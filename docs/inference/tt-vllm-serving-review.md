@@ -9,7 +9,7 @@ Reviews the vLLM and tt-inference-server serving path — generator_vllm.py cont
 
 ```yaml
 skills:
-  - blozano-tt/skills/tt-vllm-serving-review@<sha>
+  - tenstorrent/skills/tt-vllm-serving-review@<sha>
 ```
 
 Pins resolve by skill name, not path.

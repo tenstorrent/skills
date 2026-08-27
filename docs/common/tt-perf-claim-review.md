@@ -9,7 +9,7 @@ Reviews performance claims rather than performance changes — whether the measu
 
 ```yaml
 skills:
-  - blozano-tt/skills/tt-perf-claim-review@<sha>
+  - tenstorrent/skills/tt-perf-claim-review@<sha>
 ```
 
 Pins resolve by skill name, not path.

@@ -144,7 +144,7 @@ def test_workflow_pins_only_real_skills():
     if not wf.is_file():
         pytest.skip("no reference workflow")
     actual = {frontmatter(p)["name"] for p in ALL}
-    for pin in re.findall(r"blozano-tt/skills/([\w-]+)@", wf.read_text(encoding="utf-8")):
+    for pin in re.findall(r"tenstorrent/skills/([\w-]+)@", wf.read_text(encoding="utf-8")):
         assert pin in actual, f"workflow pins {pin!r}, which does not exist"
 
 

@@ -9,7 +9,7 @@ Reviews per-core L1 footprint and circular-buffer sizing — buffer inventory di
 
 ```yaml
 skills:
-  - blozano-tt/skills/tt-l1-memory-review@<sha>
+  - tenstorrent/skills/tt-l1-memory-review@<sha>
 ```
 
 Pins resolve by skill name, not path.

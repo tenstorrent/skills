@@ -1,7 +1,7 @@
 {
-  "name": "blozano-tt-skills",
+  "name": "tenstorrent-skills",
   "owner": {
-    "name": "blozano-tt"
+    "name": "tenstorrent"
   },
   "plugins": [
     {

@@ -9,7 +9,7 @@ Check whether the vendored skills in this repo have drifted from their recorded 
 
 ```yaml
 skills:
-  - blozano-tt/skills/tt-skills-upstream-audit@<sha>
+  - tenstorrent/skills/tt-skills-upstream-audit@<sha>
 ```
 
 Pins resolve by skill name, not path.

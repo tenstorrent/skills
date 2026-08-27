@@ -9,7 +9,7 @@ Static performance review of Tensix compute kernels — wasted cycles, redundant
 
 ```yaml
 skills:
-  - blozano-tt/skills/llk-perf-audit-review@<sha>
+  - tenstorrent/skills/llk-perf-audit-review@<sha>
 ```
 
 Pins resolve by skill name, not path.

@@ -9,7 +9,7 @@ Maps changed paths in a Tenstorrent pull request to the domain review skills tha
 
 ```yaml
 skills:
-  - blozano-tt/skills/tt-review-router@<sha>
+  - tenstorrent/skills/tt-review-router@<sha>
 ```
 
 Pins resolve by skill name, not path.

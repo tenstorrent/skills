@@ -9,7 +9,7 @@ Reviews dtype and math-fidelity policy — per-tensor-group precision, the prefi
 
 ```yaml
 skills:
-  - blozano-tt/skills/tt-precision-review@<sha>
+  - tenstorrent/skills/tt-precision-review@<sha>
 ```
 
 Pins resolve by skill name, not path.

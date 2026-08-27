@@ -9,7 +9,7 @@ Reviews test coverage for Tenstorrent changes — PCC bars and when a lower one 
 
 ```yaml
 skills:
-  - blozano-tt/skills/tt-test-coverage-review@<sha>
+  - tenstorrent/skills/tt-test-coverage-review@<sha>
 ```
 
 Pins resolve by skill name, not path.

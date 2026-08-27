@@ -9,7 +9,7 @@ Reviews trace capture and replay safety — nothing host-side inside capture, pr
 
 ```yaml
 skills:
-  - blozano-tt/skills/tt-trace-review@<sha>
+  - tenstorrent/skills/tt-trace-review@<sha>
 ```
 
 Pins resolve by skill name, not path.

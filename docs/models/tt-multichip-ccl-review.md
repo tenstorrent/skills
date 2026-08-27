@@ -9,7 +9,7 @@ Reviews multi-chip and collective-communication code — num_links against devic
 
 ```yaml
 skills:
-  - blozano-tt/skills/tt-multichip-ccl-review@<sha>
+  - tenstorrent/skills/tt-multichip-ccl-review@<sha>
 ```
 
 Pins resolve by skill name, not path.
