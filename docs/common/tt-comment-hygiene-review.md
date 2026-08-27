@@ -9,7 +9,7 @@ Reviews comments and documentation surface — iteration-journey comments that d
 
 ```yaml
 skills:
-  - blozano-tt/skills/tt-comment-hygiene-review@<sha>
+  - tenstorrent/skills/tt-comment-hygiene-review@<sha>
 ```
 
 Pins resolve by skill name, not path.

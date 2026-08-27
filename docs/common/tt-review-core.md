@@ -9,7 +9,7 @@ Shared review contract for all Tenstorrent code review — severity vocabulary, 
 
 ```yaml
 skills:
-  - blozano-tt/skills/tt-review-core@<sha>
+  - tenstorrent/skills/tt-review-core@<sha>
 ```
 
 Pins resolve by skill name, not path.

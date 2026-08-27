@@ -3,10 +3,10 @@
   "version": "0.1.0",
   "description": "Tenstorrent domain-knowledge code-review skills for gh-aw, Claude Code and Codex.",
   "author": {
-    "name": "blozano-tt"
+    "name": "tenstorrent"
   },
   "license": "Apache-2.0",
-  "homepage": "https://github.com/blozano-tt/skills",
+  "homepage": "https://github.com/tenstorrent/skills",
   "skills": [
     "llk-perf-audit-review",
     "llk-race-audit-review",

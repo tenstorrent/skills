@@ -14,13 +14,13 @@ imports:
   - shared/pr-diff-data-fetch.md
 
 skills:
-  - blozano-tt/skills/tt-review-core@0000000000000000000000000000000000000000
-  - blozano-tt/skills/tt-review-router@0000000000000000000000000000000000000000
-  - blozano-tt/skills/ttnn-op-kernel-review@0000000000000000000000000000000000000000
-  - blozano-tt/skills/tt-l1-memory-review@0000000000000000000000000000000000000000
-  - blozano-tt/skills/tt-model-bringup-review@0000000000000000000000000000000000000000
-  - blozano-tt/skills/tt-multichip-ccl-review@0000000000000000000000000000000000000000
-  - blozano-tt/skills/tt-test-coverage-review@0000000000000000000000000000000000000000
+  - tenstorrent/skills/tt-review-core@0000000000000000000000000000000000000000
+  - tenstorrent/skills/tt-review-router@0000000000000000000000000000000000000000
+  - tenstorrent/skills/ttnn-op-kernel-review@0000000000000000000000000000000000000000
+  - tenstorrent/skills/tt-l1-memory-review@0000000000000000000000000000000000000000
+  - tenstorrent/skills/tt-model-bringup-review@0000000000000000000000000000000000000000
+  - tenstorrent/skills/tt-multichip-ccl-review@0000000000000000000000000000000000000000
+  - tenstorrent/skills/tt-test-coverage-review@0000000000000000000000000000000000000000
 
 safe-outputs:
   create-pull-request-review-comment:
@@ -34,7 +34,7 @@ safe-outputs:
 Review this pull request using the Tenstorrent domain-knowledge skills pinned above.
 
 > **The pinned SHAs above are placeholders.** Replace each with a real 40-character commit SHA from
-> `blozano-tt/skills` before using this workflow. gh-aw reports a failed skill install as a
+> `tenstorrent/skills` before using this workflow. gh-aw reports a failed skill install as a
 > **non-fatal warning**, so an unresolvable pin silently degrades the review rather than failing the
 > run — you would get a generic review that looks like a domain review.
 

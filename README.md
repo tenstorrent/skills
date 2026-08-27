@@ -13,9 +13,9 @@ In a gh-aw workflow, pin the skills you want:
 
 ```yaml
 skills:
-  - blozano-tt/skills/tt-review-core@<sha>
-  - blozano-tt/skills/ttnn-op-kernel-review@<sha>
-  - blozano-tt/skills/tt-l1-memory-review@<sha>
+  - tenstorrent/skills/tt-review-core@<sha>
+  - tenstorrent/skills/ttnn-op-kernel-review@<sha>
+  - tenstorrent/skills/tt-l1-memory-review@<sha>
 ```
 
 Pins resolve by skill **name**, not path — the bucket a skill lives in is invisible to the

@@ -9,7 +9,7 @@ Reviews TTNN model code — layout and memory-config defaults, the decode residu
 
 ```yaml
 skills:
-  - blozano-tt/skills/tt-model-bringup-review@<sha>
+  - tenstorrent/skills/tt-model-bringup-review@<sha>
 ```
 
 Pins resolve by skill name, not path.

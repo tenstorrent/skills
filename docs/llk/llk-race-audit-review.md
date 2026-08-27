@@ -9,7 +9,7 @@ Reviews tt-llk kernel changes for the nine race hazard classes — cfg-word over
 
 ```yaml
 skills:
-  - blozano-tt/skills/llk-race-audit-review@<sha>
+  - tenstorrent/skills/llk-race-audit-review@<sha>
 ```
 
 Pins resolve by skill name, not path.

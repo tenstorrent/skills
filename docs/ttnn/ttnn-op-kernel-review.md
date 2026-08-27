@@ -9,7 +9,7 @@ Structural correctness review for TTNN op kernels — init and data-format recon
 
 ```yaml
 skills:
-  - blozano-tt/skills/ttnn-op-kernel-review@<sha>
+  - tenstorrent/skills/ttnn-op-kernel-review@<sha>
 ```
 
 Pins resolve by skill name, not path.
