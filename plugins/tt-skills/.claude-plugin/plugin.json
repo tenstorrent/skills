@@ -1,0 +1,20 @@
+{
+  "name": "tt-skills",
+  "displayName": "Tenstorrent Skills",
+  "version": "0.1.0",
+  "description": "Finds relevant Tenstorrent plugins without installing or invoking them automatically.",
+  "author": {
+    "name": "Tenstorrent"
+  },
+  "homepage": "https://github.com/tenstorrent/skills",
+  "repository": "https://github.com/tenstorrent/skills",
+  "license": "Apache-2.0",
+  "keywords": [
+    "tenstorrent",
+    "tt-metal",
+    "skills",
+    "discovery"
+  ],
+  "skills": "./skills/",
+  "defaultEnabled": true
+}

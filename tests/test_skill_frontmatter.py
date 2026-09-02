@@ -1,12 +1,11 @@
-"""Repo invariants for the skill catalogue.
+"""Invariants for the canonical tt-review-skills catalogue.
 
-mattpocock/skills keeps four parallel indexes hand-synced with no CI, which its own
-CLAUDE.md concedes is fragile. We enforce instead.
+These are deliberately not global plugin rules: future authoring, bring-up, and debugging plugins
+may need different dependencies, structure, and size budgets.
 """
 
 from __future__ import annotations
 
-import json
 import pathlib
 import re
 
@@ -119,14 +118,15 @@ def test_no_posting_from_skills(path):
             f"{path}: appears to instruct posting ({bad})"
 
 
-def test_promoted_skills_in_plugin_manifest():
-    manifest = REPO / ".claude-plugin" / "plugin.json"
-    if not manifest.is_file():
-        pytest.skip("no plugin manifest")
-    listed = {s["name"] if isinstance(s, dict) else s
-              for s in json.loads(manifest.read_text())["skills"]}
-    actual = {frontmatter(p)["name"] for p in ALL}
-    assert listed == actual, f"plugin.json out of sync: {listed ^ actual}"
+def test_review_plugin_contains_promoted_review_skills():
+    packaged = REPO / "plugins" / "tt-review-skills" / "skills"
+    listed = {path.parent.name for path in packaged.glob("*/SKILL.md")}
+    actual = {
+        frontmatter(path)["name"]
+        for path in ALL
+        if path.parent.parent.name != "meta"
+    }
+    assert listed == actual, f"tt-review-skills package out of sync: {listed ^ actual}"
 
 
 def test_promoted_skills_in_readme():
@@ -148,13 +148,12 @@ def test_workflow_pins_only_real_skills():
         assert pin in actual, f"workflow pins {pin!r}, which does not exist"
 
 
-def test_agents_md_matches_claude_md():
-    """AGENTS.md is a real file, not a symlink: symlinks break on Windows checkouts
-    and in some archive extractions, and self-containment is the whole premise of
-    this repo. Enforced rather than hand-synced."""
-    claude, agents = REPO / "CLAUDE.md", REPO / "AGENTS.md"
-    assert not agents.is_symlink(), "AGENTS.md must be a real file, not a symlink"
-    assert agents.read_text() == claude.read_text(), "AGENTS.md and CLAUDE.md have diverged"
+@pytest.mark.parametrize("root", [REPO, SKILLS], ids=["repo", "tt-review-skills"])
+def test_agents_md_matches_claude_md(root):
+    """Keep equivalent scoped instructions for Codex and Claude without symlinks."""
+    claude, agents = root / "CLAUDE.md", root / "AGENTS.md"
+    assert not agents.is_symlink(), f"{agents} must be a real file, not a symlink"
+    assert agents.read_text() == claude.read_text(), f"{agents} and {claude} have diverged"
 
 
 @pytest.mark.parametrize("script", sorted(SKILLS.rglob("*.py")), ids=lambda p: p.name)
@@ -185,18 +184,8 @@ def test_every_credited_source_has_an_attribution():
         "README credit section has no linked GitHub handles"
 
 
-def test_claude_md_stays_a_rulebook():
-    """CLAUDE.md is loaded into context every session in this repo, so it is the one
-    file that is always paid for. It carries rules; justification belongs in
-    .agents/adr/ where it is read once, when someone is changing a rule rather than
-    following one. Same discipline the repo already applies to SKILL.md routers."""
-    lines = (REPO / "CLAUDE.md").read_text(encoding="utf-8").splitlines()
-    assert len(lines) <= 90, (
-        f"CLAUDE.md is {len(lines)} lines; move justification into .agents/adr/"
-    )
-
-
-def test_adrs_referenced_from_claude_md_exist():
-    text = (REPO / "CLAUDE.md").read_text(encoding="utf-8")
-    for rel in set(re.findall(r"\((\.agents/adr/[\w./-]+\.md)\)", text)):
-        assert (REPO / rel).is_file(), f"CLAUDE.md links missing ADR {rel}"
+@pytest.mark.parametrize("path", [REPO / "CLAUDE.md", SKILLS / "CLAUDE.md"])
+def test_claude_md_stays_a_rulebook(path):
+    """Always-loaded instructions carry concise rules, not historical essays."""
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) <= 90, f"{path}: {len(lines)} lines; keep scoped instructions concise"

@@ -1,15 +1,43 @@
-# Tenstorrent code-review skills
+# Tenstorrent skills
 
-Agent Skills carrying Tenstorrent domain knowledge into pull-request review, so an automated
-reviewer catches what a generic one cannot: CB ownership UB, race hazards, L1 footprint discipline,
-trace-capture safety, precision policy, CCL topology.
+The Tenstorrent plugin marketplace for agents working on tt-metal, TTNN, Metalium, models, and
+related projects. Register one repository, then choose only the focused plugins your task needs.
 
-Built for [gh-aw](https://github.com/githubnext/gh-aw) agentic workflows, and usable as a Claude
-Code plugin or from Codex.
+The small `tt-skills` plugin contains `tt-skills-finder`. It recommends relevant optional plugins
+but does not install, enable, or invoke them without the user's action or explicit permission.
 
-## Install
+## Install the finder
 
-In a gh-aw workflow, pin the skills you want:
+Codex and the ChatGPT desktop app:
+
+```bash
+codex plugin marketplace add tenstorrent/skills
+```
+
+The Codex catalogue marks `tt-skills` as installed by default. Other plugins remain available for
+the user to select individually in the **Tenstorrent Skills** section of the Plugins Directory.
+
+Claude Code:
+
+```text
+/plugin marketplace add tenstorrent/skills
+/plugin install tt-skills@tenstorrent-skills
+```
+
+Adding the Claude marketplace installs nothing by itself. The second command installs only the
+finder; it can then recommend an optional plugin such as `tt-review-skills`.
+
+## Plugin catalogue
+
+| Plugin | Installation | Purpose |
+|---|---|---|
+| `tt-skills` | Default in Codex; explicit in Claude | Recommends relevant Tenstorrent plugins while preserving user choice |
+| `tt-review-skills` | Optional | Domain-aware PR and diff review for TTNN, Metalium, LLK, model, serving, multi-chip, trace, precision, testing, and L1 changes |
+
+## Direct gh-aw use
+
+The review skills remain directly pin-able by name in a
+[gh-aw](https://github.com/githubnext/gh-aw) workflow:
 
 ```yaml
 skills:
@@ -23,11 +51,9 @@ resolver, so skills can move between buckets without breaking a pin. Always pin 
 a pin that fails to resolve is reported as a non-fatal warning, so a typo degrades the review
 silently rather than failing the run.
 
-As a Claude Code plugin, install from the marketplace manifest in `.claude-plugin/`.
-
 See `.github/workflows/tt-pr-review.md` for a complete worked workflow.
 
-## How they compose
+## How `tt-review-skills` composes
 
 Load `tt-review-core` first — it carries the severity vocabulary, the evidence rule, the scope
 rules, and the do-not-flag guards that every other skill assumes and does not restate. Then load
@@ -42,7 +68,7 @@ rules, and the do-not-flag guards that every other skill assumes and does not re
 | Skill | Reviews |
 |---|---|
 | `tt-review-core` | The shared contract: severity, evidence, scope, output shape, false-positive guards |
-| `tt-review-router` | Maps changed paths to the domain skills that apply *(user-invoked)* |
+| `tt-review-router` | Maps changed paths to the domain skills that apply |
 | `tt-test-coverage-review` | PCC bars, tile-boundary cases, program-cache tests, regression tests on bug fixes |
 | `tt-perf-claim-review` | Whether a stated performance number is supported by its measurement |
 | `tt-comment-hygiene-review` | Iteration-journey comments, tribal knowledge, magic values, op docstrings |
@@ -117,7 +143,7 @@ one.
 
 | Source | Primary author | What came from it |
 |---|---|---|
-| [`mattpocock/skills`](https://github.com/mattpocock/skills) | [@mattpocock](https://github.com/mattpocock) | **The shape of this repo.** Bucketed `skills/<bucket>/<name>/`, progressive disclosure, trigger-style descriptions, `in-progress/` and `deprecated/`, invocation bifurcation, changesets, the install-block convention |
+| [`mattpocock/skills`](https://github.com/mattpocock/skills) | [@mattpocock](https://github.com/mattpocock) | **The shape of the review catalogue.** Bucketed `skills/<bucket>/<name>/`, progressive disclosure, trigger-style descriptions, `in-progress/` and `deprecated/`, invocation bifurcation, changesets, the install-block convention |
 | [`githubnext/gh-aw`](https://github.com/githubnext/gh-aw) | [@dsyme](https://github.com/dsyme), [@pelikhan](https://github.com/pelikhan), [@mnkiefer](https://github.com/mnkiefer) | The consumer. `skills:` frontmatter, `safe-outputs`, and the `mattpocock-skills-reviewer` triage pattern the reference workflow follows |
 
 ### Consulted, little or nothing taken
@@ -136,8 +162,21 @@ Every skill records its upstreams in `metadata.upstream`; [`SOURCES.md`](SOURCES
 from that.
 
 Vendored copies rot as upstreams move. `tt-skills-upstream-audit` checks for that, and
-[`CLAUDE.md`](CLAUDE.md) carries the invariants for maintainers — including the **disclosure gate
-that applies to every re-vendor**.
+[`skills/CLAUDE.md`](skills/CLAUDE.md) carries the review-catalogue invariants for maintainers —
+including the **disclosure gate that applies to every re-vendor**. Those rules are deliberately
+scoped to `tt-review-skills`; they do not constrain unrelated plugins.
+
+## Validate changes
+
+```bash
+python3 scripts/sync_review_plugin.py --check
+pytest tests/
+claude plugin validate . --strict
+```
+
+CI runs the deterministic package-sync check and the Python test suite. The Claude validator is an
+additional local check when the CLI is available; Codex plugin manifests are covered by the test
+suite and the Codex plugin validator during authoring.
 
 ## Licence
 
