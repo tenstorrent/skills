@@ -11,7 +11,7 @@ but does not install, enable, or invoke them without the user's action or explic
 Codex and the ChatGPT desktop app:
 
 ```bash
-codex plugin marketplace add tenstorrent/skills
+codex plugin marketplace add git@github.com:tenstorrent/skills.git
 ```
 
 The Codex catalogue marks `tt-skills` as installed by default. Other plugins remain available for
@@ -20,12 +20,18 @@ the user to select individually in the **Tenstorrent Skills** section of the Plu
 Claude Code:
 
 ```text
-/plugin marketplace add tenstorrent/skills
+/plugin marketplace add git@github.com:tenstorrent/skills.git
 /plugin install tt-skills@tenstorrent-skills
 ```
 
 Adding the Claude marketplace installs nothing by itself. The second command installs only the
 finder; it can then recommend an optional plugin such as `tt-review-skills`.
+
+Both marketplace commands use your existing GitHub SSH access.
+
+> [!IMPORTANT]
+> **Internal note:** This repository is currently private. When it is made public, change both
+> marketplace-add commands to the simpler `tenstorrent/skills` form.
 
 ## Plugin catalogue
 
