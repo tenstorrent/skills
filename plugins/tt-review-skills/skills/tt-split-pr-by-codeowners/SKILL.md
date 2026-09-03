@@ -1,7 +1,6 @@
 ---
 name: tt-split-pr-by-codeowners
 description: Decide whether a wide-ranging pull request should be broken up so each piece needs fewer CODEOWNERS approvals, and propose how. Use for 'too many reviewers on this', 'can this be broken up', 'why does this need six approvals'.
-disable-model-invocation: false
 metadata:
   tier: process
   upstream: []

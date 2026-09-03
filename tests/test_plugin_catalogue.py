@@ -24,6 +24,7 @@ def load(path: pathlib.Path) -> dict:
 def test_host_catalogues_expose_the_same_plugins():
     codex = load(CODEX_MARKETPLACE)
     claude = load(CLAUDE_MARKETPLACE)
+    assert codex["name"] == claude["name"]
     codex_entries = {entry["name"]: entry for entry in codex["plugins"]}
     claude_entries = {entry["name"]: entry for entry in claude["plugins"]}
     assert codex_entries.keys() == claude_entries.keys()
@@ -88,6 +89,15 @@ def test_packaged_skills_have_discoverable_frontmatter():
         assert frontmatter.get("description")
 
 
+def test_packaged_skill_references_exist():
+    for path in PLUGINS.glob("*/skills/*/SKILL.md"):
+        text = path.read_text(encoding="utf-8")
+        code_refs = re.findall(r"`(references/[\w./-]+\.md)`", text)
+        link_refs = re.findall(r"\]\((references/[\w./-]+\.md)\)", text)
+        for rel in set(code_refs + link_refs):
+            assert (path.parent / rel).is_file(), f"{path}: references missing file {rel}"
+
+
 def test_plugins_are_individually_owned():
     codeowners = (REPO / ".github" / "CODEOWNERS").read_text(encoding="utf-8")
     for plugin in PLUGINS.iterdir():
@@ -122,6 +132,14 @@ def test_finder_is_discovery_only():
     assert "a recommendation is not permission" in skill
     assert "do not run an installation command" in skill
     assert "explicitly asks to install" in skill
+
+
+def test_readme_catalogues_every_plugin():
+    readme = (REPO / "README.md").read_text(encoding="utf-8")
+    section = readme.split("## Plugin catalogue", 1)[1].split("\n## ", 1)[0]
+    listed = set(re.findall(r"^\| `([^`]+)` \|", section, re.MULTILINE))
+    expected = {entry["name"] for entry in load(CODEX_MARKETPLACE)["plugins"]}
+    assert listed == expected, f"README plugin catalogue is out of sync: {listed ^ expected}"
 
 
 def test_packaged_review_skills_are_current():

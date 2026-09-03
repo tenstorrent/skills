@@ -9,6 +9,8 @@ all substantive workflows installed only when the user chooses them.
 - `tt-skills` contains discovery guidance only. It may recommend an optional plugin, but must not
   install, enable, or invoke one without the user's action or explicit permission.
 - Registering the marketplace is not permission to use every plugin in it.
+- Installing an optional plugin permits its skills to participate in normal automatic selection.
+  The consent boundary is installation, not each invocation.
 - Optional plugins must stay independently installable. Do not create an aggregate plugin that
   silently loads the full catalogue.
 
@@ -38,9 +40,12 @@ two hand-maintained versions.
 ## Adding or changing a plugin
 
 1. Add or update both plugin manifests and both marketplace entries.
-2. Add the plugin's CODEOWNERS rule before asking for review.
-3. Update the root README's user-facing catalogue and installation instructions.
-4. If changing a canonical review skill, run `python3 scripts/sync_review_plugin.py`.
-5. Run the package-sync check and `pytest tests/`; also run host plugin validators when available.
+2. When installed plugin content changes, bump its version in both manifests. Claude caches
+   explicit plugin versions, and CI rejects changed content with an unchanged version.
+3. Add the plugin's CODEOWNERS rule before asking for review.
+4. Update the root README's user-facing catalogue and installation instructions.
+5. If changing a canonical review skill, run `python3 scripts/sync_review_plugin.py`.
+6. Run the package-sync and version checks and `pytest tests/`; also run host plugin validators
+   when available.
 
 Do not claim tests, model quality, hardware behavior, or performance that was not measured.

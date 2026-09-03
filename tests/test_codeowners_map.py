@@ -3,8 +3,8 @@
 `test_skill_frontmatter.py` guards structure. This file guards the one piece of
 behaviour in this repo that is wrong *silently*: an exclusion that misses still
 reports the excluded name, so the output looks correct while the headline
-approval count is one that cannot occur. ADR-0003's argument for tests over
-convention applies exactly here.
+approval count is one that cannot occur. This invariant therefore belongs in a
+behavioural test rather than a maintenance convention.
 """
 
 from __future__ import annotations
