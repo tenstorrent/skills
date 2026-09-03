@@ -1,0 +1,19 @@
+{
+  "name": "tt-review-skills",
+  "displayName": "Tenstorrent Review Skills",
+  "version": "0.2.0",
+  "description": "Tenstorrent domain-knowledge code-review skills for gh-aw, Claude Code, and Codex.",
+  "author": {
+    "name": "Tenstorrent"
+  },
+  "homepage": "https://github.com/tenstorrent/skills",
+  "repository": "https://github.com/tenstorrent/skills",
+  "license": "Apache-2.0",
+  "keywords": [
+    "tenstorrent",
+    "tt-metal",
+    "code-review"
+  ],
+  "skills": "./skills/",
+  "defaultEnabled": true
+}

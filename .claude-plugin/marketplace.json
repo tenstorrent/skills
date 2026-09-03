@@ -3,10 +3,16 @@
   "owner": {
     "name": "tenstorrent"
   },
+  "description": "Tenstorrent skills and workflows for tt-metal development.",
   "plugins": [
     {
+      "name": "tt-skills",
+      "source": "./plugins/tt-skills",
+      "description": "Finds relevant Tenstorrent plugins without installing or invoking them automatically."
+    },
+    {
       "name": "tt-review-skills",
-      "source": "./",
+      "source": "./plugins/tt-review-skills",
       "description": "Tenstorrent domain-knowledge code-review skills for gh-aw, Claude Code and Codex."
     }
   ]

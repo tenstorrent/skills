@@ -1,0 +1,17 @@
+# Marketplace-wide policy and CI
+/* @yieldthought @blozano-tt
+/.agents/ @yieldthought @blozano-tt
+/.claude-plugin/ @yieldthought @blozano-tt
+/.github/ @yieldthought @blozano-tt
+/.changeset/ @yieldthought @blozano-tt
+/scripts/ @yieldthought @blozano-tt
+/tests/ @yieldthought @blozano-tt
+
+# Default discovery plugin
+/plugins/tt-skills/ @yieldthought @blozano-tt
+
+# Existing review catalogue and its packaged plugin
+/skills/ @blozano-tt @yieldthought
+/docs/ @blozano-tt @yieldthought
+/SOURCES.md @blozano-tt @yieldthought
+/plugins/tt-review-skills/ @blozano-tt @yieldthought
