@@ -13,7 +13,8 @@ the investigation cannot consume or distort the calling agent's context window.
 1. Resolve `scripts/autodebug.sh` relative to this `SKILL.md`, not relative to the target repository.
 2. Invoke that script by absolute path while the working directory is the checkout to investigate.
 3. Pass the concrete problem after `--`. Add one or more `--focus <path>` arguments when they help
-   bound the investigation. Use `--agent claude` only when Claude is the desired child agent.
+   bound the investigation. The launcher selects the current host automatically when run from an
+   installed Codex or Claude plugin. Use `--agent` before `--` only to override that choice.
 4. Do not ask for separate confirmation merely to launch AutoDebug. Installing this optional plugin
    enables normal implicit skill selection; the child remains inspection-only.
 

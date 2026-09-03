@@ -157,6 +157,23 @@ def test_launcher_can_select_claude_and_override_model(tmp_path):
     ]
 
 
+def test_launcher_infers_claude_inside_claude_code(tmp_path):
+    capture = install_fake_cli(tmp_path, "claude")
+    capture["env"]["CLAUDECODE"] = "1"
+    result = subprocess.run(
+        [str(LAUNCHER), "--", "explain the failure"],
+        cwd=tmp_path,
+        env=capture["env"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    args = json.loads(Path(capture["args"]).read_text(encoding="utf-8"))
+    assert args[:3] == ["-p", "--output-format", "text"]
+    assert "--permission-mode" in args
+
+
 def test_launcher_requires_a_problem():
     result = subprocess.run(
         [str(LAUNCHER)],

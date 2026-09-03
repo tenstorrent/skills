@@ -3,7 +3,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 PROMPT_TEMPLATE="$SCRIPT_DIR/../references/AUTODEBUG_PROMPT.md"
-AGENT="${AUTODEBUG_AGENT:-codex}"
+DEFAULT_AGENT="codex"
+if [[ -n "${CLAUDECODE:-}" || "$SCRIPT_DIR" == *"/.claude/plugins/"* ]]; then
+    DEFAULT_AGENT="claude"
+fi
+AGENT="${AUTODEBUG_AGENT:-$DEFAULT_AGENT}"
 CODEX_MODEL="${AUTODEBUG_CODEX_MODEL:-}"
 CLAUDE_MODEL="${AUTODEBUG_CLAUDE_MODEL:-}"
 EFFORT="${AUTODEBUG_EFFORT:-xhigh}"
@@ -20,7 +24,7 @@ The child agent writes ./AUTODEBUG.md.
 
 Options:
   --focus PATH            Add a focus path. May be repeated.
-  --agent codex|claude    Agent CLI to run. Default: codex.
+  --agent codex|claude    Override the inferred agent CLI.
   --model MODEL           Override the selected agent's configured model.
   --effort LEVEL          Reasoning effort. Default: xhigh.
   --help                  Show this help.
