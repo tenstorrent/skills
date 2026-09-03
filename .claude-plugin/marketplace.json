@@ -14,6 +14,11 @@
       "name": "tt-review-skills",
       "source": "./plugins/tt-review-skills",
       "description": "Tenstorrent domain-knowledge code-review skills for gh-aw, Claude Code and Codex."
+    },
+    {
+      "name": "tt-autodebug",
+      "source": "./plugins/tt-autodebug",
+      "description": "Isolated AutoDebug investigation, tt-triage analysis, and verified repair for tt-metal."
     }
   ]
 }

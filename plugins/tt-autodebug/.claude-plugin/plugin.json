@@ -1,8 +1,8 @@
 {
-  "name": "tt-skills",
-  "displayName": "Tenstorrent Skills",
-  "version": "0.1.1",
-  "description": "Finds relevant Tenstorrent plugins without installing or invoking them automatically.",
+  "name": "tt-autodebug",
+  "displayName": "Tenstorrent AutoDebug",
+  "version": "0.1.0",
+  "description": "Diagnoses and fixes hard tt-metal failures with isolated AutoDebug analysis, AutoTriage evidence, and verified repair.",
   "author": {
     "name": "Tenstorrent"
   },
@@ -12,8 +12,8 @@
   "keywords": [
     "tenstorrent",
     "tt-metal",
-    "skills",
-    "discovery"
+    "debugging",
+    "triage"
   ],
   "skills": "./skills/",
   "defaultEnabled": true

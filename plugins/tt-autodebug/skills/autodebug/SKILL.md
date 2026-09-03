@@ -1,0 +1,38 @@
+---
+name: autodebug
+description: Investigate hard, unclear, or context-heavy tt-metal and TTNN failures by launching a fresh inspection-only Codex or Claude session. Use automatically when an installed plugin is available and an isolated deep investigation would protect the calling agent's context, especially before autofix. Do not run hardware-dependent reproductions or edit source in the child session.
+---
+
+# AutoDebug
+
+Run the bundled launcher. It renders the current AutoDebug prompt and starts a new agent process so
+the investigation cannot consume or distort the calling agent's context window.
+
+## Launch
+
+1. Resolve `scripts/autodebug.sh` relative to this `SKILL.md`, not relative to the target repository.
+2. Invoke that script by absolute path while the working directory is the checkout to investigate.
+3. Pass the concrete problem after `--`. Add one or more `--focus <path>` arguments when they help
+   bound the investigation. Use `--agent claude` only when Claude is the desired child agent.
+4. Do not ask for separate confirmation merely to launch AutoDebug. Installing this optional plugin
+   enables normal implicit skill selection; the child remains inspection-only.
+
+Example:
+
+```bash
+"<this-skill-directory>/scripts/autodebug.sh" --focus ttnn/cpp -- "Program-cache test hangs after the second trace"
+```
+
+The launcher waits for the fresh session to finish. Read `AUTODEBUG.md`, verify its important claims
+against the checkout, and distinguish supported findings from suggested follow-ups. If the user's
+request includes implementation, continue with `$autofix`; otherwise report the diagnosis.
+
+## Invariants
+
+- Do not replace the launcher with an in-context investigation. Isolation is part of this skill's
+  correctness contract.
+- Do not edit source in the child session. AutoDebug produces evidence; AutoFix owns changes.
+- Do not assume silicon is unavailable to the calling agent. The AutoDebug child is intentionally
+  inspection-only because its prompt must be portable across environments.
+- Do not rely on a separate checkout of the prompt repository at runtime. The installed plugin is
+  self-contained.

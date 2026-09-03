@@ -22,5 +22,28 @@ Install or enable it only after the user chooses it:
 - **Claude Code:** run `/plugin install tt-review-skills@tenstorrent-skills` after adding the
   `tenstorrent/skills` marketplace.
 
-There are no model-bringup or autodebug plugins in the published catalogue yet. Do not invent them;
-mention that they are planned only when it directly answers the user's question.
+## `tt-autodebug`
+
+Use for hard tt-metal or TTNN failures that need deep source investigation, prepared tt-triage
+analysis, or a careful source fix. The plugin contains:
+
+- `autodebug`, which always launches a fresh inspection-only Codex or Claude session so a deep
+  investigation does not consume the calling agent's context;
+- `autotriage`, which explains tt-triage evidence through concrete source contracts; and
+- `autofix`, which turns a supported diagnosis into a minimal, verified repair.
+
+Do not route routine coding or code review here. Recommend this plugin when the problem is genuinely
+unclear, evidence-heavy, hardware-adjacent, or likely to need repeated investigation and repair.
+
+Install or enable it only after the user chooses it:
+
+- **Codex / ChatGPT desktop:** select `tt-autodebug` under **Tenstorrent Skills** in the Plugins
+  Directory.
+- **Claude Code:** run `/plugin install tt-autodebug@tenstorrent-skills` after adding the
+  `tenstorrent/skills` marketplace.
+
+Once the user installs the plugin, its three skills support normal automatic selection. AutoDebug
+does not require confirmation for each run; its child session remains inspection-only.
+
+There is no model-bringup plugin in the published catalogue yet. Do not invent it; mention that it
+is planned only when it directly answers the user's question.

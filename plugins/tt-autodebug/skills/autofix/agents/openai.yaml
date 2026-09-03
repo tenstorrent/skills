@@ -1,0 +1,6 @@
+interface:
+  display_name: "Tenstorrent AutoFix"
+  short_description: "Turn strong diagnoses into minimal verified fixes"
+  default_prompt: "Use $autofix to fix this difficult tt-metal failure."
+policy:
+  allow_implicit_invocation: true

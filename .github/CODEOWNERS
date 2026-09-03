@@ -10,6 +10,9 @@
 # Default discovery plugin
 /plugins/tt-skills/ @yieldthought @blozano-tt
 
+# AutoDebug, AutoTriage, and AutoFix
+/plugins/tt-autodebug/ @yieldthought
+
 # Existing review catalogue and its packaged plugin
 /skills/ @blozano-tt @yieldthought
 /docs/ @blozano-tt @yieldthought
