@@ -1,6 +1,6 @@
 ---
 name: autotriage
-description: Diagnose tt-metal hangs and accelerator failures from prepared tt-triage evidence and a source snapshot. Use automatically for AUTOTRIAGE_INPUT.md, tt-triage captures, RISC-V stack traces, LLK assertions, NoC or circular-buffer stalls, fabric hangs, and downstream synchronization fanout. Preserve live failure evidence before any reset or process termination.
+description: Debug tt-metal hangs by inspecting prepared tt-triage evidence and source without running the target code. Use automatically for AUTOTRIAGE_INPUT.md, tt-triage captures, RISC-V stack traces, LLK assertions, NoC or circular-buffer stalls, fabric hangs, and downstream synchronization fanout. Preserve live failure evidence before any reset or process termination.
 ---
 
 # AutoTriage

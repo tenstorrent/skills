@@ -41,7 +41,7 @@ Both marketplace commands use your existing GitHub SSH access.
 |---|---|---|
 | `tt-skills` | Explicit after marketplace registration | Recommends relevant Tenstorrent plugins while preserving user choice |
 | `tt-review-skills` | Optional | Domain-aware PR and diff review for TTNN, Metalium, LLK, model, serving, multi-chip, trace, precision, testing, and L1 changes |
-| `tt-autodebug` | Optional | Isolated deep investigation, tt-triage analysis, and verified repair for hard tt-metal failures |
+| `tt-autodebug` | Optional | Inspection-only debugging for code issues and hangs, followed by tenacious experiments that find and address the root cause |
 
 Install AutoDebug only when you want its debugging workflow:
 

@@ -1,6 +1,6 @@
 interface:
   display_name: "Tenstorrent AutoDebug"
-  short_description: "Investigate hard bugs in an isolated agent session"
+  short_description: "Debug code issues by inspection in a fresh agent"
   default_prompt: "Use $autodebug to investigate this failure in a fresh agent context."
 policy:
   allow_implicit_invocation: true

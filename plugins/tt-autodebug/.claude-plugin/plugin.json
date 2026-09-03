@@ -2,7 +2,7 @@
   "name": "tt-autodebug",
   "displayName": "Tenstorrent AutoDebug",
   "version": "0.1.0",
-  "description": "Diagnoses and fixes hard tt-metal failures with isolated AutoDebug analysis, AutoTriage evidence, and verified repair.",
+  "description": "Adds skills that debug code issues (AutoDebug) and hangs (AutoTriage) by inspection without running the target code, plus a tenacious AutoFix workflow that tests hypotheses until it finds and addresses the root cause.",
   "author": {
     "name": "Tenstorrent"
   },

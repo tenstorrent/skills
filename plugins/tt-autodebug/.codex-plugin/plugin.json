@@ -1,7 +1,7 @@
 {
   "name": "tt-autodebug",
   "version": "0.1.0",
-  "description": "Diagnoses and fixes hard tt-metal failures with isolated AutoDebug analysis, AutoTriage evidence, and verified repair.",
+  "description": "Adds skills that debug code issues (AutoDebug) and hangs (AutoTriage) by inspection without running the target code, plus a tenacious AutoFix workflow that tests hypotheses until it finds and addresses the root cause.",
   "author": {
     "name": "Tenstorrent"
   },
@@ -17,8 +17,8 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Tenstorrent AutoDebug",
-    "shortDescription": "Isolated diagnosis and verified repair for tt-metal",
-    "longDescription": "Investigates difficult tt-metal failures in a fresh agent context, interprets tt-triage evidence, and drives evidence-led fixes without consuming the calling agent's context window.",
+    "shortDescription": "Debug code issues and hangs, then prove the fix",
+    "longDescription": "Adds skills that debug code issues (AutoDebug) and hangs (AutoTriage) by inspection without running the target code, plus a tenacious AutoFix workflow that tests hypotheses until it finds and addresses the root cause.",
     "developerName": "Tenstorrent",
     "category": "Developer Tools",
     "capabilities": [

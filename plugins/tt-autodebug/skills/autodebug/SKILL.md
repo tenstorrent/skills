@@ -1,6 +1,6 @@
 ---
 name: autodebug
-description: Investigate hard, unclear, or context-heavy tt-metal and TTNN failures by launching a fresh inspection-only Codex or Claude session. Use automatically when an installed plugin is available and an isolated deep investigation would protect the calling agent's context, especially before autofix. Do not run hardware-dependent reproductions or edit source in the child session.
+description: Debug difficult tt-metal and TTNN code issues by inspecting source in a fresh Codex or Claude session without running the target code. Use automatically when an installed plugin is available and an isolated deep investigation would protect the calling agent's context, especially before autofix. Do not edit source in the child session.
 ---
 
 # AutoDebug

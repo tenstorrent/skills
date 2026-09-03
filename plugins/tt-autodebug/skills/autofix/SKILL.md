@@ -1,6 +1,6 @@
 ---
 name: autofix
-description: Repair difficult tt-metal and TTNN bugs after AutoDebug or AutoTriage has produced a concrete diagnosis. Use automatically when the user asked for a fix and the failure needs hypothesis-driven changes, focused validation, or careful accelerator-specific reasoning. Keep fixes minimal, preserve evidence, and report unverified hardware claims explicitly.
+description: Tenaciously repair difficult tt-metal and TTNN bugs after AutoDebug or AutoTriage has produced a diagnosis. Use automatically when the user asked for a fix and the failure needs experiments that prove or disprove competing hypotheses until the root cause is found and addressed. Keep fixes minimal and report unverified hardware claims explicitly.
 ---
 
 # AutoFix

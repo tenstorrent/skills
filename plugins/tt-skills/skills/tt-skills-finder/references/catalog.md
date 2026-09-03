@@ -24,13 +24,15 @@ Install or enable it only after the user chooses it:
 
 ## `tt-autodebug`
 
-Use for hard tt-metal or TTNN failures that need deep source investigation, prepared tt-triage
-analysis, or a careful source fix. The plugin contains:
+Use for tt-metal or TTNN code issues and hangs that should first be debugged by inspection without
+running the target code, then fixed through experiments that distinguish the root cause from
+plausible alternatives. The plugin contains:
 
-- `autodebug`, which always launches a fresh inspection-only Codex or Claude session so a deep
-  investigation does not consume the calling agent's context;
-- `autotriage`, which explains tt-triage evidence through concrete source contracts; and
-- `autofix`, which turns a supported diagnosis into a minimal, verified repair.
+- `autodebug`, which diagnoses code issues in a fresh inspection-only Codex or Claude session so
+  the investigation does not consume the calling agent's context;
+- `autotriage`, which diagnoses hangs from tt-triage evidence and concrete source contracts; and
+- `autofix`, which tenaciously proves or disproves hypotheses with experiments until it finds and
+  addresses the root cause.
 
 Do not route routine coding or code review here. Recommend this plugin when the problem is genuinely
 unclear, evidence-heavy, hardware-adjacent, or likely to need repeated investigation and repair.
