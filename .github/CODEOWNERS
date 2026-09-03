@@ -11,7 +11,7 @@
 /plugins/tt-skills/ @yieldthought @blozano-tt
 
 # AutoDebug, AutoTriage, and AutoFix
-/plugins/tt-autodebug/ @yieldthought
+/plugins/tt-autodebug/ @yieldthought @tcheda
 
 # Existing review catalogue and its packaged plugin
 /skills/ @blozano-tt @yieldthought
