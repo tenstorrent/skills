@@ -8,14 +8,16 @@ but does not install, enable, or invoke them without the user's action or explic
 
 ## Install the finder
 
-Codex and the ChatGPT desktop app:
+Codex CLI:
 
 ```bash
 codex plugin marketplace add git@github.com:tenstorrent/skills.git
+codex plugin add tt-skills@tenstorrent-skills
 ```
 
-The Codex catalogue marks `tt-skills` as installed by default. Other plugins remain available for
-the user to select individually in the **Tenstorrent Skills** section of the Plugins Directory.
+The first command registers the marketplace. The second command installs only the finder. Other
+plugins remain available for the user to select individually in the **Tenstorrent Skills** section
+of the Plugins Directory.
 
 Claude Code:
 
@@ -37,7 +39,7 @@ Both marketplace commands use your existing GitHub SSH access.
 
 | Plugin | Installation | Purpose |
 |---|---|---|
-| `tt-skills` | Default in Codex; explicit in Claude | Recommends relevant Tenstorrent plugins while preserving user choice |
+| `tt-skills` | Explicit after marketplace registration | Recommends relevant Tenstorrent plugins while preserving user choice |
 | `tt-review-skills` | Optional | Domain-aware PR and diff review for TTNN, Metalium, LLK, model, serving, multi-chip, trace, precision, testing, and L1 changes |
 
 ## Direct gh-aw use
