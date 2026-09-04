@@ -5,6 +5,10 @@ description: Debug difficult tt-metal and TTNN code issues by inspecting source 
 
 # AutoDebug
 
+The launch instructions below are for the calling agent. If your prompt identifies
+you as the already-isolated AutoDebug investigator, perform that investigation in
+this session and write `AUTODEBUG.md`; do not launch AutoDebug again.
+
 Run the bundled launcher. It renders the current AutoDebug prompt and starts a new agent process so
 the investigation cannot consume or distort the calling agent's context window.
 
@@ -24,9 +28,10 @@ Example:
 "<this-skill-directory>/scripts/autodebug.sh" --focus ttnn/cpp -- "Program-cache test hangs after the second trace"
 ```
 
-The launcher waits for the fresh session to finish. Read `AUTODEBUG.md`, verify its important claims
-against the checkout, and distinguish supported findings from suggested follow-ups. If the user's
-request includes implementation, continue with `$autofix`; otherwise report the diagnosis.
+Wait for the launcher to finish and read `AUTODEBUG.md` before ending your response. If you start it
+in the background, wait for that task to complete. Verify the report's important claims against the
+checkout and distinguish supported findings from suggested follow-ups. If the user's request includes
+implementation, continue with `$autofix`; otherwise report the diagnosis.
 
 ## Codex sandbox startup
 
