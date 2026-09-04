@@ -109,7 +109,8 @@ PROBLEM="$*"
 PROMPT_FILE="$(mktemp "${TMPDIR:-/tmp}/autodebug-prompt.XXXXXX")"
 trap 'rm -f "$PROMPT_FILE"' EXIT
 
-python3 - "$PROMPT_TEMPLATE" "$PROBLEM" "${FOCUS_PATHS[@]}" >"$PROMPT_FILE" <<'PY'
+# The conditional expansion also works for an empty array under Bash 3.2's set -u.
+python3 - "$PROMPT_TEMPLATE" "$PROBLEM" ${FOCUS_PATHS[@]+"${FOCUS_PATHS[@]}"} >"$PROMPT_FILE" <<'PY'
 from pathlib import Path
 import sys
 
@@ -137,8 +138,13 @@ print(
 print(rendered.strip())
 PY
 
-case "${AGENT,,}" in
-    codex)
+# Keep the prompt readable on stdin without leaving its file behind after exec.
+exec <"$PROMPT_FILE"
+rm -f "$PROMPT_FILE"
+trap - EXIT
+
+case "$AGENT" in
+    [cC][oO][dD][eE][xX])
         command -v codex >/dev/null 2>&1 || die "codex executable not found"
         SANDBOX="$(python3 "$SCRIPT_DIR/codex_sandbox.py")"
         COMMAND=(codex --approve-for-me exec)
@@ -154,14 +160,14 @@ case "${AGENT,,}" in
             --cd "$RUN_DIR"
             -
         )
-        exec "${COMMAND[@]}" <"$PROMPT_FILE"
+        exec "${COMMAND[@]}"
         ;;
-    claude)
+    [cC][lL][aA][uU][dD][eE])
         command -v claude >/dev/null 2>&1 || die "claude executable not found"
         COMMAND=(claude -p --output-format text)
         [[ -z "$CLAUDE_MODEL" ]] || COMMAND+=(--model "$CLAUDE_MODEL")
         COMMAND+=(--effort "$EFFORT" --permission-mode auto)
-        exec "${COMMAND[@]}" <"$PROMPT_FILE"
+        exec "${COMMAND[@]}"
         ;;
     *)
         die "--agent must be codex or claude, got: $AGENT"
