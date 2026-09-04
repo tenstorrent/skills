@@ -1,0 +1,6 @@
+interface:
+  display_name: "Tenstorrent AutoTriage"
+  short_description: "Debug hangs by inspecting tt-triage evidence"
+  default_prompt: "Use $autotriage to diagnose this tt-triage capture."
+policy:
+  allow_implicit_invocation: true

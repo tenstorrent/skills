@@ -1,6 +1,6 @@
 {
   "name": "tt-skills",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Finds relevant Tenstorrent plugins without installing or invoking them automatically.",
   "author": {
     "name": "Tenstorrent"

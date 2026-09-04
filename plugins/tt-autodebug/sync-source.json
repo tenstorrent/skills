@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "source": {
+    "kind": "maintainer-local-git",
+    "repository": "autodebug",
+    "branch": "main",
+    "commit": "4d15fd683d279a1503c8f3f8a0508b83ea7a8657"
+  },
+  "importedOn": "2026-09-03",
+  "files": [
+    {
+      "source": "AUTODEBUG_PROMPT.md",
+      "destination": "skills/autodebug/references/AUTODEBUG_PROMPT.md",
+      "gitBlob": "8d4b28a328b44aea437f2c166e3b11517e095713",
+      "sha256": "87975d94db7c1007d93e226e853000db6811a518e45e2f562478f1f9bca8f1ec"
+    },
+    {
+      "source": "AUTOTRIAGE_PROMPT.md",
+      "destination": "skills/autotriage/references/AUTOTRIAGE_PROMPT.md",
+      "gitBlob": "d164669a2d9d1abedba34b17271a96eb3215471c",
+      "sha256": "099cdcdba7f8dd12a3a3be05ab7ea2b1431158c352dd462ce90fc3c59425250b"
+    }
+  ]
+}

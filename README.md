@@ -41,6 +41,23 @@ Both marketplace commands use your existing GitHub SSH access.
 |---|---|---|
 | `tt-skills` | Explicit after marketplace registration | Recommends relevant Tenstorrent plugins while preserving user choice |
 | `tt-review-skills` | Optional | Domain-aware PR and diff review for TTNN, Metalium, LLK, model, serving, multi-chip, trace, precision, testing, and L1 changes |
+| `tt-autodebug` | Optional | Inspection-only debugging for code issues and hangs, followed by tenacious experiments that find and address the root cause |
+
+Install AutoDebug only when you want its debugging workflow:
+
+```bash
+codex plugin add tt-autodebug@tenstorrent-skills
+```
+
+For Claude Code, run `/plugin install tt-autodebug@tenstorrent-skills`. Once installed, its
+`autodebug`, `autotriage`, and `autofix` skills can be selected automatically as the task
+requires. The AutoDebug skill launches a fresh inspection-only agent process to keep deep
+investigation out of the calling agent's context.
+
+Prompt development and backtesting currently continue in a maintainer-local standalone repository.
+The published plugin is a self-contained snapshot; see
+[`plugins/tt-autodebug/SYNC.md`](plugins/tt-autodebug/SYNC.md) for the manual synchronization
+contract.
 
 ## Direct gh-aw use
 
