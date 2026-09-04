@@ -29,6 +29,11 @@ Options:
   --effort LEVEL          Reasoning effort. Default: xhigh.
   --help                  Show this help.
 
+Environment:
+  AUTODEBUG_ALLOW_UNSANDBOXED=1
+    Permit unsandboxed Codex only after a recognized sandbox startup failure.
+    Set only with user/operator approval for this environment. Default: 0.
+
 Examples:
   autodebug.sh --focus models/demos/foo -- "decode diverges after token 128"
   autodebug.sh --agent claude -- "why does this test hang?"
@@ -130,11 +135,15 @@ PY
 case "${AGENT,,}" in
     codex)
         command -v codex >/dev/null 2>&1 || die "codex executable not found"
+        SANDBOX="$(python3 "$SCRIPT_DIR/codex_sandbox.py")"
         COMMAND=(codex --approve-for-me exec)
+        if [[ "$SANDBOX" == "danger-full-access" ]]; then
+            COMMAND=(codex --ask-for-approval never exec)
+        fi
         [[ -z "$CODEX_MODEL" ]] || COMMAND+=(--model "$CODEX_MODEL")
         COMMAND+=(
             -c "model_reasoning_effort=$EFFORT"
-            --sandbox workspace-write
+            --sandbox "$SANDBOX"
             --skip-git-repo-check
             --color never
             --cd "$RUN_DIR"

@@ -28,6 +28,9 @@ import os
 from pathlib import Path
 import sys
 
+if sys.argv[1:2] == ["sandbox"]:
+    raise SystemExit(0)
+
 Path(os.environ["AUTODEBUG_TEST_ARGS"]).write_text(
     json.dumps(sys.argv[1:]), encoding="utf-8"
 )
