@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Declares the surface this skill claims. tests/test_debug_tools_manifests.py
+# joins it against a snapshot of upstream, in both directions: a name here that
+# upstream does not have is an over-claim, a TT_METAL_* token in SKILL.md that is
+# missing here is an under-claim.
+skill: tt-noc-dump
+env_vars:
+  - TT_METAL_NOC_DEBUG_DUMP
+  - TT_METAL_RECORD_NOC_TRANSFER_DATA
+shared_env_vars: []
+cli_flags:
+  - --gtest_filter
+kernel_apis: []
+artifacts: []
+fixtures:
+  binary: unit_tests_noc_debugging
+  cases:
+    - NOCDebuggingFixture.McastOnlyWriteFlush
+output_literals:
+  - "NOC Debug Summary"
+  - "missing noc_async_write_barrier"

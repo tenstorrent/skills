@@ -1,0 +1,37 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Declares the surface this skill claims. tests/test_debug_tools_manifests.py
+# joins it against a snapshot of upstream, in both directions: a name here that
+# upstream does not have is an over-claim, a TT_METAL_* token in SKILL.md that is
+# missing here is an under-claim.
+skill: tt-triage
+env_vars: []
+# Set by the workload, not by this skill, but named in SKILL.md's traps because
+# a zero here silently thins the report.
+shared_env_vars:
+  - TT_METAL_INSPECTOR
+cli_flags:
+  - --llm-output
+  - --llm-output-path
+  - --triage-summary-path
+  - --run
+  - --dev
+  - --all-cores
+  - --initialize-with-noc1
+  - --remote-exalens
+  - --rank-binding
+  - --skip-version-check
+  - --gtest_filter
+kernel_apis: []
+artifacts:
+  - out.txt
+  - summary.txt
+fixtures:
+  binary: unit_tests_debug_tools
+  cases:
+    - MeshWatcherFixture.TensixTestWatcherSanitize
+output_literals:
+  - "dump_callstacks"
+  - "dump_running_operations"
+  - "Data mismatch in section .text"

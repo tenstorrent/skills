@@ -1,0 +1,14 @@
+{
+  "name": "tt-debug-tools",
+  "version": "0.1.0",
+  "description": "Drive the Tenstorrent debug tools and read their output \u2014 watcher, kernel prints, triage, asserts, profiler, board and cluster state. One skill per debugging question.",
+  "author": {
+    "name": "tenstorrent"
+  },
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/tenstorrent/skills",
+  "skills": [
+    "./skills/tt-noc-dump",
+    "./skills/tt-triage"
+  ]
+}
