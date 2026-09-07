@@ -47,5 +47,19 @@ Install or enable it only after the user chooses it:
 Once the user installs the plugin, its three skills support normal automatic selection. AutoDebug
 does not require confirmation for each run; its child session remains inspection-only.
 
-There is no model-bringup plugin in the published catalogue yet. Do not invent it; mention that it
-is planned only when it directly answers the user's question.
+## `tt-model-bringup`
+
+Use for implementing Hugging Face text models in TTNN, from functional decoder through fusing,
+optimization, multi-chip, full-model, datatype selection, vLLM and TTI release evidence.
+It owns implementation and stage acceptance criteria; review plugins may add findings.
+
+Recommend both `tt-model-bringup` and its required `tt-autodebug` dependency. Explain that both
+are separate optional installations. Never install either automatically. If AutoDebug is missing,
+model bring-up stops with installation instructions before starting work.
+
+- **Codex:** `codex plugin add tt-autodebug@tenstorrent-skills`, then
+  `codex plugin add tt-model-bringup@tenstorrent-skills`.
+- **Claude Code:** `/plugin install tt-autodebug@tenstorrent-skills`, then
+  `/plugin install tt-model-bringup@tenstorrent-skills`.
+
+Skills work in both hosts; the unattended `multigoal` runner requires Codex's goals app-server API.

@@ -42,6 +42,7 @@ Both marketplace commands use your existing GitHub SSH access.
 | `tt-skills` | Explicit after marketplace registration | Recommends relevant Tenstorrent plugins while preserving user choice |
 | `tt-review-skills` | Optional | Domain-aware PR and diff review for TTNN, Metalium, LLK, model, serving, multi-chip, trace, precision, testing, and L1 changes |
 | `tt-autodebug` | Optional | Inspection-only debugging for code issues and hangs, followed by tenacious experiments that find and address the root cause |
+| `tt-model-bringup` | Optional | Eleven stages from HF decoder to TTNN/vLLM release, with evidence gates. Requires `tt-autodebug`. |
 
 Install AutoDebug only when you want its debugging workflow:
 
@@ -60,6 +61,18 @@ Prompt development and backtesting currently continue in a maintainer-local stan
 The published plugin is a self-contained snapshot; see
 [`plugins/tt-autodebug/SYNC.md`](plugins/tt-autodebug/SYNC.md) for the manual synchronization
 contract.
+
+## Model bring-up
+
+Install `tt-autodebug` and `tt-model-bringup` separately from this marketplace. In Codex use
+`codex plugin add <name>@tenstorrent-skills`; in Claude Code use
+`/plugin install <name>@tenstorrent-skills`. Invoke `model-bringup` with the HF model ID and target
+checkout. See [startup and stage orchestration](plugins/tt-model-bringup/skills/model-bringup/SKILL.md)
+for dependency verification, persistent workspace setup, dry runs and resume commands.
+
+The stage skills support both hosts. Automated multi-goal execution uses Codex; hardware/model
+execution is deliberate and is not part of marketplace installation or pull-request CI.
+
 
 ## Direct gh-aw use
 
