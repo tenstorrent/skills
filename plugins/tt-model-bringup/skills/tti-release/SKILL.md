@@ -338,6 +338,17 @@ Do not use `$autofix` for pure infrastructure failures such as missing Docker, H
 
 ## Release Readiness Failures
 
+Reconcile the verdict with raw workflow/server logs and expected result rows before
+accepting report labels or a zero wrapper exit code. Engine death, an aborted harness,
+uncompleted required requests, or missing mandatory results are execution/evidence
+failures, not low accuracy. An `EXPERIMENTAL` label or a quality waiver cannot make
+those failures pass. Apply row-specific quality waivers only to valid completed
+measurements; evidence that a harness target itself is invalid must identify that
+exact target and must not hide unrelated operational failures. Report incomplete
+required execution as `release-workflow-fail`, even if report generation succeeded.
+Reuse valid raw artifacts for this reconciliation; rerun only missing, invalid, or
+affected data collection under the aggregation policy above.
+
 Parse the final release report and report data. Classify every failed accuracy, benchmark target, API conformance, and missing/incomparable metric row as one of:
 
 - `fixed`: the issue was fixed and the release report was regenerated;

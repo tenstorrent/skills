@@ -62,6 +62,21 @@ requirements. AutoDebug/AutoTriage/AutoFix come from the explicit dependency. In
 review must return `clean-pass`; findings require repairs and rereview. Preserve original goal
 criteria, local commit boundaries and the prohibition on pushing stage changes automatically.
 
+### Validate changed paths
+
+When a stage adds or changes chunking, padding, sharding, dispatch, or memory ownership,
+select a small set of checks from the actual branch conditions and allocation rules.
+Cover each affected path, the valid lengths immediately around its boundaries, and
+awkward tails; one large passing input does not cover a different branch or remainder.
+Check sibling consumers of the same rule (for example, attention and MLP). Use cheap
+host-side shape/allocation arithmetic where useful, then exercise the affected device path.
+
+Record the changed path, selected cases, and results in the existing stage evidence.
+A previous stage's pass does not validate a path introduced or changed later. Rerun the
+affected cases on the final implementation; reuse unaffected evidence. Start diagnosis
+with an op or representative layer, but preserve the stage's required full-model and
+serving acceptance checks. Do not add a full boundary sweep or long soak by default.
+
 For an unattended Codex run, install [requirements.txt](../../requirements.txt) in the active
 Python environment, or provide `--codex-bin` for an existing Codex with goals/app-server support.
 The templates authorize skill-requested subagents. Inspect the full expanded goals and execution

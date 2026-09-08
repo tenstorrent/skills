@@ -106,6 +106,27 @@ The reduced target is only an inner-loop tool. It is not final serving evidence,
 
 Run checks from smallest to largest. If a vLLM pytest, prompt, request, or benchmark shape fails, rerun that failing item directly against a live server while debugging; do not rerun the whole suite after every edit. If a check suite is slow, run `--sampling-profile smoke` or a single targeted request first, then rerun the full profile once the issue is fixed.
 
+## Short Request-Lifecycle Check
+
+Extend the existing serving smoke run with a short sequence derived from the affected
+shape and memory paths. Reuse the live server: complete prefill and decode to warm
+traces and collectives, submit a previously unseen valid shape, then repeat known
+shapes. Include the boundary/tail cases selected for changed paths; a fresh-process
+single request cannot establish behavior after decode allocations or across requests.
+
+Record request completion and available device-memory/cache counters before and after
+the sequence. Distinguish bounded compilation/cache warmup from retained request-local
+allocations: repeats should stabilize, and per-shape growth needs an ownership and
+capacity explanation consistent with the advertised input range. If counters are not
+available, inspect allocation/cache ownership and record the limit of the evidence;
+successful requests alone do not prove stable memory use.
+
+Keep this within the existing smoke run, aiming for minutes of additional requests,
+not a separate all-layer startup or default soak. Expand only for unexplained growth,
+errors, or uncovered affected paths; use an isolated op/layer repro to investigate.
+A time budget ending before required checks complete is incomplete evidence, not a
+pass. Preserve final all-layer serving evidence and the existing acceptance gates.
+
 ## Plugin Registration
 
 Register the model with the TT vLLM plugin. vLLM discovers TT models from the hardcoded list in:
