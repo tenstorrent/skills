@@ -150,6 +150,13 @@ default. For any stage, review:
 - stale-artifact risk: paths in reports should exist and match the described
   run.
 
+For changed chunking, padding, sharding, dispatch, or memory ownership, compare the
+actual branch/allocation rules with the selected cases. Require coverage of affected
+paths, nearby valid boundary lengths, and awkward tails, including sibling consumers
+of a shared rule. Earlier evidence does not cover a later implementation change.
+Request only the missing or invalidated checks; do not demand a full sweep, a new
+profiler run, or a long soak when existing evidence establishes the required behavior.
+
 For generation or serving stages, also inspect:
 
 - qualitative outputs, autoregressive completions, or release/eval output text;
@@ -187,6 +194,12 @@ For release stages, also inspect:
 - mandatory text-LLM quality gates such as `meta_ifeval` and `meta_gpqa_cot`.
   Treat these as required work unless a current linked issue proves the correct
   canonical implementation fails the same eval in the same way.
+
+Check release verdicts against raw execution evidence and expected result rows.
+Engine death, aborted execution, uncompleted required requests, and missing mandatory
+results require more work even if a wrapper exits zero or a report says `PASS` or
+`EXPERIMENTAL`. A quality waiver cannot waive an execution failure. Reuse valid raw
+outputs for this check; request new runs only for missing, invalid, or affected evidence.
 
 For optimization stages, also inspect:
 

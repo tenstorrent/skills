@@ -239,7 +239,7 @@
       "destination": "skills/stage-review/SKILL.md",
       "blob": "7c89b9d281aa1a853a273d3ff4b1c16ad8ccac0d",
       "source_sha256": "b84c344e6a2c0130569dc7e4147ad748d44aa04afa11f181b0711d00afbe3466",
-      "packaged_sha256": "8f8bb2d2590d67c0a85e028f9d62579145c7413186aa860818be617ede0afb78"
+      "packaged_sha256": "50f12f82e8c2da211cd1f39c8d92fb6da87b8e20329ac4dd8ecc1e6e34e714c8"
     },
     {
       "source": ".agents/skills/stage-review/agents/openai.yaml",
@@ -288,7 +288,7 @@
       "destination": "skills/tti-release/SKILL.md",
       "blob": "af09c19651cadaceb231edab4de3c9707801bc75",
       "source_sha256": "bec4650d82fd95793652014d078125ee9370528c09a3f95cfb381f4ef1447fef",
-      "packaged_sha256": "b421cb921f2b3a7db4139dfd4cb381f8146916c16df25e7f642722804bd798e2"
+      "packaged_sha256": "f466cdafb6e8048e25238dbb31207fe964c665290cce4cb128805da68d88b790"
     },
     {
       "source": ".agents/skills/tti-release/agents/openai.yaml",
@@ -302,7 +302,7 @@
       "destination": "skills/vllm-integration/SKILL.md",
       "blob": "05d9e19f7cfbb596d209c504cc49e063b9361da1",
       "source_sha256": "a23a516ab0e8afc3a5dd6ddd72a42781997fb454872139e70605ecbd234e114c",
-      "packaged_sha256": "b15aae3b193d8174b051850b70390c7ffe25ce20eed24924f465ef86ba0533ab"
+      "packaged_sha256": "17674a1d2dac96df8733429fa6b4cddbafff197896174d5653eddeaa22fe035d"
     },
     {
       "source": ".agents/skills/vllm-integration/agents/openai.yaml",
