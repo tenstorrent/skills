@@ -227,19 +227,6 @@ one.
 | [`mattpocock/skills`](https://github.com/mattpocock/skills) | [@mattpocock](https://github.com/mattpocock) | **The shape of the review catalogue.** Bucketed `skills/<bucket>/<name>/`, progressive disclosure, trigger-style descriptions, `in-progress/` and `deprecated/`, invocation bifurcation, changesets, the install-block convention |
 | [`githubnext/gh-aw`](https://github.com/githubnext/gh-aw) | [@dsyme](https://github.com/dsyme), [@pelikhan](https://github.com/pelikhan), [@mnkiefer](https://github.com/mnkiefer) | The consumer. `skills:` frontmatter, `safe-outputs`, and the `mattpocock-skills-reviewer` triage pattern the reference workflow follows |
 
-## Provenance and drift
-
-AutoDebug prompt development and backtesting continue in a standalone repository. The published
-plugin is self-contained; see [`plugins/tt-autodebug/SYNC.md`](plugins/tt-autodebug/SYNC.md) for its
-synchronization process.
-
-Every skill records its upstreams in `metadata.upstream`; [`SOURCES.md`](SOURCES.md) is generated
-from that.
-
-Vendored copies rot as upstreams move. `tt-skills-upstream-audit` checks for that, and
-[`skills/CLAUDE.md`](skills/CLAUDE.md) carries the review-catalogue invariants for maintainers —
-including the **disclosure gate that applies to every re-vendor**. Those rules are deliberately
-scoped to `tt-review-skills`; they do not constrain unrelated plugins.
 
 ## Validate changes
 
