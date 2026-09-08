@@ -367,7 +367,7 @@ ttnn.synchronize_device(device)
 
 ### 3.1 Overview
 
-This section assumes that you are familiar with the contents and apis described in [Metal Trace](#metal-trace) and [Multiple Command Queues](#multiple-command-queues).
+This section assumes that you are familiar with the contents and apis described in [Metal Trace](#1-metal-trace) and [Multiple Command Queues](#2-multiple-command-queues).
 
 By combining these optimizations, we can achieve higher end-to-end performance where host is running well ahead of device and enqueuing for many subsequent iterations ahead, and device is continuously executing operations with little to no latency between them. This can be seen in the following figure where host has enqueued 10 iterations before device has finished an iteration, and there is little to no gap between the device operations and model execution iterations.
 

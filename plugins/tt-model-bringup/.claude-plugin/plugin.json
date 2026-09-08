@@ -1,7 +1,7 @@
 {
   "name": "tt-model-bringup",
   "displayName": "Tenstorrent Model Bring-up",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Bring Hugging Face text models to TTNN through eleven verified stages. Requires the separately installed tt-autodebug plugin.",
   "author": {
     "name": "Tenstorrent"

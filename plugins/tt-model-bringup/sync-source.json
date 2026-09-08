@@ -274,7 +274,7 @@
       "destination": "skills/tt-enable-tracing/advanced_perf_optimizations.md",
       "blob": "af91f047ec8e25674935451dc0cafc7d874aeb56",
       "source_sha256": "45c3ccebf9636cf19af8242d5af403ec1a3586cda1edaaa3d74c0d26bcd59a0f",
-      "packaged_sha256": "45c3ccebf9636cf19af8242d5af403ec1a3586cda1edaaa3d74c0d26bcd59a0f"
+      "packaged_sha256": "553f0c236d85da14c7a0ecf7bbff1839defea7917538db72d0a02443cd116282"
     },
     {
       "source": ".agents/skills/tt-enable-tracing/agents/openai.yaml",
