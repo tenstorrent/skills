@@ -1,6 +1,6 @@
 {
   "name": "tt-model-bringup",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Bring Hugging Face text models to TTNN through eleven verified stages. Requires the separately installed tt-autodebug plugin.",
   "author": {
     "name": "Tenstorrent"

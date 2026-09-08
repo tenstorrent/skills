@@ -98,6 +98,8 @@ import openai
 import requests
 from transformers import AutoTokenizer
 
+from readiness_check.mesh_device import MESH_SHAPES
+
 DEFAULT_PORT = 8000
 DEFAULT_BLOCK_SIZE = 64
 DEFAULT_MAX_NUM_SEQS = 32
@@ -156,12 +158,6 @@ _FATAL_LOG_PATTERNS = (
     "Failed core proc",
 )
 
-_MESH_SHAPES: dict[str, tuple[int, int]] = {
-    "N150": (1, 1),
-    "N300": (1, 2),
-    "T3K": (1, 8),
-    "TG": (8, 4),
-}
 
 
 def _find_plugin_tests_dir() -> Path:
@@ -236,7 +232,7 @@ def _launch_server(
     # Pass TT plugin config as a single JSON dict so JSON quoting can't be
     # mangled by intermediate shells. The dict already has
     # `sample_on_device_mode` enforced; callers extend via `tt_config`.
-    cmd += ["--plugin-config", json.dumps({"tt": tt_config})]
+    cmd += ["--additional-config", json.dumps({"tt": tt_config})]
     cmd += additional_args
 
     env = {
@@ -794,7 +790,7 @@ def _main() -> None:
         "--mesh-device",
         type=str,
         default=None,
-        choices=sorted(_MESH_SHAPES),
+        choices=sorted(MESH_SHAPES),
         help="Required when `serve` is in --stages; ignored otherwise.",
     )
     parser.add_argument(

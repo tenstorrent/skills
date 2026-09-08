@@ -46,3 +46,18 @@ PYTHONPATH=plugins/tt-model-bringup/runtime HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLIN
 
 These tests use synthetic generators and tokenizers; they do not download weights or open a device.
 Actual PCC, Tracy, vLLM/TTI and hardware validation remain separate deliberate work.
+
+## Serving compatibility correction (0.1.1)
+
+The serving CLI and TT configuration interface target `tenstorrent/vllm` commit
+`5ffebf4128f81ea5cf8413175eabde52cd8c8d75` (`dev` head checked on 2026-09-08).
+`vllm/engine/arg_utils.py` registers `--additional-config`; the TT plugin's
+`config.py::get_tt_config` reads its `tt` object. Use that interface rather than the
+obsolete `--plugin-config` flag. Serving and generator readiness now share mesh labels,
+including the QB2's `P300x2` (1 x 4 chips).
+
+Stages 9 and 10 require served qualitative artifacts (`--scope vllm`), so earlier
+full-model autoregressive output cannot satisfy these gates. The serving skill also
+requires verification of page-growth refresh and pending-token handling before async
+overlap; the pinned dependency does not provide the previously claimed guarantee.
+These changes do not include a vLLM scheduler patch or imply hardware validation.

@@ -14,7 +14,7 @@ else
   exit 3
 fi
 python "${TT_MODEL_BRINGUP_ROOT}/runtime/readiness_check/check_degenerate_output.py" \
-  "${scope_args[@]}" --missing-artifacts critical --scope all || exit $?
+  "${scope_args[@]}" --missing-artifacts critical --scope vllm || exit $?
 
 python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_context_contract.py" \
   --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}" \

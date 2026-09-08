@@ -14,6 +14,7 @@ from typing import Any
 MESH_SHAPES: dict[str, tuple[int, int]] = {
     "N150": (1, 1),
     "N300": (1, 2),
+    "P300x2": (1, 4),  # Blackhole QuietBox 2: two dual-chip P300 cards.
     "T3K": (1, 8),
     "TG": (8, 4),
 }

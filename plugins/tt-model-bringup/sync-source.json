@@ -78,7 +78,7 @@
       "destination": "prompts/model_bringup_multigoal/09-vllm.check.sh",
       "blob": "54873057b0cd77d369de89e8732a5f7bf6810027",
       "source_sha256": "e5860d4f3d9a3f5076062814db09b403ad7de9d0bef6d8aeec02325bccb626ba",
-      "packaged_sha256": "ab479df5fae1390e069f10f39e817c35527a1025aec262d4cdfca04f2ae9ec9b"
+      "packaged_sha256": "014708dffd476cd46967f2a62bf867a2d3bcf89090f56b20f9faefbd78767098"
     },
     {
       "source": ".agents/prompts/model_bringup_multigoal/09-vllm.txt",
@@ -92,7 +92,7 @@
       "destination": "prompts/model_bringup_multigoal/10-optimized-vllm.check.sh",
       "blob": "f591fa622e04bcb3258bf0cd5a1fdd47a1b2f983",
       "source_sha256": "a0412e5076c40f17077c5d172563c6e0e6c279da5234bcc21c356362713f9ae9",
-      "packaged_sha256": "7ae605210dafb43c2f6bc42ed3ffa13abc18f633f2ee6f4c9d247afec9b7fa23"
+      "packaged_sha256": "d387c2bea22e1ebdb2c709b178da52c996fe61f37bf563c1dcc824820389102f"
     },
     {
       "source": ".agents/prompts/model_bringup_multigoal/10-optimized-vllm.txt",
@@ -302,7 +302,7 @@
       "destination": "skills/vllm-integration/SKILL.md",
       "blob": "05d9e19f7cfbb596d209c504cc49e063b9361da1",
       "source_sha256": "a23a516ab0e8afc3a5dd6ddd72a42781997fb454872139e70605ecbd234e114c",
-      "packaged_sha256": "f2e8915a9d4411934f40b5ff27bcc9a8345405800e0cf2c536a65ebbf93d4fe5"
+      "packaged_sha256": "b15aae3b193d8174b051850b70390c7ffe25ce20eed24924f465ef86ba0533ab"
     },
     {
       "source": ".agents/skills/vllm-integration/agents/openai.yaml",
@@ -365,7 +365,7 @@
       "destination": "runtime/readiness_check/mesh_device.py",
       "blob": "cd7b66bc550f71518884f1c45193a06704980d60",
       "source_sha256": "13a3295cf60e9ff0a4e7b628eb1f231d13c299cfbba5b22d64dd1a2dd7c1f894",
-      "packaged_sha256": "13a3295cf60e9ff0a4e7b628eb1f231d13c299cfbba5b22d64dd1a2dd7c1f894"
+      "packaged_sha256": "71ce700470d89a8d4c5c8ddefbe653b1b008307f135354ca52f1a6bef591ebb8"
     },
     {
       "source": "models/common/readiness_check/run_autoregressive.py",
@@ -393,7 +393,7 @@
       "destination": "runtime/readiness_check/run_vllm_server.py",
       "blob": "854a62c6b4caedd64708da951c89c51af96d10d2",
       "source_sha256": "051d45493d4a822da38395f506188f08d46cba981ef1e1e9d7a0a74efd7c291c",
-      "packaged_sha256": "43085cd53dd55491b362fd4ec18f1567d50d506fa861d04d359f5a8238c81b40"
+      "packaged_sha256": "bb9602ff2ec7329b486bc344653ad9e3794b93eb81bd393828ce225b19924818"
     },
     {
       "source": "models/common/readiness_check/schema.py",

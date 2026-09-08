@@ -60,17 +60,30 @@ Not every cache must be vLLM-owned. vLLM owns the attention KV cache, but recurr
 Make prompt lengths, page tables, decode positions, batch dimensions, trace-side state, and on-device sampling explicit. The serving decode pass must drive the generator's traced decode path, not an eager-only fallback. When adding or debugging trace capture/replay, trace-safe inputs, or replay correctness for this adapter, use `$tt-enable-tracing`. The adapter should not duplicate model logic that already lives in `tt/model.py` or `tt/generator.py`.
 
 For decode performance, implement the vLLM async split before advertising it: `decode_forward(..., read_from_device=False)` should return device tensors, `read_decode_output(..., async_read=True)` should perform the minimal deferred read, and `process_decode_output_host(...)` should do host formatting. Only set `supports_async_decode=True` after this path passes the vLLM plugin's expectations with decode trace enabled and stale-token/current-position tests passing.
-When
-1. `supports_async_decode=True`
-2. sampling on device
-2. tracing is enabled
-3. reset_batch=False
-vLLM may build and submit decode step N+1 before sampled token N has been applied to host scheduler state, so the inputs may be stale or wrong.
-This is OK because vLLM expects the model to not read the inputs, and instead have the previous step's sampling output preserved and used as input. Page-table tensor is guaranteed to be unchanged.
-Make sure to not read from host in such case, and instead use the inputs already on device.
-To allow this, always update the device copy of inputs, such as token/current-position/RoPE-position-state when sampling on device and do it exactly once per emitted token.
-Make sure to account for different traces within a model.
-To validate, run a focus overlap test under `--async-scheduling` and `sample_on_device_mode=all` checking tha the output passes the degenerate-output check, with no doubled subwords or repeated control tokens.
+When async decode, on-device sampling and tracing are enabled, vLLM may submit step
+N+1 before sampled token N reaches host scheduler state. Reuse the device token and
+position state for steady decode; advance it exactly once per emitted token. Account
+for transitions between the model's traces.
+
+`reset_batch=False` does **not** prove the page table is unchanged. In the compatibility
+source [tenstorrent/vllm at 5ffebf4128f81ea5cf8413175eabde52cd8c8d75](https://github.com/tenstorrent/vllm/blob/5ffebf4128f81ea5cf8413175eabde52cd8c8d75/plugins/vllm-tt-plugin/src/vllm_tt_plugin/model_runner.py#L683),
+`_update_states` appends newly allocated blocks without marking the decode layout changed.
+The [steady-decode check](https://github.com/tenstorrent/vllm/blob/5ffebf4128f81ea5cf8413175eabde52cd8c8d75/plugins/vllm-tt-plugin/src/vllm_tt_plugin/async_decode.py#L249)
+does not reject this page-growth case. This was also the `dev` head checked on 2026-09-08;
+do not assume an upstream repair exists.
+
+Before enabling overlap, verify that the selected vLLM revision invalidates or refreshes
+device page tables when active requests gain blocks. A reset that reloads host tokens or
+positions must first drain pending decode results. A page-only refresh is acceptable only
+with evidence that it preserves token and position state. Empty new-block lists must not
+force a refresh on every token. If the dependency lacks this behavior, fix and verify the
+dependency or keep overlap disabled; do not report the async path as complete.
+
+Validate automatic allocator-driven page growth across multiple page boundaries, with
+several distinct concurrent requests and a trustworthy non-overlapped control. Check
+request reordering, pending-token handling and unchanged-table steady decode. A test that
+manually forces `reset_batch=True`, changes only an unused page, or checks only for
+degenerate text does not establish page-table correctness.
 
 Leave prefix caching `False` unless it is implemented and tested.
 
@@ -78,6 +91,12 @@ Leave prefix caching `False` unless it is implemented and tested.
 If the vLLM plugin or harness is being changed, prefer the same safety rule there: overlap should default to false unless the model declares this proof-backed capability. Leaving overlap disabled may cost a few tokens/sec/user; letting it default on can silently corrupt generation.
 
 The traced serving decode path reuses the full-model generator's canonical split-sampling path and replays via `ttnn.execute_trace(..., blocking=False)`. For `sample_on_device_mode=all`, serving has no new sampling strategy, host greedy/top-1 argmax, full-logits readback, generic top-k fallback for greedy, or Python readback/writeback token-feedback loop. If the full-model generator lacks split sampling, stop and fix `$full-model`; do not complete vLLM by patching sampling in the adapter. Do not copy a full page table every token when it is unchanged. Reduce token/current-position/page-table refresh to actual scheduler state changes, then prove both changed and unchanged cases with stale-input tests.
+
+The packaged serving runner uses `--additional-config` with a `{"tt": ...}` JSON
+object, matching the compatibility commit above. It accepts `P300x2` for a Blackhole
+QuietBox 2 (1 x 4 chips). Do not patch vLLM to accept the obsolete `--plugin-config`
+flag or wrap the runner to modify its mesh choices. When changing the vLLM revision,
+check its argument parser and TT config reader before serving.
 
 ## Minimum-Surface Bring-Up Loop
 
@@ -105,7 +124,7 @@ Use the shared runner:
 python -m readiness_check.run_vllm_server \
   --model-dir models/autoports/<model_name> \
   --hf-model <hf-model-id-or-local-path> \
-  --mesh-device <N150|N300|T3K|TG> \
+  --mesh-device <N150|N300|P300x2|T3K|TG> \
   --max-num-seqs <int> \
   --max-model-len <int> \
   --sampling-profile <full|smoke> \
