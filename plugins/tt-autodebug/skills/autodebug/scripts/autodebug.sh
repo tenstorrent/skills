@@ -30,9 +30,10 @@ Options:
   --help                  Show this help.
 
 Environment:
-  AUTODEBUG_ALLOW_UNSANDBOXED=1
-    Permit unsandboxed Codex only after a recognized sandbox startup failure.
-    Set only with user/operator approval for this environment. Default: 0.
+  AUTODEBUG_SKIP_CHILD_SANDBOX=1
+    Explicitly skip the additional Codex child sandbox and its preflight.
+    The calling agent must assess the failure and existing authorization first.
+    Any inherited parent restrictions still apply. Default: 0.
 
 Examples:
   autodebug.sh --focus models/demos/foo -- "decode diverges after token 128"

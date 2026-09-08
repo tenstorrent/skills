@@ -38,14 +38,20 @@ implementation, continue with `$autofix`; otherwise report the diagnosis.
 The launcher runs a no-model sandbox preflight before starting Codex. A successful check keeps
 `workspace-write`. A failed check stops before a model starts.
 
-On a machine where the user/operator has authorized unsandboxed work, they can set
-`AUTODEBUG_ALLOW_UNSANDBOXED=1` in the launch environment. After a recognized Linux sandbox startup
-failure, the launcher then warns and uses `danger-full-access` with no approval prompts. This
-removes OS sandbox protection, including protection for mounted/shared data. It does not remove
-fresh-process isolation or the inspection-only instructions. Other errors and timeouts still stop.
+If preflight or the child fails, inspect its diagnostics in context. The launcher does not classify
+error strings or automatically retry without a sandbox. Fix unrelated launch, configuration, or
+application errors rather than assuming sandboxing caused them.
 
-Do not set this variable yourself to get past a failure without user/operator authorization.
-Docker or Slurm membership alone is not authorization. Claude's permission mode is unchanged.
+When the failure warrants skipping the additional Codex child sandbox and existing user authorization
+covers that execution, the calling agent may explicitly retry with `AUTODEBUG_SKIP_CHILD_SANDBOX=1`.
+Do not ask again when that authorization is already clear; if it is missing, obtain it before retrying.
+Docker or Slurm membership alone does not establish authorization.
+
+The explicit skip bypasses preflight and selects `danger-full-access` with no approval prompts. It
+adds no child sandbox: any restrictions inherited from the parent process still apply, but a parent
+sandbox is not guaranteed to exist. Fresh-process investigation isolation, inspection-only instructions,
+and model configuration are preserved. The setting applies only to Codex; Claude's permission mode
+is unchanged.
 
 ## Invariants
 
