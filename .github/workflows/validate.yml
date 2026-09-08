@@ -8,6 +8,12 @@ on:
 permissions:
   contents: read
 
+# Cancel superseded runs when a PR branch is force-pushed or updated; never
+# cancel in-flight runs on main.
+concurrency:
+  group: validate-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   validate:
     runs-on: ubuntu-latest

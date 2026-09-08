@@ -1,0 +1,48 @@
+name: Lint
+
+# Static checks that complement validate.yml's pytest suite:
+#   - actionlint catches workflow-file errors (bad expressions, shell bugs in
+#     run blocks) before they break CI itself.
+#   - shellcheck covers every tracked shell script, such as the AutoDebug
+#     launcher, which the pytest suite exercises functionally but never lints.
+#   - lychee (offline mode) verifies relative links and heading anchors across
+#     all Markdown. Skills are pinned by name, not path, and are expected to
+#     move between buckets, which silently breaks relative links. Offline mode
+#     keeps the check deterministic: external URLs are not fetched, so private
+#     repositories and network flakiness cannot fail a PR.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lint-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Lint GitHub Actions workflows
+        run: |
+          curl -sSfL -o actionlint.tar.gz \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  actionlint.tar.gz" | sha256sum -c -
+          tar xzf actionlint.tar.gz actionlint
+          ./actionlint -color
+
+      - name: Shellcheck all tracked shell scripts
+        run: git ls-files '*.sh' | xargs --no-run-if-empty shellcheck
+
+      - name: Check relative links and anchors in Markdown
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+        with:
+          args: --offline --include-fragments --no-progress "**/*.md"
+          fail: true
