@@ -139,9 +139,9 @@ rules, and the do-not-flag guards that every other skill assumes and does not re
 |---|---|
 | `tt-skills-upstream-audit` | Drift between vendored skills and their upstream sources *(user-invoked)* |
 
-## Credit
+## Attributions
 
-**This repo is an aggregation. Almost none of the knowledge in it is ours.** The skills here are
+**This repo is an aggregation. ** The skills here are
 vendored, reshaped and re-framed from work other people did — often work that took years of
 debugging to learn. The structure is borrowed too.
 
@@ -170,16 +170,6 @@ one.
 |---|---|---|
 | [`mattpocock/skills`](https://github.com/mattpocock/skills) | [@mattpocock](https://github.com/mattpocock) | **The shape of the review catalogue.** Bucketed `skills/<bucket>/<name>/`, progressive disclosure, trigger-style descriptions, `in-progress/` and `deprecated/`, invocation bifurcation, changesets, the install-block convention |
 | [`githubnext/gh-aw`](https://github.com/githubnext/gh-aw) | [@dsyme](https://github.com/dsyme), [@pelikhan](https://github.com/pelikhan), [@mnkiefer](https://github.com/mnkiefer) | The consumer. `skills:` frontmatter, `safe-outputs`, and the `mattpocock-skills-reviewer` triage pattern the reference workflow follows |
-
-### Consulted, little or nothing taken
-
-| Source | Primary author | Outcome |
-|---|---|---|
-| [`tenstorrent/tt-ai-workflow`](https://github.com/tenstorrent/tt-ai-workflow) — `examples/kernel_gen` | [@rlesliehurdTT](https://github.com/rlesliehurdTT) | Reviewed in full. Its special-values documentation pointed us at the public tt-metal tech report, which we used instead. The generation pipeline, templates, and API reference are about *producing* kernels rather than reviewing them, so they were left alone |
-
-**If your work is here and the attribution is wrong, thin, or you would rather it were not — open an
-issue and we will fix or remove it.** Everything vendored is Apache-2.0, but licence compliance and
-proper credit are different things, and we care about the second one.
 
 ## Provenance and drift
 
