@@ -90,23 +90,21 @@ class SandboxTests(unittest.TestCase):
     def session(self):
         return json.loads((self.workspace / "session.json").read_text())
 
-    def test_success_keeps_sandbox_even_when_fallback_authorized(self):
-        for opt_in in ("0", "1"):
-            with self.subTest(opt_in=opt_in):
-                result = self.launch(AUTODEBUG_ALLOW_UNSANDBOXED=opt_in)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                session = self.session()
-                self.assertIn("workspace-write", session["args"])
-                self.assertNotIn("danger-full-access", session["args"])
-                self.assertEqual(session["cwd"], str(self.workspace))
-                self.assertEqual(session["home"], self.env["CODEX_HOME"])
-                self.assertIn("test-model", session["args"])
-                self.assertIn("model_reasoning_effort=high", session["args"])
-                self.assertIn("Investigate the sample failure", session["prompt"])
-                self.assertNotIn("WARNING", result.stderr)
-                probe = json.loads((self.workspace / "probe.json").read_text())
-                self.assertEqual(probe["cwd"], session["cwd"])
-                self.assertEqual(probe["home"], session["home"])
+    def test_success_keeps_sandbox_by_default(self):
+        result = self.launch()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        session = self.session()
+        self.assertIn("workspace-write", session["args"])
+        self.assertNotIn("danger-full-access", session["args"])
+        self.assertEqual(session["cwd"], str(self.workspace))
+        self.assertEqual(session["home"], self.env["CODEX_HOME"])
+        self.assertIn("test-model", session["args"])
+        self.assertIn("model_reasoning_effort=high", session["args"])
+        self.assertIn("Investigate the sample failure", session["prompt"])
+        self.assertNotIn("WARNING", result.stderr)
+        probe = json.loads((self.workspace / "probe.json").read_text())
+        self.assertEqual(probe["cwd"], session["cwd"])
+        self.assertEqual(probe["home"], session["home"])
 
     def test_known_failure_stops_by_default(self):
         result = self.launch(
@@ -119,27 +117,30 @@ class SandboxTests(unittest.TestCase):
         self.assertIn("no model was started", result.stderr)
         self.assertFalse((self.workspace / "session.json").exists())
 
-    def test_authorized_known_failures_warn_and_replace_approval_flags(self):
+    def test_explicit_skip_bypasses_probe_and_preserves_investigation(self):
+        result = self.launch(AUTODEBUG_SKIP_CHILD_SANDBOX="1", PROBE_STATUS="1", PROBE_ERROR="arbitrary error")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.workspace / "probe.json").exists())
+        session = self.session()
+        args = session["args"]
+        self.assertEqual(args[:3], ["--ask-for-approval", "never", "exec"])
+        self.assertIn("danger-full-access", args)
+        self.assertNotIn("--approve-for-me", args)
+        self.assertNotIn("workspace-write", args)
+        self.assertIn("test-model", args)
+        self.assertIn("model_reasoning_effort=high", args)
+        self.assertEqual(session["cwd"], str(self.workspace))
+        self.assertEqual(session["home"], self.env["CODEX_HOME"])
+        self.assertIn("inspection-only", session["prompt"])
+        self.assertIn("inherited parent restrictions", result.stderr)
+
+    def test_all_preflight_errors_stop_without_retry(self):
         for error in (
             "bwrap: Failed to make / slave: Permission denied",
             "bwrap: setting up uid map: Permission denied",
             "bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted",
             "bwrap: Creating new namespace failed: Operation not permitted",
-        ):
-            with self.subTest(error=error):
-                result = self.launch(AUTODEBUG_ALLOW_UNSANDBOXED="1", PROBE_STATUS="1", PROBE_ERROR=error)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                args = self.session()["args"]
-                self.assertEqual(args[:3], ["--ask-for-approval", "never", "exec"])
-                self.assertIn("danger-full-access", args)
-                self.assertNotIn("--approve-for-me", args)
-                self.assertNotIn("workspace-write", args)
-                self.assertIn(error, result.stderr)
-                self.assertIn("WARNING", result.stderr)
-                self.assertIn("mounted/shared data", result.stderr)
-
-    def test_unrelated_errors_never_enable_fallback(self):
-        for error in (
+            "sandbox-exec: sandbox_apply: Operation not permitted",
             "invalid config",
             "No space left on device",
             "Permission denied",
@@ -147,15 +148,17 @@ class SandboxTests(unittest.TestCase):
             "bwrap: execvp /bin/true: Permission denied",
         ):
             with self.subTest(error=error):
-                result = self.launch(AUTODEBUG_ALLOW_UNSANDBOXED="1", PROBE_STATUS="1", PROBE_ERROR=error)
+                result = self.launch(PROBE_STATUS="7", PROBE_ERROR=error)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(error, result.stderr)
+                self.assertIn("exit 7", result.stderr)
+                self.assertIn("no model was started", result.stderr)
                 self.assertFalse((self.workspace / "session.json").exists())
 
     def test_invalid_opt_in_stops_before_probe(self):
         for value in ("yes", "true", "", "2"):
             with self.subTest(value=value):
-                result = self.launch(AUTODEBUG_ALLOW_UNSANDBOXED=value)
+                result = self.launch(AUTODEBUG_SKIP_CHILD_SANDBOX=value)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("must be 0 or 1", result.stderr)
                 self.assertFalse((self.workspace / "probe.json").exists())
@@ -170,27 +173,27 @@ class SandboxTests(unittest.TestCase):
             started.append(process)
             return process
 
-        with patch.dict(os.environ, {**self.env, "PROBE_SLEEP": "1", "AUTODEBUG_ALLOW_UNSANDBOXED": "1"}):
+        with patch.dict(os.environ, {**self.env, "PROBE_SLEEP": "1", "AUTODEBUG_SKIP_CHILD_SANDBOX": "0"}):
             with patch("subprocess.Popen", side_effect=start):
                 with self.assertRaisesRegex(SystemExit, "timed out"):
                     PREFLIGHT.select_sandbox(timeout=0.2)
                 self.assertIsNotNone(started[0].returncode)
 
     def test_missing_binary_never_enables_fallback(self):
-        with patch.dict(os.environ, AUTODEBUG_ALLOW_UNSANDBOXED="1"):
+        with patch.dict(os.environ, AUTODEBUG_SKIP_CHILD_SANDBOX="0"):
             with patch("subprocess.Popen", side_effect=FileNotFoundError("codex missing")):
                 with self.assertRaisesRegex(SystemExit, "cannot run sandbox preflight"):
                     PREFLIGHT.select_sandbox()
 
     def test_claude_does_not_run_codex_preflight(self):
-        result = self.launch(agent="claude", PROBE_STATUS="1", AUTODEBUG_ALLOW_UNSANDBOXED="invalid")
+        result = self.launch(agent="claude", PROBE_STATUS="1", AUTODEBUG_SKIP_CHILD_SANDBOX="invalid")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((self.workspace / "probe.json").exists())
         self.assertIn("--permission-mode", self.session()["args"])
         self.assertIn("auto", self.session()["args"])
 
     def test_child_failure_is_not_retried_unsandboxed(self):
-        result = self.launch(AUTODEBUG_ALLOW_UNSANDBOXED="1", SESSION_STATUS="7")
+        result = self.launch(SESSION_STATUS="7")
         self.assertEqual(result.returncode, 7)
         self.assertIn("workspace-write", self.session()["args"])
         self.assertNotIn("WARNING", result.stderr)

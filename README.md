@@ -52,7 +52,9 @@ codex plugin add tt-autodebug@tenstorrent-skills
 For Claude Code, run `/plugin install tt-autodebug@tenstorrent-skills`. Once installed, its
 `autodebug`, `autotriage`, and `autofix` skills can be selected automatically as the task
 requires. The AutoDebug skill launches a fresh inspection-only agent process to keep deep
-investigation out of the calling agent's context.
+investigation out of the calling agent's context. If its Codex child sandbox fails, the calling
+agent assesses the error and existing authorization before explicitly retrying with
+`AUTODEBUG_SKIP_CHILD_SANDBOX=1`; see the [sandbox guidance](plugins/tt-autodebug/skills/autodebug/SKILL.md#codex-sandbox-startup).
 
 Prompt development and backtesting currently continue in a maintainer-local standalone repository.
 The published plugin is a self-contained snapshot; see
