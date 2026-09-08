@@ -67,7 +67,7 @@ contract.
 
 ## Model bring-up
 
-Install `tt-autodebug` and `tt-model-bringup` separately from this marketplace. In Codex use
+Install both `tt-autodebug` and `tt-model-bringup` from this marketplace. In Codex use
 `codex plugin add <name>@tenstorrent-skills`; in Claude Code use
 `/plugin install <name>@tenstorrent-skills`. Invoke `model-bringup` with the HF model ID and target
 checkout. See [startup and stage orchestration](plugins/tt-model-bringup/skills/model-bringup/SKILL.md)
