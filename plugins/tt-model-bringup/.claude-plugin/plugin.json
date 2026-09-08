@@ -1,8 +1,8 @@
 {
-  "name": "tt-skills",
-  "displayName": "Tenstorrent Skills",
+  "name": "tt-model-bringup",
+  "displayName": "Tenstorrent Model Bring-up",
   "version": "0.1.2",
-  "description": "Finds relevant Tenstorrent plugins without installing or invoking them automatically.",
+  "description": "Bring Hugging Face text models to TTNN through eleven verified stages. Requires the separately installed tt-autodebug plugin.",
   "author": {
     "name": "Tenstorrent"
   },
@@ -11,9 +11,8 @@
   "license": "Apache-2.0",
   "keywords": [
     "tenstorrent",
-    "tt-metal",
-    "skills",
-    "discovery"
+    "ttnn",
+    "model-bringup"
   ],
   "skills": "./skills/",
   "defaultEnabled": true

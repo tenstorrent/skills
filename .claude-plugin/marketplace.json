@@ -19,6 +19,11 @@
       "name": "tt-autodebug",
       "source": "./plugins/tt-autodebug",
       "description": "Adds skills that debug code issues (AutoDebug) and hangs (AutoTriage) by inspection without running the target code, plus a tenacious AutoFix workflow that tests hypotheses until it finds and addresses the root cause."
+    },
+    {
+      "name": "tt-model-bringup",
+      "source": "./plugins/tt-model-bringup",
+      "description": "Staged TTNN model bring-up. Requires separately installed tt-autodebug."
     }
   ]
 }

@@ -1,65 +1,119 @@
 # Tenstorrent skills
 
-The Tenstorrent plugin marketplace for agents working on tt-metal, TTNN, Metalium, models, and
-related projects. Register one repository, then choose only the focused plugins your task needs.
+Skills for agents working on tt-metal, TTNN, Metalium, models, and related projects.
+Tell your agent what you want to do; the finder helps it choose and install the right plugin.
+A plugin is a collection of related skills that you can enable or disable together.
 
-The small `tt-skills` plugin contains `tt-skills-finder`. It recommends relevant optional plugins
-but does not install, enable, or invoke them without the user's action or explicit permission.
+**[Getting started with Agentic Research skills](docs/agentic-research/getting-started.md)** —
+use AutoDebug, AutoFix, and model bring-up.
 
-## Install the finder
+## Get started
 
-Codex CLI:
+Ask your Codex or Claude Code agent:
+
+```text
+Read https://github.com/tenstorrent/skills and set up the marketplace and
+its tt-skills finder plugin for this agent.
+```
+
+Once the finder is active, **just ask for the skill you want to use**:
+
+```text
+Use AutoDebug to fix <problem>.
+```
+
+This is the normal way to use this repository. If the required plugin is missing, the finder
+recommends it and asks for your approval. Approve the installation and your agent follows the
+host's installation flow, then uses the skills to do the work. Restart the session if prompted.
+For this example, it installs `tt-autodebug`, uses AutoDebug to investigate, and AutoFix to repair.
+
+You can also ask:
+
+```text
+Use tt-model-bringup on <HF model ID>.
+```
+
+Or describe the job, such as “Review this TTNN pull request,” and let the finder recommend a
+suitable plugin. You choose which plugins to install. Once installed, their skills can be selected
+automatically for matching tasks; you can also ask your agent to make them explicit-only.
+
+## Plugin catalogue
+
+| Plugin | Purpose |
+|---|---|
+| `tt-skills` | The finder: recommends relevant plugins and helps you install them with your approval |
+| `tt-review-skills` | PR and diff review for TTNN, Metalium, LLK, models, serving, multi-chip, trace, precision, testing, and L1 changes |
+| `tt-autodebug` | AutoDebug and AutoTriage investigate code issues and hangs; AutoFix tests hypotheses and repairs the cause |
+| `tt-model-bringup` | Eleven stages from HF decoder to TTNN/vLLM release. Requires `tt-autodebug`. |
+
+AutoDebug investigates in a fresh agent process and writes `AUTODEBUG.md`. AutoFix handles source
+changes and validation. For examples and expected outputs, see the
+[Agentic Research guide](docs/agentic-research/getting-started.md).
+
+If AutoDebug’s Codex child sandbox fails, the calling agent assesses the error and existing
+authorization before explicitly retrying with `AUTODEBUG_SKIP_CHILD_SANDBOX=1`; see the
+[sandbox guidance](plugins/tt-autodebug/skills/autodebug/SKILL.md#codex-sandbox-startup).
+
+## Model bring-up
+
+Ask your agent to use `tt-model-bringup` with the HF model ID in your target checkout. The finder
+recommends both `tt-model-bringup` and its `tt-autodebug` dependency if needed, and asks for approval
+to install them.
+
+The stage skills support Codex and Claude Code; automated multi-goal execution uses Codex.
+See the [Agentic Research guide](docs/agentic-research/getting-started.md#model-bring-up) for how to
+run a bring-up, and [startup and stage orchestration](plugins/tt-model-bringup/skills/model-bringup/SKILL.md)
+for detailed setup, dry-run, and resume instructions.
+
+## Alternative manual skill installation
+
+If you prefer to install plugins yourself, use the commands below. The repository has internal
+visibility; these commands use your GitHub SSH access.
+
+### Codex
+
+In a terminal, register the marketplace and install the finder:
 
 ```bash
 codex plugin marketplace add git@github.com:tenstorrent/skills.git
 codex plugin add tt-skills@tenstorrent-skills
 ```
 
-The first command registers the marketplace. The second command installs only the finder. Other
-plugins remain available for the user to select individually in the **Tenstorrent Skills** section
-of the Plugins Directory.
+Choose any optional plugins you want:
 
-Claude Code:
+```bash
+codex plugin add tt-autodebug@tenstorrent-skills
+codex plugin add tt-review-skills@tenstorrent-skills
+# Model bring-up also requires tt-autodebug:
+codex plugin add tt-model-bringup@tenstorrent-skills
+```
+
+You can also select plugins under **Tenstorrent Skills** in the Plugins Directory.
+
+### Claude Code
+
+Inside the session, register the marketplace and install the finder:
 
 ```text
 /plugin marketplace add git@github.com:tenstorrent/skills.git
 /plugin install tt-skills@tenstorrent-skills
 ```
 
-Adding the Claude marketplace installs nothing by itself. The second command installs only the
-finder; it can then recommend an optional plugin such as `tt-review-skills`.
+Choose any optional plugins you want:
 
-Both marketplace commands use your existing GitHub SSH access.
-
-> [!IMPORTANT]
-> **Internal note:** This repository is currently private. When it is made public, change both
-> marketplace-add commands to the simpler `tenstorrent/skills` form.
-
-## Plugin catalogue
-
-| Plugin | Installation | Purpose |
-|---|---|---|
-| `tt-skills` | Explicit after marketplace registration | Recommends relevant Tenstorrent plugins while preserving user choice |
-| `tt-review-skills` | Optional | Domain-aware PR and diff review for TTNN, Metalium, LLK, model, serving, multi-chip, trace, precision, testing, and L1 changes |
-| `tt-autodebug` | Optional | Inspection-only debugging for code issues and hangs, followed by tenacious experiments that find and address the root cause |
-
-Install AutoDebug only when you want its debugging workflow:
-
-```bash
-codex plugin add tt-autodebug@tenstorrent-skills
+```text
+/plugin install tt-autodebug@tenstorrent-skills
+/plugin install tt-review-skills@tenstorrent-skills
 ```
 
-For Claude Code, run `/plugin install tt-autodebug@tenstorrent-skills`. Once installed, its
-`autodebug`, `autotriage`, and `autofix` skills can be selected automatically as the task
-requires. The AutoDebug skill launches a fresh inspection-only agent process to keep deep
-investigation out of the calling agent's context. If its Codex child sandbox fails, the calling
-agent assesses the error and existing authorization before explicitly retrying with
-`AUTODEBUG_SKIP_CHILD_SANDBOX=1`; see the [sandbox guidance](plugins/tt-autodebug/skills/autodebug/SKILL.md#codex-sandbox-startup).
+For model bring-up, install `tt-autodebug` above and then:
 
-Prompt development and backtesting currently continue in a maintainer-local standalone repository.
-The published plugin is a self-contained snapshot; see
-[`plugins/tt-autodebug/SYNC.md`](plugins/tt-autodebug/SYNC.md) for the manual synchronization
-contract.
+```text
+/plugin install tt-model-bringup@tenstorrent-skills
+```
+
+Adding the marketplace does not bulk-install the optional plugins. Codex marks the finder as
+installed by default; Claude requires the explicit finder installation shown above.
 
 ## Direct gh-aw use
 
@@ -173,15 +227,6 @@ one.
 | [`mattpocock/skills`](https://github.com/mattpocock/skills) | [@mattpocock](https://github.com/mattpocock) | **The shape of the review catalogue.** Bucketed `skills/<bucket>/<name>/`, progressive disclosure, trigger-style descriptions, `in-progress/` and `deprecated/`, invocation bifurcation, changesets, the install-block convention |
 | [`githubnext/gh-aw`](https://github.com/githubnext/gh-aw) | [@dsyme](https://github.com/dsyme), [@pelikhan](https://github.com/pelikhan), [@mnkiefer](https://github.com/mnkiefer) | The consumer. `skills:` frontmatter, `safe-outputs`, and the `mattpocock-skills-reviewer` triage pattern the reference workflow follows |
 
-## Provenance and drift
-
-Every skill records its upstreams in `metadata.upstream`; [`SOURCES.md`](SOURCES.md) is generated
-from that.
-
-Vendored copies rot as upstreams move. `tt-skills-upstream-audit` checks for that, and
-[`skills/CLAUDE.md`](skills/CLAUDE.md) carries the review-catalogue invariants for maintainers —
-including the **disclosure gate that applies to every re-vendor**. Those rules are deliberately
-scoped to `tt-review-skills`; they do not constrain unrelated plugins.
 
 ## Validate changes
 

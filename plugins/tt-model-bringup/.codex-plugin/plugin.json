@@ -1,0 +1,33 @@
+{
+  "name": "tt-model-bringup",
+  "version": "0.1.2",
+  "description": "Bring Hugging Face text models to TTNN through eleven verified stages. Requires the separately installed tt-autodebug plugin.",
+  "author": {
+    "name": "Tenstorrent"
+  },
+  "homepage": "https://github.com/tenstorrent/skills",
+  "repository": "https://github.com/tenstorrent/skills",
+  "license": "Apache-2.0",
+  "keywords": [
+    "tenstorrent",
+    "ttnn",
+    "model-bringup"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Tenstorrent Model Bring-up",
+    "shortDescription": "Implement and validate HF models on TTNN",
+    "longDescription": "Bring Hugging Face text models to TTNN through eleven verified stages. Requires the separately installed tt-autodebug plugin.",
+    "developerName": "Tenstorrent",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Staged model implementation",
+      "Evidence gates",
+      "Persistent goal orchestration"
+    ],
+    "websiteURL": "https://github.com/tenstorrent/skills",
+    "defaultPrompt": [
+      "Use model-bringup to bring this Hugging Face model to TTNN."
+    ]
+  }
+}
