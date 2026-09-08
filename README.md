@@ -3,6 +3,9 @@
 The Tenstorrent plugin marketplace for agents working on tt-metal, TTNN, Metalium, models, and
 related projects. Register one repository, then choose only the focused plugins your task needs.
 
+**[Getting started with Agentic Research skills](docs/agentic-research/getting-started.md)** —
+set up and use AutoDebug, AutoFix, and model bring-up.
+
 The small `tt-skills` plugin contains `tt-skills-finder`. It recommends relevant optional plugins
 but does not install, enable, or invoke them without the user's action or explicit permission.
 
