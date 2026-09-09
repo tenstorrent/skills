@@ -51,6 +51,18 @@
         "authentication": "ON_INSTALL"
       },
       "category": "Developer Tools"
+    },
+    {
+      "name": "tt-metal-macos",
+      "source": {
+        "source": "local",
+        "path": "./plugins/tt-metal-macos"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
     }
   ]
 }

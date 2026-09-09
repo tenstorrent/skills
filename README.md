@@ -42,6 +42,7 @@ automatically for matching tasks; you can also ask your agent to make them expli
 | Plugin | Purpose |
 |---|---|
 | `tt-skills` | The finder: recommends relevant plugins and helps you install them with your approval |
+| `tt-metal-macos` | Native Apple Silicon builds of Metalium, SFPI, and the public simulator |
 | `tt-review-skills` | PR and diff review for TTNN, Metalium, LLK, models, serving, multi-chip, trace, precision, testing, and L1 changes |
 | `tt-autodebug` | AutoDebug and AutoTriage investigate code issues and hangs; AutoFix tests hypotheses and repairs the cause |
 | `tt-model-bringup` | Eleven stages from HF decoder to TTNN/vLLM release, with targeted checks for changed paths and serving request lifecycles. Requires `tt-autodebug`. |
@@ -84,6 +85,7 @@ Choose any optional plugins you want:
 ```bash
 codex plugin add tt-autodebug@tenstorrent-skills
 codex plugin add tt-review-skills@tenstorrent-skills
+codex plugin add tt-metal-macos@tenstorrent-skills
 # Model bring-up also requires tt-autodebug:
 codex plugin add tt-model-bringup@tenstorrent-skills
 ```
@@ -104,6 +106,7 @@ Choose any optional plugins you want:
 ```text
 /plugin install tt-autodebug@tenstorrent-skills
 /plugin install tt-review-skills@tenstorrent-skills
+/plugin install tt-metal-macos@tenstorrent-skills
 ```
 
 For model bring-up, install `tt-autodebug` above and then:

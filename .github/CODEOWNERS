@@ -21,3 +21,6 @@
 
 # Staged TTNN model bring-up
 /plugins/tt-model-bringup/ @yieldthought
+
+# Native Apple Silicon development
+/plugins/tt-metal-macos/ @blozano-tt
