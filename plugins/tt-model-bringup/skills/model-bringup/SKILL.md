@@ -124,3 +124,14 @@ No reference tensors or experiment outputs are bundled.
 
 Report stage status, commands, checked artifacts and remaining failures. Packaging tests and dry
 runs prove wiring only; they do not prove PCC, text quality, device safety or performance.
+
+## Off-boarding
+
+After every runner outcome, including failure or abandonment, the coordinating agent must
+complete [local telemetry and off-boarding](references/offboarding.md). Inspect the attempt's
+`run.json` and preserved evidence, ask for outdated APIs, papercuts, workarounds and suggested
+skill improvements, and save curated feedback with the packaged recorder. Record the exact
+tt-metal Git checkpoint separately from the model/weights revision; unknown revisions stay unknown.
+Off-boarding preserves original verdicts and artifacts and never automatically rewrites skills.
+If interrupted, leave feedback pending and complete it on return. This step requires no transport,
+new model goal or hardware allocation.
