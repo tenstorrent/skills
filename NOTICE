@@ -1,0 +1,187 @@
+# Tenstorrent skills — notices and attribution
+
+This repository includes original contributions and material adapted from the sources below.
+Original contributions are licensed under Apache-2.0; see LICENSE. Third-party material retains
+its upstream license and copyright notices. This NOTICE records attribution and provenance;
+it does not modify any license or grant rights missing from an upstream source.
+
+The per-skill table records contributors from the upstream path's commit history at the imported
+revision, most commits first. Copyright holders are recorded separately below. The README carries
+a shorter credit list, including sources consulted for structure and tooling.
+
+## Sources and licenses
+
+| Source | Upstream license | Material and attribution |
+|---|---|---|
+| `tenstorrent/tt-buddy` @ `ba9021417442d59756aa8cdf154a25648c9a0de5` | Apache-2.0 (`LICENSE` at that revision) | Reviewer contract, reviewer cast, CCL and matmul knowledge. Contributors: ppetrovicTT, viktorpusTT. |
+| `tenstorrent/tt_ops_code_gen` @ `e9c9417eee23` | NOASSERTION — no license file in the recorded tree | Static-analysis checklist, L1, memory, precision and testing guidance. Contributors: mstaletovicTT, dstoiljkovicTT, djordjenTT, astancovTT, wransom-TT. See unresolved provenance below. |
+| `tenstorrent/tt-metal` @ `d58cb341c703`, `ce91f33c0c71`, `fb5c6cfa6f08` | Apache-2.0 (`LICENSE` at each revision) | Review material from `.agents`, `tt_metal/tt-llk/.claude`, `.github/bug_checker/rules`, and `tech_reports/Handling_Special_Value`. Per-path contributors are listed below; the LLK suite also credits ndivnicTT. |
+| `tenstorrent/tt-metal` @ `70a596f92229ada922fba743cd0cd9d2658a5c1c` | Apache-2.0 (`LICENSE` at that revision) | Model bring-up skills, prompts, orchestration and readiness support in `plugins/tt-model-bringup`. Contributors to the 65 imported source paths: odjuricicTT, tchedaTT, yieldthought. Exact source paths and package adaptations: `plugins/tt-model-bringup/sync-source.json` and `SYNC.md`. |
+| `mattpocock/skills` | MIT | Review catalogue structure, progressive disclosure, trigger descriptions, changesets and install-block conventions. Contributor: mattpocock. Copyright (c) 2026 Matt Pocock. Full license: `LICENSES/mattpocock-skills-MIT.txt`. |
+| `githubnext/gh-aw` | MIT | Workflow frontmatter, safe-output and reviewer triage patterns used by `.github/workflows/tt-pr-review.md`. Credited contributors: dsyme, pelikhan, mnkiefer. Copyright GitHub, Inc. Full license: `LICENSES/gh-aw-MIT.txt`. |
+| Maintainer-local Codex skill `tt-metal-pr-review` | NOASSERTION — original source unavailable | Review checklist and false-positive guards; credited to yieldthought. The linkifier was reimplemented, as described below. |
+| Maintainer-local `autodebug` @ `4d15fd683d279a1503c8f3f8a0508b83ea7a8657` | NOASSERTION — upstream license not recorded | AutoDebug and AutoTriage prompts. Imported by yieldthought; import records: `plugins/tt-autodebug/sync-source.json` and `SYNC.md`. The plugin manifest declares Apache-2.0, but is not evidence of the local upstream's license. |
+
+The Apache-2.0 license texts were verified at the imported revisions. The two MIT licenses were
+verified at the following revisions (the original catalogue import did not pin those sources):
+
+- https://github.com/mattpocock/skills/blob/3cca18b368ae95cdbdebbff572ccafa662551015/LICENSE
+- https://github.com/githubnext/gh-aw/blob/099efdda60fe970829f53f29f726c35615cd55eb/LICENSE
+
+The local MIT license files preserve the full upstream copyright, permission and warranty notices.
+
+## Applicable upstream NOTICE: tt-metal
+
+The following notice is retained from tt-metal. Its notices for LLVM files and other dependencies
+do not apply to the skill, prompt and readiness files imported here and are not reproduced.
+
+tt-metal
+Copyright 2026 Tenstorrent USA, Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+## Unresolved provenance and distribution scope
+
+`NOASSERTION` means the upstream license has not been established; it does not mean Apache-2.0,
+MIT, public domain, or permission to redistribute. The `tt_ops_code_gen` recorded tree contains
+no LICENSE, LICENCE, COPYING or NOTICE file. The two maintainer-local sources have no upstream
+license text recorded here. Source owners must confirm the applicable terms and copyright notices;
+the repository's Apache-2.0 license cannot substitute for that confirmation.
+
+This repository has internal visibility. Earlier attribution text described it as public and
+claimed approval for public copying; that statement is not evidence of a license grant. Before
+distributing restricted upstream material to a broader audience, verify both licensing and
+disclosure authorization. See `skills/AGENTS.md` for the vendoring review rules.
+
+## Reimplemented, not vendored
+
+`skills/common/tt-review-core/scripts/linkify_review.py` is a **reimplementation** from the
+documented behaviour of the upstream Codex skill's script. The original lives on its author's
+machine and was not available to copy, so the behaviour was reconstructed from its specification
+(convert `path:line` and `path#Lline` to commit permalinks, normalise backtick-wrapped refs). It is
+not a copy and may differ in edge cases.
+
+## The bug_checker rules are different evidence — about frequency, not mechanism
+
+Most of this catalogue is expert-authored guidance. The `.github/bug_checker/rules` material is
+distilled from an audit of roughly 1,398 merged `fix`-labelled tt-metal PRs.
+
+**What that establishes is which failures actually occur, and how often.** "This shipped 74 times" is
+real evidence about *what to prioritise* — it is why op-level input validation earned a category of
+its own rather than a bullet.
+
+**What it does not establish is that any given rule's technical content is right.** Frequency data
+says a class of bug is common; it says nothing about whether the rule's description of the mechanism
+is accurate. Those are different claims, and volume of provenance does not transfer from the first
+to the second.
+
+**So there is no precedence rule.** An earlier version of this file said that where bug_checker and
+expert guidance disagree, bug_checker wins. That was wrong, and four defects entered this repo behind
+it — see the corrections below. On a technical conflict, neither source wins by provenance: **read
+the code the rule describes.** Where that is not possible, state the uncertainty and follow
+`tt-review-core`'s evidence and severity rules.
+
+## Corrections to upstream sources
+
+Vendoring is not endorsement, and the `bug_checker` rules were vendored before they had been
+reviewed against the code they describe. Four defects were carried in and have since been corrected
+here. Found by a GPT-5.6 analysis posted by [@bbradelTT](https://github.com/bbradelTT) on
+[tt-metal#54114](https://github.com/tenstorrent/tt-metal/pull/54114), and verified against the tree
+before acting.
+
+| Upstream claim | Correction |
+|---|---|
+| `is_sharded()` guards a `shard_spec().value()` dereference | It does not. `is_sharded()` is true for `ND_SHARDED`, whose `MemoryConfig` sets `shard_spec` to `nullopt` — the spec is in `nd_shard_spec()`. Guard on `has_value()` |
+| Math config writes need both math engines drained | Architecture- and field-specific. An FPU-only field needs only the FPU drained; requiring both flags correct code |
+| An `_init_` with a non-restoring `_uninit_` is a bug | A no-op teardown is correct where the state is transient and reprogrammed by the next init. In-tree implementations document this |
+| `apply_descriptor_runtime_args()` is a rebuild | It applies args from an existing descriptor; against a minimal CB-only descriptor it is a cheap cache-hit repair |
+
+Two further defects in those rules — a non-existent `cb.index` field and a deprecated `tt::stl::hash`
+namespace — did not reach this repo, because the code examples containing them were not vendored.
+
+**The drift audit cannot catch this class of error.** It compares *then* against *now*; it has no
+opinion on whether *then* was right. Only reading a rule against the code it describes does.
+
+## Adapted, not copied verbatim
+
+The review catalogue was reshaped for gh-aw consumption. The main structural changes:
+
+- **Posting removed.** The upstream Codex skill posted review comments through the GitHub API.
+  gh-aw agents run read-only and the workflow posts via `safe-outputs`, so all posting steps were
+  deleted rather than ported.
+- **Machine-specific content scrubbed** — absolute paths, an identity mapping, and harness-specific
+  instructions.
+- **Progressive disclosure enforced.** Monolithic upstream audits were split into a router plus
+  bounded reference files; the pytest suite enforces the bounds.
+- **Framing shifted from doing to reviewing.** Several upstreams instruct an agent performing
+  optimization work. Here they instruct an agent *reviewing someone else's* work, which changes what
+  counts as a finding.
+
+## Per-skill provenance
+
+Generated by `python3 skills/meta/tt-skills-upstream-audit/scripts/check_drift.py --notice`.
+The command emits only the table to stdout. Replace only this table after a re-vendor; preserve
+the surrounding notices. License values come from `metadata.upstream[].license` and must be
+verified against the upstream revision before being changed.
+
+| Skill | Upstream | License | Path | Pinned | Contributors (most commits first) |
+|---|---|---|---|---|---|
+| `tt-comment-hygiene-review` | `tenstorrent/tt-buddy` | Apache-2.0 | `skills/code-review/reviewers/fresh-eye.md` | `ba9021417442` | ppetrovicTT |
+| `tt-comment-hygiene-review` | `tenstorrent/tt-buddy` | Apache-2.0 | `skills/code-review/reviewers/documentation.md` | `ba9021417442` | ppetrovicTT |
+| `tt-perf-claim-review` | `tenstorrent/tt-metal` | Apache-2.0 | `.agents/skills/optimize/SKILL.md` | `d58cb341c703` | yieldthought |
+| `tt-perf-claim-review` | `tenstorrent/tt_ops_code_gen` | NOASSERTION | `skills/perf-measure/SKILL.md` | `e9c9417eee23` | dstoiljkovicTT, mstaletovicTT, djordjenTT |
+| `tt-review-core` | `tenstorrent/tt-buddy` | Apache-2.0 | `skills/code-review/shared.md` | `ba9021417442` | ppetrovicTT |
+| `tt-review-core` | `tenstorrent/tt-buddy` | Apache-2.0 | `skills/code-review/review-loop.md` | `ba9021417442` | ppetrovicTT |
+| `tt-review-core` | `tenstorrent/tt-metal` | Apache-2.0 | `.agents/skills/code_quality_review` | `d58cb341c703` | tchedaTT |
+| `tt-review-router` | `tenstorrent/tt-buddy` | Apache-2.0 | `skills/buddy/SKILL.md` | `ba9021417442` | ppetrovicTT |
+| `tt-review-router` | `tenstorrent/tt-metal` | Apache-2.0 | `tt_metal/tt-llk/.claude/skills/race-audit-all` | `ce91f33c0c71` | amahmudTT |
+| `tt-test-coverage-review` | `tenstorrent/tt-buddy` | Apache-2.0 | `skills/code-review/reviewers/qa.md` | `ba9021417442` | ppetrovicTT |
+| `tt-test-coverage-review` | `tenstorrent/tt_ops_code_gen` | NOASSERTION | `skills/golden-tests/SKILL.md` | `e9c9417eee23` | mstaletovicTT, djordjenTT, dstoiljkovicTT |
+| `tt-vllm-serving-review` | `tenstorrent/tt-metal` | Apache-2.0 | `.agents/skills/vllm-integration/SKILL.md` | `d58cb341c703` | yieldthought, tchedaTT |
+| `tt-vllm-serving-review` | `tenstorrent/tt-buddy` | Apache-2.0 | `knowledge/recipes/vllm` | `ba9021417442` | ppetrovicTT, viktorpusTT |
+| `llk-perf-audit-review` | `tenstorrent/tt-metal` | Apache-2.0 | `tt_metal/tt-llk/.claude/skills/perf-optimization-audit` | `ce91f33c0c71` | fvranicTT |
+| `llk-perf-audit-review` | `tenstorrent/tt-metal` | Apache-2.0 | `tech_reports/Handling_Special_Value/special_values.md` | `ce91f33c0c71` | blozano-tt, ttmtrajkovic, jasondavies, ndivnicTT |
+| `llk-race-audit-review` | `tenstorrent/tt-metal` | Apache-2.0 | `tt_metal/tt-llk/.claude/skills/race-audit-all` | `ce91f33c0c71` | amahmudTT |
+| `llk-race-audit-review` | `tenstorrent/tt-metal` | Apache-2.0 | `.github/bug_checker/rules/llk-stale-hw-config-state.md` | `fb5c6cfa6f08` | blozano-tt |
+| `tt-l1-memory-review` | `tenstorrent/tt_ops_code_gen` | NOASSERTION | `references/l1-footprint-discipline.md` | `e9c9417eee23` | mstaletovicTT |
+| `tt-l1-memory-review` | `tenstorrent/tt_ops_code_gen` | NOASSERTION | `skills/memory-budget-metal/SKILL.md` | `e9c9417eee23` | mstaletovicTT, astancovTT, wransom-TT |
+| `tt-l1-memory-review` | `tenstorrent/tt_ops_code_gen` | NOASSERTION | `references/ttnn-cb-memory-fundamentals.md` | `e9c9417eee23` | mstaletovicTT, astancovTT, wransom-TT, dstoiljkovicTT |
+| `tt-model-bringup-review` | `tenstorrent/tt-metal` | Apache-2.0 | `.agents/skills/optimize/SKILL.md` | `d58cb341c703` | yieldthought |
+| `tt-model-bringup-review` | `tenstorrent/tt-metal` | Apache-2.0 | `.agents/skills/functional-decoder/SKILL.md` | `d58cb341c703` | yieldthought |
+| `tt-model-bringup-review` | `tenstorrent/tt-buddy` | Apache-2.0 | `knowledge/matmul.md` | `ba9021417442` | ppetrovicTT |
+| `tt-multichip-ccl-review` | `tenstorrent/tt-buddy` | Apache-2.0 | `knowledge/ccl.md` | `ba9021417442` | ppetrovicTT |
+| `tt-multichip-ccl-review` | `tenstorrent/tt-metal` | Apache-2.0 | `.agents/skills/multichip/SKILL.md` | `d58cb341c703` | yieldthought |
+| `tt-multichip-ccl-review` | `tenstorrent/tt-metal` | Apache-2.0 | `.github/bug_checker/rules/ccl-ring-buffer-mismatch.md` | `ce91f33c0c71` | stevendae |
+| `tt-precision-review` | `tenstorrent/tt-metal` | Apache-2.0 | `.agents/skills/datatype-sweep/SKILL.md` | `d58cb341c703` | yieldthought |
+| `tt-precision-review` | `tenstorrent/tt_ops_code_gen` | NOASSERTION | `references/precision_convention.md` | `e9c9417eee23` | djordjenTT |
+| `tt-precision-review` | `tenstorrent/tt_ops_code_gen` | NOASSERTION | `skills/numeric-formats-metal/SKILL.md` | `e9c9417eee23` | mstaletovicTT |
+| `tt-precision-review` | `tenstorrent/tt-metal` | Apache-2.0 | `tech_reports/Handling_Special_Value/special_values.md` | `ce91f33c0c71` | blozano-tt, ttmtrajkovic, jasondavies, ndivnicTT |
+| `tt-trace-review` | `tenstorrent/tt-metal` | Apache-2.0 | `.agents/skills/tt-enable-tracing/SKILL.md` | `d58cb341c703` | yieldthought, tchedaTT |
+| `ttnn-op-kernel-review` | `tenstorrent/tt_ops_code_gen` | NOASSERTION | `references/static-analysis-checklist.md` | `e9c9417eee23` | mstaletovicTT, astancovTT |
+| `ttnn-op-kernel-review` | `tenstorrent/tt_ops_code_gen` | NOASSERTION | `skills/debug-ttnn-op` | `e9c9417eee23` | mstaletovicTT |
+| `ttnn-op-kernel-review` | `tenstorrent/tt-metal` | Apache-2.0 | `.github/bug_checker/rules/reshape-dim-check.md` | `ce91f33c0c71` | stevendae |
+| `ttnn-op-kernel-review` | `tenstorrent/tt-metal` | Apache-2.0 | `.github/bug_checker/rules/program-cache-hash-collision.md` | `fb5c6cfa6f08` | blozano-tt |
+| `ttnn-op-kernel-review` | `tenstorrent/tt-metal` | Apache-2.0 | `.github/bug_checker/rules/smuggled-buffer-runtime-arg.md` | `fb5c6cfa6f08` | blozano-tt |
+| `ttnn-op-kernel-review` | `tenstorrent/tt-metal` | Apache-2.0 | `.github/bug_checker/rules/override-rebuild-in-cache-hit.md` | `fb5c6cfa6f08` | blozano-tt |
+| `ttnn-op-kernel-review` | `tenstorrent/tt-metal` | Apache-2.0 | `.github/bug_checker/rules/op-shard-layout-validation.md` | `fb5c6cfa6f08` | blozano-tt |
+
+> **Five rows are provisional.** The `bug_checker` rules from tt-metal PR 54114 are pinned at the
+> PR head rather than `main`, because that PR is still open. Re-pin them when it merges —
+> `tt-skills-upstream-audit` flags the rows once the branch is deleted.
+
+> `references/special-values.md` is intentionally duplicated in two skill folders. gh-aw copies a
+> single skill folder, so a shared reference cannot live in a sibling skill. The test suite asserts
+> the copies stay identical.
+
+> If your handle appears here and the credit is wrong, thin, or unwanted — open an issue and we
+> will fix or remove it.

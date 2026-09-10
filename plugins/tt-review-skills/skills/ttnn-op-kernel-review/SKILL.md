@@ -5,29 +5,36 @@ metadata:
   tier: kernel
   upstream:
     - repo: tenstorrent/tt_ops_code_gen
+      license: NOASSERTION
       ref: e9c9417eee23c6783b5e72d6a2eed9f75f389fc4
       path: references/static-analysis-checklist.md
     - repo: tenstorrent/tt_ops_code_gen
+      license: NOASSERTION
       ref: e9c9417eee23c6783b5e72d6a2eed9f75f389fc4
       path: skills/debug-ttnn-op
     - repo: tenstorrent/tt-metal
+      license: Apache-2.0
       ref: ce91f33c0c7184618d60553e4b32910c5ebdbfaa
       path: .github/bug_checker/rules/reshape-dim-check.md
     - repo: tenstorrent/tt-metal
+      license: Apache-2.0
       ref: fb5c6cfa6f08436079d10b0e2f794f6749c0ad42
       branch: bug-checker/program-cache-staleness-rules
       path: .github/bug_checker/rules/program-cache-hash-collision.md
     - repo: tenstorrent/tt-metal
+      license: Apache-2.0
       ref: fb5c6cfa6f08436079d10b0e2f794f6749c0ad42
       branch: bug-checker/program-cache-staleness-rules
       path: .github/bug_checker/rules/smuggled-buffer-runtime-arg.md
     - repo: tenstorrent/tt-metal
+      license: Apache-2.0
       ref: fb5c6cfa6f08436079d10b0e2f794f6749c0ad42
       branch: bug-checker/program-cache-staleness-rules
       path: .github/bug_checker/rules/override-rebuild-in-cache-hit.md
     # PROVISIONAL: sourced from PR 54114, not yet merged. Re-pin to main on merge --
     # tt-skills-upstream-audit will flag this row once the branch goes away.
     - repo: tenstorrent/tt-metal
+      license: Apache-2.0
       ref: fb5c6cfa6f08436079d10b0e2f794f6749c0ad42
       branch: bug-checker/program-cache-staleness-rules
       path: .github/bug_checker/rules/op-shard-layout-validation.md

@@ -5,12 +5,15 @@ metadata:
   tier: process
   upstream:
     - repo: tenstorrent/tt-buddy
+      license: Apache-2.0
       ref: ba9021417442d59756aa8cdf154a25648c9a0de5
       path: skills/code-review/shared.md
     - repo: tenstorrent/tt-buddy
+      license: Apache-2.0
       ref: ba9021417442d59756aa8cdf154a25648c9a0de5
       path: skills/code-review/review-loop.md
     - repo: tenstorrent/tt-metal
+      license: Apache-2.0
       ref: d58cb341c703310cf41b5d88baafc0790ec0270b
       path: .agents/skills/code_quality_review
       branch: agentic-research/fast-models-fast

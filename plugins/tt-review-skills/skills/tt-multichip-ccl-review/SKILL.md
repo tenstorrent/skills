@@ -5,13 +5,16 @@ metadata:
   tier: model
   upstream:
     - repo: tenstorrent/tt-buddy
+      license: Apache-2.0
       ref: ba9021417442d59756aa8cdf154a25648c9a0de5
       path: knowledge/ccl.md
     - repo: tenstorrent/tt-metal
+      license: Apache-2.0
       ref: d58cb341c703310cf41b5d88baafc0790ec0270b
       path: .agents/skills/multichip/SKILL.md
       branch: agentic-research/fast-models-fast
     - repo: tenstorrent/tt-metal
+      license: Apache-2.0
       ref: ce91f33c0c7184618d60553e4b32910c5ebdbfaa
       path: .github/bug_checker/rules/ccl-ring-buffer-mismatch.md
 ---

@@ -1,7 +1,7 @@
 # Category 10a — program cache hashing
 
 Host-side, not kernel-side, but the same failure grade: a wrong cache **hit** produces wrong results
-with no error. Distilled from merged tt-metal fixes — see `SOURCES.md`.
+with no error. Distilled from merged tt-metal fixes — see `NOTICE`.
 
 The shared premise: on a cache hit the framework reuses a compiled program and re-patches only what
 it was told to. Anything the hash omits, or any address the override does not patch, silently

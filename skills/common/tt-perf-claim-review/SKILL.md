@@ -5,10 +5,12 @@ metadata:
   tier: process
   upstream:
     - repo: tenstorrent/tt-metal
+      license: Apache-2.0
       ref: d58cb341c703310cf41b5d88baafc0790ec0270b
       path: .agents/skills/optimize/SKILL.md
       branch: agentic-research/fast-models-fast
     - repo: tenstorrent/tt_ops_code_gen
+      license: NOASSERTION
       ref: e9c9417eee23c6783b5e72d6a2eed9f75f389fc4
       path: skills/perf-measure/SKILL.md
 ---

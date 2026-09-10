@@ -17,6 +17,10 @@ SKILLS = REPO / "skills"
 PROMOTED = ("common", "models", "ttnn", "metal", "llk", "inference", "meta")
 TIERS = {"model", "op", "kernel", "process"}
 SHA = re.compile(r"^[0-9a-f]{40}$")
+DUPLICATED = (
+    ("llk/llk-perf-audit-review/references/special-values.md",
+     "models/tt-precision-review/references/special-values.md"),
+)
 
 
 def skill_files() -> list[pathlib.Path]:
@@ -77,6 +81,7 @@ def test_upstream_shape(path):
     for entry in upstream:
         assert SHA.match(entry.get("ref", "")), f"{path}: ref must be a 40-char lowercase sha"
         assert entry.get("path"), f"{path}: upstream entry missing path"
+        assert entry.get("license"), f"{path}: record the upstream license or NOASSERTION"
         assert re.match(r"^[\w.-]+/[\w.-]+$", entry.get("repo", "")), \
             f"{path}: repo must be owner/name"
 
@@ -134,6 +139,12 @@ def test_promoted_skills_in_readme():
     for path in ALL:
         name = frontmatter(path)["name"]
         assert name in readme, f"{name} missing from README Reference section"
+
+
+@pytest.mark.parametrize("pair", DUPLICATED)
+def test_duplicated_references_match(pair):
+    left, right = (SKILLS / rel for rel in pair)
+    assert left.read_bytes() == right.read_bytes(), f"duplicated references differ: {pair}"
 
 
 def test_workflow_pins_only_real_skills():

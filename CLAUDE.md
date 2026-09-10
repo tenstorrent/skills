@@ -10,7 +10,7 @@ all substantive workflows installed only when the user chooses them.
   install, enable, or invoke one without the user's action or explicit permission.
 - Registering the marketplace is not permission to use every plugin in it.
 - Installing an optional plugin permits its skills to participate in normal automatic selection.
-  The consent boundary is installation, not each invocation.
+  Respect host enablement, explicit-only preferences, and any authorization needed by the workflow.
 - Optional plugins must stay independently installable. Do not create an aggregate plugin that
   silently loads the full catalogue.
 
@@ -26,12 +26,19 @@ all substantive workflows installed only when the user chooses them.
   owners.
 - Scope implementation rules to the plugin they protect. In particular, the constraints under
   `skills/` apply to `tt-review-skills`, not to future model-bringup or debugging plugins.
+- Preserve upstream licenses and copyright notices. Record sources, contributors, and their
+  licenses in `NOTICE`; keep required third-party license texts in `LICENSES/`. Never infer an
+  upstream license from this repository's Apache-2.0 license or invent a missing grant.
 
 ## Canonical and packaged files
 
-The bucketed `skills/` tree is the canonical source for `tt-review-skills` and remains directly
-pin-able by gh-aw. `scripts/sync_review_plugin.py` creates the flat, self-contained plugin copy.
-Never edit `plugins/tt-review-skills/skills/` by hand.
+The six review buckets under `skills/` are the canonical source for `tt-review-skills` and remain
+directly pin-able by gh-aw. The `meta/` maintenance bucket is not packaged in the plugin.
+`scripts/sync_review_plugin.py` creates the flat plugin copy and bundles LICENSE, NOTICE and
+LICENSES/ from the repository root. Regenerate after changing review skills or these notices.
+Never edit the generated skills or legal files in `plugins/tt-review-skills/` by hand.
+Read `skills/AGENTS.md` before changing the review catalogue or its generated package. Keep each
+`AGENTS.md` byte-identical to its sibling `CLAUDE.md` so both hosts receive the same rules.
 
 Other plugins keep their canonical skills inside their own plugin directory unless they have a
 documented generator. Prefer one canonical implementation plus an enforced generated copy over
@@ -45,7 +52,10 @@ two hand-maintained versions.
 3. Add the plugin's CODEOWNERS rule before asking for review.
 4. Update the root README's user-facing catalogue and installation instructions.
 5. If changing a canonical review skill, run `python3 scripts/sync_review_plugin.py`.
-6. Run the package-sync and version checks and `pytest tests/`; also run host plugin validators
-   when available.
+6. Use the activated validation environment documented in README. Run
+   `python3 scripts/sync_review_plugin.py --check` and `python3 -m pytest tests/`.
+   After committing the changes, run `python3 scripts/check_plugin_versions.py origin/main`
+   (or the PR's actual base ref); it compares committed content through `HEAD`.
+   Also run host plugin validators when available.
 
 Do not claim tests, model quality, hardware behavior, or performance that was not measured.

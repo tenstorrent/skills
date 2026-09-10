@@ -5,14 +5,17 @@ metadata:
   tier: model
   upstream:
     - repo: tenstorrent/tt-metal
+      license: Apache-2.0
       ref: d58cb341c703310cf41b5d88baafc0790ec0270b
       path: .agents/skills/optimize/SKILL.md
       branch: agentic-research/fast-models-fast
     - repo: tenstorrent/tt-metal
+      license: Apache-2.0
       ref: d58cb341c703310cf41b5d88baafc0790ec0270b
       path: .agents/skills/functional-decoder/SKILL.md
       branch: agentic-research/fast-models-fast
     - repo: tenstorrent/tt-buddy
+      license: Apache-2.0
       ref: ba9021417442d59756aa8cdf154a25648c9a0de5
       path: knowledge/matmul.md
 ---

@@ -5,7 +5,7 @@ what it was handed before building a program at all.
 
 `tt-review-core` states the principle — preconditions belong at the boundary, not patched
 downstream. This is that principle for TTNN ops, and it is the single largest bug bucket in the
-tt-metal fix history. See `SOURCES.md`.
+tt-metal fix history. See `NOTICE`.
 
 ## Shape and volume arithmetic
 

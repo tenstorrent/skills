@@ -132,12 +132,16 @@ resolver, so skills can move between buckets without breaking a pin. Always pin 
 a pin that fails to resolve is reported as a non-fatal warning, so a typo degrades the review
 silently rather than failing the run.
 
-See `.github/workflows/tt-pr-review.md` for a complete worked workflow.
+See [the example workflow](.github/workflows/tt-pr-review.md) for a template. Before compiling it
+with gh-aw, replace its placeholder SHAs and supply or adapt the two `shared/` imports, which are
+not included in this repository. An internal skills repository also requires the consuming
+workflow's credential to have read access; its default token may not have cross-repository access.
 
 ## How `tt-review-skills` composes
 
-Load `tt-review-core` first — it carries the severity vocabulary, the evidence rule, the scope
-rules, and the do-not-flag guards that every other skill assumes and does not restate. Then load
+Use `tt-review-router` to select the review's scope. Load `tt-review-core` before reviewing — it
+carries the severity vocabulary, evidence rule, scope rules, and do-not-flag guards that the
+domain skills assume and do not restate. Then load
 **at most two** domain skills. A reviewer holding fourteen checklists applies all of them shallowly.
 
 `tt-review-router` maps changed paths to the right subset.
@@ -191,20 +195,22 @@ rules, and the do-not-flag guards that every other skill assumes and does not re
 
 ### meta — catalogue maintenance
 
+Available from a repository checkout; not included in the `tt-review-skills` plugin.
+
 | Skill | Reviews |
 |---|---|
 | `tt-skills-upstream-audit` | Drift between vendored skills and their upstream sources *(user-invoked)* |
 
 ## Attributions
 
-**This repo is an aggregation. ** The skills here are
+**This repo includes adapted upstream work.** The review skills are
 vendored, reshaped and re-framed from work other people did — often work that took years of
 debugging to learn. The structure is borrowed too.
 
 Everything below was consulted while building this, whether or not content was ultimately taken.
-Primary author is the top contributor to that path by commit count; see [`SOURCES.md`](SOURCES.md)
-for the full per-skill list, which credits **every** contributor to each path, not just the primary
-one.
+The primary-author column highlights contributors; see [`NOTICE`](NOTICE) for upstream licenses
+and the per-path contributor history at the recorded revisions. Copyright holders and contributors
+are recorded separately; a GitHub handle is not a substitute for an upstream copyright notice.
 
 ### Content sources
 
@@ -217,7 +223,7 @@ one.
 | [`tt-metal`](https://github.com/tenstorrent/tt-metal) — `tt-llk/.claude` | [@ndivnicTT](https://github.com/ndivnicTT) | The LLK audit suite as a whole |
 | ⤷ `race-audit-all` | [@amahmudTT](https://github.com/amahmudTT) | Nine hazard classes, the monotonic JOIN contract, per-architecture divergence |
 | ⤷ `perf-optimization-audit` | [@fvranicTT](https://github.com/fvranicTT) | The provenance lens, semantic-equivalence gate, SIMD false-positive guards |
-| [`tt-metal`](https://github.com/tenstorrent/tt-metal) — `.github/bug_checker` | [@stevendae](https://github.com/stevendae) | Rules distilled from ~1,398 merged fix PRs: program-cache correctness, op validation, CCL ring buffers, stale LLK config. Strong evidence of which failures *recur*; see [`SOURCES.md`](SOURCES.md) for four of its technical claims we corrected |
+| [`tt-metal`](https://github.com/tenstorrent/tt-metal) — `.github/bug_checker` | [@stevendae](https://github.com/stevendae) | Rules distilled from ~1,398 merged fix PRs: program-cache correctness, op validation, CCL ring buffers, stale LLK config. Strong evidence of which failures *recur*; see [`NOTICE`](NOTICE) for four of its technical claims we corrected |
 | [`tt-metal`](https://github.com/tenstorrent/tt-metal) — `tech_reports/Handling_Special_Value` | [@ttmtrajkovic](https://github.com/ttmtrajkovic) | NaN/Inf/denormal semantics and the FPU/SFPU divergence |
 
 ### Structure and tooling
@@ -230,10 +236,25 @@ one.
 
 ## Validate changes
 
+Use an activated virtual environment so the shell-based checks can also resolve `python`:
+
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install pytest==9.1.1 pyyaml==6.0.3
 python3 scripts/sync_review_plugin.py --check
-pytest tests/
+python3 -m pytest tests/
+# After committing the changes; use the actual PR base if it is not main:
+python3 scripts/check_plugin_versions.py origin/main
+```
+
+When Claude Code is installed, validate the marketplace and each plugin:
+
+```bash
 claude plugin validate . --strict
+for plugin in plugins/*; do
+  claude plugin validate "$plugin" --strict || exit 1
+done
 ```
 
 CI runs the deterministic package-sync check and the Python test suite. The Claude validator is an
@@ -242,4 +263,8 @@ suite and the Codex plugin validator during authoring.
 
 ## Licence
 
-Apache-2.0, as are all four upstream sources.
+Original contributions are licensed under [Apache-2.0](LICENSE). Adapted third-party material
+retains its upstream license and copyright notices, including MIT-licensed material from
+`mattpocock/skills` and `githubnext/gh-aw`. See [NOTICE](NOTICE) for the source-to-license mapping,
+contributors, and unresolved provenance, and [LICENSES](LICENSES/) for the MIT license texts.
+This repository's license does not relicense upstream material.

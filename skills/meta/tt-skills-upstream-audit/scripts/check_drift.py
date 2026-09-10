@@ -6,7 +6,7 @@ whether the upstream path has moved since the recorded ref.
 
     python3 scripts/check_drift.py                 # table
     python3 scripts/check_drift.py --json          # machine-readable
-    python3 scripts/check_drift.py --sources       # SOURCES.md provenance table
+    python3 scripts/check_drift.py --notice        # NOTICE provenance table (stdout only)
 
 Requires an authenticated `gh`. Private upstreams resolve only if the caller's
 own credential can see them -- that is the point of running this locally rather
@@ -16,10 +16,12 @@ than in CI. Unreachable upstreams are reported as `unreachable`, never guessed.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import pathlib
 import subprocess
 import sys
+from urllib.parse import urlencode
 
 try:
     import yaml
@@ -75,17 +77,25 @@ def latest(repo: str, path: str, branch: str | None = None) -> dict | None:
     return parsed
 
 
-def authors(repo: str, path: str, branch: str | None = None, limit: int = 100) -> list[str]:
+def authors(repo: str, path: str, ref: str) -> list[str]:
     """Contributors to `path`, most commits first. Prefers the GitHub login over the
     commit author name -- attribution should point at an account someone can follow,
-    not a display string that may not resolve to anyone."""
-    q = f"repos/{repo}/commits?path={path}&per_page={limit}"
-    if branch:
-        q += f"&sha={branch}"
-    raw = gh("api", q, "--jq",
-             "[.[] | .author.login // .commit.author.name] | group_by(.) "
-             "| sort_by(-length) | .[] | .[0]")
-    return [a for a in (raw or "").splitlines() if a]
+    not a display string that may not resolve to anyone. Read every page at the
+    imported revision, so later contributors do not replace the original credit."""
+    q = f"repos/{repo}/commits?" + urlencode({"path": path, "per_page": 100, "sha": ref})
+    raw = gh("api", q, "--paginate", "--slurp")
+    if raw is None:
+        raise ValueError(f"cannot read contributors for {repo}/{path}@{ref}")
+    try:
+        counts = Counter(
+            (commit.get("author") or {}).get("login") or commit["commit"]["author"]["name"]
+            for page in json.loads(raw) for commit in page
+        )
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise ValueError(f"invalid contributor response for {repo}/{path}@{ref}") from exc
+    if not counts or any(not name for name in counts):
+        raise ValueError(f"no contributors found for {repo}/{path}@{ref}")
+    return sorted(counts, key=lambda name: (-counts[name], name))
 
 
 def changed_files(repo: str, base: str, head: str, path: str) -> int | None:
@@ -101,7 +111,7 @@ def changed_files(repo: str, base: str, head: str, path: str) -> int | None:
         return None
 
 
-def collect() -> list[dict]:
+def sources() -> list[dict]:
     rows: list[dict] = []
     for skill in sorted((REPO_ROOT / "skills").rglob("SKILL.md")):
         fm = frontmatter(skill)
@@ -112,57 +122,80 @@ def collect() -> list[dict]:
             if not (repo and ref and path):
                 rows.append({"skill": name, "status": "malformed", "upstream": str(up)})
                 continue
-            base = {"skill": name, "repo": repo, "path": path, "recorded": ref,
-                    "branch": branch}
-            cur = latest(repo, path, branch)
-            if cur is None:
-                rows.append({**base, "status": "unreachable"})
-                continue
-            if cur == {}:
-                rows.append({**base, "status": "missing"})
-                continue
-            # `recorded` is the snapshot we vendored from, which is a repo-level
-            # SHA and generally does NOT equal the last commit touching this path.
-            # So drift is a path-filtered comparison, not SHA equality -- comparing
-            # SHAs directly reports drift on every row forever.
-            n = changed_files(repo, ref, cur["sha"], path)
-            if n is None:
-                rows.append({**base, "status": "unreachable"})
-                continue
-            rows.append({
-                **base, "current": cur["sha"],
-                "last_author": cur["author"], "last_date": cur["date"],
-                "files_changed": n,
-                "status": "drifted" if n > 0 else "current",
-            })
+            rows.append({"skill": name, "repo": repo, "path": path, "recorded": ref,
+                         "branch": branch, "license": up.get("license", "NOASSERTION")})
     return rows
+
+
+def collect() -> list[dict]:
+    rows: list[dict] = []
+    for base in sources():
+        if base.get("status") == "malformed":
+            rows.append(base)
+            continue
+        repo, ref, path = base["repo"], base["recorded"], base["path"]
+        cur = latest(repo, path, base["branch"])
+        if cur is None:
+            rows.append({**base, "status": "unreachable"})
+            continue
+        if cur == {}:
+            rows.append({**base, "status": "missing"})
+            continue
+        # `recorded` is the snapshot we vendored from, which is a repo-level
+        # SHA and generally does NOT equal the last commit touching this path.
+        # So drift is a path-filtered comparison, not SHA equality -- comparing
+        # SHAs directly reports drift on every row forever.
+        n = changed_files(repo, ref, cur["sha"], path)
+        if n is None:
+            rows.append({**base, "status": "unreachable"})
+            continue
+        rows.append({
+            **base, "current": cur["sha"],
+            "last_author": cur["author"], "last_date": cur["date"],
+            "files_changed": n,
+            "status": "drifted" if n > 0 else "current",
+        })
+    return rows
+
+
+def notice_table(rows: list[dict]) -> str:
+    lines = ["| Skill | Upstream | License | Path | Pinned | Contributors (most commits first) |",
+             "|---|---|---|---|---|---|"]
+    for r in rows:
+        if r.get("status") == "malformed":
+            raise ValueError(f"malformed upstream for {r['skill']}: {r['upstream']}")
+        names = ", ".join(authors(r["repo"], r["path"], r["recorded"]))
+        names = names.replace("|", "\\|").replace("\n", " ")
+        lines.append(f"| `{r['skill']}` | `{r['repo']}` | {r['license']} | `{r['path']}` "
+                     f"| `{r['recorded'][:12]}` | {names} |")
+    return "\n".join(lines)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--json", action="store_true")
-    ap.add_argument("--sources", action="store_true", help="emit a SOURCES.md provenance table")
+    output = ap.add_mutually_exclusive_group()
+    output.add_argument("--json", action="store_true")
+    output.add_argument("--notice", "--sources", dest="notice", action="store_true",
+                        help="emit only the NOTICE provenance table to stdout (--sources is an alias)")
     args = ap.parse_args()
 
     if gh("auth", "status") is None and not args.json:
         print("warning: gh is not authenticated; every upstream will read as unreachable\n",
               file=sys.stderr)
 
+    if args.notice:
+        try:
+            table = notice_table(sources())
+        except ValueError as exc:
+            print(f"error: {exc}; keep the existing NOTICE table", file=sys.stderr)
+            return 1
+        print(table)
+        return 0
+
     rows = collect()
 
     if args.json:
         print(json.dumps(rows, indent=2))
-        return 0
-
-    if args.sources:
-        print("| Skill | Upstream | Path | Pinned | Authors |")
-        print("|---|---|---|---|---|")
-        for r in rows:
-            if r["status"] == "malformed":
-                continue
-            names = ", ".join(authors(r["repo"], r["path"], r.get("branch"))) or "unknown"
-            print(f"| `{r['skill']}` | `{r['repo']}` | `{r['path']}` "
-                  f"| `{r['recorded'][:12]}` | {names} |")
         return 0
 
     width = max((len(r["skill"]) for r in rows), default=5)

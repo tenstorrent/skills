@@ -2,7 +2,7 @@
 """Convert plain path:line references in a review body into GitHub permalinks.
 
 Reimplemented from the documented behaviour of the upstream Codex skill script
-(see SOURCES.md) -- the original was not available to vendor.
+(see NOTICE) -- the original was not available to vendor.
 
     linkify_review.py --sha <SHA> --input review_raw.txt --output review_comment.txt
 

@@ -5,16 +5,20 @@ metadata:
   tier: model
   upstream:
     - repo: tenstorrent/tt-metal
+      license: Apache-2.0
       ref: d58cb341c703310cf41b5d88baafc0790ec0270b
       path: .agents/skills/datatype-sweep/SKILL.md
       branch: agentic-research/fast-models-fast
     - repo: tenstorrent/tt_ops_code_gen
+      license: NOASSERTION
       ref: e9c9417eee23c6783b5e72d6a2eed9f75f389fc4
       path: references/precision_convention.md
     - repo: tenstorrent/tt_ops_code_gen
+      license: NOASSERTION
       ref: e9c9417eee23c6783b5e72d6a2eed9f75f389fc4
       path: skills/numeric-formats-metal/SKILL.md
     - repo: tenstorrent/tt-metal
+      license: Apache-2.0
       ref: ce91f33c0c7184618d60553e4b32910c5ebdbfaa
       path: tech_reports/Handling_Special_Value/special_values.md
 ---

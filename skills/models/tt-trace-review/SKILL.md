@@ -5,6 +5,7 @@ metadata:
   tier: model
   upstream:
     - repo: tenstorrent/tt-metal
+      license: Apache-2.0
       ref: d58cb341c703310cf41b5d88baafc0790ec0270b
       path: .agents/skills/tt-enable-tracing/SKILL.md
       branch: agentic-research/fast-models-fast

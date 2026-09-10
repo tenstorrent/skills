@@ -16,7 +16,7 @@
 # Existing review catalogue and its packaged plugin
 /skills/ @blozano-tt @yieldthought
 /docs/ @blozano-tt @yieldthought
-/SOURCES.md @blozano-tt @yieldthought
+/NOTICE @blozano-tt @yieldthought
 /plugins/tt-review-skills/ @blozano-tt @yieldthought
 
 # Staged TTNN model bring-up

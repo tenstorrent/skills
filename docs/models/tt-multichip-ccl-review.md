@@ -16,4 +16,4 @@ Pins resolve by skill name, not path.
 
 ## Provenance
 
-See [SOURCES.md](../../SOURCES.md) for upstream paths and author attribution.
+See [NOTICE](../../NOTICE) for upstream paths and author attribution.

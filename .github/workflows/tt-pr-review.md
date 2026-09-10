@@ -37,6 +37,10 @@ Review this pull request using the Tenstorrent domain-knowledge skills pinned ab
 > `tenstorrent/skills` before using this workflow. gh-aw reports a failed skill install as a
 > **non-fatal warning**, so an unresolvable pin silently degrades the review rather than failing the
 > run — you would get a generic review that looks like a domain review.
+>
+> **The two `shared/` imports are consumer-provided templates and are not shipped here.** Supply
+> or adapt them in the consuming repository before compiling this workflow. Its credential must
+> also have read access to the internal `tenstorrent/skills` repository.
 
 ## Inputs
 

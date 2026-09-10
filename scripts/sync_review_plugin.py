@@ -12,6 +12,7 @@ REPO = Path(__file__).resolve().parents[1]
 SOURCE_ROOT = REPO / "skills"
 TARGET_ROOT = REPO / "plugins" / "tt-review-skills" / "skills"
 REVIEW_BUCKETS = ("common", "models", "ttnn", "metal", "llk", "inference")
+LEGAL_FILES = ("LICENSE", "NOTICE", "LICENSES/gh-aw-MIT.txt", "LICENSES/mattpocock-skills-MIT.txt")
 
 
 def source_skills() -> list[Path]:
@@ -50,10 +51,17 @@ def check() -> int:
     changed = sorted(
         path for path in expected.keys() & actual.keys() if expected[path] != actual[path]
     )
-    if missing or extra or changed:
+    stale_notices = [
+        name for name in LEGAL_FILES
+        if not (TARGET_ROOT.parent / name).is_file()
+        or (TARGET_ROOT.parent / name).read_bytes() != (REPO / name).read_bytes()
+    ]
+    if missing or extra or changed or stale_notices:
         for label, paths in (("missing", missing), ("extra", extra), ("changed", changed)):
             for path in paths:
                 print(f"{label}: {path}")
+        for name in stale_notices:
+            print(f"missing or stale package notice: {name}")
         print("run: python3 scripts/sync_review_plugin.py")
         return 1
     print(f"tt-review-skills package is current ({len(source_skills())} skills)")
@@ -66,6 +74,10 @@ def sync() -> int:
     TARGET_ROOT.mkdir(parents=True)
     for source in source_skills():
         shutil.copytree(source, TARGET_ROOT / source.name)
+    for name in LEGAL_FILES:
+        target = TARGET_ROOT.parent / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(REPO / name, target)
     print(f"synced {len(source_skills())} skills into {TARGET_ROOT.relative_to(REPO)}")
     return 0
 

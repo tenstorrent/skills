@@ -9,8 +9,8 @@ metadata:
 
 # Upstream drift audit
 
-This repo is an **aggregation**. Its skills are vendored copies of content that lives in four other
-repositories and keeps moving. Without a deliberate check, the copies rot silently.
+The review catalogue adapts content from the upstream repositories recorded in each skill's
+metadata. Without a deliberate check, the copies can become stale.
 
 Run this periodically, or before relying on a skill for something important.
 
@@ -19,17 +19,18 @@ Run this periodically, or before relying on a skill for something important.
 ```bash
 python3 skills/meta/tt-skills-upstream-audit/scripts/check_drift.py
 python3 skills/meta/tt-skills-upstream-audit/scripts/check_drift.py --json
-python3 skills/meta/tt-skills-upstream-audit/scripts/check_drift.py --sources   # SOURCES.md table
+python3 skills/meta/tt-skills-upstream-audit/scripts/check_drift.py --notice    # NOTICE table
 ```
 
-Requires an authenticated `gh`. Two of the four upstreams are private, so the audit resolves them
-only if **your own** credential can see them — a Tenstorrent employee gets a full report, anyone
-else gets `unreachable` rows and an otherwise working audit.
+Requires PyYAML and an authenticated `gh`. Restricted upstreams resolve only if **your own**
+credential can see them. The drift report marks inaccessible sources `unreachable`.
 
-That is deliberate. A scheduled workflow doing this in CI would need a credential with private-repo
-read access stored as a secret in a **public** repo, on a timer, for a convenience feature. Running
-locally under the caller's own access has no secret to store and no standing access, and the
-boundary matches the person.
+`--notice` (also available as `--sources`) prints only the per-skill table, with recorded licenses
+and contributor history at the pinned revisions. Replace that table in `NOTICE`; do not overwrite
+the surrounding license and attribution notices. A failed contributor lookup exits nonzero without
+printing a partial table. `NOASSERTION` marks an unresolved upstream license, not a license grant.
+
+Running locally uses the caller's existing access without storing a cross-repository token in CI.
 
 ## What the statuses mean
 
@@ -61,7 +62,7 @@ we recorded. If a skill's domain changed somewhere we never recorded, this repor
 **And it cannot tell you the upstream was wrong when you vendored it.** Drift detection compares
 *then* against *now*; it has no opinion on whether *then* was correct. A defect vendored faithfully
 from a source that was itself mistaken produces a permanently clean audit. This has already happened
-once — see the correction recorded in `SOURCES.md` — and the only thing that catches it is someone
+once — see the correction recorded in `NOTICE` — and the only thing that catches it is someone
 checking a rule against the code it describes.
 
 ## Triage: which drift matters
@@ -86,16 +87,16 @@ Report and propose. **Do not auto-apply.** For each drift worth acting on:
 4. Keep them in the same change. A ref bump without the content update is worse than no bump: it
    silences the signal while leaving the copy stale.
 
-## Every re-vendor crosses the private/public boundary
+## Review the distribution scope on every re-vendor
 
 **This is why the skill reports and proposes rather than auto-applying.**
 
-Two upstreams are private and this repo is public, so a drift-driven update pulls fresh text across
-that boundary while looking like routine maintenance.
+Some upstreams have restricted visibility, as does this repository. A drift-driven update can move
+material to a broader audience while looking like routine maintenance. Verify the actual access
+boundary, upstream license and disclosure authorization before distributing it more widely.
 
-The review is narrow — see `CLAUDE.md` for the settled scope. Architecture detail stays, including
-Quasar. What comes out is internal-only pointers (Confluence page IDs and similar: dead links in a
-public repo, not secrets), machine-specific paths, and personal identity mappings.
+See `skills/AGENTS.md` for the vendoring rules. Preserve useful public architecture detail;
+remove internal-only pointers, machine-specific paths, and personal identity mappings.
 
 Apply it to the text you are proposing to bring across, not to the whole file — and if a call is
 genuinely uncertain, that is a question for a person, not a judgement to make inside the proposal.

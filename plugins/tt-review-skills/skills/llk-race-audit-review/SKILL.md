@@ -5,9 +5,11 @@ metadata:
   tier: kernel
   upstream:
     - repo: tenstorrent/tt-metal
+      license: Apache-2.0
       ref: ce91f33c0c7184618d60553e4b32910c5ebdbfaa
       path: tt_metal/tt-llk/.claude/skills/race-audit-all
     - repo: tenstorrent/tt-metal
+      license: Apache-2.0
       ref: fb5c6cfa6f08436079d10b0e2f794f6749c0ad42
       branch: bug-checker/program-cache-staleness-rules
       path: .github/bug_checker/rules/llk-stale-hw-config-state.md

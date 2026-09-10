@@ -5,20 +5,24 @@ These rules apply only to the canonical review catalogue under `skills/` and its
 
 ## Vendoring and provenance
 
-Two upstreams are private while this repository is intended for public distribution. When bringing
-text across, remove internal-only pointers, machine-specific or personal content, and anything a
+Some upstreams have restricted visibility, as does this repository. Before moving content to a
+broader audience, verify the applicable license and disclosure authorization. When bringing text
+across, remove internal-only pointers, machine-specific or personal content, and anything a
 disclosure owner asks to remove. Preserve useful public architecture detail and verify technical
 claims against the code; provenance is not proof of correctness.
 
 Record every source in `metadata.upstream`. Use a 40-character lowercase commit SHA and include
-`repo`, `ref`, and `path` (plus `branch` when needed). Use `[]` for original work. Regenerate
-`SOURCES.md` with:
+`repo`, `ref`, `path`, and `license` (plus `branch` when needed). Record the license at that
+revision; `NOASSERTION` flags an unresolved license, not permission to redistribute. Use `[]` for
+original work. Emit the per-skill provenance table with:
 
 ```bash
-python3 skills/meta/tt-skills-upstream-audit/scripts/check_drift.py --sources
+python3 skills/meta/tt-skills-upstream-audit/scripts/check_drift.py --notice
 ```
 
-The drift audit proposes updates; it never applies vendored changes automatically.
+This requires PyYAML and authenticated `gh` access to the upstreams. Replace only the per-skill
+table in `NOTICE` with the output; preserve the license notices and other attribution sections.
+The command writes to stdout, not to `NOTICE`. The drift audit never applies vendored changes.
 
 ## gh-aw self-containment
 
@@ -38,9 +42,13 @@ review-runner dependency constraints because it contains repository maintenance 
 - names equal their directories and are globally unique;
 - `metadata.tier` is `model`, `op`, `kernel`, or `process`;
 - entrypoints are at most 130 lines and references are under 4500 bytes;
-- referenced files exist, workflow pins resolve, and duplicated references match;
+- referenced files exist, workflow skill names exist locally, and duplicated references match;
 - review skills emit findings but never post them;
 - every vendored repository is credited in the review documentation.
 
+The workflow check does not verify remote SHAs or imports. Replace the example workflow's
+placeholders and supply its shared imports before compiling it with gh-aw.
+
 Buckets are `common`, `models`, `ttnn`, `metal`, `llk`, `inference`, and `meta`. Add promoted skills
-to the review reference in the root README, regenerate the packaged plugin, and run `pytest tests/`.
+to both their bucket README and the root README reference, regenerate the packaged plugin, and
+run `pytest tests/`. The `meta/` maintenance skill is available from the checkout, not the plugin.

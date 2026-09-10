@@ -5,9 +5,11 @@ metadata:
   tier: kernel
   upstream:
     - repo: tenstorrent/tt-metal
+      license: Apache-2.0
       ref: ce91f33c0c7184618d60553e4b32910c5ebdbfaa
       path: tt_metal/tt-llk/.claude/skills/perf-optimization-audit
     - repo: tenstorrent/tt-metal
+      license: Apache-2.0
       ref: ce91f33c0c7184618d60553e4b32910c5ebdbfaa
       path: tech_reports/Handling_Special_Value/special_values.md
 ---

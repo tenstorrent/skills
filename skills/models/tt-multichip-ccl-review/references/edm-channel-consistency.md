@@ -6,7 +6,7 @@ device-side kernel arguments**, and between the sender and receiver ends of a ch
 
 A whole bug family lives in that agreement: values computed on the host and passed inconsistently to
 kernels, or two sides of a channel disagreeing. Distilled from merged tt-metal fix PRs — see
-`SOURCES.md`.
+`NOTICE`.
 
 ## What to check
 

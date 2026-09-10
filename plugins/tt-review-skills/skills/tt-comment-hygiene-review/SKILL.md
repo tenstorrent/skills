@@ -5,9 +5,11 @@ metadata:
   tier: process
   upstream:
     - repo: tenstorrent/tt-buddy
+      license: Apache-2.0
       ref: ba9021417442d59756aa8cdf154a25648c9a0de5
       path: skills/code-review/reviewers/fresh-eye.md
     - repo: tenstorrent/tt-buddy
+      license: Apache-2.0
       ref: ba9021417442d59756aa8cdf154a25648c9a0de5
       path: skills/code-review/reviewers/documentation.md
 ---

@@ -13,7 +13,7 @@ state it depends on, so behaviour depends on **which op ran before it**. Symptom
 isolation and in its own unit test, wrong only when preceded by another op in a fused sequence or on
 a cache-warmed second call. No crash — subtly wrong datums, or a hang.
 
-Roughly thirty merged fix PRs share this root cause. See `SOURCES.md`.
+Roughly thirty merged fix PRs share this root cause. See `NOTICE`.
 
 ## What to look for
 
