@@ -9,6 +9,7 @@ import json
 import os
 import pathlib
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -20,6 +21,7 @@ from typing import Any, Callable
 # Load sibling support when imported by host-side tests as well as executed.
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from environment import ROOT, DEPENDENCY_SKILLS, dependency_root, environment
+from bringup_telemetry import RunRecord
 
 
 MAX_GOAL_OBJECTIVE_CHARS = 4_000
@@ -313,6 +315,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--approval-policy", default="never")
     parser.add_argument("--sandbox", default="danger-full-access")
     parser.add_argument("--model")
+    parser.add_argument("--hf-revision", help="Requested weights revision for telemetry; does not pin model loaders")
     parser.add_argument("--effort")
     parser.add_argument("--summary")
     parser.add_argument("--service-tier")
@@ -646,6 +649,7 @@ def write_manifest_header(
                 f"codex_home={home}",
                 f"codex_bin={codex_bin}",
                 f"hf_model={hf_model or ''}",
+                f"hf_revision={args.hf_revision or ''}",
                 f"model_dir={model_dir or ''}",
                 "runner=app-server",
                 f"approval_policy={args.approval_policy}",
@@ -890,18 +894,16 @@ def run_check_script(
 ) -> int:
     env = os.environ.copy()
     env.update(extra_env)
-    result = subprocess.run(
-        ["bash", str(script)],
-        cwd=repo,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    check_log.write_text(result.stdout or "", encoding="utf-8")
-    tail = "\n".join((result.stdout or "").splitlines()[-15:])
+    # Stream directly to the artifact so interruption cannot discard buffered output.
+    with check_log.open("w", encoding="utf-8") as output:
+        result = subprocess.run(
+            ["bash", str(script)],
+            cwd=repo,
+            env=env,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+        )
+    tail = "\n".join(check_log.read_text(encoding="utf-8", errors="replace").splitlines()[-15:])
     print(f"check {script.name} exited {result.returncode}; log: {check_log}", file=sys.stderr)
     if tail:
         print(tail, file=sys.stderr)
@@ -1039,8 +1041,11 @@ def run_stage(
     objective = objective_from_prompt(prompt)
     name = stage_name(index, prompt_path)
     prompt_copy = log_dir / f"{name}.prompt.txt"
-    prompt_copy.write_text(prompt)
     output_log = log_dir / f"{name}.jsonl"
+    if prompt_copy.exists() or output_log.exists():
+        raise RuntimeError(f"stage {index} already has artifacts in {log_dir}; "
+                           "resume that stage explicitly or use a fresh log directory")
+    prompt_copy.write_text(prompt)
     _input_items, missing_skills = input_items_for_objective(repo, objective)
 
     print(f"\n== Stage {index}: {prompt_path} ==", file=sys.stderr)
@@ -1212,6 +1217,55 @@ def run_resumed_stage(
     return 0
 
 
+def telemetry_update(action: Callable[[], Any]) -> Any:
+    """Telemetry failure must not replace a stage verdict or strand its artifacts."""
+    try:
+        return action()
+    except Exception as exc:
+        print(f"Warning: local telemetry write failed ({type(exc).__name__}); preserve the runner logs.", file=sys.stderr)
+        return None
+
+
+def run_recorded_stage(client, args, repo, log_dir, manifest, index, prompt_path,
+                       replacements, manifest_values, telemetry) -> int:
+    if telemetry is not None:
+        telemetry_update(lambda: telemetry.start_stage(index, prompt_path))
+    resumed = args.resume_stage is not None and index == args.resume_stage and not args.dry_run
+    prefix = f"stage_{index}"
+    if resumed:
+        prefix += f"_resume_{next_resume_attempt(manifest_values, index)}"
+    code = None
+    error = None
+    try:
+        if resumed:
+            code = run_resumed_stage(client, args, repo, log_dir, manifest, index,
+                                     prompt_path, replacements, manifest_values)
+        else:
+            code = run_stage(client, args, repo, log_dir, manifest, index, prompt_path, replacements)
+        return code
+    except BaseException as exc:
+        error = exc
+        raise
+    finally:
+        if telemetry is not None:
+            def record_result() -> None:
+                values = read_manifest(manifest)
+                telemetry.finish_stage(
+                    code, goal_status=values.get(f"{prefix}_terminal_status") if not args.dry_run else None,
+                    check_status=values.get(f"{prefix}_check") if not args.dry_run else None,
+                    error=error,
+                )
+            telemetry_update(record_result)
+
+
+class Terminated(KeyboardInterrupt):
+    """SIGTERM follows the same artifact-preserving unwind as Ctrl-C."""
+
+
+def terminate_run(signum, frame) -> None:
+    raise Terminated()
+
+
 def main() -> int:
     args = parse_args()
     repo = args.repo.expanduser().resolve()
@@ -1228,9 +1282,42 @@ def main() -> int:
     log_dir.mkdir(parents=True, exist_ok=True)
     replacements = parse_replacements(args.replace)
     manifest = log_dir / "manifest.txt"
+    if args.resume_stage is None and manifest.exists():
+        raise SystemExit("This log directory already has a manifest. Use a new --log-dir for a fresh run, "
+                         "or --resume-stage to continue it; preserve the earlier artifacts.")
     if args.resume_stage is not None and not manifest.exists():
         raise SystemExit(f"--resume-stage requires an existing manifest: {manifest}")
     manifest_values = read_manifest(manifest) if args.resume_stage is not None else {}
+    telemetry = telemetry_update(lambda: RunRecord(
+        repo, log_dir,
+        model_id=replacement_value(replacements, "HF_MODEL") or manifest_values.get("hf_model") or None,
+        requested_revision=args.hf_revision or manifest_values.get("hf_revision") or None,
+        resume_stage=args.resume_stage, dry_run=args.dry_run,
+    ))
+    code = None
+    error = None
+    previous_handler = signal.signal(signal.SIGTERM, terminate_run)
+    try:
+        code = run_pipeline(args, repo, env, home, log_dir, replacements, manifest, manifest_values, telemetry)
+        return code
+    except BaseException as exc:
+        error = exc
+        if isinstance(exc, Terminated):
+            code = 143
+        elif isinstance(exc, KeyboardInterrupt):
+            code = 130
+        elif isinstance(exc, SystemExit) and isinstance(exc.code, int):
+            code = exc.code
+        raise
+    finally:
+        signal.signal(signal.SIGTERM, previous_handler)
+        if telemetry is not None:
+            telemetry_update(lambda: telemetry.finish(code, error=error))
+            print(f"Local telemetry: {telemetry.path}", file=sys.stderr)
+            print(f"Coordinating agent: complete off-boarding using {telemetry.path.parent / 'OFFBOARDING.md'}", file=sys.stderr)
+
+
+def run_pipeline(args, repo, env, home, log_dir, replacements, manifest, manifest_values, telemetry) -> int:
     model_dir = resolve_model_dir_for_launch(
         replacements=replacements,
         manifest_values=manifest_values,
@@ -1253,27 +1340,18 @@ def main() -> int:
             raise SystemExit("Missing packaged skills: " + ", ".join(missing))
 
     if args.dry_run:
-        client: AppServerClient | None = None
         for index, prompt_path in enumerate(args.prompt_files, start=args.start_index):
             if args.resume_stage is not None and index < args.resume_stage:
                 continue
-            code = run_stage(
-                client,  # type: ignore[arg-type]
-                args,
-                repo,
-                log_dir,
-                manifest,
-                index,
-                prompt_path,
-                replacements,
-            )
+            code = run_recorded_stage(None, args, repo, log_dir, manifest, index,
+                                      prompt_path, replacements, {}, telemetry)
             if code != 0:
                 return code
         return 0
 
     stderr_log = log_dir / "app-server.stderr.log"
     with AppServerClient(codex_bin, repo, env, stderr_log, args.config) as client:
-        with (log_dir / "initialize.jsonl").open("w", encoding="utf-8") as init_log:
+        with (log_dir / "initialize.jsonl").open("a", encoding="utf-8") as init_log:
             client.request(
                 "initialize",
                 {
@@ -1295,29 +1373,8 @@ def main() -> int:
         for index, prompt_path in enumerate(args.prompt_files, start=args.start_index):
             if args.resume_stage is not None and index < args.resume_stage:
                 continue
-            if args.resume_stage is not None and index == args.resume_stage:
-                code = run_resumed_stage(
-                    client,
-                    args,
-                    repo,
-                    log_dir,
-                    manifest,
-                    index,
-                    prompt_path,
-                    replacements,
-                    manifest_values,
-                )
-            else:
-                code = run_stage(
-                    client,
-                    args,
-                    repo,
-                    log_dir,
-                    manifest,
-                    index,
-                    prompt_path,
-                    replacements,
-                )
+            code = run_recorded_stage(client, args, repo, log_dir, manifest, index,
+                                      prompt_path, replacements, manifest_values, telemetry)
             if code != 0:
                 return code
 
@@ -1327,4 +1384,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except Terminated:
+        raise SystemExit(143)
