@@ -169,7 +169,7 @@
       "destination": "skills/functional-decoder/SKILL.md",
       "blob": "5ea84505c81347d6773fc8325c3115d31094e5d8",
       "source_sha256": "133caffc050d9bb0343a37509ce09a6b2a4e640294761e7226e52f8f82037b71",
-      "packaged_sha256": "7928c54112bb6041f8372a6f22cad87fbb2305c978c3f3e5337410f92bedc836"
+      "packaged_sha256": "eee2637d64dfaee0cff30500bf76f2762016bc5f7534f926ad73ea873091c09a"
     },
     {
       "source": ".agents/skills/functional-decoder/agents/openai.yaml",
@@ -211,7 +211,7 @@
       "destination": "skills/optimize/SKILL.md",
       "blob": "280abb027d839f1f076ab8a524fc6f61ed6df587",
       "source_sha256": "c4b4015ed198c305ed19f73c2ef6a539923212457588319767d08489a5331c8b",
-      "packaged_sha256": "4fe8daf63d989433af55607c5dc62d8942ba1ffaeb6e12bdb29470df0b2d88ce"
+      "packaged_sha256": "7b36efe3848376742dbe874910dfa367ac96efa8efa13d664c690f1483da3336"
     },
     {
       "source": ".agents/skills/optimize/agents/openai.yaml",
