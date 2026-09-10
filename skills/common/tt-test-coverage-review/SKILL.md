@@ -9,7 +9,7 @@ metadata:
       ref: ba9021417442d59756aa8cdf154a25648c9a0de5
       path: skills/code-review/reviewers/qa.md
     - repo: tenstorrent/tt_ops_code_gen
-      license: NOASSERTION
+      license: Apache-2.0
       ref: e9c9417eee23c6783b5e72d6a2eed9f75f389fc4
       path: skills/golden-tests/SKILL.md
 ---

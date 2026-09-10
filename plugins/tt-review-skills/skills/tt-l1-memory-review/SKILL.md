@@ -5,15 +5,15 @@ metadata:
   tier: kernel
   upstream:
     - repo: tenstorrent/tt_ops_code_gen
-      license: NOASSERTION
+      license: Apache-2.0
       ref: e9c9417eee23c6783b5e72d6a2eed9f75f389fc4
       path: references/l1-footprint-discipline.md
     - repo: tenstorrent/tt_ops_code_gen
-      license: NOASSERTION
+      license: Apache-2.0
       ref: e9c9417eee23c6783b5e72d6a2eed9f75f389fc4
       path: skills/memory-budget-metal/SKILL.md
     - repo: tenstorrent/tt_ops_code_gen
-      license: NOASSERTION
+      license: Apache-2.0
       ref: e9c9417eee23c6783b5e72d6a2eed9f75f389fc4
       path: references/ttnn-cb-memory-fundamentals.md
 ---

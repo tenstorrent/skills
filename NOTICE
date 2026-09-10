@@ -14,15 +14,15 @@ a shorter credit list, including sources consulted for structure and tooling.
 | Source | Upstream license | Material and attribution |
 |---|---|---|
 | `tenstorrent/tt-buddy` @ `ba9021417442d59756aa8cdf154a25648c9a0de5` | Apache-2.0 (`LICENSE` at that revision) | Reviewer contract, reviewer cast, CCL and matmul knowledge. Contributors: ppetrovicTT, viktorpusTT. |
-| `tenstorrent/tt_ops_code_gen` @ `e9c9417eee23` | NOASSERTION — no license file in the recorded tree | Static-analysis checklist, L1, memory, precision and testing guidance. Contributors: mstaletovicTT, dstoiljkovicTT, djordjenTT, astancovTT, wransom-TT. See unresolved provenance below. |
+| `tenstorrent/tt_ops_code_gen` @ `e9c9417eee23` | Apache-2.0 (maintainer-specified; see license provenance below) | Static-analysis checklist, L1, memory, precision and testing guidance. Contributors: mstaletovicTT, dstoiljkovicTT, djordjenTT, astancovTT, wransom-TT. |
 | `tenstorrent/tt-metal` @ `d58cb341c703`, `ce91f33c0c71`, `fb5c6cfa6f08` | Apache-2.0 (`LICENSE` at each revision) | Review material from `.agents`, `tt_metal/tt-llk/.claude`, `.github/bug_checker/rules`, and `tech_reports/Handling_Special_Value`. Per-path contributors are listed below; the LLK suite also credits ndivnicTT. |
 | `tenstorrent/tt-metal` @ `70a596f92229ada922fba743cd0cd9d2658a5c1c` | Apache-2.0 (`LICENSE` at that revision) | Model bring-up skills, prompts, orchestration and readiness support in `plugins/tt-model-bringup`. Contributors to the 65 imported source paths: odjuricicTT, tchedaTT, yieldthought. Exact source paths and package adaptations: `plugins/tt-model-bringup/sync-source.json` and `SYNC.md`. |
 | `mattpocock/skills` | MIT | Review catalogue structure, progressive disclosure, trigger descriptions, changesets and install-block conventions. Contributor: mattpocock. Copyright (c) 2026 Matt Pocock. Full license: `LICENSES/mattpocock-skills-MIT.txt`. |
 | `githubnext/gh-aw` | MIT | Workflow frontmatter, safe-output and reviewer triage patterns used by `.github/workflows/tt-pr-review.md`. Credited contributors: dsyme, pelikhan, mnkiefer. Copyright GitHub, Inc. Full license: `LICENSES/gh-aw-MIT.txt`. |
-| Maintainer-local Codex skill `tt-metal-pr-review` | NOASSERTION — original source unavailable | Review checklist and false-positive guards; credited to yieldthought. The linkifier was reimplemented, as described below. |
-| Maintainer-local `autodebug` @ `4d15fd683d279a1503c8f3f8a0508b83ea7a8657` | NOASSERTION — upstream license not recorded | AutoDebug and AutoTriage prompts. Imported by yieldthought; import records: `plugins/tt-autodebug/sync-source.json` and `SYNC.md`. The plugin manifest declares Apache-2.0, but is not evidence of the local upstream's license. |
+| Maintainer-local Codex skill `tt-metal-pr-review` | Apache-2.0 (maintainer-specified; see license provenance below) | Review checklist and false-positive guards; credited to yieldthought. The linkifier was reimplemented, as described below. |
+| Maintainer-local `autodebug` @ `4d15fd683d279a1503c8f3f8a0508b83ea7a8657` | Apache-2.0 (maintainer-specified; see license provenance below) | AutoDebug and AutoTriage prompts. Imported by yieldthought; import records: `plugins/tt-autodebug/sync-source.json` and `SYNC.md`. |
 
-The Apache-2.0 license texts were verified at the imported revisions. The two MIT licenses were
+The tt-buddy and tt-metal Apache-2.0 license texts were verified at the imported revisions. The two MIT licenses were
 verified at the following revisions (the original catalogue import did not pin those sources):
 
 - https://github.com/mattpocock/skills/blob/3cca18b368ae95cdbdebbff572ccafa662551015/LICENSE
@@ -50,13 +50,14 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-## Unresolved provenance and distribution scope
+## License provenance and distribution scope
 
-`NOASSERTION` means the upstream license has not been established; it does not mean Apache-2.0,
-MIT, public domain, or permission to redistribute. The `tt_ops_code_gen` recorded tree contains
-no LICENSE, LICENCE, COPYING or NOTICE file. The two maintainer-local sources have no upstream
-license text recorded here. Source owners must confirm the applicable terms and copyright notices;
-the repository's Apache-2.0 license cannot substitute for that confirmation.
+Repository maintainer @blozano-tt specified Apache-2.0 for `tt_ops_code_gen`, the maintainer-local
+`tt-metal-pr-review` skill, and the maintainer-local `autodebug` source on 2026-09-09. Their license
+entries are based on that instruction. The recorded `tt_ops_code_gen` tree contains no LICENSE,
+LICENCE, COPYING or NOTICE file, and the two maintainer-local sources have no upstream license
+text recorded here. These entries are not the result of independently finding upstream license
+files. The complete Apache-2.0 license is provided in LICENSE.
 
 This repository has internal visibility. Earlier attribution text described it as public and
 claimed approval for public copying; that statement is not evidence of a license grant. Before
@@ -139,23 +140,23 @@ verified against the upstream revision before being changed.
 | `tt-comment-hygiene-review` | `tenstorrent/tt-buddy` | Apache-2.0 | `skills/code-review/reviewers/fresh-eye.md` | `ba9021417442` | ppetrovicTT |
 | `tt-comment-hygiene-review` | `tenstorrent/tt-buddy` | Apache-2.0 | `skills/code-review/reviewers/documentation.md` | `ba9021417442` | ppetrovicTT |
 | `tt-perf-claim-review` | `tenstorrent/tt-metal` | Apache-2.0 | `.agents/skills/optimize/SKILL.md` | `d58cb341c703` | yieldthought |
-| `tt-perf-claim-review` | `tenstorrent/tt_ops_code_gen` | NOASSERTION | `skills/perf-measure/SKILL.md` | `e9c9417eee23` | dstoiljkovicTT, mstaletovicTT, djordjenTT |
+| `tt-perf-claim-review` | `tenstorrent/tt_ops_code_gen` | Apache-2.0 | `skills/perf-measure/SKILL.md` | `e9c9417eee23` | dstoiljkovicTT, mstaletovicTT, djordjenTT |
 | `tt-review-core` | `tenstorrent/tt-buddy` | Apache-2.0 | `skills/code-review/shared.md` | `ba9021417442` | ppetrovicTT |
 | `tt-review-core` | `tenstorrent/tt-buddy` | Apache-2.0 | `skills/code-review/review-loop.md` | `ba9021417442` | ppetrovicTT |
 | `tt-review-core` | `tenstorrent/tt-metal` | Apache-2.0 | `.agents/skills/code_quality_review` | `d58cb341c703` | tchedaTT |
 | `tt-review-router` | `tenstorrent/tt-buddy` | Apache-2.0 | `skills/buddy/SKILL.md` | `ba9021417442` | ppetrovicTT |
 | `tt-review-router` | `tenstorrent/tt-metal` | Apache-2.0 | `tt_metal/tt-llk/.claude/skills/race-audit-all` | `ce91f33c0c71` | amahmudTT |
 | `tt-test-coverage-review` | `tenstorrent/tt-buddy` | Apache-2.0 | `skills/code-review/reviewers/qa.md` | `ba9021417442` | ppetrovicTT |
-| `tt-test-coverage-review` | `tenstorrent/tt_ops_code_gen` | NOASSERTION | `skills/golden-tests/SKILL.md` | `e9c9417eee23` | mstaletovicTT, djordjenTT, dstoiljkovicTT |
+| `tt-test-coverage-review` | `tenstorrent/tt_ops_code_gen` | Apache-2.0 | `skills/golden-tests/SKILL.md` | `e9c9417eee23` | mstaletovicTT, djordjenTT, dstoiljkovicTT |
 | `tt-vllm-serving-review` | `tenstorrent/tt-metal` | Apache-2.0 | `.agents/skills/vllm-integration/SKILL.md` | `d58cb341c703` | yieldthought, tchedaTT |
 | `tt-vllm-serving-review` | `tenstorrent/tt-buddy` | Apache-2.0 | `knowledge/recipes/vllm` | `ba9021417442` | ppetrovicTT, viktorpusTT |
 | `llk-perf-audit-review` | `tenstorrent/tt-metal` | Apache-2.0 | `tt_metal/tt-llk/.claude/skills/perf-optimization-audit` | `ce91f33c0c71` | fvranicTT |
 | `llk-perf-audit-review` | `tenstorrent/tt-metal` | Apache-2.0 | `tech_reports/Handling_Special_Value/special_values.md` | `ce91f33c0c71` | blozano-tt, ttmtrajkovic, jasondavies, ndivnicTT |
 | `llk-race-audit-review` | `tenstorrent/tt-metal` | Apache-2.0 | `tt_metal/tt-llk/.claude/skills/race-audit-all` | `ce91f33c0c71` | amahmudTT |
 | `llk-race-audit-review` | `tenstorrent/tt-metal` | Apache-2.0 | `.github/bug_checker/rules/llk-stale-hw-config-state.md` | `fb5c6cfa6f08` | blozano-tt |
-| `tt-l1-memory-review` | `tenstorrent/tt_ops_code_gen` | NOASSERTION | `references/l1-footprint-discipline.md` | `e9c9417eee23` | mstaletovicTT |
-| `tt-l1-memory-review` | `tenstorrent/tt_ops_code_gen` | NOASSERTION | `skills/memory-budget-metal/SKILL.md` | `e9c9417eee23` | mstaletovicTT, astancovTT, wransom-TT |
-| `tt-l1-memory-review` | `tenstorrent/tt_ops_code_gen` | NOASSERTION | `references/ttnn-cb-memory-fundamentals.md` | `e9c9417eee23` | mstaletovicTT, astancovTT, wransom-TT, dstoiljkovicTT |
+| `tt-l1-memory-review` | `tenstorrent/tt_ops_code_gen` | Apache-2.0 | `references/l1-footprint-discipline.md` | `e9c9417eee23` | mstaletovicTT |
+| `tt-l1-memory-review` | `tenstorrent/tt_ops_code_gen` | Apache-2.0 | `skills/memory-budget-metal/SKILL.md` | `e9c9417eee23` | mstaletovicTT, astancovTT, wransom-TT |
+| `tt-l1-memory-review` | `tenstorrent/tt_ops_code_gen` | Apache-2.0 | `references/ttnn-cb-memory-fundamentals.md` | `e9c9417eee23` | mstaletovicTT, astancovTT, wransom-TT, dstoiljkovicTT |
 | `tt-model-bringup-review` | `tenstorrent/tt-metal` | Apache-2.0 | `.agents/skills/optimize/SKILL.md` | `d58cb341c703` | yieldthought |
 | `tt-model-bringup-review` | `tenstorrent/tt-metal` | Apache-2.0 | `.agents/skills/functional-decoder/SKILL.md` | `d58cb341c703` | yieldthought |
 | `tt-model-bringup-review` | `tenstorrent/tt-buddy` | Apache-2.0 | `knowledge/matmul.md` | `ba9021417442` | ppetrovicTT |
@@ -163,12 +164,12 @@ verified against the upstream revision before being changed.
 | `tt-multichip-ccl-review` | `tenstorrent/tt-metal` | Apache-2.0 | `.agents/skills/multichip/SKILL.md` | `d58cb341c703` | yieldthought |
 | `tt-multichip-ccl-review` | `tenstorrent/tt-metal` | Apache-2.0 | `.github/bug_checker/rules/ccl-ring-buffer-mismatch.md` | `ce91f33c0c71` | stevendae |
 | `tt-precision-review` | `tenstorrent/tt-metal` | Apache-2.0 | `.agents/skills/datatype-sweep/SKILL.md` | `d58cb341c703` | yieldthought |
-| `tt-precision-review` | `tenstorrent/tt_ops_code_gen` | NOASSERTION | `references/precision_convention.md` | `e9c9417eee23` | djordjenTT |
-| `tt-precision-review` | `tenstorrent/tt_ops_code_gen` | NOASSERTION | `skills/numeric-formats-metal/SKILL.md` | `e9c9417eee23` | mstaletovicTT |
+| `tt-precision-review` | `tenstorrent/tt_ops_code_gen` | Apache-2.0 | `references/precision_convention.md` | `e9c9417eee23` | djordjenTT |
+| `tt-precision-review` | `tenstorrent/tt_ops_code_gen` | Apache-2.0 | `skills/numeric-formats-metal/SKILL.md` | `e9c9417eee23` | mstaletovicTT |
 | `tt-precision-review` | `tenstorrent/tt-metal` | Apache-2.0 | `tech_reports/Handling_Special_Value/special_values.md` | `ce91f33c0c71` | blozano-tt, ttmtrajkovic, jasondavies, ndivnicTT |
 | `tt-trace-review` | `tenstorrent/tt-metal` | Apache-2.0 | `.agents/skills/tt-enable-tracing/SKILL.md` | `d58cb341c703` | yieldthought, tchedaTT |
-| `ttnn-op-kernel-review` | `tenstorrent/tt_ops_code_gen` | NOASSERTION | `references/static-analysis-checklist.md` | `e9c9417eee23` | mstaletovicTT, astancovTT |
-| `ttnn-op-kernel-review` | `tenstorrent/tt_ops_code_gen` | NOASSERTION | `skills/debug-ttnn-op` | `e9c9417eee23` | mstaletovicTT |
+| `ttnn-op-kernel-review` | `tenstorrent/tt_ops_code_gen` | Apache-2.0 | `references/static-analysis-checklist.md` | `e9c9417eee23` | mstaletovicTT, astancovTT |
+| `ttnn-op-kernel-review` | `tenstorrent/tt_ops_code_gen` | Apache-2.0 | `skills/debug-ttnn-op` | `e9c9417eee23` | mstaletovicTT |
 | `ttnn-op-kernel-review` | `tenstorrent/tt-metal` | Apache-2.0 | `.github/bug_checker/rules/reshape-dim-check.md` | `ce91f33c0c71` | stevendae |
 | `ttnn-op-kernel-review` | `tenstorrent/tt-metal` | Apache-2.0 | `.github/bug_checker/rules/program-cache-hash-collision.md` | `fb5c6cfa6f08` | blozano-tt |
 | `ttnn-op-kernel-review` | `tenstorrent/tt-metal` | Apache-2.0 | `.github/bug_checker/rules/smuggled-buffer-runtime-arg.md` | `fb5c6cfa6f08` | blozano-tt |

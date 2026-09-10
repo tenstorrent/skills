@@ -10,11 +10,11 @@ metadata:
       path: .agents/skills/datatype-sweep/SKILL.md
       branch: agentic-research/fast-models-fast
     - repo: tenstorrent/tt_ops_code_gen
-      license: NOASSERTION
+      license: Apache-2.0
       ref: e9c9417eee23c6783b5e72d6a2eed9f75f389fc4
       path: references/precision_convention.md
     - repo: tenstorrent/tt_ops_code_gen
-      license: NOASSERTION
+      license: Apache-2.0
       ref: e9c9417eee23c6783b5e72d6a2eed9f75f389fc4
       path: skills/numeric-formats-metal/SKILL.md
     - repo: tenstorrent/tt-metal

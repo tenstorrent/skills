@@ -5,11 +5,11 @@ metadata:
   tier: kernel
   upstream:
     - repo: tenstorrent/tt_ops_code_gen
-      license: NOASSERTION
+      license: Apache-2.0
       ref: e9c9417eee23c6783b5e72d6a2eed9f75f389fc4
       path: references/static-analysis-checklist.md
     - repo: tenstorrent/tt_ops_code_gen
-      license: NOASSERTION
+      license: Apache-2.0
       ref: e9c9417eee23c6783b5e72d6a2eed9f75f389fc4
       path: skills/debug-ttnn-op
     - repo: tenstorrent/tt-metal

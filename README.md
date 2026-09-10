@@ -266,5 +266,5 @@ suite and the Codex plugin validator during authoring.
 Original contributions are licensed under [Apache-2.0](LICENSE). Adapted third-party material
 retains its upstream license and copyright notices, including MIT-licensed material from
 `mattpocock/skills` and `githubnext/gh-aw`. See [NOTICE](NOTICE) for the source-to-license mapping,
-contributors, and unresolved provenance, and [LICENSES](LICENSES/) for the MIT license texts.
+contributors, and license provenance, and [LICENSES](LICENSES/) for the MIT license texts.
 This repository's license does not relicense upstream material.
