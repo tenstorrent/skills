@@ -52,9 +52,9 @@ For MoE models, validate the real router/gate and active experts end-to-end. Com
 
 When PCC is low, debug it. Split the decoder into components, check HF parity, raise fidelity where useful, simplify the failing shape, and keep narrowing until the cause is understood. If a bug is tricky enough that ordinary narrowing stalls, use `$autofix`; it will run `$autodebug` if needed, then verify or refute each proposed bug before keeping any fix. If the cause is a tt-metal bug, make a reproducer or an on-branch workaround and record the evidence.
 
-## Consider Chunked Prefill
+## Implement Chunked Prefill
 
-Consider chunked prefill during functional bringup when long prompts or repeated requests with increasing lengths cause temporary-memory pressure, excessive shape-specific compilation, or failures before the supported context limit. A bounded physical chunk size can reuse working shapes while preserving arbitrary logical prompt lengths. It does not remove the KV capacity needed by the model. Keep a simpler unchunked path when it meets the contract; choose chunking from the model's needs and measured behavior, not a universal chunk size.
+Implement chunked prefill during functional bringup. A bounded physical chunk size can reuse working shapes while preserving arbitrary logical prompt lengths, it plays nicely with tracing and makes it easier to optimize L1 usage.
 
 Read existing implementations before designing the path:
 
@@ -62,13 +62,13 @@ Read existing implementations before designing the path:
 - [TT-Transformers attention](https://github.com/tenstorrent/tt-metal/blob/fc7777ceca4a2360667dbb193b28fedcccc89866/models/tt_transformers/tt/attention.py): chunk-local page tables drive cache writes, while `chunked_scaled_dot_product_attention` reads the accumulated cache with a causal chunk offset. This path explicitly rejects sliding-window attention.
 - [Gemma4 generator](https://github.com/tenstorrent/tt-metal/blob/fc7777ceca4a2360667dbb193b28fedcccc89866/models/demos/gemma4/tt/generator.py): true last-token indices, intermediate-chunk handling, per-layer page-table routing, and bounded sliding-cache tails need model-specific treatment. Its traced-chunk path excludes bounded sliding KV. Inspect the target revision and layer contracts rather than transplanting these exceptions.
 
-If using chunking:
-
 - Keep chunk start, valid token count, and padded physical length distinct. For continuation, absolute position is cached-prefix length plus the offset in the new input. Preserve prior K/V, write new K/V to the intended request's pages, and let each query attend to the valid prefix and causal current chunk. Padding must not become visible to attention or overwrite live cache entries.
 - Fill the required K/V for every intermediate chunk. Select generation logits from the final logical token, not a padded row; preserve all logical outputs when the layer or readiness caller requests them. The generator owns orchestration; the decoder exposes the cache/position inputs it needs.
 - Exercise increasing lengths on the same loaded instance, including just below/at/above a chunk boundary and multiple chunks plus a tail, then reuse a short request. Compare with HF and a feasible unchunked control, including follow-on decode that consumes the filled cache. Distinguish fresh requests, which reset request state, from explicit prefix continuation. Change tokens and page ownership to expose stale state; check each supported layer kind and sliding-window boundary.
 
 Keep later tracing straightforward: separate host chunk planning from device execution, and follow `$tt-enable-tracing` for stable buffers and input refresh. Warm/capture each distinct physical shape and op path; the first chunk, continuation chunks, and tails may need different traces or an eager path. Tensor-valued offsets only permit reuse when the op supports them and the remaining program signature is unchanged. Refresh positions, valid lengths and page tables before replay, and restore cache state after warmup/capture. A passing fixed-input replay does not prove increasing-length requests work.
+
+If after working on a chunked prefill implementation you have strong evidence that it would still produce a more performant model whilst still remaining trace-safe when interleaving prefill and decode with a variety of sequence lengths, then present that evidence clearly before proceeding with the alternative path.
 
 ## Evidence To Leave
 
