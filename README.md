@@ -67,15 +67,15 @@ for detailed setup, dry-run, and resume instructions.
 
 ## Alternative manual skill installation
 
-If you prefer to install plugins yourself, use the commands below. The repository has internal
-visibility; these commands use your GitHub SSH access.
+If you prefer to install plugins yourself, use the commands below. GitHub authentication is
+required while the repository has restricted visibility.
 
 ### Codex
 
 In a terminal, register the marketplace and install the finder:
 
 ```bash
-codex plugin marketplace add git@github.com:tenstorrent/skills.git
+codex plugin marketplace add https://github.com/tenstorrent/skills.git
 codex plugin add tt-skills@tenstorrent-skills
 ```
 
@@ -95,7 +95,7 @@ You can also select plugins under **Tenstorrent Skills** in the Plugins Director
 Inside the session, register the marketplace and install the finder:
 
 ```text
-/plugin marketplace add git@github.com:tenstorrent/skills.git
+/plugin marketplace add https://github.com/tenstorrent/skills.git
 /plugin install tt-skills@tenstorrent-skills
 ```
 
@@ -240,6 +240,23 @@ CI runs the deterministic package-sync check and the Python test suite. The Clau
 additional local check when the CLI is available; Codex plugin manifests are covered by the test
 suite and the Codex plugin validator during authoring.
 
-## Licence
+## Contributing
 
-Apache-2.0, as are all four upstream sources.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the plugin layout, contribution workflow,
+versioning, validation, and attribution requirements. Maintainers are listed in
+[CODEOWNERS](.github/CODEOWNERS).
+
+## Security
+
+For reporting security vulnerabilities privately, see [SECURITY.md](SECURITY.md).
+
+## Code of Conduct
+
+This project follows the [Contributor Covenant Code of Conduct](CODE_OF_CONDUCT.md).
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE), with third-party notices
+and license details in [NOTICE](NOTICE). See [LICENSE_understanding.txt](LICENSE_understanding.txt)
+for the accompanying Tenstorrent rights clarification and [SOURCES.md](SOURCES.md)
+for detailed contributor credits and provenance.
