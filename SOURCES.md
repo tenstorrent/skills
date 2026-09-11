@@ -21,11 +21,14 @@ vendor from.
 | `tenstorrent/tt-metal` @ `main` | public | `tt_metal/tt-llk/.claude`: race audits and the SFPU perf audit; `.github/bug_checker/rules` |
 | Codex skill `tt-metal-pr-review` | — | PR-review checklist, TTNN dealloc and vLLM-DP false-positive guards |
 
-All four repositories are Apache-2.0, as is this one.
+This repository uses [Apache-2.0](LICENSE). See [NOTICE](NOTICE) for applicable
+upstream notices and the MIT license texts for the catalogue structure and workflow
+sources credited in the README. This file preserves the detailed contributor and
+source records.
 
-## Two upstreams are private and this repo is public
+## Private upstream sources
 
-Content from `tt-buddy` and `tt_ops_code_gen` was copied into a public repository deliberately, with
+Content from `tt-buddy` and `tt_ops_code_gen` was copied into this collection deliberately, with
 approval. Two consequences worth stating plainly:
 
 1. **Naming those repositories here discloses that they exist** and roughly how they are laid out.

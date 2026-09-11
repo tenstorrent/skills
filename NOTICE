@@ -1,0 +1,80 @@
+Tenstorrent skills
+Copyright 2026 Tenstorrent USA, Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+================================================================================
+Sources and attribution
+
+This repository includes original contributions and material adapted from other
+projects. Third-party material retains its applicable license and copyright
+notices. This NOTICE is informational and does not modify those licenses.
+
+The review catalogue draws on tenstorrent/tt-buddy, tenstorrent/tt_ops_code_gen,
+tenstorrent/tt-metal, and the maintainer-local tt-metal-pr-review skill.
+SOURCES.md records the upstream paths, revisions, contributors, and adaptations.
+
+The tt-model-bringup plugin imports skills, prompts, orchestration, and readiness
+support from tt-metal. Its SYNC.md and sync-source.json record the source revision,
+imported paths, and package adaptations.
+
+The tt-autodebug plugin imports AutoDebug and AutoTriage prompts from a
+maintainer-local autodebug repository. Its SYNC.md and sync-source.json record the
+source revision and imported files.
+
+================================================================================
+Applicable upstream notice: tt-metal
+
+The following notice applies to the skill, prompt, and support files adapted from
+tt-metal. The LLVM source files and separately distributed dependencies listed in
+tt-metal's full NOTICE are not included in this repository's imports.
+
+tt-metal
+Copyright 2026 Tenstorrent USA, Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+================================================================================
+Catalogue structure and workflow patterns
+
+mattpocock/skills
+https://github.com/mattpocock/skills
+Copyright (c) 2026 Matt Pocock
+MIT License: LICENSES/mattpocock-skills-MIT.txt
+
+Credited for review catalogue structure, progressive disclosure, trigger
+descriptions, changesets, and installation conventions.
+License text preserved from revision 3cca18b368ae95cdbdebbff572ccafa662551015.
+
+githubnext/gh-aw
+https://github.com/githubnext/gh-aw
+Copyright GitHub, Inc.
+MIT License: LICENSES/gh-aw-MIT.txt
+
+Credited for workflow frontmatter, safe-output, and reviewer triage patterns used
+by .github/workflows/tt-pr-review.md. Contributors credited in the README:
+dsyme, pelikhan, and mnkiefer.
+License text preserved from revision 099efdda60fe970829f53f29f726c35615cd55eb.
+
+These license revisions identify the preserved license texts; the original
+catalogue import did not pin revisions for these two sources.
