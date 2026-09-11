@@ -216,6 +216,40 @@ The smoke passes only if `run.py` exits `0`, the TTI-written run spec has `docke
 
 If the smoke fails before a request is sent because the TTI benchmark client entry point is missing, fix the TTI client environment. For example, create/install the checkout's `BENCHMARKS_VLLM` venv or point the expected `vllm` client command at the already-installed vLLM CLI. Record this as a TTI setup fix. Do not respond by switching to `--docker-server` or a stock implementation.
 
+## Evaluation Reference Scores
+
+Choose references before launching release evals. For each task, use a suitable
+reference score already provided by the selected `tt-inference-server` checkout.
+If it has none for this model/task, use a published score from the matching Hugging
+Face model card or the original model paper. A TTI acceptance threshold is not a
+measured reference score; record the two separately. Never invent either value.
+
+Check the exact model/checkpoint and base versus instruct variant, task/dataset
+version and split, metric and units, sample count/subset, few-shot setup, prompt/chat
+template, and generation/scoring settings. Record unknown settings as unknown.
+A matching task name alone does not establish comparability. Published full-set
+scores are context for a CI subset, not a matched control or proof of parity.
+
+Record each source URL plus revision/table/row (or TTI commit and file/key), quoted
+score and units, measured autoport score, evaluation settings, and known differences
+or unknowns in `RUN_NOTES.md`. Add the source and comparability caveat beside the
+corresponding result in the copied release report and final handoff, not only in
+the work log. Preserve the original TTI output and its verdict when annotating it.
+Label published scores as published references, not locally reproduced baselines.
+Only claim parity when the evidence is comparable and meets an established
+model/task acceptance rule. Do not introduce a universal tolerance or turn a
+published reference score into an acceptance threshold. Without an established
+rule, report the comparison without a pass/parity claim.
+
+Do not launch a CPU or other reference evaluation merely because a score is missing.
+Use available published evidence with the caveats above; if no suitable reference
+or acceptance rule exists, report that limitation without claiming parity.
+An incomparable published score can provide context but cannot satisfy a quality
+gate. Missing comparison evidence is not itself an autoport bug to repair with
+`$autofix`, nor a reason to repeat completed evals. A new reference run requires an
+explicit request with an agreed runtime budget and compute allocation. This policy
+concerns release benchmark scores, not earlier stages' required HF tensor/PCC checks.
+
 ## Run The Release Workflow
 
 Run the release workflow only after the smoke passes. Keep the generated autoport vLLM server running and run TTI as a client. Never print tokens.
