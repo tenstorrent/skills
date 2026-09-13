@@ -21,10 +21,10 @@ vendor from.
 | `tenstorrent/tt-metal` @ `main` | public | `tt_metal/tt-llk/.claude`: race audits and the SFPU perf audit; `.github/bug_checker/rules` |
 | Codex skill `tt-metal-pr-review` | — | PR-review checklist, TTNN dealloc and vLLM-DP false-positive guards |
 
-This repository uses [Apache-2.0](LICENSE). See [NOTICE](NOTICE) for applicable
-upstream notices and the MIT license texts for the catalogue structure and workflow
-sources credited in the README. This file preserves the detailed contributor and
-source records.
+This repository uses [Apache-2.0](LICENSE). See [NOTICE](NOTICE) for third-party
+attribution and [LICENSES/](LICENSES/) for the preserved MIT license texts for the
+catalogue structure and workflow sources credited in the README. This file
+preserves the detailed contributor and source records.
 
 ## Private upstream sources
 
