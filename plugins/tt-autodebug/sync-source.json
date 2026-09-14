@@ -4,15 +4,15 @@
     "kind": "maintainer-local-git",
     "repository": "autodebug",
     "branch": "main",
-    "commit": "4d15fd683d279a1503c8f3f8a0508b83ea7a8657"
+    "commit": "c92eecbfc2075fa0e49add82e4b69689f57313f2"
   },
-  "importedOn": "2026-09-03",
+  "importedOn": "2026-09-14",
   "files": [
     {
       "source": "AUTODEBUG_PROMPT.md",
       "destination": "skills/autodebug/references/AUTODEBUG_PROMPT.md",
-      "gitBlob": "8d4b28a328b44aea437f2c166e3b11517e095713",
-      "sha256": "87975d94db7c1007d93e226e853000db6811a518e45e2f562478f1f9bca8f1ec"
+      "gitBlob": "50f8a0f8f3ece575f4e1518b7f4d65b23d82a6d0",
+      "sha256": "24c48940ca29f76cf2e32d8cd05237800d23d9ef3dbd178d48a2169df9945711"
     },
     {
       "source": "AUTOTRIAGE_PROMPT.md",

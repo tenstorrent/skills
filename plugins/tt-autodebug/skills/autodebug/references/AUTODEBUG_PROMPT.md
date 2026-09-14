@@ -186,3 +186,17 @@ For each possible explanation, ask: "What code fact would have to be true for th
 Turn those questions into small code-inspection experiments. A useful experiment may trace one value through callers, compare two setup paths, check whether a branch can run with the failing shape, or prove which code owns a default. Prefer checks that can make a favored explanation false. When useful, hand these experiments to subagents: give each subagent one precise fact to prove or refute, the relevant paths or observations, and no preferred answer. Ask for file and line evidence, traced values, and a clear `true`, `false`, or `uncertain`.
 
 If code inspection breaks the story, update the story instead of defending it. If a runtime control would be decisive but is outside AutoDebug's inspection-only scope, describe that control as a follow-up rather than treating it as evidence. In the report, headline the explanation that best predicts all important observations with the fewest extra assumptions, and explicitly mark attractive but unproven stories as unproven.
+
+### DBG-025: Audit capacity checks across allocation time
+
+When code uses current free capacity to admit work or select a factory, schedule, strategy, or buffer layout, build a time-ordered resource ledger from the check through output and workspace creation to final placement. Record what is live at the check, what is guaranteed to be allocated afterward, and what is placed last. Include later guaranteed allocations in the earlier budget, while avoiding double-counting when a later check reruns after allocation.
+
+Do not let the immediate error family collapse the investigation. Proving that one failed request is a tensor, static buffer, workspace, or other resource identifies that request only; it does not rule out another capacity bug in an adjacent planner or selector. After matching the observed failure, inspect capacity-based choices on the same path for stale snapshots, missing future reservations, and decisions based on transient allocator state.
+
+### DBG-026: Audit semantic domains in low-level control APIs
+
+When a low-level macro or helper accepts several integer selectors, indices, enum values, flags, or bitmasks, do not trust type checking or plausible names. Resolve every argument to its definition and verify that it belongs to the semantic domain required by that parameter. Compare sibling calls and definitions: values from different domains can overlap numerically, compile successfully, and still control the wrong resource or behavior.
+
+For primitives that control ordering, ownership, or resource state, verify both the encoding and the need for the control. A defensive wait, barrier, reset, or mode change is not automatically harmless. Identify exactly what it controls, which event or state it observes, whether adjacent work already executes in an ordered domain, and how the control interacts with every producer and consumer that can still be live.
+
+If an exact repro artifact is unavailable, still complete this local contract audit around the reported path and use the reported passing-versus-failing differential as a constraint. Missing runtime confirmation should lower confidence and be stated explicitly; it should not replace source analysis with a request for more artifacts when the available code contains a concrete contract contradiction.
