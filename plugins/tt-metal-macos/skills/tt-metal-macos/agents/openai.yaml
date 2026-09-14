@@ -1,0 +1,4 @@
+interface:
+  display_name: "TT-Metal for macOS"
+  short_description: "Build Metalium and SFPI on Apple Silicon"
+  default_prompt: "Use $tt-metal-macos to build tt-metal natively on this Apple Silicon Mac and verify the matching SFPI compiler."

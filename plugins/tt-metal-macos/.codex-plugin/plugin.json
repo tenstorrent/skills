@@ -1,0 +1,35 @@
+{
+  "name": "tt-metal-macos",
+  "version": "0.1.0",
+  "description": "Build tt-metal and the matching SFPI cross-compiler natively on Apple Silicon, then validate with the public ttsim simulator.",
+  "author": {
+    "name": "Tenstorrent"
+  },
+  "homepage": "https://github.com/tenstorrent/skills",
+  "repository": "https://github.com/tenstorrent/skills",
+  "license": "Apache-2.0",
+  "keywords": [
+    "tenstorrent",
+    "tt-metal",
+    "macos",
+    "apple-silicon",
+    "sfpi"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "TT-Metal for macOS",
+    "shortDescription": "Build Metalium and SFPI on Apple Silicon",
+    "longDescription": "Build tt-metal and the matching SFPI cross-compiler natively on Apple Silicon, then validate with the public ttsim simulator.",
+    "developerName": "Tenstorrent",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Native macOS builds",
+      "Pinned SFPI toolchain",
+      "Simulator validation"
+    ],
+    "websiteURL": "https://github.com/tenstorrent/skills",
+    "defaultPrompt": [
+      "Build tt-metal natively on this Apple Silicon Mac with the matching SFPI compiler."
+    ]
+  }
+}

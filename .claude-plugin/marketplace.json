@@ -24,6 +24,11 @@
       "name": "tt-model-bringup",
       "source": "./plugins/tt-model-bringup",
       "description": "Staged TTNN model bring-up. Requires separately installed tt-autodebug."
+    },
+    {
+      "name": "tt-metal-macos",
+      "source": "./plugins/tt-metal-macos",
+      "description": "Build tt-metal and the matching SFPI cross-compiler natively on Apple Silicon, then validate with the public ttsim simulator."
     }
   ]
 }

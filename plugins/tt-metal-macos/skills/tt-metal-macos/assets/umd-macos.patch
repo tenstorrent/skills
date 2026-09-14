@@ -1,0 +1,218 @@
+diff --git a/device/CMakeLists.txt b/device/CMakeLists.txt
+index 52cd44e..c0af884 100644
+--- a/device/CMakeLists.txt
++++ b/device/CMakeLists.txt
+@@ -15,7 +15,7 @@ if(TT_UMD_BUILD_SIMULATION)
+         OUTPUT
+             ${FBS_GENERATED_HEADER}
+         COMMAND
+-            flatc --cpp -o "${CMAKE_CURRENT_BINARY_DIR}" ${FBS_FILE}
++            $<TARGET_FILE:flatc> --cpp -o "${CMAKE_CURRENT_BINARY_DIR}" ${FBS_FILE}
+         DEPENDS
+             ${FBS_DEPENDS}
+             ${FBS_FILE}
+@@ -292,18 +292,25 @@ target_include_directories(
+         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>/common
+ )
+
++find_path(HWLOC_INCLUDE_DIR hwloc.h HINTS /opt/homebrew/include REQUIRED)
++get_filename_component(HWLOC_HEADER_REAL_PATH "${HWLOC_INCLUDE_DIR}/hwloc.h" REALPATH)
++get_filename_component(HWLOC_INCLUDE_DIR "${HWLOC_HEADER_REAL_PATH}" DIRECTORY)
++find_library(HWLOC_LIBRARY hwloc HINTS /opt/homebrew/lib REQUIRED)
++target_include_directories(tt-umd SYSTEM PRIVATE ${HWLOC_INCLUDE_DIR})
++
+ target_link_libraries(
+     tt-umd
+     PRIVATE
+         umd::Firmware
+-        hwloc
+-        rt
++        ${HWLOC_LIBRARY}
++        $<$<NOT:$<PLATFORM_ID:Darwin>>:rt>
+         spdlog::spdlog_header_only
+         fmt::fmt-header-only
+         tt-logger::tt-logger
+         yaml-cpp::yaml-cpp
+ )
+
++
+ target_link_libraries(tt-umd PRIVATE umd_asio_lib)
+
+ check_function_exists(
+diff --git a/device/chip_helpers/silicon_sysmem_manager.cpp b/device/chip_helpers/silicon_sysmem_manager.cpp
+index ba38976..b44f1ff 100644
+--- a/device/chip_helpers/silicon_sysmem_manager.cpp
++++ b/device/chip_helpers/silicon_sysmem_manager.cpp
+@@ -7,7 +7,11 @@
+ #include "umd/device/chip_helpers/silicon_sysmem_manager.hpp"
+
+ #include <fmt/format.h>
++#if defined(__linux__)
+ #include <linux/mman.h>  // for MAP_HUGE_1GB, MAP_HUGE_2MB
++#else
++#define MAP_POPULATE 0
++#endif
+ #include <sys/mman.h>    // for mmap, munmap
+ #include <sys/stat.h>    // for fstat
+ #include <unistd.h>
+@@ -42,11 +46,11 @@ namespace tt::umd {
+ // This is a performance optimization: hugepages reduce page fault overhead during allocation.
+ // All three options are functionally correct when IOMMU is enabled.
+ static void *mmap_with_hugepage_fallback(size_t size) {
+-    constexpr size_t kHugepage1GiB = 1ULL << 30;
+-    constexpr size_t kHugepage2MiB = 2ULL << 20;
+-
+     void *addr = MAP_FAILED;
+
++#if defined(__linux__)
++    constexpr size_t kHugepage1GiB = 1ULL << 30;
++    constexpr size_t kHugepage2MiB = 2ULL << 20;
+     // Only attempt 1GiB hugepages when the size is a multiple of 1GiB.
+     if (size >= kHugepage1GiB && (size % kHugepage1GiB) == 0) {
+         addr = mmap(
+@@ -77,6 +81,7 @@ static void *mmap_with_hugepage_fallback(size_t size) {
+         }
+     }
+
++#endif
+     addr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
+     if (addr != MAP_FAILED) {
+         log_debug(LogUMD, "Allocated {:#x} bytes using regular pages.", size);
+diff --git a/device/chip_helpers/simulation_sysmem_manager.cpp b/device/chip_helpers/simulation_sysmem_manager.cpp
+index 2d6f90d..cd4a412 100644
+--- a/device/chip_helpers/simulation_sysmem_manager.cpp
++++ b/device/chip_helpers/simulation_sysmem_manager.cpp
+@@ -50,7 +50,9 @@ bool SimulationSysmemManager::init_sysmem(uint32_t num_host_mem_channels) {
+     system_memory_ =
+         static_cast<uint8_t*>(mmap(nullptr, total_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+     UMD_ASSERT(system_memory_ != MAP_FAILED, error::RuntimeError, "system_memory mmap() failed");
++#if defined(__linux__)
+     madvise(system_memory_, total_size, MADV_HUGEPAGE);
++#endif
+     system_memory_size_ = total_size;
+
+     for (int i = 0; i < num_host_mem_channels; i++) {
+diff --git a/device/pcie/ioctl.h b/device/pcie/ioctl.h
+index d613eb4..fa898c1 100644
+--- a/device/pcie/ioctl.h
++++ b/device/pcie/ioctl.h
+@@ -8,8 +8,19 @@
+ #ifndef TTDRIVER_IOCTL_H_INCLUDED
+ #define TTDRIVER_IOCTL_H_INCLUDED
+
++#if defined(__APPLE__)
++#include <stdint.h>
++#include <sys/ioctl.h>
++typedef uint8_t __u8;
++typedef uint16_t __u16;
++typedef uint32_t __u32;
++typedef uint64_t __u64;
++typedef int32_t __s32;
++typedef int64_t __s64;
++#else
+ #include <linux/types.h>
+ #include <linux/ioctl.h>
++#endif
+
+ #define TENSTORRENT_DRIVER_VERSION 2
+
+diff --git a/device/pcie/pci_device.cpp b/device/pcie/pci_device.cpp
+index 2230d53..412ca35 100644
+--- a/device/pcie/pci_device.cpp
++++ b/device/pcie/pci_device.cpp
+@@ -9,6 +9,9 @@
+ #include <sys/ioctl.h>  // for ioctl
+ #include <sys/mman.h>   // for mmap, munmap
+ #include <unistd.h>     // for ::close
++#if defined(__APPLE__)
++#define MAP_POPULATE 0
++#endif
+
+ #include <cerrno>
+ #include <cstdint>
+diff --git a/device/simulation/tt_sim_communicator.cpp b/device/simulation/tt_sim_communicator.cpp
+index de06186..16dea1c 100644
+--- a/device/simulation/tt_sim_communicator.cpp
++++ b/device/simulation/tt_sim_communicator.cpp
+@@ -8,7 +8,9 @@
+ #include <fcntl.h>
+ #include <fmt/format.h>
+ #include <sys/mman.h>
++#if defined(__linux__)
+ #include <sys/sendfile.h>
++#endif
+ #include <sys/stat.h>
+ #include <unistd.h>
+
+@@ -120,6 +122,13 @@ void TTSimCommunicator::set_pcie_dma_mem_callbacks(
+     pfn_libttsim_set_pci_dma_mem_callbacks_(pci_dma_mem_rd_bytes_wrapper, pci_dma_mem_wr_bytes_wrapper);
+ }
+
++#if defined(__APPLE__)
++void TTSimCommunicator::create_simulator_binary() {
++    UMD_THROW(error::RuntimeError, "Copying simulator libraries with memfd is unavailable on macOS. Use copy_sim_binary=false.");
++}
++void TTSimCommunicator::copy_simulator_binary() { create_simulator_binary(); }
++void TTSimCommunicator::secure_simulator_binary() { create_simulator_binary(); }
++#else
+ void TTSimCommunicator::create_simulator_binary() {
+     const std::string filename = simulator_directory_.stem().string();
+     const std::string extension = simulator_directory_.extension().string();
+@@ -179,6 +188,8 @@ void TTSimCommunicator::secure_simulator_binary() {
+     }
+ }
+
++#endif
++
+ void TTSimCommunicator::load_simulator_library(const std::filesystem::path &path) {
+     libttsim_handle_ = dlopen(path.c_str(), RTLD_LAZY);
+     if (!libttsim_handle_) {
+diff --git a/device/soc_descriptor.cpp b/device/soc_descriptor.cpp
+index 43ee162..eed0c80 100644
+--- a/device/soc_descriptor.cpp
++++ b/device/soc_descriptor.cpp
+@@ -6,6 +6,7 @@
+
+ #include <fmt/format.h>
+ #include <yaml-cpp/yaml.h>
++#include <unistd.h>
+
+ #include <cstddef>
+ #include <cstdint>
+diff --git a/device/utils/robust_mutex.cpp b/device/utils/robust_mutex.cpp
+index 45620d0..7e7b6de 100644
+--- a/device/utils/robust_mutex.cpp
++++ b/device/utils/robust_mutex.cpp
+@@ -1,3 +1,26 @@
++// SPDX-License-Identifier: Apache-2.0
++#if defined(__APPLE__)
++#include "umd/device/utils/robust_mutex.hpp"
++#include "umd/device/utils/error.hpp"
++
++namespace tt::umd {
++// The simulator uses process-local locks. Physical-device process-shared robust
++// mutexes have no macOS pthread equivalent; reject that path explicitly.
++RobustMutex::RobustMutex(std::string_view name) : mutex_name_(name) {}
++RobustMutex::~RobustMutex() noexcept = default;
++RobustMutex::RobustMutex(RobustMutex&&) noexcept = default;
++RobustMutex& RobustMutex::operator=(RobustMutex&&) noexcept = default;
++void RobustMutex::initialize() {
++    UMD_THROW(error::RuntimeError, "Process-shared robust device locks are unavailable on macOS; use the simulator.");
++}
++void RobustMutex::lock() { initialize(); }
++void RobustMutex::unlock() { initialize(); }
++std::optional<std::pair<pid_t, pid_t>> RobustMutex::probe_lock(std::chrono::seconds) {
++    initialize();
++    return std::nullopt;
++}
++}  // namespace tt::umd
++#else
+ // SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+ //
+ // SPDX-License-Identifier: Apache-2.0
+@@ -474,3 +497,5 @@ void RobustMutex::lock() {
+ }
+
+ }  // namespace tt::umd
++
++#endif

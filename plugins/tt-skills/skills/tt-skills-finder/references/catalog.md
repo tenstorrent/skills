@@ -63,3 +63,12 @@ model bring-up stops with installation instructions before starting work.
   `/plugin install tt-model-bringup@tenstorrent-skills`.
 
 Skills work in both hosts; the unattended `multigoal` runner requires Codex's goals app-server API.
+
+## `tt-metal-macos`
+
+Use for native Apple Silicon builds of tt-metal, choosing an SFPI toolchain that runs on macOS,
+or running the public ttsim simulator on a Mac. The recipe pins a macOS port and the matching
+SFPI release; it does not claim current tt-metal main or physical-device support on macOS.
+
+- **Codex:** `codex plugin add tt-metal-macos@tenstorrent-skills`.
+- **Claude Code:** `/plugin install tt-metal-macos@tenstorrent-skills`.

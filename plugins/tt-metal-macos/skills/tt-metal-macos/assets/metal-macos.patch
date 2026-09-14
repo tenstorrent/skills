@@ -1,0 +1,15 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 73b5516640..a1f9cf2b9d 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -176,6 +176,10 @@ endif()
+ ############################################################################################################################
+ # Find hwloc properly (brew installs to non-standard prefix on macOS)
+ find_path(HWLOC_INCLUDE_DIR hwloc.h HINTS /opt/homebrew/include /usr/local/include /usr/include)
++if(HWLOC_INCLUDE_DIR)
++    get_filename_component(HWLOC_HEADER_REAL_PATH "${HWLOC_INCLUDE_DIR}/hwloc.h" REALPATH)
++    get_filename_component(HWLOC_INCLUDE_DIR "${HWLOC_HEADER_REAL_PATH}" DIRECTORY)
++endif()
+ find_library(HWLOC_LIBRARY hwloc HINTS /opt/homebrew/lib /usr/local/lib /usr/lib)
+ if(NOT HWLOC_LIBRARY)
+     set(HWLOC_LIBRARY hwloc)
