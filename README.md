@@ -45,6 +45,7 @@ automatically for matching tasks; you can also ask your agent to make them expli
 | `tt-review-skills` | PR and diff review for TTNN, Metalium, LLK, models, serving, multi-chip, trace, precision, testing, and L1 changes |
 | `tt-autodebug` | AutoDebug and AutoTriage investigate code issues and hangs; AutoFix tests hypotheses and repairs the cause |
 | `tt-model-bringup` | Eleven stages from HF decoder to TTNN/vLLM release, with chunked-prefill guidance, prefill/TTFT optimization, targeted path/serving checks, and published evaluation references with comparability caveats. Requires `tt-autodebug`. |
+| `tt-debug-tools` | Drive the Tenstorrent debug tools and read their output: tt-triage, dprint, watcher, asserts, etc. See [`plugins/tt-debug-tools/README.md`](plugins/tt-debug-tools/README.md) |
 
 AutoDebug investigates in a fresh agent process and writes `AUTODEBUG.md`. AutoFix handles source
 changes and validation. For examples and expected outputs, see the
@@ -84,6 +85,7 @@ Choose any optional plugins you want:
 ```bash
 codex plugin add tt-autodebug@tenstorrent-skills
 codex plugin add tt-review-skills@tenstorrent-skills
+codex plugin add tt-debug-tools@tenstorrent-skills
 # Model bring-up also requires tt-autodebug:
 codex plugin add tt-model-bringup@tenstorrent-skills
 ```
@@ -104,6 +106,7 @@ Choose any optional plugins you want:
 ```text
 /plugin install tt-autodebug@tenstorrent-skills
 /plugin install tt-review-skills@tenstorrent-skills
+/plugin install tt-debug-tools@tenstorrent-skills
 ```
 
 For model bring-up, install `tt-autodebug` above and then:
@@ -217,6 +220,8 @@ Primary author is the top contributor to that path by commit count.
 | ⤷ `perf-optimization-audit` | [@fvranicTT](https://github.com/fvranicTT) | The provenance lens, semantic-equivalence gate, SIMD false-positive guards |
 | [`tt-metal`](https://github.com/tenstorrent/tt-metal) — `.github/bug_checker` | [@stevendae](https://github.com/stevendae) | Rules distilled from ~1,398 merged fix PRs: program-cache correctness, op validation, CCL ring buffers, stale LLK config. Strong evidence of which failures *recur* |
 | [`tt-metal`](https://github.com/tenstorrent/tt-metal) — `tech_reports/Handling_Special_Value` | [@ttmtrajkovic](https://github.com/ttmtrajkovic) | NaN/Inf/denormal semantics and the FPU/SFPU divergence |
+| [`tt-metal`](https://github.com/tenstorrent/tt-metal) — `docs/source/tt-metalium/tools`, `tt_metal/impl/debug`, `tt_metal/tools`, `tt_metal/hw/inc/api/debug` | *see note below* | The `tt-debug-tools` plugin: watcher, DPRINT, NoC debug dump, asserts and the LLK sanitizer, Inspector, triage, the device profiler, and TTNN's host-side debug flags |
+| [`tenstorrent/tt-exalens`](https://github.com/tenstorrent/tt-exalens) | *see note below* | The `tt-exalens` skill: the command set, the server/remote and GDB modes, JTAG, and NoC selection |
 
 ### Structure and tooling
 
@@ -225,18 +230,20 @@ Primary author is the top contributor to that path by commit count.
 | [`mattpocock/skills`](https://github.com/mattpocock/skills) | [@mattpocock](https://github.com/mattpocock) | **The shape of the review catalogue.** Bucketed `skills/<bucket>/<name>/`, progressive disclosure, trigger-style descriptions, `in-progress/` and `deprecated/`, invocation bifurcation, changesets, the install-block convention |
 | [`githubnext/gh-aw`](https://github.com/githubnext/gh-aw) | [@dsyme](https://github.com/dsyme), [@pelikhan](https://github.com/pelikhan), [@mnkiefer](https://github.com/mnkiefer) | The consumer. `skills:` frontmatter, `safe-outputs`, and the `mattpocock-skills-reviewer` triage pattern the reference workflow follows |
 
+**If your work is here and the attribution is wrong, thin, or you would rather it were not — open an
+issue and we will fix or remove it.** Everything vendored is Apache-2.0, but licence compliance and
+proper credit are different things, and we care about the second one.
 
 ## Validate changes
 
 ```bash
 python3 scripts/sync_review_plugin.py --check
-pytest tests/
+pytest                                     # repo and every plugin
 claude plugin validate . --strict
 ```
 
-CI runs the deterministic package-sync check and the Python test suite. The Claude validator is an
-additional local check when the CLI is available; Codex plugin manifests are covered by the test
-suite and the Codex plugin validator during authoring.
+Agent-driven evals are separate — they cost money per run and never run in CI. Each plugin invokes
+its own; see [`plugins/tt-debug-tools/README.md`](plugins/tt-debug-tools/README.md) for that plugin's.
 
 ## Contributing
 
