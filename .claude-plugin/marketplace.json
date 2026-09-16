@@ -24,6 +24,11 @@
       "name": "tt-model-bringup",
       "source": "./plugins/tt-model-bringup",
       "description": "Staged TTNN model bring-up. Requires separately installed tt-autodebug."
+    },
+    {
+      "name": "tt-debug-tools",
+      "source": "./plugins/tt-debug-tools",
+      "description": "Drive the Tenstorrent debug tools and read their output: tt-triage, dprint, watcher, asserts, etc."
     }
   ]
 }

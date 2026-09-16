@@ -1,0 +1,6 @@
+{
+  "must_mention": [
+    "core_magic",
+    "0xDEADBEEF"
+  ]
+}

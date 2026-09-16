@@ -1,0 +1,11 @@
+{
+  "name": "tt-debug-tools",
+  "version": "0.1.1",
+  "description": "Drive the Tenstorrent debug tools and read their output: tt-triage, dprint, watcher, asserts, etc.",
+  "author": {
+    "name": "tenstorrent"
+  },
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/tenstorrent/skills",
+  "skills": "./skills/"
+}

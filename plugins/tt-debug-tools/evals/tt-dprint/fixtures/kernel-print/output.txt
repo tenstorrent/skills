@@ -1,0 +1,297 @@
+2026-09-04 19:40:54.194 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:228)
+2026-09-04 19:40:54.194 | info     |             UMD | Cluster constructor started. (cluster.cpp:378)
+2026-09-04 19:40:54.195 | info     |             UMD | Creating TopologyDiscovery for architecture: wormhole_b0 (topology_discovery.cpp:95)
+2026-09-04 19:40:54.195 | info     |             UMD | Starting topology discovery. (topology_discovery.cpp:114)
+2026-09-04 19:40:54.203 | info     |             UMD | Established firmware bundle version: 19.7.1 (topology_discovery.cpp:574)
+2026-09-04 19:40:54.233 | info     |             UMD | Completed topology discovery. (topology_discovery.cpp:118)
+2026-09-04 19:40:54.314 | info     |             UMD | Opening local chip ids/PCIe ids: {0, 1, 2, 3}/[0, 1, 2, 3] and remote chip ids {4, 5, 6, 7} (cluster.cpp:168)
+2026-09-04 19:40:54.314 | info     |             UMD | IOMMU: disabled (cluster.cpp:142)
+2026-09-04 19:40:54.314 | info     |             UMD | KMD version: 2.10.0 (cluster.cpp:145)
+2026-09-04 19:40:54.314 | info     |             UMD | Cluster constructor completed. (cluster.cpp:574)
+2026-09-04 19:40:54.321 | info     |             UMD | Starting devices in cluster (cluster.cpp:1092)
+2026-09-04 19:40:54.340 | info     |             UMD | Starting devices in cluster completed. (cluster.cpp:1100)
+2026-09-04 19:40:54.386 | info     |     Distributed | Using auto discovery to generate mesh graph. (metal_env.cpp:423)
+2026-09-04 19:40:54.386 | info     |     Distributed | Constructing control plane using auto-discovery (no mesh graph descriptor). (metal_env.cpp:485)
+2026-09-04 19:40:54.387 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {2:4, 3:4} (topology_mapper_utils.cpp:2452)
+2026-09-04 19:40:54.387 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {2:4, 3:4} (topology_mapper_utils.cpp:2460)
+2026-09-04 19:40:54.435 | info     |           Metal | DPRINT enabled on device 0, all worker cores. (dprint_server.cpp:1078)
+2026-09-04 19:40:54.436 | info     |           Metal | DPRINT Server attached device 0 (dprint_server.cpp:1163)
+2026-09-04 19:40:54.541 | info     |           Metal | DPRINT enabled on device 1, all worker cores. (dprint_server.cpp:1078)
+2026-09-04 19:40:54.541 | info     |           Metal | DPRINT Server attached device 1 (dprint_server.cpp:1163)
+2026-09-04 19:40:54.647 | info     |           Metal | DPRINT enabled on device 2, all worker cores. (dprint_server.cpp:1078)
+2026-09-04 19:40:54.648 | info     |           Metal | DPRINT Server attached device 2 (dprint_server.cpp:1163)
+2026-09-04 19:40:54.753 | info     |           Metal | DPRINT enabled on device 3, all worker cores. (dprint_server.cpp:1078)
+2026-09-04 19:40:54.754 | info     |           Metal | DPRINT Server attached device 3 (dprint_server.cpp:1163)
+2026-09-04 19:40:54.859 | info     |           Metal | DPRINT enabled on device 4, all worker cores. (dprint_server.cpp:1078)
+2026-09-04 19:40:54.865 | info     |           Metal | DPRINT Server attached device 4 (dprint_server.cpp:1163)
+2026-09-04 19:40:54.971 | info     |           Metal | DPRINT enabled on device 5, all worker cores. (dprint_server.cpp:1078)
+2026-09-04 19:40:54.976 | info     |           Metal | DPRINT Server attached device 5 (dprint_server.cpp:1163)
+2026-09-04 19:40:55.084 | info     |           Metal | DPRINT enabled on device 6, all worker cores. (dprint_server.cpp:1078)
+2026-09-04 19:40:55.090 | info     |           Metal | DPRINT Server attached device 6 (dprint_server.cpp:1163)
+2026-09-04 19:40:55.198 | info     |           Metal | DPRINT enabled on device 7, all worker cores. (dprint_server.cpp:1078)
+2026-09-04 19:40:55.206 | info     |           Metal | DPRINT Server attached device 7 (dprint_server.cpp:1163)
+2026-09-04 19:40:55.506 | warning  |           Metal | Opening subset of mmio devices slows down UMD read/write to remote chips. If opening more devices, consider using CreateDevices API. (device_manager.cpp:261)
+2026-09-04 19:40:55.507 | warning  |           Metal | Dispatch telemetry SMC buffer is unavailable (dispatch_telemetry.cpp:53)
+2026-09-04 19:40:55.508 | warning  |           Metal | Dispatch telemetry SMC buffer is unavailable (dispatch_telemetry.cpp:53)
+2026-09-04 19:40:58.966 | info     |           Metal | D2HSocket: Using hugepage fallback for device 0 (data_dev_addr=0x3fffe000, pcie_xy_enc=0xc08) (d2h_socket.cpp:138)
+2026-09-04 19:40:58.968 | info     |           Metal | DPRINT: dispatch DRAM aggregation running on device 0 (dprint_server.cpp:707)
+0:1-7:BR: dispatch_11: start
+0:1-7:NC: dispatch_s : start
+0:0-7:BR: prefetcher_11: start
+0:1-7:NC: CQ_DISPATCH_SET_NUM_WORKER_SEMS
+0:1-7:NC: CQ_DISPATCH_SET_SUB_DEVICE_WORKER_COUNTS
+0:1-7:NC: dispatch_s sub_device_idx=0 num_workers=62
+0:1-7:NC: CQ_DISPATCH_SET_GO_SIGNAL_NOC_DATA
+0:7-7:BR: REALTIME BRISC: kernel started
+0:7-7:BR: REALTIME: sync_request detected!
+0:7-7:BR: REALTIME: entering sync
+0:7-7:BR: REALTIME: sync got host_time=154382770
+0:7-7:BR: REALTIME: sync pushed count=1
+0:7-7:BR: REALTIME: sync got host_time=168593842
+0:7-7:BR: REALTIME: sync pushed count=2
+0:7-7:BR: REALTIME: sync got host_time=183235882
+0:7-7:BR: REALTIME: sync pushed count=3
+0:7-7:BR: REALTIME: sync got host_time=197873890
+0:7-7:BR: REALTIME: sync pushed count=4
+0:7-7:BR: REALTIME: sync got host_time=212512178
+0:7-7:BR: REALTIME: sync pushed count=5
+0:7-7:BR: REALTIME: sync got host_time=227148386
+0:7-7:BR: REALTIME: sync pushed count=6
+0:7-7:BR: REALTIME: sync got host_time=241785610
+0:7-7:BR: REALTIME: sync pushed count=7
+0:7-7:BR: REALTIME: sync got host_time=256431774
+0:7-7:BR: REALTIME: sync pushed count=8
+0:7-7:BR: REALTIME: sync got host_time=271065798
+0:7-7:BR: REALTIME: sync pushed count=9
+0:7-7:BR: REALTIME: sync got host_time=285722862
+0:7-7:BR: REALTIME: sync pushed count=10
+0:7-7:BR: REALTIME: sync got host_time=300009034
+0:7-7:BR: REALTIME: sync pushed count=11
+0:7-7:BR: REALTIME: sync got host_time=314654170
+0:7-7:BR: REALTIME: sync pushed count=12
+0:7-7:BR: REALTIME: sync got host_time=329296350
+0:7-7:BR: REALTIME: sync pushed count=13
+0:7-7:BR: REALTIME: sync got host_time=343935178
+0:7-7:BR: REALTIME: sync pushed count=14
+0:7-7:BR: REALTIME: sync got host_time=358570862
+0:7-7:BR: REALTIME: sync pushed count=15
+0:7-7:BR: REALTIME: sync got host_time=373122270
+0:7-7:BR: REALTIME: sync pushed count=16
+0:7-7:BR: REALTIME: sync got host_time=387758222
+0:7-7:BR: REALTIME: sync pushed count=17
+0:7-7:BR: REALTIME: sync got host_time=402390922
+0:7-7:BR: REALTIME: sync pushed count=18
+0:7-7:BR: REALTIME: sync got host_time=417031570
+0:7-7:BR: REALTIME: sync pushed count=19
+0:7-7:BR: REALTIME: sync got host_time=431669822
+0:7-7:BR: REALTIME: sync pushed count=20
+0:7-7:BR: REALTIME: sync got host_time=446327558
+0:7-7:BR: REALTIME: sync pushed count=21
+0:7-7:BR: REALTIME: sync got host_time=460960734
+0:7-7:BR: REALTIME: sync pushed count=22
+0:7-7:BR: REALTIME: sync got host_time=475594986
+0:7-7:BR: REALTIME: sync pushed count=23
+0:7-7:BR: REALTIME: sync got host_time=490230430
+0:7-7:BR: REALTIME: sync pushed count=24
+0:7-7:BR: REALTIME: sync got host_time=504864366
+0:7-7:BR: REALTIME: sync pushed count=25
+0:7-7:BR: REALTIME: sync got host_time=519517134
+0:7-7:BR: REALTIME: sync pushed count=26
+0:7-7:BR: REALTIME: sync got host_time=533738678
+0:7-7:BR: REALTIME: sync pushed count=27
+0:7-7:BR: REALTIME: sync got host_time=548397034
+0:7-7:BR: REALTIME: sync pushed count=28
+0:7-7:BR: REALTIME: sync got host_time=563060410
+0:7-7:BR: REALTIME: sync pushed count=29
+0:7-7:BR: REALTIME: sync got host_time=577711782
+0:7-7:BR: REALTIME: sync pushed count=30
+0:7-7:BR: REALTIME: sync got host_time=592340202
+0:7-7:BR: REALTIME: sync pushed count=31
+0:7-7:BR: REALTIME: sync got host_time=606982590
+0:7-7:BR: REALTIME: sync pushed count=32
+0:7-7:BR: REALTIME: sync got host_time=621621318
+0:7-7:BR: REALTIME: sync pushed count=33
+0:7-7:BR: REALTIME: sync got host_time=636276562
+0:7-7:BR: REALTIME: sync pushed count=34
+0:7-7:BR: REALTIME: sync got host_time=650912842
+0:7-7:BR: REALTIME: sync pushed count=35
+0:7-7:BR: REALTIME: sync got host_time=665547242
+0:7-7:BR: REALTIME: sync pushed count=36
+0:7-7:BR: REALTIME: sync got host_time=680181302
+0:7-7:BR: REALTIME: sync pushed count=37
+0:7-7:BR: REALTIME: sync got host_time=694816722
+0:7-7:BR: REALTIME: sync pushed count=38
+0:7-7:BR: REALTIME: sync got host_time=709450314
+0:7-7:BR: REALTIME: sync pushed count=39
+0:7-7:BR: REALTIME: sync got host_time=724125818
+0:7-7:BR: REALTIME: sync pushed count=40
+0:7-7:BR: REALTIME: sync got host_time=738406470
+0:7-7:BR: REALTIME: sync pushed count=41
+0:7-7:BR: REALTIME: sync got host_time=752618702
+0:7-7:BR: REALTIME: sync pushed count=42
+0:7-7:BR: REALTIME: sync got host_time=767262674
+0:7-7:BR: REALTIME: sync pushed count=43
+0:7-7:BR: REALTIME: sync got host_time=781896478
+0:7-7:BR: REALTIME: sync pushed count=44
+0:7-7:BR: REALTIME: sync got host_time=796125286
+0:7-7:BR: REALTIME: sync pushed count=45
+0:7-7:BR: REALTIME: sync got host_time=810758994
+0:7-7:BR: REALTIME: sync pushed count=46
+0:7-7:BR: REALTIME: sync got host_time=825395778
+0:7-7:BR: REALTIME: sync pushed count=47
+0:7-7:BR: REALTIME: sync got host_time=840033358
+0:7-7:BR: REALTIME: sync pushed count=48
+0:7-7:BR: REALTIME: sync got host_time=854682426
+0:7-7:BR: REALTIME: sync pushed count=49
+0:7-7:BR: REALTIME: sync got host_time=869313842
+0:7-7:BR: REALTIME: sync pushed count=50
+0:7-7:BR: REALTIME: sync got host_time=883947630
+0:7-7:BR: REALTIME: sync pushed count=51
+0:7-7:BR: REALTIME: sync got host_time=898581870
+0:7-7:BR: REALTIME: sync pushed count=52
+0:7-7:BR: REALTIME: sync got host_time=913217610
+0:7-7:BR: REALTIME: sync pushed count=53
+0:7-7:BR: REALTIME: sync got host_time=927851306
+0:7-7:BR: REALTIME: sync pushed count=54
+0:7-7:BR: REALTIME: sync got host_time=942483650
+0:7-7:BR: REALTIME: sync pushed count=55
+0:7-7:BR: REALTIME: sync got host_time=957117102
+0:7-7:BR: REALTIME: sync pushed count=56
+0:7-7:BR: REALTIME: sync got host_time=971751290
+0:7-7:BR: REALTIME: sync pushed count=57
+0:7-7:BR: REALTIME: sync got host_time=986283070
+0:7-7:BR: REALTIME: sync pushed count=58
+0:7-7:BR: REALTIME: sync got host_time=1000915562
+0:7-7:BR: REALTIME: sync pushed count=59
+0:7-7:BR: REALTIME: sync got host_time=1015563790
+0:7-7:BR: REALTIME: sync pushed count=60
+0:7-7:BR: REALTIME: sync got host_time=1030199890
+0:7-7:BR: REALTIME: sync pushed count=61
+0:7-7:BR: REALTIME: sync got host_time=1044837006
+0:7-7:BR: REALTIME: sync pushed count=62
+0:7-7:BR: REALTIME: sync got host_time=1059476158
+0:7-7:BR: REALTIME: sync pushed count=63
+0:7-7:BR: REALTIME: sync got host_time=1074112346
+0:7-7:BR: REALTIME: sync pushed count=64
+0:7-7:BR: REALTIME: sync got host_time=1088748526
+0:7-7:BR: REALTIME: sync pushed count=65
+0:7-7:BR: REALTIME: sync got host_time=1103383130
+0:7-7:BR: REALTIME: sync pushed count=66
+0:7-7:BR: REALTIME: sync got host_time=1118055382
+0:7-7:BR: REALTIME: sync pushed count=67
+0:7-7:BR: REALTIME: sync got host_time=1132690102
+0:7-7:BR: REALTIME: sync pushed count=68
+0:7-7:BR: REALTIME: sync got host_time=1147325134
+0:7-7:BR: REALTIME: sync pushed count=69
+0:7-7:BR: REALTIME: sync got host_time=1161958370
+0:7-7:BR: REALTIME: sync pushed count=70
+0:7-7:BR: REALTIME: sync got host_time=1176595314
+0:7-7:BR: REALTIME: sync pushed count=71
+0:7-7:BR: REALTIME: sync got host_time=1191235146
+0:7-7:BR: REALTIME: sync pushed count=72
+0:7-7:BR: REALTIME: sync got host_time=1205439042
+0:7-7:BR: REALTIME: sync pushed count=73
+0:7-7:BR: REALTIME: sync got host_time=1220078766
+0:7-7:BR: REALTIME: sync pushed count=74
+0:7-7:BR: REALTIME: sync got host_time=1234715506
+0:7-7:BR: REALTIME: sync pushed count=75
+0:7-7:BR: REALTIME: sync got host_time=1249369630
+0:7-7:BR: REALTIME: sync pushed count=76
+0:7-7:BR: REALTIME: sync got host_time=1264013442
+0:7-7:BR: REALTIME: sync pushed count=77
+0:7-7:BR: REALTIME: sync got host_time=1278654326
+0:7-7:BR: REALTIME: sync pushed count=78
+0:7-7:BR: REALTIME: sync got host_time=1293290178
+0:7-7:BR: REALTIME: sync pushed count=79
+0:7-7:BR: REALTIME: sync got host_time=1307927934
+0:7-7:BR: REALTIME: sync pushed count=80
+0:7-7:BR: REALTIME: sync got host_time=1322567578
+0:7-7:BR: REALTIME: sync pushed count=81
+0:7-7:BR: REALTIME: sync got host_time=1337202466
+0:7-7:BR: REALTIME: sync pushed count=82
+0:7-7:BR: REALTIME: sync got host_time=1351837926
+0:7-7:BR: REALTIME: sync pushed count=83
+0:7-7:BR: REALTIME: sync got host_time=1366530826
+0:7-7:BR: REALTIME: sync pushed count=84
+0:7-7:BR: REALTIME: sync got host_time=1380824842
+0:7-7:BR: REALTIME: sync pushed count=85
+0:7-7:BR: REALTIME: sync got host_time=1395480322
+0:7-7:BR: REALTIME: sync pushed count=86
+0:7-7:BR: REALTIME: sync got host_time=1410117810
+0:7-7:BR: REALTIME: sync pushed count=87
+0:7-7:BR: REALTIME: sync got host_time=1424751786
+0:7-7:BR: REALTIME: sync pushed count=88
+0:7-7:BR: REALTIME: sync got host_time=1439388290
+0:7-7:BR: REALTIME: sync pushed count=89
+0:7-7:BR: REALTIME: sync got host_time=1454025354
+0:7-7:BR: REALTIME: sync pushed count=90
+0:7-7:BR: REALTIME: sync got host_time=1468661834
+0:7-7:BR: REALTIME: sync pushed count=91
+0:7-7:BR: REALTIME: sync got host_time=1483310638
+0:7-7:BR: REALTIME: sync pushed count=92
+0:7-7:BR: REALTIME: sync got host_time=1497959042
+0:7-7:BR: REALTIME: sync pushed count=93
+2026-09-04 19:41:00.428 | info     |           Metal | [Real-time profiler] Device 0 sync complete: 100 samples, frequency=0.985495 GHz, device_time_at_sync=53270749890 cycles (realtime_profiler_manager.cpp:1088)
+0:7-7:BR: REALTIME: sync got host_time=1512593870
+0:7-7:BR: REALTIME: sync pushed count=94
+0:7-7:BR: REALTIME: sync got host_time=1527227698
+0:7-7:BR: REALTIME: sync pushed count=95
+0:7-7:BR: REALTIME: sync got host_time=1541860906
+0:7-7:BR: REALTIME: sync pushed count=96
+0:7-7:BR: REALTIME: sync got host_time=1556495162
+0:7-7:BR: REALTIME: sync pushed count=97
+0:7-7:BR: REALTIME: sync got host_time=1571129662
+0:7-7:BR: REALTIME: sync pushed count=98
+0:7-7:BR: REALTIME: sync got host_time=1585763638
+0:7-7:BR: REALTIME: sync pushed count=99
+0:7-7:BR: REALTIME: sync got host_time=1600396262
+0:7-7:BR: REALTIME: sync pushed count=100
+0:7-7:BR: REALTIME: sync got host_time=1615032662
+0:7-7:BR: REALTIME: sync pushed count=101
+0:7-7:BR: REALTIME: exiting sync, total=101
+0:7-7:BR: REALTIME: sync_request detected!
+0:7-7:BR: REALTIME: entering sync
+0:7-7:BR: REALTIME: sync got host_time=1549556828
+0:7-7:BR: REALTIME: sync pushed count=1
+0:7-7:BR: REALTIME: exiting sync, total=1
+Result = 14 : Expected = 14
+0:0-0:NC: 1. READER 0: Reading input data to L1 src0 CB
+0:0-0:NC:  > Data in buffer: 14
+0:0-0:NC: 2. READER 0: Data in src0 CB pushed from reader0
+0:0-0:BR: 3. WRITER 0: Data available in src0 CB
+0:0-0:BR: 4. WRITER 0: Data sent to core 1 from core 0
+0:0-1:NC: 5. READER 1: Preparing for data transfer
+0:0-1:NC: 6. READER 1: Data received and stored in src1
+0:0-1:BR: 7. WRITER 1: Received data
+0:0-1:BR:  > Received data from src1: 14
+0:0-1:BR: 8. WRITER 1: Data saved
+0:1-7:NC: CQ_DISPATCH_CMD_SEND_GO_SIGNAL
+0:1-7:NC: DISPATCH_S: wait_for_workers: wait_count: 0, worker_sem: 0
+0:1-7:NC: CQ_DISPATCH_CMD_RT_PROFILER_FLUSH
+0:1-7:NC: DISPATCH_S: wait_for_workers: wait_count: 56, worker_sem: 56
+0:1-7:NC: CQ_DISPATCH_CMD_RT_PROFILER_FLUSH
+0:1-7:NC: DISPATCH_S: wait_for_workers: wait_count: 56, worker_sem: 56
+0:7-7:BR: REALTIME: sync_request detected!
+0:7-7:BR: REALTIME: entering sync
+0:7-7:BR: REALTIME: sync got host_time=1650847633
+0:7-7:BR: REALTIME: sync pushed count=1
+0:7-7:BR: REALTIME: exiting sync, total=1
+0:0-7:BR: prefetcher_11: out
+0:1-7:NC: CQ_DISPATCH_CMD_TERMINATE
+0:1-7:NC: dispatch_s : done
+2026-09-04 19:41:01.272 | warning  |           Metal | Dispatch telemetry SMC buffer is unavailable (dispatch_telemetry.cpp:53)
+2026-09-04 19:41:01.273 | info     |    BuildKernels | JIT cache stats: 11/20 hits (55.0%) [11 cached, 7 build-once dedup, 0 merged artifacts, 0 merged genfiles] (build_cache_telemetry.cpp:207)
+2026-09-04 19:41:01.273 | info     |    BuildKernels | JIT telemetry: 3 registered TelemetryTokens (build_cache_telemetry.cpp:230)
+2026-09-04 19:41:01.274 | info     |           Metal | DPRINT Server detached device 0 (dprint_server.cpp:1235)
+2026-09-04 19:41:01.275 | info     |           Metal | DPRINT Server detached device 1 (dprint_server.cpp:1235)
+2026-09-04 19:41:01.276 | info     |           Metal | DPRINT Server detached device 2 (dprint_server.cpp:1235)
+2026-09-04 19:41:01.277 | info     |           Metal | DPRINT Server detached device 3 (dprint_server.cpp:1235)
+2026-09-04 19:41:01.278 | info     |           Metal | DPRINT Server detached device 4 (dprint_server.cpp:1235)
+2026-09-04 19:41:01.283 | info     |           Metal | DPRINT Server detached device 5 (dprint_server.cpp:1235)
+2026-09-04 19:41:01.288 | info     |           Metal | DPRINT Server detached device 6 (dprint_server.cpp:1235)
+2026-09-04 19:41:01.294 | info     |           Metal | DPRINT Server detached device 7 (dprint_server.cpp:1235)
+2026-09-04 19:41:01.322 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:513)
+2026-09-04 19:41:01.322 | info     |             UMD | Closing devices in cluster (cluster.cpp:1105)
+2026-09-04 19:41:01.372 | info     |             UMD | Closing devices in cluster completed. (cluster.cpp:1114)
+2026-09-04 19:41:01.373 | info     |             UMD | Cluster destructor started. (cluster.cpp:808)
+2026-09-04 19:41:01.373 | info     |             UMD | Cluster destructor completed. (cluster.cpp:811)

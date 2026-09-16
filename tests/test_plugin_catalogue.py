@@ -16,6 +16,10 @@ PLUGINS = REPO / "plugins"
 CODEX_MARKETPLACE = REPO / ".agents" / "plugins" / "marketplace.json"
 CLAUDE_MARKETPLACE = REPO / ".claude-plugin" / "marketplace.json"
 
+REFERENCE_BYTE_CAP = 4500
+# Line numbers rot on every refactor. File basenames and identifiers are fine.
+LINE_CITATION = re.compile(r"\.(?:cpp|hpp|h|py|rst|sh)\s*:\s*\d+")
+
 
 def load(path: pathlib.Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
@@ -87,6 +91,41 @@ def test_packaged_skills_have_discoverable_frontmatter():
         frontmatter = yaml.safe_load(text[3:end]) or {}
         assert frontmatter.get("name") == path.parent.name
         assert frontmatter.get("description")
+
+
+def test_packaged_skill_references_stay_short():
+    """A reference is loaded whole, so its size is what it costs. Scoped to
+    tt-debug-tools because tt-autodebug carries two references over this cap.
+    """
+    for ref in (PLUGINS / "tt-debug-tools" / "skills").glob("*/references/*.md"):
+        size = ref.stat().st_size
+        assert size < REFERENCE_BYTE_CAP, (
+            f"{ref.relative_to(PLUGINS)} is {size} bytes, cap {REFERENCE_BYTE_CAP}"
+        )
+
+
+def test_packaged_skills_cite_no_source_line_numbers():
+    """A file:line citation into upstream is wrong by the next refactor, and reads
+    authoritative while being wrong. Basenames and identifiers survive.
+
+    Quoted and fenced lines are exempt, and the distinction is real rather than a
+    carve-out: a `file.cpp:212` inside a blockquote or a code fence is showing
+    text -- an output template a reviewer should imitate, a sample of what a tool
+    prints -- not pointing the reader at a line of source.
+    """
+    for path in list(PLUGINS.glob("*/skills/*/SKILL.md")) + list(
+        PLUGINS.glob("*/skills/*/references/*.md")
+    ):
+        fenced = False
+        for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if line.lstrip().startswith("```"):
+                fenced = not fenced
+                continue
+            if fenced or line.lstrip().startswith(">"):
+                continue
+            assert not LINE_CITATION.search(line), (
+                f"{path}:{n} cites a source line number, which rots"
+            )
 
 
 def test_packaged_skill_references_exist():
