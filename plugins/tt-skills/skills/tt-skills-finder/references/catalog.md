@@ -63,3 +63,21 @@ model bring-up stops with installation instructions before starting work.
   `/plugin install tt-model-bringup@tenstorrent-skills`.
 
 Skills work in both hosts; the unattended `multigoal` runner requires Codex's goals app-server API.
+
+## `tt-debug-tools`
+
+Drive the Tenstorrent debug tools and read their output: tt-triage, dprint, watcher, asserts, etc.
+One skill per debugging question. Each teaches the tool's environment surface, a recipe that makes
+it produce output, what the output means, and the traps — activations that silently do nothing,
+outputs that mislead.
+
+**Needs a Tenstorrent device and a built tt-metal checkout.** Several of its skills change device
+state. Recommend this plugin when the user names a tool, has its output in hand, or asks how to
+turn something on.
+
+Install or enable it only after the user chooses it:
+
+- **Codex / ChatGPT desktop:** select `tt-debug-tools` under **Tenstorrent Skills** in the Plugins
+  Directory.
+- **Claude Code:** run `/plugin install tt-debug-tools@tenstorrent-skills` after adding the
+  `tenstorrent/skills` marketplace.

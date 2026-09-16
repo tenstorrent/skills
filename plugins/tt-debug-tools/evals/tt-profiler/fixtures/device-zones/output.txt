@@ -1,0 +1,61 @@
+2026-09-04 19:41:11.829 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:228)
+2026-09-04 19:41:11.830 | info     |             UMD | Cluster constructor started. (cluster.cpp:378)
+2026-09-04 19:41:11.830 | info     |             UMD | Creating TopologyDiscovery for architecture: wormhole_b0 (topology_discovery.cpp:95)
+2026-09-04 19:41:11.830 | info     |             UMD | Starting topology discovery. (topology_discovery.cpp:114)
+2026-09-04 19:41:11.838 | info     |             UMD | Established firmware bundle version: 19.7.1 (topology_discovery.cpp:574)
+2026-09-04 19:41:11.869 | info     |             UMD | Completed topology discovery. (topology_discovery.cpp:118)
+2026-09-04 19:41:11.951 | info     |             UMD | Opening local chip ids/PCIe ids: {0, 1, 2, 3}/[0, 1, 2, 3] and remote chip ids {4, 5, 6, 7} (cluster.cpp:168)
+2026-09-04 19:41:11.951 | info     |             UMD | IOMMU: disabled (cluster.cpp:142)
+2026-09-04 19:41:11.951 | info     |             UMD | KMD version: 2.10.0 (cluster.cpp:145)
+2026-09-04 19:41:11.951 | info     |             UMD | Cluster constructor completed. (cluster.cpp:574)
+2026-09-04 19:41:11.958 | info     |             UMD | Starting devices in cluster (cluster.cpp:1092)
+2026-09-04 19:41:11.979 | info     |             UMD | Starting devices in cluster completed. (cluster.cpp:1100)
+2026-09-04 19:41:12.034 | info     |     Distributed | Using auto discovery to generate mesh graph. (metal_env.cpp:423)
+2026-09-04 19:41:12.034 | info     |     Distributed | Constructing control plane using auto-discovery (no mesh graph descriptor). (metal_env.cpp:485)
+2026-09-04 19:41:12.035 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {2:4, 3:4} (topology_mapper_utils.cpp:2452)
+2026-09-04 19:41:12.035 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {2:4, 3:4} (topology_mapper_utils.cpp:2460)
+2026-09-04 19:41:12.186 | warning  |           Metal | Opening subset of mmio devices slows down UMD read/write to remote chips. If opening more devices, consider using CreateDevices API. (device_manager.cpp:261)
+2026-09-04 19:41:12.187 | warning  |           Metal | Dispatch telemetry SMC buffer is unavailable (dispatch_telemetry.cpp:53)
+2026-09-04 19:41:12.189 | warning  |           Metal | Dispatch telemetry SMC buffer is unavailable (dispatch_telemetry.cpp:53)
+2026-09-04 19:41:12.237 | info     |           Metal | Profiler started on device 0 (profiler_initializer.cpp:49)
+2026-09-04 19:41:12.290 | info     |           Metal | D2HSocket: Using hugepage fallback for device 0 (data_dev_addr=0x3fffe000, pcie_xy_enc=0xc08) (d2h_socket.cpp:138)
+2026-09-04 19:41:12.867 | info     |           Metal | [Real-time profiler] Device 0 sync complete: 100 samples, frequency=0.985470 GHz, device_time_at_sync=63858629095 cycles (realtime_profiler_manager.cpp:1088)
+2026-09-04 19:41:18.125 | warning  |           Metal | Dispatch telemetry SMC buffer is unavailable (dispatch_telemetry.cpp:53)
+Test Passed
+2026-09-04 19:41:18.126 | info     |    BuildKernels | JIT cache stats: 21/21 hits (100.0%) [21 cached, 7 build-once dedup, 0 merged artifacts, 0 merged genfiles] (build_cache_telemetry.cpp:207)
+2026-09-04 19:41:18.126 | info     |    BuildKernels | JIT telemetry: 3 registered TelemetryTokens (build_cache_telemetry.cpp:230)
+2026-09-04 19:41:18.143 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:513)
+2026-09-04 19:41:18.143 | info     |             UMD | Closing devices in cluster (cluster.cpp:1105)
+2026-09-04 19:41:18.197 | info     |             UMD | Closing devices in cluster completed. (cluster.cpp:1114)
+2026-09-04 19:41:18.197 | info     |             UMD | Cluster destructor started. (cluster.cpp:808)
+2026-09-04 19:41:18.198 | info     |             UMD | Cluster destructor completed. (cluster.cpp:811)
+0,9,9,TRISC_2,27919,64479520316,0,0,,,TEST-FULL,ZONE_START,11,$TT_METAL_HOME/tt_metal/programming_examples/profiler/test_full_buffer/kernels/full_buffer_compute.cpp,
+0,9,9,TRISC_2,27919,64479520541,0,0,,,TEST-FULL,ZONE_END,11,$TT_METAL_HOME/tt_metal/programming_examples/profiler/test_full_buffer/kernels/full_buffer_compute.cpp,
+0,9,9,TRISC_2,27919,64479520581,0,0,,,TEST-FULL,ZONE_START,11,$TT_METAL_HOME/tt_metal/programming_examples/profiler/test_full_buffer/kernels/full_buffer_compute.cpp,
+0,9,9,TRISC_2,27919,64479520806,0,0,,,TEST-FULL,ZONE_END,11,$TT_METAL_HOME/tt_metal/programming_examples/profiler/test_full_buffer/kernels/full_buffer_compute.cpp,
+0,9,9,TRISC_2,27919,64479520846,0,0,,,TEST-FULL,ZONE_START,11,$TT_METAL_HOME/tt_metal/programming_examples/profiler/test_full_buffer/kernels/full_buffer_compute.cpp,
+0,9,9,TRISC_2,27919,64479521071,0,0,,,TEST-FULL,ZONE_END,11,$TT_METAL_HOME/tt_metal/programming_examples/profiler/test_full_buffer/kernels/full_buffer_compute.cpp,
+0,9,9,TRISC_2,27919,64479521111,0,0,,,TEST-FULL,ZONE_START,11,$TT_METAL_HOME/tt_metal/programming_examples/profiler/test_full_buffer/kernels/full_buffer_compute.cpp,
+0,9,9,TRISC_2,27919,64479521336,0,0,,,TEST-FULL,ZONE_END,11,$TT_METAL_HOME/tt_metal/programming_examples/profiler/test_full_buffer/kernels/full_buffer_compute.cpp,
+0,9,9,TRISC_2,27919,64479521376,0,0,,,TEST-FULL,ZONE_START,11,$TT_METAL_HOME/tt_metal/programming_examples/profiler/test_full_buffer/kernels/full_buffer_compute.cpp,
+0,9,9,TRISC_2,27919,64479521601,0,0,,,TEST-FULL,ZONE_END,11,$TT_METAL_HOME/tt_metal/programming_examples/profiler/test_full_buffer/kernels/full_buffer_compute.cpp,
+0,9,9,TRISC_2,27919,64479521641,0,0,,,TEST-FULL,ZONE_START,11,$TT_METAL_HOME/tt_metal/programming_examples/profiler/test_full_buffer/kernels/full_buffer_compute.cpp,
+0,9,9,TRISC_2,27919,64479521866,0,0,,,TEST-FULL,ZONE_END,11,$TT_METAL_HOME/tt_metal/programming_examples/profiler/test_full_buffer/kernels/full_buffer_compute.cpp,
+0,9,9,TRISC_2,27919,64479521906,0,0,,,TEST-FULL,ZONE_START,11,$TT_METAL_HOME/tt_metal/programming_examples/profiler/test_full_buffer/kernels/full_buffer_compute.cpp,
+0,9,9,TRISC_2,27919,64479522131,0,0,,,TEST-FULL,ZONE_END,11,$TT_METAL_HOME/tt_metal/programming_examples/profiler/test_full_buffer/kernels/full_buffer_compute.cpp,
+0,9,9,TRISC_2,27919,64479522171,0,0,,,TEST-FULL,ZONE_START,11,$TT_METAL_HOME/tt_metal/programming_examples/profiler/test_full_buffer/kernels/full_buffer_compute.cpp,
+0,9,9,TRISC_2,27919,64479522396,0,0,,,TEST-FULL,ZONE_END,11,$TT_METAL_HOME/tt_metal/programming_examples/profiler/test_full_buffer/kernels/full_buffer_compute.cpp,
+0,9,9,TRISC_2,27919,64479522436,0,0,,,TEST-FULL,ZONE_START,11,$TT_METAL_HOME/tt_metal/programming_examples/profiler/test_full_buffer/kernels/full_buffer_compute.cpp,
+0,9,9,TRISC_2,27919,64479522661,0,0,,,TEST-FULL,ZONE_END,11,$TT_METAL_HOME/tt_metal/programming_examples/profiler/test_full_buffer/kernels/full_buffer_compute.cpp,
+0,9,9,TRISC_2,27919,64479522701,0,0,,,TEST-FULL,ZONE_START,11,$TT_METAL_HOME/tt_metal/programming_examples/profiler/test_full_buffer/kernels/full_buffer_compute.cpp,
+0,9,9,TRISC_2,27919,64479522926,0,0,,,TEST-FULL,ZONE_END,11,$TT_METAL_HOME/tt_metal/programming_examples/profiler/test_full_buffer/kernels/full_buffer_compute.cpp,
+0,9,9,TRISC_2,27919,64479522966,0,0,,,TEST-FULL,ZONE_START,11,$TT_METAL_HOME/tt_metal/programming_examples/profiler/test_full_buffer/kernels/full_buffer_compute.cpp,
+0,9,9,TRISC_2,27919,64479523191,0,0,,,TEST-FULL,ZONE_END,11,$TT_METAL_HOME/tt_metal/programming_examples/profiler/test_full_buffer/kernels/full_buffer_compute.cpp,
+0,9,9,TRISC_2,27919,64479523231,0,0,,,TEST-FULL,ZONE_START,11,$TT_METAL_HOME/tt_metal/programming_examples/profiler/test_full_buffer/kernels/full_buffer_compute.cpp,
+0,9,9,TRISC_2,27919,64479523456,0,0,,,TEST-FULL,ZONE_END,11,$TT_METAL_HOME/tt_metal/programming_examples/profiler/test_full_buffer/kernels/full_buffer_compute.cpp,
+0,9,9,TRISC_2,27919,64479523496,0,0,,,TEST-FULL,ZONE_START,11,$TT_METAL_HOME/tt_metal/programming_examples/profiler/test_full_buffer/kernels/full_buffer_compute.cpp,
+0,9,9,TRISC_2,27919,64479523721,0,0,,,TEST-FULL,ZONE_END,11,$TT_METAL_HOME/tt_metal/programming_examples/profiler/test_full_buffer/kernels/full_buffer_compute.cpp,
+0,9,9,TRISC_2,27919,64479523761,0,0,,,TEST-FULL,ZONE_START,11,$TT_METAL_HOME/tt_metal/programming_examples/profiler/test_full_buffer/kernels/full_buffer_compute.cpp,
+0,9,9,TRISC_2,27919,64479523986,0,0,,,TEST-FULL,ZONE_END,11,$TT_METAL_HOME/tt_metal/programming_examples/profiler/test_full_buffer/kernels/full_buffer_compute.cpp,
+0,9,9,TRISC_2,56064,64479529321,0,0,,,TRISC-KERNEL,ZONE_END,86,$TT_METAL_HOME/tt_metal/hw/firmware/src/tt-1xx/trisck.cc,
+0,9,9,TRISC_2,44820,64479529370,0,0,,,TRISC-FW,ZONE_END,150,$TT_METAL_HOME/tt_metal/hw/firmware/src/tt-1xx/trisc.cc,

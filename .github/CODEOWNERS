@@ -18,6 +18,8 @@
 /docs/ @blozano-tt @yieldthought
 /SOURCES.md @blozano-tt @yieldthought
 /plugins/tt-review-skills/ @blozano-tt @yieldthought
-
 # Staged TTNN model bring-up
 /plugins/tt-model-bringup/ @yieldthought
+
+# Debug tools
+/plugins/tt-debug-tools/ @ppetrovicTT
