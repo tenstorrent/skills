@@ -202,9 +202,7 @@ vendored, reshaped and re-framed from work other people did — often work that 
 debugging to learn. The structure is borrowed too.
 
 Everything below was consulted while building this, whether or not content was ultimately taken.
-Primary author is the top contributor to that path by commit count; see [`SOURCES.md`](SOURCES.md)
-for the full per-skill list, which credits **every** contributor to each path, not just the primary
-one.
+Primary author is the top contributor to that path by commit count.
 
 ### Content sources
 
@@ -217,7 +215,7 @@ one.
 | [`tt-metal`](https://github.com/tenstorrent/tt-metal) — `tt-llk/.claude` | [@ndivnicTT](https://github.com/ndivnicTT) | The LLK audit suite as a whole |
 | ⤷ `race-audit-all` | [@amahmudTT](https://github.com/amahmudTT) | Nine hazard classes, the monotonic JOIN contract, per-architecture divergence |
 | ⤷ `perf-optimization-audit` | [@fvranicTT](https://github.com/fvranicTT) | The provenance lens, semantic-equivalence gate, SIMD false-positive guards |
-| [`tt-metal`](https://github.com/tenstorrent/tt-metal) — `.github/bug_checker` | [@stevendae](https://github.com/stevendae) | Rules distilled from ~1,398 merged fix PRs: program-cache correctness, op validation, CCL ring buffers, stale LLK config. Strong evidence of which failures *recur*; see [`SOURCES.md`](SOURCES.md) for four of its technical claims we corrected |
+| [`tt-metal`](https://github.com/tenstorrent/tt-metal) — `.github/bug_checker` | [@stevendae](https://github.com/stevendae) | Rules distilled from ~1,398 merged fix PRs: program-cache correctness, op validation, CCL ring buffers, stale LLK config. Strong evidence of which failures *recur* |
 | [`tt-metal`](https://github.com/tenstorrent/tt-metal) — `tech_reports/Handling_Special_Value` | [@ttmtrajkovic](https://github.com/ttmtrajkovic) | NaN/Inf/denormal semantics and the FPU/SFPU divergence |
 
 ### Structure and tooling
@@ -258,5 +256,4 @@ This project follows the [Contributor Covenant Code of Conduct](CODE_OF_CONDUCT.
 
 Licensed under the [Apache License, Version 2.0](LICENSE), with third-party notices
 and license details in [NOTICE](NOTICE). See [LICENSE_understanding.txt](LICENSE_understanding.txt)
-for the accompanying Tenstorrent rights clarification and [SOURCES.md](SOURCES.md)
-for detailed contributor credits and provenance.
+for the accompanying Tenstorrent rights clarification.
