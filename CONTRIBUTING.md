@@ -80,6 +80,9 @@ before adding material from another repository.
 
 ## Community and review
 
+See [Copilot review and smoke tests](docs/copilot-review.md) for repository-specific
+review guidance and optional candidate-skill evaluations.
+
 Participation is covered by the [Code of Conduct](CODE_OF_CONDUCT.md).
 The maintainers for each area are listed in [CODEOWNERS](.github/CODEOWNERS).
 Shared marketplace and CI changes should involve both catalogue owners.

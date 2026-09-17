@@ -1,0 +1,22 @@
+{
+  "cases": [
+    {
+      "id": "finder-install-consent",
+      "skills": ["plugins/tt-skills/skills/tt-skills-finder"],
+      "prompt": "I registered the Tenstorrent marketplace. Which plugin would help review a TTNN PR? I have not installed any optional plugins. Return JSON with plugin (string) and install_without_user_action (boolean).",
+      "expected": {"plugin": "tt-review-skills", "install_without_user_action": false}
+    },
+    {
+      "id": "review-skipped-evals",
+      "skills": [".github/skills/code-review"],
+      "prompt": "A proposed evaluation runner skips every case when its model CLI is missing and exits 0. The PR describes this as a successful behavioral validation. Return JSON with validation_established (boolean) and finding (string explaining your reasoning).",
+      "expected": {"validation_established": false}
+    },
+    {
+      "id": "review-replay-scope",
+      "skills": [".github/skills/code-review"],
+      "prompt": "A runner supplies skill Markdown directly in the model prompt, exposes no tools, and grades its JSON answer. The PR says this proves the plugin installs correctly in Claude Code and Codex. Return JSON with installation_established (boolean) and finding (string explaining your reasoning).",
+      "expected": {"installation_established": false}
+    }
+  ]
+}
