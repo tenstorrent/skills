@@ -23,6 +23,7 @@ Read only what helps the current task:
 - `models/tt_transformers/tt/generator.py`: canonical decode trace patterns, including host input preparation, persistent device inputs, replay refresh, and split sampling.
 - `models/common/sampling/generator.py` and `models/common/modules/sampling/sampling_1d.py`: common on-device sampling implementations to compare before choosing a token-out sampling path.
 - `models/tt_transformers/tt/model.py`: model-side `prepare_decode_inputs_host` and device-only `ttnn_decode_forward` split.
+- In the target tt-metal checkout, `tech_reports/AdvancedPerformanceOptimizationsForModels/TraceCorrectness.md` ([upstream guide](https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/AdvancedPerformanceOptimizationsForModels/TraceCorrectness.md)): trace correctness requirements and the trace allocation tracker. Read this before accepting a capture/replay path or exempting intentionally shared trace buffers. This guide and the tracker implementation belong to tt-metal, not the installed skill package.
 - `advanced_perf_optimizations.md`: deeper examples for TTNN trace capture/replay, multiple command queues, trace plus multi-CQ, and production benchmarking patterns. Search this file for the API or failure mode you are working on before loading it wholesale.
 
 ## Mental Model
@@ -154,6 +155,33 @@ Mesh traces can include collective operations, but collective resources need car
 
 If a single decoder layer traces but the full model does not, inspect terminal work separately: final distributed norm, hidden gathers, LM head, logits gather, sampling, argmax, and token readback.
 
+## Trace Allocation Safety Gate
+
+Before accepting a new or changed traced path, run its representative repeated-replay test in a fresh process with tracking enabled before TTNN is imported. For example, from the target tt-metal checkout:
+
+```bash
+TT_METAL_TRACE_ALLOC_TRACKING=1 TT_METAL_TRACE_ALLOC_SKIP_PROGRAM_CACHE=0 python your_replay_test.py
+```
+
+The tracker is disabled by default and reads configuration once at startup. It validates live unsafe allocations automatically before `ttnn.execute_trace`; surviving unsafe buffers raise `RuntimeError`. For serving, set the environment in the server/worker processes before startup, not only in the client sending requests. If the target checkout predates [tt-metal #53735](https://github.com/tenstorrent/tt-metal/pull/53735), record that prerequisite instead of silently disabling the check or using the obsolete `ttnn.mark_corruptible` and root-level scope APIs.
+
+Exercise every trace variant and the real replay ordering, including alternating traces that share persistent inputs or outputs. Keep program-cache allocations in the acceptance check. `TT_METAL_TRACE_ALLOC_SKIP_PROGRAM_CACHE=1` is only a diagnostic noise filter; a run that needs it is not passing evidence because late program compilation remains unsafe. When investigating a failure, add `TT_METAL_TRACE_ALLOC_TRACEBACKS=1` and, if needed, set `TT_METAL_TRACE_ALLOC_REFERRER_DEPTH`.
+
+Some multi-trace paths deliberately reuse buffers that another trace may overwrite. Acknowledge those buffers only through the tracker tool:
+
+```python
+from ttnn.tools import trace_allocation_tracker
+
+trace_allocation_tracker.acknowledge_corruptible(tensor)
+
+with trace_allocation_tracker.corruptible_allocation_scope(mesh_device):
+    trace_input = create_trace_input()
+```
+
+Neither API prevents corruption; it only removes the acknowledged allocation from validation. Use it only when the path overwrites an acknowledged input before use and preserves an acknowledged output before another trace can overwrite it. Prefer `acknowledge_corruptible` for specific tensors; acknowledging a view exempts the shared backing buffer. The scope form excludes every device allocation made inside it, including implicit and program-cache allocations, so keep it narrow and justify it in the evidence.
+
+Trace IDs are scoped by the active sub-device manager. Capture, end, execute, and release each trace with the intended manager active, and cover manager changes in the replay test when the implementation uses them. A clean tracker run does not replace warmup, cache-key, updated-input, output-correctness, or token-feedback checks. Collect performance numbers separately with tracking and diagnostics disabled, recording the settings for each run.
+
 ## Debugging Trace Failures
 
 Common fatal signatures:
@@ -207,6 +235,7 @@ Leave compact evidence that the traced path is real:
 
 - Correctness before and after tracing against the same reference.
 - Repeated replay determinism across several executions.
+- The exact tracking-enabled invocation and environment, trace variants and replay ordering covered, and a clean allocation-check result with program-cache allocations included. List every corruptible-buffer acknowledgment with its overwrite-before-use or preserve-before-overwrite invariant.
 - Updated-input replay test proving outputs change when trace inputs are refreshed.
 - For vLLM decode: stale-input validation for token/current-position/page-table refresh, explicit async-overlap setting and proof if enabled, on-device sampling trace evidence, and a passing server smoke run with decode trace enabled.
 - Split-sampling evidence for token-out decode: internal sampling trace enabled, `tt_out_tok` wired to the persistent decode token input, and greedy benchmarks using the fastest correct on-device sampling strategy measured for this mesh.
