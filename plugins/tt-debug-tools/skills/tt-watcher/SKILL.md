@@ -92,12 +92,15 @@ The log lands at `<logs_dir>/generated/watcher/watcher.log`, where `logs_dir` is
 `TT_METAL_LOGS_PATH` or, unset, **the working directory** — not `TT_METAL_HOME`.
 Set it, or the log follows wherever you launched from.
 
-## After a trip: hand off to triage
+## After a trip
 
-A trip halts the device with the Inspector RPC still serving the hung process
-— the state `tt-triage` reads best. Do not kill it to look at `watcher.log`:
-the per-core callstacks and integrity checks need the live process. See
-`tt-triage`.
+The watcher server catches the fault, prints the report to stderr and
+`watcher.log`, and re-throws. The re-throw unwinds the host process and
+returns from `main`: the process exits, its Inspector RPC closes, and any
+live introspection window is gone. `watcher.log` and the console fault
+report are what you keep. To hold the process open past the throw for live
+introspection, set `TT_METAL_WATCHER_TEST_MODE=1` — the watcher thread
+catches instead of re-throwing, but no test asserts through this path yet.
 
 ## Traps
 

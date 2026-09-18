@@ -37,28 +37,35 @@ values — `tt-dprint`.
 
 ## Surface
 
-`enable_fast_runtime_mode` is **`True` by default**, and it disables the debug
-modes. Turning a mode on without turning that off does nothing at all — no
-error, no output.
+`enable_fast_runtime_mode` is **`True` by default**. At the pinned commit,
+`FastOperation._requires_slow_runtime` (`ttnn/ttnn/decorators.py`) routes each
+op through the slow runtime when **either** `enable_fast_runtime_mode` is
+false **or** `enable_comparison_mode` is true **or** `enable_logging` is true.
+So the two features that need to run *inside* every op — comparison and
+logging — force slow runtime on their own. Everything else in the table below
+is silently inert while fast-runtime stays on: no error, no output. Set
+`enable_fast_runtime_mode: false` explicitly to remove the ambiguity, and set
+it in **every** report scenario since `enable_graph_report` depends on
+`enable_logging` and `enable_detailed_*` depends on the reports.
 
 ```bash
 TTNN_CONFIG_OVERRIDES='{"enable_fast_runtime_mode": false, "enable_comparison_mode": true}' pytest <test>
 ```
 
-| Key | Default | Effect |
-|---|---|---|
-| `enable_fast_runtime_mode` | **`true`** | Set `false` first; everything below is inert otherwise. |
-| `enable_comparison_mode` | `false` | Compare each op against a golden reference. |
-| `comparison_mode_pcc` | `0.9999` | The threshold a comparison must meet. |
-| `comparison_mode_should_raise_exception` | `false` | Stop at the first failing op rather than logging it. |
-| `enable_logging` | `false` | Per-op logging; the base for the reports. |
-| `enable_graph_report` | `false` | Emit the captured graph. |
-| `enable_graph_python_stack_traces` | `false` | Python stack traces on graph nodes. |
-| `enable_detailed_buffer_report` | `false` | Per-op buffer detail. |
-| `enable_detailed_tensor_report` | `false` | Per-op tensor detail. |
-| `throw_exception_on_fallback` | `false` | Fail rather than silently falling back to a host implementation. |
-| `root_report_path` | `generated/ttnn/reports` | Where reports land. |
-| `report_name` | `None` | Names this report. |
+| Key | Default | Effect | Forces slow runtime on its own |
+|---|---|---|---|
+| `enable_fast_runtime_mode` | **`true`** | Set `false` to route every op through slow runtime. | — |
+| `enable_comparison_mode` | `false` | Compare each op against a golden reference. | **yes** |
+| `enable_logging` | `false` | Per-op logging; the base for the reports. | **yes** |
+| `comparison_mode_pcc` | `0.9999` | The threshold a comparison must meet. | no |
+| `comparison_mode_should_raise_exception` | `false` | Stop at the first failing op rather than logging it. | no |
+| `enable_graph_report` | `false` | Emit the captured graph. Needs `enable_logging` too, which forces slow runtime. | no (via logging) |
+| `enable_graph_python_stack_traces` | `false` | Python stack traces on graph nodes. | no |
+| `enable_detailed_buffer_report` | `false` | Per-op buffer detail. | no |
+| `enable_detailed_tensor_report` | `false` | Per-op tensor detail. | no |
+| `throw_exception_on_fallback` | `false` | Fail rather than silently falling back to a host implementation. | no |
+| `root_report_path` | `generated/ttnn/reports` | Where reports land. | no |
+| `report_name` | `None` | Names this report. | no |
 
 Two ways in — `TTNN_CONFIG_OVERRIDES` as a JSON string, or `TTNN_CONFIG_PATH`
 pointing at a JSON file. Plus `ttnn.manage_config(name, value)` as a context

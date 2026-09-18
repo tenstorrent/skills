@@ -49,7 +49,7 @@ def hang():
 
 worker = threading.Thread(target=hang, daemon=True)
 worker.start()
-print("enqueued; BRISC will spin holding the process alive for Inspector RPC", flush=True)
+print("enqueued", flush=True)
 
 deadline = HOLD_SECS
 while worker.is_alive() and deadline > 0:

@@ -235,10 +235,12 @@ def eval_reports_a_noc_sanitize_trip(agent):
         },
     )
 
-    # No assert_invoked_tool guard here: the provoke source is hidden by the
-    # harness, so the phantom coord can only reach the diagnosis through one
-    # of watcher's evidence paths — watcher.log, the broker's captured stderr
-    # for the "Watcher detected" line, or tt-triage's own watcher reader.
+    # The agent must have reached watcher's own evidence — watcher.log, the
+    # process stderr with the fault line, or tt-triage's watcher reader. The
+    # provoke script prints nothing that names the fault (source hidden, and
+    # the launch stdout is just "enqueued"), so a diagnosis passing without
+    # touching one of those paths would have to fabricate the coord.
+    res.assert_invoked_tool(r"watcher\.log|Watcher detected|tt-triage|tt_device_job_logs")
     diagnosis = res.answer["diagnosis"].lower()
     assert "brisc" in diagnosis, res.answer["diagnosis"]
     assert "26-18" in diagnosis or "26,18" in diagnosis or "(26, 18)" in diagnosis, (
@@ -269,10 +271,11 @@ def eval_reports_a_kernel_assert(agent):
         },
     )
 
+    res.assert_invoked_tool(r"watcher\.log|Watcher detected|tt-triage|tt_device_job_logs")
     diagnosis = res.answer["diagnosis"].lower()
-    # Watcher's assert output names both the RISC and the concept "assert" —
-    # either alone is fabrication-safe with the provoke source hidden.
-    assert "assert" in diagnosis, res.answer["diagnosis"]
+    # "assert" alone is easily hallucinated; the line number in watcher's
+    # output only exists in the report. Grade on the full compound instead.
+    assert "assert" in diagnosis and "line" in diagnosis, res.answer["diagnosis"]
     assert "brisc" in diagnosis, res.answer["diagnosis"]
 
 
@@ -298,6 +301,7 @@ def eval_reports_a_waypoint_on_a_stalled_core(agent):
         },
     )
 
+    res.assert_invoked_tool(r"watcher\.log|tt-triage|tt_device_job_logs")
     diagnosis = res.answer["diagnosis"]
     # STOP is the discriminator — a distinctive 4-char waypoint the source
     # of watcher.log names verbatim.

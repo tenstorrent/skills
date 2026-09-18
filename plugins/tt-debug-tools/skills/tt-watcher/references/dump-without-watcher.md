@@ -32,11 +32,10 @@ The last two are not conveniences: get them wrong and the tool reads the wrong
 structures and reports confidently from them. Take both from the run being
 investigated.
 
-## `gdb`, against a live or core-dumped process
+## `gdb`, against a **live** process
 
-This is the post-mortem path for a **host-side** failure — an assert or a
-segfault in the host process — where the device is still holding the state that
-explains it.
+For a host-side failure — an assert or a segfault — where the process is
+still up and the device is still holding the state that explains it.
 
 Attach, interrupt with ctrl-c, then:
 
@@ -54,13 +53,21 @@ optimisation and remains callable this way.
 Output goes to the process's stderr, in the same per-core shape as a log dump —
 `references/log-format.md`.
 
+**Core dumps cannot do this.** `call` needs a running process — it executes
+the function against the live device to read hardware registers. A core dump
+carries saved memory only; against one, `gdb` can `bt`, `p` locals, and inspect
+recorded L1 addresses that made it into the core, but it cannot invoke
+`tt::watcher::dump` or read the device. For a post-crash device read, use
+`watcher_dump` above — it opens the device directly and does not need the
+original process.
+
 ## Which to reach for
 
 | Situation | Path |
 |---|---|
-| Host process died or asserted; device untouched since | `gdb` on the core dump |
+| Host process is still up and stuck | `gdb --pid=$PID`, then `call tt::watcher::dump(...)` |
+| Only a core dump left | `gdb core`, inspect with `bt`/`p`; run `watcher_dump` for the device state |
 | Host process is gone entirely | `watcher_dump` |
-| Host process is alive and stuck, and you want host-side context too | `tt-triage` — it reads the Inspector RPC as well, which neither of these does |
 
 Neither path resumes anything. Both read a device that some other process may
 still own, so on a shared host confirm the run you are investigating is the one

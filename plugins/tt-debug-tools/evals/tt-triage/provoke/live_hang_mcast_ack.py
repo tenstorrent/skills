@@ -83,7 +83,7 @@ def hang():
 
 worker = threading.Thread(target=hang, daemon=True)
 worker.start()
-print(f"enqueued; {NUM_ITERS} x {PHANTOM_DEST_CORES} acks will never arrive", flush=True)
+print("enqueued", flush=True)
 
 # Heartbeat while parked so the broker's no-output watchdog does not reap the
 # job while an agent is triaging it. Kernel DPRINT goes to its own file, so

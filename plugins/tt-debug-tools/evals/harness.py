@@ -166,9 +166,11 @@ class AgentResult:
         assert self.skill == name, f"expected skill {name!r}, got {self.skill!r}"
 
     def assert_invoked_tool(self, pattern: str) -> None:
-        """The agent ran a command matching `pattern`, through Bash or the
-        tt-device-mcp `tt_device_exec` tool, and it actually ran (was not
-        blocked by the denylist)."""
+        """The agent invoked a tool whose name or command string matches
+        `pattern`, and the invocation actually ran (was not blocked by the
+        denylist). Bash matches by command, tt_device_exec by the wrapped
+        command, and any other MCP tool (`tt_device_job_logs`,
+        `tt_device_job_status`) matches by tool name."""
         rx = re.compile(pattern)
         matched, denied = [], []
         pending_id = None
@@ -181,14 +183,15 @@ class AgentResult:
                     name = block.get("name") or ""
                     inp = block.get("input") or {}
                     if name == "Bash":
-                        cmd = inp.get("command") or ""
+                        needle = inp.get("command") or ""
                     elif name.endswith("__tt_device_exec"):
-                        cmd = (inp.get("params") or {}).get("command") or ""
+                        needle = (inp.get("params") or {}).get("command") or ""
                     else:
-                        continue
-                    if rx.search(cmd):
+                        # Any other tool call: match against the tool name.
+                        needle = name
+                    if rx.search(needle):
                         pending_id = block.get("id")
-                        matched.append(cmd)
+                        matched.append(needle)
             elif typ == "user" and pending_id is not None:
                 for block in ev.get("message", {}).get("content", []):
                     if (block.get("type") == "tool_result"

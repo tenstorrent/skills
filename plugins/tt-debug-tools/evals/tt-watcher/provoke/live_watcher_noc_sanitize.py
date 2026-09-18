@@ -78,7 +78,7 @@ def hang():
 
 worker = threading.Thread(target=hang, daemon=True)
 worker.start()
-print("enqueued; BRISC will hit watcher's sanitize on write to virtual (26,18)", flush=True)
+print("enqueued", flush=True)
 
 deadline = HOLD_SECS
 while worker.is_alive() and deadline > 0:

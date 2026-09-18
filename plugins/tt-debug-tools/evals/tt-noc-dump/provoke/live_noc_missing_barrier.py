@@ -49,4 +49,4 @@ program = ttnn.ProgramDescriptor(
 ttnn.generic_op([operand, result], program)
 ttnn.synchronize_device(mesh)
 ttnn.close_mesh_device(mesh)
-print("missing-barrier program done — expect the NoC debug dump summary above", flush=True)
+print("done", flush=True)
