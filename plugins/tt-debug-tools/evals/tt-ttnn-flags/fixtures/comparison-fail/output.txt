@@ -1,0 +1,8 @@
+$ TTNN_CONFIG_OVERRIDES='{"enable_fast_runtime_mode": false, "enable_comparison_mode": true, "comparison_mode_pcc": 1.0}' python run_graph_capture.py
+
+Config{cache_path=/home/ppetrovic/.cache/ttnn,model_cache_path=/home/ppetrovic/.cache/ttnn/models,tmp_dir=/tmp/ttnn,enable_model_cache=false,enable_fast_runtime_mode=false,validate_program_args=false,throw_exception_on_fallback=false,enable_logging=false,enable_graph_report=false,enable_graph_python_stack_traces=false,enable_detailed_buffer_report=false,enable_detailed_tensor_report=false,enable_comparison_mode=true,comparison_mode_should_raise_exception=false,comparison_mode_pcc=1,root_report_path=generated/ttnn/reports,report_name=std::nullopt,std::nullopt}
+
+2026-09-18 14:28:25.839 | DEBUG    | ttnn.decorators:call_wrapper:1347 - ttnn.from_torch: Comparing against CPU
+2026-09-18 14:28:25.891 | DEBUG    | ttnn.decorators:call_wrapper:1347 - ttnn.from_torch: Comparing against CPU
+2026-09-18 14:28:25.901 | DEBUG    | ttnn.decorators:call_wrapper:1347 - ttnn.matmul: Comparing against CPU
+2026-09-18 14:28:25.911 | ERROR    | ttnn.decorators:compare_tensors_using_pcc:262 - ttnn.matmul: Comparing output tensor 0 against CPU locally failed: pcc is 0.999971009254056 but should be >=1.0

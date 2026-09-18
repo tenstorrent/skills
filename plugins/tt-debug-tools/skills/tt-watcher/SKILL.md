@@ -98,9 +98,20 @@ The watcher server catches the fault, prints the report to stderr and
 `watcher.log`, and re-throws. The re-throw unwinds the host process and
 returns from `main`: the process exits, its Inspector RPC closes, and any
 live introspection window is gone. `watcher.log` and the console fault
-report are what you keep. To hold the process open past the throw for live
-introspection, set `TT_METAL_WATCHER_TEST_MODE=1` — the watcher thread
-catches instead of re-throwing, but no test asserts through this path yet.
+report are what you keep.
+
+**To keep the process alive for live introspection, set
+`TT_METAL_WATCHER_TEST_MODE=1`.** The watcher thread catches the
+`std::runtime_error`, sets `server_killed_due_to_error_ = true`, and
+exits its polling loop instead of re-throwing (see
+`tt_metal/impl/debug/watcher_server.cpp` around the `dump()` call site).
+The main thread is still blocked on the halted kernel, so the process
+hangs alive: Inspector RPC keeps serving, and a second shell can attach
+Inspector clients, `gdb --pid`, or tt-triage to it.
+
+```bash
+TT_METAL_WATCHER=1 TT_METAL_WATCHER_TEST_MODE=1 <your program>
+```
 
 ## Traps
 

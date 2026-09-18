@@ -1,26 +1,23 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Run one ttnn matmul under graph capture + per-op comparison and exit.
+"""Run one ttnn matmul with comparison mode on and an unreachably strict PCC
+threshold, so the per-op comparison fires against the golden and logs.
 
 ttnn reads its CONFIG once at import time — post-import mutation does not
-reach the report writer. The debug flags are set through TTNN_CONFIG_OVERRIDES
-before ttnn imports, so the config the C++ side sees already has fast-runtime
-off and the report knobs on.
+reach comparison mode. Flags go through TTNN_CONFIG_OVERRIDES before ttnn
+imports. `comparison_mode_pcc=1.0` guarantees the log line since random
+bfloat16 inputs won't PCC-match the CPU golden exactly.
 """
 
 import json
 import os
 from pathlib import Path
 
-REPORT_NAME = "eval_graph_capture"
-
 os.environ["TTNN_CONFIG_OVERRIDES"] = json.dumps({
     "enable_fast_runtime_mode": False,
-    "enable_logging": True,
-    "enable_graph_report": True,
     "enable_comparison_mode": True,
-    "report_name": REPORT_NAME,
+    "comparison_mode_pcc": 1.0,
 })
 
 import torch  # noqa: E402
@@ -37,8 +34,4 @@ try:
 finally:
     ttnn.close_device(device)
 
-report_root = Path(os.environ["TT_METAL_HOME"]) / "generated" / "ttnn" / "reports"
-matching = sorted(report_root.glob(f"*{REPORT_NAME}*"))
-print(f"reports under: {report_root}", flush=True)
-for p in matching:
-    print(f"  {p.relative_to(report_root)}", flush=True)
+print("done", flush=True)

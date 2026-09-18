@@ -64,3 +64,32 @@ def eval_reads_the_fast_runtime_trap_from_a_config_dump(agent):
         assert token in body, (
             f"missing {token!r} anywhere in the answer. answer={res.answer}"
         )
+
+
+def eval_reads_a_comparison_fail_line(agent):
+    """Hand the agent the stderr of a ttnn matmul running with
+    `enable_comparison_mode=true` and `comparison_mode_pcc=1.0` — the
+    ERROR-level per-op comparison line. The agent has to name the op and
+    the actual PCC. Same shape as the trap eval, but the input shows the
+    tool doing what the SKILL says it does."""
+    output, expected = agent.fixture("comparison-fail")
+    prompt = (
+        "Below is a stderr capture from a ttnn run under comparison mode "
+        "on a Tenstorrent host. Report which op fell below the PCC "
+        "threshold and the exact actual PCC the runtime measured. Quote "
+        "the log line in quoted_evidence.\n\n"
+        "----- begin ttnn stderr -----\n" + output +
+        "----- end ttnn stderr -----"
+    )
+    res = agent.ask(prompt)
+
+    body = " ".join([
+        res.answer["primary_signal"], res.answer["location"], res.answer["command"],
+        " ".join(res.answer["quoted_evidence"]),
+        " ".join(res.answer["output_literals"]),
+        " ".join(res.answer["prereqs"]),
+    ])
+    for token in expected["must_mention"]:
+        assert token in body, (
+            f"missing {token!r} anywhere in the answer. answer={res.answer}"
+        )
