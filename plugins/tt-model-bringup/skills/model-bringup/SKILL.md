@@ -1,6 +1,6 @@
 ---
 name: model-bringup
-description: Implement Hugging Face text models in TTNN through staged decoder, multi-chip, full-model, datatype, vLLM and TTI release work. Use for model bring-up or resuming its staged goals; requires separately installed tt-autodebug.
+description: Implement Hugging Face text models in TTNN through staged decoder, multi-chip, full-model, datatype, vLLM and benchmark work. Use for model bring-up or resuming its staged goals; requires separately installed tt-autodebug.
 ---
 
 # Model bring-up
@@ -55,7 +55,10 @@ The eleven [goal templates](../../prompts/model_bringup_multigoal) run in order:
 8. Datatype sweep — `datatype-sweep`
 9. vLLM integration — `vllm-integration`
 10. Optimized vLLM — `optimize`
-11. TTI release — `tti-release`
+11. Benchmarks — `benchmark-model`
+
+`tti-release` remains available for an optional standalone TTI release handoff after
+serving is ready. It is not part of this eleven-stage sequence.
 
 `tt-device-usage`, `tt-enable-tracing`, `qualitative-check` and `stage-review` provide shared
 requirements. AutoDebug/AutoTriage/AutoFix come from the explicit dependency. Independent stage

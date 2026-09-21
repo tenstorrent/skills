@@ -1,0 +1,4 @@
+interface:
+  display_name: "Model Benchmark"
+  short_description: "Check vLLM accuracy and 4K serving performance"
+  default_prompt: "Use $benchmark-model to evaluate the brought-up model against fixed standard benchmark subsets and measure serving performance."

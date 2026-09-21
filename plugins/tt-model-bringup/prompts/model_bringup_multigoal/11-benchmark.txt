@@ -1,0 +1,17 @@
+/goal Use $benchmark-model and $tt-device-usage for HF_MODEL after optimized-vLLM in the current tt-metal checkout.
+
+As the user, I explicitly authorize you to use subagents when a selected skill requests or recommends them.
+
+Create a benchmark handoff in models/autoports/<model>/doc/benchmark/. Use the working Stage 10 vLLM server and the selected precision policy. Evaluate the generated autoport implementation; stock models are invalid final bringup evidence.
+
+Completion requirements:
+- Use pinned lm-evaluation-harness tasks and frozen common subsets, selected before observing model scores. Evaluate two or three applicable standard generative benchmarks with published figures for the exact model. Record task/protocol, actual N/full N, dataset/content hashes, few-shot and scorer settings.
+- Use the native HF chat template exactly once and the intended model-specific thinking/generation policy. No Meta-family wrapper or silent truncation. Keep benchmark input lengths unchanged. Preserve doc/context_contract.json; valid unaligned requests must work.
+- Accuracy runs at 32 concurrent requests through vLLM. Preserve responses, errors, stop/truncation reasons and upstream metrics. Investigate poor scores or parsing failures with $autofix.
+- Measure warmed vLLM performance at concurrency 1 and 32, 4096 actual input tokens and the same 128 output tokens. Report TTFT, TPOT, ITL, end-to-end latency, per-user decode rate, aggregate output rate and percentile metrics. Disable prefix caching, use distinct prompts, and require every request to complete.
+- The complete client stage, including task preparation/verification, evals, performance warmups/runs and report generation, finishes in less than one hour. Record cold setup/model-load/compile time separately. Timeout or missing rows are incomplete, never a pass.
+- Save REPORT.md, RUN_NOTES.md, identity.json, manifest.json, accuracy_review.json and raw/normalized run artifacts. Prove actual imported autoport module, full layers, model/tokenizer revisions, policy, hardware, source commits and launch configuration.
+- Compare subset metrics with correctly identified full-set published references; record deltas, uncertainty and protocol caveats. Resolve unexplained accuracy failures. Do not tune subsets to obtain matching scores.
+- $stage-review returns clean-pass after findings are fixed and reviewed. Commit stage-owned changes locally, never push, and log SHAs. Stop only processes owned by this stage; preserve evidence and follow reservation ownership.
+
+Unmet requirements and failed gates remain work. Stop only after $autofix fails.

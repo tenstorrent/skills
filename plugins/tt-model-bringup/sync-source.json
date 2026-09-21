@@ -102,20 +102,6 @@
       "packaged_sha256": "6817dc59aa6d8cdc9c50404aa4e919240f1a07e3ce772dab04ae21d4561bec24"
     },
     {
-      "source": ".agents/prompts/model_bringup_multigoal/11-tti-release.check.sh",
-      "destination": "prompts/model_bringup_multigoal/11-tti-release.check.sh",
-      "blob": "9cf16e6d4a2a45ab49fc88337fae474010a05ff2",
-      "source_sha256": "7f2e4e78a03f9de87daa6086626643b45c5331d7a25e5dfb1213e95e8712294b",
-      "packaged_sha256": "49247d546f0a31d8cf7396774bb67c6e880790f367eca0caac2689e5d7457168"
-    },
-    {
-      "source": ".agents/prompts/model_bringup_multigoal/11-tti-release.txt",
-      "destination": "prompts/model_bringup_multigoal/11-tti-release.txt",
-      "blob": "fe9b6e2c99ae39ddbd75b43d0190098651d163c5",
-      "source_sha256": "901d33ea82794ff0945d30a02cf6c62297e9bc62bf265a4f808ed2d496f4bf67",
-      "packaged_sha256": "901d33ea82794ff0945d30a02cf6c62297e9bc62bf265a4f808ed2d496f4bf67"
-    },
-    {
       "source": ".agents/requirements.txt",
       "destination": "requirements.txt",
       "blob": "f91d95881cec1c853fcd6b05090fa408607700b9",
@@ -127,7 +113,7 @@
       "destination": "scripts/check_context_contract.py",
       "blob": "53418ff24d91abd4552e64ff89885d756e411f62",
       "source_sha256": "b5a234f85e2d29603947eb36671b09f0442adbb4a219224baa7da16b7f2e8f09",
-      "packaged_sha256": "b5a234f85e2d29603947eb36671b09f0442adbb4a219224baa7da16b7f2e8f09"
+      "packaged_sha256": "943138760111aede7596f57d2caf374b25049d5df795a9c098104128bffc7b6e"
     },
     {
       "source": ".agents/scripts/multigoal",
@@ -282,20 +268,6 @@
       "blob": "02bf1ce1012a44a9f27e471f1da5b1facbf9a65d",
       "source_sha256": "5a386a3df722ecb5a5913c58a55bac8d83b2015e17cf596645eb35e99a5bf03e",
       "packaged_sha256": "5a386a3df722ecb5a5913c58a55bac8d83b2015e17cf596645eb35e99a5bf03e"
-    },
-    {
-      "source": ".agents/skills/tti-release/SKILL.md",
-      "destination": "skills/tti-release/SKILL.md",
-      "blob": "af09c19651cadaceb231edab4de3c9707801bc75",
-      "source_sha256": "bec4650d82fd95793652014d078125ee9370528c09a3f95cfb381f4ef1447fef",
-      "packaged_sha256": "47232f50d75a41cbab8d878d6250711546eaa04f653256b8c400e5ba165fd8d5"
-    },
-    {
-      "source": ".agents/skills/tti-release/agents/openai.yaml",
-      "destination": "skills/tti-release/agents/openai.yaml",
-      "blob": "d7b75c108f214e24c8cce7ea682820c067104d37",
-      "source_sha256": "9b65d65a898743c8f48e4438e99e9acb369f01cdc2aeda3804af29f8e7b96928",
-      "packaged_sha256": "9b65d65a898743c8f48e4438e99e9acb369f01cdc2aeda3804af29f8e7b96928"
     },
     {
       "source": ".agents/skills/vllm-integration/SKILL.md",
@@ -457,6 +429,27 @@
       "blob": "b95c9244dec7f2a9c9ce7c67a3590b023c7f4cf6",
       "source_sha256": "2ad452c15d8442d3fe641eb968bbd84e3bfe9acb01ddc540f451983c0da3cbbd",
       "packaged_sha256": "2ad452c15d8442d3fe641eb968bbd84e3bfe9acb01ddc540f451983c0da3cbbd"
+    },
+    {
+      "source": ".agents/prompts/model_bringup_multigoal/11-tti-release.check.sh",
+      "destination": "skills/tti-release/scripts/check-evidence.sh",
+      "blob": "9cf16e6d4a2a45ab49fc88337fae474010a05ff2",
+      "source_sha256": "7f2e4e78a03f9de87daa6086626643b45c5331d7a25e5dfb1213e95e8712294b",
+      "packaged_sha256": "8be4fc14ba3bdfffabad5b2583e3880fa3d79b7940d9906000ba326bff7ddb1c"
+    },
+    {
+      "source": ".agents/skills/tti-release/SKILL.md",
+      "destination": "skills/tti-release/SKILL.md",
+      "blob": "af09c19651cadaceb231edab4de3c9707801bc75",
+      "source_sha256": "bec4650d82fd95793652014d078125ee9370528c09a3f95cfb381f4ef1447fef",
+      "packaged_sha256": "3221ddb72a7899de9e662133d9b81fc5188be569988b49a514b61f4c9a1e19e4"
+    },
+    {
+      "source": ".agents/skills/tti-release/agents/openai.yaml",
+      "destination": "skills/tti-release/agents/openai.yaml",
+      "blob": "d7b75c108f214e24c8cce7ea682820c067104d37",
+      "source_sha256": "9b65d65a898743c8f48e4438e99e9acb369f01cdc2aeda3804af29f8e7b96928",
+      "packaged_sha256": "9b65d65a898743c8f48e4438e99e9acb369f01cdc2aeda3804af29f8e7b96928"
     }
   ]
 }

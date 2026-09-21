@@ -76,6 +76,8 @@ def test_clean_package_runs_all_goals_without_codex_or_old_framework(installed):
     assert len(manifests) == 1
     manifest = runner.read_manifest(manifests[0])
     assert manifest['stage_11_dry_run'] == 'true'
+    assert manifest['stage_11_check_script'].endswith('/11-benchmark.check.sh')
+    assert all('tti-release' not in p.read_text() for p in prompts)
     assert manifest['stage_6_check_script'].startswith(str(plugin))
     assert len(list(manifests[0].parent.glob('*.prompt.txt'))) == 11
     assert not (target / '.agents').exists()
@@ -118,7 +120,7 @@ def test_skill_graph_and_package_links_resolve():
             assert target.exists(), (path, ref)
 
 
-@pytest.mark.parametrize('stage', ['06-full-model', '07-optimized-full-model', '09-vllm', '10-optimized-vllm', '11-tti-release'])
+@pytest.mark.parametrize('stage', ['06-full-model', '07-optimized-full-model', '09-vllm', '10-optimized-vllm', '11-benchmark'])
 def test_installed_gates_fail_critical_for_missing_evidence(installed, stage):
     plugin, target, env = installed
     env['MODEL_DIR'] = 'models/autoports/org_model'
@@ -148,6 +150,30 @@ def test_full_model_gate_accepts_valid_evidence_and_rejects_context_reduction(in
     result = run('bash', str(gate), cwd=target, env=env)
     assert result.returncode == 2
     assert 'without device-DRAM capacity evidence' in result.stderr
+
+
+def test_standalone_tti_checker_resolves_package_and_rejects_stock_evidence(installed):
+    plugin, target, env = installed
+    assert (plugin / 'skills/tti-release/SKILL.md').is_file()
+    model = target / 'models/autoports/org_model'
+    release = model / 'doc/tti_release'
+    release.mkdir(parents=True)
+    (release / 'report_test.md').write_text('Release results\n')
+    (release / 'RUN_NOTES.md').write_text(
+        'EXIT_CODE=0\nGit SHA: recorded\n'
+        'Autoport implementation check: models/autoports/org_model\n')
+    (model / 'doc/context_contract.json').write_text(json.dumps({
+        'hf_advertised_context': 8192, 'current_supported_context': 8192}))
+    spec = release / 'model_spec.json'
+    spec.write_text(json.dumps({'impl': {'code_path': 'models/autoports/org_model'}}))
+    env['MODEL_DIR'] = 'models/autoports/org_model'
+    gate = plugin / 'skills/tti-release/scripts/check-evidence.sh'
+    result = run('bash', str(gate), cwd=target, env=env)
+    assert result.returncode == 0, result.stderr + result.stdout
+    spec.write_text(json.dumps({'impl': {'code_path': 'models/tt_transformers'}}))
+    result = run('bash', str(gate), cwd=target, env=env)
+    assert result.returncode == 2
+    assert 'stock implementation' in result.stderr
 
 
 @pytest.mark.parametrize('codes, expected, calls', [([0], 'pass', 1), ([1], 'advisory-fail', 1),

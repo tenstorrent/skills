@@ -61,3 +61,14 @@ full-model autoregressive output cannot satisfy these gates. The serving skill a
 requires verification of page-growth refresh and pending-token handling before async
 overlap; the pinned dependency does not provide the previously claimed guarantee.
 These changes do not include a vLLM scheduler patch or imply hardware validation.
+
+## Benchmark stage replacement (0.1.6)
+
+Stage 11 now uses pinned lm-eval tasks through native-chat vLLM, fixed content-identified
+subsets, and 4K-input performance at concurrency 1 and 32. TTI release remains a
+standalone skill, with its former prompt's handoff guidance in the skill and its
+artifact checker under `skills/tti-release/scripts/`. It has no multigoal prompt.
+Original source hashes remain in sync-source.json while packaged hashes describe
+the adapted imports; the benchmark runtime and prompts are new files. New runtime
+helpers live in benchmark_stage. The calibration report records measured coverage,
+runtime, reference agreement and hardware limitations; package tests alone establish none.
