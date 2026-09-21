@@ -1,7 +1,9 @@
 """Offline invariants for subset comparability and bounded benchmark execution."""
 import importlib.util
 import json
+import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import time
@@ -14,6 +16,7 @@ sys.path.insert(0, str(RUNTIME))
 from benchmark_stage.subsets import allocate, digest, indices
 from benchmark_stage.run import command
 from benchmark_stage.check import check
+from benchmark_stage.evidence import PERFORMANCE_METRICS
 
 
 def test_recipe_variant_preserves_questions_and_rejects_changed_population():
@@ -89,6 +92,34 @@ def test_failed_client_is_not_success(tmp_path):
         command([sys.executable, '-c', 'raise SystemExit(7)'], tmp_path / 'failure.log', time.monotonic() + 5)
 
 
+def test_timeout_kills_child_even_when_group_leader_exits(tmp_path):
+    pidfile = tmp_path / 'child.pid'
+    child = ('import os,signal,time; from pathlib import Path; '
+             'signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+             f'Path({str(pidfile)!r}).write_text(str(os.getpid())); time.sleep(30)')
+    parent = ('import subprocess,sys,time; '
+              f'subprocess.Popen([sys.executable,"-c",{child!r}]); time.sleep(30)')
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            command([sys.executable, '-c', parent], tmp_path / 'timeout.log',
+                    time.monotonic() + 0.5, terminate_grace_seconds=0.1)
+        pid = int(pidfile.read_text())
+        deadline = time.monotonic() + 3
+        while True:
+            state = subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)],
+                                   capture_output=True, text=True).stdout.strip()
+            if not state or state.startswith('Z'):
+                break
+            assert time.monotonic() < deadline, 'owned child survived process-group cleanup'
+            time.sleep(0.05)
+    finally:
+        if pidfile.exists():
+            try:
+                os.kill(int(pidfile.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
 def test_missing_benchmark_evidence_fails_closed(tmp_path):
     with pytest.raises(ValueError, match='missing benchmark evidence'):
         check(tmp_path / 'models/autoports/model')
@@ -97,8 +128,8 @@ def test_missing_benchmark_evidence_fails_closed(tmp_path):
 def performance_fixture(requests, output_tokens=128):
     return dict(completed=requests, failed=0, input_lens=[4096] * requests,
                 output_lens=[output_tokens] * requests, total_input_tokens=4096 * requests,
-                total_output_tokens=output_tokens * requests, mean_ttft_ms=5,
-                mean_tpot_ms=6, mean_itl_ms=6, output_throughput=7)
+                total_output_tokens=output_tokens * requests,
+                **{field: 7 for field in PERFORMANCE_METRICS})
 
 
 @pytest.mark.parametrize('field,value', [('input_lens', [512] * 8), ('output_lens', [1] * 8),
@@ -206,6 +237,23 @@ def test_gate_connects_review_to_raw_evidence(tmp_path, mutation):
             data[key] = value
         path.write_text(json.dumps(data))
     with pytest.raises((ValueError, OSError)):
+        check(root, 'org/model')
+
+
+@pytest.mark.parametrize('field', PERFORMANCE_METRICS)
+def test_gate_requires_and_reconciles_all_performance_metrics(tmp_path, field):
+    root, evidence = valid_gate_fixture(tmp_path)
+    summary_path = evidence / 'run/summary.json'
+    summary = json.loads(summary_path.read_text())
+    summary['performance']['32'][field] += 1
+    summary_path.write_text(json.dumps(summary))
+    with pytest.raises(ValueError, match='summary disagrees'):
+        check(root, 'org/model')
+    raw_path = evidence / 'run/perf-b32.json'
+    raw = json.loads(raw_path.read_text())
+    del raw[field]
+    raw_path.write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match='missing/invalid performance'):
         check(root, 'org/model')
 
 

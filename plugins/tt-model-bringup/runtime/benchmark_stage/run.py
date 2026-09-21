@@ -12,7 +12,7 @@ import time
 from benchmark_stage.evidence import validate_performance
 
 
-def command(argv, log, deadline):
+def command(argv, log, deadline, *, terminate_grace_seconds=10):
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise TimeoutError('benchmark stage exceeded its wall-clock budget')
@@ -27,11 +27,26 @@ def command(argv, log, deadline):
                 os.killpg(process.pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
+            # A terminated group leader does not imply its children have exited.
+            grace_deadline = time.monotonic() + terminate_grace_seconds
+            while True:
+                process.poll()
+                try:
+                    os.killpg(process.pid, 0)
+                except ProcessLookupError:
+                    break
+                except PermissionError:
+                    # macOS can return EPERM briefly while a terminated leader
+                    # is being reaped. Keep the bounded cleanup attempt active.
+                    pass
+                if time.monotonic() >= grace_deadline:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    break
+                time.sleep(0.05)
+            process.wait()
             raise
     if code:
         raise RuntimeError(f'command exited {code}; inspect {log}')

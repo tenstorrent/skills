@@ -3,6 +3,12 @@ from __future__ import annotations
 
 import math
 
+PERFORMANCE_METRICS = (
+    'duration', 'request_throughput', 'output_throughput', 'total_token_throughput',
+    *(f'{stat}_{metric}_ms' for metric in ('ttft', 'tpot', 'itl', 'e2el')
+      for stat in ('mean', 'median', 'p95', 'p99')),
+)
+
 
 def finite_number(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
@@ -17,7 +23,7 @@ def validate_performance(raw, requests, output_tokens):
             raise ValueError(f'performance {field}: expected {requests} requests of {length} tokens')
     if raw.get('total_input_tokens') != requests * 4096 or raw.get('total_output_tokens') != requests * output_tokens:
         raise ValueError('performance total token counts disagree with requested lengths')
-    for field in ('mean_ttft_ms', 'mean_tpot_ms', 'mean_itl_ms', 'output_throughput'):
+    for field in PERFORMANCE_METRICS:
         value = raw.get(field)
         if not finite_number(value) or value <= 0:
             raise ValueError(f'missing/invalid performance {field}')

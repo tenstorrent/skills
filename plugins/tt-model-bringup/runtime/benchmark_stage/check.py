@@ -5,7 +5,7 @@ import json
 import math
 from pathlib import Path
 
-from benchmark_stage.evidence import finite_number, metric_score, validate_performance
+from benchmark_stage.evidence import PERFORMANCE_METRICS, finite_number, metric_score, validate_performance
 from benchmark_stage.subsets import digest
 
 
@@ -110,7 +110,7 @@ def check(model_dir, hf_model=''):
             if raw.get('model_id') != identity['model'] or raw.get('max_concurrency') != int(batch):
                 raise ValueError(f'batch {batch}: raw performance identity/concurrency mismatch')
             if not warmup:
-                for key in ('completed', 'total_input_tokens', 'total_output_tokens', 'mean_ttft_ms', 'mean_tpot_ms', 'mean_itl_ms', 'output_throughput'):
+                for key in ('completed', 'total_input_tokens', 'total_output_tokens', *PERFORMANCE_METRICS):
                     if result.get(key) != raw.get(key):
                         raise ValueError(f'batch {batch}: summary disagrees with raw {key}')
     review = read(evidence / 'accuracy_review.json')
