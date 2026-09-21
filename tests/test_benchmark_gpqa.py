@@ -143,8 +143,13 @@ def fake_harness(monkeypatch, tmp_path, upstream_preprocess):
         task = get_task_dict(tasks)[gpqa.TASK]
         docs = list(task.eval_docs)
         selected = samples[gpqa.TASK]
-        model.parse_generations([dict(choices=[dict(
-            message=dict(content='The answer is (A).'), finish_reason='stop')]) for _ in selected])
+        responses = [dict(choices=[dict(
+            index=0, message=dict(content='The answer is (A).'), finish_reason='stop')]) for _ in selected]
+        responses[0] = dict(choices=[dict(index=0, message=dict(content=None, reasoning='The answer is (A).'),
+                                         finish_reason='length')], usage=dict(completion_tokens=32768))
+        parsed = model.parse_generations(responses)
+        assert parsed == [''] + ['The answer is (A).'] * (len(selected) - 1)
+        assert responses[0]['choices'][0]['message']['content'] is None
         return dict(results={gpqa.TASK: {'exact_match,strict-match': 0.5}},
                     samples={gpqa.TASK: [dict(doc_id=i, doc=docs[i]) for i in selected]})
 
@@ -168,6 +173,7 @@ def test_prepare_preflight_and_evaluator_share_gpqa_policy(tmp_path, fake_harnes
     assert fake_harness[0] == fake_harness[1] == fake_harness[2]
     assert result['benchmark_stage']['document_processing'] == gpqa.PROCESSING_POLICY
     assert result['benchmark_stage']['responses'] == 6
+    assert result['benchmark_stage']['empty_final_length_responses'] == 1
     rows = [json.loads(line) for line in
             (tmp_path / f'evaluation/samples_{gpqa.TASK}.jsonl').read_text().splitlines()]
     frozen = manifest['tasks'][gpqa.TASK]

@@ -70,3 +70,49 @@ lm-eval 0.4.13. A KV-capacity-only pool adjustment and larger trace allocation w
 needed; model math and kernels were unchanged. Generic and Meta profile manifests
 are packaged with the stage. GPQA, MoE, reasoning and multimodal profiles still
 require separate calibration.
+
+## QB2 Llama 3.1 8B calibration
+
+The requested specialized `models/demos/llama31_8b_qb2` implementation completed
+all 792 accuracy requests and both performance rows in **9m19s**, after a narrow
+local model fix. Unmodified main (`8da445c5cf7fe6e0369e744079ea9260ed78fb04`)
+reproducibly fails a 1,214-token prompt with an RMSNorm L1 allocation collision.
+Routing tails above 128 rows through its existing interleaved normalization path
+passed the isolated regression (HF PCC 0.998396 prefill, 0.998542 decode) and the
+full serving run. These results describe that patched model; the skills PR does
+not change tt-metal.
+
+| Benchmark | Samples / full | QB2 subset % | Published full % | Sampling-only 95% interval |
+|---|---:|---:|---:|---:|
+| MMLU-Pro, subject macro | 280 / 12,032 | 45.71 | 48.3 | 39.87–51.56 |
+| GSM8K, strict extraction | 256 / 1,319 | 83.20 | 84.5 | 78.99–87.06 |
+| IFEval, mean of four | 256 / 541 | 80.99 | 80.4 | 77.77–84.05 |
+
+The same Meta profile and generation limits used in the T3K control were retained.
+Published figures are from the [Meta model card](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct).
+Aggregate agreement supports a coarse bringup check. It does not establish output
+quality on every question: 38 MMLU answers exhausted the 1,024-token cap and scored
+zero; repetitive answers also occur. Prior T3K counts were similar, but a backend
+cause was not established. The intervals describe subset sampling only.
+
+| Serving metric, 4096 input / 128 output tokens | Concurrency 1 | Concurrency 32 |
+|---|---:|---:|
+| Aggregate output tokens/s | 86.94 | 388.94 |
+| Mean time to first token, ms | 248.88 | 7,448.47 |
+| Mean time per output token, ms | 9.63 | 17.55 |
+| Median inter-token latency, ms | 9.66 | 16.05 |
+| p95 inter-token latency, ms | 9.76 | 17.99 |
+| Median end-to-end latency, ms | 1,472.85 | 9,445.35 |
+
+The concurrency-32 run includes one 31.56-second request and a 9.97-second
+inter-token gap. The raw client's peak-concurrency field is incorrect (63);
+reconstructing request intervals confirms 32. The table preserves its effect on
+aggregate throughput and mean latency. A 32-sized tile does not make these
+continuous-batching serving latencies equal between concurrency settings.
+
+QB2 uses four Blackhole devices across two P300 cards. All 32 layers ran with the
+specialized implementation's shipped fixed precision policy; it has no generic
+accuracy-mode switch. Native CI build `9b04e73a4ee2a30c2ee5a8694d63d4450234984d`,
+companion vllm-tt-plugin `ce08904469f1ce1b524008b350cbb856c79d3a61`, vLLM 0.26.0
+and lm-eval 0.4.13 were used. Setup, loading and initial compilation are outside
+the client-stage timer. Gemma 4 31B QB2 calibration remains in progress.

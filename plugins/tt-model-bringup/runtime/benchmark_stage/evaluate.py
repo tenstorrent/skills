@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 from benchmark_stage.gpqa import processing_policy, task_spec
+from benchmark_stage.responses import scoring_response
 from benchmark_stage.subsets import digest, flatten
 
 
@@ -48,10 +49,8 @@ def evaluate(*, model, base_url, manifest_path, group, output, generation=None):
             with response_file.open('a') as f:
                 for row in rows:
                     f.write(json.dumps(row, ensure_ascii=False) + '\n')
-            for row in rows:
-                if not row.get('choices') or any(not (c.get('message', {}).get('content') or '').strip() for c in row['choices']):
-                    raise ValueError('missing final answer in API response; inspect reasoning/parser configuration')
-            return super().parse_generations(outputs, **kwargs)
+            normalized = [scoring_response(row)[0] for row in rows]
+            return super().parse_generations(normalized if isinstance(outputs, list) else normalized[0], **kwargs)
 
     # Long reasoning answers can exceed 15 minutes. The parent runner enforces
     # the complete stage's deadline, including queued and in-flight requests.
@@ -87,6 +86,7 @@ def evaluate(*, model, base_url, manifest_path, group, output, generation=None):
         'request_timeout_seconds': request_timeout_seconds,
         'expected_samples': expected, 'responses': len(responses),
         'finish_reasons': reasons, 'generation_overrides': generation or {},
+        'empty_final_length_responses': sum(scoring_response(row)[1] for row in responses),
         'template': 'native server chat template; structured messages exactly once',
         'fewshot_as_multiturn': True,
     }

@@ -7,6 +7,7 @@ from pathlib import Path
 
 from benchmark_stage.evidence import PERFORMANCE_METRICS, finite_number, metric_score, validate_performance
 from benchmark_stage.subsets import digest
+from benchmark_stage.responses import scoring_response
 
 
 def read(path):
@@ -68,11 +69,11 @@ def check(model_dir, hf_model=''):
             raise ValueError(f'{task}: summary disagrees with raw accuracy result')
         transcript = evidence / 'run' / task / 'responses.jsonl'
         responses = [json.loads(line) for line in transcript.read_text().splitlines()]
-        if len(responses) != group['sample_count'] or any(
-            len(r.get('choices', [])) != 1 or not (r['choices'][0].get('message', {}).get('content') or '').strip()
-            for r in responses
-        ):
+        if len(responses) != group['sample_count']:
             raise ValueError(f'{task}: incomplete response transcript')
+        empty_finals = sum(scoring_response(response)[1] for response in responses)
+        if result.get('empty_final_length_responses', 0) != empty_finals:
+            raise ValueError(f'{task}: summary disagrees with exhausted final-answer count')
         reasons = {}
         for response in responses:
             reason = response['choices'][0].get('finish_reason', 'missing')

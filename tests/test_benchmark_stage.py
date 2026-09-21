@@ -187,7 +187,7 @@ def valid_gate_fixture(tmp_path):
         summary['accuracy'][task] = stage
         write(f'run/{task}/results.json', dict(results={task: {'acc,none': 0.5}}, benchmark_stage=stage))
         (evidence / f'run/{task}/samples_{task}.jsonl').write_text(''.join(json.dumps({'doc_id': i, 'doc': d}) + '\n' for i, d in enumerate(docs)))
-        response = dict(choices=[dict(message=dict(content='answer'), finish_reason='stop')])
+        response = dict(choices=[dict(index=0, message=dict(content='answer'), finish_reason='stop')])
         (evidence / f'run/{task}/responses.jsonl').write_text((json.dumps(response) + '\n') * 2)
     for b in (1, 32):
         requests = max(8, b * 3)
@@ -318,3 +318,98 @@ def test_budget_failure_report_does_not_say_completed(tmp_path,monkeypatch):
  with pytest.raises(RuntimeError,match='budget'):runner.run(config_path=cfg,output=tmp_path/'run')
  assert json.loads((tmp_path/'run/summary.json').read_text())['status']=='failed'
  assert 'Status: completed.' not in (tmp_path/'run/REPORT.md').read_text()
+
+
+def exhausted_response(content=None, reasoning_key='reasoning'):
+    return {'choices': [{'index': 0, 'message': {'content': content, reasoning_key: 'The answer is (A).'},
+                         'finish_reason': 'length'}], 'usage': {'completion_tokens': 32768}}
+
+
+@pytest.mark.parametrize('content', [None, '', '  '])
+@pytest.mark.parametrize('reasoning_key', ['reasoning', 'reasoning_content'])
+def test_exhausted_reasoning_retains_raw_and_never_scores_reasoning(content, reasoning_key, monkeypatch):
+    from benchmark_stage.responses import scoring_response
+    monkeypatch.setenv('LMEVAL_MODEL_NONE_ANSWER_PLACEHOLDER', 'The answer is (A).')
+    raw = exhausted_response(content, reasoning_key)
+    original = json.dumps(raw)
+    normalized, exhausted = scoring_response(raw)
+    assert exhausted and normalized['choices'][0]['message']['content'] == ''
+    assert json.dumps(raw) == original
+
+
+@pytest.mark.parametrize('reason', ['stop', 'length'])
+def test_nonempty_final_is_preserved(reason):
+    from benchmark_stage.responses import scoring_response
+    raw = exhausted_response('Final answer')
+    raw['choices'][0]['finish_reason'] = reason
+    assert scoring_response(raw) == (raw, False)
+
+
+@pytest.mark.parametrize('mutation', ['stop', 'no_reasoning', 'no_usage', 'bad_usage', 'no_content',
+                                     'bad_content', 'bad_index', 'no_message', 'no_choices', 'two_choices', 'error'])
+def test_invalid_final_responses_fail(mutation):
+    from benchmark_stage.responses import scoring_response
+    raw = exhausted_response()
+    choice = raw['choices'][0]
+    if mutation == 'stop': choice['finish_reason'] = 'stop'
+    elif mutation == 'no_reasoning': del choice['message']['reasoning']
+    elif mutation == 'no_usage': del raw['usage']
+    elif mutation == 'bad_usage': raw['usage']['completion_tokens'] = True
+    elif mutation == 'no_content': del choice['message']['content']
+    elif mutation == 'bad_content': choice['message']['content'] = []
+    elif mutation == 'bad_index': choice['index'] = 1
+    elif mutation == 'no_message': del choice['message']
+    elif mutation == 'no_choices': del raw['choices']
+    elif mutation == 'two_choices': raw['choices'].append(choice.copy())
+    else: raw['error'] = {'message': 'transport error'}
+    with pytest.raises(ValueError): scoring_response(raw)
+
+
+def test_gate_requires_exhaustion_count_and_truncation_assessment(tmp_path):
+    root, evidence = valid_gate_fixture(tmp_path)
+    path = evidence / 'run/ifeval/responses.jsonl'
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    rows[0] = exhausted_response()
+    path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+    for path, stage in ((evidence / 'run/summary.json', 'summary'), (evidence / 'run/ifeval/results.json', 'raw')):
+        data = json.loads(path.read_text())
+        metadata = data['accuracy']['ifeval'] if stage == 'summary' else data['benchmark_stage']
+        metadata['finish_reasons'] = {'stop': 1, 'length': 1}
+        path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match='exhausted final-answer count'): check(root)
+    for path, stage in ((evidence / 'run/summary.json', 'summary'), (evidence / 'run/ifeval/results.json', 'raw')):
+        data = json.loads(path.read_text())
+        metadata = data['accuracy']['ifeval'] if stage == 'summary' else data['benchmark_stage']
+        metadata['empty_final_length_responses'] = 1
+        path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match='truncation assessment'): check(root)
+    path = evidence / 'accuracy_review.json'
+    review = json.loads(path.read_text())
+    review['benchmarks']['ifeval']['truncation_assessment'] = 'One exhausted answer retained and scored empty.'
+    path.write_text(json.dumps(review))
+    assert check(root) == evidence
+
+
+def test_empty_exhausted_final_with_pinned_upstream_parser_and_ifeval(monkeypatch):
+    pytest.importorskip('lm_eval')
+    from importlib.metadata import version
+    from lm_eval.models.openai_completions import LocalChatCompletion
+    from lm_eval.tasks.ifeval import utils, instructions_registry
+    from benchmark_stage.responses import scoring_response
+    assert version('lm_eval') == '0.4.13'
+    monkeypatch.setenv('LMEVAL_MODEL_NONE_ANSWER_PLACEHOLDER', 'The answer is (A).')
+    backend = object.__new__(LocalChatCompletion)
+    backend.think_end_token = None
+    parsed = backend.parse_generations(scoring_response(exhausted_response())[0])
+    assert parsed == ['']
+    class PermissiveInstruction:
+        def __init__(self, instruction_id): pass
+        def build_description(self, **kwargs): pass
+        def get_instruction_args(self): return []
+        def check_following(self, response): return True
+    monkeypatch.setitem(instructions_registry.INSTRUCTION_DICT, 'test:always', PermissiveInstruction)
+    doc = dict(key=1, instruction_id_list=['test:always'], prompt='test', kwargs=[{}])
+    scores = utils.process_results(doc, parsed)
+    assert scores == dict(prompt_level_strict_acc=False, inst_level_strict_acc=[False],
+                          prompt_level_loose_acc=False, inst_level_loose_acc=[False])
+    assert utils.process_results(doc, ['control'])['prompt_level_strict_acc'] is True

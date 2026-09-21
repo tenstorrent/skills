@@ -126,3 +126,11 @@ server log alongside this record. For each accuracy review, `reference_metric`
 is the exact upstream metric key; `subject_macro:<metric>` computes an unweighted mean of the explicitly listed child-task scores, needed for Meta MMLU-Pro even though the upstream group itself micro-averages; `ifeval_mean_four` selects Meta’s published
 mean of the four IFEval metrics. Scores and deltas are percentage points. Any
 length-limited response requires an explicit `truncation_assessment` or a rerun.
+
+
+A valid reasoning response that reaches its token limit without a final answer
+remains in the scored denominator as an empty answer. The client preserves the
+raw response, never grades hidden reasoning, and records
+`empty_final_length_responses`. The evidence gate reconciles that count and
+requires the same explicit truncation assessment as other length-limited outputs.
+Empty answers with a normal stop or malformed API responses still fail the run.
