@@ -5,6 +5,7 @@ import json
 import time
 from pathlib import Path
 
+from benchmark_stage.gpqa import processing_policy, task_spec
 from benchmark_stage.subsets import digest, flatten
 
 
@@ -20,13 +21,15 @@ def evaluate(*, model, base_url, manifest_path, group, output, generation=None):
     expected_hash = manifest['manifest_sha256']
     if digest({k: v for k, v in manifest.items() if k != 'manifest_sha256'}) != expected_hash:
         raise ValueError('subset manifest checksum mismatch')
-    tasks = flatten(get_task_dict([group]))
+    tasks = flatten(get_task_dict([task_spec(group)]))
     if sorted(tasks) != manifest['groups'][group]['tasks']:
         raise ValueError('task membership differs from frozen subset')
     samples = {}
     for name, task in tasks.items():
         docs = list(task.eval_docs)
         frozen = manifest['tasks'][name]
+        if frozen.get('document_processing') != processing_policy(name):
+            raise ValueError(f'{name}: document-processing policy differs from frozen subset')
         if len(docs) != frozen['population'] or digest(docs) != frozen['population_sha256']:
             raise ValueError(f'{name}: dataset changed since subset freeze')
         if 'num_fewshot' in frozen:
@@ -55,7 +58,7 @@ def evaluate(*, model, base_url, manifest_path, group, output, generation=None):
                            tokenized_requests=False, tokenizer_backend=None, max_gen_toks=2048)
     started = time.time()
     result = evaluator.simple_evaluate(
-        model=backend, tasks=[group], samples=samples,
+        model=backend, tasks=[task_spec(group)], samples=samples,
         apply_chat_template=True, fewshot_as_multiturn=True, log_samples=True,
         gen_kwargs=generation or None, random_seed=0, numpy_random_seed=1234,
         torch_random_seed=1234, fewshot_random_seed=1234,
@@ -83,6 +86,8 @@ def evaluate(*, model, base_url, manifest_path, group, output, generation=None):
         'template': 'native server chat template; structured messages exactly once',
         'fewshot_as_multiturn': True,
     }
+    if policy := processing_policy(group):
+        result['benchmark_stage']['document_processing'] = policy
     (output / 'results.json').write_text(json.dumps(result, indent=2, default=str) + '\n')
     if len(responses) != expected:
         raise RuntimeError(f'incomplete requests: {len(responses)}/{expected}')

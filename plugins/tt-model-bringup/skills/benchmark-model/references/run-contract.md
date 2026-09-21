@@ -17,6 +17,8 @@ an older copied package; do not assume exporting the path selects the intended c
 
 The CI profile contains 280 MMLU-Pro questions (proportional subject allocation), 256 GSM8K-CoT questions and 256 IFEval prompts. Its measured scope is non-reasoning dense controls; retain the calibration report's score and protocol limitations. GPQA Diamond can replace GSM8K when that is the model's published evaluation; select and record its sample budget before scoring and calibrate that profile separately. Do not imply that this profile is calibrated on long-thinking or MoE models.
 
+For `gpqa_diamond_cot_zeroshot`, the client preserves the upstream prompt and scorer but makes answer-choice shuffling deterministic with a private seed-0 RNG and recomputes that transform. Upstream 0.4.13 uses a global RNG whose state is absent from the dataset transform cache key. The manifest records this processing policy and evaluation rejects a different policy. Freeze a new GPQA manifest with this client; do not reuse a manifest prepared with the upstream cache-dependent shuffle.
+
 Freeze once, before observing scores:
 
 ```bash

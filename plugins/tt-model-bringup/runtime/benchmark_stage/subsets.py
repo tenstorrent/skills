@@ -6,6 +6,8 @@ import json
 import math
 from pathlib import Path
 
+from benchmark_stage.gpqa import processing_policy, task_spec
+
 SEED = 'tt-bringup-benchmark-v1'
 
 
@@ -73,7 +75,7 @@ def prepare(task_groups, budgets, output, reuse_manifest=None):
         manifest['reused_manifest_sha256'] = source['manifest_sha256']
     samples = {}
     for group in task_groups:
-        tasks = flatten(get_task_dict([group]))
+        tasks = flatten(get_task_dict([task_spec(group)]))
         documents = {k: list(v.eval_docs) for k, v in tasks.items()}
         counts = allocate({k: len(v) for k, v in documents.items()}, budgets[group])
         manifest['groups'][group] = {'sample_count': sum(counts.values()), 'population': sum(map(len, documents.values())), 'tasks': sorted(tasks)}
@@ -89,6 +91,8 @@ def prepare(task_groups, budgets, output, reuse_manifest=None):
                 'fewshot_sha256': digest(list(tasks[name].fewshot_docs())) if tasks[name].config.num_fewshot else None,
                 'dataset_fingerprint': getattr(tasks[name].eval_docs, '_fingerprint', None),
             }
+            if policy := processing_policy(name):
+                manifest['tasks'][name]['document_processing'] = policy
             if source_task:
                 manifest['tasks'][name]['reused_from_task'] = source_task
     manifest['manifest_sha256'] = digest(manifest)
