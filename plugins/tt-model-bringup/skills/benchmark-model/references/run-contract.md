@@ -15,7 +15,7 @@ from the actual launch directory and verify that it is inside this plugin's
 `runtime/benchmark_stage`. Python's working directory can shadow `PYTHONPATH` with
 an older copied package; do not assume exporting the path selects the intended code.
 
-The CI profile contains 280 MMLU-Pro questions (proportional subject allocation), 256 GSM8K-CoT questions and 256 IFEval prompts. Its measured scope is non-reasoning dense controls; retain the calibration report's score and protocol limitations. GPQA Diamond can replace GSM8K when that is the model's published evaluation; select and record its sample budget before scoring and calibrate that profile separately. Do not imply that this profile is calibrated on long-thinking or MoE models.
+The CI profile contains 280 MMLU-Pro questions (proportional subject allocation), 256 GSM8K-CoT questions and 256 IFEval prompts. Its original measured scope is non-reasoning dense controls; retain the calibration report's score and protocol limitations. For the Gemma 4 QB2 reasoning calibration, use the separate frozen profile described below. GPQA Diamond can replace GSM8K when that is the model's published evaluation. Neither profile has been calibrated on MoE models.
 
 For `gpqa_diamond_cot_zeroshot`, the client preserves the upstream prompt and scorer but makes answer-choice shuffling deterministic with a private seed-0 RNG and recomputes that transform. Upstream 0.4.13 uses a global RNG whose state is absent from the dataset transform cache key. The manifest records this processing policy and evaluation rejects a different policy. Freeze a new GPQA manifest with this client; do not reuse a manifest prepared with the upstream cache-dependent shuffle.
 
@@ -155,3 +155,43 @@ Shared mode requires unique requests with one generation per question. It writes
 request hash, dataset ID, response ID and scored final answer. Duplicate or
 ambiguous requests fail before inference. A deadline still fails the complete
 stage; partial raw transcripts are diagnostic evidence only.
+
+
+## Gemma 4 QB2 reasoning profile
+
+`profiles/ci-v1-reasoning.json` preserves the same 280 MMLU-Pro and 256 IFEval
+questions and adds all 198 GPQA Diamond questions. Its manifest hash is
+`83203b75b253a2dff70c9bac96c257fe784981a714c767b61f15fdefb707598b`.
+The full GPQA set was frozen before inference: a 64-question candidate was
+6.28 percentage points easier than the full set in a historical result, so the
+candidate was expanded without searching for a better-matching seed.
+
+The timed Gemma candidate selects only `mmlu_pro` and
+`gpqa_diamond_cot_zeroshot`, with `accuracy_execution: "shared"`. IFEval remains
+available in the manifest for a separate diagnostic; it is not part of that timed
+candidate. Google's reported IFEval figure does not identify which of its four
+aggregations was used.
+
+Use the following identical generation dictionary for both selected tasks when
+reproducing this calibration:
+
+```json
+{
+  "max_gen_toks": 32768,
+  "temperature": 1,
+  "top_p": 0.95,
+  "top_k": 20,
+  "chat_template_kwargs": {"enable_thinking": true},
+  "until": [],
+  "do_sample": true
+}
+```
+
+This uses the Gemma PR's device-supported sampler. Top-k 20 differs from Google's
+general top-k 64 recommendation; it is a recorded calibration protocol, not a
+universal default or an exact reproduction of the published recipe. Preserve
+native reasoning/final-answer separation. Compare `exact_match,custom-extract`
+for pooled MMLU-Pro with 85.2%, and `exact_match,flexible-extract` for GPQA Diamond
+with 84.3%, from the [Gemma 4 model card](https://ai.google.dev/gemma/docs/core/model_card_4).
+The final measured runtime, scores and limitations belong in the calibration
+report; the existence of a frozen profile alone does not establish a passing run.

@@ -19,6 +19,21 @@ from benchmark_stage.check import check
 from benchmark_stage.evidence import PERFORMANCE_METRICS
 
 
+def test_reasoning_profile_preserves_common_questions_and_full_gpqa():
+    profiles = RUNTIME / 'benchmark_stage/profiles'
+    generic = json.loads((profiles / 'ci-v1.json').read_text())
+    reasoning = json.loads((profiles / 'ci-v1-reasoning.json').read_text())
+    assert reasoning['manifest_sha256'] == digest({
+        key: value for key, value in reasoning.items() if key != 'manifest_sha256'})
+    for name in generic['tasks'].keys() & reasoning['tasks'].keys():
+        for field in ('indices', 'document_sha256', 'population_sha256'):
+            assert generic['tasks'][name][field] == reasoning['tasks'][name][field]
+    gpqa = reasoning['tasks']['gpqa_diamond_cot_zeroshot']
+    assert gpqa['population'] == 198
+    assert gpqa['indices'] == list(range(198))
+    assert len(gpqa['document_sha256']) == 198
+
+
 def test_recipe_variant_preserves_questions_and_rejects_changed_population():
     from benchmark_stage.subsets import reuse_indices
     source = {'tasks': {'original': {'population_sha256': 'same-documents', 'indices': [2, 9, 12]}}}
