@@ -19,19 +19,30 @@ from benchmark_stage.check import check
 from benchmark_stage.evidence import PERFORMANCE_METRICS
 
 
-def test_reasoning_profile_preserves_common_questions_and_full_gpqa():
+def test_reasoning_profiles_preserve_common_questions_and_gpqa_documents():
     profiles = RUNTIME / 'benchmark_stage/profiles'
     generic = json.loads((profiles / 'ci-v1.json').read_text())
-    reasoning = json.loads((profiles / 'ci-v1-reasoning.json').read_text())
-    assert reasoning['manifest_sha256'] == digest({
-        key: value for key, value in reasoning.items() if key != 'manifest_sha256'})
-    for name in generic['tasks'].keys() & reasoning['tasks'].keys():
-        for field in ('indices', 'document_sha256', 'population_sha256', 'fewshot_sha256'):
-            assert generic['tasks'][name][field] == reasoning['tasks'][name][field]
-    gpqa = reasoning['tasks']['gpqa_diamond_cot_zeroshot']
-    assert gpqa['population'] == 198
-    assert gpqa['indices'] == list(range(198))
-    assert len(gpqa['document_sha256']) == 198
+    full = json.loads((profiles / 'ci-v1-reasoning-full.json').read_text())
+    subset = json.loads((profiles / 'ci-v1-reasoning.json').read_text())
+    for reasoning, count in ((full, 198), (subset, 128)):
+        assert reasoning['manifest_sha256'] == digest({
+            key: value for key, value in reasoning.items() if key != 'manifest_sha256'})
+        for name in generic['tasks'].keys() & reasoning['tasks'].keys():
+            for field in ('indices', 'document_sha256', 'population_sha256', 'fewshot_sha256'):
+                assert generic['tasks'][name][field] == reasoning['tasks'][name][field]
+        gpqa = reasoning['tasks']['gpqa_diamond_cot_zeroshot']
+        assert gpqa['population'] == 198
+        assert len(set(gpqa['indices'])) == count
+        assert len(gpqa['document_sha256']) == count
+        assert reasoning['groups']['gpqa_diamond_cot_zeroshot']['sample_count'] == count
+    full_gpqa = full['tasks']['gpqa_diamond_cot_zeroshot']
+    subset_gpqa = subset['tasks']['gpqa_diamond_cot_zeroshot']
+    assert full_gpqa['indices'] == list(range(198))
+    assert subset['candidate_from_manifest_sha256'] == full['manifest_sha256']
+    assert subset_gpqa['document_processing'] == full_gpqa['document_processing']
+    assert subset_gpqa['population_sha256'] == full_gpqa['population_sha256']
+    assert subset_gpqa['document_sha256'] == [
+        full_gpqa['document_sha256'][i] for i in subset_gpqa['indices']]
 
 
 def test_recipe_variant_preserves_questions_and_rejects_changed_population():

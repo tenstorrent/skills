@@ -15,7 +15,7 @@ from the actual launch directory and verify that it is inside this plugin's
 `runtime/benchmark_stage`. Python's working directory can shadow `PYTHONPATH` with
 an older copied package; do not assume exporting the path selects the intended code.
 
-The CI profile contains 280 MMLU-Pro questions (proportional subject allocation), 256 GSM8K-CoT questions and 256 IFEval prompts. Its original measured scope is non-reasoning dense controls; retain the calibration report's score and protocol limitations. For the Gemma 4 QB2 reasoning calibration, use the separate frozen profile described below. GPQA Diamond can replace GSM8K when that is the model's published evaluation. Neither profile has been calibrated on MoE models.
+The CI profile contains 280 MMLU-Pro questions (proportional subject allocation), 256 GSM8K-CoT questions and 256 IFEval prompts. Its original measured scope is non-reasoning dense controls; retain the calibration report's score and protocol limitations. For the Gemma 4 QB2 reasoning calibration, use the separate frozen profile described below. GPQA Diamond can replace GSM8K when that is the model's published evaluation. None of these profiles has been calibrated on MoE models.
 
 For `gpqa_diamond_cot_zeroshot`, the client preserves the upstream prompt and scorer but makes answer-choice shuffling deterministic with a private seed-0 RNG and recomputes that transform. Upstream 0.4.13 uses a global RNG whose state is absent from the dataset transform cache key. The manifest records this processing policy and evaluation rejects a different policy. Freeze a new GPQA manifest with this client; do not reuse a manifest prepared with the upstream cache-dependent shuffle.
 
@@ -160,16 +160,27 @@ stage; partial raw transcripts are diagnostic evidence only.
 ## Gemma 4 QB2 reasoning profile
 
 `profiles/ci-v1-reasoning.json` preserves the same 280 MMLU-Pro and 256 IFEval
-questions and adds all 198 GPQA Diamond questions. Its manifest hash is
-`83203b75b253a2dff70c9bac96c257fe784981a714c767b61f15fdefb707598b`.
-The full GPQA set was frozen before inference: a 64-question candidate was
-6.28 percentage points easier than the full set in a historical result, so the
-candidate was expanded without searching for a better-matching seed.
+questions and selects 128 of 198 GPQA Diamond questions. Its manifest hash is
+`7bdb5c3910b530169dfeaabe56882de103dd8d8dfc842ef0a7ebd026eecdcdba`.
+The companion `profiles/ci-v1-reasoning-full.json` contains all 198 GPQA questions,
+with hash `83203b75b253a2dff70c9bac96c257fe784981a714c767b61f15fdefb707598b`.
+Both preserve the same full-population identity and choice ordering.
 
-The timed Gemma candidate selects only `mmlu_pro` and
+The full GPQA candidate completed accuracy but failed the whole-stage one-hour
+budget during performance warmup. The 128-question fallback was frozen for
+runtime using the existing deterministic hash order before checking its score.
+It was 2.56 percentage points easier within the new full run and 3.94 points
+easier within a historical TT run. An earlier 64-question candidate was 6.28
+points easier historically. These controls are not independent HF inference;
+retain the observed subset bias when comparing with published full-set figures.
+Do not search for a seed that makes the scores agree.
+
+The measured Gemma profile selects only `mmlu_pro` and
 `gpqa_diamond_cot_zeroshot`, with `accuracy_execution: "shared"`. IFEval remains
-available in the manifest for a separate diagnostic; it is not part of that timed
-candidate. Google's reported IFEval figure does not identify which of its four
+available in the manifest for a separate diagnostic; it is not part of the timed
+profile. The fresh 128-question run completed in 51m02s, including both performance
+rows. Its upstream scores were 86.79% MMLU-Pro and 84.38% GPQA Diamond. The manifest
+retains its original candidate note as historical freeze-time metadata. Google's reported IFEval figure does not identify which of its four
 aggregations was used.
 
 Use the following identical generation dictionary for both selected tasks when
@@ -195,3 +206,12 @@ for pooled MMLU-Pro with 85.2%, and `exact_match,flexible-extract` for GPQA Diam
 with 84.3%, from the [Gemma 4 model card](https://ai.google.dev/gemma/docs/core/model_card_4).
 The final measured runtime, scores and limitations belong in the calibration
 report; the existence of a frozen profile alone does not establish a passing run.
+
+
+The upstream GPQA flexible extractor selects the last parenthesized uppercase
+letter, including letters beyond the four answer choices. Raw calibration review
+found rejected options and chemical stereochemistry markers selected instead of
+an explicit answer. Preserve upstream scores, and report such discrepancies
+separately. Do not hand-correct the headline or change the prompt/extractor after
+observing answers. The task's separate strict extractor requires a phrase that
+its prompt does not request; it is not the metric used for this comparison.
