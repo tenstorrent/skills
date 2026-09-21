@@ -53,6 +53,9 @@ def check(model_dir, hf_model=''):
     if digest({k: v for k, v in manifest.items() if k != 'manifest_sha256'}) != manifest['manifest_sha256']:
         raise ValueError('subset manifest checksum mismatch')
     accuracy = summary.get('accuracy', {})
+    execution = config.get('accuracy_execution', 'sequential')
+    if execution not in ('sequential', 'shared') or summary.get('accuracy_execution', 'sequential') != execution:
+        raise ValueError('accuracy execution mode differs from run configuration')
     if len(accuracy) < 2 or set(accuracy) != set(config['tasks']):
         raise ValueError('missing required accuracy tasks')
     results = {}
@@ -64,6 +67,8 @@ def check(model_dir, hf_model=''):
             raise ValueError(f'{task}: incomplete accuracy requests or wrong concurrency')
         if result.get('model') != identity['model']:
             raise ValueError(f'{task}: accuracy model mismatch')
+        if result.get('generation_overrides', {}) != config.get('generation', {}).get(task, {}):
+            raise ValueError(f'{task}: generation overrides differ from run configuration')
         raw = read(evidence / 'run' / task / 'results.json')
         if raw.get('benchmark_stage') != result or not raw.get('results'):
             raise ValueError(f'{task}: summary disagrees with raw accuracy result')
@@ -74,6 +79,20 @@ def check(model_dir, hf_model=''):
         empty_finals = sum(scoring_response(response)[1] for response in responses)
         if result.get('empty_final_length_responses', 0) != empty_finals:
             raise ValueError(f'{task}: summary disagrees with exhausted final-answer count')
+        linked = {}
+        if execution == 'shared':
+            if result.get('shared_groups') != config['tasks'] or result.get('timing_scope') != 'shared accuracy pass':
+                raise ValueError(f'{task}: missing shared accuracy identity')
+            links = [json.loads(line) for line in (transcript.parent / 'request_links.jsonl').read_text().splitlines()]
+            if len(links) != len(responses):
+                raise ValueError(f'{task}: incomplete request links')
+            if len({row.get('response_id') for row in links}) != len(links) or len({row.get('request_sha256') for row in links}) != len(links):
+                raise ValueError(f'{task}: repeated request/response identity')
+            for link, response in zip(links, responses):
+                key = (link.get('task'), link.get('doc_id'))
+                if key in linked or link.get('group') != task or key[0] not in group['tasks'] or not response.get('id') or link.get('response_id') != response['id']:
+                    raise ValueError(f'{task}: invalid request/response identity')
+                linked[key] = (link, scoring_response(response)[0]['choices'][0]['message']['content'])
         reasons = {}
         for response in responses:
             reason = response['choices'][0].get('finish_reason', 'missing')
@@ -95,6 +114,12 @@ def check(model_dir, hf_model=''):
             hashes = dict(zip(frozen['indices'], frozen['document_sha256']))
             if any(digest(row['doc']) != hashes[row['doc_id']] for row in samples):
                 raise ValueError(f'{child}: scored documents differ from the frozen subset')
+            if execution == 'shared':
+                for row in samples:
+                    link, content = linked.get((child, row['doc_id']), ({}, None))
+                    args = row.get('arguments', [])
+                    if len(args) != 1 or digest(args[0]) != link.get('request_sha256') or row.get('resps') != [[content]]:
+                        raise ValueError(f'{child}: scored answer disagrees with linked API request/response')
         results[task] = raw
     osl = config.get('output_tokens', 128)
     if not isinstance(osl, int) or osl < 2:

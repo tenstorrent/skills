@@ -134,3 +134,24 @@ raw response, never grades hidden reasoning, and records
 `empty_final_length_responses`. The evidence gate reconciles that count and
 requires the same explicit truncation assessment as other length-limited outputs.
 Empty answers with a normal stop or malformed API responses still fail the run.
+
+For long reasoning runs, set `accuracy_execution` to `shared` when all selected
+tasks use identical generation overrides. The client makes one upstream
+`simple_evaluate` call with one pool of 32 requests, so a long answer in one task
+does not leave the other tasks waiting with idle serving slots. Keep separate
+scores, sample IDs and raw responses for every task. Shared accuracy durations
+refer to the same wall-clock interval and must not be added together.
+
+Provide the same complete `generation` dictionary for each selected task,
+including `do_sample`, `until`, token budget and native thinking settings. The
+client checks the effective upstream generation dictionaries before sending any
+request; different settings require the default `sequential` mode. Upstream's API
+backend discards `do_sample` and uses `temperature` for sampling, but the explicit
+flag prevents different task defaults from splitting its request pool. Do not
+change a publisher's generation protocol merely to make tasks share a pool.
+
+Shared mode requires unique requests with one generation per question. It writes
+`request_links.jsonl` beside each raw transcript. The gate reconciles each link's
+request hash, dataset ID, response ID and scored final answer. Duplicate or
+ambiguous requests fail before inference. A deadline still fails the complete
+stage; partial raw transcripts are diagnostic evidence only.

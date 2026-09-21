@@ -75,15 +75,26 @@ def run(*, config_path, output):
         raise InterruptedError(f'benchmark interrupted by signal {signum}')
     previous_term = signal.signal(signal.SIGTERM, interrupted)
     try:
-        for task in config['tasks']:
-            task_output = output / task
+        execution = config.get('accuracy_execution', 'sequential')
+        if execution not in ('sequential', 'shared'):
+            raise ValueError('accuracy_execution must be sequential or shared')
+        summary['accuracy_execution'] = execution
+        batches = [config['tasks']] if execution == 'shared' else [[task] for task in config['tasks']]
+        for batch in batches:
+            generation = config.get('generation', {}).get(batch[0], {})
+            if any(config.get('generation', {}).get(task, {}) != generation for task in batch):
+                raise ValueError('shared accuracy requires identical generation overrides for all groups')
+            task_output = output if execution == 'shared' else output / batch[0]
             argv = [sys.executable, '-m', 'benchmark_stage', 'evaluate', '--model', config['model'],
                     '--base-url', config['base_url'], '--manifest', config['manifest'],
-                    '--task', task, '--output', str(task_output),
-                    '--generation', json.dumps(config.get('generation', {}).get(task, {}))]
-            command(argv, output / f'{task}.log', deadline)
-            result = json.loads((task_output / 'results.json').read_text())
-            summary['accuracy'][task] = result['benchmark_stage']
+                    '--task', ','.join(batch), '--output', str(task_output),
+                    '--generation', json.dumps(generation)]
+            if execution == 'shared':
+                argv.append('--shared')
+            command(argv, output / ('accuracy-shared.log' if execution == 'shared' else f'{batch[0]}.log'), deadline)
+            for task in batch:
+                result = json.loads((output / task / 'results.json').read_text())
+                summary['accuracy'][task] = result['benchmark_stage']
         for concurrency in (1, 32):
             for warmup in (True, False):
                 name = f'perf-b{concurrency}' + ('-warmup' if warmup else '')

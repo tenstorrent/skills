@@ -413,3 +413,42 @@ def test_empty_exhausted_final_with_pinned_upstream_parser_and_ifeval(monkeypatc
     assert scores == dict(prompt_level_strict_acc=False, inst_level_strict_acc=[False],
                           prompt_level_loose_acc=False, inst_level_loose_acc=[False])
     assert utils.process_results(doc, ['control'])['prompt_level_strict_acc'] is True
+
+
+@pytest.mark.parametrize('mutation', [None, 'link_id', 'doc_id', 'request_hash', 'scored_answer'])
+def test_shared_gate_reconciles_requests_with_scored_answers(tmp_path, mutation):
+    root, evidence = valid_gate_fixture(tmp_path)
+    config_path = evidence / 'run/run_config.json'
+    config = json.loads(config_path.read_text())
+    config['accuracy_execution'] = 'shared'
+    config_path.write_text(json.dumps(config))
+    summary_path = evidence / 'run/summary.json'
+    summary = json.loads(summary_path.read_text())
+    summary['accuracy_execution'] = 'shared'
+    for task in config['tasks']:
+        meta = summary['accuracy'][task]
+        meta.update(shared_groups=config['tasks'], timing_scope='shared accuracy pass')
+        path = evidence / f'run/{task}/results.json'
+        raw = json.loads(path.read_text()); raw['benchmark_stage'] = meta
+        path.write_text(json.dumps(raw))
+        sample_path = evidence / f'run/{task}/samples_{task}.jsonl'
+        samples = [json.loads(line) for line in sample_path.read_text().splitlines()]
+        responses, links = [], []
+        for row in samples:
+            row.update(arguments=[[f'question {row["doc_id"]}', {'until': []}]], resps=[['answer']])
+            response_id = f'{task}-{row["doc_id"]}'
+            responses.append(dict(id=response_id, choices=[dict(index=0, message=dict(content='answer'), finish_reason='stop')]))
+            links.append(dict(group=task, task=task, doc_id=row['doc_id'], response_id=response_id,
+                              request_sha256=digest(row['arguments'][0])))
+        if task == 'ifeval':
+            if mutation == 'link_id': links[0]['response_id'] = 'wrong'
+            elif mutation == 'doc_id': links[0]['doc_id'] = 3
+            elif mutation == 'request_hash': links[0]['request_sha256'] = 'wrong'
+            elif mutation == 'scored_answer': samples[0]['resps'] = [['different answer']]
+        for name, rows in [(sample_path.name, samples), ('responses.jsonl', responses), ('request_links.jsonl', links)]:
+            (sample_path.parent / name).write_text(''.join(json.dumps(row) + '\n' for row in rows))
+    summary_path.write_text(json.dumps(summary))
+    if mutation:
+        with pytest.raises(ValueError): check(root)
+    else:
+        assert check(root) == evidence

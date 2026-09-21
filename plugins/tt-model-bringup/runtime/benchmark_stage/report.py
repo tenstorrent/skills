@@ -35,7 +35,10 @@ def write_report(output, config, summary):
             delta = f"{100 * score - ref['score']:+.2f}" if ref else '—'
             lines.append(f"| {task} | {group['sample_count']} / {group['population']} | {metric} | {100 * score:.2f} | {published} | {delta} |")
         finish = result['benchmark_stage']['finish_reasons']
-        notes += ['', f"{task}: finish reasons `{json.dumps(finish)}`; {result['benchmark_stage']['elapsed_seconds']:.1f} seconds.", '']
+        timing = result['benchmark_stage'].get('timing_scope', 'single task group')
+        if timing == 'shared accuracy pass':
+            timing += '; shared times are not additive'
+        notes += ['', f"{task}: finish reasons `{json.dumps(finish)}`; {result['benchmark_stage']['elapsed_seconds']:.1f} seconds ({timing}).", '']
     lines += notes
     lines += ['', '| Concurrency | ISL / OSL | TTFT ms | TPOT ms | Decode tokens/s/user | Output tokens/s |',
               '|---:|---:|---:|---:|---:|---:|']
