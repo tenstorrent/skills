@@ -26,7 +26,7 @@ def test_reasoning_profile_preserves_common_questions_and_full_gpqa():
     assert reasoning['manifest_sha256'] == digest({
         key: value for key, value in reasoning.items() if key != 'manifest_sha256'})
     for name in generic['tasks'].keys() & reasoning['tasks'].keys():
-        for field in ('indices', 'document_sha256', 'population_sha256'):
+        for field in ('indices', 'document_sha256', 'population_sha256', 'fewshot_sha256'):
             assert generic['tasks'][name][field] == reasoning['tasks'][name][field]
     gpqa = reasoning['tasks']['gpqa_diamond_cot_zeroshot']
     assert gpqa['population'] == 198
@@ -467,3 +467,12 @@ def test_shared_gate_reconciles_requests_with_scored_answers(tmp_path, mutation)
         with pytest.raises(ValueError): check(root)
     else:
         assert check(root) == evidence
+
+
+def test_jsonl_keeps_unicode_question_and_answer_separators(tmp_path):
+    from benchmark_stage.responses import read_jsonl
+    rows = [{'doc': {'question': 'one\u2028two\u2029three\u0085four'}},
+            {'choices': [{'message': {'content': 'answer\u2028continued'}}]}]
+    path = tmp_path / 'samples.jsonl'
+    path.write_text(''.join(json.dumps(row, ensure_ascii=False) + '\n' for row in rows), encoding='utf-8')
+    assert read_jsonl(path) == rows

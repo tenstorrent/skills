@@ -7,7 +7,7 @@ its artifact checker now lives beside the skill. The multigoal sequence still ha
 
 See [benchmark-model](../plugins/tt-model-bringup/skills/benchmark-model/SKILL.md)
 and its [run contract](../plugins/tt-model-bringup/skills/benchmark-model/references/run-contract.md)
-for installation, commands, evidence requirements and the two frozen profiles.
+for installation, commands, evidence requirements and the frozen profiles.
 The stage attaches to the working optimized-vLLM server, runs accuracy at
 concurrency 32, and measures 4096-input/128-output-token serving at concurrency 1
 and 32. The one-hour budget includes task verification, inference, scoring,
@@ -68,8 +68,10 @@ Calibration stack: tt-metal v0.79.0 (`de546d3b146758714d900f11b218c8f9c805f410`)
 vllm-tt-plugin `1799d6ed2780f8ef05c166fca7c40fee555bedb0`, vLLM 0.26.0 and
 lm-eval 0.4.13. A KV-capacity-only pool adjustment and larger trace allocation were
 needed; model math and kernels were unchanged. Generic and Meta profile manifests
-are packaged with the stage. GPQA, MoE, reasoning and multimodal profiles still
-require separate calibration.
+are packaged with the stage. The generic manifest later gained few-shot hashes
+while preserving every evaluation question and its original manifest identity.
+The QB2 reasoning calibration is separate from these controls; MoE and multimodal
+models remain untested.
 
 ## QB2 Llama 3.1 8B calibration
 

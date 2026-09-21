@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 from benchmark_stage.gpqa import processing_policy, task_spec
-from benchmark_stage.responses import scoring_response
+from benchmark_stage.responses import read_jsonl, scoring_response
 from benchmark_stage.subsets import digest, flatten
 
 
@@ -135,7 +135,7 @@ def evaluate_groups(*, model, base_url, manifest_path, groups, output, generatio
             with (path / f'samples_{task_name}.jsonl').open('w') as f:
                 for row in sample_results[task_name]:
                     f.write(json.dumps(row, ensure_ascii=False, default=str) + '\n')
-        responses = [json.loads(line) for line in (path / 'responses.jsonl').read_text().splitlines()]
+        responses = read_jsonl(path / 'responses.jsonl')
         reasons = {}
         for response in responses:
             for choice in response['choices']:

@@ -28,7 +28,7 @@ Freeze once, before observing scores:
 ```
 
 For the pilot tasks, prefer the packaged `runtime/benchmark_stage/profiles/ci-v1.json`
-manifest. `prepare` creates a new candidate profile. A benchmark name alone is
+manifest. Its `reused_manifest_sha256` retains the original calibration manifest identity; the later freeze adds few-shot hashes without changing any evaluation questions. `prepare` creates a new candidate profile. A benchmark name alone is
 not an exact recipe: for example, upstream `gsm8k_cot_llama` documents Meta's
 published prompt, while `gsm8k_cot` is the generic recipe. Choose the publisher's
 supported recipe for that model; do not apply a Llama-specific recipe to other

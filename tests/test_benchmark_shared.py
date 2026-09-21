@@ -13,6 +13,9 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'plugins/tt-model-bringup/runtime'))
 from benchmark_stage.evaluate import evaluate_groups
 from benchmark_stage.subsets import digest
+from benchmark_stage.responses import read_jsonl
+
+ANSWER = "identical answer\u2028same record\u2029same paragraph\u0085same value"
 
 
 @pytest.mark.parametrize('mutation', [None, 'nested_kwargs', 'duplicate', 'repeats', 'malformed_response'])
@@ -24,7 +27,7 @@ def test_shared_pool_preserves_request_identity_and_global_concurrency(tmp_path,
     from lm_eval.models.api_models import JsonChatStr
     assert version('lm_eval') == '0.4.13'
     selected = list(range(1, 73, 2))
-    documents = {name: [{'prompt': f'{name}:{i:03}'} for i in range(80)] for name in ('alpha', 'beta')}
+    documents = {name: [{'prompt': f'{name}:{i:03}', 'note': 'GPQA\u2028question'} for i in range(80)] for name in ('alpha', 'beta')}
     manifest = {'harness_version': '0.4.13', 'groups': {}, 'tasks': {}}
     for name, docs in documents.items():
         manifest['groups'][name] = {'tasks': [name], 'sample_count': len(selected), 'population': len(docs)}
@@ -54,7 +57,7 @@ def test_shared_pool_preserves_request_identity_and_global_concurrency(tmp_path,
             slow = label == 'alpha:001'
             time.sleep(0.7 if slow else 0.02)
             response = {'id': label, 'choices': [{'index': 0, 'message': {
-                'content': None if slow else 'identical answer',
+                'content': None if slow else ANSWER,
                 'reasoning': 'Never score this as a final answer'}, 'finish_reason': 'length' if slow else 'stop'}],
                 'usage': {'completion_tokens': 32 if slow else 1}}
             if mutation == 'malformed_response' and slow:
@@ -92,7 +95,7 @@ def test_shared_pool_preserves_request_identity_and_global_concurrency(tmp_path,
         for request, answer in zip(requests, answers):
             doc_id = samples[request.task_name][request.doc_id]
             scored[request.task_name].append(dict(doc_id=doc_id, doc=request.doc, arguments=[request.args],
-                resps=[[answer]], filter='none', exact_match=float(answer == 'identical answer')))
+                resps=[[answer]], filter='none', exact_match=float(answer == ANSWER)))
         return {'results': {name: {'exact_match,none': sum(x['exact_match'] for x in rows) / len(rows)}
                             for name, rows in scored.items()}, 'samples': scored}
     monkeypatch.setattr(evaluator, 'simple_evaluate', fake_evaluate)
@@ -104,8 +107,7 @@ def test_shared_pool_preserves_request_identity_and_global_concurrency(tmp_path,
         if mutation == 'malformed_response':
             with pytest.raises(ValueError, match='invalid API response'):
                 evaluate_groups(**kwargs)
-            raw = (tmp_path / 'run/alpha/responses.jsonl').read_text().splitlines()
-            assert 'malformed API payload' in [json.loads(line) for line in raw]
+            assert 'malformed API payload' in read_jsonl(tmp_path / 'run/alpha/responses.jsonl')
             return
         if mutation:
             with pytest.raises(ValueError): evaluate_groups(**kwargs)
@@ -122,7 +124,7 @@ def test_shared_pool_preserves_request_identity_and_global_concurrency(tmp_path,
     assert result['beta']['results']['beta']['exact_match,none'] == 1
     for name in documents:
         root = tmp_path / 'run' / name
-        read = lambda filename: [json.loads(line) for line in (root / filename).read_text().splitlines()]
+        read = lambda filename: read_jsonl(root / filename)
         links, raw, scored = read('request_links.jsonl'), read('responses.jsonl'), read(f'samples_{name}.jsonl')
         assert len(raw) == len(links) == len(scored) == 36
         assert sorted(x['doc_id'] for x in links) == selected
@@ -136,5 +138,5 @@ def test_shared_pool_preserves_request_identity_and_global_concurrency(tmp_path,
         assert metadata['empty_final_length_responses'] == int(name == 'alpha')
         assert metadata['timing_scope'] == 'shared accuracy pass'
     assert any(x['choices'][0]['message']['content'] is None for x in read('responses.jsonl')) is False
-    alpha_raw = [json.loads(line) for line in (tmp_path / 'run/alpha/responses.jsonl').read_text().splitlines()]
+    alpha_raw = read_jsonl(tmp_path / 'run/alpha/responses.jsonl')
     assert sum(x['choices'][0]['message']['content'] is None for x in alpha_raw) == 1

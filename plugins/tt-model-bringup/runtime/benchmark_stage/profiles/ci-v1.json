@@ -80,7 +80,10 @@
         "52c69fdeda1ab866fd8d6352f3807fb57bbf91650fad7f00da40f5fe876bd62a"
       ],
       "population_sha256": "ba21596656f356666bd51fdbc870aec6b09a57b0c6173f6dfae6c6c3fd0d7f7d",
-      "dataset_fingerprint": "7a1b56f4fd780ecf"
+      "num_fewshot": 5,
+      "fewshot_sha256": "98c237aa68cfce22fd3d1675bcf17444912f74c80c299ee2bd2475f99979f0be",
+      "dataset_fingerprint": "7a1b56f4fd780ecf",
+      "reused_from_task": "mmlu_pro_biology"
     },
     "mmlu_pro_business": {
       "population": 789,
@@ -125,7 +128,10 @@
         "abc16ff93a3429ae93bea8ffd558e06ce1fea1a731b502132430744f826ff596"
       ],
       "population_sha256": "dca6f2ffc306627566eb95d4c8001ac7467da00c5a9e6ed16c27249f172ee16c",
-      "dataset_fingerprint": "1306d057265563ea"
+      "num_fewshot": 5,
+      "fewshot_sha256": "78bff00c998338ebdd012b48152a705ce784869f02f07d887858d5ba382c4379",
+      "dataset_fingerprint": "1306d057265563ea",
+      "reused_from_task": "mmlu_pro_business"
     },
     "mmlu_pro_chemistry": {
       "population": 1132,
@@ -186,7 +192,10 @@
         "debf4a63350c7ba36a4f1bb3521163fdf7aedbfa64a5e87bc24635b1899c37ef"
       ],
       "population_sha256": "9da7edc50b372375fa9ea19aef33aed019fdcc62ac4f7ed5cbbc8ccf73d9e886",
-      "dataset_fingerprint": "afdc2f24d66494ec"
+      "num_fewshot": 5,
+      "fewshot_sha256": "0889a6132f2a5468f7ccf456d4faab19dfad4f56089e465f63f4a1f04f8796a9",
+      "dataset_fingerprint": "afdc2f24d66494ec",
+      "reused_from_task": "mmlu_pro_chemistry"
     },
     "mmlu_pro_computer_science": {
       "population": 410,
@@ -213,7 +222,10 @@
         "6bafbe9a1a4079b244e4c680f755faf9378e3762df1236d5c1aab608332826c7"
       ],
       "population_sha256": "daff9cb05ac20021d3d6d8c65fb5d39856c0eb2314bc8c840db400902c2aedcb",
-      "dataset_fingerprint": "0d7834f7b9f5960d"
+      "num_fewshot": 5,
+      "fewshot_sha256": "0e6571c54190ff47dffe16ddfdbc4884e90ad41fa4a46098987bb923f2e9b293",
+      "dataset_fingerprint": "0d7834f7b9f5960d",
+      "reused_from_task": "mmlu_pro_computer_science"
     },
     "mmlu_pro_economics": {
       "population": 844,
@@ -262,7 +274,10 @@
         "21b7d82e6efb3ee67addb1703476ec09e7cd8d5d13e3271ba429aa91cb6774e0"
       ],
       "population_sha256": "fc3d05c1a103b188247c003954865cce7c78048ef844d6591a3b590184fa1b3a",
-      "dataset_fingerprint": "828c950ddabdb60c"
+      "num_fewshot": 5,
+      "fewshot_sha256": "f2b0587930515ec5ca8f1be2fd79a5a76cc9821724fdced12dcb27f06aea3724",
+      "dataset_fingerprint": "828c950ddabdb60c",
+      "reused_from_task": "mmlu_pro_economics"
     },
     "mmlu_pro_engineering": {
       "population": 969,
@@ -317,7 +332,10 @@
         "c44e3a8ffbe7d0cadf96e6c9c1efb131c343f48b5048da7fe5eb54797e90cc5d"
       ],
       "population_sha256": "c5db1c4ae73e43f28dc5f9a07b1f6f3809c5a2ce4f3930c4f5a50be19943cdd6",
-      "dataset_fingerprint": "75eb1f5621c83bb9"
+      "num_fewshot": 5,
+      "fewshot_sha256": "5576ae09ae984c0b8828044a4ae6c14d7a85beac59651a2be1559727c22716da",
+      "dataset_fingerprint": "75eb1f5621c83bb9",
+      "reused_from_task": "mmlu_pro_engineering"
     },
     "mmlu_pro_health": {
       "population": 818,
@@ -364,7 +382,10 @@
         "d9176f4d5efb50f36c3d387c8147af52269cda1224d89acd245e843a3510504d"
       ],
       "population_sha256": "86b64380ac38d3a2c0f187ded77c66b2051936800ce14f6a11292e132a76d7ef",
-      "dataset_fingerprint": "21931bcf6f8f7e09"
+      "num_fewshot": 5,
+      "fewshot_sha256": "ecbbddfb13f04c598f0b56a5e6810bad0591eb5ef284d8a24f974fac285445d0",
+      "dataset_fingerprint": "21931bcf6f8f7e09",
+      "reused_from_task": "mmlu_pro_health"
     },
     "mmlu_pro_history": {
       "population": 381,
@@ -391,7 +412,10 @@
         "8aed13ec7bdf14ba2bdd8333a5b97ea28d049186a535c2b6750586ff1b8856ce"
       ],
       "population_sha256": "c33e80920f19738cca8ab5849f38b05ba9c38ca40fc44c8af750fa463f81af2e",
-      "dataset_fingerprint": "691698ea5a638f22"
+      "num_fewshot": 5,
+      "fewshot_sha256": "1fd666c21bce0e185cea3779a6ecdb074985b753c9edd98a54289afd7f79bcd6",
+      "dataset_fingerprint": "691698ea5a638f22",
+      "reused_from_task": "mmlu_pro_history"
     },
     "mmlu_pro_law": {
       "population": 1101,
@@ -452,7 +476,10 @@
         "de6178cc9cf446491b889ac58afa08a6c96391098351f377f4eabe9ef924c5db"
       ],
       "population_sha256": "1199e7fbfcfdbb24aec4a48b2697328052f0dff5500ed8337ea4edd18e9bcebb",
-      "dataset_fingerprint": "2eb9807e2ca59dcc"
+      "num_fewshot": 5,
+      "fewshot_sha256": "56cf7f07384862e236d80d3103c4f25920a1af4b8c8e4e713fd454b404dddc90",
+      "dataset_fingerprint": "2eb9807e2ca59dcc",
+      "reused_from_task": "mmlu_pro_law"
     },
     "mmlu_pro_math": {
       "population": 1351,
@@ -523,7 +550,10 @@
         "f9c64aa9663673cfc7d56c108ce36a70b1b1afa25732d662329c607c5255694d"
       ],
       "population_sha256": "b6c5ea603a571adff321c0d04f22019dcf32b52e4d0d45b6153f8737e058d5cb",
-      "dataset_fingerprint": "2215dbcdc9a38ce1"
+      "num_fewshot": 5,
+      "fewshot_sha256": "964437de3bce51c505c88e8c7a5871fe5d3773ea63bb4176f286a80c51cdd818",
+      "dataset_fingerprint": "2215dbcdc9a38ce1",
+      "reused_from_task": "mmlu_pro_math"
     },
     "mmlu_pro_other": {
       "population": 924,
@@ -574,7 +604,10 @@
         "f4038aa6cdcd445b917fb020d7ec2066acce9eb76cc3ba626ee4b5cd9dae7486"
       ],
       "population_sha256": "c50b42d29896e04f22d1cdcf08062762d8c53b4bc510a931eae751a491ac5473",
-      "dataset_fingerprint": "043b255c1ac8ebb7"
+      "num_fewshot": 5,
+      "fewshot_sha256": "d43d810a7ad265af8553c1ac3d5674de1c75e8c9a0bebe8d4fcda3c622aa76ad",
+      "dataset_fingerprint": "043b255c1ac8ebb7",
+      "reused_from_task": "mmlu_pro_other"
     },
     "mmlu_pro_philosophy": {
       "population": 499,
@@ -607,7 +640,10 @@
         "3a121133c7aa948ffb03f53d59c4d88a7467aad9dd7510c3b372b21be41c99a4"
       ],
       "population_sha256": "3d63a7a10c8b3c4cd55a5c7f4462fa5cca7433288c029433c11ff737bb773edf",
-      "dataset_fingerprint": "e50604297fd3835b"
+      "num_fewshot": 5,
+      "fewshot_sha256": "241d25a5eaca000d3b348873d3c7d17bf41490d68edd0d987ffb85bc84d71673",
+      "dataset_fingerprint": "e50604297fd3835b",
+      "reused_from_task": "mmlu_pro_philosophy"
     },
     "mmlu_pro_physics": {
       "population": 1299,
@@ -676,7 +712,10 @@
         "9836a8af150c455aef965763da0eacbe7aaf0c5018efe31065061d3006465af4"
       ],
       "population_sha256": "9904f566d2a8e9888f2601cd60922f59fa569d51b575a537749a71b0c30fe650",
-      "dataset_fingerprint": "ac279ec9b9647047"
+      "num_fewshot": 5,
+      "fewshot_sha256": "349b2fd16676a6c76e750b3d28d7264a84c55f5b971b7d4127a1d8bac087484d",
+      "dataset_fingerprint": "ac279ec9b9647047",
+      "reused_from_task": "mmlu_pro_physics"
     },
     "mmlu_pro_psychology": {
       "population": 798,
@@ -723,7 +762,10 @@
         "8098daf1707012a1c158183cb9cc1d1b4026df28b4909a06ecab44e1ff171268"
       ],
       "population_sha256": "f9f5d77f0c0d566d29c250ca20f293a2c1d565b9cbea772d2cf8333a1e8e888b",
-      "dataset_fingerprint": "4f08568ad429ed24"
+      "num_fewshot": 5,
+      "fewshot_sha256": "7fdd066c24ec47a407514d13ebdfd7f14e85cdf01da1086906993f912fdfc9a6",
+      "dataset_fingerprint": "4f08568ad429ed24",
+      "reused_from_task": "mmlu_pro_psychology"
     },
     "gsm8k_cot": {
       "population": 1319,
@@ -1244,7 +1286,10 @@
         "30d9a14c0c247493597d1497da8216bb9ed454c08bebd6a4c8e1bf03b93cebb3"
       ],
       "population_sha256": "e5cba797d83336f35da00c37e973eb7e56b60c14b841e22d2af3acad2f3a47c9",
-      "dataset_fingerprint": "59ec1b7f9357c7a2"
+      "num_fewshot": 8,
+      "fewshot_sha256": "3a6099b24fa1812e1c8749366209a242bd0fa673352976debe0101a6c00eeb5c",
+      "dataset_fingerprint": "59ec1b7f9357c7a2",
+      "reused_from_task": "gsm8k_cot"
     },
     "ifeval": {
       "population": 541,
@@ -1765,8 +1810,12 @@
         "bf027b6720fa785be1b729116c9cd3ad3f09a282233f32888302f168d0af051c"
       ],
       "population_sha256": "e568904dbe4276c330feae28281cae8c847705071de86c0a5da7ab329224a0fa",
-      "dataset_fingerprint": "62b01b907665bf3d"
+      "num_fewshot": 0,
+      "fewshot_sha256": null,
+      "dataset_fingerprint": "62b01b907665bf3d",
+      "reused_from_task": "ifeval"
     }
   },
-  "manifest_sha256": "71723b10f188293044efdda582aa06d490aa5ab63f1a13f08588fbe6bb42e7e0"
+  "reused_manifest_sha256": "71723b10f188293044efdda582aa06d490aa5ab63f1a13f08588fbe6bb42e7e0",
+  "manifest_sha256": "a76275b17f9ae457e9e15c93c339d0e9c9c5de6ac74ff42099183cded18d733b"
 }

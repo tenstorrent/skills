@@ -7,7 +7,7 @@ from pathlib import Path
 
 from benchmark_stage.evidence import PERFORMANCE_METRICS, finite_number, metric_score, validate_performance
 from benchmark_stage.subsets import digest
-from benchmark_stage.responses import scoring_response
+from benchmark_stage.responses import read_jsonl, scoring_response
 
 
 def read(path):
@@ -73,7 +73,7 @@ def check(model_dir, hf_model=''):
         if raw.get('benchmark_stage') != result or not raw.get('results'):
             raise ValueError(f'{task}: summary disagrees with raw accuracy result')
         transcript = evidence / 'run' / task / 'responses.jsonl'
-        responses = [json.loads(line) for line in transcript.read_text().splitlines()]
+        responses = read_jsonl(transcript)
         if len(responses) != group['sample_count']:
             raise ValueError(f'{task}: incomplete response transcript')
         empty_finals = sum(scoring_response(response)[1] for response in responses)
@@ -83,7 +83,7 @@ def check(model_dir, hf_model=''):
         if execution == 'shared':
             if result.get('shared_groups') != config['tasks'] or result.get('timing_scope') != 'shared accuracy pass':
                 raise ValueError(f'{task}: missing shared accuracy identity')
-            links = [json.loads(line) for line in (transcript.parent / 'request_links.jsonl').read_text().splitlines()]
+            links = read_jsonl(transcript.parent / 'request_links.jsonl')
             if len(links) != len(responses):
                 raise ValueError(f'{task}: incomplete request links')
             if len({row.get('response_id') for row in links}) != len(links) or len({row.get('request_sha256') for row in links}) != len(links):
@@ -103,7 +103,7 @@ def check(model_dir, hf_model=''):
             raise ValueError(f'{task}: invalid/missing API finish reason')
         for child in group['tasks']:
             frozen = manifest['tasks'][child]
-            samples = [json.loads(line) for line in (evidence / 'run' / task / f'samples_{child}.jsonl').read_text().splitlines()]
+            samples = read_jsonl(evidence / 'run' / task / f'samples_{child}.jsonl')
             filters = {key.rsplit(',', 1)[1] for key in raw['results'][child] if ',' in key and '_stderr' not in key}
             if {row.get('filter', 'none') for row in samples} != filters:
                 raise ValueError(f'{child}: missing scored sample filters')
