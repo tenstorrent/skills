@@ -15,11 +15,50 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
+import sys
 import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+
+
+# Live broker background jobs by job_id, mapped to the hidden provoke root
+# that goes away with them. The signal handler walks this on SIGTERM/SIGINT:
+# Python's default SIGTERM terminates without unwinding, so a hang()'s finally
+# would otherwise never fire and the broker job would keep holding the device.
+_LIVE_JOBS: dict[str, Path] = {}
+
+
+def _cleanup_one(job_id: str, hidden_root: Path | None) -> None:
+    """Kill a live broker job, reset the boards, and remove its hidden root.
+    Loud on reset failure — a silent reset would leave the next eval running
+    on a wedged device and it would report a spurious failure of its own."""
+    subprocess.run(["tt-device-mcp", "kill", job_id],
+                   capture_output=True, text=True, timeout=60)
+    r = subprocess.run(["tt-device-mcp", "reset"],
+                       capture_output=True, text=True, timeout=900)
+    if r.returncode != 0:
+        print(
+            f"tt-device-mcp reset failed after job {job_id} (rc={r.returncode}): "
+            f"{r.stderr.strip()[:400]}",
+            file=sys.stderr, flush=True,
+        )
+    if hidden_root is not None:
+        shutil.rmtree(hidden_root, ignore_errors=True)
+    _LIVE_JOBS.pop(job_id, None)
+
+
+def _emergency_cleanup(signum, _frame) -> None:
+    for job_id, hidden_root in list(_LIVE_JOBS.items()):
+        _cleanup_one(job_id, hidden_root)
+    sys.exit(128 + signum)
+
+
+def install_signal_handlers() -> None:
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, _emergency_cleanup)
 
 
 ANSWER_SCHEMA = {
@@ -168,9 +207,11 @@ class AgentResult:
     def assert_invoked_tool(self, pattern: str) -> None:
         """The agent invoked a tool whose name or command string matches
         `pattern`, and the invocation actually ran (was not blocked by the
-        denylist). Bash matches by command, tt_device_exec by the wrapped
-        command, and any other MCP tool (`tt_device_job_logs`,
-        `tt_device_job_status`) matches by tool name."""
+        denylist). Bash matches by command; any MCP tool with a `command`
+        field (top-level as in `tt_device_job_run`, or wrapped under `params`
+        as in `tt_device_exec`) matches by that command; anything else
+        (`tt_device_job_logs`, `tt_device_job_status`, ...) matches by tool
+        name."""
         rx = re.compile(pattern)
         matched, denied = [], []
         pending_id = None
@@ -184,11 +225,10 @@ class AgentResult:
                     inp = block.get("input") or {}
                     if name == "Bash":
                         needle = inp.get("command") or ""
-                    elif name.endswith("__tt_device_exec"):
-                        needle = (inp.get("params") or {}).get("command") or ""
                     else:
-                        # Any other tool call: match against the tool name.
-                        needle = name
+                        needle = (inp.get("command")
+                                  or (inp.get("params") or {}).get("command")
+                                  or name)
                     if rx.search(needle):
                         pending_id = block.get("id")
                         matched.append(needle)
@@ -549,6 +589,7 @@ class Agent:
                 f"tt-device-mcp run-bg exited {launch.returncode}: {launch.stderr[:400]}"
             )
         job_id = _parse_job_id(launch.stdout)
+        _LIVE_JOBS[job_id] = hidden_root
         try:
             _wait_for_marker(dprint_file, marker, timeout=120, job_id=job_id)
             prompt = (
@@ -560,11 +601,7 @@ class Agent:
             return self._claude_on_device(prompt, workspace)
         finally:
             # A test that leaves the boards degraded breaks every later one.
-            subprocess.run(["tt-device-mcp", "kill", job_id],
-                           capture_output=True, text=True, timeout=60)
-            subprocess.run(["tt-device-mcp", "reset"],
-                           capture_output=True, text=True, timeout=900)
-            shutil.rmtree(hidden_root, ignore_errors=True)
+            _cleanup_one(job_id, hidden_root)
 
 
 def _parse_job_id(stdout: str) -> str:

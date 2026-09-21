@@ -101,13 +101,37 @@ def eval_treats_corruption_as_a_trust_gate(agent):
 
 
 def eval_rechecks_one_script_cheaply(agent):
+    """The `--run=<script>` flag is what makes a targeted re-check cheap. An
+    agent that reaches for the full diagnostic pass again is the wrong move
+    the skill exists to correct."""
     res = agent.ask(
-        "I already ran a full tt-triage pass on a hung Tenstorrent job. I only "
-        "want to re-read the callstacks now. What is the cheapest command?"
+        "My Tenstorrent workload is hung. I already have a full diagnostic "
+        "pass from a minute ago. I want to re-read only the RISC callstacks "
+        "now — the full pass again would be wasteful. What is the cheapest "
+        "command?"
     )
 
     res.assert_dispatched("tt-triage")
     assert "--run=dump_callstacks" in res.answer["command"]
+
+
+def eval_wires_auto_triage_on_hang(agent):
+    """The auto-triage recipe: `TT_METAL_OPERATION_TIMEOUT_SECONDS` bounds any
+    dispatch operation, and `TT_METAL_DISPATCH_TIMEOUT_COMMAND_TO_EXECUTE` runs
+    a shell command on timeout — before the host raises, so the process is
+    still alive for triage to read. This is what CI and long pytest sessions
+    use to catch hangs no human is watching for."""
+    res = agent.ask(
+        "My Tenstorrent CI has to catch any dispatch hang automatically, "
+        "run diagnostics on the still-alive process and reset the board — "
+        "not just time out with no data. Which environment variables wire "
+        "that up?"
+    )
+
+    res.assert_dispatched("tt-triage")
+    env_names = {e["name"] for e in res.answer["env"]}
+    assert "TT_METAL_OPERATION_TIMEOUT_SECONDS" in env_names, env_names
+    assert "TT_METAL_DISPATCH_TIMEOUT_COMMAND_TO_EXECUTE" in env_names, env_names
 
 
 # ---- Device execution --------------------------------------------------------

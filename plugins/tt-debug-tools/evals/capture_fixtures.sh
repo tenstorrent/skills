@@ -29,6 +29,7 @@ TRIAGE="$TT_METAL_HOME/tools/tt-triage.py"
 # interpreter is first on PATH and fails the import.
 TRIAGE_PY="$TT_METAL_HOME/python_env/bin/python"
 PROVOKE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/tt-triage/provoke"
+EXALENS_PROVOKE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/tt-exalens/provoke"
 
 # TT_METAL_HOME does not locate the runtime any more: without one of these the
 # binaries abort in SetUp with "Root Directory is not set".
@@ -540,6 +541,27 @@ main() {
   record tt-noc-dump missing-write-barrier \
     "$MIN_ENV TT_METAL_NOC_DEBUG_DUMP=1 $BIN/unit_tests_noc_debugging \
        --gtest_filter=NOCDebuggingFixture.McastOnlyWriteFlush"
+
+  # ---- tt-inspector: kernels.yaml from a completed run ----------------------
+  # Inspector is on by default and writes its logs at the end of a run. A
+  # completed programming example is the cheapest producer: no marker, no hang,
+  # small YAML. This is the artifact anyone triaging an exited process reads.
+  clear_env; health_gate || return 1
+  record tt-inspector kernels-log \
+    "$MIN_ENV $EXAMPLES/metal_example_loopback >/dev/null 2>&1; \
+     cat $TT_METAL_LOGS_PATH/generated/inspector/kernels.yaml"
+
+  # ---- tt-exalens: a scripted --commands run against a live device ----------
+  # A worker BRISC writes a magic word to L1 and spins. tt-exalens attaches
+  # via Inspector, reads the same address back, exits. Captures the shape of
+  # `Executing command: ...` output, `device` summary and `brxy` read that the
+  # skill describes from source.
+  clear_env; health_gate || return 1
+  record_at_marker tt-exalens scripted-commands "$DPRINT_LOG" 'EXALENS_MAGIC_WRITTEN' 600 \
+    "$MIN_ENV HOLD_SECS=900 TT_METAL_DPRINT_CORES=0,0 TT_METAL_DPRINT_FILE=$DPRINT_LOG \
+       $TT_METAL_HOME/python_env/bin/python $EXALENS_PROVOKE/live_exalens_magic.py" \
+    "$MIN_ENV $TT_METAL_HOME/python_env/bin/tt-exalens --commands='device; brxy 0,0 0x50000 4; exit'" \
+    nofreeze
 
   # ---- tt-triage: a real hang, held open for the whole probe ------------------
   # The positive fixture the healthy run is the control for. A declared multicast

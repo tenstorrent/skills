@@ -22,7 +22,7 @@ from pathlib import Path
 # Absolute-import the sibling module regardless of how run.py is invoked.
 EVALS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(EVALS_DIR))
-from harness import Agent, SkipEval  # noqa: E402
+from harness import Agent, SkipEval, install_signal_handlers  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -69,6 +69,7 @@ def run_one(skill: str, name: str, fn, host: str, model: str | None,
 
 def main() -> int:
     args = parse_args()
+    install_signal_handlers()
     if args.skill:
         skills = [EVALS_DIR / args.skill]
         if not skills[0].is_dir():

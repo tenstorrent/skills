@@ -6,6 +6,40 @@
 downstream tool silently."""
 
 
+def _body(answer) -> str:
+    return " ".join([
+        answer["primary_signal"], answer["location"], answer["command"],
+        " ".join(answer["quoted_evidence"]),
+        " ".join(answer["output_literals"]),
+        " ".join(answer["prereqs"]),
+    ])
+
+
+def eval_reads_kernels_yaml(agent):
+    """`generated/inspector/kernels.yaml` lists every kernel Inspector saw
+    the runtime build, grouped by `program_id`. Dispatch kernels sit under
+    the runtime's own program ids; the user's kernel sits under the last
+    id. Naming the user kernel and its program id proves the agent parsed
+    the grouping rather than the first row."""
+    output, expected = agent.fixture("kernels-log")
+    prompt = (
+        "Below is the `generated/inspector/kernels.yaml` file from a "
+        "Tenstorrent run of one small programming example. Which kernel is "
+        "the user program's, and which `program_id` does it live under? "
+        "How do you tell it apart from the dispatch kernels? Quote the "
+        "rows you relied on in quoted_evidence.\n\n"
+        "----- begin kernels.yaml -----\n" + output +
+        "----- end kernels.yaml -----"
+    )
+    res = agent.ask(prompt)
+
+    body = _body(res.answer)
+    for token in expected["must_mention"]:
+        assert token in body, (
+            f"missing {token!r} anywhere in the answer. answer={res.answer}"
+        )
+
+
 def eval_treats_disabling_inspector_as_a_trap(agent):
     """`TT_METAL_INSPECTOR=1` is the default. Setting it to `0` does not raise
     an error — it makes `tt-triage`'s dispatcher-aware scripts skip, and the

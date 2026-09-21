@@ -1,0 +1,8 @@
+{
+  "must_mention": [
+    "TRISC_2",
+    "TEST-FULL",
+    "ZONE_START",
+    "ZONE_END"
+  ]
+}

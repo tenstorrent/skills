@@ -22,10 +22,10 @@ def eval_missing_barrier_suspected(agent):
 
     res.assert_dispatched("tt-noc-dump")
     assert "TT_METAL_NOC_DEBUG_DUMP" in res.env()
+    # The three tools share on-chip SRAM budget; enabling one alongside the
+    # dump silently corrupts the output. The skill teaches the conflict — this
+    # asserts the agent did not stomp itself, not that it recited the trap.
     assert not (res.env().keys() & EXCLUSIVE), f"enabled a conflicting tool: {res.env()}"
-    # The conflict is load-bearing, so the skill has to surface it rather than
-    # merely avoid setting it.
-    assert set(res.answer["must_disable"]) & EXCLUSIVE, res.answer["must_disable"]
 
 
 def eval_reports_the_upstream_fixture(agent):

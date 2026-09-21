@@ -205,6 +205,37 @@ def eval_does_not_read_an_idle_dump_as_a_hang(agent):
     _check(res, expected, output)
 
 
+def eval_reads_the_dump_before_a_fault(agent):
+    """The last completed dump before a fault is context, not the fault
+    itself: kernels have launched (`k_ids` non-zero, waypoints past `GW`)
+    but the fault is in the *next* interval's dump. Grading on the specific
+    `Dump #` header and the `k_ids` field proves the agent read this block,
+    not the negative-control idle one."""
+    output, expected = agent.fixture("last-dump-before-fault")
+    prompt = (
+        "Below is one dump block from a Tenstorrent watcher.log — "
+        "specifically the last completed dump before a fault fired. Read "
+        "it and report which dump number this is, whether any kernel was "
+        "loaded on any of these cores, and whether the fault itself is "
+        "visible in this dump. Quote lines you relied on in "
+        "quoted_evidence.\n\n"
+        "----- begin watcher.log block -----\n" + output +
+        "----- end watcher.log block -----"
+    )
+    res = agent.ask(prompt)
+
+    assert res.answer["fault_found"] == "no", res.answer["fault_found"]
+    body = " ".join([
+        res.answer["primary_signal"], res.answer["location"],
+        " ".join(res.answer["quoted_evidence"]),
+        " ".join(res.answer["output_literals"]),
+    ])
+    for token in expected["must_mention"]:
+        assert token in body, (
+            f"missing {token!r} anywhere in the answer. answer={res.answer}"
+        )
+
+
 # ---- Device execution --------------------------------------------------------
 
 def eval_reports_a_noc_sanitize_trip(agent):
@@ -240,7 +271,7 @@ def eval_reports_a_noc_sanitize_trip(agent):
     # provoke script prints nothing that names the fault (source hidden, and
     # the launch stdout is just "enqueued"), so a diagnosis passing without
     # touching one of those paths would have to fabricate the coord.
-    res.assert_invoked_tool(r"watcher\.log|Watcher detected|tt-triage|tt_device_job_logs")
+    res.assert_invoked_tool(r"watcher\.log|Watcher detected|tt-triage|tt_device_job_logs|tt_device_job_status")
     diagnosis = res.answer["diagnosis"].lower()
     assert "brisc" in diagnosis, res.answer["diagnosis"]
     assert "26-18" in diagnosis or "26,18" in diagnosis or "(26, 18)" in diagnosis, (

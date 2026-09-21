@@ -73,6 +73,29 @@ is wedged, and `--remote-exalens` when UMD cannot initialise because another
 process owns the device — that one needs `tt-exalens --server` already running in
 another shell, started before the workload. Full set: `references/flags.md`.
 
+## Auto-triage on hang
+
+Two variables wire triage to fire on any dispatch hang without an operator in
+the loop:
+
+| Variable | Effect |
+|---|---|
+| `TT_METAL_OPERATION_TIMEOUT_SECONDS=<seconds>` | Ceiling on any dispatch operation. Bare number is seconds. |
+| `TT_METAL_DISPATCH_TIMEOUT_COMMAND_TO_EXECUTE=<shell>` | Shell command the host runs when the timeout fires, before it raises `RuntimeError`. The process is still alive and Inspector still serves. |
+
+```bash
+export TT_METAL_OPERATION_TIMEOUT_SECONDS=30
+export TT_METAL_DISPATCH_TIMEOUT_COMMAND_TO_EXECUTE=\
+  "tools/tt-triage.py --llm-output --llm-output-path=triage.out && tt-smi -r"
+```
+
+Triage first, reset second. Reversing them kills the RPC before triage can read
+it. `tt-smi -r` is board-level and hits every tenant on a shared host — drop it
+there and reset by hand.
+
+This is how CI and long-running pytest sessions attach triage to *any* dispatch
+timeout, not only hangs a human noticed.
+
 ## Force the state
 
 Any run that is still **running** is inspectable — that is the whole
@@ -128,3 +151,7 @@ working around it; `--skip-version-check` exists but you own what follows.
 **`TT_METAL_INSPECTOR=0` in the workload degrades this silently** — the
 dispatcher-aware scripts skip and only hardware checks run. Report the
 degradation instead of reading the thin report as a clean bill of health.
+
+**A short `TT_METAL_OPERATION_TIMEOUT_SECONDS` fires on slow legitimate work.**
+5 seconds is tuned for provoking an assert path; 30 or more is safer for a real
+workload. Do not leave a short value exported into an unrelated session.

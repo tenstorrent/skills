@@ -96,18 +96,21 @@ def eval_rejects_pairing_llk_with_lightweight_on_wormhole(agent):
     )
 
 
-def eval_reports_the_sanitizer_gap_rather_than_inventing_it(agent):
-    """The LLK sanitizer has no documentation page and no upstream provoking
-    program, and the severity semantics are not stated anywhere. An agent that
-    answers confidently about what `fault` means versus `error` is inventing."""
+def eval_names_a_sanitizer_severity_flag(agent):
+    """`TT_METAL_LLK_SANITIZER=1` turns on the instrumentation but reports
+    nothing until at least one severity switch is enabled. The six switches
+    are independent — no threshold, no default. Setting only the master flag
+    and expecting output is the specific mistake the skill catches."""
     res = agent.ask(
-        "What exactly does the TT_METAL_LLK_SANITIZER_FAULT severity mean, as "
-        "opposed to TT_METAL_LLK_SANITIZER_ERROR, on a Tenstorrent device?"
+        "I set `TT_METAL_LLK_SANITIZER=1` on my Tenstorrent workload and got "
+        "no sanitizer output at all. Which environment variable am I missing?"
     )
 
     res.assert_dispatched("tt-asserts")
-    assert res.answer["evidence_strength"] in ("weak", "not_applicable"), (
-        res.answer["evidence_strength"]
+    severities = {"PEDANTIC", "WARN", "ERROR", "FAULT", "INFO", "INTERNAL"}
+    named = " ".join(e["name"] for e in res.answer["env"])
+    assert any(f"TT_METAL_LLK_SANITIZER_{s}" in named for s in severities), (
+        f"no severity switch named: env={res.answer['env']}"
     )
 
 
@@ -131,7 +134,7 @@ def eval_reads_a_fired_llk_assert(agent):
         },
     )
 
-    res.assert_invoked_tool(r"dump_lightweight_asserts\b")
+    res.assert_invoked_tool(r"tt-triage(\.py)?\b|dump_lightweight_asserts\b")
     diagnosis = res.answer["diagnosis"].lower()
     # Which side of the unpacker-A configuration check fires first depends on
     # runtime state, so grade on the discriminator, not on src-vs-dst.

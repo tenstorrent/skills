@@ -5,14 +5,24 @@
 """tt-profiler: does an agent know the two entry points and the conflict set."""
 
 
+def _body(answer) -> str:
+    return " ".join([
+        answer["primary_signal"], answer["location"], answer["command"],
+        " ".join(answer["quoted_evidence"]),
+        " ".join(answer["output_literals"]),
+        " ".join(answer["prereqs"]),
+    ])
+
+
 def eval_ranks_ops_in_a_test_through_tracy(agent):
     """`python -m tracy -p -r -v -m pytest <test>` is the invocation that writes
     the ops-perf-results CSV under `generated/profiler/reports/<ts>/`, ready for
     `tt-perf-report`. Calling `tt-perf-report` directly, or setting
     `TT_METAL_DEVICE_PROFILER=1` without tracy, does not produce that CSV."""
     res = agent.ask(
-        "I have a Tenstorrent ttnn pytest and I want to know which op dominates "
-        "device time. What do I run to get a ranked report?"
+        "I have a Tenstorrent ttnn pytest with no profiling data captured "
+        "yet. Give me one command that runs the test, captures the ops-perf "
+        "CSV, and prints the ranked ops report."
     )
 
     res.assert_dispatched("tt-profiler")
@@ -97,3 +107,26 @@ def eval_names_the_dominant_op_in_a_tt_perf_report(agent):
     assert "under-parallel" in body.lower() or "under parallel" in body.lower(), (
         f"did not classify as under-parallelized. answer={res.answer}"
     )
+
+
+def eval_reads_device_zone_csv(agent):
+    """Device zones are the CSV rows written by `TT_METAL_DEVICE_PROFILER=1`,
+    with one row per zone-boundary event. Grading on the recording RISC, the
+    user zone name and the START/END pairing proves the agent read the
+    columns rather than paraphrasing the header."""
+    output, expected = agent.fixture("device-zones")
+    prompt = (
+        "Below is device zone data captured by tt-profiler on a Tenstorrent "
+        "run. Read it and report which RISC recorded the user zones, the "
+        "name of the user zone, and how a zone's duration is expressed. "
+        "Quote representative rows in quoted_evidence.\n\n"
+        "----- begin device-zones output -----\n" + output +
+        "----- end device-zones output -----"
+    )
+    res = agent.ask(prompt)
+
+    body = _body(res.answer)
+    for token in expected["must_mention"]:
+        assert token in body, (
+            f"missing {token!r} anywhere in the answer. answer={res.answer}"
+        )

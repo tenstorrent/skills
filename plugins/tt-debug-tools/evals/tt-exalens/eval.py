@@ -15,6 +15,38 @@ MAGIC_ADDR = 0x50000
 MAGIC_VALUE = 0xC0DEBABE
 
 
+def _body(answer) -> str:
+    return " ".join([
+        answer["primary_signal"], answer["location"], answer["command"],
+        " ".join(answer["quoted_evidence"]),
+        " ".join(answer["output_literals"]),
+        " ".join(answer["prereqs"]),
+    ])
+
+
+def eval_reads_scripted_commands_output(agent):
+    """The `--commands` batch echoes each command back before its output.
+    Grading on the batch shape (`--commands`, `brxy`) and the RISC-V grid
+    (`RRRRR` = five RISCs running per core) proves the agent parsed both
+    what was run and what came back, not just one half."""
+    output, expected = agent.fixture("scripted-commands")
+    prompt = (
+        "Below is the output of a `tt-exalens --commands=...` batch. What "
+        "shape did the batch have, and what does the `RRRRR` per cell in "
+        "the device grid tell you about the RISCs on those cores? Quote "
+        "lines you relied on in quoted_evidence.\n\n"
+        "----- begin tt-exalens output -----\n" + output +
+        "----- end tt-exalens output -----"
+    )
+    res = agent.ask(prompt)
+
+    body = _body(res.answer)
+    for token in expected["must_mention"]:
+        assert token in body, (
+            f"missing {token!r} anywhere in the answer. answer={res.answer}"
+        )
+
+
 def eval_batches_commands_with_semicolons(agent):
     """`--commands=<cmds>` runs semicolon-separated commands and exits. Newline
     or comma will not parse. This is what the skill teaches instead of the REPL
@@ -29,16 +61,19 @@ def eval_batches_commands_with_semicolons(agent):
     assert ";" in res.answer["command"], res.answer["command"]
 
 
-def eval_serves_a_daemon_for_remote_clients(agent):
-    """The daemon mode is what lets `tt-triage --remote-exalens` attach and what
-    lets another shell reach the device with `--remote`. Default port 5555."""
+def eval_daemon_must_start_before_the_workload(agent):
+    """The `--server` daemon is a `--remote-exalens` prerequisite, but with a
+    timing rule: a daemon started *after* the workload has taken the device
+    cannot open the device either. Answering "just start it now" is the
+    plausible wrong move the skill exists to correct."""
     res = agent.ask(
-        "I want to leave tt-exalens running so tt-triage can attach to it "
-        "instead of initialising UMD itself. What do I start?"
+        "A tt-metal workload has already grabbed my Tenstorrent device and is "
+        "running. Can I start a tt-exalens daemon on the same host now, so "
+        "tt-triage can attach with --remote-exalens?"
     )
 
     res.assert_dispatched("tt-exalens")
-    assert "--server" in res.answer["command"], res.answer["command"]
+    assert res.answer["verdict"] == "no", res.answer["verdict"]
 
 
 # ---- Device execution --------------------------------------------------------
