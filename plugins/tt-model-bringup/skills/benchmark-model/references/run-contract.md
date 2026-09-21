@@ -96,7 +96,7 @@ Then run:
   --output "$MODEL_DIR/doc/benchmark/run"
 ```
 
-The output directory must be new. Each task runs in a child process with concurrency 32. Existing response caches are not used. Accuracy budgets come from the upstream task, with a 2048-token backend default where upstream omits one; override explicitly when the model's intended evaluation needs a larger budget. `generation` forwards upstream-supported options including `chat_template_kwargs`. Record all overrides and compare them with the reference protocol.
+The output directory must be new. Each task runs in a child process with concurrency 32. Existing response caches are not used. The HTTP timeout allows an individual long reasoning answer up to one hour; the parent runner still terminates the whole stage at its remaining wall-clock budget. Accuracy budgets come from the upstream task, with a 2048-token backend default where upstream omits one; override explicitly when the model's intended evaluation needs a larger budget. `generation` forwards upstream-supported options including `chat_template_kwargs`. Record all overrides and compare them with the reference protocol.
 
 Use the upstream vLLM 0.26 performance client (the calibration uses its empty
 build with vllm-tt-plugin). This is a client requirement; do not replace a working

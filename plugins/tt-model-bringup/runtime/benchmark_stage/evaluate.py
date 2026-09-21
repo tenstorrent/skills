@@ -53,8 +53,11 @@ def evaluate(*, model, base_url, manifest_path, group, output, generation=None):
                     raise ValueError('missing final answer in API response; inspect reasoning/parser configuration')
             return super().parse_generations(outputs, **kwargs)
 
+    # Long reasoning answers can exceed 15 minutes. The parent runner enforces
+    # the complete stage's deadline, including queued and in-flight requests.
+    request_timeout_seconds = 3600
     backend = RecordedChat(model=model, base_url=base_url.rstrip('/') + '/v1/chat/completions',
-                           num_concurrent=32, max_retries=0, timeout=900,
+                           num_concurrent=32, max_retries=0, timeout=request_timeout_seconds,
                            tokenized_requests=False, tokenizer_backend=None, max_gen_toks=2048)
     started = time.time()
     result = evaluator.simple_evaluate(
@@ -81,6 +84,7 @@ def evaluate(*, model, base_url, manifest_path, group, output, generation=None):
     result['benchmark_stage'] = {
         'model': model, 'group': group, 'subset_sha256': expected_hash,
         'concurrency': 32, 'elapsed_seconds': elapsed,
+        'request_timeout_seconds': request_timeout_seconds,
         'expected_samples': expected, 'responses': len(responses),
         'finish_reasons': reasons, 'generation_overrides': generation or {},
         'template': 'native server chat template; structured messages exactly once',
