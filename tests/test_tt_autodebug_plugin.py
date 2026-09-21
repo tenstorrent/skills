@@ -44,6 +44,13 @@ Path(os.environ["AUTODEBUG_TEST_PROMPT"]).write_text(
     args_path = tmp_path / f"{name}-args.json"
     prompt_path = tmp_path / f"{name}-prompt.md"
     env = os.environ.copy()
+    # Claude Code exports CLAUDECODE=1, which the launcher reads to infer its
+    # agent. Inherited, it sends the codex tests down the claude branch, where no
+    # fake was installed -- so the launcher execs the real `claude -p
+    # --permission-mode auto` and the test sits there running an agent. A test of
+    # inference has to own every input to it. test_autodebug_sandbox.py drops the
+    # same variable for the same reason.
+    env.pop("CLAUDECODE", None)
     env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
     env["AUTODEBUG_TEST_ARGS"] = str(args_path)
     env["AUTODEBUG_TEST_PROMPT"] = str(prompt_path)
