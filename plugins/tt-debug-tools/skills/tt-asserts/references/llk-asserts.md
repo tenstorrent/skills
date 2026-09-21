@@ -28,8 +28,8 @@ Three ways to get a report:
 | `TT_METAL_LLK_ASSERTS=1` + `TT_METAL_LIGHTWEIGHT_KERNEL_ASSERTS=1` | Upstream's recommended pair. **Fails to build under ttnn fabric dispatch on Wormhole n300; measured no richer than LLK-only.** |
 
 Upstream recommends the pair because lightweight asserts are supposed to give
-more detail. Measured on Wormhole n300 at `058b93d450f`, the pair overflows the
-`idle_erisc` code region as soon as ttnn brings up fabric dispatch:
+more detail. Measured on Wormhole n300 at `058b93d450f`, the pair overflows
+`idle_erisc`'s code region once ttnn brings up fabric dispatch:
 
 ```
 kernels/cq_prefetch/.../idle_erisc.elf: segment[0] overflows region:0
@@ -38,11 +38,10 @@ kernels/cq_prefetch/.../idle_erisc.elf: segment[0] overflows region:0
 A raw `metal_example_loopback` under both flags is fine, so the recommendation
 looks correct until a real workload uses it. And it bought nothing: on the LLK
 flag alone, `dump_lightweight_asserts` gave the failing condition, callstack,
-template parameters and locals. Triage recovers those from the ELF, not from
-anything recorded at runtime.
+template parameters and locals — triage recovers those from the ELF, not from
+anything runtime records.
 
-Add the lightweight flag only if a specific assert really does report less
-without it.
+Add the lightweight flag only if an assert reports less without it.
 
 ## The instrumented one-liner
 
