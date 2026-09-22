@@ -57,8 +57,8 @@ The eleven [goal templates](../../prompts/model_bringup_multigoal) run in order:
 10. Optimized vLLM — `optimize`
 11. Benchmarks — `benchmark-model`
 
-`tti-release` remains available for an optional standalone TTI release handoff after
-serving is ready. It is not part of this eleven-stage sequence.
+For an optional standalone TTI release handoff once serving is ready, use
+[`tti-release`](../tti-release/SKILL.md).
 
 `tt-device-usage`, `tt-enable-tracing`, `qualitative-check` and `stage-review` provide shared
 requirements. AutoDebug/AutoTriage/AutoFix come from the explicit dependency. Independent stage
@@ -83,7 +83,7 @@ serving acceptance checks. Do not add a full boundary sweep or long soak by defa
 For an unattended Codex run, install [requirements.txt](../../requirements.txt) in the active
 Python environment, or provide `--codex-bin` for an existing Codex with goals/app-server support.
 The templates authorize skill-requested subagents. Inspect the full expanded goals and execution
-permissions before starting a costly run. The imported runner defaults to `--approval-policy never`
+permissions before starting a costly run. The runner defaults to `--approval-policy never`
 and `--sandbox danger-full-access`; override these for environments that require narrower access.
 It uses the supplied Codex home's authentication and removes ambient OpenAI/Codex API keys.
 

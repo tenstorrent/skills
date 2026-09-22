@@ -15,7 +15,7 @@ from the actual launch directory and verify that it is inside this plugin's
 `runtime/benchmark_stage`. Python's working directory can shadow `PYTHONPATH` with
 an older copied package; do not assume exporting the path selects the intended code.
 
-The CI profile contains 280 MMLU-Pro questions (proportional subject allocation), 256 GSM8K-CoT questions and 256 IFEval prompts. Its original measured scope is non-reasoning dense controls; retain the calibration report's score and protocol limitations. For the Gemma 4 QB2 reasoning calibration, use the separate frozen profile described below. GPQA Diamond can replace GSM8K when that is the model's published evaluation. None of these profiles has been calibrated on MoE models.
+The CI profile contains 280 MMLU-Pro questions (proportional subject allocation), 256 GSM8K-CoT questions and 256 IFEval prompts. It is calibrated on non-reasoning dense models; retain the calibration report's score and protocol limitations. For Gemma 4 QB2, use the reasoning profile described below. GPQA Diamond can replace GSM8K when that is the model's published evaluation. Calibration coverage is limited to dense text models.
 
 For `gpqa_diamond_cot_zeroshot`, the client preserves the upstream prompt and scorer but makes answer-choice shuffling deterministic with a private seed-0 RNG and recomputes that transform. Upstream 0.4.13 uses a global RNG whose state is absent from the dataset transform cache key. The manifest records this processing policy and evaluation rejects a different policy. Freeze a new GPQA manifest with this client; do not reuse a manifest prepared with the upstream cache-dependent shuffle.
 
@@ -27,8 +27,10 @@ Freeze once, before observing scores:
   --output "$BENCHMARK_ROOT/subset"
 ```
 
-For the pilot tasks, prefer the packaged `runtime/benchmark_stage/profiles/ci-v1.json`
-manifest. Its `reused_manifest_sha256` retains the original calibration manifest identity; the later freeze adds few-shot hashes without changing any evaluation questions. `prepare` creates a new candidate profile. A benchmark name alone is
+For these tasks, prefer the packaged `runtime/benchmark_stage/profiles/ci-v1.json`
+manifest. Its `reused_manifest_sha256` identifies the source calibration manifest;
+document and few-shot hashes verify the selected content. Use `prepare` to create
+a profile for a different task selection. A benchmark name alone is
 not an exact recipe: for example, upstream `gsm8k_cot_llama` documents Meta's
 published prompt, while `gsm8k_cot` is the generic recipe. Choose the publisher's
 supported recipe for that model; do not apply a Llama-specific recipe to other
@@ -166,22 +168,18 @@ The companion `profiles/ci-v1-reasoning-full.json` contains all 198 GPQA questio
 with hash `83203b75b253a2dff70c9bac96c257fe784981a714c767b61f15fdefb707598b`.
 Both preserve the same full-population identity and choice ordering.
 
-The full GPQA candidate completed accuracy but failed the whole-stage one-hour
-budget during performance warmup. The 128-question fallback was frozen for
-runtime using the existing deterministic hash order before checking its score.
-It was 2.56 percentage points easier within the new full run and 3.94 points
-easier within a historical TT run. An earlier 64-question candidate was 6.28
-points easier historically. These controls are not independent HF inference;
-retain the observed subset bias when comparing with published full-set figures.
-Do not search for a seed that makes the scores agree.
+The calibrated Gemma configuration selects `mmlu_pro` and
+`gpqa_diamond_cot_zeroshot`, with `accuracy_execution: "shared"`. The 128-question
+profile completed in 51m02s, including both performance rows, and scored 86.79%
+MMLU-Pro and 84.38% GPQA Diamond. The full-198 profile exceeded the one-hour budget
+during performance warmup. IFEval is available for a separate diagnostic; Google's
+reported figure does not identify which of its four aggregations was used.
 
-The measured Gemma profile selects only `mmlu_pro` and
-`gpqa_diamond_cot_zeroshot`, with `accuracy_execution: "shared"`. IFEval remains
-available in the manifest for a separate diagnostic; it is not part of the timed
-profile. The fresh 128-question run completed in 51m02s, including both performance
-rows. Its upstream scores were 86.79% MMLU-Pro and 84.38% GPQA Diamond. The manifest
-retains its original candidate note as historical freeze-time metadata. Google's reported IFEval figure does not identify which of its four
-aggregations was used.
+The 128-question subset uses a deterministic hash order frozen before score
+inspection. Its score was 2.56 and 3.94 percentage points above full-set GPQA
+scores in two TT controls. Account for this observed subset bias when comparing
+with published full-set figures. These controls use TT outputs, not independent
+HF inference. Do not search for a seed that makes the scores agree.
 
 Use the following identical generation dictionary for both selected tasks when
 reproducing this calibration:

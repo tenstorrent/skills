@@ -5,7 +5,7 @@ We publish our skills at [tenstorrent/skills](https://github.com/tenstorrent/ski
 | Plugin | Details |
 | --- | --- |
 | `tt-autodebug` | AutoDebug, AutoTriage and AutoFix skills - find 80% of tt-metal bugs by inspection, fix bugs with a principled process of experimentation |
-| `tt-model-bringup` | Fully-automated HF model to TTNN bringup including vLLM integration and testing. Includes many skills you can also use interactively including optimization, multichip parallelization, adding tracing support, adding vLLM integration. Requires `tt-autodebug` and will add it when used. |
+| `tt-model-bringup` | Fully-automated HF model to TTNN bringup including vLLM integration and benchmarking. Includes skills you can also use interactively for optimization, multichip parallelization, tracing, vLLM integration, and TTI release handoff. Requires a separately installed and enabled `tt-autodebug`. |
 
 For broader direction and priorities, see the [AR Roadmap](https://docs.google.com/presentation/d/1TODRqfYb3Muw_pmlpZXw_emKx6xjY1i17t8aHPLuRfk/edit).
 
@@ -87,7 +87,7 @@ It takes the current tt-metal checkout and uses that version to bring up the mod
 | 1–3 | Functional, fused, then optimized decoder; HF comparison and warmed performance evidence |
 | 4–5 | Multi-chip decoder and multi-chip optimization |
 | 6–8 | Full model, optimized generation, and a datatype/fidelity sweep |
-| 9–11 | vLLM integration, optimized serving, and release evidence |
+| 9–11 | vLLM integration, optimized serving, and accuracy/performance benchmarks |
 
 Code and tests are created under `models/autoports/<model>/` plus a lot of profiling dumps and other information. Tell a separate agent to monitor this and create a HTML dashboard to show you the progress!
 

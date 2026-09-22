@@ -442,7 +442,7 @@
       "destination": "skills/tti-release/SKILL.md",
       "blob": "af09c19651cadaceb231edab4de3c9707801bc75",
       "source_sha256": "bec4650d82fd95793652014d078125ee9370528c09a3f95cfb381f4ef1447fef",
-      "packaged_sha256": "3221ddb72a7899de9e662133d9b81fc5188be569988b49a514b61f4c9a1e19e4"
+      "packaged_sha256": "288f0eab0fdc5225f85609aa375616a79c075db3450469af1d0c12ae6c6df5ec"
     },
     {
       "source": ".agents/skills/tti-release/agents/openai.yaml",

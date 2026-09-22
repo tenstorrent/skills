@@ -5,7 +5,7 @@ description: Evaluate a brought-up text model through vLLM using fixed lm-eval s
 
 # Benchmark a model through vLLM
 
-Follow [model-bringup startup](../model-bringup/SKILL.md#startup). This replaces the TTI release stage. Use upstream EleutherAI lm-evaluation-harness for accuracy and `vllm bench serve` for performance. Keep native model formatting and upstream scoring; do not introduce a model-family prompt wrapper.
+Follow [model-bringup startup](../model-bringup/SKILL.md#startup). Use upstream EleutherAI lm-evaluation-harness for accuracy and `vllm bench serve` for performance. Keep native model formatting and upstream scoring; do not introduce a model-family prompt wrapper.
 
 The target is a complete stage in **less than one hour**, attached to the working Stage 10 server. Record cold installation, download, model-load and trace-compilation time separately. Include task preparation/verification, all accuracy requests, performance warmups/runs, scoring and reporting in stage wall time. A timeout is incomplete evidence, not a pass.
 

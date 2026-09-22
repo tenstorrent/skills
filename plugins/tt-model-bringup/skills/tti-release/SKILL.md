@@ -13,9 +13,7 @@ this plugin is copied into the target tt-metal checkout.
 
 ## Overview
 
-This is an optional standalone release workflow. It is available after vLLM serving is ready; it is not one of the multigoal bringup stages. Stage 11 uses `$benchmark-model`.
-
-This skill runs the Tenstorrent `tt-inference-server` release workflow for the generated `models/autoports/<model>` implementation whose vLLM serving path is already complete. The goal is a copied-back markdown release report plus a short local handoff note with exact commands, versions, recovery actions, and release-readiness status.
+This standalone skill runs the Tenstorrent `tt-inference-server` release workflow for the generated `models/autoports/<model>` implementation whose vLLM serving path is complete. The goal is a copied-back markdown release report plus a short local handoff note with exact commands, versions, recovery actions, and release-readiness status.
 
 Separate release workflow success from release readiness. `run.py` exiting `0`, API requests completing, or a report being copied back proves the release harness ran. It does not prove the model is ready if the report contains failed accuracy, API conformance, or benchmark target rows.
 
@@ -444,8 +442,7 @@ After copy-back, remove any `.env` left in the TTI checkout and stop the finishe
 ## Independent handoff review
 
 Before declaring release readiness, run [scripts/check-evidence.sh](scripts/check-evidence.sh)
-from the target tt-metal checkout with `MODEL_DIR` and `HF_MODEL` set. This preserves
-the former multigoal check as a standalone artifact check. Exit 0 establishes
+from the target tt-metal checkout with `MODEL_DIR` and `HF_MODEL` set. Exit 0 establishes
 artifact presence, implementation identity and context consistency; it does not
 establish accuracy or release readiness. Inspect every report row as described above.
 
