@@ -1,0 +1,33 @@
+{
+  "name": "tt-debug-tools",
+  "version": "0.1.1",
+  "description": "Drive the Tenstorrent debug tools and read their output: tt-triage, dprint, watcher, asserts, etc.",
+  "author": {
+    "name": "Tenstorrent"
+  },
+  "homepage": "https://github.com/tenstorrent/skills",
+  "repository": "https://github.com/tenstorrent/skills",
+  "license": "Apache-2.0",
+  "keywords": [
+    "tenstorrent",
+    "tt-metal",
+    "debugging"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Tenstorrent Debug Tools",
+    "shortDescription": "Drive the Tenstorrent debug tools and read their output: tt-triage, dprint, watcher, asserts, etc.",
+    "longDescription": "One skill per debugging question. Each teaches how to put the stack in the state a tool reports on, how to run it, and how to read what comes back. Needs a Tenstorrent device and a built tt-metal checkout.",
+    "developerName": "Tenstorrent",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Device state capture",
+      "Debug tool configuration",
+      "Tool output interpretation"
+    ],
+    "websiteURL": "https://github.com/tenstorrent/skills",
+    "defaultPrompt": [
+      "My Tenstorrent job is hung \u2014 get me the device state."
+    ]
+  }
+}
