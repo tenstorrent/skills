@@ -1,4 +1,4 @@
-# Model bringup benchmark stage
+# Benchmark stage calibration
 
 Stage 11 is the final model-bringup stage. It evaluates accuracy with fixed subsets
 of standard lm-evaluation-harness tasks and measures vLLM serving performance.
@@ -12,7 +12,7 @@ and 32. The one-hour budget includes task verification, inference, scoring,
 performance warmups and reporting; environment setup and model startup are separate.
 
 The packaged profiles cover MMLU-Pro, GSM8K and IFEval for non-reasoning models,
-and MMLU-Pro plus GPQA Diamond for Gemma 4 reasoning. Select the upstream task
+and MMLU-Pro plus GPQA Diamond for reasoning evaluations. Select the upstream task
 variants and generation settings that match the model's published evaluation
 recipe. The calibrations below establish measured coverage, runtime and comparison
 limits for these profiles.
@@ -108,8 +108,7 @@ cause was not established. The intervals describe subset sampling only.
 The concurrency-32 run includes one 31.56-second request and a 9.97-second
 inter-token gap. The raw client's peak-concurrency field is incorrect (63);
 reconstructing request intervals confirms 32. The table preserves its effect on
-aggregate throughput and mean latency. A 32-sized tile does not make these
-continuous-batching serving latencies equal between concurrency settings.
+aggregate throughput and mean latency.
 
 QB2 uses four Blackhole devices across two P300 cards. All 32 layers ran with the
 specialized implementation's shipped fixed precision policy; it has no generic
@@ -129,9 +128,9 @@ top-p 0.95, top-k 20 and a 32,768-token cap. The device-supported top-k 20 diffe
 from Google's general top-k 64 recommendation. The exact publisher recipe is not
 fully specified.
 
-The packaged `ci-v1-reasoning.json` profile uses 280 MMLU questions and 128 GPQA
-Diamond questions. It completed the stage in **51m02s** (3,062.25 seconds),
-including verification, shared accuracy, scoring, performance warmups, both
+The calibration used the question selection in `ci-v1-reasoning.json`: 280 MMLU
+questions and 128 GPQA Diamond questions. It completed the stage in **51m02s**
+(3,062.25 seconds), including verification, shared accuracy, scoring, performance warmups, both
 performance rows and generated reporting.
 
 | Completed timed subset | Samples / full | Measured % | Published full % | Sampling-only 95% interval |
@@ -207,5 +206,5 @@ physical-batch kernel timings.
 The three-task Meta/generic profiles and the two-task 280-MMLU/128-GPQA reasoning
 profile completed within an hour on these controls. Applying a profile to another
 model requires checking its published recipe and reviewing raw output failures
-alongside aggregate scores. Stage completion requires both successful execution
-and an explicit accuracy assessment.
+alongside aggregate scores. The final stage reports measured results and available
+references; the bringup owner decides whether the model meets their accuracy needs.

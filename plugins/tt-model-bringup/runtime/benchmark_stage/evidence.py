@@ -47,3 +47,25 @@ def metric_score(result, task, metric, *, expected_children=None):
     if any(not finite_number(v) or not 0 <= v <= 1 for v in values):
         raise ValueError(f'{task}: missing/invalid measured metric {metric}')
     return 100 * sum(values) / len(values)
+
+
+def benchmark_rows(config, manifest, task, result):
+    """Resolve report metrics and optional references; impose no accuracy threshold."""
+    raw = result.get('groups', {}).get(task, result.get('results', {}).get(task, {}))
+    references = config.get('references', {}).get(task, {})
+    metrics = config.get('metrics', {}).get(task) or list(references) or [
+        key for key in raw if ',' in key and '_stderr' not in key]
+    if not metrics or len(metrics) != len(set(metrics)):
+        raise ValueError(f'{task}: missing or repeated report metrics')
+    if set(references) - set(metrics):
+        raise ValueError(f'{task}: reference metric is absent from the report')
+    rows = []
+    for metric in metrics:
+        score = metric_score(result, task, metric, expected_children=manifest['groups'][task]['tasks'])
+        ref = references.get(metric)
+        if ref is not None:
+            if (not finite_number(ref.get('score')) or not 0 <= ref['score'] <= 100
+                    or not ref.get('source_url', '').startswith('https://')):
+                raise ValueError(f'{task}: published reference needs a percentage and source URL')
+        rows.append((metric, score, ref))
+    return rows

@@ -61,8 +61,10 @@ For an optional standalone TTI release handoff once serving is ready, use
 [`tti-release`](../tti-release/SKILL.md).
 
 `tt-device-usage`, `tt-enable-tracing`, `qualitative-check` and `stage-review` provide shared
-requirements. AutoDebug/AutoTriage/AutoFix come from the explicit dependency. Independent stage
-review must return `clean-pass`; findings require repairs and rereview. Preserve original goal
+requirements. AutoDebug/AutoTriage/AutoFix come from the explicit dependency. Implementation
+stages 1–10 require independent review with `clean-pass`; findings require repairs and rereview.
+The final benchmark stage produces results for the bringup owner and checks measurement
+completeness without an accuracy acceptance review. Preserve original goal
 criteria, local commit boundaries and the prohibition on pushing stage changes automatically.
 
 ### Validate changed paths

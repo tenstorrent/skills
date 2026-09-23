@@ -63,5 +63,5 @@ PYTHONPATH=plugins/tt-model-bringup/runtime HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLIN
 
 These tests use synthetic generators and tokenizers. Model accuracy and performance
 require separate hardware measurements with recorded implementation identity,
-protocol and sample coverage. The benchmark calibration report documents those
-measurements and their limitations.
+protocol and sample coverage. Benchmark completion checks measurement integrity and
+report completeness; accuracy acceptance belongs to the bringup owner.

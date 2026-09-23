@@ -123,6 +123,11 @@ def run(*, config_path, output):
                            ('duration', 'request_throughput', 'output_throughput', 'total_token_throughput',
                             'total_input_tokens', 'total_output_tokens')},
                     }
+        if config.get('roofline_command'):
+            command([*config['roofline_command'], '--run-dir', str(output)],
+                    output / 'roofline.log', deadline)
+            if not (output / 'roofline.json').is_file():
+                raise ValueError('roofline_command did not write roofline.json')
         summary['status'] = 'completed'
     except BaseException as exc:
         summary['status'] = 'failed'

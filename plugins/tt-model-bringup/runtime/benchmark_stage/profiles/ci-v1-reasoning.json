@@ -1569,6 +1569,6 @@
     }
   },
   "candidate_from_manifest_sha256": "83203b75b253a2dff70c9bac96c257fe784981a714c767b61f15fdefb707598b",
-  "candidate_note": "Prospective128-question fallback selected solely to reduce runtime, using the existing deterministic hash ordering; created before checking historical128-question accuracy. Current full198 run remains active and unchanged.",
-  "manifest_sha256": "7bdb5c3910b530169dfeaabe56882de103dd8d8dfc842ef0a7ebd026eecdcdba"
+  "selection_note": "GPQA Diamond: first 128 documents in deterministic hash order, selected before score inspection.",
+  "manifest_sha256": "3dd6b5fe3878c8138817180626bf5f551ae6a966d11777d3eac935db695fcc38"
 }

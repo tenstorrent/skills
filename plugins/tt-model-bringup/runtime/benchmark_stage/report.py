@@ -1,18 +1,26 @@
-"""Write a compact report from upstream results without redefining scorers."""
+"""Write the final results tables from upstream scores and measured performance."""
 from __future__ import annotations
 import json
 from pathlib import Path
 
-from benchmark_stage.evidence import metric_score
+from benchmark_stage.evidence import benchmark_rows
+from benchmark_stage.roofline import load_roofline
+
+
+def cell(value):
+    return str(value).replace('|', r'\|').replace('\n', ' ')
 
 
 def write_report(output, config, summary):
     output = Path(output)
+    if set(config.get('references', {})) - set(config['tasks']) or set(config.get('metrics', {})) - set(config['tasks']):
+        raise ValueError('report metrics/references name a task that was not run')
     manifest = json.loads(Path(config['manifest']).read_text())
+    roofline = load_roofline(output)
     lines = [f"# Benchmark: {config['model']}", '',
-             f"Status: {summary['status']}. Accuracy concurrency: 32. Subset: `{manifest['manifest_sha256']}`.", '',
-             '| Task | Samples / full | Metric | Subset % | Published % | Difference pp |',
-             '|---|---:|---|---:|---:|---:|']
+             f"Status: {summary['status']}. Accuracy concurrency: 32.", '',
+             '| Benchmark | Samples / full | Metric | Subset % | Published full % | Difference pp | Source |',
+             '|---|---:|---|---:|---:|---:|---|']
     notes = []
     for task in config['tasks']:
         result_path = output / task / 'results.json'
@@ -20,31 +28,37 @@ def write_report(output, config, summary):
             continue
         result = json.loads(result_path.read_text())
         group = manifest['groups'][task]
-        rows = result.get('groups', {}).get(task, result.get('results', {}).get(task, {}))
-        rows = dict(rows)
-        if 'ifeval_mean_four' in config.get('references', {}).get(task, {}):
-            rows['ifeval_mean_four'] = metric_score(result, task, 'ifeval_mean_four') / 100
-        for metric in config.get('references', {}).get(task, {}):
-            if metric.startswith('subject_macro:'):
-                rows[metric] = metric_score(result, task, metric, expected_children=group['tasks']) / 100
-        for metric, score in rows.items():
-            if not isinstance(score, (int, float)) or '_stderr' in metric or (',' not in metric and metric != 'ifeval_mean_four'):
-                continue
-            ref = config.get('references', {}).get(task, {}).get(metric)
+        for metric, score, ref in benchmark_rows(config, manifest, task, result):
             published = f"{ref['score']:.2f}" if ref else '—'
-            delta = f"{100 * score - ref['score']:+.2f}" if ref else '—'
-            lines.append(f"| {task} | {group['sample_count']} / {group['population']} | {metric} | {100 * score:.2f} | {published} | {delta} |")
-        finish = result['benchmark_stage']['finish_reasons']
-        timing = result['benchmark_stage'].get('timing_scope', 'single task group')
-        if timing == 'shared accuracy pass':
-            timing += '; shared times are not additive'
-        notes += ['', f"{task}: finish reasons `{json.dumps(finish)}`; {result['benchmark_stage']['elapsed_seconds']:.1f} seconds ({timing}).", '']
-    lines += notes
-    lines += ['', '| Concurrency | ISL / OSL | TTFT ms | TPOT ms | Decode tokens/s/user | Output tokens/s |',
-              '|---:|---:|---:|---:|---:|---:|']
+            delta = f"{score - ref['score']:+.2f}" if ref else '—'
+            source = f"[reference]({ref['source_url']})" if ref else 'Unavailable'
+            lines.append(f"| {cell(task)} | {group['sample_count']} / {group['population']} | {cell(metric)} | {score:.2f} | {published} | {delta} | {source} |")
+            if ref and ref.get('protocol_notes'):
+                notes.append(f"- {task}, {metric}: {ref['protocol_notes']}")
+    lines += ['', '| Concurrency | ISL / OSL | TTFT ms | TPOT ms | Decode tokens/s/user | Output tokens/s | Prefill FLOP roofline % (est.) | Decode DRAM roofline % (est.) |',
+              '|---:|---:|---:|---:|---:|---:|---:|---:|']
     for batch, row in summary.get('performance', {}).items():
         tpot = row.get('mean_tpot_ms', 0)
-        lines.append(f"| {batch} | {row['requested_input_tokens']} / {row['requested_output_tokens']} | {row.get('mean_ttft_ms', 0):.2f} | {tpot:.2f} | {1000/tpot if tpot else 0:.2f} | {row.get('output_throughput', 0):.2f} |")
+        utilization = [f"{roofline[batch][phase]['percent']:.2f}" if roofline.get(batch, {}).get(phase) else '—'
+                       for phase in ('prefill', 'decode')]
+        lines.append(f"| {batch} | {row['requested_input_tokens']} / {row['requested_output_tokens']} | {row.get('mean_ttft_ms', 0):.2f} | {tpot:.2f} | {1000/tpot if tpot else 0:.2f} | {row.get('output_throughput', 0):.2f} | " + ' | '.join(utilization) + ' |')
+    lines += ['', 'Scores use fixed subsets; published figures cover the full dataset. Missing references are shown as unavailable. The bringup owner decides whether these results meet their needs.', '',
+              'Roofline estimates divide modeled work by full-phase elapsed wall time and the participating hardware’s peak rate. Missing phase accounting is shown as —. HTTP concurrency is not a fixed device batch size.', '']
+    if notes:
+        lines += ['Reference protocol notes:', *notes, '']
+    lines += ['## Run details', '', f"Subset: `{manifest['manifest_sha256']}`. Configuration: [run_config.json](run_config.json).", '',
+              '| Benchmark | Responses | Token-limited | Empty final at token limit | Wall seconds |',
+              '|---|---:|---:|---:|---:|']
+    for task, meta in summary.get('accuracy', {}).items():
+        count = meta['responses']
+        limited = meta.get('finish_reasons', {}).get('length', 0)
+        lines.append(f"| [{cell(task)}]({task}/results.json) | {count} | {limited} ({100 * limited / count if count else 0:.1f}%) | {meta.get('empty_final_length_responses', 0)} | {meta.get('elapsed_seconds', 0):.1f} |")
+    if summary.get('accuracy_execution') == 'shared':
+        lines += ['', 'Accuracy tasks share one request pool; their wall times refer to the same interval.']
+    lines += ['', '| Concurrency | Completed / requested | Wall seconds | Requests/s |',
+              '|---:|---:|---:|---:|']
+    for batch, row in summary.get('performance', {}).items():
+        lines.append(f"| [{batch}](perf-b{batch}.json) | {row['completed']} / {row['requests']} | {row['duration']:.2f} | {row['request_throughput']:.2f} |")
     lines += ['', '| Concurrency | Latency | Mean ms | Median ms | p95 ms | p99 ms |',
               '|---:|---|---:|---:|---:|---:|']
     for batch, row in summary.get('performance', {}).items():
@@ -52,7 +66,13 @@ def write_report(output, config, summary):
             values = [row.get(f'{stat}_{metric}_ms') for stat in ('mean', 'median', 'p95', 'p99')]
             formatted = [f'{v:.2f}' if isinstance(v, (int, float)) else '—' for v in values]
             lines.append(f"| {batch} | {metric.upper()} | " + ' | '.join(formatted) + ' |')
-    lines += ['', 'Published results cover the full dataset. These are fixed subsets; score differences can reflect sampling, protocol or implementation differences. See the separate accuracy review for uncertainty and comparability.', '']
+    if roofline:
+        lines += ['', 'Roofline inputs: [roofline.json](roofline.json).', '']
+        for batch, row in roofline.items():
+            for phase in ('prefill', 'decode'):
+                entry = row.get(phase)
+                if entry:
+                    lines.append(f"- Concurrency {batch}, {phase}: {entry['seconds']:.6g} s. {entry['work_method']} Peak: {entry['peak_source']}. Timing: {entry['timing_method']}. [Evidence]({entry['evidence']}).")
     if summary.get('error'):
-        lines += [f"Error: {summary['error']}", '']
-    (output / 'REPORT.md').write_text('\n'.join(lines))
+        lines += ['', f"Error: {summary['error']}"]
+    (output / 'REPORT.md').write_text('\n'.join(lines) + '\n')

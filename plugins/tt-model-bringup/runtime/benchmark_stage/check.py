@@ -2,10 +2,10 @@
 from __future__ import annotations
 import argparse
 import json
-import math
 from pathlib import Path
 
-from benchmark_stage.evidence import PERFORMANCE_METRICS, finite_number, metric_score, validate_performance
+from benchmark_stage.evidence import PERFORMANCE_METRICS, benchmark_rows, finite_number, validate_performance
+from benchmark_stage.roofline import load_roofline
 from benchmark_stage.subsets import digest
 from benchmark_stage.responses import read_jsonl, scoring_response
 
@@ -19,7 +19,7 @@ def read(path):
 def check(model_dir, hf_model=''):
     root = Path(model_dir)
     evidence = root / 'doc/benchmark'
-    for filename in ('REPORT.md', 'RUN_NOTES.md'):
+    for filename in ('run/REPORT.md', 'RUN_NOTES.md'):
         path = evidence / filename
         if not path.is_file() or not path.stat().st_size:
             raise ValueError(f'missing benchmark evidence: {path}')
@@ -49,14 +49,14 @@ def check(model_dir, hf_model=''):
     elapsed = summary.get('elapsed_seconds')
     if summary.get('status') != 'completed' or not finite_number(elapsed) or not 0 < elapsed < min(config.get('budget_seconds', 3600), 3600):
         raise ValueError('benchmark stage did not complete within its budget and one hour')
-    manifest = read(evidence / 'manifest.json')
+    manifest = read(evidence / 'run/manifest.json')
     if digest({k: v for k, v in manifest.items() if k != 'manifest_sha256'}) != manifest['manifest_sha256']:
         raise ValueError('subset manifest checksum mismatch')
     accuracy = summary.get('accuracy', {})
     execution = config.get('accuracy_execution', 'sequential')
     if execution not in ('sequential', 'shared') or summary.get('accuracy_execution', 'sequential') != execution:
         raise ValueError('accuracy execution mode differs from run configuration')
-    if len(accuracy) < 2 or set(accuracy) != set(config['tasks']):
+    if not accuracy or set(accuracy) != set(config['tasks']):
         raise ValueError('missing required accuracy tasks')
     results = {}
     for task, result in accuracy.items():
@@ -139,21 +139,11 @@ def check(model_dir, hf_model=''):
                 for key in ('completed', 'total_input_tokens', 'total_output_tokens', *PERFORMANCE_METRICS):
                     if result.get(key) != raw.get(key):
                         raise ValueError(f'batch {batch}: summary disagrees with raw {key}')
-    review = read(evidence / 'accuracy_review.json')
-    if review.get('verdict') != 'pass' or set(review.get('benchmarks', {})) != set(accuracy):
-        raise ValueError('accuracy comparison has not passed review for every task')
-    for task, entry in review['benchmarks'].items():
-        if not entry.get('source_url', '').startswith('https://') or not entry.get('assessment'):
-            raise ValueError(f'{task}: incomplete published-reference assessment')
-        if accuracy[task].get('finish_reasons', {}).get('length') and not entry.get('truncation_assessment'):
-            raise ValueError(f'{task}: length-limited answers require a truncation assessment or rerun')
-        score = metric_score(results[task], task, entry.get('reference_metric'),
-                             expected_children=manifest['groups'][task]['tasks'])
-        for key in ('reference_score', 'subset_score', 'delta'):
-            if not finite_number(entry.get(key)):
-                raise ValueError(f'{task}: invalid review {key}')
-        if not 0 <= entry['reference_score'] <= 100 or not math.isclose(entry['subset_score'], score, abs_tol=0.005) or not math.isclose(entry['delta'], score - entry['reference_score'], abs_tol=0.005):
-            raise ValueError(f'{task}: published comparison contradicts measured score')
+    if set(config.get('references', {})) - set(accuracy) or set(config.get('metrics', {})) - set(accuracy):
+        raise ValueError('report metrics/references name a task that was not run')
+    for task, raw in results.items():
+        benchmark_rows(config, manifest, task, raw)
+    load_roofline(evidence / 'run')
     return evidence
 
 

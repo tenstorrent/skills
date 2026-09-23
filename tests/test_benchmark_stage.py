@@ -193,14 +193,15 @@ def valid_gate_fixture(tmp_path):
         path = evidence / path
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(data))
-    for name in ('REPORT.md', 'RUN_NOTES.md'):
+    for name in ('run/REPORT.md', 'RUN_NOTES.md'):
+        (evidence / name).parent.mkdir(parents=True, exist_ok=True)
         (evidence / name).write_text('measured evidence')
     tasks = ['gsm8k_cot', 'ifeval']
     docs = [{'question': 'one'}, {'question': 'two'}]
     manifest = {'groups': {t: {'sample_count': 2, 'tasks': [t]} for t in tasks},
                 'tasks': {t: {'indices': [0, 1], 'document_sha256': [digest(d) for d in docs]} for t in tasks}}
     manifest['manifest_sha256'] = digest(manifest)
-    write('manifest.json', manifest)
+    write('run/manifest.json', manifest)
     write('identity.json', dict(model='org/model', implementation='models/autoports/model',
         generator_module='models.autoports.model.generator', prefix_caching=False,
         model_revision='123', tokenizer_revision='123', precision='accuracy', layer_count=32,
@@ -223,23 +224,21 @@ def valid_gate_fixture(tmp_path):
         write(f'run/perf-b{b}.json', raw)
         write(f'run/perf-b{b}-warmup.json', dict(performance_fixture(b), model_id='org/model', max_concurrency=b))
     write('run/summary.json', summary)
-    write('accuracy_review.json', dict(verdict='pass', benchmarks={t: dict(reference_metric='acc,none',
-        reference_score=51, subset_score=50, delta=-1, source_url='https://example.org/model', assessment='Agrees within uncertainty') for t in tasks}))
     return root, evidence
 
 
-@pytest.mark.parametrize('mutation', ['review_score', 'model', 'raw_perf', 'transcript', 'batch', 'layers', 'manifest', 'sample_ids', 'truncation'])
-def test_gate_connects_review_to_raw_evidence(tmp_path, mutation):
+@pytest.mark.parametrize('mutation', ['reference_metric', 'model', 'raw_perf', 'transcript', 'batch', 'layers', 'manifest', 'sample_ids', 'truncation'])
+def test_gate_connects_results_to_raw_evidence(tmp_path, mutation):
     root, evidence = valid_gate_fixture(tmp_path)
     assert check(root, 'org/model') == evidence
     file, key, value = {
         'sample_ids': ('run/ifeval/samples_ifeval.jsonl', None, None),
         'truncation': ('run/ifeval/responses.jsonl', None, None),
-        'review_score': ('accuracy_review.json', None, None),
+        'reference_metric': ('run/run_config.json', None, None),
         'model': ('run/run_config.json', 'model', 'wrong/model'),
         'batch': ('run/summary.json', None, None),
         'layers': ('identity.json', 'layer_count', 1),
-        'manifest': ('manifest.json', 'manifest_sha256', 'wrong'),
+        'manifest': ('run/manifest.json', 'manifest_sha256', 'wrong'),
         'raw_perf': ('run/perf-b32.json', None, None),
         'transcript': ('run/ifeval/responses.jsonl', None, None),
     }[mutation]
@@ -255,8 +254,8 @@ def test_gate_connects_review_to_raw_evidence(tmp_path, mutation):
         path.unlink()
     else:
         data = json.loads(path.read_text())
-        if mutation == 'review_score':
-            data['benchmarks']['ifeval']['subset_score'] = 96
+        if mutation == 'reference_metric':
+            data['references'] = {'ifeval': {'nonexistent,none': {'score': 90, 'source_url': 'https://example.org/model'}}}
         elif mutation == 'batch':
             data['performance']['32']['concurrency'] = 1
         else:
@@ -391,7 +390,7 @@ def test_invalid_final_responses_fail(mutation):
     with pytest.raises(ValueError): scoring_response(raw)
 
 
-def test_gate_requires_exhaustion_count_and_truncation_assessment(tmp_path):
+def test_gate_requires_exhaustion_count_without_accuracy_assessment(tmp_path):
     root, evidence = valid_gate_fixture(tmp_path)
     path = evidence / 'run/ifeval/responses.jsonl'
     rows = [json.loads(line) for line in path.read_text().splitlines()]
@@ -408,11 +407,6 @@ def test_gate_requires_exhaustion_count_and_truncation_assessment(tmp_path):
         metadata = data['accuracy']['ifeval'] if stage == 'summary' else data['benchmark_stage']
         metadata['empty_final_length_responses'] = 1
         path.write_text(json.dumps(data))
-    with pytest.raises(ValueError, match='truncation assessment'): check(root)
-    path = evidence / 'accuracy_review.json'
-    review = json.loads(path.read_text())
-    review['benchmarks']['ifeval']['truncation_assessment'] = 'One exhausted answer retained and scored empty.'
-    path.write_text(json.dumps(review))
     assert check(root) == evidence
 
 
@@ -487,3 +481,119 @@ def test_jsonl_keeps_unicode_question_and_answer_separators(tmp_path):
     path = tmp_path / 'samples.jsonl'
     path.write_text(''.join(json.dumps(row, ensure_ascii=False) + '\n' for row in rows), encoding='utf-8')
     assert read_jsonl(path) == rows
+
+
+def test_low_scores_and_missing_references_complete_without_review(tmp_path):
+    root, evidence = valid_gate_fixture(tmp_path)
+    path = evidence / 'run/ifeval/results.json'
+    raw = json.loads(path.read_text())
+    raw['results']['ifeval']['acc,none'] = 0.0
+    path.write_text(json.dumps(raw))
+    config_path = evidence / 'run/run_config.json'
+    config = json.loads(config_path.read_text())
+    config['references'] = {'ifeval': {'acc,none': {'score': 99, 'source_url': 'https://example.org/model'}}}
+    config_path.write_text(json.dumps(config))
+    assert not (evidence / 'accuracy_review.json').exists()
+    assert check(root) == evidence  # 99-point gap and no reference for GSM8K are valid results.
+
+
+@pytest.mark.parametrize('reference', [None, {'score': 70, 'source_url': 'https://example.org/model'}])
+def test_report_has_measured_scores_references_and_performance_without_verdict(tmp_path, reference):
+    from benchmark_stage.report import write_report
+    root, evidence = valid_gate_fixture(tmp_path)
+    run = evidence / 'run'
+    manifest = json.loads((run / 'manifest.json').read_text())
+    for group in manifest['groups'].values():
+        group['population'] = 100
+    (run / 'manifest.json').write_text(json.dumps(manifest))
+    config = json.loads((run / 'run_config.json').read_text())
+    config['manifest'] = str(run / 'manifest.json')
+    if reference:
+        config['references'] = {'ifeval': {'acc,none': reference}}
+    summary = json.loads((run / 'summary.json').read_text())
+    write_report(run, config, summary)
+    report = (run / 'REPORT.md').read_text()
+    assert '| 2 / 100 | acc,none | 50.00 |' in report
+    assert '| 70.00 | -20.00 | [reference](https://example.org/model)' in report if reference else 'Unavailable' in report
+    assert '| 1 | 4096 / 128 |' in report and '| 32 | 4096 / 128 |' in report
+    assert 'verdict' not in report and 'separate accuracy review' not in report
+    assert report.index('| Concurrency | ISL') < report.index('## Run details')
+
+
+def roofline_fixture(run):
+    import hashlib
+    (run / 'phase-timings.json').write_text('{"source": "synthetic full-phase timing fixture"}')
+    data = {'1': {
+        'performance_sha256': hashlib.sha256((run / 'perf-b1.json').read_bytes()).hexdigest(),
+        'prefill': dict(flops=2000, seconds=2, peak_flops_per_second=2000),
+        'decode': dict(dram_bytes=3000, seconds=3, peak_dram_bytes_per_second=2000)}}
+    for phase in ('prefill', 'decode'):
+        data['1'][phase].update(timing_scope='full_phase_wall_time', timing_method='Full host interval',
+            work_method='Synthetic accounting fixture', peak_source='Synthetic peak fixture',
+            evidence='phase-timings.json')
+    (run / 'roofline.json').write_text(json.dumps(data))
+    return data
+
+
+def test_roofline_uses_full_phase_time_and_is_linked_to_perf_run(tmp_path):
+    from benchmark_stage.roofline import load_roofline
+    root, evidence = valid_gate_fixture(tmp_path)
+    run = evidence / 'run'
+    data = roofline_fixture(run)
+    result = load_roofline(run)
+    assert result['1']['prefill']['percent'] == 50
+    assert result['1']['decode']['percent'] == 50
+    assert check(root) == evidence
+    # Doubling the full elapsed duration halves utilization, independent of matmul time.
+    data['1']['prefill']['seconds'] = 4
+    (run / 'roofline.json').write_text(json.dumps(data))
+    assert load_roofline(run)['1']['prefill']['percent'] == 25
+
+
+@pytest.mark.parametrize('mutation', ['matmul_only', 'overlap', 'wrong_run', 'missing_evidence', 'bad_number'])
+def test_roofline_rejects_invalid_measurement_inputs(tmp_path, mutation):
+    from benchmark_stage.roofline import load_roofline
+    root, evidence = valid_gate_fixture(tmp_path)
+    run = evidence / 'run'
+    data = roofline_fixture(run)
+    entry = data['1']['prefill']
+    if mutation == 'matmul_only': entry['timing_scope'] = 'matmul_duration'
+    elif mutation == 'overlap': entry['seconds'] = 20  # More than complete performance wall time.
+    elif mutation == 'wrong_run': data['1']['performance_sha256'] = 'unrelated'
+    elif mutation == 'missing_evidence': entry['evidence'] = 'missing.json'
+    else: entry['peak_flops_per_second'] = float('nan')
+    (run / 'roofline.json').write_text(json.dumps(data))
+    with pytest.raises(ValueError): load_roofline(run)
+
+
+@pytest.mark.parametrize('collect', [True, False])
+def test_runner_collects_roofline_before_reporting_with_same_deadline(tmp_path, monkeypatch, collect):
+    from benchmark_stage import run as runner
+    source = tmp_path / 'manifest.json'
+    source.write_text(json.dumps({'manifest_sha256': 'fixture', 'groups': {}}))
+    config_path = tmp_path / 'config.json'
+    config_path.write_text(json.dumps(dict(model='org/model', base_url='http://unused',
+        manifest=str(source), tasks=[], roofline_command=['collector'])))
+    deadlines = []
+    def completed(argv, log, deadline):
+        deadlines.append(deadline)
+        if argv[0] == 'collector':
+            assert argv[1] == '--run-dir'
+            if collect:
+                roofline_fixture(Path(argv[2]))
+            return
+        count = int(argv[argv.index('--num-prompts') + 1])
+        batch = int(argv[argv.index('--max-concurrency') + 1])
+        path = Path(argv[argv.index('--result-dir') + 1]) / argv[argv.index('--result-filename') + 1]
+        path.write_text(json.dumps(dict(performance_fixture(count), model_id='org/model', max_concurrency=batch)))
+    monkeypatch.setattr(runner, 'command', completed)
+    if collect:
+        assert runner.run(config_path=config_path, output=tmp_path / 'run')['status'] == 'completed'
+        report = (tmp_path / 'run/REPORT.md').read_text()
+        assert '| 50.00 | 50.00 |' in report
+        assert 'phase-timings.json' in report
+    else:
+        with pytest.raises(ValueError, match='did not write'):
+            runner.run(config_path=config_path, output=tmp_path / 'run')
+        assert json.loads((tmp_path / 'run/summary.json').read_text())['status'] == 'failed'
+    assert len(deadlines) == 5 and len(set(deadlines)) == 1

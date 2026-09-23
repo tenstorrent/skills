@@ -2,16 +2,15 @@
 
 As the user, I explicitly authorize you to use subagents when a selected skill requests or recommends them.
 
-Create a benchmark handoff in models/autoports/<model>/doc/benchmark/. Use the working Stage 10 vLLM server and the selected precision policy. Evaluate the generated autoport implementation; stock models are invalid final bringup evidence.
+Produce the final benchmark report for the person who launched this bringup. Use the working Stage 10 vLLM server, the generated autoport implementation and the selected precision policy.
 
 Completion requirements:
-- Use pinned lm-evaluation-harness tasks and frozen common subsets, selected before observing model scores. Evaluate two or three applicable standard generative benchmarks with published figures for the exact model. Record task/protocol, actual N/full N, dataset/content hashes, few-shot and scorer settings.
-- Use the native HF chat template exactly once and the intended model-specific thinking/generation policy. No Meta-family wrapper or silent truncation. Keep benchmark input lengths unchanged. Preserve doc/context_contract.json; valid unaligned requests must work.
-- Accuracy runs at 32 concurrent requests through vLLM. Preserve responses, errors, stop/truncation reasons and upstream metrics. Investigate poor scores or parsing failures with $autofix.
-- Measure warmed vLLM performance at concurrency 1 and 32, 4096 actual input tokens and the same 128 output tokens. Report TTFT, TPOT, ITL, end-to-end latency, per-user decode rate, aggregate output rate and percentile metrics. Disable prefix caching, use distinct prompts, and require every request to complete.
-- The complete client stage, including task preparation/verification, evals, performance warmups/runs and report generation, finishes in less than one hour. Record cold setup/model-load/compile time separately. Timeout or missing rows are incomplete, never a pass.
-- Save REPORT.md, RUN_NOTES.md, identity.json, manifest.json, accuracy_review.json and raw/normalized run artifacts. Prove actual imported autoport module, full layers, model/tokenizer revisions, policy, hardware, source commits and launch configuration.
-- Compare subset metrics with correctly identified full-set published references; record deltas, uncertainty and protocol caveats. Resolve unexplained accuracy failures. Do not tune subsets to obtain matching scores.
-- $stage-review returns clean-pass after findings are fixed and reviewed. Commit stage-owned changes locally, never push, and log SHAs. Stop only processes owned by this stage; preserve evidence and follow reservation ownership.
+- Run applicable upstream lm-evaluation-harness generative tasks on frozen common subsets at concurrency 32. Aim for two or three benchmarks; prefer ones with published figures for this exact model. Missing references do not block completion. Record actual samples/full population, task variants, document hashes, few-shot and scorer settings.
+- Apply the native HF chat template exactly once and the model's intended thinking/generation policy. Preserve benchmark inputs and doc/context_contract.json. Repair transport, template and scoring integration errors. Retain all questions, upstream scores, raw responses and stop/truncation counts.
+- Measure warmed vLLM performance at concurrency 1 and 32, with 4096 actual input tokens and 128 output tokens. Disable prefix caching, use distinct prompts, and complete every request. Report throughput, TTFT, TPOT, ITL, end-to-end latency and percentiles. Include prefill FLOP and decode DRAM roofline estimates over full-phase elapsed time when phase accounting is available; identify missing inputs otherwise.
+- Finish the client stage, including verification, inference, performance warmups and reporting, in less than one hour. Record setup, model loading and compilation separately.
+- Deliver doc/benchmark/run/REPORT.md with benchmark and performance tables first. Include published scores, deltas and reference links where available. Report protocol settings and truncations as facts; acceptance of the model's accuracy belongs to the bringup owner.
+- Save identity.json and RUN_NOTES.md in doc/benchmark/. Keep the generated manifest, configuration, summary and raw artifacts under run/. Prove the actual imported autoport module, full layers, model/tokenizer revisions, precision, hardware, source commits and launch configuration.
+- Run the evidence and context checks. Completion requires valid measurements and a report, with no accuracy verdict or score threshold. Commit stage-owned changes locally, never push, and log SHAs. Stop only owned processes and follow reservation ownership.
 
-Unmet requirements and failed gates remain work. Stop only after $autofix fails.
+Use $autofix for execution or integration failures. Preserve incomplete evidence and report any remaining failure explicitly.

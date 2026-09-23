@@ -1,6 +1,8 @@
 # Benchmark stage run contract
 
-Client dependencies are separate from the TT server environment. Install explicitly into a client venv:
+## Client setup
+
+Use a client environment separate from the working TT server:
 
 ```bash
 uv pip install --python "$EVAL_PYTHON" 'lm-eval[api,ifeval]==0.4.13' 'transformers<5'
@@ -8,18 +10,44 @@ uv pip install --python "$EVAL_PYTHON" 'lm-eval[api,ifeval]==0.4.13' 'transforme
 export PYTHONPATH="$TT_MODEL_BRINGUP_ROOT/runtime${PYTHONPATH:+:$PYTHONPATH}"
 ```
 
-Dataset access uses the operator's existing Hugging Face credentials. Keep credentials out of copied commands and results. Dataset downloads and client provisioning are setup, performed before the stage; dataset verification within the runner counts toward stage time.
+Use the operator's existing Hugging Face credentials for datasets. Downloads and
+client provisioning happen before the timed stage. Dataset verification is timed.
+Check `benchmark_stage.__file__` from the launch directory: it must resolve inside
+this plugin's `runtime/benchmark_stage`, since the working directory can shadow
+`PYTHONPATH`.
 
-Before launching, print `benchmark_stage.__file__` with the selected client Python
-from the actual launch directory and verify that it is inside this plugin's
-`runtime/benchmark_stage`. Python's working directory can shadow `PYTHONPATH` with
-an older copied package; do not assume exporting the path selects the intended code.
+For performance, select a working upstream **vLLM 0.26** client with
+`vllm bench serve --help`. Set `vllm_cli` to its executable. An older TT server can
+stay running while a separate client sends requests. If no compatible client is
+installed, use a dedicated venv and the [vLLM installation instructions](https://docs.vllm.ai/en/v0.26.0/getting_started/installation/gpu/).
+For a host without GPU build tools, the documented `VLLM_TARGET_DEVICE=empty`
+source installation skips accelerator binaries; this client sends HTTP requests
+and does not run the model. Pin the source to `v0.26.0` and verify the benchmark
+CLI starts before running accuracy. The runner uses `--random-range-ratio 0` and
+validates each server-reported input/output token count.
 
-The CI profile contains 280 MMLU-Pro questions (proportional subject allocation), 256 GSM8K-CoT questions and 256 IFEval prompts. It is calibrated on non-reasoning dense models; retain the calibration report's score and protocol limitations. For Gemma 4 QB2, use the reasoning profile described below. GPQA Diamond can replace GSM8K when that is the model's published evaluation. Calibration coverage is limited to dense text models.
+## Select questions and protocol
 
-For `gpqa_diamond_cot_zeroshot`, the client preserves the upstream prompt and scorer but makes answer-choice shuffling deterministic with a private seed-0 RNG and recomputes that transform. Upstream 0.4.13 uses a global RNG whose state is absent from the dataset transform cache key. The manifest records this processing policy and evaluation rejects a different policy. Freeze a new GPQA manifest with this client; do not reuse a manifest prepared with the upstream cache-dependent shuffle.
+Choose tasks for the model's intended use and prefer published references for its
+exact checkpoint. Missing reference figures are allowed. The packaged manifests
+under `runtime/benchmark_stage/profiles/` contain:
 
-Freeze once, before observing scores:
+| Manifest | Available tasks and sample counts |
+|---|---|
+| `ci-v1.json` | MMLU-Pro 280; GSM8K-CoT 256; IFEval 256 |
+| `ci-v1-meta.json` | Same questions, with Meta-specific MMLU-Pro/GSM8K recipes |
+| `ci-v1-reasoning.json` | MMLU-Pro 280; GPQA Diamond 128; IFEval 256 |
+| `ci-v1-reasoning-full.json` | MMLU-Pro 280; all 198 GPQA Diamond questions; IFEval 256 |
+
+Select only the tasks to run in the configuration. Profile names describe the
+available tasks, not generation settings for a model family. Determine chat
+formatting, thinking mode, sampling and output budgets from the exact model's
+published protocol or intended use. Runtime depends on model speed and generated
+length. The full GPQA profile is available for larger evaluations; it is not
+necessary for the one-hour stage.
+
+Reuse the same documents on each model. For a new benchmark, freeze a manifest
+before observing scores:
 
 ```bash
 "$EVAL_PYTHON" -m benchmark_stage prepare \
@@ -27,51 +55,30 @@ Freeze once, before observing scores:
   --output "$BENCHMARK_ROOT/subset"
 ```
 
-For these tasks, prefer the packaged `runtime/benchmark_stage/profiles/ci-v1.json`
-manifest. Its `reused_manifest_sha256` identifies the source calibration manifest;
-document and few-shot hashes verify the selected content. Use `prepare` to create
-a profile for a different task selection. A benchmark name alone is
-not an exact recipe: for example, upstream `gsm8k_cot_llama` documents Meta's
-published prompt, while `gsm8k_cot` is the generic recipe. Choose the publisher's
-supported recipe for that model; do not apply a Llama-specific recipe to other
-families by default. It stores task-local indices,
-content hashes, few-shot hashes and full-population hashes. When expanding a profile,
-verify every prior per-task index remains selected; subject apportionment may round
-differently at a new total. Use the resulting manifest unchanged on each model. Dataset revision drift fails closed. Archive the manifest with the release evidence; do not recompute indices for an already published profile.
-
-To select an upstream recipe variant without changing the questions, use
-`prepare --reuse-manifest`. It requires identical evaluation-document populations
-and sample counts, carries the source manifest hash, and freezes the new recipe's
-few-shot examples independently:
+To choose another upstream recipe over the same documents, preserve question IDs
+and counts with `--reuse-manifest`. This example selects Meta-specific recipes;
+use them only when appropriate to the model's protocol:
 
 ```bash
 "$EVAL_PYTHON" -m benchmark_stage prepare \
   --tasks mmlu_pro_llama,gsm8k_cot_llama,ifeval --counts 280,256,256 \
-  --reuse-manifest "$BENCHMARK_ROOT/subset/manifest.json" \
+  --reuse-manifest "$TT_MODEL_BRINGUP_ROOT/runtime/benchmark_stage/profiles/ci-v1.json" \
   --output "$BENCHMARK_ROOT/subset-meta"
 ```
 
-Use the new manifest and exact variant task name in the run configuration. Native
-chat serialization remains the checkpoint's own template. This option does not
-claim that every other part of the publisher's protocol matches. If the publisher
-provides per-question evaluation records, compare their full-set and selected-set
-scores directly as an additional subset-difficulty check; never use those records
-to choose better-matching questions.
+The manifest freezes document populations, selected content and few-shot examples.
+Changed dataset content fails verification. Archive the manifest used by the run.
+Do not change questions to obtain closer agreement with published figures.
 
-The packaged `profiles/ci-v1-meta.json` contains the same questions with the
-Meta-aligned recipes already frozen. For Llama 3.1/3.2 calibration, use
-`mmlu_pro_llama`, `gsm8k_cot_llama`, and `ifeval`, with respective generation caps
-1024, 1024, and 3840 at temperature zero, as recorded in Meta's official evaluation
-records. Select `subject_macro:exact_match,strict_match` for Meta MMLU-Pro,
-`exact_match,strict-match` as the predeclared primary GSM metric, and
-`ifeval_mean_four`. Preserve flexible GSM extraction as a secondary result. Neither
-GSM filter exactly reproduces Meta's numeric normalization; compare against saved
-official outputs rescored with the same filter when available.
+For `gpqa_diamond_cot_zeroshot`, the client preserves upstream prompts and scoring
+and makes choice shuffling deterministic with a private seed-0 RNG. It recomputes
+the transform because upstream 0.4.13 caches a shuffle whose RNG state is absent
+from the cache key. Use the packaged GPQA manifest or prepare one with this client.
 
-The generic example below is a different protocol. Do not use its results as
-publisher-equivalent just because the task names refer to the same benchmarks.
+## Run configuration
 
-Create a run configuration JSON with the following fields:
+This model-neutral example uses greedy, non-thinking generation. Set the budgets
+and sampling options for the model you are benchmarking:
 
 ```json
 {
@@ -79,7 +86,7 @@ Create a run configuration JSON with the following fields:
   "base_url": "http://127.0.0.1:8000",
   "manifest": "/operator-selected/subset/manifest.json",
   "tasks": ["mmlu_pro", "gsm8k_cot", "ifeval"],
-  "vllm_cli": "/operator-selected/serve-env/bin/vllm",
+  "vllm_cli": "/operator-selected/client-env/bin/vllm",
   "budget_seconds": 3600,
   "output_tokens": 128,
   "generation": {
@@ -90,7 +97,41 @@ Create a run configuration JSON with the following fields:
 }
 ```
 
-Then run:
+The `generation` overrides also accept upstream options such as
+`chat_template_kwargs`. Check textual stop strings for reasoning models: a
+benchmark's `Question:` stop can occur within reasoning. If it cuts off native
+reasoning, explicitly use `until: []` and retain the declared token cap and EOS.
+Record the setting as a protocol difference. The API must expose final-answer
+content separately from reasoning.
+
+Optionally add `metrics` to select headline upstream metric keys and `references`
+to attach published figures. Scores are percentages. This schema example uses an
+illustrative score and URL; replace them with the exact model's source:
+
+```json
+{
+  "metrics": {"gsm8k_cot": ["exact_match,strict-match"]},
+  "references": {
+    "gsm8k_cot": {
+      "exact_match,strict-match": {
+        "score": 75.0,
+        "source_url": "https://example.org/model-card",
+        "protocol_notes": "Describe any known difference in prompt, scoring or generation settings."
+      }
+    }
+  }
+}
+```
+
+With no explicit `metrics`, the report uses reference metric keys when present,
+or all upstream score keys otherwise. Raw results always retain all metrics.
+`subject_macro:<metric>` computes the unweighted mean of the frozen child tasks;
+`ifeval_mean_four` computes the mean of IFEval's four accuracy metrics. Select
+these only when they match the reference aggregation. Unknown metrics, invalid
+scores or references without source URLs are errors; an absent reference is not.
+The report calculates score differences directly. No accuracy verdict is required.
+
+Run into a new directory:
 
 ```bash
 "$EVAL_PYTHON" -m benchmark_stage run \
@@ -98,118 +139,111 @@ Then run:
   --output "$MODEL_DIR/doc/benchmark/run"
 ```
 
-The output directory must be new. Each task runs in a child process with concurrency 32. Existing response caches are not used. The HTTP timeout allows an individual long reasoning answer up to one hour; the parent runner still terminates the whole stage at its remaining wall-clock budget. Accuracy budgets come from the upstream task, with a 2048-token backend default where upstream omits one; override explicitly when the model's intended evaluation needs a larger budget. `generation` forwards upstream-supported options including `chat_template_kwargs`. Record all overrides and compare them with the reference protocol. For reasoning models, inspect upstream textual stop strings before the full run: MMLU-Pro's `Question:` can occur inside native reasoning. When it stops reasoning before a final answer, record an explicit `until: []` override to rely on native EOS and the declared token cap; preserve the failed attempt and rerun all frozen questions. Verify the API returns the final answer separately from reasoning.
+The runner freezes a copy of the configuration and manifest. Accuracy uses fresh
+requests at concurrency 32. A watchdog terminates owned client subprocesses when
+the one-hour budget expires and writes a failed summary. Preserve that evidence;
+use a new output directory for a rerun. The server remains owned by the caller.
 
-Use the upstream vLLM 0.26 performance client (the calibration uses its empty
-build with vllm-tt-plugin). This is a client requirement; do not replace a working
-Stage 10 server simply to obtain the benchmark CLI. Older fork clients do not consume server prompt-token
-usage, and random-range-ratio semantics changed. The runner uses ratio 0 for fixed
-lengths and checks each returned input/output token count.
+Set `accuracy_execution` to `shared` when every task has the same complete
+`generation` dictionary. One request pool avoids separate long tails per task.
+Include `do_sample`, `until`, output budget and native thinking settings explicitly;
+the client also checks effective upstream defaults. Do not change the intended
+protocol to make tasks share a pool. Shared mode retains separate task scores and
+request links; its per-task wall times refer to the same interval.
 
-The watchdog covers client subprocesses and writes a failed summary if any command fails or the deadline expires. Performance uses the explicitly selected vLLM client CLI; it may be in a separate
-client environment when the working server uses an older fork. Check its supported
-flags and server usage-token reporting before expensive accuracy runs. The server remains owned by the caller. For a larger generation budget or another profile, change the configuration and rerun into a new directory; never edit a completed result to pretend the original run passed.
+A reasoning response that exhausts its token budget without a final answer is
+scored as empty and stays in the denominator. Raw reasoning is retained but never
+graded as the final answer. Truncation and empty-final counts appear in the report.
+Malformed responses or empty answers with a normal stop fail the run. Preserve
+upstream extraction results, including apparent scorer mistakes; document a
+protocol limitation without hand-correcting scores.
 
-Evidence alongside `run/`:
+## Full-phase roofline accounting
 
-- `manifest.json`: identical to the manifest used for evaluation.
-- `identity.json`: model ID, actual implementation path and imported generator, model/tokenizer revisions, precision policy, full-layer count, server configuration/command, source commits, device topology and prefix-cache setting.
-- `REPORT.md`: per-task samples/full size, upstream metric names, subset/full reference scores, deltas, uncertainty, protocol comparability and observed failures; performance rows and elapsed time.
-- `RUN_NOTES.md`: environment, exact commands, setup versus timed-stage wall times, recovery and artifact locations.
-- `accuracy_review.json`: verdict (`pass` or `fail`) plus one assessment per task with exact reference metric, source, score, subset score, observed delta and explanation. A successful harness process alone is not an accuracy pass.
+The performance table includes estimated prefill FLOP utilization and decode DRAM
+bandwidth utilization. For each phase:
 
-References: [lm-evaluation-harness v0.4.13](https://github.com/EleutherAI/lm-evaluation-harness/tree/v0.4.13), [vLLM benchmark CLI](https://docs.vllm.ai/en/latest/benchmarking/cli/). The serving API's native chat template and model-specific generation protocol take precedence over a generic family preset.
+`percent = 100 × modeled work / (elapsed phase seconds × hardware peak rate)`
 
-Identity field names checked by the gate: `model`, `implementation`, `generator_module`,
-`model_revision`, `tokenizer_revision`, `precision`, `layer_count`,
-`configured_layer_count`, `source_commits`, `hardware`, `server_command`,
-`prefix_caching`. Both layer counts must match. Preserve the imported file and
-server log alongside this record. For each accuracy review, `reference_metric`
-is the exact upstream metric key; `subject_macro:<metric>` computes an unweighted mean of the explicitly listed child-task scores, needed for Meta MMLU-Pro even though the upstream group itself micro-averages; `ifeval_mean_four` selects Meta’s published
-mean of the four IFEval metrics. Scores and deltas are percentage points. Any
-length-limited response requires an explicit `truncation_assessment` or a rerun.
+Use useful prefill FLOPs for the actual prompts and a dtype/fidelity-appropriate
+peak FLOP/s over all participating chips. Count decode DRAM bytes for weights at
+their stored dtypes, KV reads/writes and other material traffic across the actual
+steps. Account for tensor/data parallelism, replication, batch sharing and active
+MoE experts. Cite the accounting method and hardware peak source.
 
+Time the entire warmed phase at the host boundary, including dispatch, all ops,
+communication, sampling/readback and intervening host gaps. For chunked prefill,
+include every chunk. Sum non-overlapping phase intervals on one common timeline;
+never sum overlapping request latencies or per-device times. Work and elapsed
+time must cover the same requests/steps on the same chips. A matmul-only duration
+is not a valid denominator. If prefill/decode overlap cannot be separated, record
+the missing phase accounting rather than infer it from HTTP concurrency.
 
-A valid reasoning response that reaches its token limit without a final answer
-remains in the scored denominator as an empty answer. The client preserves the
-raw response, never grades hidden reasoning, and records
-`empty_final_length_responses`. The evidence gate reconciles that count and
-requires the same explicit truncation assessment as other length-limited outputs.
-Empty answers with a normal stop or malformed API responses still fail the run.
+The serving client does not supply these server timings or model byte counts.
+Use the implementation's timing logs or add lightweight host timing, following
+the serving skill's profiler restrictions. An optional `roofline_command` array
+in the run configuration invokes an implementation-specific collector after the
+performance runs, with `--run-dir <output>` appended. It runs within the stage
+budget and writes `roofline.json` and its supporting artifacts in that directory.
+For example: `["/client/bin/python", "/model/tools/collect_roofline.py"]`.
 
-For long reasoning runs, set `accuracy_execution` to `shared` when all selected
-tasks use identical generation overrides. The client makes one upstream
-`simple_evaluate` call with one pool of 32 requests, so a long answer in one task
-does not leave the other tasks waiting with idle serving slots. Keep separate
-scores, sample IDs and raw responses for every task. Shared accuracy durations
-refer to the same wall-clock interval and must not be added together.
+The collector output maps concurrency (`"1"`, `"32"`) to entries with:
 
-Provide the same complete `generation` dictionary for each selected task,
-including `do_sample`, `until`, token budget and native thinking settings. The
-client checks the effective upstream generation dictionaries before sending any
-request; different settings require the default `sequential` mode. Upstream's API
-backend discards `do_sample` and uses `temperature` for sampling, but the explicit
-flag prevents different task defaults from splitting its request pool. Do not
-change a publisher's generation protocol merely to make tasks share a pool.
+- `performance_sha256`: SHA-256 of the corresponding `perf-b1.json` or `perf-b32.json` file bytes, binding accounting to this run.
+- `prefill`: `flops`, `seconds`, `peak_flops_per_second`.
+- `decode`: `dram_bytes`, `seconds`, `peak_dram_bytes_per_second`.
 
-Shared mode requires unique requests with one generation per question. It writes
-`request_links.jsonl` beside each raw transcript. The gate reconciles each link's
-request hash, dataset ID, response ID and scored final answer. Duplicate or
-ambiguous requests fail before inference. A deadline still fails the complete
-stage; partial raw transcripts are diagnostic evidence only.
+Each phase also records `timing_scope: "full_phase_wall_time"`, `timing_method`,
+`work_method`, `peak_source` and `evidence` (a relative path to a retained timing
+and accounting artifact). Rates use FLOP/s or bytes/s, not TFLOP/s or GB/s. The
+report computes percentages and links the inputs. Omit an unavailable phase;
+missing accounting is shown as — and does not block the benchmark report. Record
+why it is unavailable in `RUN_NOTES.md`. A collector that fails or writes invalid
+accounting fails the run, rather than publishing a misleading percentage.
 
+## Report and retained evidence
 
-## Gemma 4 QB2 reasoning profile
+```text
+doc/benchmark/
+  identity.json                 authored from the running server
+  RUN_NOTES.md                  commands, setup time, protocol details and limitations
+  run/
+    REPORT.md                   generated final report: scores, references and performance
+    run_config.json             frozen configuration
+    manifest.json               frozen subset, with full populations and content hashes
+    summary.json                execution status, timing and normalized results
+    <task>/                     upstream results, scored samples and raw responses
+    perf-b{1,32}*.json           raw performance measurements and warmups
+    roofline.json               optional server phase accounting and source artifacts
+```
 
-`profiles/ci-v1-reasoning.json` preserves the same 280 MMLU-Pro and 256 IFEval
-questions and selects 128 of 198 GPQA Diamond questions. Its manifest hash is
-`7bdb5c3910b530169dfeaabe56882de103dd8d8dfc842ef0a7ebd026eecdcdba`.
-The companion `profiles/ci-v1-reasoning-full.json` contains all 198 GPQA questions,
-with hash `83203b75b253a2dff70c9bac96c257fe784981a714c767b61f15fdefb707598b`.
-Both preserve the same full-population identity and choice ordering.
+No report or manifest copying is needed. The checker reads the generated report
+and manifest under `run/`. It verifies workload identity, complete responses,
+scored documents, token counts, timing and reference metric validity. It does not
+judge the model's accuracy.
 
-The calibrated Gemma configuration selects `mmlu_pro` and
-`gpqa_diamond_cot_zeroshot`, with `accuracy_execution: "shared"`. The 128-question
-profile completed in 51m02s, including both performance rows, and scored 86.79%
-MMLU-Pro and 84.38% GPQA Diamond. The full-198 profile exceeded the one-hour budget
-during performance warmup. IFEval is available for a separate diagnostic; Google's
-reported figure does not identify which of its four aggregations was used.
-
-The 128-question subset uses a deterministic hash order frozen before score
-inspection. Its score was 2.56 and 3.94 percentage points above full-set GPQA
-scores in two TT controls. Account for this observed subset bias when comparing
-with published full-set figures. These controls use TT outputs, not independent
-HF inference. Do not search for a seed that makes the scores agree.
-
-Use the following identical generation dictionary for both selected tasks when
-reproducing this calibration:
+`identity.json` uses these fields (replace illustrative values with observed ones):
 
 ```json
 {
-  "max_gen_toks": 32768,
-  "temperature": 1,
-  "top_p": 0.95,
-  "top_k": 20,
-  "chat_template_kwargs": {"enable_thinking": true},
-  "until": [],
-  "do_sample": true
+  "model": "organization/model",
+  "implementation": "models/autoports/model",
+  "generator_module": "models.autoports.model.generator",
+  "model_revision": "checkpoint-commit",
+  "tokenizer_revision": "tokenizer-commit",
+  "precision": "the server's selected precision policy",
+  "layer_count": 32,
+  "configured_layer_count": 32,
+  "source_commits": {"tt-metal": "commit", "vllm": "commit"},
+  "hardware": "observed chip topology",
+  "server_command": ["the", "actual", "launch", "command"],
+  "prefix_caching": false
 }
 ```
 
-This uses the Gemma PR's device-supported sampler. Top-k 20 differs from Google's
-general top-k 64 recommendation; it is a recorded calibration protocol, not a
-universal default or an exact reproduction of the published recipe. Preserve
-native reasoning/final-answer separation. Compare `exact_match,custom-extract`
-for pooled MMLU-Pro with 85.2%, and `exact_match,flexible-extract` for GPQA Diamond
-with 84.3%, from the [Gemma 4 model card](https://ai.google.dev/gemma/docs/core/model_card_4).
-The final measured runtime, scores and limitations belong in the calibration
-report; the existence of a frozen profile alone does not establish a passing run.
+Both layer counts must match. Keep the imported module's file path and server log
+with the identity evidence. The standalone skill also supports stock models;
+the final bringup checker requires the target autoport implementation.
 
-
-The upstream GPQA flexible extractor selects the last parenthesized uppercase
-letter, including letters beyond the four answer choices. Raw calibration review
-found rejected options and chemical stereochemistry markers selected instead of
-an explicit answer. Preserve upstream scores, and report such discrepancies
-separately. Do not hand-correct the headline or change the prompt/extractor after
-observing answers. The task's separate strict extractor requires a phrase that
-its prompt does not request; it is not the metric used for this comparison.
+References: [lm-evaluation-harness v0.4.13](https://github.com/EleutherAI/lm-evaluation-harness/tree/v0.4.13),
+[vLLM benchmark CLI](https://docs.vllm.ai/en/v0.26.0/benchmarking/cli/).
