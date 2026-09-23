@@ -7,7 +7,7 @@ description: Report a text model's accuracy on fixed lm-eval subsets and 4K-inpu
 
 Follow [model-bringup startup](../model-bringup/SKILL.md#startup). Produce an end-of-bringup report with benchmark scores, published references where available, and serving performance. The person who launched the bringup judges whether the results are good enough.
 
-Use upstream EleutherAI lm-evaluation-harness for accuracy and `vllm bench serve` for performance. Attach to the working Stage 10 server with its selected precision policy. The complete client stage must finish in **less than one hour**, including dataset verification, accuracy requests, server configuration changes, performance warmups/runs, phase-accounting collection, scoring and reporting. Record initial installation, downloads, model loading and trace compilation separately.
+Use upstream EleutherAI lm-evaluation-harness for accuracy and `vllm bench serve` for performance. Attach to the working Stage 10 server with its selected precision policy. The complete client stage must finish in **less than one hour**. Its clock starts when `benchmark_stage run` is invoked, before the first server-selection hook, and includes verification, inference, every server launch or reload it performs, compilation, warmups, phase collection, scoring and reporting. Record setup completed before invocation separately, including installation, downloads and the already-running server's startup.
 
 ## Select and run benchmarks
 

@@ -206,10 +206,18 @@ with the bringup identity, including precision, hardware and context capacity.
 It also checks the configuration evidence hashes. Report columns show both
 concurrent requests and server slots.
 
-Initial environment setup, model loading and trace compilation precede the stage.
-All profile switching, reloads, compilation and warmups after the timer starts
-count toward the one-hour limit. A one-server calibration does not establish the
-runtime of a complete two-profile stage.
+The clock starts on entry to `benchmark_stage run`, before the first
+server-selection hook, and runs through report generation. The stage attaches
+to the ready server from optimized-vLLM; record its earlier startup and environment
+setup separately. For a standalone benchmark, prepare the environment and initial
+server before invoking the runner and record that setup time separately.
+
+Every launch, reload, compilation and warmup performed by the runner counts toward
+the one-hour limit, including a launch needed by the first 32-slot selection. For
+example, if the supplied server has one slot, the initial switch to 32 slots and
+the later switch back to one slot both count. The timer never pauses for server
+selection, collection or reporting. Report the starting server configuration so
+the measured stage runtime can be interpreted.
 
 ## Full-phase roofline accounting
 
