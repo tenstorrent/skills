@@ -13,6 +13,9 @@ or replace acceptance criteria with a review plugin's criteria.
 
 1. Resolve this plugin root from this file: two directories above its skill directory. Set
    `TT_MODEL_BRINGUP_ROOT` to that absolute path. Keep the installed package read-only.
+   If the host's enabled skill inventory includes an optional model-bringup telemetry
+   integration, read that skill and follow its launch setup alongside this workflow.
+   Select only an enabled installation; do not install or search cached copies automatically.
 2. Verify `tt-autodebug` is installed **and enabled** in the current host using its plugin inventory.
    This dependency is declared in [dependencies.json](../../dependencies.json). If missing, stop
    and give the appropriate explicit install instruction:
@@ -111,6 +114,15 @@ To resume a stopped stage, use the same prompt selection/replacements, Codex hom
 `--log-dir`, adding `--resume-stage N`. Keep the original `--start-index` for that prompt selection;
 use `--start-index N` only when the supplied first prompt itself is stage N. Resume reuses the
 recorded thread and appends attempt logs. Do not restart earlier completed stages unnecessarily.
+
+### Optional telemetry integration
+
+The runner accepts `--telemetry-plugin PATH` or `TT_BRINGUP_TELEMETRY_ROOT` for an
+explicitly selected, enabled telemetry plugin. Without either, no telemetry extension
+is loaded. An installed integration can add stage evidence instructions, local reports
+and delivery to its own endpoint. Follow that plugin's skill for its launcher and options.
+Extension failures are advisory and never change model goals or checker outcomes.
+The [hook API](../../telemetry-hooks.md) contains no endpoint or upload implementation.
 
 ## Evidence gates
 
