@@ -696,18 +696,21 @@ def next_resume_attempt(manifest_values: dict[str, str], index: int) -> int:
 
 
 def tracked_goal(function):
+    """Report the explicit attempt kind independently of log naming conventions."""
     @functools.wraps(function)
     def run(*positional, **keyword):
-        values = inspect.signature(function).bind(*positional, **keyword).arguments
+        bound = inspect.signature(function).bind(*positional, **keyword)
+        bound.apply_defaults()
+        values = bound.arguments
         telemetry = getattr(values["args"], "_telemetry", None)
         if telemetry is None:
             return function(*positional, **keyword)
-        kind = "resume" if "thread_id" in values else "remediation" if ".remediation-" in values["output_log"].name else "initial"
-        telemetry.safe("begin_attempt", values["output_log"], kind, values.get("thread_id"))
-        if "thread_id" not in values:
+        kind = values["attempt_kind"]
+        telemetry.safe_hook("begin_attempt", values["output_log"], kind, values.get("thread_id"))
+        if kind != "resume":
             callback = values.get("on_thread_started")
             def started(thread_id):
-                telemetry.safe("thread", thread_id)
+                telemetry.safe_hook("thread", thread_id)
                 if callback is not None:
                     callback(thread_id)
             values["on_thread_started"] = started
@@ -717,14 +720,14 @@ def tracked_goal(function):
             status = result[0]
             return result
         finally:
-            telemetry.safe("end_attempt", status)
+            telemetry.safe_hook("end_attempt", status)
     return run
 
 
 def telemetry_input(args, input_items):
     telemetry = getattr(args, "_telemetry", None)
     if telemetry is not None:
-        instruction = telemetry.safe("instructions")
+        instruction = telemetry.safe_hook("instructions")
         if instruction:
             input_items.append({"type": "text", "text": instruction})
 
@@ -737,6 +740,8 @@ def execute_goal(
     objective: str,
     output_log: pathlib.Path,
     on_thread_started: Callable[[str], None] | None = None,
+    *,
+    attempt_kind: str = "initial",
 ) -> tuple[str, str, str | None]:
     """Run one objective to a terminal goal status.
 
@@ -805,6 +810,8 @@ def execute_resumed_goal(
     thread_id: str,
     output_log: pathlib.Path,
     prompt_copy: pathlib.Path,
+    *,
+    attempt_kind: str = "resume",
 ) -> tuple[str, str | None]:
     """Resume an existing stage thread and run one continuation turn.
 
@@ -990,7 +997,7 @@ def append_status(log_dir: pathlib.Path, name: str, goal_status: str, check_stat
     with status.open("a", encoding="utf-8") as f:
         f.write(f"| {name} | {goal_status} | {check_status} |\n")
     if telemetry is not None:
-        telemetry.safe("stage_result", goal_status, check_status)
+        telemetry.safe_hook("stage_result", goal_status, check_status)
 
 
 def run_stage_checks(
@@ -1024,14 +1031,14 @@ def run_stage_checks(
         check_log = log_dir / f"{name}.check-{attempt + 1}.log"
         code = run_check_script(script, repo, extra_env, check_log)
         if getattr(args, "_telemetry", None) is not None:
-            args._telemetry.safe("check", code, False)
+            args._telemetry.safe_hook("check", code, False)
         append_manifest(manifest, [f"{manifest_key_prefix}_check_attempt_{attempt + 1}=exit{code}"])
         if code not in (CHECK_PASS, CHECK_ADVISORY, CHECK_CRITICAL):
             # Broken check or environment: retry once for transients.
             check_log = log_dir / f"{name}.check-{attempt + 1}-retry.log"
             code = run_check_script(script, repo, extra_env, check_log)
             if getattr(args, "_telemetry", None) is not None:
-                args._telemetry.safe("check", code, True)
+                args._telemetry.safe_hook("check", code, True)
             append_manifest(manifest, [f"{manifest_key_prefix}_check_attempt_{attempt + 1}_retry=exit{code}"])
         if code == CHECK_PASS:
             append_manifest(manifest, [f"{manifest_key_prefix}_check=pass"])
@@ -1057,6 +1064,7 @@ def run_stage_checks(
             repo,
             objective,
             remediation_log,
+            attempt_kind="remediation",
             on_thread_started=lambda tid: append_manifest(
                 manifest, [f"{manifest_key_prefix}_remediation_{attempt + 1}_thread_id={tid}"]
             ),
@@ -1335,8 +1343,8 @@ def main() -> int:
     run_status = "interrupted"
     try:
         if telemetry is not None:
-            telemetry.safe("start")
-            telemetry.safe("bootstrap")
+            telemetry.safe_hook("start")
+            telemetry.safe_hook("bootstrap")
         with AppServerClient(codex_bin, repo, env, stderr_log, args.config) as client:
             with (log_dir / "initialize.jsonl").open("w", encoding="utf-8") as init_log:
                 client.request(
@@ -1361,7 +1369,7 @@ def main() -> int:
                 if args.resume_stage is not None and index < args.resume_stage:
                     continue
                 if telemetry is not None:
-                    telemetry.safe("begin_stage", index)
+                    telemetry.safe_hook("begin_stage", index)
                 if args.resume_stage is not None and index == args.resume_stage:
                     code = run_resumed_stage(
                         client,
@@ -1386,7 +1394,7 @@ def main() -> int:
                         replacements,
                     )
                 if telemetry is not None:
-                    telemetry.safe("end_stage")
+                    telemetry.safe_hook("end_stage")
                 if code != 0:
                     run_status = "stopped"
                     return code
@@ -1394,9 +1402,9 @@ def main() -> int:
         run_status = "complete"
     finally:
         if telemetry is not None:
-            telemetry.safe("end_stage", "interrupted")
+            telemetry.safe_hook("end_stage", "interrupted")
             try:
-                telemetry.safe("finish", run_status)
+                telemetry.safe_hook("finish", run_status)
             finally:
                 telemetry.close()
 

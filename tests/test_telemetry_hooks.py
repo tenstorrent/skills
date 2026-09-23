@@ -29,7 +29,7 @@ def test_extension_loads_only_explicit_root_and_supports_relative_imports(tmp_pa
                   "def create(**context):\n"
                   "    assert context['hf_model'] == 'org/model'\n"
                   "    return Extension()\n")
-    assert hooks.load_telemetry(root, hf_model="org/model").safe("instructions") == "stage evidence"
+    assert hooks.load_telemetry(root, hf_model="org/model").safe_hook("instructions") == "stage evidence"
 
 
 @pytest.mark.parametrize("code", [
@@ -49,16 +49,21 @@ def test_failed_callbacks_and_wrong_instruction_type_are_advisory(capsys, error)
                 return {"not": "text"}
             raise error("callback failed")
     extension = hooks.GuardedTelemetry(Extension())
-    assert extension.safe("instructions") is None
-    assert extension.safe("end_stage") is None
+    assert extension.safe_hook("instructions") is None
+    assert extension.safe_hook("end_stage") is None
     extension.close()
     assert capsys.readouterr().err.count("bringup continues") == 3
 
 
-def test_entrypoint_cannot_escape_selected_plugin(tmp_path, capsys):
+@pytest.mark.parametrize("escape", ["parent", "symlink"])
+def test_entrypoint_cannot_escape_selected_plugin(tmp_path, capsys, escape):
     root = tmp_path / "plugin"
     root.mkdir()
     (tmp_path / "outside.py").write_text("raise AssertionError('must not execute')")
-    (root / "telemetry.json").write_text(json.dumps({"api_version": 1, "entrypoint": "../outside.py"}))
+    entrypoint = "../outside.py"
+    if escape == "symlink":
+        (root / "entry.py").symlink_to(tmp_path / "outside.py")
+        entrypoint = "entry.py"
+    (root / "telemetry.json").write_text(json.dumps({"api_version": 1, "entrypoint": entrypoint}))
     assert hooks.load_telemetry(root) is None
     assert "inside the plugin" in capsys.readouterr().err

@@ -121,7 +121,9 @@ The runner accepts `--telemetry-plugin PATH` or `TT_BRINGUP_TELEMETRY_ROOT` for 
 explicitly selected, enabled telemetry plugin. Without either, no telemetry extension
 is loaded. An installed integration can add stage evidence instructions, local reports
 and delivery to its own endpoint. Follow that plugin's skill for its launcher and options.
-Extension failures are advisory and never change model goals or checker outcomes.
+The runner reports ordinary extension exceptions and SystemExit as advisory errors.
+Plugins execute in the runner process with its permissions; use only trusted plugins.
+The loader does not enforce callback timeouts or isolate plugin code.
 The [hook API](../../telemetry-hooks.md) contains no endpoint or upload implementation.
 
 ## Evidence gates

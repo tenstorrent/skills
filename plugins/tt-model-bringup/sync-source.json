@@ -120,7 +120,7 @@
       "destination": "scripts/multigoal",
       "blob": "11ba52778be9b7d6e86483df6e77b270063c93fd",
       "source_sha256": "ef6e721f22958f5b99e22867370c20d4d9db8f87a16fce1cb7603693dcc1e4b8",
-      "packaged_sha256": "2115915e8bdce164a8f87e8e1d69f12c4e3bebef2bdef57ee1970cc81ce88e8f"
+      "packaged_sha256": "ef692f58bdcc034890e0e630b69e98f869c5204bae0a142478b9ccaf0db567f6"
     },
     {
       "source": ".agents/skills/datatype-sweep/SKILL.md",

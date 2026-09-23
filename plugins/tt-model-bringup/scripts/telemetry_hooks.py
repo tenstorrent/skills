@@ -11,12 +11,15 @@ API_VERSION = 1
 
 
 class GuardedTelemetry:
-    """An extension failure cannot change the model's goal or checker result."""
+    """Report ordinary hook exceptions and SystemExit without aborting the runner.
+
+    Hooks run in process; this wrapper is neither a sandbox nor a timeout.
+    """
 
     def __init__(self, extension):
         self.extension = extension
 
-    def safe(self, method, *args, **kwargs):
+    def safe_hook(self, method, *args, **kwargs):
         try:
             dispatch = getattr(self.extension, "safe", None)
             result = (dispatch(method, *args, **kwargs) if callable(dispatch)
@@ -29,15 +32,17 @@ class GuardedTelemetry:
             return None
 
     def close(self):
-        self.safe("close")
+        self.safe_hook("close")
 
 
 def load_telemetry(root: Path | None, **context):
-    """Load trusted local code only from the selected plugin; never scan caches.
+    """Execute the explicitly selected plugin; the caller must trust its code.
 
     telemetry.json declares {"api_version": 1, "entrypoint": "relative/file.py"}.
     The entrypoint exports create(**context). Its parent is treated as a Python
-    package, so relative imports remain contained in the selected installation.
+    package to support relative imports. Only the resolved entrypoint is checked
+    for containment; imports and callbacks execute unrestricted in this process.
+    This loader does not authenticate the plugin or verify that it is enabled.
     """
     if root is None:
         return None
@@ -49,6 +54,7 @@ def load_telemetry(root: Path | None, **context):
         entrypoint = (root / config["entrypoint"]).resolve()
         if not entrypoint.is_relative_to(root) or not entrypoint.is_file():
             raise ValueError("telemetry entrypoint must be a file inside the plugin")
+        # Namespace by installation path; this hash does not verify code integrity.
         name = "_multigoal_telemetry_" + hashlib.sha256(str(root).encode()).hexdigest()[:16]
         spec = importlib.util.spec_from_file_location(name, entrypoint,
                                                      submodule_search_locations=[str(entrypoint.parent)])
