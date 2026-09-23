@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-TT_MODEL_BRINGUP_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-# Runner-side gate for the TTI release stage: the customer-facing release report
+TT_MODEL_BRINGUP_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+# Standalone TTI release artifact check: the customer-facing release report
 # and run notes must be copied into the target model's doc/tti_release directory.
 # Exit 0 pass, 1 advisory, 2 critical, 3 error.
 set -uo pipefail

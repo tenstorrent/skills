@@ -1,0 +1,359 @@
+# Benchmark stage run contract
+
+## Client setup
+
+Use a client environment separate from the working TT server:
+
+```bash
+uv pip install --python "$EVAL_PYTHON" 'lm-eval[api,ifeval]==0.4.13' 'transformers<5'
+"$EVAL_PYTHON" -m nltk.downloader punkt_tab
+export PYTHONPATH="$TT_MODEL_BRINGUP_ROOT/runtime${PYTHONPATH:+:$PYTHONPATH}"
+```
+
+Use the operator's existing Hugging Face credentials for datasets. Downloads and
+client provisioning happen before the timed stage. Dataset verification is timed.
+Check `benchmark_stage.__file__` from the launch directory: it must resolve inside
+this plugin's `runtime/benchmark_stage`, since the working directory can shadow
+`PYTHONPATH`.
+
+For performance, select a working upstream **vLLM 0.26** client with
+`vllm bench serve --help`. Set `vllm_cli` to its executable. An older TT server can
+stay running while a separate client sends requests. If no compatible client is
+installed, use a dedicated venv and the [vLLM installation instructions](https://docs.vllm.ai/en/v0.26.0/getting_started/installation/gpu/).
+For a host without GPU build tools, the documented `VLLM_TARGET_DEVICE=empty`
+source installation skips accelerator binaries; this client sends HTTP requests
+and does not run the model. Pin the source to `v0.26.0` and verify the benchmark
+CLI starts before running accuracy. The runner uses `--random-range-ratio 0` and
+validates each server-reported input/output token count.
+
+## Select questions and protocol
+
+Choose tasks for the model's intended use and prefer published references for its
+exact checkpoint. Missing reference figures are allowed. The packaged manifests
+under `runtime/benchmark_stage/profiles/` contain:
+
+| Manifest | Available tasks and sample counts |
+|---|---|
+| `ci-v1.json` | MMLU-Pro 280; GSM8K-CoT 256; IFEval 256 |
+| `ci-v1-meta.json` | Same questions, with Meta-specific MMLU-Pro/GSM8K recipes |
+| `ci-v1-reasoning.json` | MMLU-Pro 280; GPQA Diamond 128; IFEval 256 |
+| `ci-v1-reasoning-full.json` | MMLU-Pro 280; all 198 GPQA Diamond questions; IFEval 256 |
+
+Select only the tasks to run in the configuration. Profile names describe the
+available tasks, not generation settings for a model family. Determine chat
+formatting, thinking mode, sampling and output budgets from the exact model's
+published protocol or intended use. Runtime depends on model speed and generated
+length. The full GPQA profile is available for larger evaluations; it is not
+necessary for the one-hour stage.
+
+Reuse the same documents on each model. For a new benchmark, freeze a manifest
+before observing scores:
+
+```bash
+"$EVAL_PYTHON" -m benchmark_stage prepare \
+  --tasks mmlu_pro,gsm8k_cot,ifeval --counts 280,256,256 \
+  --output "$BENCHMARK_ROOT/subset"
+```
+
+To choose another upstream recipe over the same documents, preserve question IDs
+and counts with `--reuse-manifest`. This example selects Meta-specific recipes;
+use them only when appropriate to the model's protocol:
+
+```bash
+"$EVAL_PYTHON" -m benchmark_stage prepare \
+  --tasks mmlu_pro_llama,gsm8k_cot_llama,ifeval --counts 280,256,256 \
+  --reuse-manifest "$TT_MODEL_BRINGUP_ROOT/runtime/benchmark_stage/profiles/ci-v1.json" \
+  --output "$BENCHMARK_ROOT/subset-meta"
+```
+
+The manifest freezes document populations, selected content and few-shot examples.
+Changed dataset content fails verification. Archive the manifest used by the run.
+Do not change questions to obtain closer agreement with published figures.
+
+For `gpqa_diamond_cot_zeroshot`, the client preserves upstream prompts and scoring
+and makes choice shuffling deterministic with a private seed-0 RNG. It recomputes
+the transform because upstream 0.4.13 caches a shuffle whose RNG state is absent
+from the cache key. Use the packaged GPQA manifest or prepare one with this client.
+
+## Run configuration
+
+This model-neutral example uses greedy, non-thinking generation. Set the budgets
+and sampling options for the model you are benchmarking:
+
+```json
+{
+  "model": "organization/model",
+  "base_url": "http://127.0.0.1:8000",
+  "manifest": "/operator-selected/subset/manifest.json",
+  "tasks": ["mmlu_pro", "gsm8k_cot", "ifeval"],
+  "vllm_cli": "/operator-selected/client-env/bin/vllm",
+  "budget_seconds": 3600,
+  "performance_server_command": ["/client/bin/python", "/model/tools/benchmark_server.py"],
+  "roofline_command": ["/client/bin/python", "/model/tools/collect_roofline.py"],
+  "output_tokens": 128,
+  "generation": {
+    "mmlu_pro": {"max_gen_toks": 4096, "temperature": 0},
+    "gsm8k_cot": {"max_gen_toks": 4096, "temperature": 0},
+    "ifeval": {"max_gen_toks": 4096, "temperature": 0}
+  }
+}
+```
+
+The `generation` overrides also accept upstream options such as
+`chat_template_kwargs`. Check textual stop strings for reasoning models: a
+benchmark's `Question:` stop can occur within reasoning. If it cuts off native
+reasoning, explicitly use `until: []` and retain the declared token cap and EOS.
+Record the setting as a protocol difference. The API must expose final-answer
+content separately from reasoning.
+
+Optionally add `metrics` to select headline upstream metric keys and `references`
+to attach published figures. Scores are percentages. This schema example uses an
+illustrative score and URL; replace them with the exact model's source:
+
+```json
+{
+  "metrics": {"gsm8k_cot": ["exact_match,strict-match"]},
+  "references": {
+    "gsm8k_cot": {
+      "exact_match,strict-match": {
+        "score": 75.0,
+        "source_url": "https://example.org/model-card",
+        "protocol_notes": "Describe any known difference in prompt, scoring or generation settings."
+      }
+    }
+  }
+}
+```
+
+With no explicit `metrics`, the report uses reference metric keys when present,
+or all upstream score keys otherwise. Raw results always retain all metrics.
+`subject_macro:<metric>` computes the unweighted mean of the frozen child tasks;
+`ifeval_mean_four` computes the mean of IFEval's four accuracy metrics. Select
+these only when they match the reference aggregation. Unknown metrics, invalid
+scores or references without source URLs are errors; an absent reference is not.
+The report calculates score differences directly. No accuracy verdict is required.
+
+Run into a new directory:
+
+```bash
+"$EVAL_PYTHON" -m benchmark_stage run \
+  --config "$BENCHMARK_ROOT/run_config.json" \
+  --output "$MODEL_DIR/doc/benchmark/run"
+```
+
+The runner freezes a copy of the configuration and manifest. Accuracy uses fresh
+requests at concurrency 32. A watchdog terminates owned client subprocesses when
+the one-hour budget expires and writes a failed summary. Preserve that evidence;
+use a new output directory for a rerun. The servers remain owned by the enclosing bringup; the control hook follows its cleanup policy.
+
+Set `accuracy_execution` to `shared` when every task has the same complete
+`generation` dictionary. One request pool avoids separate long tails per task.
+Include `do_sample`, `until`, output budget and native thinking settings explicitly;
+the client also checks effective upstream defaults. Do not change the intended
+protocol to make tasks share a pool. Shared mode retains separate task scores and
+request links; its per-task wall times refer to the same interval.
+
+A reasoning response that exhausts its token budget without a final answer is
+scored as empty and stays in the denominator. Raw reasoning is retained but never
+graded as the final answer. Truncation and empty-final counts appear in the report.
+Malformed responses or empty answers with a normal stop fail the run. Preserve
+upstream extraction results, including apparent scorer mistakes; document a
+protocol limitation without hand-correcting scores.
+
+## Single-user and 32-user server profiles
+
+The headline rows use different server configurations:
+
+| Profile | Concurrent requests | Server `max_num_seqs` | Input / output tokens |
+|---|---:|---:|---:|
+| Single user | 1 | 1 | 4096 / 128 |
+| 32 users | 32 | 32 | 4096 / 128 |
+
+Use the best validated single-user serving settings from optimized-vLLM. Keep the
+same implementation, checkpoint, precision, hardware and full context capacity
+for both profiles. Changing request concurrency alone does not select a one-slot
+decode trace or cache configuration.
+
+The runner prepares the 32-slot server before accuracy, retains it for the
+32-user performance profile, then switches to the single-user profile. Configure `performance_server_command` as an argument
+array for a server-control script in the model checkout. The runner calls it as:
+
+```text
+<performance_server_command> --max-num-seqs 32 --base-url <url> --output <run>/perf-b32-server.json
+<performance_server_command> --max-num-seqs 1  --base-url <url> --output <run>/perf-b1-server.json
+```
+
+Adapt the model's existing server launcher. The hook should reuse the running
+server when its configuration matches, otherwise stop only the server owned by
+this bringup and launch the requested configuration. Wait for API readiness
+before returning. Keep process ownership and cleanup with the enclosing bringup;
+on startup failure, clean up any server started by the hook. Enable the prepared
+phase-timing instrumentation in both server profiles. The runner invokes the
+phase collector before switching; retain its exported logs after shutdown.
+
+Each call writes an observed server identity using the fields in `identity.json`
+below, plus `base_url`, `max_num_seqs`, `max_model_len`,
+`configuration_evidence` and `configuration_evidence_sha256`. The last two fields
+identify a retained startup/configuration snapshot relative to `run/` and its
+SHA-256 over file bytes. Use a separate snapshot for each profile. Record the
+actual engine launch command, including `--max-num-seqs`; verify the effective
+configuration from that running process or its startup log. Do not fill this
+record from the requested values without checking the server.
+
+The runner rejects a capacity mismatch before warmup and retains the identity
+with each performance row. The final checker reconciles the two server identities
+with the bringup identity, including precision, hardware and context capacity.
+It also checks the configuration evidence hashes. Report columns show both
+concurrent requests and server slots.
+
+The clock starts on entry to `benchmark_stage run`, before the first
+server-selection hook, and runs through report generation. The stage attaches
+to the ready server from optimized-vLLM; record its earlier startup and environment
+setup separately. For a standalone benchmark, prepare the environment and initial
+server before invoking the runner and record that setup time separately.
+
+Every launch, reload, compilation and warmup performed by the runner counts toward
+the one-hour limit, including a launch needed by the first 32-slot selection. For
+example, if the supplied server has one slot, the initial switch to 32 slots and
+the later switch back to one slot both count. The timer never pauses for server
+selection, collection or reporting. Report the starting server configuration so
+the measured stage runtime can be interpreted.
+
+## Full-phase roofline accounting
+
+The performance table requires estimated prefill FLOP utilization and decode DRAM
+bandwidth utilization for both server profiles. These are required measurements,
+with no minimum percentage needed for completion. For each phase:
+
+`percent = 100 × modeled work / (elapsed phase seconds × hardware peak rate)`
+
+Use useful prefill FLOPs for the actual prompts and a dtype/fidelity-appropriate
+peak FLOP/s over all participating chips. Count decode DRAM bytes for weights at
+their stored dtypes, KV reads/writes and other material traffic across the actual
+steps. Account for tensor/data parallelism, replication, batch sharing and active
+MoE experts. Cite the accounting method and hardware peak source.
+
+Time the entire warmed phase at the host boundary, including dispatch, all ops,
+communication, sampling/readback and intervening host gaps. For chunked prefill,
+include every chunk. Sum non-overlapping phase intervals on one common timeline;
+never sum overlapping request latencies or per-device times. Work and elapsed
+time must cover the same requests/steps on the same chips. A matmul-only duration
+is not a valid denominator. Resolve overlapping phases from the actual scheduler
+and completion events; do not infer their durations from HTTP concurrency, TTFT
+or TPOT. If the measured path cannot supply valid accounting, retain its results
+and record the collection failure. The stage remains incomplete.
+
+The serving client does not supply these server timings or model byte counts.
+Prepare an implementation-specific collector before the timed run:
+
+1. Reuse existing full-phase timing logs or add lightweight monotonic host markers
+   around the complete prefill/decode path. For asynchronous execution, end timing
+   at the existing completion/readback boundary, not when a trace is enqueued.
+   Include communication, token handling and gaps between decode steps. Buffer
+   events and flush them outside measured work; do not introduce per-token device
+   synchronization or change the serving configuration to obtain timings.
+2. Retain request/step identifiers, active batch membership, sequence positions,
+   chunk lengths and participating devices with the events. Match accounting to
+   the measured requests and exclude warmups and the client's initial probe.
+   Detailed client `start_times` can help when client and server share the same
+   monotonic clock; otherwise retain an explicit request mapping. Do not assume
+   that all traffic between client process start and exit is measured traffic.
+3. Derive useful FLOPs and estimated DRAM bytes from these shapes and the actual
+   model/precision policy. Retain the calculation and peak-rate sources. Validate
+   that the instrumentation can emit both phases before committing to the accuracy
+   run. Missing instrumentation is setup work to complete, not a reason to omit
+   the figures.
+
+Follow the serving skill's profiler restrictions: do not use Tracy, the live
+device profiler or `ReadDeviceProfiler` to obtain these host wall times.
+
+Configure `roofline_command` as an argument array. The runner calls it while the
+corresponding server is still running:
+
+```text
+<roofline_command> --run-dir <run> --concurrency 32 --action check
+<roofline_command> --run-dir <run> --concurrency 32 --action collect
+<roofline_command> --run-dir <run> --concurrency 1  --action check
+<roofline_command> --run-dir <run> --concurrency 1  --action collect
+```
+
+`check` runs immediately after server selection, before accuracy on the 32-slot
+server and before warmup on the one-slot server. Read `perf-bN-server.json`, verify
+that the running server's timing instrumentation and the model/hardware accounting
+are ready, and fail with an actionable error if they are not. It must not silently
+enable a different precision, layer count or context capacity.
+
+`collect` runs after that profile's measured requests, before any server switch.
+Read `perf-bN.json`, flush and copy the matching raw timing evidence into `run/`,
+and add the profile to `roofline.json`, preserving any profile already collected.
+All four calls run within the same one-hour deadline. The runner requires valid
+accounting for the current profile before it proceeds to the next one.
+
+The collector output maps concurrency (`"1"`, `"32"`) to entries with:
+
+- `performance_sha256`: SHA-256 of the corresponding `perf-b1.json` or `perf-b32.json` file bytes, binding accounting to this run.
+- `server_identity_sha256`: `benchmark_stage.subsets.digest` of the corresponding parsed `perf-bN-server.json` object.
+- `requests`, `input_tokens`, `output_tokens`: the measured request and token counts, matching `completed`, `total_input_tokens` and `total_output_tokens` in `perf-bN.json`.
+- `prefill`: `flops`, `seconds`, `peak_flops_per_second`.
+- `decode`: `dram_bytes`, `seconds`, `peak_dram_bytes_per_second`.
+
+Each phase also records `timing_scope: "full_phase_wall_time"`, `timing_method`,
+`work_method`, `peak_source`, `evidence` (a relative path to a retained timing
+and accounting artifact), and `evidence_sha256` (SHA-256 of that file's bytes).
+Rates use FLOP/s or bytes/s, not TFLOP/s or GB/s. The report computes percentages
+and links the inputs. Missing profiles, missing phases, collection failures and
+invalid evidence prevent completion. The failed-run report preserves scores and
+serving measurements and shows unavailable percentages as —; record the specific
+failure in `RUN_NOTES.md` and repair the collector before rerunning.
+
+## Report and retained evidence
+
+```text
+doc/benchmark/
+  identity.json                 authored from the running server
+  RUN_NOTES.md                  commands, setup time, protocol details and limitations
+  run/
+    REPORT.md                   generated final report: scores, references and performance
+    run_config.json             frozen configuration
+    manifest.json               frozen subset, with full populations and content hashes
+    summary.json                execution status, timing and normalized results
+    <task>/                     upstream results, scored samples and raw responses
+    perf-b{1,32}*.json           raw performance measurements, warmups and server identities
+    configuration-*.log          retained effective server configuration evidence
+    roofline.json               required full-phase accounting for both profiles
+    roofline-b{1,32}-*.log      collector readiness and collection commands/results
+    <phase evidence artifacts> retained raw timings, request mapping and work calculations
+```
+
+No report or manifest copying is needed. The checker reads the generated report
+and manifest under `run/`. It verifies workload identity, complete responses,
+scored documents, token counts, timing and reference metric validity. It does not
+judge the model's accuracy.
+
+`identity.json` uses these fields (replace illustrative values with observed ones):
+
+```json
+{
+  "model": "organization/model",
+  "implementation": "models/autoports/model",
+  "generator_module": "models.autoports.model.generator",
+  "model_revision": "checkpoint-commit",
+  "tokenizer_revision": "tokenizer-commit",
+  "precision": "the server's selected precision policy",
+  "layer_count": 32,
+  "configured_layer_count": 32,
+  "source_commits": {"tt-metal": "commit", "vllm": "commit"},
+  "hardware": "observed chip topology",
+  "server_command": ["vllm", "serve", "organization/model", "--max-num-seqs", "32", "--max-model-len", "131072", "--no-enable-prefix-caching"],
+  "prefix_caching": false,
+  "max_num_seqs": 32,
+  "max_model_len": 131072
+}
+```
+
+Both layer counts must match. Keep the imported module's file path and server log
+with the identity evidence. The standalone skill also supports stock models;
+the final bringup checker requires the target autoport implementation.
+
+References: [lm-evaluation-harness v0.4.13](https://github.com/EleutherAI/lm-evaluation-harness/tree/v0.4.13),
+[vLLM benchmark CLI](https://docs.vllm.ai/en/v0.26.0/benchmarking/cli/).

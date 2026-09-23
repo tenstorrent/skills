@@ -10,7 +10,7 @@ The contract is intentionally simple:
 
 This script is a runner-side guardrail. It avoids broad eval-parameter
 inference because names such as "max_length" are overloaded across harnesses.
-Stage-review and tti-release instructions handle deliberate eval weakening.
+Stage-review and benchmark-model instructions handle deliberate eval weakening.
 """
 
 from __future__ import annotations
@@ -134,6 +134,7 @@ def checked_files(model_dir: Path) -> list[Path]:
         "readiness_vllm",
         "doc/vllm_integration",
         "doc/optimized_vllm",
+        "doc/benchmark",
         "doc/tti_release",
     ):
         root = model_dir / rel

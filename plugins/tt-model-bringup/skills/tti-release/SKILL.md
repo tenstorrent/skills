@@ -13,7 +13,7 @@ this plugin is copied into the target tt-metal checkout.
 
 ## Overview
 
-This skill runs the Tenstorrent `tt-inference-server` release workflow for the generated `models/autoports/<model>` implementation whose vLLM serving path is already complete. The goal is a copied-back markdown release report plus a short local handoff note with exact commands, versions, recovery actions, and release-readiness status.
+This standalone skill runs the Tenstorrent `tt-inference-server` release workflow for the generated `models/autoports/<model>` implementation whose vLLM serving path is complete. The goal is a copied-back markdown release report plus a short local handoff note with exact commands, versions, recovery actions, and release-readiness status.
 
 Separate release workflow success from release readiness. `run.py` exiting `0`, API requests completing, or a report being copied back proves the release harness ran. It does not prove the model is ready if the report contains failed accuracy, API conformance, or benchmark target rows.
 
@@ -261,7 +261,7 @@ sample counts, and their generation limits. Record the estimate in
 
 If the unrestricted eval suite would take a prohibitively long time for the
 experiment or available reservation window, it is acceptable to use TTI's CI
-configuration for Stage 11:
+configuration for this standalone release:
 
 ```bash
 python3 run.py \
@@ -288,9 +288,8 @@ in `RUN_NOTES.md`. Label every resulting accuracy number as a CI-subset result;
 never present it as full-set accuracy or compare it directly with a full-set
 release threshold without that qualification.
 
-A justified, successfully completed `ci-nightly` release may satisfy Stage 11,
-but it establishes CI-subset readiness rather than unrestricted full-set
-release readiness.
+A justified, successfully completed `ci-nightly` release establishes CI-subset
+readiness rather than unrestricted full-set release readiness.
 
 When the unrestricted suite is practical, use the normal release command:
 
@@ -439,6 +438,19 @@ Do not copy:
 - large raw eval sample dumps unless explicitly requested.
 
 After copy-back, remove any `.env` left in the TTI checkout and stop the finished tmux session. Do not release the reservation unless the user or monitor asks.
+
+## Independent handoff review
+
+Before declaring release readiness, run [scripts/check-evidence.sh](scripts/check-evidence.sh)
+from the target tt-metal checkout with `MODEL_DIR` and `HF_MODEL` set. Exit 0 establishes
+artifact presence, implementation identity and context consistency; it does not
+establish accuracy or release readiness. Inspect every report row as described above.
+
+Use `$stage-review` for the release handoff. Supply the selected release scope,
+this skill, raw workflow evidence and the copied report. Fix findings and repeat
+the affected checks before accepting `clean-pass`. If working within the bringup
+checkpoint convention, commit only stage-owned changes locally and record their
+SHAs. Follow the user's instructions for publication and reservation cleanup.
 
 ## Completion Criteria
 

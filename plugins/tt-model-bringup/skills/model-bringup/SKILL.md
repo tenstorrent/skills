@@ -1,6 +1,6 @@
 ---
 name: model-bringup
-description: Implement Hugging Face text models in TTNN through staged decoder, multi-chip, full-model, datatype, vLLM and TTI release work. Use for model bring-up or resuming its staged goals; requires separately installed tt-autodebug.
+description: Implement Hugging Face text models in TTNN through staged decoder, multi-chip, full-model, datatype, vLLM and benchmark work. Use for model bring-up or resuming its staged goals; requires separately installed tt-autodebug.
 ---
 
 # Model bring-up
@@ -55,11 +55,16 @@ The eleven [goal templates](../../prompts/model_bringup_multigoal) run in order:
 8. Datatype sweep — `datatype-sweep`
 9. vLLM integration — `vllm-integration`
 10. Optimized vLLM — `optimize`
-11. TTI release — `tti-release`
+11. Benchmarks — `benchmark-model`
+
+For an optional standalone TTI release handoff once serving is ready, use
+[`tti-release`](../tti-release/SKILL.md).
 
 `tt-device-usage`, `tt-enable-tracing`, `qualitative-check` and `stage-review` provide shared
-requirements. AutoDebug/AutoTriage/AutoFix come from the explicit dependency. Independent stage
-review must return `clean-pass`; findings require repairs and rereview. Preserve original goal
+requirements. AutoDebug/AutoTriage/AutoFix come from the explicit dependency. Implementation
+stages 1–10 require independent review with `clean-pass`; findings require repairs and rereview.
+The final benchmark stage produces results for the bringup owner and checks measurement
+completeness without an accuracy acceptance review. Preserve original goal
 criteria, local commit boundaries and the prohibition on pushing stage changes automatically.
 
 ### Validate changed paths
@@ -80,7 +85,7 @@ serving acceptance checks. Do not add a full boundary sweep or long soak by defa
 For an unattended Codex run, install [requirements.txt](../../requirements.txt) in the active
 Python environment, or provide `--codex-bin` for an existing Codex with goals/app-server support.
 The templates authorize skill-requested subagents. Inspect the full expanded goals and execution
-permissions before starting a costly run. The imported runner defaults to `--approval-policy never`
+permissions before starting a costly run. The runner defaults to `--approval-policy never`
 and `--sandbox danger-full-access`; override these for environments that require narrower access.
 It uses the supplied Codex home's authentication and removes ambient OpenAI/Codex API keys.
 
