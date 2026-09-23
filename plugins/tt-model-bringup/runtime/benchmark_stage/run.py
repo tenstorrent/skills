@@ -79,6 +79,17 @@ def run(*, config_path, output):
         server_command = config.get('performance_server_command')
         if not isinstance(server_command, list) or not server_command or not all(isinstance(arg, str) for arg in server_command):
             raise ValueError('performance_server_command is required to select and record 32-slot and one-slot servers')
+        def select_server(capacity, baseline=None):
+            server_path = output / f'perf-b{capacity}-server.json'
+            command([*server_command, '--max-num-seqs', str(capacity),
+                     '--base-url', config['base_url'], '--output', str(server_path)],
+                    output / f'perf-b{capacity}-server.log', deadline)
+            server = json.loads(server_path.read_text())
+            validate_server(server, capacity, config['model'], config['base_url'],
+                            baseline=baseline, output=output)
+            return server
+
+        baseline_server = select_server(32)
         execution = config.get('accuracy_execution', 'sequential')
         if execution not in ('sequential', 'shared'):
             raise ValueError('accuracy_execution must be sequential or shared')
@@ -99,17 +110,8 @@ def run(*, config_path, output):
             for task in batch:
                 result = json.loads((output / task / 'results.json').read_text())
                 summary['accuracy'][task] = result['benchmark_stage']
-        baseline_server = None
         for concurrency in (32, 1):
-            server_path = output / f'perf-b{concurrency}-server.json'
-            command([*server_command, '--max-num-seqs', str(concurrency),
-                     '--base-url', config['base_url'], '--output', str(server_path)],
-                    output / f'perf-b{concurrency}-server.log', deadline)
-            server = json.loads(server_path.read_text())
-            validate_server(server, concurrency, config['model'], config['base_url'],
-                            baseline=baseline_server, output=output)
-            if baseline_server is None:
-                baseline_server = server
+            server = baseline_server if concurrency == 32 else select_server(1, baseline_server)
             for warmup in (True, False):
                 name = f'perf-b{concurrency}' + ('-warmup' if warmup else '')
                 requests = concurrency if warmup else max(8, concurrency * 3)

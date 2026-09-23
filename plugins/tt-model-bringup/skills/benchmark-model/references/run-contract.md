@@ -173,8 +173,8 @@ same implementation, checkpoint, precision, hardware and full context capacity
 for both profiles. Changing request concurrency alone does not select a one-slot
 decode trace or cache configuration.
 
-The runner evaluates accuracy first, measures the 32-user profile, then switches
-to the single-user profile. Configure `performance_server_command` as an argument
+The runner prepares the 32-slot server before accuracy, retains it for the
+32-user performance profile, then switches to the single-user profile. Configure `performance_server_command` as an argument
 array for a server-control script in the model checkout. The runner calls it as:
 
 ```text

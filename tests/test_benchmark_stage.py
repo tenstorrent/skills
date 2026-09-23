@@ -658,10 +658,10 @@ def test_gate_requires_real_single_user_profile(tmp_path, mutation):
 def test_runner_switches_server_capacity_before_each_performance_profile(tmp_path, monkeypatch, wrong_capacity):
     from benchmark_stage import run as runner
     manifest = tmp_path / 'manifest.json'
-    manifest.write_text(json.dumps({'manifest_sha256': 'fixture', 'groups': {}}))
+    manifest.write_text(json.dumps({'manifest_sha256': 'fixture', 'groups': {'ifeval': {'tasks': ['ifeval'], 'sample_count': 1, 'population': 1}}}))
     config_path = tmp_path / 'config.json'
     config_path.write_text(json.dumps(dict(model='org/model', base_url='http://unused',
-        manifest=str(manifest), tasks=[], performance_server_command=['server-control'])))
+        manifest=str(manifest), tasks=['ifeval'], performance_server_command=['server-control'])))
     events = []
     def completed(argv, log, deadline):
         if argv[0] == 'server-control':
@@ -674,6 +674,14 @@ def test_runner_switches_server_capacity_before_each_performance_profile(tmp_pat
                 server['server_command'][-1] = '32'
                 path.write_text(json.dumps(server))
             return
+        if 'evaluate' in argv:
+            events.append(('accuracy', 32))
+            task_output = Path(argv[argv.index('--output') + 1])
+            task_output.mkdir()
+            (task_output / 'results.json').write_text(json.dumps({
+                'results': {'ifeval': {'acc,none': 0.5}},
+                'benchmark_stage': {'responses': 1, 'finish_reasons': {'stop': 1}, 'elapsed_seconds': 1}}))
+            return
         capacity = int(argv[argv.index('--max-concurrency') + 1])
         count = int(argv[argv.index('--num-prompts') + 1])
         events.append(('measure', capacity))
@@ -683,11 +691,11 @@ def test_runner_switches_server_capacity_before_each_performance_profile(tmp_pat
     if wrong_capacity:
         with pytest.raises(ValueError, match='1-slot server'):
             runner.run(config_path=config_path, output=tmp_path / 'run')
-        assert events == [('server', 32), ('measure', 32), ('measure', 32), ('server', 1)]
+        assert events == [('server', 32), ('accuracy', 32), ('measure', 32), ('measure', 32), ('server', 1)]
         assert not (tmp_path / 'run/perf-b1.json').exists()
     else:
         summary = runner.run(config_path=config_path, output=tmp_path / 'run')
-        assert events == [('server', 32), ('measure', 32), ('measure', 32),
+        assert events == [('server', 32), ('accuracy', 32), ('measure', 32), ('measure', 32),
                           ('server', 1), ('measure', 1), ('measure', 1)]
         assert summary['performance']['1']['server_max_num_seqs'] == 1
         assert summary['performance']['32']['server_max_num_seqs'] == 32
