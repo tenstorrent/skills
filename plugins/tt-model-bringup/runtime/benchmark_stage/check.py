@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-from benchmark_stage.evidence import PERFORMANCE_METRICS, benchmark_rows, finite_number, validate_performance
+from benchmark_stage.evidence import PERFORMANCE_METRICS, benchmark_rows, finite_number, validate_performance, validate_server
 from benchmark_stage.roofline import load_roofline
 from benchmark_stage.subsets import digest
 from benchmark_stage.responses import read_jsonl, scoring_response
@@ -126,6 +126,11 @@ def check(model_dir, hf_model=''):
         raise ValueError('performance output length must permit decode timing')
     for batch in ('1', '32'):
         result = summary.get('performance', {}).get(batch, {})
+        server = read(evidence / 'run' / f'perf-b{batch}-server.json')
+        validate_server(server, int(batch), config['model'], config['base_url'],
+                        baseline=identity, output=evidence / 'run')
+        if result.get('server_max_num_seqs') != int(batch) or result.get('server_identity_sha256') != digest(server):
+            raise ValueError(f'batch {batch}: summary disagrees with performance server identity')
         requests = max(8, int(batch) * 3)
         if result.get('requested_input_tokens') != 4096 or result.get('requested_output_tokens') != osl or result.get('requests') != requests or result.get('concurrency') != int(batch):
             raise ValueError(f'batch {batch}: wrong performance workload')

@@ -7,7 +7,7 @@ description: Report a text model's accuracy on fixed lm-eval subsets and 4K-inpu
 
 Follow [model-bringup startup](../model-bringup/SKILL.md#startup). Produce an end-of-bringup report with benchmark scores, published references where available, and serving performance. The person who launched the bringup judges whether the results are good enough.
 
-Use upstream EleutherAI lm-evaluation-harness for accuracy and `vllm bench serve` for performance. Attach to the working Stage 10 server with its selected precision policy. The complete client stage must finish in **less than one hour**, including dataset verification, accuracy requests, performance warmups/runs, scoring and reporting. Record installation, downloads, model loading and trace compilation separately.
+Use upstream EleutherAI lm-evaluation-harness for accuracy and `vllm bench serve` for performance. Attach to the working Stage 10 server with its selected precision policy. The complete client stage must finish in **less than one hour**, including dataset verification, accuracy requests, server configuration changes, performance warmups/runs, scoring and reporting. Record installation, downloads, model loading and trace compilation separately.
 
 ## Select and run benchmarks
 
@@ -21,9 +21,9 @@ Run accuracy at **32 concurrent HTTP requests**. Use the shared request pool whe
 
 ## Measure performance
 
-Use **4096 input tokens** and **128 output tokens**, at concurrency **1 and 32**. Warm both shapes, then measure repeated requests under the same precision policy as accuracy. Disable prefix caching, use distinct prompts, request greedy decoding and ignore EOS for performance. Verify actual token counts.
+Measure two serving profiles with **4096 input tokens** and **128 output tokens**: **single user**, with `--max-num-seqs 1` and one concurrent request, and **32 users**, with `--max-num-seqs 32` and 32 concurrent requests. Use the best validated single-user settings from optimized-vLLM for the first profile. Each profile must use its corresponding decode trace and cache configuration. Keep model, precision, hardware and full context capacity unchanged. Warm each server configuration, then measure repeated requests. Disable prefix caching, use distinct prompts, request greedy decoding and ignore EOS for performance. Verify actual token counts.
 
-Headline performance includes TTFT, TPOT, per-user decode tokens/s, aggregate output tokens/s, prefill FLOP roofline percentage and decode DRAM bandwidth roofline percentage. Compute roofline estimates using the complete elapsed prefill/decode phases, including host work and gaps. Use measured server phase timing and model/hardware accounting as described in the run contract; show unavailable values when those inputs cannot be obtained. HTTP concurrency does not establish physical device batch size. Preserve ITL, end-to-end latency, percentiles, request throughput, completion counts and wall time in the report details.
+The report labels the profile, concurrent requests and server slots separately. Headline performance includes TTFT, TPOT, per-user decode tokens/s, aggregate output tokens/s, prefill FLOP roofline percentage and decode DRAM bandwidth roofline percentage. Compute roofline estimates using the complete elapsed prefill/decode phases, including host work and gaps. Use measured server phase timing and model/hardware accounting as described in the run contract; show unavailable values when those inputs cannot be obtained. A single request on a 32-slot server is not the single-user profile. Use the run contract's server-control hook to record the running configuration, measure 32-user performance after accuracy, then switch to the one-slot server. Switching and warmup count toward the stage budget. Preserve ITL, end-to-end latency, percentiles, request throughput, completion counts and wall time in the report details.
 
 ## Deliver the report
 

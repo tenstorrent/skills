@@ -88,6 +88,7 @@ and sampling options for the model you are benchmarking:
   "tasks": ["mmlu_pro", "gsm8k_cot", "ifeval"],
   "vllm_cli": "/operator-selected/client-env/bin/vllm",
   "budget_seconds": 3600,
+  "performance_server_command": ["/client/bin/python", "/model/tools/benchmark_server.py"],
   "output_tokens": 128,
   "generation": {
     "mmlu_pro": {"max_gen_toks": 4096, "temperature": 0},
@@ -142,7 +143,7 @@ Run into a new directory:
 The runner freezes a copy of the configuration and manifest. Accuracy uses fresh
 requests at concurrency 32. A watchdog terminates owned client subprocesses when
 the one-hour budget expires and writes a failed summary. Preserve that evidence;
-use a new output directory for a rerun. The server remains owned by the caller.
+use a new output directory for a rerun. The servers remain owned by the enclosing bringup; the control hook follows its cleanup policy.
 
 Set `accuracy_execution` to `shared` when every task has the same complete
 `generation` dictionary. One request pool avoids separate long tails per task.
@@ -157,6 +158,56 @@ graded as the final answer. Truncation and empty-final counts appear in the repo
 Malformed responses or empty answers with a normal stop fail the run. Preserve
 upstream extraction results, including apparent scorer mistakes; document a
 protocol limitation without hand-correcting scores.
+
+## Single-user and 32-user server profiles
+
+The headline rows use different server configurations:
+
+| Profile | Concurrent requests | Server `max_num_seqs` | Input / output tokens |
+|---|---:|---:|---:|
+| Single user | 1 | 1 | 4096 / 128 |
+| 32 users | 32 | 32 | 4096 / 128 |
+
+Use the best validated single-user serving settings from optimized-vLLM. Keep the
+same implementation, checkpoint, precision, hardware and full context capacity
+for both profiles. Changing request concurrency alone does not select a one-slot
+decode trace or cache configuration.
+
+The runner evaluates accuracy first, measures the 32-user profile, then switches
+to the single-user profile. Configure `performance_server_command` as an argument
+array for a server-control script in the model checkout. The runner calls it as:
+
+```text
+<performance_server_command> --max-num-seqs 32 --base-url <url> --output <run>/perf-b32-server.json
+<performance_server_command> --max-num-seqs 1  --base-url <url> --output <run>/perf-b1-server.json
+```
+
+Adapt the model's existing server launcher. The hook should reuse the running
+server when its configuration matches, otherwise stop only the server owned by
+this bringup and launch the requested configuration. Wait for API readiness
+before returning. Keep process ownership and cleanup with the enclosing bringup;
+on startup failure, clean up any server started by the hook. Save phase timing
+logs before switching if roofline accounting needs them.
+
+Each call writes an observed server identity using the fields in `identity.json`
+below, plus `base_url`, `max_num_seqs`, `max_model_len`,
+`configuration_evidence` and `configuration_evidence_sha256`. The last two fields
+identify a retained startup/configuration snapshot relative to `run/` and its
+SHA-256 over file bytes. Use a separate snapshot for each profile. Record the
+actual engine launch command, including `--max-num-seqs`; verify the effective
+configuration from that running process or its startup log. Do not fill this
+record from the requested values without checking the server.
+
+The runner rejects a capacity mismatch before warmup and retains the identity
+with each performance row. The final checker reconciles the two server identities
+with the bringup identity, including precision, hardware and context capacity.
+It also checks the configuration evidence hashes. Report columns show both
+concurrent requests and server slots.
+
+Initial environment setup, model loading and trace compilation precede the stage.
+All profile switching, reloads, compilation and warmups after the timer starts
+count toward the one-hour limit. A one-server calibration does not establish the
+runtime of a complete two-profile stage.
 
 ## Full-phase roofline accounting
 
@@ -213,7 +264,8 @@ doc/benchmark/
     manifest.json               frozen subset, with full populations and content hashes
     summary.json                execution status, timing and normalized results
     <task>/                     upstream results, scored samples and raw responses
-    perf-b{1,32}*.json           raw performance measurements and warmups
+    perf-b{1,32}*.json           raw performance measurements, warmups and server identities
+    configuration-*.log          retained effective server configuration evidence
     roofline.json               optional server phase accounting and source artifacts
 ```
 
@@ -236,8 +288,10 @@ judge the model's accuracy.
   "configured_layer_count": 32,
   "source_commits": {"tt-metal": "commit", "vllm": "commit"},
   "hardware": "observed chip topology",
-  "server_command": ["the", "actual", "launch", "command"],
-  "prefix_caching": false
+  "server_command": ["vllm", "serve", "organization/model", "--max-num-seqs", "32", "--max-model-len", "131072", "--no-enable-prefix-caching"],
+  "prefix_caching": false,
+  "max_num_seqs": 32,
+  "max_model_len": 131072
 }
 ```
 

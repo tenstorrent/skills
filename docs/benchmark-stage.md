@@ -9,7 +9,12 @@ for installation, commands, evidence requirements and the frozen profiles.
 The stage attaches to the working optimized-vLLM server, runs accuracy at
 concurrency 32, and measures 4096-input/128-output-token serving at concurrency 1
 and 32. The one-hour budget includes task verification, inference, scoring,
-performance warmups and reporting; environment setup and model startup are separate.
+server profile switching, performance warmups and reporting; initial environment setup
+and model startup are separate. The single-user row uses a one-slot server; the
+32-user row uses a 32-slot server. Both use the same precision and full context
+capacity. The calibration measurements below used one 32-slot server for both
+concurrency settings. They do not measure the dedicated single-user profile or
+establish the two-profile stage runtime.
 
 The packaged profiles cover MMLU-Pro, GSM8K and IFEval for non-reasoning models,
 and MMLU-Pro plus GPQA Diamond for reasoning evaluations. Select the upstream task
@@ -185,7 +190,7 @@ GPQA uses upstream prompts/scorers with the client's deterministic seed-0 choice
 ordering. One shared pool of 32 requests avoids separate idle tails between tasks.
 
 
-| Gemma serving metric, 4096 input / 128 output tokens | Concurrency 1 | Concurrency 32 |
+| Gemma serving metric, 32-slot server, 4096 input / 128 output tokens | Concurrency 1 | Concurrency 32 |
 |---|---:|---:|
 | Aggregate output tokens/s | 23.24 | 170.28 |
 | Mean time to first token, ms | 679.11 | 18,476.77 |

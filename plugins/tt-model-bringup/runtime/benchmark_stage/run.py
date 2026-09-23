@@ -9,7 +9,8 @@ import subprocess
 import sys
 import time
 
-from benchmark_stage.evidence import validate_performance
+from benchmark_stage.evidence import validate_performance, validate_server
+from benchmark_stage.subsets import digest
 
 
 def command(argv, log, deadline, *, terminate_grace_seconds=10):
@@ -75,6 +76,9 @@ def run(*, config_path, output):
         raise InterruptedError(f'benchmark interrupted by signal {signum}')
     previous_term = signal.signal(signal.SIGTERM, interrupted)
     try:
+        server_command = config.get('performance_server_command')
+        if not isinstance(server_command, list) or not server_command or not all(isinstance(arg, str) for arg in server_command):
+            raise ValueError('performance_server_command is required to select and record 32-slot and one-slot servers')
         execution = config.get('accuracy_execution', 'sequential')
         if execution not in ('sequential', 'shared'):
             raise ValueError('accuracy_execution must be sequential or shared')
@@ -95,7 +99,17 @@ def run(*, config_path, output):
             for task in batch:
                 result = json.loads((output / task / 'results.json').read_text())
                 summary['accuracy'][task] = result['benchmark_stage']
-        for concurrency in (1, 32):
+        baseline_server = None
+        for concurrency in (32, 1):
+            server_path = output / f'perf-b{concurrency}-server.json'
+            command([*server_command, '--max-num-seqs', str(concurrency),
+                     '--base-url', config['base_url'], '--output', str(server_path)],
+                    output / f'perf-b{concurrency}-server.log', deadline)
+            server = json.loads(server_path.read_text())
+            validate_server(server, concurrency, config['model'], config['base_url'],
+                            baseline=baseline_server, output=output)
+            if baseline_server is None:
+                baseline_server = server
             for warmup in (True, False):
                 name = f'perf-b{concurrency}' + ('-warmup' if warmup else '')
                 requests = concurrency if warmup else max(8, concurrency * 3)
@@ -117,6 +131,7 @@ def run(*, config_path, output):
                 if not warmup:
                     summary['performance'][str(concurrency)] = {
                         'concurrency': concurrency, 'requested_input_tokens': 4096,
+                        'server_max_num_seqs': server['max_num_seqs'], 'server_identity_sha256': digest(server),
                         'requested_output_tokens': config.get('output_tokens', 128), 'requests': requests,
                         'completed': raw['completed'],
                         **{k: v for k, v in raw.items() if k.startswith(('mean_', 'median_', 'p95_', 'p99_')) or k in

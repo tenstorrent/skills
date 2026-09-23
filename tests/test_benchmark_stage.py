@@ -172,7 +172,7 @@ def test_actual_performance_workload_is_validated(field, value):
 def test_report_failure_preserves_original_client_error(tmp_path, monkeypatch):
     from benchmark_stage import run as runner
     config = tmp_path / 'config.json'
-    config.write_text(json.dumps({'model': 'org/model', 'base_url': 'http://unused',
+    config.write_text(json.dumps({'model': 'org/model', 'base_url': 'http://unused', 'performance_server_command': ['server-control'],
                                  'manifest': str(tmp_path / 'missing'), 'tasks': ['ifeval']}))
     def fail(*args):
         raise RuntimeError('original client error')
@@ -183,6 +183,37 @@ def test_report_failure_preserves_original_client_error(tmp_path, monkeypatch):
     assert summary['status'] == 'failed'
     assert summary['error'] == 'RuntimeError: original client error'
     assert 'FileNotFoundError' in summary['report_error']
+
+
+
+def server_fixture(capacity):
+    return dict(model='org/model', implementation='models/autoports/model',
+        generator_module='models.autoports.model.generator', prefix_caching=False,
+        model_revision='123', tokenizer_revision='123', precision='accuracy', layer_count=32,
+        configured_layer_count=32, source_commits={'tt-metal': '123'}, hardware='T3K',
+        max_num_seqs=capacity, max_model_len=131072, base_url='http://unused',
+        server_command=['vllm', 'serve', '--max-num-seqs', str(capacity)])
+
+
+def write_server_fixture(output, capacity):
+    import hashlib
+    output.mkdir(parents=True, exist_ok=True)
+    server = server_fixture(capacity)
+    evidence = output / f'configuration-b{capacity}.log'
+    evidence.write_text(f'Synthetic server startup: max_num_seqs={capacity}\n')
+    server['configuration_evidence'] = evidence.name
+    server['configuration_evidence_sha256'] = hashlib.sha256(evidence.read_bytes()).hexdigest()
+    (output / f'perf-b{capacity}-server.json').write_text(json.dumps(server))
+    return server
+
+
+def fake_server_command(argv):
+    if argv[0] != 'server-control':
+        return False
+    path = Path(argv[argv.index('--output') + 1])
+    capacity = int(argv[argv.index('--max-num-seqs') + 1])
+    write_server_fixture(path.parent, capacity)
+    return True
 
 
 def valid_gate_fixture(tmp_path):
@@ -202,11 +233,9 @@ def valid_gate_fixture(tmp_path):
                 'tasks': {t: {'indices': [0, 1], 'document_sha256': [digest(d) for d in docs]} for t in tasks}}
     manifest['manifest_sha256'] = digest(manifest)
     write('run/manifest.json', manifest)
-    write('identity.json', dict(model='org/model', implementation='models/autoports/model',
-        generator_module='models.autoports.model.generator', prefix_caching=False,
-        model_revision='123', tokenizer_revision='123', precision='accuracy', layer_count=32,
-        configured_layer_count=32, source_commits={'tt-metal': '123'}, hardware='T3K', server_command=['vllm', 'serve']))
-    write('run/run_config.json', dict(model='org/model', tasks=tasks, budget_seconds=3600, output_tokens=128))
+    write('identity.json', server_fixture(32))
+    write('run/run_config.json', dict(model='org/model', base_url='http://unused', tasks=tasks,
+                                     budget_seconds=3600, output_tokens=128))
     summary = dict(status='completed', elapsed_seconds=30, accuracy={}, performance={})
     for task in tasks:
         stage = dict(model='org/model', subset_sha256=manifest['manifest_sha256'],
@@ -217,9 +246,11 @@ def valid_gate_fixture(tmp_path):
         response = dict(choices=[dict(index=0, message=dict(content='answer'), finish_reason='stop')])
         (evidence / f'run/{task}/responses.jsonl').write_text((json.dumps(response) + '\n') * 2)
     for b in (1, 32):
+        server = write_server_fixture(evidence / 'run', b)
         requests = max(8, b * 3)
         raw = dict(performance_fixture(requests), model_id='org/model', max_concurrency=b)
-        summary['performance'][str(b)] = dict(raw, concurrency=b, requested_input_tokens=4096,
+        summary['performance'][str(b)] = dict(raw, concurrency=b, server_max_num_seqs=b,
+                                              server_identity_sha256=digest(server), requested_input_tokens=4096,
                                               requested_output_tokens=128, requests=requests)
         write(f'run/perf-b{b}.json', raw)
         write(f'run/perf-b{b}-warmup.json', dict(performance_fixture(b), model_id='org/model', max_concurrency=b))
@@ -305,11 +336,12 @@ def test_reporting_budget_and_manifest_snapshot(tmp_path, monkeypatch):
     original = {'manifest_sha256': 'fixture', 'groups': {}}
     source.write_text(json.dumps(original))
     config = tmp_path / 'config.json'
-    config.write_text(json.dumps(dict(model='org/model', base_url='http://unused',
+    config.write_text(json.dumps(dict(model='org/model', base_url='http://unused', performance_server_command=['server-control'],
         manifest=str(source), tasks=[], budget_seconds=1)))
     clock = [0]
     monkeypatch.setattr(runner.time, 'monotonic', lambda: clock[0])
     def completed(argv, log, deadline):
+        if fake_server_command(argv): return
         count = int(argv[argv.index('--num-prompts') + 1])
         batch = int(argv[argv.index('--max-concurrency') + 1])
         path = Path(argv[argv.index('--result-dir') + 1]) / argv[argv.index('--result-filename') + 1]
@@ -331,9 +363,10 @@ def test_reporting_budget_and_manifest_snapshot(tmp_path, monkeypatch):
 def test_budget_failure_report_does_not_say_completed(tmp_path,monkeypatch):
  from benchmark_stage import run as runner,report
  source=tmp_path/'source.json';source.write_text(json.dumps({'manifest_sha256':'fixture','groups':{}}))
- cfg=tmp_path/'config.json';cfg.write_text(json.dumps({'model':'org/model','base_url':'http://unused','manifest':str(source),'tasks':[],'budget_seconds':1}))
+ cfg=tmp_path/'config.json';cfg.write_text(json.dumps({'model':'org/model','base_url':'http://unused','performance_server_command':['server-control'],'manifest':str(source),'tasks':[],'budget_seconds':1}))
  clock=[0];monkeypatch.setattr(runner.time,'monotonic',lambda:clock[0])
  def command(argv,log,deadline):
+  if fake_server_command(argv): return
   count=int(argv[argv.index('--num-prompts')+1]);batch=int(argv[argv.index('--max-concurrency')+1]);out=Path(argv[argv.index('--result-dir')+1])/argv[argv.index('--result-filename')+1]
   out.write_text(json.dumps(dict(performance_fixture(count),model_id='org/model',max_concurrency=batch)))
  monkeypatch.setattr(runner,'command',command);original=report.write_report
@@ -515,9 +548,9 @@ def test_report_has_measured_scores_references_and_performance_without_verdict(t
     report = (run / 'REPORT.md').read_text()
     assert '| 2 / 100 | acc,none | 50.00 |' in report
     assert '| 70.00 | -20.00 | [reference](https://example.org/model)' in report if reference else 'Unavailable' in report
-    assert '| 1 | 4096 / 128 |' in report and '| 32 | 4096 / 128 |' in report
+    assert '| Single user | 1 | 1 | 4096 / 128 |' in report and '| 32 users | 32 | 32 | 4096 / 128 |' in report
     assert 'verdict' not in report and 'separate accuracy review' not in report
-    assert report.index('| Concurrency | ISL') < report.index('## Run details')
+    assert report.index('| Profile | Concurrent requests') < report.index('## Run details')
 
 
 def roofline_fixture(run):
@@ -572,11 +605,12 @@ def test_runner_collects_roofline_before_reporting_with_same_deadline(tmp_path, 
     source = tmp_path / 'manifest.json'
     source.write_text(json.dumps({'manifest_sha256': 'fixture', 'groups': {}}))
     config_path = tmp_path / 'config.json'
-    config_path.write_text(json.dumps(dict(model='org/model', base_url='http://unused',
+    config_path.write_text(json.dumps(dict(model='org/model', base_url='http://unused', performance_server_command=['server-control'],
         manifest=str(source), tasks=[], roofline_command=['collector'])))
     deadlines = []
     def completed(argv, log, deadline):
         deadlines.append(deadline)
+        if fake_server_command(argv): return
         if argv[0] == 'collector':
             assert argv[1] == '--run-dir'
             if collect:
@@ -596,4 +630,80 @@ def test_runner_collects_roofline_before_reporting_with_same_deadline(tmp_path, 
         with pytest.raises(ValueError, match='did not write'):
             runner.run(config_path=config_path, output=tmp_path / 'run')
         assert json.loads((tmp_path / 'run/summary.json').read_text())['status'] == 'failed'
-    assert len(deadlines) == 5 and len(set(deadlines)) == 1
+    assert len(deadlines) == 7 and len(set(deadlines)) == 1
+
+
+@pytest.mark.parametrize('mutation', ['capacity', 'launch_command', 'precision', 'context', 'evidence', 'summary'])
+def test_gate_requires_real_single_user_profile(tmp_path, mutation):
+    root, evidence = valid_gate_fixture(tmp_path)
+    path = evidence / 'run/perf-b1-server.json'
+    server = json.loads(path.read_text())
+    if mutation == 'capacity': server['max_num_seqs'] = 32
+    elif mutation == 'launch_command': server['server_command'][-1] = '32'
+    elif mutation == 'precision': server['precision'] = 'lower precision'
+    elif mutation == 'context': server['max_model_len'] = 8192
+    elif mutation == 'evidence':
+        (path.parent / server['configuration_evidence']).write_text('changed source evidence')
+    path.write_text(json.dumps(server))
+    summary_path = evidence / 'run/summary.json'
+    summary = json.loads(summary_path.read_text())
+    summary['performance']['1']['server_identity_sha256'] = digest(server)
+    if mutation == 'summary': summary['performance']['1']['server_max_num_seqs'] = 32
+    summary_path.write_text(json.dumps(summary))
+    with pytest.raises(ValueError):
+        check(root)
+
+
+@pytest.mark.parametrize('wrong_capacity', [False, True])
+def test_runner_switches_server_capacity_before_each_performance_profile(tmp_path, monkeypatch, wrong_capacity):
+    from benchmark_stage import run as runner
+    manifest = tmp_path / 'manifest.json'
+    manifest.write_text(json.dumps({'manifest_sha256': 'fixture', 'groups': {}}))
+    config_path = tmp_path / 'config.json'
+    config_path.write_text(json.dumps(dict(model='org/model', base_url='http://unused',
+        manifest=str(manifest), tasks=[], performance_server_command=['server-control'])))
+    events = []
+    def completed(argv, log, deadline):
+        if argv[0] == 'server-control':
+            capacity = int(argv[argv.index('--max-num-seqs') + 1])
+            path = Path(argv[argv.index('--output') + 1])
+            events.append(('server', capacity))
+            server = write_server_fixture(path.parent, capacity)
+            if wrong_capacity and capacity == 1:
+                server['max_num_seqs'] = 32
+                server['server_command'][-1] = '32'
+                path.write_text(json.dumps(server))
+            return
+        capacity = int(argv[argv.index('--max-concurrency') + 1])
+        count = int(argv[argv.index('--num-prompts') + 1])
+        events.append(('measure', capacity))
+        path = Path(argv[argv.index('--result-dir') + 1]) / argv[argv.index('--result-filename') + 1]
+        path.write_text(json.dumps(dict(performance_fixture(count), model_id='org/model', max_concurrency=capacity)))
+    monkeypatch.setattr(runner, 'command', completed)
+    if wrong_capacity:
+        with pytest.raises(ValueError, match='1-slot server'):
+            runner.run(config_path=config_path, output=tmp_path / 'run')
+        assert events == [('server', 32), ('measure', 32), ('measure', 32), ('server', 1)]
+        assert not (tmp_path / 'run/perf-b1.json').exists()
+    else:
+        summary = runner.run(config_path=config_path, output=tmp_path / 'run')
+        assert events == [('server', 32), ('measure', 32), ('measure', 32),
+                          ('server', 1), ('measure', 1), ('measure', 1)]
+        assert summary['performance']['1']['server_max_num_seqs'] == 1
+        assert summary['performance']['32']['server_max_num_seqs'] == 32
+        report = (tmp_path / 'run/REPORT.md').read_text()
+        assert report.index('| Single user | 1 | 1 |') < report.index('| 32 users | 32 | 32 |')
+
+
+def test_runner_rejects_implicit_shared_server_before_accuracy(tmp_path, monkeypatch):
+    from benchmark_stage import run as runner
+    manifest = tmp_path / 'manifest.json'
+    manifest.write_text(json.dumps({'manifest_sha256': 'fixture', 'groups': {}}))
+    config = tmp_path / 'config.json'
+    config.write_text(json.dumps(dict(model='org/model', base_url='http://unused',
+        manifest=str(manifest), tasks=[])))
+    def unexpected(*args):
+        pytest.fail('client ran before server-profile configuration was checked')
+    monkeypatch.setattr(runner, 'command', unexpected)
+    with pytest.raises(ValueError, match='performance_server_command is required'):
+        runner.run(config_path=config, output=tmp_path / 'run')
