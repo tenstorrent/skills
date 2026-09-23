@@ -89,6 +89,7 @@ and sampling options for the model you are benchmarking:
   "vllm_cli": "/operator-selected/client-env/bin/vllm",
   "budget_seconds": 3600,
   "performance_server_command": ["/client/bin/python", "/model/tools/benchmark_server.py"],
+  "roofline_command": ["/client/bin/python", "/model/tools/collect_roofline.py"],
   "output_tokens": 128,
   "generation": {
     "mmlu_pro": {"max_gen_toks": 4096, "temperature": 0},
@@ -186,8 +187,9 @@ Adapt the model's existing server launcher. The hook should reuse the running
 server when its configuration matches, otherwise stop only the server owned by
 this bringup and launch the requested configuration. Wait for API readiness
 before returning. Keep process ownership and cleanup with the enclosing bringup;
-on startup failure, clean up any server started by the hook. Save phase timing
-logs before switching if roofline accounting needs them.
+on startup failure, clean up any server started by the hook. Enable the prepared
+phase-timing instrumentation in both server profiles. The runner invokes the
+phase collector before switching; retain its exported logs after shutdown.
 
 Each call writes an observed server identity using the fields in `identity.json`
 below, plus `base_url`, `max_num_seqs`, `max_model_len`,
@@ -211,8 +213,9 @@ runtime of a complete two-profile stage.
 
 ## Full-phase roofline accounting
 
-The performance table includes estimated prefill FLOP utilization and decode DRAM
-bandwidth utilization. For each phase:
+The performance table requires estimated prefill FLOP utilization and decode DRAM
+bandwidth utilization for both server profiles. These are required measurements,
+with no minimum percentage needed for completion. For each phase:
 
 `percent = 100 × modeled work / (elapsed phase seconds × hardware peak rate)`
 
@@ -227,30 +230,73 @@ communication, sampling/readback and intervening host gaps. For chunked prefill,
 include every chunk. Sum non-overlapping phase intervals on one common timeline;
 never sum overlapping request latencies or per-device times. Work and elapsed
 time must cover the same requests/steps on the same chips. A matmul-only duration
-is not a valid denominator. If prefill/decode overlap cannot be separated, record
-the missing phase accounting rather than infer it from HTTP concurrency.
+is not a valid denominator. Resolve overlapping phases from the actual scheduler
+and completion events; do not infer their durations from HTTP concurrency, TTFT
+or TPOT. If the measured path cannot supply valid accounting, retain its results
+and record the collection failure. The stage remains incomplete.
 
 The serving client does not supply these server timings or model byte counts.
-Use the implementation's timing logs or add lightweight host timing, following
-the serving skill's profiler restrictions. An optional `roofline_command` array
-in the run configuration invokes an implementation-specific collector after the
-performance runs, with `--run-dir <output>` appended. It runs within the stage
-budget and writes `roofline.json` and its supporting artifacts in that directory.
-For example: `["/client/bin/python", "/model/tools/collect_roofline.py"]`.
+Prepare an implementation-specific collector before the timed run:
+
+1. Reuse existing full-phase timing logs or add lightweight monotonic host markers
+   around the complete prefill/decode path. For asynchronous execution, end timing
+   at the existing completion/readback boundary, not when a trace is enqueued.
+   Include communication, token handling and gaps between decode steps. Buffer
+   events and flush them outside measured work; do not introduce per-token device
+   synchronization or change the serving configuration to obtain timings.
+2. Retain request/step identifiers, active batch membership, sequence positions,
+   chunk lengths and participating devices with the events. Match accounting to
+   the measured requests and exclude warmups and the client's initial probe.
+   Detailed client `start_times` can help when client and server share the same
+   monotonic clock; otherwise retain an explicit request mapping. Do not assume
+   that all traffic between client process start and exit is measured traffic.
+3. Derive useful FLOPs and estimated DRAM bytes from these shapes and the actual
+   model/precision policy. Retain the calculation and peak-rate sources. Validate
+   that the instrumentation can emit both phases before committing to the accuracy
+   run. Missing instrumentation is setup work to complete, not a reason to omit
+   the figures.
+
+Follow the serving skill's profiler restrictions: do not use Tracy, the live
+device profiler or `ReadDeviceProfiler` to obtain these host wall times.
+
+Configure `roofline_command` as an argument array. The runner calls it while the
+corresponding server is still running:
+
+```text
+<roofline_command> --run-dir <run> --concurrency 32 --action check
+<roofline_command> --run-dir <run> --concurrency 32 --action collect
+<roofline_command> --run-dir <run> --concurrency 1  --action check
+<roofline_command> --run-dir <run> --concurrency 1  --action collect
+```
+
+`check` runs immediately after server selection, before accuracy on the 32-slot
+server and before warmup on the one-slot server. Read `perf-bN-server.json`, verify
+that the running server's timing instrumentation and the model/hardware accounting
+are ready, and fail with an actionable error if they are not. It must not silently
+enable a different precision, layer count or context capacity.
+
+`collect` runs after that profile's measured requests, before any server switch.
+Read `perf-bN.json`, flush and copy the matching raw timing evidence into `run/`,
+and add the profile to `roofline.json`, preserving any profile already collected.
+All four calls run within the same one-hour deadline. The runner requires valid
+accounting for the current profile before it proceeds to the next one.
 
 The collector output maps concurrency (`"1"`, `"32"`) to entries with:
 
 - `performance_sha256`: SHA-256 of the corresponding `perf-b1.json` or `perf-b32.json` file bytes, binding accounting to this run.
+- `server_identity_sha256`: `benchmark_stage.subsets.digest` of the corresponding parsed `perf-bN-server.json` object.
+- `requests`, `input_tokens`, `output_tokens`: the measured request and token counts, matching `completed`, `total_input_tokens` and `total_output_tokens` in `perf-bN.json`.
 - `prefill`: `flops`, `seconds`, `peak_flops_per_second`.
 - `decode`: `dram_bytes`, `seconds`, `peak_dram_bytes_per_second`.
 
 Each phase also records `timing_scope: "full_phase_wall_time"`, `timing_method`,
-`work_method`, `peak_source` and `evidence` (a relative path to a retained timing
-and accounting artifact). Rates use FLOP/s or bytes/s, not TFLOP/s or GB/s. The
-report computes percentages and links the inputs. Omit an unavailable phase;
-missing accounting is shown as — and does not block the benchmark report. Record
-why it is unavailable in `RUN_NOTES.md`. A collector that fails or writes invalid
-accounting fails the run, rather than publishing a misleading percentage.
+`work_method`, `peak_source`, `evidence` (a relative path to a retained timing
+and accounting artifact), and `evidence_sha256` (SHA-256 of that file's bytes).
+Rates use FLOP/s or bytes/s, not TFLOP/s or GB/s. The report computes percentages
+and links the inputs. Missing profiles, missing phases, collection failures and
+invalid evidence prevent completion. The failed-run report preserves scores and
+serving measurements and shows unavailable percentages as —; record the specific
+failure in `RUN_NOTES.md` and repair the collector before rerunning.
 
 ## Report and retained evidence
 
@@ -266,7 +312,9 @@ doc/benchmark/
     <task>/                     upstream results, scored samples and raw responses
     perf-b{1,32}*.json           raw performance measurements, warmups and server identities
     configuration-*.log          retained effective server configuration evidence
-    roofline.json               optional server phase accounting and source artifacts
+    roofline.json               required full-phase accounting for both profiles
+    roofline-b{1,32}-*.log      collector readiness and collection commands/results
+    <phase evidence artifacts> retained raw timings, request mapping and work calculations
 ```
 
 No report or manifest copying is needed. The checker reads the generated report

@@ -10,6 +10,7 @@ import sys
 import time
 
 from benchmark_stage.evidence import validate_performance, validate_server
+from benchmark_stage.roofline import load_roofline
 from benchmark_stage.subsets import digest
 
 
@@ -79,6 +80,17 @@ def run(*, config_path, output):
         server_command = config.get('performance_server_command')
         if not isinstance(server_command, list) or not server_command or not all(isinstance(arg, str) for arg in server_command):
             raise ValueError('performance_server_command is required to select and record 32-slot and one-slot servers')
+        roofline_command = config.get('roofline_command')
+        if not isinstance(roofline_command, list) or not roofline_command or not all(
+                isinstance(arg, str) and arg.strip() for arg in roofline_command):
+            raise ValueError('roofline_command is required to collect full-phase prefill/decode accounting')
+
+        def phase_accounting(capacity, action):
+            command([*roofline_command, '--run-dir', str(output), '--concurrency', str(capacity),
+                     '--action', action], output / f'roofline-b{capacity}-{action}.log', deadline)
+            if action == 'collect':
+                load_roofline(output, required=(str(capacity),))
+
         def select_server(capacity, baseline=None):
             server_path = output / f'perf-b{capacity}-server.json'
             command([*server_command, '--max-num-seqs', str(capacity),
@@ -87,6 +99,7 @@ def run(*, config_path, output):
             server = json.loads(server_path.read_text())
             validate_server(server, capacity, config['model'], config['base_url'],
                             baseline=baseline, output=output)
+            phase_accounting(capacity, 'check')
             return server
 
         baseline_server = select_server(32)
@@ -140,11 +153,10 @@ def run(*, config_path, output):
                            ('duration', 'request_throughput', 'output_throughput', 'total_token_throughput',
                             'total_input_tokens', 'total_output_tokens')},
                     }
-        if config.get('roofline_command'):
-            command([*config['roofline_command'], '--run-dir', str(output)],
-                    output / 'roofline.log', deadline)
-            if not (output / 'roofline.json').is_file():
-                raise ValueError('roofline_command did not write roofline.json')
+            # Flush and retain this server's timings before a profile switch can
+            # destroy its in-memory counters or task-local logs.
+            phase_accounting(concurrency, 'collect')
+        load_roofline(output, required=('1', '32'))
         summary['status'] = 'completed'
     except BaseException as exc:
         summary['status'] = 'failed'

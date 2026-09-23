@@ -16,7 +16,15 @@ def write_report(output, config, summary):
     if set(config.get('references', {})) - set(config['tasks']) or set(config.get('metrics', {})) - set(config['tasks']):
         raise ValueError('report metrics/references name a task that was not run')
     manifest = json.loads(Path(config['manifest']).read_text())
-    roofline = load_roofline(output)
+    roofline_error = None
+    try:
+        roofline = load_roofline(output, required=('1', '32') if summary['status'] == 'completed' else ())
+    except (ValueError, OSError) as exc:
+        if summary['status'] == 'completed':
+            raise
+        # Preserve the scores and serving measurements even when accounting
+        # fails; the run remains incomplete and no invalid percentage is shown.
+        roofline, roofline_error = {}, str(exc)
     lines = [f"# Benchmark: {config['model']}", '',
              f"Status: {summary['status']}. Accuracy concurrency: 32.", '',
              '| Benchmark | Samples / full | Metric | Subset % | Published full % | Difference pp | Source |',
@@ -45,7 +53,9 @@ def write_report(output, config, summary):
         profile = 'Single user' if batch == '1' and capacity == 1 else '32 users' if batch == '32' and capacity == 32 else 'Serving'
         lines.append(f"| {profile} | {batch} | {capacity} | {row['requested_input_tokens']} / {row['requested_output_tokens']} | {row.get('mean_ttft_ms', 0):.2f} | {tpot:.2f} | {1000/tpot if tpot else 0:.2f} | {row.get('output_throughput', 0):.2f} | " + ' | '.join(utilization) + ' |')
     lines += ['', 'Scores use fixed subsets; published figures cover the full dataset. Missing references are shown as unavailable. The bringup owner decides whether these results meet their needs.', '',
-              'Roofline estimates divide modeled work by full-phase elapsed wall time and the participating hardware’s peak rate. Missing phase accounting is shown as —. HTTP concurrency is not a fixed device batch size.', '']
+              'Roofline estimates divide modeled work by full-phase elapsed wall time and the participating hardware’s peak rate. Both phases are required for both serving profiles; — indicates incomplete accounting. HTTP concurrency is not a fixed device batch size.', '']
+    if roofline_error:
+        lines += [f'Phase accounting error: {cell(roofline_error)}', '']
     if notes:
         lines += ['Reference protocol notes:', *notes, '']
     lines += ['## Run details', '', f"Subset: `{manifest['manifest_sha256']}`. Configuration: [run_config.json](run_config.json).", '',

@@ -13,14 +13,19 @@ with two server profiles: one slot for one user, and 32 slots for 32 users.
 Both profiles preserve precision, checkpoint, hardware and full context capacity.
 The one-hour stage budget includes task verification, inference, scoring, server
 profile switching, performance warmups and reporting. Initial environment setup
-and model startup are separate.
+and model startup are separate. Completion requires full-phase prefill FLOP and
+decode DRAM accounting for both profiles; the collector runs before each server
+is stopped.
 
 ## QB2 validation, 23 September 2026
 
 Both models completed the stage on a four-chip Blackhole QB2. Each run generated
 new answers for the fixed subsets and measured both server profiles. The audit
 checked document identities, response counts, scoring inputs, performance token
-lengths and observed server configurations.
+lengths and observed server configurations. These measurements used client
+version 0.1.10 and did not capture phase accounting. They validate the accuracy
+and serving profiles; a hardware run including required phase collection remains
+to be measured.
 
 | Model | Accuracy subset coverage | Complete stage | One-slot reload, included |
 |---|---|---:|---:|

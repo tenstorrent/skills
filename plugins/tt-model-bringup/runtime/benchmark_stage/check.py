@@ -148,7 +148,7 @@ def check(model_dir, hf_model=''):
         raise ValueError('report metrics/references name a task that was not run')
     for task, raw in results.items():
         benchmark_rows(config, manifest, task, raw)
-    load_roofline(evidence / 'run')
+    load_roofline(evidence / 'run', required=('1', '32'))
     return evidence
 
 
