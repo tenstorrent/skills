@@ -20,9 +20,12 @@ which skill and context Copilot actually used. Custom MCP servers are not requir
 
 Install Python 3.11+ and an authenticated Copilot CLI. The runner targets CLI
 **1.0.85** (`npm install --prefix /tmp/tt-copilot-cli @github/copilot@1.0.85`).
-Use a token supported by Copilot CLI in `COPILOT_GITHUB_TOKEN`; the runner uses a
-fresh `COPILOT_HOME`, so it does not reuse your interactive login/configuration.
-A normal Actions `GITHUB_TOKEN` is not a substitute for Copilot authentication.
+Use a token supported by Copilot CLI in `COPILOT_GITHUB_TOKEN`; the runner points
+`COPILOT_HOME` at a fresh directory so it does not reuse interactive Copilot
+settings, custom providers, or extensions. It still inherits `HOME` and `PATH`,
+so CLI credential fallbacks outside `COPILOT_HOME` (for example `gh` auth or an
+OS keychain) are not isolated. A normal Actions `GITHUB_TOKEN` is not a
+substitute for Copilot authentication.
 
 Validate cases without credentials or model calls:
 
@@ -49,9 +52,12 @@ The runner stages only the selected skill Markdown under a temporary
 the enabled candidate paths, then supplies those exact instructions and references
 in a tool-free prompt. Expected fields stay in the parent grader, outside the
 agent's workspace and prompt. Candidate scripts, hooks, and plugin manifests are
-not executed or installed. Shell, file, MCP, and delegation tools are unavailable
-to the model. Run on a disposable machine when evaluating untrusted contributions;
-a temporary directory alone is not an OS sandbox.
+not executed or installed. The CLI is invoked with flags that request no shell,
+file, MCP, or delegation tools (`--available-tools=`, `--disable-builtin-mcps`,
+`--no-bash-env`, among others); this has not been verified against a live paid
+run, so treat tool unavailability as requested, not confirmed, until someone
+records a real 1.0.85 result. Run on a disposable machine when evaluating
+untrusted contributions; a temporary directory alone is not an OS sandbox.
 
 Results record the candidate Git commit, hashes of the actual Markdown and case
 suite, CLI version, requested model, discovered skills, answers, and case status.

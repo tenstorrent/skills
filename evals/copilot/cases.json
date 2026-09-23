@@ -10,13 +10,15 @@
       "id": "review-skipped-evals",
       "skills": [".github/skills/code-review"],
       "prompt": "A proposed evaluation runner skips every case when its model CLI is missing and exits 0. The PR describes this as a successful behavioral validation. Return JSON with validation_established (boolean) and finding (string explaining your reasoning).",
-      "expected": {"validation_established": false}
+      "expected": {"validation_established": false},
+      "required_string_fields": ["finding"]
     },
     {
       "id": "review-replay-scope",
       "skills": [".github/skills/code-review"],
       "prompt": "A runner supplies skill Markdown directly in the model prompt, exposes no tools, and grades its JSON answer. The PR says this proves the plugin installs correctly in Claude Code and Codex. Return JSON with installation_established (boolean) and finding (string explaining your reasoning).",
-      "expected": {"installation_established": false}
+      "expected": {"installation_established": false},
+      "required_string_fields": ["finding"]
     }
   ]
 }

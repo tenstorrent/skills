@@ -36,7 +36,7 @@ def test_context_follows_candidate_bytes_and_excludes_executable_files(candidate
     assert before != after
 
 
-@pytest.mark.parametrize("path", ["../outside", "/tmp/outside"])
+@pytest.mark.parametrize("path", ["../outside", "/tmp/outside", "", "."])
 def test_rejects_escaping_paths(candidate, path):
     with pytest.raises(ValueError):
         smoke.skill_context(candidate, [path])
@@ -54,9 +54,46 @@ def test_grading_does_not_accept_missing_fields_or_zero_for_false():
     assert not smoke.grade({"allowed": False}, {"allowed": False})
 
 
+@pytest.mark.parametrize("finding", [None, "", "   ", 123])
+def test_grading_rejects_missing_or_empty_required_string_fields(finding):
+    answer = {"allowed": False}
+    if finding is not None:
+        answer["finding"] = finding
+    assert smoke.grade(answer, {"allowed": False}, ["finding"])
+
+
+def test_grading_accepts_populated_required_string_fields():
+    answer = {"allowed": False, "finding": "the runner skips every case"}
+    assert not smoke.grade(answer, {"allowed": False}, ["finding"])
+
+
+def test_load_cases_rejects_malformed_required_string_fields(tmp_path):
+    cases = tmp_path / "cases.json"
+    bad_case = {**case(), "required_string_fields": "finding"}
+    cases.write_text(json.dumps({"cases": [bad_case]}))
+    with pytest.raises(ValueError, match="required_string_fields"):
+        smoke.load_cases(cases)
+
+
+def test_review_cases_require_a_nonempty_finding_explanation():
+    cases = {item["id"]: item for item in
+             smoke.load_cases(smoke.REPO / "evals/copilot/cases.json")}
+    for case_id in ("review-skipped-evals", "review-replay-scope"):
+        review_case = cases[case_id]
+        assert review_case["required_string_fields"] == ["finding"]
+        key = next(iter(review_case["expected"]))
+        base = {key: review_case["expected"][key]}
+        assert smoke.grade(base, review_case["expected"], review_case["required_string_fields"])
+        assert smoke.grade({**base, "finding": "  "}, review_case["expected"],
+                            review_case["required_string_fields"])
+        assert not smoke.grade({**base, "finding": "explanation"}, review_case["expected"],
+                                review_case["required_string_fields"])
+
+
 @pytest.mark.parametrize("outcome,status", [("ok", "pass"), ("wrong", "fail"),
     ("non-json", "error"), ("timeout", "error"), ("exit", "error"),
-    ("wrong-install", "error"), ("ambient", "error"), ("bad-inventory", "error")])
+    ("wrong-install", "error"), ("ambient", "error"), ("bad-inventory", "error"),
+    ("ambiguous", "error")])
 def test_runner_results_and_agent_boundary(candidate, monkeypatch, outcome, status):
     workspaces = []
 
@@ -64,7 +101,9 @@ def test_runner_results_and_agent_boundary(candidate, monkeypatch, outcome, stat
         cwd = Path(kwargs["cwd"])
         workspaces.append(cwd)
         assert kwargs["stdin"] == subprocess.DEVNULL
-        if cmd[1:3] == ["skill", "list"]:
+        assert "--no-auto-update" in cmd
+        assert kwargs["env"]["COPILOT_HOME"] != "/inherited-settings"
+        if "skill" in cmd and "list" in cmd:
             path = cwd / ".github/skills/example/SKILL.md"
             assert path.read_text().endswith("Guidance")
             assert not list(cwd.rglob("*.json"))
@@ -75,6 +114,8 @@ def test_runner_results_and_agent_boundary(candidate, monkeypatch, outcome, stat
                 rows.append({"name": "personal-skill", "source": "user"})
             if outcome == "bad-inventory":
                 rows = {"unexpected": "shape"}
+            if outcome == "ambiguous":
+                rows.append({"name": "example", "enabled": True, "path": "/somewhere/else"})
             return subprocess.CompletedProcess(cmd, 0, json.dumps(rows))
         assert "--available-tools=" in cmd
         assert "--allow-all-tools" not in cmd
@@ -103,6 +144,27 @@ def test_missing_cli_is_error_not_skip(candidate, monkeypatch, tmp_path):
     monkeypatch.setattr("sys.argv", ["runner", "--candidate", str(candidate),
                        "--cases", str(cases), "--model", "explicit-model"])
     monkeypatch.setattr(smoke.shutil, "which", lambda _: None)
+    assert smoke.main() == 2
+
+
+def test_duplicate_staged_name_fails_validate_only(candidate, monkeypatch, tmp_path):
+    other = candidate / "skills/other/example"
+    other.mkdir(parents=True)
+    (other / "SKILL.md").write_text("---\nname: example\ndescription: Dup\n---\nGuidance")
+    dup_case = {**case(), "skills": ["skills/example", "skills/other/example"]}
+    cases = tmp_path / "cases.json"
+    cases.write_text(json.dumps({"cases": [dup_case]}))
+    monkeypatch.setattr("sys.argv", ["runner", "--candidate", str(candidate),
+                       "--cases", str(cases), "--validate-only"])
+    assert smoke.main() == 2
+
+
+def test_rejects_shell_interpreted_cli_wrapper(candidate, monkeypatch, tmp_path):
+    cases = tmp_path / "cases.json"
+    cases.write_text(json.dumps({"cases": [case()]}))
+    monkeypatch.setattr("sys.argv", ["runner", "--candidate", str(candidate),
+                       "--cases", str(cases), "--model", "explicit-model"])
+    monkeypatch.setattr(smoke.shutil, "which", lambda _: "/usr/bin/copilot.cmd")
     assert smoke.main() == 2
 
 
