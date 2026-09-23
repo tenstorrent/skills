@@ -65,6 +65,8 @@ The stage skills support Codex and Claude Code; automated multi-goal execution u
 See the [Agentic Research guide](docs/agentic-research/getting-started.md#model-bring-up) for how to
 run a bring-up, and [startup and stage orchestration](plugins/tt-model-bringup/skills/model-bringup/SKILL.md)
 for detailed setup, dry-run, and resume instructions.
+Enabled optional telemetry plugins can use the [multigoal lifecycle hooks](plugins/tt-model-bringup/telemetry-hooks.md).
+No telemetry implementation or endpoint is loaded by default.
 
 ## Alternative manual skill installation
 

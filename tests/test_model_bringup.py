@@ -231,3 +231,43 @@ def test_import_provenance_and_publication_boundary():
         assert not path.is_symlink()
         if path.suffix in {'.md', '.py', '.txt', '.sh', '.json', '.yaml'}:
             assert not re.search(r'/Users/|/home/[^<\s]+|wh-lb-\d+', path.read_text()), path
+
+
+@pytest.mark.parametrize(('attempt_kind', 'filename'), [
+    ('initial', 'model.remediation-1.jsonl'),
+    ('remediation', 'renamed-attempt.jsonl'),
+])
+def test_telemetry_attempt_kind_does_not_depend_on_log_filename(tmp_path, monkeypatch, attempt_kind, filename):
+    events = []
+    threads = []
+
+    class Extension:
+        def safe(self, method, *args):
+            events.append((method, args))
+
+    class Client:
+        def request(self, method, params, *args):
+            if method == 'thread/start':
+                return {'thread': {'id': 'fixture-thread'}}
+            if method == 'thread/goal/set':
+                return {'goal': {'objective': 'fixture objective', 'status': params['status']}}
+            if method == 'turn/start':
+                return {'turn': {'id': 'fixture-turn', 'status': 'completed'}}
+            raise AssertionError(method)
+
+    from telemetry_hooks import GuardedTelemetry
+    args = SimpleNamespace(_telemetry=GuardedTelemetry(Extension()))
+    monkeypatch.setattr(runner, 'input_items_for_objective', lambda *args: ([], []))
+    monkeypatch.setattr(runner, 'thread_start_params', lambda *args: {})
+    monkeypatch.setattr(runner, 'turn_params', lambda *args: {})
+    monkeypatch.setattr(runner, 'wait_for_turn_started', lambda *args: None)
+    monkeypatch.setattr(runner, 'wait_for_stage_terminal', lambda *args: 'complete')
+    kwargs = {} if attempt_kind == 'initial' else {'attempt_kind': attempt_kind}
+    log = tmp_path / filename
+    result = runner.execute_goal(Client(), args, tmp_path, 'fixture objective', log,
+                                 on_thread_started=threads.append, **kwargs)
+    assert result == ('complete', 'fixture-thread', None)
+    assert events[0] == ('begin_attempt', (log, attempt_kind, None))
+    assert ('thread', ('fixture-thread',)) in events
+    assert events[-1] == ('end_attempt', ('complete',))
+    assert threads == ['fixture-thread']

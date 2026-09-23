@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import functools
+import inspect
 import datetime as dt
 import json
 import os
@@ -20,6 +22,7 @@ from typing import Any, Callable
 # Load sibling support when imported by host-side tests as well as executed.
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from environment import ROOT, DEPENDENCY_SKILLS, dependency_root, environment
+from telemetry_hooks import load_telemetry
 
 
 MAX_GOAL_OBJECTIVE_CHARS = 4_000
@@ -317,6 +320,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--summary")
     parser.add_argument("--service-tier")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--telemetry-plugin", type=pathlib.Path,
+                        default=os.environ.get("TT_BRINGUP_TELEMETRY_ROOT") or None,
+                        help="Explicit optional telemetry plugin root; disabled when unset.")
     args = parser.parse_args()
     args.config = with_shell_profile_default(args.config)
     if args.start_index < 1:
@@ -689,6 +695,44 @@ def next_resume_attempt(manifest_values: dict[str, str], index: int) -> int:
     return max(attempts, default=0) + 1
 
 
+def tracked_goal(function):
+    """Report the explicit attempt kind independently of log naming conventions."""
+    @functools.wraps(function)
+    def run(*positional, **keyword):
+        bound = inspect.signature(function).bind(*positional, **keyword)
+        bound.apply_defaults()
+        values = bound.arguments
+        telemetry = getattr(values["args"], "_telemetry", None)
+        if telemetry is None:
+            return function(*positional, **keyword)
+        kind = values["attempt_kind"]
+        telemetry.safe_hook("begin_attempt", values["output_log"], kind, values.get("thread_id"))
+        if kind != "resume":
+            callback = values.get("on_thread_started")
+            def started(thread_id):
+                telemetry.safe_hook("thread", thread_id)
+                if callback is not None:
+                    callback(thread_id)
+            values["on_thread_started"] = started
+        status = "interrupted"
+        try:
+            result = function(**values)
+            status = result[0]
+            return result
+        finally:
+            telemetry.safe_hook("end_attempt", status)
+    return run
+
+
+def telemetry_input(args, input_items):
+    telemetry = getattr(args, "_telemetry", None)
+    if telemetry is not None:
+        instruction = telemetry.safe_hook("instructions")
+        if instruction:
+            input_items.append({"type": "text", "text": instruction})
+
+
+@tracked_goal
 def execute_goal(
     client: AppServerClient,
     args: argparse.Namespace,
@@ -696,12 +740,15 @@ def execute_goal(
     objective: str,
     output_log: pathlib.Path,
     on_thread_started: Callable[[str], None] | None = None,
+    *,
+    attempt_kind: str = "initial",
 ) -> tuple[str, str, str | None]:
     """Run one objective to a terminal goal status.
 
     Returns (terminal_status, thread_id, last_turn_error).
     """
     input_items, _missing = input_items_for_objective(repo, objective)
+    telemetry_input(args, input_items)
     with output_log.open("w", encoding="utf-8") as log:
         started = client.request("thread/start", thread_start_params(args, repo), log)
         thread = started.get("thread")
@@ -754,6 +801,7 @@ def execute_goal(
         return terminal, thread_id, state.last_turn_error
 
 
+@tracked_goal
 def execute_resumed_goal(
     client: AppServerClient,
     args: argparse.Namespace,
@@ -762,6 +810,8 @@ def execute_resumed_goal(
     thread_id: str,
     output_log: pathlib.Path,
     prompt_copy: pathlib.Path,
+    *,
+    attempt_kind: str = "resume",
 ) -> tuple[str, str | None]:
     """Resume an existing stage thread and run one continuation turn.
 
@@ -780,6 +830,7 @@ def execute_resumed_goal(
         ]
     )
     input_items, _missing = input_items_for_resume(repo, message, objective)
+    telemetry_input(args, input_items)
     with output_log.open("w", encoding="utf-8") as log:
         resumed = client.request("thread/resume", thread_resume_params(args, repo, thread_id), log)
         state = StageState(thread_id=thread_id, objective=objective, ignore_stale_goal_objective=True)
@@ -939,12 +990,14 @@ def remediation_objective(
     return objective
 
 
-def append_status(log_dir: pathlib.Path, name: str, goal_status: str, check_status: str) -> None:
+def append_status(log_dir: pathlib.Path, name: str, goal_status: str, check_status: str, telemetry=None) -> None:
     status = log_dir / "STATUS.md"
     if not status.exists():
         status.write_text("| stage | goal | check |\n|---|---|---|\n", encoding="utf-8")
     with status.open("a", encoding="utf-8") as f:
         f.write(f"| {name} | {goal_status} | {check_status} |\n")
+    if telemetry is not None:
+        telemetry.safe_hook("stage_result", goal_status, check_status)
 
 
 def run_stage_checks(
@@ -977,11 +1030,15 @@ def run_stage_checks(
     for attempt in range(args.check_retries + 1):
         check_log = log_dir / f"{name}.check-{attempt + 1}.log"
         code = run_check_script(script, repo, extra_env, check_log)
+        if getattr(args, "_telemetry", None) is not None:
+            args._telemetry.safe_hook("check", code, False)
         append_manifest(manifest, [f"{manifest_key_prefix}_check_attempt_{attempt + 1}=exit{code}"])
         if code not in (CHECK_PASS, CHECK_ADVISORY, CHECK_CRITICAL):
             # Broken check or environment: retry once for transients.
             check_log = log_dir / f"{name}.check-{attempt + 1}-retry.log"
             code = run_check_script(script, repo, extra_env, check_log)
+            if getattr(args, "_telemetry", None) is not None:
+                args._telemetry.safe_hook("check", code, True)
             append_manifest(manifest, [f"{manifest_key_prefix}_check_attempt_{attempt + 1}_retry=exit{code}"])
         if code == CHECK_PASS:
             append_manifest(manifest, [f"{manifest_key_prefix}_check=pass"])
@@ -1007,6 +1064,7 @@ def run_stage_checks(
             repo,
             objective,
             remediation_log,
+            attempt_kind="remediation",
             on_thread_started=lambda tid: append_manifest(
                 manifest, [f"{manifest_key_prefix}_remediation_{attempt + 1}_thread_id={tid}"]
             ),
@@ -1083,11 +1141,11 @@ def run_stage(
     append_manifest(manifest, [f"stage_{index}_terminal_status={terminal}"])
     print(f"stage_terminal_status={terminal}", file=sys.stderr)
     if terminal == "turnFailed":
-        append_status(log_dir, name, terminal, "not-run")
+        append_status(log_dir, name, terminal, "not-run", getattr(args, "_telemetry", None))
         print(f"Stopping after stage {index}: turn failed: {turn_error}", file=sys.stderr)
         return 5
     if terminal != "complete":
-        append_status(log_dir, name, terminal, "not-run")
+        append_status(log_dir, name, terminal, "not-run", getattr(args, "_telemetry", None))
         print(f"Stopping after stage {index}: goal is {terminal}", file=sys.stderr)
         return 3
 
@@ -1104,7 +1162,7 @@ def run_stage(
         prompt_copy,
         replacements,
     )
-    append_status(log_dir, name, terminal, check_status)
+    append_status(log_dir, name, terminal, check_status, getattr(args, "_telemetry", None))
     if check_status == "critical-fail":
         print(
             f"Stopping after stage {index}: verification failed critically after "
@@ -1173,11 +1231,11 @@ def run_resumed_stage(
     append_manifest(manifest, [f"stage_{index}_resume_{attempt}_terminal_status={terminal}"])
     print(f"stage_resume_terminal_status={terminal}", file=sys.stderr)
     if terminal == "turnFailed":
-        append_status(log_dir, resume_name, terminal, "not-run")
+        append_status(log_dir, resume_name, terminal, "not-run", getattr(args, "_telemetry", None))
         print(f"Stopping after resumed stage {index}: turn failed: {turn_error}", file=sys.stderr)
         return 5
     if terminal != "complete":
-        append_status(log_dir, resume_name, terminal, "not-run")
+        append_status(log_dir, resume_name, terminal, "not-run", getattr(args, "_telemetry", None))
         print(f"Stopping after resumed stage {index}: goal is {terminal}", file=sys.stderr)
         return 3
 
@@ -1195,7 +1253,7 @@ def run_resumed_stage(
         replacements,
         manifest_key_prefix=f"stage_{index}_resume_{attempt}",
     )
-    append_status(log_dir, resume_name, terminal, check_status)
+    append_status(log_dir, resume_name, terminal, check_status, getattr(args, "_telemetry", None))
     if check_status == "critical-fail":
         print(
             f"Stopping after resumed stage {index}: verification failed critically after "
@@ -1228,6 +1286,10 @@ def main() -> int:
     log_dir.mkdir(parents=True, exist_ok=True)
     replacements = parse_replacements(args.replace)
     manifest = log_dir / "manifest.txt"
+    if manifest.exists() and args.resume_stage is None and any(
+        key.endswith("_thread_id") for key in read_manifest(manifest)
+    ):
+        raise SystemExit("This log directory contains a live run. Use --resume-stage or a new --log-dir.")
     if args.resume_stage is not None and not manifest.exists():
         raise SystemExit(f"--resume-stage requires an existing manifest: {manifest}")
     manifest_values = read_manifest(manifest) if args.resume_stage is not None else {}
@@ -1252,6 +1314,11 @@ def main() -> int:
         if missing:
             raise SystemExit("Missing packaged skills: " + ", ".join(missing))
 
+    args._telemetry = load_telemetry(
+        args.telemetry_plugin, log_dir=log_dir, repo=repo, args=args, env=env,
+        codex_bin=codex_bin, hf_model=replacement_value(replacements, "HF_MODEL"),
+    )
+
     if args.dry_run:
         client: AppServerClient | None = None
         for index, prompt_path in enumerate(args.prompt_files, start=args.start_index):
@@ -1271,55 +1338,75 @@ def main() -> int:
                 return code
         return 0
 
+    telemetry = args._telemetry
     stderr_log = log_dir / "app-server.stderr.log"
-    with AppServerClient(codex_bin, repo, env, stderr_log, args.config) as client:
-        with (log_dir / "initialize.jsonl").open("w", encoding="utf-8") as init_log:
-            client.request(
-                "initialize",
-                {
-                    "clientInfo": {
-                        "name": "tt-metal-multigoal",
-                        "title": "TT Metal Multigoal Runner",
-                        "version": "1",
+    run_status = "interrupted"
+    try:
+        if telemetry is not None:
+            telemetry.safe_hook("start")
+            telemetry.safe_hook("bootstrap")
+        with AppServerClient(codex_bin, repo, env, stderr_log, args.config) as client:
+            with (log_dir / "initialize.jsonl").open("w", encoding="utf-8") as init_log:
+                client.request(
+                    "initialize",
+                    {
+                        "clientInfo": {
+                            "name": "tt-metal-multigoal",
+                            "title": "TT Metal Multigoal Runner",
+                            "version": "1",
+                        },
+                        "capabilities": {"experimentalApi": True},
                     },
-                    "capabilities": {"experimentalApi": True},
-                },
-                init_log,
-            )
-            client._send({"method": "initialized"}, init_log)
-            verify_enabled_installations(client.request(
-                "skills/list", {"cwds": [str(repo)], "forceReload": True}, init_log
-            ))
+                    init_log,
+                )
+                client._send({"method": "initialized"}, init_log)
+                verify_enabled_installations(client.request(
+                    "skills/list", {"cwds": [str(repo)], "forceReload": True}, init_log
+                ))
 
-        manifest_values = read_manifest(manifest)
-        for index, prompt_path in enumerate(args.prompt_files, start=args.start_index):
-            if args.resume_stage is not None and index < args.resume_stage:
-                continue
-            if args.resume_stage is not None and index == args.resume_stage:
-                code = run_resumed_stage(
-                    client,
-                    args,
-                    repo,
-                    log_dir,
-                    manifest,
-                    index,
-                    prompt_path,
-                    replacements,
-                    manifest_values,
-                )
-            else:
-                code = run_stage(
-                    client,
-                    args,
-                    repo,
-                    log_dir,
-                    manifest,
-                    index,
-                    prompt_path,
-                    replacements,
-                )
-            if code != 0:
-                return code
+            manifest_values = read_manifest(manifest)
+            for index, prompt_path in enumerate(args.prompt_files, start=args.start_index):
+                if args.resume_stage is not None and index < args.resume_stage:
+                    continue
+                if telemetry is not None:
+                    telemetry.safe_hook("begin_stage", index)
+                if args.resume_stage is not None and index == args.resume_stage:
+                    code = run_resumed_stage(
+                        client,
+                        args,
+                        repo,
+                        log_dir,
+                        manifest,
+                        index,
+                        prompt_path,
+                        replacements,
+                        manifest_values,
+                    )
+                else:
+                    code = run_stage(
+                        client,
+                        args,
+                        repo,
+                        log_dir,
+                        manifest,
+                        index,
+                        prompt_path,
+                        replacements,
+                    )
+                if telemetry is not None:
+                    telemetry.safe_hook("end_stage")
+                if code != 0:
+                    run_status = "stopped"
+                    return code
+
+        run_status = "complete"
+    finally:
+        if telemetry is not None:
+            telemetry.safe_hook("end_stage", "interrupted")
+            try:
+                telemetry.safe_hook("finish", run_status)
+            finally:
+                telemetry.close()
 
     print(f"\nAll {len(args.prompt_files)} goals completed.", file=sys.stderr)
     print(f"Logs: {log_dir}", file=sys.stderr)
