@@ -1,0 +1,25 @@
+{
+  "name": "tt-buddy",
+  "displayName": "Tenstorrent Buddy",
+  "version": "0.1.0",
+  "description": "A coding agent with Tenstorrent operating principles: takes notes all the time, learns when needed, keeps the diff minimal.",
+  "author": {
+    "name": "Tenstorrent"
+  },
+  "homepage": "https://github.com/tenstorrent/skills",
+  "repository": "https://github.com/tenstorrent/skills",
+  "license": "Apache-2.0",
+  "keywords": [
+    "tenstorrent",
+    "tt-metal",
+    "notes",
+    "workflow"
+  ],
+  "skills": "./skills/",
+  "mcpServers": {
+    "deepwiki": {
+      "type": "http",
+      "url": "https://mcp.deepwiki.com/mcp"
+    }
+  }
+}

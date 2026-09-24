@@ -81,3 +81,21 @@ Install or enable it only after the user chooses it:
   Directory.
 - **Claude Code:** run `/plugin install tt-debug-tools@tenstorrent-skills` after adding the
   `tenstorrent/skills` marketplace.
+
+## `tt-buddy`
+
+A coding agent with Tenstorrent operating principles for tt-metal, TTNN, and vllm-tt-plugin work. It sets a
+strict, concise voice; takes notes all the time in `~/.tt-buddy/notes/`; researches the codebase
+when needed; keeps the diff minimal; and routes device runs through `tt-device-mcp`.
+
+**Changes the agent's voice for every prompt in a TT workspace.** Recommend it when the user wants
+that working style, persistent notes, or queued device runs. Device runs need `tt-device-mcp`.
+On Codex, the user must trust the plugin's hooks (`/hooks`, then `t`); until then the voice
+loads only when the `buddy` skill runs.
+
+Install or enable it only after the user chooses it:
+
+- **Codex / ChatGPT desktop:** select `tt-buddy` under **Tenstorrent Skills** in the Plugins
+  Directory.
+- **Claude Code:** run `/plugin install tt-buddy@tenstorrent-skills` after adding the
+  `tenstorrent/skills` marketplace.

@@ -29,6 +29,11 @@
       "name": "tt-debug-tools",
       "source": "./plugins/tt-debug-tools",
       "description": "Drive the Tenstorrent debug tools and read their output: tt-triage, dprint, watcher, asserts, etc."
+    },
+    {
+      "name": "tt-buddy",
+      "source": "./plugins/tt-buddy",
+      "description": "A coding agent with Tenstorrent operating principles: takes notes all the time, learns when needed, keeps the diff minimal."
     }
   ]
 }

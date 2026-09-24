@@ -1,0 +1,40 @@
+{
+  "name": "tt-buddy",
+  "version": "0.1.0",
+  "description": "A coding agent with Tenstorrent operating principles: takes notes all the time, learns when needed, keeps the diff minimal.",
+  "author": {
+    "name": "Tenstorrent"
+  },
+  "homepage": "https://github.com/tenstorrent/skills",
+  "repository": "https://github.com/tenstorrent/skills",
+  "license": "Apache-2.0",
+  "keywords": [
+    "tenstorrent",
+    "tt-metal",
+    "notes",
+    "workflow"
+  ],
+  "skills": "./skills/",
+  "mcpServers": {
+    "deepwiki": {
+      "type": "http",
+      "url": "https://mcp.deepwiki.com/mcp"
+    }
+  },
+  "interface": {
+    "displayName": "Tenstorrent Buddy",
+    "shortDescription": "A coding agent with Tenstorrent operating principles",
+    "longDescription": "Strict, concise voice for tt-metal work. Takes notes all the time, learns the codebase when needed, keeps the diff minimal, and routes device runs through tt-device-mcp.",
+    "developerName": "Tenstorrent",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Persistent notes",
+      "Codebase research",
+      "Device run routing"
+    ],
+    "websiteURL": "https://github.com/tenstorrent/skills",
+    "defaultPrompt": [
+      "How does program caching work in tt-metal?"
+    ]
+  }
+}
