@@ -65,3 +65,26 @@ These tests use synthetic generators and tokenizers. Model accuracy and performa
 require separate hardware measurements with recorded implementation identity,
 protocol and sample coverage. Benchmark completion checks measurement integrity and
 report completeness; accuracy acceptance belongs to the bringup owner.
+
+## Trace allocation guidance (0.1.15)
+
+Adapt the six-skill policy change from [tt-metal #54769](https://github.com/tenstorrent/tt-metal/pull/54769),
+commit `0799df070a5b07583f4315550a8daed925be84cb`, to this plugin's canonical skill paths.
+References and API examples were checked against [tt-metal #53735](https://github.com/tenstorrent/tt-metal/pull/53735),
+merged as `c05eff453698efb2c992c078de21d1e3c8ed7036`, and main at
+`b99aa035f391aa32466350090543bc0eabb026bb`.
+The guide lives in the target checkout at
+`tech_reports/AdvancedPerformanceOptimizationsForModels/TraceCorrectness.md`;
+the public Python helpers live in `ttnn.tools.trace_allocation_tracker`.
+
+Generator-wide two-phase warmup follows [tt-metal #42698](https://github.com/tenstorrent/tt-metal/issues/42698)
+and the prepare/record split in [#55343](https://github.com/tenstorrent/tt-metal/pull/55343),
+merged as `743890db568bd3ff9626166a2ae201c28aa35072`.
+That implementation is a warmup-structure reference, not an endorsement of its
+broad allocation scopes. Cross-request reuse and exact-buffer acknowledgment
+requirements address [#51800](https://github.com/tenstorrent/tt-metal/issues/51800)
+and [#57299](https://github.com/tenstorrent/tt-metal/issues/57299), including
+cross-trace lifetime proofs and unexpected-allocation negative controls.
+
+Only packaged hashes for the six edited skills change in `sync-source.json`;
+the original import provenance stays intact. No tracker runtime code is vendored.

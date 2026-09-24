@@ -48,7 +48,7 @@ Keep setup-time work outside the hot runtime path: weight conversion, dtype choi
 
 Do not use repeated full-stack model runs as the normal debugging loop. After one or two expensive full-model failures, build a reduced reproducer before continuing: for example, load the same full-model wrapper with one real layer of each kind, real tensor shapes, real cache/page-table shapes, real terminal norm/LM head/sampling, and a short prompt/generation length. Use that reduced full-model path to localize wrapper, trace, cache, page-table, LM-head, or sampling bugs, then return to the all-layer model for final evidence. If the reduced reproducer cannot expose the failure, record why before spending more full-stack runs.
 
-Avoid hidden host fallback in a single prefill or decode pass. The final decode path uses traced TTNN execution. Teacher-forcing readiness runs through traced decode. Eager decode is useful only while debugging and is not completion evidence. When adding trace capture/replay or debugging trace execution failures, use `$tt-enable-tracing`.
+Avoid hidden host fallback in a single prefill or decode pass. The final decode path uses traced TTNN execution. Teacher-forcing readiness runs through traced decode. Eager decode is useful only while debugging and is not completion evidence. When adding trace capture/replay or debugging trace execution failures, use `$tt-enable-tracing`. Before accepting the full-model trace, run representative repeated token-out replay with `TT_METAL_TRACE_ALLOC_TRACKING=1`. Exercise every captured trace key in the ordering used by the generator, including persistent decode and sampling inputs/outputs, and resolve every unsafe allocation under the contract in the target tt-metal checkout's `tech_reports/AdvancedPerformanceOptimizationsForModels/TraceCorrectness.md`.
 
 The full-model stage owns sampling. A full model is complete only when token-out decode uses the canonical split-sampling contract:
 
@@ -68,8 +68,9 @@ Some shared tests require host-side sampling. Support that as an explicit compat
 
 Build decode around persistent device state:
 
+- own generator-wide two-phase warmup for both standalone and serving use: prepare all supported prefill/decode/sampling variants before the first capture, as specified by `$tt-enable-tracing`; restore warmup-mutated KV/request and RNG state;
 - allocate stable token, current-position/RoPE, page-table, KV-cache, sampler, output, and any CCL buffers before capture;
-- capture model decode and sampling traces over those stable tensors;
+- capture model decode and sampling traces over those stable tensors and retain them across compatible requests and mode switches;
 - feed the next token through `tt_out_tok`, not a host reconstruction path;
 - advance current-position/RoPE state on device for each replay when the decode step is a simple increment;
 - skip page-table copies when the page table is unchanged;

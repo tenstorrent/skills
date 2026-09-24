@@ -86,6 +86,20 @@ Return `more-work-needed` when evidence shows one of these:
   explanation;
 - a required check, artifact, metric, or implementation path from the goal
   contract is missing, failing, stale, or contradicted by another artifact;
+- a stage adds or changes trace capture/replay but has no representative
+  repeated-replay evidence with `TT_METAL_TRACE_ALLOC_TRACKING=1`, accepts a run
+  that excludes program-cache allocations, or exempts an entire capture/forward/
+  warmup instead of identifying the intended corruptible allocations;
+- a corruptible-buffer acknowledgment lacks a backing-allocation/alias lifetime
+  invariant against every live trace, or an acknowledgment change lacks the
+  unexpected-allocation negative control required by `$tt-enable-tracing`;
+- supported prefill/decode/sampling or eager helper paths compile or allocate
+  unsafe persistent state after the first capture because generator-wide
+  preparation is missing; warmup protection exists only in the serving wrapper;
+- compatible requests or returns to retained trace keys trigger recapture,
+  without a demonstrated invalidation or capacity constraint and measured
+  request-latency cost; trace reuse is claimed without cross-request trace-ID
+  and capture/release-count evidence;
 - logs or code show a plausible bug in a stage-critical subsystem, such as
   cache ownership, trace replay, token feedback, sampling, precision policy,
   page-table handling, or model output correctness;
