@@ -18,8 +18,9 @@
    - No entry: no local device. Report it.
    - New backends add a branch here. See `execution.md` § Backend contract.
 
-4. **Env values for jobs:** `$USER`, `$HF_HOME`, whether `$HF_TOKEN` is set.
-   - These feed `inherited_env` for device jobs. See `execution.md`.
+4. **Env values for jobs:** `$USER`, `$HF_HOME`.
+   - Whether `$HF_TOKEN` is set: report only. NEVER copy its value.
+   - These feed the device job env file. See `execution.md`.
 
 ## Output
 

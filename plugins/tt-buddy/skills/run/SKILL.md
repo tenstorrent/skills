@@ -23,7 +23,8 @@ Invoke `tt-buddy:run` to:
 - **Recover the device**: triage → kill → reset → verify → cache.
 - **Reset the device** as a single step.
 
-- NEVER call `pytest`, server launches, or device commands via Bash.
+- NEVER run device-touching commands via Bash: tests, servers, scripts.
+- Host-only commands (e.g. host-stub test suites) run via Bash.
 - Bypassing skips § MCP Routing Rule. Runs become unreproducible.
 - Building is **not** in scope.
 - Builds follow `<plugin-root>/recipes/<repo>/build.md` directly, via Bash.

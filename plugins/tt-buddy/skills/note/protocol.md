@@ -84,14 +84,15 @@ git add -A && git commit -m "init: capture existing notes"
 ## Atomic-write protocol
 
 - One entry per file per invocation.
-- `git add <file> && git commit -m "<subject>"` as one bash compound.
+- `git add <file> && git commit -m "<subject>" -- <file>` as one bash compound.
+- The `-- <file>` pathspec keeps other staged paths out of the commit.
 
 **Per write:**
 
 1. `BEFORE_HEAD=$(git -C ~/.tt-buddy/notes rev-parse HEAD 2>/dev/null || echo "")`
 2. Read the topic file. Absent: initialize with `# <topic>\n\n`.
 3. Prepend the new entry. Write the file.
-4. `git -C ~/.tt-buddy/notes add <file> && git -C ~/.tt-buddy/notes commit -m "<subject>"`.
+4. `git -C ~/.tt-buddy/notes add <file> && git -C ~/.tt-buddy/notes commit -m "<subject>" -- <file>`.
 5. Verify `git -C ~/.tt-buddy/notes rev-parse HEAD~1` equals `BEFORE_HEAD`.
    - Not equal: another commit landed during 2–4.
    - Run `git reset --soft HEAD~1`, re-read, re-prepend.

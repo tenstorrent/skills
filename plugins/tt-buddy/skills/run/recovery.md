@@ -52,11 +52,11 @@ triage → kill → reset → verify → cache (conditional)
 
 | Cache | Path |
 |---|---|
-| Global tt-metal cache | `~/.cache/tt-metal-cache/` |
+| Global tt-metal cache | `$HOME/.cache/tt-metal-cache/` |
 | Workspace cache | `<workspace>/.tt-metal-cache/` |
 
 ```
-rm -rf ~/.cache/tt-metal-cache/ <workspace>/.tt-metal-cache/
+rm -rf -- "$HOME/.cache/tt-metal-cache/" "<workspace>/.tt-metal-cache/"
 ```
 
 - Unsure if kernel code changed: clear both.

@@ -23,7 +23,7 @@ A device backend is a **mode file**. It MUST provide:
 | Section the mode file provides | Owns |
 |---|---|
 | § Tools | tool per operation: queued run, background, push-through, reset, kill |
-| § Env file | env output format, path, and `<run-id>` scheme |
+| § Env file | env file format, path, and `<run-id>` scheme |
 | § Push-through pathway | how to bypass the queue for live inspection |
 | § Recovery substitutions | per-step triage / kill / reset / verify commands |
 | § Failure handling | backend-specific failure rows |
@@ -42,7 +42,7 @@ A device backend is a **mode file**. It MUST provide:
 
 Build env content from three sources, in order:
 
-1. **Workspace-detect:** paths, `$USER`, `HF_HOME`, `HF_TOKEN`.
+1. **Workspace-detect:** paths, `$USER`, `HF_HOME`.
 2. **Learn note** (`~/.tt-buddy/notes/learn-<target-slug>-params.md`):
    - Required and optional env vars, numeric constraints, paths.
    - Authoritative: extracted from source, not recipe tables.
@@ -67,7 +67,7 @@ Build env content from three sources, in order:
 
 ```bash
 TT_METAL_OPERATION_TIMEOUT_SECONDS=30 \
-TT_METAL_DISPATCH_TIMEOUT_COMMAND_TO_EXECUTE='<workspace>/tt-metal/tools/tt-triage.py --disable-progress --triage-summary-path=$HOME/.tt-buddy/triage/<run-id>/triage_summary.txt 2>&1 | tee $HOME/.tt-buddy/triage/<run-id>/triage_output.txt' \
+TT_METAL_DISPATCH_TIMEOUT_COMMAND_TO_EXECUTE='"<workspace>/tt-metal/tools/tt-triage.py" --disable-progress --triage-summary-path="$HOME/.tt-buddy/triage/<run-id>/triage_summary.txt" 2>&1 | tee "$HOME/.tt-buddy/triage/<run-id>/triage_output.txt"' \
 <command>
 ```
 

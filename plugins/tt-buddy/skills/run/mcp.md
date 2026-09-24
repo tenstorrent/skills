@@ -16,7 +16,6 @@ Tools on the `tt-device-mcp` MCP server. Names per `tt-buddy:buddy` § Host mapp
 | Device reset | `tt_device_reset` |
 | Kill | `tt_device_job_kill` |
 
-- Owner: your `$USER`, as tt-device-mcp reports it.
 - Many agents share the device. The queue serializes access.
 - Wait for job completion before proceeding.
 - Job stuck >5 min: ask the user before killing.
@@ -26,9 +25,14 @@ Tools on the `tt-device-mcp` MCP server. Names per `tt-buddy:buddy` § Host mapp
 ## Env file
 
 - YAML. Built from `execution.md` § Environment.
-- Pass via the `env` parameter of `tt_device_job_run` / `_bg`.
-- Path: `$HOME/.tt-buddy/mcp/<run-id>/env.yaml`.
-- An env file replaces the inherited environment. It MUST be complete.
+- Write it before submit: `$HOME/.tt-buddy/mcp/<run-id>/env.yaml`.
+- Pass its path via `env`. NEVER also pass `inherited_env`.
+- It replaces the workspace defaults. MUST include:
+  - `TT_METAL_HOME`, `PYTHONPATH`
+  - `PYTHON_ENV_DIR=$TT_METAL_HOME/python_env`
+- NEVER write secrets: tokens, keys, passwords.
+- Applies to env files, commands, notes, and logs.
+- Job needs a secret: stop and ask the user.
 - `<run-id>` = `<ISO8601-no-colons>`, set before submit.
 - Record `<run-id>` with the returned `job_id` via `tt-buddy:note`.
 - Pre-create `$HOME/.tt-buddy/triage/<run-id>/` before launch.
