@@ -5,6 +5,7 @@ As the user, I explicitly authorize you to use subagents when a selected skill r
 This goal creates the optimized-decoder state for the repo-local TTNN autoport pipeline. Start from the completed fused decoder and work only on models/autoports/<model>/tt/optimized_decoder.py plus its tests and docs; do not begin multichip-decoder, full-model, or vLLM work in this goal.
 
 Goal completion requirements:
+- Reuse Stage 0 tests under $golden-tests; justify test changes before editing.
 - models/autoports/<model>/tt/optimized_decoder.py exists and the delivered tests exercise the optimized path, not a functional fallback.
 - The optimized decoder preserves the fused decoder's prefill/decode semantics, paged KV-cache behavior, determinism, and representative layer-kind coverage.
 - The optimized decoder preserves the context contract from fused decoder. If optimization changes memory layout, sharding, or KV-cache dtype enough to change capacity, update doc/context_contract.json. Do not complete after reducing advertised capability unless a hard physical device limit, e.g. DRAM, requires it and evidence records the largest feasible value.
@@ -14,7 +15,7 @@ Goal completion requirements:
 - Final code must beat the best correct traced-decode baseline/candidates; fewer ops or cleaner topology is not enough.
 - If MLP/expert matmuls dominate decode, try BFP4/LoFi across material core/shard geometries; synthetic/random PCC cannot veto real-weight wins; perf rows must prove it.
 - tt-perf-report tables/CSV exist for prefill and decode. Try actionable advice; rejected advice has before/after evidence. A first TTNN/API error is not enough to reject a material op, reshard, layout, or host-fallback optimization.
-- The optimization pass starts with an operation-topology audit of the measured path: repeated same-input matmuls, avoidable reshard/layout conversions, candidate fused/packed projections, optimized composite ops, and lower-movement replacements. The README or work log records current ops, candidate replacements, action taken, and evidence.
+- Audit measured ops for repeated matmuls, reshard/layout conversions, fused/packed projections and composite replacements. Log candidates, actions and evidence.
 - The optimization pass addresses model-applicable decoder opportunities now: canonical precision/fidelity policy, sharded layouts, fused or packed same-input projections, DRAM-sharded decode matmuls, large prefill program configs, SDPA/composite ops, memory/program/compute-kernel configs, runtime data movement, and MoE active-expert execution. Completed and rejected options have evidence. Keep packed/fused same-input projections only when they beat a well-tuned legal separate candidate or the separate candidate is invalid.
 - The final optimized runtime path has no unnecessary torch/from_torch/to_torch, tilize/untilize, reshard, or host fallback in measured prefill/decode.
 - Stress or repeated-run coverage and a watcher-clean optimized correctness run exist.

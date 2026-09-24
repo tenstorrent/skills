@@ -110,6 +110,12 @@ ssh "$PHYSICAL_HOST" "cd '$WORK_ROOT' && test -d tt-inference-server || git clon
 
 The required repo tag is model-specific. Do not assume `main` or `v0.9.0`.
 
+Read the workload requirements before selecting a TTI revision. Prefer a source
+revision supplied there; otherwise choose and pin a compatible one. Inspect the
+matching model/eval entry, use requirements as coverage priorities, and record
+the revision, configuration, and effective subsets in `RUN_NOTES.md`. Label a
+CI subset as subset evidence, never full-set quality.
+
 Use one of these evidence-backed methods:
 
 - Run the command on the default checkout and follow the version mismatch error if `run.py` says to checkout a matching release tag.
@@ -253,6 +259,16 @@ concerns release benchmark scores, not earlier stages' required HF tensor/PCC ch
 ## Run The Release Workflow
 
 Run the release workflow only after the smoke passes. Keep the generated autoport vLLM server running and run TTI as a client. Never print tokens.
+
+After the smoke, run representative performance benchmarks before expensive
+accuracy or agentic evaluations. Use requirements-informed workloads to expose
+serving failures and severe slowdowns; repair those before spending on evals,
+but do not wait for every performance target to be met. Use the measurements
+to estimate eval runtime. Inspect the checkout's release order: if it runs
+evals first, make a small recorded local ordering change so benchmarks run
+first while preserving all release children and report aggregation. Reuse
+valid benchmark results when the harness supports it; rerun only results
+invalidated by changes to the model, server, or workload.
 
 Before launching it, estimate the unrestricted model-specific eval runtime from
 the measured optimized-vLLM serving throughput, the selected eval tasks, their

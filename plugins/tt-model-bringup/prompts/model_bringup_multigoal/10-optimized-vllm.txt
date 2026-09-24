@@ -5,12 +5,15 @@ Subagents are authorized when a selected skill requests or recommends them.
 Start from completed vLLM integration and the selected datatype-sweep config; optimize serving in place.
 
 Goal completion requirements:
+- Reuse Stage 0 tests under $golden-tests; justify test changes before editing.
+- Read the Stage 0 requirements summary and MODEL_REQUIREMENTS. Use them to prioritize final serving workloads/features and record material tradeoffs; batch-one PCC tests are not the whole serving workload.
 - The measured path is real vLLM TT plugin serving through models/autoports/<model>/tt/generator_vllm.py.
 - vLLM sampling tests, qualitative outputs, primary single-user benchmarks, and CI serving-burst benchmarks pass.
 - Warmed primary single-user TTFT, TPOT, ITL, aggregate throughput, and TPOT-derived decode t/s/u are measured before and after using the same run_vllm_server workload, generation mode, max-num-seqs, max-model-len, mesh, sampling mode, and TT config.
 - CI serving-burst metrics are measured before and after as capacity/nightly-parity evidence. Do not use CI burst as headline decode t/s/u.
 - Preserve the context contract. Do not lower `max_model_len`, benchmark context, or eval context below doc/context_contract.json except for a proven hard physical limit.
 - Preserve valid non-aligned prompt-length serving support while optimizing. Do not trade it away for an aligned-only faster path.
+- Keep valuable cache, chunked-prefill, and speculative-decoding features when the requirements call for them; rebenchmark representative workloads and disclose material gaps.
 - Optimized vLLM decode is about as fast as optimized full-model traced decode for comparable work.
 - The adapter implements async decode: `decode_forward(..., read_from_device=False)` returns device tensors; deferred reads are minimal; `supports_async_decode` is true only when vLLM exercises it.
 - Serving decode reuses persistent trace inputs and calls ttnn.execute_trace(..., blocking=False). Any synchronization or host read happens after the async boundary and is limited to the plugin contract.

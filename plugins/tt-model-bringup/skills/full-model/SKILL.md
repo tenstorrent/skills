@@ -30,6 +30,8 @@ Implement the model-specific pieces around the working block stack:
 
 Use the strongest correct implementation available as your block stack. If there are several candidates, choose the one with the best evidence for the target mesh and explain the choice.
 
+An upstream decoder precision or fidelity policy is a starting point, not proof of complete-model correctness. If the integrated model fails an applicable numerical gate and controlled comparisons implicate an inherited policy, revise the smallest implicated choice in this stage. Rerun the affected decoder checks and the full-model gate, then update the policy, performance, and capacity evidence. Do not preserve an invalid inherited choice solely because an earlier stage selected it.
+
 ## Capability And Context Contract
 
 The full model must support the context length advertised by the HF config. Start from `models/autoports/<model>/doc/context_contract.json`, then recompute it for the full layer stack. Include all loaded weights, the full-layer KV cache, page tables, trace buffers, persistent CCL buffers, and other long-lived tensors that consume device DRAM.
@@ -140,6 +142,11 @@ python -m readiness_check.generate \
 Raw Tale-of-Two-Cities/book references can still be useful as extra stress coverage, but they should not be the main quality gate for an instruct model unless the model lacks a usable chat template. Use `$qualitative-check` for all prompt-based quality checks, prompt-format evidence, HF controls, and raw-completion versus chat-template classification.
 
 Generate the main reference fresh by default. Reuse a reference only when metadata under the current autoport directory proves the same HF model id and revision, tokenizer, prompt source, chat-template flag, generation length, top-k, and generation command. If any of that is missing or mismatched, regenerate the reference rather than carrying forward a possibly contaminated artifact.
+
+In a Stage 0 pipeline, first check for its exported `readiness_v1` reference and
+matching provenance. Reuse it when those fields match. If AIME/chat requirements
+need a different reference, generate that once, record its metadata and reuse it
+across unchanged reruns; do not regenerate the Stage 0 golden suite.
 
 Free-running comparison must be strong enough to catch feedback bugs; teacher forcing cannot see them by construction (it overrides the token-feedback path every step). Use several prompts and the longest feasible generation - at least 64-128 tokens when runtime allows - not a single short continuation. Then run:
 

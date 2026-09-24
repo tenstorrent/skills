@@ -69,6 +69,7 @@ def test_clean_package_runs_all_goals_without_codex_or_old_framework(installed):
     prompts = sorted((plugin / 'prompts/model_bringup_multigoal').glob('*.txt'))
     result = run(sys.executable, str(plugin / 'scripts/multigoal'), *map(str, prompts),
                  '--replace', 'HF_MODEL=org/model', '--replace', 'MODEL_DIR=models/autoports/org_model',
+                 '--replace', 'MODEL_REQUIREMENTS=workloads.yaml',
                  '--dry-run', cwd=target, env=env)
     assert result.returncode == 0, result.stderr
     assert 'missing skill' not in result.stderr
@@ -76,8 +77,11 @@ def test_clean_package_runs_all_goals_without_codex_or_old_framework(installed):
     assert len(manifests) == 1
     manifest = runner.read_manifest(manifests[0])
     assert manifest['stage_11_dry_run'] == 'true'
+    assert manifest['stage_0_dry_run'] == 'true'
+    assert 'golden-tests' in manifest['stage_0_skills'].split(',')
+    assert 'functional-decoder' in manifest['stage_1_skills'].split(',')
     assert manifest['stage_6_check_script'].startswith(str(plugin))
-    assert len(list(manifests[0].parent.glob('*.prompt.txt'))) == 11
+    assert len(list(manifests[0].parent.glob('*.prompt.txt'))) == 12
     assert not (target / '.agents').exists()
 
 
@@ -94,7 +98,8 @@ def test_environment_imports_offline_checker_without_model_dependencies(installe
 def test_goal_skill_references_and_objectives(monkeypatch):
     monkeypatch.setenv('TT_AUTODEBUG_ROOT', str(AUTODEBUG))
     for path in (PLUGIN / 'prompts/model_bringup_multigoal').glob('*.txt'):
-        objective = runner.objective_from_prompt(runner.load_prompt(path, [('HF_MODEL', 'org/model')]))
+        objective = runner.objective_from_prompt(runner.load_prompt(path, [
+            ('HF_MODEL', 'org/model'), ('MODEL_REQUIREMENTS', 'workloads.yaml')]))
         items, missing = runner.input_items_for_objective(Path('/unused'), objective)
         assert not missing
         assert items[0]['text'] == objective
@@ -103,6 +108,12 @@ def test_goal_skill_references_and_objectives(monkeypatch):
             assert str(REPO / 'plugins') in item['path']
     with pytest.raises(SystemExit, match='limit'):
         runner.objective_from_prompt('/goal ' + 'x' * 4001)
+
+
+def test_stage_zero_requires_an_explicit_workload_file():
+    prompt = PLUGIN / 'prompts/model_bringup_multigoal/00-golden-tests.txt'
+    with pytest.raises(SystemExit, match='MODEL_REQUIREMENTS'):
+        runner.load_prompt(prompt, [('HF_MODEL', 'org/model')])
 
 
 def test_skill_graph_and_package_links_resolve():

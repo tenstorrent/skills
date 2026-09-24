@@ -64,6 +64,22 @@ required follow-up as a finding; do not perform it inside the review.
 
 ## Review Stance
 
+For Stage 0, verify the inventory, requirements coverage, reference provenance,
+cached-test harness and semantic adapter contract against PyTorch. Check that the
+lightweight analysis explains each case's layer/state behavior; no decoder skeleton
+or matching implementation structure is required. TTNN execution is not yet expected. For later pipeline stages,
+read [the golden-test contract](../golden-tests/SKILL.md#later-stages), inspect test
+and manifest changes from Stage 0, and require evidence for any correction. Reject
+weakened assertions, substituted goldens, skipped cases or adapters that bypass the
+delivered stage implementation. Verify required cases ran against cached references.
+Match the manifest's layer kinds, cases and execution modes to machine-readable
+test results for the delivered revision. Missing/skipped cases, collection errors,
+zero executed tests or only TTNN-vs-TTNN parity require `more-work-needed`.
+Use the packaged golden gate's fresh pytest/provenance files. At Stage 0 verify
+that the CPU adapter wraps original PyTorch layers and computes from captured
+inputs/state, rather than returning expected values or reimplementing the model,
+and that negative controls catch wrong cache updates, not just malformed files.
+
 Tell the reviewer:
 
 - Treat agent-written READMEs and work logs as claims, not facts.
@@ -205,6 +221,7 @@ For optimization stages, also inspect:
 
 - before/after measurements in the same regime;
 - whether optimized paths from previous stages were preserved;
+- whether a broader current-stage correctness result invalidates an inherited precision or fidelity choice. A targeted repair is valid when its controls identify the inherited policy as insufficient, affected earlier checks and current-stage gates are rerun, and performance plus capacity evidence is refreshed. Do not require an invalid policy to be preserved solely because an earlier stage selected it;
 - evidence for rejected optimizations or "already optimal" claims;
 - whether rejected optimizations were actually earned. For any material
   optimization that would remove an op, collective, reshard, or layout

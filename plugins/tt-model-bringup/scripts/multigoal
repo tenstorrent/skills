@@ -8,6 +8,8 @@ import datetime as dt
 import json
 import os
 import pathlib
+import queue
+import random
 import re
 import subprocess
 import sys
@@ -24,6 +26,7 @@ from environment import ROOT, DEPENDENCY_SKILLS, dependency_root, environment
 
 MAX_GOAL_OBJECTIVE_CHARS = 4_000
 TERMINAL_GOAL_STATUSES = {"complete", "blocked", "usageLimited", "budgetLimited"}
+TURN_DRAIN_TIMEOUT = 300.0
 SKILL_RE = re.compile(r"\$([A-Za-z0-9][A-Za-z0-9_-]*)")
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 SHELL_PROFILE_CONFIG = "shell_environment_policy.experimental_use_profile"
@@ -61,6 +64,7 @@ class StageState:
     active_turns: set[str] = field(default_factory=set)
     last_turn_status: str | None = None
     last_turn_error: str | None = None
+    last_turn_id: str | None = None
     ignore_stale_goal_objective: bool = False
     stale_goal_objective_ignored: bool = False
 
@@ -83,6 +87,7 @@ class AppServerClient:
         self._write_lock = threading.Lock()
         self._stderr_tail: list[str] = []
         self._stderr_thread: threading.Thread | None = None
+        self._stdout_queue: queue.Queue[str | None] = queue.Queue()
 
     def __enter__(self) -> AppServerClient:
         args = [self.codex_bin]
@@ -101,6 +106,19 @@ class AppServerClient:
             bufsize=1,
         )
         self._start_stderr_drain_thread()
+        # A queue avoids select()+TextIO buffering races and permits interruptible
+        # backoff while continuing to consume goal/turn notifications.
+        stdout = self.proc.stdout
+        assert stdout is not None
+
+        def drain_stdout() -> None:
+            try:
+                for line in stdout:
+                    self._stdout_queue.put(line)
+            finally:
+                self._stdout_queue.put(None)
+
+        threading.Thread(target=drain_stdout, daemon=True).start()
         return self
 
     def __exit__(self, _exc_type: object, _exc: object, _tb: object) -> None:
@@ -146,9 +164,12 @@ class AppServerClient:
         self,
         log: Any,
         on_event: Callable[[JsonObject], None] | None = None,
+        timeout: float | None = None,
     ) -> JsonObject:
+        deadline = None if timeout is None else time.monotonic() + timeout
         while True:
-            message = self._read(log)
+            remaining = None if deadline is None else max(0, deadline - time.monotonic())
+            message = self._read(log, remaining)
             if "id" in message and "method" in message:
                 self._handle_server_request(message, log)
                 continue
@@ -188,10 +209,13 @@ class AppServerClient:
             self.proc.stdin.write(json.dumps(payload) + "\n")
             self.proc.stdin.flush()
 
-    def _read(self, log: Any) -> JsonObject:
+    def _read(self, log: Any, timeout: float | None = None) -> JsonObject:
         if self.proc is None or self.proc.stdout is None:
             raise RuntimeError("app-server process is not running")
-        line = self.proc.stdout.readline()
+        try:
+            line = self._stdout_queue.get(timeout=timeout)
+        except queue.Empty:
+            raise TimeoutError("waiting for app-server event") from None
         if not line:
             tail = "\n".join(self._stderr_tail[-40:])
             raise RuntimeError(f"app-server closed stdout; stderr tail:\n{tail}")
@@ -262,8 +286,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--start-index",
         type=int,
-        default=1,
-        help="Stage number to use for the first prompt file, useful when continuing from a later stage.",
+        default=None,
+        help="First stage number; defaults to 0 for a 00-* first prompt, otherwise 1. Override for later-stage selections.",
     )
     parser.add_argument(
         "--resume-stage",
@@ -316,13 +340,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--effort")
     parser.add_argument("--summary")
     parser.add_argument("--service-tier")
+    parser.add_argument(
+        "--overload-retry-budget", type=int, default=21600, metavar="SECONDS",
+        help="Total automatic overload backoff per stage (default: 21600 / 6 hours; 0 disables).",
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     args.config = with_shell_profile_default(args.config)
-    if args.start_index < 1:
-        raise SystemExit("--start-index must be >= 1")
-    if args.resume_stage is not None and args.resume_stage < 1:
-        raise SystemExit("--resume-stage must be >= 1")
+    if args.overload_retry_budget < 0:
+        raise SystemExit("--overload-retry-budget must be >= 0")
+    if args.start_index is None:
+        args.start_index = 0 if args.prompt_files[0].name.startswith("00-") else 1
+    if args.start_index < 0:
+        raise SystemExit("--start-index must be >= 0")
+    if args.resume_stage is not None and args.resume_stage < 0:
+        raise SystemExit("--resume-stage must be >= 0")
     if args.resume_stage is not None and args.log_dir is None:
         raise SystemExit("--resume-stage requires --log-dir pointing at the existing multigoal log directory")
     return args
@@ -356,6 +388,8 @@ def load_prompt(path: pathlib.Path, replacements: list[tuple[str, str]]) -> str:
     text = path.read_text()
     for old, new in replacements:
         text = text.replace(old, new)
+    if "MODEL_REQUIREMENTS" in text:
+        raise SystemExit("Stage 0 requires --replace MODEL_REQUIREMENTS=<model workload requirements path>")
     if not text.lstrip().startswith("/goal"):
         raise SystemExit(f"{path} must start with a /goal command")
     return text.rstrip() + "\n"
@@ -565,10 +599,15 @@ def update_stage_state(state: StageState, message: JsonObject) -> None:
             status = turn.get("status")
             if isinstance(status, str):
                 state.last_turn_status = status
+                state.last_turn_id = turn_id
                 if status == "failed":
                     error = turn.get("error")
                     state.last_turn_error = json.dumps(error) if error is not None else "turn failed"
                     state.terminal_status = "turnFailed"
+                elif status == "interrupted":
+                    state.terminal_status = "interrupted"
+                elif not state.active_turns and state.status in TERMINAL_GOAL_STATUSES:
+                    state.terminal_status = state.status
         return
 
     if method == "thread/goal/updated":
@@ -597,15 +636,36 @@ def update_stage_state(state: StageState, message: JsonObject) -> None:
             )
         status = goal.get("status")
         if isinstance(status, str):
+            previous_status = state.status
             state.status = status
-            if status in TERMINAL_GOAL_STATUSES:
+            # The server may publish automatic blocked BEFORE failed-turn/error.
+            # Drain the active turn, even on success (final writes can follow the
+            # complete goal notification). Never let a late goal hide a failure.
+            if status == "paused" and previous_status != "paused":
+                state.terminal_status = "paused"
+            elif (status in TERMINAL_GOAL_STATUSES and not state.active_turns
+                  and state.terminal_status not in {"turnFailed", "interrupted"}):
                 state.terminal_status = status
 
 
 def wait_for_stage_terminal(client: AppServerClient, log: Any, state: StageState) -> str:
     last_notice = time.monotonic()
+    drain_started: float | None = None
     while state.terminal_status is None:
-        client.read_event(log, lambda msg: update_stage_state(state, msg))
+        if state.status in TERMINAL_GOAL_STATUSES and state.active_turns:
+            if drain_started is None:
+                drain_started = time.monotonic()
+            if time.monotonic() - drain_started >= TURN_DRAIN_TIMEOUT:
+                state.last_turn_error = "Terminal goal without turn/completed; outcome unknown. No automatic retry."
+                state.terminal_status = "turnFailed"
+                break
+        else:
+            drain_started = None
+        timeout = 60.0 if drain_started is None else min(60.0, max(0.01, TURN_DRAIN_TIMEOUT - (time.monotonic() - drain_started)))
+        try:
+            client.read_event(log, lambda msg: update_stage_state(state, msg), timeout=timeout)
+        except TimeoutError:
+            pass
         now = time.monotonic()
         if now - last_notice > 300:
             print(
@@ -614,18 +674,6 @@ def wait_for_stage_terminal(client: AppServerClient, log: Any, state: StageState
             )
             last_notice = now
     return state.terminal_status
-
-
-def wait_for_turn_started(
-    client: AppServerClient,
-    log: Any,
-    state: StageState,
-    turn_id: str,
-) -> None:
-    while turn_id not in state.active_turns and state.terminal_status is None:
-        client.read_event(log, lambda msg: update_stage_state(state, msg))
-    if state.terminal_status is not None:
-        raise RuntimeError(f"stage reached terminal status {state.terminal_status} before turn {turn_id} started")
 
 
 def write_manifest_header(
@@ -689,6 +737,134 @@ def next_resume_attempt(manifest_values: dict[str, str], index: int) -> int:
     return max(attempts, default=0) + 1
 
 
+def start_goal_turn(
+    client: AppServerClient, args: argparse.Namespace, repo: pathlib.Path,
+    log: Any, state: StageState, input_items: list[JsonObject],
+) -> None:
+    """Start exactly one continuation, preserving the goal and thread identity."""
+    if state.active_turns:
+        raise RuntimeError("Refusing to start a duplicate stage turn")
+    # The runner's own bootstrap pause is not an operator stop.
+    state.status = "paused"
+    paused = client.request(
+        "thread/goal/set",
+        {"threadId": state.thread_id, "objective": state.objective, "status": "paused"},
+        log, lambda msg: update_stage_state(state, msg),
+    )
+    goal = goal_from_response(paused)
+    if goal.get("objective") != state.objective or goal.get("status") != "paused":
+        raise RuntimeError(f"paused goal was not set exactly: {goal!r}")
+    state.status = "paused"
+    state.terminal_status = None
+    state.last_turn_status = None
+    state.last_turn_error = None
+    state.last_turn_id = None
+
+    payload = turn_params(args, repo)
+    payload.update(threadId=state.thread_id, input=input_items)
+    result = client.request("turn/start", payload, log, lambda msg: update_stage_state(state, msg))
+    turn = result.get("turn")
+    if not isinstance(turn, dict) or not isinstance(turn.get("id"), str):
+        raise RuntimeError(f"turn/start did not return a turn id: {result!r}")
+    # A fast failure can arrive before the turn/start response. Do not overwrite
+    # it with the response's earlier inProgress snapshot.
+    if state.last_turn_id != turn["id"]:
+        method = "turn/started" if turn.get("status") == "inProgress" else "turn/completed"
+        update_stage_state(state, {"method": method, "params": {"threadId": state.thread_id, "turn": turn}})
+    if state.terminal_status is not None:
+        # The bootstrap pause should not prevent retrying a confirmed overload.
+        if state.last_turn_status == "failed" and state.status == "paused":
+            state.status = "active"
+        return
+    active = client.request(
+        "thread/goal/set", {"threadId": state.thread_id, "status": "active"},
+        log, lambda msg: update_stage_state(state, msg),
+    )
+    goal = goal_from_response(active)
+    if goal.get("objective") != state.objective or goal.get("status") != "active":
+        raise RuntimeError(f"active goal was not set exactly: {goal!r}")
+    if state.terminal_status is None:
+        state.status = "active"
+
+
+def is_model_overload(error: str | None) -> bool:
+    """Retry only the structured capacity error, never arbitrary error prose."""
+    try:
+        value = json.loads(error or "null")
+    except (ValueError, TypeError):
+        return False
+    return isinstance(value, dict) and value.get("codexErrorInfo") == "serverOverloaded"
+
+
+def record_recovery(log: Any, state: StageState, event: str, **details: Any) -> None:
+    record = {"ts": timestamp(), "event": event, "thread_id": state.thread_id,
+              "turn_id": state.last_turn_id, **details}
+    log.write(json.dumps({"ts": record["ts"], "direction": "runner", "message": record}) + "\n")
+    log.flush()
+    # Independent of agent-written docs, and usable even if the model is down.
+    path = pathlib.Path(log.name).with_suffix(".recovery.jsonl")
+    with path.open("a", encoding="utf-8") as output:
+        output.write(json.dumps(record) + "\n")
+    print(f"stage recovery: {json.dumps(record)}", file=sys.stderr)
+
+
+def wait_with_overload_recovery(
+    client: AppServerClient, args: argparse.Namespace, repo: pathlib.Path,
+    log: Any, state: StageState,
+) -> str:
+    budget = args.overload_retry_budget
+    waited = 0.0
+    attempts = 0
+    while True:
+        terminal = wait_for_stage_terminal(client, log, state)
+        if state.status in {"paused", "usageLimited", "budgetLimited", "complete"} and terminal == "turnFailed":
+            # Never reactivate a deliberate stop, exhausted budget, or completed goal.
+            record_recovery(log, state, "stopped", status=state.status, error=state.last_turn_error)
+            return terminal
+        if terminal != "turnFailed" or not is_model_overload(state.last_turn_error):
+            if attempts:
+                record_recovery(log, state, "finished", status=terminal, attempts=attempts)
+            return terminal
+        if waited >= budget:
+            record_recovery(log, state, "exhausted", error=state.last_turn_error,
+                            attempts=attempts, waited_seconds=waited)
+            state.terminal_status = "overloadRetryExhausted"
+            return state.terminal_status
+        attempts += 1
+        delay = min(300.0, 30.0 * 2 ** min(attempts - 1, 4)) * random.uniform(0.8, 1.0)
+        delay = min(delay, budget - waited)
+        deadline = time.monotonic() + delay
+        retry_at = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=delay)).isoformat()
+        record_recovery(log, state, "waiting", error=state.last_turn_error, attempt=attempts,
+                        delay_seconds=delay, retry_at_utc=retry_at,
+                        remaining_wait_budget_seconds=budget - waited)
+        while time.monotonic() < deadline:
+            try:
+                client.read_event(log, lambda msg: update_stage_state(state, msg),
+                                  timeout=min(60.0, max(0.0, deadline - time.monotonic())))
+            except TimeoutError:
+                pass
+            if state.status in {"paused", "usageLimited", "budgetLimited", "complete"} or state.terminal_status == "interrupted":
+                result = "interrupted" if state.terminal_status == "interrupted" else state.status
+                record_recovery(log, state, "cancelled", status=result)
+                return result
+        waited += delay
+        if state.active_turns:
+            # If the server already continued, monitor it rather than duplicating it.
+            state.terminal_status = None
+            continue
+        record_recovery(log, state, "retrying", attempt=attempts)
+        message = (
+            "The previous turn ended with a confirmed serverOverloaded service error. "
+            "Continue the same stage from the existing worktree and recorded results. "
+            "Inspect any commands still running before launching hardware work; do not replay "
+            "completed operations blindly. The original objective, review requirements, "
+            "and acceptance gates still apply."
+        )
+        items, _ = input_items_for_resume(repo, message, state.objective)
+        start_goal_turn(client, args, repo, log, state, items)
+
+
 def execute_goal(
     client: AppServerClient,
     args: argparse.Namespace,
@@ -712,45 +888,8 @@ def execute_goal(
             on_thread_started(thread_id)
         state = StageState(thread_id=thread_id, objective=objective)
 
-        set_paused = client.request(
-            "thread/goal/set",
-            {"threadId": thread_id, "objective": objective, "status": "paused"},
-            log,
-            lambda msg: update_stage_state(state, msg),
-        )
-        paused_goal = goal_from_response(set_paused)
-        if paused_goal.get("objective") != objective or paused_goal.get("status") != "paused":
-            raise RuntimeError(f"paused goal was not set exactly: {paused_goal!r}")
-
-        turn_payload = turn_params(args, repo)
-        turn_payload["input"] = input_items
-        turn_payload["threadId"] = thread_id
-        turn_started = client.request(
-            "turn/start",
-            turn_payload,
-            log,
-            lambda msg: update_stage_state(state, msg),
-        )
-        turn = turn_started.get("turn")
-        turn_id: str | None = None
-        if isinstance(turn, dict) and isinstance(turn.get("id"), str):
-            turn_id = turn["id"]
-            if turn.get("status") == "inProgress":
-                state.active_turns.add(turn_id)
-        if turn_id is not None:
-            wait_for_turn_started(client, log, state, turn_id)
-
-        active_goal = client.request(
-            "thread/goal/set",
-            {"threadId": thread_id, "status": "active"},
-            log,
-            lambda msg: update_stage_state(state, msg),
-        )
-        goal = goal_from_response(active_goal)
-        if goal.get("objective") != objective or goal.get("status") != "active":
-            raise RuntimeError(f"active goal was not set exactly: {goal!r}")
-
-        terminal = wait_for_stage_terminal(client, log, state)
+        start_goal_turn(client, args, repo, log, state, input_items)
+        terminal = wait_with_overload_recovery(client, args, repo, log, state)
         return terminal, thread_id, state.last_turn_error
 
 
@@ -794,57 +933,20 @@ def execute_resumed_goal(
             active_goal = goal_from_response(active)
             if active_goal.get("objective") != objective or active_goal.get("status") != "active":
                 raise RuntimeError(f"active resumed goal was not set exactly: {active_goal!r}")
-            state.status = "active"
-            state.terminal_status = None
-            terminal = wait_for_stage_terminal(client, log, state)
+            if state.terminal_status is None:
+                state.status = "active"
+            terminal = wait_with_overload_recovery(client, args, repo, log, state)
             return terminal, state.last_turn_error
 
-        paused = client.request(
-            "thread/goal/set",
-            {"threadId": thread_id, "objective": objective, "status": "paused"},
-            log,
-            lambda msg: update_stage_state(state, msg),
-        )
-        paused_goal = goal_from_response(paused)
-        if paused_goal.get("objective") != objective or paused_goal.get("status") != "paused":
-            raise RuntimeError(f"paused resumed goal was not set exactly: {paused_goal!r}")
-        state.status = "paused"
-        state.terminal_status = None
-
-        turn_payload = turn_params(args, repo)
-        turn_payload["input"] = input_items
-        turn_payload["threadId"] = thread_id
-        turn_started = client.request(
-            "turn/start",
-            turn_payload,
-            log,
-            lambda msg: update_stage_state(state, msg),
-        )
-        turn = turn_started.get("turn")
-        if isinstance(turn, dict) and isinstance(turn.get("id"), str):
-            turn_id = turn["id"]
-            if turn.get("status") == "inProgress":
-                state.active_turns.add(turn_id)
-            wait_for_turn_started(client, log, state, turn_id)
-
-        active = client.request(
-            "thread/goal/set",
-            {"threadId": thread_id, "objective": objective, "status": "active"},
-            log,
-            lambda msg: update_stage_state(state, msg),
-        )
-        active_goal = goal_from_response(active)
-        if active_goal.get("objective") != objective or active_goal.get("status") != "active":
-            raise RuntimeError(f"active resumed goal was not set exactly: {active_goal!r}")
-        state.status = "active"
-        state.terminal_status = None
-
-        terminal = wait_for_stage_terminal(client, log, state)
+        start_goal_turn(client, args, repo, log, state, input_items)
+        terminal = wait_with_overload_recovery(client, args, repo, log, state)
         return terminal, state.last_turn_error
 
 
 def find_check_script(prompt_path: pathlib.Path) -> pathlib.Path | None:
     candidate = prompt_path.with_name(prompt_path.stem + ".check.sh")
+    if not candidate.exists() and "$golden-tests" in prompt_path.read_text():
+        return ROOT / "scripts/check_golden_tests.sh"
     return candidate if candidate.exists() else None
 
 
@@ -890,6 +992,12 @@ def run_check_script(
 ) -> int:
     env = os.environ.copy()
     env.update(extra_env)
+    if "GOLDEN_TEST_STAGE" in extra_env and script != ROOT / "scripts/check_golden_tests.sh":
+        golden_log = check_log.with_name(check_log.stem + ".golden.log")
+        code = run_check_script(ROOT / "scripts/check_golden_tests.sh", repo, extra_env, golden_log)
+        if code:
+            check_log.write_text(f"Golden verification failed; see {golden_log}\n", encoding="utf-8")
+            return code
     result = subprocess.run(
         ["bash", str(script)],
         cwd=repo,
@@ -972,6 +1080,8 @@ def run_stage_checks(
     extra_env = replacement_env(replacements)
     extra_env["MULTIGOAL_LOG_DIR"] = str(log_dir)
     extra_env["MULTIGOAL_STAGE"] = name
+    if "$golden-tests" in prompt:
+        extra_env["GOLDEN_TEST_STAGE"] = str(index)
 
     code = -1
     for attempt in range(args.check_retries + 1):

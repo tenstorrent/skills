@@ -17,6 +17,15 @@ If this skill is used as part of `$model-bringup`, follow that skill's mission, 
 
 ## Your Part
 
+For staged bringup, read Stage 0's `tests/golden/manifest.json` and
+`doc/golden_tests/README.md` for the layer analysis, source pointers and semantic
+test contract. Choose the implementation structure and implement a thin TTNN test
+adapter; no Stage 0 decoder skeleton is expected. Preserve the agreed logical
+inputs/outputs and state semantics, not a particular internal structure. The
+adapter may convert layouts but must not compute missing model operations or
+repair state. Keep the independent fixtures/assertions;
+justify any contract correction under [the golden-test rules](../golden-tests/SKILL.md#later-stages).
+
 Implement:
 
 ```text
@@ -114,7 +123,8 @@ Use this reference while bringing up a TTNN decoder layer. It folds in relevant 
 
 ## HF Reference And Synthetic Weights
 
-- Prefer a layer-only HF reference over full causal LM loading.
+- In staged bringup, use [Stage 0 cached goldens](../golden-tests/SKILL.md) for acceptance. Synthetic fixtures below are additional offline diagnostics; they cannot replace real-weight, real-input prefill/decode and cache checks per kind.
+- Prefer a layer-only HF reference for additional diagnostics; reuse Stage 0 activations and goldens instead of rebuilding the reference on each acceptance run.
 - Inspect the decoder layer constructor, rotary/position embedding inputs, attention mask semantics, and cache API before writing the test.
 - Use real weights to record tensor stats and to validate that `from_state_dict` can load a real checkpoint path when available. Treat the real HF state dict as the canonical key and shape contract. Normal CI tests should use synthetic weights generated from those stats so they do not require HF weight downloads.
 - For each tensor used by the TTNN layer, store at least name, shape, dtype, mean, and std.

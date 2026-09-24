@@ -48,7 +48,7 @@ Done means all of these are true and recorded:
 - Updated context contract for the multichip target mesh, including any hard-physical-limit context reduction.
 - Evidence that valid non-aligned logical sequence lengths still work after multichip sharding and padding.
 - Table of tensor shapes, configs and shard specs along with how these are mesh-sharded, how that affects the per-device shapes used and any implicit or explicit padding that is necessary as a result.
-- Multi-chip prefill and decode PCC against the single-chip TTNN baseline.
+- Multi-chip prefill/decode output and cache PCC against [Stage 0 cached PyTorch goldens](../golden-tests/SKILL.md#later-stages) for staged bringup. Single-chip TTNN parity is an additional sharding diagnostic, not the acceptance oracle.
 - Paged KV-cache behavior on the target mesh.
 - Warmed trace replay for decode on the target mesh.
 - Determinism or stress coverage appropriate to the implementation risk.

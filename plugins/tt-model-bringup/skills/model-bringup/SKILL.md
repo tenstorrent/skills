@@ -43,8 +43,11 @@ or replace acceptance criteria with a review plugin's criteria.
 
 ## Execution
 
-The eleven [goal templates](../../prompts/model_bringup_multigoal) run in order:
+The twelve [goal templates](../../prompts/model_bringup_multigoal) run in order.
+Supply the workload requirements path with `--replace MODEL_REQUIREMENTS=/path/to/model-requirements`.
+The file must be readable in the worker checkout; it specifies model workloads, not Python dependencies.
 
+0. Model analysis, semantic test contracts and cached golden tests — `golden-tests`
 1. Functional decoder — `functional-decoder`
 2. Fused decoder — `graph-fusing`
 3. Optimized decoder — `optimize`
@@ -56,6 +59,12 @@ The eleven [goal templates](../../prompts/model_bringup_multigoal) run in order:
 9. vLLM integration — `vllm-integration`
 10. Optimized vLLM — `optimize`
 11. TTI release — `tti-release`
+
+All later stages follow [the golden-test baseline](../golden-tests/SKILL.md#later-stages).
+Stage 0 summarizes the source workload requirements for later-stage context;
+use the source file and summary to choose high-value work and record material
+tradeoffs. Its initial matrix is batch size 1; existing stage-specific
+acceptance checks still apply.
 
 `tt-device-usage`, `tt-enable-tracing`, `qualitative-check` and `stage-review` provide shared
 requirements. AutoDebug/AutoTriage/AutoFix come from the explicit dependency. Independent stage
@@ -90,6 +99,7 @@ From the target tt-metal checkout, first perform a no-model dry run:
 python "$TT_MODEL_BRINGUP_ROOT/scripts/multigoal" \
   "$TT_MODEL_BRINGUP_ROOT"/prompts/model_bringup_multigoal/*.txt \
   --repo "$PWD" --replace HF_MODEL=org/model \
+  --replace MODEL_REQUIREMENTS=/path/to/model-requirements \
   --replace MODEL_DIR=models/autoports/org_model --dry-run
 ```
 
@@ -102,12 +112,20 @@ Remove `--dry-run` to execute the reviewed goals; choose the requested model wit
 reasoning effort with `--effort`. This runner requires Codex. Claude can execute individual stage
 skills and check scripts directly, preserving the same stage order and acceptance criteria.
 
+The full glob starts at Stage 0 automatically; stages 1–11 keep their existing numbers.
+For an existing run, preserve its original prompt selection; do not insert Stage 0 on resume.
 To resume a stopped stage, use the same prompt selection/replacements, Codex home and preserved
 `--log-dir`, adding `--resume-stage N`. Keep the original `--start-index` for that prompt selection;
 use `--start-index N` only when the supplied first prompt itself is stage N. Resume reuses the
 recorded thread and appends attempt logs. Do not restart earlier completed stages unnecessarily.
 
 ## Evidence gates
+
+Every Stage 0-enabled prompt runs the packaged golden-test gate, which executes
+the manifest's pytest cases and checks coverage, output/state PCC and artifact
+integrity. Stage 0 selects CPU-adapter and sensitivity tests; later stages select
+their actual implementation. Missing baselines block completion. See
+[the manifest contract](../golden-tests/references/manifest.md).
 
 Stages 6, 7, 9, 10 and 11 have sibling `.check.sh` scripts. Run from the target checkout with
 `MODEL_DIR` set to its exact autoport path. They resolve their own package resources. Exit 0 passes;

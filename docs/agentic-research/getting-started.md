@@ -84,10 +84,54 @@ It takes the current tt-metal checkout and uses that version to bring up the mod
 
 | Stages | Main result |
 | :-: | --- |
+| 0 | Lightweight model analysis, semantic test contracts and batch-one PCC tests with cached real-weight goldens for up to ten required ISL/OSL pairs |
 | 1–3 | Functional, fused, then optimized decoder; HF comparison and warmed performance evidence |
 | 4–5 | Multi-chip decoder and multi-chip optimization |
 | 6–8 | Full model, optimized generation, and a datatype/fidelity sweep |
 | 9–11 | vLLM integration, optimized serving, and release evidence |
+
+Supply `--replace MODEL_REQUIREMENTS=/path/to/model-requirements` to the runner
+when launching (or give that file path to the supervising agent). Stage 0 saves its test
+manifest and harness under `models/autoports/<model>/tests/golden/` and caches
+reference tensors outside Git under `bringup/references/<model>/golden/`. Later
+stages reuse them and must demonstrate a test defect before changing the baseline.
+Existing runs resume with their original prompt selection; new full runs start at 0.
+
+The runner automatically continues the same stage/thread after a confirmed
+`serverOverloaded` turn failure. It waits for the active turn's terminal event
+before interpreting an automatic `blocked` goal update, so the actual error is
+retained. Retries start around 30 seconds and back off to at most five minutes
+with jitter. `--overload-retry-budget SECONDS` limits total backoff per stage
+(default six hours; `0` disables retries). Each retry starts a continuation with
+the same model, objective, worktree, and acceptance gates. It does not replay
+shell commands directly or reset token budgets.
+
+Watch the console or `<stage-log>.recovery.jsonl` for the error, attempt number,
+next retry time, and remaining wait budget. Successful recovery proceeds to
+the normal external check and subsequent stages. Explicit pauses, interrupted
+turns, usage/budget limits, genuine blockers, and other errors are not retried.
+If the server connection closes or a terminal goal lacks its turn outcome for
+five minutes, the runner stops instead of guessing whether work is still active.
+These cases still require inspection and an explicit resume. The retry policy
+is in the runner, so it can operate while the model is unavailable.
+
+For local skill development, use a branch/worktree containing these changes; a
+published release is not required. Verify the runner and enabled skills resolve to
+that checkout (or a refreshed installation of it), not an older plugin cache. A
+remote worker needs the same revision installed there; editing your laptop checkout
+does not update it. Older `agentic-research` launch profiles may pin a pre-Stage-0
+skills revision: override that source explicitly, confirm `00-golden-tests.txt` is
+in the selected prompts, and pass `MODEL_REQUIREMENTS` through the launch wrapper.
+Keep each running experiment pinned; try edits in a new run rather than changing
+its skill files underneath it.
+
+Stage 0 wraps original PyTorch layers in a thin CPU adapter to validate captured
+fixtures against saved full-model reference outputs/state. It leaves analysis and
+semantic test contracts, not a decoder skeleton or another reference implementation.
+Stage 1 owns decoder structure and its TTNN adapter. Stage 0 does not validate TTNN.
+Every stage then runs the packaged golden gate before its existing checks; missing,
+skipped or failing cases block advancement. This host-side gate still needs a real
+model run to establish model correctness.
 
 Code and tests are created under `models/autoports/<model>/` plus a lot of profiling dumps and other information. Tell a separate agent to monitor this and create a HTML dashboard to show you the progress!
 

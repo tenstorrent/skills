@@ -1,0 +1,18 @@
+/goal Use $golden-tests for HF_MODEL in the current tt-metal checkout.
+
+As the user, I explicitly authorize you to use subagents when a selected skill requests or recommends them.
+
+Prepare the Stage 0 baseline before functional decoder work. Read the PyTorch implementation and model workload requirements file at MODEL_REQUIREMENTS. Inventory layer types/counts and choose at most ten representative required ISL/OSL pairs at batch size 1.
+
+Goal completion requirements:
+- Model-specific PCC tests and adapter interfaces exist under models/autoports/<model>/tests/golden/ for each layer type and selected case, with the packaged v1 manifest. Future stages implement their own backend adapters.
+- The manifest and README provide a lightweight model-analysis handoff: layer inventory, source pointers, checkpoint mappings, unusual behavior and the adapter's logical input/output, mask, position and state semantics. Do not create a decoder skeleton; Stage 1 owns implementation structure.
+- Summarize the supplied requirements in the README: the source path, the high-value workloads/features/evals, and any external tooling input that later stages should consider. This is context for later choices, not a decoder plan or a promise to meet every target.
+- Separate prefill and decode PCC tests use real checkpoint weights and real-text model activations. Cache inputs, golden outputs and real reference K/V per case outside Git; comparisons never rerun the CPU reference.
+- Decode uses populated real KV cache. Test isolated decode and the implementation's own prefill-to-decode cache evolution. Check final K and V PCC separately after both phases over all valid retained positions.
+- A thin CPU adapter wraps original PyTorch layers and replays captured inputs/state against goldens saved from the full-model run; do not handwrite another reference model. The packaged Stage 0 gate passes CPU parity and negative controls for output/state/position corruption and missing/invalid goldens. Unimplemented TTNN adapters fail explicitly.
+- All stages have explicit pytest node IDs in the manifest; the runner executes them and checks coverage and numeric evidence before advancement.
+- doc/golden_tests/README.md and work_log.md record source/requirements, selection, generation, case-to-behavior mapping and per-stage commands. Leave TTNN computation to Stage 1.
+- $stage-review returns `clean-pass`; findings fixed/rereviewed. Local commit stage-owned tests/docs/manifest; never commit golden tensors or push.
+
+Unmet requirements: continue working; use $autofix for harness failures. Missing requirements or inaccessible real weights are explicit blockers.

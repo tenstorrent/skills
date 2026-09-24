@@ -83,6 +83,8 @@ for batch in batches:
 
 ## Program-Cache Warmup
 
+Trace lifetime safety also covers eager paths between replays: initialize their retained tensors and program-cache resources before capture, or rebuild affected traces when new shapes require new resources. Validate a complete request followed by another request with allocation tracking enabled where available. Keep corruptible-allocation exemptions limited to proven disposable scratch; do not exempt an entire forward path that may initialize retained state.
+
 Trace capture cannot compile programs. A program-cache miss inside capture forces a new kernel build, which issues a host->device write and aborts with `Writes are not supported during trace capture`. So every op in the traced region must already be compiled (warmed) with the *exact* program-cache signature it will have during capture.
 
 - Warm with the same shapes, dtypes, layouts, memory configs, and mode as capture; the warm call must drive the identical op sequence and code path so every op variant is compiled.

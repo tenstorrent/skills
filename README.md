@@ -44,7 +44,7 @@ automatically for matching tasks; you can also ask your agent to make them expli
 | `tt-skills` | The finder: recommends relevant plugins and helps you install them with your approval |
 | `tt-review-skills` | PR and diff review for TTNN, Metalium, LLK, models, serving, multi-chip, trace, precision, testing, and L1 changes |
 | `tt-autodebug` | AutoDebug and AutoTriage investigate code issues and hangs; AutoFix tests hypotheses and repairs the cause |
-| `tt-model-bringup` | Eleven stages from HF decoder to TTNN/vLLM release, with chunked-prefill guidance, prefill/TTFT optimization, targeted path/serving checks, and published evaluation references with comparability caveats. Requires `tt-autodebug`. |
+| `tt-model-bringup` | Stage 0 prepares cached real-weight golden tests; stages 1–11 bring up an HF decoder through TTNN/vLLM release, with chunked prefill, optimization and evidence gates. Requires `tt-autodebug`. |
 
 AutoDebug investigates in a fresh agent process and writes `AUTODEBUG.md`. AutoFix handles source
 changes and validation. For examples and expected outputs, see the
@@ -63,7 +63,9 @@ to install them.
 The stage skills support Codex and Claude Code; automated multi-goal execution uses Codex.
 See the [Agentic Research guide](docs/agentic-research/getting-started.md#model-bring-up) for how to
 run a bring-up, and [startup and stage orchestration](plugins/tt-model-bringup/skills/model-bringup/SKILL.md)
-for detailed setup, dry-run, and resume instructions.
+for detailed setup, dry-run, and resume instructions. The runner automatically
+retries confirmed model-capacity failures on the same stage/thread; see the
+[retry policy and recovery logs](docs/agentic-research/getting-started.md#how-model-bringup-works).
 
 ## Alternative manual skill installation
 
