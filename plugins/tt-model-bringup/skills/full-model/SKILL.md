@@ -68,8 +68,9 @@ Some shared tests require host-side sampling. Support that as an explicit compat
 
 Build decode around persistent device state:
 
+- own generator-wide two-phase warmup for both standalone and serving use: prepare all supported prefill/decode/sampling variants before the first capture, as specified by `$tt-enable-tracing`; restore warmup-mutated KV/request and RNG state;
 - allocate stable token, current-position/RoPE, page-table, KV-cache, sampler, output, and any CCL buffers before capture;
-- capture model decode and sampling traces over those stable tensors;
+- capture model decode and sampling traces over those stable tensors and retain them across compatible requests and mode switches;
 - feed the next token through `tt_out_tok`, not a host reconstruction path;
 - advance current-position/RoPE state on device for each replay when the decode step is a simple increment;
 - skip page-table copies when the page table is unchanged;
