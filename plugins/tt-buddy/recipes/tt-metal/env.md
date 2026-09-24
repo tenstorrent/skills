@@ -11,4 +11,3 @@ For developer setup (HF_TOKEN, cache paths), see `recipes/developer-setup.md`.
 | `HF_MODEL` | User request (when test needs a model) | `meta-llama/Llama-3.1-8B-Instruct` |
 | `TT_CACHE_PATH` | Test config (if cached weights exist) | `/mnt/MLPerf/huggingface/tt_cache/...` |
 | `HF_HOME` | Workspace-detect | `/localdev/user/hf_data` |
-| `HF_TOKEN` | Workspace-detect (when model download needed) | Developer's token |
