@@ -1,7 +1,7 @@
 {
   "name": "tt-model-bringup",
-  "version": "0.1.13",
-  "description": "Bring Hugging Face text models to TTNN through eleven verified stages. Requires the separately installed tt-autodebug plugin.",
+  "version": "0.1.14",
+  "description": "Bring Hugging Face text models to TTNN through eleven verified stages. Requires tt-autodebug. Codex multigoal setup automatically adds optional telemetry when tenstorrent/ar-dashboard is accessible.",
   "author": {
     "name": "Tenstorrent"
   },
@@ -17,7 +17,7 @@
   "interface": {
     "displayName": "Tenstorrent Model Bring-up",
     "shortDescription": "Implement and validate HF models on TTNN",
-    "longDescription": "Bring Hugging Face text models to TTNN through eleven verified stages. Requires the separately installed tt-autodebug plugin.",
+    "longDescription": "Bring Hugging Face text models to TTNN through eleven verified stages. Requires tt-autodebug. Codex multigoal setup automatically adds optional telemetry when tenstorrent/ar-dashboard is accessible.",
     "developerName": "Tenstorrent",
     "category": "Developer Tools",
     "capabilities": [

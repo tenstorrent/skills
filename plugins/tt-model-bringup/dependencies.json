@@ -11,6 +11,15 @@
       ],
       "installation": "explicit-user-action",
       "resolution": "TT_AUTODEBUG_ROOT points to the enabled installed package"
+    },
+    {
+      "name": "tt-bringup-telemetry",
+      "marketplace": "tenstorrent-ar-dashboard",
+      "repository": "https://github.com/tenstorrent/ar-dashboard",
+      "required": false,
+      "skills": ["model-bringup-telemetry"],
+      "installation": "automatic-when-accessible-for-new-codex-multigoal-runs",
+      "resolution": "TT_BRINGUP_TELEMETRY_ROOT points to the enabled installed package; unavailable access is silently skipped"
     }
   ]
 }
