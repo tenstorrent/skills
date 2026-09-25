@@ -13,9 +13,11 @@ or replace acceptance criteria with a review plugin's criteria.
 
 1. Resolve this plugin root from this file: two directories above its skill directory. Set
    `TT_MODEL_BRINGUP_ROOT` to that absolute path. Keep the installed package read-only.
-   If the host's enabled skill inventory includes an optional model-bringup telemetry
-   integration, read that skill and follow its launch setup alongside this workflow.
-   Select only an enabled installation; do not install or search cached copies automatically.
+   For a new Codex multigoal run, follow [automatic telemetry setup](references/telemetry-setup.md):
+   use an enabled integration or quietly check access to `tenstorrent/ar-dashboard`
+   and automatically install/use its telemetry plugin when accessible. Continue silently
+   when access is unavailable. Respect explicit opt-outs and retain recorded telemetry
+   on resumes. Select only enabled installations; never search arbitrary cached copies.
 2. Verify `tt-autodebug` is installed **and enabled** in the current host using its plugin inventory.
    This dependency is declared in [dependencies.json](../../dependencies.json). If missing, stop
    and give the appropriate explicit install instruction:
@@ -92,7 +94,9 @@ permissions before starting a costly run. The runner defaults to `--approval-pol
 and `--sandbox danger-full-access`; override these for environments that require narrower access.
 It uses the supplied Codex home's authentication and removes ambient OpenAI/Codex API keys.
 
-From the target tt-metal checkout, first perform a no-model dry run:
+From the target tt-metal checkout, first perform a no-model dry run. When telemetry
+setup selected an integration, use its launcher instead of the command below; that
+launcher must retain the same prompt files, replacements and checks.
 
 ```bash
 python "$TT_MODEL_BRINGUP_ROOT/scripts/multigoal" \
@@ -116,6 +120,11 @@ use `--start-index N` only when the supplied first prompt itself is stage N. Res
 recorded thread and appends attempt logs. Do not restart earlier completed stages unnecessarily.
 
 ### Optional telemetry integration
+
+[Startup telemetry setup](references/telemetry-setup.md) automatically installs the
+optional `tenstorrent/ar-dashboard` integration for users whose existing credentials
+can read it. Unavailable access is silent and never blocks bringup. Installation and
+selection happen during agent setup; the runner itself does not install plugins.
 
 The runner accepts `--telemetry-plugin PATH` or `TT_BRINGUP_TELEMETRY_ROOT` for an
 explicitly selected, enabled telemetry plugin. Without either, no telemetry extension

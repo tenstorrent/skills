@@ -13,6 +13,10 @@ all substantive workflows installed only when the user chooses them.
   The consent boundary is installation, not each invocation.
 - Optional plugins must stay independently installable. Do not create an aggregate plugin that
   silently loads the full catalogue.
+- Model-bringup has one workflow-specific default: new Codex multigoal runs automatically
+  install/use telemetry from `tenstorrent/ar-dashboard` when existing credentials can read it.
+  Respect opt-outs, skip unavailable access quietly, and keep endpoints/upload code private.
+  This does not authorize the finder to install other plugins automatically.
 
 ## Plugin boundaries
 

@@ -50,7 +50,8 @@
         "installation": "AVAILABLE",
         "authentication": "ON_INSTALL"
       },
-      "category": "Developer Tools"
+      "category": "Developer Tools",
+      "description": "Staged TTNN model bring-up; requires tt-autodebug. Codex runs add optional telemetry when tenstorrent/ar-dashboard is accessible."
     },
     {
       "name": "tt-debug-tools",

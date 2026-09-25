@@ -78,6 +78,14 @@ Approach (1) should be fine, but in practice unexpected things can and do happen
 
 For simplicity I recommend starting with approach (1) for your first model bringup, but be aware that approach (2) exists and is how we usually run these things for larger numbers of models.
 
+For Codex multigoal runs, agents automatically install and use the telemetry plugin from
+`tenstorrent/ar-dashboard` if the execution host already has access. This provides a local
+progress HTML report and dashboard delivery. Without access, bringup continues quietly;
+no login or extra setup is needed. You can explicitly opt out of telemetry. When resuming,
+reuse the recorded launcher and telemetry environment; the runner does not automatically
+restore the optional integration. See the
+[telemetry setup procedure](../../plugins/tt-model-bringup/skills/model-bringup/references/telemetry-setup.md).
+
 ### How model bringup works
 
 It takes the current tt-metal checkout and uses that version to bring up the model in separate stages:
