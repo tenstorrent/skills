@@ -57,7 +57,7 @@ fi
 file="$notes/$topic.md"
 [ -f "$file" ] || printf '# %s\n\n' "$topic" > "$file"
 
-entry="$(printf '## %s\n**%s** · `%s`\n\n%s\n' "$title" "$(date '+%Y-%m-%d %H:%M')" "$source" "$body")"
+entry="$(printf '## %s\n**%s** · %s\n\n%s\n' "$title" "$(date '+%Y-%m-%d %H:%M')" "\`$source\`" "$body")"
 tmp="$(mktemp "$notes/.entry.XXXXXX")"
 {
     head -n 1 "$file"
