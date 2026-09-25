@@ -18,7 +18,8 @@ Invoke `tt-buddy:run` to:
 
 - **Run / test / execute** on a TT device (queued).
 - **Push-through exec** on a hung device, bypassing the queue.
-- **Recover the device**: triage → kill → reset → verify → cache.
+- **Recover after a hang**: triage → kill → gate resets → verify → cache.
+- **Reset the device**: only with an empty queue. See `mcp.md` § Tools.
 
 - NEVER run device-touching commands via Bash: tests, servers, scripts.
 - Host-only commands (e.g. host-stub test suites) run via Bash.

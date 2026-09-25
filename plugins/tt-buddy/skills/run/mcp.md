@@ -13,7 +13,7 @@ Tools on the `tt-device-mcp` MCP server. Names per `tt-buddy:buddy` § Host mapp
 | Queued job (blocking) | `tt_device_job_run` |
 | Queued job (background, e.g. server) | `tt_device_job_run_bg` |
 | Push-through exec | `tt_device_exec` (60s cap) |
-| Device reset (user request only) | `tt_device_reset` |
+| Device reset (empty queue only) | `tt_device_reset` |
 | Kill | `tt_device_job_kill` |
 
 - Many agents share the device. The queue serializes access.
@@ -21,8 +21,8 @@ Tools on the `tt-device-mcp` MCP server. Names per `tt-buddy:buddy` § Host mapp
 - Job stuck >5 min: ask the user before killing.
 - Foreign-owned hung job: STOP. Report owner.
 - NEVER kill another agent's job.
-- Reset only when the user asks. Other agents may share your user.
-- Before reset: `tt_device_queue_status` shows no running job.
+- Reset only with an empty queue: nothing running or queued.
+- Check `tt_device_queue_status` right before resetting.
 
 ## Env file
 
@@ -61,6 +61,7 @@ Mode-agnostic rows: `execution.md` § Failure handling.
 - Reset steps depend on platform and privileges.
 - The broker kills jobs on timeout or 300s silence.
 - Queue held: the gate is recovering. Wait.
+- After a hang: NEVER reset. The gate detects it and resets.
 
 ## Recovery substitutions
 
