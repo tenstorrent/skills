@@ -51,7 +51,7 @@ Skills that generate code MUST verify:
 
 ## Developer-Rule Conflict Protocol
 
-- Personal rules (CLAUDE.md, AGENTS.md) may conflict with skill needs.
+- Personal rules (host instruction files) may conflict with skill needs.
 - Neither side silently overrides the other.
 - The skill surfaces the conflict.
 
@@ -64,7 +64,7 @@ Skills that generate code MUST verify:
 
 1. **State plainly** what the skill does autonomously.
    - Name actions, e.g. "commit every iteration".
-2. **Detect conflicts** in the developer's CLAUDE.md and AGENTS.md files.
+2. **Detect conflicts** in every host instruction file the developer keeps.
    - Common: commit, push, deletion, parallel-execution rules.
 3. **Surface the conflict.** Quote the rule. Ask to override or rescope.
 4. **Wait for explicit confirmation.** Silence is not consent.

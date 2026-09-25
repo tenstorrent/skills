@@ -53,7 +53,7 @@ Where session detail goes instead:
 - NEVER reference files inside another skill's directory.
 - Use another skill's capability by invoking it.
 - Within a skill: relative paths to siblings, e.g. `tone.md`.
-- Claude Code and Codex announce the skill's absolute directory.
+- The host announces the skill's absolute directory.
 - Across skills: invoke the skill.
 - Plugin-root resources (`<plugin-root>/recipes/`): shared plugin data.
 - Reference them as `<plugin-root>/...`. NEVER use `../` paths.

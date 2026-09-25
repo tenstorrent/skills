@@ -11,9 +11,7 @@ description: "Design and build skills for the tt-buddy system — guides through
 - Most important part: **design the skill well**.
 - Expose spec flaws. Reach full alignment before writing.
 - Base format: `base-format.md`. Self-contained.
-- Optional: a generic skill-creator adds evals.
-  - Codex: built-in `skill-creator`.
-  - Claude Code: the separate `skill-creator` plugin.
+- Optional: the host's generic skill-creator, if any, adds evals.
 - Adds TT rules from `placement.md`, `prose.md`, `workflow.md`, `economy.md`, `self-check.md`.
 
 ## When to Invoke

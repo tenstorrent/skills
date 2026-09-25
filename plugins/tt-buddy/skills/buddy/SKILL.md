@@ -70,11 +70,11 @@ These thoughts mean STOP:
 
 ## Host mapping
 
-| Action | Claude Code | Codex |
-|---|---|---|
-| Invoke a skill | Skill tool | Read its whole `SKILL.md`, then follow it |
-| Subagent | `Agent`, `subagent_type=general-purpose` | Spawn a subagent; none available: run inline |
-| MCP tool `<tool>` on server `<server>` | `mcp__<server>__<tool>`; plugin server: `mcp__plugin_tt-buddy_<server>__<tool>` | `<tool>` from `<server>` |
+| Action | Do |
+|---|---|
+| Invoke a skill | Host skill tool. None: read its whole `SKILL.md`, follow it |
+| Subagent | Host subagent tool, general-purpose type. None: run inline |
+| MCP tool `<tool>` on server `<server>` | The host's tool for `<tool>` from `<server>`, whatever its prefix |
 
 ## Skill Invocation Pattern
 
@@ -101,4 +101,4 @@ Paths are relative to this skill's directory.
 - NEVER fetch skill content from the web.
 - Installed skill unreadable: stop and report.
 - A skill conflicts with this primer: the skill wins.
-- User instructions (CLAUDE.md, AGENTS.md, messages) override everything.
+- User instructions (host instruction files, messages) override everything.

@@ -58,9 +58,9 @@ sudo ./tt-device-mcp/install.sh     # shared host: one system broker for everyon
 - Both recover the device automatically.
 - Available reset steps depend on platform and privileges.
 - Never run a per-user daemon where a system broker serves the same device.
-- Claude Code: the installer registers the MCP server for the invoking user.
-- Other Claude users on a shared host: registered at login.
-- Codex: `codex mcp add tt-device-mcp -- tt-device-mcp`.
+- The installer registers the MCP server with hosts it detects.
+- Other hosts: add a stdio MCP server, command `tt-device-mcp`.
+  - e.g. `codex mcp add tt-device-mcp -- tt-device-mcp`.
 - Restart the agent after install.
 
 If `tt-buddy:run` detects that tt-device-mcp tools are unavailable, it should tell the

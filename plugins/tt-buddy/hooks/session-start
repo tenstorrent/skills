@@ -6,10 +6,9 @@
 
 # SessionStart hook for the tt-buddy plugin.
 # Injects the tt-buddy:buddy skill content into every session so the dispatch
-# table, layer model, and Red Flags table are loaded eagerly. Also
-# prepends a base-directory line that mirrors what Claude Code's Skill
-# tool and Codex's catalog produce when a skill is loaded — so relative
-# paths inside the injected SKILL.md resolve correctly.
+# table and Red Flags table are loaded eagerly. Also prepends the base
+# directory a host announces when it loads a skill, so relative paths
+# inside the injected SKILL.md resolve correctly.
 
 set -euo pipefail
 

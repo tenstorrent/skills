@@ -31,9 +31,7 @@ codex plugin add tt-buddy@tenstorrent-skills    # Codex
 - A tt-metal, vllm-tt-plugin, or tt-inference-server checkout.
 - For device runs: a Tenstorrent device and `tt-device-mcp`.
 - Setup steps: [`recipes/developer-setup.md`](recipes/developer-setup.md).
-- Optional, for skill evals: a generic skill-creator.
-  - Codex: built in.
-  - Claude Code: install the separate `skill-creator` plugin.
+- Optional, for skill evals: the host's generic skill-creator, if any.
 
 ## Hooks
 
@@ -53,8 +51,7 @@ codex plugin add tt-buddy@tenstorrent-skills    # Codex
 | Server | Registered by |
 |---|---|
 | `deepwiki` | This plugin, in both host manifests |
-| `tt-device-mcp` | The tt-device-mcp installer (Claude Code) |
-| `tt-device-mcp` | `codex mcp add tt-device-mcp -- tt-device-mcp` (Codex) |
+| `tt-device-mcp` | The tt-device-mcp installer, for hosts it detects. Else your host's MCP config, stdio command `tt-device-mcp` |
 
 ## Check it works
 
