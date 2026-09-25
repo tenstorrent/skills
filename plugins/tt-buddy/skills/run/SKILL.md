@@ -19,7 +19,6 @@ Invoke `tt-buddy:run` to:
 - **Run / test / execute** on a TT device (queued).
 - **Push-through exec** on a hung device, bypassing the queue.
 - **Recover the device**: triage → kill → reset → verify → cache.
-- **Reset the device** as a single step.
 
 - NEVER run device-touching commands via Bash: tests, servers, scripts.
 - Host-only commands (e.g. host-stub test suites) run via Bash.
@@ -59,7 +58,7 @@ detect workspace → load recipe → research target → route → execute → r
 | Command routing, env sources, auto-triage contract | `execution.md` |
 | Full device recovery (triage → kill → reset → verify → cache) | `recovery.md` |
 | Test invocation for detected repo | `<plugin-root>/recipes/<repo>/test.md` |
-| Server lifecycle for detected repo | `<plugin-root>/recipes/<repo>/server.md` |
-| Benchmark for detected repo | `<plugin-root>/recipes/<repo>/benchmark.md` |
+| Server lifecycle (vllm-tt-plugin only) | `<plugin-root>/recipes/vllm-tt-plugin/server.md` |
+| Benchmark (vllm-tt-plugin only) | `<plugin-root>/recipes/vllm-tt-plugin/benchmark.md` |
 | Environment variables | `<plugin-root>/recipes/<repo>/env.md` |
 | Target env vars, constraints, config params | invoke `tt-buddy:learn("<target> env vars and config params")` |

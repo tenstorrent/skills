@@ -118,3 +118,25 @@ def test_write_commits_only_the_note_file(tmp_path):
     _write(src, notes, "topic", "second")
     assert _git(notes, "show", "--name-only", "--format=", "HEAD").split() == ["topic.md"]
     assert "staged.md" in _git(notes, "diff", "--cached", "--name-only")
+
+
+def test_writer_waits_for_a_held_lock(tmp_path):
+    src, notes = _source_repo(tmp_path), tmp_path / "notes"
+    _write(src, notes, "topic", "first")
+    lock = tmp_path / "notes.lock"
+    lock.mkdir()
+    env = dict(os.environ, TT_BUDDY_NOTES=str(notes), GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+               GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+    writer = subprocess.Popen([str(WRITE_ENTRY), "topic", "second"], cwd=src, env=env,
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    writer.stdin.write("- entry")
+    writer.stdin.close()
+    try:
+        writer.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        pass
+    assert writer.poll() is None, "writer did not wait for the held lock"
+    assert _subjects(notes)[0] == "topic: first"
+    lock.rmdir()
+    assert writer.wait(timeout=10) == 0
+    assert _subjects(notes)[0] == "topic: second"

@@ -13,7 +13,7 @@ Tools on the `tt-device-mcp` MCP server. Names per `tt-buddy:buddy` § Host mapp
 | Queued job (blocking) | `tt_device_job_run` |
 | Queued job (background, e.g. server) | `tt_device_job_run_bg` |
 | Push-through exec | `tt_device_exec` (60s cap) |
-| Device reset | `tt_device_reset` |
+| Device reset (user request only) | `tt_device_reset` |
 | Kill | `tt_device_job_kill` |
 
 - Many agents share the device. The queue serializes access.
@@ -21,6 +21,8 @@ Tools on the `tt-device-mcp` MCP server. Names per `tt-buddy:buddy` § Host mapp
 - Job stuck >5 min: ask the user before killing.
 - Foreign-owned hung job: STOP. Report owner.
 - NEVER kill another agent's job.
+- Reset only when the user asks. Other agents may share your user.
+- Before reset: `tt_device_queue_status` shows no running job.
 
 ## Env file
 
