@@ -36,32 +36,35 @@ def succeeds(command: list[str], env: dict[str, str]) -> bool:
     return False
 
 
-def accessible_url() -> str | None:
+def accessible_repository() -> dict[str, str] | None:
     env = dict(os.environ, GH_PROMPT_DISABLED="1", GH_NO_UPDATE_NOTIFIER="1",
                GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="never",
                GIT_ASKPASS="false", SSH_ASKPASS="false")
-    # Reading contents, rather than public repository metadata, proves code access.
-    gh = shutil.which("gh")
-    if gh and succeeds([gh, "api", "--hostname", "github.com",
-                        f"repos/{REPOSITORY}/contents/README.md?ref=main"], env):
-        return HTTPS_URL
     git = shutil.which("git")
     if not git:
         return None
     if succeeds([git, "ls-remote", "--exit-code", HTTPS_URL, "HEAD"], env):
-        return HTTPS_URL
+        return {"repository": REPOSITORY, "clone_url": HTTPS_URL, "auth_method": "git"}
+    # Verify Git can use gh's existing credentials, not just API access. Keep the
+    # helper override command-local and report it for the installation to reuse.
+    if shutil.which("gh") and succeeds(
+        [git, "-c", "credential.https://github.com.helper=",
+         "-c", "credential.https://github.com.helper=!gh auth git-credential",
+         "ls-remote", "--exit-code", HTTPS_URL, "HEAD"], env
+    ):
+        return {"repository": REPOSITORY, "clone_url": HTTPS_URL, "auth_method": "gh"}
     # Use existing SSH keys/config without a password or new-host-key prompt.
     env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=5"
     if succeeds([git, "ls-remote", "--exit-code", SSH_URL, "HEAD"], env):
-        return SSH_URL
+        return {"repository": REPOSITORY, "clone_url": SSH_URL, "auth_method": "ssh"}
     return None
 
 
 def main() -> int:
-    url = accessible_url()
-    if url is None:
+    repository = accessible_repository()
+    if repository is None:
         return 1
-    print(json.dumps({"repository": REPOSITORY, "clone_url": url}))
+    print(json.dumps(repository))
     return 0
 
 

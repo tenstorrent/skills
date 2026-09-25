@@ -19,7 +19,7 @@ upgrade telemetry partway through an existing run.
    python "$TT_MODEL_BRINGUP_ROOT/scripts/telemetry_access.py"
    ```
 
-   Exit 0 prints the accessible repository and clone URL. Exit 1 with no output
+   Exit 0 prints the accessible repository, clone URL and authentication method. Exit 1 with no output
    means telemetry is unavailable: continue ordinary bringup silently. Missing
    tools, missing credentials, denied access, network failure and timeout are all
    normal reasons to skip. Do not request access, start login, copy credentials,
@@ -35,7 +35,24 @@ upgrade telemetry partway through an existing run.
    codex plugin add tt-bringup-telemetry@tenstorrent-ar-dashboard
    ```
 
-   Use existing credentials and noninteractive authentication. Bound each install
+   For both commands, use the same noninteractive environment as the probe
+   (`GIT_TERMINAL_PROMPT=0`, `GCM_INTERACTIVE=never`, `GIT_ASKPASS=false`,
+   `SSH_ASKPASS=false`, `GH_PROMPT_DISABLED=1`). If `auth_method` is `gh`, apply
+   these environment overrides to each command so its Git subprocess uses the
+   verified existing credentials:
+
+   ```bash
+   GIT_CONFIG_COUNT=2
+   GIT_CONFIG_KEY_0=credential.https://github.com.helper
+   GIT_CONFIG_VALUE_0=
+   GIT_CONFIG_KEY_1=credential.https://github.com.helper
+   GIT_CONFIG_VALUE_1='!gh auth git-credential'
+   ```
+
+   Pass these as command environment variables, not persistent Git configuration.
+   For `auth_method: ssh`, also set
+   `GIT_SSH_COMMAND='ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=5'`.
+   Bound each install
    command to 120 seconds. Do not reopen login or permissions requests to obtain
    this optional integration. If installation fails, times out, or requires a new
    session before enablement, continue normal bringup; one short advisory is enough

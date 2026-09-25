@@ -21,12 +21,15 @@ def test_access_routes_use_existing_credentials_without_prompts(monkeypatch, suc
     monkeypatch.setattr(probe.shutil, "which", lambda name: name)
 
     def check(command, env):
-        kind = "gh" if command[0] == "gh" else "ssh" if command[-2] == probe.SSH_URL else "https"
+        kind = "gh" if "-c" in command else "ssh" if command[-2] == probe.SSH_URL else "https"
         calls.append(kind)
         assert env["GH_PROMPT_DISABLED"] == "1"
         assert env["GIT_TERMINAL_PROMPT"] == "0"
         assert env["GCM_INTERACTIVE"] == "never"
         assert env["GIT_ASKPASS"] == env["SSH_ASKPASS"] == "false"
+        if kind == "gh":
+            assert "credential.https://github.com.helper=" in command
+            assert "credential.https://github.com.helper=!gh auth git-credential" in command
         if kind == "ssh":
             assert "BatchMode=yes" in env["GIT_SSH_COMMAND"]
             assert "StrictHostKeyChecking=yes" in env["GIT_SSH_COMMAND"]
@@ -38,13 +41,14 @@ def test_access_routes_use_existing_credentials_without_prompts(monkeypatch, suc
     assert not output.err
     if success is None:
         assert result == 1 and not output.out
-        assert calls == ["gh", "https", "ssh"]
+        assert calls == ["https", "gh", "ssh"]
     else:
         assert result == 0
         data = json.loads(output.out)
         assert data["repository"] == "tenstorrent/ar-dashboard"
         assert data["clone_url"] == (probe.SSH_URL if success == "ssh" else probe.HTTPS_URL)
-        assert calls[-1] == success
+        assert data["auth_method"] == ("git" if success == "https" else success)
+        assert calls == ["https", "gh", "ssh"][:["https", "gh", "ssh"].index(success) + 1]
 
 
 def test_missing_tools_are_silent(monkeypatch, capsys):
@@ -70,3 +74,10 @@ def test_hung_probe_is_bounded_and_missing_executable_is_unavailable(monkeypatch
     assert not probe.succeeds([sys.executable, "-c", "import time; time.sleep(60)"], os.environ.copy())
     assert time.monotonic() - started < 5
     assert not probe.succeeds(["/nonexistent-telemetry-access-tool"], os.environ.copy())
+
+
+def test_gh_without_git_cannot_install(monkeypatch, capsys):
+    monkeypatch.setattr(probe.shutil, "which", lambda name: "gh" if name == "gh" else None)
+    monkeypatch.setattr(probe, "succeeds", lambda *args: pytest.fail("must require Git"))
+    assert probe.main() == 1
+    assert capsys.readouterr() == ("", "")
