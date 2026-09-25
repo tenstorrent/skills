@@ -81,8 +81,10 @@ For simplicity I recommend starting with approach (1) for your first model bring
 For Codex multigoal runs, agents automatically install and use the telemetry plugin from
 `tenstorrent/ar-dashboard` if the execution host already has access. This provides a local
 progress HTML report and dashboard delivery. Without access, bringup continues quietly;
-no login or extra setup is needed. You can explicitly opt out of telemetry. Existing runs
-keep their recorded setup when resumed.
+no login or extra setup is needed. You can explicitly opt out of telemetry. When resuming,
+reuse the recorded launcher and telemetry environment; the runner does not automatically
+restore the optional integration. See the
+[telemetry setup procedure](../../plugins/tt-model-bringup/skills/model-bringup/references/telemetry-setup.md).
 
 ### How model bringup works
 
