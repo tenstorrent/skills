@@ -1,8 +1,6 @@
 ---
 name: note
 description: "Record an entry to git-tracked timeline notes at ~/.tt-buddy/notes/. Used by every skill that writes notes; invoke directly and often to record findings, plans, status, or observations. One commit per entry; subject `<topic>: <entry-title>`."
-metadata:
-  layer: meta
 ---
 
 # TT Note
@@ -23,25 +21,23 @@ Invoke `tt-buddy:note` all the time:
 - `tt-buddy:learn` or `tt-buddy:run` records a result.
 
 - In doubt: write the note.
-- NEVER write to `~/.tt-buddy/notes/` via Bash or Write.
-- Always go through `tt-buddy:note`.
+- Other skills: invoke `tt-buddy:note`. NEVER write notes themselves.
+- This skill writes via `scripts/write-entry.sh`. NEVER edit notes by hand.
 
 ## Pipeline
 
 ```
-detect topic → format entry → atomic-write → return path
+detect topic → write entry → return path
 ```
 
 1. **Detect topic:** pick the filename per `protocol.md` § Filename rules.
-2. **Format entry:** build the H2 entry per `protocol.md` § Entry shape.
-   - Capture source repo + short SHA per § Source-SHA capture.
-3. **Atomic-write:** prepend to the topic file. Auto-init if absent.
-   - Commit per `protocol.md` § Atomic-write protocol.
-   - Subject: `<topic>: <entry-title>`.
-4. **Return path:** report topic file path and notes-repo SHA.
+2. **Write entry:** run `scripts/write-entry.sh` per `protocol.md` § Write.
+   - Body per `protocol.md` § Entry shape.
+3. **Return path:** report the path and notes-repo SHA it prints.
 
 ## Progressive Load Table
 
 | Sub-task | Load |
 |---|---|
-| Filename rules, file shape, entry shape, source-SHA capture, auto-init, atomic-write protocol, cross-topic referencing, operational policies | `protocol.md` |
+| Filename rules, file shape, entry shape, source-SHA capture, write, cross-topic referencing, operational policies | `protocol.md` |
+| Write one entry | `scripts/write-entry.sh` |

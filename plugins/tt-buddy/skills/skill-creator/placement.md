@@ -1,29 +1,8 @@
-# Layer & Content Placement
+# Content Placement
 
 - Where a tt-buddy skill lives.
 - What it contains.
 - Where each rule's canonical location is.
-
-## Layer Placement
-
-- Every skill belongs to exactly one layer.
-- Declare it via `metadata.layer` in YAML frontmatter.
-- Skills are flat under `skills/<name>/`. Layers are metadata only.
-
-| Layer | Frontmatter value | Decision rule |
-|---|---|---|
-| Workflow | `metadata: { layer: workflow }` | Runs until a goal is met? |
-| Tool | `metadata: { layer: tool }` | Does one concrete pipeline-bound thing (build, run)? |
-| Meta | `metadata: { layer: meta }` | Cross-cutting utility, or builds/introspects tt-buddy? |
-
-- Tool vs Meta: is it **pipeline-bound** or **cross-cutting**?
-- Pipeline-bound: `tt-buddy:run` for execution.
-- Cross-cutting, writes notes: `tt-buddy:learn`, `tt-buddy:note`, `tt-buddy:buddy`.
-- Cross-cutting goes in Meta.
-
----
-
-## Content Placement
 
 | Content type | Where it goes | Rule |
 |---|---|---|

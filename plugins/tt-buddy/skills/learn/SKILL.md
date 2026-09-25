@@ -1,8 +1,6 @@
 ---
 name: learn
 description: "Research live Tenstorrent codebases on demand — produces dated context notes from local code search and deepwiki, consumed by other skills and developers"
-metadata:
-  layer: meta
 ---
 
 # TT Learn
@@ -39,7 +37,8 @@ check existing → research subagent → write entry → return entry
 ```
 
 1. **Check existing:** look for `~/.tt-buddy/notes/learn-<subject-slug>.md`.
-   - Exists and no refresh: return latest entry body.
+   - Reuse the latest entry only if fresh (§ Refresh).
+   - Else: research again.
 2. **Dispatch research subagent:** spawn a subagent with `research-prompt.md` (`tt-buddy:buddy` § Host mapping).
    - Pass the subject and refresh flag.
    - Subagent does the Grep/Read/deepwiki work and returns the body.
@@ -66,7 +65,8 @@ check existing → research subagent → write entry → return entry
 
 ## Refresh
 
-- Entries are fresh for the current development session.
+- Fresh: entry `<repo>@<sha>` equals current repo and HEAD.
+- Never fresh: entry or current tree is `-dirty`.
 - Force re-research when the user says "refresh" or "re-learn".
 - Force re-research when the caller passes a refresh hint.
 - Refresh skips step 1. New entry goes on top.

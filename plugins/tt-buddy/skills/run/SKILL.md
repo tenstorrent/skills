@@ -1,8 +1,6 @@
 ---
 name: run
 description: "Run, test, and execute commands on Tenstorrent devices — handles workspace detection, recipe loading, MCP routing, and job lifecycle. Use for any device-touching run/test action. Building follows the build recipe directly, not tt-buddy:run."
-metadata:
-  layer: tool
 ---
 
 # TT Run

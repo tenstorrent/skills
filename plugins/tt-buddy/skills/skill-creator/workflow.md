@@ -1,9 +1,9 @@
-# Workflow Skill Specifics
+# Goal-Loop Skill Specifics
 
-- Rules for workflow-layer skills only.
+- Rules for skills that run until a goal is met.
 - Convergence criteria, phase tables, quality bar, dev-rule conflicts.
 
-## Workflow Skills
+## Goal Loops
 
 Must define explicit convergence criteria:
 

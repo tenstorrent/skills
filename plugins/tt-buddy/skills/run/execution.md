@@ -43,10 +43,10 @@ A device backend is a **mode file**. It MUST provide:
 Build env content from three sources, in order:
 
 1. **Workspace-detect:** paths, `$USER`, `HF_HOME`.
-2. **Learn note** (`~/.tt-buddy/notes/learn-<target-slug>-params.md`):
+2. **Learn entry:** invoke `tt-buddy:learn("<target> env vars and config params")`.
+   - It reuses a fresh note or researches again.
    - Required and optional env vars, numeric constraints, paths.
    - Authoritative: extracted from source, not recipe tables.
-   - Absent: invoke `tt-buddy:learn("<target> env vars and config params")`.
 3. **User request:** model name, mesh topology, batch size, etc.
 
 - Validate numeric constraints from the note before emitting.

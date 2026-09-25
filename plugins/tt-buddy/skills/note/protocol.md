@@ -69,36 +69,19 @@
 - H2 entry title prefixed by the topic slug.
 - Commit body usually empty. The diff carries the entry.
 
-## Auto-init
+## Write
 
-On first write, if `~/.tt-buddy/notes/.git/` is absent:
+Run `scripts/write-entry.sh` from the source workspace:
 
 ```bash
-cd ~/.tt-buddy/notes
-git init
-git add -A && git commit -m "init: capture existing notes"
+printf '%s\n' "<body>" | scripts/write-entry.sh <topic> "<entry-title>"
 ```
 
-- Idempotent. Later writes detect `.git/` and skip.
-
-## Atomic-write protocol
-
-- One entry per file per invocation.
-- `git add <file> && git commit -m "<subject>" -- <file>` as one bash compound.
-- The `-- <file>` pathspec keeps other staged paths out of the commit.
-
-**Per write:**
-
-1. `BEFORE_HEAD=$(git -C ~/.tt-buddy/notes rev-parse HEAD 2>/dev/null || echo "")`
-2. Read the topic file. Absent: initialize with `# <topic>\n\n`.
-3. Prepend the new entry. Write the file.
-4. `git -C ~/.tt-buddy/notes add <file> && git -C ~/.tt-buddy/notes commit -m "<subject>" -- <file>`.
-5. Verify `git -C ~/.tt-buddy/notes rev-parse HEAD~1` equals `BEFORE_HEAD`.
-   - Not equal: another commit landed during 2–4.
-   - Run `git reset --soft HEAD~1`, re-read, re-prepend.
-   - Retry step 4 once.
-
-`BEFORE_HEAD` empty: run Auto-init first, then start at step 1.
+- It creates the notes repo on first use.
+- It takes a lock, prepends the entry, commits only that file.
+- It fills the metadata line per § Source-SHA capture.
+- NEVER run these git steps by hand.
+- Lock held 30s: report the lock path to the user.
 
 ## Cross-topic referencing
 
@@ -118,6 +101,6 @@ See `<other-topic>.md` (entry written this timestamp).
 ## Operational policies
 
 - **Sync:** local-only by default. Share via standard git remotes.
-- **Concurrency:** no locks. Same-file race: § Atomic-write protocol.
+- **Concurrency:** `scripts/write-entry.sh` serializes writers with a lock.
 - **Human entries:** edit and commit directly, same convention.
 - **Pruning:** none automatic. Developer prunes when a file grows unwieldy.

@@ -1,8 +1,6 @@
 ---
 name: buddy
 description: Use when starting any tt-metal, tt-inference, or vllm-tt-plugin task — a coding agent with Tenstorrent operating principles. Lists the tt-buddy skills, when to invoke each, and the artifacts they produce.
-metadata:
-  layer: meta
 ---
 
 <EXTREMELY-IMPORTANT>
@@ -22,12 +20,12 @@ This is not optional. You cannot rationalize your way out of it.
 
 Invoke per § Host mapping.
 
-| Task signal | Skill | Layer |
-|---|---|---|
-| Run/test on device, `pytest`, vllm-tt-plugin server lifecycle | `tt-buddy:run` | tool |
-| "How does X work" / "what are the knobs for Y" | `tt-buddy:learn` | meta |
-| Finding, observation, plan, or status update | `tt-buddy:note` | meta |
-| Create, edit, or audit a tt-buddy skill | `tt-buddy:skill-creator` | meta |
+| Task signal | Skill |
+|---|---|
+| Run/test on device, `pytest`, vllm-tt-plugin server lifecycle | `tt-buddy:run` |
+| "How does X work" / "what are the knobs for Y" | `tt-buddy:learn` |
+| Finding, observation, plan, or status update | `tt-buddy:note` |
+| Create, edit, or audit a tt-buddy skill | `tt-buddy:skill-creator` |
 
 No row matches: not tt-buddy work. Use default tools.
 
@@ -43,13 +41,6 @@ No row matches: not tt-buddy work. Use default tools.
 - `<plugin-root>/recipes/<repo>/` holds build, test, env steps.
 - **MUST Read** the matching recipe before acting.
 - NEVER use `cmake`, `ninja`, `make`, or direct C++ binaries.
-
-## Layers
-
-| Layer | Role | Examples |
-|---|---|---|
-| `tool` | Pipeline-bound, does one concrete thing | `tt-buddy:run` |
-| `meta` | Cross-cutting, callable from any skill | `tt-buddy:learn`, `tt-buddy:note`, `tt-buddy:skill-creator`, `tt-buddy:buddy` |
 
 ## Red Flags
 

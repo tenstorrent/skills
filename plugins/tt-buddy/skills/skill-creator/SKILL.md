@@ -1,8 +1,6 @@
 ---
 name: skill-creator
 description: "Design and build skills for the tt-buddy system — guides through rigorous design alignment before writing, then applies TT conventions. Use when creating, improving, or reviewing tt-buddy skills"
-metadata:
-  layer: meta
 ---
 
 # TT Skill Creator
@@ -12,7 +10,10 @@ metadata:
 - Designs and builds tt-buddy skills.
 - Most important part: **design the skill well**.
 - Expose spec flaws. Reach full alignment before writing.
-- Wraps `/skill-creator` for base mechanics: format, frontmatter, evals.
+- Base format: `base-format.md`. Self-contained.
+- Optional: a generic skill-creator adds evals.
+  - Codex: built-in `skill-creator`.
+  - Claude Code: the separate `skill-creator` plugin.
 - Adds TT rules from `placement.md`, `prose.md`, `workflow.md`, `economy.md`, `self-check.md`.
 
 ## When to Invoke
@@ -46,11 +47,10 @@ No exceptions, even with a full spec.
 Before any question, produce a design summary:
 
 1. **Purpose:** what it does and does not do.
-2. **Layer:** workflow / tool / meta, with justification.
-3. **Trigger:** request patterns; boundary with adjacent skills.
-4. **Input → output:** what it receives, produces, where output lands.
-5. **Dependencies:** skills it calls, callers, device access.
-6. **Open questions:** what context cannot resolve.
+2. **Trigger:** request patterns; boundary with adjacent skills.
+3. **Input → output:** what it receives, produces, where output lands.
+4. **Dependencies:** skills it calls, callers, device access.
+5. **Open questions:** what context cannot resolve.
 
 End with: _"What did I get wrong? What did I miss?"_
 Wait for the developer's response.
@@ -66,7 +66,7 @@ Wait for the developer's response.
 - Scope creep: 5 things may be 2 skills.
 - Overlap: read the dispatch table.
 - Volatile info MUST go through `tt-buddy:learn`, not assumed.
-- Missing convergence criteria (workflow) or verification steps (tool).
+- Missing convergence criteria (goal loops) or verification steps.
 
 ### Step 4 — Gate
 
@@ -77,7 +77,7 @@ Wait for the developer's response.
 
 Only after explicit approval:
 
-1. **Invoke `/skill-creator`** for base mechanics.
+1. **Apply `base-format.md`.** Generic skill-creator installed: invoke it too.
 2. **Load** `placement.md`, `prose.md`, `workflow.md`, `economy.md` as needed.
 3. Write SKILL.md + sub-files.
 4. Keep the diff minimal. Touch only what the task needs.
@@ -123,9 +123,10 @@ Applies to new skills and edits alike.
 
 | Sub-task | Load |
 |---|---|
-| Layer / content / canonical-location decisions | `placement.md` |
+| Content and canonical-location decisions | `placement.md` |
 | Voice, directness, abstraction discipline, self-contained skills | `prose.md` |
-| Workflow-skill specifics (convergence, phases, quality, dev-rule conflict) | `workflow.md` |
+| Goal-loop specifics (convergence, phases, quality, dev-rule conflict) | `workflow.md` |
 | Size limits and dedup rules | `economy.md` |
 | Pre-finalize self-check | `self-check.md` |
-| Base skill format, frontmatter, evals | Invoke `/skill-creator` |
+| Base skill format, frontmatter | `base-format.md` |
+| Evals (optional) | Invoke the host's generic skill-creator, if installed |
