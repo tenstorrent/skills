@@ -33,7 +33,8 @@ triage → kill → reset → verify → cache (conditional)
 ## Step 3 — Reset the device
 
 - Reset per mode's substitution table.
-- Backend recovers automatically: NEVER reset manually.
+- The backend resets automatically after a hang.
+- Confirm it in step 4.
 - **ALL device processes MUST be dead before reset.**
 - Reset with a live handle can wedge the machine.
 - Galaxy / multi-chip: one reset hits all host devices.

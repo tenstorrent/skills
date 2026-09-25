@@ -61,7 +61,8 @@ Mode-agnostic rows: `execution.md` § Failure handling.
 - Reset steps depend on platform and privileges.
 - The broker kills jobs on timeout or 300s silence.
 - Queue held: the gate is recovering. Wait.
-- After a hang: NEVER reset. The gate detects it and resets.
+- After a hang: tt-device-mcp resets the device automatically.
+- Confirm: `tt_device_queue_status` shows the queue not held.
 
 ## Recovery substitutions
 
