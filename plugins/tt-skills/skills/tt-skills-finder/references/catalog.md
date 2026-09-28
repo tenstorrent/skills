@@ -81,3 +81,29 @@ Install or enable it only after the user chooses it:
   Directory.
 - **Claude Code:** run `/plugin install tt-debug-tools@tenstorrent-skills` after adding the
   `tenstorrent/skills` marketplace.
+
+## `tt-deploy`
+
+Use once a model launch on Tenstorrent hardware has started (`docker run` / `run.py` already
+invoked) or a server is already answering `/health`. Two skills:
+
+- `launch`, which diagnoses a launch that is running, hanging, or has failed — stage/hang/failure
+  classification, mandatory docker flags, minimum-override selection and safety, realistic timing,
+  and displaced services — from the launching container's own log and state.
+- `verify`, which checks a live server is actually healthy, correct, and performant — health,
+  served model/context, generation correctness, mesh utilization, throughput/batching, and
+  reasoning-model quirks — and narrows down the root cause when a check fails.
+
+Every answer traces to a captured log, a live request/response, or a listed static rule. Discovery
+(what the host is) and model retrieval (what the model/image should be) land in a follow-up release.
+
+Do not route pre-launch host discovery or model/image lookup here — this plugin starts once a
+launch attempt exists. Recommend it when the user asks whether a launch is hanging or failed, what
+flags it needs, how long it should take, or whether a running server is actually working.
+
+Install or enable it only after the user chooses it:
+
+- **Codex / ChatGPT desktop:** select `tt-deploy` under **Tenstorrent Skills** in the Plugins
+  Directory.
+- **Claude Code:** run `/plugin install tt-deploy@tenstorrent-skills` after adding the
+  `tenstorrent/skills` marketplace.

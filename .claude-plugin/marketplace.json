@@ -29,6 +29,11 @@
       "name": "tt-debug-tools",
       "source": "./plugins/tt-debug-tools",
       "description": "Drive the Tenstorrent debug tools and read their output: tt-triage, dprint, watcher, asserts, etc."
+    },
+    {
+      "name": "tt-deploy",
+      "source": "./plugins/tt-deploy",
+      "description": "Diagnose a model launch and verify a running server on Tenstorrent hardware, deterministically and evidence-based."
     }
   ]
 }

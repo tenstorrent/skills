@@ -46,6 +46,7 @@ automatically for matching tasks; you can also ask your agent to make them expli
 | `tt-autodebug` | AutoDebug and AutoTriage investigate code issues and hangs; AutoFix tests hypotheses and repairs the cause |
 | `tt-model-bringup` | Eleven stages from HF decoder through TTNN/vLLM benchmarking, with chunked-prefill guidance, prefill/TTFT optimization, targeted path/serving checks, and fixed standard accuracy subsets plus 4K-input vLLM benchmarks at concurrency 1 and 32. Includes a standalone TTI release skill. Requires `tt-autodebug`. |
 | `tt-debug-tools` | Drive the Tenstorrent debug tools and read their output: tt-triage, dprint, watcher, asserts, etc. See [`plugins/tt-debug-tools/README.md`](plugins/tt-debug-tools/README.md) |
+| `tt-deploy` | Diagnose a model launch (stage/hang/failure classification, mandatory docker flags, override safety, timing, displaced services) and verify a running server (health, correctness, mesh utilization, throughput/batching, reasoning-model checks) on Tenstorrent hardware. Discovery and model retrieval skills land in a follow-up. |
 
 AutoDebug investigates in a fresh agent process and writes `AUTODEBUG.md`. AutoFix handles source
 changes and validation. For examples and expected outputs, see the

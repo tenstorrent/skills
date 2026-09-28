@@ -1,0 +1,41 @@
+{
+  "name": "tt-deploy",
+  "version": "0.1.0",
+  "description": "Diagnose a model launch and verify a running server on Tenstorrent hardware. launch reads the launching container's own log/state to classify hangs and failures, mandatory docker flags, override safety, timing, and displaced services. verify checks health, generation correctness, mesh utilization, throughput/batching, and reasoning-model quirks against a live endpoint, with root-cause elimination when a check fails. Deterministic, evidence-based; every answer traces to a captured log, a live request/response, or a listed static rule. Covers the launch and verification stages of the model-deployment journey; discovery and model retrieval land in a follow-up.",
+  "author": {
+    "name": "Tenstorrent"
+  },
+  "homepage": "https://github.com/tenstorrent/skills",
+  "repository": "https://github.com/tenstorrent/skills",
+  "license": "Apache-2.0",
+  "keywords": [
+    "deploy",
+    "diagnostics",
+    "inference",
+    "launch",
+    "tenstorrent",
+    "tt-inference-server",
+    "verification",
+    "vllm"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Tenstorrent Deploy",
+    "shortDescription": "Diagnose a model launch and verify a running server on Tenstorrent hardware",
+    "longDescription": "Diagnose a model launch that is running, hanging, or has failed (launch steps, mandatory docker flags, failure-signature classification, minimum-override selection and safety, override persistence, realistic timing, displaced services), and verify a live server is actually healthy, correct, and performant (health, served model/context, generation correctness, mesh utilization, throughput/batching, reasoning-model checks, root-cause elimination). Deterministic and evidence-based. Discovery and model retrieval skills land in a follow-up release.",
+    "developerName": "Tenstorrent",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Launch diagnostics: stage/hang/failure classification from container log and state",
+      "Mandatory docker flag and override verification",
+      "Server health, correctness, and generation checks",
+      "Mesh utilization, throughput, and batching verification",
+      "Reasoning-model quirk checks and root-cause elimination"
+    ],
+    "websiteURL": "https://github.com/tenstorrent/skills",
+    "defaultPrompt": [
+      "Use launch --container <id> to diagnose a model launch that is running, hanging, or has failed, and get a ranked fix.",
+      "Use verify --endpoint http://localhost:<n> to check a running server is healthy, correct, and performant."
+    ]
+  }
+}

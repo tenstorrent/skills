@@ -23,3 +23,6 @@
 
 # Debug tools
 /plugins/tt-debug-tools/ @ppetrovicTT
+
+# Model-deployment lifecycle (launch, verify; discover/retrieve to follow)
+/plugins/tt-deploy/ @ctr-fmamedov-crypto @ndalyTT

@@ -1,0 +1,23 @@
+{
+  "name": "tt-deploy",
+  "displayName": "Tenstorrent Deploy",
+  "version": "0.1.0",
+  "description": "Diagnose a model launch and verify a running server on Tenstorrent hardware. launch reads the launching container's own log/state to classify hangs and failures, mandatory docker flags, override safety, timing, and displaced services. verify checks health, generation correctness, mesh utilization, throughput/batching, and reasoning-model quirks against a live endpoint, with root-cause elimination when a check fails. Deterministic, evidence-based; every answer traces to a captured log, a live request/response, or a listed static rule. Covers the launch and verification stages of the model-deployment journey; discovery and model retrieval land in a follow-up.",
+  "author": {
+    "name": "Tenstorrent"
+  },
+  "homepage": "https://github.com/tenstorrent/skills",
+  "repository": "https://github.com/tenstorrent/skills",
+  "license": "Apache-2.0",
+  "keywords": [
+    "deploy",
+    "diagnostics",
+    "inference",
+    "launch",
+    "tenstorrent",
+    "tt-inference-server",
+    "verification",
+    "vllm"
+  ],
+  "skills": "./skills/"
+}
