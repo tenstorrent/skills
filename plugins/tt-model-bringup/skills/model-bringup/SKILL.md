@@ -46,6 +46,15 @@ or replace acceptance criteria with a review plugin's criteria.
    commands, commits, hardware identity and evidence. Keep weights, credentials and private logs
    out of published commits.
 
+## Dependency selection
+
+Treat upstream documentation and the selected source tree as the authority for dependency
+versions, installation commands and APIs. Resolve current supported combinations for new runs;
+do not copy version pins or workarounds from an old experiment. Record the resolved commits,
+versions and recommendation source, then retain them across resumes. Re-resolve only for an
+explicit restart or migration, preserving prior evidence and revalidating affected checks.
+For serving, follow [vLLM stack setup](../vllm-integration/references/serving-stack.md).
+
 ## Execution
 
 The eleven [goal templates](../../prompts/model_bringup_multigoal) run in order:

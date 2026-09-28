@@ -41,6 +41,15 @@ Other plugins keep their canonical skills inside their own plugin directory unle
 documented generator. Prefer one canonical implementation plus an enforced generated copy over
 two hand-maintained versions.
 
+## Dependency guidance
+
+Write skills to consult current authoritative installation and compatibility instructions,
+resolve a supported combination, and verify it in the target environment. Avoid embedding
+transient version pins, branch assumptions or historical workarounds as permanent defaults.
+Examples and regression fixtures may record specific versions as evidence, but must not become
+the selection rule for future runs. Record the resolved versions/commits per run and retain
+them across resumes; re-resolve deliberately for new runs or requested migrations.
+
 ## Adding or changing a plugin
 
 1. Add or update both plugin manifests and both marketplace entries.

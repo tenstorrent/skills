@@ -40,9 +40,14 @@ target tt-metal checkout.
 
 Serving configuration uses `--additional-config` with a `tt` object. The interface
 is defined in `vllm/engine/arg_utils.py` and the TT plugin's `config.py::get_tt_config`;
-the compatibility reference is `tenstorrent/vllm` commit
-`5ffebf4128f81ea5cf8413175eabde52cd8c8d75`. Serving and generator readiness use the
+select the standalone `tenstorrent/vllm-tt-plugin` and the upstream vLLM version
+recommended by its current installation instructions, recording the resolved pair per run.
+Serving and generator readiness use the
 same mesh labels, including `P300x2` for QB2's 1 x 4 chips.
+
+Every local server launch rejects known legacy vLLM and bundled-plugin source layouts.
+Sampling tests run from the source checkout that matches the installed plugin.
+Version and commit verification remains part of setup and resume.
 
 Stages 9 and 10 require served qualitative artifacts (`--scope vllm`). Verify
 page-growth refresh and pending-token handling before enabling async overlap.
