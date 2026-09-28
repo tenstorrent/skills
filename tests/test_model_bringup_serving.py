@@ -5,6 +5,7 @@ import argparse
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
 import sys
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
@@ -38,6 +39,7 @@ def serving(monkeypatch):
 def test_serving_cli_forwards_mesh_and_supported_config_flag(serving, monkeypatch, tmp_path, mesh):
     # Upstream vLLM owns --additional-config; the standalone plugin reads tt.
     # arg_utils.py registers --additional-config; TT config.py reads its tt object.
+    install_fake_stack(serving, monkeypatch, tmp_path)
     config = {'sample_on_device_mode': 'all', 'cache_path': 'path with spaces', 'nested': {'enabled': True}}
     monkeypatch.setattr(sys, 'argv', [
         'run_vllm_server', '--model-dir', str(tmp_path), '--hf-model', 'org/model',
@@ -155,11 +157,175 @@ def test_sampling_requires_installed_plugin(serving, monkeypatch):
 
 
 def test_missing_sampling_suite_fails_before_server_launch(serving, monkeypatch, tmp_path):
+    _, tests, _ = install_fake_stack(serving, monkeypatch, tmp_path)
+    (tests / 'conftest.py').unlink()
     monkeypatch.setattr(sys, 'argv', ['run_vllm_server', '--model-dir', str(tmp_path),
                                    '--hf-model', 'org/model', '--mesh-device', 'N150'])
+    launch = Mock()
+    monkeypatch.setattr(serving, '_launch_server', launch)
+    with pytest.raises(RuntimeError, match='Canonical standalone plugin tests missing'):
+        serving._main()
+    launch.assert_not_called()
+
+
+def install_fake_stack(serving, monkeypatch, tmp_path, *, editable=False):
+    tests = install_fake_plugin(serving, monkeypatch, tmp_path / 'plugin')
+    site = tmp_path / 'site-packages'
+    metadata = site / 'vllm-1.2.3.dist-info'
+    metadata.mkdir(parents=True)
+    (metadata / 'METADATA').write_text('Metadata-Version: 2.1\nName: vllm\nVersion: 1.2.3\n')
+    root = tmp_path / 'source with spaces' if editable else site
+    origin = root / 'vllm/__init__.py'
+    origin.parent.mkdir(parents=True)
+    origin.touch()
+    if editable:
+        (metadata / 'direct_url.json').write_text(json.dumps({
+            'url': root.as_uri(), 'dir_info': {'editable': True},
+        }))
+    monkeypatch.syspath_prepend(str(site))
+    plugin_find_spec = serving.importlib.util.find_spec
+    monkeypatch.setattr(serving.importlib.util, 'find_spec', lambda name:
+                        SimpleNamespace(origin=str(origin)) if name == 'vllm' else plugin_find_spec(name))
+    monkeypatch.setenv('VLLM_EXPECTED_VERSION', '1.2.3')
+    monkeypatch.delenv('VLLM_EXPECTED_COMMIT', raising=False)
+    return root, tests, metadata
+
+
+@pytest.mark.parametrize('editable', [False, True])
+def test_serving_stack_accepts_matching_package(serving, monkeypatch, tmp_path, editable):
+    install_fake_stack(serving, monkeypatch, tmp_path, editable=editable)
+    serving._validate_serving_stack()
+
+
+@pytest.mark.parametrize('stages', ['serve', 'serve,sampling', 'serve,qualitative', 'serve,benchmark'])
+@pytest.mark.parametrize('marker', ['plugins/vllm-tt-plugin', 'tests/tt'])
+def test_mixed_legacy_core_and_standalone_plugin_fail_before_launch(
+    serving, monkeypatch, tmp_path, stages, marker,
+):
+    root, _, _ = install_fake_stack(serving, monkeypatch, tmp_path)
+    (root / 'pyproject.toml').touch()
+    (root / marker).mkdir(parents=True)
+    monkeypatch.setattr(sys, 'argv', [
+        'run_vllm_server', '--model-dir', str(tmp_path), '--hf-model', 'org/model',
+        '--mesh-device', 'N150', '--stages', stages,
+    ])
+    launch = Mock()
+    monkeypatch.setattr(serving, '_launch_server', launch)
+    with pytest.raises(RuntimeError, match='Legacy tenstorrent/vllm checkout'):
+        serving._main()
+    launch.assert_not_called()
+
+
+@pytest.mark.parametrize('marker', ['plugins/vllm-tt-plugin', 'tests/tt'])
+def test_unrelated_site_packages_directories_are_not_legacy_sources(serving, monkeypatch, tmp_path, marker):
+    root, _, _ = install_fake_stack(serving, monkeypatch, tmp_path)
+    (root / marker).mkdir(parents=True)
+    serving._validate_serving_stack()
+
+
+def test_serve_only_requires_standalone_plugin(serving, monkeypatch, tmp_path):
     monkeypatch.setattr(serving.importlib.util, 'find_spec', lambda name: None)
+    monkeypatch.setattr(sys, 'argv', [
+        'run_vllm_server', '--model-dir', str(tmp_path), '--hf-model', 'org/model',
+        '--mesh-device', 'N150', '--stages', 'serve',
+    ])
     launch = Mock()
     monkeypatch.setattr(serving, '_launch_server', launch)
     with pytest.raises(RuntimeError, match='Install the standalone'):
         serving._main()
     launch.assert_not_called()
+
+
+def test_serve_only_does_not_require_sampling_tests(serving, monkeypatch, tmp_path):
+    _, tests, _ = install_fake_stack(serving, monkeypatch, tmp_path)
+    (tests / 'conftest.py').unlink()
+    monkeypatch.setattr(sys, 'argv', [
+        'run_vllm_server', '--model-dir', str(tmp_path), '--hf-model', 'org/model',
+        '--mesh-device', 'N150', '--stages', 'serve',
+    ])
+    for name in ('_launch_server', '_check_port_available', '_wait_for_server', '_hold_until_signal', '_shutdown'):
+        monkeypatch.setattr(serving, name, Mock())
+    serving._main()
+    serving._launch_server.assert_called_once()
+
+
+@pytest.mark.parametrize('version', [None, '9.9.9'])
+def test_serving_stack_requires_recorded_version(serving, monkeypatch, tmp_path, version):
+    install_fake_stack(serving, monkeypatch, tmp_path)
+    if version is None:
+        monkeypatch.delenv('VLLM_EXPECTED_VERSION')
+    else:
+        monkeypatch.setenv('VLLM_EXPECTED_VERSION', version)
+    with pytest.raises(RuntimeError, match='recorded'):
+        serving._validate_serving_stack()
+
+
+def test_serving_stack_rejects_package_shadowing(serving, monkeypatch, tmp_path):
+    install_fake_stack(serving, monkeypatch, tmp_path)
+    shadow = tmp_path / 'other-checkout/vllm/__init__.py'
+    shadow.parent.mkdir(parents=True)
+    shadow.touch()
+    previous = serving.importlib.util.find_spec
+    monkeypatch.setattr(serving.importlib.util, 'find_spec', lambda name:
+                        SimpleNamespace(origin=str(shadow)) if name == 'vllm' else previous(name))
+    with pytest.raises(RuntimeError, match='does not match installed package'):
+        serving._validate_serving_stack()
+
+
+def test_serving_stack_rejects_missing_distribution_metadata(serving, monkeypatch, tmp_path):
+    _, _, metadata = install_fake_stack(serving, monkeypatch, tmp_path)
+    (metadata / 'METADATA').unlink()
+    metadata.rmdir()
+    with pytest.raises(RuntimeError, match='No installed vLLM package metadata'):
+        serving._validate_serving_stack()
+
+
+def test_serving_stack_checks_checkout_commit_on_resume(serving, monkeypatch, tmp_path):
+    root, _, _ = install_fake_stack(serving, monkeypatch, tmp_path, editable=True)
+    subprocess.run(['git', 'init', '-q', str(root)], check=True)
+    commit_cmd = ['git', '-C', str(root), '-c', 'user.name=Test', '-c', 'user.email=test@example.com',
+                  '-c', 'commit.gpgsign=false', 'commit', '-q', '--allow-empty', '-m', 'Test commit']
+    subprocess.run(commit_cmd, check=True)
+    commit = subprocess.check_output(['git', '-C', str(root), 'rev-parse', 'HEAD'], text=True).strip()
+    with pytest.raises(RuntimeError, match='Set VLLM_EXPECTED_COMMIT'):
+        serving._validate_serving_stack()
+    monkeypatch.setenv('VLLM_EXPECTED_COMMIT', commit)
+    serving._validate_serving_stack()
+    subprocess.run(commit_cmd, check=True)
+    with pytest.raises(RuntimeError, match='does not match recorded commit'):
+        serving._validate_serving_stack()
+
+
+def test_serving_stack_checks_vcs_wheel_commit(serving, monkeypatch, tmp_path):
+    _, _, metadata = install_fake_stack(serving, monkeypatch, tmp_path)
+    commit = 'a' * 40
+    (metadata / 'direct_url.json').write_text(json.dumps({
+        'url': 'https://github.com/vllm-project/vllm',
+        'vcs_info': {'vcs': 'git', 'commit_id': commit},
+    }))
+    monkeypatch.setenv('VLLM_EXPECTED_COMMIT', commit)
+    serving._validate_serving_stack()
+    monkeypatch.setenv('VLLM_EXPECTED_COMMIT', 'b' * 40)
+    with pytest.raises(RuntimeError, match='does not match recorded commit'):
+        serving._validate_serving_stack()
+
+
+def test_serving_stack_rejects_unverifiable_commit(serving, monkeypatch, tmp_path):
+    install_fake_stack(serving, monkeypatch, tmp_path)
+    monkeypatch.setenv('VLLM_EXPECTED_COMMIT', 'a' * 40)
+    with pytest.raises(RuntimeError, match='commit unavailable'):
+        serving._validate_serving_stack()
+
+
+def test_external_sampling_does_not_validate_local_vllm(serving, monkeypatch, tmp_path):
+    install_fake_plugin(serving, monkeypatch, tmp_path / 'plugin')
+    monkeypatch.delenv('VLLM_EXPECTED_VERSION', raising=False)
+    monkeypatch.setattr(sys, 'argv', [
+        'run_vllm_server', '--model-dir', str(tmp_path), '--hf-model', 'org/model',
+        '--stages', 'sampling', '--server-url', 'http://example.test:8000',
+    ])
+    monkeypatch.setattr(serving, '_probe_external_server', Mock())
+    sampling = Mock(return_value=True)
+    monkeypatch.setattr(serving, '_run_plugin_sampling_tests', sampling)
+    serving._main()
+    sampling.assert_called_once()

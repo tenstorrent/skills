@@ -26,6 +26,19 @@ For a new run:
    URLs, the recommendation file/commit, install commands, interpreter and resolved package
    locations. Keep that pair for the run. Later runs consult upstream afresh.
 
+Before each local runner launch, export these values from the saved run record:
+
+- `VLLM_EXPECTED_VERSION`: the exact vLLM package version, including any build suffix.
+- `VLLM_EXPECTED_COMMIT`: the full vLLM commit SHA for a Git checkout or an install from
+  a Git URL. Leave this unset for release-package installs without Git commit metadata.
+
+The runner checks the imported plugin and vLLM locations before every local launch.
+It rejects legacy fork layouts and compares vLLM's version and available commit with these
+values. Keep the expected values across resumes; do not replace them with whatever the
+current environment reports. Sampling also requires the plugin's source test suite.
+For an external server, verify its stack in the server environment; local package checks
+cannot establish what a remote process loaded.
+
 For an explicitly requested migration, preserve the old environment, local patches and all
 failed evidence first. Compare local fixes with the new sources rather than blindly applying
 fork patches. Use a separate environment for compatibility checks. Update registration,

@@ -45,6 +45,11 @@ recommended by its current installation instructions, recording the resolved pai
 Serving and generator readiness use the
 same mesh labels, including `P300x2` for QB2's 1 x 4 chips.
 
+Every local server launch validates the imported plugin and vLLM locations. The runner
+rejects legacy fork layouts and checks vLLM against `VLLM_EXPECTED_VERSION` and, for Git
+installs, `VLLM_EXPECTED_COMMIT` from the run record. Only sampling requires the source test
+suite. External-server checks require separate validation in the server environment.
+
 Stages 9 and 10 require served qualitative artifacts (`--scope vllm`). Verify
 page-growth refresh and pending-token handling before enabling async overlap.
 
