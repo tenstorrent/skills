@@ -3,7 +3,8 @@
 "tt-skills": minor
 ---
 
-Add the optional `tt-deploy` plugin with its `launch` and `verify` skills.
+Add the optional `tt-deploy` plugin with its `discover`, `retrieve`, `launch` and
+`verify` skills, covering all four stages of the model-deployment journey.
 
 `launch` diagnoses a model launch that is running, hanging, or has failed —
 stage/hang/failure classification, mandatory docker flags, minimum-override
@@ -28,9 +29,20 @@ mandatory-flag check, a SIGBUS crash after a long idle period, and a
 reasoning-model case where `reasoning_content` stays null even though the
 parser is wired.
 
-Discovery (what the host is) and model retrieval (what the model/image
-should be) are a separate, already-drafted pair of skills for the same
-deploy-model journey and land in a fast-follow PR, so `tt-deploy` grows to
-all four lifecycle stages without blocking this one on that work.
+`discover` answers the Discovery-stage host questions (D1–D16) from fixed
+commands: host facts, driver, boards vs ASICs, hugepages, docker, HF cache,
+port 8000, device holders, the `--tt-device` string derived from board serials,
+firmware minimums, idle telemetry, a reset verdict, deployable models, gating,
+disk budget, and clean-box. Read-only; the reset itself is never run here.
+
+`retrieve` answers the Model Retrieval-stage questions (R1–R16, B1–B20) for one
+model: HF existence, gating and config; the tt-inference-server spec entry
+(image, commits, status, ceilings, known_issues); image-vs-repo spec drift;
+GHCR tag, size and ancestry; run.py vs direct docker; and the tt-model-manager
+bundle path (search, catalog, manifest, weights pointer, install state, exact
+serve command). Read-only unless `--pull`.
+
+The shared `knowledge/` tree grows `hf-hub.md`, `hardware/boards.md` and
+`recipes/tt-inference-server/model-spec.md`, which the four skills cite.
 
 The finder catalogue gains `tt-deploy` alongside the other optional plugins.
