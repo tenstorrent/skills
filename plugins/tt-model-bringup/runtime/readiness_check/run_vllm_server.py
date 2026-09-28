@@ -60,8 +60,8 @@ omit ``serve`` from the stages:
 
 To install vLLM, consult `tenstorrent/vllm-tt-plugin` checkout's
 current README and installation script. Use the upstream vLLM version it
-recommends. For sampling, install the plugin editable and set VLLM_TT_PLUGIN_ROOT
-to its source checkout.
+recommends and follow the documented plugin installation procedure.
+Set VLLM_TT_PLUGIN_ROOT to the selected plugin checkout.
 Record the selected pair; do not use the old tenstorrent/vllm fork.
 
 Before invoking it, two things must already be true:
@@ -161,8 +161,18 @@ _FATAL_LOG_PATTERNS = (
 
 
 
+def _reject_legacy_plugin_source(origin: Path) -> None:
+    root = origin.parent.parent.parent
+    if (
+        origin.parent.parent.name == "src"
+        and root.parent.name == "plugins"
+        and (root.parent.parent / "vllm").is_dir()
+    ):
+        raise RuntimeError("Legacy bundled TT plugin detected. Migrate to standalone tenstorrent/vllm-tt-plugin.")
+
+
 def _find_plugin_root() -> Path:
-    """Locate the plugin source checkout required by sampling tests."""
+    """Locate the source checkout that matches the imported plugin."""
     spec = importlib.util.find_spec("vllm_tt_plugin")
     if spec is None or spec.origin is None:
         raise RuntimeError("Install the standalone tenstorrent/vllm-tt-plugin editable in the server environment.")
@@ -176,13 +186,12 @@ def _find_plugin_root() -> Path:
             f"VLLM_TT_PLUGIN_ROOT/source checkout does not match installed plugin {origin}. "
             "Install `tenstorrent/vllm-tt-plugin` editable with the server interpreter."
         )
-    if root.parent.name == "plugins" and (root.parent.parent / "vllm").is_dir():
-        raise RuntimeError("Legacy bundled TT plugin detected. Migrate to standalone tenstorrent/vllm-tt-plugin.")
+    _reject_legacy_plugin_source(origin)
     return root
 
 
 def _reject_legacy_serving_sources() -> None:
-    """Reject known legacy checkouts without requiring editable installs."""
+    """Reject known legacy vLLM and bundled-plugin sources."""
     origins: dict[str, Path] = {}
     for package in ("vllm", "vllm_tt_plugin"):
         spec = importlib.util.find_spec(package)
@@ -198,14 +207,7 @@ def _reject_legacy_serving_sources() -> None:
     ):
         raise RuntimeError(f"Legacy tenstorrent/vllm checkout detected at {root}. Install upstream vLLM.")
 
-    plugin_origin = origins["vllm_tt_plugin"]
-    plugin_root = plugin_origin.parent.parent.parent
-    if (
-        plugin_origin.parent.parent.name == "src"
-        and plugin_root.parent.name == "plugins"
-        and (plugin_root.parent.parent / "vllm").is_dir()
-    ):
-        raise RuntimeError("Legacy bundled TT plugin detected. Migrate to standalone tenstorrent/vllm-tt-plugin.")
+    _reject_legacy_plugin_source(origins["vllm_tt_plugin"])
 
 
 def _find_plugin_tests_dir() -> Path:

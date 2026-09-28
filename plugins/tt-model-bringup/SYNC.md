@@ -46,8 +46,8 @@ Serving and generator readiness use the
 same mesh labels, including `P300x2` for QB2's 1 x 4 chips.
 
 Every local server launch rejects known legacy vLLM and bundled-plugin source layouts.
-Serving supports normal package installs. Only sampling requires the plugin's source
-checkout and test suite. Version and commit verification remains part of setup and resume.
+Sampling tests run from the source checkout that matches the installed plugin.
+Version and commit verification remains part of setup and resume.
 
 Stages 9 and 10 require served qualitative artifacts (`--scope vllm`). Verify
 page-growth refresh and pending-token handling before enabling async overlap.

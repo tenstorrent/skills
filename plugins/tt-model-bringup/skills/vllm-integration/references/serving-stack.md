@@ -27,9 +27,9 @@ For a new run:
    locations. Keep that pair for the run. Later runs consult upstream afresh.
 
 Before each local launch, the runner rejects known legacy vLLM and bundled-plugin source
-layouts. Serving supports normal package installs. Only sampling requires the plugin's
-source checkout and test suite. Verify versions and commits against the run record during
-setup and resume. For an external server, perform that verification in its environment.
+layouts. Sampling tests run from the source checkout that matches the installed plugin.
+Verify versions and commits against the run record during setup and resume. For an external
+server, perform that verification in its environment.
 
 For an explicitly requested migration, preserve the old environment, local patches and all
 failed evidence first. Compare local fixes with the new sources rather than blindly applying
