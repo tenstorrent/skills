@@ -55,6 +55,9 @@ If AutoDebug’s Codex child sandbox fails, the calling agent assesses the error
 authorization before explicitly retrying with `AUTODEBUG_SKIP_CHILD_SANDBOX=1`; see the
 [sandbox guidance](plugins/tt-autodebug/skills/autodebug/SKILL.md#codex-sandbox-startup).
 
+Model bringup serving uses the standalone TT vLLM plugin and resolves its recommended
+upstream vLLM version for each new run.
+
 ## Model bring-up
 
 Ask your agent to use `tt-model-bringup` with the HF model ID in your target checkout. The finder

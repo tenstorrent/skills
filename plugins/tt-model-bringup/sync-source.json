@@ -85,7 +85,7 @@
       "destination": "prompts/model_bringup_multigoal/09-vllm.txt",
       "blob": "fc930a5472158d07221c2c5440786a7c5aed9ed2",
       "source_sha256": "65e532c7e54a6e1bd348575f4471fa0708990fe93e91ef06bbfa9695c60ca727",
-      "packaged_sha256": "65e532c7e54a6e1bd348575f4471fa0708990fe93e91ef06bbfa9695c60ca727"
+      "packaged_sha256": "a1ad54e8690645dd74bfbdcbb48e1975c01998715d3c306bfe6fa6a3e1b4a9cf"
     },
     {
       "source": ".agents/prompts/model_bringup_multigoal/10-optimized-vllm.check.sh",
@@ -274,7 +274,7 @@
       "destination": "skills/vllm-integration/SKILL.md",
       "blob": "05d9e19f7cfbb596d209c504cc49e063b9361da1",
       "source_sha256": "a23a516ab0e8afc3a5dd6ddd72a42781997fb454872139e70605ecbd234e114c",
-      "packaged_sha256": "17674a1d2dac96df8733429fa6b4cddbafff197896174d5653eddeaa22fe035d"
+      "packaged_sha256": "441ee79255635f11824a50b767f2b73b6d08643764d21a74d842062741d00ea0"
     },
     {
       "source": ".agents/skills/vllm-integration/agents/openai.yaml",
@@ -365,7 +365,7 @@
       "destination": "runtime/readiness_check/run_vllm_server.py",
       "blob": "854a62c6b4caedd64708da951c89c51af96d10d2",
       "source_sha256": "051d45493d4a822da38395f506188f08d46cba981ef1e1e9d7a0a74efd7c291c",
-      "packaged_sha256": "bb9602ff2ec7329b486bc344653ad9e3794b93eb81bd393828ce225b19924818"
+      "packaged_sha256": "9d35be42bef0fc910026ffef5a41c6f3a39f5ce5b9539bb9a3c22f31f3914300"
     },
     {
       "source": "models/common/readiness_check/schema.py",

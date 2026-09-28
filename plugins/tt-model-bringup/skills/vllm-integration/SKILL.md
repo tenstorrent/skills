@@ -40,6 +40,12 @@ Serving requests may have any valid prompt length up to that supported context. 
 
 Preserve larger-batch serving capability. The headline performance target is still batch-1 single-user latency, but the adapter must not assume `max_num_seqs=1` or batch size 1 in cache allocation, page tables, scheduler inputs, sampling, async decode, or output formatting. Test serving up to 32 concurrent sequences when the target hardware, memory, and harness allow it. If 32 cannot run, record the largest tested value and the hard physical limit.
 
+## Serving dependency
+
+Before serving, follow [serving stack setup](references/serving-stack.md): use the standalone
+TT plugin and the upstream vLLM version its current instructions recommend. Keep the selected
+pair and its source provenance in the run record.
+
 ## vLLM Adapter
 
 `tt/generator_vllm.py` should delegate to the existing generator's low-level methods. Keep adapter-only code limited to vLLM interface translation.
@@ -65,12 +71,9 @@ N+1 before sampled token N reaches host scheduler state. Reuse the device token 
 position state for steady decode; advance it exactly once per emitted token. Account
 for transitions between the model's traces.
 
-`reset_batch=False` does **not** prove the page table is unchanged. In the compatibility
-source [tenstorrent/vllm at 5ffebf4128f81ea5cf8413175eabde52cd8c8d75](https://github.com/tenstorrent/vllm/blob/5ffebf4128f81ea5cf8413175eabde52cd8c8d75/plugins/vllm-tt-plugin/src/vllm_tt_plugin/model_runner.py#L683),
-`_update_states` appends newly allocated blocks without marking the decode layout changed.
-The [steady-decode check](https://github.com/tenstorrent/vllm/blob/5ffebf4128f81ea5cf8413175eabde52cd8c8d75/plugins/vllm-tt-plugin/src/vllm_tt_plugin/async_decode.py#L249)
-does not reject this page-growth case. This was also the `dev` head checked on 2026-09-08;
-do not assume an upstream repair exists.
+`reset_batch=False` does **not** prove the page table is unchanged. Inspect the pinned
+standalone plugin's state updates and decode-reload contract; behavior depends on that
+revision. Do not retain a workaround solely because an old fork needed it.
 
 Before enabling overlap, verify that the selected vLLM revision invalidates or refreshes
 device page tables when active requests gain blocks. A reset that reloads host tokens or
@@ -93,7 +96,7 @@ If the vLLM plugin or harness is being changed, prefer the same safety rule ther
 The traced serving decode path reuses the full-model generator's canonical split-sampling path and replays via `ttnn.execute_trace(..., blocking=False)`. For `sample_on_device_mode=all`, serving has no new sampling strategy, host greedy/top-1 argmax, full-logits readback, generic top-k fallback for greedy, or Python readback/writeback token-feedback loop. If the full-model generator lacks split sampling, stop and fix `$full-model`; do not complete vLLM by patching sampling in the adapter. Do not copy a full page table every token when it is unchanged. Reduce token/current-position/page-table refresh to actual scheduler state changes, then prove both changed and unchanged cases with stale-input tests.
 
 The packaged serving runner uses `--additional-config` with a `{"tt": ...}` JSON
-object, matching the compatibility commit above. It accepts `P300x2` for a Blackhole
+object. Verify this against the selected upstream CLI and plugin config reader. It accepts `P300x2` for a Blackhole
 QuietBox 2 (1 x 4 chips). Do not patch vLLM to accept the obsolete `--plugin-config`
 flag or wrap the runner to modify its mesh choices. When changing the vLLM revision,
 check its argument parser and TT config reader before serving.
@@ -129,13 +132,10 @@ pass. Preserve final all-layer serving evidence and the existing acceptance gate
 
 ## Plugin Registration
 
-Register the model with the TT vLLM plugin. vLLM discovers TT models from the hardcoded list in:
-
-```text
-vllm/plugins/vllm-tt-plugin/src/vllm_tt_plugin/platform.py::register_tt_models()
-```
-
-Add a `_register_model_if_missing(ModelRegistry, "TT<Arch>ForCausalLM", "<dotted.module.path>:<ClassName>")` call for the new adapter. Without this registration, the server will reject the architecture at startup before your adapter can run.
+Register the model through the pinned standalone plugin's documented extension mechanism;
+see [serving stack setup](references/serving-stack.md). Verify the resolved class is this
+experiment's adapter, including in engine subprocesses. An existing built-in architecture
+must not silently select a reference model instead.
 
 ## vLLM Server Integration Test
 
@@ -273,4 +273,4 @@ The README should lead with vLLM sampling status, qualitative verdict, primary s
 | Generator contract | `${TT_MODEL_BRINGUP_ROOT}/runtime/readiness_check/contract.py` |
 | tt_transformers generator | `models/tt_transformers/tt/generator.py` |
 | Thin vLLM adapter | `models/tt_transformers/tt/generator_vllm.py` |
-| vLLM model registration | `vllm/plugins/vllm-tt-plugin/src/vllm_tt_plugin/platform.py::register_tt_models` |
+| vLLM model registration | Standalone plugin registration; see [stack setup](references/serving-stack.md) |

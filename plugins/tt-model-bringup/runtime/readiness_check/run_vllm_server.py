@@ -58,10 +58,10 @@ omit ``serve`` from the stages:
         --model-dir models/autoports/<model_name> \\
         --hf-model <hf-model-id>
 
-To install vLLM, if not already present:
-1. Clone `https://github.com/tenstorrent/vllm.git`
-2. Switch to the `dev` branch
-3. Follow the Tenstorrent vLLM installation instructions for that checkout.
+To install vLLM, consult the standalone `tenstorrent/vllm-tt-plugin` checkout's
+current README and installation script. Use the upstream vLLM version it
+recommends, install that plugin editable, and set VLLM_TT_PLUGIN_ROOT to its root.
+Record the selected pair; do not use the old tenstorrent/vllm fork.
 
 Before invoking it, two things must already be true:
 
@@ -161,27 +161,26 @@ _FATAL_LOG_PATTERNS = (
 
 
 def _find_plugin_tests_dir() -> Path:
-    """Locate the TT vLLM pytest suite in either old plugin or in-tree layouts."""
-    candidates: List[Path] = []
-
-    plugin_spec = importlib.util.find_spec("vllm_tt_plugin")
-    if plugin_spec is not None and plugin_spec.origin is not None:
-        # Old layout: <plugin_root>/src/vllm_tt_plugin/__init__.py
-        plugin_root = Path(plugin_spec.origin).resolve().parent.parent.parent
-        candidates.append(plugin_root / "tests" / "tt")
-
-    vllm_spec = importlib.util.find_spec("vllm")
-    if vllm_spec is not None and vllm_spec.origin is not None:
-        # Current Tenstorrent fork layout: <vllm_repo>/vllm/__init__.py
-        vllm_repo = Path(vllm_spec.origin).resolve().parent.parent
-        candidates.append(vllm_repo / "tests" / "tt")
-
-    for tests_dir in candidates:
-        if tests_dir.is_dir():
-            return tests_dir
-
-    checked = ", ".join(str(path) for path in candidates) or "no importable vllm/vllm_tt_plugin package"
-    raise RuntimeError(f"Could not find TT vLLM pytest tests. Checked: {checked}")
+    """Use tests belonging to the installed standalone plugin, never the fork."""
+    spec = importlib.util.find_spec("vllm_tt_plugin")
+    if spec is None or spec.origin is None:
+        raise RuntimeError("Install the standalone tenstorrent/vllm-tt-plugin editable in the server environment.")
+    origin = Path(spec.origin).resolve()
+    # Editable source layout: <plugin_root>/src/vllm_tt_plugin/__init__.py
+    installed_root = origin.parent.parent.parent
+    configured = os.environ.get("VLLM_TT_PLUGIN_ROOT")
+    root = Path(configured).expanduser().resolve() if configured else installed_root
+    if origin != root / "src" / "vllm_tt_plugin" / "__init__.py":
+        raise RuntimeError(
+            f"VLLM_TT_PLUGIN_ROOT/source checkout does not match installed plugin {origin}. "
+            "Install that standalone checkout editable with the server interpreter."
+        )
+    if root.parent.name == "plugins" and (root.parent.parent / "vllm").is_dir():
+        raise RuntimeError("Legacy bundled TT plugin detected. Migrate to standalone tenstorrent/vllm-tt-plugin.")
+    tests_dir = root / "tests" / "tt"
+    if not (tests_dir / "conftest.py").is_file():
+        raise RuntimeError(f"Canonical standalone plugin tests missing at {tests_dir}; inspect the pinned plugin layout.")
+    return tests_dir
 
 
 def _check_port_available(port: int) -> None:
@@ -981,6 +980,10 @@ def _main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     server_log = output_dir / "server.log"
     sampling_log = output_dir / "sampling_tests.log"
+
+    # Reject a stale or missing suite before allocating devices or warming a model.
+    if STAGE_SAMPLING in stages:
+        _find_plugin_tests_dir()
 
     server_proc: Optional[subprocess.Popen] = None
     try:

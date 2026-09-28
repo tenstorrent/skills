@@ -8,7 +8,7 @@ Goal completion requirements:
 - models/autoports/<model>/tt/generator_vllm.py exists and delegates to tt/generator.py low-level methods whenever possible.
 - The adapter reuses the full-model generator's canonical split-sampling token-out path. It has no separate sampling path, host argmax path, full-logits readback path, generic top-k greedy fallback, or Python readback/writeback token-feedback loop.
 - The vLLM path uses the selected precision config, including weight groups, activation/CCL dtype, KV-cache dtype, compute fidelities, and layer exceptions.
-- The model is registered in vllm/plugins/vllm-tt-plugin/src/vllm_tt_plugin/platform.py::register_tt_models().
+- Serving uses the standalone tenstorrent/vllm-tt-plugin and the upstream vLLM version recommended by its pinned installation instructions. Record both sources and verify registration resolves to this autoport adapter.
 - vLLM owns the serving cache; the adapter passes it through without hidden standalone-cache assumptions.
 - Served `max_model_len` matches doc/context_contract.json. Reduce advertised capability only for a hard physical limit, with evidence and the largest feasible value.
 - Serving accepts valid prompt lengths that are not divisible by internal chunk/page/tile/trace sizes. Include a direct request or targeted runner check with a non-aligned prompt length.
