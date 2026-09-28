@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+
+# SPDX-License-Identifier: Apache-2.0
+
+# UserPromptSubmit hook for tt-buddy plugin.
+# Reinforces the persona on every user prompt and embeds absolute paths
+# for the on-demand commit / code-comment rule files.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+SKILL_DIR="${PLUGIN_ROOT}/skills/buddy"
+
+# Gate on TT context: skip injection without hardware or a Tenstorrent checkout.
+# shellcheck source=helper.sh
+. "${SCRIPT_DIR}/helper.sh"
+user_cwd="$(read_hook_cwd)"
+if ! is_tt_context "$user_cwd"; then
+    exit 0
+fi
+
+tone_content=$(cat "${SKILL_DIR}/tone.md" 2>&1 || echo "Error reading tone.md")
+
+# Compose: tone block + file-pointer rules with embedded absolute paths.
+combined="${tone_content}
+
+**File-pointer rules:**
+- Before writing or editing source code, MUST Read ${SKILL_DIR}/code-comments.md.
+- Before any git commit, MUST Read ${SKILL_DIR}/commit-messages.md."
+
+# Escape for JSON embedding (same routine as session-start).
+escape_for_json() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\t'/\\t}"
+    printf '%s' "$s"
+}
+
+combined_escaped=$(escape_for_json "$combined")
+
+session_context="<EXTREMELY_IMPORTANT>\n${combined_escaped}\n</EXTREMELY_IMPORTANT>"
+
+printf '{\n  "hookSpecificOutput": {\n    "hookEventName": "UserPromptSubmit",\n    "additionalContext": "%s"\n  }\n}\n' "$session_context"
+
+exit 0

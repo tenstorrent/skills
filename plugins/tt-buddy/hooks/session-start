@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+
+# SPDX-License-Identifier: Apache-2.0
+
+# SessionStart hook for the tt-buddy plugin.
+# Injects the tt-buddy:buddy skill content into every session so the dispatch
+# table and Red Flags table are loaded eagerly. Also prepends the base
+# directory a host announces when it loads a skill, so relative paths
+# inside the injected SKILL.md resolve correctly.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+SKILL_DIR="${PLUGIN_ROOT}/skills/buddy"
+
+# Gate on TT context: skip injection without hardware or a Tenstorrent checkout.
+# shellcheck source=helper.sh
+. "${SCRIPT_DIR}/helper.sh"
+user_cwd="$(read_hook_cwd)"
+if ! is_tt_context "$user_cwd"; then
+    exit 0
+fi
+
+skill_md_content=$(cat "${SKILL_DIR}/SKILL.md" 2>&1 || echo "Error reading tt-buddy:buddy SKILL.md")
+tone_content=$(cat "${SKILL_DIR}/tone.md" 2>&1 || echo "Error reading tone.md")
+
+# Compose the injection: base-dir announcement + SKILL.md + tone.md.
+combined="**tt-buddy:buddy skill loaded** — base directory: ${SKILL_DIR}
+**<plugin-root>:** ${PLUGIN_ROOT}
+
+${skill_md_content}
+
+${tone_content}"
+
+# Escape for JSON embedding using bash parameter substitution.
+escape_for_json() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\t'/\\t}"
+    printf '%s' "$s"
+}
+
+combined_escaped=$(escape_for_json "$combined")
+
+session_context="<EXTREMELY_IMPORTANT>\nYou have tt-buddy loaded.\n\n**Below is the full content of your 'tt-buddy:buddy' skill — your introduction to the tt-buddy skill ecosystem. For all other skills, use the 'Skill' tool:**\n\n${combined_escaped}\n</EXTREMELY_IMPORTANT>"
+
+printf '{\n  "hookSpecificOutput": {\n    "hookEventName": "SessionStart",\n    "additionalContext": "%s"\n  }\n}\n' "$session_context"
+
+exit 0

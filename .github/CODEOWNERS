@@ -23,3 +23,6 @@
 
 # Debug tools
 /plugins/tt-debug-tools/ @ppetrovicTT
+
+# Tenstorrent operating principles
+/plugins/tt-buddy/ @ppetrovicTT
