@@ -58,7 +58,7 @@ omit ``serve`` from the stages:
         --model-dir models/autoports/<model_name> \\
         --hf-model <hf-model-id>
 
-To install vLLM, consult the standalone `tenstorrent/vllm-tt-plugin` checkout's
+To install vLLM, consult `tenstorrent/vllm-tt-plugin` checkout's
 current README and installation script. Use the upstream vLLM version it
 recommends, install that plugin editable, and set VLLM_TT_PLUGIN_ROOT to its root.
 Record the selected pair; do not use the old tenstorrent/vllm fork.
@@ -173,7 +173,7 @@ def _find_plugin_tests_dir() -> Path:
     if origin != root / "src" / "vllm_tt_plugin" / "__init__.py":
         raise RuntimeError(
             f"VLLM_TT_PLUGIN_ROOT/source checkout does not match installed plugin {origin}. "
-            "Install that standalone checkout editable with the server interpreter."
+            "Install `tenstorrent/vllm-tt-plugin` editable with the server interpreter."
         )
     if root.parent.name == "plugins" and (root.parent.parent / "vllm").is_dir():
         raise RuntimeError("Legacy bundled TT plugin detected. Migrate to standalone tenstorrent/vllm-tt-plugin.")

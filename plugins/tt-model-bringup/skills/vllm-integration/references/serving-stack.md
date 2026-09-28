@@ -1,6 +1,6 @@
 # Serving stack setup
 
-Use the standalone [tenstorrent/vllm-tt-plugin](https://github.com/tenstorrent/vllm-tt-plugin)
+Use the standalone plugin [tenstorrent/vllm-tt-plugin](https://github.com/tenstorrent/vllm-tt-plugin)
 with the upstream [vllm-project/vllm](https://github.com/vllm-project/vllm) version it recommends.
 The old `tenstorrent/vllm` fork and its bundled plugin are not the default serving stack.
 
@@ -13,13 +13,11 @@ For a new run:
    Do not hardcode a release in this skill, assume upstream HEAD works, parse one historical
    script format as a permanent API, or reuse another experiment's pin. If the docs/script
    disagree, inspect current upstream compatibility evidence and resolve that before install.
-3. Use the plugin's current installation procedure in the source TT-Metal environment. It
-   currently builds upstream vLLM with `VLLM_TARGET_DEVICE=empty` and installs the standalone
-   plugin editable. Follow its dependency overrides and CPU Torch/torchvision handling;
-   a generic PyPI vLLM install can introduce CUDA dependencies. Inspect the script before
-   running it and stop on a failed command. Only make an upstream source checkout when
-   needed, at the recommended ref, applying the experiment's repository isolation policy.
-4. Export `VLLM_TT_PLUGIN_ROOT` to that standalone checkout. Use its `tests/tt` suite with
+3. Use the plugin's current installation procedure in the source TT-Metal environment.
+   Inspect the installation script before running it and stop on a failed command. Only
+   make an upstream source checkout when needed, at the recommended ref, applying the
+   experiment's repository isolation policy.
+4. Export `VLLM_TT_PLUGIN_ROOT` to the plugin's checkout. Use its `tests/tt` suite with
    the same interpreter as the server. Verify `vllm`, `vllm_tt_plugin`, TTNN and model imports,
    installed package versions/locations, TT plugin entry points, `python -m pip check`, server
    CLI parsing and pytest collection. Ensure old fork paths are absent from `PYTHONPATH`,

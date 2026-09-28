@@ -85,7 +85,7 @@
       "destination": "prompts/model_bringup_multigoal/09-vllm.txt",
       "blob": "fc930a5472158d07221c2c5440786a7c5aed9ed2",
       "source_sha256": "65e532c7e54a6e1bd348575f4471fa0708990fe93e91ef06bbfa9695c60ca727",
-      "packaged_sha256": "a1ad54e8690645dd74bfbdcbb48e1975c01998715d3c306bfe6fa6a3e1b4a9cf"
+      "packaged_sha256": "52779fdb1c43c0db61598420bfd91da86ce1f297342d097a9920dea3712cd5cb"
     },
     {
       "source": ".agents/prompts/model_bringup_multigoal/10-optimized-vllm.check.sh",
@@ -365,7 +365,7 @@
       "destination": "runtime/readiness_check/run_vllm_server.py",
       "blob": "854a62c6b4caedd64708da951c89c51af96d10d2",
       "source_sha256": "051d45493d4a822da38395f506188f08d46cba981ef1e1e9d7a0a74efd7c291c",
-      "packaged_sha256": "9d35be42bef0fc910026ffef5a41c6f3a39f5ce5b9539bb9a3c22f31f3914300"
+      "packaged_sha256": "a1cc54ec4a54dc0e018a7246c5a1b6023ab9160e1ee2260cb241ad19a53f8b82"
     },
     {
       "source": "models/common/readiness_check/schema.py",
