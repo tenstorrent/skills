@@ -152,6 +152,14 @@ python -m readiness_check.run_vllm_server \
   --tt-config '{"trace_region_size": <bytes>, "fabric_config": <fabric mode>}'
 ```
 
+For reasoning models, follow [$qualitative-check](../qualitative-check/SKILL.md#reasoning-and-completion-budgets)
+before treating a missing final answer at a short generation cap as a serving defect.
+Use `--reasoning-token-budget <measured-extra-tokens>` for the plugin's completed-answer
+tests and `--qualitative-max-tokens <measured-total-tokens>` for qualitative requests.
+Verify the selected plugin test revision supports the extra-budget option; a rejected flag
+is a dependency mismatch, not permission to skip the suite. Preserve output assertions,
+historical failures and the separate benchmark workload.
+
 The runner owns server launch, health polling, check execution, and shutdown. It writes `server.log`, `sampling_tests.log`, `vllm_qualitative_outputs.json`, primary single-user raw `vllm_result.json`, primary normalized `vllm_benchmark.json`, `vllm_benchmark.log`, and by default the secondary CI serving-burst files `vllm_ci_serving_result.json`, `vllm_ci_serving_benchmark.json`, and `vllm_ci_serving_benchmark.log` under `<model_dir>/readiness_vllm/`.
 
 `--stages` accepts `serve`, `sampling`, `qualitative`, and `benchmark`. The default runs the full launch-check-shutdown flow. To hold a server open while iterating:

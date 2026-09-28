@@ -355,6 +355,7 @@ def _run_plugin_sampling_tests(
     server_log: Path,
     max_num_seqs: int,
     sampling_profile: str,
+    reasoning_token_budget: int = 0,
 ) -> bool:
     """
     Invoke `vllm-tt-plugin/tests/tt/` against the live server. This is the same
@@ -393,6 +394,8 @@ def _run_plugin_sampling_tests(
         f"--tt-model-name={hf_model}",
         f"--tt-max-num-seqs={max_num_seqs}",
     ]
+    if reasoning_token_budget:
+        cmd.append(f"--tt-reasoning-token-budget={reasoning_token_budget}")
     print("\n=== Running plugin sampling tests ===")
     print(f"  profile: {sampling_profile} ({len(test_targets)} target(s))")
     print(f"  tt-max-num-seqs: {max_num_seqs}")
@@ -423,6 +426,7 @@ def _run_qualitative_prompts(
     hf_model: str,
     prompts_file: Path,
     output_dir: Path,
+    max_tokens: int = 256,
 ) -> None:
     """Run prompts through the server and save completions for manual review."""
     print(f"\n=== Running qualitative prompts from {prompts_file} ===")
@@ -434,7 +438,7 @@ def _run_qualitative_prompts(
     if not prompts:
         raise RuntimeError(f"No prompts found in {prompts_file}")
 
-    print(f"  Loaded {len(prompts)} prompts")
+    print(f"  Loaded {len(prompts)} prompts; total generation cap: {max_tokens} tokens")
     client = openai.OpenAI(base_url=f"{server_url.rstrip('/')}/v1", api_key="dummy")
     prompt_mode = _qualitative_prompt_mode(hf_model)
     print(f"  Prompt mode: {prompt_mode}")
@@ -448,6 +452,7 @@ def _run_qualitative_prompts(
             hf_model=hf_model,
             prompt=prompt,
             prompt_mode=prompt_mode,
+            max_tokens=max_tokens,
             temperature=0.0,
         )
         sampled_text = _request_qualitative_completion(
@@ -455,6 +460,7 @@ def _run_qualitative_prompts(
             hf_model=hf_model,
             prompt=prompt,
             prompt_mode=prompt_mode,
+            max_tokens=max_tokens,
             temperature=0.7,
             top_p=0.9,
         )
@@ -463,6 +469,7 @@ def _run_qualitative_prompts(
             {
                 "prompt": prompt,
                 "prompt_mode": prompt_mode,
+                "max_tokens": max_tokens,
                 "greedy_completion": greedy_text,
                 "sampled_completion": sampled_text,
             }
@@ -493,10 +500,11 @@ def _request_qualitative_completion(
     prompt_mode: str,
     temperature: float,
     top_p: Optional[float] = None,
+    max_tokens: int = 256,
 ) -> str:
     request_args: dict[str, Any] = {
         "model": hf_model,
-        "max_tokens": 256,
+        "max_tokens": max_tokens,
         "temperature": temperature,
     }
     if top_p is not None:
@@ -846,6 +854,22 @@ def _main() -> None:
             f"`{SAMPLING_PROFILE_SMOKE}` runs a small integration sanity subset."
         ),
     )
+    parser.add_argument(
+        "--reasoning-token-budget",
+        type=int,
+        default=0,
+        help=(
+            "Extra reasoning tokens for the plugin's completed-answer tests. "
+            "Forwarded as --tt-reasoning-token-budget when nonzero; requires a plugin "
+            "test revision supporting that option. Select from matched native-reference evidence."
+        ),
+    )
+    parser.add_argument(
+        "--qualitative-max-tokens",
+        type=int,
+        default=256,
+        help="Total reasoning-plus-answer generation cap for qualitative requests (default: 256).",
+    )
     parser.add_argument("--block-size", type=int, default=DEFAULT_BLOCK_SIZE)
     parser.add_argument(
         "--server-timeout",
@@ -988,6 +1012,10 @@ def _main() -> None:
         ),
     )
     args = parser.parse_args()
+    if args.reasoning_token_budget < 0:
+        parser.error("--reasoning-token-budget must be non-negative")
+    if args.qualitative_max_tokens <= 0:
+        parser.error("--qualitative-max-tokens must be positive")
 
     stages: List[str] = args.stages
     serve_locally = STAGE_SERVE in stages
@@ -1066,6 +1094,7 @@ def _main() -> None:
                     server_log=server_log,
                     max_num_seqs=args.max_num_seqs,
                     sampling_profile=args.sampling_profile,
+                    reasoning_token_budget=args.reasoning_token_budget,
                 )
                 if not ok:
                     print("\nSampling tests failed — skipping remaining stages.")
@@ -1076,6 +1105,7 @@ def _main() -> None:
                     hf_model=args.hf_model,
                     prompts_file=args.prompts.resolve(),
                     output_dir=output_dir,
+                    max_tokens=args.qualitative_max_tokens,
                 )
             elif stage == STAGE_BENCHMARK:
                 primary_summary = _run_serving_benchmark(
