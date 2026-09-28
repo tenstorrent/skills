@@ -40,6 +40,29 @@ Every quality verdict needs a control rendered with the same prompt format:
 - If HF fails the same prompt in the same way, record that as a model/control behavior, not a TT serving bug.
 - If TT output is materially worse than the HF or previous-stage control, treat it as stage work: token feedback, cache/position handling, sampling, trace replay, dtype/fidelity, or adapter state are common causes.
 
+## Reasoning and Completion Budgets
+
+For a model that reasons before answering, distinguish reasoning tokens from final-answer
+tokens. A small total generation cap can end before the answer exists. When this happens,
+replay the exact prompt IDs, template, reasoning effort and sampling settings on the native
+HF reference with a generous bounded cap and normal EOS stopping. Record per-case reasoning,
+answer and total completion counts, finish reason, visible final output and sampled coverage.
+Do not infer equivalent sampled trajectories merely from equal seeds across different samplers.
+
+Choose a completion allowance from that evidence, with a documented safety margin such as
+twice the largest observed completed requirement. A reference that reaches the discovery cap
+has not established a usable limit. Preserve the failed short-budget evidence and investigate
+censored or incoherent outputs; do not accept null content or drop output assertions. Keep
+grammar and bad-word controls equivalent and label any control that checks only the reasoning
+prefix. For tests maintained by another repository, report the matched reference failure and
+propose the budget change there instead of silently editing a local oracle.
+
+The serving runner accepts `--qualitative-max-tokens` as a total reasoning-plus-answer cap.
+For plugin completed-answer tests, `--reasoning-token-budget` forwards an extra allowance
+on top of their existing answer budgets; verify the selected plugin tests support the option.
+Record the exact adopted test revision and settings per run. These correctness-test budgets
+do not change the declared performance benchmark workload.
+
 ## Artifacts
 
 Leave small, inspectable artifacts under the stage evidence directory:

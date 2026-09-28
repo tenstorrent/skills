@@ -294,3 +294,55 @@ def test_external_sampling_does_not_validate_local_vllm(serving, monkeypatch, tm
     monkeypatch.setattr(serving, '_run_plugin_sampling_tests', sampling)
     serving._main()
     sampling.assert_called_once()
+
+
+@pytest.mark.parametrize('extra', [0, 640])
+def test_reasoning_budget_reaches_canonical_plugin_tests(serving, monkeypatch, tmp_path, extra):
+    install_fake_plugin(serving, monkeypatch, tmp_path / 'plugin')
+    run = Mock(return_value=SimpleNamespace(returncode=0))
+    monkeypatch.setattr(serving.subprocess, 'run', run)
+    monkeypatch.setattr(serving, '_probe_external_server', Mock())
+    monkeypatch.setattr(sys, 'argv', [
+        'run_vllm_server', '--model-dir', str(tmp_path), '--hf-model', 'org/model',
+        '--stages', 'sampling', '--server-url', 'http://example.test:8000',
+        '--reasoning-token-budget', str(extra),
+    ])
+    serving._main()
+    budget_args = [arg for arg in run.call_args.args[0] if arg.startswith('--tt-reasoning-token-budget')]
+    assert budget_args == ([f'--tt-reasoning-token-budget={extra}'] if extra else [])
+
+
+def test_qualitative_budget_reaches_both_modes_and_saved_evidence(serving, monkeypatch, tmp_path):
+    prompts = tmp_path / 'prompts.txt'
+    prompts.write_text('A question')
+    create = Mock(return_value=SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='Answer'))]))
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    monkeypatch.setattr(serving.openai, 'OpenAI', Mock(return_value=client), raising=False)
+    monkeypatch.setattr(serving, '_qualitative_prompt_mode', lambda model: 'chat')
+    monkeypatch.setattr(serving, '_probe_external_server', Mock())
+    monkeypatch.setattr(sys, 'argv', [
+        'run_vllm_server', '--model-dir', str(tmp_path), '--hf-model', 'org/model',
+        '--stages', 'qualitative', '--server-url', 'http://example.test:8000',
+        '--prompts', str(prompts), '--qualitative-max-tokens', '2048',
+    ])
+    serving._main()
+    assert create.call_count == 2
+    assert [call.kwargs['max_tokens'] for call in create.call_args_list] == [2048, 2048]
+    assert [call.kwargs['temperature'] for call in create.call_args_list] == [0.0, 0.7]
+    saved = json.loads((tmp_path / 'readiness_vllm/vllm_qualitative_outputs.json').read_text())
+    assert saved[0]['max_tokens'] == 2048
+    assert saved[0]['greedy_completion'] == saved[0]['sampled_completion'] == 'Answer'
+
+
+@pytest.mark.parametrize('option,value', [('--reasoning-token-budget', '-1'), ('--qualitative-max-tokens', '0')])
+def test_invalid_completion_budgets_fail_before_server_action(serving, monkeypatch, tmp_path, option, value):
+    launch = Mock()
+    monkeypatch.setattr(serving, '_launch_server', launch)
+    monkeypatch.setattr(sys, 'argv', [
+        'run_vllm_server', '--model-dir', str(tmp_path), '--hf-model', 'org/model',
+        '--mesh-device', 'N150', '--stages', 'serve', option, value,
+    ])
+    with pytest.raises(SystemExit) as error:
+        serving._main()
+    assert error.value.code == 2
+    launch.assert_not_called()
