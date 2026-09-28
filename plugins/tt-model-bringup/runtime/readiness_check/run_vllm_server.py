@@ -60,10 +60,9 @@ omit ``serve`` from the stages:
 
 To install vLLM, consult `tenstorrent/vllm-tt-plugin` checkout's
 current README and installation script. Use the upstream vLLM version it
-recommends, install that plugin editable, and set VLLM_TT_PLUGIN_ROOT to its root.
-Set VLLM_EXPECTED_VERSION to the exact vLLM package version recorded for this run.
-For a Git checkout or an install from a Git URL, also set VLLM_EXPECTED_COMMIT to its recorded
-full commit SHA. Keep these values across resumes; do not use the old tenstorrent/vllm fork.
+recommends. For sampling, install the plugin editable and set VLLM_TT_PLUGIN_ROOT
+to its source checkout.
+Record the selected pair; do not use the old tenstorrent/vllm fork.
 
 Before invoking it, two things must already be true:
 
@@ -83,7 +82,6 @@ over it with host-side sampling.
 from __future__ import annotations
 
 import argparse
-import importlib.metadata
 import importlib.util
 import json
 import os
@@ -96,7 +94,6 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, List, Optional
-from urllib.parse import unquote, urlparse
 
 import openai
 import requests
@@ -165,7 +162,7 @@ _FATAL_LOG_PATTERNS = (
 
 
 def _find_plugin_root() -> Path:
-    """Validate the imported plugin independently of sampling test availability."""
+    """Locate the plugin source checkout required by sampling tests."""
     spec = importlib.util.find_spec("vllm_tt_plugin")
     if spec is None or spec.origin is None:
         raise RuntimeError("Install the standalone tenstorrent/vllm-tt-plugin editable in the server environment.")
@@ -184,14 +181,16 @@ def _find_plugin_root() -> Path:
     return root
 
 
-def _validate_serving_stack() -> None:
-    """Check the imported vLLM and plugin before starting a local server."""
-    _find_plugin_root()
-    spec = importlib.util.find_spec("vllm")
-    if spec is None or spec.origin is None:
-        raise RuntimeError("Install the recorded upstream vLLM version with the server interpreter.")
-    origin = Path(spec.origin).resolve()
-    root = origin.parent.parent
+def _reject_legacy_serving_sources() -> None:
+    """Reject known legacy checkouts without requiring editable installs."""
+    origins: dict[str, Path] = {}
+    for package in ("vllm", "vllm_tt_plugin"):
+        spec = importlib.util.find_spec(package)
+        if spec is None or spec.origin is None:
+            raise RuntimeError(f"Install {package} with the server interpreter before serving.")
+        origins[package] = Path(spec.origin).resolve()
+
+    root = origins["vllm"].parent.parent
     # A wheel's parent is shared site-packages, not a vLLM source tree.
     is_source_tree = (root / "pyproject.toml").is_file() or (root / "setup.py").is_file()
     if is_source_tree and (
@@ -199,41 +198,14 @@ def _validate_serving_stack() -> None:
     ):
         raise RuntimeError(f"Legacy tenstorrent/vllm checkout detected at {root}. Install upstream vLLM.")
 
-    try:
-        distribution = importlib.metadata.distribution("vllm")
-    except importlib.metadata.PackageNotFoundError as exc:
-        raise RuntimeError(f"No installed vLLM package metadata for {origin}.") from exc
-    direct_url = json.loads(distribution.read_text("direct_url.json") or "{}")
-    installed_origin = Path(distribution.locate_file("vllm/__init__.py")).resolve()
-    if direct_url.get("dir_info", {}).get("editable"):
-        source_url = urlparse(direct_url.get("url", ""))
-        if source_url.scheme != "file" or source_url.netloc not in ("", "localhost"):
-            raise RuntimeError("The editable vLLM install must identify a local source checkout.")
-        installed_origin = (Path(unquote(source_url.path)) / "vllm" / "__init__.py").resolve()
-    if origin != installed_origin:
-        raise RuntimeError(
-            f"Imported vLLM {origin} does not match installed package {installed_origin}. "
-            "Remove stale checkout paths from PYTHONPATH and launch wrappers."
-        )
-
-    expected_version = os.environ.get("VLLM_EXPECTED_VERSION")
-    if not expected_version:
-        raise RuntimeError("Set VLLM_EXPECTED_VERSION to the exact vLLM package version recorded for this run.")
-    if distribution.version != expected_version:
-        raise RuntimeError(f"vLLM version {distribution.version} does not match recorded version {expected_version}.")
-
-    commit = direct_url.get("vcs_info", {}).get("commit_id")
-    if (root / ".git").exists():
-        result = subprocess.run(
-            ["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True, check=True,
-        )
-        commit = result.stdout.strip()
-    expected_commit = os.environ.get("VLLM_EXPECTED_COMMIT")
-    if commit or expected_commit:
-        if not expected_commit:
-            raise RuntimeError("Set VLLM_EXPECTED_COMMIT to the full vLLM commit SHA recorded for this run.")
-        if commit != expected_commit:
-            raise RuntimeError(f"vLLM commit {commit or 'unavailable'} does not match recorded commit {expected_commit}.")
+    plugin_origin = origins["vllm_tt_plugin"]
+    plugin_root = plugin_origin.parent.parent.parent
+    if (
+        plugin_origin.parent.parent.name == "src"
+        and plugin_root.parent.name == "plugins"
+        and (plugin_root.parent.parent / "vllm").is_dir()
+    ):
+        raise RuntimeError("Legacy bundled TT plugin detected. Migrate to standalone tenstorrent/vllm-tt-plugin.")
 
 
 def _find_plugin_tests_dir() -> Path:
@@ -1043,9 +1015,9 @@ def _main() -> None:
     server_log = output_dir / "server.log"
     sampling_log = output_dir / "sampling_tests.log"
 
-    # Validate every local launch, including serve-only and benchmark-only runs.
+    # Reject legacy sources for every local launch, even without sampling.
     if serve_locally:
-        _validate_serving_stack()
+        _reject_legacy_serving_sources()
     # External-server checks only need the local suite, not a local server stack.
     if STAGE_SAMPLING in stages:
         _find_plugin_tests_dir()

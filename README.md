@@ -56,8 +56,8 @@ authorization before explicitly retrying with `AUTODEBUG_SKIP_CHILD_SANDBOX=1`; 
 [sandbox guidance](plugins/tt-autodebug/skills/autodebug/SKILL.md#codex-sandbox-startup).
 
 Model bringup serving uses the standalone TT vLLM plugin and resolves its recommended
-upstream vLLM version for each new run. Before each local launch, the runner checks package
-locations and the expected vLLM version and commit from the run record. See
+upstream vLLM version for each new run. Before each local launch, the runner rejects known
+legacy vLLM and bundled-plugin source layouts. See
 [serving stack setup](plugins/tt-model-bringup/skills/vllm-integration/references/serving-stack.md).
 
 ## Model bring-up
