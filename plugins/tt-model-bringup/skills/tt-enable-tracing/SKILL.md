@@ -109,6 +109,10 @@ Switching between supported modes should select the matching cached trace, not c
 
 Real invalidation can require rebuilding traces, for example after replacing captured backing storage or changing a baked-in program signature or device/sub-device-manager lifetime. Never replay an invalid trace just to avoid recapture. Document the exact invalidation or evidence-backed capacity/eviction constraint, rebuild safely, and measure the resulting request latency. Do not hide recurring capture costs by measuring only the inner decode replay loop.
 
+A changed request key does not prove trace invalidation. Exact prompt lengths, chunk start positions, batch composition, and row order can change without changing the captured program. Show which captured program argument, physical layout, backing allocation, or device lifetime became incompatible. Do not use a request-key mismatch as that proof.
+
+Chunked prefill needs explicit coverage. Test first chunks, continuation chunks with different start positions, and partial final chunks. Include new combinations and orderings of known lengths while other requests decode. A new chunk must not retire compatible prefill, decode, or sampling traces. This applies even when prefill runs eagerly. Use the [mixed-shape serving check](../vllm-integration/SKILL.md#mixed-shape-trace-reuse-check) to expose the failure described in [tt-metal #58202](https://github.com/tenstorrent/tt-metal/issues/58202). Retain the allocation safety checks; removing retirement alone is not a safe fix.
+
 ## Generator Pattern
 
 Do not trace the high-level generator method unless it is already proven trace-safe. Split the generator into:

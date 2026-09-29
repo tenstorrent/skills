@@ -68,6 +68,8 @@ Read existing implementations before designing the path:
 
 Keep later tracing straightforward: separate host chunk planning from device execution, and follow `$tt-enable-tracing` for stable buffers and input refresh. Prepare/compile all supported physical shapes and op paths before recording the first trace; the first chunk, continuation chunks, and tails may need different traces or an eager path, whose persistent setup must also precede capture. Tensor-valued offsets only permit reuse when the op supports them and the remaining program signature is unchanged. Refresh positions, valid lengths and page tables before replay, and restore cache state after warmup/capture. A new logical length within a prepared physical bucket should reuse its trace, not trigger routine recapture. A passing fixed-input replay does not prove increasing-length requests work.
 
+Test changed chunk start positions and partial final chunks on the same generator instance. Include new combinations and orderings of known request lengths. A changed request key alone does not justify trace invalidation.
+
 If after working on a chunked prefill implementation you have strong evidence that it would still produce a more performant model whilst still remaining trace-safe when interleaving prefill and decode with a variety of sequence lengths, then present that evidence clearly before proceeding with the alternative path.
 
 ## Evidence To Leave

@@ -100,6 +100,10 @@ Return `more-work-needed` when evidence shows one of these:
   without a demonstrated invalidation or capacity constraint and measured
   request-latency cost; trace reuse is claimed without cross-request trace-ID
   and capture/release-count evidence;
+- a changed request key is the only reason given for trace invalidation;
+- serving evidence lacks the mixed-shape trace reuse check from
+  `$vllm-integration`, including supported chunked-prefill paths with changed
+  start positions and batch orderings while other requests decode;
 - logs or code show a plausible bug in a stage-critical subsystem, such as
   cache ownership, trace replay, token feedback, sampling, precision policy,
   page-table handling, or model output correctness;

@@ -10,3 +10,5 @@ Require generator-wide prepare-before-capture warmup and trace reuse across
 compatible requests. Keep acknowledgments specific to reviewed backing buffers,
 reject capture-wide exemptions, and require cross-trace lifetime and negative-control
 evidence when acknowledgments change.
+Require mixed-shape serving evidence for supported chunked-prefill paths.
+A changed request key alone does not justify trace invalidation.
