@@ -91,14 +91,13 @@ Return `more-work-needed` when evidence shows one of these:
   that excludes program-cache allocations, or exempts an entire capture/forward/
   warmup instead of identifying the intended corruptible allocations;
 - a corruptible-buffer acknowledgment lacks a backing-allocation/alias lifetime
-  invariant against every live trace, or an acknowledgment change lacks the
-  unexpected-allocation negative control required by `$tt-enable-tracing`;
+  invariant against every live trace;
+- an allocation scope replaces an available exact-tensor acknowledgment, includes
+  unrelated work, or contains unreviewed allocations contrary to `$tt-enable-tracing`;
 - supported prefill/decode/sampling or eager helper paths compile or allocate
   unsafe persistent state after the first capture because generator-wide
   preparation is missing; warmup protection exists only in the serving wrapper;
-- supported requests invalidate, retire, evict, or recapture traces during
-  normal serving; a claimed correctness need or measured latency cost does not
-  waive the lifetime rule in `$tt-enable-tracing`;
+- request handling violates the trace lifetime rule in `$tt-enable-tracing`;
 - trace reuse is claimed without cross-request trace-ID and capture/release-count
   evidence mapped to execution signatures, or counters/restarts hide recapture;
 - serving evidence lacks the mixed-shape trace reuse check from

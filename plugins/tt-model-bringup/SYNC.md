@@ -71,7 +71,7 @@ require separate hardware measurements with recorded implementation identity,
 protocol and sample coverage. Benchmark completion checks measurement integrity and
 report completeness; accuracy acceptance belongs to the bringup owner.
 
-## Trace allocation guidance (0.1.18)
+## Trace allocation guidance (0.1.19)
 
 Adapt the six-skill policy change from [tt-metal #54769](https://github.com/tenstorrent/tt-metal/pull/54769),
 commit `0799df070a5b07583f4315550a8daed925be84cb`, to this plugin's canonical skill paths.
@@ -85,11 +85,14 @@ the public Python helpers live in `ttnn.tools.trace_allocation_tracker`.
 Generator-wide two-phase warmup follows [tt-metal #42698](https://github.com/tenstorrent/tt-metal/issues/42698)
 and the prepare/record split in [#55343](https://github.com/tenstorrent/tt-metal/pull/55343),
 merged as `743890db568bd3ff9626166a2ae201c28aa35072`.
-That implementation is a warmup-structure reference, not an endorsement of its
-broad allocation scopes. Cross-request reuse and exact-buffer acknowledgment
+These historical sources explain the change. The operational skills describe the
+process directly, without issue references or a pinned generator implementation.
+Cross-request reuse and exact-buffer acknowledgment
 requirements address [#51800](https://github.com/tenstorrent/tt-metal/issues/51800)
 and [#57299](https://github.com/tenstorrent/tt-metal/issues/57299), including
-cross-trace lifetime proofs and unexpected-allocation negative controls.
+cross-trace lifetime proofs. Use exact-tensor acknowledgments whenever possible.
+Allocation scopes require a reason and the narrowest possible boundary around
+reviewed allocation calls. No injected-allocation test is required.
 
 The mixed-shape serving requirement covers the request-key and chunk-offset
 failure in [#58202](https://github.com/tenstorrent/tt-metal/issues/58202).

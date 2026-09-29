@@ -12,7 +12,7 @@ Goal completion requirements:
 - vLLM owns the serving cache; the adapter passes it through without hidden standalone-cache assumptions.
 - Served `max_model_len` matches doc/context_contract.json. Reduce advertised capability only for a hard physical limit, with evidence and the largest feasible value.
 - Serving accepts valid prompt lengths that are not divisible by internal chunk/page/tile/trace sizes. Include a direct request or targeted runner check with a non-aligned prompt length.
-- The mixed-shape trace reuse check from $vllm-integration passes on the same running server. Evidence includes actual chunk start positions, concurrent decode, and capture/retirement counts mapped to execution signatures. Supported requests must not invalidate, retire, evict, or recapture traces during normal serving. A claimed correctness need does not waive this requirement.
+- The mixed-shape trace reuse check from $vllm-integration passes on the same running server. Evidence includes actual chunk start positions, concurrent decode, and capture/retirement counts mapped to execution signatures.
 - run_vllm_server succeeds with the final sampling profile defined by $vllm-integration.
 - Sampling tests, qualitative outputs, primary single-user benchmark artifacts, and CI serving-burst benchmark artifacts exist under readiness_vllm/.
 - `supports_async_decode=True`, decode trace is enabled, and stale-token/current-position/page-table tests pass through the adapter. Full-model split sampling is already present.
