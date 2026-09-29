@@ -96,11 +96,11 @@ Return `more-work-needed` when evidence shows one of these:
 - supported prefill/decode/sampling or eager helper paths compile or allocate
   unsafe persistent state after the first capture because generator-wide
   preparation is missing; warmup protection exists only in the serving wrapper;
-- compatible requests or returns to retained trace keys trigger recapture,
-  without a demonstrated invalidation or capacity constraint and measured
-  request-latency cost; trace reuse is claimed without cross-request trace-ID
-  and capture/release-count evidence;
-- a changed request key is the only reason given for trace invalidation;
+- supported requests invalidate, retire, evict, or recapture traces during
+  normal serving; a claimed correctness need or measured latency cost does not
+  waive the lifetime rule in `$tt-enable-tracing`;
+- trace reuse is claimed without cross-request trace-ID and capture/release-count
+  evidence mapped to execution signatures, or counters/restarts hide recapture;
 - serving evidence lacks the mixed-shape trace reuse check from
   `$vllm-integration`, including supported chunked-prefill paths with changed
   start positions and batch orderings while other requests decode;

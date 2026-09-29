@@ -71,7 +71,7 @@ require separate hardware measurements with recorded implementation identity,
 protocol and sample coverage. Benchmark completion checks measurement integrity and
 report completeness; accuracy acceptance belongs to the bringup owner.
 
-## Trace allocation guidance (0.1.17)
+## Trace allocation guidance (0.1.18)
 
 Adapt the six-skill policy change from [tt-metal #54769](https://github.com/tenstorrent/tt-metal/pull/54769),
 commit `0799df070a5b07583f4315550a8daed925be84cb`, to this plugin's canonical skill paths.
@@ -95,6 +95,11 @@ The mixed-shape serving requirement covers the request-key and chunk-offset
 failure in [#58202](https://github.com/tenstorrent/tt-metal/issues/58202).
 Stages 9 and 10 require this evidence. The packaged runner does not yet automate
 the workload or validate its trace events.
+
+Normal serving must preserve traces for the configured model/device lifetime.
+Correctness-driven invalidation is a design defect, not an accepted recapture path.
+Explicit lifecycle transitions and deliberate bounded-cache designs are separate
+from this serving requirement; they are not automatic exceptions to its checks.
 
 Only packaged hashes for the six edited skills and two stage prompts change in `sync-source.json`;
 the original import provenance stays intact. No tracker runtime code is vendored.
