@@ -167,6 +167,15 @@ default. For any stage, review:
 - stale-artifact risk: paths in reports should exist and match the described
   run.
 
+For generator and serving stages, inspect the
+[version-1 reload contract](../vllm-integration/references/decode-reload-contract.md).
+Check the four commands through the adapter and generator. Check full reload,
+page-table-only reload, and resident decode with stale host inputs. Confirm that
+the version marker does not substitute for async capability, and that slot remaps,
+partial prefill, penalty history, and seeds follow the documented rules.
+For a full-reload-only adapter, require tested rejection of unsupported resident
+commands and keep async support false; do not require those modes to succeed.
+
 For changed chunking, padding, sharding, dispatch, or memory ownership, compare the
 actual branch/allocation rules with the selected cases. Require coverage of affected
 paths, nearby valid boundary lengths, and awkward tails, including sibling consumers

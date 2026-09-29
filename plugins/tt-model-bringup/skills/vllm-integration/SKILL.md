@@ -52,6 +52,8 @@ pair and its source provenance in the run record.
 
 Read:
 
+- [decode reload contract and adapter example](references/decode-reload-contract.md);
+- `${TT_MODEL_BRINGUP_ROOT}/runtime/readiness_check/contract_vllm.py`;
 - `tech_reports/LLMs/vLLM_integration.md`;
 - `models/tt_transformers/tt/generator_vllm.py`;
 - the model's existing `tt/generator.py` low-level `prefill_forward` and `decode_forward` methods.
@@ -67,27 +69,37 @@ Make prompt lengths, page tables, decode positions, batch dimensions, trace-side
 
 Use the generator-owned two-phase warmup and trace lifetime rule from `$tt-enable-tracing`. vLLM callbacks must not be the only entrypoint that enforces warmup. Run the [mixed-shape trace reuse check](#mixed-shape-trace-reuse-check) on the same server.
 
-For decode performance, implement the vLLM async split before advertising it: `decode_forward(..., read_from_device=False)` should return device tensors, `read_decode_output(..., async_read=True)` should perform the minimal deferred read, and `process_decode_output_host(...)` should do host formatting. Only set `supports_async_decode=True` after this path passes the vLLM plugin's expectations with decode trace enabled and stale-token/current-position tests passing.
-When async decode, on-device sampling and tracing are enabled, vLLM may submit step
-N+1 before sampled token N reaches host scheduler state. Reuse the device token and
-position state for steady decode; advance it exactly once per emitted token. Account
-for transitions between the model's traces.
+Implement `decode_input_update_contract = 1`. Require and honor `reload_inputs`,
+`reload_page_table`, `reload_sampling_params`, and `reset_sampling_state` on every
+decode. The plugin owns reload decisions. The adapter forwards the commands or
+executes them once. Do not replace them with `reset_batch`, model-side tensor
+comparisons, or mode/batch heuristics. Audit the selected generator before using
+it as a base; the marker alone does not migrate a legacy implementation.
 
-`reset_batch=False` does **not** prove the page table is unchanged. Inspect the pinned
-standalone plugin's state updates and decode-reload contract; behavior depends on that
-revision. Do not retain a workaround solely because an old fork needed it.
+When `reload_inputs=False`, host tokens and positions can be stale. Keep token,
+position, and RoPE state on device. Advance position once in the decode forward
+and feed the sampled token into the next decode input. A page-table-only command
+updates all relevant page tables without changing those inputs. Apply slot
+remaps to all persistent slot state, including a dormant device sampler during
+host sampling. Preserve unlisted live slots during partial prefill.
 
-Before enabling overlap, verify that the selected vLLM revision invalidates or refreshes
-device page tables when active requests gain blocks. A reset that reloads host tokens or
-positions must first drain pending decode results. A page-only refresh is acceptable only
-with evidence that it preserves token and position state. Empty new-block lists must not
-force a refresh on every token. If the dependency lacks this behavior, fix and verify the
-dependency or keep overlap disabled; do not report the async path as complete.
+Keep contract version separate from async capability. Enable
+`supports_async_decode=True` only after token feedback, position advance,
+page-table-only updates, and split readback pass. The async read method must
+return `(host_output, read_events)`. Readback and host formatting do not sample
+or change decode state. Version 1 also supports models without async capability;
+the plugin sends full input reloads for them. Record that limit instead of
+advertising unsupported overlap.
+
+The plugin completes pending work and applies valid tokens before a full reload.
+Verify this path with the selected plugin. Follow the focused checks in the
+[reload reference](references/decode-reload-contract.md), including seed state,
+host/device sampling switches, and return to an existing trace buffer.
 
 Validate automatic allocator-driven page growth across multiple page boundaries, with
 several distinct concurrent requests and a trustworthy non-overlapped control. Check
 request reordering, pending-token handling and unchanged-table steady decode. A test that
-manually forces `reset_batch=True`, changes only an unused page, or checks only for
+manually forces a full reload, changes only an unused page, or checks only for
 degenerate text does not establish page-table correctness.
 
 Leave prefix caching `False` unless it is implemented and tested.
@@ -95,7 +107,7 @@ Leave prefix caching `False` unless it is implemented and tested.
 
 If the vLLM plugin or harness is being changed, prefer the same safety rule there: overlap should default to false unless the model declares this proof-backed capability. Leaving overlap disabled may cost a few tokens/sec/user; letting it default on can silently corrupt generation.
 
-The traced serving decode path reuses the full-model generator's canonical split-sampling path and replays via `ttnn.execute_trace(..., blocking=False)`. For `sample_on_device_mode=all`, serving has no new sampling strategy, host greedy/top-1 argmax, full-logits readback, generic top-k fallback for greedy, or Python readback/writeback token-feedback loop. If the full-model generator lacks split sampling, stop and fix `$full-model`; do not complete vLLM by patching sampling in the adapter. Do not copy a full page table every token when it is unchanged. Reduce token/current-position/page-table refresh to actual scheduler state changes, then prove both changed and unchanged cases with stale-input tests.
+The traced serving decode path reuses the full-model generator's canonical split-sampling path and replays via `ttnn.execute_trace(..., blocking=False)`. For `sample_on_device_mode=all`, serving has no new sampling strategy, host greedy/top-1 argmax, full-logits readback, generic top-k fallback for greedy, or Python readback/writeback token-feedback loop. If the full-model generator lacks split sampling, stop and fix `$full-model`; do not complete vLLM by patching sampling in the adapter. Execute only the copies the reload commands require. A full reload includes page tables even if their values match. A steady resident step performs no input copies unless `reload_page_table=True`.
 
 The packaged serving runner uses `--additional-config` with a `{"tt": ...}` JSON
 object. Verify this against the selected upstream CLI and plugin config reader. It accepts `P300x2` for a Blackhole
@@ -260,6 +272,7 @@ Done means all of these are true and recorded:
 - Non-aligned prompt-length evidence through serving: a valid request length that is not divisible by internal chunk/page/block alignment succeeds without capping or truncating the advertised context.
 - Served batch/concurrency coverage, including the largest tested `max_num_seqs` up to 32 and any hard-physical-limit reduction evidence.
 - Capability flags with evidence: no unproven `supports_async_decode=True`, no prefix-caching claim without tests, and on-device sampling verified for the measured mode.
+- Version-1 command handling, seed initialization, slot remaps in both sampling modes, partial-prefill state preservation, and the focused reload checks in the reference above.
 - Evidence that serving uses the full-model split-sampling contract: internal sampling trace, `tt_out_tok` feedback into the persistent decode token input, greedy benchmarks using the fastest correct on-device sampling strategy measured for this mesh, and stale-token/current-position smoke coverage.
 - Logit-determinism evidence through vLLM, with run-to-run and cross-batch-position reproducibility checks and standalone baseline comparison.
 - Sampling test results, with any reproducibility-only failures separated from real failures.

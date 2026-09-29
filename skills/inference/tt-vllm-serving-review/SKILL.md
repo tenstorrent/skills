@@ -1,9 +1,12 @@
 ---
 name: tt-vllm-serving-review
-description: Reviews the vLLM and tt-inference-server serving path — generator_vllm.py contracts, plugin registration, the tt_data_parallel ambiguity, and TT-fork branch and config conventions. Use when reviewing changes to generator_vllm.py, vLLM plugin registration, or serving configuration.
+description: Reviews the vLLM and tt-inference-server serving path, including generator contracts, explicit decode reload commands, plugin registration, and TT data-parallel layouts. Use when reviewing generator_vllm.py, vLLM plugin registration, or serving configuration.
 metadata:
   tier: model
   upstream:
+    - repo: tenstorrent/vllm-tt-plugin
+      ref: cacf1e7a867ae7b636d173ed42f8b409418f59a5
+      path: docs/DECODE_RELOAD_CONTRACT.md
     - repo: tenstorrent/tt-metal
       ref: d58cb341c703310cf41b5d88baafc0790ec0270b
       path: .agents/skills/vllm-integration/SKILL.md
@@ -54,12 +57,42 @@ nothing and falls back to a default implementation. Check that the entry point n
 vLLM looks up, and that registration happens on the import path actually taken when the server
 starts — not only under a test import.
 
-## TT-fork conventions
+## Decode reload commands
 
-vLLM here is a Tenstorrent fork. Branch and config conventions are load-bearing: a change pinning
-the wrong branch, or assuming upstream behaviour the fork has changed, breaks at deploy rather than
-in CI. Where a diff pins or bumps a fork reference, check it against the convention in the
-surrounding config rather than assuming upstream semantics.
+For `decode_input_update_contract = 1`, inspect all four commands from caller to model:
+
+- `reload_inputs` copies all forward inputs, including page tables.
+- `reload_page_table` copies only page tables and preserves token, position, and RoPE state.
+- `reload_sampling_params` uploads sampling settings, including seeds.
+- `reset_sampling_state` rebuilds penalty and RNG state. It requires a full input reload.
+
+The plugin chooses reloads. Flag model-side heuristics that override these commands.
+Host tokens and positions can be stale when `reload_inputs=False`; they must not reset inputs
+or seed counters. A full reload and a page-table-only reload are mutually exclusive.
+For resident decode, require evidence for all three input modes and mode or trace-buffer
+transitions. A full-reload-only adapter can use version 1 with async support false; test
+full reloads and clear rejection of unsupported resident commands instead.
+
+Contract version does not imply `supports_async_decode`. Async support needs split readback
+returning `(host_output, read_events)`, device token feedback, one position advance per decode,
+and independent page-table refresh. Readback must not sample or change state.
+
+Check `slot_remap[i] = j` before slot state is read. Every slot-bound subsystem consumes it once,
+including a dormant sampler during host sampling. A full input reload is not a remap. New slot
+ownership comes from prefill placement. Partial prefill must preserve unlisted live slots and
+their sampling parameters, seeds, and penalty history. A seed reset must initialize device seeds
+even when both cached and requested seeds are `None`.
+
+Read `docs/DECODE_RELOAD_CONTRACT.md` in the selected standalone plugin checkout for lifecycle
+and DP details. Missing or zero contract version uses the legacy call shape. Do not flag a
+legacy adapter merely for lacking the new keywords, or claim an inherited marker proves that
+an override implements them.
+
+## Serving dependency
+
+New bring-up uses `tenstorrent/vllm-tt-plugin` with its recommended upstream vLLM version.
+Check the selected installation instructions, imports, and source commits. For an explicitly
+maintained fork, inspect its caller contract separately; do not assume either API applies.
 
 ## Perf evidence works differently here
 

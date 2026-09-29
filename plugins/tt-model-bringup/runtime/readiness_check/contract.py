@@ -25,6 +25,13 @@ A typical implementation builds the low level first, then implements
 `prefill_logits()` and `generate()` by allocating its own KV cache + page table
 and driving those low-level methods.
 
+Low-level decode takes the four explicit version-1 reload commands. The
+standalone driver chooses them; the serving adapter forwards the plugin's
+commands. The model does not infer when to reload from prior calls or tensors.
+See ``skills/vllm-integration/references/decode-reload-contract.md`` for modes,
+slot state, and examples. The version marker belongs on the concrete serving
+adapter, not on this abstract base.
+
 # Discovery
 
 The readiness runner imports a generator by **convention**:
@@ -90,8 +97,21 @@ class Generator(ABC):
             def prefill_forward(self, tokens, *, page_table, kv_cache, prompt_lens, **kw):
                 return self._inner.prefill_forward_text(...)
 
-            def decode_forward(self, tokens, start_pos, *, page_table, kv_cache, **kw):
-                return self._inner.decode_forward(...)
+            def decode_forward(
+                self, tokens, start_pos, *, page_table, kv_cache,
+                reload_inputs, reload_page_table, reload_sampling_params,
+                reset_sampling_state, slot_remap=None, **kw,
+            ):
+                if "reset_batch" in kw:
+                    raise TypeError("Version 1 does not accept reset_batch")
+                return self._inner.decode_forward(
+                    tokens=tokens, start_pos=start_pos, page_table=page_table,
+                    kv_cache=kv_cache, reload_inputs=reload_inputs,
+                    reload_page_table=reload_page_table,
+                    reload_sampling_params=reload_sampling_params,
+                    reset_sampling_state=reset_sampling_state,
+                    slot_remap=slot_remap, **kw,
+                )
 
             def prefill_logits(self, prompt_token_ids):
                 ...  # allocate model-specific cache state and return all prompt logits
@@ -157,6 +177,11 @@ class Generator(ABC):
         *,
         page_table: torch.Tensor,
         kv_cache: Any,
+        reload_inputs: bool,
+        reload_page_table: bool,
+        reload_sampling_params: bool,
+        reset_sampling_state: bool,
+        slot_remap: Any | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
         """
@@ -169,8 +194,23 @@ class Generator(ABC):
         - Return logits ``[batch, vocab]`` (or sampled tokens ``[batch]``
           on the on-device-sampling path).
 
-        Like `prefill_forward`, this method must be safe to call
-        repeatedly; advancing `start_pos` is the caller's responsibility.
+        The caller chooses the commands. Execute them without new heuristics:
+
+        - reload_inputs copies tokens, positions, RoPE inputs, and page tables.
+        - reload_page_table copies only page tables. Do not combine it with
+          reload_inputs. Otherwise keep forward inputs resident on device.
+        - reload_sampling_params uploads sampling settings, including seeds.
+        - reset_sampling_state rebuilds penalty history and RNG state. It
+          requires reload_inputs. Seed=None still needs device initialization.
+
+        Host tokens and start_pos are current only when reload_inputs is true.
+        A resident decode advances the device position once in the forward
+        trace. Device sampling writes the next token into the persistent input
+        and advances RNG state once. Sampling and readback do not advance
+        position. Never align counters from stale host positions.
+
+        Apply slot_remap once to all slot-bound state before reading it, even
+        during host sampling. Reject reset_batch passed through kwargs.
         """
 
     @abstractmethod
@@ -230,6 +270,13 @@ class Generator(ABC):
         path and must fail rather than silently falling back to eager decode
         when tracing is unavailable. ``enable_trace=False`` may exist only
         as a model-local debug path outside readiness.
+        Send all four reload commands to each low-level decode. Teacher forcing
+        replaces the input token, so use reload_inputs=True with the current
+        host position on every forced step. Full reloads include page tables;
+        set reload_page_table=False. Initialize device sampling parameters and
+        state at the request boundary, then preserve them unless a command
+        requires an update. Without teacher forcing, a validated device-feedback
+        loop can use resident tokens and positions between transitions.
         The remaining ``**kwargs`` slot is reserved for per-model extras
         (e.g. ``stop_on_eos`` toggles); implementations should ignore
         unknown kwargs.

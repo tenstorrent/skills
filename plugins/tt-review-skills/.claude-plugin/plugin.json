@@ -1,7 +1,7 @@
 {
   "name": "tt-review-skills",
   "displayName": "Tenstorrent Review Skills",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Tenstorrent domain-knowledge code-review skills for gh-aw, Claude Code, and Codex.",
   "author": {
     "name": "Tenstorrent"

@@ -25,6 +25,13 @@ Optimization must also preserve valid non-aligned logical sequence lengths. Fast
 
 When direct traced generator decode is already fast but vLLM/serving decode is slower, treat the gap as orchestration overhead before retuning decoder math. First fix the adapter/generator path: async decode split, nonblocking trace replay, on-device traced sampling, host readbacks, page-table/input refreshes, and fallback sampling. Keep same-harness primary single-user and CI serving-burst before/after metrics.
 
+Preserve the [version-1 reload contract](../vllm-integration/references/decode-reload-contract.md)
+while optimizing. The plugin chooses all four reload commands. The model must not
+override them to skip a copy or reset. Measure copy counts against those commands.
+Steady resident decode keeps inputs on device; host sampling and teacher-forced
+token replacement require full reloads. Do not use stale host positions to align
+seed counters. Test state transitions as well as steady throughput.
+
 A note on the term "sharding" - tt-metal uses this to mean two things. On-device sharding means sharding across the cores or DRAM banks of one device, such as L1-sharded activations or DRAM-sharded weights. Multi-chip sharding means distributing tensors across devices in a mesh. On-device sharding is in scope for this skill. When `tt-perf-report` mentions sharding, it usually means on-device sharding.
 
 Profile warmed prefill and decode separately. Use `tt-perf-report` to find bottlenecks and suggestions for decoder, module, and non-serving full-model optimization. Try applicable advice. Keep changes that improve the target without unacceptable correctness or complexity cost. Record why rejected advice was rejected. If advice seems wrong, incomplete, or misleading, call that out as a candidate improvement to `tt-perf-report`.
@@ -146,7 +153,7 @@ For optimized full-model work, first compute a target budget from the best decod
 - `layer_stack_tps = 1000 / layer_stack_ms` for batch-1 single-user decode;
 - `full_model_overhead_ms = measured_full_model_ms_per_token - layer_stack_ms`.
 
-If the layer-stack estimate is already slower than the target, return to decoder optimization before spending time on generator orchestration. If the layer-stack estimate can meet the target but the full model cannot, optimize the overhead explicitly before changing the mathematical core: final norm, LM head, logits movement, sampling trace, token/current-position/RoPE/page-table refresh, trace replay blocking, synchronizations, host readbacks, cache management, and CCL buffer lifetime. For token/current-position/RoPE/page-table refresh specifically, the optimized steady-state loop should use persistent device tensors, `tt_out_tok` feedback, device-side position advance for fixed-step decode, and page-table copies only when the page table changes.
+If the layer-stack estimate is already slower than the target, return to decoder optimization before spending time on generator orchestration. If the layer-stack estimate can meet the target but the full model cannot, optimize the overhead explicitly before changing the mathematical core: final norm, LM head, logits movement, sampling trace, token/current-position/RoPE/page-table refresh, trace replay blocking, synchronizations, host readbacks, cache management, and CCL buffer lifetime. Steady resident decode should use persistent device tensors, `tt_out_tok` feedback, and device-side position advance. Copy page tables only on a commanded full reload or page-table-only reload.
 
 ### LM Head And Sampling
 
@@ -577,6 +584,7 @@ Avoid suppressing advice in the report used to guide optimization. When applicab
 - Generator-wide preparation precedes capture. Cross-request trace IDs and capture/retirement counts meet the lifetime and reuse evidence requirements in `$tt-enable-tracing`. Follow that skill for exact-tensor acknowledgments and minimal allocation scopes. Include any deferred first-capture cost in request latency, not just warmed inner-loop timing.
 - Program configs and compute-kernel configs are described in the final report or a compact structured summary.
 - If `supports_async_decode=True` is advertised, the split vLLM path has been exercised: `decode_forward(read_from_device=False)`, `read_decode_output(async_read=True)`, and `process_decode_output_host`.
+- New serving adapters use `decode_input_update_contract = 1`. The four commands reach the generator unchanged. Resident steps ignore stale host inputs. Page-table-only reloads preserve token/position state. Slot remaps and sampling resets retain their ownership and ordering.
 - On-device sampling returns device tokens/logprobs through decode; host top-1 or argmax fast paths are removed or proven unused by the measured benchmark.
 - PCC covers prefill and decode for every representative layer kind.
 - Optimized stress runs and passes for every representative layer kind and exercised mode; skipped stress is not a passing optimized result.

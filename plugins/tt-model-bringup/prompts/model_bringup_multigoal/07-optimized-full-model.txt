@@ -6,7 +6,7 @@ This goal creates the optimized-full-model state. Start from the completed full 
 
 Goal completion requirements:
 - Parallelize/optimize the full path, not just the decoder: embeddings, norms, LM head, logits, sampling, cache, trace replay, collectives, residual layouts, host boundaries, and generator orchestration.
-- Preserve canonical split-sampling token-out from $full-model/$tt-enable-tracing: sampler-ready logits, `tt_out_tok` feedback, device-side position/RoPE advance, changed-only page tables, and traced greedy plus top-k/top-p-capable sampling.
+- Preserve canonical split-sampling token-out from $full-model/$tt-enable-tracing: sampler-ready logits, `tt_out_tok` feedback, one device-side position/RoPE advance, and traced greedy plus top-k/top-p-capable sampling. Execute the four reload commands without model-side heuristics. Full reloads include page tables; page-table-only reloads preserve token/position state.
 - Preserve the serving-ready generator contract while making it fast: explicit cache/page-table/position/prompt-length/batch state, mixed prompts, fixed slots, and inactive rows still work.
 - Greedy decode must stay on device. Benchmark correct greedy sampler choices for this mesh. Do not accept force-argmax just because an incorrectly shaped generic sampled path is slower; fix split greedy or leave a repro.
 - Preserve the decoder stack's selected dtype/fidelity/KV-cache/activation/CCL policy, rejection ledger, and inter-layer residual layout. Do not switch to a faster rejected policy or replicated stream.
