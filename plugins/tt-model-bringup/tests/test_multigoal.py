@@ -97,6 +97,49 @@ class PersistentLogTests(unittest.TestCase):
         self.assertFalse((self.codex_home / "multigoal-runs").exists())
         self.assertFalse((self.tmp_dir / "codex-multigoal-runs").exists())
 
+    def test_permissions_reach_app_server_threads_and_turns(self) -> None:
+        cases = [
+            ("default", [], "never", "danger-full-access", "dangerFullAccess"),
+            (
+                "restricted",
+                ["--approval-policy", "on-request", "--sandbox", "workspace-write"],
+                "on-request", "workspace-write", "workspaceWrite",
+            ),
+            (
+                "conflicting-config",
+                ["--config", 'approval_policy="on-request"',
+                 "--config", 'sandbox_mode="read-only"'],
+                "never", "danger-full-access", "dangerFullAccess",
+            ),
+        ]
+        for name, options, approval, sandbox, policy_type in cases:
+            with self.subTest(name=name), mock.patch.object(
+                MULTIGOAL, "AppServerClient"
+            ) as server, mock.patch.object(
+                MULTIGOAL, "execute_goal", return_value=("complete", "thread-id", None)
+            ) as goal:
+                self.run_main(
+                    "--log-dir", str(self.root / name),
+                    "--config", "model_reasoning_effort=high", *options,
+                )
+
+                # Last CLI config override wins; it must agree with RPC settings.
+                config = dict(item.split("=", 1) for item in server.call_args.args[4])
+                self.assertEqual(config["approval_policy"], f'"{approval}"')
+                self.assertEqual(config["sandbox_mode"], f'"{sandbox}"')
+                self.assertEqual(config["model_reasoning_effort"], "high")
+                self.assertEqual(config["shell_environment_policy.experimental_use_profile"], "false")
+                args = goal.call_args.args[1]
+                for params in (
+                    MULTIGOAL.thread_start_params(args, self.repo),
+                    MULTIGOAL.thread_resume_params(args, self.repo, "existing-thread"),
+                ):
+                    self.assertEqual(params["approvalPolicy"], approval)
+                    self.assertEqual(params["sandbox"], sandbox)
+                turn = MULTIGOAL.turn_params(args, self.repo)
+                self.assertEqual(turn["approvalPolicy"], approval)
+                self.assertEqual(turn["sandboxPolicy"], {"type": policy_type})
+
     def test_explicit_codex_home_keeps_logs_in_the_workspace(self) -> None:
         explicit_home = self.root / "explicit-codex-home"
         self.run_main("--dry-run", "--codex-home", str(explicit_home))

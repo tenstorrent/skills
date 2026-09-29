@@ -68,6 +68,13 @@ recommends both `tt-model-bringup` and its `tt-autodebug` dependency if needed, 
 to install them.
 
 The stage skills support Codex and Claude Code; automated multi-goal execution uses Codex.
+
+Multigoal defaults to full Codex permissions: no sandbox and no approval prompts
+(`danger-full-access` with approval policy `never`, equivalent to `codex --yolo`).
+These settings apply to app-server startup, new and resumed stages, and turns. To change them,
+pass `--sandbox` and `--approval-policy` to `multigoal`; these take precedence over the same
+settings in Codex config files or `--config` overrides.
+
 See the [Agentic Research guide](docs/agentic-research/getting-started.md#model-bring-up) for how to
 run a bring-up, and [startup and stage orchestration](plugins/tt-model-bringup/skills/model-bringup/SKILL.md)
 for detailed setup, dry-run, and resume instructions.
