@@ -189,8 +189,15 @@ def burn_rate(db: DB, provider: str, window: str, resets_at: float | None, now: 
                 (provider, window, now - span, resets_at, resets_at))
     if len(rows) < 2 or rows[-1]["ts"] - rows[0]["ts"] < 300:
         return None
-    return max(float(rows[-1]["utilization"]) - float(rows[0]["utilization"]), 0.0) / (
-        (rows[-1]["ts"] - rows[0]["ts"]) / HOUR)
+    # Least-squares slope over every reading: readings come in whole percents, so a two-point
+    # estimate jumps with each new reading and the pace would flap between over and under.
+    ts = [(float(r["ts"]) - float(rows[0]["ts"])) / HOUR for r in rows]
+    us = [float(r["utilization"]) for r in rows]
+    mt, mu = sum(ts) / len(ts), sum(us) / len(us)
+    var = sum((t - mt) ** 2 for t in ts)
+    if var <= 0:
+        return None
+    return max(sum((t - mt) * (u - mu) for t, u in zip(ts, us)) / var, 0.0)
 
 
 def plan_windows(db: DB, now: float | None = None) -> list[Window]:

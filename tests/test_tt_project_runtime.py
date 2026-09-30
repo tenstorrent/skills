@@ -1572,3 +1572,17 @@ def test_plan_pacing_changes_do_not_alert_the_user(env, monkeypatch):
     assert alerts() == before, "pacing between green and yellow alerted the user"
     settle("red")
     assert alerts() == before + 1, "hitting the plan limit must alert"
+
+
+def test_burn_rate_is_steady_across_whole_percent_readings(env):
+    p = make(env)
+    from ttp import budget as bud
+    now = time.time()
+    resets = now + 3 * 3600
+    # 6 points per hour, reported in whole percents every 10 minutes
+    for i, minutes_ago in enumerate(range(60, -1, -10)):
+        util = round(30 + 6 * (60 - minutes_ago) / 60)
+        p.db.x("INSERT INTO snapshots(ts,provider,account,window,utilization,resets_at) VALUES(?,?,?,?,?,?)",
+               (now - minutes_ago * 60, "claude", "a", "five_hour", util, resets))
+    rate = bud.burn_rate(p.db, "claude", "five_hour", resets, now)
+    assert 5.0 <= rate <= 7.0, rate
