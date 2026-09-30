@@ -2526,3 +2526,24 @@ def test_a_run_that_never_launched_its_agent_costs_nothing(env):
     d.finish_run(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)),
                  {"rc": None, "started": t0, "ended": t0 + 50, "stopped": "resource_busy", "launched": False})
     assert p.db.one("SELECT cost_usd FROM runs WHERE id=?", (rid,))["cost_usd"] == 0
+
+
+def test_a_task_waiting_for_its_resource_keeps_its_reservation(env):
+    p = make(env)
+    from ttp import budget as bud
+    from ttp import coordinator as coord
+    from ttp import locks
+    from ttp.daemon import Daemon
+    assert coord.apply(p, [{"type": "task_add", "title": "reflash", "spec": "s", "tier": "light",
+                            "resources": ["board"], "exclusive": True}]) == []
+    task = p.db.one("SELECT * FROM tasks WHERE title='reflash'")
+    d = Daemon(p.base)
+    held = locks.try_take(d._slot_paths("board"), "ttp lock", "held by a command")
+    assert held
+    mark = locks.reserve_path(p.state / "locks", "board")
+    provider = task["provider"] or d.cfg.get("core_provider", "claude")
+    d.gates[provider] = bud.Gate(provider, regime="windows")
+    assert [t["id"] for t in p.db.ready_tasks()] == [task["id"]]
+    d.dispatch()
+    assert locks.reserved_by(mark) == f"task #{task['id']}", "a task waiting for its resource lost its reservation"
+    held.close()
