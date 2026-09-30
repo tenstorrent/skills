@@ -278,19 +278,23 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         raise ValueError(f"#{task['id']} rejected: depends on #{dep} which "
                                          f"{'does not exist' if why == 'does not exist' else 'is ' + why}; "
                                          f"drop or replace depends_on")
-                if a.get("text"):
+                spec = a.get("spec") or ""
+                if a.get("text") and upd.get("status", task["status"]) in ("blocked", "cancelled"):
                     upd["blocked_reason"] = a["text"][:500]
+                elif a.get("text"):
+                    # Kept as the reason, a note would outlive the state it described.
+                    spec = "\n\n".join(x for x in (spec, a["text"]) if x)
                 if a.get("priority"):
                     upd["priority"] = int(a["priority"])
-                if a.get("spec"):
-                    upd["spec"] = task["spec"] + "\n\n## Update\n" + a["spec"]
+                if spec:
+                    upd["spec"] = task["spec"] + "\n\n## Update\n" + spec
                 db.update_task(task["id"], **upd)
-                if a.get("spec") and task["status"] == "running":
+                if spec and task["status"] == "running":
                     stamp = time.strftime("%Y-%m-%d %H:%M")
                     for r in db.q("SELECT dir FROM runs WHERE task=? AND status='running'", (task["id"],)):
                         if r["dir"]:
                             with open(Path(r["dir"], "steer.md"), "a") as f:
-                                f.write(f"\n## Update {stamp}\n{a['spec'].strip()}\n")
+                                f.write(f"\n## Update {stamp}\n{spec.strip()}\n")
                 if upd.get("status") == "cancelled":
                     stop_runs(db, p.runs, task["id"])
             elif t == "ask_user":

@@ -711,6 +711,32 @@ def test_a_cancelled_task_stays_cancelled_when_its_run_ends(env, tmp_path):
     assert not p.db.q("SELECT id FROM events WHERE kind='task_failed'"), "a cancel was reported as a failure"
 
 
+def test_a_task_note_never_outlives_the_state_it_described(env, tmp_path):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    tid = p.db.add_task("long job", "spec", kind="work", tier="light", origin="user")
+    p.db.update_task(tid, status="running")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "output.jsonl").write_text("")
+    p.db.x("INSERT INTO runs(task,role,provider,started,status,dir,boot_id) VALUES(?,?,?,?,?,?,?)",
+           (tid, "worker", "fake", time.time(), "running", str(run_dir), "x"))
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "text": "use the smaller board"}]) == []
+    task = p.db.task(tid)
+    assert task["blocked_reason"] is None and "use the smaller board" in task["spec"]
+    assert "use the smaller board" in (run_dir / "steer.md").read_text(), "the note did not reach the worker"
+    p.db.update_task(tid, blocked_reason="waiting for a board; next try 10:00")
+    (run_dir / "result.json").write_text(json.dumps({"status": "done", "summary": "measured it"}))
+    (run_dir / "exit.json").write_text(json.dumps({"rc": 0, "ended": time.time()}))
+    Daemon(p.base).reap_runs()
+    task = p.db.task(tid)
+    assert task["status"] == "done" and task["blocked_reason"] is None, "a done task kept an old reason"
+    tid2 = p.db.add_task("other", "spec", kind="work", tier="light", origin="user")
+    assert coord.apply(p, [{"type": "task_update", "id": tid2, "status": "blocked", "text": "needs a board"}]) == []
+    assert p.db.task(tid2)["blocked_reason"] == "needs a board"
+
+
 def test_coordinator_can_point_code_tasks_at_the_working_branch(env):
     p = make(env)
     from ttp import coordinator as coord

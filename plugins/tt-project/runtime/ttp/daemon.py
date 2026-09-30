@@ -520,6 +520,8 @@ class Daemon:
             upd["blocked_reason"] = reason[:500]
         elif new == "blocked":
             upd["blocked_reason"] = str(result.get("question") or result.get("blocked_reason") or summary)[:500]
+        else:
+            upd["blocked_reason"] = None
         if not_before:
             upd["not_before"] = not_before
         elif new == "queued" and status not in ("limit", "auth"):
