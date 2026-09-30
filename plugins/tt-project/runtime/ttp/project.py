@@ -43,6 +43,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "task_default_usd": {"light": 2.0, "standard": 8.0, "deep": 25.0},
         "run_timeout_s": {"light": 1200, "standard": 3600, "deep": 7200},
         "stall_s": {"light": 900, "standard": 1800, "deep": 2700},
+        # A run that ends without reporting its cost is estimated from its tokens at the project's
+        # own observed rate; until there is one, this $ per million weighted tokens (set high).
+        "estimate_usd_per_mtok": 15.0,
     },
     "resources": {},                    # shared-slot limits, e.g. {"device": 1}
     "coordinator": {"tier": "light", "debounce_s": 15, "max_events_per_turn": 40,

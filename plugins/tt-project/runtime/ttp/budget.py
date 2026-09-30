@@ -6,7 +6,8 @@ Two regimes, chosen per provider from what the provider reports:
 - plan windows (subscription plans report utilization per window): the project may never take the
   account past 100 - reserve_pct, because the remainder belongs to the user's own work;
 - dollar caps (usage-billed accounts report no window): rolling 24 h and 7 d caps on what THIS
-  project spends, with the user's defaults when the charter sets none.
+  project spends across all its providers not on plan windows, with the user's defaults when the
+  charter sets none.
 A runaway check (spend rate far above this project's own norm) overrides both.
 """
 from __future__ import annotations
@@ -20,6 +21,9 @@ from .db import DB
 LEVELS = ("green", "yellow", "orange", "red")
 HOUR, DAY, WEEK = 3600.0, 86400.0, 7 * 86400.0
 SNAPSHOT_FRESH_S = 30 * 60
+# Relative price of each token class (input = 1), used only to apply an observed rate to a token
+# mix; not a price list. Override with budget.estimate_weights.
+TOKEN_WEIGHTS = {"input": 1.0, "output": 5.0, "cache_read": 0.1, "cache_write": 1.25}
 
 
 @dataclass
@@ -73,10 +77,14 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
             elif w.utilization >= limit - 25:
                 _raise(g, "yellow", f"{w.window} window at {w.utilization:.0f}%")
     else:
+        # The caps bound the project's dollars, whichever provider spends them. Providers on plan
+        # windows are bounded by their windows instead, so their spend does not count here.
         day_cap, week_cap = float(b.get("daily_usd") or 0), float(b.get("weekly_usd") or 0)
-        d = db.spent_since(now - DAY, provider)
-        w7 = db.spent_since(now - WEEK, provider)
+        windowed = sorted({w.provider for w in windows})
+        d = db.spent_since(now - DAY, exclude=windowed)
+        w7 = db.spent_since(now - WEEK, exclude=windowed)
         g.numbers.update({"spent_24h": round(d, 2), "spent_7d": round(w7, 2),
+                          "estimated_24h": round(db.spent_since(now - DAY, exclude=windowed, estimated_only=True), 2),
                           "daily_cap": day_cap, "weekly_cap": week_cap})
         ratio = max(d / day_cap if day_cap else 0.0, w7 / week_cap if week_cap else 0.0)
         g.numbers["cap_ratio"] = round(ratio, 3)
@@ -122,6 +130,37 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
     elif g.level == "red":
         g.max_tier, g.max_parallel, g.allow_optional, g.allow_new_work = "light", 0, False, False
     return g
+
+
+def estimate_cost(db: DB, cfg: dict, provider: str, model: str, tokens: dict[str, int],
+                  now: float | None = None) -> float:
+    """Cost of a run that ended without reporting one (killed, lost, cut off) from its token counts.
+
+    The rate is this project's own: reported cost over weighted tokens of its recent runs on the same
+    provider (same model when there are any). The weights only relate the token classes to each
+    other. With no such runs yet, the configured fallback applies; it is set high on purpose.
+    """
+    now = now or time.time()
+    b = cfg["budget"]
+    w = {**TOKEN_WEIGHTS, **(b.get("estimate_weights") or {})}
+
+    def weighted(i: float, o: float, cr: float, cw: float) -> float:
+        return i * w["input"] + o * w["output"] + cr * w["cache_read"] + cw * w["cache_write"]
+
+    rate = None
+    for same_model in (True, False):
+        rows = db.q("SELECT cost_usd, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens FROM runs "
+                    "WHERE provider=? AND (? OR model=?) AND cost_estimated=0 AND cost_usd>0 AND ended>=? "
+                    "ORDER BY id DESC LIMIT 50", (provider, int(not same_model), model, now - 14 * DAY))
+        units = sum(weighted(r["input_tokens"] or 0, r["output_tokens"] or 0, r["cache_read_tokens"] or 0,
+                             r["cache_write_tokens"] or 0) for r in rows)
+        if units > 0:
+            rate = sum(float(r["cost_usd"]) for r in rows) / units
+            break
+    if rate is None:
+        rate = float(b.get("estimate_usd_per_mtok", 15.0)) / 1e6
+    return round(rate * weighted(tokens.get("input", 0), tokens.get("output", 0), tokens.get("cache_read", 0),
+                                 tokens.get("cache_write", 0)), 4)
 
 
 TIER_ORDER = ("light", "standard", "deep")

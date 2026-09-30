@@ -9,13 +9,12 @@ reading files, running commands or thinking hard becomes a task for a worker ins
 """
 from __future__ import annotations
 
-import json
 import time
 from pathlib import Path
 from typing import Any
 
 from . import schedule as sched
-from .db import SEVERITY_RANK, TERMINAL_TASK_STATES
+from .db import SEVERITY_RANK, TERMINAL_TASK_STATES, load_result
 from .project import Project
 
 ACTION_TYPES = ("reply", "task_add", "task_update", "ask_user", "resolve", "notify", "memory_add",
@@ -78,15 +77,17 @@ def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int]) ->
             money = (f"plan windows: {n.get('window')} at {n.get('utilization')}% of the account; "
                      f"the project may use it up to {n.get('limit')}%")
         else:
-            money = (f"caps: ${n.get('spent_24h', 0):.2f} of ${b.get('daily_usd')} per 24h, "
-                     f"${n.get('spent_7d', 0):.2f} of ${b.get('weekly_usd')} per 7 days")
+            est = f" (${n['estimated_24h']:.2f} of it estimated)" if n.get("estimated_24h") else ""
+            money = (f"project caps (usage-billed providers together): ${n.get('spent_24h', 0):.2f} of "
+                     f"${b.get('daily_usd')} per 24h"
+                     f"{est}, ${n.get('spent_7d', 0):.2f} of ${b.get('weekly_usd')} per 7 days")
         lines.append(f"- {prov}: {g['level']} ({'; '.join(g['reasons']) or 'ok'}) · {money} · max_tier={g['max_tier']} "
                      f"max_parallel={g['max_parallel']} optional_work={'yes' if g['allow_optional'] else 'no'}")
     lines.append(f"- per-task default budgets: {b.get('task_default_usd')}")
     lines.append("## Open tasks (id | status | tier | priority | age | title | last note)")
     rows = db.q("SELECT * FROM tasks WHERE status NOT IN ('done','failed','cancelled') ORDER BY priority, id LIMIT 60")
     for t in rows:
-        note = (t["blocked_reason"] or (json.loads(t["result"]).get("summary", "") if t["result"] else ""))[:140]
+        note = (t["blocked_reason"] or str(load_result(t["result"]).get("summary") or ""))[:140]
         lines.append(f"- #{t['id']} | {t['status']} | {t['tier']} | p{t['priority']} | "
                      f"{(now - t['created']) / 3600:.1f}h | {t['title']} | {note}")
     if not rows:
@@ -94,7 +95,7 @@ def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int]) ->
     lines.append("## Recently finished (last 48h)")
     for t in db.q("SELECT * FROM tasks WHERE status IN ('done','failed','cancelled') AND updated>? "
                   "ORDER BY updated DESC LIMIT 15", (now - 172800,)):
-        summary = json.loads(t["result"]).get("summary", "")[:200] if t["result"] else ""
+        summary = str(load_result(t["result"]).get("summary") or "")[:200]
         lines.append(f"- #{t['id']} {t['status']}: {t['title']} — {summary}")
     lines.append("## Recurring")
     for s in sched.with_costs(db):
@@ -184,7 +185,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None) -> l
                                 f.write(f"\n## Update {stamp}\n{a['spec'].strip()}\n")
                 if upd.get("status") == "cancelled":
                     for r in db.q("SELECT dir FROM runs WHERE task=? AND status='running'", (task["id"],)):
-                        Path(r["dir"], "STOP").touch()
+                        if r["dir"]:
+                            Path(r["dir"], "STOP").touch()
             elif t == "ask_user":
                 db.post("out", a["text"], chat=None, kind="ask", severity=_norm_severity(a.get("severity") or "high"))
             elif t == "resolve":
@@ -213,7 +215,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None) -> l
                 pass
             else:
                 raise ValueError(f"unknown action {t!r}")
-        except (KeyError, ValueError, TypeError) as e:
+        except Exception as e:   # one bad action is reported back; it never aborts the turn
             problems.append(f"{t}: {e}")
     return problems
 

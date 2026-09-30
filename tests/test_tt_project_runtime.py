@@ -548,3 +548,200 @@ def test_coordinator_can_point_code_tasks_at_the_working_branch(env):
     subprocess.run(["git", "-C", str(env["repo"]), "branch", "work/fast"], check=True)
     assert coord.apply(p, [{"type": "config_set", "key": "delivery.base_ref", "value": "work/fast"}]) == []
     assert base_ref(p) == "work/fast"
+
+
+def test_a_long_handoff_stays_valid_json_and_the_next_turn_runs(env, monkeypatch):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    long = "x" * 30000
+    monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps({
+        "status": "done", "summary": "measured " + long,
+        "followups": [{"title": f"follow-up {i}", "spec": "s"} for i in range(8)]}))
+    tid = p.db.add_task("big report", "write a lot", kind="work", tier="light", origin="user")
+    p.set_config("coordinator.debounce_s", 0)
+    d = Daemon(p.base)
+    assert _run_until(d, p, lambda: p.db.task(tid)["status"] == "done" and p.db.one(
+        "SELECT id FROM runs WHERE role='coordinator' AND status='ok'")), "no coordinator turn after a long hand-off"
+    stored = p.db.task(tid)["result"]
+    assert len(stored) <= 20000 and json.loads(stored)["summary"].startswith("measured x")
+    done = p.db.one("SELECT text FROM events WHERE kind='task_done' AND task=?", (tid,))["text"]
+    assert "follow-up 7" in done, "follow-ups beyond the first five were dropped"
+    # A row that an older version cut mid-JSON: the digest still builds and keeps its summary.
+    p.db.update_task(tid, result=json.dumps({"summary": "old news " + long})[:20000])
+    assert "old news" in coord.digest(p, {}, [], [])
+
+
+def test_a_bulky_handoff_keeps_its_summary_and_retry_fields(env):
+    from ttp.db import dump_result
+    stored = json.loads(dump_result({
+        "summary": "S" * 8000, "status": "waiting", "waits": 3,
+        "followups": [{"title": "t", "spec": "x" * 3000} for _ in range(200)],
+        "metrics": {f"k{i}": ["y" * 100] * 50 for i in range(500)}}))
+    assert stored["summary"] == "S" * 8000 and stored["status"] == "waiting" and stored["waits"] == 3
+    assert stored["clipped"] and stored["followups"]
+
+
+def test_an_orphan_run_row_is_reaped_and_the_next_turn_runs(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    # A coordinator turn whose start was cut short: no run directory or pid was ever recorded.
+    rid = p.db.x("INSERT INTO runs(role,provider,started,status,boot_id,note) VALUES(?,?,?,?,?,?)",
+                 ("coordinator", "fake", time.time(), "running", d.boot, "{}"))
+    p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)",
+           (time.time(), "t", time.time()))
+    p.db.post("in", "status please", chat="c1")
+    p.set_config("coordinator.debounce_s", 0)
+    assert _run_until(d, p, lambda: any("ack: status please" in m["text"] for m in p.db.unread_for_chat("c1", 0)))
+    assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == "lost"
+
+
+def test_a_failed_start_leaves_the_task_queued_without_spending_an_attempt(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    tid = p.db.add_task("tidy", "tidy up", kind="work", tier="light", origin="user")
+
+    def no_space(*a, **k):
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(dmod.subprocess, "Popen", no_space)
+    d.dispatch()
+    t = p.db.task(tid)
+    assert t["status"] == "queued" and t["attempts"] == 0 and t["not_before"] > time.time()
+    assert "No space left" in t["blocked_reason"]
+    assert not p.db.q("SELECT id FROM runs WHERE status='running'"), "a run that never launched stays running"
+
+
+def test_a_task_left_running_without_a_run_is_requeued(env, tmp_path):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    orphan = p.db.add_task("orphan", "s", kind="work", tier="light", origin="user")
+    p.db.update_task(orphan, status="running")
+    live = p.db.add_task("busy", "s", kind="work", tier="light", origin="user")
+    p.db.update_task(live, status="running")
+    run_dir = tmp_path / "live"
+    run_dir.mkdir()
+    (run_dir / "lease").touch()
+    p.db.x("INSERT INTO runs(task,role,provider,started,status,dir,boot_id) VALUES(?,?,?,?,?,?,?)",
+           (live, "worker", "fake", time.time(), "running", str(run_dir), d.boot))
+    d.tick()
+    assert p.db.q("SELECT id FROM runs WHERE task=?", (orphan,)), "the orphaned task was never picked up again"
+    assert p.db.task(orphan)["attempts"] == 0
+    assert p.db.one("SELECT severity FROM events WHERE kind='task_requeued' AND task=?", (orphan,))["severity"] == "low"
+    assert p.db.task(live)["status"] == "running" and len(p.db.q("SELECT id FROM runs WHERE task=?", (live,))) == 1, \
+        "a task with a live run was requeued"
+    assert _run_until(d, p, lambda: p.db.task(orphan)["status"] == "done")
+
+
+def test_dependents_of_a_failed_task_are_blocked(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    base = p.db.add_task("base", "s", origin="user")
+    p.db.update_task(base, status="failed")
+    child = p.db.add_task("child", "s", origin="user", depends_on=[base])
+    ghost = p.db.add_task("ghost", "s", origin="user", depends_on=[999])
+    waiting = p.db.add_task("waiting", "s", origin="user", depends_on=[child])
+    Daemon(p.base).tick()
+    assert p.db.task(child)["status"] == "blocked" and f"#{base} failed" in p.db.task(child)["blocked_reason"]
+    assert p.db.task(ghost)["status"] == "blocked"
+    assert p.db.task(waiting)["status"] == "queued", "a task whose dependency may still finish was blocked"
+    assert p.db.one("SELECT id FROM events WHERE kind='task_blocked' AND task=?", (child,))
+
+
+def test_a_run_end_is_recorded_whole_or_not_at_all(env, tmp_path, monkeypatch):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    tid = p.db.add_task("job", "s", kind="work", tier="light", origin="user")
+    p.db.update_task(tid, status="running")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "output.jsonl").write_text(json.dumps({"_cost": 1.5}))
+    (run_dir / "exit.json").write_text(json.dumps({"rc": 0, "ended": time.time()}))
+    rid = p.db.x("INSERT INTO runs(task,role,provider,started,status,dir,boot_id) VALUES(?,?,?,?,?,?,?)",
+                 (tid, "worker", "fake", time.time(), "running", str(run_dir), d.boot))
+
+    def broken(*a, **k):
+        raise RuntimeError("bug while recording the hand-off")
+    monkeypatch.setattr(d, "_finish_worker", broken)
+    d.reap_runs()
+    assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == "running"
+    assert not p.db.q("SELECT id FROM ledger") and not p.db.task(tid)["spent_usd"], "a half-recorded run end"
+    d.reap_runs()
+    d.reap_runs()          # a run end that keeps failing is closed, not retried forever
+    assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == "failed"
+    assert p.db.task(tid)["status"] == "failed"
+
+
+def _claude_stream_without_result(path, messages=4):
+    """A Claude run killed before its result line. Each API message streams as three events that
+    repeat the same usage; 107,510 weighted tokens per message."""
+    evs = [{"type": "system", "subtype": "init", "session_id": "s", "model": "m"}]
+    usage = {"input_tokens": 10, "output_tokens": 5000, "cache_read_input_tokens": 800_000,
+             "cache_creation_input_tokens": 2000}
+    for i in range(messages):
+        for block in ({"type": "thinking", "thinking": "..."}, {"type": "text", "text": f"step {i}"},
+                      {"type": "tool_use", "id": f"t{i}", "name": "Bash", "input": {}}):
+            evs.append({"type": "assistant", "message": {"id": f"msg_{i}", "usage": usage, "content": [block]}})
+    path.write_text("\n".join(json.dumps(e) for e in evs) + "\n")
+
+
+def test_runs_without_a_result_line_count_their_estimated_cost(env, tmp_path, monkeypatch):
+    p = make(env)
+    from ttp import budget as bud
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    tid = p.db.add_task("long job", "s", kind="work", tier="standard", origin="user", provider="claude",
+                        budget_usd=10.0)
+
+    def stalled_run(n):
+        run_dir = tmp_path / f"run{n}"
+        run_dir.mkdir()
+        _claude_stream_without_result(run_dir / "output.jsonl")
+        (run_dir / "exit.json").write_text(json.dumps({"rc": -15, "stopped": "stalled", "ended": time.time()}))
+        p.db.update_task(tid, status="running")
+        rid = p.db.x("INSERT INTO runs(task,role,provider,model,started,status,dir,boot_id) VALUES(?,?,?,?,?,?,?,?)",
+                     (tid, "worker", "claude", "opus", time.time() - 600, "running", str(run_dir), d.boot))
+        d.reap_runs()
+        return p.db.one("SELECT * FROM runs WHERE id=?", (rid,))
+
+    first = stalled_run(1)
+    assert first["cost_estimated"] == 1 and first["cost_usd"] == pytest.approx(4 * 107_510 * 15 / 1e6)
+    assert first["cache_read_tokens"] == 4 * 800_000, "one message's usage was counted more than once"
+    assert p.db.one("SELECT estimated FROM ledger")["estimated"] == 1
+    assert p.db.task(tid)["spent_usd"] == pytest.approx(first["cost_usd"])
+    started = {}
+    monkeypatch.setattr(d, "start_run", lambda *a, **k: started.update(k) or 0)
+    p.db.update_task(tid, not_before=None)
+    d.dispatch()
+    assert started["budget_usd"] == pytest.approx(10.0 - first["cost_usd"]), "the retry got a fresh budget"
+    stalled_run(2)
+    g = bud.evaluate(p.db, p.config(), "claude", [])
+    assert g.level == "red" and any("failed or stalled" in r for r in g.reasons)
+
+
+def test_estimates_use_the_projects_own_observed_rate(env):
+    p = make(env)
+    from ttp import budget as bud
+    tokens = {"input": 0, "output": 10_000, "cache_read": 500_000, "cache_write": 0}     # 100k weighted
+    assert bud.estimate_cost(p.db, p.config(), "claude", "opus", tokens) == pytest.approx(1.5)
+    # $1 reported for 200k weighted tokens: $5 per million from now on
+    p.db.x("INSERT INTO runs(role,provider,model,status,started,ended,cost_usd,cost_estimated,output_tokens,"
+           "cache_read_tokens) VALUES('worker','claude','opus','ok',?,?,1.0,0,20000,1000000)",
+           (time.time() - 100, time.time() - 50))
+    assert bud.estimate_cost(p.db, p.config(), "claude", "opus", tokens) == pytest.approx(0.5)
+
+
+def test_dollar_caps_cover_the_whole_project(env):
+    p = make(env)
+    from ttp import budget as bud
+    two_hours_ago = time.time() - 7200          # outside the runaway guard's last hour
+    for prov in ("claude", "codex"):
+        p.db.x("INSERT INTO ledger(ts,provider,source,usd) VALUES(?,?,?,?)", (two_hours_ago, prov, "task:1", 60.0))
+    for prov in ("claude", "codex"):
+        g = bud.evaluate(p.db, p.config(), prov, [])
+        assert g.level == "red" and any("cap reached" in r for r in g.reasons), (prov, g.reasons)
+    # A provider on plan windows is bounded by its windows, so its spend does not use up the caps.
+    assert bud.evaluate(p.db, p.config(), "codex", [bud.Window("claude", "seven_day", 20)]).level == "yellow"

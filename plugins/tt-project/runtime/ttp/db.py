@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 SCHEMA_VERSION = 1
 
@@ -112,6 +114,20 @@ class DB:
         cur = self.conn.execute(sql, tuple(args))
         return cur.lastrowid or cur.rowcount
 
+    @contextmanager
+    def tx(self) -> Iterator[None]:
+        """All writes inside commit together or not at all. Nested use joins the outer transaction."""
+        if self.conn.in_transaction:
+            yield
+            return
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            self.conn.execute("ROLLBACK")
+            raise
+        self.conn.execute("COMMIT")
+
     def meta(self, key: str) -> str | None:
         r = self.one("SELECT value FROM meta WHERE key=?", (key,))
         return r["value"] if r else None
@@ -178,7 +194,22 @@ class DB:
         rows = self.q("SELECT * FROM tasks WHERE status='queued' AND (not_before IS NULL OR not_before<=?) "
                       "ORDER BY priority, id", (now,))
         done = {r["id"] for r in self.q("SELECT id FROM tasks WHERE status='done'")}
-        return [r for r in rows if all(d in done for d in json.loads(r["depends_on"] or "[]"))]
+        return [r for r in rows if all(d in done for d in _dependency_ids(r))]
+
+    def dead_dependencies(self) -> list[tuple[dict, Any, str]]:
+        """Queued tasks waiting on a dependency that can no longer finish: (task, dependency, why)."""
+        rows = self.q("SELECT * FROM tasks WHERE status='queued' AND depends_on NOT IN ('', '[]')")
+        if not rows:
+            return []
+        states = {r["id"]: r["status"] for r in self.q("SELECT id, status FROM tasks")}
+        out = []
+        for t in rows:
+            for d in _dependency_ids(t):
+                why = "does not exist" if states.get(d) is None else states[d]
+                if why in ("does not exist", "failed", "cancelled"):
+                    out.append((t, d, why))
+                    break
+        return out
 
     # money ---------------------------------------------------------------------------------
     def spend(self, provider: str, usd: float, source: str, account: str = "",
@@ -187,13 +218,93 @@ class DB:
                "VALUES(?,?,?,?,?,?,?,?)",
                (time.time(), provider, account, source, float(usd or 0), int(estimated), tokens_in, tokens_out))
 
-    def spent_since(self, since_ts: float, provider: str | None = None) -> float:
+    def spent_since(self, since_ts: float, provider: str | None = None, exclude: Iterable[str] = (),
+                    estimated_only: bool = False) -> float:
+        sql, args = "SELECT COALESCE(SUM(usd),0) s FROM ledger WHERE ts>=?", [since_ts]
         if provider:
-            r = self.one("SELECT COALESCE(SUM(usd),0) s FROM ledger WHERE ts>=? AND provider=?",
-                         (since_ts, provider))
-        else:
-            r = self.one("SELECT COALESCE(SUM(usd),0) s FROM ledger WHERE ts>=?", (since_ts,))
+            sql, args = sql + " AND provider=?", args + [provider]
+        exclude = list(exclude)
+        if exclude:
+            sql, args = sql + f" AND provider NOT IN ({','.join('?' * len(exclude))})", args + exclude
+        if estimated_only:
+            sql += " AND estimated=1"
+        r = self.one(sql, args)
         return float(r["s"]) if r else 0.0
 
 
 SEVERITY_RANK = {"info": 0, "low": 0, "normal": 1, "high": 2, "critical": 3}
+RESULT_MAX_CHARS = 20000
+
+
+def _dependency_ids(task: dict) -> list:
+    """A task's dependencies as ids; an entry that is not an id comes back as None (never done)."""
+    try:
+        deps = json.loads(task["depends_on"] or "[]")
+    except ValueError:
+        return [None]
+    out = []
+    for d in deps if isinstance(deps, list) else [deps]:
+        try:
+            out.append(int(d))
+        except (TypeError, ValueError):
+            out.append(None)
+    return out
+
+
+def dump_result(result: dict, limit: int = RESULT_MAX_CHARS) -> str:
+    """A hand-off as JSON of at most `limit` chars for tasks.result. Values are shortened, never the
+    serialized text, so every reader can parse it; the full hand-off stays in the run directory.
+    The summary is what readers show and status/waits drive retries, so those go last: other fields
+    shrink first, then the largest of them are dropped, then the summary shrinks."""
+    text = json.dumps(result, ensure_ascii=False)
+    if len(text) <= limit:
+        return text
+    summary = str(result.get("summary") or "")
+    rest = {k: v for k, v in result.items() if k != "summary"}
+    cap, summary_cap = limit, limit // 2
+    while True:
+        text = json.dumps({"summary": _clip(summary, summary_cap), **_clip(rest, cap), "clipped": True},
+                          ensure_ascii=False)
+        if len(text) <= limit:
+            return text
+        droppable = [k for k in rest if k not in ("status", "waits")]
+        if cap > 64:
+            cap = max(cap // 2, 64)
+        elif droppable:
+            del rest[max(droppable, key=lambda k: len(json.dumps(_clip(rest[k], cap), ensure_ascii=False)))]
+        elif summary_cap > 64:
+            summary_cap = max(summary_cap // 2, 64)
+        else:
+            last = {"summary": summary[:64], "status": str(rest.get("status") or "")[:64], "clipped": True}
+            if isinstance(rest.get("waits"), int):
+                last["waits"] = rest["waits"]
+            return json.dumps(last, ensure_ascii=False)
+
+
+def _clip(value: Any, cap: int) -> Any:
+    if isinstance(value, str):
+        return value if len(value) <= cap else value[:cap] + "…"
+    if isinstance(value, list):
+        return [_clip(v, cap) for v in value[:cap]]
+    if isinstance(value, dict):
+        return {k: _clip(v, cap) for k, v in list(value.items())[:cap]}
+    return value
+
+
+def load_result(text: str | None) -> dict:
+    """A task's stored hand-off, {} when there is none or it cannot be read. Rows that older versions
+    cut mid-JSON still yield their summary, so one bad row never breaks a reader."""
+    if not text:
+        return {}
+    try:
+        data = json.loads(text)
+        return data if isinstance(data, dict) else {}
+    except ValueError:
+        pass
+    m = re.match(r'\s*\{\s*"summary"\s*:\s*"((?:[^"\\]|\\.)*)', text)
+    if not m:
+        return {}
+    try:
+        return {"summary": json.loads('"' + re.sub(r"\\u[0-9a-fA-F]{0,3}$", "", m.group(1)) + '"')}
+    except ValueError:
+        return {}

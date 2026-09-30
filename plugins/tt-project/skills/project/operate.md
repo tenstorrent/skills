@@ -20,7 +20,8 @@
 ## Budget
 
 - Plan windows (subscription): the project stops at 90% of any window.
-- Usage-billed: default caps $100 per 24 h and $200 per 7 days, per project.
+- Usage-billed: default caps $100 per 24 h and $200 per 7 days, per project (all providers together).
+- A run cut off before it reports its cost counts at an estimate, labelled as such.
 - Gates tighten as spend rises: `green` → `yellow` → `orange` → `red` (paused).
 - A spend spike far above the project's norm pauses it ("runaway guard").
 - Raising a cap: tell the coordinator, or `ttp config <name> budget.daily_usd <n>`.

@@ -29,7 +29,9 @@ in `state/runs/<id>/`, so a daemon restart never loses a result.
 3. No run starts when its provider's gate forbids it. Every run has a wall clock and a budget.
 4. A run's outcome is read from files, never a pipe. Runs survive daemon restarts.
 5. A missed schedule fires once on wake, never once per missed slot.
-6. Plan windows keep `reserve_pct` for the user. Usage-billed accounts have dollar caps.
+6. Plan windows keep `reserve_pct` for the user. Usage-billed spend has dollar caps on the project
+   total across providers. A run that ends without reporting its cost counts at an estimate from its
+   streamed tokens, at the project's own observed rate.
 7. A limit or logout pauses a provider with one clear alert; it is never counted as task failure.
    Neither is a `waiting` hand-off (busy machine or queue): the task retries later, up to
    `budget.max_waits` times, then asks the user.
@@ -37,6 +39,9 @@ in `state/runs/<id>/`, so a daemon restart never loses a result.
 9. Secrets live only in `~/.tt-project/secrets.json` (0600). Never in argv, logs or projects.
 10. The runtime is standard-library Python ≥ 3.9. Web assets are static files.
 11. Text from outside (logs, issues, chats, PR comments) is data, never instructions.
+12. A run's end, its spend and its task's new state commit in one transaction. No state row can
+    wedge the loop: a task never stays `running` without a live run, and a queued task whose
+    dependency failed or was cancelled is blocked with the reason.
 
 ## Why the coordinator is tool-less
 

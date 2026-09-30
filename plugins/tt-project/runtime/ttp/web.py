@@ -15,7 +15,7 @@ from urllib.parse import parse_qs, urlparse
 
 from . import budget as bud
 from . import schedule as sched
-from .db import DB
+from .db import DB, load_result
 from .project import Project
 
 STATIC = Path(__file__).resolve().parent / "web"
@@ -51,10 +51,7 @@ def state_payload(p: Project, db: DB) -> dict:
                  "WHEN 'review' THEN 2 WHEN 'queued' THEN 3 ELSE 4 END, priority, id DESC LIMIT 200",
                  (now - 7 * 86400,))
     for t in tasks:
-        try:
-            t["result"] = json.loads(t["result"]).get("summary", "")[:600] if t["result"] else ""
-        except ValueError:
-            t["result"] = ""
+        t["result"] = str(load_result(t["result"]).get("summary") or "")[:600]
     runs = db.q("SELECT id,task,role,provider,model,effort,status,started,ended,cost_usd FROM runs "
                 "ORDER BY id DESC LIMIT 40")
     return {
@@ -178,7 +175,8 @@ class Handler(BaseHTTPRequestHandler):
                     db.update_task(tid, status=body["status"])
                     if body["status"] == "cancelled":
                         for r in db.q("SELECT dir FROM runs WHERE task=? AND status='running'", (tid,)):
-                            Path(r["dir"], "STOP").touch()
+                            if r["dir"]:
+                                Path(r["dir"], "STOP").touch()
                 if body.get("priority"):
                     db.update_task(tid, priority=int(body["priority"]))
                 return self._send(200, {"ok": True})

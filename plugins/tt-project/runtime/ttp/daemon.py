@@ -29,7 +29,7 @@ from . import runner
 from . import schedule as sched
 from . import screen as scr
 from . import worktree
-from .db import SEVERITY_RANK
+from .db import SEVERITY_RANK, dump_result, load_result
 from .project import Project, hostname, load_secrets
 from .providers import get_provider
 from .providers.base import last_json_object, service_path
@@ -59,6 +59,8 @@ class Daemon:
         self._slack = None
         self._last_cfg = 0.0
         self._last_slack = 0.0
+        self._reap_errors: dict[int, int] = {}
+        self._start_failures = 0
 
     # lifecycle ------------------------------------------------------------------------------------
     def run(self) -> int:
@@ -93,10 +95,10 @@ class Daemon:
         if now - self._last_cfg > 10:
             self.cfg, self._last_cfg = self.p.config(), now
             self.jev = Jev(self.cfg, db=self.p.db)
-        if self.p.db.kv("paused", False):
-            self.reap_runs()
-            return
         self.reap_runs()
+        self.reconcile_tasks()
+        if self.p.db.kv("paused", False):
+            return
         self._refresh_meters()
         self.update_gates()
         self.run_schedules()
@@ -122,50 +124,125 @@ class Daemon:
                       (task["id"] if task else None, role, provider, model, effort, prov.account(), time.time(),
                        self.boot, "running", json.dumps(note or {})))
         run_dir = self.p.runs / str(run_id)
-        run_dir.mkdir(parents=True, exist_ok=True)
-        if system is not None:
-            (run_dir / "system.md").write_text(system)
-            if provider == "claude":
-                argv = _with_system_prompt(provider, argv, run_dir / "system.md")
-            else:   # no replaceable system prompt: the stable part leads the prompt instead
-                prompt = system + "\n\n" + prompt
-        (run_dir / "prompt.md").write_text(prompt)
-        runtime_dir = str(Path(__file__).resolve().parent.parent)
-        env = {**env, "TTP_RUN_DIR": str(run_dir), "TTP_PROJECT": str(self.p.base), "TTP_RUN_ID": str(run_id),
-               "TTP_TASK": str(task["id"]) if task else "", "PYTHONPATH": runtime_dir,
-               "PATH": f"{self.p.harness / 'bin'}:{service_path()}:{os.environ.get('PATH', '')}"}
-        tout = timeout_s or self.cfg["budget"]["run_timeout_s"].get(tier, 3600)
-        stall = self.cfg["budget"].get("stall_s", {}).get(tier) if role != "coordinator" else None
-        spec = {"argv": argv, "env": env, "cwd": cwd, "timeout_s": tout, "provider": provider, "stall_s": stall,
-                "budget_usd": budget_usd if provider not in ("claude",) else None}
-        (run_dir / "run.json").write_text(json.dumps(spec, indent=1))
-        with open(run_dir / "runner.log", "wb") as out:
-            proc = subprocess.Popen([sys.executable, "-m", "ttp.runner", str(run_dir)], cwd=runtime_dir,
-                                    env={**os.environ, "PYTHONPATH": runtime_dir}, stdout=out, stderr=out,
-                                    stdin=subprocess.DEVNULL, start_new_session=True)
-        db.x("UPDATE runs SET pid=?, dir=? WHERE id=?", (proc.pid, str(run_dir), run_id))
+        # Raising from here on means nothing was launched: the run row must not stay "running".
+        try:
+            run_dir.mkdir(parents=True, exist_ok=True)
+            if system is not None:
+                (run_dir / "system.md").write_text(system)
+                if provider == "claude":
+                    argv = _with_system_prompt(provider, argv, run_dir / "system.md")
+                else:   # no replaceable system prompt: the stable part leads the prompt instead
+                    prompt = system + "\n\n" + prompt
+            (run_dir / "prompt.md").write_text(prompt)
+            runtime_dir = str(Path(__file__).resolve().parent.parent)
+            env = {**env, "TTP_RUN_DIR": str(run_dir), "TTP_PROJECT": str(self.p.base), "TTP_RUN_ID": str(run_id),
+                   "TTP_TASK": str(task["id"]) if task else "", "PYTHONPATH": runtime_dir,
+                   "PATH": f"{self.p.harness / 'bin'}:{service_path()}:{os.environ.get('PATH', '')}"}
+            tout = timeout_s or self.cfg["budget"]["run_timeout_s"].get(tier, 3600)
+            stall = self.cfg["budget"].get("stall_s", {}).get(tier) if role != "coordinator" else None
+            spec = {"argv": argv, "env": env, "cwd": cwd, "timeout_s": tout, "provider": provider, "stall_s": stall,
+                    "budget_usd": budget_usd if provider not in ("claude",) else None}
+            (run_dir / "run.json").write_text(json.dumps(spec, indent=1))
+            with open(run_dir / "runner.log", "wb") as out:
+                proc = subprocess.Popen([sys.executable, "-m", "ttp.runner", str(run_dir)], cwd=runtime_dir,
+                                        env={**os.environ, "PYTHONPATH": runtime_dir}, stdout=out, stderr=out,
+                                        stdin=subprocess.DEVNULL, start_new_session=True)
+        except BaseException:
+            db.x("UPDATE runs SET status='failed', ended=? WHERE id=?", (time.time(), run_id))
+            raise
+        try:
+            db.x("UPDATE runs SET pid=?, dir=? WHERE id=?", (proc.pid, str(run_dir), run_id))
+        except Exception as e:   # launched all the same: the reaper finds it by its run id's directory
+            log(self.p, f"run {run_id} started but its pid was not recorded: {e}")
         log(self.p, f"run {run_id} start role={role} provider={provider} tier={tier} task={task and task['id']}")
         return run_id
 
+    def _run_dir(self, r: dict) -> Path:
+        # A row whose start was cut short has no dir recorded; its directory is still named by its id.
+        return Path(r["dir"]) if r["dir"] else self.p.runs / str(r["id"])
+
+    def _run_alive(self, r: dict) -> bool:
+        """The run's supervisor still lives: it renews the lease, or its process is up on this boot."""
+        run_dir = self._run_dir(r)
+        if (run_dir / "exit.json").exists():
+            return False
+        try:
+            fresh = time.time() - (run_dir / "lease").stat().st_mtime <= LEASE_STALE_S
+        except OSError:
+            fresh = False
+        return fresh or (r["boot_id"] == self.boot and bool(r["pid"]) and _alive(r["pid"]))
+
     def reap_runs(self) -> None:
-        db = self.p.db
-        for r in db.q("SELECT * FROM runs WHERE status='running'"):
-            run_dir = Path(r["dir"] or self.p.runs / str(r["id"]))
-            exit_file = run_dir / "exit.json"
-            if exit_file.exists():
-                self.finish_run(r, json.loads(exit_file.read_text()))
+        for r in self.p.db.q("SELECT * FROM runs WHERE status='running'"):
+            try:
+                exit_file = self._run_dir(r) / "exit.json"
+                if exit_file.exists():
+                    self.finish_run(r, _read_result(exit_file) or {"rc": -1, "stopped": "lost", "ended": time.time()})
+                elif not self._run_alive(r):
+                    self.finish_run(r, {"rc": -1, "stopped": "lost", "ended": time.time()})
+                self._reap_errors.pop(r["id"], None)
+            except Exception:
+                # One run whose end cannot be processed must not hold up the others or wedge the loop.
+                n = self._reap_errors[r["id"]] = self._reap_errors.get(r["id"], 0) + 1
+                log(self.p, f"run {r['id']} reap error {n}: " + traceback.format_exc().replace("\n", " | ")[:2000])
+                if n >= 3:
+                    self._abandon_run(r)
+
+    def _abandon_run(self, r: dict) -> None:
+        """Last resort for a run whose end keeps failing to process: close it so it cannot block the
+        loop. Its task fails with the reason and the coordinator decides; a coordinator turn backs off."""
+        db, now = self.p.db, time.time()
+        why = f"run {r['id']} ended but its result could not be processed (details in the daemon log)"
+        try:
+            with db.tx():
+                db.x("UPDATE runs SET status='failed', ended=? WHERE id=? AND status='running'", (now, r["id"]))
+                if r["role"] == "coordinator":
+                    self._coordinator_failed(why)
+                elif r["task"] and (db.task(r["task"]) or {}).get("status") == "running":
+                    db.update_task(r["task"], status="failed", blocked_reason=why)
+                    db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                         (now, f"task:{r['task']}", "task_failed", "normal", f"#{r['task']}: {why}", "queued",
+                          r["task"]))
+            self._reap_errors.pop(r["id"], None)
+            log(self.p, f"run {r['id']} abandoned after repeated reap errors")
+        except Exception:
+            log(self.p, f"run {r['id']} could not be abandoned: " + traceback.format_exc().replace("\n", " | ")[:2000])
+
+    def reconcile_tasks(self) -> None:
+        """Repair task states nothing else would. A task marked running with no live run (the daemon
+        stopped between marking it and starting the run) goes back to the queue with no attempt spent.
+        A queued task whose dependency failed, was cancelled or does not exist is blocked with the
+        reason instead of waiting forever. That event does not start a turn: the dependency's own
+        event already does, and a turn per block could ping-pong with a requeue."""
+        db, now = self.p.db, time.time()
+        for t in db.q("SELECT * FROM tasks WHERE status='running' AND NOT EXISTS "
+                      "(SELECT 1 FROM runs WHERE runs.task=tasks.id AND runs.status='running')"):
+            last = db.one("SELECT * FROM runs WHERE task=? ORDER BY id DESC LIMIT 1", (t["id"],))
+            if last and self._run_alive(last):
                 continue
-            lease = run_dir / "lease"
-            stale = (not lease.exists()) or time.time() - lease.stat().st_mtime > LEASE_STALE_S
-            gone = r["boot_id"] != self.boot or not (r["pid"] and _alive(r["pid"]))
-            if stale and gone:
-                self.finish_run(r, {"rc": -1, "stopped": "lost", "ended": time.time()})
+            with db.tx():
+                db.update_task(t["id"], status="queued")
+                db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                     (now, "daemon", "task_requeued", "low", f"#{t['id']} {t['title']} was marked running with no "
+                      f"live run; queued again, no attempt spent", "handled", t["id"]))
+            log(self.p, f"task {t['id']} requeued: marked running with no live run")
+        for t, dep, why in db.dead_dependencies():
+            reason = f"dependency #{dep} {why}" if dep is not None else "a dependency is not a task id"
+            with db.tx():
+                db.update_task(t["id"], status="blocked", blocked_reason=reason)
+                db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                     (now, "daemon", "task_blocked", "normal", f"#{t['id']} {t['title']} is blocked: {reason}. "
+                      f"Requeue it once the dependency is redone, or cancel it.", "handled", t["id"]))
 
     def finish_run(self, r: dict, exit_info: dict) -> None:
         db, p = self.p.db, self.p
-        run_dir = Path(r["dir"])
+        run_dir = self._run_dir(r)
         prov = get_provider(r["provider"])
         usage = prov.parse(run_dir / "output.jsonl", run_dir / "stderr.log")
+        if usage.estimated and not usage.cost_usd:
+            usage.cost_usd = bud.estimate_cost(db, self.cfg, r["provider"], r["model"] or "", {
+                "input": usage.input_tokens, "output": usage.output_tokens,
+                "cache_read": usage.cache_read_tokens, "cache_write": usage.cache_write_tokens})
         stopped = exit_info.get("stopped")
         status = "ok" if exit_info.get("rc") == 0 and not usage.error else "failed"
         if stopped in ("timeout", "budget", "stopped", "lost", "stalled"):
@@ -175,41 +252,47 @@ class Daemon:
         if usage.auth_failed:
             status = "auth"
         source = self._source_for(r)
-        db.x("UPDATE runs SET ended=?, status=?, exit_code=?, cost_usd=?, cost_estimated=?, input_tokens=?, "
-             "output_tokens=?, cache_read_tokens=?, cache_write_tokens=? WHERE id=?",
-             (exit_info.get("ended", time.time()), status, exit_info.get("rc"), usage.cost_usd, int(usage.estimated),
-              usage.input_tokens, usage.output_tokens, usage.cache_read_tokens, usage.cache_write_tokens, r["id"]))
-        db.spend(r["provider"], usage.cost_usd, source, account=r["account"] or "", estimated=usage.estimated,
-                 tokens_in=usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens,
-                 tokens_out=usage.output_tokens)
-        if r["task"]:
-            db.x("UPDATE tasks SET spent_usd=COALESCE(spent_usd,0)+? WHERE id=?", (usage.cost_usd, r["task"]))
-        wins = usage.extra.get("windows")
-        if wins and r["provider"] == "claude":
-            bud.record_windows(db, as_windows(wins, r["account"] or ""))
-        elif wins:
-            bud.record_windows(db, [bud.Window(r["provider"], w["window"], w["utilization"], w.get("resets_at"),
-                                               r["account"] or "") for w in wins])
-        if usage.limited:
-            until = time.time() + 3600
-            db.set_kv(f"limited:{r['provider']}", {"until": until, "note": usage.limit_note})
-            self.alert(f"limit:{r['provider']}",
-                       f"{r['provider']} refused work: {usage.limit_note}. Heavy work on it is paused for an hour; "
-                       f"the account ({r['account'] or 'unknown'}) may need more credits or a higher cap.", "high")
-        if usage.auth_failed:
-            # Logged out is not a task failure and not worth retrying blindly: pause this provider,
-            # say exactly how to fix it, and probe again every 15 minutes (a cheap decision turn).
-            db.set_kv(f"limited:{r['provider']}", {"until": time.time() + 900, "note": "logged out"})
-            self.alert(f"auth:{r['provider']}",
-                       f"{r['provider']} on {hostname()} is logged out ({(usage.final_text or usage.error)[:120]}). "
-                       f"Log in once on that machine (for Claude Code: run `claude` there and use /login). "
-                       f"Work resumes by itself; queued messages are kept.", "high", every_s=4 * 3600)
-        log(p, f"run {r['id']} end status={status} cost=${usage.cost_usd:.3f} role={r['role']}")
-        note = json.loads(r["note"] or "{}")
-        if r["role"] == "coordinator":
-            self._finish_coordinator(r, usage, status, note)
-        else:
-            self._finish_worker(r, usage, status, run_dir)
+        # The run's end, its spend and what it did to its task commit together: a daemon stopped
+        # half way leaves the run "running", and the next tick processes it again from disk.
+        with db.tx():
+            db.x("UPDATE runs SET ended=?, status=?, exit_code=?, cost_usd=?, cost_estimated=?, input_tokens=?, "
+                 "output_tokens=?, cache_read_tokens=?, cache_write_tokens=? WHERE id=?",
+                 (exit_info.get("ended", time.time()), status, exit_info.get("rc"), usage.cost_usd,
+                  int(usage.estimated), usage.input_tokens, usage.output_tokens, usage.cache_read_tokens,
+                  usage.cache_write_tokens, r["id"]))
+            db.spend(r["provider"], usage.cost_usd, source, account=r["account"] or "", estimated=usage.estimated,
+                     tokens_in=usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens,
+                     tokens_out=usage.output_tokens)
+            if r["task"]:
+                db.x("UPDATE tasks SET spent_usd=COALESCE(spent_usd,0)+? WHERE id=?", (usage.cost_usd, r["task"]))
+            wins = usage.extra.get("windows")
+            if wins and r["provider"] == "claude":
+                bud.record_windows(db, as_windows(wins, r["account"] or ""))
+            elif wins:
+                bud.record_windows(db, [bud.Window(r["provider"], w["window"], w["utilization"], w.get("resets_at"),
+                                                   r["account"] or "") for w in wins])
+            if usage.limited:
+                until = time.time() + 3600
+                db.set_kv(f"limited:{r['provider']}", {"until": until, "note": usage.limit_note})
+                self.alert(f"limit:{r['provider']}",
+                           f"{r['provider']} refused work: {usage.limit_note}. Heavy work on it is paused for an "
+                           f"hour; the account ({r['account'] or 'unknown'}) may need more credits or a higher cap.",
+                           "high")
+            if usage.auth_failed:
+                # Logged out is not a task failure and not worth retrying blindly: pause this provider,
+                # say exactly how to fix it, and probe again every 15 minutes (a cheap decision turn).
+                db.set_kv(f"limited:{r['provider']}", {"until": time.time() + 900, "note": "logged out"})
+                self.alert(f"auth:{r['provider']}",
+                           f"{r['provider']} on {hostname()} is logged out ({(usage.final_text or usage.error)[:120]}). "
+                           f"Log in once on that machine (for Claude Code: run `claude` there and use /login). "
+                           f"Work resumes by itself; queued messages are kept.", "high", every_s=4 * 3600)
+            note = json.loads(r["note"] or "{}")
+            if r["role"] == "coordinator":
+                self._finish_coordinator(r, usage, status, note)
+            else:
+                self._finish_worker(r, usage, status, run_dir)
+        log(p, f"run {r['id']} end status={status} cost=${usage.cost_usd:.3f}"
+               f"{' (estimated)' if usage.estimated else ''} role={r['role']}")
 
     def _source_for(self, r: dict) -> str:
         if r["role"] == "coordinator":
@@ -224,16 +307,13 @@ class Daemon:
         db = self.p.db
         out = usage.structured if isinstance(usage.structured, dict) else last_json_object(usage.final_text or "")
         actions = (out or {}).get("actions")
+        if status == "lost" and not r["dir"]:
+            return   # never launched, so not a failed turn: its messages and events stay queued
         if status == "auth":
             db.set_kv("coordinator_backoff_until", time.time() + 900)
             return
         if status != "ok" or not isinstance(actions, list):
-            fails = int(db.kv("coordinator_failures", 0)) + 1
-            db.set_kv("coordinator_failures", fails)
-            db.set_kv("coordinator_backoff_until", time.time() + min(1800, 30 * 2 ** fails))
-            if fails >= 3:
-                self.alert("coordinator", f"The coordinator failed {fails} turns in a row (last: {status} "
-                           f"{usage.error[:200]}). Messages are queued, not lost.", "high")
+            self._coordinator_failed(f"{status} {usage.error[:200]}")
             return
         db.set_kv("coordinator_failures", 0)
         default_chat = note.get("default_chat")
@@ -249,6 +329,15 @@ class Daemon:
                  (time.time(), "daemon", "rejected_actions", "normal", "; ".join(problems)[:1500], "queued"))
         db.set_kv("last_coordinator_summary", {"ts": time.time(), "summary": (out or {}).get("summary", "")})
 
+    def _coordinator_failed(self, why: str) -> None:
+        db = self.p.db
+        fails = int(db.kv("coordinator_failures", 0)) + 1
+        db.set_kv("coordinator_failures", fails)
+        db.set_kv("coordinator_backoff_until", time.time() + min(1800, 30 * 2 ** fails))
+        if fails >= 3:
+            self.alert("coordinator", f"The coordinator failed {fails} turns in a row (last: {why}). "
+                       f"Messages are queued, not lost.", "high")
+
     def _finish_worker(self, r: dict, usage, status: str, run_dir: Path) -> None:
         db = self.p.db
         task = db.task(r["task"]) if r["task"] else None
@@ -258,9 +347,9 @@ class Daemon:
         if task["status"] == "cancelled":
             # Cancelled while this run was ending: the decision stands. Keep what the run produced,
             # and tell the coordinator only if the work actually got done.
-            summary = (result.get("summary") if isinstance(result, dict) else "") or ""
-            db.update_task(task["id"], result=json.dumps({"summary": summary, "status": "cancelled",
-                                                          "run_status": status})[:20000])
+            summary = str((result.get("summary") if isinstance(result, dict) else "") or "")
+            db.update_task(task["id"], result=dump_result({"summary": summary, "status": "cancelled",
+                                                           "run_status": status}))
             if isinstance(result, dict) and result.get("status") == "done":
                 db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                      (time.time(), f"task:{task['id']}", "cancelled_but_done", "normal",
@@ -268,7 +357,7 @@ class Daemon:
                       f"{summary[:800]}", "queued", task["id"]))
             return
         rstatus = result.get("status") if isinstance(result, dict) else None
-        summary = (result.get("summary") if isinstance(result, dict) else None) or (usage.final_text or "")[:1500]
+        summary = str((result.get("summary") if isinstance(result, dict) else None) or (usage.final_text or "")[:1500])
         waiting = status == "ok" and rstatus == "waiting"
         if waiting:
             new = "queued"   # a busy resource is not a failed attempt: the task comes back later
@@ -288,25 +377,28 @@ class Daemon:
         not_before = None
         if waiting:
             try:
-                waits = int(json.loads(task["result"] or "{}").get("waits") or 0) + 1
-            except (ValueError, AttributeError):
+                waits = int(load_result(task["result"]).get("waits") or 0) + 1
+            except (TypeError, ValueError):
                 waits = 1
             what = str(result.get("waiting_for") or summary)[:300]
             extra["waits"] = waits
             if waits > int(self.cfg["budget"].get("max_waits", 24)):
                 new, reason = "blocked", f"still waiting after {waits} tries: {what}"
             else:
-                retry = min(max(float(result.get("retry_after_s") or 1800), 300.0), 6 * 3600.0)
+                try:
+                    retry = min(max(float(result.get("retry_after_s") or 1800), 300.0), 6 * 3600.0)
+                except (TypeError, ValueError):
+                    retry = 1800.0
                 not_before = time.time() + retry
                 reason = f"waiting for {what}; next try {time.strftime('%H:%M', time.localtime(not_before))}"
-        upd = {"status": new, "attempts": attempts, "result": json.dumps(
+        upd = {"status": new, "attempts": attempts, "result": dump_result(
             {"summary": summary, "status": rstatus or status, **extra,
              **({k: v for k, v in result.items() if k not in ("summary", "waits")}
-                if isinstance(result, dict) else {})})[:20000]}
+                if isinstance(result, dict) else {})})}
         if reason:
             upd["blocked_reason"] = reason[:500]
         elif new == "blocked":
-            upd["blocked_reason"] = (result.get("question") or result.get("blocked_reason") or summary)[:500]
+            upd["blocked_reason"] = str(result.get("question") or result.get("blocked_reason") or summary)[:500]
         if not_before:
             upd["not_before"] = not_before
         elif new == "queued" and status not in ("limit", "auth"):
@@ -324,15 +416,18 @@ class Daemon:
             chat = None if task["reply_chat"] == "all" else task["reply_chat"]
             db.post("out", text[:6000], chat=chat, kind="reply", severity="normal")
         sev = "high" if new == "blocked" else "normal"
+        fups = result.get("followups") if isinstance(result, dict) else None
+        fups = [f for f in fups if isinstance(f, dict) and f.get("title")] if isinstance(fups, list) else []
+        text = (f"#{task['id']} {task['title']} → {new} (run {status}, {'~' if usage.estimated else ''}"
+                f"${usage.cost_usd:.2f}): {summary[:1200]}")
+        if len(fups) > 5:
+            text += " | more proposed follow-ups: " + "; ".join(str(f["title"])[:120] for f in fups[5:])[:1500]
         db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
-             (time.time(), f"task:{task['id']}", f"task_{new}", sev,
-              f"#{task['id']} {task['title']} → {new} (run {status}, ${usage.cost_usd:.2f}): {summary[:1200]}",
-              "queued", task["id"]))
-        for f in (result.get("followups") or [])[:5] if isinstance(result, dict) else []:
-            if isinstance(f, dict) and f.get("title"):
-                db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
-                     (time.time(), f"task:{task['id']}", "followup_proposed", "normal",
-                      f"proposed follow-up: {f['title']} — {str(f.get('spec', ''))[:600]}", "queued", task["id"]))
+             (time.time(), f"task:{task['id']}", f"task_{new}", sev, text, "queued", task["id"]))
+        for f in fups[:5]:
+            db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                 (time.time(), f"task:{task['id']}", "followup_proposed", "normal",
+                  f"proposed follow-up: {f['title']} — {str(f.get('spec', ''))[:600]}", "queued", task["id"]))
 
     # money ----------------------------------------------------------------------------------------
     def _refresh_meters(self, every_s: float = 600) -> None:
@@ -492,14 +587,21 @@ class Daemon:
         if lim and lim.get("until", 0) > now:
             return   # provider paused (logged out or at its limit); the pause expiry is the retry
         gates = {k: v.as_dict() for k, v in self.gates.items()}
-        prompt = coord.digest(self.p, gates, [e["id"] for e in evs], [m["id"] for m in msgs])
         default_chat = msgs[-1]["chat"] if msgs else None
         provider = self.cfg.get("core_provider", "claude")
-        self.start_run("coordinator", prompt, provider, c.get("tier", "light"), str(self.p.base),
-                       read_only=True, schema=coord.ACTIONS_SCHEMA, system=coord.system_prompt(self.p),
-                       budget_usd=float(c.get("turn_budget_usd", 1.0)), timeout_s=float(c.get("turn_timeout_s", 600)),
-                       note={"messages": [m["id"] for m in msgs], "events": [e["id"] for e in evs],
-                             "default_chat": default_chat})
+        try:
+            prompt = coord.digest(self.p, gates, [e["id"] for e in evs], [m["id"] for m in msgs])
+            self.start_run("coordinator", prompt, provider, c.get("tier", "light"), str(self.p.base),
+                           read_only=True, schema=coord.ACTIONS_SCHEMA, system=coord.system_prompt(self.p),
+                           budget_usd=float(c.get("turn_budget_usd", 1.0)),
+                           timeout_s=float(c.get("turn_timeout_s", 600)),
+                           note={"messages": [m["id"] for m in msgs], "events": [e["id"] for e in evs],
+                                 "default_chat": default_chat})
+        except Exception as e:
+            # A turn that cannot even start backs off like a failed turn instead of retrying every tick.
+            log(self.p, "coordinator start failed: " + traceback.format_exc().replace("\n", " | ")[:2000])
+            self._coordinator_failed(f"could not start: {type(e).__name__}: {e}"[:250])
+            return
         db.set_kv("last_coordinator_turn", now)
 
     # workers ----------------------------------------------------------------------------------------
@@ -531,12 +633,32 @@ class Daemon:
                 db.update_task(task["id"], status="blocked", blocked_reason=f"workspace: {e}"[:400])
                 continue
             from .prompts import worker_prompt
-            prompt = worker_prompt(self.p, task, cwd, branch)
-            db.update_task(task["id"], status="running", branch=branch, blocked_reason=None)
-            self.start_run("worker" if task["kind"] != "review" else "reviewer", prompt, provider, tier, cwd,
-                           task=task, budget_usd=max(remaining, 0.5) if task["budget_usd"] else None,
-                           read_only=False)
+            try:
+                prompt = worker_prompt(self.p, task, cwd, branch)
+                db.update_task(task["id"], status="running", branch=branch, blocked_reason=None)
+                self.start_run("worker" if task["kind"] != "review" else "reviewer", prompt, provider, tier, cwd,
+                               task=task, budget_usd=max(remaining, 0.5) if task["budget_usd"] else None,
+                               read_only=False)
+            except Exception as e:
+                self._start_failed(task, e)
+                continue
+            self._start_failures = 0
             busy[provider] = busy.get(provider, 0) + 1
+
+    def _start_failed(self, task: dict, e: Exception) -> None:
+        """Nothing was launched, so no attempt is spent. The task waits a minute before the next try,
+        so a lasting cause (a full disk, a broken install) cannot spin; three failures in a row alert."""
+        db = self.p.db
+        why = f"could not start a run: {type(e).__name__}: {e}"[:400]
+        log(self.p, f"task {task['id']} {why}")
+        with db.tx():
+            db.update_task(task["id"], status="queued", not_before=time.time() + 60, blocked_reason=why)
+            db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                 (time.time(), "daemon", "run_start_failed", "low", f"#{task['id']} {task['title']}: {why}",
+                  "handled", task["id"]))
+        self._start_failures += 1
+        if self._start_failures >= 3:
+            self.alert("run-start", f"Runs cannot start ({why}). Tasks stay queued and retry every minute.", "high")
 
     def _resources_free(self, task: dict) -> bool:
         """Tasks labelled `resource:<name>` share that resource's slot count (config `resources`),

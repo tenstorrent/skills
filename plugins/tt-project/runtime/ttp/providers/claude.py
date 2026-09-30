@@ -15,6 +15,8 @@ from . import register
 from ..budget import Window
 from .base import AUTH_RE, LIMIT_RE, Provider, RunUsage
 
+USAGE_KEYS = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+
 
 @register
 class Claude(Provider):
@@ -63,18 +65,20 @@ class Claude(Provider):
     def parse(self, output_path, stderr_path=None) -> RunUsage:
         u = RunUsage()
         last_text = ""
-        est_in = est_out = est_cr = est_cw = 0
-        for ev in self._events(output_path):
+        saw_result = False
+        # One API message streams as several events (one per content block), each repeating its
+        # usage: count every message id once, at its highest reading.
+        per_msg: dict[str, dict[str, int]] = {}
+        for n, ev in enumerate(self._events(output_path)):
             t = ev.get("type")
             if t == "rate_limit_event":
                 u.extra["windows"] = windows_from_event(ev)
             elif t == "assistant":
                 msg = ev.get("message") or {}
                 us = msg.get("usage") or {}
-                est_in += int(us.get("input_tokens") or 0)
-                est_out += int(us.get("output_tokens") or 0)
-                est_cr += int(us.get("cache_read_input_tokens") or 0)
-                est_cw += int(us.get("cache_creation_input_tokens") or 0)
+                seen = per_msg.setdefault(str(msg.get("id") or f"event-{n}"), {})
+                for k in USAGE_KEYS:
+                    seen[k] = max(seen.get(k, 0), int(us.get(k) or 0))
                 for block in msg.get("content") or []:
                     if isinstance(block, dict) and block.get("type") == "text":
                         last_text = block.get("text") or last_text
@@ -82,6 +86,7 @@ class Claude(Provider):
                 u.session_id = ev.get("session_id", "")
                 u.extra["model"] = ev.get("model", "")
             elif t == "result":
+                saw_result = True
                 usage = ev.get("usage") or {}
                 u.cost_usd = float(ev.get("total_cost_usd") or 0.0)
                 u.input_tokens = int(usage.get("input_tokens") or 0)
@@ -94,11 +99,12 @@ class Claude(Provider):
                     u.error = f"{ev.get('subtype')}: {str(ev.get('result'))[:300]}"
                 u.extra["subtype"] = ev.get("subtype")
                 u.session_id = ev.get("session_id", u.session_id)
-        if not u.final_text and not u.cost_usd:
-            # Killed before the result line: fall back to what the stream showed.
+        if not saw_result:
+            # Ended before the result line (killed, lost): the tokens the stream showed are all there
+            # is. The cost is left to the daemon, which prices them at this project's observed rate.
             u.final_text = last_text
-            u.input_tokens, u.output_tokens = est_in, est_out
-            u.cache_read_tokens, u.cache_write_tokens = est_cr, est_cw
+            u.input_tokens, u.output_tokens, u.cache_read_tokens, u.cache_write_tokens = (
+                sum(m[k] for m in per_msg.values()) for k in USAGE_KEYS)
             u.estimated = True
         for ev in self._events(output_path):
             if ev.get("type") == "assistant" and ev.get("error") == "authentication_failed":

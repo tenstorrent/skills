@@ -4,8 +4,7 @@
 Templates live in the project's own harness (prompts/*.md), so each project can tune them."""
 from __future__ import annotations
 
-import json
-
+from .db import load_result
 from .project import Project
 
 
@@ -52,12 +51,9 @@ def worker_prompt(p: Project, task: dict, cwd: str, branch: str | None) -> str:
     if mem:
         parts.append("# PROJECT MEMORY\n" + mem)
     history = ""
-    if task["result"]:
-        try:
-            prev = json.loads(task["result"])
-            history = f"\nPrevious attempt ended '{prev.get('status')}': {prev.get('summary', '')[:1500]}\n"
-        except ValueError:
-            pass
+    prev = load_result(task["result"])
+    if prev:
+        history = f"\nPrevious attempt ended '{prev.get('status')}': {str(prev.get('summary') or '')[:1500]}\n"
     delivery = cfg.get("delivery", {})
     parts.append(
         f"# YOUR TASK #{task['id']}: {task['title']}\n"

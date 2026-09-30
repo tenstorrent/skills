@@ -101,5 +101,7 @@ Design notes, invariants and how to add a provider: [docs/design.md](docs/design
 ## Limits
 
 - Codex and Cursor report tokens but no cost; their spend is estimated from a price table.
+- A Claude run cut off before its final report is estimated from its streamed tokens. A Cursor run
+  cut off the same way is recorded at $0: Cursor reports usage only when it exits.
 - Cursor has no reasoning-effort flag; tiers map to model names.
 - A laptop pauses while it sleeps. Use an always-on machine for round-the-clock work.
