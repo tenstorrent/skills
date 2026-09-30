@@ -5,5 +5,6 @@
   {"name": "daily-review", "kind": "llm", "every": "1d", "at": "04:30", "enabled": true,
    "budget_usd_day": 4.0,
    "description": "Assess progress, spend, quality and harness friction; propose at most 5 improvements.",
-   "payload": {"prompt": "daily-review.md", "tier": "standard", "kind": "work", "priority": 4}}
+   "payload": {"prompt": "daily-review.md", "tier": "standard", "kind": "work", "priority": 4,
+               "skip_if_idle": true}}
 ]

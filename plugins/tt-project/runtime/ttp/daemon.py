@@ -587,8 +587,13 @@ class Daemon:
                     f"\n- {str(x['path'])[:200]}: {str(x.get('why', ''))[:160]}" for x in plugs)
         if len(fups) > 5:
             text += " | more proposed follow-ups: " + "; ".join(str(f["title"])[:120] for f in fups[5:])[:1500]
+        # A retry the daemon already scheduled, after a refusal (which has its own alert) or a run that
+        # ended without a verdict, leaves nothing to decide: the final attempt's outcome starts the turn.
+        # A timeout still does, since the task may need splitting before it times out again.
+        quiet = new == "queued" and status in ("limit", "auth", "failed", "lost", "stalled", "no_handoff")
         db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
-             (time.time(), f"task:{task['id']}", f"task_{new}", sev, text, "queued", task["id"]))
+             (time.time(), f"task:{task['id']}", f"task_{new}", sev, text, "handled" if quiet else "queued",
+              task["id"]))
         for f in fups[:5]:
             db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                  (time.time(), f"task:{task['id']}", "followup_proposed", "normal",
@@ -698,6 +703,11 @@ class Daemon:
         if db.one("SELECT id FROM tasks WHERE origin='schedule' AND labels=? AND status NOT IN "
                   "('done','failed','cancelled')", (json.dumps([s["name"]]),)):
             return "skipped: previous run still open"
+        # A review of a period with no work and no user message would report that nothing moved.
+        # The built-in daily review opts in by name, so projects created before the flag get it too.
+        if payload.get("skip_if_idle", s["name"] == "daily-review") and s["last_run"] and not self._active_since(
+                float(s["last_run"]), s["name"]):
+            return "skipped: nothing happened since the last run"
         spec = payload.get("spec") or s["description"]
         prompt_file = payload.get("prompt")
         if prompt_file and (self.p.harness / "prompts" / prompt_file).exists():
@@ -706,6 +716,15 @@ class Daemon:
                     tier=payload.get("tier", "standard"), priority=int(payload.get("priority", 4)),
                     budget_usd=s["budget_usd_day"], origin="schedule", labels=[s["name"]])
         return "queued"
+
+    def _active_since(self, since: float, schedule: str) -> bool:
+        """Whether any worker ran, other than this schedule's own, or the user wrote, since `since`."""
+        db = self.p.db
+        return bool(db.one("SELECT id FROM messages WHERE direction='in' AND ts>?", (since,))
+                    or db.one("SELECT runs.id FROM runs LEFT JOIN tasks ON tasks.id=runs.task "
+                              "WHERE runs.role!='coordinator' AND runs.started>? AND NOT "
+                              "(COALESCE(tasks.origin,'')='schedule' AND COALESCE(tasks.labels,'')=?)",
+                              (since, json.dumps([schedule]))))
 
     def observe(self, source: str, text: str, hint: str | None = None) -> None:
         if not text.strip():

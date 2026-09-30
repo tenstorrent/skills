@@ -1368,6 +1368,64 @@ def test_a_run_without_a_handoff_is_retried_not_done(env, monkeypatch):
     assert "without a hand-off" in load_result_summary(t)
 
 
+
+def test_an_automatic_retry_does_not_wake_the_coordinator_but_the_final_failure_does(env, monkeypatch):
+    p = make(env)
+    from ttp.daemon import Daemon
+    monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps({"summary": "stopped mid-way"}))
+    p.db.x("UPDATE messages SET handled=1")
+    tid = p.db.add_task("baseline", "build and time it", kind="work", tier="light", origin="user", max_attempts=2)
+    d = Daemon(p.base)
+    d.maybe_coordinate = lambda: None   # keep events where the daemon left them
+    assert _run_until(d, p, lambda: p.db.task(tid)["attempts"] == 1
+                      and not p.db.q("SELECT id FROM runs WHERE status='running'"))
+    assert p.db.task(tid)["status"] == "queued"
+    ev = p.db.one("SELECT * FROM events WHERE task=? AND kind='task_queued'", (tid,))
+    assert ev and ev["status"] == "handled", "an automatic retry started a coordinator turn"
+    p.db.update_task(tid, not_before=0)
+    assert _run_until(d, p, lambda: p.db.task(tid)["status"] == "failed")
+    ev = p.db.one("SELECT * FROM events WHERE task=? AND kind='task_failed'", (tid,))
+    assert ev and ev["status"] == "queued", "the final failure must reach the coordinator"
+
+
+def test_a_refused_run_requeues_without_waking_the_coordinator(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage as Usage
+    tid = p.db.add_task("job", "spec", kind="work", tier="light", origin="user")
+    p.db.update_task(tid, status="running")
+    d = Daemon(p.base)
+    run = {"task": tid}
+    d._finish_worker(run, Usage(final_text="usage limit reached"), "limit", env["tmp"])
+    assert p.db.task(tid)["status"] == "queued" and p.db.task(tid)["attempts"] == 0
+    assert not p.db.q("SELECT id FROM events WHERE task=? AND status='queued'", (tid,)), \
+        "a provider refusal has its own alert; the coordinator has nothing to decide"
+
+
+def test_the_daily_review_skips_a_day_with_no_activity(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    old = time.time() - 2 * 86400
+    p.db.x("UPDATE messages SET ts=?", (old,))
+    own = p.db.add_task("[daily-review] last one", "x", origin="schedule", status="done")
+    p.db.x("UPDATE tasks SET labels=? WHERE id=?", (json.dumps(["daily-review"]), own))
+    p.db.x("INSERT INTO runs(task,role,provider,started,status) VALUES(?,?,?,?,?)",
+           (own, "worker", "fake", old + 3700, "ok"))
+    p.db.x("UPDATE schedules SET last_run=?, next_run=? WHERE name='daily-review'", (old + 3600, time.time() - 60))
+    d = Daemon(p.base)
+    d.gates = {}
+    d.run_schedules()
+    s = p.db.one("SELECT * FROM schedules WHERE name='daily-review'")
+    assert s["last_status"].startswith("skipped: nothing"), s["last_status"]
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='schedule'")["n"] == 1
+    tid = p.db.add_task("real work", "x", kind="work", tier="light", origin="user")
+    p.db.x("INSERT INTO runs(task,role,provider,started,status) VALUES(?,?,?,?,?)",
+           (tid, "worker", "fake", time.time() - 600, "ok"))
+    p.db.x("UPDATE schedules SET last_run=?, next_run=? WHERE name='daily-review'", (old + 3600, time.time() - 60))
+    d.run_schedules()
+    assert p.db.one("SELECT last_status FROM schedules WHERE name='daily-review'")["last_status"] == "queued"
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='schedule'")["n"] == 2
+
 def load_result_summary(task) -> str:
     return json.loads(task["result"] or "{}").get("summary", "")
 

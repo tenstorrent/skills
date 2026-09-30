@@ -26,6 +26,8 @@ in `state/runs/<id>/`, so a daemon restart never loses a result.
 
 1. Models never poll. The daemon polls; a model runs only for a decision or a task.
 2. At most one coordinator turn at a time; turns are debounced, batched and capped per hour.
+   A retry the daemon schedules by itself (after a refusal or a run with no verdict) starts no
+   turn; the final attempt's outcome does. The daily review skips a period with no work.
 3. No run starts when its provider's gate forbids it. Every run has a wall clock and a budget.
 4. A run's outcome is read from files, never a pipe. Runs survive daemon restarts.
 5. A missed schedule fires once on wake, never once per missed slot.
