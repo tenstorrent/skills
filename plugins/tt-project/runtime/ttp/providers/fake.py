@@ -57,8 +57,9 @@ def _main(role: str) -> int:
             out = {"actions": actions or [{"type": "noop"}]}
     else:
         run_dir = Path(os.environ["TTP_RUN_DIR"])
-        (run_dir / "result.json").write_text(json.dumps(
-            {"status": "done", "summary": f"fake {role} finished", "followups": []}))
+        result = json.loads(os.environ.get("TTP_FAKE_RESULT") or "null") or {
+            "status": "done", "summary": f"fake {role} finished", "followups": []}
+        (run_dir / "result.json").write_text(json.dumps(result))
         out = {"ok": True}
     out["_cost"] = cost
     sys.stdout.write(json.dumps(out))

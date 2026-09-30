@@ -11,6 +11,7 @@ For people (and agents) changing tt-project itself. Users start with the plugin 
 | Runner | `runtime/ttp/runner.py` | detached supervisor per run: stdin prompt, lease, wall clock, budget, stall guard |
 | Coordinator | `runtime/ttp/coordinator.py` + `template/prompts/coordinator.md` | digest in, JSON actions out, validated before applying |
 | Workers | `runtime/ttp/prompts.py` + `template/prompts/worker.md`, `kind-*.md` | one task, one handoff (`result.json`) |
+| Mid-run updates | `runtime/ttp/hook.py` | rescopes reach a running worker: appended to `steer.md`, delivered once by a post-tool hook (Claude Code) or read between steps |
 | Budget | `runtime/ttp/budget.py` | gates per provider from plan windows or dollar caps, runaway guard |
 | Screening | `runtime/ttp/screen.py`, `providers/jev.py` | dedupe → rules → Jev → wake the coordinator or not |
 | Watchers, schedules | `runtime/ttp/watchers.py`, `schedule.py` | model-free probes that report changes only |
@@ -30,6 +31,8 @@ in `state/runs/<id>/`, so a daemon restart never loses a result.
 5. A missed schedule fires once on wake, never once per missed slot.
 6. Plan windows keep `reserve_pct` for the user. Usage-billed accounts have dollar caps.
 7. A limit or logout pauses a provider with one clear alert; it is never counted as task failure.
+   Neither is a `waiting` hand-off (busy machine or queue): the task retries later, up to
+   `budget.max_waits` times, then asks the user.
 8. The project folder ignores itself; nothing of a project is ever committed to the user's repo.
 9. Secrets live only in `~/.tt-project/secrets.json` (0600). Never in argv, logs or projects.
 10. The runtime is standard-library Python ≥ 3.9. Web assets are static files.

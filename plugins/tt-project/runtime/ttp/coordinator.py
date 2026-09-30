@@ -168,6 +168,12 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None) -> l
                 if a.get("spec"):
                     upd["spec"] = task["spec"] + "\n\n## Update\n" + a["spec"]
                 db.update_task(task["id"], **upd)
+                if a.get("spec") and task["status"] == "running":
+                    stamp = time.strftime("%Y-%m-%d %H:%M")
+                    for r in db.q("SELECT dir FROM runs WHERE task=? AND status='running'", (task["id"],)):
+                        if r["dir"]:
+                            with open(Path(r["dir"], "steer.md"), "a") as f:
+                                f.write(f"\n## Update {stamp}\n{a['spec'].strip()}\n")
                 if upd.get("status") == "cancelled":
                     for r in db.q("SELECT dir FROM runs WHERE task=? AND status='running'", (task["id"],)):
                         Path(r["dir"], "STOP").touch()

@@ -257,27 +257,56 @@ class Daemon:
         result = _read_result(run_dir / RESULT_FILE) or last_json_object(usage.final_text or "") or {}
         rstatus = result.get("status") if isinstance(result, dict) else None
         summary = (result.get("summary") if isinstance(result, dict) else None) or (usage.final_text or "")[:1500]
-        if status == "ok" and rstatus in ("done", "blocked", "failed", "needs_review", None):
+        waiting = status == "ok" and rstatus == "waiting"
+        if waiting:
+            new = "queued"   # a busy resource is not a failed attempt: the task comes back later
+        elif status == "ok" and rstatus in ("done", "blocked", "failed", "needs_review", None):
             new = {"done": "done", "blocked": "blocked", "failed": "failed", "needs_review": "review",
                    None: "done"}[rstatus]
         elif status in ("limit", "auth"):
             new = "queued"   # not an attempt: the account refused, the task did not fail
         else:
             new = "failed"
-        attempts = int(task["attempts"] or 0) + (0 if status in ("limit", "auth") else 1)
+        attempts = int(task["attempts"] or 0) + (0 if status in ("limit", "auth") or waiting else 1)
         if new == "failed" and attempts < int(task["max_attempts"] or 3) and status in ("failed", "lost", "timeout",
                                                                                      "stalled"):
             new = "queued"
+        extra: dict = {}
+        reason = None
+        not_before = None
+        if waiting:
+            try:
+                waits = int(json.loads(task["result"] or "{}").get("waits") or 0) + 1
+            except (ValueError, AttributeError):
+                waits = 1
+            what = str(result.get("waiting_for") or summary)[:300]
+            extra["waits"] = waits
+            if waits > int(self.cfg["budget"].get("max_waits", 24)):
+                new, reason = "blocked", f"still waiting after {waits} tries: {what}"
+            else:
+                retry = min(max(float(result.get("retry_after_s") or 1800), 300.0), 6 * 3600.0)
+                not_before = time.time() + retry
+                reason = f"waiting for {what}; next try {time.strftime('%H:%M', time.localtime(not_before))}"
         upd = {"status": new, "attempts": attempts, "result": json.dumps(
-            {"summary": summary, "status": rstatus or status, **({k: v for k, v in result.items() if k != "summary"}
-                                                                 if isinstance(result, dict) else {})})[:20000]}
-        if new == "blocked":
+            {"summary": summary, "status": rstatus or status, **extra,
+             **({k: v for k, v in result.items() if k not in ("summary", "waits")}
+                if isinstance(result, dict) else {})})[:20000]}
+        if reason:
+            upd["blocked_reason"] = reason[:500]
+        elif new == "blocked":
             upd["blocked_reason"] = (result.get("question") or result.get("blocked_reason") or summary)[:500]
-        if new == "queued" and status not in ("limit", "auth"):
+        if not_before:
+            upd["not_before"] = not_before
+        elif new == "queued" and status not in ("limit", "auth"):
             upd["not_before"] = time.time() + 120 * attempts
         if isinstance(result, dict) and result.get("pr"):
             upd["pr_url"] = str(result["pr"])[:300]
         db.update_task(task["id"], **upd)
+        if waiting and new == "queued":
+            db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                 (time.time(), f"task:{task['id']}", "task_waiting", "low",
+                  f"#{task['id']} {task['title']}: {reason}", "handled", task["id"]))
+            return
         if task["reply_chat"] and new in ("done", "failed", "blocked"):
             text = summary if new == "done" else f"(task #{task['id']} {new}) {summary}"
             chat = None if task["reply_chat"] == "all" else task["reply_chat"]
@@ -491,7 +520,7 @@ class Daemon:
                 continue
             from .prompts import worker_prompt
             prompt = worker_prompt(self.p, task, cwd, branch)
-            db.update_task(task["id"], status="running", branch=branch)
+            db.update_task(task["id"], status="running", branch=branch, blocked_reason=None)
             self.start_run("worker" if task["kind"] != "review" else "reviewer", prompt, provider, tier, cwd,
                            task=task, budget_usd=max(remaining, 0.5) if task["budget_usd"] else None,
                            read_only=False)

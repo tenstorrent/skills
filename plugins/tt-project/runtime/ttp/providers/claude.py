@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
+import sys
 from pathlib import Path
 
 from . import register
@@ -40,6 +42,8 @@ class Claude(Provider):
             denied += ["WebFetch", "WebSearch"]
         if denied and not read_only:
             argv += ["--disallowedTools", *denied]
+        if not read_only:
+            argv += ["--settings", json.dumps(hook_settings())]
         env = {"CLAUDE_CODE_ENABLE_CFC": "0"}
         return argv, env
 
@@ -118,6 +122,19 @@ class Claude(Provider):
         org = acct.get("organizationName") or ""
         bill = acct.get("billingType") or data.get("billingType") or ""
         return " | ".join(x for x in (who, org if org and who not in org else "", bill) if x)
+
+
+def hook_settings() -> dict:
+    """Route tool-use events through `ttp.hook`, so coordinator updates reach a running worker.
+
+    Passed as JSON on the command line: nothing is written to the user's settings files, and one
+    project never changes another's behavior.
+    """
+    runtime = str(Path(__file__).resolve().parents[2])
+    cmd = f"{shlex.quote(sys.executable)} -m ttp.hook PostToolUse"
+    return {"hooks": {"PostToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": cmd,
+                                                                  "timeout": 20}]}]},
+            "env": {"PYTHONPATH": runtime}}
 
 
 def windows_from_event(ev: dict) -> list[dict]:

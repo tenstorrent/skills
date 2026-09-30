@@ -296,3 +296,66 @@ def test_one_listener_per_chat(env):
                             "--timeout", "2"], env=run_env, capture_output=True, text=True, timeout=30)
     assert third.returncode == 0, third.stderr
     assert not (p.state / "listen-c1.pid").exists(), "the listener left its lock behind"
+
+
+def _run_until(d, p, cond, timeout=60):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        d.cfg = p.config()
+        d.tick()
+        if cond():
+            return True
+        time.sleep(0.3)
+    return False
+
+
+def test_waiting_handoff_requeues_without_spending_an_attempt(env, monkeypatch):
+    p = make(env)
+    from ttp.daemon import Daemon
+    monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps(
+        {"status": "waiting", "summary": "all boards reserved", "waiting_for": "a free board",
+         "retry_after_s": 600}))
+    tid = p.db.add_task("measure on a board", "needs a board", kind="work", tier="light", origin="user")
+    d = Daemon(p.base)
+    assert _run_until(d, p, lambda: p.db.task(tid)["status"] == "queued" and p.db.task(tid)["attempts"] == 0
+                      and p.db.task(tid)["not_before"] and not p.db.q("SELECT id FROM runs WHERE status='running'"))
+    t = p.db.task(tid)
+    assert t["not_before"] > time.time() + 500, "the retry came too soon"
+    assert "a free board" in (t["blocked_reason"] or "")
+    assert json.loads(t["result"])["waits"] == 1
+
+
+def test_update_reaches_a_running_worker_once(env, tmp_path):
+    p = make(env)
+    from ttp import coordinator as coord
+    tid = p.db.add_task("long job", "original spec", kind="work", tier="light", origin="user")
+    p.db.update_task(tid, status="running")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    p.db.x("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(?,?,?,?,?,?)",
+           (tid, "worker", "fake", time.time(), "running", str(run_dir)))
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "spec": "use any free board"}]) == []
+
+    def hook():
+        r = subprocess.run([sys.executable, "-m", "ttp.hook", "PostToolUse"], input="{}", capture_output=True,
+                           text=True, env={**os.environ, "PYTHONPATH": str(RUNTIME), "TTP_RUN_DIR": str(run_dir)})
+        assert r.returncode == 0, r.stderr
+        return json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"] if r.stdout.strip() else ""
+
+    first = hook()
+    assert "use any free board" in first
+    assert hook() == "", "the same update was delivered twice"
+    coord.apply(p, [{"type": "task_update", "id": tid, "spec": "and label every number with its board"}])
+    second = hook()
+    assert "label every number" in second and "use any free board" not in second
+
+
+def test_claude_workers_get_the_update_hook_but_decisions_do_not(env):
+    from ttp.providers import get_provider
+    worker, _ = get_provider("claude").build(role="worker", model="opus", effort="low", cwd=".", budget_usd=None,
+                                             read_only=False, schema=None, restrictions={})
+    turn, _ = get_provider("claude").build(role="coordinator", model="opus", effort="low", cwd=".",
+                                           budget_usd=1.0, read_only=True, schema=None, restrictions={})
+    settings = json.loads(worker[worker.index("--settings") + 1])
+    assert "ttp.hook PostToolUse" in settings["hooks"]["PostToolUse"][0]["hooks"][0]["command"]
+    assert "--settings" not in turn

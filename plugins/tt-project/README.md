@@ -49,7 +49,9 @@ and preferences you add later become part of the project's charter and memory.
 - **Coordinator**: a short, tool-less decision over a digest of the project, batched and rate
   capped. Anything needing files, commands or deep thought becomes a task.
 - **Workers**: one task each, in a git worktree on their own branch for code, with a dollar
-  budget, a wall clock, and a stall guard. Each hands off a structured result.
+  budget, a wall clock, and a stall guard. Each hands off a structured result. A worker whose
+  machine or queue is busy hands the task back to retry later, instead of waiting inside the run.
+  When the coordinator rescopes a running task, the change reaches the worker mid-run.
 - **Memory and charter**: plain files in the project's harness, one fact per file.
 - **Watchers**: pull requests (CI, reviews, mergeability) and logs, reporting only changes.
   With Jev enabled, new observations are screened by a cheap decision model first.
