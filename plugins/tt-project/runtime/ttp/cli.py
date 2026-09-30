@@ -550,7 +550,7 @@ def cmd_lock(a) -> None:
     Inside a run, waiting is reported in the run's progress (a wait is not a stall) and gives up
     after half the run's stall limit unless --timeout says otherwise (0: wait as long as it takes).
     Giving up exits 75: the task hands back `waiting`. Time spent waiting does not count against
-    the run's wall clock.
+    the run's wall clock, which grows by at most its own length this way.
     """
     from . import locks as lk
     cmd = list(a.command or [])
@@ -582,7 +582,11 @@ def cmd_lock(a) -> None:
     waiting = False
 
     def _end_wait(*_):
+        # Cleared first: a signal arriving while this records would otherwise take the record's
+        # flock a second time in this process and hang.
+        nonlocal waiting
         if waiting:
+            waiting = False
             lk.record_wait(run_dir, wait_key, started, time.time())
 
     while True:

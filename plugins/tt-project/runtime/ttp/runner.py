@@ -14,7 +14,9 @@
   has ended, the same locks `ttp lock` takes per command; the wait for them has its own bound
   (exclusive_wait_s), and the wall-clock limit starts once they are held;
 - extends the wall-clock limit by the time the agent's `ttp lock` commands spent waiting, so work
-  queued behind a shared device is not cut off for the queue;
+  queued behind a shared device is not cut off for the queue; at most by the limit itself, since a
+  wait in the background (or with --timeout 0) must not lift the only spend bound of providers
+  that report cost only at the end;
 - writes exit.json exactly once, then asks the provider adapter for usage and records it.
 
 It survives a daemon restart: the daemon re-adopts runs by run_dir, pid and boot id.
@@ -150,7 +152,7 @@ def supervise(run_dir: Path) -> int:
             if now - last_lease >= LEASE_EVERY_S:
                 _touch(lease)
                 last_lease = now
-            if time.time() - started > timeout_s + locks.waited(run_dir):
+            if time.time() - started > timeout_s + min(locks.waited(run_dir), timeout_s):
                 threading.Thread(target=stop, args=("timeout",), daemon=True).start()
             if stall_s:
                 # Stalled = the agent has produced nothing (no stream event, no progress note) for

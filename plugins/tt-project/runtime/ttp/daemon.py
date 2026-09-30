@@ -422,9 +422,10 @@ class Daemon:
         status = "ok" if exit_info.get("rc") == 0 and not usage.error else "failed"
         if stopped in ("timeout", "budget", "stopped", "lost", "stalled", "shutdown", "resource_busy"):
             status = stopped if stopped != "stopped" else "killed"
+        cut_off = None
         if status == "timeout" and r["role"] != "coordinator" and \
-                (_read_result(run_dir / RESULT_FILE) or {}).get("status"):
-            status = "ok"   # it handed off before the clock ran out: the work is done, not wasted
+                (_read_result(run_dir / RESULT_FILE) or {}).get("status") in HANDOFF_STATES:
+            cut_off, status = status, "ok"   # it handed off before the clock ran out: the work is done, not wasted
         if usage.limited:
             status = "limit"
         if usage.auth_failed:
@@ -471,7 +472,7 @@ class Daemon:
             if r["role"] == "coordinator":
                 self._finish_coordinator(r, usage, status, note)
             else:
-                self._finish_worker(r, usage, status, run_dir)
+                self._finish_worker(r, usage, status, run_dir, cut_off if status == "ok" else None)
         log(p, f"run {r['id']} end status={status} cost=${usage.cost_usd:.3f}"
                f"{' (estimated)' if usage.estimated else ''} role={r['role']}")
 
@@ -538,7 +539,7 @@ class Daemon:
             self.alert("coordinator", f"The coordinator failed {fails} turns in a row (last: {why}). "
                        f"Messages are queued, not lost.", "high")
 
-    def _finish_worker(self, r: dict, usage, status: str, run_dir: Path) -> None:
+    def _finish_worker(self, r: dict, usage, status: str, run_dir: Path, ended: str | None = None) -> None:
         db = self.p.db
         task = db.task(r["task"]) if r["task"] else None
         if not task:
@@ -565,7 +566,6 @@ class Daemon:
                      (time.time(), "daemon", "task_requeued", "low", f"#{task['id']} {task['title']}: its run "
                       f"never started; queued again, no attempt spent", "handled", task["id"]))
             return
-        ended = None
         # A hand-off written before the run ended badly (supervisor killed, reboot, timeout, stall)
         # stands: the work it reports is done and redoing it would repeat it.
         if status not in ("ok", "killed", "resource_busy") and (
@@ -1320,9 +1320,9 @@ def _cut_off_cost(run_dir: Path, exit_info: dict) -> float:
     budget = float(spec.get("budget_usd") or spec.get("default_budget_usd") or 0)
     timeout = float(spec.get("timeout_s") or 0)
     elapsed = float(exit_info.get("ended") or time.time()) - float(exit_info.get("started") or 0)
-    elapsed -= locks.waited(run_dir, float(exit_info.get("ended") or time.time()))
     if budget <= 0 or timeout <= 0 or not exit_info.get("started"):
         return 0.0
+    elapsed -= min(locks.waited(run_dir, float(exit_info.get("ended") or time.time())), timeout)
     return round(budget * min(max(elapsed, 0.0) / timeout, 1.0), 4)
 
 

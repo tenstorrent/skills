@@ -3194,9 +3194,12 @@ def test_a_handoff_written_before_a_run_ends_badly_is_kept(env, tmp_path, ended)
     rid = p.db.x("INSERT INTO runs(task,role,provider,started,status,dir,boot_id) VALUES(?,?,?,?,?,?,?)",
                  (tid, "worker", "fake", time.time(), "running", str(run_dir), boot))
     d.reap_runs()
-    assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == ("lost" if ended == "reboot" else ended)
+    # A timed-out run that handed off is not waste; the task still says how its run ended.
+    run_status = {"reboot": "lost", "timeout": "ok"}.get(ended, ended)
+    assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == run_status
     t = p.db.task(tid)
     assert t["status"] == "done" and json.loads(t["result"])["summary"] == "measured 12 ms"
+    assert json.loads(t["result"]).get("run_status") == ("lost" if ended == "reboot" else ended)
 
 
 def test_the_reaper_never_kills_a_process_that_reused_the_agents_pid(env, tmp_path):
@@ -3579,10 +3582,42 @@ def test_the_waste_limit_scales_with_parallel_workers(env):
                "VALUES(?,'worker','claude','timeout',?,?,4.0)", (task, now - 3000, now - 60))
     g = bud.evaluate(p.db, p.config(), "claude", [], now)
     assert not any("failed or stalled" in r for r in g.reasons), g.reasons
-    # One task failing over and over is a loop, however many workers the project may run.
-    p.db.x("DELETE FROM runs")
-    for _ in range(3):
-        p.db.x("INSERT INTO runs(task,role,provider,status,started,ended,cost_usd) "
-               "VALUES(1,'worker','claude','timeout',?,?,4.0)", (now - 3000, now - 60))
-    g = bud.evaluate(p.db, p.config(), "claude", [], now)
-    assert g.level == "red" and any("failed or stalled" in r for r in g.reasons), g.reasons
+    # One task failing over and over is a loop, however many workers the project may run; so are
+    # new tasks failing one after another.
+    for tasks in ((1, 1, 1), (1, 2, 3)):
+        p.db.x("DELETE FROM runs")
+        for i, task in enumerate(tasks):
+            p.db.x("INSERT INTO runs(task,role,provider,status,started,ended,cost_usd) "
+                   "VALUES(?,'worker','claude','timeout',?,?,4.0)", (task, now - 3000 + i * 900, now - 2200 + i * 900))
+        g = bud.evaluate(p.db, p.config(), "claude", [], now)
+        assert g.level == "red" and any("failed or stalled" in r for r in g.reasons), (tasks, g.reasons)
+        assert g.numbers["waste_limit"] == 8.0, g.numbers
+
+
+def test_a_lock_wait_extends_the_wall_clock_at_most_by_the_limit(env, tmp_path):
+    p = make(env)
+    run_env = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost", TTP_PROJECT=str(p.base),
+                   PYTHONPATH=str(RUNTIME))
+    holder = subprocess.Popen([sys.executable, str(TTP), "lock", "board", "--", "sleep", "30"], env=run_env)
+    time.sleep(1.0)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "prompt.md").write_text("x")
+    # A wait with no end of its own (--timeout 0, or one left in the background) must not lift the
+    # wall clock: for providers that report cost only at the end it is the only spend bound.
+    lock_cmd = f"{shlex.quote(sys.executable)} {shlex.quote(str(TTP))} lock board --timeout 0 -- true"
+    (run_dir / "run.json").write_text(json.dumps({
+        "argv": ["sh", "-c", f"{lock_cmd} && echo handed-off"], "cwd": str(tmp_path), "timeout_s": 3,
+        "provider": "fake", "env": {"TTP_RUN_DIR": str(run_dir)}}))
+    t0 = time.time()
+    subprocess.run([sys.executable, "-m", "ttp.runner", str(run_dir)], cwd=str(RUNTIME), env=run_env, timeout=120)
+    took = time.time() - t0
+    holder.kill()
+    holder.wait(timeout=30)
+    info = json.loads((run_dir / "exit.json").read_text())
+    assert info["stopped"] == "timeout" and took < 20, (info, took)
+    from ttp.daemon import _cut_off_cost
+    (run_dir / "run.json").write_text(json.dumps({"budget_usd": 6.0, "timeout_s": 3}))
+    # Booked on the time beyond the one limit's worth of waiting, never below it.
+    assert _cut_off_cost(run_dir, info) == pytest.approx(6.0 * min(max(info["ended"] - info["started"] - 3, 0) / 3, 1),
+                                                         abs=0.01)

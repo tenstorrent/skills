@@ -95,6 +95,29 @@ def spent_last_hour(db: DB, provider: str, now: float) -> float:
     return max(total, 0.0)
 
 
+WASTED = ("failed", "stalled", "timeout", "lost", "budget", "no_handoff")
+
+
+def _peak_tasks(spans: list, now: float) -> int:
+    """Most distinct tasks whose given runs (task, started, ended) were going at the same moment.
+    Runs without a task count as one."""
+    edges = []
+    for s in spans:
+        if not s["started"]:
+            continue    # never launched
+        start = float(s["started"])
+        end = max(float(s["ended"]) if s["ended"] is not None else now, start)
+        edges += [(start, 1, s["task"]), (end, -1, s["task"])]
+    active: dict = {}
+    peak = 0
+    for _, step, task in sorted(edges, key=lambda e: e[:2]):   # an end sorts before a start at the same instant
+        active[task] = active.get(task, 0) + step
+        if not active[task]:
+            del active[task]
+        peak = max(peak, len(active))
+    return peak
+
+
 def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float | None = None) -> Gate:
     now = now or time.time()
     b = cfg["budget"]
@@ -143,18 +166,18 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
     last_h = spent_last_hour(db, provider, now)
     runs_h = db.q("SELECT role, status, cost_usd FROM runs WHERE provider=? AND ended>=?", (provider, hour_ago))
     # A run stopped on purpose (a cancel, a pause, a redirect) is a decision, not waste.
-    waste = sum(float(r["cost_usd"] or 0) for r in runs_h
-                if r["status"] in ("failed", "stalled", "timeout", "lost", "budget", "no_handoff"))
+    waste = sum(float(r["cost_usd"] or 0) for r in runs_h if r["status"] in WASTED)
     thrash = sum(float(r["cost_usd"] or 0) for r in runs_h if r["role"] == "coordinator")
     norm = db.spent_since(now - WEEK, provider) / (7 * 24)
     per_task = max((b.get("task_default_usd") or {"deep": 25.0}).values())
     floor = float(b.get("hourly_floor_usd") or max(int(b.get("max_parallel_workers", 2)), 1) * per_task)
     ceiling = max(float(b.get("hourly_alarm_x", 4.0)) * norm, floor)
     # The waste limit is per worker: parallel workers each losing a run (a shared device kept them
-    # all waiting) are not a loop, while one task failing over and over counts as one worker.
-    busy = db.q("SELECT DISTINCT task FROM runs WHERE provider=? AND role!='coordinator' AND task IS NOT NULL "
-                "AND (status='running' OR ended>=?)", (provider, hour_ago))
-    workers = min(max(len(busy), 1), max(int(b.get("max_parallel_workers", 6)), 1))
+    # all waiting) are not a loop. Workers are the most tasks whose wasted runs went at once, so one
+    # task failing over and over, or new tasks failing one after another, count as one worker.
+    spans = db.q(f"SELECT task, started, ended FROM runs WHERE provider=? AND role!='coordinator' AND ended>=? "
+                 f"AND status IN ({','.join('?' * len(WASTED))})", (provider, hour_ago, *WASTED))
+    workers = min(max(_peak_tasks(spans, now), 1), max(int(b.get("max_parallel_workers", 6)), 1))
     waste_cap = float(b.get("hourly_waste_usd", 8.0)) * workers
     thrash_cap = float(b.get("hourly_coordinator_usd", 4.0))
     g.numbers.update({"spent_1h": round(last_h, 2), "hourly_ceiling": round(ceiling, 2),
