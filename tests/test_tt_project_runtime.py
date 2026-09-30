@@ -278,6 +278,81 @@ def test_slack_routing(env):
     assert projects_in_dm([{"bot_id": "B", "text": "[demo] x"}, {"text": "[fake] y"}]) == ["demo"]
 
 
+class FakeSlackHTTP:
+    """Stands in for the Slack Web API at the urlopen level. `fail(text)` decides how a
+    chat.postMessage of `text` fails: None (delivered), an error code, an HTTP status or 'net'."""
+
+    def __init__(self, fail):
+        self.fail = fail
+        self.delivered: list[str] = []
+
+    def __call__(self, req, timeout=None):
+        import io
+        import urllib.parse
+        method = req.full_url.rsplit("/", 1)[-1]
+        params = urllib.parse.parse_qs(req.data.decode(), keep_blank_values=True)
+        if method == "conversations.open":
+            body = {"ok": True, "channel": {"id": "D1"}}
+        else:
+            text = params["text"][0]
+            why = self.fail(text)
+            if why == "net":
+                raise urllib.error.URLError("connection refused")
+            if isinstance(why, int):
+                raise urllib.error.HTTPError(req.full_url, why, "err", {"Retry-After": "0"}, None)
+            if why:
+                body = {"ok": False, "error": why}
+            else:
+                self.delivered.append(text)
+                body = {"ok": True, "ts": f"{len(self.delivered)}.0"}
+        return io.BytesIO(json.dumps(body).encode())
+
+
+def slack_daemon(env, monkeypatch, fake):
+    import ttp.slack
+    from ttp.daemon import Daemon
+    from ttp.slack import Slack
+    p = make(env)
+    monkeypatch.setattr(ttp.slack.urllib.request, "urlopen", fake)
+    monkeypatch.setattr(ttp.slack.time, "sleep", lambda s: None)
+    d = Daemon(p.base)
+    d._slack = Slack("xoxb-test", user_id="U1")
+    d.slack = lambda: d._slack
+    return p, d
+
+
+def test_slack_outbound_skips_a_message_slack_keeps_rejecting(env, monkeypatch):
+    fake = FakeSlackHTTP(lambda text: "no_text" if not text.strip() else None)
+    p, d = slack_daemon(env, monkeypatch, fake)
+    p.db.post("in", "hi", chat="slack", channel="slack", kind="user", ref="9.0")
+    bad = p.db.post("out", "", chat="slack", ref="9.0")          # a thread reply with no text
+    good = p.db.post("out", "second", chat="slack", ref="9.0")
+    d.deliver_outbound()
+    d.deliver_outbound()
+    assert fake.delivered == [] and int(p.db.kv("slack_last_out", 0)) < bad   # retried before skipping
+    for _ in range(8):
+        d.deliver_outbound()
+    assert fake.delivered == ["second"]
+    assert int(p.db.kv("slack_last_out", 0)) == good
+    assert f"skipped message {bad}" in (p.logs / "daemon.log").read_text()
+
+
+@pytest.mark.parametrize("why", ["net", 500, 503, 429, "invalid_auth", "token_revoked", "ratelimited"])
+def test_slack_outbound_never_skips_on_outages(env, monkeypatch, why):
+    down = {"on": True}
+    fake = FakeSlackHTTP(lambda text: why if down["on"] else None)
+    p, d = slack_daemon(env, monkeypatch, fake)
+    first = p.db.post("out", "first", kind="alert", severity="high")
+    second = p.db.post("out", "second", kind="alert", severity="high")
+    for _ in range(10):
+        d.deliver_outbound()
+    assert fake.delivered == [] and int(p.db.kv("slack_last_out", 0)) < first
+    down["on"] = False
+    d.deliver_outbound()
+    assert fake.delivered == ["[demo] first", "[demo] second"]
+    assert int(p.db.kv("slack_last_out", 0)) == second
+
+
 def test_logged_out_provider_is_detected_not_retried_as_failure(env, tmp_path):
     from ttp.providers import get_provider
     out = tmp_path / "o.jsonl"

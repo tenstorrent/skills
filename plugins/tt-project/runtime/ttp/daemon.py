@@ -68,6 +68,7 @@ class Daemon:
         self._last_cfg = 0.0
         self._last_slack = 0.0
         self._thread_scan = 0.0
+        self._slack_rejects: dict[int, int] = {}   # outbound message id -> times Slack refused it
         self._reap_errors: dict[int, int] = {}
         self._metered: dict[int, tuple[int, float]] = {}   # run id -> (output size, when) last priced
         self._start_failures = 0
@@ -1206,7 +1207,13 @@ class Daemon:
                     db.set_kv("slack_threads", sorted(threads)[-500:])
                 except Exception as e:
                     log(self.p, f"slack post failed: {e}")
-                    return
+                    if not sl.rejected_message(e):
+                        return
+                    tries = self._slack_rejects[m["id"]] = self._slack_rejects.get(m["id"], 0) + 1
+                    if tries < 3:
+                        return
+                    log(self.p, f"slack skipped message {m['id']} after {tries} rejections: {e}")
+                self._slack_rejects.pop(m["id"], None)
             db.set_kv("slack_last_out", m["id"])
 
     def poll_slack(self) -> None:

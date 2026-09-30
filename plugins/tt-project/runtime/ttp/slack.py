@@ -29,7 +29,18 @@ MAX_PAGES = 20
 
 
 class SlackError(Exception):
-    pass
+    def __init__(self, msg: str, method: str = "", code: str | None = None):
+        super().__init__(msg)
+        self.method = method
+        self.code = code   # Slack's `error` from an ok=false reply; None for HTTP and network errors
+
+
+# chat.postMessage errors caused by the message itself: retrying the same message cannot succeed.
+# Auth, rate-limit and service errors are left out so an outage never drops a message.
+REJECTED_MESSAGE = frozenset({
+    "no_text", "msg_too_long", "msg_blocks_too_long", "invalid_blocks", "invalid_blocks_format",
+    "invalid_attachments", "too_many_attachments", "invalid_metadata_format",
+    "invalid_metadata_schema", "metadata_too_large", "markdown_text_conflict"})
 
 
 class Slack:
@@ -53,11 +64,11 @@ class Slack:
                 if e.code == 429 and attempt < 2:
                     time.sleep(int(e.headers.get("Retry-After", "5")))
                     continue
-                raise SlackError(f"HTTP {e.code} on {method}") from None
+                raise SlackError(f"HTTP {e.code} on {method}", method) from None
             if not out.get("ok"):
-                raise SlackError(f"{method}: {out.get('error')}")
+                raise SlackError(f"{method}: {out.get('error')}", method, out.get("error"))
             return out
-        raise SlackError(f"{method}: rate limited")
+        raise SlackError(f"{method}: rate limited", method)
 
     def resolve_user(self) -> str:
         if not self.user_id:
@@ -75,6 +86,11 @@ class Slack:
         body = text if thread_ts else f"[{project}] {text}"
         return self.call("chat.postMessage", channel=self.dm_channel(), text=body[:39000],
                          thread_ts=thread_ts, unfurl_links=False)["ts"]
+
+    @staticmethod
+    def rejected_message(e: Exception) -> bool:
+        """Whether Slack refused this particular message, as opposed to being unreachable."""
+        return isinstance(e, SlackError) and e.method == "chat.postMessage" and e.code in REJECTED_MESSAGE
 
     def poll(self, oldest: str) -> tuple[list[dict], list[dict]]:
         """Top-level messages the user wrote in the DM after `oldest`, oldest first, and every post
