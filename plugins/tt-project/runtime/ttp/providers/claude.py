@@ -21,6 +21,15 @@ APPEND_SYSTEM = "--append-system-prompt"
 APPEND_SYSTEM_FILE = "--append-system-prompt[-file]"   # how `--help` names the (unlisted) file form
 _FLAGS: dict[str, bool] = {}   # CLI flag support, probed once per daemon from `claude --help`
 USAGE_KEYS = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+# Claude Code's bundled skills, which workers have never used: listed by name only (still callable),
+# which saves ~2.1k tokens a call. "off" and disableBundledSkills both add tokens instead.
+BUNDLED_SKILLS = ("dataviz", "update-config", "keybindings-help", "code-review", "simplify",
+                  "fewer-permission-prompts", "loop", "schedule", "claude-api", "workflow-authoring", "run",
+                  "init", "security-review")
+# Scheduling, remote and orchestration tools a headless worker must not use; their definitions
+# alone are ~3.7k tokens a call.
+WORKER_DENIED_TOOLS = ("Workflow", "ScheduleWakeup", "CronCreate", "CronDelete", "CronList", "RemoteTrigger",
+                       "PushNotification", "DesignSync")
 
 
 @register
@@ -48,13 +57,12 @@ class Claude(Provider):
             argv += ["--permission-mode", "bypassPermissions"]
         if schema:
             argv += ["--json-schema", json.dumps(schema)]
-        denied = []
-        if restrictions.get("no_internet"):
-            denied += ["WebFetch", "WebSearch"]
-        if denied and not read_only:
-            argv += ["--disallowedTools", *denied]
         if not read_only:
-            argv += ["--settings", json.dumps(hook_settings())]
+            denied = list(WORKER_DENIED_TOOLS)
+            if restrictions.get("no_internet"):
+                denied += ["WebFetch", "WebSearch"]
+            argv += ["--disallowedTools", *denied]
+            argv += ["--settings", json.dumps(worker_settings())]
             # Workers start in many different worktrees; with the per-directory sections out of the
             # system prompt, it stays cached across them (measured: ~30% fewer cache-write tokens).
             if self.supports(EXCLUDE_DYNAMIC):
@@ -224,6 +232,13 @@ def hook_settings() -> dict:
     return {"hooks": {"PostToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": cmd,
                                                                   "timeout": 20}]}]},
             "env": {"PYTHONPATH": runtime}}
+
+
+def worker_settings() -> dict:
+    """The hook, plus a leaner context: bundled skills by name only, no auto-memory (the project
+    keeps its own). Skills from a project's plugin dirs stay fully listed."""
+    return {**hook_settings(), "skillOverrides": {name: "name-only" for name in BUNDLED_SKILLS},
+            "autoMemoryEnabled": False}
 
 
 def windows_from_event(ev: dict) -> list[dict]:

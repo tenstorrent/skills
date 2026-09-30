@@ -987,6 +987,33 @@ def test_claude_workers_get_the_update_hook_but_decisions_do_not(env):
     assert "--settings" not in turn
 
 
+def test_claude_workers_get_a_lean_context_but_keep_plugin_skills(env):
+    from ttp.providers import get_provider
+    build = get_provider("claude").build
+    worker, _ = build(role="worker", model="opus", effort="low", cwd=".", budget_usd=None, read_only=False,
+                      schema=None, restrictions={"no_internet": True})
+    settings = json.loads(worker[worker.index("--settings") + 1])
+    skills = settings["skillOverrides"]
+    assert {"dataviz", "workflow-authoring", "loop", "schedule", "security-review"} <= set(skills)
+    assert set(skills.values()) == {"name-only"}, "'off' adds tokens; bundled skills stay callable by name"
+    assert "disableBundledSkills" not in settings
+    assert settings["autoMemoryEnabled"] is False
+    assert worker.count("--disallowedTools") == 1, "a second flag would hide part of the deny list"
+    i = worker.index("--disallowedTools") + 1
+    denied = worker[i:worker.index("--settings", i)]
+    assert {"Workflow", "ScheduleWakeup", "CronCreate", "CronDelete", "CronList", "RemoteTrigger",
+            "PushNotification", "DesignSync", "WebFetch", "WebSearch"} == set(denied)
+    online, _ = build(role="worker", model="opus", effort="low", cwd=".", budget_usd=None, read_only=False,
+                      schema=None, restrictions={})
+    assert "WebFetch" not in online and "Workflow" in online
+    # Plugin-dir skills are namespaced by their plugin and never overridden.
+    argv = online + get_provider("claude").plugin_args(["/p/plugin"])
+    assert all(":" not in name for name in skills) and "--plugin-dir" in argv
+    turn, _ = build(role="coordinator", model="opus", effort="low", cwd=".", budget_usd=1.0, read_only=True,
+                    schema=None, restrictions={})
+    assert "Workflow" not in turn and "skillOverrides" not in " ".join(turn)
+
+
 def test_claude_runs_cannot_start_background_tasks_that_die_at_exit(env):
     from ttp.providers import get_provider
     _, worker_env = get_provider("claude").build(role="worker", model="opus", effort="low", cwd=".",
