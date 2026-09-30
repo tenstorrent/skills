@@ -26,14 +26,24 @@ CONF = HOME_DIR / "notifier.json"
 
 
 def alerts_since(p: Project, after: int, floor: str = "high") -> list[dict]:
+    """Broadcasts at or above the floor after `after`. Ones whose condition has since cleared are
+    returned marked `cleared`, so the reader moves its cursor past them without showing them."""
+    from .web import cleared
     rank = SEVERITY_RANK.get(floor, 2)
+    # Filter severity in the query: a page of quieter broadcasts would otherwise stall the cursor.
+    levels = [s for s, r in SEVERITY_RANK.items() if r >= rank]
     db = DB(p.state / "project.db")
     try:
-        rows = db.q("SELECT id, ts, kind, severity, text FROM messages WHERE direction='out' AND chat IS NULL "
-                    "AND id>? ORDER BY id LIMIT 50", (after,))
+        rows = db.q("SELECT id, ts, kind, severity, text, ref FROM messages WHERE direction='out' AND chat IS NULL "
+                    f"AND id>? AND severity IN ({','.join('?' * len(levels))}) ORDER BY id LIMIT 50",
+                    (after, *levels))
+        now = time.time()
+        for r in rows:
+            r["cleared"] = cleared(db, r, now)
+            del r["ref"]
     finally:
         db.close()
-    return [r for r in rows if SEVERITY_RANK.get(r["severity"], 1) >= rank]
+    return rows
 
 
 def _remote_alerts(entry: dict, name: str, after: int, floor: str) -> list[dict] | None:
@@ -89,7 +99,8 @@ def run_once(state: dict, floor: str) -> dict:
                 state[name] = max([r["id"] for r in rows] + [0])
                 continue
         for r in rows:
-            show(f"tt-project · {name}", r["text"])
+            if not r.get("cleared"):
+                show(f"tt-project · {name}", r["text"])
             state[name] = max(int(state.get(name, 0)), int(r["id"]))
     return state
 

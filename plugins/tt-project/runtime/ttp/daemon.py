@@ -1119,12 +1119,14 @@ class Daemon:
         sl = self.slack()
         if not sl:
             return
+        from .web import cleared
         db = self.p.db
         floor = SEVERITY_RANK.get(self.cfg["notify"].get("slack_min_severity", "high"), 2)
         last = int(db.kv("slack_last_out", 0))
         rows = db.q("SELECT * FROM messages WHERE direction='out' AND id>? ORDER BY id LIMIT 20", (last,))
         for m in rows:
-            to_slack = (m["chat"] is None and SEVERITY_RANK.get(m["severity"], 1) >= floor) or m["chat"] == "slack"
+            to_slack = ((m["chat"] is None and SEVERITY_RANK.get(m["severity"], 1) >= floor
+                         and not cleared(db, m, time.time())) or m["chat"] == "slack")
             if to_slack:
                 try:
                     thread = m["ref"] if m["chat"] == "slack" else None

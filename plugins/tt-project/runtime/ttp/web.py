@@ -239,6 +239,13 @@ def _still_holds(db: DB, key: str, since: float, now: float) -> bool:
     return True
 
 
+def cleared(db: DB, m: dict, now: float) -> bool:
+    """A high alert whose condition no longer holds: not worth delivering late. Lower-severity
+    messages sharing the key (a budget back to normal) are news whatever the state."""
+    return (m.get("kind") == "alert" and m.get("severity") in ("high", "critical") and bool(m.get("ref"))
+            and not _still_holds(db, m["ref"], m["ts"], now))
+
+
 def attention(db: DB, now: float) -> list[dict]:
     """Open asks and the last day's high alerts, minus alerts whose condition has since cleared
     or that a newer alert on the same condition replaced."""

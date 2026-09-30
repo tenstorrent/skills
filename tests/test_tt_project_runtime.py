@@ -645,6 +645,60 @@ def test_the_web_app_drops_high_alerts_once_their_condition_clears(env):
     assert "Runs cannot start" not in shown(), "a run started since, yet the alert stayed"
 
 
+def test_relays_skip_high_alerts_whose_condition_cleared_before_delivery(env, capsys, monkeypatch):
+    """A chat, the desktop notifier or Slack catching up after being down must not replay a high
+    alert that no longer applies. Alerts that still hold, and lower-severity follow-ups, still go."""
+    p = make(env)
+    from types import SimpleNamespace
+    from ttp import notifier
+    from ttp.cli import _listen_loop
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    p.db.set_kv("limited:fake", {"until": time.time() + 900, "note": "logged out"})
+    d.alert("auth:fake", "fake is logged out", "high")
+    p.db.set_kv("disk_low", {"path": "/", "free_gb": 1.0})
+    d.alert("disk", "Only 1.0 GB free", "high")
+    p.db.set_kv("limited:fake", {"until": time.time() - 1, "note": "logged out"})
+    p.db.post("out", "Budget for fake is now green: back to normal. ", chat=None, kind="alert",
+              severity="normal", ref="budget:fake")
+    held, follow_up = "Only 1.0 GB free", "Budget for fake is now green: back to normal."
+
+    p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)",
+           (time.time(), "t", time.time()))
+    _listen_loop(p, p.db, SimpleNamespace(chat="c1", timeout=3, once=True, ack=None), 0, "normal")
+    out = capsys.readouterr().out
+    assert "fake is logged out" not in out, "the chat relay replayed a cleared alert"
+    assert held in out and follow_up in out, out
+
+    shown = []
+    monkeypatch.setattr(notifier, "show", lambda title, body, url=None: shown.append(body))
+    state = notifier.run_once({"demo": 0}, "high")
+    assert shown == [held], shown
+    assert state["demo"] == p.db.one("SELECT MAX(id) m FROM messages WHERE severity='high'")["m"], state
+    rows = notifier.alerts_since(p, 0, "high")
+    assert [r["text"] for r in rows if not r.get("cleared")] == [held], rows
+
+    posted = []
+    d.cfg["notify"]["slack"] = True
+    d._slack = SimpleNamespace(post=lambda name, text, thread_ts=None: posted.append(text) or str(len(posted)))
+    d.deliver_outbound()
+    assert posted == [held], posted
+    assert p.db.kv("slack_last_out") == p.db.one("SELECT MAX(id) m FROM messages")["m"]
+
+
+def test_the_desktop_notifier_moves_past_a_run_of_quiet_broadcasts(env, monkeypatch):
+    """Broadcasts below the floor must not fill the notifier's page and stall it for good."""
+    p = make(env)
+    from ttp import notifier
+    for i in range(60):
+        p.db.post("out", f"fyi {i}", chat=None, kind="alert", severity="normal")
+    p.db.post("out", "Only 1.0 GB free", chat=None, kind="alert", severity="high")
+    shown = []
+    monkeypatch.setattr(notifier, "show", lambda title, body, url=None: shown.append(body))
+    notifier.run_once({"demo": 0}, "high")
+    assert shown == ["Only 1.0 GB free"], "quiet broadcasts hid a high alert from the desktop notifier"
+
+
 def test_status_says_why_ready_work_is_not_starting_while_runs_are_active(env):
     p = make(env)
     from ttp.cli import status_text

@@ -393,6 +393,7 @@ def _listener_alive(pid: int, chat: str) -> bool:
 
 
 def _listen_loop(p: Project, db, a, after: int, floor: str) -> None:
+    from .web import cleared
     deadline = time.time() + a.timeout if a.timeout else None
     parent = os.getppid()
     while True:
@@ -401,7 +402,7 @@ def _listen_loop(p: Project, db, a, after: int, floor: str) -> None:
         # The high-water mark comes first: a reply posted after it is left for the next pass,
         # never skipped as if it had been read.
         top = db.one("SELECT COALESCE(MAX(id),0) m FROM messages")["m"]
-        msgs = db.unread_for_chat(a.chat, after, floor, upto=top)
+        msgs = [m for m in db.unread_for_chat(a.chat, after, floor, upto=top) if not cleared(db, m, time.time())]
         for m in msgs:
             who = "coordinator" if m["chat"] else f"{p.name} ({m['kind']}, {m['severity']})"
             print(f"[#{m['id']} {who}] {m['text']}", flush=True)
@@ -892,7 +893,8 @@ def cmd_alerts(a) -> None:
         print(json.dumps(rows))
     else:
         for r in rows:
-            print(f"#{r['id']} [{r['severity']}] {r['text']}")
+            if not r["cleared"]:
+                print(f"#{r['id']} [{r['severity']}] {r['text']}")
 
 
 def cmd_notifier(a) -> None:
