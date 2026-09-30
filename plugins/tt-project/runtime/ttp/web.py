@@ -121,8 +121,9 @@ class Handler(BaseHTTPRequestHandler):
             if url.path == "/api/messages":
                 q = parse_qs(url.query)
                 after = int(q.get("after", ["0"])[0])
-                rows = db.q("SELECT id,ts,direction,chat,channel,kind,severity,text FROM messages WHERE id>? AND "
-                            "(chat IS NULL OR chat='web' OR channel='web') ORDER BY id LIMIT 300", (after,))
+                rows = db.q("SELECT m.id,m.ts,m.direction,m.chat,m.channel,m.kind,m.severity,m.text,"
+                            "c.label chat_label FROM messages m LEFT JOIN chats c ON c.id=m.chat "
+                            "WHERE m.id>? ORDER BY m.id LIMIT 300", (after,))
                 return self._send(200, rows)
             if url.path.startswith("/api/run/"):
                 run_id = int(url.path.rsplit("/", 1)[-1])

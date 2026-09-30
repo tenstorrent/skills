@@ -133,7 +133,9 @@ async function pollChat() {
   const log = $("#log"), atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
   rows.forEach((m) => { lastMsg = Math.max(lastMsg, m.id);
     const d = document.createElement("div"); d.className = `msg ${m.direction} sev-${m.severity}`;
-    d.innerHTML = `<div class="b">${esc(m.text)}</div><div class="meta">${ago(m.ts)} ago${m.chat === null && m.direction === "out" ? " · to everyone" : ""}</div>`;
+    const where = m.chat === null ? (m.direction === "out" ? " · to everyone" : "")
+      : m.chat === "web" ? "" : ` · chat ${esc(m.chat_label || m.chat)}`;
+    d.innerHTML = `<div class="b">${esc(m.text)}</div><div class="meta">${ago(m.ts)} ago${where}</div>`;
     log.appendChild(d); });
   if (rows.length && atBottom) log.scrollTop = log.scrollHeight;
 }

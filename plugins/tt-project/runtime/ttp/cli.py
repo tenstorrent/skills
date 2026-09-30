@@ -317,6 +317,10 @@ def cmd_say(a) -> None:
 def cmd_listen(a) -> None:
     p = need(a.name, sys.argv[1:])
     db = p.db
+    if a.ack is not None:
+        # Acknowledged ids only move forward and never past the newest message.
+        db.x("UPDATE chats SET last_read=MAX(COALESCE(last_read,0), MIN(?, (SELECT COALESCE(MAX(id),0) "
+             "FROM messages))) WHERE id=?", (a.ack, a.chat))
     row = db.one("SELECT last_read, min_severity FROM chats WHERE id=?", (a.chat,))
     if not row:
         die(f"unknown chat {a.chat}; run `ttp connect {a.name}` first")
@@ -370,20 +374,23 @@ def _listen_loop(p: Project, db, a, after: int, floor: str) -> None:
     while True:
         if os.getppid() != parent:
             return      # whoever started this listener is gone; nobody would read what it prints
-        msgs = db.unread_for_chat(a.chat, after, floor)
+        # The high-water mark comes first: a reply posted after it is left for the next pass,
+        # never skipped as if it had been read.
+        top = db.one("SELECT COALESCE(MAX(id),0) m FROM messages")["m"]
+        msgs = db.unread_for_chat(a.chat, after, floor, upto=top)
+        for m in msgs:
+            who = "coordinator" if m["chat"] else f"{p.name} ({m['kind']}, {m['severity']})"
+            print(f"[#{m['id']} {who}] {m['text']}", flush=True)
+        if top > after:
+            after = top
+            # With --ack, only an acknowledgement marks messages read, so what was printed to a
+            # reader that is gone comes back on the next listen.
+            if a.ack is None:
+                db.x("UPDATE chats SET last_read=? WHERE id=?", (after, a.chat))
         if msgs:
-            for m in msgs:
-                who = "coordinator" if m["chat"] else f"{p.name} ({m['kind']}, {m['severity']})"
-                print(f"[{who}] {m['text']}", flush=True)
-                after = max(after, m["id"])
-            db.x("UPDATE chats SET last_read=?, last_active=? WHERE id=?", (after, time.time(), a.chat))
+            db.x("UPDATE chats SET last_active=? WHERE id=?", (time.time(), a.chat))
             if a.once:
                 return
-        else:
-            last = db.one("SELECT COALESCE(MAX(id),0) m FROM messages")["m"]
-            if last > after:   # skipped messages below this chat's severity floor
-                after = last
-                db.x("UPDATE chats SET last_read=? WHERE id=?", (after, a.chat))
         if deadline and time.time() > deadline:
             return
         time.sleep(2)
@@ -726,6 +733,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--chat", required=True)
     s.add_argument("--once", action="store_true", help="exit after the first batch")
     s.add_argument("--timeout", type=float, default=0)
+    s.add_argument("--ack", type=int, metavar="ID",
+                   help="mark messages up to ID read; later ones stay unread until acknowledged")
     s.set_defaults(fn=cmd_listen)
 
     s = sub.add_parser("note", help="(inside a run) append a progress note")

@@ -27,7 +27,7 @@ description: "Start, connect to, and talk with a long-running tt-project: a loca
 | 3b. Existing | `ttp connect <name> --label "<short chat label>"`. Keep the printed `chat:` id. |
 | 4. Listen | Start the listener for this host: `hosts.md`. |
 | 5. Relay | User message for the project → `ttp say <name> --chat <id> "<message>"`. |
-| 6. Show | Print coordinator replies as they arrive, lightly formatted, no additions. |
+| 6. Show | Print coordinator replies as they arrive, lightly formatted, no additions. Restart the listener with `--ack <last id shown>`. |
 
 ## Relay rules
 
@@ -36,6 +36,7 @@ description: "Start, connect to, and talk with a long-running tt-project: a loca
 - Anything else goes to the coordinator. Answers arrive through the listener.
 - Keep this chat free: after `ttp say`, end your turn. Do not wait in the foreground.
 - Alerts arrive in every attached chat. Replies arrive only in the chat that asked.
+- A repeated message id was already shown. Skip it.
 - The user asks what is running, costs, or blockers → `ttp status <name>`.
 
 ## Always print the project locator

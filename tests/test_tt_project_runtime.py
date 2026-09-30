@@ -319,6 +319,82 @@ def test_one_listener_per_chat(env):
         os.kill(orphan, 15)
         raise AssertionError("an orphaned listener kept running")
 
+def test_listener_does_not_skip_a_reply_posted_between_its_reads(env, capsys):
+    """A reply that lands after the unread query but before the high-water read is still shown."""
+    p = make(env)
+    p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)",
+           (time.time(), "t", time.time()))
+    from types import SimpleNamespace
+    from ttp.cli import _listen_loop
+    db, real, posted = p.db, p.db.unread_for_chat, []
+
+    def racy(*args, **kw):
+        rows = real(*args, **kw)
+        if not posted:
+            posted.append(db.post("out", "late reply", chat="c1", kind="reply"))
+        return rows
+    db.unread_for_chat = racy
+    _listen_loop(p, db, SimpleNamespace(chat="c1", timeout=3, once=True, ack=None), 0, "normal")
+    assert "late reply" in capsys.readouterr().out, "the listener skipped a reply posted between its reads"
+
+
+def test_listener_redelivers_until_acknowledged(env):
+    """A listener killed after printing leaves the message unread; `--ack` is what marks it read."""
+    import select
+    p = make(env)
+    p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)",
+           (time.time(), "t", time.time()))
+    run_env = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost")
+    cmd = [sys.executable, str(TTP), "listen", "demo", "--chat", "c1"]
+    mid = p.db.post("out", "important", chat="c1", kind="reply")
+    first = subprocess.Popen(cmd + ["--ack", "0", "--timeout", "60"], env=run_env, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True)
+    try:
+        ready, _, _ = select.select([first.stdout], [], [], 15)
+        assert ready, "the listener printed nothing"
+        line = first.stdout.readline()
+        assert "important" in line and f"#{mid}" in line, line
+    finally:
+        first.kill()
+        first.wait(timeout=10)
+    assert p.db.one("SELECT last_read FROM chats WHERE id='c1'")["last_read"] == 0
+    again = subprocess.run(cmd + ["--once", "--ack", "0", "--timeout", "5"], env=run_env,
+                           capture_output=True, text=True, timeout=30)
+    assert "important" in again.stdout, "an unacknowledged message was not delivered again"
+    done = subprocess.run(cmd + ["--once", "--ack", str(mid), "--timeout", "1"], env=run_env,
+                          capture_output=True, text=True, timeout=30)
+    assert "important" not in done.stdout, "an acknowledged message was delivered again"
+    assert p.db.one("SELECT last_read FROM chats WHERE id='c1'")["last_read"] == mid
+
+
+def test_web_chat_shows_replies_to_every_chat(env):
+    p = make(env)
+    from ttp import web
+    port = web.free_port(19750)
+    p.set_config("web.port", port)
+    p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)",
+           (time.time(), "laptop", time.time()))
+    p.db.post("in", "question from a terminal", chat="c1", kind="user")
+    p.db.post("out", "answer to the terminal", chat="c1", kind="reply")
+
+    class Stub:
+        pass
+    stub = Stub()
+    stub.p = p
+    threading.Thread(target=web.serve, args=(stub,), daemon=True).start()
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/api/messages?after=0",
+                                 headers={"X-TTP-Token": web.token(p)})
+    for _ in range(50):
+        try:
+            rows = json.loads(urllib.request.urlopen(req, timeout=2).read())
+            break
+        except OSError:
+            time.sleep(0.1)
+    reply = [r for r in rows if r["text"] == "answer to the terminal"]
+    assert reply and reply[0]["chat_label"] == "laptop", rows
+    assert any(r["text"] == "question from a terminal" for r in rows)
+
+
 def _run_until(d, p, cond, timeout=60):
     deadline = time.time() + timeout
     while time.time() < deadline:

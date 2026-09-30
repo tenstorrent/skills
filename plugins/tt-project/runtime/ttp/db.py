@@ -136,12 +136,13 @@ class DB:
                       "VALUES(?,?,?,?,?,?,?,?,?)",
                       (time.time(), direction, chat, channel, kind, severity, text, ref, int(handled)))
 
-    def unread_for_chat(self, chat: str, after: int, min_severity: str = "normal") -> list[dict]:
+    def unread_for_chat(self, chat: str, after: int, min_severity: str = "normal",
+                        upto: int | None = None) -> list[dict]:
         """Outbound messages this chat has not seen: its own replies plus broadcasts at or above
         its severity floor. Replies addressed to another chat are never shown here."""
         floor = SEVERITY_RANK.get(min_severity, 1)
-        rows = self.q("SELECT * FROM messages WHERE direction='out' AND id>? AND (chat=? OR chat IS NULL) "
-                      "ORDER BY id", (after, chat))
+        rows = self.q("SELECT * FROM messages WHERE direction='out' AND id>? AND id<=? AND (chat=? OR chat IS NULL) "
+                      "ORDER BY id", (after, upto if upto is not None else 2**62, chat))
         return [r for r in rows if r["chat"] == chat or SEVERITY_RANK.get(r["severity"], 1) >= floor]
 
     # tasks ---------------------------------------------------------------------------------
