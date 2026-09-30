@@ -87,17 +87,33 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
         elif ratio >= 0.6:
             _raise(g, "yellow", f"{ratio:.0%} of cap used")
 
-    # Runaway: this project's last hour against a ceiling of max(k x its own 7-day hourly norm, a
-    # floor). The floor lets a legitimately heavy task run; the multiple catches a loop that has
-    # quietly settled into spending far more than this project ever does.
-    last_h = db.spent_since(now - HOUR, provider)
+    # Runaway guard: catch loops, not busy projects. Three signals over the last hour:
+    # - waste: spend on runs that ended without an outcome (failed, stalled, timed out, lost);
+    # - thrash: coordinator spend (decisions should be cents; dollars mean it is spinning);
+    # - total: all spend above max(k x this project's 7-day hourly norm, a floor sized to the
+    #   parallel work it is allowed), so even "successful" repetition is bounded.
+    hour_ago = now - HOUR
+    last_h = db.spent_since(hour_ago, provider)
+    runs_h = db.q("SELECT role, status, cost_usd FROM runs WHERE provider=? AND ended>=?", (provider, hour_ago))
+    waste = sum(float(r["cost_usd"] or 0) for r in runs_h
+                if r["status"] in ("failed", "stalled", "timeout", "lost", "killed", "budget"))
+    thrash = sum(float(r["cost_usd"] or 0) for r in runs_h if r["role"] == "coordinator")
     norm = db.spent_since(now - WEEK, provider) / (7 * 24)
-    day_cap = float(b.get("daily_usd") or 0)
-    floor = float(b.get("hourly_floor_usd") or (day_cap / 4 if g.regime == "caps" and day_cap else 10.0))
+    per_task = max((b.get("task_default_usd") or {"deep": 25.0}).values())
+    floor = float(b.get("hourly_floor_usd") or max(int(b.get("max_parallel_workers", 2)), 1) * per_task)
     ceiling = max(float(b.get("hourly_alarm_x", 4.0)) * norm, floor)
-    g.numbers.update({"spent_1h": round(last_h, 2), "hourly_ceiling": round(ceiling, 2)})
+    waste_cap = float(b.get("hourly_waste_usd", 8.0))
+    thrash_cap = float(b.get("hourly_coordinator_usd", 4.0))
+    g.numbers.update({"spent_1h": round(last_h, 2), "hourly_ceiling": round(ceiling, 2),
+                      "waste_1h": round(waste, 2), "coordinator_1h": round(thrash, 2)})
+    if waste > waste_cap:
+        _raise(g, "red", f"runaway guard: ${waste:.2f} spent on failed or stalled runs in the last hour "
+                         f"(limit ${waste_cap:.0f}); resumes automatically as the hour rolls over")
+    if thrash > thrash_cap:
+        _raise(g, "red", f"runaway guard: coordinator spent ${thrash:.2f} in the last hour (limit ${thrash_cap:.0f})")
     if last_h > ceiling:
-        _raise(g, "red", f"runaway guard: ${last_h:.2f} spent in the last hour, ceiling ${ceiling:.2f}/h")
+        _raise(g, "red", f"runaway guard: ${last_h:.2f} spent in the last hour, ceiling ${ceiling:.2f}/h; "
+                         f"resumes automatically as the hour rolls over")
 
     if g.level == "yellow":
         g.max_tier, g.max_parallel = "standard", max(1, g.max_parallel // 2 or 1)

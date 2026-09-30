@@ -252,3 +252,20 @@ def test_alerts_are_not_repeated_after_a_daemon_restart(env):
     Daemon(p.base).alert("auth:claude", "logged out")
     Daemon(p.base).alert("auth:claude", "logged out")      # a fresh daemon, e.g. after an upgrade
     assert len(p.db.q("SELECT id FROM messages WHERE text='logged out'")) == 1
+
+
+def test_productive_burst_is_not_a_runaway_but_waste_is(env):
+    p = make(env)
+    from ttp import budget as bud
+    now = time.time()
+    wins = [bud.Window("claude", "seven_day", 40)]
+    for i, cost in enumerate((4.3, 4.3, 1.5, 0.5, 0.9)):   # a busy first hour of real work
+        p.db.x("INSERT INTO runs(role,provider,status,started,ended,cost_usd) VALUES('worker','claude','ok',?,?,?)",
+               (now - 3000, now - 60 * i, cost))
+        p.db.spend("claude", cost, f"task:{i}")
+    assert bud.evaluate(p.db, p.config(), "claude", wins).level == "green"
+    for cost in (4.0, 5.0):                                # the same hour, two runs that went nowhere
+        p.db.x("INSERT INTO runs(role,provider,status,started,ended,cost_usd) VALUES('worker','claude','stalled',?,?,?)",
+               (now - 2000, now - 30, cost))
+    g = bud.evaluate(p.db, p.config(), "claude", wins)
+    assert g.level == "red" and any("failed or stalled" in r for r in g.reasons)

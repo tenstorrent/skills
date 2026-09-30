@@ -334,10 +334,14 @@ class Daemon:
             provider_paused = any(r.startswith("provider limit") for r in g.reasons + (prev.reasons if prev else []))
             if prev and prev.level != g.level and not provider_paused:   # a pause has its own, specific alert
                 sev = "high" if g.level == "red" else "normal"
+                capped = any("cap reached" in r for r in g.reasons)
+                hint = ""
+                if g.level == "red":
+                    hint = ("New work is paused; replies to you continue. " +
+                            ("You can raise the cap (carefully) by telling me, or in the web app."
+                             if capped else "The web app's Budget tab shows what spent it."))
                 self.p.db.post("out", f"Budget for {prov} is now {g.level}: {'; '.join(g.reasons) or 'back to normal'}. "
-                               + ("New work is paused; replies to you continue. You can raise the cap "
-                                  "(carefully) by telling me, or in the web app." if g.level == "red" else ""),
-                               chat=None, kind="alert", severity=sev)
+                               + hint, chat=None, kind="alert", severity=sev)
             gates[prov] = g
         self.gates = gates
         self.p.db.set_kv("gates", {k: v.as_dict() for k, v in gates.items()})
