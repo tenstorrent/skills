@@ -2793,12 +2793,15 @@ def test_finished_worktrees_are_removed_at_task_end_only_when_nothing_is_lost(en
     p = make(env)
     from ttp.daemon import Daemon
     t_clean, clean, clean_branch = _code_task(p, "clean")
+    (clean / ".gitignore").write_text("build/\n")
     _commit_file(clean, "clean")
     (clean / "build").mkdir()
     (clean / "build" / "big.o").write_bytes(b"0" * 1000)
     head = _git_out(clean, "rev-parse", "HEAD")
     t_dirty, dirty, _ = _code_task(p, "dirty", status="failed")
     (dirty / "pkg").mkdir()
+    (dirty / ".gitignore").write_text("build/\n__pycache__/\n.venv/\n")
+    _git_out(dirty, "add", ".gitignore")
     _commit_file(dirty / "pkg", "mod")
     (dirty / "README.md").write_text("edited\n")
     for cache in ("build", "pkg/__pycache__", ".venv/lib"):
@@ -2840,11 +2843,56 @@ def test_a_tracked_file_in_a_cache_named_directory_is_never_cleared(env):
     _, path, _ = _code_task(p, "tracked build dir")
     (path / "build").mkdir()
     (path / "build" / "script.sh").write_text("echo hi\n")
+    (path / ".gitignore").write_text("*.o\n__pycache__/\n")
     _git_out(path, "add", ".")
     _git_out(path, *_IDENT, "commit", "-qm", "tracked build dir")
     (path / "build" / "out.o").write_text("x")
-    assert worktree.clear_caches(path) == ["build/out.o"]
-    assert (path / "build" / "script.sh").exists()
+    (path / "build" / "__pycache__").mkdir()
+    (path / "build" / "__pycache__" / "m.pyc").write_text("x")
+    assert worktree.clear_caches(path) == ["build/__pycache__"]
+    assert (path / "build" / "script.sh").exists() and (path / "build" / "out.o").exists()
+
+
+def test_an_untracked_file_in_a_tracked_build_directory_keeps_the_worktree(env):
+    p = make(env)
+    from ttp import worktree
+    tid, path, _ = _code_task(p, "new build step")
+    (path / "tools" / "build").mkdir(parents=True)
+    (path / "tools" / "build" / "CMakeLists.txt").write_text("project(x)\n")
+    _git_out(path, "add", ".")
+    _git_out(path, *_IDENT, "commit", "-qm", "tools")
+    (path / "tools" / "build" / "new.cmake").write_text("uncommitted work\n")
+    (res,) = worktree.sweep(p)
+    assert (path / "tools" / "build" / "new.cmake").read_text() == "uncommitted work\n", "uncommitted work was lost"
+    assert res["cleared"] == [] and "uncommitted" in res["why"] and path.exists()
+
+
+def test_a_finished_worktree_stays_while_an_unfinished_task_still_needs_it(env):
+    p = make(env)
+    from ttp import worktree
+    from ttp.daemon import Daemon
+    tid, path, branch = _code_task(p, "change")
+    _commit_file(path, "change")
+    review = p.db.add_task("review change", "Review it, then ttp push.", kind="review", tier="light",
+                           origin="user", depends_on=[tid])
+    named = p.db.add_task("review by name", f"Push {branch} after checks.", kind="review", tier="light",
+                          origin="user")
+    p.db.update_task(review, status="cancelled")
+    d = Daemon(p.base)
+    d.prune_worktrees()
+    assert path.exists(), "the worktree went while a queued task names its branch"
+    assert f"task #{named} (queued)" in p.db.kv("worktrees_kept")[str(tid)]
+    p.db.update_task(named, status="done")
+    p.db.update_task(review, status="queued")
+    d.prune_worktrees()
+    assert path.exists(), "the worktree went while a queued review depends on its task"
+    p.db.update_task(review, status="done")
+    d.prune_worktrees()
+    assert not path.exists() and str(tid) not in (p.db.kv("worktrees_kept") or {})
+    assert worktree.needed_by({"id": 7, "branch": None}, [{"id": 8, "status": "queued", "spec": "see #7 and t7.",
+                                                           "depends_on": None, "labels": None}])
+    assert not worktree.needed_by({"id": 7, "branch": None}, [{"id": 8, "status": "queued", "spec": "#70, t77",
+                                                               "depends_on": None, "labels": None}])
 
 
 def test_a_task_continuing_one_whose_worktree_was_removed_starts_from_its_commits(env):

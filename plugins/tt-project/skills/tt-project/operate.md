@@ -38,9 +38,11 @@
   the disk and `disk.min_free_gb` (150) → only question and plan tasks start; running work goes on;
   one high alert per episode, cleared once free space is 1.2× the threshold. Status, the web app and
   the coordinator's digest show free space.
-- When a task ends (done, failed, cancelled), its worktree loses its build and cache directories
-  (`disk.cache_dirs`) and is removed once clean with HEAD on a branch. Branches are never deleted,
-  so `continues` still starts from the old commits. A dirty worktree is kept and listed.
+- When a task ends (done, failed, cancelled), its worktree loses its git-ignored build and cache
+  directories (`disk.cache_dirs`) and is removed once clean with HEAD on a branch. Branches are never
+  deleted, so `continues` still starts from the old commits. A dirty worktree is kept and listed, and
+  so is one an unfinished task still needs (it depends on or continues the task, or its spec names
+  the task's branch or id), until that task ends.
   `ttp prune <name>` sweeps now.
 - Coordinator failing repeatedly → an alert says so; messages are kept, not lost.
 - A worker that produces nothing for too long is stopped and retried (stall guard).

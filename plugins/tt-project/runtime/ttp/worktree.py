@@ -122,29 +122,34 @@ def keep_reason(path: Path) -> str | None:
     return None if held.stdout.strip() else "commits on no branch (detached HEAD)"
 
 
-# Build output and tool caches: regenerated on demand, often gigabytes. Matched against each path
-# component of the untracked or ignored entries git lists, so a tracked file is never touched.
+# Build output and tool caches: regenerated on demand, often gigabytes. Only ignored entries are
+# cleared, so a tracked file or an uncommitted new one (which keeps the worktree) is never touched.
 CACHE_DIRS = ["build", "_build", "cmake-build-*", ".cache", "__pycache__", ".pytest_cache", ".mypy_cache",
               ".ruff_cache", ".tox", ".nox", ".venv", "venv", "node_modules", "*.egg-info", ".eggs",
               ".gradle", ".ccache"]
 
 
 def clear_caches(path: Path, names: list[str] | None = None) -> list[str]:
-    """Delete untracked or ignored build and cache directories in a worktree, and anything
-    untracked below one. Returns what went."""
+    """Delete ignored build and cache directories in a worktree. A cache-named directory goes only
+    when git ignores it wholly; else just the ignored entries named like one inside it. Returns
+    what went."""
     import fnmatch
     import shutil
     pats = CACHE_DIRS if names is None else names
+    out = subprocess.run(["git", "-C", str(path), "ls-files", "--others", "--ignored", "--exclude-standard",
+                          "--directory", "-z"], capture_output=True, text=True, timeout=300)
+    if out.returncode != 0:
+        return []
+    # With --directory git lists a directory itself only when everything in it is ignored.
+    listed = {e.rstrip("/") for e in out.stdout.split("\0") if e}
     found: set[str] = set()
-    for extra in ([], ["--ignored", "--exclude-standard"]):
-        out = subprocess.run(["git", "-C", str(path), "ls-files", "--others", "--directory", "-z", *extra],
-                             capture_output=True, text=True, timeout=300)
-        if out.returncode != 0:
-            return []
-        for entry in filter(None, out.stdout.split("\0")):
-            # The entry itself, never a parent: git lists only wholly untracked paths.
-            if any(fnmatch.fnmatchcase(part, pat) for part in entry.rstrip("/").split("/") for pat in pats):
-                found.add(entry.rstrip("/"))
+    for entry in listed:
+        parts = entry.split("/")
+        for i, part in enumerate(parts):
+            prefix = "/".join(parts[:i + 1])
+            if prefix in listed and any(fnmatch.fnmatchcase(part, pat) for pat in pats):
+                found.add(prefix)
+                break
     gone = []
     for rel in sorted(found):
         if any(rel.startswith(g + "/") for g in gone):
@@ -163,12 +168,27 @@ def clear_caches(path: Path, names: list[str] | None = None) -> list[str]:
     return gone
 
 
+def needed_by(task: dict, open_tasks: list[dict]) -> dict | None:
+    """The first unfinished task that may still work in this task's worktree (a review that runs
+    `ttp push` there, say): it depends on or continues the task, or its spec names the task's
+    branch or id (#12, t12, task 12)."""
+    from .db import dependency_ids
+    tid, branch = task["id"], task.get("branch")
+    named = re.compile(rf"(?<![\w/.-])(?:#|t|task\s+){tid}(?!\d)"
+                       + (rf"|(?<![\w/.-]){re.escape(branch)}(?![\w/-])" if branch else ""), re.I)
+    for t in open_tasks:
+        if t["id"] != tid and (tid in dependency_ids(t) or continues_id(t) == tid or named.search(t.get("spec") or "")):
+            return t
+    return None
+
+
 def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None,
           skip=lambda task: False) -> list[dict]:
     """Tidy the worktrees of finished tasks (done, failed, cancelled) with no run still going: clear
     their build and cache directories, then remove each one whose removal loses nothing (see
-    keep_reason). Branches stay, so a task that `continues` one starts from its commits. One sweep
-    at a time per project; a busy lock returns no results."""
+    keep_reason). A worktree an unfinished task still needs (see needed_by) is left as it is, and
+    reported with `held` set. Branches stay, so a task that `continues` one starts from its commits.
+    One sweep at a time per project; a busy lock returns no results."""
     import fcntl
     import time
     from .db import TERMINAL_TASK_STATES
@@ -183,6 +203,8 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
             return []
         out = []
         now = time.time()
+        open_tasks = p.db.q("SELECT id, status, spec, depends_on, labels FROM tasks WHERE status NOT IN (%s)"
+                            % ",".join("?" * len(TERMINAL_TASK_STATES)), TERMINAL_TASK_STATES)
         for path in sorted(p.worktrees.iterdir()):
             m = re.fullmatch(r"t(\d+)", path.name)
             task = p.db.task(int(m.group(1))) if m else None
@@ -192,6 +214,11 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
                 continue
             res = {"task": task["id"], "path": str(path), "branch": task["branch"], "status": task["status"],
                    "updated": task["updated"]}
+            user = needed_by(task, open_tasks)
+            if user:
+                out.append({**res, "cleared": [], "held": True,
+                            "why": f"task #{user['id']} ({user['status']}) may still use it"})
+                continue
             try:
                 res["cleared"] = clear_caches(path, names)
                 res["why"] = keep_reason(path)

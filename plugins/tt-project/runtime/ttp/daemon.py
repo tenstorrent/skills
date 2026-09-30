@@ -1355,7 +1355,8 @@ class Daemon:
             else:
                 if r["task"] not in self._kept:
                     log(self.p, f"worktree {r['path']} of task {r['task']} kept: {r['why']}")
-                self._kept[r["task"]] = (r["updated"], now, r["why"])
+                # Held for another task: checked again every sweep (no git work), so it goes soon after that task ends.
+                self._kept[r["task"]] = (r["updated"], 0 if r.get("held") else now, r["why"])
         kept = {str(t): why for t, (_, _, why) in sorted(self._kept.items())
                 if (self.p.worktrees / f"t{t}").exists()}
         if kept != (self.p.db.kv("worktrees_kept") or {}):
