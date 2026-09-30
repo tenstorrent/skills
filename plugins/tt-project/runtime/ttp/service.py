@@ -6,6 +6,10 @@ Linux: a systemd user unit (restart on failure) plus `loginctl enable-linger` so
 a login session and starts at boot. Where linger is refused, a crontab watchdog (@reboot plus
 every 5 minutes) restarts the daemon instead. macOS: a launchd agent with KeepAlive and the
 project folder as working directory (never `/` or the home folder).
+
+A daemon that is alive but stuck (no completed tick for WATCHDOG_S) is restarted too: systemd by
+WatchdogSec (the daemon pings it after each tick), launchd and cron by `ttp.watchdog`, run every
+5 minutes, which ends it so the service starts a new one.
 """
 from __future__ import annotations
 
@@ -27,8 +31,27 @@ def unit_name(p: Project) -> str:
     return "tt-project-" + re.sub(r"[^A-Za-z0-9_.-]", "-", p.name)
 
 
+WATCHDOG_EVERY_S = 300   # how often launchd and cron look for a stuck daemon
+
+
 def daemon_argv(p: Project) -> list[str]:
     return [sys.executable, "-m", "ttp.daemon", str(p.base)]
+
+
+def watchdog_argv(p: Project) -> list[str]:
+    return [sys.executable, "-m", "ttp.watchdog", str(p.base)]
+
+
+def launchd_label(p: Project, watchdog: bool = False) -> str:
+    return f"com.tt-project.{unit_name(p)}" + (".watchdog" if watchdog else "")
+
+
+def _agent(p: Project, watchdog: bool = False) -> Path:
+    return Path.home() / "Library" / "LaunchAgents" / f"{launchd_label(p, watchdog)}.plist"
+
+
+def _unit(p: Project) -> Path:
+    return Path.home() / ".config" / "systemd" / "user" / f"{unit_name(p)}.service"
 
 
 def _env(p: Project) -> dict:
@@ -56,11 +79,10 @@ def install(p: Project) -> str:
     return _install_cron(p)
 
 
-def _install_systemd(p: Project) -> str:
-    d = Path.home() / ".config" / "systemd" / "user"
-    d.mkdir(parents=True, exist_ok=True)
+def _unit_text(p: Project) -> str:
+    from .daemon import WATCHDOG_S
     env = "\n".join(f"Environment={k}={v}" for k, v in _env(p).items())
-    (d / f"{unit_name(p)}.service").write_text(f"""[Unit]
+    return f"""[Unit]
 Description=tt-project daemon for {p.name}
 After=network-online.target
 
@@ -72,10 +94,17 @@ ExecStart={' '.join(shlex.quote(a) for a in daemon_argv(p))}
 Restart=always
 RestartSec=10
 KillMode=process
+WatchdogSec={WATCHDOG_S}
+NotifyAccess=main
 
 [Install]
 WantedBy=default.target
-""")
+"""
+
+
+def _install_systemd(p: Project) -> str:
+    _unit(p).parent.mkdir(parents=True, exist_ok=True)
+    _unit(p).write_text(_unit_text(p))
     _run("systemctl", "--user", "daemon-reload")
     r = _run("systemctl", "--user", "enable", "--now", f"{unit_name(p)}.service")
     if r.returncode != 0:
@@ -84,8 +113,8 @@ WantedBy=default.target
 
 
 def _install_launchd(p: Project) -> str:
-    label = f"com.tt-project.{unit_name(p)}"
-    plist = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
+    label = launchd_label(p)
+    plist = _agent(p)
     plist.parent.mkdir(parents=True, exist_ok=True)
     p.logs.mkdir(parents=True, exist_ok=True)
     job = {"Label": label, "ProgramArguments": daemon_argv(p), "WorkingDirectory": str(p.base),
@@ -99,7 +128,24 @@ def _install_launchd(p: Project) -> str:
     r = _run("launchctl", "bootstrap", f"gui/{uid}", str(plist))
     if r.returncode != 0:
         return f"launchd bootstrap failed: {r.stderr.strip()[:200]}"
-    return f"launchd agent {label}"
+    return f"launchd agent {label}" + _install_launchd_watchdog(p)
+
+
+def _install_launchd_watchdog(p: Project) -> str:
+    """A second agent that runs `ttp.watchdog` every few minutes: KeepAlive restarts a daemon that
+    exits, not one that is alive but stuck."""
+    label, plist = launchd_label(p, watchdog=True), _agent(p, watchdog=True)
+    job = {"Label": label, "ProgramArguments": watchdog_argv(p), "WorkingDirectory": str(p.base),
+           "EnvironmentVariables": _env(p), "StartInterval": WATCHDOG_EVERY_S, "ProcessType": "Background",
+           "StandardOutPath": str(p.logs / "launchd.log"), "StandardErrorPath": str(p.logs / "launchd.log")}
+    plist.parent.mkdir(parents=True, exist_ok=True)
+    p.logs.mkdir(parents=True, exist_ok=True)
+    with open(plist, "wb") as f:
+        plistlib.dump(job, f)
+    uid = os.getuid()
+    _run("launchctl", "bootout", f"gui/{uid}/{label}")
+    r = _run("launchctl", "bootstrap", f"gui/{uid}", str(plist))
+    return " with a watchdog" if r.returncode == 0 else f" (watchdog bootstrap failed: {r.stderr.strip()[:200]})"
 
 
 CRON_TAG = "# tt-project:"
@@ -109,8 +155,7 @@ def _install_cron(p: Project) -> str:
     cur = _run("crontab", "-l").stdout if shutil.which("crontab") else ""
     tag = f"{CRON_TAG}{p.base}"
     keep = [ln for ln in cur.splitlines() if tag not in ln]
-    cmd = _cron_cmd(p)
-    keep += [f"@reboot {cmd} {tag}", f"*/5 * * * * {cmd} {tag}"]
+    keep += _cron_lines(p)
     r = subprocess.run(["crontab", "-"], input="\n".join(keep) + "\n", text=True, capture_output=True)
     if r.returncode != 0:
         return "crontab install failed: " + r.stderr.strip()[:200]
@@ -119,25 +164,32 @@ def _install_cron(p: Project) -> str:
     return "crontab watchdog"
 
 
+def _cron_lines(p: Project) -> list[str]:
+    """At boot, start the daemon; every 5 minutes, end a stuck one, then start one if none runs."""
+    tag, cmd = f"{CRON_TAG}{p.base}", _cron_cmd(p)
+    return [f"@reboot {cmd} {tag}", f"*/5 * * * * {_cron_cmd(p, watchdog_argv(p))}; {cmd} {tag}"]
+
+
 def _spawn(p: Project) -> None:
     subprocess.Popen(["sh", "-c", _cron_cmd(p)], start_new_session=True, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL)
 
 
-def _cron_cmd(p: Project) -> str:
+def _cron_cmd(p: Project, argv: list[str] | None = None) -> str:
     env = " ".join(f"{k}={shlex.quote(v)}" for k, v in _env(p).items())
-    return f"cd {shlex.quote(str(p.base))} && {env} {' '.join(shlex.quote(a) for a in daemon_argv(p))} " \
+    argv = argv or daemon_argv(p)
+    return f"cd {shlex.quote(str(p.base))} && {env} {' '.join(shlex.quote(a) for a in argv)} " \
            f">> {shlex.quote(str(p.logs / 'daemon.out'))} 2>&1"
 
 
 def uninstall(p: Project) -> str:
     done = []
     if sys.platform == "darwin":
-        label = f"com.tt-project.{unit_name(p)}"
-        _run("launchctl", "bootout", f"gui/{os.getuid()}/{label}")
-        (Path.home() / "Library" / "LaunchAgents" / f"{label}.plist").unlink(missing_ok=True)
+        for wd in (True, False):
+            _run("launchctl", "bootout", f"gui/{os.getuid()}/{launchd_label(p, wd)}")
+            _agent(p, wd).unlink(missing_ok=True)
         done.append("launchd")
-    unit = Path.home() / ".config" / "systemd" / "user" / f"{unit_name(p)}.service"
+    unit = _unit(p)
     if unit.exists():
         _run("systemctl", "--user", "disable", "--now", unit.name)
         unit.unlink()
@@ -153,15 +205,74 @@ def uninstall(p: Project) -> str:
     return ", ".join(done) or "nothing installed"
 
 
+def installed(p: Project) -> dict | None:
+    """The service that keeps the daemon running, {"kind": "systemd" | "launchd" | "cron", "watchdog":
+    whether it also restarts a stuck daemon (one installed before the watchdog existed does not)}, or
+    None when there is none (`ttp stop`, or a daemon started by hand). Cached for a minute: the web
+    app asks often."""
+    now = time.time()
+    hit = _WATCHDOG_SEEN.get(str(p.base))
+    if hit and now - hit[0] < 60:
+        return hit[1]
+    found = None
+    unit = _unit(p)
+    if unit.exists():
+        found = {"kind": "systemd", "watchdog": "WatchdogSec=" in unit.read_text(errors="replace")}
+    elif sys.platform == "darwin" and _agent(p).exists():
+        found = {"kind": "launchd", "watchdog": _agent(p, watchdog=True).exists()}
+    elif shutil.which("crontab"):
+        mine = [ln for ln in _run("crontab", "-l").stdout.splitlines() if f"{CRON_TAG}{p.base}" in ln]
+        if mine:
+            found = {"kind": "cron", "watchdog": any("ttp.watchdog" in ln for ln in mine)}
+    _WATCHDOG_SEEN[str(p.base)] = (now, found)
+    return found
+
+
+def down_note(p: Project) -> str:
+    """What happens to a daemon that is down or stuck, naming a step only where the harness has none."""
+    from .daemon import WATCHDOG_S
+    svc = installed(p)
+    if svc and svc["watchdog"]:
+        return (f"its {svc['kind']} service restarts it by itself (a stuck one after "
+                f"{WATCHDOG_S // 60} min without a tick)")
+    if svc:
+        return (f"its {svc['kind']} service restarts it if it exits, but predates the watchdog for a stuck "
+                f"one: `ttp restart {p.name}` restarts it and adds the watchdog")
+    return f"no service keeps it running (stopped on purpose?): `ttp start {p.name}` starts it"
+
+
+_WATCHDOG_SEEN: dict[str, tuple[float, str | None]] = {}
+
+
+def refresh(p: Project) -> None:
+    """Bring an installed service up to date with this runtime (a service installed before the
+    watchdog existed gets it) without starting or stopping anything."""
+    unit = _unit(p)
+    if unit.exists() and unit.read_text(errors="replace") != _unit_text(p):
+        unit.write_text(_unit_text(p))
+        _run("systemctl", "--user", "daemon-reload")
+    if sys.platform == "darwin" and _agent(p).exists() and not _agent(p, watchdog=True).exists():
+        _install_launchd_watchdog(p)
+    if shutil.which("crontab"):
+        cur = _run("crontab", "-l").stdout
+        tag = f"{CRON_TAG}{p.base}"
+        if tag in cur and "ttp.watchdog" not in "".join(ln for ln in cur.splitlines() if tag in ln):
+            keep = [ln for ln in cur.splitlines() if tag not in ln]
+            keep += _cron_lines(p)
+            subprocess.run(["crontab", "-"], input="\n".join(keep) + "\n", text=True, capture_output=True)
+    _WATCHDOG_SEEN.pop(str(p.base), None)
+
+
 def restart_service(p: Project) -> str:
     """Restart the daemon process. Running workers are not touched: the new daemon adopts them."""
-    label = f"com.tt-project.{unit_name(p)}"
-    if sys.platform == "darwin" and (Path.home() / "Library" / "LaunchAgents" / f"{label}.plist").exists():
+    refresh(p)
+    label = launchd_label(p)
+    if sys.platform == "darwin" and _agent(p).exists():
         r = _run("launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}")
         if r.returncode == 0:
             return "restarted"
         # The agent is not loaded (its bootstrap failed): restart the daemon by hand like cron does.
-    unit = Path.home() / ".config" / "systemd" / "user" / f"{unit_name(p)}.service"
+    unit = _unit(p)
     if unit.exists():
         r = _run("systemctl", "--user", "restart", unit.name)
         return "restarted" if r.returncode == 0 else r.stderr.strip()[:200]

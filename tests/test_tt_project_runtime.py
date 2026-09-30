@@ -2843,8 +2843,157 @@ def test_a_macos_restart_uses_the_launchd_agent_and_falls_back_when_it_is_not_lo
                         lambda *a: calls.append(a) or subprocess.CompletedProcess(a, kickstart_rc, "", ""))
     monkeypatch.setattr(service, "_spawn", lambda p: spawned.append(p))
     assert service.restart_service(p) == "restarted"
-    assert calls == [("launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}")]
+    # A daemon agent installed before the watchdog existed gets its watchdog agent on restart.
+    boot = [c for c in calls if c[:2] == ("launchctl", "bootstrap")]
+    assert boot and boot[0][-1].endswith(".watchdog.plist"), calls
+    assert calls[-1] == ("launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}")
     assert bool(spawned) == bool(kickstart_rc), "a loaded agent restarts itself; an unloaded one is started by hand"
+
+
+def test_systemd_restarts_a_stuck_daemon_through_its_watchdog(env, monkeypatch):
+    import socket
+    p = make(env)
+    from ttp import daemon as dm, service, web
+    unit = service._unit_text(p)
+    assert f"WatchdogSec={dm.WATCHDOG_S}\n" in unit and "NotifyAccess=main" in unit and "Restart=always" in unit
+    assert dm.WATCHDOG_S > dm.HEARTBEAT_STALE_S
+    addr = str(env["tmp"] / "notify.sock")
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    sock.bind(addr)
+    sock.settimeout(5)
+    monkeypatch.setenv("NOTIFY_SOCKET", addr)
+    d = dm.Daemon(p.base)
+    ticks = []
+
+    def tick():
+        ticks.append(os.environ.get("NOTIFY_SOCKET"))
+        d.stopping = len(ticks) >= 2
+
+    monkeypatch.setattr(d, "tick", tick)
+    monkeypatch.setattr(web, "serve", lambda daemon: None)
+    monkeypatch.setattr(dm.signal, "signal", lambda *a: None)
+    monkeypatch.setattr(dm.time, "sleep", lambda s: None)
+    try:
+        assert d.run() == 0
+        assert [sock.recv(64), sock.recv(64)] == [b"WATCHDOG=1"] * 2, "each completed tick pings systemd"
+    finally:
+        sock.close()
+    assert ticks == [None, None], "runs and their tools would inherit systemd's socket"
+    assert not dm.sd_notify("WATCHDOG=1", None)
+
+
+def _stuck_daemon(env, monkeypatch, age):
+    """A live process the project takes for its daemon, whose last completed tick was `age` s ago."""
+    from ttp import daemon as dm, watchdog
+    p = make(env)
+    proc = subprocess.Popen(["sleep", "600"])
+    monkeypatch.setattr(watchdog, "_is_daemon", lambda pid: pid == proc.pid and proc.poll() is None)
+    (p.state / "daemon.pid").write_text(str(proc.pid))
+    hb = p.state / "heartbeat"
+    hb.write_text(json.dumps({"pid": proc.pid, "started": time.time() - 3600}))
+    os.utime(hb, (time.time() - age, time.time() - age))
+    assert dm.heartbeat(p)["pid"] == proc.pid
+    return p, proc
+
+
+def test_the_watchdog_ends_a_stuck_daemon_after_two_looks_and_says_so(env, monkeypatch):
+    from ttp import watchdog
+    from ttp.daemon import WATCHDOG_S
+    p, proc = _stuck_daemon(env, monkeypatch, age=WATCHDOG_S + 100)
+    now = time.time()
+    try:
+        # A stale heartbeat alone (a laptop just woke from sleep) is only noted.
+        assert watchdog.check(p, now=now) == "stale"
+        assert watchdog.check(p, now=now + watchdog.CONFIRM_S / 2) == "stale", "a second look too soon"
+        assert proc.poll() is None
+        assert watchdog.check(p, now=now + watchdog.CONFIRM_S, grace_s=5) == "restarted"
+        assert proc.wait(timeout=10) is not None
+    finally:
+        proc.kill()
+        proc.wait()
+    assert not (p.state / "watchdog.json").exists()
+    msg = p.db.one("SELECT kind, severity, text FROM messages WHERE ref LIKE 'watchdog:%'")
+    assert msg["kind"] == "info" and msg["severity"] == "low" and "restarted it" in msg["text"], dict(msg)
+    assert "watchdog: daemon pid=" in (p.logs / "daemon.log").read_text()
+    assert watchdog.check(p) == "not running"
+
+
+def test_the_watchdog_leaves_a_daemon_that_ticks_again_alone(env, monkeypatch):
+    p, proc = _stuck_daemon(env, monkeypatch, age=400)
+    from ttp import watchdog
+    from ttp.daemon import WATCHDOG_S
+    now = time.time()
+    try:
+        assert watchdog.check(p, now=now) == "stale"
+        assert watchdog.check(p, now=now + watchdog.CONFIRM_S) == "stale", "younger than WATCHDOG_S"
+        os.utime(p.state / "heartbeat", None)   # the daemon woke and completed a tick
+        assert watchdog.check(p) == "ok"
+        assert not (p.state / "watchdog.json").exists()
+        # A new stale heartbeat starts the count again rather than ending the daemon at once.
+        old = time.time() - 2 * WATCHDOG_S
+        os.utime(p.state / "heartbeat", (old, old))
+        assert watchdog.check(p, now=time.time()) == "stale"
+        assert proc.poll() is None
+    finally:
+        proc.kill()
+        proc.wait()
+    assert not p.db.one("SELECT id FROM messages WHERE ref LIKE 'watchdog:%'")
+
+
+def test_launchd_and_cron_run_the_watchdog_and_old_installs_get_it(env, monkeypatch):
+    p = make(env)
+    from ttp import service
+    monkeypatch.setenv("HOME", str(env["tmp"] / "userhome"))
+    service._WATCHDOG_SEEN.clear()
+    lines = service._cron_lines(p)
+    assert lines[0].startswith("@reboot ") and "ttp.watchdog" not in lines[0]
+    assert lines[1].startswith("*/5 ") and lines[1].index("ttp.watchdog") < lines[1].index("ttp.daemon"), lines
+    # An old crontab entry (daemon only) gets the watchdog when the service is refreshed.
+    tag = f"{service.CRON_TAG}{p.base}"
+    tab = {"text": f"0 1 * * * other job\n@reboot {service._cron_cmd(p)} {tag}\n*/5 * * * * {service._cron_cmd(p)} {tag}\n"}
+    monkeypatch.setattr(service.shutil, "which", lambda name: "/usr/bin/" + name if name == "crontab" else None)
+
+    def run(*argv):
+        return subprocess.CompletedProcess(argv, 0, tab["text"] if argv[:2] == ("crontab", "-l") else "", "")
+
+    def write(argv, input=None, **kw):
+        if argv == ["crontab", "-"]:
+            tab["text"] = input
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(service, "_run", run)
+    monkeypatch.setattr(service.subprocess, "run", write)
+    monkeypatch.setattr(service.sys, "platform", "linux")
+    assert service.installed(p) == {"kind": "cron", "watchdog": False}
+    assert "predates the watchdog" in service.down_note(p) and "`ttp restart demo`" in service.down_note(p)
+    service.refresh(p)
+    assert "0 1 * * * other job" in tab["text"] and tab["text"].count(tag) == 2
+    assert service.installed(p) == {"kind": "cron", "watchdog": True}
+    note = service.down_note(p)
+    assert "restarts it by itself" in note and "ttp " not in note, note
+    # macOS: a second agent runs the watchdog every few minutes; KeepAlive alone misses a stuck daemon.
+    monkeypatch.setattr(service.sys, "platform", "darwin")
+    job = {}
+    monkeypatch.setattr(service.plistlib, "dump", lambda j, f: job.update(j))
+    assert service._install_launchd_watchdog(p) == " with a watchdog"
+    assert job["ProgramArguments"][-3:] == ["-m", "ttp.watchdog", str(p.base)]
+    assert job["StartInterval"] == service.WATCHDOG_EVERY_S and "KeepAlive" not in job
+    tab["text"] = ""
+    service._WATCHDOG_SEEN.clear()
+    assert service.installed(p) is None
+    assert "`ttp start demo`" in service.down_note(p)
+
+
+def test_status_says_a_down_daemon_is_restarted_by_its_service(env, monkeypatch):
+    p = make(env)
+    from ttp import service
+    from ttp.cli import status_text
+    monkeypatch.setattr(service, "installed", lambda p: {"kind": "systemd", "watchdog": True})
+    out = status_text(p)   # no daemon ever ran here
+    idle = [ln for ln in out.splitlines() if "daemon is not running" in ln]
+    assert idle and "systemd service restarts it by itself" in idle[0] and "ttp restart" not in idle[0], out
+    js = (RUNTIME / "ttp" / "web" / "app.js").read_text()
+    assert "Its watchdog restarts it after" in js
 
 
 def test_the_daemon_records_its_start_and_first_tick_failures(env, monkeypatch):
@@ -6566,7 +6715,8 @@ def test_the_web_page_explains_an_unreachable_daemon_without_setup_details(env):
     from ttp.web import offline_help, state_payload
     text = offline_help("demo")
     assert "`ttp web demo --tunnel`" in text and "`ttp web demo --tunnel --keep`" in text, text
-    assert "`ttp restart demo`" in text and "testhost" not in text, text
+    # Its service restarts a down daemon by itself: the page says so rather than name a command.
+    assert "service restarts it" in text and "ttp restart" not in text and "testhost" not in text, text
     assert state_payload(p, p.db)["offline_help"] == text
     js = (RUNTIME / "ttp" / "web" / "app.js").read_text()
     assert "Cannot reach the project's daemon" in js and 'localStorage.getItem("ttp_offline_help")' in js

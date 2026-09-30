@@ -18,6 +18,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -45,6 +46,7 @@ from .providers.jev import Jev, JevOutOfFunds
 TICK_S = 3.0
 LEASE_STALE_S = 180
 HEARTBEAT_STALE_S = 300   # longer than any single tick step (a git fetch, a watcher command)
+WATCHDOG_S = 2 * HEARTBEAT_STALE_S   # no completed tick this long: the service restarts the daemon
 RESULT_FILE = "result.json"
 MAX_FOLLOWUPS, FOLLOWUP_SPEC_CHARS = 12, 4000   # per hand-off; each follow-up is its own event
 PROBE_EVERY_S = 180     # how often a waiting task's `retry_when` probe runs
@@ -97,6 +99,7 @@ class Daemon:
         self._reboot_told = False
         self._boot_woken = False
         self._held: list[str] | None = None   # lock holders the heartbeat file last recorded
+        self._notify: str | None = None   # systemd's socket for the watchdog ping, when it runs us
         self._note_boot()
 
     # lifecycle ------------------------------------------------------------------------------------
@@ -107,6 +110,8 @@ class Daemon:
             print(f"daemon already running (pid {_read_pid(pidfile)})", file=sys.stderr)
             return 1
         pidfile.write_text(str(os.getpid()))
+        # Kept here rather than in the environment, which runs and their tools would inherit.
+        self._notify = os.environ.pop("NOTIFY_SOCKET", None)
         self._mark_start()
         signal.signal(signal.SIGTERM, lambda *_: setattr(self, "stopping", True))
         signal.signal(signal.SIGINT, lambda *_: setattr(self, "stopping", True))
@@ -189,6 +194,7 @@ class Daemon:
             self._held = held
         else:
             os.utime(hb, None)
+        sd_notify("WATCHDOG=1", self._notify)
         if not self._healthy:
             self._healthy = True
             try:
@@ -1964,6 +1970,22 @@ def start_marker(p: Project) -> dict | None:
         return info if isinstance(info, dict) else None
     except (OSError, ValueError):
         return None
+
+
+def sd_notify(msg: str, addr: str | None) -> bool:
+    """Tell systemd about this service (the unit's WatchdogSec expects WATCHDOG=1 after each completed
+    tick, or it restarts the daemon). No-op outside systemd."""
+    if not addr:
+        return False
+    if addr[0] == "@":   # an abstract socket
+        addr = "\0" + addr[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
+            s.connect(addr)
+            s.sendall(msg.encode())
+        return True
+    except OSError:
+        return False
 
 
 def _alive(pid: int) -> bool:

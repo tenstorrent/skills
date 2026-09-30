@@ -44,7 +44,9 @@
 
 ## Health
 
-- Daemon not running (or "stuck": up but not completing ticks) → `ttp restart <name>`; still down →
+- Daemon not running → its service restarts it. "Stuck" (up but no completed tick for 10 min) → its
+  watchdog restarts it (systemd `WatchdogSec`; launchd and cron run `ttp.watchdog` every 5 min). Only a
+  service installed before the watchdog needs `ttp restart <name>` (which adds it); still down →
   `ttp logs <name>`.
 - Only one daemon runs per project (a lock file), whatever starts it.
 - Disk guard: free space under the project folder below the smaller of `disk.min_free_pct` (5) of

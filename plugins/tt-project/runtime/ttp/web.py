@@ -16,12 +16,13 @@ from urllib.parse import parse_qs, urlparse
 from . import alerts
 from . import budget as bud
 from . import schedule as sched
-from .daemon import HEARTBEAT_STALE_S, heartbeat
+from .daemon import HEARTBEAT_STALE_S, WATCHDOG_S, heartbeat
 from .alerts import cleared  # noqa: F401  (readers import it from here)
 from .db import DB, SEVERITY_RANK, chat_floor, dump_result, host_line, load_result
 from .project import Project
 from .providers import get_provider
 from .runner import stop_runs
+from .service import down_note, installed
 
 STATIC = Path(__file__).resolve().parent / "web"
 TYPES = {".html": "text/html; charset=utf-8", ".js": "application/javascript", ".css": "text/css",
@@ -121,8 +122,8 @@ def offline_help(name: str) -> str:
     a tunnel, so the command is given as information; the daemon's own service restarts it."""
     return (f"If {name} runs on another machine, the SSH tunnel from this computer is down: "
             f"`ttp web {name} --tunnel` reopens it, and `ttp web {name} --tunnel --keep` keeps it up across "
-            f"reboots and network drops. If it runs on this computer, its daemon is down: its service "
-            f"restarts it, and `ttp restart {name}` does so now.")
+            f"reboots and network drops. If it runs on this computer, its daemon is down and its service "
+            f"restarts it within a few minutes, unless `ttp stop` stopped it.")
 
 
 WINDOW_LABELS = {"five_hour": "5-hour", "5h": "5-hour", "seven_day": "Weekly", "7d": "Weekly",
@@ -255,7 +256,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
     # What keeps ready tasks from starting; shown even while other runs work.
     stops = []
     if not alive:
-        stops.append(f"the daemon is not running (`ttp restart {p.name}`)")
+        stops.append(f"the daemon is not running: {down_note(p)}")
     if db.kv("paused", False):
         stops.append(f"the project is paused (`ttp resume {p.name}` or the web app)")
     for pp in paused_providers:
@@ -337,7 +338,8 @@ def state_payload(p: Project, db: DB) -> dict:
         "project": {"name": p.name, "root": str(p.root), "config": p.config()},
         "daemon": db.kv("daemon", {}), "paused": db.kv("paused", False),
         "gates": {k: {**g, "detail": gate_detail(g, now)} for k, g in db.kv("gates", {}).items()},
-        "heartbeat": heartbeat(p), "heartbeat_stale_s": HEARTBEAT_STALE_S, "disk_low": db.kv("disk_low"),
+        "heartbeat": heartbeat(p), "heartbeat_stale_s": HEARTBEAT_STALE_S, "watchdog_s": WATCHDOG_S,
+        "service": installed(p), "disk_low": db.kv("disk_low"),
         "disk": db.kv("disk"), "worktrees_kept": db.kv("worktrees_kept"),
         "tasks": tasks, "runs": runs,
         "issues": db.q("SELECT id,source,title,severity,status,count,first_seen,last_seen,task FROM issues "

@@ -116,7 +116,7 @@ async function refresh() {
     if (e.message === "auth") return;
     // The page keeps its last data; say so rather than let it look current.
     // Only this computer can reopen a tunnel, so the page says how; the daemon's service restarts it by itself.
-    const help = localStorage.getItem("ttp_offline_help") || "If the project runs on another machine, the SSH tunnel from this computer is down: `ttp web <project> --tunnel` reopens it, and `--keep` keeps it up. If it runs on this computer, its daemon is down.";
+    const help = localStorage.getItem("ttp_offline_help") || "If the project runs on another machine, the SSH tunnel from this computer is down: `ttp web <project> --tunnel` reopens it, and `--keep` keeps it up. If it runs on this computer, its daemon is down and its service restarts it within a few minutes.";
     banner(`Cannot reach the project's daemon (${esc(e.message || e)}). What you see is from ${lastOk ? ago(lastOk / 1000) + " ago" : "earlier"} and may be out of date.<br>${codes(help)}`);
     $("#daemon").textContent = "unreachable"; $("#daemon").className = "pill lv-red";
     return;
@@ -129,7 +129,11 @@ async function refresh() {
   const hb = st.heartbeat;
   const stuck = hb && hb.age > st.heartbeat_stale_s;
   const disk = st.disk_low;
-  banner([stuck ? `The daemon has not completed a tick for ${Math.round(hb.age / 60)} min: nothing new starts. <code>ttp restart ${esc(st.project.name)}</code> restarts it.` : "",
+  // The daemon's service restarts a stuck daemon by itself; a command is named only where none does.
+  const svc = st.service, fix = !svc ? `<code>ttp restart ${esc(st.project.name)}</code> restarts it.`
+    : svc.watchdog ? `Its watchdog restarts it after ${Math.round((st.watchdog_s || 600) / 60)} min without a tick.`
+    : `Its service predates the watchdog: <code>ttp restart ${esc(st.project.name)}</code> restarts it and adds one.`;
+  banner([stuck ? `The daemon has not completed a tick for ${Math.round(hb.age / 60)} min: nothing new starts. ${fix}` : "",
           disk ? `Only ${disk.free_gb} GB free under ${esc(disk.path)}: only questions and plans start until ${st.disk && st.disk.resume_gb ? st.disk.resume_gb + " GB are" : "space is"} free.` : "",
           h.undelivered ? `${h.undelivered.asks} question(s) not delivered to any chat since ${at(h.undelivered.since)}: is the chat relay running? Answer here meanwhile.${h.undelivered.below_floor ? ` ${h.undelivered.below_floor} of them are below every chat's severity floor.` : ""}` : ""].filter(Boolean).join("<br>"));
   $("#pname").textContent = st.project.name;
