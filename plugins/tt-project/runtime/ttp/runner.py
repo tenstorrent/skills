@@ -10,6 +10,8 @@
   otherwise run on past its bound);
 - enforces the run's dollar budget mid-flight when the provider streams usage;
 - ends the child when <run_dir>/STOP appears (a cancel, or `ttp stop --kill` writing "shutdown");
+- holds a slot of each resource an `exclusive:` task names from before the child starts until it
+  has ended, the same locks `ttp lock` takes per command;
 - writes exit.json exactly once, then asks the provider adapter for usage and records it.
 
 It survives a daemon restart: the daemon re-adopts runs by run_dir, pid and boot id.
@@ -85,10 +87,17 @@ def supervise(run_dir: Path) -> int:
     env = {**os.environ, **env_extra}
     lease, out_path = run_dir / "lease", run_dir / "output.jsonl"
     _touch(lease)
+    started = time.time()
+    held = _take_exclusive(run_dir, spec.get("exclusive") or [], spec.get("env", {}), started + timeout_s)
+    if held is None:
+        exit_info = {"rc": None, "started": started, "ended": time.time(),
+                     "stopped": stop_reason(run_dir) or "timeout"}
+        (run_dir / "exit.json.tmp").write_text(json.dumps(exit_info))
+        os.replace(run_dir / "exit.json.tmp", run_dir / "exit.json")
+        return 1
     prompt = open(run_dir / "prompt.md", "rb")
     out = open(out_path, "wb")
     err = open(run_dir / "stderr.log", "wb")
-    started = time.time()
     child = subprocess.Popen(argv, stdin=prompt, stdout=out, stderr=err, cwd=cwd, env=env,
                              start_new_session=True)
     (run_dir / "child.pid").write_text(str(child.pid))
@@ -146,13 +155,41 @@ def supervise(run_dir: Path) -> int:
     t.start()
     rc = child.wait()
     ended = time.time()
-    for f in (prompt, out, err):
+    for f in (prompt, out, err, *held):
         f.close()
     exit_info = {"rc": rc, "started": started, "ended": ended, "stopped": reason[0] if reason else None}
     tmp = run_dir / "exit.json.tmp"
     tmp.write_text(json.dumps(exit_info))
     os.replace(tmp, run_dir / "exit.json")
     return rc
+
+
+def _take_exclusive(run_dir: Path, wanted: list[dict], env: dict, deadline: float) -> list | None:
+    """One slot of each resource, waiting while `ttp lock` commands hold them all. The daemon starts
+    an exclusive task only when a slot is free, so a wait here is a race it lost. The wait counts
+    toward the run's wall clock and ends early on a stop; None when it ended without the slots."""
+    from . import locks
+    who = f"task #{env.get('TTP_TASK') or '?'} (run {env.get('TTP_RUN_ID') or '?'}), whole run"
+    held, told = [], 0.0
+    for res in wanted:
+        paths = [Path(x) for x in res["paths"]]
+        while True:
+            f = locks.try_take(paths, who, "exclusive")
+            if f:
+                held.append(f)
+                break
+            if stop_reason(run_dir) or time.time() > deadline:
+                for h in held:
+                    h.close()
+                return None
+            _touch(run_dir / "lease")
+            if time.time() - told >= 120:
+                with open(run_dir / "progress.md", "a") as pf:
+                    pf.write(f"{time.strftime('%H:%M:%S')} waiting for {res['resource']} "
+                             f"(held by {', '.join(locks.holders(paths)) or 'another task'})\n")
+                told = time.time()
+            time.sleep(2)
+    return held
 
 
 if __name__ == "__main__":

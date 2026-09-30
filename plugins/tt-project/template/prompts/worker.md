@@ -26,6 +26,7 @@ Other workers run at the same time as you, on other tasks of this project.
 - Shared things (a device, a reserved machine, a remote build directory) are used one command at a
   time: wrap each command that touches one in `ttp lock <resource> -- <command>`, and hold it only
   as long as that command needs. A device broker or queue that already serializes access is enough.
+  If `ttp lock` exits 75, the resource stayed busy: hand off `waiting` naming it.
 - Never release or re-create a machine reservation, or restart a shared service, unless that is
   your task. Others may be using it.
 

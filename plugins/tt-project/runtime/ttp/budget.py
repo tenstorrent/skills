@@ -31,6 +31,10 @@ WINDOW_HOURS = {"five_hour": 5.0, "5h": 5.0, "seven_day": 168.0, "7d": 168.0, "s
                 "seven_day_sonnet": 168.0}
 # Spend this long after a plan provider's last window reading still counts as plan-billed.
 PLAN_GRACE_S = HOUR
+# A plan provider's windows arrive with each run or from a meter read every few minutes. Once its
+# last reading is stale and this many paid runs have ended since, it is billed by use (an API key,
+# an expired plan): the dollar caps apply again.
+PLAN_LAPSE_RUNS = 2
 # Relative price of each token class (input = 1), used only to apply an observed rate to a token
 # mix; not a price list. Override with budget.estimate_weights.
 TOKEN_WEIGHTS = {"input": 1.0, "output": 5.0, "cache_read": 0.1, "cache_write": 1.25}
@@ -73,7 +77,11 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
     g = Gate(provider=provider, max_parallel=int(b.get("max_parallel_workers", 6)))
     limit = 100.0 - float(b.get("reserve_pct", 10))
 
-    plan = [w for w in windows if w.provider == provider]
+    last = plan_providers(db, now)
+    lapsed = {p for p, ts in last.items() if now - ts > SNAPSHOT_FRESH_S and plan_lapsed(db, p, ts)}
+    plan = [w for w in windows if w.provider == provider and provider not in lapsed]
+    if provider in lapsed:
+        g.reasons.append(f"{provider} stopped reporting plan windows; its spend counts toward the dollar caps")
     if plan:
         g.regime = "windows"
         _pace(db, g, provider, plan, limit, int(b.get("max_parallel_workers", 6)), now)
@@ -84,8 +92,8 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
         # Only spend up to a provider's last reading (plus grace) is plan-billed: a provider that
         # stops reporting windows may have moved to usage billing. The windows passed in may be
         # days old, so only a fresh reading covers spend up to now.
-        last = plan_providers(db, now)
-        windowed = {p: now if now - ts <= SNAPSHOT_FRESH_S else ts + PLAN_GRACE_S for p, ts in last.items()}
+        windowed = {p: ts if p in lapsed else now if now - ts <= SNAPSHOT_FRESH_S else ts + PLAN_GRACE_S
+                    for p, ts in last.items()}
         windowed.update({w.provider: now for w in windows if w.provider not in last})
         d = db.spent_since(now - DAY, exclude=windowed)
         w7 = db.spent_since(now - WEEK, exclude=windowed)
@@ -278,6 +286,14 @@ def plan_providers(db: DB, now: float | None = None) -> dict[str, float]:
     now = now or time.time()
     return {r["provider"]: float(r["ts"]) for r in
             db.q("SELECT provider, MAX(ts) ts FROM snapshots WHERE ts>=? GROUP BY provider", (now - WEEK,))}
+
+
+def plan_lapsed(db: DB, provider: str, last_reading: float) -> bool:
+    """Whether the provider's paid runs since its last window reading say it is no longer on a plan.
+    A run's spend is recorded just before the windows it reported, so only runs without a reading
+    count."""
+    return db.one("SELECT COUNT(*) n FROM ledger WHERE provider=? AND ts>? AND usd>0",
+                  (provider, last_reading))["n"] >= PLAN_LAPSE_RUNS
 
 
 def record_windows(db: DB, windows: list[Window]) -> None:

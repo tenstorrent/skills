@@ -27,6 +27,7 @@ from pathlib import Path
 
 from . import budget as bud
 from . import coordinator as coord
+from . import locks
 from . import runner
 from . import schedule as sched
 from . import screen as scr
@@ -209,7 +210,9 @@ class Daemon:
             tout = timeout_s or self.cfg["budget"]["run_timeout_s"].get(tier, 3600)
             stall = self.cfg["budget"].get("stall_s", {}).get(tier) if role != "coordinator" else None
             spec = {"argv": argv, "env": env, "cwd": cwd, "timeout_s": tout, "provider": provider, "stall_s": stall,
-                    "budget_usd": budget_usd if provider not in ("claude",) else None}
+                    "budget_usd": budget_usd if provider not in ("claude",) else None,
+                    "exclusive": [{"resource": res, "paths": [str(x) for x in self._slot_paths(res)]}
+                                  for res in _exclusive(task)] if task else []}
             (run_dir / "run.json").write_text(json.dumps(spec, indent=1))
             with open(run_dir / "runner.log", "wb") as out:
                 proc = subprocess.Popen([sys.executable, "-m", "ttp.runner", str(run_dir)], cwd=runtime_dir,
@@ -691,11 +694,7 @@ class Daemon:
             backoff = min(float(c.get("idle_wake_s", 3600)) * 2 ** repeats, 86400.0) if repeats else 0.0
             idle_due = (not busy and now - last > max(float(c.get("idle_wake_s", 3600)), backoff)
                         and (gate is None or gate.allow_optional))
-            # Paid capacity sitting idle: worker slots are free and nothing is ready to run. Ask the
-            # coordinator for more independent work well before the idle wake would.
-            starved = (gate is not None and gate.allow_new_work and self._free_slots(gate) > 0
-                       and not self._dispatchable()
-                       and now - last > max(float(c.get("starve_wake_s", 300)), backoff))
+            starved = not idle_due and now - last > backoff and self._starved(gate, now - last)
             if not (idle_due or starved):
                 return
             wake = {"fp": fp, "n": repeats + 1}
@@ -750,6 +749,39 @@ class Daemon:
         blob = json.dumps([tasks, asks, scheds, gates, mtimes], default=str)
         return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
+    def _starved(self, gate, since_last: float) -> bool:
+        """Paid plan capacity sitting idle: worker slots are free, the plan is burning slower than
+        its pace allows, and nothing is ready or about to be. Ask the coordinator for more
+        independent work well before the idle wake would. Usage-billed work costs money whether or
+        not it runs, so only plans qualify. A turn that adds no task doubles the wait for the next
+        one, up to the idle wake; a new task resets it."""
+        db, c = self.p.db, self.cfg["coordinator"]
+        if gate is None or gate.regime != "windows" or gate.level != "green" or not gate.allow_new_work:
+            return False
+        if any(r.get("need_per_h") is None or (r.get("burn_per_h") is not None and r["burn_per_h"] >= r["need_per_h"])
+               for r in gate.numbers.get("pace") or []):
+            return False
+        if self._free_slots(gate) <= 0 or self._dispatchable():
+            return False
+        # Queued work waiting on a retry timer, a dependency or a resource starts by itself; an open
+        # question waits for the user.
+        if db.one("SELECT id FROM tasks WHERE status='queued'") or \
+                db.one("SELECT id FROM messages WHERE kind='ask' AND handled=0"):
+            return False
+        made = db.one("SELECT COUNT(*) n FROM tasks WHERE origin='coordinator' AND created>?",
+                      (time.time() - 86400,))["n"]
+        if made >= int(c.get("max_new_tasks_per_day", 40)):
+            return False
+        base = float(c.get("starve_wake_s", 300))
+        newest = db.one("SELECT COALESCE(MAX(id),0) n FROM tasks")["n"]
+        st = db.kv("starve") or {}
+        wait = base if not st or newest > st.get("task", 0) else \
+            min(float(st.get("wait", base)) * 2, float(c.get("idle_wake_s", 3600)))
+        if since_last <= wait:
+            return False
+        db.set_kv("starve", {"task": newest, "wait": wait})
+        return True
+
     # workers ----------------------------------------------------------------------------------------
     def dispatch(self) -> None:
         db = self.p.db
@@ -759,6 +791,7 @@ class Daemon:
         ready = db.ready_tasks()
         if ready and not self._disk_ok():
             return
+        committed = None    # what running work under the dollar caps may still spend
         for task in ready:
             provider = task["provider"] or self.cfg.get("core_provider", "claude")
             gate = self.gates.get(provider) or bud.evaluate(db, self.cfg, provider, bud.plan_windows(db))
@@ -775,6 +808,17 @@ class Daemon:
                      (time.time(), "daemon", "task_budget_exhausted", "normal",
                       f"#{task['id']} {task['title']} used its ${task['budget_usd']:.2f} budget", "queued", task["id"]))
                 continue
+            # Several runs start in one tick: under the dollar caps, each must fit in what is left
+            # of them after what running work may still spend, or one tick commits past a cap.
+            cost = max(remaining, 0.5) if task["budget_usd"] else 0.0
+            if gate.regime == "caps":
+                committed = self._committed_usd() if committed is None else committed
+                if not self._fits_caps(gate, committed + cost):
+                    if any(cap and cost > cap for cap in (gate.numbers.get("daily_cap"),
+                                                          gate.numbers.get("weekly_cap"))):
+                        db.update_task(task["id"], status="blocked",
+                                       blocked_reason=f"its ${cost:.2f} budget is above the dollar cap")
+                    continue
             tier = bud.clamp_tier(task["tier"], gate)
             try:
                 cwd, branch = self._workdir_for(task)
@@ -793,6 +837,22 @@ class Daemon:
                 continue
             self._start_failures = 0
             busy[provider] = busy.get(provider, 0) + 1
+            if gate.regime == "caps":
+                committed += cost
+
+    def _committed_usd(self) -> float:
+        """Budget that running workers on providers under the dollar caps have left to spend."""
+        rows = self.p.db.q("SELECT t.provider, t.budget_usd, t.spent_usd FROM runs r JOIN tasks t ON t.id=r.task "
+                           "WHERE r.status='running' AND r.role!='coordinator'")
+        core = self.cfg.get("core_provider", "claude")
+        return sum(max((r["budget_usd"] or 0) - (r["spent_usd"] or 0), 0) for r in rows
+                   if getattr(self.gates.get(r["provider"] or core), "regime", "caps") == "caps")
+
+    @staticmethod
+    def _fits_caps(gate, usd: float) -> bool:
+        n = gate.numbers
+        return all(not cap or spent + usd <= cap for spent, cap in (
+            (n.get("spent_24h", 0), n.get("daily_cap")), (n.get("spent_7d", 0), n.get("weekly_cap"))))
 
     def _disk_ok(self) -> bool:
         """A full disk corrupts state and fails runs half way, so below `disk.min_free_gb` under the
@@ -896,15 +956,19 @@ class Daemon:
         its slot count (config `resources`, default 1). A `resource:<name>` label means the task uses
         the resource for some commands: those take the resource's lock (`ttp lock`) or its own queue,
         so the rest of the task runs in parallel with other work instead of waiting for the slot."""
-        wanted = [lb.split(":", 1)[1] for lb in json.loads(task["labels"] or "[]") if lb.startswith("exclusive:")]
         limits = self.cfg.get("resources", {})
-        for res in wanted:
+        for res in _exclusive(task):
             limit = int(limits.get(res, 1))
+            # Running exclusive tasks count even before their supervisor has taken its slot; the
+            # lock files show the slots `ttp lock` commands hold.
             busy = self.p.db.one("SELECT COUNT(*) n FROM tasks WHERE status='running' AND labels LIKE ?",
                                  (f'%"exclusive:{res}"%',))["n"]
-            if busy >= limit:
+            if busy >= limit or not locks.any_free(self._slot_paths(res)):
                 return False
         return True
+
+    def _slot_paths(self, res: str) -> list[Path]:
+        return locks.slot_paths(self.p.state / "locks", res, int(self.cfg.get("resources", {}).get(res, 1) or 1))
 
     def _free_slots(self, gate) -> int:
         running = self.p.db.one("SELECT COUNT(*) n FROM runs WHERE provider=? AND status='running' "
@@ -1008,6 +1072,10 @@ class Daemon:
                              stderr=subprocess.DEVNULL, start_new_session=True)
         except OSError:
             pass
+
+
+def _exclusive(task: dict) -> list[str]:
+    return [lb.split(":", 1)[1] for lb in json.loads(task["labels"] or "[]") if lb.startswith("exclusive:")]
 
 
 def _with_system_prompt(provider: str, argv: list[str], path: Path) -> list[str]:

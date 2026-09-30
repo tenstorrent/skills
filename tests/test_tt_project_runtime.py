@@ -24,6 +24,8 @@ def env(tmp_path, monkeypatch):
     home = tmp_path / "home"
     monkeypatch.setenv("TTP_HOME", str(home))
     monkeypatch.setenv("TTP_HOST", "testhost")
+    for var in ("TTP_RUN_DIR", "TTP_TASK", "TTP_RUN_ID", "TTP_PROJECT"):   # tests may run inside a live run
+        monkeypatch.delenv(var, raising=False)
     sys.path.insert(0, str(RUNTIME))
     for mod in [m for m in list(sys.modules) if m == "ttp" or m.startswith("ttp.")]:
         del sys.modules[mod]
@@ -1792,3 +1794,184 @@ def test_a_waiting_task_runs_only_once_its_probe_passes(env, monkeypatch, tmp_pa
     flag.write_text("")
     assert _run_until(d, p, lambda: p.db.task(tid)["status"] == "done", timeout=30)
     assert runs() == 2
+
+
+def test_a_plan_that_stopped_reporting_windows_falls_back_to_the_caps(env):
+    p = make(env)
+    from ttp import budget as bud
+    now = time.time()
+    p.db.x("INSERT INTO snapshots(ts,provider,account,window,utilization,resets_at) VALUES(?,?,?,?,?,?)",
+           (now - 3 * 3600, "claude", "a", "seven_day", 40.0, now + 3 * 86400))
+    ledger = "INSERT INTO ledger(ts,provider,account,source,usd) VALUES(?,?,?,?,?)"
+    p.db.x(ledger, (now - 3 * 3600 + 600, "claude", "a", "task:1", 90.0))
+    g = bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db, now), now)
+    assert g.regime == "windows", "one run without a reading is not yet a lapsed plan"
+    for h in (2, 1):
+        p.db.x(ledger, (now - h * 3600 + 600, "claude", "a", "task:1", 90.0))
+    g = bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db, now), now)
+    assert g.regime == "caps" and g.level == "red" and not g.allow_new_work, (g.regime, g.level, g.reasons)
+    assert g.numbers["spent_24h"] == 270.0, g.numbers
+    # a new reading puts it back on the plan, and runs ending between a meter's reads keep it there
+    p.db.x("INSERT INTO snapshots(ts,provider,account,window,utilization,resets_at) VALUES(?,?,?,?,?,?)",
+           (now - 600, "claude", "a", "seven_day", 45.0, now + 3 * 86400))
+    for m in (5, 1):
+        p.db.x(ledger, (now - m * 60, "claude", "a", "task:1", 1.0))
+    assert bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db, now), now).regime == "windows"
+
+
+def _stop_all(p):
+    for r in p.db.q("SELECT dir FROM runs WHERE status='running'"):
+        if r["dir"]:
+            (pathlib.Path(r["dir"]) / "STOP").write_text("cancel")
+
+
+def test_one_dispatch_tick_does_not_commit_past_the_caps(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    p.db.x("UPDATE messages SET handled=1")
+    p.db.x("INSERT INTO ledger(ts,provider,account,source,usd) VALUES(?,?,?,?,?)",
+           (time.time() - 600, "fake", "", "task:0", 59.0))
+    for i in range(6):
+        p.db.add_task(f"deep {i}", "s", kind="work", tier="deep", origin="user", budget_usd=25.0)
+    light = p.db.add_task("light", "s", kind="work", tier="light", origin="user", budget_usd=5.0)
+    d = Daemon(p.base)
+    d.update_gates()
+    try:
+        d.dispatch()
+        started = p.db.q("SELECT t.id, t.budget_usd FROM runs r JOIN tasks t ON t.id=r.task "
+                         "WHERE r.role!='coordinator'")
+    finally:
+        _stop_all(p)
+    assert 59.0 + sum(r["budget_usd"] for r in started) <= 100.0, started
+    assert sum(r["budget_usd"] == 25.0 for r in started) == 1 and light in {r["id"] for r in started}, started
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE status='queued'")["n"] == 5, "tasks that did not fit wait"
+    huge = p.db.add_task("huge", "s", kind="work", tier="deep", origin="user", budget_usd=150.0)
+    d.dispatch()
+    _stop_all(p)
+    assert p.db.task(huge)["status"] == "blocked", "a task that can never fit must say so, not wait forever"
+
+
+def _hold_exclusive(p, tmp_path, seconds):
+    """A run supervisor holding the board for a whole run, as an exclusive task's does."""
+    from ttp.daemon import Daemon
+    run_dir = tmp_path / "xrun"
+    run_dir.mkdir(parents=True)
+    (run_dir / "prompt.md").write_text("x")
+    paths = [str(x) for x in Daemon(p.base)._slot_paths("board")]
+    (run_dir / "run.json").write_text(json.dumps({
+        "argv": ["sleep", str(seconds)], "env": {"TTP_TASK": "7"}, "cwd": str(tmp_path), "timeout_s": 60,
+        "provider": "fake", "exclusive": [{"resource": "board", "paths": paths}]}))
+    proc = subprocess.Popen([sys.executable, "-m", "ttp.runner", str(run_dir)], cwd=str(RUNTIME),
+                            env={**os.environ, "PYTHONPATH": str(RUNTIME)})
+    deadline = time.time() + 20
+    while time.time() < deadline and not (run_dir / "child.pid").exists():
+        time.sleep(0.1)
+    return proc, run_dir
+
+
+def test_an_exclusive_task_and_ttp_lock_exclude_each_other(env, tmp_path):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    run_env = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost", TTP_PROJECT=str(p.base))
+    # an exclusive run holds the board: a ttp lock command waits for it
+    proc, _ = _hold_exclusive(p, tmp_path, 4)
+    rc = subprocess.run([sys.executable, str(TTP), "lock", "--timeout", "1", "board", "--", "true"],
+                        env=run_env).returncode
+    assert rc == 75, "ttp lock got the board while an exclusive task held it"
+    assert proc.wait(timeout=60) == 0
+    # the exclusive task's own commands use the slot its run already holds
+    proc, run_dir = _hold_exclusive(p, tmp_path / "own", 4)
+    own = subprocess.run([sys.executable, str(TTP), "lock", "--timeout", "1", "board", "--", "true"],
+                         env={**run_env, "TTP_RUN_DIR": str(run_dir)}).returncode
+    assert own == 0, "an exclusive task's own ttp lock waited for itself"
+    assert proc.wait(timeout=60) == 0
+    # a ttp lock command holds the board: the exclusive task does not start
+    assert coord.apply(p, [{"type": "task_add", "title": "reflash", "spec": "s", "tier": "light",
+                            "resources": ["board"], "exclusive": True}]) == []
+    task = p.db.one("SELECT * FROM tasks WHERE title='reflash'")
+    d = Daemon(p.base)
+    assert d._resources_free(task)
+    holder = subprocess.Popen([sys.executable, str(TTP), "lock", "board", "--", "sleep", "3"], env=run_env)
+    try:
+        deadline = time.time() + 20
+        while time.time() < deadline and d._resources_free(task):
+            time.sleep(0.1)
+        assert not d._resources_free(task), "an exclusive task would start while a ttp lock command runs"
+    finally:
+        holder.wait(timeout=30)
+    assert d._resources_free(task)
+
+
+def test_a_lock_wait_is_progress_and_gives_up_with_75(env, tmp_path):
+    p = make(env)
+    run_dir = tmp_path / "wrun"
+    run_dir.mkdir()
+    (run_dir / "run.json").write_text(json.dumps({"stall_s": 4}))
+    run_env = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost", TTP_PROJECT=str(p.base))
+    holder = subprocess.Popen([sys.executable, str(TTP), "lock", "board", "--", "sleep", "8"], env=run_env)
+    time.sleep(1.0)
+    t0 = time.time()
+    rc = subprocess.run([sys.executable, str(TTP), "lock", "board", "--", "true"],
+                        env={**run_env, "TTP_RUN_DIR": str(run_dir)}).returncode
+    waited = time.time() - t0
+    holder.wait(timeout=30)
+    assert rc == 75 and waited < 7, (rc, waited)   # half the stall limit, not forever
+    assert "waiting for board" in (run_dir / "progress.md").read_text(), "a wait looked like a stall"
+
+
+def _no_events(p):
+    p.db.x("UPDATE messages SET handled=1")
+    p.db.x("UPDATE events SET status='handled'")
+
+
+def _turns(p):
+    return p.db.one("SELECT COUNT(*) n FROM runs WHERE role='coordinator'")["n"]
+
+
+def test_the_idle_slot_wake_skips_usage_billed_and_waiting_projects(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    _no_events(p)
+    d = Daemon(p.base)
+    d.update_gates()
+    assert d.gates[d.cfg.get("core_provider", "claude")].regime == "caps"
+    p.db.set_kv("last_coordinator_turn", time.time() - 301)
+    d.maybe_coordinate()
+    assert _turns(p) == 0, "an idle usage-billed project woke the coordinator"
+    tid = p.db.add_task("needs the board", "s", kind="work", tier="light", origin="user")
+    p.db.update_task(tid, not_before=time.time() + 1800)
+    d.maybe_coordinate()
+    _stop_all(p)
+    assert _turns(p) == 0, "woken while the only task waits on its retry timer"
+
+
+def test_the_idle_slot_wake_fires_under_pace_and_backs_off(env):
+    p = make(env)
+    from ttp import budget as bud
+    from ttp.daemon import Daemon
+    _no_events(p)
+    d = Daemon(p.base)
+    prov = d.cfg.get("core_provider", "claude")
+    pace = [{"window": "seven_day", "utilization": 50.0, "resets_at": time.time() + 36000, "hours_left": 10.0,
+             "burn_per_h": 1.0, "need_per_h": 4.0, "projected": 60.0}]
+    d.gates = {prov: bud.Gate(provider=prov, regime="windows", max_parallel=6, numbers={"pace": pace})}
+
+    def turn_after(seconds, same_state=False):
+        before = _turns(p)
+        if not same_state:
+            p.db.set_kv("idle_wake", {})    # isolate this wake's own backoff from the unchanged-state one
+        p.db.set_kv("last_coordinator_turn", time.time() - seconds)
+        d.maybe_coordinate()
+        _stop_all(p)
+        p.db.x("UPDATE runs SET status='killed', ended=? WHERE status='running'", (time.time(),))
+        return _turns(p) > before
+
+    assert turn_after(301), "a plan under pace with free slots asks for work"
+    assert not turn_after(1201, same_state=True), "an unchanged state backs the idle-slot wake off too"
+    assert not turn_after(301) and turn_after(601), "a turn that added no task doubles the wait"
+    p.db.add_task("new work", "s", kind="work", tier="light", origin="coordinator", status="done")
+    assert turn_after(301), "a new task resets the wait"
+    pace[0]["burn_per_h"] = 5.0
+    p.db.add_task("more work", "s", kind="work", tier="light", origin="coordinator", status="done")
+    assert not turn_after(3000), "a plan on pace needs no extra work"

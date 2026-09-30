@@ -530,10 +530,14 @@ def cmd_lock(a) -> None:
 
     Parallel tasks share a device or a remote build directory this way: each takes the lock only for
     the commands that touch it, and the rest of the task runs alongside other work. Slots come from
-    the project's `resources` config (default 1). The lock is an OS file lock, so it is released
-    whenever the command's process ends, however it ends.
+    the project's `resources` config (default 1); a running `exclusive:<resource>` task holds one for
+    its whole run. The lock is held until the command has ended, however it ends.
+
+    Inside a run, waiting is reported in the run's progress (a wait is not a stall) and gives up
+    after half the run's stall limit unless --timeout says otherwise (0: wait as long as it takes).
+    Giving up exits 75: the task hands back `waiting`.
     """
-    import fcntl
+    from . import locks as lk
     cmd = list(a.command or [])
     if cmd and cmd[0] == "--":
         cmd = cmd[1:]
@@ -543,23 +547,24 @@ def cmd_lock(a) -> None:
     if not base:
         die("ttp lock only works inside a tt-project run (or with TTP_PROJECT set)")
     p = Project(base)
-    slots = max(int((p.config().get("resources") or {}).get(a.resource, 1) or 1), 1)
-    locks = p.state / "locks"
-    locks.mkdir(parents=True, exist_ok=True)
+    paths = lk.slot_paths(p.state / "locks", a.resource,
+                          int((p.config().get("resources") or {}).get(a.resource, 1) or 1))
     who = f"task #{os.environ.get('TTP_TASK') or '?'} (run {os.environ.get('TTP_RUN_ID') or '?'})"
+    run_dir = Path(os.environ["TTP_RUN_DIR"]) if os.environ.get("TTP_RUN_DIR") else None
+    try:
+        spec = json.loads((run_dir / "run.json").read_text()) if run_dir else {}
+    except (OSError, ValueError):
+        spec = {}
+    if a.resource in {x.get("resource") for x in spec.get("exclusive") or []}:
+        # This run's task holds the resource for its whole run already.
+        sys.exit(subprocess.call(cmd))
+    timeout = a.timeout
+    if timeout is None:
+        timeout = float(spec.get("stall_s") or 0) / 2
     started, told = time.time(), 0.0
     while True:
-        for i in range(slots):
-            f = open(locks / f"{a.resource}.{i}.lock", "a+")
-            try:
-                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError:
-                f.close()
-                continue
-            f.seek(0)
-            f.truncate()
-            f.write(json.dumps({"holder": who, "since": time.time(), "command": " ".join(cmd)[:300]}))
-            f.flush()
+        f = lk.try_take(paths, who, " ".join(cmd))
+        if f:
             waited = time.time() - started
             if waited > 5:
                 print(f"ttp lock: got {a.resource} after {waited / 60:.1f} min", file=sys.stderr, flush=True)
@@ -581,18 +586,17 @@ def cmd_lock(a) -> None:
             finally:
                 f.close()
             sys.exit(rc)
-        if a.timeout and time.time() - started > a.timeout:
-            die(f"{a.resource} stayed busy for {a.timeout:.0f} s; hand the task back as waiting", 75)
-        if time.time() - told >= 60:
-            holders = []
-            for lf in sorted(locks.glob(f"{a.resource}.*.lock")):
+        if timeout and time.time() - started > timeout:
+            die(f"{a.resource} stayed busy for {timeout:.0f} s; hand the task back as waiting", 75)
+        if time.time() - told >= 120:
+            line = f"waiting for {a.resource} (held by {', '.join(lk.holders(paths)) or 'another task'})"
+            print(f"ttp lock: {line}", file=sys.stderr, flush=True)
+            if run_dir:
                 try:
-                    h = json.loads(lf.read_text() or "{}")
-                    holders.append(f"{h.get('holder')} since {time.strftime('%H:%M', time.localtime(h.get('since', 0)))}")
-                except (OSError, ValueError):
+                    with open(run_dir / "progress.md", "a") as pf:
+                        pf.write(f"{time.strftime('%H:%M:%S')} {line}\n")
+                except OSError:
                     pass
-            print(f"ttp lock: waiting for {a.resource} (held by {', '.join(holders) or 'another task'})",
-                  file=sys.stderr, flush=True)
             told = time.time()
         time.sleep(3)
 
@@ -963,7 +967,9 @@ def main(argv: list[str] | None = None) -> None:
 
     s = sub.add_parser("lock", help="(inside a run) hold a shared resource while one command runs")
     s.add_argument("resource")
-    s.add_argument("--timeout", type=float, default=0, help="give up after this many seconds (exit 75)")
+    s.add_argument("--timeout", type=float, default=None,
+                   help="give up after this many seconds (exit 75); 0 waits as long as it takes; "
+                        "default inside a run: half its stall limit")
     s.add_argument("command", nargs=argparse.REMAINDER)
     s.set_defaults(fn=cmd_lock)
 
