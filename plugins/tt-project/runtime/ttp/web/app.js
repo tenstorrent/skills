@@ -25,8 +25,8 @@ function gateHtml(gates) {
   const ks = Object.keys(gates || {});
   if (!ks.length) return `<p class="muted">No readings yet.</p>`;
   return ks.map((k) => { const g = gates[k], n = g.numbers || {};
-    const detail = g.regime === "windows" ? `${n.window}: ${n.utilization}% of account used · project stops at ${n.limit}%`
-      : `project ${money(n.spent_24h)} / ${money(n.daily_cap)} per 24h${n.estimated_24h ? ` (~${money(n.estimated_24h)} estimated)` : ""} · ${money(n.spent_7d)} / ${money(n.weekly_cap)} per 7d`;
+    const detail = g.detail || (g.regime === "windows" ? `${n.window}: ${n.utilization}% of account used · project stops at ${n.limit}%`
+      : `project ${money(n.spent_24h)} / ${money(n.daily_cap)} per 24h${n.estimated_24h ? ` (~${money(n.estimated_24h)} estimated)` : ""} · ${money(n.spent_7d)} / ${money(n.weekly_cap)} per 7d`);
     return `<div class="row"><b>${esc(k)}</b><span class="pill lv-${g.level}">${g.level}</span><span class="meta">${esc(detail)}</span>
       <span class="meta">${esc((g.reasons || []).join("; "))}</span></div>`; }).join("");
 }
@@ -80,13 +80,14 @@ document.addEventListener("visibilitychange", () => { if (!document.hidden) unse
 function board(st) {
   const asks = st.attention.filter((m) => m.kind === "ask");
   const cols = [
-    ["you", "Waiting on you", st.tasks.filter((t) => t.status === "blocked").map((t) => `#${t.id} ${t.title}`).concat(asks.map((m) => m.text))],
+    ["you", "Waiting on you", st.tasks.filter((t) => t.status === "blocked").map((t) => `#${t.id} ${t.title}${t.blocked_reason ? ` — ${t.blocked_reason}` : ""}`)
+      .concat(asks.map((m) => `ask #${m.id}, ${ago(m.ts)} ago: ${m.text}`))],
     ["review", "Ready for review", st.tasks.filter((t) => t.status === "review" || (t.pr_url && t.status === "done")).map((t) => `#${t.id} ${t.title}`)],
     ["work", "Working", st.tasks.filter((t) => t.status === "running").map((t) => `#${t.id} ${t.title}`)],
     ["queued", "Queued", st.tasks.filter((t) => t.status === "queued").map((t) => `#${t.id} ${t.title}${waiting(t) ? ` (waiting, next try ${at(t.not_before)})` : ""}`)],
   ];
   $("#board").innerHTML = cols.map(([cls, name, items]) => `<div class="col ${cls}"><h3>${name}<span class="n">${items.length}</span></h3>` +
-    (items.slice(0, 6).map((x) => `<div class="item">${esc(x).slice(0, 160)}</div>`).join("") || `<div class="item muted">—</div>`) + `</div>`).join("");
+    (items.slice(0, 6).map((x) => `<div class="item">${esc(x.slice(0, cls === "you" ? 320 : 160))}</div>`).join("") || `<div class="item muted">—</div>`) + `</div>`).join("");
 }
 
 let lastOk = 0;
@@ -127,7 +128,9 @@ async function refresh() {
   $("#pname").textContent = st.project.name;
   $("#daemon").textContent = st.paused ? "paused" : stuck ? "stuck" : (st.daemon && st.daemon.pid ? `running on ${st.daemon.host}` : "stopped");
   $("#daemon").className = "pill " + (stuck ? "lv-red" : st.paused ? "lv-orange" : "lv-green");
-  $("#spend").textContent = `${money(h.spend.spent_24h)} 24h · ${money(h.spend.spent_7d)} 7d${h.spend.in_flight ? ` · ~${money(h.spend.in_flight)} running` : ""}`;
+  $("#spend").textContent = (h.spend.headline || `${money(h.spend.spent_24h)} 24h · ${money(h.spend.spent_7d)} 7d`) +
+    (h.spend.in_flight ? ` · ~${money(h.spend.in_flight)} running` : "");
+  $("#spend").title = h.spend.detail || "all providers";
   const needs = st.tasks.filter((t) => t.status === "blocked").length + h.asks.length;
   $("#needs").hidden = !needs; $("#needs").textContent = `${needs} need${needs === 1 ? "s" : ""} you`;
   $("#why").innerHTML = h.why_idle ? `<b>Idle:</b> ${esc(h.why_idle)}` : `${h.running} run${h.running === 1 ? "" : "s"} working.`;
@@ -138,8 +141,8 @@ async function refresh() {
   board(st);
   $("#attention").innerHTML = (st.attention || []).slice(0, 5).map((m) => `<div class="attn"><span class="when">${ago(m.ts)} ago · ${esc(m.kind)}</span><div>${esc(m.text)}</div></div>`).join("");
   $("#gates").innerHTML = $("#gates2").innerHTML = gateHtml(st.gates);
-  const running = st.runs.filter((r) => r.status === "running");
-  $("#running").innerHTML = running.length ? running.map((r) => `<div class="row"><span class="id">run ${r.id}</span><span class="title">${esc(r.role)}${r.task ? " · task #" + r.task : ""}</span><span class="meta">${esc(r.provider)} ${esc(r.model || "")} ${esc(r.effort || "")} · ${ago(r.started)}${r.cost_usd ? ` · ~${money(r.cost_usd)} so far` : ""}</span></div>`).join("") : `<p class="muted">Idle.</p>`;
+  const running = h.working || st.runs.filter((r) => r.status === "running").map((r) => ({ ...r, run: r.id }));
+  $("#running").innerHTML = running.length ? running.map((r) => `<div class="row"><span class="id">run ${r.run}</span><span class="title">${r.task ? `#${r.task} ${esc(r.title || "")}` : esc(r.role)}</span><span class="meta">${esc(r.provider)} ${esc(r.model || "")} ${esc(r.effort || "")} · ${ago(r.started)}${r.cost_usd ? ` · ~${money(r.cost_usd)} so far` : ""}</span>${r.note ? `<div class="meta">${esc(r.note)}</div>` : ""}</div>`).join("") : `<p class="muted">Idle.</p>`;
   $("#coord").textContent = (st.coordinator && st.coordinator.summary) || "—";
   const done = st.tasks.filter((t) => ["done", "failed", "cancelled"].includes(t.status)).slice(0, 8);
   $("#recent").innerHTML = done.map(taskRow).join("") || `<p class="muted">Nothing yet.</p>`;

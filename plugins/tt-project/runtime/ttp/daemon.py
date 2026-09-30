@@ -565,6 +565,9 @@ class Daemon:
             return
         if task["reply_chat"] and new in ("done", "failed", "blocked"):
             text = summary if new == "done" else f"(task #{task['id']} {new}) {summary}"
+            need = upd.get("blocked_reason") if new == "blocked" else None
+            if need and need not in summary:
+                text += f"\nNeeds from you: {need}"
             chat = None if task["reply_chat"] == "all" else task["reply_chat"]
             db.post("out", text[:6000], chat=chat, kind="reply", severity="normal")
         sev = "high" if new == "blocked" else "normal"

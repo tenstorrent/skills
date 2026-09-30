@@ -421,7 +421,7 @@ def _listen_loop(p: Project, db, a, after: int, floor: str) -> None:
 
 
 def status_text(p: Project) -> str:
-    from .web import at, gate_detail, health
+    from .web import at, gate_detail, health, since
     db = p.db
     state = daemon_state(p)
     gates = db.kv("gates", {})
@@ -453,8 +453,11 @@ def status_text(p: Project) -> str:
         lines.append(f"{pp['provider']} paused until {at(pp['until'], now)}: {pp['note']} — fix: {pp['fix']}")
     if h["why_idle"]:
         lines.append(f"idle: {h['why_idle']}")
-    for t in db.q("SELECT id,title,status,blocked_reason FROM tasks WHERE status IN ('running','blocked','review') "
-                  "ORDER BY status, id LIMIT 12"):
+    for w in h["working"][:8]:
+        what = f"#{w['task']} {w['title']}" if w["task"] else w["role"]
+        lines.append(f"  running {since(w['started'], now)}: {what}" + (f" — {w['note']}" if w["note"] else ""))
+    for t in db.q("SELECT id,title,status,blocked_reason FROM tasks WHERE status IN ('blocked','review') "
+                  "ORDER BY status, id LIMIT 8"):
         lines.append(f"  #{t['id']} {t['status']}: {t['title']}" + (f" — {t['blocked_reason']}" if t["blocked_reason"] else ""))
     disk = db.kv("disk_low")
     if disk:
@@ -470,7 +473,8 @@ def status_text(p: Project) -> str:
             lines.append(f"  {u['below_floor']} of them are below every chat's severity floor; lower "
                          f"notify.chat_min_severity or the chat's own floor to see them")
     for m in h["asks"]:
-        lines.append(f"  needs you: {m['text'][:200]}")
+        text = " ".join(m["text"].split())
+        lines.append(f"  needs you (ask #{m['id']}, {since(m['ts'], now)} ago): {text[:300]}")
     return "\n".join(lines)
 
 

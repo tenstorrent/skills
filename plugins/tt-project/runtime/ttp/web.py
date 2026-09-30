@@ -66,13 +66,52 @@ def at(ts: float | None, now: float | None = None) -> str:
     return time.strftime("%H:%M" if abs(ts - (now or time.time())) < 20 * 3600 else "%a %H:%M", time.localtime(ts))
 
 
-def gate_detail(g: dict) -> str:
+def since(ts: float, now: float | None = None) -> str:
+    s = max((now or time.time()) - ts, 0)
+    return f"{int(s // 60)} min" if s < 7200 else f"{s / 3600:.0f} h" if s < 2 * DAY else f"{s / DAY:.0f} days"
+
+
+def gate_detail(g: dict, now: float | None = None) -> str:
     n = g.get("numbers") or {}
     if g.get("regime") == "windows":
-        return f"{n.get('window')}: {n.get('utilization')}% of account used, project stops at {n.get('limit')}%"
+        wins = n.get("pace") or [n]
+        parts = []
+        for w in wins:
+            s = f"{w.get('window')} {w.get('utilization')}%"
+            if w.get("projected") is not None:
+                s += f", on pace for {w['projected']:.0f}%" + (f" by the {at(w['resets_at'], now)} reset"
+                                                                if w.get("resets_at") else "")
+            elif w.get("resets_at"):
+                s += f", resets {at(w['resets_at'], now)}"
+            parts.append(s)
+        # Plan-billed dollars are bounded by the windows, so the dollar caps do not apply to them.
+        return (f"account use: {'; '.join(parts)}. The project stops at {n.get('limit')}% "
+                f"(plan-billed, so the dollar caps do not apply)")
     est = f" (~${n['estimated_24h']:.2f} estimated)" if n.get("estimated_24h") else ""
     return (f"${n.get('spent_24h', 0):.2f} of ${n.get('daily_cap', 0):.0f} per 24h{est}, "
             f"${n.get('spent_7d', 0):.2f} of ${n.get('weekly_cap', 0):.0f} per 7d")
+
+
+def spend_headline(spend: dict, g: dict) -> str:
+    """The header's one-line answer to "how does spend compare with the limit that binds"."""
+    n = g.get("numbers") or {}
+    if g.get("regime") == "windows" and n.get("window"):
+        return f"${spend['spent_24h']:.2f} 24h · {n['window']} {n['utilization']:.0f}% of {n['limit']:.0f}%"
+    if n.get("daily_cap"):
+        return (f"${n.get('spent_24h', 0):.2f} of ${n['daily_cap']:.0f} 24h · "
+                f"${n.get('spent_7d', 0):.2f} of ${n.get('weekly_cap', 0):.0f} 7d")
+    return f"${spend['spent_24h']:.2f} 24h · ${spend['spent_7d']:.2f} 7d"
+
+
+def last_note(run_dir: str | None) -> str:
+    """The run's latest `ttp note`: what a worker says it is doing, without opening its log."""
+    f = Path(run_dir) / "progress.md" if run_dir else None
+    if not f or not f.is_file():
+        return ""
+    with open(f, "rb") as fh:
+        fh.seek(max(f.stat().st_size - 2048, 0))
+        lines = [ln for ln in fh.read().decode(errors="replace").splitlines() if ln.strip()]
+    return lines[-1].strip()[:200] if lines else ""
 
 
 def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> dict:
@@ -152,15 +191,23 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
                                                               f"{len(asks)} open question(s)" if asks else "") if x))
     if not why and idle_wake:
         why.append(f"nothing queued; the coordinator checks in at {at(idle_wake, now)}")
+    working = db.q("SELECT r.id run, r.task, r.role, r.provider, r.model, r.effort, r.started, r.cost_usd, r.dir, t.title "
+                   "FROM runs r "
+                   "LEFT JOIN tasks t ON t.id=r.task WHERE r.status='running' ORDER BY r.id")
+    for w in working:
+        w["note"] = last_note(w.pop("dir"))
+    spend = {"spent_24h": round(db.spent_since(now - DAY), 2), "spent_7d": round(db.spent_since(now - WEEK), 2),
+             "top_7d": top if top and top["usd"] else None, "in_flight": round(bud.in_flight(db), 2)}
+    spend["headline"] = spend_headline(spend, g)
+    spend["detail"] = gate_detail(g, now) if g else ""
     return {
-        "spend": {"spent_24h": round(db.spent_since(now - DAY), 2), "spent_7d": round(db.spent_since(now - WEEK), 2),
-                  "top_7d": top if top and top["usd"] else None, "in_flight": round(bud.in_flight(db), 2)},
+        "spend": spend,
         "coordinator": {"last_turn": last_turn or None, "last_status": last_run["status"] if last_run else None,
                         "failures": int(db.kv("coordinator_failures", 0)),
                         "backoff_until": backoff if backoff > now else None,
                         "summary": (db.kv("last_coordinator_summary", {}) or {}).get("summary", ""),
                         "idle_wake": idle_wake},
-        "providers_paused": paused_providers, "waiting": waiting, "asks": asks, "running": running,
+        "providers_paused": paused_providers, "waiting": waiting, "asks": asks, "running": running, "working": working,
         "undelivered": undelivered,
         "why_idle": "; ".join(why) if not running else "",
     }
@@ -179,7 +226,8 @@ def state_payload(p: Project, db: DB) -> dict:
                 "ORDER BY id DESC LIMIT 40")
     return {
         "project": {"name": p.name, "root": str(p.root), "config": p.config()},
-        "daemon": db.kv("daemon", {}), "paused": db.kv("paused", False), "gates": db.kv("gates", {}),
+        "daemon": db.kv("daemon", {}), "paused": db.kv("paused", False),
+        "gates": {k: {**g, "detail": gate_detail(g, now)} for k, g in db.kv("gates", {}).items()},
         "heartbeat": heartbeat(p), "heartbeat_stale_s": HEARTBEAT_STALE_S, "disk_low": db.kv("disk_low"),
         "tasks": tasks, "runs": runs,
         "issues": db.q("SELECT id,source,title,severity,status,count,first_seen,last_seen,task FROM issues "

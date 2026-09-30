@@ -541,7 +541,61 @@ def test_status_shows_spend_waiting_retry_and_coordinator_health(env):
     assert "fake paused until" in out and "logged out" in out and "fix: log in" in out, out
     idle = [ln for ln in lines if ln.startswith("idle: ")]
     assert idle and "daemon is not running" in idle[0] and "waiting on you" in idle[0], out
-    assert "needs you: Which board should I use?" in out
+    ask = [ln for ln in lines if "Which board should I use?" in ln]
+    assert ask and ask[0].startswith("  needs you (ask #") and " min ago): " in ask[0], out
+
+
+def test_plan_window_spend_shows_every_window_its_reset_and_that_caps_do_not_apply(env):
+    p = make(env)
+    from ttp.web import gate_detail, spend_headline
+    now = time.time()
+    g = {"regime": "windows", "level": "green", "numbers": {
+        "window": "five_hour", "utilization": 65.0, "limit": 90.0, "resets_at": now + 3600, "projected": 89.8,
+        "pace": [{"window": "five_hour", "utilization": 65.0, "resets_at": now + 3600, "projected": 89.8},
+                 {"window": "seven_day", "utilization": 62.0, "resets_at": now + 4 * 3600, "projected": None}]}}
+    d = gate_detail(g, now)
+    assert d.startswith("account use: five_hour 65.0%, on pace for 90% by the "), d
+    assert "; seven_day 62.0%, resets " in d, d
+    assert "stops at 90.0%" in d and "dollar caps do not apply" in d, d
+    spend = {"spent_24h": 80.37, "spent_7d": 80.37}
+    assert spend_headline(spend, g) == "$80.37 24h · five_hour 65% of 90%"
+    caps = {"regime": "caps", "numbers": {"spent_24h": 4.5, "spent_7d": 9.0, "daily_cap": 100.0, "weekly_cap": 200.0}}
+    assert spend_headline(spend, caps) == "$4.50 of $100 24h · $9.00 of $200 7d"
+    p.db.set_kv("gates", {"fake": g})
+    from ttp.web import state_payload
+    st = state_payload(p, p.db)
+    assert "seven_day" in st["gates"]["fake"]["detail"]
+
+
+def test_status_and_web_show_what_each_running_worker_says_it_is_doing(env, tmp_path):
+    p = make(env)
+    from ttp.cli import status_text
+    from ttp.web import state_payload
+    now = time.time()
+    tid = p.db.add_task("tune the kernel", "make it faster", kind="work", tier="light", origin="user")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "progress.md").write_text("10:00:00 built\n10:05:00 measuring on the board\n\n")
+    p.db.x("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(?,?,?,?,?,?)",
+           (tid, "worker", "fake", now - 600, "running", str(run_dir)))
+    w = state_payload(p, p.db)["health"]["working"]
+    assert len(w) == 1 and w[0]["title"] == "tune the kernel" and w[0]["note"] == "10:05:00 measuring on the board"
+    assert "dir" not in w[0]
+    out = status_text(p)
+    assert f"running 10 min: #{tid} tune the kernel — 10:05:00 measuring on the board" in out, out
+
+
+def test_blocked_reply_to_a_chat_carries_the_question(env, monkeypatch):
+    p = make(env)
+    from ttp.daemon import Daemon
+    monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps(
+        {"status": "blocked", "summary": "the board is not reachable", "question": "which board should I use?"}))
+    tid = p.db.add_task("measure on a board", "needs a board", kind="work", tier="light", origin="user",
+                        reply_chat="laptop")
+    d = Daemon(p.base)
+    assert _run_until(d, p, lambda: p.db.task(tid)["status"] == "blocked")
+    replies = [m["text"] for m in p.db.q("SELECT text FROM messages WHERE direction='out' AND chat='laptop'")]
+    assert replies and replies[-1].endswith("\nNeeds from you: which board should I use?"), replies
 
 
 def test_web_payload_carries_coordinator_health_and_why_idle(env):
