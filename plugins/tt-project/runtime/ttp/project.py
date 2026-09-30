@@ -124,7 +124,8 @@ class Project:
             except (OSError, ValueError):
                 return {}
         try:
-            if self.state.is_dir() and (not good.exists() or good.stat().st_mtime < self.config_path.stat().st_mtime):
+            # <=: two writes within one filesystem clock tick share an mtime.
+            if self.state.is_dir() and (not good.exists() or good.stat().st_mtime <= self.config_path.stat().st_mtime):
                 write_json(good, data)
         except OSError:
             pass
