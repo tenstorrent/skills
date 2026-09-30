@@ -137,7 +137,10 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
                    "ORDER BY not_before", (now,))
     queued = db.q("SELECT id, depends_on FROM tasks WHERE status='queued' AND (not_before IS NULL OR not_before<=?)",
                   (now,))
-    ready = len(db.ready_tasks())
+    # A task on a paused resource is held, not ready: it is listed under its resource instead.
+    from .coordinator import task_resources
+    due = db.ready_tasks()
+    ready = sum(1 for t in due if not task_resources(t) & {r["resource"] for r in paused_resources})
     blocked = db.one("SELECT COUNT(*) n FROM tasks WHERE status='blocked'")["n"]
     running = db.one("SELECT COUNT(*) n FROM runs WHERE status='running'")["n"]
     asks = db.q("SELECT id, ts, text FROM messages WHERE kind='ask' AND handled=0 AND ts>? ORDER BY id DESC LIMIT 5",
@@ -195,8 +198,8 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
                    + f": its tasks wait (`ttp resume {p.name} --resource {pr['resource']}`)")
     if waiting:
         why.append(f"{len(waiting)} task(s) waiting, next try {at(waiting[0]['not_before'], now)}")
-    if len(queued) > ready:
-        why.append(f"{len(queued) - ready} queued task(s) wait on other tasks")
+    if len(queued) > len(due):
+        why.append(f"{len(queued) - len(due)} queued task(s) wait on other tasks")
     if you:
         why.append(you)
     if not why and idle_wake:
@@ -423,7 +426,7 @@ class Handler(BaseHTTPRequestHandler):
                     from .coordinator import pause_resource
                     try:
                         pause_resource(p, str(body["resource"]), bool(body.get("paused")),
-                                       reason=str(body.get("reason") or ""), by="user")
+                                       reason=str(body.get("reason") or ""), by="user", db=db)
                     except ValueError as e:
                         return self._send(400, {"error": str(e)})
                     return self._send(200, {"ok": True})

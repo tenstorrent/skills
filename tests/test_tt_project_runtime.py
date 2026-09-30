@@ -5601,6 +5601,85 @@ def test_paused_resources_show_in_the_digest_status_and_web_state(env):
     assert "Paused resources" not in coord.digest(p, {}, [], [])
 
 
+def test_resuming_a_resource_wakes_the_tasks_that_waited_on_its_pause(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.db import load_result
+
+    def waiting(title, labels, what, since):
+        tid = p.db.add_task(title, "s", kind="work", tier="light", origin="user", labels=labels)
+        p.db.update_task(tid, status="queued", not_before=time.time() + 7200, blocked_reason=f"waiting for {what}",
+                         result=json.dumps({"status": "waiting", "waiting_for": what, "retry_when": "exit 1",
+                                            "retry_after_s": 7200, "waiting_since": since}))
+        return tid
+    early = waiting("before the pause", ["resource:board"], "board: a long soak run", time.time() - 60)
+    coord.pause_resource(p, "board", True, reason="maintenance", by="user")
+    now = time.time()
+    lock = waiting("lock refused", ["resource:board"], "board (ttp lock exit 75: paused)", now)
+    held = waiting("holds it", ["exclusive:board"], "the resource board to be resumed", now)
+    build = waiting("build", ["resource:board"], "the nightly build", now)
+    other = waiting("other board", ["resource:board2"], "board2 and board", now)
+    out = coord.pause_resource(p, "board", False)
+    assert out == "board resumed; 2 task(s) that waited on it start again", out
+    due = {t["id"] for t in p.db.ready_tasks()}
+    assert {lock, held} <= due, "a task that waited on the pause still sleeps its full retry_after_s"
+    for tid in (lock, held):
+        t = p.db.task(tid)
+        assert t["not_before"] is None and not t["blocked_reason"] and not t["attempts"], t
+        assert load_result(t["result"])["woke"] == "the resource board was resumed"
+    for tid in (early, build, other):
+        assert p.db.task(tid)["not_before"] > time.time() + 3600 and tid not in due, p.db.task(tid)
+
+
+def test_health_does_not_count_a_task_on_a_paused_resource_as_ready(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.web import state_payload
+    p.db.add_task("measure", "s", kind="work", tier="light", origin="user", labels=["resource:board"])
+    p.db.add_task("docs", "s", kind="work", tier="light", origin="user")
+    assert "2 task(s) ready to start" in state_payload(p, p.db)["health"]["why_idle"]
+    coord.pause_resource(p, "board", True, by="user")
+    why = state_payload(p, p.db)["health"]["why_idle"]
+    assert "1 task(s) ready to start" in why and "board is paused" in why, why
+    assert "wait on other tasks" not in why, why
+    p.db.x("UPDATE tasks SET status='done' WHERE title='docs'")
+    why = state_payload(p, p.db)["health"]["why_idle"]
+    assert "ready to start" not in why and "board is paused" in why, why
+
+
+def test_web_api_pauses_and_resumes_a_resource(env):
+    p = make(env)
+    from ttp import web
+    port = web.free_port(19900)
+    p.set_config("web.port", port)
+
+    class Stub:
+        pass
+    stub = Stub()
+    stub.p = p
+    threading.Thread(target=web.serve, args=(stub,), daemon=True).start()
+
+    def post(body):
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/api/pause", method="POST", data=json.dumps(body).encode(),
+                                     headers={"X-TTP-Token": web.token(p), "Content-Type": "application/json"})
+        for _ in range(50):
+            try:
+                return urllib.request.urlopen(req, timeout=5).status, None
+            except urllib.error.HTTPError as e:
+                return e.code, json.loads(e.read())
+            except OSError:
+                time.sleep(0.1)
+        raise AssertionError("the web app did not start")
+    assert post({"resource": "board", "paused": True, "reason": "firmware update"}) == (200, None)
+    assert p.db.paused_resources()["board"]["reason"] == "firmware update"
+    assert p.db.paused_resources()["board"]["by"] == "user" and not p.db.kv("paused", False)
+    assert post({"resource": "board", "paused": False}) == (200, None)
+    assert p.db.paused_resources() == {}
+    code, err = post({"resource": "../board", "paused": True})
+    assert code == 400 and "not a resource name" in err["error"], err
+    assert p.db.paused_resources() == {} and not p.db.kv("paused", False)
+
+
 def test_ttp_lock_refuses_a_paused_resource_with_75(env, tmp_path):
     p = make(env)
     from ttp import coordinator as coord

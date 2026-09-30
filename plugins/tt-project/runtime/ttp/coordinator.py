@@ -603,14 +603,15 @@ RESOURCE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@+-]{0,79}")
 
 
 def pause_resource(p: Project, name: str, paused: bool, reason: str = "", by: str = "user",
-                   key: str | None = None) -> str:
+                   key: str | None = None, db=None) -> str:
     """Pause or resume one resource for the project's tasks. While paused, no task labelled with it
     is dispatched and `ttp lock` refuses it; running workers whose task uses it are told mid-run.
-    Returns a line for the user."""
+    Resuming it makes tasks that handed off `waiting` on the pause due now. `db` is the caller's
+    own connection when it runs on another thread (the web app). Returns a line for the user."""
     name = (name or "").strip()
     if not RESOURCE_RE.fullmatch(name):
         raise ValueError(f"not a resource name: {name!r}")
-    db = p.db
+    db, woken = db or p.db, 0
     with db.tx():
         cur = db.paused_resources()
         if paused:
@@ -622,7 +623,7 @@ def pause_resource(p: Project, name: str, paused: bool, reason: str = "", by: st
         elif name not in cur:
             return f"{name} is not paused"
         else:
-            cur.pop(name)
+            woken = _wake_pause_waiters(db, name, float(cur.pop(name).get("since") or 0))
         db.set_kv(PAUSED_RESOURCES_KEY, cur)
     why = f" ({cur[name]['reason']})" if paused and cur[name]["reason"] else ""
     text = (f"The resource `{name}` is paused{why}. Do not use it: start no new command on it, and `ttp lock "
@@ -635,7 +636,25 @@ def pause_resource(p: Project, name: str, paused: bool, reason: str = "", by: st
         if r["dir"] and Path(r["dir"]).is_dir() and name in task_resources({"labels": r["labels"]}):
             _append_update(Path(r["dir"], "steer.md"), text, key)
     return (f"{name} paused{why}: tasks using it wait, and `ttp lock {name}` refuses it" if paused
-            else f"{name} resumed")
+            else f"{name} resumed" + (f"; {woken} task(s) that waited on it start again" if woken else ""))
+
+
+def _wake_pause_waiters(db, name: str, since: float) -> int:
+    """Tasks that handed off `waiting` on `name` while it was paused are due now: their wait was the
+    pause, not their `retry_after_s` timer or `retry_when` probe. Returns how many woke."""
+    woken = 0
+    for t in db.q("SELECT * FROM tasks WHERE status='queued' AND not_before IS NOT NULL"):
+        prev = load_result(t["result"])
+        at = prev.get("waiting_since")
+        at = at if isinstance(at, (int, float)) else t["updated"] or 0
+        said = f"{prev.get('waiting_for') or ''} {prev.get('summary') or ''}"
+        if prev.get("status") != "waiting" or at < since or name not in task_resources(t) \
+                or not re.search(rf"(?<![\w.@+-]){re.escape(name)}(?![\w@+-])", said):
+            continue
+        db.update_task(t["id"], not_before=None, blocked_reason=None,
+                       result=dump_result({**prev, "woke": f"the resource {name} was resumed"}))
+        woken += 1
+    return woken
 
 
 def task_resources(task: dict) -> set[str]:
