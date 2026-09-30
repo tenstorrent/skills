@@ -33,6 +33,7 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "memory_kind": {"type": "string"}, "section": {"type": "string"}, "name": {"type": "string"},
             "every": {"type": "string"}, "at": {"type": "string"}, "enabled": {"type": "boolean"},
             "key": {"type": "string"}, "value": {"type": "string"},
+            "reversible": {"type": "boolean"}, "recommendation": {"type": "string"},
             "resources": {"type": "array", "items": {"type": "string"}}},
             "required": ["type"]}},
         "summary": {"type": "string"},
@@ -49,7 +50,12 @@ USER_SETTABLE = {
     "coordinator.tier": str, "jev.enabled": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     # Where code tasks branch from: the project's working branch once it has one.
     "delivery.base_ref": str,
+    # Hours before an unanswered reversible ask falls back to its recommendation; 0 turns it off.
+    "coordinator.ask_timeout_h": float,
 }
+
+ASK_DEFAULTS_KEY = "ask_defaults"   # kv: {ask message id: recommendation} for reversible asks
+_DEFAULT_NOTE = "\n\nIf there is no answer within "
 
 
 def system_prompt(p: Project) -> str:
@@ -105,7 +111,15 @@ def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int]) ->
                     (now - 14 * 86400,))
     if blockers:
         lines.append("## Open questions to the user (resolve each once answered)")
-        lines += [f"- ask #{b['id']}: {b['text'][:300]}" for b in blockers]
+        pending = p.db.kv(ASK_DEFAULTS_KEY, {})
+        hours = ask_timeout_h(p.config())
+        for b in blockers:
+            if str(b["id"]) in pending and hours > 0:
+                left = max(0.0, (b["ts"] + hours * 3600 - now) / 3600)
+                when = f"reversible; defaults to its recommendation in {left:.1f}h"
+            else:
+                when = "waits for the user"
+            lines.append(f"- ask #{b['id']} ({when}): {b['text'][:300]}")
     lines.append("## Chats attached")
     for c in db.q("SELECT id, label, last_active FROM chats ORDER BY last_active DESC LIMIT 10"):
         lines.append(f"- {c['id']} ({c['label'] or 'chat'}), active {(now - (c['last_active'] or now)) / 60:.0f} min ago")
@@ -188,7 +202,20 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None) -> l
                         if r["dir"]:
                             Path(r["dir"], "STOP").touch()
             elif t == "ask_user":
-                db.post("out", a["text"], chat=None, kind="ask", severity=_norm_severity(a.get("severity") or "high"))
+                rec = (a.get("recommendation") or "").strip()
+                hours = ask_timeout_h(cfg)
+                defaults = a.get("reversible") is True and bool(rec) and hours > 0
+                text = a["text"].strip()
+                if defaults:
+                    text += f"{_DEFAULT_NOTE}{hours:g}h, I will go with the recommendation: {rec}"
+                with db.tx():
+                    mid = db.post("out", text, chat=None, kind="ask",
+                                  severity=_norm_severity(a.get("severity") or "high"))
+                    if defaults:
+                        db.set_kv(ASK_DEFAULTS_KEY, {**db.kv(ASK_DEFAULTS_KEY, {}), str(mid): rec})
+                if a.get("reversible") is True and not rec:
+                    raise ValueError(f"ask #{mid} is marked reversible without a recommendation, "
+                                     f"so it waits for the user")
             elif t == "resolve":
                 n = db.x("UPDATE messages SET handled=1 WHERE id=? AND kind='ask'", (int(a["id"]),))
                 if not n:
@@ -218,6 +245,52 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None) -> l
         except Exception as e:   # one bad action is reported back; it never aborts the turn
             problems.append(f"{t}: {e}")
     return problems
+
+
+def ask_timeout_h(cfg: dict) -> float:
+    try:
+        return max(0.0, float(cfg["coordinator"].get("ask_timeout_h", 12) or 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def expire_asks(p: Project, *, hold: bool = False, now: float | None = None) -> list[int]:
+    """Resolve reversible asks left unanswered past the timeout into their recommendation.
+
+    Only asks the coordinator marked reversible with a recommendation are ever listed; anything
+    else waits for the user indefinitely. Nothing expires while `hold` is set (the project is at a
+    cap) or while a user message is unhandled, since that message may be the answer. The user is
+    told what was decided and the coordinator gets an event to act on it. Returns expired ask ids.
+    """
+    db = p.db
+    if not db.kv(ASK_DEFAULTS_KEY, {}):
+        return []
+    now = now or time.time()
+    hours = ask_timeout_h(p.config())
+    with db.tx():   # re-read inside: a resolve or a new ask may land between ticks
+        pending = db.kv(ASK_DEFAULTS_KEY, {})
+        open_asks = {str(r["id"]): r for r in db.q(
+            f"SELECT * FROM messages WHERE kind='ask' AND handled=0 AND id IN ({','.join('?' * len(pending))})",
+            [int(k) for k in pending])}
+        live = {k: v for k, v in pending.items() if k in open_asks}
+        due = [k for k in live if hours > 0 and open_asks[k]["ts"] + hours * 3600 <= now]
+        if hold or (due and db.one("SELECT id FROM messages WHERE direction='in' AND handled=0")):
+            due = []
+        for k in due:
+            ask, rec = open_asks[k], live.pop(k)
+            db.x("UPDATE messages SET handled=1 WHERE id=?", (ask["id"],))
+            question = ask["text"].split(_DEFAULT_NOTE)[0][:300]
+            db.post("out", f"No answer to ask #{k} after {hours:g}h, so I went with the recommendation: {rec}\n"
+                           f"It can be reversed: reply to change it.\nThe question was: {question}",
+                    chat=None, kind="alert", severity=ask["severity"])
+            db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                 (now, "daemon", "ask_timeout", "normal",
+                  f"Ask #{k} got no answer in {hours:g}h. The user was told its recommendation now applies: "
+                  f"{rec}. Act on it; it is not permission for anything beyond that choice. "
+                  f"The question was: {question}", "queued"))
+        if live != pending:
+            db.set_kv(ASK_DEFAULTS_KEY, live)
+    return [int(k) for k in due]
 
 
 def open_task_count(p: Project) -> int:

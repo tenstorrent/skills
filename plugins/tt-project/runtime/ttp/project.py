@@ -50,7 +50,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "resources": {},                    # shared-slot limits, e.g. {"device": 1}
     "coordinator": {"tier": "light", "debounce_s": 15, "max_events_per_turn": 40,
                     "max_turns_per_hour": 30, "max_new_tasks_per_day": 40, "idle_wake_s": 3600,
-                    "turn_budget_usd": 1.0, "turn_timeout_s": 600},
+                    "turn_budget_usd": 1.0, "turn_timeout_s": 600,
+                    "ask_timeout_h": 12},
     "notify": {"slack": False, "slack_min_severity": "high", "chat_min_severity": "normal"},
     "delivery": {"draft_prs": True, "review_before_pr": True, "auto_merge_repos": [],
                  "push_allowed": True},

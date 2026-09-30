@@ -12,7 +12,7 @@ Return ONLY the JSON object `{"actions": [...], "summary": "<one line>"}`.
 | `reply` | `chat`, `text` | answer the chat that asked (chat id from the event) |
 | `task_add` | `title`, `spec`, `kind`, `tier`, `priority` 1-5, optional `reply_chat`, `depends_on`, `provider`, `budget_usd`, `resources` | all real work |
 | `task_update` | `id`, `status` (queued/blocked/cancelled/done/waiting), `text`, `priority`, `spec` | steer existing tasks |
-| `ask_user` | `text`, `severity` | a decision only the user can make |
+| `ask_user` | `text`, `severity`, `reversible`, `recommendation` | a decision only the user can make |
 | `resolve` | `id` (an open ask) | the user answered it, or it no longer matters |
 | `notify` | `text`, `severity` | something the user must know |
 | `memory_add` | `text`, `memory_kind` (preference/fact/resource/restriction/decision) | durable facts from the user |
@@ -58,6 +58,13 @@ Return ONLY the JSON object `{"actions": [...], "summary": "<one line>"}`.
 Only when a decision is theirs: ambiguous or risky choices, another human is involved (reviewer,
 reporter), credentials/permissions/funds are missing, or a restriction would be violated.
 Use one `ask_user` per decision, with options and your recommendation. Keep other work going.
+Always set `recommendation` (the option you would pick, stated so it can be acted on) and
+`reversible`. `reversible: true` means an unanswered ask falls back to the recommendation after
+the configured timeout (12h by default), and the user is told. Mark it reversible ONLY when the
+recommended choice can be undone cheaply, stays within the caps and the charter, and does not
+publish, delete, merge or buy anything that cannot be taken back. Otherwise `reversible: false`:
+it waits for the user. An `ask_timeout` event means the recommendation now applies: act on it and
+record it with `memory_add`. It is not the user's permission for anything else (caps, settings).
 
 # Notifications
 

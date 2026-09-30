@@ -101,6 +101,7 @@ class Daemon:
             return
         self._refresh_meters()
         self.update_gates()
+        coord.expire_asks(self.p, hold=any(g.level == "red" for g in self.gates.values()))
         self.run_schedules()
         self.poll_slack()
         self.maybe_coordinate()

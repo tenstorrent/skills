@@ -755,3 +755,72 @@ def test_remote_listener_reconnects_after_a_network_drop(env, monkeypatch):
     assert cli.forward_listen({"host": "box", "dir": "/x"}, ["listen", "demo", "--chat", "c1", "--once"]) == 0
     assert calls == [False, True, True], "the unreachable message should print once, not on every retry"
     assert naps == [5.0, 10.0]
+
+
+def _ask(p, **fields):
+    from ttp import coordinator as coord
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")   # the kickoff brief, already read
+    problems = coord.apply(p, [{"type": "ask_user", "text": "Option A or B?", **fields}])
+    return problems, p.db.one("SELECT * FROM messages WHERE kind='ask' ORDER BY id DESC LIMIT 1")
+
+
+def test_a_reversible_ask_falls_back_to_its_recommendation_after_the_timeout(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    problems, ask = _ask(p, reversible=True, recommendation="use option A")
+    assert problems == [] and "within 12h" in ask["text"] and "use option A" in ask["text"]
+    assert "reversible; defaults to its recommendation in 12.0h" in coord.digest(p, {}, [], [])
+    assert coord.expire_asks(p, now=ask["ts"] + 11 * 3600) == []
+    assert coord.expire_asks(p, now=ask["ts"] + 12 * 3600 + 1) == [ask["id"]]
+    assert p.db.one("SELECT handled FROM messages WHERE id=?", (ask["id"],))["handled"] == 1
+    told = p.db.one("SELECT * FROM messages WHERE kind='alert' ORDER BY id DESC LIMIT 1")
+    assert "use option A" in told["text"] and "Option A or B?" in told["text"] and told["chat"] is None
+    assert told["severity"] == ask["severity"]
+    ev = p.db.one("SELECT * FROM events WHERE kind='ask_timeout'")
+    assert ev["status"] == "queued" and "use option A" in ev["text"]
+    assert coord.expire_asks(p, now=ask["ts"] + 99 * 3600) == [], "an ask expired twice"
+    assert p.db.kv(coord.ASK_DEFAULTS_KEY) == {}
+
+
+def test_irreversible_asks_never_time_out(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    _, firm = _ask(p, reversible=False, recommendation="delete the old data")
+    _, silent = _ask(p, recommendation="use option A")
+    problems, bare = _ask(p, reversible=True)
+    assert problems and "without a recommendation" in problems[0], "a reversible ask with nothing to fall back to"
+    assert "within" not in firm["text"]
+    assert coord.expire_asks(p, now=time.time() + 1000 * 3600) == []
+    assert all(p.db.one("SELECT handled FROM messages WHERE id=?", (a["id"],))["handled"] == 0
+               for a in (firm, silent, bare))
+    assert coord.digest(p, {}, [], []).count("(waits for the user)") == 3
+
+
+def test_an_ask_waits_while_an_answer_is_pending_over_a_cap_or_turned_off(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    _, ask = _ask(p, reversible=True, recommendation="use option A")
+    late = ask["ts"] + 13 * 3600
+    assert coord.expire_asks(p, now=late, hold=True) == [], "a cap-hold did not stop the default"
+    reply = p.db.post("in", "go with B", chat="c1")
+    assert coord.expire_asks(p, now=late) == [], "defaulted over a user reply that may answer it"
+    p.db.x("UPDATE messages SET handled=1 WHERE id=?", (reply,))
+    p.set_config("coordinator.ask_timeout_h", 0)
+    assert coord.expire_asks(p, now=late) == []
+    assert coord.apply(p, [{"type": "config_set", "key": "coordinator.ask_timeout_h", "value": "24"}]) == []
+    assert coord.expire_asks(p, now=late) == []
+    assert coord.expire_asks(p, now=ask["ts"] + 24 * 3600) == [ask["id"]]
+
+
+def test_the_daemon_expires_a_due_ask_and_hands_it_to_the_coordinator(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    _, ask = _ask(p, reversible=True, recommendation="use option A")
+    p.db.x("UPDATE messages SET ts=? WHERE id=?", (time.time() - 13 * 3600, ask["id"]))
+    p.set_config("coordinator.debounce_s", 0)
+    d = Daemon(p.base)
+    d.tick()
+    assert p.db.one("SELECT handled FROM messages WHERE id=?", (ask["id"],))["handled"] == 1
+    assert "use option A" in p.db.one("SELECT text FROM messages WHERE kind='alert' ORDER BY id DESC")["text"]
+    assert _run_until(d, p, lambda: p.db.one("SELECT status FROM events WHERE kind='ask_timeout'")["status"]
+                      == "handled"), "the coordinator never saw the timed-out ask"

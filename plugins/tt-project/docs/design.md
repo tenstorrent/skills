@@ -42,6 +42,9 @@ in `state/runs/<id>/`, so a daemon restart never loses a result.
 12. A run's end, its spend and its task's new state commit in one transaction. No state row can
     wedge the loop: a task never stays `running` without a live run, and a queued task whose
     dependency failed or was cancelled is blocked with the reason.
+13. A question to the user falls back to its recommendation only when marked reversible, after
+    `coordinator.ask_timeout_h` (12h), never at a cap or over an unread user message; the user is
+    told what was decided. Irreversible questions wait for the user.
 
 ## Why the coordinator is tool-less
 
