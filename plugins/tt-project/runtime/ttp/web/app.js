@@ -91,6 +91,8 @@ function board(st) {
 }
 
 let lastOk = 0;
+// `cmd` in server text becomes <code>cmd</code>; the rest is escaped.
+const codes = (t) => esc(t).replace(/`([^`]+)`/g, "<code>$1</code>");
 function banner(html) {
   $("#banner").innerHTML = html;
   $("#banner").hidden = !html;
@@ -113,18 +115,21 @@ async function refresh() {
   try { st = await api("/api/state"); } catch (e) {
     if (e.message === "auth") return;
     // The page keeps its last data; say so rather than let it look current.
-    banner(`Cannot reach the daemon (${esc(e.message || e)}). What you see is from ${lastOk ? ago(lastOk / 1000) + " ago" : "earlier"} and may be out of date. Check <code>ttp status</code>.`);
+    // Only this computer can reopen a tunnel, so the page says how; the daemon's service restarts it by itself.
+    const help = localStorage.getItem("ttp_offline_help") || "If the project runs on another machine, the SSH tunnel from this computer is down: `ttp web <project> --tunnel` reopens it, and `--keep` keeps it up. If it runs on this computer, its daemon is down.";
+    banner(`Cannot reach the project's daemon (${esc(e.message || e)}). What you see is from ${lastOk ? ago(lastOk / 1000) + " ago" : "earlier"} and may be out of date.<br>${codes(help)}`);
     $("#daemon").textContent = "unreachable"; $("#daemon").className = "pill lv-red";
     return;
   }
   lastOk = Date.now();
+  if (st.offline_help) localStorage.setItem("ttp_offline_help", st.offline_help);
   // A daemon started before an upgrade serves this file without the health fields until it restarts.
   const h = st.health || { spend: {}, coordinator: {}, providers_paused: [], asks: [], running: 0, why_idle: "" };
   const cfg = st.project.config || {};
   const hb = st.heartbeat;
   const stuck = hb && hb.age > st.heartbeat_stale_s;
   const disk = st.disk_low;
-  banner([stuck ? `The daemon has not completed a tick for ${Math.round(hb.age / 60)} min: nothing new starts. Try <code>ttp restart ${esc(st.project.name)}</code>.` : "",
+  banner([stuck ? `The daemon has not completed a tick for ${Math.round(hb.age / 60)} min: nothing new starts. <code>ttp restart ${esc(st.project.name)}</code> restarts it.` : "",
           disk ? `Only ${disk.free_gb} GB free under ${esc(disk.path)}: only questions and plans start until ${st.disk && st.disk.resume_gb ? st.disk.resume_gb + " GB are" : "space is"} free.` : "",
           h.undelivered ? `${h.undelivered.asks} question(s) not delivered to any chat since ${at(h.undelivered.since)}: is the chat relay running? Answer here meanwhile.${h.undelivered.below_floor ? ` ${h.undelivered.below_floor} of them are below every chat's severity floor.` : ""}` : ""].filter(Boolean).join("<br>"));
   $("#pname").textContent = st.project.name;
@@ -133,9 +138,10 @@ async function refresh() {
   $("#spend").textContent = (h.spend.headline || `${money(h.spend.spent_24h)} 24h · ${money(h.spend.spent_7d)} 7d`) +
     (h.spend.in_flight ? ` · ~${money(h.spend.in_flight)} running` : "");
   $("#spend").title = h.spend.detail || "all providers";
-  const needs = st.tasks.filter((t) => t.status === "blocked").length + h.asks.length;
+  const needs = st.tasks.filter((t) => t.status === "blocked").length + (st.attention || []).length;
   $("#needs").hidden = !needs; $("#needs").textContent = `${needs} need${needs === 1 ? "s" : ""} you`;
-  $("#host").hidden = !h.host; $("#host").textContent = h.host || "";
+  $("#hostline").hidden = !h.host; $("#hostline").textContent = h.host || "";
+  $("#budgetlines").textContent = (h.budget_lines || []).join("\n");
   const dk = st.disk, kept = Object.keys(st.worktrees_kept || {});
   $("#disk").hidden = !dk;
   if (dk) {
@@ -153,8 +159,12 @@ async function refresh() {
   announce(st.attention || [], st.project.name);
   document.title = `${unseen ? "(" + unseen + ") " : ""}${st.project.name} · tt-project`;
   board(st);
-  $("#attention").innerHTML = (st.attention || []).slice(0, 5).map((m) => `<div class="attn"><span class="when">${ago(m.ts)} ago · ${esc(m.kind)}</span><div>${esc(m.text)}</div></div>`).join("");
-  $("#gates").innerHTML = $("#gates2").innerHTML = gateHtml(st.gates);
+  $("#attention").innerHTML = (st.attention || []).map((m) => `<div class="attn"><span class="when">${ago(m.ts)} ago · ${m.kind === "ask" ? "question #" + m.id : "problem"}</span><div>${esc(m.text)}</div></div>`).join("")
+    || `<p class="muted">Nothing needs you right now.</p>`;
+  $("#feed").innerHTML = `<div class="feed">${(st.feed || []).map((m) => `<div class="row"><span class="when">${ago(m.ts)} ago</span>` +
+    `<span class="meta">${m.state === "cleared" ? "cleared" + (m.cleared_at ? " " + at(m.cleared_at) : "") : esc(m.kind === "alert" ? "note" : m.kind)}</span>` +
+    `<span class="title">${esc(m.text)}</span></div>`).join("") || `<p class="muted">Nothing yet.</p>`}</div>`;
+  $("#gates2").innerHTML = gateHtml(st.gates);
   const running = h.working || st.runs.filter((r) => r.status === "running").map((r) => ({ ...r, run: r.id }));
   $("#running").innerHTML = running.length ? running.map((r) => `<div class="row"><span class="id">run ${r.run}</span><span class="title">${r.task ? `#${r.task} ${esc(r.title || "")}` : esc(r.role)}</span><span class="meta">${esc(r.provider)} ${esc(r.model || "")} ${esc(r.effort || "")} · ${ago(r.started)}${r.cost_usd ? ` · ~${money(r.cost_usd)} so far` : ""}</span>${r.note ? `<div class="meta">${esc(r.note)}</div>` : ""}</div>`).join("") : `<p class="muted">Idle.</p>`;
   $("#coord").textContent = (st.coordinator && st.coordinator.summary) || "—";

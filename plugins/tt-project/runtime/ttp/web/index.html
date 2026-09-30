@@ -10,7 +10,7 @@
 <header>
   <div class="brand"><span id="pname">project</span><span id="daemon" class="pill">…</span>
     <span id="spend" class="pill" title="all providers"></span><span id="needs" class="pill lv-red" hidden></span>
-    <span id="host" class="pill lv-orange" hidden></span><span id="disk" class="pill" hidden></span>
+    <span id="disk" class="pill" hidden></span>
     <button id="notify" class="ghost" hidden>Turn on notifications</button></div>
   <nav id="tabs">
     <button data-tab="overview" class="on">Overview</button>
@@ -24,15 +24,16 @@
 <main>
   <div id="banner" class="attn" hidden></div>
   <section id="overview" class="tab on">
+    <div class="card needs"><h2>Needs you now</h2><div id="attention"></div></div>
+    <div id="budgetlines" class="budgetlines"></div>
     <p id="why" class="muted"></p>
-    <div id="attention"></div>
     <div class="board" id="board"></div>
     <div class="grid">
-      <div class="card"><h2>Budget</h2><div id="gates"></div><p id="top" class="meta"></p></div>
       <div class="card"><h2>Working now</h2><div id="running"></div></div>
-      <div class="card wide"><h2>Coordinator</h2><div id="chealth"></div><p id="coord" class="muted"></p></div>
+      <div class="card"><h2>Coordinator</h2><div id="chealth"></div><p id="coord" class="muted"></p></div>
     </div>
     <div class="card"><h2>Recently finished</h2><div id="recent"></div></div>
+    <div class="card"><h2>Feed</h2><p id="hostline" class="meta" hidden></p><div id="feed"></div></div>
   </section>
   <section id="tasks" class="tab"><div id="tasklist"></div></section>
   <section id="issues" class="tab"><div id="issuelist"></div></section>
@@ -42,7 +43,7 @@
   </section>
   <section id="budget" class="tab">
     <div class="grid">
-      <div class="card"><h2>Gates</h2><div id="gates2"></div></div>
+      <div class="card"><h2>Gates</h2><div id="gates2"></div><p id="top" class="meta"></p></div>
       <div class="card"><h2>Who pays</h2><div id="accounts"></div></div>
     </div>
     <div class="card"><h2>Daily project spend, last 14 days</h2><div id="spendchart" class="chart"></div></div>

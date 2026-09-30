@@ -6348,3 +6348,199 @@ def test_invalid_resource_names_are_reported_not_silently_dropped(env):
     assert len(problems) == 1 and "'-bad' dropped" in problems[0] and problems[0].startswith("task_add")
     new = p.db.one("SELECT labels FROM tasks WHERE title='new'")
     assert json.loads(new["labels"]) == ["resource:ok1"]
+
+
+# self-clearing alerts, the "needs you now" split, the kept tunnel and the budget lines --------------
+def _episodes(p, key):
+    return p.db.q("SELECT * FROM alerts WHERE key=? ORDER BY id", (key,))
+
+
+def test_a_logged_out_alert_clears_on_the_next_successful_run_and_keeps_its_history(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    from ttp.web import attention
+    d = Daemon(p.base)
+    p.db.set_kv("limited:fake", {"until": time.time() + 900, "note": "logged out"})
+    d.alert("auth:fake", "fake is logged out", "high", every_s=4 * 3600)
+    p.db.set_kv("limited:fake", {"until": time.time() - 1, "note": "logged out"})
+    d.sweep_alerts()
+    assert [e["cleared"] for e in _episodes(p, "auth:fake")] == [None], "a lapsed probe pause is not a login"
+    assert [m["text"] for m in attention(p.db, time.time())] == ["fake is logged out"]
+    p.db.x("INSERT INTO runs(role,provider,started,ended,status) VALUES('worker','fake',?,?,'ok')",
+           (time.time(), time.time()))
+    d.sweep_alerts()
+    d.sweep_alerts()
+    ep = _episodes(p, "auth:fake")
+    assert len(ep) == 1 and ep[0]["cleared"] and ep[0]["cleared_why"] == "condition cleared", ep
+    assert attention(p.db, time.time()) == []
+    assert p.db.one("SELECT id FROM messages WHERE text='fake is logged out'"), "history was deleted"
+    told = p.db.q("SELECT text, severity FROM messages WHERE kind='resolved'")
+    assert told == [{"text": "Cleared: fake works again: a run succeeded after the logout alert.",
+                     "severity": "normal"}], told
+    # The same condition again is a new episode, alerted at once rather than deduplicated away.
+    d.alert("auth:fake", "fake is logged out again", "high", every_s=4 * 3600)
+    assert [m["text"] for m in attention(p.db, time.time())] == ["fake is logged out again"]
+    assert len(_episodes(p, "auth:fake")) == 2
+
+
+def test_a_red_budget_alert_clears_once_the_gate_leaves_red(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    from ttp.web import attention
+    d = Daemon(p.base)
+    d.update_gates()
+    p.db.spend("fake", 150.0, "task:1")
+    d.update_gates()
+    assert _episodes(p, "budget:fake")[0]["cleared"] is None
+    assert any(m["text"].startswith("Budget for fake is now red") for m in attention(p.db, time.time()))
+    p.db.x("DELETE FROM ledger")
+    d.update_gates()
+    d.sweep_alerts()
+    ep = _episodes(p, "budget:fake")
+    assert len(ep) == 1 and ep[0]["cleared"], ep
+    assert attention(p.db, time.time()) == []
+    assert not p.db.q("SELECT id FROM messages WHERE kind='resolved'"), "the gate already says back to normal"
+
+
+def test_coordinator_failure_alert_clears_on_a_successful_turn(env):
+    p = make(env)
+    from types import SimpleNamespace
+    from ttp.daemon import Daemon
+    from ttp.web import attention
+    d = Daemon(p.base)
+    for _ in range(3):
+        d._coordinator_failed("error boom")
+    assert [m["text"][:40] for m in attention(p.db, time.time())] == ["The coordinator failed 3 turns in a row "]
+    d.sweep_alerts()
+    assert _episodes(p, "coordinator")[0]["cleared"] is None
+    usage = SimpleNamespace(structured={"actions": [], "summary": "ok"}, final_text="", error="")
+    d._finish_coordinator({"id": 1, "dir": "x"}, usage, "ok", {})
+    d.sweep_alerts()
+    assert _episodes(p, "coordinator")[0]["cleared"], "a successful turn did not clear the alert"
+    assert attention(p.db, time.time()) == []
+    assert p.db.one("SELECT id FROM messages WHERE kind='resolved' AND text LIKE 'Cleared: The coordinator%'")
+
+
+def test_a_host_reboot_is_information_only(env, tmp_path, monkeypatch):
+    p = make(env)
+    from ttp import notifier
+    from ttp.daemon import Daemon
+    from ttp.web import state_payload
+    _lost_deep_runs(p, tmp_path, "an-earlier-boot")
+    d = Daemon(p.base)
+    for _ in range(3):
+        d.tick()
+    notes = p.db.q("SELECT kind FROM messages WHERE ref LIKE 'reboot:%'")
+    assert notes == [{"kind": "info"}], notes
+    assert not p.db.q("SELECT id FROM alerts WHERE key LIKE 'reboot:%'")
+    st = state_payload(p, p.db)
+    assert not [m for m in st["attention"] if "rebooted" in m["text"]], st["attention"]
+    assert [m["state"] for m in st["feed"] if "rebooted" in m["text"]] == ["info"], st["feed"]
+    # Pushed channels skip it even when it is loud (a host that keeps rebooting).
+    p.db.post("out", "The host rebooted (3rd reboot in 24 h)", kind="info", severity="high", ref="reboot:x")
+    shown = []
+    monkeypatch.setattr(notifier, "show", lambda title, body, url=None: shown.append(body))
+    notifier.run_once({"demo": 0}, "high")
+    assert shown == [], shown
+
+
+def test_the_top_section_holds_only_what_needs_the_user_and_the_rest_is_a_feed(env):
+    p = make(env)
+    from ttp.cli import status_text
+    from ttp.daemon import Daemon
+    from ttp.web import state_payload
+    d = Daemon(p.base)
+    p.db.post("out", "Decided: the nightly check runs at 02:00.", kind="alert", severity="low")
+    p.db.set_kv("disk_low", {"path": "/", "free_gb": 1.0})
+    d.alert("disk", "Only 1.0 GB free", "high", every_s=0)
+    p.db.set_kv("disk_low", None)
+    d.sweep_alerts()
+    p.db.set_kv("limited:fake", {"until": time.time() + 900, "note": "logged out"})
+    d.alert("auth:fake", "fake is logged out", "high")
+    p.db.post("out", "Which board should I use?", kind="ask", severity="high")
+    st = state_payload(p, p.db)
+    assert [(m["kind"], m["text"]) for m in st["attention"]] == [
+        ("ask", "Which board should I use?"), ("alert", "fake is logged out")], st["attention"]
+    feed = st["feed"]
+    assert [m["text"] for m in feed] == ["Cleared: Disk space is back above the guard; held tasks start again.",
+                                         "Only 1.0 GB free", "Decided: the nightly check runs at 02:00."], feed
+    assert feed[1]["state"] == "cleared" and feed[1]["cleared_at"], feed[1]
+    assert feed[2]["state"] == "fyi"
+    lines = status_text(p).splitlines()
+    assert lines[1].startswith("  needs you (ask #") and lines[2].startswith("  needs you (alert, "), lines
+    assert "recent:" in lines and "Only 1.0 GB free" not in "\n".join(lines[:lines.index("recent:")]), lines
+    assert any("(cleared " in ln and "Only 1.0 GB free" in ln for ln in lines[lines.index("recent:"):]), lines
+
+
+def test_the_web_page_explains_an_unreachable_daemon_without_setup_details(env):
+    p = make(env)
+    from ttp.web import offline_help, state_payload
+    text = offline_help("demo")
+    assert "`ttp web demo --tunnel`" in text and "`ttp web demo --tunnel --keep`" in text, text
+    assert "`ttp restart demo`" in text and "testhost" not in text, text
+    assert state_payload(p, p.db)["offline_help"] == text
+    js = (RUNTIME / "ttp" / "web" / "app.js").read_text()
+    assert "Cannot reach the project's daemon" in js and 'localStorage.getItem("ttp_offline_help")' in js
+    assert 'localStorage.setItem("ttp_offline_help", st.offline_help)' in js
+
+
+def test_kept_tunnel_service_files_and_adopt_replace_remove(env, tmp_path, monkeypatch):
+    from ttp import tunnel
+    argv = tunnel.ssh_argv("the-host", 18800, 18700, ssh="/usr/bin/ssh")
+    unit = tunnel.systemd_unit("demo", argv)
+    for want in ("Restart=always", "RestartSec=5", "RestartMaxDelaySec=300", "StartLimitIntervalSec=0",
+                 "ServerAliveInterval=30", "ExitOnForwardFailure=yes", "BatchMode=yes",
+                 "-L 127.0.0.1:18800:127.0.0.1:18700 the-host", "WantedBy=default.target"):
+        assert want in unit, (want, unit)
+    plist = tunnel.launchd_plist("demo", argv)
+    assert plist["Label"] == "com.tt-project.tunnel.demo" and plist["KeepAlive"] is True
+    assert plist["RunAtLoad"] is True and plist["ThrottleInterval"] >= 10 and plist["ProgramArguments"] == argv
+
+    monkeypatch.setenv("HOME", str(tmp_path / "userhome"))
+    calls = []
+    monkeypatch.setattr(tunnel, "_run", lambda *a: calls.append(a) or subprocess.CompletedProcess(a, 0, "", ""))
+    for platform in ("linux", "darwin"):
+        calls.clear()
+        picked = []
+        pick = lambda pref: picked.append(pref) or pref  # noqa: E731
+        local, did = tunnel.keep("demo", "the-host", 18700, pick, platform=platform)
+        f = tunnel.service_file("demo", platform)
+        assert f.name.startswith("com.tt-project.tunnel.demo") and f.is_file(), f
+        assert local == 18800 and did.startswith("installed a kept tunnel"), did
+        assert tunnel.installed("demo", platform)["local"] == 18800
+        before = f.read_bytes()
+        local, did = tunnel.keep("demo", "the-host", 18700, pick, platform=platform)
+        assert did.startswith("adopted") and local == 18800 and f.read_bytes() == before, did
+        assert picked == [18800], "adopting picked a new port"
+        local, did = tunnel.keep("demo", "the-host", 18701, pick, platform=platform)
+        assert did.startswith("replaced") and local == 18800, did
+        assert tunnel.installed("demo", platform)["remote"] == 18701
+        stops = [c for c in calls if "bootout" in c or "disable" in c]
+        assert len(stops) == 1, "the old forward was not stopped before its replacement"
+        assert tunnel.unkeep("demo", platform).startswith("removed") and not f.exists()
+        assert tunnel.unkeep("demo", platform) == "no kept tunnel for demo"
+
+
+def test_budget_lines_show_each_plan_window_its_reset_and_history(env):
+    p = make(env)
+    from ttp.web import budget_lines
+    now = time.time()
+    assert budget_lines(p.db, now) == [], "no data must show nothing"
+    snap = lambda ts, win, util, resets: p.db.x(  # noqa: E731
+        "INSERT INTO snapshots(ts,provider,account,window,utilization,resets_at) VALUES(?,?,?,?,?,?)",
+        (ts, "claude", "", win, util, resets))
+    snap(now - 3 * 86400, "five_hour", 62.0, now - 3 * 86400 + 3600)
+    snap(now - 2 * 86400, "five_hour", 40.0, now - 2 * 86400 + 3600)
+    snap(now - 2 * 86400 + 60, "five_hour", 88.0, now - 2 * 86400 + 3600)
+    snap(now - 1, "five_hour", 3.0, now + 3 * 3600 + 40 * 60 + 30)
+    snap(now - 9 * 86400, "seven_day", 50.0, now - 8 * 86400)
+    snap(now - 8 * 86400 - 60, "seven_day", 87.0, now - 8 * 86400 + 2)
+    snap(now - 2 * 86400, "seven_day", 91.0, now - 86400)
+    snap(now - 1, "seven_day", 3.0, now + 6 * 86400 + 20 * 3600 + 30)
+    lines = budget_lines(p.db, now)
+    assert lines == ["Claude plan",
+                     "  5-hour: 3% used, resets in 3h 40m, peaks last 14 days: 62 88 3",
+                     "  Weekly: 3% used, resets in 6d 20h, last two weeks: 87%, 91%"], lines
+    p.db.set_kv("gates", {"fake": {"regime": "caps", "numbers": {"spent_24h": 12.0, "daily_cap": 100.0,
+                                                                 "spent_7d": 40.0, "weekly_cap": 200.0}}})
+    assert budget_lines(p.db, now)[-1] == "$12.00 of $100 last 24h, $40.00 of $200 last 7 days"
