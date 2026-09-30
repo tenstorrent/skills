@@ -1610,3 +1610,12 @@ def test_ttp_lock_holds_until_its_command_ends_even_when_signalled(env):
     assert second.wait(timeout=30) == 0
     t = {ln.split()[0]: float(ln.split()[1]) for ln in marks.read_text().splitlines()}
     assert t["start2"] >= t["end1"] - 0.05, "the resource was handed on while the first command still ran"
+
+
+def test_the_task_creation_valve_opens_only_with_the_user(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    action = {"type": "config_set", "key": "coordinator.max_new_tasks_per_day", "value": "50"}
+    assert "approval" in coord.apply(p, [action])[0]
+    assert coord.apply(p, [action], user_turn=True) == []
+    assert p.config()["coordinator"]["max_new_tasks_per_day"] == 50

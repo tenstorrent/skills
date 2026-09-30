@@ -51,6 +51,8 @@ USER_SETTABLE = {
     "coordinator.tier": str, "jev.enabled": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     # Where code tasks branch from: the project's working branch once it has one.
     "delivery.base_ref": str,
+    # The runaway valve on task creation: raised only with the user's yes (see NEEDS_USER).
+    "coordinator.max_new_tasks_per_day": int,
     # Skill plugins loaded for this project's workers only (a plan may recommend them).
     "providers.claude.plugin_dirs": lambda v: [str(x) for x in (v if isinstance(v, list) else [v])],
     # Hours before an unanswered reversible ask falls back to its recommendation; 0 turns it off.
@@ -157,7 +159,7 @@ def _norm_severity(s: str | None) -> str:
 # Settings that change what code workers run. The coordinator may set them only in a turn that
 # carries a message from the user, after asking: a turn woken by logs, pull requests or a worker's
 # hand-off can be steered by text from outside, and must not be able to load new code.
-NEEDS_USER = {"providers.claude.plugin_dirs"}
+NEEDS_USER = {"providers.claude.plugin_dirs", "coordinator.max_new_tasks_per_day"}
 
 
 def apply(p: Project, actions: list[dict], default_chat: str | None = None, user_turn: bool = False) -> list[str]:
