@@ -3621,3 +3621,131 @@ def test_a_lock_wait_extends_the_wall_clock_at_most_by_the_limit(env, tmp_path):
     # Booked on the time beyond the one limit's worth of waiting, never below it.
     assert _cut_off_cost(run_dir, info) == pytest.approx(6.0 * min(max(info["ended"] - info["started"] - 3, 0) / 3, 1),
                                                          abs=0.01)
+
+
+# guarded push -------------------------------------------------------------------------------------
+def _push_setup(env, monkeypatch, checks):
+    """The project's repo pushes to a bare `origin` whose `proj` branch is the target; `other` is a
+    second clone standing in for someone else pushing to it."""
+    for var, val in (("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"),
+                     ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t")):
+        monkeypatch.setenv(var, val)
+    p = make(env)
+    repo, tmp = env["repo"], env["tmp"]
+    origin, other = tmp / "origin.git", tmp / "other"
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    _git_out(repo, "remote", "add", "origin", str(origin))
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/proj")
+    subprocess.run(["git", "clone", "-q", "-b", "proj", str(origin), str(other)], check=True)
+    p.set_config("delivery.push_branch", "origin/proj")
+    p.set_config("delivery.push_checks", checks)
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.chdir(repo)
+    return p, repo, origin, other
+
+
+def _commit(path, name, text):
+    (path / name).write_text(text)
+    _git_out(path, "add", name)
+    _git_out(path, "commit", "-qm", f"edit {name}")
+
+
+def _ttp_push():
+    from ttp import cli
+    with pytest.raises(SystemExit) as e:
+        cli.main(["push"])
+    return e.value.code
+
+
+def test_push_rebases_onto_the_moved_target_checks_the_result_and_pushes_without_force(env, monkeypatch):
+    log = env["tmp"] / "checked"
+    p, repo, origin, other = _push_setup(env, monkeypatch, [f"git rev-parse HEAD >> {log}", "test -f mine.txt"])
+    _commit(repo, "mine.txt", "mine\n")
+    _commit(other, "theirs.txt", "theirs\n")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    assert _ttp_push() == 0
+    pushed = _git_out(origin, "rev-parse", "proj")
+    assert pushed == _git_out(repo, "rev-parse", "HEAD")
+    assert log.read_text().split() == [pushed], "the checks must run on exactly the pushed commit"
+    assert _git_out(origin, "show", "proj:theirs.txt") == "theirs", "the other side's commit was lost"
+    assert _git_out(origin, "rev-list", "--count", "proj") == "3", "history must stay linear"
+
+
+def test_push_starts_over_when_the_target_moves_during_the_checks(env, monkeypatch):
+    log, once = env["tmp"] / "checked", env["tmp"] / "moved"
+    p, repo, origin, other = _push_setup(env, monkeypatch, [])
+    move = (f"test -e {once} || (touch {once} && cd {other} && echo x > late.txt && git add late.txt"
+            f" && git commit -qm late && git push -q origin HEAD:proj)")
+    p.set_config("delivery.push_checks", [f"git rev-parse HEAD >> {log}", move])
+    _commit(repo, "mine.txt", "mine\n")
+    assert _ttp_push() == 0
+    runs = log.read_text().split()
+    assert len(runs) == 2 and runs[0] != runs[1], "the checks must rerun on the new head"
+    assert _git_out(origin, "rev-parse", "proj") == runs[1]
+    assert _git_out(origin, "show", "proj:late.txt") == "x"
+
+
+def test_push_stops_after_its_rounds_when_the_target_keeps_moving(env, monkeypatch):
+    p, repo, origin, other = _push_setup(env, monkeypatch, [])
+    move = (f"cd {other} && date +%s%N >> late.txt && git add late.txt && git commit -qm late"
+            f" && git push -q origin HEAD:proj")
+    p.set_config("delivery.push_checks", [move])
+    p.set_config("delivery.push_rounds", 2)
+    _commit(repo, "mine.txt", "mine\n")
+    assert _ttp_push() == 5
+    assert "mine.txt" not in _git_out(origin, "ls-tree", "--name-only", "proj").split()
+
+
+def test_push_refuses_a_dirty_tree_a_failed_check_and_a_conflict(env, monkeypatch):
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["test ! -f broken.txt"])
+    before = _git_out(origin, "rev-parse", "proj")
+    (repo / "README.md").write_text("edited, not committed\n")
+    assert _ttp_push() == 2 and _git_out(origin, "rev-parse", "proj") == before
+    _git_out(repo, "checkout", "README.md")
+
+    _commit(repo, "broken.txt", "x\n")
+    assert _ttp_push() == 4
+    _git_out(repo, "reset", "-q", "--hard", "HEAD~1")
+
+    _commit(repo, "README.md", "mine\n")
+    _commit(other, "README.md", "theirs\n")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    moved = _git_out(origin, "rev-parse", "proj")
+    assert _ttp_push() == 3
+    assert not (repo / _git_out(repo, "rev-parse", "--git-path", "rebase-merge")).exists(), \
+        "a conflicting rebase must be aborted"
+    assert _git_out(repo, "show", "HEAD:README.md") == "mine"
+    assert _git_out(origin, "rev-parse", "proj") == moved != before
+
+
+def test_push_needs_a_configured_target_and_checks(env, monkeypatch, capsys):
+    p, repo, origin, other = _push_setup(env, monkeypatch, [])
+    before = _git_out(origin, "rev-parse", "proj")
+    _commit(repo, "mine.txt", "mine\n")
+    assert _ttp_push() == 2 and "no checks configured" in capsys.readouterr().err
+    p.set_config("delivery.push_checks", "true")
+    p.set_config("delivery.push_branch", "")
+    p.set_config("delivery.base_ref", "")
+    assert _ttp_push() == 2 and "no target branch" in capsys.readouterr().err, \
+        "no target must not fall back to the remote's default branch"
+    p.set_config("delivery.push_branch", "origin/proj")
+    p.set_config("delivery.push_allowed", False)
+    assert _ttp_push() == 2 and "push_allowed" in capsys.readouterr().err
+    assert _git_out(origin, "rev-parse", "proj") == before
+
+
+def test_push_checks_accept_the_forms_config_set_sends():
+    sys.path.insert(0, str(RUNTIME))
+    try:
+        from ttp.push import check_list
+    finally:
+        sys.path.remove(str(RUNTIME))
+    assert check_list('["pytest -q", "make lint"]') == ["pytest -q", "make lint"]
+    assert check_list("pytest -q\n\nmake lint\n") == ["pytest -q", "make lint"]
+    assert check_list(["pytest -q", " "]) == ["pytest -q"]
+    assert check_list(None) == []
+
+
+def test_the_review_prompt_pushes_only_through_the_guarded_push():
+    text = (RUNTIME.parent / "template" / "prompts" / "kind-review.md").read_text()
+    assert "`ttp push`" in text and "NEVER use `git push` directly" in text

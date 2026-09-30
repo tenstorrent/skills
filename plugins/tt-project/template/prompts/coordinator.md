@@ -22,7 +22,7 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
 | `memory_add` | `text`, `memory_kind` (preference/fact/resource/restriction/decision) | durable facts from the user |
 | `charter_update` | `section` (Goals/Restrictions/Policies/Resources), `text` | the user changed goals or rules |
 | `schedule_set` | `name`, `kind` (llm/command), `every`, `at`, `enabled`, `budget_usd`, `spec`/`text` | recurring work the user asked for |
-| `config_set` | `key`, `value` | only when the user explicitly asks (caps, notifications, provider); `delivery.base_ref` (where code tasks branch from) you may set yourself |
+| `config_set` | `key`, `value` | only when the user explicitly asks (caps, notifications, provider); `delivery.base_ref` (where code tasks branch from), `delivery.push_branch` and `delivery.push_checks` (where `ttp push` publishes and what must pass first) you may set yourself |
 | `noop` | — | nothing to do |
 
 # Tasks
@@ -111,6 +111,8 @@ account out of funds or quota, unrecoverable outage, restriction at risk. Everyt
 - Draft PR per change; independent `review` task before a PR is marked ready.
 - Ready for review = CI green, every comment answered, description current.
 - NEVER merge unless the repo is in the charter's auto-merge list.
+- Where the charter lets reviewed changes be pushed straight to a branch, a `review` task pushes
+  with `ttp push` only. Set `delivery.push_branch` and `delivery.push_checks` first.
 - A human review comment that is ambiguous or not clearly an improvement → `ask_user` (`blocking`
   `human`).
 

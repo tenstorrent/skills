@@ -538,6 +538,19 @@ def cmd_note(a) -> None:
         f.write(f"{time.strftime('%H:%M:%S')} {a.text}\n")
 
 
+def cmd_push(a) -> None:
+    """Publish this worktree's commits onto the project's target branch, guarded: refuse a dirty
+    tree, rebase onto the latest tip, run `delivery.push_checks` on the final head, start over if
+    the tip moved meanwhile, and push without force. Exit codes are in `push.py`."""
+    from . import push
+    base = os.environ.get("TTP_PROJECT")
+    p = Project(base) if base else next((c for d in [Path.cwd(), *Path.cwd().parents]
+                                         if (c := Project(d)).exists()), None)
+    if not p or not p.exists():
+        die("ttp push: no tt-project project here (run it inside a run or a project's worktree)")
+    sys.exit(push.run(p, Path.cwd()))
+
+
 def cmd_lock(a) -> None:
     """Hold one slot of a shared resource while a command runs: `ttp lock <resource> -- <cmd...>`.
 
@@ -1003,6 +1016,9 @@ def main(argv: list[str] | None = None) -> None:
     s = sub.add_parser("note", help="(inside a run) append a progress note")
     s.add_argument("text")
     s.set_defaults(fn=cmd_note)
+
+    s = sub.add_parser("push", help="guarded push of this worktree to the project's target branch")
+    s.set_defaults(fn=cmd_push)
 
     s = sub.add_parser("lock", help="(inside a run) hold a shared resource while one command runs")
     s.add_argument("resource")

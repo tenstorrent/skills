@@ -80,6 +80,11 @@ and preferences you add later become part of the project's charter and memory.
   marked exclusive holds the resource's lock for its whole run; while it waits for a slot, new
   `ttp lock` commands wait behind it, so it is not starved.
 - Each task edits only its own worktree.
+- Where reviewed changes go straight to a shared branch, `ttp push` publishes them guarded: it
+  refuses uncommitted changes, rebases onto the latest tip, runs `delivery.push_checks` on the
+  exact commit it pushes, starts over if the branch moved meanwhile, and never forces. The target
+  is `delivery.push_branch` (default `delivery.base_ref`); with neither set, or no checks, it
+  refuses.
 - A plan task starts from what is already known: prior work, the organization's docs and chats
   through the connectors you have, available skills, and public work. Skill plugins it recommends
   can be enabled for the project's workers only (`providers.claude.plugin_dirs`).

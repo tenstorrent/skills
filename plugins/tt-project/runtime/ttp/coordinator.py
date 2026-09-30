@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from . import push
 from . import schedule as sched
 from .db import SEVERITY_RANK, TERMINAL_TASK_STATES, dependency_ids, load_result
 from .project import Project
@@ -57,6 +58,9 @@ USER_SETTABLE = {
     "coordinator.tier": str, "jev.enabled": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     # Where code tasks branch from: the project's working branch once it has one.
     "delivery.base_ref": str,
+    # Where `ttp push` publishes (default: base_ref) and the commands that must pass first.
+    "delivery.push_branch": str,
+    "delivery.push_checks": lambda v: push.check_list(v),
     # The runaway valve on task creation; the coordinator may raise it within MAX_TASKS_PER_DAY.
     "coordinator.max_new_tasks_per_day": lambda v: min(int(v), MAX_TASKS_PER_DAY),
     # Skill plugins loaded for this project's workers only (a plan may recommend them).
