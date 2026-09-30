@@ -262,6 +262,12 @@ class DB:
 
 
 SEVERITY_RANK = {"info": 0, "low": 0, "normal": 1, "high": 2, "critical": 3}
+
+
+def chat_floor(chat_min: str | None, project_min: str | None) -> str:
+    """A chat's severity floor: the project floor (notify.chat_min_severity) applies to every chat,
+    and a chat can only raise it."""
+    return max((chat_min or "normal", project_min or "normal"), key=lambda n: SEVERITY_RANK.get(n, -1))
 RESULT_MAX_CHARS = 20000
 
 

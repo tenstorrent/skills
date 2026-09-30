@@ -16,7 +16,7 @@ from urllib.parse import parse_qs, urlparse
 from . import budget as bud
 from . import schedule as sched
 from .daemon import HEARTBEAT_STALE_S, heartbeat
-from .db import DB, load_result
+from .db import DB, SEVERITY_RANK, chat_floor, load_result
 from .project import Project
 from .providers import get_provider
 from .runner import stop_runs
@@ -80,7 +80,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
     app's header show, so both answer "is it working, what is it costing, what is it waiting for"."""
     now = now or time.time()
     cfg = p.config()
-    c, core = cfg["coordinator"], cfg.get("core_provider", "claude")
+    c, core, notify = cfg["coordinator"], cfg.get("core_provider", "claude"), cfg["notify"]
     gates = db.kv("gates", {})
     last_turn = float(db.kv("last_coordinator_turn", 0))
     backoff = float(db.kv("coordinator_backoff_until", 0))
@@ -105,13 +105,23 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
     top = db.one("SELECT source, ROUND(SUM(usd),2) usd FROM ledger WHERE ts>=? GROUP BY source ORDER BY SUM(usd) DESC "
                  "LIMIT 1", (now - WEEK,))
     # A relay that stopped reading: questions the user has not seen, so nothing can be decided.
-    relay = db.one("SELECT COUNT(*) n, COALESCE(MAX(last_read),0) seen FROM chats WHERE id!='web'")
+    # A chat that read past an ask below its severity floor skipped it, so that does not count.
+    readers = [(int(r["last_read"] or 0),
+                SEVERITY_RANK.get(chat_floor(r["min_severity"], notify.get("chat_min_severity")), 1))
+               for r in db.q("SELECT last_read, min_severity FROM chats WHERE id!='web'")]
+    if notify.get("slack"):
+        slack_floor = SEVERITY_RANK.get(notify.get("slack_min_severity", "high"), 2)
+        readers.append((int(db.kv("slack_last_out", 0)), slack_floor))
     undelivered = None
-    if relay["n"]:
-        late = db.one("SELECT COUNT(*) n, MIN(ts) since FROM messages WHERE kind='ask' AND handled=0 AND chat IS NULL "
-                      "AND id>? AND ts>?", (relay["seen"], now - 14 * DAY))
-        if late["n"] and late["since"] < now - RELAY_LATE_S:
-            undelivered = {"asks": late["n"], "since": late["since"]}
+    if readers:
+        late = [a for a in db.q("SELECT id, ts, severity FROM messages WHERE kind='ask' AND handled=0 AND chat IS NULL "
+                                "AND ts>?", (now - 14 * DAY,))
+                if not any(seen >= a["id"] and SEVERITY_RANK.get(a["severity"], 1) >= floor for seen, floor in readers)]
+        since = min((a["ts"] for a in late), default=now)
+        if late and since < now - RELAY_LATE_S:
+            lowest = min(floor for _, floor in readers)
+            undelivered = {"asks": len(late), "since": since,
+                           "below_floor": sum(SEVERITY_RANK.get(a["severity"], 1) < lowest for a in late)}
     idle_wake = None
     if last_turn and not waiting and not queued and not db.one("SELECT id FROM tasks WHERE status='running'"):
         idle_wake = max(last_turn + float(c.get("idle_wake_s", 1800)), backoff, now)

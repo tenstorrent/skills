@@ -1186,10 +1186,31 @@ def test_status_says_when_questions_are_not_reaching_any_chat(env):
     assert problems == []
     assert health(p, p.db, now=ask["ts"] + 60)["undelivered"] is None, "reported before the relay had a chance"
     late = health(p, p.db, now=ask["ts"] + 3600)["undelivered"]
-    assert late == {"asks": 1, "since": ask["ts"]}, "a relay that stopped delivering was not reported"
+    assert late == {"asks": 1, "since": ask["ts"], "below_floor": 0}, "a relay that stopped delivering was not reported"
     p.db.x("UPDATE messages SET ts=? WHERE id=?", (time.time() - 3600, ask["id"]))
     assert "1 question(s) not delivered to any chat" in status_text(p)
     p.db.x("UPDATE chats SET last_read=? WHERE id='c1'", (ask["id"],))
+    assert health(p, p.db)["undelivered"] is None
+
+
+def test_a_chat_that_filtered_an_ask_out_did_not_deliver_it(env):
+    p = make(env)
+    from ttp.cli import status_text
+    from ttp.web import health
+    p.db.x("INSERT INTO chats(id,created,label,last_active,last_read,min_severity) VALUES('c1',?,?,?,0,'critical')",
+           (time.time(), "relay", time.time()))
+    problems, ask = _ask(p, blocking="access")
+    assert problems == [] and ask["severity"] != "critical"
+    p.db.x("UPDATE chats SET last_read=? WHERE id='c1'", (ask["id"],))
+    late = health(p, p.db, now=ask["ts"] + 3600)["undelivered"]
+    assert late == {"asks": 1, "since": ask["ts"], "below_floor": 1}, "an ask a chat skipped counted as delivered"
+    p.db.x("UPDATE messages SET ts=? WHERE id=?", (time.time() - 3600, ask["id"]))
+    assert "below every chat's severity floor" in status_text(p)
+    # The project floor applies to every chat, whatever the chat's own floor says.
+    p.db.x("UPDATE chats SET min_severity='normal'")
+    p.set_config("notify.chat_min_severity", "critical")
+    assert health(p, p.db)["undelivered"]["asks"] == 1
+    p.set_config("notify.chat_min_severity", "normal")
     assert health(p, p.db)["undelivered"] is None
 
 
@@ -1404,6 +1425,30 @@ def test_ttp_lock_serializes_commands_on_one_slot(env):
     assert starts[1] >= ends[0] - 0.05, "two commands held the one slot at the same time"
 
 
+def test_hourly_guard_counts_long_runs_only_for_the_time_they_ran_in_the_hour(env):
+    p = make(env)
+    from ttp import budget as bud
+    p.set_config("budget.hourly_floor_usd", 30)
+    now = time.time()
+    # $60 over three hours so far is $20 in the last hour: a busy run, not a runaway.
+    p.db.x("INSERT INTO runs(role,provider,started,status,cost_usd) VALUES('worker','claude',?,'running',60)",
+           (now - 3 * 3600,))
+    g = bud.evaluate(p.db, p.config(), "claude", [], now)
+    assert g.numbers["spent_1h"] == pytest.approx(20, abs=0.01)
+    assert not any("runaway guard" in r for r in g.reasons), g.reasons
+    # The same run, ended now: the ledger books all $60 at its end, the guard still counts $20.
+    p.db.x("UPDATE runs SET status='ok', ended=?", (now,))
+    p.db.spend("claude", 60.0, "task:1")
+    g = bud.evaluate(p.db, p.config(), "claude", [], now)
+    assert g.numbers["spent_1h"] == pytest.approx(20, abs=0.1)
+    assert not any("runaway guard" in r for r in g.reasons), g.reasons
+    # Spending that fast inside the hour still trips it.
+    p.db.x("INSERT INTO runs(role,provider,started,status,cost_usd) VALUES('worker','claude',?,'running',15)",
+           (now - 600,))
+    g = bud.evaluate(p.db, p.config(), "claude", [], now)
+    assert g.level == "red" and any("long runs pro rata" in r for r in g.reasons), g.reasons
+
+
 def test_cancelled_runs_are_not_runaway_waste(env):
     """Redirecting a project cancels its running work; that must not pause the project."""
     p = make(env)
@@ -1447,6 +1492,13 @@ def test_project_plugins_load_for_workers_only(env, tmp_path, monkeypatch):
     assert p.db.one("SELECT id FROM messages WHERE kind='alert' AND text LIKE ?", (f"%{missing}%",)), \
         "a missing plugin folder was dropped without telling anyone"
     (p.runs / str(rid) / "STOP").touch()
+    # A path may contain a comma: a list keeps it whole, and so does a string naming it alone.
+    comma = tmp_path / "plugin, v2"
+    comma.mkdir()
+    for value in (json.dumps([str(comma), str(plug)]), str(comma), f"{comma}\n{plug}", f"{comma}{os.pathsep}{plug}"):
+        assert coord.apply(p, [{"type": "config_set", "key": key, "value": value}]) == [], value
+        assert str(comma) in p.config()["providers"]["claude"]["plugin_dirs"], value
+    assert coord.dir_list(p.config()["providers"]["claude"]["plugin_dirs"])[0] == str(comma)
     crid = d.start_run("coordinator", "decide", "claude", "light", str(p.base), read_only=True)
     assert "--plugin-dir" not in json.loads((p.runs / str(crid) / "run.json").read_text())["argv"]
     (p.runs / str(crid) / "STOP").touch()

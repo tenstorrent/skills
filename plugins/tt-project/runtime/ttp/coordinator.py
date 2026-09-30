@@ -381,7 +381,8 @@ def _new_dependencies(db, task: dict | None, raw: Any) -> list[int]:
 def dir_list(v: Any) -> list[str]:
     """Directories from a config value. The action schema carries `value` as a string, so a list
     arrives JSON-encoded or comma/newline separated, and an older config may hold such a string
-    as a single list element."""
+    as a single list element. A path may itself contain a comma, so a piece that is an existing
+    directory is kept whole; `existing_dirs` rejects whatever a split got wrong."""
     out: list[str] = []
     for item in (v if isinstance(v, list) else [v]):
         if isinstance(item, list):
@@ -394,12 +395,25 @@ def dir_list(v: Any) -> list[str]:
                 continue
             except ValueError:
                 pass
-        out += [x.strip() for x in re.split(r"[,\n]", text) if x.strip()]
+        out += _split_dirs(text)
     return out
 
 
+def _split_dirs(text: str) -> list[str]:
+    out: list[str] = []
+    for part in [text] if _is_dir(text) else re.split(f"[\n{re.escape(os.pathsep)}]", text):
+        part = part.strip()
+        if part:
+            out += [part] if _is_dir(part) else [x.strip() for x in part.split(",") if x.strip()]
+    return out
+
+
+def _is_dir(path: str) -> bool:
+    return bool(path) and Path(os.path.expanduser(path)).is_dir()
+
+
 def existing_dirs(dirs: list[str]) -> list[str]:
-    missing = [d for d in dirs if not Path(os.path.expanduser(d)).is_dir()]
+    missing = [d for d in dirs if not _is_dir(d)]
     if missing:
         raise ValueError(f"not a directory on this machine: {', '.join(missing)}; nothing was changed")
     return dirs

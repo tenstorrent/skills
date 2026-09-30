@@ -79,6 +79,22 @@ def in_flight(db: DB, provider: str | None = None, exclude: set[str] | None = No
     return sum(float(r["cost_usd"] or 0) for r in rows if r["provider"] not in (exclude or set()))
 
 
+def spent_last_hour(db: DB, provider: str, now: float) -> float:
+    """Spend in the hour before `now`, each run's cost spread evenly over the time it ran. The
+    ledger books a run's whole cost when it ends, so a long run would otherwise land in one hour."""
+    since = now - HOUR
+    total = db.spent_since(since, provider)
+    for r in db.q("SELECT started, ended, status, cost_usd FROM runs WHERE provider=? "
+                  "AND (status='running' OR ended>=?)", (provider, since)):
+        cost = float(r["cost_usd"] or 0)
+        running = r["status"] == "running"
+        end = now if running else float(r["ended"])
+        start = min(float(r["started"] or end), end)
+        before = min(max(since - start, 0.0), end - start) / (end - start) if end > start else 0.0
+        total += cost * (1 - before) if running else -cost * before
+    return max(total, 0.0)
+
+
 def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float | None = None) -> Gate:
     now = now or time.time()
     b = cfg["budget"]
@@ -124,7 +140,7 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
     # - total: all spend above max(k x this project's 7-day hourly norm, a floor sized to the
     #   parallel work it is allowed), so even "successful" repetition is bounded.
     hour_ago = now - HOUR
-    last_h = db.spent_since(hour_ago, provider) + in_flight(db, provider=provider)
+    last_h = spent_last_hour(db, provider, now)
     runs_h = db.q("SELECT role, status, cost_usd FROM runs WHERE provider=? AND ended>=?", (provider, hour_ago))
     # A run stopped on purpose (a cancel, a pause, a redirect) is a decision, not waste.
     waste = sum(float(r["cost_usd"] or 0) for r in runs_h
@@ -144,7 +160,7 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
     if thrash > thrash_cap:
         _raise(g, "red", f"runaway guard: coordinator spent ${thrash:.2f} in the last hour (limit ${thrash_cap:.0f})")
     if last_h > ceiling:
-        _raise(g, "red", f"runaway guard: ${last_h:.2f} spent in the last hour, ceiling ${ceiling:.2f}/h; "
+        _raise(g, "red", f"runaway guard: ${last_h:.2f} spent in the last hour (long runs pro rata), ceiling ${ceiling:.2f}/h; "
                          f"resumes automatically as the hour rolls over")
 
     if g.level == "yellow" and g.regime == "caps":

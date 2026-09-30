@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 
 from . import __version__
-from .db import SEVERITY_RANK
+from .db import chat_floor
 from . import schedule as sched
 from .project import (FOLDER, NAME_RE, Project, hostname, load_registry, load_secrets, register, save_secret,
                       write_json)
@@ -347,9 +347,7 @@ def cmd_listen(a) -> None:
     row = db.one("SELECT last_read, min_severity FROM chats WHERE id=?", (a.chat,))
     if not row:
         die(f"unknown chat {a.chat}; run `ttp connect {a.name}` first")
-    # The project floor (notify.chat_min_severity) applies to every chat; a chat can only raise it.
-    floor = max((row["min_severity"] or "normal", p.config()["notify"].get("chat_min_severity") or "normal"),
-                key=lambda n: SEVERITY_RANK.get(n, -1))
+    floor = chat_floor(row["min_severity"], p.config()["notify"].get("chat_min_severity"))
     after = int(row["last_read"] or 0)
     # One listener per chat, and the newest wins. Two would race for the same messages, and one
     # printing to nowhere (a lost background task, a dropped ssh session) would silently mark them
@@ -468,6 +466,9 @@ def status_text(p: Project) -> str:
         u = h["undelivered"]
         lines.append(f"chat relay: {u['asks']} question(s) not delivered to any chat since {at(u['since'], now)}; "
                      f"is the chat's `ttp listen` running?")
+        if u["below_floor"]:
+            lines.append(f"  {u['below_floor']} of them are below every chat's severity floor; lower "
+                         f"notify.chat_min_severity or the chat's own floor to see them")
     for m in h["asks"]:
         lines.append(f"  needs you: {m['text'][:200]}")
     return "\n".join(lines)
