@@ -632,7 +632,11 @@ def cmd_lock(a) -> None:
 
     def _refuse_paused() -> None:
         # Checked before each try, so a pause set while this waits holds too.
-        held = p.db.paused_resources().get(a.resource)
+        try:
+            held = p.db.paused_resources().get(a.resource)
+        except Exception as e:   # an unreadable database must not stop device commands
+            print(f"ttp lock: could not check for a pause of {a.resource}: {e}", file=sys.stderr, flush=True)
+            held = None
         if held is not None:
             if waiting:
                 _end_wait()
