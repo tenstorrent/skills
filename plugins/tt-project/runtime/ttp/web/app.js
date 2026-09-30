@@ -133,7 +133,8 @@ async function refresh() {
   $("#spend").title = h.spend.detail || "all providers";
   const needs = st.tasks.filter((t) => t.status === "blocked").length + h.asks.length;
   $("#needs").hidden = !needs; $("#needs").textContent = `${needs} need${needs === 1 ? "s" : ""} you`;
-  $("#why").innerHTML = h.why_idle ? `<b>Idle:</b> ${esc(h.why_idle)}` : `${h.running} run${h.running === 1 ? "" : "s"} working.`;
+  $("#why").innerHTML = h.why_idle ? `<b>Idle:</b> ${esc(h.why_idle)}` : `${h.running} run${h.running === 1 ? "" : "s"} working.` +
+    (h.held ? ` <b>Held:</b> ${esc(h.held)}` : "");
   $("#top").textContent = h.spend.top_7d ? `Top spender, 7 days: ${h.spend.top_7d.source} ${money(h.spend.top_7d.usd)}` : "";
   $("#chealth").innerHTML = healthHtml(h);
   announce(st.attention || [], st.project.name);

@@ -165,19 +165,26 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
     if last_turn and not waiting and not queued and not db.one("SELECT id FROM tasks WHERE status='running'"):
         idle_wake = max(last_turn + float(c.get("idle_wake_s", 1800)), backoff, now)
 
-    why = []
+    # What keeps ready tasks from starting; shown even while other runs work.
+    stops = []
     if not alive:
-        why.append(f"the daemon is not running (`ttp restart {p.name}`)")
+        stops.append(f"the daemon is not running (`ttp restart {p.name}`)")
     if db.kv("paused", False):
-        why.append(f"the project is paused (`ttp resume {p.name}` or the web app)")
+        stops.append(f"the project is paused (`ttp resume {p.name}` or the web app)")
     for pp in paused_providers:
-        why.append(f"{pp['provider']} is paused until {at(pp['until'], now)}: {pp['note']}")
+        stops.append(f"{pp['provider']} is paused until {at(pp['until'], now)}: {pp['note']}")
+    for prov, pg in sorted(gates.items(), key=lambda kv: kv[0] != core):
+        if pg.get("level") == "red":
+            stops.append(("budget is red: " if prov == core else f"budget for {prov} is red: ")
+                         + "; ".join(pg.get("reasons") or []))
     g = gates.get(core) or {}
-    if g.get("level") == "red":
-        why.append("budget is red: " + "; ".join(g.get("reasons") or []))
     disk = db.kv("disk_low")
     if disk:
-        why.append(f"disk is low ({disk['free_gb']} GB free), so no new worker runs start")
+        stops.append(f"disk is low ({disk['free_gb']} GB free), so no new worker runs start")
+    you = ("waiting on you: " + ", ".join(x for x in (f"{blocked} blocked task(s)" if blocked else "",
+                                                     f"{len(asks)} open question(s)" if asks else "") if x)
+           if blocked or asks else "")
+    why = list(stops)
     if backoff > now:
         why.append(f"the coordinator is backing off after failed turns, next try {at(backoff, now)}")
     if ready:
@@ -186,11 +193,13 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         why.append(f"{len(waiting)} task(s) waiting, next try {at(waiting[0]['not_before'], now)}")
     if len(queued) > ready:
         why.append(f"{len(queued) - ready} queued task(s) wait on other tasks")
-    if blocked or asks:
-        why.append("waiting on you: " + ", ".join(x for x in (f"{blocked} blocked task(s)" if blocked else "",
-                                                              f"{len(asks)} open question(s)" if asks else "") if x))
+    if you:
+        why.append(you)
     if not why and idle_wake:
         why.append(f"nothing queued; the coordinator checks in at {at(idle_wake, now)}")
+    held = ""
+    if running and ready and stops:
+        held = f"{ready} ready task(s) not starting: " + "; ".join(stops + ([you] if you else []))
     working = db.q("SELECT r.id run, r.task, r.role, r.provider, r.model, r.effort, r.started, r.cost_usd, r.dir, t.title "
                    "FROM runs r "
                    "LEFT JOIN tasks t ON t.id=r.task WHERE r.status='running' ORDER BY r.id")
@@ -209,8 +218,46 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
                         "idle_wake": idle_wake},
         "providers_paused": paused_providers, "waiting": waiting, "asks": asks, "running": running, "working": working,
         "undelivered": undelivered,
-        "why_idle": "; ".join(why) if not running else "",
+        "why_idle": "; ".join(why) if not running else "", "held": held,
     }
+
+
+def _still_holds(db: DB, key: str, since: float, now: float) -> bool:
+    """Whether the condition an alert (keyed as in Daemon.alert) reported is still true.
+    Unknown keys cannot be checked and hold until the alert ages out."""
+    kind, _, arg = key.partition(":")
+    if kind in ("auth", "limit"):
+        return float((db.kv(f"limited:{arg}") or {}).get("until") or 0) > now
+    if kind == "budget":
+        return (db.kv("gates", {}).get(arg) or {}).get("level") == "red"
+    if key == "disk":
+        return bool(db.kv("disk_low"))
+    if key == "coordinator":
+        return int(db.kv("coordinator_failures", 0)) > 0
+    if key == "run-start":
+        return not db.one("SELECT id FROM runs WHERE role!='coordinator' AND started>? LIMIT 1", (since,))
+    return True
+
+
+def attention(db: DB, now: float) -> list[dict]:
+    """Open asks and the last day's high alerts, minus alerts whose condition has since cleared
+    or that a newer alert on the same condition replaced."""
+    rows = db.q("SELECT id,ts,kind,severity,text,ref FROM messages WHERE direction='out' AND chat IS NULL "
+                "AND ((kind='ask' AND handled=0) OR (kind='alert' AND ts>?)) ORDER BY id DESC LIMIT 200",
+                (now - DAY,))
+    out, seen = [], set()
+    for m in rows:
+        ref = m.pop("ref")
+        key = ref if m["kind"] == "alert" else None
+        if key:
+            if key in seen:
+                continue
+            seen.add(key)
+        if m["kind"] == "alert" and (m["severity"] not in ("high", "critical")
+                                     or (key and not _still_holds(db, key, m["ts"], now))):
+            continue
+        out.append(m)
+    return out[:20]
 
 
 def state_payload(p: Project, db: DB) -> dict:
@@ -233,10 +280,7 @@ def state_payload(p: Project, db: DB) -> dict:
         "issues": db.q("SELECT id,source,title,severity,status,count,first_seen,last_seen,task FROM issues "
                        "WHERE status IN ('open','tracking') ORDER BY last_seen DESC LIMIT 100"),
         "schedules": sched.with_costs(db),
-        "attention": db.q("SELECT id,ts,kind,severity,text FROM messages WHERE direction='out' AND chat IS NULL "
-                          "AND ((kind='ask' AND handled=0) OR "
-                          "(kind='alert' AND ts>? AND severity IN ('high','critical'))) "
-                          "ORDER BY id DESC LIMIT 20", (now - 86400,)),
+        "attention": attention(db, now),
         "budget": bud.history(db),
         "coordinator": db.kv("last_coordinator_summary", {}),
         "health": health(p, db, now=now),

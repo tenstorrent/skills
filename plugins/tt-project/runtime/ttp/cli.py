@@ -453,6 +453,8 @@ def status_text(p: Project) -> str:
         lines.append(f"{pp['provider']} paused until {at(pp['until'], now)}: {pp['note']} — fix: {pp['fix']}")
     if h["why_idle"]:
         lines.append(f"idle: {h['why_idle']}")
+    elif h["held"]:
+        lines.append(f"held: {h['held']}")
     for w in h["working"][:8]:
         what = f"#{w['task']} {w['title']}" if w["task"] else w["role"]
         lines.append(f"  running {since(w['started'], now)}: {what}" + (f" — {w['note']}" if w["note"] else ""))

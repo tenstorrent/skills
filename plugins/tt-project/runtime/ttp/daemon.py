@@ -662,7 +662,7 @@ class Daemon:
                             ("You can raise the cap (carefully) by telling me, or in the web app."
                              if capped else "The web app's Budget tab shows what spent it."))
                 self.p.db.post("out", f"Budget for {prov} is now {g.level}: {'; '.join(g.reasons) or 'back to normal'}. "
-                               + hint, chat=None, kind="alert", severity=sev)
+                               + hint, chat=None, kind="alert", severity=sev, ref=f"budget:{prov}")
             gates[prov] = g
         self.gates = gates
         self.p.db.set_kv("gates", {k: v.as_dict() for k, v in gates.items()})
@@ -1088,14 +1088,15 @@ class Daemon:
     # notifications and Slack -------------------------------------------------------------------------
     def alert(self, key: str, text: str, severity: str = "high", every_s: float = 6 * 3600) -> None:
         """Deduplicated broadcast: the same condition alerts at most once per `every_s`, across
-        daemon restarts too (an upgrade must not re-announce a condition the user already has)."""
+        daemon restarts too (an upgrade must not re-announce a condition the user already has).
+        The key is kept as the message's ref, so the web app can drop the alert once it clears."""
         now = time.time()
         sent = self.p.db.kv("alerts_sent", {})
         if now - float(sent.get(key, 0)) < every_s:
             return
         sent[key] = now
         self.p.db.set_kv("alerts_sent", {k: v for k, v in sent.items() if now - float(v) < 7 * 86400})
-        self.p.db.post("out", text, chat=None, kind="alert", severity=severity)
+        self.p.db.post("out", text, chat=None, kind="alert", severity=severity, ref=key)
 
     def slack(self):
         if not self.cfg["notify"].get("slack"):

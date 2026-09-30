@@ -616,6 +616,57 @@ def test_web_payload_carries_coordinator_health_and_why_idle(env):
     assert "spent_24h" in h["spend"]
 
 
+def test_the_web_app_drops_high_alerts_once_their_condition_clears(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    from ttp.web import state_payload
+    d = Daemon(p.base)
+    d.update_gates()
+    shown = lambda: [m["text"] for m in state_payload(p, p.db)["attention"]]  # noqa: E731
+    p.db.spend("fake", 150.0, "task:1")
+    d.update_gates()
+    p.db.set_kv("limited:fake", {"until": time.time() + 900, "note": "logged out"})
+    d.alert("auth:fake", "fake is logged out", "high")
+    p.db.set_kv("disk_low", {"path": "/", "free_gb": 1.0})
+    d.alert("disk", "Only 1.0 GB free", "high")
+    p.db.post("out", "an alert with no known condition", chat=None, kind="alert", severity="high")
+    now = shown()
+    assert "fake is logged out" in now and "Only 1.0 GB free" in now, now
+    assert any(t.startswith("Budget for fake is now red") for t in now), now
+    p.db.set_kv("limited:fake", {"until": time.time() - 1, "note": "logged out"})
+    p.db.set_kv("disk_low", None)
+    p.db.x("DELETE FROM ledger")
+    d.update_gates()
+    now = shown()
+    assert now == ["an alert with no known condition"], "a cleared alert still asks for attention"
+    d.alert("run-start", "Runs cannot start", "high")
+    assert "Runs cannot start" in shown()
+    p.db.x("INSERT INTO runs(role,provider,started,status) VALUES('worker','fake',?,'running')", (time.time() + 1,))
+    assert "Runs cannot start" not in shown(), "a run started since, yet the alert stayed"
+
+
+def test_status_says_why_ready_work_is_not_starting_while_runs_are_active(env):
+    p = make(env)
+    from ttp.cli import status_text
+    from ttp.web import health
+    now = time.time()
+    p.db.x("INSERT INTO runs(role,provider,started,status) VALUES('worker','fake',?,'running')", (now,))
+    p.db.add_task("ready work", "s", origin="user")
+    h = health(p, p.db, now=now)
+    assert h["why_idle"] == "" and h["held"] == "", "nothing holds the ready task, yet a reason was shown"
+    p.db.set_kv("limited:fake", {"until": now + 900, "note": "logged out"})
+    p.db.set_kv("disk_low", {"path": "/", "free_gb": 1.0})
+    p.db.post("out", "Which board should I use?", kind="ask", severity="high")
+    h = health(p, p.db, now=now)
+    assert h["why_idle"] == ""
+    assert h["held"].startswith("1 ready task(s) not starting: "), h
+    for part in ("fake is paused until", "disk is low", "waiting on you: 1 open question(s)"):
+        assert part in h["held"], h["held"]
+    held = [ln for ln in status_text(p).splitlines() if ln.startswith("held: ")]
+    assert held and "fake is paused until" in held[0], status_text(p)
+    assert 'h.held' in (RUNTIME / "ttp" / "web" / "app.js").read_text()
+
+
 def test_web_app_elements_exist_in_the_page():
     import re
     web = RUNTIME / "ttp" / "web"
