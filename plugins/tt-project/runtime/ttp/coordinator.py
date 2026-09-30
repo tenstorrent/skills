@@ -48,6 +48,8 @@ USER_SETTABLE = {
     "budget.max_parallel_workers": int, "notify.slack": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     "notify.slack_min_severity": str, "notify.chat_min_severity": str, "core_provider": str,
     "coordinator.tier": str, "jev.enabled": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
+    # Where code tasks branch from: the project's working branch once it has one.
+    "delivery.base_ref": str,
 }
 
 

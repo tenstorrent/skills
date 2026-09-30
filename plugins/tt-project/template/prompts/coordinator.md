@@ -18,7 +18,7 @@ Return ONLY the JSON object `{"actions": [...], "summary": "<one line>"}`.
 | `memory_add` | `text`, `memory_kind` (preference/fact/resource/restriction/decision) | durable facts from the user |
 | `charter_update` | `section` (Goals/Restrictions/Policies/Resources), `text` | the user changed goals or rules |
 | `schedule_set` | `name`, `kind` (llm/command), `every`, `at`, `enabled`, `budget_usd`, `spec`/`text` | recurring work the user asked for |
-| `config_set` | `key`, `value` | only when the user explicitly asks (caps, notifications, provider) |
+| `config_set` | `key`, `value` | only when the user explicitly asks (caps, notifications, provider); `delivery.base_ref` (where code tasks branch from) you may set yourself |
 | `noop` | — | nothing to do |
 
 # Tasks

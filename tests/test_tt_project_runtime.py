@@ -433,3 +433,12 @@ def test_a_cancelled_task_stays_cancelled_when_its_run_ends(env, tmp_path):
     assert p.db.task(tid)["status"] == "cancelled"
     assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == "killed"
     assert not p.db.q("SELECT id FROM events WHERE kind='task_failed'"), "a cancel was reported as a failure"
+
+
+def test_coordinator_can_point_code_tasks_at_the_working_branch(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.worktree import base_ref
+    subprocess.run(["git", "-C", str(env["repo"]), "branch", "work/fast"], check=True)
+    assert coord.apply(p, [{"type": "config_set", "key": "delivery.base_ref", "value": "work/fast"}]) == []
+    assert base_ref(p) == "work/fast"
