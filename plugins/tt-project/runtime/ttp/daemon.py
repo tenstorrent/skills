@@ -191,7 +191,8 @@ class Daemon:
         if unknown:
             self.alert(f"mcp_servers_unknown:{provider}",
                        f"Workers run without these MCP servers, which your {provider} config does not define: "
-                       f"{', '.join(unknown)}. Fix providers.{provider}.mcp_servers in project.json.",
+                       f"{', '.join(unknown)}. Fix providers.{provider}.mcp_servers in project.json "
+                       "(servers from a plugin cannot be listed).",
                        severity="low", every_s=86400)
         return found
 

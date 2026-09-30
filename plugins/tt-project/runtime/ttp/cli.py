@@ -1023,7 +1023,8 @@ def cmd_doctor(a) -> None:
         from .providers import get_provider
         _, unknown = get_provider("claude").mcp_servers(names, [str(p.root), str(p.root.resolve())])
         print(f"mcp servers for workers: {', '.join(names)}"
-              + (f" · not defined in your Claude config: {', '.join(unknown)}" if unknown else "")
+              + (f" · not defined in your Claude config: {', '.join(unknown)} (servers from a plugin "
+                 "cannot be listed; add them with `claude mcp add`)" if unknown else "")
               + ("" if claude_cfg.get("worker_isolation") else " · unused: worker_isolation is off, "
                  "so workers load all your servers"))
     sec = load_secrets()

@@ -1160,7 +1160,9 @@ def test_an_unknown_mcp_server_is_named_and_the_run_still_starts(env, monkeypatc
     from ttp import cli
     monkeypatch.setattr(cli, "need", lambda *a: p)
     cli.cmd_doctor(types.SimpleNamespace(name="demo"))
-    assert "not defined in your Claude config: missing-one" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "not defined in your Claude config: missing-one" in out
+    assert "servers from a plugin cannot be listed" in out, "doctor must name the plugin-server limit"
     from ttp import coordinator as coord
     assert coord.apply(p, [{"type": "config_set", "key": "providers.claude.mcp_servers",
                             "value": "bad name!"}]), "a malformed name must be rejected"

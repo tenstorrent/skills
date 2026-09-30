@@ -102,7 +102,8 @@ and preferences you add later become part of the project's charter and memory.
   Each run copies just those entries from your Claude config (local, then `.mcp.json`, then user
   scope) into its own owner-only file in the temp directory, and deletes it when the run ends.
   Listing a server approves it for workers. A name your config does not define is skipped: the
-  run still starts, and `ttp doctor` and a low alert name it.
+  run still starts, and `ttp doctor` and a low alert name it. Servers that come from a Claude plugin
+  are not in those files, so they cannot be listed; add the server with `claude mcp add` to list it.
 
 ## Where things live
 
