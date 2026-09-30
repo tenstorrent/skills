@@ -1052,12 +1052,28 @@ def test_an_ask_needs_a_blocking_reason_and_never_gets_a_default(env):
         assert problems and "`blocking` must be one of" in problems[0], fields
         assert ask is None, "a rejected ask reached the user"
     problems, ask = _ask(p, blocking="access", recommendation="use option A")
-    assert problems == [] and ask["text"] == "Option A or B?"
+    assert problems == [] and ask["text"].startswith("Option A or B?")
     assert p.db.kv(coord.ASK_DEFAULTS_KEY, {}) == {}, "a new ask was registered to fall back on a timer"
     assert coord.expire_asks(p, now=time.time() + 1000 * 3600) == []
     assert f"ask #{ask['id']} (waits for the user)" in coord.digest(p, {}, [], [])
     for reason in coord.BLOCKING_REASONS:
         assert _ask(p, f"Question on {reason}?", blocking=reason)[0] == [], reason
+
+
+def test_a_blocking_ask_shows_its_recommendation_but_never_applies_it(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.web import state_payload
+    problems, ask = _ask(p, blocking="spend", recommendation="raise the daily cap to $150")
+    assert problems == [] and "My recommendation: raise the daily cap to $150" in ask["text"]
+    assert ask["id"] in [m["id"] for m in p.db.unread_for_chat("c1", 0, "info")], "the relay would not show it"
+    shown = [m["text"] for m in state_payload(p, p.db)["attention"] if m["id"] == ask["id"]]
+    assert shown and "raise the daily cap to $150" in shown[0], "the web app would not show it"
+    assert p.db.kv(coord.ASK_DEFAULTS_KEY, {}) == {}
+    assert coord.expire_asks(p, now=time.time() + 1000 * 3600) == []
+    assert p.db.one("SELECT handled FROM messages WHERE id=?", (ask["id"],))["handled"] == 0
+    problems, _ = _ask(p, " option a or b? ", blocking="spend", recommendation="something else")
+    assert problems and "already asked" in problems[0]
 
 
 def test_a_reversible_ask_is_rejected_and_the_rejection_reaches_the_next_digest(env):

@@ -9,5 +9,6 @@
   yourself"; the rejection shows in the coordinator's next digest.
 - Judgment calls are decided by the coordinator, recorded as a decision and sent as a low-severity
   notice.
-- New asks never default to a recommendation. Asks registered earlier with a default still drain
+- Asks still carry a `recommendation`, shown to the user so they can answer in one word. It is
+  never applied without their answer: new asks never default to it. Asks registered earlier with a default still drain
   after `coordinator.ask_timeout_h`.

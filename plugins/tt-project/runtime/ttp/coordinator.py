@@ -37,7 +37,7 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "memory_kind": {"type": "string"}, "section": {"type": "string"}, "name": {"type": "string"},
             "every": {"type": "string"}, "at": {"type": "string"}, "enabled": {"type": "boolean"},
             "key": {"type": "string"}, "value": {"type": "string"},
-            "blocking": {"type": "string", "enum": list(BLOCKING_REASONS)},
+            "blocking": {"type": "string", "enum": list(BLOCKING_REASONS)}, "recommendation": {"type": "string"},
             "resources": {"type": "array", "items": {"type": "string"}}, "exclusive": {"type": "boolean"}},
             "required": ["type"]}},
         "summary": {"type": "string"},
@@ -68,6 +68,8 @@ RECENT_OUT = 5                       # outbound messages the digest repeats, so 
 MAX_TASKS_PER_DAY = 1000
 ASK_DEFAULTS_KEY = "ask_defaults"   # kv: {ask message id: recommendation}; no new ask is added
 _DEFAULT_NOTE = "\n\nIf there is no answer within "
+# Shown so the user can answer in one word; never applied without their answer.
+_REC_NOTE = "\n\nMy recommendation: "
 
 
 def system_prompt(p: Project) -> str:
@@ -268,8 +270,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                      f"got {a.get('blocking')!r}. Anything else, decide it yourself")
                 text = a["text"].strip()
                 for o in db.q("SELECT id, text FROM messages WHERE kind='ask' AND handled=0"):
-                    if _same_text(o["text"].split(_DEFAULT_NOTE)[0], text):
+                    if _same_text(_ask_question(o["text"]), text):
                         raise ValueError(f"already asked as open ask #{o['id']}; it waits for the answer")
+                rec = (a.get("recommendation") or "").strip()
+                if rec:
+                    text += f"{_REC_NOTE}{rec}"
                 db.post("out", text, chat=None, kind="ask", severity=_norm_severity(a.get("severity") or "high"))
             elif t == "resolve":
                 n = db.x("UPDATE messages SET handled=1 WHERE id=? AND kind='ask'", (int(a["id"]),))
@@ -307,6 +312,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
         except Exception as e:   # one bad action is reported back; it never aborts the turn
             problems.append(f"{t}: {e}")
     return problems
+
+
+def _ask_question(text: str) -> str:
+    return text.split(_DEFAULT_NOTE)[0].split(_REC_NOTE)[0]
 
 
 def _same_text(a: str, b: str) -> bool:

@@ -16,7 +16,7 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
 | `reply` | `chat`, `text` | answer the chat that asked (chat id from the event) |
 | `task_add` | `title`, `spec`, `kind`, `tier`, `priority` 1-5, optional `reply_chat`, `depends_on`, `provider`, `budget_usd`, `resources`, `exclusive` | all real work |
 | `task_update` | `id`, `status` (queued/blocked/cancelled/done/waiting), `text`, `priority`, `spec`, `depends_on` (replaces the list; `[]` clears it) | steer existing tasks |
-| `ask_user` | `text`, `severity`, `blocking` | a decision only the user can make |
+| `ask_user` | `text`, `severity`, `blocking`, `recommendation` | a decision only the user can make |
 | `resolve` | `id` (an open ask) | the user answered it, or it no longer matters |
 | `notify` | `text`, `severity` | something the user must know |
 | `memory_add` | `text`, `memory_kind` (preference/fact/resource/restriction/decision) | durable facts from the user |
@@ -92,8 +92,9 @@ The project runs unattended. The user reads what you decided; they do not approv
   - `restriction`: a restriction would be violated;
   - `human`: another human (reviewer, reporter) asked for something ambiguous.
   An ask without one of these reasons, or marked `reversible`, is rejected: decide it yourself.
-  An ask never falls back to a default; it waits for the user. Keep all other work moving while
-  it waits.
+- Always set `recommendation`: the option you would pick, stated so the user can answer in one
+  word. The user sees it; it is never applied without their answer, and no timer falls back to
+  it. The ask waits for the user; keep all other work moving meanwhile.
 - An `ask_timeout` event is about an older ask that was registered with a default: act on it and
   record it with `memory_add`. It is not permission for anything else (caps, settings). If the
   event says the default was NOT applied, the user wrote after the ask: act on their answer and

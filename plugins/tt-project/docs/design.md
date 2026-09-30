@@ -46,7 +46,8 @@ in `state/runs/<id>/`, so a daemon restart never loses a result.
     re-pointing `depends_on`; a requeue onto a dead dependency is rejected, never silently undone.
 13. A question to the user carries a blocking reason (access, funds, spend, review, merge,
     irreversible, restriction, human) and waits for the user; anything else is a judgment call
-    the coordinator decides and records. No new question falls back on a timer. Questions asked
+    the coordinator decides and records. Its recommendation is shown so the user can answer in
+    one word, but no new question falls back to it or to anything else on a timer. Questions asked
     before this rule with a default still drain: after `coordinator.ask_timeout_h`, never at a
     cap or when the user has written since it was asked (the coordinator is asked to confirm
     instead); the user is told what was decided, at `high` severity or above.
