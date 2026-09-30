@@ -325,12 +325,37 @@ def cmd_listen(a) -> None:
     lock = p.state / f"listen-{a.chat}.pid"
     try:
         other = int(lock.read_text())
-        os.kill(other, 0)
-        if other != os.getpid():
-            die(f"another listener (pid {other}) is already attached to chat {a.chat}; stop it or reuse it", 3)
     except (OSError, ValueError):
-        pass
+        other = 0
+    if other and other != os.getpid() and _listener_alive(other, a.chat):
+        die(f"a listener for chat {a.chat} is already running (pid {other}); its output arrives where it "
+            f"was started. To replace it, stop it first: kill {other}", 3)
     lock.write_text(str(os.getpid()))
+    try:
+        _listen_loop(p, db, a, after, floor)
+    finally:
+        try:
+            if lock.read_text().strip() == str(os.getpid()):
+                lock.unlink()
+        except OSError:
+            pass
+
+
+def _listener_alive(pid: int, chat: str) -> bool:
+    """True if pid is a live `ttp listen` for this chat (not a recycled pid)."""
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    try:
+        cmd = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True,
+                             text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return True
+    return "listen" in cmd and chat in cmd
+
+
+def _listen_loop(p: Project, db, a, after: int, floor: str) -> None:
     deadline = time.time() + a.timeout if a.timeout else None
     while True:
         msgs = db.unread_for_chat(a.chat, after, floor)

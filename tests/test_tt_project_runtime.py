@@ -269,3 +269,30 @@ def test_productive_burst_is_not_a_runaway_but_waste_is(env):
                (now - 2000, now - 30, cost))
     g = bud.evaluate(p.db, p.config(), "claude", wins)
     assert g.level == "red" and any("failed or stalled" in r for r in g.reasons)
+
+
+def test_one_listener_per_chat(env):
+    p = make(env)
+    p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)",
+           (time.time(), "t", time.time()))
+    run_env = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost")
+    first = subprocess.Popen([sys.executable, str(TTP), "listen", "demo", "--chat", "c1", "--timeout", "30"],
+                             env=run_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        lock = p.state / "listen-c1.pid"
+        deadline = time.time() + 15
+        while time.time() < deadline and not lock.exists():
+            time.sleep(0.2)
+        assert lock.exists(), "the first listener never took the chat"
+        second = subprocess.run([sys.executable, str(TTP), "listen", "demo", "--chat", "c1", "--once",
+                                 "--timeout", "5"], env=run_env, capture_output=True, text=True, timeout=30)
+        assert second.returncode == 3 and "already running" in second.stderr
+    finally:
+        first.terminate()
+        first.wait(timeout=10)
+    # A lock left by a dead or unrelated process never blocks a new listener.
+    (p.state / "listen-c1.pid").write_text(str(os.getpid()))
+    third = subprocess.run([sys.executable, str(TTP), "listen", "demo", "--chat", "c1", "--once",
+                            "--timeout", "2"], env=run_env, capture_output=True, text=True, timeout=30)
+    assert third.returncode == 0, third.stderr
+    assert not (p.state / "listen-c1.pid").exists(), "the listener left its lock behind"
