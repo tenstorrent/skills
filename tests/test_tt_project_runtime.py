@@ -2375,3 +2375,30 @@ def test_a_codex_run_cut_off_before_reporting_usage_is_not_free(env):
     run = p.db.one("SELECT status, cost_usd, cost_estimated FROM runs WHERE id=?", (rid,))
     assert run["status"] == "timeout" and run["cost_estimated"] == 1
     assert run["cost_usd"] == pytest.approx(1.0), "half the wall clock books half the budget"
+
+
+def test_a_reservation_stamped_in_the_future_is_stale(env):
+    p = make(env)
+    from ttp import locks
+    mark = locks.reserve_path(p.state / "locks", "board")
+    mark.parent.mkdir(parents=True, exist_ok=True)
+    mark.write_text(json.dumps({"holder": "task #9", "since": 0, "ts": time.time() + 3600}))
+    assert locks.reserved_by(mark) is None, "a reservation from the future (clock went back) stayed fresh"
+
+
+def test_a_gated_task_drops_its_reservation(env):
+    p = make(env)
+    import types
+    from ttp import coordinator as coord
+    from ttp import locks
+    from ttp.daemon import Daemon
+    assert coord.apply(p, [{"type": "task_add", "title": "reflash", "spec": "s", "tier": "light",
+                            "resources": ["board"], "exclusive": True}]) == []
+    task = p.db.one("SELECT * FROM tasks WHERE title='reflash'")
+    d = Daemon(p.base)
+    mark = locks.reserve_path(p.state / "locks", "board")
+    locks.reserve(mark, f"task #{task['id']}")
+    provider = task["provider"] or d.cfg.get("core_provider", "claude")
+    d.gates[provider] = types.SimpleNamespace(allow_new_work=False, max_parallel=0)
+    d.dispatch()
+    assert locks.reserved_by(mark) is None, "a task a gate kept out still held its reservation"

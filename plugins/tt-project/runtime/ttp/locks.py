@@ -97,7 +97,10 @@ def reserved_by(path: Path) -> str | None:
         r = json.loads(path.read_text() or "{}")
     except (OSError, ValueError):
         return None
-    if time.time() - float(r.get("ts") or 0) > RESERVE_STALE_S:
+    age = time.time() - float(r.get("ts") or 0)
+    # A stamp from the future means the clock went back; trusting it would hold the resource
+    # until the clock caught up.
+    if age > RESERVE_STALE_S or age < -5:
         return None
     return str(r.get("holder") or "") or None
 

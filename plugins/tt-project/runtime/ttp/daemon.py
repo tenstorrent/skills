@@ -842,6 +842,7 @@ class Daemon:
         if ready and not self._disk_ok():
             return
         committed = None    # what running work under the dollar caps may still spend
+        reached = set()     # tasks that got past the gates to the resource check
         for task in ready:
             provider = task["provider"] or self.cfg.get("core_provider", "claude")
             gate = self.gates.get(provider) or bud.evaluate(db, self.cfg, provider, bud.plan_windows(db))
@@ -869,6 +870,7 @@ class Daemon:
                     continue
             # Checked last: a task that waits for its resource reserves it, and only a task that
             # would otherwise start now may hold others off the resource.
+            reached.add(task["id"])
             if not self._resources_free(task, reserve=True):
                 continue
             tier = bud.clamp_tier(task["tier"], gate)
@@ -891,6 +893,11 @@ class Daemon:
             busy[provider] = busy.get(provider, 0) + 1
             if gate.regime == "caps":
                 committed += cost
+        # A task a gate kept out this tick cannot start, so it must not hold `ttp lock` commands off.
+        for task in ready:
+            if task["id"] not in reached:
+                for res in _exclusive(task):
+                    locks.unreserve(locks.reserve_path(self.p.state / "locks", res), f"task #{task['id']}")
 
     def _committed_usd(self) -> float:
         """Budget that running workers on providers under the dollar caps have left to spend."""
