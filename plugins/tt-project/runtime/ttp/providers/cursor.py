@@ -10,6 +10,7 @@ so the runner's stall guard sees progress and its budget check sees spend before
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 
@@ -26,6 +27,11 @@ class Cursor(Provider):
     binaries = ("agent", "cursor-agent")
     login_hint = "run `agent login` there"
     isolate_read_only = True
+
+    def credential_files(self) -> list[str]:
+        # `agent login` writes auth.json under $XDG_CONFIG_HOME/cursor (default ~/.config/cursor) on
+        # Linux; macOS keeps tokens in the Keychain, where the missing file just never changes.
+        return [str(Path(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")) / "cursor" / "auth.json")]
 
     def build(self, *, role, model, effort, cwd, budget_usd, read_only, schema, restrictions):
         exe = self.binary() or "agent"

@@ -4817,3 +4817,17 @@ def test_a_login_that_creates_the_missing_credentials_file_ends_the_pause(env, m
     p.db.set_kv("limited:fake", {"until": time.time() + 900, "note": "logged out",
                                  "creds": get_provider("fake").credentials_stamp()})
     assert d._provider_pause("fake")
+
+
+def test_cursor_credential_file_follows_xdg_config_home(monkeypatch, tmp_path):
+    from ttp.providers import get_provider
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    cursor = get_provider("cursor")
+    assert cursor.credential_files() == [str(tmp_path / "cursor" / "auth.json")]
+    before = cursor.credentials_stamp()
+    (tmp_path / "cursor").mkdir()
+    (tmp_path / "cursor" / "auth.json").write_text("{}")
+    assert cursor.credentials_stamp() != before
+    monkeypatch.delenv("XDG_CONFIG_HOME")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert cursor.credential_files() == [str(tmp_path / ".config" / "cursor" / "auth.json")]
