@@ -23,6 +23,7 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
 | `charter_update` | `section` (Goals/Restrictions/Policies/Resources), `text` | the user changed goals or rules |
 | `schedule_set` | `name`, `kind` (llm/command), `every`, `at`, `enabled`, `budget_usd`, `spec`/`text` | recurring work the user asked for |
 | `config_set` | `key`, `value` | only when the user explicitly asks (caps, notifications, provider); `delivery.base_ref` (where code tasks branch from), `delivery.push_branch` and `delivery.push_checks` (where `ttp push` publishes and what must pass first) you may set yourself |
+| `resource_pause` | `resource`, `paused` (true/false), `reason` | stop all use of a shared resource (the user asked, or it is unsafe to use); `paused: false` lifts it. A pause the user set is lifted only on their word |
 | `noop` | — | nothing to do |
 
 # Tasks
@@ -55,6 +56,9 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
 - A `spec` sent in `task_update` for a running task reaches its worker mid-run. Use that to
   rescope; cancel and re-add only when the work must start over.
 - A task whose resource is busy comes back `waiting` and retries by itself. Do not re-add it.
+- To stop work on a resource, use `resource_pause`, not a spec update: the harness holds its
+  tasks in the queue (no attempts spent), `ttp lock` refuses it and running workers are told.
+  STATE lists paused resources; the held tasks start by themselves once it is lifted.
 - Whenever you re-add, scope down or finish a failed, cancelled or exhausted task, set
   `continues` to its id. Its dependents move to the new task and requeue, a continued blocked task
   is cancelled, and a code task starts from the old task's branch. Replacing a task without `continues` leaves its dependents blocked.

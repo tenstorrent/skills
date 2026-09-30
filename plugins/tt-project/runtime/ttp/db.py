@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping
 
 SCHEMA_VERSION = 1
+PAUSED_RESOURCES_KEY = "paused_resources"   # kv: see DB.paused_resources
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -156,6 +157,12 @@ class DB:
     def set_kv(self, key: str, value: Any) -> None:
         self.x("INSERT INTO kv(key,value,ts) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET "
                "value=excluded.value, ts=excluded.ts", (key, json.dumps(value), time.time()))
+
+    def paused_resources(self) -> dict[str, dict]:
+        """Resources paused by name: {"reason", "since", "by"}. Kept in the database, so a pause
+        outlives daemon restarts and reboots until someone lifts it."""
+        v = self.kv(PAUSED_RESOURCES_KEY, {})
+        return v if isinstance(v, dict) else {}
 
     def boots(self, since: float) -> list[dict]:
         """Reboots the daemon recorded since `since`, oldest first: ts (the boot time where known)

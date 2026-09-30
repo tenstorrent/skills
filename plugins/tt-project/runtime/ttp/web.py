@@ -132,6 +132,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
             note = str(v.get("note") or "limit reached")
             paused_providers.append({"provider": r["key"].split(":", 1)[1], "note": note, "until": v["until"],
                                      "fix": fix_for(r["key"].split(":", 1)[1], note)})
+    paused_resources = [{"resource": k, **v} for k, v in sorted(db.paused_resources().items())]
     waiting = db.q("SELECT id, title, not_before, blocked_reason FROM tasks WHERE status='queued' AND not_before>? "
                    "ORDER BY not_before", (now,))
     queued = db.q("SELECT id, depends_on FROM tasks WHERE status='queued' AND (not_before IS NULL OR not_before<=?)",
@@ -189,6 +190,9 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         why.append(f"the coordinator is backing off after failed turns, next try {at(backoff, now)}")
     if ready:
         why.append(f"{ready} task(s) ready to start")
+    for pr in paused_resources:
+        why.append(f"{pr['resource']} is paused" + (f" ({pr['reason']})" if pr.get("reason") else "")
+                   + f": its tasks wait (`ttp resume {p.name} --resource {pr['resource']}`)")
     if waiting:
         why.append(f"{len(waiting)} task(s) waiting, next try {at(waiting[0]['not_before'], now)}")
     if len(queued) > ready:
@@ -216,7 +220,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
                         "backoff_until": backoff if backoff > now else None,
                         "summary": (db.kv("last_coordinator_summary", {}) or {}).get("summary", ""),
                         "idle_wake": idle_wake},
-        "providers_paused": paused_providers, "waiting": waiting, "asks": asks, "running": running, "working": working,
+        "providers_paused": paused_providers, "resources_paused": paused_resources, "waiting": waiting, "asks": asks, "running": running, "working": working,
         "undelivered": undelivered,
         "why_idle": "; ".join(why) if not running else "", "held": held,
         "host": host_line(db.boots(now - DAY)),
@@ -415,6 +419,14 @@ class Handler(BaseHTTPRequestHandler):
                     db.update_task(tid, priority=int(body["priority"]))
                 return self._send(200, {"ok": True})
             if url.path == "/api/pause":
+                if body.get("resource"):
+                    from .coordinator import pause_resource
+                    try:
+                        pause_resource(p, str(body["resource"]), bool(body.get("paused")),
+                                       reason=str(body.get("reason") or ""), by="user")
+                    except ValueError as e:
+                        return self._send(400, {"error": str(e)})
+                    return self._send(200, {"ok": True})
                 db.set_kv("paused", bool(body.get("paused")))
                 return self._send(200, {"ok": True})
             if url.path == "/api/config":

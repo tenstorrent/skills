@@ -57,6 +57,7 @@ description: "Start, connect to, and talk with a long-running tt-project: a loca
 |---|---|
 | status, spend, blockers, why idle | `ttp status <name>` |
 | pause or resume all model work | `ttp pause <name>` / `ttp resume <name>` |
+| stop all use of one resource (a device) | `ttp pause <name> --resource <r> --reason "..."` / `ttp resume <name> --resource <r>` |
 | change caps | tell the coordinator, or `ttp config <name> budget.daily_usd 150` |
 | restart after trouble | `ttp restart <name>`, then `ttp doctor <name>` |
 | stop for good | `ttp stop <name>` (removes the service; data stays; running workers finish) |

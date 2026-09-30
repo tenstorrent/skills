@@ -497,6 +497,10 @@ def status_text(p: Project) -> str:
     lines.append(coord)
     for pp in h["providers_paused"]:
         lines.append(f"{pp['provider']} paused until {at(pp['until'], now)}: {pp['note']} — fix: {pp['fix']}")
+    for pr in h["resources_paused"]:
+        lines.append(f"resource {pr['resource']} paused since {at(pr['since'], now)} by {pr.get('by') or 'user'}"
+                     + (f": {pr['reason']}" if pr.get("reason") else "")
+                     + f" — resume: ttp resume {p.name} --resource {pr['resource']}")
     if h["why_idle"]:
         lines.append(f"idle: {h['why_idle']}")
     elif h["held"]:
@@ -625,6 +629,16 @@ def cmd_lock(a) -> None:
     if not base:
         die("ttp lock only works inside a tt-project run (or with TTP_PROJECT set)")
     p = Project(base)
+
+    def _refuse_paused() -> None:
+        # Checked before each try, so a pause set while this waits holds too.
+        held = p.db.paused_resources().get(a.resource)
+        if held is not None:
+            if waiting:
+                _end_wait()
+            why = f" ({held['reason']})" if held.get("reason") else ""
+            die(f"{a.resource} is paused{why}; hand the task back as waiting until it is resumed", 75)
+
     paths = lk.slot_paths(p.state / "locks", a.resource,
                           int((p.config().get("resources") or {}).get(a.resource, 1) or 1))
     who = f"task #{os.environ.get('TTP_TASK') or '?'} (run {os.environ.get('TTP_RUN_ID') or '?'})"
@@ -633,8 +647,10 @@ def cmd_lock(a) -> None:
         spec = json.loads((run_dir / "run.json").read_text()) if run_dir else {}
     except (OSError, ValueError):
         spec = {}
+    waiting = False
     if a.resource in {x.get("resource") for x in spec.get("exclusive") or []}:
         # This run's task holds the resource for its whole run already.
+        _refuse_paused()
         sys.exit(subprocess.call(cmd))
     timeout = a.timeout
     if timeout is None:
@@ -642,7 +658,6 @@ def cmd_lock(a) -> None:
     mark = lk.reserve_path(p.state / "locks", a.resource)
     started, told = time.time(), 0.0
     wait_key = f"{os.getpid()}:{started}"
-    waiting = False
 
     def _end_wait(*_):
         # Cleared first: a signal arriving while this records would otherwise take the record's
@@ -653,6 +668,7 @@ def cmd_lock(a) -> None:
             lk.record_wait(run_dir, wait_key, started, time.time())
 
     while True:
+        _refuse_paused()
         reserved = lk.reserved_by(mark)
         f = None if reserved else lk.try_take(paths, who, " ".join(cmd))
         if f:
@@ -751,6 +767,13 @@ def cmd_memory(a) -> None:
 
 def cmd_pause(a) -> None:
     p = need(a.name, sys.argv[1:])
+    if a.resource:
+        from .coordinator import pause_resource
+        try:
+            print(f"{p.name}: " + pause_resource(p, a.resource, a.cmd == "pause", reason=getattr(a, "reason", None) or "", by="user"))
+        except ValueError as e:
+            die(str(e))
+        return
     p.db.set_kv("paused", a.cmd == "pause")
     print(f"{p.name} {'paused: no new model runs start' if a.cmd == 'pause' else 'resumed'}")
 
@@ -1140,8 +1163,12 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_memory)
 
     for name in ("pause", "resume"):
-        s = sub.add_parser(name)
+        s = sub.add_parser(name, help=f"{name} the project, or with --resource one shared resource")
         s.add_argument("name")
+        s.add_argument("--resource", help=f"{name} only this resource: tasks using it wait, `ttp lock` refuses it"
+                       if name == "pause" else f"{name} only this resource")
+        if name == "pause":
+            s.add_argument("--reason", help="why, shown to workers, the coordinator and in status")
         s.set_defaults(fn=cmd_pause)
     for name in ("start", "stop", "restart"):
         s = sub.add_parser(name, help=f"{name} the project's daemon service (running workers are kept)")

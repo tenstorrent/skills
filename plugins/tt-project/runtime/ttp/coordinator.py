@@ -18,13 +18,13 @@ from typing import Any
 
 from . import push
 from . import schedule as sched
-from .db import (SEVERITY_RANK, TERMINAL_TASK_STATES, continues_id, dependency_ids, dump_result, host_line,
+from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, TERMINAL_TASK_STATES, continues_id, dependency_ids, dump_result, host_line,
                  load_result)
 from .project import Project
 from .runner import stop_runs
 
 ACTION_TYPES = ("reply", "task_add", "task_update", "ask_user", "resolve", "notify", "memory_add",
-                "charter_update", "schedule_set", "config_set", "noop")
+                "charter_update", "schedule_set", "config_set", "resource_pause", "noop")
 
 # Why an ask cannot be decided by the coordinator itself. Anything else is a judgment call.
 BLOCKING_REASONS = ("access", "funds", "spend", "review", "merge", "irreversible", "restriction", "human")
@@ -44,7 +44,8 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "key": {"type": "string"}, "value": {"type": "string"},
             "blocking": {"type": "string", "enum": list(BLOCKING_REASONS)}, "recommendation": {"type": "string"},
             "resources": {"type": "array", "items": {"type": "string"}}, "exclusive": {"type": "boolean"},
-            "continues": {"type": "integer"}},
+            "continues": {"type": "integer"}, "resource": {"type": "string"}, "paused": {"type": "boolean"},
+            "reason": {"type": "string"}},
             "required": ["type"]}},
         "summary": {"type": "string"},
     },
@@ -154,6 +155,12 @@ def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int]) ->
         at_each = "; ".join(f"{time.strftime('%H:%M', time.localtime(x['ts']))} "
                             f"{', '.join(x.get('held') or []) or 'nothing'}" for x in boots)
         lines.append(f"## Host: {host_line(boots)[len('host: '):]}; held at each: {clip(at_each, 600)}")
+    paused = db.paused_resources()
+    if paused:
+        lines.append("## Paused resources (tasks using one are not dispatched; `ttp lock` refuses it)")
+        for name, v in sorted(paused.items()):
+            lines.append(f"- {name}: paused {(now - float(v.get('since') or now)) / 3600:.1f}h ago by "
+                         f"{v.get('by') or 'user'}" + (f": {clip(v['reason'], NOTE_CHARS)}" if v.get("reason") else ""))
     lines.append("## Open tasks (id | status | tier | priority | age | title | last note)")
     rows = db.q("SELECT * FROM tasks WHERE status NOT IN ('done','failed','cancelled') ORDER BY priority, id LIMIT 60")
     for t in rows:
@@ -387,6 +394,17 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     raise ValueError(f"{key} needs the user's approval: ask_user (blocking spend) with the exact value, and set "
                                      f"it in the turn that carries their yes")
                 p.set_config(key, USER_SETTABLE[key](a.get("value")))
+            elif t == "resource_pause":
+                if not isinstance(a.get("paused"), bool):
+                    raise ValueError("resource_pause needs `paused`: true or false")
+                name = str(a.get("resource") or "").strip()
+                held = db.paused_resources().get(name)
+                if not a["paused"] and held and held.get("by") == "user" and not user_turn:
+                    # A pause the user set is lifted on their word only, never by text from outside.
+                    raise ValueError(f"{name} was paused by the user; lift it only in the turn that carries "
+                                     f"their go-ahead")
+                pause_resource(p, name, a["paused"], reason=a.get("reason") or a.get("text") or "",
+                               by="coordinator", key=key)
             elif t in ("noop", None):
                 pass
             else:
@@ -579,6 +597,55 @@ def expire_asks(p: Project, *, hold: bool = False, now: float | None = None) -> 
         if live != pending:
             db.set_kv(ASK_DEFAULTS_KEY, live)
     return [int(k) for k in due]
+
+
+RESOURCE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@+-]{0,79}")
+
+
+def pause_resource(p: Project, name: str, paused: bool, reason: str = "", by: str = "user",
+                   key: str | None = None) -> str:
+    """Pause or resume one resource for the project's tasks. While paused, no task labelled with it
+    is dispatched and `ttp lock` refuses it; running workers whose task uses it are told mid-run.
+    Returns a line for the user."""
+    name = (name or "").strip()
+    if not RESOURCE_RE.fullmatch(name):
+        raise ValueError(f"not a resource name: {name!r}")
+    db = p.db
+    with db.tx():
+        cur = db.paused_resources()
+        if paused:
+            was = cur.get(name) or {}
+            cur[name] = {"reason": " ".join(str(reason or "").split())[:300] or was.get("reason", ""),
+                         "since": was.get("since") or time.time(),
+                         # The coordinator may lift only a pause the user had no part in.
+                         "by": "user" if "user" in (by, was.get("by")) else by}
+        elif name not in cur:
+            return f"{name} is not paused"
+        else:
+            cur.pop(name)
+        db.set_kv(PAUSED_RESOURCES_KEY, cur)
+    why = f" ({cur[name]['reason']})" if paused and cur[name]["reason"] else ""
+    text = (f"The resource `{name}` is paused{why}. Do not use it: start no new command on it, and `ttp lock "
+            f"{name}` refuses it. Finish or stop what already runs on it safely; if the task cannot go on "
+            f"without it, save your work and hand off `waiting` naming `{name}`. The task is dispatched "
+            f"again once the pause is lifted." if paused else
+            f"The resource `{name}` is no longer paused; you may use it again (through `ttp lock {name}`).")
+    for r in db.q("SELECT r.dir, t.labels FROM runs r JOIN tasks t ON t.id=r.task "
+                  "WHERE r.status='running' AND r.role!='coordinator'"):
+        if r["dir"] and Path(r["dir"]).is_dir() and name in task_resources({"labels": r["labels"]}):
+            _append_update(Path(r["dir"], "steer.md"), text, key)
+    return (f"{name} paused{why}: tasks using it wait, and `ttp lock {name}` refuses it" if paused
+            else f"{name} resumed")
+
+
+def task_resources(task: dict) -> set[str]:
+    """Resources a task names in its labels, shared (`resource:`) or held for the run (`exclusive:`)."""
+    try:
+        labels = json.loads(task.get("labels") or "[]")
+    except ValueError:
+        return set()
+    return {lb.split(":", 1)[1] for lb in labels if isinstance(lb, str)
+            and lb.split(":", 1)[0] in ("resource", "exclusive") and ":" in lb}
 
 
 def _tell_running_workers(db, text: str, key: str | None = None) -> None:

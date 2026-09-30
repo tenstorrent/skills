@@ -5472,3 +5472,147 @@ def test_a_waiting_hand_off_cut_short_by_a_reboot_runs_again_now(env, tmp_path):
     d.probe_waiting()
     assert tid in [x["id"] for x in p.db.ready_tasks()], "a wait the reboot ended slept on its timer or probe"
     assert json.loads(p.db.task(tid)["result"])["woke"] == "the host rebooted"
+
+
+def _paused_dispatch(p, monkeypatch):
+    from ttp import budget as bud
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    started = []
+    monkeypatch.setattr(d, "start_run", lambda *a, **k: started.append(k["task"]["title"]) or 0)
+    monkeypatch.setattr(d, "_workdir_for", lambda task: (str(p.root), None))
+    provider = d.cfg.get("core_provider", "claude")
+    d.gates[provider] = bud.Gate(provider, regime="windows", max_parallel=6)
+    d.dispatch()
+    return d, started
+
+
+def test_a_paused_resource_holds_its_tasks_across_restarts_until_resumed(env, monkeypatch):
+    p = make(env)
+    from ttp import cli
+    from ttp import coordinator as coord
+    from ttp.daemon import PAUSED_NOTE
+    assert coord.apply(p, [{"type": "task_add", "title": "measure", "spec": "s", "tier": "light",
+                            "resources": ["board"]},
+                           {"type": "task_add", "title": "reflash", "spec": "s", "tier": "light",
+                            "resources": ["board"], "exclusive": True},
+                           {"type": "task_add", "title": "docs", "spec": "s", "tier": "light"}]) == []
+    cli.main(["pause", "demo", "--resource", "board", "--reason", "maintenance window"])
+    _, started = _paused_dispatch(p, monkeypatch)
+    assert started == ["docs"], started
+    held = p.db.q("SELECT * FROM tasks WHERE title IN ('measure', 'reflash')")
+    assert all(t["status"] == "queued" and not t["attempts"] for t in held), held
+    assert all(t["blocked_reason"].startswith(PAUSED_NOTE) and "maintenance window" in t["blocked_reason"]
+               for t in held), held
+    # A new daemon (a restart, a reboot) reads the pause from the database and still holds them.
+    p.db.x("UPDATE tasks SET status='done' WHERE title='docs'")
+    d, started = _paused_dispatch(p, monkeypatch)
+    assert started == [] and not d._dispatchable()
+    cli.main(["resume", "demo", "--resource", "board"])
+    _, started = _paused_dispatch(p, monkeypatch)
+    assert sorted(started) == ["measure", "reflash"], started
+    assert p.db.paused_resources() == {}
+
+
+def test_a_resource_pause_reaches_only_workers_that_use_it(env, tmp_path):
+    p = make(env)
+    from ttp import coordinator as coord
+    dirs = {}
+    for title, labels in (("on board", ["resource:board"]), ("holds board", ["exclusive:board"]), ("other", [])):
+        tid = p.db.add_task(title, "s", kind="work", tier="light", origin="user", labels=labels)
+        dirs[title] = tmp_path / title.replace(" ", "_")
+        dirs[title].mkdir()
+        p.db.x("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(?,?,?,?,?,?)",
+               (tid, "worker", "fake", time.time(), "running", str(dirs[title])))
+    assert coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": True,
+                            "reason": "the user asked to stop device jobs"}], turn=7) == []
+    for title in ("on board", "holds board"):
+        steer = (dirs[title] / "steer.md").read_text()
+        assert "`board` is paused (the user asked to stop device jobs)" in steer and "hand off `waiting`" in steer
+    assert not (dirs["other"] / "steer.md").exists(), "a worker that does not use the resource was interrupted"
+    # A replay of the same turn does not repeat the update.
+    coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": True}], turn=7)
+    assert (dirs["on board"] / "steer.md").read_text().count("is paused") == 1
+    assert coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": False}]) == []
+    assert "no longer paused" in (dirs["on board"] / "steer.md").read_text()
+
+
+def test_resource_pause_actions_are_validated_and_a_user_pause_needs_the_user(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.coordinator import pause_resource
+    bad = coord.apply(p, [{"type": "resource_pause", "resource": "board"},
+                          {"type": "resource_pause", "resource": "../x", "paused": True},
+                          {"type": "resource_pause", "resource": "", "paused": True}])
+    assert len(bad) == 3 and "paused" in bad[0] and "not a resource name" in bad[1], bad
+    assert p.db.paused_resources() == {}
+    pause_resource(p, "board", True, reason="firmware update", by="user")
+    # A turn woken by a hand-off or a log line cannot lift the user's pause; re-pausing keeps it theirs.
+    assert coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": True, "reason": "still"}]) == []
+    problems = coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": False}])
+    assert problems and "paused by the user" in problems[0], problems
+    assert p.db.paused_resources()["board"]["by"] == "user"
+    assert coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": False}], user_turn=True) == []
+    assert p.db.paused_resources() == {}
+    # A pause the coordinator set, it may lift itself.
+    assert coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": True}]) == []
+    assert coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": False}]) == []
+
+
+def test_paused_resources_show_in_the_digest_status_and_web_state(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.cli import status_text
+    from ttp.web import state_payload
+    coord.pause_resource(p, "board", True, reason="firmware update", by="user")
+    dig = coord.digest(p, {}, [], [])
+    assert "## Paused resources" in dig and "- board: paused" in dig and "firmware update" in dig
+    out = status_text(p)
+    assert "resource board paused" in out and "ttp resume demo --resource board" in out, out
+    h = state_payload(p, p.db)["health"]
+    assert [r["resource"] for r in h["resources_paused"]] == ["board"]
+    assert "board is paused" in h["why_idle"]
+    coord.pause_resource(p, "board", False)
+    assert "Paused resources" not in coord.digest(p, {}, [], [])
+
+
+def test_ttp_lock_refuses_a_paused_resource_with_75(env, tmp_path):
+    p = make(env)
+    from ttp import coordinator as coord
+    run_env = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost", TTP_PROJECT=str(p.base))
+    marker = tmp_path / "ran"
+    cmd = [sys.executable, str(TTP), "lock", "--timeout", "5", "board", "--", "touch", str(marker)]
+    coord.pause_resource(p, "board", True, reason="maintenance", by="user")
+    out = subprocess.run(cmd, env=run_env, capture_output=True, text=True)
+    assert out.returncode == 75 and "board is paused (maintenance)" in out.stderr, out
+    assert not marker.exists(), "the command ran on a paused resource"
+    # A task holding the resource for its whole run is refused too.
+    run_dir = tmp_path / "own"
+    run_dir.mkdir()
+    (run_dir / "run.json").write_text(json.dumps({"exclusive": [{"resource": "board"}]}))
+    out = subprocess.run(cmd, env={**run_env, "TTP_RUN_DIR": str(run_dir)}, capture_output=True, text=True)
+    assert out.returncode == 75 and not marker.exists(), out
+    coord.pause_resource(p, "board", False)
+    assert subprocess.run(cmd, env=run_env).returncode == 0 and marker.exists()
+
+
+def test_a_pause_set_while_ttp_lock_waits_ends_the_wait_with_75(env, tmp_path):
+    p = make(env)
+    from ttp import coordinator as coord
+    run_env = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost", TTP_PROJECT=str(p.base))
+    holder = subprocess.Popen([sys.executable, str(TTP), "lock", "board", "--", "sleep", "30"], env=run_env,
+                              start_new_session=True)
+    try:
+        slot = p.state / "locks" / "board.0.lock"
+        deadline = time.time() + 20
+        while time.time() < deadline and not (slot.exists() and slot.read_text()):
+            time.sleep(0.1)
+        waiter = subprocess.Popen([sys.executable, str(TTP), "lock", "--timeout", "0", "board", "--", "true"],
+                                  env=run_env, stderr=subprocess.PIPE, text=True)
+        time.sleep(1)
+        coord.pause_resource(p, "board", True, by="user")
+        _, err = waiter.communicate(timeout=30)
+        assert waiter.returncode == 75 and "board is paused" in err, err
+    finally:
+        os.killpg(holder.pid, signal.SIGTERM)
+        holder.wait(timeout=30)

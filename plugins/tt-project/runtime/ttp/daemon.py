@@ -1124,7 +1124,8 @@ class Daemon:
         files = [p.charter_path, p.config_path, p.memory_index,
                  *(p.memory_dir.iterdir() if p.memory_dir.is_dir() else [])]
         mtimes = sorted((f.name, f.stat().st_mtime) for f in files if f.exists())
-        blob = json.dumps([tasks, asks, scheds, gates, mtimes], default=str)
+        paused = sorted(db.paused_resources())
+        blob = json.dumps([tasks, asks, scheds, gates, mtimes] + ([paused] if paused else []), default=str)
         return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
     def _starved(self, gate, since_last: float) -> bool:
@@ -1173,7 +1174,20 @@ class Daemon:
             return
         committed = None    # what running work under the dollar caps may still spend
         reached = set()     # tasks that got past the gates to the resource check
+        paused = db.paused_resources()
         for task in ready:
+            # A paused resource holds its tasks in the queue, attempts untouched, until it resumes.
+            hit = sorted(coord.task_resources(task) & paused.keys())
+            note = task["blocked_reason"] or ""
+            if hit:
+                why = "; ".join(f"{r}: {paused[r]['reason']}" if paused[r].get("reason") else r for r in hit)
+                held = (f"{PAUSED_NOTE} {why}; it starts once resumed "
+                        f"(`ttp resume {self.p.name} --resource {hit[0]}`)")[:500]
+                if note != held:
+                    db.update_task(task["id"], blocked_reason=held)
+                continue
+            if note.startswith(PAUSED_NOTE):
+                db.update_task(task["id"], blocked_reason=None)
             provider = task["provider"] or self.cfg.get("core_provider", "claude")
             gate = self.gates.get(provider) or bud.evaluate(db, self.cfg, provider, bud.plan_windows(db))
             if not gate.allow_new_work or busy.get(provider, 0) >= gate.max_parallel:
@@ -1457,6 +1471,8 @@ class Daemon:
 
         At most twice its slots run at once among the tasks that use a resource either way: more
         would only queue in `ttp lock` on a worker slot and a wall clock that other work could use."""
+        if coord.task_resources(task) & self.p.db.paused_resources().keys():
+            return False
         limits = self.cfg.get("resources", {})
         for res in _shared(task):
             users = self.p.db.one("SELECT COUNT(*) n FROM tasks WHERE status='running' AND (labels LIKE ? "
@@ -1638,6 +1654,9 @@ class Daemon:
                              stderr=subprocess.DEVNULL, start_new_session=True)
         except OSError:
             pass
+
+
+PAUSED_NOTE = "waits for a paused resource:"
 
 
 def _exclusive(task: dict) -> list[str]:

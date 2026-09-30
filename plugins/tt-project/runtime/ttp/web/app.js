@@ -103,7 +103,9 @@ function healthHtml(h) {
   if (c.backoff_until) parts.push(`retry at ${at(c.backoff_until)}`);
   if (c.idle_wake) parts.push(`next idle check ${at(c.idle_wake)}`);
   return `<div class="row"><span class="meta">${parts.join(" · ")}</span></div>` + h.providers_paused.map((p) =>
-    `<div class="row"><b>${esc(p.provider)}</b><span class="pill lv-red">paused until ${at(p.until)}</span><span>${esc(p.note)}</span><span class="meta">fix: ${esc(p.fix)}</span></div>`).join("");
+    `<div class="row"><b>${esc(p.provider)}</b><span class="pill lv-red">paused until ${at(p.until)}</span><span>${esc(p.note)}</span><span class="meta">fix: ${esc(p.fix)}</span></div>`).join("") +
+    (h.resources_paused || []).map((r) =>
+    `<div class="row"><b>${esc(r.resource)}</b><span class="pill lv-orange">resource paused</span><span>${esc(r.reason || "")}</span><span class="meta">since ${at(r.since)} by ${esc(r.by || "user")}: its tasks wait</span><button data-resume-resource="${esc(r.resource)}">Resume</button></div>`).join("");
 }
 
 async function refresh() {
@@ -138,6 +140,8 @@ async function refresh() {
     (h.held ? ` <b>Held:</b> ${esc(h.held)}` : "");
   $("#top").textContent = h.spend.top_7d ? `Top spender, 7 days: ${h.spend.top_7d.source} ${money(h.spend.top_7d.usd)}` : "";
   $("#chealth").innerHTML = healthHtml(h);
+  $("#chealth").querySelectorAll("[data-resume-resource]").forEach((b) => b.onclick = async () => {
+    await api("/api/pause", { resource: b.dataset.resumeResource, paused: false }); refresh(); });
   announce(st.attention || [], st.project.name);
   document.title = `${unseen ? "(" + unseen + ") " : ""}${st.project.name} · tt-project`;
   board(st);
