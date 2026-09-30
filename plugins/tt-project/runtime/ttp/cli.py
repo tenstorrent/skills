@@ -15,6 +15,7 @@ import re
 import secrets as pysecrets
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -320,16 +321,24 @@ def cmd_listen(a) -> None:
     if not row:
         die(f"unknown chat {a.chat}; run `ttp connect {a.name}` first")
     after, floor = int(row["last_read"] or 0), row["min_severity"] or "normal"
-    # One listener per chat: a second one would race the first for the same messages, and
-    # whichever prints to nowhere would silently mark them read.
+    # One listener per chat, and the newest wins. Two would race for the same messages, and one
+    # printing to nowhere (a lost background task, a dropped ssh session) would silently mark them
+    # read. Whoever arms a listener last is the one that wants the messages.
     lock = p.state / f"listen-{a.chat}.pid"
     try:
         other = int(lock.read_text())
     except (OSError, ValueError):
         other = 0
     if other and other != os.getpid() and _listener_alive(other, a.chat):
-        die(f"a listener for chat {a.chat} is already running (pid {other}); its output arrives where it "
-            f"was started. To replace it, stop it first: kill {other}", 3)
+        try:
+            os.kill(other, signal.SIGTERM)
+        except OSError:
+            pass
+        for _ in range(50):
+            if not _listener_alive(other, a.chat):
+                break
+            time.sleep(0.1)
+        print(f"ttp: replaced an older listener for chat {a.chat} (pid {other})", file=sys.stderr)
     lock.write_text(str(os.getpid()))
     try:
         _listen_loop(p, db, a, after, floor)
@@ -357,7 +366,10 @@ def _listener_alive(pid: int, chat: str) -> bool:
 
 def _listen_loop(p: Project, db, a, after: int, floor: str) -> None:
     deadline = time.time() + a.timeout if a.timeout else None
+    parent = os.getppid()
     while True:
+        if os.getppid() != parent:
+            return      # whoever started this listener is gone; nobody would read what it prints
         msgs = db.unread_for_chat(a.chat, after, floor)
         if msgs:
             for m in msgs:

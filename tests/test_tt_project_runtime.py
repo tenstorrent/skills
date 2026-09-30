@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import os
 import pathlib
 import subprocess
@@ -272,31 +273,51 @@ def test_productive_burst_is_not_a_runaway_but_waste_is(env):
 
 
 def test_one_listener_per_chat(env):
+    """The newest listener wins, and a listener whose starter is gone exits by itself."""
     p = make(env)
     p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)",
            (time.time(), "t", time.time()))
     run_env = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost")
-    first = subprocess.Popen([sys.executable, str(TTP), "listen", "demo", "--chat", "c1", "--timeout", "30"],
-                             env=run_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    lock = p.state / "listen-c1.pid"
+    cmd = [sys.executable, str(TTP), "listen", "demo", "--chat", "c1", "--timeout", "60"]
+    first = subprocess.Popen(cmd, env=run_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
-        lock = p.state / "listen-c1.pid"
         deadline = time.time() + 15
         while time.time() < deadline and not lock.exists():
             time.sleep(0.2)
         assert lock.exists(), "the first listener never took the chat"
-        second = subprocess.run([sys.executable, str(TTP), "listen", "demo", "--chat", "c1", "--once",
-                                 "--timeout", "5"], env=run_env, capture_output=True, text=True, timeout=30)
-        assert second.returncode == 3 and "already running" in second.stderr
+        second = subprocess.Popen(cmd, env=run_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            first.wait(timeout=15)
+            assert lock.read_text().strip() == str(second.pid), "the newest listener does not own the chat"
+            p.db.post("out", "hello", chat="c1", kind="reply")
+            out = ""
+            deadline = time.time() + 15
+            while time.time() < deadline and "hello" not in out:
+                time.sleep(0.3)
+                out = p.db.one("SELECT last_read FROM chats WHERE id='c1'")["last_read"] and "hello" or ""
+            assert out == "hello", "the newest listener did not receive the message"
+        finally:
+            second.terminate()
+            second.wait(timeout=10)
     finally:
-        first.terminate()
-        first.wait(timeout=10)
-    # A lock left by a dead or unrelated process never blocks a new listener.
-    (p.state / "listen-c1.pid").write_text(str(os.getpid()))
-    third = subprocess.run([sys.executable, str(TTP), "listen", "demo", "--chat", "c1", "--once",
-                            "--timeout", "2"], env=run_env, capture_output=True, text=True, timeout=30)
-    assert third.returncode == 0, third.stderr
-    assert not (p.state / "listen-c1.pid").exists(), "the listener left its lock behind"
-
+        if first.poll() is None:
+            first.terminate()
+            first.wait(timeout=10)
+    # A listener whose parent dies (a lost background task, a dropped ssh session) exits on its own.
+    starter = subprocess.run(["/bin/sh", "-c", " ".join(shlex.quote(x) for x in cmd) + " >/dev/null 2>&1 & echo $!; sleep 1"],
+                             env=run_env, capture_output=True, text=True, timeout=30)
+    orphan = int(starter.stdout.split()[0])
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        try:
+            os.kill(orphan, 0)
+        except OSError:
+            break
+        time.sleep(0.3)
+    else:
+        os.kill(orphan, 15)
+        raise AssertionError("an orphaned listener kept running")
 
 def _run_until(d, p, cond, timeout=60):
     deadline = time.time() + timeout
