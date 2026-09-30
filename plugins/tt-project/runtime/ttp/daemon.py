@@ -66,6 +66,7 @@ class Daemon:
         self._last_cfg = 0.0
         self._last_slack = 0.0
         self._reap_errors: dict[int, int] = {}
+        self._metered: dict[int, tuple[int, float]] = {}   # run id -> (output size, when) last priced
         self._start_failures = 0
         self._lock_fd: int | None = None
         self._started = time.time()
@@ -156,6 +157,7 @@ class Daemon:
             self.cfg, self._last_cfg = self.p.config(), now
             self.jev = Jev(self.cfg, db=self.p.db)
         self.reap_runs()
+        self.meter_running()
         self.reconcile_tasks()
         self.prune_worktrees()
         if self.p.db.kv("paused", False):
@@ -318,15 +320,42 @@ class Daemon:
                       f"The coordinator can re-point it with task_update depends_on (an empty list clears it), "
                       f"requeue it once the dependency is redone, or cancel it.", "handled", t["id"]))
 
+    def meter_running(self, every_s: float = 60) -> None:
+        """Price runs still going from their stream, so status and the caps see a long run's spend
+        before it ends. `finish_run` replaces the figure with the final one."""
+        now = time.time()
+        running = self.p.db.q("SELECT * FROM runs WHERE status='running'")
+        self._metered = {k: v for k, v in self._metered.items() if k in {r["id"] for r in running}}
+        for r in running:
+            out = self._run_dir(r) / "output.jsonl"
+            try:
+                size = out.stat().st_size
+            except OSError:
+                continue
+            seen = self._metered.get(r["id"])
+            if seen and (seen[0] == size or now - seen[1] < every_s):
+                continue
+            self._metered[r["id"]] = (size, now)
+            try:
+                cost = self._priced(r, get_provider(r["provider"]).parse(out))
+            except Exception:
+                continue
+            self.p.db.x("UPDATE runs SET cost_usd=?, cost_estimated=1 WHERE id=? AND status='running'",
+                        (cost, r["id"]))
+
+    def _priced(self, r: dict, usage) -> float:
+        if usage.estimated and not usage.cost_usd:
+            usage.cost_usd = bud.estimate_cost(self.p.db, self.cfg, r["provider"], r["model"] or "", {
+                "input": usage.input_tokens, "output": usage.output_tokens,
+                "cache_read": usage.cache_read_tokens, "cache_write": usage.cache_write_tokens})
+        return usage.cost_usd
+
     def finish_run(self, r: dict, exit_info: dict) -> None:
         db, p = self.p.db, self.p
         run_dir = self._run_dir(r)
         prov = get_provider(r["provider"]).use(r["model"] or "", (self.cfg.get("pricing") or {}).get(r["provider"]))
         usage = prov.parse(run_dir / "output.jsonl", run_dir / "stderr.log")
-        if usage.estimated and not usage.cost_usd:
-            usage.cost_usd = bud.estimate_cost(db, self.cfg, r["provider"], r["model"] or "", {
-                "input": usage.input_tokens, "output": usage.output_tokens,
-                "cache_read": usage.cache_read_tokens, "cache_write": usage.cache_write_tokens})
+        self._priced(r, usage)
         stopped = exit_info.get("stopped")
         if usage.estimated and not usage.cost_usd and stopped:
             usage.cost_usd = _cut_off_cost(run_dir, exit_info)

@@ -435,7 +435,8 @@ def status_text(p: Project) -> str:
     lines = [head]
     s = h["spend"]
     top = f" · top 7d: {s['top_7d']['source']} ${s['top_7d']['usd']:.2f}" if s["top_7d"] else ""
-    lines.append(f"spend: ${s['spent_24h']:.2f} last 24h, ${s['spent_7d']:.2f} last 7d{top}")
+    live = f" · ~${s['in_flight']:.2f} so far in running work" if s.get("in_flight") else ""
+    lines.append(f"spend: ${s['spent_24h']:.2f} last 24h, ${s['spent_7d']:.2f} last 7d{live}{top}")
     for prov, g in gates.items():
         lines.append(f"budget {prov}: {g['level']} · {gate_detail(g)}" + (f" — {'; '.join(g['reasons'])}" if g["reasons"] else ""))
     c = h["coordinator"]

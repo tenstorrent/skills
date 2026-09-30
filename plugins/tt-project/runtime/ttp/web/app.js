@@ -127,7 +127,7 @@ async function refresh() {
   $("#pname").textContent = st.project.name;
   $("#daemon").textContent = st.paused ? "paused" : stuck ? "stuck" : (st.daemon && st.daemon.pid ? `running on ${st.daemon.host}` : "stopped");
   $("#daemon").className = "pill " + (stuck ? "lv-red" : st.paused ? "lv-orange" : "lv-green");
-  $("#spend").textContent = `${money(h.spend.spent_24h)} 24h · ${money(h.spend.spent_7d)} 7d`;
+  $("#spend").textContent = `${money(h.spend.spent_24h)} 24h · ${money(h.spend.spent_7d)} 7d${h.spend.in_flight ? ` · ~${money(h.spend.in_flight)} running` : ""}`;
   const needs = st.tasks.filter((t) => t.status === "blocked").length + h.asks.length;
   $("#needs").hidden = !needs; $("#needs").textContent = `${needs} need${needs === 1 ? "s" : ""} you`;
   $("#why").innerHTML = h.why_idle ? `<b>Idle:</b> ${esc(h.why_idle)}` : `${h.running} run${h.running === 1 ? "" : "s"} working.`;
@@ -139,7 +139,7 @@ async function refresh() {
   $("#attention").innerHTML = (st.attention || []).slice(0, 5).map((m) => `<div class="attn"><span class="when">${ago(m.ts)} ago · ${esc(m.kind)}</span><div>${esc(m.text)}</div></div>`).join("");
   $("#gates").innerHTML = $("#gates2").innerHTML = gateHtml(st.gates);
   const running = st.runs.filter((r) => r.status === "running");
-  $("#running").innerHTML = running.length ? running.map((r) => `<div class="row"><span class="id">run ${r.id}</span><span class="title">${esc(r.role)}${r.task ? " · task #" + r.task : ""}</span><span class="meta">${esc(r.provider)} ${esc(r.model || "")} ${esc(r.effort || "")} · ${ago(r.started)}</span></div>`).join("") : `<p class="muted">Idle.</p>`;
+  $("#running").innerHTML = running.length ? running.map((r) => `<div class="row"><span class="id">run ${r.id}</span><span class="title">${esc(r.role)}${r.task ? " · task #" + r.task : ""}</span><span class="meta">${esc(r.provider)} ${esc(r.model || "")} ${esc(r.effort || "")} · ${ago(r.started)}${r.cost_usd ? ` · ~${money(r.cost_usd)} so far` : ""}</span></div>`).join("") : `<p class="muted">Idle.</p>`;
   $("#coord").textContent = (st.coordinator && st.coordinator.summary) || "—";
   const done = st.tasks.filter((t) => ["done", "failed", "cancelled"].includes(t.status)).slice(0, 8);
   $("#recent").innerHTML = done.map(taskRow).join("") || `<p class="muted">Nothing yet.</p>`;

@@ -144,7 +144,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         why.append(f"nothing queued; the coordinator checks in at {at(idle_wake, now)}")
     return {
         "spend": {"spent_24h": round(db.spent_since(now - DAY), 2), "spent_7d": round(db.spent_since(now - WEEK), 2),
-                  "top_7d": top if top and top["usd"] else None},
+                  "top_7d": top if top and top["usd"] else None, "in_flight": round(bud.in_flight(db), 2)},
         "coordinator": {"last_turn": last_turn or None, "last_status": last_run["status"] if last_run else None,
                         "failures": int(db.kv("coordinator_failures", 0)),
                         "backoff_until": backoff if backoff > now else None,

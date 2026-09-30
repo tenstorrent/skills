@@ -737,6 +737,36 @@ def test_a_task_note_never_outlives_the_state_it_described(env, tmp_path):
     assert p.db.task(tid2)["blocked_reason"] == "needs a board"
 
 
+def test_a_running_worker_spend_counts_before_it_ends(env, tmp_path):
+    p = make(env)
+    from ttp import budget as bud
+    from ttp.daemon import Daemon
+    from ttp.web import health
+    p.set_config("budget.daily_usd", 5)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    msg = {"type": "assistant", "message": {"id": "m1", "usage": {"input_tokens": 1_000_000, "output_tokens": 0},
+                                            "content": [{"type": "text", "text": "building"}]}}
+    (run_dir / "output.jsonl").write_text(json.dumps(msg) + "\n")
+    rid = p.db.x("INSERT INTO runs(role,provider,model,started,status,dir,boot_id) VALUES(?,?,?,?,?,?,?)",
+                 ("worker", "claude", "opus", time.time(), "running", str(run_dir), "x"))
+    d = Daemon(p.base)
+    d.meter_running()
+    cost = p.db.one("SELECT cost_usd FROM runs WHERE id=?", (rid,))["cost_usd"]
+    assert cost and cost > 5, "a running worker showed no spend"
+    g = bud.evaluate(p.db, p.config(), "claude", [])
+    assert g.level == "red" and g.numbers["in_flight"] == round(cost, 2), "the caps ignored spend in flight"
+    assert health(p, p.db)["spend"]["in_flight"] == round(cost, 2)
+    result = {"type": "result", "total_cost_usd": 1.25, "usage": {}, "result": "done", "subtype": "success"}
+    with open(run_dir / "output.jsonl", "a") as f:
+        f.write(json.dumps(result) + "\n")
+    (run_dir / "exit.json").write_text(json.dumps({"rc": 0, "ended": time.time()}))
+    d.reap_runs()
+    row = p.db.one("SELECT cost_usd, cost_estimated FROM runs WHERE id=?", (rid,))
+    assert (row["cost_usd"], row["cost_estimated"]) == (1.25, 0)
+    assert bud.in_flight(p.db) == 0 and round(p.db.spent_since(0), 2) == 1.25, "counted twice once it ended"
+
+
 def test_coordinator_can_point_code_tasks_at_the_working_branch(env):
     p = make(env)
     from ttp import coordinator as coord

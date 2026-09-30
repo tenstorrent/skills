@@ -71,6 +71,14 @@ def _raise(g: Gate, level: str, reason: str) -> None:
     g.reasons.append(reason)
 
 
+def in_flight(db: DB, provider: str | None = None, exclude: set[str] | None = None) -> float:
+    """Spend so far of runs still going, as the daemon last priced it; the ledger has it only
+    once they end."""
+    rows = db.q("SELECT provider, cost_usd FROM runs WHERE status='running' AND (? IS NULL OR provider=?)",
+                (provider, provider))
+    return sum(float(r["cost_usd"] or 0) for r in rows if r["provider"] not in (exclude or set()))
+
+
 def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float | None = None) -> Gate:
     now = now or time.time()
     b = cfg["budget"]
@@ -95,9 +103,10 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
         windowed = {p: ts if p in lapsed else now if now - ts <= SNAPSHOT_FRESH_S else ts + PLAN_GRACE_S
                     for p, ts in last.items()}
         windowed.update({w.provider: now for w in windows if w.provider not in last})
-        d = db.spent_since(now - DAY, exclude=windowed)
-        w7 = db.spent_since(now - WEEK, exclude=windowed)
-        g.numbers.update({"spent_24h": round(d, 2), "spent_7d": round(w7, 2),
+        live = in_flight(db, exclude={p for p, until in windowed.items() if until >= now})
+        d = db.spent_since(now - DAY, exclude=windowed) + live
+        w7 = db.spent_since(now - WEEK, exclude=windowed) + live
+        g.numbers.update({"spent_24h": round(d, 2), "spent_7d": round(w7, 2), "in_flight": round(live, 2),
                           "estimated_24h": round(db.spent_since(now - DAY, exclude=windowed, estimated_only=True), 2),
                           "daily_cap": day_cap, "weekly_cap": week_cap})
         ratio = max(d / day_cap if day_cap else 0.0, w7 / week_cap if week_cap else 0.0)
@@ -115,7 +124,7 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
     # - total: all spend above max(k x this project's 7-day hourly norm, a floor sized to the
     #   parallel work it is allowed), so even "successful" repetition is bounded.
     hour_ago = now - HOUR
-    last_h = db.spent_since(hour_ago, provider)
+    last_h = db.spent_since(hour_ago, provider) + in_flight(db, provider=provider)
     runs_h = db.q("SELECT role, status, cost_usd FROM runs WHERE provider=? AND ended>=?", (provider, hour_ago))
     # A run stopped on purpose (a cancel, a pause, a redirect) is a decision, not waste.
     waste = sum(float(r["cost_usd"] or 0) for r in runs_h
