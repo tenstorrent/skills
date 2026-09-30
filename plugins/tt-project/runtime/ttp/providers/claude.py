@@ -66,6 +66,7 @@ class Claude(Provider):
         u = RunUsage()
         last_text = ""
         saw_result = False
+        rejected = ""
         # One API message streams as several events (one per content block), each repeating its
         # usage: count every message id once, at its highest reading.
         per_msg: dict[str, dict[str, int]] = {}
@@ -73,6 +74,9 @@ class Claude(Provider):
             t = ev.get("type")
             if t == "rate_limit_event":
                 u.extra["windows"] = windows_from_event(ev)
+                info = ev.get("rate_limit_info") or {}
+                if info.get("status") == "rejected":
+                    rejected = f"rate limit rejected: {info.get('rateLimitType') or 'unknown'}"
             elif t == "assistant":
                 msg = ev.get("message") or {}
                 us = msg.get("usage") or {}
@@ -112,12 +116,13 @@ class Claude(Provider):
         stderr = ""
         if stderr_path and Path(stderr_path).exists():
             stderr = Path(stderr_path).read_text(errors="replace")[-2000:]
-        blob = u.final_text + " " + u.error + " " + stderr
-        # Not final_text: a killed worker's last message may just be discussing a 401.
-        if not u.cost_usd and AUTH_RE.search(u.error + " " + stderr):
+        # Not final_text: a killed worker's last message may just be discussing a 401 or a rate limit.
+        blob = u.error + " " + stderr
+        if not u.cost_usd and AUTH_RE.search(blob):
             u.auth_failed = True
-        if LIMIT_RE.search(blob) and (u.error or not u.cost_usd) and not u.auth_failed:
-            u.limited, u.limit_note = True, LIMIT_RE.search(blob).group(0)
+        hit = LIMIT_RE.search(blob)
+        if (rejected or hit) and (u.error or not u.cost_usd) and not u.auth_failed:
+            u.limited, u.limit_note = True, rejected or hit.group(0)
         return u
 
     def account(self) -> str:

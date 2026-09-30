@@ -20,3 +20,5 @@
 - A Claude run counts as logged out only from its stderr, its result's error or an
   `authentication_failed` event, so a killed worker whose last message mentions a 401 no longer
   pauses the provider.
+- A Claude run counts as rate limited only from its stderr, its result's error or a rejected
+  `rate_limit_event`, so a worker whose last message discusses rate limits is no longer paused.

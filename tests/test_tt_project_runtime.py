@@ -256,6 +256,24 @@ def test_killed_run_discussing_a_401_is_not_logged_out(env, tmp_path):
     assert u.estimated and not u.auth_failed
 
 
+def test_killed_run_discussing_rate_limits_is_not_limited(env, tmp_path):
+    from ttp.providers import get_provider
+    out = tmp_path / "o.jsonl"
+    out.write_text(json.dumps({"type": "assistant", "message": {"content": [
+        {"type": "text", "text": "Added a retry for when the API hits its rate limit (quota exceeded)."}]}}) + "\n")
+    u = get_provider("claude").parse(out)
+    assert u.estimated and not u.limited
+
+
+def test_rejected_rate_limit_event_marks_run_limited(env, tmp_path):
+    from ttp.providers import get_provider
+    out = tmp_path / "o.jsonl"
+    out.write_text(json.dumps({"type": "rate_limit_event", "rate_limit_info": {
+        "status": "rejected", "rateLimitType": "five_hour"}}) + "\n")
+    u = get_provider("claude").parse(out)
+    assert u.limited and not u.auth_failed
+
+
 def test_alerts_are_not_repeated_after_a_daemon_restart(env):
     p = make(env)
     from ttp.daemon import Daemon
