@@ -1247,3 +1247,229 @@ def test_a_new_restriction_reaches_workers_already_running(env, tmp_path):
     assert "Never push to main." in (run_dir / "steer.md").read_text()
     assert coord.apply(p, [{"type": "charter_update", "section": "Goals", "text": "Go faster."}]) == []
     assert "Go faster." not in (run_dir / "steer.md").read_text(), "only restrictions interrupt running work"
+
+
+def test_one_daemon_per_project(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dm
+    first = dm.Daemon(p.base)
+    assert first._single_instance()
+    assert dm.Daemon(p.base).run() == 1, "a second daemon started while the first holds the lock"
+    os.close(first._lock_fd)
+    again = dm.Daemon(p.base)
+    assert again._single_instance(), "the lock outlived its holder"
+    os.close(again._lock_fd)
+    # Without flock, a pid file naming a live process that is not a daemon (a recycled pid) does not block.
+    monkeypatch.setattr(dm, "_flock", lambda path: None)
+    other = subprocess.Popen(["sleep", "30"])
+    try:
+        (p.state / "daemon.pid").write_text(str(other.pid))
+        assert dm.Daemon(p.base)._single_instance()
+        monkeypatch.setattr(dm, "_is_daemon", lambda pid: True)
+        assert not dm.Daemon(p.base)._single_instance()
+    finally:
+        other.kill()
+        other.wait()
+
+
+def _start_sleeping_run(p, tid, role="worker"):
+    rid = p.db.x("INSERT INTO runs(task,role,provider,started,status,boot_id) VALUES(?,?,?,?,?,?)",
+                 (tid, role, "fake", time.time(), "running", "x"))
+    run_dir = p.runs / str(rid)
+    run_dir.mkdir(parents=True)
+    (run_dir / "prompt.md").write_text("x")
+    (run_dir / "run.json").write_text(json.dumps({"argv": ["sleep", "120"], "env": {}, "cwd": str(p.root),
+                                                  "timeout_s": 600, "provider": "fake"}))
+    proc = subprocess.Popen([sys.executable, "-m", "ttp.runner", str(run_dir)], cwd=str(RUNTIME),
+                            env={**os.environ, "PYTHONPATH": str(RUNTIME)})
+    p.db.x("UPDATE runs SET dir=?, pid=? WHERE id=?", (str(run_dir), proc.pid, rid))
+    return rid, run_dir, proc
+
+
+def test_cancel_and_stop_kill_end_running_workers_but_stop_keeps_them(env, monkeypatch):
+    p = make(env)
+    from ttp import cli, service
+    from ttp.daemon import Daemon
+    monkeypatch.setattr(service, "uninstall", lambda p: "nothing installed")
+    cancelled = p.db.add_task("cancel me", "s", kind="work", tier="light", origin="user")
+    kept = p.db.add_task("keep me", "s", kind="work", tier="light", origin="user")
+    for t in (cancelled, kept):
+        p.db.update_task(t, status="running")
+    rc, dir_c, proc_c = _start_sleeping_run(p, cancelled)
+    rk, dir_k, proc_k = _start_sleeping_run(p, kept)
+    try:
+        cli.main(["task", "demo", "cancel", str(cancelled)])
+        proc_c.wait(timeout=30)
+        assert json.loads((dir_c / "exit.json").read_text())["stopped"] == "stopped"
+        # A plain stop leaves running workers alone, so a restart or upgrade never loses work.
+        cli.main(["stop", "demo"])
+        time.sleep(6)
+        assert proc_k.poll() is None and not (dir_k / "STOP").exists()
+        cli.main(["stop", "demo", "--kill"])
+        proc_k.wait(timeout=30)
+    finally:
+        for proc in (proc_c, proc_k):
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+    assert json.loads((dir_k / "exit.json").read_text())["stopped"] == "shutdown"
+    Daemon(p.base).reap_runs()
+    assert p.db.task(cancelled)["status"] == "cancelled"
+    assert p.db.one("SELECT status FROM runs WHERE id=?", (rk,))["status"] == "shutdown"
+    t = p.db.task(kept)
+    assert t["status"] == "queued" and t["attempts"] == 0, "a project stop cost the task an attempt"
+
+
+def test_status_says_not_running_when_the_heartbeat_is_stale(env):
+    p = make(env)
+    from ttp.cli import status_text
+    from ttp.daemon import HEARTBEAT_STALE_S, Daemon, heartbeat
+    from ttp.web import state_payload
+    Daemon(p.base)._beat()
+    head = subprocess.run(["git", "-C", str(p.harness), "rev-parse", "HEAD"], capture_output=True, text=True).stdout
+    assert p.db.kv("harness_good")["commit"] == head.strip()
+    p.db.set_kv("daemon", {"pid": os.getpid(), "host": "testhost"})
+    assert heartbeat(p)["pid"] == os.getpid()
+    assert "daemon running" in status_text(p)
+    old = time.time() - HEARTBEAT_STALE_S - 60
+    os.utime(p.state / "heartbeat", (old, old))
+    assert "daemon NOT RUNNING" in status_text(p)
+    st = state_payload(p, p.db)
+    assert st["heartbeat"]["age"] > st["heartbeat_stale_s"]
+
+
+def _install_template(env, edit=None):
+    """A copy of the plugin as `ttp setup` installs it, optionally with prompt edits {name: text}."""
+    import shutil
+    lib = env["home"] / "lib" / "current"
+    if lib.exists():
+        shutil.rmtree(lib)
+    plugin = RUNTIME.parent
+    for part in ("runtime", "template", "bin"):
+        shutil.copytree(plugin / part, lib / part, ignore=shutil.ignore_patterns("__pycache__"))
+    for name, text in (edit or {}).items():
+        (lib / "template" / "prompts" / name).write_text(text)
+
+
+def _git_out(path, *args):
+    return subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True, check=True).stdout.strip()
+
+
+def test_a_conflicting_upgrade_leaves_the_harness_untouched_and_queues_a_task(env, monkeypatch):
+    p = make(env)
+    from ttp import cli, service
+    restarts = []
+    monkeypatch.setattr(service, "restart", lambda p: restarts.append(1) or "restarted")
+    h = p.harness
+    (h / "prompts" / "kind-harness.md").write_text("# Harness task, this project's way\n")
+    _git_out(h, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "local prompt")
+    before = _git_out(h, "rev-parse", "HEAD")
+    _install_template(env, {"kind-harness.md": "# Harness task, upstream's way\n"})
+    with pytest.raises(SystemExit):
+        cli.main(["upgrade", "demo"])
+    assert _git_out(h, "rev-parse", "HEAD") == before and not _git_out(h, "status", "--porcelain")
+    for f in list((h / "prompts").rglob("*")) + list((h / "runtime").rglob("*.py")):
+        assert "<<<<<<<" not in f.read_text(), f"conflict markers in {f}"
+    task = p.db.one("SELECT * FROM tasks WHERE kind='harness'")
+    assert task and "kind-harness.md" in task["spec"] and not restarts
+    assert len(_git_out(h, "worktree", "list").splitlines()) == 1
+    # Once upstream agrees with the project, the next upgrade merges and restarts.
+    worker = (RUNTIME.parent / "template" / "prompts" / "worker.md").read_text()
+    _install_template(env, {"kind-harness.md": "# Harness task, this project's way\n",
+                            "worker.md": worker + "\nupstream line\n"})
+    cli.main(["upgrade", "demo"])
+    assert "upstream line" in (h / "prompts" / "worker.md").read_text() and restarts == [1]
+
+
+def test_a_merged_runtime_that_does_not_import_is_not_applied(env, monkeypatch):
+    p = make(env)
+    from ttp import cli, service
+    monkeypatch.setattr(service, "restart", lambda p: "restarted")
+    _install_template(env)
+    lib = env["home"] / "lib" / "current" / "runtime" / "ttp" / "daemon.py"
+    lib.write_text(lib.read_text() + "\ndef broken(:\n")
+    before = _git_out(p.harness, "rev-parse", "HEAD")
+    with pytest.raises(SystemExit):
+        cli.main(["upgrade", "demo"])
+    assert _git_out(p.harness, "rev-parse", "HEAD") == before
+    assert "compileall" in p.db.one("SELECT spec FROM tasks WHERE kind='harness'")["spec"]
+
+
+def test_restart_rolls_back_a_runtime_the_daemon_cannot_start_with(env):
+    import py_compile
+    p = make(env)
+    from ttp import service
+    h = p.harness
+    p.db.set_kv("harness_good", {"commit": _git_out(h, "rev-parse", "HEAD")})
+
+    def fake_restart(p):
+        try:
+            py_compile.compile(str(h / "runtime" / "ttp" / "daemon.py"), doraise=True)
+        except py_compile.PyCompileError:
+            return "restarted"      # the daemon dies on import: no heartbeat
+        (p.state / "heartbeat").write_text(json.dumps({"pid": 1, "started": time.time()}))
+        return "restarted"
+
+    assert "daemon is running" in service.restart(p, wait_s=2, restart_fn=fake_restart)
+    (h / "CHARTER.md").write_text((h / "CHARTER.md").read_text() + "\nA charter edit.\n")
+    daemon_py = h / "runtime" / "ttp" / "daemon.py"
+    daemon_py.write_text(daemon_py.read_text() + "\ndef broken(:\n")
+    _git_out(h, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "tweak the daemon")
+    text = service.restart(p, wait_s=2, restart_fn=fake_restart)
+    assert "tweak the daemon" in text and "running again" in text
+    py_compile.compile(str(daemon_py), doraise=True)
+    assert "A charter edit." in (h / "CHARTER.md").read_text(), "the rollback reverted more than the runtime"
+    assert "tweak the daemon" in _git_out(h, "log", "--format=%s"), "history was rewritten"
+    assert p.db.one("SELECT id FROM messages WHERE kind='alert' AND text LIKE '%rolled back%'")
+
+
+def test_finished_worktrees_are_removed_only_when_nothing_is_lost(env):
+    p = make(env)
+    from ttp import worktree
+    from ttp.daemon import Daemon
+    remote = env["tmp"] / "remote.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+    _git_out(p.root, "remote", "add", "origin", str(remote))
+    _git_out(p.root, "push", "-q", "origin", "HEAD")
+    ident = ["-c", "user.name=t", "-c", "user.email=t@t"]
+    paths = {}
+    for name in ("pushed", "unpushed", "dirty", "recent"):
+        tid = p.db.add_task(name, "s", kind="code", tier="light", origin="user")
+        path, branch = worktree.ensure(p, p.db.task(tid))
+        p.db.update_task(tid, status="done", branch=branch)
+        if name != "dirty":
+            (path / f"{name}.txt").write_text(name)
+            _git_out(path, "add", ".")
+            _git_out(path, *ident, "commit", "-qm", name)
+        else:
+            (path / "README.md").write_text("edited\n")
+        if name in ("pushed", "recent"):
+            _git_out(path, "push", "-q", "origin", f"HEAD:refs/heads/{branch}")
+        if name != "recent":
+            p.db.x("UPDATE tasks SET updated=? WHERE id=?", (time.time() - 8 * 86400, tid))
+        paths[name] = (path, branch)
+    Daemon(p.base).prune_worktrees()
+    assert not paths["pushed"][0].exists()
+    assert _git_out(p.root, "rev-parse", "--verify", "--quiet", paths["pushed"][1]), "a branch was deleted"
+    for name in ("unpushed", "dirty", "recent"):
+        assert paths[name][0].exists(), f"the {name} worktree was removed"
+    assert "removed" in (p.logs / "daemon.log").read_text()
+
+
+def test_low_disk_space_blocks_new_workers_and_alerts_once(env, monkeypatch):
+    import collections
+    p = make(env)
+    from ttp import daemon as dm
+    from ttp.cli import status_text
+    usage = collections.namedtuple("usage", "total used free")
+    monkeypatch.setattr(dm.shutil, "disk_usage", lambda path: usage(100e9, 99.5e9, 0.5e9))
+    tid = p.db.add_task("needs space", "s", kind="work", tier="light", origin="user")
+    d = dm.Daemon(p.base)
+    d.dispatch()
+    d.dispatch()
+    assert not p.db.q("SELECT id FROM runs WHERE task=?", (tid,))
+    assert len(p.db.q("SELECT id FROM messages WHERE kind='alert' AND text LIKE '%GB free%'")) == 1
+    assert "disk: only 0.5 GB free" in status_text(p)
+    monkeypatch.setattr(dm.shutil, "disk_usage", lambda path: usage(100e9, 50e9, 50e9))
+    assert _run_until(d, p, lambda: p.db.task(tid)["status"] == "done")
+    assert p.db.kv("disk_low") is None

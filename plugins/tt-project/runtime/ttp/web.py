@@ -15,8 +15,10 @@ from urllib.parse import parse_qs, urlparse
 
 from . import budget as bud
 from . import schedule as sched
+from .daemon import HEARTBEAT_STALE_S, heartbeat
 from .db import DB, load_result
 from .project import Project
+from .runner import stop_runs
 
 STATIC = Path(__file__).resolve().parent / "web"
 TYPES = {".html": "text/html; charset=utf-8", ".js": "application/javascript", ".css": "text/css",
@@ -57,6 +59,7 @@ def state_payload(p: Project, db: DB) -> dict:
     return {
         "project": {"name": p.name, "root": str(p.root), "config": p.config()},
         "daemon": db.kv("daemon", {}), "paused": db.kv("paused", False), "gates": db.kv("gates", {}),
+        "heartbeat": heartbeat(p), "heartbeat_stale_s": HEARTBEAT_STALE_S, "disk_low": db.kv("disk_low"),
         "tasks": tasks, "runs": runs,
         "issues": db.q("SELECT id,source,title,severity,status,count,first_seen,last_seen,task FROM issues "
                        "WHERE status IN ('open','tracking') ORDER BY last_seen DESC LIMIT 100"),
@@ -178,9 +181,7 @@ class Handler(BaseHTTPRequestHandler):
                         return self._send(409, {"error": f"task #{tid} is running: cancel it first"})
                 elif body.get("status") == "cancelled":
                     db.update_task(tid, status="cancelled")
-                    for r in db.q("SELECT dir FROM runs WHERE task=? AND status='running'", (tid,)):
-                        if r["dir"]:
-                            Path(r["dir"], "STOP").touch()
+                    stop_runs(db, p.runs, tid)
                 if body.get("priority"):
                     db.update_task(tid, priority=int(body["priority"]))
                 return self._send(200, {"ok": True})

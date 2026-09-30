@@ -59,7 +59,8 @@ description: "Start, connect to, and talk with a long-running tt-project: a loca
 | pause or resume all model work | `ttp pause <name>` / `ttp resume <name>` |
 | change caps | tell the coordinator, or `ttp config <name> budget.daily_usd 150` |
 | restart after trouble | `ttp restart <name>`, then `ttp doctor <name>` |
-| stop for good | `ttp stop <name>` (removes the service; data stays) |
+| stop for good | `ttp stop <name>` (removes the service; data stays; running workers finish) |
+| stop and end running work now | `ttp stop <name> --kill` (their tasks resume on the next start) |
 | logs | `ttp logs <name>` |
 
 More: `operate.md`.

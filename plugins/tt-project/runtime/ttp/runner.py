@@ -9,6 +9,7 @@
 - enforces the wall-clock limit with TERM, then KILL 30 s later (a child that ignores TERM would
   otherwise run on past its bound);
 - enforces the run's dollar budget mid-flight when the provider streams usage;
+- ends the child when <run_dir>/STOP appears (a cancel, or `ttp stop --kill` writing "shutdown");
 - writes exit.json exactly once, then asks the provider adapter for usage and records it.
 
 It survives a daemon restart: the daemon re-adopts runs by run_dir, pid and boot id.
@@ -26,6 +27,8 @@ from pathlib import Path
 
 LEASE_EVERY_S = 30
 KILL_AFTER_S = 30
+POLL_S = 5
+BUDGET_EVERY_S = 10
 
 
 def boot_id() -> str:
@@ -43,6 +46,35 @@ def boot_id() -> str:
 def _touch(p: Path) -> None:
     p.touch()
     os.utime(p, None)
+
+
+def request_stop(run_dir: Path, why: str = "cancel") -> None:
+    """Ask a run's supervisor to end its agent (TERM, then KILL after the grace period)."""
+    (run_dir / "STOP").write_text(why)
+
+
+def stop_runs(db, runs_dir: Path, task: int | None = None, why: str = "cancel") -> list[int]:
+    """Request a stop for every running run (of one task, if given). Returns their run ids."""
+    sql, args = "SELECT id, dir FROM runs WHERE status='running'", ()
+    if task is not None:
+        sql, args = sql + " AND task=?", (task,)
+    ids = []
+    for r in db.q(sql, args):
+        run_dir = Path(r["dir"]) if r["dir"] else runs_dir / str(r["id"])
+        if run_dir.is_dir():
+            request_stop(run_dir, why)
+            ids.append(r["id"])
+    return ids
+
+
+def stop_reason(run_dir: Path) -> str | None:
+    """"shutdown" when the whole project was stopped (the task goes back to the queue), else
+    "stopped" (a cancel). None while there is no STOP file."""
+    try:
+        text = (run_dir / "STOP").read_text().strip()
+    except OSError:
+        return None
+    return "shutdown" if text == "shutdown" else "stopped"
 
 
 def supervise(run_dir: Path) -> int:
@@ -82,8 +114,12 @@ def supervise(run_dir: Path) -> int:
     def watch() -> None:
         from .providers import get_provider  # local import: keeps startup cheap
         prov = get_provider(spec["provider"])
+        last_lease = last_budget = 0.0
         while child.poll() is None:
-            _touch(lease)
+            now = time.time()
+            if now - last_lease >= LEASE_EVERY_S:
+                _touch(lease)
+                last_lease = now
             if time.time() - started > timeout_s:
                 threading.Thread(target=stop, args=("timeout",), daemon=True).start()
             if stall_s:
@@ -93,16 +129,18 @@ def supervise(run_dir: Path) -> int:
                 marks = [started] + [f.stat().st_mtime for f in (out_path, run_dir / "progress.md") if f.exists()]
                 if time.time() - max(marks) > stall_s:
                     threading.Thread(target=stop, args=("stalled",), daemon=True).start()
-            if budget is not None:
+            if budget is not None and now - last_budget >= BUDGET_EVERY_S:
+                last_budget = now
                 try:
                     so_far = prov.cost_so_far(out_path)
                 except Exception:
                     so_far = None
                 if so_far is not None and so_far > float(budget):
                     threading.Thread(target=stop, args=("budget",), daemon=True).start()
-            if (run_dir / "STOP").exists():
-                threading.Thread(target=stop, args=("stopped",), daemon=True).start()
-            time.sleep(LEASE_EVERY_S if budget is None else 10)
+            why = stop_reason(run_dir)
+            if why:
+                threading.Thread(target=stop, args=(why,), daemon=True).start()
+            time.sleep(POLL_S)
 
     t = threading.Thread(target=watch, daemon=True)
     t.start()

@@ -70,9 +70,28 @@ def resolve_base(p: Project) -> str:
 
 
 def remove(p: Project, task_id: int) -> None:
+    """Remove a task's worktree; its branch stays. Refuses (raises) if git sees edits in it."""
     path = p.worktrees / f"t{task_id}"
     if path.exists():
-        _git(p.root, "worktree", "remove", "--force", str(path), check=False)
+        _git(p.root, "worktree", "remove", str(path))
+
+
+def keep_reason(p: Project, path: Path) -> str | None:
+    """Why this worktree must stay, or None when removing it loses nothing: no uncommitted or
+    untracked files, and its HEAD is on a remote branch or already in the base branch."""
+    def git(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True, timeout=120)
+    st = git("status", "--porcelain")
+    if st.returncode != 0:
+        return "git status failed"
+    if st.stdout.strip():
+        return "uncommitted changes"
+    remote = git("branch", "-r", "--contains", "HEAD")
+    if remote.returncode == 0 and remote.stdout.strip():
+        return None
+    if git("merge-base", "--is-ancestor", "HEAD", base_ref(p)).returncode == 0:
+        return None
+    return "commits not pushed or merged"
 
 
 def has_changes(path: Path, since_ref: str) -> bool:

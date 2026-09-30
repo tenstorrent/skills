@@ -70,7 +70,14 @@ The stable part (role, charter, memory) is the system prompt, which providers ca
 - `ttp new` copies `runtime/`, `template/prompts`, `template/bin` into `<root>/tt-project/harness/`,
   commits them on branch `upstream`, then commits charter and config on `main`.
 - Projects change their own harness on `main` (harness tasks, the daily review).
-- `ttp upgrade <name>` commits the installed template on `upstream` and merges it into `main`.
+- `ttp upgrade <name>` commits the installed template on `upstream`, merges it into `main` in a
+  scratch worktree, and fast-forwards the live harness only when the merge is clean and the
+  runtime compiles and imports. Otherwise it queues a harness task and changes nothing.
+- The daemon holds `state/daemon.lock` (flock) while it lives and touches `state/heartbeat` after
+  every completed tick. `status` and the web app report a stale heartbeat. `ttp restart` waits
+  for a fresh one; without it, `runtime/` is restored to the last commit a daemon ran on.
+- Stopping or restarting the daemon leaves running workers alone; the next daemon adopts them.
+  A cancel ends the task's runs; `ttp stop --kill` ends all runs and requeues their tasks.
 - Generic lessons from a project come back as follow-ups titled `upstream: …`.
 
 ## Prior art

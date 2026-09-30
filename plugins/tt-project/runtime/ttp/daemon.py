@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -29,7 +30,7 @@ from . import runner
 from . import schedule as sched
 from . import screen as scr
 from . import worktree
-from .db import SEVERITY_RANK, dump_result, load_result
+from .db import SEVERITY_RANK, TERMINAL_TASK_STATES, dump_result, load_result
 from .project import Project, hostname, load_secrets
 from .providers import get_provider
 from .providers.base import last_json_object, service_path
@@ -38,6 +39,7 @@ from .providers.jev import Jev, JevOutOfFunds
 
 TICK_S = 3.0
 LEASE_STALE_S = 180
+HEARTBEAT_STALE_S = 300   # longer than any single tick step (a git fetch, a watcher command)
 RESULT_FILE = "result.json"
 
 
@@ -61,14 +63,18 @@ class Daemon:
         self._last_slack = 0.0
         self._reap_errors: dict[int, int] = {}
         self._start_failures = 0
+        self._lock_fd: int | None = None
+        self._started = time.time()
+        self._healthy = False
+        self._last_prune = 0.0
+        self._disk_low: bool | None = None   # unknown until checked
 
     # lifecycle ------------------------------------------------------------------------------------
     def run(self) -> int:
         self.p.state.mkdir(parents=True, exist_ok=True)
         pidfile = self.p.state / "daemon.pid"
-        other = _read_pid(pidfile)
-        if other and other != os.getpid() and _alive(other):
-            print(f"daemon already running (pid {other})", file=sys.stderr)
+        if not self._single_instance():
+            print(f"daemon already running (pid {_read_pid(pidfile)})", file=sys.stderr)
             return 1
         pidfile.write_text(str(os.getpid()))
         signal.signal(signal.SIGTERM, lambda *_: setattr(self, "stopping", True))
@@ -81,6 +87,7 @@ class Daemon:
         while not self.stopping:
             try:
                 self.tick()
+                self._beat()
             except Exception:  # a bad tick must never kill the daemon
                 log(self.p, "tick error: " + traceback.format_exc().replace("\n", " | ")[:2000])
                 time.sleep(10)
@@ -88,7 +95,40 @@ class Daemon:
         log(self.p, "daemon stop")
         if _read_pid(pidfile) == os.getpid():
             pidfile.unlink(missing_ok=True)
+        # Running workers are left alone: they write their results to disk and the next start
+        # adopts them. `ttp stop --kill` and cancels end them explicitly.
         return 0
+
+    def _single_instance(self) -> bool:
+        """Hold an exclusive lock on state/daemon.lock for the process lifetime: the kernel drops it
+        when the process dies, so neither a race between two starters nor a recycled pid in a stale
+        pid file can matter. Where the file system has no flock, fall back to the pid file, trusting
+        it only if that pid is really a tt-project daemon."""
+        held = _flock(self.p.state / "daemon.lock")
+        if held is False:
+            return False
+        if held is not None:
+            self._lock_fd = held
+            return True
+        other = _read_pid(self.p.state / "daemon.pid")
+        return not (other and other != os.getpid() and _is_daemon(other))
+
+    def _beat(self) -> None:
+        """A completed tick. `status`, the web app and `ttp restart` read its age; the first one
+        marks the harness commit this runtime is known to run on."""
+        hb = self.p.state / "heartbeat"
+        if not self._healthy:
+            hb.write_text(json.dumps({"pid": os.getpid(), "host": hostname(), "started": self._started}))
+            self._healthy = True
+            try:
+                head = subprocess.run(["git", "-C", str(self.p.harness), "rev-parse", "HEAD"], capture_output=True,
+                                      text=True, timeout=30)
+                if head.returncode == 0:
+                    self.p.db.set_kv("harness_good", {"commit": head.stdout.strip(), "ts": time.time()})
+            except (OSError, subprocess.SubprocessError):
+                pass
+        else:
+            os.utime(hb, None)
 
     def tick(self) -> None:
         now = time.time()
@@ -97,6 +137,7 @@ class Daemon:
             self.jev = Jev(self.cfg, db=self.p.db)
         self.reap_runs()
         self.reconcile_tasks()
+        self.prune_worktrees()
         if self.p.db.kv("paused", False):
             return
         self._refresh_meters()
@@ -253,7 +294,7 @@ class Daemon:
                 "cache_read": usage.cache_read_tokens, "cache_write": usage.cache_write_tokens})
         stopped = exit_info.get("stopped")
         status = "ok" if exit_info.get("rc") == 0 and not usage.error else "failed"
-        if stopped in ("timeout", "budget", "stopped", "lost", "stalled"):
+        if stopped in ("timeout", "budget", "stopped", "lost", "stalled", "shutdown"):
             status = stopped if stopped != "stopped" else "killed"
         if usage.limited:
             status = "limit"
@@ -315,8 +356,8 @@ class Daemon:
         db = self.p.db
         out = usage.structured if isinstance(usage.structured, dict) else last_json_object(usage.final_text or "")
         actions = (out or {}).get("actions")
-        if status == "lost" and not r["dir"]:
-            return   # never launched, so not a failed turn: its messages and events stay queued
+        if (status == "lost" and not r["dir"]) or status == "shutdown":
+            return   # never launched, or ended by `ttp stop --kill`: its messages and events stay queued
         if status == "auth":
             db.set_kv("coordinator_backoff_until", time.time() + 900)
             return
@@ -364,6 +405,13 @@ class Daemon:
                       f"#{task['id']} {task['title']} was cancelled, but its run finished the work: "
                       f"{summary[:800]}", "queued", task["id"]))
             return
+        if status == "shutdown":
+            if isinstance(result, dict) and result.get("status"):
+                status = "ok"   # it handed off before the stop reached it
+            else:
+                # The project was stopped, not the task: it resumes on the next start, on its own branch.
+                db.update_task(task["id"], status="queued", blocked_reason="interrupted by `ttp stop --kill`; resumes")
+                return
         rstatus = result.get("status") if isinstance(result, dict) else None
         summary = str((result.get("summary") if isinstance(result, dict) else None) or (usage.final_text or "")[:1500])
         waiting = status == "ok" and rstatus == "waiting"
@@ -637,7 +685,10 @@ class Daemon:
         running = db.q("SELECT provider, COUNT(*) n FROM runs WHERE role!='coordinator' AND status='running' "
                        "GROUP BY provider")
         busy = {r["provider"]: r["n"] for r in running}
-        for task in db.ready_tasks():
+        ready = db.ready_tasks()
+        if ready and not self._disk_ok():
+            return
+        for task in ready:
             provider = task["provider"] or self.cfg.get("core_provider", "claude")
             gate = self.gates.get(provider) or bud.evaluate(db, self.cfg, provider, bud.plan_windows(db))
             if not gate.allow_new_work or busy.get(provider, 0) >= gate.max_parallel:
@@ -671,6 +722,55 @@ class Daemon:
                 continue
             self._start_failures = 0
             busy[provider] = busy.get(provider, 0) + 1
+
+    def _disk_ok(self) -> bool:
+        """A full disk corrupts state and fails runs half way, so below `disk.min_free_gb` under the
+        project folder no new worker starts. Running work, coordinator turns and replies continue."""
+        need = float(self.cfg.get("disk", {}).get("min_free_gb", 2)) * 1e9
+        low = None
+        for path in {self.p.base.resolve(), self.p.worktrees.resolve()} if need > 0 else ():
+            try:
+                free = shutil.disk_usage(path).free
+            except OSError:
+                continue
+            if free < need:
+                low = (path, free)
+        if bool(low) != self._disk_low:
+            if low or self._disk_low:
+                log(self.p, f"disk low: {low[1] / 1e9:.1f} GB free under {low[0]}; no new worker runs" if low
+                    else "disk space ok again")
+            self.p.db.set_kv("disk_low", {"path": str(low[0]), "free_gb": round(low[1] / 1e9, 1)} if low else None)
+        self._disk_low = bool(low)
+        if low:
+            self.alert("disk", f"Only {low[1] / 1e9:.1f} GB free under {low[0]} (minimum {need / 1e9:g} GB). No new "
+                       f"worker runs start until space is freed; running work and replies continue. Finished "
+                       f"tasks' worktrees are removed after `disk.worktree_retention_days` once pushed.", "high",
+                       every_s=24 * 3600)
+        return not low
+
+    def prune_worktrees(self, every_s: float = 3600) -> None:
+        """Remove worktrees of tasks finished more than `disk.worktree_retention_days` ago, only when
+        removing loses nothing (see worktree.keep_reason). Branches are never deleted."""
+        now = time.time()
+        if now - self._last_prune < every_s or not self.p.worktrees.is_dir():
+            return
+        self._last_prune = now
+        days = float(self.cfg.get("disk", {}).get("worktree_retention_days", 7))
+        if days <= 0:
+            return
+        for path in sorted(self.p.worktrees.iterdir()):
+            m = re.fullmatch(r"t(\d+)", path.name)
+            task = self.p.db.task(int(m.group(1))) if m else None
+            if not task or task["status"] not in TERMINAL_TASK_STATES or now - float(task["updated"] or now) < days * 86400:
+                continue
+            try:
+                why = worktree.keep_reason(self.p, path)
+                if why is None:
+                    worktree.remove(self.p, task["id"])
+                    log(self.p, f"worktree {path} of task {task['id']} ({task['status']}) removed; "
+                                f"branch {task['branch'] or '?'} kept")
+            except Exception as e:
+                log(self.p, f"worktree {path} not removed: {e}")
 
     def _start_failed(self, task: dict, e: Exception) -> None:
         """Nothing was launched, so no attempt is spent. The task waits a minute before the next try,
@@ -843,6 +943,48 @@ def _read_pid(path: Path) -> int | None:
     try:
         return int(path.read_text().strip())
     except (OSError, ValueError):
+        return None
+
+
+def _flock(path: Path):
+    """An fd holding an exclusive lock on path; False if another process holds it; None where
+    the file system does not support flock."""
+    try:
+        import fcntl
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)   # not inherited by children (PEP 446)
+    except (ImportError, OSError):
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
+    except BlockingIOError:
+        os.close(fd)
+        return False
+    except OSError:
+        os.close(fd)
+        return None
+
+
+def _is_daemon(pid: int) -> bool:
+    """pid is a live tt-project daemon, not a recycled pid now used by something else."""
+    if not _alive(pid):
+        return False
+    try:
+        cmd = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True,
+                             timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return True
+    return "ttp" in cmd and "daemon" in cmd
+
+
+def heartbeat(p: Project) -> dict | None:
+    """The daemon's last completed tick: {pid, host, started, age}, or None if it never ticked."""
+    hb = p.state / "heartbeat"
+    try:
+        info = json.loads(hb.read_text())
+        info["age"] = max(0.0, time.time() - hb.stat().st_mtime)
+        return info
+    except (OSError, ValueError, TypeError):
         return None
 
 

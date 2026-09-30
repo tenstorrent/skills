@@ -16,6 +16,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from .project import Project
@@ -88,7 +89,7 @@ def _install_launchd(p: Project) -> str:
     p.logs.mkdir(parents=True, exist_ok=True)
     job = {"Label": label, "ProgramArguments": daemon_argv(p), "WorkingDirectory": str(p.base),
            "EnvironmentVariables": _env(p), "RunAtLoad": True, "KeepAlive": True, "ProcessType": "Background",
-           "ThrottleInterval": 10, "StandardOutPath": str(p.logs / "launchd.log"),
+           "ThrottleInterval": 10, "AbandonProcessGroup": True, "StandardOutPath": str(p.logs / "launchd.log"),
            "StandardErrorPath": str(p.logs / "launchd.log")}
     with open(plist, "wb") as f:
         plistlib.dump(job, f)
@@ -107,16 +108,20 @@ def _install_cron(p: Project) -> str:
     cur = _run("crontab", "-l").stdout if shutil.which("crontab") else ""
     tag = f"{CRON_TAG}{p.base}"
     keep = [ln for ln in cur.splitlines() if tag not in ln]
-    env = " ".join(f"{k}={shlex.quote(v)}" for k, v in _env(p).items())
-    cmd = f"cd {shlex.quote(str(p.base))} && {env} {' '.join(shlex.quote(a) for a in daemon_argv(p))} " \
-          f">> {shlex.quote(str(p.logs / 'daemon.out'))} 2>&1"
+    cmd = _cron_cmd(p)
     keep += [f"@reboot {cmd} {tag}", f"*/5 * * * * {cmd} {tag}"]
     r = subprocess.run(["crontab", "-"], input="\n".join(keep) + "\n", text=True, capture_output=True)
     if r.returncode != 0:
         return "crontab install failed: " + r.stderr.strip()[:200]
-    # The daemon refuses to start twice (pid file), so the 5-minute entry is a no-op while it runs.
+    # The daemon refuses to start twice (lock file), so the 5-minute entry is a no-op while it runs.
     subprocess.Popen(["sh", "-c", cmd], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return "crontab watchdog"
+
+
+def _cron_cmd(p: Project) -> str:
+    env = " ".join(f"{k}={shlex.quote(v)}" for k, v in _env(p).items())
+    return f"cd {shlex.quote(str(p.base))} && {env} {' '.join(shlex.quote(a) for a in daemon_argv(p))} " \
+           f">> {shlex.quote(str(p.logs / 'daemon.out'))} 2>&1"
 
 
 def uninstall(p: Project) -> str:
@@ -142,7 +147,8 @@ def uninstall(p: Project) -> str:
     return ", ".join(done) or "nothing installed"
 
 
-def restart(p: Project) -> str:
+def restart_service(p: Project) -> str:
+    """Restart the daemon process. Running workers are not touched: the new daemon adopts them."""
     if sys.platform == "darwin":
         label = f"com.tt-project.{unit_name(p)}"
         r = _run("launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}")
@@ -151,10 +157,69 @@ def restart(p: Project) -> str:
     if unit.exists():
         r = _run("systemctl", "--user", "restart", unit.name)
         return "restarted" if r.returncode == 0 else r.stderr.strip()[:200]
-    pid = (p.state / "daemon.pid")
-    if pid.exists():
+    from .daemon import _alive, _read_pid
+    pid = _read_pid(p.state / "daemon.pid")
+    if pid:
         try:
-            os.kill(int(pid.read_text()), 15)
-        except (OSError, ValueError):
+            os.kill(pid, 15)
+        except OSError:
             pass
-    return "stopped; the crontab watchdog restarts it within 5 minutes"
+        deadline = time.time() + 30
+        while time.time() < deadline and _alive(pid):
+            time.sleep(0.5)
+    p.logs.mkdir(parents=True, exist_ok=True)
+    subprocess.Popen(["sh", "-c", _cron_cmd(p)], start_new_session=True, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL)
+    return "restarted"
+
+
+def _git(h: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", "-C", str(h), "-c", "user.name=tt-project", "-c", "user.email=tt-project@localhost",
+                           *args], capture_output=True, text=True, timeout=120)
+
+
+def wait_for_heartbeat(p: Project, since: float, wait_s: float) -> bool:
+    """True once a daemon started after `since` has completed a tick."""
+    from .daemon import heartbeat
+    deadline = time.time() + wait_s
+    while True:
+        hb = heartbeat(p)
+        if hb and float(hb.get("started") or 0) >= since:
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(1)
+
+
+def restart(p: Project, wait_s: float = 60, restart_fn=None) -> str:
+    """Restart the daemon and confirm it ticks. If it does not, and the harness runtime changed
+    since the commit a daemon last ran well on, put runtime/ back to that commit as a new commit
+    (history, charter, memory and prompts untouched), restart again and alert."""
+    restart_fn = restart_fn or restart_service
+    t0 = time.time()
+    msg = restart_fn(p)
+    if wait_for_heartbeat(p, t0, wait_s):
+        return f"{msg}; the daemon is running"
+    h = p.harness
+    good = (p.db.kv("harness_good") or {}).get("commit")
+    changed = _git(h, "log", "--format=%h %s", f"{good}..HEAD", "--", "runtime").stdout.strip() if good else ""
+    dirty = _git(h, "status", "--porcelain", "--", "runtime").stdout.strip() if good else ""
+    if not changed and not dirty:
+        return (f"{msg}; but the daemon did not report within {wait_s:.0f}s. Check `ttp logs {p.name}`"
+                + ("" if good else " (no known-good harness commit to fall back to)"))
+    if dirty:
+        _git(h, "add", "-A", "--", "runtime")
+        _git(h, "commit", "-q", "-m", "runtime edits in place when the daemon failed to start")
+        changed = _git(h, "log", "--format=%h %s", f"{good}..HEAD", "--", "runtime").stdout.strip()
+    if _git(h, "restore", f"--source={good}", "--staged", "--worktree", "--", "runtime").returncode != 0:
+        _git(h, "checkout", good, "--", "runtime")    # git older than 2.23
+    _git(h, "commit", "-q", "-m", f"roll back runtime to {good[:10]}: the daemon did not start with it")
+    t1 = time.time()
+    restart_fn(p)
+    back = wait_for_heartbeat(p, t1, wait_s)
+    commits = "; ".join(changed.splitlines()[:10])
+    text = (f"The daemon did not start after a runtime change, so the harness runtime was rolled back to "
+            f"{good[:10]}, the last version that ran (a new commit; nothing was deleted). Rolled back: {commits}. "
+            + ("The daemon is running again." if back else f"It still does not start: check `ttp logs {p.name}`."))
+    p.db.post("out", text, chat=None, kind="alert", severity="high")
+    return text

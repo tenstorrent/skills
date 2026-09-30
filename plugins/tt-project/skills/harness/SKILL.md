@@ -43,11 +43,15 @@ description: "Improve a tt-project's own harness — its coordinator and worker 
 - One friction, one small commit, a one-line reason in the message.
 - NEVER loosen a restriction, cap or notification policy without the user.
 - Runtime edits: keep Python 3.9-compatible; run `python3 -m pytest -q runtime/tests` if present;
-  then `ttp restart <name>`.
+  then `ttp restart <name>`. It waits for the daemon to tick; if it does not, `runtime/` goes back
+  to the last version that ran (a new commit) and the user is alerted.
 - Measure after: same evidence, a day later. Revert what did not help.
 - A lesson every project would benefit from → a follow-up titled `upstream: …`.
 
 ## Template updates
 
-- `ttp upgrade <name>` merges the installed tt-project template into this harness.
-- Conflicts: keep this project's intent, take upstream fixes. Commit the merge.
+- `ttp upgrade <name>` merges the installed tt-project template in a scratch worktree, checks the
+  runtime compiles and imports, then fast-forwards this harness. Otherwise the harness is left
+  as it was and a harness task is queued to finish the merge.
+- Conflicts: keep this project's intent, take upstream fixes. Resolve them in a scratch worktree,
+  never in the live harness.

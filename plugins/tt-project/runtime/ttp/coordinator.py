@@ -16,6 +16,7 @@ from typing import Any
 from . import schedule as sched
 from .db import SEVERITY_RANK, TERMINAL_TASK_STATES, dependency_ids, load_result
 from .project import Project
+from .runner import stop_runs
 
 ACTION_TYPES = ("reply", "task_add", "task_update", "ask_user", "resolve", "notify", "memory_add",
                 "charter_update", "schedule_set", "config_set", "noop")
@@ -233,9 +234,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None) -> l
                             with open(Path(r["dir"], "steer.md"), "a") as f:
                                 f.write(f"\n## Update {stamp}\n{a['spec'].strip()}\n")
                 if upd.get("status") == "cancelled":
-                    for r in db.q("SELECT dir FROM runs WHERE task=? AND status='running'", (task["id"],)):
-                        if r["dir"]:
-                            Path(r["dir"], "STOP").touch()
+                    stop_runs(db, p.runs, task["id"])
             elif t == "ask_user":
                 rec = (a.get("recommendation") or "").strip()
                 hours = ask_timeout_h(cfg)

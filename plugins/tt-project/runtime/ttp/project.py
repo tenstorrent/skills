@@ -59,6 +59,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "jev": {"enabled": "auto"},
     "web": {"bind": "127.0.0.1", "port": 0},
     "power": {"keep_awake": "on_ac"},
+    # Below min_free_gb under the project folder no new worker starts. Worktrees of finished tasks
+    # are removed after worktree_retention_days, only when clean and pushed or merged (0 = never).
+    "disk": {"min_free_gb": 2, "worktree_retention_days": 7},
     "screen": {"wake_min_severity": "normal"},
 }
 

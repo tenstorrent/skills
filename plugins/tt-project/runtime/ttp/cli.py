@@ -424,12 +424,9 @@ def _listen_loop(p: Project, db, a, after: int, floor: str) -> None:
 
 def status_text(p: Project) -> str:
     db = p.db
-    d = db.kv("daemon", {})
-    from .daemon import _alive
-    alive = bool(d.get("pid")) and d.get("host") == hostname() and _alive(int(d["pid"]))
     gates = db.kv("gates", {})
     counts = {r["status"]: r["n"] for r in db.q("SELECT status, COUNT(*) n FROM tasks GROUP BY status")}
-    head = f"{p.name}: daemon {'running' if alive else 'NOT RUNNING'}" + (" (paused)" if db.kv("paused") else "")
+    head = f"{p.name}: daemon {daemon_state(p)}" + (" (paused)" if db.kv("paused") else "")
     head += " · tasks: " + (", ".join(f"{k} {v}" for k, v in sorted(counts.items())) if counts else "none yet")
     lines = [head]
     for prov, g in gates.items():
@@ -437,10 +434,26 @@ def status_text(p: Project) -> str:
     for t in db.q("SELECT id,title,status,blocked_reason FROM tasks WHERE status IN ('running','blocked','review') "
                   "ORDER BY status, id LIMIT 12"):
         lines.append(f"  #{t['id']} {t['status']}: {t['title']}" + (f" — {t['blocked_reason']}" if t["blocked_reason"] else ""))
+    disk = db.kv("disk_low")
+    if disk:
+        lines.append(f"disk: only {disk['free_gb']} GB free under {disk['path']}; no new worker runs start")
     for m in db.q("SELECT text FROM messages WHERE kind='ask' AND handled=0 AND ts>? ORDER BY id DESC LIMIT 5",
                   (time.time() - 14 * 86400,)):
         lines.append(f"  needs you: {m['text'][:200]}")
     return "\n".join(lines)
+
+
+def daemon_state(p: Project) -> str:
+    """'running', or NOT RUNNING with why: its process is gone, or it stopped completing ticks."""
+    from .daemon import HEARTBEAT_STALE_S, _alive, heartbeat
+    d = p.db.kv("daemon", {})
+    alive = bool(d.get("pid")) and d.get("host") == hostname() and _alive(int(d["pid"]))
+    hb = heartbeat(p)
+    if not alive:
+        return "NOT RUNNING"
+    if hb and int(hb.get("pid") or 0) == int(d["pid"]) and hb["age"] > HEARTBEAT_STALE_S:
+        return f"NOT RUNNING (process {d['pid']} is up but stuck: no completed tick for {int(hb['age'] // 60)} min)"
+    return "running"
 
 
 def cmd_status(a) -> None:
@@ -580,8 +593,12 @@ def cmd_task(a) -> None:
         for t in p.db.q("SELECT id,status,tier,title FROM tasks ORDER BY id DESC LIMIT 50"):
             print(f"#{t['id']}\t{t['status']}\t{t['tier']}\t{t['title']}")
     elif a.action == "cancel":
-        p.db.update_task(int(a.title), status="cancelled")
-        print("cancelled")
+        from .runner import stop_runs
+        tid = int(a.title)
+        p.db.update_task(tid, status="cancelled")
+        runs = stop_runs(p.db, p.runs, tid)
+        print("cancelled" + (f"; ending its running run{'s' if len(runs) > 1 else ''} "
+                             f"{', '.join(map(str, runs))}" if runs else ""))
 
 
 def cmd_memory(a) -> None:
@@ -608,8 +625,41 @@ def cmd_service(a) -> None:
                 os.kill(int(pid.read_text()), 15)
             except (OSError, ValueError):
                 pass
+        print(stop_workers(p, a.kill))
     else:
         print(service.restart(p))
+
+
+def stop_workers(p: Project, kill: bool, wait_s: float = 60) -> str:
+    """Without kill, running workers finish on their own and the next start records their results.
+    With kill, they end now (TERM, then KILL); their tasks go back to the queue and resume later."""
+    from .runner import stop_runs
+    running = p.db.q("SELECT id FROM runs WHERE status='running'")
+    if not running:
+        return "no runs in progress"
+    if not kill:
+        return (f"{len(running)} run(s) in progress keep going; the next start records their results. "
+                f"`ttp stop {p.name} --kill` ends them.")
+    ids = stop_runs(p.db, p.runs, why="shutdown")
+    deadline = time.time() + wait_s
+    left = list(ids)
+    while left and time.time() < deadline:
+        time.sleep(1)
+        left = [i for i in left if _run_dir_alive(p, i)]
+    if left:
+        return f"ending {len(ids)} run(s); still ending: {', '.join(map(str, left))}"
+    return f"ended {len(ids)} run(s); their tasks resume on the next start"
+
+
+def _run_dir_alive(p: Project, run_id: int) -> bool:
+    row = p.db.one("SELECT dir FROM runs WHERE id=?", (run_id,))
+    d = Path(row["dir"]) if row and row["dir"] else p.runs / str(run_id)
+    if (d / "exit.json").exists():
+        return False
+    try:
+        return time.time() - (d / "lease").stat().st_mtime <= 180
+    except OSError:
+        return False
 
 
 def cmd_config(a) -> None:
@@ -719,14 +769,61 @@ def cmd_upgrade(a) -> None:
             _git(tmp, *ident, "commit", "-q", "-m", f"tt-project template {ver}")
     finally:
         _git(h, "worktree", "remove", "--force", str(tmp))
-    r = subprocess.run(["git", "-C", str(h), *ident, "merge", "--no-edit", "upstream"], capture_output=True, text=True)
-    if r.returncode != 0:
-        print("merge has conflicts; resolve them in", h, "(keep this project's intent, take upstream fixes)")
-        print(r.stdout[-1500:])
+    merged, problem = _merge_upstream(h, p.state / "upgrade-merge", ident)
+    if problem:
+        tid = p.db.add_task(
+            "Finish the tt-project template upgrade", _UPGRADE_TASK.format(problem=problem, name=p.name),
+            kind="harness", tier="standard", priority=2, origin="user")
+        print(f"upgrade not applied; the running harness is unchanged. {problem}\nQueued harness task #{tid} to "
+              f"finish it.")
         sys.exit(1)
+    r = subprocess.run(["git", "-C", str(h), *ident, "merge", "--ff-only", merged], capture_output=True, text=True)
+    if r.returncode != 0:   # the daemon committed charter or memory meanwhile: those touch other files
+        r = subprocess.run(["git", "-C", str(h), *ident, "merge", "--no-edit", merged], capture_output=True, text=True)
+        if r.returncode != 0:
+            subprocess.run(["git", "-C", str(h), "merge", "--abort"], capture_output=True)
+            die(f"could not apply the checked upgrade to {h}: {r.stdout[-500:]}", 1)
     print("harness up to date with the installed template; restarting the daemon")
     from . import service
     print(service.restart(p))
+
+
+_UPGRADE_TASK = """`ttp upgrade` could not apply the new tt-project template on its own: {problem}
+
+The live harness was left untouched. In this harness repo:
+1. `git worktree add --detach <tmp> main`, then in <tmp>: `git merge upstream`.
+2. Resolve each conflict keeping this project's intent and taking upstream's fixes.
+3. Check in <tmp>: `python3 -m compileall -q runtime` and `PYTHONPATH=runtime python3 -c "import ttp.daemon, ttp.cli"`.
+4. Commit, then in the harness: `git merge --ff-only <commit>`; remove <tmp>.
+5. `ttp restart {name}` (it rolls the runtime back if the daemon does not start).
+"""
+
+
+def _merge_upstream(h: Path, tmp: Path, ident: list[str]) -> tuple[str, str]:
+    """Merge `upstream` into a scratch worktree of main and check the result compiles and imports.
+    Returns (merge commit, "") or ("", what went wrong); the live harness is never touched here."""
+    subprocess.run(["git", "-C", str(h), "worktree", "remove", "--force", str(tmp)], capture_output=True)
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    subprocess.run(["git", "-C", str(h), "worktree", "prune"], capture_output=True)
+    _git(h, "worktree", "add", "-q", "--detach", str(tmp), "main")
+    try:
+        r = subprocess.run(["git", "-C", str(tmp), *ident, "merge", "--no-edit", "upstream"], capture_output=True,
+                           text=True)
+        if r.returncode != 0:
+            files = subprocess.run(["git", "-C", str(tmp), "diff", "--name-only", "--diff-filter=U"],
+                                   capture_output=True, text=True).stdout.split()
+            return "", ("the merge conflicts in " + ", ".join(files) if files else
+                        "the merge failed: " + (r.stderr or r.stdout).strip()[-400:])
+        env = {**os.environ, "PYTHONPATH": str(tmp / "runtime")}
+        for check in ([sys.executable, "-m", "compileall", "-q", "runtime"],
+                      [sys.executable, "-c", "import ttp.daemon, ttp.cli"]):
+            c = subprocess.run(check, cwd=str(tmp), env=env, capture_output=True, text=True, timeout=300)
+            if c.returncode != 0:
+                return "", f"the merged runtime fails `{' '.join(check[1:])}`: " + (c.stderr or c.stdout).strip()[-400:]
+        return _git(tmp, "rev-parse", "HEAD"), ""
+    finally:
+        subprocess.run(["git", "-C", str(h), "worktree", "remove", "--force", str(tmp)], capture_output=True)
 
 
 def cmd_alerts(a) -> None:
@@ -864,8 +961,10 @@ def main(argv: list[str] | None = None) -> None:
         s.add_argument("name")
         s.set_defaults(fn=cmd_pause)
     for name in ("start", "stop", "restart"):
-        s = sub.add_parser(name, help=f"{name} the project's daemon service")
+        s = sub.add_parser(name, help=f"{name} the project's daemon service (running workers are kept)")
         s.add_argument("name")
+        if name == "stop":
+            s.add_argument("--kill", action="store_true", help="also end running workers; their tasks resume on start")
         s.set_defaults(fn=cmd_service)
 
     s = sub.add_parser("config", help="read or set a config key (dotted)")

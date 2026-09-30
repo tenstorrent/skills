@@ -88,13 +88,28 @@ function board(st) {
     (items.slice(0, 6).map((x) => `<div class="item">${esc(x).slice(0, 160)}</div>`).join("") || `<div class="item muted">—</div>`) + `</div>`).join("");
 }
 
+function banner(html) {
+  $("#banner").innerHTML = html;
+  $("#banner").hidden = !html;
+}
+
 async function refresh() {
   let st;
-  try { st = await api("/api/state"); } catch (e) { return; }
+  try { st = await api("/api/state"); } catch (e) {
+    // The page keeps its last data; say so rather than let it look current.
+    banner(`Cannot reach the daemon (${esc(e.message || e)}). What you see may be out of date. Check <code>ttp status</code>.`);
+    $("#daemon").textContent = "unreachable"; $("#daemon").className = "pill lv-red";
+    return;
+  }
   const cfg = st.project.config || {};
+  const hb = st.heartbeat;
+  const stuck = hb && hb.age > st.heartbeat_stale_s;
+  const disk = st.disk_low;
+  banner([stuck ? `The daemon has not completed a tick for ${Math.round(hb.age / 60)} min: nothing new starts. Try <code>ttp restart ${esc(st.project.name)}</code>.` : "",
+          disk ? `Only ${disk.free_gb} GB free under ${esc(disk.path)}: no new worker runs start until space is freed.` : ""].filter(Boolean).join("<br>"));
   $("#pname").textContent = st.project.name;
-  $("#daemon").textContent = st.paused ? "paused" : (st.daemon && st.daemon.pid ? `running on ${st.daemon.host}` : "stopped");
-  $("#daemon").className = "pill " + (st.paused ? "lv-orange" : "lv-green");
+  $("#daemon").textContent = st.paused ? "paused" : stuck ? "stuck" : (st.daemon && st.daemon.pid ? `running on ${st.daemon.host}` : "stopped");
+  $("#daemon").className = "pill " + (stuck ? "lv-red" : st.paused ? "lv-orange" : "lv-green");
   announce(st.attention || [], st.project.name);
   document.title = `${unseen ? "(" + unseen + ") " : ""}${st.project.name} · tt-project`;
   board(st);
