@@ -46,7 +46,10 @@ description: "Improve a tt-project's own harness — its coordinator and worker 
   then `ttp restart <name>`. It waits for the daemon to tick; if it does not, `runtime/` goes back
   to the last version that ran (a new commit) and the user is alerted.
 - Measure after: same evidence, a day later. Revert what did not help.
-- A lesson every project would benefit from → a follow-up titled `upstream: …`.
+- Change only this project's own harness. Never edit, or create a worktree or branch in, the
+  tt-project plugin's source repository or another project's harness.
+- A lesson every project would benefit from → an upstream note in the hand-off: a follow-up
+  titled `upstream: …`.
 
 ## Template updates
 

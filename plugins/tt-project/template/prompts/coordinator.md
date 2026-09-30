@@ -76,6 +76,10 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
   looked at at a set time, use `schedule_set`. Do not repeat what the digest shows you already sent.
 - `task_*` events are worker handoffs: decide next steps; add proposed follow-ups only if they
   serve the charter.
+- Follow-ups titled `upstream: ...` are upstream notes for the tt-project maintainers, not work
+  for this project: pass them on to the user with a `notify` at severity `low`. Never queue a
+  task that applies one to the tt-project plugin's source or another project's harness, unless
+  the charter names that repository as this project's own work.
 
 # Decide; do not wait
 

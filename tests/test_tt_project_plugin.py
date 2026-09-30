@@ -90,3 +90,17 @@ def test_launchers_are_executable():
     for launcher in (PLUGIN / "bin" / "ttp", PLUGIN / "template" / "bin" / "ttp"):
         assert os.access(launcher, os.X_OK), f"{launcher} is not executable"
     assert (PLUGIN / "bin" / "ttp").read_text() == (PLUGIN / "template" / "bin" / "ttp").read_text()
+
+
+def test_harness_tasks_stay_in_their_own_harness():
+    """A harness task never edits the plugin's source or another project's harness; generic lessons
+    travel as upstream notes in the hand-off instead."""
+    prompts = PLUGIN / "template" / "prompts"
+    for path in (prompts / "kind-harness.md", prompts / "worker.md", SKILLS / "tt-project-harness" / "SKILL.md"):
+        text = " ".join(path.read_text(encoding="utf-8").split())
+        assert "only this project's own harness" in text, f"{path.name}: harness tasks stay in their own harness"
+        assert re.search(r"[Nn]ever edit[s]?, or (create|make)s? a worktree or branch in, the tt-project "
+                         r"plugin's source repository or (any other|another) project's harness", text), path.name
+        assert "upstream note" in text and "`upstream: " in text, f"{path.name}: names the upstream notes"
+    coordinator = " ".join((prompts / "coordinator.md").read_text(encoding="utf-8").split())
+    assert "upstream notes for the tt-project maintainers, not work for this project" in coordinator
