@@ -20,6 +20,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -179,6 +180,21 @@ class Daemon:
         self.deliver_outbound()
 
     # runs -----------------------------------------------------------------------------------------
+    def _approved_mcp(self, prov, provider: str, cwd: str) -> dict:
+        """The project's allowlisted MCP servers (`providers.<p>.mcp_servers`) for an isolated run,
+        looked up for the worktree and the project root."""
+        names = coord.name_list(self.cfg["providers"].get(provider, {}).get("mcp_servers") or [])
+        if not names:
+            return {}
+        dirs = list(dict.fromkeys(str(d) for d in (cwd, Path(cwd).resolve(), self.p.root, self.p.root.resolve())))
+        found, unknown = prov.mcp_servers(names, dirs)
+        if unknown:
+            self.alert(f"mcp_servers_unknown:{provider}",
+                       f"Workers run without these MCP servers, which your {provider} config does not define: "
+                       f"{', '.join(unknown)}. Fix providers.{provider}.mcp_servers in project.json.",
+                       severity="low", every_s=86400)
+        return found
+
     def start_run(self, role: str, prompt: str, provider: str, tier: str, cwd: str, *, task: dict | None = None,
                   budget_usd: float | None = None, timeout_s: float | None = None, read_only: bool = False,
                   schema: dict | None = None, system: str | None = None, append_system: str | None = None,
@@ -193,6 +209,8 @@ class Daemon:
             cwd = scratch_dir(str(self.p.base))
         argv, env = prov.build(role=role, model=model, effort=effort, cwd=cwd, budget_usd=budget_usd,
                                read_only=read_only, schema=schema, restrictions=restrictions)
+        mcp_servers: dict = {}
+        private: list[str] = []   # files that may hold credentials, removed when the run ends
         if not read_only:
             # Skill plugins this project enabled for its workers only (never the user's own setup).
             dirs = [str(Path(os.path.expanduser(d))) for d in
@@ -207,6 +225,7 @@ class Daemon:
             extra = prov.writable_args(roots) + prov.plugin_args([d for d in dirs if d not in missing])
             if self.cfg["providers"].get(provider, {}).get("worker_isolation"):
                 extra += prov.isolation_args()
+                mcp_servers = self._approved_mcp(prov, provider, cwd)
             # A trailing "-" (prompt on stdin) stays the last argument.
             argv = argv[:-1] + extra + ["-"] if argv[-1:] == ["-"] else argv + extra
         db = self.p.db
@@ -218,6 +237,13 @@ class Daemon:
         # Raising from here on means nothing was launched: the run row must not stay "running".
         try:
             run_dir.mkdir(parents=True, exist_ok=True)
+            if mcp_servers:
+                # Outside the repo and the run directory, owner-only: server entries can carry tokens.
+                fd, mcp_path = tempfile.mkstemp(prefix=f"ttp-mcp-{run_id}-", suffix=".json")
+                private.append(mcp_path)
+                with os.fdopen(fd, "w") as f:
+                    json.dump({"mcpServers": mcp_servers}, f)
+                argv = prov.with_mcp_config(argv, Path(mcp_path))
             if system is not None:
                 (run_dir / "system.md").write_text(system)
                 if provider == "claude":
@@ -246,7 +272,8 @@ class Daemon:
                     "exclusive": [{"resource": res, "paths": [str(x) for x in self._slot_paths(res)],
                                    "reserve": str(locks.reserve_path(self.p.state / "locks", res))}
                                   for res in _exclusive(task)] if task else [],
-                    "exclusive_wait_s": self.cfg["budget"].get("exclusive_wait_s", 600)}
+                    "exclusive_wait_s": self.cfg["budget"].get("exclusive_wait_s", 600),
+                    "private_files": private}
             (run_dir / "run.json").write_text(json.dumps(spec, indent=1))
             with open(run_dir / "runner.log", "wb") as out:
                 proc = subprocess.Popen([sys.executable, "-m", "ttp.runner", str(run_dir)], cwd=runtime_dir,
@@ -254,6 +281,7 @@ class Daemon:
                                         stdin=subprocess.DEVNULL, start_new_session=True)
         except BaseException:
             db.x("UPDATE runs SET status='failed', ended=? WHERE id=?", (time.time(), run_id))
+            runner.remove_files(private)
             raise
         try:
             db.x("UPDATE runs SET pid=?, dir=? WHERE id=?", (proc.pid, str(run_dir), run_id))
@@ -478,6 +506,7 @@ class Daemon:
     def finish_run(self, r: dict, exit_info: dict) -> None:
         db, p = self.p.db, self.p
         run_dir = self._run_dir(r)
+        runner.remove_private(run_dir)   # the runner removes them too, unless it died first
         prov = get_provider(r["provider"]).use(r["model"] or "", (self.cfg.get("pricing") or {}).get(r["provider"]))
         usage = prov.parse(run_dir / "output.jsonl", run_dir / "stderr.log")
         self._priced(r, usage)

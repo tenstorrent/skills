@@ -101,6 +101,15 @@ class Provider:
         worker (the project's approved plugins and the harness hook still load); [] if unsupported."""
         return []
 
+    def mcp_servers(self, names: list[str], dirs: list[str]) -> tuple[dict, list[str]]:
+        """The named MCP server definitions from the user's own agent config, looked up for the
+        directories `dirs`, and the names not found. They may hold secrets: never log them."""
+        return {}, list(names)
+
+    def with_mcp_config(self, argv: list[str], path: Path) -> list[str]:
+        """`argv` that also loads the MCP servers in the config file `path`; unchanged if unsupported."""
+        return argv
+
     def writable_args(self, dirs: list[str]) -> list[str]:
         """Arguments that let a sandboxed worker also write `dirs` (run dir, project state, git
         metadata); [] when the agent has no write sandbox."""

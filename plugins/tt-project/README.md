@@ -94,9 +94,15 @@ and preferences you add later become part of the project's charter and memory.
   can be enabled for the project's workers only (`providers.claude.plugin_dirs`).
 - On Claude, the part of a worker's prompt that is the same for every task of its kind (rules,
   charter, memory) goes in the system prompt, so the next worker reads it from the cache.
-- `providers.claude.worker_isolation: true` (off by default) starts Claude workers without your
-  own MCP servers, plugins, hooks and user settings; the project's `plugin_dirs` and its hook still
+- `providers.claude.worker_isolation: true` starts Claude workers and reviewers without your own
+  MCP servers, plugins, hooks and user settings; the project's `plugin_dirs` and its hook still
   load. In one measurement it cut a worker's first turn from about 38k to 23k input tokens.
+  `ttp new` turns it on; projects created earlier keep it off until you set it.
+- `providers.claude.mcp_servers: ["name", ...]` lists the MCP servers isolated workers still get.
+  Each run copies just those entries from your Claude config (local, then `.mcp.json`, then user
+  scope) into its own owner-only file in the temp directory, and deletes it when the run ends.
+  Listing a server approves it for workers. A name your config does not define is skipped: the
+  run still starts, and `ttp doctor` and a low alert name it.
 
 ## Where things live
 

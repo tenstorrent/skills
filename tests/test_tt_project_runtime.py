@@ -9,9 +9,11 @@ import os
 import pathlib
 import signal
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
+import types
 import time
 import urllib.error
 import urllib.request
@@ -1026,7 +1028,7 @@ def test_charter_restrictions_lead_and_close_every_worker_prompt(env):
     assert "Draft PRs." in system
 
 
-def _dispatch_claude_worker(p, monkeypatch, flags):
+def _dispatch_claude_worker(p, monkeypatch, flags, kind="work"):
     from ttp import daemon as dmod
     from ttp.providers import claude
 
@@ -1039,7 +1041,7 @@ def _dispatch_claude_worker(p, monkeypatch, flags):
     monkeypatch.setattr(dmod.subprocess, "Popen",
                         lambda argv, *a, **k: Proc() if "ttp.runner" in argv else real(argv, *a, **k))
     p.set_config("core_provider", "claude")
-    tid = p.db.add_task("tidy docs", "TASK-SPEC-MARKER", kind="work", tier="light", origin="user")
+    tid = p.db.add_task("tidy docs", "TASK-SPEC-MARKER", kind=kind, tier="light", origin="user")
     dmod.Daemon(p.base).dispatch()
     run = p.db.one("SELECT dir FROM runs WHERE task=?", (tid,))
     assert run, p.db.task(tid)["blocked_reason"]
@@ -1077,13 +1079,19 @@ def test_workers_read_one_prompt_when_the_cli_cannot_append_a_system_prompt(env,
     assert "Go fast." not in prompt and prompt.rstrip().endswith("Never merge to main.")
 
 
-def test_worker_isolation_is_opt_in_and_keeps_the_hook_and_approved_plugins(env, monkeypatch, tmp_path):
+def test_worker_isolation_is_on_for_new_projects_only_and_keeps_the_hook_and_approved_plugins(
+        env, monkeypatch, tmp_path):
     p = make(env)
+    assert p.config()["providers"]["claude"]["worker_isolation"] is True, "ttp new must turn isolation on"
+    raw = json.loads(p.config_path.read_text())   # a project created before the option existed
+    del raw["providers"]["claude"]["worker_isolation"]
+    p.config_path.write_text(json.dumps(raw))
     plug = tmp_path / "plugin"
     plug.mkdir()
     p.set_config("providers.claude.plugin_dirs", [str(plug)])
     argv, _, _ = _dispatch_claude_worker(p, monkeypatch, {})
-    assert "--strict-mcp-config" not in argv and "--setting-sources" not in argv, "isolation must be opt-in"
+    assert "--strict-mcp-config" not in argv and "--setting-sources" not in argv, \
+        "an existing project must keep isolation off"
     from ttp import coordinator as coord
     assert coord.apply(p, [{"type": "config_set", "key": "providers.claude.worker_isolation",
                             "value": "true"}]) == []
@@ -1092,6 +1100,84 @@ def test_worker_isolation_is_opt_in_and_keeps_the_hook_and_approved_plugins(env,
     assert argv[argv.index("--setting-sources") + 1] == "project,local", "user settings must be left out"
     assert "ttp.hook" in argv[argv.index("--settings") + 1], "the harness hook no longer loads"
     assert argv[argv.index("--plugin-dir") + 1] == str(plug), "approved plugins no longer load"
+
+
+def _claude_mcp_config(tmp_path, monkeypatch, p):
+    cfg_dir = tmp_path / "claude-config"
+    cfg_dir.mkdir()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg_dir))
+    (cfg_dir / ".claude.json").write_text(json.dumps({
+        "mcpServers": {"docs": {"type": "stdio", "command": "docs-mcp", "env": {"TOKEN": "user-scope"}},
+                       "other": {"type": "http", "url": "http://127.0.0.1:1/mcp"}},
+        "projects": {str(p.root): {"mcpServers": {"docs": {"type": "stdio", "command": "docs-mcp",
+                                                           "env": {"TOKEN": "local-scope"}}}}}}))
+    (p.root / ".mcp.json").write_text(json.dumps({"mcpServers": {"shared": {"type": "stdio", "command": "x"}}}))
+
+
+def test_isolated_workers_get_only_the_listed_mcp_servers_in_a_private_file(env, monkeypatch, tmp_path):
+    p = make(env)
+    _claude_mcp_config(tmp_path, monkeypatch, p)
+    argv, run_dir, _ = _dispatch_claude_worker(p, monkeypatch, {})
+    assert "--strict-mcp-config" in argv and "--mcp-config" not in argv, "no list: no MCP servers at all"
+
+    from ttp import coordinator as coord
+    assert coord.apply(p, [{"type": "config_set", "key": "providers.claude.mcp_servers", "value": "docs"}]) == []
+    argv, run_dir, _ = _dispatch_claude_worker(p, monkeypatch, {})
+    i = argv.index("--mcp-config")
+    path = pathlib.Path(argv[i + 1])
+    assert argv[i + 2].startswith("--"), "--mcp-config takes several values: a flag must follow it"
+    assert json.loads(path.read_text()) == {"mcpServers": {"docs": {"type": "stdio", "command": "docs-mcp",
+                                                                     "env": {"TOKEN": "local-scope"}}}}
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert p.root not in path.parents and run_dir not in path.parents, "the config must stay outside the repo"
+    assert "local-scope" not in (run_dir / "run.json").read_text(), "server entries must never be logged"
+    assert json.loads((run_dir / "run.json").read_text())["private_files"] == [str(path)]
+    from ttp import runner
+    runner.remove_private(run_dir)
+    assert not path.exists()
+
+
+def test_reviewers_get_the_same_mcp_allowlist(env, monkeypatch, tmp_path):
+    p = make(env)
+    _claude_mcp_config(tmp_path, monkeypatch, p)
+    p.set_config("providers.claude.mcp_servers", ["shared"])
+    argv, run_dir, _ = _dispatch_claude_worker(p, monkeypatch, {}, kind="review")
+    assert p.db.one("SELECT role FROM runs WHERE dir=?", (str(run_dir),))["role"] == "reviewer"
+    assert "--strict-mcp-config" in argv
+    path = pathlib.Path(argv[argv.index("--mcp-config") + 1])
+    assert list(json.loads(path.read_text())["mcpServers"]) == ["shared"]
+    path.unlink()
+
+
+def test_an_unknown_mcp_server_is_named_and_the_run_still_starts(env, monkeypatch, tmp_path, capsys):
+    p = make(env)
+    _claude_mcp_config(tmp_path, monkeypatch, p)
+    p.set_config("providers.claude.mcp_servers", ["missing-one"])
+    argv, _, _ = _dispatch_claude_worker(p, monkeypatch, {})
+    assert "--strict-mcp-config" in argv and "--mcp-config" not in argv
+    alert = p.db.one("SELECT text, severity FROM messages WHERE ref='mcp_servers_unknown:claude'")
+    assert alert and "missing-one" in alert["text"] and alert["severity"] == "low"
+    from ttp import cli
+    monkeypatch.setattr(cli, "need", lambda *a: p)
+    cli.cmd_doctor(types.SimpleNamespace(name="demo"))
+    assert "not defined in your Claude config: missing-one" in capsys.readouterr().out
+    from ttp import coordinator as coord
+    assert coord.apply(p, [{"type": "config_set", "key": "providers.claude.mcp_servers",
+                            "value": "bad name!"}]), "a malformed name must be rejected"
+
+
+def test_the_runner_removes_private_files_when_the_agent_exits(env, tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "prompt.md").write_text("x")
+    secret = tmp_path / "mcp.json"
+    secret.write_text("{}")
+    (run_dir / "run.json").write_text(json.dumps({"argv": ["true"], "env": {}, "cwd": str(tmp_path),
+                                                  "timeout_s": 30, "provider": "fake",
+                                                  "private_files": [str(secret)]}))
+    subprocess.run([sys.executable, "-m", "ttp.runner", str(run_dir)], cwd=str(RUNTIME),
+                   env={**os.environ, "PYTHONPATH": str(RUNTIME)}, timeout=60)
+    assert (run_dir / "exit.json").exists() and not secret.exists()
 
 
 def test_charter_and_memory_changes_are_committed_alone(env):

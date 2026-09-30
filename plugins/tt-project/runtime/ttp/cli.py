@@ -238,7 +238,9 @@ def bootstrap(root: Path, name: str, brief: str, provider: str) -> Project:
     p.memory_index.write_text("# Memory index\n")
     cfg = {"name": name, "created": time.time(), "root": str(p.root), "host": hostname(),
            "core_provider": provider, "tt_project_version": __version__,
-           "id": pysecrets.token_hex(4)}
+           "id": pysecrets.token_hex(4),
+           # New projects only: DEFAULT_CONFIG keeps it off, so existing projects are unchanged.
+           "providers": {"claude": {"worker_isolation": True}}}
     sec = load_secrets()
     if (sec.get("slack") or {}).get("bot_token"):
         cfg["notify"] = {"slack": True}
@@ -1014,6 +1016,16 @@ def cmd_doctor(a) -> None:
             continue
         print(f"provider {prov.name}: {'found ' + prov.binary() if prov.available() else 'not installed'}"
               + (f" · account {prov.account()}" if prov.available() and prov.account() else ""))
+    claude_cfg = p.config()["providers"].get("claude", {})
+    from .coordinator import name_list
+    names = name_list(claude_cfg.get("mcp_servers") or [])
+    if names:
+        from .providers import get_provider
+        _, unknown = get_provider("claude").mcp_servers(names, [str(p.root), str(p.root.resolve())])
+        print(f"mcp servers for workers: {', '.join(names)}"
+              + (f" · not defined in your Claude config: {', '.join(unknown)}" if unknown else "")
+              + ("" if claude_cfg.get("worker_isolation") else " · unused: worker_isolation is off, "
+                 "so workers load all your servers"))
     sec = load_secrets()
     print(f"jev: {'key saved' if (sec.get('jev') or {}).get('key') else 'no key (rules-only screening)'}"
           f" · enabled in project: {p.config()['jev'].get('enabled')}")

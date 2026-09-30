@@ -95,6 +95,26 @@ class Claude(Provider):
         # Flag settings (the harness hook) and --plugin-dir load whatever the sources are.
         return ["--strict-mcp-config", "--setting-sources", "project,local"]
 
+    def mcp_servers(self, names: list[str], dirs: list[str]) -> tuple[dict, list[str]]:
+        # Claude Code's own scopes, most specific first: local (per directory, in the user's
+        # config), project (`.mcp.json`), user. `claude mcp get` has no machine-readable output.
+        user_cfg = _read_json(claude_config_path())
+        scopes = [((user_cfg.get("projects") or {}).get(d) or {}).get("mcpServers") for d in dirs]
+        scopes += [_read_json(Path(d) / ".mcp.json").get("mcpServers") for d in dirs]
+        scopes.append(user_cfg.get("mcpServers"))
+        found: dict = {}
+        for name in names:
+            for scope in scopes:
+                if isinstance(scope, dict) and isinstance(scope.get(name), dict):
+                    found[name] = scope[name]
+                    break
+        return found, [n for n in names if n not in found]
+
+    def with_mcp_config(self, argv: list[str], path: Path) -> list[str]:
+        # --mcp-config takes several values, so a flag must follow it, never a positional argument.
+        i = argv.index("--strict-mcp-config") if "--strict-mcp-config" in argv else len(argv)
+        return argv[:i] + ["--mcp-config", str(path)] + argv[i:]
+
     def plugin_args(self, dirs: list[str]) -> list[str]:
         out: list[str] = []
         for d in dirs:
@@ -174,6 +194,20 @@ class Claude(Provider):
         org = acct.get("organizationName") or ""
         bill = acct.get("billingType") or data.get("billingType") or ""
         return " | ".join(x for x in (who, org if org and who not in org else "", bill) if x)
+
+
+def claude_config_path() -> Path:
+    """Where Claude Code keeps user- and local-scope MCP servers."""
+    base = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(base).expanduser() / ".claude.json" if base else Path.home() / ".claude.json"
+
+
+def _read_json(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def hook_settings() -> dict:

@@ -99,6 +99,22 @@ def stop_reason(run_dir: Path) -> str | None:
     return "shutdown" if text == "shutdown" else "stopped"
 
 
+def remove_files(paths: list[str]) -> None:
+    for f in paths:
+        try:
+            os.unlink(f)
+        except FileNotFoundError:
+            pass
+
+
+def remove_private(run_dir: Path) -> None:
+    """Delete the run's private files (a per-run MCP config may carry credentials)."""
+    try:
+        remove_files(json.loads((run_dir / "run.json").read_text()).get("private_files") or [])
+    except (OSError, ValueError):
+        pass
+
+
 def supervise(run_dir: Path) -> int:
     spec = json.loads((run_dir / "run.json").read_text())
     argv, env_extra, cwd = spec["argv"], spec.get("env", {}), spec["cwd"]
@@ -111,6 +127,7 @@ def supervise(run_dir: Path) -> int:
     wait_s = min(float(spec.get("exclusive_wait_s") or 600), timeout_s)
     held = _take_exclusive(run_dir, spec.get("exclusive") or [], spec.get("env", {}), started + wait_s)
     if held is None:
+        remove_files(spec.get("private_files") or [])
         exit_info = {"rc": None, "started": started, "ended": time.time(),
                      "stopped": stop_reason(run_dir) or "resource_busy", "launched": False}
         (run_dir / "exit.json.tmp").write_text(json.dumps(exit_info))
@@ -178,6 +195,7 @@ def supervise(run_dir: Path) -> int:
     t.start()
     rc = child.wait()
     ended = time.time()
+    remove_files(spec.get("private_files") or [])
     for f in (prompt, out, err, *held):
         f.close()
     exit_info = {"rc": rc, "started": started, "ended": ended, "stopped": reason[0] if reason else None}
