@@ -15,3 +15,6 @@
   few minutes without a model and brings the task back as soon as it passes; `retry_after_s`
   stays the fallback.
 - Worker prompts state the charter's restrictions twice (first and last) instead of three times.
+- Claude workers pass `--exclude-dynamic-system-prompt-sections` when the installed CLI has it, so
+  the system prompt stays cached across worktrees (measured on a trivial run in a fresh worktree:
+  cache-write tokens 13,285 → 9,382).

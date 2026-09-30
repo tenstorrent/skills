@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import subprocess
 import sys
 from pathlib import Path
 
@@ -15,6 +16,8 @@ from . import register
 from ..budget import Window
 from .base import AUTH_RE, LIMIT_RE, Provider, RunUsage
 
+EXCLUDE_DYNAMIC = "--exclude-dynamic-system-prompt-sections"
+_FLAGS: dict[str, bool] = {}   # CLI flag support, probed once per daemon from `claude --help`
 USAGE_KEYS = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
 
 
@@ -46,8 +49,22 @@ class Claude(Provider):
             argv += ["--disallowedTools", *denied]
         if not read_only:
             argv += ["--settings", json.dumps(hook_settings())]
+            # Workers start in many different worktrees; with the per-directory sections out of the
+            # system prompt, it stays cached across them (measured: ~30% fewer cache-write tokens).
+            if self.supports(EXCLUDE_DYNAMIC):
+                argv.append(EXCLUDE_DYNAMIC)
         env = {"CLAUDE_CODE_ENABLE_CFC": "0"}
         return argv, env
+
+    def supports(self, flag: str) -> bool:
+        if flag not in _FLAGS:
+            try:
+                out = subprocess.run([self.binary() or "claude", "--help"], capture_output=True, text=True,
+                                     timeout=20).stdout
+            except (OSError, subprocess.SubprocessError):
+                out = ""
+            _FLAGS[flag] = flag in out
+        return _FLAGS[flag]
 
     def _events(self, output_path: Path):
         try:

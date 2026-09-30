@@ -572,6 +572,17 @@ def test_claude_workers_get_the_update_hook_but_decisions_do_not(env):
     assert "--settings" not in turn
 
 
+def test_claude_workers_keep_the_system_prompt_cacheable_when_the_cli_can(env, monkeypatch):
+    from ttp.providers import claude, get_provider
+    kw = dict(role="worker", model="opus", effort="low", cwd=".", budget_usd=None, schema=None, restrictions={})
+    for supported in (True, False):
+        monkeypatch.setattr(claude, "_FLAGS", {claude.EXCLUDE_DYNAMIC: supported})
+        worker, _ = get_provider("claude").build(read_only=False, **kw)
+        turn, _ = get_provider("claude").build(read_only=True, **kw)
+        assert (claude.EXCLUDE_DYNAMIC in worker) is supported, "an unsupported flag would break every run"
+        assert claude.EXCLUDE_DYNAMIC not in turn
+
+
 def test_charter_restrictions_lead_and_close_every_worker_prompt(env):
     p = make(env)
     p.charter_path.write_text("# demo\n\n## Goals\nGo fast.\n\n## Restrictions\n(none stated yet)\n\n"
