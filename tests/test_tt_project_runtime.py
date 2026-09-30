@@ -4705,6 +4705,11 @@ def test_push_free_tells_whether_a_push_holds_the_branch(env, monkeypatch):
     assert _ttp("push", "--free") == 0 and not any(x.exists() for x in paths), "--free must not create the lock"
     held = locks.try_take(paths, "someone")
     assert _ttp("push", "--free") == 1
+    # The harness runs the probe in the project root, which need not have the pushing repo's remotes.
+    elsewhere = env["tmp"] / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    assert _ttp("push", "--free") == 1
     held.close()
     assert _ttp("push", "--free") == 0
 

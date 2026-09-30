@@ -234,16 +234,18 @@ def run(p: Project, repo: Path) -> int:
 
 
 def free(p: Project, repo: Path) -> int:
-    """`ttp push --free`: 0 when no push to the project's target branch holds its lock, 1 while one
-    does, 2 when there is no target. Read-only and instant, for a waiting task's `retry_when`."""
+    """`ttp push --free`: 0 when no push of this project holds a push lock, 1 while one does, 2 when
+    there is no target. Read-only and instant, for a waiting task's `retry_when`. It checks every
+    push lock of the project: the harness runs the probe in the project root, whose git remotes
+    may resolve `delivery.push_branch` differently from the worktree that pushes."""
     try:
-        remote, branch = target(p, repo)
+        target(p, repo)
     except ValueError as e:
         print(f"ttp push: {e}", file=sys.stderr)
         return REFUSED
-    paths = lock_paths(p, remote, branch)
-    if locks.any_free(paths):
+    held = [x for x in sorted((p.state / "locks").glob("push:*.lock")) if not locks.any_free([x])]
+    if not held:
         return 0
-    print(f"ttp push: {lock_name(remote, branch)} is held by {', '.join(locks.holders(paths)) or 'another push'}",
+    print(f"ttp push: a push holds its turn: {', '.join(locks.holders(held)) or 'another push'}",
           file=sys.stderr)
     return 1
