@@ -793,6 +793,21 @@ def test_depends_on_must_name_real_tasks_without_a_cycle(env):
     assert json.loads(p.db.task(b)["depends_on"]) == [a]
 
 
+
+def test_task_add_rejects_unknown_or_dead_dependencies(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    ok = p.db.add_task("ok", "s", origin="user")
+    gone = p.db.add_task("gone", "s", origin="user")
+    p.db.update_task(gone, status="cancelled")
+    before = p.db.one("SELECT COUNT(*) n FROM tasks")["n"]
+    for deps, why in (([999], "no task #999"), ([ok, gone], f"#{gone} which is cancelled"), ("x", "must be a list")):
+        problems = coord.apply(p, [{"type": "task_add", "title": f"new {why}", "depends_on": deps}])
+        assert len(problems) == 1 and why in problems[0], (deps, problems)
+    assert p.db.one("SELECT COUNT(*) n FROM tasks")["n"] == before, "a rejected task_add created a task"
+    assert not coord.apply(p, [{"type": "task_add", "title": "fine", "depends_on": [ok, ok]}])
+    assert json.loads(p.db.one("SELECT depends_on FROM tasks WHERE title='fine'")["depends_on"]) == [ok]
+
 def test_a_run_end_is_recorded_whole_or_not_at_all(env, tmp_path, monkeypatch):
     p = make(env)
     from ttp.daemon import Daemon

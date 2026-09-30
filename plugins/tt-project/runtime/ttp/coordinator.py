@@ -181,9 +181,15 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None) -> l
                 budget = a.get("budget_usd") or cfg["budget"]["task_default_usd"].get(tier, 8.0)
                 kind_label = "exclusive" if a.get("exclusive") else "resource"
                 labels = [f"{kind_label}:{r}" for r in (a.get("resources") or []) if isinstance(r, str)]
+                deps = _new_dependencies(db, None, a.get("depends_on") or [])
+                # The daemon would block a new task on a dead dependency at once.
+                dead = db.dead_dependency(deps)
+                if dead:
+                    raise ValueError(f"task_add rejected: depends on #{dead[0]} which is {dead[1]}; "
+                                     f"drop or replace depends_on")
                 db.add_task(title, a.get("spec") or "", kind=a.get("kind") or "work", tier=tier,
                             priority=int(a.get("priority") or 3), provider=a.get("provider") or None,
-                            budget_usd=float(budget), depends_on=a.get("depends_on") or [],
+                            budget_usd=float(budget), depends_on=deps,
                             reply_chat=a.get("reply_chat") or None, origin="coordinator", labels=labels)
             elif t == "task_update":
                 task = db.task(int(a["id"]))
@@ -276,20 +282,23 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None) -> l
     return problems
 
 
-def _new_dependencies(db, task: dict, raw: Any) -> list[int]:
+def _new_dependencies(db, task: dict | None, raw: Any) -> list[int]:
+    """Validated dependency ids for `task`, or for a task not yet created when `task` is None."""
+    who = f"#{task['id']}" if task else "task_add"
     if not isinstance(raw, list):
-        raise ValueError(f"#{task['id']} depends_on must be a list of task ids")
+        raise ValueError(f"{who} depends_on must be a list of task ids")
     try:
         deps = list(dict.fromkeys(int(d) for d in raw))
     except (TypeError, ValueError):
-        raise ValueError(f"#{task['id']} depends_on must be a list of task ids") from None
+        raise ValueError(f"{who} depends_on must be a list of task ids") from None
     for d in deps:
-        if d == task["id"]:
-            raise ValueError(f"#{task['id']} cannot depend on itself")
+        if task and d == task["id"]:
+            raise ValueError(f"{who} cannot depend on itself")
         if not db.task(d):
-            raise ValueError(f"#{task['id']} depends_on: no task #{d}")
-    if db.dependency_cycle(task["id"], deps):
-        raise ValueError(f"#{task['id']} depends_on {deps} would create a cycle")
+            raise ValueError(f"{who} depends_on: no task #{d}")
+    # Nothing depends on a new task yet, so only an existing one can close a loop.
+    if task and db.dependency_cycle(task["id"], deps):
+        raise ValueError(f"{who} depends_on {deps} would create a cycle")
     return deps
 
 
