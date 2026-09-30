@@ -103,6 +103,8 @@ def sweep(db: DB, now: float | None = None) -> list[dict]:
     alert again at once, and tell the chats once. Returns the episodes closed."""
     now = now or time.time()
     closed = []
+    if not db.one("SELECT id FROM alerts WHERE cleared IS NULL LIMIT 1"):
+        return closed   # the usual tick: no write lock taken
     with db.tx():
         for ep in db.q("SELECT * FROM alerts WHERE cleared IS NULL ORDER BY id"):
             if holds(db, ep["key"], _since(ep), now):
