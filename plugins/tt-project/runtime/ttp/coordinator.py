@@ -250,7 +250,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     raise ValueError("task_add needs a title")
                 dup = db.one("SELECT id FROM tasks WHERE title=? AND status NOT IN ('done','failed','cancelled')",
                              (title,))
-                if dup:
+                if dup and str(dup["id"]) != str(a.get("continues")):
                     raise ValueError(f"duplicate of open task #{dup['id']}")
                 cap = int(cfg["coordinator"].get("max_new_tasks_per_day", 40))
                 made = db.one("SELECT COUNT(*) n FROM tasks WHERE origin='coordinator' AND created>?",
@@ -278,6 +278,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                          labels=labels)
                     if old:
                         _take_over_dependents(db, old["id"], new_id)
+                        if old["status"] == "blocked":   # superseded: never requeued into duplicate work
+                            db.update_task(old["id"], status="cancelled", blocked_reason=f"continued by #{new_id}")
             elif t == "task_update":
                 task = db.task(int(a["id"]))
                 if not task:

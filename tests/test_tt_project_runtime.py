@@ -1449,6 +1449,20 @@ def test_task_add_continues_rejects_a_dependency_on_its_own_dependents(env):
     assert json.loads(p.db.task(child)["depends_on"]) == [old]
 
 
+def test_continuing_a_blocked_task_cancels_it_and_may_reuse_its_title(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    old = p.db.add_task("stuck", "s", origin="user")
+    p.db.update_task(old, status="blocked", blocked_reason="needs a rethink")
+    other = p.db.add_task("other", "s", origin="user")
+    p.db.update_task(other, status="blocked")
+    assert coord.apply(p, [{"type": "task_add", "title": "other", "continues": old}])[0].startswith("task_add: duplicate")
+    assert coord.apply(p, [{"type": "task_add", "title": "stuck", "continues": old}]) == []
+    new = p.db.one("SELECT id FROM tasks WHERE title='stuck' AND id!=?", (old,))["id"]
+    assert p.db.task(old)["status"] == "cancelled" and f"#{new}" in p.db.task(old)["blocked_reason"]
+    assert p.db.task(other)["status"] == "blocked"
+
+
 def test_a_code_task_continues_from_the_dead_tasks_branch(env):
     p = make(env)
     from ttp import coordinator as coord, prompts, worktree
