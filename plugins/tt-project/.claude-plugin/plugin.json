@@ -1,0 +1,20 @@
+{
+  "name": "tt-project",
+  "displayName": "Tenstorrent Project",
+  "version": "0.1.0",
+  "description": "Long-running, self-driving projects that run locally: a coordinator daemon that plans and delegates, isolated workers, memory, budget guards with headroom for your own work, watchers, and a web app. Works with Claude Code, Codex and Cursor.",
+  "author": {
+    "name": "Tenstorrent"
+  },
+  "homepage": "https://github.com/tenstorrent/skills",
+  "repository": "https://github.com/tenstorrent/skills",
+  "license": "Apache-2.0",
+  "keywords": [
+    "tenstorrent",
+    "project",
+    "agents",
+    "automation",
+    "coordinator"
+  ],
+  "skills": "./skills/"
+}

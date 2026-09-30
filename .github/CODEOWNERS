@@ -26,3 +26,6 @@
 
 # Tenstorrent operating principles
 /plugins/tt-buddy/ @ppetrovicTT
+
+# Long-running local projects
+/plugins/tt-project/ @smartonTT

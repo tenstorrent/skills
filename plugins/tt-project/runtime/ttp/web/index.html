@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>tt-project</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <div class="brand"><span id="pname">project</span><span id="daemon" class="pill">…</span>
+    <button id="notify" class="ghost" hidden>Turn on notifications</button></div>
+  <nav id="tabs">
+    <button data-tab="overview" class="on">Overview</button>
+    <button data-tab="tasks">Tasks</button>
+    <button data-tab="issues">Issues</button>
+    <button data-tab="recurring">Recurring</button>
+    <button data-tab="budget">Budget</button>
+    <button data-tab="chat">Chat</button>
+  </nav>
+</header>
+<main>
+  <section id="overview" class="tab on">
+    <div id="attention"></div>
+    <div class="board" id="board"></div>
+    <div class="grid">
+      <div class="card"><h2>Budget</h2><div id="gates"></div></div>
+      <div class="card"><h2>Working now</h2><div id="running"></div></div>
+      <div class="card wide"><h2>Coordinator's last note</h2><p id="coord" class="muted"></p></div>
+    </div>
+    <div class="card"><h2>Recently finished</h2><div id="recent"></div></div>
+  </section>
+  <section id="tasks" class="tab"><div id="tasklist"></div></section>
+  <section id="issues" class="tab"><div id="issuelist"></div></section>
+  <section id="recurring" class="tab">
+    <p class="muted">Everything that runs on its own. Deterministic watchers cost nothing; model-driven ones show their last-7-day cost. Turn off anything that is not earning its keep.</p>
+    <div id="schedlist"></div>
+  </section>
+  <section id="budget" class="tab">
+    <div class="grid">
+      <div class="card"><h2>Gates</h2><div id="gates2"></div></div>
+      <div class="card"><h2>Who pays</h2><div id="accounts"></div></div>
+    </div>
+    <div class="card"><h2>Daily project spend, last 14 days</h2><div id="spendchart" class="chart"></div></div>
+    <div class="card"><h2>Plan window peaks, last 14 days</h2><div id="peakchart" class="chart"></div></div>
+    <div class="card"><h2>Top spenders, last 7 days</h2><div id="sources"></div></div>
+    <div class="card"><h2>Controls</h2>
+      <label>Daily cap $ <input id="daily" type="number" min="0" step="1"></label>
+      <label>Weekly cap $ <input id="weekly" type="number" min="0" step="1"></label>
+      <button id="savecaps">Save caps</button>
+      <button id="pause" class="danger">Pause project</button>
+    </div>
+  </section>
+  <section id="chat" class="tab">
+    <div id="log"></div>
+    <form id="say"><input id="msg" autocomplete="off" placeholder="Message the coordinator…"><button>Send</button></form>
+  </section>
+</main>
+<script src="app.js"></script>
+</body>
+</html>

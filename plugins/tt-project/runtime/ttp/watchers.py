@@ -1,0 +1,120 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""Built-in, model-free watchers. Each reports only CHANGES, so an unchanged world costs nothing.
+
+- `prs`: every pull request a task opened — draft/ready, CI result, new review activity, approval,
+  merge. Emits events straight to the coordinator (they are already specific and actionable).
+- `logfile`: tails files named in the payload and screens new lines (rules, then Jev if enabled).
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import subprocess
+import time
+from pathlib import Path
+
+
+def run_builtin(daemon, name: str, payload: dict) -> str:
+    kind = payload.get("builtin") or name
+    if kind == "prs":
+        return watch_prs(daemon)
+    if kind == "logfile":
+        return watch_logs(daemon, payload)
+    return f"unknown builtin {kind}"
+
+
+def _gh(args: list[str], cwd: str) -> dict | None:
+    try:
+        out = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=60, cwd=cwd)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    try:
+        return json.loads(out.stdout)
+    except ValueError:
+        return None
+
+
+def pr_signature(pr: dict) -> dict:
+    checks = pr.get("statusCheckRollup") or []
+    states = sorted({(c.get("conclusion") or c.get("state") or c.get("status") or "").upper() for c in checks})
+    failing = sorted(c.get("name") or c.get("context") or "?" for c in checks
+                     if (c.get("conclusion") or c.get("state") or "").upper() in ("FAILURE", "ERROR", "TIMED_OUT",
+                                                                                 "CANCELLED", "ACTION_REQUIRED"))
+    pending = any((c.get("status") or c.get("state") or "").upper() in ("IN_PROGRESS", "QUEUED", "PENDING")
+                  for c in checks)
+    human = [c for c in (pr.get("comments") or []) + (pr.get("reviews") or [])
+             if not ((c.get("author") or {}).get("login", "").endswith("[bot]"))]
+    activity = hashlib.sha1(json.dumps([(c.get("author") or {}).get("login", "") + str(c.get("body", ""))[:200]
+                                        + str(c.get("state", "")) for c in human]).encode()).hexdigest()[:12]
+    return {"state": pr.get("state"), "draft": pr.get("isDraft"), "decision": pr.get("reviewDecision"),
+            "mergeable": pr.get("mergeable"), "checks": "pending" if pending else ("failing" if failing else
+                                                                                  ("passing" if states else "none")),
+            "failing": failing[:10], "activity": activity, "n_human": len(human)}
+
+
+def watch_prs(daemon) -> str:
+    db, root = daemon.p.db, str(daemon.p.root)
+    rows = db.q("SELECT id, title, pr_url, status FROM tasks WHERE pr_url IS NOT NULL AND pr_url!='' "
+                "AND status NOT IN ('cancelled')")
+    seen = db.kv("pr_signatures", {})
+    changed = 0
+    for t in rows:
+        pr = _gh(["pr", "view", t["pr_url"], "--json", "state,isDraft,mergeable,reviewDecision,statusCheckRollup,"
+                  "comments,reviews,url,title"], root)
+        if pr is None:
+            continue
+        sig = pr_signature(pr)
+        old = seen.get(t["pr_url"])
+        if sig == old:
+            continue
+        seen[t["pr_url"]] = sig
+        changed += 1
+        if old is None:
+            continue   # first sighting records a baseline; nothing new has happened yet
+        what = [f"{k}: {old.get(k)} → {v}" for k, v in sig.items() if old.get(k) != v and k != "activity"]
+        if sig["activity"] != old.get("activity"):
+            what.append(f"new review/comment activity ({sig['n_human']} human items)")
+        sev = "high" if sig["state"] == "MERGED" or sig["decision"] == "CHANGES_REQUESTED" else "normal"
+        db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+             (time.time(), "pr", "pr_changed", sev,
+              f"PR for task #{t['id']} ({pr.get('url')}): " + "; ".join(what), "queued", t["id"]))
+    db.set_kv("pr_signatures", seen)
+    return f"ok ({len(rows)} PRs, {changed} changed)"
+
+
+def watch_logs(daemon, payload: dict) -> str:
+    db = daemon.p.db
+    offsets = db.kv("log_offsets", {})
+    n = 0
+    for pattern in payload.get("files", []):
+        for path in sorted(Path(daemon.p.root).glob(pattern)) if not os.path.isabs(pattern) else [Path(pattern)]:
+            if not path.is_file():
+                continue
+            key = str(path)
+            size = path.stat().st_size
+            start = offsets.get(key, size)       # first sighting starts at the end: history is not news
+            if size < start:
+                start = 0                       # rotated or truncated
+            if size > start:
+                with open(path, "rb") as f:
+                    f.seek(start)
+                    chunk = f.read(min(size - start, 256 * 1024)).decode(errors="replace")
+                offsets[key] = start + len(chunk.encode())
+                lines = [ln for ln in chunk.splitlines() if ln.strip()]
+                interesting = [ln for ln in lines if daemon_rule(ln) != "info"]
+                for ln in interesting[:20]:
+                    daemon.observe(f"log:{path.name}", ln[:2000])
+                    n += 1
+            else:
+                offsets[key] = size
+    db.set_kv("log_offsets", offsets)
+    return f"ok ({n} lines screened)"
+
+
+def daemon_rule(line: str) -> str:
+    from .screen import rule_severity
+    return rule_severity(line)

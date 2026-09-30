@@ -1,0 +1,99 @@
+# tt-project
+
+Long-running, self-driving projects that run on your own machines.
+
+Tell your agent "start a tt-project called `docs-refresh` that keeps our README accurate", and a
+project comes up with its own coordinator. The coordinator plans the work and hands it to
+headless workers in isolated workspaces. It watches pull requests and logs, fixes what it finds,
+remembers what you tell it, and stays inside a budget. Close the chat and it keeps going. Open any
+chat later, in Claude Code, Codex or Cursor, and connect to it by name.
+
+Nothing runs in a hosted cloud. The project runs on this machine or on an always-on box you
+name, which is also where it can use local hardware.
+
+## Install
+
+```text
+/plugin install tt-project@tenstorrent-skills      # Claude Code, after adding the marketplace
+codex plugin add tt-project@tenstorrent-skills     # Codex
+```
+
+Cursor: link the plugin folder into `~/.cursor/plugins/local/tt-project`, or start the CLI with
+`agent --plugin-dir <this folder>`.
+
+The first use installs a `ttp` command for your user (`ttp setup`). Python 3.9+ and `git` are the
+only requirements; the runtime uses the standard library.
+
+## Using it
+
+| You say | What happens |
+|---|---|
+| "Start a tt-project called X on box B: <brief>" | the project is created on B and starts working |
+| "Connect to project X" | this chat attaches; replies and alerts arrive here |
+| anything addressed to the project | relayed to the coordinator; its answer comes back to this chat |
+| "What is X doing?" | `ttp status X`: running work, blockers, budget |
+
+The brief can be inline text, a file, or links. Goals, restrictions ("never access the internet")
+and preferences you add later become part of the project's charter and memory.
+
+## How it works
+
+```
+ chats (any host) ─┐                ┌─ worker: headless agent in its own worktree ─┐
+ web app ──────────┼─ inbox ─► daemon ─► coordinator turn (decides, never works)   ├─► results
+ watchers ─────────┘   (deterministic)  └─ worker … (parallel, budgeted, stall-guarded)┘
+```
+
+- **Daemon** (one per project): schedules, watchers, budget gates, message routing, web app.
+  Deterministic and cheap. It starts a model only through a run.
+- **Coordinator**: a short, tool-less decision over a digest of the project, batched and rate
+  capped. Anything needing files, commands or deep thought becomes a task.
+- **Workers**: one task each, in a git worktree on their own branch for code, with a dollar
+  budget, a wall clock, and a stall guard. Each hands off a structured result.
+- **Memory and charter**: plain files in the project's harness, one fact per file.
+- **Watchers**: pull requests (CI, reviews, mergeability) and logs, reporting only changes.
+  With Jev enabled, new observations are screened by a cheap decision model first.
+
+## Budget
+
+- Subscription plans: the project reads the account's live window usage and never takes it past
+  90%, leaving the rest for your own work.
+- Usage-billed accounts: $100 per 24 hours and $200 per 7 days per project by default.
+- Work backs off in steps as spend rises, pauses at the cap, and tells you how to raise it.
+- A runaway guard pauses a project whose hourly spend jumps far above its own norm.
+- The web app shows spend per day, per task and per recurring job, and plan-window peaks for the
+  last two weeks.
+
+## Where things live
+
+| Path | Holds |
+|---|---|
+| `<project root>/tt-project/` | everything for the project; ignores itself, so nothing gets committed |
+| `…/harness/` | the project's own harness (git): charter, memory, config, prompts, runtime |
+| `…/state/` | database, run directories, logs |
+| `…/worktrees/` | one git worktree per code task |
+| `~/.tt-project/` | per-user registry of projects, secrets (mode 0600), the `ttp` install |
+
+Each project starts from this plugin's template and then improves its own harness from
+experience. `ttp upgrade <name>` merges later template versions into it.
+
+## Notifications
+
+Alerts go to every attached chat, to the web app (one-click browser notifications), and, if you
+install it, to a desktop notifier on your workstation that covers all your projects
+(`ttp notifier install`). Only decisions, reviews, merges, funds and outages notify by default.
+Workers can read Slack links you paste, using your Slack connector if you have one.
+
+## Security
+
+- The web app listens on localhost with a per-project token. Use an SSH forward from elsewhere.
+- Workers run with your permissions, in their own worktree; restrictions in the charter are
+  passed to every worker and enforced by the provider where it can (for example, no web tools).
+- Text from logs, issues and chats is treated as data, not instructions.
+- Secrets are entered in a terminal (`ttp secret …`), never in chat, and never copied into a project.
+
+## Limits
+
+- Codex and Cursor report tokens but no cost; their spend is estimated from a price table.
+- Cursor has no reasoning-effort flag; tiers map to model names.
+- A laptop pauses while it sleeps. Use an always-on machine for round-the-clock work.

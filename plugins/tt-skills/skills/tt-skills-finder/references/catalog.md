@@ -99,3 +99,19 @@ Install or enable it only after the user chooses it:
   Directory.
 - **Claude Code:** run `/plugin install tt-buddy@tenstorrent-skills` after adding the
   `tenstorrent/skills` marketplace.
+
+## `tt-project`
+
+Use when the user wants a long-running, self-driving project rather than a one-off task: a named
+project with its own coordinator that keeps working, watches pull requests and logs, fixes what it
+finds, keeps memory, guards spend, and can be reconnected from any chat by name. It runs locally or
+on an always-on box, never in a hosted cloud.
+
+Do not recommend it for work the user wants done in the current chat, or for a single bug fix.
+
+Install or enable it only after the user chooses it:
+
+- **Codex / ChatGPT desktop:** select `tt-project` under **Tenstorrent Skills** in the Plugins
+  Directory.
+- **Claude Code:** run `/plugin install tt-project@tenstorrent-skills` after adding the
+  `tenstorrent/skills` marketplace.

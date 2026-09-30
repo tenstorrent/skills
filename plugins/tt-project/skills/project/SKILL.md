@@ -1,0 +1,74 @@
+---
+name: project
+description: "Start, connect to, and talk with a long-running tt-project: a local, self-driving project with its own coordinator, workers, memory, budget guard and web app, running on this machine or an always-on box. Use when the user says tt-project, asks to start or connect to a project by name, or messages an existing project."
+---
+
+# tt-project: project
+
+## Purpose
+
+- The chat is a thin client. The project's coordinator runs as a daemon elsewhere.
+- You create or find the project, relay messages, and show replies.
+- NEVER do the project's work in this chat. The project does it.
+
+## When to Invoke
+
+- "Start a tt-project called X…", "connect to project X", "tell X to…".
+- Any message the user addresses to an attached project.
+- Not for one-off tasks the user wants done here and now.
+
+## Pipeline
+
+| Step | Do |
+|---|---|
+| 1. Install | Run `<plugin-root>/bin/ttp setup` once per machine. Afterwards use `ttp`. |
+| 2. Name | Get the project name. `ttp find <name>` says whether it exists. |
+| 3a. New | Follow `create.md`. |
+| 3b. Existing | `ttp connect <name> --label "<short chat label>"`. Keep the printed `chat:` id. |
+| 4. Listen | Start the listener for this host: `hosts.md`. |
+| 5. Relay | User message for the project → `ttp say <name> --chat <id> "<message>"`. |
+| 6. Show | Print coordinator replies as they arrive, lightly formatted, no additions. |
+
+## Relay rules
+
+- Forward the user's words verbatim. Do not rephrase instructions.
+- A project question you can answer from `ttp status <name>`: answer directly.
+- Anything else goes to the coordinator. Answers arrive through the listener.
+- Keep this chat free: after `ttp say`, end your turn. Do not wait in the foreground.
+- Alerts arrive in every attached chat. Replies arrive only in the chat that asked.
+- The user asks what is running, costs, or blockers → `ttp status <name>`.
+
+## Always print the project locator
+
+- After `new` or `connect`, show the `tt-project://…` line once.
+- Later chats find the project by it, even without the registry.
+
+## Web app and notifications
+
+- `ttp web <name>` prints the link. Remote project → `remote.md` (tunnel, ask first).
+- The web app has a one-click "Turn on notifications" button.
+- Offer desktop alerts once per machine: `ttp notifier install` (ask first).
+- Details and optional Slack: `notifications.md`.
+
+## Operating
+
+| User wants | Command |
+|---|---|
+| status / blockers | `ttp status <name>` |
+| pause or resume all model work | `ttp pause <name>` / `ttp resume <name>` |
+| change caps | tell the coordinator, or `ttp config <name> budget.daily_usd 150` |
+| restart after trouble | `ttp restart <name>`, then `ttp doctor <name>` |
+| stop for good | `ttp stop <name>` (removes the service; data stays) |
+| logs | `ttp logs <name>` |
+
+More: `operate.md`.
+
+## Red Flags
+
+| Thought | Reality |
+|---|---|
+| "I'll just do this quick task myself" | The project owns the work. Relay it. |
+| "I'll poll until the answer comes" | The listener wakes you. End your turn. |
+| "I'll paste the key here" | Secrets go through `ttp secret`, typed by the user. |
+| "I'll open a tunnel quickly" | Tunnels need the user's OK first. |
+| "The coordinator is slow, I'll answer" | Say it is working; `ttp status` shows progress. |

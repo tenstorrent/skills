@@ -1,0 +1,35 @@
+{
+  "name": "tt-project",
+  "version": "0.1.0",
+  "description": "Long-running, self-driving projects that run locally: a coordinator daemon that plans and delegates, isolated workers, memory, budget guards with headroom for your own work, watchers, and a web app. Works with Claude Code, Codex and Cursor.",
+  "author": {
+    "name": "Tenstorrent"
+  },
+  "homepage": "https://github.com/tenstorrent/skills",
+  "repository": "https://github.com/tenstorrent/skills",
+  "license": "Apache-2.0",
+  "keywords": [
+    "tenstorrent",
+    "project",
+    "agents",
+    "automation",
+    "coordinator"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Tenstorrent Project",
+    "shortDescription": "Local, self-driving projects with a coordinator, workers and budget guards",
+    "longDescription": "Start a named project from any chat. A local daemon coordinates it: it plans, delegates work to headless agents in isolated workspaces, watches pull requests and logs, keeps memory, enforces spend caps with headroom for your own work, and serves a web app. Reconnect from any chat by name.",
+    "developerName": "Tenstorrent",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Long-running project coordinator",
+      "Budget guard and spend dashboard",
+      "Watchers and self-improving harness"
+    ],
+    "websiteURL": "https://github.com/tenstorrent/skills",
+    "defaultPrompt": [
+      "Start a tt-project called docs-refresh that keeps our README accurate"
+    ]
+  }
+}
