@@ -259,11 +259,15 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None) -> l
                 db.post("out", a["text"], chat=None, kind="alert", severity=_norm_severity(a.get("severity")))
             elif t == "memory_add":
                 p.add_memory(a["text"], kind=a.get("memory_kind") or "fact", title=a.get("title"))
+                if (a.get("memory_kind") or "") == "restriction":
+                    _tell_running_workers(db, f"New binding restriction: {a['text'].strip()}")
             elif t == "charter_update":
                 section = (a.get("section") or "Notes").strip().title()
                 with open(p.charter_path, "a") as f:
                     f.write(f"\n## {section} (added {time.strftime('%Y-%m-%d')})\n{a['text'].strip()}\n")
                 p.commit_harness([p.charter_path], f"charter ({section.lower()}): {a['text'].strip()[:80]}")
+                if section.startswith("Restriction"):
+                    _tell_running_workers(db, f"New binding restriction: {a['text'].strip()}")
             elif t == "schedule_set":
                 sched.upsert(db, a["name"], a.get("kind") or "llm", a.get("every") or "1d", a.get("at"),
                              bool(a.get("enabled", True)), a.get("budget_usd"), a.get("text") or "",
@@ -361,6 +365,16 @@ def expire_asks(p: Project, *, hold: bool = False, now: float | None = None) -> 
         if live != pending:
             db.set_kv(ASK_DEFAULTS_KEY, live)
     return [int(k) for k in due]
+
+
+def _tell_running_workers(db, text: str) -> None:
+    """A new restriction binds work already in flight, not only work started later: it goes to
+    every running worker's update file, which the worker receives mid-run."""
+    stamp = time.strftime("%Y-%m-%d %H:%M")
+    for r in db.q("SELECT dir FROM runs WHERE status='running' AND role!='coordinator'"):
+        if r["dir"] and Path(r["dir"]).is_dir():
+            with open(Path(r["dir"], "steer.md"), "a") as f:
+                f.write(f"\n## Update {stamp}\n{text}\n")
 
 
 def open_task_count(p: Project) -> int:

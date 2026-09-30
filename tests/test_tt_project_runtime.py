@@ -1232,3 +1232,18 @@ def test_task_branches_start_from_a_remote_only_base(env):
     p.set_config("delivery.base_ref", "fast")
     with pytest.raises(RuntimeError, match="similar: .*work/fast"):
         worktree.resolve_base(p)
+
+
+def test_a_new_restriction_reaches_workers_already_running(env, tmp_path):
+    p = make(env)
+    from ttp import coordinator as coord
+    run_dir = tmp_path / "live"
+    run_dir.mkdir()
+    tid = p.db.add_task("long job", "s", kind="work", tier="light", origin="user")
+    p.db.x("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(?,?,?,?,?,?)",
+           (tid, "worker", "fake", time.time(), "running", str(run_dir)))
+    assert coord.apply(p, [{"type": "charter_update", "section": "Restrictions",
+                            "text": "Never push to main."}]) == []
+    assert "Never push to main." in (run_dir / "steer.md").read_text()
+    assert coord.apply(p, [{"type": "charter_update", "section": "Goals", "text": "Go faster."}]) == []
+    assert "Go faster." not in (run_dir / "steer.md").read_text(), "only restrictions interrupt running work"
