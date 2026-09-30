@@ -25,6 +25,16 @@ def is_git(path: Path) -> bool:
         return False
 
 
+def git_common_dir(path: Path) -> str | None:
+    """The repository's shared .git directory; for a worktree it lies outside the worktree."""
+    try:
+        out = _git(path, "rev-parse", "--git-common-dir", check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    common = (Path(path) / out).resolve() if out else None
+    return str(common) if common and common.is_dir() else None
+
+
 def slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:40] or "task"
 

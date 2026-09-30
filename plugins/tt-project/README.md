@@ -118,8 +118,17 @@ Design notes, invariants and how to add a provider: [docs/design.md](docs/design
 
 ## Limits
 
-- Codex and Cursor report tokens but no cost; their spend is estimated from a price table.
-- A Claude run cut off before its final report is estimated from its streamed tokens. A Cursor run
-  cut off the same way is recorded at $0: Cursor reports usage only when it exits.
+- Codex and Cursor report tokens but no cost; their spend is estimated from a price table. Set
+  your own rates in project.json as `"pricing": {"codex": {"<model>": [input, cached input,
+  output]}}` in $ per million tokens (`"default"` covers other models; same for `cursor`).
+- A Claude run cut off before its final report is estimated from its streamed tokens. Codex and
+  Cursor report usage only when a run ends, so their mid-run budget check cannot trip, and a run
+  cut off early is booked at the elapsed share of its budget (flagged estimated).
+- Codex workers run in Codex's workspace-write sandbox, with the project's state folder and the
+  repository's git folder added as writable roots. Coordinator turns use its read-only sandbox.
+- Not yet on Codex or Cursor: worker plugins (`plugin_dirs`), coordinator updates reaching a
+  running worker (Claude hooks only), and isolation of coordinator turns from your own CLI
+  config, MCP servers and rules. Cursor enforces no read-only mode and no `no_internet`
+  restriction, and has no plan-window meter.
 - Cursor has no reasoning-effort flag; tiers map to model names.
 - A laptop pauses while it sleeps. Use an always-on machine for round-the-clock work.

@@ -174,9 +174,10 @@ class Daemon:
     def start_run(self, role: str, prompt: str, provider: str, tier: str, cwd: str, *, task: dict | None = None,
                   budget_usd: float | None = None, timeout_s: float | None = None, read_only: bool = False,
                   schema: dict | None = None, system: str | None = None, note: dict | None = None) -> int:
-        prov = get_provider(provider)
         tiers = self.cfg["providers"].get(provider, {}).get("tiers", {})
         model = tiers.get(tier, {}).get("model", "")
+        prices = (self.cfg.get("pricing") or {}).get(provider) or {}
+        prov = get_provider(provider).use(model, prices)
         effort = tiers.get(tier, {}).get("effort", "")
         restrictions = self.cfg.get("restrictions", {})
         argv, env = prov.build(role=role, model=model, effort=effort, cwd=cwd, budget_usd=budget_usd,
@@ -186,7 +187,10 @@ class Daemon:
             dirs = [str(Path(os.path.expanduser(d))) for d in
                     (self.cfg["providers"].get(provider, {}).get("plugin_dirs") or [])
                     if Path(os.path.expanduser(d)).is_dir()]
-            argv += prov.plugin_args(dirs)
+            roots = [str(self.p.state)] + [d for d in [worktree.git_common_dir(Path(cwd))] if d]
+            extra = prov.writable_args(roots) + prov.plugin_args(dirs)
+            # A trailing "-" (prompt on stdin) stays the last argument.
+            argv = argv[:-1] + extra + ["-"] if argv[-1:] == ["-"] else argv + extra
         db = self.p.db
         run_id = db.x("INSERT INTO runs(task,role,provider,model,effort,account,started,boot_id,status,note) "
                       "VALUES(?,?,?,?,?,?,?,?,?,?)",
@@ -210,6 +214,7 @@ class Daemon:
             tout = timeout_s or self.cfg["budget"]["run_timeout_s"].get(tier, 3600)
             stall = self.cfg["budget"].get("stall_s", {}).get(tier) if role != "coordinator" else None
             spec = {"argv": argv, "env": env, "cwd": cwd, "timeout_s": tout, "provider": provider, "stall_s": stall,
+                    "model": model, "prices": prices,
                     "budget_usd": budget_usd if provider not in ("claude",) else None,
                     "exclusive": [{"resource": res, "paths": [str(x) for x in self._slot_paths(res)],
                                    "reserve": str(locks.reserve_path(self.p.state / "locks", res))}
@@ -311,13 +316,15 @@ class Daemon:
     def finish_run(self, r: dict, exit_info: dict) -> None:
         db, p = self.p.db, self.p
         run_dir = self._run_dir(r)
-        prov = get_provider(r["provider"])
+        prov = get_provider(r["provider"]).use(r["model"] or "", (self.cfg.get("pricing") or {}).get(r["provider"]))
         usage = prov.parse(run_dir / "output.jsonl", run_dir / "stderr.log")
         if usage.estimated and not usage.cost_usd:
             usage.cost_usd = bud.estimate_cost(db, self.cfg, r["provider"], r["model"] or "", {
                 "input": usage.input_tokens, "output": usage.output_tokens,
                 "cache_read": usage.cache_read_tokens, "cache_write": usage.cache_write_tokens})
         stopped = exit_info.get("stopped")
+        if usage.estimated and not usage.cost_usd and stopped:
+            usage.cost_usd = _cut_off_cost(run_dir, exit_info)
         status = "ok" if exit_info.get("rc") == 0 and not usage.error else "failed"
         if stopped in ("timeout", "budget", "stopped", "lost", "stalled", "shutdown", "resource_busy"):
             status = stopped if stopped != "stopped" else "killed"
@@ -358,7 +365,7 @@ class Daemon:
                 db.set_kv(f"limited:{r['provider']}", {"until": time.time() + 900, "note": "logged out"})
                 self.alert(f"auth:{r['provider']}",
                            f"{r['provider']} on {hostname()} is logged out ({(usage.final_text or usage.error)[:120]}). "
-                           f"Log in once on that machine (for Claude Code: run `claude` there and use /login). "
+                           f"Log in once on that machine ({prov.login_hint}). "
                            f"Work resumes by itself; queued messages are kept.", "high", every_s=4 * 3600)
             note = json.loads(r["note"] or "{}")
             if r["role"] == "coordinator":
@@ -1091,6 +1098,21 @@ class Daemon:
 
 def _exclusive(task: dict) -> list[str]:
     return [lb.split(":", 1)[1] for lb in json.loads(task["labels"] or "[]") if lb.startswith("exclusive:")]
+
+
+def _cut_off_cost(run_dir: Path, exit_info: dict) -> float:
+    """A run stopped before its provider reported any usage (Codex and Cursor report it only at the
+    end) still spent money. Book the elapsed share of its dollar budget rather than $0, so the
+    caps keep counting it."""
+    try:
+        spec = json.loads((run_dir / "run.json").read_text())
+    except (OSError, ValueError):
+        return 0.0
+    budget, timeout = float(spec.get("budget_usd") or 0), float(spec.get("timeout_s") or 0)
+    elapsed = float(exit_info.get("ended") or time.time()) - float(exit_info.get("started") or 0)
+    if budget <= 0 or timeout <= 0 or not exit_info.get("started"):
+        return 0.0
+    return round(budget * min(max(elapsed, 0.0) / timeout, 1.0), 4)
 
 
 def _with_system_prompt(provider: str, argv: list[str], path: Path) -> list[str]:

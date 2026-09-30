@@ -2108,3 +2108,125 @@ def test_the_idle_slot_wake_fires_under_pace_and_backs_off(env):
     pace[0]["burn_per_h"] = 5.0
     p.db.add_task("more work", "s", kind="work", tier="light", origin="coordinator", status="done")
     assert not turn_after(3000), "a plan on pace needs no extra work"
+
+
+def _objects(schema):
+    if isinstance(schema, dict):
+        if schema.get("type") == "object" or "properties" in schema:
+            yield schema
+        for v in schema.values():
+            yield from _objects(v)
+    elif isinstance(schema, list):
+        for v in schema:
+            yield from _objects(v)
+
+
+def test_codex_coordinator_schema_is_strict_and_its_nulls_are_dropped(env, tmp_path):
+    from ttp import coordinator as coord
+    from ttp.providers import get_provider
+    codex = get_provider("codex")
+    argv, _ = codex.build(role="coordinator", model="", effort="low", cwd=str(tmp_path), budget_usd=1.0,
+                          read_only=True, schema=coord.ACTIONS_SCHEMA, restrictions={})
+    path = argv[argv.index("--output-schema") + 1]
+    strict = json.loads(pathlib.Path(path).read_text())
+    for obj in _objects(strict):
+        assert obj["additionalProperties"] is False and set(obj["required"]) == set(obj["properties"]), obj
+    item = strict["properties"]["actions"]["items"]["properties"]
+    assert item["type"]["type"] == "string" and "null" in item["title"]["type"]
+    again, _ = codex.build(role="coordinator", model="", effort="low", cwd=str(tmp_path), budget_usd=1.0,
+                           read_only=True, schema=coord.ACTIONS_SCHEMA, restrictions={})
+    assert again[again.index("--output-schema") + 1] == path, "each turn must not leave a new temp file"
+    filled = {"actions": [{"type": "reply", "chat": "c1", "text": "hi", **{k: None for k in item if k not in
+                                                                             ("type", "chat", "text")}}],
+              "summary": None}
+    out = tmp_path / "o.jsonl"
+    out.write_text(json.dumps({"type": "item.completed", "item": {"type": "agent_message",
+                                                                  "text": json.dumps(filled)}}) + "\n")
+    assert codex.parse(out).structured == {"actions": [{"type": "reply", "chat": "c1", "text": "hi"}]}
+
+
+def test_codex_workers_may_write_run_state_and_git_metadata(env, monkeypatch):
+    from ttp.providers import codex as codex_provider
+    monkeypatch.setattr(codex_provider.Codex, "binary", lambda self: "/usr/bin/true")  # never a real agent
+    p = make(env)
+    p.set_config("pricing", {"codex": {"some-model": [1.0, 0.1, 2.0]}})
+    from ttp.daemon import Daemon
+    wt = env["tmp"] / "wt"
+    subprocess.run(["git", "-C", str(env["repo"]), "worktree", "add", "-q", str(wt)], check=True)
+    d = Daemon(p.base)
+    tid = p.db.add_task("t", "s", kind="work", tier="light", origin="user")
+    rid = d.start_run("worker", "go", "codex", "light", str(wt), task=p.db.task(tid))
+    spec = json.loads((p.runs / str(rid) / "run.json").read_text())
+    argv = spec["argv"]
+    assert argv[-1] == "-", "the prompt on stdin must stay the last argument"
+    roots = next(a for a in argv if a.startswith("sandbox_workspace_write.writable_roots="))
+    roots = json.loads(roots.split("=", 1)[1])
+    assert str(p.state) in roots and str((env["repo"] / ".git").resolve()) in roots
+    assert spec["prices"] == {"some-model": [1.0, 0.1, 2.0]}, "the runner's budget check must use project prices"
+    (p.runs / str(rid) / "STOP").touch()
+    crid = d.start_run("coordinator", "decide", "codex", "light", str(p.base), read_only=True)
+    assert not any("writable_roots" in a for a in json.loads((p.runs / str(crid) / "run.json").read_text())["argv"])
+    (p.runs / str(crid) / "STOP").touch()
+
+
+def test_codex_and_cursor_price_tokens_with_project_rows(env, tmp_path):
+    from ttp.providers import get_provider
+    out = tmp_path / "o.jsonl"
+    out.write_text(json.dumps({"type": "turn.completed", "usage": {
+        "input_tokens": 1_000_000, "cached_input_tokens": 0, "output_tokens": 1_000_000,
+        "reasoning_output_tokens": 400_000}}) + "\n")
+    u = get_provider("codex").use("m1", {"m1": [1.0, 0.1, 2.0]}).parse(out)
+    assert u.output_tokens == 1_000_000, "reasoning tokens are part of output_tokens, not extra"
+    assert u.cost_usd == pytest.approx(3.0)
+    assert get_provider("codex").use("m1", {"m1": [1.0, 0.1, 2.0]}).cost_so_far(out) == pytest.approx(3.0)
+    assert get_provider("codex").use("other", {"m1": [1.0, 0.1, 2.0]}).parse(out).cost_usd == pytest.approx(24.0)
+    cur = tmp_path / "c.json"
+    cur.write_text(json.dumps({"result": "ok", "usage": {"inputTokens": 1_000_000, "outputTokens": 1_000_000}}))
+    assert get_provider("cursor").use("fast", {"fast": [0.5, 0.05, 1.0]}).parse(cur).cost_usd == pytest.approx(1.5)
+    assert get_provider("cursor").parse(cur).cost_usd == pytest.approx(18.0)
+
+
+def test_logged_out_alert_and_fix_name_the_right_provider(env):
+    p = make(env)
+    from ttp import web
+    from ttp.daemon import Daemon
+    assert "codex login" in web.fix_for("codex", "logged out")
+    assert "/login" in web.fix_for("claude", "logged out") and "claude" in web.fix_for("claude", "logged out")
+    d = Daemon(p.base)
+    rid = p.db.x("INSERT INTO runs(role,provider,model,started,status) VALUES('worker','codex','',?,'running')",
+                 (time.time(),))
+    run_dir = p.runs / str(rid)
+    run_dir.mkdir(parents=True)
+    (run_dir / "output.jsonl").write_text("")
+    (run_dir / "stderr.log").write_text("Error: not logged in\n")
+    d.finish_run(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)), {"rc": 1})
+    alert = p.db.one("SELECT text FROM messages WHERE kind='alert' ORDER BY id DESC LIMIT 1")["text"]
+    assert "codex login" in alert and "/login" not in alert, alert
+
+
+def test_an_unrelated_401_in_stderr_does_not_log_a_provider_out(env, tmp_path):
+    from ttp.providers import get_provider
+    out, err = tmp_path / "o.jsonl", tmp_path / "e.log"
+    out.write_text("")
+    err.write_text("warning: skipped 401 files larger than the limit\n")
+    assert not get_provider("codex").parse(out, err).auth_failed
+    err.write_text("error: unexpected status 401 from the API\n")
+    assert get_provider("codex").parse(out, err).auth_failed
+
+
+def test_a_codex_run_cut_off_before_reporting_usage_is_not_free(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    rid = p.db.x("INSERT INTO runs(role,provider,model,started,status) VALUES('worker','codex','',?,'running')",
+                 (time.time(),))
+    run_dir = p.runs / str(rid)
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text(json.dumps({"budget_usd": 2.0, "timeout_s": 100}))
+    (run_dir / "output.jsonl").write_text(json.dumps({"type": "item.started", "item": {"type": "command"}}) + "\n")
+    t0 = time.time() - 50
+    d.finish_run(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)),
+                 {"rc": -15, "started": t0, "ended": t0 + 50, "stopped": "timeout"})
+    run = p.db.one("SELECT status, cost_usd, cost_estimated FROM runs WHERE id=?", (rid,))
+    assert run["status"] == "timeout" and run["cost_estimated"] == 1
+    assert run["cost_usd"] == pytest.approx(1.0), "half the wall clock books half the budget"

@@ -125,7 +125,7 @@ def supervise(run_dir: Path) -> int:
 
     def watch() -> None:
         from .providers import get_provider  # local import: keeps startup cheap
-        prov = get_provider(spec["provider"])
+        prov = get_provider(spec["provider"]).use(spec.get("model", ""), spec.get("prices"))
         last_lease = last_budget = 0.0
         while child.poll() is None:
             now = time.time()

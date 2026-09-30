@@ -15,7 +15,7 @@ EXTRA_BIN_DIRS = ["~/.local/bin", "~/.npm-global/bin", "~/bin", "/opt/homebrew/b
                   "~/.bun/bin", "~/.cargo/bin"]
 
 AUTH_RE = re.compile(r"(authentication_failed|failed to authenticate|oauth (session|token) (expired|invalid)|"
-                     r"not logged in|please (run )?/?login|invalid api key|unauthorized|401)", re.I)
+                     r"not logged in|please (run )?/?login|invalid api key|unauthorized|(status|http|error)[ :=]*401\b)", re.I)
 
 LIMIT_RE = re.compile(r"(usage limit|limit reached|rate limit|quota exceeded|out of credits|"
                       r"insufficient (credits|balance|funds)|spend(ing)? limit)", re.I)
@@ -59,6 +59,14 @@ class RunUsage:
 class Provider:
     name = "base"
     binaries: tuple[str, ...] = ()
+    login_hint = "log in to the agent CLI there"   # how the user fixes "logged out" on this provider
+    model = ""                       # the run's model and the project's price rows, for providers
+    prices: dict = {}                # whose cost is estimated from tokens (see use())
+
+    def use(self, model: str = "", prices: dict | None = None) -> "Provider":
+        """Price this run's tokens with `model` and the project's `pricing.<provider>` rows."""
+        self.model, self.prices = model or "", dict(prices or {})
+        return self
 
     def binary(self) -> str | None:
         return find_binary(*self.binaries)
@@ -78,6 +86,11 @@ class Provider:
         """Arguments that load extra skill plugins for one run; [] when the agent cannot."""
         return []
 
+    def writable_args(self, dirs: list[str]) -> list[str]:
+        """Arguments that let a sandboxed worker also write `dirs` (run dir, project state, git
+        metadata); [] when the agent has no write sandbox."""
+        return []
+
     def cost_so_far(self, output_path: Path) -> float | None:
         """Mid-run spend, when the provider streams it and does not enforce a budget itself."""
         return None
@@ -89,6 +102,14 @@ class Provider:
     def meter(self) -> list:
         """Plan-window utilization for the whole account, when the provider exposes it."""
         return []
+
+
+def price_row(defaults: dict, overrides: dict, model: str) -> tuple[float, float, float]:
+    """($ per million input, cached input, output tokens) for `model`: the project's
+    `pricing.<provider>` rows win over the adapter's, and unknown models use "default"."""
+    rows = {k: v for k, v in (overrides or {}).items() if isinstance(v, (list, tuple)) and len(v) == 3}
+    table = {**defaults, **rows}
+    return tuple(float(x) for x in (table.get(model) or table["default"]))
 
 
 def last_json_object(text: str) -> dict | None:

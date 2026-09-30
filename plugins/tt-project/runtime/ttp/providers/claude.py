@@ -25,6 +25,7 @@ USAGE_KEYS = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache
 class Claude(Provider):
     name = "claude"
     binaries = ("claude",)
+    login_hint = "run `claude` there and use /login"
 
     def build(self, *, role, model, effort, cwd, budget_usd, read_only, schema, restrictions):
         argv = [self.binary() or "claude", "-p", "--output-format", "stream-json", "--verbose", "--no-chrome"]

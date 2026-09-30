@@ -2,10 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """OpenAI Codex CLI (`codex exec --json`). Codex reports tokens but no cost, has no budget flag,
 and exposes plan windows through `codex app-server` (`account/rateLimits/read`, no model tokens).
-Cost is therefore an estimate from a price table the project can edit; the runner enforces the
-run's dollar budget mid-flight from streamed token counts."""
+Cost is therefore an estimate from a price table the project can edit. Tokens arrive only when a
+turn completes, so the runner's mid-run budget check sees completed turns only."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -13,7 +14,7 @@ import tempfile
 from pathlib import Path
 
 from . import register
-from .base import AUTH_RE, LIMIT_RE, Provider, RunUsage
+from .base import AUTH_RE, LIMIT_RE, Provider, RunUsage, price_row
 
 # $ per million tokens: (input, cached input, output). Estimates only; the project may override
 # them in project.json under pricing.codex.<model>. Unknown models use the "default" row.
@@ -24,6 +25,7 @@ PRICES = {"default": (4.0, 0.4, 20.0)}
 class Codex(Provider):
     name = "codex"
     binaries = ("codex",)
+    login_hint = "run `codex login` there"
 
     def build(self, *, role, model, effort, cwd, budget_usd, read_only, schema, restrictions):
         argv = [self.binary() or "codex", "exec", "--json", "-C", cwd, "--skip-git-repo-check"]
@@ -39,12 +41,14 @@ class Codex(Provider):
             if not restrictions.get("no_internet"):
                 argv += ["-c", "sandbox_workspace_write.network_access=true"]
         if schema:
-            fd, path = tempfile.mkstemp(prefix="ttp-schema-", suffix=".json")
-            with os.fdopen(fd, "w") as f:
-                json.dump(schema, f)
-            argv += ["--output-schema", path]
+            argv += ["--output-schema", schema_file(strict_schema(schema))]
         argv += ["-"]
         return argv, {}
+
+    def writable_args(self, dirs):
+        # workspace-write only lets the worker write its cwd; result.json, `ttp note`, `ttp lock`
+        # and commits in a worktree (whose git metadata lives in the main repository) are elsewhere.
+        return ["-c", "sandbox_workspace_write.writable_roots=" + json.dumps([str(d) for d in dirs])] if dirs else []
 
     def _events(self, output_path: Path):
         try:
@@ -67,31 +71,31 @@ class Codex(Provider):
                 u = ev.get("usage") or {}
                 inp += int(u.get("input_tokens") or 0)
                 cached += int(u.get("cached_input_tokens") or 0)
-                out += int(u.get("output_tokens") or 0) + int(u.get("reasoning_output_tokens") or 0)
+                # output_tokens already includes reasoning; reasoning_output_tokens is a breakdown.
+                out += int(u.get("output_tokens") or 0)
             elif t.startswith("item.") and (ev.get("item") or {}).get("type") == "agent_message":
                 last = (ev.get("item") or {}).get("text") or last
         return inp, cached, out, last
 
-    def _price(self, model: str, inp: int, cached: int, out: int, prices: dict | None = None) -> float:
-        table = {**PRICES, **(prices or {})}
-        pin, pcached, pout = table.get(model) or table["default"]
+    def _price(self, inp: int, cached: int, out: int) -> float:
+        pin, pcached, pout = price_row(PRICES, self.prices, self.model)
         return ((inp - cached) * pin + cached * pcached + out * pout) / 1e6
 
     def cost_so_far(self, output_path):
         inp, cached, out, _ = self._tokens(output_path)
-        return self._price("", inp, cached, out)
+        return self._price(inp, cached, out)
 
     def parse(self, output_path, stderr_path=None) -> RunUsage:
         inp, cached, out, last = self._tokens(output_path)
         u = RunUsage(input_tokens=inp - cached, cache_read_tokens=cached, output_tokens=out, final_text=last,
                      estimated=True)
-        u.cost_usd = self._price("", inp, cached, out)
+        u.cost_usd = self._price(inp, cached, out)
         errors = [ev for ev in self._events(output_path) if ev.get("type") in ("turn.failed", "error")]
         if errors:
             u.error = json.dumps(errors[-1])[:400]
         if last.strip().startswith("{"):
             try:
-                u.structured = json.loads(last)
+                u.structured = drop_nulls(json.loads(last))
             except ValueError:
                 pass
         blob = u.error + " " + (Path(stderr_path).read_text(errors="replace")[-2000:]
@@ -162,3 +166,53 @@ class Codex(Provider):
             util = float(w.get("usedPercent") or 0)
             wins.append(Window("codex", name, 100.0 if not allowed else util, w.get("resetsAt"), rl.get("planType") or ""))
         return wins
+
+
+def strict_schema(schema):
+    """`--output-schema` is enforced in strict mode: every object closed and every property
+    required. Optional properties become nullable instead; drop_nulls() undoes that on the way back."""
+    if not isinstance(schema, dict):
+        return schema
+    out = dict(schema)
+    if "items" in out:
+        out["items"] = strict_schema(out["items"])
+    props = schema.get("properties")
+    if schema.get("type") == "object" and isinstance(props, dict):
+        required = set(schema.get("required") or [])
+        out["properties"] = {}
+        for name, sub in props.items():
+            sub = strict_schema(sub)
+            if name not in required:
+                sub = _nullable(sub)
+            out["properties"][name] = sub
+        out["required"] = list(props)
+        out["additionalProperties"] = False
+    return out
+
+
+def _nullable(sub: dict) -> dict:
+    t = sub.get("type")
+    sub = dict(sub)
+    sub["type"] = [*(t if isinstance(t, list) else [t]), "null"] if t else ["null"]
+    if "enum" in sub:
+        sub["enum"] = [*sub["enum"], None]
+    return sub
+
+
+def drop_nulls(value):
+    if isinstance(value, dict):
+        return {k: drop_nulls(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [drop_nulls(v) for v in value]
+    return value
+
+
+def schema_file(schema: dict) -> str:
+    """One file per distinct schema, reused across runs, so coordinator turns leave no temp files."""
+    text = json.dumps(schema, sort_keys=True)
+    path = Path(tempfile.gettempdir()) / f"ttp-schema-{hashlib.sha256(text.encode()).hexdigest()[:16]}.json"
+    if not path.exists() or path.read_text(errors="replace") != text:
+        tmp = path.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_text(text)
+        os.replace(tmp, path)
+    return str(path)

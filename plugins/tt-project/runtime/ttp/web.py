@@ -18,6 +18,7 @@ from . import schedule as sched
 from .daemon import HEARTBEAT_STALE_S, heartbeat
 from .db import DB, load_result
 from .project import Project
+from .providers import get_provider
 from .runner import stop_runs
 
 STATIC = Path(__file__).resolve().parent / "web"
@@ -46,7 +47,16 @@ def free_port(start: int = 18700) -> int:
 
 
 DAY, WEEK = 86400, 7 * 86400
-FIXES = {"logged out": "log in once on the project's machine (for Claude Code: run `claude` there and use /login)"}
+
+
+def fix_for(provider: str, note: str) -> str:
+    if note == "logged out":
+        try:
+            hint = get_provider(provider).login_hint
+        except KeyError:
+            hint = "log in to the agent CLI there"
+        return f"log in once on the project's machine: {hint}"
+    return "resumes by itself when the limit resets"
 
 
 def at(ts: float | None, now: float | None = None) -> str:
@@ -81,7 +91,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         if float(v.get("until") or 0) > now:
             note = str(v.get("note") or "limit reached")
             paused_providers.append({"provider": r["key"].split(":", 1)[1], "note": note, "until": v["until"],
-                                     "fix": FIXES.get(note, "resumes by itself when the limit resets")})
+                                     "fix": fix_for(r["key"].split(":", 1)[1], note)})
     waiting = db.q("SELECT id, title, not_before, blocked_reason FROM tasks WHERE status='queued' AND not_before>? "
                    "ORDER BY not_before", (now,))
     queued = db.q("SELECT id, depends_on FROM tasks WHERE status='queued' AND (not_before IS NULL OR not_before<=?)",

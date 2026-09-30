@@ -9,7 +9,7 @@ import json
 from pathlib import Path
 
 from . import register
-from .base import AUTH_RE, LIMIT_RE, Provider, RunUsage
+from .base import AUTH_RE, LIMIT_RE, Provider, RunUsage, price_row
 
 PRICES = {"default": (3.0, 0.3, 15.0)}
 
@@ -18,6 +18,7 @@ PRICES = {"default": (3.0, 0.3, 15.0)}
 class Cursor(Provider):
     name = "cursor"
     binaries = ("agent", "cursor-agent")
+    login_hint = "run `agent login` there"
 
     def build(self, *, role, model, effort, cwd, budget_usd, read_only, schema, restrictions):
         argv = [self.binary() or "agent", "-p", "--output-format", "json", "--trust", "--workspace", cwd]
@@ -48,7 +49,7 @@ class Cursor(Provider):
             u.cache_write_tokens = int(usage.get("cacheWriteTokens") or 0)
             if data.get("is_error"):
                 u.error = str(data.get("result"))[:400]
-        pin, pcached, pout = PRICES["default"]
+        pin, pcached, pout = price_row(PRICES, self.prices, self.model)
         u.cost_usd = (u.input_tokens * pin + u.cache_read_tokens * pcached + u.output_tokens * pout) / 1e6
         blob = u.error + " " + (Path(stderr_path).read_text(errors="replace")[-2000:]
                                 if stderr_path and Path(stderr_path).exists() else "")

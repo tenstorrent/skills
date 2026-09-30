@@ -62,8 +62,10 @@ The stable part (role, charter, memory) is the system prompt, which providers ca
 ## Adding a provider
 
 1. `runtime/ttp/providers/<name>.py`: subclass `Provider`; `build`, `parse`, `account`,
-   optionally `meter` (only if it costs no model tokens) and `cost_so_far` (if it streams usage
-   but cannot enforce a budget itself).
+   `login_hint`, optionally `meter` (only if it costs no model tokens), `cost_so_far` (if it
+   streams usage but cannot enforce a budget itself), `writable_args` (if workers run in a write
+   sandbox) and `plugin_args`. Price estimated tokens with `price_row(PRICES, self.prices,
+   self.model)` so `pricing.<provider>` in project.json applies.
 2. Import it in `providers/__init__.py:_load_all`.
 3. Add default tiers in `project.py:DEFAULT_CONFIG`.
 4. Add a parsing test with a recorded output sample.
