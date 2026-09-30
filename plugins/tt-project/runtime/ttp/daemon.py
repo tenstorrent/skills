@@ -720,12 +720,11 @@ class Daemon:
         not_before = None
         if rebooted:
             extra["reboot"] = {"at": self.boot_at, "notes": _last_notes(run_dir)}
+        wakes = _reboot_wakes(task)
         if reboot_lost:
-            losses = sum(1 for x in db.q("SELECT note FROM runs WHERE task=? AND status='lost' AND note LIKE ?",
-                                         (task["id"], "%lost_to_reboot%"))
-                         if json.loads(x["note"] or "{}").get("lost_to_reboot"))
-            if losses >= int(self.cfg["budget"].get("max_reboot_losses", 3)):
-                new, reason = "blocked", f"lost to a host reboot {losses} times; it may be causing them"
+            n = self._reboot_losses(task["id"]) + wakes
+            if n >= int(self.cfg["budget"].get("max_reboot_losses", 3)):
+                new, reason = "blocked", f"lost to a host reboot {n} times; it may be causing them"
         if waiting:
             try:
                 waits = int(load_result(task["result"]).get("waits") or 0) + 1
@@ -735,6 +734,11 @@ class Daemon:
             extra["waits"] = waits
             if waits > int(self.cfg["budget"].get("max_waits", 24)):
                 new, reason = "blocked", f"still waiting after {waits} tries: {what}"
+            elif rebooted and result.get("survives_reboot") is not True and (
+                    n := self._reboot_losses(task["id"]) + wakes) >= int(
+                    self.cfg["budget"].get("max_reboot_losses", 3)):
+                # This run is already one of the losses: its wait counts once, not again as a wake.
+                new, reason = "blocked", f"lost to a host reboot {n} times; it may be causing them"
             elif rebooted and result.get("survives_reboot") is not True:
                 # What it waited on died with the host: its next run finds out now, not at the timer.
                 not_before = time.time()
@@ -746,9 +750,13 @@ class Daemon:
                 reason = f"waiting for {what}; next try {time.strftime('%H:%M', time.localtime(not_before))}"
         if ended:
             extra["run_status"] = ended
+        if wakes and new != "blocked":
+            # Waits a reboot cut short count against max_reboot_losses; a block starts the count over.
+            extra["reboot_wakes"] = wakes
         upd = {"status": new, "attempts": attempts, "result": dump_result(
             {"summary": summary, "status": rstatus or status, **extra,
-             **({k: v for k, v in result.items() if k not in ("summary", "waits", "waiting_since", "woke")}
+             **({k: v for k, v in result.items()
+                 if k not in ("summary", "waits", "waiting_since", "woke", "reboot_wakes")}
                 if isinstance(result, dict) else {})})}
         if reason:
             upd["blocked_reason"] = reason[:500]
@@ -1288,9 +1296,31 @@ class Daemon:
             if not since or since >= self.boot_at:
                 continue
             self._probe_rc.pop(t["id"], None)
+            wakes = _reboot_wakes(t) + 1
+            n = self._reboot_losses(t["id"]) + wakes
+            if n >= int(self.cfg["budget"].get("max_reboot_losses", 3)):
+                # Its detached job may be what takes the host down: stop waking it.
+                prev.pop("reboot_wakes", None)
+                reason = f"lost to a host reboot {n} times; it may be causing them"
+                with db.tx():
+                    db.update_task(t["id"], status="blocked", blocked_reason=reason, result=dump_result(prev))
+                    db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                         (time.time(), f"task:{t['id']}", "task_blocked", "high",
+                          f"#{t['id']} {t['title']} → blocked: {reason}", "queued", t["id"]))
+                log(self.p, f"task {t['id']} blocked: {reason}")
+                continue
             db.update_task(t["id"], not_before=None, result=dump_result(
-                {**prev, "woke": "the host rebooted", "reboot": {"at": self.boot_at}}))
+                {**prev, "woke": "the host rebooted", "reboot": {"at": self.boot_at}, "reboot_wakes": wakes}))
             log(self.p, f"task {t['id']} waited from before the reboot; due now")
+
+    def _reboot_losses(self, tid: int) -> int:
+        """Runs of the task lost to a host reboot since it was last blocked: a person or the
+        coordinator who requeues a task blocked for reboots starts its count over."""
+        db = self.p.db
+        since = (db.one("SELECT MAX(ts) ts FROM events WHERE task=? AND kind='task_blocked'", (tid,)) or {}).get("ts")
+        return sum(1 for x in db.q("SELECT note FROM runs WHERE task=? AND status='lost' AND note LIKE ? "
+                                   "AND started>?", (tid, "%lost_to_reboot%", since or 0))
+                   if json.loads(x["note"] or "{}").get("lost_to_reboot"))
 
     def _start_probe(self, tid: int, probe: str, now: float) -> None:
         self._probed[tid] = now
@@ -1661,6 +1691,14 @@ def _end_group(pgid: int, grace_s: float) -> None:
         os.killpg(pgid, signal.SIGKILL)
     except OSError:
         pass
+
+
+def _reboot_wakes(task: dict) -> int:
+    """Boot-time wakes of a waiting task since it was last blocked, carried in its result."""
+    try:
+        return max(0, int(load_result(task["result"]).get("reboot_wakes") or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _last_notes(run_dir: Path, n: int = 5) -> list[str]:

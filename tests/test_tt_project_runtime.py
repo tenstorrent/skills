@@ -5131,6 +5131,70 @@ def test_the_third_reboot_loss_blocks_the_task(env, tmp_path):
     assert ev and ev[-1]["severity"] == "high" and ev[-1]["status"] == "queued", ev
 
 
+
+def test_a_requeued_task_is_not_blocked_again_by_one_later_reboot_loss(env, tmp_path):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    tid = p.db.add_task("flash the board", "s", kind="work", tier="light", origin="user")
+    for i in range(3):
+        _lost_to_reboot(p, d, tmp_path, tid, name=f"lost{i}")
+    assert p.db.task(tid)["status"] == "blocked"
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "status": "queued"}]) == []
+    _lost_to_reboot(p, d, tmp_path, tid, name="after")
+    assert p.db.task(tid)["status"] == "queued", "a requeue did not start the reboot count over"
+
+
+def _waiting_from_before_the_boot(p, tid):
+    p.db.update_task(tid, status="queued", not_before=time.time() + 3600, result=json.dumps(
+        {**json.loads(p.db.task(tid)["result"] or "{}"), "status": "waiting", "summary": "job running",
+         "retry_after_s": 3600, "retry_when": "exit 1", "waiting_since": time.time() - 900}))
+
+
+def test_three_boot_time_wakes_of_a_waiting_task_block_it(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    tid = p.db.add_task("soak test", "s", kind="work", tier="light", origin="user")
+    for i in range(3):
+        _waiting_from_before_the_boot(p, tid)
+        d = Daemon(p.base)
+        d.boot_at = time.time() - 300
+        d.wake_after_reboot()
+        t = p.db.task(tid)
+        assert t["status"] == ("blocked" if i == 2 else "queued"), (i, dict(t))
+    assert t["blocked_reason"] == "lost to a host reboot 3 times; it may be causing them"
+    assert "reboot_wakes" not in json.loads(t["result"]), "a block kept the old count"
+    ev = p.db.q("SELECT severity, status FROM events WHERE kind='task_blocked' AND task=?", (tid,))
+    assert ev and ev[-1]["severity"] == "high" and ev[-1]["status"] == "queued", ev
+
+
+def test_boot_time_wakes_and_reboot_losses_count_together(env, tmp_path):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    tid = p.db.add_task("soak test", "s", kind="work", tier="light", origin="user")
+    _lost_to_reboot(p, d, tmp_path, tid, name="lost0")
+    _waiting_from_before_the_boot(p, tid)
+    d.boot_at = time.time() - 300
+    d.wake_after_reboot()
+    assert json.loads(p.db.task(tid)["result"])["reboot_wakes"] == 1
+    # The woken run hands off 'waiting' again; the host goes down under that wait's job.
+    p.db.update_task(tid, status="running")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "output.jsonl").write_text("")
+    (run_dir / "result.json").write_text(json.dumps({"status": "waiting", "summary": "job restarted",
+                                                     "retry_after_s": 3600, "reboot_wakes": 0}))
+    (run_dir / "lease").touch()
+    os.utime(run_dir / "lease", (time.time() - 999, time.time() - 999))
+    p.db.x("INSERT INTO runs(task,role,provider,started,status,dir,boot_id) VALUES(?,?,?,?,?,?,?)",
+           (tid, "worker", "fake", time.time() - 1800, "running", str(run_dir), "an-earlier-boot"))
+    d.reap_runs()
+    t = p.db.task(tid)
+    assert t["status"] == "blocked", dict(t)
+    assert t["blocked_reason"] == "lost to a host reboot 3 times; it may be causing them"
+
 def test_a_light_review_stays_light_after_a_reboot_loss(env, tmp_path):
     p = make(env)
     from ttp import worktree
