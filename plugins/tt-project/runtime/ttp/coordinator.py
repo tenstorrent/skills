@@ -62,10 +62,20 @@ def system_prompt(p: Project) -> str:
 def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int]) -> str:
     db = p.db
     now = time.time()
-    lines = [f"# STATE at {time.strftime('%Y-%m-%d %H:%M %Z')}", "## Budget"]
+    lines = [f"# STATE at {time.strftime('%Y-%m-%d %H:%M %Z')}",
+             "## Project budget (authoritative; your own turn's small spend limit is NOT this budget)"]
+    b = p.config()["budget"]
     for prov, g in gates.items():
-        lines.append(f"- {prov}: {g['level']} ({'; '.join(g['reasons']) or 'ok'}) max_tier={g['max_tier']} "
+        n = g.get("numbers", {})
+        if g.get("regime") == "windows":
+            money = (f"plan windows: {n.get('window')} at {n.get('utilization')}% of the account; "
+                     f"the project may use it up to {n.get('limit')}%")
+        else:
+            money = (f"caps: ${n.get('spent_24h', 0):.2f} of ${b.get('daily_usd')} per 24h, "
+                     f"${n.get('spent_7d', 0):.2f} of ${b.get('weekly_usd')} per 7 days")
+        lines.append(f"- {prov}: {g['level']} ({'; '.join(g['reasons']) or 'ok'}) · {money} · max_tier={g['max_tier']} "
                      f"max_parallel={g['max_parallel']} optional_work={'yes' if g['allow_optional'] else 'no'}")
+    lines.append(f"- per-task default budgets: {b.get('task_default_usd')}")
     lines.append("## Open tasks (id | status | tier | priority | age | title | last note)")
     rows = db.q("SELECT * FROM tasks WHERE status NOT IN ('done','failed','cancelled') ORDER BY priority, id LIMIT 60")
     for t in rows:

@@ -550,7 +550,7 @@ def cmd_upgrade(a) -> None:
             _copy_tree(src / part, tmp / dst)
         _git(tmp, "add", "-A")
         if _git(tmp, "status", "--porcelain"):
-            ver = (src / "runtime" / "ttp" / "__init__.py").read_text().split('"')[1]
+            ver = re.search(r'__version__ = "([^"]+)"', (src / "runtime" / "ttp" / "__init__.py").read_text()).group(1)
             _git(tmp, *ident, "commit", "-q", "-m", f"tt-project template {ver}")
     finally:
         _git(h, "worktree", "remove", "--force", str(tmp))

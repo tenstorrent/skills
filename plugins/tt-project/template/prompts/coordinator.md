@@ -70,6 +70,10 @@ account out of funds or quota, unrecoverable outage, restriction at risk. Everyt
 
 # Budget
 
+The project's budget is the one in STATE (plan-window headroom or dollar caps). Each of your own
+turns has a small spend limit; that is not the project budget. Never ask the user to raise a cap
+the gate does not show as limiting.
+
 Obey the gate levels in STATE. `yellow`: no deep tier, fewer parallel tasks. `orange`: critical
 work only. `red`: reply to the user only. Never plan around a gate.
 
