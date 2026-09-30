@@ -23,6 +23,7 @@ Read only what helps the current task:
 - `models/tt_transformers/tt/generator.py`: canonical decode trace patterns, including host input preparation, persistent device inputs, replay refresh, and split sampling.
 - `models/common/sampling/generator.py` and `models/common/modules/sampling/sampling_1d.py`: common on-device sampling implementations to compare before choosing a token-out sampling path.
 - `models/tt_transformers/tt/model.py`: model-side `prepare_decode_inputs_host` and device-only `ttnn_decode_forward` split.
+- In the target tt-metal checkout, `tech_reports/AdvancedPerformanceOptimizationsForModels/TraceCorrectness.md` ([upstream guide](https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/AdvancedPerformanceOptimizationsForModels/TraceCorrectness.md)): trace correctness requirements and the trace allocation tracker. Read this before accepting a capture/replay path or exempting intentionally shared trace buffers. This guide and the tracker implementation belong to tt-metal, not the installed skill package.
 - `advanced_perf_optimizations.md`: deeper examples for TTNN trace capture/replay, multiple command queues, trace plus multi-CQ, and production benchmarking patterns. Search this file for the API or failure mode you are working on before loading it wholesale.
 
 ## Mental Model
@@ -50,13 +51,13 @@ Prefer this structure:
 1. Build all weights, caches, page tables, semaphores, persistent CCL buffers, and lazy module state before capture.
 2. Create host-side input tensors with `device=None` if useful.
 3. Copy or allocate stable device input tensors before capture.
-4. Run one warm compile call with the same shapes and mode so every op is compiled (see Program-Cache Warmup).
+4. Prepare and compile all supported variants with their exact shapes and modes before recording the first trace (see Program-Cache Warmup).
 5. Begin trace capture.
 6. Call a device-only forward method that consumes the stable device tensors.
 7. End trace capture.
 8. For each replay, update stable device inputs outside capture, then call `ttnn.execute_trace`.
 
-Minimal pattern:
+Minimal single-variant pattern (for multiple variants, finish every variant's preparation before the first capture):
 
 ```python
 trace_input = ttnn.from_torch(
@@ -85,11 +86,32 @@ for batch in batches:
 
 Trace capture cannot compile programs. A program-cache miss inside capture forces a new kernel build, which issues a host->device write and aborts with `Writes are not supported during trace capture`. So every op in the traced region must already be compiled (warmed) with the *exact* program-cache signature it will have during capture.
 
+Warmup must cover the whole generator, not only the trace about to be captured. Even compilation outside capture, in an otherwise unrelated path, can leave persistent allocations that a live trace overwrites. Use two phases:
+
+1. **Prepare all supported variants without capture.** Compile the physical prefill/chunk buckets, decode variants, sampling modes, and applicable post-processing or vision paths; allocate their persistent inputs, outputs where supported, CCL resources, and helper state. Include eager paths that run between replays. Deduplicate preparation by the actual program signature, not each request's logical length tuple.
+2. **Record from prepared state.** Only after that preparation finishes, record traces without interleaving new compilation or unrelated persistent allocations. An already-prepared variant may have its first capture deferred until needed to conserve trace-region space; that is not repeated recapture.
+
+The generator owns this ordering for standalone and serving entrypoints, during explicit setup or coordinated first use; do not depend solely on vLLM warmup callbacks. Repeated setup calls should reuse prepared state. Restore request/KV state and sampling RNG state modified by warmup; a late decode compile pass with mock inputs must not overwrite a real request's prefilled cache.
+
 - Warm with the same shapes, dtypes, layouts, memory configs, and mode as capture; the warm call must drive the identical op sequence and code path so every op variant is compiled.
-- The signature can include arguments you would not expect. For example, the integer `begins`/`ends`/`step` passed to `ttnn.slice` are compile-time constants baked into the program hash, so slicing at a different offset, length, or start-tile alignment is a different program that needs its own warm-up. (There is a version which tensor-valued arguments that avoids this.) When in doubt, warm with the same argument *values*, not just the same tensor shapes.
+- The signature can include arguments you would not expect. For example, the integer `begins`/`ends`/`step` passed to `ttnn.slice` are compile-time constants baked into the program hash, so slicing at a different offset, length, or start-tile alignment is a different program that needs its own warm-up. Tensor-valued arguments can avoid this only where the op supports them. When in doubt, warm with the same argument *values*, not just the same tensor shapes.
 - Warm state-update ops too. Autoregressive helpers such as `ttnn.plus_one`, page/position tensor updates, sampler trace setup, and persistent-output buffer allocation are easy to forget because they are not "the model", but they still compile programs and allocate resources.
 - If warm-up mutates persistent trace inputs such as token, position, RoPE index, page table, or KV-cache state, reset those tensors to the exact intended capture state immediately before `begin_trace_capture`.
-- If you still hit an unexpected program-cache miss during capture, warm up again immediately before `begin_trace_capture` (re-run the exact forward once more, then capture with nothing else in between). In rare cases an op's program-cache signature depends on transient device state such as free L1, so a warm-up done earlier no longer matches by the time capture runs. See https://github.com/tenstorrent/tt-metal/issues/46533.
+- If you still hit an unexpected program-cache miss during capture, reproduce on a fresh setup without conflicting live traces: re-run the exact warm forward immediately before `begin_trace_capture`, with nothing else in between. In rare cases an op's program-cache signature depends on transient device state such as free L1, so an earlier warmup no longer matches. Diagnose and stabilize that signature; repeated production warmup/recapture is not the fix.
+
+## Trace Lifetime And Reuse
+
+During normal serving, retain each captured trace for the lifetime of the configured model and device. Supported requests must not invalidate, retire, evict, or recapture traces. If request handling needs invalidation for correctness, treat that as a preparation, trace-selection, or buffer-lifetime defect. Fix that defect before accepting the serving path.
+
+Capture at most once per distinct execution signature. Identify that signature by the captured program, physical layout, and stable buffer/resource bindings, not by a request ID or cache-key label. Separate prepared buffer slots can need separate traces. A different signature selects a different trace; it does not invalidate existing traces. Changes to tokens, positions, logical prompt lengths, page mappings, or scheduler slots must refresh persistent inputs or select a prepared variant. Use supported physical buckets and runtime tensor inputs to bound the variants. Do not impose new logical-length restrictions to make warmup finite. A deferred first capture of a prepared variant is not recapture and must preserve every existing trace.
+
+Switching between supported modes must select the matching cached trace, not clear traces. For example, greedy -> regular sampling -> greedy must reuse the first greedy trace. A new logical prefill length must not retire decode or sampling traces to make room for late persistent allocations. Prepare those allocations before capture.
+
+Keep captured backing storage and execution resources valid throughout serving. Replacing them during request handling is not an accepted reason to rebuild traces. Never replay an unsafe trace to meet the reuse requirement. Keep the allocation checks enabled for validation and leave the gate failing until the cause is fixed. Measured recapture latency does not turn a correctness workaround into an accepted design.
+
+Explicit model unload/reconfiguration, server teardown, or device recovery ends the affected trace lifetime. Stop using those traces before releasing their resources. Prepare and capture again before resuming on the new configuration. These lifecycle transitions are not a request-time fallback. A deliberately bounded trace cache can be a memory/latency tradeoff, but it is not a correctness fix or an automatic exception to this bringup requirement. If the target service requires that design, raise it with the owner instead of silently weakening the gate.
+
+Exact prompt lengths, chunk start positions, batch composition, and row order can change without changing the captured program. A changed request key must not trigger invalidation. Chunked prefill needs explicit coverage: first chunks, continuation chunks with different start positions, and partial final chunks. Include new combinations and orderings of known lengths while other requests decode. None may retire prefill, decode, or sampling traces. This applies even when prefill runs eagerly. Run the [mixed-shape serving check](../vllm-integration/SKILL.md#mixed-shape-trace-reuse-check) to test these transitions on the same server. Retain the allocation safety checks; removing retirement alone is not a safe fix.
 
 ## Generator Pattern
 
@@ -106,7 +128,7 @@ Build the hot loop so the steady-state step is trace replay plus the minimum cal
 
 ## Canonical Split Sampling
 
-Implement token-out traced decode with two cooperating traces:
+After preparing all model and sampling variants under the warmup contract above, implement token-out traced decode with two cooperating traces:
 
 1. Capture the model decode trace up to sampler-ready logits.
 2. Capture the chosen common sampling implementation, or a correct generator-owned trace wrapper around it, for the active sampling mode. Before choosing, compare `models/common/sampling/` and `models/common/modules/sampling/sampling_1d.py` against the model's state, seed, topology, trace, and logprob requirements.
@@ -153,6 +175,33 @@ Mesh traces can include collective operations, but collective resources need car
 - Reuse the same replicated or sharded input tensor allocations for capture and replay.
 
 If a single decoder layer traces but the full model does not, inspect terminal work separately: final distributed norm, hidden gathers, LM head, logits gather, sampling, argmax, and token readback.
+
+## Trace Allocation Safety Gate
+
+Before accepting a new or changed traced path, run its representative repeated-replay test in a fresh process with tracking enabled before TTNN is imported. For example, from the target tt-metal checkout:
+
+```bash
+TT_METAL_TRACE_ALLOC_TRACKING=1 TT_METAL_TRACE_ALLOC_SKIP_PROGRAM_CACHE=0 python your_replay_test.py
+```
+
+The tracker is disabled by default and reads configuration once at startup. It validates live unsafe allocations automatically before `ttnn.execute_trace`; surviving unsafe buffers raise `RuntimeError`. For serving, set the environment in the server/worker processes before startup, not only in the client sending requests.
+
+Exercise every trace variant and the real replay ordering, including alternating traces that share persistent inputs or outputs. Keep program-cache allocations in the acceptance check. `TT_METAL_TRACE_ALLOC_SKIP_PROGRAM_CACHE=1` is only a diagnostic noise filter; a run that needs it is not passing evidence because late program compilation remains unsafe. When investigating a failure, add `TT_METAL_TRACE_ALLOC_TRACEBACKS=1` and, if needed, set `TT_METAL_TRACE_ALLOC_REFERRER_DEPTH`.
+
+First fix late compilation and unintended persistent allocations. For deliberately shared buffers that remain, use `trace_allocation_tracker.acknowledge_corruptible(tensor)` whenever possible. Acknowledge only the exact tensors whose lifetimes have been reviewed. If a known output is created during capture, identify it after capture and acknowledge that output before replay, rather than exempting the capture window:
+
+```python
+from ttnn.tools import trace_allocation_tracker
+
+# The exact output identified after capture, with its lifetime verified below.
+trace_allocation_tracker.acknowledge_corruptible(trace_output)
+```
+
+Acknowledgment does not prevent corruption; it removes the backing allocation from validation. Acknowledging a view exempts the shared backing buffer, so identify its other aliases and consumers too. Prove the lifetime against every live trace and their actual replay order: refresh an input after any replay that can clobber it and before its next read; consume or preserve an output before another trace can overwrite it. Trace B overwriting its own output does not prove that the output survives an intervening replay of trace A.
+
+Use `trace_allocation_tracker.corruptible_allocation_scope` only when exact-tensor acknowledgment is not possible. Use the narrowest possible scope around the required allocation calls. Move unrelated work outside it. Do not wrap an entire trace capture, forward pass, or warmup. The scope exempts every allocation made inside it, including implicit program-cache and helper allocations, against all active traces. Identify those allocations and verify each lifetime as above. Explain why exact-tensor acknowledgment cannot be used. If you cannot isolate and justify the allocations, fix the allocation path or report the blocker instead of widening the scope.
+
+Trace IDs are scoped by the active sub-device manager. Capture, end, execute, and release each trace with the intended manager active, and cover manager changes in the replay test when the implementation uses them. A clean tracker run does not replace warmup, cache-key, updated-input, output-correctness, or token-feedback checks. Collect performance numbers separately with tracking and diagnostics disabled, recording the settings for each run.
 
 ## Debugging Trace Failures
 
@@ -207,6 +256,9 @@ Leave compact evidence that the traced path is real:
 
 - Correctness before and after tracing against the same reference.
 - Repeated replay determinism across several executions.
+- The exact tracking-enabled invocation and environment, trace variants and replay ordering covered, and a clean allocation-check result with program-cache allocations included. List each acknowledged backing allocation, its aliases/consumers, and its lifetime invariant against every live trace. For each allocation scope, explain why exact-tensor acknowledgment is not possible and identify the allocation calls it encloses.
+- Warmup coverage and ordering: supported physical buckets/modes and persistent setup completed before the first capture, plus restoration of request/KV and RNG state.
+- Cross-request reuse evidence on the same generator/server: interleave prefill and decode, change logical lengths within prepared buckets, and alternate supported sampling modes before returning to an earlier signature. Map cache keys to actual execution signatures and trace IDs. Show at most one capture per signature and zero invalidations, retirements, or evictions during the workload. Include traces captured before the workload. Do not reset counters or restart the generator to hide recapture. Separate teardown releases from request handling. Include any deferred first-capture cost in request latency.
 - Updated-input replay test proving outputs change when trace inputs are refreshed.
 - For vLLM decode: stale-input validation for token/current-position/page-table refresh, explicit async-overlap setting and proof if enabled, on-device sampling trace evidence, and a passing server smoke run with decode trace enabled.
 - Split-sampling evidence for token-out decode: internal sampling trace enabled, `tt_out_tok` wired to the persistent decode token input, and greedy benchmarks using the fastest correct on-device sampling strategy measured for this mesh.

@@ -63,7 +63,9 @@ vLLM owns KV-cache allocation in serving mode. Preserve the generator's two cach
 
 Not every cache must be vLLM-owned. vLLM owns the attention KV cache, but recurrent / linear-attention state of constant size (for example conv windows or SSM / gated-delta recurrent state) can live inside the model and be carried across decode steps there, rather than being modeled as a vLLM KV cache. For attention itself, route sliding-window and full-attention layers through vLLM's hybrid attention infrastructure (per-layer KV-cache specs and block tables) instead of forcing a single uniform attention type across all layers.
 
-Make prompt lengths, page tables, decode positions, batch dimensions, trace-side state, and on-device sampling explicit. The serving decode pass must drive the generator's traced decode path, not an eager-only fallback. When adding or debugging trace capture/replay, trace-safe inputs, or replay correctness for this adapter, use `$tt-enable-tracing`. The adapter should not duplicate model logic that already lives in `tt/model.py` or `tt/generator.py`.
+Make prompt lengths, page tables, decode positions, batch dimensions, trace-side state, and on-device sampling explicit. The serving decode pass must drive the generator's traced decode path, not an eager-only fallback. When adding or debugging trace capture/replay, trace-safe inputs, or replay correctness for this adapter, use `$tt-enable-tracing`. Before accepting the adapter, run representative repeated serving replay with `TT_METAL_TRACE_ALLOC_TRACKING=1` set in the server/worker environment before TTNN is imported. Alternate the trace keys and request patterns that share persistent inputs/outputs, and resolve every unsafe allocation under the target tt-metal checkout's `tech_reports/AdvancedPerformanceOptimizationsForModels/TraceCorrectness.md`. The adapter should not duplicate model logic that already lives in `tt/model.py` or `tt/generator.py`.
+
+Use the generator-owned two-phase warmup and trace lifetime rule from `$tt-enable-tracing`. vLLM callbacks must not be the only entrypoint that enforces warmup. Run the [mixed-shape trace reuse check](#mixed-shape-trace-reuse-check) on the same server.
 
 For decode performance, implement the vLLM async split before advertising it: `decode_forward(..., read_from_device=False)` should return device tensors, `read_decode_output(..., async_read=True)` should perform the minimal deferred read, and `process_decode_output_host(...)` should do host formatting. Only set `supports_async_decode=True` after this path passes the vLLM plugin's expectations with decode trace enabled and stale-token/current-position tests passing.
 When async decode, on-device sampling and tracing are enabled, vLLM may submit step
@@ -129,6 +131,22 @@ not a separate all-layer startup or default soak. Expand only for unexplained gr
 errors, or uncovered affected paths; use an isolated op/layer repro to investigate.
 A time budget ending before required checks complete is incomplete evidence, not a
 pass. Preserve final all-layer serving evidence and the existing acceptance gates.
+
+### Mixed-shape trace reuse check
+
+Include this check in Stage 9 serving evidence. Repeat it after Stage 10 optimization changes the trace or scheduler path. Use the existing live server and the request-lifecycle check above.
+
+1. Complete normal generator-wide preparation before the workload. This must not include a separate warmup for each measured request signature.
+2. Send unseen valid logical lengths within prepared physical buckets. Lengths such as 129, 130, and 131 tokens can expose exact-length keys when the model supports them.
+3. Exercise each supported chunked-prefill path with first chunks, changed continuation start positions, and partial final chunks. Scheduler coverage requires concurrent arrivals and prompts that cross its token budget while other requests decode.
+4. Repeat known lengths in different batch combinations and row orderings, with supported sampling-mode switches before returning to an earlier trace key.
+5. Record actual request lengths, chunk lengths, start positions, and active decode work. A configured chunking flag alone does not prove that the workload exercised chunking.
+6. Collect trace IDs, capture/retirement counts, and compilation/capture times for prefill, decode, and sampling. Map cache keys to actual execution signatures. Include a baseline for traces captured before the workload. Model or plugin event instrumentation is required where HTTP results cannot expose these events. Missing counters are incomplete evidence, not zero recaptures.
+7. Report request completion, correctness, TTFT p50/p95/p99, decode pauses, and completed-request throughput for this traffic. The measurements must include first encounters with the measured logical lengths and chunk offsets. This result is separate from fixed-shape warmed performance.
+
+Apply the [trace lifetime rule](../tt-enable-tracing/SKILL.md#trace-lifetime-and-reuse): at most one capture per prepared execution signature and zero invalidations, retirements, evictions, or recaptures throughout the workload. Preserve traces captured before the workload as well as deferred first captures made during it. Do not restart the generator or reset counters between requests. Record shutdown releases separately. Apply the allocation-safety gate from `$tt-enable-tracing` and measure performance separately with tracking disabled.
+
+Keep commands, workload details, trace events, and results under `readiness_vllm/`. Check for stale inputs and request contamination as well as recapture. The packaged serving runner does not yet automate this workload or validate its trace events. Use a targeted integration test until it does. Fixed-shape benchmark results or successful HTTP responses alone do not satisfy this check.
 
 ## Plugin Registration
 
