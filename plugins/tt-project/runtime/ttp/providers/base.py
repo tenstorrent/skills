@@ -4,9 +4,11 @@
 they never run anything themselves (the detached runner does), so they stay easy to test."""
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -62,6 +64,9 @@ class Provider:
     login_hint = "log in to the agent CLI there"   # how the user fixes "logged out" on this provider
     model = ""                       # the run's model and the project's price rows, for providers
     prices: dict = {}                # whose cost is estimated from tokens (see use())
+    # Read-only turns run from scratch_dir(), not the project: this agent otherwise loads the
+    # project's AGENTS.md or rules from its working directory into a decision-only turn.
+    isolate_read_only = False
 
     def use(self, model: str = "", prices: dict | None = None) -> "Provider":
         """Price this run's tokens with `model` and the project's `pricing.<provider>` rows."""
@@ -112,6 +117,29 @@ class Provider:
     def meter(self) -> list:
         """Plan-window utilization for the whole account, when the provider exposes it."""
         return []
+
+
+_CLI_OUTPUT: dict[tuple, str] = {}
+
+
+def cli_output(*argv: str) -> str:
+    """What a quick CLI query (`--help`, a feature list) prints, cached per process; "" when it
+    cannot run. Flags differ between CLI versions, so adapters check before using newer ones."""
+    if argv not in _CLI_OUTPUT:
+        try:
+            out = subprocess.run(list(argv), capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=20)
+            _CLI_OUTPUT[argv] = out.stdout + out.stderr
+        except (OSError, subprocess.SubprocessError):
+            _CLI_OUTPUT[argv] = ""
+    return _CLI_OUTPUT[argv]
+
+
+def scratch_dir(key: str) -> str:
+    """An empty per-project directory outside any repository, for turns that need nothing on disk."""
+    base = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "ttp" / "scratch"
+    path = base / hashlib.sha256(key.encode()).hexdigest()[:16]
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return str(path)
 
 
 def stderr_tail(stderr_path: Path | None, chars: int = 2000) -> str:

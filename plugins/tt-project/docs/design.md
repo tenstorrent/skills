@@ -67,7 +67,10 @@ The stable part (role, charter, memory) is the system prompt, which providers ca
    `login_hint`, optionally `meter` (only if it costs no model tokens), `cost_so_far` (if it
    streams usage but cannot enforce a budget itself), `writable_args` (if workers run in a write
    sandbox) and `plugin_args`. Price estimated tokens with `price_row(PRICES, self.prices,
-   self.model)` so `pricing.<provider>` in project.json applies.
+   self.model)` so `pricing.<provider>` in project.json applies. Set `isolate_read_only` when the
+   agent loads instructions from its working directory, so coordinator turns run from an empty
+   scratch directory. Probe newer CLI flags with `cli_output(exe, "--help")` and keep the older
+   command when they are missing.
 2. Import it in `providers/__init__.py:_load_all`.
 3. Add default tiers in `project.py:DEFAULT_CONFIG`.
 4. Add a parsing test with a recorded output sample.

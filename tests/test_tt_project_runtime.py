@@ -2964,25 +2964,39 @@ def test_codex_and_cursor_price_tokens_with_project_rows(env, tmp_path):
     assert get_provider("cursor").parse(cur).cost_usd == pytest.approx(18.0)
 
 
-# A stand-in for the `codex` and `agent` CLIs: records its argv and stdin, writes result.json when
-# told to, then prints FAKE_CLI_STDOUT and FAKE_CLI_STDERR and exits with FAKE_CLI_RC.
+# A stand-in for the `codex` and `agent` CLIs: answers `--help` and `features list` with
+# FAKE_CLI_HELP; otherwise records its argv and stdin, writes result.json when told to, then prints
+# FAKE_CLI_STDOUT and FAKE_CLI_STDERR and exits with FAKE_CLI_RC. With FAKE_CLI_PACE it takes that
+# many seconds per output line: streamed one by one under stream-json, all at the end otherwise.
 FAKE_CLI = """#!{python}
-import json, os, sys
+import json, os, sys, time
 from pathlib import Path
+if "--help" in sys.argv[1:] or sys.argv[1:3] == ["features", "list"]:
+    print(os.environ.get("FAKE_CLI_HELP", ""))
+    sys.exit(0)
 log = Path(os.environ["FAKE_CLI_LOG"])
 log.mkdir(parents=True, exist_ok=True)
 (log / "argv.json").write_text(json.dumps(sys.argv))
+(log / "cwd.txt").write_text(os.getcwd())
 (log / "stdin.txt").write_text(sys.stdin.read())
 if os.environ.get("FAKE_CLI_RESULT"):
     (Path(os.environ["TTP_RUN_DIR"]) / "result.json").write_text(os.environ["FAKE_CLI_RESULT"])
-sys.stdout.write(os.environ.get("FAKE_CLI_STDOUT", ""))
+pace, streaming = float(os.environ.get("FAKE_CLI_PACE") or 0), "stream-json" in sys.argv
+lines = os.environ.get("FAKE_CLI_STDOUT", "").splitlines(keepends=True)
+if pace and not streaming:
+    time.sleep(pace * len(lines))
+for line in lines:
+    if pace and streaming:
+        time.sleep(pace)
+    sys.stdout.write(line)
+    sys.stdout.flush()
 sys.stderr.write(os.environ.get("FAKE_CLI_STDERR", ""))
 sys.exit(int(os.environ.get("FAKE_CLI_RC", "0")))
 """
 
 
 def _cli_run(env, monkeypatch, provider, stdout, *, stderr="", rc=0, result=None, role="worker",
-             read_only=False, schema=None, note=None, before=None, budget_usd=2.0):
+             read_only=False, schema=None, note=None, before=None, budget_usd=2.0, help_text="", pace=0):
     """Launch one run of `provider` through the daemon and its detached runner against a fake CLI,
     reap it, and return the project, run row, task row, argv and the stdin the CLI received."""
     bin_dir = env["tmp"] / "fakebin"
@@ -2998,6 +3012,8 @@ def _cli_run(env, monkeypatch, provider, stdout, *, stderr="", rc=0, result=None
     monkeypatch.setenv("FAKE_CLI_STDERR", stderr)
     monkeypatch.setenv("FAKE_CLI_RC", str(rc))
     monkeypatch.setenv("FAKE_CLI_RESULT", json.dumps(result) if result else "")
+    monkeypatch.setenv("FAKE_CLI_HELP", help_text)
+    monkeypatch.setenv("FAKE_CLI_PACE", str(pace))
     p = make(env)
     if before:
         before(p)
@@ -3150,6 +3166,105 @@ def test_cursor_read_only_run_does_not_force_writes(env, monkeypatch):
     _, run, _, argv, _ = _cli_run(env, monkeypatch, "cursor", _cursor_result('{"actions": []}'),
                                   role="coordinator", read_only=True)
     assert "--force" not in argv and run["status"] == "ok"
+
+
+CURSOR_HELP = """Usage: agent [options] [command] [prompt...]
+  -p, --print                Print responses to console (for scripts or non-interactive use)
+  --output-format <format>   Output format (only works with --print): text | json | stream-json
+  --mode <mode>              Start in the given execution mode: plan | ask
+  -f, --force                Force allow commands unless explicitly denied
+"""
+
+# stream-json samples in the shape Cursor documents: init, the prompt, messages and tool calls,
+# then the same result object `--output-format json` prints alone.
+CURSOR_STREAM_OK = [
+    {"type": "system", "subtype": "init", "apiKeySource": "login", "cwd": "/w", "session_id": "s-9",
+     "model": "auto", "permissionMode": "default"},
+    {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "PROMPT"}]}, "session_id": "s-9"},
+    {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Reading it."}]},
+     "session_id": "s-9"},
+    {"type": "tool_call", "subtype": "started", "call_id": "c1",
+     "tool_call": {"readToolCall": {"args": {"path": "README.md"}}}, "session_id": "s-9"},
+    {"type": "tool_call", "subtype": "completed", "call_id": "c1",
+     "tool_call": {"readToolCall": {"args": {"path": "README.md"}, "result": {"success": {"content": "hello"}}}},
+     "session_id": "s-9"},
+    {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "all done"}]},
+     "session_id": "s-9"},
+    {"type": "result", "subtype": "success", "is_error": False, "duration_ms": 5200, "duration_api_ms": 5000,
+     "result": "Reading it.all done", "session_id": "s-9",
+     "usage": {"inputTokens": 200_000, "outputTokens": 10_000, "cacheReadTokens": 100_000, "cacheWriteTokens": 0}},
+]
+CURSOR_STREAM_ERROR = CURSOR_STREAM_OK[:3] + [
+    {"type": "result", "subtype": "error", "is_error": True, "duration_ms": 900, "result": "model request failed",
+     "session_id": "s-9"}]
+CURSOR_STREAM_KILLED = CURSOR_STREAM_OK[:4]
+
+
+def test_cursor_stream_json_samples_parse(env, tmp_path):
+    from ttp.providers import get_provider
+    cursor = get_provider("cursor").use("m1", {"m1": [1.0, 0.1, 10.0]})
+    out = tmp_path / "o.jsonl"
+    out.write_text(_codex_events(*CURSOR_STREAM_OK))
+    u = cursor.parse(out)
+    assert u.final_text == "Reading it.all done" and u.session_id == "s-9" and not u.error
+    assert (u.input_tokens, u.output_tokens, u.cache_read_tokens) == (200_000, 10_000, 100_000)
+    assert u.cost_usd == pytest.approx(0.2 + 0.01 + 0.1) and cursor.cost_so_far(out) == pytest.approx(u.cost_usd)
+    out.write_text(_codex_events(*CURSOR_STREAM_ERROR))
+    u = cursor.parse(out)
+    assert u.error == "model request failed" and not u.auth_failed and not u.limited
+    out.write_text(_codex_events(*CURSOR_STREAM_KILLED))
+    u = cursor.parse(out)
+    assert u.final_text == "Reading it." and not u.error and u.cost_usd == 0, "the daemon prices unreported runs"
+    assert 0 < cursor.cost_so_far(out) < 0.01, "a run that is streaming shows spend before its result"
+    out.write_text("")
+    assert cursor.cost_so_far(out) is None
+
+
+def test_cursor_streams_when_its_cli_can(env, monkeypatch):
+    p, run, task, argv, _ = _cli_run(env, monkeypatch, "cursor", _codex_events(*CURSOR_STREAM_OK),
+                                     result={"status": "done", "summary": "ok"}, help_text=CURSOR_HELP)
+    assert argv[1:4] == ["-p", "--output-format", "stream-json"] and "--mode" not in argv
+    assert run["status"] == "ok" and task["status"] == "done"
+    assert run["input_tokens"] == 200_000 and run["cost_estimated"] == 1
+
+
+def test_streaming_cursor_run_is_not_killed_as_stalled(env, monkeypatch):
+    # Nine events a second apart, with a 2 s stall limit: only a CLI that streams shows progress.
+    events = CURSOR_STREAM_OK + [CURSOR_STREAM_OK[3], CURSOR_STREAM_OK[4]]
+    stall = lambda p: p.set_config("budget.stall_s", {"light": 2})   # noqa: E731
+    _, run, _, argv, _ = _cli_run(env, monkeypatch, "cursor", _codex_events(*events), before=stall,
+                                  result={"status": "done", "summary": "ok"}, help_text=CURSOR_HELP, pace=1)
+    assert "stream-json" in argv and run["status"] == "ok", run["status"]
+    from ttp.providers import base
+    base._CLI_OUTPUT.clear()   # the probe is cached per daemon; this one is a CLI without stream-json
+    _, run, _, argv, _ = _cli_run(env, monkeypatch, "cursor", _codex_events(*events), before=stall, pace=1)
+    assert "stream-json" not in argv and run["status"] == "stalled", "an older CLI keeps the old guard"
+
+
+def test_codex_and_cursor_coordinator_turns_run_outside_the_repo(env, monkeypatch):
+    repo = env["repo"].resolve()
+    features = "shell_tool          stable  true\nweb_search_request  stable  false\nview_image_tool  stable  true\n"
+    reply = json.dumps({"actions": [], "summary": None})
+    _, run, _, argv, _ = _cli_run(env, monkeypatch, "codex", _codex_events(*_codex_turn(reply)),
+                                  role="coordinator", read_only=True, help_text=features)
+    cwd = pathlib.Path((env["tmp"] / "fakecli" / "cwd.txt").read_text()).resolve()
+    assert argv[argv.index("-C") + 1] == str(cwd) and repo not in cwd.parents and cwd != repo
+    assert not any(pathlib.Path(cwd).iterdir()), "the scratch directory must hold no instructions"
+    assert "features.shell_tool=false" in argv and "features.web_search_request=false" in argv
+    assert "features.view_image_tool=false" not in argv and run["status"] == "ok"
+    _, run, _, argv, _ = _cli_run(env, monkeypatch, "cursor", _cursor_result(reply),
+                                  role="coordinator", read_only=True, help_text=CURSOR_HELP)
+    cwd = pathlib.Path((env["tmp"] / "fakecli" / "cwd.txt").read_text()).resolve()
+    assert argv[argv.index("--workspace") + 1] == str(cwd) and repo not in cwd.parents and cwd != repo
+    assert argv[argv.index("--mode") + 1] == "ask" and "--force" not in argv and run["status"] == "ok"
+    # Workers keep the task's directory, and CLIs without the newer flags keep the old command.
+    _, _, _, argv, _ = _cli_run(env, monkeypatch, "codex", _codex_events(*_codex_turn("ok")))
+    assert argv[argv.index("-C") + 1] == str(env["repo"])
+    from ttp.providers import base
+    base._CLI_OUTPUT.clear()   # the probe is cached per daemon; this one is a CLI without features
+    _, _, _, argv, _ = _cli_run(env, monkeypatch, "codex", _codex_events(*_codex_turn(reply)),
+                                role="coordinator", read_only=True)
+    assert not any(a.startswith("features.") for a in argv)
 
 
 def test_logged_out_alert_and_fix_name_the_right_provider(env):

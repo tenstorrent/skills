@@ -9,15 +9,18 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
 from . import register
-from .base import AUTH_RE, LIMIT_RE, Provider, RunUsage, price_row, stderr_tail
+from .base import AUTH_RE, LIMIT_RE, Provider, RunUsage, cli_output, price_row, stderr_tail
 
 # $ per million tokens: (input, cached input, output). Estimates only; the project may override
 # them in project.json under pricing.codex.<model>. Unknown models use the "default" row.
 PRICES = {"default": (4.0, 0.4, 20.0)}
+# Tools a decision-only turn does without, switched off when this build lists them as features.
+READ_ONLY_OFF = ("shell_tool", "unified_exec", "web_search_request")
 
 
 @register
@@ -25,9 +28,11 @@ class Codex(Provider):
     name = "codex"
     binaries = ("codex",)
     login_hint = "run `codex login` there"
+    isolate_read_only = True
 
     def build(self, *, role, model, effort, cwd, budget_usd, read_only, schema, restrictions):
-        argv = [self.binary() or "codex", "exec", "--json", "-C", cwd, "--skip-git-repo-check"]
+        exe = self.binary() or "codex"
+        argv = [exe, "exec", "--json", "-C", cwd, "--skip-git-repo-check"]
         if model:
             argv += ["-m", model]
         if effort:
@@ -35,6 +40,10 @@ class Codex(Provider):
         argv += ["-c", "approval_policy=never"]
         if read_only:
             argv += ["-s", "read-only"]
+            features = cli_output(exe, "features", "list")
+            for feature in READ_ONLY_OFF:
+                if re.search(rf"^{feature}\b", features, re.M):
+                    argv += ["-c", f"features.{feature}=false"]
         else:
             argv += ["-s", "workspace-write"]
             if not restrictions.get("no_internet"):

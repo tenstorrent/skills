@@ -35,7 +35,7 @@ from . import worktree
 from .db import SEVERITY_RANK, TERMINAL_TASK_STATES, dump_result, load_result
 from .project import Project, hostname, load_secrets
 from .providers import get_provider
-from .providers.base import last_json_object, service_path
+from .providers.base import last_json_object, scratch_dir, service_path
 from .providers.claude import as_windows
 from .providers.jev import Jev, JevOutOfFunds
 
@@ -189,6 +189,8 @@ class Daemon:
         prov = get_provider(provider).use(model, prices)
         effort = tiers.get(tier, {}).get("effort", "")
         restrictions = self.cfg.get("restrictions", {})
+        if read_only and prov.isolate_read_only:
+            cwd = scratch_dir(str(self.p.base))
         argv, env = prov.build(role=role, model=model, effort=effort, cwd=cwd, budget_usd=budget_usd,
                                read_only=read_only, schema=schema, restrictions=restrictions)
         if not read_only:

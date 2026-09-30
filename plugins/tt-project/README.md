@@ -132,14 +132,20 @@ Design notes, invariants and how to add a provider: [docs/design.md](docs/design
 - Codex and Cursor report tokens but no cost; their spend is estimated from a price table. Set
   your own rates in project.json as `"pricing": {"codex": {"<model>": [input, cached input,
   output]}}` in $ per million tokens (`"default"` covers other models; same for `cursor`).
-- A Claude run cut off before its final report is estimated from its streamed tokens. Codex and
-  Cursor report usage only when a run ends, so their mid-run budget check cannot trip, and a run
-  cut off early is booked at the elapsed share of its budget (flagged estimated).
+- A Claude run cut off before its final report is estimated from its streamed tokens. Codex
+  reports usage per completed turn, so its mid-run budget check sees completed turns only. Cursor
+  builds that offer `--output-format stream-json` stream their progress: the stall guard sees it,
+  and until usage arrives the budget check uses a floor from the text written so far. Older
+  Cursor builds print nothing until the end, so set `stall_s` above their longest run. A run cut
+  off before reporting usage is booked at the elapsed share of its budget (flagged estimated).
 - Codex workers run in Codex's workspace-write sandbox, with the project's state folder and the
   repository's git folder added as writable roots. Coordinator turns use its read-only sandbox.
+- Codex and Cursor coordinator turns run from an empty scratch directory, so the project's
+  AGENTS.md and rules stay out of them. Codex's shell and web search tools are off, and Cursor
+  runs in ask mode, when the installed CLI offers those switches.
 - Not yet on Codex or Cursor: worker plugins (`plugin_dirs`), worker isolation, coordinator
   updates reaching a running worker (Claude hooks only), and isolation of coordinator turns from
-  your own CLI config, MCP servers and rules. Cursor enforces no read-only mode and no `no_internet`
-  restriction, and has no plan-window meter.
+  your own CLI config and MCP servers. Cursor enforces no `no_internet` restriction and has no
+  plan-window meter; without ask mode it has no read-only mode either.
 - Cursor has no reasoning-effort flag; tiers map to model names.
 - A laptop pauses while it sleeps. Use an always-on machine for round-the-clock work.
