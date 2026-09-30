@@ -92,6 +92,10 @@ Workers can read Slack links you paste, using your Slack connector if you have o
 - Text from logs, issues and chats is treated as data, not instructions.
 - Secrets are entered in a terminal (`ttp secret …`), never in chat, and never copied into a project.
 
+## Maintainers
+
+Design notes, invariants and how to add a provider: [docs/design.md](docs/design.md).
+
 ## Limits
 
 - Codex and Cursor report tokens but no cost; their spend is estimated from a price table.
