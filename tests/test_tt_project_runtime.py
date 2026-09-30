@@ -2758,6 +2758,19 @@ def test_an_abandoned_run_keeps_its_live_spend(env):
     assert g.numbers["spent_1h"] == pytest.approx(13, abs=0.1), "other spend was discounted by the run's share"
 
 
+def test_a_task_whose_run_fails_to_start_drops_its_reservation(env, monkeypatch):
+    p = make(env)
+    from ttp import locks
+    d, task, mark = _reserved_board_task(p)
+
+    def broken(*a, **k):
+        raise RuntimeError("agent launch failed")
+    monkeypatch.setattr(d, "start_run", broken)
+    d.dispatch()
+    assert p.db.task(task["id"])["status"] == "queued"
+    assert locks.reserved_by(mark) is None, "a task whose run failed to start still held its reservation"
+
+
 def test_a_run_that_never_launched_its_agent_costs_nothing(env):
     p = make(env)
     from ttp.daemon import Daemon

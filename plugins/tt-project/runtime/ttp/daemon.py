@@ -978,6 +978,7 @@ class Daemon:
                                read_only=False)
             except Exception as e:
                 self._start_failed(task, e)
+                self._unreserve(task)
                 continue
             self._start_failures = 0
             busy[provider] = busy.get(provider, 0) + 1
