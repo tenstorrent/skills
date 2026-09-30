@@ -19,6 +19,18 @@
 | `ttp task <name> cancel <id>` | cancel a task and end its running worker |
 | `ttp doctor <name>` | providers, accounts, Jev, notifications, web |
 | `ttp alerts <name> --after N` | alerts since a message id |
+| `ttp web <name> --tunnel --keep` / `--unkeep` | keep the web app's tunnel up as a user service / remove it (remote projects; ask first) |
+
+## What needs the user
+
+- The top of `ttp status` and of the web app shows only open questions and problems active now.
+  Everything else (FYI notes, decisions, reboots, cleared alerts) is in the feed below, newest first.
+- Alerts clear themselves and keep their history: logged out → the next successful run; budget red →
+  the gate leaves red; coordinator failures → a successful turn; disk low → space is back. Chats
+  hear once that it cleared. A host reboot is information only.
+- The budget is a few plain lines: per plan window the percent used, time to reset and history
+  (daily peaks for the 5-hour window, the last two weekly finals), and one line for dollar caps.
+  Pacing, gate reasons and top spenders are in the web app's Budget tab.
 
 ## Budget
 

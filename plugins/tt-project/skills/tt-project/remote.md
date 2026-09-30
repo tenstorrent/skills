@@ -8,7 +8,13 @@
 
 - `ttp web <name>` prints the exact tunnel command (with a free local port) and the link.
 - After the user agrees: `ttp web <name> --tunnel` opens it in the background.
-- Persistent: only if the user asks. Use a user service (launchd / systemd --user).
+- Persistent: only if the user asks. `ttp web <name> --tunnel --keep` installs a user service
+  (`com.tt-project.tunnel.<name>`: launchd on macOS, systemd --user on Linux) that restarts the
+  forward after reboots (at login) and network drops. Run again, it adopts a matching service or
+  replaces a stale one on the same local port. `ttp web <name> --unkeep` removes it.
+- The ssh login must work without a prompt (key or agent). On Linux the unit starts at login;
+  it runs at boot without a login only with lingering (`loginctl enable-linger`).
+- When the page cannot reach the daemon it says so and shows these commands as information.
 
 ## Persistent tunnel rules
 

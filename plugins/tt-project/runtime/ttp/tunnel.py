@@ -91,10 +91,12 @@ def _stop(name: str, platform: str) -> None:
 def _start(name: str, platform: str) -> str:
     f = service_file(name, platform)
     if platform == "darwin":
-        r = _run("launchctl", "bootstrap", f"gui/{os.getuid()}", str(f))
-        if r.returncode != 0 and "already" not in (r.stderr or "").lower():
-            return f"launchd refused it: {r.stderr.strip()[:200]}"
-        _run("launchctl", "kickstart", f"gui/{os.getuid()}/{label(name)}")
+        target = f"gui/{os.getuid()}/{label(name)}"
+        if _run("launchctl", "print", target).returncode != 0:   # not loaded yet
+            r = _run("launchctl", "bootstrap", f"gui/{os.getuid()}", str(f))
+            if r.returncode != 0:
+                return f"launchd refused it: {r.stderr.strip()[:200]}"
+        _run("launchctl", "kickstart", target)   # starts it if it is not running; never a second copy
         return "launchd agent"
     _run("systemctl", "--user", "daemon-reload")
     r = _run("systemctl", "--user", "enable", "--now", f"{label(name)}.service")

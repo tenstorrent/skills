@@ -498,9 +498,10 @@ def status_text(p: Project) -> str:
         lines.append(f"spend: ${s['spent_24h']:.2f} last 24h, ${s['spent_7d']:.2f} last 7d{live}")
     elif live:
         budget = [*budget[:-1], budget[-1] + live]
-    if budget:
-        lines.append("budget: " + budget[0].strip())
-        lines += [f"  {ln}" for ln in budget[1:]]
+    if len(budget) == 1:
+        lines.append("budget: " + budget[0])
+    elif budget:
+        lines += ["budget:", *(f"  {ln}" for ln in budget)]
     c = h["coordinator"]
     coord = "coordinator: no turn yet"
     if c["last_turn"]:
