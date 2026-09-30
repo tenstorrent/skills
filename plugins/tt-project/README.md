@@ -88,7 +88,9 @@ and preferences you add later become part of the project's charter and memory.
   exact commit it pushes, starts over if the branch moved meanwhile, and never forces. The target
   is `delivery.push_branch`, which must be set explicitly; it refuses without one, without
   checks, when `delivery.push_allowed` is false, and for `HEAD`, `main`, `master` or the
-  remote's default branch.
+  remote's default branch. Pushes to one branch take turns under a lock that a killed push or a
+  reboot frees. One that waits longer than `delivery.push_wait_s` (default 300 s) exits 75 and
+  prints a `retry_when` for its hand-off: `ttp push --free`, which exits 0 once the turn is free.
 - A plan task starts from what is already known: prior work, the organization's docs and chats
   through the connectors you have, available skills, and public work. Skill plugins it recommends
   can be enabled for the project's workers only (`providers.claude.plugin_dirs`).

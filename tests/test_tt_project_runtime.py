@@ -4636,6 +4636,98 @@ def test_push_checks_accept_the_forms_config_set_sends():
 def test_the_review_prompt_pushes_only_through_the_guarded_push():
     text = (RUNTIME.parent / "template" / "prompts" / "kind-review.md").read_text()
     assert "`ttp push`" in text and "NEVER use `git push` directly" in text
+    assert "longest tool timeout" in text and "NEVER run it detached or in the background" in text
+    assert "75: another push to the branch held its turn too long; hand off `waiting` with the `retry_when`" in text
+
+
+def _ttp(*args):
+    from ttp import cli
+    with pytest.raises(SystemExit) as e:
+        cli.main(list(args))
+    return e.value.code
+
+
+def _push_proc(p, cwd, **kw):
+    """`ttp push` as its own process in cwd, for the project p."""
+    env = {**os.environ, "PYTHONPATH": str(RUNTIME), "TTP_PROJECT": str(p.base)}
+    return subprocess.Popen([sys.executable, "-m", "ttp", "push"], cwd=str(cwd), env=env, text=True, **kw)
+
+
+def test_concurrent_pushes_to_one_branch_take_turns_and_both_land(env, monkeypatch):
+    log = env["tmp"] / "checks.log"
+    p, repo, origin, other = _push_setup(env, monkeypatch, [f"echo start >> {log}; sleep 2; echo end >> {log}"])
+    second = env["tmp"] / "second"
+    subprocess.run(["git", "clone", "-q", "-b", "proj", str(origin), str(second)], check=True)
+    _commit(repo, "mine.txt", "mine\n")
+    _commit(second, "second.txt", "second\n")
+    procs = [_push_proc(p, d, stdout=subprocess.PIPE, stderr=subprocess.STDOUT) for d in (repo, second)]
+    outs = [pr.communicate(timeout=60)[0] for pr in procs]
+    assert [pr.returncode for pr in procs] == [0, 0], outs
+    assert {"mine.txt", "second.txt"} <= set(_git_out(origin, "ls-tree", "--name-only", "proj").split())
+    assert log.read_text().split() == ["start", "end", "start", "end"], \
+        "the checks must run once per push, one push after the other"
+    assert not any("round 2" in o for o in outs), outs
+    assert any("waiting up to" in o for o in outs), outs
+
+
+def test_a_push_that_waits_past_push_wait_s_exits_75_with_a_probe(env, monkeypatch, capsys):
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    p.set_config("delivery.push_wait_s", 1)
+    run_dir = env["tmp"] / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("TTP_RUN_DIR", str(run_dir))
+    from ttp import locks, push
+    held = locks.try_take(push.lock_paths(p, "origin", "proj"), "task #7 (run 9)")
+    before = _git_out(origin, "rev-parse", "proj")
+    _commit(repo, "mine.txt", "mine\n")
+    t0 = time.time()
+    assert _ttp_push() == 75
+    assert 1 <= time.time() - t0 < 15
+    err = capsys.readouterr().err
+    assert "task #7 (run 9)" in err and "retry_when: " in err, err
+    assert _git_out(origin, "rev-parse", "proj") == before
+    (w,) = json.loads((run_dir / "lock_waits.json").read_text()).values()
+    assert w["end"] - w["start"] >= 1 and locks.waited(run_dir) >= 1, "the wait must stop the run's clock"
+    # The printed probe works where the harness runs it: in the project root, without the run's env.
+    probe = err.split("retry_when: ")[1].strip()
+    assert probe.endswith("ttp push --free")
+    penv = {k: v for k, v in os.environ.items() if not k.startswith("TTP_") or k == "TTP_HOME"}
+    run_probe = lambda: subprocess.run(probe, shell=True, cwd=str(p.root), env=penv, capture_output=True).returncode
+    assert run_probe() == 1
+    held.close()
+    assert run_probe() == 0
+
+
+def test_push_free_tells_whether_a_push_holds_the_branch(env, monkeypatch):
+    p, repo, origin, other = _push_setup(env, monkeypatch, [])
+    from ttp import locks, push
+    paths = push.lock_paths(p, "origin", "proj")
+    assert _ttp("push", "--free") == 0 and not any(x.exists() for x in paths), "--free must not create the lock"
+    held = locks.try_take(paths, "someone")
+    assert _ttp("push", "--free") == 1
+    held.close()
+    assert _ttp("push", "--free") == 0
+
+
+def test_a_killed_push_frees_the_branch(env, monkeypatch):
+    started = env["tmp"] / "started"
+    p, repo, origin, other = _push_setup(env, monkeypatch, [f"touch {started}; sleep 60"])
+    _commit(repo, "mine.txt", "mine\n")
+    proc = _push_proc(p, repo, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    try:
+        deadline = time.time() + 30
+        while not started.exists() and time.time() < deadline:
+            time.sleep(0.1)
+        assert started.exists()
+        assert _ttp("push", "--free") == 1
+        proc.kill()     # only the push itself; its check lives on without the lock
+        proc.wait(timeout=10)
+        assert _ttp("push", "--free") == 0
+    finally:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
 
 
 def _lost_deep_runs(p, tmp_path, boot, costs=(24.0, 29.0), handoff=None):

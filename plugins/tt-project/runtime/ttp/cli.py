@@ -587,14 +587,16 @@ def cmd_push(a) -> None:
     """Publish this worktree's commits onto the project's target branch, guarded: refuse a dirty
     tree, rebase onto the latest tip, run `delivery.push_checks` on the final head, start over if
     the tip moved meanwhile, and push without force. The target is `delivery.push_branch`, never
-    main, master or the remote's default branch. Exit codes are in `push.py`."""
+    main, master or the remote's default branch. Pushes to one branch take turns; one that waits
+    longer than `delivery.push_wait_s` for its turn exits 75. `--free` only tells whether it is
+    free (0) or taken (1). Exit codes are in `push.py`."""
     from . import push
     base = os.environ.get("TTP_PROJECT")
     p = Project(base) if base else next((c for d in [Path.cwd(), *Path.cwd().parents]
                                          if (c := Project(d)).exists()), None)
     if not p or not p.exists():
         die("ttp push: no tt-project project here (run it inside a run or a project's worktree)")
-    sys.exit(push.run(p, Path.cwd()))
+    sys.exit(push.free(p, Path.cwd()) if a.free else push.run(p, Path.cwd()))
 
 
 def cmd_lock(a) -> None:
@@ -1096,6 +1098,8 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_note)
 
     s = sub.add_parser("push", help="guarded push of this worktree to delivery.push_branch")
+    s.add_argument("--free", action="store_true",
+                   help="push nothing: exit 0 when no other push to the target branch is running, 1 while one is")
     s.set_defaults(fn=cmd_push)
 
     s = sub.add_parser("lock", help="(inside a run) hold a shared resource while one command runs")
