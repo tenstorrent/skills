@@ -18,7 +18,7 @@ from . import schedule as sched
 from .db import SEVERITY_RANK, TERMINAL_TASK_STATES
 from .project import Project
 
-ACTION_TYPES = ("reply", "task_add", "task_update", "ask_user", "notify", "memory_add",
+ACTION_TYPES = ("reply", "task_add", "task_update", "ask_user", "resolve", "notify", "memory_add",
                 "charter_update", "schedule_set", "config_set", "noop")
 
 ACTIONS_SCHEMA: dict[str, Any] = {
@@ -93,10 +93,11 @@ def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int]) ->
     for s in sched.with_costs(db):
         lines.append(f"- {s['name']} ({s['kind']}, every {s['every_s'] // 60} min, "
                      f"{'on' if s['enabled'] else 'off'}, 7d cost ${s['cost_7d']}): {s['description'][:100]}")
-    blockers = db.q("SELECT * FROM messages WHERE kind='ask' AND handled=0 ORDER BY id DESC LIMIT 10")
+    blockers = db.q("SELECT * FROM messages WHERE kind='ask' AND handled=0 AND ts>? ORDER BY id DESC LIMIT 10",
+                    (now - 14 * 86400,))
     if blockers:
-        lines.append("## Open questions to the user (unanswered)")
-        lines += [f"- {b['text'][:200]}" for b in blockers]
+        lines.append("## Open questions to the user (resolve each once answered)")
+        lines += [f"- ask #{b['id']}: {b['text'][:300]}" for b in blockers]
     lines.append("## Chats attached")
     for c in db.q("SELECT id, label, last_active FROM chats ORDER BY last_active DESC LIMIT 10"):
         lines.append(f"- {c['id']} ({c['label'] or 'chat'}), active {(now - (c['last_active'] or now)) / 60:.0f} min ago")
@@ -172,6 +173,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None) -> l
                         Path(r["dir"], "STOP").touch()
             elif t == "ask_user":
                 db.post("out", a["text"], chat=None, kind="ask", severity=_norm_severity(a.get("severity") or "high"))
+            elif t == "resolve":
+                n = db.x("UPDATE messages SET handled=1 WHERE id=? AND kind='ask'", (int(a["id"]),))
+                if not n:
+                    raise ValueError(f"no open question #{a.get('id')}")
             elif t == "notify":
                 db.post("out", a["text"], chat=None, kind="alert", severity=_norm_severity(a.get("severity")))
             elif t == "memory_add":

@@ -348,7 +348,8 @@ def status_text(p: Project) -> str:
     for t in db.q("SELECT id,title,status,blocked_reason FROM tasks WHERE status IN ('running','blocked','review') "
                   "ORDER BY status, id LIMIT 12"):
         lines.append(f"  #{t['id']} {t['status']}: {t['title']}" + (f" — {t['blocked_reason']}" if t["blocked_reason"] else ""))
-    for m in db.q("SELECT text FROM messages WHERE kind='ask' AND handled=0 ORDER BY id DESC LIMIT 5"):
+    for m in db.q("SELECT text FROM messages WHERE kind='ask' AND handled=0 AND ts>? ORDER BY id DESC LIMIT 5",
+                  (time.time() - 14 * 86400,)):
         lines.append(f"  needs you: {m['text'][:200]}")
     return "\n".join(lines)
 

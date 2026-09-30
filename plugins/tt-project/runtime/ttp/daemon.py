@@ -305,7 +305,8 @@ class Daemon:
                 bud._raise(g, "red", f"provider limit: {lim.get('note')}")
                 g.max_parallel, g.allow_new_work, g.allow_optional = 0, False, False
             prev = self.gates.get(prov)
-            if prev and prev.level != g.level:
+            provider_paused = any(r.startswith("provider limit") for r in g.reasons + (prev.reasons if prev else []))
+            if prev and prev.level != g.level and not provider_paused:   # a pause has its own, specific alert
                 sev = "high" if g.level == "red" else "normal"
                 self.p.db.post("out", f"Budget for {prov} is now {g.level}: {'; '.join(g.reasons) or 'back to normal'}. "
                                + ("New work is paused; replies to you continue. You can raise the cap "

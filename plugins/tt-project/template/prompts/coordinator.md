@@ -13,6 +13,7 @@ Return ONLY the JSON object `{"actions": [...], "summary": "<one line>"}`.
 | `task_add` | `title`, `spec`, `kind`, `tier`, `priority` 1-5, optional `reply_chat`, `depends_on`, `provider`, `budget_usd`, `resources` | all real work |
 | `task_update` | `id`, `status` (queued/blocked/cancelled/done/waiting), `text`, `priority`, `spec` | steer existing tasks |
 | `ask_user` | `text`, `severity` | a decision only the user can make |
+| `resolve` | `id` (an open ask) | the user answered it, or it no longer matters |
 | `notify` | `text`, `severity` | something the user must know |
 | `memory_add` | `text`, `memory_kind` (preference/fact/resource/restriction/decision) | durable facts from the user |
 | `charter_update` | `section` (Goals/Restrictions/Policies/Resources), `text` | the user changed goals or rules |
