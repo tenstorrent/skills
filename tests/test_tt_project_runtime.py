@@ -1903,6 +1903,85 @@ def test_an_exclusive_task_and_ttp_lock_exclude_each_other(env, tmp_path):
     assert d._resources_free(task)
 
 
+def test_a_waiting_exclusive_task_reserves_its_resource(env, tmp_path):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import locks
+    from ttp.daemon import Daemon
+    run_env = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost", TTP_PROJECT=str(p.base))
+    assert coord.apply(p, [{"type": "task_add", "title": "reflash", "spec": "s", "tier": "light",
+                            "resources": ["board"], "exclusive": True}]) == []
+    task = p.db.one("SELECT * FROM tasks WHERE title='reflash'")
+    d = Daemon(p.base)
+    mark = locks.reserve_path(p.state / "locks", "board")
+    holder = subprocess.Popen([sys.executable, str(TTP), "lock", "board", "--", "sleep", "4"], env=run_env)
+    try:
+        deadline = time.time() + 20
+        while time.time() < deadline and d._resources_free(task, reserve=True):
+            time.sleep(0.1)
+        assert locks.reserved_by(mark) == f"task #{task['id']}", "a blocked exclusive task did not reserve"
+        # a new ttp lock command waits for the reserved task instead of taking the freed slot
+        rc = subprocess.run([sys.executable, str(TTP), "lock", "--timeout", "6", "board", "--", "true"],
+                            env=run_env).returncode
+        assert rc == 75, "ttp lock took a slot the exclusive task had reserved"
+    finally:
+        holder.wait(timeout=30)
+    assert d._resources_free(task), "the slot did not come free for the reserved task"
+    # the task's own run takes the slot and drops the reservation; ttp lock then waits on the slot
+    run_dir = tmp_path / "xrun"
+    run_dir.mkdir()
+    (run_dir / "prompt.md").write_text("x")
+    (run_dir / "run.json").write_text(json.dumps({
+        "argv": ["sleep", "1"], "env": {"TTP_TASK": str(task["id"])}, "cwd": str(tmp_path), "timeout_s": 60,
+        "provider": "fake", "exclusive": [{"resource": "board", "paths": [str(x) for x in d._slot_paths("board")],
+                                           "reserve": str(mark)}]}))
+    assert subprocess.run([sys.executable, "-m", "ttp.runner", str(run_dir)], cwd=str(RUNTIME), timeout=60,
+                          env={**os.environ, "PYTHONPATH": str(RUNTIME)}).returncode == 0
+    assert not mark.exists(), "the run kept the reservation after taking its slot"
+
+
+def test_a_stale_reservation_never_wedges_the_resource(env):
+    p = make(env)
+    from ttp import locks
+    mark = locks.reserve_path(p.state / "locks", "board")
+    mark.parent.mkdir(parents=True, exist_ok=True)
+    mark.write_text(json.dumps({"holder": "task #9", "since": 0, "ts": time.time() - locks.RESERVE_STALE_S - 5}))
+    run_env = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost", TTP_PROJECT=str(p.base))
+    rc = subprocess.run([sys.executable, str(TTP), "lock", "--timeout", "2", "board", "--", "true"],
+                        env=run_env).returncode
+    assert rc == 0, "a reservation nobody refreshes still held the resource"
+    locks.reserve(mark, "task #3")
+    assert locks.reserved_by(mark) == "task #3", "a stale reservation blocked a new one"
+
+
+def test_an_exclusive_run_that_loses_the_race_requeues_without_an_attempt(env, monkeypatch):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import daemon as dmod
+    run_env = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost", TTP_PROJECT=str(p.base))
+    p.set_config("budget.exclusive_wait_s", 1)
+    assert coord.apply(p, [{"type": "task_add", "title": "reflash", "spec": "s", "tier": "light",
+                            "resources": ["board"], "exclusive": True}]) == []
+    tid = p.db.one("SELECT id FROM tasks WHERE title='reflash'")["id"]
+    p.db.x("UPDATE messages SET handled=1")
+    holder = subprocess.Popen([sys.executable, str(TTP), "lock", "board", "--", "sleep", "30"], env=run_env)
+    try:
+        time.sleep(1.0)
+        monkeypatch.setattr(dmod.locks, "any_free", lambda paths: True)   # the slot looked free at the tick
+        d = dmod.Daemon(p.base)
+        t0 = time.time()
+        assert _run_until(d, p, lambda: p.db.q("SELECT id FROM runs WHERE task=? AND status!='running'", (tid,)),
+                          timeout=30)
+        waited = time.time() - t0
+    finally:
+        holder.kill()
+        holder.wait(timeout=30)
+    run = p.db.one("SELECT * FROM runs WHERE task=?", (tid,))
+    t = p.db.task(tid)
+    assert run["status"] == "resource_busy" and waited < 20, (run["status"], waited)
+    assert t["status"] == "queued" and not t["attempts"] and t["not_before"], dict(t)
+
+
 def test_a_lock_wait_is_progress_and_gives_up_with_75(env, tmp_path):
     p = make(env)
     run_dir = tmp_path / "wrun"

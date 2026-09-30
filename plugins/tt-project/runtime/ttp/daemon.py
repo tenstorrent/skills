@@ -211,8 +211,10 @@ class Daemon:
             stall = self.cfg["budget"].get("stall_s", {}).get(tier) if role != "coordinator" else None
             spec = {"argv": argv, "env": env, "cwd": cwd, "timeout_s": tout, "provider": provider, "stall_s": stall,
                     "budget_usd": budget_usd if provider not in ("claude",) else None,
-                    "exclusive": [{"resource": res, "paths": [str(x) for x in self._slot_paths(res)]}
-                                  for res in _exclusive(task)] if task else []}
+                    "exclusive": [{"resource": res, "paths": [str(x) for x in self._slot_paths(res)],
+                                   "reserve": str(locks.reserve_path(self.p.state / "locks", res))}
+                                  for res in _exclusive(task)] if task else [],
+                    "exclusive_wait_s": self.cfg["budget"].get("exclusive_wait_s", 600)}
             (run_dir / "run.json").write_text(json.dumps(spec, indent=1))
             with open(run_dir / "runner.log", "wb") as out:
                 proc = subprocess.Popen([sys.executable, "-m", "ttp.runner", str(run_dir)], cwd=runtime_dir,
@@ -317,7 +319,7 @@ class Daemon:
                 "cache_read": usage.cache_read_tokens, "cache_write": usage.cache_write_tokens})
         stopped = exit_info.get("stopped")
         status = "ok" if exit_info.get("rc") == 0 and not usage.error else "failed"
-        if stopped in ("timeout", "budget", "stopped", "lost", "stalled", "shutdown"):
+        if stopped in ("timeout", "budget", "stopped", "lost", "stalled", "shutdown", "resource_busy"):
             status = stopped if stopped != "stopped" else "killed"
         if usage.limited:
             status = "limit"
@@ -453,6 +455,11 @@ class Daemon:
                 # The project was stopped, not the task: it resumes on the next start, on its own branch.
                 db.update_task(task["id"], status="queued", blocked_reason="interrupted by `ttp stop --kill`; resumes")
                 return
+        if status == "resource_busy":
+            # The run lost the race for its resource and never started its agent: not an attempt.
+            db.update_task(task["id"], status="queued", not_before=time.time() + 30,
+                           blocked_reason="its resource stayed busy before the run could start; retries")
+            return
         rstatus = result.get("status") if isinstance(result, dict) else None
         summary = str((result.get("summary") if isinstance(result, dict) else None) or (usage.final_text or "")[:1500])
         waiting = status == "ok" and rstatus == "waiting"
@@ -799,8 +806,6 @@ class Daemon:
                 continue
             if task["origin"] in ("schedule", "harness") and not gate.allow_optional:
                 continue
-            if not self._resources_free(task):
-                continue
             remaining = (task["budget_usd"] or 0) - (task["spent_usd"] or 0)
             if task["budget_usd"] and remaining <= 0.05:
                 db.update_task(task["id"], status="blocked", blocked_reason="task budget exhausted")
@@ -819,6 +824,10 @@ class Daemon:
                         db.update_task(task["id"], status="blocked",
                                        blocked_reason=f"its ${cost:.2f} budget is above the dollar cap")
                     continue
+            # Checked last: a task that waits for its resource reserves it, and only a task that
+            # would otherwise start now may hold others off the resource.
+            if not self._resources_free(task, reserve=True):
+                continue
             tier = bud.clamp_tier(task["tier"], gate)
             try:
                 cwd, branch = self._workdir_for(task)
@@ -951,11 +960,13 @@ class Daemon:
         if self._start_failures >= 3:
             self.alert("run-start", f"Runs cannot start ({why}). Tasks stay queued and retry every minute.", "high")
 
-    def _resources_free(self, task: dict) -> bool:
+    def _resources_free(self, task: dict, reserve: bool = False) -> bool:
         """Only tasks labelled `exclusive:<name>` hold a resource for their whole run; they share
         its slot count (config `resources`, default 1). A `resource:<name>` label means the task uses
         the resource for some commands: those take the resource's lock (`ttp lock`) or its own queue,
-        so the rest of the task runs in parallel with other work instead of waiting for the slot."""
+        so the rest of the task runs in parallel with other work instead of waiting for the slot.
+        With reserve, a task kept out only by `ttp lock` commands reserves the resource so new ones
+        wait; the reservation lapses unless the next dispatch refreshes it."""
         limits = self.cfg.get("resources", {})
         for res in _exclusive(task):
             limit = int(limits.get(res, 1))
@@ -963,7 +974,11 @@ class Daemon:
             # lock files show the slots `ttp lock` commands hold.
             busy = self.p.db.one("SELECT COUNT(*) n FROM tasks WHERE status='running' AND labels LIKE ?",
                                  (f'%"exclusive:{res}"%',))["n"]
-            if busy >= limit or not locks.any_free(self._slot_paths(res)):
+            if busy >= limit:
+                return False
+            if not locks.any_free(self._slot_paths(res)):
+                if reserve:
+                    locks.reserve(locks.reserve_path(self.p.state / "locks", res), f"task #{task['id']}")
                 return False
         return True
 

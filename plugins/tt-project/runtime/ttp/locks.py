@@ -5,13 +5,21 @@
 Every holder takes one slot file under state/locks: `ttp lock` for one command, the run supervisor
 of an `exclusive:<name>` task for its whole run. A lock ends with the process that holds it, so a
 crash or a reboot never leaves a resource taken.
+
+An exclusive task that finds every slot held reserves the resource: new `ttp lock` commands wait
+until it has its slot, so commands that keep taking the lock in turn cannot starve it. Whoever
+reserves refreshes the reservation while it waits; one not refreshed for RESERVE_STALE_S no longer
+counts, so a crashed daemon or supervisor never wedges the resource.
 """
 from __future__ import annotations
 
 import fcntl
 import json
+import os
 import time
 from pathlib import Path
+
+RESERVE_STALE_S = 120
 
 
 def slot_paths(locks_dir: Path, resource: str, slots: int) -> list[Path]:
@@ -62,3 +70,41 @@ def holders(paths: list[Path]) -> list[str]:
         if h:
             out.append(f"{h.get('holder')} since {time.strftime('%H:%M', time.localtime(h.get('since', 0)))}")
     return out
+
+
+def reserve_path(locks_dir: Path, resource: str) -> Path:
+    return Path(locks_dir) / f"{resource}.reserved"
+
+
+def reserve(path: Path, holder: str) -> None:
+    """Reserve for holder, or refresh its reservation. A fresh one by another holder stays."""
+    other = reserved_by(path)
+    if other and other != holder:
+        return
+    try:
+        since = json.loads(path.read_text()).get("since") if other else None
+    except (OSError, ValueError):
+        since = None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps({"holder": holder, "since": since or time.time(), "ts": time.time()}))
+    os.replace(tmp, path)
+
+
+def reserved_by(path: Path) -> str | None:
+    """The holder of a live reservation; None when there is none or it went stale."""
+    try:
+        r = json.loads(path.read_text() or "{}")
+    except (OSError, ValueError):
+        return None
+    if time.time() - float(r.get("ts") or 0) > RESERVE_STALE_S:
+        return None
+    return str(r.get("holder") or "") or None
+
+
+def unreserve(path: Path, holder: str) -> None:
+    try:
+        if json.loads(path.read_text() or "{}").get("holder") == holder:
+            path.unlink()
+    except (OSError, ValueError):
+        pass

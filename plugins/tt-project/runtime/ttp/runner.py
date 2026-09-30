@@ -11,7 +11,8 @@
 - enforces the run's dollar budget mid-flight when the provider streams usage;
 - ends the child when <run_dir>/STOP appears (a cancel, or `ttp stop --kill` writing "shutdown");
 - holds a slot of each resource an `exclusive:` task names from before the child starts until it
-  has ended, the same locks `ttp lock` takes per command;
+  has ended, the same locks `ttp lock` takes per command; the wait for them has its own bound
+  (exclusive_wait_s), and the wall-clock limit starts once they are held;
 - writes exit.json exactly once, then asks the provider adapter for usage and records it.
 
 It survives a daemon restart: the daemon re-adopts runs by run_dir, pid and boot id.
@@ -88,13 +89,15 @@ def supervise(run_dir: Path) -> int:
     lease, out_path = run_dir / "lease", run_dir / "output.jsonl"
     _touch(lease)
     started = time.time()
-    held = _take_exclusive(run_dir, spec.get("exclusive") or [], spec.get("env", {}), started + timeout_s)
+    wait_s = min(float(spec.get("exclusive_wait_s") or 600), timeout_s)
+    held = _take_exclusive(run_dir, spec.get("exclusive") or [], spec.get("env", {}), started + wait_s)
     if held is None:
         exit_info = {"rc": None, "started": started, "ended": time.time(),
-                     "stopped": stop_reason(run_dir) or "timeout"}
+                     "stopped": stop_reason(run_dir) or "resource_busy"}
         (run_dir / "exit.json.tmp").write_text(json.dumps(exit_info))
         os.replace(run_dir / "exit.json.tmp", run_dir / "exit.json")
         return 1
+    started = time.time()
     prompt = open(run_dir / "prompt.md", "rb")
     out = open(out_path, "wb")
     err = open(run_dir / "stderr.log", "wb")
@@ -166,22 +169,31 @@ def supervise(run_dir: Path) -> int:
 
 def _take_exclusive(run_dir: Path, wanted: list[dict], env: dict, deadline: float) -> list | None:
     """One slot of each resource, waiting while `ttp lock` commands hold them all. The daemon starts
-    an exclusive task only when a slot is free, so a wait here is a race it lost. The wait counts
-    toward the run's wall clock and ends early on a stop; None when it ended without the slots."""
+    an exclusive task only when a slot is free, so a wait here is a race it lost; the resource stays
+    reserved while it waits, so new `ttp lock` commands let it in. The wait ends at the deadline or
+    on a stop; None when it ended without the slots."""
     from . import locks
-    who = f"task #{env.get('TTP_TASK') or '?'} (run {env.get('TTP_RUN_ID') or '?'}), whole run"
+    task = f"task #{env.get('TTP_TASK') or '?'}"
+    who = f"{task} (run {env.get('TTP_RUN_ID') or '?'}), whole run"
     held, told = [], 0.0
     for res in wanted:
         paths = [Path(x) for x in res["paths"]]
+        mark = Path(res["reserve"]) if res.get("reserve") else None
         while True:
             f = locks.try_take(paths, who, "exclusive")
             if f:
                 held.append(f)
+                if mark:
+                    locks.unreserve(mark, task)
                 break
             if stop_reason(run_dir) or time.time() > deadline:
                 for h in held:
                     h.close()
+                if mark:
+                    locks.unreserve(mark, task)
                 return None
+            if mark:
+                locks.reserve(mark, task)
             _touch(run_dir / "lease")
             if time.time() - told >= 120:
                 with open(run_dir / "progress.md", "a") as pf:

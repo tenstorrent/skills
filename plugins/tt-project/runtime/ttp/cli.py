@@ -531,7 +531,8 @@ def cmd_lock(a) -> None:
     Parallel tasks share a device or a remote build directory this way: each takes the lock only for
     the commands that touch it, and the rest of the task runs alongside other work. Slots come from
     the project's `resources` config (default 1); a running `exclusive:<resource>` task holds one for
-    its whole run. The lock is held until the command has ended, however it ends.
+    its whole run, and one waiting for a slot reserves the resource: new commands wait until it has
+    started. The lock is held until the command has ended, however it ends.
 
     Inside a run, waiting is reported in the run's progress (a wait is not a stall) and gives up
     after half the run's stall limit unless --timeout says otherwise (0: wait as long as it takes).
@@ -561,9 +562,11 @@ def cmd_lock(a) -> None:
     timeout = a.timeout
     if timeout is None:
         timeout = float(spec.get("stall_s") or 0) / 2
+    mark = lk.reserve_path(p.state / "locks", a.resource)
     started, told = time.time(), 0.0
     while True:
-        f = lk.try_take(paths, who, " ".join(cmd))
+        reserved = lk.reserved_by(mark)
+        f = None if reserved else lk.try_take(paths, who, " ".join(cmd))
         if f:
             waited = time.time() - started
             if waited > 5:
@@ -589,7 +592,8 @@ def cmd_lock(a) -> None:
         if timeout and time.time() - started > timeout:
             die(f"{a.resource} stayed busy for {timeout:.0f} s; hand the task back as waiting", 75)
         if time.time() - told >= 120:
-            line = f"waiting for {a.resource} (held by {', '.join(lk.holders(paths)) or 'another task'})"
+            line = (f"waiting for {a.resource} (reserved for {reserved})" if reserved else
+                    f"waiting for {a.resource} (held by {', '.join(lk.holders(paths)) or 'another task'})")
             print(f"ttp lock: {line}", file=sys.stderr, flush=True)
             if run_dir:
                 try:
