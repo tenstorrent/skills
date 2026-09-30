@@ -3235,21 +3235,26 @@ def test_an_exclusive_run_that_loses_the_race_requeues_without_an_attempt(env, m
                             "resources": ["board"], "exclusive": True}]) == []
     tid = p.db.one("SELECT id FROM tasks WHERE title='reflash'")["id"]
     p.db.x("UPDATE messages SET handled=1")
-    holder = subprocess.Popen([sys.executable, str(TTP), "lock", "board", "--", "sleep", "30"], env=run_env)
+    hold_s = 600   # far longer than any wait the losing run may do, so finishing early proves it gave up
+    holder = subprocess.Popen([sys.executable, str(TTP), "lock", "board", "--", "sleep", str(hold_s)], env=run_env)
     try:
-        time.sleep(1.0)
-        monkeypatch.setattr(dmod.locks, "any_free", lambda paths: True)   # the slot looked free at the tick
         d = dmod.Daemon(p.base)
+        deadline = time.time() + 60   # wait on the lock itself, not a fixed sleep: slow hosts start late
+        while dmod.locks.any_free(d._slot_paths("board")):
+            assert time.time() < deadline and holder.poll() is None, "the holder never took the lock"
+            time.sleep(0.1)
+        monkeypatch.setattr(dmod.locks, "any_free", lambda paths: True)   # the slot looked free at the tick
         t0 = time.time()
         assert _run_until(d, p, lambda: p.db.q("SELECT id FROM runs WHERE task=? AND status!='running'", (tid,)),
-                          timeout=30)
+                          timeout=hold_s / 2)
         waited = time.time() - t0
+        assert holder.poll() is None, "the holder let go before the run finished"
     finally:
         holder.kill()
         holder.wait(timeout=30)
     run = p.db.one("SELECT * FROM runs WHERE task=?", (tid,))
     t = p.db.task(tid)
-    assert run["status"] == "resource_busy" and waited < 20, (run["status"], waited)
+    assert run["status"] == "resource_busy" and waited < hold_s / 5, (run["status"], waited)
     assert t["status"] == "queued" and not t["attempts"] and t["not_before"], dict(t)
 
 
