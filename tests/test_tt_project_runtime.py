@@ -2141,6 +2141,50 @@ def test_restart_rolls_back_when_the_new_daemon_dies_or_its_first_tick_fails(env
     assert subprocess.run(["git", "-C", str(h), "diff", "--quiet", good, "HEAD", "--", "runtime"]).returncode == 0
 
 
+@pytest.mark.parametrize("exits_after", [45, None])
+def test_a_cron_restart_waits_for_the_old_daemon_and_never_rolls_it_back(env, monkeypatch, exits_after):
+    p = make(env)
+    from ttp import daemon as dm, service
+    h = p.harness
+    p.db.set_kv("harness_good", {"commit": _git_out(h, "rev-parse", "HEAD")})
+    head = _runtime_change(h)
+    old = subprocess.Popen(["sleep", "600"])
+    (p.state / "daemon.pid").write_text(str(old.pid))
+
+    class Clock:
+        now = time.time()
+
+        def time(self):
+            return self.now
+
+        def sleep(self, s):
+            self.now += s
+
+    clock = Clock()
+    t0 = clock.now
+    old_alive = lambda pid: pid == old.pid and (exits_after is None or clock.now < t0 + exits_after)  # noqa: E731
+    monkeypatch.setattr(service, "time", clock)
+    monkeypatch.setattr(dm, "_alive", old_alive)
+    monkeypatch.setattr(dm, "_is_daemon", old_alive)
+
+    def spawn(p):
+        if old_alive(old.pid):
+            return   # the new daemon finds the lock held and exits at once
+        (p.state / "daemon.pid").write_text(str(os.getpid()))
+        (p.state / "daemon.start").write_text(json.dumps({"pid": os.getpid(), "started": clock.now}))
+        (p.state / "heartbeat").write_text(json.dumps({"pid": os.getpid(), "started": clock.now}))
+
+    monkeypatch.setattr(service, "_spawn", spawn)
+    try:
+        text = service.restart(p)
+    finally:
+        old.kill()
+        old.wait()
+    assert ("daemon is running" in text) if exits_after else ("old daemon has not exited" in text)
+    assert _git_out(h, "rev-parse", "HEAD") == head, "the runtime was rolled back while the old daemon lived"
+    assert not p.db.one("SELECT id FROM messages WHERE kind='alert' AND text LIKE '%rolled back%'")
+
+
 def test_the_daemon_records_its_start_and_first_tick_failures(env, monkeypatch):
     p = make(env)
     from ttp import daemon as dm, web
@@ -2193,6 +2237,41 @@ def test_finished_worktrees_are_removed_only_when_nothing_is_lost(env):
     for name in ("unpushed", "dirty", "recent"):
         assert paths[name][0].exists(), f"the {name} worktree was removed"
     assert "removed" in (p.logs / "daemon.log").read_text()
+
+
+@pytest.mark.parametrize("merged", [True, False])
+def test_a_worktree_merged_into_a_remote_only_base_is_pruned(env, merged):
+    p = make(env)
+    from ttp import worktree
+    from ttp.daemon import Daemon
+    remote = env["tmp"] / "remote.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+    _git_out(p.root, "remote", "add", "origin", str(remote))
+    _git_out(p.root, "push", "-q", "origin", "HEAD:refs/heads/release")
+    _git_out(p.root, "fetch", "-q", "origin")
+    p.set_config("delivery.base_ref", "release")
+    assert not _git_out(p.root, "branch", "--list", "release"), "the base must exist only on the remote"
+    tid = p.db.add_task("merged", "s", kind="code", tier="light", origin="user")
+    path, branch = worktree.ensure(p, p.db.task(tid))
+    (path / "work.txt").write_text("work")
+    _git_out(path, "add", ".")
+    _git_out(path, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "work")
+    if merged:
+        _git_out(path, "push", "-q", "origin", "HEAD:refs/heads/release")
+        _git_out(p.root, "fetch", "-q", "origin")
+    p.db.update_task(tid, status="done", branch=branch)
+    p.db.x("UPDATE tasks SET updated=? WHERE id=?", (time.time() - 8 * 86400, tid))
+    Daemon(p.base).prune_worktrees()
+    assert path.exists() != merged
+
+
+def test_a_worktree_is_kept_when_the_base_cannot_be_resolved(env):
+    p = make(env)
+    from ttp import worktree
+    tid = p.db.add_task("t", "s", kind="code", tier="light", origin="user")
+    path, _ = worktree.ensure(p, p.db.task(tid))
+    p.set_config("delivery.base_ref", "no-such-branch")
+    assert "no-such-branch" in worktree.keep_reason(p, path)
 
 
 def test_low_disk_space_blocks_new_workers_and_alerts_once(env, monkeypatch):

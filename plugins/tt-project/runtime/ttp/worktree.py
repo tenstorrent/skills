@@ -99,7 +99,11 @@ def keep_reason(p: Project, path: Path) -> str | None:
     remote = git("branch", "-r", "--contains", "HEAD")
     if remote.returncode == 0 and remote.stdout.strip():
         return None
-    if git("merge-base", "--is-ancestor", "HEAD", base_ref(p)).returncode == 0:
+    try:
+        base = resolve_base(p)
+    except RuntimeError as e:
+        return str(e)
+    if git("merge-base", "--is-ancestor", "HEAD", base).returncode == 0:
         return None
     return "commits not pushed or merged"
 
