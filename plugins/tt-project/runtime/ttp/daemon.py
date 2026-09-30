@@ -39,7 +39,7 @@ from . import upstream
 from . import screen as scr
 from . import shared
 from . import worktree
-from .db import SEVERITY_RANK, TERMINAL_TASK_STATES, continues_id, dependency_ids, dump_result, load_result
+from .db import OPEN_ASK_MAX_AGE_S, SEVERITY_RANK, TERMINAL_TASK_STATES, continues_id, dependency_ids, dump_result, load_result
 from .project import Project, hostname, load_secrets
 from .providers import get_provider
 from .providers.base import last_json_object, scratch_dir, service_path
@@ -1447,7 +1447,8 @@ class Daemon:
         # Queued work waiting on a retry timer, a dependency or a resource starts by itself; an open
         # question waits for the user.
         if db.one("SELECT id FROM tasks WHERE status='queued'") or \
-                db.one("SELECT id FROM messages WHERE kind='ask' AND handled=0"):
+                db.one("SELECT id FROM messages WHERE kind='ask' AND handled=0 AND ts>?",
+                       (time.time() - OPEN_ASK_MAX_AGE_S,)):
             return False
         if coord.next_task_slot(db, coord.task_cap(self.cfg)) is not None:
             return False

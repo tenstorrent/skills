@@ -9353,3 +9353,19 @@ def test_the_coordinator_model_and_effort_override_its_tier_and_leave_workers_al
     d = Daemon(p.base)
     row = run(d, "coordinator")
     assert (row["model"], row["effort"]) == ("pinned-model", "low")
+
+
+def test_idle_slot_wake_ignores_forgotten_open_asks(env, monkeypatch):
+    from types import SimpleNamespace
+    p = make(env)
+    from ttp.daemon import Daemon
+    from ttp.db import OPEN_ASK_MAX_AGE_S
+    d = Daemon(p.base)
+    monkeypatch.setattr(d, "_free_slots", lambda gate: 1)
+    monkeypatch.setattr(d, "_dispatchable", lambda: False)
+    gate = SimpleNamespace(regime="windows", level="green", allow_new_work=True,
+                           numbers={"pace": [{"need_per_h": 10, "burn_per_h": 1}]})
+    ask = p.db.post("out", "which option?", kind="ask")
+    assert not d._starved(gate, 10 ** 6), "a fresh open ask waits for the user"
+    p.db.x("UPDATE messages SET ts=? WHERE id=?", (time.time() - OPEN_ASK_MAX_AGE_S - 60, ask))
+    assert d._starved(gate, 10 ** 6), "a forgotten ask must not hold back idle-slot wakes forever"

@@ -90,6 +90,8 @@ CREATE INDEX IF NOT EXISTS alerts_key ON alerts(key, cleared);
 """
 
 TERMINAL_TASK_STATES = ("done", "failed", "cancelled")
+# Open asks older than this no longer hold back idle-slot wakes. They are still shown until answered.
+OPEN_ASK_MAX_AGE_S = 14 * 86400
 
 
 class DB:
