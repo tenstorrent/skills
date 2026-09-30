@@ -415,7 +415,7 @@ class Daemon:
         usage = prov.parse(run_dir / "output.jsonl", run_dir / "stderr.log")
         self._priced(r, usage)
         stopped = exit_info.get("stopped")
-        if usage.estimated and not usage.cost_usd and stopped:
+        if usage.estimated and not usage.cost_usd:
             usage.cost_usd = _cut_off_cost(run_dir, exit_info)
         status = "ok" if exit_info.get("rc") == 0 and not usage.error else "failed"
         if stopped in ("timeout", "budget", "stopped", "lost", "stalled", "shutdown", "resource_busy"):
@@ -577,7 +577,8 @@ class Daemon:
                            blocked_reason="its resource stayed busy before the run could start; retries")
             return
         rstatus = result.get("status") if isinstance(result, dict) else None
-        summary = str((result.get("summary") if isinstance(result, dict) else None) or (usage.final_text or "")[:1500])
+        summary = str((result.get("summary") if isinstance(result, dict) else None)
+                      or (usage.final_text or usage.error or "")[:1500])
         waiting = status == "ok" and rstatus == "waiting"
         no_handoff = status == "ok" and rstatus is None
         if waiting:
@@ -1286,10 +1287,10 @@ def _exclusive(task: dict) -> list[str]:
 
 
 def _cut_off_cost(run_dir: Path, exit_info: dict) -> float:
-    """A run stopped before its provider reported any usage (Codex and Cursor report it only at the
-    end) still spent money. Book the elapsed share of its dollar budget rather than $0, so the
-    caps keep counting it. A run whose agent never started (it gave up waiting for a resource)
-    spent nothing."""
+    """A run that ended without any usage to price still spent money: Codex reports usage only when
+    a turn completes, and Cursor's result has none at all. Book the elapsed share of its dollar
+    budget rather than $0, so the caps keep counting it. A run whose agent never started (it gave
+    up waiting for a resource) spent nothing."""
     if exit_info.get("launched") is False:
         return 0.0
     try:

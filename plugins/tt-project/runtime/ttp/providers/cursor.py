@@ -9,7 +9,7 @@ import json
 from pathlib import Path
 
 from . import register
-from .base import AUTH_RE, LIMIT_RE, Provider, RunUsage, price_row
+from .base import AUTH_RE, LIMIT_RE, Provider, RunUsage, price_row, stderr_tail
 
 PRICES = {"default": (3.0, 0.3, 15.0)}
 
@@ -49,10 +49,12 @@ class Cursor(Provider):
             u.cache_write_tokens = int(usage.get("cacheWriteTokens") or 0)
             if data.get("is_error"):
                 u.error = str(data.get("result"))[:400]
+        err = stderr_tail(stderr_path)
+        if not data and err.strip():
+            u.error = err.strip()[-400:]   # a failed run prints no JSON, only its reason on stderr
         pin, pcached, pout = price_row(PRICES, self.prices, self.model)
         u.cost_usd = (u.input_tokens * pin + u.cache_read_tokens * pcached + u.output_tokens * pout) / 1e6
-        blob = u.error + " " + (Path(stderr_path).read_text(errors="replace")[-2000:]
-                                if stderr_path and Path(stderr_path).exists() else "")
+        blob = u.error + " " + err
         if AUTH_RE.search(blob) and not u.output_tokens:
             u.auth_failed = True
         elif LIMIT_RE.search(blob):

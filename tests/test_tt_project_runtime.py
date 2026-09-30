@@ -2703,6 +2703,186 @@ def test_codex_and_cursor_price_tokens_with_project_rows(env, tmp_path):
     assert get_provider("cursor").parse(cur).cost_usd == pytest.approx(18.0)
 
 
+# A stand-in for the `codex` and `agent` CLIs: records its argv and stdin, writes result.json when
+# told to, then prints FAKE_CLI_STDOUT and FAKE_CLI_STDERR and exits with FAKE_CLI_RC.
+FAKE_CLI = """#!{python}
+import json, os, sys
+from pathlib import Path
+log = Path(os.environ["FAKE_CLI_LOG"])
+log.mkdir(parents=True, exist_ok=True)
+(log / "argv.json").write_text(json.dumps(sys.argv))
+(log / "stdin.txt").write_text(sys.stdin.read())
+if os.environ.get("FAKE_CLI_RESULT"):
+    (Path(os.environ["TTP_RUN_DIR"]) / "result.json").write_text(os.environ["FAKE_CLI_RESULT"])
+sys.stdout.write(os.environ.get("FAKE_CLI_STDOUT", ""))
+sys.stderr.write(os.environ.get("FAKE_CLI_STDERR", ""))
+sys.exit(int(os.environ.get("FAKE_CLI_RC", "0")))
+"""
+
+
+def _cli_run(env, monkeypatch, provider, stdout, *, stderr="", rc=0, result=None, role="worker",
+             read_only=False, schema=None, note=None, before=None):
+    """Launch one run of `provider` through the daemon and its detached runner against a fake CLI,
+    reap it, and return the project, run row, task row, argv and the stdin the CLI received."""
+    bin_dir = env["tmp"] / "fakebin"
+    bin_dir.mkdir(exist_ok=True)
+    for name in ("codex", "agent"):
+        exe = bin_dir / name
+        exe.write_text(FAKE_CLI.format(python=sys.executable))
+        exe.chmod(0o755)
+    log_dir = env["tmp"] / "fakecli"
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setenv("FAKE_CLI_LOG", str(log_dir))
+    monkeypatch.setenv("FAKE_CLI_STDOUT", stdout)
+    monkeypatch.setenv("FAKE_CLI_STDERR", stderr)
+    monkeypatch.setenv("FAKE_CLI_RC", str(rc))
+    monkeypatch.setenv("FAKE_CLI_RESULT", json.dumps(result) if result else "")
+    p = make(env)
+    if before:
+        before(p)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    tid = None
+    if role != "coordinator":
+        tid = p.db.add_task("t", "s", kind="work", tier="light", origin="user")
+        p.db.update_task(tid, status="running")
+    rid = d.start_run(role, "PROMPT-MARKER", provider, "light", str(env["repo"]),
+                      task=p.db.task(tid) if tid else None, budget_usd=2.0, timeout_s=100,
+                      read_only=read_only, schema=schema, note=note)
+    exit_file = p.runs / str(rid) / "exit.json"
+    deadline = time.time() + 60
+    while not exit_file.exists() and time.time() < deadline:
+        time.sleep(0.1)
+    assert exit_file.exists(), (p.runs / str(rid) / "runner.log").read_text()
+    d.reap_runs()
+    argv = json.loads((log_dir / "argv.json").read_text())
+    assert argv[0] == str(bin_dir / ("codex" if provider == "codex" else "agent")), "not the fake CLI"
+    return (p, p.db.one("SELECT * FROM runs WHERE id=?", (rid,)), p.db.task(tid) if tid else None, argv,
+            (log_dir / "stdin.txt").read_text())
+
+
+def _codex_events(*events):
+    return "".join(json.dumps(e) + "\n" for e in events)
+
+
+def _codex_turn(text, inp=1000, cached=0, out=500):
+    return [{"type": "thread.started", "thread_id": "th-1"}, {"type": "turn.started"},
+            {"type": "item.completed", "item": {"id": "i1", "type": "agent_message", "text": text}},
+            {"type": "turn.completed", "usage": {"input_tokens": inp, "cached_input_tokens": cached,
+                                                 "output_tokens": out}}]
+
+
+def test_codex_worker_launches_on_stdin_and_hands_off(env, monkeypatch):
+    done = {"status": "done", "summary": "changed the README"}
+    p, run, task, argv, stdin = _cli_run(env, monkeypatch, "codex", _codex_events(*_codex_turn("all done")),
+                                         result=done)
+    cwd = str(env["repo"])
+    assert argv[1:3] == ["exec", "--json"] and argv[argv.index("-C") + 1] == cwd
+    assert argv[argv.index("-s") + 1] == "workspace-write" and "approval_policy=never" in argv
+    assert "model_reasoning_effort=low" in argv and "sandbox_workspace_write.network_access=true" in argv
+    assert any(a.startswith("sandbox_workspace_write.writable_roots=") for a in argv)
+    assert "--output-schema" not in argv and argv[-1] == "-", "the prompt must arrive on stdin"
+    assert "PROMPT-MARKER" in stdin
+    assert run["status"] == "ok" and run["exit_code"] == 0 and run["cost_estimated"] == 1
+    assert run["input_tokens"] == 1000 and run["output_tokens"] == 500
+    assert run["cost_usd"] == pytest.approx((1000 * 4.0 + 500 * 20.0) / 1e6), "priced from the default row"
+    assert task["status"] == "done" and task["spent_usd"] == pytest.approx(run["cost_usd"])
+
+
+def test_codex_error_it_retried_does_not_fail_a_completed_turn(env, monkeypatch):
+    turn = _codex_turn("all done")
+    out = _codex_events(turn[0], turn[1], {"type": "error", "message": "stream disconnected; retrying 1/5"},
+                        *turn[2:])
+    _, run, task, _, _ = _cli_run(env, monkeypatch, "codex", out, result={"status": "done", "summary": "ok"})
+    assert run["status"] == "ok", "a transient error the turn recovered from failed the run"
+    assert task["status"] == "done" and task["attempts"] == 1
+
+
+def test_codex_failed_turn_is_an_attempt_and_says_why(env, monkeypatch):
+    out = _codex_events({"type": "thread.started", "thread_id": "th-1"}, {"type": "turn.started"},
+                        {"type": "error", "message": "model is overloaded"},
+                        {"type": "turn.failed", "error": {"message": "model is overloaded"}})
+    _, run, task, _, _ = _cli_run(env, monkeypatch, "codex", out, rc=1)
+    assert run["status"] == "failed" and run["exit_code"] == 1
+    assert task["status"] == "queued" and task["attempts"] == 1
+    assert "overloaded" in json.loads(task["result"])["summary"], "the failure's reason was lost"
+    assert run["cost_usd"] > 0 and run["cost_estimated"] == 1, "a run that reported no usage booked $0"
+
+
+def test_codex_usage_limit_pauses_the_provider_without_an_attempt(env, monkeypatch):
+    out = _codex_events({"type": "turn.failed", "error": {"message": "You've hit your usage limit."}})
+    p, run, task, _, _ = _cli_run(env, monkeypatch, "codex", out, rc=1)
+    assert run["status"] == "limit" and task["status"] == "queued" and task["attempts"] == 0
+    assert p.db.kv("limited:codex")["until"] > time.time()
+
+
+def test_codex_that_cannot_start_reports_its_stderr(env, monkeypatch):
+    err = "error: unexpected argument '--bogus' found\n"
+    _, run, task, _, _ = _cli_run(env, monkeypatch, "codex", "", stderr=err, rc=2)
+    assert run["status"] == "failed" and task["status"] == "queued"
+    assert "unexpected argument" in json.loads(task["result"])["summary"]
+
+
+def test_codex_coordinator_turn_is_read_only_and_its_actions_apply(env, monkeypatch):
+    from ttp import coordinator as coord
+
+    def chat(p):
+        p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)",
+               (time.time(), "t", time.time()))
+    reply = {"actions": [{"type": "reply", "chat": "c1", "text": "hello from codex", "title": None}],
+             "summary": None}
+    p, run, _, argv, stdin = _cli_run(env, monkeypatch, "codex", _codex_events(*_codex_turn(json.dumps(reply))),
+                                      role="coordinator", read_only=True, schema=coord.ACTIONS_SCHEMA,
+                                      note={"default_chat": "c1"}, before=chat)
+    assert argv[argv.index("-s") + 1] == "read-only" and "--output-schema" in argv
+    assert not any("writable_roots" in a or "network_access" in a for a in argv)
+    assert argv[-1] == "-" and "PROMPT-MARKER" in stdin
+    assert run["status"] == "ok"
+    assert p.db.one("SELECT text FROM messages WHERE direction='out' AND chat='c1'")["text"] == "hello from codex"
+
+
+def _cursor_result(text, **extra):
+    return json.dumps({"type": "result", "subtype": "success", "is_error": False, "duration_ms": 1200,
+                       "duration_api_ms": 1100, "result": text, "session_id": "s-1", **extra}) + "\n"
+
+
+def test_cursor_worker_launches_on_stdin_and_books_spend_without_usage(env, monkeypatch):
+    done = {"status": "done", "summary": "changed the README"}
+    p, run, task, argv, stdin = _cli_run(env, monkeypatch, "cursor", _cursor_result("all done"), result=done)
+    assert argv[1:4] == ["-p", "--output-format", "json"] and argv[argv.index("--workspace") + 1] == str(env["repo"])
+    assert argv[argv.index("--model") + 1] == "auto" and "--force" in argv and "--trust" in argv
+    assert "PROMPT-MARKER" in stdin, "the prompt must arrive on stdin"
+    assert run["status"] == "ok" and task["status"] == "done"
+    # Cursor's result carries no usage: the run still spent money, and the caps must count it.
+    assert run["cost_usd"] > 0 and run["cost_estimated"] == 1, "a Cursor run booked $0"
+    assert p.db.one("SELECT SUM(usd) AS s FROM ledger WHERE provider='cursor'")["s"] == pytest.approx(run["cost_usd"])
+
+
+def test_cursor_reported_error_fails_the_run(env, monkeypatch):
+    _, run, task, _, _ = _cli_run(env, monkeypatch, "cursor", _cursor_result("tool crashed", is_error=True))
+    assert run["status"] == "failed" and task["status"] == "queued" and task["attempts"] == 1
+
+
+def test_cursor_failure_without_json_reports_its_stderr(env, monkeypatch):
+    _, run, task, _, _ = _cli_run(env, monkeypatch, "cursor", "", stderr="Error: model not available\n", rc=1)
+    assert run["status"] == "failed" and task["status"] == "queued"
+    assert "model not available" in json.loads(task["result"])["summary"], "the failure's reason was lost"
+
+
+def test_cursor_logged_out_pauses_the_provider_without_an_attempt(env, monkeypatch):
+    err = "Error: Authentication required. Please run 'agent login' first, or set CURSOR_API_KEY.\n"
+    p, run, task, _, _ = _cli_run(env, monkeypatch, "cursor", "", stderr=err, rc=1)
+    assert run["status"] == "auth" and task["status"] == "queued" and task["attempts"] == 0
+    alert = p.db.one("SELECT text FROM messages WHERE kind='alert' ORDER BY id DESC LIMIT 1")["text"]
+    assert "agent login" in alert
+
+
+def test_cursor_read_only_run_does_not_force_writes(env, monkeypatch):
+    _, run, _, argv, _ = _cli_run(env, monkeypatch, "cursor", _cursor_result('{"actions": []}'),
+                                  role="coordinator", read_only=True)
+    assert "--force" not in argv and run["status"] == "ok"
+
+
 def test_logged_out_alert_and_fix_name_the_right_provider(env):
     p = make(env)
     from ttp import web

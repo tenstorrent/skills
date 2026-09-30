@@ -14,7 +14,7 @@ from pathlib import Path
 EXTRA_BIN_DIRS = ["~/.local/bin", "~/.npm-global/bin", "~/bin", "/opt/homebrew/bin", "/usr/local/bin",
                   "~/.bun/bin", "~/.cargo/bin"]
 
-AUTH_RE = re.compile(r"(authentication_failed|failed to authenticate|oauth (session|token) (expired|invalid)|"
+AUTH_RE = re.compile(r"(authentication_failed|failed to authenticate|authentication required|oauth (session|token) (expired|invalid)|"
                      r"not logged in|please (run )?/?login|invalid api key|unauthorized|(status|http|error)[ :=]*401\b)", re.I)
 
 LIMIT_RE = re.compile(r"(usage limit|limit reached|rate limit|quota exceeded|out of credits|"
@@ -102,6 +102,13 @@ class Provider:
     def meter(self) -> list:
         """Plan-window utilization for the whole account, when the provider exposes it."""
         return []
+
+
+def stderr_tail(stderr_path: Path | None, chars: int = 2000) -> str:
+    try:
+        return Path(stderr_path).read_text(errors="replace")[-chars:] if stderr_path else ""
+    except OSError:
+        return ""
 
 
 def price_row(defaults: dict, overrides: dict, model: str) -> tuple[float, float, float]:

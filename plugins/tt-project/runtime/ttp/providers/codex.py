@@ -13,7 +13,7 @@ import subprocess
 from pathlib import Path
 
 from . import register
-from .base import AUTH_RE, LIMIT_RE, Provider, RunUsage, price_row
+from .base import AUTH_RE, LIMIT_RE, Provider, RunUsage, price_row, stderr_tail
 
 # $ per million tokens: (input, cached input, output). Estimates only; the project may override
 # them in project.json under pricing.codex.<model>. Unknown models use the "default" row.
@@ -89,16 +89,24 @@ class Codex(Provider):
         u = RunUsage(input_tokens=inp - cached, cache_read_tokens=cached, output_tokens=out, final_text=last,
                      estimated=True)
         u.cost_usd = self._price(inp, cached, out)
-        errors = [ev for ev in self._events(output_path) if ev.get("type") in ("turn.failed", "error")]
+        events, errors = 0, []
+        for ev in self._events(output_path):
+            events += 1
+            if ev.get("type") == "turn.completed":
+                errors = []   # transient errors Codex retried are reported as "error" events too
+            elif ev.get("type") in ("turn.failed", "error"):
+                errors.append(ev)
+        err = stderr_tail(stderr_path)
         if errors:
             u.error = json.dumps(errors[-1])[:400]
+        elif not events and err.strip():
+            u.error = err.strip()[-400:]   # it failed before starting a session: only stderr says why
         if last.strip().startswith("{"):
             try:
                 u.structured = drop_nulls(json.loads(last))
             except ValueError:
                 pass
-        blob = u.error + " " + (Path(stderr_path).read_text(errors="replace")[-2000:]
-                                if stderr_path and Path(stderr_path).exists() else "")
+        blob = u.error + " " + err
         if AUTH_RE.search(blob) and not u.output_tokens:
             u.auth_failed = True
         elif LIMIT_RE.search(blob):
