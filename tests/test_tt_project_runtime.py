@@ -4312,19 +4312,28 @@ def test_a_lock_wait_extends_the_runs_wall_clock(env, tmp_path):
     p = make(env)
     run_env = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost", TTP_PROJECT=str(p.base),
                    PYTHONPATH=str(RUNTIME))
-    holder = subprocess.Popen([sys.executable, str(TTP), "lock", "board", "--", "sleep", "9"], env=run_env)
-    time.sleep(1.0)
+    # The lock is held for 8s from the moment the holder has it, against a 5s limit: the run must
+    # outlast its limit, and the one limit's worth of extension leaves ~5s for start-up under load.
+    # (Holding for about twice the limit left no margin at all.)
+    held = tmp_path / "held"
+    holder = subprocess.Popen([sys.executable, str(TTP), "lock", "board", "--", "sh", "-c",
+                               f"touch {shlex.quote(str(held))}; sleep 8"], env=run_env)
+    deadline = time.time() + 60
+    while not held.exists():
+        assert time.time() < deadline and holder.poll() is None, "the holder never took the lock"
+        time.sleep(0.05)
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     (run_dir / "prompt.md").write_text("x")
     lock_cmd = f"{shlex.quote(sys.executable)} {shlex.quote(str(TTP))} lock board -- true"
     (run_dir / "run.json").write_text(json.dumps({
-        "argv": ["sh", "-c", f"{lock_cmd} && echo handed-off"], "cwd": str(tmp_path), "timeout_s": 4,
+        "argv": ["sh", "-c", f"{lock_cmd} && echo handed-off"], "cwd": str(tmp_path), "timeout_s": 5,
         "provider": "fake", "env": {"TTP_RUN_DIR": str(run_dir)}}))
     subprocess.run([sys.executable, "-m", "ttp.runner", str(run_dir)], cwd=str(RUNTIME), env=run_env, timeout=120)
     holder.wait(timeout=30)
     info = json.loads((run_dir / "exit.json").read_text())
     assert info["stopped"] is None and info["rc"] == 0, info
+    assert info["ended"] - info["started"] > 5, ("the run never outlasted its limit", info)
     assert "handed-off" in (run_dir / "output.jsonl").read_text()
 
 
