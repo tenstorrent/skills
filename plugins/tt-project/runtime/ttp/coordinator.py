@@ -286,7 +286,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 tier = a.get("tier") if a.get("tier") in ("light", "standard", "deep") else "standard"
                 budget = a.get("budget_usd") or cfg["budget"]["task_default_usd"].get(tier, 8.0)
                 kind_label = "exclusive" if a.get("exclusive") else "resource"
-                labels = [f"{kind_label}:{r}" for r in (a.get("resources") or []) if isinstance(r, str)]
+                labels = [f"{kind_label}:{r}" for r in _resource_names(a.get("resources") or [], t, problems)]
                 deps = _new_dependencies(db, None, a.get("depends_on") or [])
                 # The daemon would block a new task on a dead dependency at once.
                 dead = db.dead_dependency(deps)
@@ -338,8 +338,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     kind_label = "exclusive" if a.get("exclusive") else "resource"
                     keep = [lb for lb in json.loads(task["labels"] or "[]")
                             if not (isinstance(lb, str) and lb.split(":", 1)[0] in ("resource", "exclusive"))]
-                    upd["labels"] = keep + [f"{kind_label}:{r}" for r in a["resources"]
-                                            if isinstance(r, str) and RESOURCE_RE.fullmatch(r)]
+                    upd["labels"] = keep + [f"{kind_label}:{r}"
+                                            for r in _resource_names(a["resources"], t, problems)]
                     if upd.get("status", task["status"]) == "queued" and task["not_before"]:
                         # What it waited on was the old resource: it may start on the new one now.
                         upd.update(not_before=None, blocked_reason=None)
@@ -627,6 +627,18 @@ def expire_asks(p: Project, *, hold: bool = False, now: float | None = None) -> 
 
 
 RESOURCE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@+-]{0,79}")
+
+
+def _resource_names(names, action: str, problems: list) -> list[str]:
+    """The valid resource names; each dropped one is reported, so a typo is not silently lost."""
+    ok = []
+    for r in names if isinstance(names, list) else [names]:
+        if isinstance(r, str) and RESOURCE_RE.fullmatch(r):
+            ok.append(r)
+        else:
+            problems.append(f"{action}: resource {r!r} dropped: names are letters, digits and _.@+- "
+                            f"(max 80, starting with a letter or digit)")
+    return ok
 
 
 def pause_resource(p: Project, name: str, paused: bool, reason: str = "", by: str = "user",

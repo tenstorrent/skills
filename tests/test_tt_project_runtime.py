@@ -6216,3 +6216,16 @@ def test_waits_and_dependency_blocks_alone_do_not_start_a_trouble_episode_and_ep
     _bad_runs(p, tid, 1)
     d.check_resource_trouble(every_s=0)
     assert len(events()) == 1, "a count hovering at the threshold started a second episode"
+
+
+def test_invalid_resource_names_are_reported_not_silently_dropped(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    tid = p.db.add_task("soak", "s", kind="work", tier="light", origin="user", labels=["resource:box-a"])
+    problems = coord.apply(p, [{"type": "task_update", "id": tid, "resources": ["box b", "box-c"]}])
+    assert len(problems) == 1 and "'box b' dropped" in problems[0] and problems[0].startswith("task_update")
+    assert json.loads(p.db.task(tid)["labels"]) == ["resource:box-c"]
+    problems = coord.apply(p, [{"type": "task_add", "title": "new", "spec": "x", "resources": ["-bad", "ok1"]}])
+    assert len(problems) == 1 and "'-bad' dropped" in problems[0] and problems[0].startswith("task_add")
+    new = p.db.one("SELECT labels FROM tasks WHERE title='new'")
+    assert json.loads(new["labels"]) == ["resource:ok1"]
