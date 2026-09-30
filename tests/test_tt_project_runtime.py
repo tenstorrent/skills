@@ -1164,3 +1164,22 @@ def test_project_plugins_load_for_workers_only(env, tmp_path, monkeypatch):
     crid = d.start_run("coordinator", "decide", "claude", "light", str(p.base), read_only=True)
     assert "--plugin-dir" not in json.loads((p.runs / str(crid) / "run.json").read_text())["argv"]
     (p.runs / str(crid) / "STOP").touch()
+
+
+def test_task_branches_start_from_a_remote_only_base(env):
+    """A fresh clone has origin/<branch> but no local <branch>; a base set by name still works."""
+    p = make(env)
+    from ttp import worktree
+    remote = env["tmp"] / "remote.git"
+    subprocess.run(["git", "clone", "-q", "--bare", str(env["repo"]), str(remote)], check=True)
+    subprocess.run(["git", "-C", str(env["repo"]), "remote", "add", "origin", str(remote)], check=True)
+    subprocess.run(["git", "-C", str(env["repo"]), "push", "-q", "origin", "HEAD:refs/heads/work/fast"], check=True)
+    subprocess.run(["git", "-C", str(env["repo"]), "fetch", "-q", "origin"], check=True)
+    p.set_config("delivery.base_ref", "work/fast")
+    assert worktree.resolve_base(p) == "origin/work/fast"
+    tid = p.db.add_task("t", "s", kind="code", tier="light", origin="user")
+    path, branch = worktree.ensure(p, dict(p.db.task(tid)))
+    assert path.exists()
+    p.set_config("delivery.base_ref", "fast")
+    with pytest.raises(RuntimeError, match="similar: .*work/fast"):
+        worktree.resolve_base(p)

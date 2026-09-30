@@ -50,8 +50,23 @@ def ensure(p: Project, task: dict) -> tuple[Path, str]:
         _git(p.root, "worktree", "add", str(path), branch)
     else:
         _git(p.root, "fetch", "--quiet", "origin", check=False)
-        _git(p.root, "worktree", "add", "-b", branch, str(path), base_ref(p))
+        _git(p.root, "worktree", "add", "-b", branch, str(path), resolve_base(p))
     return path, branch
+
+
+def resolve_base(p: Project) -> str:
+    """The configured base as a commit git can find: the name itself, else the remote's branch of
+    that name (a fresh clone has `origin/<name>` but no local `<name>`). A miss names close matches,
+    so whoever set it can fix it in one step."""
+    ref = base_ref(p)
+    for cand in (ref, f"origin/{ref}"):
+        if _git(p.root, "rev-parse", "--verify", "--quiet", f"{cand}^{{commit}}", check=False):
+            return cand
+    tail = ref.split("/")[-1]
+    near = [b for b in _git(p.root, "branch", "-a", "--format=%(refname:short)", check=False).split()
+            if tail and tail in b][:5]
+    raise RuntimeError(f"base branch {ref!r} not found here or on origin"
+                       + (f"; similar: {', '.join(near)}" if near else ""))
 
 
 def remove(p: Project, task_id: int) -> None:
