@@ -12,6 +12,7 @@
 | `ttp memory <name> "<fact>"` | add a durable fact |
 | `ttp config <name> <key> [value]` | read or set settings (dotted keys) |
 | `ttp pause <name>` / `resume` | stop starting model runs / start again |
+| `ttp machines add <alias> --tags device,... [--note ...]` / `ttp machines list` / `ttp machines remove <alias>` | the user's machines, shared by all their projects; each charter says which ones a project may use |
 | `ttp pause <name> --resource <r> [--reason ...]` / `ttp resume <name> --resource <r>` | hold every task that uses resource `<r>` and make `ttp lock <r>` refuse it; running workers on it are told / lift it |
 | `ttp restart <name>` | restart the daemon and confirm it runs; a runtime it cannot start with is rolled back |
 | `ttp stop <name> [--kill]` | remove the service; keeps all data. Running workers finish unless `--kill` (their tasks resume on start) |

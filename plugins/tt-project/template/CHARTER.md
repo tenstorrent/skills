@@ -23,3 +23,6 @@ Created {{DATE}}. The coordinator keeps this file current; the user's words win 
 ## Resources
 
 (machines, devices, reservations, repositories, data — to be filled in)
+
+Machines this project may use (aliases from `ttp machines list`; the coordinator routes work
+only to these): (none stated yet)

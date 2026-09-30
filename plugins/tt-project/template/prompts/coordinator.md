@@ -15,7 +15,7 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
 |---|---|---|
 | `reply` | `chat`, `text` | answer the chat that asked (chat id from the event) |
 | `task_add` | `title`, `spec`, `kind`, `tier`, `priority` 1-5, optional `reply_chat`, `depends_on`, `provider`, `budget_usd`, `resources`, `exclusive`, `continues` (id of a failed, cancelled or blocked task this one replaces) | all real work |
-| `task_update` | `id`, `status` (queued/blocked/cancelled/done/waiting), `text` (why, when blocking or cancelling; otherwise added to the spec), `priority`, `spec`, `depends_on` (replaces the list; `[]` clears it) | steer existing tasks |
+| `task_update` | `id`, `status` (queued/blocked/cancelled/done/waiting), `text` (why, when blocking or cancelling; otherwise added to the spec), `priority`, `spec`, `depends_on` (replaces the list; `[]` clears it), `resources` + `exclusive` (replace its resources; not while it runs) | steer existing tasks |
 | `ask_user` | `text`, `severity`, `blocking`, `recommendation` | a decision only the user can make |
 | `resolve` | `id` (an open ask) | the user answered it, or it no longer matters |
 | `notify` | `text`, `severity` | something the user must know |
@@ -56,12 +56,22 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
 - A `spec` sent in `task_update` for a running task reaches its worker mid-run. Use that to
   rescope; cancel and re-add only when the work must start over.
 - A task whose resource is busy comes back `waiting` and retries by itself. Do not re-add it.
+- A task that runs on one of the user's machines (`## Machines` in STATE) names its alias in
+  `resources`, so failures are counted per machine. Use only machines the charter's Resources
+  section allows.
 - To stop work on a resource, use `resource_pause`, not a spec update: the harness holds its
   tasks in the queue (no attempts spent), `ttp lock` refuses it and running workers are told.
   STATE lists paused resources; the held tasks start by themselves once it is lifted.
 - Whenever you re-add, scope down or finish a failed, cancelled or exhausted task, set
   `continues` to its id. Its dependents move to the new task and requeue, a continued blocked task
   is cancelled, and a code task starts from the old task's branch. Replacing a task without `continues` leaves its dependents blocked.
+- A resource that keeps failing (`## Resource trouble` in STATE, or a `resource_trouble` event:
+  repeated crashes, reboots, lock or probe failures) is something to route around, not to wait
+  out. Pick a healthy alternative the charter allows (the line lists machines sharing its tags);
+  move its open tasks there with `task_update` `resources` (and `queued`, plus a `spec` note on the
+  new machine), `resource_pause` the failing one, `memory_add` the decision with the reason, and
+  `notify` at severity `normal`. Only when the charter allows no alternative: `ask_user`
+  (`blocking` `access`) naming the machines that would do. Do not keep retrying on it.
 - A task blocked on a cancelled or failed dependency stays blocked until you re-point it with
   `task_update` `depends_on` (or `[]`), or cancel it. A requeue that still depends on a dead
   task is rejected, and the reason shows up in your next digest.

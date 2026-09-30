@@ -27,6 +27,19 @@ Ask only what you cannot infer. One message, all questions at once.
 - Remote machine → `--host <ssh-alias> --dir <root on that machine>`.
 - Device details or reservations named by the user go into the brief.
 
+## 3b. The user's machines (for device or remote work)
+
+The user's machines are listed once per user and shared by all their projects:
+`ttp machines list`. When the work needs devices or other machines, offer in the same message:
+
+- to record machines not listed yet: `ttp machines add <alias> --tags device,... --note "..."`
+  (a short alias such as `box-a`; tags say what it offers; no secrets in the note);
+- which of them this project may use. Put that in the brief as a line starting
+  "Machines this project may use:", so the charter's Resources section records it.
+
+When one machine keeps failing, the coordinator moves the work to another allowed machine with
+the same tags and tells the user. With only one allowed machine it has to ask instead.
+
 ## 4. Jev (optional)
 
 Check `ttp secret show`. No Jev entry → tell the user, in plain words:

@@ -6063,3 +6063,125 @@ def test_a_pause_set_while_ttp_lock_waits_ends_the_wait_with_75(env, tmp_path):
     finally:
         os.killpg(holder.pid, signal.SIGTERM)
         holder.wait(timeout=30)
+
+
+def test_machines_list_is_per_user_and_managed_by_ttp_machines(env, capsys):
+    from ttp import machines as mm
+    from ttp.cli import main
+    assert mm.load() == {}
+    main(["machines", "add", "box-a", "--tags", "device, n300", "--note", "  the rack\nboard "])
+    main(["machines", "add", "box-b", "--tags", "Device"])
+    assert mm.path() == env["home"] / "machines.json"
+    assert stat.S_IMODE(mm.path().stat().st_mode) == 0o600
+    got = mm.load()
+    assert got["box-a"]["tags"] == ["device", "n300"] and got["box-a"]["note"] == "the rack board"
+    assert got["box-b"]["tags"] == ["device"]
+    mm.add("box-a", tags="device")   # a note left out keeps the old one
+    assert mm.load()["box-a"] == {**got["box-a"], "tags": ["device"]}
+    for bad in ("", "-x", "a b", "box/a"):
+        with pytest.raises(ValueError):
+            mm.add(bad, tags="device")
+    with pytest.raises(ValueError):
+        mm.add("box-c", tags="dev;ice")
+    capsys.readouterr()
+    main(["machines", "list"])
+    assert capsys.readouterr().out.splitlines() == ["box-a [device]: the rack board", "box-b [device]"]
+    main(["machines", "remove", "box-b"])
+    assert set(mm.load()) == {"box-a"}
+    with pytest.raises(SystemExit):
+        main(["machines", "remove", "box-b"])
+
+
+def _bad_runs(p, tid, n, status="failed", ago=60):
+    for _ in range(n):
+        p.db.x("INSERT INTO runs(task, role, status, started, ended) VALUES(?,?,?,?,?)",
+               (tid, "worker", status, time.time() - ago - 10, time.time() - ago))
+
+
+def test_the_digest_lists_machines_and_resources_that_keep_failing(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import machines as mm
+    dig = coord.digest(p, {}, [], [])
+    assert "## Machines" not in dig and "## Resource trouble" not in dig
+    mm.add("box-a", tags="device", note="main board")
+    mm.add("box-b", tags="device")
+    mm.add("box-c", tags="cpu")
+    tid = p.db.add_task("soak test", "s", kind="work", tier="light", origin="user", labels=["resource:box-a"])
+    other = p.db.add_task("build", "s", kind="work", tier="light", origin="user", labels=["resource:box-c"])
+    _bad_runs(p, tid, 1)
+    _bad_runs(p, other, 1, status="lost", ago=2 * 86400)   # older than a day: not counted
+    dig = coord.digest(p, {}, [], [])
+    assert "## Machines" in dig and "- box-a [device]: main board" in dig and "- box-c [cpu]" in dig
+    assert "## Resource trouble" not in dig, "one failure is not trouble yet"
+    _bad_runs(p, tid, 1, status="stalled")
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+           (time.time(), f"task:{tid}", "task_failed", "normal", "board hung", "handled", tid))
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,data,status) VALUES(?,?,?,?,?,?,?)",
+           (time.time(), "host", "boot", "normal", "reboot", json.dumps({"held": ["box-a: task #1 (run 2) since 10:02"]}),
+            "handled"))
+    dig = coord.digest(p, {}, [], [])
+    trouble = dig.split("## Resource trouble")[1].split("\n## ")[0]
+    assert ("box-a: 2 runs crashed, stalled or lost, 1 hand-offs failed or blocked, 1 host reboots while held; "
+            f"open tasks on it: #{tid}; machines sharing its tags: box-b") in trouble, trouble
+    assert "box-c" not in trouble
+    coord.pause_resource(p, "box-b", True, reason="firmware", by="user")
+    assert "no other machine shares its tags" in coord.digest(p, {}, [], []), "a paused machine was offered"
+
+
+def test_a_failing_resource_starts_one_coordinator_turn_per_episode(env):
+    p = make(env)
+    from ttp import machines as mm
+    from ttp.daemon import Daemon
+    mm.add("box-a", tags="device")
+    mm.add("box-b", tags="device")
+    tid = p.db.add_task("soak test", "s", kind="work", tier="light", origin="user", labels=["exclusive:box-a"])
+    d = Daemon(p.base)
+    events = lambda: p.db.q("SELECT * FROM events WHERE kind='resource_trouble'")
+    d.check_resource_trouble(every_s=0)
+    assert not events()
+    _bad_runs(p, tid, 2, status="lost")
+    d.check_resource_trouble(every_s=0)
+    d.check_resource_trouble(every_s=0)
+    evs = events()
+    assert len(evs) == 1 and evs[0]["status"] == "queued" and "box-a" in evs[0]["text"]
+    assert "machines sharing its tags: box-b" in evs[0]["text"] and "task_update `resources`" in evs[0]["text"]
+    assert set(p.db.kv("resource_trouble")) == {"box-a"}
+    p.db.x("UPDATE runs SET ended=?", (time.time() - 2 * 86400,))
+    d.check_resource_trouble(every_s=0)
+    assert p.db.kv("resource_trouble") == {}, "the episode did not end once the failures aged out"
+    _bad_runs(p, tid, 2)
+    d.check_resource_trouble(every_s=0)
+    assert len(events()) == 2, "a new episode was not told"
+
+
+def test_task_update_moves_a_task_to_another_resource(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    tid = p.db.add_task("soak test", "s", kind="work", tier="light", origin="user",
+                        labels=["exclusive:box-a", "continues:3"])
+    p.db.update_task(tid, status="queued", not_before=time.time() + 7200, blocked_reason="waiting for box-a",
+                     result=json.dumps({"status": "waiting", "waiting_for": "box-a", "waiting_since": time.time()}))
+    problems = coord.apply(p, [{"type": "task_update", "id": tid, "status": "queued", "resources": ["box-b"],
+                                "exclusive": True, "spec": "Run on box-b now: box-a keeps crashing."}])
+    assert problems == []
+    t = p.db.task(tid)
+    assert json.loads(t["labels"]) == ["continues:3", "exclusive:box-b"]
+    assert t["not_before"] is None and not t["blocked_reason"] and "waiting_since" not in json.loads(t["result"])
+    assert "Run on box-b now" in t["spec"] and tid in {x["id"] for x in p.db.ready_tasks()}
+    p.db.update_task(tid, status="running")
+    problems = coord.apply(p, [{"type": "task_update", "id": tid, "resources": ["box-c"]}])
+    assert problems and "is running" in problems[0]
+    assert json.loads(p.db.task(tid)["labels"]) == ["continues:3", "exclusive:box-b"]
+
+
+def test_the_coordinator_routes_around_failing_resources_and_creation_offers_machines():
+    text = (RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text()
+    assert "`## Resource trouble`" in text and "route around" in text
+    assert "`task_update` `resources`" in text and "`memory_add` the decision" in text
+    assert "(`blocking` `access`) naming the machines" in text and "charter allows no alternative" in text
+    assert "the charter's Resources" in text
+    charter = (RUNTIME.parent / "template" / "CHARTER.md").read_text()
+    assert "Machines this project may use" in charter
+    create = (RUNTIME.parent / "skills" / "tt-project" / "create.md").read_text()
+    assert "ttp machines add <alias> --tags" in create and "Machines this project may use:" in create

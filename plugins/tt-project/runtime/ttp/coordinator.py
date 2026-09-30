@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import push
+from . import machines, push
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, TERMINAL_TASK_STATES, continues_id, dependency_ids, dump_result, host_line,
                  load_result)
@@ -171,6 +171,7 @@ def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int]) ->
         for name, v in sorted(paused.items()):
             lines.append(f"- {name}: paused {(now - float(v.get('since') or now)) / 3600:.1f}h ago by "
                          f"{v.get('by') or 'user'}" + (f": {clip(v['reason'], NOTE_CHARS)}" if v.get("reason") else ""))
+    lines += machines.digest_lines(db, paused, now)
     lines.append("## Open tasks (id | status | tier | priority | age | title | last note)")
     rows = db.q("SELECT * FROM tasks WHERE status NOT IN ('done','failed','cancelled') ORDER BY priority, id LIMIT 60")
     for t in rows:
@@ -329,6 +330,22 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     if "status" not in upd and task["status"] == "blocked" and \
                             db.dead_dependency(dependency_ids(task)):
                         upd.update(status="queued", blocked_reason=None)
+                if a.get("resources") is not None:
+                    # Moves the task to other resources (a healthy machine instead of a failing one).
+                    if task["status"] == "running":
+                        raise ValueError(f"task #{task['id']} is running: its resources change only while it is "
+                                         f"not; cancel it and re-add it with `continues` to move it now")
+                    kind_label = "exclusive" if a.get("exclusive") else "resource"
+                    keep = [lb for lb in json.loads(task["labels"] or "[]")
+                            if not (isinstance(lb, str) and lb.split(":", 1)[0] in ("resource", "exclusive"))]
+                    upd["labels"] = keep + [f"{kind_label}:{r}" for r in a["resources"]
+                                            if isinstance(r, str) and RESOURCE_RE.fullmatch(r)]
+                    if upd.get("status", task["status"]) == "queued" and task["not_before"]:
+                        # What it waited on was the old resource: it may start on the new one now.
+                        upd.update(not_before=None, blocked_reason=None)
+                        prev = load_result(upd.get("result") or task["result"])
+                        prev.pop("waiting_since", None)
+                        upd["result"] = dump_result(prev)
                 # The daemon blocks a queued task on a dead dependency at once, so accepting this
                 # would report a requeue that does not stick.
                 if upd.get("status", task["status"]) == "queued" and ("status" in upd or "depends_on" in upd):

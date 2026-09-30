@@ -29,6 +29,7 @@ from pathlib import Path
 from . import budget as bud
 from . import coordinator as coord
 from . import locks
+from . import machines
 from . import runner
 from . import schedule as sched
 from . import screen as scr
@@ -73,6 +74,7 @@ class Daemon:
         self.jev = Jev(self.cfg, db=self.p.db)
         self._slack = None
         self._last_cfg = 0.0
+        self._trouble_checked = 0.0
         self._last_slack = 0.0
         self._thread_scan = 0.0
         self._slack_rejects: dict[int, int] = {}   # outbound message id -> times Slack refused it
@@ -214,6 +216,7 @@ class Daemon:
         coord.expire_asks(self.p, hold=any(g.level == "red" for g in self.gates.values()))
         self.run_schedules()
         self.poll_slack()
+        self.check_resource_trouble()
         self.maybe_coordinate()
         self.probe_waiting()
         self.dispatch()
@@ -1319,6 +1322,35 @@ class Daemon:
         else:
             db.set_kv("disk_low", None)
             log(self.p, f"disk space ok again: {free / 1e9:.1f} GB free under {path}")
+
+    def check_resource_trouble(self, every_s: float = 60) -> None:
+        """A resource whose tasks keep failing (machines.trouble) starts a coordinator turn once per
+        episode, so it moves the work to a healthy alternative instead of retrying on it. The episode
+        ends when the resource drops out of trouble; it is kept in the database across restarts."""
+        now = time.time()
+        if now - self._trouble_checked < every_s:
+            return
+        self._trouble_checked = now
+        db = self.p.db
+        try:
+            bad = machines.trouble(db, now)
+            known = machines.load()
+        except Exception:
+            log(self.p, "resource trouble check: " + traceback.format_exc().replace("\n", " | ")[:1000])
+            return
+        told = db.kv("resource_trouble") or {}
+        new = [n for n in sorted(bad) if n not in told]
+        with db.tx():
+            for name in new:
+                text = machines.trouble_line(name, bad[name], known, set(bad) | set(db.paused_resources()))
+                db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                     (now, "daemon", "resource_trouble", "normal",
+                      f"Resource {text}. Route around it: move its tasks to a healthy machine the charter "
+                      f"allows (task_update `resources`), record the decision and notify the user; ask "
+                      f"(blocking access) only if the charter allows no alternative.", "queued"))
+            live = {n: told.get(n, now) for n in bad}
+            if live != told:
+                db.set_kv("resource_trouble", live)
 
     def _disk_holds(self, task: dict) -> bool:
         """Under the disk guard, tasks that may check out, build or test code (all but questions and

@@ -787,6 +787,31 @@ def cmd_memory(a) -> None:
     print(p.add_memory(a.text, kind=a.kind))
 
 
+def cmd_machines(a) -> None:
+    """The user's machines (~/.tt-project/machines.json), shared by all their projects. Each
+    project's charter says which of them it may use; its coordinator routes work only to those."""
+    from . import machines as mm
+    if a.action == "add":
+        try:
+            entry = mm.add(a.alias, a.tags, a.note)
+        except ValueError as e:
+            die(str(e))
+        print(f"saved {mm.line(a.alias.strip(), entry)}")
+    elif a.action == "remove":
+        if not mm.remove(a.alias):
+            die(f"no machine {a.alias!r} in {mm.path()}")
+        print(f"removed {a.alias}")
+    else:
+        known = mm.load()
+        if a.json:
+            print(json.dumps(known, indent=2, sort_keys=True))
+            return
+        if not known:
+            print("no machines yet: ttp machines add <alias> --tags device,... [--note TEXT]")
+        for alias in sorted(known):
+            print(mm.line(alias, known[alias]))
+
+
 def cmd_pause(a) -> None:
     p = need(a.name, sys.argv[1:])
     if a.resource:
@@ -1184,6 +1209,18 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("text")
     s.add_argument("--kind", default="fact")
     s.set_defaults(fn=cmd_memory)
+
+    s = sub.add_parser("machines", help="your machines, shared by all your projects (add/list/remove)")
+    ms = s.add_subparsers(dest="action", required=True)
+    m = ms.add_parser("add", help="add a machine, or change its tags or note")
+    m.add_argument("alias", help="a short name, also used as the resource name in tasks (e.g. box-a)")
+    m.add_argument("--tags", help="what it offers, comma-separated (e.g. device,x86)")
+    m.add_argument("--note", help="one line for the coordinator (no secrets)")
+    m = ms.add_parser("list", help="list your machines")
+    m.add_argument("--json", action="store_true")
+    m = ms.add_parser("remove", help="remove a machine")
+    m.add_argument("alias")
+    s.set_defaults(fn=cmd_machines)
 
     for name in ("pause", "resume"):
         s = sub.add_parser(name, help=f"{name} the project, or with --resource one shared resource")
