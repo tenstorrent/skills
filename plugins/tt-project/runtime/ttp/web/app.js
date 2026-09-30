@@ -30,10 +30,15 @@ function gateHtml(gates) {
       <span class="meta">${esc((g.reasons || []).join("; "))}</span></div>`; }).join("");
 }
 
+// A queued task with a future retry time is waiting on a busy resource, not idle in the queue.
+const waiting = (t) => t.status === "queued" && t.not_before && t.not_before > Date.now() / 1000;
+
 function taskRow(t) {
-  return `<details class="row"><summary><span class="id">#${t.id}</span> <span class="st st-${t.status}">${t.status}</span>
+  const label = waiting(t) ? "waiting" : t.status;
+  const noteLabel = t.status === "blocked" ? "Blocked" : waiting(t) ? "Waiting" : "Note";
+  return `<details class="row"><summary><span class="id">#${t.id}</span> <span class="st st-${t.status}">${label}</span>
     <span class="title">${esc(t.title)}</span> <span class="meta">${esc(t.tier)} · ${money(t.spent_usd)}${t.budget_usd ? " / " + money(t.budget_usd) : ""} · ${ago(t.updated)} ago${t.pr_url ? ` · <a href="${esc(t.pr_url)}" target="_blank" rel="noopener">PR</a>` : ""}</span></summary>
-    ${t.blocked_reason ? `<p><b>Blocked:</b> ${esc(t.blocked_reason)}</p>` : ""}${t.result ? `<p>${esc(t.result)}</p>` : ""}
+    ${t.blocked_reason ? `<p><b>${noteLabel}:</b> ${esc(t.blocked_reason)}</p>` : ""}${t.result ? `<p>${esc(t.result)}</p>` : ""}
     <p class="meta">origin ${esc(t.origin)} · kind ${esc(t.kind)} · attempts ${t.attempts}${t.branch ? " · branch " + esc(t.branch) : ""}</p>
     ${["queued", "running", "blocked"].includes(t.status) ? `<button class="ghost" onclick="taskAct(${t.id},'cancelled')">Cancel</button>` : ""}
     ${["blocked", "failed"].includes(t.status) ? `<button class="ghost" onclick="taskAct(${t.id},'queued')">Retry</button>` : ""}</details>`;
@@ -77,7 +82,7 @@ function board(st) {
     ["you", "Waiting on you", st.tasks.filter((t) => t.status === "blocked").map((t) => `#${t.id} ${t.title}`).concat(asks.map((m) => m.text))],
     ["review", "Ready for review", st.tasks.filter((t) => t.status === "review" || (t.pr_url && t.status === "done")).map((t) => `#${t.id} ${t.title}`)],
     ["work", "Working", st.tasks.filter((t) => t.status === "running").map((t) => `#${t.id} ${t.title}`)],
-    ["queued", "Queued", st.tasks.filter((t) => t.status === "queued").map((t) => `#${t.id} ${t.title}`)],
+    ["queued", "Queued", st.tasks.filter((t) => t.status === "queued").map((t) => `#${t.id} ${t.title}${waiting(t) ? " (waiting)" : ""}`)],
   ];
   $("#board").innerHTML = cols.map(([cls, name, items]) => `<div class="col ${cls}"><h3>${name}<span class="n">${items.length}</span></h3>` +
     (items.slice(0, 6).map((x) => `<div class="item">${esc(x).slice(0, 160)}</div>`).join("") || `<div class="item muted">—</div>`) + `</div>`).join("");

@@ -46,7 +46,7 @@ def free_port(start: int = 18700) -> int:
 def state_payload(p: Project, db: DB) -> dict:
     now = time.time()
     tasks = db.q("SELECT id,title,kind,status,priority,tier,provider,budget_usd,spent_usd,attempts,origin,branch,"
-                 "pr_url,blocked_reason,created,updated,result FROM tasks WHERE status NOT IN ('done','failed',"
+                 "pr_url,blocked_reason,not_before,created,updated,result FROM tasks WHERE status NOT IN ('done','failed',"
                  "'cancelled') OR updated>? ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'blocked' THEN 1 "
                  "WHEN 'review' THEN 2 WHEN 'queued' THEN 3 ELSE 4 END, priority, id DESC LIMIT 200",
                  (now - 7 * 86400,))
