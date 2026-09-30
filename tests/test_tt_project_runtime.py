@@ -1012,6 +1012,10 @@ def test_workers_read_one_prompt_when_the_cli_cannot_append_a_system_prompt(env,
     assert not [a for a in argv if a.startswith("--append-system-prompt")]
     assert prompt.startswith("# BINDING RESTRICTIONS") and prompt.rstrip().endswith("Never merge to main.")
     assert "Go fast." in prompt and "TASK-SPEC-MARKER" in prompt
+    # A CLI with only the inline flag gets the stable part as its argument.
+    argv, _, prompt = _dispatch_claude_worker(p, monkeypatch, {claude.APPEND_SYSTEM_FILE: False})
+    assert argv[argv.index("--append-system-prompt") + 1].startswith("# BINDING RESTRICTIONS")
+    assert "Go fast." not in prompt and prompt.rstrip().endswith("Never merge to main.")
 
 
 def test_worker_isolation_is_opt_in_and_keeps_the_hook_and_approved_plugins(env, monkeypatch, tmp_path):
@@ -1026,7 +1030,7 @@ def test_worker_isolation_is_opt_in_and_keeps_the_hook_and_approved_plugins(env,
                             "value": "true"}]) == []
     argv, _, _ = _dispatch_claude_worker(p, monkeypatch, {})
     assert "--strict-mcp-config" in argv
-    assert argv[argv.index("--setting-sources") + 1] == "project,local", "the user's own settings still load"
+    assert argv[argv.index("--setting-sources") + 1] == "project,local", "user settings must be left out"
     assert "ttp.hook" in argv[argv.index("--settings") + 1], "the harness hook no longer loads"
     assert argv[argv.index("--plugin-dir") + 1] == str(plug), "approved plugins no longer load"
 
