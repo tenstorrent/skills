@@ -77,7 +77,8 @@ and preferences you add later become part of the project's charter and memory.
   the coordinator is asked for more work, less often each time it finds none.
 - A shared device or machine is taken per command, through its own queue (for example a device
   broker) or `ttp lock <resource> -- <command>`, so the rest of each task runs in parallel. A task
-  marked exclusive holds the resource's lock for its whole run.
+  marked exclusive holds the resource's lock for its whole run; while it waits for a slot, new
+  `ttp lock` commands wait behind it, so it is not starved.
 - Each task edits only its own worktree.
 - A plan task starts from what is already known: prior work, the organization's docs and chats
   through the connectors you have, available skills, and public work. Skill plugins it recommends
