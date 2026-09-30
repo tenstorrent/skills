@@ -13,7 +13,7 @@ import tempfile
 from pathlib import Path
 
 from . import register
-from .base import LIMIT_RE, Provider, RunUsage
+from .base import AUTH_RE, LIMIT_RE, Provider, RunUsage
 
 # $ per million tokens: (input, cached input, output). Estimates only; the project may override
 # them in project.json under pricing.codex.<model>. Unknown models use the "default" row.
@@ -96,7 +96,9 @@ class Codex(Provider):
                 pass
         blob = u.error + " " + (Path(stderr_path).read_text(errors="replace")[-2000:]
                                 if stderr_path and Path(stderr_path).exists() else "")
-        if LIMIT_RE.search(blob):
+        if AUTH_RE.search(blob) and not u.output_tokens:
+            u.auth_failed = True
+        elif LIMIT_RE.search(blob):
             u.limited, u.limit_note = True, LIMIT_RE.search(blob).group(0)
         return u
 

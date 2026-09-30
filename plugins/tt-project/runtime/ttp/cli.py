@@ -189,12 +189,16 @@ def cmd_new(a) -> None:
         die("project names use letters, digits, '.', '_' and '-' (max 63)")
     brief = a.describe or ""
     if a.describe_file:
-        brief = Path(a.describe_file).expanduser().read_text()
+        brief = sys.stdin.read() if a.describe_file == "-" else Path(a.describe_file).expanduser().read_text()
     if a.host and a.host not in (hostname(), "localhost"):
         return new_remote(a, brief)
     root = Path(a.dir).expanduser().resolve() if a.dir else _default_root()
     p = bootstrap(root, a.name, brief, a.provider or detect_provider())
     register(a.name, {"host": hostname(), "dir": str(p.root)})
+    ident = subprocess.run(["git", "-C", str(p.root), "config", "user.email"], capture_output=True, text=True)
+    if ident.returncode != 0 or not ident.stdout.strip():
+        print("warning: git has no user.email here, so workers cannot commit. Set one "
+              "(git config --global user.name/user.email) or tell the coordinator which identity to use.")
     how = "service not installed (--no-service)"
     if not a.no_service:
         from .service import install
@@ -227,17 +231,28 @@ def push_secrets(host: str) -> str:
     return f"copied keys ({r.stdout.strip()}) to {host}" if r.returncode == 0 else f"could not copy keys: {r.stderr[-200:]}"
 
 
+def ship_runtime(host: str) -> str:
+    """Copy this runtime and template to ~/.tt-project/lib/<version> on another machine and make it
+    that machine's installed `ttp`. Returns the remote launcher path."""
+    stage = f".tt-project/lib/{__version__}"
+    subprocess.check_call(["ssh", "-o", "BatchMode=yes", host, f"rm -rf ~/{stage} && mkdir -p ~/{stage}"])
+    mac = ["--no-xattrs", "--no-mac-metadata"] if sys.platform == "darwin" else []
+    tar = subprocess.Popen(["tar", *mac, "--exclude", "__pycache__", "-C", str(PLUGIN_ROOT), "-czf", "-",
+                            "runtime", "template", "bin"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                           env={**os.environ, "COPYFILE_DISABLE": "1"})
+    subprocess.check_call(["ssh", "-o", "BatchMode=yes", host, f"tar -C ~/{stage} -xzf -"], stdin=tar.stdout)
+    tar.wait()
+    subprocess.check_call(["ssh", "-o", "BatchMode=yes", host, f"~/{stage}/bin/ttp setup >/dev/null"])
+    return f"~/{stage}/bin/ttp"
+
+
 def new_remote(a, brief: str) -> None:
     """Ship this runtime to the other machine and create the project there."""
     if not a.dir:
         die("--dir is required with --host (the project root on that machine)")
     host = a.host
     stage = f".tt-project/lib/{__version__}"
-    subprocess.check_call(["ssh", "-o", "BatchMode=yes", host, f"mkdir -p ~/{stage}"])
-    tar = subprocess.Popen(["tar", "-C", str(PLUGIN_ROOT), "-czf", "-", "runtime", "template", "bin"],
-                           stdout=subprocess.PIPE)
-    subprocess.check_call(["ssh", "-o", "BatchMode=yes", host, f"tar -C ~/{stage} -xzf -"], stdin=tar.stdout)
-    tar.wait()
+    ship_runtime(host)
     if load_secrets() and not a.no_secrets:
         print(push_secrets(host))
     args = [f"~/{stage}/bin/ttp", "new", a.name, "--dir", a.dir, "--provider", a.provider or detect_provider()]
@@ -510,6 +525,10 @@ def cmd_setup(a) -> None:
 def cmd_upgrade(a) -> None:
     """Merge the installed template into a project's harness. The harness repo keeps pristine
     template snapshots on its `upstream` branch, so this is an ordinary three-way merge."""
+    entry = remote_entry(a.name)
+    if entry and not local_project(a.name):
+        ship_runtime(entry.get("ssh") or entry["host"])      # the newer runtime becomes that machine's ttp
+        sys.exit(forward(entry, sys.argv[1:]))
     p = need(a.name, sys.argv[1:])
     from .project import HOME_DIR
     src = HOME_DIR / "lib" / "current"

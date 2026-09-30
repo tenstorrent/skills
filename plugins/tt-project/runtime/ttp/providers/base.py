@@ -14,6 +14,9 @@ from pathlib import Path
 EXTRA_BIN_DIRS = ["~/.local/bin", "~/.npm-global/bin", "~/bin", "/opt/homebrew/bin", "/usr/local/bin",
                   "~/.bun/bin", "~/.cargo/bin"]
 
+AUTH_RE = re.compile(r"(authentication_failed|failed to authenticate|oauth (session|token) (expired|invalid)|"
+                     r"not logged in|please (run )?/?login|invalid api key|unauthorized|401)", re.I)
+
 LIMIT_RE = re.compile(r"(usage limit|limit reached|rate limit|quota exceeded|out of credits|"
                       r"insufficient (credits|balance|funds)|spend(ing)? limit)", re.I)
 
@@ -45,6 +48,7 @@ class RunUsage:
     cache_write_tokens: int = 0
     final_text: str = ""             # the agent's last message
     structured: dict | None = None   # schema-validated output, when requested and supported
+    auth_failed: bool = False        # the provider is logged out or its credentials are invalid
     limited: bool = False            # the provider refused for quota/limit reasons
     limit_note: str = ""
     error: str = ""

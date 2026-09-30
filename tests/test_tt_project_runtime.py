@@ -231,3 +231,16 @@ def test_slack_routing(env):
     assert route({"text": "hi", "ts": "2", "thread_ts": "9"}, "demo", {"9"}, ["demo", "other"]) == "hi"
     assert route({"text": "hi", "ts": "3"}, "demo", set(), ["demo"]) == "hi"
     assert projects_in_dm([{"bot_id": "B", "text": "[demo] x"}, {"text": "[fake] y"}]) == ["demo"]
+
+
+def test_logged_out_provider_is_detected_not_retried_as_failure(env, tmp_path):
+    from ttp.providers import get_provider
+    out = tmp_path / "o.jsonl"
+    out.write_text("\n".join(json.dumps(x) for x in [
+        {"type": "assistant", "error": "authentication_failed", "message": {"content": [
+            {"type": "text", "text": "Failed to authenticate: OAuth session expired and could not be refreshed"}]}},
+        {"type": "result", "subtype": "success", "is_error": True, "total_cost_usd": 0,
+         "result": "Failed to authenticate: OAuth session expired", "usage": {}},
+    ]) + "\n")
+    u = get_provider("claude").parse(out)
+    assert u.auth_failed and not u.limited

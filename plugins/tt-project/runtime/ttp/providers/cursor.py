@@ -9,7 +9,7 @@ import json
 from pathlib import Path
 
 from . import register
-from .base import LIMIT_RE, Provider, RunUsage
+from .base import AUTH_RE, LIMIT_RE, Provider, RunUsage
 
 PRICES = {"default": (3.0, 0.3, 15.0)}
 
@@ -52,7 +52,9 @@ class Cursor(Provider):
         u.cost_usd = (u.input_tokens * pin + u.cache_read_tokens * pcached + u.output_tokens * pout) / 1e6
         blob = u.error + " " + (Path(stderr_path).read_text(errors="replace")[-2000:]
                                 if stderr_path and Path(stderr_path).exists() else "")
-        if LIMIT_RE.search(blob):
+        if AUTH_RE.search(blob) and not u.output_tokens:
+            u.auth_failed = True
+        elif LIMIT_RE.search(blob):
             u.limited, u.limit_note = True, LIMIT_RE.search(blob).group(0)
         if u.final_text.strip().startswith("{"):
             try:

@@ -11,7 +11,7 @@ from pathlib import Path
 
 from . import register
 from ..budget import Window
-from .base import LIMIT_RE, Provider, RunUsage
+from .base import AUTH_RE, LIMIT_RE, Provider, RunUsage
 
 
 @register
@@ -96,10 +96,15 @@ class Claude(Provider):
             u.input_tokens, u.output_tokens = est_in, est_out
             u.cache_read_tokens, u.cache_write_tokens = est_cr, est_cw
             u.estimated = True
+        for ev in self._events(output_path):
+            if ev.get("type") == "assistant" and ev.get("error") == "authentication_failed":
+                u.auth_failed = True
         blob = u.final_text + " " + u.error
         if stderr_path and Path(stderr_path).exists():
             blob += " " + Path(stderr_path).read_text(errors="replace")[-2000:]
-        if LIMIT_RE.search(blob) and (u.error or not u.cost_usd):
+        if not u.cost_usd and AUTH_RE.search(blob):
+            u.auth_failed = True
+        if LIMIT_RE.search(blob) and (u.error or not u.cost_usd) and not u.auth_failed:
             u.limited, u.limit_note = True, LIMIT_RE.search(blob).group(0)
         return u
 

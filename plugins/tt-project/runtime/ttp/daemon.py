@@ -172,6 +172,8 @@ class Daemon:
             status = stopped if stopped != "stopped" else "killed"
         if usage.limited:
             status = "limit"
+        if usage.auth_failed:
+            status = "auth"
         source = self._source_for(r)
         db.x("UPDATE runs SET ended=?, status=?, exit_code=?, cost_usd=?, cost_estimated=?, input_tokens=?, "
              "output_tokens=?, cache_read_tokens=?, cache_write_tokens=? WHERE id=?",
@@ -194,6 +196,14 @@ class Daemon:
             self.alert(f"limit:{r['provider']}",
                        f"{r['provider']} refused work: {usage.limit_note}. Heavy work on it is paused for an hour; "
                        f"the account ({r['account'] or 'unknown'}) may need more credits or a higher cap.", "high")
+        if usage.auth_failed:
+            # Logged out is not a task failure and not worth retrying blindly: pause this provider,
+            # say exactly how to fix it, and probe again every 15 minutes (a cheap decision turn).
+            db.set_kv(f"limited:{r['provider']}", {"until": time.time() + 900, "note": "logged out"})
+            self.alert(f"auth:{r['provider']}",
+                       f"{r['provider']} on {hostname()} is logged out ({(usage.final_text or usage.error)[:120]}). "
+                       f"Log in once on that machine (for Claude Code: run `claude` there and use /login). "
+                       f"Work resumes by itself; queued messages are kept.", "high", every_s=4 * 3600)
         log(p, f"run {r['id']} end status={status} cost=${usage.cost_usd:.3f} role={r['role']}")
         note = json.loads(r["note"] or "{}")
         if r["role"] == "coordinator":
@@ -214,6 +224,9 @@ class Daemon:
         db = self.p.db
         out = usage.structured if isinstance(usage.structured, dict) else last_json_object(usage.final_text or "")
         actions = (out or {}).get("actions")
+        if status == "auth":
+            db.set_kv("coordinator_backoff_until", time.time() + 900)
+            return
         if status != "ok" or not isinstance(actions, list):
             fails = int(db.kv("coordinator_failures", 0)) + 1
             db.set_kv("coordinator_failures", fails)
@@ -247,11 +260,11 @@ class Daemon:
         if status == "ok" and rstatus in ("done", "blocked", "failed", "needs_review", None):
             new = {"done": "done", "blocked": "blocked", "failed": "failed", "needs_review": "review",
                    None: "done"}[rstatus]
-        elif status == "limit":
+        elif status in ("limit", "auth"):
             new = "queued"   # not an attempt: the account refused, the task did not fail
         else:
             new = "failed"
-        attempts = int(task["attempts"] or 0) + (0 if status == "limit" else 1)
+        attempts = int(task["attempts"] or 0) + (0 if status in ("limit", "auth") else 1)
         if new == "failed" and attempts < int(task["max_attempts"] or 3) and status in ("failed", "lost", "timeout",
                                                                                      "stalled"):
             new = "queued"
@@ -260,7 +273,7 @@ class Daemon:
                                                                  if isinstance(result, dict) else {})})[:20000]}
         if new == "blocked":
             upd["blocked_reason"] = (result.get("question") or result.get("blocked_reason") or summary)[:500]
-        if new == "queued" and status != "limit":
+        if new == "queued" and status not in ("limit", "auth"):
             upd["not_before"] = time.time() + 120 * attempts
         if isinstance(result, dict) and result.get("pr"):
             upd["pr_url"] = str(result["pr"])[:300]
@@ -403,6 +416,9 @@ class Daemon:
         gate = self.gates.get(self.cfg.get("core_provider", "claude"))
         if gate and gate.level == "red" and not msgs:
             return
+        lim = db.kv(f"limited:{self.cfg.get('core_provider', 'claude')}")
+        if lim and lim.get("until", 0) > now:
+            return   # provider paused (logged out or at its limit); the pause expiry is the retry
         gates = {k: v.as_dict() for k, v in self.gates.items()}
         prompt = coord.digest(self.p, gates, [e["id"] for e in evs], [m["id"] for m in msgs])
         default_chat = msgs[-1]["chat"] if msgs else None
