@@ -227,6 +227,8 @@ class Daemon:
             spec = {"argv": argv, "env": env, "cwd": cwd, "timeout_s": tout, "provider": provider, "stall_s": stall,
                     "model": model, "prices": prices,
                     "budget_usd": budget_usd if provider not in ("claude",) else None,
+                    # What a run without its own budget is priced at when it reports no usage.
+                    "default_budget_usd": self.cfg["budget"].get("task_default_usd", {}).get(tier, 8.0),
                     "exclusive": [{"resource": res, "paths": [str(x) for x in self._slot_paths(res)],
                                    "reserve": str(locks.reserve_path(self.p.state / "locks", res))}
                                   for res in _exclusive(task)] if task else [],
@@ -1300,7 +1302,8 @@ def _cut_off_cost(run_dir: Path, exit_info: dict) -> float:
         spec = json.loads((run_dir / "run.json").read_text())
     except (OSError, ValueError):
         return 0.0
-    budget, timeout = float(spec.get("budget_usd") or 0), float(spec.get("timeout_s") or 0)
+    budget = float(spec.get("budget_usd") or spec.get("default_budget_usd") or 0)
+    timeout = float(spec.get("timeout_s") or 0)
     elapsed = float(exit_info.get("ended") or time.time()) - float(exit_info.get("started") or 0)
     if budget <= 0 or timeout <= 0 or not exit_info.get("started"):
         return 0.0

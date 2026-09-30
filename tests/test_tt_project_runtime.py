@@ -2740,7 +2740,7 @@ sys.exit(int(os.environ.get("FAKE_CLI_RC", "0")))
 
 
 def _cli_run(env, monkeypatch, provider, stdout, *, stderr="", rc=0, result=None, role="worker",
-             read_only=False, schema=None, note=None, before=None):
+             read_only=False, schema=None, note=None, before=None, budget_usd=2.0):
     """Launch one run of `provider` through the daemon and its detached runner against a fake CLI,
     reap it, and return the project, run row, task row, argv and the stdin the CLI received."""
     bin_dir = env["tmp"] / "fakebin"
@@ -2766,7 +2766,7 @@ def _cli_run(env, monkeypatch, provider, stdout, *, stderr="", rc=0, result=None
         tid = p.db.add_task("t", "s", kind="work", tier="light", origin="user")
         p.db.update_task(tid, status="running")
     rid = d.start_run(role, "PROMPT-MARKER", provider, "light", str(env["repo"]),
-                      task=p.db.task(tid) if tid else None, budget_usd=2.0, timeout_s=100,
+                      task=p.db.task(tid) if tid else None, budget_usd=budget_usd, timeout_s=100,
                       read_only=read_only, schema=schema, note=note)
     exit_file = p.runs / str(rid) / "exit.json"
     deadline = time.time() + 60
@@ -2875,6 +2875,14 @@ def test_cursor_worker_launches_on_stdin_and_books_spend_without_usage(env, monk
     # Cursor's result carries no usage: the run still spent money, and the caps must count it.
     assert run["cost_usd"] > 0 and run["cost_estimated"] == 1, "a Cursor run booked $0"
     assert p.db.one("SELECT SUM(usd) AS s FROM ledger WHERE provider='cursor'")["s"] == pytest.approx(run["cost_usd"])
+
+
+def test_cursor_run_of_a_task_without_a_budget_books_spend(env, monkeypatch):
+    p, run, _, _, _ = _cli_run(env, monkeypatch, "cursor", _cursor_result("all done"), budget_usd=None,
+                               result={"status": "done", "summary": "ok"})
+    spec = json.loads((p.runs / str(run["id"]) / "run.json").read_text())
+    assert spec["budget_usd"] is None and spec["default_budget_usd"] == 2.0, "light tier's default budget"
+    assert run["cost_usd"] > 0 and run["cost_estimated"] == 1, "a Cursor run without a budget booked $0"
 
 
 def test_cursor_reported_error_fails_the_run(env, monkeypatch):
