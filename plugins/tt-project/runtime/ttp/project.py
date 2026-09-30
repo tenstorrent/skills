@@ -50,7 +50,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "notify": {"slack": False, "slack_min_severity": "high", "chat_min_severity": "normal"},
     "delivery": {"draft_prs": True, "review_before_pr": True, "auto_merge_repos": [],
                  "push_allowed": True},
-    "jev": {"enabled": False},
+    "jev": {"enabled": "auto"},
     "web": {"bind": "127.0.0.1", "port": 0},
     "power": {"keep_awake": "on_ac"},
     "screen": {"wake_min_severity": "normal"},

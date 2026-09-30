@@ -166,8 +166,6 @@ def bootstrap(root: Path, name: str, brief: str, provider: str) -> Project:
            "core_provider": provider, "tt_project_version": __version__,
            "id": pysecrets.token_hex(4)}
     sec = load_secrets()
-    if (sec.get("jev") or {}).get("key"):
-        cfg["jev"] = {"enabled": True}
     if (sec.get("slack") or {}).get("bot_token"):
         cfg["notify"] = {"slack": True}
     write_json(p.config_path, cfg)
@@ -212,6 +210,23 @@ def _default_root() -> Path:
     return Path(out.stdout.strip() if out.returncode == 0 else os.getcwd())
 
 
+def push_secrets(host: str) -> str:
+    """Copy this user's saved keys to another machine (same user), merging with what is there.
+    Travels over ssh stdin, lands mode 0600, never on a command line or in a project folder."""
+    sec = load_secrets()
+    if not sec:
+        return "no saved keys to copy"
+    merge = ("import json,os,sys;h=os.path.expanduser('~/.tt-project');os.makedirs(h,mode=0o700,exist_ok=True);"
+             "p=os.path.join(h,'secrets.json');old={}\n"
+             "try: old=json.load(open(p))\nexcept Exception: pass\n"
+             "new=json.load(sys.stdin);new.update({k:v for k,v in old.items() if k not in new});"
+             "fd=os.open(p+'.tmp',os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600);os.write(fd,json.dumps(new).encode());"
+             "os.close(fd);os.replace(p+'.tmp',p);print(','.join(sorted(new)))")
+    r = subprocess.run(["ssh", "-o", "BatchMode=yes", host, f"python3 -c {shlex.quote(merge)}"],
+                       input=json.dumps(sec), text=True, capture_output=True)
+    return f"copied keys ({r.stdout.strip()}) to {host}" if r.returncode == 0 else f"could not copy keys: {r.stderr[-200:]}"
+
+
 def new_remote(a, brief: str) -> None:
     """Ship this runtime to the other machine and create the project there."""
     if not a.dir:
@@ -223,6 +238,8 @@ def new_remote(a, brief: str) -> None:
                            stdout=subprocess.PIPE)
     subprocess.check_call(["ssh", "-o", "BatchMode=yes", host, f"tar -C ~/{stage} -xzf -"], stdin=tar.stdout)
     tar.wait()
+    if load_secrets() and not a.no_secrets:
+        print(push_secrets(host))
     args = [f"~/{stage}/bin/ttp", "new", a.name, "--dir", a.dir, "--provider", a.provider or detect_provider()]
     if a.no_service:
         args.append("--no-service")
@@ -451,6 +468,10 @@ def cmd_secret(a) -> None:
             die(f"Slack check failed: {e}")
         save_secret("slack", {"bot_token": tok, "user_id": uid, "user_email": a.email})
         print(f"saved Slack bot for user {uid}")
+    elif a.kind == "push":
+        if not a.host:
+            die("--host is required")
+        print(push_secrets(a.host))
     elif a.kind == "show":
         sec = load_secrets()
         print(json.dumps({k: sorted(v.keys()) if isinstance(v, dict) else "set" for k, v in sec.items()}))
@@ -581,6 +602,7 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--describe-file", help="the brief, from a file ('-' for stdin)")
     s.add_argument("--provider", choices=["claude", "codex", "cursor", "fake"])
     s.add_argument("--no-service", action="store_true", help="do not install a boot-time service")
+    s.add_argument("--no-secrets", action="store_true", help="with --host: do not copy your saved keys there")
     s.set_defaults(fn=cmd_new)
 
     for name, fn, hlp in (("connect", cmd_connect, "attach this chat to a project"),
@@ -657,7 +679,8 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_config)
 
     s = sub.add_parser("secret", help="store per-user credentials (read from stdin)")
-    s.add_argument("kind", choices=["jev", "slack", "show"])
+    s.add_argument("kind", choices=["jev", "slack", "show", "push"])
+    s.add_argument("--host", help="with push: the machine to copy your saved keys to")
     s.add_argument("--via", default="typesafe", choices=["typesafe", "openrouter"])
     s.add_argument("--url")
     s.add_argument("--email")

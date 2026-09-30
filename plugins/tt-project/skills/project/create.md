@@ -37,6 +37,9 @@ Check `ttp secret show`. No Jev entry → tell the user, in plain words:
 
 - OpenRouter users: `ttp secret jev --via openrouter`.
 - The key is saved once per user and shared by all their projects on that machine.
+- Creating a project on another machine copies saved keys there over ssh.
+  Boxes set up earlier: `ttp secret push --host <ssh-alias>`.
+- Jev turns on by itself once a key exists. No key: say so once, carry on.
 
 ## 5. Create
 

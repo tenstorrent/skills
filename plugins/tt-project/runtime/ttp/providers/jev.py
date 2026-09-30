@@ -46,7 +46,9 @@ class Jev:
         self._pause_until = 0.0
 
     def enabled(self) -> bool:
-        return bool(self.cfg.get("enabled") and self.key and self.url and time.time() >= self._pause_until)
+        # "auto" (the default): on whenever the user has saved a key; a project can opt out with false.
+        on = self.cfg.get("enabled", "auto") in (True, "auto")
+        return bool(on and self.key and self.url and time.time() >= self._pause_until)
 
     def decide(self, state: str, questions: dict[str, Any], purpose: str = "decide",
                timeout: float = 20.0) -> dict[str, Any] | None:
