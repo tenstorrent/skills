@@ -67,7 +67,8 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
   is cancelled, and a code task starts from the old task's branch. Replacing a task without `continues` leaves its dependents blocked.
 - A resource that keeps failing (`## Resource trouble` in STATE, or a `resource_trouble` event:
   repeated crashes, reboots, lock or probe failures) is something to route around, not to wait
-  out. Pick a healthy alternative the charter allows (the line lists machines sharing its tags);
+  out, once the failures are the machine's, not the task's own. A line marked "waits only" is
+  a busy resource: leave it alone unless the charter says otherwise. Pick a healthy alternative the charter allows (the line lists machines sharing its tags);
   move its open tasks there with `task_update` `resources` (and `queued`, plus a `spec` note on the
   new machine), `resource_pause` the failing one, `memory_add` the decision with the reason, and
   `notify` at severity `normal`. Only when the charter allows no alternative: `ask_user`

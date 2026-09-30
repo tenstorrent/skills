@@ -1325,21 +1325,25 @@ class Daemon:
 
     def check_resource_trouble(self, every_s: float = 60) -> None:
         """A resource whose tasks keep failing (machines.trouble) starts a coordinator turn once per
-        episode, so it moves the work to a healthy alternative instead of retrying on it. The episode
-        ends when the resource drops out of trouble; it is kept in the database across restarts."""
+        episode, so it moves the open work on it to a healthy alternative instead of retrying on it.
+        Waits alone never start one: a busy resource is not a broken one. The episode ends only once
+        the resource has had no failure for 24 h, so a count hovering at the threshold does not
+        start a new one each time; it is kept in the database across restarts."""
         now = time.time()
         if now - self._trouble_checked < every_s:
             return
         self._trouble_checked = now
         db = self.p.db
         try:
-            bad = machines.trouble(db, now)
+            seen = machines.stats(db, now)
+            bad = machines.trouble(db, now, seen)
             known = machines.load()
         except Exception:
             log(self.p, "resource trouble check: " + traceback.format_exc().replace("\n", " | ")[:1000])
             return
         told = db.kv("resource_trouble") or {}
-        new = [n for n in sorted(bad) if n not in told]
+        new = [n for n in sorted(bad) if n not in told and bad[n]["failures"] >= machines.TROUBLE_AT
+               and bad[n].get("tasks")]
         with db.tx():
             for name in new:
                 text = machines.trouble_line(name, bad[name], known, set(bad) | set(db.paused_resources()))
@@ -1348,7 +1352,7 @@ class Daemon:
                       f"Resource {text}. Route around it: move its tasks to a healthy machine the charter "
                       f"allows (task_update `resources`), record the decision and notify the user; ask "
                       f"(blocking access) only if the charter allows no alternative.", "queued"))
-            live = {n: told.get(n, now) for n in bad}
+            live = {n: told.get(n, now) for n in (*told, *new) if (seen.get(n) or {}).get("failures")}
             if live != told:
                 db.set_kv("resource_trouble", live)
 

@@ -6185,3 +6185,34 @@ def test_the_coordinator_routes_around_failing_resources_and_creation_offers_mac
     assert "Machines this project may use" in charter
     create = (RUNTIME.parent / "skills" / "tt-project" / "create.md").read_text()
     assert "ttp machines add <alias> --tags" in create and "Machines this project may use:" in create
+
+
+def test_waits_and_dependency_blocks_alone_do_not_start_a_trouble_episode_and_episodes_do_not_flap(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import machines as mm
+    from ttp.daemon import Daemon
+    tid = p.db.add_task("soak test", "s", kind="work", tier="light", origin="user", labels=["resource:box-a"])
+    d = Daemon(p.base)
+    events = lambda: p.db.q("SELECT * FROM events WHERE kind='resource_trouble'")
+
+    def ev(kind, source=f"task:{tid}", ago=60):
+        p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+               (time.time() - ago, source, kind, "low", "x", "handled", tid))
+    for _ in range(mm.WAITS_AT + 4):
+        ev("task_waiting")
+    for _ in range(3):
+        ev("task_blocked", source="daemon")   # blocked on a dead dependency: not the resource's doing
+    d.check_resource_trouble(every_s=0)
+    assert not events(), "a busy but healthy resource started a coordinator turn"
+    assert "waits only: it may be busy" in coord.digest(p, {}, [], [])
+    _bad_runs(p, tid, 1, ago=86400 - 120)   # ages out first
+    _bad_runs(p, tid, 1)
+    d.check_resource_trouble(every_s=0)
+    assert len(events()) == 1
+    p.db.x("UPDATE runs SET ended=? WHERE ended<?", (time.time() - 2 * 86400, time.time() - 3600))
+    d.check_resource_trouble(every_s=0)
+    assert set(p.db.kv("resource_trouble")) == {"box-a"}, "one failure left: the episode goes on"
+    _bad_runs(p, tid, 1)
+    d.check_resource_trouble(every_s=0)
+    assert len(events()) == 1, "a count hovering at the threshold started a second episode"

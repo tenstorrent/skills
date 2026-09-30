@@ -10,7 +10,7 @@ machine names its alias in `resources`, so failures can be counted per machine.
 A resource is in trouble when the tasks using it keep failing in the last 24 h: runs that crashed,
 stalled, timed out or were lost, hand-offs that failed or blocked, host reboots while it was held.
 The coordinator routes around it: the tasks move to a machine the charter allows that shares its
-tags.
+tags. Many waits alone also show up, but only as a hint: a busy resource is not a broken one.
 """
 from __future__ import annotations
 
@@ -109,8 +109,8 @@ def _labels(t: dict) -> set[str]:
     return task_resources(t)
 
 
-def trouble(db, now: float | None = None) -> dict[str, dict]:
-    """Resources whose tasks keep failing in the last 24 h: {name: counts, open task ids}."""
+def stats(db, now: float | None = None) -> dict[str, dict]:
+    """Every resource with a failure or wait in the last 24 h: {name: counts}."""
     now = now or time.time()
     since = now - 86400
     stats: dict[str, dict] = {}
@@ -125,16 +125,24 @@ def trouble(db, now: float | None = None) -> dict[str, dict]:
         if r["status"] == "lost" and "lost_to_reboot" in (r["note"] or ""):
             continue   # counted once, as the reboot below
         bump(_labels(r), "runs")
+    # Only what the task's own runs reported: a block the daemon set on a dead dependency says
+    # nothing about the resource.
     for e in db.q("SELECT e.kind, t.labels FROM events e JOIN tasks t ON t.id=e.task "
-                  "WHERE e.ts>? AND e.kind IN ('task_failed','task_blocked','task_waiting')", (since,)):
+                  "WHERE e.ts>? AND e.source LIKE 'task:%' "
+                  "AND e.kind IN ('task_failed','task_blocked','task_waiting')", (since,)):
         bump(_labels(e), "waits" if e["kind"] == "task_waiting" else "handoffs")
     for b in db.boots(since):
         bump({str(h).split(":", 1)[0] for h in b.get("held") or [] if ":" in str(h)}, "reboots")
-    out = {}
-    for name, s in stats.items():
+    for s in stats.values():
         s["failures"] = s["runs"] + s["handoffs"] + s["reboots"]
-        if s["failures"] >= TROUBLE_AT or s["waits"] >= WAITS_AT:
-            out[name] = s
+    return stats
+
+
+def trouble(db, now: float | None = None, seen: dict[str, dict] | None = None) -> dict[str, dict]:
+    """Resources whose tasks keep failing in the last 24 h: {name: counts, open task ids}.
+    `seen` is stats() already read for the same moment."""
+    seen = stats(db, now) if seen is None else seen
+    out = {name: dict(s) for name, s in seen.items() if s["failures"] >= TROUBLE_AT or s["waits"] >= WAITS_AT}
     if out:
         for t in db.q("SELECT id, labels FROM tasks WHERE status NOT IN ('done','failed','cancelled') ORDER BY id"):
             for name in _labels(t) & set(out):
@@ -155,7 +163,8 @@ def trouble_line(name: str, s: dict, machines: dict[str, dict], avoid: set[str])
         alts = alternatives(name, machines, avoid)
         alt = (f"; machines sharing its tags: {', '.join(alts)}" if alts
                else "; no other machine shares its tags")
-    return f"{name}: {', '.join(parts)}{on}{alt}"
+    hint = "; waits only: it may be busy, not down, so do not pause it for this" if not s.get("failures") else ""
+    return f"{name}: {', '.join(parts)}{on}{alt}{hint}"
 
 
 def digest_lines(db, paused: dict | None = None, now: float | None = None) -> list[str]:
