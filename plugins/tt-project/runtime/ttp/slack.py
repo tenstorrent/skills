@@ -23,6 +23,9 @@ import urllib.request
 from typing import Any
 
 API = "https://slack.com/api/"
+THREAD_WINDOW_S = 7 * 86400   # replies to posts older than this are not looked for
+THREAD_SCAN_S = 60            # how often all posts of that window are checked for new replies
+MAX_PAGES = 20
 
 
 class SlackError(Exception):
@@ -73,17 +76,44 @@ class Slack:
         return self.call("chat.postMessage", channel=self.dm_channel(), text=body[:39000],
                          thread_ts=thread_ts, unfurl_links=False)["ts"]
 
-    def poll(self, oldest: str) -> list[dict]:
-        """Messages the user wrote in the DM after `oldest` (top level and in threads), oldest first."""
-        ch = self.dm_channel()
+    def poll(self, oldest: str) -> tuple[list[dict], list[dict]]:
+        """Top-level messages the user wrote in the DM after `oldest`, oldest first, and every post
+        after `oldest` (thread parents). A backlog longer than one page is read whole."""
+        posts = self._pages("conversations.history", channel=self.dm_channel(), oldest=oldest)
         uid = self.resolve_user()
-        msgs = self.call("conversations.history", channel=ch, oldest=oldest, limit=100).get("messages", [])
-        out = [m for m in msgs if m.get("user") == uid]
-        for parent in msgs:   # replies live in threads; fetch only threads with new activity
-            if parent.get("reply_count") and float(parent.get("latest_reply", "0")) > float(oldest):
-                reps = self.call("conversations.replies", channel=ch, ts=parent["ts"], oldest=oldest)
-                out += [r for r in reps.get("messages", [])[1:] if r.get("user") == uid]
-        return sorted(out, key=lambda m: float(m["ts"]))
+        top = [m for m in posts if m.get("user") == uid and m.get("thread_ts") in (None, m["ts"])]
+        return sorted(top, key=lambda m: float(m["ts"])), posts
+
+    def recent_posts(self) -> list[dict]:
+        """The DM's posts of the last THREAD_WINDOW_S. A reply never moves its parent, so threads with
+        new replies are looked for among all of these, not only among posts after the read cursor."""
+        return self._pages("conversations.history", channel=self.dm_channel(),
+                           oldest=f"{time.time() - THREAD_WINDOW_S:.6f}")
+
+    def new_replies(self, parents: list[dict], read: dict[str, str], floor: str) -> list[tuple[str, list[dict]]]:
+        """(parent ts, replies oldest first) for each thread with replies after its own read position,
+        `read[parent ts]`, or `floor` for a thread not read yet. Every thread keeps its own position,
+        so a reply is never skipped because a newer message elsewhere was read first."""
+        ch, out = self.dm_channel(), []
+        for parent in {m["ts"]: m for m in parents}.values():
+            pos = read.get(parent["ts"], floor)
+            if parent.get("reply_count") and float(parent.get("latest_reply", "0")) > float(pos):
+                reps = [r for r in self._pages("conversations.replies", channel=ch, ts=parent["ts"], oldest=pos)
+                        if r["ts"] != parent["ts"] and float(r["ts"]) > float(pos)]
+                if reps:
+                    out.append((parent["ts"], sorted(reps, key=lambda r: float(r["ts"]))))
+        return out
+
+    def _pages(self, method: str, **params: Any) -> list[dict]:
+        msgs: list[dict] = []
+        cursor = None
+        for _ in range(MAX_PAGES):
+            page = self.call(method, limit=200, cursor=cursor, **params)
+            msgs += page.get("messages", [])
+            cursor = (page.get("response_metadata") or {}).get("next_cursor")
+            if not cursor:
+                break
+        return msgs
 
 
 PREFIX = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]{0,62})\s*:\s*(.+)$", re.S)

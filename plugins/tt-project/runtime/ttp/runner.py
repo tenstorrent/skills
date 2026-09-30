@@ -46,6 +46,21 @@ def boot_id() -> str:
         return "unknown"
 
 
+def proc_start(pid: int) -> str | None:
+    """When process pid started, as a token that stays the same for its whole life and differs for
+    a later process given the same pid. None if it is gone."""
+    try:   # Linux: clock ticks from boot to its start (field 22)
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError):
+        pass
+    try:
+        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
+                             timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out or None
+
+
 def _touch(p: Path) -> None:
     p.touch()
     os.utime(p, None)
@@ -103,7 +118,7 @@ def supervise(run_dir: Path) -> int:
     err = open(run_dir / "stderr.log", "wb")
     child = subprocess.Popen(argv, stdin=prompt, stdout=out, stderr=err, cwd=cwd, env=env,
                              start_new_session=True)
-    (run_dir / "child.pid").write_text(str(child.pid))
+    (run_dir / "child.pid").write_text(f"{child.pid}\n{proc_start(child.pid) or ''}\n")
     reason: list[str] = []
 
     def stop(why: str) -> None:

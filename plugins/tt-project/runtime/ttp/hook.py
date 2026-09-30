@@ -14,38 +14,43 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Callable
 
 STEER_FILE = "steer.md"
 OFFSET_FILE = "steer.offset"
 
 
-def unread_update(run_dir: Path) -> str:
-    """The part of steer.md this run has not seen yet; marks it seen."""
+def unread_update(run_dir: Path) -> tuple[str, int]:
+    """The part of steer.md this run has not seen yet, and the offset that marks it seen. The caller
+    marks it only once the text is handed over (a repeat is harmless, a loss is not)."""
     steer = run_dir / STEER_FILE
     if not steer.exists():
-        return ""
+        return "", 0
     data = steer.read_bytes()
     try:
         seen = int((run_dir / OFFSET_FILE).read_text())
     except (OSError, ValueError):
         seen = 0
     if len(data) <= seen:
-        return ""
-    (run_dir / OFFSET_FILE).write_text(str(len(data)))
-    return data[seen:].decode("utf-8", errors="replace").strip()
+        return "", seen
+    return data[seen:].decode("utf-8", errors="replace").strip(), len(data)
 
 
-def post_tool_use(payload: dict) -> dict | None:
+def mark_seen(run_dir: Path, offset: int) -> None:
+    (run_dir / OFFSET_FILE).write_text(str(offset))
+
+
+def post_tool_use(payload: dict) -> tuple[dict | None, Callable[[], None] | None]:
     run_dir = os.environ.get("TTP_RUN_DIR")
     if not run_dir:
-        return None
-    text = unread_update(Path(run_dir))
+        return None, None
+    text, offset = unread_update(Path(run_dir))
     if not text:
-        return None
+        return None, None
     return {"hookSpecificOutput": {
         "hookEventName": "PostToolUse",
         "additionalContext": "Update for your task from the project coordinator. Where it differs from "
-                             "the spec, it wins:\n" + text}}
+                             "the spec, it wins:\n" + text}}, lambda: mark_seen(Path(run_dir), offset)
 
 
 HANDLERS = {"PostToolUse": post_tool_use}
@@ -61,11 +66,14 @@ def main(argv: list[str]) -> int:
     if not handler:
         return 0
     try:
-        out = handler(payload)
+        out, delivered = handler(payload)
+        if out:
+            json.dump(out, sys.stdout)
+            sys.stdout.flush()
+        if delivered:
+            delivered()
     except Exception:
         return 0
-    if out:
-        json.dump(out, sys.stdout)
     return 0
 
 

@@ -180,20 +180,30 @@ class Project:
         except (OSError, subprocess.SubprocessError):
             return False
 
-    def add_memory(self, text: str, kind: str = "fact", title: str | None = None) -> Path:
-        """One fact per file plus a one-line pointer in MEMORY.md, so the index stays cheap to load."""
+    def add_memory(self, text: str, kind: str = "fact", title: str | None = None, key: str | None = None) -> Path:
+        """One fact per file plus a one-line pointer in MEMORY.md, so the index stays cheap to load.
+        A memory written again under the same `key` (a replayed coordinator turn) keeps its one
+        file and line."""
         self.memory_dir.mkdir(parents=True, exist_ok=True)
         text = text.strip()
         title = (title or text.splitlines()[0])[:80]
         slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:48] or "note"
-        path = self.memory_dir / f"{kind}-{slug}.md"
-        n = 2
-        while path.exists():
-            path = self.memory_dir / f"{kind}-{slug}-{n}.md"
-            n += 1
-        path.write_text(f"---\nkind: {kind}\ncreated: {time.strftime('%Y-%m-%d')}\n---\n{text}\n")
-        with open(self.memory_index, "a") as f:
-            f.write(f"- [{title}](memory/{path.name}) ({kind})\n")
+        tag = f"turn: {key}\n" if key else ""
+        same = [f for f in sorted(self.memory_dir.glob(f"{kind}-{slug}*.md"))
+                if f"\n{tag}---\n" in f.read_text()] if key else []
+        if same:
+            path = same[0]
+        else:
+            path = self.memory_dir / f"{kind}-{slug}.md"
+            n = 2
+            while path.exists():
+                path = self.memory_dir / f"{kind}-{slug}-{n}.md"
+                n += 1
+            path.write_text(f"---\nkind: {kind}\ncreated: {time.strftime('%Y-%m-%d')}\n{tag}---\n{text}\n")
+        index = self.memory_index.read_text() if self.memory_index.exists() else ""
+        if f"](memory/{path.name})" not in index:
+            with open(self.memory_index, "a") as f:
+                f.write(f"- [{title}](memory/{path.name}) ({kind})\n")
         self.commit_harness([path, self.memory_index], f"memory ({kind}): {title}")
         return path
 

@@ -212,12 +212,18 @@ def _norm_severity(s: str | None) -> str:
 NEEDS_USER = {"budget.daily_usd", "budget.weekly_usd", "budget.reserve_pct"}
 
 
-def apply(p: Project, actions: list[dict], default_chat: str | None = None, user_turn: bool = False) -> list[str]:
-    """Apply validated actions. Returns human-readable notes about rejected ones, fed back next turn."""
+def apply(p: Project, actions: list[dict], default_chat: str | None = None, user_turn: bool = False,
+          turn: int | None = None) -> list[str]:
+    """Apply validated actions. Returns human-readable notes about rejected ones, fed back next turn.
+
+    A turn cut off before its database transaction commits is applied again from its output. Its
+    file writes carry `turn`.<action index> so the replay does not repeat them, while the same
+    text sent again by a later turn is still written."""
     db, problems = p.db, []
     cfg = p.config()
-    for a in actions:
+    for i, a in enumerate(actions):
         t = a.get("type")
+        key = f"{turn}.{i}" if turn is not None else None
         try:
             if t == "reply":
                 chat = a.get("chat") or default_chat
@@ -290,13 +296,13 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     upd["spec"] = task["spec"] + "\n\n## Update\n" + spec
                 db.update_task(task["id"], **upd)
                 if spec and task["status"] == "running":
-                    stamp = time.strftime("%Y-%m-%d %H:%M")
                     for r in db.q("SELECT dir FROM runs WHERE task=? AND status='running'", (task["id"],)):
                         if r["dir"]:
-                            with open(Path(r["dir"], "steer.md"), "a") as f:
-                                f.write(f"\n## Update {stamp}\n{spec.strip()}\n")
+                            _append_update(Path(r["dir"], "steer.md"), spec, key)
                 if upd.get("status") == "cancelled":
-                    stop_runs(db, p.runs, task["id"])
+                    # Only once the cancel is saved: a turn cut off before that must not stop the run.
+                    # The daemon asks a cancelled task's runs to stop if this never happens.
+                    db.after_commit(lambda tid=task["id"]: stop_runs(db, p.runs, tid))
             elif t == "ask_user":
                 if a.get("reversible") is True:
                     raise ValueError("ask_user rejected: decide it yourself. A reversible choice is a judgment "
@@ -319,16 +325,19 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
             elif t == "notify":
                 db.post("out", a["text"], chat=None, kind="alert", severity=_norm_severity(a.get("severity")))
             elif t == "memory_add":
-                p.add_memory(a["text"], kind=a.get("memory_kind") or "fact", title=a.get("title"))
+                p.add_memory(a["text"], kind=a.get("memory_kind") or "fact", title=a.get("title"), key=key)
                 if (a.get("memory_kind") or "") == "restriction":
-                    _tell_running_workers(db, f"New binding restriction: {a['text'].strip()}")
+                    _tell_running_workers(db, f"New binding restriction: {a['text'].strip()}", key)
             elif t == "charter_update":
                 section = (a.get("section") or "Notes").strip().title()
-                with open(p.charter_path, "a") as f:
-                    f.write(f"\n## {section} (added {time.strftime('%Y-%m-%d')})\n{a['text'].strip()}\n")
+                text = a["text"].strip()
+                stamp = time.strftime("%Y-%m-%d") + (f", turn {key}" if key else "")
+                if not (key and _has_line(p.charter_path, f", turn {key})")):
+                    with open(p.charter_path, "a") as f:
+                        f.write(f"\n## {section} (added {stamp})\n{text}\n")
                 p.commit_harness([p.charter_path], f"charter ({section.lower()}): {a['text'].strip()[:80]}")
                 if section.startswith("Restriction"):
-                    _tell_running_workers(db, f"New binding restriction: {a['text'].strip()}")
+                    _tell_running_workers(db, f"New binding restriction: {text}", key)
             elif t == "schedule_set":
                 sched.upsert(db, a["name"], a.get("kind") or "llm", a.get("every") or "1d", a.get("at"),
                              bool(a.get("enabled", True)), a.get("budget_usd"), a.get("text") or "",
@@ -480,14 +489,27 @@ def expire_asks(p: Project, *, hold: bool = False, now: float | None = None) -> 
     return [int(k) for k in due]
 
 
-def _tell_running_workers(db, text: str) -> None:
+def _tell_running_workers(db, text: str, key: str | None = None) -> None:
     """A new restriction binds work already in flight, not only work started later: it goes to
     every running worker's update file, which the worker receives mid-run."""
-    stamp = time.strftime("%Y-%m-%d %H:%M")
     for r in db.q("SELECT dir FROM runs WHERE status='running' AND role!='coordinator'"):
         if r["dir"] and Path(r["dir"]).is_dir():
-            with open(Path(r["dir"], "steer.md"), "a") as f:
-                f.write(f"\n## Update {stamp}\n{text}\n")
+            _append_update(Path(r["dir"], "steer.md"), text, key)
+
+
+def _append_update(steer: Path, text: str, key: str | None = None) -> None:
+    """Add an update to a run's steer.md, once per `key` (see apply)."""
+    if key and _has_line(steer, f"(turn {key})"):
+        return
+    with open(steer, "a") as f:
+        f.write(f"\n## Update {time.strftime('%Y-%m-%d %H:%M')}{f' (turn {key})' if key else ''}\n{text.strip()}\n")
+
+
+def _has_line(path: Path, ending: str) -> bool:
+    try:
+        return any(line.endswith(ending) for line in path.read_text().splitlines())
+    except FileNotFoundError:
+        return False
 
 
 def open_task_count(p: Project) -> int:

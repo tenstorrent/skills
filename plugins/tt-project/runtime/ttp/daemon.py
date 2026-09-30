@@ -45,6 +45,8 @@ HEARTBEAT_STALE_S = 300   # longer than any single tick step (a git fetch, a wat
 RESULT_FILE = "result.json"
 PROBE_EVERY_S = 180     # how often a waiting task's `retry_when` probe runs
 PROBE_TIMEOUT_S = 60
+ORPHAN_GRACE_S = 10     # TERM to KILL for an agent whose supervisor died
+HANDOFF_STATES = ("done", "blocked", "failed", "needs_review", "waiting")
 
 
 def log(p: Project, msg: str) -> None:
@@ -65,6 +67,7 @@ class Daemon:
         self._slack = None
         self._last_cfg = 0.0
         self._last_slack = 0.0
+        self._thread_scan = 0.0
         self._reap_errors: dict[int, int] = {}
         self._metered: dict[int, tuple[int, float]] = {}   # run id -> (output size, when) last priced
         self._start_failures = 0
@@ -264,6 +267,7 @@ class Daemon:
                 if exit_file.exists():
                     self.finish_run(r, _read_result(exit_file) or {"rc": -1, "stopped": "lost", "ended": time.time()})
                 elif not self._run_alive(r):
+                    self._end_orphan(r)
                     self.finish_run(r, {"rc": -1, "stopped": "lost", "ended": time.time()})
                 self._reap_errors.pop(r["id"], None)
             except Exception:
@@ -272,6 +276,20 @@ class Daemon:
                 log(self.p, f"run {r['id']} reap error {n}: " + traceback.format_exc().replace("\n", " | ")[:2000])
                 if n >= 3:
                     self._abandon_run(r)
+
+    def _end_orphan(self, r: dict) -> None:
+        """A supervisor that died (kill -9, OOM) leaves its agent running with no wall clock, budget
+        or cancel, beside the retry of its task. End the agent's process group, TERM then KILL."""
+        if r["boot_id"] != self.boot:
+            return   # a reboot already ended it
+        try:
+            pid_text, _, started = (self._run_dir(r) / "child.pid").read_text().partition("\n")
+            pid, started = int(pid_text), started.strip()
+        except (OSError, ValueError):
+            return
+        if _is_agent(pid, started):
+            log(self.p, f"run {r['id']} lost its supervisor; ending its agent (pid {pid})")
+            _end_group(pid, ORPHAN_GRACE_S)
 
     def _abandon_run(self, r: dict) -> None:
         """Last resort for a run whose end keeps failing to process: close it so it cannot block the
@@ -326,6 +344,17 @@ class Daemon:
                      (now, "daemon", "task_requeued", "low", f"#{t['id']} {t['title']} was marked running with no "
                       f"live run; queued again, no attempt spent", "handled", t["id"]))
             log(self.p, f"task {t['id']} requeued: marked running with no live run")
+        # A cancel saves the task first and then asks its runs to stop; a crash in between must not
+        # leave a cancelled task's run spending until its own limits end it.
+        for r in db.q("SELECT runs.id, runs.dir FROM runs JOIN tasks ON tasks.id=runs.task "
+                      "WHERE runs.status='running' AND tasks.status='cancelled'"):
+            run_dir = self._run_dir(r)
+            if run_dir.is_dir() and not (run_dir / "STOP").exists():
+                try:
+                    runner.request_stop(run_dir)
+                    log(self.p, f"run {r['id']} of a cancelled task asked to stop")
+                except OSError as e:
+                    log(self.p, f"run {r['id']} of a cancelled task could not be asked to stop: {e}")
         for t, dep, why in db.dead_dependencies():
             reason = f"dependency #{dep} {why}" if dep is not None else "a dependency is not a task id"
             with db.tx():
@@ -450,7 +479,8 @@ class Daemon:
             return
         db.set_kv("coordinator_failures", 0)
         default_chat = note.get("default_chat")
-        problems = coord.apply(self.p, actions, default_chat=default_chat, user_turn=bool(note.get("messages")))
+        problems = coord.apply(self.p, actions, default_chat=default_chat, user_turn=bool(note.get("messages")),
+                               turn=r.get("id"))
         ids = note.get("messages", [])
         if ids:
             db.x(f"UPDATE messages SET handled=1 WHERE id IN ({','.join('?' * len(ids))})", ids)
@@ -494,7 +524,8 @@ class Daemon:
         task = db.task(r["task"]) if r["task"] else None
         if not task:
             return
-        result = _read_result(run_dir / RESULT_FILE) or last_json_object(usage.final_text or "") or {}
+        handoff = _read_result(run_dir / RESULT_FILE)
+        result = handoff or last_json_object(usage.final_text or "") or {}
         if task["status"] == "cancelled":
             # Cancelled while this run was ending: the decision stands. Keep what the run produced,
             # and tell the coordinator only if the work actually got done.
@@ -507,13 +538,25 @@ class Daemon:
                       f"#{task['id']} {task['title']} was cancelled, but its run finished the work: "
                       f"{summary[:800]}", "queued", task["id"]))
             return
-        if status == "shutdown":
-            if isinstance(result, dict) and result.get("status"):
-                status = "ok"   # it handed off before the stop reached it
-            else:
-                # The project was stopped, not the task: it resumes on the next start, on its own branch.
-                db.update_task(task["id"], status="queued", blocked_reason="interrupted by `ttp stop --kill`; resumes")
-                return
+        if status == "lost" and not r["dir"] and not (run_dir / "lease").exists():
+            # The daemon stopped between recording the run and launching it: nothing ran.
+            with db.tx():
+                db.update_task(task["id"], status="queued", blocked_reason=None)
+                db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                     (time.time(), "daemon", "task_requeued", "low", f"#{task['id']} {task['title']}: its run "
+                      f"never started; queued again, no attempt spent", "handled", task["id"]))
+            return
+        ended = None
+        # A hand-off written before the run ended badly (supervisor killed, reboot, timeout, stall)
+        # stands: the work it reports is done and redoing it would repeat it.
+        if status not in ("ok", "killed", "resource_busy") and (
+                (handoff or {}).get("status") in HANDOFF_STATES
+                or (status == "shutdown" and isinstance(result, dict) and result.get("status"))):
+            ended, status = status, "ok"
+        elif status == "shutdown":
+            # The project was stopped, not the task: it resumes on the next start, on its own branch.
+            db.update_task(task["id"], status="queued", blocked_reason="interrupted by `ttp stop --kill`; resumes")
+            return
         if status == "resource_busy":
             # The run lost the race for its resource and never started its agent: not an attempt.
             db.update_task(task["id"], status="queued", not_before=time.time() + 30,
@@ -559,6 +602,8 @@ class Daemon:
                     retry = 1800.0
                 not_before = time.time() + retry
                 reason = f"waiting for {what}; next try {time.strftime('%H:%M', time.localtime(not_before))}"
+        if ended:
+            extra["run_status"] = ended
         upd = {"status": new, "attempts": attempts, "result": dump_result(
             {"summary": summary, "status": rstatus or status, **extra,
              **({k: v for k, v in result.items() if k not in ("summary", "waits")}
@@ -591,7 +636,7 @@ class Daemon:
         sev = "high" if new == "blocked" else "normal"
         fups = result.get("followups") if isinstance(result, dict) else None
         fups = [f for f in fups if isinstance(f, dict) and f.get("title")] if isinstance(fups, list) else []
-        text = (f"#{task['id']} {task['title']} → {new} (run {status}, {'~' if usage.estimated else ''}"
+        text = (f"#{task['id']} {task['title']} → {new} (run {ended or status}, {'~' if usage.estimated else ''}"
                 f"${usage.cost_usd:.2f}): {summary[:1200]}")
         if isinstance(result, dict):
             # A plan's findings and plugin advice reach the coordinator, which decides what to keep.
@@ -647,6 +692,8 @@ class Daemon:
     def update_gates(self) -> None:
         windows = bud.plan_windows(self.p.db)
         gates = {}
+        # After a restart the last levels come from disk, so a change while the daemon was down is news.
+        saved = {} if self.gates else (self.p.db.kv("gates") or {})
         for prov in {self.cfg.get("core_provider", "claude"), *[t["provider"] for t in self.p.db.q(
                 "SELECT DISTINCT provider FROM tasks WHERE provider IS NOT NULL AND status IN ('queued','running')")]}:
             g = bud.evaluate(self.p.db, self.cfg, prov, windows)
@@ -654,7 +701,7 @@ class Daemon:
             if lim and lim.get("until", 0) > time.time():
                 bud._raise(g, "red", f"provider limit: {lim.get('note')}")
                 g.max_parallel, g.allow_new_work, g.allow_optional = 0, False, False
-            prev = self.gates.get(prov)
+            prev = self.gates.get(prov) or _saved_gate(saved.get(prov))
             provider_paused = any(r.startswith("provider limit") for r in g.reasons + (prev.reasons if prev else []))
             # On a plan, green and yellow are the pacing working as designed (more or fewer workers
             # as the account's burn moves); only nearing or hitting the limit is news to the user.
@@ -1104,12 +1151,14 @@ class Daemon:
         daemon restarts too (an upgrade must not re-announce a condition the user already has).
         The key is kept as the message's ref, so the web app can drop the alert once it clears."""
         now = time.time()
-        sent = self.p.db.kv("alerts_sent", {})
-        if now - float(sent.get(key, 0)) < every_s:
-            return
-        sent[key] = now
-        self.p.db.set_kv("alerts_sent", {k: v for k, v in sent.items() if now - float(v) < 7 * 86400})
-        self.p.db.post("out", text, chat=None, kind="alert", severity=severity, ref=key)
+        db = self.p.db
+        with db.tx():   # marked sent only together with the message
+            sent = db.kv("alerts_sent", {})
+            if now - float(sent.get(key, 0)) < every_s:
+                return
+            sent[key] = now
+            db.set_kv("alerts_sent", {k: v for k, v in sent.items() if now - float(v) < 7 * 86400})
+            db.post("out", text, chat=None, kind="alert", severity=severity, ref=key)
 
     def slack(self):
         if not self.cfg["notify"].get("slack"):
@@ -1152,27 +1201,50 @@ class Daemon:
         if not sl or now - self._last_slack < float(self.cfg["notify"].get("slack_poll_s", 20)):
             return
         self._last_slack = now
-        from .slack import projects_in_dm, route
+        from .slack import THREAD_SCAN_S, THREAD_WINDOW_S, projects_in_dm, route
         db = self.p.db
         oldest = str(db.kv("slack_oldest", f"{now - 60:.6f}"))
+        # Each thread has its own read position; `floor` is where a thread not read yet starts: the
+        # cursor when all recent posts were last checked, so a reply is not skipped for a newer message.
+        replies = db.kv("slack_replies") or {}
+        read, floor = dict(replies.get("read") or {}), str(replies.get("floor") or oldest)
+        scan = now - self._thread_scan >= THREAD_SCAN_S
         try:
-            msgs = sl.poll(oldest)
+            msgs, posts = sl.poll(oldest)
+            threads_new = sl.new_replies(posts + (sl.recent_posts() if scan else []), read, floor)
             siblings = projects_in_dm(sl.call("conversations.history", channel=sl.dm_channel(), limit=200)
                                       .get("messages", [])) or [self.p.name]
+            uid = sl.resolve_user()
         except Exception as e:
             log(self.p, f"slack poll failed: {e}")
             return
         threads = set(db.kv("slack_threads", []))
+        names = sorted(set(siblings) | {self.p.name})
         for m in msgs:
-            text = route(m, self.p.name, threads, sorted(set(siblings) | {self.p.name}))
+            text = route(m, self.p.name, threads, names)
             if text:
-                db.post("in", text, chat="slack", channel="slack", kind="user", ref=m.get("thread_ts") or m["ts"])
-            elif not m.get("thread_ts") and sorted(set(siblings) | {self.p.name})[0] == self.p.name \
+                with db.tx():   # stored exactly once: the message and the cursor past it commit together
+                    db.post("in", text, chat="slack", channel="slack", kind="user", ref=m["ts"])
+                    db.set_kv("slack_oldest", m["ts"])
+                continue
+            if not m.get("thread_ts") and names[0] == self.p.name \
                     and not re.match(r"^\s*[A-Za-z0-9._-]+\s*:", m.get("text") or ""):
-                names = ", ".join(sorted(set(siblings) | {self.p.name}))
-                sl.post(self.p.name, f"Which project is this for? Start the message with one of: {names}, "
+                sl.post(self.p.name, f"Which project is this for? Start the message with one of: {', '.join(names)}, "
                                      f"e.g. `{self.p.name}: ...`", thread_ts=m["ts"])
             db.set_kv("slack_oldest", m["ts"])
+        for parent, reps in threads_new:
+            for r in reps:
+                text = route(r, self.p.name, threads, names) if r.get("user") == uid else None
+                read[parent] = r["ts"]
+                with db.tx():
+                    if text:
+                        db.post("in", text, chat="slack", channel="slack", kind="user", ref=parent)
+                    db.set_kv("slack_replies", {"floor": floor, "read": read})
+        if scan:
+            self._thread_scan = now
+            # A thread older than both the window and the cursor is never read again.
+            keep = min(now - THREAD_WINDOW_S, float(oldest))
+            db.set_kv("slack_replies", {"floor": oldest, "read": {k: v for k, v in read.items() if float(k) >= keep}})
 
     # misc -------------------------------------------------------------------------------------------
     def _keep_awake(self) -> None:
@@ -1241,6 +1313,40 @@ def _read_result(path: Path) -> dict | None:
         return data if isinstance(data, dict) else None
     except (OSError, ValueError):
         return None
+
+
+def _saved_gate(d: dict | None) -> bud.Gate | None:
+    try:
+        return bud.Gate(**d) if isinstance(d, dict) else None
+    except TypeError:   # saved by a version with other fields
+        return None
+
+
+def _is_agent(pid: int, started: str) -> bool:
+    """pid is still the agent its supervisor recorded: the leader of its own session, with the start
+    token the supervisor wrote. A pid reused since then has another start, so it is never signalled."""
+    try:
+        return bool(started) and os.getsid(pid) == pid and runner.proc_start(pid) == started
+    except OSError:
+        return False
+
+
+def _end_group(pgid: int, grace_s: float) -> None:
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except OSError:
+        return
+    deadline = time.time() + grace_s
+    while time.time() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except OSError:
+            return
+        time.sleep(0.2)
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except OSError:
+        pass
 
 
 def _kill_group(proc: subprocess.Popen) -> None:

@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import io
 import json
 import shlex
 import os
 import pathlib
+import signal
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -1782,14 +1785,14 @@ def test_one_daemon_per_project(env, monkeypatch):
         other.wait()
 
 
-def _start_sleeping_run(p, tid, role="worker"):
+def _start_sleeping_run(p, tid, role="worker", argv=("sleep", "120"), boot="x"):
     rid = p.db.x("INSERT INTO runs(task,role,provider,started,status,boot_id) VALUES(?,?,?,?,?,?)",
-                 (tid, role, "fake", time.time(), "running", "x"))
+                 (tid, role, "fake", time.time(), "running", boot))
     run_dir = p.runs / str(rid)
     run_dir.mkdir(parents=True)
     (run_dir / "prompt.md").write_text("x")
-    (run_dir / "run.json").write_text(json.dumps({"argv": ["sleep", "120"], "env": {}, "cwd": str(p.root),
-                                                  "timeout_s": 600, "provider": "fake"}))
+    (run_dir / "run.json").write_text(json.dumps({"argv": list(argv), "env": {"TTP_RUN_DIR": str(run_dir)},
+                                                  "cwd": str(p.root), "timeout_s": 600, "provider": "fake"}))
     proc = subprocess.Popen([sys.executable, "-m", "ttp.runner", str(run_dir)], cwd=str(RUNTIME),
                             env={**os.environ, "PYTHONPATH": str(RUNTIME)})
     p.db.x("UPDATE runs SET dir=?, pid=? WHERE id=?", (str(run_dir), proc.pid, rid))
@@ -2789,3 +2792,384 @@ def test_a_task_waiting_for_its_resource_keeps_its_reservation(env):
     d.dispatch()
     assert locks.reserved_by(mark) == f"task #{task['id']}", "a task waiting for its resource lost its reservation"
     held.close()
+
+
+# crash windows: each test kills (or fails) a step half way, then checks nothing was lost or doubled --------
+def _die_in(p, code):
+    """Run `code` against the project in a fresh process that is killed outright (os._exit, no cleanup,
+    no rollback handler) wherever it calls die(). `d` is a Daemon on the project."""
+    script = (f"import os, sys\nsys.path.insert(0, {str(RUNTIME)!r})\nfrom ttp.daemon import Daemon\n"
+              f"d = Daemon({str(p.base)!r})\n\ndef die(*a, **k):\n    os._exit(9)\n\n{code}\n")
+    r = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=120)
+    assert r.returncode == 9, f"the process was not killed where expected: {r.stdout}{r.stderr}"
+
+
+def _wait(cond, timeout=30.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if cond():
+            return True
+        time.sleep(0.1)
+    return cond()
+
+
+def _gone(pid):
+    """pid runs no more (a zombie waiting for its reaper counts as gone)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    try:
+        return pathlib.Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z"
+    except (OSError, IndexError):
+        return False
+
+
+def _json_or_none(path):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def test_a_killed_supervisor_ends_its_agent_and_the_handoff_still_counts(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    tid = p.db.add_task("finish the thing", "s", kind="work", tier="light", origin="user", reply_chat="c1")
+    p.db.update_task(tid, status="running")
+    handoff = json.dumps({"status": "done", "summary": "pushed the fix, tests green"})
+    rid, run_dir, proc = _start_sleeping_run(p, tid, boot=d.boot, argv=(
+        "sh", "-c", f'printf %s {shlex.quote(handoff)} > "$TTP_RUN_DIR/result.json"; exec sleep 120'))
+    agent = None
+    try:
+        assert _wait(lambda: _json_or_none(run_dir / "result.json") and (run_dir / "child.pid").exists())
+        agent = int((run_dir / "child.pid").read_text().split()[0])
+        proc.kill()           # the supervisor dies after the hand-off (kill -9, OOM) and stops renewing its lease
+        proc.wait()
+        os.utime(run_dir / "lease", (time.time() - 999, time.time() - 999))
+        d.reap_runs()
+        assert _wait(lambda: _gone(agent), 15), "the agent kept running without its supervisor"
+    finally:
+        if agent and not _gone(agent):
+            os.killpg(agent, signal.SIGKILL)
+    assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == "lost"
+    t = p.db.task(tid)
+    assert t["status"] == "done" and "pushed the fix" in t["result"], "a finished task was queued to be redone"
+    assert len(p.db.q("SELECT id FROM events WHERE kind='task_done' AND task=?", (tid,))) == 1
+    assert p.db.q("SELECT id FROM messages WHERE direction='out' AND chat='c1' AND text LIKE '%pushed the fix%'")
+
+
+@pytest.mark.parametrize("ended", ["timeout", "stalled", "reboot"])
+def test_a_handoff_written_before_a_run_ends_badly_is_kept(env, tmp_path, ended):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    tid = p.db.add_task("measure", "s", kind="work", tier="light", origin="user")
+    p.db.update_task(tid, status="running")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "output.jsonl").write_text("")
+    (run_dir / "result.json").write_text(json.dumps({"status": "done", "summary": "measured 12 ms"}))
+    boot = d.boot
+    if ended == "reboot":     # no exit.json: the machine went down under the run
+        boot = "an-earlier-boot"
+        (run_dir / "lease").touch()
+        os.utime(run_dir / "lease", (time.time() - 999, time.time() - 999))
+    else:
+        (run_dir / "exit.json").write_text(json.dumps({"rc": -15, "stopped": ended, "ended": time.time()}))
+    rid = p.db.x("INSERT INTO runs(task,role,provider,started,status,dir,boot_id) VALUES(?,?,?,?,?,?,?)",
+                 (tid, "worker", "fake", time.time(), "running", str(run_dir), boot))
+    d.reap_runs()
+    assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == ("lost" if ended == "reboot" else ended)
+    t = p.db.task(tid)
+    assert t["status"] == "done" and json.loads(t["result"])["summary"] == "measured 12 ms"
+
+
+def test_the_reaper_never_kills_a_process_that_reused_the_agents_pid(env, tmp_path):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    tid = p.db.add_task("job", "s", kind="work", tier="light", origin="user")
+    p.db.update_task(tid, status="running")
+    other = subprocess.Popen(["sleep", "60"], start_new_session=True)
+    try:
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        (run_dir / "output.jsonl").write_text("")
+        (run_dir / "child.pid").write_text(f"{other.pid}\n1\n")   # the run's agent had another start
+        (run_dir / "lease").touch()
+        old = time.time() - 600
+        os.utime(run_dir / "lease", (old, old))
+        p.db.x("INSERT INTO runs(task,role,provider,started,status,dir,boot_id) VALUES(?,?,?,?,?,?,?)",
+               (tid, "worker", "fake", old, "running", str(run_dir), d.boot))
+        d.reap_runs()
+        time.sleep(0.5)
+        assert other.poll() is None, "the reaper killed a process that only reused the agent's pid"
+    finally:
+        other.kill()
+        other.wait()
+
+
+def test_a_run_killed_before_its_launch_spends_no_attempt(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    tid = p.db.add_task("tidy", "tidy up", kind="work", tier="light", origin="user")
+    # Killed between recording the run and starting its supervisor.
+    _die_in(p, "import ttp.daemon as dm\nreal = dm.subprocess.Popen\n"
+               "dm.subprocess.Popen = lambda argv, *a, **k: die() if 'ttp.runner' in argv else real(argv, *a, **k)\n"
+               "d.dispatch()")
+    assert p.db.task(tid)["status"] == "running"
+    Daemon(p.base).reap_runs()
+    t = p.db.task(tid)
+    assert p.db.one("SELECT status FROM runs WHERE task=?", (tid,))["status"] == "lost"
+    assert t["status"] == "queued" and t["attempts"] == 0, "a run that never started cost an attempt"
+
+
+def test_a_coordinator_turn_replayed_after_a_crash_writes_its_files_once(env, tmp_path):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    tid = p.db.add_task("long job", "spec", kind="work", tier="light", origin="user")
+    p.db.update_task(tid, status="running")
+    wdir = tmp_path / "worker"
+    wdir.mkdir()
+    (wdir / "lease").touch()
+    p.db.x("INSERT INTO runs(task,role,provider,started,status,dir,boot_id) VALUES(?,?,?,?,?,?,?)",
+           (tid, "worker", "fake", time.time(), "running", str(wdir), d.boot))
+    doomed = p.db.add_task("side job", "spec", kind="work", tier="light", origin="user")
+    p.db.update_task(doomed, status="running")
+    ddir = tmp_path / "doomed"
+    ddir.mkdir()
+    (ddir / "lease").touch()
+    p.db.x("INSERT INTO runs(task,role,provider,started,status,dir,boot_id) VALUES(?,?,?,?,?,?,?)",
+           (doomed, "worker", "fake", time.time(), "running", str(ddir), d.boot))
+    mid = p.db.post("in", "remember that X holds, never do Y, and drop the side job", chat="c1")
+    cdir = tmp_path / "coordinator"
+    cdir.mkdir()
+    (cdir / "output.jsonl").write_text(json.dumps({"actions": [
+        {"type": "reply", "text": "noted"},
+        {"type": "memory_add", "text": "X holds", "memory_kind": "fact"},
+        {"type": "charter_update", "section": "Restrictions", "text": "Never do Y."},
+        {"type": "task_update", "id": tid, "spec": "use any free board"},
+        {"type": "task_update", "id": doomed, "status": "cancelled"}]}))
+    (cdir / "exit.json").write_text(json.dumps({"rc": 0, "ended": time.time()}))
+    p.db.x("INSERT INTO runs(role,provider,started,status,dir,boot_id,note) VALUES(?,?,?,?,?,?,?)",
+           ("coordinator", "fake", time.time(), "running", str(cdir), d.boot,
+            json.dumps({"messages": [mid], "events": [], "default_chat": "c1"})))
+    # Killed after the turn wrote its files, before its database transaction committed: the turn replays.
+    _die_in(p, "d._record_rejections = die\nd.reap_runs()")
+    assert p.db.task(doomed)["status"] == "running" and not (ddir / "STOP").exists(), \
+        "a cancel that was never saved stopped its run"
+    Daemon(p.base).reap_runs()
+    assert p.db.task(doomed)["status"] == "cancelled" and (ddir / "STOP").read_text() == "cancel"
+    assert [f.name for f in p.memory_dir.glob("fact-x-holds*.md")] == ["fact-x-holds.md"]
+    assert p.memory_index.read_text().count("(memory/fact-x-holds") == 1
+    assert p.charter_path.read_text().count("Never do Y.") == 1
+    steer = (wdir / "steer.md").read_text()
+    assert steer.count("use any free board") == 1 and steer.count("Never do Y.") == 1, steer
+    assert len(p.db.q("SELECT id FROM messages WHERE direction='out' AND text='noted'")) == 1
+    assert p.db.one("SELECT handled FROM messages WHERE id=?", (mid,))["handled"] == 1
+    assert "## Update\nuse any free board" in p.db.task(tid)["spec"]
+    log = subprocess.run(["git", "-C", str(p.harness), "log", "--format=%s"], capture_output=True, text=True).stdout
+    assert log.count("memory (fact): X holds") == 1 and log.count("charter (restrictions)") == 1
+
+
+def test_the_same_update_from_a_later_turn_is_still_written(env, tmp_path):
+    p = make(env)
+    from ttp import coordinator as coord
+    tid = p.db.add_task("long job", "spec", kind="work", tier="light", origin="user")
+    p.db.update_task(tid, status="running")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    p.db.x("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(?,?,?,?,?,?)",
+           (tid, "worker", "fake", time.time(), "running", str(run_dir)))
+    for turn, text in enumerate(["Use board 1 only.", "Use any free board.", "Use board 1 only."], 1):
+        assert coord.apply(p, [{"type": "task_update", "id": tid, "spec": text},
+                               {"type": "charter_update", "section": "Notes", "text": text},
+                               {"type": "memory_add", "text": text}], turn=turn) == []
+    steer = (run_dir / "steer.md").read_text()
+    assert steer.count("Use board 1 only.") == 2 and steer.rstrip().endswith("Use board 1 only.")
+    assert p.charter_path.read_text().count("Use board 1 only.") == 2
+    assert len(list(p.memory_dir.glob("fact-use-board-1-only*.md"))) == 2
+
+
+def test_a_cancel_cut_off_before_its_stop_still_ends_the_run(env, tmp_path):
+    p = make(env)
+    from ttp.daemon import Daemon
+    tid = p.db.add_task("long job", "s", kind="work", tier="light", origin="user")
+    p.db.update_task(tid, status="running")
+    run_dir = p.runs / "7"
+    run_dir.mkdir(parents=True)
+    (run_dir / "lease").touch()
+    p.db.x("INSERT INTO runs(task,role,provider,started,status,dir,boot_id) VALUES(?,?,?,?,?,?,?)",
+           (tid, "worker", "fake", time.time(), "running", str(run_dir), "x"))
+    # Killed between saving the cancel and asking the run to stop.
+    _die_in(p, f"import ttp.runner\nttp.runner.request_stop = die\nfrom ttp import cli\n"
+               f"cli.main(['task', 'demo', 'cancel', '{tid}'])")
+    assert p.db.task(tid)["status"] == "cancelled" and not (run_dir / "STOP").exists()
+    Daemon(p.base).reconcile_tasks()
+    assert (run_dir / "STOP").read_text() == "cancel", "a cancelled task's run went on spending"
+
+
+def test_a_budget_change_while_the_daemon_was_down_is_announced_once(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    p.set_config("budget.daily_usd", 10)
+    d = Daemon(p.base)
+    d.update_gates()
+    assert d.gates["fake"].level == "green"
+    p.db.spend("fake", 50, "task:1")         # spent while the daemon was down
+    d = Daemon(p.base)
+    d.update_gates()
+    d.update_gates()
+    assert len(p.db.q("SELECT id FROM messages WHERE text LIKE 'Budget for fake is now red%'")) == 1
+
+
+def test_an_alert_cut_off_before_it_was_posted_is_not_suppressed(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    _die_in(p, "import ttp.db\nttp.db.DB.post = die\nd.alert('disk', 'Only 1 GB free')")
+    Daemon(p.base).alert("disk", "Only 1 GB free")
+    assert len(p.db.q("SELECT id FROM messages WHERE text='Only 1 GB free'")) == 1
+
+
+def test_an_update_is_marked_seen_only_once_it_was_handed_over(env, tmp_path, monkeypatch):
+    from ttp import hook
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "steer.md").write_text("\n## Update 2026-01-01 10:00\nuse any free board\n")
+    monkeypatch.setenv("TTP_RUN_DIR", str(run_dir))
+
+    class Closed(io.StringIO):
+        def write(self, s):
+            raise BrokenPipeError(32, "Broken pipe")
+
+    def hook_output(out):
+        monkeypatch.setattr(sys, "stdin", io.StringIO("{}"))
+        monkeypatch.setattr(sys, "stdout", out)
+        assert hook.main(["hook", "PostToolUse"]) == 0
+        return out.getvalue()
+
+    hook_output(Closed())                      # the output never reached the agent
+    assert "use any free board" in hook_output(io.StringIO()), "an update was lost on the way to the worker"
+    assert hook_output(io.StringIO()) == ""
+
+
+def _fake_slack():
+    """Slack as documented for a DM: history lists top-level messages newer than `oldest`, newest first,
+    in pages of `limit` with a cursor; a reply in a thread never changes its parent's ts."""
+    from ttp.slack import Slack
+
+    class FakeSlack(Slack):
+        def __init__(self):
+            super().__init__("token", "U1")
+            self.msgs = []
+
+        def dm_channel(self):
+            return "D1"
+
+        def call(self, method, **kw):
+            oldest = float(kw.get("oldest") or 0)
+            if method == "conversations.history":
+                top = sorted((m for m in self.msgs if m.get("thread_ts") in (None, m["ts"])
+                              and float(m["ts"]) > oldest), key=lambda m: -float(m["ts"]))
+                for m in top:
+                    reps = [r["ts"] for r in self.msgs if r.get("thread_ts") == m["ts"] and r["ts"] != m["ts"]]
+                    if reps:
+                        m.update(reply_count=len(reps), latest_reply=max(reps, key=float))
+                start, limit = int(kw.get("cursor") or 0), int(kw.get("limit") or 100)
+                more = start + limit < len(top)
+                return {"messages": top[start:start + limit], "has_more": more,
+                        "response_metadata": {"next_cursor": str(start + limit) if more else ""}}
+            if method == "conversations.replies":
+                return {"messages": [m for m in self.msgs if m["ts"] == kw["ts"]] + [
+                    r for r in self.msgs if r.get("thread_ts") == kw["ts"] and r["ts"] != kw["ts"]
+                    and float(r["ts"]) > oldest]}
+            return {}
+
+        def post(self, project, text, thread_ts=None):
+            ts = f"{time.time() + len(self.msgs):.6f}"
+            self.msgs.append({"ts": ts, "bot_id": "B1", "text": text if thread_ts else f"[{project}] {text}"})
+            return ts
+
+    return FakeSlack()
+
+
+def _slack_daemon(p):
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    d.cfg["notify"]["slack"] = True
+    d._slack = _fake_slack()
+
+    def poll(scan=False):
+        d._last_slack = 0
+        if scan:      # every post of the last week is checked for new replies, not only recent ones
+            d._thread_scan = 0
+        d.poll_slack()
+    return d, d._slack, poll
+
+
+def _slack_in(p):
+    return [m["text"] for m in p.db.q("SELECT text FROM messages WHERE direction='in' AND channel='slack' ORDER BY id")]
+
+
+def test_slack_reads_replies_to_older_threads_and_all_of_a_backlog(env):
+    p = make(env)
+    d, sl, poll = _slack_daemon(p)
+    t0 = time.time() - 3600
+    p.db.set_kv("slack_oldest", f"{t0:.6f}")
+    ask = f"{t0 + 1:.6f}"
+    sl.msgs.append({"ts": ask, "bot_id": "B1", "text": "[demo] Push the branch now?"})
+    p.db.set_kv("slack_threads", [ask])
+    poll(scan=True)
+    # The answer lands in the ask's thread just before a top-level message that moves the cursor past it.
+    sl.msgs.append({"ts": f"{t0 + 2:.6f}", "user": "U1", "text": "yes, push it", "thread_ts": ask})
+    sl.msgs.append({"ts": f"{t0 + 3:.6f}", "user": "U1", "text": "status?"})
+    poll()
+    poll(scan=True)
+    poll(scan=True)
+    assert _slack_in(p) == ["status?", "yes, push it"]
+    backlog = [f"m{i}" for i in range(250)]   # more than a page arrived while the daemon was down
+    for i, text in enumerate(backlog):
+        sl.msgs.append({"ts": f"{t0 + 10 + i:.6f}", "user": "U1", "text": text})
+    poll()
+    poll()
+    assert _slack_in(p)[2:] == backlog
+    new_ask = f"{t0 + 300:.6f}"      # a reply to a post newer than the cursor needs no scan
+    sl.msgs.append({"ts": new_ask, "bot_id": "B1", "text": "[demo] Merge it?"})
+    p.db.set_kv("slack_threads", [ask, new_ask])
+    sl.msgs.append({"ts": f"{t0 + 301:.6f}", "user": "U1", "text": "merge", "thread_ts": new_ask})
+    poll()
+    poll(scan=True)
+    assert _slack_in(p)[-1:] == ["merge"] and _slack_in(p).count("merge") == 1
+
+
+@pytest.mark.parametrize("cursor", ["slack_oldest", "slack_replies"])
+def test_a_slack_message_is_stored_once_when_its_cursor_write_fails(env, monkeypatch, cursor):
+    p = make(env)
+    from ttp.db import DB
+    d, sl, poll = _slack_daemon(p)
+    t0 = time.time() - 60
+    p.db.set_kv("slack_oldest", f"{t0:.6f}")
+    ask = f"{t0 + 1:.6f}"
+    sl.msgs.append({"ts": ask, "bot_id": "B1", "text": "[demo] Stop task 4?"})
+    p.db.set_kv("slack_threads", [ask])
+    poll(scan=True)
+    if cursor == "slack_oldest":
+        sl.msgs.append({"ts": f"{t0 + 2:.6f}", "user": "U1", "text": "please stop task 4"})
+    else:
+        sl.msgs.append({"ts": f"{t0 + 2:.6f}", "user": "U1", "text": "please stop task 4", "thread_ts": ask})
+    real = DB.set_kv
+
+    def cursor_fails(self, key, value):
+        if key == cursor:
+            raise sqlite3.OperationalError("disk I/O error")
+        return real(self, key, value)
+    monkeypatch.setattr(DB, "set_kv", cursor_fails)
+    with pytest.raises(sqlite3.OperationalError):
+        poll(scan=True)
+    monkeypatch.setattr(DB, "set_kv", real)
+    poll(scan=True)
+    poll(scan=True)
+    assert _slack_in(p) == ["please stop task 4"], "the coordinator would act on one instruction twice"
