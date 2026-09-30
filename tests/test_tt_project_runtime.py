@@ -6077,7 +6077,7 @@ def test_machines_list_is_per_user_and_managed_by_ttp_machines(env, capsys):
     assert got["box-a"]["tags"] == ["device", "n300"] and got["box-a"]["note"] == "the rack board"
     assert got["box-b"]["tags"] == ["device"]
     mm.add("box-a", tags="device")   # a note left out keeps the old one
-    assert mm.load()["box-a"] == {**got["box-a"], "tags": ["device"]}
+    assert mm.load()["box-a"] == {**got["box-a"], "tags": ["device"], "updated": mm.load()["box-a"]["updated"]}
     for bad in ("", "-x", "a b", "box/a"):
         with pytest.raises(ValueError):
             mm.add(bad, tags="device")
@@ -6090,6 +6090,118 @@ def test_machines_list_is_per_user_and_managed_by_ttp_machines(env, capsys):
     assert set(mm.load()) == {"box-a"}
     with pytest.raises(SystemExit):
         main(["machines", "remove", "box-b"])
+
+
+def _fake_ssh(monkeypatch, remote_home, calls, between=None):
+    """ssh HOST CMD runs CMD locally with HOME=remote_home, so the remote side's script really runs."""
+    from ttp import machines as mm
+    real = subprocess.run
+
+    def run(args, **kw):
+        assert args[0] == "ssh" and "BatchMode=yes" in args
+        calls.append(args[-2])
+        if between and "python3" in args[-1]:
+            between()
+        return real(["bash", "-c", args[-1]], env={**os.environ, "HOME": str(remote_home)}, **kw)
+    monkeypatch.setattr(mm.subprocess, "run", run)
+
+
+def test_machines_lists_merge_alias_by_alias_newest_change_wins(env):
+    from ttp import machines as mm
+    mine = {"machines": {"a": {"tags": ["x"], "updated": 10}, "b": {"tags": ["x"], "added": 5},
+                         "c": {"tags": ["mine"], "updated": 7}},
+            "removed": {"d": 20}}
+    theirs = {"machines": {"a": {"tags": ["old"], "updated": 3}, "b": {"tags": ["newer"], "updated": 9},
+                           "d": {"tags": ["x"], "updated": 15}, "z": {"tags": ["theirs"], "updated": 1}},
+              "removed": {"c": 7}}
+    got = mm.merge(mine, theirs)
+    assert got["machines"]["a"]["tags"] == ["x"]            # mine is newer
+    assert got["machines"]["b"]["tags"] == ["newer"]        # theirs is newer: kept, not overwritten
+    assert got["machines"]["c"]["tags"] == ["mine"]         # a tie keeps the machine
+    assert got["machines"]["z"]["tags"] == ["theirs"]       # only there: kept
+    assert "d" not in got["machines"] and got["removed"] == {"d": 20}   # removed after their last change
+    assert mm.merge(theirs, {}) == mm.merge({}, theirs) and mm.merge({}, {}) == {"machines": {}}
+
+
+def test_machines_push_copies_the_list_merged_mode_600(env, tmp_path, monkeypatch):
+    from ttp import machines as mm
+    remote = tmp_path / "remote"
+    remote.mkdir()
+    rfile = remote / ".tt-project" / "machines.json"
+    calls = []
+    _fake_ssh(monkeypatch, remote, calls)
+    assert mm.push("far") == "no machines list to copy" and not rfile.exists()
+    mm.add("box-a", tags="device")
+    mm.add("box-b", tags="device", note="local")
+    assert mm.push("far") == "copied the machines list (2 machines) to far"
+    assert stat.S_IMODE(rfile.stat().st_mode) == 0o600
+    assert json.loads(rfile.read_text())["machines"] == mm.load()
+    assert mm.push("far") == "machines list on far is up to date (2 machines)"
+    # edited there after the copy: a newer box-b and a machine only that side knows
+    there = json.loads(rfile.read_text())
+    there["machines"]["box-b"] = {"tags": ["device"], "note": "edited there", "updated": time.time() + 60}
+    there["machines"]["box-z"] = {"tags": ["x"], "updated": time.time()}
+    rfile.write_text(json.dumps(there))
+    mm.add("box-c", tags="device")
+    assert mm.push("far") == "copied the machines list (4 machines) to far"
+    got = json.loads(rfile.read_text())["machines"]
+    assert got["box-b"]["note"] == "edited there" and "box-z" in got and "box-c" in got
+    assert mm.load()["box-b"]["note"] == "local"             # the push never changes this side
+    mm.remove("box-a")
+    mm.push("far")
+    got = json.loads(rfile.read_text())
+    assert "box-a" not in got["machines"] and "box-a" in got["removed"]
+    assert stat.S_IMODE(rfile.stat().st_mode) == 0o600
+    rfile.write_text("{not json")
+    assert "left the machines list on far alone" in mm.push("far") and rfile.read_text() == "{not json"
+
+
+def test_machines_push_rereads_a_list_that_changed_during_the_copy(env, tmp_path, monkeypatch):
+    from ttp import machines as mm
+    remote = tmp_path / "remote"
+    rfile = remote / ".tt-project" / "machines.json"
+    rfile.parent.mkdir(parents=True)
+    rfile.write_text(json.dumps({"machines": {"box-y": {"tags": ["x"], "updated": 1}}}))
+    done = []
+
+    def edit_there():       # someone adds a machine there between the read and the write, once
+        if not done:
+            done.append(1)
+            doc = json.loads(rfile.read_text())
+            doc["machines"]["box-w"] = {"tags": ["x"], "updated": time.time()}
+            rfile.write_text(json.dumps(doc))
+    calls = []
+    _fake_ssh(monkeypatch, remote, calls, between=edit_there)
+    mm.add("box-a", tags="device")
+    assert mm.push("far") == "copied the machines list (3 machines) to far"
+    assert set(json.loads(rfile.read_text())["machines"]) == {"box-a", "box-w", "box-y"}
+    assert len(calls) == 4      # read, refused write, read again, write
+
+
+def test_machine_changes_are_copied_to_remote_project_machines(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli
+    from ttp import machines as mm
+    from ttp.project import register
+    pushed = []
+    monkeypatch.setattr(mm, "push", lambda host: pushed.append(host) or f"pushed {host}")
+    cli.main(["machines", "add", "box-a", "--tags", "device"])
+    assert pushed == []                                     # no projects elsewhere: no ssh
+    register("far1", {"host": "far", "dir": "/p1"})
+    register("far2", {"host": "far", "dir": "/p2"})
+    register("via", {"host": "other", "ssh": "other-alias", "dir": "/p3"})
+    register("here", {"host": "testhost", "dir": str(tmp_path)})
+    cli.main(["machines", "add", "box-b", "--tags", "device"])
+    assert pushed == ["far", "other-alias"]
+    cli.main(["machines", "remove", "box-b"])
+    cli.main(["machines", "push", "--host", "only"])
+    assert pushed == ["far", "other-alias"] * 2 + ["only"]
+    assert "pushed only" in capsys.readouterr().out
+    monkeypatch.setattr(cli, "ship_runtime", lambda host: pushed.append(f"ship {host}"))
+    monkeypatch.setattr(cli, "forward", lambda entry, argv: 0)
+    pushed.clear()
+    with pytest.raises(SystemExit):
+        cli.main(["upgrade", "via"])
+    assert pushed == ["ship other-alias", "other-alias"]    # upgrade copies it with the runtime
 
 
 def _bad_runs(p, tid, n, status="failed", ago=60):

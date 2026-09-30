@@ -11,12 +11,19 @@ A resource is in trouble when the tasks using it keep failing in the last 24 h: 
 stalled, timed out or were lost, hand-offs that failed or blocked, host reboots while it was held.
 The coordinator routes around it: the tasks move to a machine the charter allows that shares its
 tags. Many waits alone also show up, but only as a hint: a busy resource is not a broken one.
+
+A project created with --host runs its daemon on that machine, which reads its own copy of the list.
+`push` copies the list there, merged alias by alias with what is there: the newest change wins, a
+removal included, so a list edited on that machine is never overwritten by an older one.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import shlex
+import subprocess
 import time
 from pathlib import Path
 from typing import Any
@@ -36,19 +43,28 @@ def path() -> Path:
     return project.HOME_DIR / "machines.json"
 
 
-def load() -> dict[str, dict]:
-    """{alias: {"tags": [...], "note": str, "added": ts}}; {} when there is no list yet."""
+def _doc() -> dict:
     try:
         data = json.loads(path().read_text())
     except (FileNotFoundError, ValueError):
         return {}
-    got = data.get("machines") if isinstance(data, dict) else None
-    return {k: v for k, v in got.items() if isinstance(v, dict)} if isinstance(got, dict) else {}
+    return data if isinstance(data, dict) else {}
 
 
-def _save(machines: dict[str, dict]) -> None:
+def _part(doc: dict, key: str) -> dict:
+    got = doc.get(key)
+    return got if isinstance(got, dict) else {}
+
+
+def load() -> dict[str, dict]:
+    """{alias: {"tags": [...], "note": str, "added": ts, "updated": ts}}; {} when there is no list yet."""
+    return {k: v for k, v in _part(_doc(), "machines").items() if isinstance(v, dict)}
+
+
+def _save(machines: dict[str, dict], removed: dict[str, float]) -> None:
+    """`removed` keeps when each alias was removed, so copies elsewhere learn of the removal."""
     project.HOME_DIR.mkdir(parents=True, exist_ok=True)
-    project.write_json(path(), {"machines": machines})
+    project.write_json(path(), {"machines": machines, **({"removed": removed} if removed else {})})
     os.chmod(path(), 0o600)
 
 
@@ -70,22 +86,95 @@ def add(alias: str, tags: Any = None, note: str | None = None) -> dict:
     alias = (alias or "").strip()
     if not ALIAS_RE.fullmatch(alias):
         raise ValueError(f"not a machine alias: {alias!r} (letters, digits and _.@+- only)")
-    machines = load()
+    doc = _doc()
+    machines, removed = load(), dict(_part(doc, "removed"))
     old = machines.get(alias) or {}
+    now = time.time()
     entry = {"tags": tag_list(tags) if tags is not None else old.get("tags", []),
              "note": " ".join(str(note).split())[:NOTE_CHARS] if note is not None else old.get("note", ""),
-             "added": old.get("added") or time.time()}
+             "added": old.get("added") or now, "updated": now}
     machines[alias] = entry
-    _save(machines)
+    removed.pop(alias, None)
+    _save(machines, removed)
     return entry
 
 
 def remove(alias: str) -> bool:
-    machines = load()
-    if machines.pop((alias or "").strip(), None) is None:
+    alias = (alias or "").strip()
+    machines, removed = load(), dict(_part(_doc(), "removed"))
+    if machines.pop(alias, None) is None:
         return False
-    _save(machines)
+    removed[alias] = time.time()
+    _save(machines, removed)
     return True
+
+
+def _when(v: Any) -> float:
+    try:
+        return float(v or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def merge(mine: dict, theirs: dict) -> dict:
+    """Two copies of the list as one, alias by alias: the newest change wins, a removal included.
+    On a tie a machine beats a removal (nothing is lost) and `mine` beats `theirs`."""
+    machines, removed = {}, {}
+    ours = (_part(mine, "machines"), _part(mine, "removed"))
+    other = (_part(theirs, "machines"), _part(theirs, "removed"))
+    for alias in set().union(*ours, *other):
+        best = None
+        for rank, (ms, rs) in ((1, ours), (0, other)):
+            m = ms.get(alias)
+            if isinstance(m, dict):
+                best = max(best or (), (_when(m.get("updated") or m.get("added")), 1, rank, m))
+            if alias in rs:
+                best = max(best or (), (_when(rs[alias]), 0, rank, rs[alias]))
+        if best and best[1]:
+            machines[alias] = best[3]
+        elif best:
+            removed[alias] = best[0]
+    return {"machines": machines, **({"removed": removed} if removed else {})}
+
+
+SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15"]
+REMOTE = "~/.tt-project/machines.json"
+# Replaces the remote list only if it is still the one read (sha256 of its text), mode 0600.
+_WRITE = ("import hashlib,json,os,sys;h=os.path.expanduser('~/.tt-project');os.makedirs(h,mode=0o700,exist_ok=True);"
+          "p=os.path.join(h,'machines.json');d=json.load(sys.stdin)\n"
+          "try: cur=open(p,'rb').read()\nexcept FileNotFoundError: cur=b''\n"
+          "if hashlib.sha256(cur).hexdigest()!=d['expect']: sys.exit(3)\n"
+          "fd=os.open(p+'.tmp',os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600);"
+          "os.write(fd,(json.dumps(d['doc'],indent=2,sort_keys=True)+'\\n').encode());os.close(fd);"
+          "os.chmod(p+'.tmp',0o600);os.replace(p+'.tmp',p)")
+
+
+def push(host: str, tries: int = 3) -> str:
+    """Copy this user's machines list to another machine (same user), merged with the list there.
+    A list there that cannot be read is left alone."""
+    mine = _doc()
+    if not _part(mine, "machines") and not _part(mine, "removed"):
+        return "no machines list to copy"
+    for _ in range(tries):
+        r = subprocess.run([*SSH, host, f"cat {REMOTE} 2>/dev/null || true"], capture_output=True)
+        if r.returncode != 0:
+            return f"could not copy the machines list to {host}: {r.stderr.decode(errors='replace').strip()[-200:]}"
+        try:
+            theirs = json.loads(r.stdout) if r.stdout.strip() else {}
+        except ValueError:
+            theirs = None
+        if not isinstance(theirs, dict):
+            return f"left the machines list on {host} alone: {REMOTE} there is not a valid list"
+        doc = merge(mine, theirs)
+        if doc == merge(theirs, {}):
+            return f"machines list on {host} is up to date ({len(doc['machines'])} machines)"
+        w = subprocess.run([*SSH, host, f"python3 -c {shlex.quote(_WRITE)}"], text=True, capture_output=True,
+                           input=json.dumps({"expect": hashlib.sha256(r.stdout).hexdigest(), "doc": doc}))
+        if w.returncode == 0:
+            return f"copied the machines list ({len(doc['machines'])} machines) to {host}"
+        if w.returncode != 3:
+            return f"could not copy the machines list to {host}: {w.stderr.strip()[-200:]}"
+    return f"could not copy the machines list to {host}: it kept changing there; try `ttp machines push` again"
 
 
 def line(alias: str, m: dict) -> str:

@@ -57,6 +57,13 @@ def remote_entry(name: str) -> dict | None:
     return None
 
 
+def remote_hosts() -> list[str]:
+    """The other machines this user's projects run on (projects created with --host)."""
+    here = hostname()
+    return sorted({e.get("ssh") or e["host"] for e in load_registry().get("projects", {}).values()
+                   if isinstance(e, dict) and e.get("host") and e["host"] != here})
+
+
 def forward_listen(entry: dict, argv: list[str]) -> int:
     """A remote listener outlives network drops: a laptop changes networks, sleeps and wakes.
 
@@ -332,6 +339,8 @@ def new_remote(a, brief: str) -> None:
     ship_runtime(host)
     if load_secrets() and not a.no_secrets:
         print(push_secrets(host))
+    from . import machines as mm
+    print(mm.push(host))        # its daemon reads the machines list there
     args = [f"~/{stage}/bin/ttp", "new", a.name, "--dir", a.dir, "--provider", a.provider or detect_provider()]
     if a.no_service:
         args.append("--no-service")
@@ -789,7 +798,8 @@ def cmd_memory(a) -> None:
 
 def cmd_machines(a) -> None:
     """The user's machines (~/.tt-project/machines.json), shared by all their projects. Each
-    project's charter says which of them it may use; its coordinator routes work only to those."""
+    project's charter says which of them it may use; its coordinator routes work only to those.
+    A project created with --host reads the copy on its machine: changes are copied there, merged."""
     from . import machines as mm
     if a.action == "add":
         try:
@@ -801,6 +811,12 @@ def cmd_machines(a) -> None:
         if not mm.remove(a.alias):
             die(f"no machine {a.alias!r} in {mm.path()}")
         print(f"removed {a.alias}")
+    if a.action in ("add", "remove", "push"):
+        hosts = [a.host] if getattr(a, "host", None) else remote_hosts()
+        if a.action == "push" and not hosts:
+            print("no projects on other machines; nothing to copy")
+        for host in hosts:
+            print(mm.push(host))
     else:
         known = mm.load()
         if a.json:
@@ -962,7 +978,9 @@ def cmd_upgrade(a) -> None:
     template snapshots on its `upstream` branch, so this is an ordinary three-way merge."""
     entry = remote_entry(a.name)
     if entry and not local_project(a.name):
+        from . import machines as mm
         ship_runtime(entry.get("ssh") or entry["host"])      # the newer runtime becomes that machine's ttp
+        print(mm.push(entry.get("ssh") or entry["host"]))
         sys.exit(forward(entry, sys.argv[1:]))
     p = need(a.name, sys.argv[1:])
     from .project import HOME_DIR
@@ -1210,7 +1228,7 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--kind", default="fact")
     s.set_defaults(fn=cmd_memory)
 
-    s = sub.add_parser("machines", help="your machines, shared by all your projects (add/list/remove)")
+    s = sub.add_parser("machines", help="your machines, shared by all your projects (add/list/remove/push)")
     ms = s.add_subparsers(dest="action", required=True)
     m = ms.add_parser("add", help="add a machine, or change its tags or note")
     m.add_argument("alias", help="a short name, also used as the resource name in tasks (e.g. box-a)")
@@ -1220,6 +1238,8 @@ def main(argv: list[str] | None = None) -> None:
     m.add_argument("--json", action="store_true")
     m = ms.add_parser("remove", help="remove a machine")
     m.add_argument("alias")
+    m = ms.add_parser("push", help="copy the list to the machines your --host projects run on, merged")
+    m.add_argument("--host", help="only this machine")
     s.set_defaults(fn=cmd_machines)
 
     for name in ("pause", "resume"):
