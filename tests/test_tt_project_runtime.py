@@ -4848,6 +4848,8 @@ def test_the_third_reboot_with_lost_runs_in_a_day_raises_one_high_alert(env, tmp
     from ttp.daemon import Daemon
     _boot_as(monkeypatch, "boot-0")
     Daemon(p.base).tick()
+    # Paused, the ticks still reap and tell, but start no run that the next boot would find running.
+    p.db.set_kv("paused", True)
     for i in range(1, 5):
         (tmp_path / f"b{i}").mkdir()
         _lost_deep_runs(p, tmp_path / f"b{i}", f"boot-{i - 1}", costs=(1.0,))

@@ -394,7 +394,7 @@ class Daemon:
             now = time.time()
             usd = sum(float(r["cost_usd"] or 0) for r in lost)
             held = list(prev.get("held") or [])
-            booted = runner.boot_time()
+            booted = self.boot_at
             data = {"boot": self.boot, "boot_time": booted, "prev_boot": prev.get("prev_boot"),
                     "last_heartbeat": prev.get("last_heartbeat"), "held": held, "lost_usd": round(usd, 2),
                     "lost": [{"run": r["id"], "task": r["task"], "role": r["role"],
