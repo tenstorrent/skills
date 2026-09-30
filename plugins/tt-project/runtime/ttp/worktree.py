@@ -97,8 +97,9 @@ def resolve_base(p: Project) -> str:
 
 def remove(p: Project, task_id: int) -> None:
     """Remove a task's worktree; its branch stays. Call only once keep_reason() found nothing to lose.
-    Ignored files go with it. No --force: git itself then refuses a worktree with changes or with
-    submodules, whose commits may live only in the worktree's own git directory."""
+    Ignored files go with it (sweep keeps one holding hand-off artifacts). No --force: git itself then
+    refuses a worktree with changes or with submodules, whose commits may live only in the worktree's
+    own git directory."""
     path = p.worktrees / f"t{task_id}"
     if path.exists():
         _git(p.root, "worktree", "remove", str(path))
@@ -124,7 +125,7 @@ def keep_reason(path: Path) -> str | None:
     if inited or (modules.is_dir() and any(modules.iterdir())):
         return ("has submodules set up (" + (", ".join(inited[:3]) or "modules/") + "); their commits may exist "
                 "only here, so it is never removed automatically")
-    st = git("status", "--porcelain", "--ignore-submodules=none")
+    st = git("status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=none")
     if st.returncode != 0:
         return "git status failed"
     dirty = st.stdout.splitlines()
@@ -143,19 +144,82 @@ CACHE_DIRS = ["build", "_build", "cmake-build-*", ".cache", "__pycache__", ".pyt
               ".gradle", ".ccache"]
 
 
-def clear_caches(path: Path, names: list[str] | None = None) -> list[str]:
+def _ignored(path: Path) -> set[str] | None:
+    """Git-ignored entries in a worktree, relative to it. With --directory git lists a directory
+    itself only when everything in it is ignored. None when git fails."""
+    out = subprocess.run(["git", "-C", str(path), "ls-files", "--others", "--ignored", "--exclude-standard",
+                          "--directory", "-z"], capture_output=True, text=True, timeout=300)
+    return {e.rstrip("/") for e in out.stdout.split("\0") if e} if out.returncode == 0 else None
+
+
+def _handoff_paths(p: Project, task_id: int) -> list[str]:
+    """The `artifacts` of every hand-off (result.json) the task's runs wrote."""
+    import json
+    out = []
+    for r in p.db.q("SELECT id, dir FROM runs WHERE task=?", (task_id,)):
+        try:
+            data = json.loads(((Path(r["dir"]) if r["dir"] else p.runs / str(r["id"])) / "result.json").read_text())
+        except (OSError, ValueError):
+            continue
+        arts = data.get("artifacts") if isinstance(data, dict) else None
+        out += [a for a in arts if isinstance(a, str)] if isinstance(arts, list) else []
+    return out
+
+
+def _existing(entry: str, bases: list[Path]) -> Path | None:
+    """The file an artifact entry names, or None. Entries may be absolute or relative to one of
+    `bases`, and may carry trailing text ("out.mp4 (the video)", "run.log:12"), so the longest
+    leading part that exists wins."""
+    words = entry.strip().split()
+    for n in range(len(words), 0, -1):
+        text = " ".join(words[:n])
+        for cand in dict.fromkeys((text, text.rstrip(".,;:)]}'\"`"), re.sub(r"(:\d+)+[.,;:]?$", "", text))):
+            cand = cand.strip("'\"`(")
+            if not cand or "://" in cand:
+                continue
+            q = Path(cand).expanduser()
+            for full in ([q] if q.is_absolute() else [b / q for b in bases]):
+                try:
+                    if full.exists():
+                        return full
+                except OSError:
+                    continue
+    return None
+
+
+def handoff_artifacts(p: Project, task_id: int, path: Path, ignored: set[str] | None = None) -> list[str]:
+    """Hand-off artifacts of the task (its result.json `artifacts`) that still exist inside its
+    worktree and that git ignores, relative to the worktree. `git worktree remove` deletes ignored
+    files, and only those: tracked ones are on the branch, other untracked ones keep the worktree."""
+    ignored = _ignored(path) if ignored is None else ignored
+    if not ignored:
+        return []
+    root = path.resolve()
+    found: list[str] = []
+    for entry in _handoff_paths(p, task_id):
+        full = _existing(entry, [path, p.root])
+        if full is None:
+            continue
+        try:
+            rel = full.resolve().relative_to(root).as_posix()
+        except (OSError, ValueError):
+            continue
+        if rel != "." and rel not in found and any(
+                rel == e or rel.startswith(e + "/") or e.startswith(rel + "/") for e in ignored):
+            found.append(rel)
+    return found
+
+
+def clear_caches(path: Path, names: list[str] | None = None, keep: list[str] = ()) -> list[str]:
     """Delete ignored build and cache directories in a worktree. A cache-named directory goes only
-    when git ignores it wholly; else just the ignored entries named like one inside it. Returns
-    what went."""
+    when git ignores it wholly; else just the ignored entries named like one inside it. Nothing that
+    is, holds or lies in a path of `keep` (hand-off artifacts) goes. Returns what went."""
     import fnmatch
     import shutil
     pats = CACHE_DIRS if names is None else names
-    out = subprocess.run(["git", "-C", str(path), "ls-files", "--others", "--ignored", "--exclude-standard",
-                          "--directory", "-z"], capture_output=True, text=True, timeout=300)
-    if out.returncode != 0:
+    listed = _ignored(path)
+    if listed is None:
         return []
-    # With --directory git lists a directory itself only when everything in it is ignored.
-    listed = {e.rstrip("/") for e in out.stdout.split("\0") if e}
     found: set[str] = set()
     for entry in listed:
         parts = entry.split("/")
@@ -166,7 +230,8 @@ def clear_caches(path: Path, names: list[str] | None = None) -> list[str]:
                 break
     gone = []
     for rel in sorted(found):
-        if any(rel.startswith(g + "/") for g in gone):
+        if any(rel.startswith(g + "/") for g in gone) or any(
+                k == rel or k.startswith(rel + "/") or rel.startswith(k + "/") for k in keep):
             continue
         target = path / rel
         try:
@@ -217,7 +282,8 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
           skip=lambda task: False) -> list[dict]:
     """Tidy the worktrees of finished tasks (done, failed, cancelled) with no run still going: clear
     their build and cache directories, then remove each one whose removal loses nothing (see
-    keep_reason). A worktree that may still be wanted (see held_by: an unfinished task needs it, the
+    keep_reason) and that holds none of the task's hand-off artifacts (see handoff_artifacts:
+    `git worktree remove` deletes ignored files, where workers often leave them). A worktree that may still be wanted (see held_by: an unfinished task needs it, the
     coordinator has not seen the finish yet, or it ended under FINISH_GRACE_S ago) is left as it
     is, and reported with `held` set. Branches stay, so a task that `continues` one starts from its
     commits. One sweep at a time per project; a busy lock returns no results."""
@@ -251,8 +317,12 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
                 out.append({**res, "cleared": [], "held": True, "why": why})
                 continue
             try:
-                res["cleared"] = clear_caches(path, names)
-                res["why"] = keep_reason(path)
+                arts = handoff_artifacts(p, task["id"], path)
+                res["cleared"] = clear_caches(path, names, keep=arts)
+                res["why"] = keep_reason(path) or (
+                    f"hand-off artifacts inside: {', '.join(arts[:3])}"[:200] + (f" (+{len(arts) - 3} more)"
+                                                                               if len(arts) > 3 else "")
+                    if arts else None)
                 if res["why"] is None:
                     remove(p, task["id"])
             except Exception as e:

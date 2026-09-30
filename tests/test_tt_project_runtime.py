@@ -2876,6 +2876,51 @@ def test_an_untracked_file_in_a_tracked_build_directory_keeps_the_worktree(env, 
     assert res["cleared"] == [] and "uncommitted" in res["why"] and path.exists()
 
 
+def _handoff(p, tid, artifacts):
+    run = p.db.x("INSERT INTO runs(role,provider,started,status,task) VALUES('worker','fake',?,'done',?)",
+                 (time.time(), tid))
+    d = p.runs / str(run)
+    d.mkdir(parents=True)
+    p.db.x("UPDATE runs SET dir=? WHERE id=?", (str(d), run))
+    (d / "result.json").write_text(json.dumps({"status": "done", "summary": "s", "artifacts": artifacts}))
+
+
+def test_ignored_hand_off_artifacts_keep_the_worktree_and_other_ignored_files_do_not(env, monkeypatch):
+    # `git worktree remove` deletes ignored files, and workers often leave their hand-off there.
+    p = make(env)
+    _no_grace(monkeypatch)
+    from ttp import worktree
+    exclude = pathlib.Path(_git_out(p.root, "rev-parse", "--git-common-dir"))
+    exclude = (exclude if exclude.is_absolute() else p.root / exclude) / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    exclude.write_text("tmp/\nbuild/\n")
+    tid, path, _ = _code_task(p, "render")
+    _commit_file(path, "tracked")
+    (path / "tmp" / "out").mkdir(parents=True)
+    (path / "tmp" / "out" / "new.mp4").write_bytes(b"video")
+    (path / "tmp" / "NEXT.md").write_text("notes\n")
+    (path / "build").mkdir()
+    (path / "build" / "model.pt").write_bytes(b"weights")
+    rel_root = path.relative_to(p.root).as_posix()
+    _handoff(p, tid, [f"{rel_root}/tmp/out/new.mp4 (the render)", f"{path}/tmp/NEXT.md:3", "build/model.pt",
+                      "tracked.txt", "https://example.com/x", "tmp/gone.log"])
+    t2, other, _ = _code_task(p, "scratch only")
+    _commit_file(other, "tracked")
+    (other / "tmp").mkdir()
+    (other / "tmp" / "scratch.log").write_text("not handed off")
+    _handoff(p, t2, ["tracked.txt", str(path / "tmp" / "out" / "new.mp4")])
+    # status.showUntrackedFiles=no must not hide a new, not ignored file.
+    _git_out(p.root, "config", "status.showUntrackedFiles", "no")
+    t3, hidden, _ = _code_task(p, "untracked")
+    (hidden / "new.py").write_text("uncommitted work\n")
+    res = {r["task"]: r for r in worktree.sweep(p)}
+    assert (path / "tmp" / "out" / "new.mp4").read_bytes() == b"video", "a hand-off artifact was lost"
+    assert (path / "build" / "model.pt").exists(), "a hand-off artifact in a cache directory was cleared"
+    assert res[tid]["why"].startswith("hand-off artifacts inside: tmp/out/new.mp4, tmp/NEXT.md, build/model.pt")
+    assert not other.exists() and res[t2]["why"] is None, "an ignored file nobody handed off kept the worktree"
+    assert (hidden / "new.py").exists() and "uncommitted" in res[t3]["why"]
+
+
 def test_a_finished_worktree_stays_while_an_unfinished_task_still_needs_it(env, monkeypatch):
     p = make(env)
     _no_grace(monkeypatch)
