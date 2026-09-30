@@ -69,6 +69,7 @@ RECENT_OUT = 5                       # outbound messages the digest repeats, so 
 NOTE_CHARS = 140
 FINISHED_ROWS, FINISHED_CHARS = 10, 120
 SENT_CHARS = 100
+HANDOFF_KINDS = ("task_done", "task_failed", "task_cancelled", "cancelled_but_done")
 MAX_TASKS_PER_DAY = 1000
 ASK_DEFAULTS_KEY = "ask_defaults"   # kv: {ask message id: recommendation}; no new ask is added
 _DEFAULT_NOTE = "\n\nIf there is no answer within "
@@ -141,8 +142,9 @@ def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int]) ->
         lines.append("- (none)")
     events = (db.q(f"SELECT * FROM events WHERE id IN ({','.join('?' * len(event_ids))}) ORDER BY id", event_ids)
               if event_ids else [])
-    # A task finishing this turn has its full hand-off under NEW EVENTS.
-    in_events = {e["source"] for e in events}
+    # A task finishing this turn has its full hand-off under NEW EVENTS. Only a hand-off counts:
+    # a batch of at most max_events_per_turn can split it from its follow-ups or a retry event.
+    in_events = {e["source"] for e in events if e["kind"] in HANDOFF_KINDS}
     finished = db.q("SELECT * FROM tasks WHERE status IN ('done','failed','cancelled') AND updated>? "
                     "ORDER BY updated DESC LIMIT ?", (now - 172800, FINISHED_ROWS))
     if finished:

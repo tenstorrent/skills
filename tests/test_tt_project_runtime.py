@@ -1853,6 +1853,10 @@ def test_the_digest_cuts_background_rows_but_keeps_new_events_whole(env):
     assert sent.endswith("word…") and len(sent) < coord.SENT_CHARS + 40
     assert "## Recurring" not in d and "## Chats attached" not in d, "empty sections are still shown"
     assert ("fresh hand-off " + long)[:1500] in d.split("# NEW EVENTS")[1], "a new event was cut short"
+    # A follow-up alone (its hand-off was in an earlier batch) does not stand in for the summary.
+    fup = p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                 (time.time(), f"task:{done}", "followup_proposed", "normal", "proposed follow-up: x", "new"))
+    assert f"#{done} done: fresh task — fresh word" in coord.digest(p, {}, [fup], [])
 
 
 def test_clip_cuts_at_a_word_and_marks_the_cut():
