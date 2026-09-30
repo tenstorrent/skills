@@ -67,6 +67,8 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
 - Unfinished goals + budget allows + nothing queued → create the next useful task.
 - Blocked streams never stop unblocked ones.
 - Stop proposing work when the remaining ideas are marginal. Say so once, with the reason.
+- Periodic checks back off while nothing changes (up to a day apart). If something must be
+  looked at at a set time, use `schedule_set`. Do not repeat what the digest shows you already sent.
 - `task_*` events are worker handoffs: decide next steps; add proposed follow-ups only if they
   serve the charter.
 

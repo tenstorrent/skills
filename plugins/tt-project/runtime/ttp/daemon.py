@@ -12,6 +12,7 @@ Invariants:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -41,6 +42,8 @@ TICK_S = 3.0
 LEASE_STALE_S = 180
 HEARTBEAT_STALE_S = 300   # longer than any single tick step (a git fetch, a watcher command)
 RESULT_FILE = "result.json"
+PROBE_EVERY_S = 180     # how often a waiting task's `retry_when` probe runs
+PROBE_TIMEOUT_S = 60
 
 
 def log(p: Project, msg: str) -> None:
@@ -69,6 +72,8 @@ class Daemon:
         self._last_prune = 0.0
         self._disk_low: bool | None = None   # unknown until checked
         self._tick_errors = 0
+        self._probes: dict[int, tuple[subprocess.Popen, float]] = {}
+        self._probed: dict[int, float] = {}
 
     # lifecycle ------------------------------------------------------------------------------------
     def run(self) -> int:
@@ -160,6 +165,7 @@ class Daemon:
         self.run_schedules()
         self.poll_slack()
         self.maybe_coordinate()
+        self.probe_waiting()
         self.dispatch()
         self.deliver_outbound()
 
@@ -387,10 +393,28 @@ class Daemon:
         evs = note.get("events", [])
         if evs:
             db.x(f"UPDATE events SET status='handled' WHERE id IN ({','.join('?' * len(evs))})", evs)
-        if problems:
-            db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
-                 (time.time(), "daemon", "rejected_actions", "normal", "; ".join(problems)[:1500], "queued"))
+        self._record_rejections([x[:500] for x in problems])
         db.set_kv("last_coordinator_summary", {"ts": time.time(), "summary": (out or {}).get("summary", "")})
+
+    def _record_rejections(self, problems: list[str]) -> None:
+        """Rejected actions reach the next turn's digest; they never start a turn by themselves.
+        A rejection repeated on consecutive turns is a harness problem and is recorded once."""
+        db = self.p.db
+        before = set(db.kv(coord.REJECTED_KEY, []) or [])
+        db.set_kv(coord.REJECTED_KEY, problems)
+        if not problems:
+            return
+        db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+             (time.time(), "daemon", "rejected_actions", "normal", "; ".join(problems)[:1500], "handled"))
+        seen = db.kv("rejected_repeats", []) or []
+        for x in problems:
+            key = hashlib.sha256(x.encode()).hexdigest()[:16]
+            if x in before and key not in seen:
+                seen.append(key)
+                db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                     (time.time(), "harness", "rejected_repeat", "normal",
+                      f"The coordinator repeated an action that was rejected: {x}", "handled"))
+        db.set_kv("rejected_repeats", seen[-50:])
 
     def _coordinator_failed(self, why: str) -> None:
         db = self.p.db
@@ -652,18 +676,29 @@ class Daemon:
         evs = db.q("SELECT id, ts FROM events WHERE status='queued' ORDER BY id LIMIT ?",
                    (int(c.get("max_events_per_turn", 40)),))
         idle_due = False
+        wake: dict = {}
         if not msgs and not evs:
             busy = db.one("SELECT id FROM tasks WHERE status IN ('queued','running')")
             last = float(db.kv("last_coordinator_turn", 0))
             gate = self.gates.get(self.cfg.get("core_provider", "claude"))
-            idle_due = (not busy and now - last > float(c.get("idle_wake_s", 1800))
+            if now - last <= min(float(c.get("idle_wake_s", 3600)), float(c.get("starve_wake_s", 300))):
+                return
+            # A wake turn that met the same state as the previous one had nothing new to decide:
+            # each such repeat doubles the wait, up to a day. Explicit check-backs use schedules.
+            fp = self._wake_fingerprint()
+            prev = db.kv("idle_wake", {}) or {}
+            repeats = int(prev.get("n", 0)) if prev.get("fp") == fp else 0
+            backoff = min(float(c.get("idle_wake_s", 3600)) * 2 ** repeats, 86400.0) if repeats else 0.0
+            idle_due = (not busy and now - last > max(float(c.get("idle_wake_s", 3600)), backoff)
                         and (gate is None or gate.allow_optional))
             # Paid capacity sitting idle: worker slots are free and nothing is ready to run. Ask the
             # coordinator for more independent work well before the idle wake would.
             starved = (gate is not None and gate.allow_new_work and self._free_slots(gate) > 0
-                       and not self._dispatchable() and now - last > float(c.get("starve_wake_s", 300)))
+                       and not self._dispatchable()
+                       and now - last > max(float(c.get("starve_wake_s", 300)), backoff))
             if not (idle_due or starved):
                 return
+            wake = {"fp": fp, "n": repeats + 1}
         else:
             newest = max([m["ts"] for m in msgs] + [e["ts"] for e in evs])
             oldest = min([m["ts"] for m in msgs] + [e["ts"] for e in evs])
@@ -696,6 +731,24 @@ class Daemon:
             self._coordinator_failed(f"could not start: {type(e).__name__}: {e}"[:250])
             return
         db.set_kv("last_coordinator_turn", now)
+        db.set_kv("idle_wake", wake)
+
+    def _wake_fingerprint(self) -> str:
+        """The state a wake turn decides on. Running counts as queued: dispatch moves tasks between
+        the two without the coordinator. Spend numbers are left out; gate levels carry them."""
+        db, p = self.p.db, self.p
+        tasks = [(t["id"], "queued" if t["status"] == "running" else t["status"], t["priority"], t["depends_on"])
+                 for t in db.q("SELECT id, status, priority, depends_on FROM tasks "
+                               "WHERE status NOT IN ('done','failed','cancelled') ORDER BY id")]
+        asks = [r["id"] for r in db.q("SELECT id FROM messages WHERE kind='ask' AND handled=0 ORDER BY id")]
+        scheds = [(s["name"], s["enabled"], s["every_s"], s["at"])
+                  for s in db.q("SELECT name, enabled, every_s, at FROM schedules ORDER BY name")]
+        gates = sorted((k, g.level, g.allow_new_work) for k, g in self.gates.items())
+        files = [p.charter_path, p.config_path, p.memory_index,
+                 *(p.memory_dir.iterdir() if p.memory_dir.is_dir() else [])]
+        mtimes = sorted((f.name, f.stat().st_mtime) for f in files if f.exists())
+        blob = json.dumps([tasks, asks, scheds, gates, mtimes], default=str)
+        return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
     # workers ----------------------------------------------------------------------------------------
     def dispatch(self) -> None:
@@ -789,6 +842,39 @@ class Daemon:
                                 f"branch {task['branch'] or '?'} kept")
             except Exception as e:
                 log(self.p, f"worktree {path} not removed: {e}")
+
+    def probe_waiting(self) -> None:
+        """A waiting task may name a shell probe (`retry_when`) for the thing it waits on. The probe
+        runs here, model-free and in the background; when it exits 0 the task is due at once, so no
+        worker run is spent finding out that the wait is not over. `retry_after_s` stays the fallback."""
+        db, now = self.p.db, time.time()
+        for tid, (proc, started) in list(self._probes.items()):
+            rc = proc.poll()
+            if rc is None and now - started < PROBE_TIMEOUT_S:
+                continue
+            del self._probes[tid]
+            if rc is None:
+                _kill_group(proc)
+            elif rc == 0:
+                task = db.task(tid)
+                if task and task["status"] == "queued" and (task["not_before"] or 0) > now:
+                    db.update_task(tid, not_before=now)
+                    log(self.p, f"task {tid} retry_when probe passed; dispatching")
+        for t in db.q("SELECT id, result FROM tasks WHERE status='queued' AND not_before>?", (now,)):
+            prev = load_result(t["result"])
+            probe = prev.get("retry_when")
+            if (prev.get("status") != "waiting" or not isinstance(probe, str) or not probe.strip()
+                    or t["id"] in self._probes or now - self._probed.get(t["id"], 0) < PROBE_EVERY_S):
+                continue
+            self._probed[t["id"]] = now
+            try:
+                proc = subprocess.Popen(probe, shell=True, cwd=str(self.p.root), stdin=subprocess.DEVNULL,
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                        start_new_session=True)
+            except OSError as e:
+                log(self.p, f"task {t['id']} retry_when probe could not start: {e}")
+                continue
+            self._probes[t["id"]] = (proc, now)
 
     def _start_failed(self, task: dict, e: Exception) -> None:
         """Nothing was launched, so no attempt is spent. The task waits a minute before the next try,
@@ -955,6 +1041,14 @@ def _read_result(path: Path) -> dict | None:
         return data if isinstance(data, dict) else None
     except (OSError, ValueError):
         return None
+
+
+def _kill_group(proc: subprocess.Popen) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        pass
+    proc.wait()
 
 
 def _read_pid(path: Path) -> int | None:

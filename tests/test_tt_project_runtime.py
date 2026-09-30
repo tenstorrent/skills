@@ -585,6 +585,8 @@ def test_charter_restrictions_lead_and_close_every_worker_prompt(env):
     prompt = worker_prompt(p, p.db.task(tid), str(p.root), None)
     assert prompt.startswith("# BINDING RESTRICTIONS")
     assert prompt.rstrip().endswith("Never merge to main.")
+    assert prompt.count("Never merge to main.") == 2, "the restrictions are stated more than twice"
+    assert "Go fast." in prompt and "Draft PRs." in prompt
     assert system_prompt(p).startswith("# BINDING RESTRICTIONS")
 
 
@@ -772,10 +774,10 @@ def test_a_requeue_onto_a_dead_dependency_is_rejected_and_reported(env):
                                         "summary": "requeued"}, error="", final_text="")
     d._finish_coordinator({"dir": "x"}, usage, "ok", {})
     assert p.db.task(child)["status"] == "blocked", "a requeue onto a failed dependency was applied"
-    ev = p.db.one("SELECT id, text FROM events WHERE kind='rejected_actions' AND status='queued'")
+    ev = p.db.one("SELECT id, text FROM events WHERE kind='rejected_actions'")
     assert f"#{child} rejected: depends on #{dead} which is failed" in ev["text"]
     assert "drop or replace depends_on" in ev["text"]
-    assert f"#{child} rejected" in coord.digest(p, {}, [ev["id"]], [])
+    assert f"#{child} rejected" in coord.digest(p, {}, [], [])
     problems = coord.apply(p, [{"type": "task_update", "id": child, "depends_on": [dead]}])
     assert problems and "which is failed" in problems[0] and p.db.task(child)["status"] == "blocked"
 
@@ -953,10 +955,10 @@ def test_remote_listener_reconnects_after_a_network_drop(env, monkeypatch):
     assert naps == [5.0, 10.0]
 
 
-def _ask(p, **fields):
+def _ask(p, text="Option A or B?", **fields):
     from ttp import coordinator as coord
     p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")   # the kickoff brief, already read
-    problems = coord.apply(p, [{"type": "ask_user", "text": "Option A or B?", **fields}])
+    problems = coord.apply(p, [{"type": "ask_user", "text": text, **fields}])
     return problems, p.db.one("SELECT * FROM messages WHERE kind='ask' ORDER BY id DESC LIMIT 1")
 
 
@@ -981,9 +983,9 @@ def test_a_reversible_ask_falls_back_to_its_recommendation_after_the_timeout(env
 def test_irreversible_asks_never_time_out(env):
     p = make(env)
     from ttp import coordinator as coord
-    _, firm = _ask(p, reversible=False, recommendation="delete the old data")
-    _, silent = _ask(p, recommendation="use option A")
-    problems, bare = _ask(p, reversible=True)
+    _, firm = _ask(p, "Delete the old data?", reversible=False, recommendation="delete the old data")
+    _, silent = _ask(p, "Option A or C?", recommendation="use option A")
+    problems, bare = _ask(p, "Option B or C?", reversible=True)
     assert problems and "without a recommendation" in problems[0], "a reversible ask with nothing to fall back to"
     assert "within" not in firm["text"]
     assert coord.expire_asks(p, now=time.time() + 1000 * 3600) == []
@@ -1619,3 +1621,104 @@ def test_the_task_creation_valve_opens_only_with_the_user(env):
     assert "approval" in coord.apply(p, [action])[0]
     assert coord.apply(p, [action], user_turn=True) == []
     assert p.config()["coordinator"]["max_new_tasks_per_day"] == 50
+
+
+def _count_turns(d, monkeypatch, clock):
+    """Stub the coordinator launch so wake decisions can be counted over simulated time."""
+    starts = []
+    monkeypatch.setattr(d, "start_run", lambda *a, **k: starts.append(clock[0]))
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    return starts
+
+
+def test_an_idle_project_with_only_blocked_work_backs_off_its_wake_turns(env, monkeypatch):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    for i in range(3):
+        tid = p.db.add_task(f"needs the user {i}", "s", origin="user")
+        p.db.update_task(tid, status="blocked", blocked_reason="waiting for a decision")
+    d.update_gates()
+    clock = [time.time()]
+    starts = _count_turns(d, monkeypatch, clock)
+    day_end = clock[0] + 86400
+    while clock[0] < day_end:
+        d.maybe_coordinate()
+        clock[0] += 60
+    assert 1 <= len(starts) <= 5, f"{len(starts)} wake turns in a day with nothing changing"
+    # A change to the work is noticed at the normal pace again.
+    p.db.update_task(tid, status="queued", blocked_reason=None)
+    p.db.update_task(tid, status="blocked", depends_on=[tid - 1])
+    n = len(starts)
+    for _ in range(int(float(p.config()["coordinator"]["idle_wake_s"]) // 60) + 2):
+        d.maybe_coordinate()
+        clock[0] += 60
+    assert len(starts) == n + 1, "a changed task did not get a wake turn at the normal interval"
+    # A user message still gets a turn within the debounce, whatever the backoff.
+    p.db.post("in", "status?", chat="c1", kind="user")
+    msg_at = clock[0]
+    while len(starts) == n + 1 and clock[0] < msg_at + 4 * float(p.config()["coordinator"]["debounce_s"]):
+        d.maybe_coordinate()
+        clock[0] += 5
+    assert len(starts) == n + 2 and starts[-1] - msg_at <= float(p.config()["coordinator"]["debounce_s"]) + 5
+
+
+def test_a_rejected_action_waits_for_the_next_turn_instead_of_starting_one(env, monkeypatch):
+    p = make(env)
+    from types import SimpleNamespace
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    d.update_gates()
+    bad = SimpleNamespace(structured={"actions": [{"type": "task_update", "id": 999, "status": "queued"}],
+                                      "summary": ""}, error="", final_text="")
+    clock = [time.time()]
+    starts = _count_turns(d, monkeypatch, clock)
+    p.db.set_kv("last_coordinator_turn", clock[0])
+    d._finish_coordinator({"dir": "x"}, bad, "ok", {})
+    clock[0] += 60
+    d.maybe_coordinate()
+    assert starts == [], "a rejected action started a turn on its own"
+    assert "no task #999" in coord.digest(p, {}, [], [])
+    for _ in range(2):
+        d._finish_coordinator({"dir": "x"}, bad, "ok", {})
+    assert len(p.db.q("SELECT id FROM events WHERE kind='rejected_repeat'")) == 1
+    ok = SimpleNamespace(structured={"actions": [{"type": "noop"}], "summary": ""}, error="", final_text="")
+    d._finish_coordinator({"dir": "x"}, ok, "ok", {})
+    assert "no task #999" not in coord.digest(p, {}, [], []), "a fixed rejection kept being shown"
+
+
+def test_an_identical_open_ask_is_not_posted_twice(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    assert _ask(p, "Ship it now or wait?", reversible=True, recommendation="wait")[0] == []
+    problems, _ = _ask(p, "  ship it now   or WAIT? ", reversible=True, recommendation="wait")
+    assert problems and "already asked" in problems[0]
+    assert len(p.db.q("SELECT id FROM messages WHERE kind='ask'")) == 1
+    assert "Ship it now or wait?" in coord.digest(p, {}, [], []).split("## Recently sent to the user")[1]
+
+
+def test_a_waiting_task_runs_only_once_its_probe_passes(env, monkeypatch, tmp_path):
+    p = make(env)
+    from ttp import daemon as dmod
+    flag = tmp_path / "board-free"
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps(
+        {"status": "waiting", "summary": "all boards reserved", "waiting_for": "a free board",
+         "retry_after_s": 3600, "retry_when": f"test -f {shlex.quote(str(flag))}"}))
+    tid = p.db.add_task("measure on a board", "needs a board", kind="work", tier="light", origin="user")
+    d = dmod.Daemon(p.base)
+    assert _run_until(d, p, lambda: p.db.task(tid)["status"] == "queued" and p.db.task(tid)["attempts"] == 0
+                      and p.db.task(tid)["not_before"] and not p.db.q("SELECT id FROM runs WHERE status='running'"))
+    runs = lambda: len(p.db.q("SELECT id FROM runs WHERE task=?", (tid,)))
+    assert runs() == 1
+    for _ in range(6):
+        d.tick()
+        time.sleep(0.2)
+    assert runs() == 1 and d._probed.get(tid), "the task ran while its probe was failing, or never probed"
+    monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps({"status": "done", "summary": "measured"}))
+    flag.write_text("")
+    assert _run_until(d, p, lambda: p.db.task(tid)["status"] == "done", timeout=30)
+    assert runs() == 2

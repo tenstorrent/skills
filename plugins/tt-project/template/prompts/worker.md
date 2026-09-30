@@ -45,6 +45,7 @@ Before you finish, write `$TTP_RUN_DIR/result.json`:
  "question": "only when blocked: the one decision you need",
  "waiting_for": "only when waiting: the busy resource or event",
  "retry_after_s": 1800,
+ "retry_when": "only when waiting: a quick shell check that exits 0 once the wait is over",
  "pr": "URL if you opened or updated one",
  "artifacts": ["paths or URLs"],
  "metrics": {"name": "value"},
@@ -53,7 +54,10 @@ Before you finish, write `$TTP_RUN_DIR/result.json`:
 
 - `done` only with evidence: tests run, numbers measured, files produced.
 - `waiting` when a resource is busy (a machine reservation, a queue, a review). The task comes back
-  after `retry_after_s` without counting as an attempt. Save what you learned first.
+  after `retry_after_s` without counting as an attempt. Save what you learned first. If a
+  command can tell when the wait is over (a job finished, a file exists, a queue is free), give it
+  as `retry_when`: the harness runs it every few minutes in the project root, without a model, and
+  brings the task back as soon as it exits 0. Keep it read-only and under a minute.
 - `blocked` when a human decision, credential or resource is missing. Say exactly what.
 - `failed` when the approach does not work. Say what you learned.
 - A process exiting cleanly is not the task being done. Judge the outcome.

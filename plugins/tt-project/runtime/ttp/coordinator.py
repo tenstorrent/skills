@@ -59,6 +59,8 @@ USER_SETTABLE = {
     "coordinator.ask_timeout_h": float,
 }
 
+REJECTED_KEY = "rejected_actions"   # kv: the last turn's rejected actions, shown in the next digest
+RECENT_OUT = 5                       # outbound messages the digest repeats, so turns do not resend them
 ASK_DEFAULTS_KEY = "ask_defaults"   # kv: {ask message id: recommendation} for reversible asks
 _DEFAULT_NOTE = "\n\nIf there is no answer within "
 
@@ -135,6 +137,12 @@ def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int]) ->
             else:
                 when = "waits for the user"
             lines.append(f"- ask #{b['id']} ({when}): {b['text'][:300]}")
+    sent = db.q("SELECT * FROM messages WHERE direction='out' AND kind IN ('reply','ask','alert') "
+                "ORDER BY id DESC LIMIT ?", (RECENT_OUT,))
+    if sent:
+        lines.append("## Recently sent to the user (do not repeat these)")
+        for m in reversed(sent):
+            lines.append(f"- {m['kind']} #{m['id']}, {(now - m['ts']) / 3600:.1f}h ago: {m['text'][:200]}")
     lines.append("## Chats attached")
     for c in db.q("SELECT id, label, last_active FROM chats ORDER BY last_active DESC LIMIT 10"):
         lines.append(f"- {c['id']} ({c['label'] or 'chat'}), active {(now - (c['last_active'] or now)) / 60:.0f} min ago")
@@ -146,7 +154,10 @@ def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int]) ->
     if event_ids:
         for e in db.q(f"SELECT * FROM events WHERE id IN ({','.join('?' * len(event_ids))}) ORDER BY id", event_ids):
             lines.append(f"- [{e['kind']} from {e['source']}, severity {e['severity']}] {e['text'][:1500]}")
-    if not msg_ids and not event_ids:
+    rejected = db.kv(REJECTED_KEY, []) or []
+    for x in rejected:
+        lines.append(f"- [your previous turn's action was rejected; fix or drop it] {x[:500]}")
+    if not msg_ids and not event_ids and not rejected:
         lines.append("- (none: periodic check — keep work flowing if the charter has unfinished goals)")
     lines.append("\nRespond with the JSON actions object only.")
     return "\n".join(lines)
@@ -248,6 +259,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 hours = ask_timeout_h(cfg)
                 defaults = a.get("reversible") is True and bool(rec) and hours > 0
                 text = a["text"].strip()
+                for o in db.q("SELECT id, text FROM messages WHERE kind='ask' AND handled=0"):
+                    if _same_text(o["text"].split(_DEFAULT_NOTE)[0], text):
+                        raise ValueError(f"already asked as open ask #{o['id']}; it waits for the answer")
                 if defaults:
                     text += f"{_DEFAULT_NOTE}{hours:g}h, I will go with the recommendation: {rec}"
                 with db.tx():
@@ -294,6 +308,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
         except Exception as e:   # one bad action is reported back; it never aborts the turn
             problems.append(f"{t}: {e}")
     return problems
+
+
+def _same_text(a: str, b: str) -> bool:
+    return " ".join(a.lower().split()) == " ".join(b.lower().split())
 
 
 def _new_dependencies(db, task: dict | None, raw: Any) -> list[int]:

@@ -31,6 +31,17 @@ def charter_restrictions(charter: str) -> str:
     return "\n".join(out)
 
 
+def charter_without_restrictions(charter: str) -> str:
+    """The charter minus its `## Restrictions ...` sections, for prompts that already state them."""
+    out, keep = [], True
+    for line in charter.splitlines():
+        if line.startswith("## "):
+            keep = not line[3:].strip().lower().startswith("restriction")
+        if keep:
+            out.append(line)
+    return "\n".join(out)
+
+
 def restrictions_block(p: Project) -> str:
     charter = p.charter_path.read_text() if p.charter_path.exists() else ""
     body = charter_restrictions(charter)
@@ -60,8 +71,10 @@ def worker_prompt(p: Project, task: dict, cwd: str, branch: str | None) -> str:
     addendum = _read(p, f"kind-{kind}.md")
     if addendum:
         parts.append(addendum)
-    parts.append("# CHARTER (goals, restrictions, policies — restrictions are binding)\n" +
-                 (p.charter_path.read_text() if p.charter_path.exists() else "(none)"))
+    # The restrictions open and close this prompt; a third copy inside the charter only costs tokens.
+    charter = p.charter_path.read_text() if p.charter_path.exists() else "(none)"
+    parts.append("# CHARTER (goals and policies; its restrictions are the binding block above)\n" +
+                 charter_without_restrictions(charter))
     mem = p.memory_text(limit_chars=8000)
     if mem:
         parts.append("# PROJECT MEMORY\n" + mem)
