@@ -58,7 +58,8 @@ USER_SETTABLE = {
     "coordinator.tier": str, "jev.enabled": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     # Where code tasks branch from: the project's working branch once it has one.
     "delivery.base_ref": str,
-    # Where `ttp push` publishes (default: base_ref) and the commands that must pass first.
+    # Where `ttp push` publishes (required; never main, master or the remote's default branch) and
+    # the commands that must pass first.
     "delivery.push_branch": str,
     "delivery.push_checks": lambda v: push.check_list(v),
     # The runaway valve on task creation; the coordinator may raise it within MAX_TASKS_PER_DAY.

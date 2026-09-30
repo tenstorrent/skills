@@ -15,6 +15,7 @@ from .project import Project
 # Exit codes, distinct so a worker can say why it did not push.
 REFUSED, CONFLICT, CHECKS_FAILED, KEPT_MOVING, REJECTED = 2, 3, 4, 5, 6
 DEFAULT_ROUNDS = 3
+PROTECTED = {"HEAD", "main", "master"}
 
 
 def check_list(v: Any) -> list[str]:
@@ -45,16 +46,42 @@ def _fetch(repo: Path, remote: str, branch: str) -> str:
 
 
 def target(p: Project, repo: Path) -> tuple[str, str]:
-    """(remote, branch) to push to: `delivery.push_branch`, else `delivery.base_ref`. There is no
-    fallback to the remote's default branch: an unconfigured project must not push to it."""
+    """(remote, branch) to push to: `delivery.push_branch` only. `delivery.base_ref` is where work
+    starts, which may be the default branch, so it is never a push target."""
     d = p.config().get("delivery") or {}
-    ref = str(d.get("push_branch") or d.get("base_ref") or "").strip()
+    ref = str(d.get("push_branch") or "").strip()
     if not ref:
-        raise ValueError("no target branch: set delivery.push_branch (or delivery.base_ref)")
+        raise ValueError("no target branch: set delivery.push_branch")
     remote, _, rest = ref.partition("/")
-    if rest and remote in _git(repo, "remote").stdout.split():
-        return remote, rest
-    return "origin", ref
+    if not (rest and remote in _git(repo, "remote").stdout.split()):
+        remote, rest = "origin", ref
+    return remote, rest[len("refs/heads/"):] if rest.startswith("refs/heads/") else rest
+
+
+def refusal(repo: Path, remote: str, branch: str) -> str:
+    """Why `branch` on `remote` must not be pushed to, or "" when it may. Fails closed when the
+    remote cannot be asked for its default branch."""
+    if branch in PROTECTED:
+        return f"refusing to push to {remote}/{branch}"
+    ls = _git(repo, "ls-remote", "--symref", remote, "HEAD")
+    if ls.returncode != 0:
+        return f"cannot reach {remote}: {ls.stderr.strip()}"
+    for line in ls.stdout.splitlines():
+        if line.startswith("ref: ") and line[5:].split("\t")[0] == f"refs/heads/{branch}":
+            return f"refusing to push to {remote}/{branch}, the remote's default branch"
+    return ""
+
+
+def rounds_of(v: Any) -> int:
+    """`delivery.push_rounds` as an integer of at least 1; ValueError when it is not an integer."""
+    if v is None or v == "":
+        return DEFAULT_ROUNDS
+    if isinstance(v, bool) or not isinstance(v, (int, str)):
+        raise ValueError(f"delivery.push_rounds must be an integer, not {v!r}")
+    try:
+        return max(1, int(v))
+    except ValueError:
+        raise ValueError(f"delivery.push_rounds must be an integer, not {v!r}") from None
 
 
 def push(repo: Path, remote: str, branch: str, checks: list[str], rounds: int = DEFAULT_ROUNDS,
@@ -64,6 +91,10 @@ def push(repo: Path, remote: str, branch: str, checks: list[str], rounds: int = 
     repo = Path(_git(repo, "rev-parse", "--show-toplevel").stdout.strip() or repo)
     if _git(repo, "status", "--porcelain", "--untracked-files=no").stdout.strip():
         say("uncommitted changes; commit first")
+        return REFUSED
+    why = refusal(repo, remote, branch)
+    if why:
+        say(why)
         return REFUSED
     upstream = f"{remote}/{branch}"
     for rnd in range(1, rounds + 1):
@@ -98,7 +129,8 @@ def push(repo: Path, remote: str, branch: str, checks: list[str], rounds: int = 
 def run(p: Project, repo: Path) -> int:
     """`ttp push` for a project: target, checks and rounds come from its `delivery` config."""
     d = p.config().get("delivery") or {}
-    if d.get("push_allowed") is False:
+    allowed = True if d.get("push_allowed") is None else d.get("push_allowed")
+    if not (allowed is True or str(allowed).strip().lower() in ("1", "true", "yes", "on")):
         print("ttp push: this project does not allow pushing (delivery.push_allowed)", file=sys.stderr)
         return REFUSED
     checks = check_list(d.get("push_checks"))
@@ -108,7 +140,8 @@ def run(p: Project, repo: Path) -> int:
         return REFUSED
     try:
         remote, branch = target(p, repo)
+        rounds = rounds_of(d.get("push_rounds"))
     except ValueError as e:
         print(f"ttp push: {e}", file=sys.stderr)
         return REFUSED
-    return push(repo, remote, branch, checks, int(d.get("push_rounds") or DEFAULT_ROUNDS))
+    return push(repo, remote, branch, checks, rounds)

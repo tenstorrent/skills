@@ -83,8 +83,9 @@ and preferences you add later become part of the project's charter and memory.
 - Where reviewed changes go straight to a shared branch, `ttp push` publishes them guarded: it
   refuses uncommitted changes, rebases onto the latest tip, runs `delivery.push_checks` on the
   exact commit it pushes, starts over if the branch moved meanwhile, and never forces. The target
-  is `delivery.push_branch` (default `delivery.base_ref`); with neither set, or no checks, it
-  refuses.
+  is `delivery.push_branch`, which must be set explicitly; it refuses without one, without
+  checks, when `delivery.push_allowed` is false, and for `HEAD`, `main`, `master` or the
+  remote's default branch.
 - A plan task starts from what is already known: prior work, the organization's docs and chats
   through the connectors you have, available skills, and public work. Skill plugins it recommends
   can be enabled for the project's workers only (`providers.claude.plugin_dirs`).

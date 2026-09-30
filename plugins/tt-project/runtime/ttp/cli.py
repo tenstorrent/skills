@@ -541,7 +541,8 @@ def cmd_note(a) -> None:
 def cmd_push(a) -> None:
     """Publish this worktree's commits onto the project's target branch, guarded: refuse a dirty
     tree, rebase onto the latest tip, run `delivery.push_checks` on the final head, start over if
-    the tip moved meanwhile, and push without force. Exit codes are in `push.py`."""
+    the tip moved meanwhile, and push without force. The target is `delivery.push_branch`, never
+    main, master or the remote's default branch. Exit codes are in `push.py`."""
     from . import push
     base = os.environ.get("TTP_PROJECT")
     p = Project(base) if base else next((c for d in [Path.cwd(), *Path.cwd().parents]
@@ -1017,7 +1018,7 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("text")
     s.set_defaults(fn=cmd_note)
 
-    s = sub.add_parser("push", help="guarded push of this worktree to the project's target branch")
+    s = sub.add_parser("push", help="guarded push of this worktree to delivery.push_branch")
     s.set_defaults(fn=cmd_push)
 
     s = sub.add_parser("lock", help="(inside a run) hold a shared resource while one command runs")

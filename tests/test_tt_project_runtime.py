@@ -3770,6 +3770,86 @@ def test_push_needs_a_configured_target_and_checks(env, monkeypatch, capsys):
     assert _git_out(origin, "rev-parse", "proj") == before
 
 
+def test_push_does_not_fall_back_to_the_base_ref(env, monkeypatch, capsys):
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    before = _git_out(origin, "rev-parse", "proj")
+    _commit(repo, "mine.txt", "mine\n")
+    p.set_config("delivery.push_branch", "")
+    p.set_config("delivery.base_ref", "origin/proj")
+    assert _ttp_push() == 2 and "delivery.push_branch" in capsys.readouterr().err
+    assert _git_out(origin, "rev-parse", "proj") == before
+
+
+@pytest.mark.parametrize("ref", ["main", "origin/main", "origin/master", "HEAD", "origin/HEAD",
+                                 "origin/refs/heads/main"])
+def test_push_refuses_head_main_and_master(env, monkeypatch, capsys, ref):
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/main")
+    before = _git_out(origin, "rev-parse", "main")
+    _commit(repo, "mine.txt", "mine\n")
+    p.set_config("delivery.push_branch", ref)
+    assert _ttp_push() == 2 and "refusing" in capsys.readouterr().err
+    assert _git_out(origin, "rev-parse", "main") == before
+
+
+def test_push_refuses_the_remotes_default_branch(env, monkeypatch, capsys):
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    before = _git_out(origin, "rev-parse", "proj")
+    subprocess.run(["git", "-C", str(origin), "symbolic-ref", "HEAD", "refs/heads/proj"], check=True)
+    _commit(repo, "mine.txt", "mine\n")
+    assert _ttp_push() == 2 and "default branch" in capsys.readouterr().err
+    assert _git_out(origin, "rev-parse", "proj") == before
+
+
+@pytest.mark.parametrize("value", [False, 0, "false", "0", "no", "off", "False", " OFF "])
+def test_push_reads_push_allowed_strings_as_false(env, monkeypatch, capsys, value):
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    before = _git_out(origin, "rev-parse", "proj")
+    _commit(repo, "mine.txt", "mine\n")
+    p.set_config("delivery.push_allowed", value)
+    assert _ttp_push() == 2 and "push_allowed" in capsys.readouterr().err
+    assert _git_out(origin, "rev-parse", "proj") == before
+
+
+@pytest.mark.parametrize("value", ["three", 2.5, True, [3]])
+def test_push_refuses_a_non_integer_push_rounds(env, monkeypatch, capsys, value):
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    before = _git_out(origin, "rev-parse", "proj")
+    _commit(repo, "mine.txt", "mine\n")
+    p.set_config("delivery.push_rounds", value)
+    assert _ttp_push() == 2 and "push_rounds" in capsys.readouterr().err
+    assert _git_out(origin, "rev-parse", "proj") == before
+
+
+@pytest.mark.parametrize("value", [0, -2, "0"])
+def test_push_clamps_push_rounds_to_at_least_one(env, monkeypatch, value):
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    _commit(repo, "mine.txt", "mine\n")
+    p.set_config("delivery.push_rounds", value)
+    assert _ttp_push() == 0
+    assert _git_out(origin, "rev-parse", "proj") == _git_out(repo, "rev-parse", "HEAD")
+
+
+def test_push_reports_a_rejected_push_without_moving_the_remote(env, monkeypatch):
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    before = _git_out(origin, "rev-parse", "proj")
+    hook = origin / "hooks" / "pre-receive"
+    hook.write_text("#!/bin/sh\nexit 1\n")
+    hook.chmod(0o755)
+    _commit(repo, "mine.txt", "mine\n")
+    assert _ttp_push() == 6
+    assert _git_out(origin, "rev-parse", "proj") == before
+
+
+def test_push_refuses_when_the_remote_is_unreachable(env, monkeypatch, capsys):
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    before = _git_out(origin, "rev-parse", "proj")
+    _git_out(repo, "remote", "set-url", "origin", str(env["tmp"] / "gone.git"))
+    _commit(repo, "mine.txt", "mine\n")
+    assert _ttp_push() == 2 and "origin" in capsys.readouterr().err
+    assert _git_out(origin, "rev-parse", "proj") == before
+
+
 def test_push_checks_accept_the_forms_config_set_sends():
     sys.path.insert(0, str(RUNTIME))
     try:
