@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import shlex
@@ -3236,7 +3237,8 @@ def test_an_exclusive_run_that_loses_the_race_requeues_without_an_attempt(env, m
     tid = p.db.one("SELECT id FROM tasks WHERE title='reflash'")["id"]
     p.db.x("UPDATE messages SET handled=1")
     hold_s = 600   # far longer than any wait the losing run may do, so finishing early proves it gave up
-    holder = subprocess.Popen([sys.executable, str(TTP), "lock", "board", "--", "sleep", str(hold_s)], env=run_env)
+    holder = subprocess.Popen([sys.executable, str(TTP), "lock", "board", "--", "sleep", str(hold_s)], env=run_env,
+                              start_new_session=True)   # own group, so cleanup reaches the sleep child too
     try:
         d = dmod.Daemon(p.base)
         deadline = time.time() + 60   # wait on the lock itself, not a fixed sleep: slow hosts start late
@@ -3250,8 +3252,15 @@ def test_an_exclusive_run_that_loses_the_race_requeues_without_an_attempt(env, m
         waited = time.time() - t0
         assert holder.poll() is None, "the holder let go before the run finished"
     finally:
-        holder.kill()
-        holder.wait(timeout=30)
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(holder.pid, sig)
+                holder.wait(timeout=5)
+                break
+            except (ProcessLookupError, subprocess.TimeoutExpired):
+                pass
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(holder.pid, signal.SIGKILL)   # the group outlives a leader that exits on TERM
     run = p.db.one("SELECT * FROM runs WHERE task=?", (tid,))
     t = p.db.task(tid)
     assert run["status"] == "resource_busy" and waited < hold_s / 5, (run["status"], waited)
