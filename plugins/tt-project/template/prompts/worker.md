@@ -18,6 +18,7 @@
 
 - Run `ttp note "<one line>"` at each milestone. Humans read these live.
 - Make durable progress early: commit, write files. A killed run keeps what is on disk.
+- Send big command output (builds, test logs) to a file and read only the part you need.
 
 ## Working in parallel
 

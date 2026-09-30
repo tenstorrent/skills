@@ -1131,6 +1131,67 @@ def test_claude_runs_cannot_start_background_tasks_that_die_at_exit(env):
     assert "setsid nohup" in prompt
 
 
+def test_worker_and_reviewer_context_is_compacted_per_tier_but_not_the_coordinators(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+
+    def run_env(role, tier, **kw):
+        tid = p.db.add_task(f"t {role} {tier}", "s", kind="review" if role == "reviewer" else "code",
+                            tier=tier, origin="user")
+        rid = d.start_run(role, "go", "claude", tier, str(p.root), task=p.db.task(tid), **kw)
+        (p.runs / str(rid) / "STOP").touch()
+        return json.loads((p.runs / str(rid) / "run.json").read_text())["env"]
+
+    want = {"light": "80000", "standard": "150000", "deep": "200000"}
+    for tier, tokens in want.items():
+        assert run_env("worker", tier)["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == tokens
+        assert run_env("reviewer", tier)["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == tokens
+    crid = d.start_run("coordinator", "decide", "claude", "light", str(p.base), read_only=True)
+    (p.runs / str(crid) / "STOP").touch()
+    assert "CLAUDE_CODE_AUTO_COMPACT_WINDOW" not in json.loads((p.runs / str(crid) / "run.json").read_text())["env"]
+    # 0 turns it off, per tier or for every tier.
+    p.set_config("budget.compact_window_tokens", {"light": 0, "standard": 150000, "deep": 200000})
+    d.cfg = p.config()
+    assert "CLAUDE_CODE_AUTO_COMPACT_WINDOW" not in run_env("worker", "light")
+    assert run_env("worker", "standard")["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "150000"
+    p.set_config("budget.compact_window_tokens", 0)
+    d.cfg = p.config()
+    assert "CLAUDE_CODE_AUTO_COMPACT_WINDOW" not in run_env("reviewer", "deep")
+    from ttp.providers import get_provider
+    assert get_provider("codex").compact_env(150000) == {}
+
+
+def test_claude_cost_and_tokens_survive_a_context_compaction(env, tmp_path):
+    """Shaped like a live headless run with CLAUDE_CODE_AUTO_COMPACT_WINDOW set: compaction adds
+    status and compact_boundary events between turns, and the result still carries the whole cost."""
+    from ttp.providers import get_provider
+
+    def asst(mid, ctx):
+        return {"type": "assistant", "message": {"id": mid, "usage": {"input_tokens": 10, "output_tokens": 50,
+                "cache_read_input_tokens": ctx, "cache_creation_input_tokens": 1000},
+                "content": [{"type": "text", "text": f"at {ctx}"}]}}
+
+    events = [{"type": "system", "subtype": "init", "session_id": "s1", "model": "m"}, asst("a", 70000),
+              {"type": "system", "subtype": "status", "status": "compacting"},
+              {"type": "system", "subtype": "status", "status": None},
+              {"type": "system", "subtype": "compact_boundary",
+               "compact_metadata": {"trigger": "auto", "pre_tokens": 75000, "post_tokens": 7000}},
+              asst("b", 8000)]
+    result = {"type": "result", "subtype": "success", "is_error": False, "result": "DONE", "session_id": "s1",
+              "total_cost_usd": 0.82, "usage": {"input_tokens": 114, "output_tokens": 5321,
+                                                "cache_read_input_tokens": 442724,
+                                                "cache_creation_input_tokens": 285481}}
+    out = tmp_path / "out.jsonl"
+    out.write_text("".join(json.dumps(e) + "\n" for e in events + [result]))
+    u = get_provider("claude").parse(out)
+    assert (u.cost_usd, u.cache_read_tokens, u.final_text, u.error, u.estimated) == (0.82, 442724, "DONE", "", False)
+    # Cut off after the compaction: every streamed message before and after it still counts.
+    out.write_text("".join(json.dumps(e) + "\n" for e in events))
+    u = get_provider("claude").parse(out)
+    assert u.estimated and u.cache_read_tokens == 78000 and u.final_text == "at 8000"
+
+
 def test_claude_workers_keep_the_system_prompt_cacheable_when_the_cli_can(env, monkeypatch):
     from ttp.providers import claude, get_provider
     kw = dict(role="worker", model="opus", effort="low", cwd=".", budget_usd=None, schema=None, restrictions={})

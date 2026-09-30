@@ -130,6 +130,11 @@ class Provider:
         metadata); [] when the agent has no write sandbox."""
         return []
 
+    def compact_env(self, tokens: int) -> dict[str, str]:
+        """Environment that makes the agent compact its context near `tokens`; {} when it has no
+        such switch or `tokens` is 0."""
+        return {}
+
     def cost_so_far(self, output_path: Path) -> float | None:
         """Mid-run spend, when the provider streams it and does not enforce a budget itself."""
         return None

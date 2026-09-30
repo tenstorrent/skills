@@ -261,6 +261,10 @@ class Daemon:
             cwd = scratch_dir(str(self.p.base))
         argv, env = prov.build(role=role, model=model, effort=effort, cwd=cwd, budget_usd=budget_usd,
                                read_only=read_only, schema=schema, restrictions=restrictions)
+        if role != "coordinator":
+            window = self.cfg["budget"].get("compact_window_tokens") or 0   # 0: off for every tier
+            window = window.get(tier) if isinstance(window, dict) else window
+            env = {**env, **prov.compact_env(int(window or 0))}
         mcp_servers: dict = {}
         private: list[str] = []   # files that may hold credentials, removed when the run ends
         if not read_only:

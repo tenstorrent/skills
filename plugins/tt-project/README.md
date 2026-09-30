@@ -167,4 +167,5 @@ Design notes, invariants and how to add a provider: [docs/design.md](docs/design
   your own CLI config and MCP servers. Cursor enforces no `no_internet` restriction and has no
   plan-window meter; without ask mode it has no read-only mode either.
 - Cursor has no reasoning-effort flag; tiers map to model names.
+- Context compaction per tier (`budget.compact_window_tokens`) works on Claude Code only.
 - A laptop pauses while it sleeps. Use an always-on machine for round-the-clock work.

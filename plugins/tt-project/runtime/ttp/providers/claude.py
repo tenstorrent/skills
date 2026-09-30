@@ -72,6 +72,11 @@ class Claude(Provider):
         env = {"CLAUDE_CODE_ENABLE_CFC": "0", "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1"}
         return argv, env
 
+    def compact_env(self, tokens: int) -> dict[str, str]:
+        # Honoured by headless stream-json runs (checked live: a `compact_boundary` event follows).
+        # CLAUDE_AUTOCOMPACT_PCT_OVERRIDE alone did not compact there.
+        return {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": str(int(tokens))} if tokens and tokens > 0 else {}
+
     def supports(self, flag: str) -> bool:
         if flag not in _FLAGS:
             try:
