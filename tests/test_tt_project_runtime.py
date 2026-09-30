@@ -745,3 +745,13 @@ def test_dollar_caps_cover_the_whole_project(env):
         assert g.level == "red" and any("cap reached" in r for r in g.reasons), (prov, g.reasons)
     # A provider on plan windows is bounded by its windows, so its spend does not use up the caps.
     assert bud.evaluate(p.db, p.config(), "codex", [bud.Window("claude", "seven_day", 20)]).level == "yellow"
+
+def test_remote_listener_reconnects_after_a_network_drop(env, monkeypatch):
+    from ttp import cli
+    results = iter([255, 255, 0])
+    calls, naps = [], []
+    monkeypatch.setattr(cli, "forward", lambda entry, argv, quiet=False: calls.append(quiet) or next(results))
+    monkeypatch.setattr(cli.time, "sleep", lambda s: naps.append(s))
+    assert cli.forward_listen({"host": "box", "dir": "/x"}, ["listen", "demo", "--chat", "c1", "--once"]) == 0
+    assert calls == [False, True, True], "the unreachable message should print once, not on every retry"
+    assert naps == [5.0, 10.0]

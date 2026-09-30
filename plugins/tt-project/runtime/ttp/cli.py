@@ -56,7 +56,26 @@ def remote_entry(name: str) -> dict | None:
     return None
 
 
-def forward(entry: dict, argv: list[str]) -> int:
+def forward_listen(entry: dict, argv: list[str]) -> int:
+    """A remote listener outlives network drops: a laptop changes networks, sleeps and wakes.
+
+    ssh failing (255) means this machine lost the path, not that the project stopped, so wait and
+    reconnect. The listener left on the far side exits on its own once its session is gone, and
+    the new one replaces it if it has not yet.
+    """
+    delay, told = 5.0, False
+    while True:
+        rc = forward(entry, argv, quiet=told)
+        if rc != 255:
+            return rc
+        if not told:
+            print("ttp: will keep retrying and deliver messages once the connection is back", file=sys.stderr)
+            told = True
+        time.sleep(delay)
+        delay = min(delay * 2, 120.0)
+
+
+def forward(entry: dict, argv: list[str], quiet: bool = False) -> int:
     """Run this same command on the project's machine, streaming its output."""
     remote_ttp = f"{entry['dir']}/{FOLDER}/harness/bin/ttp"
     cmd = " ".join(shlex.quote(a) for a in [remote_ttp, *argv])
@@ -64,9 +83,10 @@ def forward(entry: dict, argv: list[str]) -> int:
     r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", host, cmd], stderr=subprocess.PIPE,
                        text=True)
     if r.returncode == 255:   # ssh itself failed: the project is fine, this machine cannot reach it
-        why = (r.stderr.strip().splitlines() or ["unknown ssh error"])[-1]
-        print(f"ttp: cannot reach {host} right now ({why}). The project keeps running there; "
-              f"try again once this machine is back on that network.", file=sys.stderr)
+        if not quiet:
+            why = (r.stderr.strip().splitlines() or ["unknown ssh error"])[-1]
+            print(f"ttp: cannot reach {host} right now ({why}). The project keeps running there; "
+                  f"try again once this machine is back on that network.", file=sys.stderr)
     elif r.stderr:
         sys.stderr.write(r.stderr)
     return r.returncode
@@ -119,6 +139,8 @@ def resolve(name: str) -> tuple[Project | None, dict | None]:
 def need(name: str, argv: list[str]) -> Project:
     p, entry = resolve(name)
     if entry:
+        if argv and argv[0] == "listen":
+            sys.exit(forward_listen(entry, argv))
         sys.exit(forward(entry, argv))
     if not p:
         die(f"no project named {name!r} on this machine or in the registry; try `ttp find {name}`")
