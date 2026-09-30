@@ -68,6 +68,7 @@ class Daemon:
         self._healthy = False
         self._last_prune = 0.0
         self._disk_low: bool | None = None   # unknown until checked
+        self._tick_errors = 0
 
     # lifecycle ------------------------------------------------------------------------------------
     def run(self) -> int:
@@ -77,6 +78,7 @@ class Daemon:
             print(f"daemon already running (pid {_read_pid(pidfile)})", file=sys.stderr)
             return 1
         pidfile.write_text(str(os.getpid()))
+        self._mark_start()
         signal.signal(signal.SIGTERM, lambda *_: setattr(self, "stopping", True))
         signal.signal(signal.SIGINT, lambda *_: setattr(self, "stopping", True))
         log(self.p, f"daemon start pid={os.getpid()} host={hostname()} boot={self.boot}")
@@ -90,6 +92,9 @@ class Daemon:
                 self._beat()
             except Exception:  # a bad tick must never kill the daemon
                 log(self.p, "tick error: " + traceback.format_exc().replace("\n", " | ")[:2000])
+                if not self._healthy:
+                    self._tick_errors += 1
+                    self._mark_start()
                 time.sleep(10)
             time.sleep(TICK_S)
         log(self.p, "daemon stop")
@@ -112,6 +117,15 @@ class Daemon:
             return True
         other = _read_pid(self.p.state / "daemon.pid")
         return not (other and other != os.getpid() and _is_daemon(other))
+
+    def _mark_start(self) -> None:
+        """Record that this process started, and how often its first tick has failed, so `ttp restart`
+        can tell a daemon that is alive but still in a slow first tick from one that is broken."""
+        try:
+            (self.p.state / "daemon.start").write_text(json.dumps(
+                {"pid": os.getpid(), "host": hostname(), "started": self._started, "tick_errors": self._tick_errors}))
+        except OSError:
+            pass
 
     def _beat(self) -> None:
         """A completed tick. `status`, the web app and `ttp restart` read its age; the first one
@@ -985,6 +999,15 @@ def heartbeat(p: Project) -> dict | None:
         info["age"] = max(0.0, time.time() - hb.stat().st_mtime)
         return info
     except (OSError, ValueError, TypeError):
+        return None
+
+
+def start_marker(p: Project) -> dict | None:
+    """The last daemon process to start: {pid, host, started, tick_errors}, or None."""
+    try:
+        info = json.loads((p.state / "daemon.start").read_text())
+        return info if isinstance(info, dict) else None
+    except (OSError, ValueError):
         return None
 
 

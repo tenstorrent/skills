@@ -178,34 +178,49 @@ def _git(h: Path, *args: str) -> subprocess.CompletedProcess:
                            *args], capture_output=True, text=True, timeout=120)
 
 
-def wait_for_heartbeat(p: Project, since: float, wait_s: float) -> bool:
-    """True once a daemon started after `since` has completed a tick."""
-    from .daemon import heartbeat
-    deadline = time.time() + wait_s
+def wait_for_start(p: Project, since: float, wait_s: float, tick_wait_s: float | None = None) -> str:
+    """How a daemon started after `since` came up: "running" once it completed a tick; "busy" if it
+    is alive and still in its first tick after tick_wait_s (a first tick may fetch and add worktrees);
+    otherwise "broken": it did not start within wait_s, it exited, or its first tick failed twice."""
+    from .daemon import HEARTBEAT_STALE_S, _alive, heartbeat, start_marker
+    tick_wait_s = HEARTBEAT_STALE_S if tick_wait_s is None else tick_wait_s
     while True:
         hb = heartbeat(p)
         if hb and float(hb.get("started") or 0) >= since:
-            return True
-        if time.time() >= deadline:
-            return False
+            return "running"
+        now = time.time()
+        st = start_marker(p)
+        if st and float(st.get("started") or 0) >= since:
+            pid = int(st.get("pid") or 0)
+            if pid <= 0 or not _alive(pid) or int(st.get("tick_errors") or 0) >= 2:
+                return "broken"
+            if now >= since + max(wait_s, tick_wait_s):
+                return "busy"
+        elif now >= since + wait_s:
+            return "broken"
         time.sleep(1)
 
 
-def restart(p: Project, wait_s: float = 60, restart_fn=None) -> str:
-    """Restart the daemon and confirm it ticks. If it does not, and the harness runtime changed
-    since the commit a daemon last ran well on, put runtime/ back to that commit as a new commit
-    (history, charter, memory and prompts untouched), restart again and alert."""
+def restart(p: Project, wait_s: float = 60, restart_fn=None, tick_wait_s: float | None = None) -> str:
+    """Restart the daemon and confirm it ticks. If it is broken (never started, exited, or its first
+    tick keeps failing) and the harness runtime changed since the commit a daemon last ran well on,
+    put runtime/ back to that commit as a new commit (history, charter, memory and prompts untouched),
+    restart again and alert. A daemon that is alive but still in a slow first tick is left alone."""
     restart_fn = restart_fn or restart_service
     t0 = time.time()
     msg = restart_fn(p)
-    if wait_for_heartbeat(p, t0, wait_s):
+    state = wait_for_start(p, t0, wait_s, tick_wait_s)
+    if state == "running":
         return f"{msg}; the daemon is running"
+    if state == "busy":
+        return (f"{msg}; the daemon is up but still in its first tick after {time.time() - t0:.0f}s. "
+                f"Check `ttp status {p.name}` shortly")
     h = p.harness
     good = (p.db.kv("harness_good") or {}).get("commit")
     changed = _git(h, "log", "--format=%h %s", f"{good}..HEAD", "--", "runtime").stdout.strip() if good else ""
     dirty = _git(h, "status", "--porcelain", "--", "runtime").stdout.strip() if good else ""
     if not changed and not dirty:
-        return (f"{msg}; but the daemon did not report within {wait_s:.0f}s. Check `ttp logs {p.name}`"
+        return (f"{msg}; but the daemon did not start or its first tick failed. Check `ttp logs {p.name}`"
                 + ("" if good else " (no known-good harness commit to fall back to)"))
     if dirty:
         _git(h, "add", "-A", "--", "runtime")
@@ -216,7 +231,7 @@ def restart(p: Project, wait_s: float = 60, restart_fn=None) -> str:
     _git(h, "commit", "-q", "-m", f"roll back runtime to {good[:10]}: the daemon did not start with it")
     t1 = time.time()
     restart_fn(p)
-    back = wait_for_heartbeat(p, t1, wait_s)
+    back = wait_for_start(p, t1, wait_s, tick_wait_s) != "broken"
     commits = "; ".join(changed.splitlines()[:10])
     text = (f"The daemon did not start after a runtime change, so the harness runtime was rolled back to "
             f"{good[:10]}, the last version that ran (a new commit; nothing was deleted). Rolled back: {commits}. "

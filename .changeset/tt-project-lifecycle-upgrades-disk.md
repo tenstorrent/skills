@@ -13,8 +13,9 @@
 - Cancelling a task from the CLI, web app or coordinator ends its running worker within seconds.
 - `ttp upgrade` merges in a scratch worktree and applies the result only when it is clean and the
   runtime compiles and imports; otherwise the harness is unchanged and a harness task is queued.
-- `ttp restart` waits for the daemon to tick. If it does not, the harness runtime goes back to
-  the last version that ran, as a new commit, and the user is alerted.
+- `ttp restart` waits for the daemon to tick. If the new daemon never starts, exits, or its first
+  tick keeps failing, the harness runtime goes back to the last version that ran, as a new commit,
+  and the user is alerted. A daemon that is alive but still in a slow first tick is left alone.
 - Below `disk.min_free_gb` of free space no new worker starts, with one alert. Worktrees of tasks
   finished more than `disk.worktree_retention_days` ago are removed when clean and pushed or
   merged; branches are kept.

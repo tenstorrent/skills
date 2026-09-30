@@ -1423,6 +1423,84 @@ def test_restart_rolls_back_a_runtime_the_daemon_cannot_start_with(env):
     assert p.db.one("SELECT id FROM messages WHERE kind='alert' AND text LIKE '%rolled back%'")
 
 
+def _runtime_change(h):
+    daemon_py = h / "runtime" / "ttp" / "daemon.py"
+    daemon_py.write_text(daemon_py.read_text() + "\n# a runtime change\n")
+    _git_out(h, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "change the runtime")
+    return _git_out(h, "rev-parse", "HEAD")
+
+
+def test_restart_leaves_a_live_daemon_in_a_slow_first_tick_alone(env):
+    import threading
+    p = make(env)
+    from ttp import service
+    h = p.harness
+    p.db.set_kv("harness_good", {"commit": _git_out(h, "rev-parse", "HEAD")})
+    head = _runtime_change(h)
+
+    def started_alive(p, tick_after=None):
+        (p.state / "daemon.start").write_text(json.dumps({"pid": os.getpid(), "started": time.time(),
+                                                          "tick_errors": 0}))
+        if tick_after is not None:
+            beat = json.dumps({"pid": os.getpid(), "started": time.time()})
+            threading.Timer(tick_after, lambda: (p.state / "heartbeat").write_text(beat)).start()
+        return "restarted"
+
+    text = service.restart(p, wait_s=1, tick_wait_s=10, restart_fn=lambda p: started_alive(p, tick_after=2.5))
+    assert "daemon is running" in text
+    text = service.restart(p, wait_s=1, tick_wait_s=2, restart_fn=started_alive)
+    assert "still in its first tick" in text
+    assert _git_out(h, "rev-parse", "HEAD") == head, "a live daemon's runtime was rolled back"
+    assert not p.db.one("SELECT id FROM messages WHERE kind='alert' AND text LIKE '%rolled back%'")
+
+
+@pytest.mark.parametrize("failure", ["exited", "tick_errors"])
+def test_restart_rolls_back_when_the_new_daemon_dies_or_its_first_tick_fails(env, failure):
+    p = make(env)
+    from ttp import service
+    h = p.harness
+    good = _git_out(h, "rev-parse", "HEAD")
+    p.db.set_kv("harness_good", {"commit": good})
+    _runtime_change(h)
+    dead = subprocess.Popen(["true"])
+    dead.wait()
+
+    def fake_restart(p):
+        if subprocess.run(["git", "-C", str(h), "diff", "--quiet", good, "HEAD", "--", "runtime"]).returncode == 0:
+            (p.state / "heartbeat").write_text(json.dumps({"pid": os.getpid(), "started": time.time()}))
+        elif failure == "exited":
+            (p.state / "daemon.start").write_text(json.dumps({"pid": dead.pid, "started": time.time()}))
+        else:
+            (p.state / "daemon.start").write_text(json.dumps({"pid": os.getpid(), "started": time.time(),
+                                                              "tick_errors": 2}))
+        return "restarted"
+
+    text = service.restart(p, wait_s=30, tick_wait_s=30, restart_fn=fake_restart)
+    assert "rolled back" in text and "running again" in text
+    assert subprocess.run(["git", "-C", str(h), "diff", "--quiet", good, "HEAD", "--", "runtime"]).returncode == 0
+
+
+def test_the_daemon_records_its_start_and_first_tick_failures(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dm, web
+    d = dm.Daemon(p.base)
+    calls = []
+
+    def failing_tick():
+        calls.append(1)
+        d.stopping = len(calls) >= 2
+        raise RuntimeError("bad runtime")
+
+    monkeypatch.setattr(d, "tick", failing_tick)
+    monkeypatch.setattr(web, "serve", lambda daemon: None)
+    monkeypatch.setattr(dm.signal, "signal", lambda *a: None)
+    monkeypatch.setattr(dm.time, "sleep", lambda s: None)
+    assert d.run() == 0
+    marker = dm.start_marker(p)
+    assert marker["pid"] == os.getpid() and marker["tick_errors"] == 2
+    assert dm.heartbeat(p) is None
+
+
 def test_finished_worktrees_are_removed_only_when_nothing_is_lost(env):
     p = make(env)
     from ttp import worktree
