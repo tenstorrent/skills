@@ -106,3 +106,57 @@ def test_harness_tasks_stay_in_their_own_harness():
     assert "upstream notes for the tt-project maintainers, not work for this project" in coordinator
     # A project whose own work is the plugin (its charter says so) may still queue that work.
     assert "unless the charter names that repository as this project's own work" in coordinator
+
+
+# Wording that makes the user do, or approve, what tt-project can do itself.
+ASKS_USER_TO_DO = [
+    r"\b(ask|tell)(ing)? (the )?user to (run|do|open|install|type|start|restart|set up|enable)\b",
+    r"\bwith the user's (OK|okay|approval)\b", r"\bafter the user agrees\b", r"\(ask first\)",
+    r"\b(would|do) you (like|want) me to\b", r"\bshall I\b", r"\bwant me to\b", r"\byou can run\b",
+    r"\boffer (to|`ttp)", r"\bplease run\b",
+]
+
+
+def user_facing_texts():
+    for f in sorted(SKILLS.rglob("*.md")) + sorted((PLUGIN / "template").rglob("*.md")):
+        yield f.relative_to(PLUGIN), f.read_text(encoding="utf-8")
+    # Strings the runtime prints or shows (status, web app, alerts, help).
+    for f in sorted(RUNTIME.rglob("*.py")) + sorted((RUNTIME / "web").glob("*.js")):
+        yield f.relative_to(PLUGIN), f.read_text(encoding="utf-8")
+
+
+def test_no_wording_asks_the_user_to_do_what_tt_project_can_do():
+    """Never ask the user to do what tt-project can do, never offer it: do it and say so. A rule that
+    forbids such wording may quote it, so items saying "never" and quoted examples are skipped."""
+    pattern = re.compile("|".join(ASKS_USER_TO_DO), re.I)
+    for rel, text in user_facing_texts():
+        # Markdown: one item per paragraph, list entry or table row, so a quote wrapped over lines
+        # stays whole. Code: one item per line.
+        md = rel.suffix == ".md"
+        for item in re.split(r"\n\s*\n|\n(?=\s*[-|#] )", text) if md else text.splitlines():
+            item = " ".join(item.split())
+            if re.search(r"\bnever\b", item, re.I):
+                continue
+            if md:   # in code, quotes are the strings themselves
+                item = re.sub(r'"[^"]*"', "", item)
+            m = pattern.search(item)
+            assert not m, f"{rel}: {m.group(0)!r} makes the user do or approve what tt-project can do: {item[:120]}"
+
+
+def test_local_web_forwards_open_without_asking_and_exposing_tunnels_ask():
+    remote = " ".join((SKILLS / "tt-project" / "remote.md").read_text(encoding="utf-8").split())
+    assert "ALWAYS ask the user before opening any tunnel" not in remote
+    assert "open it without asking and keep it up" in remote
+    assert "`ttp web <name> --tunnel --keep`" in remote and "`com.tt-project.tunnel.<name>`" in remote
+    assert re.search(r"Ask the user before any tunnel that exposes their machine to others: a reverse forward", remote)
+    rows = {row.split("|")[1].strip(): row.split("|")[3].strip()
+            for row in (SKILLS / "tt-project" / "remote.md").read_text(encoding="utf-8").splitlines()
+            if row.startswith("| ") and "forward" in row}
+    assert rows["Laptop reaches a service on a box"] == "no"
+    assert rows["Box reaches a service on the laptop"] == "yes"
+    assert rows["Box A reaches box B via the laptop"] == "yes"
+    skill = (SKILLS / "tt-project" / "SKILL.md").read_text(encoding="utf-8")
+    assert "Tunnels need the user's OK first" not in skill and "--tunnel --keep" in skill
+    for prompt in ("coordinator.md", "worker.md"):
+        text = " ".join((PLUGIN / "template" / "prompts" / prompt).read_text(encoding="utf-8").split())
+        assert re.search(r"Never ask (or tell )?the user to do what (you or )?the project can do", text), prompt

@@ -22,7 +22,8 @@ from pathlib import Path
 
 from .project import HOME_DIR
 
-FORWARD = re.compile(r"-L\s*(?:127\.0\.0\.1:)?(\d+):127\.0\.0\.1:(\d+)")
+# Ours, and the shapes a hand-made service uses: `-L 8800:localhost:8700`, `-L127.0.0.1:8800:...`.
+FORWARD = re.compile(r"-L\s*(?:(?:127\.0\.0\.1|localhost):)?(\d+):(?:127\.0\.0\.1|localhost):(\d+)")
 
 
 def label(name: str) -> str:
@@ -72,8 +73,9 @@ def installed(name: str, platform: str | None = None) -> dict | None:
             argv = shlex.split(line[len("ExecStart="):])
     except (OSError, ValueError, plistlib.InvalidFileException):
         return {"file": str(f), "host": "", "local": 0, "remote": 0}
-    m = FORWARD.search(" ".join(argv))
-    return {"file": str(f), "host": argv[-1] if argv else "", "local": int(m.group(1)) if m else 0,
+    words = " ".join(argv).split()   # also sees into `sh -c "exec ssh ... host"`
+    m = FORWARD.search(" ".join(words))
+    return {"file": str(f), "host": words[-1] if words else "", "local": int(m.group(1)) if m else 0,
             "remote": int(m.group(2)) if m else 0}
 
 

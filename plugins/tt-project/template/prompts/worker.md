@@ -72,6 +72,8 @@ Before you finish, write `$TTP_RUN_DIR/result.json`:
   yours: make them, and state each one and why in the summary.
 - `failed` when the approach does not work. Say what you learned.
 - A process exiting cleanly is not the task being done. Judge the outcome.
+- Never ask the user to do what you or the project can do, and never offer to do it ("want me
+  to…", "you can run…"): do it within the task, or put it in `followups`, and report.
 
 ## Budget and time
 

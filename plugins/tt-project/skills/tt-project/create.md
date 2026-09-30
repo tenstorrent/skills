@@ -4,7 +4,8 @@ Ask only what you cannot infer. One message, all questions at once.
 
 ## 1. Name and brief
 
-- Name: letters, digits, `.`, `_`, `-`. Taken → offer to connect instead.
+- Name: letters, digits, `.`, `_`, `-`. Taken → connect to it and say so; ask for another name only
+  if the brief clearly describes different work.
 - Brief: inline text, a file path, a link — anything. Pass it on verbatim.
 - Save a long inline brief to a file first; pass it with `--describe-file`.
 
@@ -30,11 +31,13 @@ Ask only what you cannot infer. One message, all questions at once.
 ## 3b. The user's machines (for device or remote work)
 
 The user's machines are listed once per user and shared by all their projects:
-`ttp machines list`. When the work needs devices or other machines, offer in the same message:
+`ttp machines list`. When the work needs devices or other machines:
 
-- to record machines not listed yet: `ttp machines add <alias> --tags device,... --note "..."`
-  (a short alias such as `box-a`; tags say what it offers; no secrets in the note);
-- which of them this project may use. Put that in the brief as a line starting
+- record machines the user names that are not listed yet yourself:
+  `ttp machines add <alias> --tags device,... --note "..."` (their ssh alias; tags say what it
+  offers; no secrets in the note);
+- ask, in the same message as any other question, which of them this project may use (a
+  restriction only the user sets). Put that in the brief as a line starting
   "Machines this project may use:", so the charter's Resources section records it.
 
 When one machine keeps failing, the coordinator moves the work to another allowed machine with
@@ -68,4 +71,5 @@ ttp new <name> [--dir <root>] [--host <ssh-alias>] --describe-file <brief.md>
 
 - `ttp connect <name> --label "<chat label>"` and start the listener (`hosts.md`).
 - The coordinator restates goals and asks what it still needs. Relay its message.
-- Offer `ttp notifier install` if this is the user's workstation (ask first).
+- On the user's own workstation, run `ttp notifier install` and say so.
+- Remote project: open its web app with `ttp web <name> --tunnel --keep` and give the link.

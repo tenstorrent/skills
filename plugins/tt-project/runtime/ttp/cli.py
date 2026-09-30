@@ -617,7 +617,8 @@ def cmd_web(a) -> None:
             subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
             print(f"tunnel open (pid in background): localhost:{local} → {host}:{remote_port}")
         else:
-            print(f"The project runs on {host}. With the user's OK, open a tunnel:\n  {' '.join(cmd)}")
+            print(f"The project runs on {host}. `ttp web {a.name} --tunnel --keep` opens this local forward and "
+                  f"keeps it up:\n  {' '.join(cmd)}")
     print(f"web app: http://127.0.0.1:{local}/#token={tok}")
 
 
@@ -1182,9 +1183,10 @@ def main(argv: list[str] | None = None) -> None:
 
     s = sub.add_parser("web", help="web app link (for a remote project: tunnel command and link)")
     s.add_argument("name")
-    s.add_argument("--tunnel", action="store_true", help="open the ssh tunnel now (ask the user first)")
-    s.add_argument("--keep", action="store_true",
-                   help="with --tunnel: a user service keeps the tunnel up across reboots and network drops")
+    s.add_argument("--tunnel", action="store_true", help="open the local forward now (no need to ask: it only "
+                   "lets this machine view the web app)")
+    s.add_argument("--keep", action="store_true", help="with --tunnel: keep it up as a user service across drops "
+                   "and reboots (adopts or replaces an existing com.tt-project.tunnel.<name> service)")
     s.add_argument("--unkeep", action="store_true", help="stop and remove the kept tunnel")
     s.set_defaults(fn=cmd_web)
     for name, fn, hlp in (("connect", cmd_connect, "attach this chat to a project"),

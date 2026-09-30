@@ -31,6 +31,8 @@ description: "Start, connect to, and talk with a long-running tt-project: a loca
 
 ## Relay rules
 
+- Never ask the user to do what you or the project can do, and never offer to do it: do it and
+  say so. Ask only when a choice is truly ambiguous, dangerous, or involves another human.
 - Forward the user's words verbatim. Do not rephrase instructions.
 - A project question you can answer from `ttp status <name>`: answer directly.
 - Anything else goes to the coordinator. Answers arrive through the listener.
@@ -46,9 +48,10 @@ description: "Start, connect to, and talk with a long-running tt-project: a loca
 
 ## Web app and notifications
 
-- `ttp web <name>` prints the link. Remote project → `remote.md` (tunnel, ask first).
+- `ttp web <name>` prints the link. Remote project → `ttp web <name> --tunnel --keep` opens a kept
+  local forward without asking (`remote.md`).
 - The web app has a one-click "Turn on notifications" button.
-- Offer desktop alerts once per machine: `ttp notifier install` (ask first).
+- On the user's own workstation, run `ttp notifier install` once and say so (desktop alerts).
 - Details and optional Slack: `notifications.md`.
 
 ## Operating
@@ -74,5 +77,6 @@ More: `operate.md`.
 | "I'll just do this quick task myself" | The project owns the work. Relay it. |
 | "I'll poll until the answer comes" | The listener wakes you. End your turn. |
 | "I'll paste the key here" | Secrets go through `ttp secret`, typed by the user. |
-| "I'll open a tunnel quickly" | Tunnels need the user's OK first. |
+| "Shall I open a tunnel to the web app?" | Local forwards to view it: open and keep them, then say so. Ask only before a tunnel that exposes the user's machine. |
+| "Would you like me to…?" / "You can run…" | If tt-project can do it, do it and report. Ask only real decisions. |
 | "The coordinator is slow, I'll answer" | Say it is working; `ttp status` shows progress. |

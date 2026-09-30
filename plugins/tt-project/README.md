@@ -130,7 +130,8 @@ Workers can read Slack links you paste, using your Slack connector if you have o
 
 ## Security
 
-- The web app listens on localhost with a per-project token. Use an SSH forward from elsewhere.
+- The web app listens on localhost with a per-project token. From another machine,
+  `ttp web <name> --tunnel --keep` opens and keeps an SSH local forward to it.
 - Workers run with your permissions, in their own worktree; restrictions in the charter are
   passed to every worker and enforced by the provider where it can (for example, no web tools).
 - Text from logs, issues and chats is treated as data, not instructions.

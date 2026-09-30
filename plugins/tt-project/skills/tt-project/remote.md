@@ -2,16 +2,21 @@
 
 - Commands for a remote project forward over ssh automatically.
 - The web app binds to localhost on its machine. Reach it with a local forward.
-- ALWAYS ask the user before opening any tunnel. Say what it connects and why.
+- A local forward to view a project's web app: open it without asking and keep it up. Tell the
+  user it is open and give the link.
+- Ask the user before any tunnel that exposes their machine to others: a reverse forward into
+  the laptop, or a port bound on anything but localhost. Say what it connects and why.
 
 ## Web app from another machine
 
-- `ttp web <name>` prints the exact tunnel command (with a free local port) and the link.
-- After the user agrees: `ttp web <name> --tunnel` opens it in the background.
-- Persistent: only if the user asks. `ttp web <name> --tunnel --keep` installs a user service
-  (`com.tt-project.tunnel.<name>`: launchd on macOS, systemd --user on Linux) that restarts the
-  forward after reboots (at login) and network drops. Run again, it adopts a matching service or
-  replaces a stale one on the same local port. `ttp web <name> --unkeep` removes it.
+- `ttp web <name> --tunnel --keep` opens the local forward as a user service
+  (`com.tt-project.tunnel.<name>`: launchd on macOS, systemd --user on Linux) that restarts it
+  after reboots (at login) and network drops, then prints the link. Run it whenever the user
+  wants the web app of a remote project.
+- It adopts an existing `com.tt-project.tunnel.<name>` service that already forwards to the
+  project; any other it replaces, keeping its local port so the link stays the same.
+  `ttp web <name> --unkeep` removes it.
+- `ttp web <name>` alone prints the forward command and the link without opening anything.
 - The ssh login must work without a prompt (key or agent). On Linux the unit starts at login;
   it runs at boot without a login only with lingering (`loginctl enable-linger`).
 - When the page cannot reach the daemon it says so and shows these commands as information.
@@ -25,12 +30,12 @@
 
 ## When a task needs a path between machines
 
-| Need | Shape |
-|---|---|
-| Box reaches a service on the laptop | reverse forward from the laptop: `ssh -N -R <p>:127.0.0.1:<p> <box>` |
-| Laptop reaches a service on a box | local forward: `ssh -N -L <p>:127.0.0.1:<p> <box>` |
-| Box A reaches box B via the laptop | reverse forward on A to B's port: `ssh -N -R <p>:<B>:<port> <A>` |
-| Hop through a gateway | `ProxyJump <gateway>` in the ssh config |
+| Need | Shape | Ask first |
+|---|---|---|
+| Laptop reaches a service on a box | local forward: `ssh -N -L <p>:127.0.0.1:<p> <box>` | no |
+| Box reaches a service on the laptop | reverse forward from the laptop: `ssh -N -R <p>:127.0.0.1:<p> <box>` | yes |
+| Box A reaches box B via the laptop | reverse forward on A to B's port: `ssh -N -R <p>:<B>:<port> <A>` | yes |
+| Hop through a gateway | `ProxyJump <gateway>` in the ssh config | no |
 
 - Prefer the user's existing ssh config aliases. NEVER invent hostnames.
 - Record every tunnel the project depends on as a memory (`resource`).

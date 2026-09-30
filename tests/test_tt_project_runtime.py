@@ -6544,3 +6544,51 @@ def test_budget_lines_show_each_plan_window_its_reset_and_history(env):
     p.db.set_kv("gates", {"fake": {"regime": "caps", "numbers": {"spent_24h": 12.0, "daily_cap": 100.0,
                                                                  "spent_7d": 40.0, "weekly_cap": 200.0}}})
     assert budget_lines(p.db, now)[-1] == "$12.00 of $100 last 24h, $40.00 of $200 last 7 days"
+
+
+def test_web_keep_installs_a_kept_local_forward_and_adopts_an_existing_one(env, tmp_path, monkeypatch, capsys):
+    """`ttp web <name> --tunnel --keep` opens the local forward to a remote project's web app as a
+    user service without asking. A com.tt-project.tunnel.<name> service set up by hand is adopted
+    when it already forwards to the project, and otherwise replaced on its own local port."""
+    import plistlib
+    from ttp import cli, tunnel
+    monkeypatch.setenv("HOME", str(tmp_path / "userhome"))
+    monkeypatch.setattr(tunnel.sys, "platform", "darwin")
+    calls = []
+    monkeypatch.setattr(tunnel, "_run", lambda *argv: calls.append(argv) or subprocess.CompletedProcess(argv, 1, "", ""))
+    monkeypatch.setattr(cli, "resolve", lambda name: (None, {"host": "box", "dir": "/srv/p"}))
+    monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(
+        a, 0, "web app: http://127.0.0.1:18700/#token=abc123\n", ""))
+    plist = tmp_path / "userhome" / "Library" / "LaunchAgents" / "com.tt-project.tunnel.demo.plist"
+    plist.parent.mkdir(parents=True)
+    # Set up by hand earlier, through a shell, forwarding to the right port: adopted as is.
+    hand = {"Label": "com.tt-project.tunnel.demo", "KeepAlive": True, "ProgramArguments":
+            ["/bin/sh", "-c", "exec ssh -N -L 18999:localhost:18700 box"]}
+    plist.write_bytes(plistlib.dumps(hand))
+    cli.main(["web", "demo", "--tunnel", "--keep"])
+    out = capsys.readouterr().out
+    assert "adopted the kept tunnel already installed" in out and "localhost:18999" in out, out
+    assert "http://127.0.0.1:18999/#token=abc123" in out
+    assert plistlib.loads(plist.read_bytes()) == hand
+    # Forwarding to an old port: replaced, keeping the local port so the link stays the same.
+    hand["ProgramArguments"][-1] = "exec ssh -N -L 18999:127.0.0.1:18650 box"
+    plist.write_bytes(plistlib.dumps(hand))
+    calls.clear()
+    cli.main(["web", "demo", "--tunnel", "--keep"])
+    out = capsys.readouterr().out
+    assert "replaced the kept tunnel" in out and "http://127.0.0.1:18999/#token=abc123" in out, out
+    job = plistlib.loads(plist.read_bytes())
+    argv = job["ProgramArguments"]
+    assert job["KeepAlive"] and job["RunAtLoad"] and argv[-1] == "box"
+    assert "127.0.0.1:18999:127.0.0.1:18700" in argv and "ExitOnForwardFailure=yes" in argv and "BatchMode=yes" in argv
+    assert calls[0] == ("launchctl", "bootout", f"gui/{os.getuid()}/com.tt-project.tunnel.demo")
+    assert ("launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist)) in calls
+    # A kept tunnel already forwards: plain `ttp web` reuses its port and opens nothing.
+    cli.main(["web", "demo"])
+    out = capsys.readouterr().out
+    assert "the kept tunnel forwards localhost:18999" in out and "http://127.0.0.1:18999/" in out, out
+    # Without a kept tunnel nothing opens, and the hint is the command that keeps it, not a request to ask.
+    plist.unlink()
+    cli.main(["web", "demo"])
+    out = capsys.readouterr().out
+    assert "--tunnel --keep" in out and "OK" not in out and "ask" not in out.lower()

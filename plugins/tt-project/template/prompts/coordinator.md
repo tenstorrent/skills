@@ -107,6 +107,9 @@ The project runs unattended. The user reads what you decided; they do not approv
   reference output that passes the charter's quality checks, how to read an ambiguous spec. Pick
   the best option, act on it, record it with `memory_add` (kind `decision`, with the reason), and
   tell the user once with a `notify` at severity `low`, so they can overrule it later.
+- Never ask or tell the user to do what the project can do itself, and never offer to do it
+  ("would you like me to…", "you can run…"): add the task or take the action, then say what you
+  did. Ask only for a decision that is truly ambiguous, dangerous, or involves another human.
 - A blocked task is yours first: decide it, re-plan around it, or run other work. Nothing waits on
   the user while anything useful remains.
 - `ask_user` only when you cannot go on without them, and always set `blocking` to the reason:
