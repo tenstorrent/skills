@@ -2783,18 +2783,26 @@ def _code_task(p, name, status="done"):
     return tid, path, branch
 
 
+def _no_grace(monkeypatch):
+    """Finished worktrees become removable at once (not after worktree.FINISH_GRACE_S)."""
+    from ttp import worktree
+    monkeypatch.setattr(worktree, "FINISH_GRACE_S", 0)
+
+
 def _commit_file(path, name):
     (path / f"{name}.txt").write_text(name)
     _git_out(path, "add", ".")
     _git_out(path, *_IDENT, "commit", "-qm", name)
 
 
-def test_finished_worktrees_are_removed_at_task_end_only_when_nothing_is_lost(env):
+def test_finished_worktrees_are_removed_at_task_end_only_when_nothing_is_lost(env, monkeypatch):
     p = make(env)
+    _no_grace(monkeypatch)
     from ttp.daemon import Daemon
     t_clean, clean, clean_branch = _code_task(p, "clean")
-    (clean / ".gitignore").write_text("build/\n")
+    (clean / ".gitignore").write_text("build/\n*.log\n")
     _commit_file(clean, "clean")
+    (clean / "run.log").write_text("ignored, not a cache: goes with the worktree")
     (clean / "build").mkdir()
     (clean / "build" / "big.o").write_bytes(b"0" * 1000)
     head = _git_out(clean, "rev-parse", "HEAD")
@@ -2853,8 +2861,9 @@ def test_a_tracked_file_in_a_cache_named_directory_is_never_cleared(env):
     assert (path / "build" / "script.sh").exists() and (path / "build" / "out.o").exists()
 
 
-def test_an_untracked_file_in_a_tracked_build_directory_keeps_the_worktree(env):
+def test_an_untracked_file_in_a_tracked_build_directory_keeps_the_worktree(env, monkeypatch):
     p = make(env)
+    _no_grace(monkeypatch)
     from ttp import worktree
     tid, path, _ = _code_task(p, "new build step")
     (path / "tools" / "build").mkdir(parents=True)
@@ -2867,8 +2876,9 @@ def test_an_untracked_file_in_a_tracked_build_directory_keeps_the_worktree(env):
     assert res["cleared"] == [] and "uncommitted" in res["why"] and path.exists()
 
 
-def test_a_finished_worktree_stays_while_an_unfinished_task_still_needs_it(env):
+def test_a_finished_worktree_stays_while_an_unfinished_task_still_needs_it(env, monkeypatch):
     p = make(env)
+    _no_grace(monkeypatch)
     from ttp import worktree
     from ttp.daemon import Daemon
     tid, path, branch = _code_task(p, "change")
@@ -2893,10 +2903,85 @@ def test_a_finished_worktree_stays_while_an_unfinished_task_still_needs_it(env):
                                                            "depends_on": None, "labels": None}])
     assert not worktree.needed_by({"id": 7, "branch": None}, [{"id": 8, "status": "queued", "spec": "#70, t77",
                                                                "depends_on": None, "labels": None}])
+    assert worktree.needed_by({"id": 7, "branch": None}, [{"id": 8, "status": "queued", "depends_on": None,
+                                                           "spec": "cd tt-project/worktrees/t7 && ttp push",
+                                                           "labels": None}])
 
 
-def test_a_task_continuing_one_whose_worktree_was_removed_starts_from_its_commits(env):
+def _sub_git(*args):
+    return ["git", "-c", "protocol.file.allow=always", *_IDENT, *args]
+
+
+def test_a_worktree_with_submodule_commits_is_never_removed(env, monkeypatch):
+    # `git worktree remove --force` deletes the worktree's git directory, and with it modules/,
+    # the only copy of commits made inside a submodule there.
     p = make(env)
+    _no_grace(monkeypatch)
+    from ttp.daemon import Daemon
+    sub = env["tmp"] / "sub"
+    subprocess.run(["git", "init", "-q", str(sub)], check=True)
+    _commit_file(sub, "lib")
+    subprocess.run(_sub_git("-C", str(p.root), "submodule", "add", "-q", str(sub), "sub"), check=True,
+                   capture_output=True)
+    _git_out(p.root, *_IDENT, "commit", "-qm", "add submodule")
+    tid, path, branch = _code_task(p, "bump submodule")
+    assert _git_out(path, "rev-parse", "--abbrev-ref", "HEAD") == branch
+    subprocess.run(_sub_git("-C", str(path), "submodule", "update", "--init", "-q"), check=True, capture_output=True)
+    _commit_file(path / "sub", "fix")
+    sub_head = _git_out(path / "sub", "rev-parse", "HEAD")
+    _git_out(path, "add", "sub")
+    _git_out(path, *_IDENT, "commit", "-qm", "bump sub")
+    assert not _git_out(path, "status", "--porcelain", "--ignore-submodules=none")
+    d = Daemon(p.base)
+    d.prune_worktrees()
+    assert path.exists() and _git_out(path / "sub", "rev-parse", "HEAD") == sub_head, "submodule commits were lost"
+    assert "submodules" in p.db.kv("worktrees_kept")[str(tid)]
+    # A submodule that was never set up in the worktree holds nothing.
+    t2, plain, _ = _code_task(p, "no submodule work")
+    d.prune_worktrees(every_s=0)
+    assert not plain.exists()
+
+
+def test_a_finished_worktree_waits_for_the_review_queued_after_it(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    tid, path, _ = _code_task(p, "change")
+    _commit_file(path, "change")
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+           (time.time(), f"task:{tid}", "task_done", "normal", "done", "queued", tid))
+    p.db.x("UPDATE tasks SET updated=? WHERE id=?", (time.time() - 7200, tid))
+    d = Daemon(p.base)
+    d.prune_worktrees()
+    assert path.exists(), "the worktree went before the coordinator saw the task end"
+    assert "not yet seen" in p.db.kv("worktrees_kept")[str(tid)]
+    p.db.x("UPDATE events SET status='handled' WHERE task=?", (tid,))
+    p.db.x("UPDATE tasks SET updated=? WHERE id=?", (time.time(), tid))
+    d.prune_worktrees(every_s=0)
+    assert path.exists(), "the worktree went within the grace period"
+    review = p.db.add_task("review change", "Review it, then ttp push.", kind="review", tier="light",
+                           origin="user", depends_on=[tid])
+    p.db.x("UPDATE tasks SET updated=? WHERE id=?", (time.time() - 7200, tid))
+    d.prune_worktrees(every_s=0)
+    assert path.exists(), "the worktree went while its review was queued"
+    p.db.update_task(review, status="done")
+    d.prune_worktrees()
+    assert not path.exists()
+
+
+def test_worktree_retention_days_zero_never_removes(env, monkeypatch):
+    p = make(env)
+    _no_grace(monkeypatch)
+    from ttp.daemon import Daemon
+    p.set_config("disk.worktree_retention_days", 0)
+    _, path, _ = _code_task(p, "kept")
+    p.db.x("UPDATE tasks SET updated=?", (time.time() - 30 * 86400,))
+    Daemon(p.base).prune_worktrees()
+    assert path.exists()
+
+
+def test_a_task_continuing_one_whose_worktree_was_removed_starts_from_its_commits(env, monkeypatch):
+    p = make(env)
+    _no_grace(monkeypatch)
     from ttp import worktree
     from ttp.daemon import Daemon
     old, path, _ = _code_task(p, "old", status="failed")
@@ -2913,8 +2998,9 @@ def test_a_task_continuing_one_whose_worktree_was_removed_starts_from_its_commit
     assert _git_out(again, "rev-parse", "HEAD") == head
 
 
-def test_worktree_retention_delays_removal(env):
+def test_worktree_retention_delays_removal(env, monkeypatch):
     p = make(env)
+    _no_grace(monkeypatch)
     from ttp.daemon import Daemon
     p.set_config("disk.worktree_retention_days", 7)
     tid, recent, _ = _code_task(p, "recent")
@@ -2924,8 +3010,9 @@ def test_worktree_retention_delays_removal(env):
     assert recent.exists() and not old.exists()
 
 
-def test_ttp_prune_sweeps_finished_worktrees_once(env, capsys):
+def test_ttp_prune_sweeps_finished_worktrees_once(env, capsys, monkeypatch):
     p = make(env)
+    _no_grace(monkeypatch)
     from ttp import cli
     _, clean, branch = _code_task(p, "clean")
     t_dirty, dirty, _ = _code_task(p, "dirty")

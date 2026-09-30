@@ -96,20 +96,34 @@ def resolve_base(p: Project) -> str:
 
 
 def remove(p: Project, task_id: int) -> None:
-    """Remove a task's worktree; its branch stays. Call only once keep_reason() found nothing to lose:
-    ignored files go with it, and so do checked-out submodules (which plain `remove` refuses)."""
+    """Remove a task's worktree; its branch stays. Call only once keep_reason() found nothing to lose.
+    Ignored files go with it. No --force: git itself then refuses a worktree with changes or with
+    submodules, whose commits may live only in the worktree's own git directory."""
     path = p.worktrees / f"t{task_id}"
     if path.exists():
-        _git(p.root, "worktree", "remove", "--force", str(path))
+        _git(p.root, "worktree", "remove", str(path))
     _git(p.root, "worktree", "prune", check=False)
 
 
 def keep_reason(path: Path) -> str | None:
-    """Why this worktree must stay, or None when removing it loses nothing: no uncommitted or
-    untracked files (submodules included), and its HEAD is on a local or remote branch (the
-    task's own branch is never deleted, so its commits stay reachable)."""
+    """Why this worktree must stay, or None when removing it loses nothing: no submodules set up in
+    it, no uncommitted or untracked files, and its HEAD is on a local or remote branch (the task's
+    own branch is never deleted, so its commits stay reachable)."""
     def git(*args: str) -> subprocess.CompletedProcess:
         return subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True, timeout=300)
+    # A submodule's repository lives in the worktree's own git directory (modules/), so commits made
+    # in it exist nowhere else and removing the worktree would delete them. Such a worktree stays.
+    gd = git("rev-parse", "--absolute-git-dir")
+    if gd.returncode != 0:
+        return "git rev-parse failed"
+    modules = Path(gd.stdout.strip()) / "modules"
+    subs = git("submodule", "status")
+    if subs.returncode != 0:
+        return "git submodule status failed"
+    inited = [ln.split()[1] for ln in subs.stdout.splitlines() if ln.strip() and not ln.startswith("-")]
+    if inited or (modules.is_dir() and any(modules.iterdir())):
+        return ("has submodules set up (" + (", ".join(inited[:3]) or "modules/") + "); their commits may exist "
+                "only here, so it is never removed automatically")
     st = git("status", "--porcelain", "--ignore-submodules=none")
     if st.returncode != 0:
         return "git status failed"
@@ -171,10 +185,10 @@ def clear_caches(path: Path, names: list[str] | None = None) -> list[str]:
 def needed_by(task: dict, open_tasks: list[dict]) -> dict | None:
     """The first unfinished task that may still work in this task's worktree (a review that runs
     `ttp push` there, say): it depends on or continues the task, or its spec names the task's
-    branch or id (#12, t12, task 12)."""
+    branch or id (#12, t12, task 12, worktrees/t12)."""
     from .db import dependency_ids
     tid, branch = task["id"], task.get("branch")
-    named = re.compile(rf"(?<![\w/.-])(?:#|t|task\s+){tid}(?!\d)"
+    named = re.compile(rf"(?<![\w.-])(?:#|t|task\s+){tid}(?!\d)"
                        + (rf"|(?<![\w/.-]){re.escape(branch)}(?![\w/-])" if branch else ""), re.I)
     for t in open_tasks:
         if t["id"] != tid and (tid in dependency_ids(t) or continues_id(t) == tid or named.search(t.get("spec") or "")):
@@ -182,13 +196,31 @@ def needed_by(task: dict, open_tasks: list[dict]) -> dict | None:
     return None
 
 
+# A finished task's worktree stays at least this long, and while the coordinator has not yet seen how
+# the task ended: the review that pushes from it is often queued only after that.
+FINISH_GRACE_S = 3600
+
+
+def held_by(p: Project, task: dict, open_tasks: list[dict], now: float) -> str | None:
+    """Why a finished task's worktree must stay untouched for now, or None."""
+    user = needed_by(task, open_tasks)
+    if user:
+        return f"task #{user['id']} ({user['status']}) may still use it"
+    if p.db.one("SELECT id FROM events WHERE task=? AND status='queued' LIMIT 1", (task["id"],)):
+        return "the coordinator has not yet seen how it ended"
+    if now - float(task["updated"] or now) < FINISH_GRACE_S:
+        return f"it ended under {FINISH_GRACE_S // 60} min ago; kept for a review"
+    return None
+
+
 def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None,
           skip=lambda task: False) -> list[dict]:
     """Tidy the worktrees of finished tasks (done, failed, cancelled) with no run still going: clear
     their build and cache directories, then remove each one whose removal loses nothing (see
-    keep_reason). A worktree an unfinished task still needs (see needed_by) is left as it is, and
-    reported with `held` set. Branches stay, so a task that `continues` one starts from its commits.
-    One sweep at a time per project; a busy lock returns no results."""
+    keep_reason). A worktree that may still be wanted (see held_by: an unfinished task needs it, the
+    coordinator has not seen the finish yet, or it ended under FINISH_GRACE_S ago) is left as it
+    is, and reported with `held` set. Branches stay, so a task that `continues` one starts from its
+    commits. One sweep at a time per project; a busy lock returns no results."""
     import fcntl
     import time
     from .db import TERMINAL_TASK_STATES
@@ -214,10 +246,9 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
                 continue
             res = {"task": task["id"], "path": str(path), "branch": task["branch"], "status": task["status"],
                    "updated": task["updated"]}
-            user = needed_by(task, open_tasks)
-            if user:
-                out.append({**res, "cleared": [], "held": True,
-                            "why": f"task #{user['id']} ({user['status']}) may still use it"})
+            why = held_by(p, task, open_tasks, now)
+            if why:
+                out.append({**res, "cleared": [], "held": True, "why": why})
                 continue
             try:
                 res["cleared"] = clear_caches(path, names)

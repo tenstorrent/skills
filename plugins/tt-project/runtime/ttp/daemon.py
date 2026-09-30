@@ -1331,16 +1331,20 @@ class Daemon:
     def prune_worktrees(self, every_s: float = 300) -> None:
         """Tidy finished tasks' worktrees (worktree.sweep) soon after they end: every `every_s`, and
         at once when a task finished since the last sweep. `disk.worktree_retention_days` delays
-        removal (0, the default, removes right away). A worktree kept for a reason is checked again
-        when its task changes or after KEEP_RECHECK_S. Branches are never deleted."""
+        removal (null, the default: no delay beyond worktree.held_by; 0 or less: never tidy, as
+        before). A worktree kept for a reason is checked again when its task changes or after
+        KEEP_RECHECK_S. Branches are never deleted."""
         now = time.time()
+        cfg = self.cfg.get("disk", {})
+        days = cfg.get("worktree_retention_days")
+        if days is not None and float(days) <= 0:
+            return
         latest = self.p.db.one("SELECT MAX(updated) m FROM tasks WHERE status IN (%s)"
                                % ",".join("?" * len(TERMINAL_TASK_STATES)), TERMINAL_TASK_STATES)["m"] or 0
         if (now - self._last_prune < every_s and latest <= self._pruned_upto) or not self.p.worktrees.is_dir():
             return
         self._last_prune, self._pruned_upto = now, latest
-        cfg = self.cfg.get("disk", {})
-        days = float(cfg.get("worktree_retention_days", 0) or 0)
+        days = float(days or 0)
 
         def recent(task: dict) -> bool:
             memo = self._kept.get(task["id"])
@@ -1355,7 +1359,7 @@ class Daemon:
             else:
                 if r["task"] not in self._kept:
                     log(self.p, f"worktree {r['path']} of task {r['task']} kept: {r['why']}")
-                # Held for another task: checked again every sweep (no git work), so it goes soon after that task ends.
+                # Held (see worktree.held_by): checked again every sweep (no git work), so it goes soon after the hold ends.
                 self._kept[r["task"]] = (r["updated"], 0 if r.get("held") else now, r["why"])
         kept = {str(t): why for t, (_, _, why) in sorted(self._kept.items())
                 if (self.p.worktrees / f"t{t}").exists()}

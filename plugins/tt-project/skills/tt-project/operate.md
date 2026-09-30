@@ -41,8 +41,10 @@
 - When a task ends (done, failed, cancelled), its worktree loses its git-ignored build and cache
   directories (`disk.cache_dirs`) and is removed once clean with HEAD on a branch. Branches are never
   deleted, so `continues` still starts from the old commits. A dirty worktree is kept and listed, and
-  so is one an unfinished task still needs (it depends on or continues the task, or its spec names
-  the task's branch or id), until that task ends.
+  so is one with submodules set up (their commits may exist only there). A worktree is left untouched
+  for at least an hour after its task ends, until the coordinator has seen the result, and while an
+  unfinished task still needs it (it depends on or continues the task, or its spec names the task's
+  branch, id or `worktrees/tN` path). `disk.worktree_retention_days` waits longer; 0 never tidies.
   `ttp prune <name>` sweeps now.
 - Coordinator failing repeatedly → an alert says so; messages are kept, not lost.
 - A worker that produces nothing for too long is stopped and retried (stall guard).
