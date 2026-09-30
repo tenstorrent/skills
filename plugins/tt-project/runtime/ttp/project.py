@@ -8,6 +8,7 @@ import json
 import os
 import re
 import socket
+import subprocess
 import time
 from pathlib import Path
 from typing import Any
@@ -146,6 +147,25 @@ class Project:
         return self.raw_config().get("name", self.root.name)
 
     # memory -----------------------------------------------------------------------------------
+    def commit_harness(self, paths: list[Path], message: str) -> bool:
+        """Commit just these harness files, so the project's history shows what it learned and when.
+
+        Only the named paths are committed: a harness task may be editing other files right now,
+        and its half-done work must not be swept into this commit.
+        """
+        rel = [str(Path(x).resolve().relative_to(self.harness.resolve())) for x in paths if Path(x).exists()]
+        if not rel or not (self.harness / ".git").exists():
+            return False
+        ident = ["-c", "user.name=tt-project", "-c", "user.email=tt-project@localhost"]
+        try:
+            subprocess.run(["git", "-C", str(self.harness), "add", "--", *rel], check=True, capture_output=True,
+                           timeout=30)
+            r = subprocess.run(["git", "-C", str(self.harness), *ident, "commit", "-q", "-m", message[:200], "--",
+                                *rel], capture_output=True, timeout=30)
+            return r.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            return False
+
     def add_memory(self, text: str, kind: str = "fact", title: str | None = None) -> Path:
         """One fact per file plus a one-line pointer in MEMORY.md, so the index stays cheap to load."""
         self.memory_dir.mkdir(parents=True, exist_ok=True)
@@ -160,6 +180,7 @@ class Project:
         path.write_text(f"---\nkind: {kind}\ncreated: {time.strftime('%Y-%m-%d')}\n---\n{text}\n")
         with open(self.memory_index, "a") as f:
             f.write(f"- [{title}](memory/{path.name}) ({kind})\n")
+        self.commit_harness([path, self.memory_index], f"memory ({kind}): {title}")
         return path
 
     def memory_text(self, limit_chars: int = 12000) -> str:

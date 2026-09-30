@@ -359,3 +359,36 @@ def test_claude_workers_get_the_update_hook_but_decisions_do_not(env):
     settings = json.loads(worker[worker.index("--settings") + 1])
     assert "ttp.hook PostToolUse" in settings["hooks"]["PostToolUse"][0]["hooks"][0]["command"]
     assert "--settings" not in turn
+
+
+def test_charter_restrictions_lead_and_close_every_worker_prompt(env):
+    p = make(env)
+    p.charter_path.write_text("# demo\n\n## Goals\nGo fast.\n\n## Restrictions\n(none stated yet)\n\n"
+                              "## Policies\nDraft PRs.\n\n## Restrictions (added 2026-09-30)\n"
+                              "Never merge to main.\n")
+    from ttp.prompts import charter_restrictions, worker_prompt
+    from ttp.coordinator import system_prompt
+    body = charter_restrictions(p.charter_path.read_text())
+    assert body == "Never merge to main."
+    tid = p.db.add_task("tidy docs", "tidy the docs", kind="work", tier="light", origin="user")
+    prompt = worker_prompt(p, p.db.task(tid), str(p.root), None)
+    assert prompt.startswith("# BINDING RESTRICTIONS")
+    assert prompt.rstrip().endswith("Never merge to main.")
+    assert system_prompt(p).startswith("# BINDING RESTRICTIONS")
+
+
+def test_charter_and_memory_changes_are_committed_alone(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    (p.harness / "prompts" / "scratch.md").write_text("a harness task's unfinished edit\n")
+    problems = coord.apply(p, [
+        {"type": "memory_add", "text": "Prefer the p100 boards for quick checks.", "memory_kind": "preference"},
+        {"type": "charter_update", "section": "Policies", "text": "Label every number with its board."}])
+    assert problems == []
+    log = subprocess.run(["git", "-C", str(p.harness), "log", "--format=%s", "-3"], capture_output=True,
+                         text=True).stdout
+    assert "memory (preference)" in log and "charter (policies)" in log
+    status = subprocess.run(["git", "-C", str(p.harness), "status", "--porcelain"], capture_output=True,
+                            text=True).stdout
+    assert "prompts/scratch.md" in status, "someone else's unfinished edit was swept into the commit"
+    assert "CHARTER.md" not in status and "MEMORY.md" not in status

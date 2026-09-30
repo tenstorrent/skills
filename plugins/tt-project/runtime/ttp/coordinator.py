@@ -56,7 +56,12 @@ def system_prompt(p: Project) -> str:
     role = (p.harness / "prompts" / "coordinator.md").read_text()
     charter = p.charter_path.read_text() if p.charter_path.exists() else "(no charter yet)"
     memory = p.memory_text() or "(no memories yet)"
-    return f"{role}\n\n# CHARTER\n{charter}\n\n# MEMORY\n{memory}\n"
+    from .prompts import restrictions_block
+    rules = restrictions_block(p)
+    if rules:
+        rules += ("\nWorkers are shown this block verbatim; when a spec touches anything it covers, "
+                  "restate the relevant restriction in the spec itself.\n\n")
+    return f"{rules}{role}\n\n# CHARTER\n{charter}\n\n# MEMORY\n{memory}\n"
 
 
 def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int]) -> str:
@@ -191,6 +196,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None) -> l
                 section = (a.get("section") or "Notes").strip().title()
                 with open(p.charter_path, "a") as f:
                     f.write(f"\n## {section} (added {time.strftime('%Y-%m-%d')})\n{a['text'].strip()}\n")
+                p.commit_harness([p.charter_path], f"charter ({section.lower()}): {a['text'].strip()[:80]}")
             elif t == "schedule_set":
                 sched.upsert(db, a["name"], a.get("kind") or "llm", a.get("every") or "1d", a.get("at"),
                              bool(a.get("enabled", True)), a.get("budget_usd"), a.get("text") or "",

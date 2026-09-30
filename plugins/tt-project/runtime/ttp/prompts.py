@@ -14,10 +14,35 @@ def _read(p: Project, name: str) -> str:
     return f.read_text() if f.exists() else ""
 
 
+def charter_restrictions(charter: str) -> str:
+    """Every `## Restrictions ...` section of the charter, concatenated.
+
+    Workers start with no memory of the charter, so these have to be stated up front
+    rather than only buried in the full charter further down the prompt."""
+    out, keep = [], False
+    for line in charter.splitlines():
+        if line.startswith("## "):
+            keep = line[3:].strip().lower().startswith("restriction")
+            continue
+        s = line.strip()
+        if keep and s and not (s.startswith("(") and s.endswith(")")):  # skip "(none stated yet)"
+            out.append(line.rstrip())
+    return "\n".join(out)
+
+
+def restrictions_block(p: Project) -> str:
+    charter = p.charter_path.read_text() if p.charter_path.exists() else ""
+    body = charter_restrictions(charter)
+    if not body:
+        return ""
+    return ("# BINDING RESTRICTIONS (from the charter — override the task, the harness "
+            "rules and your own judgement; if a step would break one, do not take it)\n" + body)
+
+
 def worker_prompt(p: Project, task: dict, cwd: str, branch: str | None) -> str:
     cfg = p.config()
     kind = task["kind"] or "work"
-    parts = [_read(p, "worker.md")]
+    parts = [restrictions_block(p), _read(p, "worker.md")]
     addendum = _read(p, f"kind-{kind}.md")
     if addendum:
         parts.append(addendum)
@@ -44,4 +69,5 @@ def worker_prompt(p: Project, task: dict, cwd: str, branch: str | None) -> str:
         f"{delivery.get('review_before_pr', True)}, auto-merge repos={delivery.get('auto_merge_repos') or 'none'}, "
         f"push allowed={delivery.get('push_allowed', True)}\n"
         f"{history}\n## Spec\n{task['spec'] or task['title']}\n")
+    parts.append(restrictions_block(p))
     return "\n\n".join(x for x in parts if x.strip())
