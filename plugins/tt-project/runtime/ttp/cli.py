@@ -507,6 +507,8 @@ def status_text(p: Project) -> str:
     for t in db.q("SELECT id,title,status,blocked_reason FROM tasks WHERE status IN ('blocked','review') "
                   "ORDER BY status, id LIMIT 8"):
         lines.append(f"  #{t['id']} {t['status']}: {t['title']}" + (f" — {t['blocked_reason']}" if t["blocked_reason"] else ""))
+    if h.get("host"):
+        lines.append(h["host"])
     disk = db.kv("disk_low")
     if disk:
         lines.append(f"disk: only {disk['free_gb']} GB free under {disk['path']}; no new worker runs start")

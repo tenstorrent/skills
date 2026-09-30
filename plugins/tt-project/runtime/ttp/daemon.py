@@ -86,6 +86,8 @@ class Daemon:
         self._probe_rc: dict[int, tuple[int | str, float]] = {}   # last verdict: exit code or why, when
         self._reboot_told = False
         self._boot_woken = False
+        self._held: list[str] | None = None   # lock holders the heartbeat file last recorded
+        self._note_boot()
 
     # lifecycle ------------------------------------------------------------------------------------
     def run(self) -> int:
@@ -144,12 +146,40 @@ class Daemon:
         except OSError:
             pass
 
+    def _note_boot(self) -> None:
+        """On a new boot, keep what the earlier boot's last heartbeat said (when, and the resources
+        held then) before this daemon's first tick overwrites it; the boot event is written from it
+        once the runs the reboot cut short are reaped."""
+        try:
+            db = self.p.db
+            if (db.kv("boot_prev") or {}).get("boot") == self.boot:
+                return
+            hb = heartbeat(self.p) or {}
+            # An older runtime's heartbeat has no boot id; the boot last told about stands in.
+            prev = hb.get("boot") or db.kv("reboot_told")
+            if not prev or prev == self.boot:
+                return
+            db.set_kv("boot_prev", {"boot": self.boot, "prev_boot": prev, "held": hb.get("held") or [],
+                                    "last_heartbeat": time.time() - hb["age"] if "age" in hb else None})
+        except Exception:
+            log(self.p, "boot record: " + traceback.format_exc().replace("\n", " | ")[:1000])
+
     def _beat(self) -> None:
         """A completed tick. `status`, the web app and `ttp restart` read its age; the first one
-        marks the harness commit this runtime is known to run on."""
+        marks the harness commit this runtime is known to run on. The file names the boot and the
+        resources held, so the next boot can say what a reboot cut off; it is rewritten only when
+        those change."""
         hb = self.p.state / "heartbeat"
+        held = locks.held(self.p.state / "locks")
+        if not self._healthy or held != self._held:
+            tmp = hb.with_name(f"heartbeat.{os.getpid()}.tmp")
+            tmp.write_text(json.dumps({"pid": os.getpid(), "host": hostname(), "started": self._started,
+                                       "boot": self.boot, "held": held}))
+            os.replace(tmp, hb)
+            self._held = held
+        else:
+            os.utime(hb, None)
         if not self._healthy:
-            hb.write_text(json.dumps({"pid": os.getpid(), "host": hostname(), "started": self._started}))
             self._healthy = True
             try:
                 head = subprocess.run(["git", "-C", str(self.p.harness), "rev-parse", "HEAD"], capture_output=True,
@@ -158,8 +188,6 @@ class Daemon:
                     self.p.db.set_kv("harness_good", {"commit": head.stdout.strip(), "ts": time.time()})
             except (OSError, subprocess.SubprocessError):
                 pass
-        else:
-            os.utime(hb, None)
 
     def tick(self) -> None:
         now = time.time()
@@ -342,8 +370,10 @@ class Daemon:
         self._tell_reboot()
 
     def _tell_reboot(self) -> None:
-        """Once per boot, after every run of an earlier boot is reaped: which runs the reboot cut
-        short, what they cost and what became of their tasks. A restart on the same boot says nothing."""
+        """Once per boot, after every run of an earlier boot is reaped: record the boot (when, the
+        earlier boot's last heartbeat, the runs it cut short and the resources held then) and tell
+        which runs it cut short, what they cost, what became of their tasks and how often the host
+        rebooted lately. A restart on the same boot says nothing."""
         db = self.p.db
         if self._reboot_told or db.one("SELECT COUNT(*) n FROM runs WHERE status='running' AND boot_id IS NOT NULL "
                                        "AND boot_id!=?", (self.boot,))["n"]:
@@ -356,16 +386,43 @@ class Daemon:
             lost = [r for r in db.q("SELECT id, task, role, cost_usd, note FROM runs WHERE status='lost' "
                                     "AND boot_id!=? AND note LIKE ?", (self.boot, f"%{self.boot}%"))
                     if json.loads(r["note"] or "{}").get("lost_to_reboot") == self.boot]
+            prev = db.kv("boot_prev") or {}
+            if prev.get("boot") != self.boot:
+                prev = {}
+            if not lost and not prev:
+                return   # the first start of this project, or nothing says the host rebooted
+            now = time.time()
+            usd = sum(float(r["cost_usd"] or 0) for r in lost)
+            held = list(prev.get("held") or [])
+            booted = runner.boot_time()
+            data = {"boot": self.boot, "boot_time": booted, "prev_boot": prev.get("prev_boot"),
+                    "last_heartbeat": prev.get("last_heartbeat"), "held": held, "lost_usd": round(usd, 2),
+                    "lost": [{"run": r["id"], "task": r["task"], "role": r["role"],
+                              "usd": round(float(r["cost_usd"] or 0), 2)} for r in lost]}
+            # A record, not news: the coordinator sees it in its digest, not as a new event.
+            db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status) VALUES(?,?,?,?,?,?,?,?)",
+                 (min(booted or now, now), "host", "boot", f"boot:{self.boot}", "normal",
+                  f"the host rebooted; {len(lost)} run(s) cut short", json.dumps(data), "record"))
             if not lost:
                 return
+            boots = db.boots(now - 86400)
+            cut = sum(1 for b in boots if b.get("lost"))
+            severity, unstable = "normal", ""
+            if cut >= 3 and now - float(db.kv("host_unstable_told") or 0) >= 86400:
+                db.set_kv("host_unstable_told", now)
+                severity = "high"
+                unstable = (f" The host looks unstable: {cut} reboots cut runs short in 24 h; check its power, "
+                            f"cooling and system logs.")
+            then = f" Held at its last heartbeat: {', '.join(held)}." if held else ""
             parts = []
             for r in lost:
                 task = db.task(r["task"]) if r["task"] else None
                 parts.append(f"run {r['id']} (#{task['id']} {task['title'][:60]} → {task['status']})" if task
                              else f"run {r['id']} ({r['role']})")
-            usd = sum(float(r["cost_usd"] or 0) for r in lost)
-            db.post("out", f"The host rebooted; {len(lost)} run(s) were cut short (${usd:.2f}): "
-                           f"{'; '.join(parts)}"[:3000], kind="alert", severity="normal", ref=f"reboot:{self.boot}")
+            nth = ordinal(max(len(boots), 1))
+            db.post("out", f"The host rebooted ({nth} reboot in 24 h); {len(lost)} run(s) were cut short "
+                           f"(${usd:.2f}).{then}{unstable} Runs: {'; '.join(parts)}"[:3000],
+                    kind="alert", severity=severity, ref=f"reboot:{self.boot}")
 
     def _end_orphan(self, r: dict) -> None:
         """A supervisor that died (kill -9, OOM) leaves its agent running with no wall clock, budget
@@ -1762,6 +1819,10 @@ def _is_daemon(pid: int) -> bool:
     except (OSError, subprocess.SubprocessError):
         return True
     return "ttp" in cmd and "daemon" in cmd
+
+
+def ordinal(n: int) -> str:
+    return f"{n}{'th' if 10 <= n % 100 <= 20 else {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')}"
 
 
 def heartbeat(p: Project) -> dict | None:

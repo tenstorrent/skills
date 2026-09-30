@@ -18,7 +18,8 @@ from typing import Any
 
 from . import push
 from . import schedule as sched
-from .db import SEVERITY_RANK, TERMINAL_TASK_STATES, continues_id, dependency_ids, dump_result, load_result
+from .db import (SEVERITY_RANK, TERMINAL_TASK_STATES, continues_id, dependency_ids, dump_result, host_line,
+                 load_result)
 from .project import Project
 from .runner import stop_runs
 
@@ -148,6 +149,11 @@ def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int]) ->
         lines.append(f"- {prov}: {g['level']} ({'; '.join(g['reasons']) or 'ok'}) · {money} · max_tier={g['max_tier']} "
                      f"max_parallel={g['max_parallel']} optional_work={'yes' if g['allow_optional'] else 'no'}")
     lines.append(f"- per-task default budgets: {b.get('task_default_usd')}")
+    boots = db.boots(now - 86400)
+    if boots:
+        at_each = "; ".join(f"{time.strftime('%H:%M', time.localtime(x['ts']))} "
+                            f"{', '.join(x.get('held') or []) or 'nothing'}" for x in boots)
+        lines.append(f"## Host: {host_line(boots)[len('host: '):]}; held at each: {clip(at_each, 600)}")
     lines.append("## Open tasks (id | status | tier | priority | age | title | last note)")
     rows = db.q("SELECT * FROM tasks WHERE status NOT IN ('done','failed','cancelled') ORDER BY priority, id LIMIT 60")
     for t in rows:

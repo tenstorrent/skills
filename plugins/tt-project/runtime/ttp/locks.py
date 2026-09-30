@@ -72,6 +72,34 @@ def holders(paths: list[Path]) -> list[str]:
     return out
 
 
+def held(locks_dir: Path) -> list[str]:
+    """Who holds each resource right now, and who has one reserved: "device: task #3 (run 9) since
+    10:02". A slot file keeps its label after release, so only slots whose lock is taken count;
+    testing takes a free one for an instant, which a `ttp lock` trying then just retries."""
+    out, locks_dir = [], Path(locks_dir)
+    try:
+        slots = sorted(locks_dir.glob("*.lock"))
+        marks = sorted(locks_dir.glob("*.reserved"))
+    except OSError:
+        return out
+    for path in slots:
+        try:
+            with open(path) as f:
+                try:
+                    fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                    continue
+                except OSError:
+                    pass
+        except OSError:
+            continue
+        out += [f"{path.name.rsplit('.', 2)[0]}: {h}" for h in holders([path])]
+    for path in marks:
+        who = reserved_by(path)
+        if who:
+            out.append(f"{path.name[:-len('.reserved')]}: reserved for {who}")
+    return out
+
+
 def reserve_path(locks_dir: Path, resource: str) -> Path:
     return Path(locks_dir) / f"{resource}.reserved"
 

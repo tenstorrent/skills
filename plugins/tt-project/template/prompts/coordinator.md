@@ -49,6 +49,9 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
 - A task that touches a shared resource (a device, a reserved machine) lists it in `resources`. The
   worker locks it per command, so the task still runs alongside others. Set `exclusive: true` only
   when the whole task must hold the resource alone.
+- A `## Host` line in STATE means the host rebooted in the last 24 h and names what was held at
+  each reboot: when reboots keep hitting while one resource is in use, run the tasks on it one at a
+  time (`exclusive: true`) until they stop.
 - A `spec` sent in `task_update` for a running task reaches its worker mid-run. Use that to
   rescope; cancel and re-add only when the work must start over.
 - A task whose resource is busy comes back `waiting` and retries by itself. Do not re-add it.

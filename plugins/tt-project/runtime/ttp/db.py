@@ -157,6 +157,13 @@ class DB:
         self.x("INSERT INTO kv(key,value,ts) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET "
                "value=excluded.value, ts=excluded.ts", (key, json.dumps(value), time.time()))
 
+    def boots(self, since: float) -> list[dict]:
+        """Reboots the daemon recorded since `since`, oldest first: ts (the boot time where known)
+        plus the boot event's data (runs lost, resources held at the last heartbeat before it)."""
+        rows = self.q("SELECT ts, data FROM events WHERE source='host' AND kind='boot' AND ts>? ORDER BY ts, id",
+                      (since,))
+        return [{**json.loads(r["data"] or "{}"), "ts": r["ts"]} for r in rows]
+
     # messages ------------------------------------------------------------------------------
     def post(self, direction: str, text: str, chat: str | None = None, channel: str = "chat",
              kind: str = "user", severity: str = "normal", ref: str | None = None,
@@ -262,6 +269,18 @@ class DB:
 
 
 SEVERITY_RANK = {"info": 0, "low": 0, "normal": 1, "high": 2, "critical": 3}
+
+
+def host_line(boots: list[dict]) -> str:
+    """'host: N reboots in 24 h (last HH:MM), M runs lost ($X)' for the boots of the last day, as
+    DB.boots returns them; '' when there were none."""
+    if not boots:
+        return ""
+    lost = sum(len(b.get("lost") or []) for b in boots)
+    usd = sum(float(b.get("lost_usd") or 0) for b in boots)
+    last = time.strftime("%H:%M", time.localtime(boots[-1]["ts"]))
+    return (f"host: {len(boots)} reboot{'' if len(boots) == 1 else 's'} in 24 h (last {last}), "
+            f"{lost} run{'' if lost == 1 else 's'} lost (${usd:.2f})")
 
 
 def chat_floor(chat_min: str | None, project_min: str | None) -> str:

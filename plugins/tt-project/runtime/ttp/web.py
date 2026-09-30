@@ -16,7 +16,7 @@ from urllib.parse import parse_qs, urlparse
 from . import budget as bud
 from . import schedule as sched
 from .daemon import HEARTBEAT_STALE_S, heartbeat
-from .db import DB, SEVERITY_RANK, chat_floor, dump_result, load_result
+from .db import DB, SEVERITY_RANK, chat_floor, dump_result, host_line, load_result
 from .project import Project
 from .providers import get_provider
 from .runner import stop_runs
@@ -219,6 +219,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         "providers_paused": paused_providers, "waiting": waiting, "asks": asks, "running": running, "working": working,
         "undelivered": undelivered,
         "why_idle": "; ".join(why) if not running else "", "held": held,
+        "host": host_line(db.boots(now - DAY)),
     }
 
 

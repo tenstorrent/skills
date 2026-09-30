@@ -4798,6 +4798,87 @@ def test_runs_lost_to_a_reboot_are_not_runaway_waste_and_are_announced_once(env,
     assert "$53.00" in text and all(f"run {r}" in text for r in rids) and "queued" in text, text
 
 
+def _boot_as(monkeypatch, boot, booted=None):
+    from ttp import runner
+    monkeypatch.setattr(runner, "boot_id", lambda: boot)
+    monkeypatch.setattr(runner, "boot_time", lambda: booted)
+
+
+def test_a_reboot_is_recorded_with_the_runs_it_cut_and_the_locks_held(env, tmp_path, monkeypatch):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import locks
+    from ttp.cli import status_text
+    from ttp.daemon import Daemon
+    from ttp.web import health
+    _boot_as(monkeypatch, "boot-a")
+    before = Daemon(p.base)
+    before.tick()
+    slot = locks.try_take(locks.slot_paths(p.state / "locks", "board", 1), "task #7 (run 3)", "make test")
+    before._beat()   # the last heartbeat before the power went: the board was in use
+    slot.close()     # the reboot ended the lock; its slot file keeps the label
+    assert locks.held(p.state / "locks") == [], "a released slot counted as held"
+    tids, rids = _lost_deep_runs(p, tmp_path, "boot-a")
+    booted = time.time() - 120
+    _boot_as(monkeypatch, "boot-b", booted)
+    d = Daemon(p.base)
+    d._beat()        # this boot's first heartbeat does not erase what the last one said
+    d.tick()
+    d.tick()
+    rows = p.db.q("SELECT ts, status, data FROM events WHERE source='host' AND kind='boot'")
+    assert len(rows) == 1 and rows[0]["status"] == "record" and rows[0]["ts"] == booted, rows
+    data = json.loads(rows[0]["data"])
+    assert data["prev_boot"] == "boot-a" and data["boot_time"] == booted and data["last_heartbeat"]
+    assert [x["run"] for x in data["lost"]] == rids and data["lost_usd"] == 53.0
+    assert len(data["held"]) == 1 and data["held"][0].startswith("board: task #7 (run 3) since"), data["held"]
+    note = _reboot_notices(p)
+    assert len(note) == 1 and note[0]["severity"] == "normal", note
+    assert "1st reboot in 24 h" in note[0]["text"] and "board: task #7" in note[0]["text"], note
+    line = f"host: 1 reboot in 24 h (last {time.strftime('%H:%M', time.localtime(booted))}), 2 runs lost ($53.00)"
+    assert health(p, p.db)["host"] == line
+    assert line in status_text(p).splitlines()
+    digest = coord.digest(p, {}, [], [])
+    assert "## Host: 1 reboot in 24 h" in digest and "held at each:" in digest and "board: task #7" in digest
+    Daemon(p.base).tick()   # a restart on the same boot records nothing new
+    assert len(p.db.boots(0)) == 1
+
+
+def test_the_third_reboot_with_lost_runs_in_a_day_raises_one_high_alert(env, tmp_path, monkeypatch):
+    p = make(env)
+    from ttp.daemon import Daemon
+    _boot_as(monkeypatch, "boot-0")
+    Daemon(p.base).tick()
+    for i in range(1, 5):
+        (tmp_path / f"b{i}").mkdir()
+        _lost_deep_runs(p, tmp_path / f"b{i}", f"boot-{i - 1}", costs=(1.0,))
+        _boot_as(monkeypatch, f"boot-{i}", time.time() - (5 - i) * 600)
+        d = Daemon(p.base)
+        d.tick()
+        d.tick()
+    notes = _reboot_notices(p)
+    assert len(notes) == 4, notes
+    assert [n["severity"] for n in notes] == ["normal", "normal", "high", "normal"], notes
+    assert "3rd reboot in 24 h" in notes[2]["text"] and "looks unstable" in notes[2]["text"], notes[2]
+    assert "4th reboot in 24 h" in notes[3]["text"] and "unstable" not in notes[3]["text"]
+
+
+def test_no_host_line_without_a_reboot_in_the_last_day(env, tmp_path, monkeypatch):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.cli import status_text
+    from ttp.daemon import Daemon
+    from ttp.web import health
+    _boot_as(monkeypatch, "boot-a")
+    Daemon(p.base).tick()
+    Daemon(p.base).tick()   # restarts on one boot are not reboots
+    assert not p.db.boots(0)
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,data,status) VALUES(?,?,?,?,?,?,?)",
+           (time.time() - 2 * 86400, "host", "boot", "normal", "old", json.dumps({"lost": [], "held": []}), "record"))
+    assert health(p, p.db)["host"] == ""
+    assert "host:" not in status_text(p)
+    assert "## Host" not in coord.digest(p, {}, [], [])
+
+
 def test_runs_lost_on_the_same_boot_still_trip_the_runaway_guard(env, tmp_path):
     p = make(env)
     from ttp.daemon import Daemon
