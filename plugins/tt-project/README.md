@@ -62,6 +62,11 @@ and preferences you add later become part of the project's charter and memory.
   the account's live window usage, measures how fast the account is burning it, and paces itself
   to land each window near 90% by its reset: more parallel workers while there is room, fewer when
   the pace would overshoot. It never goes past 90%; the rest stays yours.
+- Over pace, deep tasks run at the standard tier. When even one worker is too many, new starts are
+  spaced out: if the pace allows a fraction `f` of a worker, the next start waits the last run's
+  length x (1/f - 1) after it ended, at most `budget.max_pace_hold_s` (default 2 hours). Your own
+  tasks and reviews of finished work start anyway, running work is never stopped, and the wait
+  wakes no coordinator. `ttp status` and the web app show `paced: next start ~HH:MM (...)`.
 - Usage-billed accounts: $100 per 24 hours and $200 per 7 days per project by default. A new run
   starts only if its budget fits in what is left of both caps. A plan account whose runs stop
   reporting plan windows falls under these caps too.

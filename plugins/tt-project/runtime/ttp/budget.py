@@ -144,7 +144,8 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
         g.reasons.append(f"{provider} stopped reporting plan windows; its spend counts toward the dollar caps")
     if plan:
         g.regime = "windows"
-        _pace(db, g, provider, plan, limit, int(b.get("max_parallel_workers", 6)), now)
+        _pace(db, g, provider, plan, limit, int(b.get("max_parallel_workers", 6)), now,
+              float(b.get("max_pace_hold_s", 7200)))
     else:
         # The caps bound the project's dollars, whichever provider spends them. Providers on plan
         # windows are bounded by their windows instead, so their spend does not count here.
@@ -207,8 +208,11 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
         _raise(g, "red", f"runaway guard: ${last_h:.2f} spent in the last hour (long runs pro rata), ceiling ${ceiling:.2f}/h; "
                          f"resumes automatically as the hour rolls over")
 
-    if g.level == "yellow" and g.regime == "caps":
-        g.max_tier, g.max_parallel = "standard", max(1, g.max_parallel // 2 or 1)
+    if g.level == "yellow":
+        # On a plan the pace already sets the workers; a deep run burns the window fastest.
+        g.max_tier = "standard"
+        if g.regime == "caps":
+            g.max_parallel = max(1, g.max_parallel // 2 or 1)
     elif g.level == "orange":
         g.max_tier, g.max_parallel, g.allow_optional = "light", 1, False
     elif g.level == "red":
@@ -216,7 +220,8 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
     return g
 
 
-def _pace(db: DB, g: Gate, provider: str, plan: list[Window], target: float, most: int, now: float) -> None:
+def _pace(db: DB, g: Gate, provider: str, plan: list[Window], target: float, most: int, now: float,
+          max_hold: float = 7200.0) -> None:
     """Size parallel work so each window lands at `target` by its reset, from measured burn.
 
     For each window: `need` is the burn (points of the window per hour) that reaches the target
@@ -229,10 +234,16 @@ def _pace(db: DB, g: Gate, provider: str, plan: list[Window], target: float, mos
     The burn was produced by the workers that ran while it was measured, so the scale applies to
     their time-weighted mean, not to the count running now: after a burst the running count may be
     1, and scaling that would hold the project at 1 until the burst leaves the measured span.
+
+    One worker can still be too many: the pace allows a fraction `duty = mean * need / burn` of one
+    (mean here not floored at 1). Then new starts are spaced out: the next may start the last run's
+    length x (1/duty - 1) after it ended, at most `max_hold` later, so noisy readings cannot stall
+    the project. Running work is never stopped; the daemon lets a user's own tasks and reviews
+    through (see `pace_hold`).
     """
     running = db.one("SELECT COUNT(*) n FROM runs WHERE provider=? AND status='running' AND role!='coordinator'",
                      (provider,))["n"]
-    allowed, rows = most, []
+    allowed, rows, duty = most, [], None
     for w in plan:
         hours_left = max((w.resets_at - now) / HOUR, 0.05) if w.resets_at else None
         readings = _readings(db, provider, w.window, w.resets_at, now)
@@ -260,11 +271,39 @@ def _pace(db: DB, g: Gate, provider: str, plan: list[Window], target: float, mos
                                 f"{target:.0f}% target; running {row['allowed']} workers (averaged "
                                 f"{mean:.1f} while it was measured)")
             allowed = min(allowed, row["allowed"])
+            raw = avg_running(db, provider, float(readings[0]["ts"]), now, floor=0.0)
+            row["duty"] = round(raw * need / burn, 3)
+            if row["duty"] < 1 and (duty is None or row["duty"] < duty["duty"]):
+                duty = row
     worst = max(rows, key=lambda r: (r["projected"] if r["projected"] is not None else r["utilization"]))
     g.max_parallel = allowed
     g.numbers.update({"window": worst["window"], "utilization": worst["utilization"], "limit": target,
                       "resets_at": worst["resets_at"], "projected": worst["projected"], "running": running,
                       "pace": rows})
+    if duty is None:
+        return
+    last = db.one("SELECT started, ended FROM runs WHERE provider=? AND role!='coordinator' AND status!='running' "
+                  "AND started IS NOT NULL AND ended IS NOT NULL ORDER BY ended DESC LIMIT 1", (provider,))
+    if not last:
+        return
+    end, length = float(last["ended"]), max(float(last["ended"]) - float(last["started"]), 0.0)
+    wait = length * (1 / duty["duty"] - 1) if duty["duty"] > 0 else max_hold
+    until = end + min(wait, max_hold)
+    if until > now:
+        g.numbers["paced"] = {"until": until, "window": duty["window"], "projected": duty["projected"],
+                              "duty": duty["duty"]}
+
+
+def pace_hold(gate: Gate | dict | None, task: dict, now: float | None = None) -> float | None:
+    """When a pace hold keeps `task` from starting, the time it ends. A task from the user's own
+    request (added by the user, or answering a chat) and a review of finished work go ahead."""
+    n = (gate.get("numbers") if isinstance(gate, dict) else getattr(gate, "numbers", None)) or {}
+    until = float((n.get("paced") or {}).get("until") or 0)
+    if until <= (now or time.time()):
+        return None
+    if task.get("origin") == "user" or task.get("reply_chat") or task.get("kind") == "review":
+        return None
+    return until
 
 
 def burn_rate(db: DB, provider: str, window: str, resets_at: float | None, now: float) -> float | None:
@@ -296,9 +335,9 @@ def _slope(rows: list) -> float | None:
     return max(sum((t - mt) * (u - mu) for t, u in zip(ts, us)) / var, 0.0)
 
 
-def avg_running(db: DB, provider: str, since: float, now: float) -> float:
+def avg_running(db: DB, provider: str, since: float, now: float, floor: float = 1.0) -> float:
     """Time-weighted mean of this project's workers on `provider` between `since` and `now`, at
-    least 1: the burn over that span came from them."""
+    least `floor`: the burn over that span came from them."""
     if now <= since:
         return 1.0
     busy = 0.0
@@ -308,7 +347,7 @@ def avg_running(db: DB, provider: str, since: float, now: float) -> float:
         start = float(r["started"])
         end = now if r["status"] == "running" or r["ended"] is None else float(r["ended"])
         busy += max(min(end, now) - max(start, since), 0.0)
-    return max(busy / (now - since), 1.0)
+    return max(busy / (now - since), floor)
 
 
 def plan_windows(db: DB, now: float | None = None) -> list[Window]:

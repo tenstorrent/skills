@@ -1151,6 +1151,8 @@ class Daemon:
         db, c = self.p.db, self.cfg["coordinator"]
         if gate is None or gate.regime != "windows" or gate.level != "green" or not gate.allow_new_work:
             return False
+        if (gate.numbers.get("paced") or {}).get("until", 0) > time.time():
+            return False    # a pace hold is the plan working as intended, not idle capacity
         if any(r.get("need_per_h") is None or (r.get("burn_per_h") is not None and r["burn_per_h"] >= r["need_per_h"])
                for r in gate.numbers.get("pace") or []):
             return False
@@ -1206,6 +1208,8 @@ class Daemon:
             if not gate.allow_new_work or busy.get(provider, 0) >= gate.max_parallel:
                 continue
             if task["origin"] in ("schedule", "harness") and not gate.allow_optional:
+                continue
+            if bud.pace_hold(gate, task):
                 continue
             remaining = (task["budget_usd"] or 0) - (task["spent_usd"] or 0)
             if task["budget_usd"] and remaining <= 0.05:

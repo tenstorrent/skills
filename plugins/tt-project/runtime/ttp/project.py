@@ -40,6 +40,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "weekly_usd": 200.0,
         "hourly_alarm_x": 4.0,          # spend rate this many times the 7-day hourly norm = runaway
         "max_parallel_workers": 6,          # ceiling; on a plan, measured pacing sets the actual number
+        "max_pace_hold_s": 7200,        # on a plan over pace with one worker, the longest gap between starts
         "task_default_usd": {"light": 2.0, "standard": 8.0, "deep": 25.0},
         "run_timeout_s": {"light": 1200, "standard": 3600, "deep": 7200},
         "stall_s": {"light": 900, "standard": 1800, "deep": 2700},

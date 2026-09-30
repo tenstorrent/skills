@@ -216,6 +216,95 @@ def test_pace_near_and_at_the_target_ignores_the_average(env):
     assert at.numbers["pace"][0]["allowed"] == 0
 
 
+def _weekly_over_pace(p, now, runs):
+    """Replays readings like the ones that motivated the pace hold: a weekly window at 5% three hours
+    after its reset, burning ~1.5 points/h against the ~0.52/h that lands 90% at the reset."""
+    resets = now + 165 * 3600
+    for ago, util in [(180, 0.5), (120, 2.0), (60, 3.5), (0, 5.0)]:
+        p.db.x("INSERT INTO snapshots(ts,provider,account,window,utilization,resets_at) VALUES(?,?,?,?,?,?)",
+               (now - ago * 60, "claude", "a", "seven_day", util, resets))
+    for start, end in runs:
+        p.db.x("INSERT INTO runs(role,provider,started,ended,status) VALUES('worker','claude',?,?,?)",
+               (now - start * 60, None if end is None else now - end * 60, "running" if end is None else "done"))
+    return [bud_window("claude", "seven_day", 5.0, resets)]
+
+
+def bud_window(*a):
+    from ttp import budget as bud
+    return bud.Window(*a)
+
+
+def test_pace_below_one_worker_spaces_out_new_starts(env):
+    """One worker all along still burns ~3x the pace: the project runs about a third of the time."""
+    p = make(env)
+    from ttp import budget as bud
+    cfg = p.config()
+    now = time.time()
+    w = _weekly_over_pace(p, now, [(180, None)])
+    g = bud.evaluate(p.db, cfg, "claude", w, now)
+    row = g.numbers["pace"][0]
+    assert g.level == "yellow" and g.max_parallel == 1 and 0.3 < row["duty"] < 0.4, row
+    assert "paced" not in g.numbers, "a running worker is never stopped, and nothing ended to space from"
+    # it ends now after 55 minutes (another ran before it): the next start waits 55 x (1/duty - 1)
+    p.db.x("UPDATE runs SET status='done', started=?, ended=?", (now - 55 * 60, now))
+    p.db.x("INSERT INTO runs(role,provider,started,ended,status) VALUES('worker','claude',?,?,'done')",
+           (now - 180 * 60, now - 55 * 60))
+    g = bud.evaluate(p.db, cfg, "claude", w, now)
+    duty, hold = g.numbers["pace"][0]["duty"], g.numbers["paced"]
+    assert duty < 1 and hold["window"] == "seven_day", g.numbers
+    assert hold["until"] == pytest.approx(now + 55 * 60 * (1 / duty - 1), abs=1) and hold["until"] < now + 7200
+    task = {"origin": "coordinator", "kind": "work", "reply_chat": None}
+    assert bud.pace_hold(g, task, now) == hold["until"]
+    assert bud.pace_hold(g, {**task, "origin": "user"}, now) is None, "the user's own task starts anyway"
+    assert bud.pace_hold(g, {**task, "reply_chat": "c1"}, now) is None, "so does one answering a chat"
+    assert bud.pace_hold(g, {**task, "kind": "review"}, now) is None, "finished work gets its review"
+    assert bud.pace_hold(g, task, hold["until"] + 1) is None
+    # the hold is capped, so noisy readings cannot stall a project
+    cfg["budget"]["max_pace_hold_s"] = 1800
+    assert bud.evaluate(p.db, cfg, "claude", w, now).numbers["paced"]["until"] == pytest.approx(now + 1800)
+    from ttp.web import paced_line
+    line = paced_line(g.as_dict(), now)
+    assert line.startswith("paced: next start ~") and "(seven_day on pace for" in line, line
+
+
+def test_a_plan_over_pace_runs_deep_work_at_standard(env):
+    p = make(env)
+    from ttp import budget as bud
+    now = time.time()
+    g = bud.evaluate(p.db, p.config(), "claude", _weekly_over_pace(p, now, [(180, None)]), now)
+    assert g.regime == "windows" and g.level == "yellow" and g.max_tier == "standard", g
+    assert bud.clamp_tier("deep", g) == "standard" and bud.clamp_tier("light", g) == "light"
+
+
+def test_a_pace_hold_starts_only_user_work_and_wakes_no_coordinator(env, monkeypatch):
+    p = make(env)
+    from ttp import budget as bud
+    from ttp.daemon import Daemon
+    _no_events(p)
+    d = Daemon(p.base)
+    prov = d.cfg.get("core_provider", "claude")
+    now = time.time()
+    pace = [{"window": "seven_day", "utilization": 5.0, "resets_at": now + 165 * 3600, "hours_left": 165.0,
+             "burn_per_h": 1.5, "need_per_h": 0.52, "projected": 252.0, "duty": 0.34}]
+    d.gates = {prov: bud.Gate(provider=prov, level="green", regime="windows", max_parallel=6,
+                              numbers={"pace": pace, "paced": {"until": now + 3600, "window": "seven_day",
+                                                               "projected": 252.0, "duty": 0.34}})}
+    mine = p.db.add_task("coordinator work", "s", kind="work", tier="light", origin="coordinator")
+    started = []
+    monkeypatch.setattr(d, "start_run", lambda *a, **k: started.append(k["task"]["id"]) or 0)
+    d.dispatch()
+    assert started == [] and p.db.task(mine)["status"] == "queued"
+    p.db.set_kv("last_coordinator_turn", now - 7200)
+    p.db.set_kv("idle_wake", {})
+    before = _turns(p)
+    d.maybe_coordinate()
+    _stop_all(p)
+    assert _turns(p) == before, "a pace hold is not idle capacity"
+    user = p.db.add_task("user work", "s", kind="work", tier="light", origin="user")
+    d.dispatch()
+    assert started == [user]
+
+
 def test_a_plan_stays_a_plan_when_readings_are_old(env):
     """An idle hour must not turn a plan account into a dollar-capped one."""
     p = make(env)

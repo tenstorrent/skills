@@ -94,6 +94,17 @@ def gate_detail(g: dict, now: float | None = None) -> str:
             f"${n.get('spent_7d', 0):.2f} of ${n.get('weekly_cap', 0):.0f} per 7d")
 
 
+def paced_line(g: dict, now: float) -> str:
+    """'paced: next start ~14:20 (seven_day on pace for 250%)' while a pace hold spaces out new
+    starts (budget._pace), else ''."""
+    hold = (g.get("numbers") or {}).get("paced") or {}
+    if float(hold.get("until") or 0) <= now:
+        return ""
+    over = f"{hold.get('window')} on pace for {hold['projected']:.0f}%" if hold.get("projected") is not None \
+        else f"{hold.get('window')} over pace"
+    return f"paced: next start ~{at(hold['until'], now)} ({over})"
+
+
 def spend_headline(spend: dict, g: dict) -> str:
     """The header's one-line answer to "how does spend compare with the limit that binds"."""
     n = g.get("numbers") or {}
@@ -254,6 +265,9 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
             stops.append(("budget is red: " if prov == core else f"budget for {prov} is red: ")
                          + "; ".join(pg.get("reasons") or []))
     g = gates.get(core) or {}
+    paced = paced_line(g, now)
+    if paced:
+        stops.append(paced)
     disk = db.kv("disk_low")
     if disk:
         stops.append(f"disk is low ({disk['free_gb']} GB free), so only questions and plans start")
