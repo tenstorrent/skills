@@ -986,6 +986,24 @@ def test_an_orphan_run_row_is_reaped_and_the_next_turn_runs(env):
     assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == "lost"
 
 
+def test_a_lost_run_ends_at_its_last_sign_of_life(env, tmp_path):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    now = time.time()
+    run_dir = tmp_path / "gone"
+    run_dir.mkdir()
+    (run_dir / "lease").touch()
+    (run_dir / "output.jsonl").touch()
+    os.utime(run_dir / "lease", (now - 7200, now - 7200))
+    os.utime(run_dir / "output.jsonl", (now - 3600, now - 3600))
+    rid = p.db.x("INSERT INTO runs(role,provider,started,status,dir,boot_id,pid) VALUES(?,?,?,?,?,?,?)",
+                 ("worker", "fake", now - 9000, "running", str(run_dir), "old-boot", 1))
+    d.reap_runs()
+    row = p.db.one("SELECT status, ended FROM runs WHERE id=?", (rid,))
+    assert row["status"] == "lost" and abs(row["ended"] - (now - 3600)) < 5
+
+
 def test_a_failed_start_leaves_the_task_queued_without_spending_an_attempt(env, monkeypatch):
     p = make(env)
     from ttp import daemon as dmod

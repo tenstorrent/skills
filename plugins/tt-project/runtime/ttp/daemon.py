@@ -260,6 +260,19 @@ class Daemon:
             fresh = False
         return fresh or (r["boot_id"] == self.boot and bool(r["pid"]) and _alive(r["pid"]))
 
+    def _last_sign_of_life(self, r) -> float:
+        """When a lost run was last seen working, so downtime is not billed to it: the newest mtime
+        of its lease and output, kept between its start and now. Now when neither file exists."""
+        now, seen = time.time(), []
+        for name in ("lease", "output.jsonl"):
+            try:
+                seen.append((self._run_dir(r) / name).stat().st_mtime)
+            except OSError:
+                pass
+        if not seen:
+            return now
+        return min(now, max(max(seen), r["started"] or 0))
+
     def reap_runs(self) -> None:
         for r in self.p.db.q("SELECT * FROM runs WHERE status='running'"):
             try:
@@ -268,7 +281,7 @@ class Daemon:
                     self.finish_run(r, _read_result(exit_file) or {"rc": -1, "stopped": "lost", "ended": time.time()})
                 elif not self._run_alive(r):
                     self._end_orphan(r)
-                    self.finish_run(r, {"rc": -1, "stopped": "lost", "ended": time.time()})
+                    self.finish_run(r, {"rc": -1, "stopped": "lost", "ended": self._last_sign_of_life(r)})
                 self._reap_errors.pop(r["id"], None)
             except Exception:
                 # One run whose end cannot be processed must not hold up the others or wedge the loop.
