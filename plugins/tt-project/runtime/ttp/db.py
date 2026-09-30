@@ -242,10 +242,10 @@ class DB:
 
     # money ---------------------------------------------------------------------------------
     def spend(self, provider: str, usd: float, source: str, account: str = "",
-              estimated: bool = False, tokens_in: int = 0, tokens_out: int = 0) -> None:
+              estimated: bool = False, tokens_in: int = 0, tokens_out: int = 0, ts: float | None = None) -> None:
         self.x("INSERT INTO ledger(ts,provider,account,source,usd,estimated,tokens_in,tokens_out) "
                "VALUES(?,?,?,?,?,?,?,?)",
-               (time.time(), provider, account, source, float(usd or 0), int(estimated), tokens_in, tokens_out))
+               (ts or time.time(), provider, account, source, float(usd or 0), int(estimated), tokens_in, tokens_out))
 
     def spent_since(self, since_ts: float, provider: str | None = None, exclude: Mapping[str, float] | None = None,
                     estimated_only: bool = False) -> float:

@@ -279,6 +279,10 @@ class Daemon:
         db, now = self.p.db, time.time()
         why = f"run {r['id']} ended but its result could not be processed (details in the daemon log)"
         try:
+            source = self._source_for(r)
+        except Exception:
+            source = f"task:{r['task']}" if r["task"] else r["role"]
+        try:
             with db.tx():
                 # Book what the run was priced at so far, once: only while it is still running.
                 cur = db.one("SELECT * FROM runs WHERE id=? AND status='running'", (r["id"],))
@@ -288,8 +292,8 @@ class Daemon:
                 db.x("UPDATE runs SET status='failed', ended=? WHERE id=?", (now, r["id"]))
                 cost = cur["cost_usd"] or 0
                 if cost:
-                    db.spend(r["provider"], cost, self._source_for(r), account=r["account"] or "",
-                             estimated=bool(cur["cost_estimated"]))
+                    db.spend(r["provider"], cost, source, account=r["account"] or "",
+                             estimated=bool(cur["cost_estimated"]), ts=now)
                     if r["task"]:
                         db.x("UPDATE tasks SET spent_usd=COALESCE(spent_usd,0)+? WHERE id=?", (cost, r["task"]))
                 if r["role"] == "coordinator":
@@ -378,17 +382,20 @@ class Daemon:
         if usage.auth_failed:
             status = "auth"
         source = self._source_for(r)
+        # Spend is booked at the run's end, not when the daemon gets to it: a run reaped after
+        # downtime must not count toward the current hour. A stamp from the future is clamped.
+        ended = min(float(exit_info.get("ended") or time.time()), time.time())
         # The run's end, its spend and what it did to its task commit together: a daemon stopped
         # half way leaves the run "running", and the next tick processes it again from disk.
         with db.tx():
             db.x("UPDATE runs SET ended=?, status=?, exit_code=?, cost_usd=?, cost_estimated=?, input_tokens=?, "
                  "output_tokens=?, cache_read_tokens=?, cache_write_tokens=? WHERE id=?",
-                 (exit_info.get("ended", time.time()), status, exit_info.get("rc"), usage.cost_usd,
+                 (ended, status, exit_info.get("rc"), usage.cost_usd,
                   int(usage.estimated), usage.input_tokens, usage.output_tokens, usage.cache_read_tokens,
                   usage.cache_write_tokens, r["id"]))
             db.spend(r["provider"], usage.cost_usd, source, account=r["account"] or "", estimated=usage.estimated,
                      tokens_in=usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens,
-                     tokens_out=usage.output_tokens)
+                     tokens_out=usage.output_tokens, ts=ended)
             if r["task"]:
                 db.x("UPDATE tasks SET spent_usd=COALESCE(spent_usd,0)+? WHERE id=?", (usage.cost_usd, r["task"]))
             wins = usage.extra.get("windows")

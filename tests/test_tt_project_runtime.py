@@ -2717,6 +2717,44 @@ def test_a_task_blocked_on_its_workspace_drops_its_reservation(env, monkeypatch)
     assert locks.reserved_by(mark) is None, "a task blocked on its workspace still held its reservation"
 
 
+def test_a_run_booked_late_counts_toward_the_hour_it_ended_in(env):
+    p = make(env)
+    from ttp import budget as bud
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    now = time.time()
+    run_dir = p.runs / "late"
+    run_dir.mkdir(parents=True)
+    result = {"type": "result", "total_cost_usd": 40.0, "usage": {}, "result": "done", "subtype": "success"}
+    (run_dir / "output.jsonl").write_text(json.dumps(result) + "\n")
+    rid = p.db.x("INSERT INTO runs(role,provider,model,started,status,dir) VALUES(?,?,?,?,?,?)",
+                 ("worker", "claude", "opus", now - 5 * 3600, "running", str(run_dir)))
+    # It ended three hours ago; the daemon was down and books it only now.
+    (run_dir / "exit.json").write_text(json.dumps({"rc": 0, "ended": now - 3 * 3600}))
+    d.reap_runs()
+    assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == "ok"
+    g = bud.evaluate(p.db, p.config(), "claude", [])
+    assert g.numbers["spent_1h"] == pytest.approx(0, abs=0.01), "a run that ended hours ago counted as last-hour spend"
+    assert p.db.spent_since(now - 4 * 3600) == pytest.approx(40), "its spend left the day's total"
+
+
+def test_an_abandoned_run_keeps_its_live_spend(env):
+    p = make(env)
+    from ttp import budget as bud
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    now = time.time()
+    p.set_config("budget.hourly_floor_usd", 30)
+    rid = p.db.x("INSERT INTO runs(role,provider,model,started,status,cost_usd,cost_estimated) "
+                 "VALUES('worker','claude','opus',?,'running',6,1)", (now - 2 * 3600,))
+    p.db.spend("claude", 10.0, "task:2")
+    d._abandon_run(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)))
+    assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == "failed"
+    assert p.db.spent_since(now - 3600) == pytest.approx(16), "the run's live spend vanished from the caps"
+    g = bud.evaluate(p.db, p.config(), "claude", [])
+    assert g.numbers["spent_1h"] == pytest.approx(13, abs=0.1), "other spend was discounted by the run's share"
+
+
 def test_a_run_that_never_launched_its_agent_costs_nothing(env):
     p = make(env)
     from ttp.daemon import Daemon
