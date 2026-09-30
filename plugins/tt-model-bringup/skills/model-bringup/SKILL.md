@@ -5,9 +5,14 @@ description: Implement Hugging Face text models in TTNN through staged decoder, 
 
 # Model bring-up
 
-Own the implementation, stage gates and evidence for one target HF model in a tt-metal checkout.
-Read the relevant stage skill and its exact goal before doing that stage. Do not skip unmet gates
-or replace acceptance criteria with a review plugin's criteria.
+Bring up a TT implementation that reproduces the declared Hugging Face reference behavior within the agreed numerical tolerances, and meets the explicit runtime and serving contracts. Expect the relevant upstream tests to pass. These tests help reveal differences from the reference, but some may never have been tried on the current model, even in its HF form. In rare cases, a test may be inapplicable or incorrect because it assumes behavior from the models it was designed for.
+
+When the evidence suggests such a case, the stage worker and reviewer should study the test's purpose, assumptions, actual assertion, and the matched HF and TT outputs. Apply engineering judgment and common sense, with reproducing HF behavior as the guiding objective; making every upstream test green even when the HF reference fails it is not the goal. An HF failure is a reason to investigate the test, not an automatic exemption. Preserve the result and explain what the evidence establishes. Real TT deviations and independent runtime or serving-contract violations still require repair.
+
+For example, a recall test expected `cobalt-heron-256` with ASCII hyphens (U+002D). Native HF GPT-OSS answered `The secret passphrase is **cobalt‑heron‑256**.` with nonbreaking hyphens (U+2011). A literal substring check rejected the answer although it contained the correct identifier. That rejection alone does not show faulty recall or a TT implementation bug. If TT reproduces this HF behavior under matched conditions, changing TT to emit ASCII solely to satisfy the test would move it away from the reference. Examine whether the test's punctuation requirement serves its intended purpose, while keeping checks for genuinely wrong identifiers and request leakage.
+
+Read the relevant stage skill and its exact goal before doing that stage. Use
+`$stage-review` to resolve test applicability while preserving the original results.
 
 ## Startup
 
@@ -76,7 +81,7 @@ For an optional standalone TTI release handoff once serving is ready, use
 
 `tt-device-usage`, `tt-enable-tracing`, `qualitative-check` and `stage-review` provide shared
 requirements. AutoDebug/AutoTriage/AutoFix come from the explicit dependency. Implementation
-stages 1–10 require independent review with `clean-pass`; findings require repairs and rereview.
+stages 1–10 require independent review with `clean-pass`; required work must be resolved under `$stage-review`.
 The final benchmark stage produces results for the bringup owner and checks measurement
 completeness without an accuracy acceptance review. Preserve original goal
 criteria, local commit boundaries and the prohibition on pushing stage changes automatically.

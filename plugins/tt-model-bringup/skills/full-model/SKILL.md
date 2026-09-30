@@ -149,7 +149,7 @@ python "${TT_MODEL_BRINGUP_ROOT}/runtime/readiness_check/check_degenerate_output
   --hf-model <hf-model-id> --missing-artifacts critical --scope autoregressive
 ```
 
-and include its verdict in the stage evidence. Mechanical degeneracy - doubled tokens, single-token collapse - is a decode-loop bug, never a model property. The runner-side stage gate runs the same check.
+and include its verdict in the stage evidence. Mechanical repetition, doubled tokens and single-token collapse are strong bug signals. Compare the affected trajectory with the matched reference before assigning the cause. Shared reference behavior is not by itself a TT defect; a greater or different TT failure remains required work. Preserve the checker result and the comparison. The runner-side stage gate runs the same check.
 
 Shift qualitative checks left: as soon as the full model can generate text, use `$qualitative-check` to run the shared qualitative prompt suite through both the HF reference and TT generator. Later stages may add serving-specific checks, but they should not be the first place these prompts are tried.
 

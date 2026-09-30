@@ -8,35 +8,35 @@
       "destination": "prompts/model_bringup_multigoal/01-functional-decoder.txt",
       "blob": "960d0a474d572dd7f169938da171311438342295",
       "source_sha256": "afe16e47125b9615fca258965d44c52e7844a0c5e99f31183eb53147aa50d7c8",
-      "packaged_sha256": "6b689bd4653658c7a3d5f987460a86cad5a4be1dcc63058a4fbef946834896b9"
+      "packaged_sha256": "29a0c3a4a5e4c6df0fc252ace84ef8356609bf63fd98d5dda1b75a7933d88eb2"
     },
     {
       "source": ".agents/prompts/model_bringup_multigoal/02-fused-decoder.txt",
       "destination": "prompts/model_bringup_multigoal/02-fused-decoder.txt",
       "blob": "40bd12d6917899849a0d1e4376670ea51e3621f1",
       "source_sha256": "d79961f8c22be1d499d73cba1d059250606801f5b6cb47f5c5db2809edee6417",
-      "packaged_sha256": "d79961f8c22be1d499d73cba1d059250606801f5b6cb47f5c5db2809edee6417"
+      "packaged_sha256": "2172e3ac710a6de14136345ba50c9107fc0ddd4eb34a8df8df11d9fbaa973f2d"
     },
     {
       "source": ".agents/prompts/model_bringup_multigoal/03-optimized-decoder.txt",
       "destination": "prompts/model_bringup_multigoal/03-optimized-decoder.txt",
       "blob": "96b53dbad52f26c32a9333dc55c7f84c2c1f7c3a",
       "source_sha256": "86a8ce4e96f9f1b1227ba87d9eb2ef8ba51ba3d84410318d88bf222e96e552d9",
-      "packaged_sha256": "86a8ce4e96f9f1b1227ba87d9eb2ef8ba51ba3d84410318d88bf222e96e552d9"
+      "packaged_sha256": "434529a54c8a88165737f66025cfce2982bc2ea314e6165f5443c4b660f09de1"
     },
     {
       "source": ".agents/prompts/model_bringup_multigoal/04-multichip-decoder.txt",
       "destination": "prompts/model_bringup_multigoal/04-multichip-decoder.txt",
       "blob": "d36726dce73b1f54ac67f959fc01df2161c2bb7a",
       "source_sha256": "dbb26cede472925099237a8bd025624f815f8bff6a826e589c871a12b65a65a9",
-      "packaged_sha256": "dbb26cede472925099237a8bd025624f815f8bff6a826e589c871a12b65a65a9"
+      "packaged_sha256": "c099d05f2eb2dfc691e467415e9a639dc06907c14b159228576bab93375d53d7"
     },
     {
       "source": ".agents/prompts/model_bringup_multigoal/05-optimized-multichip-decoder.txt",
       "destination": "prompts/model_bringup_multigoal/05-optimized-multichip-decoder.txt",
       "blob": "aeb4df1163ff0c03c341972220a7738ffb76c2a0",
       "source_sha256": "2153d6ef772602377aba44aa0f4b0676eccb52188fdabcd3983bfa61141205fb",
-      "packaged_sha256": "2153d6ef772602377aba44aa0f4b0676eccb52188fdabcd3983bfa61141205fb"
+      "packaged_sha256": "7b934bd28f36feadf0b0d429a241fa23842dea90e6694f999a5ef392432ff6a8"
     },
     {
       "source": ".agents/prompts/model_bringup_multigoal/06-full-model.check.sh",
@@ -50,7 +50,7 @@
       "destination": "prompts/model_bringup_multigoal/06-full-model.txt",
       "blob": "bff9bb890a6052bfa0fff9f06f12891ce1ad0f10",
       "source_sha256": "9ffedb6e7af6dcbbd32fc8002b5add7cd599967ef163eb9e0191af47bb14cf09",
-      "packaged_sha256": "9ffedb6e7af6dcbbd32fc8002b5add7cd599967ef163eb9e0191af47bb14cf09"
+      "packaged_sha256": "2878ac96119dd137ae4998d1c8f38ed6e2ff635a6b32c842f5ee10b742917f17"
     },
     {
       "source": ".agents/prompts/model_bringup_multigoal/07-optimized-full-model.check.sh",
@@ -64,28 +64,28 @@
       "destination": "prompts/model_bringup_multigoal/07-optimized-full-model.txt",
       "blob": "84927756cdd3f18bd213adac14014c953767681a",
       "source_sha256": "55dfaf78918a0fa1282cc5d7682418789ad4f95f5db37ff244eeca99e1bf01a0",
-      "packaged_sha256": "55dfaf78918a0fa1282cc5d7682418789ad4f95f5db37ff244eeca99e1bf01a0"
+      "packaged_sha256": "f60254d7123af210152f42632b575dfed6b2f55949d9856c2590e97abc823f92"
     },
     {
       "source": ".agents/prompts/model_bringup_multigoal/08-datatype-sweep.txt",
       "destination": "prompts/model_bringup_multigoal/08-datatype-sweep.txt",
       "blob": "29a35149aa4699d19f1a4a938f93d5da24fc02f5",
       "source_sha256": "2f104bfb9a6e777063a2843868ac9fc6351901b0b641a5d3bdcc73cad3310cb4",
-      "packaged_sha256": "2f104bfb9a6e777063a2843868ac9fc6351901b0b641a5d3bdcc73cad3310cb4"
+      "packaged_sha256": "e33c843208e2d53495fbc3cffe6f04bab8a76ee4a19624db843ddb81a0f9440b"
     },
     {
       "source": ".agents/prompts/model_bringup_multigoal/09-vllm.check.sh",
       "destination": "prompts/model_bringup_multigoal/09-vllm.check.sh",
       "blob": "54873057b0cd77d369de89e8732a5f7bf6810027",
       "source_sha256": "e5860d4f3d9a3f5076062814db09b403ad7de9d0bef6d8aeec02325bccb626ba",
-      "packaged_sha256": "014708dffd476cd46967f2a62bf867a2d3bcf89090f56b20f9faefbd78767098"
+      "packaged_sha256": "4ec20c9977ca5a97e665a04668d38cd696cdc484a175e0550fcbfb62de9c1ae7"
     },
     {
       "source": ".agents/prompts/model_bringup_multigoal/09-vllm.txt",
       "destination": "prompts/model_bringup_multigoal/09-vllm.txt",
       "blob": "fc930a5472158d07221c2c5440786a7c5aed9ed2",
       "source_sha256": "65e532c7e54a6e1bd348575f4471fa0708990fe93e91ef06bbfa9695c60ca727",
-      "packaged_sha256": "25bbd0ae23662362c57f0b054622453703b546defa54f0d1eebae748bc519500"
+      "packaged_sha256": "4c797a51fb65de711e71deba04ffe2906dbbf830abe2909a3bc8bfbc2205732a"
     },
     {
       "source": ".agents/prompts/model_bringup_multigoal/10-optimized-vllm.check.sh",
@@ -99,7 +99,7 @@
       "destination": "prompts/model_bringup_multigoal/10-optimized-vllm.txt",
       "blob": "7c661791b3c29bbad8de5ce8d50176d13633657f",
       "source_sha256": "6817dc59aa6d8cdc9c50404aa4e919240f1a07e3ce772dab04ae21d4561bec24",
-      "packaged_sha256": "d918a1cf738823ae15717b848c8f16d0a4cd0366d0377884b7a62a8cc8c6a361"
+      "packaged_sha256": "292f1cc3ad8c42516cb7fe9ba3d91c3df9c1363ecaed04dacba89128facf69e4"
     },
     {
       "source": ".agents/requirements.txt",
@@ -141,7 +141,7 @@
       "destination": "skills/full-model/SKILL.md",
       "blob": "de994d5552a74b4f1cdcaf64f6ba364178b8d5a4",
       "source_sha256": "0618a7bd6ee01f995cb98dd73a9b2c46d8fd3daab9fcecdafde67501c529d2f8",
-      "packaged_sha256": "92b37989d9dd4a93e2f8501571849cf8d9432c68d187569bf2bc23bcb7ad1a87"
+      "packaged_sha256": "586ec8f780010c51b0f8225633cc4e972ffa1f7f139a9035faa0d6e40e6813e4"
     },
     {
       "source": ".agents/skills/full-model/agents/openai.yaml",
@@ -211,7 +211,7 @@
       "destination": "skills/qualitative-check/SKILL.md",
       "blob": "47623b7658024f8cd40cd47a589dce9572bc74a3",
       "source_sha256": "e4dbff5cff348b0c04b43221a94ea4ca7e88cba2f328b440dc03ea9cc0713788",
-      "packaged_sha256": "6f27a0bd135fb05760f038160f9bee39f68d14d0c22ec0ad8a6add3b531e4fed"
+      "packaged_sha256": "ff486fa109cb7346d188615872630efc9b3368aae9b2e093b216a8872d15ce12"
     },
     {
       "source": ".agents/skills/qualitative-check/agents/openai.yaml",
@@ -225,7 +225,7 @@
       "destination": "skills/stage-review/SKILL.md",
       "blob": "7c89b9d281aa1a853a273d3ff4b1c16ad8ccac0d",
       "source_sha256": "b84c344e6a2c0130569dc7e4147ad748d44aa04afa11f181b0711d00afbe3466",
-      "packaged_sha256": "f46fc472ed5f6d791874f5ee7c14efd0393f6c6179ab27905d5211b473f1c6e4"
+      "packaged_sha256": "21676fa2fc53b292a2971dd5de8f87b1e9b58eae1ed08d9b28a542829d1bb156"
     },
     {
       "source": ".agents/skills/stage-review/agents/openai.yaml",
@@ -274,7 +274,7 @@
       "destination": "skills/vllm-integration/SKILL.md",
       "blob": "05d9e19f7cfbb596d209c504cc49e063b9361da1",
       "source_sha256": "a23a516ab0e8afc3a5dd6ddd72a42781997fb454872139e70605ecbd234e114c",
-      "packaged_sha256": "b20dc786698ac19960f90e9fe80c3e00f5ef3fe1c8b07aef6f7bfa49ac296242"
+      "packaged_sha256": "4e4eb629d860e8ecb36a2b10fa52177f537688b4d4fc75be832746c1c4e90066"
     },
     {
       "source": ".agents/skills/vllm-integration/agents/openai.yaml",

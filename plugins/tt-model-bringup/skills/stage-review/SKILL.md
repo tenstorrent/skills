@@ -15,7 +15,7 @@ this plugin is copied into the target tt-metal checkout.
 
 Prevent unsupported stage closure. A stage review is an independent,
 inspection-first review of one bringup stage against the stage's actual goal
-contract and evidence. Hard checks are a floor, not proof of correctness.
+contract and evidence. Normally require the relevant tests to pass, and use their results to assess whether TT reproduces HF behavior and meets the explicit runtime and serving contracts. Some tests may not have been validated on the current model's HF reference. In rare cases their assumptions or expected answers are inapplicable or incorrect. Study those cases carefully: inspect the test and actual matched outputs, and apply engineering judgment and common sense. A passing test does not prove full correctness, and a failed test does not establish its claimed cause. Keep the reference behavior and the test's intended capability in view when deciding what needs repair.
 
 The reviewer is looking for anything that should be investigated or fixed in
 the spirit of bringing up a correct, fast, production-worthy model, even when
@@ -134,6 +134,12 @@ Return `more-work-needed` when evidence shows one of these:
   `$qualitative-check` shared suite, or did not record why the suite was
   impossible.
 
+Exceptionally, a defective or inapplicable upstream test can be nonblocking for bringup when this review establishes the test defect, accepts matched HF fidelity evidence for the affected behavior, and verifies targeted coverage of the capability the test intended to exercise. Preserve the failing result and explain the disposition in the existing review. Do not mark the test passed, silently skip it, or require upstream publication or merge before continuing authorized bringup unless the user explicitly made that a requirement.
+
+“HF also fails” alone is insufficient. It does not establish that TT behaves equivalently, that the test's intended path ran, or that an independent API/runtime contract was met. Missing matched coverage, TT-specific divergence, crashes, request leakage, invalid output framing and untested affected paths remain required work. For a cache/concurrency test, a serial native result cannot substitute for TT scheduling and request-isolation evidence.
+
+This disposition belongs to the existing stage review; do not add another approval or review round solely to classify the test. A later release may retain a separate compatibility requirement. Report that requirement separately from a model fidelity defect.
+
 Do not return `more-work-needed` only because a stronger evidence format would
 be nice. If the goal and skill accept tests, code inspection, runner
 configuration, logs, and summary JSON as evidence, do not invent a new required
@@ -147,13 +153,11 @@ lifecycle hazards, wrong language/output behavior, host fallbacks, or device
 health as required work when they touch the stage's core contract and are not
 classified in the stage evidence.
 
-A review verdict of `more-work-needed` means exactly that: the stage is not
-ready to pass yet. It is a remediation trigger, not permission for the stage
-owner to set the Codex goal to terminal `blocked`. The stage owner must treat
-each finding as work: fix it directly when the cause is obvious, or use
-`$autofix` when the fix is not obvious or the first direct fix does not close
-the gate. Only a later, explicit `$autofix` failure or an unrecoverable external
-dependency can justify terminal goal `blocked`.
+A review verdict of `more-work-needed` means the stage is not ready to pass.
+Investigate unmet requirements and failed checks against the bringup objective. Continue until demonstrated implementation defects are repaired or a bounded repair attempt fails. When the evidence refutes an implementation defect or shows a faulty test, use the existing stage review to record that conclusion and the remaining capability coverage; do not run AutoFix merely to turn the test green. Preserve the original result and continue other authorized work.
+For supported defects, fix the cause directly when clear; use `$autofix` when
+the repair is unclear or the first fix fails. Record failed bounded repairs and
+unavailable external dependencies as such.
 
 ## What To Inspect
 
@@ -399,11 +403,12 @@ it to complete the stage.
 
 After the reviewer returns:
 
-1. Read the findings and verify that the cited artifacts exist.
-2. If the verdict is `more-work-needed`, do not mark the stage complete or
-   terminal `blocked`. Treat the findings as the next stage work item. Use the
-   relevant debugging skill or `$autofix` to resolve it, then rerun
-   `$stage-review`.
+1. Read the findings and verify the cited evidence. Resolve required work by fixing
+   the implementation, supplying missing evidence, or correcting a finding that
+   rests on an invalid test inference. Use AutoFix for supported defects whose
+   repair is unclear.
+2. Rereview materially changed implementation or unresolved findings; do not
+   require a new review just to repeat an already accepted test disposition.
 3. If the verdict is `clean-pass`, record the review artifact or subagent final
    answer path in the stage work log.
 4. After `clean-pass`, create local checkpoint commits for stage-owned changes

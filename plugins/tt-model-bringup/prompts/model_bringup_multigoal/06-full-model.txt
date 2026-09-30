@@ -22,6 +22,6 @@ Goal completion requirements:
 - models/autoports/<model>/doc/full_model/README.md and work_log.md record commands, top-k accuracy, qualitative verdict, perf, limitations, and exact artifacts.
 - Canonical split sampling is required. If sampler ops dominate token-out decode, fix the LM-head/sampling contract before completing.
 - The generator supports an explicit host-sampling compatibility mode for tests that require host sampling, while the optimized measured token-out path remains on-device traced sampling.
-- $stage-review returns `clean-pass`; findings fixed/rereviewed. Local commit stage-owned touched-repo changes; never push; log SHAs.
+- $stage-review returns `clean-pass`; required work resolved/reviewed. Local commit stage-owned touched-repo changes; never push; log SHAs.
 
-Unmet requirements, review findings, failed gates: work. Stop only after `$autofix` fails.
+Use `$stage-review` to resolve failed checks against HF fidelity and explicit contracts; repair supported defects.
