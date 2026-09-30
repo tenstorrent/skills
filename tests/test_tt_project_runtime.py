@@ -2626,6 +2626,43 @@ def test_a_gated_task_drops_its_reservation(env):
     assert locks.reserved_by(mark) is None, "a task a gate kept out still held its reservation"
 
 
+def _reserved_board_task(p):
+    from ttp import coordinator as coord
+    from ttp import locks
+    from ttp.daemon import Daemon
+    assert coord.apply(p, [{"type": "task_add", "title": "reflash", "spec": "s", "tier": "light",
+                            "resources": ["board"], "exclusive": True}]) == []
+    task = p.db.one("SELECT * FROM tasks WHERE title='reflash'")
+    mark = locks.reserve_path(p.state / "locks", "board")
+    locks.reserve(mark, f"task #{task['id']}")
+    return Daemon(p.base), task, mark
+
+
+def test_low_disk_space_drops_reservations(env, monkeypatch):
+    import collections
+    p = make(env)
+    from ttp import daemon as dm
+    from ttp import locks
+    d, _, mark = _reserved_board_task(p)
+    usage = collections.namedtuple("usage", "total used free")
+    monkeypatch.setattr(dm.shutil, "disk_usage", lambda path: usage(100e9, 99.5e9, 0.5e9))
+    d.dispatch()
+    assert locks.reserved_by(mark) is None, "a task kept out by low disk space still held its reservation"
+
+
+def test_a_task_blocked_on_its_workspace_drops_its_reservation(env, monkeypatch):
+    p = make(env)
+    from ttp import locks
+    d, task, mark = _reserved_board_task(p)
+
+    def broken(task):
+        raise RuntimeError("worktree add failed")
+    monkeypatch.setattr(d, "_workdir_for", broken)
+    d.dispatch()
+    assert p.db.task(task["id"])["status"] == "blocked"
+    assert locks.reserved_by(mark) is None, "a task blocked on its workspace still held its reservation"
+
+
 def test_a_run_that_never_launched_its_agent_costs_nothing(env):
     p = make(env)
     from ttp.daemon import Daemon

@@ -873,6 +873,8 @@ class Daemon:
         busy = {r["provider"]: r["n"] for r in running}
         ready = db.ready_tasks()
         if ready and not self._disk_ok():
+            for task in ready:
+                self._unreserve(task)
             return
         committed = None    # what running work under the dollar caps may still spend
         reached = set()     # tasks that got past the gates to the resource check
@@ -911,6 +913,7 @@ class Daemon:
                 cwd, branch = self._workdir_for(task)
             except Exception as e:
                 db.update_task(task["id"], status="blocked", blocked_reason=f"workspace: {e}"[:400])
+                self._unreserve(task)
                 continue
             from .prompts import worker_prompt
             try:
@@ -929,8 +932,11 @@ class Daemon:
         # A task a gate kept out this tick cannot start, so it must not hold `ttp lock` commands off.
         for task in ready:
             if task["id"] not in reached:
-                for res in _exclusive(task):
-                    locks.unreserve(locks.reserve_path(self.p.state / "locks", res), f"task #{task['id']}")
+                self._unreserve(task)
+
+    def _unreserve(self, task: dict) -> None:
+        for res in _exclusive(task):
+            locks.unreserve(locks.reserve_path(self.p.state / "locks", res), f"task #{task['id']}")
 
     def _committed_usd(self) -> float:
         """Budget that running workers on providers under the dollar caps have left to spend."""
