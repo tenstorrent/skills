@@ -97,6 +97,7 @@ class Daemon:
             self.reap_runs()
             return
         self.reap_runs()
+        self._refresh_meters()
         self.update_gates()
         self.run_schedules()
         self.poll_slack()
@@ -293,6 +294,32 @@ class Daemon:
                       f"proposed follow-up: {f['title']} — {str(f.get('spec', ''))[:600]}", "queued", task["id"]))
 
     # money ----------------------------------------------------------------------------------------
+    def _refresh_meters(self, every_s: float = 600) -> None:
+        """Providers that expose plan windows for free (no model call) are read in the background,
+        so headroom stays current between runs. Claude's windows arrive with every run instead."""
+        now = time.time()
+        if now - getattr(self, "_last_meter", 0) < every_s or getattr(self, "_metering", False):
+            return
+        self._last_meter, self._metering = now, True
+        wanted = {self.cfg.get("core_provider", "claude")} | {t["provider"] for t in self.p.db.q(
+            "SELECT DISTINCT provider FROM tasks WHERE provider IS NOT NULL AND status IN ('queued','running')")}
+
+        def work() -> None:
+            from .db import DB
+            db = DB(self.p.state / "project.db")        # this thread's own connection
+            try:
+                for name in wanted - {"claude", "fake"}:
+                    try:
+                        wins = get_provider(name).meter()
+                    except Exception:
+                        wins = []
+                    if wins:
+                        bud.record_windows(db, wins)
+            finally:
+                db.close()
+                self._metering = False
+        threading.Thread(target=work, daemon=True).start()
+
     def update_gates(self) -> None:
         windows = bud.windows_from_snapshots(self.p.db)
         gates = {}

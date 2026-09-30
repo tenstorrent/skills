@@ -6,11 +6,8 @@
 
 ## Web app from another machine
 
-```bash
-ssh -N -L <port>:127.0.0.1:<port> <host>     # then open the link from `ttp web <name>`
-```
-
-- One-off: run it in the background for the session.
+- `ttp web <name>` prints the exact tunnel command (with a free local port) and the link.
+- After the user agrees: `ttp web <name> --tunnel` opens it in the background.
 - Persistent: only if the user asks. Use a user service (launchd / systemd --user).
 
 ## Persistent tunnel rules

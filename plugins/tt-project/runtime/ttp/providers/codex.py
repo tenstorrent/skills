@@ -111,35 +111,54 @@ class Codex(Provider):
         return f"codex ({mode})"
 
     def meter(self) -> list:
-        """Plan windows via the app-server protocol; spends no model tokens."""
+        """Plan windows via the app-server protocol; spends no model tokens. The server answers
+        asynchronously, so stdin stays open until the reply arrives (closing it early loses it)."""
         exe = self.binary()
         if not exe:
             return []
-        msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize",
-                 "params": {"clientInfo": {"name": "tt-project", "version": "1"}}},
-                {"jsonrpc": "2.0", "method": "initialized"},
-                {"jsonrpc": "2.0", "id": 2, "method": "account/rateLimits/read"}]
-        try:
-            out = subprocess.run([exe, "app-server"], input="\n".join(json.dumps(m) for m in msgs) + "\n",
-                                 capture_output=True, text=True, timeout=30).stdout
-        except (OSError, subprocess.SubprocessError):
-            return []
+        import select
+        import time
         from ..budget import Window
-        wins = []
-        for line in out.splitlines():
-            try:
-                msg = json.loads(line)
-            except ValueError:
-                continue
-            if msg.get("id") != 2:
-                continue
-            rl = (msg.get("result") or {}).get("rateLimits") or {}
-            for key in ("primary", "secondary"):
-                w = rl.get(key)
-                if not w:
+        try:
+            proc = subprocess.Popen([exe, "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL, text=True, bufsize=1)
+        except OSError:
+            return []
+        rl, allowed = {}, True
+        try:
+            for m in ({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                       "params": {"clientInfo": {"name": "tt-project", "version": "1"}}},
+                      {"jsonrpc": "2.0", "method": "initialized"},
+                      {"jsonrpc": "2.0", "id": 2, "method": "account/rateLimits/read"}):
+                proc.stdin.write(json.dumps(m) + "\n")
+                proc.stdin.flush()
+            deadline = time.time() + 25
+            while time.time() < deadline:
+                ready, _, _ = select.select([proc.stdout], [], [], 1)
+                if not ready:
                     continue
-                mins = int(w.get("windowDurationMins") or 0)
-                name = "5h" if mins == 300 else "7d" if mins == 10080 else f"{mins}m"
-                wins.append(Window("codex", name, float(w.get("usedPercent") or 0), w.get("resetsAt"),
-                                   rl.get("planType") or ""))
+                line = proc.stdout.readline()
+                if not line:
+                    break
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                if msg.get("id") == 2:
+                    res = msg.get("result") or {}
+                    rl, allowed = res.get("rateLimits") or {}, res.get("ordinaryUsageAllowed", True)
+                    break
+        except (OSError, ValueError):
+            return []
+        finally:
+            proc.terminate()
+        wins = []
+        for key in ("primary", "secondary"):
+            w = rl.get(key)
+            if not w:
+                continue
+            mins = int(w.get("windowDurationMins") or 0)
+            name = "5h" if mins == 300 else "7d" if mins == 10080 else f"{mins}m"
+            util = float(w.get("usedPercent") or 0)
+            wins.append(Window("codex", name, 100.0 if not allowed else util, w.get("resetsAt"), rl.get("planType") or ""))
         return wins

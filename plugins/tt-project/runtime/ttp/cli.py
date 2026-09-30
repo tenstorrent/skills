@@ -373,13 +373,29 @@ def cmd_status(a) -> None:
 
 def cmd_web(a) -> None:
     p, entry = resolve(a.name)
-    if entry:
-        print(f"The project runs on {entry['host']}. Open a tunnel first (asks nothing of the remote side):")
-        print(f"  ssh -N -L <port>:127.0.0.1:<port> {entry['host']}")
-        sys.exit(forward(entry, sys.argv[1:]))
-    if not p:
+    if p:
+        print(web_line(p))
+        return
+    if not entry:
         die(f"no project {a.name!r}")
-    print(web_line(p))
+    host = entry.get("ssh") or entry["host"]
+    remote_ttp = f"{entry['dir']}/{FOLDER}/harness/bin/ttp"
+    r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", host, f"{remote_ttp} web {shlex.quote(a.name)}"],
+                       capture_output=True, text=True)
+    m = re.search(r"http://127\.0\.0\.1:(\d+)/#token=([0-9a-f]+)", r.stdout)
+    if not m:
+        die(f"could not read the web address from {host}: {(r.stderr or r.stdout).strip()[-200:]}")
+    from .web import free_port
+    remote_port, tok = m.group(1), m.group(2)
+    local = free_port(int(remote_port) + 100)
+    cmd = ["ssh", "-N", "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=30", "-L",
+           f"{local}:127.0.0.1:{remote_port}", host]
+    if a.tunnel:
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        print(f"tunnel open (pid in background): localhost:{local} → {host}:{remote_port}")
+    else:
+        print(f"The project runs on {host}. With the user's OK, open a tunnel:\n  {' '.join(cmd)}")
+    print(f"web app: http://127.0.0.1:{local}/#token={tok}")
 
 
 def cmd_note(a) -> None:
@@ -633,8 +649,12 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--no-secrets", action="store_true", help="with --host: do not copy your saved keys there")
     s.set_defaults(fn=cmd_new)
 
+    s = sub.add_parser("web", help="web app link (for a remote project: tunnel command and link)")
+    s.add_argument("name")
+    s.add_argument("--tunnel", action="store_true", help="open the ssh tunnel now (ask the user first)")
+    s.set_defaults(fn=cmd_web)
     for name, fn, hlp in (("connect", cmd_connect, "attach this chat to a project"),
-                          ("status", cmd_status, "one-screen status"), ("web", cmd_web, "web app link"),
+                          ("status", cmd_status, "one-screen status"),
                           ("logs", cmd_logs, "daemon log tail"), ("doctor", cmd_doctor, "diagnose setup")):
         s = sub.add_parser(name, help=hlp)
         s.add_argument("name")
