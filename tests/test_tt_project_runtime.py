@@ -905,8 +905,42 @@ def test_dollar_caps_cover_the_whole_project(env):
     assert bud.evaluate(p.db, p.config(), "codex", [bud.Window("claude", "seven_day", 20)]).level == "yellow"
     # An idle plan provider has no fresh reading but is still on a plan: its unbilled cost stays out.
     p.db.x("INSERT INTO snapshots(ts,provider,account,window,utilization,resets_at) VALUES(?,?,?,?,?,?)",
-           (time.time() - 3 * 86400, "claude", "", "seven_day", 20, None))
+           (time.time() - 3600, "claude", "", "seven_day", 20, None))
     assert bud.evaluate(p.db, p.config(), "codex", []).level == "yellow"
+
+
+def test_plan_provider_spend_after_its_last_window_counts_toward_caps(env):
+    # A provider that stops reporting windows may have moved to usage billing: its later spend counts.
+    p = make(env)
+    from ttp import budget as bud
+    now = time.time()
+    p.db.x("INSERT INTO snapshots(ts,provider,account,window,utilization,resets_at) VALUES(?,?,?,?,?,?)",
+           (now - 3 * 86400, "claude", "", "seven_day", 20, None))
+    p.db.x("INSERT INTO ledger(ts,provider,source,usd) VALUES(?,?,?,?)", (now - 3 * 86400 + 600, "claude", "t", 500.0))
+    assert bud.evaluate(p.db, p.config(), "codex", []).level == "green"
+    p.db.x("INSERT INTO ledger(ts,provider,source,usd) VALUES(?,?,?,?)", (now - 7200, "claude", "t", 120.0))
+    g = bud.evaluate(p.db, p.config(), "codex", [])
+    assert g.level == "red" and any("cap reached" in r for r in g.reasons), g.reasons
+
+
+def test_stale_plan_windows_do_not_extend_the_cap_exclusion(env):
+    # The daemon passes plan_windows (readings up to a week old) to evaluate; a stale one must not
+    # re-exclude the provider's spend since that reading.
+    p = make(env)
+    from ttp import budget as bud
+    now = time.time()
+    p.db.x("INSERT INTO snapshots(ts,provider,account,window,utilization,resets_at) VALUES(?,?,?,?,?,?)",
+           (now - 3 * 86400, "claude", "", "seven_day", 20, None))
+    p.db.x("INSERT INTO ledger(ts,provider,source,usd) VALUES(?,?,?,?)", (now - 7200, "claude", "t", 120.0))
+    g = bud.evaluate(p.db, p.config(), "codex", bud.plan_windows(p.db, now), now)
+    assert g.level == "red" and g.numbers["spent_24h"] == 120.0, (g.level, g.numbers)
+    # A fresh reading covers spend up to now.
+    p.db.x("INSERT INTO snapshots(ts,provider,account,window,utilization,resets_at) VALUES(?,?,?,?,?,?)",
+           (now - 60, "claude", "", "seven_day", 25, None))
+    p.db.x("INSERT INTO ledger(ts,provider,source,usd) VALUES(?,?,?,?)", (now - 30, "claude", "t", 50.0))
+    g = bud.evaluate(p.db, p.config(), "codex", bud.plan_windows(p.db, now), now)
+    assert g.numbers["spent_24h"] == 0.0, g.numbers
+
 
 def test_remote_listener_reconnects_after_a_network_drop(env, monkeypatch):
     from ttp import cli

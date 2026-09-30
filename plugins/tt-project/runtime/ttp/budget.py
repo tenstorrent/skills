@@ -29,6 +29,8 @@ PLAN_MEMORY_S = 7 * 86400      # a provider that reported plan windows this rece
 # when its reset has passed without a new reading. Unknown names fall back to a week.
 WINDOW_HOURS = {"five_hour": 5.0, "5h": 5.0, "seven_day": 168.0, "7d": 168.0, "seven_day_opus": 168.0,
                 "seven_day_sonnet": 168.0}
+# Spend this long after a plan provider's last window reading still counts as plan-billed.
+PLAN_GRACE_S = HOUR
 # Relative price of each token class (input = 1), used only to apply an observed rate to a token
 # mix; not a price list. Override with budget.estimate_weights.
 TOKEN_WEIGHTS = {"input": 1.0, "output": 5.0, "cache_read": 0.1, "cache_write": 1.25}
@@ -79,7 +81,12 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
         # The caps bound the project's dollars, whichever provider spends them. Providers on plan
         # windows are bounded by their windows instead, so their spend does not count here.
         day_cap, week_cap = float(b.get("daily_usd") or 0), float(b.get("weekly_usd") or 0)
-        windowed = sorted({w.provider for w in windows} | plan_providers(db, now))
+        # Only spend up to a provider's last reading (plus grace) is plan-billed: a provider that
+        # stops reporting windows may have moved to usage billing. The windows passed in may be
+        # days old, so only a fresh reading covers spend up to now.
+        last = plan_providers(db, now)
+        windowed = {p: now if now - ts <= SNAPSHOT_FRESH_S else ts + PLAN_GRACE_S for p, ts in last.items()}
+        windowed.update({w.provider: now for w in windows if w.provider not in last})
         d = db.spent_since(now - DAY, exclude=windowed)
         w7 = db.spent_since(now - WEEK, exclude=windowed)
         g.numbers.update({"spent_24h": round(d, 2), "spent_7d": round(w7, 2),
@@ -258,10 +265,12 @@ def windows_from_snapshots(db: DB, now: float | None = None) -> list[Window]:
             for r in rows]
 
 
-def plan_providers(db: DB, now: float | None = None) -> set[str]:
-    """Providers with any window reading in the last week, i.e. billed by plan windows, not dollars."""
+def plan_providers(db: DB, now: float | None = None) -> dict[str, float]:
+    """Providers with any window reading in the last week (billed by plan windows, not dollars),
+    mapped to the time of their last reading."""
     now = now or time.time()
-    return {r["provider"] for r in db.q("SELECT DISTINCT provider FROM snapshots WHERE ts>=?", (now - WEEK,))}
+    return {r["provider"]: float(r["ts"]) for r in
+            db.q("SELECT provider, MAX(ts) ts FROM snapshots WHERE ts>=? GROUP BY provider", (now - WEEK,))}
 
 
 def record_windows(db: DB, windows: list[Window]) -> None:

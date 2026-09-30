@@ -9,7 +9,7 @@ import sqlite3
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator, Mapping
 
 SCHEMA_VERSION = 1
 
@@ -247,14 +247,14 @@ class DB:
                "VALUES(?,?,?,?,?,?,?,?)",
                (time.time(), provider, account, source, float(usd or 0), int(estimated), tokens_in, tokens_out))
 
-    def spent_since(self, since_ts: float, provider: str | None = None, exclude: Iterable[str] = (),
+    def spent_since(self, since_ts: float, provider: str | None = None, exclude: Mapping[str, float] | None = None,
                     estimated_only: bool = False) -> float:
         sql, args = "SELECT COALESCE(SUM(usd),0) s FROM ledger WHERE ts>=?", [since_ts]
         if provider:
             sql, args = sql + " AND provider=?", args + [provider]
-        exclude = list(exclude)
-        if exclude:
-            sql, args = sql + f" AND provider NOT IN ({','.join('?' * len(exclude))})", args + exclude
+        # exclude maps provider -> time up to which its rows are left out.
+        for prov, until in (exclude or {}).items():
+            sql, args = sql + " AND NOT (provider=? AND ts<=?)", args + [prov, until]
         if estimated_only:
             sql += " AND estimated=1"
         r = self.one(sql, args)
