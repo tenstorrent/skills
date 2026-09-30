@@ -74,4 +74,7 @@ Before you finish, write `$TTP_RUN_DIR/result.json`:
 - Your run ends when you stop. Nothing picks up later unless your hand-off says so. Started a
   long build or job? Leave it running, note how to check on it, and hand off `waiting` with a
   `retry_after_s` that fits it.
+- Anything still running when you stop must be detached from your session
+  (`setsid nohup <cmd> > <log> 2>&1 &`), or it is killed with you. Your own background tasks
+  and subagents do not outlive the run.
 - No `result.json`, no credit: a run that ends without one counts as an unfinished attempt.

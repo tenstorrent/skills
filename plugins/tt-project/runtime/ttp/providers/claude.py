@@ -54,7 +54,9 @@ class Claude(Provider):
             # system prompt, it stays cached across them (measured: ~30% fewer cache-write tokens).
             if self.supports(EXCLUDE_DYNAMIC):
                 argv.append(EXCLUDE_DYNAMIC)
-        env = {"CLAUDE_CODE_ENABLE_CFC": "0"}
+        # A headless run kills its background tasks when it exits, so a job started that way dies
+        # with the worker and the run ends with no hand-off. Without them, long jobs are detached.
+        env = {"CLAUDE_CODE_ENABLE_CFC": "0", "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1"}
         return argv, env
 
     def supports(self, flag: str) -> bool:

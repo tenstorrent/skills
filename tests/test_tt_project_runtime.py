@@ -633,6 +633,15 @@ def test_claude_workers_get_the_update_hook_but_decisions_do_not(env):
     assert "--settings" not in turn
 
 
+def test_claude_runs_cannot_start_background_tasks_that_die_at_exit(env):
+    from ttp.providers import get_provider
+    _, worker_env = get_provider("claude").build(role="worker", model="opus", effort="low", cwd=".",
+                                                 budget_usd=None, read_only=False, schema=None, restrictions={})
+    assert worker_env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] == "1"
+    prompt = (RUNTIME.parent / "template" / "prompts" / "worker.md").read_text()
+    assert "setsid nohup" in prompt
+
+
 def test_claude_workers_keep_the_system_prompt_cacheable_when_the_cli_can(env, monkeypatch):
     from ttp.providers import claude, get_provider
     kw = dict(role="worker", model="opus", effort="low", cwd=".", budget_usd=None, schema=None, restrictions={})
