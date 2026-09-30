@@ -225,29 +225,41 @@ def _pace(db: DB, g: Gate, provider: str, plan: list[Window], target: float, mos
     Burning faster scales this project's workers down in proportion (other projects on the same
     account see the same readings and do the same). Near the target only light work runs; at the
     target nothing new starts until the reset.
+
+    The burn was produced by the workers that ran while it was measured, so the scale applies to
+    their time-weighted mean, not to the count running now: after a burst the running count may be
+    1, and scaling that would hold the project at 1 until the burst leaves the measured span.
     """
     running = db.one("SELECT COUNT(*) n FROM runs WHERE provider=? AND status='running' AND role!='coordinator'",
                      (provider,))["n"]
     allowed, rows = most, []
     for w in plan:
         hours_left = max((w.resets_at - now) / HOUR, 0.05) if w.resets_at else None
-        burn = burn_rate(db, provider, w.window, w.resets_at, now)
+        readings = _readings(db, provider, w.window, w.resets_at, now)
+        burn = _slope(readings)
+        mean = None if burn is None else avg_running(db, provider, float(readings[0]["ts"]), now)
         need = max(target - w.utilization, 0.0) / hours_left if hours_left else None
         projected = w.utilization + burn * hours_left if (burn is not None and hours_left) else None
-        rows.append({"window": w.window, "utilization": round(w.utilization, 1), "resets_at": w.resets_at,
-                     "hours_left": round(hours_left, 2) if hours_left else None,
-                     "burn_per_h": None if burn is None else round(burn, 2),
-                     "need_per_h": None if need is None else round(need, 2),
-                     "projected": None if projected is None else round(projected, 1)})
+        row = {"window": w.window, "utilization": round(w.utilization, 1), "resets_at": w.resets_at,
+               "hours_left": round(hours_left, 2) if hours_left else None,
+               "burn_per_h": None if burn is None else round(burn, 2),
+               "need_per_h": None if need is None else round(need, 2),
+               "projected": None if projected is None else round(projected, 1),
+               "avg_running": None if mean is None else round(mean, 2), "allowed": most}
+        rows.append(row)
         if w.utilization >= target:
             _raise(g, "red", f"{w.window} window at {w.utilization:.0f}%; the project stops at {target:.0f}% "
                              f"until it resets")
+            row["allowed"] = 0
         elif w.utilization >= target - 2:
             _raise(g, "orange", f"{w.window} window at {w.utilization:.0f}%, just under the {target:.0f}% stop")
+            row["allowed"] = 1
         elif burn is not None and need is not None and burn > need * 1.05:
+            row["allowed"] = min(most, max(1, int(mean * need / burn)))
             _raise(g, "yellow", f"{w.window} window on pace for {projected:.0f}% by its reset, over the "
-                                f"{target:.0f}% target; running fewer workers")
-            allowed = min(allowed, max(1, int(max(running, 1) * need / burn)))
+                                f"{target:.0f}% target; running {row['allowed']} workers (averaged "
+                                f"{mean:.1f} while it was measured)")
+            allowed = min(allowed, row["allowed"])
     worst = max(rows, key=lambda r: (r["projected"] if r["projected"] is not None else r["utilization"]))
     g.max_parallel = allowed
     g.numbers.update({"window": worst["window"], "utilization": worst["utilization"], "limit": target,
@@ -260,10 +272,17 @@ def burn_rate(db: DB, provider: str, window: str, resets_at: float | None, now: 
 
     None until two readings at least five minutes apart exist: no reading, no guess.
     """
+    return _slope(_readings(db, provider, window, resets_at, now))
+
+
+def _readings(db: DB, provider: str, window: str, resets_at: float | None, now: float) -> list:
     span = min(WINDOW_HOURS.get(window, 168.0) * HOUR / 4, 3 * HOUR)
-    rows = db.q("SELECT ts, utilization FROM snapshots WHERE provider=? AND window=? AND ts>=? AND "
+    return db.q("SELECT ts, utilization FROM snapshots WHERE provider=? AND window=? AND ts>=? AND "
                 "(resets_at=? OR (? IS NULL AND resets_at IS NULL)) ORDER BY ts",
                 (provider, window, now - span, resets_at, resets_at))
+
+
+def _slope(rows: list) -> float | None:
     if len(rows) < 2 or rows[-1]["ts"] - rows[0]["ts"] < 300:
         return None
     # Least-squares slope over every reading: readings come in whole percents, so a two-point
@@ -275,6 +294,21 @@ def burn_rate(db: DB, provider: str, window: str, resets_at: float | None, now: 
     if var <= 0:
         return None
     return max(sum((t - mt) * (u - mu) for t, u in zip(ts, us)) / var, 0.0)
+
+
+def avg_running(db: DB, provider: str, since: float, now: float) -> float:
+    """Time-weighted mean of this project's workers on `provider` between `since` and `now`, at
+    least 1: the burn over that span came from them."""
+    if now <= since:
+        return 1.0
+    busy = 0.0
+    for r in db.q("SELECT started, ended, status FROM runs WHERE provider=? AND role!='coordinator' "
+                  "AND started IS NOT NULL AND started<? AND (status='running' OR ended>?)",
+                  (provider, now, since)):
+        start = float(r["started"])
+        end = now if r["status"] == "running" or r["ended"] is None else float(r["ended"])
+        busy += max(min(end, now) - max(start, since), 0.0)
+    return max(busy / (now - since), 1.0)
 
 
 def plan_windows(db: DB, now: float | None = None) -> list[Window]:

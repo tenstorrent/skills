@@ -134,13 +134,72 @@ def test_plan_windows_pace_to_the_target_and_keep_the_reserve(env):
     reading(60, 42)
     reading(0, 50)
     for i in range(4):
-        p.db.x("INSERT INTO runs(role,provider,started,status) VALUES('worker','claude',?,'running')", (now,))
+        p.db.x("INSERT INTO runs(role,provider,started,status) VALUES('worker','claude',?,'running')", (now - 3600,))
     g = bud.evaluate(p.db, cfg, "claude", w(50), now)
     assert g.level == "yellow" and g.max_parallel == 2, (g.level, g.max_parallel, g.numbers)
+    assert g.numbers["pace"][0]["avg_running"] == 4.0 and g.numbers["pace"][0]["allowed"] == 2
     # at the edge only light work, at the target nothing new
     assert bud.evaluate(p.db, cfg, "claude", w(89), now).level == "orange"
     red = bud.evaluate(p.db, cfg, "claude", w(90), now)
     assert red.level == "red" and not red.allow_new_work
+
+
+def _pace_setup(p, now, resets, readings, runs):
+    """Five-hour window readings (minutes ago, percent) and worker runs (minutes ago started, ended)."""
+    for ago, util in readings:
+        p.db.x("INSERT INTO snapshots(ts,provider,account,window,utilization,resets_at) VALUES(?,?,?,?,?,?)",
+               (now - ago * 60, "claude", "a", "five_hour", util, resets))
+    for start, end in runs:
+        p.db.x("INSERT INTO runs(role,provider,started,ended,status) VALUES('worker','claude',?,?,?)",
+               (now - start * 60, None if end is None else now - end * 60, "running" if end is None else "done"))
+
+
+def test_pace_scales_the_workers_that_made_the_burn_not_the_one_left_running(env):
+    """A burst of five workers after a reset, then one: the burn came from ~3 workers on average, so
+    the pace must not hold the project at 1 until the burst leaves the measured span."""
+    p = make(env)
+    from ttp import budget as bud
+    cfg = p.config()
+    now = time.time()
+    resets = now + 4.5 * 3600
+    # reset 30 min ago; 5 workers for 15 min, then 1; 0 -> 12% in whole percents every 5 min
+    _pace_setup(p, now, resets, [(30, 0), (25, 3), (20, 7), (15, 10), (10, 11), (5, 11), (0, 12)],
+                [(30, 15)] * 4 + [(30, None)])
+    g = bud.evaluate(p.db, cfg, "claude", [bud.Window("claude", "five_hour", 12.0, resets)], now)
+    row = g.numbers["pace"][0]
+    assert row["avg_running"] == 3.0, row
+    # Burn 24/h from 3 workers is 8/h each; landing at 90% needs 78/4.5 = 17.3/h: 2 workers land at
+    # 84%, 3 would pass the target. The running count alone gave 1.
+    assert g.level == "yellow" and g.max_parallel == 2 and row["allowed"] == 2, (g.level, g.numbers)
+
+
+def test_pace_still_cuts_a_project_that_burns_far_over_the_target(env):
+    p = make(env)
+    from ttp import budget as bud
+    cfg = p.config()
+    now = time.time()
+    resets = now + 3 * 3600
+    # 6 workers all along; 18 points/h against the 6/h that lands 72% at 90% in 3 h
+    _pace_setup(p, now, resets, [(60, 54), (30, 63), (0, 72)], [(90, None)] * 6)
+    g = bud.evaluate(p.db, cfg, "claude", [bud.Window("claude", "five_hour", 72.0, resets)], now)
+    row = g.numbers["pace"][0]
+    assert row["avg_running"] == 6.0 and row["burn_per_h"] == 18.0 and row["need_per_h"] == 6.0, row
+    assert g.level == "yellow" and g.max_parallel <= 2 and row["allowed"] == g.max_parallel, g.numbers
+
+
+def test_pace_near_and_at_the_target_ignores_the_average(env):
+    p = make(env)
+    from ttp import budget as bud
+    cfg = p.config()
+    now = time.time()
+    resets = now + 3 * 3600
+    _pace_setup(p, now, resets, [(60, 70), (0, 88)], [(90, None)] * 6)
+    near = bud.evaluate(p.db, cfg, "claude", [bud.Window("claude", "five_hour", 88.5, resets)], now)
+    assert near.level == "orange" and near.max_parallel == 1 and near.max_tier == "light", near.numbers
+    assert near.numbers["pace"][0]["allowed"] == 1
+    at = bud.evaluate(p.db, cfg, "claude", [bud.Window("claude", "five_hour", 90.0, resets)], now)
+    assert at.level == "red" and at.max_parallel == 0 and not at.allow_new_work, at.numbers
+    assert at.numbers["pace"][0]["allowed"] == 0
 
 
 def test_a_plan_stays_a_plan_when_readings_are_old(env):
