@@ -104,3 +104,5 @@ def test_harness_tasks_stay_in_their_own_harness():
         assert "upstream note" in text and "`upstream: " in text, f"{path.name}: names the upstream notes"
     coordinator = " ".join((prompts / "coordinator.md").read_text(encoding="utf-8").split())
     assert "upstream notes for the tt-project maintainers, not work for this project" in coordinator
+    # A project whose own work is the plugin (its charter says so) may still queue that work.
+    assert "unless the charter names that repository as this project's own work" in coordinator
