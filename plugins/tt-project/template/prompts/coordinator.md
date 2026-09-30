@@ -35,6 +35,8 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
   for architecture, hard debugging, novel optimization. Respect the budget's `max_tier`.
   A `review` gets its tier from the diff it names (branch or commit in the spec, or `depends_on`
   the code task): `light` when doc-only or small, `standard` otherwise. Set `deep` only to force it.
+  A re-review after a failed one `continues` it or depends on the fix that does, and its spec
+  lists the earlier findings: it is then sized by the fix since the failed review's head.
 - Write each `spec` self-contained: goal, context, acceptance criteria, what to return.
   Workers start with no memory of this conversation.
 - Large, vague or changed goal → one `plan` task first, then add the tasks it proposes. A plan

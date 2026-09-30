@@ -363,17 +363,35 @@ def reviewed_refs(p: Project, task: dict) -> list[str]:
     return list(dict.fromkeys(refs))
 
 
-def diff_lines(p: Project, refs: list[str]) -> dict[str, int | None] | None:
+def diff_lines(p: Project, refs: list[str], since: list[str] | None = None) -> dict[str, int | None] | None:
     """Lines changed per file by `refs` since they left the base branch (None for a binary file),
-    or None when they change nothing measurable, such as a commit already on the base."""
+    or None when they change nothing measurable, such as a commit already on the base.
+    With `since` (heads an earlier review saw), a ref descending from one of them is measured from
+    the closest such head instead: only what changed after that review."""
     base = resolve_base(p)
     out: dict[str, int | None] = {}
     for ref in refs:
         if not _git(p.root, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", check=False):
             continue
-        for line in _git(p.root, "diff", "--numstat", "--no-renames", f"{base}...{ref}").splitlines():
+        start = _closest_ancestor(p, since or [], ref) or base
+        for line in _git(p.root, "diff", "--numstat", "--no-renames", f"{start}...{ref}").splitlines():
             added, deleted, path = line.split("\t", 2)
             prev = out.get(path, 0)
             n = None if added == "-" else int(added) + int(deleted)
             out[path] = None if n is None or prev is None else max(n, prev)
     return out or None
+
+
+def _closest_ancestor(p: Project, heads: list[str], ref: str) -> str | None:
+    """The head in `heads` that is an ancestor of `ref` with the fewest commits between them."""
+    best: tuple[int, str] | None = None
+    for head in heads:
+        if not _git(p.root, "rev-parse", "--verify", "--quiet", f"{head}^{{commit}}", check=False):
+            continue
+        if subprocess.run(["git", "-C", str(p.root), "merge-base", "--is-ancestor", head, ref],
+                          capture_output=True, timeout=120).returncode != 0:
+            continue
+        n = int(_git(p.root, "rev-list", "--count", f"{head}..{ref}") or 0)
+        if best is None or n < best[0]:
+            best = (n, head)
+    return best[1] if best else None

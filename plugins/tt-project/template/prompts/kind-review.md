@@ -6,6 +6,9 @@
 - Report only real problems: bugs, missed requirements, risky changes, missing tests.
 - `result.json`: `status` `done` when it may proceed, `failed` when it must not.
 - `followups`: one entry per blocking problem, each a self-contained fix spec.
+- With `failed`, put the full hash of the head you reviewed in `metrics.reviewed_head`: the
+  re-review of the fix is then sized by the fix alone.
+- A re-review whose spec lists earlier findings: check each is fixed, then review what changed since.
 - NEVER edit the change yourself.
 
 ## Pushing a reviewed change (only when the spec asks for it)

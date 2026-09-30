@@ -36,7 +36,7 @@ from . import runner
 from . import schedule as sched
 from . import screen as scr
 from . import worktree
-from .db import SEVERITY_RANK, TERMINAL_TASK_STATES, dependency_ids, dump_result, load_result
+from .db import SEVERITY_RANK, TERMINAL_TASK_STATES, continues_id, dependency_ids, dump_result, load_result
 from .project import Project, hostname, load_secrets
 from .providers import get_provider
 from .providers.base import last_json_object, scratch_dir, service_path
@@ -1618,7 +1618,10 @@ class Daemon:
         if task["tier"] == "deep":
             return task
         try:
-            changes = worktree.diff_lines(self.p, worktree.reviewed_refs(self.p, task))
+            refs = worktree.reviewed_refs(self.p, task)
+            since = self._reviewed_heads(task)
+            # A re-review is sized by the fix since the blocked review; nothing new, the whole stack.
+            changes = (since and worktree.diff_lines(self.p, refs, since)) or worktree.diff_lines(self.p, refs)
         except Exception as e:
             log(self.p, f"task {task['id']}: review diff not measured: {e}")
             return task
@@ -1632,6 +1635,25 @@ class Daemon:
                         f"({len(changes)} files, {sum(n or 0 for n in changes.values())} lines)")
             self.p.db.update_task(task["id"], tier=tier)
         return dict(task, tier=tier)
+
+    def _reviewed_heads(self, task: dict) -> list[str]:
+        """Heads earlier reviews of this stack saw (their `metrics.reviewed_head`): reviews the task
+        continues, directly or through the fix it depends on (a `continues:` chain)."""
+        heads, seen = [], {task["id"]}
+        todo = [continues_id(task)] + [continues_id(t) for i in dependency_ids(task) if i is not None
+                                       for t in [self.p.db.task(i)] if t]
+        while todo:
+            tid = todo.pop()
+            t = self.p.db.task(tid) if tid is not None and tid not in seen else None
+            if not t:
+                continue
+            seen.add(tid)
+            metrics = load_result(t["result"]).get("metrics") if t["kind"] == "review" else None
+            head = metrics.get("reviewed_head") if isinstance(metrics, dict) else None
+            if isinstance(head, str) and re.fullmatch(r"[0-9a-f]{7,40}", head.strip()):
+                heads.append(head.strip())
+            todo.append(continues_id(t))
+        return heads
 
     def _workdir_for(self, task: dict) -> tuple[str, str | None]:
         if task["kind"] == "harness":

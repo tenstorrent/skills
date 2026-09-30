@@ -5762,6 +5762,82 @@ def test_a_review_runs_at_the_tier_its_diff_needs(env, monkeypatch):
     assert started[risky][1] == "standard"
 
 
+def test_a_re_review_is_sized_by_the_fix_since_the_failed_review(env):
+    p = make(env)
+    from ttp import worktree
+    from ttp.daemon import Daemon
+    from ttp.db import dump_result
+    d = Daemon(p.base)
+    ident = ["-c", "user.name=t", "-c", "user.email=t@t"]
+    first = p.db.add_task("stack", "s", kind="code", tier="standard", origin="user")
+    path, branch = worktree.ensure(p, p.db.task(first))
+
+    def commit(name, lines, msg):
+        f = path / name
+        f.write_text((f.read_text() if f.exists() else "") + "".join(f"{msg} {i}\n" for i in range(lines)))
+        _git_out(path, "add", ".")
+        _git_out(path, *ident, "commit", "-qm", msg)
+        return _git_out(path, "rev-parse", "HEAD")
+
+    reviewed = commit("app.py", 600, "stack")
+    p.db.update_task(first, status="done", branch=branch)
+
+    def failed_review(head):
+        rid = p.db.add_task(f"review {head}", f"Review branch {branch}.", kind="review", origin="coordinator")
+        p.db.update_task(rid, status="failed", result=dump_result(
+            {"summary": "blocked", "status": "failed", "metrics": {"reviewed_head": head}}))
+        return rid
+
+    def re_review(old, via_fix=True):
+        labels = [f"continues:{old}"]
+        if not via_fix:
+            return p.db.add_task(f"re-review {old}", "Earlier findings: x.", kind="review", tier="standard",
+                                 origin="coordinator", labels=labels, depends_on=[first])
+        fix = p.db.add_task(f"fix {old}", "s", kind="code", origin="coordinator", labels=labels)
+        p.db.update_task(fix, status="done", branch=branch)
+        return p.db.add_task(f"re-review {old}", "Earlier findings: x.", kind="review", tier="standard",
+                             origin="coordinator", depends_on=[fix])
+
+    blocked = failed_review(reviewed)
+    commit("app.py", 30, "fix")
+    rev = re_review(blocked)
+    assert d._size_review(p.db.task(rev))["tier"] == "light", "a 30-line fix on a 600-line stack"
+    assert d._size_review(p.db.task(re_review(blocked, via_fix=False)))["tier"] == "light"
+    assert d._size_review(p.db.task(p.db.add_task("fresh", f"Review branch {branch}.", kind="review",
+                                                  origin="coordinator")))["tier"] == "standard"
+    # Nothing new since the failed review: the whole stack decides.
+    same = failed_review(_git_out(path, "rev-parse", "HEAD"))
+    assert d._size_review(p.db.task(re_review(same, via_fix=False)))["tier"] == "standard"
+
+    p.set_config("review.risky_paths", ["state/*"])
+    d.cfg = p.config()
+    (path / "state").mkdir()
+    blocked = failed_review(_git_out(path, "rev-parse", "HEAD"))
+    commit("state/db.py", 5, "risky")
+    assert d._size_review(p.db.task(re_review(blocked)))["tier"] == "standard", "a fix on a risky path"
+    p.set_config("review.risky_paths", [])
+    d.cfg = p.config()
+
+    # A head the branch no longer descends from (rewritten history), or none recorded: the whole stack.
+    other = p.db.add_task("other", "s", kind="code", origin="user")
+    opath, _ = worktree.ensure(p, p.db.task(other))
+    (opath / "x.py").write_text("x = 1\n")
+    _git_out(opath, "add", ".")
+    _git_out(opath, *ident, "commit", "-qm", "other")
+    stray = failed_review(_git_out(opath, "rev-parse", "HEAD"))
+    commit("app.py", 10, "more")
+    assert d._size_review(p.db.task(re_review(stray)))["tier"] == "standard"
+    none = failed_review(None)
+    assert d._size_review(p.db.task(re_review(none)))["tier"] == "standard"
+
+
+def test_a_failed_review_records_the_head_it_reviewed():
+    text = (RUNTIME.parent / "template" / "prompts" / "kind-review.md").read_text()
+    assert "`metrics.reviewed_head`" in text and "earlier findings" in text
+    coord = (RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text()
+    assert "lists the earlier findings" in coord
+
+
 def test_the_coordinator_prompt_leaves_review_tiers_to_the_diff():
     text = (RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text()
     assert "A `review` gets its tier from the diff" in text and "Set `deep` only to force it" in text

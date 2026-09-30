@@ -74,7 +74,8 @@ and preferences you add later become part of the project's charter and memory.
 - A runaway guard pauses a project whose hourly spend jumps far above its own norm.
 - A review runs light when the diff it checks touches no `review.risky_paths` glob and is doc-only
   or small (`review.light_max_lines` non-doc lines, default 60), standard otherwise; only the
-  coordinator picks deep.
+  coordinator picks deep. A re-review after a failed review is measured from the head that review
+  recorded (`metrics.reviewed_head`), so a small fix on a large stack runs light.
 - The web app shows spend per day, per task and per recurring job, and plan-window peaks for the
   last two weeks.
 
