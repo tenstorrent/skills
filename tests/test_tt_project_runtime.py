@@ -1084,8 +1084,8 @@ def test_a_long_handoff_stays_valid_json_and_the_next_turn_runs(env, monkeypatch
         "SELECT id FROM runs WHERE role='coordinator' AND status='ok'")), "no coordinator turn after a long hand-off"
     stored = p.db.task(tid)["result"]
     assert len(stored) <= 20000 and json.loads(stored)["summary"].startswith("measured x")
-    done = p.db.one("SELECT text FROM events WHERE kind='task_done' AND task=?", (tid,))["text"]
-    assert "follow-up 7" in done, "follow-ups beyond the first five were dropped"
+    fups = [e["text"] for e in p.db.q("SELECT text FROM events WHERE kind='followup_proposed' AND task=?", (tid,))]
+    assert len(fups) == 8 and "follow-up 7" in fups[-1], "follow-ups beyond the first five were dropped"
     # A row that an older version cut mid-JSON: the digest still builds and keeps its summary.
     p.db.update_task(tid, result=json.dumps({"summary": "old news " + long})[:20000])
     assert "old news" in coord.digest(p, {}, [], [])
@@ -2465,6 +2465,65 @@ def test_the_digest_cuts_background_rows_but_keeps_new_events_whole(env):
     fup = p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
                  (time.time(), f"task:{done}", "followup_proposed", "normal", "proposed follow-up: x", "new"))
     assert f"#{done} done: fresh task — fresh word" in coord.digest(p, {}, [fup], [])
+
+
+def _hand_off(env, p, result: dict, kind="work"):
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage as Usage
+    tid = p.db.add_task("hand-off", "spec", kind=kind, tier="standard", origin="coordinator")
+    p.db.update_task(tid, status="running")
+    run_dir = env["tmp"] / f"run-{tid}"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps(result))
+    Daemon(p.base)._finish_worker({"task": tid}, Usage(cost_usd=1.0), "ok", run_dir)
+    ids = [e["id"] for e in p.db.q("SELECT id FROM events WHERE task=? AND status='queued' ORDER BY id", (tid,))]
+    return tid, run_dir, ids
+
+
+def test_a_plan_hand_off_reaches_the_coordinator_whole(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    fups = [{"title": f"step {i}", "spec": (f"spec{i} " + "detail " * 400)[:2000]} for i in range(8)]
+    facts = [{"fact": f"fact {i} " + "measured " * 40, "source": f"src/{i}.py"} for i in range(12)]
+    plugs = [{"path": "plugins/x", "why": "it helps " * 20}]
+    _, run_dir, ids = _hand_off(env, p, {"status": "done", "summary": "planned", "followups": fups,
+                                         "findings": facts, "enable_plugins": plugs}, kind="plan")
+    new = coord.digest(p, {}, ids, []).split("# NEW EVENTS")[1]
+    for f in fups:
+        assert f["title"] in new and f["spec"] in new, f"follow-up {f['title']} was cut"
+    for f in facts:
+        assert f["fact"].strip() in new and f["source"] in new, "a finding was cut"
+    assert plugs[0]["why"].strip() in new
+    assert "result.json" not in new, "nothing was cut, yet the digest says so"
+
+
+def test_a_cut_hand_off_says_so_and_names_its_result_file(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    fups = [{"title": f"step {i}", "spec": "long " * 1000} for i in range(14)]
+    facts = [{"fact": "fact " * 300, "source": "s"} for _ in range(20)]
+    _, run_dir, ids = _hand_off(env, p, {"status": "done", "summary": "planned", "followups": fups,
+                                         "findings": facts}, kind="plan")
+    new = coord.digest(p, {}, ids, []).split("# NEW EVENTS")[1]
+    where = str(run_dir / "result.json")
+    evs = p.db.q(f"SELECT kind, text FROM events WHERE id IN ({','.join('?' * len(ids))})", ids)
+    assert all(e["text"] in new for e in evs), "the digest cut an event the daemon had sized to fit"
+    assert sum(e["kind"] == "followup_proposed" for e in evs) == 12
+    notes = [e["text"] for e in evs if e["kind"] == "task_notes"]
+    assert len(notes) == 1 and "step 12; step 13" in notes[0], "follow-ups past the twelfth lost their titles"
+    cut = [e["text"] for e in evs if e["kind"] in ("followup_proposed", "task_notes")]
+    assert all(t.endswith(f"[cut; the whole text is in {where}]") for t in cut), "a cut does not say so"
+
+
+@pytest.mark.parametrize("words, before", [(60, 784), (300, 1324)])
+def test_a_plain_hand_off_digest_does_not_grow(env, words, before):
+    # `before`: the NEW EVENTS section for the same hand-off before plans got their own events.
+    p = make(env)
+    from ttp import coordinator as coord
+    _, _, ids = _hand_off(env, p, {"status": "done", "summary": "shipped it " * words})
+    new = coord.digest(p, {}, ids, []).split("# NEW EVENTS")[1]
+    assert len(ids) == 1
+    assert len(new) <= before * 1.05
 
 
 def test_clip_cuts_at_a_word_and_marks_the_cut():

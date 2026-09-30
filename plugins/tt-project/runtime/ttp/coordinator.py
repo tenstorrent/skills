@@ -77,6 +77,9 @@ RECENT_OUT = 5                       # outbound messages the digest repeats, so 
 NOTE_CHARS = 140
 FINISHED_ROWS, FINISHED_CHARS = 10, 120
 SENT_CHARS = 100
+EVENT_CHARS = 1500
+# A plan's product arrives as these events; the daemon sizes them to fit, so they show whole.
+EVENT_CHARS_BY_KIND = {"followup_proposed": 4300, "task_notes": 6000}
 HANDOFF_KINDS = ("task_done", "task_failed", "task_cancelled", "cancelled_but_done")
 MAX_TASKS_PER_DAY = 1000
 ASK_DEFAULTS_KEY = "ask_defaults"   # kv: {ask message id: recommendation}; no new ask is added
@@ -197,7 +200,9 @@ def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int]) ->
         for m in db.q(f"SELECT * FROM messages WHERE id IN ({','.join('?' * len(msg_ids))}) ORDER BY id", msg_ids):
             lines.append(f"- [user message via {m['channel']}, chat={m['chat'] or '-'}] {m['text']}")
     for e in events:
-        lines.append(f"- [{e['kind']} from {e['source']}, severity {e['severity']}] {e['text'][:1500]}")
+        cap = EVENT_CHARS_BY_KIND.get(e["kind"], EVENT_CHARS)
+        text = e["text"] if len(e["text"]) <= cap else e["text"][:cap] + " … [cut]"
+        lines.append(f"- [{e['kind']} from {e['source']}, severity {e['severity']}] {text}")
     rejected = db.kv(REJECTED_KEY, []) or []
     for x in rejected:
         lines.append(f"- [your previous turn's action was rejected; fix or drop it] {x[:500]}")

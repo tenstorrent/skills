@@ -43,6 +43,7 @@ TICK_S = 3.0
 LEASE_STALE_S = 180
 HEARTBEAT_STALE_S = 300   # longer than any single tick step (a git fetch, a watcher command)
 RESULT_FILE = "result.json"
+MAX_FOLLOWUPS, FOLLOWUP_SPEC_CHARS = 12, 4000   # per hand-off; each follow-up is its own event
 PROBE_EVERY_S = 180     # how often a waiting task's `retry_when` probe runs
 PROBE_TIMEOUT_S = 60
 ORPHAN_GRACE_S = 10     # TERM to KILL for an agent whose supervisor died
@@ -691,20 +692,24 @@ class Daemon:
         sev = "high" if new == "blocked" else "normal"
         fups = result.get("followups") if isinstance(result, dict) else None
         fups = [f for f in fups if isinstance(f, dict) and f.get("title")] if isinstance(fups, list) else []
+        # A plan's findings, plugin advice and follow-up specs are its product: each part gets its own
+        # event, sized for the digest to show it whole, so an ordinary hand-off does not grow.
+        where = _result_ref(self.p, run_dir if handoff is None else run_dir / RESULT_FILE)
         text = (f"#{task['id']} {task['title']} → {new} (run {ended or status}, {'~' if usage.estimated else ''}"
-                f"${usage.cost_usd:.2f}): {summary[:1200]}")
+                f"${usage.cost_usd:.2f}): {_cut(summary, 1200, where)}")
+        notes = ""
+        if len(fups) > MAX_FOLLOWUPS:
+            notes += (f"\nMore proposed follow-ups (their specs are in {where}): "
+                      + "; ".join(str(f["title"])[:120] for f in fups[MAX_FOLLOWUPS:]))
         if isinstance(result, dict):
-            # A plan's findings and plugin advice reach the coordinator, which decides what to keep.
-            facts = [f for f in (result.get("findings") or []) if isinstance(f, dict) and f.get("fact")][:12]
+            facts = [f for f in (result.get("findings") or []) if isinstance(f, dict) and f.get("fact")]
             if facts:
-                text += "\nFindings (save the durable ones as memory):" + "".join(
-                    f"\n- {str(f['fact'])[:240]} [{str(f.get('source', ''))[:120]}]" for f in facts)
-            plugs = [x for x in (result.get("enable_plugins") or []) if isinstance(x, dict) and x.get("path")][:6]
+                notes += "\nFindings (save the durable ones as memory):" + "".join(
+                    f"\n- {f['fact']} [{f.get('source', '')}]" for f in facts)
+            plugs = [x for x in (result.get("enable_plugins") or []) if isinstance(x, dict) and x.get("path")]
             if plugs:
-                text += "\nRecommended skill plugins for workers:" + "".join(
-                    f"\n- {str(x['path'])[:200]}: {str(x.get('why', ''))[:160]}" for x in plugs)
-        if len(fups) > 5:
-            text += " | more proposed follow-ups: " + "; ".join(str(f["title"])[:120] for f in fups[5:])[:1500]
+                notes += "\nRecommended skill plugins for workers:" + "".join(
+                    f"\n- {x['path']}: {x.get('why', '')}" for x in plugs)
         # A retry the daemon already scheduled, after a refusal (which has its own alert) or a run that
         # ended without a verdict, leaves nothing to decide: the final attempt's outcome starts the turn.
         # A timeout still does, since the task may need splitting before it times out again.
@@ -712,10 +717,16 @@ class Daemon:
         db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
              (time.time(), f"task:{task['id']}", f"task_{new}", sev, text, "handled" if quiet else "queued",
               task["id"]))
-        for f in fups[:5]:
+        if notes:
+            db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                 (time.time(), f"task:{task['id']}", "task_notes", "normal",
+                  _cut(f"#{task['id']} {task['title']}:{notes}", coord.EVENT_CHARS_BY_KIND["task_notes"], where),
+                  "handled" if quiet and len(fups) <= MAX_FOLLOWUPS else "queued", task["id"]))
+        for f in fups[:MAX_FOLLOWUPS]:
             db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                  (time.time(), f"task:{task['id']}", "followup_proposed", "normal",
-                  f"proposed follow-up: {f['title']} — {str(f.get('spec', ''))[:600]}", "queued", task["id"]))
+                  f"proposed follow-up: {str(f['title'])[:200]} — "
+                  f"{_cut(str(f.get('spec', '')), FOLLOWUP_SPEC_CHARS, where)}", "queued", task["id"]))
 
     # money ----------------------------------------------------------------------------------------
     def _refresh_meters(self, every_s: float = 600) -> None:
@@ -1391,6 +1402,21 @@ def _observations(text: str) -> list[dict]:
         obs = []
         break
     return obs or [{"text": text[:6000]}]
+
+
+def _result_ref(p: Project, path: Path) -> str:
+    try:
+        return str(path.relative_to(p.root))
+    except ValueError:
+        return str(path)
+
+
+def _cut(text: str, n: int, where: str) -> str:
+    """`text` within `n` characters; a cut one says so and where the whole text is."""
+    if len(text) <= n:
+        return text
+    note = f" … [cut; the whole text is in {where}]"
+    return text[:max(0, n - len(note))] + note
 
 
 def _read_result(path: Path) -> dict | None:
