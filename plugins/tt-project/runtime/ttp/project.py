@@ -39,7 +39,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "daily_usd": 100.0,             # applied when the plan reports no window (usage-billed)
         "weekly_usd": 200.0,
         "hourly_alarm_x": 4.0,          # spend rate this many times the 7-day hourly norm = runaway
-        "max_parallel_workers": 2,
+        "max_parallel_workers": 6,          # ceiling; on a plan, measured pacing sets the actual number
         "task_default_usd": {"light": 2.0, "standard": 8.0, "deep": 25.0},
         "run_timeout_s": {"light": 1200, "standard": 3600, "deep": 7200},
         "stall_s": {"light": 900, "standard": 1800, "deep": 2700},
@@ -50,6 +50,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "resources": {},                    # shared-slot limits, e.g. {"device": 1}
     "coordinator": {"tier": "light", "debounce_s": 15, "max_events_per_turn": 40,
                     "max_turns_per_hour": 30, "max_new_tasks_per_day": 40, "idle_wake_s": 3600,
+                    "starve_wake_s": 300,
                     "turn_budget_usd": 1.0, "turn_timeout_s": 600,
                     "ask_timeout_h": 12},
     "notify": {"slack": False, "slack_min_severity": "high", "chat_min_severity": "normal"},

@@ -487,6 +487,65 @@ def cmd_note(a) -> None:
         f.write(f"{time.strftime('%H:%M:%S')} {a.text}\n")
 
 
+def cmd_lock(a) -> None:
+    """Hold one slot of a shared resource while a command runs: `ttp lock <resource> -- <cmd...>`.
+
+    Parallel tasks share a device or a remote build directory this way: each takes the lock only for
+    the commands that touch it, and the rest of the task runs alongside other work. Slots come from
+    the project's `resources` config (default 1). The lock is an OS file lock, so it is released
+    whenever the command's process ends, however it ends.
+    """
+    import fcntl
+    cmd = list(a.command or [])
+    if cmd and cmd[0] == "--":
+        cmd = cmd[1:]
+    if not cmd:
+        die("usage: ttp lock <resource> -- <command...>")
+    base = os.environ.get("TTP_PROJECT")
+    if not base:
+        die("ttp lock only works inside a tt-project run (or with TTP_PROJECT set)")
+    p = Project(base)
+    slots = max(int((p.config().get("resources") or {}).get(a.resource, 1) or 1), 1)
+    locks = p.state / "locks"
+    locks.mkdir(parents=True, exist_ok=True)
+    who = f"task #{os.environ.get('TTP_TASK') or '?'} (run {os.environ.get('TTP_RUN_ID') or '?'})"
+    started, told = time.time(), 0.0
+    while True:
+        for i in range(slots):
+            f = open(locks / f"{a.resource}.{i}.lock", "a+")
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                f.close()
+                continue
+            f.seek(0)
+            f.truncate()
+            f.write(json.dumps({"holder": who, "since": time.time(), "command": " ".join(cmd)[:300]}))
+            f.flush()
+            waited = time.time() - started
+            if waited > 5:
+                print(f"ttp lock: got {a.resource} after {waited / 60:.1f} min", file=sys.stderr, flush=True)
+            try:
+                rc = subprocess.call(cmd)
+            finally:
+                f.close()
+            sys.exit(rc)
+        if a.timeout and time.time() - started > a.timeout:
+            die(f"{a.resource} stayed busy for {a.timeout:.0f} s; hand the task back as waiting", 75)
+        if time.time() - told >= 60:
+            holders = []
+            for lf in sorted(locks.glob(f"{a.resource}.*.lock")):
+                try:
+                    h = json.loads(lf.read_text() or "{}")
+                    holders.append(f"{h.get('holder')} since {time.strftime('%H:%M', time.localtime(h.get('since', 0)))}")
+                except (OSError, ValueError):
+                    pass
+            print(f"ttp lock: waiting for {a.resource} (held by {', '.join(holders) or 'another task'})",
+                  file=sys.stderr, flush=True)
+            told = time.time()
+        time.sleep(3)
+
+
 # operating ----------------------------------------------------------------------------------------
 def cmd_list(a) -> None:
     reg = load_registry().get("projects", {})
@@ -766,6 +825,12 @@ def main(argv: list[str] | None = None) -> None:
     s = sub.add_parser("note", help="(inside a run) append a progress note")
     s.add_argument("text")
     s.set_defaults(fn=cmd_note)
+
+    s = sub.add_parser("lock", help="(inside a run) hold a shared resource while one command runs")
+    s.add_argument("resource")
+    s.add_argument("--timeout", type=float, default=0, help="give up after this many seconds (exit 75)")
+    s.add_argument("command", nargs=argparse.REMAINDER)
+    s.set_defaults(fn=cmd_lock)
 
     for name, fn in (("list", cmd_list),):
         sub.add_parser(name).set_defaults(fn=fn)

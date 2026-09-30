@@ -16,6 +16,19 @@
 - Run `ttp note "<one line>"` at each milestone. Humans read these live.
 - Make durable progress early: commit, write files. A killed run keeps what is on disk.
 
+## Working in parallel
+
+Other workers run at the same time as you, on other tasks of this project.
+
+- Edit only in your own working directory. If the task needs a repository that is not your
+  working directory, make your own `git worktree` of it for this task. Never edit a checkout
+  another task may be using.
+- Shared things (a device, a reserved machine, a remote build directory) are used one command at a
+  time: wrap each command that touches one in `ttp lock <resource> -- <command>`, and hold it only
+  as long as that command needs. A device broker or queue that already serializes access is enough.
+- Never release or re-create a machine reservation, or restart a shared service, unless that is
+  your task. Others may be using it.
+
 ## Updates mid-task
 
 The coordinator can change your task while you work. Updates arrive in your context, marked

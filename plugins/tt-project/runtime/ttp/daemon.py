@@ -119,6 +119,12 @@ class Daemon:
         restrictions = self.cfg.get("restrictions", {})
         argv, env = prov.build(role=role, model=model, effort=effort, cwd=cwd, budget_usd=budget_usd,
                                read_only=read_only, schema=schema, restrictions=restrictions)
+        if not read_only:
+            # Skill plugins this project enabled for its workers only (never the user's own setup).
+            dirs = [str(Path(os.path.expanduser(d))) for d in
+                    (self.cfg["providers"].get(provider, {}).get("plugin_dirs") or [])
+                    if Path(os.path.expanduser(d)).is_dir()]
+            argv += prov.plugin_args(dirs)
         db = self.p.db
         run_id = db.x("INSERT INTO runs(task,role,provider,model,effort,account,started,boot_id,status,note) "
                       "VALUES(?,?,?,?,?,?,?,?,?,?)",
@@ -427,6 +433,16 @@ class Daemon:
         fups = [f for f in fups if isinstance(f, dict) and f.get("title")] if isinstance(fups, list) else []
         text = (f"#{task['id']} {task['title']} → {new} (run {status}, {'~' if usage.estimated else ''}"
                 f"${usage.cost_usd:.2f}): {summary[:1200]}")
+        if isinstance(result, dict):
+            # A plan's findings and plugin advice reach the coordinator, which decides what to keep.
+            facts = [f for f in (result.get("findings") or []) if isinstance(f, dict) and f.get("fact")][:12]
+            if facts:
+                text += "\nFindings (save the durable ones as memory):" + "".join(
+                    f"\n- {str(f['fact'])[:240]} [{str(f.get('source', ''))[:120]}]" for f in facts)
+            plugs = [x for x in (result.get("enable_plugins") or []) if isinstance(x, dict) and x.get("path")][:6]
+            if plugs:
+                text += "\nRecommended skill plugins for workers:" + "".join(
+                    f"\n- {str(x['path'])[:200]}: {str(x.get('why', ''))[:160]}" for x in plugs)
         if len(fups) > 5:
             text += " | more proposed follow-ups: " + "; ".join(str(f["title"])[:120] for f in fups[5:])[:1500]
         db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
@@ -464,7 +480,7 @@ class Daemon:
         threading.Thread(target=work, daemon=True).start()
 
     def update_gates(self) -> None:
-        windows = bud.windows_from_snapshots(self.p.db)
+        windows = bud.plan_windows(self.p.db)
         gates = {}
         for prov in {self.cfg.get("core_provider", "claude"), *[t["provider"] for t in self.p.db.q(
                 "SELECT DISTINCT provider FROM tasks WHERE provider IS NOT NULL AND status IN ('queued','running')")]}:
@@ -576,7 +592,11 @@ class Daemon:
             gate = self.gates.get(self.cfg.get("core_provider", "claude"))
             idle_due = (not busy and now - last > float(c.get("idle_wake_s", 1800))
                         and (gate is None or gate.allow_optional))
-            if not idle_due:
+            # Paid capacity sitting idle: worker slots are free and nothing is ready to run. Ask the
+            # coordinator for more independent work well before the idle wake would.
+            starved = (gate is not None and gate.allow_new_work and self._free_slots(gate) > 0
+                       and not self._dispatchable() and now - last > float(c.get("starve_wake_s", 300)))
+            if not (idle_due or starved):
                 return
         else:
             newest = max([m["ts"] for m in msgs] + [e["ts"] for e in evs])
@@ -619,7 +639,7 @@ class Daemon:
         busy = {r["provider"]: r["n"] for r in running}
         for task in db.ready_tasks():
             provider = task["provider"] or self.cfg.get("core_provider", "claude")
-            gate = self.gates.get(provider) or bud.evaluate(db, self.cfg, provider, bud.windows_from_snapshots(db))
+            gate = self.gates.get(provider) or bud.evaluate(db, self.cfg, provider, bud.plan_windows(db))
             if not gate.allow_new_work or busy.get(provider, 0) >= gate.max_parallel:
                 continue
             if task["origin"] in ("schedule", "harness") and not gate.allow_optional:
@@ -668,17 +688,28 @@ class Daemon:
             self.alert("run-start", f"Runs cannot start ({why}). Tasks stay queued and retry every minute.", "high")
 
     def _resources_free(self, task: dict) -> bool:
-        """Tasks labelled `resource:<name>` share that resource's slot count (config `resources`),
-        e.g. one device: at most `resources.device` such tasks run at once."""
-        wanted = [lb.split(":", 1)[1] for lb in json.loads(task["labels"] or "[]") if lb.startswith("resource:")]
+        """Only tasks labelled `exclusive:<name>` hold a resource for their whole run; they share
+        its slot count (config `resources`, default 1). A `resource:<name>` label means the task uses
+        the resource for some commands: those take the resource's lock (`ttp lock`) or its own queue,
+        so the rest of the task runs in parallel with other work instead of waiting for the slot."""
+        wanted = [lb.split(":", 1)[1] for lb in json.loads(task["labels"] or "[]") if lb.startswith("exclusive:")]
         limits = self.cfg.get("resources", {})
         for res in wanted:
             limit = int(limits.get(res, 1))
             busy = self.p.db.one("SELECT COUNT(*) n FROM tasks WHERE status='running' AND labels LIKE ?",
-                                 (f'%"resource:{res}"%',))["n"]
+                                 (f'%"exclusive:{res}"%',))["n"]
             if busy >= limit:
                 return False
         return True
+
+    def _free_slots(self, gate) -> int:
+        running = self.p.db.one("SELECT COUNT(*) n FROM runs WHERE provider=? AND status='running' "
+                                "AND role!='coordinator'", (gate.provider,))["n"]
+        return max(int(gate.max_parallel) - running, 0)
+
+    def _dispatchable(self) -> bool:
+        """Whether any queued task could start now (dependencies done, resources free)."""
+        return any(self._resources_free(t) for t in self.p.db.ready_tasks())
 
     def _workdir_for(self, task: dict) -> tuple[str, str | None]:
         if task["kind"] == "harness":

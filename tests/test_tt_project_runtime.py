@@ -101,17 +101,55 @@ def test_caps_gate_escalates_and_blocks_new_work(env):
     assert g.level == "red" and not g.allow_new_work and g.max_parallel == 0
 
 
-def test_plan_windows_keep_the_reserve(env):
+def test_plan_windows_pace_to_the_target_and_keep_the_reserve(env):
+    """On a plan, unused capacity is lost at the reset: pace to 90% by then, from measured burn."""
     p = make(env)
     from ttp import budget as bud
     cfg = p.config()
-    w = lambda u: [bud.Window("claude", "seven_day", u)]  # noqa: E731
-    assert bud.evaluate(p.db, cfg, "claude", w(50)).level == "green"
-    assert bud.evaluate(p.db, cfg, "claude", w(70)).level == "yellow"
-    assert bud.evaluate(p.db, cfg, "claude", w(85)).level == "orange"
-    red = bud.evaluate(p.db, cfg, "claude", w(90))
+    now = time.time()
+    resets = now + 10 * 3600
+
+    def reading(minutes_ago, util):
+        p.db.x("INSERT INTO snapshots(ts,provider,account,window,utilization,resets_at) VALUES(?,?,?,?,?,?)",
+               (now - minutes_ago * 60, "claude", "a", "seven_day", util, resets))
+
+    w = lambda u: [bud.Window("claude", "seven_day", u, resets)]  # noqa: E731
+    # no burn measured yet: nothing says the plan is being over-used, so all slots are open
+    g = bud.evaluate(p.db, cfg, "claude", w(50), now)
+    assert g.regime == "windows" and g.level == "green" and g.max_parallel == 6
+    # slow burn (2 points/h, 4/h needed to land at 90% in 10 h): under pace, all slots open
+    reading(60, 48)
+    reading(0, 50)
+    g = bud.evaluate(p.db, cfg, "claude", w(50), now)
+    assert g.level == "green" and g.max_parallel == 6, g.numbers
+    assert g.numbers["pace"][0]["need_per_h"] == 4.0
+    # fast burn (8 points/h): on pace for 130%, so fewer workers, in proportion
+    p.db.x("DELETE FROM snapshots")
+    reading(60, 42)
+    reading(0, 50)
+    for i in range(4):
+        p.db.x("INSERT INTO runs(role,provider,started,status) VALUES('worker','claude',?,'running')", (now,))
+    g = bud.evaluate(p.db, cfg, "claude", w(50), now)
+    assert g.level == "yellow" and g.max_parallel == 2, (g.level, g.max_parallel, g.numbers)
+    # at the edge only light work, at the target nothing new
+    assert bud.evaluate(p.db, cfg, "claude", w(89), now).level == "orange"
+    red = bud.evaluate(p.db, cfg, "claude", w(90), now)
     assert red.level == "red" and not red.allow_new_work
 
+
+def test_a_plan_stays_a_plan_when_readings_are_old(env):
+    """An idle hour must not turn a plan account into a dollar-capped one."""
+    p = make(env)
+    from ttp import budget as bud
+    now = time.time()
+    p.db.x("INSERT INTO snapshots(ts,provider,account,window,utilization,resets_at) VALUES(?,?,?,?,?,?)",
+           (now - 3 * 3600, "claude", "a", "seven_day", 40.0, now + 3600))
+    p.db.x("INSERT INTO snapshots(ts,provider,account,window,utilization,resets_at) VALUES(?,?,?,?,?,?)",
+           (now - 6 * 3600, "claude", "a", "five_hour", 70.0, now - 3600))
+    wins = {w.window: w for w in bud.plan_windows(p.db, now)}
+    assert wins["seven_day"].utilization == 40.0
+    assert wins["five_hour"].utilization == 0.0 and wins["five_hour"].resets_at > now, "a reset window is empty"
+    assert bud.evaluate(p.db, p.config(), "claude", list(wins.values()), now).regime == "windows"
 
 def test_runaway_guard_trips_on_a_spend_spike(env):
     p = make(env)
@@ -1057,3 +1095,72 @@ def test_harness_commits_wait_until_the_run_end_is_saved(env, tmp_path, monkeypa
     log = subprocess.run(["git", "-C", str(p.harness), "log", "--format=%s", "-3"], capture_output=True,
                          text=True).stdout
     assert "memory (fact)" in log and "charter (policies)" in log
+
+def test_only_exclusive_resources_serialize_whole_tasks(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    from ttp import coordinator as coord
+    assert coord.apply(p, [
+        {"type": "task_add", "title": "measure a", "spec": "s", "tier": "light", "resources": ["board"]},
+        {"type": "task_add", "title": "measure b", "spec": "s", "tier": "light", "resources": ["board"]},
+        {"type": "task_add", "title": "reflash", "spec": "s", "tier": "light", "resources": ["board"],
+         "exclusive": True},
+        {"type": "task_add", "title": "reconfigure", "spec": "s", "tier": "light", "resources": ["board"],
+         "exclusive": True}]) == []
+    d = Daemon(p.base)
+    tasks = {t["title"]: t for t in p.db.q("SELECT * FROM tasks")}
+    assert d._resources_free(tasks["measure a"]) and d._resources_free(tasks["measure b"])
+    p.db.update_task(tasks["reflash"]["id"], status="running")
+    assert not d._resources_free(p.db.task(tasks["reconfigure"]["id"])), "two exclusive holders at once"
+    assert d._resources_free(p.db.task(tasks["measure a"]["id"])), "a shared user waited for the whole task"
+
+
+def test_ttp_lock_serializes_commands_on_one_slot(env):
+    p = make(env)
+    run_env = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost", TTP_PROJECT=str(p.base))
+    marks = env["tmp"] / "marks.txt"
+    cmd = [sys.executable, str(TTP), "lock", "board", "--", sys.executable, "-c",
+           f"import time; open({str(marks)!r}, 'a').write('start %f\\n' % time.time()); time.sleep(1.5); "
+           f"open({str(marks)!r}, 'a').write('end %f\\n' % time.time())"]
+    a = subprocess.Popen(cmd, env=run_env)
+    b = subprocess.Popen(cmd, env=run_env)
+    assert a.wait(timeout=60) == 0 and b.wait(timeout=60) == 0
+    events = [(ln.split()[0], float(ln.split()[1])) for ln in marks.read_text().splitlines()]
+    starts = sorted(t for k, t in events if k == "start")
+    ends = sorted(t for k, t in events if k == "end")
+    assert starts[1] >= ends[0] - 0.05, "two commands held the one slot at the same time"
+
+
+def test_cancelled_runs_are_not_runaway_waste(env):
+    """Redirecting a project cancels its running work; that must not pause the project."""
+    p = make(env)
+    from ttp import budget as bud
+    now = time.time()
+    for cost in (4.6, 4.5):
+        p.db.x("INSERT INTO runs(role,provider,started,ended,status,cost_usd) VALUES('worker','claude',?,?,?,?)",
+               (now - 600, now - 60, "killed", cost))
+    g = bud.evaluate(p.db, p.config(), "claude", [], now)
+    assert not any("failed or stalled" in r for r in g.reasons), g.reasons
+
+
+def test_project_plugins_load_for_workers_only(env, tmp_path, monkeypatch):
+    from ttp.providers import claude as claude_provider
+    monkeypatch.setattr(claude_provider.Claude, "binary", lambda self: "/usr/bin/true")  # never a real agent
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    plug = tmp_path / "some-plugin"
+    plug.mkdir()
+    assert coord.apply(p, [{"type": "config_set", "key": "providers.claude.plugin_dirs",
+                            "value": [str(plug), str(tmp_path / "missing")]}]) == []
+    p.set_config("core_provider", "claude")
+    d = Daemon(p.base)
+    tid = p.db.add_task("t", "s", kind="work", tier="light", origin="user")
+    rid = d.start_run("worker", "go", "claude", "light", str(p.root), task=p.db.task(tid))
+    argv = json.loads((p.runs / str(rid) / "run.json").read_text())["argv"]
+    assert argv[argv.index("--plugin-dir") + 1] == str(plug)
+    assert str(tmp_path / "missing") not in argv, "a missing plugin folder was passed on"
+    (p.runs / str(rid) / "STOP").touch()
+    crid = d.start_run("coordinator", "decide", "claude", "light", str(p.base), read_only=True)
+    assert "--plugin-dir" not in json.loads((p.runs / str(crid) / "run.json").read_text())["argv"]
+    (p.runs / str(crid) / "STOP").touch()

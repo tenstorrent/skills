@@ -34,7 +34,7 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "every": {"type": "string"}, "at": {"type": "string"}, "enabled": {"type": "boolean"},
             "key": {"type": "string"}, "value": {"type": "string"},
             "reversible": {"type": "boolean"}, "recommendation": {"type": "string"},
-            "resources": {"type": "array", "items": {"type": "string"}}},
+            "resources": {"type": "array", "items": {"type": "string"}}, "exclusive": {"type": "boolean"}},
             "required": ["type"]}},
         "summary": {"type": "string"},
     },
@@ -50,6 +50,8 @@ USER_SETTABLE = {
     "coordinator.tier": str, "jev.enabled": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     # Where code tasks branch from: the project's working branch once it has one.
     "delivery.base_ref": str,
+    # Skill plugins loaded for this project's workers only (a plan may recommend them).
+    "providers.claude.plugin_dirs": lambda v: [str(x) for x in (v if isinstance(v, list) else [v])],
     # Hours before an unanswered reversible ask falls back to its recommendation; 0 turns it off.
     "coordinator.ask_timeout_h": float,
 }
@@ -80,8 +82,18 @@ def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int]) ->
     for prov, g in gates.items():
         n = g.get("numbers", {})
         if g.get("regime") == "windows":
-            money = (f"plan windows: {n.get('window')} at {n.get('utilization')}% of the account; "
-                     f"the project may use it up to {n.get('limit')}%")
+            parts = []
+            for w in n.get("pace") or []:
+                left = f"{w['hours_left']:.1f} h" if w.get("hours_left") is not None else "unknown time"
+                pace = (f"burning {w['burn_per_h']}/h, needs {w['need_per_h']}/h to land at {n.get('limit')}% "
+                        f"(on pace for {w['projected']}%)" if w.get("burn_per_h") is not None
+                        else "no burn measured yet")
+                parts.append(f"{w['window']} {w['utilization']}% used, resets in {left}, {pace}")
+            money = ("plan windows (unused capacity is lost at each reset; the target is "
+                     f"{n.get('limit')}% by then): " + "; ".join(parts))
+            if g.get("level") == "green":
+                money += (f" · {n.get('running', 0)} of {g['max_parallel']} worker slots busy: keep enough "
+                          f"independent tasks ready to fill the free ones")
         else:
             est = f" (${n['estimated_24h']:.2f} of it estimated)" if n.get("estimated_24h") else ""
             money = (f"project caps (usage-billed providers together): ${n.get('spent_24h', 0):.2f} of "
@@ -167,7 +179,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None) -> l
                     raise ValueError(f"daily cap of {cap} new tasks reached; finish or cancel work first")
                 tier = a.get("tier") if a.get("tier") in ("light", "standard", "deep") else "standard"
                 budget = a.get("budget_usd") or cfg["budget"]["task_default_usd"].get(tier, 8.0)
-                labels = [f"resource:{r}" for r in (a.get("resources") or []) if isinstance(r, str)]
+                kind_label = "exclusive" if a.get("exclusive") else "resource"
+                labels = [f"{kind_label}:{r}" for r in (a.get("resources") or []) if isinstance(r, str)]
                 db.add_task(title, a.get("spec") or "", kind=a.get("kind") or "work", tier=tier,
                             priority=int(a.get("priority") or 3), provider=a.get("provider") or None,
                             budget_usd=float(budget), depends_on=a.get("depends_on") or [],

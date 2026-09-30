@@ -3,8 +3,11 @@
 """Budget governor: turns meter readings and the spend ledger into a gate for new work.
 
 Two regimes, chosen per provider from what the provider reports:
-- plan windows (subscription plans report utilization per window): the project may never take the
-  account past 100 - reserve_pct, because the remainder belongs to the user's own work;
+- plan windows (subscription plans report utilization per window): a plan is paid for per period,
+  so unused capacity is lost at each reset. The project paces itself to land each window at
+  100 - reserve_pct by its reset: it measures the account's burn rate from its own readings and
+  runs as many parallel workers as that pace allows. It never takes the account past the target,
+  because the remainder belongs to the user's own work;
 - dollar caps (usage-billed accounts report no window): rolling 24 h and 7 d caps on what THIS
   project spends across all its providers not on plan windows, with the user's defaults when the
   charter sets none.
@@ -21,6 +24,11 @@ from .db import DB
 LEVELS = ("green", "yellow", "orange", "red")
 HOUR, DAY, WEEK = 3600.0, 86400.0, 7 * 86400.0
 SNAPSHOT_FRESH_S = 30 * 60
+PLAN_MEMORY_S = 7 * 86400      # a provider that reported plan windows this recently is on a plan
+# Length of each named window, used to measure burn over a sensible span and to roll a window over
+# when its reset has passed without a new reading. Unknown names fall back to a week.
+WINDOW_HOURS = {"five_hour": 5.0, "5h": 5.0, "seven_day": 168.0, "7d": 168.0, "seven_day_opus": 168.0,
+                "seven_day_sonnet": 168.0}
 # Relative price of each token class (input = 1), used only to apply an observed rate to a token
 # mix; not a price list. Override with budget.estimate_weights.
 TOKEN_WEIGHTS = {"input": 1.0, "output": 5.0, "cache_read": 0.1, "cache_write": 1.25}
@@ -60,22 +68,13 @@ def _raise(g: Gate, level: str, reason: str) -> None:
 def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float | None = None) -> Gate:
     now = now or time.time()
     b = cfg["budget"]
-    g = Gate(provider=provider, max_parallel=int(b.get("max_parallel_workers", 2)))
+    g = Gate(provider=provider, max_parallel=int(b.get("max_parallel_workers", 6)))
     limit = 100.0 - float(b.get("reserve_pct", 10))
 
-    fresh = [w for w in windows if w.provider == provider]
-    if fresh:
+    plan = [w for w in windows if w.provider == provider]
+    if plan:
         g.regime = "windows"
-        worst = max(fresh, key=lambda w: w.utilization)
-        g.numbers.update({"window": worst.window, "utilization": round(worst.utilization, 1),
-                          "limit": limit, "resets_at": worst.resets_at})
-        for w in fresh:
-            if w.utilization >= limit:
-                _raise(g, "red", f"{w.window} window at {w.utilization:.0f}% (project stops at {limit:.0f}%)")
-            elif w.utilization >= limit - 10:
-                _raise(g, "orange", f"{w.window} window at {w.utilization:.0f}%")
-            elif w.utilization >= limit - 25:
-                _raise(g, "yellow", f"{w.window} window at {w.utilization:.0f}%")
+        _pace(db, g, provider, plan, limit, int(b.get("max_parallel_workers", 6)), now)
     else:
         # The caps bound the project's dollars, whichever provider spends them. Providers on plan
         # windows are bounded by their windows instead, so their spend does not count here.
@@ -103,8 +102,9 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
     hour_ago = now - HOUR
     last_h = db.spent_since(hour_ago, provider)
     runs_h = db.q("SELECT role, status, cost_usd FROM runs WHERE provider=? AND ended>=?", (provider, hour_ago))
+    # A run stopped on purpose (a cancel, a pause, a redirect) is a decision, not waste.
     waste = sum(float(r["cost_usd"] or 0) for r in runs_h
-                if r["status"] in ("failed", "stalled", "timeout", "lost", "killed", "budget"))
+                if r["status"] in ("failed", "stalled", "timeout", "lost", "budget", "no_handoff"))
     thrash = sum(float(r["cost_usd"] or 0) for r in runs_h if r["role"] == "coordinator")
     norm = db.spent_since(now - WEEK, provider) / (7 * 24)
     per_task = max((b.get("task_default_usd") or {"deep": 25.0}).values())
@@ -123,13 +123,90 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
         _raise(g, "red", f"runaway guard: ${last_h:.2f} spent in the last hour, ceiling ${ceiling:.2f}/h; "
                          f"resumes automatically as the hour rolls over")
 
-    if g.level == "yellow":
+    if g.level == "yellow" and g.regime == "caps":
         g.max_tier, g.max_parallel = "standard", max(1, g.max_parallel // 2 or 1)
     elif g.level == "orange":
         g.max_tier, g.max_parallel, g.allow_optional = "light", 1, False
     elif g.level == "red":
         g.max_tier, g.max_parallel, g.allow_optional, g.allow_new_work = "light", 0, False, False
     return g
+
+
+def _pace(db: DB, g: Gate, provider: str, plan: list[Window], target: float, most: int, now: float) -> None:
+    """Size parallel work so each window lands at `target` by its reset, from measured burn.
+
+    For each window: `need` is the burn (points of the window per hour) that reaches the target
+    exactly at the reset; `burn` is what the account has actually used over the recent past. Burning
+    slower than needed leaves paid capacity unused, so the project may run up to `most` workers.
+    Burning faster scales this project's workers down in proportion (other projects on the same
+    account see the same readings and do the same). Near the target only light work runs; at the
+    target nothing new starts until the reset.
+    """
+    running = db.one("SELECT COUNT(*) n FROM runs WHERE provider=? AND status='running' AND role!='coordinator'",
+                     (provider,))["n"]
+    allowed, rows = most, []
+    for w in plan:
+        hours_left = max((w.resets_at - now) / HOUR, 0.05) if w.resets_at else None
+        burn = burn_rate(db, provider, w.window, w.resets_at, now)
+        need = max(target - w.utilization, 0.0) / hours_left if hours_left else None
+        projected = w.utilization + burn * hours_left if (burn is not None and hours_left) else None
+        rows.append({"window": w.window, "utilization": round(w.utilization, 1), "resets_at": w.resets_at,
+                     "hours_left": round(hours_left, 2) if hours_left else None,
+                     "burn_per_h": None if burn is None else round(burn, 2),
+                     "need_per_h": None if need is None else round(need, 2),
+                     "projected": None if projected is None else round(projected, 1)})
+        if w.utilization >= target:
+            _raise(g, "red", f"{w.window} window at {w.utilization:.0f}%; the project stops at {target:.0f}% "
+                             f"until it resets")
+        elif w.utilization >= target - 2:
+            _raise(g, "orange", f"{w.window} window at {w.utilization:.0f}%, just under the {target:.0f}% stop")
+        elif burn is not None and need is not None and burn > need * 1.05:
+            _raise(g, "yellow", f"{w.window} window on pace for {projected:.0f}% by its reset, over the "
+                                f"{target:.0f}% target; running fewer workers")
+            allowed = min(allowed, max(1, int(max(running, 1) * need / burn)))
+    worst = max(rows, key=lambda r: (r["projected"] if r["projected"] is not None else r["utilization"]))
+    g.max_parallel = allowed
+    g.numbers.update({"window": worst["window"], "utilization": worst["utilization"], "limit": target,
+                      "resets_at": worst["resets_at"], "projected": worst["projected"], "running": running,
+                      "pace": rows})
+
+
+def burn_rate(db: DB, provider: str, window: str, resets_at: float | None, now: float) -> float | None:
+    """Points of the window used per hour, from this project's readings in the current period.
+
+    None until two readings at least five minutes apart exist: no reading, no guess.
+    """
+    span = min(WINDOW_HOURS.get(window, 168.0) * HOUR / 4, 3 * HOUR)
+    rows = db.q("SELECT ts, utilization FROM snapshots WHERE provider=? AND window=? AND ts>=? AND "
+                "(resets_at=? OR (? IS NULL AND resets_at IS NULL)) ORDER BY ts",
+                (provider, window, now - span, resets_at, resets_at))
+    if len(rows) < 2 or rows[-1]["ts"] - rows[0]["ts"] < 300:
+        return None
+    return max(float(rows[-1]["utilization"]) - float(rows[0]["utilization"]), 0.0) / (
+        (rows[-1]["ts"] - rows[0]["ts"]) / HOUR)
+
+
+def plan_windows(db: DB, now: float | None = None) -> list[Window]:
+    """The latest reading of every plan window reported in the last week.
+
+    Being on a plan is a fact about the account, so an old reading still says which regime applies;
+    the pacing works from the readings themselves. A window whose reset has passed since its last
+    reading has started a new period: it counts as empty until the next reading says otherwise.
+    """
+    now = now or time.time()
+    rows = db.q("SELECT s.* FROM snapshots s JOIN (SELECT provider, window, MAX(ts) mts FROM snapshots "
+                "WHERE ts>=? GROUP BY provider, window) m ON s.provider=m.provider AND s.window=m.window "
+                "AND s.ts=m.mts", (now - PLAN_MEMORY_S,))
+    out = []
+    for r in rows:
+        util, resets = float(r["utilization"] or 0), r["resets_at"]
+        if resets and now >= resets:
+            hours = WINDOW_HOURS.get(r["window"], 168.0)
+            while resets <= now:
+                resets += hours * HOUR
+            util = 0.0
+        out.append(Window(r["provider"], r["window"], util, resets, r["account"] or ""))
+    return out
 
 
 def estimate_cost(db: DB, cfg: dict, provider: str, model: str, tokens: dict[str, int],

@@ -29,9 +29,10 @@ in `state/runs/<id>/`, so a daemon restart never loses a result.
 3. No run starts when its provider's gate forbids it. Every run has a wall clock and a budget.
 4. A run's outcome is read from files, never a pipe. Runs survive daemon restarts.
 5. A missed schedule fires once on wake, never once per missed slot.
-6. Plan windows keep `reserve_pct` for the user. Usage-billed spend has dollar caps on the project
-   total across providers. A run that ends without reporting its cost counts at an estimate from its
-   streamed tokens, at the project's own observed rate.
+6. Plan windows keep `reserve_pct` for the user, and the project paces itself to use the rest by
+   each reset, from burn measured in its own readings, never from an assumed rate. A provider that
+   reported plan windows in the last week stays on the plan regime; old readings never fall back to
+   dollar caps. Usage-billed accounts have dollar caps. Cancelled runs are decisions, not waste.
 7. A limit or logout pauses a provider with one clear alert; it is never counted as task failure.
    Neither is a `waiting` hand-off (busy machine or queue): the task retries later, up to
    `budget.max_waits` times, then asks the user.

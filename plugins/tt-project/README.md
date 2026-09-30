@@ -58,13 +58,26 @@ and preferences you add later become part of the project's charter and memory.
 
 ## Budget
 
-- Subscription plans: the project reads the account's live window usage and never takes it past
-  90%, leaving the rest for your own work.
+- Subscription plans: a plan's capacity is lost at each reset, so the project uses it. It reads
+  the account's live window usage, measures how fast the account is burning it, and paces itself
+  to land each window near 90% by its reset: more parallel workers while there is room, fewer when
+  the pace would overshoot. It never goes past 90%; the rest stays yours.
 - Usage-billed accounts: $100 per 24 hours and $200 per 7 days per project by default.
 - Work backs off in steps as spend rises, pauses at the cap, and tells you how to raise it.
 - A runaway guard pauses a project whose hourly spend jumps far above its own norm.
 - The web app shows spend per day, per task and per recurring job, and plan-window peaks for the
   last two weeks.
+
+## Parallel work
+
+- Up to 6 workers per project run side by side (`budget.max_parallel_workers`); on a plan, the
+  pacing sets the actual number. When slots sit idle, the coordinator is asked for more work.
+- A shared device or machine is taken per command, through its own queue (for example a device
+  broker) or `ttp lock <resource> -- <command>`, so the rest of each task runs in parallel.
+- Each task edits only its own worktree.
+- A plan task starts from what is already known: prior work, the organization's docs and chats
+  through the connectors you have, available skills, and public work. Skill plugins it recommends
+  can be enabled for the project's workers only (`providers.claude.plugin_dirs`).
 
 ## Where things live
 

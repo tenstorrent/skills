@@ -62,6 +62,12 @@ class Claude(Provider):
         except FileNotFoundError:
             return
 
+    def plugin_args(self, dirs: list[str]) -> list[str]:
+        out: list[str] = []
+        for d in dirs:
+            out += ["--plugin-dir", d]
+        return out
+
     def parse(self, output_path, stderr_path=None) -> RunUsage:
         u = RunUsage()
         last_text = ""

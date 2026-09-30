@@ -4,6 +4,8 @@
 Templates live in the project's own harness (prompts/*.md), so each project can tune them."""
 from __future__ import annotations
 
+import json
+
 from .db import load_result
 from .project import Project
 
@@ -38,6 +40,19 @@ def restrictions_block(p: Project) -> str:
             "rules and your own judgement; if a step would break one, do not take it)\n" + body)
 
 
+def _resource_line(task: dict) -> str:
+    labels = json.loads(task["labels"] or "[]") if task["labels"] else []
+    shared = [lb.split(":", 1)[1] for lb in labels if lb.startswith("resource:")]
+    held = [lb.split(":", 1)[1] for lb in labels if lb.startswith("exclusive:")]
+    out = ""
+    if shared:
+        out += (f"shared resources: {', '.join(shared)}; run each command that touches one as "
+                f"`ttp lock <name> -- <command>` (or through its own queue)\n")
+    if held:
+        out += f"held for this whole run: {', '.join(held)}\n"
+    return out
+
+
 def worker_prompt(p: Project, task: dict, cwd: str, branch: str | None) -> str:
     cfg = p.config()
     kind = task["kind"] or "work"
@@ -60,7 +75,8 @@ def worker_prompt(p: Project, task: dict, cwd: str, branch: str | None) -> str:
         f"kind: {kind} · tier: {task['tier']} · attempt {int(task['attempts'] or 0) + 1} of "
         f"{task['max_attempts']} · budget ${task['budget_usd'] or 0:.2f} (spent ${task['spent_usd'] or 0:.2f})\n"
         f"working directory: {cwd}" + (f" · branch: {branch}" if branch else "") + "\n"
-        f"project root: {p.root}\n"
+        + _resource_line(task)
+        + f"project root: {p.root}\n"
         f"delivery policy: draft PRs={delivery.get('draft_prs', True)}, review before PR="
         f"{delivery.get('review_before_pr', True)}, auto-merge repos={delivery.get('auto_merge_repos') or 'none'}, "
         f"push allowed={delivery.get('push_allowed', True)}\n"

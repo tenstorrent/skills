@@ -74,6 +74,10 @@ class Provider:
     def parse(self, output_path: Path, stderr_path: Path | None = None) -> RunUsage:
         raise NotImplementedError
 
+    def plugin_args(self, dirs: list[str]) -> list[str]:
+        """Arguments that load extra skill plugins for one run; [] when the agent cannot."""
+        return []
+
     def cost_so_far(self, output_path: Path) -> float | None:
         """Mid-run spend, when the provider streams it and does not enforce a budget itself."""
         return None
