@@ -2176,6 +2176,50 @@ def test_a_launcher_refuses_a_foreign_runtime(env, tmp_path, case):
     assert not (env["home"] / "lib").exists()
 
 
+def test_setup_records_the_source_commit_and_reports_a_same_version_overwrite(env, tmp_path):
+    import shutil
+    from ttp import __version__
+    plugin = tmp_path / "plugin"
+    for part in ("runtime", "template", "bin"):
+        shutil.copytree(RUNTIME.parent / part, plugin / part, ignore=shutil.ignore_patterns("__pycache__"))
+    ident = ["-c", "user.name=t", "-c", "user.email=t@t"]
+
+    def setup():
+        r = subprocess.run([sys.executable, str(plugin / "bin" / "ttp"), "setup", "--bin-dir", str(tmp_path / "bin")],
+                           capture_output=True, text=True, timeout=60)
+        assert r.returncode == 0, r.stderr
+        return r.stdout, (env["home"] / "lib" / __version__ / "runtime" / "ttp" / "SOURCE_COMMIT").read_text().strip()
+
+    def version():
+        return subprocess.run([str(tmp_path / "bin" / "ttp"), "--version"], capture_output=True, text=True,
+                              timeout=60).stdout.strip()
+
+    out, got = setup()                                   # not a git checkout
+    assert got == "unknown" and f"ttp {__version__} (unknown) installed" in out
+    subprocess.run(["git", "init", "-q", str(plugin)], check=True)
+    _git_out(plugin, "add", "-A")
+    _git_out(plugin, *ident, "commit", "-qm", "one")
+    first = _git_out(plugin, "rev-parse", "--short=12", "HEAD")
+    out, got = setup()
+    assert got == first and f"with commit {first}" in out
+    assert version() == f"ttp {__version__} ({first})"
+    (plugin / "template" / "prompts" / "worker.md").write_text("changed\n")
+    assert setup()[1] == first + "-dirty"                 # uncommitted edits are not passed off as the commit
+    _git_out(plugin, *ident, "commit", "-qam", "two")
+    second = _git_out(plugin, "rev-parse", "--short=12", "HEAD")
+    out, got = setup()                                   # same version, newer commit
+    assert got == second and f"replaced ttp {__version__} from commit {first}-dirty with commit {second}" in out
+    assert version() == f"ttp {__version__} ({second})"
+
+
+def test_version_shows_the_source_commit(env, capsys):
+    from ttp import __version__, cli
+    with pytest.raises(SystemExit):
+        cli.main(["--version"])
+    out = capsys.readouterr().out.strip()
+    assert out.startswith(f"ttp {__version__} (") and out.endswith(")") and len(out) > len(f"ttp {__version__} ()")
+
+
 def test_setup_from_a_harness_copy_refuses(env, tmp_path):
     p = make(env)
     r = subprocess.run([sys.executable, str(p.harness / "bin" / "ttp"), "setup", "--bin-dir", str(tmp_path / "bin")],
@@ -2212,6 +2256,26 @@ def test_a_conflicting_upgrade_leaves_the_harness_untouched_and_queues_a_task(en
                             "worker.md": worker + "\nupstream line\n"})
     cli.main(["upgrade", "demo"])
     assert "upstream line" in (h / "prompts" / "worker.md").read_text() and restarts == [1]
+
+
+def test_upgrade_reports_a_new_source_commit_at_the_same_version(env, monkeypatch, capsys):
+    p = make(env)
+    from ttp import __version__, cli, service
+    monkeypatch.setattr(service, "restart", lambda p: "restarted")
+    mark = env["home"] / "lib" / "current" / "runtime" / "ttp" / "SOURCE_COMMIT"
+    _install_template(env)
+    mark.write_text("aaaa1111\n")
+    cli.main(["upgrade", "demo"])
+    assert (p.harness / "runtime" / "ttp" / "SOURCE_COMMIT").read_text().strip() == "aaaa1111"
+    capsys.readouterr()
+    mark.write_text("bbbb2222\n")                            # a newer checkout, version unchanged
+    cli.main(["upgrade", "demo"])
+    out = capsys.readouterr().out
+    assert f"same version {__version__}, new source commit: aaaa1111 -> bbbb2222" in out
+    assert (p.harness / "runtime" / "ttp" / "SOURCE_COMMIT").read_text().strip() == "bbbb2222"
+    assert "(bbbb2222)" in _git_out(p.harness, "log", "-1", "--format=%s", "upstream")
+    cli.main(["upgrade", "demo"])
+    assert f"installed template: ttp {__version__} (bbbb2222)" in capsys.readouterr().out
 
 
 def test_a_merged_runtime_that_does_not_import_is_not_applied(env, monkeypatch):

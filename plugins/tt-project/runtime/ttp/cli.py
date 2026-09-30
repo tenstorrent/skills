@@ -167,6 +167,47 @@ def _git(cwd: Path, *args: str) -> str:
     return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, check=True).stdout.strip()
 
 
+SOURCE_FILE = "SOURCE_COMMIT"      # in runtime/ttp/: the git commit `ttp setup` installed this runtime from
+
+
+def _checkout_commit(root: Path) -> str:
+    """The commit of the git checkout the plugin at `root` is tracked in ("-dirty" with local edits
+    under it), or "unknown" when it is not in one (a plugin cache, a copy, no git)."""
+    def run(*args: str) -> str:
+        try:
+            r = subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        return r.stdout.strip() if r.returncode == 0 else ""
+    if not run("ls-files", "--", "runtime/ttp/__init__.py"):      # not a checkout of this plugin
+        return "unknown"
+    commit = run("rev-parse", "--short=12", "HEAD")
+    if not commit:
+        return "unknown"
+    return commit + ("-dirty" if run("status", "--porcelain", "--", ".") else "")
+
+
+def recorded_commit(runtime: Path) -> str:
+    """The source commit `ttp setup` recorded in an installed runtime, or "unknown"."""
+    try:
+        return (runtime / "ttp" / SOURCE_FILE).read_text().strip() or "unknown"
+    except OSError:
+        return "unknown"
+
+
+def source_commit() -> str:
+    """The git commit this runtime came from: recorded at install, else read from the plugin checkout."""
+    got = recorded_commit(RUNTIME)
+    if got == "unknown" and (PLUGIN_ROOT / "template").is_dir():   # a harness copy is not the plugin
+        got = _checkout_commit(PLUGIN_ROOT)
+    return got
+
+
+def _runtime_version(runtime: Path) -> str:
+    m = re.search(r'__version__ = "([^"]+)"', (runtime / "ttp" / "__init__.py").read_text())
+    return m.group(1) if m else "unknown"
+
+
 def bootstrap(root: Path, name: str, brief: str, provider: str) -> Project:
     p = Project(root)
     if p.exists():
@@ -180,6 +221,7 @@ def bootstrap(root: Path, name: str, brief: str, provider: str) -> Project:
         d.mkdir(parents=True, exist_ok=True)
     template = PLUGIN_ROOT / "template"
     _copy_tree(RUNTIME, p.harness / "runtime")
+    (p.harness / "runtime" / "ttp" / SOURCE_FILE).write_text(source_commit() + "\n")
     _copy_tree(template / "prompts", p.harness / "prompts")
     _copy_tree(template / "bin", p.harness / "bin")
     for f in (p.harness / "bin").iterdir():
@@ -274,7 +316,8 @@ def ship_runtime(host: str) -> str:
                            env={**os.environ, "COPYFILE_DISABLE": "1"})
     subprocess.check_call(["ssh", "-o", "BatchMode=yes", host, f"tar -C ~/{stage} -xzf -"], stdin=tar.stdout)
     tar.wait()
-    subprocess.check_call(["ssh", "-o", "BatchMode=yes", host, f"~/{stage}/bin/ttp setup >/dev/null"])
+    mark = f"printf '%s\\n' {shlex.quote(source_commit())} > ~/{stage}/runtime/ttp/{SOURCE_FILE}"
+    subprocess.check_call(["ssh", "-o", "BatchMode=yes", host, f"{mark} && ~/{stage}/bin/ttp setup >/dev/null"])
     return f"~/{stage}/bin/ttp"
 
 
@@ -813,6 +856,8 @@ def cmd_setup(a) -> None:
     lib = HOME_DIR / "lib" / __version__
     if not (PLUGIN_ROOT / "template").is_dir():
         die(f"{RUNTIME} is a project's harness copy, not the plugin; run `<plugin-root>/bin/ttp setup`", 1)
+    commit = source_commit()
+    before = recorded_commit(lib / "runtime") if (lib / "runtime").is_dir() else ""
     if RUNTIME.resolve() != (lib / "runtime").resolve():
         for part in ("runtime", "template", "bin"):
             src = PLUGIN_ROOT / part
@@ -820,6 +865,7 @@ def cmd_setup(a) -> None:
                 _copy_tree(src, lib / part)
         for f in (lib / "bin").iterdir():
             f.chmod(0o755)
+    (lib / "runtime" / "ttp" / SOURCE_FILE).write_text(commit + "\n")
     cur = HOME_DIR / "lib" / "current"
     if cur.is_symlink() or cur.exists():
         cur.unlink()
@@ -830,7 +876,9 @@ def cmd_setup(a) -> None:
     shim.write_text(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(cur / 'bin' / 'ttp'))} \"$@\"\n")
     shim.chmod(0o755)
     on_path = str(bindir) in os.environ.get("PATH", "").split(":")
-    print(f"ttp {__version__} installed: {shim}" + ("" if on_path else f" (add {bindir} to PATH)"))
+    print(f"ttp {__version__} ({commit}) installed: {shim}" + ("" if on_path else f" (add {bindir} to PATH)"))
+    if before and before != commit:
+        print(f"replaced ttp {__version__} from commit {before} with commit {commit}")
 
 
 def cmd_upgrade(a) -> None:
@@ -846,6 +894,14 @@ def cmd_upgrade(a) -> None:
     if not (src / "runtime").is_dir():
         die("no installed template; run `ttp setup` from the plugin first")
     h = p.harness
+    new_v, new_c = _runtime_version(src / "runtime"), recorded_commit(src / "runtime")
+    old_v, old_c = _runtime_version(h / "runtime"), recorded_commit(h / "runtime")
+    if old_v != new_v:
+        print(f"upgrading the harness from ttp {old_v} ({old_c}) to {new_v} ({new_c})")
+    elif old_c != new_c:
+        print(f"same version {new_v}, new source commit: {old_c} -> {new_c}")
+    else:
+        print(f"installed template: ttp {new_v} ({new_c})")
     ident = ["-c", "user.name=tt-project", "-c", "user.email=tt-project@localhost"]
     if _git(h, "status", "--porcelain"):
         _git(h, "add", "-A")
@@ -861,8 +917,7 @@ def cmd_upgrade(a) -> None:
             _copy_tree(src / part, tmp / dst)
         _git(tmp, "add", "-A")
         if _git(tmp, "status", "--porcelain"):
-            ver = re.search(r'__version__ = "([^"]+)"', (src / "runtime" / "ttp" / "__init__.py").read_text()).group(1)
-            _git(tmp, *ident, "commit", "-q", "-m", f"tt-project template {ver}")
+            _git(tmp, *ident, "commit", "-q", "-m", f"tt-project template {new_v} ({new_c})")
     finally:
         _git(h, "worktree", "remove", "--force", str(tmp))
     merged, problem = _merge_upstream(h, p.state / "upgrade-merge", ident)
@@ -967,9 +1022,16 @@ def cmd_doctor(a) -> None:
     print(web_line(p))
 
 
+class _Version(argparse.Action):
+    """`ttp --version`: the source commit is looked up only when asked for (it may run git)."""
+    def __call__(self, parser, namespace, values, option_string=None):
+        print(f"ttp {__version__} ({source_commit()})")
+        parser.exit()
+
+
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(prog="ttp", description="tt-project: long-running, self-driving projects")
-    ap.add_argument("--version", action="version", version=__version__)
+    ap.add_argument("--version", action=_Version, nargs=0, help="show the version and source commit, then exit")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("new", help="create a project")
