@@ -9,6 +9,9 @@ reading files, running commands or thinking hard becomes a task for a worker ins
 """
 from __future__ import annotations
 
+import json
+import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -57,7 +60,7 @@ USER_SETTABLE = {
     # The runaway valve on task creation; the coordinator may raise it within MAX_TASKS_PER_DAY.
     "coordinator.max_new_tasks_per_day": lambda v: min(int(v), MAX_TASKS_PER_DAY),
     # Skill plugins loaded for this project's workers only (a plan may recommend them).
-    "providers.claude.plugin_dirs": lambda v: [str(x) for x in (v if isinstance(v, list) else [v])],
+    "providers.claude.plugin_dirs": lambda v: existing_dirs(dir_list(v)),
     # Hours before an unanswered ask registered with a default falls back to it; 0 turns it off.
     # New asks never get a default, so this only drains asks registered with one.
     "coordinator.ask_timeout_h": float,
@@ -369,6 +372,33 @@ def _new_dependencies(db, task: dict | None, raw: Any) -> list[int]:
     if task and db.dependency_cycle(task["id"], deps):
         raise ValueError(f"{who} depends_on {deps} would create a cycle")
     return deps
+
+
+def dir_list(v: Any) -> list[str]:
+    """Directories from a config value. The action schema carries `value` as a string, so a list
+    arrives JSON-encoded or comma/newline separated, and an older config may hold such a string
+    as a single list element."""
+    out: list[str] = []
+    for item in (v if isinstance(v, list) else [v]):
+        if isinstance(item, list):
+            out += dir_list(item)
+            continue
+        text = str(item or "").strip()
+        if text.startswith("["):
+            try:
+                out += dir_list(json.loads(text))
+                continue
+            except ValueError:
+                pass
+        out += [x.strip() for x in re.split(r"[,\n]", text) if x.strip()]
+    return out
+
+
+def existing_dirs(dirs: list[str]) -> list[str]:
+    missing = [d for d in dirs if not Path(os.path.expanduser(d)).is_dir()]
+    if missing:
+        raise ValueError(f"not a directory on this machine: {', '.join(missing)}; nothing was changed")
+    return dirs
 
 
 def ask_timeout_h(cfg: dict) -> float:

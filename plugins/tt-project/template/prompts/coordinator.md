@@ -37,7 +37,7 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
 - Large, vague or changed goal → one `plan` task first, then add the tasks it proposes. A plan
   starts from what is already known (prior work, the organization's docs and chats, skills, public
   work); save its `findings` as memory. When it recommends skill plugins, `ask_user` (`blocking`
-  `access`) with the exact folders; once the user says yes, set `providers.claude.plugin_dirs` (a list of plugin folders)
+  `access`) with the exact folders; once the user says yes, set `providers.claude.plugin_dirs` (plugin folders, as a JSON list)
   in that same turn. Plugins run code in every worker, so this always needs the user's yes.
 - Check open tasks before adding one. NEVER add a duplicate.
 - Work runs in parallel. The budget line shows busy and free worker slots. On a plan, unused

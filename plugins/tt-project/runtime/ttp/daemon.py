@@ -185,10 +185,15 @@ class Daemon:
         if not read_only:
             # Skill plugins this project enabled for its workers only (never the user's own setup).
             dirs = [str(Path(os.path.expanduser(d))) for d in
-                    (self.cfg["providers"].get(provider, {}).get("plugin_dirs") or [])
-                    if Path(os.path.expanduser(d)).is_dir()]
+                    coord.dir_list(self.cfg["providers"].get(provider, {}).get("plugin_dirs") or [])]
+            missing = [d for d in dirs if not Path(d).is_dir()]
+            if missing:
+                self.alert(f"plugin_dirs_missing:{provider}",
+                           f"Workers run without these {provider} plugin directories, which do not exist: "
+                           f"{', '.join(missing)}. Fix providers.{provider}.plugin_dirs in project.json.",
+                           severity="normal", every_s=86400)
             roots = [str(self.p.state)] + [d for d in [worktree.git_common_dir(Path(cwd))] if d]
-            extra = prov.writable_args(roots) + prov.plugin_args(dirs)
+            extra = prov.writable_args(roots) + prov.plugin_args([d for d in dirs if d not in missing])
             # A trailing "-" (prompt on stdin) stays the last argument.
             argv = argv[:-1] + extra + ["-"] if argv[-1:] == ["-"] else argv + extra
         db = self.p.db

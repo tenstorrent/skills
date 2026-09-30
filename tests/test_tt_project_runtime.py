@@ -1340,16 +1340,28 @@ def test_project_plugins_load_for_workers_only(env, tmp_path, monkeypatch):
     from ttp.daemon import Daemon
     plug = tmp_path / "some-plugin"
     plug.mkdir()
-    action = {"type": "config_set", "key": "providers.claude.plugin_dirs",
-              "value": [str(plug), str(tmp_path / "missing")]}
+    other = tmp_path / "other-plugin"
+    other.mkdir()
+    missing = str(tmp_path / "missing")
+    key = "providers.claude.plugin_dirs"
+    # The action schema types `value` as a string, so a list arrives JSON-encoded.
+    action = {"type": "config_set", "key": key, "value": json.dumps([str(plug), str(other)])}
     assert coord.apply(p, [action]) == [], "enabling worker plugins must not wait for the user"
+    assert p.config()["providers"]["claude"]["plugin_dirs"] == [str(plug), str(other)]
+    problems = coord.apply(p, [{"type": "config_set", "key": key, "value": f"{plug}, {missing}"}])
+    assert problems and missing in problems[0], "a missing folder must be rejected where the coordinator sees it"
+    assert p.config()["providers"]["claude"]["plugin_dirs"] == [str(plug), str(other)]
+    # A config written before the value was parsed holds the JSON string as one element.
+    p.set_config(key, [json.dumps([str(plug), missing])])
     p.set_config("core_provider", "claude")
     d = Daemon(p.base)
     tid = p.db.add_task("t", "s", kind="work", tier="light", origin="user")
     rid = d.start_run("worker", "go", "claude", "light", str(p.root), task=p.db.task(tid))
     argv = json.loads((p.runs / str(rid) / "run.json").read_text())["argv"]
     assert argv[argv.index("--plugin-dir") + 1] == str(plug)
-    assert str(tmp_path / "missing") not in argv, "a missing plugin folder was passed on"
+    assert missing not in argv, "a missing plugin folder was passed on"
+    assert p.db.one("SELECT id FROM messages WHERE kind='alert' AND text LIKE ?", (f"%{missing}%",)), \
+        "a missing plugin folder was dropped without telling anyone"
     (p.runs / str(rid) / "STOP").touch()
     crid = d.start_run("coordinator", "decide", "claude", "light", str(p.base), read_only=True)
     assert "--plugin-dir" not in json.loads((p.runs / str(crid) / "run.json").read_text())["argv"]
