@@ -33,6 +33,9 @@ def test_manifests_agree():
     data = [json.loads(p.read_text()) for p in MANIFESTS]
     assert {d["name"] for d in data} == {"tt-project"}
     assert len({d["version"] for d in data}) == 1
+    runtime_version = re.search(r'__version__ = "([^"]+)"',
+                                (PLUGIN / "runtime" / "ttp" / "__init__.py").read_text()).group(1)
+    assert runtime_version == data[0]["version"], "bump runtime/ttp/__init__.py with the manifests"
     assert all(d["skills"] == "./skills/" for d in data)
 
 
