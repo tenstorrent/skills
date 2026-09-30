@@ -65,6 +65,10 @@ USER_SETTABLE = {
 
 REJECTED_KEY = "rejected_actions"   # kv: the last turn's rejected actions, shown in the next digest
 RECENT_OUT = 5                       # outbound messages the digest repeats, so turns do not resend them
+# Digest row lengths. Background rows are cut; new events, asks and open-task notes carry decisions.
+NOTE_CHARS = 140
+FINISHED_ROWS, FINISHED_CHARS = 10, 120
+SENT_CHARS = 100
 MAX_TASKS_PER_DAY = 1000
 ASK_DEFAULTS_KEY = "ask_defaults"   # kv: {ask message id: recommendation}; no new ask is added
 _DEFAULT_NOTE = "\n\nIf there is no answer within "
@@ -77,12 +81,25 @@ def system_prompt(p: Project) -> str:
     role = (p.harness / "prompts" / "coordinator.md").read_text()
     charter = p.charter_path.read_text() if p.charter_path.exists() else "(no charter yet)"
     memory = p.memory_text() or "(no memories yet)"
-    from .prompts import restrictions_block
+    from .prompts import charter_without_restrictions, restrictions_block
     rules = restrictions_block(p)
     if rules:
         rules += ("\nWorkers are shown this block verbatim; when a spec touches anything it covers, "
                   "restate the relevant restriction in the spec itself.\n\n")
+        charter = charter_without_restrictions(charter)
     return f"{rules}{role}\n\n# CHARTER\n{charter}\n\n# MEMORY\n{memory}\n"
+
+
+def clip(text: Any, n: int) -> str:
+    """`text` on one line, at most `n` characters, cut at a word where one is near."""
+    s = " ".join(str(text or "").split())
+    if len(s) <= n:
+        return s
+    cut = s[:n - 1]
+    space = cut.rfind(" ")
+    if space > n * 2 // 3:
+        cut = cut[:space]
+    return cut.rstrip(" ,;:") + "…"
 
 
 def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int]) -> str:
@@ -117,20 +134,29 @@ def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int]) ->
     lines.append("## Open tasks (id | status | tier | priority | age | title | last note)")
     rows = db.q("SELECT * FROM tasks WHERE status NOT IN ('done','failed','cancelled') ORDER BY priority, id LIMIT 60")
     for t in rows:
-        note = (t["blocked_reason"] or str(load_result(t["result"]).get("summary") or ""))[:140]
+        note = clip(t["blocked_reason"] or load_result(t["result"]).get("summary"), NOTE_CHARS)
         lines.append(f"- #{t['id']} | {t['status']} | {t['tier']} | p{t['priority']} | "
                      f"{(now - t['created']) / 3600:.1f}h | {t['title']} | {note}")
     if not rows:
         lines.append("- (none)")
-    lines.append("## Recently finished (last 48h)")
-    for t in db.q("SELECT * FROM tasks WHERE status IN ('done','failed','cancelled') AND updated>? "
-                  "ORDER BY updated DESC LIMIT 15", (now - 172800,)):
-        summary = str(load_result(t["result"]).get("summary") or "")[:200]
+    events = (db.q(f"SELECT * FROM events WHERE id IN ({','.join('?' * len(event_ids))}) ORDER BY id", event_ids)
+              if event_ids else [])
+    # A task finishing this turn has its full hand-off under NEW EVENTS.
+    in_events = {e["source"] for e in events}
+    finished = db.q("SELECT * FROM tasks WHERE status IN ('done','failed','cancelled') AND updated>? "
+                    "ORDER BY updated DESC LIMIT ?", (now - 172800, FINISHED_ROWS))
+    if finished:
+        lines.append("## Recently finished (last 48h, newest first)")
+    for t in finished:
+        summary = ("see new events" if f"task:{t['id']}" in in_events
+                   else clip(load_result(t["result"]).get("summary"), FINISHED_CHARS))
         lines.append(f"- #{t['id']} {t['status']}: {t['title']} — {summary}")
-    lines.append("## Recurring")
-    for s in sched.with_costs(db):
+    recurring = sched.with_costs(db)
+    if recurring:
+        lines.append("## Recurring")
+    for s in recurring:
         lines.append(f"- {s['name']} ({s['kind']}, every {s['every_s'] // 60} min, "
-                     f"{'on' if s['enabled'] else 'off'}, 7d cost ${s['cost_7d']}): {s['description'][:100]}")
+                     f"{'on' if s['enabled'] else 'off'}, 7d cost ${s['cost_7d']}): {clip(s['description'], 100)}")
     blockers = db.q("SELECT * FROM messages WHERE kind='ask' AND handled=0 AND ts>? ORDER BY id DESC LIMIT 10",
                     (now - 14 * 86400,))
     if blockers:
@@ -149,18 +175,19 @@ def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int]) ->
     if sent:
         lines.append("## Recently sent to the user (do not repeat these)")
         for m in reversed(sent):
-            lines.append(f"- {m['kind']} #{m['id']}, {(now - m['ts']) / 3600:.1f}h ago: {m['text'][:200]}")
-    lines.append("## Chats attached")
-    for c in db.q("SELECT id, label, last_active FROM chats ORDER BY last_active DESC LIMIT 10"):
+            lines.append(f"- {m['kind']} #{m['id']}, {(now - m['ts']) / 3600:.1f}h ago: {clip(m['text'], SENT_CHARS)}")
+    chats = db.q("SELECT id, label, last_active FROM chats ORDER BY last_active DESC LIMIT 10")
+    if chats:
+        lines.append("## Chats attached")
+    for c in chats:
         lines.append(f"- {c['id']} ({c['label'] or 'chat'}), active {(now - (c['last_active'] or now)) / 60:.0f} min ago")
 
     lines.append("\n# NEW EVENTS")
     if msg_ids:
         for m in db.q(f"SELECT * FROM messages WHERE id IN ({','.join('?' * len(msg_ids))}) ORDER BY id", msg_ids):
             lines.append(f"- [user message via {m['channel']}, chat={m['chat'] or '-'}] {m['text']}")
-    if event_ids:
-        for e in db.q(f"SELECT * FROM events WHERE id IN ({','.join('?' * len(event_ids))}) ORDER BY id", event_ids):
-            lines.append(f"- [{e['kind']} from {e['source']}, severity {e['severity']}] {e['text'][:1500]}")
+    for e in events:
+        lines.append(f"- [{e['kind']} from {e['source']}, severity {e['severity']}] {e['text'][:1500]}")
     rejected = db.kv(REJECTED_KEY, []) or []
     for x in rejected:
         lines.append(f"- [your previous turn's action was rejected; fix or drop it] {x[:500]}")

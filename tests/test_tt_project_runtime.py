@@ -659,7 +659,10 @@ def test_charter_restrictions_lead_and_close_every_worker_prompt(env):
     assert prompt.rstrip().endswith("Never merge to main.")
     assert prompt.count("Never merge to main.") == 2, "the restrictions are stated more than twice"
     assert "Go fast." in prompt and "Draft PRs." in prompt
-    assert system_prompt(p).startswith("# BINDING RESTRICTIONS")
+    system = system_prompt(p)
+    assert system.startswith("# BINDING RESTRICTIONS")
+    assert system.count("Never merge to main.") == 1, "the coordinator reads the restrictions twice"
+    assert "Draft PRs." in system
 
 
 def test_charter_and_memory_changes_are_committed_alone(env):
@@ -1824,6 +1827,40 @@ def test_an_identical_open_ask_is_not_posted_twice(env):
     assert problems and "already asked" in problems[0]
     assert len(p.db.q("SELECT id FROM messages WHERE kind='ask'")) == 1
     assert "Ship it now or wait?" in coord.digest(p, {}, [], []).split("## Recently sent to the user")[1]
+
+
+def test_the_digest_cuts_background_rows_but_keeps_new_events_whole(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    long = "word " * 400
+    for i in range(coord.FINISHED_ROWS + 3):
+        tid = p.db.add_task(f"old task {i}", origin="user")
+        p.db.update_task(tid, status="done", result=json.dumps({"summary": f"finished {i} {long}"}))
+    done = p.db.add_task("fresh task", origin="user")
+    p.db.update_task(done, status="done", result=json.dumps({"summary": "fresh " + long}))
+    ev = p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                (time.time(), f"task:{done}", "task_done", "normal", "fresh hand-off " + long, "new"))
+    p.db.post("out", "sent " + long, kind="reply")
+    p.db.x("DELETE FROM schedules")
+    p.db.x("DELETE FROM chats")
+    d = coord.digest(p, {}, [ev], [])
+    background = d.split("# NEW EVENTS")[0]
+    finished = background.split("## Recently finished")[1].split("\n## ")[0].splitlines()[1:]
+    assert len(finished) == coord.FINISHED_ROWS
+    assert f"#{done} done: fresh task — see new events" in finished[0], "the hand-off was repeated"
+    assert all(len(row) < coord.FINISHED_CHARS + 40 and row.endswith("…") for row in finished[1:])
+    sent = background.split("## Recently sent to the user")[1].splitlines()[1]
+    assert sent.endswith("word…") and len(sent) < coord.SENT_CHARS + 40
+    assert "## Recurring" not in d and "## Chats attached" not in d, "empty sections are still shown"
+    assert ("fresh hand-off " + long)[:1500] in d.split("# NEW EVENTS")[1], "a new event was cut short"
+
+
+def test_clip_cuts_at_a_word_and_marks_the_cut():
+    from ttp.coordinator import clip
+    assert clip("short\n  text", 50) == "short text"
+    assert clip(None, 10) == ""
+    assert clip("alpha beta gamma delta", 18) == "alpha beta gamma…"
+    assert clip("x" * 30, 10) == "x" * 9 + "…"
 
 
 def test_a_waiting_task_runs_only_once_its_probe_passes(env, monkeypatch, tmp_path):
