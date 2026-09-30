@@ -380,7 +380,7 @@ class Daemon:
             return
         db.set_kv("coordinator_failures", 0)
         default_chat = note.get("default_chat")
-        problems = coord.apply(self.p, actions, default_chat=default_chat)
+        problems = coord.apply(self.p, actions, default_chat=default_chat, user_turn=bool(note.get("messages")))
         ids = note.get("messages", [])
         if ids:
             db.x(f"UPDATE messages SET handled=1 WHERE id IN ({','.join('?' * len(ids))})", ids)

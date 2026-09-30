@@ -32,8 +32,9 @@ Return ONLY the JSON object `{"actions": [...], "summary": "<one line>"}`.
   Workers start with no memory of this conversation.
 - Large, vague or changed goal → one `plan` task first, then add the tasks it proposes. A plan
   starts from what is already known (prior work, the organization's docs and chats, skills, public
-  work); save its `findings` as memory. When it recommends skill plugins, enable them for this
-  project's workers with `config_set` `providers.claude.plugin_dirs` (a list of plugin folders).
+  work); save its `findings` as memory. When it recommends skill plugins, `ask_user` with the exact
+  folders; once the user says yes, set `providers.claude.plugin_dirs` (a list of plugin folders)
+  in that same turn. Plugins run code in every worker, so this always needs the user's yes.
 - Check open tasks before adding one. NEVER add a duplicate.
 - Work runs in parallel. The budget line shows busy and free worker slots. On a plan, unused
   capacity is lost at each reset: when slots are free and the plan is under pace, add independent

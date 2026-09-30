@@ -1200,8 +1200,10 @@ def test_project_plugins_load_for_workers_only(env, tmp_path, monkeypatch):
     from ttp.daemon import Daemon
     plug = tmp_path / "some-plugin"
     plug.mkdir()
-    assert coord.apply(p, [{"type": "config_set", "key": "providers.claude.plugin_dirs",
-                            "value": [str(plug), str(tmp_path / "missing")]}]) == []
+    action = {"type": "config_set", "key": "providers.claude.plugin_dirs",
+              "value": [str(plug), str(tmp_path / "missing")]}
+    assert "approval" in coord.apply(p, [action])[0], "plugins were enabled without the user"
+    assert coord.apply(p, [action], user_turn=True) == []
     p.set_config("core_provider", "claude")
     d = Daemon(p.base)
     tid = p.db.add_task("t", "s", kind="work", tier="light", origin="user")
@@ -1586,3 +1588,25 @@ def test_burn_rate_is_steady_across_whole_percent_readings(env):
                (now - minutes_ago * 60, "claude", "a", "five_hour", util, resets))
     rate = bud.burn_rate(p.db, "claude", "five_hour", resets, now)
     assert 5.0 <= rate <= 7.0, rate
+
+
+def test_ttp_lock_holds_until_its_command_ends_even_when_signalled(env):
+    p = make(env)
+    run_env = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost", TTP_PROJECT=str(p.base))
+    marks = env["tmp"] / "marks.txt"
+    stubborn = (f"import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                f"open({str(marks)!r}, 'a').write('start1 %f\\n' % time.time()); time.sleep(2); "
+                f"open({str(marks)!r}, 'a').write('end1 %f\\n' % time.time())")
+    first = subprocess.Popen([sys.executable, str(TTP), "lock", "board", "--", sys.executable, "-c", stubborn],
+                             env=run_env)
+    deadline = time.time() + 20
+    while time.time() < deadline and not (marks.exists() and "start1" in marks.read_text()):
+        time.sleep(0.1)
+    first.send_signal(15)
+    second = subprocess.Popen([sys.executable, str(TTP), "lock", "board", "--", sys.executable, "-c",
+                               f"import time; open({str(marks)!r}, 'a').write('start2 %f\\n' % time.time())"],
+                              env=run_env)
+    first.wait(timeout=30)
+    assert second.wait(timeout=30) == 0
+    t = {ln.split()[0]: float(ln.split()[1]) for ln in marks.read_text().splitlines()}
+    assert t["start2"] >= t["end1"] - 0.05, "the resource was handed on while the first command still ran"

@@ -538,8 +538,21 @@ def cmd_lock(a) -> None:
             waited = time.time() - started
             if waited > 5:
                 print(f"ttp lock: got {a.resource} after {waited / 60:.1f} min", file=sys.stderr, flush=True)
+            # The lock is held until the command itself has ended. A signal to this process (a
+            # timeout, a cancel) is passed on to the command, and the lock is released only once
+            # the command is gone, so nobody else ever gets the resource while it is still in use.
+            proc = subprocess.Popen(cmd)
+
+            def _forward(signum, _frame):
+                try:
+                    proc.send_signal(signum)
+                except OSError:
+                    pass
+
+            for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+                signal.signal(sig, _forward)
             try:
-                rc = subprocess.call(cmd)
+                rc = proc.wait()
             finally:
                 f.close()
             sys.exit(rc)

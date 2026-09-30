@@ -154,7 +154,13 @@ def _norm_severity(s: str | None) -> str:
     return s if s in SEVERITY_RANK else "normal"
 
 
-def apply(p: Project, actions: list[dict], default_chat: str | None = None) -> list[str]:
+# Settings that change what code workers run. The coordinator may set them only in a turn that
+# carries a message from the user, after asking: a turn woken by logs, pull requests or a worker's
+# hand-off can be steered by text from outside, and must not be able to load new code.
+NEEDS_USER = {"providers.claude.plugin_dirs"}
+
+
+def apply(p: Project, actions: list[dict], default_chat: str | None = None, user_turn: bool = False) -> list[str]:
     """Apply validated actions. Returns human-readable notes about rejected ones, fed back next turn."""
     db, problems = p.db, []
     cfg = p.config()
@@ -275,6 +281,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None) -> l
                 key = a.get("key", "")
                 if key not in USER_SETTABLE:
                     raise ValueError(f"{key} is not user-settable from chat")
+                if key in NEEDS_USER and not user_turn:
+                    raise ValueError(f"{key} needs the user's approval: ask_user with the exact value, and set "
+                                     f"it in the turn that carries their yes")
                 p.set_config(key, USER_SETTABLE[key](a.get("value")))
             elif t in ("noop", None):
                 pass
