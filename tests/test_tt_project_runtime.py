@@ -31,11 +31,22 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("TTP_HOME", str(home))
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     monkeypatch.setenv("TTP_HOST", "testhost")
+    monkeypatch.setenv("TTP_TEST_POLL_S", "0.05")   # wait loops (runner, ttp lock, listen) check often
     for var in ("TTP_RUN_DIR", "TTP_TASK", "TTP_RUN_ID", "TTP_PROJECT"):   # tests may run inside a live run
         monkeypatch.delenv(var, raising=False)
     sys.path.insert(0, str(RUNTIME))
     for mod in [m for m in list(sys.modules) if m == "ttp" or m.startswith("ttp.")]:
         del sys.modules[mod]
+    real_connect = sqlite3.connect
+
+    def no_fsync(*args, **kwargs):
+        # Test databases need no power-loss durability; skipping the fsync per commit (the schema
+        # alone is a dozen commits) saves most of the time of the many short tests. Subprocesses
+        # (runner, ttp lock) keep the real setting.
+        conn = real_connect(*args, **kwargs)
+        conn.execute("PRAGMA synchronous=OFF")
+        return conn
+    monkeypatch.setattr(sqlite3, "connect", no_fsync)
     repo = tmp_path / "repo"
     repo.mkdir()
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
@@ -2181,15 +2192,35 @@ def test_only_exclusive_resources_serialize_whole_tasks(env):
     assert d._resources_free(p.db.task(tasks["measure a"]["id"])), "a shared user waited for the whole task"
 
 
+def _wait_for_lock_waiter(procs, timeout=60):
+    """Until one of these `ttp lock` commands says it is waiting for the resource."""
+    import select
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        ready, _, _ = select.select([p.stderr for p in procs], [], [], max(deadline - time.time(), 0))
+        for f in ready:
+            line = f.readline()
+            if "waiting for board" in line:
+                return
+            assert line, "a ttp lock command ended without waiting"
+    raise AssertionError("no ttp lock command waited")
+
+
 def test_ttp_lock_serializes_commands_on_one_slot(env):
     p = make(env)
     run_env = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost", TTP_PROJECT=str(p.base))
-    marks = env["tmp"] / "marks.txt"
+    marks, go = env["tmp"] / "marks.txt", env["tmp"] / "go"
+    # Each command holds the slot until `go` exists, which the test creates once one of them waits.
     cmd = [sys.executable, str(TTP), "lock", "board", "--", sys.executable, "-c",
-           f"import time; open({str(marks)!r}, 'a').write('start %f\\n' % time.time()); time.sleep(1.5); "
+           f"import os, time; open({str(marks)!r}, 'a').write('start %f\\n' % time.time())\n"
+           f"while not os.path.exists({str(go)!r}): time.sleep(0.02)\n"
            f"open({str(marks)!r}, 'a').write('end %f\\n' % time.time())"]
-    a = subprocess.Popen(cmd, env=run_env)
-    b = subprocess.Popen(cmd, env=run_env)
+    a = subprocess.Popen(cmd, env=run_env, stderr=subprocess.PIPE, text=True)
+    b = subprocess.Popen(cmd, env=run_env, stderr=subprocess.PIPE, text=True)
+    try:
+        _wait_for_lock_waiter([a, b])
+    finally:
+        go.touch()
     assert a.wait(timeout=60) == 0 and b.wait(timeout=60) == 0
     events = [(ln.split()[0], float(ln.split()[1])) for ln in marks.read_text().splitlines()]
     starts = sorted(t for k, t in events if k == "start")
@@ -2364,7 +2395,7 @@ def test_cancel_and_stop_kill_end_running_workers_but_stop_keeps_them(env, monke
         assert json.loads((dir_c / "exit.json").read_text())["stopped"] == "stopped"
         # A plain stop leaves running workers alone, so a restart or upgrade never loses work.
         cli.main(["stop", "demo"])
-        time.sleep(6)
+        time.sleep(0.5)     # ten of the supervisor's checks for a STOP
         assert proc_k.poll() is None and not (dir_k / "STOP").exists()
         cli.main(["stop", "demo", "--kill"])
         proc_k.wait(timeout=30)
@@ -2580,12 +2611,12 @@ def test_restart_rolls_back_a_runtime_the_daemon_cannot_start_with(env):
         (p.state / "heartbeat").write_text(json.dumps({"pid": 1, "started": time.time()}))
         return "restarted"
 
-    assert "daemon is running" in service.restart(p, wait_s=2, restart_fn=fake_restart)
+    assert "daemon is running" in service.restart(p, wait_s=0.5, restart_fn=fake_restart)
     (h / "CHARTER.md").write_text((h / "CHARTER.md").read_text() + "\nA charter edit.\n")
     daemon_py = h / "runtime" / "ttp" / "daemon.py"
     daemon_py.write_text(daemon_py.read_text() + "\ndef broken(:\n")
     _git_out(h, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "tweak the daemon")
-    text = service.restart(p, wait_s=2, restart_fn=fake_restart)
+    text = service.restart(p, wait_s=0.5, restart_fn=fake_restart)
     assert "tweak the daemon" in text and "running again" in text
     py_compile.compile(str(daemon_py), doraise=True)
     assert "A charter edit." in (h / "CHARTER.md").read_text(), "the rollback reverted more than the runtime"
@@ -2616,9 +2647,10 @@ def test_restart_leaves_a_live_daemon_in_a_slow_first_tick_alone(env):
             threading.Timer(tick_after, lambda: (p.state / "heartbeat").write_text(beat)).start()
         return "restarted"
 
-    text = service.restart(p, wait_s=1, tick_wait_s=10, restart_fn=lambda p: started_alive(p, tick_after=2.5))
+    # The first tick ends after wait_s is over, but within tick_wait_s.
+    text = service.restart(p, wait_s=0.3, tick_wait_s=10, restart_fn=lambda p: started_alive(p, tick_after=0.8))
     assert "daemon is running" in text
-    text = service.restart(p, wait_s=1, tick_wait_s=2, restart_fn=started_alive)
+    text = service.restart(p, wait_s=0.3, tick_wait_s=0.6, restart_fn=started_alive)
     assert "still in its first tick" in text
     assert _git_out(h, "rev-parse", "HEAD") == head, "a live daemon's runtime was rolled back"
     assert not p.db.one("SELECT id FROM messages WHERE kind='alert' AND text LIKE '%rolled back%'")
@@ -2840,19 +2872,25 @@ def test_burn_rate_is_steady_across_whole_percent_readings(env):
 def test_ttp_lock_holds_until_its_command_ends_even_when_signalled(env):
     p = make(env)
     run_env = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost", TTP_PROJECT=str(p.base))
-    marks = env["tmp"] / "marks.txt"
-    stubborn = (f"import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-                f"open({str(marks)!r}, 'a').write('start1 %f\\n' % time.time()); time.sleep(2); "
+    marks, go = env["tmp"] / "marks.txt", env["tmp"] / "go"
+    stubborn = (f"import os, signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                f"open({str(marks)!r}, 'a').write('start1 %f\\n' % time.time())\n"
+                f"while not os.path.exists({str(go)!r}): time.sleep(0.02)\n"
                 f"open({str(marks)!r}, 'a').write('end1 %f\\n' % time.time())")
     first = subprocess.Popen([sys.executable, str(TTP), "lock", "board", "--", sys.executable, "-c", stubborn],
                              env=run_env)
-    deadline = time.time() + 20
-    while time.time() < deadline and not (marks.exists() and "start1" in marks.read_text()):
-        time.sleep(0.1)
-    first.send_signal(15)
-    second = subprocess.Popen([sys.executable, str(TTP), "lock", "board", "--", sys.executable, "-c",
-                               f"import time; open({str(marks)!r}, 'a').write('start2 %f\\n' % time.time())"],
-                              env=run_env)
+    try:
+        deadline = time.time() + 20
+        while time.time() < deadline and not (marks.exists() and "start1" in marks.read_text()):
+            time.sleep(0.02)
+        first.send_signal(15)
+        second = subprocess.Popen([sys.executable, str(TTP), "lock", "board", "--", sys.executable, "-c",
+                                   f"import time; open({str(marks)!r}, 'a').write('start2 %f\\n' % time.time())"],
+                                  env=run_env, stderr=subprocess.PIPE, text=True)
+        _wait_for_lock_waiter([second])     # the second command waits while the first one still runs
+        assert first.poll() is None, "ttp lock ended on the signal while its command still ran"
+    finally:
+        go.touch()
     first.wait(timeout=30)
     assert second.wait(timeout=30) == 0
     t = {ln.split()[0]: float(ln.split()[1]) for ln in marks.read_text().splitlines()}
@@ -3123,15 +3161,21 @@ def test_one_dispatch_tick_does_not_commit_past_the_caps(env):
     assert p.db.task(huge)["status"] == "blocked", "a task that can never fit must say so, not wait forever"
 
 
-def _hold_exclusive(p, tmp_path, seconds):
-    """A run supervisor holding the board for a whole run, as an exclusive task's does."""
+def _until(flag):
+    """A command that runs until the file `flag` exists: the test decides when it ends."""
+    return ["sh", "-c", f"while [ ! -e {shlex.quote(str(flag))} ]; do sleep 0.05; done"]
+
+
+def _hold_exclusive(p, tmp_path, release):
+    """A run supervisor holding the board for a whole run, as an exclusive task's does, until the
+    file `release` exists."""
     from ttp.daemon import Daemon
     run_dir = tmp_path / "xrun"
     run_dir.mkdir(parents=True)
     (run_dir / "prompt.md").write_text("x")
     paths = [str(x) for x in Daemon(p.base)._slot_paths("board")]
     (run_dir / "run.json").write_text(json.dumps({
-        "argv": ["sleep", str(seconds)], "env": {"TTP_TASK": "7"}, "cwd": str(tmp_path), "timeout_s": 60,
+        "argv": _until(release), "env": {"TTP_TASK": "7"}, "cwd": str(tmp_path), "timeout_s": 60,
         "provider": "fake", "exclusive": [{"resource": "board", "paths": paths}]}))
     proc = subprocess.Popen([sys.executable, "-m", "ttp.runner", str(run_dir)], cwd=str(RUNTIME),
                             env={**os.environ, "PYTHONPATH": str(RUNTIME)})
@@ -3146,16 +3190,24 @@ def test_an_exclusive_task_and_ttp_lock_exclude_each_other(env, tmp_path):
     from ttp import coordinator as coord
     from ttp.daemon import Daemon
     run_env = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost", TTP_PROJECT=str(p.base))
-    # an exclusive run holds the board: a ttp lock command waits for it
-    proc, _ = _hold_exclusive(p, tmp_path, 4)
-    rc = subprocess.run([sys.executable, str(TTP), "lock", "--timeout", "1", "board", "--", "true"],
-                        env=run_env).returncode
+    # an exclusive run holds the board until released: a ttp lock command waits for it
+    release = tmp_path / "release"
+    proc, _ = _hold_exclusive(p, tmp_path, release)
+    try:
+        rc = subprocess.run([sys.executable, str(TTP), "lock", "--timeout", "0.5", "board", "--", "true"],
+                            env=run_env).returncode
+    finally:
+        release.touch()
     assert rc == 75, "ttp lock got the board while an exclusive task held it"
     assert proc.wait(timeout=60) == 0
     # the exclusive task's own commands use the slot its run already holds
-    proc, run_dir = _hold_exclusive(p, tmp_path / "own", 4)
-    own = subprocess.run([sys.executable, str(TTP), "lock", "--timeout", "1", "board", "--", "true"],
-                         env={**run_env, "TTP_RUN_DIR": str(run_dir)}).returncode
+    release = tmp_path / "own-release"
+    proc, run_dir = _hold_exclusive(p, tmp_path / "own", release)
+    try:
+        own = subprocess.run([sys.executable, str(TTP), "lock", "--timeout", "0.5", "board", "--", "true"],
+                             env={**run_env, "TTP_RUN_DIR": str(run_dir)}).returncode
+    finally:
+        release.touch()
     assert own == 0, "an exclusive task's own ttp lock waited for itself"
     assert proc.wait(timeout=60) == 0
     # a ttp lock command holds the board: the exclusive task does not start
@@ -3164,13 +3216,15 @@ def test_an_exclusive_task_and_ttp_lock_exclude_each_other(env, tmp_path):
     task = p.db.one("SELECT * FROM tasks WHERE title='reflash'")
     d = Daemon(p.base)
     assert d._resources_free(task)
-    holder = subprocess.Popen([sys.executable, str(TTP), "lock", "board", "--", "sleep", "3"], env=run_env)
+    release = tmp_path / "lock-release"
+    holder = subprocess.Popen([sys.executable, str(TTP), "lock", "board", "--", *_until(release)], env=run_env)
     try:
         deadline = time.time() + 20
         while time.time() < deadline and d._resources_free(task):
-            time.sleep(0.1)
+            time.sleep(0.05)
         assert not d._resources_free(task), "an exclusive task would start while a ttp lock command runs"
     finally:
+        release.touch()
         holder.wait(timeout=30)
     assert d._resources_free(task)
 
@@ -3186,25 +3240,30 @@ def test_a_waiting_exclusive_task_reserves_its_resource(env, tmp_path):
     task = p.db.one("SELECT * FROM tasks WHERE title='reflash'")
     d = Daemon(p.base)
     mark = locks.reserve_path(p.state / "locks", "board")
-    holder = subprocess.Popen([sys.executable, str(TTP), "lock", "board", "--", "sleep", "4"], env=run_env)
+    release = tmp_path / "release"
+    holder = subprocess.Popen([sys.executable, str(TTP), "lock", "board", "--", *_until(release)], env=run_env)
     try:
         deadline = time.time() + 20
         while time.time() < deadline and d._resources_free(task, reserve=True):
-            time.sleep(0.1)
+            time.sleep(0.05)
         assert locks.reserved_by(mark) == f"task #{task['id']}", "a blocked exclusive task did not reserve"
-        # a new ttp lock command waits for the reserved task instead of taking the freed slot
-        rc = subprocess.run([sys.executable, str(TTP), "lock", "--timeout", "6", "board", "--", "true"],
-                            env=run_env).returncode
-        assert rc == 75, "ttp lock took a slot the exclusive task had reserved"
+        # a new ttp lock command waits for the reserved task instead of taking the freed slot: it
+        # is still waiting once the holder has ended, and gives up without the slot
+        waiter = subprocess.Popen([sys.executable, str(TTP), "lock", "--timeout", "2", "board", "--", "true"],
+                                  env=run_env, stderr=subprocess.PIPE, text=True)
+        assert "waiting for board (reserved for" in waiter.stderr.readline()
     finally:
+        release.touch()
         holder.wait(timeout=30)
     assert d._resources_free(task), "the slot did not come free for the reserved task"
+    assert waiter.poll() is None, "ttp lock stopped waiting before the slot came free"
+    assert waiter.wait(timeout=30) == 75, "ttp lock took a slot the exclusive task had reserved"
     # the task's own run takes the slot and drops the reservation; ttp lock then waits on the slot
     run_dir = tmp_path / "xrun"
     run_dir.mkdir()
     (run_dir / "prompt.md").write_text("x")
     (run_dir / "run.json").write_text(json.dumps({
-        "argv": ["sleep", "1"], "env": {"TTP_TASK": str(task["id"])}, "cwd": str(tmp_path), "timeout_s": 60,
+        "argv": ["true"], "env": {"TTP_TASK": str(task["id"])}, "cwd": str(tmp_path), "timeout_s": 60,
         "provider": "fake", "exclusive": [{"resource": "board", "paths": [str(x) for x in d._slot_paths("board")],
                                            "reserve": str(mark)}]}))
     assert subprocess.run([sys.executable, "-m", "ttp.runner", str(run_dir)], cwd=str(RUNTIME), timeout=60,
@@ -3271,17 +3330,31 @@ def test_a_lock_wait_is_progress_and_gives_up_with_75(env, tmp_path):
     p = make(env)
     run_dir = tmp_path / "wrun"
     run_dir.mkdir()
-    (run_dir / "run.json").write_text(json.dumps({"stall_s": 4}))
+    (run_dir / "run.json").write_text(json.dumps({"stall_s": 2}))
     run_env = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost", TTP_PROJECT=str(p.base))
-    holder = subprocess.Popen([sys.executable, str(TTP), "lock", "board", "--", "sleep", "8"], env=run_env)
-    time.sleep(1.0)
-    t0 = time.time()
-    rc = subprocess.run([sys.executable, str(TTP), "lock", "board", "--", "true"],
-                        env={**run_env, "TTP_RUN_DIR": str(run_dir)}).returncode
-    waited = time.time() - t0
-    holder.wait(timeout=30)
-    assert rc == 75 and waited < 7, (rc, waited)   # half the stall limit, not forever
+    held, release = tmp_path / "held", tmp_path / "release"
+    holder = subprocess.Popen([sys.executable, str(TTP), "lock", "board", "--", "sh", "-c",
+                               f"touch {shlex.quote(str(held))}; {shlex.join(_until(release))}"], env=run_env)
+    try:
+        _wait_for_file(held, holder)
+        t0 = time.time()
+        # The holder keeps the board until this command has returned: only a give-up ends it.
+        r = subprocess.run([sys.executable, str(TTP), "lock", "board", "--", "true"], capture_output=True,
+                           text=True, env={**run_env, "TTP_RUN_DIR": str(run_dir)}, timeout=60)
+        waited = time.time() - t0
+    finally:
+        release.touch()
+        holder.wait(timeout=30)
+    # half the stall limit, not forever
+    assert r.returncode == 75 and "stayed busy for 1 s" in r.stderr and waited >= 1, (r.returncode, r.stderr, waited)
     assert "waiting for board" in (run_dir / "progress.md").read_text(), "a wait looked like a stall"
+
+
+def _wait_for_file(path, proc, timeout=60):
+    deadline = time.time() + timeout
+    while not path.exists():
+        assert time.time() < deadline and proc.poll() is None, f"{path.name} never appeared"
+        time.sleep(0.02)
 
 
 def _no_events(p):
@@ -3440,8 +3513,8 @@ pace, streaming = float(os.environ.get("FAKE_CLI_PACE") or 0), "stream-json" in 
 lines = os.environ.get("FAKE_CLI_STDOUT", "").splitlines(keepends=True)
 if pace and not streaming:
     time.sleep(pace * len(lines))
-for line in lines:
-    if pace and streaming:
+for i, line in enumerate(lines):
+    if pace and streaming and i:
         time.sleep(pace)
     sys.stdout.write(line)
     sys.stdout.flush()
@@ -3684,15 +3757,16 @@ def test_cursor_streams_when_its_cli_can(env, monkeypatch):
 
 
 def test_streaming_cursor_run_is_not_killed_as_stalled(env, monkeypatch):
-    # Nine events a second apart, with a 2 s stall limit: only a CLI that streams shows progress.
+    # Nine events 0.25 s apart (2 s in all), with a 1 s stall limit: only a CLI that streams shows
+    # progress. The first event comes at once, so start-up under load is not counted as a gap.
     events = CURSOR_STREAM_OK + [CURSOR_STREAM_OK[3], CURSOR_STREAM_OK[4]]
-    stall = lambda p: p.set_config("budget.stall_s", {"light": 2})   # noqa: E731
+    stall = lambda p: p.set_config("budget.stall_s", {"light": 1})   # noqa: E731
     _, run, _, argv, _ = _cli_run(env, monkeypatch, "cursor", _codex_events(*events), before=stall,
-                                  result={"status": "done", "summary": "ok"}, help_text=CURSOR_HELP, pace=1)
+                                  result={"status": "done", "summary": "ok"}, help_text=CURSOR_HELP, pace=0.25)
     assert "stream-json" in argv and run["status"] == "ok", run["status"]
     from ttp.providers import base
     base._CLI_OUTPUT.clear()   # the probe is cached per daemon; this one is a CLI without stream-json
-    _, run, _, argv, _ = _cli_run(env, monkeypatch, "cursor", _codex_events(*events), before=stall, pace=1)
+    _, run, _, argv, _ = _cli_run(env, monkeypatch, "cursor", _codex_events(*events), before=stall, pace=0.25)
     assert "stream-json" not in argv and run["status"] == "stalled", "an older CLI keeps the old guard"
 
 
@@ -4310,44 +4384,70 @@ def test_ttp_lock_records_its_wait_once_for_overlapping_waits(env, tmp_path):
     run_dir.mkdir()
     (run_dir / "run.json").write_text(json.dumps({"stall_s": 0}))
     run_env = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost", TTP_PROJECT=str(p.base))
-    holder = subprocess.Popen([sys.executable, str(TTP), "lock", "board", "--", "sleep", "4"], env=run_env)
-    time.sleep(1.0)
-    waiters = [subprocess.Popen([sys.executable, str(TTP), "lock", "board", "--", "true"],
-                                env={**run_env, "TTP_RUN_DIR": str(run_dir)}) for _ in range(2)]
+    held, release = tmp_path / "held", tmp_path / "release"
+    holder = subprocess.Popen([sys.executable, str(TTP), "lock", "board", "--", "sh", "-c",
+                               f"touch {shlex.quote(str(held))}; {shlex.join(_until(release))}"], env=run_env)
+    waiters = []
+    try:
+        _wait_for_file(held, holder)
+        waiters = [subprocess.Popen([sys.executable, str(TTP), "lock", "board", "--", "true"],
+                                    env={**run_env, "TTP_RUN_DIR": str(run_dir)}) for _ in range(2)]
+        deadline = time.time() + 60
+        while time.time() < deadline:   # both commands are waiting at once
+            try:
+                open_waits = [w for w in json.loads((run_dir / locks.WAITS_FILE).read_text()).values()
+                              if w["end"] is None]
+            except (OSError, ValueError):
+                open_waits = []
+            if len(open_waits) == 2:
+                break
+            time.sleep(0.02)
+        both = time.time()
+        time.sleep(0.5)
+    finally:
+        release.touch()
     assert all(w.wait(timeout=60) == 0 for w in waiters) and holder.wait(timeout=30) == 0
     waits = json.loads((run_dir / locks.WAITS_FILE).read_text()).values()
     assert len(waits) == 2 and all(w["end"] for w in waits), "a concurrent wait was lost or left open"
+    assert all(w["start"] < both < both + 0.5 < w["end"] for w in waits), ("the waits did not overlap", waits, both)
     each = [w["end"] - w["start"] for w in waits]
-    # The two commands waited side by side: the run lost the longer wait, not their sum.
-    assert locks.waited(run_dir) == pytest.approx(max(each), abs=0.5) and max(each) > 1.5, each
+    union = max(w["end"] for w in waits) - min(w["start"] for w in waits)
+    # The two commands waited side by side: the run lost the time either waited, not their sum.
+    assert locks.waited(run_dir) == pytest.approx(union, abs=0.01) and union < sum(each) - 0.5, each
 
 
 def test_a_lock_wait_extends_the_runs_wall_clock(env, tmp_path):
     p = make(env)
     run_env = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost", TTP_PROJECT=str(p.base),
                    PYTHONPATH=str(RUNTIME))
-    # The lock is held for 8s from the moment the holder has it, against a 5s limit: the run must
-    # outlast its limit, and the one limit's worth of extension leaves ~5s for start-up under load.
-    # (Holding for about twice the limit left no margin at all.)
-    held = tmp_path / "held"
+    # The lock is held against a 3s limit until the run has outlived that limit by half a second;
+    # the run may then use up to one more limit's worth for its wait, which leaves ~2.5s for the
+    # release to reach it under load.
+    held, release = tmp_path / "held", tmp_path / "release"
     holder = subprocess.Popen([sys.executable, str(TTP), "lock", "board", "--", "sh", "-c",
-                               f"touch {shlex.quote(str(held))}; sleep 8"], env=run_env)
-    deadline = time.time() + 60
-    while not held.exists():
-        assert time.time() < deadline and holder.poll() is None, "the holder never took the lock"
-        time.sleep(0.05)
+                               f"touch {shlex.quote(str(held))}; {shlex.join(_until(release))}"], env=run_env)
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     (run_dir / "prompt.md").write_text("x")
     lock_cmd = f"{shlex.quote(sys.executable)} {shlex.quote(str(TTP))} lock board -- true"
     (run_dir / "run.json").write_text(json.dumps({
-        "argv": ["sh", "-c", f"{lock_cmd} && echo handed-off"], "cwd": str(tmp_path), "timeout_s": 5,
+        "argv": ["sh", "-c", f"{lock_cmd} && echo handed-off"], "cwd": str(tmp_path), "timeout_s": 3,
         "provider": "fake", "env": {"TTP_RUN_DIR": str(run_dir)}}))
-    subprocess.run([sys.executable, "-m", "ttp.runner", str(run_dir)], cwd=str(RUNTIME), env=run_env, timeout=120)
+    try:
+        _wait_for_file(held, holder)
+        runner = subprocess.Popen([sys.executable, "-m", "ttp.runner", str(run_dir)], cwd=str(RUNTIME), env=run_env)
+        _wait_for_file(run_dir / "child.pid", runner)     # written after the run's clock started
+        running_since = time.time()
+        while time.time() < running_since + 3.5:
+            assert runner.poll() is None, "the run ended while its lock wait was on"
+            time.sleep(0.05)
+    finally:
+        release.touch()
+    assert runner.wait(timeout=120) == 0
     holder.wait(timeout=30)
     info = json.loads((run_dir / "exit.json").read_text())
     assert info["stopped"] is None and info["rc"] == 0, info
-    assert info["ended"] - info["started"] > 5, ("the run never outlasted its limit", info)
+    assert info["ended"] - info["started"] > 3.5, ("the run never outlasted its limit", info)
     assert "handed-off" in (run_dir / "output.jsonl").read_text()
 
 
@@ -4419,8 +4519,9 @@ def test_a_lock_wait_extends_the_wall_clock_at_most_by_the_limit(env, tmp_path):
     p = make(env)
     run_env = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost", TTP_PROJECT=str(p.base),
                    PYTHONPATH=str(RUNTIME))
-    holder = subprocess.Popen([sys.executable, str(TTP), "lock", "board", "--", "sleep", "30"], env=run_env)
-    time.sleep(1.0)
+    held, release = tmp_path / "held", tmp_path / "release"
+    holder = subprocess.Popen([sys.executable, str(TTP), "lock", "board", "--", "sh", "-c",
+                               f"touch {shlex.quote(str(held))}; {shlex.join(_until(release))}"], env=run_env)
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     (run_dir / "prompt.md").write_text("x")
@@ -4428,19 +4529,23 @@ def test_a_lock_wait_extends_the_wall_clock_at_most_by_the_limit(env, tmp_path):
     # wall clock: for providers that report cost only at the end it is the only spend bound.
     lock_cmd = f"{shlex.quote(sys.executable)} {shlex.quote(str(TTP))} lock board --timeout 0 -- true"
     (run_dir / "run.json").write_text(json.dumps({
-        "argv": ["sh", "-c", f"{lock_cmd} && echo handed-off"], "cwd": str(tmp_path), "timeout_s": 3,
+        "argv": ["sh", "-c", f"{lock_cmd} && echo handed-off"], "cwd": str(tmp_path), "timeout_s": 1,
         "provider": "fake", "env": {"TTP_RUN_DIR": str(run_dir)}}))
-    t0 = time.time()
-    subprocess.run([sys.executable, "-m", "ttp.runner", str(run_dir)], cwd=str(RUNTIME), env=run_env, timeout=120)
-    took = time.time() - t0
-    holder.kill()
-    holder.wait(timeout=30)
+    try:
+        _wait_for_file(held, holder)
+        # The holder keeps the board until the run has ended: only the wall clock can end it.
+        subprocess.run([sys.executable, "-m", "ttp.runner", str(run_dir)], cwd=str(RUNTIME), env=run_env,
+                       timeout=120)
+    finally:
+        release.touch()
+        holder.wait(timeout=30)
     info = json.loads((run_dir / "exit.json").read_text())
-    assert info["stopped"] == "timeout" and took < 20, (info, took)
+    assert info["stopped"] == "timeout" and info["ended"] - info["started"] < 6, info
+    assert "handed-off" not in (run_dir / "output.jsonl").read_text()
     from ttp.daemon import _cut_off_cost
-    (run_dir / "run.json").write_text(json.dumps({"budget_usd": 6.0, "timeout_s": 3}))
+    (run_dir / "run.json").write_text(json.dumps({"budget_usd": 6.0, "timeout_s": 1}))
     # Booked on the time beyond the one limit's worth of waiting, never below it.
-    assert _cut_off_cost(run_dir, info) == pytest.approx(6.0 * min(max(info["ended"] - info["started"] - 3, 0) / 3, 1),
+    assert _cut_off_cost(run_dir, info) == pytest.approx(6.0 * min(max(info["ended"] - info["started"] - 1, 0) / 1, 1),
                                                          abs=0.01)
 
 

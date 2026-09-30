@@ -21,7 +21,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import __version__
+from . import __version__, poll_s
 from .db import chat_floor
 from . import schedule as sched
 from .project import (FOLDER, NAME_RE, Project, hostname, load_registry, load_secrets, register, save_secret,
@@ -463,7 +463,7 @@ def _listen_loop(p: Project, db, a, after: int, floor: str) -> None:
                 return
         if deadline and time.time() > deadline:
             return
-        time.sleep(2)
+        time.sleep(poll_s(2))
 
 
 def status_text(p: Project) -> str:
@@ -699,7 +699,7 @@ def cmd_lock(a) -> None:
                 except OSError:
                     pass
             told = time.time()
-        time.sleep(3)
+        time.sleep(poll_s(3))
 
 
 # operating ----------------------------------------------------------------------------------------
@@ -787,7 +787,7 @@ def stop_workers(p: Project, kill: bool, wait_s: float = 60) -> str:
     deadline = time.time() + wait_s
     left = list(ids)
     while left and time.time() < deadline:
-        time.sleep(1)
+        time.sleep(poll_s(1))
         left = [i for i in left if _run_dir_alive(p, i)]
     if left:
         return f"ending {len(ids)} run(s); still ending: {', '.join(map(str, left))}"

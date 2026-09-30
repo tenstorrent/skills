@@ -19,6 +19,7 @@ import sys
 import time
 from pathlib import Path
 
+from . import poll_s
 from .project import Project
 
 
@@ -209,7 +210,7 @@ def wait_for_start(p: Project, since: float, wait_s: float, tick_wait_s: float |
         elif now >= waits_from + wait_s:
             old = _read_pid(p.state / "daemon.pid")
             return "busy" if old and _is_daemon(old) else "broken"
-        time.sleep(1)
+        time.sleep(poll_s(1))
 
 
 def restart(p: Project, wait_s: float = 60, restart_fn=None, tick_wait_s: float | None = None) -> str:

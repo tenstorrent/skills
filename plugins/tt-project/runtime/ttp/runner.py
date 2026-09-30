@@ -32,6 +32,8 @@ import threading
 import time
 from pathlib import Path
 
+from . import poll_s
+
 LEASE_EVERY_S = 30
 KILL_AFTER_S = 30
 POLL_S = 5
@@ -204,7 +206,7 @@ def supervise(run_dir: Path) -> int:
             why = stop_reason(run_dir)
             if why:
                 threading.Thread(target=stop, args=(why,), daemon=True).start()
-            time.sleep(POLL_S)
+            time.sleep(poll_s(POLL_S))
 
     t = threading.Thread(target=watch, daemon=True)
     t.start()
@@ -253,7 +255,7 @@ def _take_exclusive(run_dir: Path, wanted: list[dict], env: dict, deadline: floa
                     pf.write(f"{time.strftime('%H:%M:%S')} waiting for {res['resource']} "
                              f"(held by {', '.join(locks.holders(paths)) or 'another task'})\n")
                 told = time.time()
-            time.sleep(2)
+            time.sleep(poll_s(2))
     return held
 
 
