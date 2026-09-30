@@ -1119,6 +1119,23 @@ def test_a_legacy_ask_with_a_default_still_drains_after_the_timeout(env):
     assert p.db.kv(coord.ASK_DEFAULTS_KEY) == {}
 
 
+def test_status_says_when_questions_are_not_reaching_any_chat(env):
+    p = make(env)
+    from ttp.cli import status_text
+    from ttp.web import health
+    p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)",
+           (time.time(), "relay", time.time()))
+    problems, ask = _ask(p, blocking="access")
+    assert problems == []
+    assert health(p, p.db, now=ask["ts"] + 60)["undelivered"] is None, "reported before the relay had a chance"
+    late = health(p, p.db, now=ask["ts"] + 3600)["undelivered"]
+    assert late == {"asks": 1, "since": ask["ts"]}, "a relay that stopped delivering was not reported"
+    p.db.x("UPDATE messages SET ts=? WHERE id=?", (time.time() - 3600, ask["id"]))
+    assert "1 question(s) not delivered to any chat" in status_text(p)
+    p.db.x("UPDATE chats SET last_read=? WHERE id='c1'", (ask["id"],))
+    assert health(p, p.db)["undelivered"] is None
+
+
 def test_asks_without_a_registered_default_never_time_out(env):
     p = make(env)
     from ttp import coordinator as coord

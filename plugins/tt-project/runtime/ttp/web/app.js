@@ -122,7 +122,8 @@ async function refresh() {
   const stuck = hb && hb.age > st.heartbeat_stale_s;
   const disk = st.disk_low;
   banner([stuck ? `The daemon has not completed a tick for ${Math.round(hb.age / 60)} min: nothing new starts. Try <code>ttp restart ${esc(st.project.name)}</code>.` : "",
-          disk ? `Only ${disk.free_gb} GB free under ${esc(disk.path)}: no new worker runs start until space is freed.` : ""].filter(Boolean).join("<br>"));
+          disk ? `Only ${disk.free_gb} GB free under ${esc(disk.path)}: no new worker runs start until space is freed.` : "",
+          h.undelivered ? `${h.undelivered.asks} question(s) not delivered to any chat since ${at(h.undelivered.since)}: is the chat relay running? Answer here meanwhile.` : ""].filter(Boolean).join("<br>"));
   $("#pname").textContent = st.project.name;
   $("#daemon").textContent = st.paused ? "paused" : stuck ? "stuck" : (st.daemon && st.daemon.pid ? `running on ${st.daemon.host}` : "stopped");
   $("#daemon").className = "pill " + (stuck ? "lv-red" : st.paused ? "lv-orange" : "lv-green");

@@ -47,6 +47,7 @@ def free_port(start: int = 18700) -> int:
 
 
 DAY, WEEK = 86400, 7 * 86400
+RELAY_LATE_S = 600   # an open question no chat has read for this long: the relay is not delivering
 
 
 def fix_for(provider: str, note: str) -> str:
@@ -103,6 +104,14 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
                 (now - 14 * DAY,))
     top = db.one("SELECT source, ROUND(SUM(usd),2) usd FROM ledger WHERE ts>=? GROUP BY source ORDER BY SUM(usd) DESC "
                  "LIMIT 1", (now - WEEK,))
+    # A relay that stopped reading: questions the user has not seen, so nothing can be decided.
+    relay = db.one("SELECT COUNT(*) n, COALESCE(MAX(last_read),0) seen FROM chats WHERE id!='web'")
+    undelivered = None
+    if relay["n"]:
+        late = db.one("SELECT COUNT(*) n, MIN(ts) since FROM messages WHERE kind='ask' AND handled=0 AND chat IS NULL "
+                      "AND id>? AND ts>?", (relay["seen"], now - 14 * DAY))
+        if late["n"] and late["since"] < now - RELAY_LATE_S:
+            undelivered = {"asks": late["n"], "since": late["since"]}
     idle_wake = None
     if last_turn and not waiting and not queued and not db.one("SELECT id FROM tasks WHERE status='running'"):
         idle_wake = max(last_turn + float(c.get("idle_wake_s", 1800)), backoff, now)
@@ -142,6 +151,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
                         "summary": (db.kv("last_coordinator_summary", {}) or {}).get("summary", ""),
                         "idle_wake": idle_wake},
         "providers_paused": paused_providers, "waiting": waiting, "asks": asks, "running": running,
+        "undelivered": undelivered,
         "why_idle": "; ".join(why) if not running else "",
     }
 
