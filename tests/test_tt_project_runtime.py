@@ -3486,3 +3486,103 @@ def test_a_slack_message_is_stored_once_when_its_cursor_write_fails(env, monkeyp
     poll(scan=True)
     poll(scan=True)
     assert _slack_in(p) == ["please stop task 4"], "the coordinator would act on one instruction twice"
+
+
+def test_ttp_lock_records_its_wait_once_for_overlapping_waits(env, tmp_path):
+    p = make(env)
+    from ttp import locks
+    run_dir = tmp_path / "wrun"
+    run_dir.mkdir()
+    (run_dir / "run.json").write_text(json.dumps({"stall_s": 0}))
+    run_env = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost", TTP_PROJECT=str(p.base))
+    holder = subprocess.Popen([sys.executable, str(TTP), "lock", "board", "--", "sleep", "4"], env=run_env)
+    time.sleep(1.0)
+    waiters = [subprocess.Popen([sys.executable, str(TTP), "lock", "board", "--", "true"],
+                                env={**run_env, "TTP_RUN_DIR": str(run_dir)}) for _ in range(2)]
+    assert all(w.wait(timeout=60) == 0 for w in waiters) and holder.wait(timeout=30) == 0
+    waits = json.loads((run_dir / locks.WAITS_FILE).read_text()).values()
+    assert len(waits) == 2 and all(w["end"] for w in waits), "a concurrent wait was lost or left open"
+    each = [w["end"] - w["start"] for w in waits]
+    # The two commands waited side by side: the run lost the longer wait, not their sum.
+    assert locks.waited(run_dir) == pytest.approx(max(each), abs=0.5) and max(each) > 1.5, each
+
+
+def test_a_lock_wait_extends_the_runs_wall_clock(env, tmp_path):
+    p = make(env)
+    run_env = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost", TTP_PROJECT=str(p.base),
+                   PYTHONPATH=str(RUNTIME))
+    holder = subprocess.Popen([sys.executable, str(TTP), "lock", "board", "--", "sleep", "9"], env=run_env)
+    time.sleep(1.0)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "prompt.md").write_text("x")
+    lock_cmd = f"{shlex.quote(sys.executable)} {shlex.quote(str(TTP))} lock board -- true"
+    (run_dir / "run.json").write_text(json.dumps({
+        "argv": ["sh", "-c", f"{lock_cmd} && echo handed-off"], "cwd": str(tmp_path), "timeout_s": 4,
+        "provider": "fake", "env": {"TTP_RUN_DIR": str(run_dir)}}))
+    subprocess.run([sys.executable, "-m", "ttp.runner", str(run_dir)], cwd=str(RUNTIME), env=run_env, timeout=120)
+    holder.wait(timeout=30)
+    info = json.loads((run_dir / "exit.json").read_text())
+    assert info["stopped"] is None and info["rc"] == 0, info
+    assert "handed-off" in (run_dir / "output.jsonl").read_text()
+
+
+def test_a_run_that_times_out_after_handing_off_keeps_its_result(env):
+    p = make(env)
+    from ttp import budget as bud
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    tid = p.db.add_task("measure", "s", kind="work", tier="light", origin="user")
+    p.db.update_task(tid, status="running")
+    rid = p.db.x("INSERT INTO runs(task,role,provider,model,started,status) VALUES(?,'worker','codex','',?,'running')",
+                 (tid, time.time() - 3600))
+    run_dir = p.runs / str(rid)
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text(json.dumps({"budget_usd": 8.0, "timeout_s": 3600}))
+    (run_dir / "output.jsonl").write_text("")
+    (run_dir / "result.json").write_text(json.dumps({"status": "done", "summary": "measured 42"}))
+    d.finish_run(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)),
+                 {"rc": -15, "started": time.time() - 3600, "ended": time.time(), "stopped": "timeout"})
+    assert p.db.task(tid)["status"] == "done", "a finished result was thrown away on a timeout"
+    assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == "ok"
+    assert not any("failed or stalled" in r for r in bud.evaluate(p.db, p.config(), "codex", []).reasons)
+
+
+def test_dispatch_caps_tasks_on_a_shared_resource_and_fills_slots_with_other_work(env, monkeypatch):
+    p = make(env)
+    from ttp import budget as bud
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    p.set_config("resources", {"board": 1})
+    assert coord.apply(p, [{"type": "task_add", "title": f"measure {i}", "spec": "s", "tier": "light",
+                            "resources": ["board"], "priority": 1} for i in range(4)] +
+                       [{"type": "task_add", "title": "docs", "spec": "s", "tier": "light", "priority": 3}]) == []
+    d = Daemon(p.base)
+    started = []
+    monkeypatch.setattr(d, "start_run", lambda *a, **k: started.append(k["task"]["title"]) or 0)
+    monkeypatch.setattr(d, "_workdir_for", lambda task: (str(p.root), None))
+    provider = d.cfg.get("core_provider", "claude")
+    d.gates[provider] = bud.Gate(provider, regime="windows", max_parallel=6)
+    d.dispatch()
+    assert sorted(started) == ["docs", "measure 0", "measure 1"], started
+    held = p.db.q("SELECT status FROM tasks WHERE title IN ('measure 2', 'measure 3')")
+    assert [t["status"] for t in held] == ["queued", "queued"]
+
+
+def test_the_waste_limit_scales_with_parallel_workers(env):
+    p = make(env)
+    from ttp import budget as bud
+    now = time.time()
+    # Three workers side by side each lost a run to a timeout: not a loop.
+    for task in (1, 2, 3):
+        p.db.x("INSERT INTO runs(task,role,provider,status,started,ended,cost_usd) "
+               "VALUES(?,'worker','claude','timeout',?,?,4.0)", (task, now - 3000, now - 60))
+    g = bud.evaluate(p.db, p.config(), "claude", [], now)
+    assert not any("failed or stalled" in r for r in g.reasons), g.reasons
+    # One task failing over and over is a loop, however many workers the project may run.
+    p.db.x("DELETE FROM runs")
+    for _ in range(3):
+        p.db.x("INSERT INTO runs(task,role,provider,status,started,ended,cost_usd) "
+               "VALUES(1,'worker','claude','timeout',?,?,4.0)", (now - 3000, now - 60))
+    g = bud.evaluate(p.db, p.config(), "claude", [], now)
+    assert g.level == "red" and any("failed or stalled" in r for r in g.reasons), g.reasons

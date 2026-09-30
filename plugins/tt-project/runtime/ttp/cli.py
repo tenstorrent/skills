@@ -549,7 +549,8 @@ def cmd_lock(a) -> None:
 
     Inside a run, waiting is reported in the run's progress (a wait is not a stall) and gives up
     after half the run's stall limit unless --timeout says otherwise (0: wait as long as it takes).
-    Giving up exits 75: the task hands back `waiting`.
+    Giving up exits 75: the task hands back `waiting`. Time spent waiting does not count against
+    the run's wall clock.
     """
     from . import locks as lk
     cmd = list(a.command or [])
@@ -577,10 +578,18 @@ def cmd_lock(a) -> None:
         timeout = float(spec.get("stall_s") or 0) / 2
     mark = lk.reserve_path(p.state / "locks", a.resource)
     started, told = time.time(), 0.0
+    wait_key = f"{os.getpid()}:{started}"
+    waiting = False
+
+    def _end_wait(*_):
+        if waiting:
+            lk.record_wait(run_dir, wait_key, started, time.time())
+
     while True:
         reserved = lk.reserved_by(mark)
         f = None if reserved else lk.try_take(paths, who, " ".join(cmd))
         if f:
+            _end_wait()
             waited = time.time() - started
             if waited > 5:
                 print(f"ttp lock: got {a.resource} after {waited / 60:.1f} min", file=sys.stderr, flush=True)
@@ -602,7 +611,15 @@ def cmd_lock(a) -> None:
             finally:
                 f.close()
             sys.exit(rc)
+        if run_dir and not waiting:
+            # The run's wall clock stops while it waits here; the supervisor reads this record.
+            # A signal ends the wait through _end_wait, so the record never stays open.
+            lk.record_wait(run_dir, wait_key, started, None)
+            waiting = True
+            for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+                signal.signal(sig, lambda signum, _f: (_end_wait(), sys.exit(128 + signum)))
         if timeout and time.time() - started > timeout:
+            _end_wait()
             die(f"{a.resource} stayed busy for {timeout:.0f} s; hand the task back as waiting", 75)
         if time.time() - told >= 120:
             line = (f"waiting for {a.resource} (reserved for {reserved})" if reserved else

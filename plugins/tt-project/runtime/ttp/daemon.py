@@ -422,6 +422,9 @@ class Daemon:
         status = "ok" if exit_info.get("rc") == 0 and not usage.error else "failed"
         if stopped in ("timeout", "budget", "stopped", "lost", "stalled", "shutdown", "resource_busy"):
             status = stopped if stopped != "stopped" else "killed"
+        if status == "timeout" and r["role"] != "coordinator" and \
+                (_read_result(run_dir / RESULT_FILE) or {}).get("status"):
+            status = "ok"   # it handed off before the clock ran out: the work is done, not wasted
         if usage.limited:
             status = "limit"
         if usage.auth_failed:
@@ -1130,8 +1133,16 @@ class Daemon:
         the resource for some commands: those take the resource's lock (`ttp lock`) or its own queue,
         so the rest of the task runs in parallel with other work instead of waiting for the slot.
         With reserve, a task kept out only by `ttp lock` commands reserves the resource so new ones
-        wait; the reservation lapses unless the next dispatch refreshes it."""
+        wait; the reservation lapses unless the next dispatch refreshes it.
+
+        At most twice its slots run at once among the tasks that use a resource either way: more
+        would only queue in `ttp lock` on a worker slot and a wall clock that other work could use."""
         limits = self.cfg.get("resources", {})
+        for res in _shared(task):
+            users = self.p.db.one("SELECT COUNT(*) n FROM tasks WHERE status='running' AND (labels LIKE ? "
+                                  "OR labels LIKE ?)", (f'%"resource:{res}"%', f'%"exclusive:{res}"%'))["n"]
+            if users >= 2 * max(int(limits.get(res, 1) or 1), 1):
+                return False
         for res in _exclusive(task):
             limit = int(limits.get(res, 1))
             # Running exclusive tasks count even before their supervisor has taken its slot; the
@@ -1291,6 +1302,10 @@ def _exclusive(task: dict) -> list[str]:
     return [lb.split(":", 1)[1] for lb in json.loads(task["labels"] or "[]") if lb.startswith("exclusive:")]
 
 
+def _shared(task: dict) -> list[str]:
+    return [lb.split(":", 1)[1] for lb in json.loads(task["labels"] or "[]") if lb.startswith("resource:")]
+
+
 def _cut_off_cost(run_dir: Path, exit_info: dict) -> float:
     """A run that ended without any usage to price still spent money: Codex reports usage only when
     a turn completes, and Cursor's result has none at all. Book the elapsed share of its dollar
@@ -1305,6 +1320,7 @@ def _cut_off_cost(run_dir: Path, exit_info: dict) -> float:
     budget = float(spec.get("budget_usd") or spec.get("default_budget_usd") or 0)
     timeout = float(spec.get("timeout_s") or 0)
     elapsed = float(exit_info.get("ended") or time.time()) - float(exit_info.get("started") or 0)
+    elapsed -= locks.waited(run_dir, float(exit_info.get("ended") or time.time()))
     if budget <= 0 or timeout <= 0 or not exit_info.get("started"):
         return 0.0
     return round(budget * min(max(elapsed, 0.0) / timeout, 1.0), 4)

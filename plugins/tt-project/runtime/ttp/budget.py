@@ -150,10 +150,16 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
     per_task = max((b.get("task_default_usd") or {"deep": 25.0}).values())
     floor = float(b.get("hourly_floor_usd") or max(int(b.get("max_parallel_workers", 2)), 1) * per_task)
     ceiling = max(float(b.get("hourly_alarm_x", 4.0)) * norm, floor)
-    waste_cap = float(b.get("hourly_waste_usd", 8.0))
+    # The waste limit is per worker: parallel workers each losing a run (a shared device kept them
+    # all waiting) are not a loop, while one task failing over and over counts as one worker.
+    busy = db.q("SELECT DISTINCT task FROM runs WHERE provider=? AND role!='coordinator' AND task IS NOT NULL "
+                "AND (status='running' OR ended>=?)", (provider, hour_ago))
+    workers = min(max(len(busy), 1), max(int(b.get("max_parallel_workers", 6)), 1))
+    waste_cap = float(b.get("hourly_waste_usd", 8.0)) * workers
     thrash_cap = float(b.get("hourly_coordinator_usd", 4.0))
     g.numbers.update({"spent_1h": round(last_h, 2), "hourly_ceiling": round(ceiling, 2),
-                      "waste_1h": round(waste, 2), "coordinator_1h": round(thrash, 2)})
+                      "waste_1h": round(waste, 2), "waste_limit": round(waste_cap, 2),
+                      "coordinator_1h": round(thrash, 2)})
     if waste > waste_cap:
         _raise(g, "red", f"runaway guard: ${waste:.2f} spent on failed or stalled runs in the last hour "
                          f"(limit ${waste_cap:.0f}); resumes automatically as the hour rolls over")
