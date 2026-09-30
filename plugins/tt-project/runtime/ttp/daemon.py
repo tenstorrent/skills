@@ -181,7 +181,8 @@ class Daemon:
     # runs -----------------------------------------------------------------------------------------
     def start_run(self, role: str, prompt: str, provider: str, tier: str, cwd: str, *, task: dict | None = None,
                   budget_usd: float | None = None, timeout_s: float | None = None, read_only: bool = False,
-                  schema: dict | None = None, system: str | None = None, note: dict | None = None) -> int:
+                  schema: dict | None = None, system: str | None = None, append_system: str | None = None,
+                  note: dict | None = None) -> int:
         tiers = self.cfg["providers"].get(provider, {}).get("tiers", {})
         model = tiers.get(tier, {}).get("model", "")
         prices = (self.cfg.get("pricing") or {}).get(provider) or {}
@@ -202,6 +203,8 @@ class Daemon:
                            severity="normal", every_s=86400)
             roots = [str(self.p.state)] + [d for d in [worktree.git_common_dir(Path(cwd))] if d]
             extra = prov.writable_args(roots) + prov.plugin_args([d for d in dirs if d not in missing])
+            if self.cfg["providers"].get(provider, {}).get("worker_isolation"):
+                extra += prov.isolation_args()
             # A trailing "-" (prompt on stdin) stays the last argument.
             argv = argv[:-1] + extra + ["-"] if argv[-1:] == ["-"] else argv + extra
         db = self.p.db
@@ -219,6 +222,13 @@ class Daemon:
                     argv = _with_system_prompt(provider, argv, run_dir / "system.md")
                 else:   # no replaceable system prompt: the stable part leads the prompt instead
                     prompt = system + "\n\n" + prompt
+            if append_system is not None:
+                (run_dir / "system.md").write_text(append_system)
+                sys_args = prov.append_system_args(run_dir / "system.md")
+                if sys_args:
+                    argv = argv[:-1] + sys_args + ["-"] if argv[-1:] == ["-"] else argv + sys_args
+                else:
+                    prompt = append_system + "\n\n" + prompt
             (run_dir / "prompt.md").write_text(prompt)
             runtime_dir = str(Path(__file__).resolve().parent.parent)
             env = {**env, "TTP_RUN_DIR": str(run_dir), "TTP_PROJECT": str(self.p.base), "TTP_RUN_ID": str(run_id),
@@ -1041,13 +1051,13 @@ class Daemon:
                 db.update_task(task["id"], status="blocked", blocked_reason=f"workspace: {e}"[:400])
                 self._unreserve(task)
                 continue
-            from .prompts import worker_prompt
+            from .prompts import worker_system, worker_task
             try:
-                prompt = worker_prompt(self.p, task, cwd, branch)
+                system, prompt = worker_system(self.p, task), worker_task(self.p, task, cwd, branch)
                 db.update_task(task["id"], status="running", branch=branch, blocked_reason=None)
                 self.start_run("worker" if task["kind"] != "review" else "reviewer", prompt, provider, tier, cwd,
                                task=task, budget_usd=max(remaining, 0.5) if task["budget_usd"] else None,
-                               read_only=False)
+                               read_only=False, append_system=system)
             except Exception as e:
                 self._start_failed(task, e)
                 self._unreserve(task)

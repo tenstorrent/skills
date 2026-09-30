@@ -86,6 +86,16 @@ class Provider:
         """Arguments that load extra skill plugins for one run; [] when the agent cannot."""
         return []
 
+    def append_system_args(self, path: Path) -> list[str]:
+        """Arguments that add the text in `path` to the agent's system prompt, where a provider
+        caches it across runs; [] when the agent cannot, and the text then leads the prompt."""
+        return []
+
+    def isolation_args(self) -> list[str]:
+        """Arguments that keep the user's own MCP servers, plugins, hooks and settings out of a
+        worker (the project's approved plugins and the harness hook still load); [] if unsupported."""
+        return []
+
     def writable_args(self, dirs: list[str]) -> list[str]:
         """Arguments that let a sandboxed worker also write `dirs` (run dir, project state, git
         metadata); [] when the agent has no write sandbox."""

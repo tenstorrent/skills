@@ -64,26 +64,32 @@ def _resource_line(task: dict) -> str:
     return out
 
 
-def worker_prompt(p: Project, task: dict, cwd: str, branch: str | None) -> str:
-    cfg = p.config()
+def worker_system(p: Project, task: dict) -> str:
+    """The part of a worker's prompt shared by every task of its kind until the charter or memory
+    changes: sent as the system prompt where the agent allows it, so the provider caches it across
+    the project's workers."""
     kind = task["kind"] or "work"
-    parts = [restrictions_block(p), _read(p, "worker.md")]
-    addendum = _read(p, f"kind-{kind}.md")
-    if addendum:
-        parts.append(addendum)
-    # The restrictions open and close this prompt; a third copy inside the charter only costs tokens.
+    parts = [restrictions_block(p), _read(p, "worker.md"), _read(p, f"kind-{kind}.md")]
+    # The restrictions open and close the prompt; a third copy inside the charter only costs tokens.
     charter = p.charter_path.read_text() if p.charter_path.exists() else "(none)"
     parts.append("# CHARTER (goals and policies; its restrictions are the binding block above)\n" +
                  charter_without_restrictions(charter))
     mem = p.memory_text(limit_chars=8000)
     if mem:
         parts.append("# PROJECT MEMORY\n" + mem)
+    return "\n\n".join(x for x in parts if x.strip())
+
+
+def worker_task(p: Project, task: dict, cwd: str, branch: str | None) -> str:
+    """The per-task part of a worker's prompt, after worker_system(); it ends with the restrictions."""
+    cfg = p.config()
+    kind = task["kind"] or "work"
     history = ""
     prev = load_result(task["result"])
     if prev:
         history = f"\nPrevious attempt ended '{prev.get('status')}': {str(prev.get('summary') or '')[:1500]}\n"
     delivery = cfg.get("delivery", {})
-    parts.append(
+    parts = [
         f"# YOUR TASK #{task['id']}: {task['title']}\n"
         f"kind: {kind} · tier: {task['tier']} · attempt {int(task['attempts'] or 0) + 1} of "
         f"{task['max_attempts']} · budget ${task['budget_usd'] or 0:.2f} (spent ${task['spent_usd'] or 0:.2f})\n"
@@ -93,6 +99,11 @@ def worker_prompt(p: Project, task: dict, cwd: str, branch: str | None) -> str:
         f"delivery policy: draft PRs={delivery.get('draft_prs', True)}, review before PR="
         f"{delivery.get('review_before_pr', True)}, auto-merge repos={delivery.get('auto_merge_repos') or 'none'}, "
         f"push allowed={delivery.get('push_allowed', True)}\n"
-        f"{history}\n## Spec\n{task['spec'] or task['title']}\n")
-    parts.append(restrictions_block(p))
+        f"{history}\n## Spec\n{task['spec'] or task['title']}\n",
+        restrictions_block(p)]
     return "\n\n".join(x for x in parts if x.strip())
+
+
+def worker_prompt(p: Project, task: dict, cwd: str, branch: str | None) -> str:
+    """The whole prompt in one piece, as a worker reads it."""
+    return worker_system(p, task) + "\n\n" + worker_task(p, task, cwd, branch)

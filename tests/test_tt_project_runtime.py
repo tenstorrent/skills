@@ -967,6 +967,70 @@ def test_charter_restrictions_lead_and_close_every_worker_prompt(env):
     assert "Draft PRs." in system
 
 
+def _dispatch_claude_worker(p, monkeypatch, flags):
+    from ttp import daemon as dmod
+    from ttp.providers import claude
+
+    class Proc:
+        pid = 4242
+    real = subprocess.Popen
+    monkeypatch.setattr(claude, "_FLAGS", {claude.EXCLUDE_DYNAMIC: True, claude.APPEND_SYSTEM_FILE: True,
+                                           claude.APPEND_SYSTEM: True, **flags})
+    # Only the runner is not launched; git still runs.
+    monkeypatch.setattr(dmod.subprocess, "Popen",
+                        lambda argv, *a, **k: Proc() if "ttp.runner" in argv else real(argv, *a, **k))
+    p.set_config("core_provider", "claude")
+    tid = p.db.add_task("tidy docs", "TASK-SPEC-MARKER", kind="work", tier="light", origin="user")
+    dmod.Daemon(p.base).dispatch()
+    run = p.db.one("SELECT dir FROM runs WHERE task=?", (tid,))
+    assert run, p.db.task(tid)["blocked_reason"]
+    run_dir = pathlib.Path(run["dir"])
+    return (json.loads((run_dir / "run.json").read_text())["argv"], run_dir,
+            (run_dir / "prompt.md").read_text())
+
+
+def test_claude_workers_get_the_stable_prompt_as_a_cacheable_system_prompt(env, monkeypatch):
+    p = make(env)
+    p.charter_path.write_text("# demo\n\n## Goals\nGo fast.\n\n## Restrictions\nNever merge to main.\n")
+    p.add_memory("MEMORY-MARKER", kind="fact")
+    from ttp.providers import claude
+    argv, run_dir, prompt = _dispatch_claude_worker(p, monkeypatch, {})
+    assert argv[argv.index("--append-system-prompt-file") + 1] == str(run_dir / "system.md")
+    system = (run_dir / "system.md").read_text()
+    assert system.startswith("# BINDING RESTRICTIONS")
+    assert "Go fast." in system and "MEMORY-MARKER" in system and "TASK-SPEC-MARKER" not in system
+    assert "TASK-SPEC-MARKER" in prompt and "Go fast." not in prompt and "MEMORY-MARKER" not in prompt
+    assert prompt.rstrip().endswith("Never merge to main."), "the restrictions must close the prompt"
+
+
+def test_workers_read_one_prompt_when_the_cli_cannot_append_a_system_prompt(env, monkeypatch):
+    p = make(env)
+    p.charter_path.write_text("# demo\n\n## Goals\nGo fast.\n\n## Restrictions\nNever merge to main.\n")
+    from ttp.providers import claude
+    argv, _, prompt = _dispatch_claude_worker(p, monkeypatch, {claude.APPEND_SYSTEM_FILE: False,
+                                                                claude.APPEND_SYSTEM: False})
+    assert not [a for a in argv if a.startswith("--append-system-prompt")]
+    assert prompt.startswith("# BINDING RESTRICTIONS") and prompt.rstrip().endswith("Never merge to main.")
+    assert "Go fast." in prompt and "TASK-SPEC-MARKER" in prompt
+
+
+def test_worker_isolation_is_opt_in_and_keeps_the_hook_and_approved_plugins(env, monkeypatch, tmp_path):
+    p = make(env)
+    plug = tmp_path / "plugin"
+    plug.mkdir()
+    p.set_config("providers.claude.plugin_dirs", [str(plug)])
+    argv, _, _ = _dispatch_claude_worker(p, monkeypatch, {})
+    assert "--strict-mcp-config" not in argv and "--setting-sources" not in argv, "isolation must be opt-in"
+    from ttp import coordinator as coord
+    assert coord.apply(p, [{"type": "config_set", "key": "providers.claude.worker_isolation",
+                            "value": "true"}]) == []
+    argv, _, _ = _dispatch_claude_worker(p, monkeypatch, {})
+    assert "--strict-mcp-config" in argv
+    assert argv[argv.index("--setting-sources") + 1] == "project,local", "the user's own settings still load"
+    assert "ttp.hook" in argv[argv.index("--settings") + 1], "the harness hook no longer loads"
+    assert argv[argv.index("--plugin-dir") + 1] == str(plug), "approved plugins no longer load"
+
+
 def test_charter_and_memory_changes_are_committed_alone(env):
     p = make(env)
     from ttp import coordinator as coord

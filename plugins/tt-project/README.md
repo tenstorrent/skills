@@ -89,6 +89,11 @@ and preferences you add later become part of the project's charter and memory.
 - A plan task starts from what is already known: prior work, the organization's docs and chats
   through the connectors you have, available skills, and public work. Skill plugins it recommends
   can be enabled for the project's workers only (`providers.claude.plugin_dirs`).
+- On Claude, the part of a worker's prompt that is the same for every task of its kind (rules,
+  charter, memory) goes in the system prompt, so the next worker reads it from the cache.
+- `providers.claude.worker_isolation: true` (off by default) starts Claude workers without your
+  own MCP servers, plugins, hooks and user settings; the project's `plugin_dirs` and its hook still
+  load. In one measurement it cut a worker's first turn from about 38k to 23k input tokens.
 
 ## Where things live
 
@@ -132,9 +137,9 @@ Design notes, invariants and how to add a provider: [docs/design.md](docs/design
   cut off early is booked at the elapsed share of its budget (flagged estimated).
 - Codex workers run in Codex's workspace-write sandbox, with the project's state folder and the
   repository's git folder added as writable roots. Coordinator turns use its read-only sandbox.
-- Not yet on Codex or Cursor: worker plugins (`plugin_dirs`), coordinator updates reaching a
-  running worker (Claude hooks only), and isolation of coordinator turns from your own CLI
-  config, MCP servers and rules. Cursor enforces no read-only mode and no `no_internet`
+- Not yet on Codex or Cursor: worker plugins (`plugin_dirs`), worker isolation, coordinator
+  updates reaching a running worker (Claude hooks only), and isolation of coordinator turns from
+  your own CLI config, MCP servers and rules. Cursor enforces no read-only mode and no `no_internet`
   restriction, and has no plan-window meter.
 - Cursor has no reasoning-effort flag; tiers map to model names.
 - A laptop pauses while it sleeps. Use an always-on machine for round-the-clock work.

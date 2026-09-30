@@ -66,6 +66,8 @@ USER_SETTABLE = {
     "coordinator.max_new_tasks_per_day": lambda v: min(int(v), MAX_TASKS_PER_DAY),
     # Skill plugins loaded for this project's workers only (a plan may recommend them).
     "providers.claude.plugin_dirs": lambda v: existing_dirs(dir_list(v)),
+    # Workers load none of the user's own MCP servers, plugins, hooks or settings.
+    "providers.claude.worker_isolation": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     # Hours before an unanswered ask registered with a default falls back to it; 0 turns it off.
     # New asks never get a default, so this only drains asks registered with one.
     "coordinator.ask_timeout_h": float,

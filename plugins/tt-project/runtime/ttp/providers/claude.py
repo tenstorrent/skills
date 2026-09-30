@@ -17,6 +17,8 @@ from ..budget import Window
 from .base import AUTH_RE, LIMIT_RE, Provider, RunUsage
 
 EXCLUDE_DYNAMIC = "--exclude-dynamic-system-prompt-sections"
+APPEND_SYSTEM = "--append-system-prompt"
+APPEND_SYSTEM_FILE = "--append-system-prompt[-file]"   # how `--help` names the (unlisted) file form
 _FLAGS: dict[str, bool] = {}   # CLI flag support, probed once per daemon from `claude --help`
 USAGE_KEYS = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
 
@@ -81,6 +83,17 @@ class Claude(Provider):
                             continue
         except FileNotFoundError:
             return
+
+    def append_system_args(self, path: Path) -> list[str]:
+        if self.supports(APPEND_SYSTEM_FILE):
+            return ["--append-system-prompt-file", str(path)]
+        if self.supports(APPEND_SYSTEM):
+            return [APPEND_SYSTEM, Path(path).read_text()]
+        return []
+
+    def isolation_args(self) -> list[str]:
+        # Flag settings (the harness hook) and --plugin-dir load whatever the sources are.
+        return ["--strict-mcp-config", "--setting-sources", "project,local"]
 
     def plugin_args(self, dirs: list[str]) -> list[str]:
         out: list[str] = []
