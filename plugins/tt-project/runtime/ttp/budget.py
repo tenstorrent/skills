@@ -80,7 +80,7 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
         # The caps bound the project's dollars, whichever provider spends them. Providers on plan
         # windows are bounded by their windows instead, so their spend does not count here.
         day_cap, week_cap = float(b.get("daily_usd") or 0), float(b.get("weekly_usd") or 0)
-        windowed = sorted({w.provider for w in windows})
+        windowed = sorted({w.provider for w in windows} | plan_providers(db, now))
         d = db.spent_since(now - DAY, exclude=windowed)
         w7 = db.spent_since(now - WEEK, exclude=windowed)
         g.numbers.update({"spent_24h": round(d, 2), "spent_7d": round(w7, 2),
@@ -179,6 +179,12 @@ def windows_from_snapshots(db: DB, now: float | None = None) -> list[Window]:
                 "WHERE s.ts>=?", (now - SNAPSHOT_FRESH_S,))
     return [Window(r["provider"], r["window"], float(r["utilization"] or 0), r["resets_at"], r["account"] or "")
             for r in rows]
+
+
+def plan_providers(db: DB, now: float | None = None) -> set[str]:
+    """Providers with any window reading in the last week, i.e. billed by plan windows, not dollars."""
+    now = now or time.time()
+    return {r["provider"] for r in db.q("SELECT DISTINCT provider FROM snapshots WHERE ts>=?", (now - WEEK,))}
 
 
 def record_windows(db: DB, windows: list[Window]) -> None:

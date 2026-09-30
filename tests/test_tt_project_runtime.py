@@ -816,6 +816,10 @@ def test_dollar_caps_cover_the_whole_project(env):
         assert g.level == "red" and any("cap reached" in r for r in g.reasons), (prov, g.reasons)
     # A provider on plan windows is bounded by its windows, so its spend does not use up the caps.
     assert bud.evaluate(p.db, p.config(), "codex", [bud.Window("claude", "seven_day", 20)]).level == "yellow"
+    # An idle plan provider has no fresh reading but is still on a plan: its unbilled cost stays out.
+    p.db.x("INSERT INTO snapshots(ts,provider,account,window,utilization,resets_at) VALUES(?,?,?,?,?,?)",
+           (time.time() - 3 * 86400, "claude", "", "seven_day", 20, None))
+    assert bud.evaluate(p.db, p.config(), "codex", []).level == "yellow"
 
 def test_remote_listener_reconnects_after_a_network_drop(env, monkeypatch):
     from ttp import cli
