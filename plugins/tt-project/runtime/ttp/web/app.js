@@ -125,7 +125,7 @@ async function refresh() {
   const stuck = hb && hb.age > st.heartbeat_stale_s;
   const disk = st.disk_low;
   banner([stuck ? `The daemon has not completed a tick for ${Math.round(hb.age / 60)} min: nothing new starts. Try <code>ttp restart ${esc(st.project.name)}</code>.` : "",
-          disk ? `Only ${disk.free_gb} GB free under ${esc(disk.path)}: no new worker runs start until space is freed.` : "",
+          disk ? `Only ${disk.free_gb} GB free under ${esc(disk.path)}: only questions and plans start until ${st.disk && st.disk.resume_gb ? st.disk.resume_gb + " GB are" : "space is"} free.` : "",
           h.undelivered ? `${h.undelivered.asks} question(s) not delivered to any chat since ${at(h.undelivered.since)}: is the chat relay running? Answer here meanwhile.${h.undelivered.below_floor ? ` ${h.undelivered.below_floor} of them are below every chat's severity floor.` : ""}` : ""].filter(Boolean).join("<br>"));
   $("#pname").textContent = st.project.name;
   $("#daemon").textContent = st.paused ? "paused" : stuck ? "stuck" : (st.daemon && st.daemon.pid ? `running on ${st.daemon.host}` : "stopped");
@@ -136,6 +136,14 @@ async function refresh() {
   const needs = st.tasks.filter((t) => t.status === "blocked").length + h.asks.length;
   $("#needs").hidden = !needs; $("#needs").textContent = `${needs} need${needs === 1 ? "s" : ""} you`;
   $("#host").hidden = !h.host; $("#host").textContent = h.host || "";
+  const dk = st.disk, kept = Object.keys(st.worktrees_kept || {});
+  $("#disk").hidden = !dk;
+  if (dk) {
+    $("#disk").textContent = `disk ${dk.free_gb} GB free${dk.low ? " · guard on" : ""}`;
+    $("#disk").className = "pill " + (dk.low ? "lv-red" : dk.free_gb < 2 * dk.threshold_gb ? "lv-orange" : "lv-green");
+    $("#disk").title = `${dk.free_gb} of ${dk.total_gb} GB free under ${dk.path}; the guard holds new tasks below ${dk.threshold_gb} GB` +
+      (kept.length ? `\nFinished tasks' worktrees kept: ${kept.map(t => `#${t} (${st.worktrees_kept[t]})`).join(", ")}` : "");
+  }
   $("#why").innerHTML = h.why_idle ? `<b>Idle:</b> ${esc(h.why_idle)}` : `${h.running} run${h.running === 1 ? "" : "s"} working.` +
     (h.held ? ` <b>Held:</b> ${esc(h.held)}` : "");
   $("#top").textContent = h.spend.top_7d ? `Top spender, 7 days: ${h.spend.top_7d.source} ${money(h.spend.top_7d.usd)}` : "";

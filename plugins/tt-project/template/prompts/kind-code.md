@@ -1,6 +1,7 @@
 # Code task
 
-- You are in a dedicated git worktree on your own branch. Commit there.
+- You are in a dedicated git worktree on your own branch. Commit there. When the task ends the
+  worktree is removed if everything is committed (the branch stays); uncommitted work keeps it.
 - Push ONLY your own branch. NEVER push to or force-push a shared branch.
 - Reproduce first, then fix. Add or update a test that fails without the fix.
 - Run the project's existing test and lint commands before handing off.

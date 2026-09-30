@@ -515,7 +515,8 @@ def status_text(p: Project) -> str:
         lines.append(h["host"])
     disk = db.kv("disk_low")
     if disk:
-        lines.append(f"disk: only {disk['free_gb']} GB free under {disk['path']}; no new worker runs start")
+        lines.append(f"disk: only {disk['free_gb']} GB free under {disk['path']} (guard {disk.get('threshold_gb', '?')} GB); "
+                     f"only questions and plans start")
     for t in h["waiting"][:5]:
         why = re.sub(r";? *next try \S+$", "", t["blocked_reason"] or "").strip()
         lines.append(f"  #{t['id']} waiting, next try {at(t['not_before'], now)}: {t['title']}" + (f" — {why}" if why else ""))
@@ -762,6 +763,23 @@ def cmd_task(a) -> None:
         runs = stop_runs(p.db, p.runs, tid)
         print("cancelled" + (f"; ending its running run{'s' if len(runs) > 1 else ''} "
                              f"{', '.join(map(str, runs))}" if runs else ""))
+
+
+def cmd_prune(a) -> None:
+    """One sweep over finished tasks' worktrees, with the daemon's checks: clear build and cache
+    directories, remove the worktree when nothing is lost. Branches stay."""
+    from . import worktree
+    p = need(a.name, sys.argv[1:])
+    before = shutil.disk_usage(p.worktrees).free if p.worktrees.is_dir() else 0
+    res = worktree.sweep(p, names=p.config().get("disk", {}).get("cache_dirs"))
+    for r in res:
+        cleared = f"; cleared {', '.join(r['cleared'][:5])}" if r["cleared"] else ""
+        print(f"#{r['task']} ({r['status']}): " + ("removed, branch " + (r["branch"] or "?") + " kept"
+                                                   if r["why"] is None else f"kept: {r['why']}") + cleared)
+    if not res:
+        print("no finished task's worktree to tidy")
+    elif before:
+        print(f"freed {max(shutil.disk_usage(p.worktrees).free - before, 0) / 1e9:.1f} GB")
 
 
 def cmd_memory(a) -> None:
@@ -1095,7 +1113,8 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_web)
     for name, fn, hlp in (("connect", cmd_connect, "attach this chat to a project"),
                           ("status", cmd_status, "one-screen status"),
-                          ("logs", cmd_logs, "daemon log tail"), ("doctor", cmd_doctor, "diagnose setup")):
+                          ("logs", cmd_logs, "daemon log tail"), ("doctor", cmd_doctor, "diagnose setup"),
+                          ("prune", cmd_prune, "tidy finished tasks' worktrees now (branches are kept)")):
         s = sub.add_parser(name, help=hlp)
         s.add_argument("name")
         if name == "connect":

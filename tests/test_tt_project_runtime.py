@@ -2772,72 +2772,120 @@ def test_the_daemon_records_its_start_and_first_tick_failures(env, monkeypatch):
     assert dm.heartbeat(p) is None
 
 
-def test_finished_worktrees_are_removed_only_when_nothing_is_lost(env):
-    p = make(env)
-    from ttp import worktree
-    from ttp.daemon import Daemon
-    remote = env["tmp"] / "remote.git"
-    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
-    _git_out(p.root, "remote", "add", "origin", str(remote))
-    _git_out(p.root, "push", "-q", "origin", "HEAD")
-    ident = ["-c", "user.name=t", "-c", "user.email=t@t"]
-    paths = {}
-    for name in ("pushed", "unpushed", "dirty", "recent"):
-        tid = p.db.add_task(name, "s", kind="code", tier="light", origin="user")
-        path, branch = worktree.ensure(p, p.db.task(tid))
-        p.db.update_task(tid, status="done", branch=branch)
-        if name != "dirty":
-            (path / f"{name}.txt").write_text(name)
-            _git_out(path, "add", ".")
-            _git_out(path, *ident, "commit", "-qm", name)
-        else:
-            (path / "README.md").write_text("edited\n")
-        if name in ("pushed", "recent"):
-            _git_out(path, "push", "-q", "origin", f"HEAD:refs/heads/{branch}")
-        if name != "recent":
-            p.db.x("UPDATE tasks SET updated=? WHERE id=?", (time.time() - 8 * 86400, tid))
-        paths[name] = (path, branch)
-    Daemon(p.base).prune_worktrees()
-    assert not paths["pushed"][0].exists()
-    assert _git_out(p.root, "rev-parse", "--verify", "--quiet", paths["pushed"][1]), "a branch was deleted"
-    for name in ("unpushed", "dirty", "recent"):
-        assert paths[name][0].exists(), f"the {name} worktree was removed"
-    assert "removed" in (p.logs / "daemon.log").read_text()
+_IDENT = ["-c", "user.name=t", "-c", "user.email=t@t"]
 
 
-@pytest.mark.parametrize("merged", [True, False])
-def test_a_worktree_merged_into_a_remote_only_base_is_pruned(env, merged):
-    p = make(env)
+def _code_task(p, name, status="done"):
     from ttp import worktree
-    from ttp.daemon import Daemon
-    remote = env["tmp"] / "remote.git"
-    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
-    _git_out(p.root, "remote", "add", "origin", str(remote))
-    _git_out(p.root, "push", "-q", "origin", "HEAD:refs/heads/release")
-    _git_out(p.root, "fetch", "-q", "origin")
-    p.set_config("delivery.base_ref", "release")
-    assert not _git_out(p.root, "branch", "--list", "release"), "the base must exist only on the remote"
-    tid = p.db.add_task("merged", "s", kind="code", tier="light", origin="user")
+    tid = p.db.add_task(name, "s", kind="code", tier="light", origin="user")
     path, branch = worktree.ensure(p, p.db.task(tid))
-    (path / "work.txt").write_text("work")
+    p.db.update_task(tid, status=status, branch=branch)
+    return tid, path, branch
+
+
+def _commit_file(path, name):
+    (path / f"{name}.txt").write_text(name)
     _git_out(path, "add", ".")
-    _git_out(path, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "work")
-    if merged:
-        _git_out(path, "push", "-q", "origin", "HEAD:refs/heads/release")
-        _git_out(p.root, "fetch", "-q", "origin")
-    p.db.update_task(tid, status="done", branch=branch)
-    p.db.x("UPDATE tasks SET updated=? WHERE id=?", (time.time() - 8 * 86400, tid))
-    Daemon(p.base).prune_worktrees()
-    assert path.exists() != merged
+    _git_out(path, *_IDENT, "commit", "-qm", name)
 
 
-def test_a_worktree_is_kept_when_the_base_cannot_be_resolved(env):
+def test_finished_worktrees_are_removed_at_task_end_only_when_nothing_is_lost(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    t_clean, clean, clean_branch = _code_task(p, "clean")
+    _commit_file(clean, "clean")
+    (clean / "build").mkdir()
+    (clean / "build" / "big.o").write_bytes(b"0" * 1000)
+    head = _git_out(clean, "rev-parse", "HEAD")
+    t_dirty, dirty, _ = _code_task(p, "dirty", status="failed")
+    (dirty / "pkg").mkdir()
+    _commit_file(dirty / "pkg", "mod")
+    (dirty / "README.md").write_text("edited\n")
+    for cache in ("build", "pkg/__pycache__", ".venv/lib"):
+        (dirty / cache).mkdir(parents=True)
+        (dirty / cache / "blob").write_text("x")
+    t_open, open_, _ = _code_task(p, "still open", status="queued")
+    t_run, running, _ = _code_task(p, "cancelled, run not ended yet", status="cancelled")
+    p.db.x("INSERT INTO runs(role,provider,started,status,task) VALUES('worker','fake',?,'running',?)",
+           (time.time(), t_run))
+    t_det, detached, _ = _code_task(p, "detached")
+    _git_out(detached, "checkout", "-q", "--detach")
+    _commit_file(detached, "orphan")
+    d = Daemon(p.base)
+    d.prune_worktrees()
+    assert not clean.exists(), "a clean finished worktree was kept"
+    assert _git_out(p.root, "rev-parse", clean_branch) == head, "the task branch was lost"
+    assert f"t{t_clean}" not in _git_out(p.root, "worktree", "list"), "the worktree was not pruned from git"
+    assert dirty.exists() and (dirty / "README.md").read_text() == "edited\n", "uncommitted work was lost"
+    assert not any((dirty / c).exists() for c in ("build", "pkg/__pycache__", ".venv")), "caches were kept"
+    assert open_.exists() and running.exists() and detached.exists()
+    kept = p.db.kv("worktrees_kept")
+    assert set(kept) == {str(t_dirty), str(t_det)} and "uncommitted" in kept[str(t_dirty)], kept
+    assert "detached" in kept[str(t_det)]
+    log = (p.logs / "daemon.log").read_text()
+    assert f"task {t_clean} (done) removed" in log and f"task {t_dirty} kept: uncommitted" in log
+    # Kept worktrees are not re-examined every sweep, but are once their task changes.
+    (dirty / "build").mkdir()
+    d.prune_worktrees(every_s=0)
+    assert (dirty / "build").exists(), "an unchanged kept worktree was swept again"
+    _git_out(dirty, "checkout", "--", "README.md")
+    p.db.update_task(t_dirty, status="cancelled")
+    d.prune_worktrees()
+    assert not dirty.exists() and str(t_dirty) not in (p.db.kv("worktrees_kept") or {})
+
+
+def test_a_tracked_file_in_a_cache_named_directory_is_never_cleared(env):
     p = make(env)
     from ttp import worktree
-    tid = p.db.add_task("t", "s", kind="code", tier="light", origin="user")
-    path, _ = worktree.ensure(p, p.db.task(tid))
-    p.set_config("delivery.base_ref", "no-such-branch")
-    assert "no-such-branch" in worktree.keep_reason(p, path)
+    _, path, _ = _code_task(p, "tracked build dir")
+    (path / "build").mkdir()
+    (path / "build" / "script.sh").write_text("echo hi\n")
+    _git_out(path, "add", ".")
+    _git_out(path, *_IDENT, "commit", "-qm", "tracked build dir")
+    (path / "build" / "out.o").write_text("x")
+    assert worktree.clear_caches(path) == ["build/out.o"]
+    assert (path / "build" / "script.sh").exists()
+
+
+def test_a_task_continuing_one_whose_worktree_was_removed_starts_from_its_commits(env):
+    p = make(env)
+    from ttp import worktree
+    from ttp.daemon import Daemon
+    old, path, _ = _code_task(p, "old", status="failed")
+    _commit_file(path, "partial")
+    head = _git_out(path, "rev-parse", "HEAD")
+    Daemon(p.base).prune_worktrees()
+    assert not path.exists()
+    new = p.db.add_task("redo old", "s", kind="code", tier="light", origin="user", labels=[f"continues:{old}"])
+    new_path, _ = worktree.ensure(p, p.db.task(new))
+    assert _git_out(new_path, "rev-parse", "HEAD") == head and (new_path / "partial.txt").exists()
+    # A finished task brought back on its own branch gets its worktree again.
+    p.db.update_task(old, status="queued")
+    again, _ = worktree.ensure(p, p.db.task(old))
+    assert _git_out(again, "rev-parse", "HEAD") == head
+
+
+def test_worktree_retention_delays_removal(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    p.set_config("disk.worktree_retention_days", 7)
+    tid, recent, _ = _code_task(p, "recent")
+    _, old, _ = _code_task(p, "old")
+    p.db.x("UPDATE tasks SET updated=? WHERE id!=?", (time.time() - 8 * 86400, tid))
+    Daemon(p.base).prune_worktrees()
+    assert recent.exists() and not old.exists()
+
+
+def test_ttp_prune_sweeps_finished_worktrees_once(env, capsys):
+    p = make(env)
+    from ttp import cli
+    _, clean, branch = _code_task(p, "clean")
+    t_dirty, dirty, _ = _code_task(p, "dirty")
+    (dirty / "new.txt").write_text("unsaved")
+    cli.main(["prune", "demo"])
+    out = capsys.readouterr().out
+    assert not clean.exists() and dirty.exists()
+    assert f"removed, branch {branch} kept" in out and f"#{t_dirty} (done): kept: uncommitted" in out, out
 
 
 def test_low_disk_space_blocks_new_workers_and_alerts_once(env, monkeypatch):
@@ -2857,6 +2905,67 @@ def test_low_disk_space_blocks_new_workers_and_alerts_once(env, monkeypatch):
     monkeypatch.setattr(dm.shutil, "disk_usage", lambda path: usage(100e9, 50e9, 50e9))
     assert _run_until(d, p, lambda: p.db.task(tid)["status"] == "done")
     assert p.db.kv("disk_low") is None
+
+
+@pytest.mark.parametrize("total_gb, free_gb, low", [(10000, 400, False), (10000, 140, True), (1000, 60, False),
+                                                    (1000, 40, True), (100, 6, False), (100, 4, True)])
+def test_the_disk_guard_threshold_is_the_smaller_of_its_percent_and_gigabytes(env, monkeypatch, total_gb, free_gb, low):
+    import collections
+    p = make(env)
+    from ttp import daemon as dm
+    usage = collections.namedtuple("usage", "total used free")
+    monkeypatch.setattr(dm.shutil, "disk_usage", lambda path: usage(total_gb * 1e9, 0, free_gb * 1e9))
+    dm.Daemon(p.base).check_disk()
+    assert bool(p.db.kv("disk_low")) == low
+    assert p.db.kv("disk")["threshold_gb"] == min(total_gb * 0.05, 150)
+
+
+def test_the_disk_guard_alerts_once_per_episode_holds_heavy_tasks_and_resumes(env, monkeypatch):
+    import collections
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import daemon as dm
+    from ttp.web import state_payload
+    usage = collections.namedtuple("usage", "total used free")
+    free = {"gb": 40}   # a 1000 GB disk: the guard is at 50 GB, and lifts at 60
+    monkeypatch.setattr(dm.shutil, "disk_usage", lambda path: usage(1000e9, 0, free["gb"] * 1e9))
+    alerts = lambda: p.db.q("SELECT id FROM messages WHERE kind='alert' AND ref='disk'")  # noqa: E731
+    code = p.db.add_task("build it", "s", kind="code", tier="light", origin="user")
+    ask = p.db.add_task("what fills the disk?", "s", kind="question", tier="light", origin="user")
+    d = dm.Daemon(p.base)
+    d.dispatch()
+    assert p.db.q("SELECT id FROM runs WHERE task=?", (ask,)), "a question was held by the disk guard"
+    assert not p.db.q("SELECT id FROM runs WHERE task=?", (code,)), "a code task started on a low disk"
+    assert p.db.task(code)["attempts"] == 0
+    assert len(alerts()) == 1
+    assert "## Disk: 40.0 GB free of 1000.0 GB; LOW" in coord.digest(p, {}, [], [])
+    st = state_payload(p, p.db)
+    assert st["disk"]["low"] and st["disk"]["free_gb"] == 40.0 and st["disk_low"]
+    free["gb"] = 55    # above the threshold, below the resume point: still on, no new alert
+    d.dispatch()
+    assert p.db.kv("disk_low") and len(alerts()) == 1
+    free["gb"] = 45
+    dm.Daemon(p.base).dispatch()   # a restart keeps the episode and does not alert again
+    assert len(alerts()) == 1
+    free["gb"] = 61
+    d = dm.Daemon(p.base)
+    d.dispatch()
+    assert p.db.kv("disk_low") is None and p.db.q("SELECT id FROM runs WHERE task=?", (code,))
+    assert "## Disk: 61.0 GB free of 1000.0 GB; ok (guard below 50.0 GB)" in coord.digest(p, {}, [], [])
+    free["gb"] = 30
+    d.dispatch()
+    assert len(alerts()) == 2, "a new episode must alert again"
+
+
+def test_below_the_disk_floor_even_questions_wait(env, monkeypatch):
+    import collections
+    p = make(env)
+    from ttp import daemon as dm
+    usage = collections.namedtuple("usage", "total used free")
+    monkeypatch.setattr(dm.shutil, "disk_usage", lambda path: usage(100e9, 0, 1e9))
+    ask = p.db.add_task("what fills the disk?", "s", kind="question", tier="light", origin="user")
+    dm.Daemon(p.base).dispatch()
+    assert not p.db.q("SELECT id FROM runs WHERE task=?", (ask,))
 
 
 def test_plan_pacing_changes_do_not_alert_the_user(env, monkeypatch):

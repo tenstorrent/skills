@@ -4,6 +4,7 @@
 ignored folder, so parallel workers never share a working tree with each other or the user."""
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -95,32 +96,113 @@ def resolve_base(p: Project) -> str:
 
 
 def remove(p: Project, task_id: int) -> None:
-    """Remove a task's worktree; its branch stays. Refuses (raises) if git sees edits in it."""
+    """Remove a task's worktree; its branch stays. Call only once keep_reason() found nothing to lose:
+    ignored files go with it, and so do checked-out submodules (which plain `remove` refuses)."""
     path = p.worktrees / f"t{task_id}"
     if path.exists():
-        _git(p.root, "worktree", "remove", str(path))
+        _git(p.root, "worktree", "remove", "--force", str(path))
+    _git(p.root, "worktree", "prune", check=False)
 
 
-def keep_reason(p: Project, path: Path) -> str | None:
+def keep_reason(path: Path) -> str | None:
     """Why this worktree must stay, or None when removing it loses nothing: no uncommitted or
-    untracked files, and its HEAD is on a remote branch or already in the base branch."""
+    untracked files (submodules included), and its HEAD is on a local or remote branch (the
+    task's own branch is never deleted, so its commits stay reachable)."""
     def git(*args: str) -> subprocess.CompletedProcess:
-        return subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True, timeout=120)
-    st = git("status", "--porcelain")
+        return subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True, timeout=300)
+    st = git("status", "--porcelain", "--ignore-submodules=none")
     if st.returncode != 0:
         return "git status failed"
-    if st.stdout.strip():
-        return "uncommitted changes"
-    remote = git("branch", "-r", "--contains", "HEAD")
-    if remote.returncode == 0 and remote.stdout.strip():
-        return None
+    dirty = st.stdout.splitlines()
+    if dirty:
+        return f"uncommitted changes in {len(dirty)} path(s), e.g. {dirty[0][3:].strip()[:80]}"
+    held = git("for-each-ref", "--count=1", "--contains", "HEAD", "--format=%(refname)", "refs/heads", "refs/remotes")
+    if held.returncode != 0:
+        return "git for-each-ref failed"
+    return None if held.stdout.strip() else "commits on no branch (detached HEAD)"
+
+
+# Build output and tool caches: regenerated on demand, often gigabytes. Matched against each path
+# component of the untracked or ignored entries git lists, so a tracked file is never touched.
+CACHE_DIRS = ["build", "_build", "cmake-build-*", ".cache", "__pycache__", ".pytest_cache", ".mypy_cache",
+              ".ruff_cache", ".tox", ".nox", ".venv", "venv", "node_modules", "*.egg-info", ".eggs",
+              ".gradle", ".ccache"]
+
+
+def clear_caches(path: Path, names: list[str] | None = None) -> list[str]:
+    """Delete untracked or ignored build and cache directories in a worktree, and anything
+    untracked below one. Returns what went."""
+    import fnmatch
+    import shutil
+    pats = CACHE_DIRS if names is None else names
+    found: set[str] = set()
+    for extra in ([], ["--ignored", "--exclude-standard"]):
+        out = subprocess.run(["git", "-C", str(path), "ls-files", "--others", "--directory", "-z", *extra],
+                             capture_output=True, text=True, timeout=300)
+        if out.returncode != 0:
+            return []
+        for entry in filter(None, out.stdout.split("\0")):
+            # The entry itself, never a parent: git lists only wholly untracked paths.
+            if any(fnmatch.fnmatchcase(part, pat) for part in entry.rstrip("/").split("/") for pat in pats):
+                found.add(entry.rstrip("/"))
+    gone = []
+    for rel in sorted(found):
+        if any(rel.startswith(g + "/") for g in gone):
+            continue
+        target = path / rel
+        try:
+            if target.is_symlink() or not target.is_dir():
+                target.unlink()
+            else:
+                shutil.rmtree(target)
+            gone.append(rel)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            pass
+    return gone
+
+
+def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None,
+          skip=lambda task: False) -> list[dict]:
+    """Tidy the worktrees of finished tasks (done, failed, cancelled) with no run still going: clear
+    their build and cache directories, then remove each one whose removal loses nothing (see
+    keep_reason). Branches stay, so a task that `continues` one starts from its commits. One sweep
+    at a time per project; a busy lock returns no results."""
+    import fcntl
+    import time
+    from .db import TERMINAL_TASK_STATES
+    if not p.worktrees.is_dir():
+        return []
+    p.state.mkdir(parents=True, exist_ok=True)
+    fd = os.open(p.state / "prune.lock", os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        base = resolve_base(p)
-    except RuntimeError as e:
-        return str(e)
-    if git("merge-base", "--is-ancestor", "HEAD", base).returncode == 0:
-        return None
-    return "commits not pushed or merged"
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return []
+        out = []
+        now = time.time()
+        for path in sorted(p.worktrees.iterdir()):
+            m = re.fullmatch(r"t(\d+)", path.name)
+            task = p.db.task(int(m.group(1))) if m else None
+            if (not task or task["status"] not in TERMINAL_TASK_STATES or not is_git(path)
+                    or now - float(task["updated"] or now) < older_than_s or skip(task)
+                    or p.db.one("SELECT id FROM runs WHERE task=? AND status='running' LIMIT 1", (task["id"],))):
+                continue
+            res = {"task": task["id"], "path": str(path), "branch": task["branch"], "status": task["status"],
+                   "updated": task["updated"]}
+            try:
+                res["cleared"] = clear_caches(path, names)
+                res["why"] = keep_reason(path)
+                if res["why"] is None:
+                    remove(p, task["id"])
+            except Exception as e:
+                res["why"] = f"error: {e}"[:300]
+            out.append(res)
+        return out
+    finally:
+        os.close(fd)
 
 
 def has_changes(path: Path, since_ref: str) -> bool:

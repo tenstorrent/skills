@@ -67,9 +67,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "jev": {"enabled": "auto"},
     "web": {"bind": "127.0.0.1", "port": 0},
     "power": {"keep_awake": "on_ac"},
-    # Below min_free_gb under the project folder no new worker starts. Worktrees of finished tasks
-    # are removed after worktree_retention_days, only when clean and pushed or merged (0 = never).
-    "disk": {"min_free_gb": 2, "worktree_retention_days": 7},
+    # Disk guard: with free space under the project folder below the smaller of min_free_pct of the
+    # disk and min_free_gb (either 0 = off), only question and plan tasks start. Finished tasks'
+    # worktrees lose their cache_dirs (null = the built-in list) and are removed once clean with
+    # HEAD on a branch, worktree_retention_days after the task ended. Branches are never deleted.
+    "disk": {"min_free_pct": 5, "min_free_gb": 150, "worktree_retention_days": 0, "cache_dirs": None},
     "screen": {"wake_min_severity": "normal"},
 }
 

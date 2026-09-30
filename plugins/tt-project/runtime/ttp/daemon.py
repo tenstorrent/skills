@@ -49,6 +49,10 @@ PROBE_EVERY_S = 180     # how often a waiting task's `retry_when` probe runs
 PROBE_TIMEOUT_S = 60
 ORPHAN_GRACE_S = 10     # TERM to KILL for an agent whose supervisor died
 HANDOFF_STATES = ("done", "blocked", "failed", "needs_review", "waiting")
+DISK_LIGHT_KINDS = ("question", "plan")   # the only task kinds that still start under the disk guard
+DISK_RESUME = 1.2        # the guard ends once free space is this many times its threshold
+DISK_FLOOR_GB = 2        # below this even questions and plans wait
+KEEP_RECHECK_S = 6 * 3600   # a finished task's kept worktree is looked at again this often
 
 
 def log(p: Project, msg: str) -> None:
@@ -79,7 +83,10 @@ class Daemon:
         self._started = time.time()
         self._healthy = False
         self._last_prune = 0.0
-        self._disk_low: bool | None = None   # unknown until checked
+        self._pruned_upto = 0.0   # the latest finish the last worktree sweep saw
+        self._kept: dict[int, tuple[float, float, str]] = {}   # task id -> (task updated, checked, why kept)
+        self._disk_low = bool(self.p.db.kv("disk_low"))   # an episode outlives a restart: no second alert
+        self._disk_free: float | None = None
         self._tick_errors = 0
         self._probes: dict[int, tuple[subprocess.Popen, float]] = {}
         self._probed: dict[int, float] = {}
@@ -199,6 +206,7 @@ class Daemon:
         self.meter_running()
         self.reconcile_tasks()
         self.prune_worktrees()
+        self.check_disk()
         if self.p.db.kv("paused", False):
             return
         self._refresh_meters()
@@ -1168,14 +1176,13 @@ class Daemon:
                        "GROUP BY provider")
         busy = {r["provider"]: r["n"] for r in running}
         ready = db.ready_tasks()
-        if ready and not self._disk_ok():
-            for task in ready:
-                self._unreserve(task)
-            return
+        self.check_disk()
         committed = None    # what running work under the dollar caps may still spend
         reached = set()     # tasks that got past the gates to the resource check
         paused = db.paused_resources()
         for task in ready:
+            if self._disk_holds(task):
+                continue
             # A paused resource holds its tasks in the queue, attempts untouched, until it resumes.
             hit = sorted(coord.task_resources(task) & paused.keys())
             note = task["blocked_reason"] or ""
@@ -1264,54 +1271,95 @@ class Daemon:
         return all(not cap or spent + usd <= cap for spent, cap in (
             (n.get("spent_24h", 0), n.get("daily_cap")), (n.get("spent_7d", 0), n.get("weekly_cap"))))
 
-    def _disk_ok(self) -> bool:
-        """A full disk corrupts state and fails runs half way, so below `disk.min_free_gb` under the
-        project folder no new worker starts. Running work, coordinator turns and replies continue."""
-        need = float(self.cfg.get("disk", {}).get("min_free_gb", 2)) * 1e9
-        low = None
-        for path in {self.p.base.resolve(), self.p.worktrees.resolve()} if need > 0 else ():
+    def check_disk(self) -> None:
+        """The disk guard. Free space under the project folder and its worktrees below the smaller of
+        `disk.min_free_pct` of the disk and `disk.min_free_gb` (either at 0 turns it off) holds new
+        tasks that may build or check out code; see _disk_holds. One high alert per episode, which ends
+        once free space is back above DISK_RESUME times the threshold, so a disk hovering at the
+        line does not flap. The episode is kept in the database: a restart neither re-alerts nor forgets it."""
+        cfg = self.cfg.get("disk", {})
+        pct, gb = float(cfg.get("min_free_pct", 5) or 0), float(cfg.get("min_free_gb", 150) or 0)
+        worst = None   # (margin, path, free, total, threshold)
+        for path in {self.p.base.resolve(), self.p.worktrees.resolve()}:
             try:
-                free = shutil.disk_usage(path).free
+                u = shutil.disk_usage(path)
             except OSError:
                 continue
-            if free < need:
-                low = (path, free)
-        if bool(low) != self._disk_low:
-            if low or self._disk_low:
-                log(self.p, f"disk low: {low[1] / 1e9:.1f} GB free under {low[0]}; no new worker runs" if low
-                    else "disk space ok again")
-            self.p.db.set_kv("disk_low", {"path": str(low[0]), "free_gb": round(low[1] / 1e9, 1)} if low else None)
-        self._disk_low = bool(low)
-        if low:
-            self.alert("disk", f"Only {low[1] / 1e9:.1f} GB free under {low[0]} (minimum {need / 1e9:g} GB). No new "
-                       f"worker runs start until space is freed; running work and replies continue. Finished "
-                       f"tasks' worktrees are removed after `disk.worktree_retention_days` once pushed.", "high",
-                       every_s=24 * 3600)
-        return not low
-
-    def prune_worktrees(self, every_s: float = 3600) -> None:
-        """Remove worktrees of tasks finished more than `disk.worktree_retention_days` ago, only when
-        removing loses nothing (see worktree.keep_reason). Branches are never deleted."""
+            need = min(pct / 100 * u.total, gb * 1e9)
+            margin = u.free - need * (DISK_RESUME if self._disk_low else 1)
+            if worst is None or margin < worst[0]:
+                worst = (margin, path, u.free, u.total, need)
+        if worst is None:
+            return
+        _, path, free, total, need = worst
+        self._disk_free = free
+        low = need > 0 and worst[0] < 0
         now = time.time()
-        if now - self._last_prune < every_s or not self.p.worktrees.is_dir():
+        db = self.p.db
+        info = {"path": str(path), "free_gb": round(free / 1e9, 1), "total_gb": round(total / 1e9, 1),
+                "threshold_gb": round(need / 1e9, 1), "resume_gb": round(need * DISK_RESUME / 1e9, 1), "low": low,
+                "checked": now}
+        last = db.kv("disk") or {}
+        if (low != last.get("low") or abs(info["free_gb"] - float(last.get("free_gb") or 0)) >= 1
+                or now - float(last.get("checked") or 0) > 600):
+            db.set_kv("disk", info)
+        if low == self._disk_low:
             return
-        self._last_prune = now
-        days = float(self.cfg.get("disk", {}).get("worktree_retention_days", 7))
-        if days <= 0:
+        self._disk_low = low
+        if low:
+            db.set_kv("disk_low", {"path": str(path), "free_gb": info["free_gb"], "threshold_gb": info["threshold_gb"],
+                                   "since": now})
+            log(self.p, f"disk low: {free / 1e9:.1f} GB free under {path} (guard {need / 1e9:.1f} GB); "
+                        f"only questions and plans start")
+            self.alert("disk", f"Only {free / 1e9:.1f} GB free under {path} (guard: {need / 1e9:.0f} GB, the smaller "
+                               f"of {pct:g}% of the disk and {gb:g} GB). New tasks other than questions and plans "
+                               f"are held until {need * DISK_RESUME / 1e9:.0f} GB are free; running work, questions, plans "
+                               f"and replies continue. Finished tasks' worktrees are removed as they end; "
+                               f"`ttp prune {self.p.name}` sweeps now and lists the ones kept.", "high", every_s=0)
+        else:
+            db.set_kv("disk_low", None)
+            log(self.p, f"disk space ok again: {free / 1e9:.1f} GB free under {path}")
+
+    def _disk_holds(self, task: dict) -> bool:
+        """Under the disk guard, tasks that may check out, build or test code (all but questions and
+        plans) wait in the queue, attempts untouched. Questions and plans still run, so the coordinator can look into it, but not when
+        the disk is nearly full: that would corrupt state and fail runs half way."""
+        if not self._disk_low:
+            return False
+        return task["kind"] not in DISK_LIGHT_KINDS or (self._disk_free or 0) < DISK_FLOOR_GB * 1e9
+
+    def prune_worktrees(self, every_s: float = 300) -> None:
+        """Tidy finished tasks' worktrees (worktree.sweep) soon after they end: every `every_s`, and
+        at once when a task finished since the last sweep. `disk.worktree_retention_days` delays
+        removal (0, the default, removes right away). A worktree kept for a reason is checked again
+        when its task changes or after KEEP_RECHECK_S. Branches are never deleted."""
+        now = time.time()
+        latest = self.p.db.one("SELECT MAX(updated) m FROM tasks WHERE status IN (%s)"
+                               % ",".join("?" * len(TERMINAL_TASK_STATES)), TERMINAL_TASK_STATES)["m"] or 0
+        if (now - self._last_prune < every_s and latest <= self._pruned_upto) or not self.p.worktrees.is_dir():
             return
-        for path in sorted(self.p.worktrees.iterdir()):
-            m = re.fullmatch(r"t(\d+)", path.name)
-            task = self.p.db.task(int(m.group(1))) if m else None
-            if not task or task["status"] not in TERMINAL_TASK_STATES or now - float(task["updated"] or now) < days * 86400:
-                continue
-            try:
-                why = worktree.keep_reason(self.p, path)
-                if why is None:
-                    worktree.remove(self.p, task["id"])
-                    log(self.p, f"worktree {path} of task {task['id']} ({task['status']}) removed; "
-                                f"branch {task['branch'] or '?'} kept")
-            except Exception as e:
-                log(self.p, f"worktree {path} not removed: {e}")
+        self._last_prune, self._pruned_upto = now, latest
+        cfg = self.cfg.get("disk", {})
+        days = float(cfg.get("worktree_retention_days", 0) or 0)
+
+        def recent(task: dict) -> bool:
+            memo = self._kept.get(task["id"])
+            return bool(memo) and memo[0] == task["updated"] and now - memo[1] < KEEP_RECHECK_S
+        for r in worktree.sweep(self.p, older_than_s=days * 86400, names=cfg.get("cache_dirs"), skip=recent):
+            if r["cleared"]:
+                log(self.p, f"worktree {r['path']} of task {r['task']}: removed {', '.join(r['cleared'][:10])}")
+            if r["why"] is None:
+                self._kept.pop(r["task"], None)
+                log(self.p, f"worktree {r['path']} of task {r['task']} ({r['status']}) removed; "
+                            f"branch {r['branch'] or '?'} kept")
+            else:
+                if r["task"] not in self._kept:
+                    log(self.p, f"worktree {r['path']} of task {r['task']} kept: {r['why']}")
+                self._kept[r["task"]] = (r["updated"], now, r["why"])
+        kept = {str(t): why for t, (_, _, why) in sorted(self._kept.items())
+                if (self.p.worktrees / f"t{t}").exists()}
+        if kept != (self.p.db.kv("worktrees_kept") or {}):
+            self.p.db.set_kv("worktrees_kept", kept or None)
 
     def probe_waiting(self) -> None:
         """A waiting task may name a shell probe (`retry_when`) for the thing it waits on. The probe

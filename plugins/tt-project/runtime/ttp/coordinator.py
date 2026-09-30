@@ -155,6 +155,16 @@ def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int]) ->
         at_each = "; ".join(f"{time.strftime('%H:%M', time.localtime(x['ts']))} "
                             f"{', '.join(x.get('held') or []) or 'nothing'}" for x in boots)
         lines.append(f"## Host: {host_line(boots)[len('host: '):]}; held at each: {clip(at_each, 600)}")
+    disk = db.kv("disk")
+    if disk:
+        low = db.kv("disk_low")
+        guard = (f"LOW since {(now - float(low.get('since') or now)) / 3600:.1f}h: only question and plan tasks start "
+                 f"until {disk.get('resume_gb')} GB are free; free space before queueing code work"
+                 if low else f"ok (guard below {disk.get('threshold_gb')} GB)")
+        kept = db.kv("worktrees_kept") or {}
+        held = ("; finished tasks' worktrees kept: " + clip(", ".join(f"#{t} ({why})" for t, why in kept.items()), 400)
+                if kept else "")
+        lines.append(f"## Disk: {disk.get('free_gb')} GB free of {disk.get('total_gb')} GB; {guard}{held}")
     paused = db.paused_resources()
     if paused:
         lines.append("## Paused resources (tasks using one are not dispatched; `ttp lock` refuses it)")

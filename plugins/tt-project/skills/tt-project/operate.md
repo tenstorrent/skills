@@ -34,8 +34,13 @@
 - Daemon not running (or "stuck": up but not completing ticks) → `ttp restart <name>`; still down →
   `ttp logs <name>`.
 - Only one daemon runs per project (a lock file), whatever starts it.
-- Low disk (`disk.min_free_gb`, default 2) → no new worker starts; one alert. Worktrees of tasks
-  finished more than `disk.worktree_retention_days` (7) ago are removed when clean and pushed or
-  merged. Branches are never deleted.
+- Disk guard: free space under the project folder below the smaller of `disk.min_free_pct` (5) of
+  the disk and `disk.min_free_gb` (150) → only question and plan tasks start; running work goes on;
+  one high alert per episode, cleared once free space is 1.2× the threshold. Status, the web app and
+  the coordinator's digest show free space.
+- When a task ends (done, failed, cancelled), its worktree loses its build and cache directories
+  (`disk.cache_dirs`) and is removed once clean with HEAD on a branch. Branches are never deleted,
+  so `continues` still starts from the old commits. A dirty worktree is kept and listed.
+  `ttp prune <name>` sweeps now.
 - Coordinator failing repeatedly → an alert says so; messages are kept, not lost.
 - A worker that produces nothing for too long is stopped and retried (stall guard).

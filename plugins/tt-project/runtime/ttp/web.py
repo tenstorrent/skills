@@ -184,7 +184,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
     g = gates.get(core) or {}
     disk = db.kv("disk_low")
     if disk:
-        stops.append(f"disk is low ({disk['free_gb']} GB free), so no new worker runs start")
+        stops.append(f"disk is low ({disk['free_gb']} GB free), so only questions and plans start")
     you = ("waiting on you: " + ", ".join(x for x in (f"{blocked} blocked task(s)" if blocked else "",
                                                      f"{len(asks)} open question(s)" if asks else "") if x)
            if blocked or asks else "")
@@ -291,6 +291,7 @@ def state_payload(p: Project, db: DB) -> dict:
         "daemon": db.kv("daemon", {}), "paused": db.kv("paused", False),
         "gates": {k: {**g, "detail": gate_detail(g, now)} for k, g in db.kv("gates", {}).items()},
         "heartbeat": heartbeat(p), "heartbeat_stale_s": HEARTBEAT_STALE_S, "disk_low": db.kv("disk_low"),
+        "disk": db.kv("disk"), "worktrees_kept": db.kv("worktrees_kept"),
         "tasks": tasks, "runs": runs,
         "issues": db.q("SELECT id,source,title,severity,status,count,first_seen,last_seen,task FROM issues "
                        "WHERE status IN ('open','tracking') ORDER BY last_seen DESC LIMIT 100"),
