@@ -878,3 +878,76 @@ def test_a_run_without_a_handoff_is_retried_not_done(env, monkeypatch):
 
 def load_result_summary(task) -> str:
     return json.loads(task["result"] or "{}").get("summary", "")
+
+
+def test_web_cannot_requeue_a_running_task(env, tmp_path):
+    p = make(env)
+    from ttp import web
+    port = web.free_port(19800)
+    p.set_config("web.port", port)
+    tid = p.db.add_task("long job", "spec", kind="work", tier="light", origin="user")
+    p.db.update_task(tid, status="running")
+    p.db.x("INSERT INTO runs(task,role,provider,started,status,dir,boot_id) VALUES(?,?,?,?,?,?,?)",
+           (tid, "worker", "fake", time.time(), "running", str(tmp_path), "x"))
+
+    class Stub:
+        pass
+    stub = Stub()
+    stub.p = p
+    threading.Thread(target=web.serve, args=(stub,), daemon=True).start()
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/api/task/{tid}", method="POST",
+                                 data=json.dumps({"status": "queued"}).encode(),
+                                 headers={"X-TTP-Token": web.token(p), "Content-Type": "application/json"})
+    for _ in range(50):
+        try:
+            urllib.request.urlopen(req, timeout=2)
+            code = 200
+            break
+        except urllib.error.HTTPError as e:
+            code = e.code
+            break
+        except OSError:
+            time.sleep(0.1)
+    assert code == 409
+    assert p.db.task(tid)["status"] == "running", "a second run of the same task could start"
+    p.db.update_task(tid, status="failed")
+    urllib.request.urlopen(req, timeout=2)
+    assert p.db.task(tid)["status"] == "queued"
+
+
+def test_harness_commits_wait_until_the_run_end_is_saved(env, tmp_path, monkeypatch):
+    p = make(env)
+    from ttp import project as proj
+    from ttp.daemon import Daemon
+    from ttp.db import DB
+    d = Daemon(p.base)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "output.jsonl").write_text(json.dumps({"actions": [
+        {"type": "memory_add", "text": "Prefer the p100 boards for quick checks."},
+        {"type": "charter_update", "section": "Policies", "text": "Label every number with its board."}]}))
+    (run_dir / "exit.json").write_text(json.dumps({"rc": 0, "ended": time.time()}))
+    p.db.x("INSERT INTO runs(task,role,provider,started,status,dir,boot_id,note) VALUES(?,?,?,?,?,?,?,?)",
+           (None, "coordinator", "fake", time.time(), "running", str(run_dir), d.boot, "{}"))
+    real_run, seen = subprocess.run, []
+
+    def slow_git(argv, *a, **k):
+        if argv[0] == "git":
+            # A slow git must not hold the database: another writer gets in while it runs.
+            other = DB(p.state / "project.db")
+            other.conn.execute("PRAGMA busy_timeout=200")
+            try:
+                other.set_kv("probe", 1)
+                seen.append("free")
+            except Exception:
+                seen.append("locked")
+            finally:
+                other.close()
+            time.sleep(0.2)
+        return real_run(argv, *a, **k)
+    monkeypatch.setattr(proj.subprocess, "run", slow_git)
+    d.reap_runs()
+    assert seen and set(seen) == {"free"}, seen
+    log = subprocess.run(["git", "-C", str(p.harness), "log", "--format=%s", "-3"], capture_output=True,
+                         text=True).stdout
+    assert "memory (fact)" in log and "charter (policies)" in log

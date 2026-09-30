@@ -9,7 +9,7 @@ import sqlite3
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 SCHEMA_VERSION = 1
 
@@ -91,6 +91,7 @@ class DB:
         self.path = str(path)
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(self.path, timeout=30, isolation_level=None)
+        self._after_commit: list[Callable[[], Any]] = []
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA busy_timeout=30000")
@@ -124,9 +125,21 @@ class DB:
         try:
             yield
         except BaseException:
+            self._after_commit.clear()
             self.conn.execute("ROLLBACK")
             raise
         self.conn.execute("COMMIT")
+        pending, self._after_commit = self._after_commit, []
+        for fn in pending:
+            fn()
+
+    def after_commit(self, fn: Callable[[], Any]) -> None:
+        """Run fn once the open transaction commits, or now outside one. Slow side effects go here,
+        so they never hold the write lock that every other process is waiting on."""
+        if self.conn.in_transaction:
+            self._after_commit.append(fn)
+        else:
+            fn()
 
     def meta(self, key: str) -> str | None:
         r = self.one("SELECT value FROM meta WHERE key=?", (key,))

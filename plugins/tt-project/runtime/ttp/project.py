@@ -152,15 +152,19 @@ class Project:
         return self.raw_config().get("name", self.root.name)
 
     # memory -----------------------------------------------------------------------------------
-    def commit_harness(self, paths: list[Path], message: str) -> bool:
+    def commit_harness(self, paths: list[Path], message: str) -> None:
         """Commit just these harness files, so the project's history shows what it learned and when.
 
         Only the named paths are committed: a harness task may be editing other files right now,
-        and its half-done work must not be swept into this commit.
+        and its half-done work must not be swept into this commit. Inside a database transaction
+        the commit waits until the transaction ends, so git never holds the write lock.
         """
         rel = [str(Path(x).resolve().relative_to(self.harness.resolve())) for x in paths if Path(x).exists()]
         if not rel or not (self.harness / ".git").exists():
-            return False
+            return
+        self.db.after_commit(lambda: self._git_commit(rel, message))
+
+    def _git_commit(self, rel: list[str], message: str) -> bool:
         ident = ["-c", "user.name=tt-project", "-c", "user.email=tt-project@localhost"]
         try:
             subprocess.run(["git", "-C", str(self.harness), "add", "--", *rel], check=True, capture_output=True,

@@ -43,7 +43,7 @@ function taskRow(t) {
     ${["queued", "running", "blocked"].includes(t.status) ? `<button class="ghost" onclick="taskAct(${t.id},'cancelled')">Cancel</button>` : ""}
     ${["blocked", "failed"].includes(t.status) ? `<button class="ghost" onclick="taskAct(${t.id},'queued')">Retry</button>` : ""}</details>`;
 }
-window.taskAct = async (id, status) => { await api(`/api/task/${id}`, { status }); refresh(); };
+window.taskAct = async (id, status) => { const r = await api(`/api/task/${id}`, { status }); if (r.error) alert(r.error); refresh(); };
 
 function bars(el, rows, key, label, cap) {
   if (!rows.length) { el.innerHTML = `<p class="muted">No data yet.</p>`; return; }

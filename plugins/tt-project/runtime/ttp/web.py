@@ -171,12 +171,16 @@ class Handler(BaseHTTPRequestHandler):
                 t = db.task(tid)
                 if not t:
                     return self._send(404, {"error": "no task"})
-                if body.get("status") in ("cancelled", "queued"):
-                    db.update_task(tid, status=body["status"])
-                    if body["status"] == "cancelled":
-                        for r in db.q("SELECT dir FROM runs WHERE task=? AND status='running'", (tid,)):
-                            if r["dir"]:
-                                Path(r["dir"], "STOP").touch()
+                if body.get("status") == "queued":
+                    # One statement, so dispatch cannot start the task between a check and the write.
+                    if not db.conn.execute("UPDATE tasks SET status='queued', blocked_reason=NULL, updated=? "
+                                           "WHERE id=? AND status!='running'", (time.time(), tid)).rowcount:
+                        return self._send(409, {"error": f"task #{tid} is running: cancel it first"})
+                elif body.get("status") == "cancelled":
+                    db.update_task(tid, status="cancelled")
+                    for r in db.q("SELECT dir FROM runs WHERE task=? AND status='running'", (tid,)):
+                        if r["dir"]:
+                            Path(r["dir"], "STOP").touch()
                 if body.get("priority"):
                     db.update_task(tid, priority=int(body["priority"]))
                 return self._send(200, {"ok": True})
