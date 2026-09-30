@@ -41,10 +41,11 @@ def test_manifests_agree():
 
 def test_skills_are_discoverable_and_self_contained():
     skills = sorted(SKILLS.glob("*/SKILL.md"))
-    assert {p.parent.name for p in skills} == {"project", "harness"}
+    assert {p.parent.name for p in skills} == {"tt-project", "tt-project-harness"}
     for path in skills:
         fm = frontmatter(path)
         assert fm["name"] == path.parent.name
+        assert fm["name"].startswith("tt-"), f"{path}: skill names start with tt-"
         assert len(fm["description"]) > 40
     for md in SKILLS.rglob("*.md"):
         text = md.read_text(encoding="utf-8")

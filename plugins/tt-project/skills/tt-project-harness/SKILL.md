@@ -1,5 +1,5 @@
 ---
-name: harness
+name: tt-project-harness
 description: "Improve a tt-project's own harness — its coordinator and worker prompts, schedules, watchers, budget settings and web app — from measured friction, and take upstream template updates. Use for harness tasks, daily reviews, or when a project wastes money or time or needs the user too often."
 ---
 

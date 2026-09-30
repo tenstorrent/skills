@@ -6,9 +6,9 @@
 Add the optional `tt-project` plugin: long-running, self-driving projects that run locally or on
 an always-on box, with no hosted service.
 
-- `project`: start a named project from any chat, reconnect to it by name, relay messages to its
+- `tt-project`: start a named project from any chat, reconnect to it by name, relay messages to its
   coordinator, and get replies and alerts back in the chat.
-- `harness`: improve a project's own harness from measured friction; merge template updates.
+- `tt-project-harness`: improve a project's own harness from measured friction; merge template updates.
 
 Each project has a per-project daemon (standard-library Python), a coordinator that only decides,
 workers in isolated worktrees, file-based memory, schedules and model-free watchers, optional Jev

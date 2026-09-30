@@ -1,5 +1,5 @@
 ---
-name: project
+name: tt-project
 description: "Start, connect to, and talk with a long-running tt-project: a local, self-driving project with its own coordinator, workers, memory, budget guard and web app, running on this machine or an always-on box. Use when the user says tt-project, asks to start or connect to a project by name, or messages an existing project."
 ---
 

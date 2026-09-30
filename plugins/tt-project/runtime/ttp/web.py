@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """The project's web app: a JSON API plus a static single-page UI, served by the daemon.
 Bound to localhost by default and guarded by a per-project token; reach it from another machine
-through an SSH local forward (see the `project` skill's tunnels notes)."""
+through an SSH local forward (see the `tt-project` skill's tunnels notes)."""
 from __future__ import annotations
 
 import json
