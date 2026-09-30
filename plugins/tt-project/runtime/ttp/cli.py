@@ -423,22 +423,47 @@ def _listen_loop(p: Project, db, a, after: int, floor: str) -> None:
 
 
 def status_text(p: Project) -> str:
+    from .web import at, gate_detail, health
     db = p.db
+    state = daemon_state(p)
     gates = db.kv("gates", {})
+    h = health(p, db, alive=state == "running")
+    now = time.time()
     counts = {r["status"]: r["n"] for r in db.q("SELECT status, COUNT(*) n FROM tasks GROUP BY status")}
-    head = f"{p.name}: daemon {daemon_state(p)}" + (" (paused)" if db.kv("paused") else "")
+    head = f"{p.name}: daemon {state}" + (" (paused)" if db.kv("paused") else "")
     head += " · tasks: " + (", ".join(f"{k} {v}" for k, v in sorted(counts.items())) if counts else "none yet")
     lines = [head]
+    s = h["spend"]
+    top = f" · top 7d: {s['top_7d']['source']} ${s['top_7d']['usd']:.2f}" if s["top_7d"] else ""
+    lines.append(f"spend: ${s['spent_24h']:.2f} last 24h, ${s['spent_7d']:.2f} last 7d{top}")
     for prov, g in gates.items():
-        lines.append(f"budget {prov}: {g['level']}" + (f" — {'; '.join(g['reasons'])}" if g["reasons"] else ""))
+        lines.append(f"budget {prov}: {g['level']} · {gate_detail(g)}" + (f" — {'; '.join(g['reasons'])}" if g["reasons"] else ""))
+    c = h["coordinator"]
+    coord = "coordinator: no turn yet"
+    if c["last_turn"]:
+        coord = f"coordinator: last turn {int((now - c['last_turn']) // 60)} min ago" + (
+            f" ({c['last_status']})" if c["last_status"] else "")
+    if c["failures"]:
+        coord += f" · {c['failures']} failed in a row"
+    if c["backoff_until"]:
+        coord += f" · retry at {at(c['backoff_until'], now)}"
+    if c["idle_wake"]:
+        coord += f" · next idle check {at(c['idle_wake'], now)}"
+    lines.append(coord)
+    for pp in h["providers_paused"]:
+        lines.append(f"{pp['provider']} paused until {at(pp['until'], now)}: {pp['note']} — fix: {pp['fix']}")
+    if h["why_idle"]:
+        lines.append(f"idle: {h['why_idle']}")
     for t in db.q("SELECT id,title,status,blocked_reason FROM tasks WHERE status IN ('running','blocked','review') "
                   "ORDER BY status, id LIMIT 12"):
         lines.append(f"  #{t['id']} {t['status']}: {t['title']}" + (f" — {t['blocked_reason']}" if t["blocked_reason"] else ""))
     disk = db.kv("disk_low")
     if disk:
         lines.append(f"disk: only {disk['free_gb']} GB free under {disk['path']}; no new worker runs start")
-    for m in db.q("SELECT text FROM messages WHERE kind='ask' AND handled=0 AND ts>? ORDER BY id DESC LIMIT 5",
-                  (time.time() - 14 * 86400,)):
+    for t in h["waiting"][:5]:
+        why = re.sub(r";? *next try \S+$", "", t["blocked_reason"] or "").strip()
+        lines.append(f"  #{t['id']} waiting, next try {at(t['not_before'], now)}: {t['title']}" + (f" — {why}" if why else ""))
+    for m in h["asks"]:
         lines.append(f"  needs you: {m['text'][:200]}")
     return "\n".join(lines)
 

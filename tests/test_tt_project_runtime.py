@@ -509,6 +509,56 @@ def test_web_chat_shows_replies_to_every_chat(env):
     assert any(r["text"] == "question from a terminal" for r in rows)
 
 
+def test_status_shows_spend_waiting_retry_and_coordinator_health(env):
+    p = make(env)
+    from ttp.cli import status_text
+    from ttp.daemon import Daemon
+    now = time.time()
+    p.db.spend("fake", 3.5, "task:1")
+    p.db.spend("fake", 1.0, "coordinator")
+    Daemon(p.base).update_gates()
+    retry = now + 1800
+    p.db.add_task("measure on a board", "needs a board", kind="work", tier="light", origin="user",
+                  not_before=retry)
+    p.db.x("UPDATE tasks SET blocked_reason=? WHERE title='measure on a board'",
+           (f"waiting for a free board; next try {time.strftime('%H:%M', time.localtime(retry))}",))
+    p.db.set_kv("last_coordinator_turn", now - 300)
+    p.db.set_kv("coordinator_failures", 2)
+    p.db.set_kv("coordinator_backoff_until", now + 600)
+    p.db.set_kv("limited:fake", {"until": now + 900, "note": "logged out"})
+    p.db.post("out", "Which board should I use?", kind="ask", severity="high")
+    out = status_text(p)
+    lines = out.splitlines()
+    assert len(lines) <= 25, out
+    assert "spend: $4.50 last 24h, $4.50 last 7d · top 7d: task:1 $3.50" in out, out
+    assert "budget fake:" in out and "of $100 per 24h" in out, out
+    wait = [ln for ln in lines if "measure on a board" in ln]
+    assert wait and "waiting, next try" in wait[0] and wait[0].count("next try") == 1, out
+    assert "2 failed in a row" in out and "retry at" in out, out
+    assert "fake paused until" in out and "logged out" in out and "fix: log in" in out, out
+    idle = [ln for ln in lines if ln.startswith("idle: ")]
+    assert idle and "daemon is not running" in idle[0] and "waiting on you" in idle[0], out
+    assert "needs you: Which board should I use?" in out
+
+
+def test_web_payload_carries_coordinator_health_and_why_idle(env):
+    p = make(env)
+    from ttp.web import state_payload
+    now = time.time()
+    p.db.set_kv("last_coordinator_turn", now - 60)
+    h = state_payload(p, p.db)["health"]
+    assert h["coordinator"]["last_turn"] and h["coordinator"]["failures"] == 0
+    assert h["coordinator"]["idle_wake"] > now
+    assert h["why_idle"].startswith("nothing queued; the coordinator checks in at"), h
+    p.db.set_kv("limited:fake", {"until": now + 900, "note": "logged out"})
+    p.db.set_kv("coordinator_failures", 3)
+    h = state_payload(p, p.db)["health"]
+    assert h["coordinator"]["failures"] == 3
+    assert h["providers_paused"][0]["provider"] == "fake" and "log in" in h["providers_paused"][0]["fix"]
+    assert "fake is paused until" in h["why_idle"]
+    assert "spent_24h" in h["spend"]
+
+
 def _run_until(d, p, cond, timeout=60):
     deadline = time.time() + timeout
     while time.time() < deadline:

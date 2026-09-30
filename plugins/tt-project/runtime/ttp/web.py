@@ -45,6 +45,97 @@ def free_port(start: int = 18700) -> int:
     raise RuntimeError("no free port")
 
 
+DAY, WEEK = 86400, 7 * 86400
+FIXES = {"logged out": "log in once on the project's machine (for Claude Code: run `claude` there and use /login)"}
+
+
+def at(ts: float | None, now: float | None = None) -> str:
+    if not ts:
+        return "—"
+    return time.strftime("%H:%M" if abs(ts - (now or time.time())) < 20 * 3600 else "%a %H:%M", time.localtime(ts))
+
+
+def gate_detail(g: dict) -> str:
+    n = g.get("numbers") or {}
+    if g.get("regime") == "windows":
+        return f"{n.get('window')}: {n.get('utilization')}% of account used, project stops at {n.get('limit')}%"
+    est = f" (~${n['estimated_24h']:.2f} estimated)" if n.get("estimated_24h") else ""
+    return (f"${n.get('spent_24h', 0):.2f} of ${n.get('daily_cap', 0):.0f} per 24h{est}, "
+            f"${n.get('spent_7d', 0):.2f} of ${n.get('weekly_cap', 0):.0f} per 7d")
+
+
+def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> dict:
+    """Spend, coordinator health, waiting work and why nothing runs: what `ttp status` and the web
+    app's header show, so both answer "is it working, what is it costing, what is it waiting for"."""
+    now = now or time.time()
+    cfg = p.config()
+    c, core = cfg["coordinator"], cfg.get("core_provider", "claude")
+    gates = db.kv("gates", {})
+    last_turn = float(db.kv("last_coordinator_turn", 0))
+    backoff = float(db.kv("coordinator_backoff_until", 0))
+    last_run = db.one("SELECT status, ended FROM runs WHERE role='coordinator' AND status!='running' "
+                      "ORDER BY id DESC LIMIT 1")
+    paused_providers = []
+    for r in db.q("SELECT key, value FROM kv WHERE key LIKE 'limited:%'"):
+        v = json.loads(r["value"] or "{}")
+        if float(v.get("until") or 0) > now:
+            note = str(v.get("note") or "limit reached")
+            paused_providers.append({"provider": r["key"].split(":", 1)[1], "note": note, "until": v["until"],
+                                     "fix": FIXES.get(note, "resumes by itself when the limit resets")})
+    waiting = db.q("SELECT id, title, not_before, blocked_reason FROM tasks WHERE status='queued' AND not_before>? "
+                   "ORDER BY not_before", (now,))
+    queued = db.q("SELECT id, depends_on FROM tasks WHERE status='queued' AND (not_before IS NULL OR not_before<=?)",
+                  (now,))
+    ready = len(db.ready_tasks())
+    blocked = db.one("SELECT COUNT(*) n FROM tasks WHERE status='blocked'")["n"]
+    running = db.one("SELECT COUNT(*) n FROM runs WHERE status='running'")["n"]
+    asks = db.q("SELECT id, ts, text FROM messages WHERE kind='ask' AND handled=0 AND ts>? ORDER BY id DESC LIMIT 5",
+                (now - 14 * DAY,))
+    top = db.one("SELECT source, ROUND(SUM(usd),2) usd FROM ledger WHERE ts>=? GROUP BY source ORDER BY SUM(usd) DESC "
+                 "LIMIT 1", (now - WEEK,))
+    idle_wake = None
+    if last_turn and not waiting and not queued and not db.one("SELECT id FROM tasks WHERE status='running'"):
+        idle_wake = max(last_turn + float(c.get("idle_wake_s", 1800)), backoff, now)
+
+    why = []
+    if not alive:
+        why.append(f"the daemon is not running (`ttp restart {p.name}`)")
+    if db.kv("paused", False):
+        why.append(f"the project is paused (`ttp resume {p.name}` or the web app)")
+    for pp in paused_providers:
+        why.append(f"{pp['provider']} is paused until {at(pp['until'], now)}: {pp['note']}")
+    g = gates.get(core) or {}
+    if g.get("level") == "red":
+        why.append("budget is red: " + "; ".join(g.get("reasons") or []))
+    disk = db.kv("disk_low")
+    if disk:
+        why.append(f"disk is low ({disk['free_gb']} GB free), so no new worker runs start")
+    if backoff > now:
+        why.append(f"the coordinator is backing off after failed turns, next try {at(backoff, now)}")
+    if ready:
+        why.append(f"{ready} task(s) ready to start")
+    if waiting:
+        why.append(f"{len(waiting)} task(s) waiting, next try {at(waiting[0]['not_before'], now)}")
+    if len(queued) > ready:
+        why.append(f"{len(queued) - ready} queued task(s) wait on other tasks")
+    if blocked or asks:
+        why.append("waiting on you: " + ", ".join(x for x in (f"{blocked} blocked task(s)" if blocked else "",
+                                                              f"{len(asks)} open question(s)" if asks else "") if x))
+    if not why and idle_wake:
+        why.append(f"nothing queued; the coordinator checks in at {at(idle_wake, now)}")
+    return {
+        "spend": {"spent_24h": round(db.spent_since(now - DAY), 2), "spent_7d": round(db.spent_since(now - WEEK), 2),
+                  "top_7d": top if top and top["usd"] else None},
+        "coordinator": {"last_turn": last_turn or None, "last_status": last_run["status"] if last_run else None,
+                        "failures": int(db.kv("coordinator_failures", 0)),
+                        "backoff_until": backoff if backoff > now else None,
+                        "summary": (db.kv("last_coordinator_summary", {}) or {}).get("summary", ""),
+                        "idle_wake": idle_wake},
+        "providers_paused": paused_providers, "waiting": waiting, "asks": asks, "running": running,
+        "why_idle": "; ".join(why) if not running else "",
+    }
+
+
 def state_payload(p: Project, db: DB) -> dict:
     now = time.time()
     tasks = db.q("SELECT id,title,kind,status,priority,tier,provider,budget_usd,spent_usd,attempts,origin,branch,"
@@ -69,6 +160,7 @@ def state_payload(p: Project, db: DB) -> dict:
                           "AND severity IN ('high','critical') ORDER BY id DESC LIMIT 20", (now - 86400,)),
         "budget": bud.history(db),
         "coordinator": db.kv("last_coordinator_summary", {}),
+        "health": health(p, db, now=now),
         "accounts": db.q("SELECT provider, account, MAX(started) last FROM runs WHERE account IS NOT NULL "
                          "GROUP BY provider, account ORDER BY last DESC"),
         "now": now,
