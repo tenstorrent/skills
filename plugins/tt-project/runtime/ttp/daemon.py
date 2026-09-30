@@ -80,6 +80,7 @@ class Daemon:
         self._tick_errors = 0
         self._probes: dict[int, tuple[subprocess.Popen, float]] = {}
         self._probed: dict[int, float] = {}
+        self._reboot_told = False
 
     # lifecycle ------------------------------------------------------------------------------------
     def run(self) -> int:
@@ -292,6 +293,33 @@ class Daemon:
                 log(self.p, f"run {r['id']} reap error {n}: " + traceback.format_exc().replace("\n", " | ")[:2000])
                 if n >= 3:
                     self._abandon_run(r)
+        self._tell_reboot()
+
+    def _tell_reboot(self) -> None:
+        """Once per boot, after every run of an earlier boot is reaped: which runs the reboot cut
+        short, what they cost and what became of their tasks. A restart on the same boot says nothing."""
+        db = self.p.db
+        if self._reboot_told or db.one("SELECT COUNT(*) n FROM runs WHERE status='running' AND boot_id IS NOT NULL "
+                                       "AND boot_id!=?", (self.boot,))["n"]:
+            return
+        with db.tx():
+            self._reboot_told = True
+            if db.kv("reboot_told") == self.boot:
+                return
+            db.set_kv("reboot_told", self.boot)
+            lost = [r for r in db.q("SELECT id, task, role, cost_usd, note FROM runs WHERE status='lost' "
+                                    "AND boot_id!=? AND note LIKE ?", (self.boot, f"%{self.boot}%"))
+                    if json.loads(r["note"] or "{}").get("lost_to_reboot") == self.boot]
+            if not lost:
+                return
+            parts = []
+            for r in lost:
+                task = db.task(r["task"]) if r["task"] else None
+                parts.append(f"run {r['id']} (#{task['id']} {task['title'][:60]} → {task['status']})" if task
+                             else f"run {r['id']} ({r['role']})")
+            usd = sum(float(r["cost_usd"] or 0) for r in lost)
+            db.post("out", f"The host rebooted; {len(lost)} run(s) were cut short (${usd:.2f}): "
+                           f"{'; '.join(parts)}"[:3000], kind="alert", severity="normal", ref=f"reboot:{self.boot}")
 
     def _end_orphan(self, r: dict) -> None:
         """A supervisor that died (kill -9, OOM) leaves its agent running with no wall clock, budget
@@ -423,13 +451,21 @@ class Daemon:
         if stopped in ("timeout", "budget", "stopped", "lost", "stalled", "shutdown", "resource_busy"):
             status = stopped if stopped != "stopped" else "killed"
         cut_off = None
-        if status == "timeout" and r["role"] != "coordinator" and \
-                (_read_result(run_dir / RESULT_FILE) or {}).get("status") in HANDOFF_STATES:
+        handed_off = r["role"] != "coordinator" and \
+            (_read_result(run_dir / RESULT_FILE) or {}).get("status") in HANDOFF_STATES
+        if status == "timeout" and handed_off:
             cut_off, status = status, "ok"   # it handed off before the clock ran out: the work is done, not wasted
         if usage.limited:
             status = "limit"
         if usage.auth_failed:
             status = "auth"
+        note = json.loads(r["note"] or "{}")
+        # The runaway guard counts runs that ended without an outcome; a reboot or a hand-off that
+        # stands is an outcome, not a loop.
+        if status == "lost" and r["boot_id"] and r["boot_id"] != self.boot:
+            note.update(not_waste="reboot", lost_to_reboot=self.boot)
+        elif status in bud.WASTED and handed_off:
+            note["not_waste"] = "handoff"
         source = self._source_for(r)
         # Spend is booked at the run's end, not when the daemon gets to it: a run reaped after
         # downtime must not count toward the current hour. A stamp from the future is clamped.
@@ -438,10 +474,10 @@ class Daemon:
         # half way leaves the run "running", and the next tick processes it again from disk.
         with db.tx():
             db.x("UPDATE runs SET ended=?, status=?, exit_code=?, cost_usd=?, cost_estimated=?, input_tokens=?, "
-                 "output_tokens=?, cache_read_tokens=?, cache_write_tokens=? WHERE id=?",
+                 "output_tokens=?, cache_read_tokens=?, cache_write_tokens=?, note=? WHERE id=?",
                  (ended, status, exit_info.get("rc"), usage.cost_usd,
                   int(usage.estimated), usage.input_tokens, usage.output_tokens, usage.cache_read_tokens,
-                  usage.cache_write_tokens, r["id"]))
+                  usage.cache_write_tokens, json.dumps(note), r["id"]))
             db.spend(r["provider"], usage.cost_usd, source, account=r["account"] or "", estimated=usage.estimated,
                      tokens_in=usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens,
                      tokens_out=usage.output_tokens, ts=ended)
@@ -468,7 +504,6 @@ class Daemon:
                            f"{r['provider']} on {hostname()} is logged out ({(usage.final_text or usage.error)[:120]}). "
                            f"Log in once on that machine ({prov.login_hint}). "
                            f"Work resumes by itself; queued messages are kept.", "high", every_s=4 * 3600)
-            note = json.loads(r["note"] or "{}")
             if r["role"] == "coordinator":
                 self._finish_coordinator(r, usage, status, note)
             else:
@@ -1098,7 +1133,11 @@ class Daemon:
                 task = db.task(tid)
                 if task and task["status"] == "queued" and (task["not_before"] or 0) > now:
                     db.update_task(tid, not_before=now)
-                    log(self.p, f"task {tid} retry_when probe passed; dispatching")
+                    gate = self.gates.get(task["provider"] or self.cfg.get("core_provider", "claude"))
+                    held = gate and (not gate.allow_new_work or (task["origin"] in ("schedule", "harness")
+                                                                  and not gate.allow_optional))
+                    log(self.p, f"task {tid} retry_when probe passed; "
+                                f"{f'held by gate {gate.level}' if held else 'dispatching'}")
         for t in db.q("SELECT id, result FROM tasks WHERE status='queued' AND not_before>?", (now,)):
             prev = load_result(t["result"])
             probe = prev.get("retry_when")

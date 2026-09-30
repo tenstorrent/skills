@@ -15,6 +15,7 @@ A runaway check (spend rate far above this project's own norm) overrides both.
 """
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
@@ -98,6 +99,17 @@ def spent_last_hour(db: DB, provider: str, now: float) -> float:
 WASTED = ("failed", "stalled", "timeout", "lost", "budget", "no_handoff")
 
 
+def wasted(run: dict) -> bool:
+    """A run that ended without an outcome, unless the daemon found a cause other than a loop: the
+    host rebooted under it, or its hand-off stood. Its spend still counts everywhere else."""
+    if run["status"] not in WASTED:
+        return False
+    try:
+        return not (json.loads(run["note"] or "{}") or {}).get("not_waste")
+    except (TypeError, ValueError, AttributeError):
+        return True
+
+
 def _peak_tasks(spans: list, now: float) -> int:
     """Most distinct tasks whose given runs (task, started, ended) were going at the same moment.
     Runs without a task count as one."""
@@ -158,15 +170,16 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
             _raise(g, "yellow", f"{ratio:.0%} of cap used")
 
     # Runaway guard: catch loops, not busy projects. Three signals over the last hour:
-    # - waste: spend on runs that ended without an outcome (failed, stalled, timed out, lost);
+    # - waste: spend on runs that ended without an outcome (failed, stalled, timed out, lost), except
+    #   runs a reboot cut short or whose hand-off stood;
     # - thrash: coordinator spend (decisions should be cents; dollars mean it is spinning);
     # - total: all spend above max(k x this project's 7-day hourly norm, a floor sized to the
     #   parallel work it is allowed), so even "successful" repetition is bounded.
     hour_ago = now - HOUR
     last_h = spent_last_hour(db, provider, now)
-    runs_h = db.q("SELECT role, status, cost_usd FROM runs WHERE provider=? AND ended>=?", (provider, hour_ago))
+    runs_h = db.q("SELECT role, status, cost_usd, note FROM runs WHERE provider=? AND ended>=?", (provider, hour_ago))
     # A run stopped on purpose (a cancel, a pause, a redirect) is a decision, not waste.
-    waste = sum(float(r["cost_usd"] or 0) for r in runs_h if r["status"] in WASTED)
+    waste = sum(float(r["cost_usd"] or 0) for r in runs_h if wasted(r))
     thrash = sum(float(r["cost_usd"] or 0) for r in runs_h if r["role"] == "coordinator")
     norm = db.spent_since(now - WEEK, provider) / (7 * 24)
     per_task = max((b.get("task_default_usd") or {"deep": 25.0}).values())
@@ -175,8 +188,9 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
     # The waste limit is per worker: parallel workers each losing a run (a shared device kept them
     # all waiting) are not a loop. Workers are the most tasks whose wasted runs went at once, so one
     # task failing over and over, or new tasks failing one after another, count as one worker.
-    spans = db.q(f"SELECT task, started, ended FROM runs WHERE provider=? AND role!='coordinator' AND ended>=? "
-                 f"AND status IN ({','.join('?' * len(WASTED))})", (provider, hour_ago, *WASTED))
+    spans = [r for r in db.q(f"SELECT task, started, ended, status, note FROM runs WHERE provider=? "
+                             f"AND role!='coordinator' AND ended>=? AND status IN ({','.join('?' * len(WASTED))})",
+                             (provider, hour_ago, *WASTED)) if wasted(r)]
     workers = min(max(_peak_tasks(spans, now), 1), max(int(b.get("max_parallel_workers", 6)), 1))
     waste_cap = float(b.get("hourly_waste_usd", 8.0)) * workers
     thrash_cap = float(b.get("hourly_coordinator_usd", 4.0))

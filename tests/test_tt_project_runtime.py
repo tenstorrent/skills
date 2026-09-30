@@ -3944,3 +3944,93 @@ def test_push_checks_accept_the_forms_config_set_sends():
 def test_the_review_prompt_pushes_only_through_the_guarded_push():
     text = (RUNTIME.parent / "template" / "prompts" / "kind-review.md").read_text()
     assert "`ttp push`" in text and "NEVER use `git push` directly" in text
+
+
+def _lost_deep_runs(p, tmp_path, boot, costs=(24.0, 29.0), handoff=None):
+    """Deep runs of different tasks whose supervisors vanished ten minutes ago, as the reaper finds them."""
+    now = time.time()
+    tids, rids = [], []
+    for i, cost in enumerate(costs):
+        tid = p.db.add_task(f"deep job {i}", "s", kind="work", tier="deep", origin="user")
+        p.db.update_task(tid, status="running")
+        run_dir = tmp_path / f"lost{i}"
+        run_dir.mkdir()
+        (run_dir / "output.jsonl").write_text(json.dumps({"_cost": cost}))
+        if handoff:
+            (run_dir / "result.json").write_text(json.dumps(handoff))
+        (run_dir / "lease").touch()
+        for name in ("lease", "output.jsonl"):
+            os.utime(run_dir / name, (now - 600, now - 600))
+        rids.append(p.db.x("INSERT INTO runs(task,role,provider,started,status,dir,boot_id) VALUES(?,?,?,?,?,?,?)",
+                           (tid, "worker", "fake", now - 1800, "running", str(run_dir), boot)))
+        tids.append(tid)
+    return tids, rids
+
+
+def _reboot_notices(p):
+    return p.db.q("SELECT text, severity FROM messages WHERE direction='out' AND ref LIKE 'reboot:%'")
+
+
+def test_runs_lost_to_a_reboot_are_not_runaway_waste_and_are_announced_once(env, tmp_path):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    tids, rids = _lost_deep_runs(p, tmp_path, "an-earlier-boot")
+    nxt = p.db.add_task("next", "s", kind="work", tier="light", origin="user")
+    d.tick()
+    g = d.gates["fake"]
+    assert g.level != "red" and g.numbers["waste_1h"] == 0, g.reasons
+    # The spend is real: it still counts toward the caps and the tasks' budgets.
+    assert g.numbers["spent_24h"] >= 53.0, g.numbers
+    assert [p.db.task(t)["spent_usd"] for t in tids] == [24.0, 29.0]
+    assert all(p.db.task(t)["status"] == "queued" for t in tids)
+    assert p.db.q("SELECT id FROM runs WHERE task=?", (nxt,)), "the gate held a queued task after a reboot"
+    for _ in range(2):
+        d.tick()
+    Daemon(p.base).tick()   # a plain restart on the same boot says nothing new
+    notes = _reboot_notices(p)
+    assert len(notes) == 1 and notes[0]["severity"] == "normal", notes
+    text = notes[0]["text"]
+    assert "$53.00" in text and all(f"run {r}" in text for r in rids) and "queued" in text, text
+
+
+def test_runs_lost_on_the_same_boot_still_trip_the_runaway_guard(env, tmp_path):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    _lost_deep_runs(p, tmp_path, d.boot)
+    nxt = p.db.add_task("next", "s", kind="work", tier="light", origin="user")
+    d.tick()
+    g = d.gates["fake"]
+    assert g.level == "red" and any("failed or stalled" in r for r in g.reasons), g.reasons
+    assert not p.db.q("SELECT id FROM runs WHERE task=?", (nxt,))
+    assert not _reboot_notices(p)
+
+
+def test_a_lost_run_whose_hand_off_stood_is_not_runaway_waste(env, tmp_path):
+    p = make(env)
+    from ttp import budget as bud
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    tids, _ = _lost_deep_runs(p, tmp_path, d.boot, handoff={"status": "done", "summary": "measured"})
+    d.reap_runs()
+    assert all(p.db.task(t)["status"] == "done" for t in tids)
+    g = bud.evaluate(p.db, p.config(), "fake", [])
+    assert g.level != "red" and g.numbers["waste_1h"] == 0, g.reasons
+
+
+def test_a_passed_probe_held_by_the_gate_is_logged_as_held(env, monkeypatch):
+    p = make(env)
+    from ttp import budget as bud
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    tid = p.db.add_task("measure", "s", kind="work", tier="light", origin="user",
+                        not_before=time.time() + 3600)
+    p.db.update_task(tid, result=json.dumps({"status": "waiting", "retry_when": "true"}))
+    d.gates["fake"] = bud.Gate(provider="fake", level="red", allow_new_work=False)
+    d.probe_waiting()
+    d._probes[tid][0].wait(10)
+    d.probe_waiting()
+    logged = (p.logs / "daemon.log").read_text()
+    assert f"task {tid} retry_when probe passed; held by gate red" in logged, logged[-500:]
