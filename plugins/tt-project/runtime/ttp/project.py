@@ -48,6 +48,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # own observed rate; until there is one, this $ per million weighted tokens (set high).
         "estimate_usd_per_mtok": 15.0,
     },
+    # A waiting task whose `retry_when` probe still says "not yet" sleeps on, but wakes this long
+    # after its hand-off whatever the probe says.
+    "waiting": {"max_hold_s": 21600},
     "resources": {},                    # shared-slot limits, e.g. {"device": 1}
     "coordinator": {"tier": "light", "debounce_s": 15, "max_events_per_turn": 40,
                     "max_turns_per_hour": 30, "max_new_tasks_per_day": 200, "idle_wake_s": 3600,

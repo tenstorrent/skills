@@ -18,7 +18,7 @@ from typing import Any
 
 from . import push
 from . import schedule as sched
-from .db import SEVERITY_RANK, TERMINAL_TASK_STATES, continues_id, dependency_ids, load_result
+from .db import SEVERITY_RANK, TERMINAL_TASK_STATES, continues_id, dependency_ids, dump_result, load_result
 from .project import Project
 from .runner import stop_runs
 
@@ -294,6 +294,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     upd["status"] = a["status"]
                     if a["status"] == "queued":
                         upd["blocked_reason"] = None
+                        prev = load_result(task["result"])
+                        if task["status"] != "queued" and "waiting_since" in prev:
+                            # A requeue is a decision to run it, not to sleep on its probe.
+                            prev.pop("waiting_since")
+                            upd["result"] = dump_result(prev)
                 if a.get("depends_on") is not None:
                     deps = _new_dependencies(db, task, a["depends_on"])
                     upd["depends_on"] = deps

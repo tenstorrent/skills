@@ -3058,6 +3058,7 @@ def test_a_waiting_task_runs_only_once_its_probe_passes(env, monkeypatch, tmp_pa
         d.tick()
         time.sleep(0.2)
     assert runs() == 1 and d._probed.get(tid), "the task ran while its probe was failing, or never probed"
+    assert json.loads(p.db.task(tid)["result"])["waiting_since"] > time.time() - 120
     monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps({"status": "done", "summary": "measured"}))
     flag.write_text("")
     assert _run_until(d, p, lambda: p.db.task(tid)["status"] == "done", timeout=30)
@@ -4831,3 +4832,132 @@ def test_cursor_credential_file_follows_xdg_config_home(monkeypatch, tmp_path):
     monkeypatch.delenv("XDG_CONFIG_HOME")
     monkeypatch.setenv("HOME", str(tmp_path))
     assert cursor.credential_files() == [str(tmp_path / ".config" / "cursor" / "auth.json")]
+
+
+def _due_waiting_task(p, probe, since_ago=600.0, **extra):
+    now = time.time()
+    tid = p.db.add_task("measure", "s", kind="work", tier="light", origin="user", not_before=now - 1)
+    p.db.update_task(tid, result=json.dumps({"status": "waiting", "summary": "board busy", "waiting_for": "a board",
+                                             "retry_after_s": 900, "retry_when": probe,
+                                             "waiting_since": now - since_ago, **extra}))
+    return tid
+
+
+def _settle_probe(d, tid):
+    d.probe_waiting()
+    if tid in d._probes:
+        d._probes[tid][0].wait(10)
+        d.probe_waiting()
+
+
+def _ready(p, tid):
+    return tid in [t["id"] for t in p.db.ready_tasks()]
+
+
+def test_a_due_waiting_task_sleeps_on_while_its_probe_says_not_yet(env):
+    p = make(env)
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    tid = _due_waiting_task(p, "exit 1")
+    d.probe_waiting()
+    assert not _ready(p, tid) and tid in d._probes, "with no verdict yet it must ask the probe before waking"
+    d._probes[tid][0].wait(10)
+    d.probe_waiting()          # reaps the probe: exit 1
+    p.db.update_task(tid, not_before=time.time() - 1)
+    d.probe_waiting()          # due with a fresh "not yet": extended, not run
+    task = p.db.task(tid)
+    assert not _ready(p, tid) and task["not_before"] > time.time() + 800, task["not_before"] - time.time()
+    assert "probe says not yet" in task["blocked_reason"]
+    assert "woke" not in json.loads(task["result"])
+    assert f"task {tid} retry_when probe still failing" in (p.logs / "daemon.log").read_text()
+
+
+def test_a_waiting_task_wakes_when_its_probe_passes_and_says_so(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dmod
+    from ttp.prompts import worker_task
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    tid = _due_waiting_task(p, "true")
+    p.db.update_task(tid, not_before=time.time() + 3600)
+    _settle_probe(d, tid)
+    assert _ready(p, tid)
+    assert "Woken because: probe passed." in worker_task(p, p.db.task(tid), str(p.root), None)
+
+
+@pytest.mark.parametrize("probe, why", [("exit 127", "probe broken: exit 127"),
+                                        ("exit 2", "probe broken: exit 2")])
+def test_a_broken_probe_wakes_the_task_at_its_timer(env, probe, why):
+    p = make(env)
+    from ttp import daemon as dmod
+    from ttp.prompts import worker_task
+    d = dmod.Daemon(p.base)
+    tid = _due_waiting_task(p, probe)
+    _settle_probe(d, tid)
+    p.db.update_task(tid, not_before=time.time() - 1)
+    d.probe_waiting()
+    assert _ready(p, tid)
+    assert f"Woken because: {why}." in worker_task(p, p.db.task(tid), str(p.root), None)
+
+
+def test_a_timed_out_probe_is_broken(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_TIMEOUT_S", 0.2)
+    d = dmod.Daemon(p.base)
+    tid = _due_waiting_task(p, "sleep 30")
+    d.probe_waiting()
+    time.sleep(0.4)
+    d.probe_waiting()          # kills it: timeout
+    p.db.update_task(tid, not_before=time.time() - 1)
+    d.probe_waiting()
+    assert _ready(p, tid) and json.loads(p.db.task(tid)["result"])["woke"] == "probe broken: timeout"
+
+
+def test_a_waiting_task_wakes_at_the_hold_cap_whatever_its_probe_says(env):
+    p = make(env)
+    from ttp import daemon as dmod
+    from ttp.prompts import worker_task
+    d = dmod.Daemon(p.base)
+    tid = _due_waiting_task(p, "exit 1", since_ago=5.5 * 3600)
+    _settle_probe(d, tid)
+    p.db.update_task(tid, not_before=time.time() - 1)
+    d.probe_waiting()
+    left = p.db.task(tid)["not_before"] - time.time()
+    assert 0 < left <= 0.5 * 3600 + 5, "the extension must stop at the cap"
+    p.db.update_task(tid, result=json.dumps({**json.loads(p.db.task(tid)["result"]),
+                                             "waiting_since": time.time() - 6 * 3600 - 1}),
+                     not_before=time.time() - 1)
+    _settle_probe(d, tid)
+    assert _ready(p, tid)
+    assert "Woken because: held 6 h, probe still failing." in worker_task(p, p.db.task(tid), str(p.root), None)
+
+
+def test_a_waiting_task_without_a_probe_keeps_its_timer(env):
+    p = make(env)
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    tid = _due_waiting_task(p, None)
+    legacy = _due_waiting_task(p, "exit 1")   # a hand-off from before the hold
+    p.db.update_task(legacy, result=json.dumps({"status": "waiting", "retry_when": "exit 1"}))
+    d.probe_waiting()
+    assert _ready(p, tid) and _ready(p, legacy) and not d._probes
+
+
+def test_requeuing_a_blocked_waiting_task_runs_it_without_the_probe_hold(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    tid = _due_waiting_task(p, "exit 1")
+    p.db.update_task(tid, status="blocked")
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "status": "queued"}]) == []
+    d.probe_waiting()
+    assert _ready(p, tid) and not d._probes
+
+
+def test_worker_prompt_asks_for_a_probe_that_exits_0_whatever_the_outcome():
+    prompt = (RUNTIME.parent / "template" / "prompts" / "worker.md").read_text()
+    flat = " ".join(prompt.split())
+    assert "exit 0 once the wait is over whatever the outcome" in flat
+    assert "1 while it is not" in flat and "driver script" in flat

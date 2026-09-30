@@ -82,6 +82,7 @@ class Daemon:
         self._tick_errors = 0
         self._probes: dict[int, tuple[subprocess.Popen, float]] = {}
         self._probed: dict[int, float] = {}
+        self._probe_rc: dict[int, tuple[int | str, float]] = {}   # last verdict: exit code or why, when
         self._reboot_told = False
 
     # lifecycle ------------------------------------------------------------------------------------
@@ -719,17 +720,14 @@ class Daemon:
             if waits > int(self.cfg["budget"].get("max_waits", 24)):
                 new, reason = "blocked", f"still waiting after {waits} tries: {what}"
             else:
-                try:
-                    retry = min(max(float(result.get("retry_after_s") or 1800), 300.0), 6 * 3600.0)
-                except (TypeError, ValueError):
-                    retry = 1800.0
-                not_before = time.time() + retry
+                not_before = time.time() + _retry_s(result)
+                extra["waiting_since"] = time.time()
                 reason = f"waiting for {what}; next try {time.strftime('%H:%M', time.localtime(not_before))}"
         if ended:
             extra["run_status"] = ended
         upd = {"status": new, "attempts": attempts, "result": dump_result(
             {"summary": summary, "status": rstatus or status, **extra,
-             **({k: v for k, v in result.items() if k not in ("summary", "waits")}
+             **({k: v for k, v in result.items() if k not in ("summary", "waits", "waiting_since", "woke")}
                 if isinstance(result, dict) else {})})}
         if reason:
             upd["blocked_reason"] = reason[:500]
@@ -1215,8 +1213,11 @@ class Daemon:
 
     def probe_waiting(self) -> None:
         """A waiting task may name a shell probe (`retry_when`) for the thing it waits on. The probe
-        runs here, model-free and in the background; when it exits 0 the task is due at once, so no
-        worker run is spent finding out that the wait is not over. `retry_after_s` stays the fallback."""
+        runs here, model-free and in the background. Exit 0 makes the task due at once. When its
+        `retry_after_s` timer runs out while the probe still exits 1 ("not yet"), the task sleeps
+        another `retry_after_s` instead of spending a worker run to find that out. A broken probe
+        (any other exit, a timeout, a probe that cannot start) wakes it at its timer so a worker can
+        fix the probe, and `waiting.max_hold_s` after the hand-off it wakes whatever the probe says."""
         db, now = self.p.db, time.time()
         for tid, (proc, started) in list(self._probes.items()):
             rc = proc.poll()
@@ -1225,30 +1226,78 @@ class Daemon:
             del self._probes[tid]
             if rc is None:
                 _kill_group(proc)
-            elif rc == 0:
+            self._probe_rc[tid] = ("timeout" if rc is None else rc, now)
+            if rc == 0:
                 task = db.task(tid)
                 if task and task["status"] == "queued" and (task["not_before"] or 0) > now:
-                    db.update_task(tid, not_before=now)
-                    gate = self.gates.get(task["provider"] or self.cfg.get("core_provider", "claude"))
-                    held = gate and (not gate.allow_new_work or (task["origin"] in ("schedule", "harness")
-                                                                  and not gate.allow_optional))
-                    log(self.p, f"task {tid} retry_when probe passed; "
-                                f"{f'held by gate {gate.level}' if held else 'dispatching'}")
-        for t in db.q("SELECT id, result FROM tasks WHERE status='queued' AND not_before>?", (now,)):
+                    self._wake_waiting(task, "probe passed", now)
+        for t in db.q("SELECT * FROM tasks WHERE status='queued' AND not_before IS NOT NULL"):
             prev = load_result(t["result"])
             probe = prev.get("retry_when")
-            if (prev.get("status") != "waiting" or not isinstance(probe, str) or not probe.strip()
-                    or t["id"] in self._probes or now - self._probed.get(t["id"], 0) < PROBE_EVERY_S):
+            if prev.get("status") != "waiting" or not isinstance(probe, str) or not probe.strip():
                 continue
-            self._probed[t["id"]] = now
-            try:
-                proc = subprocess.Popen(probe, shell=True, cwd=str(self.p.root), stdin=subprocess.DEVNULL,
-                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                        start_new_session=True)
-            except OSError as e:
-                log(self.p, f"task {t['id']} retry_when probe could not start: {e}")
+            if t["not_before"] <= now:
+                # Hand-offs from before the hold, and tasks already woken, keep their timer.
+                if prev.get("woke") or not isinstance(prev.get("waiting_since"), (int, float)):
+                    continue
+                if not self._hold_waiting(t, prev, now):
+                    continue
+            elif t["id"] in self._probes or now - self._probed.get(t["id"], 0) < PROBE_EVERY_S:
                 continue
-            self._probes[t["id"]] = (proc, now)
+            self._start_probe(t["id"], probe, now)
+
+    def _start_probe(self, tid: int, probe: str, now: float) -> None:
+        self._probed[tid] = now
+        try:
+            proc = subprocess.Popen(probe, shell=True, cwd=str(self.p.root), stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                    start_new_session=True)
+        except OSError as e:
+            log(self.p, f"task {tid} retry_when probe could not start: {e}")
+            self._probe_rc[tid] = ("could not start", now)
+            return
+        self._probes[tid] = (proc, now)
+
+    def _hold_waiting(self, task: dict, prev: dict, now: float) -> bool:
+        """A waiting task whose timer ran out: wake it, or put it back to sleep while its probe says
+        "not yet". True when a probe must run before that can be decided."""
+        tid = task["id"]
+        max_hold = float((self.cfg.get("waiting") or {}).get("max_hold_s") or 6 * 3600)
+        since = float(prev["waiting_since"])
+        rc, at = self._probe_rc.get(tid, (None, 0.0))
+        fresh = at >= since and now - at <= 2 * PROBE_EVERY_S
+        if fresh and rc == 0:
+            self._wake_waiting(task, "probe passed", now)
+        elif fresh and rc != 1:
+            self._wake_waiting(task, f"probe broken: {rc if isinstance(rc, str) else f'exit {rc}'}", now)
+        elif now >= since + max_hold:
+            self._wake_waiting(task, f"held {max_hold / 3600:g} h, probe still failing", now)
+        elif fresh:
+            nb = min(now + _retry_s(prev), since + max_hold)
+            what = str(prev.get("waiting_for") or prev.get("summary") or "")[:300]
+            db = self.p.db
+            db.update_task(tid, not_before=nb, blocked_reason=(
+                f"waiting for {what}; its probe says not yet; next try "
+                f"{time.strftime('%H:%M', time.localtime(nb))}")[:500])
+            log(self.p, f"task {tid} retry_when probe still failing; asleep until "
+                        f"{time.strftime('%H:%M', time.localtime(nb))}")
+        else:
+            # No recent verdict (the daemon restarted): ask the probe before waking a worker.
+            self.p.db.update_task(tid, not_before=now + PROBE_TIMEOUT_S)
+            return tid not in self._probes
+        return False
+
+    def _wake_waiting(self, task: dict, why: str, now: float) -> None:
+        """Make a waiting task due now and tell its next run why it woke."""
+        tid = task["id"]
+        self._probe_rc.pop(tid, None)
+        prev = load_result(task["result"])
+        self.p.db.update_task(tid, not_before=min(task["not_before"] or now, now),
+                              result=dump_result({**prev, "woke": why}))
+        gate = self.gates.get(task["provider"] or self.cfg.get("core_provider", "claude"))
+        held = gate and (not gate.allow_new_work or (task["origin"] in ("schedule", "harness")
+                                                      and not gate.allow_optional))
+        log(self.p, f"task {tid} retry_when {why}; {f'held by gate {gate.level}' if held else 'dispatching'}")
 
     def _start_failed(self, task: dict, e: Exception) -> None:
         """Nothing was launched, so no attempt is spent. The task waits a minute before the next try,
@@ -1566,6 +1615,14 @@ def _end_group(pgid: int, grace_s: float) -> None:
         os.killpg(pgid, signal.SIGKILL)
     except OSError:
         pass
+
+
+def _retry_s(result: dict) -> float:
+    """A waiting hand-off's `retry_after_s`, kept between 5 minutes and 6 hours."""
+    try:
+        return min(max(float(result.get("retry_after_s") or 1800), 300.0), 6 * 3600.0)
+    except (TypeError, ValueError):
+        return 1800.0
 
 
 def _kill_group(proc: subprocess.Popen) -> None:

@@ -61,7 +61,11 @@ Before you finish, write `$TTP_RUN_DIR/result.json`:
   after `retry_after_s` without counting as an attempt. Save what you learned first. If a
   command can tell when the wait is over (a job finished, a file exists, a queue is free), give it
   as `retry_when`: the harness runs it every few minutes in the project root, without a model, and
-  brings the task back as soon as it exits 0. Keep it read-only and under a minute.
+  brings the task back as soon as it exits 0. Keep it read-only and under a minute. It must exit 0
+  once the wait is over whatever the outcome (the job finished or failed), and 1 while it is not:
+  while it exits 1 the task stays asleep past `retry_after_s`; any other exit wakes it as broken.
+  For a wait with several steps (build, then device run), chain them in one detached driver script
+  that writes a final marker, and point `retry_when` at that marker.
 - `blocked` only when access, a credential, funds or a resource you cannot get is missing, or the
   next step cannot be undone and is outside the charter. Say exactly what. Judgment calls are
   yours: make them, and state each one and why in the summary.

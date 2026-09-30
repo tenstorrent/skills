@@ -88,6 +88,8 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None) -> str:
     prev = load_result(task["result"])
     if prev:
         history = f"\nPrevious attempt ended '{prev.get('status')}': {str(prev.get('summary') or '')[:1500]}\n"
+        if prev.get("woke"):
+            history += f"Woken because: {prev['woke']}.\n"
     old_id = continues_id(task)
     old = p.db.task(old_id) if old_id else None
     if old:
