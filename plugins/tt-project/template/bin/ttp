@@ -3,12 +3,26 @@
 # SPDX-License-Identifier: Apache-2.0
 """Launcher for the ttp CLI next to this file's ../runtime (plugin checkout or a project's harness)."""
 import os
+import re
 import sys
 
 HERE = os.path.dirname(os.path.realpath(__file__))
-sys.path.insert(0, os.path.join(os.path.dirname(HERE), "runtime"))
+RUNTIME = os.path.join(os.path.dirname(HERE), "runtime")
 if sys.version_info < (3, 9):
     sys.exit("ttp needs Python 3.9 or newer")
+# Only this launcher's own runtime may run: inside a worker PYTHONPATH names the harness's runtime, and
+# `ttp setup` would silently reinstall that one.
+if not os.path.isfile(os.path.join(RUNTIME, "ttp", "__init__.py")):
+    sys.exit("ttp: no runtime at %s; run bin/ttp from the plugin root instead" % RUNTIME)
+sys.path.insert(0, RUNTIME)
+import ttp  # noqa: E402
+
+if os.path.dirname(os.path.dirname(os.path.realpath(ttp.__file__))) != os.path.realpath(RUNTIME):
+    with open(os.path.join(RUNTIME, "ttp", "__init__.py")) as f:
+        want = re.search(r'__version__ = "([^"]+)"', f.read())
+    sys.exit("ttp: loaded ttp %s from %s, not %s from %s; unset PYTHONPATH and retry"
+             % (getattr(ttp, "__version__", "?"), os.path.dirname(ttp.__file__),
+                want.group(1) if want else "?", RUNTIME))
 from ttp.cli import main  # noqa: E402
 
 main()

@@ -811,6 +811,8 @@ def cmd_setup(a) -> None:
     """Install this runtime as the user's stable `ttp` (plugin caches move on every update)."""
     from .project import HOME_DIR
     lib = HOME_DIR / "lib" / __version__
+    if not (PLUGIN_ROOT / "template").is_dir():
+        die(f"{RUNTIME} is a project's harness copy, not the plugin; run `<plugin-root>/bin/ttp setup`", 1)
     if RUNTIME.resolve() != (lib / "runtime").resolve():
         for part in ("runtime", "template", "bin"):
             src = PLUGIN_ROOT / part

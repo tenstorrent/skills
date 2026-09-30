@@ -2080,6 +2080,51 @@ def _install_template(env, edit=None):
         (lib / "template" / "prompts" / name).write_text(text)
 
 
+def _stale_runtime(tmp_path, preload=False):
+    """An older ttp on PYTHONPATH, as a worker sees its harness runtime; `preload` imports it at startup."""
+    stale = tmp_path / "stale"
+    (stale / "ttp").mkdir(parents=True)
+    (stale / "ttp" / "__init__.py").write_text('__version__ = "0.0.1"\n')
+    (stale / "ttp" / "cli.py").write_text("def main():\n    print('stale runtime ran')\n")
+    if preload:
+        (stale / "sitecustomize.py").write_text("import ttp\n")
+    return {**os.environ, "PYTHONPATH": str(stale)}
+
+
+def test_setup_installs_its_own_runtime_not_the_one_on_pythonpath(env, tmp_path):
+    from ttp import __version__
+    r = subprocess.run([sys.executable, str(TTP), "setup", "--bin-dir", str(tmp_path / "bin")],
+                       env=_stale_runtime(tmp_path), capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    assert (env["home"] / "lib" / "current").resolve() == (env["home"] / "lib" / __version__).resolve()
+    assert f'__version__ = "{__version__}"' in (env["home"] / "lib" / "current" / "runtime" / "ttp" /
+                                                  "__init__.py").read_text()
+
+
+@pytest.mark.parametrize("case", ["no runtime next to the launcher", "stale ttp already imported"])
+def test_a_launcher_refuses_a_foreign_runtime(env, tmp_path, case):
+    import shutil
+    launcher = TTP
+    if case == "no runtime next to the launcher":
+        launcher = tmp_path / "copy" / "bin" / "ttp"
+        launcher.parent.mkdir(parents=True)
+        shutil.copy(TTP, launcher)
+    r = subprocess.run([sys.executable, str(launcher), "setup", "--bin-dir", str(tmp_path / "bin")],
+                       env=_stale_runtime(tmp_path, preload=case == "stale ttp already imported"),
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode != 0 and "stale runtime ran" not in r.stdout
+    assert ("no runtime at" if launcher != TTP else "loaded ttp 0.0.1") in r.stderr
+    assert not (env["home"] / "lib").exists()
+
+
+def test_setup_from_a_harness_copy_refuses(env, tmp_path):
+    p = make(env)
+    r = subprocess.run([sys.executable, str(p.harness / "bin" / "ttp"), "setup", "--bin-dir", str(tmp_path / "bin")],
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode != 0 and "harness copy" in r.stderr
+    assert not (env["home"] / "lib" / "current").exists()
+
+
 def _git_out(path, *args):
     return subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True, check=True).stdout.strip()
 
