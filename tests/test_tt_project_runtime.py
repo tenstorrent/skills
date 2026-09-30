@@ -1024,10 +1024,14 @@ def test_a_run_end_is_recorded_whole_or_not_at_all(env, tmp_path, monkeypatch):
     d.reap_runs()
     assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == "running"
     assert not p.db.q("SELECT id FROM ledger") and not p.db.task(tid)["spent_usd"], "a half-recorded run end"
+    p.db.x("UPDATE runs SET cost_usd=0.75, cost_estimated=1 WHERE id=?", (rid,))   # priced while it ran
     d.reap_runs()
     d.reap_runs()          # a run end that keeps failing is closed, not retried forever
     assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == "failed"
     assert p.db.task(tid)["status"] == "failed"
+    assert p.db.spent_since(0) == 0.75 and p.db.task(tid)["spent_usd"] == 0.75, "an abandoned run's spend vanished"
+    d._abandon_run(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)))
+    assert p.db.spent_since(0) == 0.75 and p.db.task(tid)["spent_usd"] == 0.75, "booked twice"
 
 
 def _claude_stream_without_result(path, messages=4):

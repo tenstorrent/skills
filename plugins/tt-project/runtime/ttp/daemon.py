@@ -280,7 +280,18 @@ class Daemon:
         why = f"run {r['id']} ended but its result could not be processed (details in the daemon log)"
         try:
             with db.tx():
-                db.x("UPDATE runs SET status='failed', ended=? WHERE id=? AND status='running'", (now, r["id"]))
+                # Book what the run was priced at so far, once: only while it is still running.
+                cur = db.one("SELECT * FROM runs WHERE id=? AND status='running'", (r["id"],))
+                if not cur:
+                    self._reap_errors.pop(r["id"], None)
+                    return
+                db.x("UPDATE runs SET status='failed', ended=? WHERE id=?", (now, r["id"]))
+                cost = cur["cost_usd"] or 0
+                if cost:
+                    db.spend(r["provider"], cost, self._source_for(r), account=r["account"] or "",
+                             estimated=bool(cur["cost_estimated"]))
+                    if r["task"]:
+                        db.x("UPDATE tasks SET spent_usd=COALESCE(spent_usd,0)+? WHERE id=?", (cost, r["task"]))
                 if r["role"] == "coordinator":
                     self._coordinator_failed(why)
                 elif r["task"] and (db.task(r["task"]) or {}).get("status") == "running":
