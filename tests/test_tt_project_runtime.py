@@ -1551,3 +1551,24 @@ def test_low_disk_space_blocks_new_workers_and_alerts_once(env, monkeypatch):
     monkeypatch.setattr(dm.shutil, "disk_usage", lambda path: usage(100e9, 50e9, 50e9))
     assert _run_until(d, p, lambda: p.db.task(tid)["status"] == "done")
     assert p.db.kv("disk_low") is None
+
+
+def test_plan_pacing_changes_do_not_alert_the_user(env, monkeypatch):
+    p = make(env)
+    from ttp import budget as bud
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    alerts = lambda: p.db.one("SELECT COUNT(*) n FROM messages WHERE kind='alert'")["n"]  # noqa: E731
+
+    def settle(level: str) -> None:
+        gate = bud.Gate(provider="fake", level=level, regime="windows")
+        monkeypatch.setattr(bud, "evaluate", lambda *a, **k: gate)
+        d.update_gates()
+
+    settle("green")
+    before = alerts()
+    for level in ("yellow", "green", "yellow", "green"):
+        settle(level)
+    assert alerts() == before, "pacing between green and yellow alerted the user"
+    settle("red")
+    assert alerts() == before + 1, "hitting the plan limit must alert"

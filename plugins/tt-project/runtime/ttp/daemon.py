@@ -553,7 +553,11 @@ class Daemon:
                 g.max_parallel, g.allow_new_work, g.allow_optional = 0, False, False
             prev = self.gates.get(prov)
             provider_paused = any(r.startswith("provider limit") for r in g.reasons + (prev.reasons if prev else []))
-            if prev and prev.level != g.level and not provider_paused:   # a pause has its own, specific alert
+            # On a plan, green and yellow are the pacing working as designed (more or fewer workers
+            # as the account's burn moves); only nearing or hitting the limit is news to the user.
+            pacing = (g.regime == "windows" and prev is not None
+                      and {prev.level, g.level} <= {"green", "yellow"})
+            if prev and prev.level != g.level and not provider_paused and not pacing:   # a pause has its own alert
                 sev = "high" if g.level == "red" else "normal"
                 capped = any("cap reached" in r for r in g.reasons)
                 hint = ""
