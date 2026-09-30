@@ -80,6 +80,12 @@ CREATE TABLE IF NOT EXISTS snapshots (
 CREATE INDEX IF NOT EXISTS snapshots_ts ON snapshots(ts);
 
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT, ts REAL);
+
+-- One row per episode of a high alert with a condition key; cleared is set, never deleted.
+CREATE TABLE IF NOT EXISTS alerts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL, raised REAL NOT NULL, last REAL,
+  message INTEGER, severity TEXT, text TEXT, cleared REAL, cleared_why TEXT);
+CREATE INDEX IF NOT EXISTS alerts_key ON alerts(key, cleared);
 """
 
 TERMINAL_TASK_STATES = ("done", "failed", "cancelled")
@@ -175,9 +181,15 @@ class DB:
     def post(self, direction: str, text: str, chat: str | None = None, channel: str = "chat",
              kind: str = "user", severity: str = "normal", ref: str | None = None,
              handled: bool = False) -> int:
-        return self.x("INSERT INTO messages(ts,direction,chat,channel,kind,severity,text,ref,handled) "
-                      "VALUES(?,?,?,?,?,?,?,?,?)",
-                      (time.time(), direction, chat, channel, kind, severity, text, ref, int(handled)))
+        from . import alerts
+        ts = time.time()
+        with self.tx():
+            mid = self.x("INSERT INTO messages(ts,direction,chat,channel,kind,severity,text,ref,handled) "
+                         "VALUES(?,?,?,?,?,?,?,?,?)",
+                         (ts, direction, chat, channel, kind, severity, text, ref, int(handled)))
+            if direction == "out" and chat is None and alerts.tracked(kind, severity, ref):
+                alerts.open_episode(self, ref, ts, mid, severity, text)
+        return mid
 
     def unread_for_chat(self, chat: str, after: int, min_severity: str = "normal",
                         upto: int | None = None) -> list[dict]:

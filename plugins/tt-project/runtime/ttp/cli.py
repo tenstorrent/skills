@@ -476,22 +476,31 @@ def _listen_loop(p: Project, db, a, after: int, floor: str) -> None:
 
 
 def status_text(p: Project) -> str:
-    from .web import at, gate_detail, health, since
+    """One screen: what needs the user now first, then the budget and the work, then information."""
+    from .alerts import feed
+    from .web import at, attention, health, since
     db = p.db
     state = daemon_state(p)
-    gates = db.kv("gates", {})
     h = health(p, db, alive=state == "running")
     now = time.time()
     counts = {r["status"]: r["n"] for r in db.q("SELECT status, COUNT(*) n FROM tasks GROUP BY status")}
     head = f"{p.name}: daemon {state}" + (" (paused)" if db.kv("paused") else "")
     head += " · tasks: " + (", ".join(f"{k} {v}" for k, v in sorted(counts.items())) if counts else "none yet")
     lines = [head]
+    for m in attention(db, now)[:6]:
+        text = " ".join(m["text"].split())
+        what = f"ask #{m['id']}" if m["kind"] == "ask" else "alert"
+        lines.append(f"  needs you ({what}, {since(m['ts'], now)} ago): {text[:300]}")
     s = h["spend"]
-    top = f" · top 7d: {s['top_7d']['source']} ${s['top_7d']['usd']:.2f}" if s["top_7d"] else ""
     live = f" · ~${s['in_flight']:.2f} so far in running work" if s.get("in_flight") else ""
-    lines.append(f"spend: ${s['spent_24h']:.2f} last 24h, ${s['spent_7d']:.2f} last 7d{live}{top}")
-    for prov, g in gates.items():
-        lines.append(f"budget {prov}: {g['level']} · {gate_detail(g)}" + (f" — {'; '.join(g['reasons'])}" if g["reasons"] else ""))
+    budget = h["budget_lines"]
+    if not any(ln.startswith("$") for ln in budget):   # the dollar-caps line already says what was spent
+        lines.append(f"spend: ${s['spent_24h']:.2f} last 24h, ${s['spent_7d']:.2f} last 7d{live}")
+    elif live:
+        budget = [*budget[:-1], budget[-1] + live]
+    if budget:
+        lines.append("budget: " + budget[0].strip())
+        lines += [f"  {ln}" for ln in budget[1:]]
     c = h["coordinator"]
     coord = "coordinator: no turn yet"
     if c["last_turn"]:
@@ -536,9 +545,13 @@ def status_text(p: Project) -> str:
         if u["below_floor"]:
             lines.append(f"  {u['below_floor']} of them are below every chat's severity floor; lower "
                          f"notify.chat_min_severity or the chat's own floor to see them")
-    for m in h["asks"]:
+    recent = feed(db, now, limit=3)
+    if recent:
+        lines.append("recent:")
+    for m in recent:
         text = " ".join(m["text"].split())
-        lines.append(f"  needs you (ask #{m['id']}, {since(m['ts'], now)} ago): {text[:300]}")
+        tag = f"cleared {at(m['cleared_at'], now)}" if m.get("cleared_at") else m["state"]
+        lines.append(f"  {at(m['ts'], now)} ({tag}) {text[:160]}")
     return "\n".join(lines)
 
 
@@ -565,8 +578,16 @@ def cmd_status(a) -> None:
 
 
 def cmd_web(a) -> None:
+    from . import tunnel
+    if a.unkeep:
+        print(tunnel.unkeep(a.name))
+        return
+    if a.keep and not a.tunnel:
+        die("--keep goes with --tunnel: `ttp web NAME --tunnel --keep`")
     p, entry = resolve(a.name)
     if p:
+        if a.keep:
+            print(f"{a.name} runs on this computer: there is no tunnel to keep")
         print(web_line(p))
         return
     if not entry:
@@ -579,15 +600,23 @@ def cmd_web(a) -> None:
     if not m:
         die(f"could not read the web address from {host}: {(r.stderr or r.stdout).strip()[-200:]}")
     from .web import free_port
-    remote_port, tok = m.group(1), m.group(2)
-    local = free_port(int(remote_port) + 100)
-    cmd = ["ssh", "-N", "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=30", "-L",
-           f"{local}:127.0.0.1:{remote_port}", host]
-    if a.tunnel:
-        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-        print(f"tunnel open (pid in background): localhost:{local} → {host}:{remote_port}")
+    remote_port, tok = int(m.group(1)), m.group(2)
+    kept = tunnel.installed(a.name)
+    if a.keep:
+        local, did = tunnel.keep(a.name, host, remote_port, free_port)
+        print(f"{did}: localhost:{local} → {host}:{remote_port}, restarted after reboots (at login) and network "
+              f"drops; `ttp web {a.name} --unkeep` removes it")
+    elif kept and kept["host"] == host and kept["remote"] == remote_port and kept["local"]:
+        local = kept["local"]   # the kept tunnel already forwards; a second one would only clash
+        print(f"the kept tunnel forwards localhost:{local} → {host}:{remote_port} ({kept['file']})")
     else:
-        print(f"The project runs on {host}. With the user's OK, open a tunnel:\n  {' '.join(cmd)}")
+        local = free_port(remote_port + 100)
+        cmd = tunnel.ssh_argv(host, local, remote_port, ssh="ssh")
+        if a.tunnel:
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            print(f"tunnel open (pid in background): localhost:{local} → {host}:{remote_port}")
+        else:
+            print(f"The project runs on {host}. With the user's OK, open a tunnel:\n  {' '.join(cmd)}")
     print(f"web app: http://127.0.0.1:{local}/#token={tok}")
 
 
@@ -1153,6 +1182,9 @@ def main(argv: list[str] | None = None) -> None:
     s = sub.add_parser("web", help="web app link (for a remote project: tunnel command and link)")
     s.add_argument("name")
     s.add_argument("--tunnel", action="store_true", help="open the ssh tunnel now (ask the user first)")
+    s.add_argument("--keep", action="store_true",
+                   help="with --tunnel: a user service keeps the tunnel up across reboots and network drops")
+    s.add_argument("--unkeep", action="store_true", help="stop and remove the kept tunnel")
     s.set_defaults(fn=cmd_web)
     for name, fn, hlp in (("connect", cmd_connect, "attach this chat to a project"),
                           ("status", cmd_status, "one-screen status"),

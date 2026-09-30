@@ -13,9 +13,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from . import alerts
 from . import budget as bud
 from . import schedule as sched
 from .daemon import HEARTBEAT_STALE_S, heartbeat
+from .alerts import cleared  # noqa: F401  (readers import it from here)
 from .db import DB, SEVERITY_RANK, chat_floor, dump_result, host_line, load_result
 from .project import Project
 from .providers import get_provider
@@ -101,6 +103,76 @@ def spend_headline(spend: dict, g: dict) -> str:
         return (f"${n.get('spent_24h', 0):.2f} of ${n['daily_cap']:.0f} 24h · "
                 f"${n.get('spent_7d', 0):.2f} of ${n.get('weekly_cap', 0):.0f} 7d")
     return f"${spend['spent_24h']:.2f} 24h · ${spend['spent_7d']:.2f} 7d"
+
+
+def offline_help(name: str) -> str:
+    """What the web page says once it cannot reach the daemon. Only the viewer's computer can reopen
+    a tunnel, so the command is given as information; the daemon's own service restarts it."""
+    return (f"If {name} runs on another machine, the SSH tunnel from this computer is down: "
+            f"`ttp web {name} --tunnel` reopens it, and `ttp web {name} --tunnel --keep` keeps it up across "
+            f"reboots and network drops. If it runs on this computer, its daemon is down: its service "
+            f"restarts it, and `ttp restart {name}` does so now.")
+
+
+WINDOW_LABELS = {"five_hour": "5-hour", "5h": "5-hour", "seven_day": "Weekly", "7d": "Weekly",
+                 "seven_day_opus": "Weekly (Opus)", "seven_day_sonnet": "Weekly (Sonnet)"}
+
+
+def until(ts: float, now: float) -> str:
+    """'3h 40m', '6d 20h', '12m': time left until ts."""
+    m = max(int((ts - now) // 60), 0)
+    if m < 60:
+        return f"{m}m"
+    if m < 24 * 60:
+        return f"{m // 60}h {m % 60}m"
+    return f"{m // 1440}d {m % 1440 // 60}h"
+
+
+def window_history(db: DB, provider: str, window: str, now: float, days: int = 14) -> str:
+    """A plan window's recent history from the stored readings, '' without any: the daily peak for
+    windows of a day or less, the final reading of the last two completed periods for longer ones."""
+    hours = bud.WINDOW_HOURS.get(window, 168.0)
+    if hours <= 24:
+        rows = db.q("SELECT date(ts,'unixepoch','localtime') d, MAX(utilization) peak FROM snapshots "
+                    "WHERE provider=? AND window=? AND ts>=? GROUP BY d ORDER BY d", (provider, window, now - days * DAY))
+        return f"peaks last {days} days: " + " ".join(f"{float(r['peak']):.0f}" for r in rows) if rows else ""
+    rows = db.q("SELECT ts, utilization, resets_at FROM snapshots WHERE provider=? AND window=? AND resets_at IS NOT NULL "
+                "AND resets_at<=? AND ts>=? ORDER BY ts", (provider, window, now, now - 3 * hours * 3600 - DAY))
+    finals: dict[int, float] = {}
+    for r in rows:   # a period is keyed by its reset, to the hour: readings of one period jitter by seconds
+        finals[round(float(r["resets_at"]) / 3600)] = float(r["utilization"] or 0)
+    last = [finals[k] for k in sorted(finals)][-2:]
+    if not last:
+        return ""
+    unit = "week" if hours == 168 else "period"
+    label = f"last two {unit}s: " if len(last) == 2 else f"last {unit}: "
+    return label + ", ".join(f"{v:.0f}%" for v in last)
+
+
+def budget_lines(db: DB, now: float | None = None) -> list[str]:
+    """The budget in a few plain lines, for the top of the web app and `ttp status`: one line per plan
+    window (used, time to reset, history) and one for the dollar caps. Nothing where there is no data.
+    Pacing, gate reasons and top spenders are in the Budget tab."""
+    now = now or time.time()
+    lines: list[str] = []
+    wins = bud.plan_windows(db, now)
+    for prov in sorted({w.provider for w in wins}):
+        lines.append(f"{prov.capitalize()} plan")
+        for w in sorted((w for w in wins if w.provider == prov),
+                        key=lambda w: (bud.WINDOW_HOURS.get(w.window, 168.0), w.window)):
+            parts = [f"{w.utilization:.0f}% used"]
+            if w.resets_at:
+                parts.append(f"resets in {until(w.resets_at, now)}")
+            hist = window_history(db, prov, w.window, now)
+            if hist:
+                parts.append(hist)
+            lines.append(f"  {WINDOW_LABELS.get(w.window, w.window)}: " + ", ".join(parts))
+    caps = [g.get("numbers") or {} for g in (db.kv("gates", {}) or {}).values() if g.get("regime") != "windows"]
+    n = next((c for c in caps if c.get("daily_cap") or c.get("weekly_cap")), None)
+    if n:
+        lines.append(f"${n.get('spent_24h', 0):.2f} of ${n.get('daily_cap', 0):.0f} last 24h, "
+                     f"${n.get('spent_7d', 0):.2f} of ${n.get('weekly_cap', 0):.0f} last 7 days")
+    return lines
 
 
 def last_note(run_dir: str | None) -> str:
@@ -227,52 +299,13 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         "undelivered": undelivered,
         "why_idle": "; ".join(why) if not running else "", "held": held,
         "host": host_line(db.boots(now - DAY)),
+        "budget_lines": budget_lines(db, now),
     }
 
 
-def _still_holds(db: DB, key: str, since: float, now: float) -> bool:
-    """Whether the condition an alert (keyed as in Daemon.alert) reported is still true.
-    Unknown keys cannot be checked and hold until the alert ages out."""
-    kind, _, arg = key.partition(":")
-    if kind in ("auth", "limit"):
-        return float((db.kv(f"limited:{arg}") or {}).get("until") or 0) > now
-    if kind == "budget":
-        return (db.kv("gates", {}).get(arg) or {}).get("level") == "red"
-    if key == "disk":
-        return bool(db.kv("disk_low"))
-    if key == "coordinator":
-        return int(db.kv("coordinator_failures", 0)) > 0
-    if key == "run-start":
-        return not db.one("SELECT id FROM runs WHERE role!='coordinator' AND started>? LIMIT 1", (since,))
-    return True
-
-
-def cleared(db: DB, m: dict, now: float) -> bool:
-    """A high alert whose condition no longer holds: not worth delivering late. Lower-severity
-    messages sharing the key (a budget back to normal) are news whatever the state."""
-    return (m.get("kind") == "alert" and m.get("severity") in ("high", "critical") and bool(m.get("ref"))
-            and not _still_holds(db, m["ref"], m["ts"], now))
-
-
 def attention(db: DB, now: float) -> list[dict]:
-    """Open asks and the last day's high alerts, minus alerts whose condition has since cleared
-    or that a newer alert on the same condition replaced."""
-    rows = db.q("SELECT id,ts,kind,severity,text,ref FROM messages WHERE direction='out' AND chat IS NULL "
-                "AND ((kind='ask' AND handled=0) OR (kind='alert' AND ts>?)) ORDER BY id DESC LIMIT 200",
-                (now - DAY,))
-    out, seen = [], set()
-    for m in rows:
-        ref = m.pop("ref")
-        key = ref if m["kind"] == "alert" else None
-        if key:
-            if key in seen:
-                continue
-            seen.add(key)
-        if m["kind"] == "alert" and (m["severity"] not in ("high", "critical")
-                                     or (key and not _still_holds(db, key, m["ts"], now))):
-            continue
-        out.append(m)
-    return out[:20]
+    """The top section: open asks and alerts about problems active now (see alerts.needs_you)."""
+    return alerts.needs_you(db, now)
 
 
 def state_payload(p: Project, db: DB) -> dict:
@@ -297,6 +330,8 @@ def state_payload(p: Project, db: DB) -> dict:
                        "WHERE status IN ('open','tracking') ORDER BY last_seen DESC LIMIT 100"),
         "schedules": sched.with_costs(db),
         "attention": attention(db, now),
+        "feed": alerts.feed(db, now),
+        "offline_help": offline_help(p.name),
         "budget": bud.history(db),
         "coordinator": db.kv("last_coordinator_summary", {}),
         "health": health(p, db, now=now),

@@ -26,6 +26,7 @@ import time
 import traceback
 from pathlib import Path
 
+from . import alerts
 from . import budget as bud
 from . import coordinator as coord
 from . import locks
@@ -209,6 +210,7 @@ class Daemon:
         self.reconcile_tasks()
         self.prune_worktrees()
         self.check_disk()
+        self.sweep_alerts()
         if self.p.db.kv("paused", False):
             return
         self._refresh_meters()
@@ -431,9 +433,10 @@ class Daemon:
                 parts.append(f"run {r['id']} (#{task['id']} {task['title'][:60]} → {task['status']})" if task
                              else f"run {r['id']} ({r['role']})")
             nth = ordinal(max(len(boots), 1))
+            # Information, never a "needs you" alert: the lost runs are already requeued.
             db.post("out", f"The host rebooted ({nth} reboot in 24 h); {len(lost)} run(s) were cut short "
                            f"(${usd:.2f}).{then}{unstable} Runs: {'; '.join(parts)}"[:3000],
-                    kind="alert", severity=severity, ref=f"reboot:{self.boot}")
+                    kind="info", severity=severity, ref=f"reboot:{self.boot}")
 
     def _end_orphan(self, r: dict) -> None:
         """A supervisor that died (kill -9, OOM) leaves its agent running with no wall clock, budget
@@ -937,7 +940,7 @@ class Daemon:
 
     def update_gates(self) -> None:
         windows = bud.plan_windows(self.p.db)
-        gates, alerts = {}, []
+        gates, news = {}, []
         # After a restart the last levels come from disk, so a change while the daemon was down is news.
         saved = {} if self.gates else (self.p.db.kv("gates") or {})
         for prov in {self.cfg.get("core_provider", "claude"), *[t["provider"] for t in self.p.db.q(
@@ -961,7 +964,7 @@ class Daemon:
                     hint = ("New work is paused; replies to you continue. " +
                             ("You can raise the cap (carefully) by telling me, or in the web app."
                              if capped else "The web app's Budget tab shows what spent it."))
-                alerts.append((f"Budget for {prov} is now {g.level}: {'; '.join(g.reasons) or 'back to normal'}. "
+                news.append((f"Budget for {prov} is now {g.level}: {'; '.join(g.reasons) or 'back to normal'}. "
                                + hint, sev, f"budget:{prov}"))
             gates[prov] = g
         # One transaction: saved gates without their alert would hide the change from every later
@@ -969,7 +972,7 @@ class Daemon:
         # count it as cleared.
         with self.p.db.tx():
             self.p.db.set_kv("gates", {k: v.as_dict() for k, v in gates.items()})
-            for text, sev, ref in alerts:
+            for text, sev, ref in news:
                 self.p.db.post("out", text, chat=None, kind="alert", severity=sev, ref=ref)
         self.gates = gates
 
@@ -1628,7 +1631,8 @@ class Daemon:
     def alert(self, key: str, text: str, severity: str = "high", every_s: float = 6 * 3600) -> None:
         """Deduplicated broadcast: the same condition alerts at most once per `every_s`, across
         daemon restarts too (an upgrade must not re-announce a condition the user already has).
-        The key is kept as the message's ref, so the web app can drop the alert once it clears."""
+        The key is kept as the message's ref and, for a high alert, opens an episode that clears
+        itself once the condition does (alerts.sweep); the same condition may then alert again."""
         now = time.time()
         db = self.p.db
         with db.tx():   # marked sent only together with the message
@@ -1638,6 +1642,11 @@ class Daemon:
             sent[key] = now
             db.set_kv("alerts_sent", {k: v for k, v in sent.items() if now - float(v) < 7 * 86400})
             db.post("out", text, chat=None, kind="alert", severity=severity, ref=key)
+
+    def sweep_alerts(self) -> None:
+        """Close alert episodes whose condition cleared (stored with the time; the chats hear it once)."""
+        for ep in alerts.sweep(self.p.db):
+            log(self.p, f"alert cleared: {ep['key']} ({ep['cleared_why']})")
 
     def slack(self):
         if not self.cfg["notify"].get("slack"):
@@ -1660,7 +1669,7 @@ class Daemon:
         last = int(db.kv("slack_last_out", 0))
         rows = db.q("SELECT * FROM messages WHERE direction='out' AND id>? ORDER BY id LIMIT 20", (last,))
         for m in rows:
-            to_slack = ((m["chat"] is None and SEVERITY_RANK.get(m["severity"], 1) >= floor
+            to_slack = ((m["chat"] is None and SEVERITY_RANK.get(m["severity"], 1) >= floor and m["kind"] != "info"
                          and not cleared(db, m, time.time())) or m["chat"] == "slack")
             if to_slack:
                 try:

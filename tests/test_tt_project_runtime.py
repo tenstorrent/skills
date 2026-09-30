@@ -684,8 +684,9 @@ def test_status_shows_spend_waiting_retry_and_coordinator_health(env):
     out = status_text(p)
     lines = out.splitlines()
     assert len(lines) <= 25, out
-    assert "spend: $4.50 last 24h, $4.50 last 7d · top 7d: task:1 $3.50" in out, out
-    assert "budget fake:" in out and "of $100 per 24h" in out, out
+    # The budget is one plain line; top spenders and gate reasons are in the web app's Budget tab.
+    assert "budget: $4.50 of $100 last 24h, $4.50 of $200 last 7 days" in lines, out
+    assert "top 7d" not in out and "spend:" not in out, out
     wait = [ln for ln in lines if "measure on a board" in ln]
     assert wait and "waiting, next try" in wait[0] and wait[0].count("next try") == 1, out
     assert "2 failed in a row" in out and "retry at" in out, out
@@ -785,6 +786,9 @@ def test_the_web_app_drops_high_alerts_once_their_condition_clears(env):
     assert "fake is logged out" in now and "Only 1.0 GB free" in now, now
     assert any(t.startswith("Budget for fake is now red") for t in now), now
     p.db.set_kv("limited:fake", {"until": time.time() - 1, "note": "logged out"})
+    # A lapsed pause only spaces out the probes; the next successful run ends a logout.
+    p.db.x("INSERT INTO runs(role,provider,started,ended,status) VALUES('coordinator','fake',?,?,'ok')",
+           (time.time() + 1, time.time() + 2))
     p.db.set_kv("disk_low", None)
     p.db.x("DELETE FROM ledger")
     d.update_gates()
@@ -865,6 +869,9 @@ def test_relays_skip_high_alerts_whose_condition_cleared_before_delivery(env, ca
     p.db.set_kv("disk_low", {"path": "/", "free_gb": 1.0})
     d.alert("disk", "Only 1.0 GB free", "high")
     p.db.set_kv("limited:fake", {"until": time.time() - 1, "note": "logged out"})
+    # A lapsed pause only spaces out the probes; the next successful run ends a logout.
+    p.db.x("INSERT INTO runs(role,provider,started,ended,status) VALUES('coordinator','fake',?,?,'ok')",
+           (time.time() + 1, time.time() + 2))
     p.db.post("out", "Budget for fake is now green: back to normal. ", chat=None, kind="alert",
               severity="normal", ref="budget:fake")
     held, follow_up = "Only 1.0 GB free", "Budget for fake is now green: back to normal."

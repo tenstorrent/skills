@@ -39,7 +39,8 @@ def alerts_since(p: Project, after: int, floor: str = "high") -> list[dict]:
                     (after, *levels))
         now = time.time()
         for r in rows:
-            r["cleared"] = cleared(db, r, now)
+            # Information (a host reboot) is never pushed as an alert; the cursor still moves past it.
+            r["cleared"] = r["kind"] == "info" or cleared(db, r, now)
             del r["ref"]
     finally:
         db.close()
