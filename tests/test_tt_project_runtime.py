@@ -6847,6 +6847,35 @@ def test_the_top_section_holds_only_what_needs_the_user_and_the_rest_is_a_feed(e
     assert any("(cleared " in ln and "Only 1.0 GB free" in ln for ln in lines[lines.index("recent:"):]), lines
 
 
+def test_top_section_keeps_old_open_asks_and_drops_keyless_alerts_after_an_hour(env):
+    p = make(env)
+    from ttp.alerts import needs_you
+    now = time.time()
+    old = p.db.post("out", "Old question?", kind="ask", severity="high")
+    p.db.x("UPDATE messages SET ts=? WHERE id=?", (now - 30 * 86400, old))
+    for i in range(310):   # many alerts must not push the ask out
+        p.db.post("out", f"noise {i}", kind="alert", severity="low")
+    stale = p.db.post("out", "Keyless old", kind="alert", severity="high")
+    p.db.x("UPDATE messages SET ts=? WHERE id=?", (now - 2 * 3600, stale))
+    p.db.post("out", "Relabelled", kind="alert_old", severity="high")
+    p.db.post("out", "Keyless fresh", kind="alert", severity="high")
+    texts = [m["text"] for m in needs_you(p.db, now)]
+    assert texts == ["Keyless fresh", "Old question?"], texts
+    from ttp.web import health
+    assert [a["text"] for a in health(p, p.db, now=now)["asks"]] == ["Old question?"]
+
+
+def test_budget_line_leaves_out_a_zero_cap(env):
+    p = make(env)
+    from ttp.web import budget_lines
+    p.db.set_kv("gates", {"fake": {"regime": "caps", "numbers": {"spent_24h": 3.0, "daily_cap": 10.0,
+                                                                 "spent_7d": 9.0, "weekly_cap": 0}}})
+    assert budget_lines(p.db)[-1] == "$3.00 of $10 last 24h"
+    p.db.set_kv("gates", {"fake": {"regime": "caps", "numbers": {"spent_24h": 3.0, "daily_cap": 0,
+                                                                 "spent_7d": 9.0, "weekly_cap": 50.0}}})
+    assert budget_lines(p.db)[-1] == "$9.00 of $50 last 7 days"
+
+
 def test_the_web_page_explains_an_unreachable_daemon_without_setup_details(env):
     p = make(env)
     from ttp.web import offline_help, state_payload

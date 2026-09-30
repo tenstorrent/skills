@@ -182,8 +182,12 @@ def budget_lines(db: DB, now: float | None = None) -> list[str]:
     caps = [g.get("numbers") or {} for g in (db.kv("gates", {}) or {}).values() if g.get("regime") != "windows"]
     n = next((c for c in caps if c.get("daily_cap") or c.get("weekly_cap")), None)
     if n:
-        lines.append(f"${n.get('spent_24h', 0):.2f} of ${n.get('daily_cap', 0):.0f} last 24h, "
-                     f"${n.get('spent_7d', 0):.2f} of ${n.get('weekly_cap', 0):.0f} last 7 days")
+        halves = []
+        if n.get("daily_cap"):
+            halves.append(f"${n.get('spent_24h', 0):.2f} of ${n['daily_cap']:.0f} last 24h")
+        if n.get("weekly_cap"):
+            halves.append(f"${n.get('spent_7d', 0):.2f} of ${n['weekly_cap']:.0f} last 7 days")
+        lines.append(", ".join(halves))
     return lines
 
 
@@ -227,8 +231,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
     ready = sum(1 for t in due if not task_resources(t) & {r["resource"] for r in paused_resources})
     blocked = db.one("SELECT COUNT(*) n FROM tasks WHERE status='blocked'")["n"]
     running = db.one("SELECT COUNT(*) n FROM runs WHERE status='running'")["n"]
-    asks = db.q("SELECT id, ts, text FROM messages WHERE kind='ask' AND handled=0 AND ts>? ORDER BY id DESC LIMIT 5",
-                (now - 14 * DAY,))
+    asks = db.q("SELECT id, ts, text FROM messages WHERE kind='ask' AND handled=0 ORDER BY id DESC LIMIT 5")
     top = db.one("SELECT source, ROUND(SUM(usd),2) usd FROM ledger WHERE ts>=? GROUP BY source ORDER BY SUM(usd) DESC "
                  "LIMIT 1", (now - WEEK,))
     # A relay that stopped reading: questions the user has not seen, so nothing can be decided.

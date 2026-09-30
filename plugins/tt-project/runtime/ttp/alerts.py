@@ -123,12 +123,18 @@ def sweep(db: DB, now: float | None = None) -> list[dict]:
     return closed
 
 
+KEYLESS_TTL = 3600   # seconds an alert without a condition key stays in the top section
+
+
 def needs_you(db: DB, now: float) -> list[dict]:
     """The top section: open asks and high alerts about problems that are active now, newest first.
     A newer alert on the same condition replaces the older one."""
+    # Open asks are queried apart from alerts and kept whatever their age: they wait on the user.
+    asks = db.q("SELECT id,ts,kind,severity,text,ref FROM messages WHERE direction='out' AND chat IS NULL "
+                "AND kind='ask' AND handled=0 ORDER BY id DESC")
     rows = db.q("SELECT id,ts,kind,severity,text,ref FROM messages WHERE direction='out' AND chat IS NULL "
-                "AND ((kind='ask' AND handled=0 AND ts>?) OR (kind='alert' AND ts>?)) ORDER BY id DESC LIMIT 300",
-                (now - 14 * DAY, now - 14 * DAY))
+                "AND kind='alert' AND ts>? ORDER BY id DESC LIMIT 300", (now - 14 * DAY,))
+    rows = sorted(asks + rows, key=lambda m: -m["id"])
     out, seen = [], set()
     for m in rows:
         ref = m.pop("ref")
@@ -141,7 +147,7 @@ def needs_you(db: DB, now: float) -> list[dict]:
                 seen.add(ref)
                 if not active(db, ref, m["ts"], now):
                     continue
-            elif now - m["ts"] >= DAY:   # an alert with no condition to check stays for a day
+            elif now - m["ts"] >= KEYLESS_TTL:   # an alert with no condition to check stays an hour
                 continue
         out.append(m)
     return out[:20]
@@ -157,7 +163,7 @@ def feed(db: DB, now: float, limit: int = 30) -> list[dict]:
         ref = m.pop("ref")
         m["state"] = "info" if m["kind"] in ("info", "resolved") else "fyi"
         if m["kind"] == "alert" and _urgent(m["severity"]):
-            if (ref and active(db, ref, m["ts"], now)) or (not ref and now - m["ts"] < DAY):
+            if (ref and active(db, ref, m["ts"], now)) or (not ref and now - m["ts"] < KEYLESS_TTL):
                 continue   # in the top section
             m["state"] = "cleared"
             ep = episode(db, ref, m["ts"]) if ref else None
