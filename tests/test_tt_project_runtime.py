@@ -244,3 +244,11 @@ def test_logged_out_provider_is_detected_not_retried_as_failure(env, tmp_path):
     ]) + "\n")
     u = get_provider("claude").parse(out)
     assert u.auth_failed and not u.limited
+
+
+def test_alerts_are_not_repeated_after_a_daemon_restart(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    Daemon(p.base).alert("auth:claude", "logged out")
+    Daemon(p.base).alert("auth:claude", "logged out")      # a fresh daemon, e.g. after an upgrade
+    assert len(p.db.q("SELECT id FROM messages WHERE text='logged out'")) == 1

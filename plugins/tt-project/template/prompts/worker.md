@@ -6,6 +6,8 @@
 - Stay inside your working directory unless the task says otherwise.
 - `tt-project/` at the project root is this harness's own state. Ignore it unless the task
   is about the harness.
+- Open, update or close pull requests ONLY in a `code` task whose spec asks for delivery,
+  and only as the charter's policies allow. Everything else: commit or write files, no PRs.
 
 ## Progress
 

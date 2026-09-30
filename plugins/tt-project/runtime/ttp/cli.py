@@ -59,8 +59,16 @@ def forward(entry: dict, argv: list[str]) -> int:
     """Run this same command on the project's machine, streaming its output."""
     remote_ttp = f"{entry['dir']}/{FOLDER}/harness/bin/ttp"
     cmd = " ".join(shlex.quote(a) for a in [remote_ttp, *argv])
-    return subprocess.call(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", entry.get("ssh") or entry["host"],
-                            cmd])
+    host = entry.get("ssh") or entry["host"]
+    r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", host, cmd], stderr=subprocess.PIPE,
+                       text=True)
+    if r.returncode == 255:   # ssh itself failed: the project is fine, this machine cannot reach it
+        why = (r.stderr.strip().splitlines() or ["unknown ssh error"])[-1]
+        print(f"ttp: cannot reach {host} right now ({why}). The project keeps running there; "
+              f"try again once this machine is back on that network.", file=sys.stderr)
+    elif r.stderr:
+        sys.stderr.write(r.stderr)
+    return r.returncode
 
 
 def search_transcripts(name: str) -> list[dict]:

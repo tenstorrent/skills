@@ -59,7 +59,6 @@ class Daemon:
         self._slack = None
         self._last_cfg = 0.0
         self._last_slack = 0.0
-        self._last_alerted: dict[str, float] = {}
 
     # lifecycle ------------------------------------------------------------------------------------
     def run(self) -> int:
@@ -490,11 +489,14 @@ class Daemon:
 
     # notifications and Slack -------------------------------------------------------------------------
     def alert(self, key: str, text: str, severity: str = "high", every_s: float = 6 * 3600) -> None:
-        """Deduplicated broadcast: the same condition alerts at most once per `every_s`."""
+        """Deduplicated broadcast: the same condition alerts at most once per `every_s`, across
+        daemon restarts too (an upgrade must not re-announce a condition the user already has)."""
         now = time.time()
-        if now - self._last_alerted.get(key, 0) < every_s:
+        sent = self.p.db.kv("alerts_sent", {})
+        if now - float(sent.get(key, 0)) < every_s:
             return
-        self._last_alerted[key] = now
+        sent[key] = now
+        self.p.db.set_kv("alerts_sent", {k: v for k, v in sent.items() if now - float(v) < 7 * 86400})
         self.p.db.post("out", text, chat=None, kind="alert", severity=severity)
 
     def slack(self):
