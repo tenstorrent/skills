@@ -23,6 +23,7 @@ TTP = pathlib.Path(__file__).resolve().parents[1] / "plugins" / "tt-project" / "
 def env(tmp_path, monkeypatch):
     home = tmp_path / "home"
     monkeypatch.setenv("TTP_HOME", str(home))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     monkeypatch.setenv("TTP_HOST", "testhost")
     for var in ("TTP_RUN_DIR", "TTP_TASK", "TTP_RUN_ID", "TTP_PROJECT"):   # tests may run inside a live run
         monkeypatch.delenv(var, raising=False)
@@ -2273,6 +2274,8 @@ def test_codex_coordinator_schema_is_strict_and_its_nulls_are_dropped(env, tmp_p
     argv, _ = codex.build(role="coordinator", model="", effort="low", cwd=str(tmp_path), budget_usd=1.0,
                           read_only=True, schema=coord.ACTIONS_SCHEMA, restrictions={})
     path = argv[argv.index("--output-schema") + 1]
+    import tempfile
+    assert pathlib.Path(path).parent != pathlib.Path(tempfile.gettempdir()), "not the shared temp dir"
     strict = json.loads(pathlib.Path(path).read_text())
     for obj in _objects(strict):
         assert obj["additionalProperties"] is False and set(obj["required"]) == set(obj["properties"]), obj
@@ -2402,3 +2405,18 @@ def test_a_gated_task_drops_its_reservation(env):
     d.gates[provider] = types.SimpleNamespace(allow_new_work=False, max_parallel=0)
     d.dispatch()
     assert locks.reserved_by(mark) is None, "a task a gate kept out still held its reservation"
+
+
+def test_a_run_that_never_launched_its_agent_costs_nothing(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    rid = p.db.x("INSERT INTO runs(role,provider,model,started,status) VALUES('worker','codex','',?,'running')",
+                 (time.time(),))
+    run_dir = p.runs / str(rid)
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text(json.dumps({"budget_usd": 2.0, "timeout_s": 100}))
+    t0 = time.time() - 50
+    d.finish_run(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)),
+                 {"rc": None, "started": t0, "ended": t0 + 50, "stopped": "resource_busy", "launched": False})
+    assert p.db.one("SELECT cost_usd FROM runs WHERE id=?", (rid,))["cost_usd"] == 0

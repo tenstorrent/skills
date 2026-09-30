@@ -1146,7 +1146,10 @@ def _exclusive(task: dict) -> list[str]:
 def _cut_off_cost(run_dir: Path, exit_info: dict) -> float:
     """A run stopped before its provider reported any usage (Codex and Cursor report it only at the
     end) still spent money. Book the elapsed share of its dollar budget rather than $0, so the
-    caps keep counting it."""
+    caps keep counting it. A run whose agent never started (it gave up waiting for a resource)
+    spent nothing."""
+    if exit_info.get("launched") is False:
+        return 0.0
     try:
         spec = json.loads((run_dir / "run.json").read_text())
     except (OSError, ValueError):

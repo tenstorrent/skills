@@ -10,7 +10,6 @@ import hashlib
 import json
 import os
 import subprocess
-import tempfile
 from pathlib import Path
 
 from . import register
@@ -210,7 +209,10 @@ def drop_nulls(value):
 def schema_file(schema: dict) -> str:
     """One file per distinct schema, reused across runs, so coordinator turns leave no temp files."""
     text = json.dumps(schema, sort_keys=True)
-    path = Path(tempfile.gettempdir()) / f"ttp-schema-{hashlib.sha256(text.encode()).hexdigest()[:16]}.json"
+    # A per-user directory: in the shared temp dir another user could create the file first.
+    cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "ttp"
+    cache.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = cache / f"ttp-schema-{hashlib.sha256(text.encode()).hexdigest()[:16]}.json"
     if not path.exists() or path.read_text(errors="replace") != text:
         tmp = path.with_suffix(f".{os.getpid()}.tmp")
         tmp.write_text(text)

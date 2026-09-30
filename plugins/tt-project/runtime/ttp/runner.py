@@ -93,7 +93,7 @@ def supervise(run_dir: Path) -> int:
     held = _take_exclusive(run_dir, spec.get("exclusive") or [], spec.get("env", {}), started + wait_s)
     if held is None:
         exit_info = {"rc": None, "started": started, "ended": time.time(),
-                     "stopped": stop_reason(run_dir) or "resource_busy"}
+                     "stopped": stop_reason(run_dir) or "resource_busy", "launched": False}
         (run_dir / "exit.json.tmp").write_text(json.dumps(exit_info))
         os.replace(run_dir / "exit.json.tmp", run_dir / "exit.json")
         return 1
