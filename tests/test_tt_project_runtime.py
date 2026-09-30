@@ -723,6 +723,25 @@ def test_the_web_app_drops_high_alerts_once_their_condition_clears(env):
     assert "Runs cannot start" not in shown(), "a run started since, yet the alert stayed"
 
 
+def test_the_red_budget_alert_is_posted_after_the_gates_show_red(env, monkeypatch):
+    """A relay polling between the post and the gates write would see the alert as cleared."""
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    d.update_gates()
+    p.db.spend("fake", 150.0, "task:1")
+    seen = []
+    post = d.p.db.post
+
+    def spy(*a, **kw):
+        if str(kw.get("ref", "")).startswith("budget:"):
+            seen.append((p.db.kv("gates") or {}).get("fake", {}).get("level"))
+        return post(*a, **kw)
+    monkeypatch.setattr(d.p.db, "post", spy)
+    d.update_gates()
+    assert seen == ["red"], seen
+
+
 def test_relays_skip_high_alerts_whose_condition_cleared_before_delivery(env, capsys, monkeypatch):
     """A chat, the desktop notifier or Slack catching up after being down must not replay a high
     alert that no longer applies. Alerts that still hold, and lower-severity follow-ups, still go."""

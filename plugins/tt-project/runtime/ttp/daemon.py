@@ -706,7 +706,7 @@ class Daemon:
 
     def update_gates(self) -> None:
         windows = bud.plan_windows(self.p.db)
-        gates = {}
+        gates, alerts = {}, []
         # After a restart the last levels come from disk, so a change while the daemon was down is news.
         saved = {} if self.gates else (self.p.db.kv("gates") or {})
         for prov in {self.cfg.get("core_provider", "claude"), *[t["provider"] for t in self.p.db.q(
@@ -730,11 +730,14 @@ class Daemon:
                     hint = ("New work is paused; replies to you continue. " +
                             ("You can raise the cap (carefully) by telling me, or in the web app."
                              if capped else "The web app's Budget tab shows what spent it."))
-                self.p.db.post("out", f"Budget for {prov} is now {g.level}: {'; '.join(g.reasons) or 'back to normal'}. "
-                               + hint, chat=None, kind="alert", severity=sev, ref=f"budget:{prov}")
+                alerts.append((f"Budget for {prov} is now {g.level}: {'; '.join(g.reasons) or 'back to normal'}. "
+                               + hint, sev, f"budget:{prov}"))
             gates[prov] = g
         self.gates = gates
+        # Gates first: a relay reading an alert before the gates show red would count it as cleared.
         self.p.db.set_kv("gates", {k: v.as_dict() for k, v in gates.items()})
+        for text, sev, ref in alerts:
+            self.p.db.post("out", text, chat=None, kind="alert", severity=sev, ref=ref)
 
     # schedules and watchers ------------------------------------------------------------------------
     def run_schedules(self) -> None:
