@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import json
 
-from .db import load_result
+from .db import continues_id, load_result
 from .project import Project
 
 
@@ -88,6 +88,14 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None) -> str:
     prev = load_result(task["result"])
     if prev:
         history = f"\nPrevious attempt ended '{prev.get('status')}': {str(prev.get('summary') or '')[:1500]}\n"
+    old_id = continues_id(task)
+    old = p.db.task(old_id) if old_id else None
+    if old:
+        on = f" on branch {old['branch']}" if old["kind"] == "code" and old["branch"] else ""
+        was = str(load_result(old["result"]).get("summary") or old["blocked_reason"] or "")[:1500]
+        history += (f"\nThis task continues #{old['id']} {old['title']} ({old['status']}){on}"
+                    + (", and starts from that branch's head" if on and kind == "code" else "")
+                    + (f". Its last summary: {was}" if was else "") + "\n")
     delivery = cfg.get("delivery", {})
     parts = [
         f"# YOUR TASK #{task['id']}: {task['title']}\n"

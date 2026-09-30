@@ -1388,6 +1388,115 @@ def test_task_add_rejects_unknown_or_dead_dependencies(env):
     assert not coord.apply(p, [{"type": "task_add", "title": "fine", "depends_on": [ok, ok]}])
     assert json.loads(p.db.one("SELECT depends_on FROM tasks WHERE title='fine'")["depends_on"]) == [ok]
 
+def test_task_add_continues_takes_over_the_dead_tasks_dependents(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    old = p.db.add_task("old", "s", origin="user")
+    p.db.update_task(old, status="failed")
+    gone = p.db.add_task("gone", "s", origin="user")
+    p.db.update_task(gone, status="cancelled")
+    b = p.db.add_task("b", "s", origin="user", depends_on=[old])
+    c = p.db.add_task("c", "s", origin="user", depends_on=[old])
+    both = p.db.add_task("both", "s", origin="user", depends_on=[old, gone])
+    finished = p.db.add_task("finished", "s", origin="user", depends_on=[old])
+    p.db.update_task(finished, status="done")
+    d.tick()
+    assert all(p.db.task(t)["status"] == "blocked" for t in (b, c, both))
+    assert coord.apply(p, [{"type": "task_add", "title": "redo old", "spec": "s", "continues": old}]) == []
+    new = p.db.one("SELECT * FROM tasks WHERE title='redo old'")
+    assert f"continues:{old}" in json.loads(new["labels"])
+    for t in (b, c):
+        assert json.loads(p.db.task(t)["depends_on"]) == [new["id"]]
+        assert p.db.task(t)["status"] == "queued" and not p.db.task(t)["blocked_reason"]
+    assert json.loads(p.db.task(both)["depends_on"]) == [new["id"], gone]
+    assert p.db.task(both)["status"] == "blocked", "a task still on another dead dependency was requeued"
+    assert json.loads(p.db.task(finished)["depends_on"]) == [old], "a finished task's history was rewritten"
+    d.tick()
+    assert p.db.task(b)["status"] == "queued" and p.db.task(c)["status"] == "queued"
+    assert f"continues #{old}" in coord.digest(p, {}, [], [])
+
+
+@pytest.mark.parametrize("status", ["queued", "running", "done", "waiting"])
+def test_task_add_continues_only_a_failed_cancelled_or_blocked_task(env, status):
+    p = make(env)
+    from ttp import coordinator as coord
+    old = p.db.add_task("old", "s", origin="user")
+    p.db.update_task(old, status=status)
+    dep = p.db.add_task("dep", "s", origin="user", depends_on=[old])
+    before = p.db.one("SELECT COUNT(*) n FROM tasks")["n"]
+    problems = coord.apply(p, [{"type": "task_add", "title": "redo", "continues": old}])
+    assert len(problems) == 1 and f"#{old} is {status}" in problems[0], problems
+    assert p.db.one("SELECT COUNT(*) n FROM tasks")["n"] == before, "a rejected continue created a task"
+    assert json.loads(p.db.task(dep)["depends_on"]) == [old]
+    for bad, why in ((999, "no task #999"), ("x", "task id")):
+        problems = coord.apply(p, [{"type": "task_add", "title": f"redo {bad}", "continues": bad}])
+        assert len(problems) == 1 and why in problems[0], problems
+
+
+def test_task_add_continues_rejects_a_dependency_on_its_own_dependents(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    old = p.db.add_task("old", "s", origin="user")
+    p.db.update_task(old, status="blocked")
+    child = p.db.add_task("child", "s", origin="user", depends_on=[old])
+    grandchild = p.db.add_task("grandchild", "s", origin="user", depends_on=[child])
+    for deps in ([child], [grandchild], [old]):
+        problems = coord.apply(p, [{"type": "task_add", "title": f"redo {deps}", "continues": old,
+                                    "depends_on": deps}])
+        assert len(problems) == 1 and ("cycle" in problems[0] or "it continues" in problems[0]), problems
+    assert json.loads(p.db.task(child)["depends_on"]) == [old]
+
+
+def test_a_code_task_continues_from_the_dead_tasks_branch(env):
+    p = make(env)
+    from ttp import coordinator as coord, prompts, worktree
+    old = p.db.add_task("old", "s", kind="code", tier="light", origin="user")
+    path, branch = worktree.ensure(p, p.db.task(old))
+    (path / "work.txt").write_text("half done")
+    _git_out(path, "add", ".")
+    _git_out(path, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "half")
+    head = _git_out(path, "rev-parse", "HEAD")
+    p.db.update_task(old, status="failed", branch=branch,
+                     result=json.dumps({"status": "failed", "summary": "ran out of budget at step 3"}))
+    assert coord.apply(p, [{"type": "task_add", "title": "finish old", "kind": "code", "continues": old}]) == []
+    new = p.db.one("SELECT * FROM tasks WHERE title='finish old'")
+    new_path, new_branch = worktree.ensure(p, new)
+    assert new_branch != branch
+    assert _git_out(new_path, "rev-parse", "HEAD") == head
+    text = prompts.worker_task(p, new, str(new_path), new_branch)
+    assert f"#{old}" in text and branch in text and "ran out of budget at step 3" in text
+
+
+def test_a_block_on_a_dead_dependency_left_after_a_turn_is_raised_once(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    dead = p.db.add_task("dead", "s", origin="user")
+    p.db.update_task(dead, status="failed")
+    child = p.db.add_task("child", "s", origin="user", depends_on=[dead])
+    d.tick()
+    assert p.db.task(child)["status"] == "blocked"
+
+    def raised():
+        return p.db.q("SELECT * FROM events WHERE kind='dead_dependency' AND task=?", (child,))
+    d.tick()
+    assert not raised(), "raised before the coordinator had a turn to act"
+    now = time.time()
+    p.db.x("INSERT INTO runs(task,role,started,ended,status) VALUES(NULL,'coordinator',?,?,'ok')", (now + 1, now + 2))
+    for _ in range(3):
+        d.tick()
+    rows = raised()
+    assert len(rows) == 1 and rows[0]["status"] == "queued"
+    assert f"#{dead}" in rows[0]["text"] and "continues" in rows[0]["text"]
+
+
+def test_the_coordinator_is_told_to_continue_a_dead_task():
+    text = (RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text()
+    assert "`continues`" in text and "leaves its dependents blocked" in text
+
+
 def test_a_run_end_is_recorded_whole_or_not_at_all(env, tmp_path, monkeypatch):
     p = make(env)
     from ttp.daemon import Daemon

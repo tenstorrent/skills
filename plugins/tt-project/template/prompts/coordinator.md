@@ -14,7 +14,7 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
 | action | fields | use for |
 |---|---|---|
 | `reply` | `chat`, `text` | answer the chat that asked (chat id from the event) |
-| `task_add` | `title`, `spec`, `kind`, `tier`, `priority` 1-5, optional `reply_chat`, `depends_on`, `provider`, `budget_usd`, `resources`, `exclusive` | all real work |
+| `task_add` | `title`, `spec`, `kind`, `tier`, `priority` 1-5, optional `reply_chat`, `depends_on`, `provider`, `budget_usd`, `resources`, `exclusive`, `continues` (id of a failed, cancelled or blocked task this one replaces) | all real work |
 | `task_update` | `id`, `status` (queued/blocked/cancelled/done/waiting), `text` (why, when blocking or cancelling; otherwise added to the spec), `priority`, `spec`, `depends_on` (replaces the list; `[]` clears it) | steer existing tasks |
 | `ask_user` | `text`, `severity`, `blocking`, `recommendation` | a decision only the user can make |
 | `resolve` | `id` (an open ask) | the user answered it, or it no longer matters |
@@ -52,6 +52,9 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
 - A `spec` sent in `task_update` for a running task reaches its worker mid-run. Use that to
   rescope; cancel and re-add only when the work must start over.
 - A task whose resource is busy comes back `waiting` and retries by itself. Do not re-add it.
+- Whenever you re-add, scope down or finish a failed, cancelled or exhausted task, set
+  `continues` to its id. Its dependents move to the new task and requeue, and a code task starts
+  from the old task's branch. Replacing a task without `continues` leaves its dependents blocked.
 - A task blocked on a cancelled or failed dependency stays blocked until you re-point it with
   `task_update` `depends_on` (or `[]`), or cancel it. A requeue that still depends on a dead
   task is rejected, and the reason shows up in your next digest.

@@ -18,7 +18,7 @@ from typing import Any
 
 from . import push
 from . import schedule as sched
-from .db import SEVERITY_RANK, TERMINAL_TASK_STATES, dependency_ids, load_result
+from .db import SEVERITY_RANK, TERMINAL_TASK_STATES, continues_id, dependency_ids, load_result
 from .project import Project
 from .runner import stop_runs
 
@@ -42,7 +42,8 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "every": {"type": "string"}, "at": {"type": "string"}, "enabled": {"type": "boolean"},
             "key": {"type": "string"}, "value": {"type": "string"},
             "blocking": {"type": "string", "enum": list(BLOCKING_REASONS)}, "recommendation": {"type": "string"},
-            "resources": {"type": "array", "items": {"type": "string"}}, "exclusive": {"type": "boolean"}},
+            "resources": {"type": "array", "items": {"type": "string"}}, "exclusive": {"type": "boolean"},
+            "continues": {"type": "integer"}},
             "required": ["type"]}},
         "summary": {"type": "string"},
     },
@@ -149,8 +150,10 @@ def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int]) ->
     rows = db.q("SELECT * FROM tasks WHERE status NOT IN ('done','failed','cancelled') ORDER BY priority, id LIMIT 60")
     for t in rows:
         note = clip(t["blocked_reason"] or load_result(t["result"]).get("summary"), NOTE_CHARS)
+        cont = continues_id(t)
+        title = f"{t['title']} (continues #{cont})" if cont else t["title"]
         lines.append(f"- #{t['id']} | {t['status']} | {t['tier']} | p{t['priority']} | "
-                     f"{(now - t['created']) / 3600:.1f}h | {t['title']} | {note}")
+                     f"{(now - t['created']) / 3600:.1f}h | {title} | {note}")
     if not rows:
         lines.append("- (none)")
     events = (db.q(f"SELECT * FROM events WHERE id IN ({','.join('?' * len(event_ids))}) ORDER BY id", event_ids)
@@ -264,10 +267,17 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if dead:
                     raise ValueError(f"task_add rejected: depends on #{dead[0]} which is {dead[1]}; "
                                      f"drop or replace depends_on")
-                db.add_task(title, a.get("spec") or "", kind=a.get("kind") or "work", tier=tier,
-                            priority=int(a.get("priority") or 3), provider=a.get("provider") or None,
-                            budget_usd=float(budget), depends_on=deps,
-                            reply_chat=a.get("reply_chat") or None, origin="coordinator", labels=labels)
+                old = _continued(db, a["continues"], deps) if a.get("continues") is not None else None
+                if old:
+                    labels.append(f"continues:{old['id']}")
+                with db.tx():
+                    new_id = db.add_task(title, a.get("spec") or "", kind=a.get("kind") or "work", tier=tier,
+                                         priority=int(a.get("priority") or 3), provider=a.get("provider") or None,
+                                         budget_usd=float(budget), depends_on=deps,
+                                         reply_chat=a.get("reply_chat") or None, origin="coordinator",
+                                         labels=labels)
+                    if old:
+                        _take_over_dependents(db, old["id"], new_id)
             elif t == "task_update":
                 task = db.task(int(a["id"]))
                 if not task:
@@ -397,6 +407,43 @@ def _new_dependencies(db, task: dict | None, raw: Any) -> list[int]:
     if task and db.dependency_cycle(task["id"], deps):
         raise ValueError(f"{who} depends_on {deps} would create a cycle")
     return deps
+
+
+def _continued(db, raw: Any, deps: list[int]) -> dict:
+    """The task a new one continues, checked: only work that can no longer finish is taken over,
+    and the new task must not wait on the dependents it takes over."""
+    try:
+        old = db.task(int(raw))
+    except (TypeError, ValueError):
+        raise ValueError("task_add continues must be a task id") from None
+    if not old:
+        raise ValueError(f"task_add continues: no task #{raw}")
+    if old["status"] not in ("failed", "cancelled", "blocked"):
+        raise ValueError(f"task_add continues rejected: #{old['id']} is {old['status']}; only a failed, "
+                         f"cancelled or blocked task can be continued")
+    if old["id"] in deps:
+        raise ValueError(f"task_add cannot depend on #{old['id']}, the task it continues")
+    if any(db.dependency_cycle(t["id"], deps) for t in _open_dependents(db, old["id"])):
+        raise ValueError(f"task_add depends_on {deps} would create a cycle: it waits on a task that "
+                         f"waits on #{old['id']}")
+    return old
+
+
+def _open_dependents(db, task_id: int) -> list[dict]:
+    return [t for t in db.q("SELECT * FROM tasks WHERE status NOT IN ('done','failed','cancelled') "
+                            "AND depends_on NOT IN ('', '[]')") if task_id in dependency_ids(t)]
+
+
+def _take_over_dependents(db, old_id: int, new_id: int) -> None:
+    """Re-point every open task waiting on `old_id` to `new_id`. One blocked only because that
+    dependency died goes back to the queue; a block with another cause stays."""
+    for t in _open_dependents(db, old_id):
+        before = dependency_ids(t)
+        deps = list(dict.fromkeys(new_id if d == old_id else d for d in before))
+        upd: dict[str, Any] = {"depends_on": deps}
+        if t["status"] == "blocked" and db.dead_dependency(before) and not db.dead_dependency(deps):
+            upd.update(status="queued", blocked_reason=None)
+        db.update_task(t["id"], **upd)
 
 
 def dir_list(v: Any) -> list[str]:

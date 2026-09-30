@@ -8,6 +8,7 @@ import re
 import subprocess
 from pathlib import Path
 
+from .db import continues_id
 from .project import Project
 
 
@@ -60,8 +61,22 @@ def ensure(p: Project, task: dict) -> tuple[Path, str]:
         _git(p.root, "worktree", "add", str(path), branch)
     else:
         _git(p.root, "fetch", "--quiet", "origin", check=False)
-        _git(p.root, "worktree", "add", "-b", branch, str(path), resolve_base(p))
+        _git(p.root, "worktree", "add", "-b", branch, str(path), continued_head(p, task) or resolve_base(p))
     return path, branch
+
+
+def continued_head(p: Project, task: dict) -> str | None:
+    """The head of the branch of the code task this one continues, so its commits carry over.
+    A branch of its own lets the old worktree stay checked out until it is pruned."""
+    old_id = continues_id(task)
+    old = p.db.task(old_id) if old_id else None
+    if not old or old["kind"] != "code" or not old["branch"]:
+        return None
+    for cand in (old["branch"], f"origin/{old['branch']}"):
+        head = _git(p.root, "rev-parse", "--verify", "--quiet", f"{cand}^{{commit}}", check=False)
+        if head:
+            return head
+    return None
 
 
 def resolve_base(p: Project) -> str:

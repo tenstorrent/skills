@@ -45,7 +45,9 @@ in `state/runs/<id>/`, so a daemon restart never loses a result.
 12. A run's end, its spend and its task's new state commit in one transaction. No state row can
     wedge the loop: a task never stays `running` without a live run, and a queued task whose
     dependency failed or was cancelled is blocked with the reason. The coordinator unsticks it by
-    re-pointing `depends_on`; a requeue onto a dead dependency is rejected, never silently undone.
+    re-pointing `depends_on`, or by adding a replacement with `continues`, which takes over the
+    dependents (and, for code, the branch) in one transaction. A requeue onto a dead dependency is
+    rejected, never silently undone; a block left after a coordinator turn is raised once.
 13. A question to the user carries a blocking reason (access, funds, spend, review, merge,
     irreversible, restriction, human) and waits for the user; anything else is a judgment call
     the coordinator decides and records. Its recommendation is shown so the user can answer in

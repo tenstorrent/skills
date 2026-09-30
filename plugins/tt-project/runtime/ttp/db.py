@@ -286,6 +286,18 @@ def dependency_ids(task: dict) -> list:
     return out
 
 
+def continues_id(task: dict) -> int | None:
+    """The task this one continues (from its `continues:<id>` label), or None."""
+    try:
+        labels = json.loads(task["labels"] or "[]")
+    except ValueError:
+        return None
+    for lb in labels if isinstance(labels, list) else []:
+        if isinstance(lb, str) and lb.startswith("continues:") and lb[10:].isdigit():
+            return int(lb[10:])
+    return None
+
+
 def _first_dead(deps: list, states: dict) -> tuple[Any, str] | None:
     for d in deps:
         why = "does not exist" if states.get(d) is None else states[d]
