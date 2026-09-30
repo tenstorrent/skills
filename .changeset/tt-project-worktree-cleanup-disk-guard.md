@@ -5,7 +5,8 @@
 `tt-project`: A finished task's worktree is now removed soon after the task ends, once it is clean, its
 HEAD is on a branch (branches are never deleted, so `continues` still starts from them), it has no submodules
 set up (their commits may exist only in that worktree, so such a worktree is always kept), it holds no
-git-ignored file that one of the task's hand-offs lists in `artifacts` (removal would delete it; cache clearing
+git-ignored file that any task's hand-off lists in `artifacts`, globs included (other tasks often leave files in an
+earlier task's worktree, and removal would delete them; cache clearing
 skips such files too), and nothing may
 still want it: no unfinished task (a review that pushes from it, say) depends on, continues or names it, the
 coordinator has seen how the task ended, and the task ended at least an hour ago.

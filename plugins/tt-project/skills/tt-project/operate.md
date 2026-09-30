@@ -42,7 +42,7 @@
   directories (`disk.cache_dirs`) and is removed once clean with HEAD on a branch. Branches are never
   deleted, so `continues` still starts from the old commits. A dirty worktree is kept and listed, and
   so is one with submodules set up (their commits may exist only there), and one holding git-ignored
-  files that a hand-off (`result.json` `artifacts`) lists; cache clearing skips those. A worktree is
+  files that any task's hand-off (`result.json` `artifacts`, globs too) lists; cache clearing skips those. A worktree is
   left untouched for at least an hour after its task ends, until the coordinator has seen the result,
   and while an unfinished task still needs it (it depends on or continues the task, or its spec names
   the task's branch, id or `worktrees/tN` path). `disk.worktree_retention_days` waits longer; 0 never tidies.

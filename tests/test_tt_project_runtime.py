@@ -2921,6 +2921,60 @@ def test_ignored_hand_off_artifacts_keep_the_worktree_and_other_ignored_files_do
     assert (hidden / "new.py").exists() and "uncommitted" in res[t3]["why"]
 
 
+def _ignore_tmp(p):
+    exclude = pathlib.Path(_git_out(p.root, "rev-parse", "--git-common-dir"))
+    exclude = (exclude if exclude.is_absolute() else p.root / exclude) / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    exclude.write_text("tmp/\n")
+
+
+def test_another_tasks_hand_off_keeps_the_worktree_it_left_files_in(env, monkeypatch):
+    # Later tasks often write their logs into an earlier task's worktree; removing it deletes them.
+    p = make(env)
+    _no_grace(monkeypatch)
+    from ttp import worktree
+    _ignore_tmp(p)
+    ta, a, _ = _code_task(p, "first")
+    _commit_file(a, "tracked")
+    (a / "tmp").mkdir()
+    (a / "tmp" / "b.log").write_text("task b's log")
+    (a / "tmp" / "stray.log").write_text("nobody's")
+    tc, c, _ = _code_task(p, "untouched")
+    _commit_file(c, "tracked")
+    (c / "tmp").mkdir()
+    (c / "tmp" / "stray.log").write_text("nobody's")
+    tb = p.db.add_task("second", "s", kind="experiment", tier="light", origin="user")
+    p.db.update_task(tb, status="done")
+    # Relative to the tt-project folder; a bare tmp/stray.log is B's own, not A's or C's.
+    _handoff(p, tb, [f"worktrees/t{ta}/tmp/b.log (the drive log)", "tmp/stray.log"])
+    res = {r["task"]: r for r in worktree.sweep(p)}
+    assert (a / "tmp" / "b.log").exists(), "another task's hand-off artifact was lost"
+    assert res[ta]["why"] == "hand-off artifacts inside: tmp/b.log"
+    assert not c.exists() and res[tc]["why"] is None
+
+
+def test_a_glob_hand_off_entry_keeps_the_worktree(env, monkeypatch):
+    p = make(env)
+    _no_grace(monkeypatch)
+    from ttp import worktree
+    _ignore_tmp(p)
+    ta, a, _ = _code_task(p, "weights")
+    _commit_file(a, "tracked")
+    (a / "tmp").mkdir()
+    (a / "tmp" / "px_1.pt").write_bytes(b"w1")
+    (a / "tmp" / "px_2.pt").write_bytes(b"w2")
+    tb, b, _ = _code_task(p, "no match")
+    _commit_file(b, "tracked")
+    (b / "tmp").mkdir()
+    (b / "tmp" / "other.pt").write_bytes(b"w")
+    _handoff(p, ta, ["tmp/px_*.pt (weights)"])
+    _handoff(p, tb, ["tmp/px_*.pt"])
+    res = {r["task"]: r for r in worktree.sweep(p)}
+    assert (a / "tmp" / "px_1.pt").exists() and (a / "tmp" / "px_2.pt").exists()
+    assert res[ta]["why"].startswith("hand-off artifacts inside: tmp/px_")
+    assert not b.exists() and res[tb]["why"] is None
+
+
 def test_a_finished_worktree_stays_while_an_unfinished_task_still_needs_it(env, monkeypatch):
     p = make(env)
     _no_grace(monkeypatch)

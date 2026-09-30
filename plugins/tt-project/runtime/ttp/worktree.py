@@ -152,24 +152,26 @@ def _ignored(path: Path) -> set[str] | None:
     return {e.rstrip("/") for e in out.stdout.split("\0") if e} if out.returncode == 0 else None
 
 
-def _handoff_paths(p: Project, task_id: int) -> list[str]:
-    """The `artifacts` of every hand-off (result.json) the task's runs wrote."""
+def handoff_paths(p: Project) -> list[tuple[int, str]]:
+    """(task, entry) for each `artifacts` entry of every hand-off (result.json) any run wrote. Other
+    tasks often leave files in an earlier task's worktree, so a sweep reads them all, once."""
     import json
     out = []
-    for r in p.db.q("SELECT id, dir FROM runs WHERE task=?", (task_id,)):
+    for r in p.db.q("SELECT id, task, dir FROM runs WHERE task IS NOT NULL"):
         try:
             data = json.loads(((Path(r["dir"]) if r["dir"] else p.runs / str(r["id"])) / "result.json").read_text())
         except (OSError, ValueError):
             continue
         arts = data.get("artifacts") if isinstance(data, dict) else None
-        out += [a for a in arts if isinstance(a, str)] if isinstance(arts, list) else []
+        out += [(r["task"], a) for a in arts if isinstance(a, str)] if isinstance(arts, list) else []
     return out
 
 
-def _existing(entry: str, bases: list[Path]) -> Path | None:
-    """The file an artifact entry names, or None. Entries may be absolute or relative to one of
-    `bases`, and may carry trailing text ("out.mp4 (the video)", "run.log:12"), so the longest
-    leading part that exists wins."""
+def _existing(entry: str, bases: list[Path]) -> list[Path]:
+    """The files an artifact entry names. Entries may be absolute or relative to one of `bases`,
+    may be globs (tmp/px_*.pt), and may carry trailing text ("out.mp4 (the video)", "run.log:12"),
+    so the longest leading part that exists wins."""
+    import glob
     words = entry.strip().split()
     for n in range(len(words), 0, -1):
         text = " ".join(words[:n])
@@ -181,32 +183,36 @@ def _existing(entry: str, bases: list[Path]) -> Path | None:
             for full in ([q] if q.is_absolute() else [b / q for b in bases]):
                 try:
                     if full.exists():
-                        return full
+                        return [full]
+                    found = [Path(m) for m in glob.glob(str(full), recursive=True)] if any(
+                        c in cand for c in "*?[") else []
+                    if found:
+                        return found
                 except OSError:
                     continue
-    return None
+    return []
 
 
-def handoff_artifacts(p: Project, task_id: int, path: Path, ignored: set[str] | None = None) -> list[str]:
-    """Hand-off artifacts of the task (its result.json `artifacts`) that still exist inside its
-    worktree and that git ignores, relative to the worktree. `git worktree remove` deletes ignored
-    files, and only those: tracked ones are on the branch, other untracked ones keep the worktree."""
+def handoff_artifacts(p: Project, task_id: int, path: Path, ignored: set[str] | None = None,
+                      entries: list[tuple[int, str]] | None = None) -> list[str]:
+    """Hand-off artifacts (any task's result.json `artifacts`, see handoff_paths) that still exist
+    inside this task's worktree and that git ignores, relative to the worktree. An entry is read
+    relative to its own task's worktree or the project. `git worktree remove` deletes ignored files,
+    and only those: tracked ones are on the branch, other untracked ones keep the worktree."""
     ignored = _ignored(path) if ignored is None else ignored
     if not ignored:
         return []
     root = path.resolve()
     found: list[str] = []
-    for entry in _handoff_paths(p, task_id):
-        full = _existing(entry, [path, p.root])
-        if full is None:
-            continue
-        try:
-            rel = full.resolve().relative_to(root).as_posix()
-        except (OSError, ValueError):
-            continue
-        if rel != "." and rel not in found and any(
-                rel == e or rel.startswith(e + "/") or e.startswith(rel + "/") for e in ignored):
-            found.append(rel)
+    for tid, entry in handoff_paths(p) if entries is None else entries:
+        for full in _existing(entry, [path if tid == task_id else p.worktrees / f"t{tid}", p.root, p.base]):
+            try:
+                rel = full.resolve().relative_to(root).as_posix()
+            except (OSError, ValueError):
+                continue
+            if rel != "." and rel not in found and any(
+                    rel == e or rel.startswith(e + "/") or e.startswith(rel + "/") for e in ignored):
+                found.append(rel)
     return found
 
 
@@ -282,7 +288,7 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
           skip=lambda task: False) -> list[dict]:
     """Tidy the worktrees of finished tasks (done, failed, cancelled) with no run still going: clear
     their build and cache directories, then remove each one whose removal loses nothing (see
-    keep_reason) and that holds none of the task's hand-off artifacts (see handoff_artifacts:
+    keep_reason) and that holds no task's hand-off artifacts (see handoff_artifacts:
     `git worktree remove` deletes ignored files, where workers often leave them). A worktree that may still be wanted (see held_by: an unfinished task needs it, the
     coordinator has not seen the finish yet, or it ended under FINISH_GRACE_S ago) is left as it
     is, and reported with `held` set. Branches stay, so a task that `continues` one starts from its
@@ -301,6 +307,7 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
             return []
         out = []
         now = time.time()
+        entries = None
         open_tasks = p.db.q("SELECT id, status, spec, depends_on, labels FROM tasks WHERE status NOT IN (%s)"
                             % ",".join("?" * len(TERMINAL_TASK_STATES)), TERMINAL_TASK_STATES)
         for path in sorted(p.worktrees.iterdir()):
@@ -317,7 +324,8 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
                 out.append({**res, "cleared": [], "held": True, "why": why})
                 continue
             try:
-                arts = handoff_artifacts(p, task["id"], path)
+                entries = handoff_paths(p) if entries is None else entries
+                arts = handoff_artifacts(p, task["id"], path, entries=entries)
                 res["cleared"] = clear_caches(path, names, keep=arts)
                 res["why"] = keep_reason(path) or (
                     f"hand-off artifacts inside: {', '.join(arts[:3])}"[:200] + (f" (+{len(arts) - 3} more)"
