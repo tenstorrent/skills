@@ -367,6 +367,36 @@ def test_listener_redelivers_until_acknowledged(env):
     assert p.db.one("SELECT last_read FROM chats WHERE id='c1'")["last_read"] == mid
 
 
+
+def test_listen_ack_is_clamped_to_known_messages(env):
+    """An `--ack` past the newest message stops at it, and an older `--ack` never moves back."""
+    p = make(env)
+    p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)",
+           (time.time(), "t", time.time()))
+    run_env = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost")
+    cmd = [sys.executable, str(TTP), "listen", "demo", "--chat", "c1", "--once", "--timeout", "1"]
+    mid = p.db.post("out", "first", chat="c1", kind="reply")
+    top = p.db.one("SELECT MAX(id) m FROM messages")["m"]
+    subprocess.run(cmd + ["--ack", str(top + 1000)], env=run_env, capture_output=True, text=True, timeout=30)
+    assert p.db.one("SELECT last_read FROM chats WHERE id='c1'")["last_read"] == top
+    later = p.db.post("out", "second", chat="c1", kind="reply")
+    assert later > top, "a future message would have been pre-acknowledged"
+    subprocess.run(cmd + ["--ack", str(mid - 1)], env=run_env, capture_output=True, text=True, timeout=30)
+    assert p.db.one("SELECT last_read FROM chats WHERE id='c1'")["last_read"] == top
+
+
+def test_config_refreshes_last_good_on_equal_mtime(env):
+    """Two writes in one filesystem clock tick share an mtime; the newer config still becomes last-good."""
+    p = make(env)
+    p.set_config("budget.daily_usd", 42)
+    p.config()
+    good = p.state / "project.last-good.json"
+    p.set_config("budget.daily_usd", 43)
+    stamp = good.stat().st_mtime
+    os.utime(p.config_path, (stamp, stamp))
+    assert p.config()["budget"]["daily_usd"] == 43
+    assert json.loads(good.read_text())["budget"]["daily_usd"] == 43
+
 def test_web_chat_shows_replies_to_every_chat(env):
     p = make(env)
     from ttp import web
