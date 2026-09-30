@@ -16,7 +16,7 @@ from urllib.parse import parse_qs, urlparse
 from . import budget as bud
 from . import schedule as sched
 from .daemon import HEARTBEAT_STALE_S, heartbeat
-from .db import DB, SEVERITY_RANK, chat_floor, load_result
+from .db import DB, SEVERITY_RANK, chat_floor, dump_result, load_result
 from .project import Project
 from .providers import get_provider
 from .runner import stop_runs
@@ -401,6 +401,12 @@ class Handler(BaseHTTPRequestHandler):
                     if not db.conn.execute("UPDATE tasks SET status='queued', blocked_reason=NULL, updated=? "
                                            "WHERE id=? AND status!='running'", (time.time(), tid)).rowcount:
                         return self._send(409, {"error": f"task #{tid} is running: cancel it first"})
+                    prev = load_result(t["result"])
+                    if t["status"] != "queued" and "waiting_since" in prev:
+                        # A requeue is a decision to run it, not to sleep on its probe.
+                        prev.pop("waiting_since")
+                        db.x("UPDATE tasks SET result=? WHERE id=? AND result=?",
+                             (dump_result(prev), tid, t["result"]))
                 elif body.get("status") == "cancelled":
                     db.update_task(tid, status="cancelled")
                     stop_runs(db, p.runs, tid)

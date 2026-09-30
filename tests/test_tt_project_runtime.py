@@ -2117,9 +2117,11 @@ def test_web_cannot_requeue_a_running_task(env, tmp_path):
             time.sleep(0.1)
     assert code == 409
     assert p.db.task(tid)["status"] == "running", "a second run of the same task could start"
-    p.db.update_task(tid, status="failed")
+    p.db.update_task(tid, status="failed", result=json.dumps({"status": "waiting", "retry_when": "exit 1",
+                                                              "waiting_since": time.time()}))
     urllib.request.urlopen(req, timeout=2)
     assert p.db.task(tid)["status"] == "queued"
+    assert "waiting_since" not in json.loads(p.db.task(tid)["result"]), "a requeue must not sleep on the probe"
 
 
 def test_harness_commits_wait_until_the_run_end_is_saved(env, tmp_path, monkeypatch):
@@ -4912,6 +4914,21 @@ def test_a_timed_out_probe_is_broken(env, monkeypatch):
     p.db.update_task(tid, not_before=time.time() - 1)
     d.probe_waiting()
     assert _ready(p, tid) and json.loads(p.db.task(tid)["result"])["woke"] == "probe broken: timeout"
+
+
+def test_a_probe_that_cannot_start_is_broken(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    tid = _due_waiting_task(p, "exit 1")
+
+    def refuse(*a, **k):
+        raise OSError("no shell")
+    monkeypatch.setattr(dmod.subprocess, "Popen", refuse)
+    d.probe_waiting()          # asks the probe first; it cannot start
+    p.db.update_task(tid, not_before=time.time() - 1)
+    d.probe_waiting()
+    assert _ready(p, tid) and json.loads(p.db.task(tid)["result"])["woke"] == "probe broken: could not start"
 
 
 def test_a_waiting_task_wakes_at_the_hold_cap_whatever_its_probe_says(env):
