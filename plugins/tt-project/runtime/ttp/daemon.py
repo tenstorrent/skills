@@ -566,7 +566,8 @@ class Daemon:
             if usage.auth_failed:
                 # Logged out is not a task failure and not worth retrying blindly: pause this provider,
                 # say exactly how to fix it, and probe again every 15 minutes (a cheap decision turn).
-                db.set_kv(f"limited:{r['provider']}", {"until": time.time() + 900, "note": "logged out"})
+                db.set_kv(f"limited:{r['provider']}", {"until": time.time() + 900, "note": "logged out",
+                                                       "creds": prov.credentials_stamp()})
                 self.alert(f"auth:{r['provider']}",
                            f"{r['provider']} on {hostname()} is logged out ({(usage.final_text or usage.error)[:120]}). "
                            f"Log in once on that machine ({prov.login_hint}). "
@@ -821,6 +822,22 @@ class Daemon:
                 self._metering = False
         threading.Thread(target=work, daemon=True).start()
 
+    def _provider_pause(self, prov: str) -> dict | None:
+        """The provider's pause, or None once a logged-out pause is over because a login changed its
+        credential files. The check is a stat, so a waiting pause costs no model call."""
+        lim = self.p.db.kv(f"limited:{prov}")
+        if not lim or lim.get("note") != "logged out" or not lim.get("creds") or lim.get("until", 0) <= time.time():
+            return lim
+        try:
+            stamp = get_provider(prov).credentials_stamp()
+        except Exception:   # an unknown provider keeps its pause until it expires
+            return lim
+        if not stamp or stamp == lim["creds"]:
+            return lim
+        self.p.db.set_kv(f"limited:{prov}", {**lim, "until": 0, "note": "credentials changed"})
+        log(self.p, f"{prov} credentials changed; ending the logged-out pause")
+        return None
+
     def update_gates(self) -> None:
         windows = bud.plan_windows(self.p.db)
         gates, alerts = {}, []
@@ -829,7 +846,7 @@ class Daemon:
         for prov in {self.cfg.get("core_provider", "claude"), *[t["provider"] for t in self.p.db.q(
                 "SELECT DISTINCT provider FROM tasks WHERE provider IS NOT NULL AND status IN ('queued','running')")]}:
             g = bud.evaluate(self.p.db, self.cfg, prov, windows)
-            lim = self.p.db.kv(f"limited:{prov}")
+            lim = self._provider_pause(prov)
             if lim and lim.get("until", 0) > time.time():
                 bud._raise(g, "red", f"provider limit: {lim.get('note')}")
                 g.max_parallel, g.allow_new_work, g.allow_optional = 0, False, False
@@ -985,7 +1002,7 @@ class Daemon:
         gate = self.gates.get(self.cfg.get("core_provider", "claude"))
         if gate and gate.level == "red" and not msgs:
             return
-        lim = db.kv(f"limited:{self.cfg.get('core_provider', 'claude')}")
+        lim = self._provider_pause(self.cfg.get("core_provider", "claude"))
         if lim and lim.get("until", 0) > now:
             return   # provider paused (logged out or at its limit); the pause expiry is the retry
         gates = {k: v.as_dict() for k, v in self.gates.items()}

@@ -76,6 +76,21 @@ class Provider:
     def binary(self) -> str | None:
         return find_binary(*self.binaries)
 
+    def credential_files(self) -> list[str]:
+        """Files a login writes; a change to one ends a logged-out pause without waiting it out."""
+        return []
+
+    def credentials_stamp(self) -> str:
+        """Cheap fingerprint (path, mtime, size) of credential_files(); "" when this provider has none."""
+        parts = []
+        for f in self.credential_files():
+            try:
+                st = os.stat(f)
+                parts.append(f"{f}:{st.st_mtime_ns}:{st.st_size}")
+            except OSError:
+                parts.append(f"{f}:-")
+        return "|".join(parts)
+
     def available(self) -> bool:
         return self.binary() is not None
 

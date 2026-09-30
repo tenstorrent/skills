@@ -4752,3 +4752,23 @@ def test_a_review_runs_at_the_tier_its_diff_needs(env, monkeypatch):
 def test_the_coordinator_prompt_leaves_review_tiers_to_the_diff():
     text = (RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text()
     assert "A `review` gets its tier from the diff" in text and "Set `deep` only to force it" in text
+
+
+def test_a_login_ends_the_logged_out_pause_without_a_model_call(env, monkeypatch, tmp_path):
+    creds = tmp_path / "creds.json"
+    creds.write_text("{}")
+    monkeypatch.setenv("TTP_FAKE_CREDENTIALS", str(creds))
+    p = make(env)
+    from ttp.daemon import Daemon
+    from ttp.providers import get_provider
+    d = Daemon(p.base)
+    p.db.set_kv("limited:fake", {"until": time.time() + 900, "note": "logged out",
+                                 "creds": get_provider("fake").credentials_stamp()})
+    d.update_gates()
+    assert d.gates["fake"].level == "red" and d._provider_pause("fake")
+    runs = p.db.one("SELECT COUNT(*) n FROM runs")["n"]
+    creds.write_text('{"token": "new login"}')
+    d.update_gates()
+    assert d.gates["fake"].level != "red"
+    assert (p.db.kv("limited:fake") or {}).get("until", 0) <= time.time()
+    assert p.db.one("SELECT COUNT(*) n FROM runs")["n"] == runs   # detected by a stat, not a model turn

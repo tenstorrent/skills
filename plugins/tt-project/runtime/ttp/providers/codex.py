@@ -28,6 +28,9 @@ class Codex(Provider):
     name = "codex"
     binaries = ("codex",)
     login_hint = "run `codex login` there"
+
+    def credential_files(self) -> list[str]:
+        return [str(Path(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")) / "auth.json")]
     isolate_read_only = True
 
     def build(self, *, role, model, effort, cwd, budget_usd, read_only, schema, restrictions):

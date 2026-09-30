@@ -29,6 +29,9 @@ class Claude(Provider):
     binaries = ("claude",)
     login_hint = "run `claude` there and use /login"
 
+    def credential_files(self) -> list[str]:
+        return [str(Path(os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")) / ".credentials.json")]
+
     def build(self, *, role, model, effort, cwd, budget_usd, read_only, schema, restrictions):
         argv = [self.binary() or "claude", "-p", "--output-format", "stream-json", "--verbose", "--no-chrome"]
         if model:
