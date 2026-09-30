@@ -109,10 +109,12 @@ class Claude(Provider):
         for ev in self._events(output_path):
             if ev.get("type") == "assistant" and ev.get("error") == "authentication_failed":
                 u.auth_failed = True
-        blob = u.final_text + " " + u.error
+        stderr = ""
         if stderr_path and Path(stderr_path).exists():
-            blob += " " + Path(stderr_path).read_text(errors="replace")[-2000:]
-        if not u.cost_usd and AUTH_RE.search(blob):
+            stderr = Path(stderr_path).read_text(errors="replace")[-2000:]
+        blob = u.final_text + " " + u.error + " " + stderr
+        # Not final_text: a killed worker's last message may just be discussing a 401.
+        if not u.cost_usd and AUTH_RE.search(u.error + " " + stderr):
             u.auth_failed = True
         if LIMIT_RE.search(blob) and (u.error or not u.cost_usd) and not u.auth_failed:
             u.limited, u.limit_note = True, LIMIT_RE.search(blob).group(0)
