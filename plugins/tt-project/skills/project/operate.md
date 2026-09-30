@@ -7,7 +7,7 @@
 | `ttp list` | projects known on this machine |
 | `ttp find <name>` | locate by registry, then by chat-log locators |
 | `ttp adopt <name> --host H --dir D` | record where a project lives |
-| `ttp status <name> [--json]` | daemon, budget gates, running/blocked tasks, open questions |
+| `ttp status <name> [--json]` | daemon, spend vs caps, coordinator health, why idle, running/blocked/waiting tasks, open questions |
 | `ttp task <name> list` / `add "<title>" --spec …` | inspect or queue work by hand |
 | `ttp memory <name> "<fact>"` | add a durable fact |
 | `ttp config <name> <key> [value]` | read or set settings (dotted keys) |

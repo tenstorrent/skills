@@ -55,7 +55,7 @@ description: "Start, connect to, and talk with a long-running tt-project: a loca
 
 | User wants | Command |
 |---|---|
-| status / blockers | `ttp status <name>` |
+| status, spend, blockers, why idle | `ttp status <name>` |
 | pause or resume all model work | `ttp pause <name>` / `ttp resume <name>` |
 | change caps | tell the coordinator, or `ttp config <name> budget.daily_usd 150` |
 | restart after trouble | `ttp restart <name>`, then `ttp doctor <name>` |

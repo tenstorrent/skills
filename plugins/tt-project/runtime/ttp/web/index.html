@@ -9,6 +9,7 @@
 <body>
 <header>
   <div class="brand"><span id="pname">project</span><span id="daemon" class="pill">…</span>
+    <span id="spend" class="pill" title="all providers"></span><span id="needs" class="pill lv-red" hidden></span>
     <button id="notify" class="ghost" hidden>Turn on notifications</button></div>
   <nav id="tabs">
     <button data-tab="overview" class="on">Overview</button>
@@ -22,12 +23,13 @@
 <main>
   <div id="banner" class="attn" hidden></div>
   <section id="overview" class="tab on">
+    <p id="why" class="muted"></p>
     <div id="attention"></div>
     <div class="board" id="board"></div>
     <div class="grid">
-      <div class="card"><h2>Budget</h2><div id="gates"></div></div>
+      <div class="card"><h2>Budget</h2><div id="gates"></div><p id="top" class="meta"></p></div>
       <div class="card"><h2>Working now</h2><div id="running"></div></div>
-      <div class="card wide"><h2>Coordinator's last note</h2><p id="coord" class="muted"></p></div>
+      <div class="card wide"><h2>Coordinator</h2><div id="chealth"></div><p id="coord" class="muted"></p></div>
     </div>
     <div class="card"><h2>Recently finished</h2><div id="recent"></div></div>
   </section>

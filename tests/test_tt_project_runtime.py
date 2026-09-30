@@ -559,6 +559,15 @@ def test_web_payload_carries_coordinator_health_and_why_idle(env):
     assert "spent_24h" in h["spend"]
 
 
+def test_web_app_elements_exist_in_the_page():
+    import re
+    web = RUNTIME / "ttp" / "web"
+    html = (web / "index.html").read_text()
+    ids = set(re.findall(r'\$\("#([\w-]+)"\)', (web / "app.js").read_text()))
+    assert {"spend", "needs", "why", "banner", "chealth", "top"} <= ids
+    assert not [i for i in ids if f'id="{i}"' not in html]
+
+
 def _run_until(d, p, cond, timeout=60):
     deadline = time.time() + timeout
     while time.time() < deadline:

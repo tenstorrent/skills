@@ -5,6 +5,7 @@ const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const ago = (ts) => { if (!ts) return "—"; const s = Date.now() / 1000 - ts; return s < 90 ? `${Math.round(s)}s` : s < 5400 ? `${Math.round(s / 60)}m` : s < 172800 ? `${(s / 3600).toFixed(1)}h` : `${Math.round(s / 86400)}d`; };
 const money = (x) => `$${(+x || 0).toFixed(2)}`;
+const at = (ts) => ts ? new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "—";
 
 let TOKEN = new URLSearchParams(location.hash.slice(1)).get("token") || sessionStorage.getItem("ttp_token") || "";
 if (TOKEN) { sessionStorage.setItem("ttp_token", TOKEN); document.cookie = `ttp_token=${TOKEN}; SameSite=Strict; path=/`; history.replaceState(null, "", location.pathname); }
@@ -82,25 +83,40 @@ function board(st) {
     ["you", "Waiting on you", st.tasks.filter((t) => t.status === "blocked").map((t) => `#${t.id} ${t.title}`).concat(asks.map((m) => m.text))],
     ["review", "Ready for review", st.tasks.filter((t) => t.status === "review" || (t.pr_url && t.status === "done")).map((t) => `#${t.id} ${t.title}`)],
     ["work", "Working", st.tasks.filter((t) => t.status === "running").map((t) => `#${t.id} ${t.title}`)],
-    ["queued", "Queued", st.tasks.filter((t) => t.status === "queued").map((t) => `#${t.id} ${t.title}${waiting(t) ? " (waiting)" : ""}`)],
+    ["queued", "Queued", st.tasks.filter((t) => t.status === "queued").map((t) => `#${t.id} ${t.title}${waiting(t) ? ` (waiting, next try ${at(t.not_before)})` : ""}`)],
   ];
   $("#board").innerHTML = cols.map(([cls, name, items]) => `<div class="col ${cls}"><h3>${name}<span class="n">${items.length}</span></h3>` +
     (items.slice(0, 6).map((x) => `<div class="item">${esc(x).slice(0, 160)}</div>`).join("") || `<div class="item muted">—</div>`) + `</div>`).join("");
 }
 
+let lastOk = 0;
 function banner(html) {
   $("#banner").innerHTML = html;
   $("#banner").hidden = !html;
 }
 
+function healthHtml(h) {
+  const c = h.coordinator, parts = [];
+  parts.push(c.last_turn ? `last turn ${ago(c.last_turn)} ago${c.last_status ? ` (${esc(c.last_status)})` : ""}` : "no turn yet");
+  if (c.failures) parts.push(`<span class="lv-red">${c.failures} failed in a row</span>`);
+  if (c.backoff_until) parts.push(`retry at ${at(c.backoff_until)}`);
+  if (c.idle_wake) parts.push(`next idle check ${at(c.idle_wake)}`);
+  return `<div class="row"><span class="meta">${parts.join(" · ")}</span></div>` + h.providers_paused.map((p) =>
+    `<div class="row"><b>${esc(p.provider)}</b><span class="pill lv-red">paused until ${at(p.until)}</span><span>${esc(p.note)}</span><span class="meta">fix: ${esc(p.fix)}</span></div>`).join("");
+}
+
 async function refresh() {
   let st;
   try { st = await api("/api/state"); } catch (e) {
+    if (e.message === "auth") return;
     // The page keeps its last data; say so rather than let it look current.
-    banner(`Cannot reach the daemon (${esc(e.message || e)}). What you see may be out of date. Check <code>ttp status</code>.`);
+    banner(`Cannot reach the daemon (${esc(e.message || e)}). What you see is from ${lastOk ? ago(lastOk / 1000) + " ago" : "earlier"} and may be out of date. Check <code>ttp status</code>.`);
     $("#daemon").textContent = "unreachable"; $("#daemon").className = "pill lv-red";
     return;
   }
+  lastOk = Date.now();
+  // A daemon started before an upgrade serves this file without the health fields until it restarts.
+  const h = st.health || { spend: {}, coordinator: {}, providers_paused: [], asks: [], running: 0, why_idle: "" };
   const cfg = st.project.config || {};
   const hb = st.heartbeat;
   const stuck = hb && hb.age > st.heartbeat_stale_s;
@@ -110,6 +126,12 @@ async function refresh() {
   $("#pname").textContent = st.project.name;
   $("#daemon").textContent = st.paused ? "paused" : stuck ? "stuck" : (st.daemon && st.daemon.pid ? `running on ${st.daemon.host}` : "stopped");
   $("#daemon").className = "pill " + (stuck ? "lv-red" : st.paused ? "lv-orange" : "lv-green");
+  $("#spend").textContent = `${money(h.spend.spent_24h)} 24h · ${money(h.spend.spent_7d)} 7d`;
+  const needs = st.tasks.filter((t) => t.status === "blocked").length + h.asks.length;
+  $("#needs").hidden = !needs; $("#needs").textContent = `${needs} need${needs === 1 ? "s" : ""} you`;
+  $("#why").innerHTML = h.why_idle ? `<b>Idle:</b> ${esc(h.why_idle)}` : `${h.running} run${h.running === 1 ? "" : "s"} working.`;
+  $("#top").textContent = h.spend.top_7d ? `Top spender, 7 days: ${h.spend.top_7d.source} ${money(h.spend.top_7d.usd)}` : "";
+  $("#chealth").innerHTML = healthHtml(h);
   announce(st.attention || [], st.project.name);
   document.title = `${unseen ? "(" + unseen + ") " : ""}${st.project.name} · tt-project`;
   board(st);
