@@ -4772,3 +4772,21 @@ def test_a_login_ends_the_logged_out_pause_without_a_model_call(env, monkeypatch
     assert d.gates["fake"].level != "red"
     assert (p.db.kv("limited:fake") or {}).get("until", 0) <= time.time()
     assert p.db.one("SELECT COUNT(*) n FROM runs")["n"] == runs   # detected by a stat, not a model turn
+
+
+def test_a_login_that_creates_the_missing_credentials_file_ends_the_pause(env, monkeypatch, tmp_path):
+    creds = tmp_path / "creds.json"   # logged out with no credentials file yet
+    monkeypatch.setenv("TTP_FAKE_CREDENTIALS", str(creds))
+    p = make(env)
+    from ttp.daemon import Daemon
+    from ttp.providers import get_provider
+    d = Daemon(p.base)
+    p.db.set_kv("limited:fake", {"until": time.time() + 900, "note": "logged out",
+                                 "creds": get_provider("fake").credentials_stamp()})
+    assert d._provider_pause("fake")
+    creds.write_text("{}")
+    assert d._provider_pause("fake") is None
+    monkeypatch.delenv("TTP_FAKE_CREDENTIALS")   # a provider without credential files waits the pause out
+    p.db.set_kv("limited:fake", {"until": time.time() + 900, "note": "logged out",
+                                 "creds": get_provider("fake").credentials_stamp()})
+    assert d._provider_pause("fake")
