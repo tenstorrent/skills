@@ -653,6 +653,65 @@ def test_dependents_of_a_failed_task_are_blocked(env):
     assert p.db.one("SELECT id FROM events WHERE kind='task_blocked' AND task=?", (child,))
 
 
+def test_a_blocked_task_can_be_repointed_and_stays_queued(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    dead = p.db.add_task("dead", "s", origin="user")
+    p.db.update_task(dead, status="cancelled")
+    redo = p.db.add_task("redo", "s", origin="user", not_before=time.time() + 3600)   # stays unfinished
+    child = p.db.add_task("child", "s", origin="user", depends_on=[dead])
+    other = p.db.add_task("other", "s", origin="user", depends_on=[dead])
+    d.tick()
+    assert p.db.task(child)["status"] == "blocked"
+    ev = p.db.one("SELECT text FROM events WHERE kind='task_blocked' AND task=?", (child,))["text"]
+    assert f"#{dead} cancelled" in ev and "task_update depends_on" in ev and "cancel" in ev
+    assert coord.apply(p, [{"type": "task_update", "id": child, "depends_on": [redo]},
+                           {"type": "task_update", "id": other, "depends_on": [], "status": "queued"}]) == []
+    assert json.loads(p.db.task(child)["depends_on"]) == [redo] and json.loads(p.db.task(other)["depends_on"]) == []
+    assert p.db.task(child)["status"] == "queued" and not p.db.task(child)["blocked_reason"]
+    for _ in range(2):
+        d.tick()
+        assert p.db.task(child)["status"] == "queued", "an accepted re-point was undone by the daemon"
+        assert p.db.task(other)["status"] != "blocked", "a cleared dependency was blocked again"
+
+
+def test_a_requeue_onto_a_dead_dependency_is_rejected_and_reported(env):
+    p = make(env)
+    from types import SimpleNamespace
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    dead = p.db.add_task("dead", "s", origin="user")
+    p.db.update_task(dead, status="failed")
+    child = p.db.add_task("child", "s", origin="user", depends_on=[dead])
+    d.tick()
+    usage = SimpleNamespace(structured={"actions": [{"type": "task_update", "id": child, "status": "queued"}],
+                                        "summary": "requeued"}, error="", final_text="")
+    d._finish_coordinator({"dir": "x"}, usage, "ok", {})
+    assert p.db.task(child)["status"] == "blocked", "a requeue onto a failed dependency was applied"
+    ev = p.db.one("SELECT id, text FROM events WHERE kind='rejected_actions' AND status='queued'")
+    assert f"#{child} rejected: depends on #{dead} which is failed" in ev["text"]
+    assert "drop or replace depends_on" in ev["text"]
+    assert f"#{child} rejected" in coord.digest(p, {}, [ev["id"]], [])
+    problems = coord.apply(p, [{"type": "task_update", "id": child, "depends_on": [dead]}])
+    assert problems and "which is failed" in problems[0] and p.db.task(child)["status"] == "blocked"
+
+
+def test_depends_on_must_name_real_tasks_without_a_cycle(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    a = p.db.add_task("a", "s", origin="user")
+    b = p.db.add_task("b", "s", origin="user", depends_on=[a])
+    c = p.db.add_task("c", "s", origin="user", depends_on=[b])
+    for deps, why in (([999], "no task #999"), ([a], "itself"), ([b, c], "cycle")):
+        problems = coord.apply(p, [{"type": "task_update", "id": a, "depends_on": deps, "priority": 1}])
+        assert len(problems) == 1 and why in problems[0], (deps, problems)
+    assert json.loads(p.db.task(a)["depends_on"]) == [] and p.db.task(a)["priority"] == 3, "a rejected update was applied"
+    assert json.loads(p.db.task(b)["depends_on"]) == [a]
+
+
 def test_a_run_end_is_recorded_whole_or_not_at_all(env, tmp_path, monkeypatch):
     p = make(env)
     from ttp.daemon import Daemon

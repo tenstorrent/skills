@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from . import schedule as sched
-from .db import SEVERITY_RANK, TERMINAL_TASK_STATES, load_result
+from .db import SEVERITY_RANK, TERMINAL_TASK_STATES, dependency_ids, load_result
 from .project import Project
 
 ACTION_TYPES = ("reply", "task_add", "task_update", "ask_user", "resolve", "notify", "memory_add",
@@ -184,6 +184,22 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None) -> l
                     upd["status"] = a["status"]
                     if a["status"] == "queued":
                         upd["blocked_reason"] = None
+                if a.get("depends_on") is not None:
+                    deps = _new_dependencies(db, task, a["depends_on"])
+                    upd["depends_on"] = deps
+                    # A task blocked on a dead dependency is released by re-pointing it.
+                    if "status" not in upd and task["status"] == "blocked" and \
+                            db.dead_dependency(dependency_ids(task)):
+                        upd.update(status="queued", blocked_reason=None)
+                # The daemon blocks a queued task on a dead dependency at once, so accepting this
+                # would report a requeue that does not stick.
+                if upd.get("status", task["status"]) == "queued" and ("status" in upd or "depends_on" in upd):
+                    dead = db.dead_dependency(upd.get("depends_on", dependency_ids(task)))
+                    if dead:
+                        dep, why = dead
+                        raise ValueError(f"#{task['id']} rejected: depends on #{dep} which "
+                                         f"{'does not exist' if why == 'does not exist' else 'is ' + why}; "
+                                         f"drop or replace depends_on")
                 if a.get("text"):
                     upd["blocked_reason"] = a["text"][:500]
                 if a.get("priority"):
@@ -245,6 +261,23 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None) -> l
         except Exception as e:   # one bad action is reported back; it never aborts the turn
             problems.append(f"{t}: {e}")
     return problems
+
+
+def _new_dependencies(db, task: dict, raw: Any) -> list[int]:
+    if not isinstance(raw, list):
+        raise ValueError(f"#{task['id']} depends_on must be a list of task ids")
+    try:
+        deps = list(dict.fromkeys(int(d) for d in raw))
+    except (TypeError, ValueError):
+        raise ValueError(f"#{task['id']} depends_on must be a list of task ids") from None
+    for d in deps:
+        if d == task["id"]:
+            raise ValueError(f"#{task['id']} cannot depend on itself")
+        if not db.task(d):
+            raise ValueError(f"#{task['id']} depends_on: no task #{d}")
+    if db.dependency_cycle(task["id"], deps):
+        raise ValueError(f"#{task['id']} depends_on {deps} would create a cycle")
+    return deps
 
 
 def ask_timeout_h(cfg: dict) -> float:

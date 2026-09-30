@@ -233,7 +233,8 @@ class Daemon:
                 db.update_task(t["id"], status="blocked", blocked_reason=reason)
                 db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                      (now, "daemon", "task_blocked", "normal", f"#{t['id']} {t['title']} is blocked: {reason}. "
-                      f"Requeue it once the dependency is redone, or cancel it.", "handled", t["id"]))
+                      f"The coordinator can re-point it with task_update depends_on (an empty list clears it), "
+                      f"requeue it once the dependency is redone, or cancel it.", "handled", t["id"]))
 
     def finish_run(self, r: dict, exit_info: dict) -> None:
         db, p = self.p.db, self.p

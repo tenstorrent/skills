@@ -11,7 +11,7 @@ Return ONLY the JSON object `{"actions": [...], "summary": "<one line>"}`.
 |---|---|---|
 | `reply` | `chat`, `text` | answer the chat that asked (chat id from the event) |
 | `task_add` | `title`, `spec`, `kind`, `tier`, `priority` 1-5, optional `reply_chat`, `depends_on`, `provider`, `budget_usd`, `resources` | all real work |
-| `task_update` | `id`, `status` (queued/blocked/cancelled/done/waiting), `text`, `priority`, `spec` | steer existing tasks |
+| `task_update` | `id`, `status` (queued/blocked/cancelled/done/waiting), `text`, `priority`, `spec`, `depends_on` (replaces the list; `[]` clears it) | steer existing tasks |
 | `ask_user` | `text`, `severity`, `reversible`, `recommendation` | a decision only the user can make |
 | `resolve` | `id` (an open ask) | the user answered it, or it no longer matters |
 | `notify` | `text`, `severity` | something the user must know |
@@ -36,6 +36,9 @@ Return ONLY the JSON object `{"actions": [...], "summary": "<one line>"}`.
 - A `spec` sent in `task_update` for a running task reaches its worker mid-run. Use that to
   rescope; cancel and re-add only when the work must start over.
 - A task whose resource is busy comes back `waiting` and retries by itself. Do not re-add it.
+- A task blocked on a cancelled or failed dependency stays blocked until you re-point it with
+  `task_update` `depends_on` (or `[]`), or cancel it. A requeue that still depends on a dead
+  task is rejected, and the reason shows up in your next digest.
 - A question you can answer from the digest: `reply` directly. Otherwise a `question` task with
   `reply_chat` set; do NOT send an acknowledgement unless the answer will take over ~10 minutes.
 

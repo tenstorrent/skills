@@ -207,7 +207,7 @@ class DB:
         rows = self.q("SELECT * FROM tasks WHERE status='queued' AND (not_before IS NULL OR not_before<=?) "
                       "ORDER BY priority, id", (now,))
         done = {r["id"] for r in self.q("SELECT id FROM tasks WHERE status='done'")}
-        return [r for r in rows if all(d in done for d in _dependency_ids(r))]
+        return [r for r in rows if all(d in done for d in dependency_ids(r))]
 
     def dead_dependencies(self) -> list[tuple[dict, Any, str]]:
         """Queued tasks waiting on a dependency that can no longer finish: (task, dependency, why)."""
@@ -217,12 +217,28 @@ class DB:
         states = {r["id"]: r["status"] for r in self.q("SELECT id, status FROM tasks")}
         out = []
         for t in rows:
-            for d in _dependency_ids(t):
-                why = "does not exist" if states.get(d) is None else states[d]
-                if why in ("does not exist", "failed", "cancelled"):
-                    out.append((t, d, why))
-                    break
+            dead = _first_dead(dependency_ids(t), states)
+            if dead:
+                out.append((t, *dead))
         return out
+
+    def dead_dependency(self, deps: list) -> tuple[Any, str] | None:
+        """The first of `deps` that can no longer finish and why, or None."""
+        states = {r["id"]: r["status"] for r in self.q("SELECT id, status FROM tasks")}
+        return _first_dead(deps, states)
+
+    def dependency_cycle(self, task_id: int, deps: list) -> bool:
+        """True when `task_id` depending on `deps` would close a loop."""
+        edges = {r["id"]: dependency_ids(r) for r in self.q("SELECT id, depends_on FROM tasks")}
+        seen, todo = set(), list(deps)
+        while todo:
+            d = todo.pop()
+            if d == task_id:
+                return True
+            if d not in seen:
+                seen.add(d)
+                todo.extend(edges.get(d, []))
+        return False
 
     # money ---------------------------------------------------------------------------------
     def spend(self, provider: str, usd: float, source: str, account: str = "",
@@ -249,7 +265,7 @@ SEVERITY_RANK = {"info": 0, "low": 0, "normal": 1, "high": 2, "critical": 3}
 RESULT_MAX_CHARS = 20000
 
 
-def _dependency_ids(task: dict) -> list:
+def dependency_ids(task: dict) -> list:
     """A task's dependencies as ids; an entry that is not an id comes back as None (never done)."""
     try:
         deps = json.loads(task["depends_on"] or "[]")
@@ -262,6 +278,14 @@ def _dependency_ids(task: dict) -> list:
         except (TypeError, ValueError):
             out.append(None)
     return out
+
+
+def _first_dead(deps: list, states: dict) -> tuple[Any, str] | None:
+    for d in deps:
+        why = "does not exist" if states.get(d) is None else states[d]
+        if why in ("does not exist", "failed", "cancelled"):
+            return d, why
+    return None
 
 
 def dump_result(result: dict, limit: int = RESULT_MAX_CHARS) -> str:
