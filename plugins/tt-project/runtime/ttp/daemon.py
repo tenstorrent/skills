@@ -63,6 +63,7 @@ class Daemon:
         self.p = Project(base)
         self.stopping = False
         self.boot = runner.boot_id()
+        self.boot_at = runner.boot_time()
         self.gates: dict[str, bud.Gate] = {}
         self.cfg = self.p.config()
         self.jev = Jev(self.cfg, db=self.p.db)
@@ -84,6 +85,7 @@ class Daemon:
         self._probed: dict[int, float] = {}
         self._probe_rc: dict[int, tuple[int | str, float]] = {}   # last verdict: exit code or why, when
         self._reboot_told = False
+        self._boot_woken = False
 
     # lifecycle ------------------------------------------------------------------------------------
     def run(self) -> int:
@@ -165,6 +167,7 @@ class Daemon:
             self.cfg, self._last_cfg = self.p.config(), now
             self.jev = Jev(self.cfg, db=self.p.db)
         self.reap_runs()
+        self.wake_after_reboot()
         self.meter_running()
         self.reconcile_tasks()
         self.prune_worktrees()
@@ -531,7 +534,7 @@ class Daemon:
         # The runaway guard counts runs that ended without an outcome; a reboot or a hand-off that
         # stands is an outcome, not a loop.
         if status == "lost" and r["boot_id"] and r["boot_id"] != self.boot:
-            note.update(not_waste="reboot", lost_to_reboot=self.boot)
+            note.update(not_waste="reboot", lost_to_reboot=self.boot, boot_at=self.boot_at)
         elif status in bud.WASTED and handed_off:
             note["not_waste"] = "handoff"
         source = self._source_for(r)
@@ -576,7 +579,8 @@ class Daemon:
             if r["role"] == "coordinator":
                 self._finish_coordinator(r, usage, status, note)
             else:
-                self._finish_worker(r, usage, status, run_dir, cut_off if status == "ok" else None)
+                self._finish_worker(r, usage, status, run_dir, cut_off if status == "ok" else None,
+                                    rebooted=bool(note.get("lost_to_reboot")))
         log(p, f"run {r['id']} end status={status} cost=${usage.cost_usd:.3f}"
                f"{' (estimated)' if usage.estimated else ''} role={r['role']}")
 
@@ -643,7 +647,8 @@ class Daemon:
             self.alert("coordinator", f"The coordinator failed {fails} turns in a row (last: {why}). "
                        f"Messages are queued, not lost.", "high")
 
-    def _finish_worker(self, r: dict, usage, status: str, run_dir: Path, ended: str | None = None) -> None:
+    def _finish_worker(self, r: dict, usage, status: str, run_dir: Path, ended: str | None = None,
+                       rebooted: bool = False) -> None:
         db = self.p.db
         task = db.task(r["task"]) if r["task"] else None
         if not task:
@@ -689,6 +694,9 @@ class Daemon:
         summary = str((result.get("summary") if isinstance(result, dict) else None)
                       or (usage.final_text or usage.error or "")[:1500])
         waiting = status == "ok" and rstatus == "waiting"
+        # A host reboot is not the task's failure: no attempt, no delay, unless the task keeps being
+        # the run the host went down under.
+        reboot_lost = status == "lost" and rebooted
         no_handoff = status == "ok" and rstatus is None
         if waiting:
             new = "queued"   # a busy resource is not a failed attempt: the task comes back later
@@ -699,17 +707,25 @@ class Daemon:
             summary = f"ended without a hand-off. Its last message: {summary}"[:1500]
         elif status == "ok" and rstatus in ("done", "blocked", "failed", "needs_review"):
             new = {"done": "done", "blocked": "blocked", "failed": "failed", "needs_review": "review"}[rstatus]
-        elif status in ("limit", "auth"):
-            new = "queued"   # not an attempt: the account refused, the task did not fail
+        elif status in ("limit", "auth") or reboot_lost:
+            new = "queued"   # not an attempt: the account refused or the host went down, the task did not fail
         else:
             new = "failed"
-        attempts = int(task["attempts"] or 0) + (0 if status in ("limit", "auth") or waiting else 1)
+        attempts = int(task["attempts"] or 0) + (0 if status in ("limit", "auth") or waiting or reboot_lost else 1)
         if new == "failed" and attempts < int(task["max_attempts"] or 3) and status in ("failed", "lost", "timeout",
                                                                                      "stalled", "no_handoff"):
             new = "queued"
         extra: dict = {}
         reason = None
         not_before = None
+        if rebooted:
+            extra["reboot"] = {"at": self.boot_at, "notes": _last_notes(run_dir)}
+        if reboot_lost:
+            losses = sum(1 for x in db.q("SELECT note FROM runs WHERE task=? AND status='lost' AND note LIKE ?",
+                                         (task["id"], "%lost_to_reboot%"))
+                         if json.loads(x["note"] or "{}").get("lost_to_reboot"))
+            if losses >= int(self.cfg["budget"].get("max_reboot_losses", 3)):
+                new, reason = "blocked", f"lost to a host reboot {losses} times; it may be causing them"
         if waiting:
             try:
                 waits = int(load_result(task["result"]).get("waits") or 0) + 1
@@ -719,6 +735,11 @@ class Daemon:
             extra["waits"] = waits
             if waits > int(self.cfg["budget"].get("max_waits", 24)):
                 new, reason = "blocked", f"still waiting after {waits} tries: {what}"
+            elif rebooted and result.get("survives_reboot") is not True:
+                # What it waited on died with the host: its next run finds out now, not at the timer.
+                not_before = time.time()
+                extra["woke"] = "the host rebooted"
+                reason = f"waiting for {what}; the host rebooted, so it runs again now"
             else:
                 not_before = time.time() + _retry_s(result)
                 extra["waiting_since"] = time.time()
@@ -737,6 +758,8 @@ class Daemon:
             upd["blocked_reason"] = None
         if not_before:
             upd["not_before"] = not_before
+        elif reboot_lost:
+            upd["not_before"] = None
         elif new == "queued" and status not in ("limit", "auth"):
             upd["not_before"] = time.time() + 120 * attempts
         if isinstance(result, dict) and result.get("pr"):
@@ -1246,6 +1269,29 @@ class Daemon:
                 continue
             self._start_probe(t["id"], probe, now)
 
+    def wake_after_reboot(self) -> None:
+        """Once per daemon start: a waiting task that handed off before this host booted waits on
+        something the reboot may have ended (a detached job, a /tmp file, device state). It is due
+        now, past its timer and its probe, unless its hand-off said `survives_reboot`."""
+        if self._boot_woken:
+            return
+        self._boot_woken = True
+        if not self.boot_at:
+            return
+        db = self.p.db
+        for t in db.q("SELECT * FROM tasks WHERE status='queued' AND not_before IS NOT NULL"):
+            prev = load_result(t["result"])
+            if prev.get("status") != "waiting" or prev.get("survives_reboot") is True:
+                continue
+            since = prev.get("waiting_since")
+            since = since if isinstance(since, (int, float)) else t["updated"]
+            if not since or since >= self.boot_at:
+                continue
+            self._probe_rc.pop(t["id"], None)
+            db.update_task(t["id"], not_before=None, result=dump_result(
+                {**prev, "woke": "the host rebooted", "reboot": {"at": self.boot_at}}))
+            log(self.p, f"task {t['id']} waited from before the reboot; due now")
+
     def _start_probe(self, tid: int, probe: str, now: float) -> None:
         self._probed[tid] = now
         try:
@@ -1615,6 +1661,15 @@ def _end_group(pgid: int, grace_s: float) -> None:
         os.killpg(pgid, signal.SIGKILL)
     except OSError:
         pass
+
+
+def _last_notes(run_dir: Path, n: int = 5) -> list[str]:
+    """The run's last `ttp note` lines."""
+    try:
+        lines = (run_dir / "progress.md").read_text(errors="replace").splitlines()
+    except OSError:
+        return []
+    return [x[:300] for x in lines if x.strip()][-n:]
 
 
 def _retry_s(result: dict) -> float:

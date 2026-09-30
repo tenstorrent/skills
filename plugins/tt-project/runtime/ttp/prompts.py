@@ -5,6 +5,7 @@ Templates live in the project's own harness (prompts/*.md), so each project can 
 from __future__ import annotations
 
 import json
+import time
 
 from .db import continues_id, load_result
 from .project import Project
@@ -79,6 +80,21 @@ def worker_system(p: Project) -> str:
     return "\n\n".join(x for x in parts if x.strip())
 
 
+def _reboot_note(reboot) -> str:
+    """What a run lost to a host reboot, or a wait from before one, must know before it redoes work."""
+    if not isinstance(reboot, dict):
+        return ""
+    at = reboot.get("at")
+    when = time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(at)) if isinstance(at, (int, float)) else "recently"
+    out = (f"The host rebooted (booted {when}) since the last run; that does not count as an attempt. "
+           "Detached jobs, /tmp files and device state from before the reboot are gone. Check `git status` "
+           "and the job logs before redoing work.\n")
+    notes = [str(x) for x in reboot.get("notes") or []]
+    if notes:
+        out += "The last run's notes:\n" + "".join(f"- {x}\n" for x in notes)
+    return out
+
+
 def worker_task(p: Project, task: dict, cwd: str, branch: str | None) -> str:
     """The per-task part of a worker's prompt, after worker_system(): the rules for its kind, the
     task itself, and the restrictions again at the end."""
@@ -90,6 +106,7 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None) -> str:
         history = f"\nPrevious attempt ended '{prev.get('status')}': {str(prev.get('summary') or '')[:1500]}\n"
         if prev.get("woke"):
             history += f"Woken because: {prev['woke']}.\n"
+        history += _reboot_note(prev.get("reboot"))
     old_id = continues_id(task)
     old = p.db.task(old_id) if old_id else None
     if old:

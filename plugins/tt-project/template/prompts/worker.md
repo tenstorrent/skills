@@ -66,6 +66,7 @@ Before you finish, write `$TTP_RUN_DIR/result.json`:
   while it exits 1 the task stays asleep past `retry_after_s`; any other exit wakes it as broken.
   For a wait with several steps (build, then device run), chain them in one detached driver script
   that writes a final marker, and point `retry_when` at that marker.
+  A host reboot wakes waiting tasks at once; add `"survives_reboot": true` if yours does not die with it.
 - `blocked` only when access, a credential, funds or a resource you cannot get is missing, or the
   next step cannot be undone and is outside the charter. Say exactly what. Judgment calls are
   yours: make them, and state each one and why in the summary.

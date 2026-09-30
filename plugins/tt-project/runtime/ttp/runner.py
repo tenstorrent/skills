@@ -50,6 +50,21 @@ def boot_id() -> str:
         return "unknown"
 
 
+def boot_time() -> float | None:
+    """When this host booted, as a Unix time; None if it cannot be told."""
+    try:
+        for line in Path("/proc/stat").read_text().splitlines():
+            if line.startswith("btime "):
+                return float(line.split()[1])
+    except (OSError, ValueError):
+        pass
+    try:
+        out = subprocess.run(["sysctl", "-n", "kern.boottime"], capture_output=True, text=True, timeout=5).stdout
+        return float(out.split("sec =")[1].split(",")[0].strip())
+    except Exception:
+        return None
+
+
 def proc_start(pid: int) -> str | None:
     """When process pid started, as a token that stays the same for its whole life and differs for
     a later process given the same pid. None if it is gone."""

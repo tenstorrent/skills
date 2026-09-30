@@ -4772,7 +4772,8 @@ def test_runs_lost_to_a_reboot_are_not_runaway_waste_and_are_announced_once(env,
     # The spend is real: it still counts toward the caps and the tasks' budgets.
     assert g.numbers["spent_24h"] >= 53.0, g.numbers
     assert [p.db.task(t)["spent_usd"] for t in tids] == [24.0, 29.0]
-    assert all(p.db.task(t)["status"] == "queued" for t in tids)
+    # Requeued with no delay and no attempt spent: they run again in the same tick.
+    assert all(p.db.task(t)["status"] == "running" and p.db.task(t)["attempts"] == 0 for t in tids)
     assert p.db.q("SELECT id FROM runs WHERE task=?", (nxt,)), "the gate held a queued task after a reboot"
     for _ in range(2):
         d.tick()
@@ -5084,3 +5085,124 @@ def test_worker_prompt_asks_for_a_probe_that_exits_0_whatever_the_outcome():
     flat = " ".join(prompt.split())
     assert "exit 0 once the wait is over whatever the outcome" in flat
     assert "1 while it is not" in flat and "driver script" in flat
+
+
+def _lost_to_reboot(p, d, tmp_path, tid, name="lost", notes=()):
+    """A run of task tid that the host went down under, as the reaper finds it after the reboot."""
+    p.db.update_task(tid, status="running")
+    run_dir = tmp_path / name
+    run_dir.mkdir()
+    (run_dir / "output.jsonl").write_text("")
+    if notes:
+        (run_dir / "progress.md").write_text("".join(f"10:0{i} {n}\n" for i, n in enumerate(notes)))
+    (run_dir / "lease").touch()
+    os.utime(run_dir / "lease", (time.time() - 999, time.time() - 999))
+    p.db.x("INSERT INTO runs(task,role,provider,started,status,dir,boot_id) VALUES(?,?,?,?,?,?,?)",
+           (tid, "worker", "fake", time.time() - 1800, "running", str(run_dir), "an-earlier-boot"))
+    d.reap_runs()
+    return run_dir
+
+
+def test_a_run_lost_to_a_reboot_spends_no_attempt_and_retries_at_once(env, tmp_path):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    tid = p.db.add_task("build", "s", kind="work", tier="light", origin="user")
+    p.db.update_task(tid, attempts=2)
+    _lost_to_reboot(p, d, tmp_path, tid)
+    t = p.db.task(tid)
+    assert t["status"] == "queued" and t["attempts"] == 2, dict(t)
+    assert not t["not_before"] or t["not_before"] <= time.time(), "a reboot loss was delayed like a failure"
+    assert tid in [x["id"] for x in p.db.ready_tasks()]
+
+
+def test_the_third_reboot_loss_blocks_the_task(env, tmp_path):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    tid = p.db.add_task("flash the board", "s", kind="work", tier="light", origin="user")
+    for i in range(3):
+        _lost_to_reboot(p, d, tmp_path, tid, name=f"lost{i}")
+        assert p.db.task(tid)["status"] == ("blocked" if i == 2 else "queued")
+    t = p.db.task(tid)
+    assert t["attempts"] == 0
+    assert t["blocked_reason"] == "lost to a host reboot 3 times; it may be causing them"
+    ev = p.db.q("SELECT severity, status FROM events WHERE kind='task_blocked' AND task=?", (tid,))
+    assert ev and ev[-1]["severity"] == "high" and ev[-1]["status"] == "queued", ev
+
+
+def test_a_light_review_stays_light_after_a_reboot_loss(env, tmp_path):
+    p = make(env)
+    from ttp import worktree
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    tid = p.db.add_task("small", "s", kind="code", tier="standard", origin="user")
+    path, branch = worktree.ensure(p, p.db.task(tid))
+    (path / "app.py").write_text("x = 1\n")
+    _git_out(path, "add", ".")
+    _git_out(path, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "small")
+    p.db.update_task(tid, status="done", branch=branch)
+    rev = p.db.add_task("review", f"Review branch {branch}.", kind="review", tier="light", origin="coordinator")
+    assert d._size_review(p.db.task(rev))["tier"] == "light"
+    _lost_to_reboot(p, d, tmp_path, rev)
+    assert d._size_review(p.db.task(rev))["tier"] == "light", "a reboot loss lifted the review's tier"
+
+
+def test_the_resume_after_a_reboot_says_so_with_the_last_notes(env, tmp_path):
+    p = make(env)
+    from ttp.daemon import Daemon
+    from ttp.prompts import worker_task
+    d = Daemon(p.base)
+    d.boot_at = time.time() - 300
+    tid = p.db.add_task("build", "s", kind="work", tier="light", origin="user")
+    notes = [f"step {i}" for i in range(7)]
+    _lost_to_reboot(p, d, tmp_path, tid, notes=notes)
+    text = worker_task(p, p.db.task(tid), str(p.root), None)
+    assert "The host rebooted (booted " + time.strftime("%Y-%m-%d %H:%M", time.localtime(d.boot_at)) in text, text
+    assert "Detached jobs, /tmp files and device state" in text and "`git status`" in text
+    assert all(f"step {i}" in text for i in range(2, 7)) and "step 1" not in text, text
+
+
+def test_waiting_tasks_from_before_the_boot_wake_on_the_first_tick(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    d.boot_at = time.time() - 300
+    started = []
+    monkeypatch.setattr(d, "start_run", lambda role, prompt, provider, tier, cwd, **k: started.append(k["task"]["id"]))
+    later = time.time() + 3600
+
+    def waiting(title, **extra):
+        tid = p.db.add_task(title, "s", kind="work", tier="light", origin="user", not_before=later)
+        p.db.update_task(tid, result=json.dumps({"status": "waiting", "summary": "job running", "retry_after_s": 3600,
+                                                 "retry_when": "exit 1", "waiting_since": time.time() - 900,
+                                                 **extra}))
+        return tid
+
+    dead = waiting("local job")
+    remote = waiting("remote job", survives_reboot=True)
+    d.tick()
+    assert dead in started and remote not in started, started
+    assert "the host rebooted" in json.loads(p.db.task(dead)["result"]).get("woke", "")
+    assert p.db.task(remote)["not_before"] == later
+
+
+def test_a_waiting_hand_off_cut_short_by_a_reboot_runs_again_now(env, tmp_path):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    tid = p.db.add_task("build", "s", kind="work", tier="light", origin="user")
+    p.db.update_task(tid, status="running")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "output.jsonl").write_text("")
+    (run_dir / "result.json").write_text(json.dumps({"status": "waiting", "summary": "build started",
+                                                     "retry_after_s": 3600, "retry_when": "exit 1"}))
+    (run_dir / "lease").touch()
+    os.utime(run_dir / "lease", (time.time() - 999, time.time() - 999))
+    p.db.x("INSERT INTO runs(task,role,provider,started,status,dir,boot_id) VALUES(?,?,?,?,?,?,?)",
+           (tid, "worker", "fake", time.time() - 1800, "running", str(run_dir), "an-earlier-boot"))
+    d.reap_runs()
+    d.probe_waiting()
+    assert tid in [x["id"] for x in p.db.ready_tasks()], "a wait the reboot ended slept on its timer or probe"
+    assert json.loads(p.db.task(tid)["result"])["woke"] == "the host rebooted"
