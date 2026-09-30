@@ -64,12 +64,11 @@ def _resource_line(task: dict) -> str:
     return out
 
 
-def worker_system(p: Project, task: dict) -> str:
-    """The part of a worker's prompt shared by every task of its kind until the charter or memory
-    changes: sent as the system prompt where the agent allows it, so the provider caches it across
-    the project's workers."""
-    kind = task["kind"] or "work"
-    parts = [restrictions_block(p), _read(p, "worker.md"), _read(p, f"kind-{kind}.md")]
+def worker_system(p: Project) -> str:
+    """The part of a worker's prompt shared by every task, whatever its kind or tier, until the
+    charter or memory changes: sent as the system prompt where the agent allows it, so the provider
+    caches it across all the project's workers. Nothing about the task may go in here."""
+    parts = [restrictions_block(p), _read(p, "worker.md")]
     # The restrictions open and close the prompt; a third copy inside the charter only costs tokens.
     charter = p.charter_path.read_text() if p.charter_path.exists() else "(none)"
     parts.append("# CHARTER (goals and policies; its restrictions are the binding block above)\n" +
@@ -81,7 +80,8 @@ def worker_system(p: Project, task: dict) -> str:
 
 
 def worker_task(p: Project, task: dict, cwd: str, branch: str | None) -> str:
-    """The per-task part of a worker's prompt, after worker_system(); it ends with the restrictions."""
+    """The per-task part of a worker's prompt, after worker_system(): the rules for its kind, the
+    task itself, and the restrictions again at the end."""
     cfg = p.config()
     kind = task["kind"] or "work"
     history = ""
@@ -98,6 +98,7 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None) -> str:
                     + (f". Its last summary: {was}" if was else "") + "\n")
     delivery = cfg.get("delivery", {})
     parts = [
+        _read(p, f"kind-{kind}.md"),
         f"# YOUR TASK #{task['id']}: {task['title']}\n"
         f"kind: {kind} · tier: {task['tier']} · attempt {int(task['attempts'] or 0) + 1} of "
         f"{task['max_attempts']} · budget ${task['budget_usd'] or 0:.2f} (spent ${task['spent_usd'] or 0:.2f})\n"
@@ -114,4 +115,4 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None) -> str:
 
 def worker_prompt(p: Project, task: dict, cwd: str, branch: str | None) -> str:
     """The whole prompt in one piece, as a worker reads it."""
-    return worker_system(p, task) + "\n\n" + worker_task(p, task, cwd, branch)
+    return worker_system(p) + "\n\n" + worker_task(p, task, cwd, branch)

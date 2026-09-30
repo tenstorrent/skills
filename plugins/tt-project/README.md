@@ -92,8 +92,9 @@ and preferences you add later become part of the project's charter and memory.
 - A plan task starts from what is already known: prior work, the organization's docs and chats
   through the connectors you have, available skills, and public work. Skill plugins it recommends
   can be enabled for the project's workers only (`providers.claude.plugin_dirs`).
-- On Claude, the part of a worker's prompt that is the same for every task of its kind (rules,
-  charter, memory) goes in the system prompt, so the next worker reads it from the cache.
+- On Claude, the part of a worker's prompt that is the same for every task (rules, charter,
+  memory) goes in the system prompt, so the next worker, of any kind, reads it from the cache. The
+  kind's rules and the task itself go in the user prompt.
 - `providers.claude.worker_isolation: true` starts Claude workers and reviewers without your own
   MCP servers, plugins, hooks and user settings; the project's `plugin_dirs` and its hook still
   load. In one measurement it cut a worker's first turn from about 38k to 23k input tokens.

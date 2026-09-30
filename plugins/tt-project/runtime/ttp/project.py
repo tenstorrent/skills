@@ -215,7 +215,7 @@ class Project:
         if not self.memory_dir.is_dir():
             return ""
         parts = []
-        for p in sorted(self.memory_dir.glob("*.md"), key=lambda p: p.stat().st_mtime):
+        for p in sorted(self.memory_dir.glob("*.md"), key=lambda p: (p.stat().st_mtime, p.name)):
             body = p.read_text().split("---", 2)[-1].strip()
             parts.append(f"[{p.stem}] {body}")
         text = "\n".join(parts)

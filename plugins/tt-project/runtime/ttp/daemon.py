@@ -1111,7 +1111,7 @@ class Daemon:
                 continue
             from .prompts import worker_system, worker_task
             try:
-                system, prompt = worker_system(self.p, task), worker_task(self.p, task, cwd, branch)
+                system, prompt = worker_system(self.p), worker_task(self.p, task, cwd, branch)
                 db.update_task(task["id"], status="running", branch=branch, blocked_reason=None)
                 self.start_run("worker" if task["kind"] != "review" else "reviewer", prompt, provider, tier, cwd,
                                task=task, budget_usd=max(remaining, 0.5) if task["budget_usd"] else None,

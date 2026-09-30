@@ -1064,6 +1064,38 @@ def test_claude_workers_get_the_stable_prompt_as_a_cacheable_system_prompt(env, 
     assert prompt.rstrip().endswith("Never merge to main."), "the restrictions must close the prompt"
 
 
+def test_every_worker_gets_the_same_system_prompt_so_its_cache_is_shared(env, monkeypatch):
+    p = make(env)
+    p.charter_path.write_text("# demo\n\n## Goals\nGo fast.\n\n## Restrictions\nNever merge to main.\n")
+    p.add_memory("MEMORY-MARKER", kind="fact")
+    from ttp import daemon as dmod
+    from ttp.providers import claude
+
+    class Proc:
+        pid = 4242
+    monkeypatch.setattr(claude, "_FLAGS", {claude.EXCLUDE_DYNAMIC: True, claude.APPEND_SYSTEM_FILE: True,
+                                           claude.APPEND_SYSTEM: True})
+    real = subprocess.Popen
+    monkeypatch.setattr(dmod.subprocess, "Popen",
+                        lambda argv, *a, **k: Proc() if "ttp.runner" in argv else real(argv, *a, **k))
+    p.set_config("core_provider", "claude")
+    (p.harness / "prompts" / "kind-question.md").write_text("QUESTION-RULES\n")
+    (p.harness / "prompts" / "kind-plan.md").write_text("PLAN-RULES\n")
+    a = p.db.add_task("first", "SPEC-A", kind="question", tier="light", origin="user", budget_usd=2)
+    b = p.db.add_task("second", "SPEC-B", kind="plan", tier="standard", origin="coordinator", budget_usd=5)
+    daemon = dmod.Daemon(p.base)
+    daemon.dispatch()
+    daemon.dispatch()
+    dirs = {r["task"]: pathlib.Path(r["dir"]) for r in p.db.q("SELECT task, dir FROM runs")}
+    assert set(dirs) == {a, b}, [p.db.task(t)["blocked_reason"] for t in (a, b)]
+    sys_a, sys_b = ((dirs[t] / "system.md").read_bytes() for t in (a, b))
+    assert sys_a == sys_b, "a per-task byte in the system prompt makes every worker re-write the cache"
+    assert b"MEMORY-MARKER" in sys_a and b"RULES" not in sys_a
+    prompt_a, prompt_b = ((dirs[t] / "prompt.md").read_text() for t in (a, b))
+    assert prompt_a.startswith("QUESTION-RULES") and "SPEC-A" in prompt_a and "PLAN-RULES" not in prompt_a
+    assert prompt_b.startswith("PLAN-RULES") and "SPEC-B" in prompt_b
+
+
 def test_workers_read_one_prompt_when_the_cli_cannot_append_a_system_prompt(env, monkeypatch):
     p = make(env)
     p.charter_path.write_text("# demo\n\n## Goals\nGo fast.\n\n## Restrictions\nNever merge to main.\n")
