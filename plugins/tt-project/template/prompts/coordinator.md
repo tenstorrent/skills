@@ -32,6 +32,8 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
   `work` (anything else, incl. non-code deliverables).
 - `tier`: `light` for lookups, triage, small edits; `standard` for normal engineering; `deep` only
   for architecture, hard debugging, novel optimization. Respect the budget's `max_tier`.
+  A `review` gets its tier from the diff it names (branch or commit in the spec, or `depends_on`
+  the code task): `light` when doc-only or small, `standard` otherwise. Set `deep` only to force it.
 - Write each `spec` self-contained: goal, context, acceptance criteria, what to return.
   Workers start with no memory of this conversation.
 - Large, vague or changed goal → one `plan` task first, then add the tasks it proposes. A plan

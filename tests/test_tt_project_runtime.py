@@ -4321,3 +4321,66 @@ def test_a_passed_probe_held_by_the_gate_is_logged_as_held(env, monkeypatch):
     d.probe_waiting()
     logged = (p.logs / "daemon.log").read_text()
     assert f"task {tid} retry_when probe passed; held by gate red" in logged, logged[-500:]
+
+
+def test_review_tier_follows_the_size_and_risk_of_the_diff(env):
+    from ttp.budget import review_tier
+    cfg = {"review": {"light_max_lines": 60, "risky_paths": ["src/state/*"]}}
+    assert review_tier({"README.md": 400, "docs/guide.rst": 90}, cfg) == "light"
+    assert review_tier({"src/app.py": 40, "README.md": 300}, cfg) == "light"
+    assert review_tier({"src/app.py": 40, "tests/test_app.py": 21}, cfg) == "standard"
+    assert review_tier({"src/state/db.py": 2}, cfg) == "standard"
+    assert review_tier({"assets/logo.png": None}, cfg) == "standard"
+    assert review_tier({"src/app.py": 60}, {}) == "light"
+
+
+def test_a_review_runs_at_the_tier_its_diff_needs(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dmod
+    from ttp import worktree
+    d = dmod.Daemon(p.base)
+    started = {}
+    monkeypatch.setattr(d, "start_run", lambda role, prompt, provider, tier, cwd, **k: started.update(
+        {k["task"]["id"]: (role, tier)}))
+    ident = ["-c", "user.name=t", "-c", "user.email=t@t"]
+
+    def change(title, files):
+        tid = p.db.add_task(title, "s", kind="code", tier="standard", origin="user")
+        path, branch = worktree.ensure(p, p.db.task(tid))
+        for name, lines in files.items():
+            (path / name).write_text("".join(f"line {i}\n" for i in range(lines)))
+        _git_out(path, "add", ".")
+        _git_out(path, *ident, "commit", "-qm", title)
+        p.db.update_task(tid, status="done", branch=branch)
+        return tid, branch, _git_out(path, "rev-parse", "--short", "HEAD")
+
+    small, small_branch, _ = change("small", {"app.py": 20, "NOTES.md": 500})
+    big, _, big_commit = change("big", {"app.py": 200})
+
+    def review(spec, **kw):
+        return p.db.add_task(f"review {len(started)}", spec, kind="review", origin="coordinator", **kw)
+
+    by_branch = review(f"Review branch {small_branch}.", tier="standard")
+    by_dep = review("Review the change.", tier="standard", depends_on=[small])
+    by_commit = review(f"Review commit {big_commit}.", tier="light")
+    forced = review(f"Review branch {small_branch}.", tier="deep")
+    unknown = review("Review PR 12 on the forge.", tier="standard")
+    retried = review(f"Review branch {small_branch}.", tier="light")
+    p.db.update_task(retried, attempts=1)
+    d.dispatch()
+    assert started[by_branch] == ("reviewer", "light") and p.db.task(by_branch)["tier"] == "light"
+    assert started[by_dep][1] == "light"
+    assert started[by_commit][1] == "standard" and p.db.task(by_commit)["tier"] == "standard"
+    assert started[forced][1] == "deep"
+    assert started[unknown][1] == "standard"
+    assert started[retried][1] == "standard"
+    p.set_config("review.risky_paths", ["app.py"])
+    d.cfg = p.config()
+    risky = review(f"Review branch {small_branch}.", tier="standard")
+    d.dispatch()
+    assert started[risky][1] == "standard"
+
+
+def test_the_coordinator_prompt_leaves_review_tiers_to_the_diff():
+    text = (RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text()
+    assert "A `review` gets its tier from the diff" in text and "Set `deep` only to force it" in text

@@ -113,3 +113,34 @@ def has_changes(path: Path, since_ref: str) -> bool:
     ahead = _git(path, "rev-list", "--count", f"{since_ref}..HEAD", check=False)
     dirty = _git(path, "status", "--porcelain", check=False)
     return (ahead.isdigit() and int(ahead) > 0) or bool(dirty)
+
+
+_HEX = re.compile(r"\b[0-9a-f]{7,40}\b")
+
+
+def reviewed_refs(p: Project, task: dict) -> list[str]:
+    """What a review task reviews: the branches of the tasks it depends on, and the task branches
+    and commit hashes its spec names."""
+    from .db import dependency_ids
+    spec = task.get("spec") or ""
+    ids = [i for i in dependency_ids(task) if i is not None]
+    refs = [r["branch"] for r in p.db.q("SELECT id, branch FROM tasks WHERE branch IS NOT NULL AND branch!=''")
+            if r["id"] in ids or re.search(rf"(?<![\w/.-]){re.escape(r['branch'])}(?![\w/-])", spec)]
+    refs += _HEX.findall(spec)
+    return list(dict.fromkeys(refs))
+
+
+def diff_lines(p: Project, refs: list[str]) -> dict[str, int | None] | None:
+    """Lines changed per file by `refs` since they left the base branch (None for a binary file),
+    or None when they change nothing measurable, such as a commit already on the base."""
+    base = resolve_base(p)
+    out: dict[str, int | None] = {}
+    for ref in refs:
+        if not _git(p.root, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", check=False):
+            continue
+        for line in _git(p.root, "diff", "--numstat", "--no-renames", f"{base}...{ref}").splitlines():
+            added, deleted, path = line.split("\t", 2)
+            prev = out.get(path, 0)
+            n = None if added == "-" else int(added) + int(deleted)
+            out[path] = None if n is None or prev is None else max(n, prev)
+    return out or None

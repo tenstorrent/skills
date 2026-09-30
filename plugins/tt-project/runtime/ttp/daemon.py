@@ -1046,6 +1046,8 @@ class Daemon:
             reached.add(task["id"])
             if not self._resources_free(task, reserve=True):
                 continue
+            if task["kind"] == "review":
+                task = self._size_review(task)
             tier = bud.clamp_tier(task["tier"], gate)
             try:
                 cwd, branch = self._workdir_for(task)
@@ -1233,6 +1235,28 @@ class Daemon:
     def _dispatchable(self) -> bool:
         """Whether any queued task could start now (dependencies done, resources free)."""
         return any(self._resources_free(t) for t in self.p.db.ready_tasks())
+
+    def _size_review(self, task: dict) -> dict:
+        """A review runs at the tier its diff needs, not the one it was queued with. Deep stays the
+        coordinator's call. A retry never drops to light: the light try may be why it
+        failed. A diff that cannot be measured keeps the tier the task was given."""
+        if task["tier"] == "deep":
+            return task
+        try:
+            changes = worktree.diff_lines(self.p, worktree.reviewed_refs(self.p, task))
+        except Exception as e:
+            log(self.p, f"task {task['id']}: review diff not measured: {e}")
+            return task
+        if changes is None:
+            return task
+        tier = bud.review_tier(changes, self.cfg)
+        if tier == "light" and task["attempts"]:
+            tier = "standard"
+        if tier != task["tier"]:
+            log(self.p, f"task {task['id']}: review tier {task['tier']} -> {tier} "
+                        f"({len(changes)} files, {sum(n or 0 for n in changes.values())} lines)")
+            self.p.db.update_task(task["id"], tier=tier)
+        return dict(task, tier=tier)
 
     def _workdir_for(self, task: dict) -> tuple[str, str | None]:
         if task["kind"] == "harness":

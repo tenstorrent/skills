@@ -15,6 +15,7 @@ A runaway check (spend rate far above this project's own norm) overrides both.
 """
 from __future__ import annotations
 
+import fnmatch
 import json
 import time
 from dataclasses import asdict, dataclass, field
@@ -336,6 +337,22 @@ TIER_ORDER = ("light", "standard", "deep")
 def clamp_tier(tier: str, gate: Gate) -> str:
     tier = tier if tier in TIER_ORDER else "standard"
     return tier if TIER_ORDER.index(tier) <= TIER_ORDER.index(gate.max_tier) else gate.max_tier
+
+
+DOC_SUFFIXES = (".md", ".markdown", ".rst", ".txt", ".adoc")
+
+
+def review_tier(changes: dict[str, int | None], cfg: dict) -> str:
+    """Light for a doc-only diff or a small one that touches no risky path, standard otherwise.
+    Doc lines do not count toward the size: prose next to a small code change is not risk."""
+    rules = cfg.get("review", {})
+    risky = rules.get("risky_paths") or []
+    if any(fnmatch.fnmatch(path, g) for path in changes for g in risky):
+        return "standard"
+    code = [n for path, n in changes.items() if not path.lower().endswith(DOC_SUFFIXES)]
+    if any(n is None for n in code):
+        return "standard"
+    return "light" if sum(code) <= int(rules.get("light_max_lines", 60)) else "standard"
 
 
 def windows_from_snapshots(db: DB, now: float | None = None) -> list[Window]:
