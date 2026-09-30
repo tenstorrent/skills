@@ -4332,6 +4332,8 @@ def test_review_tier_follows_the_size_and_risk_of_the_diff(env):
     assert review_tier({"src/state/db.py": 2}, cfg) == "standard"
     assert review_tier({"assets/logo.png": None}, cfg) == "standard"
     assert review_tier({"src/app.py": 60}, {}) == "light"
+    assert review_tier({"CMakeLists.txt": 61}, {}) == "standard"
+    assert review_tier({"docs/state/guide.md": 1}, {"review": {"risky_paths": ["docs/state/*"]}}) == "standard"
 
 
 def test_a_review_runs_at_the_tier_its_diff_needs(env, monkeypatch):

@@ -339,7 +339,8 @@ def clamp_tier(tier: str, gate: Gate) -> str:
     return tier if TIER_ORDER.index(tier) <= TIER_ORDER.index(gate.max_tier) else gate.max_tier
 
 
-DOC_SUFFIXES = (".md", ".markdown", ".rst", ".txt", ".adoc")
+# Not .txt: CMakeLists.txt and requirements.txt are build and dependency changes.
+DOC_SUFFIXES = (".md", ".markdown", ".rst", ".adoc")
 
 
 def review_tier(changes: dict[str, int | None], cfg: dict) -> str:
