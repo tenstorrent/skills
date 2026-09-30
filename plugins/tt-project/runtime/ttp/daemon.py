@@ -255,6 +255,18 @@ class Daemon:
         if not task:
             return
         result = _read_result(run_dir / RESULT_FILE) or last_json_object(usage.final_text or "") or {}
+        if task["status"] == "cancelled":
+            # Cancelled while this run was ending: the decision stands. Keep what the run produced,
+            # and tell the coordinator only if the work actually got done.
+            summary = (result.get("summary") if isinstance(result, dict) else "") or ""
+            db.update_task(task["id"], result=json.dumps({"summary": summary, "status": "cancelled",
+                                                          "run_status": status})[:20000])
+            if isinstance(result, dict) and result.get("status") == "done":
+                db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                     (time.time(), f"task:{task['id']}", "cancelled_but_done", "normal",
+                      f"#{task['id']} {task['title']} was cancelled, but its run finished the work: "
+                      f"{summary[:800]}", "queued", task["id"]))
+            return
         rstatus = result.get("status") if isinstance(result, dict) else None
         summary = (result.get("summary") if isinstance(result, dict) else None) or (usage.final_text or "")[:1500]
         waiting = status == "ok" and rstatus == "waiting"

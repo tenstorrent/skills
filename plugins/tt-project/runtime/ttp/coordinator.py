@@ -162,7 +162,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None) -> l
                 upd: dict[str, Any] = {}
                 if a.get("status") in ("queued", "blocked", "cancelled", "done", "waiting"):
                     if task["status"] == "running" and a["status"] != "cancelled":
-                        raise ValueError(f"task #{task['id']} is running; only cancel is allowed")
+                        raise ValueError(f"task #{task['id']} is running: send `spec` alone to steer it mid-run, "
+                                         f"or set status cancelled")
                     upd["status"] = a["status"]
                     if a["status"] == "queued":
                         upd["blocked_reason"] = None

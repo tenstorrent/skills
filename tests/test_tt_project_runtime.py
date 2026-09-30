@@ -392,3 +392,23 @@ def test_charter_and_memory_changes_are_committed_alone(env):
                             text=True).stdout
     assert "prompts/scratch.md" in status, "someone else's unfinished edit was swept into the commit"
     assert "CHARTER.md" not in status and "MEMORY.md" not in status
+
+
+def test_a_cancelled_task_stays_cancelled_when_its_run_ends(env, tmp_path):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    tid = p.db.add_task("long job", "spec", kind="work", tier="light", origin="user")
+    p.db.update_task(tid, status="running")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "output.jsonl").write_text("")
+    rid = p.db.x("INSERT INTO runs(task,role,provider,started,status,dir,boot_id) VALUES(?,?,?,?,?,?,?)",
+                 (tid, "worker", "fake", time.time(), "running", str(run_dir), "x"))
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "status": "cancelled"}]) == []
+    assert (run_dir / "STOP").exists()
+    (run_dir / "exit.json").write_text(json.dumps({"rc": 143, "stopped": "stopped", "ended": time.time()}))
+    Daemon(p.base).reap_runs()
+    assert p.db.task(tid)["status"] == "cancelled"
+    assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == "killed"
+    assert not p.db.q("SELECT id FROM events WHERE kind='task_failed'"), "a cancel was reported as a failure"
