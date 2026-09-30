@@ -10,4 +10,8 @@
   is told in the chat what was decided and that they can reverse it. The coordinator then acts on it.
 - Irreversible questions, and questions without a recommendation, always wait for the user.
 - Nothing times out while the project is at a spend cap or while a user message is still unread.
+- A question never falls back once the user has written after it, even if that message was already
+  read. The coordinator is asked to check whether it was answered, and otherwise it waits for the user.
+- The fallback notice is sent at `high` severity or above, never below the chat's severity floor, so
+  the user always sees what was decided.
 - `coordinator.ask_timeout_h` sets the timeout; 0 turns it off.

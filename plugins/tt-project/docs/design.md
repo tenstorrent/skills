@@ -43,8 +43,9 @@ in `state/runs/<id>/`, so a daemon restart never loses a result.
     wedge the loop: a task never stays `running` without a live run, and a queued task whose
     dependency failed or was cancelled is blocked with the reason.
 13. A question to the user falls back to its recommendation only when marked reversible, after
-    `coordinator.ask_timeout_h` (12h), never at a cap or over an unread user message; the user is
-    told what was decided. Irreversible questions wait for the user.
+    `coordinator.ask_timeout_h` (12h), never at a cap or when the user has written since it was
+    asked (the coordinator is asked to confirm instead); the user is told what was decided, at
+    `high` severity or above so it clears the chat floor. Irreversible questions wait for the user.
 
 ## Why the coordinator is tool-less
 

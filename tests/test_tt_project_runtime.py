@@ -805,14 +805,49 @@ def test_an_ask_waits_while_an_answer_is_pending_over_a_cap_or_turned_off(env):
     _, ask = _ask(p, reversible=True, recommendation="use option A")
     late = ask["ts"] + 13 * 3600
     assert coord.expire_asks(p, now=late, hold=True) == [], "a cap-hold did not stop the default"
-    reply = p.db.post("in", "go with B", chat="c1")
-    assert coord.expire_asks(p, now=late) == [], "defaulted over a user reply that may answer it"
-    p.db.x("UPDATE messages SET handled=1 WHERE id=?", (reply,))
     p.set_config("coordinator.ask_timeout_h", 0)
     assert coord.expire_asks(p, now=late) == []
     assert coord.apply(p, [{"type": "config_set", "key": "coordinator.ask_timeout_h", "value": "24"}]) == []
     assert coord.expire_asks(p, now=late) == []
     assert coord.expire_asks(p, now=ask["ts"] + 24 * 3600) == [ask["id"]]
+
+
+def test_a_user_reply_after_an_ask_blocks_its_default_even_once_handled(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    _, ask = _ask(p, reversible=True, recommendation="use option A")
+    late = ask["ts"] + 13 * 3600
+    reply = p.db.post("in", "go with B", chat="c1")
+    assert coord.expire_asks(p, now=late) == [], "defaulted over an unread user reply that may answer it"
+    assert not p.db.q("SELECT id FROM events WHERE kind='ask_timeout'")
+    p.db.x("UPDATE messages SET handled=1 WHERE id=?", (reply,))   # read, but the ask was never resolved
+    assert coord.expire_asks(p, now=late) == [], "a fallback overrode a user answer"
+    assert p.db.one("SELECT handled FROM messages WHERE id=?", (ask["id"],))["handled"] == 0
+    assert not p.db.q("SELECT id FROM messages WHERE kind='alert'"), "the user was told a default applied"
+    ev = p.db.one("SELECT * FROM events WHERE kind='ask_timeout'")
+    assert ev["status"] == "queued" and "NOT applied" in ev["text"] and "Option A or B?" in ev["text"]
+    assert p.db.kv(coord.ASK_DEFAULTS_KEY) == {}
+    assert coord.expire_asks(p, now=late + 99 * 3600) == []
+    assert len(p.db.q("SELECT id FROM events WHERE kind='ask_timeout'")) == 1, "the coordinator was asked twice"
+    assert f"ask #{ask['id']} (waits for the user)" in coord.digest(p, {}, [], [])
+
+
+def test_a_fallback_notice_is_never_below_the_chat_floor(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.db import SEVERITY_RANK
+    _, ask = _ask(p, reversible=True, recommendation="use option A", severity="low")
+    assert ask["severity"] == "low"
+    assert coord.expire_asks(p, now=ask["ts"] + 12 * 3600 + 1) == [ask["id"]]
+    told = p.db.one("SELECT * FROM messages WHERE kind='alert' ORDER BY id DESC LIMIT 1")
+    floor = p.config()["notify"]["chat_min_severity"]
+    assert SEVERITY_RANK[told["severity"]] >= max(SEVERITY_RANK["high"], SEVERITY_RANK[floor])
+    assert told["id"] in [m["id"] for m in p.db.unread_for_chat("c1", 0, floor)]
+    _, ask2 = _ask(p, reversible=True, recommendation="use option C", severity="low")
+    p.set_config("notify.chat_min_severity", "critical")
+    assert coord.expire_asks(p, now=ask2["ts"] + 12 * 3600 + 1) == [ask2["id"]]
+    told = p.db.one("SELECT * FROM messages WHERE kind='alert' ORDER BY id DESC LIMIT 1")
+    assert "use option C" in told["text"] and told["severity"] == "critical"
 
 
 def test_the_daemon_expires_a_due_ask_and_hands_it_to_the_coordinator(env):

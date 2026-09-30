@@ -259,14 +259,17 @@ def expire_asks(p: Project, *, hold: bool = False, now: float | None = None) -> 
 
     Only asks the coordinator marked reversible with a recommendation are ever listed; anything
     else waits for the user indefinitely. Nothing expires while `hold` is set (the project is at a
-    cap) or while a user message is unhandled, since that message may be the answer. The user is
+    cap) or while a user message is unhandled, since that message may be the answer. A due ask
+    with any user message after it, handled or not, may have been answered without a `resolve`:
+    it keeps waiting for the user and the coordinator is asked to confirm instead. The user is
     told what was decided and the coordinator gets an event to act on it. Returns expired ask ids.
     """
     db = p.db
     if not db.kv(ASK_DEFAULTS_KEY, {}):
         return []
     now = now or time.time()
-    hours = ask_timeout_h(p.config())
+    cfg = p.config()
+    hours = ask_timeout_h(cfg)
     with db.tx():   # re-read inside: a resolve or a new ask may land between ticks
         pending = db.kv(ASK_DEFAULTS_KEY, {})
         open_asks = {str(r["id"]): r for r in db.q(
@@ -276,13 +279,25 @@ def expire_asks(p: Project, *, hold: bool = False, now: float | None = None) -> 
         due = [k for k in live if hours > 0 and open_asks[k]["ts"] + hours * 3600 <= now]
         if hold or (due and db.one("SELECT id FROM messages WHERE direction='in' AND handled=0")):
             due = []
+        for k in [k for k in due if db.one("SELECT id FROM messages WHERE direction='in' AND id>?", (int(k),))]:
+            due.remove(k)
+            live.pop(k)
+            db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                 (now, "daemon", "ask_timeout", "normal",
+                  f"Ask #{k} reached its {hours:g}h timeout, but the user wrote after it was asked, so its "
+                  f"recommendation was NOT applied. If the user answered it, act on the answer and `resolve` "
+                  f"it; otherwise it now waits for the user. The question was: "
+                  f"{open_asks[k]['text'].split(_DEFAULT_NOTE)[0][:300]}", "queued"))
         for k in due:
             ask, rec = open_asks[k], live.pop(k)
+            # at least high, and never under the chat floor: the user must see what was decided for them
+            severity = max((ask["severity"], "high", cfg["notify"].get("chat_min_severity")),
+                           key=lambda n: SEVERITY_RANK.get(n, -1))
             db.x("UPDATE messages SET handled=1 WHERE id=?", (ask["id"],))
             question = ask["text"].split(_DEFAULT_NOTE)[0][:300]
             db.post("out", f"No answer to ask #{k} after {hours:g}h, so I went with the recommendation: {rec}\n"
                            f"It can be reversed: reply to change it.\nThe question was: {question}",
-                    chat=None, kind="alert", severity=ask["severity"])
+                    chat=None, kind="alert", severity=severity)
             db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
                  (now, "daemon", "ask_timeout", "normal",
                   f"Ask #{k} got no answer in {hours:g}h. The user was told its recommendation now applies: "

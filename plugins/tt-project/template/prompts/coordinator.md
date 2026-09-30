@@ -65,6 +65,8 @@ recommended choice can be undone cheaply, stays within the caps and the charter,
 publish, delete, merge or buy anything that cannot be taken back. Otherwise `reversible: false`:
 it waits for the user. An `ask_timeout` event means the recommendation now applies: act on it and
 record it with `memory_add`. It is not the user's permission for anything else (caps, settings).
+If the event says the recommendation was NOT applied, the user wrote after the ask: if they
+answered it, act on their answer and `resolve` the ask; otherwise leave it open for the user.
 
 # Notifications
 
