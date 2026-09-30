@@ -1162,6 +1162,16 @@ def test_status_says_when_questions_are_not_reaching_any_chat(env):
     assert health(p, p.db)["undelivered"] is None
 
 
+def test_the_web_app_shows_every_open_ask(env):
+    p = make(env)
+    from ttp.web import state_payload
+    problems, ask = _ask(p, severity="normal", blocking="access")
+    assert problems == [] and ask["severity"] == "normal"
+    p.db.post("out", "fyi", chat=None, kind="alert", severity="normal")
+    shown = {m["id"]: m["kind"] for m in state_payload(p, p.db)["attention"]}
+    assert shown == {ask["id"]: "ask"}, "an open question was counted but hidden, or a routine alert shown"
+
+
 def test_asks_without_a_registered_default_never_time_out(env):
     p = make(env)
     from ttp import coordinator as coord

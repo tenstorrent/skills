@@ -176,8 +176,9 @@ def state_payload(p: Project, db: DB) -> dict:
                        "WHERE status IN ('open','tracking') ORDER BY last_seen DESC LIMIT 100"),
         "schedules": sched.with_costs(db),
         "attention": db.q("SELECT id,ts,kind,severity,text FROM messages WHERE direction='out' AND chat IS NULL "
-                          "AND ((kind='ask' AND handled=0) OR (kind='alert' AND ts>?)) "
-                          "AND severity IN ('high','critical') ORDER BY id DESC LIMIT 20", (now - 86400,)),
+                          "AND ((kind='ask' AND handled=0) OR "
+                          "(kind='alert' AND ts>? AND severity IN ('high','critical'))) "
+                          "ORDER BY id DESC LIMIT 20", (now - 86400,)),
         "budget": bud.history(db),
         "coordinator": db.kv("last_coordinator_summary", {}),
         "health": health(p, db, now=now),
