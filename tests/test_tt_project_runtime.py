@@ -2682,10 +2682,16 @@ def test_restart_rolls_back_when_the_new_daemon_dies_or_its_first_tick_fails(env
     assert subprocess.run(["git", "-C", str(h), "diff", "--quiet", good, "HEAD", "--", "runtime"]).returncode == 0
 
 
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
 @pytest.mark.parametrize("exits_after", [45, None])
-def test_a_cron_restart_waits_for_the_old_daemon_and_never_rolls_it_back(env, monkeypatch, exits_after):
+def test_a_cron_restart_waits_for_the_old_daemon_and_never_rolls_it_back(env, monkeypatch, exits_after, platform):
+    # With no launchd agent or systemd unit (on macOS too: a daemon started by hand, or a failed
+    # bootstrap), a restart stops the old daemon and starts a new one itself.
     p = make(env)
     from ttp import daemon as dm, service
+    monkeypatch.setenv("HOME", str(env["tmp"] / "userhome"))
+    monkeypatch.setattr(service.sys, "platform", platform)
+    monkeypatch.setattr(service, "_run", lambda *a: subprocess.CompletedProcess(a, 1, "", "no such service"))
     h = p.harness
     p.db.set_kv("harness_good", {"commit": _git_out(h, "rev-parse", "HEAD")})
     head = _runtime_change(h)
@@ -2724,6 +2730,25 @@ def test_a_cron_restart_waits_for_the_old_daemon_and_never_rolls_it_back(env, mo
     assert ("daemon is running" in text) if exits_after else ("old daemon has not exited" in text)
     assert _git_out(h, "rev-parse", "HEAD") == head, "the runtime was rolled back while the old daemon lived"
     assert not p.db.one("SELECT id FROM messages WHERE kind='alert' AND text LIKE '%rolled back%'")
+
+
+@pytest.mark.parametrize("kickstart_rc", [0, 1])
+def test_a_macos_restart_uses_the_launchd_agent_and_falls_back_when_it_is_not_loaded(env, monkeypatch, kickstart_rc):
+    p = make(env)
+    from ttp import service
+    monkeypatch.setenv("HOME", str(env["tmp"] / "userhome"))
+    monkeypatch.setattr(service.sys, "platform", "darwin")
+    label = f"com.tt-project.{service.unit_name(p)}"
+    plist = env["tmp"] / "userhome" / "Library" / "LaunchAgents" / f"{label}.plist"
+    plist.parent.mkdir(parents=True)
+    plist.write_text("")
+    calls, spawned = [], []
+    monkeypatch.setattr(service, "_run",
+                        lambda *a: calls.append(a) or subprocess.CompletedProcess(a, kickstart_rc, "", ""))
+    monkeypatch.setattr(service, "_spawn", lambda p: spawned.append(p))
+    assert service.restart_service(p) == "restarted"
+    assert calls == [("launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}")]
+    assert bool(spawned) == bool(kickstart_rc), "a loaded agent restarts itself; an unloaded one is started by hand"
 
 
 def test_the_daemon_records_its_start_and_first_tick_failures(env, monkeypatch):

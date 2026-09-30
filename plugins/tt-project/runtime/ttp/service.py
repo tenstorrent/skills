@@ -155,10 +155,12 @@ def uninstall(p: Project) -> str:
 
 def restart_service(p: Project) -> str:
     """Restart the daemon process. Running workers are not touched: the new daemon adopts them."""
-    if sys.platform == "darwin":
-        label = f"com.tt-project.{unit_name(p)}"
+    label = f"com.tt-project.{unit_name(p)}"
+    if sys.platform == "darwin" and (Path.home() / "Library" / "LaunchAgents" / f"{label}.plist").exists():
         r = _run("launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}")
-        return "restarted" if r.returncode == 0 else r.stderr.strip()[:200]
+        if r.returncode == 0:
+            return "restarted"
+        # The agent is not loaded (its bootstrap failed): restart the daemon by hand like cron does.
     unit = Path.home() / ".config" / "systemd" / "user" / f"{unit_name(p)}.service"
     if unit.exists():
         r = _run("systemctl", "--user", "restart", unit.name)
