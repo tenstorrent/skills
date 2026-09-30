@@ -22,6 +22,7 @@ import time
 from pathlib import Path
 
 from . import __version__
+from .db import SEVERITY_RANK
 from . import schedule as sched
 from .project import (FOLDER, NAME_RE, Project, hostname, load_registry, load_secrets, register, save_secret,
                       write_json)
@@ -346,7 +347,10 @@ def cmd_listen(a) -> None:
     row = db.one("SELECT last_read, min_severity FROM chats WHERE id=?", (a.chat,))
     if not row:
         die(f"unknown chat {a.chat}; run `ttp connect {a.name}` first")
-    after, floor = int(row["last_read"] or 0), row["min_severity"] or "normal"
+    # The project floor (notify.chat_min_severity) applies to every chat; a chat can only raise it.
+    floor = max((row["min_severity"] or "normal", p.config()["notify"].get("chat_min_severity") or "normal"),
+                key=lambda n: SEVERITY_RANK.get(n, -1))
+    after = int(row["last_read"] or 0)
     # One listener per chat, and the newest wins. Two would race for the same messages, and one
     # printing to nowhere (a lost background task, a dropped ssh session) would silently mark them
     # read. Whoever arms a listener last is the one that wants the messages.

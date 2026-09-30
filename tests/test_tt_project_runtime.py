@@ -415,6 +415,22 @@ def test_listen_ack_is_clamped_to_known_messages(env):
     assert p.db.one("SELECT last_read FROM chats WHERE id='c1'")["last_read"] == top
 
 
+def test_listen_honours_the_project_chat_floor(env):
+    """notify.chat_min_severity filters broadcasts on every listener; a per-chat floor can only raise it."""
+    p = make(env)
+    p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)",
+           (time.time(), "t", time.time()))
+    run_env = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost")
+    cmd = [sys.executable, str(TTP), "listen", "demo", "--chat", "c1", "--once", "--timeout", "1"]
+    p.db.post("out", "routine note", kind="alert", severity="normal")
+    p.set_config("notify.chat_min_severity", "high")
+    out = subprocess.run(cmd, env=run_env, capture_output=True, text=True, timeout=30).stdout
+    assert "routine note" not in out
+    p.db.post("out", "urgent note", kind="alert", severity="high")
+    out = subprocess.run(cmd, env=run_env, capture_output=True, text=True, timeout=30).stdout
+    assert "urgent note" in out and "routine note" not in out
+
+
 def test_config_refreshes_last_good_on_equal_mtime(env):
     """Two writes in one filesystem clock tick share an mtime; the newer config still becomes last-good."""
     p = make(env)
