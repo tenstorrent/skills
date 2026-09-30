@@ -724,22 +724,58 @@ def test_the_web_app_drops_high_alerts_once_their_condition_clears(env):
 
 
 def test_the_red_budget_alert_is_posted_after_the_gates_show_red(env, monkeypatch):
-    """A relay polling between the post and the gates write would see the alert as cleared."""
+    """A relay seeing the alert while the gates still show the old level would count it as cleared."""
     p = make(env)
     from ttp.daemon import Daemon
     d = Daemon(p.base)
     d.update_gates()
     p.db.spend("fake", 150.0, "task:1")
-    seen = []
+    seen, outside = [], []
     post = d.p.db.post
 
     def spy(*a, **kw):
         if str(kw.get("ref", "")).startswith("budget:"):
-            seen.append((p.db.kv("gates") or {}).get("fake", {}).get("level"))
+            seen.append((d.p.db.kv("gates") or {}).get("fake", {}).get("level"))
+            outside.append(((p.db.kv("gates") or {}).get("fake", {}).get("level"),
+                            len(p.db.q("SELECT id FROM messages WHERE ref='budget:fake'"))))
         return post(*a, **kw)
     monkeypatch.setattr(d.p.db, "post", spy)
     d.update_gates()
     assert seen == ["red"], seen
+    assert outside[0][0] != "red" and outside[0][1] == 0, outside
+    assert p.db.kv("gates")["fake"]["level"] == "red"
+    assert len(p.db.q("SELECT id FROM messages WHERE ref='budget:fake'")) == 1
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_a_budget_alert_lost_to_a_failed_write_is_posted_on_the_next_tick(env, monkeypatch, restart):
+    """Saving the new level without its alert would hide the change from every later tick."""
+    import sqlite3
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    d.update_gates()
+    p.db.spend("fake", 150.0, "task:1")
+    post = d.p.db.post
+
+    def locked(*a, **kw):
+        if str(kw.get("ref", "")).startswith("budget:"):
+            raise sqlite3.OperationalError("database is locked")
+        return post(*a, **kw)
+    monkeypatch.setattr(d.p.db, "post", locked)
+    with pytest.raises(sqlite3.OperationalError):
+        d.update_gates()
+    monkeypatch.setattr(d.p.db, "post", post)
+
+    def alerts():
+        return p.db.q("SELECT id FROM messages WHERE ref='budget:fake'")
+    assert alerts() == [] and (p.db.kv("gates") or {}).get("fake", {}).get("level") != "red"
+    if restart:
+        d = Daemon(p.base)
+    d.update_gates()
+    assert len(alerts()) == 1 and p.db.kv("gates")["fake"]["level"] == "red"
+    d.update_gates()
+    assert len(alerts()) == 1, "the alert was posted twice"
 
 
 def test_relays_skip_high_alerts_whose_condition_cleared_before_delivery(env, capsys, monkeypatch):

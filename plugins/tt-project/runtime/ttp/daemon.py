@@ -738,11 +738,14 @@ class Daemon:
                 alerts.append((f"Budget for {prov} is now {g.level}: {'; '.join(g.reasons) or 'back to normal'}. "
                                + hint, sev, f"budget:{prov}"))
             gates[prov] = g
+        # One transaction: saved gates without their alert would hide the change from every later
+        # tick and restart. Gates first: a relay reading an alert before the gates show red would
+        # count it as cleared.
+        with self.p.db.tx():
+            self.p.db.set_kv("gates", {k: v.as_dict() for k, v in gates.items()})
+            for text, sev, ref in alerts:
+                self.p.db.post("out", text, chat=None, kind="alert", severity=sev, ref=ref)
         self.gates = gates
-        # Gates first: a relay reading an alert before the gates show red would count it as cleared.
-        self.p.db.set_kv("gates", {k: v.as_dict() for k, v in gates.items()})
-        for text, sev, ref in alerts:
-            self.p.db.post("out", text, chat=None, kind="alert", severity=sev, ref=ref)
 
     # schedules and watchers ------------------------------------------------------------------------
     def run_schedules(self) -> None:
