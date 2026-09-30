@@ -320,6 +320,17 @@ def cmd_listen(a) -> None:
     if not row:
         die(f"unknown chat {a.chat}; run `ttp connect {a.name}` first")
     after, floor = int(row["last_read"] or 0), row["min_severity"] or "normal"
+    # One listener per chat: a second one would race the first for the same messages, and
+    # whichever prints to nowhere would silently mark them read.
+    lock = p.state / f"listen-{a.chat}.pid"
+    try:
+        other = int(lock.read_text())
+        os.kill(other, 0)
+        if other != os.getpid():
+            die(f"another listener (pid {other}) is already attached to chat {a.chat}; stop it or reuse it", 3)
+    except (OSError, ValueError):
+        pass
+    lock.write_text(str(os.getpid()))
     deadline = time.time() + a.timeout if a.timeout else None
     while True:
         msgs = db.unread_for_chat(a.chat, after, floor)
