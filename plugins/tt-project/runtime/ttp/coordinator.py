@@ -51,8 +51,8 @@ USER_SETTABLE = {
     "coordinator.tier": str, "jev.enabled": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     # Where code tasks branch from: the project's working branch once it has one.
     "delivery.base_ref": str,
-    # The runaway valve on task creation: raised only with the user's yes (see NEEDS_USER).
-    "coordinator.max_new_tasks_per_day": int,
+    # The runaway valve on task creation; the coordinator may raise it within MAX_TASKS_PER_DAY.
+    "coordinator.max_new_tasks_per_day": lambda v: min(int(v), MAX_TASKS_PER_DAY),
     # Skill plugins loaded for this project's workers only (a plan may recommend them).
     "providers.claude.plugin_dirs": lambda v: [str(x) for x in (v if isinstance(v, list) else [v])],
     # Hours before an unanswered reversible ask falls back to its recommendation; 0 turns it off.
@@ -61,6 +61,7 @@ USER_SETTABLE = {
 
 REJECTED_KEY = "rejected_actions"   # kv: the last turn's rejected actions, shown in the next digest
 RECENT_OUT = 5                       # outbound messages the digest repeats, so turns do not resend them
+MAX_TASKS_PER_DAY = 1000
 ASK_DEFAULTS_KEY = "ask_defaults"   # kv: {ask message id: recommendation} for reversible asks
 _DEFAULT_NOTE = "\n\nIf there is no answer within "
 
@@ -167,10 +168,10 @@ def _norm_severity(s: str | None) -> str:
     return s if s in SEVERITY_RANK else "normal"
 
 
-# Settings that change what code workers run. The coordinator may set them only in a turn that
-# carries a message from the user, after asking: a turn woken by logs, pull requests or a worker's
-# hand-off can be steered by text from outside, and must not be able to load new code.
-NEEDS_USER = {"providers.claude.plugin_dirs", "coordinator.max_new_tasks_per_day"}
+# Settings that spend the user's money or eat into their reserve. The coordinator may change them
+# only in a turn that carries the user's message: a turn woken by logs, pull requests or a worker's
+# hand-off can be steered by text from outside. Everything else it decides on its own.
+NEEDS_USER = {"budget.daily_usd", "budget.weekly_usd", "budget.reserve_pct"}
 
 
 def apply(p: Project, actions: list[dict], default_chat: str | None = None, user_turn: bool = False) -> list[str]:
@@ -336,7 +337,7 @@ def _new_dependencies(db, task: dict | None, raw: Any) -> list[int]:
 
 def ask_timeout_h(cfg: dict) -> float:
     try:
-        return max(0.0, float(cfg["coordinator"].get("ask_timeout_h", 12) or 0))
+        return max(0.0, float(cfg["coordinator"].get("ask_timeout_h", 1) or 0))
     except (TypeError, ValueError):
         return 0.0
 

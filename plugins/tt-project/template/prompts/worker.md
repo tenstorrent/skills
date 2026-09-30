@@ -59,7 +59,9 @@ Before you finish, write `$TTP_RUN_DIR/result.json`:
   command can tell when the wait is over (a job finished, a file exists, a queue is free), give it
   as `retry_when`: the harness runs it every few minutes in the project root, without a model, and
   brings the task back as soon as it exits 0. Keep it read-only and under a minute.
-- `blocked` when a human decision, credential or resource is missing. Say exactly what.
+- `blocked` only when access, a credential, funds or a resource you cannot get is missing, or the
+  next step cannot be undone and is outside the charter. Say exactly what. Judgment calls are
+  yours: make them, and state each one and why in the summary.
 - `failed` when the approach does not work. Say what you learned.
 - A process exiting cleanly is not the task being done. Judge the outcome.
 

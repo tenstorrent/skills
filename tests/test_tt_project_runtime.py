@@ -1038,10 +1038,10 @@ def test_a_reversible_ask_falls_back_to_its_recommendation_after_the_timeout(env
     p = make(env)
     from ttp import coordinator as coord
     problems, ask = _ask(p, reversible=True, recommendation="use option A")
-    assert problems == [] and "within 12h" in ask["text"] and "use option A" in ask["text"]
-    assert "reversible; defaults to its recommendation in 12.0h" in coord.digest(p, {}, [], [])
-    assert coord.expire_asks(p, now=ask["ts"] + 11 * 3600) == []
-    assert coord.expire_asks(p, now=ask["ts"] + 12 * 3600 + 1) == [ask["id"]]
+    assert problems == [] and "within 1h" in ask["text"] and "use option A" in ask["text"]
+    assert "reversible; defaults to its recommendation in 1.0h" in coord.digest(p, {}, [], [])
+    assert coord.expire_asks(p, now=ask["ts"] + 0.9 * 3600) == []
+    assert coord.expire_asks(p, now=ask["ts"] + 3600 + 1) == [ask["id"]]
     assert p.db.one("SELECT handled FROM messages WHERE id=?", (ask["id"],))["handled"] == 1
     told = p.db.one("SELECT * FROM messages WHERE kind='alert' ORDER BY id DESC LIMIT 1")
     assert "use option A" in told["text"] and "Option A or B?" in told["text"] and told["chat"] is None
@@ -1276,8 +1276,7 @@ def test_project_plugins_load_for_workers_only(env, tmp_path, monkeypatch):
     plug.mkdir()
     action = {"type": "config_set", "key": "providers.claude.plugin_dirs",
               "value": [str(plug), str(tmp_path / "missing")]}
-    assert "approval" in coord.apply(p, [action])[0], "plugins were enabled without the user"
-    assert coord.apply(p, [action], user_turn=True) == []
+    assert coord.apply(p, [action]) == [], "enabling worker plugins must not wait for the user"
     p.set_config("core_provider", "claude")
     d = Daemon(p.base)
     tid = p.db.add_task("t", "s", kind="work", tier="light", origin="user")
@@ -1686,14 +1685,15 @@ def test_ttp_lock_holds_until_its_command_ends_even_when_signalled(env):
     assert t["start2"] >= t["end1"] - 0.05, "the resource was handed on while the first command still ran"
 
 
-def test_the_task_creation_valve_opens_only_with_the_user(env):
+def test_only_money_waits_for_the_user(env):
+    """The project runs unattended: it may raise its own task valve, never spend past a cap."""
     p = make(env)
     from ttp import coordinator as coord
-    action = {"type": "config_set", "key": "coordinator.max_new_tasks_per_day", "value": "50"}
-    assert "approval" in coord.apply(p, [action])[0]
-    assert coord.apply(p, [action], user_turn=True) == []
-    assert p.config()["coordinator"]["max_new_tasks_per_day"] == 50
-
+    assert coord.apply(p, [{"type": "config_set", "key": "coordinator.max_new_tasks_per_day", "value": "5000"}]) == []
+    assert p.config()["coordinator"]["max_new_tasks_per_day"] == coord.MAX_TASKS_PER_DAY
+    for key, value in (("budget.daily_usd", "500"), ("budget.reserve_pct", "2")):
+        assert "approval" in coord.apply(p, [{"type": "config_set", "key": key, "value": value}])[0], key
+        assert coord.apply(p, [{"type": "config_set", "key": key, "value": value}], user_turn=True) == []
 
 def _count_turns(d, monkeypatch, clock):
     """Stub the coordinator launch so wake decisions can be counted over simulated time."""
