@@ -44,10 +44,12 @@ in `state/runs/<id>/`, so a daemon restart never loses a result.
     wedge the loop: a task never stays `running` without a live run, and a queued task whose
     dependency failed or was cancelled is blocked with the reason. The coordinator unsticks it by
     re-pointing `depends_on`; a requeue onto a dead dependency is rejected, never silently undone.
-13. A question to the user falls back to its recommendation only when marked reversible, after
-    `coordinator.ask_timeout_h` (12h), never at a cap or when the user has written since it was
-    asked (the coordinator is asked to confirm instead); the user is told what was decided, at
-    `high` severity or above so it clears the chat floor. Irreversible questions wait for the user.
+13. A question to the user carries a blocking reason (access, funds, spend, review, merge,
+    irreversible, restriction, human) and waits for the user; anything else is a judgment call
+    the coordinator decides and records. No new question falls back on a timer. Questions asked
+    before this rule with a default still drain: after `coordinator.ask_timeout_h`, never at a
+    cap or when the user has written since it was asked (the coordinator is asked to confirm
+    instead); the user is told what was decided, at `high` severity or above.
 
 ## Why the coordinator is tool-less
 

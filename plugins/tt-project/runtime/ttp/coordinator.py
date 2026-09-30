@@ -21,6 +21,9 @@ from .runner import stop_runs
 ACTION_TYPES = ("reply", "task_add", "task_update", "ask_user", "resolve", "notify", "memory_add",
                 "charter_update", "schedule_set", "config_set", "noop")
 
+# Why an ask cannot be decided by the coordinator itself. Anything else is a judgment call.
+BLOCKING_REASONS = ("access", "funds", "spend", "review", "merge", "irreversible", "restriction", "human")
+
 ACTIONS_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -34,7 +37,7 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "memory_kind": {"type": "string"}, "section": {"type": "string"}, "name": {"type": "string"},
             "every": {"type": "string"}, "at": {"type": "string"}, "enabled": {"type": "boolean"},
             "key": {"type": "string"}, "value": {"type": "string"},
-            "reversible": {"type": "boolean"}, "recommendation": {"type": "string"},
+            "blocking": {"type": "string", "enum": list(BLOCKING_REASONS)},
             "resources": {"type": "array", "items": {"type": "string"}}, "exclusive": {"type": "boolean"}},
             "required": ["type"]}},
         "summary": {"type": "string"},
@@ -55,14 +58,15 @@ USER_SETTABLE = {
     "coordinator.max_new_tasks_per_day": lambda v: min(int(v), MAX_TASKS_PER_DAY),
     # Skill plugins loaded for this project's workers only (a plan may recommend them).
     "providers.claude.plugin_dirs": lambda v: [str(x) for x in (v if isinstance(v, list) else [v])],
-    # Hours before an unanswered reversible ask falls back to its recommendation; 0 turns it off.
+    # Hours before an unanswered ask registered with a default falls back to it; 0 turns it off.
+    # New asks never get a default, so this only drains asks registered with one.
     "coordinator.ask_timeout_h": float,
 }
 
 REJECTED_KEY = "rejected_actions"   # kv: the last turn's rejected actions, shown in the next digest
 RECENT_OUT = 5                       # outbound messages the digest repeats, so turns do not resend them
 MAX_TASKS_PER_DAY = 1000
-ASK_DEFAULTS_KEY = "ask_defaults"   # kv: {ask message id: recommendation} for reversible asks
+ASK_DEFAULTS_KEY = "ask_defaults"   # kv: {ask message id: recommendation}; no new ask is added
 _DEFAULT_NOTE = "\n\nIf there is no answer within "
 
 
@@ -256,23 +260,17 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if upd.get("status") == "cancelled":
                     stop_runs(db, p.runs, task["id"])
             elif t == "ask_user":
-                rec = (a.get("recommendation") or "").strip()
-                hours = ask_timeout_h(cfg)
-                defaults = a.get("reversible") is True and bool(rec) and hours > 0
+                if a.get("reversible") is True:
+                    raise ValueError("ask_user rejected: decide it yourself. A reversible choice is a judgment "
+                                     "call: act on it, memory_add a decision and notify at severity low")
+                if a.get("blocking") not in BLOCKING_REASONS:
+                    raise ValueError(f"ask_user rejected: `blocking` must be one of {', '.join(BLOCKING_REASONS)}; "
+                                     f"got {a.get('blocking')!r}. Anything else, decide it yourself")
                 text = a["text"].strip()
                 for o in db.q("SELECT id, text FROM messages WHERE kind='ask' AND handled=0"):
                     if _same_text(o["text"].split(_DEFAULT_NOTE)[0], text):
                         raise ValueError(f"already asked as open ask #{o['id']}; it waits for the answer")
-                if defaults:
-                    text += f"{_DEFAULT_NOTE}{hours:g}h, I will go with the recommendation: {rec}"
-                with db.tx():
-                    mid = db.post("out", text, chat=None, kind="ask",
-                                  severity=_norm_severity(a.get("severity") or "high"))
-                    if defaults:
-                        db.set_kv(ASK_DEFAULTS_KEY, {**db.kv(ASK_DEFAULTS_KEY, {}), str(mid): rec})
-                if a.get("reversible") is True and not rec:
-                    raise ValueError(f"ask #{mid} is marked reversible without a recommendation, "
-                                     f"so it waits for the user")
+                db.post("out", text, chat=None, kind="ask", severity=_norm_severity(a.get("severity") or "high"))
             elif t == "resolve":
                 n = db.x("UPDATE messages SET handled=1 WHERE id=? AND kind='ask'", (int(a["id"]),))
                 if not n:
@@ -299,7 +297,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if key not in USER_SETTABLE:
                     raise ValueError(f"{key} is not user-settable from chat")
                 if key in NEEDS_USER and not user_turn:
-                    raise ValueError(f"{key} needs the user's approval: ask_user with the exact value, and set "
+                    raise ValueError(f"{key} needs the user's approval: ask_user (blocking spend) with the exact value, and set "
                                      f"it in the turn that carries their yes")
                 p.set_config(key, USER_SETTABLE[key](a.get("value")))
             elif t in ("noop", None):
@@ -343,10 +341,10 @@ def ask_timeout_h(cfg: dict) -> float:
 
 
 def expire_asks(p: Project, *, hold: bool = False, now: float | None = None) -> list[int]:
-    """Resolve reversible asks left unanswered past the timeout into their recommendation.
+    """Resolve asks registered with a default and left unanswered past the timeout into it.
 
-    Only asks the coordinator marked reversible with a recommendation are ever listed; anything
-    else waits for the user indefinitely. Nothing expires while `hold` is set (the project is at a
+    New asks are never registered, so this only drains asks that got a default when they were
+    asked; every other ask waits for the user indefinitely. Nothing expires while `hold` is set (the project is at a
     cap) or while a user message is unhandled, since that message may be the answer. A due ask
     with any user message after it, handled or not, may have been answered without a `resolve`:
     it keeps waiting for the user and the coordinator is asked to confirm instead. The user is

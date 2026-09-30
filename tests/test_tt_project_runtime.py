@@ -1034,11 +1034,50 @@ def _ask(p, text="Option A or B?", **fields):
     return problems, p.db.one("SELECT * FROM messages WHERE kind='ask' ORDER BY id DESC LIMIT 1")
 
 
-def test_a_reversible_ask_falls_back_to_its_recommendation_after_the_timeout(env):
+def _legacy_ask(p, rec="use option A", text="Option A or B?", severity="high"):
+    """An ask registered with a default before new asks stopped getting one."""
+    from ttp import coordinator as coord
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    mid = p.db.post("out", f"{text}{coord._DEFAULT_NOTE}1h, I will go with the recommendation: {rec}",
+                    chat=None, kind="ask", severity=severity)
+    p.db.set_kv(coord.ASK_DEFAULTS_KEY, {**p.db.kv(coord.ASK_DEFAULTS_KEY, {}), str(mid): rec})
+    return p.db.one("SELECT * FROM messages WHERE id=?", (mid,))
+
+
+def test_an_ask_needs_a_blocking_reason_and_never_gets_a_default(env):
     p = make(env)
     from ttp import coordinator as coord
-    problems, ask = _ask(p, reversible=True, recommendation="use option A")
-    assert problems == [] and "within 1h" in ask["text"] and "use option A" in ask["text"]
+    for fields in ({}, {"blocking": "preference"}, {"blocking": ""}):
+        problems, ask = _ask(p, **fields)
+        assert problems and "`blocking` must be one of" in problems[0], fields
+        assert ask is None, "a rejected ask reached the user"
+    problems, ask = _ask(p, blocking="access", recommendation="use option A")
+    assert problems == [] and ask["text"] == "Option A or B?"
+    assert p.db.kv(coord.ASK_DEFAULTS_KEY, {}) == {}, "a new ask was registered to fall back on a timer"
+    assert coord.expire_asks(p, now=time.time() + 1000 * 3600) == []
+    assert f"ask #{ask['id']} (waits for the user)" in coord.digest(p, {}, [], [])
+    for reason in coord.BLOCKING_REASONS:
+        assert _ask(p, f"Question on {reason}?", blocking=reason)[0] == [], reason
+
+
+def test_a_reversible_ask_is_rejected_and_the_rejection_reaches_the_next_digest(env):
+    p = make(env)
+    from types import SimpleNamespace
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    ok = SimpleNamespace(structured={"actions": [
+        {"type": "ask_user", "text": "Option A or B?", "blocking": "human", "reversible": True,
+         "recommendation": "use option A"}], "summary": ""}, error="", final_text="")
+    d._finish_coordinator({"dir": "x"}, ok, "ok", {})
+    assert not p.db.q("SELECT id FROM messages WHERE kind='ask'")
+    assert "decide it yourself" in coord.digest(p, {}, [], []).split("# NEW EVENTS")[1]
+
+
+def test_a_legacy_ask_with_a_default_still_drains_after_the_timeout(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    ask = _legacy_ask(p)
     assert "reversible; defaults to its recommendation in 1.0h" in coord.digest(p, {}, [], [])
     assert coord.expire_asks(p, now=ask["ts"] + 0.9 * 3600) == []
     assert coord.expire_asks(p, now=ask["ts"] + 3600 + 1) == [ask["id"]]
@@ -1052,24 +1091,23 @@ def test_a_reversible_ask_falls_back_to_its_recommendation_after_the_timeout(env
     assert p.db.kv(coord.ASK_DEFAULTS_KEY) == {}
 
 
-def test_irreversible_asks_never_time_out(env):
+def test_asks_without_a_registered_default_never_time_out(env):
     p = make(env)
     from ttp import coordinator as coord
-    _, firm = _ask(p, "Delete the old data?", reversible=False, recommendation="delete the old data")
-    _, silent = _ask(p, "Option A or C?", recommendation="use option A")
-    problems, bare = _ask(p, "Option B or C?", reversible=True)
-    assert problems and "without a recommendation" in problems[0], "a reversible ask with nothing to fall back to"
+    _, firm = _ask(p, "Delete the old data?", blocking="irreversible", reversible=False,
+                   recommendation="delete the old data")
+    _, silent = _ask(p, "Option A or C?", blocking="human", recommendation="use option A")
     assert "within" not in firm["text"]
     assert coord.expire_asks(p, now=time.time() + 1000 * 3600) == []
     assert all(p.db.one("SELECT handled FROM messages WHERE id=?", (a["id"],))["handled"] == 0
-               for a in (firm, silent, bare))
-    assert coord.digest(p, {}, [], []).count("(waits for the user)") == 3
+               for a in (firm, silent))
+    assert coord.digest(p, {}, [], []).count("(waits for the user)") == 2
 
 
 def test_an_ask_waits_while_an_answer_is_pending_over_a_cap_or_turned_off(env):
     p = make(env)
     from ttp import coordinator as coord
-    _, ask = _ask(p, reversible=True, recommendation="use option A")
+    ask = _legacy_ask(p)
     late = ask["ts"] + 13 * 3600
     assert coord.expire_asks(p, now=late, hold=True) == [], "a cap-hold did not stop the default"
     p.set_config("coordinator.ask_timeout_h", 0)
@@ -1082,7 +1120,7 @@ def test_an_ask_waits_while_an_answer_is_pending_over_a_cap_or_turned_off(env):
 def test_a_user_reply_after_an_ask_blocks_its_default_even_once_handled(env):
     p = make(env)
     from ttp import coordinator as coord
-    _, ask = _ask(p, reversible=True, recommendation="use option A")
+    ask = _legacy_ask(p)
     late = ask["ts"] + 13 * 3600
     reply = p.db.post("in", "go with B", chat="c1")
     assert coord.expire_asks(p, now=late) == [], "defaulted over an unread user reply that may answer it"
@@ -1103,14 +1141,14 @@ def test_a_fallback_notice_is_never_below_the_chat_floor(env):
     p = make(env)
     from ttp import coordinator as coord
     from ttp.db import SEVERITY_RANK
-    _, ask = _ask(p, reversible=True, recommendation="use option A", severity="low")
+    ask = _legacy_ask(p, severity="low")
     assert ask["severity"] == "low"
     assert coord.expire_asks(p, now=ask["ts"] + 12 * 3600 + 1) == [ask["id"]]
     told = p.db.one("SELECT * FROM messages WHERE kind='alert' ORDER BY id DESC LIMIT 1")
     floor = p.config()["notify"]["chat_min_severity"]
     assert SEVERITY_RANK[told["severity"]] >= max(SEVERITY_RANK["high"], SEVERITY_RANK[floor])
     assert told["id"] in [m["id"] for m in p.db.unread_for_chat("c1", 0, floor)]
-    _, ask2 = _ask(p, reversible=True, recommendation="use option C", severity="low")
+    ask2 = _legacy_ask(p, "use option C", "Option C or D?", severity="low")
     p.set_config("notify.chat_min_severity", "critical")
     assert coord.expire_asks(p, now=ask2["ts"] + 12 * 3600 + 1) == [ask2["id"]]
     told = p.db.one("SELECT * FROM messages WHERE kind='alert' ORDER BY id DESC LIMIT 1")
@@ -1120,7 +1158,7 @@ def test_a_fallback_notice_is_never_below_the_chat_floor(env):
 def test_the_daemon_expires_a_due_ask_and_hands_it_to_the_coordinator(env):
     p = make(env)
     from ttp.daemon import Daemon
-    _, ask = _ask(p, reversible=True, recommendation="use option A")
+    ask = _legacy_ask(p)
     p.db.x("UPDATE messages SET ts=? WHERE id=?", (time.time() - 13 * 3600, ask["id"]))
     p.set_config("coordinator.debounce_s", 0)
     d = Daemon(p.base)
@@ -1765,8 +1803,8 @@ def test_a_rejected_action_waits_for_the_next_turn_instead_of_starting_one(env, 
 def test_an_identical_open_ask_is_not_posted_twice(env):
     p = make(env)
     from ttp import coordinator as coord
-    assert _ask(p, "Ship it now or wait?", reversible=True, recommendation="wait")[0] == []
-    problems, _ = _ask(p, "  ship it now   or WAIT? ", reversible=True, recommendation="wait")
+    assert _ask(p, "Ship it now or wait?", blocking="merge")[0] == []
+    problems, _ = _ask(p, "  ship it now   or WAIT? ", blocking="merge")
     assert problems and "already asked" in problems[0]
     assert len(p.db.q("SELECT id FROM messages WHERE kind='ask'")) == 1
     assert "Ship it now or wait?" in coord.digest(p, {}, [], []).split("## Recently sent to the user")[1]
