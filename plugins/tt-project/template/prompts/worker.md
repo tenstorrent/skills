@@ -51,3 +51,7 @@ Before you finish, write `$TTP_RUN_DIR/result.json`:
 - No progress possible → stop early with an honest handoff.
 - NEVER poll, sleep-wait, or loop waiting for something. Hand off `waiting`, `blocked` or
   `needs_review`.
+- Your run ends when you stop. Nothing picks up later unless your hand-off says so. Started a
+  long build or job? Leave it running, note how to check on it, and hand off `waiting` with a
+  `retry_after_s` that fits it.
+- No `result.json`, no credit: a run that ends without one counts as an unfinished attempt.

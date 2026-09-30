@@ -360,18 +360,23 @@ class Daemon:
         rstatus = result.get("status") if isinstance(result, dict) else None
         summary = str((result.get("summary") if isinstance(result, dict) else None) or (usage.final_text or "")[:1500])
         waiting = status == "ok" and rstatus == "waiting"
+        no_handoff = status == "ok" and rstatus is None
         if waiting:
             new = "queued"   # a busy resource is not a failed attempt: the task comes back later
-        elif status == "ok" and rstatus in ("done", "blocked", "failed", "needs_review", None):
-            new = {"done": "done", "blocked": "blocked", "failed": "failed", "needs_review": "review",
-                   None: "done"}[rstatus]
+        elif no_handoff:
+            # A clean exit without a hand-off is not evidence of done work: the worker may have
+            # stopped mid-task ("I'll pick up later"). Count an attempt and retry with its last words.
+            new, status = "failed", "no_handoff"
+            summary = f"ended without a hand-off. Its last message: {summary}"[:1500]
+        elif status == "ok" and rstatus in ("done", "blocked", "failed", "needs_review"):
+            new = {"done": "done", "blocked": "blocked", "failed": "failed", "needs_review": "review"}[rstatus]
         elif status in ("limit", "auth"):
             new = "queued"   # not an attempt: the account refused, the task did not fail
         else:
             new = "failed"
         attempts = int(task["attempts"] or 0) + (0 if status in ("limit", "auth") or waiting else 1)
         if new == "failed" and attempts < int(task["max_attempts"] or 3) and status in ("failed", "lost", "timeout",
-                                                                                     "stalled"):
+                                                                                     "stalled", "no_handoff"):
             new = "queued"
         extra: dict = {}
         reason = None

@@ -289,6 +289,9 @@ def test_one_listener_per_chat(env):
         second = subprocess.Popen(cmd, env=run_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             first.wait(timeout=15)
+            deadline = time.time() + 10     # the new listener writes its id just after the old one dies
+            while time.time() < deadline and lock.exists() and lock.read_text().strip() != str(second.pid):
+                time.sleep(0.1)
             assert lock.read_text().strip() == str(second.pid), "the newest listener does not own the chat"
             p.db.post("out", "hello", chat="c1", kind="reply")
             out = ""
@@ -824,3 +827,19 @@ def test_the_daemon_expires_a_due_ask_and_hands_it_to_the_coordinator(env):
     assert "use option A" in p.db.one("SELECT text FROM messages WHERE kind='alert' ORDER BY id DESC")["text"]
     assert _run_until(d, p, lambda: p.db.one("SELECT status FROM events WHERE kind='ask_timeout'")["status"]
                       == "handled"), "the coordinator never saw the timed-out ask"
+
+def test_a_run_without_a_handoff_is_retried_not_done(env, monkeypatch):
+    p = make(env)
+    from ttp.daemon import Daemon
+    monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps({"summary": "The build is still running. I'll pick up later."}))
+    tid = p.db.add_task("baseline", "build and time it", kind="work", tier="light", origin="user")
+    d = Daemon(p.base)
+    assert _run_until(d, p, lambda: p.db.task(tid)["attempts"] == 1
+                      and not p.db.q("SELECT id FROM runs WHERE status='running'"))
+    t = p.db.task(tid)
+    assert t["status"] == "queued", f"a run with no hand-off became {t['status']}"
+    assert "without a hand-off" in load_result_summary(t)
+
+
+def load_result_summary(task) -> str:
+    return json.loads(task["result"] or "{}").get("summary", "")
