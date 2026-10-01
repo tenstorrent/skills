@@ -38,7 +38,10 @@ Also preserve the rest of the advertised model capability contract established b
 
 Prompt length is a logical API input. The full model and generator must accept valid prompt lengths up to the supported context, including lengths that are not divisible by internal prefill chunk, tile, block, page, or trace sizes. If an op path needs aligned physical shapes, pad or chunk internally, mask padded tokens, and slice returned logits/output state back to the logical prompt length. Do not expose assertions such as `seq_len % chunk_size == 0` unless the HF model itself has that semantic restriction.
 
-Batch handling is part of the capability contract. Optimize primarily for batch-1 single-user latency, but do not hard-code batch 1 into the model, generator, cache, page tables, position handling, sampling, or output formatting. Support larger batches through the same low-level API and test up to batch 32 when the target hardware, memory, and harness allow it. If batch 32 cannot run, record the largest tested batch and the hard physical limit.
+Batch handling is part of the capability contract. Optimize primarily for batch-1 single-user
+latency, but do not hard-code batch 1 into the model, generator, cache, page tables, position
+handling, sampling, or output formatting. Test the larger batch values in the recorded user
+workload through the same low-level API. Do not add unrequested batch targets.
 
 ## How To Approach It
 
@@ -124,7 +127,10 @@ Compare full-model behavior against the HuggingFace reference with real weights.
 
 Run correctness from the smallest useful surface to the full gate. Start with a short smoke check on the reduced full-model probe when the all-layer gate is slow, then move to the complete all-layer model after the smoke check passes. If a test, prompt, or command fails, rerun that failing item directly while debugging; do not rerun the whole suite after every edit. Once the targeted failure is fixed, rerun the smoke check, then rerun the full all-layer correctness gate for final evidence.
 
-Include both batch-1 and larger-batch correctness coverage. Batch 1 is the primary latency target, but the model must still handle batch dimensions correctly. Add at least one batch >1 test for prefill, decode, cache/page-table indexing, token feedback, and output formatting; test up to batch 32 when the hardware and harness allow it.
+Include batch-1 correctness coverage and the larger batch values requested by the user. Batch 1 is
+the primary latency target, but the model must still handle batch dimensions correctly. For each
+requested larger value, cover prefill, decode, cache/page-table indexing, token feedback, and
+output formatting.
 
 For instruction/chat models, prefer a teacher-forcing reference generated from a normal chat-template prompt over raw book text. In tt-metal autoports, use the DeepSeek AIME24 prompt set rendered by the HF tokenizer chat template as the main readiness reference, for example:
 
@@ -224,7 +230,7 @@ Done means all of these are true and recorded:
 - state-dict mapping, tied-embedding behavior if relevant, and real-weight loading behavior;
 - KV-cache, page-table or position handling, prompt lengths, and repeated decode reuse;
 - context contract: HF-advertised context, full-model supported context, and any hard-physical-limit reduction evidence;
-- batch contract: batch-1 primary path, largest batch tested up to 32, and any hard-physical-limit reduction evidence;
+- batch contract: batch-1 primary path, requested larger batch values tested, and any hard-physical-limit evidence;
 - full-model accuracy and `$qualitative-check` evidence, including prompt-format metadata, rendered prompt artifacts, HF controls, and the shared qualitative prompt suite run through the TT generator;
 - split-sampling trace evidence: model trace to logits, internal sampling trace, `tt_out_tok` feedback into the persistent decode token input, current-position coherence, and page-table refresh coverage;
 - determinism or repeated-run coverage appropriate to the implementation risk, including logit reproducibility across runs and batch positions;

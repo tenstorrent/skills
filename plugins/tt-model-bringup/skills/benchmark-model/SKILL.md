@@ -1,6 +1,6 @@
 ---
 name: benchmark-model
-description: Report a text model's accuracy on fixed lm-eval subsets and 4K-input vLLM serving performance at concurrency 1 and 32. Use after optimized-vLLM for the final model-bringup report or to benchmark a supported model.
+description: Report a text model's accuracy on fixed lm-eval subsets and vLLM serving performance at single-user plus user-selected workload profiles. Use after optimized-vLLM for the final model-bringup report or to benchmark a supported model.
 ---
 
 # Benchmark a model through vLLM
@@ -17,17 +17,50 @@ Select the upstream prompt/scorer variant and the model's generation settings be
 
 Reuse the packaged common question subsets. A new model does not require a new subset. Use `prepare --reuse-manifest` to select a different recipe over the same documents. For a new benchmark, freeze documents before observing scores; retain IDs, content hashes and population counts. Never select questions to improve agreement with a published score.
 
-Run accuracy at **32 concurrent HTTP requests**. Use the shared request pool when the selected tasks have identical generation settings. Check raw responses for template, transport and scoring integration errors and repair those errors. Keep upstream scores and all questions in the denominator, including token-limited answers. Report truncation counts and relevant protocol differences. Low scores are results to present, not a reason to block completion or keep optimizing the model.
+Run accuracy at the user-selected concurrency. If none was selected, use concurrency 1. Use the
+shared request pool when the selected tasks have identical generation settings. Check raw responses
+for template, transport and scoring integration errors and repair those errors. Keep upstream
+scores and all questions in the denominator, including token-limited answers. Report truncation
+counts and relevant protocol differences. Low scores are results to present, not a reason to block
+completion or keep optimizing the model.
 
 ## Measure performance
 
-Measure two serving profiles with **4096 input tokens** and **128 output tokens**: **single user**, with `--max-num-seqs 1` and one concurrent request, and **32 users**, with `--max-num-seqs 32` and 32 concurrent requests. Use the best validated single-user settings from optimized-vLLM for the first profile. Each profile must use its corresponding decode trace and cache configuration. Keep model, precision, hardware and full context capacity unchanged. Warm each server configuration, then measure repeated requests. Disable prefix caching, use distinct prompts, request greedy decoding and ignore EOS for performance. Verify actual token counts.
+Always measure the single-user profile and add only the input length, output length and concurrency
+profiles requested by the user. Use the best validated settings from optimized-vLLM for each
+profile. Each must use its corresponding decode trace and cache configuration. Keep model,
+precision, hardware and full context capacity unchanged. Warm each server configuration, then
+measure repeated requests. Disable prefix caching, use distinct prompts, request greedy decoding
+and ignore EOS for performance. Verify actual token counts.
 
 Prepare full-phase accounting before starting the timed run. Use or implement the model's collector and configure the required `roofline_command` from the run contract. Enable lightweight host timing at the actual prefill/decode completion boundaries and derive work from the model's executed shapes, precision and parallelism. Do not enable the live device profiler or add synchronization that changes the serving path. The runner checks the collector on each running server and collects its evidence before switching profiles.
 
-The report labels the profile, concurrent requests and server slots separately. Headline performance includes TTFT, TPOT, per-user decode tokens/s, aggregate output tokens/s, prefill FLOP roofline percentage and decode DRAM bandwidth roofline percentage. **Both roofline estimates are required for both profiles.** Their denominators cover complete elapsed phases, including host work and gaps, rather than matmul duration. If timing or work accounting is missing, preserve the measured results and repair the collection; the stage is incomplete. No minimum roofline percentage or accuracy score is required.
+The report labels each workload, concurrent requests and server slots separately. Headline
+performance includes TTFT, TPOT, per-user decode tokens/s, aggregate output tokens/s, prefill FLOP
+roofline percentage and decode DRAM bandwidth roofline percentage. Both roofline estimates are
+required for every requested profile. Their denominators cover complete elapsed phases, including
+host work and gaps, rather than matmul duration. If timing or work accounting is missing, preserve
+the measured results and repair the collection; the stage is incomplete. No minimum roofline
+percentage or accuracy score is required.
 
-Use the run contract's server-control hook to prepare and record the 32-slot configuration before accuracy, measure 32-user performance, then switch to the one-slot server. Switching and warmup count toward the stage budget. Preserve ITL, end-to-end latency, percentiles, request throughput, completion counts and wall time in the report details.
+Use the run contract's server-control hook to prepare and record the selected accuracy server and
+each requested performance profile. Switching and warmup count toward the stage budget. Preserve
+ITL, end-to-end latency, percentiles, request throughput, completion counts and wall time.
+
+## Diagnose Slow Benchmarks And Evals
+
+Before a long run, use a small representative subset to estimate wall time from measured TTFT,
+TPOT/tokens-per-user, input/output lengths, concurrency and sample count. For high input length,
+output length, batch or concurrency cases, passing is not sufficient: compare host-observed TTFT
+and token cadence with device prefill/decode intervals and check whether an unexamined optimization
+could materially shorten the run.
+
+If device time explains the wall time, return to the relevant prefill, decode, sampling or
+multi-device optimization. If it does not, measure queue wait, request scheduling, trace
+compilation/selection, synchronization, HTTP/client overhead, serialization, retries, timeouts and
+eval-framework or task-environment setup. Fix the dominant overhead and repeat the small probe
+before committing the stage budget to the full workload. Keep first-use and warmed measurements
+separate, and do not shorten valid inputs or outputs to make the run finish.
 
 ## Deliver the report
 

@@ -17,13 +17,21 @@ This guide does not choose a completely new model-level parallelization strategy
 
 Read the advice in `tech_reports/LLMs/llms.md`, particularly section 4 "Best practices and optimizations". In this skill we will strive to optimize *on-device* performance. For decode it is required to always measure the performance of a traced execution run; untraced/eager decode performance is not acceptable optimized evidence. Teacher-forcing decode must also use the traced path. For complete model or serving paths, avoidable host gaps are part of the optimization target and must be removed rather than merely noted. Always perform optimization using real tensor shapes, sequence shapes, batch size, sharding, and dtypes. Do not shrink hidden sizes, head counts, sequence lengths, or weight shapes just to make evidence easier to collect.
 
-Optimize primarily for batch-1 single-user latency, with prefill latency and time-to-first-token (TTFT) as explicit targets alongside decode. Prioritize the measured bottleneck in the requested workload. Preserve larger-batch correctness: do not hard-code batch 1 into the optimized path, trace inputs, cache/page-table handling, sampling, or output formatting. For complete model and serving optimization, keep or add evidence that larger batches/concurrency still work, normally up to 32 when the target hardware, memory, and harness allow it.
+Optimize primarily for batch-1 single-user latency, with prefill latency and time-to-first-token
+(TTFT) as explicit targets alongside decode. Prioritize the measured bottleneck in the requested
+workload. Preserve larger-batch correctness: do not hard-code batch 1 into the optimized path,
+trace inputs, cache/page-table handling, sampling, or output formatting. For complete model and
+serving optimization, test only the additional batch or concurrency values requested by the user.
 
 Optimization must preserve the model's capability and context contract. If a change affects KV-cache dtype, cache layout, trace buffers, activation memory, CCL buffers, or any other persistent allocation, update `models/autoports/<model>/doc/context_contract.json`. Do not improve performance by lowering `max_model_len`, benchmark context, eval context, or any other advertised capability. A reduction is acceptable only when a hard physical device limit prevents the advertised capability from fitting or running, such as device DRAM capacity for weights + KV/cache/state + required persistent buffers. If reduced, record the byte calculation or failed capacity probe, the largest feasible supported value, and the exact construction/serving setting that uses it.
 
 Optimization must also preserve valid non-aligned logical sequence lengths. Faster code that only works when prompt or prefill length is divisible by a chunk, tile, block, page, or trace size is not complete; keep padding, masking, cache fill, position handling, and output slicing inside the model path.
 
-When direct traced generator decode is already fast but vLLM/serving decode is slower, treat the gap as orchestration overhead before retuning decoder math. First fix the adapter/generator path: async decode split, nonblocking trace replay, on-device traced sampling, host readbacks, page-table/input refreshes, and fallback sampling. Keep same-harness primary single-user and CI serving-burst before/after metrics.
+When direct traced generator decode is already fast but vLLM/serving decode is slower, treat the
+gap as orchestration overhead before retuning decoder math. First fix the adapter/generator path:
+async decode split, nonblocking trace replay, on-device traced sampling, host readbacks,
+page-table/input refreshes, and fallback sampling. Keep same-harness before/after metrics for
+single-user and each additional requested profile.
 
 A note on the term "sharding" - tt-metal uses this to mean two things. On-device sharding means sharding across the cores or DRAM banks of one device, such as L1-sharded activations or DRAM-sharded weights. Multi-chip sharding means distributing tensors across devices in a mesh. On-device sharding is in scope for this skill. When `tt-perf-report` mentions sharding, it usually means on-device sharding.
 
@@ -47,7 +55,14 @@ Optimize against the best correct measured path you have, not only against the o
 
 Before finalizing, rerun the selected default path with the same evidence harness used for candidates. The headline optimized numbers are the final default-run numbers, not the best candidate run copied from an earlier environment. If the final default run is materially slower than the candidate it is meant to preserve, fix the default wiring or explain the difference before completing the stage.
 
-When this skill is invoked as part of vLLM integration or optimized-vLLM, do not collect Tracy, `tt-perf-report`, or `TT_METAL_DEVICE_PROFILER` metrics from the live vLLM server or serving adapter. The profiler/table requirement does not apply to vLLM serving stages. Use same-harness `run_vllm_server` benchmark JSON for before/after serving performance: primary single-user 128/128/1 for headline decode t/s/u and CI serving-burst 100/100/32 for vLLM-nightly parity and serving-capacity context. Also keep sampling, qualitative, degenerate-output, async-split, stale-input, and no-host-fallback evidence. Use earlier full-model or reduced non-serving profiles for device-op context if available; if not, record that evidence gap instead of profiling the vLLM stage.
+When this skill is invoked as part of vLLM integration or optimized-vLLM, do not collect Tracy,
+`tt-perf-report`, or `TT_METAL_DEVICE_PROFILER` metrics from the live vLLM server or serving
+adapter. The profiler/table requirement does not apply to vLLM serving stages. Use same-harness
+`run_vllm_server` JSON for before/after performance at concurrency 1 and each additional
+user-requested profile. Also keep sampling, qualitative, degenerate-output, async-split,
+stale-input, and no-host-fallback evidence. Use earlier full-model or reduced non-serving profiles
+for device-op context if available; if not, record that evidence gap instead of profiling the
+vLLM stage.
 
 Every optimization stage that can generate text must preserve prompt-correct qualitative behavior. From optimized-full-model onward, use `$qualitative-check` to rerun the shared qualitative prompt suite after selecting the optimized path. If text quality changes after an optimization, compare against a prompt-correct HF or previous-stage control before blaming the checkpoint.
 
@@ -103,6 +118,31 @@ Sometimes you will encounter a ttnn limitation or a bug. If, for example, you tr
 ## Prefill Latency And TTFT
 
 Use the existing decoder, multichip, and full-model optimization stages to improve prefill. Record before/after warmed prefill latency at the relevant logical prompt lengths, including a short prompt, a long prompt, and chunk boundaries/tails when used. Report physical chunk/bucket sizes and chunk counts beside the numbers. Keep first-use compilation/capture separate from warmed execution. At full-model and serving stages, also measure host TTFT with the same request workload; state the timing boundary and whether it includes input preparation, all chunks, final norm/LM head, sampling, and first-token readback. A faster matmul or chunk is only useful if the complete prefill/TTFT target improves without an unexplained decode regression.
+
+Before closing an optimized full-model or serving stage, decompose TTFT into request/scheduler
+delay, host input preparation and dispatch, device prefill, terminal norm/LM head, first-token
+sampling, synchronization, and caller-visible readback. Compare complete host TTFT with the sum of
+measured device intervals. If device work does not explain the observed TTFT, fix orchestration,
+dispatch, synchronization, or readback overhead before retuning kernels.
+
+For stable physical execution signatures, evaluate bounded generator-owned traces for prefill and
+first-token sampling, including the short-input single-user path. Prepare persistent inputs before
+capture, key traces by the physical program and resource bindings rather than request identity,
+and prove reuse across supported logical lengths. Retain a correct bounded fallback for signatures
+that are not prepared. Compare latency-priority and overlapped scheduling when both are valid;
+async execution is not automatically the best single-user TTFT choice. Keep the mode that wins the
+requested workload and report any decode-throughput tradeoff.
+
+## Serving Throughput Per User
+
+For concurrency 1 and each additional user-requested profile, compare observed TPOT-derived
+tokens/s/user (TSU) with the device-step time for the same completed requests. If device time predicts
+materially better throughput than the client observes, fix scheduler gaps, blocking replay,
+readback, trace selection/recapture, page-table refresh, or repeated per-request host work before
+retuning device math. At higher requested concurrency, inspect whether identical work is repeated
+across logical rows and evaluate safe shared batching or coalescing where model state permits it.
+Verify per-request cache, positions, sampling state, output identity, and fairness before keeping
+shared work.
 
 Use reduced non-serving profiles as described above to identify whether time goes into projections, attention/cache operations, layout conversions, collectives, or dispatch between chunks. In serving stages use the existing benchmark JSON, without adding profiler collection. For slow prefill matmuls:
 
@@ -192,7 +232,7 @@ Final optimized evidence checklist - these items MUST be completed:
 - Warmed prefill and decode latency before/after optimization.
 - `tt-perf-report` output with advice enabled and the main performance conclusions, collected from representative decoder/module tests or a reduced full-model profiling variant, not a full all-layer model trace. This requirement does not apply to vLLM serving stages.
 - Watcher still clean. Watcher should be run by setting `TT_METAL_WATCHER=10`, don't skip asserts or anything. Keep watcher runs separate from device-profiler runs. If watcher/profiler collection produces remote Ethernet, ARC, or ERISC errors and `tt-smi` starts hanging, do not retry more profiler collection; preserve compact evidence, run T3K reset recovery, and resume the same stage if the node returns healthy.
-- For vLLM decode-serving optimization: same-harness primary single-user and CI serving-burst vLLM before/after metrics, and proof the measured path used on-device sampling without host greedy argmax or full-logits readback.
+- For vLLM decode-serving optimization: same-harness before/after metrics for single-user and each additional requested profile, and proof the measured path used on-device sampling without host greedy argmax or full-logits readback.
 - For vLLM decode-serving optimization: no Tracy, `tt-perf-report`, live-server device profiler, or serving-adapter profiler collection was attempted; if profiler evidence is absent, record that this is intentional.
 - For optimized-full-model and vLLM-serving optimization: `$qualitative-check` evidence for the shared qualitative prompt suite after the selected optimization, with HF or previous-stage controls.
 - Optimization checklist:
@@ -221,8 +261,8 @@ Final optimized evidence checklist - these items MUST be completed:
 -[ ] For models with an LM head and sampling: final norm, LM head, logits movement, sampling, and token feedback are included in the optimized token-out path; terminal costs are profiled separately in full-model or reduced non-serving evidence, not in vLLM serving stages; LM-head weights are padded when needed for legal/fast DRAM-sharded or vocab-sharded matmuls; padded vocab IDs are masked in local logits shards before force-argmax or TopK; split-sampling TopK input widths are padded to avoid the slow single-core TopK fallback where possible; avoidable `ArgMaxDeviceOperation`, full-vocab all-gather, generic `TopKDeviceOperation`, host argmax, and full-logits readback have been removed. If a TTNN/runtime limitation blocks removal, the stage remains incomplete until there is a minimal repro or a lower-level fix.
 -[ ] LM Head is optimized for DRAM-sharded matmuls if present.
 -[ ] Reduced precision/fidelity experiments appropriate to this module-level optimization stage have been carried out and documented using real weights and input activations. For complete full-model top-k tuning, final datatype frontier selection is deferred to `$datatype-sweep`.
--[ ] Performance accounting reconciled: roofline estimate, device-time decode, and end-to-end decode reported from the same run; avoidable gaps optimized away, and any remaining gap named as a ttnn/runtime/API limitation only after a targeted fix attempt; `perf_summary.json` written when optimizing a complete model or serving path. For vLLM serving stages, use same-harness primary single-user and CI serving-burst serving metrics and set device-time/profile fields to `null` with the no-profiler reason.
--[ ] Batch capability preserved: batch-1 is the primary optimized latency target, and larger-batch or concurrent-serving correctness was tested up to 32 where hardware and memory allow it.
+-[ ] Performance accounting reconciled: roofline estimate, device-time decode, and end-to-end decode reported from the same run; avoidable gaps optimized away, and any remaining gap named as a ttnn/runtime/API limitation only after a targeted fix attempt; `perf_summary.json` written when optimizing a complete model or serving path. For vLLM serving stages, use same-harness metrics for the requested profiles and set device-time/profile fields to `null` with the no-profiler reason.
+-[ ] Batch capability preserved: batch-1 is the primary optimized latency target, and every larger batch or concurrency value requested by the user has correctness evidence.
 
 If this checklist is not completed, go back and perform those optimization steps. For decoder/module-level work the main focus is on-device performance. For complete model and serving work, host orchestration, synchronizations, readbacks, and input-refresh overhead are also in scope and must be driven out of the measured path where the runtime contract allows it.
 
@@ -254,7 +294,7 @@ Use this reference while optimizing functional TTNN code. It captures repo-local
 - Explicitly configure `memory_config`, `program_config`, and `compute_kernel_config` for important ops. Defaults are often correct but suboptimal.
 - Choose shard specs and core grids that divide tensor dimensions cleanly into tiles. Padding in sharded paths is a common source of bugs or wasted work.
 - For DRAM-sharded decode matmul, weights should be width-sharded in DRAM and activations/outputs width-sharded in L1 on the matching core grid.
-- Keep the primary optimization target single-user batch-1 prefill/decode. This is not permission to remove larger-batch support; preserve correct batch handling and verify up to batch/concurrency 32 for complete model and serving paths when hardware and memory allow it. For MoE decoders on non-Galaxy systems, preserve gate-selected active-expert execution and prefer the GPT-OSS `ttnn.sparse_matmul` path for sparse expert projections plus score weighting and expert reduction. Dense all-expert execution is a debug baseline, not the optimized target.
+- Keep the primary optimization target single-user batch-1 prefill/decode. This is not permission to remove larger-batch support; preserve correct batch handling and verify the additional batch or concurrency values requested by the user. For MoE decoders on non-Galaxy systems, preserve gate-selected active-expert execution and prefer the GPT-OSS `ttnn.sparse_matmul` path for sparse expert projections plus score weighting and expert reduction. Dense all-expert execution is a debug baseline, not the optimized target.
 
 ## Optimization Advice
 
@@ -419,7 +459,7 @@ Use the production precision pairing when ranking candidates. For LLM decode thi
 
 Measure in two layers. First, run an isolated, alternating-order one/two/three-reader microbenchmark with the exact model tensor and shard geometry; record device time, physical and logical GB/s, percent of the target SKU's declared DRAM peak, output PCC or exact agreement, and repeated-run stability. If a candidate is unexpectedly flat or slow, record per-bank tiles, per-reader physical row bytes, NOC burst splitting, input multicast cores, and math-versus-reader time before classifying the cause. Second, integrate the winner and rerun traced layer and full-model timing plus the focused model/SKU CI. An isolated matmul win is not accepted if surrounding layout, multicast, or end-to-end time regresses.
 
-Llama 3.1 8B on P150 is a reference integration, not a universal selector: explicit two-reader settings for its decode QKV, attention output, gate/up, and down projections improved the batch-32 full-model result from 32.75 to 42.08 t/s/u with flat TTFT. Adjacent Llama and Qwen projection shapes also produced flat and regressing cases in broad sweeps. Therefore always keep the one-reader control and choose the reader count from same-shape evidence.
+Llama 3.1 8B on P150 is a reference integration, not a universal selector: explicit two-reader settings improved a higher-batch full-model result with flat TTFT, while adjacent Llama and Qwen projection shapes produced flat and regressing cases. Therefore always keep the one-reader control and choose the reader count from same-shape evidence.
 
 ## Matmul Choices
 

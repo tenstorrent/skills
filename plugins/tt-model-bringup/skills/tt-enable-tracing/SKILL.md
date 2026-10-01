@@ -113,6 +113,13 @@ Explicit model unload/reconfiguration, server teardown, or device recovery ends 
 
 Exact prompt lengths, chunk start positions, batch composition, and row order can change without changing the captured program. A changed request key must not trigger invalidation. Chunked prefill needs explicit coverage: first chunks, continuation chunks with different start positions, and partial final chunks. Include new combinations and orderings of known lengths while other requests decode. None may retire prefill, decode, or sampling traces. This applies even when prefill runs eagerly. Run the [mixed-shape serving check](../vllm-integration/SKILL.md#mixed-shape-trace-reuse-check) to test these transitions on the same server. Retain the allocation safety checks; removing retirement alone is not a safe fix.
 
+For short-input concurrency-1 TTFT, measure eager and traced prefill plus first-token
+sampling as complete paths. When stable physical signatures exist and host dispatch
+or synchronization is material, use the same preparation and lifetime rules to
+evaluate bounded generator-owned traces for those paths. Separate first-use capture
+from warmed TTFT, reuse traces across compatible logical lengths, and do not create
+an unbounded cache keyed by request identity or exact logical length.
+
 ## Generator Pattern
 
 Do not trace the high-level generator method unless it is already proven trace-safe. Split the generator into:

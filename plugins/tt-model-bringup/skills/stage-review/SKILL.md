@@ -281,6 +281,14 @@ For optimization stages, also inspect:
   without a precision-locked smaller-core or residual-grid candidate, return
   `more-work-needed`;
 - whether performance claims compare like with like.
+- for optimized full-model, serving, benchmark, and eval stages, whether concurrency
+  1 and only the additional user-requested profiles were treated as targets;
+- whether TTFT and tokens/s/user (TSU) were reconciled with device prefill and decode
+  time, and any material unexplained gap was investigated as host, scheduler,
+  synchronization, transport, trace, or eval-framework overhead;
+- for requested higher-ISL, higher-OSL, or higher-concurrency runs, whether the
+  stage checked for missed speedups instead of accepting successful completion as
+  sufficient performance evidence.
 
 For datatype-sweep stages, also inspect:
 

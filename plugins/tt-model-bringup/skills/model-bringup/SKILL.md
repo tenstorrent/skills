@@ -39,7 +39,9 @@ or replace acceptance criteria with a review plugin's criteria.
    child. `PYTHONPATH` exposes the packaged `readiness_check` module; it does not copy files into
    tt-metal. Shell commands using package resources must quote the expanded absolute paths.
 4. Confirm the HF model/revision, target checkout, acceptance contract and already-authorized
-   hardware. Resolve model directory as `models/autoports/<lowercase HF ID with non-alphanumeric
+   hardware. Record the requested workload shapes and concurrency values. Always include
+   single-user concurrency 1; optimize and report other concurrency values only when the user
+   requests them. Resolve model directory as `models/autoports/<lowercase HF ID with non-alphanumeric
    characters replaced by underscores>`. Do not acquire hardware just because a plugin was installed.
 5. Keep the checkout, `CODEX_HOME`, runner logs and artifacts on persistent storage. Runtime model
    changes belong in the target checkout; workflow fixes belong in this plugin. Record exact

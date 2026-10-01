@@ -38,7 +38,11 @@ Load `models/autoports/<model>/doc/context_contract.json` and serve the recorded
 
 Serving requests may have any valid prompt length up to that supported context. The adapter must not require prompt length to be divisible by an internal prefill chunk, tile, block, page, or trace size. If the model path pads or chunks internally, the adapter passes the logical prompt length through to masks, positions, cache fill, and output slicing. Include a direct OpenAI-compatible request or targeted runner check with a valid non-aligned prompt length, not only the default 128-token benchmark.
 
-Preserve larger-batch serving capability. The headline performance target is still batch-1 single-user latency, but the adapter must not assume `max_num_seqs=1` or batch size 1 in cache allocation, page tables, scheduler inputs, sampling, async decode, or output formatting. Test serving up to 32 concurrent sequences when the target hardware, memory, and harness allow it. If 32 cannot run, record the largest tested value and the hard physical limit.
+Preserve larger-batch serving capability. The headline performance target is still batch-1
+single-user latency, but the adapter must not assume `max_num_seqs=1` or batch size 1 in cache
+allocation, page tables, scheduler inputs, sampling, async decode, or output formatting. Test only
+the additional concurrency values in the recorded user workload. Record any requested value that
+cannot run and the hard physical limit.
 
 ## Serving dependency
 
@@ -170,7 +174,11 @@ python -m readiness_check.run_vllm_server \
   --tt-config '{"trace_region_size": <bytes>, "fabric_config": <fabric mode>}'
 ```
 
-The runner owns server launch, health polling, check execution, and shutdown. It writes `server.log`, `sampling_tests.log`, `vllm_qualitative_outputs.json`, primary single-user raw `vllm_result.json`, primary normalized `vllm_benchmark.json`, `vllm_benchmark.log`, and by default the secondary CI serving-burst files `vllm_ci_serving_result.json`, `vllm_ci_serving_benchmark.json`, and `vllm_ci_serving_benchmark.log` under `<model_dir>/readiness_vllm/`.
+The runner owns server launch, health polling, check execution, and shutdown. It writes
+`server.log`, `sampling_tests.log`, `vllm_qualitative_outputs.json`, primary single-user raw
+`vllm_result.json`, primary normalized `vllm_benchmark.json`, and `vllm_benchmark.log` under
+`<model_dir>/readiness_vllm/`. Explicitly requested secondary profiles use their configured output
+files.
 
 `--stages` accepts `serve`, `sampling`, `qualitative`, and `benchmark`. The default runs the full launch-check-shutdown flow. To hold a server open while iterating:
 
@@ -199,22 +207,42 @@ If shared tests require host-side sampling, expose it as an explicit compatibili
 
 Do not collect Tracy, `tt-perf-report`, or `TT_METAL_DEVICE_PROFILER` metrics from vLLM integration or optimized-vLLM serving runs. Do not set profiler env vars for the live server, do not run `python -m tracy` around `run_vllm_server`, do not run a serving-adapter profile just to produce a profiler table, and do not call `ttnn.ReadDeviceProfiler(mesh)` as part of vLLM-stage closure.
 
-The vLLM stages have repeatedly wedged T3K machines during profiler/device-health closure. The useful vLLM evidence is the serving-path evidence produced by `run_vllm_server`: sampling results, qualitative outputs, degenerate-output checks, server logs, primary single-user `vllm bench serve` JSON with TTFT, TPOT, ITL, aggregate output throughput, and the secondary CI serving-burst `vllm bench serve` JSON for vLLM-nightly parity and serving-capacity context. Use existing full-model or reduced non-serving profiles from earlier stages for device-op/root-cause context. If those profiles are missing, record that evidence gap; do not recreate them inside the vLLM stage.
+The vLLM stages have repeatedly wedged T3K machines during profiler/device-health closure. The
+useful vLLM evidence is the serving-path evidence produced by `run_vllm_server`: sampling results,
+qualitative outputs, degenerate-output checks, server logs, and requested `vllm bench serve` JSON
+with TTFT, TPOT, ITL and output throughput. Use existing full-model or reduced non-serving profiles
+from earlier stages for device-op/root-cause context. If those profiles are missing, record that
+evidence gap; do not recreate them inside the vLLM stage.
 
-For optimized-vLLM, optimize with same-harness primary single-user and secondary CI serving-burst before/after metrics plus contract checks: async split, nonblocking trace replay, stale input coverage, on-device sampling, no host greedy argmax, no full-logits readback, and no unnecessary page-table/token/current-position refresh. Do not require Tracy, `tt-perf-report`, or live-serving device-profiler artifacts for vLLM-stage completion.
+For optimized-vLLM, optimize with same-harness before/after metrics for concurrency 1 and each
+additional requested profile, plus contract checks: async split, nonblocking trace replay, stale
+input coverage, on-device sampling, no host greedy argmax, no full-logits readback, and no
+unnecessary page-table/token/current-position refresh. Do not require Tracy, `tt-perf-report`, or
+live-serving device-profiler artifacts for vLLM-stage completion.
 
 Check stages:
 
 - `sampling`: runs the canonical TT plugin pytest suite against the live server. `--sampling-profile full` runs the whole suite; `--sampling-profile smoke` runs a small integration sanity subset for slow bring-up loops.
 - `qualitative`: saves greedy and sampled completions for prompts from `${TT_MODEL_BRINGUP_ROOT}/runtime/readiness_check/vllm_prompts.txt`; use `$qualitative-check` to ensure the prompts are sent in the HF-declared model format, compare against controls, and judge coherence, topic, repetition, gibberish, and wrong-language drift.
 - `benchmark`: runs the primary single-user decode profile by default: 128-token input, 128-token output, one prompt, `--max-concurrency 1`, `ignore_eos`, percentile metrics `ttft,tpot,itl,e2el`, and a completed-prompt gate. Use `vllm_benchmark.json` for headline decode t/s/u and comparisons to full-model or older agentic/custom-benchmark reports. This is the primary optimization target.
-- `benchmark`: also runs the vLLM-nightly-shaped CI serving-burst profile by default: 100-token inputs, 100-token outputs, 32 prompts, no explicit `--max-concurrency`, `ignore_eos`, and the same metric set. Use `vllm_ci_serving_benchmark.json` for vLLM-nightly parity, serving-capacity context, and larger-batch/concurrency coverage. Do not use it as the headline decode t/s/u because burst admission and chunked prefill can affect TPOT. The readiness runner passes `--temperature 0.0` by default so both benchmark profiles are greedy. Use `--benchmark-use-server-generation-config` only when intentionally reproducing exact nightly/server-generation-config behavior, and label those numbers as sampled/default-generation-config rather than greedy single-user t/s/u.
+- `benchmark`: runs only the single-user profile by default. Add secondary profiles with the typed
+  benchmark flags only for user-requested workload shapes and concurrency values. Label each shape
+  separately; burst admission and chunked prefill can affect TPOT. The readiness runner passes
+  `--temperature 0.0` by default. Use `--benchmark-use-server-generation-config` only when
+  intentionally reproducing server-generation-config behavior, and label those numbers as
+  sampled/default-generation-config rather than greedy t/s/u.
 
-When optimizing decode serving overhead, benchmark with the exact same runner, prompt/output lengths, `max_num_seqs`, model length, mesh, TT config, and sampling mode as the primary or previous comparison. Report raw vLLM `median_ttft_ms`/`p99_ttft_ms`, `mean_tpot_ms`/`p99_tpot_ms`, `median_itl_ms`/`p99_itl_ms`, `output_throughput`, and TPOT-derived decode t/s/u (`1000 / mean_tpot_ms`) before/after. Compare primary single-user 128/128/1 against primary single-user 128/128/1, and compare CI serving-burst 100/100/32 against CI serving-burst 100/100/32; do not treat those two workload shapes as direct perf verdicts against each other.
+When optimizing decode serving overhead, benchmark with the exact same runner, input/output
+lengths, concurrency, `max_num_seqs`, model length, mesh, TT config, and sampling mode as the
+comparison. Report raw vLLM `median_ttft_ms`/`p99_ttft_ms`, `mean_tpot_ms`/`p99_tpot_ms`,
+`median_itl_ms`/`p99_itl_ms`, `output_throughput`, and TPOT-derived decode t/s/u
+(`1000 / mean_tpot_ms`) before/after. Compare only identical workload shapes.
 
 Keep teacher-forcing and serving performance separate. A readiness/PERF teacher-forcing number is useful as a decoder/generator lower bound; vLLM throughput includes serving orchestration, sampling, token feedback, request handling, and readback. If serving is much slower than teacher forcing, remove avoidable serving-specific overhead before retuning the decoder stack: fallback sampling, stale-input refreshes, per-token page-table copies, blocking trace replay, synchronizations, readbacks, and adapter-side reconstruction.
 
-`--max-num-seqs` is passed to both server launch and sampling pytest (`--tt-max-num-seqs`). Do not leave it at 1 except for the primary single-user benchmark or a focused debugging run. Final serving evidence should include a larger value, normally up to 32, unless hardware or memory capacity prevents it.
+`--max-num-seqs` is passed to both server launch and sampling pytest (`--tt-max-num-seqs`). Use 1
+for the primary single-user path and the exact user-requested values for additional profiles. Do
+not add a larger capacity target merely because the hardware can support it.
 
 For final vLLM-integration evidence, use `--sampling-profile full`. The normal debugging order is smoke first, then full: use `--sampling-profile smoke` for faster inner-loop iteration, rerun only failing pytest node ids or targeted requests while fixing failures, and run `--sampling-profile full` after the smoke and targeted checks pass. For MoE bring-up loops where the full profile is impractical, record the final status as `smoke-gated`; do not present it as equivalent to the full sampling gate unless the project owner explicitly accepts that coverage.
 
@@ -258,7 +286,7 @@ Done means all of these are true and recorded:
 - Exact successful `run_vllm_server` invocation.
 - Served max context, matching `doc/context_contract.json`, with any hard-physical-limit reduction evidence.
 - Non-aligned prompt-length evidence through serving: a valid request length that is not divisible by internal chunk/page/block alignment succeeds without capping or truncating the advertised context.
-- Served batch/concurrency coverage, including the largest tested `max_num_seqs` up to 32 and any hard-physical-limit reduction evidence.
+- Served concurrency coverage at 1 and every additional user-requested `max_num_seqs`, including any hard-physical-limit evidence.
 - Capability flags with evidence: no unproven `supports_async_decode=True`, no prefix-caching claim without tests, and on-device sampling verified for the measured mode.
 - Evidence that serving uses the full-model split-sampling contract: internal sampling trace, `tt_out_tok` feedback into the persistent decode token input, greedy benchmarks using the fastest correct on-device sampling strategy measured for this mesh, and stale-token/current-position smoke coverage.
 - Logit-determinism evidence through vLLM, with run-to-run and cross-batch-position reproducibility checks and standalone baseline comparison.
@@ -266,7 +294,7 @@ Done means all of these are true and recorded:
 - `$qualitative-check` artifacts: qualitative greedy and sampled serving-output verdict, prompt-format metadata, rendered prompts or token ids, and matching HF/full-model controls.
 - Primary single-user benchmark workload config, temperature/generation-config mode, and whether it used default 128/128/1 shape or explicit overrides.
 - Primary serving-path TTFT median/P99, TPOT mean/P99, ITL median/P99, aggregate output throughput, and TPOT-derived decode t/s/u from `vllm_benchmark.json`.
-- Secondary CI serving-burst benchmark workload config and metrics from `vllm_ci_serving_benchmark.json` when comparing to vLLM nightly or serving-capacity evidence.
+- Workload configuration and metrics for each additional user-requested serving profile.
 - Watcher or device-reset notes if relevant to serving stability.
 
 ## Preferred Outputs
@@ -279,7 +307,10 @@ models/autoports/<model>/doc/vllm_integration/work_log.md
 models/autoports/<model>/doc/vllm_integration/README.md
 ```
 
-The README should lead with vLLM sampling status, qualitative verdict, primary single-user 128/128/1 TTFT median, TPOT mean, ITL median, aggregate output throughput, and TPOT-derived decode t/s/u. Put CI serving-burst 100/100/32 metrics in a secondary section for vLLM-nightly parity and serving-capacity context. Include the workload config next to every number.
+The README should lead with vLLM sampling status, qualitative verdict, and the requested
+single-user workload's TTFT median, TPOT mean, ITL median, aggregate output throughput, and
+TPOT-derived decode t/s/u. Put additional user-requested profiles in a secondary section. Include
+the workload configuration next to every number.
 
 ## Useful References
 

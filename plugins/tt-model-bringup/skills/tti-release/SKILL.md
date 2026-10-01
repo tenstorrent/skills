@@ -179,7 +179,7 @@ python -m readiness_check.run_vllm_server \
   --model-dir "$MODEL_DIR" \
   --hf-model "$HF_MODEL_OR_LOCAL_WEIGHTS" \
   --mesh-device T3K \
-  --max-num-seqs 32 \
+  --max-num-seqs <requested-concurrency> \
   --max-model-len "$MAX_MODEL_LEN" \
   --tt-config '{"sample_on_device_mode": "all"}' \
   --additional-server-args "--served-model-name $HF_MODEL"
@@ -258,6 +258,16 @@ Before launching it, estimate the unrestricted model-specific eval runtime from
 the measured optimized-vLLM serving throughput, the selected eval tasks, their
 sample counts, and their generation limits. Record the estimate in
 `RUN_NOTES.md`.
+
+Validate that estimate with a small representative sample spanning the material
+ISL/OSL values and requested concurrency. Compare observed TTFT and token cadence
+with device prefill and decode time. If device time does not explain a slow run,
+measure queueing, scheduling, trace setup, synchronization, client transport,
+serialization, retries, and eval-framework overhead; fix the dominant avoidable
+cost before launching the full eval. Keep cold-start and warmed timing separate.
+For longer or higher-concurrency cases, successful completion alone is not enough:
+check whether the workload exposes a missed speedup without changing eval inputs,
+outputs, or scoring.
 
 If the unrestricted eval suite would take a prohibitively long time for the
 experiment or available reservation window, it is acceptable to use TTI's CI
