@@ -66,6 +66,8 @@ The stable part (role, charter, memory) is the system prompt, which providers ca
 
 ## Adding a provider
 
+What each supported CLI offers, with doc links: [providers.md](providers.md).
+
 1. `runtime/ttp/providers/<name>.py`: subclass `Provider`; `build`, `parse`, `account`,
    `login_hint`, optionally `meter` (only if it costs no model tokens), `cost_so_far` (if it
    streams usage but cannot enforce a budget itself), `writable_args` (if workers run in a write
