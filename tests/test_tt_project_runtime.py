@@ -7188,12 +7188,22 @@ def test_after_a_host_sleep_nothing_new_starts_until_it_has_been_awake_a_while(e
     d.tick()
     assert set(starts) == {"dispatch", "turn"}, starts
     assert p.db.task(tid)["status"] == "queued"
-    # A tick gap longer than any tick step counts as well, though the monotonic clock moved with it.
+    # A slow tick is not a sleep: the monotonic clock moved with the wall clock, so nothing is held
+    # and no run it overlapped becomes free.
     starts.clear()
+    sleeps = len(p.db.kv("host_sleeps"))
     d._tick_wall -= 400
     mono[0] += 400
     d.tick()
-    assert not starts
+    assert set(starts) == {"dispatch", "turn"}, starts
+    assert len(p.db.kv("host_sleeps")) == sleeps
+    # A person who writes while the host settles is answered now; only new work waits.
+    d._tick_wall -= 3600
+    starts.clear()
+    p.db.x("INSERT INTO messages(direction, chat, text, ts, handled) VALUES('in', 'c', 'status?', ?, 0)",
+           (time.time(),))
+    d.tick()
+    assert starts == ["turn"], starts
 
 
 def test_a_lost_run_that_overlapped_a_sleep_the_daemon_saw_is_not_waste(env, monkeypatch):

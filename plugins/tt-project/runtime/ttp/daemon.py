@@ -59,7 +59,6 @@ DISK_RESUME = 1.2        # the guard ends once free space is this many times its
 DISK_FLOOR_GB = 2        # below this even questions and plans wait
 KEEP_RECHECK_S = 6 * 3600   # a finished task's kept worktree is looked at again this often
 SLEPT_MIN_S = 60        # a run whose wall clock ran this much ahead of its monotonic clock overlapped a host sleep
-SLEEP_GAP_S = HEARTBEAT_STALE_S   # a gap between ticks longer than any tick step: the host was not running us
 SLEEPS_KEPT_S = 7 * 86400
 
 
@@ -234,7 +233,8 @@ class Daemon:
         self.check_resource_trouble()
         self.retry_rejected()
         settling = self.settling()
-        if not settling:
+        # A person who wrote while the host settles gets an answer now: only new work waits.
+        if not settling or self.p.db.one("SELECT id FROM messages WHERE direction='in' AND handled=0"):
             self.maybe_coordinate()
         self.probe_waiting()
         if not settling:
@@ -242,15 +242,16 @@ class Daemon:
         self.deliver_outbound()
 
     def _check_sleep(self) -> None:
-        """Notice that the host slept: a gap between ticks, or the wall clock jumping ahead of the
-        monotonic one (which stands still while the host sleeps). Each sleep is kept for a week, so a
-        run reaped as lost can tell it overlapped one, and starts the settle hold."""
+        """Notice that the host slept: the wall clock jumped ahead of the monotonic one, which stands
+        still while the host sleeps. A long gap between ticks alone is not a sleep (a slow tick or a
+        stopped daemon), and must not make the runs it overlapped free. Each sleep is kept for a week,
+        so a run reaped as lost can tell it overlapped one, and starts the settle hold."""
         wall, mono = time.time(), time.monotonic()
         gap = wall - self._tick_wall
         jump = gap - (mono - self._tick_mono)
         since = self._tick_wall
         self._tick_wall, self._tick_mono = wall, mono
-        if jump < SLEPT_MIN_S and gap < SLEEP_GAP_S:
+        if jump < SLEPT_MIN_S:
             return
         settle = float(self.cfg["budget"].get("wake_settle_s", 300))
         self._settle_until = mono + settle
@@ -258,7 +259,7 @@ class Daemon:
         sleeps = [s for s in db.kv("host_sleeps", []) or [] if s[1] >= wall - SLEEPS_KEPT_S]
         db.set_kv("host_sleeps", (sleeps + [[since, wall]])[-100:])
         db.set_kv("settle_until", wall + settle)   # for status: when new work starts, if it stays awake
-        log(self.p, f"host slept or stalled for {max(jump, 0):.0f} s (tick gap {gap:.0f} s); "
+        log(self.p, f"host slept for {jump:.0f} s (tick gap {gap:.0f} s); "
                     f"nothing new starts for {settle:.0f} s of awake time")
 
     def settling(self) -> bool:

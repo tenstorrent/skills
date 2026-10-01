@@ -54,7 +54,7 @@ and preferences you add later become part of the project's charter and memory.
   The wall clock and stall guard count only time the host is awake. A run a host sleep cut short
   is retried without spending an attempt and is not counted as waste. After a wake, nothing new
   starts until the host has been awake for `budget.wake_settle_s` (default 300 s), so a laptop's
-  brief maintenance wakes start nothing.
+  brief maintenance wakes start nothing. Messages from people are still answered at once.
   When the coordinator rescopes a running task, the change reaches the worker mid-run.
 - **Memory and charter**: plain files in the project's harness, one fact per file.
 - **Watchers**: pull requests (CI, reviews, mergeability) and logs, reporting only changes.
