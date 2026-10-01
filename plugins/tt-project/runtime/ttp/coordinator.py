@@ -485,9 +485,24 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if section.startswith("Restriction"):
                     _tell_running_workers(db, f"New binding restriction: {text}", key)
             elif t == "schedule_set":
-                sched.upsert(db, a["name"], a.get("kind") or "llm", a.get("every") or "1d", a.get("at"),
-                             bool(a.get("enabled", True)), a.get("budget_usd"), a.get("text") or "",
-                             {"spec": a.get("spec") or "", "tier": a.get("tier") or "standard"})
+                old = db.one("SELECT kind, payload FROM schedules WHERE name=?", (a.get("name"),))
+                kind = a.get("kind") or (old["kind"] if old else "llm")
+                kept = json.loads(old["payload"] or "{}") if old and old["kind"] == kind else {}
+                if kind == "command":
+                    # The daemon runs payload.command; a schedule without one would report "no command" forever.
+                    payload = {**kept, **{k: a[k] for k in ("command", "timeout_s") if a.get(k)}}
+                    if not str(payload.get("command") or "").strip():
+                        raise ValueError(f"schedule_set {a.get('name')!r} rejected: kind command needs `command`, "
+                                         f"the shell command to run (and optionally `timeout_s`)")
+                elif kind == "llm":
+                    payload = {**kept, "spec": a.get("spec") or kept.get("spec") or "",
+                               "tier": a.get("tier") or kept.get("tier") or "standard"}
+                elif kind == "watcher" and old:
+                    payload = kept   # a built-in probe: only its timing and switch change
+                else:
+                    raise ValueError(f"schedule_set {a.get('name')!r} rejected: `kind` must be llm or command")
+                sched.upsert(db, a["name"], kind, a.get("every") or "1d", a.get("at"),
+                             bool(a.get("enabled", True)), a.get("budget_usd"), a.get("text") or "", payload)
             elif t == "config_set":
                 key = a.get("key", "")
                 if key not in USER_SETTABLE:

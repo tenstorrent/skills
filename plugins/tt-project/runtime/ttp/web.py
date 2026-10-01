@@ -308,6 +308,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         "why_idle": "; ".join(why) if not running else "", "held": held,
         "host": host_line(db.boots(now - DAY)),
         "release": release.line(p, db, cfg),
+        "schedules_broken": sched.broken_line(db),
     }
 
 

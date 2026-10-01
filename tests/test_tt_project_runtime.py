@@ -2461,6 +2461,65 @@ def test_the_daily_review_skips_a_day_with_no_activity(env):
     assert p.db.one("SELECT last_status FROM schedules WHERE name='daily-review'")["last_status"] == "queued"
     assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='schedule'")["n"] == 2
 
+def test_schedule_set_command_makes_a_runnable_schedule(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    assert coord.apply(p, [{"type": "schedule_set", "name": "probe", "kind": "command", "every": "30m",
+                            "command": "echo checked", "timeout_s": 30, "text": "a probe"}]) == []
+    s = p.db.one("SELECT * FROM schedules WHERE name='probe'")
+    assert s["kind"] == "command" and json.loads(s["payload"]) == {"command": "echo checked", "timeout_s": 30}
+    # Re-enabling it later keeps the command it has.
+    assert coord.apply(p, [{"type": "schedule_set", "name": "probe", "every": "1h"}]) == []
+    assert json.loads(p.db.one("SELECT payload FROM schedules WHERE name='probe'")["payload"])["command"] == "echo checked"
+    p.db.x("UPDATE schedules SET next_run=? WHERE name='probe'", (time.time() - 1,))
+    d = Daemon(p.base)
+    d.gates = {}
+    d.run_schedules()
+    assert p.db.one("SELECT last_status FROM schedules WHERE name='probe'")["last_status"].startswith("ok")
+
+
+def test_schedule_set_command_without_a_command_is_rejected(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    out = coord.apply(p, [{"type": "schedule_set", "name": "probe", "kind": "command", "every": "30m",
+                           "spec": "python3 check.py"}])
+    assert len(out) == 1 and "needs `command`" in out[0], out
+    assert not p.db.one("SELECT name FROM schedules WHERE name='probe'")
+
+
+def test_a_schedule_failing_twice_raises_one_alert_that_clears_on_an_ok_run(env):
+    p = make(env)
+    from ttp import alerts
+    from ttp import schedule as sched
+    from ttp.cli import status_text
+    from ttp.daemon import Daemon
+    sched.upsert(p.db, "probe", "command", "30m", payload={})
+    d = Daemon(p.base)
+    d.gates = {}
+
+    def tick():
+        p.db.x("UPDATE schedules SET next_run=? WHERE name='probe'", (time.time() - 1,))
+        d.run_schedules()
+        d.sweep_alerts()
+
+    def live():
+        return [m for m in alerts.needs_you(p.db, time.time()) if "probe" in m["text"]]
+
+    tick()
+    assert not live()   # one failure may be a fluke
+    assert "schedules failing: probe (no command)" in status_text(p)
+    tick()
+    tick()
+    assert len(live()) == 1
+    assert p.db.one("SELECT COUNT(*) n FROM messages WHERE ref='schedule:probe' AND kind='alert'")["n"] == 1
+    p.db.x("UPDATE schedules SET payload=? WHERE name='probe'", (json.dumps({"command": "true"}),))
+    tick()
+    assert not live()
+    assert p.db.one("SELECT cleared FROM alerts WHERE key='schedule:probe'")["cleared"]
+    assert "schedules failing" not in status_text(p)
+
+
 def load_result_summary(task) -> str:
     return json.loads(task["result"] or "{}").get("summary", "")
 

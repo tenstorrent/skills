@@ -22,7 +22,7 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
 | `memory_add` | `text`, `memory_kind` (preference/fact/resource/restriction/decision) , optional `supersedes` (entry names it replaces) | durable facts from the user |
 | `memory_forget` | `name` (an entry's name in [brackets] under MEMORY) | retire a stale or done entry to memory/archive/ |
 | `charter_update` | `section` (Goals/Restrictions/Policies/Resources), `text` | the user changed goals or rules |
-| `schedule_set` | `name`, `kind` (llm/command), `every`, `at`, `enabled`, `budget_usd`, `spec`/`text` | recurring work the user asked for |
+| `schedule_set` | `name`, `kind` (llm/command), `every`, `at`, `enabled`, `budget_usd`, `text`; llm: `spec`, `tier`; command: `command` (shell, run from the project root, stdout lines become observations), `timeout_s` | recurring work the user asked for. A command schedule needs no model; one without `command` is rejected |
 | `config_set` | `key`, `value` | only when the user explicitly asks (caps, notifications, provider); `delivery.base_ref` (where code tasks branch from), `delivery.push_branch` and `delivery.push_checks` (where `ttp push` publishes and what must pass first) you may set yourself |
 | `resource_pause` | `resource`, `paused` (true/false), `reason` | stop all use of a shared resource (the user asked, or it is unsafe to use); `paused: false` lifts it. A pause the user set is lifted only on their word |
 | `noop` | — | nothing to do |

@@ -1130,7 +1130,18 @@ class Daemon:
             except Exception as e:
                 status = f"error: {type(e).__name__}: {e}"[:200]
             sched.mark_ran(db, s, status)
+            if sched.failing(status) and sched.failing(s["last_status"]):
+                self._schedule_broken(s, status)
             self._progress()
+
+    def _schedule_broken(self, s: dict, status: str) -> None:
+        """Two failed runs in a row raise one alert; it clears itself on the next run that does not fail."""
+        key = f"schedule:{s['name']}"
+        if self.p.db.one("SELECT id FROM alerts WHERE key=? AND cleared IS NULL", (key,)):
+            return
+        why = ("it has no command to run; the coordinator sets one with schedule_set `command`"
+               if status == "no command" else status)
+        self.alert(key, f"Schedule {s['name']} failed twice in a row and does nothing until fixed: {why}", "high")
 
     def _run_command_watcher(self, s: dict, payload: dict) -> str:
         cmd = payload.get("command")

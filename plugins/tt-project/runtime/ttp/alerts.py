@@ -14,6 +14,7 @@ from __future__ import annotations
 import time
 
 from .db import DB, SEVERITY_RANK
+from .schedule import failing
 
 DAY = 86400.0
 FEED_DAYS = 7
@@ -24,6 +25,7 @@ CLEARED_TEXT = {
     "coordinator": "The coordinator is working again: a turn succeeded.",
     "disk": "Disk space is back above the guard; held tasks start again.",
     "run-start": "Runs start again.",
+    "schedule": "Schedule {arg} runs again.",
 }
 
 
@@ -63,6 +65,10 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
         return bool(db.kv("disk_low"))
     if key == "coordinator":
         return int(db.kv("coordinator_failures", 0)) > 0
+    if kind == "schedule":
+        # The next run that does not fail ends it, as does disabling or removing the schedule.
+        row = db.one("SELECT last_status FROM schedules WHERE name=? AND enabled=1", (arg,))
+        return bool(row) and failing(row["last_status"])
     if key == "run-start":
         return not db.one("SELECT id FROM runs WHERE role!='coordinator' AND started>? LIMIT 1", (since,))
     return now - since < DAY
@@ -82,7 +88,7 @@ def active(db: DB, key: str, ts: float, now: float) -> bool:
 
 
 def _checkable(key: str) -> bool:
-    return key.partition(":")[0] in ("auth", "limit", "budget", "disk", "coordinator", "run-start")
+    return key.partition(":")[0] in ("auth", "limit", "budget", "disk", "coordinator", "run-start", "schedule")
 
 
 def _since(ep: dict) -> float:

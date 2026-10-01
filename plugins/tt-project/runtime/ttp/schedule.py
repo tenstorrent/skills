@@ -65,6 +65,23 @@ def mark_ran(db: DB, sched: dict, status: str, now: float | None = None) -> None
          (now, status, next_run(sched["every_s"], sched["at"], now), sched["name"]))
 
 
+def failing(status: str | None) -> bool:
+    """A run that did nothing because the schedule itself is broken, not because it chose to skip."""
+    return bool(status) and (status == "no command" or status.startswith("error"))
+
+
+def broken(db: DB) -> list[dict]:
+    """Enabled schedules whose last run failed, for `ttp status` and the web app."""
+    return [r for r in db.q("SELECT name, kind, last_run, last_status FROM schedules WHERE enabled=1 ORDER BY name")
+            if failing(r["last_status"])]
+
+
+def broken_line(db: DB) -> str:
+    """The broken schedules in one line, or ""."""
+    rows = broken(db)
+    return ("schedules failing: " + "; ".join(f"{r['name']} ({r['last_status'][:80]})" for r in rows)) if rows else ""
+
+
 def spent_today(db: DB, name: str) -> float:
     row = db.one("SELECT COALESCE(SUM(usd),0) s FROM ledger WHERE ts>=? AND source=?",
                  (time.time() - 86400, f"schedule:{name}"))

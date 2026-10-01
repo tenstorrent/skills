@@ -521,6 +521,8 @@ def status_text(p: Project) -> str:
     for t in db.q("SELECT id,title,status,blocked_reason FROM tasks WHERE status IN ('blocked','review') "
                   "ORDER BY status, id LIMIT 8"):
         lines.append(f"  #{t['id']} {t['status']}: {t['title']}" + (f" — {t['blocked_reason']}" if t["blocked_reason"] else ""))
+    if h.get("schedules_broken"):
+        lines.append(h["schedules_broken"])
     if h.get("host"):
         lines.append(h["host"])
     if h.get("release"):
