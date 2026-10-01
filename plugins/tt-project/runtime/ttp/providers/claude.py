@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -39,7 +40,7 @@ class Claude(Provider):
     login_hint = "run `claude` there and use /login"
 
     def credential_files(self) -> list[str]:
-        return [str(Path(os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")) / ".credentials.json")]
+        return [str(claude_config_dir() / ".credentials.json")]
 
     def build(self, *, role, model, effort, cwd, budget_usd, read_only, schema, restrictions):
         argv = [self.binary() or "claude", "-p", "--output-format", "stream-json", "--verbose", "--no-chrome"]
@@ -131,6 +132,20 @@ class Claude(Provider):
         i = argv.index("--strict-mcp-config") if "--strict-mcp-config" in argv else len(argv)
         return argv[:i] + ["--mcp-config", str(path)] + argv[i:]
 
+    def resume_args(self, session_id: str) -> list[str]:
+        return ["--resume", session_id] if session_id and self.supports("--resume") else []
+
+    def session_saved(self, session_id: str, cwd: str) -> bool:
+        # Transcripts live per working directory, under the directory's path with every character
+        # but letters and digits as "-" (long paths are shortened, so look in the others too).
+        projects = claude_config_dir() / "projects"
+        name = f"{session_id}.jsonl"
+        if not session_id or "/" in session_id:
+            return False
+        if (projects / re.sub(r"[^a-zA-Z0-9]", "-", cwd) / name).is_file():
+            return True
+        return any(projects.glob(f"*/{name}"))
+
     def plugin_args(self, dirs: list[str]) -> list[str]:
         out: list[str] = []
         for d in dirs:
@@ -210,6 +225,11 @@ class Claude(Provider):
         org = acct.get("organizationName") or ""
         bill = acct.get("billingType") or data.get("billingType") or ""
         return " | ".join(x for x in (who, org if org and who not in org else "", bill) if x)
+
+
+def claude_config_dir() -> Path:
+    """Where Claude Code keeps credentials and session transcripts."""
+    return Path(os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude"))
 
 
 def claude_config_path() -> Path:

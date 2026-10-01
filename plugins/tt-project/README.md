@@ -55,6 +55,9 @@ and preferences you add later become part of the project's charter and memory.
   is retried without spending an attempt and is not counted as waste. After a wake, nothing new
   starts until the host has been awake for `budget.wake_settle_s` (default 300 s), so a laptop's
   brief maintenance wakes start nothing. Messages from people are still answered at once.
+  A run a reboot, a sleep or a lost supervisor cut short after real progress
+  (`budget.resume_lost`, default $0.50 or 10 min) continues its agent session in the same
+  working directory with a short prompt, instead of starting over.
   When the coordinator rescopes a running task, the change reaches the worker mid-run.
 - **Memory and charter**: plain files in the project's harness, one fact per file.
 - **Watchers**: pull requests (CI, reviews, mergeability) and logs, reporting only changes.
@@ -177,4 +180,5 @@ Design notes, invariants and how to add a provider: [docs/design.md](docs/design
   plan-window meter; without ask mode it has no read-only mode either.
 - Cursor has no reasoning-effort flag; tiers map to model names.
 - Context compaction per tier (`budget.compact_window_tokens`) works on Claude Code only.
+- Resuming a lost run's session works on Claude Code only; Codex and Cursor start fresh.
 - A laptop pauses while it sleeps. Use an always-on machine for round-the-clock work.

@@ -306,7 +306,7 @@ class Daemon:
     def start_run(self, role: str, prompt: str, provider: str, tier: str, cwd: str, *, task: dict | None = None,
                   budget_usd: float | None = None, timeout_s: float | None = None, read_only: bool = False,
                   schema: dict | None = None, system: str | None = None, append_system: str | None = None,
-                  note: dict | None = None) -> int:
+                  note: dict | None = None, resume: str | None = None) -> int:
         tiers = self.cfg["providers"].get(provider, {}).get("tiers", {})
         model = tiers.get(tier, {}).get("model", "")
         prices = (self.cfg.get("pricing") or {}).get(provider) or {}
@@ -338,6 +338,8 @@ class Daemon:
             if self.cfg["providers"].get(provider, {}).get("worker_isolation"):
                 extra += prov.isolation_args()
                 mcp_servers = self._approved_mcp(prov, provider, cwd)
+            # A continued session (see _resumable) gets the current system prompt again, below.
+            extra += prov.resume_args(resume) if resume else []
             # A trailing "-" (prompt on stdin) stays the last argument.
             argv = argv[:-1] + extra + ["-"] if argv[-1:] == ["-"] else argv + extra
         db = self.p.db
@@ -668,12 +670,16 @@ class Daemon:
         if usage.auth_failed:
             status = "auth"
         note = json.loads(r["note"] or "{}")
+        if usage.session_id:
+            note["session_id"] = usage.session_id   # a run the host takes away resumes it (_resumable)
         # The runaway guard counts runs that ended without an outcome; a reboot, a host sleep or a
         # hand-off that stands is an outcome, not a loop.
         if status == "lost" and r["boot_id"] and r["boot_id"] != self.boot:
             note.update(not_waste="reboot", lost_to_reboot=self.boot, boot_at=self.boot_at)
         elif status in bud.WASTED and handed_off:
             note["not_waste"] = "handoff"
+        elif status == "failed" and _resume_never_started(note, usage):
+            note["not_waste"] = "resume"   # nothing ran: the task starts fresh (_finish_worker)
         elif status in SLEEP_CUT and self._slept_during(r, exit_info):
             # A run that overlapped a host sleep did not time out or fail on its own: the host went
             # away under it. It is lost to the sleep, like a run lost to a reboot.
@@ -839,6 +845,15 @@ class Daemon:
         elif status == "shutdown":
             # The project was stopped, not the task: it resumes on the next start, on its own branch.
             db.update_task(task["id"], status="queued", blocked_reason="interrupted by `ttp stop --kill`; resumes")
+            return
+        if status == "failed" and _resume_never_started(json.loads(r["note"] or "{}"), usage) and not handoff:
+            # The lost run's session could not be continued after all: nothing ran, so the task starts
+            # fresh at once, no attempt spent. This run ended 'failed', so it is not resumed again.
+            with db.tx():
+                db.update_task(task["id"], status="queued", blocked_reason=None, not_before=None)
+                db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                     (time.time(), "daemon", "task_requeued", "low", f"#{task['id']} {task['title']}: its lost "
+                      f"session could not be resumed; starts fresh, no attempt spent", "handled", task["id"]))
             return
         if status == "resource_busy":
             # The run lost the race for its resource and never started its agent: not an attempt.
@@ -1347,19 +1362,29 @@ class Daemon:
             if task["kind"] == "review":
                 task = self._size_review(task)
             tier = bud.clamp_tier(task["tier"], gate)
+            # Before _workdir_for, which would make a missing worktree afresh.
+            lost = self._resumable(task, provider)
             try:
                 cwd, branch = self._workdir_for(task)
             except Exception as e:
                 db.update_task(task["id"], status="blocked", blocked_reason=f"workspace: {e}"[:400])
                 self._unreserve(task)
                 continue
-            from .prompts import worker_system, worker_task
+            from .prompts import spec_digest, worker_resume, worker_system, worker_task
             try:
-                system, prompt = worker_system(self.p), worker_task(self.p, task, cwd, branch)
+                system = worker_system(self.p)
+                note = {"spec_sha": spec_digest(task)}
+                if lost and lost["cwd"] == cwd:
+                    # The session holds the task and its own work: a short prompt continues it.
+                    prompt = worker_resume(self.p, task, lost)
+                    note["resumes"] = {"run": lost["run"], "session": lost["session"]}
+                else:
+                    prompt, lost = worker_task(self.p, task, cwd, branch), None
                 db.update_task(task["id"], status="running", branch=branch, blocked_reason=None)
                 self.start_run("worker" if task["kind"] != "review" else "reviewer", prompt, provider, tier, cwd,
                                task=task, budget_usd=max(remaining, 0.5) if task["budget_usd"] else None,
-                               read_only=False, append_system=system)
+                               read_only=False, append_system=system, note=note,
+                               resume=lost["session"] if lost else None)
             except Exception as e:
                 self._start_failed(task, e)
                 self._unreserve(task)
@@ -1373,6 +1398,34 @@ class Daemon:
         for task in ready:
             if task["id"] not in reached:
                 self._unreserve(task)
+
+    def _resumable(self, task: dict, provider: str) -> dict | None:
+        """The task's last run, when the host took it away (reboot, sleep, lost supervisor) after
+        real progress and its agent session can be continued in the same working directory: a fresh
+        start would pay again for everything that run read and did. None otherwise: failed,
+        timed-out and finished runs never resume, nor does a run whose hand-off stands."""
+        want = self.cfg["budget"].get("resume_lost")
+        if not isinstance(want, dict):
+            return None
+        r = self.p.db.one("SELECT * FROM runs WHERE task=? AND role!='coordinator' ORDER BY id DESC LIMIT 1",
+                          (task["id"],))
+        if not r or r["status"] != "lost" or r["provider"] != provider or not r["dir"]:
+            return None
+        note = json.loads(r["note"] or "{}")
+        session = note.get("session_id")
+        run_dir = Path(r["dir"])
+        if not session or (_read_result(run_dir / RESULT_FILE) or {}).get("status") in HANDOFF_STATES:
+            return None
+        took = float(r["ended"] or 0) - float(r["started"] or 0)
+        if float(r["cost_usd"] or 0) < float(want.get("min_usd", 0.5)) and took < float(want.get("min_s", 600)):
+            return None
+        cwd = str((_read_result(run_dir / "run.json") or {}).get("cwd") or "")
+        prov = get_provider(provider)
+        if not cwd or not Path(cwd).is_dir() or not prov.resume_args(session) or not prov.session_saved(session, cwd):
+            return None
+        cause = "reboot" if note.get("lost_to_reboot") else "sleep" if note.get("lost_to_sleep") else "lost"
+        return {"run": r["id"], "session": session, "cwd": cwd, "dir": str(run_dir), "ended": r["ended"],
+                "cause": cause, "spec_sha": note.get("spec_sha")}
 
     def _unreserve(self, task: dict) -> None:
         for res in _exclusive(task):
@@ -1980,6 +2033,11 @@ def _cut(text: str, n: int, where: str) -> str:
         return text
     note = f" … [cut; the whole text is in {where}]"
     return text[:max(0, n - len(note))] + note
+
+
+def _resume_never_started(note: dict, usage) -> bool:
+    """A run that was to continue a lost session ended before its agent did anything."""
+    return bool(note.get("resumes")) and not usage.cost_usd and not usage.output_tokens
 
 
 def _read_result(path: Path) -> dict | None:

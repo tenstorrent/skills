@@ -7498,3 +7498,221 @@ def test_web_why_names_cap_zero_and_review_cap(env):
     assert "24 h cap on review tasks is full" in web.health(p, p.db, alive=True)["why_idle"]
     p.db.set_kv(coord.RETRY_WAKE_KEY, {"at": now + coord.NO_SLOT_S, "review": False})
     assert "cap on new tasks is 0: none are added until it is raised" in web.health(p, p.db, alive=True)["why_idle"]
+
+
+def _lost_with_session(p, d, tmp_path, tid, name="lost", session="s1", cost=0.0, took=1800, cwd=None,
+                       boot="an-earlier-boot", status="running"):
+    """A run of task tid with a saved agent session, cut off `took` seconds in and reaped (on a
+    reboot by default). The fake's sessions live in $TTP_FAKE_SESSIONS."""
+    p.db.update_task(tid, status="running")
+    run_dir = tmp_path / name
+    run_dir.mkdir()
+    (run_dir / "output.jsonl").write_text(json.dumps({"_session": session, "_cost": cost}))
+    (run_dir / "run.json").write_text(json.dumps({"cwd": str(cwd or p.root)}))
+    (run_dir / "lease").touch()
+    started = time.time() - took - 600
+    os.utime(run_dir / "lease", (started + took, started + took))
+    os.utime(run_dir / "output.jsonl", (started + took, started + took))
+    p.db.x("INSERT INTO runs(task,role,provider,started,status,dir,boot_id,note) VALUES(?,?,?,?,?,?,?,?)",
+           (tid, "worker", "fake", started, status, str(run_dir), boot or d.boot,
+            json.dumps({"spec_sha": "x"})))
+    if status == "running":
+        d.reap_runs()
+    return run_dir
+
+
+def d_system(p):
+    from ttp.prompts import worker_system
+    return worker_system(p)
+
+
+def _sessions(env, monkeypatch, *ids):
+    d = env["tmp"] / "sessions"
+    d.mkdir(exist_ok=True)
+    for sid in ids:
+        (d / f"{sid}.jsonl").write_text("{}\n")
+    monkeypatch.setenv("TTP_FAKE_SESSIONS", str(d))
+    return d
+
+
+def _finish_runs(p, d, deadline_s=30):
+    end = time.time() + deadline_s
+    while time.time() < end and p.db.q("SELECT id FROM runs WHERE status='running'"):
+        d.reap_runs()
+        time.sleep(0.1)
+    assert not p.db.q("SELECT id FROM runs WHERE status='running'")
+
+
+def test_a_lost_run_with_a_saved_session_resumes_it_with_a_short_prompt(env, tmp_path, monkeypatch):
+    p = make(env)
+    from ttp.daemon import Daemon
+    from ttp.prompts import spec_digest
+    sessions = _sessions(env, monkeypatch, "s1")
+    d = Daemon(p.base)
+    d.boot_at = time.time() - 300
+    tid = p.db.add_task("build", "build the thing", kind="work", tier="light", origin="user")
+    p.db.update_task(tid, attempts=1)
+    lost = _lost_with_session(p, d, tmp_path, tid)
+    assert json.loads(p.db.one("SELECT note FROM runs WHERE dir=?", (str(lost),))["note"])["session_id"] == "s1"
+    (lost / "steer.md").write_text("Also update the docs. (turn 7)\n")
+    p.db.update_task(tid, spec="build the thing, then test it")
+    assert d._resumable(p.db.task(tid), "fake")["session"] == "s1"
+    d.dispatch()
+    run = p.db.one("SELECT * FROM runs WHERE task=? ORDER BY id DESC LIMIT 1", (tid,))
+    assert json.loads(run["note"])["resumes"] == {"run": run["id"] - 1, "session": "s1"}
+    run_dir = pathlib.Path(run["dir"])
+    argv = json.loads((run_dir / "run.json").read_text())["argv"]
+    assert argv[-2:] == ["--resume", "s1"], argv
+    prompt = (run_dir / "prompt.md").read_text()
+    # The fake has no system-prompt flag, so the system text leads the prompt, as for a fresh start.
+    assert prompt.split(f"\n# Continue task #{tid}: build\n")[0].strip() == d_system(p), prompt
+    assert "the host rebooted" in prompt and "does not count as an attempt" in prompt
+    assert "Detached jobs, /tmp files and device state" in prompt and "`git status`" in prompt
+    assert "## Spec" not in prompt, "a resume sent the whole task prompt again"
+    assert "The spec changed:\nbuild the thing, then test it" in prompt and "Also update the docs." in prompt
+    assert str(lost) in prompt and "$TTP_RUN_DIR/result.json" in prompt
+    assert (run_dir / "system.md").read_text() == d_system(p), "the system prompt was not passed again"
+    _finish_runs(p, d)
+    t = p.db.task(tid)
+    assert t["status"] == "done" and t["attempts"] == 2, "the resumed run counted unlike any other run"
+    assert "Continue task" in (sessions / "s1.jsonl").read_text(), "the fake did not continue the session"
+    assert json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (run["id"],))["note"])["spec_sha"] == \
+        spec_digest(t)
+
+
+def test_a_lost_run_starts_fresh_without_its_transcript_or_worktree(env, tmp_path, monkeypatch):
+    p = make(env)
+    from ttp import worktree
+    from ttp.daemon import Daemon
+    _sessions(env, monkeypatch, "kept")
+    d = Daemon(p.base)
+    gone = p.db.add_task("no transcript", "s", kind="work", tier="light", origin="user")
+    _lost_with_session(p, d, tmp_path, gone, name="a", session="deleted")
+    assert d._resumable(p.db.task(gone), "fake") is None
+    code = p.db.add_task("no worktree", "s", kind="code", tier="light", origin="user")
+    path, _ = worktree.ensure(p, p.db.task(code))
+    _lost_with_session(p, d, tmp_path, code, name="b", session="kept", cwd=path)
+    assert d._resumable(p.db.task(code), "fake")["cwd"] == str(path)
+    _git_out(p.root, "worktree", "remove", "--force", str(path))
+    assert d._resumable(p.db.task(code), "fake") is None
+    started = {}
+    monkeypatch.setattr(d, "start_run", lambda role, prompt, *a, **k: started.update({k["task"]["id"]: (prompt, k)}))
+    d.dispatch()
+    for tid in (gone, code):
+        prompt, k = started[tid]
+        assert k["resume"] is None and "## Spec" in prompt and "Continue task" not in prompt
+        assert "The host rebooted" in prompt, "the fresh start lost the reboot note"
+
+
+def test_a_short_lost_run_starts_fresh(env, tmp_path, monkeypatch):
+    p = make(env)
+    from ttp.daemon import Daemon
+    _sessions(env, monkeypatch, "short", "costly", "long")
+    d = Daemon(p.base)
+    short = p.db.add_task("short", "s", kind="work", tier="light", origin="user")
+    _lost_with_session(p, d, tmp_path, short, name="a", session="short", cost=0.2, took=120)
+    assert d._resumable(p.db.task(short), "fake") is None
+    costly = p.db.add_task("costly", "s", kind="work", tier="light", origin="user")
+    _lost_with_session(p, d, tmp_path, costly, name="b", session="costly", cost=0.6, took=120)
+    assert d._resumable(p.db.task(costly), "fake")["session"] == "costly"
+    long = p.db.add_task("long", "s", kind="work", tier="light", origin="user")
+    _lost_with_session(p, d, tmp_path, long, name="c", session="long", took=900)
+    assert d._resumable(p.db.task(long), "fake")["session"] == "long"
+    p.set_config("budget.resume_lost", {"min_usd": 1.0, "min_s": 3600})
+    d.cfg = p.config()
+    assert d._resumable(p.db.task(costly), "fake") is None and d._resumable(p.db.task(long), "fake") is None
+    p.set_config("budget.resume_lost", False)
+    d.cfg = p.config()
+    p.db.update_task(costly, status="queued")
+    assert d._resumable(p.db.task(costly), "fake") is None
+
+
+def test_failed_timed_out_and_handed_off_runs_never_resume(env, tmp_path, monkeypatch):
+    p = make(env)
+    from ttp.daemon import Daemon
+    _sessions(env, monkeypatch, "f", "t", "h")
+    d = Daemon(p.base)
+    for status, sid in (("failed", "f"), ("timeout", "t")):
+        tid = p.db.add_task(status, "s", kind="work", tier="light", origin="user")
+        run_dir = _lost_with_session(p, d, tmp_path, tid, name=sid, session=sid, cost=3.0, status=status)
+        p.db.x("UPDATE runs SET note=?, cost_usd=3, ended=? WHERE dir=?",
+               (json.dumps({"session_id": sid}), time.time(), str(run_dir)))
+        p.db.update_task(tid, status="queued")
+        assert d._resumable(p.db.task(tid), "fake") is None, status
+    handed = p.db.add_task("handed off", "s", kind="work", tier="light", origin="user")
+    lost = tmp_path / "pre"
+    lost.mkdir()
+    (lost / "result.json").write_text(json.dumps({"status": "waiting", "summary": "job running",
+                                                  "retry_after_s": 60}))
+    run_dir = _lost_with_session(p, d, tmp_path, handed, name="h", session="h", cost=3.0)
+    (run_dir / "result.json").write_text((lost / "result.json").read_text())
+    assert d._resumable(p.db.task(handed), "fake") is None
+
+
+def test_a_resume_that_cannot_start_falls_back_to_a_fresh_start_at_no_attempt(env, tmp_path, monkeypatch):
+    p = make(env)
+    from ttp import budget as bud
+    from ttp.daemon import Daemon
+    from ttp.providers.fake import Fake
+    _sessions(env, monkeypatch)
+    monkeypatch.setattr(Fake, "session_saved", lambda self, sid, cwd: True)   # gone by the time it runs
+    d = Daemon(p.base)
+    tid = p.db.add_task("build", "s", kind="work", tier="light", origin="user")
+    p.db.update_task(tid, attempts=1)
+    _lost_with_session(p, d, tmp_path, tid, session="vanished")
+    d.dispatch()
+    _finish_runs(p, d)
+    run = p.db.one("SELECT * FROM runs WHERE task=? ORDER BY id DESC LIMIT 1", (tid,))
+    assert run["status"] == "failed" and json.loads(run["note"])["resumes"]["session"] == "vanished"
+    assert not bud.wasted(run), "a resume that never started counted toward the runaway guard"
+    t = p.db.task(tid)
+    assert t["status"] == "queued" and t["attempts"] == 1 and not t["not_before"], dict(t)
+    assert d._resumable(t, "fake") is None
+    d.dispatch()
+    run = p.db.one("SELECT * FROM runs WHERE task=? ORDER BY id DESC LIMIT 1", (tid,))
+    assert "resumes" not in json.loads(run["note"]) and "## Spec" in (pathlib.Path(run["dir"]) / "prompt.md").read_text()
+    _finish_runs(p, d)
+    assert p.db.task(tid)["status"] == "done" and p.db.task(tid)["attempts"] == 2
+
+
+def test_resuming_keeps_attempt_counting(env, tmp_path, monkeypatch):
+    p = make(env)
+    from ttp.daemon import Daemon
+    _sessions(env, monkeypatch, "r", "s")
+    d = Daemon(p.base)
+    rebooted = p.db.add_task("rebooted", "s", kind="work", tier="light", origin="user")
+    _lost_with_session(p, d, tmp_path, rebooted, name="r", session="r")
+    supervisor = p.db.add_task("lost supervisor", "s", kind="work", tier="light", origin="user")
+    _lost_with_session(p, d, tmp_path, supervisor, name="s", session="s", boot=None)
+    assert p.db.task(rebooted)["attempts"] == 0 and p.db.task(supervisor)["attempts"] == 1
+    assert d._resumable(p.db.task(supervisor), "fake")["cause"] == "lost"
+    p.db.update_task(supervisor, not_before=None)
+    d.dispatch()
+    for tid in (rebooted, supervisor):
+        run = p.db.one("SELECT * FROM runs WHERE task=? ORDER BY id DESC LIMIT 1", (tid,))
+        assert json.loads(run["note"]).get("resumes"), tid
+    prompt = (pathlib.Path(run["dir"]) / "prompt.md").read_text()
+    assert "its supervisor was lost" in prompt and "attempt 2 of 3" in prompt and "does not count" not in prompt
+    _finish_runs(p, d)
+    # A finished run counts its attempt as ever; the losses before it did as they always did.
+    assert p.db.task(rebooted)["attempts"] == 1 and p.db.task(supervisor)["attempts"] == 2
+    assert p.db.task(rebooted)["status"] == "done" and p.db.task(supervisor)["status"] == "done"
+
+
+def test_claude_resumes_by_session_id_and_finds_its_transcript(env, tmp_path, monkeypatch):
+    from ttp.providers import claude as cl
+    from ttp.providers.codex import Codex
+    from ttp.providers.cursor import Cursor
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "cc"))
+    monkeypatch.setitem(cl._FLAGS, "--resume", True)
+    c = cl.Claude()
+    assert c.resume_args("abc") == ["--resume", "abc"]
+    cwd = "/work/my_repo/worktrees/t1"
+    assert not c.session_saved("abc", cwd)
+    d = tmp_path / "cc" / "projects" / "-work-my-repo-worktrees-t1"
+    d.mkdir(parents=True)
+    (d / "abc.jsonl").write_text("{}\n")
+    assert c.session_saved("abc", cwd) and not c.session_saved("other", cwd) and not c.session_saved("", cwd)
+    monkeypatch.setitem(cl._FLAGS, "--resume", False)
+    assert c.resume_args("abc") == []
+    assert Codex().resume_args("abc") == [] and Cursor().resume_args("abc") == []

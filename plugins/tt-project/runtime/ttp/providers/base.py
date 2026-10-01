@@ -106,6 +106,15 @@ class Provider:
         """Arguments that load extra skill plugins for one run; [] when the agent cannot."""
         return []
 
+    def resume_args(self, session_id: str) -> list[str]:
+        """Arguments that continue the saved agent session `session_id` instead of starting a new
+        one; [] when the agent cannot, and a lost run then starts fresh."""
+        return []
+
+    def session_saved(self, session_id: str, cwd: str) -> bool:
+        """Whether the transcript of `session_id`, run in `cwd`, is still on disk to resume."""
+        return False
+
     def append_system_args(self, path: Path) -> list[str]:
         """Arguments that add the text in `path` to the agent's system prompt, where a provider
         caches it across runs; [] when the agent cannot, and the text then leads the prompt."""
