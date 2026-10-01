@@ -46,6 +46,21 @@ class Cursor(Provider):
             argv += ["--mode", "ask"]   # answers only: no edits and no commands
         return argv, {}
 
+    def resume_args(self, session_id: str) -> list[str]:
+        # `--resume [chatId]` continues a chat; the id is the session_id every stream event carries.
+        # session_saved() stays False: Cursor documents no place its chats are kept, and a resume of
+        # a chat that is gone may start an empty one, so the daemon never resumes a Cursor run yet.
+        ok = session_id and re.fullmatch(r"[A-Za-z0-9-]+", session_id)
+        return ["--resume", session_id] if ok and "--resume" in cli_output(self.binary() or "agent", "--help") else []
+
+    def plugin_args(self, dirs: list[str]) -> list[str]:
+        if not dirs or "--plugin-dir" not in cli_output(self.binary() or "agent", "--help"):
+            return []
+        out: list[str] = []
+        for d in dirs:
+            out += ["--plugin-dir", d]
+        return out
+
     def streams(self, argv: list[str]) -> bool:
         return "stream-json" in argv   # older builds print their one JSON result at the end
 

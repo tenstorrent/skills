@@ -4494,7 +4494,8 @@ sys.exit(int(os.environ.get("FAKE_CLI_RC", "0")))
 
 
 def _cli_run(env, monkeypatch, provider, stdout, *, stderr="", rc=0, result=None, role="worker",
-             read_only=False, schema=None, note=None, before=None, budget_usd=2.0, help_text="", pace=0):
+             read_only=False, schema=None, note=None, before=None, budget_usd=2.0, help_text="", pace=0,
+             resume=None):
     """Launch one run of `provider` through the daemon and its detached runner against a fake CLI,
     reap it, and return the project, run row, task row, argv and the stdin the CLI received."""
     bin_dir = env["tmp"] / "fakebin"
@@ -4523,7 +4524,7 @@ def _cli_run(env, monkeypatch, provider, stdout, *, stderr="", rc=0, result=None
         p.db.update_task(tid, status="running")
     rid = d.start_run(role, "PROMPT-MARKER", provider, "light", str(env["repo"]),
                       task=p.db.task(tid) if tid else None, budget_usd=budget_usd, timeout_s=100,
-                      read_only=read_only, schema=schema, note=note)
+                      read_only=read_only, schema=schema, note=note, resume=resume)
     exit_file = p.runs / str(rid) / "exit.json"
     deadline = time.time() + 60
     while not exit_file.exists() and time.time() < deadline:
@@ -7956,7 +7957,7 @@ def test_a_resume_that_cannot_start_falls_back_to_a_fresh_start_at_no_attempt(en
     from ttp.daemon import Daemon
     from ttp.providers.fake import Fake
     _sessions(env, monkeypatch)
-    monkeypatch.setattr(Fake, "session_saved", lambda self, sid, cwd: True)   # gone by the time it runs
+    monkeypatch.setattr(Fake, "session_saved", lambda self, sid, cwd, env=None: True)   # gone by the time it runs
     d = Daemon(p.base)
     tid = p.db.add_task("build", "s", kind="work", tier="light", origin="user")
     p.db.update_task(tid, attempts=1)
@@ -8014,6 +8015,105 @@ def test_claude_resumes_by_session_id_and_finds_its_transcript(env, tmp_path, mo
     d.mkdir(parents=True)
     (d / "abc.jsonl").write_text("{}\n")
     assert c.session_saved("abc", cwd) and not c.session_saved("other", cwd) and not c.session_saved("", cwd)
+    # A run given its own config dir (another account) kept its transcript there.
+    other = tmp_path / "acct2" / "projects" / "-work-my-repo-worktrees-t1"
+    other.mkdir(parents=True)
+    (other / "per-account.jsonl").write_text("{}\n")
+    assert not c.session_saved("per-account", cwd)
+    assert c.session_saved("per-account", cwd, {"CLAUDE_CONFIG_DIR": str(tmp_path / "acct2")})
+    assert c.session_saved("abc", cwd, {"CLAUDE_CONFIG_DIR": str(tmp_path / "acct2")}), "lost the daemon's own dir"
     monkeypatch.setitem(cl._FLAGS, "--resume", False)
     assert c.resume_args("abc") == []
-    assert Codex().resume_args("abc") == [] and Cursor().resume_args("abc") == []
+    monkeypatch.setattr(Codex, "binary", lambda self: "/nonexistent/codex")
+    monkeypatch.setattr(Cursor, "binary", lambda self: "/nonexistent/agent")
+    assert Codex().resume_args("abc") == [] and Cursor().resume_args("abc") == [], "a CLI that cannot resume"
+
+
+def test_a_lost_run_is_looked_up_with_its_own_environment(env, tmp_path, monkeypatch):
+    p = make(env)
+    from ttp.daemon import Daemon
+    from ttp.providers.fake import Fake
+    seen = []
+    monkeypatch.setattr(Fake, "session_saved", lambda self, sid, cwd, env=None: seen.append(env) or True)
+    d = Daemon(p.base)
+    tid = p.db.add_task("build", "s", kind="work", tier="light", origin="user")
+    run_dir = _lost_with_session(p, d, tmp_path, tid)
+    (run_dir / "run.json").write_text(json.dumps({"cwd": str(p.root), "env": {"CLAUDE_CONFIG_DIR": "/acct2"}}))
+    assert d._resumable(p.db.task(tid), "fake")["session"] == "s1"
+    assert seen[-1] == {"CLAUDE_CONFIG_DIR": "/acct2"}
+
+
+CODEX_EXEC_HELP = """Run Codex non-interactively
+
+Usage: codex exec [OPTIONS] [PROMPT] [COMMAND]
+
+Commands:
+  resume  Resume a previous session by id or pick the most recent with --last
+  help    Print this message or the help of the given subcommand(s)
+"""
+THREAD = "0199a213-81c0-7800-8aa1-bbab2a035a53"   # the id format `codex exec --json` documents
+
+
+def test_codex_keeps_its_thread_id_and_resumes_it(env, tmp_path, monkeypatch):
+    from ttp.providers import base
+    from ttp.providers.codex import Codex
+    out = tmp_path / "o.jsonl"
+    out.write_text(_codex_events({"type": "thread.started", "thread_id": THREAD}, *_codex_turn("ok")[1:]))
+    assert Codex().parse(out).session_id == THREAD
+    monkeypatch.setattr(Codex, "binary", lambda self: "/x/codex")
+    monkeypatch.setitem(base._CLI_OUTPUT, ("/x/codex", "exec", "--help"), CODEX_EXEC_HELP)
+    assert Codex().resume_args(THREAD) == ["resume", THREAD]
+    assert Codex().resume_args("") == [] and Codex().resume_args("../x") == [] and Codex().resume_args("a*") == []
+    # Rollouts are kept by date under CODEX_HOME: the daemon's, or the run's own.
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "home"))
+    day = tmp_path / "own" / "sessions" / "2026" / "09" / "30"
+    day.mkdir(parents=True)
+    (day / f"rollout-2026-09-30T10-00-00-{THREAD}.jsonl").write_text("{}\n")
+    assert not Codex().session_saved(THREAD, "/w")
+    assert Codex().session_saved(THREAD, "/w", {"CODEX_HOME": str(tmp_path / "own")})
+    assert not Codex().session_saved("0199a213", "/w", {"CODEX_HOME": str(tmp_path / "own")}), "a prefix matched"
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "own"))
+    assert Codex().session_saved(THREAD, "/w") and not Codex().session_saved("*", "/w")
+
+
+def test_codex_resume_puts_the_subcommand_after_its_options(env, monkeypatch):
+    _, run, task, argv, stdin = _cli_run(env, monkeypatch, "codex", _codex_events(*_codex_turn("all done")),
+                                         result={"status": "done", "summary": "ok"}, help_text=CODEX_EXEC_HELP,
+                                         resume=THREAD)
+    assert argv[-3:] == ["resume", THREAD, "-"], argv
+    assert argv.index("-C") < argv.index("resume") and argv.index("-s") < argv.index("resume")
+    assert any(a.startswith("sandbox_workspace_write.writable_roots=") for a in argv[:argv.index("resume")])
+    assert "PROMPT-MARKER" in stdin and run["status"] == "ok" and task["status"] == "done"
+
+
+def test_a_failed_resume_that_printed_events_but_no_tokens_is_free(env, monkeypatch):
+    from ttp import budget as bud
+    out = _codex_events({"type": "error", "message": f"no rollout found for thread id {THREAD}"})
+    p, run, task, _, _ = _cli_run(env, monkeypatch, "codex", out, rc=1, help_text=CODEX_EXEC_HELP, resume=THREAD,
+                                  note={"resumes": {"run": 1, "session": THREAD}})
+    assert run["status"] == "failed" and run["cost_usd"] == 0, "a resume that never started was charged"
+    assert not bud.wasted(run) and json.loads(run["note"])["not_waste"] == "resume"
+    assert task["status"] == "queued" and task["attempts"] == 0, dict(task)
+    # The same output from a run that resumed nothing is still priced as cut off.
+    _, run, task, _, _ = _cli_run(env, monkeypatch, "codex", out, rc=1)
+    assert run["status"] == "failed" and run["cost_usd"] > 0
+
+
+CURSOR_RESUME_HELP = CURSOR_HELP + """  --resume [chatId]          Resume a chat session
+  --plugin-dir <path>        Load a plugin from a directory (repeatable)
+"""
+
+
+def test_cursor_resumes_a_chat_and_loads_plugins_when_its_cli_can(env, tmp_path, monkeypatch):
+    from ttp.providers import base
+    from ttp.providers.cursor import Cursor
+    out = tmp_path / "o.jsonl"
+    out.write_text(_codex_events(*CURSOR_STREAM_KILLED))
+    assert Cursor().parse(out).session_id == "s-9", "a cut-off run keeps the chat id it streamed"
+    monkeypatch.setattr(Cursor, "binary", lambda self: "/x/agent")
+    monkeypatch.setitem(base._CLI_OUTPUT, ("/x/agent", "--help"), CURSOR_RESUME_HELP)
+    assert Cursor().resume_args("s-9") == ["--resume", "s-9"] and Cursor().resume_args("") == []
+    assert Cursor().plugin_args(["/a", "/b"]) == ["--plugin-dir", "/a", "--plugin-dir", "/b"]
+    assert not Cursor().session_saved("s-9", "/w"), "Cursor documents no chat store: never resumed blind"
+    monkeypatch.setitem(base._CLI_OUTPUT, ("/x/agent", "--help"), CURSOR_HELP)
+    assert Cursor().resume_args("s-9") == [] and Cursor().plugin_args(["/a"]) == []

@@ -34,7 +34,7 @@ class Fake(Provider):
     def resume_args(self, session_id: str) -> list[str]:
         return ["--resume", session_id] if session_id else []
 
-    def session_saved(self, session_id: str, cwd: str) -> bool:
+    def session_saved(self, session_id: str, cwd: str, env: dict | None = None) -> bool:
         d = os.environ.get("TTP_FAKE_SESSIONS")
         return bool(d and session_id and (Path(d) / f"{session_id}.jsonl").is_file())
 

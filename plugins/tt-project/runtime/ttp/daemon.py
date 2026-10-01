@@ -658,7 +658,11 @@ class Daemon:
         usage = prov.parse(run_dir / "output.jsonl", run_dir / "stderr.log")
         self._priced(r, usage)
         stopped = exit_info.get("stopped")
-        if usage.estimated and not usage.cost_usd:
+        # A resume that failed on its own and reported no tokens never got going, even if it printed
+        # events: it costs nothing, so it ends as the free fallback to a fresh start (_finish_worker).
+        failed_resume = not stopped and (exit_info.get("rc") != 0 or usage.error) and not _has_tokens(usage) \
+            and _resume_never_started(json.loads(r["note"] or "{}"), usage)
+        if usage.estimated and not usage.cost_usd and not failed_resume:
             usage.cost_usd = _cut_off_cost(run_dir, exit_info, usage, prov)
         status = "ok" if exit_info.get("rc") == 0 and not usage.error else "failed"
         if stopped in ("timeout", "budget", "stopped", "lost", "stalled", "shutdown", "resource_busy"):
@@ -1442,9 +1446,11 @@ class Daemon:
         took = float(r["ended"] or 0) - float(r["started"] or 0)
         if float(r["cost_usd"] or 0) < float(want.get("min_usd", 0.5)) and took < float(want.get("min_s", 600)):
             return None
-        cwd = str((_read_result(run_dir / "run.json") or {}).get("cwd") or "")
+        spec = _read_result(run_dir / "run.json") or {}
+        cwd, run_env = str(spec.get("cwd") or ""), spec.get("env") if isinstance(spec.get("env"), dict) else {}
         prov = get_provider(provider)
-        if not cwd or not Path(cwd).is_dir() or not prov.resume_args(session) or not prov.session_saved(session, cwd):
+        if not cwd or not Path(cwd).is_dir() or not prov.resume_args(session) or \
+                not prov.session_saved(session, cwd, run_env):
             return None
         cause = "reboot" if note.get("lost_to_reboot") else "sleep" if note.get("lost_to_sleep") else "lost"
         return {"run": r["id"], "session": session, "cwd": cwd, "dir": str(run_dir), "ended": r["ended"],
@@ -1991,8 +1997,7 @@ def _cut_off_cost(run_dir: Path, exit_info: dict, usage=None, prov=None) -> floa
         spec = json.loads((run_dir / "run.json").read_text())
     except (OSError, ValueError):
         return 0.0
-    tokens = usage and (usage.input_tokens or usage.output_tokens or usage.cache_read_tokens
-                        or usage.cache_write_tokens)
+    tokens = usage and _has_tokens(usage)
     try:
         silent = not (run_dir / "output.jsonl").stat().st_size
     except OSError:
@@ -2056,6 +2061,10 @@ def _cut(text: str, n: int, where: str) -> str:
         return text
     note = f" … [cut; the whole text is in {where}]"
     return text[:max(0, n - len(note))] + note
+
+
+def _has_tokens(usage) -> bool:
+    return bool(usage.input_tokens or usage.output_tokens or usage.cache_read_tokens or usage.cache_write_tokens)
 
 
 def _resume_never_started(note: dict, usage) -> bool:

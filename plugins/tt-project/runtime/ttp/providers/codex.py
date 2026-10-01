@@ -31,7 +31,25 @@ class Codex(Provider):
     isolate_read_only = True
 
     def credential_files(self) -> list[str]:
-        return [str(Path(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")) / "auth.json")]
+        return [str(codex_home() / "auth.json")]
+
+    def resume_args(self, session_id: str) -> list[str]:
+        # `codex exec [options] resume <SESSION_ID> -`: the daemon puts these last, just before the
+        # trailing "-", so the exec options stay ahead of the subcommand and the prompt is on stdin.
+        if not session_id or not re.fullmatch(r"[A-Za-z0-9-]+", session_id):
+            return []
+        exe = self.binary() or "codex"
+        return ["resume", session_id] if re.search(r"^\s*resume\b", cli_output(exe, "exec", "--help"), re.M) else []
+
+    def session_saved(self, session_id: str, cwd: str, env: dict | None = None) -> bool:
+        # Rollouts are saved as sessions/YYYY/MM/DD/rollout-<time>-<id>.jsonl under CODEX_HOME (the
+        # run's own, when it had one). Not in the official docs: if the layout moves, this finds
+        # nothing and the lost run starts fresh, as before.
+        if not session_id or not re.fullmatch(r"[A-Za-z0-9-]+", session_id):
+            return False
+        own = (env or {}).get("CODEX_HOME")
+        homes = ([Path(own).expanduser()] if own else []) + [codex_home()]
+        return any(any((h / "sessions").glob(f"*/*/*/rollout-*-{session_id}.jsonl")) for h in dict.fromkeys(homes))
 
     def build(self, *, role, model, effort, cwd, budget_usd, read_only, schema, restrictions):
         exe = self.binary() or "codex"
@@ -104,7 +122,9 @@ class Codex(Provider):
         events, errors = 0, []
         for ev in self._events(output_path):
             events += 1
-            if ev.get("type") == "turn.completed":
+            if ev.get("type") == "thread.started":
+                u.session_id = str(ev.get("thread_id") or "")   # what `codex exec resume` takes
+            elif ev.get("type") == "turn.completed":
                 errors = []   # transient errors Codex retried are reported as "error" events too
             elif ev.get("type") in ("turn.failed", "error"):
                 errors.append(ev)
@@ -185,6 +205,11 @@ class Codex(Provider):
             util = float(w.get("usedPercent") or 0)
             wins.append(Window("codex", name, 100.0 if not allowed else util, w.get("resetsAt"), rl.get("planType") or ""))
         return wins
+
+
+def codex_home() -> Path:
+    """Where Codex keeps its login and saved sessions."""
+    return Path(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"))
 
 
 def strict_schema(schema):

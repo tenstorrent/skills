@@ -135,16 +135,19 @@ class Claude(Provider):
     def resume_args(self, session_id: str) -> list[str]:
         return ["--resume", session_id] if session_id and self.supports("--resume") else []
 
-    def session_saved(self, session_id: str, cwd: str) -> bool:
+    def session_saved(self, session_id: str, cwd: str, env: dict | None = None) -> bool:
         # Transcripts live per working directory, under the directory's path with every character
-        # but letters and digits as "-" (long paths are shortened, so look in the others too).
-        projects = claude_config_dir() / "projects"
+        # but letters and digits as "-" (long paths are shortened, so look in the others too). A run
+        # given its own CLAUDE_CONFIG_DIR (another account) kept them there, not in the daemon's.
         name = f"{session_id}.jsonl"
         if not session_id or "/" in session_id:
             return False
-        if (projects / re.sub(r"[^a-zA-Z0-9]", "-", cwd) / name).is_file():
-            return True
-        return any(projects.glob(f"*/{name}"))
+        own = (env or {}).get("CLAUDE_CONFIG_DIR")
+        for base in dict.fromkeys(([Path(own).expanduser()] if own else []) + [claude_config_dir()]):
+            projects = base / "projects"
+            if (projects / re.sub(r"[^a-zA-Z0-9]", "-", cwd) / name).is_file() or any(projects.glob(f"*/{name}")):
+                return True
+        return False
 
     def plugin_args(self, dirs: list[str]) -> list[str]:
         out: list[str] = []

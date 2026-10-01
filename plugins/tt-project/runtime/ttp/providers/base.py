@@ -111,8 +111,9 @@ class Provider:
         one; [] when the agent cannot, and a lost run then starts fresh."""
         return []
 
-    def session_saved(self, session_id: str, cwd: str) -> bool:
-        """Whether the transcript of `session_id`, run in `cwd`, is still on disk to resume."""
+    def session_saved(self, session_id: str, cwd: str, env: dict | None = None) -> bool:
+        """Whether the transcript of `session_id`, run in `cwd` with the environment `env` (the run's
+        own, which may point the agent at another config directory), is still on disk to resume."""
         return False
 
     def append_system_args(self, path: Path) -> list[str]:
