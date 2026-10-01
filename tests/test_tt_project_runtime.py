@@ -5120,6 +5120,100 @@ def test_the_same_update_from_a_later_turn_is_still_written(env, tmp_path):
     assert len(list(p.memory_dir.glob("fact-use-board-1-only*.md"))) == 2
 
 
+def _memories(p, items):
+    """Add (kind, text) memories with strictly increasing mtimes, oldest first."""
+    paths = []
+    for i, (kind, text) in enumerate(items):
+        path = p.add_memory(text, kind=kind, title=f"{kind} {i}")
+        os.utime(path, (1_000_000 + i, 1_000_000 + i))
+        paths.append(path)
+    return paths
+
+
+def test_memory_is_cut_at_whole_entries_and_keeps_pinned_kinds_first(env):
+    p = make(env)
+    old_rule = "Never touch the shared board without a lock. " * 3
+    _memories(p, [("restriction", old_rule), ("preference", "Short replies."), ("resource", "Box A is ours.")]
+              + [("decision", f"DECISION-{i} " + "x" * 300) for i in range(40)])
+    text = p.memory_text(limit_chars=4000)
+    assert len(text) <= 4000
+    lines = text.splitlines()
+    assert lines[0].startswith("[restriction-") and old_rule.strip() in lines[0]
+    assert lines[1].startswith("[preference-") and lines[2].startswith("[resource-")
+    for line in lines[3:]:
+        assert line.startswith("[decision-") and line.endswith("x" * 300), "an entry was cut"
+    shown = [int(x.split("DECISION-")[1].split()[0]) for x in lines[3:]]
+    assert shown == list(range(40 - len(shown), 40)) and len(shown) > 5, "newest decisions, newest last"
+    _, use = p.memory_select(4000)
+    assert use["entries"] == 43 and use["shown"] == 3 + len(shown) and not use["pinned_over"]
+
+
+def test_pinned_memory_survives_an_overflow_and_alerts_the_coordinator_once(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.prompts import worker_system
+    big = [("restriction" if i % 2 else "preference", f"RULE-{i} " + "y" * 900) for i in range(10)]
+    _memories(p, [("fact", "OLD-FACT")] + big)
+    assert coord.apply(p, [{"type": "memory_add", "text": "NEW-FACT"}], turn=1) == []
+    system = worker_system(p)
+    assert all(f"RULE-{i} " in system for i in range(10)), "pinned entries were dropped"
+    assert "NEW-FACT" not in system and "OLD-FACT" not in system
+    alerts = lambda: p.db.q("SELECT text FROM events WHERE kind='memory_over_budget'")
+    assert len(alerts()) == 1 and "exceeds the workers' 8000-char" in alerts()[0]["text"]
+    assert coord.apply(p, [{"type": "memory_add", "text": "ANOTHER-FACT"}], turn=2) == []
+    assert len(alerts()) == 1, "the alert repeats"
+    digest = coord.digest(p, {}, [], [])
+    assert "## Memory over budget: 13 entries" in digest and "workers see 10" in digest
+
+
+def test_memory_forget_archives_the_entry_and_is_idempotent_on_replay(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    stale = p.add_memory("Pending once the cap frees: review the batch.", kind="decision")
+    keep = p.add_memory("Box A is ours.", kind="resource")
+    actions = [{"type": "memory_forget", "name": f"[{stale.stem}]"},
+               {"type": "memory_add", "text": "Box A and box B are ours.", "memory_kind": "resource",
+                "supersedes": [keep.stem]}]
+    for _ in range(2):   # the same turn replayed after a crash
+        assert coord.apply(p, actions, turn=7) == []
+    archive = p.memory_dir / "archive"
+    assert sorted(x.name for x in archive.iterdir()) == sorted([stale.name, keep.name])
+    assert not stale.exists() and not keep.exists()
+    index = p.memory_index.read_text()
+    assert stale.name not in index and keep.name not in index and index.count("box-a-and-box-b") == 1
+    text = p.memory_text()
+    assert "Pending once the cap frees" not in text and "Box A is ours." not in text
+    assert "Box A and box B are ours." in text
+    tracked = subprocess.run(["git", "-C", str(p.harness), "ls-files", "memory"], capture_output=True,
+                             text=True).stdout.split()
+    assert f"memory/{stale.name}" not in tracked and f"memory/archive/{stale.name}" in tracked
+    assert coord.apply(p, [{"type": "memory_forget", "name": "no-such-entry"}], turn=8)
+
+
+def test_memory_cli_retires_an_entry(env):
+    p = make(env)
+    stale = p.add_memory("Old news.", kind="fact")
+    from ttp import cli
+    with contextlib.redirect_stdout(io.StringIO()):
+        cli.main(["memory", "demo", "--forget", stale.stem])
+    assert (p.memory_dir / "archive" / stale.name).exists() and "Old news." not in p.memory_text()
+
+
+def test_a_restriction_memory_reaches_running_workers_and_new_prompts(env, tmp_path):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.prompts import worker_system
+    _memories(p, [("decision", "z" * 9000)])
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    p.db.x("INSERT INTO runs(role,provider,started,status,dir) VALUES(?,?,?,?,?)",
+           ("worker", "fake", time.time(), "running", str(run_dir)))
+    assert coord.apply(p, [{"type": "memory_add", "text": "Never reboot box A.",
+                            "memory_kind": "restriction"}], turn=1) == []
+    assert "Never reboot box A." in (run_dir / "steer.md").read_text()
+    assert "Never reboot box A." in worker_system(p)
+
+
 def test_a_cancel_cut_off_before_its_stop_still_ends_the_run(env, tmp_path):
     p = make(env)
     from ttp.daemon import Daemon

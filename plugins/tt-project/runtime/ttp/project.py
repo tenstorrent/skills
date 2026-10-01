@@ -101,6 +101,12 @@ def hostname() -> str:
     return re.sub(r"[^A-Za-z0-9._-]", "", raw) or "localhost"
 
 
+# Memory kinds every prompt carries whatever the budget; decisions and facts fill what is left.
+PINNED_MEMORY_KINDS = ("restriction", "preference", "resource")
+# Memory each prompt carries, in characters of whole entries (see Project.memory_select).
+COORDINATOR_MEMORY_CHARS, WORKER_MEMORY_CHARS = 12000, 8000
+
+
 class Project:
     """A project rooted at <root>/tt-project. `harness/` is its own git repo (charter, memory,
     config, prompts, runtime); `state/` holds the database, run directories and logs."""
@@ -178,25 +184,37 @@ class Project:
         return self.raw_config().get("name", self.root.name)
 
     # memory -----------------------------------------------------------------------------------
-    def commit_harness(self, paths: list[Path], message: str) -> None:
+    def commit_harness(self, paths: list[Path], message: str, removed: list[Path] = ()) -> None:
         """Commit just these harness files, so the project's history shows what it learned and when.
+        `removed` are files this change took away (their deletion is committed).
 
         Only the named paths are committed: a harness task may be editing other files right now,
         and its half-done work must not be swept into this commit. Inside a database transaction
         the commit waits until the transaction ends, so git never holds the write lock.
         """
-        rel = [str(Path(x).resolve().relative_to(self.harness.resolve())) for x in paths if Path(x).exists()]
-        if not rel or not (self.harness / ".git").exists():
+        top = self.harness.resolve()
+        rel = [str(Path(x).resolve().relative_to(top)) for x in paths if Path(x).exists()]
+        gone = [str(Path(x).resolve().relative_to(top)) for x in removed if not Path(x).exists()]
+        if not (rel or gone) or not (self.harness / ".git").exists():
             return
-        self.db.after_commit(lambda: self._git_commit(rel, message))
+        self.db.after_commit(lambda: self._git_commit(rel, message, gone))
 
-    def _git_commit(self, rel: list[str], message: str) -> bool:
+    def _git_commit(self, rel: list[str], message: str, gone: list[str] = ()) -> bool:
         ident = ["-c", "user.name=tt-project", "-c", "user.email=tt-project@localhost"]
+        git = ["git", "-C", str(self.harness)]
         try:
-            subprocess.run(["git", "-C", str(self.harness), "add", "--", *rel], check=True, capture_output=True,
-                           timeout=30)
-            r = subprocess.run(["git", "-C", str(self.harness), *ident, "commit", "-q", "-m", message[:200], "--",
-                                *rel], capture_output=True, timeout=30)
+            if gone:
+                gone = subprocess.run([*git, "ls-files", "--", *gone], capture_output=True, text=True,
+                                      timeout=30).stdout.split()
+                if gone:
+                    subprocess.run([*git, "rm", "-q", "--cached", "--", *gone], check=True, capture_output=True,
+                                   timeout=30)
+            if rel:
+                subprocess.run([*git, "add", "--", *rel], check=True, capture_output=True, timeout=30)
+            if not (rel or gone):
+                return False
+            r = subprocess.run([*git, *ident, "commit", "-q", "-m", message[:200], "--", *rel, *gone],
+                               capture_output=True, timeout=30)
             return r.returncode == 0
         except (OSError, subprocess.SubprocessError):
             return False
@@ -228,17 +246,60 @@ class Project:
         self.commit_harness([path, self.memory_index], f"memory ({kind}): {title}")
         return path
 
-    def memory_text(self, limit_chars: int = 12000) -> str:
-        """Index plus fact bodies, newest last, bounded so it never crowds the coordinator's prompt."""
+    def _memory_entries(self) -> list[dict]:
+        """Live memory entries, oldest first: `name` (the file stem shown in prompts), `kind`, `line`."""
         if not self.memory_dir.is_dir():
-            return ""
-        parts = []
+            return []
+        out = []
         for p in sorted(self.memory_dir.glob("*.md"), key=lambda p: (p.stat().st_mtime, p.name)):
-            body = p.read_text().split("---", 2)[-1].strip()
-            parts.append(f"[{p.stem}] {body}")
-        text = "\n".join(parts)
-        return text[-limit_chars:]
+            raw = p.read_text()
+            head, body = (raw.split("---", 2)[1:] if raw.startswith("---") and raw.count("---") >= 2
+                          else ("", raw))
+            m = re.search(r"^kind:\s*(\S+)", head, re.M)
+            kind = m.group(1) if m else p.stem.split("-", 1)[0]
+            out.append({"name": p.stem, "kind": kind, "line": f"[{p.stem}] {body.strip()}"})
+        return out
 
+    def memory_select(self, limit_chars: int = COORDINATOR_MEMORY_CHARS) -> tuple[list[dict], dict]:
+        """The entries a prompt of `limit_chars` gets, whole: every pinned entry (restrictions,
+        preferences, resources) first, then the newest decisions and facts that still fit. Pinned
+        entries are kept even past the budget. Also returns the usage numbers for the digest."""
+        entries = self._memory_entries()
+        pinned = [e for e in entries if e["kind"] in PINNED_MEMORY_KINDS]
+        used = sum(len(e["line"]) + 1 for e in pinned)
+        rest = []
+        for e in reversed([e for e in entries if e["kind"] not in PINNED_MEMORY_KINDS]):
+            if used + len(e["line"]) + 1 > limit_chars:
+                break   # whole entries only, and no older one slips in past a gap
+            rest.append(e)
+            used += len(e["line"]) + 1
+        chosen = pinned + rest[::-1]
+        pinned_chars = sum(len(e["line"]) + 1 for e in pinned)
+        return chosen, {"entries": len(entries), "shown": len(chosen), "pinned": len(pinned),
+                        "chars": sum(len(e["line"]) + 1 for e in entries), "pinned_chars": pinned_chars,
+                        "limit": limit_chars, "pinned_over": pinned_chars > limit_chars}
+
+    def memory_text(self, limit_chars: int = COORDINATOR_MEMORY_CHARS) -> str:
+        """Pinned entries, then the newest others (newest last), whole and bounded so they never
+        crowd the prompt."""
+        return "\n".join(e["line"] for e in self.memory_select(limit_chars)[0])
+
+    def forget_memory(self, name: str) -> Path:
+        """Retire an entry: its file moves to memory/archive/ and its line leaves MEMORY.md, so no
+        prompt carries it again. Forgetting an entry already archived (a replayed turn) is a no-op."""
+        name = Path(name.strip().strip("[]")).stem
+        src, dst = self.memory_dir / f"{name}.md", self.memory_dir / "archive" / f"{name}.md"
+        if not src.exists():
+            if dst.exists():
+                return dst
+            raise ValueError(f"no memory entry {name!r}; use the name in [brackets] from MEMORY")
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(src, dst)
+        if self.memory_index.exists():
+            lines = self.memory_index.read_text().splitlines(keepends=True)
+            self.memory_index.write_text("".join(x for x in lines if f"](memory/{name}.md)" not in x))
+        self.commit_harness([dst, self.memory_index], f"memory retired: {name}", removed=[src])
+        return dst
 
 def write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)

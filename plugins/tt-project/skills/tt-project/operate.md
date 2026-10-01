@@ -9,7 +9,7 @@
 | `ttp adopt <name> --host H --dir D` | record where a project lives |
 | `ttp status <name> [--json]` | daemon, spend vs caps, coordinator health, why idle, running/blocked/waiting tasks, open questions |
 | `ttp task <name> list` / `add "<title>" --spec …` | inspect or queue work by hand |
-| `ttp memory <name> "<fact>"` | add a durable fact |
+| `ttp memory <name> "<fact>" [--kind K]` / `--forget <entry>` | add a durable fact / retire a stale one to memory/archive/. Prompts get restrictions, preferences and resources whole, then the newest decisions and facts that fit |
 | `ttp config <name> <key> [value]` | read or set settings (dotted keys) |
 | `ttp pause <name>` / `resume` | stop starting model runs / start again |
 | `ttp machines add <alias> --tags device,... [--note ...]` / `ttp machines list` / `ttp machines remove <alias>` | the user's machines, shared by all their projects; each charter says which ones a project may use |

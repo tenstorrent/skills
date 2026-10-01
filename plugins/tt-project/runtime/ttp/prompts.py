@@ -11,7 +11,7 @@ from pathlib import Path
 
 from .db import continues_id, load_result
 from .hook import unread_update
-from .project import Project
+from .project import WORKER_MEMORY_CHARS, Project
 
 
 def _read(p: Project, name: str) -> str:
@@ -77,7 +77,7 @@ def worker_system(p: Project) -> str:
     charter = p.charter_path.read_text() if p.charter_path.exists() else "(none)"
     parts.append("# CHARTER (goals and policies; its restrictions are the binding block above)\n" +
                  charter_without_restrictions(charter))
-    mem = p.memory_text(limit_chars=8000)
+    mem = p.memory_text(limit_chars=WORKER_MEMORY_CHARS)
     if mem:
         parts.append("# PROJECT MEMORY\n" + mem)
     return "\n\n".join(x for x in parts if x.strip())

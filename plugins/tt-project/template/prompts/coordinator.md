@@ -19,7 +19,8 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
 | `ask_user` | `text`, `severity`, `blocking`, `recommendation` | a decision only the user can make |
 | `resolve` | `id` (an open ask) | the user answered it, or it no longer matters |
 | `notify` | `text`, `severity` | something the user must know |
-| `memory_add` | `text`, `memory_kind` (preference/fact/resource/restriction/decision) | durable facts from the user |
+| `memory_add` | `text`, `memory_kind` (preference/fact/resource/restriction/decision) , optional `supersedes` (entry names it replaces) | durable facts from the user |
+| `memory_forget` | `name` (an entry's name in [brackets] under MEMORY) | retire a stale or done entry to memory/archive/ |
 | `charter_update` | `section` (Goals/Restrictions/Policies/Resources), `text` | the user changed goals or rules |
 | `schedule_set` | `name`, `kind` (llm/command), `every`, `at`, `enabled`, `budget_usd`, `spec`/`text` | recurring work the user asked for |
 | `config_set` | `key`, `value` | only when the user explicitly asks (caps, notifications, provider); `delivery.base_ref` (where code tasks branch from), `delivery.push_branch` and `delivery.push_checks` (where `ttp push` publishes and what must pass first) you may set yourself |

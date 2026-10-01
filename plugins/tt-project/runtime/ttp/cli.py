@@ -824,8 +824,18 @@ def cmd_prune(a) -> None:
 
 
 def cmd_memory(a) -> None:
+    from .coordinator import memory_budget_check
     p = need(a.name, sys.argv[1:])
-    print(p.add_memory(a.text, kind=a.kind))
+    if not a.text and not a.forget:
+        sys.exit("give the memory's text, or --forget <entry>")
+    if a.text:
+        print(p.add_memory(a.text, kind=a.kind))
+    for name in a.forget or []:
+        try:
+            print(f"retired to {p.forget_memory(name)}")
+        except ValueError as e:
+            sys.exit(str(e))
+    memory_budget_check(p)
 
 
 def cmd_machines(a) -> None:
@@ -1258,10 +1268,12 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--priority", type=int, default=3)
     s.set_defaults(fn=cmd_task)
 
-    s = sub.add_parser("memory", help="add a memory")
+    s = sub.add_parser("memory", help="add a memory, or retire one with --forget")
     s.add_argument("name")
-    s.add_argument("text")
+    s.add_argument("text", nargs="?")
     s.add_argument("--kind", default="fact")
+    s.add_argument("--forget", action="append", metavar="ENTRY",
+                   help="retire an entry (its name in [brackets]) to memory/archive/; repeatable")
     s.set_defaults(fn=cmd_memory)
 
     s = sub.add_parser("machines", help="your machines, shared by all your projects (add/list/remove/push)")

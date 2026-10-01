@@ -20,10 +20,10 @@ from . import machines, push
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, TERMINAL_TASK_STATES, continues_id, dependency_ids, dump_result, host_line,
                  load_result)
-from .project import Project
+from .project import COORDINATOR_MEMORY_CHARS, WORKER_MEMORY_CHARS, Project
 from .runner import stop_runs
 
-ACTION_TYPES = ("reply", "task_add", "task_update", "ask_user", "resolve", "notify", "memory_add",
+ACTION_TYPES = ("reply", "task_add", "task_update", "ask_user", "resolve", "notify", "memory_add", "memory_forget",
                 "charter_update", "schedule_set", "config_set", "resource_pause", "noop")
 
 # Why an ask cannot be decided by the coordinator itself. Anything else is a judgment call.
@@ -45,7 +45,7 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "blocking": {"type": "string", "enum": list(BLOCKING_REASONS)}, "recommendation": {"type": "string"},
             "resources": {"type": "array", "items": {"type": "string"}}, "exclusive": {"type": "boolean"},
             "continues": {"type": "integer"}, "resource": {"type": "string"}, "paused": {"type": "boolean"},
-            "reason": {"type": "string"}},
+            "reason": {"type": "string"}, "supersedes": {"type": "array", "items": {"type": "string"}}},
             "required": ["type"]}},
         "summary": {"type": "string"},
     },
@@ -105,7 +105,7 @@ def system_prompt(p: Project) -> str:
     """Stable across turns so the provider can cache it."""
     role = (p.harness / "prompts" / "coordinator.md").read_text()
     charter = p.charter_path.read_text() if p.charter_path.exists() else "(no charter yet)"
-    memory = p.memory_text() or "(no memories yet)"
+    memory = p.memory_text(COORDINATOR_MEMORY_CHARS) or "(no memories yet)"
     from .prompts import charter_without_restrictions, restrictions_block
     rules = restrictions_block(p)
     if rules:
@@ -178,6 +178,9 @@ def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int]) ->
             lines.append(f"- {name}: paused {(now - float(v.get('since') or now)) / 3600:.1f}h ago by "
                          f"{v.get('by') or 'user'}" + (f": {clip(v['reason'], NOTE_CHARS)}" if v.get("reason") else ""))
     lines += machines.digest_lines(db, paused, now)
+    mem = memory_budget_line(p)
+    if mem:
+        lines.append(mem)
     lines.append("## Open tasks (id | status | tier | priority | age | title | last note)")
     rows = db.q("SELECT * FROM tasks WHERE status NOT IN ('done','failed','cancelled') ORDER BY priority, id LIMIT 60")
     for t in rows:
@@ -461,6 +464,16 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 p.add_memory(a["text"], kind=a.get("memory_kind") or "fact", title=a.get("title"), key=key)
                 if (a.get("memory_kind") or "") == "restriction":
                     _tell_running_workers(db, f"New binding restriction: {a['text'].strip()}", key)
+                old = a.get("supersedes") or []
+                for name in [old] if isinstance(old, str) else old:
+                    try:
+                        p.forget_memory(str(name))
+                    except ValueError as e:
+                        raise ValueError(f"memory added, but `supersedes` failed: {e}") from None
+                memory_budget_check(p)
+            elif t == "memory_forget":
+                p.forget_memory(str(a.get("name") or ""))
+                memory_budget_check(p)
             elif t == "charter_update":
                 section = (a.get("section") or "Notes").strip().title()
                 text = a["text"].strip()
@@ -772,6 +785,38 @@ def task_resources(task: dict) -> set[str]:
         return set()
     return {lb.split(":", 1)[1] for lb in labels if isinstance(lb, str)
             and lb.split(":", 1)[0] in ("resource", "exclusive") and ":" in lb}
+
+
+MEMORY_ALERT_KEY = "memory_pinned_over"   # kv: set once pinned memory alone has outgrown the budget
+
+
+def memory_budget_line(p: Project) -> str:
+    """One digest line once memory no longer fits whole: what each prompt leaves out."""
+    _, coord = p.memory_select(COORDINATOR_MEMORY_CHARS)
+    _, work = p.memory_select(WORKER_MEMORY_CHARS)
+    if work["shown"] >= work["entries"]:
+        return ""
+    return (f"## Memory over budget: {coord['entries']} entries, {coord['chars']} chars; you see "
+            f"{coord['shown']}, workers see {work['shown']} (pinned restrictions/preferences/resources "
+            f"{coord['pinned_chars']} chars, always shown). Retire stale entries with `memory_forget`, "
+            f"or `supersedes` when a new one replaces them")
+
+
+def memory_budget_check(p: Project) -> None:
+    """Tell the coordinator once when pinned memory alone no longer fits the workers' budget; it
+    is shown whole anyway, at the cost of every decision and fact. Re-arms once it fits again."""
+    over = p.memory_select(WORKER_MEMORY_CHARS)[1]
+    flagged = p.db.kv(MEMORY_ALERT_KEY)
+    if over["pinned_over"] and not flagged:
+        p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+               (time.time(), "daemon", "memory_over_budget", "normal",
+                f"Pinned memory ({over['pinned']} restriction/preference/resource entries, "
+                f"{over['pinned_chars']} chars) alone exceeds the workers' {over['limit']}-char memory "
+                f"budget, so they get no decisions or facts. Merge or retire pinned entries "
+                f"(`memory_add` with `supersedes`, or `memory_forget`).", "queued"))
+        p.db.set_kv(MEMORY_ALERT_KEY, True)
+    elif flagged and not over["pinned_over"]:
+        p.db.set_kv(MEMORY_ALERT_KEY, False)
 
 
 def _tell_running_workers(db, text: str, key: str | None = None) -> None:
