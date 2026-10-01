@@ -72,8 +72,8 @@ and preferences you add later become part of the project's charter and memory.
   tasks and reviews of finished work start anyway, running work is never stopped, and the wait
   wakes no coordinator. `ttp status` and the web app show `paced: next start ~HH:MM (...)`.
 - Usage-billed accounts: $100 per 24 hours and $200 per 7 days per project by default. A new run
-  starts only if its budget fits in what is left of both caps. A plan account whose runs stop
-  reporting plan windows falls under these caps too.
+  starts only if its budget fits in what is left of both caps. A plan account whose successful
+  runs stop reporting plan windows falls under these caps too (failed or silent runs do not count).
 - Work backs off in steps as spend rises, pauses at the cap, and tells you how to raise it.
 - A runaway guard pauses a project whose hourly spend jumps far above its own norm.
 - A review runs light when the diff it checks touches no `review.risky_paths` glob and is doc-only

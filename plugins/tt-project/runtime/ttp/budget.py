@@ -449,9 +449,10 @@ def plan_providers(db: DB, now: float | None = None) -> dict[str, float]:
 
 def plan_lapsed(db: DB, provider: str, last_reading: float) -> bool:
     """Whether the provider's paid runs since its last window reading say it is no longer on a plan.
-    A run's spend is recorded just before the windows it reported, so only runs without a reading
-    count."""
-    return db.one("SELECT COUNT(*) n FROM ledger WHERE provider=? AND ts>? AND usd>0",
+    A run's windows are recorded when the daemon processes its end, so only runs that ended after
+    the last reading had none. Only successful runs count: one that failed, was cut off or produced
+    nothing may simply not have got as far as reporting its windows."""
+    return db.one("SELECT COUNT(*) n FROM runs WHERE provider=? AND status='ok' AND ended>? AND cost_usd>0",
                   (provider, last_reading))["n"] >= PLAN_LAPSE_RUNS
 
 

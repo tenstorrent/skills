@@ -3845,12 +3845,16 @@ def test_a_plan_that_stopped_reporting_windows_falls_back_to_the_caps(env):
     now = time.time()
     p.db.x("INSERT INTO snapshots(ts,provider,account,window,utilization,resets_at) VALUES(?,?,?,?,?,?)",
            (now - 3 * 3600, "claude", "a", "seven_day", 40.0, now + 3 * 86400))
-    ledger = "INSERT INTO ledger(ts,provider,account,source,usd) VALUES(?,?,?,?,?)"
-    p.db.x(ledger, (now - 3 * 3600 + 600, "claude", "a", "task:1", 90.0))
+    def ledger(ts, provider, account, source, usd):   # a successful run that reported no windows
+        p.db.x("INSERT INTO ledger(ts,provider,account,source,usd) VALUES(?,?,?,?,?)",
+               (ts, provider, account, source, usd))
+        p.db.x("INSERT INTO runs(role,provider,started,ended,status,cost_usd) VALUES('worker',?,?,?,'ok',?)",
+               (provider, ts - 60, ts, usd))
+    ledger(now - 3 * 3600 + 600, "claude", "a", "task:1", 90.0)
     g = bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db, now), now)
     assert g.regime == "windows", "one run without a reading is not yet a lapsed plan"
     for h in (2, 1):
-        p.db.x(ledger, (now - h * 3600 + 600, "claude", "a", "task:1", 90.0))
+        ledger(now - h * 3600 + 600, "claude", "a", "task:1", 90.0)
     g = bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db, now), now)
     assert g.regime == "caps" and g.level == "red" and not g.allow_new_work, (g.regime, g.level, g.reasons)
     assert g.numbers["spent_24h"] == 270.0, g.numbers
@@ -3858,7 +3862,7 @@ def test_a_plan_that_stopped_reporting_windows_falls_back_to_the_caps(env):
     p.db.x("INSERT INTO snapshots(ts,provider,account,window,utilization,resets_at) VALUES(?,?,?,?,?,?)",
            (now - 600, "claude", "a", "seven_day", 45.0, now + 3 * 86400))
     for m in (5, 1):
-        p.db.x(ledger, (now - m * 60, "claude", "a", "task:1", 1.0))
+        ledger(now - m * 60, "claude", "a", "task:1", 1.0)
     assert bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db, now), now).regime == "windows"
 
 
@@ -7236,3 +7240,27 @@ def test_a_run_with_no_output_and_no_tokens_costs_nothing(env):
                      {"rc": -15, "started": t0, "ended": t0 + 600, "stopped": "timeout"})
         run = p.db.one("SELECT cost_usd FROM runs WHERE id=?", (rid,))
         assert run["cost_usd"] == pytest.approx(cost), (provider, out, run["cost_usd"])
+
+
+def test_failed_or_silent_runs_do_not_say_a_plan_stopped_reporting_windows(env):
+    p = make(env)
+    from ttp import budget as bud
+    now = time.time()
+    p.db.x("INSERT INTO snapshots(ts,provider,account,window,utilization,resets_at) VALUES(?,?,?,?,?,?)",
+           (now - 6 * 3600, "claude", "a", "seven_day", 40.0, now + 3 * 86400))
+    # A night of runs a sleeping laptop cut short: timed out, lost or failed, each booked an estimate.
+    for i, status in enumerate(("timeout", "lost", "failed", "stalled", "timeout")):
+        ts = now - (5 - i) * 3600
+        p.db.x("INSERT INTO ledger(ts,provider,account,source,usd,estimated) VALUES(?,?,?,?,?,1)",
+               (ts, "claude", "a", "coordinator", 2.0))
+        p.db.x("INSERT INTO runs(role,provider,started,ended,status,cost_usd,cost_estimated) "
+               "VALUES('coordinator','claude',?,?,?,2.0,1)", (ts - 60, ts, status))
+    g = bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db, now), now)
+    assert g.regime == "windows", g.reasons
+    assert not any("stopped reporting" in r for r in g.reasons), g.reasons
+    # Successful runs without a reading still do.
+    for m in (30, 20):
+        p.db.x("INSERT INTO runs(role,provider,started,ended,status,cost_usd) VALUES('worker','claude',?,?,'ok',1.0)",
+               (now - m * 60 - 60, now - m * 60))
+    g = bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db, now), now)
+    assert g.regime == "caps" and any("stopped reporting" in r for r in g.reasons), (g.regime, g.reasons)
