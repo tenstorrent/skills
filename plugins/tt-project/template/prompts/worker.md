@@ -51,6 +51,7 @@ Before you finish, write `$TTP_RUN_DIR/result.json`:
  "waiting_for": "only when waiting: the busy resource or event",
  "retry_after_s": 1800,
  "retry_when": "only when waiting: a quick shell check that exits 0 once the wait is over",
+ "wake_tier": "only when waiting: light (the next run only checks) or standard (real work follows)",
  "pr": "URL if you opened or updated one",
  "artifacts": ["paths or URLs"],
  "metrics": {"name": "value"},
@@ -68,6 +69,7 @@ Before you finish, write `$TTP_RUN_DIR/result.json`:
   For a wait with several steps (build, then device run), chain them in one detached driver script
   that writes a final marker, and point `retry_when` at that marker.
   A host reboot wakes waiting tasks at once; add `"survives_reboot": true` if yours does not die with it.
+  The next run is a cheap light wake unless you set `wake_tier`; pick standard only if it will do real work.
 - `blocked` only when access, a credential, funds or a resource you cannot get is missing, or the
   next step cannot be undone and is outside the charter. Say exactly what. Judgment calls are
   yours: make them, and state each one and why in the summary.
@@ -82,6 +84,8 @@ Before you finish, write `$TTP_RUN_DIR/result.json`:
 - No progress possible → stop early with an honest handoff.
 - NEVER poll, sleep-wait, or loop waiting for something. Hand off `waiting`, `blocked` or
   `needs_review`.
+- Never block one tool call longer than about 5 minutes: submit long work detached and hand off
+  `waiting` with a `retry_when` that tells when it is done.
 - Your run ends when you stop. Nothing picks up later unless your hand-off says so. Started a
   long build or job? Leave it running, note how to check on it, and hand off `waiting` with a
   `retry_after_s` that fits it.

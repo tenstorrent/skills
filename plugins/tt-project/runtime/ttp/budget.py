@@ -440,6 +440,20 @@ def clamp_tier(tier: str, gate: Gate) -> str:
     return tier if TIER_ORDER.index(tier) <= TIER_ORDER.index(gate.max_tier) else gate.max_tier
 
 
+def wake_tier(tier: str, prev: dict) -> str | None:
+    """The tier of the run that wakes a task whose last hand-off (`prev`) was `waiting`, or None
+    when the run is no wake. Most wakes only check whether the wait is over, so a hand-off that
+    names what it waits on wakes at light unless it asks for a `wake_tier`; never above the task's
+    own tier."""
+    if not isinstance(prev, dict) or prev.get("status") != "waiting":
+        return None
+    tier = tier if tier in TIER_ORDER else "standard"
+    want = prev.get("wake_tier")
+    if want not in TIER_ORDER:
+        want = "light" if prev.get("retry_when") or prev.get("waiting_for") else tier
+    return min(want, tier, key=TIER_ORDER.index)
+
+
 # Not .txt: CMakeLists.txt and requirements.txt are build and dependency changes.
 DOC_SUFFIXES = (".md", ".markdown", ".rst", ".adoc")
 

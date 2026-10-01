@@ -98,9 +98,10 @@ def _reboot_note(reboot) -> str:
     return out
 
 
-def worker_task(p: Project, task: dict, cwd: str, branch: str | None) -> str:
+def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict | None = None) -> str:
     """The per-task part of a worker's prompt, after worker_system(): the rules for its kind, the
-    task itself, and the restrictions again at the end."""
+    task itself, and the restrictions again at the end. `wake` (the daemon's run note) marks a run
+    that wakes a waiting task, at a tier that may be below the task's own."""
     cfg = p.config()
     kind = task["kind"] or "work"
     history = ""
@@ -110,6 +111,11 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None) -> str:
         if prev.get("woke"):
             history += f"Woken because: {prev['woke']}.\n"
         history += _reboot_note(prev.get("reboot"))
+    run_tier = (wake or {}).get("tier") or task["tier"]
+    if wake and run_tier != task["tier"] and not wake.get("escalated"):
+        history += (f"This run is a {run_tier} wake: check whether the wait is over. If it is and substantial "
+                    f"work remains, hand off `waiting` with `retry_after_s: 0` and `wake_tier: \"{task['tier']}\"` "
+                    f"at once: the task runs again now at its own tier, without costing an attempt.\n")
     old_id = continues_id(task)
     old = p.db.task(old_id) if old_id else None
     if old:
@@ -122,7 +128,8 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None) -> str:
     parts = [
         _read(p, f"kind-{kind}.md"),
         f"# YOUR TASK #{task['id']}: {task['title']}\n"
-        f"kind: {kind} · tier: {task['tier']} · attempt {int(task['attempts'] or 0) + 1} of "
+        f"kind: {kind} · tier: {task['tier']}" + (f" · this run: {run_tier} wake" if wake else "")
+        + f" · attempt {int(task['attempts'] or 0) + 1} of "
         f"{task['max_attempts']} · budget ${task['budget_usd'] or 0:.2f} (spent ${task['spent_usd'] or 0:.2f})\n"
         f"working directory: {cwd}" + (f" · branch: {branch}" if branch else "") + "\n"
         + _resource_line(task)

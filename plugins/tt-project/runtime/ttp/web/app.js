@@ -170,7 +170,7 @@ async function refresh() {
     `<span class="title">${esc(m.text)}</span></div>`).join("") || `<p class="muted">Nothing yet.</p>`}</div>`;
   $("#gates2").innerHTML = gateHtml(st.gates);
   const running = h.working || st.runs.filter((r) => r.status === "running").map((r) => ({ ...r, run: r.id }));
-  $("#running").innerHTML = running.length ? running.map((r) => `<div class="row"><span class="id">run ${r.run}</span><span class="title">${r.task ? `#${r.task} ${esc(r.title || "")}` : esc(r.role)}</span><span class="meta">${esc(r.provider)} ${esc(r.model || "")} ${esc(r.effort || "")} · ${ago(r.started)}${r.cost_usd ? ` · ~${money(r.cost_usd)} so far` : ""}</span>${r.note ? `<div class="meta">${esc(r.note)}</div>` : ""}</div>`).join("") : `<p class="muted">Idle.</p>`;
+  $("#running").innerHTML = running.length ? running.map((r) => `<div class="row"><span class="id">run ${r.run}</span><span class="title">${r.task ? `#${r.task} ${esc(r.title || "")}` : esc(r.role)}</span><span class="meta">${esc(r.provider)} ${esc(r.model || "")} ${esc(r.effort || "")}${r.wake ? ` · ${esc(r.wake)} wake` : ""} · ${ago(r.started)}${r.cost_usd ? ` · ~${money(r.cost_usd)} so far` : ""}</span>${r.note ? `<div class="meta">${esc(r.note)}</div>` : ""}</div>`).join("") : `<p class="muted">Idle.</p>`;
   $("#coord").textContent = (st.coordinator && st.coordinator.summary) || "—";
   const done = st.tasks.filter((t) => ["done", "failed", "cancelled"].includes(t.status)).slice(0, 8);
   $("#recent").innerHTML = done.map(taskRow).join("") || `<p class="muted">Nothing yet.</p>`;

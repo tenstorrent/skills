@@ -902,13 +902,25 @@ class Daemon:
             if n >= int(self.cfg["budget"].get("max_reboot_losses", 3)):
                 new, reason = "blocked", f"lost to a host reboot {n} times; it may be causing them"
         if waiting:
+            # A cheap wake that found real work asks to go on at a higher tier: once per wake, at
+            # once, and not as another wait, so the escalated run cannot escalate again.
+            wake = json.loads(r["note"] or "{}").get("wake") or {}
+            up = result.get("wake_tier")
+            escalate = (wake.get("tier") in bud.TIER_ORDER and not wake.get("escalated")
+                        and str(result.get("retry_after_s")) in ("0", "0.0") and up in bud.TIER_ORDER
+                        and bud.TIER_ORDER.index(up) > bud.TIER_ORDER.index(wake["tier"]))
             try:
-                waits = int(load_result(task["result"]).get("waits") or 0) + 1
+                waits = int(load_result(task["result"]).get("waits") or 0) + (0 if escalate else 1)
             except (TypeError, ValueError):
                 waits = 1
             what = str(result.get("waiting_for") or summary)[:300]
             extra["waits"] = waits
-            if waits > int(self.cfg["budget"].get("max_waits", 24)):
+            if escalate:
+                not_before = time.time()
+                extra["escalated_wake"] = True
+                extra["woke"] = f"the {wake['tier']} wake found work and asked for {up}"
+                reason = f"woke at {wake['tier']} and found work; runs again now at {up}"
+            elif waits > int(self.cfg["budget"].get("max_waits", 24)):
                 new, reason = "blocked", f"still waiting after {waits} tries: {what}"
             elif rebooted and result.get("survives_reboot") is not True and (
                     n := self._reboot_losses(task["id"]) + wakes) >= int(
@@ -932,7 +944,7 @@ class Daemon:
         upd = {"status": new, "attempts": attempts, "result": dump_result(
             {"summary": summary, "status": rstatus or status, **extra,
              **({k: v for k, v in result.items()
-                 if k not in ("summary", "waits", "waiting_since", "woke", "reboot_wakes")}
+                 if k not in ("summary", "waits", "waiting_since", "woke", "reboot_wakes", "escalated_wake")}
                 if isinstance(result, dict) else {})})}
         if reason:
             upd["blocked_reason"] = reason[:500]
@@ -1361,7 +1373,8 @@ class Daemon:
                 continue
             if task["kind"] == "review":
                 task = self._size_review(task)
-            tier = bud.clamp_tier(task["tier"], gate)
+            wake = bud.wake_tier(task["tier"], load_result(task["result"]))
+            tier = bud.clamp_tier(wake or task["tier"], gate)
             # Before _workdir_for, which would make a missing worktree afresh.
             lost = self._resumable(task, provider)
             try:
@@ -1374,12 +1387,14 @@ class Daemon:
             try:
                 system = worker_system(self.p)
                 note = {"spec_sha": spec_digest(task)}
+                if wake:
+                    note["wake"] = {"tier": tier, "escalated": bool(load_result(task["result"]).get("escalated_wake"))}
                 if lost and lost["cwd"] == cwd:
                     # The session holds the task and its own work: a short prompt continues it.
                     prompt = worker_resume(self.p, task, lost)
                     note["resumes"] = {"run": lost["run"], "session": lost["session"]}
                 else:
-                    prompt, lost = worker_task(self.p, task, cwd, branch), None
+                    prompt, lost = worker_task(self.p, task, cwd, branch, wake=note.get("wake")), None
                 db.update_task(task["id"], status="running", branch=branch, blocked_reason=None)
                 self.start_run("worker" if task["kind"] != "review" else "reviewer", prompt, provider, tier, cwd,
                                task=task, budget_usd=max(remaining, 0.5) if task["budget_usd"] else None,

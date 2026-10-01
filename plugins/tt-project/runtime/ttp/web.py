@@ -309,11 +309,12 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
     held = ""
     if running and ready and stops:
         held = f"{ready} ready task(s) not starting: " + "; ".join(stops + ([you] if you else []))
-    working = db.q("SELECT r.id run, r.task, r.role, r.provider, r.model, r.effort, r.started, r.cost_usd, r.dir, t.title "
-                   "FROM runs r "
+    working = db.q("SELECT r.id run, r.task, r.role, r.provider, r.model, r.effort, r.started, r.cost_usd, r.dir, "
+                   "r.note run_note, t.title FROM runs r "
                    "LEFT JOIN tasks t ON t.id=r.task WHERE r.status='running' ORDER BY r.id")
     for w in working:
         w["note"] = last_note(w.pop("dir"))
+        w["wake"] = run_wake(w.pop("run_note"))
     spend = {"spent_24h": round(db.spent_since(now - DAY), 2), "spent_7d": round(db.spent_since(now - WEEK), 2),
              "top_7d": top if top and top["usd"] else None, "in_flight": round(bud.in_flight(db), 2)}
     spend["headline"] = spend_headline(spend, g)
@@ -331,6 +332,15 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         "host": host_line(db.boots(now - DAY)),
         "budget_lines": budget_lines(db, now),
     }
+
+
+def run_wake(note: str | None) -> str | None:
+    """The tier of a run that wakes a waiting task, from its run note; None for any other run."""
+    try:
+        wake = json.loads(note or "{}").get("wake")
+    except (ValueError, AttributeError):
+        return None
+    return str(wake.get("tier")) if isinstance(wake, dict) and wake.get("tier") else None
 
 
 def attention(db: DB, now: float) -> list[dict]:

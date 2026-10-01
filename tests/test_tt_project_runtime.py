@@ -1111,6 +1111,89 @@ def test_waiting_handoff_requeues_without_spending_an_attempt(env, monkeypatch):
     assert json.loads(t["result"])["waits"] == 1
 
 
+def test_a_wake_runs_at_light_or_its_wake_tier_never_above_the_task_and_other_runs_are_unchanged(
+        env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dmod
+    from ttp.db import dump_result
+    d = dmod.Daemon(p.base)
+    started = {}
+    monkeypatch.setattr(d, "start_run", lambda role, prompt, provider, tier, cwd, **k: started.update(
+        {k["task"]["id"]: (tier, k["note"].get("wake"), prompt)}))
+
+    def task(tier, result=None):
+        tid = p.db.add_task(f"t{len(started)}-{tier}-{result}", "s", kind="work", tier=tier, origin="user")
+        if result:
+            p.db.update_task(tid, result=dump_result({"summary": "earlier", **result}))
+        return tid
+
+    waits_for = task("standard", {"status": "waiting", "waiting_for": "a build"})
+    probes = task("deep", {"status": "waiting", "retry_when": "test -e done"})
+    asks_deep = task("standard", {"status": "waiting", "waiting_for": "a build", "wake_tier": "deep"})
+    asks_std = task("deep", {"status": "waiting", "waiting_for": "a build", "wake_tier": "standard"})
+    light_task = task("light", {"status": "waiting", "waiting_for": "a build", "wake_tier": "standard"})
+    says_nothing = task("standard", {"status": "waiting"})
+    never_waited = task("standard")
+    failed_before = task("deep", {"status": "failed", "waiting_for": "a build"})
+    for _ in range(4):   # a few start per tick
+        d.dispatch()
+    assert started[waits_for][:2] == ("light", {"tier": "light", "escalated": False})
+    assert "this run: light wake" in started[waits_for][2] and 'wake_tier: "standard"' in started[waits_for][2]
+    assert started[probes][:2] == ("light", {"tier": "light", "escalated": False})
+    assert started[asks_deep][0] == "standard", "a wake_tier above the task's own tier is capped"
+    assert started[asks_std][0] == "standard"
+    assert started[light_task][0] == "light"
+    assert started[says_nothing][:2] == ("standard", {"tier": "standard", "escalated": False})
+    assert "retry_after_s: 0" not in started[says_nothing][2], "a wake at the task's tier has nothing to escalate"
+    for tid, tier in ((never_waited, "standard"), (failed_before, "deep")):
+        assert started[tid][:2] == (tier, None)
+        assert " wake" not in started[tid][2].split("## Spec")[0]
+
+
+def test_a_light_wake_escalates_once_at_once_and_free(env, monkeypatch):
+    p = make(env)
+    from ttp.daemon import Daemon
+    from ttp.db import dump_result
+    monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps(
+        {"status": "waiting", "summary": "the build is done; the measurements remain", "waiting_for": "nothing",
+         "retry_after_s": 0, "wake_tier": "standard"}))
+    tid = p.db.add_task("measure after the build", "s", kind="work", tier="standard", origin="user")
+    p.db.update_task(tid, result=dump_result({"status": "waiting", "summary": "build started",
+                                              "waiting_for": "the build", "waits": 2}))
+    d = Daemon(p.base)
+
+    def runs():
+        return p.db.q("SELECT status, note FROM runs WHERE task=? AND role='worker' ORDER BY id", (tid,))
+
+    assert _run_until(d, p, lambda: len(runs()) == 2 and p.db.task(tid)["status"] == "queued"
+                      and all(r["status"] != "running" for r in runs()))
+    wakes = [json.loads(r["note"])["wake"] for r in runs()]
+    assert wakes == [{"tier": "light", "escalated": False}, {"tier": "standard", "escalated": True}]
+    t = p.db.task(tid)
+    # The escalated run asked again: that is an ordinary wait now, not a second free run.
+    assert t["attempts"] == 0 and json.loads(t["result"])["waits"] == 3
+    assert t["not_before"] > time.time() + 200
+    assert not json.loads(t["result"]).get("escalated_wake")
+
+
+def test_status_and_the_web_app_show_a_runs_wake_tier(env, tmp_path):
+    p = make(env)
+    from ttp.cli import status_text
+    from ttp.web import health
+    for title, note in (("check the build", {"wake": {"tier": "light", "escalated": False}}),
+                        ("write the docs", {"spec_sha": "x"})):
+        tid = p.db.add_task(title, "s", kind="work", tier="standard", origin="user")
+        p.db.update_task(tid, status="running")
+        p.db.x("INSERT INTO runs(task,role,provider,started,status,dir,note) VALUES(?,?,?,?,?,?,?)",
+               (tid, "worker", "fake", time.time(), "running", str(tmp_path), json.dumps(note)))
+    working = {w["title"]: w for w in health(p, p.db)["working"]}
+    assert working["check the build"]["wake"] == "light" and working["write the docs"]["wake"] is None
+    out = status_text(p)
+    assert [ln for ln in out.splitlines() if "check the build (light wake)" in ln], out
+    assert "write the docs (" not in out, out
+    assert "r.wake" in (RUNTIME / "ttp" / "web" / "app.js").read_text()
+
+
 def test_update_reaches_a_running_worker_once(env, tmp_path):
     p = make(env)
     from ttp import coordinator as coord
