@@ -1,6 +1,6 @@
 {
   "name": "tt-project",
-  "version": "0.2.41",
+  "version": "0.2.42",
   "description": "Long-running, self-driving projects that run locally: a coordinator daemon that plans and delegates, isolated workers, memory, budget guards with headroom for your own work, watchers, and a web app. Works with Claude Code, Codex and Cursor.",
   "skills": "./skills/"
 }
