@@ -93,8 +93,9 @@ def is_doc(path: str) -> bool:
 
 
 def code_paths(repo: Path, tip: str) -> list[str]:
-    """The files this change touches since it left `tip` that are not docs."""
-    diff = _git(repo, "diff", "--name-only", f"{tip}...HEAD")
+    """The files this change touches since it left `tip` that are not docs. --no-renames lists a
+    moved file under both names, so moving code into docs/ still counts as code."""
+    diff = _git(repo, "diff", "--name-only", "--no-renames", f"{tip}...HEAD")
     if diff.returncode != 0:
         return ["(the diff could not be read)"]
     return [f for f in diff.stdout.splitlines() if f.strip() and not is_doc(f)]

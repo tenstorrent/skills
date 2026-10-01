@@ -2705,14 +2705,44 @@ def test_task_branches_start_from_the_working_branch_before_origin_head(env):
     assert worktree.base_ref(p) == default
     p.charter_path.write_text(p.charter_path.read_text() + "\nNever push to main. Each change is made on "
                               "a work branch, then pushed to branch gone/away, then branch `team/work`.\n")
-    assert worktree.base_ref(p) == "team/work", "the charter's existing branch, not main or a missing one"
+    assert worktree.base_ref(p) == "origin/team/work", "the charter's existing branch, not main or a missing one"
     assert worktree.resolve_base(p) == "origin/team/work"
     p.set_config("delivery.push_branch", "origin/push/target")
     assert worktree.base_ref(p) == "origin/push/target"
     p.set_config("delivery.push_branch", "not/there")
-    assert worktree.base_ref(p) == "team/work", "a push branch that does not exist yet is skipped"
+    assert worktree.base_ref(p) == "origin/team/work", "a push branch that does not exist yet is skipped"
+    _git_out(repo, "branch", "local/only")
+    p.set_config("delivery.push_branch", "local/only")
+    assert worktree.base_ref(p) == "local/only", "a branch only this clone has is used by its own name"
     p.set_config("delivery.base_ref", "push/target")
     assert worktree.base_ref(p) == "push/target", "an explicit base_ref always wins"
+
+
+def test_task_branches_start_from_origin_when_the_local_working_branch_is_behind(env, monkeypatch):
+    """A local copy of the push branch that lags origin must not become the base of new tasks."""
+    for var, val in (("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"),
+                     ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t")):
+        monkeypatch.setenv(var, val)
+    p = make(env)
+    from ttp import worktree
+    repo, tmp = env["repo"], env["tmp"]
+    remote, other = tmp / "remote.git", tmp / "other"
+    subprocess.run(["git", "clone", "-q", "--bare", str(repo), str(remote)], check=True)
+    _git_out(repo, "remote", "add", "origin", str(remote))
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/team/work")
+    _git_out(repo, "fetch", "-q", "origin")
+    _git_out(repo, "branch", "team/work", "origin/team/work")
+    stale = _git_out(repo, "rev-parse", "team/work")
+    subprocess.run(["git", "clone", "-q", "-b", "team/work", str(remote), str(other)], check=True)
+    _commit(other, "theirs.txt", "theirs\n")
+    _git_out(other, "push", "-q", "origin", "team/work")
+    tip = _git_out(other, "rev-parse", "HEAD")
+    p.set_config("delivery.base_ref", "")
+    p.set_config("delivery.push_branch", "team/work")
+    tid = p.db.add_task("t", "s", kind="code", tier="light", origin="user")
+    path, branch = worktree.ensure(p, dict(p.db.task(tid)))
+    assert worktree.base_ref(p) == "origin/team/work"
+    assert _git_out(path, "rev-parse", "HEAD") == tip != stale, "the task branched from the stale local tip"
 
 
 def test_a_new_restriction_reaches_workers_already_running(env, tmp_path):
@@ -5840,6 +5870,19 @@ def test_push_without_checks_refuses_code_and_names_the_key_to_set(env, monkeypa
     assert "set delivery.push_checks to the commands that must pass" in err and "config_set" in err
     assert _git_out(origin, "rev-parse", "proj") == before
     assert _git_out(repo, "rev-parse", "HEAD") == head, "a refused push must leave the branch as it was"
+
+
+def test_push_without_checks_counts_code_moved_into_docs_as_code(env, monkeypatch, capsys):
+    p, repo, origin, other = _push_setup(env, monkeypatch, [])
+    _commit(repo, "tool.py", "print(1)\n")
+    _git_out(repo, "push", "-q", "origin", "HEAD:proj")
+    before = _git_out(origin, "rev-parse", "proj")
+    (repo / "docs").mkdir()
+    _git_out(repo, "mv", "tool.py", "docs/tool.py")
+    _git_out(repo, "commit", "-qm", "move tool.py")
+    assert _ttp_push() == 2
+    assert "tool.py" in capsys.readouterr().err
+    assert _git_out(origin, "rev-parse", "proj") == before
 
 
 def test_push_refuses_the_remotes_default_branch(env, monkeypatch, capsys):

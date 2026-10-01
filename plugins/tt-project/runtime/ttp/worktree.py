@@ -59,22 +59,23 @@ def charter_branches(p: Project) -> list[str]:
     return out
 
 
-def _known(p: Project, ref: str) -> bool:
-    return any(_git(p.root, "rev-parse", "--verify", "--quiet", f"{cand}^{{commit}}", check=False)
-               for cand in (ref, f"origin/{ref}"))
+def _has(p: Project, ref: str) -> bool:
+    return bool(_git(p.root, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", check=False))
 
 
 def base_ref(p: Project) -> str:
     """Where code tasks branch from, the first of: `delivery.base_ref` as set; the project's working
-    branch, `delivery.push_branch`, then a branch the charter names (`branch <name>`), each only
-    if it exists here or on origin; the remote's default branch (origin/HEAD); the checked-out
-    branch."""
+    branch, `delivery.push_branch`, then a branch the charter names (`branch <name>`), each as
+    origin/<name> when the remote has it (a local branch of that name may be behind; ensure()
+    fetches first), else the local name; the remote's default branch (origin/HEAD); the
+    checked-out branch."""
     d = p.config().get("delivery") or {}
     if d.get("base_ref"):
         return d["base_ref"]
     for ref in [str(d.get("push_branch") or "").strip(), *charter_branches(p)]:
-        if ref and _known(p, ref):
-            return ref
+        for cand in (f"origin/{ref}", ref) if ref else ():
+            if _has(p, cand):
+                return cand
     head = _git(p.root, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD", check=False)
     return head or _git(p.root, "rev-parse", "--abbrev-ref", "HEAD")
 
