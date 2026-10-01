@@ -26,6 +26,11 @@ For a new run:
    URLs, the recommendation file/commit, install commands, interpreter and resolved package
    locations. Keep that pair for the run. Later runs consult upstream afresh.
 
+Before installing dependencies, inspect operator-provisioned environments and serving images.
+Reuse one only when the supported-version and provenance checks above pass. Do not mix TTNN Python
+packages, shared libraries or build output from different checkouts. If no coherent runtime exists,
+create an isolated environment instead of modifying the repository environment.
+
 Before each local launch, the runner rejects known legacy vLLM and bundled-plugin source
 layouts. Sampling tests run from the source checkout that matches the installed plugin.
 Verify versions and commits against the run record during setup and resume. For an external

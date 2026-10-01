@@ -58,7 +58,9 @@ authorization before explicitly retrying with `AUTODEBUG_SKIP_CHILD_SANDBOX=1`; 
 
 Model bringup serving uses the standalone TT vLLM plugin and resolves its recommended
 upstream vLLM version for each new run. Before each local launch, the runner rejects known
-legacy vLLM and bundled-plugin source layouts. See
+legacy vLLM and bundled-plugin source layouts; the workflow can reuse a qualifying local image
+without mixing runtimes across checkouts. It also distinguishes teardown failures from model
+correctness failures during multi-chip bringup. See
 [serving stack setup](plugins/tt-model-bringup/skills/vllm-integration/references/serving-stack.md).
 
 ## Model bring-up

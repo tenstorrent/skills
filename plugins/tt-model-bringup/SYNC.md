@@ -106,3 +106,10 @@ from this serving requirement; they are not automatic exceptions to its checks.
 
 Only packaged hashes for the six edited skills and two stage prompts change in `sync-source.json`;
 the original import provenance stays intact. No tracker runtime code is vendored.
+
+## Pipeline intervention guidance (0.1.20)
+
+The teardown and serving-environment guidance is adapted from Gemma 4's
+`PIPELINE_INTERVENTIONS.md` at tt-metal commit
+`7a198904b9db59e210ffbcded30988cf06e80a45`. It keeps only general workflow guidance, without
+carrying over experiment-specific fixes, versions or paths.

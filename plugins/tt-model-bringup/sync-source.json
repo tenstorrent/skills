@@ -183,7 +183,7 @@
       "destination": "skills/multichip/SKILL.md",
       "blob": "664b6e6b1383d948226185bfa7ba139b9ff1c9b2",
       "source_sha256": "a7430e0f96204dfcd0b70aa689ee88d8ddf61e37a9260ffdfae6ca799f6e6494",
-      "packaged_sha256": "ebbd90d2e4c82bbfb1fb0222d5b46a29049ec5a448cd65bf84a353e91e0ab25c"
+      "packaged_sha256": "a5a0772e268a11ac921f68c9796f0c9da4c8a6880527629880cd2d0c32a65b82"
     },
     {
       "source": ".agents/skills/multichip/agents/openai.yaml",
