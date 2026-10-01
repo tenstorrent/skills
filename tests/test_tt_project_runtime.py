@@ -406,6 +406,57 @@ def test_screening_dedupes_and_reopens_fixed_issues(env):
     assert screen(p.db, cfg, "log:app", "ERROR: device timed out after 9s on core 1").wake
 
 
+def test_screening_wakes_again_on_repeats_and_after_a_quiet_spell(env):
+    p = make(env)
+    from ttp.screen import screen
+    cfg = p.config()
+    text = "box-a: chip 3 dropped, power-cycle failed"
+    first = screen(p.db, cfg, "watcher:hw", text, rewake_after_s=6 * 3600)
+    assert first.wake
+    # Seen again soon: still the same event, stays quiet.
+    assert not screen(p.db, cfg, "watcher:hw", text, rewake_after_s=6 * 3600).wake
+    # The watcher marks it as a new occurrence: wakes every time.
+    assert screen(p.db, cfg, "watcher:hw", text, repeat=True).reason == "repeated"
+    # Back after more than the window: wakes again, without the window it never does.
+    p.db.x("UPDATE issues SET last_seen=? WHERE id=?", (time.time() - 7 * 3600, first.issue_id))
+    assert not screen(p.db, cfg, "watcher:hw", text).wake
+    p.db.x("UPDATE issues SET last_seen=? WHERE id=?", (time.time() - 7 * 3600, first.issue_id))
+    again = screen(p.db, cfg, "watcher:hw", text, rewake_after_s=6 * 3600)
+    assert again.wake and again.issue_id == first.issue_id and "quiet" in again.reason
+    # Below the wake floor, or ignored by the user: repeats stay quiet.
+    info = screen(p.db, cfg, "watcher:hw", "box-a: all chips up")
+    assert not info.wake and not screen(p.db, cfg, "watcher:hw", "box-a: all chips up", repeat=True).wake
+    p.db.x("UPDATE issues SET status='ignored' WHERE id=?", (first.issue_id,))
+    assert not screen(p.db, cfg, "watcher:hw", text, repeat=True).wake
+
+
+def test_command_watcher_repeats_wake_the_coordinator(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dm
+    out = {"stdout": ""}
+    monkeypatch.setattr(dm.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, out["stdout"], ""))
+    d = dm.Daemon(p.base)
+
+    def wakes():
+        return p.db.one("SELECT COUNT(*) AS n FROM events WHERE kind='observation'")["n"]
+
+    out["stdout"] = json.dumps({"text": "box-a: power-cycle", "severity": "high"})
+    d._run_command_watcher({"name": "hw"}, {"command": "x"})
+    d._run_command_watcher({"name": "hw"}, {"command": "x"})
+    assert wakes() == 1
+    out["stdout"] = json.dumps({"text": "box-a: power-cycle", "severity": "high", "repeat": True})
+    d._run_command_watcher({"name": "hw"}, {"command": "x"})
+    assert wakes() == 2
+    # The default window: the same report a day later wakes again; a payload can turn it off.
+    out["stdout"] = json.dumps({"text": "box-a: power-cycle", "severity": "high"})
+    p.db.x("UPDATE issues SET last_seen=?", (time.time() - 24 * 3600,))
+    d._run_command_watcher({"name": "hw"}, {"command": "x"})
+    assert wakes() == 3
+    p.db.x("UPDATE issues SET last_seen=?", (time.time() - 24 * 3600,))
+    d._run_command_watcher({"name": "hw"}, {"command": "x", "rewake_after_h": None})
+    assert wakes() == 3
+
+
 def test_missed_schedule_runs_once_on_wake(env):
     p = make(env)
     from ttp import schedule as sched

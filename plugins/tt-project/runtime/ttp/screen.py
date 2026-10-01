@@ -61,19 +61,29 @@ class Verdict:
     screen: str = "rules"   # rules | jev | dedupe
 
 
-def screen(db: DB, cfg: dict, source: str, text: str, hint: str | None = None, jev=None) -> Verdict:
-    """Record the observation as an issue and say whether the coordinator should wake for it."""
+def screen(db: DB, cfg: dict, source: str, text: str, hint: str | None = None, jev=None,
+           rewake_after_s: float | None = None, repeat: bool = False) -> Verdict:
+    """Record the observation as an issue and say whether the coordinator should wake for it.
+
+    A known open issue wakes again when `repeat` is set (the watcher says each report is a new
+    event), or when it was last seen more than `rewake_after_s` ago (it came back after a quiet
+    spell). Without either, a known open issue stays quiet."""
     fp = fingerprint(source, text)
     now = time.time()
+    floor = SEVERITY_RANK.get(cfg.get("screen", {}).get("wake_min_severity", "normal"), 1)
     row = db.one("SELECT * FROM issues WHERE fingerprint=?", (fp,))
     if row:
         db.x("UPDATE issues SET last_seen=?, count=count+1 WHERE id=?", (now, row["id"]))
-        # A known issue re-appearing only matters if it was believed fixed.
-        reopened = row["status"] == "fixed"
-        if reopened:
+        if row["status"] == "fixed":
             db.x("UPDATE issues SET status='open' WHERE id=?", (row["id"],))
-        return Verdict(reopened, row["severity"], "regressed after fix" if reopened else "known issue",
-                       fp, row["id"], "dedupe")
+            return Verdict(True, row["severity"], "regressed after fix", fp, row["id"], "dedupe")
+        reason = "known issue"
+        if row["status"] == "open" and SEVERITY_RANK.get(row["severity"], 1) >= floor:
+            if repeat:
+                reason = "repeated"
+            elif rewake_after_s is not None and now - float(row["last_seen"] or 0) > rewake_after_s:
+                reason = f"back after {(now - float(row['last_seen'] or 0)) / 3600:.1f} h quiet"
+        return Verdict(reason != "known issue", row["severity"], reason, fp, row["id"], "dedupe")
 
     severity = hint or rule_severity(text)
     verdict_src, reason = "rules", f"rule severity {severity}"
@@ -102,5 +112,4 @@ def screen(db: DB, cfg: dict, source: str, text: str, hint: str | None = None, j
                     "VALUES(?,?,?,?,1,?,?,?,?)", (fp, source, now, now, title, severity,
                                                    "open" if severity != "info" else "ignored",
                                                    json.dumps({"by": verdict_src, "reason": reason})))
-    floor = SEVERITY_RANK.get(cfg.get("screen", {}).get("wake_min_severity", "normal"), 1)
     return Verdict(SEVERITY_RANK.get(severity, 1) >= floor, severity, reason, fp, issue_id, verdict_src)

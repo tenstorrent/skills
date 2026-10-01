@@ -34,7 +34,7 @@ description: "Improve a tt-project's own harness — its coordinator and worker 
 | Worker contract, per-kind rules | `prompts/worker.md`, `prompts/kind-*.md` |
 | Tiers, caps, debounce, idle wake, resources | `project.json` (defaults: `runtime/ttp/project.py`) |
 | Recurring work | coordinator `schedule_set`, or the web app's Recurring pane |
-| Watchers | `kind: command` schedules; scripts under `watchers/` in the harness |
+| Watchers | `kind: command` schedules; scripts under `watchers/` in the harness. One JSON line per observation: `{"text", "severity", "repeat"}`; `"repeat": true` wakes the coordinator on every new occurrence, otherwise a known one wakes again after `screen.rewake_after_h` quiet |
 | Web app | `runtime/ttp/web/` |
 | Runtime behavior | `runtime/ttp/*.py` (last resort) |
 

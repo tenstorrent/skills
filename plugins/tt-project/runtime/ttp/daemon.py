@@ -1127,18 +1127,25 @@ class Daemon:
         cmd = payload.get("command")
         if not cmd:
             return "no command"
+        hours = payload.get("rewake_after_h", (self.cfg.get("screen") or {}).get("rewake_after_h", 6))
+        try:
+            rewake = float(hours) * 3600 if hours is not None else None
+        except (TypeError, ValueError):
+            rewake = 6 * 3600
         try:
             out = subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=str(self.p.root),
                                  timeout=_watcher_timeout(payload), env={**os.environ, "PATH": service_path()})
         except subprocess.TimeoutExpired:
-            self.observe(f"watcher:{s['name']}", f"watcher command timed out: {cmd}", "normal")
+            self.observe(f"watcher:{s['name']}", f"watcher command timed out: {cmd}", "normal",
+                         rewake_after_s=rewake)
             return "timeout"
         text = (out.stdout or "").strip()
         if out.returncode not in (0, 1) and not text:
             text = f"watcher command failed rc={out.returncode}: {(out.stderr or '')[-500:]}"
         n = 0
         for obs in _observations(text):
-            self.observe(f"watcher:{s['name']}", obs.get("text", ""), obs.get("severity"))
+            self.observe(f"watcher:{s['name']}", obs.get("text", ""), obs.get("severity"),
+                         rewake_after_s=rewake, repeat=obs.get("repeat") is True)
             n += 1
         return f"ok ({n} observations)"
 
@@ -1176,15 +1183,17 @@ class Daemon:
                               "(COALESCE(tasks.origin,'')='schedule' AND COALESCE(tasks.labels,'')=?)",
                               (since, json.dumps([schedule]))))
 
-    def observe(self, source: str, text: str, hint: str | None = None) -> None:
+    def observe(self, source: str, text: str, hint: str | None = None, rewake_after_s: float | None = None,
+                repeat: bool = False) -> None:
         if not text.strip():
             return
+        again = {"rewake_after_s": rewake_after_s, "repeat": repeat}
         try:
-            v = scr.screen(self.p.db, self.cfg, source, text, hint, jev=self.jev)
+            v = scr.screen(self.p.db, self.cfg, source, text, hint, jev=self.jev, **again)
         except JevOutOfFunds:
             self.alert("jev-funds", "The Jev account is out of credits. Screening falls back to rules "
                        "(more model calls, same coverage). Top up the Jev account to restore the savings.", "high")
-            v = scr.screen(self.p.db, self.cfg, source, text, hint, jev=None)
+            v = scr.screen(self.p.db, self.cfg, source, text, hint, jev=None, **again)
         if v.wake:
             self.p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
                         (time.time(), source, "observation", v.fingerprint, v.severity, text[:4000], "queued"))
