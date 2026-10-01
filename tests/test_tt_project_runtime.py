@@ -2911,6 +2911,13 @@ def test_a_macos_restart_uses_the_launchd_agent_and_falls_back_when_it_is_not_lo
     assert bool(spawned) == bool(kickstart_rc), "a loaded agent restarts itself; an unloaded one is started by hand"
 
 
+def _short_sock_path(name):
+    """A unix socket path short enough for macOS (about 104 bytes), where tmp_path is long."""
+    import shutil, tempfile
+    d = tempfile.mkdtemp(prefix="ttp", dir="/tmp" if os.path.isdir("/tmp") else None)
+    return os.path.join(d, name), lambda: shutil.rmtree(d, ignore_errors=True)
+
+
 def test_systemd_restarts_a_stuck_daemon_through_its_watchdog(env, monkeypatch):
     import socket
     p = make(env)
@@ -2918,7 +2925,7 @@ def test_systemd_restarts_a_stuck_daemon_through_its_watchdog(env, monkeypatch):
     unit = service._unit_text(p)
     assert f"WatchdogSec={dm.WATCHDOG_S}\n" in unit and "NotifyAccess=main" in unit and "Restart=always" in unit
     assert dm.WATCHDOG_S > dm.HEARTBEAT_STALE_S
-    addr = str(env["tmp"] / "notify.sock")
+    addr, cleanup = _short_sock_path("notify.sock")
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     sock.bind(addr)
     sock.settimeout(5)
@@ -2939,6 +2946,7 @@ def test_systemd_restarts_a_stuck_daemon_through_its_watchdog(env, monkeypatch):
         assert [sock.recv(64), sock.recv(64)] == [b"WATCHDOG=1"] * 2, "each completed tick pings systemd"
     finally:
         sock.close()
+        cleanup()
     assert ticks == [None, None], "runs and their tools would inherit systemd's socket"
     assert not dm.sd_notify("WATCHDOG=1", None)
 
@@ -7303,7 +7311,7 @@ def test_a_long_tick_tells_both_watchdogs_it_still_moves(env, monkeypatch):
     import socket
     p = make(env)
     from ttp import daemon as dm, watchdog
-    addr = str(env["tmp"] / "notify2.sock")
+    addr, cleanup = _short_sock_path("notify2.sock")
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     sock.bind(addr)
     sock.settimeout(0.2)
@@ -7330,6 +7338,7 @@ def test_a_long_tick_tells_both_watchdogs_it_still_moves(env, monkeypatch):
                 break
     finally:
         sock.close()
+        cleanup()
     assert len(steps) == 17 and pings == [b"WATCHDOG=1"] * 15, (steps, pings)
     # Before its first completed tick the heartbeat is not written (`ttp restart` reads it as that
     # tick); the start marker carries the progress, which `ttp.watchdog` counts.
