@@ -7228,6 +7228,10 @@ def test_budget_line_says_virtual_on_a_plan_and_actual_when_billed_by_use(env):
     assert budget_line(p.db, now, "fake", caps).endswith("24h $0.17 actual")
     p.db.set_kv("gates", {"fake": plan})
     assert health(p, p.db, now=now)["spend"]["headline"] == budget_line(p.db, now, "fake", plan)
+    # Spend still running is shown in the Budget tab, not in the header pill.
+    js = (RUNTIME / "ttp" / "web" / "app.js").read_text()
+    pill = next(ln for ln in js.splitlines() if '$("#spend").textContent' in ln)
+    assert "in_flight" not in pill and "h.spend.in_flight" in js, pill
 
 
 def test_the_web_page_explains_an_unreachable_daemon_without_setup_details(env):

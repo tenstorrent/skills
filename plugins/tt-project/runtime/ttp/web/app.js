@@ -154,7 +154,8 @@ async function refresh() {
   }
   $("#why").innerHTML = h.why_idle ? `<b>Idle:</b> ${esc(h.why_idle)}` : `${h.running} run${h.running === 1 ? "" : "s"} working.` +
     (h.held ? ` <b>Held:</b> ${esc(h.held)}` : "");
-  $("#top").textContent = h.spend.top_7d ? `Top spender, 7 days: ${h.spend.top_7d.source} ${money(h.spend.top_7d.usd)}` : "";
+  $("#top").textContent = [h.spend.in_flight ? `~${money(h.spend.in_flight)} so far in running work` : "",
+    h.spend.top_7d ? `Top spender, 7 days: ${h.spend.top_7d.source} ${money(h.spend.top_7d.usd)}` : ""].filter(Boolean).join(" · ");
   $("#chealth").innerHTML = healthHtml(h);
   $("#chealth").querySelectorAll("[data-resume-resource]").forEach((b) => b.onclick = async () => {
     await api("/api/pause", { resource: b.dataset.resumeResource, paused: false }); refresh(); });
