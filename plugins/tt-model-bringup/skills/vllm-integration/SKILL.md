@@ -87,7 +87,11 @@ Keep contract version separate from async capability. Enable
 `supports_async_decode=True` only after token feedback, position advance,
 page-table-only updates, and split readback pass. The async read method must
 return `(host_output, read_events)`. Readback and host formatting do not sample
-or change decode state. Version 1 also supports models without async capability;
+or change decode state. A later submission must not overwrite an earlier result
+before its device-to-host copy finishes. Keep host results and returned views
+unchanged until the plugin finishes using them, not just until host formatting
+returns. Test this with overlapping submissions, not only sequential reads.
+Version 1 also supports models without async capability;
 the plugin sends full input reloads for them. Record that limit instead of
 advertising unsupported overlap.
 

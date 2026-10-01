@@ -61,7 +61,7 @@ starts — not only under a test import.
 
 For `decode_input_update_contract = 1`, inspect all four commands from caller to model:
 
-- `reload_inputs` copies all forward inputs, including page tables.
+- `reload_inputs` copies token, position, and RoPE inputs, and page tables, not sampling state.
 - `reload_page_table` copies only page tables and preserves token, position, and RoPE state.
 - `reload_sampling_params` uploads sampling settings, including seeds.
 - `reset_sampling_state` rebuilds penalty and RNG state. It requires a full input reload.
@@ -76,6 +76,10 @@ full reloads and clear rejection of unsupported resident commands instead.
 Contract version does not imply `supports_async_decode`. Async support needs split readback
 returning `(host_output, read_events)`, device token feedback, one position advance per decode,
 and independent page-table refresh. Readback must not sample or change state.
+Keep each submission's output valid until its device-to-host copy completes.
+Keep host results and returned views unchanged until the plugin finishes using them,
+not just until host formatting returns. A later submission must not overwrite an
+earlier result before its copy. Check overlapping submissions, not only sequential reads.
 
 Check `slot_remap[i] = j` before slot state is read. Every slot-bound subsystem consumes it once,
 including a dormant sampler during host sampling. A full input reload is not a remap. New slot

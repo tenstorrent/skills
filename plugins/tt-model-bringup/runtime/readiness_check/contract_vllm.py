@@ -40,6 +40,12 @@ the split submit/read/process sequence:
    each TTNN event before processing the host output.
 3. ``process_decode_output_host(...)`` performs host formatting only.
 
+Keep each submission's output valid until its device-to-host copy completes.
+A later submission must not overwrite it before that copy. Use ordered device
+commands or separate buffers. Returned host tensors and their views must keep
+valid, unchanged storage until the plugin finishes using them, not just until
+``process_decode_output_host`` returns.
+
 Async support also requires persistent token feedback, one device position
 advance per decode, and page-table-only refresh. Readback must not sample or
 advance state. Contract version 1 does not itself enable async support.
@@ -159,6 +165,9 @@ class VllmGeneratorAdapter(Protocol):
         Warmup/compile prefill path for serving.
 
         This should exercise the same serving execution path used at runtime.
+        Delegate to generator-owned preparation. The generator coordinates all
+        components before any trace capture. Callers provide the supported
+        configuration; components own their internal variants and test inputs.
         """
 
     def warmup_model_decode(
@@ -175,9 +184,14 @@ class VllmGeneratorAdapter(Protocol):
         Warmup/compile decode path for serving.
 
         This should exercise traced decode and the serving sampling path.
-        Direct warmup calls send all four commands. Use full input reloads and
-        upload parameters for sampled cases. Keep reset_sampling_state false
-        when no request history is supplied, or provide valid dummy history.
+        Use the same generator-owned preparation as standalone generation.
+        The sampler prepares its own variants, buffers, and synthetic history.
+        Direct warmup calls send all four commands. A full-input, parameter-only
+        call can keep reset_sampling_state false if temporary sampling state
+        is already valid. If preparation uses a history-reset path, supply valid
+        synthetic history and full inputs. Prepare history setup before capture
+        too if it compiles programs or allocates persistent storage. Restore
+        request, KV-cache, and RNG state changed by warmup.
         """
 
     def prefill_forward(
@@ -235,7 +249,8 @@ class VllmGeneratorAdapter(Protocol):
 
         Execute or forward all four commands without model-side heuristics:
 
-        - reload_inputs copies every forward input, including page tables.
+        - reload_inputs copies token, position, and RoPE inputs, and page tables.
+          It does not upload sampling settings or reset sampling state.
         - reload_page_table copies only page tables and preserves device token,
           position, and RoPE state. The two reload flags cannot both be true.
         - reload_sampling_params uploads sampling settings, including seeds.
@@ -265,6 +280,9 @@ class VllmGeneratorAdapter(Protocol):
         reads and returns ``(host_output, read_events)`` for that submission.
         The plugin waits for the TTNN events before host processing. Do not
         sample, reload inputs, or advance positions or RNG state during readback.
+        Preserve this submission's device output until its copy completes.
+        Keep host output unchanged until the plugin finishes using all returned
+        tensors and views, even if another decode or readback starts.
 
         Required for async split decode (and for sync decode when ``decode_forward`` returns
         device tensors instead of host tensors).
@@ -276,6 +294,10 @@ class VllmGeneratorAdapter(Protocol):
 
         This stage should not submit new device work; it is the host formatting
         boundary after ``read_decode_output``.
+        Return tensors backed by per-submission storage, or keep shared backing
+        storage unchanged until all returned tensors and views are consumed.
+        Copy the result before reusing a shared host buffer if needed. Method
+        return alone does not mean that the plugin has consumed the result.
 
         Required for async split decode (and for sync decode when ``decode_forward`` returns
         device tensors instead of host tensors).

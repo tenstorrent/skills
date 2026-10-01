@@ -85,7 +85,7 @@
       "destination": "prompts/model_bringup_multigoal/09-vllm.txt",
       "blob": "fc930a5472158d07221c2c5440786a7c5aed9ed2",
       "source_sha256": "65e532c7e54a6e1bd348575f4471fa0708990fe93e91ef06bbfa9695c60ca727",
-      "packaged_sha256": "9ab26793f709aad9a4f8b1bacf7ffa3bce1eebf91d27e3153a705e193320ed54"
+      "packaged_sha256": "a79a7a8c37f91acb4fec3b8a7353d292c5c6f401a0223fc238a7ea15b48c664f"
     },
     {
       "source": ".agents/prompts/model_bringup_multigoal/10-optimized-vllm.check.sh",
@@ -225,7 +225,7 @@
       "destination": "skills/stage-review/SKILL.md",
       "blob": "7c89b9d281aa1a853a273d3ff4b1c16ad8ccac0d",
       "source_sha256": "b84c344e6a2c0130569dc7e4147ad748d44aa04afa11f181b0711d00afbe3466",
-      "packaged_sha256": "46d2bd11906a4680ec402515cad2bfffbd2b52d484601a6ecbc006340febfd19"
+      "packaged_sha256": "bd261ca5e80a99c8d052d6eb3d2141f6079b8bb145105c290cf2d38ec762b043"
     },
     {
       "source": ".agents/skills/stage-review/agents/openai.yaml",
@@ -253,7 +253,7 @@
       "destination": "skills/tt-enable-tracing/SKILL.md",
       "blob": "379f135ff209af802207532f5ad1dc1a88a70627",
       "source_sha256": "2b708c499a67a0fccd6618d6f0c2956f532605b5643c6d70e18a5c70f5bbb1da",
-      "packaged_sha256": "3adf49415eb36847f800ad0aed63378a91487a93e373a59de7c89d86b749e219"
+      "packaged_sha256": "1adbecca404490dceb5937d6c27f5f83fd904a8589eface3ef8964f84eb5763f"
     },
     {
       "source": ".agents/skills/tt-enable-tracing/advanced_perf_optimizations.md",
@@ -274,7 +274,7 @@
       "destination": "skills/vllm-integration/SKILL.md",
       "blob": "05d9e19f7cfbb596d209c504cc49e063b9361da1",
       "source_sha256": "a23a516ab0e8afc3a5dd6ddd72a42781997fb454872139e70605ecbd234e114c",
-      "packaged_sha256": "95ea5c9343a63c7ca8849b9123615756f1d0f060ffee1a53fa662a148fa743b0"
+      "packaged_sha256": "336a4b1f2afb34fb09079aac82a44a8f41c7c5be8cef34c9b693ffe078e30f5e"
     },
     {
       "source": ".agents/skills/vllm-integration/agents/openai.yaml",
@@ -323,7 +323,7 @@
       "destination": "runtime/readiness_check/contract_vllm.py",
       "blob": "17532121d80665f4e761c0accf1804b47a9e24a0",
       "source_sha256": "1cad43e6e36705297dbfa5416b38cf4ee555a564a2463066f1676ffc5ac8a5a7",
-      "packaged_sha256": "b751e34495833208388f2d18d942af5c4ba7c1e2f45a7003c3aede2ab043f8db"
+      "packaged_sha256": "d26bfa90ae96322d26b1f49c616b722f67da9df94fe8f25c43959740ee044e2f"
     },
     {
       "source": "models/common/readiness_check/generate.py",

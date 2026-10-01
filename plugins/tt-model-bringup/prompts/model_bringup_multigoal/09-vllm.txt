@@ -1,6 +1,6 @@
 /goal Use $vllm-integration and $tt-device-usage for HF_MODEL.
 
-As the user, I explicitly authorize you to use subagents when a selected skill requests or recommends them.
+Subagents are authorized when a selected skill requests or recommends them.
 
 Build models/autoports/<model>/tt/generator_vllm.py and TT plugin registration from the completed datatype-sweep stage.
 
@@ -8,7 +8,7 @@ Goal completion requirements:
 - models/autoports/<model>/tt/generator_vllm.py exists and delegates to tt/generator.py low-level methods whenever possible.
 - Declare `decode_input_update_contract = 1` after the generator implements all four commands. Follow the reload reference in $vllm-integration. Reject `reset_batch` and model-side reload heuristics.
 - Reuse full-model split sampling. Do not add adapter sampling, host argmax, full-logits readback, generic top-k greedy fallback, or a host token-feedback loop.
-- The vLLM path uses the selected precision config, including weight groups, activation/CCL dtype, KV-cache dtype, compute fidelities, and layer exceptions.
+- Serving uses the selected weight-group, activation/CCL/KV-cache dtypes, compute fidelities, and layer exceptions.
 - Serving uses tenstorrent/vllm-tt-plugin and the upstream vLLM version recommended by its pinned installation instructions. Record both sources and verify registration resolves to this autoport adapter.
 - vLLM owns the serving cache; the adapter passes it through without hidden standalone-cache assumptions.
 - Served `max_model_len` matches doc/context_contract.json. Reduce advertised capability only for a hard physical limit, with evidence and the largest feasible value.
@@ -17,8 +17,8 @@ Goal completion requirements:
 - run_vllm_server succeeds with the final sampling profile defined by $vllm-integration.
 - Sampling tests, qualitative outputs, primary single-user benchmark artifacts, and CI serving-burst benchmark artifacts exist under readiness_vllm/.
 - Enable `supports_async_decode=True` only after the async checks in the reload reference pass with decode tracing. Otherwise keep it false and report the limit. Version 1 still applies.
-- Test full reloads and each supported resident mode; unsupported commands must fail. Cover stale host inputs, mode/trace transitions, seeds including `None`, host-sampled remaps, slot reuse, and partial prefill beside live requests.
-- The qualitative outputs are read and judged for coherence, topic, repetition, gibberish, wrong-language drift, and request contamination.
+- Pass the reload reference's focused checks for all supported modes. Reject unsupported resident commands. Include stale inputs, seeds, remaps, slot reuse, and partial prefill.
+- Judge qualitative outputs for coherence, topic, repetition, gibberish, wrong-language drift, and request contamination.
 - Record server command, TT config, max model length, max-num-seqs, sampling profile, workload shape, raw benchmark path, TTFT/TPOT/ITL P50/P99, throughput, and TPOT-derived t/s/u.
 - Record CI serving-burst config and metrics from `vllm_ci_serving_benchmark.json`. Burst admission and chunked prefill affect TPOT; keep these metrics secondary.
 - Serving performance is compared against full-model teacher-forcing only as a lower bound, with no avoidable vLLM-specific decode overhead left in the measured path.

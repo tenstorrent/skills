@@ -94,6 +94,15 @@ Warmup must cover the whole generator, not only the trace about to be captured. 
 
 The generator owns this ordering for standalone and serving entrypoints, during explicit setup or coordinated first use; do not depend solely on vLLM warmup callbacks. Repeated setup calls should reuse prepared state. Restore request/KV state and sampling RNG state modified by warmup; a late decode compile pass with mock inputs must not overwrite a real request's prefilled cache.
 
+Keep variant knowledge inside the component that owns the execution path. Callers
+provide the supported configuration, such as batch/context limits and serving
+modes. The model and sampler each prepare their own internal variants, buffers,
+and synthetic inputs. The generator coordinates this preparation across all
+components before it permits any capture. A component must not capture early
+while another component still needs to compile or allocate persistent storage.
+For sampling history and reset commands, follow the
+[warmup guidance](../vllm-integration/references/decode-reload-contract.md#warmup).
+
 - Warm with the same shapes, dtypes, layouts, memory configs, and mode as capture; the warm call must drive the identical op sequence and code path so every op variant is compiled.
 - The signature can include arguments you would not expect. For example, the integer `begins`/`ends`/`step` passed to `ttnn.slice` are compile-time constants baked into the program hash, so slicing at a different offset, length, or start-tile alignment is a different program that needs its own warm-up. Tensor-valued arguments can avoid this only where the op supports them. When in doubt, warm with the same argument *values*, not just the same tensor shapes.
 - Warm state-update ops too. Autoregressive helpers such as `ttnn.plus_one`, page/position tensor updates, sampler trace setup, and persistent-output buffer allocation are easy to forget because they are not "the model", but they still compile programs and allocate resources.
@@ -129,8 +138,9 @@ For free-running resident decode, use trace replay plus the required output read
 Advance position inside the decode trace, for example with `ttnn.plus_one`, and
 use `tt_out_tok` for device token feedback. Do not rebuild these inputs from stale
 host values. Execute `reload_inputs` and `reload_page_table` exactly as commanded.
-A full reload copies all forward inputs; a page-table-only reload preserves token,
-position, and RoPE state. Do not add model-side change detection. Host sampling
+A full reload copies token, position, and RoPE inputs, and page tables. Sampling
+uses separate commands. A page-table-only reload preserves token, position, and
+RoPE state. Do not add model-side change detection. Host sampling
 and teacher-forced token replacement require full input reloads each step.
 
 ## Canonical Split Sampling
@@ -159,7 +169,10 @@ Do not collect Tracy, `tt-perf-report`, or `TT_METAL_DEVICE_PROFILER` metrics fr
 Keep async readback separate from scheduler overlap. Version 1 does not certify
 async support. For `supports_async_decode=True`, prove device token feedback,
 one position advance per decode, independent page-table copies, and split readback
-that returns `(host_output, read_events)`. The plugin completes pending work before
+that returns `(host_output, read_events)`. Preserve each submission's output until
+its device-to-host copy finishes, even if another decode has started. Keep host
+results and returned views unchanged until the plugin finishes using them, not
+just until host formatting returns. The plugin completes pending work before
 it commands a full reload. Steady decode may use device state while host tokens
 lag. Do not infer input authority from tensor equality, trace mode, or prior calls.
 Carry sampling commands from forward to a separate sampling call without applying

@@ -26,7 +26,7 @@ flag `decode_layout_changed` is not an adapter argument.
 
 | Command | Model action |
 | --- | --- |
-| `reload_inputs` | Copy all forward inputs, including tokens, positions, RoPE inputs, and every page table. |
+| `reload_inputs` | Copy token, position, and RoPE inputs, and every page table. Sampling settings and history use the separate commands below. |
 | `reload_page_table` | Copy only page-table inputs. Keep device token, position, and RoPE state. |
 | `reload_sampling_params` | Upload sampling settings, including temperature, top-k/top-p, penalty settings, seeds, and logprob settings. |
 | `reset_sampling_state` | Rebuild penalty history and random-number state for the current requests. |
@@ -109,10 +109,29 @@ after an initial full reload. It must still reload on a request or trace
 transition and send a page-table-only command when allocation changes.
 
 For device sampling, initialize parameters and state at a new request, then
-preserve them on steady steps. Warmup is different: it has no real request
-history. Use full input reloads and parameter uploads for each sampled warmup
-case, with `reset_sampling_state=False` when no history is supplied. If a warmup
-case needs a reset, supply valid dummy history for that case.
+preserve them on steady steps.
+
+### Warmup
+
+Follow the [generator-owned warmup rule](../../tt-enable-tracing/SKILL.md#program-cache-warmup).
+Callers provide the supported service configuration. Each component prepares
+its own internal execution variants and test inputs. The generator coordinates
+all components before capture starts. Do not make vLLM or a demo enumerate the
+sampler's internal variants.
+
+Warmup does not need real request history. A sampled warmup call can use full
+input reloads and parameter uploads with `reset_sampling_state=False` if the
+sampler already has valid temporary state. False means keep that state; it does
+not initialize missing history or random-number buffers. If a path needs
+history, the component supplies valid synthetic prompt/output history. If it
+needs to rebuild that history, it requests a reset with full inputs. This is
+part of component preparation, not work for the external caller.
+
+Prepare history setup and state-update paths too if they compile programs or
+allocate persistent storage. Do not skip them just because a parameter sweep
+uses `reset_sampling_state=False`. Cover supported penalty and logprob paths,
+then restore the request, KV-cache, and random-number state changed by warmup.
+Test the first real seeded request after warmup and repeated setup calls.
 
 ## Sampling and slot state
 
@@ -160,6 +179,13 @@ all of these work:
 4. Decode advances persistent position and RoPE state exactly once per token.
 5. A page-table-only reload leaves token and position state intact.
 6. Host processing only formats completed output. It does not change model state.
+7. Each submission keeps its output valid until its device-to-host copy finishes.
+   A later decode or sampling step must not overwrite that output before the
+   copy. Use ordered device commands or separate buffers as needed.
+8. Returned host tensors and their views keep valid, unchanged storage until
+   the plugin finishes using them. Returning from `process_decode_output_host`
+   does not end that lifetime. Use per-submission storage, or copy the result
+   before reusing a shared host buffer.
 
 A version-1 adapter can leave async support false. The plugin then requests full
 inputs on every decode and disables async scheduling for that model. Do not
@@ -183,6 +209,12 @@ and page-table-only cases below are required when the adapter supports them.
   or batch trace.
 - Steady device decode: pass stale host tokens and positions. Verify resident
   token feedback, one position advance, and one seed advance per step.
+- Deferred readback: submit the next step before host processing of the previous
+  result. Verify that each result and its completion events refer to the correct
+  submission, with no overwrite or early buffer release. Compare with a
+  non-overlapped run and verify that submission does not wait for host readback.
+  Keep the formatted result from one step, complete another readback, and verify
+  that the first result and its returned views have not changed.
 - Page-table-only reload: grow allocation across used page boundaries. Verify
   only page-table buffers change. Also test an unchanged table with no copies.
 - Sampling updates: test parameter-only upload, state reset, seeded requests,
