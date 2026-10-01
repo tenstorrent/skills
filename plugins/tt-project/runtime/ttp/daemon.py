@@ -225,6 +225,7 @@ class Daemon:
         self.run_schedules()
         self.poll_slack()
         self.check_resource_trouble()
+        self.retry_rejected()
         self.maybe_coordinate()
         self.probe_waiting()
         self.dispatch()
@@ -1070,6 +1071,24 @@ class Daemon:
                         (time.time(), source, "observation", v.fingerprint, v.severity, text[:4000], "queued"))
 
     # coordinator ------------------------------------------------------------------------------------
+    def retry_rejected(self) -> None:
+        """Wake the coordinator once a rejected action's blocking condition clears (the task cap's
+        next free slot), so work a turn could not start does not wait for an idle wake."""
+        db = self.p.db
+        wake = db.kv(coord.RETRY_WAKE_KEY) or {}
+        if not wake.get("at") or float(wake["at"]) > time.time():
+            return
+        later = coord.next_task_slot(db, int(self.cfg["coordinator"].get("max_new_tasks_per_day", 40)))
+        with db.tx():
+            if later is not None:   # the slot went to other work meanwhile: wait for the next one
+                db.set_kv(coord.RETRY_WAKE_KEY, {**wake, "at": later})
+                return
+            db.x("DELETE FROM kv WHERE key=?", (coord.RETRY_WAKE_KEY,))
+            db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                 (time.time(), "daemon", "retry_wake", "normal",
+                  f"A slot is free for an action an earlier turn could not do ({wake.get('why', '')[:600]}). "
+                  f"Do it now if it is still needed.", "queued"))
+
     def maybe_coordinate(self) -> None:
         db, c = self.p.db, self.cfg["coordinator"]
         if db.one("SELECT id FROM runs WHERE role='coordinator' AND status='running'"):
@@ -1173,9 +1192,7 @@ class Daemon:
         if db.one("SELECT id FROM tasks WHERE status='queued'") or \
                 db.one("SELECT id FROM messages WHERE kind='ask' AND handled=0"):
             return False
-        made = db.one("SELECT COUNT(*) n FROM tasks WHERE origin='coordinator' AND created>?",
-                      (time.time() - 86400,))["n"]
-        if made >= int(c.get("max_new_tasks_per_day", 40)):
+        if coord.next_task_slot(db, int(c.get("max_new_tasks_per_day", 40))) is not None:
             return False
         base = float(c.get("starve_wake_s", 300))
         newest = db.one("SELECT COALESCE(MAX(id),0) n FROM tasks")["n"]

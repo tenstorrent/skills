@@ -79,6 +79,9 @@ USER_SETTABLE = {
 }
 
 REJECTED_KEY = "rejected_actions"   # kv: the last turn's rejected actions, shown in the next digest
+# kv: {"at": ts, "why": text}: a rejected action whose blocking condition clears at a known time.
+# The daemon wakes the coordinator then, so the turn's undone work does not wait for an idle wake.
+RETRY_WAKE_KEY = "rejected_retry_wake"
 RECENT_OUT = 5                       # outbound messages the digest repeats, so turns do not resend them
 # Digest row lengths. Background rows are cut; new events, asks and open-task notes carry decisions.
 NOTE_CHARS = 140
@@ -253,6 +256,29 @@ def _norm_severity(s: str | None) -> str:
 NEEDS_USER = {"budget.daily_usd", "budget.weekly_usd", "budget.reserve_pct"}
 
 
+def tasks_made(db, since: float) -> list[float]:
+    """Creation times, oldest first, of the tasks that count toward max_new_tasks_per_day.
+    Reviews do not count: they check work already done and are what lets it be delivered."""
+    return [r["created"] for r in db.q("SELECT created FROM tasks WHERE origin='coordinator' AND kind!='review' "
+                                       "AND created>? ORDER BY created", (since,))]
+
+
+def next_task_slot(db, cap: int, now: float | None = None) -> float | None:
+    """When the rolling 24 h task cap next allows a new task, or None if it allows one now."""
+    now = time.time() if now is None else now
+    made = tasks_made(db, now - 86400)
+    if len(made) < cap:
+        return None
+    # The cap allows a task again once enough of the oldest ones leave the window.
+    return made[len(made) - cap] + 86400 if cap > 0 else None
+
+
+def _clock(ts: float) -> str:
+    """A local time: today's as HH:MM, another day's with its date."""
+    same_day = time.strftime("%Y-%m-%d", time.localtime(ts)) == time.strftime("%Y-%m-%d")
+    return time.strftime("%H:%M" if same_day else "%Y-%m-%d %H:%M", time.localtime(ts))
+
+
 def apply(p: Project, actions: list[dict], default_chat: str | None = None, user_turn: bool = False,
           turn: int | None = None) -> list[str]:
     """Apply validated actions. Returns human-readable notes about rejected ones, fed back next turn.
@@ -262,6 +288,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
     text sent again by a later turn is still written."""
     db, problems = p.db, []
     cfg = p.config()
+    replies: list[int] = []
     # config_set goes first so a cap raised in this turn counts for this turn's task_add actions.
     # The index stays the original one so replay keys do not change.
     order = sorted(enumerate(actions), key=lambda ia: (ia[1] or {}).get("type") != "config_set")
@@ -271,8 +298,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
         try:
             if t == "reply":
                 chat = a.get("chat") or default_chat
-                db.post("out", a["text"], chat=None if chat in (None, "all") else chat, kind="reply",
-                        severity=_norm_severity(a.get("severity") or "normal"))
+                replies.append(db.post("out", a["text"], chat=None if chat in (None, "all") else chat, kind="reply",
+                                       severity=_norm_severity(a.get("severity") or "normal")))
             elif t == "task_add":
                 title = (a.get("title") or "").strip()
                 if not title:
@@ -282,10 +309,14 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if dup and str(dup["id"]) != str(a.get("continues")):
                     raise ValueError(f"duplicate of open task #{dup['id']}")
                 cap = int(cfg["coordinator"].get("max_new_tasks_per_day", 40))
-                made = db.one("SELECT COUNT(*) n FROM tasks WHERE origin='coordinator' AND created>?",
-                              (time.time() - 86400,))["n"]
-                if made >= cap:
-                    raise ValueError(f"daily cap of {cap} new tasks reached; finish or cancel work first")
+                free_at = None if a.get("kind") == "review" else next_task_slot(db, cap)
+                if free_at is not None:
+                    why = (f"cap of {cap} new tasks in 24 h reached; the next slot frees at {_clock(free_at)} "
+                           f"local, when you are woken to add it again (reviews do not count)")
+                    wake = db.kv(RETRY_WAKE_KEY) or {}
+                    if not wake.get("at") or free_at < float(wake["at"]):
+                        db.set_kv(RETRY_WAKE_KEY, {"at": free_at, "why": f"task_add {title!r}: {why}"})
+                    raise ValueError(why)
                 tier = a.get("tier") if a.get("tier") in ("light", "standard", "deep") else "standard"
                 budget = a.get("budget_usd") or cfg["budget"]["task_default_usd"].get(tier, 8.0)
                 kind_label = "exclusive" if a.get("exclusive") else "resource"
@@ -442,6 +473,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 raise ValueError(f"unknown action {t!r}")
         except Exception as e:   # one bad action is reported back; it never aborts the turn
             problems.append(f"{t}: {e}")
+    if problems and replies:
+        # The reply may say the work is under way; the user must not read that when it is not.
+        note = clip("; ".join(problems), 240)
+        db.x(f"UPDATE messages SET text=text||? WHERE id IN ({','.join('?' * len(replies))})",
+             [f"\n\n(not done: {note})", *replies])
     return problems
 
 

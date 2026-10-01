@@ -3659,6 +3659,54 @@ def test_a_rejected_action_waits_for_the_next_turn_instead_of_starting_one(env, 
     assert "no task #999" not in coord.digest(p, {}, [], []), "a fixed rejection kept being shown"
 
 
+def test_the_task_cap_names_its_next_slot_marks_the_reply_not_done_and_wakes_then(env, monkeypatch):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    p.set_config("coordinator.max_new_tasks_per_day", 2)
+    now = time.time()
+    old = [p.db.add_task(f"earlier {i}", "s", origin="coordinator") for i in range(2)]
+    for tid, ago in zip(old, (3600, 1800)):
+        p.db.x("UPDATE tasks SET created=? WHERE id=?", (now - ago, tid))
+    problems = coord.apply(p, [{"type": "reply", "text": "Starting the fix now.", "chat": "c1"},
+                               {"type": "task_add", "title": "review the fix", "kind": "review"},
+                               {"type": "task_add", "title": "fix it", "spec": "s"}])
+    assert p.db.one("SELECT id FROM tasks WHERE title='review the fix'"), "a review counted toward the task cap"
+    assert not p.db.one("SELECT id FROM tasks WHERE title='fix it'")
+    free_at = now - 3600 + 86400
+    clock_text = time.strftime("%H:%M", time.localtime(free_at))
+    assert len(problems) == 1 and "next slot frees at" in problems[0] and f"{clock_text} local" in problems[0], problems
+    reply = p.db.one("SELECT text FROM messages WHERE kind='reply'")["text"]
+    assert reply.startswith("Starting the fix now.") and "(not done: task_add: cap of 2" in reply
+    assert abs(p.db.kv(coord.RETRY_WAKE_KEY)["at"] - free_at) < 1
+    # A clean turn leaves its reply alone.
+    assert coord.apply(p, [{"type": "reply", "text": "All fine.", "chat": "c1"}]) == []
+    assert p.db.one("SELECT text FROM messages WHERE kind='reply' ORDER BY id DESC")["text"] == "All fine."
+
+    d = Daemon(p.base)
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    clock = [free_at - 60]
+    starts = _count_turns(d, monkeypatch, clock)
+    p.db.set_kv("last_coordinator_turn", clock[0])
+    d.retry_rejected()
+    assert not p.db.one("SELECT id FROM events WHERE kind='retry_wake'"), "woke before the slot freed"
+    # The slot went to other work meanwhile: the wake moves to the next one.
+    extra = p.db.add_task("other", "s", origin="coordinator")
+    p.db.x("UPDATE tasks SET created=? WHERE id=?", (free_at - 30, extra))
+    clock[0] = free_at + 1
+    d.retry_rejected()
+    assert not p.db.one("SELECT id FROM events WHERE kind='retry_wake'")
+    assert abs(p.db.kv(coord.RETRY_WAKE_KEY)["at"] - (now - 1800 + 86400)) < 1
+    clock[0] = now - 1800 + 86400 + 1
+    d.retry_rejected()
+    ev = p.db.one("SELECT text, status FROM events WHERE kind='retry_wake'")
+    assert ev and ev["status"] == "queued" and "fix it" in ev["text"]
+    assert p.db.kv(coord.RETRY_WAKE_KEY) is None
+    clock[0] += float(p.config()["coordinator"]["debounce_s"]) + 1
+    d.maybe_coordinate()
+    assert len(starts) == 1, "the freed slot did not wake the coordinator"
+
+
 def test_an_identical_open_ask_is_not_posted_twice(env):
     p = make(env)
     from ttp import coordinator as coord

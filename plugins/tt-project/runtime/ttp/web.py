@@ -15,6 +15,7 @@ from urllib.parse import parse_qs, urlparse
 
 from . import alerts
 from . import budget as bud
+from . import coordinator as coord
 from . import schedule as sched
 from .daemon import HEARTBEAT_STALE_S, WATCHDOG_S, heartbeat
 from .alerts import cleared  # noqa: F401  (readers import it from here)
@@ -288,6 +289,9 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
                    + f": its tasks wait (`ttp resume {p.name} --resource {pr['resource']}`)")
     if waiting:
         why.append(f"{len(waiting)} task(s) waiting, next try {at(waiting[0]['not_before'], now)}")
+    retry = db.kv(coord.RETRY_WAKE_KEY) or {}
+    if retry.get("at"):
+        why.append(f"the 24 h cap on new tasks is full; the coordinator adds held work at {at(retry['at'], now)}")
     if len(queued) > len(due):
         why.append(f"{len(queued) - len(due)} queued task(s) wait on other tasks")
     if you:
