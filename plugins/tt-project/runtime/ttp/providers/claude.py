@@ -75,8 +75,12 @@ class Claude(Provider):
 
     def compact_env(self, tokens: int) -> dict[str, str]:
         # Honoured by headless stream-json runs (checked live: a `compact_boundary` event follows).
-        # CLAUDE_AUTOCOMPACT_PCT_OVERRIDE alone did not compact there.
-        return {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": str(int(tokens))} if tokens and tokens > 0 else {}
+        # CLAUDE_AUTOCOMPACT_PCT_OVERRIDE alone did not compact there. The CLI clamps the value to
+        # 100000-1000000 (https://code.claude.com/docs/en/env-vars); it is clamped here too, so the
+        # run's recorded environment shows the window that applies.
+        if not tokens or tokens <= 0:
+            return {}
+        return {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": str(min(max(int(tokens), 100_000), 1_000_000))}
 
     def supports(self, flag: str) -> bool:
         if flag not in _FLAGS:

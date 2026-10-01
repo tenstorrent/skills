@@ -21,6 +21,8 @@ from .base import AUTH_RE, LIMIT_RE, Provider, RunUsage, cli_output, price_row, 
 PRICES = {"default": (4.0, 0.4, 20.0)}
 # Tools a decision-only turn does without, switched off when this build lists them as features.
 READ_ONLY_OFF = ("shell_tool", "unified_exec", "web_search_request")
+# Linux refuses one argument longer than 128 KiB; longer system text leads the prompt instead.
+MAX_ARG_BYTES = 120_000
 
 
 @register
@@ -73,6 +75,17 @@ class Codex(Provider):
             argv += ["--output-schema", schema_file(strict_schema(schema))]
         argv += ["-"]
         return argv, {}
+
+    def append_system_args(self, path: Path) -> list[str]:
+        # `developer_instructions` adds to Codex's built-in instructions; `model_instructions_file`
+        # would replace them. `-c` values parse as TOML, so the text goes in as a TOML string.
+        # https://developers.openai.com/codex/config-reference
+        arg = "developer_instructions=" + toml_string(Path(path).read_text())
+        return ["-c", arg] if len(arg.encode()) <= MAX_ARG_BYTES else []
+
+    def compact_args(self, tokens: int) -> list[str]:
+        # `model_auto_compact_token_limit`: history is compacted once it reaches this many tokens.
+        return ["-c", f"model_auto_compact_token_limit={int(tokens)}"] if tokens and tokens > 0 else []
 
     def writable_args(self, dirs):
         # workspace-write only lets the worker write its cwd; result.json, `ttp note`, `ttp lock`
@@ -210,6 +223,23 @@ class Codex(Provider):
 def codex_home() -> Path:
     """Where Codex keeps its login and saved sessions."""
     return Path(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"))
+
+
+def toml_string(text: str) -> str:
+    """`text` as a TOML basic string: quotes, backslashes and control characters escaped."""
+    out = []
+    for ch in text:
+        if ch in '"\\':
+            out.append("\\" + ch)
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\t":
+            out.append("\\t")
+        elif ord(ch) < 0x20 or ord(ch) == 0x7F:
+            out.append(f"\\u{ord(ch):04X}")
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
 
 
 def strict_schema(schema):

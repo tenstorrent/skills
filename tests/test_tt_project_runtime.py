@@ -1326,7 +1326,7 @@ def test_worker_and_reviewer_context_is_compacted_per_tier_but_not_the_coordinat
         (p.runs / str(rid) / "STOP").touch()
         return json.loads((p.runs / str(rid) / "run.json").read_text())["env"]
 
-    want = {"light": "80000", "standard": "150000", "deep": "200000"}
+    want = {"light": "100000", "standard": "150000", "deep": "200000"}
     for tier, tokens in want.items():
         assert run_env("worker", tier)["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == tokens
         assert run_env("reviewer", tier)["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == tokens
@@ -1343,6 +1343,11 @@ def test_worker_and_reviewer_context_is_compacted_per_tier_but_not_the_coordinat
     assert "CLAUDE_CODE_AUTO_COMPACT_WINDOW" not in run_env("reviewer", "deep")
     from ttp.providers import get_provider
     assert get_provider("codex").compact_env(150000) == {}
+    # Claude Code takes 100k to 1M and raises smaller windows to 100k: the recorded value says so.
+    claude = get_provider("claude")
+    assert claude.compact_env(80000) == {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "100000"}
+    assert claude.compact_env(5_000_000) == {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "1000000"}
+    assert claude.compact_env(0) == {} and claude.compact_args(150000) == []
 
 
 def test_claude_cost_and_tokens_survive_a_context_compaction(env, tmp_path):
@@ -8178,6 +8183,50 @@ def test_codex_resume_puts_the_subcommand_after_its_options(env, monkeypatch):
     assert argv.index("-C") < argv.index("resume") and argv.index("-s") < argv.index("resume")
     assert any(a.startswith("sandbox_workspace_write.writable_roots=") for a in argv[:argv.index("resume")])
     assert "PROMPT-MARKER" in stdin and run["status"] == "ok" and task["status"] == "done"
+
+
+def test_codex_gets_its_system_text_and_compact_window_as_config_overrides(env, monkeypatch):
+    from ttp.daemon import Daemon
+    from ttp.providers import base
+    from ttp.providers import codex as codex_provider
+    tomli = pytest.importorskip("tomllib" if sys.version_info >= (3, 11) else "tomli")
+    monkeypatch.setattr(codex_provider.Codex, "binary", lambda self: "/x/codex")   # never a real agent
+    monkeypatch.setitem(base._CLI_OUTPUT, ("/x/codex", "exec", "--help"), CODEX_EXEC_HELP)
+    p = make(env)
+    d = Daemon(p.base)
+    system = 'Hand off in "result.json".\n\tC:\\path \x01 \u00e9'
+
+    def start(role, **kw):
+        tid = p.db.add_task("t", "s", kind="work", tier="light", origin="user") if role == "worker" else None
+        rid = d.start_run(role, "PROMPT-MARKER", "codex", "light", str(env["repo"]),
+                          task=p.db.task(tid) if tid else None, **kw)
+        (p.runs / str(rid) / "STOP").touch()
+        spec = json.loads((p.runs / str(rid) / "run.json").read_text())
+        return spec["argv"], (p.runs / str(rid) / "prompt.md").read_text()
+
+    def overrides(argv):
+        out = {}
+        for i, a in enumerate(argv[:-1]):
+            if a == "-c" and argv[i + 1].startswith(("developer_instructions=", "model_auto_compact")):
+                out.update(tomli.loads(argv[i + 1]))   # what Codex reads: TOML when it parses
+        return out
+
+    argv, prompt = start("worker", append_system=system, resume=THREAD)
+    assert overrides(argv)["developer_instructions"] == system, "the system text did not survive TOML"
+    assert overrides(argv)["model_auto_compact_token_limit"] == 100000
+    assert prompt == "PROMPT-MARKER", "the system text still leads the prompt"
+    assert argv[-3:] == ["resume", THREAD, "-"], "options after the resume subcommand"
+    # The coordinator's system text goes the same way; it has no compact window.
+    argv, prompt = start("coordinator", system=system, read_only=True)
+    assert overrides(argv)["developer_instructions"] == system and prompt == "PROMPT-MARKER"
+    assert "model_auto_compact_token_limit" not in overrides(argv) and argv[-1] == "-"
+    # Text too long for one argument leads the prompt, as before.
+    big = "x" * 200_000
+    argv, prompt = start("worker", append_system=big)
+    assert "developer_instructions" not in overrides(argv) and prompt == big + "\n\nPROMPT-MARKER"
+    p.set_config("budget.compact_window_tokens", 0)
+    d.cfg = p.config()
+    assert "model_auto_compact_token_limit" not in overrides(start("worker")[0])
 
 
 def test_a_failed_resume_that_printed_events_but_no_tokens_is_free(env, monkeypatch):

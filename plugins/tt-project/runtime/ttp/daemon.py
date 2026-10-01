@@ -324,7 +324,9 @@ class Daemon:
             window = self.cfg["budget"].get("compact_window_tokens") or 0   # 0: off for every tier
             window = window.get(tier) if isinstance(window, dict) else window
             env = {**env, **prov.compact_env(int(window or 0))}
+            argv = _before_stdin(argv, prov.compact_args(int(window or 0)))
         mcp_servers: dict = {}
+        resume_extra: list[str] = []
         private: list[str] = []   # files that may hold credentials, removed when the run ends
         if not read_only:
             # Skill plugins this project enabled for its workers only (never the user's own setup).
@@ -341,10 +343,10 @@ class Daemon:
             if self.cfg["providers"].get(provider, {}).get("worker_isolation"):
                 extra += prov.isolation_args()
                 mcp_servers = self._approved_mcp(prov, provider, cwd)
-            # A continued session (see _resumable) gets the current system prompt again, below.
-            extra += prov.resume_args(resume) if resume else []
-            # A trailing "-" (prompt on stdin) stays the last argument.
-            argv = argv[:-1] + extra + ["-"] if argv[-1:] == ["-"] else argv + extra
+            # A continued session (see _resumable) gets the current system prompt again, below. Its
+            # arguments go last: Codex takes them as a subcommand that must follow every option.
+            resume_extra = prov.resume_args(resume) if resume else []
+            argv = _before_stdin(argv, extra)
         db = self.p.db
         run_id = db.x("INSERT INTO runs(task,role,provider,model,effort,account,started,boot_id,status,note) "
                       "VALUES(?,?,?,?,?,?,?,?,?,?)",
@@ -365,15 +367,20 @@ class Daemon:
                 (run_dir / "system.md").write_text(system)
                 if provider == "claude":
                     argv = _with_system_prompt(provider, argv, run_dir / "system.md")
-                else:   # no replaceable system prompt: the stable part leads the prompt instead
-                    prompt = system + "\n\n" + prompt
+                else:   # no replaceable system prompt: added to the agent's own, or leading the prompt
+                    sys_args = prov.append_system_args(run_dir / "system.md")
+                    if sys_args:
+                        argv = _before_stdin(argv, sys_args)
+                    else:
+                        prompt = system + "\n\n" + prompt
             if append_system is not None:
                 (run_dir / "system.md").write_text(append_system)
                 sys_args = prov.append_system_args(run_dir / "system.md")
                 if sys_args:
-                    argv = argv[:-1] + sys_args + ["-"] if argv[-1:] == ["-"] else argv + sys_args
+                    argv = _before_stdin(argv, sys_args)
                 else:
                     prompt = append_system + "\n\n" + prompt
+            argv = _before_stdin(argv, resume_extra)
             (run_dir / "prompt.md").write_text(prompt)
             runtime_dir = str(Path(__file__).resolve().parent.parent)
             env = {**env, "TTP_RUN_DIR": str(run_dir), "TTP_PROJECT": str(self.p.base), "TTP_RUN_ID": str(run_id),
@@ -2030,6 +2037,11 @@ def _watcher_timeout(payload: dict) -> int:
     except (TypeError, ValueError):
         want = 120
     return max(1, min(want, WATCHER_MAX_S))
+
+
+def _before_stdin(argv: list[str], extra: list[str]) -> list[str]:
+    """`argv` with `extra` added; a trailing "-" (prompt on stdin) stays the last argument."""
+    return argv[:-1] + extra + ["-"] if argv[-1:] == ["-"] else argv + extra
 
 
 def _with_system_prompt(provider: str, argv: list[str], path: Path) -> list[str]:

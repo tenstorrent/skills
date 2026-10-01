@@ -145,6 +145,11 @@ class Provider:
         such switch or `tokens` is 0."""
         return {}
 
+    def compact_args(self, tokens: int) -> list[str]:
+        """Arguments that make the agent compact its context near `tokens`, for agents whose switch
+        is a flag or config override rather than an environment variable; [] if none or 0."""
+        return []
+
     def streams(self, argv: list[str]) -> bool:
         """Whether a run started with `argv` writes its output as it goes, so an empty output means
         the agent did nothing (rather than that it had not finished)."""

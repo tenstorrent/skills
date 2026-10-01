@@ -188,6 +188,6 @@ Design notes, invariants and how to add a provider: [docs/design.md](docs/design
   your own CLI config and MCP servers. Cursor enforces no `no_internet` restriction and has no
   plan-window meter; without ask mode it has no read-only mode either.
 - Cursor has no reasoning-effort flag; tiers map to model names.
-- Context compaction per tier (`budget.compact_window_tokens`) works on Claude Code only.
-- Resuming a lost run's session works on Claude Code only; Codex and Cursor start fresh.
+- Context compaction per tier (`budget.compact_window_tokens`) works on Claude Code and Codex.
+- Resuming a lost run's session works on Claude Code and Codex; Cursor starts fresh.
 - A laptop pauses while it sleeps. Use an always-on machine for round-the-clock work.

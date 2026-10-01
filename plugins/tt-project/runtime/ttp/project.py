@@ -46,8 +46,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "stall_s": {"light": 900, "standard": 1800, "deep": 2700},
         # Worker and reviewer context is compacted once it nears this many tokens (0 = the agent's
         # own default). Long runs otherwise re-read a huge context on every call. Claude Code
-        # raises values under 100k to 100k and compacts about 33k below the window.
-        "compact_window_tokens": {"light": 80000, "standard": 150000, "deep": 200000},
+        # accepts 100k to 1M (smaller values become 100k) and compacts about 33k below the window.
+        "compact_window_tokens": {"light": 100000, "standard": 150000, "deep": 200000},
         "exclusive_wait_s": 600,        # an exclusive run waiting for its resource gives up after this
         # A run that ends without reporting its cost is estimated from its tokens at the project's
         # own observed rate; until there is one, this $ per million weighted tokens (set high).
