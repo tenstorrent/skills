@@ -46,6 +46,9 @@ class Cursor(Provider):
             argv += ["--mode", "ask"]   # answers only: no edits and no commands
         return argv, {}
 
+    def streams(self, argv: list[str]) -> bool:
+        return "stream-json" in argv   # older builds print their one JSON result at the end
+
     def _scan(self, output_path: Path) -> dict:
         """The result object, the usage it (or any earlier event) reported, the last assistant text
         and how many characters the agent produced so far."""

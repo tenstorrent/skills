@@ -5277,6 +5277,7 @@ def test_a_lock_wait_extends_the_wall_clock_at_most_by_the_limit(env, tmp_path):
     assert "handed-off" not in (run_dir / "output.jsonl").read_text()
     from ttp.daemon import _cut_off_cost
     (run_dir / "run.json").write_text(json.dumps({"budget_usd": 6.0, "timeout_s": 1}))
+    (run_dir / "output.jsonl").write_text("{}\n")   # it did something; a silent run costs nothing
     # Booked on the time beyond the one limit's worth of waiting, never below it.
     assert _cut_off_cost(run_dir, info) == pytest.approx(6.0 * min(max(info["ended"] - info["started"] - 1, 0) / 1, 1),
                                                          abs=0.01)
@@ -7211,3 +7212,27 @@ def test_a_lost_run_that_overlapped_a_sleep_the_daemon_saw_is_not_waste(env, mon
     run = p.db.one("SELECT * FROM runs WHERE id=?", (rid,))
     assert run["status"] == "lost" and json.loads(run["note"]).get("not_waste") == "sleep", dict(run)
     assert p.db.task(tid)["attempts"] == 0
+
+
+def test_a_run_with_no_output_and_no_tokens_costs_nothing(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    t0 = time.time() - 600
+    for provider, argv, out, cost in (
+            ("claude", ["claude", "-p", "--output-format", "stream-json"], "", 0.0),
+            ("codex", ["codex", "exec", "--json"], "", 0.0),
+            ("codex", ["codex", "exec", "--json"], json.dumps({"type": "item.started"}) + "\n", 1.0),
+            # An older Cursor build prints nothing until it ends: its silence is not idleness.
+            ("cursor", ["agent", "-p", "--output-format", "json"], "", 1.0)):
+        rid = p.db.x("INSERT INTO runs(role,provider,model,started,status) VALUES('worker',?,'',?,'running')",
+                     (provider, t0))
+        run_dir = p.runs / str(rid)
+        run_dir.mkdir(parents=True)
+        (run_dir / "run.json").write_text(json.dumps({"budget_usd": 2.0, "timeout_s": 1200, "argv": argv,
+                                                      "provider": provider}))
+        (run_dir / "output.jsonl").write_text(out)
+        d.finish_run(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)),
+                     {"rc": -15, "started": t0, "ended": t0 + 600, "stopped": "timeout"})
+        run = p.db.one("SELECT cost_usd FROM runs WHERE id=?", (rid,))
+        assert run["cost_usd"] == pytest.approx(cost), (provider, out, run["cost_usd"])

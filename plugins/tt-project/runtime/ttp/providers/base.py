@@ -135,6 +135,11 @@ class Provider:
         such switch or `tokens` is 0."""
         return {}
 
+    def streams(self, argv: list[str]) -> bool:
+        """Whether a run started with `argv` writes its output as it goes, so an empty output means
+        the agent did nothing (rather than that it had not finished)."""
+        return True
+
     def cost_so_far(self, output_path: Path) -> float | None:
         """Mid-run spend, when the provider streams it and does not enforce a budget itself."""
         return None

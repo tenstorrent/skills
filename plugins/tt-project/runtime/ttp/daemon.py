@@ -636,7 +636,7 @@ class Daemon:
         self._priced(r, usage)
         stopped = exit_info.get("stopped")
         if usage.estimated and not usage.cost_usd:
-            usage.cost_usd = _cut_off_cost(run_dir, exit_info)
+            usage.cost_usd = _cut_off_cost(run_dir, exit_info, usage, prov)
         status = "ok" if exit_info.get("rc") == 0 and not usage.error else "failed"
         if stopped in ("timeout", "budget", "stopped", "lost", "stalled", "shutdown", "resource_busy"):
             status = stopped if stopped != "stopped" else "killed"
@@ -1880,16 +1880,25 @@ def _shared(task: dict) -> list[str]:
     return [lb.split(":", 1)[1] for lb in json.loads(task["labels"] or "[]") if lb.startswith("resource:")]
 
 
-def _cut_off_cost(run_dir: Path, exit_info: dict) -> float:
+def _cut_off_cost(run_dir: Path, exit_info: dict, usage=None, prov=None) -> float:
     """A run that ended without any usage to price still spent money: Codex reports usage only when
     a turn completes, and Cursor's result has none at all. Book the elapsed share of its dollar
     budget rather than $0, so the caps keep counting it. A run whose agent never started (it gave
-    up waiting for a resource) spent nothing."""
+    up waiting for a resource) spent nothing, and so did one that wrote no output and reported no
+    tokens, when its CLI streams (a CLI that hung, or a host that slept, before its first event)."""
     if exit_info.get("launched") is False:
         return 0.0
     try:
         spec = json.loads((run_dir / "run.json").read_text())
     except (OSError, ValueError):
+        return 0.0
+    tokens = usage and (usage.input_tokens or usage.output_tokens or usage.cache_read_tokens
+                        or usage.cache_write_tokens)
+    try:
+        silent = not (run_dir / "output.jsonl").stat().st_size
+    except OSError:
+        silent = True
+    if silent and not tokens and (prov is None or prov.streams(spec.get("argv") or [])):
         return 0.0
     budget = float(spec.get("budget_usd") or spec.get("default_budget_usd") or 0)
     timeout = float(spec.get("timeout_s") or 0)
