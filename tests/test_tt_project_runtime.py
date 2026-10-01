@@ -3581,6 +3581,17 @@ def test_only_money_waits_for_the_user(env):
         assert "approval" in coord.apply(p, [{"type": "config_set", "key": key, "value": value}])[0], key
         assert coord.apply(p, [{"type": "config_set", "key": key, "value": value}], user_turn=True) == []
 
+def test_config_set_applies_before_task_add_in_the_same_turn(env):
+    """A cap raised in a turn counts for that turn's task adds, whatever order they were listed in."""
+    p = make(env)
+    from ttp import coordinator as coord
+    p.set_config("coordinator.max_new_tasks_per_day", 1)
+    assert coord.apply(p, [{"type": "task_add", "title": "first", "spec": "s"}]) == []
+    notes = coord.apply(p, [{"type": "task_add", "title": "second", "spec": "s"},
+                            {"type": "config_set", "key": "coordinator.max_new_tasks_per_day", "value": "5"}])
+    assert notes == [], notes
+    assert p.db.one("SELECT id FROM tasks WHERE title='second'")
+
 def _count_turns(d, monkeypatch, clock):
     """Stub the coordinator launch so wake decisions can be counted over simulated time."""
     starts = []

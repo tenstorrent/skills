@@ -262,7 +262,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
     text sent again by a later turn is still written."""
     db, problems = p.db, []
     cfg = p.config()
-    for i, a in enumerate(actions):
+    # config_set goes first so a cap raised in this turn counts for this turn's task_add actions.
+    # The index stays the original one so replay keys do not change.
+    order = sorted(enumerate(actions), key=lambda ia: (ia[1] or {}).get("type") != "config_set")
+    for i, a in order:
         t = a.get("type")
         key = f"{turn}.{i}" if turn is not None else None
         try:
@@ -421,6 +424,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     raise ValueError(f"{key} needs the user's approval: ask_user (blocking spend) with the exact value, and set "
                                      f"it in the turn that carries their yes")
                 p.set_config(key, USER_SETTABLE[key](a.get("value")))
+                cfg = p.config()
             elif t == "resource_pause":
                 if not isinstance(a.get("paused"), bool):
                     raise ValueError("resource_pause needs `paused`: true or false")
