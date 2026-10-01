@@ -267,6 +267,58 @@ def test_pace_below_one_worker_spaces_out_new_starts(env):
     assert line.startswith("paced: next start ~") and "(seven_day on pace for" in line, line
 
 
+def test_a_pace_hold_does_not_move_later_while_the_project_waits(env):
+    """During a hold nothing runs, so the measured mean and the duty fall on every tick: the hold
+    must not keep moving later until it hits max_pace_hold_s."""
+    p = make(env)
+    from ttp import budget as bud
+    cfg = p.config()
+    now = time.time()
+    w = _weekly_over_pace(p, now, [(180, 55), (55, 0)])
+    first = bud.evaluate(p.db, cfg, "claude", w, now).numbers["paced"]["until"]
+    assert now < first < now + 7200
+    for minutes in range(5, 60, 5):
+        g = bud.evaluate(p.db, cfg, "claude", w, now + minutes * 60)
+        hold = g.numbers.get("paced")
+        assert hold is None or hold["until"] <= first + 1, (minutes, hold, first)
+    # a new run ending sets a new hold from its own length
+    p.db.x("INSERT INTO runs(role,provider,started,ended,status) VALUES('worker','claude',?,?,'done')",
+           (now + 30 * 60, now + 60 * 60))
+    g = bud.evaluate(p.db, cfg, "claude", w, now + 60 * 60)
+    assert g.numbers["paced"]["until"] > now + 60 * 60, g.numbers
+
+
+def test_a_weekly_window_near_pace_does_not_flip_the_gate_on_each_reading(env):
+    """Whole-percent readings of a weekly window burning a little over its pace: each one-point
+    step used to swing the projection and flip the gate between green and yellow."""
+    p = make(env)
+    from ttp import budget as bud
+    cfg = p.config()
+    t0 = time.time()
+    resets = t0 + 138 * 3600                       # period started 30 h ago
+    p.db.x("INSERT INTO runs(role,provider,started,status) VALUES('worker','claude',?,'running')",
+           (t0 - 30 * 3600,))
+    levels = []
+    for i in range(-30 * 12, 24 * 12):             # a reading every 5 min, 30 h back to 24 h ahead
+        ts = t0 + i * 300
+        util = float(int(0.56 * (ts - (resets - 168 * 3600)) / 3600))
+        p.db.x("INSERT INTO snapshots(ts,provider,account,window,utilization,resets_at) VALUES(?,?,?,?,?,?)",
+               (ts, "claude", "a", "seven_day", util, resets))
+        if i >= 0 and i % 2 == 0:
+            levels.append(bud.evaluate(p.db, cfg, "claude", [bud.Window("claude", "seven_day", util, resets)],
+                                       ts).level)
+    flips = sum(a != b for a, b in zip(levels, levels[1:]))
+    assert flips <= 1 and set(levels) <= {"green", "yellow"}, (flips, levels)
+
+
+def test_the_pace_reason_says_when_the_burn_is_not_this_projects(env):
+    p = make(env)
+    from ttp import budget as bud
+    now = time.time()
+    g = bud.evaluate(p.db, p.config(), "claude", _weekly_over_pace(p, now, []), now)
+    assert g.level == "yellow" and "other sessions on the account" in " ".join(g.reasons), g.reasons
+
+
 def test_a_plan_over_pace_runs_deep_work_at_standard(env):
     p = make(env)
     from ttp import budget as bud

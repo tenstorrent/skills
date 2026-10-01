@@ -40,6 +40,13 @@ PLAN_LAPSE_RUNS = 2
 # Relative price of each token class (input = 1), used only to apply an observed rate to a token
 # mix; not a price list. Override with budget.estimate_weights.
 TOKEN_WEIGHTS = {"input": 1.0, "output": 5.0, "cache_read": 0.1, "cache_write": 1.25}
+# Burn is measured over a quarter of the window, at most this long. Readings come in whole percents,
+# so a weekly window needs hours of them for a steady slope: over 3 h its projection swung between
+# 13% and 428% with each one-point step.
+BURN_SPAN_MAX_S = 12 * HOUR
+# A window over pace stays over until its burn falls below this fraction of the burn it needs, so
+# a slope hovering near the pace does not flip the gate between green and yellow on every reading.
+PACE_EXIT = 0.85
 
 
 @dataclass
@@ -239,7 +246,8 @@ def _pace(db: DB, g: Gate, provider: str, plan: list[Window], target: float, mos
     (mean here not floored at 1). Then new starts are spaced out: the next may start the last run's
     length x (1/duty - 1) after it ended, at most `max_hold` later, so noisy readings cannot stall
     the project. Running work is never stopped; the daemon lets a user's own tasks and reviews
-    through (see `pace_hold`).
+    through (see `pace_hold`). While a hold is on the project runs nothing, so its mean falls with
+    every tick and the duty with it: a hold, once set for the last run, can only move earlier.
     """
     running = db.one("SELECT COUNT(*) n FROM runs WHERE provider=? AND status='running' AND role!='coordinator'",
                      (provider,))["n"]
@@ -265,13 +273,15 @@ def _pace(db: DB, g: Gate, provider: str, plan: list[Window], target: float, mos
         elif w.utilization >= target - 2:
             _raise(g, "orange", f"{w.window} window at {w.utilization:.0f}%, just under the {target:.0f}% stop")
             row["allowed"] = 1
-        elif burn is not None and need is not None and burn > need * 1.05:
+        elif burn is not None and need is not None and _over_pace(db, provider, w, burn, need):
             row["allowed"] = min(most, max(1, int(mean * need / burn)))
-            _raise(g, "yellow", f"{w.window} window on pace for {projected:.0f}% by its reset, over the "
-                                f"{target:.0f}% target; running {row['allowed']} workers (averaged "
-                                f"{mean:.1f} while it was measured)")
-            allowed = min(allowed, row["allowed"])
             raw = avg_running(db, provider, float(readings[0]["ts"]), now, floor=0.0)
+            # Other sessions on the account burn the same window; say when the burn is not ours.
+            own = (f"averaged {mean:.1f} while it was measured" if raw > 0 else
+                   "none ran while it was measured: other sessions on the account made this burn")
+            _raise(g, "yellow", f"{w.window} window on pace for {projected:.0f}% by its reset, over the "
+                                f"{target:.0f}% target; running {row['allowed']} workers ({own})")
+            allowed = min(allowed, row["allowed"])
             row["duty"] = round(raw * need / burn, 3)
             if row["duty"] < 1 and (duty is None or row["duty"] < duty["duty"]):
                 duty = row
@@ -289,6 +299,12 @@ def _pace(db: DB, g: Gate, provider: str, plan: list[Window], target: float, mos
     end, length = float(last["ended"]), max(float(last["ended"]) - float(last["started"]), 0.0)
     wait = length * (1 / duty["duty"] - 1) if duty["duty"] > 0 else max_hold
     until = end + min(wait, max_hold)
+    key, run = f"pace_hold:{provider}", [float(last["started"]), end]
+    held = db.kv(key) or {}
+    if held.get("run") == run:
+        until = min(until, float(held.get("until") or until))
+    else:
+        db.set_kv(key, {"run": run, "until": until})
     if until > now:
         g.numbers["paced"] = {"until": until, "window": duty["window"], "projected": duty["projected"],
                               "duty": duty["duty"]}
@@ -314,8 +330,20 @@ def burn_rate(db: DB, provider: str, window: str, resets_at: float | None, now: 
     return _slope(_readings(db, provider, window, resets_at, now))
 
 
+def _over_pace(db: DB, provider: str, w: Window, burn: float, need: float) -> bool:
+    """Whether `w` burns over pace: above it by 5% to go over, below PACE_EXIT of it to come back."""
+    key = f"pace_over:{provider}:{w.window}"
+    was = db.kv(key)
+    was = was is not None and was == w.resets_at     # over pace earlier in this same period
+    over = burn > need * (PACE_EXIT if was else 1.05)
+    if over != was:
+        db.set_kv(key, w.resets_at if over else None)
+    return over
+
+
 def _readings(db: DB, provider: str, window: str, resets_at: float | None, now: float) -> list:
-    span = min(WINDOW_HOURS.get(window, 168.0) * HOUR / 4, 3 * HOUR)
+    # Only readings of the current period count (same reset), so the span stops at its start.
+    span = min(WINDOW_HOURS.get(window, 168.0) * HOUR / 4, BURN_SPAN_MAX_S)
     return db.q("SELECT ts, utilization FROM snapshots WHERE provider=? AND window=? AND ts>=? AND "
                 "(resets_at=? OR (? IS NULL AND resets_at IS NULL)) ORDER BY ts",
                 (provider, window, now - span, resets_at, resets_at))
