@@ -2360,6 +2360,27 @@ def test_a_refused_run_requeues_without_waking_the_coordinator(env):
         "a provider refusal has its own alert; the coordinator has nothing to decide"
 
 
+def test_a_refused_wake_keeps_the_wait_so_its_retry_stays_light(env):
+    p = make(env)
+    from ttp import budget as bud
+    from ttp.daemon import Daemon
+    from ttp.db import dump_result, load_result
+    from ttp.providers.base import RunUsage as Usage
+    tid = p.db.add_task("job", "spec", kind="work", tier="deep", origin="user")
+    p.db.update_task(tid, status="running", result=dump_result(
+        {"status": "waiting", "summary": "build running", "waiting_for": "the build",
+         "retry_when": "test -e done", "waits": 3}))
+    d = Daemon(p.base)
+    for status in ("limit", "auth"):
+        d._finish_worker({"task": tid}, Usage(final_text="usage limit reached"), status, env["tmp"])
+        t = p.db.task(tid)
+        res = load_result(t["result"])
+        assert t["status"] == "queued" and t["attempts"] == 0
+        assert res["status"] == "waiting" and res["retry_when"] == "test -e done" and res["waits"] == 3
+        assert bud.wake_tier(t["tier"], res) == "light"
+        p.db.update_task(tid, status="running")
+
+
 def test_the_daily_review_skips_a_day_with_no_activity(env):
     p = make(env)
     from ttp.daemon import Daemon
@@ -2613,6 +2634,34 @@ def test_task_branches_start_from_a_remote_only_base(env):
     p.set_config("delivery.base_ref", "fast")
     with pytest.raises(RuntimeError, match="similar: .*work/fast"):
         worktree.resolve_base(p)
+
+
+def test_task_branches_start_from_the_working_branch_before_origin_head(env):
+    """base_ref unset: delivery.push_branch, then a branch the charter names, then origin/HEAD."""
+    p = make(env)
+    from ttp import worktree
+    repo = env["repo"]
+    remote = env["tmp"] / "remote.git"
+    subprocess.run(["git", "clone", "-q", "--bare", str(repo), str(remote)], check=True)
+    _git_out(repo, "remote", "add", "origin", str(remote))
+    for b in ("team/work", "push/target"):
+        _git_out(repo, "push", "-q", "origin", f"HEAD:refs/heads/{b}")
+    _git_out(repo, "fetch", "-q", "origin")
+    _git_out(repo, "remote", "set-head", "origin", _git_out(repo, "rev-parse", "--abbrev-ref", "HEAD"))
+    default = _git_out(repo, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+    for key in ("delivery.base_ref", "delivery.push_branch"):
+        p.set_config(key, "")
+    assert worktree.base_ref(p) == default
+    p.charter_path.write_text(p.charter_path.read_text() + "\nNever push to main. Each change is made on "
+                              "a work branch, then pushed to branch gone/away, then branch `team/work`.\n")
+    assert worktree.base_ref(p) == "team/work", "the charter's existing branch, not main or a missing one"
+    assert worktree.resolve_base(p) == "origin/team/work"
+    p.set_config("delivery.push_branch", "origin/push/target")
+    assert worktree.base_ref(p) == "origin/push/target"
+    p.set_config("delivery.push_branch", "not/there")
+    assert worktree.base_ref(p) == "team/work", "a push branch that does not exist yet is skipped"
+    p.set_config("delivery.base_ref", "push/target")
+    assert worktree.base_ref(p) == "push/target", "an explicit base_ref always wins"
 
 
 def test_a_new_restriction_reaches_workers_already_running(env, tmp_path):
@@ -5187,6 +5236,23 @@ def test_memory_forget_archives_the_entry_and_is_idempotent_on_replay(env):
     assert coord.apply(p, [{"type": "memory_forget", "name": "no-such-entry"}], turn=8)
 
 
+def test_a_replayed_forget_then_add_of_the_same_title_keeps_both_entries(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    old = p.add_memory("Box A is free.", kind="fact", title="Box A status")
+    actions = [{"type": "memory_forget", "name": f"[{old.stem}]"},
+               {"type": "memory_add", "text": "Box A is taken.", "title": "Box A status"}]
+    for _ in range(2):   # the same turn replayed after a crash
+        assert coord.apply(p, actions, turn=9) == []
+    archived = p.memory_dir / "archive" / old.name
+    assert "Box A is free." in archived.read_text(), "the replay overwrote the archived entry"
+    live = [f for f in p.memory_dir.glob("fact-box-a-status*.md")]
+    assert len(live) == 1 and live[0].name != old.name and "Box A is taken." in live[0].read_text()
+    text = p.memory_text()
+    assert "Box A is taken." in text and "Box A is free." not in text
+    assert p.memory_index.read_text().count("Box A status") == 1
+
+
 def test_memory_cli_retires_an_entry(env):
     p = make(env)
     stale = p.add_memory("Old news.", kind="fact")
@@ -5698,6 +5764,32 @@ def test_push_refuses_head_main_and_master(env, monkeypatch, capsys, ref):
     assert _git_out(origin, "rev-parse", "main") == before
 
 
+def test_push_without_checks_lets_a_docs_only_change_through(env, monkeypatch, capsys):
+    p, repo, origin, other = _push_setup(env, monkeypatch, [])
+    _commit(other, "theirs.txt", "theirs\n")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    (repo / "docs").mkdir()
+    _commit(repo, "NOTES.md", "notes\n")
+    _commit(repo, "docs/guide.txt", "guide\n")
+    assert _ttp_push() == 0
+    assert _git_out(origin, "rev-parse", "proj") == _git_out(repo, "rev-parse", "HEAD")
+    assert _git_out(origin, "show", "proj:theirs.txt") == "theirs"
+
+
+def test_push_without_checks_refuses_code_and_names_the_key_to_set(env, monkeypatch, capsys):
+    p, repo, origin, other = _push_setup(env, monkeypatch, [])
+    before = _git_out(origin, "rev-parse", "proj")
+    _commit(repo, "NOTES.md", "notes\n")
+    _commit(repo, "tool.py", "print(1)\n")
+    head = _git_out(repo, "rev-parse", "HEAD")
+    assert _ttp_push() == 2
+    err = capsys.readouterr().err
+    assert "tool.py" in err and "NOTES.md" not in err
+    assert "set delivery.push_checks to the commands that must pass" in err and "config_set" in err
+    assert _git_out(origin, "rev-parse", "proj") == before
+    assert _git_out(repo, "rev-parse", "HEAD") == head, "a refused push must leave the branch as it was"
+
+
 def test_push_refuses_the_remotes_default_branch(env, monkeypatch, capsys):
     p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
     before = _git_out(origin, "rev-parse", "proj")
@@ -5773,6 +5865,13 @@ def test_the_review_prompt_pushes_only_through_the_guarded_push():
     assert "`ttp push`" in text and "NEVER use `git push` directly" in text
     assert "longest tool timeout" in text and "NEVER run it detached or in the background" in text
     assert "75: another push to the branch held its turn too long; hand off `waiting` with the `retry_when`" in text
+
+
+def test_the_worker_time_rule_leaves_room_for_a_foreground_push():
+    """worker.md's 5-minute rule must not contradict kind-review.md's foreground `ttp push`."""
+    text = (RUNTIME.parent / "template" / "prompts" / "worker.md").read_text()
+    assert "Never block one tool call longer than about 5 minutes" in text
+    assert "where your task's rules\n  say to run a command in the foreground, such as `ttp push`" in text
 
 
 def _ttp(*args):

@@ -145,7 +145,9 @@ account out of funds or quota, unrecoverable outage, restriction at risk. Everyt
 - Ready for review = CI green, every comment answered, description current.
 - NEVER merge unless the repo is in the charter's auto-merge list.
 - Where the charter lets reviewed changes be pushed straight to a branch, a `review` task pushes
-  with `ttp push` only. Set `delivery.push_branch` and `delivery.push_checks` first.
+  with `ttp push` only. Set `delivery.push_branch` and `delivery.push_checks` (the repository's
+  test commands) first; without checks it pushes docs-only changes only. A review blocked on
+  "set delivery.push_checks" → set it yourself, then `task_update` the review to `queued`.
 - A human review comment that is ambiguous or not clearly an improvement → `ask_user` (`blocking`
   `human`).
 

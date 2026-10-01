@@ -102,12 +102,16 @@ and preferences you add later become part of the project's charter and memory.
   broker) or `ttp lock <resource> -- <command>`, so the rest of each task runs in parallel. A task
   marked exclusive holds the resource's lock for its whole run; while it waits for a slot, new
   `ttp lock` commands wait behind it, so it is not starved.
-- Each task edits only its own worktree.
+- Each task edits only its own worktree. A code task branches from the first of:
+  `delivery.base_ref`; `delivery.push_branch`, then a branch the charter names as
+  `branch <name>`, each only if it exists here or on origin; the remote's default branch
+  (`origin/HEAD`); the checked-out branch.
 - Where reviewed changes go straight to a shared branch, `ttp push` publishes them guarded: it
   refuses uncommitted changes, rebases onto the latest tip, runs `delivery.push_checks` on the
   exact commit it pushes, starts over if the branch moved meanwhile, and never forces. The target
   is `delivery.push_branch`, which must be set explicitly; it refuses without one, without
-  checks, when `delivery.push_allowed` is false, and for `HEAD`, `main`, `master` or the
+  checks unless the change touches only docs (`*.md`, `*.rst`, `docs/`, ...), when
+  `delivery.push_allowed` is false, and for `HEAD`, `main`, `master` or the
   remote's default branch. Pushes to one branch take turns under a lock that a killed push or a
   reboot frees. One that waits longer than `delivery.push_wait_s` (default 300 s) exits 75 and
   prints a `retry_when` for its hand-off: `ttp push --free`, which exits 0 once the turn is free.

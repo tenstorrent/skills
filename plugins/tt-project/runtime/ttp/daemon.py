@@ -50,6 +50,9 @@ WATCHDOG_S = 2 * HEARTBEAT_STALE_S   # no tick progress this long: the service r
 PROGRESS_EVERY_S = 30   # how often a long tick tells the watchdogs it is still moving
 WATCHER_MAX_S = HEARTBEAT_STALE_S - 60   # a command watcher's timeout_s is capped here, well below WATCHDOG_S
 RESULT_FILE = "result.json"
+# What a waiting hand-off keeps across a run the account refused (limit, auth).
+WAIT_KEYS = ("retry_when", "retry_after_s", "waiting_for", "wake_tier", "survives_reboot", "waits",
+             "waiting_since")
 MAX_FOLLOWUPS, FOLLOWUP_SPEC_CHARS = 12, 4000   # per hand-off; each follow-up is its own event
 PROBE_EVERY_S = 180     # how often a waiting task's `retry_when` probe runs
 PROBE_TIMEOUT_S = 60
@@ -941,8 +944,13 @@ class Daemon:
         if wakes and new != "blocked":
             # Waits a reboot cut short count against max_reboot_losses; a block starts the count over.
             extra["reboot_wakes"] = wakes
+        shown = rstatus or status
+        if status in ("limit", "auth") and not rstatus and (prev := load_result(task["result"])).get("status") == "waiting":
+            # A wake the account refused is the same wait: its retry stays a cheap wake.
+            extra.update({k: prev[k] for k in WAIT_KEYS if k in prev})
+            shown = "waiting"
         upd = {"status": new, "attempts": attempts, "result": dump_result(
-            {"summary": summary, "status": rstatus or status, **extra,
+            {"summary": summary, "status": shown, **extra,
              **({k: v for k, v in result.items()
                  if k not in ("summary", "waits", "waiting_since", "woke", "reboot_wakes", "escalated_wake")}
                 if isinstance(result, dict) else {})})}

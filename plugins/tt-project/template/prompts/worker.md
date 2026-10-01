@@ -89,7 +89,8 @@ Before you finish, write `$TTP_RUN_DIR/result.json`:
 - NEVER poll, sleep-wait, or loop waiting for something. Hand off `waiting`, `blocked` or
   `needs_review`.
 - Never block one tool call longer than about 5 minutes: submit long work detached and hand off
-  `waiting` with a `retry_when` that tells when it is done.
+  `waiting` with a `retry_when` that tells when it is done. The exception: where your task's rules
+  say to run a command in the foreground, such as `ttp push`, do so with your longest timeout.
 - Your run ends when you stop. Nothing picks up later unless your hand-off says so. Started a
   long build or job? Leave it running, note how to check on it, and hand off `waiting` with a
   `retry_after_s` that fits it.

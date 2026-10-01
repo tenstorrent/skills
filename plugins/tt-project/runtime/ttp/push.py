@@ -19,6 +19,7 @@ from typing import Any, Callable
 from urllib.parse import quote
 
 from . import locks
+from .budget import DOC_SUFFIXES
 from .project import Project
 
 # Exit codes, distinct so a worker can say why it did not push. BUSY: another push to the same
@@ -27,6 +28,9 @@ REFUSED, CONFLICT, CHECKS_FAILED, KEPT_MOVING, REJECTED, BUSY = 2, 3, 4, 5, 6, 7
 DEFAULT_ROUNDS = 3
 DEFAULT_WAIT_S = 300
 PROTECTED = {"HEAD", "main", "master"}
+NO_CHECKS = ("set delivery.push_checks to the commands that must pass on the exact commit before it "
+             "is pushed (a list, or one per line, e.g. the repository's test suite); the coordinator "
+             "sets it with config_set")
 
 
 def check_list(v: Any) -> list[str]:
@@ -81,6 +85,19 @@ def refusal(repo: Path, remote: str, branch: str) -> str:
         if line.startswith("ref: ") and line[5:].split("\t")[0] == f"refs/heads/{branch}":
             return f"refusing to push to {remote}/{branch}, the remote's default branch"
     return ""
+
+
+def is_doc(path: str) -> bool:
+    """A documentation file: prose by its suffix, or anything under a `docs/` or `doc/` folder."""
+    return path.lower().endswith(DOC_SUFFIXES) or any(d in ("docs", "doc") for d in path.split("/")[:-1])
+
+
+def code_paths(repo: Path, tip: str) -> list[str]:
+    """The files this change touches since it left `tip` that are not docs."""
+    diff = _git(repo, "diff", "--name-only", f"{tip}...HEAD")
+    if diff.returncode != 0:
+        return ["(the diff could not be read)"]
+    return [f for f in diff.stdout.splitlines() if f.strip() and not is_doc(f)]
 
 
 def rounds_of(v: Any) -> int:
@@ -159,8 +176,9 @@ def push(repo: Path, remote: str, branch: str, checks: list[str], rounds: int = 
          say: Callable[[str], None] = lambda m: print(f"ttp push: {m}", file=sys.stderr),
          hold: Callable[[], Any] | None = None) -> int:
     """Rebase HEAD onto remote/branch, run `checks` on the result, and push it if the remote did not
-    move meanwhile; if it did, start over, at most `rounds` times. `hold` takes the push lock once
-    the quick refusals passed: it returns the held lock, or None when it stayed busy (BUSY)."""
+    move meanwhile; if it did, start over, at most `rounds` times. With no checks only a change that
+    touches nothing but docs goes through. `hold` takes the push lock once the quick refusals
+    passed: it returns the held lock, or None when it stayed busy (BUSY)."""
     repo = Path(_git(repo, "rev-parse", "--show-toplevel").stdout.strip() or repo)
     if _git(repo, "status", "--porcelain", "--untracked-files=no").stdout.strip():
         say("uncommitted changes; commit first")
@@ -186,6 +204,12 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
         tip = _fetch(repo, remote, branch)
         if not tip:
             say(f"cannot fetch {upstream}")
+            return REFUSED
+        if not checks and (code := code_paths(repo, tip)):
+            # Checked before the rebase, so a refused push leaves the branch as it was.
+            more = f" and {len(code) - 3} more" if len(code) > 3 else ""
+            say(f"no checks configured, and this change touches more than docs ({', '.join(code[:3])}{more}): "
+                + NO_CHECKS)
             return REFUSED
         if _git(repo, "rebase", tip, quiet=False).returncode != 0:
             _git(repo, "rebase", "--abort")
@@ -218,11 +242,7 @@ def run(p: Project, repo: Path) -> int:
     if not (allowed is True or str(allowed).strip().lower() in ("1", "true", "yes", "on")):
         print("ttp push: this project does not allow pushing (delivery.push_allowed)", file=sys.stderr)
         return REFUSED
-    checks = check_list(d.get("push_checks"))
-    if not checks:
-        print("ttp push: no checks configured: set delivery.push_checks to the commands that must "
-              "pass before a push", file=sys.stderr)
-        return REFUSED
+    checks = check_list(d.get("push_checks"))   # none: only a docs-only change may go (_rounds)
     try:
         remote, branch = target(p, repo)
         rounds = rounds_of(d.get("push_rounds"))

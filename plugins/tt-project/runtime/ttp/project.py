@@ -233,9 +233,11 @@ class Project:
         if same:
             path = same[0]
         else:
+            # Never a retired entry's name either: a replayed turn that forgot it and then added
+            # this one would retire the new entry over the archived copy.
             path = self.memory_dir / f"{kind}-{slug}.md"
             n = 2
-            while path.exists():
+            while path.exists() or (self.memory_dir / "archive" / path.name).exists():
                 path = self.memory_dir / f"{kind}-{slug}-{n}.md"
                 n += 1
             path.write_text(f"---\nkind: {kind}\ncreated: {time.strftime('%Y-%m-%d')}\n{tag}---\n{text}\n")

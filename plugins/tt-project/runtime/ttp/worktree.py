@@ -41,11 +41,40 @@ def slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:40] or "task"
 
 
+# "branch <name>", "branch: <name>" or "branch `<name>`" in the charter.
+CHARTER_BRANCH = re.compile(r"\bbranch\b[:\s]+`?([A-Za-z0-9][\w./-]*[\w-])`?")
+
+
+def charter_branches(p: Project) -> list[str]:
+    """Branch names the charter gives as `branch <name>`, in order of appearance, without main,
+    master and HEAD (a charter says those to forbid them)."""
+    try:
+        text = p.charter_path.read_text()
+    except OSError:
+        return []
+    out: list[str] = []
+    for name in CHARTER_BRANCH.findall(text):
+        if name not in ("HEAD", "main", "master") and name not in out:
+            out.append(name)
+    return out
+
+
+def _known(p: Project, ref: str) -> bool:
+    return any(_git(p.root, "rev-parse", "--verify", "--quiet", f"{cand}^{{commit}}", check=False)
+               for cand in (ref, f"origin/{ref}"))
+
+
 def base_ref(p: Project) -> str:
-    cfg = p.config()
-    ref = cfg.get("delivery", {}).get("base_ref")
-    if ref:
-        return ref
+    """Where code tasks branch from, the first of: `delivery.base_ref` as set; the project's working
+    branch, `delivery.push_branch`, then a branch the charter names (`branch <name>`), each only
+    if it exists here or on origin; the remote's default branch (origin/HEAD); the checked-out
+    branch."""
+    d = p.config().get("delivery") or {}
+    if d.get("base_ref"):
+        return d["base_ref"]
+    for ref in [str(d.get("push_branch") or "").strip(), *charter_branches(p)]:
+        if ref and _known(p, ref):
+            return ref
     head = _git(p.root, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD", check=False)
     return head or _git(p.root, "rev-parse", "--abbrev-ref", "HEAD")
 
