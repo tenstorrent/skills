@@ -18,7 +18,7 @@ from . import budget as bud
 from . import coordinator as coord
 from . import release
 from . import schedule as sched
-from .daemon import HEARTBEAT_STALE_S, WATCHDOG_S, heartbeat
+from .daemon import HEARTBEAT_STALE_S, KV_LOCAL_ONLY, WATCHDOG_S, heartbeat
 from .alerts import cleared  # noqa: F401  (readers import it from here)
 from .db import DB, SEVERITY_RANK, chat_floor, dump_result, host_line, load_result
 from .project import Project
@@ -309,7 +309,25 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         "host": host_line(db.boots(now - DAY)),
         "release": release.line(p, db, cfg),
         "schedules_broken": sched.broken_line(db),
+        "local_only": local_only_line(db),
     }
+
+
+def local_only_line(db: DB) -> str:
+    """Done code tasks whose branch exists only on this machine (Daemon.check_local_only), in one
+    line; "" when there are none. A task no longer done (cancelled) drops out at once."""
+    flagged = db.kv(KV_LOCAL_ONLY) or {}
+    if not flagged:
+        return ""
+    done = {str(r["id"]) for r in db.q("SELECT id FROM tasks WHERE status='done' AND id IN (%s)"
+                                       % ",".join("?" * len(flagged)), [int(k) for k in flagged])}
+    items = [(k, flagged[k]) for k in sorted(flagged, key=int) if k in done]
+    if not items:
+        return ""
+    shown = ", ".join(f"#{k} {v['branch']} ({v['ahead']} commit{'' if v['ahead'] == 1 else 's'})" for k, v in items[:5])
+    more = f" and {len(items) - 5} more" if len(items) > 5 else ""
+    return (f"{len(items)} done task{'' if len(items) == 1 else 's'} with work only on this machine "
+            f"(branch not on any remote): {shown}{more}")
 
 
 def run_wake(note: str | None) -> str | None:

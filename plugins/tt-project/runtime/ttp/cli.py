@@ -527,6 +527,8 @@ def status_text(p: Project) -> str:
         lines.append(h["host"])
     if h.get("release"):
         lines.append(h["release"])
+    if h.get("local_only"):
+        lines.append(h["local_only"])
     disk = db.kv("disk_low")
     if disk:
         lines.append(f"disk: only {disk['free_gb']} GB free under {disk['path']} (guard {disk.get('threshold_gb', '?')} GB); "

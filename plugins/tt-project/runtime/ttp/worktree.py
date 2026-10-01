@@ -425,3 +425,33 @@ def _closest_ancestor(p: Project, heads: list[str], ref: str) -> str | None:
         if best is None or n < best[0]:
             best = (n, head)
     return best[1] if best else None
+
+
+FETCH_TIMEOUT_S = 30   # the local-only check's fetch; an unreachable remote must not hold up the tick
+
+
+def local_only(repo: Path, branches: list[str], timeout_s: float = FETCH_TIMEOUT_S) -> tuple[dict, bool] | None:
+    """Which of `branches` have a head no remote-tracking branch contains (`git branch -r
+    --contains`): finished work whose only copy is on this machine. Returns ({branch: (head, commits
+    on no remote)}, whether the fetch of every remote worked), after that fetch; with a failed fetch
+    the remote refs may be old, so a branch may be listed that the remote has. A branch that no
+    longer exists is left out. None when `repo` is not a git repository or has no remote: there is
+    nothing to compare with. Pushes nothing."""
+    try:
+        if not _git(repo, "remote", check=False).split():
+            return None
+        fetched = subprocess.run(["git", "-C", str(repo), "fetch", "--all", "--quiet"], capture_output=True,
+                                 text=True, timeout=timeout_s, stdin=subprocess.DEVNULL,
+                                 env={**os.environ, "GIT_TERMINAL_PROMPT": "0"}).returncode == 0
+    except subprocess.TimeoutExpired:
+        fetched = False
+    except (OSError, subprocess.SubprocessError):
+        return None
+    out = {}
+    for b in dict.fromkeys(branches):
+        head = _git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{b}^{{commit}}", check=False)
+        if not head or _git(repo, "branch", "-r", "--contains", head, check=False):
+            continue
+        ahead = _git(repo, "rev-list", "--count", head, "--not", "--remotes", check=False)
+        out[b] = (head, int(ahead) if ahead.isdigit() else 0)
+    return out, fetched

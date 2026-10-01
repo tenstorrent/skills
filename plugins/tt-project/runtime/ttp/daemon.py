@@ -68,6 +68,9 @@ DISK_DU_TOP = 6          # the biggest top-level directories it names
 KEEP_RECHECK_S = 6 * 3600   # a finished task's kept worktree is looked at again this often
 SLEPT_MIN_S = 60        # a run whose wall clock ran this much ahead of its monotonic clock overlapped a host sleep
 SLEEPS_KEPT_S = 7 * 86400
+LOCAL_ONLY_EVERY_S = 3600   # how often done code tasks' branches are checked against the remotes
+LOCAL_ONLY_DAYS = 14        # done code tasks finished this recently are checked (flagged ones until cleared)
+KV_LOCAL_ONLY = "local_only"   # kv: {task id: {branch, head, ahead, since}} for branches only on this machine
 
 
 def log(p: Project, msg: str) -> None:
@@ -178,6 +181,7 @@ class Daemon:
         self._last_prune = 0.0
         self._release_due = 0.0   # when the installed tt-project release is next compared with the harness
         self._pruned_upto = 0.0   # the latest finish the last worktree sweep saw
+        self._local_only_due = 0.0   # when done code tasks' branches are next checked for remote copies
         self._kept: dict[int, tuple[float, float, str]] = {}   # task id -> (task updated, checked, why kept)
         self._disk_low = bool(self.p.db.kv("disk_low"))   # an episode outlives a restart: no second alert
         self._disk_free: float | None = None
@@ -323,7 +327,8 @@ class Daemon:
             self.cfg, self._last_cfg = self.p.config(), now
             self.jev = Jev(self.cfg, db=self.p.db)
         for step in (self.reap_runs, self.wake_after_reboot, self.meter_running, self.reconcile_tasks,
-                     self.prune_worktrees, self.check_disk, self.sweep_alerts, self.check_release):
+                     self.prune_worktrees, self.check_local_only, self.check_disk, self.sweep_alerts,
+                     self.check_release):
             step()
             self._progress()
         if self.p.db.kv("paused", False):
@@ -1060,6 +1065,8 @@ class Daemon:
         if isinstance(result, dict) and result.get("pr"):
             upd["pr_url"] = str(result["pr"])[:300]
         db.update_task(task["id"], **upd)
+        if new == "done" and task["kind"] == "code":
+            self._local_only_due = 0.0   # is its work on a remote? checked this tick
         if waiting and new == "queued":
             db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                  (time.time(), f"task:{task['id']}", "task_waiting", "low",
@@ -1676,6 +1683,54 @@ class Daemon:
         except Exception as e:
             release.finish(self.p, "failed", why=f"{type(e).__name__}: {str(e)[:200]}")
             log(self.p, f"automatic upgrade did not start: {type(e).__name__}: {e}")
+
+    def check_local_only(self) -> None:
+        """A done code task may leave the only copy of its work on a local branch. Hourly, and in the
+        tick a code task hands off done, fetch and look for the branches of code tasks done in the
+        last LOCAL_ONLY_DAYS (and those already flagged) that no remote-tracking branch contains.
+        Each newly found one posts one coordinator event; status and the web app count them until
+        the branch is pushed or merged, deleted, or the task leaves done (cancelled). Nothing is
+        pushed. A repository without a remote is skipped quietly. After a failed fetch the remote
+        refs may be old: flags may clear, but no new one is raised."""
+        now = time.time()
+        if now < self._local_only_due:
+            return
+        self._local_only_due = now + LOCAL_ONLY_EVERY_S
+        db = self.p.db
+        told = db.kv(KV_LOCAL_ONLY) or {}
+        tasks = [t for t in db.q("SELECT id, title, branch, updated FROM tasks WHERE kind='code' AND status='done' "
+                                 "AND branch IS NOT NULL AND branch!=''")
+                 if t["updated"] >= now - LOCAL_ONLY_DAYS * 86400 or str(t["id"]) in told]
+        if not tasks and not told:
+            return
+        try:
+            found = worktree.local_only(self.p.root, [t["branch"] for t in tasks]) if tasks else ({}, True)
+        except Exception:
+            log(self.p, "local-only branch check: " + traceback.format_exc().replace("\n", " | ")[:1000])
+            return
+        if found is None:
+            if told:
+                db.set_kv(KV_LOCAL_ONLY, None)
+            return
+        heads, fetched = found
+        live = {}
+        with db.tx():
+            for t in tasks:
+                key, b = str(t["id"]), t["branch"]
+                if b not in heads or not fetched and key not in told:
+                    continue
+                head, ahead = heads[b]
+                live[key] = {"branch": b, "head": head, "ahead": ahead, "since": (told.get(key) or {}).get("since", now)}
+                if key not in told:
+                    log(self.p, f"task {t['id']}: branch {b} exists only on this machine ({ahead} commits ahead)")
+                    db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                         (now, f"task:{t['id']}", "local_only", "normal",
+                          f"task #{t['id']}'s branch {b} exists only on this machine, {ahead} commit"
+                          f"{'' if ahead == 1 else 's'} ahead of every remote ({t['title']}). Nothing pushes it "
+                          f"automatically: deliver it as the charter allows, or cancel the task if the work is "
+                          f"not wanted.", "queued", t["id"]))
+            if live != told:
+                db.set_kv(KV_LOCAL_ONLY, live or None)
 
     def check_resource_trouble(self, every_s: float = 60) -> None:
         """A resource whose tasks keep failing (machines.trouble) starts a coordinator turn once per

@@ -3814,6 +3814,92 @@ def test_ttp_prune_sweeps_finished_worktrees_once(env, capsys, monkeypatch):
     assert f"removed, branch {branch} kept" in out and f"#{t_dirty} (done): kept: uncommitted" in out, out
 
 
+def _local_only_events(p):
+    return p.db.q("SELECT text, task FROM events WHERE kind='local_only'")
+
+
+def test_local_only_flags_a_done_branch_on_no_remote_once_until_pushed(env):
+    p = make(env)
+    from ttp import daemon as dm
+    from ttp.cli import status_text
+    from ttp.web import health
+    remote = env["tmp"] / "remote.git"
+    subprocess.run(["git", "clone", "-q", "--bare", str(env["repo"]), str(remote)], check=True)
+    subprocess.run(["git", "-C", str(env["repo"]), "remote", "add", "origin", str(remote)], check=True)
+    tid, path, branch = _code_task(p, "local work")
+    _commit_file(path, "a")
+    _commit_file(path, "b")
+    t_pushed, pushed, pushed_branch = _code_task(p, "pushed work")
+    _commit_file(pushed, "c")
+    _git_out(pushed, "push", "-q", "origin", f"HEAD:refs/heads/{pushed_branch}")
+    d = dm.Daemon(p.base)
+    d.check_local_only()
+    ev = _local_only_events(p)
+    assert [e["task"] for e in ev] == [tid], ev
+    assert f"task #{tid}'s branch {branch} exists only on this machine, 2 commits ahead" in ev[0]["text"]
+    assert f"1 done task with work only on this machine (branch not on any remote): #{tid} {branch} (2 commits)" \
+        in status_text(p)
+    assert health(p, p.db)["local_only"]
+    d._local_only_due = 0
+    d.check_local_only()
+    assert len(_local_only_events(p)) == 1   # one event, not one per check
+    _git_out(path, "push", "-q", "origin", f"HEAD:refs/heads/{branch}")
+    d._local_only_due = 0
+    d.check_local_only()
+    assert p.db.kv(dm.KV_LOCAL_ONLY) is None and "only on this machine" not in status_text(p)
+    assert len(_local_only_events(p)) == 1
+
+
+def test_local_only_skips_a_repo_without_a_remote_and_drops_a_cancelled_task(env):
+    p = make(env)
+    from ttp import daemon as dm
+    from ttp.web import health
+    tid, path, branch = _code_task(p, "no remote")
+    _commit_file(path, "a")
+    d = dm.Daemon(p.base)
+    d.check_local_only()
+    assert not _local_only_events(p) and p.db.kv(dm.KV_LOCAL_ONLY) is None
+    log = p.logs / "daemon.log"
+    assert not log.exists() or "only on this machine" not in log.read_text() and "local-only" not in log.read_text()
+    remote = env["tmp"] / "remote.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+    subprocess.run(["git", "-C", str(env["repo"]), "remote", "add", "origin", str(remote)], check=True)
+    d._local_only_due = 0
+    d.check_local_only()
+    assert len(_local_only_events(p)) == 1 and health(p, p.db)["local_only"]
+    p.db.update_task(tid, status="cancelled")
+    assert health(p, p.db)["local_only"] == ""   # at once, before the next check
+    d._local_only_due = 0
+    d.check_local_only()
+    assert p.db.kv(dm.KV_LOCAL_ONLY) is None
+
+
+def test_local_only_is_checked_in_the_tick_a_code_task_hands_off_done(env):
+    p = make(env)
+    from ttp import daemon as dm
+    remote = env["tmp"] / "remote.git"
+    subprocess.run(["git", "clone", "-q", "--bare", str(env["repo"]), str(remote)], check=True)
+    subprocess.run(["git", "-C", str(env["repo"]), "remote", "add", "origin", str(remote)], check=True)
+    tid, path, _ = _code_task(p, "hand-off", status="queued")
+    _commit_file(path, "a")
+    d = dm.Daemon(p.base)
+    d._local_only_due = time.time() + 3600   # the hourly check is not due
+    assert _run_until(d, p, lambda: p.db.task(tid)["status"] == "done")
+    assert [e["task"] for e in _local_only_events(p)] == [tid]
+
+
+def test_local_only_raises_no_new_flag_after_a_failed_fetch(env):
+    p = make(env)
+    from ttp import daemon as dm
+    subprocess.run(["git", "-C", str(env["repo"]), "remote", "add", "origin", str(env["tmp"] / "missing.git")],
+                   check=True)
+    tid, path, _ = _code_task(p, "offline")
+    _commit_file(path, "a")
+    d = dm.Daemon(p.base)
+    d.check_local_only()
+    assert not _local_only_events(p) and p.db.kv(dm.KV_LOCAL_ONLY) is None
+
+
 def test_low_disk_space_blocks_new_workers_and_alerts_once(env, monkeypatch):
     import collections
     p = make(env)
@@ -8006,7 +8092,7 @@ def test_a_long_tick_tells_both_watchdogs_it_still_moves(env, monkeypatch):
     d._notify = addr
     steps = []
     for name in ("reap_runs", "wake_after_reboot", "meter_running", "reconcile_tasks", "prune_worktrees",
-                 "check_disk", "sweep_alerts", "check_release", "_refresh_meters", "update_gates", "run_schedules", "poll_slack",
+                 "check_local_only", "check_disk", "sweep_alerts", "check_release", "_refresh_meters", "update_gates", "run_schedules", "poll_slack",
                  "check_resource_trouble", "retry_rejected", "maybe_coordinate", "probe_waiting", "dispatch",
                  "deliver_outbound"):
         monkeypatch.setattr(d, name, lambda name=name: steps.append(name))
@@ -8026,7 +8112,7 @@ def test_a_long_tick_tells_both_watchdogs_it_still_moves(env, monkeypatch):
     finally:
         sock.close()
         cleanup()
-    assert len(steps) == 18 and pings == [b"WATCHDOG=1"] * 16, (steps, pings)
+    assert len(steps) == 19 and pings == [b"WATCHDOG=1"] * 17, (steps, pings)
     # Before its first completed tick the heartbeat is not written (`ttp restart` reads it as that
     # tick); the start marker carries the progress, which `ttp.watchdog` counts.
     assert not hb.exists()

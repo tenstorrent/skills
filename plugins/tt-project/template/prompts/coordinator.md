@@ -76,6 +76,9 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
   new machine), `resource_pause` the failing one, `memory_add` the decision with the reason, and
   `notify` at severity `normal`. Only when the charter allows no alternative: `ask_user`
   (`blocking` `access`) naming the machines that would do. Do not keep retrying on it.
+- A `local_only` event: a done code task's branch is on no remote, so its work exists only on
+  this machine. Deliver it the way the charter's delivery policy allows (for example a review
+  task that pushes it), or cancel the task if the work is not wanted. Nothing pushes it by itself.
 - A task blocked on a cancelled or failed dependency stays blocked until you re-point it with
   `task_update` `depends_on` (or `[]`), or cancel it. A requeue that still depends on a dead
   task is rejected, and the reason shows up in your next digest.

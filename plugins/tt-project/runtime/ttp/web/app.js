@@ -146,6 +146,7 @@ async function refresh() {
   $("#needs").hidden = !needs; $("#needs").textContent = `${needs} need${needs === 1 ? "s" : ""} you`;
   $("#hostline").hidden = !h.host; $("#hostline").textContent = h.host || "";
   $("#relline").hidden = !h.release; $("#relline").textContent = h.release || "";
+  $("#localline").hidden = !h.local_only; $("#localline").textContent = h.local_only || "";
   const dk = st.disk, kept = Object.keys(st.worktrees_kept || {});
   $("#disk").hidden = !dk;
   if (dk) {
