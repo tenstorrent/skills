@@ -7312,7 +7312,8 @@ def test_a_long_tick_tells_both_watchdogs_it_still_moves(env, monkeypatch):
     steps = []
     for name in ("reap_runs", "wake_after_reboot", "meter_running", "reconcile_tasks", "prune_worktrees",
                  "check_disk", "sweep_alerts", "_refresh_meters", "update_gates", "run_schedules", "poll_slack",
-                 "check_resource_trouble", "maybe_coordinate", "probe_waiting", "dispatch", "deliver_outbound"):
+                 "check_resource_trouble", "retry_rejected", "maybe_coordinate", "probe_waiting", "dispatch",
+                 "deliver_outbound"):
         monkeypatch.setattr(d, name, lambda name=name: steps.append(name))
     monkeypatch.setattr(dm.coord, "expire_asks", lambda *a, **k: [])
     monkeypatch.setattr(dm, "PROGRESS_EVERY_S", 0)   # each step stands for a slow one
@@ -7329,7 +7330,7 @@ def test_a_long_tick_tells_both_watchdogs_it_still_moves(env, monkeypatch):
                 break
     finally:
         sock.close()
-    assert len(steps) == 16 and pings == [b"WATCHDOG=1"] * 14, (steps, pings)
+    assert len(steps) == 17 and pings == [b"WATCHDOG=1"] * 15, (steps, pings)
     # Before its first completed tick the heartbeat is not written (`ttp restart` reads it as that
     # tick); the start marker carries the progress, which `ttp.watchdog` counts.
     assert not hb.exists()
