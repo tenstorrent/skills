@@ -294,7 +294,12 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         why.append(f"{len(waiting)} task(s) waiting, next try {at(waiting[0]['not_before'], now)}")
     retry = db.kv(coord.RETRY_WAKE_KEY) or {}
     if retry.get("at"):
-        why.append(f"the 24 h cap on new tasks is full; the coordinator adds held work at {at(retry['at'], now)}")
+        review = bool(retry.get("review"))
+        what = "review tasks" if review else "new tasks"
+        if retry["at"] - now >= 365 * 86400 or coord.task_cap(cfg, review) == 0:
+            why.append(f"the cap on {what} is 0: none are added until it is raised")
+        else:
+            why.append(f"the 24 h cap on {what} is full; the coordinator adds held work at {at(retry['at'], now)}")
     if len(queued) > len(due):
         why.append(f"{len(queued) - len(due)} queued task(s) wait on other tasks")
     if you:

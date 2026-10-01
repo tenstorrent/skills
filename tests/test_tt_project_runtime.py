@@ -7434,3 +7434,15 @@ def test_a_command_watcher_cannot_outlast_the_watchdog(env, monkeypatch):
     d = dm.Daemon(p.base)
     assert d._run_command_watcher({"name": "slow"}, {"command": "true", "timeout_s": 7200}).startswith("ok")
     assert seen["timeout"] == dm.WATCHER_MAX_S
+
+
+def test_web_why_names_cap_zero_and_review_cap(env):
+    p = make(env)
+    from ttp import coordinator as coord, web
+    now = time.time()
+    p.db.set_kv(coord.RETRY_WAKE_KEY, {"at": now + 3600, "review": False})
+    assert "24 h cap on new tasks is full" in web.health(p, p.db, alive=True)["why_idle"]
+    p.db.set_kv(coord.RETRY_WAKE_KEY, {"at": now + 3600, "review": True})
+    assert "24 h cap on review tasks is full" in web.health(p, p.db, alive=True)["why_idle"]
+    p.db.set_kv(coord.RETRY_WAKE_KEY, {"at": now + coord.NO_SLOT_S, "review": False})
+    assert "cap on new tasks is 0: none are added until it is raised" in web.health(p, p.db, alive=True)["why_idle"]
