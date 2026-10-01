@@ -53,10 +53,12 @@ PROBE_EVERY_S = 180     # how often a waiting task's `retry_when` probe runs
 PROBE_TIMEOUT_S = 60
 ORPHAN_GRACE_S = 10     # TERM to KILL for an agent whose supervisor died
 HANDOFF_STATES = ("done", "blocked", "failed", "needs_review", "waiting")
+SLEEP_CUT = ("timeout", "stalled", "lost", "failed")   # ends a host sleep can cause
 DISK_LIGHT_KINDS = ("question", "plan")   # the only task kinds that still start under the disk guard
 DISK_RESUME = 1.2        # the guard ends once free space is this many times its threshold
 DISK_FLOOR_GB = 2        # below this even questions and plans wait
 KEEP_RECHECK_S = 6 * 3600   # a finished task's kept worktree is looked at again this often
+SLEPT_MIN_S = 60        # a run whose wall clock ran this much ahead of its monotonic clock overlapped a host sleep
 
 
 def log(p: Project, msg: str) -> None:
@@ -613,12 +615,17 @@ class Daemon:
         if usage.auth_failed:
             status = "auth"
         note = json.loads(r["note"] or "{}")
-        # The runaway guard counts runs that ended without an outcome; a reboot or a hand-off that
-        # stands is an outcome, not a loop.
+        # The runaway guard counts runs that ended without an outcome; a reboot, a host sleep or a
+        # hand-off that stands is an outcome, not a loop.
         if status == "lost" and r["boot_id"] and r["boot_id"] != self.boot:
             note.update(not_waste="reboot", lost_to_reboot=self.boot, boot_at=self.boot_at)
         elif status in bud.WASTED and handed_off:
             note["not_waste"] = "handoff"
+        elif status in SLEEP_CUT and self._slept_during(r, exit_info):
+            # A run that overlapped a host sleep did not time out or fail on its own: the host went
+            # away under it. It is lost to the sleep, like a run lost to a reboot.
+            note.update(not_waste="sleep", lost_to_sleep=True, slept_s=exit_info.get("slept_s"))
+            status = "lost"
         source = self._source_for(r)
         # Spend is booked at the run's end, not when the daemon gets to it: a run reaped after
         # downtime must not count toward the current hour. A stamp from the future is clamped.
@@ -662,9 +669,14 @@ class Daemon:
                 self._finish_coordinator(r, usage, status, note)
             else:
                 self._finish_worker(r, usage, status, run_dir, cut_off if status == "ok" else None,
-                                    rebooted=bool(note.get("lost_to_reboot")))
+                                    rebooted=bool(note.get("lost_to_reboot")), slept=bool(note.get("lost_to_sleep")))
         log(p, f"run {r['id']} end status={status} cost=${usage.cost_usd:.3f}"
                f"{' (estimated)' if usage.estimated else ''} role={r['role']}")
+
+    def _slept_during(self, r: dict, exit_info: dict) -> bool:
+        """Whether the host slept while the run was going: its supervisor saw the wall clock run
+        ahead of the monotonic one."""
+        return float(exit_info.get("slept_s") or 0) >= SLEPT_MIN_S
 
     def _source_for(self, r: dict) -> str:
         if r["role"] == "coordinator":
@@ -679,8 +691,10 @@ class Daemon:
         db = self.p.db
         out = usage.structured if isinstance(usage.structured, dict) else last_json_object(usage.final_text or "")
         actions = (out or {}).get("actions")
-        if (status == "lost" and not r["dir"]) or status == "shutdown":
-            return   # never launched, or ended by `ttp stop --kill`: its messages and events stay queued
+        if (status == "lost" and not r["dir"]) or status == "shutdown" or note.get("lost_to_sleep"):
+            # Never launched, ended by `ttp stop --kill`, or cut by a host sleep: not a failed turn.
+            # Its messages and events stay queued for the next one.
+            return
         if status == "auth":
             db.set_kv("coordinator_backoff_until", time.time() + 900)
             return
@@ -730,7 +744,7 @@ class Daemon:
                        f"Messages are queued, not lost.", "high")
 
     def _finish_worker(self, r: dict, usage, status: str, run_dir: Path, ended: str | None = None,
-                       rebooted: bool = False) -> None:
+                       rebooted: bool = False, slept: bool = False) -> None:
         db = self.p.db
         task = db.task(r["task"]) if r["task"] else None
         if not task:
@@ -779,6 +793,12 @@ class Daemon:
         # A host reboot is not the task's failure: no attempt, no delay, unless the task keeps being
         # the run the host went down under.
         reboot_lost = status == "lost" and rebooted
+        # So is a host sleep, a few times: past max_reboot_losses since the task was last blocked it
+        # counts an attempt again, so a task that fails on its own while the host also slept cannot
+        # retry for free forever.
+        if status == "lost" and slept:
+            reboot_lost = self._reboot_losses(task["id"], "lost_to_sleep") <= int(
+                self.cfg["budget"].get("max_reboot_losses", 3))
         no_handoff = status == "ok" and rstatus is None
         if waiting:
             new = "queued"   # a busy resource is not a failed attempt: the task comes back later
@@ -803,7 +823,7 @@ class Daemon:
         if rebooted:
             extra["reboot"] = {"at": self.boot_at, "notes": _last_notes(run_dir)}
         wakes = _reboot_wakes(task)
-        if reboot_lost:
+        if reboot_lost and not slept:
             n = self._reboot_losses(task["id"]) + wakes
             if n >= int(self.cfg["budget"].get("max_reboot_losses", 3)):
                 new, reason = "blocked", f"lost to a host reboot {n} times; it may be causing them"
@@ -1507,14 +1527,15 @@ class Daemon:
                 {**prev, "woke": "the host rebooted", "reboot": {"at": self.boot_at}, "reboot_wakes": wakes}))
             log(self.p, f"task {t['id']} waited from before the reboot; due now")
 
-    def _reboot_losses(self, tid: int) -> int:
-        """Runs of the task lost to a host reboot since it was last blocked: a person or the
-        coordinator who requeues a task blocked for reboots starts its count over."""
+    def _reboot_losses(self, tid: int, key: str = "lost_to_reboot") -> int:
+        """Runs of the task lost to a host reboot (or, by key, a host sleep) since it was last
+        blocked: a person or the coordinator who requeues a task blocked for reboots starts its count
+        over."""
         db = self.p.db
         since = (db.one("SELECT MAX(ts) ts FROM events WHERE task=? AND kind='task_blocked'", (tid,)) or {}).get("ts")
         return sum(1 for x in db.q("SELECT note FROM runs WHERE task=? AND status='lost' AND note LIKE ? "
-                                   "AND started>?", (tid, "%lost_to_reboot%", since or 0))
-                   if json.loads(x["note"] or "{}").get("lost_to_reboot"))
+                                   "AND started>?", (tid, f"%{key}%", since or 0))
+                   if json.loads(x["note"] or "{}").get(key))
 
     def _start_probe(self, tid: int, probe: str, now: float) -> None:
         self._probed[tid] = now

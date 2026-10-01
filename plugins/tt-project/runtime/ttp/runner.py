@@ -7,7 +7,9 @@
 - refreshes <run_dir>/lease every 30 s while the child lives, so liveness never depends on a model
   remembering to report it;
 - enforces the wall-clock limit with TERM, then KILL 30 s later (a child that ignores TERM would
-  otherwise run on past its bound);
+  otherwise run on past its bound). The limit and the stall guard count monotonic time, which stands
+  still while the host sleeps: a laptop asleep for hours does not time a run out. exit.json records
+  how long the host slept during the run (`slept_s`);
 - enforces the run's dollar budget mid-flight when the provider streams usage;
 - ends the child when <run_dir>/STOP appears (a cancel, or `ttp stop --kill` writing "shutdown");
 - holds a slot of each resource an `exclusive:` task names from before the child starts until it
@@ -150,7 +152,7 @@ def supervise(run_dir: Path) -> int:
         (run_dir / "exit.json.tmp").write_text(json.dumps(exit_info))
         os.replace(run_dir / "exit.json.tmp", run_dir / "exit.json")
         return 1
-    started = time.time()
+    started, mono_start = time.time(), time.monotonic()
     prompt = open(run_dir / "prompt.md", "rb")
     out = open(out_path, "wb")
     err = open(run_dir / "stderr.log", "wb")
@@ -181,19 +183,22 @@ def supervise(run_dir: Path) -> int:
         from .providers import get_provider  # local import: keeps startup cheap
         prov = get_provider(spec["provider"]).use(spec.get("model", ""), spec.get("prices"))
         last_lease = last_budget = 0.0
+        seen, active = _activity(out_path, run_dir), mono_start
         while child.poll() is None:
             now = time.time()
             if now - last_lease >= LEASE_EVERY_S:
                 _touch(lease)
                 last_lease = now
-            if time.time() - started > timeout_s + min(locks.waited(run_dir), timeout_s):
+            if time.monotonic() - mono_start > timeout_s + min(locks.waited(run_dir), timeout_s):
                 threading.Thread(target=stop, args=("timeout",), daemon=True).start()
             if stall_s:
                 # Stalled = the agent has produced nothing (no stream event, no progress note) for
-                # stall_s. A tool call waiting on a long job stays inside one event, so stall_s must
-                # exceed the longest single command the task is expected to run.
-                marks = [started] + [f.stat().st_mtime for f in (out_path, run_dir / "progress.md") if f.exists()]
-                if time.time() - max(marks) > stall_s:
+                # stall_s of awake time. A tool call waiting on a long job stays inside one event, so
+                # stall_s must exceed the longest single command the task is expected to run.
+                mark = _activity(out_path, run_dir)
+                if mark != seen:
+                    seen, active = mark, time.monotonic()
+                elif time.monotonic() - active > stall_s:
                     threading.Thread(target=stop, args=("stalled",), daemon=True).start()
             if budget is not None and now - last_budget >= BUDGET_EVERY_S:
                 last_budget = now
@@ -211,15 +216,28 @@ def supervise(run_dir: Path) -> int:
     t = threading.Thread(target=watch, daemon=True)
     t.start()
     rc = child.wait()
-    ended = time.time()
+    ended, mono_end = time.time(), time.monotonic()
     remove_files(spec.get("private_files") or [])
     for f in (prompt, out, err, *held):
         f.close()
-    exit_info = {"rc": rc, "started": started, "ended": ended, "stopped": reason[0] if reason else None}
+    exit_info = {"rc": rc, "started": started, "ended": ended, "stopped": reason[0] if reason else None,
+                 "slept_s": round(max((ended - started) - (mono_end - mono_start), 0.0), 1)}
     tmp = run_dir / "exit.json.tmp"
     tmp.write_text(json.dumps(exit_info))
     os.replace(tmp, run_dir / "exit.json")
     return rc
+
+
+def _activity(out_path: Path, run_dir: Path) -> tuple:
+    """What the agent has produced so far: the size and mtime of its stream and progress notes."""
+    marks = []
+    for f in (out_path, run_dir / "progress.md"):
+        try:
+            st = f.stat()
+            marks.append((st.st_size, st.st_mtime))
+        except OSError:
+            marks.append(None)
+    return tuple(marks)
 
 
 def _take_exclusive(run_dir: Path, wanted: list[dict], env: dict, deadline: float) -> list | None:

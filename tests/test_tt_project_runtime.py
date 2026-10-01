@@ -7056,3 +7056,100 @@ def test_web_keep_installs_a_kept_local_forward_and_adopts_an_existing_one(env, 
     cli.main(["web", "demo"])
     out = capsys.readouterr().out
     assert "--tunnel --keep" in out and "OK" not in out and "ask" not in out.lower()
+
+
+def _jumping_clock(run_dir, jump_s):
+    """The runner's clock module, with the wall clock jumping ahead by jump_s once the agent has
+    started (the host slept): the monotonic clock does not move during a sleep."""
+    real = time
+
+    class Clock:
+        monotonic, sleep, strftime = staticmethod(real.monotonic), staticmethod(real.sleep), staticmethod(real.strftime)
+
+        @staticmethod
+        def time():
+            return real.time() + (jump_s if (run_dir / "child.pid").exists() else 0)
+    return Clock
+
+
+def test_a_host_sleep_does_not_time_out_or_stall_a_run(env, tmp_path, monkeypatch):
+    from ttp import runner
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "prompt.md").write_text("x")
+    (run_dir / "run.json").write_text(json.dumps({
+        "argv": [sys.executable, "-c", "import time; time.sleep(1)"], "env": {}, "cwd": str(tmp_path),
+        "timeout_s": 60, "stall_s": 30, "provider": "fake"}))
+    monkeypatch.setattr(runner, "time", _jumping_clock(run_dir, 7200))
+    assert runner.supervise(run_dir) == 0
+    info = json.loads((run_dir / "exit.json").read_text())
+    assert info["stopped"] is None, "two hours asleep counted against a 60 s limit"
+    assert info["slept_s"] >= 7000, info
+
+
+def _ended_run(p, tid, exit_info, role="worker", output=""):
+    rid = p.db.x("INSERT INTO runs(task,role,provider,started,status,boot_id,dir) VALUES(?,?,?,?,?,?,?)",
+                 (tid, role, "fake", exit_info["started"], "running", "b", ""))
+    run_dir = p.runs / str(rid)
+    run_dir.mkdir(parents=True)
+    p.db.x("UPDATE runs SET dir=? WHERE id=?", (str(run_dir), rid))
+    (run_dir / "output.jsonl").write_text(output)
+    (run_dir / "run.json").write_text(json.dumps({"timeout_s": 600, "default_budget_usd": 8.0}))
+    (run_dir / "lease").touch()
+    (run_dir / "exit.json").write_text(json.dumps(exit_info))
+    return rid
+
+
+def test_a_run_that_overlapped_a_host_sleep_is_not_a_timeout_or_waste(env, monkeypatch):
+    p = make(env)
+    from ttp import runner
+    from ttp.daemon import Daemon
+    monkeypatch.setattr(runner, "boot_id", lambda: "b")
+    d = Daemon(p.base)
+    tid = p.db.add_task("build", "s", kind="work", tier="light", origin="user")
+    p.db.update_task(tid, status="running")
+    now = time.time()
+    rid = _ended_run(p, tid, {"rc": -15, "started": now - 7300, "ended": now - 60, "stopped": "timeout",
+                              "slept_s": 7000.0})
+    d.reap_runs()
+    run, t = p.db.one("SELECT * FROM runs WHERE id=?", (rid,)), p.db.task(tid)
+    assert run["status"] == "lost" and json.loads(run["note"])["not_waste"] == "sleep", dict(run)
+    assert t["status"] == "queued" and t["attempts"] == 0, dict(t)
+    assert not p.db.q("SELECT id FROM events WHERE task=? AND status='queued'", (tid,)), "a sleep woke the coordinator"
+    # The same end without a sleep is a timeout and an attempt.
+    p.db.update_task(tid, status="running")
+    _ended_run(p, tid, {"rc": -15, "started": now - 700, "ended": now - 60, "stopped": "timeout", "slept_s": 0})
+    d.reap_runs()
+    assert p.db.task(tid)["attempts"] == 1
+
+
+def test_sleep_losses_stop_being_free_after_max_reboot_losses(env, monkeypatch):
+    p = make(env)
+    from ttp import runner
+    from ttp.daemon import Daemon
+    monkeypatch.setattr(runner, "boot_id", lambda: "b")
+    d = Daemon(p.base)
+    tid = p.db.add_task("build", "s", kind="work", tier="light", origin="user")
+    now = time.time()
+    attempts = []
+    for _ in range(4):
+        p.db.update_task(tid, status="running")
+        _ended_run(p, tid, {"rc": 1, "started": now - 3600, "ended": now - 60, "slept_s": 3000.0})
+        d.reap_runs()
+        attempts.append(p.db.task(tid)["attempts"])
+    assert attempts == [0, 0, 0, 1], attempts
+    assert p.db.task(tid)["status"] != "blocked"
+
+
+def test_a_coordinator_turn_cut_by_a_host_sleep_is_not_a_failed_turn(env, monkeypatch):
+    p = make(env)
+    from ttp import runner
+    from ttp.daemon import Daemon
+    monkeypatch.setattr(runner, "boot_id", lambda: "b")
+    d = Daemon(p.base)
+    now = time.time()
+    _ended_run(p, None, {"rc": -15, "started": now - 3000, "ended": now - 60, "stopped": "timeout",
+                         "slept_s": 2500.0}, role="coordinator")
+    d.reap_runs()
+    assert int(p.db.kv("coordinator_failures", 0)) == 0
+    assert not p.db.kv("coordinator_backoff_until")
