@@ -87,6 +87,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # A command watcher's known open issue wakes the coordinator again once it was last seen more
     # than rewake_after_h ago (null = never), or every time its observation says "repeat": true.
     "screen": {"wake_min_severity": "normal", "rewake_after_h": 6},
+    # A newer tt-project installed with `ttp setup` is merged into this project's own harness by its
+    # daemon (`ttp upgrade`, once per release, never during a push), which then restarts keeping workers.
+    "upgrade": {"auto": True},
 }
 
 

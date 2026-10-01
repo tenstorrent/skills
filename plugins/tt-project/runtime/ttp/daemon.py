@@ -32,6 +32,7 @@ from . import budget as bud
 from . import coordinator as coord
 from . import locks
 from . import machines
+from . import release
 from . import runner
 from . import schedule as sched
 from . import screen as scr
@@ -97,6 +98,7 @@ class Daemon:
         self._healthy = False
         self._progressed = 0.0   # when the daemon last told the watchdogs a tick step finished
         self._last_prune = 0.0
+        self._release_due = 0.0   # when the installed tt-project release is next compared with the harness
         self._pruned_upto = 0.0   # the latest finish the last worktree sweep saw
         self._kept: dict[int, tuple[float, float, str]] = {}   # task id -> (task updated, checked, why kept)
         self._disk_low = bool(self.p.db.kv("disk_low"))   # an episode outlives a restart: no second alert
@@ -243,7 +245,7 @@ class Daemon:
             self.cfg, self._last_cfg = self.p.config(), now
             self.jev = Jev(self.cfg, db=self.p.db)
         for step in (self.reap_runs, self.wake_after_reboot, self.meter_running, self.reconcile_tasks,
-                     self.prune_worktrees, self.check_disk, self.sweep_alerts):
+                     self.prune_worktrees, self.check_disk, self.sweep_alerts, self.check_release):
             step()
             self._progress()
         if self.p.db.kv("paused", False):
@@ -1538,6 +1540,40 @@ class Daemon:
         else:
             db.set_kv("disk_low", None)
             log(self.p, f"disk space ok again: {free / 1e9:.1f} GB free under {path}")
+
+    def check_release(self) -> None:
+        """Hourly (and at start): is a newer tt-project installed than this harness runs? Status and
+        the web app say so while it is. With upgrade.auto on, and no push or upgrade in flight, start
+        this project's own `ttp upgrade` once per release; it restarts this daemon, keeping workers."""
+        now = time.time()
+        if now < self._release_due:
+            return
+        self._release_due = now + release.CHECK_S
+        db = self.p.db
+        try:
+            d = release.drift(self.p)
+        except Exception as e:   # a half-written install must not stop the tick
+            log(self.p, f"release check failed: {type(e).__name__}: {e}")
+            return
+        if d != db.kv(release.KV_RELEASE):
+            db.set_kv(release.KV_RELEASE, d)
+            if d:
+                log(self.p, f"tt-project {d['installed']} installed; harness on {d['current']}")
+        if not d or not (self.cfg.get("upgrade") or {}).get("auto", True) or db.kv("paused", False):
+            return
+        why = release.hold_reason(self.p, d)
+        if why:
+            if why.endswith("in flight"):
+                self._release_due = now + release.HELD_RECHECK_S
+            if (db.kv(release.KV_AUTO) or {}).get("key") != d["key"] or why.endswith("in flight"):
+                log(self.p, f"automatic upgrade to {d['installed']} held: {why}")
+            return
+        log(self.p, f"automatic upgrade from {d['current']} to {d['installed']}: starting `ttp upgrade`")
+        try:
+            release.start(self.p, d)
+        except Exception as e:
+            release.finish(self.p, "failed", why=f"{type(e).__name__}: {str(e)[:200]}")
+            log(self.p, f"automatic upgrade did not start: {type(e).__name__}: {e}")
 
     def check_resource_trouble(self, every_s: float = 60) -> None:
         """A resource whose tasks keep failing (machines.trouble) starts a coordinator turn once per

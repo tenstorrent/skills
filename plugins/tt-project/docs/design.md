@@ -88,6 +88,21 @@ What each supported CLI offers, with doc links: [providers.md](providers.md).
 - `ttp upgrade <name>` commits the installed template on `upstream`, merges it into `main` in a
   scratch worktree, and fast-forwards the live harness only when the merge is clean and the
   runtime compiles and imports. Otherwise it queues a harness task and changes nothing.
+- Each daemon compares `~/.tt-project/lib/current` (version and source commit) with its own
+  harness runtime at start and then hourly. While the installed release is newer (or the same
+  version from another commit), `ttp status` and the web app show `tt-project <installed>
+  available, harness on <current>`. With `upgrade.auto` on (the default) the daemon runs the
+  installed `ttp upgrade <name> --auto` for its own project only, detached, when no push and no
+  other upgrade is in flight. That restarts the daemon (workers are kept) and posts one low
+  notify. Each release is tried once: a merge conflict leaves one harness task and no hourly
+  retries. `ttp config <name> upgrade.auto false` opts out; `ttp upgrade <name>` then applies it.
+- How a release reaches `lib/current`: `ttp setup`, run from a plugin's root, copies that plugin
+  into `~/.tt-project/lib/<version>` and points `lib/current` at it. With Claude Code, a plugin
+  update (`claude plugin update tt-project@<marketplace>`, or the marketplace's auto-update)
+  only puts the new version in Claude Code's plugin cache. The skill runs
+  `<plugin-root>/bin/ttp setup` again when `ttp --version` is older than the plugin it ships
+  with, so the first session that uses the updated plugin installs it, and every project's
+  daemon notices it within an hour. Running that `setup` by hand does the same.
 - The daemon holds `state/daemon.lock` (flock) while it lives and touches `state/heartbeat` after
   every completed tick. `status` and the web app report a stale heartbeat. `ttp restart` waits
   for a fresh one; without it, `runtime/` is restored to the last commit a daemon ran on.

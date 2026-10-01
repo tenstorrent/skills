@@ -16,6 +16,7 @@ from urllib.parse import parse_qs, urlparse
 from . import alerts
 from . import budget as bud
 from . import coordinator as coord
+from . import release
 from . import schedule as sched
 from .daemon import HEARTBEAT_STALE_S, WATCHDOG_S, heartbeat
 from .alerts import cleared  # noqa: F401  (readers import it from here)
@@ -306,6 +307,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         "undelivered": undelivered,
         "why_idle": "; ".join(why) if not running else "", "held": held,
         "host": host_line(db.boots(now - DAY)),
+        "release": release.line(p, db, cfg),
     }
 
 

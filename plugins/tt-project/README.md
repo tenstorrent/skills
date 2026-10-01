@@ -143,7 +143,10 @@ and preferences you add later become part of the project's charter and memory.
 | `~/.tt-project/` | per-user registry of projects, secrets (mode 0600), the `ttp` install |
 
 Each project starts from this plugin's template and then improves its own harness from
-experience. `ttp upgrade <name>` merges later template versions into it.
+experience. When a newer tt-project is installed (`ttp setup` from the updated plugin; the skill does
+it on first use after an update), each project's daemon merges it into its own harness within an hour
+and restarts, keeping running work. `ttp config <name> upgrade.auto false` turns that off;
+`ttp upgrade <name>` then merges by hand.
 
 ## Notifications
 

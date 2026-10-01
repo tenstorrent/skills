@@ -144,6 +144,7 @@ async function refresh() {
   const needs = st.tasks.filter((t) => t.status === "blocked").length + (st.attention || []).length;
   $("#needs").hidden = !needs; $("#needs").textContent = `${needs} need${needs === 1 ? "s" : ""} you`;
   $("#hostline").hidden = !h.host; $("#hostline").textContent = h.host || "";
+  $("#relline").hidden = !h.release; $("#relline").textContent = h.release || "";
   const dk = st.disk, kept = Object.keys(st.worktrees_kept || {});
   $("#disk").hidden = !dk;
   if (dk) {

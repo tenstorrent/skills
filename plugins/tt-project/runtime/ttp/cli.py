@@ -523,6 +523,8 @@ def status_text(p: Project) -> str:
         lines.append(f"  #{t['id']} {t['status']}: {t['title']}" + (f" — {t['blocked_reason']}" if t["blocked_reason"] else ""))
     if h.get("host"):
         lines.append(h["host"])
+    if h.get("release"):
+        lines.append(h["release"])
     disk = db.kv("disk_low")
     if disk:
         lines.append(f"disk: only {disk['free_gb']} GB free under {disk['path']} (guard {disk.get('threshold_gb', '?')} GB); "
@@ -560,8 +562,20 @@ def daemon_state(p: Project) -> str:
     return "running"
 
 
+def here() -> Project | None:
+    """The project this process runs in: its run's project, else the folder it was started in."""
+    if os.environ.get("TTP_PROJECT") and Project(os.environ["TTP_PROJECT"]).exists():
+        return Project(os.environ["TTP_PROJECT"])
+    return next((c for d in [Path.cwd(), *Path.cwd().parents] if (c := Project(d)).exists()), None)
+
+
 def cmd_status(a) -> None:
-    p = need(a.name, sys.argv[1:])
+    if a.name:
+        p = need(a.name, sys.argv[1:])
+    else:
+        p = here()
+        if not p:
+            die("no tt-project project here; name one: `ttp status <name>`")
     if a.json:
         from .web import state_payload
         print(json.dumps(state_payload(p, p.db), default=str, indent=1))
@@ -1007,14 +1021,40 @@ def cmd_setup(a) -> None:
 
 def cmd_upgrade(a) -> None:
     """Merge the installed template into a project's harness. The harness repo keeps pristine
-    template snapshots on its `upstream` branch, so this is an ordinary three-way merge."""
-    entry = remote_entry(a.name)
-    if entry and not local_project(a.name):
-        from . import machines as mm
-        ship_runtime(entry.get("ssh") or entry["host"])      # the newer runtime becomes that machine's ttp
-        print(mm.push(entry.get("ssh") or entry["host"]))
-        sys.exit(forward(entry, sys.argv[1:]))
-    p = need(a.name, sys.argv[1:])
+    template snapshots on its `upstream` branch, so this is an ordinary three-way merge. `--auto` is
+    the daemon's own call (release.py): it records the outcome and sends one low notify when applied."""
+    from . import locks, release
+    if a.project_dir:      # the daemon names its own folder: never another project of the same name
+        p = Project(a.project_dir)
+        if not p.exists() or p.name != a.name:
+            die(f"{a.project_dir} does not hold project {a.name!r}")
+    else:
+        entry = remote_entry(a.name)
+        if entry and not local_project(a.name):
+            from . import machines as mm
+            ship_runtime(entry.get("ssh") or entry["host"])      # the newer runtime becomes that machine's ttp
+            print(mm.push(entry.get("ssh") or entry["host"]))
+            sys.exit(forward(entry, sys.argv[1:]))
+        p = need(a.name, sys.argv[1:])
+    held = locks.try_take([release.upgrade_lock(p)], f"ttp upgrade (pid {os.getpid()})", "ttp upgrade")
+    if held is None:
+        die(f"another upgrade of {p.name} is running", 75)
+    try:
+        _upgrade(p, a.auto)
+    except SystemExit as e:
+        if a.auto and e.code and (p.db.kv(release.KV_AUTO) or {}).get("outcome") == "running":
+            release.finish(p, "failed", why=f"exit {e.code}; see logs/upgrade.log")
+        raise
+    except Exception as e:
+        if a.auto:
+            release.finish(p, "failed", why=f"{type(e).__name__}: {str(e)[:200]}")
+        raise
+    finally:
+        held.close()
+
+
+def _upgrade(p: Project, auto: bool = False) -> None:
+    from . import release
     from .project import HOME_DIR
     src = HOME_DIR / "lib" / "current"
     if not (src / "runtime").is_dir():
@@ -1048,11 +1088,13 @@ def cmd_upgrade(a) -> None:
         _git(h, "worktree", "remove", "--force", str(tmp))
     merged, problem = _merge_upstream(h, p.state / "upgrade-merge", ident)
     if problem:
-        tid = p.db.add_task(
-            "Finish the tt-project template upgrade", _UPGRADE_TASK.format(problem=problem, name=p.name),
+        tid = release.open_upgrade_task(p) or p.db.add_task(
+            release.UPGRADE_TASK_TITLE, _UPGRADE_TASK.format(problem=problem, name=p.name),
             kind="harness", tier="standard", priority=2, origin="user")
-        print(f"upgrade not applied; the running harness is unchanged. {problem}\nQueued harness task #{tid} to "
-              f"finish it.")
+        if auto:
+            release.finish(p, "conflict", task=tid, why=problem[:300])
+        print(f"upgrade not applied; the running harness is unchanged. {problem}\nHarness task #{tid} "
+              f"finishes it.")
         sys.exit(1)
     r = subprocess.run(["git", "-C", str(h), *ident, "merge", "--ff-only", merged], capture_output=True, text=True)
     if r.returncode != 0:   # the daemon committed charter or memory meanwhile: those touch other files
@@ -1063,6 +1105,14 @@ def cmd_upgrade(a) -> None:
     print("harness up to date with the installed template; restarting the daemon")
     from . import service
     print(service.restart(p))
+    if not auto:
+        return
+    if (_runtime_version(h / "runtime"), recorded_commit(h / "runtime")) != (new_v, new_c):
+        release.finish(p, "failed", why="the daemon did not start with it, so the runtime was rolled back")
+        return
+    release.finish(p, "applied")
+    p.db.post("out", f"tt-project harness upgraded from {old_v} ({old_c}) to {new_v} ({new_c}); the daemon "
+              f"restarted and running work was kept.", chat=None, kind="alert", severity="low")
 
 
 _UPGRADE_TASK = """`ttp upgrade` could not apply the new tt-project template on its own: {problem}
@@ -1195,7 +1245,8 @@ def main(argv: list[str] | None = None) -> None:
                           ("logs", cmd_logs, "daemon log tail"), ("doctor", cmd_doctor, "diagnose setup"),
                           ("prune", cmd_prune, "tidy finished tasks' worktrees now (branches are kept)")):
         s = sub.add_parser(name, help=hlp)
-        s.add_argument("name")
+        # `ttp status` alone, inside a project's folder (or a run), is that project's status.
+        s.add_argument("name", nargs="?" if name == "status" else None)
         if name == "connect":
             s.add_argument("--chat")
             s.add_argument("--label")
@@ -1317,6 +1368,8 @@ def main(argv: list[str] | None = None) -> None:
 
     s = sub.add_parser("upgrade", help="merge the installed tt-project template into a project's harness")
     s.add_argument("name")
+    s.add_argument("--auto", action="store_true", help=argparse.SUPPRESS)          # the daemon's own upgrade
+    s.add_argument("--project-dir", help=argparse.SUPPRESS)
     s.set_defaults(fn=cmd_upgrade)
 
     s = sub.add_parser("alerts", help="broadcast alerts after a message id")

@@ -7816,7 +7816,7 @@ def test_a_long_tick_tells_both_watchdogs_it_still_moves(env, monkeypatch):
     d._notify = addr
     steps = []
     for name in ("reap_runs", "wake_after_reboot", "meter_running", "reconcile_tasks", "prune_worktrees",
-                 "check_disk", "sweep_alerts", "_refresh_meters", "update_gates", "run_schedules", "poll_slack",
+                 "check_disk", "sweep_alerts", "check_release", "_refresh_meters", "update_gates", "run_schedules", "poll_slack",
                  "check_resource_trouble", "retry_rejected", "maybe_coordinate", "probe_waiting", "dispatch",
                  "deliver_outbound"):
         monkeypatch.setattr(d, name, lambda name=name: steps.append(name))
@@ -7836,7 +7836,7 @@ def test_a_long_tick_tells_both_watchdogs_it_still_moves(env, monkeypatch):
     finally:
         sock.close()
         cleanup()
-    assert len(steps) == 17 and pings == [b"WATCHDOG=1"] * 15, (steps, pings)
+    assert len(steps) == 18 and pings == [b"WATCHDOG=1"] * 16, (steps, pings)
     # Before its first completed tick the heartbeat is not written (`ttp restart` reads it as that
     # tick); the start marker carries the progress, which `ttp.watchdog` counts.
     assert not hb.exists()
@@ -8260,3 +8260,137 @@ def test_cursor_resumes_a_chat_and_loads_plugins_when_its_cli_can(env, tmp_path,
     assert not Cursor().session_saved("s-9", "/w"), "Cursor documents no chat store: never resumed blind"
     monkeypatch.setitem(base._CLI_OUTPUT, ("/x/agent", "--help"), CURSOR_HELP)
     assert Cursor().resume_args("s-9") == [] and Cursor().plugin_args(["/a"]) == []
+
+
+def _release_daemon(env, monkeypatch, commit="bbbb2222"):
+    """A project, a newer release installed in lib/current, and a daemon whose automatic upgrade runs
+    `ttp upgrade --auto` in this process (the real merge path, restart stubbed)."""
+    p = make(env)
+    from ttp import cli, release, service
+    from ttp.daemon import Daemon
+    monkeypatch.setattr(service, "restart", lambda p: "restarted")
+    _install_template(env)
+    mark = env["home"] / "lib" / "current" / "runtime" / "ttp" / "SOURCE_COMMIT"
+    mark.write_text("aaaa1111\n")
+    with contextlib.redirect_stdout(io.StringIO()):
+        cli.main(["upgrade", p.name])                  # the harness runs the older release
+    mark.write_text(commit + "\n")
+    launches = []
+
+    def launch(proj):
+        launches.append(proj.base)
+        try:
+            cli.main(["upgrade", proj.name, "--auto", "--project-dir", str(proj.base)])
+        except SystemExit:
+            pass
+    monkeypatch.setattr(release, "launch", launch)
+    return p, Daemon(p.base), launches
+
+
+def _harness_commit(p):
+    return (p.harness / "runtime" / "ttp" / "SOURCE_COMMIT").read_text().strip()
+
+
+def test_the_release_line_shows_while_a_newer_tt_project_is_installed_and_clears(env, monkeypatch):
+    from ttp import __version__
+    from ttp.cli import status_text
+    from ttp.web import health
+    p, d, launches = _release_daemon(env, monkeypatch)
+    p.set_config("upgrade.auto", False)
+    d.cfg = p.config()
+    d.check_release()
+    want = f"tt-project {__version__} (bbbb2222) available, harness on {__version__} (aaaa1111)"
+    assert want in status_text(p) and want in health(p, p.db)["release"]
+    assert "upgrade.auto is off" in health(p, p.db)["release"]
+    (p.harness / "runtime" / "ttp" / "SOURCE_COMMIT").write_text("bbbb2222\n")   # upgraded by hand
+    d.check_release()
+    assert p.db.kv("release"), "the comparison runs hourly, not every tick"
+    d._release_due = 0
+    d.check_release()
+    assert not p.db.kv("release") and "available, harness on" not in status_text(p)
+    assert not health(p, p.db)["release"] and not launches
+
+
+def test_opting_out_of_automatic_upgrades_leaves_the_harness_unchanged(env, monkeypatch):
+    p, d, launches = _release_daemon(env, monkeypatch)
+    p.set_config("upgrade.auto", False)
+    d.cfg = p.config()
+    before = _git_out(p.harness, "rev-parse", "HEAD")
+    for _ in range(2):
+        d._release_due = 0
+        d.check_release()
+    assert not launches and _git_out(p.harness, "rev-parse", "HEAD") == before
+    assert _harness_commit(p) == "aaaa1111" and not p.db.kv("upgrade_auto")
+
+
+def test_auto_upgrade_waits_for_a_push_then_runs_once_and_notifies_once(env, monkeypatch):
+    from ttp import locks, push
+    p, d, launches = _release_daemon(env, monkeypatch)
+    assert p.config()["upgrade"]["auto"] is True, "on by default"
+    held = locks.try_take(push.lock_paths(p, "origin", "feature/x"), "task #1 (run 1)", "ttp push")
+    d.check_release()
+    assert not launches and p.db.kv("release"), "never during a push"
+    assert d._release_due - time.time() < 600, "a held upgrade is looked at again soon, not in an hour"
+    held.close()
+    d._release_due = 0
+    d.check_release()
+    assert launches == [p.base] and _harness_commit(p) == "bbbb2222"
+    assert p.db.kv("upgrade_auto")["outcome"] == "applied"
+    notes = p.db.q("SELECT severity, text FROM messages WHERE text LIKE 'tt-project harness upgraded%'")
+    assert len(notes) == 1 and notes[0]["severity"] == "low" and "(aaaa1111) to" in notes[0]["text"]
+    for _ in range(2):
+        d._release_due = 0
+        d.check_release()
+    assert launches == [p.base] and not p.db.kv("release")
+
+
+def test_auto_upgrade_skips_while_another_upgrade_runs(env, monkeypatch):
+    from ttp import locks, release
+    p, d, launches = _release_daemon(env, monkeypatch)
+    held = locks.try_take([release.upgrade_lock(p)], "ttp upgrade (pid 1)", "ttp upgrade")
+    d.check_release()
+    assert not launches
+    held.close()
+
+
+def test_a_conflicting_auto_upgrade_queues_one_task_and_is_not_retried(env, monkeypatch):
+    from ttp.cli import status_text
+    p, d, launches = _release_daemon(env, monkeypatch)
+    h = p.harness
+    (h / "prompts" / "kind-harness.md").write_text("# Harness task, this project's way\n")
+    _git_out(h, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "local prompt")
+    before = _git_out(h, "rev-parse", "HEAD")
+    lib = env["home"] / "lib" / "current"
+    (lib / "template" / "prompts" / "kind-harness.md").write_text("# Harness task, upstream's way\n")
+    d.check_release()
+    assert launches == [p.base] and _git_out(h, "rev-parse", "HEAD") == before
+    tasks = p.db.q("SELECT id FROM tasks WHERE kind='harness'")
+    assert len(tasks) == 1 and p.db.kv("upgrade_auto")["outcome"] == "conflict"
+    assert f"the merge needs harness task #{tasks[0]['id']}" in status_text(p)
+    for commit in ("bbbb2222", "cccc3333"):   # the next hour, and a newer release meanwhile
+        (lib / "runtime" / "ttp" / "SOURCE_COMMIT").write_text(commit + "\n")
+        d._release_due = 0
+        d.check_release()
+    assert launches == [p.base] and len(p.db.q("SELECT id FROM tasks WHERE kind='harness'")) == 1
+    assert not p.db.q("SELECT id FROM messages WHERE text LIKE 'tt-project harness upgraded%'")
+
+
+def test_an_older_installed_release_is_not_offered(env, monkeypatch):
+    p, d, launches = _release_daemon(env, monkeypatch)
+    init = env["home"] / "lib" / "current" / "runtime" / "ttp" / "__init__.py"
+    from ttp import __version__
+    init.write_text(init.read_text().replace(f'"{__version__}"', '"0.0.1"'))
+    d.check_release()
+    assert not p.db.kv("release") and not launches
+
+
+def test_status_without_a_name_uses_the_project_of_the_current_folder(env, monkeypatch, capsys):
+    p = make(env)
+    from ttp import cli
+    monkeypatch.chdir(p.worktrees)
+    cli.main(["status"])
+    assert capsys.readouterr().out.startswith("demo: daemon")
+    monkeypatch.chdir(env["tmp"])
+    with pytest.raises(SystemExit):
+        cli.main(["status"])
+    assert "no tt-project project here" in capsys.readouterr().err

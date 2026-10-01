@@ -7,13 +7,14 @@
 | `ttp list` | projects known on this machine |
 | `ttp find <name>` | locate by registry, then by chat-log locators |
 | `ttp adopt <name> --host H --dir D` | record where a project lives |
-| `ttp status <name> [--json]` | daemon, spend vs caps, coordinator health, why idle, running/blocked/waiting tasks, open questions |
+| `ttp status [<name>] [--json]` | daemon, spend vs caps, coordinator health, why idle, running/blocked/waiting tasks, open questions, a newer tt-project release; without a name, the project of the current folder |
 | `ttp task <name> list` / `add "<title>" --spec …` | inspect or queue work by hand |
 | `ttp memory <name> "<fact>" [--kind K]` / `--forget <entry>` | add a durable fact / retire a stale one to memory/archive/. Prompts get restrictions, preferences and resources whole, then the newest decisions and facts that fit |
 | `ttp config <name> <key> [value]` | read or set settings (dotted keys) |
 | `ttp pause <name>` / `resume` | stop starting model runs / start again |
 | `ttp machines add <alias> --tags device,... [--note ...]` / `ttp machines list` / `ttp machines remove <alias>` | the user's machines, shared by all their projects; each charter says which ones a project may use |
 | `ttp pause <name> --resource <r> [--reason ...]` / `ttp resume <name> --resource <r>` | hold every task that uses resource `<r>` and make `ttp lock <r>` refuse it; running workers on it are told / lift it |
+| `ttp upgrade <name>` | merge the installed tt-project release into the harness and restart; the daemon does this by itself unless `upgrade.auto` is false |
 | `ttp restart <name>` | restart the daemon and confirm it runs; a runtime it cannot start with is rolled back |
 | `ttp stop <name> [--kill]` | remove the service; keeps all data. Running workers finish unless `--kill` (their tasks resume on start) |
 | `ttp task <name> cancel <id>` | cancel a task and end its running worker |
