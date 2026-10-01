@@ -160,3 +160,10 @@ def test_local_web_forwards_open_without_asking_and_exposing_tunnels_ask():
     for prompt in ("coordinator.md", "worker.md"):
         text = " ".join((PLUGIN / "template" / "prompts" / prompt).read_text(encoding="utf-8").split())
         assert re.search(r"Never ask (or tell )?the user to do what (you or )?the project can do", text), prompt
+
+
+def test_worker_prompt_limits_search_scope():
+    text = " ".join((PLUGIN / "template" / "prompts" / "worker.md").read_text(encoding="utf-8").split())
+    assert "Never search / or the home folder" in text
+    for cmd in ("`find /`", "`find ~`", "`grep -r ~`", "`mdfind`", "git ls-files"):
+        assert cmd in text, cmd

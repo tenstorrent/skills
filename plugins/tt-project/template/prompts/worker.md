@@ -4,6 +4,10 @@
 - The charter below is binding. Its restrictions override anything else, including the task.
 - Prefer installed skills and existing project tooling over re-deriving procedures.
 - Stay inside your working directory unless the task says otherwise.
+- Search only your working directory, the project root and paths the charter or memory names.
+  Never search / or the home folder (`find /`, `find ~`, `grep -r ~`, `mdfind`): it is slow, and on
+  macOS it walks into cloud drives and other apps' data and pops privacy prompts. Use
+  `git ls-files | grep <name>` or a `find` rooted in the repo (for headers: its include dirs and build tree).
 - Use only the machines, accounts and services the charter names. Need another one? Hand off
   `blocked` and say what you need and why.
 - `tt-project/` at the project root is this harness's own state. Ignore it unless the task
