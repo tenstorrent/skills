@@ -3685,7 +3685,7 @@ def test_the_task_cap_names_its_next_slot_marks_the_reply_not_done_and_wakes_the
     clock_text = time.strftime("%H:%M", time.localtime(free_at))
     assert len(problems) == 1 and "next slot frees at" in problems[0] and f"{clock_text} local" in problems[0], problems
     reply = p.db.one("SELECT text FROM messages WHERE kind='reply'")["text"]
-    assert reply.startswith("Starting the fix now.") and "(not done: task_add: cap of 2" in reply
+    assert reply.startswith("Starting the fix now.") and "(not done: task_add: cap of 2 new tasks" in reply
     assert abs(p.db.kv(coord.RETRY_WAKE_KEY)["at"] - free_at) < 1
     # A clean turn leaves its reply alone.
     assert coord.apply(p, [{"type": "reply", "text": "All fine.", "chat": "c1"}]) == []
@@ -3713,6 +3713,50 @@ def test_the_task_cap_names_its_next_slot_marks_the_reply_not_done_and_wakes_the
     clock[0] += float(p.config()["coordinator"]["debounce_s"]) + 1
     d.maybe_coordinate()
     assert len(starts) == 1, "the freed slot did not wake the coordinator"
+
+
+def test_a_task_cap_of_0_stops_new_tasks_without_a_wake_loop(env, monkeypatch):
+    """Cap 0 means no new tasks (it once meant no cap); the retry wake waits for the cap to be raised."""
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    assert coord.apply(p, [{"type": "config_set", "key": "coordinator.max_new_tasks_per_day", "value": "-3"}]) == []
+    assert p.config()["coordinator"]["max_new_tasks_per_day"] == 0
+    problems = coord.apply(p, [{"type": "task_add", "title": "fix it", "spec": "s"},
+                               {"type": "task_add", "title": "review it", "kind": "review"}])
+    assert len(problems) == 2 and all("is 0" in x for x in problems), problems
+    assert not p.db.one("SELECT id FROM tasks WHERE origin='coordinator'")
+    d = Daemon(p.base)
+    clock = [time.time()]
+    _count_turns(d, monkeypatch, clock)
+    wake = p.db.kv(coord.RETRY_WAKE_KEY)
+    assert wake["at"] > clock[0] + 86400 * 365
+    for _ in range(3):
+        d.retry_rejected()
+    assert not p.db.one("SELECT id FROM events WHERE kind='retry_wake'"), "a cap of 0 woke the coordinator"
+    assert p.db.kv(coord.RETRY_WAKE_KEY)["at"] == wake["at"]
+    # Raising the cap frees a slot at once.
+    p.set_config("coordinator.max_new_tasks_per_day", 1)
+    d.cfg = p.config()
+    d.retry_rejected()
+    assert p.db.one("SELECT id FROM events WHERE kind='retry_wake'")
+    assert p.db.kv(coord.RETRY_WAKE_KEY) is None
+
+
+def test_review_tasks_have_their_own_higher_cap(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    p.set_config("coordinator.max_new_tasks_per_day", 1)
+    adds = [{"type": "task_add", "title": f"review {i}", "kind": "review"} for i in range(3)]
+    problems = coord.apply(p, adds)
+    assert len(p.db.q("SELECT id FROM tasks WHERE kind='review'")) == 2, "reviews skipped their cap of 2x"
+    assert len(problems) == 1 and "cap of 2 review tasks" in problems[0], problems
+    assert p.db.kv(coord.RETRY_WAKE_KEY)["review"] is True
+    # Reviews and other tasks count apart.
+    assert coord.apply(p, [{"type": "task_add", "title": "fix it", "spec": "s"}]) == []
+    assert coord.apply(p, [{"type": "config_set", "key": "coordinator.max_review_tasks_per_day", "value": "3"}]) == []
+    assert coord.apply(p, [{"type": "task_add", "title": "review 2", "kind": "review"}]) == []
+    assert coord.task_cap(p.config(), review=True) == 3
 
 
 def test_an_identical_open_ask_is_not_posted_twice(env):

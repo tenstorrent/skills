@@ -1153,15 +1153,18 @@ class Daemon:
     # coordinator ------------------------------------------------------------------------------------
     def retry_rejected(self) -> None:
         """Wake the coordinator once a rejected action's blocking condition clears (the task cap's
-        next free slot), so work a turn could not start does not wait for an idle wake."""
+        next free slot, or a raised cap), so work a turn could not start does not wait for an idle wake."""
         db = self.p.db
         wake = db.kv(coord.RETRY_WAKE_KEY) or {}
-        if not wake.get("at") or float(wake["at"]) > time.time():
+        if not wake.get("at"):
             return
-        later = coord.next_task_slot(db, int(self.cfg["coordinator"].get("max_new_tasks_per_day", 40)))
+        review = bool(wake.get("review"))
+        later = coord.next_task_slot(db, coord.task_cap(self.cfg, review), review=review)
         with db.tx():
-            if later is not None:   # the slot went to other work meanwhile: wait for the next one
-                db.set_kv(coord.RETRY_WAKE_KEY, {**wake, "at": later})
+            if later is not None:
+                # The slot is not free yet, or went to other work meanwhile: wait for the next one.
+                if float(wake["at"]) <= time.time():
+                    db.set_kv(coord.RETRY_WAKE_KEY, {**wake, "at": later})
                 return
             db.x("DELETE FROM kv WHERE key=?", (coord.RETRY_WAKE_KEY,))
             db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
@@ -1272,7 +1275,7 @@ class Daemon:
         if db.one("SELECT id FROM tasks WHERE status='queued'") or \
                 db.one("SELECT id FROM messages WHERE kind='ask' AND handled=0"):
             return False
-        if coord.next_task_slot(db, int(c.get("max_new_tasks_per_day", 40))) is not None:
+        if coord.next_task_slot(db, coord.task_cap(self.cfg)) is not None:
             return False
         base = float(c.get("starve_wake_s", 300))
         newest = db.one("SELECT COALESCE(MAX(id),0) n FROM tasks")["n"]

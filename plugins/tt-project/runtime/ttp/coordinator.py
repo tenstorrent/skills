@@ -66,7 +66,10 @@ USER_SETTABLE = {
     "delivery.push_branch": str,
     "delivery.push_checks": lambda v: push.check_list(v),
     # The runaway valve on task creation; the coordinator may raise it within MAX_TASKS_PER_DAY.
-    "coordinator.max_new_tasks_per_day": lambda v: min(int(v), MAX_TASKS_PER_DAY),
+    # 0 stops new tasks.
+    "coordinator.max_new_tasks_per_day": lambda v: max(0, min(int(v), MAX_TASKS_PER_DAY)),
+    # The separate valve on review tasks; unset means twice max_new_tasks_per_day.
+    "coordinator.max_review_tasks_per_day": lambda v: max(0, min(int(v), 2 * MAX_TASKS_PER_DAY)),
     # Skill plugins loaded for this project's workers only (a plan may recommend them).
     "providers.claude.plugin_dirs": lambda v: existing_dirs(dir_list(v)),
     # Workers load none of the user's own MCP servers, plugins, hooks or settings.
@@ -256,21 +259,39 @@ def _norm_severity(s: str | None) -> str:
 NEEDS_USER = {"budget.daily_usd", "budget.weekly_usd", "budget.reserve_pct"}
 
 
-def tasks_made(db, since: float) -> list[float]:
-    """Creation times, oldest first, of the tasks that count toward max_new_tasks_per_day.
-    Reviews do not count: they check work already done and are what lets it be delivered."""
-    return [r["created"] for r in db.q("SELECT created FROM tasks WHERE origin='coordinator' AND kind!='review' "
-                                       "AND created>? ORDER BY created", (since,))]
+def tasks_made(db, since: float, review: bool = False) -> list[float]:
+    """Creation times, oldest first, of the tasks that count toward max_new_tasks_per_day, or with
+    `review` toward max_review_tasks_per_day. Reviews have their own, higher cap: they check work
+    already done and are what lets it be delivered, but a runaway turn must still stop."""
+    return [r["created"] for r in db.q("SELECT created FROM tasks WHERE origin='coordinator' AND "
+                                       + ("kind='review'" if review else "kind!='review'")
+                                       + " AND created>? ORDER BY created", (since,))]
 
 
-def next_task_slot(db, cap: int, now: float | None = None) -> float | None:
-    """When the rolling 24 h task cap next allows a new task, or None if it allows one now."""
+def task_cap(cfg: dict, review: bool = False) -> int:
+    """The rolling 24 h cap on new tasks of the coordinator, or on its review tasks."""
+    c = cfg["coordinator"]
+    cap = int(c.get("max_new_tasks_per_day", 40))
+    if review:
+        cap = int(c["max_review_tasks_per_day"]) if c.get("max_review_tasks_per_day") is not None else 2 * cap
+    return max(0, cap)
+
+
+# How far off next_task_slot puts the next slot when the cap is 0: no new tasks until it is raised.
+NO_SLOT_S = 10 * 365 * 86400
+
+
+def next_task_slot(db, cap: int, now: float | None = None, review: bool = False) -> float | None:
+    """When the rolling 24 h task cap next allows a new task, or None if it allows one now.
+    A cap of 0 allows none: its next slot is far in the future."""
     now = time.time() if now is None else now
-    made = tasks_made(db, now - 86400)
+    if cap <= 0:
+        return now + NO_SLOT_S
+    made = tasks_made(db, now - 86400, review)
     if len(made) < cap:
         return None
     # The cap allows a task again once enough of the oldest ones leave the window.
-    return made[len(made) - cap] + 86400 if cap > 0 else None
+    return made[len(made) - cap] + 86400
 
 
 def _clock(ts: float) -> str:
@@ -308,14 +329,21 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                              (title,))
                 if dup and str(dup["id"]) != str(a.get("continues")):
                     raise ValueError(f"duplicate of open task #{dup['id']}")
-                cap = int(cfg["coordinator"].get("max_new_tasks_per_day", 40))
-                free_at = None if a.get("kind") == "review" else next_task_slot(db, cap)
+                review = a.get("kind") == "review"
+                cap = task_cap(cfg, review)
+                free_at = next_task_slot(db, cap, review=review)
                 if free_at is not None:
-                    why = (f"cap of {cap} new tasks in 24 h reached; the next slot frees at {_clock(free_at)} "
-                           f"local, when you are woken to add it again (reviews do not count)")
+                    what = "review tasks" if review else "new tasks (reviews have their own cap)"
+                    if cap <= 0:
+                        why = (f"the cap on {what} is 0: none can be added until it is raised; you are "
+                               f"woken when it is")
+                    else:
+                        why = (f"cap of {cap} {what} in 24 h reached; the next slot frees at "
+                               f"{_clock(free_at)} local, when you are woken to add it again")
                     wake = db.kv(RETRY_WAKE_KEY) or {}
                     if not wake.get("at") or free_at < float(wake["at"]):
-                        db.set_kv(RETRY_WAKE_KEY, {"at": free_at, "why": f"task_add {title!r}: {why}"})
+                        db.set_kv(RETRY_WAKE_KEY, {"at": free_at, "review": review,
+                                                   "why": f"task_add {title!r}: {why}"})
                     raise ValueError(why)
                 tier = a.get("tier") if a.get("tier") in ("light", "standard", "deep") else "standard"
                 budget = a.get("budget_usd") or cfg["budget"]["task_default_usd"].get(tier, 8.0)
