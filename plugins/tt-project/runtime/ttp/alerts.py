@@ -126,31 +126,33 @@ def sweep(db: DB, now: float | None = None) -> list[dict]:
 KEYLESS_TTL = 3600   # seconds an alert without a condition key stays in the top section
 
 
-def needs_you(db: DB, now: float) -> list[dict]:
-    """The top section: open asks and high alerts about problems that are active now, newest first.
-    A newer alert on the same condition replaces the older one."""
-    # Open asks are queried apart from alerts and kept whatever their age: they wait on the user.
+def needs_you(db: DB, now: float, limit: int = 20) -> list[dict]:
+    """The top section: open asks first, then high alerts about problems that are active now, each
+    newest first. A newer alert on the same condition replaces the older one. Open asks are kept
+    whatever their age and are never cut by `limit`, which only caps the alerts after them."""
     asks = db.q("SELECT id,ts,kind,severity,text,ref FROM messages WHERE direction='out' AND chat IS NULL "
                 "AND kind='ask' AND handled=0 ORDER BY id DESC")
     rows = db.q("SELECT id,ts,kind,severity,text,ref FROM messages WHERE direction='out' AND chat IS NULL "
                 "AND kind='alert' AND ts>? ORDER BY id DESC LIMIT 300", (now - 14 * DAY,))
-    rows = sorted(asks + rows, key=lambda m: -m["id"])
+    for m in asks:
+        m.pop("ref")
     out, seen = [], set()
     for m in rows:
+        if len(out) >= limit - len(asks):
+            break
         ref = m.pop("ref")
-        if m["kind"] == "alert":
-            if not _urgent(m["severity"]):
+        if not _urgent(m["severity"]):
+            continue
+        if ref:
+            if ref in seen:
                 continue
-            if ref:
-                if ref in seen:
-                    continue
-                seen.add(ref)
-                if not active(db, ref, m["ts"], now):
-                    continue
-            elif now - m["ts"] >= KEYLESS_TTL:   # an alert with no condition to check stays an hour
+            seen.add(ref)
+            if not active(db, ref, m["ts"], now):
                 continue
+        elif now - m["ts"] >= KEYLESS_TTL:   # an alert with no condition to check stays an hour
+            continue
         out.append(m)
-    return out[:20]
+    return asks + out
 
 
 def feed(db: DB, now: float, limit: int = 30) -> list[dict]:

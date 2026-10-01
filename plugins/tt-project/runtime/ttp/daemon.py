@@ -46,7 +46,9 @@ from .providers.jev import Jev, JevOutOfFunds
 TICK_S = 3.0
 LEASE_STALE_S = 180
 HEARTBEAT_STALE_S = 300   # longer than any single tick step (a git fetch, a watcher command)
-WATCHDOG_S = 2 * HEARTBEAT_STALE_S   # no completed tick this long: the service restarts the daemon
+WATCHDOG_S = 2 * HEARTBEAT_STALE_S   # no tick progress this long: the service restarts the daemon
+PROGRESS_EVERY_S = 30   # how often a long tick tells the watchdogs it is still moving
+WATCHER_MAX_S = HEARTBEAT_STALE_S - 60   # a command watcher's timeout_s is capped here, well below WATCHDOG_S
 RESULT_FILE = "result.json"
 MAX_FOLLOWUPS, FOLLOWUP_SPEC_CHARS = 12, 4000   # per hand-off; each follow-up is its own event
 PROBE_EVERY_S = 180     # how often a waiting task's `retry_when` probe runs
@@ -90,6 +92,7 @@ class Daemon:
         self._lock_fd: int | None = None
         self._started = time.time()
         self._healthy = False
+        self._progressed = 0.0   # when the daemon last told the watchdogs a tick step finished
         self._last_prune = 0.0
         self._pruned_upto = 0.0   # the latest finish the last worktree sweep saw
         self._kept: dict[int, tuple[float, float, str]] = {}   # task id -> (task updated, checked, why kept)
@@ -162,7 +165,8 @@ class Daemon:
         can tell a daemon that is alive but still in a slow first tick from one that is broken."""
         try:
             (self.p.state / "daemon.start").write_text(json.dumps(
-                {"pid": os.getpid(), "host": hostname(), "started": self._started, "tick_errors": self._tick_errors}))
+                {"pid": os.getpid(), "host": hostname(), "started": self._started, "tick_errors": self._tick_errors,
+                 "progress": self._progressed or None}))
         except OSError:
             pass
 
@@ -200,6 +204,7 @@ class Daemon:
         else:
             os.utime(hb, None)
         sd_notify("WATCHDOG=1", self._notify)
+        self._progressed = time.time()
         if not self._healthy:
             self._healthy = True
             try:
@@ -210,36 +215,48 @@ class Daemon:
             except (OSError, subprocess.SubprocessError):
                 pass
 
+    def _progress(self) -> None:
+        """A tick step finished: tell systemd's WatchdogSec and `ttp.watchdog` the daemon still moves,
+        so a long tick (a first tick that fetches and adds many worktrees, several slow watchers) is
+        not taken for a stuck one. Before this daemon's first completed tick the heartbeat is left
+        alone (`ttp restart` reads it as that tick); the start marker carries the progress instead."""
+        now = time.time()
+        if now - self._progressed < PROGRESS_EVERY_S:
+            return
+        self._progressed = now
+        sd_notify("WATCHDOG=1", self._notify)
+        if not self._healthy:
+            self._mark_start()
+            return
+        try:
+            os.utime(self.p.state / "heartbeat", None)
+        except OSError:
+            pass
+
     def tick(self) -> None:
         self._check_sleep()
         now = time.time()
         if now - self._last_cfg > 10:
             self.cfg, self._last_cfg = self.p.config(), now
             self.jev = Jev(self.cfg, db=self.p.db)
-        self.reap_runs()
-        self.wake_after_reboot()
-        self.meter_running()
-        self.reconcile_tasks()
-        self.prune_worktrees()
-        self.check_disk()
-        self.sweep_alerts()
+        for step in (self.reap_runs, self.wake_after_reboot, self.meter_running, self.reconcile_tasks,
+                     self.prune_worktrees, self.check_disk, self.sweep_alerts):
+            step()
+            self._progress()
         if self.p.db.kv("paused", False):
             return
         self._refresh_meters()
         self.update_gates()
         coord.expire_asks(self.p, hold=any(g.level == "red" for g in self.gates.values()))
-        self.run_schedules()
-        self.poll_slack()
-        self.check_resource_trouble()
-        self.retry_rejected()
         settling = self.settling()
-        # A person who wrote while the host settles gets an answer now: only new work waits.
-        if not settling or self.p.db.one("SELECT id FROM messages WHERE direction='in' AND handled=0"):
-            self.maybe_coordinate()
-        self.probe_waiting()
-        if not settling:
-            self.dispatch()
-        self.deliver_outbound()
+        for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.retry_rejected,
+                     self.maybe_coordinate, self.probe_waiting, self.dispatch, self.deliver_outbound):
+            # While the host settles after a sleep only new work waits: a person who wrote is answered now.
+            if settling and (step == self.dispatch or step == self.maybe_coordinate and not self.p.db.one(
+                    "SELECT id FROM messages WHERE direction='in' AND handled=0")):
+                continue
+            step()
+            self._progress()
 
     def _check_sleep(self) -> None:
         """Notice that the host slept: the wall clock jumped ahead of the monotonic one, which stands
@@ -1065,6 +1082,7 @@ class Daemon:
             except Exception as e:
                 status = f"error: {type(e).__name__}: {e}"[:200]
             sched.mark_ran(db, s, status)
+            self._progress()
 
     def _run_command_watcher(self, s: dict, payload: dict) -> str:
         cmd = payload.get("command")
@@ -1072,7 +1090,7 @@ class Daemon:
             return "no command"
         try:
             out = subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=str(self.p.root),
-                                 timeout=int(payload.get("timeout_s", 120)), env={**os.environ, "PATH": service_path()})
+                                 timeout=_watcher_timeout(payload), env={**os.environ, "PATH": service_path()})
         except subprocess.TimeoutExpired:
             self.observe(f"watcher:{s['name']}", f"watcher command timed out: {cmd}", "normal")
             return "timeout"
@@ -1344,6 +1362,7 @@ class Daemon:
                 self._unreserve(task)
                 continue
             self._start_failures = 0
+            self._progress()   # each start may have added a worktree
             busy[provider] = busy.get(provider, 0) + 1
             if gate.regime == "caps":
                 committed += cost
@@ -1908,6 +1927,16 @@ def _cut_off_cost(run_dir: Path, exit_info: dict, usage=None, prov=None) -> floa
         return 0.0
     elapsed -= min(locks.waited(run_dir, float(exit_info.get("ended") or time.time())), timeout)
     return round(budget * min(max(elapsed, 0.0) / timeout, 1.0), 4)
+
+
+def _watcher_timeout(payload: dict) -> int:
+    """A command watcher's timeout: its timeout_s (default 120), capped at WATCHER_MAX_S so one slow
+    watcher cannot hold a tick past the watchdog and restart the daemon over and over."""
+    try:
+        want = int(payload.get("timeout_s") or 120)
+    except (TypeError, ValueError):
+        want = 120
+    return max(1, min(want, WATCHER_MAX_S))
 
 
 def _with_system_prompt(provider: str, argv: list[str], path: Path) -> list[str]:

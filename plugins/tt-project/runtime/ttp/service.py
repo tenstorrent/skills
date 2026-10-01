@@ -7,8 +7,8 @@ a login session and starts at boot. Where linger is refused, a crontab watchdog 
 every 5 minutes) restarts the daemon instead. macOS: a launchd agent with KeepAlive and the
 project folder as working directory (never `/` or the home folder).
 
-A daemon that is alive but stuck (no completed tick for WATCHDOG_S) is restarted too: systemd by
-WatchdogSec (the daemon pings it after each tick), launchd and cron by `ttp.watchdog`, run every
+A daemon that is alive but stuck (no tick progress for WATCHDOG_S) is restarted too: systemd by
+WatchdogSec (the daemon pings it after each tick and between the steps of a long one), launchd and cron by `ttp.watchdog`, run every
 5 minutes, which ends it so the service starts a new one.
 """
 from __future__ import annotations

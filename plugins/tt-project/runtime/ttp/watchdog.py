@@ -25,13 +25,14 @@ TERM_GRACE_S = 15   # a daemon stuck in a system call may never run its TERM han
 
 
 def last_tick(p: Project, pid: int) -> float | None:
-    """When daemon pid last showed progress: its last completed tick, else its start."""
+    """When daemon pid last showed progress: its heartbeat (a completed tick, or a step of a long one),
+    else its start or the last step of its first tick."""
     hb = heartbeat(p)
     if hb and int(hb.get("pid") or 0) == pid:
         return time.time() - hb["age"]
     st = start_marker(p)
     if st and int(st.get("pid") or 0) == pid:
-        return float(st.get("started") or 0) or None
+        return max(float(st.get("started") or 0), float(st.get("progress") or 0)) or None
     return None
 
 

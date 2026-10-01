@@ -204,8 +204,8 @@ def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int]) ->
     for s in recurring:
         lines.append(f"- {s['name']} ({s['kind']}, every {s['every_s'] // 60} min, "
                      f"{'on' if s['enabled'] else 'off'}, 7d cost ${s['cost_7d']}): {clip(s['description'], 100)}")
-    blockers = db.q("SELECT * FROM messages WHERE kind='ask' AND handled=0 AND ts>? ORDER BY id DESC LIMIT 10",
-                    (now - 14 * 86400,))
+    # Open asks of any age: one still waits on the user however long ago it was sent.
+    blockers = db.q("SELECT * FROM messages WHERE kind='ask' AND handled=0 ORDER BY id DESC LIMIT 10")
     if blockers:
         lines.append("## Open questions to the user (resolve each once answered)")
         pending = p.db.kv(ASK_DEFAULTS_KEY, {})

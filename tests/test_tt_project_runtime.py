@@ -6924,7 +6924,7 @@ def test_top_section_keeps_old_open_asks_and_drops_keyless_alerts_after_an_hour(
     p.db.post("out", "Relabelled", kind="alert_old", severity="high")
     p.db.post("out", "Keyless fresh", kind="alert", severity="high")
     texts = [m["text"] for m in needs_you(p.db, now)]
-    assert texts == ["Keyless fresh", "Old question?"], texts
+    assert texts == ["Old question?", "Keyless fresh"], texts
     from ttp.web import health
     assert [a["text"] for a in health(p, p.db, now=now)["asks"]] == ["Old question?"]
 
@@ -7274,3 +7274,109 @@ def test_failed_or_silent_runs_do_not_say_a_plan_stopped_reporting_windows(env):
                (now - m * 60 - 60, now - m * 60))
     g = bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db, now), now)
     assert g.regime == "caps" and any("stopped reporting" in r for r in g.reasons), (g.regime, g.reasons)
+
+
+def test_top_section_lists_open_asks_first_and_never_caps_them(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.alerts import needs_you
+    now = time.time()
+    asks = [p.db.post("out", f"Question {i}?", kind="ask", severity="high") for i in range(3)]
+    p.db.x("UPDATE messages SET ts=? WHERE id=?", (now - 30 * 86400, asks[0]))
+    for i in range(40):   # newer urgent alerts, more than the cap
+        p.db.post("out", f"alarm {i}", kind="alert", severity="high")
+    top = needs_you(p.db, now)
+    assert [m["text"] for m in top[:3]] == ["Question 2?", "Question 1?", "Question 0?"], top[:4]
+    assert len(top) == 20 and all(m["kind"] == "alert" for m in top[3:])
+    for i in range(25):
+        p.db.post("out", f"More {i}?", kind="ask", severity="high")
+    top = needs_you(p.db, now)
+    assert len(top) == 28 and all(m["kind"] == "ask" for m in top), "the cap never drops an open ask"
+    # The coordinator sees an open ask however old it is.
+    for a in asks[1:]:
+        p.db.x("UPDATE messages SET handled=1 WHERE id=?", (a,))
+    p.db.x("UPDATE messages SET handled=1 WHERE text LIKE 'More %'")
+    assert "Question 0?" in coord.digest(p, {}, [], [])
+
+
+def test_a_long_tick_tells_both_watchdogs_it_still_moves(env, monkeypatch):
+    import socket
+    p = make(env)
+    from ttp import daemon as dm, watchdog
+    addr = str(env["tmp"] / "notify2.sock")
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    sock.bind(addr)
+    sock.settimeout(0.2)
+    d = dm.Daemon(p.base)
+    d._notify = addr
+    steps = []
+    for name in ("reap_runs", "wake_after_reboot", "meter_running", "reconcile_tasks", "prune_worktrees",
+                 "check_disk", "sweep_alerts", "_refresh_meters", "update_gates", "run_schedules", "poll_slack",
+                 "check_resource_trouble", "maybe_coordinate", "probe_waiting", "dispatch", "deliver_outbound"):
+        monkeypatch.setattr(d, name, lambda name=name: steps.append(name))
+    monkeypatch.setattr(dm.coord, "expire_asks", lambda *a, **k: [])
+    monkeypatch.setattr(dm, "PROGRESS_EVERY_S", 0)   # each step stands for a slow one
+    hb = p.state / "heartbeat"
+    hb.unlink(missing_ok=True)
+    d._started = time.time() - 2 * dm.WATCHDOG_S   # a first tick running far longer than the watchdog
+    try:
+        d.tick()
+        pings = []
+        while True:
+            try:
+                pings.append(sock.recv(64))
+            except socket.timeout:
+                break
+    finally:
+        sock.close()
+    assert len(steps) == 16 and pings == [b"WATCHDOG=1"] * 14, (steps, pings)
+    # Before its first completed tick the heartbeat is not written (`ttp restart` reads it as that
+    # tick); the start marker carries the progress, which `ttp.watchdog` counts.
+    assert not hb.exists()
+    assert dm.start_marker(p)["progress"] >= time.time() - 5
+    assert watchdog.last_tick(p, os.getpid()) >= time.time() - 5
+    # Once it has ticked, a long tick keeps the heartbeat fresh.
+    d._beat()
+    old = time.time() - dm.WATCHDOG_S
+    os.utime(hb, (old, old))
+    d.tick()
+    assert dm.heartbeat(p)["age"] < 5
+
+
+def test_the_watchdog_spares_a_daemon_in_a_slow_first_tick(env, monkeypatch):
+    from ttp import watchdog
+    from ttp.daemon import WATCHDOG_S
+    p = make(env)
+    proc = subprocess.Popen(["sleep", "600"])
+    monkeypatch.setattr(watchdog, "_is_daemon", lambda pid: pid == proc.pid and proc.poll() is None)
+    (p.state / "daemon.pid").write_text(str(proc.pid))
+    (p.state / "heartbeat").unlink(missing_ok=True)
+    now = time.time()
+    (p.state / "daemon.start").write_text(json.dumps({"pid": proc.pid, "started": now - 3 * WATCHDOG_S,
+                                                      "tick_errors": 0, "progress": now - 20}))
+    try:
+        for dt in (0, watchdog.CONFIRM_S, 2 * watchdog.CONFIRM_S):
+            assert watchdog.check(p, now=now + dt) == "ok"
+        assert proc.poll() is None
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_a_command_watcher_cannot_outlast_the_watchdog(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dm
+    assert dm.WATCHER_MAX_S < dm.HEARTBEAT_STALE_S < dm.WATCHDOG_S
+    assert dm._watcher_timeout({"timeout_s": 3600}) == dm.WATCHER_MAX_S
+    assert dm._watcher_timeout({"timeout_s": 30}) == 30
+    assert dm._watcher_timeout({}) == 120 and dm._watcher_timeout({"timeout_s": "x"}) == 120
+    seen = {}
+
+    def run(cmd, **kw):
+        seen.update(kw)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(dm.subprocess, "run", run)
+    d = dm.Daemon(p.base)
+    assert d._run_command_watcher({"name": "slow"}, {"command": "true", "timeout_s": 7200}).startswith("ok")
+    assert seen["timeout"] == dm.WATCHER_MAX_S
