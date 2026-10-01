@@ -273,6 +273,9 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
     paced = paced_line(g, now)
     if paced:
         stops.append(paced)
+    settle = float(db.kv("settle_until", 0) or 0)
+    if settle > now and alive:
+        stops.append(f"the host just woke from sleep; new work starts at {at(settle, now)} if it stays awake")
     disk = db.kv("disk_low")
     if disk:
         stops.append(f"disk is low ({disk['free_gb']} GB free), so only questions and plans start")

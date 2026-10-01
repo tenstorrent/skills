@@ -53,6 +53,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # own observed rate; until there is one, this $ per million weighted tokens (set high).
         "estimate_usd_per_mtok": 15.0,
         "max_reboot_losses": 3,         # a task lost to this many host reboots is blocked: it may cause them
+        # After the host wakes from a sleep, nothing new starts until it has been awake this long, so
+        # a laptop's brief maintenance wakes start no runs that the next sleep would cut.
+        "wake_settle_s": 300,
     },
     # A waiting task whose `retry_when` probe still says "not yet" sleeps on, but wakes this long
     # after its hand-off whatever the probe says.

@@ -59,6 +59,8 @@ DISK_RESUME = 1.2        # the guard ends once free space is this many times its
 DISK_FLOOR_GB = 2        # below this even questions and plans wait
 KEEP_RECHECK_S = 6 * 3600   # a finished task's kept worktree is looked at again this often
 SLEPT_MIN_S = 60        # a run whose wall clock ran this much ahead of its monotonic clock overlapped a host sleep
+SLEEP_GAP_S = HEARTBEAT_STALE_S   # a gap between ticks longer than any tick step: the host was not running us
+SLEEPS_KEPT_S = 7 * 86400
 
 
 def log(p: Project, msg: str) -> None:
@@ -102,6 +104,8 @@ class Daemon:
         self._boot_woken = False
         self._held: list[str] | None = None   # lock holders the heartbeat file last recorded
         self._notify: str | None = None   # systemd's socket for the watchdog ping, when it runs us
+        self._tick_wall, self._tick_mono = time.time(), time.monotonic()
+        self._settle_until = 0.0   # monotonic time before which nothing new starts (the host just woke)
         self._note_boot()
 
     # lifecycle ------------------------------------------------------------------------------------
@@ -208,6 +212,7 @@ class Daemon:
                 pass
 
     def tick(self) -> None:
+        self._check_sleep()
         now = time.time()
         if now - self._last_cfg > 10:
             self.cfg, self._last_cfg = self.p.config(), now
@@ -228,10 +233,40 @@ class Daemon:
         self.poll_slack()
         self.check_resource_trouble()
         self.retry_rejected()
-        self.maybe_coordinate()
+        settling = self.settling()
+        if not settling:
+            self.maybe_coordinate()
         self.probe_waiting()
-        self.dispatch()
+        if not settling:
+            self.dispatch()
         self.deliver_outbound()
+
+    def _check_sleep(self) -> None:
+        """Notice that the host slept: a gap between ticks, or the wall clock jumping ahead of the
+        monotonic one (which stands still while the host sleeps). Each sleep is kept for a week, so a
+        run reaped as lost can tell it overlapped one, and starts the settle hold."""
+        wall, mono = time.time(), time.monotonic()
+        gap = wall - self._tick_wall
+        jump = gap - (mono - self._tick_mono)
+        since = self._tick_wall
+        self._tick_wall, self._tick_mono = wall, mono
+        if jump < SLEPT_MIN_S and gap < SLEEP_GAP_S:
+            return
+        settle = float(self.cfg["budget"].get("wake_settle_s", 300))
+        self._settle_until = mono + settle
+        db = self.p.db
+        sleeps = [s for s in db.kv("host_sleeps", []) or [] if s[1] >= wall - SLEEPS_KEPT_S]
+        db.set_kv("host_sleeps", (sleeps + [[since, wall]])[-100:])
+        db.set_kv("settle_until", wall + settle)   # for status: when new work starts, if it stays awake
+        log(self.p, f"host slept or stalled for {max(jump, 0):.0f} s (tick gap {gap:.0f} s); "
+                    f"nothing new starts for {settle:.0f} s of awake time")
+
+    def settling(self) -> bool:
+        """The host woke from a sleep less than wake_settle_s of awake time ago: hold new runs."""
+        return time.monotonic() < self._settle_until
+
+    def _slept_between(self, start: float, end: float) -> bool:
+        return any(a < end and b > start for a, b in self.p.db.kv("host_sleeps", []) or [])
 
     # runs -----------------------------------------------------------------------------------------
     def _approved_mcp(self, prov, provider: str, cwd: str) -> dict:
@@ -675,8 +710,14 @@ class Daemon:
 
     def _slept_during(self, r: dict, exit_info: dict) -> bool:
         """Whether the host slept while the run was going: its supervisor saw the wall clock run
-        ahead of the monotonic one."""
-        return float(exit_info.get("slept_s") or 0) >= SLEPT_MIN_S
+        ahead of the monotonic one, or the daemon saw the host sleep between the run's start and end
+        (a supervisor that died leaves no clock readings)."""
+        if float(exit_info.get("slept_s") or 0) >= SLEPT_MIN_S:
+            return True
+        start = float(exit_info.get("started") or r["started"] or 0)
+        # A lost run ended somewhere between its last sign of life and now.
+        end = time.time() if exit_info.get("stopped") == "lost" else float(exit_info.get("ended") or time.time())
+        return bool(start) and self._slept_between(start, end)
 
     def _source_for(self, r: dict) -> str:
         if r["role"] == "coordinator":

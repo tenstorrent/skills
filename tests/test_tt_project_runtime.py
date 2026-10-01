@@ -7153,3 +7153,61 @@ def test_a_coordinator_turn_cut_by_a_host_sleep_is_not_a_failed_turn(env, monkey
     d.reap_runs()
     assert int(p.db.kv("coordinator_failures", 0)) == 0
     assert not p.db.kv("coordinator_backoff_until")
+
+
+def test_after_a_host_sleep_nothing_new_starts_until_it_has_been_awake_a_while(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dm
+    from ttp import web
+    d = dm.Daemon(p.base)
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    tid = p.db.add_task("build", "s", kind="work", tier="light", origin="user")
+    mono = [time.monotonic()]
+    monkeypatch.setattr(dm.time, "monotonic", lambda: mono[0])
+    starts = []
+    monkeypatch.setattr(d, "dispatch", lambda: starts.append("dispatch"))
+    monkeypatch.setattr(d, "maybe_coordinate", lambda: starts.append("turn"))
+    d.tick()
+    assert set(starts) == {"dispatch", "turn"}, starts
+    # The host sleeps for an hour: the wall clock jumps, the monotonic clock does not.
+    d._tick_wall -= 3600
+    starts.clear()
+    d.tick()
+    assert not starts, "a maintenance wake started work"
+    assert d._slept_between(time.time() - 1800, time.time() - 1700)
+    assert "just woke from sleep" in web.health(p, p.db, alive=True)["why_idle"]
+    mono[0] += 120
+    d.tick()
+    assert not starts, "two minutes awake is not settled"
+    mono[0] += 200
+    d.tick()
+    assert set(starts) == {"dispatch", "turn"}, starts
+    assert p.db.task(tid)["status"] == "queued"
+    # A tick gap longer than any tick step counts as well, though the monotonic clock moved with it.
+    starts.clear()
+    d._tick_wall -= 400
+    mono[0] += 400
+    d.tick()
+    assert not starts
+
+
+def test_a_lost_run_that_overlapped_a_sleep_the_daemon_saw_is_not_waste(env, monkeypatch):
+    p = make(env)
+    from ttp import runner
+    from ttp.daemon import Daemon
+    monkeypatch.setattr(runner, "boot_id", lambda: "b")
+    d = Daemon(p.base)
+    tid = p.db.add_task("build", "s", kind="work", tier="light", origin="user")
+    p.db.update_task(tid, status="running")
+    now = time.time()
+    p.db.set_kv("host_sleeps", [[now - 3000, now - 600]])
+    # Its supervisor died during the sleep: no exit.json, no clock readings, a stale lease.
+    rid = p.db.x("INSERT INTO runs(task,role,provider,started,status,boot_id,dir,pid) VALUES(?,?,?,?,?,?,?,?)",
+                 (tid, "worker", "fake", now - 3600, "running", "b", str(p.runs / "x"), 999999))
+    (p.runs / "x").mkdir(parents=True)
+    (p.runs / "x" / "lease").touch()
+    os.utime(p.runs / "x" / "lease", (now - 3100, now - 3100))
+    d.reap_runs()
+    run = p.db.one("SELECT * FROM runs WHERE id=?", (rid,))
+    assert run["status"] == "lost" and json.loads(run["note"]).get("not_waste") == "sleep", dict(run)
+    assert p.db.task(tid)["attempts"] == 0
