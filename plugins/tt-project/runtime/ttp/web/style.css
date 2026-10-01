@@ -38,7 +38,6 @@ h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: v
 .attn { border-left: 4px solid var(--red); background: var(--card); padding: 10px 12px; margin-bottom: 8px; border-radius: 6px; }
 .attn .when { color: var(--muted); font-size: 12px; }
 .card.needs .attn { margin-bottom: 6px; }
-.budgetlines { white-space: pre-wrap; font-variant-numeric: tabular-nums; margin: 0 0 12px; line-height: 1.6; }
 .feed .row .when { color: var(--muted); font-size: 12px; min-width: 7em; }
 details summary { cursor: pointer; }
 pre { white-space: pre-wrap; font-family: var(--mono); font-size: 12px; background: var(--bg); padding: 8px; border-radius: 6px; max-height: 320px; overflow: auto; }

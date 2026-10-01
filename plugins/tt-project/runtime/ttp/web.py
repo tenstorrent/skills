@@ -107,17 +107,6 @@ def paced_line(g: dict, now: float) -> str:
     return f"paced: next start ~{at(hold['until'], now)} ({over})"
 
 
-def spend_headline(spend: dict, g: dict) -> str:
-    """The header's one-line answer to "how does spend compare with the limit that binds"."""
-    n = g.get("numbers") or {}
-    if g.get("regime") == "windows" and n.get("window"):
-        return f"${spend['spent_24h']:.2f} 24h · {n['window']} {n['utilization']:.0f}% of {n['limit']:.0f}%"
-    if n.get("daily_cap"):
-        return (f"${n.get('spent_24h', 0):.2f} of ${n['daily_cap']:.0f} 24h · "
-                f"${n.get('spent_7d', 0):.2f} of ${n.get('weekly_cap', 0):.0f} 7d")
-    return f"${spend['spent_24h']:.2f} 24h · ${spend['spent_7d']:.2f} 7d"
-
-
 def offline_help(name: str) -> str:
     """What the web page says once it cannot reach the daemon. Only the viewer's computer can reopen
     a tunnel, so the command is given as information; the daemon's own service restarts it."""
@@ -127,69 +116,56 @@ def offline_help(name: str) -> str:
             f"restarts it within a few minutes, unless `ttp stop` stopped it.")
 
 
-WINDOW_LABELS = {"five_hour": "5-hour", "5h": "5-hour", "seven_day": "Weekly", "7d": "Weekly",
-                 "seven_day_opus": "Weekly (Opus)", "seven_day_sonnet": "Weekly (Sonnet)"}
+FIVE_HOUR, SEVEN_DAY = ("five_hour", "5h"), ("seven_day", "7d")
 
 
-def until(ts: float, now: float) -> str:
-    """'3h 40m', '6d 20h', '12m': time left until ts."""
-    m = max(int((ts - now) // 60), 0)
-    if m < 60:
-        return f"{m}m"
-    if m < 24 * 60:
-        return f"{m // 60}h {m % 60}m"
-    return f"{m // 1440}d {m % 1440 // 60}h"
+def window_peaks(db: DB, provider: str, names: tuple[str, ...], now: float, span_s: float) -> list[float]:
+    """The peak reading of each completed period of a plan window with readings in the last span_s.
+    A period is told apart by its reset: readings of one period jitter by seconds, periods are a
+    window's length apart."""
+    rows = db.q(f"SELECT utilization, resets_at FROM snapshots WHERE provider=? AND window IN "
+                f"({','.join('?' * len(names))}) AND resets_at IS NOT NULL AND resets_at<=? AND ts>=? "
+                f"ORDER BY resets_at", (provider, *names, now, now - span_s))
+    gap = bud.WINDOW_HOURS.get(names[0], 168.0) * 3600 / 2
+    peaks: list[float] = []
+    last = None
+    for r in rows:
+        reset, util = float(r["resets_at"]), float(r["utilization"] or 0)
+        if last is None or reset - last > gap:
+            peaks.append(util)
+        else:
+            peaks[-1] = max(peaks[-1], util)
+        last = reset
+    return peaks
 
 
-def window_history(db: DB, provider: str, window: str, now: float, days: int = 14) -> str:
-    """A plan window's recent history from the stored readings, '' without any: the daily peak for
-    windows of a day or less, the final reading of the last two completed periods for longer ones."""
-    hours = bud.WINDOW_HOURS.get(window, 168.0)
-    if hours <= 24:
-        rows = db.q("SELECT date(ts,'unixepoch','localtime') d, MAX(utilization) peak FROM snapshots "
-                    "WHERE provider=? AND window=? AND ts>=? GROUP BY d ORDER BY d", (provider, window, now - days * DAY))
-        return f"peaks last {days} days: " + " ".join(f"{float(r['peak']):.0f}" for r in rows) if rows else ""
-    rows = db.q("SELECT ts, utilization, resets_at FROM snapshots WHERE provider=? AND window=? AND resets_at IS NOT NULL "
-                "AND resets_at<=? AND ts>=? ORDER BY ts", (provider, window, now, now - 3 * hours * 3600 - DAY))
-    finals: dict[int, float] = {}
-    for r in rows:   # a period is keyed by its reset, to the hour: readings of one period jitter by seconds
-        finals[round(float(r["resets_at"]) / 3600)] = float(r["utilization"] or 0)
-    last = [finals[k] for k in sorted(finals)][-2:]
-    if not last:
-        return ""
-    unit = "week" if hours == 168 else "period"
-    label = f"last two {unit}s: " if len(last) == 2 else f"last {unit}: "
-    return label + ", ".join(f"{v:.0f}%" for v in last)
-
-
-def budget_lines(db: DB, now: float | None = None) -> list[str]:
-    """The budget in a few plain lines, for the top of the web app and `ttp status`: one line per plan
-    window (used, time to reset, history) and one for the dollar caps. Nothing where there is no data.
-    Pacing, gate reasons and top spenders are in the Budget tab."""
+def budget_line(db: DB, now: float | None = None, core: str = "claude", gate: dict | None = None,
+                spent_24h: float | None = None) -> str:
+    """The budget in one line, for the web app's header and `ttp status`:
+    '5h 4% - resets in 3.9 h, 7d 21% - resets in 6.0 d, 24h $0.17 virtual, 5h avg 31%, 7d avg 72%'.
+    The windows and averages are the account's, from the plan readings; an average is the mean of
+    each completed period's peak, 5-hour windows over 7 days and weekly ones over 3 weeks. The
+    dollars are this project's last 24 h: 'virtual' (list-price equivalent) on a plan, 'actual' when
+    billed by use. An item without data is left out. Pacing, targets and caps are in the Budget tab."""
     now = now or time.time()
-    lines: list[str] = []
-    wins = bud.plan_windows(db, now)
-    for prov in sorted({w.provider for w in wins}):
-        lines.append(f"{prov.capitalize()} plan")
-        for w in sorted((w for w in wins if w.provider == prov),
-                        key=lambda w: (bud.WINDOW_HOURS.get(w.window, 168.0), w.window)):
-            parts = [f"{w.utilization:.0f}% used"]
-            if w.resets_at:
-                parts.append(f"resets in {until(w.resets_at, now)}")
-            hist = window_history(db, prov, w.window, now)
-            if hist:
-                parts.append(hist)
-            lines.append(f"  {WINDOW_LABELS.get(w.window, w.window)}: " + ", ".join(parts))
-    caps = [g.get("numbers") or {} for g in (db.kv("gates", {}) or {}).values() if g.get("regime") != "windows"]
-    n = next((c for c in caps if c.get("daily_cap") or c.get("weekly_cap")), None)
-    if n:
-        halves = []
-        if n.get("daily_cap"):
-            halves.append(f"${n.get('spent_24h', 0):.2f} of ${n['daily_cap']:.0f} last 24h")
-        if n.get("weekly_cap"):
-            halves.append(f"${n.get('spent_7d', 0):.2f} of ${n['weekly_cap']:.0f} last 7 days")
-        lines.append(", ".join(halves))
-    return lines
+    provs = [r["provider"] for r in db.q("SELECT DISTINCT provider FROM snapshots WHERE ts>=? ORDER BY provider",
+                                         (now - 3 * WEEK,))]
+    prov = core if core in provs else provs[0] if provs else ""
+    wins = {w.window: w for w in bud.plan_windows(db, now) if w.provider == prov}
+    parts = []
+    for label, names, unit, secs in (("5h", FIVE_HOUR, "h", 3600), ("7d", SEVEN_DAY, "d", DAY)):
+        w = next((wins[n] for n in names if n in wins), None)
+        if w:
+            parts.append(f"{label} {w.utilization:.0f}%" +
+                         (f" - resets in {max(w.resets_at - now, 0) / secs:.1f} {unit}" if w.resets_at else ""))
+    plan = gate["regime"] == "windows" if (gate or {}).get("regime") else bool(wins)
+    spent = db.spent_since(now - DAY) if spent_24h is None else spent_24h
+    parts.append(f"24h ${spent:.2f} {'virtual' if plan else 'actual'}")
+    for label, names, span in (("5h avg", FIVE_HOUR, WEEK), ("7d avg", SEVEN_DAY, 3 * WEEK)):
+        peaks = window_peaks(db, prov, names, now, span) if prov else []
+        if peaks:
+            parts.append(f"{label} {sum(peaks) / len(peaks):.0f}%")
+    return ", ".join(parts)
 
 
 def last_note(run_dir: str | None) -> str:
@@ -317,7 +293,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         w["wake"] = run_wake(w.pop("run_note"))
     spend = {"spent_24h": round(db.spent_since(now - DAY), 2), "spent_7d": round(db.spent_since(now - WEEK), 2),
              "top_7d": top if top and top["usd"] else None, "in_flight": round(bud.in_flight(db), 2)}
-    spend["headline"] = spend_headline(spend, g)
+    spend["headline"] = budget_line(db, now, core, g, spend["spent_24h"])
     spend["detail"] = gate_detail(g, now) if g else ""
     return {
         "spend": spend,
@@ -330,7 +306,6 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         "undelivered": undelivered,
         "why_idle": "; ".join(why) if not running else "", "held": held,
         "host": host_line(db.boots(now - DAY)),
-        "budget_lines": budget_lines(db, now),
     }
 
 

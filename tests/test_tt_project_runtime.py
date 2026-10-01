@@ -825,8 +825,9 @@ def test_status_shows_spend_waiting_retry_and_coordinator_health(env):
     out = status_text(p)
     lines = out.splitlines()
     assert len(lines) <= 25, out
-    # The budget is one plain line; top spenders and gate reasons are in the web app's Budget tab.
-    assert "budget: $4.50 of $100 last 24h, $4.50 of $200 last 7 days" in lines, out
+    # The budget is one plain line; caps, top spenders and gate reasons are in the web app's Budget tab.
+    assert "budget: 24h $4.50 actual" in lines, out
+    assert [ln for ln in lines if "$" in ln] == ["budget: 24h $4.50 actual"], out
     assert "top 7d" not in out and "spend:" not in out, out
     wait = [ln for ln in lines if "measure on a board" in ln]
     assert wait and "waiting, next try" in wait[0] and wait[0].count("next try") == 1, out
@@ -840,7 +841,7 @@ def test_status_shows_spend_waiting_retry_and_coordinator_health(env):
 
 def test_plan_window_spend_shows_every_window_its_reset_and_that_caps_do_not_apply(env):
     p = make(env)
-    from ttp.web import gate_detail, spend_headline
+    from ttp.web import gate_detail
     now = time.time()
     g = {"regime": "windows", "level": "green", "numbers": {
         "window": "five_hour", "utilization": 65.0, "limit": 90.0, "resets_at": now + 3600, "projected": 89.8,
@@ -850,10 +851,6 @@ def test_plan_window_spend_shows_every_window_its_reset_and_that_caps_do_not_app
     assert d.startswith("account use: five_hour 65.0%, on pace for 90% by the "), d
     assert "; seven_day 62.0%, resets " in d, d
     assert "stops at 90.0%" in d and "dollar caps do not apply" in d, d
-    spend = {"spent_24h": 80.37, "spent_7d": 80.37}
-    assert spend_headline(spend, g) == "$80.37 24h · five_hour 65% of 90%"
-    caps = {"regime": "caps", "numbers": {"spent_24h": 4.5, "spent_7d": 9.0, "daily_cap": 100.0, "weekly_cap": 200.0}}
-    assert spend_headline(spend, caps) == "$4.50 of $100 24h · $9.00 of $200 7d"
     p.db.set_kv("gates", {"fake": g})
     from ttp.web import state_payload
     st = state_payload(p, p.db)
@@ -7210,15 +7207,27 @@ def test_top_section_keeps_old_open_asks_and_drops_keyless_alerts_after_an_hour(
     assert [a["text"] for a in health(p, p.db, now=now)["asks"]] == ["Old question?"]
 
 
-def test_budget_line_leaves_out_a_zero_cap(env):
+def test_budget_line_says_virtual_on_a_plan_and_actual_when_billed_by_use(env):
     p = make(env)
-    from ttp.web import budget_lines
-    p.db.set_kv("gates", {"fake": {"regime": "caps", "numbers": {"spent_24h": 3.0, "daily_cap": 10.0,
-                                                                 "spent_7d": 9.0, "weekly_cap": 0}}})
-    assert budget_lines(p.db)[-1] == "$3.00 of $10 last 24h"
-    p.db.set_kv("gates", {"fake": {"regime": "caps", "numbers": {"spent_24h": 3.0, "daily_cap": 0,
-                                                                 "spent_7d": 9.0, "weekly_cap": 50.0}}})
-    assert budget_lines(p.db)[-1] == "$9.00 of $50 last 7 days"
+    from ttp.web import budget_line, health
+    now = time.time()
+    p.db.spend("fake", 0.17, "task:1", ts=now - 3600)
+    p.db.spend("fake", 5.0, "task:1", ts=now - 2 * 86400)   # older than 24 h: not counted
+    assert budget_line(p.db, now, "fake") == "24h $0.17 actual", "no plan readings: billed by use"
+    caps = {"regime": "caps", "numbers": {"spent_24h": 0.17, "daily_cap": 100.0, "weekly_cap": 200.0}}
+    assert budget_line(p.db, now, "fake", caps) == "24h $0.17 actual"
+    assert "$100" not in budget_line(p.db, now, "fake", caps), "caps stay in the Budget tab"
+    p.db.x("INSERT INTO snapshots(ts,provider,account,window,utilization,resets_at) VALUES(?,?,?,?,?,?)",
+           (now - 60, "fake", "", "five_hour", 4.4, now + 3.94 * 3600))
+    assert budget_line(p.db, now, "fake") == "5h 4% - resets in 3.9 h, 24h $0.17 virtual"
+    plan = {"regime": "windows", "numbers": {"window": "five_hour", "utilization": 4.4, "limit": 90.0}}
+    line = budget_line(p.db, now, "fake", plan, 0.17)
+    assert line == "5h 4% - resets in 3.9 h, 24h $0.17 virtual", line
+    assert "90" not in line and "running" not in line, line
+    # A plan that lapsed to usage billing still has recent readings, but its gate says caps.
+    assert budget_line(p.db, now, "fake", caps).endswith("24h $0.17 actual")
+    p.db.set_kv("gates", {"fake": plan})
+    assert health(p, p.db, now=now)["spend"]["headline"] == budget_line(p.db, now, "fake", plan)
 
 
 def test_the_web_page_explains_an_unreachable_daemon_without_setup_details(env):
@@ -7271,29 +7280,41 @@ def test_kept_tunnel_service_files_and_adopt_replace_remove(env, tmp_path, monke
         assert tunnel.unkeep("demo", platform) == "no kept tunnel for demo"
 
 
-def test_budget_lines_show_each_plan_window_its_reset_and_history(env):
+def test_budget_line_shows_both_windows_their_resets_and_the_mean_of_window_peaks(env):
     p = make(env)
-    from ttp.web import budget_lines
+    from ttp.web import budget_line, window_peaks
     now = time.time()
-    assert budget_lines(p.db, now) == [], "no data must show nothing"
+    assert budget_line(p.db, now) == "24h $0.00 actual", "no data shows only this project's dollars"
     snap = lambda ts, win, util, resets: p.db.x(  # noqa: E731
         "INSERT INTO snapshots(ts,provider,account,window,utilization,resets_at) VALUES(?,?,?,?,?,?)",
         (ts, "claude", "", win, util, resets))
-    snap(now - 3 * 86400, "five_hour", 62.0, now - 3 * 86400 + 3600)
-    snap(now - 2 * 86400, "five_hour", 40.0, now - 2 * 86400 + 3600)
-    snap(now - 2 * 86400 + 60, "five_hour", 88.0, now - 2 * 86400 + 3600)
-    snap(now - 1, "five_hour", 3.0, now + 3 * 3600 + 40 * 60 + 30)
-    snap(now - 9 * 86400, "seven_day", 50.0, now - 8 * 86400)
-    snap(now - 8 * 86400 - 60, "seven_day", 87.0, now - 8 * 86400 + 2)
-    snap(now - 2 * 86400, "seven_day", 91.0, now - 86400)
-    snap(now - 1, "seven_day", 3.0, now + 6 * 86400 + 20 * 3600 + 30)
-    lines = budget_lines(p.db, now)
-    assert lines == ["Claude plan",
-                     "  5-hour: 3% used, resets in 3h 40m, peaks last 14 days: 62 88 3",
-                     "  Weekly: 3% used, resets in 6d 20h, last two weeks: 87%, 91%"], lines
-    p.db.set_kv("gates", {"fake": {"regime": "caps", "numbers": {"spent_24h": 12.0, "daily_cap": 100.0,
-                                                                 "spent_7d": 40.0, "weekly_cap": 200.0}}})
-    assert budget_lines(p.db, now)[-1] == "$12.00 of $100 last 24h, $40.00 of $200 last 7 days"
+    h, d = 3600, 86400
+    # Three completed 5-hour windows in the last 7 days, peaks 20, 50 and 30 (mean 33); readings of
+    # one window jitter by seconds in their reset. One older than 7 days and the current one do not count.
+    snap(now - 3 * d, "five_hour", 10.0, now - 3 * d + h)
+    snap(now - 3 * d + 600, "five_hour", 20.0, now - 3 * d + h + 2)
+    snap(now - 2 * d, "five_hour", 50.0, now - 2 * d + h)
+    snap(now - 2 * d + 60, "five_hour", 45.0, now - 2 * d + h - 1)
+    snap(now - d - 5 * h, "five_hour", 30.0, now - d - 4 * h)
+    snap(now - 8 * d, "five_hour", 99.0, now - 8 * d + h)
+    snap(now - 60, "five_hour", 4.4, now + 3.94 * h)
+    assert window_peaks(p.db, "claude", ("five_hour", "5h"), now, 7 * d) == [20.0, 50.0, 30.0]
+    # Weekly windows over 3 weeks: peaks 70 and 75 (mean 72.5 -> 72); a 4-week-old one does not count.
+    snap(now - 25 * d, "seven_day", 10.0, now - 23 * d)
+    snap(now - 18 * d, "seven_day", 60.0, now - 15 * d)
+    snap(now - 15 * d - 60, "seven_day", 70.0, now - 15 * d + 3)
+    snap(now - 9 * d, "seven_day", 75.0, now - 8 * d)
+    snap(now - 60, "seven_day", 21.2, now + 6.04 * d)
+    assert window_peaks(p.db, "claude", ("seven_day", "7d"), now, 21 * d) == [70.0, 75.0]
+    p.db.spend("claude", 0.17, "task:1", ts=now - 60)
+    line = budget_line(p.db, now)
+    assert line == "5h 4% - resets in 3.9 h, 7d 21% - resets in 6.0 d, 24h $0.17 virtual, 5h avg 33%, 7d avg 72%", line
+    assert "\n" not in line
+    # Readings of another provider on the account do not mix into the core provider's line.
+    p.db.x("INSERT INTO snapshots(ts,provider,account,window,utilization,resets_at) VALUES(?,?,?,?,?,?)",
+           (now - 60, "other", "", "five_hour", 80.0, now + h))
+    assert budget_line(p.db, now) == line
+    assert budget_line(p.db, now, "other").startswith("5h 80% - resets in 1.0 h, 24h $0.17 virtual")
 
 
 def test_web_keep_installs_a_kept_local_forward_and_adopts_an_existing_one(env, tmp_path, monkeypatch, capsys):

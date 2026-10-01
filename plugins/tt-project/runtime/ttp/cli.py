@@ -491,17 +491,7 @@ def status_text(p: Project) -> str:
         text = " ".join(m["text"].split())
         what = f"ask #{m['id']}" if m["kind"] == "ask" else "alert"
         lines.append(f"  needs you ({what}, {since(m['ts'], now)} ago): {text[:300]}")
-    s = h["spend"]
-    live = f" · ~${s['in_flight']:.2f} so far in running work" if s.get("in_flight") else ""
-    budget = h["budget_lines"]
-    if not any(ln.startswith("$") for ln in budget):   # the dollar-caps line already says what was spent
-        lines.append(f"spend: ${s['spent_24h']:.2f} last 24h, ${s['spent_7d']:.2f} last 7d{live}")
-    elif live:
-        budget = [*budget[:-1], budget[-1] + live]
-    if len(budget) == 1:
-        lines.append("budget: " + budget[0])
-    elif budget:
-        lines += ["budget:", *(f"  {ln}" for ln in budget)]
+    lines.append("budget: " + h["spend"]["headline"])
     c = h["coordinator"]
     coord = "coordinator: no turn yet"
     if c["last_turn"]:

@@ -87,6 +87,11 @@ and preferences you add later become part of the project's charter and memory.
   recorded (`metrics.reviewed_head`), so a small fix on a large stack runs light.
 - The web app shows spend per day, per task and per recurring job, and plan-window peaks for the
   last two weeks.
+- The web app's header and `ttp status` show the budget in one line, for example
+  `5h 4% - resets in 3.9 h, 7d 21% - resets in 6.0 d, 24h $0.17 virtual, 5h avg 31%, 7d avg 72%`.
+  The windows and averages are the account's (an average is the mean of each completed window's
+  peak: 5-hour windows over 7 days, weekly ones over 3 weeks). The dollars are this project's last
+  24 h: `virtual` (list-price equivalent) on a plan, `actual` when billed by use.
 
 ## Parallel work
 

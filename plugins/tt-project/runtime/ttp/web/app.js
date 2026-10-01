@@ -139,13 +139,11 @@ async function refresh() {
   $("#pname").textContent = st.project.name;
   $("#daemon").textContent = st.paused ? "paused" : stuck ? "stuck" : (st.daemon && st.daemon.pid ? `running on ${st.daemon.host}` : "stopped");
   $("#daemon").className = "pill " + (stuck ? "lv-red" : st.paused ? "lv-orange" : "lv-green");
-  $("#spend").textContent = (h.spend.headline || `${money(h.spend.spent_24h)} 24h · ${money(h.spend.spent_7d)} 7d`) +
-    (h.spend.in_flight ? ` · ~${money(h.spend.in_flight)} running` : "");
+  $("#spend").textContent = h.spend.headline || `24h ${money(h.spend.spent_24h)}`;
   $("#spend").title = h.spend.detail || "all providers";
   const needs = st.tasks.filter((t) => t.status === "blocked").length + (st.attention || []).length;
   $("#needs").hidden = !needs; $("#needs").textContent = `${needs} need${needs === 1 ? "s" : ""} you`;
   $("#hostline").hidden = !h.host; $("#hostline").textContent = h.host || "";
-  $("#budgetlines").textContent = (h.budget_lines || []).join("\n");
   const dk = st.disk, kept = Object.keys(st.worktrees_kept || {});
   $("#disk").hidden = !dk;
   if (dk) {
