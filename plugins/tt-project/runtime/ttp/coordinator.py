@@ -166,6 +166,7 @@ def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int]) ->
         low = db.kv("disk_low")
         guard = (f"LOW since {(now - float(low.get('since') or now)) / 3600:.1f}h: only question and plan tasks start "
                  f"until {disk.get('resume_gb')} GB are free; free space before queueing code work"
+                 + (f". {clip(low['usage'], 600)}" if low.get("usage") else "")
                  if low else f"ok (guard below {disk.get('threshold_gb')} GB)")
         kept = db.kv("worktrees_kept") or {}
         held = ("; finished tasks' worktrees kept: " + clip(", ".join(f"#{t} ({why})" for t, why in kept.items()), 400)

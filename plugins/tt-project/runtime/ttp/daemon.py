@@ -63,6 +63,8 @@ SLEEP_CUT = ("timeout", "stalled", "lost", "failed")   # ends a host sleep can c
 DISK_LIGHT_KINDS = ("question", "plan")   # the only task kinds that still start under the disk guard
 DISK_RESUME = 1.2        # the guard ends once free space is this many times its threshold
 DISK_FLOOR_GB = 2        # below this even questions and plans wait
+DISK_DU_TIMEOUT_S = 30   # the guard alert's du breakdown stops after this, keeping what it measured
+DISK_DU_TOP = 6          # the biggest top-level directories it names
 KEEP_RECHECK_S = 6 * 3600   # a finished task's kept worktree is looked at again this often
 SLEPT_MIN_S = 60        # a run whose wall clock ran this much ahead of its monotonic clock overlapped a host sleep
 SLEEPS_KEPT_S = 7 * 86400
@@ -73,6 +75,82 @@ def log(p: Project, msg: str) -> None:
     line = f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {msg}\n"
     with open(p.logs / "daemon.log", "a") as f:
         f.write(line)
+
+
+def _du(args: list[str], timeout: float) -> tuple[dict[str, int], bool]:
+    """{path: bytes} from `du -k` (unreadable directories are skipped), and whether it finished
+    within `timeout`; what it printed before it was stopped is kept."""
+    try:
+        r = subprocess.run(["du", "-k", *args], capture_output=True, timeout=max(timeout, 1))
+        out, done = r.stdout, True
+    except subprocess.TimeoutExpired as e:
+        out, done = e.stdout or b"", False
+    except OSError:
+        return {}, False
+    sizes = {}
+    for ln in (out.decode(errors="replace") if isinstance(out, bytes) else out).splitlines():
+        kb, _, name = ln.partition("\t")
+        if kb.strip().isdigit() and name:
+            sizes[name] = int(kb) * 1024
+    return sizes, done
+
+
+def _mount_of(path: Path) -> Path:
+    if os.environ.get("TTP_TEST_DISK_MOUNT"):   # tests measure a small folder, not the real disk
+        return Path(os.environ["TTP_TEST_DISK_MOUNT"])
+    p = path.resolve()
+    while not os.path.ismount(p) and p.parent != p:
+        p = p.parent
+    return p
+
+
+def disk_breakdown(p: Project, path: Path, timeout: float = DISK_DU_TIMEOUT_S) -> dict:
+    """What fills the filesystem holding `path`, so a full shared disk is not taken for project growth:
+    this project's own data on it (its root, and its worktrees wherever they are) and the biggest
+    top-level directories (du -x -d 1). The project gets at most half of `timeout`; each du keeps
+    what it measured when stopped."""
+    deadline = time.monotonic() + timeout
+    mount = _mount_of(path)
+    try:
+        dev = os.stat(mount).st_dev
+    except OSError:
+        return {"mount": str(mount), "top": [], "complete": False, "own_bytes": None, "own_complete": False}
+    roots = []
+    for d in (p.root.resolve(), p.worktrees.resolve()):
+        try:
+            if os.stat(d).st_dev == dev and not any(d == r or r in d.parents for r in roots):
+                roots.append(d)
+        except OSError:
+            continue
+    own, own_done = 0, True
+    for d in roots:
+        sizes, done = _du(["-x", "-s", str(d)], min(deadline - time.monotonic(), timeout / 2))
+        own += sum(sizes.values())
+        own_done = own_done and done and bool(sizes)
+    sizes, done = _du(["-x", "-d", "1", str(mount)], deadline - time.monotonic())
+    sizes = {k: v for k, v in sizes.items() if Path(k) != mount}   # the total line
+    top = sorted(sizes.items(), key=lambda kv: -kv[1])[:DISK_DU_TOP]
+    return {"mount": str(mount), "top": top, "complete": done, "own_bytes": own if roots else None,
+            "own_complete": own_done}
+
+
+def disk_usage_line(b: dict, used: float) -> str:
+    """One sentence for the guard alert: this project's share of the used space, then the biggest
+    top-level directories."""
+    gb = lambda n: f"{n / 1e9:.1f} GB"   # noqa: E731
+    parts = []
+    if b.get("own_bytes") is not None:
+        partial = "" if b.get("own_complete") else " or more (du stopped early)"
+        parts.append(f"This project's own data is {gb(b['own_bytes'])}{partial} of the {gb(used)} used on {b['mount']}")
+    else:
+        parts.append(f"{gb(used)} used on {b['mount']}")
+    if b.get("top"):
+        partial = "" if b.get("complete") else f" (du stopped after {DISK_DU_TIMEOUT_S} s; partial)"
+        parts.append(f"biggest top-level directories{partial}: "
+                     + ", ".join(f"{name} {gb(n)}" for name, n in b["top"]))
+    else:
+        parts.append(f"du measured no top-level directory within {DISK_DU_TIMEOUT_S} s")
+    return "; ".join(parts) + "."
 
 
 class Daemon:
@@ -1511,6 +1589,12 @@ class Daemon:
         line does not flap. The episode is kept in the database: a restart neither re-alerts nor forgets it."""
         cfg = self.cfg.get("disk", {})
         pct, gb = float(cfg.get("min_free_pct", 5) or 0), float(cfg.get("min_free_gb", 150) or 0)
+        try:
+            mine = machines.disk_min_free_gb()   # this machine's entry in the machines list wins
+        except Exception:
+            mine = None
+        if mine:
+            gb = mine[1]
         worst = None   # (margin, path, free, total, threshold)
         for path in {self.p.base.resolve(), self.p.worktrees.resolve()}:
             try:
@@ -1530,7 +1614,7 @@ class Daemon:
         db = self.p.db
         info = {"path": str(path), "free_gb": round(free / 1e9, 1), "total_gb": round(total / 1e9, 1),
                 "threshold_gb": round(need / 1e9, 1), "resume_gb": round(need * DISK_RESUME / 1e9, 1), "low": low,
-                "checked": now}
+                "checked": now, **({"machine": mine[0]} if mine else {})}
         last = db.kv("disk") or {}
         if (low != last.get("low") or abs(info["free_gb"] - float(last.get("free_gb") or 0)) >= 1
                 or now - float(last.get("checked") or 0) > 600):
@@ -1539,15 +1623,19 @@ class Daemon:
             return
         self._disk_low = low
         if low:
+            usage = disk_usage_line(disk_breakdown(self.p, path), total - free)
             db.set_kv("disk_low", {"path": str(path), "free_gb": info["free_gb"], "threshold_gb": info["threshold_gb"],
-                                   "since": now})
+                                   "since": now, "usage": usage})
             log(self.p, f"disk low: {free / 1e9:.1f} GB free under {path} (guard {need / 1e9:.1f} GB); "
-                        f"only questions and plans start")
+                        f"only questions and plans start. {usage}")
+            source = f"machine {mine[0]}'s min_free_gb" if mine else "disk.min_free_gb"
             self.alert("disk", f"Only {free / 1e9:.1f} GB free under {path} (guard: {need / 1e9:.0f} GB, the smaller "
-                               f"of {pct:g}% of the disk and {gb:g} GB). New tasks other than questions and plans "
-                               f"are held until {need * DISK_RESUME / 1e9:.0f} GB are free; running work, questions, plans "
-                               f"and replies continue. Finished tasks' worktrees are removed as they end; "
-                               f"`ttp prune {self.p.name}` sweeps now and lists the ones kept.", "high", every_s=0)
+                               f"of {pct:g}% of the disk and {gb:g} GB from {source}). {usage} New tasks other than "
+                               f"questions and plans are held until {need * DISK_RESUME / 1e9:.0f} GB are free; running "
+                               f"work, questions, plans and replies continue. Finished tasks' worktrees are removed as "
+                               f"they end; `ttp prune {self.p.name}` sweeps now and lists the ones kept. A shared disk "
+                               f"that others keep near full by design takes its own threshold: `ttp machines add "
+                               f"<alias> --min-free-gb N`.", "high", every_s=0)
         else:
             db.set_kv("disk_low", None)
             log(self.p, f"disk space ok again: {free / 1e9:.1f} GB free under {path}")

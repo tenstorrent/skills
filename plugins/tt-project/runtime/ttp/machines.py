@@ -12,6 +12,11 @@ stalled, timed out or were lost, hand-offs that failed or blocked, host reboots 
 The coordinator routes around it: the tasks move to a machine the charter allows that shares its
 tags. Many waits alone also show up, but only as a hint: a busy resource is not a broken one.
 
+An entry may also carry `min_free_gb`, the disk guard's threshold on that machine's filesystem: it
+overrides the project's `disk.min_free_gb` there (0 turns the guard off on it), so a shared disk that
+other services keep near full by design does not hold every project. The entry for the machine a
+daemon runs on is the one whose alias, or `hostname`, is this machine's short host name.
+
 A project created with --host runs its daemon on that machine, which reads its own copy of the list.
 `push` copies the list there, merged alias by alias with what is there: the newest change wins, a
 removal included, so a list edited on that machine is never overwritten by an older one.
@@ -81,8 +86,23 @@ def tag_list(v: Any) -> list[str]:
     return tags
 
 
-def add(alias: str, tags: Any = None, note: str | None = None) -> dict:
-    """Add a machine, or update its tags and note (a note left out keeps the old one)."""
+def gb_value(v: Any) -> float | None:
+    """A disk threshold in GB from text or a number; "" or "none" means none (the project's own)."""
+    if v is None or str(v).strip().lower() in ("", "none", "default"):
+        return None
+    try:
+        gb = float(v)
+    except (TypeError, ValueError):
+        raise ValueError(f"not a size in GB: {v!r}") from None
+    if not gb >= 0 or gb == float("inf"):
+        raise ValueError(f"not a size in GB: {v!r}")
+    return gb
+
+
+def add(alias: str, tags: Any = None, note: str | None = None, min_free_gb: Any = ...,
+        hostname: str | None = None) -> dict:
+    """Add a machine, or update its tags, note, disk threshold or host name (one left out keeps the
+    old value; a threshold or host name of "" removes it)."""
     alias = (alias or "").strip()
     if not ALIAS_RE.fullmatch(alias):
         raise ValueError(f"not a machine alias: {alias!r} (letters, digits and _.@+- only)")
@@ -93,6 +113,14 @@ def add(alias: str, tags: Any = None, note: str | None = None) -> dict:
     entry = {"tags": tag_list(tags) if tags is not None else old.get("tags", []),
              "note": " ".join(str(note).split())[:NOTE_CHARS] if note is not None else old.get("note", ""),
              "added": old.get("added") or now, "updated": now}
+    gb = old.get("min_free_gb") if min_free_gb is ... else gb_value(min_free_gb)
+    if gb is not None:
+        entry["min_free_gb"] = gb
+    host = old.get("hostname") if hostname is None else hostname.strip()
+    if host:
+        if not ALIAS_RE.fullmatch(host):
+            raise ValueError(f"not a host name: {host!r}")
+        entry["hostname"] = host
     machines[alias] = entry
     removed.pop(alias, None)
     _save(machines, removed)
@@ -177,10 +205,36 @@ def push(host: str, tries: int = 3) -> str:
     return f"could not copy the machines list to {host}: it kept changing there; try `ttp machines push` again"
 
 
+def here(known: dict[str, dict] | None = None) -> tuple[str, dict] | None:
+    """(alias, entry) for the machine this runs on: its alias or `hostname` is this machine's short
+    host name (any case); None when the list has no such entry."""
+    me = project.hostname().lower()
+    known = load() if known is None else known
+    for alias in sorted(known):
+        m = known[alias]
+        if me in (alias.lower(), str(m.get("hostname") or "").lower()):
+            return alias, m
+    return None
+
+
+def disk_min_free_gb(known: dict[str, dict] | None = None) -> tuple[str, float] | None:
+    """(alias, GB) when this machine's entry sets its own disk guard threshold, else None."""
+    hit = here(known)
+    if not hit:
+        return None
+    try:
+        gb = gb_value(hit[1].get("min_free_gb"))
+    except ValueError:
+        return None
+    return (hit[0], gb) if gb is not None else None
+
+
 def line(alias: str, m: dict) -> str:
     tags = f" [{', '.join(m.get('tags') or [])}]" if m.get("tags") else ""
+    host = f" (host {m['hostname']})" if m.get("hostname") else ""
+    disk = f" (disk guard {m['min_free_gb']:g} GB)" if isinstance(m.get("min_free_gb"), (int, float)) else ""
     note = f": {m['note']}" if m.get("note") else ""
-    return f"{alias}{tags}{note}"
+    return f"{alias}{tags}{host}{disk}{note}"
 
 
 def alternatives(alias: str, machines: dict[str, dict], avoid: set[str]) -> list[str]:

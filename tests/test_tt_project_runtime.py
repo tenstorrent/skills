@@ -32,6 +32,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     monkeypatch.setenv("TTP_HOST", "testhost")
     monkeypatch.setenv("TTP_TEST_POLL_S", "0.05")   # wait loops (runner, ttp lock, listen) check often
+    monkeypatch.setenv("TTP_TEST_DISK_MOUNT", str(tmp_path))   # the disk guard's du stays in the test folder
     for var in ("TTP_RUN_DIR", "TTP_TASK", "TTP_RUN_ID", "TTP_PROJECT"):   # tests may run inside a live run
         monkeypatch.delenv(var, raising=False)
     sys.path.insert(0, str(RUNTIME))
@@ -3880,6 +3881,85 @@ def test_the_disk_guard_alerts_once_per_episode_holds_heavy_tasks_and_resumes(en
     free["gb"] = 30
     d.dispatch()
     assert len(alerts()) == 2, "a new episode must alert again"
+
+
+@pytest.mark.parametrize("alias, extra, low, source", [
+    ("testhost", {"min_free_gb": 30}, False, "testhost"),              # this machine's own threshold wins
+    ("shared-box", {"min_free_gb": 30, "hostname": "TestHost"}, False, "shared-box"),   # matched by host name
+    ("testhost", {"min_free_gb": 0}, False, "testhost"),                # 0 turns the guard off on this machine
+    ("other-box", {"min_free_gb": 30}, True, None),                     # another machine's entry does not apply
+    ("testhost", {}, True, None)])                                      # no threshold: the project's own
+def test_a_machine_entry_sets_the_disk_guard_threshold_on_its_own_filesystem(env, monkeypatch, alias, extra, low,
+                                                                            source):
+    import collections
+    p = make(env)
+    from ttp import daemon as dm
+    from ttp import machines as mm
+    mm.add(alias, "device", "a shared disk", extra.get("min_free_gb", ...), extra.get("hostname"))
+    usage = collections.namedtuple("usage", "total used free")
+    monkeypatch.setattr(dm.shutil, "disk_usage", lambda path: usage(1000e9, 960e9, 40e9))   # project guard: 50 GB
+    dm.Daemon(p.base).check_disk()
+    assert bool(p.db.kv("disk_low")) == low
+    assert p.db.kv("disk").get("machine") == source
+    if source:
+        assert p.db.kv("disk")["threshold_gb"] == min(50, extra["min_free_gb"])
+
+
+def test_ttp_machines_add_sets_and_clears_a_disk_threshold(env, capsys):
+    from ttp import cli
+    from ttp import machines as mm
+    cli.main(["machines", "add", "box-a", "--tags", "device", "--min-free-gb", "30", "--hostname", "box-a-01"])
+    assert "box-a [device] (host box-a-01) (disk guard 30 GB)" in capsys.readouterr().out
+    cli.main(["machines", "add", "box-a", "--note", "shared /home"])   # left out: kept
+    assert mm.load()["box-a"]["min_free_gb"] == 30 and mm.load()["box-a"]["hostname"] == "box-a-01"
+    cli.main(["machines", "add", "box-a", "--min-free-gb", ""])
+    assert "min_free_gb" not in mm.load()["box-a"] and mm.load()["box-a"]["note"] == "shared /home"
+    with pytest.raises(SystemExit):
+        cli.main(["machines", "add", "box-a", "--min-free-gb", "lots"])
+    assert "min_free_gb" not in mm.load()["box-a"]
+
+
+def test_the_disk_guard_alert_says_what_fills_the_disk_and_the_projects_share(env, monkeypatch):
+    import collections
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import daemon as dm
+    other = env["tmp"] / "someone-elses-cache"
+    other.mkdir()
+    (other / "blob").write_bytes(os.urandom(3 << 20))
+    (p.root / "build.bin").write_bytes(os.urandom(1 << 20))
+    usage = collections.namedtuple("usage", "total used free")
+    monkeypatch.setattr(dm.shutil, "disk_usage", lambda path: usage(1000e9, 960e9, 40e9))
+    b = dm.disk_breakdown(p, p.base)
+    assert b["complete"] and b["own_complete"] and b["mount"] == str(env["tmp"])
+    top = dict(b["top"])
+    assert top[str(other)] >= 3 << 20 and top[str(env["repo"])] >= 1 << 20, top
+    assert next(iter(top)) == str(other), "the biggest directory comes first"
+    assert (1 << 20) <= b["own_bytes"] < (3 << 20)
+    dm.Daemon(p.base).check_disk()
+    text = p.db.one("SELECT text FROM messages WHERE kind='alert' AND ref='disk'")["text"]
+    assert f"This project's own data is 0.0 GB of the 960.0 GB used on {env['tmp']}" in text, text
+    assert f"biggest top-level directories: {other} 0.0 GB" in text, text
+    assert "--min-free-gb" in text
+    assert "This project's own data" in coord.digest(p, {}, [], [])
+
+
+def test_the_disk_breakdown_keeps_what_du_measured_before_its_time_ran_out(env, monkeypatch):
+    import subprocess as sp
+    p = make(env)
+    from ttp import daemon as dm
+
+    def slow(cmd, **kw):
+        assert kw["timeout"] <= dm.DISK_DU_TIMEOUT_S
+        if "-s" in cmd:
+            return sp.CompletedProcess(cmd, 0, f"{5 * 10 ** 6}\t{cmd[-1]}\n".encode(), b"")
+        raise sp.TimeoutExpired(cmd, kw["timeout"], output=f"{700 * 10 ** 6}\t/data/scratch\n".encode())
+    monkeypatch.setattr(dm.subprocess, "run", slow)
+    b = dm.disk_breakdown(p, p.base)
+    assert b["top"] == [("/data/scratch", 700 * 10 ** 6 * 1024)] and not b["complete"] and b["own_complete"]
+    line = dm.disk_usage_line(b, 900e9)
+    assert line == (f"This project's own data is 5.1 GB of the 900.0 GB used on {env['tmp']}; biggest top-level "
+                    f"directories (du stopped after {dm.DISK_DU_TIMEOUT_S} s; partial): /data/scratch 716.8 GB."), line
 
 
 def test_below_the_disk_floor_even_questions_wait(env, monkeypatch):

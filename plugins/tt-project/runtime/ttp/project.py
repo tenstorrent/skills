@@ -79,7 +79,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "web": {"bind": "127.0.0.1", "port": 0},
     "power": {"keep_awake": "on_ac"},
     # Disk guard: with free space under the project folder below the smaller of min_free_pct of the
-    # disk and min_free_gb (either 0 = off), only question and plan tasks start. Finished tasks'
+    # disk and min_free_gb (either 0 = off), only question and plan tasks start; a machines-list entry's
+    # own min_free_gb replaces min_free_gb on that machine (see machines.py). Finished tasks'
     # worktrees lose their cache_dirs (null = the built-in list) and are removed once clean with
     # HEAD on a branch and no submodules set up, at least an hour after the task ended, or
     # worktree_retention_days after it (0 = never tidy). Branches are never deleted.

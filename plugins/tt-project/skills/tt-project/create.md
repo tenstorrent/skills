@@ -35,7 +35,9 @@ The user's machines are listed once per user and shared by all their projects:
 
 - record machines the user names that are not listed yet yourself:
   `ttp machines add <alias> --tags device,... --note "..."` (their ssh alias; tags say what it
-  offers; no secrets in the note);
+  offers; no secrets in the note); a machine whose disk other services keep near full by design
+  gets its own disk guard threshold with `--min-free-gb N` (add `--hostname` if the alias is not
+  its short host name);
 - ask, in the same message as any other question, which of them this project may use (a
   restriction only the user sets). Put that in the brief as a line starting
   "Machines this project may use:", so the charter's Resources section records it.

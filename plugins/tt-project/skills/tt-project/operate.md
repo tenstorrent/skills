@@ -12,7 +12,7 @@
 | `ttp memory <name> "<fact>" [--kind K]` / `--forget <entry>` | add a durable fact / retire a stale one to memory/archive/. Prompts get restrictions, preferences and resources whole, then the newest decisions and facts that fit |
 | `ttp config <name> <key> [value]` | read or set settings (dotted keys) |
 | `ttp pause <name>` / `resume` | stop starting model runs / start again |
-| `ttp machines add <alias> --tags device,... [--note ...]` / `ttp machines list` / `ttp machines remove <alias>` | the user's machines, shared by all their projects; each charter says which ones a project may use |
+| `ttp machines add <alias> --tags device,... [--note ...] [--min-free-gb N] [--hostname H]` / `ttp machines list` / `ttp machines remove <alias>` | the user's machines, shared by all their projects; each charter says which ones a project may use. `--min-free-gb` sets the disk guard on that machine's filesystem for every project there (0 = off, "" = the projects' own); `--hostname` when the alias is not its short host name |
 | `ttp pause <name> --resource <r> [--reason ...]` / `ttp resume <name> --resource <r>` | hold every task that uses resource `<r>` and make `ttp lock <r>` refuse it; running workers on it are told / lift it |
 | `ttp upgrade <name>` | merge the installed tt-project release into the harness and restart; the daemon does this by itself unless `upgrade.auto` is false |
 | `ttp restart <name>` | restart the daemon and confirm it runs; a runtime it cannot start with is rolled back |
@@ -53,7 +53,11 @@
 - Disk guard: free space under the project folder below the smaller of `disk.min_free_pct` (5) of
   the disk and `disk.min_free_gb` (150) → only question and plan tasks start; running work goes on;
   one high alert per episode, cleared once free space is 1.2× the threshold. Status, the web app and
-  the coordinator's digest show free space.
+  the coordinator's digest show free space. A machine whose entry in the machines list has
+  `min_free_gb` uses that instead of `disk.min_free_gb` (for a shared disk that other services keep
+  near full by design). The alert, and the digest while low, say how much of the used space is this
+  project's own data and name the biggest top-level directories (`du -x -d 1`, stopped after 30 s),
+  so a full shared disk is not taken for project growth.
 - When a task ends (done, failed, cancelled), its worktree loses its git-ignored build and cache
   directories (`disk.cache_dirs`) and is removed once clean with HEAD on a branch. Branches are never
   deleted, so `continues` still starts from the old commits. A dirty worktree is kept and listed, and

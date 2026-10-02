@@ -851,7 +851,8 @@ def cmd_machines(a) -> None:
     from . import machines as mm
     if a.action == "add":
         try:
-            entry = mm.add(a.alias, a.tags, a.note)
+            entry = mm.add(a.alias, a.tags, a.note,
+                           ... if a.min_free_gb is None else a.min_free_gb, a.hostname)
         except ValueError as e:
             die(str(e))
         print(f"saved {mm.line(a.alias.strip(), entry)}")
@@ -1329,6 +1330,10 @@ def main(argv: list[str] | None = None) -> None:
     m.add_argument("alias", help="a short name, also used as the resource name in tasks (e.g. box-a)")
     m.add_argument("--tags", help="what it offers, comma-separated (e.g. device,x86)")
     m.add_argument("--note", help="one line for the coordinator (no secrets)")
+    m.add_argument("--min-free-gb", dest="min_free_gb",
+                   help="disk guard threshold on this machine's filesystem, overriding the projects' "
+                        "disk.min_free_gb there (0 = off; \"\" = back to the projects' own)")
+    m.add_argument("--hostname", help="its short host name, when that is not the alias (\"\" = none)")
     m = ms.add_parser("list", help="list your machines")
     m.add_argument("--json", action="store_true")
     m = ms.add_parser("remove", help="remove a machine")
