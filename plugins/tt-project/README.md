@@ -85,6 +85,10 @@ and preferences you add later become part of the project's charter and memory.
   or small (`review.light_max_lines` non-doc lines, default 60), standard otherwise; only the
   coordinator picks deep. A re-review after a failed review is measured from the head that review
   recorded (`metrics.reviewed_head`), so a small fix on a large stack runs light.
+- Each tier maps to a model and effort per provider (`providers.<name>.tiers`). The coordinator
+  runs at `coordinator.tier` (light) unless `coordinator.model` or `coordinator.effort` is set:
+  those pin the coordinator alone, so moving the light tier to a cheaper model does not move it.
+  Empty (the default) follows the tier. The model names one of `core_provider`'s models.
 - The web app shows spend per day, per task and per recurring job, and plan-window peaks for the
   last two weeks.
 - The web app's header and `ttp status` show the budget in one line, for example

@@ -65,7 +65,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "waiting": {"max_hold_s": 21600},
     "resources": {},                    # shared-slot limits, e.g. {"device": 1}
     "shared_resources": [],             # resources whose slots and pause all the user's projects share
-    "coordinator": {"tier": "light", "debounce_s": 15, "max_events_per_turn": 40,
+    # model / effort, when set, override the coordinator tier's for the coordinator only.
+    "coordinator": {"tier": "light", "model": "", "effort": "",
+                    "debounce_s": 15, "max_events_per_turn": 40,
                     "max_turns_per_hour": 30, "max_new_tasks_per_day": 200, "idle_wake_s": 3600,
                     "starve_wake_s": 300,
                     "turn_budget_usd": 1.0, "turn_timeout_s": 600,

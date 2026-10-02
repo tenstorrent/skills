@@ -407,9 +407,15 @@ class Daemon:
                   note: dict | None = None, resume: str | None = None) -> int:
         tiers = self.cfg["providers"].get(provider, {}).get("tiers", {})
         model = tiers.get(tier, {}).get("model", "")
+        effort = tiers.get(tier, {}).get("effort", "")
+        if role == "coordinator":
+            # coordinator.model / coordinator.effort pin the coordinator, so moving its tier's model
+            # (say light to a cheaper one for workers) does not move the coordinator with it.
+            c = self.cfg.get("coordinator") or {}
+            model = str(c.get("model") or "") or model
+            effort = str(c.get("effort") or "") or effort
         prices = (self.cfg.get("pricing") or {}).get(provider) or {}
         prov = get_provider(provider).use(model, prices)
-        effort = tiers.get(tier, {}).get("effort", "")
         restrictions = self.cfg.get("restrictions", {})
         if read_only and prov.isolate_read_only:
             cwd = scratch_dir(str(self.p.base))

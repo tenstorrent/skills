@@ -9285,3 +9285,44 @@ def test_project_scoped_resources_stay_per_project(env, tmp_path):
     assert subprocess.run([sys.executable, str(TTP), "lock", "--timeout", "5", "board", "--", "true"],
                           env=env_b).returncode == 0
     assert coord.pause_resource(a, "board", False) == "board resumed"
+
+
+def test_the_coordinator_model_and_effort_override_its_tier_and_leave_workers_alone(env):
+    """Moving the light tier to a cheaper model must not silently move the coordinator."""
+    p = make(env)
+    from ttp.daemon import Daemon
+    from ttp import coordinator as coord
+    assert p.config()["coordinator"]["model"] == "" and p.config()["coordinator"]["effort"] == ""
+    light = p.config()["providers"]["claude"]["tiers"]["light"]
+
+    def run(d, role):
+        tid = p.db.add_task(f"t {role}", "s", kind="code", tier="light", origin="user") \
+            if role == "worker" else None
+        rid = d.start_run(role, "go", "claude", "light", str(p.base if tid is None else p.root),
+                          task=p.db.task(tid) if tid else None, read_only=tid is None)
+        (p.runs / str(rid) / "STOP").touch()
+        row = p.db.one("SELECT model, effort FROM runs WHERE id=?", (rid,))
+        argv = json.loads((p.runs / str(rid) / "run.json").read_text())["argv"]
+        if row["model"]:
+            assert argv[argv.index("--model") + 1] == row["model"], "the CLI got another model than recorded"
+        return row
+
+    # Unset: the coordinator follows its tier, as before.
+    d = Daemon(p.base)
+    row = run(d, "coordinator")
+    assert (row["model"], row["effort"]) == (light.get("model", ""), light.get("effort", ""))
+    # The light tier moves; a pinned coordinator stays put, workers follow the tier.
+    p.set_config("providers.claude.tiers.light.model", "cheap-model")
+    p.set_config("providers.claude.tiers.light.effort", "low")
+    assert coord.apply(p, [{"type": "config_set", "key": "coordinator.model", "value": "pinned-model"},
+                           {"type": "config_set", "key": "coordinator.effort", "value": "high"}]) == []
+    d = Daemon(p.base)
+    row = run(d, "coordinator")
+    assert (row["model"], row["effort"]) == ("pinned-model", "high")
+    row = run(d, "worker")
+    assert (row["model"], row["effort"]) == ("cheap-model", "low")
+    # Only the model pinned: effort still follows the tier.
+    p.set_config("coordinator.effort", "")
+    d = Daemon(p.base)
+    row = run(d, "coordinator")
+    assert (row["model"], row["effort"]) == ("pinned-model", "low")

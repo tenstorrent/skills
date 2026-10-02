@@ -58,7 +58,7 @@ USER_SETTABLE = {
     "budget.daily_usd": float, "budget.weekly_usd": float, "budget.reserve_pct": float,
     "budget.max_parallel_workers": int, "notify.slack": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     "notify.slack_min_severity": str, "notify.chat_min_severity": str, "core_provider": str,
-    "coordinator.tier": str, "jev.enabled": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
+    "coordinator.tier": str, "coordinator.model": str, "coordinator.effort": str, "jev.enabled": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     # Where code tasks branch from: the project's working branch once it has one.
     "delivery.base_ref": str,
     # Where `ttp push` publishes (required; never main, master or the remote's default branch) and
