@@ -55,6 +55,17 @@ def with_shell_profile_default(config_overrides: list[str]) -> list[str]:
     return [DEFAULT_SHELL_PROFILE_CONFIG, *config_overrides]
 
 
+def app_server_config_overrides(args: argparse.Namespace) -> list[str]:
+    """Use the runner's permissions at process startup as well as in RPCs."""
+    # Keep startup config consistent with thread/turn overrides, including when
+    # the user's config or a generic --config override requests another policy.
+    return [
+        *args.config,
+        f"approval_policy={json.dumps(args.approval_policy)}",
+        f"sandbox_mode={json.dumps(args.sandbox)}",
+    ]
+
+
 @dataclass
 class StageState:
     thread_id: str
@@ -235,7 +246,8 @@ def parse_args() -> argparse.Namespace:
         description=(
             "Run each prompt file as an exact persisted Codex goal through "
             "codex app-server. This runner requires the openai-codex Python "
-            "package unless --codex-bin points at a Codex binary explicitly."
+            "package unless --codex-bin points at a Codex binary explicitly. "
+            "Runs default to full access without sandboxing or approval prompts."
         )
     )
     parser.add_argument("prompt_files", nargs="+", type=pathlib.Path)
@@ -286,7 +298,8 @@ def parse_args() -> argparse.Namespace:
         metavar="KEY=VALUE",
         help=(
             "Codex config override passed to app-server. May be repeated. "
-            "Shell profile initialization defaults to false."
+            "Shell profile initialization defaults to false. Use --approval-policy "
+            "and --sandbox to override the runner permissions."
         ),
     )
     parser.add_argument(
@@ -313,8 +326,14 @@ def parse_args() -> argparse.Namespace:
             "failure so a disabled guardrail cannot pass silently."
         ),
     )
-    parser.add_argument("--approval-policy", default="never")
-    parser.add_argument("--sandbox", default="danger-full-access")
+    parser.add_argument(
+        "--approval-policy", default="never",
+        help="Codex approval policy for the server, threads, and turns (default: never).",
+    )
+    parser.add_argument(
+        "--sandbox", default="danger-full-access",
+        help="Codex sandbox mode for the server, threads, and turns (default: danger-full-access).",
+    )
     parser.add_argument("--model")
     parser.add_argument("--effort")
     parser.add_argument("--summary")
@@ -1345,7 +1364,7 @@ def main() -> int:
         if telemetry is not None:
             telemetry.safe_hook("start")
             telemetry.safe_hook("bootstrap")
-        with AppServerClient(codex_bin, repo, env, stderr_log, args.config) as client:
+        with AppServerClient(codex_bin, repo, env, stderr_log, app_server_config_overrides(args)) as client:
             with (log_dir / "initialize.jsonl").open("w", encoding="utf-8") as init_log:
                 client.request(
                     "initialize",
