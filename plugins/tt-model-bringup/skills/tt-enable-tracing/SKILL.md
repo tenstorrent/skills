@@ -24,6 +24,7 @@ Read only what helps the current task:
 - `models/common/sampling/generator.py` and `models/common/modules/sampling/sampling_1d.py`: common on-device sampling implementations to compare before choosing a token-out sampling path.
 - `models/tt_transformers/tt/model.py`: model-side `prepare_decode_inputs_host` and device-only `ttnn_decode_forward` split.
 - In the target tt-metal checkout, `tech_reports/AdvancedPerformanceOptimizationsForModels/TraceCorrectness.md` ([upstream guide](https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/AdvancedPerformanceOptimizationsForModels/TraceCorrectness.md)): trace correctness requirements and the trace allocation tracker. Read this before accepting a capture/replay path or exempting intentionally shared trace buffers. This guide and the tracker implementation belong to tt-metal, not the installed skill package.
+- [Decode reload contract](../vllm-integration/references/decode-reload-contract.md): required commands for generators and vLLM adapters, host input authority, and direct-caller modes.
 - `advanced_perf_optimizations.md`: deeper examples for TTNN trace capture/replay, multiple command queues, trace plus multi-CQ, and production benchmarking patterns. Search this file for the API or failure mode you are working on before loading it wholesale.
 
 ## Mental Model
@@ -55,7 +56,7 @@ Prefer this structure:
 5. Begin trace capture.
 6. Call a device-only forward method that consumes the stable device tensors.
 7. End trace capture.
-8. For each replay, update stable device inputs outside capture, then call `ttnn.execute_trace`.
+8. For each replay, apply the requested input updates outside capture, then call `ttnn.execute_trace`.
 
 Minimal single-variant pattern (for multiple variants, finish every variant's preparation before the first capture):
 
@@ -93,6 +94,15 @@ Warmup must cover the whole generator, not only the trace about to be captured. 
 
 The generator owns this ordering for standalone and serving entrypoints, during explicit setup or coordinated first use; do not depend solely on vLLM warmup callbacks. Repeated setup calls should reuse prepared state. Restore request/KV state and sampling RNG state modified by warmup; a late decode compile pass with mock inputs must not overwrite a real request's prefilled cache.
 
+Keep variant knowledge inside the component that owns the execution path. Callers
+provide the supported configuration, such as batch/context limits and serving
+modes. The model and sampler each prepare their own internal variants, buffers,
+and synthetic inputs. The generator coordinates this preparation across all
+components before it permits any capture. A component must not capture early
+while another component still needs to compile or allocate persistent storage.
+For sampling history and reset commands, follow the
+[warmup guidance](../vllm-integration/references/decode-reload-contract.md#warmup).
+
 - Warm with the same shapes, dtypes, layouts, memory configs, and mode as capture; the warm call must drive the identical op sequence and code path so every op variant is compiled.
 - The signature can include arguments you would not expect. For example, the integer `begins`/`ends`/`step` passed to `ttnn.slice` are compile-time constants baked into the program hash, so slicing at a different offset, length, or start-tile alignment is a different program that needs its own warm-up. Tensor-valued arguments can avoid this only where the op supports them. When in doubt, warm with the same argument *values*, not just the same tensor shapes.
 - Warm state-update ops too. Autoregressive helpers such as `ttnn.plus_one`, page/position tensor updates, sampler trace setup, and persistent-output buffer allocation are easy to forget because they are not "the model", but they still compile programs and allocate resources.
@@ -124,7 +134,14 @@ Do not trace the high-level generator method unless it is already proven trace-s
 
 For autoregressive decode, page table and position tensors are trace inputs. Bind persistent device tensors before capture and replay the trace over those same tensors. Token feedback stays in the traced device path: do not read a sampled token to host and reconstruct the next token input.
 
-Build the hot loop so the steady-state step is trace replay plus the minimum caller-visible readback. Do not rebuild tokens, current positions, RoPE indices, masks, or page tables on the host every token. Advance device-owned state inside the captured graph where possible, such as `ttnn.plus_one` for current position/RoPE index and `tt_out_tok` feedback for the next token. Host refresh belongs at request boundaries, explicit reset, or actual scheduler-owned input changes; repeated per-token host refresh is an incomplete tracing implementation.
+For free-running resident decode, use trace replay plus the required output readback.
+Advance position inside the decode trace, for example with `ttnn.plus_one`, and
+use `tt_out_tok` for device token feedback. Do not rebuild these inputs from stale
+host values. Execute `reload_inputs` and `reload_page_table` exactly as commanded.
+A full reload copies token, position, and RoPE inputs, and page tables. Sampling
+uses separate commands. A page-table-only reload preserves token, position, and
+RoPE state. Do not add model-side change detection. Host sampling
+and teacher-forced token replacement require full input reloads each step.
 
 ## Canonical Split Sampling
 
@@ -133,8 +150,8 @@ After preparing all model and sampling variants under the warmup contract above,
 1. Capture the model decode trace up to sampler-ready logits.
 2. Capture the chosen common sampling implementation, or a correct generator-owned trace wrapper around it, for the active sampling mode. Before choosing, compare `models/common/sampling/` and `models/common/modules/sampling/sampling_1d.py` against the model's state, seed, topology, trace, and logprob requirements.
 3. Pass `tt_out_tok=<persistent decode token input tensor>` when calling the sampler, so the sampled token is written directly into the tensor consumed by the next decode replay.
-4. Keep current-position/RoPE position state coherent with that token feedback by advancing it on device inside the trace when the model has a fixed-step decode loop. A completed trace does not use host-originated position refresh in the per-token loop.
-5. Refresh page-table trace inputs only when the page table changes, and test both unchanged and changed page-table cases. The unchanged-page-table case should perform no per-token page-table copies after setup.
+4. Advance current-position/RoPE state exactly once in the fixed-step decode trace. Sampling and readback must not advance it again. On `reload_inputs=False`, ignore host position values.
+5. Copy page-table trace inputs on `reload_inputs` or `reload_page_table`. Test both commands and a steady step with neither command. The steady step must perform no input copies.
 6. For greedy decode, keep the sampled token on device and benchmark the available on-device greedy strategies on the target mesh. Force-argmax is only a candidate. Do not select it by default.
 
 The canonical pattern is in `models/tt_transformers/tt/generator.py`: capture decode once, bind the model to the same persistent trace inputs that replay refreshes, trace the chosen sampler path, and call sampling with `tt_out_tok` pointing at the decode token input. Untraced sampling hidden inside the model trace is not the canonical token-feedback path.
@@ -149,7 +166,17 @@ For vLLM decode serving, mirror the production split: bind persistent token/curr
 
 Do not collect Tracy, `tt-perf-report`, or `TT_METAL_DEVICE_PROFILER` metrics from a live vLLM server or serving adapter to prove this tracing work. vLLM-stage tracing evidence is functional and serving-level: trace capture/replay succeeds, stale-input tests pass, on-device sampling is wired, async split behavior is correct, qualitative/sampling checks pass, and `run_vllm_server` benchmark JSON records TTFT/ITL/throughput. Use non-serving full-model or reduced profiles from earlier stages for low-level device context if needed.
 
-Keep async readback separate from scheduler overlap. A traced decode path can be safe to submit/read asynchronously while still unsafe for vLLM to build the next step before the previous sampled token has updated scheduler state. If the caller builds token IDs, current positions, or request lengths from host scheduler tables, the trace input refresh for step N+1 must wait for sampled token N to be applied, unless there is a separate test proving the next token/position path is entirely device-owned and cannot be overwritten by stale host state.
+Keep async readback separate from scheduler overlap. Version 1 does not certify
+async support. For `supports_async_decode=True`, prove device token feedback,
+one position advance per decode, independent page-table copies, and split readback
+that returns `(host_output, read_events)`. Preserve each submission's output until
+its device-to-host copy finishes, even if another decode has started. Keep host
+results and returned views unchanged until the plugin finishes using them, not
+just until host formatting returns. The plugin completes pending work before
+it commands a full reload. Steady decode may use device state while host tokens
+lag. Do not infer input authority from tensor equality, trace mode, or prior calls.
+Carry sampling commands from forward to a separate sampling call without applying
+them twice. Apply slot remaps even when device sampling is dormant.
 
 ## What To Keep Outside Capture
 
@@ -228,13 +255,22 @@ If the fatal is a write, first check for host input creation, lazy weights, cach
 
 If replay uses stale inputs, compare the tensors captured by the model to the tensors refreshed before `execute_trace`. `tt_transformers` solves this by binding model-side trace inputs before capture and only refreshing those exact buffers before replay.
 
-Before accepting any reduced input-refresh scheme, add a focused replay test that runs two decode steps with different token and current-position values, inspects the exact persistent trace input tensors, and asserts the output/logits changed. If page-table refresh is skipped, cover both unchanged and changed page tables.
+Test all three forward-input modes. A full reload must copy changed host token and
+position values into the exact trace buffers. A steady step must ignore stale host
+values and use device feedback. A page-table-only step must update used page mappings
+without changing token, position, or RoPE state. Include a return to a previously
+captured mode or batch trace and an unchanged-table step with no input copies.
 
 Before accepting token-out decode, add a focused feedback test that proves the sampled token produced by replay N is the token input consumed by replay N+1. This is separate from teacher forcing; teacher forcing can pass while feedback is stale or host-reconstructed.
 
 When benchmarking trace replay, record whether `ttnn.execute_trace` is blocking. Blocking replay may be a valid correctness probe, but a production generator or vLLM async path should use nonblocking replay plus a clear read/output-processing split when the caller can consume it.
 
-When a traced loop is slower than the decoder-stack lower bound, instrument and fix the loop before retuning kernels. Eliminate host token refreshes, current-position/RoPE refreshes, page-table copies, mask rebuilds, cache resets, synchronizations, blocking trace replays, and feedback readbacks from the steady-state path. A line such as `position_refreshes = gen_len - 1` is evidence that the loop is still host-stepped, even if every decoder op inside the step is traced.
+When a traced loop is slower than the decoder-stack lower bound, inspect the loop
+before retuning kernels. Remove uncommanded input copies, mask rebuilds, cache
+resets, waits, and feedback readbacks from steady resident decode. Record the
+reload commands next to copy counts. Per-step full reloads are required for host
+sampling and teacher-forced token replacement; do not remove them to improve a
+benchmark. Compare free-running resident decode separately.
 
 If you are still stuck after isolating the failing block, use `$autofix`. It should run diagnosis, then verify or refute each proposed root cause with focused experiments before keeping a fix.
 
@@ -244,7 +280,7 @@ These are mechanism signatures, not model properties. When generated or served o
 
 | Symptom | Likely mechanism | Focused experiment |
 |---|---|---|
-| Every output token emitted twice (or k times) while the text still advances | Decode loop consumes a stale token/position input - feedback lags replay by one step, often because async scheduler overlap built step N+1 before sampled token N updated host request state | Two-step replay with different tokens/positions; assert the exact tensors the trace reads were refreshed and the outputs differ. In vLLM, repeat with async overlap enabled and disabled |
+| Every output token emitted twice (or k times) while the text still advances | Decode uses stale token/position state or copies lagging host inputs over device feedback | Test a full reload, then resident decode with stale host inputs. Verify feedback and one position advance. Compare overlap enabled and disabled |
 | Greedy output nondeterministic across runs, or wrong after a sampled request | Trace cache keyed too coarsely - sampling mode/params are not part of the trace key, so replay reuses another mode's captured graph | Alternate greedy and sampled requests back-to-back; log which trace id each replay uses |
 | Wrong output at exactly the capture position, correct afterwards | Capture recorded the cache update but never executed it | Execute the trace once immediately after capture, then validate the capture-position cache entry |
 | One device/replica diverges after layer N while single-chip is clean | Collective-variant divergence on that axis (numerics or ordering of the reduce path) | Compare per-device outputs at layer boundaries; swap the collective variant for the failing axis |
@@ -259,7 +295,7 @@ Leave compact evidence that the traced path is real:
 - The exact tracking-enabled invocation and environment, trace variants and replay ordering covered, and a clean allocation-check result with program-cache allocations included. List each acknowledged backing allocation, its aliases/consumers, and its lifetime invariant against every live trace. For each allocation scope, explain why exact-tensor acknowledgment is not possible and identify the allocation calls it encloses.
 - Warmup coverage and ordering: supported physical buckets/modes and persistent setup completed before the first capture, plus restoration of request/KV and RNG state.
 - Cross-request reuse evidence on the same generator/server: interleave prefill and decode, change logical lengths within prepared buckets, and alternate supported sampling modes before returning to an earlier signature. Map cache keys to actual execution signatures and trace IDs. Show at most one capture per signature and zero invalidations, retirements, or evictions during the workload. Include traces captured before the workload. Do not reset counters or restart the generator to hide recapture. Separate teardown releases from request handling. Include any deferred first-capture cost in request latency.
-- Updated-input replay test proving outputs change when trace inputs are refreshed.
+- Replay tests for full reload, page-table-only reload, and resident decode with stale host inputs.
 - For vLLM decode: stale-input validation for token/current-position/page-table refresh, explicit async-overlap setting and proof if enabled, on-device sampling trace evidence, and a passing server smoke run with decode trace enabled.
 - Split-sampling evidence for token-out decode: internal sampling trace enabled, `tt_out_tok` wired to the persistent decode token input, and greedy benchmarks using the fastest correct on-device sampling strategy measured for this mesh.
 - No host fallback in the captured path.

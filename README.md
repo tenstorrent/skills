@@ -60,6 +60,10 @@ Model bringup serving uses the standalone TT vLLM plugin and resolves its recomm
 upstream vLLM version for each new run. Before each local launch, the runner rejects known
 legacy vLLM and bundled-plugin source layouts. See
 [serving stack setup](plugins/tt-model-bringup/skills/vllm-integration/references/serving-stack.md).
+New generators and serving adapters use the
+[version-1 decode reload contract](plugins/tt-model-bringup/skills/vllm-integration/references/decode-reload-contract.md).
+The plugin chooses four explicit reload commands. Models execute them without reload
+heuristics. The guide includes direct-caller examples, slot-state rules, and async checks.
 
 ## Model bring-up
 
@@ -206,7 +210,7 @@ rules, and the do-not-flag guards that every other skill assumes and does not re
 
 | Skill | Reviews |
 |---|---|
-| `tt-vllm-serving-review` | Generator contracts, plugin registration, the `tt_data_parallel` ambiguity |
+| `tt-vllm-serving-review` | Version-1 decode reload commands, async and slot-state contracts, plugin registration, TT data-parallel layouts |
 
 ### meta — catalogue maintenance
 
@@ -231,6 +235,7 @@ Primary author is the top contributor to that path by commit count.
 | [`tenstorrent/tt-buddy`](https://github.com/tenstorrent/tt-buddy) — `knowledge/` | [@viktorpusTT](https://github.com/viktorpusTT) | CCL and matmul knowledge, vLLM recipes |
 | [`tenstorrent/tt_ops_code_gen`](https://github.com/tenstorrent/tt_ops_code_gen) | [@mstaletovicTT](https://github.com/mstaletovicTT) | The eight-category structural kernel checklist, L1 footprint discipline, memory and precision references |
 | [`tt-metal`](https://github.com/tenstorrent/tt-metal) — `.agents` | [@yieldthought](https://github.com/yieldthought) | Optimization rules, multichip, tracing, datatype sweep, vLLM integration — and the Codex PR-review skill this catalogue's output format came from |
+| [`vllm-tt-plugin`](https://github.com/tenstorrent/vllm-tt-plugin) — `docs/DECODE_RELOAD_CONTRACT.md` | [Tenstorrent](https://github.com/tenstorrent) | Version-1 decode reload commands, async capability, and request-slot state |
 | [`tt-metal`](https://github.com/tenstorrent/tt-metal) — `tt-llk/.claude` | [@ndivnicTT](https://github.com/ndivnicTT) | The LLK audit suite as a whole |
 | ⤷ `race-audit-all` | [@amahmudTT](https://github.com/amahmudTT) | Nine hazard classes, the monotonic JOIN contract, per-architecture divergence |
 | ⤷ `perf-optimization-audit` | [@fvranicTT](https://github.com/fvranicTT) | The provenance lens, semantic-equivalence gate, SIMD false-positive guards |

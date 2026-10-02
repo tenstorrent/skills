@@ -18,8 +18,17 @@ generator's low-level interface and preserves cache ownership semantics:
 - vLLM serving path: vLLM owns attention KV cache allocation and passes that
   cache through prefill/decode calls.
 
+Decode reload contract, version 1
+--------------------------------
+
+New adapters declare ``decode_input_update_contract = 1``. The plugin sends
+four explicit commands on every decode. The adapter forwards them to the
+generator or executes them itself. It must not infer a different reload policy.
+See ``skills/vllm-integration/references/decode-reload-contract.md`` in this
+plugin and ``docs/DECODE_RELOAD_CONTRACT.md`` in the selected TT plugin checkout.
+
 Async decode split contract
----------------------------
+--------------------------
 
 If ``model_capabilities["supports_async_decode"]`` is true, decode must support
 the split submit/read/process sequence:
@@ -27,8 +36,19 @@ the split submit/read/process sequence:
 1. ``decode_forward(..., read_from_device=False)`` submits decode and returns
    device-resident output handles.
 2. ``read_decode_output(..., async_read=True)`` performs minimal deferred host
-   reads and may return read events/futures.
+   reads and returns ``(host_output, read_events)``. The plugin synchronizes
+   each TTNN event before processing the host output.
 3. ``process_decode_output_host(...)`` performs host formatting only.
+
+Keep each submission's output valid until its device-to-host copy completes.
+A later submission must not overwrite it before that copy. Use ordered device
+commands or separate buffers. Returned host tensors and their views must keep
+valid, unchanged storage until the plugin finishes using them, not just until
+``process_decode_output_host`` returns.
+
+Async support also requires persistent token feedback, one device position
+advance per decode, and page-table-only refresh. Readback must not sample or
+advance state. Contract version 1 does not itself enable async support.
 """
 
 from __future__ import annotations
@@ -53,7 +73,15 @@ class VllmGeneratorAdapter(Protocol):
     Implementations are typically named ``TT<Arch>ForCausalLM`` (or
     ``...ForConditionalGeneration``) and are registered in the TT vLLM plugin.
 
-    This protocol mirrors what the TT vLLM plugin calls today.
+    This protocol targets the version-1 interface from standalone plugin PR #78.
+    It describes the API; it does not validate an implementation at runtime.
+    """
+
+    decode_input_update_contract: ClassVar[int]
+    """Set to 1 on the concrete adapter after its decode path implements all commands.
+
+    An override must preserve the contract. A marker alone does not migrate an
+    inherited legacy implementation. Missing or zero selects legacy plugin calls.
     """
 
     model_capabilities: ClassVar[ModelCapabilities]
@@ -137,6 +165,9 @@ class VllmGeneratorAdapter(Protocol):
         Warmup/compile prefill path for serving.
 
         This should exercise the same serving execution path used at runtime.
+        Delegate to generator-owned preparation. The generator coordinates all
+        components before any trace capture. Callers provide the supported
+        configuration; components own their internal variants and test inputs.
         """
 
     def warmup_model_decode(
@@ -153,6 +184,14 @@ class VllmGeneratorAdapter(Protocol):
         Warmup/compile decode path for serving.
 
         This should exercise traced decode and the serving sampling path.
+        Use the same generator-owned preparation as standalone generation.
+        The sampler prepares its own variants, buffers, and synthetic history.
+        Direct warmup calls send all four commands. A full-input, parameter-only
+        call can keep reset_sampling_state false if temporary sampling state
+        is already valid. If preparation uses a history-reset path, supply valid
+        synthetic history and full inputs. Prepare history setup before capture
+        too if it compiles programs or allocates persistent storage. Restore
+        request, KV-cache, and RNG state changed by warmup.
         """
 
     def prefill_forward(
@@ -166,7 +205,7 @@ class VllmGeneratorAdapter(Protocol):
         start_pos: Any,
         page_tables_per_layer: Any | None = None,  # Passed for hybrid KV-cache groups; absent for single-group models.
         sampling_params: Any | None = None,  # Passed only when device sampling is active.
-        empty_slots: Any | None = None,  # Passed for multi-DP user-slot mapping; absent in single-DP flows.
+        empty_slots: Any | None = None,  # Scheduler-owned destination slots, including single-DP placement.
         **kwargs: Any,
     ) -> Any:
         """
@@ -177,6 +216,9 @@ class VllmGeneratorAdapter(Protocol):
 
         The adapter should delegate to generator/model low-level prefill
         behavior whenever possible.
+        Initialize only the supplied destination slots. A partial prefill must
+        preserve parameters, seed state, and penalty history for unlisted live
+        requests. A decode slot_remap cannot identify new ownership on slot reuse.
         """
 
     def decode_forward(
@@ -188,19 +230,40 @@ class VllmGeneratorAdapter(Protocol):
         start_pos: Any,
         enable_trace: bool,
         read_from_device: bool,
+        reload_inputs: bool,
+        reload_page_table: bool,
+        reload_sampling_params: bool,
+        reset_sampling_state: bool,
         page_tables_per_layer: Any | None = None,  # Passed for hybrid KV-cache groups; absent for single-group models.
         sampling_params: Any | None = None,  # Passed only when device sampling is active.
         prompt_tokens: Any
         | None = None,  # Passed on device-sampling decode when prompt/output token history is available.
         output_tokens: Any | None = None,  # Passed with prompt_tokens for device-sampling decode state updates.
-        reset_batch: bool | None = None,  # Passed only on device-sampling decode; controls sampler state reset.
-        slot_remap: Any | None = None,  # Passed only when scheduler remaps slots between decode steps.
+        slot_remap: Any | None = None,  # Destination-to-source slot mapping in either sampling mode; may be identity.
         rope_deltas_all_users: Any
         | None = None,  # Passed for request-specific mRoPE models; may be None on steady requests.
         **kwargs: Any,
     ) -> Any:
         """
         Submit one serving decode step.
+
+        Execute or forward all four commands without model-side heuristics:
+
+        - reload_inputs copies token, position, and RoPE inputs, and page tables.
+          It does not upload sampling settings or reset sampling state.
+        - reload_page_table copies only page tables and preserves device token,
+          position, and RoPE state. The two reload flags cannot both be true.
+        - reload_sampling_params uploads sampling settings, including seeds.
+        - reset_sampling_state rebuilds penalty and RNG state for current
+          requests. It requires reload_inputs but is independent of parameter
+          upload. Initialize device seeds even when seed=None.
+
+        Host tokens and positions can be stale when reload_inputs is false.
+        Do not derive forward or sampling state from them in that case.
+        Apply each slot_remap exactly once to all slot-bound state before use,
+        including dormant device sampler state during host sampling.
+        Reject reset_batch in kwargs; do not translate it or silently ignore it.
+        decode_layout_changed is plugin-internal and is not an adapter argument.
 
         When async split is supported, ``read_from_device=False`` should return
         device-resident output suitable for deferred read.
@@ -214,7 +277,12 @@ class VllmGeneratorAdapter(Protocol):
         Read decode output to host buffers.
 
         For async split, ``async_read=True`` performs deferred/minimal host
-        reads and may return completion handles/events.
+        reads and returns ``(host_output, read_events)`` for that submission.
+        The plugin waits for the TTNN events before host processing. Do not
+        sample, reload inputs, or advance positions or RNG state during readback.
+        Preserve this submission's device output until its copy completes.
+        Keep host output unchanged until the plugin finishes using all returned
+        tensors and views, even if another decode or readback starts.
 
         Required for async split decode (and for sync decode when ``decode_forward`` returns
         device tensors instead of host tensors).
@@ -226,6 +294,10 @@ class VllmGeneratorAdapter(Protocol):
 
         This stage should not submit new device work; it is the host formatting
         boundary after ``read_decode_output``.
+        Return tensors backed by per-submission storage, or keep shared backing
+        storage unchanged until all returned tensors and views are consumed.
+        Copy the result before reusing a shared host buffer if needed. Method
+        return alone does not mean that the plugin has consumed the result.
 
         Required for async split decode (and for sync decode when ``decode_forward`` returns
         device tensors instead of host tensors).
