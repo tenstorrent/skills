@@ -105,6 +105,11 @@ and preferences you add later become part of the project's charter and memory.
   resource that several projects on one machine use is declared shared (`shared_resources` in the
   config, or `ttp machines add <alias> --shared [names]`), and then all of them take turns on its
   slots, a pause of it holds in each, and `ttp status` shows which project holds or paused it.
+  Each project still gives its own slot count (`resources`); when they differ, every project
+  uses the smallest, and `ttp status` and the coordinator say so. A count lowered while a holder
+  keeps a higher slot applies to the next holders. A pause outlives the resource leaving the
+  share: `ttp machines` refuses to unshare or remove a paused one, and a project that drops it
+  from `shared_resources` keeps the pause as its own.
 - Each task edits only its own worktree. A code task branches from the first of:
   `delivery.base_ref`; `delivery.push_branch`, then a branch the charter names as
   `branch <name>`, each only if it exists here or on origin; the remote's default branch

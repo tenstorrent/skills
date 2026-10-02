@@ -13,6 +13,7 @@ from typing import Any, Callable, Iterable, Iterator, Mapping
 
 SCHEMA_VERSION = 1
 PAUSED_RESOURCES_KEY = "paused_resources"   # kv: see DB.paused_resources
+SHARED_SEEN_KEY = "shared_pauses_seen"   # kv: {resource: pause} of the shared pauses this project acted on
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -173,7 +174,7 @@ class DB:
         v = v if isinstance(v, dict) else {}
         if shared:
             from . import shared as sh
-            v = {**v, **sh.paused_for_db(self.path)}
+            v = {**v, **sh.paused_for_db(self.path, self.kv(SHARED_SEEN_KEY, {}))}
         return v
 
     def boots(self, since: float) -> list[dict]:

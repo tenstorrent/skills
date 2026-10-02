@@ -9087,6 +9087,98 @@ def test_a_pause_of_a_shared_resource_holds_in_every_project(env, tmp_path):
     assert "no longer paused" in (run_dir / "steer.md").read_text()
 
 
+@pytest.mark.parametrize("how", ["unshare", "remove", "config", "list-merge"])
+def test_a_user_pause_outlives_the_resource_leaving_the_share(env, tmp_path, capsys, how):
+    a = make(env)
+    b = _second_project(env)
+    from ttp import cli
+    from ttp import coordinator as coord
+    from ttp import machines as mm
+    if how == "config":
+        for p in (a, b):
+            p.set_config("shared_resources", ["board"])
+    else:
+        mm.add("board", tags="device", shared="")
+    run_dir = tmp_path / "brun"
+    run_dir.mkdir()
+    tb = b.db.add_task("soak", "s", kind="work", tier="light", origin="user", labels=["resource:board"])
+    b.db.x("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(?,'worker','fake',?,'running',?)",
+           (tb, time.time(), str(run_dir)))
+    ta = a.db.add_task("waits", "s", kind="work", tier="light", origin="user", labels=["resource:board"])
+    a.db.update_task(ta, status="queued", not_before=time.time() + 7200, blocked_reason="waiting for board",
+                     result=json.dumps({"status": "waiting", "waiting_for": "board (paused)",
+                                        "retry_after_s": 7200, "waiting_since": time.time()}))
+    coord.pause_resource(a, "board", True, reason="flaky tray", by="user")
+    for p in (a, b):   # each daemon ticks once while it is shared
+        coord.sync_shared_pauses(p)
+    if how == "unshare":
+        with pytest.raises(SystemExit):
+            cli.main(["machines", "add", "board", "--unshared"])
+        assert "board is paused for every project" in capsys.readouterr().err
+        with pytest.raises(ValueError):
+            mm.add("board", shared="other")   # a new list without it unshares it too
+    elif how == "remove":
+        with pytest.raises(SystemExit):
+            cli.main(["machines", "remove", "board"])
+        assert "resume it first" in capsys.readouterr().err
+        assert "board" in mm.load()
+    elif how == "config":
+        for p in (a, b):
+            p.set_config("shared_resources", [])
+    else:   # a copy of the list from another machine dropped it, past the refusal
+        mm._save({"board": {"tags": ["device"], "note": "", "added": 1, "updated": 2}}, {})
+    for _ in range(2):
+        for p in (a, b):
+            got = p.db.paused_resources().get("board")
+            assert got and got["by"] == "user" and got["reason"] == "flaky tray", (how, p.name, got)
+        for p in (a, b):
+            coord.sync_shared_pauses(p)
+    if how in ("config", "list-merge"):
+        for p in (a, b):   # kept as each project's own pause
+            assert p.db.paused_resources(shared=False)["board"]["by"] == "user"
+        problems = coord.apply(b, [{"type": "resource_pause", "resource": "board", "paused": False}])
+        assert any("paused by the user" in x for x in problems), problems
+    assert ta not in {t["id"] for t in a.db.ready_tasks()}, "leaving the share woke a task waiting on the pause"
+    assert "no longer paused" not in (run_dir / "steer.md").read_text()
+
+
+def test_projects_that_give_a_shared_resource_different_slot_counts_use_the_smallest(env, tmp_path):
+    a = make(env)
+    b = _second_project(env)
+    from ttp import coordinator as coord
+    from ttp.cli import status_text
+    from ttp.daemon import Daemon
+    for p, n in ((a, 2), (b, 1)):
+        p.set_config("shared_resources", ["board"])
+        p.set_config("resources", {"board": n})
+    coord.sync_shared_pauses(b)   # b's daemon records its count
+    assert len(Daemon(a.base)._slot_paths("board")) == 1
+    env_a = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost", TTP_PROJECT=str(a.base))
+    env_b = dict(env_a, TTP_PROJECT=str(b.base))
+    release = tmp_path / "release"
+    holder = subprocess.Popen([sys.executable, str(TTP), "lock", "board", "--", *_until(release)], env=env_a)
+    slot = env["home"] / "locks" / "board" / "board.0.lock"
+    try:
+        deadline = time.time() + 20
+        while time.time() < deadline and not (slot.exists() and slot.read_text()):
+            time.sleep(0.05)
+        for e in (env_a, env_b):
+            out = subprocess.run([sys.executable, str(TTP), "lock", "--timeout", "1", "board", "--", "true"],
+                                 env=e, capture_output=True, text=True)
+            assert out.returncode == 75, "a second slot was taken on a board one project allows once"
+        assert not (env["home"] / "locks" / "board" / "board.1.lock").exists()
+        assert "projects give different slot counts (demo 2, other 1); all use 1" in status_text(a), status_text(a)
+        assert "Shared resource board: projects give different slot counts" in coord.digest(b, {}, [], [])
+    finally:
+        release.touch()
+        holder.wait(timeout=30)
+    # Once b stops sharing it, its count no longer holds a back.
+    b.set_config("shared_resources", [])
+    coord.sync_shared_pauses(b)
+    assert len(Daemon(a.base)._slot_paths("board")) == 2
+    assert "different slot counts" not in status_text(a)
+
+
 def test_project_scoped_resources_stay_per_project(env, tmp_path):
     a = make(env)
     b = _second_project(env)

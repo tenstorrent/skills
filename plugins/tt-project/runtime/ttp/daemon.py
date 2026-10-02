@@ -2013,7 +2013,8 @@ class Daemon:
 
     def _resources_free(self, task: dict, reserve: bool = False) -> bool:
         """Only tasks labelled `exclusive:<name>` hold a resource for their whole run; they share
-        its slot count (config `resources`, default 1). A `resource:<name>` label means the task uses
+        its slot count (config `resources`, default 1; on a shared resource the smallest any project
+        sharing it gives). A `resource:<name>` label means the task uses
         the resource for some commands: those take the resource's lock (`ttp lock`) or its own queue,
         so the rest of the task runs in parallel with other work instead of waiting for the slot.
         With reserve, a task kept out only by `ttp lock` commands reserves the resource so new ones
@@ -2023,14 +2024,13 @@ class Daemon:
         would only queue in `ttp lock` on a worker slot and a wall clock that other work could use."""
         if coord.task_resources(task) & self.p.db.paused_resources().keys():
             return False
-        limits = self.cfg.get("resources", {})
         for res in _shared(task):
             users = self.p.db.one("SELECT COUNT(*) n FROM tasks WHERE status='running' AND (labels LIKE ? "
                                   "OR labels LIKE ?)", (f'%"resource:{res}"%', f'%"exclusive:{res}"%'))["n"]
-            if users >= 2 * max(int(limits.get(res, 1) or 1), 1):
+            if users >= 2 * shared.slots(self.p, res, self.cfg):
                 return False
         for res in _exclusive(task):
-            limit = int(limits.get(res, 1))
+            limit = shared.slots(self.p, res, self.cfg)
             # Running exclusive tasks count even before their supervisor has taken its slot; the
             # lock files show the slots `ttp lock` commands hold.
             busy = self.p.db.one("SELECT COUNT(*) n FROM tasks WHERE status='running' AND labels LIKE ?",
@@ -2044,8 +2044,7 @@ class Daemon:
         return True
 
     def _slot_paths(self, res: str) -> list[Path]:
-        return locks.slot_paths(shared.locks_dir(self.p, res, self.cfg), res,
-                                int(self.cfg.get("resources", {}).get(res, 1) or 1))
+        return locks.slot_paths(shared.locks_dir(self.p, res, self.cfg), res, shared.slots(self.p, res, self.cfg))
 
     def _reserve_path(self, res: str) -> Path:
         return locks.reserve_path(shared.locks_dir(self.p, res, self.cfg), res)

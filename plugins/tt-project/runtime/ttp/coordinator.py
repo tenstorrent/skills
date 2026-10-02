@@ -18,7 +18,7 @@ from typing import Any
 
 from . import machines, push, shared, upstream
 from . import schedule as sched
-from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, TERMINAL_TASK_STATES, continues_id, dependency_ids, dump_result, host_line,
+from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, dependency_ids, dump_result, host_line,
                  load_result)
 from .project import COORDINATOR_MEMORY_CHARS, WORKER_MEMORY_CHARS, Project
 from .runner import stop_runs
@@ -180,6 +180,10 @@ def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int]) ->
                          f"{v.get('by') or 'user'}" + (f" in project {v.get('project')} (shared by all projects)"
                                                       if v.get("shared") else "") + (f": {clip(v['reason'], NOTE_CHARS)}" if v.get("reason") else ""))
     lines += machines.digest_lines(db, paused, now)
+    for res, got in shared.mismatches(p).items():
+        lines.append(f"## Shared resource {res}: projects give different slot counts ("
+                     + ", ".join(f"{k} {n}" for k, n in sorted(got.items())) + f"); all use the smallest, "
+                     f"{min(got.values())}")
     mem = memory_budget_line(p)
     if mem:
         lines.append(mem)
@@ -760,6 +764,7 @@ def pause_resource(p: Project, name: str, paused: bool, reason: str = "", by: st
     if not RESOURCE_RE.fullmatch(name):
         raise ValueError(f"not a resource name: {name!r}")
     db, woken = db or p.db, 0
+    sync_shared_pauses(p, db)   # first keep a pause of a resource no longer shared as the project's own
     is_shared = shared.is_shared(p, name)
     reason = " ".join(str(reason or "").split())[:300]
 
@@ -777,7 +782,7 @@ def pause_resource(p: Project, name: str, paused: bool, reason: str = "", by: st
             if is_shared:
                 entry = shared.update_pause(name, lambda w: _entry(w or cur.get(name)))[1]
                 cur.pop(name, None)
-                seen[name] = float(entry["since"])
+                seen[name] = entry
             else:
                 entry = cur[name] = _entry(cur.get(name))
         else:
@@ -798,9 +803,6 @@ def pause_resource(p: Project, name: str, paused: bool, reason: str = "", by: st
             else f"{name} resumed{scope}" + (f"; {woken} task(s) that waited on it start again" if woken else ""))
 
 
-SHARED_SEEN_KEY = "shared_pauses_seen"   # kv: {resource: since} of the shared pauses this project has acted on
-
-
 def _tell_runs(db, name: str, paused: bool, why: str = "", key: str | None = None) -> None:
     """Tell the running workers whose task uses the resource that it was paused or resumed."""
     text = (f"The resource `{name}` is paused{why}. Do not use it: start no new command on it, and `ttp lock "
@@ -816,21 +818,35 @@ def _tell_runs(db, name: str, paused: bool, why: str = "", key: str | None = Non
 
 def sync_shared_pauses(p: Project, db=None) -> None:
     """Act on pauses of shared resources set or lifted from another project: tell this project's
-    workers, and on a resume make the tasks that waited on it due. Each change is acted on once."""
+    workers, and on a resume make the tasks that waited on it due. Each change is acted on once.
+    A resource that stopped being shared while paused is not resumed: its pause is kept as the
+    project's own, `by` and all, and nothing is woken. Then record the project's slot counts."""
     db = db or p.db
-    cur = shared.paused(p.config())
-    now = {k: float(v.get("since") or 0) for k, v in cur.items()}
-    seen = db.kv(SHARED_SEEN_KEY) or {}
-    if now == seen:
-        return
-    for name, since in now.items():
-        if seen.get(name) != since:
-            _tell_runs(db, name, True, f" ({cur[name]['reason']})" if cur[name].get("reason") else "")
-    for name, since in seen.items():
-        if name not in now:
-            _wake_pause_waiters(db, name, float(since or 0))
-            _tell_runs(db, name, False)
-    db.set_kv(SHARED_SEEN_KEY, now)
+    cfg = p.config()
+    mine = shared.names(cfg)
+    cur = shared.paused(cfg)
+    seen = {k: v if isinstance(v, dict) else {"since": v} for k, v in (db.kv(SHARED_SEEN_KEY) or {}).items()}
+    left = (set(seen) | shared.recorded(p)) - mine
+    if cur != seen or left:
+        for name, v in cur.items():
+            if (seen.get(name) or {}).get("since") != v.get("since"):
+                _tell_runs(db, name, True, f" ({v['reason']})" if v.get("reason") else "")
+        for name in sorted((set(seen) | left) - set(cur)):
+            still = shared.read_pause(name) if name in left else None
+            if still is not None:
+                with db.tx():
+                    local = db.paused_resources(shared=False)
+                    was = local.get(name) or {}
+                    local[name] = {"reason": still.get("reason") or was.get("reason", ""),
+                                   "since": was.get("since") or still.get("since") or time.time(),
+                                   "by": "user" if "user" in (still.get("by"), was.get("by"))
+                                   else still.get("by") or "user"}
+                    db.set_kv(PAUSED_RESOURCES_KEY, local)
+            elif name in seen:
+                _wake_pause_waiters(db, name, float(seen[name].get("since") or 0))
+                _tell_runs(db, name, False)
+        db.set_kv(SHARED_SEEN_KEY, cur)
+    shared.record_slots(p, cfg)
 
 
 def _wake_pause_waiters(db, name: str, since: float) -> int:

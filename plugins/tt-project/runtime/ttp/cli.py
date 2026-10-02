@@ -515,6 +515,9 @@ def status_text(p: Project) -> str:
     for res in sorted(shared.names(p.config())):
         who = locks.held(shared.root() / res)
         lines.append(f"shared {res}: " + ("; ".join(w.split(": ", 1)[-1] for w in who) if who else "free"))
+    for res, got in shared.mismatches(p).items():
+        lines.append(f"shared {res}: projects give different slot counts ("
+                     + ", ".join(f"{k} {n}" for k, n in sorted(got.items())) + f"); all use {min(got.values())}")
     if h["why_idle"]:
         lines.append(f"idle: {h['why_idle']}")
     elif h["held"]:
@@ -703,7 +706,7 @@ def cmd_lock(a) -> None:
     from . import shared
     cfg = p.config()
     where = shared.locks_dir(p, a.resource, cfg)
-    paths = lk.slot_paths(where, a.resource, int((cfg.get("resources") or {}).get(a.resource, 1) or 1))
+    paths = lk.slot_paths(where, a.resource, shared.slots(p, a.resource, cfg))
     who = shared.holder(p, a.resource, f"task #{os.environ.get('TTP_TASK') or '?'} "
                                        f"(run {os.environ.get('TTP_RUN_ID') or '?'})", cfg)
     run_dir = Path(os.environ["TTP_RUN_DIR"]) if os.environ.get("TTP_RUN_DIR") else None
@@ -870,8 +873,11 @@ def cmd_machines(a) -> None:
             die(str(e))
         print(f"saved {mm.line(a.alias.strip(), entry)}")
     elif a.action == "remove":
-        if not mm.remove(a.alias):
-            die(f"no machine {a.alias!r} in {mm.path()}")
+        try:
+            if not mm.remove(a.alias):
+                die(f"no machine {a.alias!r} in {mm.path()}")
+        except ValueError as e:
+            die(str(e))
         print(f"removed {a.alias}")
     if a.action in ("add", "remove", "push"):
         hosts = [a.host] if getattr(a, "host", None) else remote_hosts()

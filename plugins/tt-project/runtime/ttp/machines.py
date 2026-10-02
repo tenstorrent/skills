@@ -140,6 +140,8 @@ def add(alias: str, tags: Any = None, note: str | None = None, min_free_gb: Any 
         shared = old.get("shared") or False
     elif shared is not False:
         shared = [alias] if shared == "" else tag_names(shared)
+    from . import shared as sh
+    sh.check_unshare(old.get("shared"), shared, alias)
     if shared:
         entry["shared"] = shared
     machines[alias] = entry
@@ -151,8 +153,11 @@ def add(alias: str, tags: Any = None, note: str | None = None, min_free_gb: Any 
 def remove(alias: str) -> bool:
     alias = (alias or "").strip()
     machines, removed = load(), dict(_part(_doc(), "removed"))
-    if machines.pop(alias, None) is None:
+    if alias not in machines:
         return False
+    from . import shared as sh
+    sh.check_unshare(machines[alias].get("shared"), False, alias)
+    machines.pop(alias)
     removed[alias] = time.time()
     _save(machines, removed)
     return True
