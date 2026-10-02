@@ -37,7 +37,9 @@ def root() -> Path:
 def names(cfg: dict) -> set[str]:
     """The resources this project shares with the user's other projects."""
     from . import machines
-    out = {str(x) for x in cfg.get("shared_resources") or [] if isinstance(x, str) and x}
+    got = cfg.get("shared_resources")
+    # A bare string ("board") is not a list: iterating it would share b, o, a, r, d.
+    out = {x for x in got if isinstance(x, str) and x} if isinstance(got, list) else set()
     for alias, m in machines.load().items():
         got = m.get("shared")
         if got is True:

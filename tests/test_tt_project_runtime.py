@@ -9270,6 +9270,33 @@ def test_projects_that_give_a_shared_resource_different_slot_counts_use_the_smal
     assert "different slot counts" not in status_text(a)
 
 
+def test_shared_resources_ignores_a_value_that_is_not_a_list(env):
+    from ttp import shared
+    p = make(env)
+    p.set_config("shared_resources", "board")
+    assert shared.names(p.config()) == set()
+    p.set_config("shared_resources", ["board"])
+    assert shared.names(p.config()) == {"board"}
+
+
+def test_shared_slot_records_of_deleted_project_folders_are_ignored(env):
+    import json
+    import shutil
+    from ttp import shared
+    a = make(env)
+    b = _second_project(env)
+    for p, n in ((a, 2), (b, 1)):
+        p.set_config("shared_resources", ["board"])
+        p.set_config("resources", {"board": n})
+    assert shared.slots(b, "board") == 1
+    assert shared.slots(a, "board") == 1
+    assert "board" in shared.mismatches(a)
+    shutil.rmtree(b.base)
+    assert str(b.base) in json.loads((shared.root() / "board" / shared.SLOTS_FILE).read_text())
+    assert shared.slots(a, "board") == 2
+    assert shared.mismatches(a) == {}
+
+
 def test_project_scoped_resources_stay_per_project(env, tmp_path):
     a = make(env)
     b = _second_project(env)
