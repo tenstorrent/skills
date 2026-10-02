@@ -430,13 +430,18 @@ def _closest_ancestor(p: Project, heads: list[str], ref: str) -> str | None:
 FETCH_TIMEOUT_S = 30   # the local-only check's fetch; an unreachable remote must not hold up the tick
 
 
-def local_only(repo: Path, branches: list[str], timeout_s: float = FETCH_TIMEOUT_S) -> tuple[dict, bool] | None:
-    """Which of `branches` have a head no remote-tracking branch contains (`git branch -r
-    --contains`): finished work whose only copy is on this machine. Returns ({branch: (head, commits
-    on no remote)}, whether the fetch of every remote worked), after that fetch; with a failed fetch
-    the remote refs may be old, so a branch may be listed that the remote has. A branch that no
-    longer exists is left out. None when `repo` is not a git repository or has no remote: there is
-    nothing to compare with. Pushes nothing."""
+def local_only(repo: Path, branches: list[str], targets: list[str] = (), known: set = frozenset(),
+               timeout_s: float = FETCH_TIMEOUT_S) -> tuple[dict, bool, dict] | None:
+    """Which of `branches` hold finished work whose only copy is on this machine. Returns ({branch:
+    (head, commits on no remote)}, whether the fetch of every remote worked, {branch: head} of the
+    others), after that fetch; with a failed fetch the remote refs may be old, so a branch may be
+    listed that the remote has. A branch is on a remote when a remote-tracking branch contains its
+    head, or when its changes already are in one of `targets` (the branch it is delivered to, as
+    `origin/<name>` or `<name>`, and each remote's default branch) although its head is not: a
+    reviewer rebased, amended, squashed or batched it (see delivered). A (branch, head) in `known`
+    was found on a remote before and is not looked at again. A branch that no longer exists is left
+    out. None when `repo` is not a git repository or has no remote: there is nothing to compare
+    with. Pushes nothing."""
     try:
         if not _git(repo, "remote", check=False).split():
             return None
@@ -447,11 +452,55 @@ def local_only(repo: Path, branches: list[str], timeout_s: float = FETCH_TIMEOUT
         fetched = False
     except (OSError, subprocess.SubprocessError):
         return None
-    out = {}
+    refs: list[str] = []
+    for t in [*targets, *_git(repo, "for-each-ref", "--format=%(symref)", "refs/remotes/*/HEAD", check=False).split()]:
+        for cand in (t, f"refs/remotes/{t}", f"refs/remotes/origin/{t}"):
+            full = _git(repo, "rev-parse", "--verify", "--quiet", "--symbolic-full-name", cand, check=False)
+            if full.startswith("refs/remotes/"):
+                if full not in refs:
+                    refs.append(full)
+                break
+    out, clean = {}, {}
     for b in dict.fromkeys(branches):
         head = _git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{b}^{{commit}}", check=False)
-        if not head or _git(repo, "branch", "-r", "--contains", head, check=False):
+        if not head:
+            continue
+        if ((b, head) in known or _git(repo, "branch", "-r", "--contains", head, check=False)
+                or any(delivered(repo, head, ref) for ref in refs)):
+            clean[b] = head
             continue
         ahead = _git(repo, "rev-list", "--count", head, "--not", "--remotes", check=False)
         out[b] = (head, int(ahead) if ahead.isdigit() else 0)
-    return out, fetched
+    return out, fetched, clean
+
+
+def delivered(repo: Path, head: str, ref: str) -> bool:
+    """Whether the changes of `head` since it left `ref` are already in `ref`: every commit has a
+    patch-equivalent one there (`git cherry`: rebased or cherry-picked) or one with the same subject
+    (at least 20 characters: rebased with conflicts, or amended), every file it changed is
+    the same there (amended or squashed, maybe with other work), or its whole diff reverts cleanly
+    from `ref`'s tree (batched, and later work touched the same files elsewhere)."""
+    import tempfile
+    base = _git(repo, "merge-base", ref, head, check=False)
+    if not base:
+        return False
+    cherry = subprocess.run(["git", "-C", str(repo), "cherry", ref, head], capture_output=True, text=True, timeout=120)
+    if cherry.returncode == 0 and not any(line.startswith("+") for line in cherry.stdout.splitlines()):
+        return True
+    mine = _git(repo, "log", "--no-merges", "--format=%s", f"{base}..{head}", check=False).splitlines()
+    if mine and all(len(m) >= 20 for m in mine) and set(mine) <= set(
+            _git(repo, "log", "--no-merges", "--format=%s", f"{base}..{ref}", check=False).splitlines()):
+        return True
+    files = _git(repo, "diff", "--no-renames", "--name-only", "-z", base, head, check=False).split("\0")
+    files = [f for f in files if f]
+    if not files or not _git(repo, "diff", "--no-renames", "--name-only", ref, head, "--", *files, check=False):
+        return True
+    patch = subprocess.run(["git", "-C", str(repo), "diff", "--binary", "--no-renames", base, head],
+                           capture_output=True, timeout=120).stdout
+    with tempfile.TemporaryDirectory() as tmp:
+        env = {**os.environ, "GIT_INDEX_FILE": str(Path(tmp) / "index")}
+        if subprocess.run(["git", "-C", str(repo), "read-tree", ref], capture_output=True, env=env,
+                          timeout=120).returncode != 0:
+            return False
+        return subprocess.run(["git", "-C", str(repo), "apply", "--cached", "--reverse", "--check"], input=patch,
+                              capture_output=True, env=env, timeout=120).returncode == 0

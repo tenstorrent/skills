@@ -71,6 +71,7 @@ SLEEPS_KEPT_S = 7 * 86400
 LOCAL_ONLY_EVERY_S = 3600   # how often done code tasks' branches are checked against the remotes
 LOCAL_ONLY_DAYS = 14        # done code tasks finished this recently are checked (flagged ones until cleared)
 KV_LOCAL_ONLY = "local_only"   # kv: {task id: {branch, head, ahead, since}} for branches only on this machine
+KV_LOCAL_ONLY_FROM = "local_only_from"   # kv: when the check first ran; tasks done before it are not checked
 
 
 def log(p: Project, msg: str) -> None:
@@ -182,6 +183,9 @@ class Daemon:
         self._release_due = 0.0   # when the installed tt-project release is next compared with the harness
         self._pruned_upto = 0.0   # the latest finish the last worktree sweep saw
         self._local_only_due = 0.0   # when done code tasks' branches are next checked for remote copies
+        self._local_only_ok: dict[str, str] = {}   # branch -> head found on a remote: not looked at again
+        if not isinstance(self.p.db.kv(KV_LOCAL_ONLY_FROM), (int, float)):
+            self.p.db.set_kv(KV_LOCAL_ONLY_FROM, time.time())   # work done before the check existed is not flagged
         self._kept: dict[int, tuple[float, float, str]] = {}   # task id -> (task updated, checked, why kept)
         self._disk_low = bool(self.p.db.kv("disk_low"))   # an episode outlives a restart: no second alert
         self._disk_free: float | None = None
@@ -1687,24 +1691,42 @@ class Daemon:
     def check_local_only(self) -> None:
         """A done code task may leave the only copy of its work on a local branch. Hourly, and in the
         tick a code task hands off done, fetch and look for the branches of code tasks done in the
-        last LOCAL_ONLY_DAYS (and those already flagged) that no remote-tracking branch contains.
-        Each newly found one posts one coordinator event; status and the web app count them until
-        the branch is pushed or merged, deleted, or the task leaves done (cancelled). Nothing is
-        pushed. A repository without a remote is skipped quietly. After a failed fetch the remote
-        refs may be old: flags may clear, but no new one is raised."""
+        last LOCAL_ONLY_DAYS that hold work no remote has (worktree.local_only: neither the head nor,
+        rebased, amended or batched by a reviewer, its changes are on a remote). Left alone: a task
+        an unfinished task still needs (a queued review or a fix, see worktree.needed_by), one a done
+        review names (its id, branch or head commit), and one that finished before this check first
+        ran (KV_LOCAL_ONLY_FROM), so an upgrade posts no burst for old work. Each newly found one
+        posts one coordinator event; status and the web app count it until the work is pushed or
+        merged, the task leaves done (cancelled) or falls out of the window. Nothing is pushed. A
+        repository without a remote is skipped quietly. After a failed fetch the remote refs may be
+        old: flags may clear, but no new one is raised."""
         now = time.time()
         if now < self._local_only_due:
             return
         self._local_only_due = now + LOCAL_ONLY_EVERY_S
         db = self.p.db
+        since = db.kv(KV_LOCAL_ONLY_FROM)
+        if not isinstance(since, (int, float)):
+            since = now
+            db.set_kv(KV_LOCAL_ONLY_FROM, since)
         told = db.kv(KV_LOCAL_ONLY) or {}
-        tasks = [t for t in db.q("SELECT id, title, branch, updated FROM tasks WHERE kind='code' AND status='done' "
-                                 "AND branch IS NOT NULL AND branch!=''")
-                 if t["updated"] >= now - LOCAL_ONLY_DAYS * 86400 or str(t["id"]) in told]
+        tasks = db.q("SELECT id, title, branch, updated FROM tasks WHERE kind='code' AND status='done' "
+                     "AND branch IS NOT NULL AND branch!='' AND updated>=?",
+                     (max(since, now - LOCAL_ONLY_DAYS * 86400),))
+        reviews = []
+        if tasks:
+            open_tasks = db.q("SELECT id, status, spec, depends_on, labels FROM tasks WHERE status NOT IN (%s)"
+                              % ",".join("?" * len(TERMINAL_TASK_STATES)), TERMINAL_TASK_STATES)
+            reviews = db.q("SELECT id, status, spec, depends_on, labels FROM tasks WHERE kind='review' "
+                           "AND status='done' AND updated>=?", (now - 2 * LOCAL_ONLY_DAYS * 86400,))
+            tasks = [t for t in tasks if not worktree.needed_by(t, open_tasks) and not worktree.needed_by(t, reviews)]
         if not tasks and not told:
             return
         try:
-            found = worktree.local_only(self.p.root, [t["branch"] for t in tasks]) if tasks else ({}, True)
+            found = (worktree.local_only(self.p.root, [t["branch"] for t in tasks],
+                                         targets=[worktree.base_ref(self.p)],
+                                         known=set(self._local_only_ok.items()))
+                     if tasks else ({}, True, {}))
         except Exception:
             log(self.p, "local-only branch check: " + traceback.format_exc().replace("\n", " | ")[:1000])
             return
@@ -1712,7 +1734,8 @@ class Daemon:
             if told:
                 db.set_kv(KV_LOCAL_ONLY, None)
             return
-        heads, fetched = found
+        heads, fetched, clean = found
+        self._local_only_ok.update(clean)
         live = {}
         with db.tx():
             for t in tasks:
@@ -1720,6 +1743,8 @@ class Daemon:
                 if b not in heads or not fetched and key not in told:
                     continue
                 head, ahead = heads[b]
+                if _names_commit(reviews, head):
+                    continue
                 live[key] = {"branch": b, "head": head, "ahead": ahead, "since": (told.get(key) or {}).get("since", now)}
                 if key not in told:
                     log(self.p, f"task {t['id']}: branch {b} exists only on this machine ({ahead} commits ahead)")
@@ -2184,6 +2209,11 @@ class Daemon:
 
 
 PAUSED_NOTE = "waits for a paused resource:"
+
+
+def _names_commit(tasks: list[dict], head: str) -> bool:
+    """Whether a task's spec names `head` by an abbreviation of at least 7 hex digits."""
+    return any(head.startswith(h.lower()) for t in tasks for h in re.findall(r"\b[0-9a-fA-F]{7,40}\b", t.get("spec") or ""))
 
 
 def _exclusive(task: dict) -> list[str]:

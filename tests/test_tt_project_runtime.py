@@ -3818,6 +3818,23 @@ def _local_only_events(p):
     return p.db.q("SELECT text, task FROM events WHERE kind='local_only'")
 
 
+def _local_only_daemon(p):
+    """A daemon whose local-only check counts as installed before the test's tasks finished."""
+    from ttp import daemon as dm
+    p.db.set_kv(dm.KV_LOCAL_ONLY_FROM, 0)
+    return dm.Daemon(p.base)
+
+
+def _with_origin(env, clone=True):
+    remote = env["tmp"] / "remote.git"
+    if clone:
+        subprocess.run(["git", "clone", "-q", "--bare", str(env["repo"]), str(remote)], check=True)
+    else:
+        subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+    subprocess.run(["git", "-C", str(env["repo"]), "remote", "add", "origin", str(remote)], check=True)
+    return remote
+
+
 def test_local_only_flags_a_done_branch_on_no_remote_once_until_pushed(env):
     p = make(env)
     from ttp import daemon as dm
@@ -3832,7 +3849,7 @@ def test_local_only_flags_a_done_branch_on_no_remote_once_until_pushed(env):
     t_pushed, pushed, pushed_branch = _code_task(p, "pushed work")
     _commit_file(pushed, "c")
     _git_out(pushed, "push", "-q", "origin", f"HEAD:refs/heads/{pushed_branch}")
-    d = dm.Daemon(p.base)
+    d = _local_only_daemon(p)
     d.check_local_only()
     ev = _local_only_events(p)
     assert [e["task"] for e in ev] == [tid], ev
@@ -3856,7 +3873,7 @@ def test_local_only_skips_a_repo_without_a_remote_and_drops_a_cancelled_task(env
     from ttp.web import health
     tid, path, branch = _code_task(p, "no remote")
     _commit_file(path, "a")
-    d = dm.Daemon(p.base)
+    d = _local_only_daemon(p)
     d.check_local_only()
     assert not _local_only_events(p) and p.db.kv(dm.KV_LOCAL_ONLY) is None
     log = p.logs / "daemon.log"
@@ -3882,7 +3899,7 @@ def test_local_only_is_checked_in_the_tick_a_code_task_hands_off_done(env):
     subprocess.run(["git", "-C", str(env["repo"]), "remote", "add", "origin", str(remote)], check=True)
     tid, path, _ = _code_task(p, "hand-off", status="queued")
     _commit_file(path, "a")
-    d = dm.Daemon(p.base)
+    d = _local_only_daemon(p)
     d._local_only_due = time.time() + 3600   # the hourly check is not due
     assert _run_until(d, p, lambda: p.db.task(tid)["status"] == "done")
     assert [e["task"] for e in _local_only_events(p)] == [tid]
@@ -3895,9 +3912,125 @@ def test_local_only_raises_no_new_flag_after_a_failed_fetch(env):
                    check=True)
     tid, path, _ = _code_task(p, "offline")
     _commit_file(path, "a")
-    d = dm.Daemon(p.base)
+    d = _local_only_daemon(p)
     d.check_local_only()
     assert not _local_only_events(p) and p.db.kv(dm.KV_LOCAL_ONLY) is None
+
+
+def _reviewer_delivers(env, remote, *branches, amend=False, later=None):
+    """A reviewer in its own clone puts the branches' commits on the remote's main branch the way
+    reviews do: cherry-picked onto a newer tip, or squashed into one commit with a version bump
+    (`amend`), optionally followed by later work on a file the branches changed."""
+    main = _git_out(env["repo"], "rev-parse", "--abbrev-ref", "HEAD")
+    clone = env["tmp"] / f"reviewer{len(list(env['tmp'].glob('reviewer*')))}"
+    subprocess.run(["git", "clone", "-q", str(remote), str(clone)], check=True)
+    (clone / f"other-{clone.name}.txt").write_text("someone else's work\n")
+    _git_out(clone, "add", ".")
+    _git_out(clone, *_IDENT, "commit", "-qm", "other work")
+    for b in branches:
+        _git_out(clone, "fetch", "-q", str(env["repo"]), f"{b}:{b}")
+        commits = _git_out(clone, "rev-list", "--reverse", f"origin/{main}..{b}").split()
+        _git_out(clone, *_IDENT, "cherry-pick", *(["-n"] if amend else []), *commits)
+    if amend:
+        (clone / "VERSION").write_text(clone.name)
+        _git_out(clone, "add", ".")
+        _git_out(clone, *_IDENT, "commit", "-qm", "batch: " + " + ".join(branches))
+    if later:
+        (clone / later).write_text((clone / later).read_text().replace("line 10\n", "line 10 changed later\n"))
+        _git_out(clone, "add", ".")
+        _git_out(clone, *_IDENT, "commit", "-qm", "later")
+    _git_out(clone, "push", "-q", "origin", f"HEAD:refs/heads/{main}")
+
+
+def test_local_only_does_not_flag_work_a_reviewer_rebased_or_batched_onto_the_target(env):
+    p = make(env)
+    from ttp import daemon as dm
+    (env["repo"] / "lines.txt").write_text("".join(f"line {i}\n" for i in range(12)))
+    _git_out(env["repo"], "add", ".")
+    _git_out(env["repo"], *_IDENT, "commit", "-qm", "lines")
+    remote = _with_origin(env)
+    picked, path, picked_branch = _code_task(p, "rebased by review")
+    _commit_file(path, "a")
+    _commit_file(path, "b")
+    t1, path1, b1 = _code_task(p, "batched one")
+    _commit_file(path1, "c")
+    t2, path2, b2 = _code_task(p, "batched two")
+    _commit_file(path2, "d")
+    _commit_file(path2, "e")
+    t3, path3, b3 = _code_task(p, "batched then changed")
+    for n in (1, 2):
+        (path3 / "lines.txt").write_text((path3 / "lines.txt").read_text().replace(f"line {n}\n", f"line {n} edited\n"))
+        _git_out(path3, "add", ".")
+        _git_out(path3, *_IDENT, "commit", "-qm", f"edit {n}")
+    lone, lpath, _ = _code_task(p, "never delivered")
+    _commit_file(lpath, "g")
+    _reviewer_delivers(env, remote, picked_branch)
+    _reviewer_delivers(env, remote, b1, b2, amend=True)
+    _reviewer_delivers(env, remote, b3, amend=True, later="lines.txt")
+    d = _local_only_daemon(p)
+    d.check_local_only()
+    assert [e["task"] for e in _local_only_events(p)] == [lone]
+    assert set(p.db.kv(dm.KV_LOCAL_ONLY)) == {str(lone)}
+
+
+def test_local_only_leaves_work_a_review_still_needs_or_has_reviewed(env):
+    p = make(env)
+    from ttp import daemon as dm
+    _with_origin(env)
+    tid, path, branch = _code_task(p, "awaiting review", status="queued")
+    _commit_file(path, "a")
+    review = p.db.add_task("review it", f"Review and push t{tid}.", kind="review", tier="light", origin="user")
+    d = _local_only_daemon(p)
+    d._local_only_due = time.time() + 3600
+    assert _run_until(d, p, lambda: p.db.task(tid)["status"] == "done")
+    d._local_only_due = 0
+    d.check_local_only()
+    assert not _local_only_events(p)   # the queued review will deliver it
+    p.db.update_task(review, status="done")
+    d._local_only_due = 0
+    d.check_local_only()
+    assert not _local_only_events(p)   # reviewed: a reviewer pushed it in another form
+    t2, path2, _ = _code_task(p, "named by commit")
+    _commit_file(path2, "b")
+    sha = _git_out(path2, "rev-parse", "--short=9", "HEAD")
+    p.db.add_task("review", f"Review commit {sha}.", kind="review", tier="light", origin="user")
+    p.db.x("UPDATE tasks SET status='done' WHERE spec LIKE ?", (f"%{sha}%",))
+    t3, path3, _ = _code_task(p, "failed review")
+    _commit_file(path3, "c")
+    p.db.add_task("review", f"Review t{t3}.", kind="review", tier="light", origin="user")
+    p.db.x("UPDATE tasks SET status='failed' WHERE spec=?", (f"Review t{t3}.",))
+    d._local_only_due = 0
+    d.check_local_only()
+    assert [e["task"] for e in _local_only_events(p)] == [t3]
+
+
+def test_local_only_posts_no_burst_on_upgrade_and_flags_age_out(env):
+    p = make(env)
+    from ttp import daemon as dm
+    _with_origin(env)
+    old = []
+    for i in range(4):
+        tid, path, _ = _code_task(p, f"old {i}")
+        _commit_file(path, f"o{i}")
+        old.append(tid)
+    d = dm.Daemon(p.base)   # first start with the check: earlier work is not flagged
+    d.check_local_only()
+    assert not _local_only_events(p) and p.db.kv(dm.KV_LOCAL_ONLY) is None
+    since = p.db.kv(dm.KV_LOCAL_ONLY_FROM)
+    dm.Daemon(p.base)
+    assert p.db.kv(dm.KV_LOCAL_ONLY_FROM) == since   # kept across restarts
+    time.sleep(0.01)
+    tid, path, _ = _code_task(p, "new")
+    _commit_file(path, "n")
+    d._local_only_due = 0
+    d.check_local_only()
+    assert [e["task"] for e in _local_only_events(p)] == [tid]
+    p.db.x("UPDATE tasks SET updated=? WHERE id=?", (time.time() - (dm.LOCAL_ONLY_DAYS + 1) * 86400, tid))
+    p.db.set_kv(dm.KV_LOCAL_ONLY_FROM, 0)
+    d._local_only_due = 0
+    d.check_local_only()
+    assert p.db.kv(dm.KV_LOCAL_ONLY) == {str(t): p.db.kv(dm.KV_LOCAL_ONLY)[str(t)] for t in old}
+    assert len(_local_only_events(p)) == 1 + len(old)
 
 
 def test_low_disk_space_blocks_new_workers_and_alerts_once(env, monkeypatch):

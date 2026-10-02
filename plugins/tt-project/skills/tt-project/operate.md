@@ -68,9 +68,12 @@
   the task's branch, id or `worktrees/tN` path). `disk.worktree_retention_days` waits longer; 0 never tidies.
   `ttp prune <name>` sweeps now.
 - Work only on this machine: when a code task hands off done, and hourly for code tasks done in the
-  last 14 days, the daemon fetches (30 s timeout) and checks whether any remote-tracking branch
-  contains the task branch's head. If none does, one coordinator event says so, and status and the
-  web app count it until the branch is pushed or merged or the task is cancelled. Nothing is pushed
-  automatically; a repository without a remote is skipped.
+  last 14 days, the daemon fetches (30 s timeout) and checks whether the task branch's work is on a
+  remote: a remote-tracking branch contains its head, or its changes are already on the delivery
+  branch or the remote's default branch (rebased, cherry-picked, amended or batched by a reviewer).
+  Tasks an unfinished task still needs (a queued review or fix), tasks a done review names, and work
+  done before the check first ran are left alone. Otherwise one coordinator event says so, and
+  status and the web app count it until the work reaches a remote, the task is cancelled or it is
+  14 days old. Nothing is pushed automatically; a repository without a remote is skipped.
 - Coordinator failing repeatedly → an alert says so; messages are kept, not lost.
 - A worker that produces nothing for too long is stopped and retried (stall guard).

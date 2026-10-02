@@ -79,6 +79,7 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
 - A `local_only` event: a done code task's branch is on no remote, so its work exists only on
   this machine. Deliver it the way the charter's delivery policy allows (for example a review
   task that pushes it), or cancel the task if the work is not wanted. Nothing pushes it by itself.
+  Work already delivered in another form needs nothing: leave the task done; the flag ages out.
 - A task blocked on a cancelled or failed dependency stays blocked until you re-point it with
   `task_update` `depends_on` (or `[]`), or cancel it. A requeue that still depends on a dead
   task is rejected, and the reason shows up in your next digest.
