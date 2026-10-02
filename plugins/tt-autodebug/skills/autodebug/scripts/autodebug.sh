@@ -22,8 +22,8 @@ usage() {
 Usage:
   autodebug.sh [options] [--] <problem...>
 
-Run a fresh, inspection-only AutoDebug investigation in the current checkout.
-The child agent writes ./AUTODEBUG.md.
+Run a fresh, inspection-only investigation in the current checkout.
+The child agent writes a task-specific report.
 
 Options:
   --focus PATH            Add a focus path. May be repeated.
