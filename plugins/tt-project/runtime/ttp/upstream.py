@@ -11,9 +11,11 @@ A project with `upstream.ingest: true` (off by default) reads the inbox: each no
 becomes an `upstream_note` event for its coordinator. Its read cursor (a byte offset per inbox, and
 the fingerprints it has seen) lives in its own database; it never writes to another project's state.
 The inboxes on the machines this user's remote projects run on (`ttp create --host`) are read over
-ssh at most once an hour. The ingesting project marks each inbox it read with upstream-reader.json,
-so the other projects' coordinators know someone reads the notes and do not also pass them on to
-the user.
+ssh at most once an hour, for at most REMOTE_BUDGET_S per daemon tick: hosts left over when the
+time runs out are read first on the next tick, so slow or hung machines never hold up dispatch for
+long and every machine is read once per round. The ingesting project marks each inbox it read with
+upstream-reader.json, so the other projects' coordinators know someone reads the notes and do not
+also pass them on to the user.
 """
 from __future__ import annotations
 
@@ -34,9 +36,12 @@ REMOTE_EVERY_S = 3600       # and at the inboxes on the machines its remote proj
 READER_FRESH_S = 2 * 86400  # a reader not seen this long is gone: coordinators pass notes on again
 SEEN_KEPT = 5000            # fingerprints a project remembers
 TITLE_CHARS, SPEC_CHARS = 300, 4000
+REMOTE_TIMEOUT_S = 60       # one machine's read
+REMOTE_BUDGET_S = 120       # all remote reads in one tick; a machine is started only if its read fits
 SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15"]
 REMOTE = "~/.tt-project/upstream.jsonl"
 LOCAL = "@here"             # the cursor's key for this machine's inbox (never a host name)
+_clock = time.monotonic
 
 
 def path() -> Path:
@@ -123,7 +128,9 @@ def _read_remote(host: str, offset: int, mark: dict) -> tuple[bytes, int] | None
     cmd = (f"f={REMOTE}; [ -d ~/.tt-project ] && printf %s {shlex.quote(json.dumps(mark))} > ~/.tt-project/upstream-reader.json; "
            f"if [ -f \"$f\" ]; then wc -c < \"$f\"; tail -c +{offset + 1} \"$f\"; else echo 0; fi")
     try:
-        r = subprocess.run([*SSH, host, cmd], capture_output=True, timeout=60)
+        # `sh -c` so a login shell that is not POSIX (fish, say) runs it too; no stdin, so ssh never waits on it.
+        r = subprocess.run([*SSH, "--", host, f"sh -c {shlex.quote(cmd)}"], stdin=subprocess.DEVNULL,
+                           capture_output=True, timeout=REMOTE_TIMEOUT_S)
     except (OSError, subprocess.SubprocessError):
         return None
     if r.returncode != 0:
@@ -153,12 +160,23 @@ def ingest(p: project.Project, cfg: dict, now: float | None = None, force_remote
     project.HOME_DIR.mkdir(parents=True, exist_ok=True)
     project.write_json(reader_path(), _mark(p, now))
     remote_due = float(cur.get("remote_due") or 0)
-    if force_remote or now >= remote_due:
-        remote_due = now + REMOTE_EVERY_S
-        for host in remote_hosts():
-            got = _read_remote(host, int(offsets.get(host, 0)), _mark(p, now))
-            if got is not None:
-                sources.append((host, *got))
+    pending: list = list(cur.get("remote_pending") or [])   # hosts of this round not yet read
+    if force_remote or (not pending and now >= remote_due):
+        pending = remote_hosts()
+    if pending:
+        hosts, start, tried = set(remote_hosts()), _clock(), 0
+        while pending:
+            host = pending[0]
+            if host in hosts:
+                if tried and _clock() - start + REMOTE_TIMEOUT_S > REMOTE_BUDGET_S:
+                    break             # out of time this tick: the rest are read first on the next
+                tried += 1
+                got = _read_remote(host, int(offsets.get(host, 0)), _mark(p, now))
+                if got is not None:
+                    sources.append((host, *got))
+            pending.pop(0)
+        if not pending:
+            remote_due = now + REMOTE_EVERY_S
     added = 0
     me = (p.name, project.hostname())
     from .coordinator import EVENT_CHARS_BY_KIND
@@ -182,7 +200,8 @@ def ingest(p: project.Project, cfg: dict, now: float | None = None, force_remote
             db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
                  (now, "upstream", "upstream_note", "normal", text[:cap], "queued"))
             added += 1
-    db.set_kv(KV_CURSOR, {"offsets": offsets, "seen": seen[-SEEN_KEPT:], "remote_due": remote_due})
+    db.set_kv(KV_CURSOR, {"offsets": offsets, "seen": seen[-SEEN_KEPT:], "remote_due": remote_due,
+                            "remote_pending": pending})
     return added
 
 

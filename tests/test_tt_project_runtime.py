@@ -9006,6 +9006,64 @@ def test_remote_upstream_inboxes_are_read_over_ssh_at_most_hourly(env, monkeypat
     assert "upstream-reader.json" in calls[0][-1], "the remote inbox was not marked read"
 
 
+def test_remote_upstream_reads_use_sh_c_no_stdin_and_end_options(env, monkeypatch):
+    from ttp import upstream
+    seen = {}
+
+    def fake_run(argv, **kw):
+        seen.update(argv=argv, kw=kw)
+        return subprocess.CompletedProcess(argv, 0, b"0\n", b"")
+    monkeypatch.setattr(upstream.subprocess, "run", fake_run)
+    assert upstream._read_remote("-oProxyCommand=x", 5, {"project": "it's", "host": "h", "ts": 1}) == (b"", 0)
+    argv = seen["argv"]
+    assert argv[:-3] == upstream.SSH and argv[-3:-1] == ["--", "-oProxyCommand=x"]
+    assert seen["kw"]["stdin"] is subprocess.DEVNULL and seen["kw"]["timeout"] == upstream.REMOTE_TIMEOUT_S
+    words = shlex.split(argv[-1])
+    assert words[:2] == ["sh", "-c"] and len(words) == 3, "the remote command is not one sh -c argument"
+    assert "tail -c +6 " in words[2]
+    # The command runs as written under a POSIX shell (here, with a home of its own).
+    monkeypatch.undo()
+    home = env["tmp"] / "remote-home"
+    (home / ".tt-project").mkdir(parents=True)
+    (home / ".tt-project" / "upstream.jsonl").write_bytes(b"0123456789\n")
+    r = subprocess.run(["sh", "-c", argv[-1]], capture_output=True, env={"HOME": str(home), "PATH": os.environ["PATH"]})
+    assert r.returncode == 0 and r.stdout == b"11\n56789\n"
+    assert json.loads((home / ".tt-project" / "upstream-reader.json").read_text())["project"] == "it's"
+
+
+def test_remote_upstream_reads_stop_at_the_tick_budget_and_resume_fairly(env, monkeypatch):
+    p = make(env)
+    from ttp import upstream
+    from ttp.project import register
+    for h in ("hostA", "hostB", "hostC", "hostD"):
+        register(f"far-{h}", {"host": h, "dir": f"/w/{h}"})
+    p.set_config("upstream.ingest", True)
+    clock, calls = [1000.0], []
+
+    def fake_run(argv, **kw):
+        calls.append(argv[-2])
+        clock[0] += kw["timeout"]          # every machine hangs until its timeout
+        raise subprocess.TimeoutExpired(argv, kw["timeout"])
+    monkeypatch.setattr(upstream.subprocess, "run", fake_run)
+    monkeypatch.setattr(upstream, "_clock", lambda: clock[0])
+    now = time.time()
+    t0 = clock[0]
+    upstream.ingest(p, p.config(), now)
+    assert calls == ["hostA", "hostB"] and clock[0] - t0 <= upstream.REMOTE_BUDGET_S
+    # The next tick reads the machines left over first, then the round is done for the hour.
+    upstream.ingest(p, p.config(), now + 60)
+    assert calls == ["hostA", "hostB", "hostC", "hostD"]
+    upstream.ingest(p, p.config(), now + 120)
+    assert len(calls) == 4, "a finished round started again within the hour"
+    upstream.ingest(p, p.config(), now + 3700)
+    assert calls[4:] == ["hostA", "hostB"]
+    # A machine whose project is gone is dropped from the round without a read.
+    from ttp.project import unregister
+    unregister("far-hostC")
+    upstream.ingest(p, p.config(), now + 3760)
+    assert calls[6:] == ["hostD"]
+
+
 def test_coordinators_pass_upstream_notes_on_only_while_no_project_reads_them(env):
     p = make(env)
     from ttp import upstream, coordinator as coord
