@@ -13,6 +13,9 @@ CLAUDE_MODEL="${AUTODEBUG_CLAUDE_MODEL:-}"
 EFFORT="${AUTODEBUG_EFFORT:-xhigh}"
 RUN_DIR="$(pwd -P)"
 FOCUS_PATHS=()
+TASK="autodebug"
+EVENTS=0
+EXTRA_ARGS=()
 
 usage() {
     cat <<'USAGE'
@@ -27,6 +30,11 @@ Options:
   --agent codex|claude    Override the inferred agent CLI.
   --model MODEL           Override the selected agent's configured model.
   --effort LEVEL          Reasoning effort. Default: xhigh.
+  --task autodebug|autotriage
+                          Select the bundled investigation prompt/report.
+  --events                Emit native JSONL events for an external harness.
+  --agent-arg VALUE       Pass one literal argument to the selected agent CLI.
+                          Repeat for settings/configuration; no shell evaluation.
   --help                  Show this help.
 
 Environment:
@@ -90,6 +98,20 @@ while [[ $# -gt 0 ]]; do
             EFFORT="${1#*=}"
             shift
             ;;
+        --task)
+            [[ $# -ge 2 ]] || die "--task requires autodebug or autotriage"
+            TASK="$2"
+            shift 2
+            ;;
+        --events)
+            EVENTS=1
+            shift
+            ;;
+        --agent-arg)
+            [[ $# -ge 2 ]] || die "--agent-arg requires a literal argument"
+            EXTRA_ARGS+=("$2")
+            shift 2
+            ;;
         --)
             shift
             break
@@ -104,6 +126,15 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ $# -gt 0 ]] || die "provide a problem description"
+case "$TASK" in
+    autodebug) REPORT="AUTODEBUG.md"; LABEL="AutoDebug" ;;
+    autotriage)
+        PROMPT_TEMPLATE="$SCRIPT_DIR/../../autotriage/references/AUTOTRIAGE_PROMPT.md"
+        REPORT="AUTOTRIAGE.md"
+        LABEL="AutoTriage"
+        ;;
+    *) die "unknown task: $TASK (expected autodebug or autotriage)" ;;
+esac
 [[ -f "$PROMPT_TEMPLATE" ]] || die "bundled prompt not found: $PROMPT_TEMPLATE"
 
 PROBLEM="$*"
@@ -111,13 +142,14 @@ PROMPT_FILE="$(mktemp "${TMPDIR:-/tmp}/autodebug-prompt.XXXXXX")"
 trap 'rm -f "$PROMPT_FILE"' EXIT
 
 # The conditional expansion also works for an empty array under Bash 3.2's set -u.
-python3 - "$PROMPT_TEMPLATE" "$PROBLEM" ${FOCUS_PATHS[@]+"${FOCUS_PATHS[@]}"} >"$PROMPT_FILE" <<'PY'
+python3 - "$PROMPT_TEMPLATE" "$PROBLEM" "$LABEL" "$REPORT" ${FOCUS_PATHS[@]+"${FOCUS_PATHS[@]}"} >"$PROMPT_FILE" <<'PY'
 from pathlib import Path
 import sys
 
 template_path = Path(sys.argv[1])
 problem = sys.argv[2]
-focus_paths = sys.argv[3:]
+label, report = sys.argv[3:5]
+focus_paths = sys.argv[5:]
 
 template = template_path.read_text(encoding="utf-8")
 if focus_paths:
@@ -132,8 +164,8 @@ if missing:
     raise SystemExit(f"unrendered prompt placeholder(s): {', '.join(missing)}")
 
 print(
-    "You are the AutoDebug investigator, already running in a fresh isolated session. "
-    "Perform the investigation here and write AUTODEBUG.md. "
+    f"You are the {label} investigator, already running in a fresh isolated session. "
+    f"Perform the investigation here and write {report}. "
     "Do not invoke the AutoDebug launcher again.\n"
 )
 print(rendered.strip())
@@ -153,21 +185,28 @@ case "$AGENT" in
             COMMAND=(codex --ask-for-approval never exec)
         fi
         [[ -z "$CODEX_MODEL" ]] || COMMAND+=(--model "$CODEX_MODEL")
+        [[ "$EVENTS" == 0 ]] || COMMAND+=(--json)
         COMMAND+=(
             -c "model_reasoning_effort=$EFFORT"
             --sandbox "$SANDBOX"
             --skip-git-repo-check
             --color never
             --cd "$RUN_DIR"
-            -
         )
+        COMMAND+=(${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} -)
         exec "${COMMAND[@]}"
         ;;
     [cC][lL][aA][uU][dD][eE])
         command -v claude >/dev/null 2>&1 || die "claude executable not found"
-        COMMAND=(claude -p --output-format text)
+        COMMAND=(claude -p)
+        if [[ "$EVENTS" == 1 ]]; then
+            COMMAND+=(--output-format stream-json --verbose)
+        else
+            COMMAND+=(--output-format text)
+        fi
         [[ -z "$CLAUDE_MODEL" ]] || COMMAND+=(--model "$CLAUDE_MODEL")
         COMMAND+=(--effort "$EFFORT" --permission-mode auto)
+        COMMAND+=(${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"})
         exec "${COMMAND[@]}"
         ;;
     *)

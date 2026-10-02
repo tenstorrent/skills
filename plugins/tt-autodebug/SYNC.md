@@ -1,60 +1,49 @@
-# Prompt development and synchronization
+# Source ownership and improvements
 
-The installed `tt-autodebug` plugin is a self-contained, reviewed snapshot. Prompt development and
-backtesting currently continue on the `main` branch of the maintainer-local `autodebug` Git
-repository. The installed plugin never reads that checkout at runtime.
+`tenstorrent/skills` is the canonical source for this plugin's prompts, skill
+instructions and investigation runner. Edit those files here and submit a PR.
+Git history preserves the provenance of the earlier standalone prompt imports.
+There is no external prompt-copying or synchronization step.
 
-[`sync-source.json`](sync-source.json) records the exact source commit, Git blob, destination, and
-SHA-256 digest for every imported prompt. This makes a manual import reviewable now and gives a
-future synchronization tool a stable contract.
+[skills-autoimprove](https://github.com/tenstorrent/skills-autoimprove) owns case
+curation, prepared source snapshots, evaluators, results and scheduled improvement
+flows. It fetches a skills revision once per run and records the exact commit.
+Candidate advice is developed and committed in a skills branch, tested through
+this plugin, and submitted with the observed case results. A single-case result
+is evidence for that case, not a claim of broad benchmark improvement.
 
-## Weekly prompt-only review
+## Runner contract
 
-A separate weekly review compares the actual standalone prompt files, including uncommitted edits,
-with the current files on this repository's `main` at an immutable commit. It presents an exact diff,
-a concise behavior summary, source and destination hashes, provenance, and validation concerns.
-Unchanged pending proposals are not repeated. Local commits and nightly prompt improvements never
-publish automatically.
+`skills/autodebug/scripts/autodebug.sh` runs either bundled investigation:
 
-Mark must explicitly approve the exact prompt changes before any publication commit or push.
-After approval, recheck both sides; materially changed content requires a revised review and fresh
-approval. Both source prompts must match the selected committed standalone revision before import.
+```bash
+/path/to/autodebug.sh --agent codex --model MODEL --effort high --events -- "symptom"
+/path/to/autodebug.sh --task autotriage --agent claude --model MODEL --effort high --events -- "Read AUTOTRIAGE_INPUT.md"
+```
 
-Approved prompt-only updates may publish directly to `main` when branch permissions allow it.
-Never bypass repository protections. This scope includes mechanical source provenance, synchronized
-host-manifest versions, changeset bookkeeping, and required distribution validation. Substantive
-skill, runtime, model-default, invocation, permission, dependency, or marketplace/host-metadata
-changes require a reviewed PR. Preserve unrelated work and keep nightly flows separate.
+Invoke it from the source tree to investigate. Reports are `AUTODEBUG.md` and
+`AUTOTRIAGE.md`. AutoTriage's interactive skill remains usable in the calling
+session; `--task autotriage` provides the fresh-process path for harnesses.
 
-## Manual update
+`--events` selects native Codex JSONL or Claude stream-json output. Callers retain
+events and stderr, check terminal provider status and the generated report, and
+record actual model/session metadata. A zero exit code alone is insufficient.
 
-1. Finish and commit the prompt change on `main` in the standalone `autodebug` repository. It is
-   fine for unrelated result files or cases to be in progress, but both imported prompt files must
-   match the recorded source commit.
-2. Use the approved prompt-only route above, or create a branch for a reviewed PR. Copy only the prompt files listed in
-   `sync-source.json` to their listed destinations. Do not import backtest cases, generated reports,
-   credentials, machine configuration, or watcher state.
-3. Update the source commit, Git blob IDs, SHA-256 digests, and import date in
-   `sync-source.json`.
-4. Review the prompt diff semantically. Preserve the `{{PROBLEM}}` and
-   `{{FOCUS_PATH_SECTION}}` placeholders and the `AUTODEBUG.md` or `AUTOTRIAGE.md` output contract.
-5. Update both `tt-autodebug` host-manifest versions together and add a changeset that explains the
-   user-visible prompt change.
-6. Run the repository validation suite and both plugin validators. Record any relevant standalone
-   backtest result in the publication review or PR, but do not copy generated backtest output into this plugin.
+The process inherits caller configuration, including isolated `CODEX_HOME` or
+`CLAUDE_CONFIG_DIR`. Repeat `--agent-arg VALUE` to pass literal CLI arguments such
+as configuration files. These arguments are explicit caller overrides; do not
+use them to silently change the requested model or weaken an evidence boundary.
+Do not override the event format when the harness requires structured results.
 
-## Future automation contract
+Benchmark isolation and ground-truth exclusion belong to the calling harness.
+The default workspace-write/inspection-only launch does not establish that
+external answer files or network sources are unreadable. Preserve session
+persistence when retained tool evidence is required.
 
-A future sync agent or script should:
+## Validation and release
 
-- accept the standalone checkout through an explicit `--source` argument; never embed a
-  maintainer-specific absolute path;
-- default to a read-only `--check` mode and require an explicit update mode before writing;
-- refuse an update when an imported source prompt differs from the recorded source commit;
-- copy only the allowlisted file mappings in `sync-source.json`;
-- update and verify every recorded digest; and
-- leave version bumps, changeset text, semantic review, and backtest interpretation visible for
-  human review.
-
-Until that tool exists, the process is intentionally manual. A newer local prompt is not
-automatically the published prompt.
+Preserve prompt placeholders and report contracts. Bump both host manifests and
+add a changeset when installed content changes. Run the repository's plugin,
+version and launcher checks. Submit changes through the normal reviewed PR path;
+case registries, generated results, credentials and local configuration stay out
+of this self-contained plugin.
