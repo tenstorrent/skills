@@ -485,13 +485,16 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if section.startswith("Restriction"):
                     _tell_running_workers(db, f"New binding restriction: {text}", key)
             elif t == "schedule_set":
-                old = db.one("SELECT kind, payload FROM schedules WHERE name=?", (a.get("name"),))
+                old = db.one("SELECT * FROM schedules WHERE name=?", (a.get("name"),))
                 kind = a.get("kind") or (old["kind"] if old else "llm")
                 kept = json.loads(old["payload"] or "{}") if old and old["kind"] == kind else {}
+                # Fields the action leaves out keep their current values; only a new schedule gets defaults.
+                enabled = bool(a["enabled"]) if "enabled" in a else (bool(old["enabled"]) if old else True)
                 if kind == "command":
                     # The daemon runs payload.command; a schedule without one would report "no command" forever.
+                    # Turning one off needs no command, so a broken schedule can always be switched off.
                     payload = {**kept, **{k: a[k] for k in ("command", "timeout_s") if a.get(k)}}
-                    if not str(payload.get("command") or "").strip():
+                    if enabled and not str(payload.get("command") or "").strip():
                         raise ValueError(f"schedule_set {a.get('name')!r} rejected: kind command needs `command`, "
                                          f"the shell command to run (and optionally `timeout_s`)")
                 elif kind == "llm":
@@ -501,8 +504,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     payload = kept   # a built-in probe: only its timing and switch change
                 else:
                     raise ValueError(f"schedule_set {a.get('name')!r} rejected: `kind` must be llm or command")
-                sched.upsert(db, a["name"], kind, a.get("every") or "1d", a.get("at"),
-                             bool(a.get("enabled", True)), a.get("budget_usd"), a.get("text") or "", payload)
+                sched.upsert(db, a["name"], kind, a.get("every") or (old["every_s"] if old else "1d"),
+                             (a.get("at") or None) if "at" in a else (old["at"] if old else None), enabled,
+                             a["budget_usd"] if "budget_usd" in a else (old["budget_usd_day"] if old else None),
+                             (a.get("text") or "") if "text" in a else ((old["description"] or "") if old else ""),
+                             payload)
             elif t == "config_set":
                 key = a.get("key", "")
                 if key not in USER_SETTABLE:

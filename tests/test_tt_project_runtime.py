@@ -2488,6 +2488,57 @@ def test_schedule_set_command_without_a_command_is_rejected(env):
     assert not p.db.one("SELECT name FROM schedules WHERE name='probe'")
 
 
+def test_schedule_set_keeps_fields_the_action_leaves_out(env):
+    p = make(env)
+    from ttp import coordinator as coord
+
+    def row():
+        return p.db.one("SELECT * FROM schedules WHERE name='pr-watch'")
+    before = row()
+    assert before["every_s"] == 300 and before["description"]
+    assert coord.apply(p, [{"type": "schedule_set", "name": "pr-watch", "enabled": False}]) == []
+    off = row()
+    assert not off["enabled"] and off["every_s"] == 300 and off["description"] == before["description"]
+    assert off["at"] == before["at"] and off["budget_usd_day"] == before["budget_usd_day"]
+    assert json.loads(off["payload"]) == json.loads(before["payload"])
+    assert coord.apply(p, [{"type": "schedule_set", "name": "pr-watch", "enabled": True}]) == []
+    on = row()
+    assert on["enabled"] and on["every_s"] == 300 and on["description"] == before["description"]
+    # A new schedule still gets the defaults.
+    assert coord.apply(p, [{"type": "schedule_set", "name": "fresh", "kind": "llm", "spec": "look"}]) == []
+    fresh = p.db.one("SELECT * FROM schedules WHERE name='fresh'")
+    assert fresh["every_s"] == 86400 and fresh["enabled"] and fresh["description"] == ""
+
+
+def test_a_broken_command_schedule_can_be_turned_off_without_a_command(env):
+    p = make(env)
+    from ttp import alerts
+    from ttp import coordinator as coord
+    from ttp import schedule as sched
+    from ttp.daemon import Daemon
+    # A legacy command schedule that stored an llm-style payload and so has no command.
+    sched.upsert(p.db, "probe", "command", "30m", payload={"spec": "python3 check.py", "tier": "light"})
+    d = Daemon(p.base)
+    d.gates = {}
+    for _ in range(2):
+        p.db.x("UPDATE schedules SET next_run=? WHERE name='probe'", (time.time() - 1,))
+        d.run_schedules()
+        d.sweep_alerts()
+    assert [m for m in alerts.needs_you(p.db, time.time()) if "probe" in m["text"]]
+    # Enabling it without a command is still rejected.
+    out = coord.apply(p, [{"type": "schedule_set", "name": "probe", "enabled": True}])
+    assert len(out) == 1 and "needs `command`" in out[0], out
+    assert coord.apply(p, [{"type": "schedule_set", "name": "probe", "enabled": False}]) == []
+    s = p.db.one("SELECT * FROM schedules WHERE name='probe'")
+    assert not s["enabled"] and s["every_s"] == 1800
+    d.sweep_alerts()
+    assert not [m for m in alerts.needs_you(p.db, time.time()) if "probe" in m["text"]]
+    assert p.db.one("SELECT cleared FROM alerts WHERE key='schedule:probe'")["cleared"]
+    # Switching it back on still needs the command.
+    out = coord.apply(p, [{"type": "schedule_set", "name": "probe", "enabled": True}])
+    assert len(out) == 1 and "needs `command`" in out[0], out
+
+
 def test_a_schedule_failing_twice_raises_one_alert_that_clears_on_an_ok_run(env):
     p = make(env)
     from ttp import alerts
