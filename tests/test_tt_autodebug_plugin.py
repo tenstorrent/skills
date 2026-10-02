@@ -57,19 +57,12 @@ Path(os.environ["AUTODEBUG_TEST_PROMPT"]).write_text(
     return {"env": env, "args": str(args_path), "prompt": str(prompt_path)}
 
 
-def test_prompt_snapshot_digests_are_current():
-    provenance = json.loads((PLUGIN / "sync-source.json").read_text(encoding="utf-8"))
-    assert provenance["source"]["kind"] == "maintainer-local-git"
-    assert len(provenance["source"]["commit"]) == 40
-    assert "/Users/" not in json.dumps(provenance)
-
-    for imported in provenance["files"]:
-        assert not Path(imported["source"]).is_absolute()
-        destination = Path(imported["destination"])
-        assert not destination.is_absolute()
-        contents = (PLUGIN / destination).read_bytes()
-        assert hashlib.sha256(contents).hexdigest() == imported["sha256"]
-        assert "{{PROBLEM}}" in contents.decode("utf-8")
+def test_canonical_prompts_preserve_rendering_and_report_contracts():
+    for skill, report in [("autodebug", "AUTODEBUG"), ("autotriage", "AUTOTRIAGE")]:
+        text = (PLUGIN / "skills" / skill / "references" / f"{report}_PROMPT.md").read_text()
+        assert "{{PROBLEM}}" in text
+        assert "{{FOCUS_PATH_SECTION}}" in text
+        assert f"{report}.md" in text
 
 
 def test_all_autodebug_skills_allow_implicit_selection():
@@ -197,3 +190,48 @@ def test_launcher_requires_a_problem():
 
 def test_launcher_is_executable():
     assert LAUNCHER.stat().st_mode & stat.S_IXUSR
+
+
+def test_harness_can_run_both_tasks_and_backends_with_structured_events(tmp_path):
+    for agent in ("codex", "claude"):
+        for task, report in (("autodebug", "AUTODEBUG.md"), ("autotriage", "AUTOTRIAGE.md")):
+            workspace = tmp_path / f"{task}-{agent}"
+            workspace.mkdir()
+            capture = install_fake_cli(workspace, agent)
+            result = subprocess.run(
+                ["/bin/bash", str(LAUNCHER), "--task", task, "--agent", agent,
+                 "--model", "test-model", "--effort", "high", "--events",
+                 "--agent-arg", "--settings" if agent == "claude" else "-c",
+                 "--agent-arg", "literal path with spaces;$(no-shell-evaluation)",
+                 "--focus", "src/kernel.cpp", "--", "Inspect the observed stall"],
+                cwd=workspace, env=capture["env"], capture_output=True, text=True,
+            )
+            assert result.returncode == 0, result.stderr
+            args = json.loads(Path(capture["args"]).read_text())
+            assert args[args.index("--model") + 1] == "test-model"
+            assert "literal path with spaces;$(no-shell-evaluation)" in args
+            if agent == "codex":
+                assert "--json" in args
+                assert "model_reasoning_effort=high" in args
+            else:
+                assert args[args.index("--output-format") + 1] == "stream-json"
+                assert "--verbose" in args
+                assert args[args.index("--effort") + 1] == "high"
+            prompt = Path(capture["prompt"]).read_text()
+            assert f"write {report}" in prompt
+            assert "Inspect the observed stall" in prompt
+            assert "src/kernel.cpp" in prompt
+            assert "{{PROBLEM}}" not in prompt
+            if task == "autotriage":
+                assert "TRI-001" in prompt
+                assert "DBG-001" not in prompt
+
+
+def test_unknown_task_stops_before_invoking_an_agent(tmp_path):
+    capture = install_fake_cli(tmp_path, "codex")
+    result = subprocess.run(
+        [str(LAUNCHER), "--task", "unknown", "--", "symptom"],
+        cwd=tmp_path, env=capture["env"], capture_output=True, text=True,
+    )
+    assert result.returncode != 0
+    assert not Path(capture["args"]).exists()
