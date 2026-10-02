@@ -1555,7 +1555,8 @@ class Daemon:
     def check_release(self) -> None:
         """Hourly (and at start): is a newer tt-project installed than this harness runs? Status and
         the web app say so while it is. With upgrade.auto on, and no push or upgrade in flight, start
-        this project's own `ttp upgrade` once per release; it restarts this daemon, keeping workers."""
+        this project's own `ttp upgrade` once per strictly newer release; it restarts this daemon,
+        keeping workers. The same version from another commit is only shown."""
         now = time.time()
         if now < self._release_due:
             return
@@ -1570,7 +1571,8 @@ class Daemon:
             db.set_kv(release.KV_RELEASE, d)
             if d:
                 log(self.p, f"tt-project {d['installed']} installed; harness on {d['current']}")
-        if not d or not (self.cfg.get("upgrade") or {}).get("auto", True) or db.kv("paused", False):
+        if not d or not d.get("newer") or not (self.cfg.get("upgrade") or {}).get("auto", True) \
+                or db.kv("paused", False):
             return
         why = release.hold_reason(self.p, d)
         if why:
@@ -1580,6 +1582,7 @@ class Daemon:
                 log(self.p, f"automatic upgrade to {d['installed']} held: {why}")
             return
         log(self.p, f"automatic upgrade from {d['current']} to {d['installed']}: starting `ttp upgrade`")
+        self._release_due = now + release.HELD_RECHECK_S   # an upgrade that finds a push at its swap retries soon
         try:
             release.start(self.p, d)
         except Exception as e:

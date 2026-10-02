@@ -1098,6 +1098,10 @@ def _upgrade(p: Project, auto: bool = False) -> None:
         print(f"upgrade not applied; the running harness is unchanged. {problem}\nHarness task #{tid} "
               f"finishes it.")
         sys.exit(1)
+    if auto and release.push_in_flight(p):   # a push started while this merged: never swap under it
+        release.finish(p, "held", why="a push is in flight")
+        print("upgrade held: a push is in flight; the running harness is unchanged and the daemon retries later")
+        sys.exit(75)
     r = subprocess.run(["git", "-C", str(h), *ident, "merge", "--ff-only", merged], capture_output=True, text=True)
     if r.returncode != 0:   # the daemon committed charter or memory meanwhile: those touch other files
         r = subprocess.run(["git", "-C", str(h), *ident, "merge", "--no-edit", merged], capture_output=True, text=True)

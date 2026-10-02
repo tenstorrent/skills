@@ -8372,8 +8372,14 @@ def test_cursor_resumes_a_chat_and_loads_plugins_when_its_cli_can(env, tmp_path,
     assert Cursor().resume_args("s-9") == [] and Cursor().plugin_args(["/a"]) == []
 
 
-def _release_daemon(env, monkeypatch, commit="bbbb2222"):
-    """A project, a newer release installed in lib/current, and a daemon whose automatic upgrade runs
+def _newer(v):
+    *head, last = v.split(".")
+    return ".".join([*head, str(int(last) + 1)])
+
+
+def _release_daemon(env, monkeypatch, commit="bbbb2222", newer=True):
+    """A project, a newer release installed in lib/current (the next version unless `newer` is off:
+    then the same version from another commit), and a daemon whose automatic upgrade runs
     `ttp upgrade --auto` in this process (the real merge path, restart stubbed)."""
     p = make(env)
     from ttp import cli, release, service
@@ -8385,6 +8391,10 @@ def _release_daemon(env, monkeypatch, commit="bbbb2222"):
     with contextlib.redirect_stdout(io.StringIO()):
         cli.main(["upgrade", p.name])                  # the harness runs the older release
     mark.write_text(commit + "\n")
+    if newer:
+        from ttp import __version__
+        init = mark.parent / "__init__.py"
+        init.write_text(init.read_text().replace(f'"{__version__}"', f'"{_newer(__version__)}"'))
     launches = []
 
     def launch(proj):
@@ -8409,10 +8419,12 @@ def test_the_release_line_shows_while_a_newer_tt_project_is_installed_and_clears
     p.set_config("upgrade.auto", False)
     d.cfg = p.config()
     d.check_release()
-    want = f"tt-project {__version__} (bbbb2222) available, harness on {__version__} (aaaa1111)"
+    want = f"tt-project {_newer(__version__)} (bbbb2222) available, harness on {__version__} (aaaa1111)"
     assert want in status_text(p) and want in health(p, p.db)["release"]
     assert "upgrade.auto is off" in health(p, p.db)["release"]
-    (p.harness / "runtime" / "ttp" / "SOURCE_COMMIT").write_text("bbbb2222\n")   # upgraded by hand
+    import shutil
+    shutil.copytree(env["home"] / "lib" / "current" / "runtime", p.harness / "runtime",
+                    dirs_exist_ok=True)                                       # upgraded by hand
     d.check_release()
     assert p.db.kv("release"), "the comparison runs hourly, not every tick"
     d._release_due = 0
@@ -8486,12 +8498,53 @@ def test_a_conflicting_auto_upgrade_queues_one_task_and_is_not_retried(env, monk
 
 
 def test_an_older_installed_release_is_not_offered(env, monkeypatch):
-    p, d, launches = _release_daemon(env, monkeypatch)
+    p, d, launches = _release_daemon(env, monkeypatch, newer=False)
     init = env["home"] / "lib" / "current" / "runtime" / "ttp" / "__init__.py"
     from ttp import __version__
     init.write_text(init.read_text().replace(f'"{__version__}"', '"0.0.1"'))
     d.check_release()
     assert not p.db.kv("release") and not launches
+
+
+def test_the_same_version_from_another_commit_is_shown_but_never_auto_upgraded(env, monkeypatch):
+    from ttp.cli import status_text
+    p, d, launches = _release_daemon(env, monkeypatch, newer=False)
+    before = _git_out(p.harness, "rev-parse", "HEAD")
+    for _ in range(2):
+        d._release_due = 0
+        d.check_release()
+    assert p.db.kv("release") and "(bbbb2222) available, harness on" in status_text(p)
+    assert "not applied automatically" in status_text(p)
+    assert not launches and not p.db.kv("upgrade_auto") and _harness_commit(p) == "aaaa1111"
+    assert _git_out(p.harness, "rev-parse", "HEAD") == before
+
+
+def test_an_auto_upgrade_that_finds_a_push_at_its_swap_leaves_the_harness_and_retries(env, monkeypatch):
+    from ttp import cli, locks, push
+    p, d, launches = _release_daemon(env, monkeypatch)
+    before = _git_out(p.harness, "rev-parse", "HEAD")
+    held = []
+    merge_upstream = cli._merge_upstream
+
+    def push_starts_meanwhile(*a, **k):   # a push takes its lock while the upgrade merges
+        out = merge_upstream(*a, **k)
+        if not held:
+            held.append(locks.try_take(push.lock_paths(p, "origin", "feature/x"), "task #1 (run 1)", "ttp push"))
+        return out
+    monkeypatch.setattr(cli, "_merge_upstream", push_starts_meanwhile)
+    d.check_release()
+    assert launches == [p.base] and _harness_commit(p) == "aaaa1111"
+    assert _git_out(p.harness, "diff", "--stat", before, "HEAD", "--", "runtime") == "", "the live harness moved"
+    assert p.db.kv("upgrade_auto")["outcome"] == "held" and p.db.kv("release")
+    assert d._release_due - time.time() < 600, "retried soon, not in an hour"
+    d._release_due = 0
+    d.check_release()
+    assert launches == [p.base], "never while the push is still in flight"
+    held[0].close()
+    d._release_due = 0
+    d.check_release()
+    assert launches == [p.base, p.base] and _harness_commit(p) == "bbbb2222"
+    assert p.db.kv("upgrade_auto")["outcome"] == "applied"
 
 
 def test_status_without_a_name_uses_the_project_of_the_current_folder(env, monkeypatch, capsys):

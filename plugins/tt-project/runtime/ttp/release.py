@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Newer tt-project releases. `ttp setup` installs a release into ~/.tt-project/lib/current; each
 project's daemon compares that with its own harness runtime, says so while they differ and, with
-`upgrade.auto` on, merges it into its own harness through `ttp upgrade` (one try per release)."""
+`upgrade.auto` on, merges a strictly newer version into its own harness through `ttp upgrade` (one try
+per release). The same version from another commit is only shown: a hand install or a rebuilt branch
+must not trigger an unattended upgrade."""
 from __future__ import annotations
 
 import fcntl
@@ -55,7 +57,8 @@ def drift(p: Project) -> dict | None:
     cur_v, cur_c = runtime_version(p.harness / "runtime"), runtime_commit(p.harness / "runtime")
     if (new_v, new_c) == (cur_v, cur_c) or _num(new_v) < _num(cur_v):
         return None
-    return {"installed": f"{new_v} ({new_c})", "current": f"{cur_v} ({cur_c})", "key": f"{new_v} {new_c}"}
+    return {"installed": f"{new_v} ({new_c})", "current": f"{cur_v} ({cur_c})", "key": f"{new_v} {new_c}",
+            "newer": _num(new_v) > _num(cur_v)}
 
 
 def upgrade_lock(p: Project) -> Path:
@@ -80,17 +83,21 @@ def open_upgrade_task(p: Project) -> int | None:
     return int(t["id"]) if t else None
 
 
+def push_in_flight(p: Project) -> bool:
+    return any(h.startswith("push:") for h in locks.held(p.state / "locks"))
+
+
 def hold_reason(p: Project, d: dict) -> str:
     """Why the daemon must not start an automatic upgrade to `d` now ("" = go)."""
     if _taken(upgrade_lock(p)):
         return "an upgrade is in flight"
-    pushes = [h for h in locks.held(p.state / "locks") if h.startswith("push:")]
-    if pushes:
+    if push_in_flight(p):
         return "a push is in flight"
     tid = open_upgrade_task(p)
     if tid:
         return f"harness task #{tid} finishes an earlier upgrade"
-    if (p.db.kv(KV_AUTO) or {}).get("key") == d["key"]:
+    rec = p.db.kv(KV_AUTO) or {}
+    if rec.get("key") == d["key"] and rec.get("outcome") != "held":
         return "already tried for this release"
     return ""
 
@@ -126,6 +133,8 @@ def line(p: Project, db, cfg: dict) -> str:
     if not d:
         return ""
     text = f"tt-project {d['installed']} available, harness on {d['current']}"
+    if not d.get("newer", True):
+        return text + " (same version from another commit: not applied automatically)"
     if not (cfg.get("upgrade") or {}).get("auto", True):
         return text + f" (upgrade.auto is off: `ttp upgrade {p.name}` applies it)"
     tid = open_upgrade_task(p)
