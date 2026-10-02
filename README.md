@@ -52,6 +52,11 @@ AutoDebug investigates in a fresh agent process and writes `AUTODEBUG.md`. AutoF
 changes and validation. For examples and expected outputs, see the
 [Agentic Research guide](docs/agentic-research/getting-started.md).
 
+AutoDebug and AutoTriage prompts and investigation runners are maintained here.
+Case curation, backtests and improvement flows live in
+[skills-autoimprove](https://github.com/tenstorrent/skills-autoimprove), which runs a
+recorded skills revision through the [shared runner interface](plugins/tt-autodebug/SYNC.md).
+
 If AutoDebug’s Codex child sandbox fails, the calling agent assesses the error and existing
 authorization before explicitly retrying with `AUTODEBUG_SKIP_CHILD_SANDBOX=1`; see the
 [sandbox guidance](plugins/tt-autodebug/skills/autodebug/SKILL.md#codex-sandbox-startup).
