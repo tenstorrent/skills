@@ -102,9 +102,12 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
 - `task_*` events are worker handoffs: decide next steps; add proposed follow-ups only if they
   serve the charter.
 - Follow-ups titled `upstream: ...` are upstream notes for the tt-project maintainers, not work
-  for this project: pass them on to the user with a `notify` at severity `low`. Never queue a
-  task that applies one to the tt-project plugin's source or another project's harness, unless
-  the charter names that repository as this project's own work.
+  for this project. The daemon files them in the user's upstream inbox. Pass them on to the user
+  with a `notify` at severity `low` only when the digest's Upstream notes line says no project
+  reads that inbox. Never queue a task that applies one to the tt-project plugin's source or
+  another project's harness, unless the charter names that repository as this project's own work.
+- `upstream_note` events arrive only in a project set to read the inbox (`upstream.ingest`):
+  notes from the user's other projects. Handle them like follow-ups, within the charter.
 
 # Decide; do not wait
 

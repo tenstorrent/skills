@@ -18,6 +18,7 @@ from . import budget as bud
 from . import coordinator as coord
 from . import release
 from . import schedule as sched
+from . import upstream
 from .daemon import HEARTBEAT_STALE_S, KV_LOCAL_ONLY, WATCHDOG_S, heartbeat
 from .alerts import cleared  # noqa: F401  (readers import it from here)
 from .db import DB, SEVERITY_RANK, chat_floor, dump_result, host_line, load_result
@@ -310,6 +311,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         "release": release.line(p, db, cfg),
         "schedules_broken": sched.broken_line(db),
         "local_only": local_only_line(db),
+        "upstream": upstream.status_line(db, cfg),
     }
 
 

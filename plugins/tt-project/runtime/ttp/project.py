@@ -91,6 +91,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # A newer tt-project installed with `ttp setup` is merged into this project's own harness by its
     # daemon (`ttp upgrade`, once per release, never during a push), which then restarts keeping workers.
     "upgrade": {"auto": True},
+    # Upstream notes (hand-off follow-ups titled `upstream: ...`) are filed in the user's inbox
+    # ~/.tt-project/upstream.jsonl. With ingest on, this project's coordinator gets them as events.
+    "upstream": {"ingest": False},
 }
 
 

@@ -109,6 +109,11 @@ What each supported CLI offers, with doc links: [providers.md](providers.md).
 - Stopping or restarting the daemon leaves running workers alone; the next daemon adopts them.
   A cancel ends the task's runs; `ttp stop --kill` ends all runs and requeues their tasks.
 - Generic lessons from a project come back as follow-ups titled `upstream: …`.
+  The daemon files each one, deduplicated by a fingerprint of title and spec, in the user's
+  inbox `~/.tt-project/upstream.jsonl`. A project with `upstream.ingest: true` (off by default)
+  reads it, and the inboxes on its remote projects' machines over ssh at most hourly, keeping its
+  own cursor; new notes become `upstream_note` events for its coordinator. Coordinators pass the
+  notes on to the user only while no project reads the inbox.
 
 ## Prior art
 

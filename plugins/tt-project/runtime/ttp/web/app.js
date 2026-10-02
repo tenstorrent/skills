@@ -107,6 +107,7 @@ function healthHtml(h) {
   return `<div class="row"><span class="meta">${parts.join(" · ")}</span></div>` + h.providers_paused.map((p) =>
     `<div class="row"><b>${esc(p.provider)}</b><span class="pill lv-red">paused until ${at(p.until)}</span><span>${esc(p.note)}</span><span class="meta">fix: ${esc(p.fix)}</span></div>`).join("") +
     (h.schedules_broken ? `<div class="row"><span class="pill lv-red">${esc(h.schedules_broken)}</span></div>` : "") +
+    (h.upstream ? `<div class="row"><span class="meta">${esc(h.upstream)}</span></div>` : "") +
     (h.resources_paused || []).map((r) =>
     `<div class="row"><b>${esc(r.resource)}</b><span class="pill lv-orange">resource paused</span><span>${esc(r.reason || "")}</span><span class="meta">since ${at(r.since)} by ${esc(r.by || "user")}: its tasks wait</span><button data-resume-resource="${esc(r.resource)}">Resume</button></div>`).join("");
 }

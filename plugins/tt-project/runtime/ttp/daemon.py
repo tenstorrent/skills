@@ -35,6 +35,7 @@ from . import machines
 from . import release
 from . import runner
 from . import schedule as sched
+from . import upstream
 from . import screen as scr
 from . import worktree
 from .db import SEVERITY_RANK, TERMINAL_TASK_STATES, continues_id, dependency_ids, dump_result, load_result
@@ -169,6 +170,7 @@ class Daemon:
         self._slack = None
         self._last_cfg = 0.0
         self._trouble_checked = 0.0
+        self._upstream_checked = 0.0
         self._last_slack = 0.0
         self._thread_scan = 0.0
         self._slack_rejects: dict[int, int] = {}   # outbound message id -> times Slack refused it
@@ -341,7 +343,7 @@ class Daemon:
         self.update_gates()
         coord.expire_asks(self.p, hold=any(g.level == "red" for g in self.gates.values()))
         settling = self.settling()
-        for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.retry_rejected,
+        for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.read_upstream, self.retry_rejected,
                      self.maybe_coordinate, self.probe_waiting, self.dispatch, self.deliver_outbound):
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
             if settling and (step == self.dispatch or step == self.maybe_coordinate and not self.p.db.one(
@@ -1086,6 +1088,10 @@ class Daemon:
         sev = "high" if new == "blocked" else "normal"
         fups = result.get("followups") if isinstance(result, dict) else None
         fups = [f for f in fups if isinstance(f, dict) and f.get("title")] if isinstance(fups, list) else []
+        try:
+            upstream.append(self.p.name, task["id"], fups)   # the user's inbox of notes for tt-project
+        except OSError as e:
+            log(self.p, f"could not file upstream notes of #{task['id']}: {e}")
         # A plan's findings, plugin advice and follow-up specs are its product: each part gets its own
         # event, sized for the digest to show it whole, so an ordinary hand-off does not grow.
         where = _result_ref(self.p, run_dir if handoff is None else run_dir / RESULT_FILE)
@@ -1756,6 +1762,21 @@ class Daemon:
                           f"not wanted.", "queued", t["id"]))
             if live != told:
                 db.set_kv(KV_LOCAL_ONLY, live or None)
+
+    def read_upstream(self) -> None:
+        """With `upstream.ingest` on, new notes in the user's upstream inboxes become coordinator events
+        (this machine's every minute, remote ones at most hourly); otherwise nothing is read."""
+        now = time.time()
+        if now - self._upstream_checked < upstream.LOCAL_EVERY_S or not (self.cfg.get("upstream") or {}).get("ingest"):
+            return
+        self._upstream_checked = now
+        try:
+            n = upstream.ingest(self.p, self.cfg, now)
+        except (OSError, ValueError) as e:
+            log(self.p, f"reading the upstream inbox failed: {type(e).__name__}: {e}")
+            return
+        if n:
+            log(self.p, f"{n} new upstream note(s) for the coordinator")
 
     def check_resource_trouble(self, every_s: float = 60) -> None:
         """A resource whose tasks keep failing (machines.trouble) starts a coordinator turn once per

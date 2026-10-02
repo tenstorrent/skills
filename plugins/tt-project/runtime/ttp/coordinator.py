@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import machines, push
+from . import machines, push, upstream
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, TERMINAL_TASK_STATES, continues_id, dependency_ids, dump_result, host_line,
                  load_result)
@@ -92,7 +92,7 @@ FINISHED_ROWS, FINISHED_CHARS = 10, 120
 SENT_CHARS = 100
 EVENT_CHARS = 1500
 # A plan's product arrives as these events; the daemon sizes them to fit, so they show whole.
-EVENT_CHARS_BY_KIND = {"followup_proposed": 4300, "task_notes": 6000}
+EVENT_CHARS_BY_KIND = {"followup_proposed": 4300, "task_notes": 6000, "upstream_note": 4300}
 HANDOFF_KINDS = ("task_done", "task_failed", "task_cancelled", "cancelled_but_done")
 MAX_TASKS_PER_DAY = 1000
 ASK_DEFAULTS_KEY = "ask_defaults"   # kv: {ask message id: recommendation}; no new ask is added
@@ -236,6 +236,9 @@ def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int]) ->
     for c in chats:
         lines.append(f"- {c['id']} ({c['label'] or 'chat'}), active {(now - (c['last_active'] or now)) / 60:.0f} min ago")
 
+    if any(e["kind"] == "upstream_note" or e["kind"] in ("followup_proposed", "task_notes")
+           and "upstream:" in e["text"].lower() for e in events):
+        lines.append(upstream.digest_line(p, p.config()))
     lines.append("\n# NEW EVENTS")
     if msg_ids:
         for m in db.q(f"SELECT * FROM messages WHERE id IN ({','.join('?' * len(msg_ids))}) ORDER BY id", msg_ids):

@@ -8226,7 +8226,7 @@ def test_a_long_tick_tells_both_watchdogs_it_still_moves(env, monkeypatch):
     steps = []
     for name in ("reap_runs", "wake_after_reboot", "meter_running", "reconcile_tasks", "prune_worktrees",
                  "check_local_only", "check_disk", "sweep_alerts", "check_release", "_refresh_meters", "update_gates", "run_schedules", "poll_slack",
-                 "check_resource_trouble", "retry_rejected", "maybe_coordinate", "probe_waiting", "dispatch",
+                 "check_resource_trouble", "read_upstream", "retry_rejected", "maybe_coordinate", "probe_waiting", "dispatch",
                  "deliver_outbound"):
         monkeypatch.setattr(d, name, lambda name=name: steps.append(name))
     monkeypatch.setattr(dm.coord, "expire_asks", lambda *a, **k: [])
@@ -8245,7 +8245,7 @@ def test_a_long_tick_tells_both_watchdogs_it_still_moves(env, monkeypatch):
     finally:
         sock.close()
         cleanup()
-    assert len(steps) == 19 and pings == [b"WATCHDOG=1"] * 17, (steps, pings)
+    assert len(steps) == 20 and pings == [b"WATCHDOG=1"] * 18, (steps, pings)
     # Before its first completed tick the heartbeat is not written (`ttp restart` reads it as that
     # tick); the start marker carries the progress, which `ttp.watchdog` counts.
     assert not hb.exists()
@@ -8856,3 +8856,134 @@ def test_status_without_a_name_uses_the_project_of_the_current_folder(env, monke
     with pytest.raises(SystemExit):
         cli.main(["status"])
     assert "no tt-project project here" in capsys.readouterr().err
+
+
+def _upstream_inbox(env):
+    return [json.loads(x) for x in (env["home"] / "upstream.jsonl").read_text().splitlines()]
+
+
+def test_upstream_notes_are_filed_once_in_the_users_inbox(env):
+    p = make(env)
+    from ttp import upstream
+    note = {"title": "upstream: status hides waits", "spec": "Show waiting tasks in status."}
+    tid, _, ids = _hand_off(env, p, {"status": "done", "summary": "ok", "followups": [
+        note, {"title": "Upstream:  STATUS hides waits", "spec": "show waiting tasks  in status."},
+        {"title": "next step here", "spec": "local work"}]})
+    inbox = _upstream_inbox(env)
+    assert len(inbox) == 1, "the same note in other case and spacing was filed twice"
+    got = inbox[0]
+    assert (got["project"], got["task"], got["title"], got["spec"], got["host"]) == (
+        "demo", tid, note["title"], note["spec"], "testhost")
+    assert got["fp"] == upstream.fingerprint(note["title"], note["spec"])
+    # A retry, or another project proposing the same note, adds nothing; a new note is added.
+    assert upstream.append("other", 7, [note]) == 0
+    assert upstream.append("other", 7, [{"title": "upstream: new", "spec": "s"}, {"title": "not one"}]) == 1
+    assert [n["title"] for n in _upstream_inbox(env)] == [note["title"], "upstream: new"]
+    # The hand-off still reached this project's own coordinator as before.
+    assert sum(e["kind"] == "followup_proposed" for e in p.db.q("SELECT kind FROM events WHERE task=?", (tid,))) == 3
+
+
+def test_a_project_without_upstream_ingest_reads_nothing(env):
+    p = make(env)
+    from ttp import upstream, cli
+    from ttp.daemon import Daemon
+    upstream.append("other", 3, [{"title": "upstream: a lesson", "spec": "s"}])
+    d = Daemon(p.base)
+    d.read_upstream()
+    assert upstream.ingest(p, p.config()) == 0
+    assert not p.db.one("SELECT id FROM events WHERE kind='upstream_note'")
+    assert p.db.kv(upstream.KV_CURSOR) is None and not upstream.reader_path().exists()
+    assert "upstream" not in cli.status_text(p)
+
+
+def test_an_ingesting_project_turns_new_notes_into_events_once(env):
+    p = make(env)
+    from ttp import upstream, cli, coordinator as coord
+    from ttp.daemon import Daemon
+    p.set_config("upstream.ingest", True)
+    upstream.append("other", 3, [{"title": "upstream: first", "spec": "one"}])
+    upstream.append("demo", 4, [{"title": "upstream: mine", "spec": "own"}])     # already sent to its coordinator
+    d = Daemon(p.base)
+    d.cfg = p.config()
+    d.read_upstream()
+    evs = p.db.q("SELECT text, status FROM events WHERE kind='upstream_note'")
+    assert [e["text"] for e in evs] == ["upstream note from other #3 on testhost: upstream: first — one"]
+    assert "1 upstream note not yet read" in cli.status_text(p)
+    assert upstream.ingest(p, p.config()) == 0, "a note was read twice"
+    # A torn last line waits for the rest; the cursor moves past whole lines only.
+    with open(upstream.path(), "ab") as f:
+        f.write(json.dumps({"fp": "abc", "project": "x", "host": "h", "title": "upstream: torn",
+                            "spec": ""}).encode()[:20])
+    assert upstream.ingest(p, p.config()) == 0
+    with open(upstream.path(), "ab") as f:
+        f.write(b"\n")
+    upstream.append("other", 5, [{"title": "upstream: second", "spec": "two"}])
+    assert upstream.ingest(p, p.config()) == 1
+    assert "2 upstream notes not yet read" in cli.status_text(p)
+    # A cut or replaced inbox is read again from the start; seen notes stay read.
+    upstream.path().write_text("")
+    upstream.append("other", 6, [{"title": "upstream: first", "spec": "one"}, {"title": "upstream: third", "spec": "3"}])
+    assert upstream.ingest(p, p.config()) == 0          # notices the cut
+    assert upstream.ingest(p, p.config()) == 1
+    # The coordinator sees them, told not to pass them on; once read, status stops counting them.
+    ids = [e["id"] for e in p.db.q("SELECT id FROM events WHERE kind='upstream_note'")]
+    dig = coord.digest(p, {}, ids, [])
+    assert "this project reads the user's upstream inbox" in dig and "upstream: third" in dig
+    p.db.x("UPDATE events SET status='handled' WHERE kind='upstream_note'")
+    assert "upstream note" not in cli.status_text(p)
+
+
+def test_each_ingesting_project_keeps_its_own_cursor(env):
+    p = make(env)
+    from ttp import upstream
+    from ttp.cli import bootstrap
+    repo2 = env["tmp"] / "repo2"
+    subprocess.run(["git", "clone", "-q", str(env["repo"]), str(repo2)], check=True)
+    q = bootstrap(repo2, "second", "Another project.", "fake")
+    for x in (p, q):
+        x.set_config("upstream.ingest", True)
+    upstream.append("third", 1, [{"title": "upstream: shared", "spec": "s"}])
+    assert upstream.ingest(p, p.config()) == 1
+    assert upstream.ingest(q, q.config()) == 1, "one project's read hid the note from another"
+    assert upstream.ingest(p, p.config()) == upstream.ingest(q, q.config()) == 0
+
+
+def test_remote_upstream_inboxes_are_read_over_ssh_at_most_hourly(env, monkeypatch):
+    p = make(env)
+    from ttp import upstream
+    from ttp.project import register
+    register("far", {"host": "farbox", "dir": "/w/far"})
+    p.set_config("upstream.ingest", True)
+    line = json.dumps({"fp": "f1", "project": "far", "host": "farbox", "task": 9, "title": "upstream: remote",
+                       "spec": "r"}) + "\n"
+    calls = []
+
+    def fake_run(argv, **kw):
+        calls.append(argv)
+        tail = int(argv[-1].split("tail -c +")[1].split()[0])
+        body = line.encode()[tail - 1:]
+        return subprocess.CompletedProcess(argv, 0, f"{len(line)}\n".encode() + body, b"")
+    monkeypatch.setattr(upstream.subprocess, "run", fake_run)
+    now = time.time()
+    assert upstream.ingest(p, p.config(), now) == 1
+    assert len(calls) == 1 and calls[0][-2] == "farbox" and "tail -c +1 " in calls[0][-1]
+    assert upstream.ingest(p, p.config(), now + 1800) == 0 and len(calls) == 1, "read again within the hour"
+    assert upstream.ingest(p, p.config(), now + 3700) == 0 and len(calls) == 2
+    assert f"tail -c +{len(line) + 1} " in calls[1][-1], "the remote cursor did not move"
+    assert "upstream-reader.json" in calls[0][-1], "the remote inbox was not marked read"
+
+
+def test_coordinators_pass_upstream_notes_on_only_while_no_project_reads_them(env):
+    p = make(env)
+    from ttp import upstream, coordinator as coord
+    _, _, ids = _hand_off(env, p, {"status": "done", "summary": "ok",
+                                   "followups": [{"title": "upstream: a lesson", "spec": "s"}]})
+    assert "no project reads the user's upstream inbox. Pass" in coord.digest(p, {}, ids, [])
+    upstream.reader_path().write_text(json.dumps({"project": "dev", "host": "box", "ts": time.time()}))
+    dig = coord.digest(p, {}, ids, [])
+    assert "project dev on box reads the user's upstream inbox" in dig and "Do not pass them on" in dig
+    upstream.reader_path().write_text(json.dumps({"project": "dev", "host": "box", "ts": time.time() - 3 * 86400}))
+    assert "no project reads" in coord.digest(p, {}, ids, []), "a reader long gone still silences the notes"
+    # A turn without an upstream note carries no such line.
+    _, _, plain = _hand_off(env, p, {"status": "done", "summary": "ok", "followups": [{"title": "x", "spec": "y"}]})
+    assert "Upstream notes" not in coord.digest(p, {}, plain, [])
