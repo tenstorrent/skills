@@ -19,6 +19,7 @@
 - Run it in the foreground with the longest tool timeout you have; it can take several minutes.
   NEVER run it detached or in the background.
 - Exit 0: pushed. 3: rebase conflict; resolving it (keeping both sides' intents) is the one edit you may make; commit, rerun.
-  4: a check failed; hand off `failed` with the output. 5: the branch kept moving; hand off
-  `waiting`. 2 or 6: refused or rejected; hand off `blocked` with its message.
+  4: a check failed; hand off `failed` with the output. If instead it says the change keeps the
+  plugin version already on the branch, bumping past it (and its changeset) is the other edit you
+  may make; commit, rerun. 5: the branch kept moving; hand off `waiting`. 2 or 6: refused or rejected; hand off `blocked` with its message.
   75: another push to the branch held its turn too long; hand off `waiting` with the `retry_when` it printed.

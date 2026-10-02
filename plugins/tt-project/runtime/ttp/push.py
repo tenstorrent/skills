@@ -101,6 +101,37 @@ def code_paths(repo: Path, tip: str) -> list[str]:
     return [f for f in diff.stdout.splitlines() if f.strip() and not is_doc(f)]
 
 
+MANIFESTS = (".claude-plugin/plugin.json", ".codex-plugin/plugin.json")
+
+
+def _version(repo: Path, rev: str, path: str) -> str:
+    """The `version` in the JSON file `path` at `rev`, or "" when it has none or cannot be read."""
+    show = _git(repo, "show", f"{rev}:{path}")
+    try:
+        v = json.loads(show.stdout).get("version") if show.returncode == 0 else ""
+    except (ValueError, AttributeError):
+        return ""
+    return str(v or "")
+
+
+def stale_versions(repo: Path, tip: str) -> list[str]:
+    """Plugins under `plugins/<name>/` whose content HEAD changes since `tip` while a manifest
+    keeps tip's version, as "plugins/<name> <version>". Two changes that each bumped to the same
+    version rebase onto each other cleanly; the second must take the next version, or installs
+    that only upgrade to a strictly newer one skip it."""
+    diff = _git(repo, "diff", "--name-only", "--no-renames", tip, "HEAD")
+    names = sorted({"/".join(f.split("/")[:2]) for f in diff.stdout.splitlines()
+                    if f.startswith("plugins/") and f.count("/") >= 2})
+    out = []
+    for d in names:
+        for m in MANIFESTS:
+            v = _version(repo, tip, f"{d}/{m}")
+            if v and v == _version(repo, "HEAD", f"{d}/{m}"):
+                out.append(f"{d} {v}")
+                break
+    return out
+
+
 def rounds_of(v: Any) -> int:
     """`delivery.push_rounds` as an integer of at least 1; ValueError when it is not an integer."""
     if v is None or v == "":
@@ -217,6 +248,11 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
             say(f"rebase onto {upstream} conflicts; resolve it keeping both sides' intents, then rerun")
             return CONFLICT
         head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+        if stale := stale_versions(repo, tip):
+            say(f"{', '.join(stale)}: this change edits the plugin but keeps the version already on "
+                f"{upstream}; bump it past that (in every manifest, plus a changeset where the "
+                "repository wants one), commit, then rerun; not pushing")
+            return CHECKS_FAILED
         for cmd in checks:
             if subprocess.run(cmd, shell=True, cwd=repo).returncode != 0:
                 say(f"check failed on {head[:10]}: {cmd}; not pushing")

@@ -6222,6 +6222,39 @@ def test_push_refuses_a_dirty_tree_a_failed_check_and_a_conflict(env, monkeypatc
     assert _git_out(origin, "rev-parse", "proj") == moved != before
 
 
+def _plugin_commit(path, version, name, text):
+    """Commit a file of plugin `p` and set both its manifests to `version`."""
+    for m in (".claude-plugin", ".codex-plugin"):
+        (path / "plugins" / "p" / m).mkdir(parents=True, exist_ok=True)
+        (path / "plugins" / "p" / m / "plugin.json").write_text(json.dumps({"name": "p", "version": version}))
+    (path / "plugins" / "p" / name).write_text(text)
+    _git_out(path, "add", "plugins")
+    _git_out(path, "commit", "-qm", f"p {version}")
+
+
+def test_push_refuses_a_rebased_change_that_keeps_the_targets_plugin_version(env, monkeypatch, capsys):
+    """Two batches both bumped 0.1.0 to 0.1.1: the second rebases cleanly onto the first, but it
+    must not land as 0.1.1 too, or an upgrade to strictly newer versions skips it."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    _plugin_commit(repo, "0.1.0", "base.txt", "base\n")
+    _git_out(repo, "push", "-q", "origin", "HEAD:proj")
+    _git_out(other, "pull", "-q", "origin", "proj")
+    _plugin_commit(other, "0.1.1", "theirs.txt", "theirs\n")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    moved = _git_out(origin, "rev-parse", "proj")
+    _plugin_commit(repo, "0.1.1", "mine.txt", "mine\n")
+    assert _ttp_push() == 4
+    assert "plugins/p 0.1.1" in capsys.readouterr().err
+    assert _git_out(origin, "rev-parse", "proj") == moved, "a same-version batch was pushed"
+
+    _plugin_commit(repo, "0.1.2", "mine.txt", "mine\n")
+    assert _ttp_push() == 0, "bumped past the target's version, it goes through"
+    assert _git_out(origin, "rev-parse", "proj") == _git_out(repo, "rev-parse", "HEAD")
+
+    _commit(repo, "outside.txt", "not a plugin\n")
+    assert _ttp_push() == 0, "a change outside plugins/ needs no bump"
+
+
 def test_push_needs_a_configured_target_and_checks(env, monkeypatch, capsys):
     p, repo, origin, other = _push_setup(env, monkeypatch, [])
     before = _git_out(origin, "rev-parse", "proj")

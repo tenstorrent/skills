@@ -116,7 +116,9 @@ and preferences you add later become part of the project's charter and memory.
   (`origin/HEAD`); the checked-out branch.
 - Where reviewed changes go straight to a shared branch, `ttp push` publishes them guarded: it
   refuses uncommitted changes, rebases onto the latest tip, runs `delivery.push_checks` on the
-  exact commit it pushes, starts over if the branch moved meanwhile, and never forces. The target
+  exact commit it pushes, starts over if the branch moved meanwhile, and never forces. It exits 4
+  when the rebased change edits a plugin under `plugins/<name>/` but a manifest keeps the version
+  already on the branch (two batches that bumped to the same version). The target
   is `delivery.push_branch`, which must be set explicitly; it refuses without one, without
   checks unless the change touches only docs (`*.md`, `*.rst`, `docs/`, ...), when
   `delivery.push_allowed` is false, and for `HEAD`, `main`, `master` or the
