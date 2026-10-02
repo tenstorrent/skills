@@ -181,11 +181,17 @@ If downstream execution worked under the legacy path, prefer a missing setup, re
 
 Do not accept the bug report's explanation, another agent's conclusion, a log label, a workaround, or your first plausible idea as the truth. Split what you know into two lists: direct observations, and interpretations of those observations. Keep the two separate in your notes and in the final report.
 
+Do not turn missing correspondence into counterevidence. If a log excerpt, value sample, trace, or summary omits indices, coordinates, timestamps, object identities, ordering, or other mapping metadata, do not invent a pairing or sequence to test a hypothesis. State the mapping that a proposed falsification requires and prove that the available artifact supplies it. Otherwise leave that symptom dimension unresolved; do not demote a direct source contract violation based on a comparison whose correspondence is assumed. Rank observed mappings, source invariants, and controlled passing/failing contrasts above patterns inferred from incomplete excerpts.
+
 For each possible explanation, ask: "What code fact would have to be true for this story to be right, and is it actually true?" The story should predict the shape of the failure: which cases pass, which fail, where the first bad output appears, whether the failure is gradual or sudden, what changed between the passing and failing runs, and which nearby code must be involved. If the explanation does not predict those details, treat it as a guess, not a finding.
 
 Turn those questions into small code-inspection experiments. A useful experiment may trace one value through callers, compare two setup paths, check whether a branch can run with the failing shape, or prove which code owns a default. Prefer checks that can make a favored explanation false. When useful, hand these experiments to subagents: give each subagent one precise fact to prove or refute, the relevant paths or observations, and no preferred answer. Ask for file and line evidence, traced values, and a clear `true`, `false`, or `uncertain`.
 
 If code inspection breaks the story, update the story instead of defending it. If a runtime control would be decisive but is outside AutoDebug's inspection-only scope, describe that control as a follow-up rather than treating it as evidence. In the report, headline the explanation that best predicts all important observations with the fewest extra assumptions, and explicitly mark attractive but unproven stories as unproven.
+
+Apply the same burden of proof to competing candidates. Compare them in one ledger using the same criteria: direct code contradiction, match to the reported sequence and controlled contrasts, unverified preconditions, observations explained, and smallest implied intervention. Do not require one candidate to reproduce the final runtime manifestation in full while accepting another candidate that depends on equally or more uncertain state.
+
+In inspection-only debugging, a direct source contract violation supported by a sequence-matched passing/failing contrast can be the leading diagnosis with an explicit runtime-confidence caveat even when hardware is needed to prove the final hang, crash, or corruption. Keep a deeper alternative secondary when it needs additional unobserved conditions, unless it explains materially more evidence or falsifies the simpler candidate.
 
 ### DBG-025: Audit capacity checks across allocation time
 
@@ -200,3 +206,15 @@ When a low-level macro or helper accepts several integer selectors, indices, enu
 For primitives that control ordering, ownership, or resource state, verify both the encoding and the need for the control. A defensive wait, barrier, reset, or mode change is not automatically harmless. Identify exactly what it controls, which event or state it observes, whether adjacent work already executes in an ordered domain, and how the control interacts with every producer and consumer that can still be live.
 
 If an exact repro artifact is unavailable, still complete this local contract audit around the reported path and use the reported passing-versus-failing differential as a constraint. Missing runtime confirmation should lower confidence and be stated explicitly; it should not replace source analysis with a request for more artifacts when the available code contains a concrete contract contradiction.
+
+### DBG-027: Keep repro evidence revision-consistent
+
+When a report names a revision, API, or control-flow path that differs from the prepared tree, separate facts that are stable across revisions from behavior inferred only from the current analogous path. Do not splice an older symptom report and a newer caller's state into one causal chain unless the required state transitions and contracts are shown to survive the change. Treat a candidate that depends on unknown historical state as less certain than one supported by the prepared tree's stable subsystem behavior.
+
+When several real-looking bugs could produce the same broad symptom, make an evidence ledger before choosing the headline finding. For each candidate, record its necessary preconditions, evidence that the reported execution reaches them, the observations or passing-versus-failing contrast it uniquely explains, and the smallest check that could falsify it. A candidate that merely could produce the same generic symptom is not enough. Prefer candidates backed by sequence-matched tests, comments, or exact contrasts, and keep candidates with unproven prerequisites in a secondary section.
+
+### DBG-028: Audit side effects in non-executing modes
+
+When a mode suppresses execution, do not assume it is side-effect-free merely because final dispatch is blocked. Trace validation, cache lookup, cache-hit refresh, descriptor or runtime-argument rebinding, lazy initialization, and persistent-object mutation that happen before the dispatch boundary. Build a sequence ledger across an ordinary or warmup call, the suppressed call, and the next ordinary call; record shared object identity and every field mutated.
+
+Compare cache-hit and cache-miss handling. If one path explicitly refuses to persist placeholder or synthetic state, check whether another path can overwrite an existing shared entry with that same state. Do not dismiss an intermediate mutation because a later call appears to refresh it until you prove that every mutated field is restored before any synchronous or asynchronous consumer can observe it. Prefer a sequence-matched persistent-state explanation over a deeper candidate that requires unverified preconditions.
