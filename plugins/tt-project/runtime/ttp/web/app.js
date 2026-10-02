@@ -104,6 +104,7 @@ function healthHtml(h) {
   if (c.failures) parts.push(`<span class="lv-red">${c.failures} failed in a row</span>`);
   if (c.backoff_until) parts.push(`retry at ${at(c.backoff_until)}`);
   if (c.idle_wake) parts.push(`next idle check ${at(c.idle_wake)}`);
+  else if (c.idle_held) parts.push(`idle check ${esc(c.idle_held)}`);
   return `<div class="row"><span class="meta">${parts.join(" · ")}</span></div>` + h.providers_paused.map((p) =>
     `<div class="row"><b>${esc(p.provider)}</b><span class="pill lv-red">paused until ${at(p.until)}</span><span>${esc(p.note)}</span><span class="meta">fix: ${esc(p.fix)}</span></div>`).join("") +
     (h.schedules_broken ? `<div class="row"><span class="pill lv-red">${esc(h.schedules_broken)}</span></div>` : "") +

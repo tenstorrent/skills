@@ -9355,17 +9355,78 @@ def test_the_coordinator_model_and_effort_override_its_tier_and_leave_workers_al
     assert (row["model"], row["effort"]) == ("pinned-model", "low")
 
 
-def test_idle_slot_wake_ignores_forgotten_open_asks(env, monkeypatch):
-    from types import SimpleNamespace
+def test_idle_slot_wake_ignores_forgotten_open_asks(env):
+    from ttp import budget as bud
+    from ttp.daemon import starve_state
+    from ttp.db import OPEN_ASK_MAX_AGE_S
+    p = make(env)
+    gate = bud.Gate(provider="fake", regime="windows", numbers={"pace": [{"need_per_h": 10, "burn_per_h": 1}]})
+    ask = p.db.post("out", "which option?", kind="ask")
+    now = time.time()
+    assert starve_state(p.db, p.config(), gate.as_dict(), now) is None, "a fresh open ask waits for the user"
+    p.db.x("UPDATE messages SET ts=? WHERE id=?", (now - OPEN_ASK_MAX_AGE_S - 60, ask))
+    assert starve_state(p.db, p.config(), gate.as_dict(), now), "a forgotten ask must not hold back idle-slot wakes forever"
+
+
+def _wake_setup(env, monkeypatch, gate=None):
+    """A quiet project whose status and daemon see the same gate, on a simulated clock."""
     p = make(env)
     from ttp.daemon import Daemon
-    from ttp.db import OPEN_ASK_MAX_AGE_S
+    _no_events(p)
     d = Daemon(p.base)
-    monkeypatch.setattr(d, "_free_slots", lambda gate: 1)
-    monkeypatch.setattr(d, "_dispatchable", lambda: False)
-    gate = SimpleNamespace(regime="windows", level="green", allow_new_work=True,
-                           numbers={"pace": [{"need_per_h": 10, "burn_per_h": 1}]})
-    ask = p.db.post("out", "which option?", kind="ask")
-    assert not d._starved(gate, 10 ** 6), "a fresh open ask waits for the user"
-    p.db.x("UPDATE messages SET ts=? WHERE id=?", (time.time() - OPEN_ASK_MAX_AGE_S - 60, ask))
-    assert d._starved(gate, 10 ** 6), "a forgotten ask must not hold back idle-slot wakes forever"
+    d.update_gates()
+    if gate:
+        d.gates = {gate.provider: gate}
+        p.db.set_kv("gates", {gate.provider: gate.as_dict()})
+    clock = [time.time()]
+    starts = _count_turns(d, monkeypatch, clock)
+    p.db.set_kv("last_coordinator_turn", clock[0])
+    return p, d, clock, starts
+
+
+def _first_turn(d, clock, starts, until):
+    while not starts and clock[0] < until:
+        d.maybe_coordinate()
+        clock[0] += 30
+    return starts[0] if starts else None
+
+
+def test_status_shows_the_backed_off_idle_wake_the_daemon_applies(env, monkeypatch):
+    from ttp.daemon import wake_fingerprint
+    from ttp.web import health
+    p, d, clock, starts = _wake_setup(env, monkeypatch)
+    idle_s = float(p.config()["coordinator"]["idle_wake_s"])
+    p.db.set_kv("idle_wake", {"fp": wake_fingerprint(p, p.db.kv("gates")), "n": 2})
+    shown = health(p, p.db, now=clock[0])["coordinator"]["idle_wake"]
+    assert shown == clock[0] + 4 * idle_s, "status ignored the doubling after unchanged wakes"
+    fired = _first_turn(d, clock, starts, shown + 3600)
+    assert fired is not None and 0 < fired - shown <= 30, (fired, shown)
+
+
+def test_status_shows_the_idle_slot_wake_when_it_comes_first(env, monkeypatch):
+    from ttp import budget as bud
+    from ttp.web import health
+    prov = "fake"
+    pace = [{"window": "seven_day", "utilization": 50.0, "resets_at": time.time() + 36000, "hours_left": 10.0,
+             "burn_per_h": 1.0, "need_per_h": 4.0, "projected": 60.0}]
+    gate = bud.Gate(provider=prov, regime="windows", max_parallel=6, numbers={"pace": pace})
+    p, d, clock, starts = _wake_setup(env, monkeypatch, gate)
+    assert p.config().get("core_provider") == prov
+    c = p.config()["coordinator"]
+    shown = health(p, p.db, now=clock[0])["coordinator"]["idle_wake"]
+    assert shown == clock[0] + float(c["starve_wake_s"]) < clock[0] + float(c["idle_wake_s"]), shown
+    fired = _first_turn(d, clock, starts, shown + 3600)
+    assert fired is not None and 0 < fired - shown <= 30, (fired, shown)
+
+
+def test_status_says_when_the_budget_gate_holds_the_idle_wake(env, monkeypatch):
+    from ttp import budget as bud
+    from ttp.web import health
+    gate = bud.Gate(provider="fake", level="yellow", allow_optional=False)
+    p, d, clock, starts = _wake_setup(env, monkeypatch, gate)
+    idle_s = float(p.config()["coordinator"]["idle_wake_s"])
+    h = health(p, p.db, now=clock[0] + 2 * idle_s)
+    assert h["coordinator"]["idle_wake"] is None, "status showed a wake the gate holds back"
+    assert h["coordinator"]["idle_held"] == "held by the budget gate (yellow)"
+    assert "idle check is held by the budget gate" in h["why_idle"], h["why_idle"]
+    assert _first_turn(d, clock, starts, clock[0] + 3 * idle_s) is None, "the daemon woke through the gate"

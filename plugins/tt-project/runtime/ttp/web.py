@@ -19,7 +19,7 @@ from . import coordinator as coord
 from . import release
 from . import schedule as sched
 from . import upstream
-from .daemon import HEARTBEAT_STALE_S, KV_LOCAL_ONLY, WATCHDOG_S, heartbeat
+from .daemon import HEARTBEAT_STALE_S, KV_LOCAL_ONLY, WATCHDOG_S, heartbeat, idle_wake
 from .alerts import cleared  # noqa: F401  (readers import it from here)
 from .db import DB, SEVERITY_RANK, chat_floor, dump_result, host_line, load_result
 from .project import Project
@@ -186,7 +186,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
     app's header show, so both answer "is it working, what is it costing, what is it waiting for"."""
     now = now or time.time()
     cfg = p.config()
-    c, core, notify = cfg["coordinator"], cfg.get("core_provider", "claude"), cfg["notify"]
+    core, notify = cfg.get("core_provider", "claude"), cfg["notify"]
     gates = db.kv("gates", {})
     last_turn = float(db.kv("last_coordinator_turn", 0))
     backoff = float(db.kv("coordinator_backoff_until", 0))
@@ -231,9 +231,8 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
             lowest = min(floor for _, floor in readers)
             undelivered = {"asks": len(late), "since": since,
                            "below_floor": sum(SEVERITY_RANK.get(a["severity"], 1) < lowest for a in late)}
-    idle_wake = None
-    if last_turn and not waiting and not queued and not db.one("SELECT id FROM tasks WHERE status='running'"):
-        idle_wake = max(last_turn + float(c.get("idle_wake_s", 1800)), backoff, now)
+    wake = idle_wake(p, cfg, gates, now) if last_turn else {"at": None, "held": None}
+    next_wake = max(wake["at"], backoff, now) if wake["at"] else None
 
     # What keeps ready tasks from starting; shown even while other runs work.
     stops = []
@@ -282,8 +281,10 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         why.append(f"{len(queued) - len(due)} queued task(s) wait on other tasks")
     if you:
         why.append(you)
-    if not why and idle_wake:
-        why.append(f"nothing queued; the coordinator checks in at {at(idle_wake, now)}")
+    if not why and next_wake:
+        why.append(f"nothing queued; the coordinator checks in at {at(next_wake, now)}")
+    elif not why and wake["held"]:
+        why.append(f"nothing queued; the coordinator's idle check is {wake['held']}")
     held = ""
     if running and ready and stops:
         held = f"{ready} ready task(s) not starting: " + "; ".join(stops + ([you] if you else []))
@@ -303,7 +304,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
                         "failures": int(db.kv("coordinator_failures", 0)),
                         "backoff_until": backoff if backoff > now else None,
                         "summary": (db.kv("last_coordinator_summary", {}) or {}).get("summary", ""),
-                        "idle_wake": idle_wake},
+                        "idle_wake": next_wake, "idle_held": wake["held"]},
         "providers_paused": paused_providers, "resources_paused": paused_resources, "waiting": waiting, "asks": asks, "running": running, "working": working,
         "undelivered": undelivered,
         "why_idle": "; ".join(why) if not running else "", "held": held,

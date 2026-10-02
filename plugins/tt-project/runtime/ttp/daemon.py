@@ -1356,26 +1356,17 @@ class Daemon:
         msgs = db.q("SELECT id, ts, chat FROM messages WHERE direction='in' AND handled=0 ORDER BY id LIMIT 30")
         evs = db.q("SELECT id, ts FROM events WHERE status='queued' ORDER BY id LIMIT ?",
                    (int(c.get("max_events_per_turn", 40)),))
-        idle_due = False
         wake: dict = {}
         if not msgs and not evs:
-            busy = db.one("SELECT id FROM tasks WHERE status IN ('queued','running')")
             last = float(db.kv("last_coordinator_turn", 0))
-            gate = self.gates.get(self.cfg.get("core_provider", "claude"))
             if now - last <= min(float(c.get("idle_wake_s", 3600)), float(c.get("starve_wake_s", 300))):
                 return
-            # A wake turn that met the same state as the previous one had nothing new to decide:
-            # each such repeat doubles the wait, up to a day. Explicit check-backs use schedules.
-            fp = self._wake_fingerprint()
-            prev = db.kv("idle_wake", {}) or {}
-            repeats = int(prev.get("n", 0)) if prev.get("fp") == fp else 0
-            backoff = min(float(c.get("idle_wake_s", 3600)) * 2 ** repeats, 86400.0) if repeats else 0.0
-            idle_due = (not busy and now - last > max(float(c.get("idle_wake_s", 3600)), backoff)
-                        and (gate is None or gate.allow_optional))
-            starved = not idle_due and now - last > backoff and self._starved(gate, now - last)
-            if not (idle_due or starved):
+            w = idle_wake(self.p, self.cfg, {k: g.as_dict() for k, g in self.gates.items()}, now)
+            if not w["due"]:
                 return
-            wake = {"fp": fp, "n": repeats + 1}
+            if w["due"] == "starve":
+                db.set_kv("starve", w["starve"])
+            wake = w["wake"]
         else:
             newest = max([m["ts"] for m in msgs] + [e["ts"] for e in evs])
             oldest = min([m["ts"] for m in msgs] + [e["ts"] for e in evs])
@@ -1409,58 +1400,6 @@ class Daemon:
             return
         db.set_kv("last_coordinator_turn", now)
         db.set_kv("idle_wake", wake)
-
-    def _wake_fingerprint(self) -> str:
-        """The state a wake turn decides on. Running counts as queued: dispatch moves tasks between
-        the two without the coordinator. Spend numbers are left out; gate levels carry them."""
-        db, p = self.p.db, self.p
-        tasks = [(t["id"], "queued" if t["status"] == "running" else t["status"], t["priority"], t["depends_on"])
-                 for t in db.q("SELECT id, status, priority, depends_on FROM tasks "
-                               "WHERE status NOT IN ('done','failed','cancelled') ORDER BY id")]
-        asks = [r["id"] for r in db.q("SELECT id FROM messages WHERE kind='ask' AND handled=0 ORDER BY id")]
-        scheds = [(s["name"], s["enabled"], s["every_s"], s["at"])
-                  for s in db.q("SELECT name, enabled, every_s, at FROM schedules ORDER BY name")]
-        gates = sorted((k, g.level, g.allow_new_work) for k, g in self.gates.items())
-        files = [p.charter_path, p.config_path, p.memory_index,
-                 *(p.memory_dir.iterdir() if p.memory_dir.is_dir() else [])]
-        mtimes = sorted((f.name, f.stat().st_mtime) for f in files if f.exists())
-        paused = sorted(db.paused_resources())
-        blob = json.dumps([tasks, asks, scheds, gates, mtimes] + ([paused] if paused else []), default=str)
-        return hashlib.sha256(blob.encode()).hexdigest()[:16]
-
-    def _starved(self, gate, since_last: float) -> bool:
-        """Paid plan capacity sitting idle: worker slots are free, the plan is burning slower than
-        its pace allows, and nothing is ready or about to be. Ask the coordinator for more
-        independent work well before the idle wake would. Usage-billed work costs money whether or
-        not it runs, so only plans qualify. A turn that adds no task doubles the wait for the next
-        one, up to the idle wake; a new task resets it."""
-        db, c = self.p.db, self.cfg["coordinator"]
-        if gate is None or gate.regime != "windows" or gate.level != "green" or not gate.allow_new_work:
-            return False
-        if (gate.numbers.get("paced") or {}).get("until", 0) > time.time():
-            return False    # a pace hold is the plan working as intended, not idle capacity
-        if any(r.get("need_per_h") is None or (r.get("burn_per_h") is not None and r["burn_per_h"] >= r["need_per_h"])
-               for r in gate.numbers.get("pace") or []):
-            return False
-        if self._free_slots(gate) <= 0 or self._dispatchable():
-            return False
-        # Queued work waiting on a retry timer, a dependency or a resource starts by itself; an open
-        # question waits for the user.
-        if db.one("SELECT id FROM tasks WHERE status='queued'") or \
-                db.one("SELECT id FROM messages WHERE kind='ask' AND handled=0 AND ts>?",
-                       (time.time() - OPEN_ASK_MAX_AGE_S,)):
-            return False
-        if coord.next_task_slot(db, coord.task_cap(self.cfg)) is not None:
-            return False
-        base = float(c.get("starve_wake_s", 300))
-        newest = db.one("SELECT COALESCE(MAX(id),0) n FROM tasks")["n"]
-        st = db.kv("starve") or {}
-        wait = base if not st or newest > st.get("task", 0) else \
-            min(float(st.get("wait", base)) * 2, float(c.get("idle_wake_s", 3600)))
-        if since_last <= wait:
-            return False
-        db.set_kv("starve", {"task": newest, "wait": wait})
-        return True
 
     # workers ----------------------------------------------------------------------------------------
     def dispatch(self) -> None:
@@ -2056,11 +1995,6 @@ class Daemon:
     def _reserve_path(self, res: str) -> Path:
         return locks.reserve_path(shared.locks_dir(self.p, res, self.cfg), res)
 
-    def _free_slots(self, gate) -> int:
-        running = self.p.db.one("SELECT COUNT(*) n FROM runs WHERE provider=? AND status='running' "
-                                "AND role!='coordinator'", (gate.provider,))["n"]
-        return max(int(gate.max_parallel) - running, 0)
-
     def _dispatchable(self) -> bool:
         """Whether any queued task could start now (dependencies done, resources free)."""
         return any(self._resources_free(t) for t in self.p.db.ready_tasks())
@@ -2250,6 +2184,95 @@ PAUSED_NOTE = "waits for a paused resource:"
 def _names_commit(tasks: list[dict], head: str) -> bool:
     """Whether a task's spec names `head` by an abbreviation of at least 7 hex digits."""
     return any(head.startswith(h.lower()) for t in tasks for h in re.findall(r"\b[0-9a-fA-F]{7,40}\b", t.get("spec") or ""))
+
+
+def idle_wake(p: Project, cfg: dict, gates: dict[str, dict], now: float) -> dict:
+    """When the coordinator next wakes by itself, with no message or event pending. Both the daemon
+    and `ttp status` / the web app read it from here, so the time shown is the one applied.
+
+    The idle wake comes `idle_wake_s` after the last turn once no task is queued or running, and
+    only while the core budget gate allows optional work. The idle-slot wake (`starve_state`) can
+    come sooner. A wake turn that met the same state as the previous one had nothing new to
+    decide: each such repeat doubles the wait for both, up to a day. Explicit check-backs use
+    schedules.
+
+    Returns `at` (next wake, possibly past), `due` ("idle", "starve" or None at `now`), `held`
+    (why the idle wake cannot come), and the `wake` / `starve` kv values a starting turn stores."""
+    db, c = p.db, cfg["coordinator"]
+    gate = gates.get(cfg.get("core_provider", "claude"))
+    last = float(db.kv("last_coordinator_turn", 0))
+    idle_s = float(c.get("idle_wake_s", 3600))
+    fp = wake_fingerprint(p, gates)
+    prev = db.kv("idle_wake", {}) or {}
+    repeats = int(prev.get("n", 0)) if prev.get("fp") == fp else 0
+    backoff = min(idle_s * 2 ** repeats, 86400.0) if repeats else 0.0
+    idle_at, held = None, None
+    if not db.one("SELECT id FROM tasks WHERE status IN ('queued','running')"):
+        if gate is None or gate["allow_optional"]:
+            idle_at = last + max(idle_s, backoff)
+        else:
+            held = f"held by the budget gate ({gate['level']})"
+    starve = starve_state(db, cfg, gate, now)
+    starve_at = last + max(backoff, starve["wait"]) if starve else None
+    due = "idle" if idle_at is not None and now > idle_at else \
+        "starve" if starve_at is not None and now > starve_at else None
+    times = [t for t in (idle_at, starve_at) if t is not None]
+    return {"at": min(times) if times else None, "due": due, "held": None if times else held,
+            "wake": {"fp": fp, "n": repeats + 1}, "starve": starve}
+
+
+def wake_fingerprint(p: Project, gates: dict[str, dict]) -> str:
+    """The state a wake turn decides on. Running counts as queued: dispatch moves tasks between
+    the two without the coordinator. Spend numbers are left out; gate levels carry them."""
+    db = p.db
+    tasks = [(t["id"], "queued" if t["status"] == "running" else t["status"], t["priority"], t["depends_on"])
+             for t in db.q("SELECT id, status, priority, depends_on FROM tasks "
+                           "WHERE status NOT IN ('done','failed','cancelled') ORDER BY id")]
+    asks = [r["id"] for r in db.q("SELECT id FROM messages WHERE kind='ask' AND handled=0 ORDER BY id")]
+    scheds = [(s["name"], s["enabled"], s["every_s"], s["at"])
+              for s in db.q("SELECT name, enabled, every_s, at FROM schedules ORDER BY name")]
+    levels = sorted((k, g["level"], g["allow_new_work"]) for k, g in gates.items())
+    files = [p.charter_path, p.config_path, p.memory_index,
+             *(p.memory_dir.iterdir() if p.memory_dir.is_dir() else [])]
+    mtimes = sorted((f.name, f.stat().st_mtime) for f in files if f.exists())
+    paused = sorted(db.paused_resources())
+    blob = json.dumps([tasks, asks, scheds, levels, mtimes] + ([paused] if paused else []), default=str)
+    return hashlib.sha256(blob.encode()).hexdigest()[:16]
+
+
+def starve_state(db, cfg: dict, gate: dict | None, now: float) -> dict | None:
+    """Paid plan capacity sitting idle: worker slots are free, the plan is burning slower than
+    its pace allows, and nothing is ready or about to be. Ask the coordinator for more
+    independent work well before the idle wake would. Usage-billed work costs money whether or
+    not it runs, so only plans qualify. A turn that adds no task doubles the wait for the next
+    one, up to the idle wake; a new task resets it. Returns None when this wake does not apply,
+    else the wait after the last turn and the newest task id, stored as kv `starve` on firing."""
+    c = cfg["coordinator"]
+    if gate is None or gate["regime"] != "windows" or gate["level"] != "green" or not gate["allow_new_work"]:
+        return None
+    numbers = gate.get("numbers") or {}
+    if (numbers.get("paced") or {}).get("until", 0) > now:
+        return None    # a pace hold is the plan working as intended, not idle capacity
+    if any(r.get("need_per_h") is None or (r.get("burn_per_h") is not None and r["burn_per_h"] >= r["need_per_h"])
+           for r in numbers.get("pace") or []):
+        return None
+    running = db.one("SELECT COUNT(*) n FROM runs WHERE provider=? AND status='running' AND role!='coordinator'",
+                     (gate["provider"],))["n"]
+    if running >= int(gate["max_parallel"]):
+        return None
+    # Queued work, whether ready or waiting on a retry timer, a dependency or a resource, starts by
+    # itself; an open question waits for the user.
+    if db.one("SELECT id FROM tasks WHERE status='queued'") or \
+            db.one("SELECT id FROM messages WHERE kind='ask' AND handled=0 AND ts>?", (now - OPEN_ASK_MAX_AGE_S,)):
+        return None
+    if coord.next_task_slot(db, coord.task_cap(cfg)) is not None:
+        return None
+    base = float(c.get("starve_wake_s", 300))
+    newest = db.one("SELECT COALESCE(MAX(id),0) n FROM tasks")["n"]
+    st = db.kv("starve") or {}
+    wait = base if not st or newest > st.get("task", 0) else \
+        min(float(st.get("wait", base)) * 2, float(c.get("idle_wake_s", 3600)))
+    return {"task": newest, "wait": wait}
 
 
 def _exclusive(task: dict) -> list[str]:

@@ -503,6 +503,8 @@ def status_text(p: Project) -> str:
         coord += f" · retry at {at(c['backoff_until'], now)}"
     if c["idle_wake"]:
         coord += f" · next idle check {at(c['idle_wake'], now)}"
+    elif c["idle_held"]:
+        coord += f" · idle check {c['idle_held']}"
     lines.append(coord)
     for pp in h["providers_paused"]:
         lines.append(f"{pp['provider']} paused until {at(pp['until'], now)}: {pp['note']} — fix: {pp['fix']}")
