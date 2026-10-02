@@ -164,11 +164,17 @@ class DB:
         self.x("INSERT INTO kv(key,value,ts) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET "
                "value=excluded.value, ts=excluded.ts", (key, json.dumps(value), time.time()))
 
-    def paused_resources(self) -> dict[str, dict]:
+    def paused_resources(self, shared: bool = True) -> dict[str, dict]:
         """Resources paused by name: {"reason", "since", "by"}. Kept in the database, so a pause
-        outlives daemon restarts and reboots until someone lifts it."""
+        outlives daemon restarts and reboots until someone lifts it. With shared, pauses of the
+        project's shared resources (see shared.py) are in it too, marked "shared" and naming the
+        project that set them."""
         v = self.kv(PAUSED_RESOURCES_KEY, {})
-        return v if isinstance(v, dict) else {}
+        v = v if isinstance(v, dict) else {}
+        if shared:
+            from . import shared as sh
+            v = {**v, **sh.paused_for_db(self.path)}
+        return v
 
     def boots(self, since: float) -> list[dict]:
         """Reboots the daemon recorded since `since`, oldest first: ts (the boot time where known)

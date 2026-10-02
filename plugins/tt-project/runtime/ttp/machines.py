@@ -99,10 +99,25 @@ def gb_value(v: Any) -> float | None:
     return gb
 
 
+def tag_names(v: Any) -> list[str]:
+    """Resource names from "a,b" or a list, in order, each once."""
+    items = v if isinstance(v, list) else str(v or "").replace(",", " ").split()
+    out = []
+    for n in items:
+        n = str(n).strip()
+        if not ALIAS_RE.fullmatch(n):
+            raise ValueError(f"not a resource name: {n!r}")
+        if n not in out:
+            out.append(n)
+    return out
+
+
 def add(alias: str, tags: Any = None, note: str | None = None, min_free_gb: Any = ...,
-        hostname: str | None = None) -> dict:
+        hostname: str | None = None, shared: Any = None) -> dict:
     """Add a machine, or update its tags, note, disk threshold or host name (one left out keeps the
-    old value; a threshold or host name of "" removes it)."""
+    old value; a threshold or host name of "" removes it). `shared` names the resources on it that
+    all of the user's projects share (shared.py): a list or "a,b"; "" the alias itself; False none.
+    Left out, it keeps the old ones."""
     alias = (alias or "").strip()
     if not ALIAS_RE.fullmatch(alias):
         raise ValueError(f"not a machine alias: {alias!r} (letters, digits and _.@+- only)")
@@ -121,6 +136,12 @@ def add(alias: str, tags: Any = None, note: str | None = None, min_free_gb: Any 
         if not ALIAS_RE.fullmatch(host):
             raise ValueError(f"not a host name: {host!r}")
         entry["hostname"] = host
+    if shared is None:
+        shared = old.get("shared") or False
+    elif shared is not False:
+        shared = [alias] if shared == "" else tag_names(shared)
+    if shared:
+        entry["shared"] = shared
     machines[alias] = entry
     removed.pop(alias, None)
     _save(machines, removed)
@@ -234,7 +255,9 @@ def line(alias: str, m: dict) -> str:
     host = f" (host {m['hostname']})" if m.get("hostname") else ""
     disk = f" (disk guard {m['min_free_gb']:g} GB)" if isinstance(m.get("min_free_gb"), (int, float)) else ""
     note = f": {m['note']}" if m.get("note") else ""
-    return f"{alias}{tags}{host}{disk}{note}"
+    shared = m.get("shared")
+    shared = f" (shared by all projects: {', '.join(shared)})" if isinstance(shared, list) and shared else ""
+    return f"{alias}{tags}{host}{disk}{shared}{note}"
 
 
 def alternatives(alias: str, machines: dict[str, dict], avoid: set[str]) -> list[str]:

@@ -508,8 +508,13 @@ def status_text(p: Project) -> str:
         lines.append(f"{pp['provider']} paused until {at(pp['until'], now)}: {pp['note']} — fix: {pp['fix']}")
     for pr in h["resources_paused"]:
         lines.append(f"resource {pr['resource']} paused since {at(pr['since'], now)} by {pr.get('by') or 'user'}"
+                     + (f" in {pr['project']} (shared: holds in every project)" if pr.get("shared") else "")
                      + (f": {pr['reason']}" if pr.get("reason") else "")
                      + f" — resume: ttp resume {p.name} --resource {pr['resource']}")
+    from . import locks, shared
+    for res in sorted(shared.names(p.config())):
+        who = locks.held(shared.root() / res)
+        lines.append(f"shared {res}: " + ("; ".join(w.split(": ", 1)[-1] for w in who) if who else "free"))
     if h["why_idle"]:
         lines.append(f"idle: {h['why_idle']}")
     elif h["held"]:
@@ -695,9 +700,12 @@ def cmd_lock(a) -> None:
             why = f" ({held['reason']})" if held.get("reason") else ""
             die(f"{a.resource} is paused{why}; hand the task back as waiting until it is resumed", 75)
 
-    paths = lk.slot_paths(p.state / "locks", a.resource,
-                          int((p.config().get("resources") or {}).get(a.resource, 1) or 1))
-    who = f"task #{os.environ.get('TTP_TASK') or '?'} (run {os.environ.get('TTP_RUN_ID') or '?'})"
+    from . import shared
+    cfg = p.config()
+    where = shared.locks_dir(p, a.resource, cfg)
+    paths = lk.slot_paths(where, a.resource, int((cfg.get("resources") or {}).get(a.resource, 1) or 1))
+    who = shared.holder(p, a.resource, f"task #{os.environ.get('TTP_TASK') or '?'} "
+                                       f"(run {os.environ.get('TTP_RUN_ID') or '?'})", cfg)
     run_dir = Path(os.environ["TTP_RUN_DIR"]) if os.environ.get("TTP_RUN_DIR") else None
     try:
         spec = json.loads((run_dir / "run.json").read_text()) if run_dir else {}
@@ -711,7 +719,7 @@ def cmd_lock(a) -> None:
     timeout = a.timeout
     if timeout is None:
         timeout = float(spec.get("stall_s") or 0) / 2
-    mark = lk.reserve_path(p.state / "locks", a.resource)
+    mark = lk.reserve_path(where, a.resource)
     started, told = time.time(), 0.0
     wait_key = f"{os.getpid()}:{started}"
 
@@ -856,7 +864,8 @@ def cmd_machines(a) -> None:
     if a.action == "add":
         try:
             entry = mm.add(a.alias, a.tags, a.note,
-                           ... if a.min_free_gb is None else a.min_free_gb, a.hostname)
+                           ... if a.min_free_gb is None else a.min_free_gb, a.hostname,
+                           False if a.unshared else a.shared)
         except ValueError as e:
             die(str(e))
         print(f"saved {mm.line(a.alias.strip(), entry)}")
@@ -1338,6 +1347,10 @@ def main(argv: list[str] | None = None) -> None:
                    help="disk guard threshold on this machine's filesystem, overriding the projects' "
                         "disk.min_free_gb there (0 = off; \"\" = back to the projects' own)")
     m.add_argument("--hostname", help="its short host name, when that is not the alias (\"\" = none)")
+    m.add_argument("--shared", nargs="?", const="", metavar="NAMES",
+                   help="resources on it that all your projects share: one set of `ttp lock` slots and one "
+                        "pause across projects (comma-separated; default: the alias itself)")
+    m.add_argument("--unshared", action="store_true", help="its resources are per project again")
     m = ms.add_parser("list", help="list your machines")
     m.add_argument("--json", action="store_true")
     m = ms.add_parser("remove", help="remove a machine")

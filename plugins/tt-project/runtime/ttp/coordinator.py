@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import machines, push, upstream
+from . import machines, push, shared, upstream
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, TERMINAL_TASK_STATES, continues_id, dependency_ids, dump_result, host_line,
                  load_result)
@@ -177,7 +177,8 @@ def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int]) ->
         lines.append("## Paused resources (tasks using one are not dispatched; `ttp lock` refuses it)")
         for name, v in sorted(paused.items()):
             lines.append(f"- {name}: paused {(now - float(v.get('since') or now)) / 3600:.1f}h ago by "
-                         f"{v.get('by') or 'user'}" + (f": {clip(v['reason'], NOTE_CHARS)}" if v.get("reason") else ""))
+                         f"{v.get('by') or 'user'}" + (f" in project {v.get('project')} (shared by all projects)"
+                                                      if v.get("shared") else "") + (f": {clip(v['reason'], NOTE_CHARS)}" if v.get("reason") else ""))
     lines += machines.digest_lines(db, paused, now)
     mem = memory_budget_line(p)
     if mem:
@@ -751,26 +752,57 @@ def pause_resource(p: Project, name: str, paused: bool, reason: str = "", by: st
                    key: str | None = None, db=None) -> str:
     """Pause or resume one resource for the project's tasks. While paused, no task labelled with it
     is dispatched and `ttp lock` refuses it; running workers whose task uses it are told mid-run.
-    Resuming it makes tasks that handed off `waiting` on the pause due now. `db` is the caller's
-    own connection when it runs on another thread (the web app). Returns a line for the user."""
+    Resuming it makes tasks that handed off `waiting` on the pause due now. A shared resource
+    (shared.py) is paused for every project that names it; their daemons tell their own workers
+    (sync_shared_pauses). `db` is the caller's own connection when it runs on another thread (the
+    web app). Returns a line for the user."""
     name = (name or "").strip()
     if not RESOURCE_RE.fullmatch(name):
         raise ValueError(f"not a resource name: {name!r}")
     db, woken = db or p.db, 0
+    is_shared = shared.is_shared(p, name)
+    reason = " ".join(str(reason or "").split())[:300]
+
+    def _entry(was: dict | None) -> dict:
+        was = was or {}
+        return {"reason": reason or was.get("reason", ""), "since": was.get("since") or time.time(),
+                # The coordinator may lift only a pause the user had no part in.
+                "by": "user" if "user" in (by, was.get("by")) else by,
+                **({"project": p.name} if is_shared else {})}
+
     with db.tx():
-        cur = db.paused_resources()
+        cur = db.paused_resources(shared=False)
+        seen = db.kv(SHARED_SEEN_KEY) or {}
         if paused:
-            was = cur.get(name) or {}
-            cur[name] = {"reason": " ".join(str(reason or "").split())[:300] or was.get("reason", ""),
-                         "since": was.get("since") or time.time(),
-                         # The coordinator may lift only a pause the user had no part in.
-                         "by": "user" if "user" in (by, was.get("by")) else by}
-        elif name not in cur:
-            return f"{name} is not paused"
+            if is_shared:
+                entry = shared.update_pause(name, lambda w: _entry(w or cur.get(name)))[1]
+                cur.pop(name, None)
+                seen[name] = float(entry["since"])
+            else:
+                entry = cur[name] = _entry(cur.get(name))
         else:
-            woken = _wake_pause_waiters(db, name, float(cur.pop(name).get("since") or 0))
+            was = shared.update_pause(name, lambda w: None)[0] if is_shared else None
+            if name not in cur and was is None:
+                return f"{name} is not paused"
+            since = min(float(x.get("since") or 0) for x in (cur.get(name), was) if x)
+            cur.pop(name, None)
+            seen.pop(name, None)
+            woken = _wake_pause_waiters(db, name, since)
         db.set_kv(PAUSED_RESOURCES_KEY, cur)
-    why = f" ({cur[name]['reason']})" if paused and cur[name]["reason"] else ""
+        if is_shared:
+            db.set_kv(SHARED_SEEN_KEY, seen)
+    why = f" ({entry['reason']})" if paused and entry["reason"] else ""
+    _tell_runs(db, name, paused, why, key)
+    scope = " for every project that shares it" if is_shared else ""
+    return (f"{name} paused{why}{scope}: tasks using it wait, and `ttp lock {name}` refuses it" if paused
+            else f"{name} resumed{scope}" + (f"; {woken} task(s) that waited on it start again" if woken else ""))
+
+
+SHARED_SEEN_KEY = "shared_pauses_seen"   # kv: {resource: since} of the shared pauses this project has acted on
+
+
+def _tell_runs(db, name: str, paused: bool, why: str = "", key: str | None = None) -> None:
+    """Tell the running workers whose task uses the resource that it was paused or resumed."""
     text = (f"The resource `{name}` is paused{why}. Do not use it: start no new command on it, and `ttp lock "
             f"{name}` refuses it. Finish or stop what already runs on it safely; if the task cannot go on "
             f"without it, save your work and hand off `waiting` naming `{name}`. The task is dispatched "
@@ -780,8 +812,25 @@ def pause_resource(p: Project, name: str, paused: bool, reason: str = "", by: st
                   "WHERE r.status='running' AND r.role!='coordinator'"):
         if r["dir"] and Path(r["dir"]).is_dir() and name in task_resources({"labels": r["labels"]}):
             _append_update(Path(r["dir"], "steer.md"), text, key)
-    return (f"{name} paused{why}: tasks using it wait, and `ttp lock {name}` refuses it" if paused
-            else f"{name} resumed" + (f"; {woken} task(s) that waited on it start again" if woken else ""))
+
+
+def sync_shared_pauses(p: Project, db=None) -> None:
+    """Act on pauses of shared resources set or lifted from another project: tell this project's
+    workers, and on a resume make the tasks that waited on it due. Each change is acted on once."""
+    db = db or p.db
+    cur = shared.paused(p.config())
+    now = {k: float(v.get("since") or 0) for k, v in cur.items()}
+    seen = db.kv(SHARED_SEEN_KEY) or {}
+    if now == seen:
+        return
+    for name, since in now.items():
+        if seen.get(name) != since:
+            _tell_runs(db, name, True, f" ({cur[name]['reason']})" if cur[name].get("reason") else "")
+    for name, since in seen.items():
+        if name not in now:
+            _wake_pause_waiters(db, name, float(since or 0))
+            _tell_runs(db, name, False)
+    db.set_kv(SHARED_SEEN_KEY, now)
 
 
 def _wake_pause_waiters(db, name: str, since: float) -> int:

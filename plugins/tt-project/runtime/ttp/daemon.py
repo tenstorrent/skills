@@ -37,6 +37,7 @@ from . import runner
 from . import schedule as sched
 from . import upstream
 from . import screen as scr
+from . import shared
 from . import worktree
 from .db import SEVERITY_RANK, TERMINAL_TASK_STATES, continues_id, dependency_ids, dump_result, load_result
 from .project import Project, hostname, load_secrets
@@ -287,7 +288,7 @@ class Daemon:
         resources held, so the next boot can say what a reboot cut off; it is rewritten only when
         those change."""
         hb = self.p.state / "heartbeat"
-        held = locks.held(self.p.state / "locks")
+        held = shared.held(self.p, self.cfg)
         if not self._healthy or held != self._held:
             tmp = hb.with_name(f"heartbeat.{os.getpid()}.tmp")
             tmp.write_text(json.dumps({"pid": os.getpid(), "host": hostname(), "started": self._started,
@@ -334,7 +335,7 @@ class Daemon:
             self.jev = Jev(self.cfg, db=self.p.db)
         for step in (self.reap_runs, self.wake_after_reboot, self.meter_running, self.reconcile_tasks,
                      self.prune_worktrees, self.check_local_only, self.check_disk, self.sweep_alerts,
-                     self.check_release):
+                     self.check_release, self.sync_shared_pauses):
             step()
             self._progress()
         if self.p.db.kv("paused", False):
@@ -351,6 +352,9 @@ class Daemon:
                 continue
             step()
             self._progress()
+
+    def sync_shared_pauses(self) -> None:
+        coord.sync_shared_pauses(self.p)
 
     def _check_sleep(self) -> None:
         """Notice that the host slept: the wall clock jumped ahead of the monotonic one, which stands
@@ -485,7 +489,8 @@ class Daemon:
                     # What a run without its own budget is priced at when it reports no usage.
                     "default_budget_usd": self.cfg["budget"].get("task_default_usd", {}).get(tier, 8.0),
                     "exclusive": [{"resource": res, "paths": [str(x) for x in self._slot_paths(res)],
-                                   "reserve": str(locks.reserve_path(self.p.state / "locks", res))}
+                                   "reserve": str(self._reserve_path(res)),
+                                   "holder": shared.holder(self.p, res, f"task #{task['id']}", self.cfg)}
                                   for res in _exclusive(task)] if task else [],
                     "exclusive_wait_s": self.cfg["budget"].get("exclusive_wait_s", 600),
                     "private_files": private}
@@ -1582,7 +1587,7 @@ class Daemon:
 
     def _unreserve(self, task: dict) -> None:
         for res in _exclusive(task):
-            locks.unreserve(locks.reserve_path(self.p.state / "locks", res), f"task #{task['id']}")
+            locks.unreserve(self._reserve_path(res), shared.holder(self.p, res, f"task #{task['id']}", self.cfg))
 
     def _committed_usd(self) -> float:
         """Budget that running workers on providers under the dollar caps have left to spend."""
@@ -2034,12 +2039,16 @@ class Daemon:
                 return False
             if not locks.any_free(self._slot_paths(res)):
                 if reserve:
-                    locks.reserve(locks.reserve_path(self.p.state / "locks", res), f"task #{task['id']}")
+                    locks.reserve(self._reserve_path(res), shared.holder(self.p, res, f"task #{task['id']}", self.cfg))
                 return False
         return True
 
     def _slot_paths(self, res: str) -> list[Path]:
-        return locks.slot_paths(self.p.state / "locks", res, int(self.cfg.get("resources", {}).get(res, 1) or 1))
+        return locks.slot_paths(shared.locks_dir(self.p, res, self.cfg), res,
+                                int(self.cfg.get("resources", {}).get(res, 1) or 1))
+
+    def _reserve_path(self, res: str) -> Path:
+        return locks.reserve_path(shared.locks_dir(self.p, res, self.cfg), res)
 
     def _free_slots(self, gate) -> int:
         running = self.p.db.one("SELECT COUNT(*) n FROM runs WHERE provider=? AND status='running' "

@@ -8225,7 +8225,7 @@ def test_a_long_tick_tells_both_watchdogs_it_still_moves(env, monkeypatch):
     d._notify = addr
     steps = []
     for name in ("reap_runs", "wake_after_reboot", "meter_running", "reconcile_tasks", "prune_worktrees",
-                 "check_local_only", "check_disk", "sweep_alerts", "check_release", "_refresh_meters", "update_gates", "run_schedules", "poll_slack",
+                 "check_local_only", "check_disk", "sweep_alerts", "check_release", "sync_shared_pauses", "_refresh_meters", "update_gates", "run_schedules", "poll_slack",
                  "check_resource_trouble", "read_upstream", "retry_rejected", "maybe_coordinate", "probe_waiting", "dispatch",
                  "deliver_outbound"):
         monkeypatch.setattr(d, name, lambda name=name: steps.append(name))
@@ -8245,7 +8245,7 @@ def test_a_long_tick_tells_both_watchdogs_it_still_moves(env, monkeypatch):
     finally:
         sock.close()
         cleanup()
-    assert len(steps) == 20 and pings == [b"WATCHDOG=1"] * 18, (steps, pings)
+    assert len(steps) == 21 and pings == [b"WATCHDOG=1"] * 19, (steps, pings)
     # Before its first completed tick the heartbeat is not written (`ttp restart` reads it as that
     # tick); the start marker carries the progress, which `ttp.watchdog` counts.
     assert not hb.exists()
@@ -8987,3 +8987,118 @@ def test_coordinators_pass_upstream_notes_on_only_while_no_project_reads_them(en
     # A turn without an upstream note carries no such line.
     _, _, plain = _hand_off(env, p, {"status": "done", "summary": "ok", "followups": [{"title": "x", "spec": "y"}]})
     assert "Upstream notes" not in coord.digest(p, {}, plain, [])
+
+
+def _second_project(env, name="other"):
+    """Another project of the same user on this machine, in its own repository."""
+    from ttp.cli import bootstrap
+    from ttp.project import register
+    repo = env["tmp"] / f"repo-{name}"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / "README.md").write_text("hi\n")
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "i"],
+                   check=True)
+    p = bootstrap(repo, name, "Keep it short.", "fake")
+    register(name, {"host": "testhost", "dir": str(p.root)})
+    return p
+
+
+def test_two_projects_take_turns_on_a_shared_resource(env, tmp_path):
+    a = make(env)
+    b = _second_project(env)
+    from ttp import coordinator as coord
+    from ttp import machines as mm
+    from ttp.cli import status_text
+    from ttp.daemon import Daemon
+    mm.add("board", tags="device", shared="")      # the user's machines list declares it shared
+    env_a = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost", TTP_PROJECT=str(a.base), TTP_TASK="3")
+    env_b = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost", TTP_PROJECT=str(b.base))
+    release = tmp_path / "release"
+    holder = subprocess.Popen([sys.executable, str(TTP), "lock", "board", "--", *_until(release)], env=env_a)
+    slot = env["home"] / "locks" / "board" / "board.0.lock"
+    try:
+        deadline = time.time() + 20
+        while time.time() < deadline and not (slot.exists() and slot.read_text()):
+            time.sleep(0.05)
+        assert not (a.state / "locks" / "board.0.lock").exists(), "a shared slot was kept per project"
+        out = subprocess.run([sys.executable, str(TTP), "lock", "--timeout", "1", "board", "--", "true"],
+                             env=env_b, capture_output=True, text=True)
+        assert out.returncode == 75, "the other project got the board while this one held it"
+        assert coord.apply(b, [{"type": "task_add", "title": "reflash", "spec": "s", "tier": "light",
+                                "resources": ["board"], "exclusive": True}]) == []
+        task = b.db.one("SELECT * FROM tasks WHERE title='reflash'")
+        assert not Daemon(b.base)._resources_free(task), "an exclusive task started on a board another project holds"
+        assert "shared board: demo task #3" in status_text(b), status_text(b)
+    finally:
+        release.touch()
+        holder.wait(timeout=30)
+    assert Daemon(b.base)._resources_free(task)
+    assert subprocess.run([sys.executable, str(TTP), "lock", "--timeout", "5", "board", "--", "true"],
+                          env=env_b).returncode == 0
+    assert "shared board: free" in status_text(a)
+
+
+def test_a_pause_of_a_shared_resource_holds_in_every_project(env, tmp_path):
+    a = make(env)
+    b = _second_project(env)
+    from ttp import coordinator as coord
+    from ttp.cli import status_text
+    from ttp.daemon import Daemon
+    for p in (a, b):
+        p.set_config("shared_resources", ["board"])
+    # A worker of b is using the board, and a task of a will wait on the pause.
+    tb = b.db.add_task("soak", "s", kind="work", tier="light", origin="user", labels=["resource:board"])
+    run_dir = tmp_path / "brun"
+    run_dir.mkdir()
+    b.db.x("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(?,'worker','fake',?,'running',?)",
+           (tb, time.time(), str(run_dir)))
+    out = coord.pause_resource(a, "board", True, reason="maintenance", by="user")
+    assert "for every project that shares it" in out, out
+    got = b.db.paused_resources()["board"]
+    assert got["project"] == "demo" and got["by"] == "user" and got["reason"] == "maintenance"
+    assert "board" not in a.db.paused_resources(shared=False), "a shared pause was kept per project"
+    env_b = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost", TTP_PROJECT=str(b.base))
+    out = subprocess.run([sys.executable, str(TTP), "lock", "--timeout", "5", "board", "--", "true"],
+                         env=env_b, capture_output=True, text=True)
+    assert out.returncode == 75 and "board is paused (maintenance)" in out.stderr, out
+    assert coord.apply(b, [{"type": "task_add", "title": "flash", "spec": "s", "tier": "light",
+                            "resources": ["board"]}]) == []
+    assert not Daemon(b.base)._resources_free(b.db.one("SELECT * FROM tasks WHERE title='flash'"))
+    assert "paused" in status_text(b) and "by user in demo" in status_text(b), status_text(b)
+    # b's daemon tells its own worker once.
+    coord.sync_shared_pauses(b)
+    coord.sync_shared_pauses(b)
+    assert (run_dir / "steer.md").read_text().count("`board` is paused (maintenance)") == 1
+    # The coordinator of b may not lift a pause the user set.
+    problems = coord.apply(b, [{"type": "resource_pause", "resource": "board", "paused": False}])
+    assert any("paused by the user" in x for x in problems) and "board" in a.db.paused_resources(), problems
+    # A task of a waits on the pause; b resumes the board, and a's daemon wakes it.
+    ta = a.db.add_task("waits", "s", kind="work", tier="light", origin="user", labels=["resource:board"])
+    a.db.update_task(ta, status="queued", not_before=time.time() + 7200, blocked_reason="waiting for board",
+                     result=json.dumps({"status": "waiting", "waiting_for": "board (paused)",
+                                        "retry_after_s": 7200, "waiting_since": time.time()}))
+    assert coord.pause_resource(b, "board", False).startswith("board resumed for every project")
+    assert "board" not in a.db.paused_resources()
+    assert ta not in {t["id"] for t in a.db.ready_tasks()}
+    coord.sync_shared_pauses(a)
+    assert ta in {t["id"] for t in a.db.ready_tasks()}, "a resume from another project did not wake the task"
+    assert "no longer paused" in (run_dir / "steer.md").read_text()
+
+
+def test_project_scoped_resources_stay_per_project(env, tmp_path):
+    a = make(env)
+    b = _second_project(env)
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    a.set_config("shared_resources", ["other-board"])
+    coord.pause_resource(a, "board", True, reason="mine", by="user")
+    assert "board" in a.db.paused_resources() and "board" not in b.db.paused_resources()
+    assert not (env["home"] / "locks" / "board").exists()
+    assert Daemon(a.base)._slot_paths("board")[0] == a.state / "locks" / "board.0.lock"
+    assert Daemon(b.base)._slot_paths("board")[0] == b.state / "locks" / "board.0.lock"
+    env_b = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost", TTP_PROJECT=str(b.base))
+    assert subprocess.run([sys.executable, str(TTP), "lock", "--timeout", "5", "board", "--", "true"],
+                          env=env_b).returncode == 0
+    assert coord.pause_resource(a, "board", False) == "board resumed"

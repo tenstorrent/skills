@@ -252,21 +252,23 @@ def _take_exclusive(run_dir: Path, wanted: list[dict], env: dict, deadline: floa
     for res in wanted:
         paths = [Path(x) for x in res["paths"]]
         mark = Path(res["reserve"]) if res.get("reserve") else None
+        # A shared resource's holder names the project as well (shared.holder).
+        mine = res.get("holder") or task
         while True:
-            f = locks.try_take(paths, who, "exclusive")
+            f = locks.try_take(paths, who if mine == task else f"{mine}{who[len(task):]}", "exclusive")
             if f:
                 held.append(f)
                 if mark:
-                    locks.unreserve(mark, task)
+                    locks.unreserve(mark, mine)
                 break
             if stop_reason(run_dir) or time.time() > deadline:
                 for h in held:
                     h.close()
                 if mark:
-                    locks.unreserve(mark, task)
+                    locks.unreserve(mark, mine)
                 return None
             if mark:
-                locks.reserve(mark, task)
+                locks.reserve(mark, mine)
             _touch(run_dir / "lease")
             if time.time() - told >= 120:
                 with open(run_dir / "progress.md", "a") as pf:

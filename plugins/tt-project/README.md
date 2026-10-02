@@ -101,7 +101,10 @@ and preferences you add later become part of the project's charter and memory.
 - A shared device or machine is taken per command, through its own queue (for example a device
   broker) or `ttp lock <resource> -- <command>`, so the rest of each task runs in parallel. A task
   marked exclusive holds the resource's lock for its whole run; while it waits for a slot, new
-  `ttp lock` commands wait behind it, so it is not starved.
+  `ttp lock` commands wait behind it, so it is not starved. Locks and pauses are per project; a
+  resource that several projects on one machine use is declared shared (`shared_resources` in the
+  config, or `ttp machines add <alias> --shared [names]`), and then all of them take turns on its
+  slots, a pause of it holds in each, and `ttp status` shows which project holds or paused it.
 - Each task edits only its own worktree. A code task branches from the first of:
   `delivery.base_ref`; `delivery.push_branch`, then a branch the charter names as
   `branch <name>`, each only if it exists here or on origin; the remote's default branch
