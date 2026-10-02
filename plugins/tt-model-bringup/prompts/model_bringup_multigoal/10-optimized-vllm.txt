@@ -6,7 +6,7 @@ Start from completed vLLM integration and the selected datatype-sweep config; op
 
 Goal completion requirements:
 - The measured path is real vLLM TT plugin serving through models/autoports/<model>/tt/generator_vllm.py.
-- vLLM sampling tests, qualitative outputs, primary single-user benchmarks, and CI serving-burst benchmarks pass.
+- Run sampling tests, qualitative checks, primary single-user and CI burst benchmarks. Preserve results and exits; resolve test applicability through `$stage-review`.
 - Warmed primary single-user TTFT, TPOT, ITL, aggregate throughput, and TPOT-derived decode t/s/u are measured before and after using the same run_vllm_server workload, generation mode, max-num-seqs, max-model-len, mesh, sampling mode, and TT config.
 - CI serving-burst metrics are measured before and after as capacity/nightly-parity evidence. Do not use CI burst as headline decode t/s/u.
 - Preserve the context contract. Do not lower `max_model_len`, benchmark context, or eval context below doc/context_contract.json except for a proven hard physical limit.
@@ -24,6 +24,6 @@ Goal completion requirements:
 - Relevant $optimize checklist items are completed with evidence for the vLLM serving path.
 - Use $tt-enable-tracing for trace capture, nonblocking replay, async readback, stale inputs, or serving trace correctness.
 - README.md leads with primary single-user vLLM TTFT and decode t/s/u; CI serving-burst metrics are secondary. Workload shapes sit next to every number.
-- $stage-review returns `clean-pass`; findings fixed/rereviewed. Local commit stage-owned touched-repo changes; never push; log SHAs.
+- $stage-review returns `clean-pass`; required work resolved/reviewed. Local commit stage-owned touched-repo changes; never push; log SHAs.
 
-Unmet requirements, review findings, failed gates: work. Stop only after `$autofix` fails.
+Use `$stage-review` to resolve failed checks against HF fidelity and explicit contracts; repair supported defects.

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 TT_MODEL_BRINGUP_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # Runner-side gate for the vLLM integration stage: served qualitative outputs
-# (greedy and sampled) must exist and must not be mechanically degenerate. A
-# serving path that doubles tokens or collapses to one token is a serving bug,
-# not a model-quality limitation. Scoped to this run's model.
+# (greedy and sampled) must exist. Mechanical degeneracy is a strong bug
+# signal; establish the cause with a matched reference comparison in stage review.
+# Preserve this checker's result. Scoped to this run's model.
 # Exit 0 pass, 1 advisory, 2 critical, 3 error.
 if [ -n "${MODEL_DIR:-}" ]; then
   scope_args=(--model-dir "$MODEL_DIR")

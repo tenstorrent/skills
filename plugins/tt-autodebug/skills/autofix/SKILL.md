@@ -10,7 +10,7 @@ Turn a supported diagnosis into the smallest verified repair. Start from `AUTODE
 
 ## Repair loop
 
-1. Restate the failing contract and the observations the proposed cause must explain.
+1. Restate the intended behavior, the actual failed assertion and the evidence of an implementation defect. A test's failure message is a hypothesis, not the causal diagnosis. For model-output failures, identify the matched reference difference or independent runtime/serving-contract violation. If the evidence instead refutes the defect, record that conclusion and return it to the caller; do not invent a source change to close the assertion.
 2. List plausible fixes in priority order. Prefer the earliest inconsistent calculation or state
    transition over suppressing the downstream assertion, allocation, waiter, or teardown symptom.
 3. For each hypothesis, identify one discriminating check. When the host supports isolated agents,

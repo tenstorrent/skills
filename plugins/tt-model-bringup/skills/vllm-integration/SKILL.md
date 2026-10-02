@@ -13,6 +13,8 @@ this plugin is copied into the target tt-metal checkout.
 
 ## Mission Context
 
+The serving stage preserves HF fidelity while meeting the serving API and cache/scheduler contracts. Before repairing a generated-output failure, identify the demonstrated TT/HF difference or independent serving-contract violation. If neither is established, the next work is a discriminating comparison or test diagnosis, not a speculative model repair.
+
 If this skill is used as part of `$model-bringup`, follow that skill's mission, workspace, and reporting contract. This stage starts from a working TTNN full model and generator, then makes it usable through the shared vLLM serving path. The full model itself belongs to `$full-model`; vLLM integration owns the adapter, plugin registration, serving checks, and serving-path performance evidence.
 
 ## Your Part
@@ -157,6 +159,8 @@ must not silently select a reference model instead.
 
 ## vLLM Server Integration Test
 
+Follow `$qualitative-check` to establish the actual predicate and matched reference behavior before treating a short or unusual output as a serving defect. Apply its completion-budget procedure only to the observable the test or explicit product contract requires.
+
 Use the shared runner:
 
 ```bash
@@ -171,6 +175,8 @@ python -m readiness_check.run_vllm_server \
 ```
 
 The runner owns server launch, health polling, check execution, and shutdown. It writes `server.log`, `sampling_tests.log`, `vllm_qualitative_outputs.json`, primary single-user raw `vllm_result.json`, primary normalized `vllm_benchmark.json`, `vllm_benchmark.log`, and by default the secondary CI serving-burst files `vllm_ci_serving_result.json`, `vllm_ci_serving_benchmark.json`, and `vllm_ci_serving_benchmark.log` under `<model_dir>/readiness_vllm/`.
+
+A reviewed test defect does not change a failing command's exit code. Use the existing `--stages` interface to collect independent authorized diagnostics when sampling failure prevents later collection, and preserve the original failure. Do not call a segmented diagnostic run a full runner pass. If the stage machinery cannot represent the accepted disposition, report that specific harness limitation and propose a scoped change; do not add a broad ignore-failures option or rewrite failed results.
 
 `--stages` accepts `serve`, `sampling`, `qualitative`, and `benchmark`. The default runs the full launch-check-shutdown flow. To hold a server open while iterating:
 
@@ -216,7 +222,7 @@ Keep teacher-forcing and serving performance separate. A readiness/PERF teacher-
 
 `--max-num-seqs` is passed to both server launch and sampling pytest (`--tt-max-num-seqs`). Do not leave it at 1 except for the primary single-user benchmark or a focused debugging run. Final serving evidence should include a larger value, normally up to 32, unless hardware or memory capacity prevents it.
 
-For final vLLM-integration evidence, use `--sampling-profile full`. The normal debugging order is smoke first, then full: use `--sampling-profile smoke` for faster inner-loop iteration, rerun only failing pytest node ids or targeted requests while fixing failures, and run `--sampling-profile full` after the smoke and targeted checks pass. For MoE bring-up loops where the full profile is impractical, record the final status as `smoke-gated`; do not present it as equivalent to the full sampling gate unless the project owner explicitly accepts that coverage.
+For final vLLM-integration evidence, use `--sampling-profile full`. The normal debugging order is smoke first, then full: use `--sampling-profile smoke` for faster inner-loop iteration, rerun only failing pytest node ids or targeted requests while fixing failures, and run `--sampling-profile full` after the smoke and targeted checks pass or receive the applicable evidence-backed test disposition from `$stage-review`. For MoE bring-up loops where the full profile is impractical, record the final status as `smoke-gated`; do not present it as equivalent to the full sampling gate unless the project owner explicitly accepts that coverage.
 
 When determinism tests fail in vLLM, validate that logits output by the model for a given prompt are reproducible across runs and batch positions. Check both standalone model and running through vllm.
 
@@ -228,7 +234,9 @@ If a profiler run is accidentally started and fails, do not escalate it into rep
 
 Transient CCL/fabric link errors immediately after a failed multi-device run still need a device reset and one retry before being treated as hardware evidence, as long as `tt-smi` remains responsive and the failure is not part of the profiler/watcher pattern above.
 
-Failed serving gates, missing serving artifacts, sampling failures, qualitative-output failures, and `$stage-review` `more-work-needed` findings are vLLM-stage work, not terminal stop reasons. If logs make the cause obvious, fix it directly and rerun the failing gate. If the first direct fix does not close the gate, or if the failure crosses the adapter, generator, cache ownership, scheduler inputs, trace inputs, sampling, or plugin registration path, use `$autofix`; it will run `$autodebug` if needed, then verify or refute each proposed bug before keeping any fix. Do not terminal-stop the vLLM stage until `$autofix` has tried and failed or an external dependency is genuinely unavailable.
+Investigate unmet requirements and failed checks against the bringup objective. Continue until demonstrated implementation defects are repaired or a bounded repair attempt fails. When the evidence refutes an implementation defect or shows a faulty test, use the existing stage review to record that conclusion and the remaining capability coverage; do not run AutoFix merely to turn the test green. Preserve the original result and continue other authorized work.
+
+For supported defects, fix the cause directly when it is clear and rerun the affected check. If the first fix fails or the cause crosses adapter, generator, cache, scheduler, trace, sampling or registration boundaries, use `$autofix` to verify or refute the diagnosis. Preserve bounded repair failures and unavailable external dependencies explicitly.
 
 Record the working server invocation in the work log, including `--max-model-len`, `--tt-config`, workload config, and any env vars that mattered. Use typed runner flags for `--max-model-len` and `--tt-config`; keep `--additional-server-args` for uncommon flags only.
 
@@ -243,7 +251,7 @@ python "${TT_MODEL_BRINGUP_ROOT}/runtime/readiness_check/check_degenerate_output
   --hf-model <hf-model-id> --missing-artifacts critical --scope vllm
 ```
 
-Mechanical degeneracy - doubled tokens, single-token collapse - is never a model property. The runner-side stage gate runs the same check.
+Mechanical repetition, doubled tokens and single-token collapse are strong bug signals. Compare the affected trajectory with the matched reference before assigning the cause. Shared reference behavior is not by itself a TT defect; a greater or different TT failure remains required work. Preserve the checker result and the comparison. The runner-side stage gate runs the same check.
 
 If the tokenizer has no chat template, say so explicitly, treat the checkpoint as a base model, and judge the qualitative outputs against continuation-style expectations; do not let chat-style prompts produce poor text that masks serving bugs.
 
@@ -255,7 +263,7 @@ Done means all of these are true and recorded:
 - Selected datatype policy loaded by serving, including KV-cache and CCL dtype.
 - Adapter class, low-level generator methods it delegates to, and KV-cache ownership contract.
 - Plugin registration path and architecture name.
-- Exact successful `run_vllm_server` invocation.
+- Exact final `run_vllm_server` invocation, actual exit/result, and the review's disposition of any remaining test failures.
 - Served max context, matching `doc/context_contract.json`, with any hard-physical-limit reduction evidence.
 - Non-aligned prompt-length evidence through serving: a valid request length that is not divisible by internal chunk/page/block alignment succeeds without capping or truncating the advertised context.
 - Served batch/concurrency coverage, including the largest tested `max_num_seqs` up to 32 and any hard-physical-limit reduction evidence.
