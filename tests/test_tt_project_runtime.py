@@ -10415,3 +10415,17 @@ def test_a_deferred_follow_up_carries_its_start_fields_to_the_coordinator(env):
     texts = [e["text"] for e in p.db.q("SELECT text FROM events WHERE kind='followup_proposed' ORDER BY id")]
     assert texts[0].startswith("proposed follow-up: re-measure [start_after: 3d; start_when: test -f out/ready] — ")
     assert texts[1].startswith("proposed follow-up: plain — ")
+
+
+def test_deferred_task_does_not_hold_back_idle_slot_wake(env):
+    from ttp import budget as bud
+    from ttp import coordinator as coord
+    from ttp.daemon import starve_state
+    p = make(env)
+    gate = bud.Gate(provider="fake", regime="windows", numbers={"pace": [{"need_per_h": 10, "burn_per_h": 1}]})
+    now = time.time()
+    assert coord.apply(p, [{"type": "task_add", "title": "later", "spec": "s", "start_when": "exit 1"},
+                           {"type": "task_add", "title": "in 3 days", "spec": "s", "start_after": "3d"}]) == []
+    assert starve_state(p.db, p.config(), gate.as_dict(), now), "deferred tasks do not start by themselves soon"
+    assert coord.apply(p, [{"type": "task_add", "title": "ready", "spec": "s"}]) == []
+    assert starve_state(p.db, p.config(), gate.as_dict(), now) is None, "ready queued work still holds the wake"
