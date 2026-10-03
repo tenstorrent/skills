@@ -126,7 +126,7 @@ def _read_local(offset: int) -> tuple[bytes, int]:
 def _read_remote(host: str, offset: int, mark: dict) -> tuple[bytes, int] | None:
     """The inbox on `host` from `offset` on and its size, marking it read; None if it cannot be reached."""
     cmd = (f"f={REMOTE}; [ -d ~/.tt-project ] && printf %s {shlex.quote(json.dumps(mark))} > ~/.tt-project/upstream-reader.json; "
-           f"if [ -f \"$f\" ]; then wc -c < \"$f\"; tail -c +{offset + 1} \"$f\"; else echo 0; fi")
+           f"if [ -f \"$f\" ]; then wc -c < \"$f\" | tr -d ' '; tail -c +{offset + 1} \"$f\"; else echo 0; fi")
     try:
         # `sh -c` so a login shell that is not POSIX (fish, say) runs it too; no stdin, so ssh never waits on it.
         r = subprocess.run([*SSH, "--", host, f"sh -c {shlex.quote(cmd)}"], stdin=subprocess.DEVNULL,

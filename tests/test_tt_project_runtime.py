@@ -9701,6 +9701,11 @@ def test_remote_upstream_reads_use_sh_c_no_stdin_and_end_options(env, monkeypatc
     r = subprocess.run(["sh", "-c", argv[-1]], capture_output=True, env={"HOME": str(home), "PATH": os.environ["PATH"]})
     assert r.returncode == 0 and r.stdout == b"11\n56789\n"
     assert json.loads((home / ".tt-project" / "upstream-reader.json").read_text())["project"] == "it's"
+    # BSD wc (macOS) pads the count: the command strips it, and the parser copes with padding too.
+    assert "wc -c < \"$f\" | tr -d ' '" in words[2]
+    monkeypatch.setattr(upstream.subprocess, "run",
+                        lambda argv, **kw: subprocess.CompletedProcess(argv, 0, b"      11\n56789\n", b""))
+    assert upstream._read_remote("h", 5, {"project": "p"}) == (b"56789\n", 11)
 
 
 def test_remote_upstream_reads_stop_at_the_tick_budget_and_resume_fairly(env, monkeypatch):
