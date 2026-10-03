@@ -9573,3 +9573,51 @@ def test_a_logged_out_provider_dispatches_everything_once_a_run_succeeds(env, mo
     assert sorted(started) == ["big", "other", "small"], "dispatch did not resume at once after the login"
     assert not p.db.one("SELECT id FROM tasks WHERE blocked_reason LIKE 'held: logged out%'")
     assert "held: logged out" not in cli.status_text(p)
+
+
+def test_a_working_logged_out_probe_releases_the_coordinator_and_queue_before_it_ends(env, monkeypatch):
+    """The user logged in and the probe runs for real: waiting for it to end would hold every other
+    run (and unanswered messages) for up to the probe's whole run timeout."""
+    p = make(env)
+    from ttp import alerts
+    d, started = _logged_out_daemon(p, monkeypatch)
+    d.dispatch()
+    assert started == ["small"]
+    now = time.time()
+    p.db.x("UPDATE alerts SET raised=raised-3600 WHERE key='auth:fake'")   # the logout came first
+    # A run from before the logout, still spending, says nothing about the login now.
+    p.db.x("INSERT INTO runs(role,provider,started,status,cost_usd) VALUES('worker','fake',?,'running',1.0)",
+           (now - 7200,))
+    p.db.set_kv("auth_probe:fake", now - 30)
+    run = p.db.x("INSERT INTO runs(role,provider,started,status,cost_usd) VALUES('worker','fake',?,'running',0)",
+                 (now - 30,))
+    p.db.post("in", "I logged in, status?", chat="cli")
+    p.db.x("UPDATE messages SET ts=ts-60")
+    # Seconds in and nothing spent yet: still the one probe.
+    d.sweep_alerts(); d.maybe_coordinate(); d.dispatch()
+    assert started == ["small"], started
+    # It spends tokens: the login works, everything starts on the same tick.
+    p.db.x("UPDATE runs SET cost_usd=0.4 WHERE id=?", (run,))
+    d.sweep_alerts(); d.maybe_coordinate(); d.dispatch()
+    assert started[:2] == ["small", "coordinator"] and sorted(started[2:]) == ["big", "other"], started
+    # Outliving the grace counts too, metered or not.
+    p.db.set_kv("limited:fake", {"until": 0, "note": "logged out"})
+    d.alert("auth:fake", "fake is logged out again", "high", every_s=0)
+    p.db.x("UPDATE runs SET cost_usd=0, started=? WHERE id=?", (time.time() + 1, run))
+    assert alerts.holds(p.db, "auth:fake", time.time(), time.time() + 5)
+    assert not alerts.holds(p.db, "auth:fake", time.time(), time.time() + alerts.AUTH_PROBE_GRACE_S + 5)
+
+
+def test_a_cleared_logout_drops_the_held_note_on_tasks_dispatch_skips(env, monkeypatch):
+    p = make(env)
+    d, started = _logged_out_daemon(p, monkeypatch)
+    d.dispatch()
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE blocked_reason LIKE 'held: logged out%'")["n"] == 2
+    d._disk_low, d._disk_free = True, 1e12   # the disk guard now skips them before the logout check
+    monkeypatch.setattr(d, "check_disk", lambda: None)
+    p.db.x("INSERT INTO runs(role,provider,started,ended,status) VALUES('worker','fake',?,?,'ok')",
+           (time.time(), time.time()))
+    d.sweep_alerts()
+    d.dispatch()
+    assert started == ["small"]
+    assert not p.db.one("SELECT id FROM tasks WHERE blocked_reason LIKE 'held: logged out%'")

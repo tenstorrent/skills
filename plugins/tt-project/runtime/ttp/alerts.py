@@ -18,6 +18,7 @@ from .schedule import failing
 
 DAY = 86400.0
 FEED_DAYS = 7
+AUTH_PROBE_GRACE_S = 120   # a run on a logged-out provider still running after this got past the login
 # What the chat hears once an episode clears. Budget gates post their own "back to normal".
 CLEARED_TEXT = {
     "auth": "{arg} works again: a run succeeded after the logout alert.",
@@ -58,6 +59,12 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
         # The next successful run on the provider ends it. A logout is not over when its pause
         # lapses (the pause only spaces out the probes); a quota limit is.
         if db.one("SELECT id FROM runs WHERE provider=? AND status='ok' AND started>=? LIMIT 1", (arg, since)):
+            return False
+        if kind == "auth" and db.one(
+                "SELECT id FROM runs WHERE provider=? AND status='running' AND started>=? "
+                "AND (cost_usd>0 OR started<=?) LIMIT 1", (arg, since, now - AUTH_PROBE_GRACE_S)):
+            # A probe that spends tokens or outlives the few seconds a logout takes to fail shows the
+            # login works; waiting for it to end would hold every other run for its whole run.
             return False
         return kind == "auth" or float((db.kv(f"limited:{arg}") or {}).get("until") or 0) > now
     if kind == "budget":

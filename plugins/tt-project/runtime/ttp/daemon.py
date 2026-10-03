@@ -2134,6 +2134,11 @@ class Daemon:
         """Close alert episodes whose condition cleared (stored with the time; the chats hear it once)."""
         for ep in alerts.sweep(self.p.db):
             log(self.p, f"alert cleared: {ep['key']} ({ep['cleared_why']})")
+            kind, _, prov = ep["key"].partition(":")
+            if kind == "auth":
+                # Tasks dispatch skips for another reason (the disk guard) would keep a stale note.
+                self.p.db.x("UPDATE tasks SET blocked_reason=NULL WHERE status='queued' AND blocked_reason LIKE ?",
+                            (f"{LOGGED_OUT_NOTE} ({prov})%",))
 
     def slack(self):
         if not self.cfg["notify"].get("slack"):
