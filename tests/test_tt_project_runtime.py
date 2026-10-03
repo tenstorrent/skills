@@ -396,6 +396,17 @@ def test_coordinator_actions_are_validated(env):
     assert any("unknown action" in x for x in probs)
 
 
+def test_fingerprint_keeps_digits_inside_identifiers(env):
+    make(env)
+    from ttp.screen import fingerprint
+    a = fingerprint("watch", "broker host03 chip 22 drop after 30s at 2026-10-01T05:30:00Z")
+    b = fingerprint("watch", "broker host01 chip 22 drop after 30s at 2026-10-01T05:30:00Z")
+    c = fingerprint("watch", "broker host03 chip 9 drop after 45s at 2026-10-02T11:02:03Z")
+    assert a != b and a == c
+    assert fingerprint("w", "gpu1 failed v1.0.0 in /tmp/x1/y") == fingerprint("w", "gpu1 failed v1.2.3 in /tmp/z")
+    assert fingerprint("w", "gpu1 failed") != fingerprint("w", "gpu2 failed")
+
+
 def test_screening_dedupes_and_reopens_fixed_issues(env):
     p = make(env)
     from ttp.screen import screen

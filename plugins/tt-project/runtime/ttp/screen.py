@@ -18,9 +18,12 @@ from .db import DB, SEVERITY_RANK
 
 _VOLATILE = [
     (re.compile(r"\b[0-9a-f]{7,64}\b", re.I), "<hex>"),
-    (re.compile(r"\b\d{4}-\d\d-\d\d[T ]\d\d:\d\d(:\d\d)?(\.\d+)?(Z|[+-]\d\d:?\d\d)?\b"), "<ts>"),
-    (re.compile(r"\d+(\.\d+)?"), "<n>"),        # also digits glued to units: 30s, 12ms, 4GB
+    (re.compile(r"\b\d{4}-\d\d-\d\d[T ]\d\d:\d\d(:\d\d)?(\.\d+)?(Z|[+-]\d\d:?\d\d)?\b", re.I), "<ts>"),
     (re.compile(r"/tmp/[^\s'\"]+"), "<tmp>"),
+    (re.compile(r"\bv\d+(\.\d+)+"), "<n>"),        # versions like v1.0.0
+    # numbers not glued to a preceding letter, so host03, gpu1 and t48 keep their identity;
+    # units after a number are masked with it: 30s, 12ms, 4GB
+    (re.compile(r"(?<![A-Za-z0-9_])\d+(\.\d+)*"), "<n>"),
     (re.compile(r"\s+"), " "),
 ]
 
