@@ -1031,7 +1031,7 @@ def cmd_logs(a) -> None:
 def cmd_setup(a) -> None:
     """Install this runtime as the user's stable `ttp` (plugin caches move on every update)."""
     from .project import HOME_DIR
-    from .release import forced_mark, is_newer, runtime_version
+    from .release import forced_mark, forced_version, is_newer, runtime_version
     lib = HOME_DIR / "lib" / __version__
     if not (PLUGIN_ROOT / "template").is_dir():
         die(f"{RUNTIME} is a project's harness copy, not the plugin; run `<plugin-root>/bin/ttp setup`", 1)
@@ -1052,7 +1052,7 @@ def cmd_setup(a) -> None:
     # The marker goes first: a daemon check between the two steps must not undo a deliberate downgrade.
     if is_newer(installed, __version__):    # a deliberate downgrade: daemons must not undo it
         forced_mark().write_text(__version__ + "\n")
-    else:
+    elif forced_version() != __version__:  # re-running setup of the forced version keeps it forced
         forced_mark().unlink(missing_ok=True)
     cur = HOME_DIR / "lib" / "current"
     if cur.is_symlink() or cur.exists():

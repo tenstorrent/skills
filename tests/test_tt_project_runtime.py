@@ -3132,6 +3132,8 @@ def test_setup_never_downgrades_a_newer_install_without_force(env, tmp_path):
     assert (env["home"] / "lib" / "current").resolve() == (env["home"] / "lib" / __version__).resolve()
     mark = env["home"] / "lib" / "forced-downgrade"
     assert mark.read_text().strip() == __version__     # daemons leave a deliberate downgrade alone
+    assert setup().returncode == 0 and mark.read_text().strip() == __version__   # same version stays forced
+    mark.write_text("0.0.1\n")                         # a marker for another version is stale
     assert setup().returncode == 0 and not mark.exists()
 
 
