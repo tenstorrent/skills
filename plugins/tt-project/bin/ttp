@@ -10,6 +10,17 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 RUNTIME = os.path.join(os.path.dirname(HERE), "runtime")
 if sys.version_info < (3, 9):
     sys.exit("ttp needs Python 3.9 or newer")
+# A project's harness copy (no template/ beside it) may be older than the installed ttp, and an upgrade
+# rewrites its files while it runs: setup and upgrade always run the installed stable copy.
+if (sys.argv[1:2] in (["setup"], ["upgrade"]) and os.path.isdir(RUNTIME)
+        and not os.path.isdir(os.path.join(os.path.dirname(HERE), "template"))):
+    home = os.environ.get("TTP_HOME") or os.path.join(os.path.expanduser("~"), ".tt-project")
+    installed = os.path.join(home, "lib", "current", "bin", "ttp")
+    if not os.path.isfile(installed):
+        sys.exit("ttp: %s is a project's harness copy and no ttp is installed at %s; run "
+                 "`<plugin-root>/bin/ttp %s` from the plugin instead" % (HERE, installed, sys.argv[1]))
+    if os.path.realpath(installed) != os.path.realpath(__file__):
+        os.execv(sys.executable, [sys.executable, installed] + sys.argv[1:])
 # Only this launcher's own runtime may run: inside a worker PYTHONPATH names the harness's runtime, and
 # `ttp setup` would silently reinstall that one.
 if not os.path.isfile(os.path.join(RUNTIME, "ttp", "__init__.py")):

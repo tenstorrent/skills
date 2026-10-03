@@ -3493,7 +3493,21 @@ def test_setup_from_a_harness_copy_refuses(env, tmp_path):
     r = subprocess.run([sys.executable, str(p.harness / "bin" / "ttp"), "setup", "--bin-dir", str(tmp_path / "bin")],
                        capture_output=True, text=True, timeout=60)
     assert r.returncode != 0 and "harness copy" in r.stderr
+    assert str(env["home"] / "lib" / "current" / "bin" / "ttp") in r.stderr   # names the ttp it would run
     assert not (env["home"] / "lib" / "current").exists()
+
+
+@pytest.mark.parametrize("cmd", ["setup", "upgrade"])
+def test_setup_and_upgrade_from_an_old_harness_copy_run_the_installed_ttp(env, tmp_path, cmd):
+    """`ttp` on a run's PATH is the project's harness copy, which may be older than the installed ttp."""
+    p = make(env)
+    _install_template(env)
+    (p.harness / "runtime" / "ttp" / "__init__.py").write_text('__version__ = "0.0.1"\n')
+    (p.harness / "runtime" / "ttp" / "cli.py").write_text("def main():\n    print('stale runtime ran')\n")
+    r = subprocess.run([sys.executable, str(p.harness / "bin" / "ttp"), cmd, "--help"],
+                       cwd=p.root, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    assert "stale runtime ran" not in r.stdout and f"usage: ttp {cmd}" in r.stdout
 
 
 def _git_out(path, *args):
