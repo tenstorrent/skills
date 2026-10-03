@@ -15,3 +15,7 @@ memory index, charter and config from the last commit or last good copy, moves a
 entry aside, and reports a task worktree whose `git status` fails. What it cannot repair raises one alert,
 which clears once a later check passes. An empty or truncated `run.json` now fails that run cleanly
 instead of crashing its supervisor.
+The check keeps a hand edit that drops the charter's last section (only a cut mid-line counts as a
+cut write) and saves whatever a restore replaces under `state/damaged/`. An empty `web.token` gets a
+new token instead of accepting an empty one, and the relay outbox's rewrite and appends sync their
+directory too.

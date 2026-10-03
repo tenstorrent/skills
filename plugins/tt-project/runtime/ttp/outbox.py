@@ -73,6 +73,7 @@ def _append(p: Path, entry: dict) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
+    project.fsync_dir(p.parent)
 
 
 def add(name: str, argv: list[str], client_id: str, chat: str | None) -> dict:
@@ -87,14 +88,7 @@ def _rewrite(name: str, keep: list[dict]) -> None:
     if not keep:
         _unlink(p)
         return
-    tmp = p.with_suffix(".jsonl.tmp")
-    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        os.write(fd, "".join(json.dumps(e, sort_keys=True) + "\n" for e in keep).encode())
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    os.replace(tmp, p)
+    project.durable_write(p, "".join(json.dumps(e, sort_keys=True) + "\n" for e in keep), mode=0o600)
 
 
 def _unlink(p: Path) -> None:
