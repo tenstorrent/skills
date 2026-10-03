@@ -37,6 +37,9 @@ description: "Start, connect to, and talk with a long-running tt-project: a loca
 - A project question you can answer from `ttp status <name>`: answer directly.
 - Anything else goes to the coordinator. Answers arrive through the listener.
 - Keep this chat free: after `ttp say`, end your turn. Do not wait in the foreground.
+- `ttp say` replies "queued on this machine": the project is unreachable right now and the message
+  is safe. It goes out by itself, in order and once, when the project is reachable. Tell the user;
+  do not resend it.
 - Alerts arrive in every attached chat. Replies arrive only in the chat that asked.
 - A repeated message id was already shown. Skip it.
 - The user asks what is running, costs, or blockers → `ttp status <name>`.

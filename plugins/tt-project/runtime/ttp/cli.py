@@ -23,6 +23,7 @@ from pathlib import Path
 
 from . import __version__, poll_s
 from .db import chat_floor
+from . import outbox
 from . import schedule as sched
 from .project import (FOLDER, NAME_RE, Project, hostname, load_registry, load_secrets, register, save_secret,
                       write_json)
@@ -64,16 +65,22 @@ def remote_hosts() -> list[str]:
                    if isinstance(e, dict) and e.get("host") and e["host"] != here})
 
 
-def forward_listen(entry: dict, argv: list[str]) -> int:
+def forward_listen(entry: dict, argv: list[str], name: str | None = None) -> int:
     """A remote listener outlives network drops: a laptop changes networks, sleeps and wakes.
 
     ssh failing (255) means this machine lost the path, not that the project stopped, so wait and
     reconnect. The listener left on the far side exits on its own once its session is gone, and
-    the new one replaces it if it has not yet.
+    the new one replaces it if it has not yet. Each (re)connect first sends what is queued here.
     """
     delay, told = 5.0, False
     while True:
-        rc = forward(entry, argv, quiet=told)
+        failed = flush_outbox(name, entry) if name else None
+        if failed is not None:
+            if not told:
+                _unreachable(entry, failed.stderr)
+            rc = 255
+        else:
+            rc = forward(entry, argv, quiet=told)
         if rc != 255:
             return rc
         if not told:
@@ -83,21 +90,84 @@ def forward_listen(entry: dict, argv: list[str]) -> int:
         delay = min(delay * 2, 120.0)
 
 
-def forward(entry: dict, argv: list[str], quiet: bool = False) -> int:
-    """Run this same command on the project's machine, streaming its output."""
+def _ssh(entry: dict, argv: list[str], capture: bool = False) -> subprocess.CompletedProcess:
     remote_ttp = f"{entry['dir']}/{FOLDER}/harness/bin/ttp"
     cmd = " ".join(shlex.quote(a) for a in [remote_ttp, *argv])
     host = entry.get("ssh") or entry["host"]
-    r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", host, cmd], stderr=subprocess.PIPE,
-                       text=True)
+    return subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", host, cmd],
+                          stdin=subprocess.DEVNULL if capture else None,
+                          stdout=subprocess.PIPE if capture else None, stderr=subprocess.PIPE, text=True)
+
+
+def _unreachable(entry: dict, stderr: str | None) -> None:
+    host = entry.get("ssh") or entry["host"]
+    why = ((stderr or "").strip().splitlines() or ["unknown ssh error"])[-1]
+    print(f"ttp: cannot reach {host} right now ({why}). The project keeps running there; "
+          f"try again once this machine is back on that network.", file=sys.stderr)
+
+
+def forward(entry: dict, argv: list[str], quiet: bool = False) -> int:
+    """Run this same command on the project's machine, streaming its output."""
+    r = _ssh(entry, argv)
     if r.returncode == 255:   # ssh itself failed: the project is fine, this machine cannot reach it
         if not quiet:
-            why = (r.stderr.strip().splitlines() or ["unknown ssh error"])[-1]
-            print(f"ttp: cannot reach {host} right now ({why}). The project keeps running there; "
-                  f"try again once this machine is back on that network.", file=sys.stderr)
+            _unreachable(entry, r.stderr)
     elif r.stderr:
         sys.stderr.write(r.stderr)
     return r.returncode
+
+
+def _send_say(entry: dict, argv: list[str], client_id: str, capture: bool = False) -> subprocess.CompletedProcess:
+    """`ttp say` on the project's machine, tagged with the client id it deduplicates on."""
+    r = _ssh(entry, [argv[0], f"--client-id={client_id}", *argv[1:]], capture)
+    if r.returncode == 2 and "--client-id" in (r.stderr or ""):   # an older runtime there: send it untagged
+        r = _ssh(entry, argv, capture)
+    return r
+
+
+def flush_outbox(name: str, entry: dict) -> subprocess.CompletedProcess | None:
+    """Send what is queued on this machine for `name`, oldest first, each removed only once the
+    project confirmed it. Returns the failed ssh attempt while the project is still unreachable
+    (that message and the ones behind it stay queued), else None."""
+    if not outbox.entries(name):
+        return None
+    failed, sent = None, 0
+    with outbox.locked(name):
+        for e in outbox.entries(name):
+            r = _send_say(entry, e["argv"], e["id"], capture=True)
+            if r.returncode == 0:
+                outbox.drop(name, e["id"])
+                sent += 1
+                continue
+            why = ((r.stderr or "").strip().splitlines() or [f"exit {r.returncode}"])[-1]
+            if r.returncode == 2:     # the project refused it: set it aside, do not block the rest
+                outbox.drop(name, e["id"], rejected=why)
+                print(f"ttp: {name} refused queued message #{e['id']} ({why}); it is kept in "
+                      f"{outbox.folder() / (name + '.rejected.jsonl')}", file=sys.stderr)
+                continue
+            failed = r
+            if r.returncode != 255:
+                print(f"ttp: queued messages for {name} stay queued ({why})", file=sys.stderr)
+            break
+    if sent:
+        print(f"ttp: delivered {sent} queued message(s) to {name}", file=sys.stderr)
+    return failed
+
+
+def say_remote(name: str, entry: dict, text: str, chat: str | None) -> int:
+    """Send a message to a project on another machine. If that machine cannot be reached, or older
+    messages are still queued for it, queue this one here: it is never dropped, and goes out in order."""
+    argv = ["say", name, *(["--chat", chat] if chat else []), "--", text]
+    cid = outbox.new_id()
+    if flush_outbox(name, entry) is None and not outbox.entries(name):
+        r = _send_say(entry, argv, cid)
+        if r.returncode != 255:
+            if r.stderr:
+                sys.stderr.write(r.stderr)
+            return r.returncode
+    outbox.add(name, argv, cid, chat)
+    print(f"queued on this machine; delivered once {name} is reachable (#{cid})")
+    return 0
 
 
 def search_transcripts(name: str) -> list[dict]:
@@ -148,8 +218,17 @@ def need(name: str, argv: list[str]) -> Project:
     p, entry = resolve(name)
     if entry:
         if argv and argv[0] == "listen":
-            sys.exit(forward_listen(entry, argv))
-        sys.exit(forward(entry, argv))
+            sys.exit(forward_listen(entry, argv, name))
+        failed = flush_outbox(name, entry)
+        if failed is None:
+            rc = forward(entry, argv)
+        else:
+            _unreachable(entry, failed.stderr)
+            rc = 255
+        n = outbox.count(name)
+        if n and argv[:1] == ["status"] and "--json" not in argv:
+            print(f"{n} message(s) queued here for {name}; they go out once it is reachable")
+        sys.exit(rc)
     if not p:
         die(f"no project named {name!r} on this machine or in the registry; try `ttp find {name}`")
     return p
@@ -393,14 +472,25 @@ def cmd_connect(a) -> None:
 
 
 def cmd_say(a) -> None:
-    p = need(a.name, sys.argv[1:])
+    p, entry = resolve(a.name)
     text = a.text if a.text != "-" else sys.stdin.read()
     if not text.strip():
         die("empty message")
-    mid = p.db.post("in", text.strip(), chat=a.chat or None, channel="chat", kind="user")
-    if a.chat:
-        p.db.x("UPDATE chats SET last_active=? WHERE id=?", (time.time(), a.chat))
-    print(f"sent (#{mid}); the coordinator answers in this chat when it has decided")
+    if entry:
+        sys.exit(say_remote(a.name, entry, text, a.chat))
+    p = p or need(a.name, sys.argv[1:])
+    seen = None
+    with p.db.tx():   # a client id makes a resent message (its confirmation was lost) a no-op
+        if a.client_id:
+            seen = p.db.one("SELECT id FROM messages WHERE direction='in' AND ref=?", (f"client:{a.client_id}",))
+        mid = seen["id"] if seen else p.db.post("in", text.strip(), chat=a.chat or None, channel="chat",
+                                                 kind="user", ref=f"client:{a.client_id}" if a.client_id else None)
+        if a.chat:
+            p.db.x("UPDATE chats SET last_active=? WHERE id=?", (time.time(), a.chat))
+    if seen:
+        print(f"already received (#{mid})")
+    else:
+        print(f"sent (#{mid}); the coordinator answers in this chat when it has decided")
 
 
 def cmd_listen(a) -> None:
@@ -1317,6 +1407,7 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("name")
     s.add_argument("text", help="message, or '-' for stdin")
     s.add_argument("--chat")
+    s.add_argument("--client-id", help=argparse.SUPPRESS)   # set by a forwarding machine; resends are skipped
     s.set_defaults(fn=cmd_say)
 
     s = sub.add_parser("listen", help="print messages for a chat as they arrive")

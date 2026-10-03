@@ -2239,6 +2239,115 @@ def test_remote_listener_reconnects_after_a_network_drop(env, monkeypatch):
     assert naps == [5.0, 10.0]
 
 
+def _flaky_ssh(monkeypatch, cwd, codes, calls):
+    """ssh HOST CMD: 255 = unreachable (nothing runs); "drop" = CMD runs, then the connection drops
+    before its answer arrives (255); anything else, or no codes left = CMD runs here in `cwd`."""
+    real = subprocess.run
+
+    def run(args, **kw):
+        if args[0] != "ssh":
+            return real(args, **kw)
+        code = codes.pop(0) if codes else 0
+        calls.append(args[-1])
+        if code == 255:
+            return subprocess.CompletedProcess(args, 255, "" if kw.get("stdout") else None,
+                                               "ssh: connect to host far port 22: Network is unreachable")
+        r = real(["bash", "-c", args[-1]], cwd=cwd, **kw)
+        return subprocess.CompletedProcess(args, 255 if code == "drop" else r.returncode, r.stdout, r.stderr)
+    monkeypatch.setattr(subprocess, "run", run)
+
+
+def _say(cli, *argv):
+    with pytest.raises(SystemExit) as e:
+        cli.main(["say", *argv])
+    return e.value.code
+
+
+def _inbound(p):
+    return [(r["text"], r["ref"]) for r in p.db.q("SELECT text, ref FROM messages WHERE direction='in' "
+                                                 "AND kind='user' AND channel='chat' ORDER BY id")]
+
+
+def test_say_to_an_unreachable_project_is_queued_then_delivered_once_in_order(env, monkeypatch, capsys):
+    from ttp import cli, outbox
+    from ttp.project import register
+    p = make(env)
+    register("demo", {"host": "far", "dir": str(env["repo"])})     # this machine is the laptop now
+    monkeypatch.chdir(env["tmp"])
+    codes, calls = [255, 255], []
+    _flaky_ssh(monkeypatch, env["repo"], codes, calls)
+    before = _inbound(p)
+    assert _say(cli, "demo", "first", "--chat", "c1") == 0
+    out = capsys.readouterr().out
+    assert "queued on this machine; delivered once demo is reachable (#" in out, out
+    # The project is still unreachable: the older message goes first, and this one queues behind it.
+    assert _say(cli, "demo", "-two words", "--chat", "c1") == 0
+    queued = outbox.entries("demo")
+    assert [e["argv"][-1] for e in queued] == ["first", "-two words"] and queued[0]["chat"] == "c1"
+    assert stat.S_IMODE(outbox.path("demo").stat().st_mode) == 0o600
+    assert _inbound(p) == before, "nothing reached the project yet"
+    codes.append(255)
+    capsys.readouterr()
+    monkeypatch.setattr(sys, "argv", ["ttp", "status", "demo"])     # what need() forwards
+    with pytest.raises(SystemExit):
+        cli.main(["status", "demo"])
+    assert "2 message(s) queued here for demo" in capsys.readouterr().out
+    # Reachable again: the queue drains in order before the new message, each exactly once.
+    assert _say(cli, "demo", "third", "--chat", "c1") == 0
+    assert "delivered 2 queued message(s) to demo" in capsys.readouterr().err
+    got = _inbound(p)[len(before):]
+    assert [t for t, _ in got] == ["first", "-two words", "third"]
+    assert [r for _, r in got] == [f"client:{e['id']}" for e in queued] + [got[2][1]] and got[2][1]
+    assert outbox.entries("demo") == [] and not outbox.path("demo").exists()
+    with pytest.raises(SystemExit):
+        cli.main(["status", "demo"])
+    assert "queued here" not in capsys.readouterr().out
+
+
+def test_queued_message_whose_first_attempt_committed_is_not_delivered_twice(env, monkeypatch, capsys):
+    from ttp import cli, outbox
+    from ttp.project import register
+    p = make(env)
+    register("demo", {"host": "far", "dir": str(env["repo"])})
+    monkeypatch.chdir(env["tmp"])
+    codes, calls = ["drop"], []
+    _flaky_ssh(monkeypatch, env["repo"], codes, calls)
+    before = _inbound(p)
+    assert _say(cli, "demo", "hello") == 0                   # stored there, but the answer was lost
+    assert "queued on this machine" in capsys.readouterr().out and len(outbox.entries("demo")) == 1
+    assert _say(cli, "demo", "again") == 0
+    assert [t for t, _ in _inbound(p)[len(before):]] == ["hello", "again"]
+    assert outbox.entries("demo") == []
+    assert sum("--client-id=" in c for c in calls) == 3      # hello twice (same id), again once
+
+
+def test_queued_message_the_project_refuses_is_set_aside_not_lost(env, monkeypatch, capsys):
+    from ttp import cli, outbox
+    outbox.add("demo", ["say", "demo", "--", "x"], "id-1", None)
+    outbox.add("demo", ["say", "demo", "--", "y"], "id-2", None)
+    rcs = iter([2, 0])
+    sent = []
+    monkeypatch.setattr(cli, "_send_say", lambda entry, argv, cid, capture=False: sent.append(cid) or
+                        subprocess.CompletedProcess(argv, next(rcs), "", "ttp: no project named 'demo'"))
+    assert cli.flush_outbox("demo", {"host": "far", "dir": "/x"}) is None
+    assert sent == ["id-1", "id-2"] and outbox.entries("demo") == []
+    kept = (outbox.folder() / "demo.rejected.jsonl").read_text()
+    assert '"id-1"' in kept and "no project named" in kept
+    assert "refused queued message #id-1" in capsys.readouterr().err
+
+
+def test_remote_listener_sends_the_outbox_on_every_reconnect(env, monkeypatch):
+    from ttp import cli
+    failed = subprocess.CompletedProcess([], 255, "", "ssh: unreachable")
+    flushes = iter([failed, None])
+    calls = []
+    monkeypatch.setattr(cli, "flush_outbox", lambda name, entry: calls.append(("flush", name)) or next(flushes))
+    monkeypatch.setattr(cli, "forward", lambda entry, argv, quiet=False: calls.append(("listen", quiet)) or 0)
+    monkeypatch.setattr(cli.time, "sleep", lambda s: None)
+    assert cli.forward_listen({"host": "box", "dir": "/x"}, ["listen", "demo", "--chat", "c1"], "demo") == 0
+    assert calls == [("flush", "demo"), ("flush", "demo"), ("listen", True)]
+
+
 def _ask(p, text="Option A or B?", **fields):
     from ttp import coordinator as coord
     p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")   # the kickoff brief, already read
