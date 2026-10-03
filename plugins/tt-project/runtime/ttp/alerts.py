@@ -18,8 +18,9 @@ from .schedule import failing
 
 DAY = 86400.0
 FEED_DAYS = 7
-# What the chat hears once an episode clears. Budget gates post their own "back to normal".
+# What the chat hears once an episode clears.
 CLEARED_TEXT = {
+    "budget": "Budget for {arg} is out of red; new work starts again.",
     "auth": "{arg} works again: a run succeeded after the logout alert.",
     "limit": "{arg} accepts work again.",
     "coordinator": "The coordinator is working again: a turn succeeded.",

@@ -182,8 +182,8 @@ def _plan_setup(p, now, resets, readings, runs):
 
 def test_near_the_line_running_work_counts_and_new_starts_stop(env):
     """Three workers burn 9 points/h, 3 each; a run lasts 1 h before any has ended. Each worker may
-    add 3 more points: all six fit 20 points under the line, four fit 14, and once the three running
-    ones plus a new one would pass it, nothing new starts."""
+    add 3 more points: all six fit 20 points under the line, four fit 14, three fit 10 (all busy,
+    nothing new starts, still yellow), and once the three running ones alone may pass it, orange."""
     p = make(env)
     from ttp import budget as bud
     cfg = p.config()
@@ -199,8 +199,12 @@ def test_near_the_line_running_work_counts_and_new_starts_stop(env):
     g = bud.evaluate(p.db, cfg, "claude", w(76), now)
     assert g.level == "yellow" and g.max_parallel == 4 and g.numbers["starts"], (g.reasons, g.numbers)
     assert "room for 4 workers" in g.reasons[0] and bud.clamp_tier("deep", g) == "standard", g.reasons
-    # the running work and one more run would reach the line: no new start, running work goes on
+    # every slot the headroom allows is busy: no new start, but that is the plan working
     g = bud.evaluate(p.db, cfg, "claude", w(80), now)
+    assert g.level == "yellow" and g.max_parallel == 3 and g.numbers["starts"] is False, (g.reasons, g.numbers)
+    assert "room for 3 workers" in g.reasons[0] and g.allow_optional, g.reasons
+    # the running work alone may reach the line: no new start, running work goes on
+    g = bud.evaluate(p.db, cfg, "claude", w(82), now)
     assert g.level == "orange" and g.max_parallel <= 3 and g.numbers["starts"] is False, (g.reasons, g.numbers)
     assert g.allow_new_work and "no new starts" in g.reasons[0], g.reasons
     assert p.db.one("SELECT COUNT(*) n FROM runs WHERE status='running'")["n"] == 3
@@ -213,6 +217,28 @@ def test_near_the_line_running_work_counts_and_new_starts_stop(env):
     _plan_setup(p, now, soon, [(60, 61), (30, 65.5), (0, 70)], [])
     g = bud.evaluate(p.db, cfg, "claude", [bud.Window("claude", "five_hour", 85, soon)], now)
     assert g.numbers["plan"][0]["horizon_h"] == 0.25 and g.level == "green", g.numbers
+
+
+def test_busy_slots_the_headroom_allows_stay_yellow_and_one_too_many_is_orange(env):
+    """15 points under the line, 4.5 points/h per worker over 1 h runs: room for 3. Dispatch filling
+    the third slot changes nothing; a fourth running worker (started before the readings) does."""
+    p = make(env)
+    from ttp import budget as bud
+    cfg = p.config()
+    now = time.time()
+    resets = now + 3 * 3600
+    w = [bud.Window("claude", "five_hour", 75, resets)]
+    _plan_setup(p, now, resets, [(60, 66), (30, 70.5), (0, 75)], [(90, None)] * 2)
+    two = bud.evaluate(p.db, cfg, "claude", w, now)
+    assert two.level == "yellow" and two.max_parallel == 3 and two.numbers["starts"] is True, two.reasons
+    _plan_setup(p, now, resets, [], [(0, None)])
+    three = bud.evaluate(p.db, cfg, "claude", w, now)
+    assert three.level == "yellow" and three.max_parallel == 3 and three.numbers["starts"] is False, three.reasons
+    assert three.max_tier == "standard" and three.allow_optional and three.reasons == two.reasons
+    _plan_setup(p, now, resets, [], [(0, None)])
+    four = bud.evaluate(p.db, cfg, "claude", w, now)
+    assert four.numbers["plan"][0]["allowed"] == 3 and four.level == "orange", (four.reasons, four.numbers)
+    assert four.numbers["starts"] is False and "the 4 running workers may add ~18.0 points" in four.reasons[0]
 
 
 def test_burn_from_other_sessions_holds_new_starts_near_the_line(env):
@@ -4616,6 +4642,40 @@ def test_plan_pacing_changes_do_not_alert_the_user(env, monkeypatch):
     assert alerts() == before + 1, "hitting the plan limit must alert"
 
 
+def test_only_reaching_the_plan_line_alerts_once_per_window_and_no_level_wakes(env, monkeypatch):
+    """Green, yellow and orange flips post nothing and leave the wake state alone; reaching the line
+    alerts once, and again only in the next window."""
+    p = make(env)
+    from ttp import budget as bud
+    from ttp.daemon import Daemon, wake_fingerprint
+    d = Daemon(p.base)
+    alerts = lambda: [m["text"] for m in p.db.q("SELECT text FROM messages WHERE kind='alert'")]  # noqa: E731
+    resets = [time.time() + 3600]
+
+    def settle(level: str, util: float = 80.0) -> str:
+        gate = bud.Gate(provider="fake", level=level, regime="windows", numbers={
+            "limit": 90.0, "plan": [{"window": "five_hour", "utilization": util, "resets_at": resets[0]}]})
+        if level == "red":
+            gate.allow_new_work = False
+        monkeypatch.setattr(bud, "evaluate", lambda *a, **k: gate)
+        d.update_gates()
+        return wake_fingerprint(p, p.db.kv("gates"))
+
+    fp = settle("green")
+    for level in ("yellow", "orange", "yellow", "orange", "green"):
+        assert settle(level) == fp, f"{level} changed what wakes the coordinator"
+    assert alerts() == [], alerts()
+    assert settle("red", 90.0) != fp
+    assert len(alerts()) == 1 and alerts()[0].startswith("Budget for fake is now red"), alerts()
+    settle("orange", 89.0)
+    settle("red", 90.0)
+    assert len(alerts()) == 1, "the same plan window alerted twice"
+    resets[0] += 5 * 3600
+    settle("green", 0.0)
+    settle("red", 90.0)
+    assert len(alerts()) == 2, "a new plan window reaching the line must alert"
+
+
 def test_burn_rate_is_steady_across_whole_percent_readings(env):
     p = make(env)
     from ttp import budget as bud
@@ -8282,7 +8342,9 @@ def test_a_red_budget_alert_clears_once_the_gate_leaves_red(env):
     ep = _episodes(p, "budget:fake")
     assert len(ep) == 1 and ep[0]["cleared"], ep
     assert attention(p.db, time.time()) == []
-    assert not p.db.q("SELECT id FROM messages WHERE kind='resolved'"), "the gate already says back to normal"
+    said = [m["text"] for m in p.db.q("SELECT text FROM messages WHERE kind IN ('alert','resolved')")]
+    assert said[-1] == "Cleared: Budget for fake is out of red; new work starts again.", said
+    assert not any("is now green" in t for t in said), "leaving red is said once, by the cleared alert"
 
 
 def test_coordinator_failure_alert_clears_on_a_successful_turn(env):

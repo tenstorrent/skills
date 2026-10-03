@@ -239,8 +239,9 @@ def _plan(db: DB, g: Gate, provider: str, plan: list[Window], line: float, most:
     against this project. `horizon` is how long a run here usually lasts, at most until the reset.
     Each worker, running or about to start, may add `per_worker x horizon` points before it ends.
     The project runs as many workers as fit in the headroom to the line: all of them until the
-    last stretch, fewer there, and no new start once the running ones alone would fill it. At the
-    line nothing new starts until the window resets. Running work is never stopped. Before any burn
+    last stretch, fewer there. Once those slots are all busy no new run starts, still yellow; orange
+    only when the running ones alone may reach the line, or not even one run fits. At the line
+    nothing new starts until the window resets. Running work is never stopped. Before any burn
     is measured all workers may run, except within LINE_MARGIN_PCT of the line, where one does.
     """
     running = db.one("SELECT COUNT(*) n FROM runs WHERE provider=? AND status='running' AND role!='coordinator'",
@@ -273,8 +274,9 @@ def _plan(db: DB, g: Gate, provider: str, plan: list[Window], line: float, most:
                 _raise(g, "orange", f"{w.window} window at {w.utilization:.0f}%, just under the {line:.0f}% line "
                                     f"and no burn measured yet: one worker at a time")
                 row["allowed"] = 1
-        elif fit < most and fit <= running:
-            # Busy slots alone are no hold: only when the headroom is what limits the starts.
+        elif fit < most and (fit < running or fit == 0):
+            # Every slot the headroom allows being busy is the plan working (yellow); orange is
+            # only running work that alone may reach the line, or no room for even one run.
             held = (f"the {running} running workers may add ~{running * add:.1f} points before they end"
                     if running else f"one more run may add ~{add:.1f} points")
             _raise(g, "orange", f"{w.window} window at {w.utilization:.0f}%, {headroom:.1f} points under the "

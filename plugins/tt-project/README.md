@@ -70,10 +70,12 @@ and preferences you add later become part of the project's charter and memory.
   evenly over a window. Running work keeps using the plan after it starts, so near the line it
   estimates what each worker will still add (the account's measured burn per worker, times how
   long a run usually lasts here) and runs only as many workers as fit under the line: fewer in the
-  last stretch, and no new start once the running ones alone would reach it. At the line nothing
-  new starts until the window resets; the rest stays yours. Running work is never stopped.
+  last stretch, none new while those are all busy or the running ones alone would reach it. At the
+  line nothing new starts until the window resets; the rest stays yours. Running work is never
+  stopped.
 - In that last stretch deep tasks run at the standard tier. `ttp status` and the web app say when
-  the line holds new starts back.
+  the line holds new starts back. You get an alert only when the project reaches the line, once
+  per window; it clears by itself when the window resets.
 - Usage-billed accounts: $100 per 24 hours and $200 per 7 days per project by default. A new run
   starts only if its budget fits in what is left of both caps. A plan account whose successful
   runs stop reporting plan windows falls under these caps too (failed or silent runs do not count).

@@ -1223,20 +1223,16 @@ class Daemon:
                 g.max_parallel, g.allow_new_work, g.allow_optional = 0, False, False
             prev = self.gates.get(prov) or _saved_gate(saved.get(prov))
             provider_paused = any(r.startswith("provider limit") for r in g.reasons + (prev.reasons if prev else []))
-            # On a plan, green and yellow are the pacing working as designed (more or fewer workers
-            # as the account's burn moves); only nearing or hitting the limit is news to the user.
-            pacing = (g.regime == "windows" and prev is not None
-                      and {prev.level, g.level} <= {"green", "yellow"})
-            if prev and prev.level != g.level and not provider_paused and not pacing:   # a pause has its own alert
-                sev = "high" if g.level == "red" else "normal"
+            # Green, yellow and orange are the budget working as designed (more or fewer workers);
+            # only red is news to the user. Its alert clears itself once the gate leaves red.
+            if prev and prev.level != "red" and g.level == "red" and not provider_paused \
+                    and self._first_red_in_window(prov, g):   # a pause has its own alert
                 capped = any("cap reached" in r for r in g.reasons)
-                hint = ""
-                if g.level == "red":
-                    hint = ("New work is paused; replies to you continue. " +
-                            ("You can raise the cap (carefully) by telling me, or in the web app."
-                             if capped else "The web app's Budget tab shows what spent it."))
-                news.append((f"Budget for {prov} is now {g.level}: {'; '.join(g.reasons) or 'back to normal'}. "
-                               + hint, sev, f"budget:{prov}"))
+                hint = "New work is paused; replies to you continue. " + (
+                    "You can raise the cap (carefully) by telling me, or in the web app."
+                    if capped else "The web app's Budget tab shows what spent it.")
+                news.append((f"Budget for {prov} is now red: {'; '.join(g.reasons)}. " + hint,
+                             "high", f"budget:{prov}"))
             gates[prov] = g
         # One transaction: saved gates without their alert would hide the change from every later
         # tick and restart. Gates first: a relay reading an alert before the gates show red would
@@ -1246,6 +1242,24 @@ class Daemon:
             for text, sev, ref in news:
                 self.p.db.post("out", text, chat=None, kind="alert", severity=sev, ref=ref)
         self.gates = gates
+
+    def _first_red_in_window(self, prov: str, g: bud.Gate) -> bool:
+        """Whether a red gate at a plan line is the first in that plan window, and remember it. The
+        line holds until the window resets, so one alert per window is enough. Red for any other
+        reason (a dollar cap, the runaway guard) is always news."""
+        n = g.numbers or {}
+        line = float(n.get("limit") or 100)
+        at_line = [r for r in n.get("plan") or [] if r.get("resets_at") and r["utilization"] >= line]
+        if not at_line:
+            return True
+        sent = self.p.db.kv("budget_red_sent", {}) or {}
+        mine = {w: t for w, t in (sent.get(prov) or {}).items() if float(t) > time.time()}
+        # A window's reset time may move by seconds between readings; the next window's is hours on.
+        if all(abs(float(mine.get(r["window"], 0)) - float(r["resets_at"])) < 600 for r in at_line):
+            return False
+        mine.update({r["window"]: r["resets_at"] for r in at_line})
+        self.p.db.set_kv("budget_red_sent", {**sent, prov: mine})
+        return True
 
     # schedules and watchers ------------------------------------------------------------------------
     def run_schedules(self) -> None:
@@ -2416,7 +2430,8 @@ def wake_fingerprint(p: Project, gates: dict[str, dict]) -> str:
     asks = [r["id"] for r in db.q("SELECT id FROM messages WHERE kind='ask' AND handled=0 ORDER BY id")]
     scheds = [(s["name"], s["enabled"], s["every_s"], s["at"])
               for s in db.q("SELECT name, enabled, every_s, at FROM schedules ORDER BY name")]
-    levels = sorted((k, g["level"], g["allow_new_work"]) for k, g in gates.items())
+    # Only red changes what a turn can do; green, yellow and orange are pacing and wake nobody.
+    levels = sorted((k, g["level"] == "red", g["allow_new_work"]) for k, g in gates.items())
     files = [p.charter_path, p.config_path, p.memory_index,
              *(p.memory_dir.iterdir() if p.memory_dir.is_dir() else [])]
     mtimes = sorted((f.name, f.stat().st_mtime) for f in files if f.exists())
