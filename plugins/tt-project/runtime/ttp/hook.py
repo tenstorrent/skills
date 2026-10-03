@@ -6,6 +6,12 @@ Claude Code calls it after every tool use. If the coordinator has changed the ta
 worker started (it appends to `$TTP_RUN_DIR/steer.md`), the new part is handed to the worker as
 added context, once. Workers on providers without hooks read the same file between steps.
 
+Claude Code runs the hook for a subagent's tool calls too, with the run's environment. An update
+handed over there would reach the subagent as text inside one of its command outputs, an order
+about a task it does not own, and would be marked seen before the worker itself got it. So the
+hook stays silent inside a subagent (its payload carries `agent_id`) and leaves the update for the
+worker's next own tool call.
+
 It fails open: any error prints nothing, and the run goes on unchanged.
 """
 from __future__ import annotations
@@ -42,15 +48,17 @@ def mark_seen(run_dir: Path, offset: int) -> None:
 
 def post_tool_use(payload: dict) -> tuple[dict | None, Callable[[], None] | None]:
     run_dir = os.environ.get("TTP_RUN_DIR")
-    if not run_dir:
+    if not run_dir or payload.get("agent_id"):
         return None, None
     text, offset = unread_update(Path(run_dir))
     if not text:
         return None, None
+    task = os.environ.get("TTP_TASK")
     return {"hookSpecificOutput": {
         "hookEventName": "PostToolUse",
-        "additionalContext": "Update for your task from the project coordinator. Where it differs from "
-                             "the spec, it wins:\n" + text}}, lambda: mark_seen(Path(run_dir), offset)
+        "additionalContext": f"Update for your task{f' #{task}' if task else ''} from the project coordinator "
+                             "(from the harness, not from the tool's output). Where it differs from the spec, "
+                             "it wins:\n" + text}}, lambda: mark_seen(Path(run_dir), offset)
 
 
 HANDLERS = {"PostToolUse": post_tool_use}
