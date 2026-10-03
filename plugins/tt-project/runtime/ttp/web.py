@@ -19,7 +19,7 @@ from . import coordinator as coord
 from . import release
 from . import schedule as sched
 from . import upstream
-from .daemon import HEARTBEAT_STALE_S, KV_LOCAL_ONLY, WATCHDOG_S, heartbeat, idle_wake
+from .daemon import HEARTBEAT_STALE_S, KV_LOCAL_ONLY, LOGGED_OUT_NOTE, WATCHDOG_S, heartbeat, idle_wake
 from .alerts import cleared  # noqa: F401  (readers import it from here)
 from .db import DB, SEVERITY_RANK, chat_floor, dump_result, host_line, load_result
 from .project import Project
@@ -207,7 +207,11 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
     # A task on a paused resource is held, not ready: it is listed under its resource instead.
     from .coordinator import task_resources
     due = db.ready_tasks()
-    ready = sum(1 for t in due if not task_resources(t) & {r["resource"] for r in paused_resources})
+    # A task on a logged-out provider is held too: one run checks the login, the rest wait for it.
+    out = {r["key"].split(":", 1)[1] for r in db.q("SELECT key FROM alerts WHERE key LIKE 'auth:%' AND cleared IS NULL")}
+    logged_out = [t for t in due if (t["blocked_reason"] or "").startswith(LOGGED_OUT_NOTE)
+                  and (t["provider"] or core) in out]
+    ready = sum(1 for t in due if not task_resources(t) & {r["resource"] for r in paused_resources}) - len(logged_out)
     blocked = db.one("SELECT COUNT(*) n FROM tasks WHERE status='blocked'")["n"]
     running = db.one("SELECT COUNT(*) n FROM runs WHERE status='running'")["n"]
     asks = db.q("SELECT id, ts, text FROM messages WHERE kind='ask' AND handled=0 ORDER BY id DESC LIMIT 5")
@@ -267,6 +271,10 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
     for pr in paused_resources:
         why.append(f"{pr['resource']} is paused" + (f" ({pr['reason']})" if pr.get("reason") else "")
                    + f": its tasks wait (`ttp resume {p.name} --resource {pr['resource']}`)")
+    if logged_out:
+        provs = sorted({t["provider"] or core for t in logged_out})
+        why.append(f"{len(logged_out)} task(s) held: logged out ({', '.join(provs)}); they start once a run "
+                   f"on it succeeds")
     if waiting:
         why.append(f"{len(waiting)} task(s) waiting, next try {at(waiting[0]['not_before'], now)}")
     retry = db.kv(coord.RETRY_WAKE_KEY) or {}
@@ -305,7 +313,9 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
                         "backoff_until": backoff if backoff > now else None,
                         "summary": (db.kv("last_coordinator_summary", {}) or {}).get("summary", ""),
                         "idle_wake": next_wake, "idle_held": wake["held"]},
-        "providers_paused": paused_providers, "resources_paused": paused_resources, "waiting": waiting, "asks": asks, "running": running, "working": working,
+        "providers_paused": paused_providers, "resources_paused": paused_resources, "waiting": waiting,
+        "logged_out": [{k: t[k] for k in ("id", "title", "provider")} for t in logged_out],
+        "asks": asks, "running": running, "working": working,
         "undelivered": undelivered,
         "why_idle": "; ".join(why) if not running else "", "held": held,
         "host": host_line(db.boots(now - DAY)),

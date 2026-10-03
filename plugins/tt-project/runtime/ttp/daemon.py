@@ -59,6 +59,7 @@ WAIT_KEYS = ("retry_when", "retry_after_s", "waiting_for", "wake_tier", "survive
 MAX_FOLLOWUPS, FOLLOWUP_SPEC_CHARS = 12, 4000   # per hand-off; each follow-up is its own event
 PROBE_EVERY_S = 180     # how often a waiting task's `retry_when` probe runs
 PROBE_TIMEOUT_S = 60
+AUTH_PROBE_S = 900      # while a provider is logged out, one run on it checks the login this often
 ORPHAN_GRACE_S = 10     # TERM to KILL for an agent whose supervisor died
 HANDOFF_STATES = ("done", "blocked", "failed", "needs_review", "waiting")
 SLEEP_CUT = ("timeout", "stalled", "lost", "failed")   # ends a host sleep can cause
@@ -833,8 +834,8 @@ class Daemon:
                            "high")
             if usage.auth_failed:
                 # Logged out is not a task failure and not worth retrying blindly: pause this provider,
-                # say exactly how to fix it, and probe again every 15 minutes (a cheap decision turn).
-                db.set_kv(f"limited:{r['provider']}", {"until": time.time() + 900, "note": "logged out",
+                # say exactly how to fix it, and probe again every 15 minutes with one run (_may_probe).
+                db.set_kv(f"limited:{r['provider']}", {"until": time.time() + AUTH_PROBE_S, "note": "logged out",
                                                        "creds": prov.credentials_stamp()})
                 self.alert(f"auth:{r['provider']}",
                            f"{r['provider']} on {hostname()} is logged out ({(usage.final_text or usage.error)[:120]}). "
@@ -877,7 +878,7 @@ class Daemon:
             # Its messages and events stay queued for the next one.
             return
         if status == "auth":
-            db.set_kv("coordinator_backoff_until", time.time() + 900)
+            db.set_kv("coordinator_backoff_until", time.time() + AUTH_PROBE_S)
             return
         if status != "ok" or not isinstance(actions, list):
             self._coordinator_failed(f"{status} {usage.error[:200]}")
@@ -1179,8 +1180,24 @@ class Daemon:
         if not stamp or stamp == lim["creds"]:
             return lim
         self.p.db.set_kv(f"limited:{prov}", {**lim, "until": 0, "note": "credentials changed"})
+        self.p.db.set_kv(f"auth_probe:{prov}", 0)   # a login is checked by the next run, not in 15 minutes
         log(self.p, f"{prov} credentials changed; ending the logged-out pause")
         return None
+
+    def _logged_out(self, prov: str) -> bool:
+        """Whether `prov` has an open logged-out alert; alerts.sweep closes it once a run succeeds."""
+        return bool(self.p.db.one("SELECT id FROM alerts WHERE key=? AND cleared IS NULL LIMIT 1", (f"auth:{prov}",)))
+
+    def _may_probe(self, prov: str, now: float) -> bool:
+        """While `prov` is logged out, whether one run on it may start now to check the login: its
+        pause is over, nothing runs on it, and the last check started AUTH_PROBE_S ago or more.
+        Starting every queued task instead would burn one failed run each per pause."""
+        lim = self._provider_pause(prov)
+        if lim and lim.get("until", 0) > now:
+            return False
+        if self.p.db.one("SELECT id FROM runs WHERE provider=? AND status='running' LIMIT 1", (prov,)):
+            return False
+        return now >= float(self.p.db.kv(f"auth_probe:{prov}", 0) or 0) + AUTH_PROBE_S
 
     def update_gates(self) -> None:
         windows = bud.plan_windows(self.p.db)
@@ -1385,6 +1402,9 @@ class Daemon:
         gates = {k: v.as_dict() for k, v in self.gates.items()}
         default_chat = msgs[-1]["chat"] if msgs else None
         provider = self.cfg.get("core_provider", "claude")
+        logged_out = self._logged_out(provider)
+        if logged_out and not self._may_probe(provider, now):
+            return   # logged out: one run at a time checks the login, and this turn is not it
         try:
             prompt = coord.digest(self.p, gates, [e["id"] for e in evs], [m["id"] for m in msgs])
             self.start_run("coordinator", prompt, provider, c.get("tier", "light"), str(self.p.base),
@@ -1400,6 +1420,8 @@ class Daemon:
             return
         db.set_kv("last_coordinator_turn", now)
         db.set_kv("idle_wake", wake)
+        if logged_out:
+            db.set_kv(f"auth_probe:{provider}", now)
 
     # workers ----------------------------------------------------------------------------------------
     def dispatch(self) -> None:
@@ -1412,6 +1434,14 @@ class Daemon:
         committed = None    # what running work under the dollar caps may still spend
         reached = set()     # tasks that got past the gates to the resource check
         paused = db.paused_resources()
+        now, core = time.time(), self.cfg.get("core_provider", "claude")
+        logged_out = {prov: self._logged_out(prov) for prov in {t["provider"] or core for t in ready}}
+        # On a logged-out provider the cheapest task goes first: it is the one run that checks the login.
+        out = [t for t in ready if logged_out[t["provider"] or core]]
+        if out:
+            rank = {t: i for i, t in enumerate(bud.TIER_ORDER)}
+            ready = [t for t in ready if not logged_out[t["provider"] or core]] + \
+                sorted(out, key=lambda t: rank.get(t["tier"], len(rank)))
         for task in ready:
             if self._disk_holds(task):
                 continue
@@ -1425,9 +1455,16 @@ class Daemon:
                 if note != held:
                     db.update_task(task["id"], blocked_reason=held)
                 continue
-            if note.startswith(PAUSED_NOTE):
+            provider = task["provider"] or core
+            if logged_out[provider] and not self._may_probe(provider, now):
+                # Logged out: the queue keeps its tasks, attempts untouched, until a run succeeds.
+                held = (f"{LOGGED_OUT_NOTE} ({provider}); one run checks the login every "
+                        f"{AUTH_PROBE_S // 60} min, the rest start once it works")
+                if note != held:
+                    db.update_task(task["id"], blocked_reason=held)
+                continue
+            if note.startswith((PAUSED_NOTE, LOGGED_OUT_NOTE)):
                 db.update_task(task["id"], blocked_reason=None)
-            provider = task["provider"] or self.cfg.get("core_provider", "claude")
             gate = self.gates.get(provider) or bud.evaluate(db, self.cfg, provider, bud.plan_windows(db))
             if not gate.allow_new_work or busy.get(provider, 0) >= gate.max_parallel:
                 continue
@@ -1492,6 +1529,8 @@ class Daemon:
                 self._unreserve(task)
                 continue
             self._start_failures = 0
+            if logged_out[provider]:
+                db.set_kv(f"auth_probe:{provider}", now)   # the one check of the login until the next
             self._progress()   # each start may have added a worktree
             busy[provider] = busy.get(provider, 0) + 1
             if gate.regime == "caps":
@@ -2203,6 +2242,7 @@ class Daemon:
 
 
 PAUSED_NOTE = "waits for a paused resource:"
+LOGGED_OUT_NOTE = "held: logged out"
 
 
 def _names_commit(tasks: list[dict], head: str) -> bool:

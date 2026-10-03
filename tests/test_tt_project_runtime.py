@@ -9503,3 +9503,73 @@ def test_status_says_when_the_budget_gate_holds_the_idle_wake(env, monkeypatch):
     assert h["coordinator"]["idle_held"] == "held by the budget gate (yellow)"
     assert "idle check is held by the budget gate" in h["why_idle"], h["why_idle"]
     assert _first_turn(d, clock, starts, clock[0] + 3 * idle_s) is None, "the daemon woke through the gate"
+
+
+def _logged_out_daemon(p, monkeypatch):
+    """A daemon whose core provider `fake` is logged out (open alert, pause lapsed), with three
+    queued tasks; start_run records the titles it would start."""
+    from ttp import budget as bud
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    assert coord.apply(p, [{"type": "task_add", "title": "big", "spec": "s", "tier": "standard"},
+                           {"type": "task_add", "title": "small", "spec": "s", "tier": "light"},
+                           {"type": "task_add", "title": "other", "spec": "s", "tier": "standard"}]) == []
+    d = Daemon(p.base)
+    started = []
+    monkeypatch.setattr(d, "start_run", lambda role, *a, **k: started.append(k["task"]["title"] if k.get("task")
+                                                                              else role) or 0)
+    monkeypatch.setattr(d, "_workdir_for", lambda task: (str(p.root), None))
+    d.gates["fake"] = bud.Gate("fake", regime="windows", max_parallel=6)
+    p.db.set_kv("limited:fake", {"until": time.time() + 900, "note": "logged out"})
+    d.alert("auth:fake", "fake is logged out", "high", every_s=4 * 3600)
+    p.db.set_kv("limited:fake", {"until": time.time() - 1, "note": "logged out"})
+    return d, started
+
+
+def test_a_logged_out_provider_starts_one_probe_per_backoff_and_holds_the_rest(env, monkeypatch):
+    p = make(env)
+    from ttp import cli
+    from ttp.daemon import AUTH_PROBE_S, LOGGED_OUT_NOTE
+    d, started = _logged_out_daemon(p, monkeypatch)
+    d.dispatch()
+    assert started == ["small"], "the cheapest task alone checks the login"
+    held = p.db.q("SELECT * FROM tasks WHERE title IN ('big', 'other')")
+    assert all(t["status"] == "queued" and not t["attempts"] and t["blocked_reason"].startswith(LOGGED_OUT_NOTE)
+               for t in held), held
+    # The probe is out: neither the next ticks nor the coordinator start another run on the provider.
+    p.db.post("in", "hello", chat="cli")
+    p.db.x("UPDATE messages SET ts=ts-60")
+    for _ in range(3):
+        d.maybe_coordinate()
+        d.dispatch()
+    assert started == ["small"], started
+    out = cli.status_text(p)
+    assert out.count("held: logged out") >= 2 and "#1 held: logged out: big" in out, out
+    # The probe ended logged out again: its pause holds everything, then one more probe goes.
+    p.db.x("UPDATE tasks SET status='queued' WHERE title='small'")
+    p.db.set_kv("limited:fake", {"until": time.time() + AUTH_PROBE_S, "note": "logged out"})
+    p.db.set_kv("auth_probe:fake", time.time() - AUTH_PROBE_S - 1)
+    p.db.set_kv("coordinator_backoff_until", 0)
+    d.maybe_coordinate()
+    d.dispatch()
+    assert started == ["small"], "a run started inside the logged-out pause"
+    p.db.set_kv("limited:fake", {"until": time.time() - 1, "note": "logged out"})
+    d.maybe_coordinate()
+    d.dispatch()
+    assert started == ["small", "coordinator"], "the coordinator, when it has work, is the next probe"
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE blocked_reason LIKE 'held: logged out%'")["n"] == 3
+
+
+def test_a_logged_out_provider_dispatches_everything_once_a_run_succeeds(env, monkeypatch):
+    p = make(env)
+    from ttp import cli
+    d, started = _logged_out_daemon(p, monkeypatch)
+    d.dispatch()
+    assert started == ["small"]
+    p.db.x("INSERT INTO runs(role,provider,started,ended,status) VALUES('worker','fake',?,?,'ok')",
+           (time.time(), time.time()))
+    d.sweep_alerts()
+    d.dispatch()
+    assert sorted(started) == ["big", "other", "small"], "dispatch did not resume at once after the login"
+    assert not p.db.one("SELECT id FROM tasks WHERE blocked_reason LIKE 'held: logged out%'")
+    assert "held: logged out" not in cli.status_text(p)

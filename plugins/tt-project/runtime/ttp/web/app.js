@@ -34,9 +34,12 @@ function gateHtml(gates) {
 // A queued task with a future retry time is waiting on a busy resource, not idle in the queue.
 const waiting = (t) => t.status === "queued" && t.not_before && t.not_before > Date.now() / 1000;
 
+// A queued task on a logged-out provider is held until a run on it works again.
+const held = (t) => t.status === "queued" && (t.blocked_reason || "").startsWith("held: logged out");
+
 function taskRow(t) {
-  const label = waiting(t) ? "waiting" : t.status;
-  const noteLabel = t.status === "blocked" ? "Blocked" : waiting(t) ? "Waiting" : "Note";
+  const label = waiting(t) ? "waiting" : held(t) ? "held: logged out" : t.status;
+  const noteLabel = t.status === "blocked" ? "Blocked" : waiting(t) ? "Waiting" : held(t) ? "Held" : "Note";
   return `<details class="row"><summary><span class="id">#${t.id}</span> <span class="st st-${t.status}">${label}</span>
     <span class="title">${esc(t.title)}</span> <span class="meta">${esc(t.tier)} · ${money(t.spent_usd)}${t.budget_usd ? " / " + money(t.budget_usd) : ""} · ${ago(t.updated)} ago${t.pr_url ? ` · <a href="${esc(t.pr_url)}" target="_blank" rel="noopener">PR</a>` : ""}</span></summary>
     ${t.blocked_reason ? `<p><b>${noteLabel}:</b> ${esc(t.blocked_reason)}</p>` : ""}${t.result ? `<p>${esc(t.result)}</p>` : ""}
