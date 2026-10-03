@@ -205,14 +205,16 @@ def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int]) ->
         n = g.get("numbers", {})
         if g.get("regime") == "windows":
             parts = []
-            for w in n.get("pace") or []:
+            for w in n.get("plan") or []:
                 left = f"{w['hours_left']:.1f} h" if w.get("hours_left") is not None else "unknown time"
-                pace = (f"burning {w['burn_per_h']}/h, needs {w['need_per_h']}/h to land at {n.get('limit')}% "
-                        f"(on pace for {w['projected']}%)" if w.get("burn_per_h") is not None
+                burn = (f"~{w['per_worker_per_h']}/h per worker" if w.get("per_worker_per_h") is not None
                         else "no burn measured yet")
-                parts.append(f"{w['window']} {w['utilization']}% used, resets in {left}, {pace}")
-            money = ("plan windows (unused capacity is lost at each reset; the target is "
-                     f"{n.get('limit')}% by then): " + "; ".join(parts))
+                parts.append(f"{w['window']} {w['utilization']}% used, {w.get('headroom')} points to the line, "
+                             f"resets in {left}, {burn}")
+            starts = ("new starts allowed" if g.get("allow_new_work") and g["max_parallel"] > n.get("running", 0)
+                      else "no new starts")
+            money = ("plan windows (unused capacity is lost at each reset; all slots run up to the "
+                     f"{n.get('limit')}% line, which is never crossed): " + "; ".join(parts) + f" · {starts}")
             if g.get("level") == "green":
                 money += (f" · {n.get('running', 0)} of {g['max_parallel']} worker slots busy: keep enough "
                           f"independent tasks ready to fill the free ones")

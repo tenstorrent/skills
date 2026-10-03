@@ -4,10 +4,11 @@
 
 Two regimes, chosen per provider from what the provider reports:
 - plan windows (subscription plans report utilization per window): a plan is paid for per period,
-  so unused capacity is lost at each reset. The project paces itself to land each window at
-  100 - reserve_pct by its reset: it measures the account's burn rate from its own readings and
-  runs as many parallel workers as that pace allows. It never takes the account past the target,
-  because the remainder belongs to the user's own work;
+  so unused capacity is lost at each reset. Below the line (100 - reserve_pct) the project runs all
+  its parallel workers; it does not spread use evenly over a window. Running work keeps burning
+  after it starts, so near the line the project estimates what running work will still add, from
+  measured burn, and stops starting runs once that would reach the line. It never takes the account
+  past the line, because the remainder belongs to the user's own work;
 - dollar caps (usage-billed accounts report no window): rolling 24 h and 7 d caps on what THIS
   project spends across all its providers not on plan windows, with the user's defaults when the
   charter sets none.
@@ -41,12 +42,13 @@ PLAN_LAPSE_RUNS = 2
 # mix; not a price list. Override with budget.estimate_weights.
 TOKEN_WEIGHTS = {"input": 1.0, "output": 5.0, "cache_read": 0.1, "cache_write": 1.25}
 # Burn is measured over a quarter of the window, at most this long. Readings come in whole percents,
-# so a weekly window needs hours of them for a steady slope: over 3 h its projection swung between
-# 13% and 428% with each one-point step.
+# so a weekly window needs hours of them for a steady slope: over 3 h its slope swung more than
+# 30-fold with each one-point step.
 BURN_SPAN_MAX_S = 12 * HOUR
-# A window over pace stays over until its burn falls below this fraction of the burn it needs, so
-# a slope hovering near the pace does not flip the gate between green and yellow on every reading.
-PACE_EXIT = 0.85
+# How long a worker run lasts before this project has finished any to measure it from.
+RUN_HORIZON_DEFAULT_S = HOUR
+# Below this many points under the line, with no burn measured yet, only one light worker runs.
+LINE_MARGIN_PCT = 2.0
 
 
 @dataclass
@@ -151,8 +153,7 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
         g.reasons.append(f"{provider} stopped reporting plan windows; its spend counts toward the dollar caps")
     if plan:
         g.regime = "windows"
-        _pace(db, g, provider, plan, limit, int(b.get("max_parallel_workers", 6)), now,
-              float(b.get("max_pace_hold_s", 7200)))
+        _plan(db, g, provider, plan, limit, int(b.get("max_parallel_workers", 6)), now)
     else:
         # The caps bound the project's dollars, whichever provider spends them. Providers on plan
         # windows are bounded by their windows instead, so their spend does not count here.
@@ -216,110 +217,87 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
                          f"resumes automatically as the hour rolls over")
 
     if g.level == "yellow":
-        # On a plan the pace already sets the workers; a deep run burns the window fastest.
+        # On a plan the headroom to the line already sets the workers; a deep run burns it fastest.
         g.max_tier = "standard"
         if g.regime == "caps":
             g.max_parallel = max(1, g.max_parallel // 2 or 1)
     elif g.level == "orange":
-        g.max_tier, g.max_parallel, g.allow_optional = "light", 1, False
+        # On a plan the headroom may already allow no new start at all.
+        g.max_tier, g.max_parallel, g.allow_optional = "light", min(g.max_parallel, 1), False
     elif g.level == "red":
         g.max_tier, g.max_parallel, g.allow_optional, g.allow_new_work = "light", 0, False, False
     return g
 
 
-def _pace(db: DB, g: Gate, provider: str, plan: list[Window], target: float, most: int, now: float,
-          max_hold: float = 7200.0) -> None:
-    """Size parallel work so each window lands at `target` by its reset, from measured burn.
+def _plan(db: DB, g: Gate, provider: str, plan: list[Window], line: float, most: int, now: float) -> None:
+    """Run all `most` workers below `line`; hold back only where running work would reach it.
 
-    For each window: `need` is the burn (points of the window per hour) that reaches the target
-    exactly at the reset; `burn` is what the account has actually used over the recent past. Burning
-    slower than needed leaves paid capacity unused, so the project may run up to `most` workers.
-    Burning faster scales this project's workers down in proportion (other projects on the same
-    account see the same readings and do the same). Near the target only light work runs; at the
-    target nothing new starts until the reset.
-
-    The burn was produced by the workers that ran while it was measured, so the scale applies to
-    their time-weighted mean, not to the count running now: after a burst the running count may be
-    1, and scaling that would hold the project at 1 until the burst leaves the measured span.
-
-    One worker can still be too many: the pace allows a fraction `duty = mean * need / burn` of one
-    (mean here not floored at 1). Then new starts are spaced out: the next may start the last run's
-    length x (1/duty - 1) after it ended, at most `max_hold` later, so noisy readings cannot stall
-    the project. Running work is never stopped; the daemon lets a user's own tasks and reviews
-    through (see `pace_hold`). While a hold is on the project runs nothing, so its mean falls with
-    every tick and the duty with it: a hold, once set for the last run, can only move earlier.
+    Unused capacity is lost at each reset, so nothing spreads use evenly over a window. Running work
+    keeps burning after it starts, though. For each window, `per_worker` is the measured burn
+    (points of the window per hour, account-wide) over the time-weighted mean of this project's
+    workers while it was measured, at least 1, so burn from other sessions on the account counts
+    against this project. `horizon` is how long a run here usually lasts, at most until the reset.
+    Each worker, running or about to start, may add `per_worker x horizon` points before it ends.
+    The project runs as many workers as fit in the headroom to the line: all of them until the
+    last stretch, fewer there, and no new start once the running ones alone would fill it. At the
+    line nothing new starts until the window resets. Running work is never stopped. Before any burn
+    is measured all workers may run, except within LINE_MARGIN_PCT of the line, where one does.
     """
     running = db.one("SELECT COUNT(*) n FROM runs WHERE provider=? AND status='running' AND role!='coordinator'",
                      (provider,))["n"]
-    allowed, rows, duty = most, [], None
+    horizon = run_horizon(db, provider, now)
+    allowed, rows = most, []
     for w in plan:
         hours_left = max((w.resets_at - now) / HOUR, 0.05) if w.resets_at else None
         readings = _readings(db, provider, w.window, w.resets_at, now)
         burn = _slope(readings)
         mean = None if burn is None else avg_running(db, provider, float(readings[0]["ts"]), now)
-        need = max(target - w.utilization, 0.0) / hours_left if hours_left else None
-        projected = w.utilization + burn * hours_left if (burn is not None and hours_left) else None
+        per = None if burn is None else burn / mean
+        span = min(horizon, hours_left) if hours_left else horizon
+        add = None if per is None else per * span          # points one worker may still add
+        headroom = max(line - w.utilization, 0.0)
+        fit = min(most, int(headroom / add)) if add else most
         row = {"window": w.window, "utilization": round(w.utilization, 1), "resets_at": w.resets_at,
-               "hours_left": round(hours_left, 2) if hours_left else None,
+               "hours_left": round(hours_left, 2) if hours_left else None, "headroom": round(headroom, 1),
                "burn_per_h": None if burn is None else round(burn, 2),
-               "need_per_h": None if need is None else round(need, 2),
-               "projected": None if projected is None else round(projected, 1),
-               "avg_running": None if mean is None else round(mean, 2), "allowed": most}
+               "avg_running": None if mean is None else round(mean, 2),
+               "per_worker_per_h": None if per is None else round(per, 2), "horizon_h": round(span, 2),
+               "running_add": None if add is None else round(running * add, 1), "allowed": fit}
         rows.append(row)
-        if w.utilization >= target:
-            _raise(g, "red", f"{w.window} window at {w.utilization:.0f}%; the project stops at {target:.0f}% "
+        if w.utilization >= line:
+            _raise(g, "red", f"{w.window} window at {w.utilization:.0f}%; the project stops at {line:.0f}% "
                              f"until it resets")
             row["allowed"] = 0
-        elif w.utilization >= target - 2:
-            _raise(g, "orange", f"{w.window} window at {w.utilization:.0f}%, just under the {target:.0f}% stop")
-            row["allowed"] = 1
-        elif burn is not None and need is not None and _over_pace(db, provider, w, burn, need):
-            row["allowed"] = min(most, max(1, int(mean * need / burn)))
-            raw = avg_running(db, provider, float(readings[0]["ts"]), now, floor=0.0)
-            # Other sessions on the account burn the same window; say when the burn is not ours.
-            own = (f"averaged {mean:.1f} while it was measured" if raw > 0 else
-                   "none ran while it was measured: other sessions on the account made this burn")
-            _raise(g, "yellow", f"{w.window} window on pace for {projected:.0f}% by its reset, over the "
-                                f"{target:.0f}% target; running {row['allowed']} workers ({own})")
-            allowed = min(allowed, row["allowed"])
-            row["duty"] = round(raw * need / burn, 3)
-            if row["duty"] < 1 and (duty is None or row["duty"] < duty["duty"]):
-                duty = row
-    worst = max(rows, key=lambda r: (r["projected"] if r["projected"] is not None else r["utilization"]))
+        elif add is None:
+            if headroom <= LINE_MARGIN_PCT:
+                _raise(g, "orange", f"{w.window} window at {w.utilization:.0f}%, just under the {line:.0f}% line "
+                                    f"and no burn measured yet: one worker at a time")
+                row["allowed"] = 1
+        elif fit <= running:
+            held = (f"the {running} running workers may add ~{running * add:.1f} points before they end"
+                    if running else f"one more run may add ~{add:.1f} points")
+            _raise(g, "orange", f"{w.window} window at {w.utilization:.0f}%, {headroom:.1f} points under the "
+                                f"{line:.0f}% line; {held}: no new starts")
+        elif fit < most:
+            _raise(g, "yellow", f"{w.window} window at {w.utilization:.0f}%, {headroom:.1f} points under the "
+                                f"{line:.0f}% line: room for {fit} workers (~{add:.1f} points each before they end)")
+        allowed = min(allowed, row["allowed"])
+    worst = min(rows, key=lambda r: (r["allowed"], r["headroom"]))
     g.max_parallel = allowed
-    g.numbers.update({"window": worst["window"], "utilization": worst["utilization"], "limit": target,
-                      "resets_at": worst["resets_at"], "projected": worst["projected"], "running": running,
-                      "pace": rows})
-    if duty is None:
-        return
-    last = db.one("SELECT started, ended FROM runs WHERE provider=? AND role!='coordinator' AND status!='running' "
-                  "AND started IS NOT NULL AND ended IS NOT NULL ORDER BY ended DESC LIMIT 1", (provider,))
-    if not last:
-        return
-    end, length = float(last["ended"]), max(float(last["ended"]) - float(last["started"]), 0.0)
-    wait = length * (1 / duty["duty"] - 1) if duty["duty"] > 0 else max_hold
-    until = end + min(wait, max_hold)
-    key, run = f"pace_hold:{provider}", [float(last["started"]), end]
-    held = db.kv(key) or {}
-    if held.get("run") == run:
-        until = min(until, float(held.get("until") or until))
-    else:
-        db.set_kv(key, {"run": run, "until": until})
-    if until > now:
-        g.numbers["paced"] = {"until": until, "window": duty["window"], "projected": duty["projected"],
-                              "duty": duty["duty"]}
+    g.numbers.update({"window": worst["window"], "utilization": worst["utilization"], "limit": line,
+                      "resets_at": worst["resets_at"], "headroom": worst["headroom"], "running": running,
+                      "starts": allowed > running, "plan": rows})
 
 
-def pace_hold(gate: Gate | dict | None, task: dict, now: float | None = None) -> float | None:
-    """When a pace hold keeps `task` from starting, the time it ends. A task from the user's own
-    request (added by the user, or answering a chat) and a review of finished work go ahead."""
-    n = (gate.get("numbers") if isinstance(gate, dict) else getattr(gate, "numbers", None)) or {}
-    until = float((n.get("paced") or {}).get("until") or 0)
-    if until <= (now or time.time()):
-        return None
-    if task.get("origin") == "user" or task.get("reply_chat") or task.get("kind") == "review":
-        return None
-    return until
+def run_horizon(db: DB, provider: str, now: float) -> float:
+    """Hours a worker run on `provider` usually lasts in this project: the median of its last 20
+    runs that ended in the past week, RUN_HORIZON_DEFAULT_S before any did."""
+    rows = db.q("SELECT started, ended FROM runs WHERE provider=? AND role!='coordinator' AND started IS NOT NULL "
+                "AND ended IS NOT NULL AND ended>=? ORDER BY ended DESC LIMIT 20", (provider, now - WEEK))
+    lengths = sorted(max(float(r["ended"]) - float(r["started"]), 0.0) for r in rows)
+    if not lengths:
+        return RUN_HORIZON_DEFAULT_S / HOUR
+    return max(lengths[len(lengths) // 2], 300.0) / HOUR
 
 
 def burn_rate(db: DB, provider: str, window: str, resets_at: float | None, now: float) -> float | None:
@@ -328,17 +306,6 @@ def burn_rate(db: DB, provider: str, window: str, resets_at: float | None, now: 
     None until two readings at least five minutes apart exist: no reading, no guess.
     """
     return _slope(_readings(db, provider, window, resets_at, now))
-
-
-def _over_pace(db: DB, provider: str, w: Window, burn: float, need: float) -> bool:
-    """Whether `w` burns over pace: above it by 5% to go over, below PACE_EXIT of it to come back."""
-    key = f"pace_over:{provider}:{w.window}"
-    was = db.kv(key)
-    was = was is not None and was == w.resets_at     # over pace earlier in this same period
-    over = burn > need * (PACE_EXIT if was else 1.05)
-    if over != was:
-        db.set_kv(key, w.resets_at if over else None)
-    return over
 
 
 def _readings(db: DB, provider: str, window: str, resets_at: float | None, now: float) -> list:
@@ -353,7 +320,7 @@ def _slope(rows: list) -> float | None:
     if len(rows) < 2 or rows[-1]["ts"] - rows[0]["ts"] < 300:
         return None
     # Least-squares slope over every reading: readings come in whole percents, so a two-point
-    # estimate jumps with each new reading and the pace would flap between over and under.
+    # estimate jumps with each new reading and the room for workers would flap with it.
     ts = [(float(r["ts"]) - float(rows[0]["ts"])) / HOUR for r in rows]
     us = [float(r["utilization"]) for r in rows]
     mt, mu = sum(ts) / len(ts), sum(us) / len(us)
@@ -382,7 +349,7 @@ def plan_windows(db: DB, now: float | None = None) -> list[Window]:
     """The latest reading of every plan window reported in the last week.
 
     Being on a plan is a fact about the account, so an old reading still says which regime applies;
-    the pacing works from the readings themselves. A window whose reset has passed since its last
+    the headroom to the line works from the readings themselves. A window whose reset has passed since its last
     reading has started a new period: it counts as empty until the next reading says otherwise.
     """
     now = now or time.time()

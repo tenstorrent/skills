@@ -1480,8 +1480,6 @@ class Daemon:
                 continue
             if task["origin"] in ("schedule", "harness") and not gate.allow_optional:
                 continue
-            if bud.pace_hold(gate, task):
-                continue
             remaining = (task["budget_usd"] or 0) - (task["spent_usd"] or 0)
             if task["budget_usd"] and remaining <= 0.05:
                 db.update_task(task["id"], status="blocked", blocked_reason="task budget exhausted")
@@ -2428,20 +2426,14 @@ def wake_fingerprint(p: Project, gates: dict[str, dict]) -> str:
 
 
 def starve_state(db, cfg: dict, gate: dict | None, now: float) -> dict | None:
-    """Paid plan capacity sitting idle: worker slots are free, the plan is burning slower than
-    its pace allows, and nothing is ready or about to be. Ask the coordinator for more
+    """Paid plan capacity sitting idle: worker slots are free, the plan is below its line with room
+    for all of them (green), and nothing is ready or about to be. Ask the coordinator for more
     independent work well before the idle wake would. Usage-billed work costs money whether or
     not it runs, so only plans qualify. A turn that adds no task doubles the wait for the next
     one, up to the idle wake; a new task resets it. Returns None when this wake does not apply,
     else the wait after the last turn and the newest task id, stored as kv `starve` on firing."""
     c = cfg["coordinator"]
     if gate is None or gate["regime"] != "windows" or gate["level"] != "green" or not gate["allow_new_work"]:
-        return None
-    numbers = gate.get("numbers") or {}
-    if (numbers.get("paced") or {}).get("until", 0) > now:
-        return None    # a pace hold is the plan working as intended, not idle capacity
-    if any(r.get("need_per_h") is None or (r.get("burn_per_h") is not None and r["burn_per_h"] >= r["need_per_h"])
-           for r in numbers.get("pace") or []):
         return None
     running = db.one("SELECT COUNT(*) n FROM runs WHERE provider=? AND status='running' AND role!='coordinator'",
                      (gate["provider"],))["n"]

@@ -48,7 +48,7 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
   in that same turn. Plugins run code in every worker, so this always needs the user's yes.
 - Check open tasks before adding one. NEVER add a duplicate.
 - Work runs in parallel. The budget line shows busy and free worker slots. On a plan, unused
-  capacity is lost at each reset: when slots are free and the plan is under pace, add independent
+  capacity is lost at each reset: when slots are free and the plan is below its line, add independent
   tasks. Split big goals into pieces that can run side by side (code, analysis, reviews,
   measurements) instead of one long chain.
 - A task that touches a shared resource (a device, a reserved machine) lists it in `resources`. The

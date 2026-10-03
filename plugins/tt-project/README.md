@@ -65,17 +65,15 @@ and preferences you add later become part of the project's charter and memory.
 
 ## Budget
 
-- Subscription plans: a plan's capacity is lost at each reset, so the project uses it. It reads
-  the account's live window usage, measures how fast the account is burning it, and paces itself
-  to land each window near 90% by its reset: more parallel workers while there is room, fewer when
-  the pace would overshoot. It never goes past 90%; the rest stays yours.
-- Over pace, deep tasks run at the standard tier. When even one worker is too many, new starts are
-  spaced out: if the pace allows a fraction `f` of a worker, the next start waits the last run's
-  length x (1/f - 1) after it ended, at most `budget.max_pace_hold_s` (default 2 hours); a wait,
-  once set, only ever moves earlier. Burn is measured over up to 12 hours, and a window stays over
-  pace until its burn falls below 85% of the pace, so whole-percent readings do not flip it. Your own
-  tasks and reviews of finished work start anyway, running work is never stopped, and the wait
-  wakes no coordinator. `ttp status` and the web app show `paced: next start ~HH:MM (...)`.
+- Subscription plans: a plan's capacity is lost at each reset, so the project uses it. Below the
+  line (90%, `100 - budget.reserve_pct`) it runs all its parallel workers; it does not spread use
+  evenly over a window. Running work keeps using the plan after it starts, so near the line it
+  estimates what each worker will still add (the account's measured burn per worker, times how
+  long a run usually lasts here) and runs only as many workers as fit under the line: fewer in the
+  last stretch, and no new start once the running ones alone would reach it. At the line nothing
+  new starts until the window resets; the rest stays yours. Running work is never stopped.
+- In that last stretch deep tasks run at the standard tier. `ttp status` and the web app say when
+  the line holds new starts back.
 - Usage-billed accounts: $100 per 24 hours and $200 per 7 days per project by default. A new run
   starts only if its budget fits in what is left of both caps. A plan account whose successful
   runs stop reporting plan windows falls under these caps too (failed or silent runs do not count).
@@ -99,9 +97,9 @@ and preferences you add later become part of the project's charter and memory.
 
 ## Parallel work
 
-- Up to 6 workers per project run side by side (`budget.max_parallel_workers`); on a plan, the
-  pacing sets the actual number. When a plan is under pace, slots sit idle and nothing is queued,
-  the coordinator is asked for more work, less often each time it finds none.
+- Up to 6 workers per project run side by side (`budget.max_parallel_workers`); on a plan, all of
+  them until the last stretch before the line. When a plan is below its line, slots sit idle and
+  nothing is queued, the coordinator is asked for more work, less often each time it finds none.
 - A shared device or machine is taken per command, through its own queue (for example a device
   broker) or `ttp lock <resource> -- <command>`, so the rest of each task runs in parallel. A task
   marked exclusive holds the resource's lock for its whole run; while it waits for a slot, new

@@ -83,14 +83,11 @@ def since(ts: float, now: float | None = None) -> str:
 def gate_detail(g: dict, now: float | None = None) -> str:
     n = g.get("numbers") or {}
     if g.get("regime") == "windows":
-        wins = n.get("pace") or [n]
+        wins = n.get("plan") or [n]
         parts = []
         for w in wins:
             s = f"{w.get('window')} {w.get('utilization')}%"
-            if w.get("projected") is not None:
-                s += f", on pace for {w['projected']:.0f}%" + (f" by the {at(w['resets_at'], now)} reset"
-                                                                if w.get("resets_at") else "")
-            elif w.get("resets_at"):
+            if w.get("resets_at"):
                 s += f", resets {at(w['resets_at'], now)}"
             parts.append(s)
         # Plan-billed dollars are bounded by the windows, so the dollar caps do not apply to them.
@@ -99,17 +96,6 @@ def gate_detail(g: dict, now: float | None = None) -> str:
     est = f" (~${n['estimated_24h']:.2f} estimated)" if n.get("estimated_24h") else ""
     return (f"${n.get('spent_24h', 0):.2f} of ${n.get('daily_cap', 0):.0f} per 24h{est}, "
             f"${n.get('spent_7d', 0):.2f} of ${n.get('weekly_cap', 0):.0f} per 7d")
-
-
-def paced_line(g: dict, now: float) -> str:
-    """'paced: next start ~14:20 (seven_day on pace for 250%)' while a pace hold spaces out new
-    starts (budget._pace), else ''."""
-    hold = (g.get("numbers") or {}).get("paced") or {}
-    if float(hold.get("until") or 0) <= now:
-        return ""
-    over = f"{hold.get('window')} on pace for {hold['projected']:.0f}%" if hold.get("projected") is not None \
-        else f"{hold.get('window')} over pace"
-    return f"paced: next start ~{at(hold['until'], now)} ({over})"
 
 
 def offline_help(name: str) -> str:
@@ -260,10 +246,9 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
             stops.append(("budget is red: " if prov == core else f"budget for {prov} is red: ")
                          + "; ".join(pg.get("reasons") or []))
     g = gates.get(core) or {}
-    paced = paced_line(g, now)
-    if paced:
-        stops.append(paced)
-    settle = float(db.kv("settle_until", 0) or 0)
+    if g.get("regime") == "windows" and g.get("level") == "orange" and (g.get("numbers") or {}).get("starts") is False:
+        stops.append("no new starts near the plan line: " + "; ".join(g.get("reasons") or []))
+    settle =float(db.kv("settle_until", 0) or 0)
     if settle > now and alive:
         stops.append(f"the host just woke from sleep; new work starts at {at(settle, now)} if it stays awake")
     disk = db.kv("disk_low")
