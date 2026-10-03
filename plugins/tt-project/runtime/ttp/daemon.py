@@ -1974,7 +1974,7 @@ class Daemon:
     def probe_deferred(self, now: float) -> None:
         """A task added with `start_when` stays queued, undispatched, until its probe exits 0; the
         probe runs here like a waiting task's, once any `start_after` has passed. Exit 1 means not
-        yet. A broken probe (another exit, a timeout, a probe that cannot start) is raised to the
+        yet, and so does 255 (ssh could not reach the host: a reboot or a network blip). A broken probe (another exit, a timeout, a probe that cannot start) is raised to the
         coordinator once, never as a worker run, and keeps being tried. So is a deferral still not
         met after `coordinator.defer_max_days`."""
         db = self.p.db
@@ -2000,11 +2000,11 @@ class Daemon:
             self.p.db.update_task(task["id"], labels=without_deferral(json.loads(task["labels"] or "[]")),
                                   not_before=None)
             log(self.p, f"task {task['id']} start_when passed; ready to start")
-        elif rc != 1:
+        elif rc not in (1, 255):
             why = rc if isinstance(rc, str) else f"exit {rc}"
             self._deferral_event(task, d.get("since") or task["created"], "deferral_probe_broken",
-                                 f"its start_when probe is broken ({why}; only 0 = start and 1 = not yet are "
-                                 f"valid): {d.get('when', '')[:300]}")
+                                 f"its start_when probe is broken ({why}; only 0 = start and 1 or 255 = not "
+                                 f"yet are valid): {d.get('when', '')[:300]}")
 
     def _deferral_event(self, task: dict, since: float, kind: str, what: str) -> None:
         """Once per deferral: the coordinator decides again (fix the probe with task_update

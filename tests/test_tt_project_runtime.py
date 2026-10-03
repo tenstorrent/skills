@@ -10382,6 +10382,20 @@ def test_a_broken_start_when_raises_one_event_and_never_a_worker_run(env, monkey
     assert not p.db.q("SELECT id FROM runs WHERE task=?", (tid,))
 
 
+
+def test_a_start_when_probe_exiting_255_means_not_yet(env, monkeypatch):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    coord.apply(p, [{"type": "task_add", "title": "remote", "spec": "s", "start_when": "exit 255"}])
+    tid = _added(p, "remote")
+    d = dmod.Daemon(p.base)
+    for _ in range(2):
+        _settle_deferred(d, tid)
+    assert not _events(p, tid, "deferral_probe_broken"), "an unreachable host is not a broken probe"
+    assert not _ready(p, tid) and p.db.task(tid)["status"] == "queued"
+
 def test_a_start_when_probe_that_cannot_start_raises_an_event(env, monkeypatch):
     p = make(env)
     from ttp import coordinator as coord
