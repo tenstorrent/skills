@@ -22,7 +22,7 @@ from . import upstream
 from .daemon import HEARTBEAT_STALE_S, KV_LOCAL_ONLY, LOGGED_OUT_NOTE, WATCHDOG_S, heartbeat, idle_wake
 from .alerts import cleared  # noqa: F401  (readers import it from here)
 from .db import DB, SEVERITY_RANK, chat_floor, dump_result, host_line, load_result
-from .project import Project
+from .project import Project, durable_write
 from .providers import get_provider
 from .runner import stop_runs
 from .service import down_note, installed
@@ -34,11 +34,14 @@ TYPES = {".html": "text/html; charset=utf-8", ".js": "application/javascript", "
 
 def token(p: Project) -> str:
     f = p.state / "web.token"
-    if not f.exists():
-        f.parent.mkdir(parents=True, exist_ok=True)
-        f.write_text(secrets.token_hex(16))
-        f.chmod(0o600)
-    return f.read_text().strip()
+    try:
+        have = f.read_text().strip()
+    except OSError:
+        have = ""
+    if not have:   # missing, or emptied by a cut write: an empty token must never let anyone in
+        have = secrets.token_hex(16)
+        durable_write(f, have, mode=0o600)
+    return have
 
 
 def free_port(start: int = 18700) -> int:

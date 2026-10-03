@@ -10542,7 +10542,6 @@ DURABLE_EXEMPT = {
     ("shared.py", '.guard", "a")'): "a flock guard file, never written",
     ("hook.py", "OFFSET_FILE).write_text"): "a lost offset re-delivers messages, never drops one",
     ("watchdog.py", "mark.write_text"): "names a process, which a reboot ends",
-    ("web.py", "f.write_text(secrets.token_hex"): "a new token is made when it is missing",
     ("codex.py", "tmp.write_text(text)"): "a cache, rewritten whenever its content differs",
     ("codex.py", "os.replace(tmp, path)"): "a cache, rewritten whenever its content differs",
     ("fake.py", '"result.json").write_text'): "the test provider",
@@ -10633,6 +10632,30 @@ def test_boot_check_restores_an_empty_memory_file_and_a_truncated_index(env):
     d.check_integrity()
     assert p.db.kv(KV_INTEGRITY)["at"] == at
     assert not alerts.holds(p.db, "integrity", at, time.time())
+
+
+def test_boot_check_keeps_hand_edits_and_what_it_replaces(env):
+    p = make(env)
+    from ttp import integrity, web
+    p.add_memory("A fact.")
+    # The user dropped the charter's last section by hand and did not commit: not a cut write.
+    head = p.charter_path.read_text()
+    edited = head[:head.rstrip("\n").rfind("\n") + 1]
+    assert edited.endswith("\n") and len(edited) < len(head)
+    p.charter_path.write_text(edited)
+    res = integrity.check_harness(p)
+    assert p.charter_path.read_text() == edited and not res["restored"], res
+    # A cut mid-line is put back, and the cut copy is kept aside.
+    p.charter_path.write_text(head[:len(head) - 3])
+    res = integrity.check_harness(p)
+    assert p.charter_path.read_text() == head and res["restored"], res
+    kept = list((p.state / "damaged").glob("CHARTER.md.*"))
+    assert len(kept) == 1 and kept[0].read_text() == head[:len(head) - 3]
+    # An emptied web token is never an empty password.
+    (p.state / "web.token").write_text("")
+    tok = web.token(p)
+    assert len(tok) == 32 and (p.state / "web.token").read_text() == tok
+    assert stat.S_IMODE((p.state / "web.token").stat().st_mode) == 0o600
 
 
 def test_boot_check_alerts_once_on_what_it_cannot_repair_and_clears(env, monkeypatch):

@@ -55,7 +55,8 @@ def _entry_ok(text: str | None) -> bool:
 
 
 def _cut_short(data: bytes, head: bytes | None) -> bool:
-    return bool(head) and len(data) < len(head) and head.startswith(data)
+    # Cut mid-line: a hand edit that drops the last section ends on a newline and is kept.
+    return bool(head) and len(data) < len(head) and head.startswith(data) and not data.endswith(b"\n")
 
 
 def _read(path: Path) -> bytes:
@@ -84,6 +85,9 @@ def check_harness(p: Project) -> dict:
     restored: list[Path] = []
 
     def put_back(path: Path, data: bytes, why: str) -> None:
+        old = _read(path)
+        if old.strip(b"\0 \n"):   # what is replaced is kept for a human, never lost
+            durable_write(p.state / "damaged" / f"{path.name}.{time.strftime('%Y%m%dT%H%M%S')}", old)
         durable_write(path, data)
         restored.append(path)
         out["restored"].append(f"{path.relative_to(p.harness)} ({why})")
