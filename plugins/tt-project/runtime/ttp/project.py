@@ -308,15 +308,39 @@ class Project:
         crowd the prompt."""
         return "\n".join(e["line"] for e in self.memory_select(limit_chars)[0])
 
+    @staticmethod
+    def _resolve_memory_name(name: str, folder: Path) -> str | None:
+        """Exact name, else the one entry starting with `name`, else the one sharing its leading
+        kind-and-number part ('fact-93' of a retyped 'fact-93-<wrong date>-...'). Several: reject."""
+        if not name:
+            return None
+        names = sorted(x.stem for x in folder.glob("*.md")) if folder.is_dir() else []
+        if name in names:
+            return name
+        tiers = [[n for n in names if n.startswith(name)]]
+        m = re.match(r"[a-z]+-\d+", name)
+        if m:
+            tiers.append([n for n in names if n == m.group(0) or n.startswith(m.group(0) + "-")])
+        for found in tiers:
+            if len(found) == 1:
+                return found[0]
+            if len(found) > 1:
+                raise ValueError(f"memory entry {name!r} is ambiguous; use one of: "
+                                 + ", ".join(f"[{n}]" for n in found))
+        return None
+
     def forget_memory(self, name: str) -> Path:
         """Retire an entry: its file moves to memory/archive/ and its line leaves MEMORY.md, so no
         prompt carries it again. Forgetting an entry already archived (a replayed turn) is a no-op."""
         name = Path(name.strip().strip("[]")).stem
-        src, dst = self.memory_dir / f"{name}.md", self.memory_dir / "archive" / f"{name}.md"
-        if not src.exists():
-            if dst.exists():
-                return dst
+        live = self._resolve_memory_name(name, self.memory_dir)
+        if live is None:   # nothing live: a replayed turn whose entry is already archived is a no-op
+            done = self._resolve_memory_name(name, self.memory_dir / "archive")
+            if done is not None:
+                return self.memory_dir / "archive" / f"{done}.md"
             raise ValueError(f"no memory entry {name!r}; use the name in [brackets] from MEMORY")
+        name = live
+        src, dst = self.memory_dir / f"{name}.md", self.memory_dir / "archive" / f"{name}.md"
         dst.parent.mkdir(parents=True, exist_ok=True)
         os.replace(src, dst)
         if self.memory_index.exists():

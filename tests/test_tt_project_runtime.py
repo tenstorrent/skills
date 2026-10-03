@@ -9993,3 +9993,24 @@ def test_a_cleared_logout_drops_the_held_note_on_tasks_dispatch_skips(env, monke
     d.dispatch()
     assert started == ["small"]
     assert not p.db.one("SELECT id FROM tasks WHERE blocked_reason LIKE 'held: logged out%'")
+
+
+def test_memory_forget_resolves_exact_prefix_and_kind_number_names(env):
+    p = make(env)
+    for stem in ["fact-93-2026-10-01-box-a-is-ours", "fact-94-2026-10-01-box-b-is-ours",
+                 "fact-940-2026-10-01-box-c", "decision-7-2026-10-01-use-plan-x"]:
+        (p.memory_dir / f"{stem}.md").write_text("x\n")
+    (p.memory_dir / "archive").mkdir(exist_ok=True)
+    (p.memory_dir / "archive" / "fact-95-2026-09-01-old.md").write_text("x\n")
+    arch = p.memory_dir / "archive"
+    assert p.forget_memory("[fact-940-2026-10-01-box-c]") == arch / "fact-940-2026-10-01-box-c.md"   # exact
+    assert p.forget_memory("decision-7-2026") == arch / "decision-7-2026-10-01-use-plan-x.md"        # prefix
+    assert p.forget_memory("fact-93-2026-10-02-box-a") == arch / "fact-93-2026-10-01-box-a-is-ours.md"  # bad date
+    (p.memory_dir / "fact-94-2026-10-02-other.md").write_text("x\n")
+    with pytest.raises(ValueError, match="ambiguous.*fact-94-2026-10-01-box-b-is-ours.*fact-94-2026-10-02-other"):
+        p.forget_memory("fact-94-2026-10-03-wrong")
+    with pytest.raises(ValueError, match="no memory entry"):
+        p.forget_memory("fact-99-nothing")
+    assert (p.memory_dir / "fact-94-2026-10-01-box-b-is-ours.md").exists()
+    assert p.forget_memory("fact-95") == arch / "fact-95-2026-09-01-old.md"   # archived: untouched no-op
+    assert (arch / "fact-95-2026-09-01-old.md").read_text() == "x\n"
