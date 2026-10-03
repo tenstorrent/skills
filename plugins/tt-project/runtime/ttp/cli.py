@@ -72,10 +72,11 @@ def forward_listen(entry: dict, argv: list[str], name: str | None = None) -> int
     reconnect. The listener left on the far side exits on its own once its session is gone, and
     the new one replaces it if it has not yet. Each (re)connect first sends what is queued here.
     """
-    delay, told = 5.0, False
+    delay, told, held = 5.0, False, False
     while True:
-        failed = flush_outbox(name, entry) if name else None
-        if failed is not None:
+        failed = flush_outbox(name, entry, quiet=held) if name else None
+        held = held or failed is not None
+        if failed is not None and failed.returncode == 255:
             if not told:
                 _unreachable(entry, failed.stderr)
             rc = 255
@@ -125,10 +126,11 @@ def _send_say(entry: dict, argv: list[str], client_id: str, capture: bool = Fals
     return r
 
 
-def flush_outbox(name: str, entry: dict) -> subprocess.CompletedProcess | None:
+def flush_outbox(name: str, entry: dict, quiet: bool = False) -> subprocess.CompletedProcess | None:
     """Send what is queued on this machine for `name`, oldest first, each removed only once the
-    project confirmed it. Returns the failed ssh attempt while the project is still unreachable
-    (that message and the ones behind it stay queued), else None."""
+    project confirmed it. Returns the failed attempt (that message and the ones behind it stay
+    queued), else None. Only a 255 means the project is unreachable; any other failure is that
+    message's own problem and must not stop the caller's command."""
     if not outbox.entries(name):
         return None
     failed, sent = None, 0
@@ -146,7 +148,7 @@ def flush_outbox(name: str, entry: dict) -> subprocess.CompletedProcess | None:
                       f"{outbox.folder() / (name + '.rejected.jsonl')}", file=sys.stderr)
                 continue
             failed = r
-            if r.returncode != 255:
+            if r.returncode != 255 and not quiet:
                 print(f"ttp: queued messages for {name} stay queued ({why})", file=sys.stderr)
             break
     if sent:
@@ -220,7 +222,7 @@ def need(name: str, argv: list[str]) -> Project:
         if argv and argv[0] == "listen":
             sys.exit(forward_listen(entry, argv, name))
         failed = flush_outbox(name, entry)
-        if failed is None:
+        if failed is None or failed.returncode != 255:   # a message stuck for its own reason: run the command anyway
             rc = forward(entry, argv)
         else:
             _unreachable(entry, failed.stderr)

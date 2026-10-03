@@ -2405,11 +2405,67 @@ def test_remote_listener_sends_the_outbox_on_every_reconnect(env, monkeypatch):
     failed = subprocess.CompletedProcess([], 255, "", "ssh: unreachable")
     flushes = iter([failed, None])
     calls = []
-    monkeypatch.setattr(cli, "flush_outbox", lambda name, entry: calls.append(("flush", name)) or next(flushes))
+    monkeypatch.setattr(cli, "flush_outbox", lambda name, entry, quiet=False: calls.append(("flush", name)) or next(flushes))
     monkeypatch.setattr(cli, "forward", lambda entry, argv, quiet=False: calls.append(("listen", quiet)) or 0)
     monkeypatch.setattr(cli.time, "sleep", lambda s: None)
     assert cli.forward_listen({"host": "box", "dir": "/x"}, ["listen", "demo", "--chat", "c1"], "demo") == 0
     assert calls == [("flush", "demo"), ("flush", "demo"), ("listen", True)]
+
+
+def _stuck_outbox(cli, outbox, monkeypatch, rc):
+    """One queued message that keeps failing with `rc` on a host that is reachable."""
+    outbox.add("demo", ["say", "demo", "--", "x"], "id-1", None)
+    monkeypatch.setattr(cli, "_send_say", lambda entry, argv, cid, capture=False:
+                        subprocess.CompletedProcess(argv, rc, "", "bash: ttp: command not found"))
+
+
+@pytest.mark.parametrize("rc", [1, 127])
+def test_a_stuck_queued_message_does_not_block_forwarded_commands(env, monkeypatch, capsys, rc):
+    from ttp import cli, outbox
+    from ttp.project import register
+    register("demo", {"host": "far", "dir": "/x"})
+    monkeypatch.chdir(env["tmp"])
+    _stuck_outbox(cli, outbox, monkeypatch, rc)
+    ran = []
+    monkeypatch.setattr(cli, "forward", lambda entry, argv, quiet=False: ran.append(argv) or 0)
+    with pytest.raises(SystemExit) as e:
+        cli.need("demo", ["status", "demo"])
+    assert e.value.code == 0 and ran == [["status", "demo"]]
+    out, err = capsys.readouterr()
+    assert "cannot reach" not in err and err.count("stay queued") == 1, err
+    assert "1 message(s) queued here for demo" in out
+    assert [q["id"] for q in outbox.entries("demo")] == ["id-1"]
+
+
+def test_a_stuck_queued_message_does_not_keep_the_listener_away(env, monkeypatch, capsys):
+    from ttp import cli, outbox
+    _stuck_outbox(cli, outbox, monkeypatch, 127)
+    results, naps = iter([255, 0]), []
+    monkeypatch.setattr(cli, "forward", lambda entry, argv, quiet=False: next(results))
+    def nap(s):
+        naps.append(s)
+        assert len(naps) < 3, "the listener backs off on the stuck message instead of connecting"
+    monkeypatch.setattr(cli.time, "sleep", nap)
+    assert cli.forward_listen({"host": "far", "dir": "/x"}, ["listen", "demo", "--chat", "c1"], "demo") == 0
+    assert naps == [5.0], "it connected, dropped once and reconnected; it did not back off on the stuck message"
+    err = capsys.readouterr().err
+    assert "cannot reach" not in err and err.count("stay queued") == 1, err
+    assert [q["id"] for q in outbox.entries("demo")] == ["id-1"]
+
+
+def test_say_to_an_older_remote_runtime_resends_without_the_client_id(env, monkeypatch):
+    from ttp import cli
+    sent = []
+
+    def ssh(entry, argv, capture=False):
+        sent.append(argv)
+        if any(a.startswith("--client-id") for a in argv):
+            return subprocess.CompletedProcess(argv, 2, "", "ttp: error: unrecognized arguments: --client-id=c-1")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+    monkeypatch.setattr(cli, "_ssh", ssh)
+    r = cli._send_say({"host": "far", "dir": "/x"}, ["say", "demo", "--", "hi"], "c-1", capture=True)
+    assert r.returncode == 0
+    assert sent == [["say", "--client-id=c-1", "demo", "--", "hi"], ["say", "demo", "--", "hi"]]
 
 
 def _ask(p, text="Option A or B?", **fields):
