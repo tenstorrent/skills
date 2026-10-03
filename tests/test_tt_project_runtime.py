@@ -2000,7 +2000,7 @@ def test_task_add_continues_takes_over_the_dead_tasks_dependents(env):
     assert f"continues #{old}" in coord.digest(p, {}, [], [])
 
 
-@pytest.mark.parametrize("status", ["queued", "running", "done", "waiting"])
+@pytest.mark.parametrize("status", ["queued", "running", "waiting"])
 def test_task_add_continues_only_a_failed_cancelled_or_blocked_task(env, status):
     p = make(env)
     from ttp import coordinator as coord
@@ -2063,6 +2063,38 @@ def test_a_code_task_continues_from_the_dead_tasks_branch(env):
     assert _git_out(new_path, "rev-parse", "HEAD") == head
     text = prompts.worker_task(p, new, str(new_path), new_branch)
     assert f"#{old}" in text and branch in text and "ran out of budget at step 3" in text
+
+
+def test_task_add_continues_on_a_done_task_adds_a_follow_up_from_the_base(env):
+    p = make(env)
+    from ttp import coordinator as coord, worktree
+    old = p.db.add_task("old", "s", kind="code", tier="light", origin="user")
+    path, branch = worktree.ensure(p, p.db.task(old))
+    (path / "work.txt").write_text("delivered")
+    _git_out(path, "add", ".")
+    _git_out(path, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "done")
+    old_head = _git_out(path, "rev-parse", "HEAD")
+    p.db.update_task(old, status="done", branch=branch)
+    dep = p.db.add_task("dep", "s", origin="user", depends_on=[old])
+    problems = coord.apply(p, [{"type": "task_add", "title": "more", "kind": "code", "continues": old}])
+    assert problems == [f"task_add: #{old} is done; added as a follow-up of #{old}"]
+    new = p.db.one("SELECT * FROM tasks WHERE title='more'")
+    assert new["parent"] == old and f"continues:{old}" not in json.loads(new["labels"])
+    assert json.loads(p.db.task(dep)["depends_on"]) == [old], "a follow-up takes over no dependents"
+    assert p.db.task(old)["status"] == "done"
+    new_path, _ = worktree.ensure(p, new)
+    assert _git_out(new_path, "rev-parse", "HEAD") == _git_out(p.root, "rev-parse", worktree.resolve_base(p))
+    assert _git_out(new_path, "rev-parse", "HEAD") != old_head
+
+
+def test_schedule_set_takes_a_bare_integer_interval_as_seconds(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    for every in (900, "900"):
+        problems = coord.apply(p, [{"type": "schedule_set", "name": "probe", "kind": "command",
+                                    "command": "true", "every": every}])
+        assert problems == ["schedule_set 'probe': every 900 s"], problems
+        assert p.db.one("SELECT every_s FROM schedules WHERE name='probe'")["every_s"] == 900
 
 
 def test_a_block_on_a_dead_dependency_left_after_a_turn_is_raised_once(env):

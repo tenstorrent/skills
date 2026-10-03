@@ -26,9 +26,11 @@ _UNIT = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 7 * 86400}
 def parse_every(spec: str | int) -> int:
     if isinstance(spec, int):
         return spec
+    if str(spec).strip().isdigit():   # a bare number is seconds
+        return int(str(spec).strip())
     m = _EVERY.match(str(spec))
     if not m:
-        raise ValueError(f"bad interval {spec!r}; use e.g. 5m, 1h, 1d")
+        raise ValueError(f"bad interval {spec!r}; use e.g. 5m, 1h, 1d or seconds")
     return int(m.group(1)) * _UNIT[m.group(2)]
 
 

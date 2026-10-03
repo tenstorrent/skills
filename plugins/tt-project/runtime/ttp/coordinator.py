@@ -497,6 +497,12 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     raise ValueError(f"task_add rejected: depends on #{dead[0]} which is {dead[1]}; "
                                      f"drop or replace depends_on")
                 old = _continued(db, a["continues"], deps) if a.get("continues") is not None else None
+                followup = old if old and old["status"] == "done" else None
+                if followup:
+                    # Done work is not taken over: the new task is a follow-up that starts fresh
+                    # (a code task from the delivery branch tip, not the old branch).
+                    old = None
+                    problems.append(f"task_add: #{followup['id']} is done; added as a follow-up of #{followup['id']}")
                 if old:
                     labels.append(f"continues:{old['id']}")
                 after, when = _start_args(a, {})
@@ -506,7 +512,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                          priority=int(a.get("priority") or 3), provider=a.get("provider") or None,
                                          budget_usd=float(budget), depends_on=deps,
                                          reply_chat=a.get("reply_chat") or None, origin="coordinator",
-                                         labels=labels, not_before=after)
+                                         labels=labels, not_before=after,
+                                         parent=followup["id"] if followup else None)
                     if old:
                         _take_over_dependents(db, old["id"], new_id)
                         if old["status"] == "blocked":   # superseded: never requeued into duplicate work
@@ -654,7 +661,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     payload = kept   # a built-in probe: only its timing and switch change
                 else:
                     raise ValueError(f"schedule_set {a.get('name')!r} rejected: `kind` must be llm or command")
-                sched.upsert(db, a["name"], kind, a.get("every") or (old["every_s"] if old else "1d"),
+                every_s = sched.parse_every(a.get("every") or (old["every_s"] if old else "1d"))
+                if str(a.get("every") or "").strip().isdigit():   # bare seconds: echo what was understood
+                    problems.append(f"schedule_set {a['name']!r}: every {every_s} s")
+                sched.upsert(db, a["name"], kind, every_s,
                              (a.get("at") or None) if "at" in a else (old["at"] if old else None), enabled,
                              a["budget_usd"] if "budget_usd" in a else (old["budget_usd_day"] if old else None),
                              (a.get("text") or "") if "text" in a else ((old["description"] or "") if old else ""),
@@ -733,9 +743,11 @@ def _continued(db, raw: Any, deps: list[int]) -> dict:
         raise ValueError("task_add continues must be a task id") from None
     if not old:
         raise ValueError(f"task_add continues: no task #{raw}")
+    if old["status"] == "done":
+        return old   # the caller adds it as a follow-up instead
     if old["status"] not in ("failed", "cancelled", "blocked"):
         raise ValueError(f"task_add continues rejected: #{old['id']} is {old['status']}; only a failed, "
-                         f"cancelled or blocked task can be continued")
+                         f"cancelled or blocked task can be continued (a done one gets a follow-up)")
     if old["id"] in deps:
         raise ValueError(f"task_add cannot depend on #{old['id']}, the task it continues")
     if any(db.dependency_cycle(t["id"], deps) for t in _open_dependents(db, old["id"])):
