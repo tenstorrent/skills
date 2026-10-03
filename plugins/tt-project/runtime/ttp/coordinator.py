@@ -14,19 +14,27 @@ import json
 import os
 import re
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from . import machines, push, shared, upstream
 from . import screen as scr
 from . import schedule as sched
-from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, dependency_ids, dump_result, host_line,
-                 load_result)
+from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
+                 dependency_ids, dump_result, host_line, load_result, without_deferral)
 from .project import COORDINATOR_MEMORY_CHARS, WORKER_MEMORY_CHARS, Project
 from .runner import stop_runs
 
 ACTION_TYPES = ("reply", "task_add", "task_update", "ask_user", "resolve", "notify", "memory_add", "memory_forget",
                 "charter_update", "schedule_set", "config_set", "resource_pause", "observation_mute", "noop")
+
+# A deferred task's `start_after`: `now`, a delay (`90m`, `3d`) or an ISO date or time (local
+# unless it names a zone). Plain character classes, so every provider's schema engine takes it.
+START_AFTER_RE = (r"^(now|[0-9]+ ?[smhdw]|[0-9]{4}-[0-9]{2}-[0-9]{2}([T ][0-9]{2}:[0-9]{2}(:[0-9]{2})?)?"
+                  r"(Z|[+-][0-9]{2}:?[0-9]{2})?)$")
+START_WHEN_CHARS = 1000
+MAX_DEFER_S = 365 * 86400
 
 # Why an ask cannot be decided by the coordinator itself. Anything else is a judgment call.
 BLOCKING_REASONS = ("access", "funds", "spend", "review", "merge", "irreversible", "restriction", "human")
@@ -49,7 +57,8 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "continues": {"type": "integer"}, "resource": {"type": "string"}, "paused": {"type": "boolean"},
             "reason": {"type": "string"}, "supersedes": {"type": "array", "items": {"type": "string"}},
             "source": {"type": "string"}, "match": {"type": "string"}, "hours": {"type": "number"},
-            "below": {"type": "string"}, "why": {"type": "string"}},
+            "below": {"type": "string"}, "why": {"type": "string"},
+            "start_after": {"type": "string", "pattern": START_AFTER_RE}, "start_when": {"type": "string"}},
             "required": ["type"]}},
         "summary": {"type": "string"},
     },
@@ -252,7 +261,8 @@ def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int]) ->
         note = clip(t["blocked_reason"] or load_result(t["result"]).get("summary"), NOTE_CHARS)
         cont = continues_id(t)
         title = f"{t['title']} (continues #{cont})" if cont else t["title"]
-        lines.append(f"- #{t['id']} | {t['status']} | {t['tier']} | p{t['priority']} | "
+        starts = starts_text(t, now) if t["status"] == "queued" else ""
+        lines.append(f"- #{t['id']} | {t['status']}{f' ({starts})' if starts else ''} | {t['tier']} | p{t['priority']} | "
                      f"{(now - t['created']) / 3600:.1f}h | {title} | {note}")
     if not rows:
         lines.append("- (none)")
@@ -370,6 +380,61 @@ def next_task_slot(db, cap: int, now: float | None = None, review: bool = False)
     return made[len(made) - cap] + 86400
 
 
+def parse_start_after(raw: Any, now: float | None = None) -> float | None:
+    """`start_after` as epoch seconds, or None for `now` and times already past. A delay counts
+    from now; an ISO time without a zone is local."""
+    now = time.time() if now is None else now
+    s = str(raw).strip()
+    if not isinstance(raw, str) or not re.fullmatch(START_AFTER_RE, s):
+        raise ValueError(f"start_after {raw!r}: use a delay such as 90m, 6h or 3d, an ISO date or time "
+                         f"such as 2026-10-05T09:00, or now")
+    if s == "now":
+        return None
+    m = re.fullmatch(r"([0-9]+) ?([smhdw])", s)
+    if m:
+        at = now + int(m[1]) * sched._UNIT[m[2]]
+    else:
+        iso = re.sub(r"([+-][0-9]{2})([0-9]{2})$", r"\1:\2", s.replace(" ", "T", 1).replace("Z", "+00:00"))
+        try:
+            at = datetime.fromisoformat(iso).timestamp()
+        except ValueError as e:
+            raise ValueError(f"start_after {raw!r}: {e}") from None
+    if at > now + MAX_DEFER_S:
+        raise ValueError(f"start_after {raw!r} is more than {MAX_DEFER_S // 86400} days away")
+    return at if at > now else None
+
+
+def _start_args(a: dict, cur: dict) -> tuple[float | None, str | None]:
+    """A task_add/task_update's deferral: (start_after, start_when), each kept from `cur` (the
+    task's current deferral) when the action leaves it out. `now` and an empty probe clear them."""
+    after = parse_start_after(a["start_after"]) if a.get("start_after") is not None else cur.get("after")
+    when = a.get("start_when")
+    if when is None:
+        when = cur.get("when")
+    elif not isinstance(when, str) or len(when) > START_WHEN_CHARS:
+        raise ValueError(f"start_when must be one shell command of at most {START_WHEN_CHARS} characters")
+    return after, (when.strip() or None) if when else None
+
+
+def defer_labels(after: float | None, when: str | None) -> list[str]:
+    """The labels a deferred task carries (see db.deferral); none when it may start now."""
+    if after is None and not when:
+        return []
+    return ([f"start_after:{after:.0f}"] if after else []) + ([f"start_when:{when}"] if when else []) \
+        + [f"deferred_since:{time.time():.0f}"]
+
+
+def starts_text(task: dict, now: float | None = None) -> str:
+    """'starts <time>' / 'starts when: <probe>' for a task that waits to start; '' otherwise."""
+    now = time.time() if now is None else now
+    d = deferral(task)
+    after = d.get("after") if (d.get("after") or 0) > now and (task.get("not_before") or 0) > now else None
+    if not after and not d.get("when"):
+        return ""
+    when = f"when: {clip(d['when'], 160)}" if d.get("when") else ""
+    return "starts " + (f"{_clock(after)}" + (f", then {when}" if when else "") if after else when)
+
+
 def _clock(ts: float) -> str:
     """A local time: today's as HH:MM, another day's with its date."""
     same_day = time.strftime("%Y-%m-%d", time.localtime(ts)) == time.strftime("%Y-%m-%d")
@@ -434,12 +499,14 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 old = _continued(db, a["continues"], deps) if a.get("continues") is not None else None
                 if old:
                     labels.append(f"continues:{old['id']}")
+                after, when = _start_args(a, {})
+                labels += defer_labels(after, when)
                 with db.tx():
                     new_id = db.add_task(title, a.get("spec") or "", kind=a.get("kind") or "work", tier=tier,
                                          priority=int(a.get("priority") or 3), provider=a.get("provider") or None,
                                          budget_usd=float(budget), depends_on=deps,
                                          reply_chat=a.get("reply_chat") or None, origin="coordinator",
-                                         labels=labels)
+                                         labels=labels, not_before=after)
                     if old:
                         _take_over_dependents(db, old["id"], new_id)
                         if old["status"] == "blocked":   # superseded: never requeued into duplicate work
@@ -478,12 +545,22 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                             if not (isinstance(lb, str) and lb.split(":", 1)[0] in ("resource", "exclusive"))]
                     upd["labels"] = keep + [f"{kind_label}:{r}"
                                             for r in _resource_names(a["resources"], t, problems)]
-                    if upd.get("status", task["status"]) == "queued" and task["not_before"]:
+                    if upd.get("status", task["status"]) == "queued" and task["not_before"] \
+                            and deferral(task).get("after") != task["not_before"]:
                         # What it waited on was the old resource: it may start on the new one now.
                         upd.update(not_before=None, blocked_reason=None)
                         prev = load_result(upd.get("result") or task["result"])
                         prev.pop("waiting_since", None)
                         upd["result"] = dump_result(prev)
+                if a.get("start_after") is not None or a.get("start_when") is not None:
+                    if task["status"] in ("running", *TERMINAL_TASK_STATES):
+                        raise ValueError(f"task #{task['id']} is {task['status']}: only a task that has not "
+                                         f"started can be deferred; add a new one with start_after/start_when")
+                    after, when = _start_args(a, deferral(task))
+                    labels = upd.get("labels")
+                    labels = json.loads(task["labels"] or "[]") if labels is None else labels
+                    upd["labels"] = without_deferral(labels) + defer_labels(after, when)
+                    upd["not_before"] = after
                 # The daemon blocks a queued task on a dead dependency at once, so accepting this
                 # would report a requeue that does not stick.
                 if upd.get("status", task["status"]) == "queued" and ("status" in upd or "depends_on" in upd):

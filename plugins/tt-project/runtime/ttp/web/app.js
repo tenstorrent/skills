@@ -31,14 +31,17 @@ function gateHtml(gates) {
       <span class="meta">${esc((g.reasons || []).join("; "))}</span></div>`; }).join("");
 }
 
+// A queued task deferred by the coordinator waits for its start time or start_when probe.
+const deferred = (t) => t.status === "queued" && !!t.starts;
+
 // A queued task with a future retry time is waiting on a busy resource, not idle in the queue.
-const waiting = (t) => t.status === "queued" && t.not_before && t.not_before > Date.now() / 1000;
+const waiting = (t) => t.status === "queued" && !deferred(t) && t.not_before && t.not_before > Date.now() / 1000;
 
 // A queued task on a logged-out provider is held until a run on it works again.
 const held = (t) => t.status === "queued" && (t.blocked_reason || "").startsWith("held: logged out");
 
 function taskRow(t) {
-  const label = waiting(t) ? "waiting" : held(t) ? "held: logged out" : t.status;
+  const label = deferred(t) ? t.starts : waiting(t) ? "waiting" : held(t) ? "held: logged out" : t.status;
   const noteLabel = t.status === "blocked" ? "Blocked" : waiting(t) ? "Waiting" : held(t) ? "Held" : "Note";
   return `<details class="row"><summary><span class="id">#${t.id}</span> <span class="st st-${t.status}">${label}</span>
     <span class="title">${esc(t.title)}</span> <span class="meta">${esc(t.tier)} · ${money(t.spent_usd)}${t.budget_usd ? " / " + money(t.budget_usd) : ""} · ${ago(t.updated)} ago${t.pr_url ? ` · <a href="${esc(t.pr_url)}" target="_blank" rel="noopener">PR</a>` : ""}</span></summary>
@@ -87,7 +90,7 @@ function board(st) {
       .concat(asks.map((m) => `ask #${m.id}, ${ago(m.ts)} ago: ${m.text}`))],
     ["review", "Ready for review", st.tasks.filter((t) => t.status === "review" || (t.pr_url && t.status === "done")).map((t) => `#${t.id} ${t.title}`)],
     ["work", "Working", st.tasks.filter((t) => t.status === "running").map((t) => `#${t.id} ${t.title}`)],
-    ["queued", "Queued", st.tasks.filter((t) => t.status === "queued").map((t) => `#${t.id} ${t.title}${waiting(t) ? ` (waiting, next try ${at(t.not_before)})` : ""}`)],
+    ["queued", "Queued", st.tasks.filter((t) => t.status === "queued").map((t) => `#${t.id} ${t.title}${deferred(t) ? ` (${t.starts})` : waiting(t) ? ` (waiting, next try ${at(t.not_before)})` : ""}`)],
   ];
   $("#board").innerHTML = cols.map(([cls, name, items]) => `<div class="col ${cls}"><h3>${name}<span class="n">${items.length}</span></h3>` +
     (items.slice(0, 6).map((x) => `<div class="item">${esc(x.slice(0, cls === "you" ? 320 : 160))}</div>`).join("") || `<div class="item muted">—</div>`) + `</div>`).join("");

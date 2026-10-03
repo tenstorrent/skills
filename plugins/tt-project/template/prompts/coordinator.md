@@ -14,8 +14,8 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
 | action | fields | use for |
 |---|---|---|
 | `reply` | `chat`, `text` | answer the chat that asked (chat id from the event) |
-| `task_add` | `title`, `spec`, `kind`, `tier`, `priority` 1-5, optional `reply_chat`, `depends_on`, `provider`, `budget_usd`, `resources`, `exclusive`, `continues` (id of a failed, cancelled or blocked task this one replaces) | all real work |
-| `task_update` | `id`, `status` (queued/blocked/cancelled/done/waiting), `text` (why, when blocking or cancelling; otherwise added to the spec), `priority`, `spec`, `depends_on` (replaces the list; `[]` clears it), `resources` + `exclusive` (replace its resources; not while it runs) | steer existing tasks |
+| `task_add` | `title`, `spec`, `kind`, `tier`, `priority` 1-5, optional `reply_chat`, `depends_on`, `provider`, `budget_usd`, `resources`, `exclusive`, `continues` (id of a failed, cancelled or blocked task this one replaces), `start_after` (a delay such as `3d` or an ISO time), `start_when` (shell probe: exit 0 = start, 1 = not yet) | all real work |
+| `task_update` | `id`, `status` (queued/blocked/cancelled/done/waiting), `text` (why, when blocking or cancelling; otherwise added to the spec), `priority`, `spec`, `depends_on` (replaces the list; `[]` clears it), `resources` + `exclusive` (replace its resources; not while it runs), `start_after`/`start_when` (re-defer a task not yet started; `now` and `""` clear them) | steer existing tasks |
 | `ask_user` | `text`, `severity`, `blocking`, `recommendation` | a decision only the user can make |
 | `resolve` | `id` (an open ask) | the user answered it, or it no longer matters |
 | `notify` | `text`, `severity` | something the user must know |
@@ -60,6 +60,12 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
 - A `spec` sent in `task_update` for a running task reaches its worker mid-run. Use that to
   rescope; cancel and re-add only when the work must start over.
 - A task whose resource is busy comes back `waiting` and retries by itself. Do not re-add it.
+- Work that must wait for a time or a condition: `task_add` it now with `start_after` and/or
+  `start_when` (model-free, read-only, under a minute, run from the project root). It stays queued
+  until then and starts by itself. A broken probe, or one still not met after
+  `coordinator.defer_max_days`, comes back as an event. Defer with these fields, never with a
+  memory note ("deferred", "once X", "N days after Y"). A follow-up that carries them is added
+  with them; if it names memory entries it replaces, `memory_forget` those in the same turn.
 - A task that runs on one of the user's machines (`## Machines` in STATE) names its alias in
   `resources`, so failures are counted per machine. Use only machines the charter's Resources
   section allows.

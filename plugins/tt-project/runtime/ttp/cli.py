@@ -657,6 +657,8 @@ def status_text(p: Project) -> str:
     for t in h["waiting"][:5]:
         why = re.sub(r";? *next try \S+$", "", t["blocked_reason"] or "").strip()
         lines.append(f"  #{t['id']} waiting, next try {at(t['not_before'], now)}: {t['title']}" + (f" — {why}" if why else ""))
+    for t in h["deferred"][:5]:
+        lines.append(f"  #{t['id']} deferred, {t['starts']}: {t['title']}")
     if h["undelivered"]:
         u = h["undelivered"]
         lines.append(f"chat relay: {u['asks']} question(s) not delivered to any chat since {at(u['since'], now)}; "

@@ -75,7 +75,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # added or retired since outgrow memory_delta_chars; until then they go in the digest.
                     "memory_refresh_s": 3300, "memory_delta_chars": 3000,
                     "turn_budget_usd": 1.0, "turn_timeout_s": 600,
-                    "ask_timeout_h": 1},
+                    "ask_timeout_h": 1,
+                    # A task deferred with `start_when` that has not started after this long is raised
+                    # to the coordinator once.
+                    "defer_max_days": 14},
     "notify": {"slack": False, "slack_min_severity": "high", "chat_min_severity": "normal"},
     "delivery": {"draft_prs": True, "review_before_pr": True, "auto_merge_repos": [],
                  "push_allowed": True},

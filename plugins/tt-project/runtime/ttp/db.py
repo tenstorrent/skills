@@ -237,12 +237,13 @@ class DB:
         return self.one("SELECT * FROM tasks WHERE id=?", (task_id,))
 
     def ready_tasks(self) -> list[dict]:
-        """Queued tasks whose dependencies are all finished, best priority first."""
+        """Queued tasks whose dependencies are all finished, best priority first. A task deferred
+        with `start_when` is not ready until its probe passes (see deferral)."""
         now = time.time()
         rows = self.q("SELECT * FROM tasks WHERE status='queued' AND (not_before IS NULL OR not_before<=?) "
                       "ORDER BY priority, id", (now,))
         done = {r["id"] for r in self.q("SELECT id FROM tasks WHERE status='done'")}
-        return [r for r in rows if all(d in done for d in dependency_ids(r))]
+        return [r for r in rows if all(d in done for d in dependency_ids(r)) and "when" not in deferral(r)]
 
     def dead_dependencies(self) -> list[tuple[dict, Any, str]]:
         """Queued tasks waiting on a dependency that can no longer finish: (task, dependency, why)."""
@@ -343,6 +344,34 @@ def continues_id(task: dict) -> int | None:
         if isinstance(lb, str) and lb.startswith("continues:") and lb[10:].isdigit():
             return int(lb[10:])
     return None
+
+
+DEFER_LABELS = ("start_after", "start_when", "deferred_since")
+
+
+def deferral(task: dict) -> dict:
+    """A deferred task's start condition, from its labels: `after` (epoch seconds, kept in
+    `not_before` too), `when` (a shell probe that must exit 0 first) and `since` (when it was
+    deferred). Empty when the task is not deferred."""
+    try:
+        labels = json.loads(task["labels"] or "[]")
+    except (ValueError, KeyError, TypeError):
+        return {}
+    out: dict = {}
+    for lb in labels if isinstance(labels, list) else []:
+        key, _, val = lb.partition(":") if isinstance(lb, str) else ("", "", "")
+        if key == "start_when" and val.strip():
+            out["when"] = val
+        elif key in ("start_after", "deferred_since"):
+            try:
+                out["after" if key == "start_after" else "since"] = float(val)
+            except ValueError:
+                pass
+    return out
+
+
+def without_deferral(labels: list) -> list:
+    return [lb for lb in labels if not (isinstance(lb, str) and lb.partition(":")[0] in DEFER_LABELS)]
 
 
 def _first_dead(deps: list, states: dict) -> tuple[Any, str] | None:

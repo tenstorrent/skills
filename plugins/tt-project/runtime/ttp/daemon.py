@@ -39,7 +39,8 @@ from . import upstream
 from . import screen as scr
 from . import shared
 from . import worktree
-from .db import OPEN_ASK_MAX_AGE_S, SEVERITY_RANK, TERMINAL_TASK_STATES, continues_id, dependency_ids, dump_result, load_result
+from .db import (OPEN_ASK_MAX_AGE_S, SEVERITY_RANK, TERMINAL_TASK_STATES, continues_id, deferral, dependency_ids,
+                 dump_result, load_result, without_deferral)
 from .project import Project, hostname, load_secrets
 from .providers import get_provider
 from .providers.base import last_json_object, scratch_dir, service_path
@@ -57,7 +58,7 @@ RESULT_FILE = "result.json"
 WAIT_KEYS = ("retry_when", "retry_after_s", "waiting_for", "wake_tier", "survives_reboot", "waits",
              "waiting_since")
 MAX_FOLLOWUPS, FOLLOWUP_SPEC_CHARS = 12, 4000   # per hand-off; each follow-up is its own event
-PROBE_EVERY_S = 180     # how often a waiting task's `retry_when` probe runs
+PROBE_EVERY_S = 180     # how often a waiting task's `retry_when` (or a deferred one's `start_when`) probe runs
 PROBE_TIMEOUT_S = 60
 AUTH_PROBE_S = 900      # while a provider is logged out, one run on it checks the login this often
 ORPHAN_GRACE_S = 10     # TERM to KILL for an agent whose supervisor died
@@ -1139,9 +1140,11 @@ class Daemon:
                   _cut(f"#{task['id']} {task['title']}:{notes}", coord.EVENT_CHARS_BY_KIND["task_notes"], where),
                   "handled" if quiet and len(fups) <= MAX_FOLLOWUPS else "queued", task["id"]))
         for f in fups[:MAX_FOLLOWUPS]:
+            # A deferred follow-up names when it may start; the coordinator adds it with those fields.
+            start = "; ".join(f"{k}: {str(f[k])[:300]}" for k in ("start_after", "start_when") if f.get(k))
             db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                  (time.time(), f"task:{task['id']}", "followup_proposed", "normal",
-                  f"proposed follow-up: {str(f['title'])[:200]} — "
+                  f"proposed follow-up: {str(f['title'])[:200]}{f' [{start}]' if start else ''} — "
                   f"{_cut(str(f.get('spec', '')), FOLLOWUP_SPEC_CHARS, where)}", "queued", task["id"]))
 
     # money ----------------------------------------------------------------------------------------
@@ -1907,6 +1910,10 @@ class Daemon:
             del self._probes[tid]
             if rc is None:
                 _kill_group(proc)
+            task = db.task(tid)
+            if task and task["status"] == "queued" and deferral(task).get("when"):
+                self._start_verdict(task, "timeout" if rc is None else rc, now)
+                continue
             self._probe_rc[tid] = ("timeout" if rc is None else rc, now)
             if rc == 0:
                 task = db.task(tid)
@@ -1915,7 +1922,8 @@ class Daemon:
         for t in db.q("SELECT * FROM tasks WHERE status='queued' AND not_before IS NOT NULL"):
             prev = load_result(t["result"])
             probe = prev.get("retry_when")
-            if prev.get("status") != "waiting" or not isinstance(probe, str) or not probe.strip():
+            if prev.get("status") != "waiting" or not isinstance(probe, str) or not probe.strip() \
+                    or deferral(t).get("when"):
                 continue
             if t["not_before"] <= now:
                 # Hand-offs from before the hold, and tasks already woken, keep their timer.
@@ -1926,6 +1934,56 @@ class Daemon:
             elif t["id"] in self._probes or now - self._probed.get(t["id"], 0) < PROBE_EVERY_S:
                 continue
             self._start_probe(t["id"], probe, now)
+        self.probe_deferred(now)
+
+    def probe_deferred(self, now: float) -> None:
+        """A task added with `start_when` stays queued, undispatched, until its probe exits 0; the
+        probe runs here like a waiting task's, once any `start_after` has passed. Exit 1 means not
+        yet. A broken probe (another exit, a timeout, a probe that cannot start) is raised to the
+        coordinator once, never as a worker run, and keeps being tried. So is a deferral still not
+        met after `coordinator.defer_max_days`."""
+        db = self.p.db
+        max_days = float(self.cfg["coordinator"].get("defer_max_days") or 14)
+        for t in db.q("SELECT * FROM tasks WHERE status='queued' AND labels LIKE '%\"start_when:%'"):
+            d = deferral(t)
+            if not d.get("when") or (t["not_before"] or 0) > now:
+                continue
+            since = d.get("since") or t["created"]
+            if now - since >= max_days * 86400:
+                self._deferral_event(t, since, "deferral_expired",
+                                     f"its start_when has not passed in {max_days:g} days: {d['when'][:300]}")
+            if t["id"] in self._probes or now - self._probed.get(t["id"], 0) < PROBE_EVERY_S:
+                continue
+            self._start_probe(t["id"], d["when"], now, "start_when")
+            if t["id"] not in self._probes:
+                self._start_verdict(t, self._probe_rc.pop(t["id"])[0], now)
+
+    def _start_verdict(self, task: dict, rc, now: float) -> None:
+        d = deferral(task)
+        if rc == 0:
+            self._probe_rc.pop(task["id"], None)
+            self.p.db.update_task(task["id"], labels=without_deferral(json.loads(task["labels"] or "[]")),
+                                  not_before=None)
+            log(self.p, f"task {task['id']} start_when passed; ready to start")
+        elif rc != 1:
+            why = rc if isinstance(rc, str) else f"exit {rc}"
+            self._deferral_event(task, d.get("since") or task["created"], "deferral_probe_broken",
+                                 f"its start_when probe is broken ({why}; only 0 = start and 1 = not yet are "
+                                 f"valid): {d.get('when', '')[:300]}")
+
+    def _deferral_event(self, task: dict, since: float, kind: str, what: str) -> None:
+        """Once per deferral: the coordinator decides again (fix the probe with task_update
+        start_when, start it with start_when "", or cancel). The task stays deferred meanwhile."""
+        db = self.p.db
+        fp = f"{kind}:{task['id']}:{since:.0f}"
+        if db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+            return
+        db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
+             (time.time(), "daemon", kind, fp, "normal",
+              f"#{task['id']} {task['title']} waits to start, but {what}. The probe keeps running; decide: fix "
+              f"it with task_update start_when, start the task now with start_when \"\", or cancel it.",
+              "queued", task["id"]))
+        log(self.p, f"task {task['id']} {kind}; raised to the coordinator")
 
     def wake_after_reboot(self) -> None:
         """Once per daemon start: a waiting task that handed off before this host booted waits on
@@ -1973,14 +2031,14 @@ class Daemon:
                                    "AND started>?", (tid, f"%{key}%", since or 0))
                    if json.loads(x["note"] or "{}").get(key))
 
-    def _start_probe(self, tid: int, probe: str, now: float) -> None:
+    def _start_probe(self, tid: int, probe: str, now: float, what: str = "retry_when") -> None:
         self._probed[tid] = now
         try:
             proc = subprocess.Popen(probe, shell=True, cwd=str(self.p.root), stdin=subprocess.DEVNULL,
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                     start_new_session=True)
         except OSError as e:
-            log(self.p, f"task {tid} retry_when probe could not start: {e}")
+            log(self.p, f"task {tid} {what} probe could not start: {e}")
             self._probe_rc[tid] = ("could not start", now)
             return
         self._probes[tid] = (proc, now)

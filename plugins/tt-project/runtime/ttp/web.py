@@ -200,10 +200,16 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
             paused_providers.append({"provider": r["key"].split(":", 1)[1], "note": note, "until": v["until"],
                                      "fix": fix_for(r["key"].split(":", 1)[1], note)})
     paused_resources = [{"resource": k, **v} for k, v in sorted(db.paused_resources().items())]
-    waiting = db.q("SELECT id, title, not_before, blocked_reason FROM tasks WHERE status='queued' AND not_before>? "
-                   "ORDER BY not_before", (now,))
-    queued = db.q("SELECT id, depends_on FROM tasks WHERE status='queued' AND (not_before IS NULL OR not_before<=?)",
-                  (now,))
+    # A deferred task waits to start (start_after / start_when): a plan, not a problem or a retry.
+    deferred = [{"id": t["id"], "title": t["title"], "starts": coord.starts_text(t, now)}
+                for t in db.q("SELECT * FROM tasks WHERE status='queued' AND labels LIKE '%\"start_%' "
+                              "ORDER BY COALESCE(not_before, 0), id")]
+    deferred = [t for t in deferred if t["starts"]]
+    later = {t["id"] for t in deferred}
+    waiting = [t for t in db.q("SELECT id, title, not_before, blocked_reason FROM tasks WHERE status='queued' "
+                               "AND not_before>? ORDER BY not_before", (now,)) if t["id"] not in later]
+    queued = [t for t in db.q("SELECT id, depends_on FROM tasks WHERE status='queued' AND (not_before IS NULL OR "
+                              "not_before<=?)", (now,)) if t["id"] not in later]
     # A task on a paused resource is held, not ready: it is listed under its resource instead.
     from .coordinator import task_resources
     due = db.ready_tasks()
@@ -277,6 +283,8 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
                    f"on it succeeds")
     if waiting:
         why.append(f"{len(waiting)} task(s) waiting, next try {at(waiting[0]['not_before'], now)}")
+    if deferred:
+        why.append(f"{len(deferred)} task(s) deferred, first {deferred[0]['starts']}")
     retry = db.kv(coord.RETRY_WAKE_KEY) or {}
     if retry.get("at"):
         review = bool(retry.get("review"))
@@ -314,6 +322,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
                         "summary": (db.kv("last_coordinator_summary", {}) or {}).get("summary", ""),
                         "idle_wake": next_wake, "idle_held": wake["held"]},
         "providers_paused": paused_providers, "resources_paused": paused_resources, "waiting": waiting,
+        "deferred": deferred,
         "logged_out": [{k: t[k] for k in ("id", "title", "provider")} for t in logged_out],
         "asks": asks, "running": running, "working": working,
         "undelivered": undelivered,
@@ -361,12 +370,14 @@ def attention(db: DB, now: float) -> list[dict]:
 def state_payload(p: Project, db: DB) -> dict:
     now = time.time()
     tasks = db.q("SELECT id,title,kind,status,priority,tier,provider,budget_usd,spent_usd,attempts,origin,branch,"
-                 "pr_url,blocked_reason,not_before,created,updated,result FROM tasks WHERE status NOT IN ('done','failed',"
+                 "pr_url,blocked_reason,not_before,created,updated,result,labels FROM tasks WHERE status NOT IN ('done','failed',"
                  "'cancelled') OR updated>? ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'blocked' THEN 1 "
                  "WHEN 'review' THEN 2 WHEN 'queued' THEN 3 ELSE 4 END, priority, id DESC LIMIT 200",
                  (now - 7 * 86400,))
     for t in tasks:
         t["result"] = str(load_result(t["result"]).get("summary") or "")[:600]
+        t["starts"] = coord.starts_text(t, now) if t["status"] == "queued" else ""
+        del t["labels"]
     runs = db.q("SELECT id,task,role,provider,model,effort,status,started,ended,cost_usd FROM runs "
                 "ORDER BY id DESC LIMIT 40")
     return {

@@ -10182,3 +10182,236 @@ def test_memory_supersedes_never_retires_the_entry_it_adds(env):
     errors = coord.apply(p, act, turn=3)
     assert errors and "supersedes" in errors[0] and "no memory entry" in errors[0]
     assert (p.memory_dir / "fact-box-a-status-now.md").exists()
+
+
+# Deferred tasks: task_add start_after / start_when ---------------------------------------------
+
+def _labels(p, tid):
+    return json.loads(p.db.task(tid)["labels"])
+
+
+def _added(p, title):
+    return p.db.one("SELECT id FROM tasks WHERE title=?", (title,))["id"]
+
+
+def test_task_add_start_after_keeps_the_task_queued_until_then(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from datetime import datetime
+    later = datetime.fromtimestamp(time.time() + 2 * 86400).strftime("%Y-%m-%dT%H:%M")
+    assert coord.apply(p, [{"type": "task_add", "title": "in three days", "spec": "s", "start_after": "3d"},
+                           {"type": "task_add", "title": "on a date", "spec": "s", "start_after": later},
+                           {"type": "task_add", "title": "now", "spec": "s", "start_after": "now"}]) == []
+    three, dated, now_ = _added(p, "in three days"), _added(p, "on a date"), _added(p, "now")
+    assert abs(p.db.task(three)["not_before"] - (time.time() + 3 * 86400)) < 60
+    assert abs(p.db.task(dated)["not_before"] - datetime.fromisoformat(later).timestamp()) < 1
+    assert any(lb.startswith("start_after:") for lb in _labels(p, three))
+    ready = [t["id"] for t in p.db.ready_tasks()]
+    assert three not in ready and dated not in ready and now_ in ready
+    assert _labels(p, now_) == [] and p.db.task(now_)["not_before"] is None
+    p.db.update_task(three, not_before=time.time() - 1)
+    assert _ready(p, three), "a start_after alone needs no probe once its time has come"
+
+
+@pytest.mark.parametrize("action, why", [
+    ({"start_after": "tomorrow"}, "start_after 'tomorrow'"),
+    ({"start_after": "2026-13-40"}, "start_after '2026-13-40'"),
+    ({"start_after": "400d"}, "more than 365 days away"),
+    ({"start_after": 3}, "start_after 3"),
+    ({"start_when": 5}, "start_when must be"),
+    ({"start_when": "x" * 1001}, "start_when must be"),
+])
+def test_task_add_rejects_bad_start_values(env, action, why):
+    p = make(env)
+    from ttp import coordinator as coord
+    problems = coord.apply(p, [{"type": "task_add", "title": "deferred", "spec": "s", **action}])
+    assert len(problems) == 1 and why in problems[0], problems
+    assert not p.db.one("SELECT id FROM tasks WHERE title='deferred'")
+
+
+def test_actions_schema_validates_start_after_and_start_when():
+    jsonschema = pytest.importorskip("jsonschema")
+    sys.path.insert(0, str(RUNTIME))
+    try:
+        from ttp import coordinator as coord
+    finally:
+        sys.path.remove(str(RUNTIME))
+
+    def ok(**kw):
+        try:
+            jsonschema.validate({"actions": [{"type": "task_add", "title": "t", **kw}]}, coord.ACTIONS_SCHEMA)
+            return True
+        except jsonschema.ValidationError:
+            return False
+    for good in ("now", "90m", "3d", "2 w", "2026-10-05", "2026-10-05T09:00", "2026-10-05 09:00:30",
+                 "2026-10-05T09:00Z", "2026-10-05T09:00+02:00", "2026-10-05T09:00-0700"):
+        assert ok(start_after=good), good
+    for bad in ("tomorrow", "3 days", "-1d", "1.5h", "05/10/2026", "2026-10-05T9:00", 3, None):
+        assert not ok(start_after=bad), bad
+    assert ok(start_when="test -f out/done") and not ok(start_when=1) and not ok(start_when=["true"])
+
+
+def _settle_deferred(d, tid):
+    d.probe_waiting()
+    if tid in d._probes:
+        d._probes[tid][0].wait(10)
+        d.probe_waiting()
+
+
+def _events(p, tid, kind):
+    return p.db.q("SELECT * FROM events WHERE task=? AND kind=?", (tid, kind))
+
+
+def test_a_start_when_task_starts_only_once_its_probe_passes(env, monkeypatch):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    flag = env["tmp"] / "ready.flag"
+    assert coord.apply(p, [{"type": "task_add", "title": "after the run", "spec": "s",
+                            "start_when": f"test -f {flag}"}]) == []
+    tid = _added(p, "after the run")
+    d = dmod.Daemon(p.base)
+    for _ in range(2):
+        _settle_deferred(d, tid)
+        assert not _ready(p, tid) and p.db.task(tid)["status"] == "queued"
+    assert not p.db.q("SELECT id FROM events WHERE task=?", (tid,)), "not yet is not news"
+    assert not p.db.q("SELECT id FROM runs WHERE task=?", (tid,))
+    flag.write_text("")
+    _settle_deferred(d, tid)
+    assert _ready(p, tid)
+    assert not any(lb.split(":")[0] in ("start_when", "deferred_since") for lb in _labels(p, tid))
+    assert f"task {tid} start_when passed" in (p.logs / "daemon.log").read_text()
+
+
+def test_a_start_when_probe_waits_for_start_after(env, monkeypatch):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    coord.apply(p, [{"type": "task_add", "title": "later", "spec": "s", "start_after": "2h", "start_when": "true"}])
+    tid = _added(p, "later")
+    d = dmod.Daemon(p.base)
+    d.probe_waiting()
+    assert tid not in d._probes and not _ready(p, tid), "no probe before start_after"
+    p.db.update_task(tid, not_before=time.time() - 1)
+    _settle_deferred(d, tid)
+    assert _ready(p, tid)
+
+
+@pytest.mark.parametrize("probe, why", [("exit 3", "exit 3"), ("sleep 30", "timeout")])
+def test_a_broken_start_when_raises_one_event_and_never_a_worker_run(env, monkeypatch, probe, why):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    monkeypatch.setattr(dmod, "PROBE_TIMEOUT_S", 0.2)
+    coord.apply(p, [{"type": "task_add", "title": "deferred", "spec": "s", "start_when": probe}])
+    tid = _added(p, "deferred")
+    d = dmod.Daemon(p.base)
+    for _ in range(3):
+        d.probe_waiting()
+        if tid in d._probes:
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                d._probes[tid][0].wait(0.4)
+            d.probe_waiting()
+    ev = _events(p, tid, "deferral_probe_broken")
+    assert len(ev) == 1 and ev[0]["status"] == "queued" and f"broken ({why}" in ev[0]["text"], ev
+    assert not _ready(p, tid) and p.db.task(tid)["status"] == "queued"
+    assert not p.db.q("SELECT id FROM runs WHERE task=?", (tid,))
+
+
+def test_a_start_when_probe_that_cannot_start_raises_an_event(env, monkeypatch):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import daemon as dmod
+    coord.apply(p, [{"type": "task_add", "title": "deferred", "spec": "s", "start_when": "true"}])
+    tid = _added(p, "deferred")
+    d = dmod.Daemon(p.base)
+
+    def refuse(*a, **k):
+        raise OSError("no shell")
+    monkeypatch.setattr(dmod.subprocess, "Popen", refuse)
+    d.probe_waiting()
+    assert len(_events(p, tid, "deferral_probe_broken")) == 1 and not _ready(p, tid)
+
+
+def test_a_start_when_not_met_after_defer_max_days_raises_one_event(env, monkeypatch):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    coord.apply(p, [{"type": "task_add", "title": "deferred", "spec": "s", "start_when": "exit 1"}])
+    tid = _added(p, "deferred")
+    d = dmod.Daemon(p.base)
+    _settle_deferred(d, tid)
+    assert not _events(p, tid, "deferral_expired")
+    old = [lb for lb in _labels(p, tid) if not lb.startswith("deferred_since:")]
+    p.db.update_task(tid, labels=old + [f"deferred_since:{time.time() - 15 * 86400:.0f}"])
+    for _ in range(2):
+        _settle_deferred(d, tid)
+    ev = _events(p, tid, "deferral_expired")
+    assert len(ev) == 1 and "has not passed in 14 days" in ev[0]["text"], ev
+    assert not _ready(p, tid)
+    # Re-deferring is a new decision: its own clock.
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "start_when": "exit 1"}]) == []
+    _settle_deferred(d, tid)
+    assert len(_events(p, tid, "deferral_expired")) == 1
+
+
+def test_task_update_changes_or_clears_a_deferral(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    coord.apply(p, [{"type": "task_add", "title": "deferred", "spec": "s", "start_when": "exit 1",
+                     "resources": ["board"]}])
+    tid = _added(p, "deferred")
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "start_after": "1d"}]) == []
+    t = p.db.task(tid)
+    assert t["not_before"] > time.time() + 86000 and coord.starts_text(t).endswith(", then when: exit 1")
+    assert "resource:board" in _labels(p, tid)
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "start_after": "now", "start_when": ""}]) == []
+    assert _ready(p, tid) and _labels(p, tid) == ["resource:board"]
+    p.db.update_task(tid, status="running")
+    problems = coord.apply(p, [{"type": "task_update", "id": tid, "start_when": "true"}])
+    assert problems and "only a task that has not started" in problems[0]
+
+
+def test_deferred_tasks_show_in_rows_not_alerts(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.cli import status_text
+    from ttp.web import state_payload
+    coord.apply(p, [{"type": "task_add", "title": "probe later", "spec": "s", "start_when": "test -f out/done"},
+                    {"type": "task_add", "title": "next week", "spec": "s", "start_after": "7d"}])
+    st = state_payload(p, p.db)
+    rows = {t["title"]: t for t in st["tasks"]}
+    assert rows["probe later"]["starts"] == "starts when: test -f out/done"
+    assert rows["next week"]["starts"].startswith("starts ") and "labels" not in rows["next week"]
+    h = st["health"]
+    assert {t["title"] for t in h["deferred"]} == {"probe later", "next week"}
+    assert not h["waiting"], "a deferred task is not waiting on a busy resource"
+    assert "2 task(s) deferred" in h["why_idle"] and "wait on other tasks" not in h["why_idle"]
+    assert not any("probe later" in a.get("text", "") or "next week" in a.get("text", "") for a in st["attention"])
+    out = status_text(p)
+    assert "deferred, starts when: test -f out/done: probe later" in out and "waiting, next try" not in out
+    dg = coord.digest(p, {}, [], [])
+    assert "| queued (starts when: test -f out/done) |" in dg
+
+
+def test_prompts_defer_with_task_fields_not_memory():
+    root = RUNTIME.parent / "template" / "prompts"
+    coordinator = " ".join((root / "coordinator.md").read_text().split())
+    assert "start_after" in coordinator and "start_when" in coordinator
+    assert "never with a memory" in coordinator
+    review = (root / "daily-review.md").read_text()
+    assert "start_after" in review and "start_when" in review
+
+
+def test_a_deferred_follow_up_carries_its_start_fields_to_the_coordinator(env):
+    p = make(env)
+    fups = [{"title": "re-measure", "spec": "replaces memory [decision-x]", "start_after": "3d",
+             "start_when": "test -f out/ready"}, {"title": "plain", "spec": "s"}]
+    _, _, ids = _hand_off(env, p, {"status": "done", "summary": "reviewed", "followups": fups})
+    texts = [e["text"] for e in p.db.q("SELECT text FROM events WHERE kind='followup_proposed' ORDER BY id")]
+    assert texts[0].startswith("proposed follow-up: re-measure [start_after: 3d; start_when: test -f out/ready] — ")
+    assert texts[1].startswith("proposed follow-up: plain — ")
