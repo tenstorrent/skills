@@ -185,7 +185,7 @@ async function refresh() {
   $("#issuelist").innerHTML = st.issues.map((i) => `<div class="row"><span class="id">${esc(i.severity)}</span><span class="title">${esc(i.title)}</span><span class="meta">${esc(i.source)} · seen ${i.count}× · last ${ago(i.last_seen)} ago${i.task ? " · task #" + i.task : ""}</span></div>`).join("") || `<p class="muted">No open issues.</p>`;
   $("#schedlist").innerHTML = `<table><tr><th>Name</th><th>Kind</th><th>Every</th><th>Last run</th><th>7-day cost</th><th>Daily budget</th><th>On</th></tr>` +
     st.schedules.map((s) => `<tr><td><b>${esc(s.name)}</b><div class="meta">${esc(s.description)}</div></td><td>${esc(s.kind)}</td><td>${Math.round(s.every_s / 60)} min</td>
-      <td>${ago(s.last_run)} ago<div class="meta">${esc(s.last_status || "")}</div></td><td>${money(s.cost_7d)}</td>
+      <td>${ago(s.last_run)} ago<div class="meta">${esc((s.last_status || "").startsWith("skipped: budget ") ? "waiting for budget" : s.last_status || "")}</div></td><td>${money(s.cost_7d)}</td>
       <td><input type="number" min="0" step="0.5" value="${s.budget_usd_day ?? ""}" style="width:6em" onchange="setSched('${esc(s.name)}',{budget_usd_day:this.value})"></td>
       <td><input type="checkbox" ${s.enabled ? "checked" : ""} onchange="setSched('${esc(s.name)}',{enabled:this.checked})"></td></tr>`).join("") + `</table>`;
   $("#accounts").innerHTML = (st.accounts || []).map((a) => `<div class="row"><b>${esc(a.provider)}</b><span class="meta">${esc(a.account || "unknown")}</span><span class="meta">last used ${ago(a.last)} ago</span></div>`).join("") || `<p class="muted">No runs yet.</p>`;

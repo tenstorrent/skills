@@ -7,6 +7,8 @@
   governor says optional work must wait.
 
 A schedule that was missed while the machine slept runs once on wake, never once per missed slot.
+An llm schedule skipped because the budget gate holds optional work keeps its period open and
+retries every half hour (or its own period, if shorter) until the gate allows it.
 """
 from __future__ import annotations
 
@@ -59,8 +61,21 @@ def due(db: DB, now: float | None = None) -> list[dict]:
                 (now,))
 
 
+BUDGET_RETRY_S = 1800
+
+
+def budget_skipped(status: str | None) -> bool:
+    """The budget gate held this run back; it is owed, not done."""
+    return bool(status) and status.startswith("skipped: budget ")
+
+
 def mark_ran(db: DB, sched: dict, status: str, now: float | None = None) -> None:
     now = now or time.time()
+    if budget_skipped(status):
+        # Keep last_run so the period still counts as not run, and retry soon instead of a full period on.
+        db.x("UPDATE schedules SET last_status=?, next_run=? WHERE name=?",
+             (status, now + min(BUDGET_RETRY_S, sched["every_s"]), sched["name"]))
+        return
     db.x("UPDATE schedules SET last_run=?, last_status=?, next_run=? WHERE name=?",
          (now, status, next_run(sched["every_s"], sched["at"], now), sched["name"]))
 
@@ -80,6 +95,13 @@ def broken_line(db: DB) -> str:
     """The broken schedules in one line, or ""."""
     rows = broken(db)
     return ("schedules failing: " + "; ".join(f"{r['name']} ({r['last_status'][:80]})" for r in rows)) if rows else ""
+
+
+def waiting_line(db: DB) -> str:
+    """Enabled schedules held back by the budget gate, in one line, or ""."""
+    rows = [r["name"] for r in db.q("SELECT name, last_status FROM schedules WHERE enabled=1 ORDER BY name")
+            if budget_skipped(r["last_status"])]
+    return ("schedules waiting for budget: " + ", ".join(rows)) if rows else ""
 
 
 def spent_today(db: DB, name: str) -> float:

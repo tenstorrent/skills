@@ -2572,6 +2572,67 @@ def test_a_schedule_failing_twice_raises_one_alert_that_clears_on_an_ok_run(env)
     assert "schedules failing" not in status_text(p)
 
 
+def test_a_budget_skipped_llm_schedule_retries_when_the_gate_opens(env):
+    p = make(env)
+    from ttp import budget as bud
+    from ttp import schedule as sched
+    from ttp.cli import status_text
+    from ttp.daemon import Daemon
+    from ttp.web import health
+    sched.upsert(p.db, "summary", "llm", "1d", payload={"spec": "sum up"})
+    last = time.time() - 86400 - 60
+    p.db.x("UPDATE schedules SET last_run=?, next_run=? WHERE name='summary'", (last, time.time() - 1))
+    d = Daemon(p.base)
+    core = d.cfg.get("core_provider", "claude")
+    d.gates = {core: bud.Gate(provider=core, level="red", allow_optional=False)}
+    before = time.time()
+    d.run_schedules()
+    s = p.db.one("SELECT * FROM schedules WHERE name='summary'")
+    assert s["last_status"] == "skipped: budget red"
+    assert s["last_run"] == last   # the period still counts as not run
+    assert before + 1800 - 5 <= s["next_run"] <= time.time() + 1800
+    assert "schedules waiting for budget: summary" in status_text(p)
+    assert health(p, p.db)["schedules_waiting"] == "schedules waiting for budget: summary"
+    app = (pathlib.Path(sched.__file__).parent / "web" / "app.js").read_text()
+    assert 'startsWith("skipped: budget ") ? "waiting for budget"' in app
+    # A short schedule retries after its own period, not later.
+    sched.upsert(p.db, "fast", "llm", "10m", payload={"spec": "x"})
+    row = p.db.one("SELECT * FROM schedules WHERE name='fast'")
+    sched.mark_ran(p.db, row, "skipped: budget yellow", now=1000.0)
+    assert p.db.one("SELECT next_run FROM schedules WHERE name='fast'")["next_run"] == 1600.0
+    # Once the gate allows optional work, the next retry runs it, once, and the period moves on.
+    d.gates = {}
+    p.db.x("UPDATE schedules SET next_run=? WHERE name='summary'", (time.time() - 1,))
+    d.run_schedules()
+    s = p.db.one("SELECT * FROM schedules WHERE name='summary'")
+    assert s["last_status"] == "queued" and s["last_run"] > last
+    assert s["next_run"] >= s["last_run"] + 86400 - 1
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='schedule' AND labels=?",
+                    (json.dumps(["summary"]),))["n"] == 1
+    assert "waiting for budget: summary" not in status_text(p)
+
+
+def test_other_llm_schedule_skips_still_wait_a_full_period(env):
+    p = make(env)
+    from ttp import schedule as sched
+    from ttp.daemon import Daemon
+    sched.upsert(p.db, "summary", "llm", "1d", payload={"spec": "sum up"})
+    tid = p.db.add_task("[summary] open", "x", origin="schedule")
+    p.db.x("UPDATE tasks SET labels=? WHERE id=?", (json.dumps(["summary"]), tid))
+    p.db.x("UPDATE schedules SET next_run=? WHERE name='summary'", (time.time() - 1,))
+    d = Daemon(p.base)
+    d.gates = {}
+    d.run_schedules()
+    s = p.db.one("SELECT * FROM schedules WHERE name='summary'")
+    assert s["last_status"] == "skipped: previous run still open"
+    assert s["last_run"] and s["next_run"] >= s["last_run"] + 86400 - 1
+    row = p.db.one("SELECT * FROM schedules WHERE name='summary'")
+    sched.mark_ran(p.db, row, "skipped: nothing happened since the last run", now=1000.0)
+    s = p.db.one("SELECT * FROM schedules WHERE name='summary'")
+    assert s["last_run"] == 1000.0 and s["next_run"] == 1000.0 + 86400
+    assert sched.waiting_line(p.db) == ""
+
+
 def load_result_summary(task) -> str:
     return json.loads(task["result"] or "{}").get("summary", "")
 

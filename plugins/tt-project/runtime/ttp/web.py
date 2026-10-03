@@ -321,6 +321,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         "host": host_line(db.boots(now - DAY)),
         "release": release.line(p, db, cfg),
         "schedules_broken": sched.broken_line(db),
+        "schedules_waiting": sched.waiting_line(db),
         "local_only": local_only_line(db),
         "upstream": upstream.status_line(db, cfg),
     }
