@@ -13,6 +13,7 @@ import json
 import re
 import time
 from dataclasses import dataclass
+from typing import Any
 
 from .db import DB, SEVERITY_RANK
 
@@ -70,7 +71,17 @@ def screen(db: DB, cfg: dict, source: str, text: str, hint: str | None = None, j
 
     A known open issue wakes again when `repeat` is set (the watcher says each report is a new
     event), or when it was last seen more than `rewake_after_s` ago (it came back after a quiet
-    spell). Without either, a known open issue stays quiet."""
+    spell). Without either, a known open issue stays quiet. An observation an active mute covers
+    is recorded and counted but never wakes (see mute)."""
+    v = _screen(db, cfg, source, text, hint, jev, rewake_after_s, repeat)
+    m = count_muted(db, source, text, v.severity)
+    if m and v.wake:
+        v.wake, v.reason = False, f"muted ({v.reason})"
+    return v
+
+
+def _screen(db: DB, cfg: dict, source: str, text: str, hint: str | None, jev,
+            rewake_after_s: float | None, repeat: bool) -> Verdict:
     fp = fingerprint(source, text)
     now = time.time()
     floor = SEVERITY_RANK.get(cfg.get("screen", {}).get("wake_min_severity", "normal"), 1)
@@ -116,3 +127,110 @@ def screen(db: DB, cfg: dict, source: str, text: str, hint: str | None = None, j
                                                    "open" if severity != "info" else "ignored",
                                                    json.dumps({"by": verdict_src, "reason": reason})))
     return Verdict(SEVERITY_RANK.get(severity, 1) >= floor, severity, reason, fp, issue_id, verdict_src)
+
+
+# Mutes ----------------------------------------------------------------------------------------
+# A known, recurring condition the user was already told about and nothing of ours can fix: its
+# observations are still recorded and counted, but do not wake the coordinator until the mute
+# ends, when one summary event does.
+MUTES_KEY = "observation_mutes"   # kv: list of active mutes, oldest first
+MUTE_MIN_MATCH, MUTE_MAX_H, MUTE_MAX = 3, 72, 20
+MUTE_BELOW = ("normal", "high", "critical")
+
+
+def mute(db: DB, source: Any, match: Any, hours: Any, below: Any = None, why: Any = "",
+         now: float | None = None) -> dict:
+    """Mute observations from `source` whose text contains `match` (any case) and whose severity is
+    below `below` (default critical), for `hours`. Muting the same source and match again replaces
+    its end, threshold and reason and keeps its count. Raises ValueError on bad input."""
+    now = time.time() if now is None else now
+    source, match = str(source or "").strip(), str(match or "").strip()
+    if not source:
+        raise ValueError("observation_mute needs `source`, the observations' source as the digest shows it "
+                         "(e.g. watcher:<name>)")
+    if len(match) < MUTE_MIN_MATCH:
+        raise ValueError(f"observation_mute needs `match`, a piece of the observation's text of at least "
+                         f"{MUTE_MIN_MATCH} characters; got {match!r}")
+    try:
+        h = float(hours)
+    except (TypeError, ValueError):
+        h = float("nan")
+    if not 1 <= h <= MUTE_MAX_H:
+        raise ValueError(f"observation_mute needs `hours` from 1 to {MUTE_MAX_H}; got {hours!r}")
+    below = str(below or "critical").strip().lower()
+    if below not in MUTE_BELOW:
+        raise ValueError(f"observation_mute `below` must be one of {', '.join(MUTE_BELOW)}; got {below!r}")
+    with db.tx():
+        active = db.kv(MUTES_KEY, []) or []
+        old = next((m for m in active if _same_mute(m, source, match)), None)
+        if old is None and len(active) >= MUTE_MAX:
+            raise ValueError(f"observation_mute rejected: {MUTE_MAX} mutes are already active; let one end first")
+        m = {"source": source, "match": match, "below": below, "hours": h, "why": str(why or "").strip()[:300],
+             "since": old["since"] if old else now, "until": now + h * 3600,
+             "count": old["count"] if old else 0, "last_at": old["last_at"] if old else None}
+        db.set_kv(MUTES_KEY, [x for x in active if x is not old] + [m])
+    return m
+
+
+def _same_mute(m: dict, source: str, match: str) -> bool:
+    return m["source"].lower() == source.lower() and m["match"].lower() == match.lower()
+
+
+def mutes(db: DB, now: float | None = None) -> list[dict]:
+    """The mutes still in force."""
+    now = time.time() if now is None else now
+    return [m for m in db.kv(MUTES_KEY, []) or [] if float(m["until"]) > now]
+
+
+def count_muted(db: DB, source: str, text: str, severity: str, now: float | None = None) -> dict | None:
+    """The active mute covering this observation, after counting it there; None when none does."""
+    now = time.time() if now is None else now
+    rank, low = SEVERITY_RANK.get(severity, 1), text.lower()
+    if not db.kv(MUTES_KEY):
+        return None
+    with db.tx():
+        active = db.kv(MUTES_KEY, []) or []
+        for m in active:
+            if (float(m["until"]) > now and m["source"].lower() == source.lower() and m["match"].lower() in low
+                    and rank < SEVERITY_RANK[m["below"]]):
+                m["count"], m["last_at"] = int(m["count"]) + 1, now
+                db.set_kv(MUTES_KEY, active)
+                return m
+    return None
+
+
+def expire_mutes(db: DB, now: float | None = None) -> list[dict]:
+    """End the mutes whose time is up, queuing one summary observation event for each."""
+    now = time.time() if now is None else now
+    with db.tx():
+        active = db.kv(MUTES_KEY, []) or []
+        done = [m for m in active if float(m["until"]) <= now]
+        if not done:
+            return []
+        db.set_kv(MUTES_KEY, [m for m in active if float(m["until"]) > now])
+        for m in done:
+            n = int(m["count"])
+            seen = (f"{n} observation{'' if n == 1 else 's'}, last at {_when(m['last_at'])}" if n
+                    else "no observations")
+            db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                 (now, m["source"], "observation", "info",
+                  f"mute ended: muted {m['source']} {m['match']!r} below {m['below']} for {_hours(m)} h: "
+                  f"{seen}" + (f". Muted because: {m['why']}" if m.get("why") else ""), "queued"))
+    return done
+
+
+def mute_line(m: dict, now: float | None = None) -> str:
+    """One line for the digest and `ttp status`."""
+    now = time.time() if now is None else now
+    n = int(m["count"])
+    seen = f"{n} muted, last at {_when(m['last_at'])}" if n else "none muted yet"
+    return (f"{m['source']} {m['match']!r} below {m['below']}: {seen}; ends in "
+            f"{max(0.0, (float(m['until']) - now) / 3600):.1f} h" + (f" ({m['why']})" if m.get("why") else ""))
+
+
+def _hours(m: dict) -> str:
+    return f"{(float(m['until']) - float(m['since'])) / 3600:.1f}".rstrip("0").rstrip(".")
+
+
+def _when(ts: Any) -> str:
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(ts))) if ts else "-"

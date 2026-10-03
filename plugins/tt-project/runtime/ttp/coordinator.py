@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from . import machines, push, shared, upstream
+from . import screen as scr
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, dependency_ids, dump_result, host_line,
                  load_result)
@@ -25,7 +26,7 @@ from .project import COORDINATOR_MEMORY_CHARS, WORKER_MEMORY_CHARS, Project
 from .runner import stop_runs
 
 ACTION_TYPES = ("reply", "task_add", "task_update", "ask_user", "resolve", "notify", "memory_add", "memory_forget",
-                "charter_update", "schedule_set", "config_set", "resource_pause", "noop")
+                "charter_update", "schedule_set", "config_set", "resource_pause", "observation_mute", "noop")
 
 # Why an ask cannot be decided by the coordinator itself. Anything else is a judgment call.
 BLOCKING_REASONS = ("access", "funds", "spend", "review", "merge", "irreversible", "restriction", "human")
@@ -46,7 +47,9 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "blocking": {"type": "string", "enum": list(BLOCKING_REASONS)}, "recommendation": {"type": "string"},
             "resources": {"type": "array", "items": {"type": "string"}}, "exclusive": {"type": "boolean"},
             "continues": {"type": "integer"}, "resource": {"type": "string"}, "paused": {"type": "boolean"},
-            "reason": {"type": "string"}, "supersedes": {"type": "array", "items": {"type": "string"}}},
+            "reason": {"type": "string"}, "supersedes": {"type": "array", "items": {"type": "string"}},
+            "source": {"type": "string"}, "match": {"type": "string"}, "hours": {"type": "number"},
+            "below": {"type": "string"}, "why": {"type": "string"}},
             "required": ["type"]}},
         "summary": {"type": "string"},
     },
@@ -273,6 +276,11 @@ def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int]) ->
         lines.append(f"- {s['name']} ({s['kind']}, every {s['every_s'] // 60} min, "
                      f"{'on' if s['enabled'] else 'off'}, 7d cost ${s['cost_7d']}): {clip(s['description'], 100)}")
     # Open asks of any age: one still waits on the user however long ago it was sent.
+    muted = scr.mutes(db, now)
+    if muted:
+        lines.append("## Muted observations (recorded and counted, never wake you; one summary event when each ends)")
+    for m in muted:
+        lines.append(f"- {clip(scr.mute_line(m, now), 300)}")
     blockers = db.q("SELECT * FROM messages WHERE kind='ask' AND handled=0 ORDER BY id DESC LIMIT 10")
     if blockers:
         lines.append("## Open questions to the user (resolve each once answered)")
@@ -594,6 +602,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                      f"their go-ahead")
                 pause_resource(p, name, a["paused"], reason=a.get("reason") or a.get("text") or "",
                                by="coordinator", key=key)
+            elif t == "observation_mute":
+                scr.mute(db, a.get("source"), a.get("match"), a.get("hours"), a.get("below"),
+                         a.get("why") or a.get("reason") or a.get("text") or "")
             elif t in ("noop", None):
                 pass
             else:

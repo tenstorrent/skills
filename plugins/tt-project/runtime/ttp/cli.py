@@ -547,6 +547,9 @@ def status_text(p: Project) -> str:
         lines.append(h["schedules_broken"])
     if h.get("schedules_waiting"):
         lines.append(h["schedules_waiting"])
+    from . import screen as scr
+    for m in scr.mutes(db, now):
+        lines.append(f"muted: {scr.mute_line(m, now)}")
     if h.get("host"):
         lines.append(h["host"])
     if h.get("release"):

@@ -344,6 +344,7 @@ class Daemon:
         self._refresh_meters()
         self.update_gates()
         coord.expire_asks(self.p, hold=any(g.level == "red" for g in self.gates.values()))
+        scr.expire_mutes(self.p.db)
         settling = self.settling()
         for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.read_upstream, self.retry_rejected,
                      self.maybe_coordinate, self.probe_waiting, self.dispatch, self.deliver_outbound):

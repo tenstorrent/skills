@@ -469,6 +469,69 @@ def test_command_watcher_repeats_wake_the_coordinator(env, monkeypatch):
     assert wakes() == 3
 
 
+def test_observation_mute_counts_without_waking_and_ends_with_one_summary(env, monkeypatch):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import daemon as dm
+    from ttp import screen as scr
+    from ttp.cli import status_text
+    out = {"stdout": ""}
+    monkeypatch.setattr(dm.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, out["stdout"], ""))
+    d = dm.Daemon(p.base)
+
+    def wakes():
+        return [e["text"] for e in p.db.q("SELECT text FROM events WHERE kind='observation' ORDER BY id")]
+
+    def report(name, text, severity="high"):
+        out["stdout"] = json.dumps({"text": text, "severity": severity, "repeat": True})
+        d._run_command_watcher({"name": name}, {"command": "x"})
+
+    assert coord.apply(p, [{"type": "observation_mute", "source": "watcher:hw", "match": "Tray 1 DROPPED",
+                            "hours": 6, "why": "user told; hardware ticket open"}]) == []
+    report("hw", "box-a: tray 1 dropped, power-cycled")
+    report("hw", "box-a: tray 1 dropped, power-cycled")
+    assert wakes() == []
+    issue = p.db.one("SELECT count FROM issues WHERE source='watcher:hw'")
+    assert issue["count"] == 2   # still recorded
+    [m] = scr.mutes(p.db)
+    assert m["count"] == 2 and m["last_at"]
+    # At or above the threshold (critical by default), another source or other text: still wakes.
+    report("hw", "box-a: tray 1 dropped, data loss", severity="critical")
+    report("other", "box-a: tray 1 dropped, power-cycled")
+    report("hw", "box-a: tray 2 dropped")
+    assert len(wakes()) == 3 and scr.mutes(p.db)[0]["count"] == 2
+    # Shown one line each in the digest and in ttp status.
+    assert "## Muted observations" in coord.digest(p, {}, [], [])
+    assert "muted: watcher:hw 'Tray 1 DROPPED' below critical: 2 muted" in status_text(p)
+    # Expiry queues exactly one summary, however often it is checked.
+    p.db.set_kv(scr.MUTES_KEY, [{**m, "until": time.time() - 1}])
+    d.tick()
+    scr.expire_mutes(p.db)
+    ended = [t for t in wakes() if t.startswith("mute ended")]
+    assert len(ended) == 1 and "2 observations, last at" in ended[0] and "hardware ticket" in ended[0], ended
+    assert scr.mutes(p.db) == [] and p.db.kv(scr.MUTES_KEY) == []
+    report("hw", "box-a: tray 1 dropped, power-cycled")
+    assert len(wakes()) == 5
+
+
+def test_observation_mute_rejects_bad_input(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import screen as scr
+    ok = {"type": "observation_mute", "source": "watcher:hw", "match": "dropped", "hours": 4}
+    bad = coord.apply(p, [{**ok, "source": ""}, {**ok, "match": "ab"}, {**ok, "match": None},
+                          {**ok, "hours": 0}, {**ok, "hours": 73}, {**ok, "hours": "soon"},
+                          {k: v for k, v in ok.items() if k != "hours"}, {**ok, "below": "info"}])
+    assert len(bad) == 8, bad
+    assert "source" in bad[0] and "match" in bad[1] and "match" in bad[2], bad
+    assert all("hours" in b for b in bad[3:7]) and "below" in bad[7], bad
+    assert scr.mutes(p.db) == []
+    # Muting the same source and match again replaces it and keeps the count.
+    assert coord.apply(p, [ok, {**ok, "match": "DROPPED", "hours": 8, "below": "high"}]) == []
+    [m] = scr.mutes(p.db)
+    assert m["below"] == "high" and m["until"] > time.time() + 7 * 3600
+
+
 def test_missed_schedule_runs_once_on_wake(env):
     p = make(env)
     from ttp import schedule as sched

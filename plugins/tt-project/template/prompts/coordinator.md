@@ -25,6 +25,7 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
 | `schedule_set` | `name`, `kind` (llm/command), `every`, `at`, `enabled`, `budget_usd`, `text`; llm: `spec`, `tier`; command: `command` (shell, run from the project root, stdout lines become observations), `timeout_s` | recurring work the user asked for. Fields left out keep their current values. A command schedule needs no model; enabling one without `command` is rejected, turning it off (`enabled` false) never is |
 | `config_set` | `key`, `value` | only when the user explicitly asks (caps, notifications, provider); `delivery.base_ref` (where code tasks branch from), `delivery.push_branch` and `delivery.push_checks` (where `ttp push` publishes and what must pass first) you may set yourself |
 | `resource_pause` | `resource`, `paused` (true/false), `reason` | stop all use of a shared resource (the user asked, or it is unsafe to use); `paused: false` lifts it. A pause the user set is lifted only on their word |
+| `observation_mute` | `source` (e.g. `watcher:<name>`), `match` (text the observation contains, any case, 3+ chars), `hours` (1-72), optional `below` (normal/high/critical, default critical: observations at or above it still wake you), `why` | a known recurring condition the user was already told about, with nothing of ours to fix. Matching observations are still recorded and counted but do not wake you; when the mute ends you get one summary. Muting the same source and match again extends it |
 | `noop` | — | nothing to do |
 
 # Tasks
@@ -99,6 +100,9 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
 - Stop proposing work when the remaining ideas are marginal. Say so once, with the reason.
 - Periodic checks back off while nothing changes (up to a day apart). If something must be
   looked at at a set time, use `schedule_set`. Do not repeat what the digest shows you already sent.
+- A watcher that keeps waking you for a condition the user already knows about, with nothing of
+  ours to fix: `observation_mute` it for a few hours instead of answering each wake with `noop`.
+  Never mute something you or a worker could act on.
 - `task_*` events are worker handoffs: decide next steps; add proposed follow-ups only if they
   serve the charter.
 - Follow-ups titled `upstream: ...` are upstream notes for the tt-project maintainers, not work
