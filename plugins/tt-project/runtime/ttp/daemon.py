@@ -489,9 +489,13 @@ class Daemon:
             argv = _before_stdin(argv, resume_extra)
             (run_dir / "prompt.md").write_text(prompt)
             runtime_dir = str(Path(__file__).resolve().parent.parent)
-            env = {**env, "TTP_RUN_DIR": str(run_dir), "TTP_PROJECT": str(self.p.base), "TTP_RUN_ID": str(run_id),
-                   "TTP_TASK": str(task["id"]) if task else "", "PYTHONPATH": runtime_dir,
-                   "PATH": f"{self.p.harness / 'bin'}:{service_path()}:{os.environ.get('PATH', '')}"}
+            path = f"{service_path()}:{os.environ.get('PATH', '')}"
+            # The project's venv, so a fresh worktree need not build one; `ttp` stays first.
+            venv = worktree.project_venv(self.p, cwd) if role in ("worker", "reviewer") and not read_only else None
+            venv_vars = worktree.venv_env(venv, path) if venv else {}
+            env = {**env, **venv_vars, "TTP_RUN_DIR": str(run_dir), "TTP_PROJECT": str(self.p.base),
+                   "TTP_RUN_ID": str(run_id), "TTP_TASK": str(task["id"]) if task else "", "PYTHONPATH": runtime_dir,
+                   "PATH": f"{self.p.harness / 'bin'}:{venv_vars.get('PATH', path)}"}
             env.update(git_fsync_env({**os.environ, **env}))   # a power cut must not corrupt workers' commits
             tout = timeout_s or self.cfg["budget"]["run_timeout_s"].get(tier, 3600)
             stall = self.cfg["budget"].get("stall_s", {}).get(tier) if role != "coordinator" else None

@@ -96,6 +96,37 @@ def ensure(p: Project, task: dict) -> tuple[Path, str]:
     return path, branch
 
 
+VENV_NAMES = (".venv", "venv")
+
+
+def _is_venv(path: Path) -> bool:
+    """A usable Python virtual environment: pyvenv.cfg and an interpreter that exists (a venv
+    whose base Python was removed has a dangling bin/python)."""
+    return (path / "pyvenv.cfg").is_file() and any((path / b).exists() for b in ("bin/python", "Scripts/python.exe"))
+
+
+def project_venv(p: Project, cwd: str | Path | None = None) -> Path | None:
+    """The project's venv for a run in `cwd` to use (see `worktree.venv` in the config), or None:
+    none is set up, it is turned off, or `cwd` has another venv of its own (VENV_NAMES)."""
+    want = (p.config().get("worktree") or {}).get("venv", "auto")
+    if not want or not isinstance(want, str):
+        return None
+    if want == "auto":
+        cands = [p.root / n for n in VENV_NAMES]
+    else:
+        q = Path(want).expanduser()
+        cands = [q if q.is_absolute() else p.root / q]
+    found = next((c.resolve() for c in cands if _is_venv(c)), None)
+    own = [v.resolve() for n in VENV_NAMES for v in [Path(cwd or ".") / n] if cwd and _is_venv(v)]
+    return None if own and found not in own else found
+
+
+def venv_env(venv: Path, path: str) -> dict[str, str]:
+    """Environment that activates `venv` in front of `path` (PATH), as its activate script does."""
+    bindir = venv / ("Scripts" if (venv / "Scripts/python.exe").exists() else "bin")
+    return {"VIRTUAL_ENV": str(venv), "PATH": f"{bindir}{os.pathsep}{path}"}
+
+
 def continued_head(p: Project, task: dict) -> str | None:
     """The head of the branch of the code task this one continues, so its commits carry over.
     A branch of its own lets the old worktree stay checked out until it is pruned."""

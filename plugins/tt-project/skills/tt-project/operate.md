@@ -67,6 +67,10 @@
   and while an unfinished task still needs it (it depends on or continues the task, or its spec names
   the task's branch, id or `worktrees/tN` path). `disk.worktree_retention_days` waits longer; 0 never tidies.
   `ttp prune <name>` sweeps now.
+- Workers and reviewers run with the project's Python venv active (`VIRTUAL_ENV`, `PATH`; their
+  prompt names it), so a fresh worktree does not rebuild one. `worktree.venv`: `auto` (default) finds
+  `.venv` or `venv` in the project root, a path names another, `""` turns it off. A worktree with a
+  venv of its own keeps it; with no venv, runs start as before.
 - Work only on this machine: when a code task hands off done, and hourly for code tasks done in the
   last 14 days, the daemon fetches (30 s timeout) and checks whether the task branch's work is on a
   remote: a remote-tracking branch contains its head, or its changes are already on the delivery

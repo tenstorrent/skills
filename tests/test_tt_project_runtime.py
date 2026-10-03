@@ -1372,6 +1372,55 @@ def test_claude_workers_get_a_lean_context_but_keep_plugin_skills(env):
     assert "Workflow" not in turn and "skillOverrides" not in " ".join(turn)
 
 
+def _fake_venv(path, python=True):
+    (path / "bin").mkdir(parents=True)
+    (path / "pyvenv.cfg").write_text("home = /usr/bin\n")
+    if python:
+        (path / "bin" / "python").write_text("")
+    return path
+
+
+def test_workers_in_a_fresh_worktree_reuse_the_project_venv(env):
+    p = make(env)
+    from ttp import worktree
+    from ttp.daemon import Daemon
+    from ttp.prompts import worker_task
+    d = Daemon(p.base)
+    tid = p.db.add_task("build it", "s", kind="code", tier="light", origin="user")
+    cwd, _ = d._workdir_for(p.db.task(tid))
+
+    def run(role="worker", where=cwd):
+        rid = d.start_run(role, "go", "claude", "light", where, task=p.db.task(tid), read_only=role == "coordinator")
+        (p.runs / str(rid) / "STOP").touch()
+        return json.loads((p.runs / str(rid) / "run.json").read_text())["env"]
+
+    # No venv anywhere: the run starts as before and the prompt says nothing.
+    assert "VIRTUAL_ENV" not in run() and "python venv" not in worker_task(p, p.db.task(tid), cwd, None)
+    venv = _fake_venv(p.root / ".venv")
+    e = run()
+    assert e["VIRTUAL_ENV"] == str(venv.resolve())
+    assert e["PATH"].split(":")[:2] == [str(p.harness / "bin"), str(venv.resolve() / "bin")], "ttp must stay first"
+    assert run("reviewer", str(p.root))["VIRTUAL_ENV"] == str(venv.resolve())
+    assert f"python venv: {venv.resolve()}" in worker_task(p, p.db.task(tid), cwd, None)
+    assert "VIRTUAL_ENV" not in run("coordinator", str(p.base))
+    # A worktree with a venv of its own keeps it.
+    own = _fake_venv(pathlib.Path(cwd) / "venv")
+    assert "VIRTUAL_ENV" not in run() and "python venv" not in worker_task(p, p.db.task(tid), cwd, None)
+    import shutil
+    shutil.rmtree(own)
+    # A venv whose interpreter is gone is skipped; a configured path wins; "" turns it off.
+    (venv / "bin" / "python").unlink()
+    assert worktree.project_venv(p, cwd) is None
+    other = _fake_venv(p.root / "envs" / "py")
+    p.set_config("worktree.venv", "envs/py")
+    d.cfg = p.config()
+    assert run()["VIRTUAL_ENV"] == str(other.resolve())
+    p.set_config("worktree.venv", str(other))
+    assert worktree.project_venv(p, cwd) == other.resolve()
+    p.set_config("worktree.venv", "")
+    assert "VIRTUAL_ENV" not in run()
+
+
 def test_claude_runs_cannot_start_background_tasks_that_die_at_exit(env):
     from ttp.providers import get_provider
     _, worker_env = get_provider("claude").build(role="worker", model="opus", effort="low", cwd=".",

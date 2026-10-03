@@ -12,6 +12,7 @@ from pathlib import Path
 from .db import continues_id, load_result
 from .hook import unread_update
 from .project import WORKER_MEMORY_CHARS, Project
+from .worktree import project_venv
 
 
 def _read(p: Project, name: str) -> str:
@@ -172,6 +173,10 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
                     + (", and starts from that branch's head" if on and kind == "code" else "")
                     + (f". Its last summary: {was}" if was else "") + "\n")
     delivery = cfg.get("delivery", {})
+    venv = project_venv(p, cwd)
+    venv_line = (f"python venv: {venv} (the project's, already active: VIRTUAL_ENV and PATH; shared with other "
+                 "workers, so do not install into it; need other packages? make a venv of your own in the "
+                 "working directory)\n") if venv else ""
     parts = [
         _read(p, f"kind-{kind}.md"),
         f"# YOUR TASK #{task['id']}: {task['title']}\n"
@@ -181,7 +186,8 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
         f"working directory: {cwd}" + (f" · branch: {branch}" if branch else "") + "\n"
         + _resource_line(task)
         + f"project root: {p.root}\n"
-        f"delivery policy: draft PRs={delivery.get('draft_prs', True)}, review before PR="
+        + venv_line
+        + f"delivery policy: draft PRs={delivery.get('draft_prs', True)}, review before PR="
         f"{delivery.get('review_before_pr', True)}, auto-merge repos={delivery.get('auto_merge_repos') or 'none'}, "
         f"push allowed={delivery.get('push_allowed', True)}\n"
         f"{history}\n## Spec\n{task['spec'] or task['title']}\n",

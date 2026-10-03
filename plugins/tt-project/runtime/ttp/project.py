@@ -95,6 +95,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # HEAD on a branch and no submodules set up, at least an hour after the task ended, or
     # worktree_retention_days after it (0 = never tidy). Branches are never deleted.
     "disk": {"min_free_pct": 5, "min_free_gb": 150, "worktree_retention_days": None, "cache_dirs": None},
+    # Workers and reviewers run with the project's Python venv active (VIRTUAL_ENV, PATH), so a
+    # fresh task worktree does not rebuild one. "auto" finds .venv or venv in the project root; a
+    # path (absolute, or relative to the project root) names one; "" turns it off. A working
+    # directory with a venv of its own keeps that one.
+    "worktree": {"venv": "auto"},
     # A command watcher's known open issue wakes the coordinator again once it was last seen more
     # than rewake_after_h ago (null = never), or every time its observation says "repeat": true.
     "screen": {"wake_min_severity": "normal", "rewake_after_h": 6},
