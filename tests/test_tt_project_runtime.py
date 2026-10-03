@@ -7245,6 +7245,28 @@ def test_a_broken_probe_wakes_the_task_at_its_timer(env, probe, why):
     assert f"Woken because: {why}." in worker_task(p, p.db.task(tid), str(p.root), None)
 
 
+def test_an_unreachable_host_probe_keeps_the_task_asleep_until_the_hold_cap(env):
+    p = make(env)
+    from ttp import daemon as dmod
+    from ttp.prompts import worker_task
+    d = dmod.Daemon(p.base)
+    tid = _due_waiting_task(p, "exit 255")
+    _settle_probe(d, tid)
+    p.db.update_task(tid, not_before=time.time() - 1)
+    d.probe_waiting()          # due with a fresh 255: extended like "not yet", no worker run
+    task = p.db.task(tid)
+    assert not _ready(p, tid) and task["not_before"] > time.time() + 800
+    assert "probe says host unreachable" in task["blocked_reason"]
+    assert "woke" not in json.loads(task["result"])
+    assert f"task {tid} retry_when probe still failing (host unreachable)" in (p.logs / "daemon.log").read_text()
+    p.db.update_task(tid, result=json.dumps({**json.loads(task["result"]),
+                                             "waiting_since": time.time() - 6 * 3600 - 1}),
+                     not_before=time.time() - 1)
+    _settle_probe(d, tid)
+    assert _ready(p, tid)
+    assert "Woken because: held 6 h, probe still failing." in worker_task(p, p.db.task(tid), str(p.root), None)
+
+
 def test_a_timed_out_probe_is_broken(env, monkeypatch):
     p = make(env)
     from ttp import daemon as dmod
@@ -7321,6 +7343,16 @@ def test_worker_prompt_asks_for_a_probe_that_exits_0_whatever_the_outcome():
     flat = " ".join(prompt.split())
     assert "exit 0 once the wait is over whatever the outcome" in flat
     assert "1 while it is not" in flat and "driver script" in flat
+
+
+def test_worker_prompt_says_how_to_wait_on_a_job_on_another_machine():
+    prompt = (RUNTIME.parent / "template" / "prompts" / "worker.md").read_text()
+    flat = " ".join(prompt.split())
+    assert "or 255, ssh not reaching the host" in flat
+    assert "For a job on another machine, start its driver there" in flat
+    assert "ssh <host> 'setsid nohup <driver> > <log> 2>&1 &'" in flat
+    assert "keep the marker there" in flat and "ssh <host> test -e <marker>" in flat
+    assert 'set `"survives_reboot": true`' in flat
 
 
 def _lost_to_reboot(p, d, tmp_path, tid, name="lost", notes=()):

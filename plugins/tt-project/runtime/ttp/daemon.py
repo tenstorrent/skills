@@ -1895,7 +1895,8 @@ class Daemon:
         """A waiting task may name a shell probe (`retry_when`) for the thing it waits on. The probe
         runs here, model-free and in the background. Exit 0 makes the task due at once. When its
         `retry_after_s` timer runs out while the probe still exits 1 ("not yet"), the task sleeps
-        another `retry_after_s` instead of spending a worker run to find that out. A broken probe
+        another `retry_after_s` instead of spending a worker run to find that out. Exit 255 (ssh could
+        not reach the host a remote marker lives on) counts as "not yet" too. A broken probe
         (any other exit, a timeout, a probe that cannot start) wakes it at its timer so a worker can
         fix the probe, and `waiting.max_hold_s` after the hand-off it wakes whatever the probe says."""
         db, now = self.p.db, time.time()
@@ -1994,18 +1995,21 @@ class Daemon:
         fresh = at >= since and now - at <= 2 * PROBE_EVERY_S
         if fresh and rc == 0:
             self._wake_waiting(task, "probe passed", now)
-        elif fresh and rc != 1:
+        elif fresh and rc not in (1, 255):
             self._wake_waiting(task, f"probe broken: {rc if isinstance(rc, str) else f'exit {rc}'}", now)
         elif now >= since + max_hold:
             self._wake_waiting(task, f"held {max_hold / 3600:g} h, probe still failing", now)
         elif fresh:
+            # 255 is ssh failing to reach the host: a reboot or a network blip, so "not yet".
             nb = min(now + _retry_s(prev), since + max_hold)
             what = str(prev.get("waiting_for") or prev.get("summary") or "")[:300]
+            says = "host unreachable" if rc == 255 else "not yet"
             db = self.p.db
             db.update_task(tid, not_before=nb, blocked_reason=(
-                f"waiting for {what}; its probe says not yet; next try "
+                f"waiting for {what}; its probe says {says}; next try "
                 f"{time.strftime('%H:%M', time.localtime(nb))}")[:500])
-            log(self.p, f"task {tid} retry_when probe still failing; asleep until "
+            log(self.p, f"task {tid} retry_when probe still failing"
+                        f"{' (host unreachable)' if rc == 255 else ''}; asleep until "
                         f"{time.strftime('%H:%M', time.localtime(nb))}")
         else:
             # No recent verdict (the daemon restarted): ask the probe before waking a worker.
