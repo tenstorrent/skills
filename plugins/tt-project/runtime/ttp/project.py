@@ -9,6 +9,7 @@ import os
 import re
 import socket
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -220,7 +221,7 @@ class Project:
 
     def _git_commit(self, rel: list[str], message: str, gone: list[str] = ()) -> bool:
         ident = ["-c", "user.name=tt-project", "-c", "user.email=tt-project@localhost"]
-        git = ["git", "-C", str(self.harness)]
+        git = ["git", "-C", str(self.harness), *git_fsync_args()]
         try:
             if gone:
                 gone = subprocess.run([*git, "ls-files", "--", *gone], capture_output=True, text=True,
@@ -259,11 +260,10 @@ class Project:
             while path.exists() or (self.memory_dir / "archive" / path.name).exists():
                 path = self.memory_dir / f"{kind}-{slug}-{n}.md"
                 n += 1
-            path.write_text(f"---\nkind: {kind}\ncreated: {_stamp(time.time())}\n{tag}---\n{text}\n")
+            durable_write(path, f"---\nkind: {kind}\ncreated: {_stamp(time.time())}\n{tag}---\n{text}\n")
         index = self.memory_index.read_text() if self.memory_index.exists() else ""
         if f"](memory/{path.name})" not in index:
-            with open(self.memory_index, "a") as f:
-                f.write(f"- [{title}](memory/{path.name}) ({kind})\n")
+            durable_append(self.memory_index, f"- [{title}](memory/{path.name}) ({kind})\n")
         self.commit_harness([path, self.memory_index], f"memory ({kind}): {title}")
         return path
 
@@ -344,9 +344,11 @@ class Project:
             return dst
         dst.parent.mkdir(parents=True, exist_ok=True)
         os.replace(src, dst)
+        fsync_dir(dst.parent)
+        fsync_dir(src.parent)
         if self.memory_index.exists():
             lines = self.memory_index.read_text().splitlines(keepends=True)
-            self.memory_index.write_text("".join(x for x in lines if f"](memory/{name}.md)" not in x))
+            durable_write(self.memory_index, "".join(x for x in lines if f"](memory/{name}.md)" not in x))
         self.commit_harness([dst, self.memory_index], f"memory retired: {name}", removed=[src])
         return dst
 
@@ -356,11 +358,116 @@ def _stamp(ts: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ts)) + f".{int(ts % 1 * 1e6):06d}Z"
 
 
-def write_json(path: Path, data: Any) -> None:
+def fsync_dir(path: Path) -> None:
+    """Make a rename or a new file in this directory survive a power cut. Some file systems
+    cannot open or sync a directory; they get what the OS gives."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def durable_write(path: Path, text: str | bytes, mode: int | None = None) -> None:
+    """Replace `path` with `text` so a power cut leaves the old content or the new, never an empty
+    or half-written file: a temporary file in the same directory is written and synced, renamed over
+    `path`, and the directory is synced so the rename lasts too. The file keeps its mode unless
+    `mode` is given (a new file gets `mode`, else the umask's default)."""
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
-    os.replace(tmp, path)
+    data = text.encode() if isinstance(text, str) else text
+    if mode is None:
+        try:
+            mode = path.stat().st_mode & 0o7777
+        except OSError:
+            pass
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600 if mode is not None else 0o666)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        if mode is not None:
+            os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    fsync_dir(path.parent)
+
+
+def durable_append(path: Path, text: str) -> None:
+    """Append `text` and sync it, so an appended line that was reported written survives a power
+    cut. A file this creates gets its directory synced as well."""
+    path = Path(path)
+    new = not path.exists()
+    with open(path, "a") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    if new:
+        fsync_dir(path.parent)
+
+
+_git_version: tuple[int, ...] | None = None
+
+
+def git_version() -> tuple[int, ...]:
+    """The installed git's version, (0,) when it cannot be told. Asked once per process."""
+    global _git_version
+    if _git_version is None:
+        try:
+            out = subprocess.run(["git", "--version"], capture_output=True, text=True, timeout=10).stdout
+            m = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", out)
+            _git_version = tuple(int(x) for x in m.groups(default="0")) if m else (0,)
+        except (OSError, subprocess.SubprocessError):
+            _git_version = (0,)
+    return _git_version
+
+
+def git_fsync_config() -> list[tuple[str, str]]:
+    """Git settings that make a commit's objects and refs reach the disk before it returns, so a
+    power cut cannot leave a commit pointing at empty objects. Given per command or per process,
+    never written into anyone's repository config."""
+    if git_version() >= (2, 36):
+        return [("core.fsync", "committed")]
+    return [("core.fsyncObjectFiles", "true")]
+
+
+def git_fsync_args() -> list[str]:
+    return [a for k, v in git_fsync_config() for a in ("-c", f"{k}={v}")]
+
+
+def git_fsync_env(base: dict[str, str]) -> dict[str, str]:
+    """The fsync settings as GIT_CONFIG_COUNT / GIT_CONFIG_KEY_<n> / GIT_CONFIG_VALUE_<n> on top of
+    those already in `base` (an environment), for every git a worker runs. Pairs `base` already
+    carries are not repeated; a count git would reject is left alone."""
+    try:
+        n = int(base.get("GIT_CONFIG_COUNT") or 0)
+    except ValueError:
+        return {}
+    if n < 0:
+        return {}
+    have = {(base.get(f"GIT_CONFIG_KEY_{i}"), base.get(f"GIT_CONFIG_VALUE_{i}")) for i in range(n)}
+    out: dict[str, str] = {}
+    for k, v in git_fsync_config():
+        if (k, v) in have:
+            continue
+        out[f"GIT_CONFIG_KEY_{n}"], out[f"GIT_CONFIG_VALUE_{n}"] = k, v
+        n += 1
+    if out:
+        out["GIT_CONFIG_COUNT"] = str(n)
+    return out
+
+
+def write_json(path: Path, data: Any, mode: int | None = None) -> None:
+    durable_write(path, json.dumps(data, indent=2, sort_keys=True) + "\n", mode)
 
 
 # user-level registry and secrets ------------------------------------------------------------------
@@ -378,8 +485,7 @@ def load_registry() -> dict:
 def register(name: str, entry: dict) -> None:
     reg = load_registry()
     reg.setdefault("projects", {})[name] = {**reg["projects"].get(name, {}), **entry, "updated": time.time()}
-    write_json(registry_path(), reg)
-    os.chmod(registry_path(), 0o600)
+    write_json(registry_path(), reg, mode=0o600)
 
 
 def unregister(name: str) -> None:
@@ -406,8 +512,4 @@ def save_secret(key: str, value: Any) -> None:
     os.chmod(HOME_DIR, 0o700)
     data = load_secrets()
     data[key] = value
-    tmp = secrets_path().with_suffix(".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        json.dump(data, f)
-    os.replace(tmp, secrets_path())
+    durable_write(secrets_path(), json.dumps(data), mode=0o600)

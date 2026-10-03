@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 
 from . import locks
-from .project import HOME_DIR, Project
+from .project import HOME_DIR, Project, fsync_dir
 
 CHECK_S = 3600          # how often the daemon compares the installed release with its harness
 HELD_RECHECK_S = 300    # a release held back by a push or an upgrade in flight is looked at again this soon
@@ -105,6 +105,7 @@ def point_current(target: Path) -> None:
         tmp.unlink()
     tmp.symlink_to(target)
     os.replace(tmp, cur)
+    fsync_dir(cur.parent)
 
 
 def drift(p: Project) -> dict | None:

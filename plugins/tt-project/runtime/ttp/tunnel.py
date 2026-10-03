@@ -20,7 +20,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .project import HOME_DIR
+from .project import HOME_DIR, durable_write
 
 # Ours, and the shapes a hand-made service uses: `-L 8800:localhost:8700`, `-L127.0.0.1:8800:...`.
 FORWARD = re.compile(r"-L\s*(?:(?:127\.0\.0\.1|localhost):)?(\d+):(?:127\.0\.0\.1|localhost):(\d+)")
@@ -125,9 +125,9 @@ def keep(name: str, host: str, remote: int, pick_port, platform: str | None = No
     f.parent.mkdir(parents=True, exist_ok=True)
     HOME_DIR.mkdir(parents=True, exist_ok=True)
     if platform == "darwin":
-        f.write_bytes(plistlib.dumps(launchd_plist(name, argv)))
+        durable_write(f, plistlib.dumps(launchd_plist(name, argv)))
     else:
-        f.write_text(systemd_unit(name, argv))
+        durable_write(f, systemd_unit(name, argv))
     how = _start(name, platform)
     verb = "replaced the kept tunnel" if have else "installed a kept tunnel"
     return local, f"{verb} ({how}, {f})"

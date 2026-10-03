@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 
 from .db import DB, SEVERITY_RANK
-from .project import FOLDER, HOME_DIR, Project, hostname, load_registry, write_json
+from .project import FOLDER, HOME_DIR, Project, durable_write, hostname, load_registry, write_json
 
 STATE = HOME_DIR / "notifier-state.json"
 CONF = HOME_DIR / "notifier.json"
@@ -136,18 +136,19 @@ def install() -> str:
         import plistlib
         label = "com.tt-project.notifier"
         plist = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
-        with open(plist, "wb") as f:
-            plistlib.dump({"Label": label, "ProgramArguments": argv, "WorkingDirectory": str(HOME_DIR),
-                           "EnvironmentVariables": env, "RunAtLoad": True, "KeepAlive": True,
-                           "ProcessType": "Background", "StandardOutPath": str(HOME_DIR / "notifier.log"),
-                           "StandardErrorPath": str(HOME_DIR / "notifier.log")}, f)
+        durable_write(plist, plistlib.dumps({
+            "Label": label, "ProgramArguments": argv, "WorkingDirectory": str(HOME_DIR),
+            "EnvironmentVariables": env, "RunAtLoad": True, "KeepAlive": True,
+            "ProcessType": "Background", "StandardOutPath": str(HOME_DIR / "notifier.log"),
+            "StandardErrorPath": str(HOME_DIR / "notifier.log")}))
         subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{label}"], capture_output=True)
         r = subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist)], capture_output=True, text=True)
         return "installed (launchd)" if r.returncode == 0 else f"launchd failed: {r.stderr.strip()[:200]}"
     unit_dir = Path.home() / ".config" / "systemd" / "user"
     unit_dir.mkdir(parents=True, exist_ok=True)
     envs = "\n".join(f"Environment={k}={v}" for k, v in env.items())
-    (unit_dir / "tt-project-notifier.service").write_text(
+    durable_write(
+        unit_dir / "tt-project-notifier.service",
         f"[Unit]\nDescription=tt-project desktop notifier\n\n[Service]\nWorkingDirectory={HOME_DIR}\n"
         f"ExecStart={' '.join(shlex.quote(a) for a in argv)}\n{envs}\nRestart=always\nRestartSec=15\n\n"
         f"[Install]\nWantedBy=default.target\n")

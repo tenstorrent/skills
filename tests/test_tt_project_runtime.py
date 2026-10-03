@@ -3805,7 +3805,7 @@ def test_launchd_and_cron_run_the_watchdog_and_old_installs_get_it(env, monkeypa
     # macOS: a second agent runs the watchdog every few minutes; KeepAlive alone misses a stuck daemon.
     monkeypatch.setattr(service.sys, "platform", "darwin")
     job = {}
-    monkeypatch.setattr(service.plistlib, "dump", lambda j, f: job.update(j))
+    monkeypatch.setattr(service.plistlib, "dumps", lambda j: job.update(j) or b"")
     assert service._install_launchd_watchdog(p) == " with a watchdog"
     assert job["ProgramArguments"][-3:] == ["-m", "ttp.watchdog", str(p.base)]
     assert job["StartInterval"] == service.WATCHDOG_EVERY_S and "KeepAlive" not in job
@@ -8764,7 +8764,7 @@ def test_a_long_tick_tells_both_watchdogs_it_still_moves(env, monkeypatch):
     d._notify = addr
     steps = []
     for name in ("reap_runs", "wake_after_reboot", "meter_running", "reconcile_tasks", "prune_worktrees",
-                 "check_local_only", "check_disk", "sweep_alerts", "check_release", "sync_shared_pauses", "_refresh_meters", "update_gates", "run_schedules", "poll_slack",
+                 "check_local_only", "check_disk", "sweep_alerts", "check_release", "sync_shared_pauses", "check_integrity", "_refresh_meters", "update_gates", "run_schedules", "poll_slack",
                  "check_resource_trouble", "read_upstream", "retry_rejected", "maybe_coordinate", "probe_waiting", "dispatch",
                  "deliver_outbound"):
         monkeypatch.setattr(d, name, lambda name=name: steps.append(name))
@@ -8784,7 +8784,7 @@ def test_a_long_tick_tells_both_watchdogs_it_still_moves(env, monkeypatch):
     finally:
         sock.close()
         cleanup()
-    assert len(steps) == 21 and pings == [b"WATCHDOG=1"] * 19, (steps, pings)
+    assert len(steps) == 22 and pings == [b"WATCHDOG=1"] * 20, (steps, pings)
     # Before its first completed tick the heartbeat is not written (`ttp restart` reads it as that
     # tick); the start marker carries the progress, which `ttp.watchdog` counts.
     assert not hb.exists()
@@ -10490,3 +10490,191 @@ def test_deferred_task_does_not_hold_back_idle_slot_wake(env):
     assert starve_state(p.db, p.config(), gate.as_dict(), now), "deferred tasks do not start by themselves soon"
     assert coord.apply(p, [{"type": "task_add", "title": "ready", "spec": "s"}]) == []
     assert starve_state(p.db, p.config(), gate.as_dict(), now) is None, "ready queued work still holds the wake"
+
+
+# Durable state writes and the boot integrity check ------------------------------------------------
+def test_durable_write_syncs_renames_and_keeps_the_mode(env, monkeypatch):
+    from ttp import project
+    synced = []
+    real = os.fsync
+    monkeypatch.setattr(project.os, "fsync", lambda fd: synced.append(fd) or real(fd))
+    f = env["tmp"] / "state" / "x.json"
+    project.durable_write(f, "one")
+    assert f.read_text() == "one" and len(synced) == 2   # the file, then its directory
+    f.chmod(0o600)
+    project.durable_write(f, b"two")
+    assert f.read_text() == "two" and stat.S_IMODE(f.stat().st_mode) == 0o600
+    assert [x.name for x in f.parent.iterdir()] == ["x.json"], "no temporary file left behind"
+    project.durable_append(f, "+three\n")
+    assert f.read_text() == "two+three\n"
+
+
+# Every place the runtime writes a file directly, and why it need not survive a power cut. Anything
+# else goes through project.durable_write / durable_append / write_json.
+DURABLE_EXEMPT = {
+    ("project.py", "os.replace(src, dst)"): "memory archive move: a rename, both directories synced after",
+    ("project.py", 'os.fdopen(fd, "wb")'): "inside durable_write",
+    ("project.py", "os.replace(tmp, path)"): "inside durable_write",
+    ("project.py", 'open(path, "a")'): "inside durable_append",
+    ("release.py", "os.replace(tmp, cur)"): "a symlink swap; the directory is synced after",
+    ("release.py", "upgrade.log"): "a log",
+    ("daemon.py", "daemon.log"): "a log",
+    ("daemon.py", "runner.log"): "a log",
+    ("daemon.py", "pidfile.write_text"): "names a process, which a reboot ends",
+    ("daemon.py", '"daemon.start"'): "names a process, which a reboot ends",
+    ("daemon.py", 'os.fdopen(fd, "w")'): "a private temporary MCP config, removed when the run ends",
+    ("daemon.py", '"system.md"'): "a run's input, read at once; a reboot ends the run and its task is requeued",
+    ("daemon.py", '"prompt.md"'): "a run's input, read at once; a reboot ends the run and its task is requeued",
+    ("runner.py", '"STOP"'): "a signal to a live run",
+    ("runner.py", '"child.pid"'): "names a process, which a reboot ends",
+    ("runner.py", "open(out_path"): "the agent's output stream",
+    ("runner.py", "stderr.log"): "the agent's error stream",
+    ("runner.py", '"progress.md", "a"'): "a wait notice in the progress log",
+    ("cli.py", '"progress.md", "a"'): "a wait notice in the progress log",
+    ("cli.py", "lock.write_text"): "names a process, which a reboot ends",
+    ("cli.py", "SOURCE_FILE).write_text"): "part of a copied runtime tree; committed or re-installed by setup",
+    ("cli.py", '".gitignore").write_text'): "committed to the harness right after",
+    ("cli.py", "shim.write_text"): "installed by `ttp setup`, which can be re-run",
+    ("cli.py", "os.replace(p+'.tmp',p)"): "runs on another machine, inside a command string",
+    ("machines.py", "os.replace(p+'.tmp',p)"): "runs on another machine, inside a command string",
+    ("locks.py", 'open(path, "a")'): "the lock file itself: its content only describes the holder",
+    ("locks.py", '.lock", "a")'): "a flock guard file, never written",
+    ("shared.py", '.guard", "a")'): "a flock guard file, never written",
+    ("hook.py", "OFFSET_FILE).write_text"): "a lost offset re-delivers messages, never drops one",
+    ("watchdog.py", "mark.write_text"): "names a process, which a reboot ends",
+    ("web.py", "f.write_text(secrets.token_hex"): "a new token is made when it is missing",
+    ("codex.py", "tmp.write_text(text)"): "a cache, rewritten whenever its content differs",
+    ("codex.py", "os.replace(tmp, path)"): "a cache, rewritten whenever its content differs",
+    ("fake.py", '"result.json").write_text'): "the test provider",
+}
+
+
+def test_every_state_write_is_durable_or_exempt_with_a_reason():
+    import re
+    pat = re.compile(r"\.write_text\(|\.write_bytes\(|os\.replace\(|os\.fdopen\([^)]*[\"'][wa]|"
+                     r"open\([^)]*[\"'][wa]b?[\"']")
+    ttp_dir = RUNTIME / "ttp"
+    used, loose = set(), []
+    for f in sorted(ttp_dir.rglob("*.py")):
+        for n, line in enumerate(f.read_text().splitlines(), 1):
+            if not pat.search(line):
+                continue
+            keys = [k for k in DURABLE_EXEMPT if k[0] == f.name and k[1] in line]
+            used.update(keys)
+            if not keys:
+                loose.append(f"{f.relative_to(ttp_dir)}:{n}: {line.strip()}")
+    assert not loose, "write these with project.durable_write (or exempt them with a reason):\n" + "\n".join(loose)
+    assert not set(DURABLE_EXEMPT) - used, f"stale exemptions: {set(DURABLE_EXEMPT) - used}"
+
+
+def test_harness_commits_and_workers_sync_git_objects_without_touching_repo_config(env, monkeypatch):
+    p = make(env)
+    from ttp import project
+    from ttp.daemon import Daemon
+    monkeypatch.setattr(project, "_git_version", (2, 34, 1))
+    assert project.git_fsync_config() == [("core.fsyncObjectFiles", "true")]
+    monkeypatch.setattr(project, "_git_version", (2, 36, 0))
+    assert project.git_fsync_config() == [("core.fsync", "committed")]
+    calls = []
+    real = project.subprocess.run
+    monkeypatch.setattr(project.subprocess, "run", lambda argv, **kw: calls.append(argv) or real(argv, **kw))
+    p.add_memory("Commits reach the disk.")
+    commit = next(a for a in calls if "commit" in a)
+    assert commit[commit.index("core.fsync=committed") - 1] == "-c"
+    for repo in (p.harness, env["repo"]):
+        cfg = subprocess.run(["git", "-C", str(repo), "config", "--local", "--list"], capture_output=True,
+                             text=True).stdout
+        assert "fsync" not in cfg, "no one's repository config is changed"
+    # Workers get the same keys after any the daemon's own environment already carries.
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "safe.directory")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "*")
+    d = Daemon(p.base)
+    tid = p.db.add_task("t", "s", kind="code", tier="light", origin="user")
+    rid = d.start_run("worker", "go", "claude", "light", str(p.root), task=p.db.task(tid))
+    (p.runs / str(rid) / "STOP").touch()
+    run_env = json.loads((p.runs / str(rid) / "run.json").read_text())["env"]
+    assert run_env["GIT_CONFIG_COUNT"] == "2"
+    assert (run_env["GIT_CONFIG_KEY_1"], run_env["GIT_CONFIG_VALUE_1"]) == ("core.fsync", "committed")
+    assert "GIT_CONFIG_KEY_0" not in run_env, "the existing pair is inherited as it is"
+    assert project.git_fsync_env({"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.fsync",
+                                  "GIT_CONFIG_VALUE_0": "committed"}) == {}, "not repeated"
+    assert project.git_fsync_env({"GIT_CONFIG_COUNT": "x"}) == {}, "a count git rejects is left alone"
+
+
+def test_boot_check_restores_an_empty_memory_file_and_a_truncated_index(env):
+    p = make(env)
+    from ttp import alerts
+    from ttp.daemon import Daemon, KV_INTEGRITY
+    a = p.add_memory("The build needs the release toolchain.", kind="fact")
+    p.add_memory("Reviews go before every push.", kind="decision")
+    good_entry, good_index = a.read_bytes(), p.memory_index.read_bytes()
+    a.write_bytes(b"")                                        # what a cut write leaves
+    p.memory_index.write_bytes(good_index[:len(good_index) // 2])
+    stray = p.memory_dir / "fact-never-committed.md"
+    stray.write_bytes(b"\0" * 64)
+    d = Daemon(p.base)
+    t0 = time.monotonic()
+    d.check_integrity(start=True)
+    took = time.monotonic() - t0
+    assert a.read_bytes() == good_entry
+    assert p.memory_index.read_bytes() == good_index
+    assert not stray.exists() and (p.state / "damaged" / stray.name).exists()
+    res = p.db.kv(KV_INTEGRITY)
+    assert res["fsck"] == "ok" and not res["bad"] and len(res["restored"]) == 3, res
+    assert took < 2, f"boot check took {took:.2f} s"
+    assert p.db.one("SELECT id FROM messages WHERE kind='info' AND text LIKE '%repaired%'")
+    assert not p.db.one("SELECT id FROM messages WHERE kind='alert'")
+    clean = subprocess.run(["git", "-C", str(p.harness), "status", "--porcelain"], capture_output=True, text=True)
+    assert clean.stdout == "", clean.stdout
+    # The same boot is not checked again; nothing was left broken.
+    at = res["at"]
+    d.check_integrity(start=True)
+    d.check_integrity()
+    assert p.db.kv(KV_INTEGRITY)["at"] == at
+    assert not alerts.holds(p.db, "integrity", at, time.time())
+
+
+def test_boot_check_alerts_once_on_what_it_cannot_repair_and_clears(env, monkeypatch):
+    p = make(env)
+    from ttp import alerts, integrity
+    from ttp.daemon import Daemon, KV_INTEGRITY
+    p.add_memory("A fact.")
+    blob = subprocess.run(["git", "-C", str(p.harness), "rev-parse", "HEAD:MEMORY.md"], capture_output=True,
+                          text=True).stdout.strip()
+    obj = p.harness / ".git" / "objects" / blob[:2] / blob[2:]
+    obj.rename(obj.with_name("gone"))
+    tid = p.db.add_task("code", "s", kind="code", tier="light", origin="user")
+    wt = p.worktrees / f"t{tid}"
+    wt.mkdir(parents=True)
+    (wt / ".git").write_text(f"gitdir: {env['tmp'] / 'nowhere'}\n")
+    fscked = []
+    real = integrity._git
+    monkeypatch.setattr(integrity, "_git", lambda cwd, *a, **kw: (fscked.append(cwd) if a[0] == "fsck" else None)
+                        or real(cwd, *a, **kw))
+    d = Daemon(p.base)
+    d.check_integrity(start=True)
+    res = p.db.kv(KV_INTEGRITY)
+    assert res["fsck"] == "failed" and res["bad"] and res["worktrees"][0]["task"] == tid, res
+    assert fscked == [p.harness], "only the harness is fsck'd, never a code repository"
+    al = p.db.q("SELECT * FROM messages WHERE kind='alert' AND ref='integrity'")
+    assert len(al) == 1 and f"task #{tid}" in al[0]["text"]
+    assert alerts.holds(p.db, "integrity", al[0]["ts"], time.time())
+    # Repaired by hand: the next start checks again and the alert clears.
+    obj.with_name("gone").rename(obj)
+    (wt / ".git").unlink()
+    wt.rmdir()
+    d.check_integrity(start=True)
+    assert not alerts.holds(p.db, "integrity", al[0]["ts"], time.time())
+    assert len(p.db.q("SELECT * FROM messages WHERE kind='alert' AND ref='integrity'")) == 1
+
+
+def test_an_empty_run_json_fails_the_run_without_crashing_its_supervisor(env):
+    from ttp import runner
+    run_dir = env["tmp"] / "run"
+    run_dir.mkdir()
+    (run_dir / "run.json").write_text("")
+    assert runner.supervise(run_dir) == 1
+    info = json.loads((run_dir / "exit.json").read_text())
+    assert info["launched"] is False and "run.json" in info["error"]
+    runner.remove_private(run_dir)   # every other reader copes too

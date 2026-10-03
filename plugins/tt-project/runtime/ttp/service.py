@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 
 from . import poll_s
-from .project import Project
+from .project import Project, durable_write
 
 
 def unit_name(p: Project) -> str:
@@ -104,7 +104,7 @@ WantedBy=default.target
 
 def _install_systemd(p: Project) -> str:
     _unit(p).parent.mkdir(parents=True, exist_ok=True)
-    _unit(p).write_text(_unit_text(p))
+    durable_write(_unit(p), _unit_text(p))
     _run("systemctl", "--user", "daemon-reload")
     r = _run("systemctl", "--user", "enable", "--now", f"{unit_name(p)}.service")
     if r.returncode != 0:
@@ -121,8 +121,7 @@ def _install_launchd(p: Project) -> str:
            "EnvironmentVariables": _env(p), "RunAtLoad": True, "KeepAlive": True, "ProcessType": "Background",
            "ThrottleInterval": 10, "AbandonProcessGroup": True, "StandardOutPath": str(p.logs / "launchd.log"),
            "StandardErrorPath": str(p.logs / "launchd.log")}
-    with open(plist, "wb") as f:
-        plistlib.dump(job, f)
+    durable_write(plist, plistlib.dumps(job))
     uid = os.getuid()
     _run("launchctl", "bootout", f"gui/{uid}/{label}")
     r = _run("launchctl", "bootstrap", f"gui/{uid}", str(plist))
@@ -140,8 +139,7 @@ def _install_launchd_watchdog(p: Project) -> str:
            "StandardOutPath": str(p.logs / "launchd.log"), "StandardErrorPath": str(p.logs / "launchd.log")}
     plist.parent.mkdir(parents=True, exist_ok=True)
     p.logs.mkdir(parents=True, exist_ok=True)
-    with open(plist, "wb") as f:
-        plistlib.dump(job, f)
+    durable_write(plist, plistlib.dumps(job))
     uid = os.getuid()
     _run("launchctl", "bootout", f"gui/{uid}/{label}")
     r = _run("launchctl", "bootstrap", f"gui/{uid}", str(plist))
@@ -249,7 +247,7 @@ def refresh(p: Project) -> None:
     watchdog existed gets it) without starting or stopping anything."""
     unit = _unit(p)
     if unit.exists() and unit.read_text(errors="replace") != _unit_text(p):
-        unit.write_text(_unit_text(p))
+        durable_write(unit, _unit_text(p))
         _run("systemctl", "--user", "daemon-reload")
     if sys.platform == "darwin" and _agent(p).exists() and not _agent(p, watchdog=True).exists():
         _install_launchd_watchdog(p)

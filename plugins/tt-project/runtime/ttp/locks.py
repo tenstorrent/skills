@@ -19,6 +19,8 @@ import os
 import time
 from pathlib import Path
 
+from .project import durable_write
+
 RESERVE_STALE_S = 120
 
 
@@ -114,9 +116,7 @@ def reserve(path: Path, holder: str) -> None:
     except (OSError, ValueError):
         since = None
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps({"holder": holder, "since": since or time.time(), "ts": time.time()}))
-    os.replace(tmp, path)
+    durable_write(path, json.dumps({"holder": holder, "since": since or time.time(), "ts": time.time()}))
 
 
 def reserved_by(path: Path) -> str | None:
@@ -157,9 +157,7 @@ def record_wait(run_dir: Path, key: str, start: float, end: float | None) -> Non
             except (OSError, ValueError):
                 waits = {}
             waits[key] = {"start": start, "end": end, "pid": os.getpid()}
-            tmp = run_dir / f"{WAITS_FILE}.{os.getpid()}.tmp"
-            tmp.write_text(json.dumps(waits))
-            os.replace(tmp, run_dir / WAITS_FILE)
+            durable_write(run_dir / WAITS_FILE, json.dumps(waits))
     except OSError:
         pass    # a missing record only costs the run its extension, never the command
 

@@ -26,7 +26,7 @@ from .db import chat_floor
 from . import outbox
 from . import schedule as sched
 from .project import (FOLDER, NAME_RE, Project, hostname, load_registry, load_secrets, register, save_secret,
-                      write_json)
+                      durable_append, durable_write, write_json)
 
 RUNTIME = Path(__file__).resolve().parent.parent              # .../runtime (plugin or project copy)
 PLUGIN_ROOT = RUNTIME.parent                                   # plugin root, or a project's harness/
@@ -302,7 +302,7 @@ def bootstrap(root: Path, name: str, brief: str, provider: str) -> Project:
         return p
     p.base.mkdir(parents=True, exist_ok=True)
     # The folder ignores itself, so no enclosing repository can ever commit project state.
-    (p.base / ".gitignore").write_text("*\n")
+    durable_write(p.base / ".gitignore", "*\n")
     for d in (p.state, p.runs, p.logs, p.worktrees, p.memory_dir):
         d.mkdir(parents=True, exist_ok=True)
     template = PLUGIN_ROOT / "template"
@@ -320,8 +320,8 @@ def bootstrap(root: Path, name: str, brief: str, provider: str) -> Project:
     _git(p.harness, "checkout", "-q", "-b", "main")
     charter = (template / "CHARTER.md").read_text().replace("{{NAME}}", name).replace(
         "{{DATE}}", time.strftime("%Y-%m-%d")).replace("{{BRIEF}}", brief.strip() or "(no description given yet)")
-    p.charter_path.write_text(charter)
-    p.memory_index.write_text("# Memory index\n")
+    durable_write(p.charter_path, charter)
+    durable_write(p.memory_index, "# Memory index\n")
     cfg = {"name": name, "created": time.time(), "root": str(p.root), "host": hostname(),
            "core_provider": provider, "tt_project_version": __version__,
            "id": pysecrets.token_hex(4),
@@ -758,8 +758,7 @@ def cmd_note(a) -> None:
     run_dir = os.environ.get("TTP_RUN_DIR")
     if not run_dir:
         die("ttp note only works inside a tt-project run")
-    with open(Path(run_dir) / "progress.md", "a") as f:
-        f.write(f"{time.strftime('%H:%M:%S')} {a.text}\n")
+    durable_append(Path(run_dir) / "progress.md", f"{time.strftime('%H:%M:%S')} {a.text}\n")
 
 
 def cmd_push(a) -> None:
@@ -1146,7 +1145,7 @@ def cmd_setup(a) -> None:
     (lib / "runtime" / "ttp" / SOURCE_FILE).write_text(commit + "\n")
     # The marker goes first: a daemon check between the two steps must not undo a deliberate downgrade.
     if is_newer(installed, __version__):    # a deliberate downgrade: daemons must not undo it
-        forced_mark().write_text(__version__ + "\n")
+        durable_write(forced_mark(), __version__ + "\n")
     elif forced_version() != __version__:  # re-running setup of the forced version keeps it forced
         forced_mark().unlink(missing_ok=True)
     cur = HOME_DIR / "lib" / "current"

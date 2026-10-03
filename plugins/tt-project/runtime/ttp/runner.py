@@ -35,6 +35,7 @@ import time
 from pathlib import Path
 
 from . import poll_s
+from .project import durable_write
 
 LEASE_EVERY_S = 30
 KILL_AFTER_S = 30
@@ -135,7 +136,17 @@ def remove_private(run_dir: Path) -> None:
 
 
 def supervise(run_dir: Path) -> int:
-    spec = json.loads((run_dir / "run.json").read_text())
+    try:
+        spec = json.loads((run_dir / "run.json").read_text())
+        if not isinstance(spec, dict) or "argv" not in spec or "cwd" not in spec:
+            raise ValueError("no argv or cwd")
+    except (OSError, ValueError) as e:
+        # Empty or cut short (a power cut while it was written): nothing to run. The daemon books a
+        # failed run that never launched, so its task is retried.
+        now = time.time()
+        durable_write(run_dir / "exit.json", json.dumps({"rc": None, "started": now, "ended": now, "launched": False,
+                                                         "error": f"run.json unreadable: {e}"[:300]}))
+        return 1
     argv, env_extra, cwd = spec["argv"], spec.get("env", {}), spec["cwd"]
     timeout_s, budget = float(spec.get("timeout_s", 3600)), spec.get("budget_usd")
     stall_s = float(spec.get("stall_s") or 0)
@@ -149,8 +160,7 @@ def supervise(run_dir: Path) -> int:
         remove_files(spec.get("private_files") or [])
         exit_info = {"rc": None, "started": started, "ended": time.time(),
                      "stopped": stop_reason(run_dir) or "resource_busy", "launched": False}
-        (run_dir / "exit.json.tmp").write_text(json.dumps(exit_info))
-        os.replace(run_dir / "exit.json.tmp", run_dir / "exit.json")
+        durable_write(run_dir / "exit.json", json.dumps(exit_info))
         return 1
     started, mono_start = time.time(), time.monotonic()
     prompt = open(run_dir / "prompt.md", "rb")
@@ -222,9 +232,7 @@ def supervise(run_dir: Path) -> int:
         f.close()
     exit_info = {"rc": rc, "started": started, "ended": ended, "stopped": reason[0] if reason else None,
                  "slept_s": round(max((ended - started) - (mono_end - mono_start), 0.0), 1)}
-    tmp = run_dir / "exit.json.tmp"
-    tmp.write_text(json.dumps(exit_info))
-    os.replace(tmp, run_dir / "exit.json")
+    durable_write(run_dir / "exit.json", json.dumps(exit_info))
     return rc
 
 

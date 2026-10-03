@@ -27,6 +27,7 @@ CLEARED_TEXT = {
     "run-start": "Runs start again.",
     "schedule": "Schedule {arg} runs again.",
     "release-older": "The installed tt-project is no longer older than this harness.",
+    "integrity": "The harness and the task worktrees check out again.",
 }
 
 
@@ -75,6 +76,9 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
         return int(db.kv("coordinator_failures", 0)) > 0
     if key == "release-older":
         return bool(db.kv("release_older"))
+    if key == "integrity":
+        last = db.kv("integrity") or {}
+        return bool(last.get("bad") or last.get("worktrees"))
     if kind == "schedule":
         # The next run that does not fail ends it, as does disabling or removing the schedule.
         row = db.one("SELECT last_status FROM schedules WHERE name=? AND enabled=1", (arg,))
@@ -99,7 +103,7 @@ def active(db: DB, key: str, ts: float, now: float) -> bool:
 
 def _checkable(key: str) -> bool:
     return key.partition(":")[0] in ("auth", "limit", "budget", "disk", "coordinator", "run-start", "schedule",
-                                         "release-older")
+                                         "release-older", "integrity")
 
 
 def _since(ep: dict) -> float:

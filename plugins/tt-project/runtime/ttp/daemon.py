@@ -30,6 +30,7 @@ from pathlib import Path
 from . import alerts
 from . import budget as bud
 from . import coordinator as coord
+from . import integrity
 from . import locks
 from . import machines
 from . import release
@@ -41,7 +42,7 @@ from . import shared
 from . import worktree
 from .db import (OPEN_ASK_MAX_AGE_S, SEVERITY_RANK, TERMINAL_TASK_STATES, continues_id, deferral, dependency_ids,
                  dump_result, load_result, without_deferral)
-from .project import Project, hostname, load_secrets
+from .project import Project, durable_write, git_fsync_env, hostname, load_secrets
 from .providers import get_provider
 from .providers.base import last_json_object, scratch_dir, service_path
 from .providers.claude import as_windows
@@ -75,6 +76,8 @@ SLEEPS_KEPT_S = 7 * 86400
 LOCAL_ONLY_EVERY_S = 3600   # how often done code tasks' branches are checked against the remotes
 LOCAL_ONLY_DAYS = 14        # done code tasks finished this recently are checked (flagged ones until cleared)
 KV_LOCAL_ONLY = "local_only"   # kv: {task id: {branch, head, ahead, since}} for branches only on this machine
+KV_INTEGRITY = "integrity"   # kv: the last boot integrity check (see Daemon.check_integrity)
+INTEGRITY_RECHECK_S = 3600
 KV_LOCAL_ONLY_FROM = "local_only_from"   # kv: when the check first ran; tasks done before it are not checked
 
 
@@ -224,6 +227,7 @@ class Daemon:
         from .web import serve
         threading.Thread(target=serve, args=(self,), daemon=True).start()
         self._keep_awake()
+        self.check_integrity(start=True)
         while not self.stopping:
             try:
                 self.tick()
@@ -292,10 +296,8 @@ class Daemon:
         hb = self.p.state / "heartbeat"
         held = shared.held(self.p, self.cfg)
         if not self._healthy or held != self._held:
-            tmp = hb.with_name(f"heartbeat.{os.getpid()}.tmp")
-            tmp.write_text(json.dumps({"pid": os.getpid(), "host": hostname(), "started": self._started,
-                                       "boot": self.boot, "held": held}))
-            os.replace(tmp, hb)
+            durable_write(hb, json.dumps({"pid": os.getpid(), "host": hostname(), "started": self._started,
+                                          "boot": self.boot, "held": held}))
             self._held = held
         else:
             os.utime(hb, None)
@@ -337,7 +339,7 @@ class Daemon:
             self.jev = Jev(self.cfg, db=self.p.db)
         for step in (self.reap_runs, self.wake_after_reboot, self.meter_running, self.reconcile_tasks,
                      self.prune_worktrees, self.check_local_only, self.check_disk, self.sweep_alerts,
-                     self.check_release, self.sync_shared_pauses):
+                     self.check_release, self.sync_shared_pauses, self.check_integrity):
             step()
             self._progress()
         if self.p.db.kv("paused", False):
@@ -490,6 +492,7 @@ class Daemon:
             env = {**env, "TTP_RUN_DIR": str(run_dir), "TTP_PROJECT": str(self.p.base), "TTP_RUN_ID": str(run_id),
                    "TTP_TASK": str(task["id"]) if task else "", "PYTHONPATH": runtime_dir,
                    "PATH": f"{self.p.harness / 'bin'}:{service_path()}:{os.environ.get('PATH', '')}"}
+            env.update(git_fsync_env({**os.environ, **env}))   # a power cut must not corrupt workers' commits
             tout = timeout_s or self.cfg["budget"]["run_timeout_s"].get(tier, 3600)
             stall = self.cfg["budget"].get("stall_s", {}).get(tier) if role != "coordinator" else None
             spec = {"argv": argv, "env": env, "cwd": cwd, "timeout_s": tout, "provider": provider, "stall_s": stall,
@@ -503,7 +506,7 @@ class Daemon:
                                   for res in _exclusive(task)] if task else [],
                     "exclusive_wait_s": self.cfg["budget"].get("exclusive_wait_s", 600),
                     "private_files": private}
-            (run_dir / "run.json").write_text(json.dumps(spec, indent=1))
+            durable_write(run_dir / "run.json", json.dumps(spec, indent=1))   # read again after a reboot
             with open(run_dir / "runner.log", "wb") as out:
                 proc = subprocess.Popen([sys.executable, "-m", "ttp.runner", str(run_dir)], cwd=runtime_dir,
                                         env={**os.environ, "PYTHONPATH": runtime_dir}, stdout=out, stderr=out,
@@ -1653,6 +1656,38 @@ class Daemon:
         else:
             db.set_kv("disk_low", None)
             log(self.p, f"disk space ok again: {free / 1e9:.1f} GB free under {path}")
+
+    def check_integrity(self, start: bool = False) -> None:
+        """On the first start of a new boot, check the harness for damage a power cut left and repair
+        what its last commit can (see ttp.integrity); also report unfinished code tasks' worktrees
+        whose `git status` fails. While something stays broken, check again at each start and
+        hourly. Repairs are a note in the feed; what stays broken is one alert keyed `integrity`."""
+        db = self.p.db
+        last = db.kv(KV_INTEGRITY) or {}
+        broken = bool(last.get("bad") or last.get("worktrees"))
+        if start:
+            due = last.get("boot") != self.boot or broken
+        else:   # a tick: only the hourly re-check of something still broken
+            due = broken and time.time() - float(last.get("at") or 0) >= INTEGRITY_RECHECK_S
+        if not due:
+            return
+        try:
+            ids = [r["id"] for r in db.q("SELECT id FROM tasks WHERE kind='code' AND status NOT IN "
+                                         f"({','.join('?' * len(TERMINAL_TASK_STATES))})", TERMINAL_TASK_STATES)]
+            res = integrity.check(self.p, [(t, self.p.worktrees / f"t{t}") for t in ids])
+        except Exception:
+            log(self.p, "integrity check: " + traceback.format_exc().replace("\n", " | ")[:1000])
+            return
+        res.update(boot=self.boot, at=time.time())
+        db.set_kv(KV_INTEGRITY, res)
+        log(self.p, f"integrity check in {res['seconds']} s: fsck {res['fsck']}, {len(res['restored'])} restored, "
+                    f"{len(res['bad'])} unrepaired, {len(res['worktrees'])} broken worktree(s)")
+        if res["restored"]:
+            db.post("out", "The harness check after a restart repaired files a cut write had damaged: "
+                           + "; ".join(res["restored"])[:2000], kind="info", severity="low")
+        text = integrity.problem_text(res)
+        if text:
+            self.alert("integrity", text, severity="high", every_s=86400)
 
     def check_release(self) -> None:
         """Hourly (and at start): is a newer tt-project installed than this harness runs? Status and

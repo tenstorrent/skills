@@ -23,7 +23,7 @@ from . import screen as scr
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
                  dependency_ids, dump_result, host_line, load_result, without_deferral)
-from .project import COORDINATOR_MEMORY_CHARS, WORKER_MEMORY_CHARS, Project
+from .project import COORDINATOR_MEMORY_CHARS, WORKER_MEMORY_CHARS, Project, durable_append
 from .runner import stop_runs
 
 ACTION_TYPES = ("reply", "task_add", "task_update", "ask_user", "resolve", "notify", "memory_add", "memory_forget",
@@ -641,8 +641,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 text = a["text"].strip()
                 stamp = time.strftime("%Y-%m-%d") + (f", turn {key}" if key else "")
                 if not (key and _has_line(p.charter_path, f", turn {key})")):
-                    with open(p.charter_path, "a") as f:
-                        f.write(f"\n## {section} (added {stamp})\n{text}\n")
+                    durable_append(p.charter_path, f"\n## {section} (added {stamp})\n{text}\n")
                 p.commit_harness([p.charter_path], f"charter ({section.lower()}): {a['text'].strip()[:80]}")
                 if section.startswith("Restriction"):
                     _tell_running_workers(db, f"New binding restriction: {text}", key)
@@ -1083,8 +1082,7 @@ def _append_update(steer: Path, text: str, key: str | None = None) -> None:
     """Add an update to a run's steer.md, once per `key` (see apply)."""
     if key and _has_line(steer, f"(turn {key})"):
         return
-    with open(steer, "a") as f:
-        f.write(f"\n## Update {time.strftime('%Y-%m-%d %H:%M')}{f' (turn {key})' if key else ''}\n{text.strip()}\n")
+    durable_append(steer, f"\n## Update {time.strftime('%Y-%m-%d %H:%M')}{f' (turn {key})' if key else ''}\n{text.strip()}\n")
 
 
 def _has_line(path: Path, ending: str) -> bool:

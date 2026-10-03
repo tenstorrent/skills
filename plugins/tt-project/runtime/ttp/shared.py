@@ -153,9 +153,7 @@ def _update(res: str, name: str, change) -> tuple[dict | None, dict | None]:
             except FileNotFoundError:
                 pass
         elif new != was:
-            tmp = d / f"{name}.{os.getpid()}.tmp"
-            tmp.write_text(json.dumps(new))
-            os.replace(tmp, d / name)
+            project.durable_write(d / name, json.dumps(new))
     return was, new
 
 
