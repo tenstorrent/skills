@@ -1623,6 +1623,7 @@ class Daemon:
         except Exception as e:   # a half-written install must not stop the tick
             log(self.p, f"release check failed: {type(e).__name__}: {e}")
             return
+        self.check_older_release()
         if d != db.kv(release.KV_RELEASE):
             db.set_kv(release.KV_RELEASE, d)
             if d:
@@ -1644,6 +1645,29 @@ class Daemon:
         except Exception as e:
             release.finish(self.p, "failed", why=f"{type(e).__name__}: {str(e)[:200]}")
             log(self.p, f"automatic upgrade did not start: {type(e).__name__}: {e}")
+
+    def check_older_release(self) -> None:
+        """One alert, cleared by itself, while ~/.tt-project/lib/current holds an older version than
+        this harness runs: an older plugin's `ttp setup` replaced the newer install, so `ttp` on PATH,
+        remote shipping and automatic upgrades all work from the older release."""
+        db = self.p.db
+        try:
+            o = release.older(self.p)
+        except Exception as e:
+            log(self.p, f"installed-release check failed: {type(e).__name__}: {e}")
+            return
+        if o == db.kv("release_older"):
+            return
+        db.set_kv("release_older", o)
+        if not o:
+            log(self.p, "the installed tt-project is no longer older than this harness")
+            return
+        log(self.p, f"installed tt-project {o['installed']} is older than this harness ({o['harness']})")
+        self.alert("release-older", f"The installed tt-project ({o['installed']}) is older than this harness "
+                                    f"({o['harness']}): an older plugin's `ttp setup` replaced a newer install. "
+                                    f"`ttp` on PATH and automatic upgrades now use the older release. Running "
+                                    f"`ttp setup` from a plugin at {o['harness']} or newer restores it; this "
+                                    f"alert clears by itself once it is.", "high")
 
     def check_local_only(self) -> None:
         """A done code task may leave the only copy of its work on a local branch. Hourly, and in the

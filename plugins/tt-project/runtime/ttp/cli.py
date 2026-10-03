@@ -314,9 +314,22 @@ def push_secrets(host: str) -> str:
     return f"copied keys ({r.stdout.strip()}) to {host}" if r.returncode == 0 else f"could not copy keys: {r.stderr[-200:]}"
 
 
+def remote_version(host: str) -> str:
+    """The version of the `ttp` installed on another machine ("" when none or unreadable)."""
+    r = subprocess.run(["ssh", "-o", "BatchMode=yes", host, "cat ~/.tt-project/lib/current/runtime/ttp/__init__.py"],
+                       capture_output=True, text=True)
+    m = re.search(r'__version__ = "([^"]+)"', r.stdout) if r.returncode == 0 else None
+    return m.group(1) if m else ""
+
+
 def ship_runtime(host: str) -> str:
     """Copy this runtime and template to ~/.tt-project/lib/<version> on another machine and make it
-    that machine's installed `ttp`. Returns the remote launcher path."""
+    that machine's installed `ttp`. Returns the remote launcher path. A machine that already has
+    this version or a newer one keeps its own: an older runtime never replaces a newer install."""
+    from .release import is_newer
+    there = remote_version(host)
+    if there and not is_newer(__version__, there):
+        return "~/.tt-project/lib/current/bin/ttp"
     stage = f".tt-project/lib/{__version__}"
     subprocess.check_call(["ssh", "-o", "BatchMode=yes", host, f"rm -rf ~/{stage} && mkdir -p ~/{stage}"])
     mac = ["--no-xattrs", "--no-mac-metadata"] if sys.platform == "darwin" else []
@@ -335,13 +348,12 @@ def new_remote(a, brief: str) -> None:
     if not a.dir:
         die("--dir is required with --host (the project root on that machine)")
     host = a.host
-    stage = f".tt-project/lib/{__version__}"
-    ship_runtime(host)
+    launcher = ship_runtime(host)
     if load_secrets() and not a.no_secrets:
         print(push_secrets(host))
     from . import machines as mm
     print(mm.push(host))        # its daemon reads the machines list there
-    args = [f"~/{stage}/bin/ttp", "new", a.name, "--dir", a.dir, "--provider", a.provider or detect_provider()]
+    args = [launcher, "new", a.name, "--dir", a.dir, "--provider", a.provider or detect_provider()]
     if a.no_service:
         args.append("--no-service")
     remote = " ".join(shlex.quote(x) if not x.startswith("~/") else x for x in args) + " --describe-file -"
@@ -1015,9 +1027,14 @@ def cmd_logs(a) -> None:
 def cmd_setup(a) -> None:
     """Install this runtime as the user's stable `ttp` (plugin caches move on every update)."""
     from .project import HOME_DIR
+    from .release import is_newer, runtime_version
     lib = HOME_DIR / "lib" / __version__
     if not (PLUGIN_ROOT / "template").is_dir():
         die(f"{RUNTIME} is a project's harness copy, not the plugin; run `<plugin-root>/bin/ttp setup`", 1)
+    installed = runtime_version(HOME_DIR / "lib" / "current" / "runtime")
+    if is_newer(installed, __version__) and not a.force:
+        die(f"ttp {installed} is installed, newer than this ttp {__version__}: not downgrading it. "
+            f"Run setup from the newer plugin, or add --force to install {__version__} anyway", 1)
     commit = source_commit()
     before = recorded_commit(lib / "runtime") if (lib / "runtime").is_dir() else ""
     if RUNTIME.resolve() != (lib / "runtime").resolve():
@@ -1400,6 +1417,7 @@ def main(argv: list[str] | None = None) -> None:
 
     s = sub.add_parser("setup", help="install ttp for this user (stable copy + shim on PATH)")
     s.add_argument("--bin-dir", default="~/.local/bin")
+    s.add_argument("--force", action="store_true", help="install even over a newer installed ttp")
     s.set_defaults(fn=cmd_setup)
 
     s = sub.add_parser("upgrade", help="merge the installed tt-project template into a project's harness")

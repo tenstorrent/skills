@@ -47,6 +47,23 @@ def _num(v: str) -> tuple[int, ...]:
     return tuple(int(x) for x in re.findall(r"\d+", v))
 
 
+def is_newer(a: str, b: str) -> bool:
+    """Version `a` is strictly newer than `b` (an unknown version is older than any known one)."""
+    return _num(a) > _num(b)
+
+
+def older(p: Project) -> dict | None:
+    """The installed release when it is an older version than the project's own harness runtime
+    (an older runtime's setup replaced a newer install); None otherwise or when either is unknown."""
+    lib = installed() / "runtime"
+    if not (lib / "ttp" / "__init__.py").is_file():
+        return None
+    new_v, cur_v = runtime_version(lib), runtime_version(p.harness / "runtime")
+    if not _num(new_v) or not _num(cur_v) or not is_newer(cur_v, new_v):
+        return None
+    return {"installed": f"{new_v} ({runtime_commit(lib)})", "harness": cur_v}
+
+
 def drift(p: Project) -> dict | None:
     """The installed release when it is newer than, or the same version from another commit as,
     the project's harness runtime; None when they match or nothing is installed."""

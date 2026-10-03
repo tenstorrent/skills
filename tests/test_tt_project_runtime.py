@@ -3051,6 +3051,55 @@ def test_setup_records_the_source_commit_and_reports_a_same_version_overwrite(en
     assert version() == f"ttp {__version__} ({second})"
 
 
+def test_setup_never_downgrades_a_newer_install_without_force(env, tmp_path):
+    from ttp import __version__
+    _install_template(env)
+    newer = env["home"] / "lib" / _newer(__version__)
+    (env["home"] / "lib" / "current").rename(newer)
+    init = newer / "runtime" / "ttp" / "__init__.py"
+    init.write_text(init.read_text().replace(f'"{__version__}"', f'"{_newer(__version__)}"'))
+    (env["home"] / "lib" / "current").symlink_to(newer)
+
+    def setup(*extra):
+        return subprocess.run([sys.executable, str(TTP), "setup", "--bin-dir", str(tmp_path / "bin"), *extra],
+                              capture_output=True, text=True, timeout=60)
+    r = setup()
+    assert r.returncode != 0 and f"ttp {_newer(__version__)} is installed" in r.stderr and "--force" in r.stderr
+    assert (env["home"] / "lib" / "current").resolve() == newer.resolve() and not (tmp_path / "bin").exists()
+    r = setup("--force")
+    assert r.returncode == 0, r.stderr
+    assert (env["home"] / "lib" / "current").resolve() == (env["home"] / "lib" / __version__).resolve()
+
+
+@pytest.mark.parametrize("there,ships", [("newer", False), ("same", False), ("older", True), ("none", True)])
+def test_ship_runtime_never_replaces_a_newer_or_equal_remote_install(env, monkeypatch, there, ships):
+    from ttp import __version__, cli
+    ver = {"newer": _newer(__version__), "same": __version__, "older": "0.0.1", "none": ""}[there]
+    calls = []
+
+    def run(cmd, **kw):
+        calls.append(("run", cmd[-1]))
+        out = f'__version__ = "{ver}"\n' if ver else ""
+        return subprocess.CompletedProcess(cmd, 0 if ver else 1, out, "" if ver else "No such file")
+
+    class Tar:
+        stdout = None
+
+        def wait(self):
+            return 0
+    monkeypatch.setattr(cli.subprocess, "run", run)
+    monkeypatch.setattr(cli.subprocess, "check_call", lambda cmd, **kw: calls.append(("call", cmd[-1])))
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda *a, **kw: Tar())
+    launcher = cli.ship_runtime("box")
+    assert calls[0] == ("run", "cat ~/.tt-project/lib/current/runtime/ttp/__init__.py")
+    shipped = [c for kind, c in calls if kind == "call"]
+    if ships:
+        assert launcher == f"~/.tt-project/lib/{__version__}/bin/ttp"
+        assert shipped[0].startswith("rm -rf") and shipped[-1].endswith("bin/ttp setup >/dev/null")
+    else:
+        assert launcher == "~/.tt-project/lib/current/bin/ttp" and not shipped
+
+
 def test_version_shows_the_source_commit(env, capsys):
     from ttp import __version__, cli
     with pytest.raises(SystemExit):
@@ -8836,6 +8885,30 @@ def test_an_older_installed_release_is_not_offered(env, monkeypatch):
     init.write_text(init.read_text().replace(f'"{__version__}"', '"0.0.1"'))
     d.check_release()
     assert not p.db.kv("release") and not launches
+
+
+def test_an_installed_release_older_than_the_harness_raises_one_alert_that_clears(env, monkeypatch):
+    from ttp import __version__, alerts
+    p, d, launches = _release_daemon(env, monkeypatch, newer=False)
+    init = env["home"] / "lib" / "current" / "runtime" / "ttp" / "__init__.py"
+    good = init.read_text()
+    init.write_text(good.replace(f'"{__version__}"', '"0.0.1"'))
+
+    def top():
+        return [m for m in alerts.needs_you(p.db, time.time()) if "is older than this harness" in m["text"]]
+    for _ in range(3):           # restarts and hourly checks do not repeat it
+        d._release_due = 0
+        d.check_release()
+        d.sweep_alerts()
+    assert len(top()) == 1 and "(0.0.1 (bbbb2222)) is older than this harness" in top()[0]["text"]
+    assert len(p.db.q("SELECT id FROM messages WHERE ref='release-older' AND kind='alert'")) == 1
+    assert not launches
+    init.write_text(good)
+    d._release_due = 0
+    d.check_release()
+    d.sweep_alerts()
+    assert not top() and not p.db.kv("release_older")
+    assert p.db.q("SELECT id FROM messages WHERE ref='release-older' AND kind='resolved'")
 
 
 def test_the_same_version_from_another_commit_is_shown_but_never_auto_upgraded(env, monkeypatch):
