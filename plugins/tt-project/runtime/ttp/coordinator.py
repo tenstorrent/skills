@@ -78,7 +78,7 @@ USER_SETTABLE = {
     # Where `ttp push` publishes (required; never main, master or the remote's default branch) and
     # the commands that must pass first.
     "delivery.push_branch": str,
-    "delivery.push_checks": lambda v: push.check_list(v),
+    "delivery.push_checks": lambda v: push.checks_of(v),
     # The runaway valve on task creation; the coordinator may raise it within MAX_TASKS_PER_DAY.
     # 0 stops new tasks.
     "coordinator.max_new_tasks_per_day": lambda v: max(0, min(int(v), MAX_TASKS_PER_DAY)),
@@ -687,7 +687,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
             elif t == "config_set":
                 key = a.get("key", "")
                 if key not in USER_SETTABLE:
-                    raise ValueError(f"{key} is not user-settable from chat")
+                    from .project import unknown_key_hint
+                    hint = unknown_key_hint(key)
+                    raise ValueError(hint or f"{key} is not user-settable from chat")
                 if key in NEEDS_USER and not user_turn:
                     raise ValueError(f"{key} needs the user's approval: ask_user (blocking spend) with the exact value, and set "
                                      f"it in the turn that carries their yes")

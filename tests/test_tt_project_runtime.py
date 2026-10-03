@@ -10986,3 +10986,32 @@ def test_a_plan_window_red_marker_commits_with_its_alert_or_not_at_all(env, monk
     d.update_gates()
     assert len(p.db.q("SELECT id FROM messages WHERE ref='budget:fake'")) == 1
     assert "5h" in p.db.kv("budget_red_sent")["fake"]
+
+
+def test_config_set_rejects_sentence_push_checks_and_unknown_keys(env):
+    p = make(env)
+    from ttp.coordinator import apply
+    probs = apply(p, [{"type": "config_set", "key": "delivery.push_checks",
+                       "value": "Run the unit tests before pushing"},
+                      {"type": "config_set", "key": "budget.daly_usd", "value": "5"},
+                      {"type": "config_set", "key": "delivery.push_checks", "value": '["true", "./run.sh -q", "X=1 sh -c :"]'}])
+    assert any("'Run' is not a program on PATH" in x for x in probs)
+    assert any("unknown key budget.daly_usd (did you mean budget.daily_usd?)" in x for x in probs)
+    assert p.config()["delivery"]["push_checks"] == ["true", "./run.sh -q", "X=1 sh -c :"]
+
+
+def test_config_problems_flag_unknown_keys_and_bad_checks(env, capsys):
+    p = make(env)
+    from ttp.project import config_problems, unknown_key_hint
+    assert unknown_key_hint("budget.daily_usd") is None and unknown_key_hint("resources.device") is None
+    assert unknown_key_hint("providers.claude.tiers") is None and unknown_key_hint("delivery.push_branch") is None
+    p.set_config("budget.max_pace_hold_s", 0)
+    p.set_config("delivery.push_checks", ["Make sure the tests pass"])
+    probs = config_problems(p.raw_config())
+    assert "unknown key budget.max_pace_hold_s" in probs[0] and "'Make' is not a program" in probs[1]
+    assert len(probs) == 2   # name, id, root and other identity keys are known
+    from ttp import cli
+    with pytest.raises(SystemExit):
+        cli.main(["config", p.name, "budget.daly_usd", "5"])
+    cli.main(["doctor", p.name])
+    assert "project.json: unknown key budget.max_pace_hold_s" in capsys.readouterr().out

@@ -224,6 +224,7 @@ class Daemon:
         signal.signal(signal.SIGINT, lambda *_: setattr(self, "stopping", True))
         log(self.p, f"daemon start pid={os.getpid()} host={hostname()} boot={self.boot}")
         self.p.db.set_kv("daemon", {"pid": os.getpid(), "host": hostname(), "started": time.time()})
+        self._check_config()
         from .web import serve
         threading.Thread(target=serve, args=(self,), daemon=True).start()
         self._keep_awake()
@@ -269,6 +270,18 @@ class Daemon:
                  "progress": self._progressed or None}))
         except OSError:
             pass
+
+    def _check_config(self) -> None:
+        """Say once (per distinct finding) what in project.json no code reads, or which push check
+        is no command, so a typo or a sentence there does not fail a push much later."""
+        try:
+            from .project import config_problems
+            probs = config_problems(self.p.raw_config())
+            if probs:
+                key = "config_problems:" + hashlib.sha1("\n".join(probs).encode()).hexdigest()[:10]
+                self.alert(key, "project.json: " + "; ".join(probs), severity="low", every_s=30 * 86400)
+        except Exception:
+            log(self.p, "config check: " + traceback.format_exc().replace("\n", " | ")[:1000])
 
     def _note_boot(self) -> None:
         """On a new boot, keep what the earlier boot's last heartbeat said (when, and the resources

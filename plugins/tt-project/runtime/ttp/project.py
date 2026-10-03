@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import difflib
 import json
 import os
 import re
@@ -111,6 +112,62 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "upstream": {"ingest": False},
 }
 
+
+# project.json keys the runtime reads beyond DEFAULT_CONFIG: identity written at creation, open
+# sections, and settings that have no default. A key in neither is reported as unknown.
+META_KEYS = {"name", "id", "host", "root", "created", "tt_project_version", "pricing", "restrictions"}
+EXTRA_KEYS = {
+    "budget": {"max_waits", "hourly_floor_usd"},
+    "coordinator": {"max_review_tasks_per_day"},
+    "notify": {"slack_poll_s"},
+    "delivery": {"base_ref", "push_branch", "push_checks", "push_rounds", "push_wait_s"},
+}
+OPEN_SECTIONS = {"resources"}           # any name below is fine
+PROVIDER_KEYS = {"tiers", "plugin_dirs", "worker_isolation", "mcp_servers"}
+
+
+def _known_keys(path: list[str]) -> set[str] | None:
+    """The keys allowed at `path` in project.json, or None when anything goes there."""
+    if not path:
+        return set(DEFAULT_CONFIG) | META_KEYS
+    if path[0] in OPEN_SECTIONS or path[0] in META_KEYS:
+        return None
+    if path[0] == "providers":
+        return {"claude", "codex", "cursor", "fake"} if len(path) == 1 else PROVIDER_KEYS if len(path) == 2 else None
+    if len(path) == 1 and isinstance(DEFAULT_CONFIG.get(path[0]), dict):
+        return set(DEFAULT_CONFIG[path[0]]) | EXTRA_KEYS.get(path[0], set())
+    return None
+
+
+def unknown_key_hint(dotted: str) -> str | None:
+    """'unknown key ... (did you mean ...?)' when no part of the runtime reads `dotted`, else None."""
+    parts = dotted.split(".")
+    for i, part in enumerate(parts):
+        known = _known_keys(parts[:i])
+        if known is None:
+            return None
+        if part not in known:
+            near = difflib.get_close_matches(part, sorted(known), n=1, cutoff=0.6)
+            guess = ".".join(parts[:i] + near[:1])
+            return f"unknown key {dotted}" + (f" (did you mean {guess}?)" if near else "")
+    return None
+
+
+def config_problems(raw: dict) -> list[str]:
+    """Unknown keys and non-command push_checks in a project's own settings, one line each."""
+    out: list[str] = []
+
+    def walk(node: dict, path: list[str]) -> None:
+        for k, v in node.items():
+            hint = unknown_key_hint(".".join(path + [str(k)]))
+            if hint:
+                out.append(hint)
+            elif isinstance(v, dict) and _known_keys(path + [str(k)]) is not None:
+                walk(v, path + [str(k)])
+    walk(raw, [])
+    from .push import check_problems    # push imports this module
+    out += [f"delivery.push_checks: {p}" for p in check_problems((raw.get("delivery") or {}).get("push_checks"))]
+    return out
 
 def deep_merge(base: dict, over: dict) -> dict:
     out = copy.deepcopy(base)

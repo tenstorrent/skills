@@ -1085,6 +1085,16 @@ def cmd_config(a) -> None:
         val = json.loads(a.value)
     except ValueError:
         val = a.value
+    from .project import unknown_key_hint
+    hint = unknown_key_hint(a.key)
+    if hint:
+        die(hint)
+    if a.key == "delivery.push_checks":
+        from .push import checks_of
+        try:
+            val = checks_of(val)
+        except ValueError as e:
+            die(str(e))
     p.set_config(a.key, val)
     print(f"{a.key} = {json.dumps(val)}")
 
@@ -1357,6 +1367,9 @@ def cmd_doctor(a) -> None:
     print(f"slack: {'bot saved' if (sec.get('slack') or {}).get('bot_token') else 'not configured'}"
           f" · enabled in project: {p.config()['notify'].get('slack')}")
     print(web_line(p))
+    from .project import config_problems
+    for line in config_problems(p.raw_config()):
+        print(f"project.json: {line}")
 
 
 class _Version(argparse.Action):

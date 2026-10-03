@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -43,6 +45,40 @@ def check_list(v: Any) -> list[str]:
             v = text.splitlines()
     return [str(c).strip() for c in (v or []) if str(c).strip()]
 
+
+
+# Shell builtins and keywords a check may start with; anything else must be a program on PATH or a path.
+BUILTINS = {".", ":", "[", "[[", "!", "(", "{", "bash", "sh", "cd", "command", "eval", "exec", "exit",
+            "export", "false", "for", "if", "set", "source", "test", "true", "type", "ulimit", "umask",
+            "unset", "while", "case", "time", "env"}
+
+
+def check_problem(cmd: str) -> str | None:
+    """Why `cmd` cannot be a check command (its first word is no program, path or builtin), or None."""
+    try:
+        words = shlex.split(cmd)
+    except ValueError as e:
+        return f"{cmd!r} does not parse as a shell command ({e})"
+    while words and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[0]):   # leading VAR=value
+        words.pop(0)
+    if not words:
+        return None
+    first = words[0]
+    if "/" in first or first in BUILTINS or shutil.which(first):
+        return None
+    return f"{cmd!r}: {first!r} is not a program on PATH, a path or a shell builtin; push_checks are commands"
+
+
+def check_problems(v: Any) -> list[str]:
+    return [p for p in map(check_problem, check_list(v)) if p]
+
+
+def checks_of(v: Any) -> list[str]:
+    """`check_list`, rejecting entries that are not commands (e.g. a sentence describing the checks)."""
+    bad = check_problems(v)
+    if bad:
+        raise ValueError("; ".join(bad))
+    return check_list(v)
 
 def _git(repo: Path, *args: str, quiet: bool = True) -> subprocess.CompletedProcess:
     """Run git; when not quiet its output goes to stderr, keeping stdout for the verdict."""
