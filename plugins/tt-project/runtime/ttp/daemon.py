@@ -962,7 +962,7 @@ class Daemon:
                 self.alert(f"auth:{r['provider']}",
                            f"{r['provider']} on {hostname()} is logged out ({(usage.final_text or usage.error)[:120]}). "
                            f"Log in once on that machine ({prov.login_hint}). "
-                           f"Work resumes by itself; queued messages are kept.", "high", every_s=4 * 3600)
+                           f"Work resumes by itself; queued messages are kept.", "high")
             if r["role"] == "coordinator":
                 self._finish_coordinator(r, usage, status, note)
             else:
@@ -2412,26 +2412,57 @@ class Daemon:
 
     # notifications and Slack -------------------------------------------------------------------------
     def alert(self, key: str, text: str, severity: str = "high", every_s: float = 6 * 3600) -> None:
-        """Deduplicated broadcast: the same condition alerts at most once per `every_s`, across
-        daemon restarts too (an upgrade must not re-announce a condition the user already has).
-        The key is kept as the message's ref and, for a high alert, opens an episode that clears
-        itself once the condition does (alerts.sweep); the same condition may then alert again."""
+        """Deduplicated broadcast, across daemon restarts too (an upgrade must not re-announce a
+        condition the user already has). A high alert with a key opens an episode that clears
+        itself once the condition does (alerts.sweep); while it is open a repeat only updates the
+        episode's `last`, with one reminder after alerts.REMIND_S. Other alerts go out at most once
+        per `every_s`; `every_s=0` is for callers that alert only when the condition starts again.
+        A machine-wide condition is broadcast by the one project holding its claim; the others post
+        it quietly (web app and status only)."""
         now = time.time()
         db = self.p.db
+        tracked = alerts.tracked("alert", severity, key)
+        claim_key = self._machine_wide(key) if tracked else None
         with db.tx():   # marked sent only together with the message
             sent = db.kv("alerts_sent", {})
-            if now - float(sent.get(key, 0)) < every_s:
+            last = float(sent.get(key, 0))
+            ep = db.one("SELECT * FROM alerts WHERE key=? AND cleared IS NULL ORDER BY id DESC LIMIT 1",
+                        (key,)) if tracked else None
+            if ep and every_s and (now - ep["raised"] < alerts.REMIND_S or last >= ep["raised"] + alerts.REMIND_S):
+                db.x("UPDATE alerts SET last=? WHERE id=?", (now, ep["id"]))
                 return
+            if not ep and not tracked and now - last < every_s:
+                return
+            quiet = bool(claim_key) and not alerts.claim(claim_key, key, str(self.p.base), now)
             sent[key] = now
             # Kept as long as the longest interval any alert uses, so a monthly one is not forgotten
             # (and re-sent) after a week.
             db.set_kv("alerts_sent", {k: v for k, v in sent.items() if now - float(v) < ALERT_KEEP_S})
-            db.post("out", text, chat=None, kind="alert", severity=severity, ref=key)
+            if ep and quiet:
+                db.x("UPDATE alerts SET last=? WHERE id=?", (now, ep["id"]))   # the reminder is the claimer's
+                return
+            db.post("out", text, chat=None, channel=alerts.QUIET if quiet else "chat", kind="alert",
+                    severity=severity, ref=key)
+
+    def _machine_wide(self, key: str) -> str | None:
+        """The per-user claim key of a condition every project on this machine sees alike: a
+        logged-out CLI, or a low disk on the filesystem the guard found short. None otherwise."""
+        if key.startswith("auth:"):
+            return f"{hostname()}|{key}"
+        if key == "disk":
+            path = (self.p.db.kv("disk_low") or {}).get("path")
+            try:
+                return f"{hostname()}|disk|{os.stat(path).st_dev}" if path else None
+            except OSError:
+                return None
+        return None
 
     def sweep_alerts(self) -> None:
         """Close alert episodes whose condition cleared (stored with the time; the chats hear it once)."""
         for ep in alerts.sweep(self.p.db):
             log(self.p, f"alert cleared: {ep['key']} ({ep['cleared_why']})")
+            if ep["key"].startswith("auth:") or ep["key"] == "disk":
+                alerts.release(ep["key"], str(self.p.base))   # the next project to see it broadcasts it
             kind, _, prov = ep["key"].partition(":")
             if kind == "auth":
                 # Tasks dispatch skips for another reason (the disk guard) would keep a stale note.
@@ -2460,7 +2491,8 @@ class Daemon:
         for m in rows:
             wanted = SEVERITY_RANK.get(m["severity"], 1) >= floor or (m["kind"] == "ask" and m["ref"] in approval_asks)
             to_slack = ((m["chat"] is None and wanted and m["kind"] != "info"
-                         and not cleared(db, m, time.time())) or m["chat"] == "slack")
+                         and m["channel"] != alerts.QUIET and not cleared(db, m, time.time()))
+                        or m["chat"] == "slack")
             if to_slack:
                 try:
                     thread = m["ref"] if m["chat"] == "slack" else None

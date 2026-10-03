@@ -8,16 +8,29 @@ and why; nothing is deleted. Readers (web app, `ttp status`, chat relay, desktop
 ask `active()`, which also checks the condition live, so a cleared alert disappears at once.
 
 A host reboot is information only: it is posted as kind `info` and never opens an episode.
+
+One condition is one broadcast: while its episode is open a repeat only updates `last`, with one
+reminder once a day has passed. A condition every project on the machine sees (a logged-out CLI, a
+full shared disk) is broadcast by one of them: the first takes a claim in the per-user tt-project
+folder, and the others post theirs on the `quiet` channel, shown in the web app and `ttp status`
+but never sent to a chat, Slack or the desktop.
 """
 from __future__ import annotations
 
+import fcntl
+import json
+import os
 import time
+from pathlib import Path
 
 from . import prguard
 from .db import DB, SEVERITY_RANK
 from .schedule import failing
 
 DAY = 86400.0
+REMIND_S = DAY          # an open episode is broadcast again once, this long after it was raised
+QUIET = "quiet"         # channel of a broadcast that stays out of chats (another project has the claim)
+CLAIM_TTL = DAY + 3600  # a claim its holder stopped renewing (gone, or no reminder) passes on after this
 FEED_DAYS = 7
 # What the chat hears once an episode clears.
 CLEARED_TEXT = {
@@ -146,10 +159,75 @@ def sweep(db: DB, now: float | None = None) -> list[dict]:
                 sent.pop(ep["key"])
                 db.set_kv("alerts_sent", sent)
             if kind in CLEARED_TEXT:
+                # A quiet episode clears quietly: the project holding the claim tells the chats.
+                first = db.one("SELECT channel FROM messages WHERE id=?", (ep["message"],)) if ep["message"] else None
                 db.post("out", "Cleared: " + CLEARED_TEXT[kind].format(arg=arg), chat=None, kind="resolved",
-                        severity="normal", ref=ep["key"])
+                        severity="normal", ref=ep["key"],
+                        channel=QUIET if first and first["channel"] == QUIET else "chat")
             closed.append({**ep, "cleared": now, "cleared_why": why})
     return closed
+
+
+def claims_path() -> Path:
+    from .project import HOME_DIR
+    return HOME_DIR / "alert-claims.json"
+
+
+def claim(claim_key: str, key: str, owner: str, now: float) -> bool:
+    """Take or renew this user's claim on broadcasting a machine-wide condition. False while another
+    project holds a live claim. A claim file that cannot be read or written never silences anyone."""
+    path = claims_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(str(path.with_suffix(".lock")), os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        return True
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)   # several daemons of this user share the file
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            data = {}
+        data = {k: v for k, v in (data if isinstance(data, dict) else {}).items()
+                if isinstance(v, dict) and now - float(v.get("ts") or 0) < CLAIM_TTL}
+        held = data.get(claim_key)
+        if held and held.get("owner") != owner:
+            return False
+        data[claim_key] = {"owner": owner, "alert": key, "ts": now}
+        from .project import write_json
+        write_json(path, data, 0o600)
+        return True
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
+
+
+def release(key: str, owner: str) -> None:
+    """Drop this project's claims for an alert key once its episode cleared, so the next project
+    that sees the condition broadcasts it at once."""
+    path = claims_path()
+    if not path.exists():
+        return
+    try:
+        fd = os.open(str(path.with_suffix(".lock")), os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return
+        keep = {k: v for k, v in data.items()
+                if not (isinstance(v, dict) and v.get("owner") == owner and v.get("alert") == key)}
+        if keep != data:
+            from .project import write_json
+            write_json(path, keep, 0o600)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
 
 KEYLESS_TTL = 3600   # seconds an alert without a condition key stays in the top section

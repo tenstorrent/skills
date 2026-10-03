@@ -985,6 +985,65 @@ def test_alerts_are_not_repeated_after_a_daemon_restart(env):
     assert len(p.db.q("SELECT id FROM messages WHERE text='logged out'")) == 1
 
 
+
+def test_an_open_alert_episode_is_not_rebroadcast_and_reminds_once_after_a_day(env, monkeypatch):
+    p = make(env)
+    from ttp.daemon import Daemon
+    start = time.time()
+    clock = {"t": start}
+    monkeypatch.setattr(time, "time", lambda: clock["t"])
+    d = Daemon(p.base)
+    sent = lambda: p.db.q("SELECT text FROM messages WHERE kind='alert' AND ref='auth:fake'")
+    for hours in (0, 4.5, 9, 23):   # the old 4-hourly repeat
+        clock["t"] = start + hours * 3600
+        d.alert("auth:fake", f"fake is logged out ({hours} h)", "high", every_s=4 * 3600)
+    assert [m["text"] for m in sent()] == ["fake is logged out (0 h)"]
+    assert _episodes(p, "auth:fake")[0]["last"] == start + 23 * 3600, "a repeat updates the episode"
+    for hours in (25, 30, 49, 73):
+        clock["t"] = start + hours * 3600
+        Daemon(p.base).alert("auth:fake", f"fake is logged out ({hours} h)", "high")
+    assert [m["text"] for m in sent()] == ["fake is logged out (0 h)", "fake is logged out (25 h)"], \
+        "one reminder after a day, then quiet"
+    assert len(_episodes(p, "auth:fake")) == 1
+
+
+def test_a_machine_wide_alert_is_broadcast_by_one_project_and_shown_quietly_by_the_others(env):
+    p = make(env)
+    from ttp import notifier
+    from ttp.cli import bootstrap
+    from ttp.daemon import Daemon
+    from ttp.web import attention
+    repo2 = env["tmp"] / "repo2"
+    subprocess.run(["git", "clone", "-q", str(env["repo"]), str(repo2)], check=True)
+    q = bootstrap(repo2, "second", "Another project.", "fake")
+    for x in (p, q):
+        x.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)",
+               (time.time(), "t", time.time()))
+    Daemon(p.base).alert("auth:fake", "fake is logged out", "high")
+    Daemon(q.base).alert("auth:fake", "fake is logged out", "high")
+    assert [m["text"] for m in p.db.unread_for_chat("c1", 0)] == ["fake is logged out"]
+    assert q.db.unread_for_chat("c1", 0) == [], "the second project told the chat again"
+    assert [a["cleared"] for a in notifier.alerts_since(q, 0)] == [True], "the desktop would show it twice"
+    assert [m["text"] for m in attention(q.db, time.time())] == ["fake is logged out"], "web and status show it"
+    # A condition only one project has (its own schedule) is not machine-wide.
+    Daemon(q.base).alert("coordinator", "The coordinator failed", "high")
+    q.db.set_kv("coordinator_failures", 1)
+    assert [m["text"] for m in q.db.unread_for_chat("c1", 0)] == ["The coordinator failed"]
+    # Once the claimer's episode clears, the claim is released: the other project may broadcast.
+    p.db.x("INSERT INTO runs(role,provider,started,ended,status) VALUES('worker','fake',?,?,'ok')",
+           (time.time() + 1, time.time() + 1))
+    Daemon(p.base).sweep_alerts()
+    q.db.x("INSERT INTO runs(role,provider,started,ended,status) VALUES('worker','fake',?,?,'ok')",
+           (time.time() + 1, time.time() + 1))
+    Daemon(q.base).sweep_alerts()
+    assert [m["text"] for m in q.db.unread_for_chat("c1", 0)] == ["The coordinator failed"], \
+        "a quiet episode clears quietly"
+    Daemon(q.base).alert("auth:fake", "fake is logged out again", "high")
+    Daemon(p.base).alert("auth:fake", "fake is logged out again", "high")
+    assert [m["text"] for m in q.db.unread_for_chat("c1", 0)][-1] == "fake is logged out again"
+    assert [m["text"] for m in p.db.unread_for_chat("c1", 0)][-1] == "Cleared: fake works again: a run succeeded after the logout alert."
+
+
 def test_productive_burst_is_not_a_runaway_but_waste_is(env):
     p = make(env)
     from ttp import budget as bud

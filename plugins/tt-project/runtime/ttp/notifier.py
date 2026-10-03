@@ -34,13 +34,14 @@ def alerts_since(p: Project, after: int, floor: str = "high") -> list[dict]:
     levels = [s for s, r in SEVERITY_RANK.items() if r >= rank]
     db = DB(p.state / "project.db")
     try:
-        rows = db.q("SELECT id, ts, kind, severity, text, ref FROM messages WHERE direction='out' AND chat IS NULL "
+        rows = db.q("SELECT id, ts, kind, severity, text, ref, channel FROM messages WHERE direction='out' AND chat IS NULL "
                     f"AND id>? AND severity IN ({','.join('?' * len(levels))}) ORDER BY id LIMIT 50",
                     (after, *levels))
         now = time.time()
         for r in rows:
             # Information (a host reboot) is never pushed as an alert; the cursor still moves past it.
-            r["cleared"] = r["kind"] == "info" or cleared(db, r, now)
+            # So is a quiet alert: another project on this machine already raised the same condition.
+            r["cleared"] = r["kind"] == "info" or r.pop("channel") == "quiet" or cleared(db, r, now)
             del r["ref"]
     finally:
         db.close()
