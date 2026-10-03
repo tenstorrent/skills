@@ -273,7 +273,8 @@ def _plan(db: DB, g: Gate, provider: str, plan: list[Window], line: float, most:
                 _raise(g, "orange", f"{w.window} window at {w.utilization:.0f}%, just under the {line:.0f}% line "
                                     f"and no burn measured yet: one worker at a time")
                 row["allowed"] = 1
-        elif fit <= running:
+        elif fit < most and fit <= running:
+            # Busy slots alone are no hold: only when the headroom is what limits the starts.
             held = (f"the {running} running workers may add ~{running * add:.1f} points before they end"
                     if running else f"one more run may add ~{add:.1f} points")
             _raise(g, "orange", f"{w.window} window at {w.utilization:.0f}%, {headroom:.1f} points under the "
@@ -286,7 +287,7 @@ def _plan(db: DB, g: Gate, provider: str, plan: list[Window], line: float, most:
     g.max_parallel = allowed
     g.numbers.update({"window": worst["window"], "utilization": worst["utilization"], "limit": line,
                       "resets_at": worst["resets_at"], "headroom": worst["headroom"], "running": running,
-                      "starts": allowed > running, "plan": rows})
+                      "starts": allowed > running or 0 < allowed >= most, "plan": rows})
 
 
 def run_horizon(db: DB, provider: str, now: float) -> float:

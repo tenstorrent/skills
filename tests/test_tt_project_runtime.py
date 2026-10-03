@@ -155,6 +155,21 @@ def test_plan_windows_run_every_worker_below_the_line_and_keep_the_reserve(env):
     assert red.level == "red" and not red.allow_new_work and red.max_parallel == 0
 
 
+def test_all_slots_busy_far_below_the_line_stays_green(env):
+    """Six workers busy at 20% burning 1 point/h each: the headroom fits all six, so busy slots are
+    not a hold. No orange, no 'no new starts', full parallelism."""
+    p = make(env)
+    from ttp import budget as bud
+    cfg = p.config()
+    now = time.time()
+    resets = now + 3 * 3600
+    _plan_setup(p, now, resets, [(60, 14), (30, 17), (0, 20)], [(90, None)] * 6)
+    g = bud.evaluate(p.db, cfg, "claude", [bud.Window("claude", "five_hour", 20, resets)], now)
+    assert g.numbers["plan"][0]["per_worker_per_h"] == 1.0, g.numbers
+    assert g.level == "green" and g.max_parallel == 6 and not g.reasons, (g.reasons, g.numbers)
+    assert g.numbers["starts"] is True and g.allow_optional, g.numbers
+
+
 def _plan_setup(p, now, resets, readings, runs):
     """Five-hour window readings (minutes ago, percent) and worker runs (minutes ago started, ended)."""
     for ago, util in readings:

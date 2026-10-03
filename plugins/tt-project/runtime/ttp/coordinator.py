@@ -211,8 +211,7 @@ def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int]) ->
                         else "no burn measured yet")
                 parts.append(f"{w['window']} {w['utilization']}% used, {w.get('headroom')} points to the line, "
                              f"resets in {left}, {burn}")
-            starts = ("new starts allowed" if g.get("allow_new_work") and g["max_parallel"] > n.get("running", 0)
-                      else "no new starts")
+            starts = "new starts allowed" if g.get("allow_new_work") and n.get("starts") else "no new starts"
             money = ("plan windows (unused capacity is lost at each reset; all slots run up to the "
                      f"{n.get('limit')}% line, which is never crossed): " + "; ".join(parts) + f" · {starts}")
             if g.get("level") == "green":
