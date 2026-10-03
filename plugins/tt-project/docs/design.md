@@ -26,6 +26,10 @@ in `state/runs/<id>/`, so a daemon restart never loses a result.
 
 1. Models never poll. The daemon polls; a model runs only for a decision or a task.
 2. At most one coordinator turn at a time; turns are debounced, batched and capped per hour.
+   Routine events (a task done, its follow-ups and notes, normal observations) wait up to
+   `coordinator.batch_s` for company, only while every worker slot is busy or runnable work is
+   queued; user messages, failed, blocked or review hand-offs, high events and an idle slot with
+   nothing to run wake it at once.
    A retry the daemon schedules by itself (after a refusal or a run with no verdict) starts no
    turn; the final attempt's outcome does. The daily review skips a period with no work.
 3. No run starts when its provider's gate forbids it. Every run has a wall clock and a budget.

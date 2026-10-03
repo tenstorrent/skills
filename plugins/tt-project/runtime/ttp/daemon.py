@@ -1496,8 +1496,8 @@ class Daemon:
         if now < float(db.kv("coordinator_backoff_until", 0)):
             return
         msgs = db.q("SELECT id, ts, chat FROM messages WHERE direction='in' AND handled=0 ORDER BY id LIMIT 30")
-        evs = db.q("SELECT id, ts FROM events WHERE status='queued' ORDER BY id LIMIT ?",
-                   (int(c.get("max_events_per_turn", 40)),))
+        queued = db.q("SELECT id, ts, kind, severity FROM events WHERE status='queued' ORDER BY id")
+        evs = queued[:int(c.get("max_events_per_turn", 40))]
         wake: dict = {}
         w: dict | None = None
         if not msgs and not evs:
@@ -1515,6 +1515,8 @@ class Daemon:
             oldest = min([m["ts"] for m in msgs] + [e["ts"] for e in evs])
             debounce = float(c.get("debounce_s", 15))
             if now - newest < debounce and now - oldest < 4 * debounce:
+                return
+            if not msgs and self._batch_hold(queued, now):
                 return
         hour_turns = db.one("SELECT COUNT(*) n FROM runs WHERE role='coordinator' AND started>?", (now - 3600,))["n"]
         if hour_turns >= int(c.get("max_turns_per_hour", 30)) and not msgs:
@@ -1551,6 +1553,27 @@ class Daemon:
         db.set_kv("idle_wake", wake)
         if logged_out:
             db.set_kv(f"auth_probe:{provider}", now)
+
+    def _batch_hold(self, evs: list[dict], now: float) -> bool:
+        """Routine events (a task done, its follow-ups and notes, normal observations) wait up to
+        coordinator.batch_s so one turn reads several, but only while no worker slot would sit idle
+        for it: every slot is busy, or runnable queued work is there to fill the free ones."""
+        batch = float(self.cfg["coordinator"].get("batch_s", 300))
+        if batch <= 0 or not evs or now - min(e["ts"] for e in evs) >= batch:
+            return False
+        if not all(coord.batchable(e["kind"], e["severity"]) for e in evs):
+            return False
+        db = self.p.db
+        gate = self.gates.get(self.cfg.get("core_provider", "claude"))
+        busy = db.one("SELECT COUNT(*) n FROM runs WHERE role!='coordinator' AND status='running'")["n"]
+        slots = (gate.max_parallel if gate.allow_new_work else 0) if gate else \
+            int(self.cfg["budget"].get("max_parallel_workers", 6))
+        if busy >= slots:
+            return True   # no slot is free; nothing the turn queues could start before one is
+        paused = db.paused_resources()
+        return any(not coord.task_resources(t) & paused.keys()
+                   and not (t["blocked_reason"] or "").startswith((PAUSED_NOTE, LOGGED_OUT_NOTE))
+                   for t in db.ready_tasks())
 
     # workers ----------------------------------------------------------------------------------------
     def dispatch(self) -> None:

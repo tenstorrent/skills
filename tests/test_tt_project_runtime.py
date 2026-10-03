@@ -13721,3 +13721,89 @@ def test_pr_watch_turns_ci_failures_and_bot_comments_into_work_before_the_review
     graph["data"]["repository"]["pullRequest"]["comments"]["nodes"].append(
         {"author": human, "createdAt": "2026-01-03T00:00:00Z", "url": "c2"})
     assert watchers.bot_open(graph) == []
+
+
+def _batch_setup(env, monkeypatch, busy):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    p.db.x("UPDATE events SET status='handled'")
+    p.db.x("UPDATE tasks SET status='done'")
+    p.set_config("budget.max_parallel_workers", 2)
+    d.cfg = p.config()
+    d.update_gates()
+    clock = [time.time()]
+    starts = _count_turns(d, monkeypatch, clock)
+    for _ in range(busy):
+        p.db.x("INSERT INTO runs(role, started, status) VALUES('worker', ?, 'running')", (clock[0],))
+    return p, d, clock, starts
+
+
+def _event(p, clock, kind, severity="normal"):
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+           (clock[0], "task:1", kind, severity, f"{kind} happened", "queued"))
+
+
+def _turn_within(d, clock, starts, seconds, step=5):
+    n, end = len(starts), clock[0] + seconds
+    while clock[0] < end and len(starts) == n:
+        d.maybe_coordinate()
+        clock[0] += step
+    return len(starts) > n
+
+
+def test_routine_events_wait_for_company_while_every_slot_is_busy(env, monkeypatch):
+    p, d, clock, starts = _batch_setup(env, monkeypatch, busy=2)
+    batch = float(p.config()["coordinator"]["batch_s"])
+    assert batch == 300
+    _event(p, clock, "task_done")
+    _event(p, clock, "followup_proposed")
+    assert not _turn_within(d, clock, starts, 120), "a routine hand-off woke a turn while every slot was busy"
+    _event(p, clock, "task_done")
+    _event(p, clock, "observation", "low")
+    assert _turn_within(d, clock, starts, batch), "the batch was held past coordinator.batch_s"
+    assert len(starts) == 1
+
+
+def test_routine_events_wait_while_runnable_work_fills_the_free_slot(env, monkeypatch):
+    p, d, clock, starts = _batch_setup(env, monkeypatch, busy=1)
+    p.db.add_task("next up", "s", origin="coordinator")
+    _event(p, clock, "task_done")
+    _event(p, clock, "task_notes")
+    assert not _turn_within(d, clock, starts, 120), "woke although queued work fills the free slot"
+    # Queued work held by a paused resource cannot fill the slot: the slot would sit idle.
+    p.db.x("UPDATE tasks SET blocked_reason='waits for a paused resource: x' WHERE status='queued'")
+    assert _turn_within(d, clock, starts, 30)
+
+
+def test_a_free_slot_with_nothing_runnable_wakes_at_once(env, monkeypatch):
+    p, d, clock, starts = _batch_setup(env, monkeypatch, busy=1)
+    _event(p, clock, "task_done")
+    debounce = float(p.config()["coordinator"]["debounce_s"])
+    assert _turn_within(d, clock, starts, debounce + 10)
+
+
+def test_urgent_events_and_messages_wake_at_once_even_with_every_slot_busy(env, monkeypatch):
+    debounce = None
+    for kind, severity in (("task_failed", "normal"), ("task_review", "normal"), ("task_blocked", "high"),
+                           ("observation", "high"), ("observation", "critical"), ("task_done", "high")):
+        p, d, clock, starts = _batch_setup(env, monkeypatch, busy=2)
+        debounce = float(p.config()["coordinator"]["debounce_s"])
+        _event(p, clock, "task_done")
+        _event(p, clock, kind, severity)
+        assert _turn_within(d, clock, starts, debounce + 10), f"{kind}/{severity} waited for the batch"
+        p.db.x("UPDATE events SET status='handled'")
+        monkeypatch.undo()
+    p, d, clock, starts = _batch_setup(env, monkeypatch, busy=2)
+    _event(p, clock, "task_done")
+    p.db.post("in", "status?", chat="c1", kind="user")
+    assert _turn_within(d, clock, starts, debounce + 10), "a user message waited for the batch"
+
+
+def test_batch_s_0_turns_batching_off(env, monkeypatch):
+    p, d, clock, starts = _batch_setup(env, monkeypatch, busy=2)
+    p.set_config("coordinator.batch_s", 0)
+    d.cfg = p.config()
+    _event(p, clock, "task_done")
+    assert _turn_within(d, clock, starts, float(d.cfg["coordinator"]["debounce_s"]) + 10)

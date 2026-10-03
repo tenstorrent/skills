@@ -74,6 +74,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     "debounce_s": 15, "max_events_per_turn": 40,
                     "max_turns_per_hour": 30, "max_new_tasks_per_day": 200, "idle_wake_s": 3600,
                     "starve_wake_s": 300,
+                    # Routine events (task done, follow-ups, notes, normal observations) wait up to
+                    # this long for company while every worker slot is busy or runnable work is queued.
+                    "batch_s": 300,
                     # The memory in the coordinator's cached system prompt is a snapshot, rebuilt
                     # after this long without a turn (the cache is cold by then) or once the entries
                     # added or retired since outgrow memory_delta_chars; until then they go in the digest.

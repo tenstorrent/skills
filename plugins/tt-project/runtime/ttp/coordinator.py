@@ -124,6 +124,13 @@ EVENT_CHARS = 1500
 # A plan's product arrives as these events; the daemon sizes them to fit, so they show whole.
 EVENT_CHARS_BY_KIND = {"followup_proposed": 4300, "task_notes": 6000, "upstream_note": 4300}
 HANDOFF_KINDS = ("task_done", "task_failed", "task_cancelled", "cancelled_but_done")
+# Events that may wait up to coordinator.batch_s for company while no worker slot would sit idle.
+# Failed, blocked and review hand-offs, high or critical events and user messages wake at once.
+BATCH_KINDS = ("task_done", "followup_proposed", "task_notes", "observation")
+
+
+def batchable(kind: str, severity: str) -> bool:
+    return kind in BATCH_KINDS and severity in ("low", "normal")
 MAX_TASKS_PER_DAY = 1000
 ASK_DEFAULTS_KEY = "ask_defaults"   # kv: {ask message id: recommendation}; no new ask is added
 _DEFAULT_NOTE = "\n\nIf there is no answer within "
