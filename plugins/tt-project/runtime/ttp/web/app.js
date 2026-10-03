@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 "use strict";
 const $ = (s) => document.querySelector(s);
-const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const ago = (ts) => { if (!ts) return "—"; const s = Date.now() / 1000 - ts; return s < 90 ? `${Math.round(s)}s` : s < 5400 ? `${Math.round(s / 60)}m` : s < 172800 ? `${(s / 3600).toFixed(1)}h` : `${Math.round(s / 86400)}d`; };
 const money = (x) => `$${(+x || 0).toFixed(2)}`;
 const at = (ts) => ts ? new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "—";
@@ -189,7 +189,7 @@ async function refresh() {
   $("#schedlist").innerHTML = `<table><tr><th>Name</th><th>Kind</th><th>Every</th><th>Last run</th><th>7-day cost</th><th>Daily budget</th><th>On</th></tr>` +
     st.schedules.map((s) => `<tr><td><b>${esc(s.name)}</b><div class="meta">${esc(s.description)}</div></td><td>${esc(s.kind)}</td><td>${Math.round(s.every_s / 60)} min</td>
       <td>${ago(s.last_run)} ago<div class="meta">${esc((s.last_status || "").startsWith("skipped: budget ") ? "waiting for budget" : s.last_status || "")}</div></td><td>${money(s.cost_7d)}</td>
-      <td><input type="number" min="0" step="0.5" value="${s.budget_usd_day ?? ""}" style="width:6em" onchange="setSched('${esc(s.name)}',{budget_usd_day:this.value})"></td>
+      <td><input type="number" min="0" step="0.5" value="${s.budget_usd_day == null ? "" : s.budget_usd_day}" style="width:6em" onchange="setSched('${esc(s.name)}',{budget_usd_day:this.value})"></td>
       <td><input type="checkbox" ${s.enabled ? "checked" : ""} onchange="setSched('${esc(s.name)}',{enabled:this.checked})"></td></tr>`).join("") + `</table>`;
   $("#accounts").innerHTML = (st.accounts || []).map((a) => `<div class="row"><b>${esc(a.provider)}</b><span class="meta">${esc(a.account || "unknown")}</span><span class="meta">last used ${ago(a.last)} ago</span></div>`).join("") || `<p class="muted">No runs yet.</p>`;
   bars($("#spendchart"), st.budget.daily_spend, "usd", "daily spend", cfg.budget && cfg.budget.daily_usd);

@@ -167,3 +167,22 @@ def test_worker_prompt_limits_search_scope():
     assert "Never search / or the home folder" in text
     for cmd in ("`find /`", "`find ~`", "`grep -r ~`", "`mdfind`", "git ls-files"):
         assert cmd in text, cmd
+
+
+def test_web_js_parses_on_old_node():
+    """The web app must stay ES2019 so older system node and browsers can run it."""
+    import shutil
+    import subprocess
+    files = sorted((RUNTIME / "web").glob("*.js"))
+    assert files
+    for f in files:
+        text = f.read_text()
+        bad = [m.group(0) for m in re.finditer(r"\?\?|\?\.(?!\d)", text)]
+        assert not bad, f"{f.name}: ES2020 syntax {bad} (use == null checks)"
+    node = shutil.which("node")
+    if not node:
+        import pytest
+        pytest.skip("node not installed")
+    for f in files:
+        r = subprocess.run([node, "--check", str(f)], capture_output=True, text=True)
+        assert r.returncode == 0, f"{f.name}: {r.stderr}"
