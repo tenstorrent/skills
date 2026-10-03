@@ -47,6 +47,7 @@ class Fake(Provider):
         u.final_text = json.dumps(data)
         u.structured = data if isinstance(data, dict) else None
         u.cost_usd = float(data.get("_cost", 0.0)) if isinstance(data, dict) else 0.0
+        u.output_tokens = int(data.get("_output_tokens", 0)) if isinstance(data, dict) else 0
         u.session_id = str(data.get("_session") or "") if isinstance(data, dict) else ""
         return u
 

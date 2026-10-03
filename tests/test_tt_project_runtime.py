@@ -9736,12 +9736,46 @@ def test_a_working_logged_out_probe_releases_the_coordinator_and_queue_before_it
     p.db.x("UPDATE runs SET cost_usd=0.4 WHERE id=?", (run,))
     d.sweep_alerts(); d.maybe_coordinate(); d.dispatch()
     assert started[:2] == ["small", "coordinator"] and sorted(started[2:]) == ["big", "other"], started
-    # Outliving the grace counts too, metered or not.
-    p.db.set_kv("limited:fake", {"until": 0, "note": "logged out"})
-    d.alert("auth:fake", "fake is logged out again", "high", every_s=0)
+    # Output tokens count too, priced or not; age alone does not.
     p.db.x("UPDATE runs SET cost_usd=0, started=? WHERE id=?", (time.time() + 1, run))
-    assert alerts.holds(p.db, "auth:fake", time.time(), time.time() + 5)
-    assert not alerts.holds(p.db, "auth:fake", time.time(), time.time() + alerts.AUTH_PROBE_GRACE_S + 5)
+    assert alerts.holds(p.db, "auth:fake", time.time(), time.time() + 3600)
+    p.db.x("UPDATE runs SET output_tokens=12 WHERE id=?", (run,))
+    assert not alerts.holds(p.db, "auth:fake", time.time(), time.time() + 5)
+
+
+def test_a_hung_logged_out_probe_holds_the_queue_until_it_shows_spend(env, monkeypatch, tmp_path):
+    """A provider CLI that hangs or retries while still logged out must not release the queue just
+    by running long: every queued run would then fail once on the logout. Through full ticks."""
+    p = make(env)
+    from ttp import alerts
+    d, started = _logged_out_daemon(p, monkeypatch)
+    d.dispatch()
+    assert started == ["small"]
+    now = time.time()
+    p.db.x("UPDATE alerts SET raised=raised-3600 WHERE key='auth:fake'")
+    p.db.set_kv("auth_probe:fake", now - 600)
+    run_dir = tmp_path / "probe"
+    run_dir.mkdir()
+    (run_dir / "lease").touch()
+    (run_dir / "output.jsonl").write_text(json.dumps({"error": "retrying"}))   # output, but nothing spent
+    run = p.db.x("INSERT INTO runs(role,provider,started,status,dir,boot_id) VALUES('worker','fake',?,'running',?,?)",
+                 (now - 600, str(run_dir), d.boot))
+    p.db.post("in", "status?", chat="cli")
+    p.db.x("UPDATE messages SET ts=ts-60")
+    for _ in range(3):
+        d.tick()
+    assert started == ["small"], "a probe hung past the old grace released the queue"
+    assert alerts.holds(p.db, "auth:fake", now - 3600, time.time() + 3600)
+    assert p.db.one("SELECT cleared FROM alerts WHERE key='auth:fake' ORDER BY id DESC")["cleared"] is None
+    # It starts spending: the login works and everything starts on the next tick.
+    (run_dir / "output.jsonl").write_text(json.dumps({"_cost": 0.3, "_output_tokens": 40}))
+    (run_dir / "lease").touch()
+    d._metered.clear()
+    d.tick()
+    row = p.db.one("SELECT cost_usd, output_tokens FROM runs WHERE id=?", (run,))
+    assert (row["cost_usd"], row["output_tokens"]) == (0.3, 40), row
+    assert p.db.one("SELECT cleared FROM alerts WHERE key='auth:fake' ORDER BY id DESC")["cleared"]
+    assert "coordinator" in started and {"big", "other"} <= set(started), started
 
 
 def test_a_cleared_logout_drops_the_held_note_on_tasks_dispatch_skips(env, monkeypatch):

@@ -732,7 +732,7 @@ class Daemon:
 
     def meter_running(self, every_s: float = 60) -> None:
         """Price runs still going from their stream, so status and the caps see a long run's spend
-        before it ends. `finish_run` replaces the figure with the final one."""
+        before it ends. `finish_run` replaces the figures with the final ones."""
         now = time.time()
         running = self.p.db.q("SELECT * FROM runs WHERE status='running'")
         self._metered = {k: v for k, v in self._metered.items() if k in {r["id"] for r in running}}
@@ -747,11 +747,14 @@ class Daemon:
                 continue
             self._metered[r["id"]] = (size, now)
             try:
-                cost = self._priced(r, get_provider(r["provider"]).parse(out))
+                usage = get_provider(r["provider"]).parse(out)
+                cost = self._priced(r, usage)
             except Exception:
                 continue
-            self.p.db.x("UPDATE runs SET cost_usd=?, cost_estimated=1 WHERE id=? AND status='running'",
-                        (cost, r["id"]))
+            # The tokens also show a run on a logged-out provider got past the login (alerts.holds).
+            self.p.db.x("UPDATE runs SET cost_usd=?, cost_estimated=1, input_tokens=?, output_tokens=? "
+                        "WHERE id=? AND status='running'",
+                        (cost, usage.input_tokens or 0, usage.output_tokens or 0, r["id"]))
 
     def _priced(self, r: dict, usage) -> float:
         if usage.estimated and not usage.cost_usd:
