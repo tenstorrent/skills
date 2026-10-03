@@ -61,7 +61,50 @@ def older(p: Project) -> dict | None:
     new_v, cur_v = runtime_version(lib), runtime_version(p.harness / "runtime")
     if not _num(new_v) or not _num(cur_v) or not is_newer(cur_v, new_v):
         return None
-    return {"installed": f"{new_v} ({runtime_commit(lib)})", "harness": cur_v}
+    out = {"installed": f"{new_v} ({runtime_commit(lib)})", "harness": cur_v}
+    if forced_version() == new_v:
+        out["forced"] = True
+    return out
+
+
+def forced_mark() -> Path:
+    """Written by `ttp setup --force` when it installs an older version over a newer one; names
+    that version. While lib/current still holds it, daemons leave the downgrade alone."""
+    return HOME_DIR / "lib" / "forced-downgrade"
+
+
+def forced_version() -> str:
+    try:
+        return forced_mark().read_text().strip()
+    except OSError:
+        return ""
+
+
+def restorable(at_least: str) -> Path | None:
+    """The newest complete release under ~/.tt-project/lib (runtime, template and launcher) whose
+    version is `at_least` or newer; None when there is none."""
+    best, best_v = None, ()
+    for d in (HOME_DIR / "lib").iterdir() if (HOME_DIR / "lib").is_dir() else ():
+        if d.name == "current" or d.is_symlink() or not d.is_dir():
+            continue
+        if not ((d / "runtime" / "ttp" / "__init__.py").is_file() and (d / "template").is_dir()
+                and (d / "bin" / "ttp").is_file()):
+            continue
+        v = _num(runtime_version(d / "runtime"))
+        if v and v >= _num(at_least) and v > best_v:
+            best, best_v = d, v
+    return best
+
+
+def point_current(target: Path) -> None:
+    """Re-point lib/current at `target` in one step (a new symlink renamed over the old one), so a
+    `ttp` starting meanwhile sees the old release or the new one, never none."""
+    cur = installed()
+    tmp = cur.with_name(f".current.{os.getpid()}.tmp")
+    if tmp.is_symlink() or tmp.exists():
+        tmp.unlink()
+    tmp.symlink_to(target)
+    os.replace(tmp, cur)
 
 
 def drift(p: Project) -> dict | None:

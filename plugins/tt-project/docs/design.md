@@ -97,7 +97,12 @@ What each supported CLI offers, with doc links: [providers.md](providers.md).
   notify. Each release is tried once: a merge conflict leaves one harness task and no hourly
   retries. `ttp config <name> upgrade.auto false` opts out; `ttp upgrade <name>` then applies it.
 - How a release reaches `lib/current`: `ttp setup`, run from a plugin's root, copies that plugin
-  into `~/.tt-project/lib/<version>` and points `lib/current` at it. With Claude Code, a plugin
+  into `~/.tt-project/lib/<version>` and points `lib/current` at it. It refuses to replace a
+  newer installed version unless run with `--force`, which leaves a `lib/forced-downgrade` marker
+  naming the version it installed. If `lib/current` still ends up older than a project's harness,
+  that project's daemon points it back at the newest complete `lib/<version>` at the harness
+  version or newer, and posts a low notice. It leaves a forced downgrade alone and raises one
+  self-clearing alert when nothing newer is left to point at. With Claude Code, a plugin
   update (`claude plugin update tt-project@<marketplace>`, or the marketplace's auto-update)
   only puts the new version in Claude Code's plugin cache. The skill runs
   `<plugin-root>/bin/ttp setup` again when `ttp --version` is older than the plugin it ships

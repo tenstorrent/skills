@@ -1686,12 +1686,24 @@ class Daemon:
             log(self.p, f"automatic upgrade did not start: {type(e).__name__}: {e}")
 
     def check_older_release(self) -> None:
-        """One alert, cleared by itself, while ~/.tt-project/lib/current holds an older version than
-        this harness runs: an older plugin's `ttp setup` replaced the newer install, so `ttp` on PATH,
-        remote shipping and automatic upgrades all work from the older release."""
+        """~/.tt-project/lib/current holds an older version than this harness runs: an older plugin's
+        `ttp setup` replaced the newer install, so `ttp` on PATH, remote shipping and automatic
+        upgrades all work from the older release. When a complete release at the harness version or
+        newer is still in ~/.tt-project/lib, point lib/current back at it and say so (low). Otherwise,
+        or when `ttp setup --force` made the downgrade on purpose, one alert that clears by itself."""
         db = self.p.db
         try:
             o = release.older(self.p)
+            back = (release.restorable(o["harness"]) if o and not o.get("forced")
+                    and release.installed().is_symlink() else None)
+            if back:
+                release.point_current(back)
+                log(self.p, f"installed tt-project {o['installed']} was older than this harness "
+                            f"({o['harness']}): lib/current now points at {back}")
+                db.post("out", f"An older tt-project ({o['installed']}) had replaced the installed release; "
+                               f"lib/current points at {back.name} again, so `ttp` on PATH and automatic "
+                               f"upgrades use it.", chat=None, kind="alert", severity="low")
+                o = release.older(self.p)
         except Exception as e:
             log(self.p, f"installed-release check failed: {type(e).__name__}: {e}")
             return
@@ -1702,11 +1714,14 @@ class Daemon:
             log(self.p, "the installed tt-project is no longer older than this harness")
             return
         log(self.p, f"installed tt-project {o['installed']} is older than this harness ({o['harness']})")
+        why = ("`ttp setup --force` installed it on purpose, so it is left as is"
+               if o.get("forced") else
+               f"an older plugin's `ttp setup` replaced a newer install, and ~/.tt-project/lib holds no "
+               f"{o['harness']} or newer to point back at")
         self.alert("release-older", f"The installed tt-project ({o['installed']}) is older than this harness "
-                                    f"({o['harness']}): an older plugin's `ttp setup` replaced a newer install. "
-                                    f"`ttp` on PATH and automatic upgrades now use the older release. Running "
-                                    f"`ttp setup` from a plugin at {o['harness']} or newer restores it; this "
-                                    f"alert clears by itself once it is.", "high")
+                                    f"({o['harness']}): {why}. `ttp` on PATH and automatic upgrades use the "
+                                    f"older release until `ttp setup` runs from a plugin at {o['harness']} or "
+                                    f"newer; this alert clears by itself then.", "high", every_s=0)
 
     def check_local_only(self) -> None:
         """A done code task may leave the only copy of its work on a local branch. Hourly, and in the

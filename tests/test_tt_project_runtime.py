@@ -3130,6 +3130,9 @@ def test_setup_never_downgrades_a_newer_install_without_force(env, tmp_path):
     r = setup("--force")
     assert r.returncode == 0, r.stderr
     assert (env["home"] / "lib" / "current").resolve() == (env["home"] / "lib" / __version__).resolve()
+    mark = env["home"] / "lib" / "forced-downgrade"
+    assert mark.read_text().strip() == __version__     # daemons leave a deliberate downgrade alone
+    assert setup().returncode == 0 and not mark.exists()
 
 
 @pytest.mark.parametrize("there,ships", [("newer", False), ("same", False), ("older", True), ("none", True)])
@@ -8970,6 +8973,78 @@ def test_an_installed_release_older_than_the_harness_raises_one_alert_that_clear
     d.sweep_alerts()
     assert not top() and not p.db.kv("release_older")
     assert p.db.q("SELECT id FROM messages WHERE ref='release-older' AND kind='resolved'")
+
+
+def _older_current(env, keep=True):
+    """lib/current as an older plugin's setup leaves it: a symlink to lib/0.0.1. With `keep`, the
+    harness's own release is still complete in lib/<version>."""
+    import shutil
+    from ttp import __version__
+    lib = env["home"] / "lib"
+    cur = lib / "current"
+    if keep:
+        shutil.copytree(cur, lib / __version__)
+    old = lib / "0.0.1"
+    cur.rename(old)
+    init = old / "runtime" / "ttp" / "__init__.py"
+    init.write_text(init.read_text().replace(f'"{__version__}"', '"0.0.1"'))
+    cur.symlink_to(old)
+    return lib
+
+
+def _release_older_alerts(p):
+    return p.db.q("SELECT text FROM messages WHERE ref='release-older' AND kind='alert'")
+
+
+def test_the_daemon_points_lib_current_back_at_a_complete_release_for_its_harness(env, monkeypatch):
+    from ttp import __version__, alerts
+    p, d, launches = _release_daemon(env, monkeypatch, newer=False)
+    lib = _older_current(env)
+    (lib / "9.9.9" / "runtime" / "ttp").mkdir(parents=True)     # incomplete: no template, no launcher
+    (lib / "9.9.9" / "runtime" / "ttp" / "__init__.py").write_text('__version__ = "9.9.9"\n')
+    d.check_release()
+    d.sweep_alerts()
+    assert (lib / "current").is_symlink() and (lib / "current").resolve() == (lib / __version__).resolve()
+    assert not p.db.kv("release_older") and not _release_older_alerts(p)
+    assert not [m for m in alerts.needs_you(p.db, time.time()) if "older" in m["text"]]
+    note = p.db.q("SELECT text, severity FROM messages WHERE kind='alert' AND text LIKE 'An older tt-project%'")
+    assert len(note) == 1 and note[0]["severity"] == "low" and f"points at {__version__} again" in note[0]["text"]
+    assert "ttp setup" not in note[0]["text"] and not launches
+    assert not list(lib.glob(".current.*"))
+
+
+def test_a_forced_downgrade_is_not_undone(env, monkeypatch):
+    from ttp import release
+    p, d, _ = _release_daemon(env, monkeypatch, newer=False)
+    lib = _older_current(env)
+    release.forced_mark().write_text("0.0.1\n")
+    d.check_release()
+    assert (lib / "current").resolve() == (lib / "0.0.1").resolve()
+    texts = _release_older_alerts(p)
+    assert len(texts) == 1 and "`ttp setup --force` installed it on purpose" in texts[0]["text"]
+
+
+def test_an_older_install_with_nothing_to_restore_alerts_and_alerts_again_when_it_returns(env, monkeypatch):
+    from ttp import __version__
+    p, d, _ = _release_daemon(env, monkeypatch, newer=False)
+    lib = _older_current(env, keep=False)
+    for _ in range(3):
+        d._release_due = 0
+        d.check_release()
+        d.sweep_alerts()
+    assert (lib / "current").resolve() == (lib / "0.0.1").resolve()
+    texts = _release_older_alerts(p)
+    assert len(texts) == 1 and f"holds no {__version__} or newer" in texts[0]["text"]
+    init = lib / "0.0.1" / "runtime" / "ttp" / "__init__.py"
+    init.write_text(init.read_text().replace('"0.0.1"', f'"{__version__}"'))
+    d._release_due = 0
+    d.check_release()
+    d.sweep_alerts()
+    assert not p.db.kv("release_older")
+    init.write_text(init.read_text().replace(f'"{__version__}"', '"0.0.1"'))    # back within the hour
+    d._release_due = 0
+    d.check_release()
+    assert len(_release_older_alerts(p)) == 2
 
 
 def test_the_same_version_from_another_commit_is_shown_but_never_auto_upgraded(env, monkeypatch):

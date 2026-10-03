@@ -1031,7 +1031,7 @@ def cmd_logs(a) -> None:
 def cmd_setup(a) -> None:
     """Install this runtime as the user's stable `ttp` (plugin caches move on every update)."""
     from .project import HOME_DIR
-    from .release import is_newer, runtime_version
+    from .release import forced_mark, is_newer, runtime_version
     lib = HOME_DIR / "lib" / __version__
     if not (PLUGIN_ROOT / "template").is_dir():
         die(f"{RUNTIME} is a project's harness copy, not the plugin; run `<plugin-root>/bin/ttp setup`", 1)
@@ -1053,6 +1053,10 @@ def cmd_setup(a) -> None:
     if cur.is_symlink() or cur.exists():
         cur.unlink()
     cur.symlink_to(lib)
+    if is_newer(installed, __version__):    # a deliberate downgrade: daemons must not undo it
+        forced_mark().write_text(__version__ + "\n")
+    else:
+        forced_mark().unlink(missing_ok=True)
     bindir = Path(a.bin_dir).expanduser()
     bindir.mkdir(parents=True, exist_ok=True)
     shim = bindir / "ttp"
