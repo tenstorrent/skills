@@ -100,5 +100,5 @@ Before you finish, write `$TTP_RUN_DIR/result.json`:
   `retry_after_s` that fits it.
 - Anything still running when you stop must be detached from your session
   (`setsid nohup <cmd> > <log> 2>&1 &`), or it is killed with you. Your own background tasks
-  and subagents do not outlive the run.
+  do not outlive the run.
 - No `result.json`, no credit: a run that ends without one counts as an unfinished attempt.

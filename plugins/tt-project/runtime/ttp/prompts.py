@@ -46,6 +46,53 @@ def charter_without_restrictions(charter: str) -> str:
     return "\n".join(out)
 
 
+def charter_sections(charter: str) -> list[tuple[str, list[str]]]:
+    """The charter split at its `## ` headings: (heading line, body lines) each, the text above the
+    first heading under "". Joining every heading and body line with newlines gives the charter back."""
+    out: list[tuple[str, list[str]]] = [("", [])]
+    for line in charter.splitlines():
+        if line.startswith("## "):
+            out.append((line, []))
+        else:
+            out[-1][1].append(line)
+    return out if out[0][1] else out[1:]
+
+
+def _placeholder(par: str) -> bool:
+    """A paragraph the template left to be filled in: wholly in parentheses, such as "(none stated
+    yet)", or ending in "(none stated yet)"."""
+    s = " ".join(par.split())
+    if s.endswith("(none stated yet)"):
+        return True
+    if not (s.startswith("(") and s.endswith(")")):
+        return False
+    depth = 0
+    for i, c in enumerate(s):
+        depth += (c == "(") - (c == ")")
+        if depth == 0:
+            return i == len(s) - 1   # the opening parenthesis closes only at the end
+    return False
+
+
+def charter_without_placeholders(charter: str) -> str:
+    """The charter minus placeholder paragraphs, and minus the sections left empty without them:
+    they tell a worker nothing and cost tokens in every prompt."""
+    out = []
+    for head, body in charter_sections(charter):
+        pars, cur = [], []
+        for line in body + [""]:
+            if line.strip():
+                cur.append(line)
+            elif cur:
+                pars.append(cur)
+                cur = []
+        kept = ["\n".join(par) for par in pars if not _placeholder(" ".join(par))]
+        if head and not kept:
+            continue
+        out.append("\n\n".join(kept) if not head else head + "\n" + "\n\n".join(kept))
+    return "\n\n".join(out) + "\n"
+
+
 def restrictions_block(p: Project) -> str:
     charter = p.charter_path.read_text() if p.charter_path.exists() else ""
     body = charter_restrictions(charter)
@@ -76,7 +123,7 @@ def worker_system(p: Project) -> str:
     # The restrictions open and close the prompt; a third copy inside the charter only costs tokens.
     charter = p.charter_path.read_text() if p.charter_path.exists() else "(none)"
     parts.append("# CHARTER (goals and policies; its restrictions are the binding block above)\n" +
-                 charter_without_restrictions(charter))
+                 charter_without_restrictions(charter_without_placeholders(charter)))
     mem = p.memory_text(limit_chars=WORKER_MEMORY_CHARS)
     if mem:
         parts.append("# PROJECT MEMORY\n" + mem)

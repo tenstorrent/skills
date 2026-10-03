@@ -23,7 +23,7 @@ from . import screen as scr
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
                  dependency_ids, dump_result, host_line, load_result, without_deferral)
-from .project import COORDINATOR_MEMORY_CHARS, WORKER_MEMORY_CHARS, Project, durable_append
+from .project import COORDINATOR_MEMORY_CHARS, WORKER_MEMORY_CHARS, Project, durable_append, durable_write
 from .runner import stop_runs
 
 ACTION_TYPES = ("reply", "task_add", "task_update", "ask_user", "resolve", "notify", "memory_add", "memory_forget",
@@ -56,6 +56,7 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "resources": {"type": "array", "items": {"type": "string"}}, "exclusive": {"type": "boolean"},
             "continues": {"type": "integer"}, "resource": {"type": "string"}, "paused": {"type": "boolean"},
             "reason": {"type": "string"}, "supersedes": {"type": "array", "items": {"type": "string"}},
+            "replaces": {"type": "string"},
             "source": {"type": "string"}, "match": {"type": "string"}, "hours": {"type": "number"},
             "below": {"type": "string"}, "why": {"type": "string"},
             "start_after": {"type": "string", "pattern": START_AFTER_RE}, "start_when": {"type": "string"}},
@@ -94,6 +95,7 @@ USER_SETTABLE = {
     "coordinator.ask_timeout_h": float,
 }
 
+CHARTER_HISTORY = "CHARTER.history.md"   # harness file: charter sections a newer one replaced
 REJECTED_KEY = "rejected_actions"   # kv: the last turn's rejected actions, shown in the next digest
 # kv: {"at": ts, "why": text}: a rejected action whose blocking condition clears at a known time.
 # The daemon wakes the coordinator then, so the turn's undone work does not wait for an idle wake.
@@ -641,9 +643,17 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 section = (a.get("section") or "Notes").strip().title()
                 text = a["text"].strip()
                 stamp = time.strftime("%Y-%m-%d") + (f", turn {key}" if key else "")
-                if not (key and _has_line(p.charter_path, f", turn {key})")):
-                    durable_append(p.charter_path, f"\n## {section} (added {stamp})\n{text}\n")
-                p.commit_harness([p.charter_path], f"charter ({section.lower()}): {a['text'].strip()[:80]}")
+                heading = f"## {section} (added {stamp})"
+                files, msg = [p.charter_path], f"charter ({section.lower()}): {text[:80]}"
+                if a.get("replaces"):
+                    files.append(p.harness / CHARTER_HISTORY)
+                if key and _has_line(p.charter_path, f", turn {key})"):
+                    pass   # this turn's update is already in: a retried turn must not add it twice
+                elif a.get("replaces"):
+                    msg += f" (replaces {_charter_replace(p, str(a['replaces']), heading, text, user_turn)})"
+                else:
+                    durable_append(p.charter_path, f"\n{heading}\n{text}\n")
+                p.commit_harness(files, msg)
                 if section.startswith("Restriction"):
                     _tell_running_workers(db, f"New binding restriction: {text}", key)
             elif t == "schedule_set":
@@ -1084,6 +1094,36 @@ def _append_update(steer: Path, text: str, key: str | None = None) -> None:
     if key and _has_line(steer, f"(turn {key})"):
         return
     durable_append(steer, f"\n## Update {time.strftime('%Y-%m-%d %H:%M')}{f' (turn {key})' if key else ''}\n{text.strip()}\n")
+
+
+def _charter_replace(p: Project, replaces: str, heading: str, text: str, user_turn: bool) -> str:
+    """Move the charter section headed `replaces` to CHARTER_HISTORY and add `heading` + `text` at
+    the end of the charter instead. Returns the replaced section's heading."""
+    from .prompts import charter_sections
+    want = " ".join(replaces.lstrip("#").split()).lower()
+    sections = charter_sections(p.charter_path.read_text())
+    names = [" ".join(h[3:].split()) for h, _ in sections]
+    hits = ([i for i, n in enumerate(names) if n and n.lower() == want]
+            or [i for i, n in enumerate(names) if n and n.lower().startswith(want)])
+    if len(hits) != 1:
+        raise ValueError(f"charter_update: `replaces` {replaces!r} matches {len(hits)} charter sections; give one "
+                         f"heading as the charter shows it: " + "; ".join(n for n in names if n))
+    old_head, old_body = sections[hits[0]]
+    name = names[hits[0]]
+    if name.lower().startswith("brief"):
+        raise ValueError("charter_update: the Brief is the user's own words and is never replaced")
+    if name.lower().startswith("restriction") and not user_turn:
+        raise ValueError(f"charter_update: retiring the restriction section {name!r} needs the user's word: ask_user "
+                         f"(blocking restriction) naming it, and replace it in the turn that carries their yes")
+    hist = p.harness / CHARTER_HISTORY
+    if not hist.exists():
+        durable_append(hist, "# Charter history\n\nSections replaced in CHARTER.md, oldest first.\n")
+    note = f"(replaced {time.strftime('%Y-%m-%d')} by \"{heading[3:]}\")"
+    if not (", turn " in heading and _has_line(hist, f"by \"{heading[3:]}\")")):   # a retried turn moves it once
+        durable_append(hist, f"\n{old_head}\n{note}\n" + "\n".join(old_body).strip("\n") + "\n")
+    kept = "\n".join(line for i, (h, b) in enumerate(sections) if i != hits[0] for line in ([h] if h else []) + b)
+    durable_write(p.charter_path, f"{kept.rstrip()}\n\n{heading}\n{text}\n")
+    return name
 
 
 def _has_line(path: Path, ending: str) -> bool:

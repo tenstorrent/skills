@@ -1479,6 +1479,58 @@ def test_charter_restrictions_lead_and_close_every_worker_prompt(env):
     assert "Draft PRs." in system
 
 
+def test_charter_update_replaces_moves_the_old_section_to_history(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    p.charter_path.write_text("# demo\n\n## Brief (verbatim from the user)\nKeep it tidy.\n\n"
+                              "## Policies (added 2026-09-01)\nPush every day.\n\n"
+                              "## Restrictions (added 2026-09-02)\nNever touch box A.\n\n"
+                              "## Goals (added 2026-09-03)\nShip v1.\n")
+    hist = p.harness / coord.CHARTER_HISTORY
+    act = {"type": "charter_update", "section": "Policies", "text": "Push once a week.",
+           "replaces": "## Policies (added 2026-09-01)"}
+    for _ in range(2):   # a retried turn changes nothing more
+        assert coord.apply(p, [act], turn=7) == []
+    charter = p.charter_path.read_text()
+    assert "Push every day." not in charter and charter.count("Push once a week.") == 1
+    assert charter.rstrip().endswith("Push once a week.") and "Ship v1." in charter and "Never touch box A." in charter
+    old = hist.read_text()
+    assert old.count("## Policies (added 2026-09-01)\n") == 1 and "Push every day." in old
+    assert ', turn 7.0)")' in old, "the history does not say what replaced it"
+    log = subprocess.run(["git", "-C", str(p.harness), "status", "--porcelain"], capture_output=True, text=True).stdout
+    assert "CHARTER" not in log, "the charter change is not committed"
+    # Restrictions retire only on the user's word; the Brief and unknown headings never.
+    retire = {"type": "charter_update", "section": "Notes", "text": "Box A is free to use.",
+              "replaces": "Restrictions (added 2026-09-02)"}
+    assert "needs the user's word" in coord.apply(p, [retire], turn=8)[0]
+    assert "Never touch box A." in p.charter_path.read_text()
+    assert coord.apply(p, [retire], turn=9, user_turn=True) == []
+    assert "Never touch box A." not in p.charter_path.read_text() and "Never touch box A." in hist.read_text()
+    assert "never replaced" in coord.apply(p, [{**retire, "replaces": "Brief"}], turn=10)[0]
+    assert "matches 0" in coord.apply(p, [{**retire, "replaces": "Resources"}], turn=11)[0]
+    assert p.charter_path.read_text().count("Box A is free to use.") == 1, "a rejected update was written"
+
+
+def test_worker_prompt_drops_placeholders_and_keeps_restrictions_verbatim(env):
+    p = make(env)
+    from ttp.prompts import worker_system
+    p.charter_path.write_text(
+        "# demo\n\n## Brief (verbatim from the user)\n\nKeep it tidy.\n\n"
+        "## Goals and success criteria\n\n(to be restated by the coordinator from the brief)\n\n"
+        "## Restrictions (binding on every task)\n\n(none stated yet)\n\n"
+        "## Resources\n\n(machines, devices — to be filled in)\n\nMachines this project may use (aliases\n"
+        "from `ttp machines list`): (none stated yet)\n\n"
+        "## Policies\n\n(drafts first)\n\n- Auto-merge repositories: none (the user merges).\n\n"
+        "## Restrictions (added 2026-09-30)\nNever push to main (the user merges).\n  - (and never force-push)\n")
+    system = worker_system(p)
+    for gone in ("(to be restated", "(none stated yet)", "## Goals and success criteria", "## Resources",
+                 "(machines", "(drafts first)"):
+        assert gone not in system, f"{gone!r} is still in the worker prompt"
+    assert "Keep it tidy." in system and "## Policies\n- Auto-merge repositories: none (the user merges)." in system
+    assert system.startswith("# BINDING RESTRICTIONS")
+    assert "\nNever push to main (the user merges).\n  - (and never force-push)\n" in system
+
+
 def _dispatch_claude_worker(p, monkeypatch, flags, kind="work"):
     from ttp import daemon as dmod
     from ttp.providers import claude
