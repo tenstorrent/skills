@@ -70,6 +70,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     "debounce_s": 15, "max_events_per_turn": 40,
                     "max_turns_per_hour": 30, "max_new_tasks_per_day": 200, "idle_wake_s": 3600,
                     "starve_wake_s": 300,
+                    # The memory in the coordinator's cached system prompt is a snapshot, rebuilt
+                    # after this long without a turn (the cache is cold by then) or once the entries
+                    # added or retired since outgrow memory_delta_chars; until then they go in the digest.
+                    "memory_refresh_s": 3300, "memory_delta_chars": 3000,
                     "turn_budget_usd": 1.0, "turn_timeout_s": 600,
                     "ask_timeout_h": 1},
     "notify": {"slack": False, "slack_min_severity": "high", "chat_min_severity": "normal"},
@@ -252,7 +256,7 @@ class Project:
             while path.exists() or (self.memory_dir / "archive" / path.name).exists():
                 path = self.memory_dir / f"{kind}-{slug}-{n}.md"
                 n += 1
-            path.write_text(f"---\nkind: {kind}\ncreated: {time.strftime('%Y-%m-%d')}\n{tag}---\n{text}\n")
+            path.write_text(f"---\nkind: {kind}\ncreated: {_stamp(time.time())}\n{tag}---\n{text}\n")
         index = self.memory_index.read_text() if self.memory_index.exists() else ""
         if f"](memory/{path.name})" not in index:
             with open(self.memory_index, "a") as f:
@@ -261,17 +265,23 @@ class Project:
         return path
 
     def _memory_entries(self) -> list[dict]:
-        """Live memory entries, oldest first: `name` (the file stem shown in prompts), `kind`, `line`."""
+        """Live memory entries, oldest first: `name` (the file stem shown in prompts), `kind`, `line`.
+        Ordered by the front matter's `created`, then name; the file's mtime stands in only where
+        `created` is missing, so a checkout or copy that touches the files does not reorder them
+        (which would change the coordinator's cached prompt)."""
         if not self.memory_dir.is_dir():
             return []
         out = []
-        for p in sorted(self.memory_dir.glob("*.md"), key=lambda p: (p.stat().st_mtime, p.name)):
+        for p in self.memory_dir.glob("*.md"):
             raw = p.read_text()
             head, body = (raw.split("---", 2)[1:] if raw.startswith("---") and raw.count("---") >= 2
                           else ("", raw))
             m = re.search(r"^kind:\s*(\S+)", head, re.M)
             kind = m.group(1) if m else p.stem.split("-", 1)[0]
-            out.append({"name": p.stem, "kind": kind, "line": f"[{p.stem}] {body.strip()}"})
+            c = re.search(r"^created:\s*(\S+)", head, re.M)
+            out.append({"name": p.stem, "kind": kind, "line": f"[{p.stem}] {body.strip()}",
+                        "order": (c.group(1) if c else _stamp(p.stat().st_mtime), p.stem)})
+        out.sort(key=lambda e: e.pop("order"))
         return out
 
     def memory_select(self, limit_chars: int = COORDINATOR_MEMORY_CHARS) -> tuple[list[dict], dict]:
@@ -314,6 +324,12 @@ class Project:
             self.memory_index.write_text("".join(x for x in lines if f"](memory/{name}.md)" not in x))
         self.commit_harness([dst, self.memory_index], f"memory retired: {name}", removed=[src])
         return dst
+
+def _stamp(ts: float) -> str:
+    """A memory entry's `created`: UTC to the microsecond, so entries sort in the order they were
+    written. Older entries carry the date alone, which sorts before any stamp of the same day."""
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ts)) + f".{int(ts % 1 * 1e6):06d}Z"
+
 
 def write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)

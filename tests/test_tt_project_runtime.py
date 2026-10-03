@@ -5895,6 +5895,96 @@ def test_memory_cli_retires_an_entry(env):
     assert (p.memory_dir / "archive" / stale.name).exists() and "Old news." not in p.memory_text()
 
 
+def _memory_section(digest):
+    """The digest's 'Memory added since the snapshot' lines, or [] when it has none."""
+    lines = digest.splitlines()
+    start = next((i for i, x in enumerate(lines) if x.startswith("## Memory added since the snapshot")), None)
+    if start is None:
+        return []
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("#")), len(lines))
+    return lines[start + 1:end]
+
+
+def test_memory_added_between_turns_waits_in_the_digest_and_keeps_the_system_prompt(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    p.add_memory("Box A is ours.", kind="resource")
+    before = coord.system_prompt(p)
+    assert "Box A is ours." in before and _memory_section(coord.digest(p, {}, [], [])) == []
+    assert coord.apply(p, [{"type": "memory_add", "text": "The nightly build takes 40 minutes."},
+                           {"type": "memory_add", "text": "Never reboot host03.", "memory_kind": "restriction"}],
+                       turn=1) == []
+    digest = coord.digest(p, {}, [], [])
+    assert coord.system_prompt(p) == before, "a memory change missed the prompt cache"
+    added = _memory_section(digest)
+    assert len(added) == 2 and "The nightly build takes 40 minutes." in added[0]
+    assert added[1].startswith("[restriction-") and "Never reboot host03." in added[1]
+
+
+def test_memory_retired_between_turns_is_named_in_the_digest_and_keeps_the_system_prompt(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    stale = p.add_memory("host01 is booked until Friday.", kind="fact")
+    before = coord.system_prompt(p)
+    assert "host01 is booked until Friday." in before
+    assert coord.apply(p, [{"type": "memory_forget", "name": f"[{stale.stem}]"}], turn=1) == []
+    digest = coord.digest(p, {}, [], [])
+    assert coord.system_prompt(p) == before
+    assert _memory_section(digest) == [f"[{stale.stem}] retired, ignore"]
+    assert "host01 is booked until Friday." not in digest
+
+
+def test_a_cold_cache_or_a_large_change_refreshes_the_memory_snapshot(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    start = time.time()
+    p.db.set_kv("last_coordinator_turn", start)
+    before = coord.system_prompt(p, now=start)
+    p.add_memory("Small fact.", kind="fact")
+    assert coord.system_prompt(p, now=start + 3000) == before, "refreshed while the cache is warm"
+    assert _memory_section(coord.digest(p, {}, [], []))
+    cold = coord.system_prompt(p, now=start + 3400)   # no turn for longer than memory_refresh_s
+    assert cold != before and "Small fact." in cold
+    assert _memory_section(coord.digest(p, {}, [], [])) == []
+    p.db.set_kv("last_coordinator_turn", time.time())
+    p.add_memory("Big fact. " + "z" * 3100, kind="fact")   # over memory_delta_chars
+    digest = coord.digest(p, {}, [], [])
+    assert _memory_section(digest) == [] and "z" * 3100 in coord.system_prompt(p)
+
+
+def test_a_charter_change_refreshes_the_memory_snapshot(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    coord.system_prompt(p)
+    p.add_memory("Use host01 for builds.", kind="decision")
+    assert _memory_section(coord.digest(p, {}, [], []))
+    assert coord.apply(p, [{"type": "charter_update", "section": "Goals", "text": "Ship the cache fix."}],
+                       turn=1) == []
+    digest = coord.digest(p, {}, [], [])
+    system = coord.system_prompt(p)
+    assert _memory_section(digest) == [] and "Use host01 for builds." in system and "Ship the cache fix." in system
+
+
+def test_memory_order_follows_created_not_mtime(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    paths = [p.add_memory(f"Fact number {i}.", kind="fact", title=f"fact {i}") for i in range(5)]
+    legacy = p.memory_dir / "fact-legacy.md"
+    legacy.write_text("---\nkind: fact\ncreated: 2026-01-01\n---\nLegacy fact.\n")
+    order = [e["name"] for e in p._memory_entries()]
+    assert order == [legacy.stem] + [x.stem for x in paths]
+    text = p.memory_text()
+    for i, path in enumerate(reversed(paths + [legacy])):   # newest file gets the oldest mtime
+        os.utime(path, (2_000_000 + i, 2_000_000 + i))
+    assert [e["name"] for e in p._memory_entries()] == order and p.memory_text() == text
+    bare = p.memory_dir / "fact-bare.md"
+    bare.write_text("No front matter.\n")
+    os.utime(bare, (1_000_000, 1_000_000))
+    assert [e["name"] for e in p._memory_entries()] == [bare.stem] + order, "mtime stands in for created"
+    p.db.set_kv(coord.MEMORY_SNAPSHOT_KEY, None)
+    assert coord.system_prompt(p) == coord.system_prompt(p)
+
+
 def test_a_restriction_memory_reaches_running_workers_and_new_prompts(env, tmp_path):
     p = make(env)
     from ttp import coordinator as coord

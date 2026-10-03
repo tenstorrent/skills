@@ -20,7 +20,7 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
 | `resolve` | `id` (an open ask) | the user answered it, or it no longer matters |
 | `notify` | `text`, `severity` | something the user must know |
 | `memory_add` | `text`, `memory_kind` (preference/fact/resource/restriction/decision) , optional `supersedes` (entry names it replaces) | durable facts from the user |
-| `memory_forget` | `name` (an entry's name in [brackets] under MEMORY) | retire a stale or done entry to memory/archive/ |
+| `memory_forget` | `name` (an entry's name in [brackets] under MEMORY or the digest's memory list) | retire a stale or done entry to memory/archive/ |
 | `charter_update` | `section` (Goals/Restrictions/Policies/Resources), `text` | the user changed goals or rules |
 | `schedule_set` | `name`, `kind` (llm/command), `every`, `at`, `enabled`, `budget_usd`, `text`; llm: `spec`, `tier`; command: `command` (shell, run from the project root, stdout lines become observations), `timeout_s` | recurring work the user asked for. Fields left out keep their current values. A command schedule needs no model; enabling one without `command` is rejected, turning it off (`enabled` false) never is |
 | `config_set` | `key`, `value` | only when the user explicitly asks (caps, notifications, provider); `delivery.base_ref` (where code tasks branch from), `delivery.push_branch` and `delivery.push_checks` (where `ttp push` publishes and what must pass first) you may set yourself |

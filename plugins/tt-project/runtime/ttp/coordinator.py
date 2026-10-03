@@ -9,6 +9,7 @@ reading files, running commands or thinking hard becomes a task for a worker ins
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -101,17 +102,71 @@ _DEFAULT_NOTE = "\n\nIf there is no answer within "
 _REC_NOTE = "\n\nMy recommendation: "
 
 
-def system_prompt(p: Project) -> str:
-    """Stable across turns so the provider can cache it."""
+MEMORY_SNAPSHOT_KEY = "memory_snapshot"   # kv: the memory the coordinator's system prompt carries
+MEMORY_DIGEST_HEADER = "## Memory added since the snapshot"
+
+
+def _prompt_head(p: Project) -> tuple[str, str, str]:
+    """The system prompt's parts other than memory: restrictions, role, charter."""
     role = (p.harness / "prompts" / "coordinator.md").read_text()
     charter = p.charter_path.read_text() if p.charter_path.exists() else "(no charter yet)"
-    memory = p.memory_text(COORDINATOR_MEMORY_CHARS) or "(no memories yet)"
     from .prompts import charter_without_restrictions, restrictions_block
     rules = restrictions_block(p)
     if rules:
         rules += ("\nWorkers are shown this block verbatim; when a spec touches anything it covers, "
                   "restate the relevant restriction in the spec itself.\n\n")
         charter = charter_without_restrictions(charter)
+    return rules, role, charter
+
+
+def _sha(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
+
+
+def memory_view(p: Project, now: float | None = None) -> dict:
+    """The memory snapshot the system prompt carries (`text`), plus the entries `added` (or
+    changed) and the names `retired` since it was taken, which the digest lists instead.
+
+    Any change to the system prompt misses the provider's prompt cache, and a miss costs about
+    three hits. So a memory change waits in the digest until the snapshot is rebuilt: when no
+    turn ran for `memory_refresh_s` (the cache is cold anyway), when the restrictions, role or
+    charter changed (the prompt changes anyway), or when the waiting changes outgrow
+    `memory_delta_chars`. The snapshot is taken by the same rules as before (pinned kinds first,
+    COORDINATOR_MEMORY_CHARS)."""
+    now = time.time() if now is None else now
+    c = p.config()["coordinator"]
+    entries = p._memory_entries()
+    live = {e["name"]: _sha(e["line"]) for e in entries}
+    basis = _sha("\0".join(_prompt_head(p)))
+    snap = p.db.kv(MEMORY_SNAPSHOT_KEY) or {}
+    taken = snap.get("entries") or {}
+    added = [e for e in entries if taken.get(e["name"]) != live[e["name"]]]
+    retired = [n for n in snap.get("shown") or [] if n not in live]
+    waiting = sum(len(e["line"]) + 1 for e in added) + sum(len(n) + 20 for n in retired)
+    last = max(float(p.db.kv("last_coordinator_turn", 0) or 0), float(snap.get("at") or 0))
+    if (not snap or snap.get("basis") != basis or now - last > float(c.get("memory_refresh_s", 3300))
+            or waiting > int(c.get("memory_delta_chars", 3000))):
+        chosen = p.memory_select(COORDINATOR_MEMORY_CHARS)[0]
+        snap = {"at": now, "basis": basis, "entries": live, "shown": [e["name"] for e in chosen],
+                "text": "\n".join(e["line"] for e in chosen)}
+        p.db.set_kv(MEMORY_SNAPSHOT_KEY, snap)
+        added, retired = [], []
+    return {"text": snap["text"], "added": added, "retired": retired}
+
+
+def memory_digest_lines(view: dict) -> list[str]:
+    """The digest's list of memory changes the system prompt's snapshot does not carry yet."""
+    if not (view["added"] or view["retired"]):
+        return []
+    return ([f"{MEMORY_DIGEST_HEADER} (as binding as MEMORY; it moves there when the snapshot is "
+             f"refreshed)"] + [e["line"] for e in view["added"]]
+            + [f"[{n}] retired, ignore" for n in view["retired"]])
+
+
+def system_prompt(p: Project, now: float | None = None) -> str:
+    """Stable across turns so the provider can cache it: memory comes from the snapshot."""
+    rules, role, charter = _prompt_head(p)
+    memory = memory_view(p, now)["text"] or "(no memories yet)"
     return f"{rules}{role}\n\n# CHARTER\n{charter}\n\n# MEMORY\n{memory}\n"
 
 
@@ -184,6 +239,7 @@ def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int]) ->
         lines.append(f"## Shared resource {res}: projects give different slot counts ("
                      + ", ".join(f"{k} {n}" for k, n in sorted(got.items())) + f"); all use the smallest, "
                      f"{min(got.values())}")
+    lines += memory_digest_lines(memory_view(p, now))
     mem = memory_budget_line(p)
     if mem:
         lines.append(mem)
