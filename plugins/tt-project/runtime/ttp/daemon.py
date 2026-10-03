@@ -1211,7 +1211,7 @@ class Daemon:
 
     def update_gates(self) -> None:
         windows = bud.plan_windows(self.p.db)
-        gates, news = {}, []
+        gates, news, red_sent = {}, [], {}
         # After a restart the last levels come from disk, so a change while the daemon was down is news.
         saved = {} if self.gates else (self.p.db.kv("gates") or {})
         for prov in {self.cfg.get("core_provider", "claude"), *[t["provider"] for t in self.p.db.q(
@@ -1225,8 +1225,12 @@ class Daemon:
             provider_paused = any(r.startswith("provider limit") for r in g.reasons + (prev.reasons if prev else []))
             # Green, yellow and orange are the budget working as designed (more or fewer workers);
             # only red is news to the user. Its alert clears itself once the gate leaves red.
-            if prev and prev.level != "red" and g.level == "red" and not provider_paused \
-                    and self._first_red_in_window(prov, g):   # a pause has its own alert
+            first, mark = (self._first_red_in_window(prov, g)
+                           if prev and prev.level != "red" and g.level == "red" and not provider_paused
+                           else (False, None))   # a pause has its own alert
+            if mark is not None:
+                red_sent[prov] = mark
+            if first:
                 capped = any("cap reached" in r for r in g.reasons)
                 hint = "New work is paused; replies to you continue. " + (
                     "You can raise the cap (carefully) by telling me, or in the web app."
@@ -1239,27 +1243,30 @@ class Daemon:
         # count it as cleared.
         with self.p.db.tx():
             self.p.db.set_kv("gates", {k: v.as_dict() for k, v in gates.items()})
+            if red_sent:   # the window's marker commits with its alert, or neither does
+                self.p.db.set_kv("budget_red_sent",
+                                 {**(self.p.db.kv("budget_red_sent", {}) or {}), **red_sent})
             for text, sev, ref in news:
                 self.p.db.post("out", text, chat=None, kind="alert", severity=sev, ref=ref)
         self.gates = gates
 
-    def _first_red_in_window(self, prov: str, g: bud.Gate) -> bool:
-        """Whether a red gate at a plan line is the first in that plan window, and remember it. The
+    def _first_red_in_window(self, prov: str, g: bud.Gate) -> tuple[bool, dict | None]:
+        """Whether a red gate at a plan line is the first in that plan window, and the provider's
+        new budget_red_sent entry (or None) for the caller to save in the alert's transaction. The
         line holds until the window resets, so one alert per window is enough. Red for any other
         reason (a dollar cap, the runaway guard) is always news."""
         n = g.numbers or {}
         line = float(n.get("limit") or 100)
         at_line = [r for r in n.get("plan") or [] if r.get("resets_at") and r["utilization"] >= line]
         if not at_line:
-            return True
+            return True, None
         sent = self.p.db.kv("budget_red_sent", {}) or {}
         mine = {w: t for w, t in (sent.get(prov) or {}).items() if float(t) > time.time()}
         # A window's reset time may move by seconds between readings; the next window's is hours on.
         if all(abs(float(mine.get(r["window"], 0)) - float(r["resets_at"])) < 600 for r in at_line):
-            return False
+            return False, None
         mine.update({r["window"]: r["resets_at"] for r in at_line})
-        self.p.db.set_kv("budget_red_sent", {**sent, prov: mine})
-        return True
+        return True, mine
 
     # schedules and watchers ------------------------------------------------------------------------
     def run_schedules(self) -> None:

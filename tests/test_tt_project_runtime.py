@@ -10815,3 +10815,37 @@ def test_an_empty_run_json_fails_the_run_without_crashing_its_supervisor(env):
     info = json.loads((run_dir / "exit.json").read_text())
     assert info["launched"] is False and "run.json" in info["error"]
     runner.remove_private(run_dir)   # every other reader copes too
+
+
+def test_a_plan_window_red_marker_commits_with_its_alert_or_not_at_all(env, monkeypatch):
+    """A marker saved without its alert would silence that plan window's red alert for good."""
+    import sqlite3
+    import time as _t
+    from ttp import budget as bud
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    d.update_gates()
+    p.db.spend("fake", 150.0, "task:1")
+    evaluate = bud.evaluate
+
+    def at_line(*a, **kw):
+        g = evaluate(*a, **kw)
+        g.numbers = {**(g.numbers or {}), "limit": 90,
+                     "plan": [{"window": "5h", "utilization": 95, "resets_at": _t.time() + 3600}]}
+        return g
+    monkeypatch.setattr(bud, "evaluate", at_line)
+    post = d.p.db.post
+
+    def locked(*a, **kw):
+        if str(kw.get("ref", "")).startswith("budget:"):
+            raise sqlite3.OperationalError("database is locked")
+        return post(*a, **kw)
+    monkeypatch.setattr(d.p.db, "post", locked)
+    with pytest.raises(sqlite3.OperationalError):
+        d.update_gates()
+    assert not p.db.kv("budget_red_sent")
+    monkeypatch.setattr(d.p.db, "post", post)
+    d.update_gates()
+    assert len(p.db.q("SELECT id FROM messages WHERE ref='budget:fake'")) == 1
+    assert "5h" in p.db.kv("budget_red_sent")["fake"]
