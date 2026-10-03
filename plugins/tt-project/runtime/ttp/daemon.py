@@ -1557,7 +1557,7 @@ class Daemon:
     def _batch_hold(self, evs: list[dict], now: float) -> bool:
         """Routine events (a task done, its follow-ups and notes, normal observations) wait up to
         coordinator.batch_s so one turn reads several, but only while no worker slot would sit idle
-        for it: every slot is busy, or runnable queued work is there to fill the free ones."""
+        for it: every slot is busy, or runnable queued work is there to fill each free one."""
         batch = float(self.cfg["coordinator"].get("batch_s", 300))
         if batch <= 0 or not evs or now - min(e["ts"] for e in evs) >= batch:
             return False
@@ -1571,9 +1571,9 @@ class Daemon:
         if busy >= slots:
             return True   # no slot is free; nothing the turn queues could start before one is
         paused = db.paused_resources()
-        return any(not coord.task_resources(t) & paused.keys()
-                   and not (t["blocked_reason"] or "").startswith((PAUSED_NOTE, LOGGED_OUT_NOTE))
-                   for t in db.ready_tasks())
+        runnable = sum(1 for t in db.ready_tasks() if not coord.task_resources(t) & paused.keys()
+                       and not (t["blocked_reason"] or "").startswith((PAUSED_NOTE, LOGGED_OUT_NOTE)))
+        return busy + runnable >= slots
 
     # workers ----------------------------------------------------------------------------------------
     def dispatch(self) -> None:

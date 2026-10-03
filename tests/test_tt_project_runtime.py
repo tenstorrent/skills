@@ -13767,8 +13767,15 @@ def test_routine_events_wait_for_company_while_every_slot_is_busy(env, monkeypat
 
 
 def test_routine_events_wait_while_runnable_work_fills_the_free_slot(env, monkeypatch):
-    p, d, clock, starts = _batch_setup(env, monkeypatch, busy=1)
+    p, d, clock, starts = _batch_setup(env, monkeypatch, busy=0)
     p.db.add_task("next up", "s", origin="coordinator")
+    _event(p, clock, "task_done")
+    _event(p, clock, "task_notes")
+    # One runnable task for two free slots: the other slot would sit idle, so the turn starts.
+    assert _turn_within(d, clock, starts, 30), "held although a free slot has nothing to run"
+    p.db.x("UPDATE events SET status='handled'")
+    p.db.x("INSERT INTO runs(role, started, status) VALUES('worker', ?, 'running')", (clock[0],))
+    p.db.set_kv("last_coordinator_turn", clock[0])
     _event(p, clock, "task_done")
     _event(p, clock, "task_notes")
     assert not _turn_within(d, clock, starts, 120), "woke although queued work fills the free slot"
@@ -13807,3 +13814,31 @@ def test_batch_s_0_turns_batching_off(env, monkeypatch):
     d.cfg = p.config()
     _event(p, clock, "task_done")
     assert _turn_within(d, clock, starts, float(d.cfg["coordinator"]["debounce_s"]) + 10)
+
+
+def test_replay_reports_the_turns_batching_saves_without_idle_slots(env):
+    from ttp import replay
+    p = make(env)
+    db = p.db
+    db.x("DELETE FROM runs")
+    t0 = time.time() - 7200
+
+    def history(workers):
+        db.x("DELETE FROM runs")
+        db.x("DELETE FROM events")
+        for _ in range(workers):
+            db.x("INSERT INTO runs(role, started, ended, status) VALUES('worker', ?, ?, 'ok')", (t0, t0 + 3000))
+        for at, kinds in ((100, ("task_done", "followup_proposed")), (200, ("task_done",)), (300, ("task_done",))):
+            ids = [db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                        (t0 + at, "task:1", k, "normal", k, "handled")) for k in kinds]
+            db.x("INSERT INTO runs(role, started, ended, status, cost_usd, note) VALUES('coordinator',?,?,'ok',0.1,?)",
+                 (t0 + at + 15, t0 + at + 25, json.dumps({"events": ids, "messages": []})))
+        return replay.load(pathlib.Path(db.path), 1, now=t0 + 3600)
+
+    out = replay.report(history(workers=2), 300, 2)
+    assert (out["replayed_turns"], out["batched_turns"]) == (3, 1), out
+    assert out["saved_pct"] > 60 and out["idle_slot_s"] == 0 and out["extra_idle_slot_s"] == 0
+    # A free slot with nothing to run: every hand-off gets its turn at once.
+    out = replay.report(history(workers=1), 300, 2)
+    assert out["turns_saved"] == 0 and out["held_s"] == 0, out
+    assert replay.main([str(db.path), "--days", "1", "--slots", "2"]) == 0
