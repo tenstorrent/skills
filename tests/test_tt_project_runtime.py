@@ -2077,8 +2077,8 @@ def test_task_add_continues_on_a_done_task_adds_a_follow_up_from_the_base(env):
     p.db.update_task(old, status="done", branch=branch)
     dep = p.db.add_task("dep", "s", origin="user", depends_on=[old])
     problems = coord.apply(p, [{"type": "task_add", "title": "more", "kind": "code", "continues": old}])
-    assert problems == [f"task_add: #{old} is done; added as a follow-up of #{old}"]
     new = p.db.one("SELECT * FROM tasks WHERE title='more'")
+    assert problems == [] and p.db.kv(coord.NOTES_KEY) == [f"task_add: #{old} is done; added #{new['id']} as its follow-up"]
     assert new["parent"] == old and f"continues:{old}" not in json.loads(new["labels"])
     assert json.loads(p.db.task(dep)["depends_on"]) == [old], "a follow-up takes over no dependents"
     assert p.db.task(old)["status"] == "done"
@@ -2093,8 +2093,37 @@ def test_schedule_set_takes_a_bare_integer_interval_as_seconds(env):
     for every in (900, "900"):
         problems = coord.apply(p, [{"type": "schedule_set", "name": "probe", "kind": "command",
                                     "command": "true", "every": every}])
-        assert problems == ["schedule_set 'probe': every 900 s"], problems
+        assert problems == [] and p.db.kv(coord.NOTES_KEY) == ["schedule_set 'probe': every 900 s"], problems
         assert p.db.one("SELECT every_s FROM schedules WHERE name='probe'")["every_s"] == 900
+
+
+def test_follow_up_and_bare_seconds_notes_are_information_not_rejections(env):
+    p = make(env)
+    from types import SimpleNamespace
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    old = p.db.add_task("old", "s", origin="user")
+    p.db.update_task(old, status="done")
+    turn = SimpleNamespace(structured={"actions": [
+        {"type": "reply", "text": "Adding the follow-up and the probe.", "chat": "c1"},
+        {"type": "task_add", "title": "more", "continues": old},
+        {"type": "schedule_set", "name": "probe", "kind": "command", "command": "true", "every": 900}],
+        "summary": ""}, error="", final_text="")
+    d._finish_coordinator({"dir": "x"}, turn, "ok", {})
+    reply = p.db.one("SELECT text FROM messages WHERE kind='reply' ORDER BY id DESC LIMIT 1")["text"]
+    assert "(not done" not in reply, reply
+    assert p.db.kv(coord.REJECTED_KEY) == []
+    assert not p.db.q("SELECT id FROM events WHERE kind='rejected_actions'")
+    new = p.db.one("SELECT id FROM tasks WHERE title='more'")["id"]
+    events = coord.digest(p, {}, [], []).split("# NEW EVENTS")[1]
+    rejected = [ln for ln in events.splitlines() if "was rejected" in ln]
+    assert not rejected, rejected
+    assert f"#{old} is done; added #{new} as its follow-up" in events
+    assert "schedule_set 'probe': every 900 s" in events
+    d._finish_coordinator({"dir": "x"}, SimpleNamespace(structured={"actions": [{"type": "noop"}], "summary": ""},
+                                                        error="", final_text=""), "ok", {})
+    assert "every 900 s" not in coord.digest(p, {}, [], []), "a note outlived the turn after"
 
 
 def test_a_block_on_a_dead_dependency_left_after_a_turn_is_raised_once(env):

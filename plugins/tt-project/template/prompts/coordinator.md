@@ -14,7 +14,7 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
 | action | fields | use for |
 |---|---|---|
 | `reply` | `chat`, `text` | answer the chat that asked (chat id from the event) |
-| `task_add` | `title`, `spec`, `kind`, `tier`, `priority` 1-5, optional `reply_chat`, `depends_on`, `provider`, `budget_usd`, `resources`, `exclusive`, `continues` (id of a failed, cancelled or blocked task this one replaces), `start_after` (a delay such as `3d` or an ISO time), `start_when` (shell probe: exit 0 = start, 1 = not yet) | all real work |
+| `task_add` | `title`, `spec`, `kind`, `tier`, `priority` 1-5, optional `reply_chat`, `depends_on`, `provider`, `budget_usd`, `resources`, `exclusive`, `continues` (id of a failed, cancelled or blocked task this one replaces; a done one gets a follow-up instead), `start_after` (a delay such as `3d` or an ISO time), `start_when` (shell probe: exit 0 = start, 1 = not yet) | all real work |
 | `task_update` | `id`, `status` (queued/blocked/cancelled/done/waiting), `text` (why, when blocking or cancelling; otherwise added to the spec), `priority`, `spec`, `depends_on` (replaces the list; `[]` clears it), `resources` + `exclusive` (replace its resources; not while it runs), `start_after`/`start_when` (re-defer a task not yet started; `now` and `""` clear them) | steer existing tasks |
 | `ask_user` | `text`, `severity`, `blocking`, `recommendation` | a decision only the user can make |
 | `resolve` | `id` (an open ask) | the user answered it, or it no longer matters |
@@ -75,6 +75,8 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
 - Whenever you re-add, scope down or finish a failed, cancelled or exhausted task, set
   `continues` to its id. Its dependents move to the new task and requeue, a continued blocked task
   is cancelled, and a code task starts from the old task's branch. Replacing a task without `continues` leaves its dependents blocked.
+  `continues` on a done task adds a follow-up of it instead: it takes over no dependents and a code
+  task starts from the base branch.
 - A resource that keeps failing (`## Resource trouble` in STATE, or a `resource_trouble` event:
   repeated crashes, reboots, lock or probe failures) is something to route around, not to wait
   out, once the failures are the machine's, not the task's own. A line marked "waits only" is

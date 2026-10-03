@@ -98,6 +98,7 @@ REJECTED_KEY = "rejected_actions"   # kv: the last turn's rejected actions, show
 # kv: {"at": ts, "why": text}: a rejected action whose blocking condition clears at a known time.
 # The daemon wakes the coordinator then, so the turn's undone work does not wait for an idle wake.
 RETRY_WAKE_KEY = "rejected_retry_wake"
+NOTES_KEY = "action_notes"   # kv: the last turn's notes on actions applied with a change; information only
 RECENT_OUT = 5                       # outbound messages the digest repeats, so turns do not resend them
 # Digest row lengths. Background rows are cut; new events, asks and open-task notes carry decisions.
 NOTE_CHARS = 140
@@ -329,6 +330,8 @@ def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int]) ->
     rejected = db.kv(REJECTED_KEY, []) or []
     for x in rejected:
         lines.append(f"- [your previous turn's action was rejected; fix or drop it] {x[:500]}")
+    for x in db.kv(NOTES_KEY, []) or []:
+        lines.append(f"- [note on your previous turn's action: applied, nothing to fix] {x[:500]}")
     if not msg_ids and not event_ids and not rejected:
         lines.append("- (none: periodic check — keep work flowing if the charter has unfinished goals)")
     lines.append("\nRespond with the JSON actions object only.")
@@ -444,11 +447,12 @@ def _clock(ts: float) -> str:
 def apply(p: Project, actions: list[dict], default_chat: str | None = None, user_turn: bool = False,
           turn: int | None = None) -> list[str]:
     """Apply validated actions. Returns human-readable notes about rejected ones, fed back next turn.
+    Notes on actions applied with a change (NOTES_KEY) reach the next digest as information only.
 
     A turn cut off before its database transaction commits is applied again from its output. Its
     file writes carry `turn`.<action index> so the replay does not repeat them, while the same
     text sent again by a later turn is still written."""
-    db, problems = p.db, []
+    db, problems, notes = p.db, [], []
     cfg = p.config()
     replies: list[int] = []
     # config_set goes first so a cap raised in this turn counts for this turn's task_add actions.
@@ -502,7 +506,6 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     # Done work is not taken over: the new task is a follow-up that starts fresh
                     # (a code task from the delivery branch tip, not the old branch).
                     old = None
-                    problems.append(f"task_add: #{followup['id']} is done; added as a follow-up of #{followup['id']}")
                 if old:
                     labels.append(f"continues:{old['id']}")
                 after, when = _start_args(a, {})
@@ -518,6 +521,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         _take_over_dependents(db, old["id"], new_id)
                         if old["status"] == "blocked":   # superseded: never requeued into duplicate work
                             db.update_task(old["id"], status="cancelled", blocked_reason=f"continued by #{new_id}")
+                if followup:
+                    notes.append(f"task_add: #{followup['id']} is done; added #{new_id} as its follow-up")
             elif t == "task_update":
                 task = db.task(int(a["id"]))
                 if not task:
@@ -663,7 +668,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     raise ValueError(f"schedule_set {a.get('name')!r} rejected: `kind` must be llm or command")
                 every_s = sched.parse_every(a.get("every") or (old["every_s"] if old else "1d"))
                 if str(a.get("every") or "").strip().isdigit():   # bare seconds: echo what was understood
-                    problems.append(f"schedule_set {a['name']!r}: every {every_s} s")
+                    notes.append(f"schedule_set {a['name']!r}: every {every_s} s")
                 sched.upsert(db, a["name"], kind, every_s,
                              (a.get("at") or None) if "at" in a else (old["at"] if old else None), enabled,
                              a["budget_usd"] if "budget_usd" in a else (old["budget_usd_day"] if old else None),
@@ -698,6 +703,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 raise ValueError(f"unknown action {t!r}")
         except Exception as e:   # one bad action is reported back; it never aborts the turn
             problems.append(f"{t}: {e}")
+    db.set_kv(NOTES_KEY, notes)
     if problems and replies:
         # The reply may say the work is under way; the user must not read that when it is not.
         note = clip("; ".join(problems), 240)
