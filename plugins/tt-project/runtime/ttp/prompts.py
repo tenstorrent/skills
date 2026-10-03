@@ -175,8 +175,8 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
     delivery = cfg.get("delivery", {})
     venv = project_venv(p, cwd)
     venv_line = (f"python venv: {venv} (the project's, already active: VIRTUAL_ENV and PATH; shared with other "
-                 "workers, so do not install into it; need other packages? make a venv of your own in the "
-                 "working directory)\n") if venv else ""
+                 "workers, so do not install into it; its editable installs import the project root's code, not "
+                 "yours; need other packages? make a venv of your own in the working directory)\n") if venv else ""
     parts = [
         _read(p, f"kind-{kind}.md"),
         f"# YOUR TASK #{task['id']}: {task['title']}\n"
