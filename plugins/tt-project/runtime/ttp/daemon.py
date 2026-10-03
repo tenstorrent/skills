@@ -1974,7 +1974,8 @@ class Daemon:
     def probe_deferred(self, now: float) -> None:
         """A task added with `start_when` stays queued, undispatched, until its probe exits 0; the
         probe runs here like a waiting task's, once any `start_after` has passed. Exit 1 means not
-        yet, and so does 255 (ssh could not reach the host: a reboot or a network blip). A broken probe (another exit, a timeout, a probe that cannot start) is raised to the
+        yet, and so does 255 (ssh could not reach the host: a reboot or a network blip). A broken
+        probe (another exit, a timeout, a probe that cannot start) is raised to the
         coordinator once, never as a worker run, and keeps being tried. So is a deferral still not
         met after `coordinator.defer_max_days`."""
         db = self.p.db
