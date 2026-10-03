@@ -1049,14 +1049,15 @@ def cmd_setup(a) -> None:
         for f in (lib / "bin").iterdir():
             f.chmod(0o755)
     (lib / "runtime" / "ttp" / SOURCE_FILE).write_text(commit + "\n")
-    cur = HOME_DIR / "lib" / "current"
-    if cur.is_symlink() or cur.exists():
-        cur.unlink()
-    cur.symlink_to(lib)
+    # The marker goes first: a daemon check between the two steps must not undo a deliberate downgrade.
     if is_newer(installed, __version__):    # a deliberate downgrade: daemons must not undo it
         forced_mark().write_text(__version__ + "\n")
     else:
         forced_mark().unlink(missing_ok=True)
+    cur = HOME_DIR / "lib" / "current"
+    if cur.is_symlink() or cur.exists():
+        cur.unlink()
+    cur.symlink_to(lib)
     bindir = Path(a.bin_dir).expanduser()
     bindir.mkdir(parents=True, exist_ok=True)
     shim = bindir / "ttp"

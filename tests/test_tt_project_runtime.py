@@ -3135,6 +3135,28 @@ def test_setup_never_downgrades_a_newer_install_without_force(env, tmp_path):
     assert setup().returncode == 0 and not mark.exists()
 
 
+def test_setup_writes_the_forced_downgrade_marker_before_it_switches_lib_current(env, tmp_path, monkeypatch):
+    from ttp import __version__, cli, release
+    _install_template(env)
+    lib = env["home"] / "lib"
+    newer = lib / _newer(__version__)
+    (lib / "current").rename(newer)
+    init = newer / "runtime" / "ttp" / "__init__.py"
+    init.write_text(init.read_text().replace(f'"{__version__}"', f'"{_newer(__version__)}"'))
+    (lib / "current").symlink_to(newer)
+    seen = []
+    real = release.forced_mark
+
+    def mark():                  # what a daemon checking at this moment would find in lib/current
+        seen.append((lib / "current").resolve())
+        return real()
+    monkeypatch.setattr(release, "forced_mark", mark)
+    with contextlib.redirect_stdout(io.StringIO()):
+        cli.main(["setup", "--bin-dir", str(tmp_path / "bin"), "--force"])
+    assert seen == [newer.resolve()] and real().read_text().strip() == __version__
+    assert (lib / "current").resolve() == (lib / __version__).resolve()
+
+
 @pytest.mark.parametrize("there,ships", [("newer", False), ("same", False), ("older", True), ("none", True)])
 def test_ship_runtime_never_replaces_a_newer_or_equal_remote_install(env, monkeypatch, there, ships):
     from ttp import __version__, cli
@@ -9011,6 +9033,20 @@ def test_the_daemon_points_lib_current_back_at_a_complete_release_for_its_harnes
     assert len(note) == 1 and note[0]["severity"] == "low" and f"points at {__version__} again" in note[0]["text"]
     assert "ttp setup" not in note[0]["text"] and not launches
     assert not list(lib.glob(".current.*"))
+    assert p.db.kv("release")["installed"] == f"{__version__} (bbbb2222)"   # drift saw the restored release
+
+
+def test_the_restore_notice_is_sent_at_most_once_a_day(env, monkeypatch):
+    p, d, _ = _release_daemon(env, monkeypatch, newer=False)
+    lib = _older_current(env)
+    for _ in range(3):           # an older plugin's setup keeps replacing it
+        (lib / "current").unlink()
+        (lib / "current").symlink_to(lib / "0.0.1")
+        d._release_due = 0
+        d.check_release()
+        assert (lib / "current").resolve() != (lib / "0.0.1").resolve()
+    note = p.db.q("SELECT ref FROM messages WHERE kind='alert' AND text LIKE 'An older tt-project%'")
+    assert [m["ref"] for m in note] == ["release-restored"]
 
 
 def test_a_forced_downgrade_is_not_undone(env, monkeypatch):

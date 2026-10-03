@@ -1660,12 +1660,12 @@ class Daemon:
             return
         self._release_due = now + release.CHECK_S
         db = self.p.db
+        self.check_older_release()   # first: drift must see a lib/current it restored
         try:
             d = release.drift(self.p)
         except Exception as e:   # a half-written install must not stop the tick
             log(self.p, f"release check failed: {type(e).__name__}: {e}")
             return
-        self.check_older_release()
         if d != db.kv(release.KV_RELEASE):
             db.set_kv(release.KV_RELEASE, d)
             if d:
@@ -1703,9 +1703,10 @@ class Daemon:
                 release.point_current(back)
                 log(self.p, f"installed tt-project {o['installed']} was older than this harness "
                             f"({o['harness']}): lib/current now points at {back}")
-                db.post("out", f"An older tt-project ({o['installed']}) had replaced the installed release; "
-                               f"lib/current points at {back.name} again, so `ttp` on PATH and automatic "
-                               f"upgrades use it.", chat=None, kind="alert", severity="low")
+                self.alert("release-restored",
+                           f"An older tt-project ({o['installed']}) had replaced the installed release; "
+                           f"lib/current points at {back.name} again, so `ttp` on PATH and automatic "
+                           f"upgrades use it.", severity="low", every_s=86400)
                 o = release.older(self.p)
         except Exception as e:
             log(self.p, f"installed-release check failed: {type(e).__name__}: {e}")
