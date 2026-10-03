@@ -1368,7 +1368,10 @@ def test_claude_workers_get_a_lean_context_but_keep_plugin_skills(env):
     i = worker.index("--disallowedTools") + 1
     denied = worker[i:worker.index("--settings", i)]
     assert {"Workflow", "ScheduleWakeup", "CronCreate", "CronDelete", "CronList", "RemoteTrigger",
-            "PushNotification", "DesignSync", "WebFetch", "WebSearch"} == set(denied)
+            "PushNotification", "DesignSync", "NotebookEdit", "EnterWorktree", "ExitWorktree", "ListAgents",
+            "ReportFindings", "Task", "Agent", "SendMessage", "WebFetch", "WebSearch"} == set(denied)
+    # The tools workers do use stay, ToolSearch included (it loads deferred and MCP tools).
+    assert not {"Bash", "Read", "Edit", "Write", "Skill", "ToolSearch", "Monitor", "TaskStop"} & set(denied)
     online, _ = build(role="worker", model="opus", effort="low", cwd=".", budget_usd=None, read_only=False,
                       schema=None, restrictions={})
     assert "WebFetch" not in online and "Workflow" in online

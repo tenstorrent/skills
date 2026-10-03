@@ -28,9 +28,13 @@ BUNDLED_SKILLS = ("dataviz", "update-config", "keybindings-help", "code-review",
                   "fewer-permission-prompts", "loop", "schedule", "claude-api", "workflow-authoring", "run",
                   "init", "security-review")
 # Scheduling, remote and orchestration tools a headless worker must not use; their definitions
-# alone are ~3.7k tokens a call.
+# alone are ~3.7k tokens a call. Then tools no worker used in ~1,000 runs, or that would step outside
+# the harness (its own worktrees, other sessions). Measured on the first call of a 'reply OK' worker
+# run, CLI 2.1.285: 10.6k tokens -> 9.3k without the notebook/worktree/listing/findings tools, 7.9k
+# also without subagents ("Task" in the init event, "Agent" in tool calls).
 WORKER_DENIED_TOOLS = ("Workflow", "ScheduleWakeup", "CronCreate", "CronDelete", "CronList", "RemoteTrigger",
-                       "PushNotification", "DesignSync")
+                       "PushNotification", "DesignSync", "NotebookEdit", "EnterWorktree", "ExitWorktree",
+                       "ListAgents", "ReportFindings", "Task", "Agent", "SendMessage")
 
 
 @register
