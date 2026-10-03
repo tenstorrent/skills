@@ -534,13 +534,13 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
             elif t == "notify":
                 db.post("out", a["text"], chat=None, kind="alert", severity=_norm_severity(a.get("severity")))
             elif t == "memory_add":
-                p.add_memory(a["text"], kind=a.get("memory_kind") or "fact", title=a.get("title"), key=key)
+                added = p.add_memory(a["text"], kind=a.get("memory_kind") or "fact", title=a.get("title"), key=key)
                 if (a.get("memory_kind") or "") == "restriction":
                     _tell_running_workers(db, f"New binding restriction: {a['text'].strip()}", key)
                 old = a.get("supersedes") or []
                 for name in [old] if isinstance(old, str) else old:
                     try:
-                        p.forget_memory(str(name))
+                        p.forget_memory(str(name), keep=added.stem)
                     except ValueError as e:
                         raise ValueError(f"memory added, but `supersedes` failed: {e}") from None
                 memory_budget_check(p)

@@ -9995,22 +9995,46 @@ def test_a_cleared_logout_drops_the_held_note_on_tasks_dispatch_skips(env, monke
     assert not p.db.one("SELECT id FROM tasks WHERE blocked_reason LIKE 'held: logged out%'")
 
 
-def test_memory_forget_resolves_exact_prefix_and_kind_number_names(env):
+def test_memory_forget_takes_an_exact_name_or_a_unique_prefix_and_refuses_the_rest(env):
     p = make(env)
-    for stem in ["fact-93-2026-10-01-box-a-is-ours", "fact-94-2026-10-01-box-b-is-ours",
-                 "fact-940-2026-10-01-box-c", "decision-7-2026-10-01-use-plan-x"]:
-        (p.memory_dir / f"{stem}.md").write_text("x\n")
-    (p.memory_dir / "archive").mkdir(exist_ok=True)
-    (p.memory_dir / "archive" / "fact-95-2026-09-01-old.md").write_text("x\n")
     arch = p.memory_dir / "archive"
-    assert p.forget_memory("[fact-940-2026-10-01-box-c]") == arch / "fact-940-2026-10-01-box-c.md"   # exact
-    assert p.forget_memory("decision-7-2026") == arch / "decision-7-2026-10-01-use-plan-x.md"        # prefix
-    assert p.forget_memory("fact-93-2026-10-02-box-a") == arch / "fact-93-2026-10-01-box-a-is-ours.md"  # bad date
-    (p.memory_dir / "fact-94-2026-10-02-other.md").write_text("x\n")
-    with pytest.raises(ValueError, match="ambiguous.*fact-94-2026-10-01-box-b-is-ours.*fact-94-2026-10-02-other"):
-        p.forget_memory("fact-94-2026-10-03-wrong")
+    arch.mkdir(parents=True, exist_ok=True)
+    for stem in ["fact-2026-10-01-user-set-disk", "fact-274-pushed-t256", "fact-94-a", "fact-940-b",
+                 "fact-7", "fact-7-2", "decision-7-2026-10-01-use-plan-x", "fact-50-new"]:
+        (p.memory_dir / f"{stem}.md").write_text("x\n")
+    for stem in ["fact-2026-10-02-tray-dropped", "fact-50-old"]:
+        (arch / f"{stem}.md").write_text("x\n")
+    live = lambda: sorted(x.stem for x in p.memory_dir.glob("*.md"))
+    before = live()
+    # an exact archived name is a replayed forget: a no-op, never a live entry sharing 'fact-2026'
+    assert p.forget_memory("fact-2026-10-02-tray-dropped") == arch / "fact-2026-10-02-tray-dropped.md"
+    # different text after a shared kind-number is a different entry: refused
+    with pytest.raises(ValueError, match="no memory entry 'fact-274-other-thing'"):
+        p.forget_memory("fact-274-other-thing")
     with pytest.raises(ValueError, match="no memory entry"):
-        p.forget_memory("fact-99-nothing")
-    assert (p.memory_dir / "fact-94-2026-10-01-box-b-is-ours.md").exists()
-    assert p.forget_memory("fact-95") == arch / "fact-95-2026-09-01-old.md"   # archived: untouched no-op
-    assert (arch / "fact-95-2026-09-01-old.md").read_text() == "x\n"
+        p.forget_memory("fact-93-2026-10-02-box-a")
+    # ambiguous prefixes, among live entries or across live and archived ones: refused, all listed
+    with pytest.raises(ValueError, match=r"ambiguous; nothing retired.*\[fact-94-a\], \[fact-940-b\]"):
+        p.forget_memory("fact-9")
+    with pytest.raises(ValueError, match=r"ambiguous.*\[fact-50-new\], \[fact-50-old\] \(archived\)"):
+        p.forget_memory("fact-50")
+    with pytest.raises(ValueError, match="no memory entry"):
+        p.forget_memory("[]")
+    assert live() == before, "a refused or replayed forget retired something"
+    assert p.forget_memory("[fact-7]") == arch / "fact-7.md"                       # exact beats prefix
+    assert p.forget_memory("fact-94") == arch / "fact-94-a.md"                     # '-' boundary first
+    assert p.forget_memory("decision-7-2026") == arch / "decision-7-2026-10-01-use-plan-x.md"
+    assert p.forget_memory("fact-274-pushed-t2") == arch / "fact-274-pushed-t256.md"   # one raw prefix
+    assert live() == ["fact-2026-10-01-user-set-disk", "fact-50-new", "fact-7-2", "fact-940-b"]
+
+
+def test_memory_supersedes_never_retires_the_entry_it_adds(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    (p.memory_dir / "archive").mkdir(parents=True, exist_ok=True)
+    (p.memory_dir / "archive" / "fact-box-a-status.md").write_text("x\n")
+    act = [{"type": "memory_add", "text": "Box A is busy.", "title": "Box A status now",
+            "supersedes": ["fact-box-a-status-n"]}]
+    errors = coord.apply(p, act, turn=3)
+    assert errors and "supersedes" in errors[0] and "no memory entry" in errors[0]
+    assert (p.memory_dir / "fact-box-a-status-now.md").exists()

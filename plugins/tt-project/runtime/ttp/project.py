@@ -308,39 +308,37 @@ class Project:
         crowd the prompt."""
         return "\n".join(e["line"] for e in self.memory_select(limit_chars)[0])
 
-    @staticmethod
-    def _resolve_memory_name(name: str, folder: Path) -> str | None:
-        """Exact name, else the one entry starting with `name`, else the one sharing its leading
-        kind-and-number part ('fact-93' of a retyped 'fact-93-<wrong date>-...'). Several: reject."""
+    def _resolve_memory_name(self, name: str, keep: str | None = None) -> tuple[str, bool]:
+        """(entry, archived) for `name`. An exact name wins, live or archived, so a replayed forget
+        of an archived entry never reaches a live one. Otherwise `name` may be a prefix of exactly
+        one entry, live or archived; one ending on a '-' word boundary ('fact-94' of 'fact-94-a',
+        not 'fact-940-b') is preferred. Names are title slugs, so nothing beyond the prefix is
+        guessed. `keep` (the entry just added) is never a candidate. Ambiguous or missing: refused."""
         if not name:
-            return None
-        names = sorted(x.stem for x in folder.glob("*.md")) if folder.is_dir() else []
-        if name in names:
-            return name
-        tiers = [[n for n in names if n.startswith(name)]]
-        m = re.match(r"[a-z]+-\d+", name)
-        if m:
-            tiers.append([n for n in names if n == m.group(0) or n.startswith(m.group(0) + "-")])
-        for found in tiers:
+            raise ValueError("no memory entry named; use the name in [brackets] from MEMORY")
+        archive = self.memory_dir / "archive"
+        entries = [(f.stem, d == archive) for d in (self.memory_dir, archive) if d.is_dir()
+                   for f in sorted(d.glob("*.md")) if f.stem != keep]
+        for e in entries:
+            if e[0] == name:
+                return e
+        for found in ([e for e in entries if e[0].startswith(name + "-")],
+                      [e for e in entries if e[0].startswith(name)]):
             if len(found) == 1:
                 return found[0]
             if len(found) > 1:
-                raise ValueError(f"memory entry {name!r} is ambiguous; use one of: "
-                                 + ", ".join(f"[{n}]" for n in found))
-        return None
+                raise ValueError(f"memory entry {name!r} is ambiguous; nothing retired. Use one of: "
+                                 + ", ".join(f"[{n}]" + (" (archived)" if old else "") for n, old in found))
+        raise ValueError(f"no memory entry {name!r}; use the name in [brackets] from MEMORY")
 
-    def forget_memory(self, name: str) -> Path:
+    def forget_memory(self, name: str, keep: str | None = None) -> Path:
         """Retire an entry: its file moves to memory/archive/ and its line leaves MEMORY.md, so no
-        prompt carries it again. Forgetting an entry already archived (a replayed turn) is a no-op."""
-        name = Path(name.strip().strip("[]")).stem
-        live = self._resolve_memory_name(name, self.memory_dir)
-        if live is None:   # nothing live: a replayed turn whose entry is already archived is a no-op
-            done = self._resolve_memory_name(name, self.memory_dir / "archive")
-            if done is not None:
-                return self.memory_dir / "archive" / f"{done}.md"
-            raise ValueError(f"no memory entry {name!r}; use the name in [brackets] from MEMORY")
-        name = live
+        prompt carries it again. Forgetting an entry already archived (a replayed turn) is a no-op.
+        `keep` names an entry that must survive (the one a `supersedes` adds)."""
+        name, archived = self._resolve_memory_name(Path(name.strip().strip("[]")).stem, keep)
         src, dst = self.memory_dir / f"{name}.md", self.memory_dir / "archive" / f"{name}.md"
+        if archived:
+            return dst
         dst.parent.mkdir(parents=True, exist_ok=True)
         os.replace(src, dst)
         if self.memory_index.exists():
