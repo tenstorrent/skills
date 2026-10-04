@@ -2460,7 +2460,7 @@ def _names_commit(tasks: list[dict], head: str) -> bool:
     return any(head.startswith(h.lower()) for t in tasks for h in re.findall(r"\b[0-9a-fA-F]{7,40}\b", t.get("spec") or ""))
 
 
-def idle_wake(p: Project, cfg: dict, gates: dict[str, dict], now: float) -> dict:
+def idle_wake(p: Project, cfg: dict, gates: dict[str, dict], now: float, db=None) -> dict:
     """When the coordinator next wakes by itself, with no message or event pending. Both the daemon
     and `ttp status` / the web app read it from here, so the time shown is the one applied.
 
@@ -2472,11 +2472,13 @@ def idle_wake(p: Project, cfg: dict, gates: dict[str, dict], now: float) -> dict
 
     Returns `at` (next wake, possibly past), `due` ("idle", "starve" or None at `now`), `held`
     (why the idle wake cannot come), and the `wake` / `starve` kv values a starting turn stores."""
-    db, c = p.db, cfg["coordinator"]
+    # `db` is the caller's own connection: the web app calls this from its request threads, and an
+    # SQLite connection works only in the thread that opened it.
+    db, c = db or p.db, cfg["coordinator"]
     gate = gates.get(cfg.get("core_provider", "claude"))
     last = float(db.kv("last_coordinator_turn", 0))
     idle_s = float(c.get("idle_wake_s", 3600))
-    fp = wake_fingerprint(p, gates)
+    fp = wake_fingerprint(p, gates, db)
     prev = db.kv("idle_wake", {}) or {}
     repeats = int(prev.get("n", 0)) if prev.get("fp") == fp else 0
     backoff = min(idle_s * 2 ** repeats, 86400.0) if repeats else 0.0
@@ -2495,10 +2497,10 @@ def idle_wake(p: Project, cfg: dict, gates: dict[str, dict], now: float) -> dict
             "wake": {"fp": fp, "n": repeats + 1}, "starve": starve}
 
 
-def wake_fingerprint(p: Project, gates: dict[str, dict]) -> str:
+def wake_fingerprint(p: Project, gates: dict[str, dict], db=None) -> str:
     """The state a wake turn decides on. Running counts as queued: dispatch moves tasks between
     the two without the coordinator. Spend numbers are left out; gate levels carry them."""
-    db = p.db
+    db = db or p.db
     tasks = [(t["id"], "queued" if t["status"] == "running" else t["status"], t["priority"], t["depends_on"])
              for t in db.q("SELECT id, status, priority, depends_on FROM tasks "
                            "WHERE status NOT IN ('done','failed','cancelled') ORDER BY id")]

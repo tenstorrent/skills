@@ -12063,3 +12063,31 @@ def test_pr_watch_alerts_when_a_pr_leaves_draft_without_approval(env, monkeypatc
     state[old]["isDraft"] = False      # #3 was grandfathered only until it went back to draft
     watchers.watch_prs(d)
     assert set(p.db.kv(prguard.UNAPPROVED_KEY)) == {"acme/widgets#3"}
+
+
+def test_web_state_works_once_the_coordinator_has_run(env):
+    """The page's data comes from request threads. After a coordinator turn it also shows the next
+    idle wake, which must read through the request thread's own connection: SQLite refuses a
+    connection made in another thread, and the page went blank."""
+    p = make(env)
+    from ttp import web
+    p.db.set_kv("last_coordinator_turn", time.time() - 600)    # opens p.db in this thread
+    port = web.free_port(19750)
+    p.set_config("web.port", port)
+
+    class Stub:
+        pass
+    stub = Stub()
+    stub.p = p
+    threading.Thread(target=web.serve, args=(stub,), daemon=True).start()
+    base = f"http://127.0.0.1:{port}"
+    for _ in range(50):
+        try:
+            urllib.request.urlopen(base + "/", timeout=1)
+            break
+        except OSError:
+            time.sleep(0.1)
+    req = urllib.request.Request(base + "/api/state", headers={"X-TTP-Token": web.token(p)})
+    data = json.loads(urllib.request.urlopen(req, timeout=10).read())
+    assert data["project"]["name"] == "demo"
+    assert "health" in data

@@ -230,7 +230,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
             lowest = min(floor for _, floor in readers)
             undelivered = {"asks": len(late), "since": since,
                            "below_floor": sum(SEVERITY_RANK.get(a["severity"], 1) < lowest for a in late)}
-    wake = idle_wake(p, cfg, gates, now) if last_turn else {"at": None, "held": None}
+    wake = idle_wake(p, cfg, gates, now, db=db) if last_turn else {"at": None, "held": None}
     next_wake = max(wake["at"], backoff, now) if wake["at"] else None
 
     # What keeps ready tasks from starting; shown even while other runs work.
