@@ -14,7 +14,7 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
 | action | fields | use for |
 |---|---|---|
 | `reply` | `chat`, `text` | answer the chat that asked (chat id from the event) |
-| `task_add` | `title`, `spec`, `kind`, `tier`, `priority` 1-5, optional `reply_chat`, `depends_on`, `provider`, `budget_usd`, `resources`, `exclusive`, `continues` (id of a failed, cancelled or blocked task this one replaces; a done one gets a follow-up instead), `start_after` (a delay such as `3d` or an ISO time), `start_when` (shell probe: exit 0 = start, 1 or 255 (host unreachable) = not yet) | all real work |
+| `task_add` | `title`, `spec`, `kind`, `tier`, `priority` 1-5, optional `reply_chat`, `depends_on`, `provider`, `budget_usd`, `resources`, `exclusive`, `continues` (id of a failed, cancelled or blocked task this one replaces; a done one gets a follow-up instead), `start_after` (a delay such as `3d` or an ISO time), `start_when` (shell probe: exit 0 = start, 1, 75 (busy `ttp lock`) or 255 (host unreachable) = not yet) | all real work |
 | `task_update` | `id`, `status` (queued/blocked/cancelled/done/waiting), `text` (why, when blocking or cancelling; otherwise added to the spec), `priority`, `spec`, `depends_on` (replaces the list; `[]` clears it), `resources` + `exclusive` (replace its resources; not while it runs), `start_after`/`start_when` (re-defer a task not yet started; `now` and `""` clear them) | steer existing tasks |
 | `ask_user` | `text`, `severity`, `blocking`, `recommendation` | a decision only the user can make |
 | `resolve` | `id` (an open ask) | the user answered it, or it no longer matters |

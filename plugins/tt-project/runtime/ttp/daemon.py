@@ -60,6 +60,7 @@ WAIT_KEYS = ("retry_when", "retry_after_s", "waiting_for", "wake_tier", "survive
              "waiting_since")
 MAX_FOLLOWUPS, FOLLOWUP_SPEC_CHARS = 12, 4000   # per hand-off; each follow-up is its own event
 PROBE_EVERY_S = 180     # how often a waiting task's `retry_when` (or a deferred one's `start_when`) probe runs
+NOT_YET_RCS = (1, 75, 255)   # probe exits meaning "not yet": 1, EX_TEMPFAIL (a busy `ttp lock`), ssh unreachable
 PROBE_TIMEOUT_S = 60
 AUTH_PROBE_S = 900      # while a provider is logged out, one run on it checks the login this often
 ORPHAN_GRACE_S = 10     # TERM to KILL for an agent whose supervisor died
@@ -2059,7 +2060,8 @@ class Daemon:
     def probe_deferred(self, now: float) -> None:
         """A task added with `start_when` stays queued, undispatched, until its probe exits 0; the
         probe runs here like a waiting task's, once any `start_after` has passed. Exit 1 means not
-        yet, and so does 255 (ssh could not reach the host: a reboot or a network blip). A broken
+        yet, and so do 75 (EX_TEMPFAIL, e.g. a busy `ttp lock`) and 255 (ssh could not reach the
+        host: a reboot or a network blip). A broken
         probe (another exit, a timeout, a probe that cannot start) is raised to the
         coordinator once, never as a worker run, and keeps being tried. So is a deferral still not
         met after `coordinator.defer_max_days`."""
@@ -2086,10 +2088,10 @@ class Daemon:
             self.p.db.update_task(task["id"], labels=without_deferral(json.loads(task["labels"] or "[]")),
                                   not_before=None)
             log(self.p, f"task {task['id']} start_when passed; ready to start")
-        elif rc not in (1, 255):
+        elif rc not in NOT_YET_RCS:
             why = rc if isinstance(rc, str) else f"exit {rc}"
             self._deferral_event(task, d.get("since") or task["created"], "deferral_probe_broken",
-                                 f"its start_when probe is broken ({why}; only 0 = start and 1 or 255 = not "
+                                 f"its start_when probe is broken ({why}; only 0 = start and 1, 75 or 255 = not "
                                  f"yet are valid): {d.get('when', '')[:300]}")
 
     def _deferral_event(self, task: dict, since: float, kind: str, what: str) -> None:
@@ -2174,12 +2176,13 @@ class Daemon:
         fresh = at >= since and now - at <= 2 * PROBE_EVERY_S
         if fresh and rc == 0:
             self._wake_waiting(task, "probe passed", now)
-        elif fresh and rc not in (1, 255):
+        elif fresh and rc not in NOT_YET_RCS:
             self._wake_waiting(task, f"probe broken: {rc if isinstance(rc, str) else f'exit {rc}'}", now)
         elif now >= since + max_hold:
             self._wake_waiting(task, f"held {max_hold / 3600:g} h, probe still failing", now)
         elif fresh:
-            # 255 is ssh failing to reach the host: a reboot or a network blip, so "not yet".
+            # 75 is EX_TEMPFAIL (e.g. a busy `ttp lock`); 255 is ssh failing to reach the host
+            # (a reboot or a network blip). Both mean "not yet".
             nb = min(now + _retry_s(prev), since + max_hold)
             what = str(prev.get("waiting_for") or prev.get("summary") or "")[:300]
             says = "host unreachable" if rc == 255 else "not yet"

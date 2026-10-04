@@ -11082,6 +11082,34 @@ def test_a_start_when_probe_exiting_255_means_not_yet(env, monkeypatch):
     assert not _ready(p, tid) and p.db.task(tid)["status"] == "queued"
 
 
+def test_a_start_when_probe_exiting_75_means_not_yet(env, monkeypatch):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    coord.apply(p, [{"type": "task_add", "title": "locked", "spec": "s", "start_when": "exit 75"}])
+    tid = _added(p, "locked")
+    d = dmod.Daemon(p.base)
+    for _ in range(2):
+        _settle_deferred(d, tid)
+    assert not _events(p, tid, "deferral_probe_broken"), "a busy lock (EX_TEMPFAIL) is not a broken probe"
+    assert not _ready(p, tid) and p.db.task(tid)["status"] == "queued"
+
+
+def test_a_retry_when_probe_exiting_75_keeps_the_task_asleep(env):
+    p = make(env)
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    tid = _due_waiting_task(p, "exit 75")
+    _settle_probe(d, tid)
+    p.db.update_task(tid, not_before=time.time() - 1)
+    d.probe_waiting()
+    task = p.db.task(tid)
+    assert not _ready(p, tid) and task["not_before"] > time.time() + 800
+    assert "probe says not yet" in task["blocked_reason"]
+    assert "woke" not in json.loads(task["result"])
+
+
 def test_a_start_when_probe_that_cannot_start_raises_an_event(env, monkeypatch):
     p = make(env)
     from ttp import coordinator as coord
