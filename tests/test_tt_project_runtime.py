@@ -13281,8 +13281,8 @@ def test_pr_watch_drops_flags_for_cancelled_tasks_and_prs_it_cannot_read(env, mo
     ids = [p.db.x("INSERT INTO tasks(title,kind,status,pr_url,created) VALUES(?,?,?,?,?)",
                   ("t", "code", "done", url, time.time())) for url in (a, b)]
     readable = {a: True, b: True}
-    monkeypatch.setattr(watchers, "_gh", lambda args, cwd: {"url": args[2], "state": "OPEN", "title": "t",
-                                                            "isDraft": False} if readable[args[2]] else None)
+    monkeypatch.setattr(watchers, "_gh", lambda args, cwd: None if args[0] == "api" or not readable[args[2]] else
+                        {"url": args[2], "state": "OPEN", "title": "t", "isDraft": False})
     monkeypatch.setattr(watchers, "_undo_ready", lambda url, cwd: False)
     p.db.set_kv("pr_signatures", {})
     d = Daemon(p.base)
