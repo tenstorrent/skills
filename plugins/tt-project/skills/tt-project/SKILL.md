@@ -66,6 +66,7 @@ description: "Start, connect to, and talk with a long-running tt-project: a loca
 | stop all use of one resource (a device) | `ttp pause <name> --resource <r> --reason "..."` / `ttp resume <name> --resource <r>` |
 | record their machines (shared by all projects) | `ttp machines add <alias> --tags device,...` / `ttp machines list`; say in the charter which ones the project may use. Projects on other machines (`--host`) get a merged copy on add/remove, `ttp upgrade` and `ttp machines push` |
 | change caps | tell the coordinator, or `ttp config <name> budget.daily_usd 150` |
+| keep schedules in git | `ttp schedules <name> --export` once: `harness/schedules.json` then holds them, the daemon applies edits to it, and every change is a harness commit |
 | restart after trouble | `ttp restart <name>`, then `ttp doctor <name>` |
 | stop for good | `ttp stop <name>` (removes the service; data stays; running workers finish) |
 | stop and end running work now | `ttp stop <name> --kill` (their tasks resume on the next start) |

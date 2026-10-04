@@ -479,11 +479,18 @@ class Handler(BaseHTTPRequestHandler):
                 row = db.one("SELECT * FROM schedules WHERE name=?", (name,))
                 if not row:
                     return self._send(404, {"error": "no schedule"})
+                own = Project(p.base)   # this thread's connection, not the daemon's
+                own._db = db
+                try:
+                    sched.before_change(own)
+                except ValueError as e:
+                    return self._send(409, {"error": str(e)})
                 if "enabled" in body:
                     db.x("UPDATE schedules SET enabled=? WHERE name=?", (int(bool(body["enabled"])), name))
                 if "budget_usd_day" in body:
                     v = body["budget_usd_day"]
                     db.x("UPDATE schedules SET budget_usd_day=? WHERE name=?", (None if v in (None, "") else float(v), name))
+                sched.write_file(own, f"schedule {name}: changed in the web app")
                 return self._send(200, {"ok": True})
             if url.path.startswith("/api/task/"):
                 tid = int(url.path.rsplit("/", 1)[-1])

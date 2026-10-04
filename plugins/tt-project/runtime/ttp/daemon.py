@@ -208,6 +208,8 @@ class Daemon:
         self._notify: str | None = None   # systemd's socket for the watchdog ping, when it runs us
         self._tick_wall, self._tick_mono = time.time(), time.monotonic()
         self._settle_until = 0.0   # monotonic time before which nothing new starts (the host just woke)
+        self._sched_sig: tuple[int, int] | None = None   # harness/schedules.json (mtime, size) last checked
+        self._sched_read = 0.0   # monotonic time it was last read
         self._note_boot()
 
     # lifecycle ------------------------------------------------------------------------------------
@@ -226,6 +228,7 @@ class Daemon:
         log(self.p, f"daemon start pid={os.getpid()} host={hostname()} boot={self.boot}")
         self.p.db.set_kv("daemon", {"pid": os.getpid(), "host": hostname(), "started": time.time()})
         self._check_config()
+        self.sync_schedules(start=True)
         from .web import serve
         threading.Thread(target=serve, args=(self,), daemon=True).start()
         self._keep_awake()
@@ -283,6 +286,29 @@ class Daemon:
                 self.alert(key, "project.json: " + "; ".join(probs), severity="low", every_s=ALERT_KEEP_S)
         except Exception:
             log(self.p, "config check: " + traceback.format_exc().replace("\n", " | ")[:1000])
+
+    def sync_schedules(self, start: bool = False) -> None:
+        """Apply harness/schedules.json when it changed (at start, always). A hand edit is committed
+        so it too leaves a trail; a file that does not check out is reported and left unapplied."""
+        sig = None
+        try:
+            st = sched.file_path(self.p).stat()
+            sig = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            pass
+        # The content is compared too, once a minute: an edit can keep both mtime and size.
+        if not start and sig == self._sched_sig and time.monotonic() - self._sched_read < 60:
+            return
+        applied, problem = sched.sync_file(self.p, force=start)
+        self._sched_sig, self._sched_read = sig, time.monotonic()
+        if applied:
+            log(self.p, f"applied {sched.FILE}")
+            self.p.commit_harness([sched.file_path(self.p)], f"schedules: {sched.FILE} applied")
+        if problem:
+            log(self.p, problem)
+            key = "schedules_file:" + hashlib.sha1(problem.encode()).hexdigest()[:10]
+            self.alert(key, f"{problem}. The schedules stay as they were until it is fixed.", severity="low",
+                       every_s=ALERT_KEEP_S)
 
     def _note_boot(self) -> None:
         """On a new boot, keep what the earlier boot's last heartbeat said (when, and the resources
@@ -353,7 +379,7 @@ class Daemon:
             self.jev = Jev(self.cfg, db=self.p.db)
         for step in (self.reap_runs, self.wake_after_reboot, self.meter_running, self.reconcile_tasks,
                      self.prune_worktrees, self.check_local_only, self.check_disk, self.sweep_alerts,
-                     self.check_release, self.sync_shared_pauses, self.check_integrity):
+                     self.check_release, self.sync_shared_pauses, self.check_integrity, self.sync_schedules):
             step()
             self._progress()
         if self.p.db.kv("paused", False):

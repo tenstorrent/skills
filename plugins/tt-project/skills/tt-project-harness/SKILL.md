@@ -33,7 +33,7 @@ description: "Improve a tt-project's own harness — its coordinator and worker 
 | Coordinator rules | `prompts/coordinator.md` |
 | Worker contract, per-kind rules | `prompts/worker.md`, `prompts/kind-*.md` |
 | Tiers, caps, debounce, idle wake, resources | `project.json` (defaults: `runtime/ttp/project.py`) |
-| Recurring work | coordinator `schedule_set`, or the web app's Recurring pane |
+| Recurring work | `schedules.json` when the harness has it (the daemon applies edits; `ttp schedules <name> --export` creates it once from the database), else coordinator `schedule_set` or the web app's Recurring pane |
 | Watchers | `kind: command` schedules; scripts under `watchers/` in the harness. One JSON line per observation: `{"text", "severity", "repeat"}`; `"repeat": true` wakes the coordinator on every new occurrence, otherwise a known one wakes again after `screen.rewake_after_h` quiet. Write a line as `<subject>: <item>; <item>`: each item is one issue (counts masked), an item may start with `now`, `still:`, `changed:` or `cleared:`, and `cleared: <item>` closes it. A run that prints nothing closes the watcher's open issues, and an issue not seen for 24 h closes; a closed one seen again reopens and wakes at its severity |
 | Web app | `runtime/ttp/web/` |
 | Runtime behavior | `runtime/ttp/*.py` (last resort) |

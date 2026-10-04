@@ -659,6 +659,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if section.startswith("Restriction"):
                     _tell_running_workers(db, f"New binding restriction: {text}", key)
             elif t == "schedule_set":
+                sched.before_change(p)
                 old = db.one("SELECT * FROM schedules WHERE name=?", (a.get("name"),))
                 kind = a.get("kind") or (old["kind"] if old else "llm")
                 kept = json.loads(old["payload"] or "{}") if old and old["kind"] == kind else {}
@@ -686,6 +687,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                              a["budget_usd"] if "budget_usd" in a else (old["budget_usd_day"] if old else None),
                              (a.get("text") or "") if "text" in a else ((old["description"] or "") if old else ""),
                              payload)
+                sched.write_file(p, f"schedule {a['name']}: {'changed' if old else 'added'}")
             elif t == "config_set":
                 key = a.get("key", "")
                 if key not in USER_SETTABLE:

@@ -340,6 +340,7 @@ def bootstrap(root: Path, name: str, brief: str, provider: str) -> Project:
     for s in json.loads((template / "recurring.json").read_text()):
         sched.upsert(db, s["name"], s["kind"], s["every"], s.get("at"), s.get("enabled", True),
                      s.get("budget_usd_day"), s.get("description", ""), s.get("payload", {}))
+    sched.write_file(p, "schedules: from the template", create=True)
     db.set_meta("name", name)
     db.post("in", "Project created. Brief:\n" + (brief.strip() or "(none)") +
             "\n\nRead the charter, restate the goals, success criteria and restrictions as you understand "
@@ -974,6 +975,23 @@ def cmd_memory(a) -> None:
     memory_budget_check(p)
 
 
+def cmd_schedules(a) -> None:
+    p = need(a.name, sys.argv[1:])
+    path = sched.file_path(p)
+    if a.export:
+        if path.exists():
+            die(f"{path} already exists: it holds the schedules; edit it, the daemon applies it")
+        sched.write_file(p, "schedules: exported from the database", create=True)
+        print(f"wrote {path}; from now on it holds the schedules and every change to them is a harness commit")
+        return
+    print(f"schedules from {path}" if path.exists() else
+          f"schedules from the database only (`ttp schedules {p.name} --export` keeps them in {path})")
+    for r in p.db.q("SELECT * FROM schedules ORDER BY name"):
+        e = sched.entry(r)
+        print(f"  {e['name']:24} {e['kind']:8} every {e['every']}{' at ' + e['at'] if e.get('at') else ''}"
+              f"{'' if e['enabled'] else ' (off)'}  {r['last_status'] or ''}")
+
+
 def cmd_machines(a) -> None:
     """The user's machines (~/.tt-project/machines.json), shared by all their projects. Each
     project's charter says which of them it may use; its coordinator routes work only to those.
@@ -1491,6 +1509,12 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--forget", action="append", metavar="ENTRY",
                    help="retire an entry (its name in [brackets]) to memory/archive/; repeatable")
     s.set_defaults(fn=cmd_memory)
+
+    s = sub.add_parser("schedules", help="list schedules, or --export them once to harness/schedules.json")
+    s.add_argument("name")
+    s.add_argument("--export", action="store_true",
+                   help="write the database's schedules to harness/schedules.json, which then holds them")
+    s.set_defaults(fn=cmd_schedules)
 
     s = sub.add_parser("machines", help="your machines, shared by all your projects (add/list/remove/push)")
     ms = s.add_subparsers(dest="action", required=True)

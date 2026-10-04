@@ -11468,3 +11468,140 @@ def test_push_check_path_args_and_unmatched(env, tmp_path):
     g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "y")
     g("update-ref", "refs/remotes/origin/work", "HEAD")
     assert push.unmatched_paths(repo, "origin", "work", checks) == ("origin/work", [])
+
+
+def _sched_file(p):
+    return json.loads((p.harness / "schedules.json").read_text())
+
+
+def _harness_log(p, path="schedules.json"):
+    return subprocess.run(["git", "-C", str(p.harness), "log", "--format=%s", "--", path],
+                          capture_output=True, text=True).stdout.splitlines()
+
+
+def test_a_new_project_keeps_its_schedules_in_a_committed_harness_file(env):
+    p = make(env)
+    names = [e["name"] for e in _sched_file(p)]
+    assert names == sorted(r["name"] for r in p.db.q("SELECT name FROM schedules")) == ["daily-review", "pr-watch"]
+    review = next(e for e in _sched_file(p) if e["name"] == "daily-review")
+    assert review["every"] == "1d" and review["at"] == "04:30" and review["payload"]["prompt"] == "daily-review.md"
+    assert _harness_log(p) == ["schedules: from the template"]
+
+
+def test_schedule_set_writes_back_to_the_schedules_file_with_a_commit(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    assert coord.apply(p, [{"type": "schedule_set", "name": "probe", "kind": "command", "every": "30m",
+                            "command": "echo checked", "text": "a probe"}]) == []
+    probe = next(e for e in _sched_file(p) if e["name"] == "probe")
+    assert probe == {"name": "probe", "kind": "command", "every": "30m", "enabled": True,
+                     "description": "a probe", "payload": {"command": "echo checked"}}
+    assert coord.apply(p, [{"type": "schedule_set", "name": "probe", "enabled": False}]) == []
+    assert next(e for e in _sched_file(p) if e["name"] == "probe")["enabled"] is False
+    assert _harness_log(p)[:2] == ["schedule probe: changed", "schedule probe: added"]
+
+
+def test_the_daemon_applies_a_hand_edit_of_the_schedules_file(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    p.db.x("UPDATE schedules SET last_run=123, last_status='ok' WHERE name='pr-watch'")
+    d = Daemon(p.base)
+    d.sync_schedules()
+    entries = [e for e in _sched_file(p) if e["name"] != "daily-review"]   # removed
+    entries[0]["every"] = "10m"
+    entries.append({"name": "probe", "kind": "command", "every": "1h", "payload": {"command": "true"}})
+    (p.harness / "schedules.json").write_text(json.dumps(entries))
+    d.sync_schedules()
+    rows = {r["name"]: r for r in p.db.q("SELECT * FROM schedules")}
+    assert sorted(rows) == ["pr-watch", "probe"]
+    assert rows["pr-watch"]["every_s"] == 600 and rows["pr-watch"]["last_run"] == 123, "run state is kept"
+    assert json.loads(rows["probe"]["payload"]) == {"command": "true"} and rows["probe"]["next_run"]
+    assert _harness_log(p)[0] == "schedules: schedules.json applied"
+    # At start the file is applied whatever the database says.
+    p.db.x("UPDATE schedules SET every_s=5 WHERE name='pr-watch'")
+    Daemon(p.base).sync_schedules(start=True)
+    assert p.db.one("SELECT every_s FROM schedules WHERE name='pr-watch'")["every_s"] == 600
+
+
+def test_a_broken_schedules_file_is_reported_and_left_unapplied(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    path = p.harness / "schedules.json"
+    entries = _sched_file(p)
+    before = p.db.q("SELECT * FROM schedules ORDER BY name")
+    bad = [dict(entries[0], evry="1h"), *entries[1:]]
+    path.write_text(json.dumps(bad))
+    d = Daemon(p.base)
+    d.sync_schedules()
+    assert p.db.q("SELECT * FROM schedules ORDER BY name") == before
+    alert = p.db.one("SELECT * FROM messages WHERE kind='alert' AND ref LIKE 'schedules_file:%'")
+    assert alert and "unknown key(s) evry" in alert["text"], alert
+    # A change from the coordinator would overwrite the edit: it is refused until the file is fixed.
+    out = coord.apply(p, [{"type": "schedule_set", "name": "pr-watch", "enabled": False}])
+    assert len(out) == 1 and "fix harness/schedules.json" in out[0], out
+    assert json.loads(path.read_text()) == bad
+    for broken in ("[", '{"name": "x"}', '[{"name": "x", "kind": "llm"}]', '[{"name": "x", "kind": "llm", "every": "1y"}]',
+                   '[{"name": "x", "kind": "command", "every": "1h"}]',
+                   '[{"name": "x", "kind": "llm", "every": "1h"}, {"name": "x", "kind": "llm", "every": "1h"}]'):
+        path.write_text(broken)
+        assert d.sync_schedules() is None and p.db.q("SELECT * FROM schedules ORDER BY name") == before, broken
+    path.write_text(json.dumps(entries[:1]))
+    d.sync_schedules()
+    assert [r["name"] for r in p.db.q("SELECT name FROM schedules")] == [entries[0]["name"]]
+
+
+def test_schedule_set_keeps_a_hand_edit_the_daemon_has_not_applied_yet(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    entries = _sched_file(p) + [{"name": "nightly", "kind": "llm", "every": "1d", "payload": {"spec": "look"}}]
+    (p.harness / "schedules.json").write_text(json.dumps(entries))
+    assert coord.apply(p, [{"type": "schedule_set", "name": "probe", "kind": "command", "every": "1h",
+                            "command": "true"}]) == []
+    assert [e["name"] for e in _sched_file(p)] == ["daily-review", "nightly", "pr-watch", "probe"]
+    assert p.db.one("SELECT name FROM schedules WHERE name='nightly'")
+
+
+def test_without_a_schedules_file_the_database_holds_them_until_exported(env, capsys):
+    p = make(env)
+    from ttp import cli
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    path = p.harness / "schedules.json"
+    path.unlink()   # a project from before the file
+    assert coord.apply(p, [{"type": "schedule_set", "name": "probe", "kind": "command", "every": "1h",
+                            "command": "true"}]) == []
+    Daemon(p.base).sync_schedules(start=True)
+    assert not path.exists() and len(p.db.q("SELECT name FROM schedules")) == 3
+    cli.main(["schedules", "demo"])
+    assert "from the database only" in capsys.readouterr().out
+    cli.main(["schedules", "demo", "--export"])
+    assert [e["name"] for e in _sched_file(p)] == ["daily-review", "pr-watch", "probe"]
+    assert _harness_log(p)[0] == "schedules: exported from the database"
+    with pytest.raises(SystemExit):
+        cli.main(["schedules", "demo", "--export"])
+
+
+def test_web_schedule_changes_write_back_to_the_schedules_file(env):
+    p = make(env)
+    from ttp import web
+    port = web.free_port(19820)
+    p.set_config("web.port", port)
+
+    class Stub:
+        pass
+    stub = Stub()
+    stub.p = p
+    threading.Thread(target=web.serve, args=(stub,), daemon=True).start()
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/api/schedule/pr-watch", method="POST",
+                                 data=json.dumps({"enabled": False}).encode(),
+                                 headers={"X-TTP-Token": web.token(p), "Content-Type": "application/json"})
+    for _ in range(50):
+        try:
+            urllib.request.urlopen(req, timeout=2)
+            break
+        except OSError:
+            time.sleep(0.1)
+    assert next(e for e in _sched_file(p) if e["name"] == "pr-watch")["enabled"] is False
+    assert not p.db.one("SELECT enabled FROM schedules WHERE name='pr-watch'")["enabled"]
+    assert _harness_log(p)[0] == "schedule pr-watch: changed in the web app"
