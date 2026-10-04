@@ -4710,6 +4710,66 @@ def test_the_disk_guard_alerts_once_per_episode_holds_heavy_tasks_and_resumes(en
     assert len(alerts()) == 2, "a new episode must alert again"
 
 
+def test_disk_resume_free_gb_holds_the_guard_until_its_resume_point(env, monkeypatch):
+    import collections
+    p = make(env)
+    from ttp import daemon as dm
+    from ttp.project import config_problems
+    p.set_config("disk.min_free_gb", 30)
+    p.set_config("disk.resume_free_gb", 50)
+    usage = collections.namedtuple("usage", "total used free")
+    free = {"gb": 29}   # a 10000 GB disk: 5% is 500 GB, so min_free_gb (30) is the threshold
+    monkeypatch.setattr(dm.shutil, "disk_usage", lambda path: usage(10000e9, 0, free["gb"] * 1e9))
+    alerts = lambda: p.db.q("SELECT id FROM messages WHERE kind='alert' AND ref='disk'")  # noqa: E731
+    d = dm.Daemon(p.base)
+    d.check_disk()   # trips below min_free_gb
+    assert p.db.kv("disk_low") and p.db.kv("disk")["resume_gb"] == 50 and len(alerts()) == 1
+    assert "held until 50 GB are free" in p.db.one("SELECT text FROM messages WHERE ref='disk'")["text"]
+    for gb in (31, 40, 49.5):   # between min and resume: still held (1.2 times 30 would have let go at 36)
+        free["gb"] = gb
+        d.check_disk()
+        assert p.db.kv("disk_low"), gb
+    d = dm.Daemon(p.base)   # a restart keeps the episode: no new alert, still held
+    d.check_disk()
+    assert p.db.kv("disk_low") and len(alerts()) == 1
+    free["gb"] = 50
+    d.check_disk()   # released at the resume point
+    assert p.db.kv("disk_low") is None
+    free["gb"] = 40
+    d.check_disk()   # above min_free_gb: not tripped again
+    assert p.db.kv("disk_low") is None and len(alerts()) == 1
+    assert config_problems(p.raw_config()) == []
+    p.set_config("disk.resume_free_gb", 10)   # below min_free_gb: raised to it, with a warning
+    assert config_problems(p.raw_config()) == ["disk.resume_free_gb: 10 is below disk.min_free_gb 30; 30 is used"]
+    free["gb"] = 29
+    d = dm.Daemon(p.base)
+    d.check_disk()
+    assert p.db.kv("disk")["resume_gb"] == 30
+    free["gb"] = 30
+    d.check_disk()
+    assert p.db.kv("disk_low") is None
+
+
+@pytest.mark.parametrize("value, resume_gb, problem", [(None, 36, False), ("lots", 36, True), (60, 36, False)])
+def test_disk_resume_free_gb_unset_or_bad_keeps_the_default_resume_point(env, monkeypatch, value, resume_gb,
+                                                                        problem):
+    import collections
+    p = make(env)
+    from ttp import daemon as dm
+    from ttp import machines as mm
+    from ttp.project import config_problems
+    p.set_config("disk.min_free_gb", 30)
+    if value is not None:
+        p.set_config("disk.resume_free_gb", value)
+    if value == 60:   # a machine's own threshold keeps the 1.2 times rule
+        mm.add("testhost", "device", "a shared disk", 30)
+    usage = collections.namedtuple("usage", "total used free")
+    monkeypatch.setattr(dm.shutil, "disk_usage", lambda path: usage(10000e9, 0, 29e9))
+    dm.Daemon(p.base).check_disk()
+    assert p.db.kv("disk_low") and p.db.kv("disk")["resume_gb"] == resume_gb
+    assert bool(config_problems(p.raw_config())) == problem
+
+
 @pytest.mark.parametrize("alias, extra, low, source", [
     ("testhost", {"min_free_gb": 30}, False, "testhost"),              # this machine's own threshold wins
     ("shared-box", {"min_free_gb": 30, "hostname": "TestHost"}, False, "shared-box"),   # matched by host name

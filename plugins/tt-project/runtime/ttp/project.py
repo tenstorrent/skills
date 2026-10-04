@@ -91,11 +91,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "power": {"keep_awake": "on_ac"},
     # Disk guard: with free space under the project folder below the smaller of min_free_pct of the
     # disk and min_free_gb (either 0 = off), only question and plan tasks start; a machines-list entry's
-    # own min_free_gb replaces min_free_gb on that machine (see machines.py). Finished tasks'
+    # own min_free_gb replaces min_free_gb on that machine (see machines.py). Once tripped, the guard
+    # holds until resume_free_gb are free (raised to min_free_gb when below it); null, or a machine's
+    # own threshold, resumes at 1.2 times the threshold. Finished tasks'
     # worktrees lose their cache_dirs (null = the built-in list) and are removed once clean with
     # HEAD on a branch and no submodules set up, at least an hour after the task ended, or
     # worktree_retention_days after it (0 = never tidy). Branches are never deleted.
-    "disk": {"min_free_pct": 5, "min_free_gb": 150, "worktree_retention_days": None, "cache_dirs": None},
+    "disk": {"min_free_pct": 5, "min_free_gb": 150, "resume_free_gb": None, "worktree_retention_days": None,
+             "cache_dirs": None},
     # Workers and reviewers run with the project's Python venv active (VIRTUAL_ENV, PATH), so a
     # fresh task worktree does not rebuild one. "auto" finds .venv or venv in the project root; a
     # path (absolute, or relative to the project root) names one; "" turns it off. A working
@@ -155,6 +158,26 @@ def unknown_key_hint(dotted: str) -> str | None:
     return None
 
 
+def disk_resume_gb(disk: dict) -> float | None:
+    """The disk guard's resume point in GB from a `disk` config section: resume_free_gb raised to
+    min_free_gb when below it, or None (unset or not a number) for the default rule."""
+    v = disk.get("resume_free_gb")
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
+        return None
+    return max(float(v), float(disk.get("min_free_gb", DEFAULT_CONFIG["disk"]["min_free_gb"]) or 0))
+
+
+def _disk_problems(disk: Any) -> list[str]:
+    if not isinstance(disk, dict) or disk.get("resume_free_gb") is None:
+        return []
+    v, low = disk["resume_free_gb"], disk.get("min_free_gb", DEFAULT_CONFIG["disk"]["min_free_gb"])
+    if disk_resume_gb(disk) is None:
+        return [f"disk.resume_free_gb: {v!r} is not a number of GB; the guard resumes at 1.2 times its threshold"]
+    if isinstance(low, (int, float)) and v < low:
+        return [f"disk.resume_free_gb: {v:g} is below disk.min_free_gb {low:g}; {low:g} is used"]
+    return []
+
+
 def config_problems(raw: dict) -> list[str]:
     """Unknown keys and non-command push_checks in a project's own settings, one line each."""
     out: list[str] = []
@@ -169,6 +192,7 @@ def config_problems(raw: dict) -> list[str]:
     walk(raw, [])
     from .push import check_problems    # push imports this module
     out += [f"delivery.push_checks: {p}" for p in check_problems((raw.get("delivery") or {}).get("push_checks"))]
+    out += _disk_problems(raw.get("disk"))
     return out
 
 def deep_merge(base: dict, over: dict) -> dict:

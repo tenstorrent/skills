@@ -42,7 +42,7 @@ from . import shared
 from . import worktree
 from .db import (OPEN_ASK_MAX_AGE_S, SEVERITY_RANK, TERMINAL_TASK_STATES, continues_id, deferral, dependency_ids,
                  dump_result, load_result, without_deferral)
-from .project import Project, durable_write, git_fsync_env, hostname, load_secrets
+from .project import Project, disk_resume_gb, durable_write, git_fsync_env, hostname, load_secrets
 from .providers import get_provider
 from .providers.base import last_json_object, scratch_dir, service_path
 from .providers.claude import as_windows
@@ -1640,8 +1640,9 @@ class Daemon:
         """The disk guard. Free space under the project folder and its worktrees below the smaller of
         `disk.min_free_pct` of the disk and `disk.min_free_gb` (either at 0 turns it off) holds new
         tasks that may build or check out code; see _disk_holds. One high alert per episode, which ends
-        once free space is back above DISK_RESUME times the threshold, so a disk hovering at the
-        line does not flap. The episode is kept in the database: a restart neither re-alerts nor forgets it."""
+        once free space is back at `disk.resume_free_gb` (never below the threshold), or, with that
+        unset, above DISK_RESUME times the threshold, so a disk hovering at the line does not flap.
+        The episode is kept in the database: a restart neither re-alerts nor forgets it."""
         cfg = self.cfg.get("disk", {})
         pct, gb = float(cfg.get("min_free_pct", 5) or 0), float(cfg.get("min_free_gb", 150) or 0)
         try:
@@ -1650,25 +1651,29 @@ class Daemon:
             mine = None
         if mine:
             gb = mine[1]
-        worst = None   # (margin, path, free, total, threshold)
+        # A machine's own threshold keeps the DISK_RESUME rule: the project's resume point was set
+        # against its own threshold and could hold a shared disk that others keep near full forever.
+        resume_gb = None if mine else disk_resume_gb(cfg)
+        worst = None   # (margin, path, free, total, threshold, resume point)
         for path in {self.p.base.resolve(), self.p.worktrees.resolve()}:
             try:
                 u = shutil.disk_usage(path)
             except OSError:
                 continue
             need = min(pct / 100 * u.total, gb * 1e9)
-            margin = u.free - need * (DISK_RESUME if self._disk_low else 1)
+            resume = need * DISK_RESUME if resume_gb is None else max(need, resume_gb * 1e9)
+            margin = u.free - (resume if self._disk_low else need)
             if worst is None or margin < worst[0]:
-                worst = (margin, path, u.free, u.total, need)
+                worst = (margin, path, u.free, u.total, need, resume)
         if worst is None:
             return
-        _, path, free, total, need = worst
+        _, path, free, total, need, resume = worst
         self._disk_free = free
         low = need > 0 and worst[0] < 0
         now = time.time()
         db = self.p.db
         info = {"path": str(path), "free_gb": round(free / 1e9, 1), "total_gb": round(total / 1e9, 1),
-                "threshold_gb": round(need / 1e9, 1), "resume_gb": round(need * DISK_RESUME / 1e9, 1), "low": low,
+                "threshold_gb": round(need / 1e9, 1), "resume_gb": round(resume / 1e9, 1), "low": low,
                 "checked": now, **({"machine": mine[0]} if mine else {})}
         last = db.kv("disk") or {}
         if (low != last.get("low") or abs(info["free_gb"] - float(last.get("free_gb") or 0)) >= 1
@@ -1686,7 +1691,7 @@ class Daemon:
             source = f"machine {mine[0]}'s min_free_gb" if mine else "disk.min_free_gb"
             self.alert("disk", f"Only {free / 1e9:.1f} GB free under {path} (guard: {need / 1e9:.0f} GB, the smaller "
                                f"of {pct:g}% of the disk and {gb:g} GB from {source}). {usage} New tasks other than "
-                               f"questions and plans are held until {need * DISK_RESUME / 1e9:.0f} GB are free; running "
+                               f"questions and plans are held until {resume / 1e9:.0f} GB are free; running "
                                f"work, questions, plans and replies continue. Finished tasks' worktrees are removed as "
                                f"they end; `ttp prune {self.p.name}` sweeps now and lists the ones kept. A shared disk "
                                f"that others keep near full by design takes its own threshold: `ttp machines add "

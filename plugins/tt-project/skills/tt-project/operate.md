@@ -52,12 +52,14 @@
 - Only one daemon runs per project (a lock file), whatever starts it.
 - Disk guard: free space under the project folder below the smaller of `disk.min_free_pct` (5) of
   the disk and `disk.min_free_gb` (150) → only question and plan tasks start; running work goes on;
-  one high alert per episode, cleared once free space is 1.2× the threshold. Status, the web app and
+  one high alert per episode, cleared once free space is back at `disk.resume_free_gb` (unset: 1.2×
+  the threshold; a value below `disk.min_free_gb` is raised to it and `ttp doctor` warns), so a disk
+  hovering at the line does not flap; the episode survives a daemon restart. Status, the web app and
   the coordinator's digest show free space. A machine whose entry in the machines list has
   `min_free_gb` uses that instead of `disk.min_free_gb` (for a shared disk that other services keep
-  near full by design). The alert, and the digest while low, say how much of the used space is this
-  project's own data and name the biggest top-level directories (`du -x -d 1`, stopped after 30 s),
-  so a full shared disk is not taken for project growth.
+  near full by design) and resumes at 1.2× it. The alert, and the digest while low, say how much of
+  the used space is this project's own data and name the biggest top-level directories (`du -x -d 1`,
+  stopped after 30 s), so a full shared disk is not taken for project growth.
 - When a task ends (done, failed, cancelled), its worktree loses its git-ignored build and cache
   directories (`disk.cache_dirs`) and is removed once clean with HEAD on a branch. Branches are never
   deleted, so `continues` still starts from the old commits. A dirty worktree is kept and listed, and
