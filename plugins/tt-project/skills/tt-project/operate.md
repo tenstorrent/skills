@@ -52,9 +52,9 @@
 - Only one daemon runs per project (a lock file), whatever starts it.
 - Disk guard: free space under the project folder below the smaller of `disk.min_free_pct` (5) of
   the disk and `disk.min_free_gb` (150) → only question and plan tasks start; running work goes on;
-  one high alert per episode, cleared once free space is back at `disk.resume_free_gb` (unset: 1.2×
-  the threshold; a value below `disk.min_free_gb` is raised to it and `ttp doctor` warns), so a disk
-  hovering at the line does not flap; the episode survives a daemon restart. Status, the web app and
+  one high alert per episode, cleared once free space is back at `disk.resume_free_gb` (unset, or
+  at least the disk's size: 1.2× the threshold; below the threshold: the threshold; a value below
+  `disk.min_free_gb` makes `ttp doctor` warn), so a disk hovering at the line does not flap; the episode survives a daemon restart. Status, the web app and
   the coordinator's digest show free space. A machine whose entry in the machines list has
   `min_free_gb` uses that instead of `disk.min_free_gb` (for a shared disk that other services keep
   near full by design) and resumes at 1.2× it. The alert, and the digest while low, say how much of

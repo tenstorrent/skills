@@ -4740,12 +4740,34 @@ def test_disk_resume_free_gb_holds_the_guard_until_its_resume_point(env, monkeyp
     assert p.db.kv("disk_low") is None and len(alerts()) == 1
     assert config_problems(p.raw_config()) == []
     p.set_config("disk.resume_free_gb", 10)   # below min_free_gb: raised to it, with a warning
-    assert config_problems(p.raw_config()) == ["disk.resume_free_gb: 10 is below disk.min_free_gb 30; 30 is used"]
+    assert config_problems(p.raw_config()) == [
+        "disk.resume_free_gb: 10 is below disk.min_free_gb 30; the guard's threshold is used instead when it is higher"]
     free["gb"] = 29
     d = dm.Daemon(p.base)
     d.check_disk()
     assert p.db.kv("disk")["resume_gb"] == 30
     free["gb"] = 30
+    d.check_disk()
+    assert p.db.kv("disk_low") is None
+
+
+@pytest.mark.parametrize("value, resume_gb", [(40, 40), (500, 7.7)])
+def test_disk_resume_free_gb_on_a_small_disk_uses_the_percent_threshold(env, monkeypatch, value, resume_gb):
+    import collections
+    p = make(env)
+    from ttp import daemon as dm
+    p.set_config("disk.resume_free_gb", value)   # min_free_gb stays at its default (150)
+    usage = collections.namedtuple("usage", "total used free")
+    free = {"gb": 6}   # a 128 GB disk: 5% is 6.4 GB, below min_free_gb, so that is the threshold
+    monkeypatch.setattr(dm.shutil, "disk_usage", lambda path: usage(128e9, 0, free["gb"] * 1e9))
+    d = dm.Daemon(p.base)
+    d.check_disk()
+    assert p.db.kv("disk_low") and p.db.kv("disk")["threshold_gb"] == 6.4
+    assert p.db.kv("disk")["resume_gb"] == resume_gb   # not raised to min_free_gb, nor past the disk's size
+    free["gb"] = resume_gb - 0.5
+    d.check_disk()
+    assert p.db.kv("disk_low")
+    free["gb"] = resume_gb
     d.check_disk()
     assert p.db.kv("disk_low") is None
 

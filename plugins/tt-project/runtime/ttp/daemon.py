@@ -1641,7 +1641,8 @@ class Daemon:
         `disk.min_free_pct` of the disk and `disk.min_free_gb` (either at 0 turns it off) holds new
         tasks that may build or check out code; see _disk_holds. One high alert per episode, which ends
         once free space is back at `disk.resume_free_gb` (never below the threshold), or, with that
-        unset, above DISK_RESUME times the threshold, so a disk hovering at the line does not flap.
+        unset or at least the disk's size, above DISK_RESUME times the threshold, so a disk hovering
+        at the line does not flap.
         The episode is kept in the database: a restart neither re-alerts nor forgets it."""
         cfg = self.cfg.get("disk", {})
         pct, gb = float(cfg.get("min_free_pct", 5) or 0), float(cfg.get("min_free_gb", 150) or 0)
@@ -1662,6 +1663,8 @@ class Daemon:
                 continue
             need = min(pct / 100 * u.total, gb * 1e9)
             resume = need * DISK_RESUME if resume_gb is None else max(need, resume_gb * 1e9)
+            if resume >= u.total:   # a resume point the disk can never reach would hold it forever
+                resume = need * DISK_RESUME
             margin = u.free - (resume if self._disk_low else need)
             if worst is None or margin < worst[0]:
                 worst = (margin, path, u.free, u.total, need, resume)

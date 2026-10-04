@@ -92,8 +92,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Disk guard: with free space under the project folder below the smaller of min_free_pct of the
     # disk and min_free_gb (either 0 = off), only question and plan tasks start; a machines-list entry's
     # own min_free_gb replaces min_free_gb on that machine (see machines.py). Once tripped, the guard
-    # holds until resume_free_gb are free (raised to min_free_gb when below it); null, or a machine's
-    # own threshold, resumes at 1.2 times the threshold. Finished tasks'
+    # holds until resume_free_gb are free (the threshold when below it; 1.2 times the threshold when
+    # at or above the disk's size); null, or a machine's own threshold, resumes at 1.2 times the
+    # threshold. Finished tasks'
     # worktrees lose their cache_dirs (null = the built-in list) and are removed once clean with
     # HEAD on a branch and no submodules set up, at least an hour after the task ended, or
     # worktree_retention_days after it (0 = never tidy). Branches are never deleted.
@@ -159,12 +160,12 @@ def unknown_key_hint(dotted: str) -> str | None:
 
 
 def disk_resume_gb(disk: dict) -> float | None:
-    """The disk guard's resume point in GB from a `disk` config section: resume_free_gb raised to
-    min_free_gb when below it, or None (unset or not a number) for the default rule."""
+    """The disk guard's resume point in GB from a `disk` config section: resume_free_gb as set, or None
+    (unset or not a number) for the default rule. The daemon raises it to the guard's threshold."""
     v = disk.get("resume_free_gb")
     if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
         return None
-    return max(float(v), float(disk.get("min_free_gb", DEFAULT_CONFIG["disk"]["min_free_gb"]) or 0))
+    return float(v)
 
 
 def _disk_problems(disk: Any) -> list[str]:
@@ -174,7 +175,8 @@ def _disk_problems(disk: Any) -> list[str]:
     if disk_resume_gb(disk) is None:
         return [f"disk.resume_free_gb: {v!r} is not a number of GB; the guard resumes at 1.2 times its threshold"]
     if isinstance(low, (int, float)) and v < low:
-        return [f"disk.resume_free_gb: {v:g} is below disk.min_free_gb {low:g}; {low:g} is used"]
+        return [f"disk.resume_free_gb: {v:g} is below disk.min_free_gb {low:g}; the guard's threshold is used "
+                f"instead when it is higher"]
     return []
 
 
