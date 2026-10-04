@@ -700,6 +700,99 @@ def test_broken_config_keeps_the_last_good_one(env):
     assert p.config()["budget"]["daily_usd"] == 42
 
 
+def test_missing_config_keeps_the_last_good_routing(env):
+    """A project.json gone for a moment must not move the project onto the default models."""
+    from ttp.project import Project
+    p = make(env)
+    p.set_config("providers.fake.tiers.standard.model", "pinned-model")
+    assert p.config()["providers"]["fake"]["tiers"]["standard"]["model"] == "pinned-model"
+    saved = p.config_path.read_text()
+    p.config_path.unlink()
+    assert p.config()["providers"]["fake"]["tiers"]["standard"]["model"] == "pinned-model"
+    assert p.config_status == "fallback"
+    (p.state / "project.last-good.json").unlink()
+    assert p.config()["providers"]["fake"]["tiers"]["standard"]["model"] == "pinned-model", "kept in memory"
+    fresh = Project(p.base)
+    assert fresh.config()["core_provider"] == "claude" and fresh.config_status == "unavailable"
+    with pytest.raises(RuntimeError):
+        fresh.set_config("budget.daily_usd", 5)   # would write a project.json of that key alone
+    assert not p.config_path.exists()
+    p.config_path.write_text(saved)
+    assert fresh.config()["providers"]["fake"]["tiers"]["standard"]["model"] == "pinned-model"
+    assert fresh.config_status == "ok"
+
+
+def test_malformed_config_uses_the_last_good_copy(env):
+    from ttp.project import Project
+    p = make(env)
+    p.set_config("core_provider", "fake")
+    p.config()
+    for broken in ("{ not json", "[]", "null"):
+        p.config_path.write_text(broken)
+        fresh = Project(p.base)   # nothing in memory: the copy on disk decides
+        assert fresh.config()["core_provider"] == "fake" and fresh.config_status == "fallback", broken
+
+
+def test_unreadable_config_starts_no_model_work_and_alerts_once(env, monkeypatch):
+    """Neither project.json nor a last good copy: no coordinator turn or worker run starts on the
+    defaults; one alert says so and clears once the file reads again."""
+    from ttp import alerts
+    from ttp.daemon import Daemon
+    p = make(env)
+    saved = p.config_path.read_text()
+    p.config_path.write_text("{ broken")
+    (p.state / "project.last-good.json").unlink(missing_ok=True)
+    p.db.add_task("user work", "s", kind="work", tier="light", origin="user")
+    p.db.post("in", "hello", chat="web")
+    d = Daemon(p.base)
+    assert d.cfg_status == "unavailable"
+    started = []
+    monkeypatch.setattr(d, "start_run", lambda *a, **k: started.append(a[0]) or 0)
+    for _ in range(2):
+        d._last_cfg = 0
+        d.tick()
+    assert started == [], "no turn or run routes on the defaults"
+    eps = p.db.q("SELECT * FROM alerts WHERE key='config' AND cleared IS NULL")
+    assert len(eps) == 1 and p.db.one("SELECT COUNT(*) n FROM messages WHERE ref='config'")["n"] == 1
+    assert alerts.active(p.db, "config", eps[0]["raised"], time.time())
+    with pytest.raises(RuntimeError):
+        Daemon.start_run(d, "worker", "x", "fake", "light", str(p.root))
+    p.config_path.write_text(saved)
+    d._load_config()
+    d.sweep_alerts()
+    assert d.cfg_status == "ok"
+    assert p.db.one("SELECT cleared FROM alerts WHERE key='config'")["cleared"]
+    assert p.db.one("SELECT id FROM messages WHERE ref='config' AND kind='resolved'")
+
+
+def test_task_provider_override_routes_on_the_last_good_config(env, monkeypatch):
+    """A task that names its provider still takes that provider's tier from the project's routing,
+    the last good one while project.json is missing."""
+    from ttp import daemon as dm
+    p = make(env)
+    _no_events(p)
+    p.set_config("providers.fake.tiers.standard.model", "pinned-model")
+    d = dm.Daemon(p.base)
+    p.config_path.unlink()
+    d._last_cfg = 0
+    d._load_config()
+    assert d.cfg_status == "fallback"
+    tid = p.db.add_task("override", "s", kind="work", tier="standard", provider="fake", origin="user")
+    seen = []
+
+    class Stop(Exception):
+        pass
+
+    class Prov:
+        def use(self, model, prices):
+            seen.append(model)
+            raise Stop()
+    monkeypatch.setattr(dm, "get_provider", lambda name: Prov())
+    d.dispatch()
+    assert seen == ["pinned-model"], seen
+    assert p.db.task(tid)["status"] != "running"
+
+
 def test_slack_routing(env):
     from ttp.slack import projects_in_dm, route
     assert route({"text": "demo: hi", "ts": "1"}, "demo", set(), ["demo", "other"]) == "hi"

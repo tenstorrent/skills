@@ -42,7 +42,8 @@ from . import shared
 from . import worktree
 from .db import (OPEN_ASK_MAX_AGE_S, SEVERITY_RANK, TERMINAL_TASK_STATES, continues_id, deferral, dependency_ids,
                  dump_result, load_result, without_deferral)
-from .project import Project, disk_resume_gb, durable_write, git_fsync_env, hostname, load_secrets
+from .project import (DEFAULT_CONFIG, Project, deep_merge, disk_resume_gb, durable_write, git_fsync_env, hostname,
+                      load_secrets)
 from .providers import get_provider
 from .providers.base import last_json_object, scratch_dir, service_path
 from .providers.claude import as_windows
@@ -72,6 +73,7 @@ DISK_FLOOR_GB = 2        # below this even questions and plans wait
 DISK_DU_TIMEOUT_S = 30   # the guard alert's du breakdown stops after this, keeping what it measured
 DISK_DU_TOP = 6          # the biggest top-level directories it names
 KEEP_RECHECK_S = 6 * 3600   # a finished task's kept worktree is looked at again this often
+CONFIG_UNREADABLE_KEY = "config_unreadable"   # kv: project.json and its last good copy both unreadable
 ALERT_KEEP_S = 30 * 86400   # alerts_sent keeps an entry this long: the longest every_s any alert uses
 SLEPT_MIN_S = 60        # a run whose wall clock ran this much ahead of its monotonic clock overlapped a host sleep
 SLEEPS_KEPT_S = 7 * 86400
@@ -173,7 +175,8 @@ class Daemon:
         self.boot = runner.boot_id()
         self.boot_at = runner.boot_time()
         self.gates: dict[str, bud.Gate] = {}
-        self.cfg = self.p.config()
+        self.cfg_status = "ok"
+        self._load_config()
         self.jev = Jev(self.cfg, db=self.p.db)
         self._slack = None
         self._last_cfg = 0.0
@@ -277,6 +280,28 @@ class Daemon:
         except OSError:
             pass
 
+    def _load_config(self) -> None:
+        """Reload project.json. Missing or broken, its last good copy stays in force; with none, an
+        established project starts no coordinator turn or worker run (both would route on the
+        defaults) and says so in one alert, which clears once the file reads again."""
+        raw, status = self.p.read_config()
+        self.cfg = deep_merge(DEFAULT_CONFIG, raw)
+        if status != self.cfg_status:
+            log(self.p, {"ok": "project.json reads again",
+                         "fallback": "project.json is missing or not valid JSON: its last good copy stays in force",
+                         "unavailable": "project.json is missing or not valid JSON and there is no last good copy: "
+                                        "no new coordinator turns or worker runs"}[status])
+        self.cfg_status = status
+        db = self.p.db
+        bad = status == "unavailable"
+        if bad != bool(db.kv(CONFIG_UNREADABLE_KEY)):
+            db.set_kv(CONFIG_UNREADABLE_KEY, bad)
+        if bad:
+            self.alert("config", f"{self.p.config_path} is missing or not valid JSON, and there is no last good "
+                                 f"copy to fall back on. No coordinator turns or worker runs start until it reads "
+                                 f"again (running work goes on); its earlier versions are in the harness git history.",
+                       every_s=ALERT_KEEP_S)
+
     def _check_config(self) -> None:
         """Say once (per distinct finding) what in project.json no code reads, or which push check
         is no command, so a typo or a sentence there does not fail a push much later."""
@@ -379,7 +404,8 @@ class Daemon:
         self._check_sleep()
         now = time.time()
         if now - self._last_cfg > 10:
-            self.cfg, self._last_cfg = self.p.config(), now
+            self._load_config()
+            self._last_cfg = now
             self.jev = Jev(self.cfg, db=self.p.db)
         for step in (self.reap_runs, self.wake_after_reboot, self.meter_running, self.reconcile_tasks,
                      self.prune_worktrees, self.check_local_only, self.check_disk, self.sweep_alerts,
@@ -396,6 +422,8 @@ class Daemon:
         settling = self.settling()
         for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.read_upstream, self.retry_rejected,
                      self.maybe_coordinate, self.probe_waiting, self.dispatch, self.deliver_outbound):
+            if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
+                continue   # no routing to start model work with (see _load_config)
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
             if settling and (step == self.dispatch or step == self.maybe_coordinate and not self.p.db.one(
                     "SELECT id FROM messages WHERE direction='in' AND handled=0")):
@@ -455,6 +483,8 @@ class Daemon:
                   budget_usd: float | None = None, timeout_s: float | None = None, read_only: bool = False,
                   schema: dict | None = None, system: str | None = None, append_system: str | None = None,
                   note: dict | None = None, resume: str | None = None, unblock: str = "") -> int:
+        if self.cfg_status == "unavailable":
+            raise RuntimeError("project.json is unreadable with no last good copy: no model work starts")
         tiers = self.cfg["providers"].get(provider, {}).get("tiers", {})
         model = tiers.get(tier, {}).get("model", "")
         effort = tiers.get(tier, {}).get("effort", "")

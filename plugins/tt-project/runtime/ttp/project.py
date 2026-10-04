@@ -249,6 +249,8 @@ class Project:
         self.worktrees = self.base / "worktrees"
         self.memory_dir = self.harness / "memory"
         self._db: DB | None = None
+        self._last_good: dict | None = None   # project.json as this process last read it valid
+        self.config_status = "ok"             # how raw_config last found it (see read_config)
 
     # layout -----------------------------------------------------------------------------------
     @property
@@ -274,31 +276,53 @@ class Project:
 
     # config -----------------------------------------------------------------------------------
     def raw_config(self) -> dict:
-        """The project's own settings. A hand edit that breaks the JSON keeps the last good copy in
-        force (and says so in the daemon log) instead of taking the project down."""
+        """The project's own settings (see read_config); `config_status` keeps how they were found."""
+        data, self.config_status = self.read_config()
+        return data
+
+    def read_config(self) -> tuple[dict, str]:
+        """The project's own settings and how they were found. A hand edit that breaks the JSON, or a
+        file that goes missing for a moment, keeps the last good copy (on disk, else the one this
+        process last read) in force instead of taking the project down or quietly moving its model
+        and provider routing to the defaults: "fallback". With neither, an established project (one
+        with a database) is "unavailable" and the daemon starts no model work until the file reads
+        again; a project still being made has an empty config, "ok"."""
         good = self.state / "project.last-good.json"
         try:
             data = json.loads(self.config_path.read_text())
-        except FileNotFoundError:
-            return {}
-        except ValueError:
-            try:
-                return json.loads(good.read_text())
-            except (OSError, ValueError):
-                return {}
+            if not isinstance(data, dict):
+                raise ValueError("project.json is not a JSON object")
+        except (OSError, ValueError):
+            for read in (lambda: json.loads(good.read_text()), lambda: self._last_good):
+                try:
+                    kept = read()
+                except (OSError, ValueError):
+                    continue
+                if isinstance(kept, dict):
+                    return copy.deepcopy(kept), "fallback"
+            return {}, "unavailable" if self.established() else "ok"
+        self._last_good = copy.deepcopy(data)
         try:
             # <=: two writes within one filesystem clock tick share an mtime.
             if self.state.is_dir() and (not good.exists() or good.stat().st_mtime <= self.config_path.stat().st_mtime):
                 write_json(good, data)
         except OSError:
             pass
-        return data
+        return data, "ok"
+
+    def established(self) -> bool:
+        """The project has run: its database exists (never created by asking)."""
+        return (self.state / "project.db").is_file()
 
     def config(self) -> dict:
         return deep_merge(DEFAULT_CONFIG, self.raw_config())
 
     def set_config(self, dotted: str, value: Any) -> None:
         raw = self.raw_config()
+        if self.config_status == "unavailable":
+            # Writing the one key would make a project.json of defaults and that key alone.
+            raise RuntimeError(f"{self.config_path} is missing or not valid JSON and there is no last good copy: "
+                               f"restore it before changing settings")
         node = raw
         parts = dotted.split(".")
         for p in parts[:-1]:

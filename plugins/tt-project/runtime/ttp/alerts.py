@@ -31,6 +31,7 @@ CLEARED_TEXT = {
     "release-older": "The installed tt-project is no longer older than this harness.",
     "integrity": "The harness and the task worktrees check out again.",
     "pr-ready": "{arg} is back in draft, closed or approved.",
+    "config": "project.json reads again; new work starts again.",
 }
 
 
@@ -77,6 +78,8 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
         return bool(db.kv("disk_low"))
     if key == "coordinator":
         return int(db.kv("coordinator_failures", 0)) > 0
+    if key == "config":   # the daemon keeps the flag while project.json and its last good copy are unreadable
+        return bool(db.kv("config_unreadable"))
     if key == "release-older":
         return bool(db.kv("release_older"))
     if key == "integrity":
@@ -108,7 +111,7 @@ def active(db: DB, key: str, ts: float, now: float) -> bool:
 
 def _checkable(key: str) -> bool:
     return key.partition(":")[0] in ("auth", "limit", "budget", "disk", "coordinator", "run-start", "schedule",
-                                         "release-older", "integrity", "pr-ready")
+                                         "release-older", "integrity", "pr-ready", "config")
 
 
 def _since(ep: dict) -> float:
