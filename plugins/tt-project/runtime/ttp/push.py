@@ -6,7 +6,7 @@ project's checks passed on exactly the commit being pushed, and never with force
 Pushes of one project to one branch take turns: each holds the lock `push:<remote>/<branch>` from
 its first fetch to its push, so two reviewers never race each other through rounds. The lock is an
 OS file lock (locks.py): a killed push or a reboot frees it. A waiting push waits as long as the
-last measured check run takes, with a margin (`delivery.push_wait_s` overrides it).
+last measured check run takes, with a margin, up to 2 h (`delivery.push_wait_s` overrides it).
 
 With `delivery.version_bump` set, the push also owns the version bump: after each rebase it sets the
 listed files one patch version above the tip's and adds a changeset, in one commit of its own. The
@@ -14,6 +14,7 @@ bump happens under the lock, so parallel pushes never race for one version."""
 from __future__ import annotations
 
 import json
+import math
 import os
 import posixpath
 import re
@@ -36,6 +37,7 @@ REFUSED, CONFLICT, CHECKS_FAILED, KEPT_MOVING, REJECTED, BUSY = 2, 3, 4, 5, 6, 7
 DEFAULT_ROUNDS = 3
 DEFAULT_WAIT_S = 900       # the lock wait with no measured check run, and its floor otherwise
 WAIT_MARGIN_S = 60          # on top of two check runs: the holder may start over once
+MAX_DEFAULT_WAIT_S = 7200  # the measured wait's ceiling; only an explicit push_wait_s waits longer
 TIMINGS = "push_checks.json"   # under the project's state: how long the last full check run took
 BUMP_TRAILER = "Ttp-Version-Bump"   # marks the bump commit ttp push made, so a rerun replaces it
 VERSION_RE = re.compile(r"""(version(?:__)?["']?\s*[:=]\s*["'])(\d+)\.(\d+)\.(\d+)(["'])""", re.I)
@@ -277,17 +279,25 @@ def last_check_s(p: Project) -> float | None:
         v = json.loads((p.state / TIMINGS).read_text()).get("last_s")
     except (OSError, ValueError, AttributeError):
         return None
-    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0 else None
+    ok = isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v >= 0
+    return float(v) if ok else None
 
 
 def record_check_s(p: Project, seconds: float) -> None:
-    write_json(p.state / TIMINGS, {"last_s": round(seconds, 1), "at": time.time()})
+    """Runs between passing checks and the push, so a failed write is logged and never stops it."""
+    try:
+        write_json(p.state / TIMINGS, {"last_s": round(seconds, 1), "at": time.time()})
+    except OSError as e:
+        print(f"ttp push: could not record the check time in {p.state / TIMINGS}: {e}", file=sys.stderr)
 
 
 def default_wait(last_s: float | None) -> float:
     """The lock wait when `delivery.push_wait_s` is unset: long enough for the holder to run its
-    checks twice (it starts over when the branch moved), and never under DEFAULT_WAIT_S."""
-    return float(DEFAULT_WAIT_S) if last_s is None else max(float(DEFAULT_WAIT_S), 2 * last_s + WAIT_MARGIN_S)
+    checks twice (it starts over when the branch moved), never under DEFAULT_WAIT_S and never over
+    MAX_DEFAULT_WAIT_S."""
+    if last_s is None:
+        return float(DEFAULT_WAIT_S)
+    return min(float(MAX_DEFAULT_WAIT_S), max(float(DEFAULT_WAIT_S), 2 * last_s + WAIT_MARGIN_S))
 
 
 def bump_of(v: Any) -> dict | None:

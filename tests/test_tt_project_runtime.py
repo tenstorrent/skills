@@ -7554,6 +7554,37 @@ def test_the_default_push_wait_outlasts_the_measured_check_run(env, monkeypatch)
     assert _ttp_push() == 75 and waits[-1] == 5
 
 
+def test_the_measured_push_wait_is_bounded(env, monkeypatch):
+    """A corrupt or huge timing must not make a waiter sit for hours or forever: Infinity, NaN and
+    negative values are ignored, and the measured default is capped; an explicit push_wait_s is not."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    from ttp import push
+    for raw in ('{"last_s": Infinity}', '{"last_s": NaN}', '{"last_s": -Infinity}', '{"last_s": -5}'):
+        (p.state / push.TIMINGS).write_text(raw)
+        assert push.last_check_s(p) is None, raw
+    assert push.default_wait(None) == push.DEFAULT_WAIT_S
+    assert push.default_wait(10 ** 9) == push.MAX_DEFAULT_WAIT_S == 2 * 3600
+    push.record_check_s(p, 10 ** 6)
+    waits = []
+    monkeypatch.setattr(push, "take", lambda p, remote, branch, wait_s, **kw: waits.append(wait_s))
+    _commit(repo, "mine.txt", "mine\n")
+    assert _ttp_push() == 75 and waits[-1] == push.MAX_DEFAULT_WAIT_S
+    p.set_config("delivery.push_wait_s", 5 * 3600)
+    assert _ttp_push() == 75 and waits[-1] == 5 * 3600
+
+
+def test_a_failed_timing_write_does_not_stop_the_push(env, monkeypatch, capsys):
+    """Recording how long the checks took runs between the checks and the push: a full disk or a
+    directory in the way is logged, and the push still goes out."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    from ttp import push
+    (p.state / push.TIMINGS).mkdir(parents=True)
+    _commit(repo, "mine.txt", "mine\n")
+    assert _ttp_push() == 0
+    assert _git_out(repo, "rev-parse", "HEAD") == _git_out(origin, "rev-parse", "refs/heads/proj")
+    assert "could not record" in capsys.readouterr().err
+
+
 def _lost_deep_runs(p, tmp_path, boot, costs=(24.0, 29.0), handoff=None):
     """Deep runs of different tasks whose supervisors vanished ten minutes ago, as the reaper finds them."""
     now = time.time()

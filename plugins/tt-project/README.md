@@ -129,7 +129,7 @@ and preferences you add later become part of the project's charter and memory.
   remote's default branch. Pushes to one branch take turns under a lock that a killed push or a
   reboot frees. One that waits longer than `delivery.push_wait_s` exits 75 and prints a
   `retry_when` for its hand-off: `ttp push --free`, which exits 0 once the turn is free. Unset,
-  the wait is twice the last measured check run plus 60 s, and at least 900 s.
+  the wait is twice the last measured check run plus 60 s, at least 900 s and at most 2 h.
 - `delivery.version_bump` lets `ttp push` own the version bump, so parallel reviews never race for
   one version: `{"files": [...], "changeset_dir": ".changeset"}` (optional `package`, and `paths`,
   default the folder the files share). After each rebase, when the change touches `paths`, it
