@@ -12396,6 +12396,10 @@ def test_workers_gh_keeps_prs_in_draft_until_the_user_approves(env, tmp_path):
     yes = p.db.post("in", "yes, go ahead", chat="web", provenance="web-session")
     # The coordinator sees each user message's id, to name it in pr_approve.
     assert f"[user message #{yes} via" in coord.digest(p, {}, [], [yes])
+    # ...and its provenance and whether it can approve a PR, so a web or cli-legacy yes is asked again.
+    assert "provenance=web-session, can approve a PR: yes" in coord.digest(p, {}, [], [yes])
+    legacy = p.db.post("in", "yes", chat="cli", provenance="cli-legacy")
+    assert "provenance=cli-legacy, can approve a PR: no" in coord.digest(p, {}, [], [legacy])
     assert coord.apply(p, [{"type": "pr_approve", "id": ask, "text": url}]) == []
     for args in [("pr", "ready", "7"), ("pr", "ready"), ("rdy", "7"), ("api", "graphql", "-f", READY_7),
                  ("api", "-X", "PATCH", "repos/acme/widgets/pulls/7", "-F", "draft=false")]:

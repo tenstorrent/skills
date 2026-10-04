@@ -344,7 +344,10 @@ def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int]) ->
     lines.append("\n# NEW EVENTS")
     if msg_ids:
         for m in db.q(f"SELECT * FROM messages WHERE id IN ({','.join('?' * len(msg_ids))}) ORDER BY id", msg_ids):
-            lines.append(f"- [user message #{m['id']} via {m['channel']}, chat={m['chat'] or '-'}] {m['text']}")
+            prov = m["provenance"] or "unknown"
+            ok = "yes" if prov in prguard.APPROVING else "no, ask again on an approving channel"
+            lines.append(f"- [user message #{m['id']} via {m['channel']}, provenance={prov}, can approve a PR: {ok}, "
+                         f"chat={m['chat'] or '-'}] {m['text']}")
     for e in events:
         cap = EVENT_CHARS_BY_KIND.get(e["kind"], EVENT_CHARS)
         text = e["text"] if len(e["text"]) <= cap else e["text"][:cap] + " … [cut]"
