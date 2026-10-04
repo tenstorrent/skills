@@ -60,6 +60,8 @@ RESULT_FILE = "result.json"
 WAIT_KEYS = ("retry_when", "retry_after_s", "waiting_for", "wake_tier", "survives_reboot", "waits",
              "waiting_since")
 MAX_FOLLOWUPS, FOLLOWUP_SPEC_CHARS = 12, 4000   # per hand-off; each follow-up is its own event
+# What a review the daemon queues repeats of the code task's spec and hand-off.
+AUTO_REVIEW_SPEC_CHARS, AUTO_REVIEW_SUMMARY_CHARS = 2000, 1000
 PROBE_EVERY_S = 180     # how often a waiting task's `retry_when` (or a deferred one's `start_when`) probe runs
 NOT_YET_RCS = (1, 75, 255)   # probe exits meaning "not yet": 1, EX_TEMPFAIL (a busy `ttp lock`), ssh unreachable
 PROBE_TIMEOUT_S = 60
@@ -1248,9 +1250,15 @@ class Daemon:
         # ended without a verdict, leaves nothing to decide: the final attempt's outcome starts the turn.
         # A timeout still does, since the task may need splitting before it times out again.
         quiet = new == "queued" and status in ("limit", "auth", "failed", "lost", "stalled", "no_handoff")
+        # A finished code task's next step is its review: the daemon queues it, and a hand-off with
+        # nothing else to decide (no follow-ups or notes, normal severity) starts no coordinator turn.
+        review = self._auto_review(dict(task, **upd), summary) if new == "done" and task["kind"] == "code" else None
+        if review:
+            text += f"\nReview #{review[0]} " + ("queued by the daemon." if review[1] else "was already queued.")
+        routine = review is not None and not fups and not notes and sev == "normal"
         db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
-             (time.time(), f"task:{task['id']}", f"task_{new}", sev, text, "handled" if quiet else "queued",
-              task["id"]))
+             (time.time(), f"task:{task['id']}", f"task_{new}", sev, text,
+              "handled" if quiet or routine else "queued", task["id"]))
         if notes:
             db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                  (time.time(), f"task:{task['id']}", "task_notes", "normal",
@@ -2382,6 +2390,67 @@ class Daemon:
                         f"({len(changes)} files, {sum(n or 0 for n in changes.values())} lines)")
             self.p.db.update_task(task["id"], tier=tier)
         return dict(task, tier=tier)
+
+    def _auto_review(self, task: dict, summary: str) -> tuple[int, bool] | None:
+        """The review of a finished code task, queued here the way the coordinator would, so a
+        routine hand-off needs no coordinator turn: (review id, whether it was added now). An open
+        review that already covers the task (queued ahead by the coordinator) is that review. None
+        when delivery has no review step, the branch changes nothing, the review cap is reached or
+        the diff cannot be read: the coordinator then decides."""
+        cfg, db = self.cfg, self.p.db
+        d = cfg.get("delivery") or {}
+        rules = cfg.get("review") or {}
+        if not rules.get("auto", True) or not (d.get("review_before_pr", True) or d.get("push_branch")):
+            return None
+        branch = task.get("branch")
+        try:
+            for t in db.q("SELECT * FROM tasks WHERE kind='review' AND status NOT IN ('done','failed','cancelled')"):
+                if task["id"] in dependency_ids(t) or (branch and branch in worktree.reviewed_refs(self.p, t)):
+                    return t["id"], False
+            changes = worktree.diff_lines(self.p, [branch]) if branch else None
+            head = worktree._git(self.p.root, "rev-parse", "--short=12", branch) if changes else ""
+        except Exception as e:
+            log(self.p, f"task {task['id']}: no review queued, its diff was not read: {e}")
+            return None
+        if not changes or coord.next_task_slot(db, coord.task_cap(cfg, True), review=True) is not None:
+            return None
+        title = f"Review #{task['id']}: {task['title']}"[:200]
+        dup = db.one("SELECT id FROM tasks WHERE title=? AND status NOT IN ('done','failed','cancelled')", (title,))
+        if dup:
+            return dup["id"], False
+        # A fix after a failed review is re-reviewed as its continuation: the reviewer gets the earlier
+        # findings, and the review is sized by what changed since the head they were found on.
+        chain, c = {task["id"]}, continues_id(task)
+        while c is not None and c not in chain:
+            chain.add(c)
+            c = continues_id(db.task(c) or {"labels": "[]"})
+        prior = next((r for r in db.q("SELECT * FROM tasks WHERE kind='review' AND status='failed' ORDER BY id DESC")
+                      if r["id"] in chain or chain & set(dependency_ids(r))), None)
+        tier = bud.review_tier(changes, cfg)
+        pr = task.get("pr_url")
+        lines = [f"Independently review the change of code task #{task['id']} ({task['title']}): branch {branch}, "
+                 f"head {head}" + (f", PR {pr}" if pr else "") + ".",
+                 f"Its spec: {coord.clip(task.get('spec'), AUTO_REVIEW_SPEC_CHARS)}",
+                 f"Its hand-off: {coord.clip(summary, AUTO_REVIEW_SUMMARY_CHARS)}"]
+        if prior:
+            lines.append(f"Review #{prior['id']} failed on an earlier head: check each of its findings is fixed, "
+                         f"then review what changed since.")
+        lines.append("Check that it does what its spec asks, is correct, keeps the charter's restrictions, and "
+                     "that its tests fail without it.")
+        if d.get("push_branch") and d.get("push_allowed", True):
+            lines.append(f"If it passes, push it with `ttp push` from the change's worktree (it publishes to "
+                         f"{d['push_branch']}).")
+        else:
+            lines.append("Review only: leave the branch" + (" and the PR" if pr else "") + " as they are.")
+        if str(rules.get("auto_notes") or "").strip():
+            lines.append(str(rules["auto_notes"]).strip())
+        lines.append("Return the verdict and findings" + (", and the pushed commit." if d.get("push_branch") else "."))
+        labels = [f"auto_review:{task['id']}"] + ([f"continues:{prior['id']}"] if prior else [])
+        rid = db.add_task(title, "\n".join(lines), kind="review", tier=tier, priority=2, origin="daemon",
+                          budget_usd=float(cfg["budget"]["task_default_usd"].get(tier, 8.0)),
+                          depends_on=[task["id"]], labels=labels)
+        log(self.p, f"task {task['id']}: queued review #{rid} ({tier})")
+        return rid, True
 
     def _reviewed_heads(self, task: dict) -> list[str]:
         """Heads earlier reviews of this stack saw (their `metrics.reviewed_head`): reviews the task

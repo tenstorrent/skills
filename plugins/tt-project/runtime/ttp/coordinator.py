@@ -92,6 +92,9 @@ USER_SETTABLE = {
     "coordinator.max_new_tasks_per_day": lambda v: max(0, min(int(v), MAX_TASKS_PER_DAY)),
     # The separate valve on review tasks; unset means twice max_new_tasks_per_day.
     "coordinator.max_review_tasks_per_day": lambda v: max(0, min(int(v), 2 * MAX_TASKS_PER_DAY)),
+    # Whether the daemon queues each finished code task's review, and what every such review also does.
+    "review.auto": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
+    "review.auto_notes": str,
     # Skill plugins loaded for this project's workers only (a plan may recommend them).
     "providers.claude.plugin_dirs": lambda v: existing_dirs(dir_list(v)),
     # Workers load none of the user's own MCP servers, plugins, hooks or settings.
@@ -390,8 +393,9 @@ SAFE_WHEN_OFF = {"delivery.code_tasks_may_push"}
 def tasks_made(db, since: float, review: bool = False) -> list[float]:
     """Creation times, oldest first, of the tasks that count toward max_new_tasks_per_day, or with
     `review` toward max_review_tasks_per_day. Reviews have their own, higher cap: they check work
-    already done and are what lets it be delivered, but a runaway turn must still stop."""
-    return [r["created"] for r in db.q("SELECT created FROM tasks WHERE origin='coordinator' AND "
+    already done and are what lets it be delivered, but a runaway turn must still stop. Reviews the
+    daemon queued for finished code tasks count too."""
+    return [r["created"] for r in db.q("SELECT created FROM tasks WHERE origin IN ('coordinator','daemon') AND "
                                        + ("kind='review'" if review else "kind!='review'")
                                        + " AND created>? ORDER BY created", (since,))]
 
@@ -545,6 +549,15 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if dead:
                     raise ValueError(f"task_add rejected: depends on #{dead[0]} which is {dead[1]}; "
                                      f"drop or replace depends_on")
+                # A review of work the daemon already queued a review for replaces it while it has not
+                # started; one already under way makes this a duplicate.
+                covered = _covered(db, deps, a.get("spec") or "") if review else set()
+                autos = _auto_reviews(db, covered)
+                started = {n: r for n, r in autos.items() if r["status"] != "queued" or r["attempts"]}
+                if covered and set(started) == covered:
+                    ids = ", ".join(f"#{r['id']}" for r in started.values())
+                    raise ValueError(f"duplicate of review {ids} the daemon queued, already under way; send it a "
+                                     f"`spec` with task_update to add checks")
                 old = _continued(db, a["continues"], deps) if a.get("continues") is not None else None
                 followup = old if old and old["status"] == "done" else None
                 if followup:
@@ -565,6 +578,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                          reply_chat=a.get("reply_chat") or None, origin="coordinator",
                                          labels=labels, not_before=after,
                                          parent=followup["id"] if followup else None)
+                    for r in {r["id"]: r for n, r in autos.items() if n not in started}.values():
+                        db.update_task(r["id"], status="cancelled", blocked_reason=f"replaced by review #{new_id}")
+                        _take_over_dependents(db, r["id"], new_id)
+                        notes.append(f"task_add: #{new_id} replaces review #{r['id']} the daemon had queued")
                     if old:
                         _take_over_dependents(db, old["id"], new_id)
                         if old["status"] == "blocked":   # superseded: never requeued into duplicate work
@@ -845,6 +862,28 @@ def _continued(db, raw: Any, deps: list[int]) -> dict:
 def _open_dependents(db, task_id: int) -> list[dict]:
     return [t for t in db.q("SELECT * FROM tasks WHERE status NOT IN ('done','failed','cancelled') "
                             "AND depends_on NOT IN ('', '[]')") if task_id in dependency_ids(t)]
+
+
+def _covered(db, deps: list, spec: str) -> set[int]:
+    """The code tasks a review covers: those it depends on and those whose branch its spec names."""
+    ids = {d for d in deps if isinstance(d, int)}
+    for r in db.q("SELECT id, branch FROM tasks WHERE kind='code' AND branch IS NOT NULL AND branch!=''"):
+        if re.search(rf"(?<![\w/.-]){re.escape(r['branch'])}(?![\w/-])", spec):
+            ids.add(r["id"])
+    return ids
+
+
+def _auto_reviews(db, covered: set[int]) -> dict[int, dict]:
+    """Code task id in `covered` -> the open review the daemon queued for it (label auto_review:<id>)."""
+    out: dict[int, dict] = {}
+    if not covered:
+        return out
+    for r in db.q("SELECT * FROM tasks WHERE kind='review' AND origin='daemon' "
+                  "AND status NOT IN ('done','failed','cancelled')"):
+        for lb in json.loads(r["labels"] or "[]"):
+            if isinstance(lb, str) and lb.startswith("auto_review:") and lb[12:].isdigit() and int(lb[12:]) in covered:
+                out[int(lb[12:])] = r
+    return out
 
 
 def _take_over_dependents(db, old_id: int, new_id: int) -> None:

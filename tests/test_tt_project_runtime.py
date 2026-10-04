@@ -5036,6 +5036,7 @@ def test_local_only_is_checked_in_the_tick_a_code_task_hands_off_done(env):
     remote = env["tmp"] / "remote.git"
     subprocess.run(["git", "clone", "-q", "--bare", str(env["repo"]), str(remote)], check=True)
     subprocess.run(["git", "-C", str(env["repo"]), "remote", "add", "origin", str(remote)], check=True)
+    p.set_config("review.auto", False)   # a queued review would still need the branch: not flagged yet
     tid, path, _ = _code_task(p, "hand-off", status="queued")
     _commit_file(path, "a")
     d = _local_only_daemon(p)
@@ -14120,3 +14121,149 @@ def test_idle_slot_wake_backs_off_to_long_waits_while_every_queued_task_is_gated
     assert coord.apply(p, [{"type": "task_add", "title": "later", "spec": "s", "start_when": "exit 1"}]) == []
     st = starve_state(p.db, p.config(), gate.as_dict(), clock[0])
     assert st and st["wait"] == float(c["idle_wake_s"]), st
+
+
+def _finish_code(env, p, title, files, result=None, labels=None):
+    """A code task that committed `files` (name -> lines) on its branch, then handed off."""
+    from ttp import worktree
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage as Usage
+    tid = p.db.add_task(title, f"spec of {title}", kind="code", tier="standard", origin="coordinator",
+                        labels=labels)
+    path, branch = worktree.ensure(p, p.db.task(tid))
+    for name, lines in files.items():
+        (path / name).parent.mkdir(parents=True, exist_ok=True)
+        (path / name).write_text("".join(f"{title} {i}\n" for i in range(lines)))
+    if files:
+        _git_out(path, "add", ".")
+        _git_out(path, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", title)
+    p.db.update_task(tid, status="running", branch=branch)
+    run_dir = env["tmp"] / f"run-{tid}"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps(result or {"status": "done", "summary": f"{title} works"}))
+    Daemon(p.base)._finish_worker({"task": tid}, Usage(cost_usd=1.0), "ok", run_dir)
+    done = p.db.one("SELECT * FROM events WHERE task=? AND kind='task_done'", (tid,))
+    reviews = p.db.q("SELECT * FROM tasks WHERE kind='review' AND depends_on=?", (json.dumps([tid]),))
+    return tid, branch, done, reviews
+
+
+def test_the_daemon_queues_the_review_of_a_finished_code_task(env):
+    p = make(env)
+    tid, branch, done, reviews = _finish_code(env, p, "small fix", {"app.py": 20, "NOTES.md": 300})
+    assert len(reviews) == 1, "no review queued"
+    rev = reviews[0]
+    assert rev["title"] == f"Review #{tid}: small fix" and rev["origin"] == "daemon" and rev["tier"] == "light"
+    assert rev["priority"] == 2 and rev["budget_usd"] == p.config()["budget"]["task_default_usd"]["light"]
+    head = _git_out(p.root, "rev-parse", "--short=12", branch)
+    assert branch in rev["spec"] and head in rev["spec"] and "spec of small fix" in rev["spec"]
+    assert "small fix works" in rev["spec"] and "Review only" in rev["spec"] and "ttp push" not in rev["spec"]
+    assert done["status"] == "handled", "a routine hand-off still starts a coordinator turn"
+    assert f"Review #{rev['id']} queued by the daemon" in done["text"]
+    # Big or risky diffs get a standard review; push delivery and the project's notes go in its spec.
+    p.set_config("delivery.push_branch", "work")
+    p.set_config("review.auto_notes", "After the push, upgrade the staging copy.")
+    _, _, _, (big,) = _finish_code(env, p, "big change", {"app.py": 200})
+    assert big["tier"] == "standard" and "ttp push" in big["spec"] and "work" in big["spec"]
+    assert big["spec"].rstrip().endswith("the pushed commit.") and "upgrade the staging copy" in big["spec"]
+    p.set_config("review.risky_paths", ["state/*"])
+    _, _, _, (risky,) = _finish_code(env, p, "risky", {"state/db.py": 3})
+    assert risky["tier"] == "standard"
+
+
+def test_a_code_hand_off_with_more_to_decide_still_wakes_the_coordinator(env):
+    p = make(env)
+    fup = {"status": "done", "summary": "ok", "followups": [{"title": "next", "spec": "s"}]}
+    _, _, done, reviews = _finish_code(env, p, "with follow-up", {"a.py": 5}, result=fup)
+    assert len(reviews) == 1 and done["status"] == "queued"
+    facts = {"status": "done", "summary": "ok", "findings": [{"fact": "x is slow", "source": "a.py"}]}
+    _, _, done, reviews = _finish_code(env, p, "with findings", {"b.py": 5}, result=facts)
+    assert len(reviews) == 1 and done["status"] == "queued"
+    # Nothing to review, or no review step in delivery: the coordinator decides.
+    _, _, done, reviews = _finish_code(env, p, "no commits", {})
+    assert reviews == [] and done["status"] == "queued"
+    p.set_config("review.auto", False)
+    _, _, done, reviews = _finish_code(env, p, "auto off", {"c.py": 5})
+    assert reviews == [] and done["status"] == "queued"
+    p.set_config("review.auto", True)
+    p.set_config("delivery.review_before_pr", False)
+    _, _, done, reviews = _finish_code(env, p, "no review step", {"d.py": 5})
+    assert reviews == [] and done["status"] == "queued"
+    p.set_config("delivery.push_branch", "work")
+    _, _, done, reviews = _finish_code(env, p, "push review", {"e.py": 5})
+    assert len(reviews) == 1 and done["status"] == "handled"
+    # The review cap holds for the daemon's reviews too.
+    p.set_config("coordinator.max_review_tasks_per_day", 0)
+    _, _, done, reviews = _finish_code(env, p, "capped", {"f.py": 5})
+    assert reviews == [] and done["status"] == "queued"
+
+
+def test_the_daemon_adds_no_review_next_to_one_already_queued(env):
+    p = make(env)
+    from ttp import worktree
+    tid = p.db.add_task("pre-reviewed", "s", kind="code", origin="coordinator")
+    ahead = p.db.add_task("Review+push it", "Review it.", kind="review", origin="coordinator", depends_on=[tid])
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage as Usage
+    path, branch = worktree.ensure(p, p.db.task(tid))
+    (path / "x.py").write_text("x = 1\n")
+    _git_out(path, "add", ".")
+    _git_out(path, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x")
+    p.db.update_task(tid, status="running", branch=branch)
+    run_dir = env["tmp"] / "run-pre"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps({"status": "done", "summary": "ok"}))
+    Daemon(p.base)._finish_worker({"task": tid}, Usage(cost_usd=1.0), "ok", run_dir)
+    assert [r["id"] for r in p.db.q("SELECT id FROM tasks WHERE kind='review'")] == [ahead]
+    done = p.db.one("SELECT * FROM events WHERE task=? AND kind='task_done'", (tid,))
+    assert done["status"] == "handled" and f"Review #{ahead} was already queued" in done["text"]
+    # A review naming the branch in its spec covers it too.
+    other, obranch = p.db.add_task("named", "s", kind="code", origin="coordinator"), None
+    opath, obranch = worktree.ensure(p, p.db.task(other))
+    p.db.add_task("Review named", f"Review branch {obranch}.", kind="review", origin="coordinator")
+    (opath / "y.py").write_text("y = 1\n")
+    _git_out(opath, "add", ".")
+    _git_out(opath, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "y")
+    p.db.update_task(other, status="running", branch=obranch)
+    run_dir = env["tmp"] / "run-named"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps({"status": "done", "summary": "ok"}))
+    Daemon(p.base)._finish_worker({"task": other}, Usage(cost_usd=1.0), "ok", run_dir)
+    assert len(p.db.q("SELECT id FROM tasks WHERE kind='review'")) == 2
+
+
+def test_a_coordinator_review_replaces_the_daemons_until_it_starts(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    a, _, _, (auto_a,) = _finish_code(env, p, "change a", {"a.py": 5})
+    b, branch_b, _, (auto_b,) = _finish_code(env, p, "change b", {"b.py": 5})
+    waiter = p.db.add_task("after the review", "s", origin="coordinator", depends_on=[auto_a["id"]])
+    notes_before = p.db.kv(coord.NOTES_KEY)
+    assert coord.apply(p, [{"type": "task_add", "title": "Review a, then deploy", "kind": "review",
+                            "spec": "Review it and deploy.", "depends_on": [a]}]) == []
+    new = p.db.one("SELECT id FROM tasks WHERE title='Review a, then deploy'")["id"]
+    assert p.db.task(auto_a["id"])["status"] == "cancelled"
+    assert json.loads(p.db.task(waiter)["depends_on"]) == [new], "the replaced review's dependents were dropped"
+    assert p.db.kv(coord.NOTES_KEY) != notes_before
+    # One already under way makes the coordinator's a duplicate, unless it also covers other work.
+    p.db.update_task(auto_b["id"], status="running")
+    problems = coord.apply(p, [{"type": "task_add", "title": "Review b again", "kind": "review",
+                                "spec": f"Review branch {branch_b}."}])
+    assert problems and "duplicate" in problems[0] and f"#{auto_b['id']}" in problems[0]
+    assert p.db.task(auto_b["id"])["status"] == "running"
+    c, _, _, (auto_c,) = _finish_code(env, p, "change c", {"c.py": 5})
+    assert coord.apply(p, [{"type": "task_add", "title": "Review b and c", "kind": "review",
+                            "spec": "Review both.", "depends_on": [b, c]}]) == []
+    assert p.db.task(auto_b["id"])["status"] == "running" and p.db.task(auto_c["id"])["status"] == "cancelled"
+
+
+def test_the_daemons_re_review_continues_the_failed_review(env):
+    p = make(env)
+    from ttp.db import continues_id, dump_result
+    first, _, _, (rev,) = _finish_code(env, p, "stack", {"app.py": 300})
+    p.db.update_task(rev["id"], status="failed", result=dump_result({"summary": "missing test", "status": "failed"}))
+    fix, _, done, (re_rev,) = _finish_code(env, p, "fix it", {"fix.py": 5}, labels=[f"continues:{rev['id']}"])
+    assert continues_id(re_rev) == rev["id"] and f"Review #{rev['id']} failed" in re_rev["spec"]
+    # A fix that continues the code task (not the review) is re-reviewed the same way.
+    p.db.update_task(re_rev["id"], status="failed")
+    _, _, _, (third,) = _finish_code(env, p, "fix again", {"fix2.py": 5}, labels=[f"continues:{fix}"])
+    assert continues_id(third) == re_rev["id"]
