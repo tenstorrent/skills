@@ -89,6 +89,9 @@ and preferences you add later become part of the project's charter and memory.
   runs at `coordinator.tier` (light) unless `coordinator.model` or `coordinator.effort` is set:
   those pin the coordinator alone, so moving the light tier to a cheaper model does not move it.
   Empty (the default) follows the tier. The model names one of `core_provider`'s models.
+  A turn about stuck work (a blocked or failed task, resource trouble, an ask timing out, an idle
+  wake that finds blocked tasks or open asks) runs at least at `coordinator.unblock_effort` (high;
+  empty turns this off), so it looks harder for a non-disruptive way forward.
 - The web app shows spend per day, per task and per recurring job, and plan-window peaks for the
   last two weeks.
 - The web app's header and `ttp status` show the budget in one line, for example

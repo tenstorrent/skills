@@ -453,7 +453,7 @@ class Daemon:
     def start_run(self, role: str, prompt: str, provider: str, tier: str, cwd: str, *, task: dict | None = None,
                   budget_usd: float | None = None, timeout_s: float | None = None, read_only: bool = False,
                   schema: dict | None = None, system: str | None = None, append_system: str | None = None,
-                  note: dict | None = None, resume: str | None = None) -> int:
+                  note: dict | None = None, resume: str | None = None, unblock: str = "") -> int:
         tiers = self.cfg["providers"].get(provider, {}).get("tiers", {})
         model = tiers.get(tier, {}).get("model", "")
         effort = tiers.get(tier, {}).get("effort", "")
@@ -463,6 +463,8 @@ class Daemon:
             c = self.cfg.get("coordinator") or {}
             model = str(c.get("model") or "") or model
             effort = str(c.get("effort") or "") or effort
+            if unblock:   # a turn that must find a way past stuck work thinks harder (raise only)
+                effort = coord.raise_effort(effort, str(c.get("unblock_effort", "high") or ""))
         prices = (self.cfg.get("pricing") or {}).get(provider) or {}
         prov = get_provider(provider).use(model, prices)
         restrictions = self.cfg.get("restrictions", {})
@@ -1458,6 +1460,7 @@ class Daemon:
         evs = db.q("SELECT id, ts FROM events WHERE status='queued' ORDER BY id LIMIT ?",
                    (int(c.get("max_events_per_turn", 40)),))
         wake: dict = {}
+        w: dict | None = None
         if not msgs and not evs:
             last = float(db.kv("last_coordinator_turn", 0))
             if now - last <= min(float(c.get("idle_wake_s", 3600)), float(c.get("starve_wake_s", 300))):
@@ -1491,12 +1494,14 @@ class Daemon:
             return   # logged out: one run at a time checks the login, and this turn is not it
         try:
             prompt = coord.digest(self.p, gates, [e["id"] for e in evs], [m["id"] for m in msgs])
+            unblock = coord.unblock_reason(db, [e["id"] for e in evs], (w or {}).get("due"))
             self.start_run("coordinator", prompt, provider, c.get("tier", "light"), str(self.p.base),
                            read_only=True, schema=coord.ACTIONS_SCHEMA, system=coord.system_prompt(self.p),
                            budget_usd=float(c.get("turn_budget_usd", 1.0)),
                            timeout_s=float(c.get("turn_timeout_s", 600)),
                            note={"messages": [m["id"] for m in msgs], "events": [e["id"] for e in evs],
-                                 "default_chat": default_chat})
+                                 "default_chat": default_chat, **({"unblock": unblock} if unblock else {})},
+                           unblock=unblock)
         except Exception as e:
             # A turn that cannot even start backs off like a failed turn instead of retrying every tick.
             log(self.p, "coordinator start failed: " + traceback.format_exc().replace("\n", " | ")[:2000])

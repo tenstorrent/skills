@@ -73,7 +73,8 @@ USER_SETTABLE = {
     "budget.daily_usd": float, "budget.weekly_usd": float, "budget.reserve_pct": float,
     "budget.max_parallel_workers": int, "notify.slack": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     "notify.slack_min_severity": str, "notify.chat_min_severity": str, "core_provider": str,
-    "coordinator.tier": str, "coordinator.model": str, "coordinator.effort": str, "jev.enabled": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
+    "coordinator.tier": str, "coordinator.model": str, "coordinator.effort": str,
+    "coordinator.unblock_effort": str, "jev.enabled": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     # Where code tasks branch from: the project's working branch once it has one.
     "delivery.base_ref": str,
     # Where `ttp push` publishes (required; never main, master or the remote's default branch) and
@@ -105,6 +106,11 @@ REJECTED_KEY = "rejected_actions"   # kv: the last turn's rejected actions, show
 # kv: {"at": ts, "why": text}: a rejected action whose blocking condition clears at a known time.
 # The daemon wakes the coordinator then, so the turn's undone work does not wait for an idle wake.
 RETRY_WAKE_KEY = "rejected_retry_wake"
+# Events that leave work stuck until the coordinator finds a way around it. A turn they start runs
+# at coordinator.unblock_effort, and so does an idle wake that finds blocked tasks or open asks.
+UNBLOCK_KINDS = frozenset({"task_blocked", "task_failed", "task_budget_exhausted", "resource_trouble",
+                           "ask_timeout", "dead_dependency", "deferral_expired", "deferral_probe_broken"})
+EFFORT_ORDER = ("minimal", "low", "medium", "high", "xhigh", "max")
 NOTES_KEY = "action_notes"   # kv: the last turn's notes on actions applied with a change; information only
 RECENT_OUT = 5                       # outbound messages the digest repeats, so turns do not resend them
 # Digest row lengths. Background rows are cut; new events, asks and open-task notes carry decisions.
@@ -841,6 +847,30 @@ def _is_dir(path: str) -> bool:
 
 
 MCP_NAME_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,100}$")
+
+
+def unblock_reason(db, event_ids: list[int], wake_due: str | None) -> str:
+    """Why the coming coordinator turn is about unblocking work, or "" for a routine one."""
+    if event_ids:
+        rows = db.q(f"SELECT DISTINCT kind FROM events WHERE id IN ({','.join('?' * len(event_ids))})",
+                    list(event_ids))
+        kinds = sorted(r["kind"] for r in rows if r["kind"] in UNBLOCK_KINDS)
+        if kinds:
+            return ", ".join(kinds)
+    if wake_due == "idle":
+        if db.one("SELECT id FROM tasks WHERE status='blocked'"):
+            return "stalled on blocked tasks"
+        if db.one("SELECT id FROM messages WHERE kind='ask' AND handled=0"):
+            return "stalled on open asks"
+    return ""
+
+
+def raise_effort(effort: str, floor: str) -> str:
+    """`effort`, raised to at least `floor`; an empty floor leaves it as is."""
+    if not floor or (effort in EFFORT_ORDER and floor in EFFORT_ORDER
+                     and EFFORT_ORDER.index(effort) >= EFFORT_ORDER.index(floor)):
+        return effort
+    return floor
 
 
 def name_list(v: Any, strict: bool = False) -> list[str]:

@@ -2406,6 +2406,14 @@ def test_a_block_on_a_dead_dependency_left_after_a_turn_is_raised_once(env):
     assert f"#{dead}" in rows[0]["text"] and "continues" in rows[0]["text"]
 
 
+def test_the_coordinator_looks_for_a_non_disruptive_way_before_blocking():
+    text = " ".join((RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text().split())
+    assert "# Unblocking" in text and "what is a reasonably non-disruptive way to proceed?" in text
+    for idea in ("canary", "roll back on regression", "lull", "cooperative queue",
+                 "is not a blocker and not a reason to `ask_user`"):
+        assert idea in text, idea
+
+
 def test_the_coordinator_is_told_to_continue_a_dead_task():
     text = (RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text()
     assert "`continues`" in text and "leaves its dependents blocked" in text
@@ -10580,6 +10588,67 @@ def test_the_coordinator_model_and_effort_override_its_tier_and_leave_workers_al
     d = Daemon(p.base)
     row = run(d, "coordinator")
     assert (row["model"], row["effort"]) == ("pinned-model", "low")
+
+
+def test_unblocking_turns_run_at_high_effort_and_routine_turns_do_not(env, monkeypatch):
+    """A turn started by stuck work (a blocked or failed task, resource trouble, an ask timing out)
+    or an idle wake that finds blocked work runs at coordinator.unblock_effort; others keep theirs."""
+    p = make(env)
+    from ttp.daemon import Daemon
+    from ttp import coordinator as coord
+    assert p.config()["coordinator"]["unblock_effort"] == "high"
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    d = Daemon(p.base)
+    d.update_gates()
+    clock = [time.time()]
+    calls = []
+    monkeypatch.setattr(d, "start_run", lambda *a, **k: calls.append(k))
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+
+    def turn(kind=None):
+        if kind:
+            p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                   (clock[0], "daemon", kind, "normal", "x", "queued"))
+        clock[0] += 120
+        n = len(calls)
+        d.maybe_coordinate()
+        assert len(calls) == n + 1, f"no turn for {kind}"
+        p.db.x("UPDATE events SET status='handled'")
+        return calls[-1].get("unblock", "")
+
+    for kind in ("task_blocked", "task_failed", "resource_trouble", "ask_timeout", "deferral_expired"):
+        assert turn(kind) == kind and calls[-1]["note"]["unblock"] == kind
+    for kind in ("task_done", "task_notes", "followup_proposed", "retry_wake"):
+        assert turn(kind) == "", f"{kind} is a routine turn"
+    p.db.post("in", "status?", chat="c1", kind="user")
+    clock[0] += 120
+    d.maybe_coordinate()
+    assert calls[-1].get("unblock", "") == "", "a plain user message is a routine turn"
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    # An idle wake that finds a blocked task is a stall, not a routine check.
+    tid = p.db.add_task("stuck", "s", origin="user")
+    p.db.update_task(tid, status="blocked", blocked_reason="waiting for a window")
+    clock[0] += float(p.config()["coordinator"]["idle_wake_s"]) + 60
+    d.maybe_coordinate()
+    assert calls[-1]["unblock"] == "stalled on blocked tasks"
+    # The effort is raised, never lowered, and an empty unblock_effort turns it off.
+    assert coord.raise_effort("low", "high") == "high"
+    assert coord.raise_effort("max", "high") == "max"
+    assert coord.raise_effort("", "high") == "high"
+    assert coord.raise_effort("low", "") == "low"
+    monkeypatch.undo()
+    p.set_config("providers.claude.tiers.light.effort", "low")
+    for floor, want in (("high", ["low", "high"]), ("", ["low", "low"])):
+        p.set_config("coordinator.unblock_effort", floor)
+        d = Daemon(p.base)
+        got = []
+        for unblock in ("", "task_blocked"):
+            rid = d.start_run("coordinator", "go", "claude", "light", str(p.base), read_only=True, unblock=unblock)
+            (p.runs / str(rid) / "STOP").touch()
+            argv = json.loads((p.runs / str(rid) / "run.json").read_text())["argv"]
+            got.append(argv[argv.index("--effort") + 1])
+            assert p.db.one("SELECT effort FROM runs WHERE id=?", (rid,))["effort"] == got[-1]
+        assert got == want, (floor, got)
 
 
 def test_idle_slot_wake_ignores_forgotten_open_asks(env):
