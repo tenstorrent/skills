@@ -61,7 +61,7 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "reason": {"type": "string"}, "supersedes": {"type": "array", "items": {"type": "string"}},
             "replaces": {"type": "string"},
             "source": {"type": "string"}, "match": {"type": "string"}, "hours": {"type": "number"},
-            "below": {"type": "string"}, "why": {"type": "string"},
+            "below": {"type": "string"}, "why": {"type": "string"}, "quote": {"type": "string"},
             "start_after": {"type": "string", "pattern": START_AFTER_RE}, "start_when": {"type": "string"}},
             "required": ["type"]}},
         "summary": {"type": "string"},
@@ -539,6 +539,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     labels.append(f"continues:{old['id']}")
                 after, when = _start_args(a, {})
                 labels += defer_labels(after, when)
+                why = prguard.spec_problem(db, a.get("spec") or "")
+                if why:
+                    raise ValueError(f"task_add rejected: {why}")
                 with db.tx():
                     new_id = db.add_task(title, a.get("spec") or "", kind=a.get("kind") or "work", tier=tier,
                                          priority=int(a.get("priority") or 3), provider=a.get("provider") or None,
@@ -620,6 +623,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if a.get("priority"):
                     upd["priority"] = int(a["priority"])
                 if spec:
+                    why = prguard.spec_problem(db, spec)
+                    if why:
+                        raise ValueError(f"#{task['id']} rejected: {why}")
                     upd["spec"] = task["spec"] + "\n\n## Update\n" + spec
                 db.update_task(task["id"], **upd)
                 if spec and task["status"] == "running":
@@ -647,6 +653,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 for o in db.q("SELECT id, text FROM messages WHERE kind='ask' AND handled=0"):
                     if _same_text(_ask_question(o["text"]), text):
                         raise ValueError(f"already asked as open ask #{o['id']}; it waits for the answer")
+                if a["blocking"] in prguard.APPROVING_REASONS:
+                    why = prguard.findings_problem(db, text)
+                    if why:
+                        raise ValueError(f"ask_user rejected: {why}")
                 rec = (a.get("recommendation") or "").strip()
                 if a["blocking"] == "restriction":
                     text += f"{_LEAST_NOTE}{least}"
@@ -661,7 +671,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
             elif t == "pr_approve":
                 from .slack import from_config
                 prguard.approve(db, str(a.get("text") or a.get("value") or ""), int(a.get("id") or 0),
-                                slack=from_config(cfg), project=p.name)
+                                str(a.get("quote") or ""), slack=from_config(cfg), project=p.name)
             elif t == "notify":
                 db.post("out", a["text"], chat=None, kind="alert", severity=_norm_severity(a.get("severity")))
             elif t == "memory_add":

@@ -6,7 +6,10 @@
   merge. Emits events straight to the coordinator (they are already specific and actionable).
   A PR that is out of draft without the user's recorded approval (prguard) is put back in draft
   with the daemon's own gh, outside any run, at most once an hour per PR. It also raises a high
-  alert, which clears once it is back in draft, closed, merged or approved.
+  alert, which clears once it is back in draft, closed, merged or approved. Open PRs' findings
+  (failing CI, bot review comments neither fixed nor answered) are recorded for prguard and are
+  work: the coordinator hears when a PR has some (to queue a fix task) and when it is clean (to ask
+  the user for a review).
 - `logfile`: tails files named in the payload and screens new lines (rules, then Jev if enabled).
 """
 from __future__ import annotations
@@ -95,6 +98,7 @@ def watch_prs(daemon) -> str:
         before = [u for u, s in seen.items() if s.get("state") == "OPEN" and s.get("draft") is False]
     before = set(before)
     flagged = dict(db.kv(prguard.UNAPPROVED_KEY, {}) or {})   # a PR gh could not read keeps its flag
+    findings = dict(db.kv(prguard.FINDINGS_KEY, {}) or {})
     changed = 0
     for t in rows:
         pr = _gh(["pr", "view", t["pr_url"], "--json", "state,isDraft,mergeable,reviewDecision,statusCheckRollup,"
@@ -103,6 +107,7 @@ def watch_prs(daemon) -> str:
             continue
         sig = pr_signature(pr)
         _check_unapproved(daemon, t, pr, sig, before, flagged)
+        _check_findings(daemon, t, pr, sig, findings, root)
         old = seen.get(t["pr_url"])
         if sig == old:
             continue
@@ -125,6 +130,7 @@ def watch_prs(daemon) -> str:
     db.set_kv("pr_signatures", seen)
     db.set_kv(prguard.PREDATES_KEY, sorted(before))
     db.set_kv(prguard.UNAPPROVED_KEY, flagged)
+    db.set_kv(prguard.FINDINGS_KEY, findings)
     unapproved = f", {len(flagged)} out of draft unapproved" if flagged else ""
     return f"ok ({len(rows)} PRs, {changed} changed{unapproved})"
 
@@ -141,6 +147,8 @@ def _check_unapproved(daemon, t: dict, pr: dict, sig: dict, before: set, flagged
     if sig["state"] != "OPEN" or sig["draft"] is not False:
         before.discard(url)
         flagged.pop(key, None)
+        if sig["draft"]:
+            prguard.drop_spent(db, key)   # back in draft: leaving it again needs a fresh yes
         return
     if url in before or prguard.approved(db, key):
         flagged.pop(key, None)
@@ -172,6 +180,83 @@ def _check_unapproved(daemon, t: dict, pr: dict, sig: dict, before: set, flagged
     daemon.alert(f"{prguard.UNAPPROVED_ALERT}:{key}",
                  f"{shown} (task #{t['id']}) left draft without your recorded approval. " + told, "high",
                  every_s=DAY)
+
+
+BOT_QUERY = ("query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){"
+             "pullRequest(number:$number){"
+             "comments(last:100){nodes{author{__typename login} createdAt url}}"
+             "reviews(last:100){nodes{author{__typename login} state body submittedAt url}}"
+             "reviewThreads(first:100){nodes{isResolved isOutdated "
+             "comments(first:50){nodes{author{__typename login} url}}}}}}}")
+
+
+def _is_bot(author: dict | None) -> bool:
+    a = author or {}
+    return a.get("__typename") == "Bot" or str(a.get("login", "")).endswith("[bot]")
+
+
+def bot_open(data: dict) -> list[str]:
+    """URLs of bot review findings on a PR that are neither fixed nor answered: a review thread a bot
+    started that is unresolved, not outdated and has no reply from a person; a bot's top-level
+    comment, or review asking for changes, with no comment from a person after it."""
+    pr = (((data or {}).get("data") or {}).get("repository") or {}).get("pullRequest") or {}
+    out = []
+    for th in (pr.get("reviewThreads") or {}).get("nodes") or []:
+        cs = (th.get("comments") or {}).get("nodes") or []
+        if cs and _is_bot(cs[0].get("author")) and not th.get("isResolved") and not th.get("isOutdated") \
+                and all(_is_bot(c.get("author")) for c in cs[1:]):
+            out.append(cs[0].get("url") or "?")
+    comments = (pr.get("comments") or {}).get("nodes") or []
+    human_times = sorted(c.get("createdAt") or "" for c in comments if not _is_bot(c.get("author")))
+    last_human = human_times[-1] if human_times else ""
+    items = [(c.get("createdAt") or "", c.get("url")) for c in comments if _is_bot(c.get("author"))]
+    items += [(r.get("submittedAt") or "", r.get("url")) for r in (pr.get("reviews") or {}).get("nodes") or []
+              if _is_bot(r.get("author")) and r.get("state") == "CHANGES_REQUESTED"]
+    out += [u or "?" for ts, u in items if ts > last_human]
+    return out
+
+
+def _check_findings(daemon, t: dict, pr: dict, sig: dict, findings: dict, root: str) -> None:
+    """Record an open PR's findings and tell the coordinator when they change: CI failing or bot
+    review comments open is work (a fix task); CI green with every bot comment fixed or answered is
+    when it may ask the user for a review."""
+    db, url = daemon.p.db, pr.get("url") or t["pr_url"]
+    key = prguard.pr_key(url)
+    if not key:
+        return
+    if sig["state"] != "OPEN":
+        findings.pop(key, None)
+        return
+    owner, rest = key.split("/", 1)
+    name, number = rest.split("#")
+    data = _gh(["api", "graphql", "-f", f"query={BOT_QUERY}", "-f", f"owner={owner}", "-f", f"name={name}",
+                "-F", f"number={number}"], root)
+    old = findings.get(key) or {}
+    bots = bot_open(data) if data is not None else old.get("bot", [])   # unread: keep what was known
+    rec = {"task": t["id"], "url": url, "failing": sig["failing"], "pending": sig["checks"] == "pending",
+           "bot_open": len(bots), "bot": bots[:10], "notified": old.get("notified")}
+    findings[key] = rec
+    if rec["pending"]:
+        return
+    dirty = bool(rec["failing"] or rec["bot_open"])
+    mark = json.dumps([rec["failing"], sorted(bots)]) if dirty else "clean"
+    if mark == rec["notified"] or (not dirty and rec["notified"] is None):
+        rec["notified"] = mark   # a PR clean when first seen needs no news: its task's hand-off said so
+        return
+    rec["notified"] = mark
+    if dirty:
+        what = "; ".join([*(["CI failing: " + ", ".join(rec["failing"])] if rec["failing"] else []),
+                          *([f"{len(bots)} bot review comment(s) neither fixed nor answered: "
+                             + ", ".join(bots[:5])] if bots else [])])
+        text = (f"PR for task #{t['id']} ({url}) has open findings: {what}. This is work: queue a code task "
+                f"(on the PR's branch) to fix or answer each and get CI green. Do not ask the user to review "
+                f"it until pr-watch reports it clean.")
+    else:
+        text = (f"PR for task #{t['id']} ({url}) is clean: CI green and every bot review comment fixed or "
+                f"answered. If its review task passed, ask the user for a draft review now (ask_user, "
+                f"blocking review, with its URL).")
+    db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+         (time.time(), "pr", "pr_findings" if dirty else "pr_clean", "normal", text, "queued", t["id"]))
 
 
 def watch_logs(daemon, payload: dict) -> str:

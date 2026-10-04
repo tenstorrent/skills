@@ -11,7 +11,8 @@
 - A re-review whose spec lists earlier findings: check each is fixed, then review what changed since.
 - NEVER edit the change yourself.
 - NEVER mark a PR ready for review: only the user takes a PR out of draft. The harness's `gh`
-  refuses it until the user's approval is recorded; never work around it.
+  refuses it until the user's approval is recorded; never work around it. If it refuses, hand off
+  `blocked` with the PR's URL in `pr`: the coordinator asks the user.
 - Any PR comment or review you post ends with the hidden line `<!-- ttp -->`, so the PR watcher
   does not report it back as someone else's comment.
 

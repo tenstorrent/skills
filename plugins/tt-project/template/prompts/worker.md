@@ -17,6 +17,9 @@
   for tt-project go in the hand-off as upstream notes: `followups` titled `upstream: ...`.
 - Open, update or close pull requests ONLY in a `code` task whose spec asks for delivery,
   and only as the charter's policies allow. Everything else: commit or write files, no PRs.
+- NEVER mark a PR ready for review or open one that is not a draft: only the user takes a PR out
+  of draft. The harness's `gh` refuses it until the user's approval is recorded; never work around it.
+  If it refuses, hand off `blocked` with the PR's URL in `pr`: the coordinator asks the user.
 
 ## Progress
 

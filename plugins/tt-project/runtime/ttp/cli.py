@@ -871,6 +871,47 @@ def cmd_push(a) -> None:
     sys.exit(push.detach(p, Path.cwd(), a.own) if a.detach else push.run(p, Path.cwd(), a.own))
 
 
+def cmd_checks(a) -> None:
+    """(inside a run) Run the local checks on this worktree's commit and record the result in the
+    run's directory: the harness's gh opens a PR (even a draft) only after they passed on HEAD. The
+    checks are the project's `delivery.push_checks`, plus the commands given after `--`."""
+    from . import prguard, push
+    run_dir = os.environ.get("TTP_RUN_DIR")
+    if not run_dir:
+        die("ttp checks only works inside a tt-project run")
+    base = os.environ.get("TTP_PROJECT")
+    p = Project(base) if base else None
+    cfg = p.config() if p and p.exists() else {}
+    extra = a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd
+    cmds = push.check_list((cfg.get("delivery") or {}).get("push_checks")) + ([shlex.join(extra)] if extra else [])
+    if not cmds:
+        die("ttp checks: the project sets no delivery.push_checks; give the repository's test commands after "
+            "`--`, e.g. ttp checks -- pytest -q")
+    git = ["git", "-C", str(Path.cwd())]
+    head = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    if not head:
+        die("ttp checks: run it in the change's git worktree")
+    if subprocess.run([*git, "status", "--porcelain", "--untracked-files=no"], capture_output=True,
+                      text=True).stdout.strip():
+        die("ttp checks: commit first; the checks are recorded for a commit, and this worktree has changes")
+    log = Path(run_dir) / "checks.log"
+    passed, failed = True, None
+    with open(log, "a") as out:
+        for c in cmds:
+            out.write(f"$ {c}\n")
+            out.flush()
+            if subprocess.run(c, shell=True, stdout=out, stderr=subprocess.STDOUT).returncode != 0:
+                passed, failed = False, c
+                break
+    write_json(Path(run_dir) / prguard.CHECKS_FILE, {"head": head, "passed": passed, "commands": cmds,
+                                                     "ts": time.time()})
+    if not passed:
+        tail = log.read_text(errors="replace").splitlines()[-30:]
+        print("\n".join(tail))
+        die(f"ttp checks: {failed!r} failed on {head[:12]} (full output: {log})", 1)
+    print(f"ttp checks: {len(cmds)} check(s) passed on {head[:12]}; recorded for the draft PR")
+
+
 def cmd_lock(a) -> None:
     """Hold one slot of a shared resource while a command runs: `ttp lock <resource> -- <cmd...>`.
 
@@ -1630,6 +1671,10 @@ def main(argv: list[str] | None = None) -> None:
                         "never delivery.push_branch")
     s.add_argument("--marker", help=argparse.SUPPRESS)   # the detached process itself
     s.set_defaults(fn=cmd_push)
+
+    s = sub.add_parser("checks", help="(inside a run) run the local checks on HEAD and record the result")
+    s.add_argument("cmd", nargs=argparse.REMAINDER, help="extra check command after --")
+    s.set_defaults(fn=cmd_checks)
 
     s = sub.add_parser("lock", help="(inside a run) hold a shared resource while one command runs")
     s.add_argument("resource")

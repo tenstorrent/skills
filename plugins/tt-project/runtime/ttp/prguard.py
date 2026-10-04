@@ -5,12 +5,17 @@
 The harness's `bin/gh` comes first on every run's PATH and calls `check()` before the real `gh`.
 It refuses, whatever the agent or provider:
 - `gh pr create` without `--draft`, and REST or GraphQL calls that create a PR that is not a draft;
+- inside a run, opening a PR (even a draft) before the run's local checks passed on the commit it
+  is opened from (`ttp checks` records that in the run's CHECKS_FILE);
 - `gh pr ready` (but not `--undo`), and REST or GraphQL calls that mark a PR ready,
-  unless the PR has an approval record.
+  unless the PR has an unspent approval record.
 
-An approval record is written only by the coordinator's `pr_approve` action, which needs a blocking
-`review` or `merge` ask that names the PR and a user message after it (or a user message that
-names the PR itself). It lives in the project database, under APPROVALS_KEY.
+An approval record is written only by the coordinator's `pr_approve` action. It needs the user's
+own words, quoted: a user message that names the PR, or the user's answer to a blocking `review` or
+`merge` ask that names it, and the words must be a clear yes (`clear_yes`). It lives in the project
+database, under APPROVALS_KEY, and is spent once a PR is marked ready with it: a PR put back in
+draft needs a fresh yes. `spec_problem` keeps the coordinator from handing out a task that tells a
+worker to take an unapproved PR out of draft.
 
 Only a message that came in on a channel a run cannot write to counts (APPROVING). Every message
 ends up as a row in the project database, which a run can write, so a Slack message is read back
@@ -33,7 +38,9 @@ import sys
 import time
 from pathlib import Path
 
-APPROVALS_KEY = "pr_ready_approvals"   # kv: {"owner/repo#N": {"ask": id, "answer": id, "ts": t}}
+APPROVALS_KEY = "pr_ready_approvals"   # kv: {"owner/repo#N": {"source": id, "answer": id, "said": text,
+#                                              "quote": text, "ts": t, "spent": t | None}}
+USED_KEY = "pr_ready_used_answers"     # kv: {"owner/repo#N": [answer ids an approval was spent with]}
 BLOCKING_REF = "blocking:"             # an ask message's ref: why the user must answer it
 APPROVING_REASONS = ("review", "merge")
 # An inbound message's provenance (messages.provenance), set by the code that received it:
@@ -48,6 +55,11 @@ UNAPPROVED_KEY = "pr_ready_unapproved"     # kv: {"owner/repo#N": {"task": id, "
 UNAPPROVED_ALERT = "pr-ready"              # alert key "pr-ready:owner/repo#N", held while flagged
 PREDATES_KEY = "pr_ready_predates_guard"   # kv: PR URLs already out of draft when the check first ran
 UNDONE_KEY = "pr_ready_undone"             # kv: {"owner/repo#N": t}, when pr-watch last put it back in draft
+# The pr-watch watcher records each open PR's open findings (failing CI, bot review comments not
+# fixed or answered); a review or merge ask for a PR waits until they are cleared.
+FINDINGS_KEY = "pr_findings"   # kv: {"owner/repo#N": {"task": id, "url": u, "failing": [..], "pending": b,
+#                                                      "bot_open": n, "bot": [..], "notified": fingerprint}}
+CHECKS_FILE = "checks.json"    # in a run's directory: {"head": sha, "passed": bool, "commands": [..], "ts": t}
 
 PR_URL_RE = re.compile(r"https?://[^/\s]+/([\w.-]+)/([\w.-]+)/pull/(\d+)", re.I)
 PR_REF_RE = re.compile(r"(?<![\w./-])([\w.-]+)/([\w.-]+)#(\d+)\b")
@@ -60,6 +72,17 @@ GH_COMMANDS = {"alias", "api", "attestation", "auth", "browse", "cache", "co", "
 
 HOW = ("A PR leaves draft only after the user approves it: the coordinator asks the user (ask_user, "
        "blocking review) naming the PR's URL and, on their yes on Slack, records it with pr_approve.")
+HANDOFF = ("Do not retry or work around it: hand off `blocked` with the PR's URL in `pr` and say it waits for "
+           "the user's approval to leave draft; the coordinator asks the user.")
+CHECKS_HOW = ("Run `ttp checks` in this worktree (it runs the project's checks, or the ones you give after "
+              "`--`, and records the result for this commit), fix what fails, commit, then open the draft PR.")
+
+# A clear yes: words of assent, and nothing that negates, defers or makes it conditional.
+YES_RE = re.compile(r"\b(yes|yep|yeah|yup|y|ok|okay|sure|approved?|go ahead|go for it|lgtm|ship it|do it|"
+                    r"please|mark\b.*\bready|ready for review|out of draft|can (?:stay|go|be) ready)\b", re.I)
+NOT_YES_RE = re.compile(r"\b(no|not|nope|nah|never|don'?t|do not|wait|hold|later|stop|broken|breaks?|"
+                        r"fail\w*|cancel\w*|until|unless|after|before|once|if|but|first|instead)\b|n't\b|\?",
+                        re.I)
 
 
 def pr_key(text: str) -> str | None:
@@ -77,15 +100,30 @@ def pr_keys(text: str) -> set[str]:
 
 # --- the approval record ----------------------------------------------------------------------
 
-def approve(db, pr: str, source_id: int, now: float | None = None, slack=None, project: str | None = None) -> str:
-    """Record the user's approval for `pr` (URL or owner/repo#N) from message `source_id`: an ask with
-    blocking review or merge that names the PR and whose first answer is the user's, or a user message
-    that names the PR. The user's message must have come in on an APPROVING channel; a Slack one is
-    checked against Slack with `slack` (slack.Slack), and so is the ask, which `project` posted.
+def clear_yes(text: str) -> bool:
+    """True when `text` is a clear yes: assent, with no negation, condition or question in it."""
+    bare = PR_REF_RE.sub(" ", PR_URL_RE.sub(" ", text or ""))   # a repo named "no-wait" says nothing
+    return bool(YES_RE.search(bare)) and not NOT_YES_RE.search(bare)
+
+
+def _norm(text: str) -> str:
+    return " ".join((text or "").lower().split())
+
+
+def approve(db, pr: str, source_id: int, quote: str, now: float | None = None, slack=None,
+            project: str | None = None) -> str:
+    """Record the user's approval for `pr` (URL or owner/repo#N). `source_id` is a user message that
+    names the PR, or an ask with blocking review or merge that names it; `quote` is the user's words,
+    which must appear in that message (or in a user message after the ask) and be a clear yes there.
+    Only messages the user wrote count: never a default, a recommendation or anything the harness
+    posted. The user's message must have come in on an APPROVING channel; a Slack one is checked
+    against Slack with `slack` (slack.Slack), and so is the ask, which `project` posted.
     Raises ValueError otherwise. Returns the PR's key."""
     key = pr_key(pr)
     if not key:
         raise ValueError(f"pr_approve: {pr!r} names no PR; give its URL or owner/repo#N")
+    if not _norm(quote):
+        raise ValueError("pr_approve needs `quote`: the user's own words saying yes, copied from their answer")
     msg = db.one("SELECT * FROM messages WHERE id=?", (int(source_id),))
     if not msg:
         raise ValueError(f"pr_approve: no message #{source_id}")
@@ -93,18 +131,26 @@ def approve(db, pr: str, source_id: int, now: float | None = None, slack=None, p
         reason = (msg["ref"] or "").removeprefix(BLOCKING_REF) if (msg["ref"] or "").startswith(BLOCKING_REF) else ""
         if msg["kind"] != "ask" or reason not in APPROVING_REASONS:
             raise ValueError(f"pr_approve: #{source_id} is not an ask with blocking review or merge")
-        answer = db.one("SELECT * FROM messages WHERE direction='in' AND id>? ORDER BY id LIMIT 1", (msg["id"],))
-        if not answer:
+        answers = db.q("SELECT * FROM messages WHERE direction='in' AND kind='user' AND id>? ORDER BY id",
+                       (msg["id"],))
+        if not answers:
             raise ValueError(f"pr_approve: the user has not answered ask #{source_id} yet")
-        if answer["kind"] != "user":
-            raise ValueError(f"pr_approve: the answer to ask #{source_id}, #{answer['id']}, is not a message "
-                             f"from the user")
     else:
         if msg["kind"] != "user":
             raise ValueError(f"pr_approve: #{source_id} is not a message from the user")
-        answer = msg
+        answers = [msg]
     if key not in pr_keys(msg["text"]):
         raise ValueError(f"pr_approve: #{source_id} does not name {key}; the approval must be for that PR")
+    answer = next((m for m in answers if _norm(quote) in _norm(m["text"])), None)
+    if not answer:
+        raise ValueError(f"pr_approve: the user never wrote {quote!r} in answer to #{source_id}; quote their "
+                         f"words exactly")
+    if answer["id"] in ((db.kv(USED_KEY, {}) or {}).get(key) or []):
+        raise ValueError(f"pr_approve: user message #{answer['id']} already let {key} out of draft once; it "
+                         f"needs a fresh yes")
+    if not clear_yes(answer["text"]):
+        raise ValueError(f"pr_approve: user message #{answer['id']} is not a clear yes ({answer['text'][:120]!r}); "
+                         f"the PR stays in draft. Ask again if it is unclear")
     channel = answer.get("provenance")
     if channel not in APPROVING:
         why = (f"pr_approve: #{answer['id']} came in via {channel or 'an unknown channel'}, which does not count "
@@ -121,7 +167,8 @@ def approve(db, pr: str, source_id: int, now: float | None = None, slack=None, p
         _check_slack(answer, key if answer is msg else None, ask_ts, slack)
     with db.tx():
         rec = db.kv(APPROVALS_KEY, {}) or {}
-        rec[key] = {"source": int(source_id), "answer": answer["id"], "ts": now or time.time(),
+        rec[key] = {"source": int(source_id), "answer": answer["id"], "said": answer["text"][:500],
+                    "quote": quote[:200], "ts": now or time.time(), "spent": None,
                     "channel": channel, "external_id": answer.get("ext_id")}
         db.set_kv(APPROVALS_KEY, rec)
     return key
@@ -201,7 +248,79 @@ def _check_slack(m: dict, names: str | None, ask_ts: str | None, slack) -> None:
 
 
 def approved(db, key: str) -> bool:
+    """The user approved `key` leaving draft (spent or not): a PR out of draft with it is not flagged."""
     return bool((db.kv(APPROVALS_KEY, {}) or {}).get(key))
+
+
+def may_ready(db, key: str) -> bool:
+    """An approval for `key` that has not been used to mark it ready yet."""
+    rec = (db.kv(APPROVALS_KEY, {}) or {}).get(key)
+    return bool(rec) and not rec.get("spent")
+
+
+def spend(db, keys, now: float | None = None) -> None:
+    """Mark the approvals for `keys` used: the next time the PR leaves draft needs a fresh yes."""
+    with db.tx():
+        rec, used = db.kv(APPROVALS_KEY, {}) or {}, db.kv(USED_KEY, {}) or {}
+        for k in keys:
+            if k in rec:
+                rec[k]["spent"] = now or time.time()
+                used[k] = sorted({*(used.get(k) or []), rec[k].get("answer")} - {None})
+        db.set_kv(APPROVALS_KEY, rec)
+        db.set_kv(USED_KEY, used)
+
+
+def drop_spent(db, key: str) -> None:
+    """A PR seen back in draft loses a spent approval."""
+    with db.tx():
+        rec = db.kv(APPROVALS_KEY, {}) or {}
+        if (rec.get(key) or {}).get("spent"):
+            rec.pop(key)
+            db.set_kv(APPROVALS_KEY, rec)
+
+
+def findings_problem(db, text: str) -> str | None:
+    """Why the user may not be asked to review a PR that `text` names yet: pr-watch saw failing or
+    pending CI, or bot review comments neither fixed nor answered. None when it may."""
+    found = db.kv(FINDINGS_KEY, {}) or {}
+    for key in sorted(pr_keys(text)):
+        f = found.get(key) or {}
+        open_ = [*(["CI failing: " + ", ".join(f["failing"][:5])] if f.get("failing") else []),
+                 *([f"{f['bot_open']} bot review comment(s) neither fixed nor answered"] if f.get("bot_open") else [])]
+        if open_:
+            return (f"{key} still has open findings ({'; '.join(open_)}). Queue a code task to fix or answer each "
+                    f"and get CI green; ask the user to review it once pr-watch reports it clean")
+        if f.get("pending"):
+            return f"{key}'s CI is still running; ask once pr-watch reports it clean"
+    return None
+
+
+# --- task specs -------------------------------------------------------------------------------
+
+READY_INSTR_RE = re.compile(
+    r"\bgh\s+pr\s+ready\b(?![^\n;|&]*--undo)|\bmark(?:s|ed|ing)?\b[^.;\n]{0,60}?\bready\b|"
+    r"\bdraft\s*[=:]\s*false\b|[\"']draft[\"']\s*:\s*false|markPullRequestReadyForReview|"
+    r"\b(?:take|move|get|bring)s?\b[^.;\n]{0,40}?\bout of draft\b|\bun-?draft", re.I)
+# A sentence that refuses or forbids it is about the rule, not an instruction to break it.
+DISCUSSES_RE = re.compile(r"\b(never|not|refuse\w*|reject\w*|den(?:y|ies|ied)|guard|only the user|"
+                          r"pr_approve|undo)\b|n't\b", re.I)
+
+
+def spec_problem(db, spec: str) -> str | None:
+    """Why a task spec must not be handed out: it tells a worker to take a PR out of draft and that
+    PR has no unspent approval. None when it may."""
+    for sentence in re.split(r"(?<=[.!?])\s+|\n|;", spec or ""):
+        bare = PR_URL_RE.sub("the PR", sentence)   # a URL's dots are not the sentence's end
+        if not READY_INSTR_RE.search(bare) or DISCUSSES_RE.search(bare):
+            continue
+        prs = pr_keys(sentence) or pr_keys(spec)
+        missing = sorted(k for k in prs if not may_ready(db, k))
+        if not prs or missing:
+            what = ", ".join(missing) if missing else "a PR it does not name"
+            return (f"the spec tells a worker to take {what} out of draft ({sentence.strip()[:120]!r}), but the "
+                    f"user's approval is not on record. Ask the user first (ask_user, blocking review, with the "
+                    f"PR's URL); on their yes, pr_approve it, then add the task naming that PR")
+    return None
 
 
 def _project_db():
@@ -259,17 +378,48 @@ def _gh(real: str, *args: str) -> str:
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
-def _refuse_ready(prs: set[str], db, what: str) -> str | None:
+def _refuse_ready(prs: set[str], db, what: str, allowed: set | None) -> str | None:
     if not prs:
-        return f"refused: {what}, and the PR could not be identified to check for the user's approval. {HOW}"
-    missing = sorted(k for k in prs if db is None or not approved(db, k))
+        return (f"refused: {what}, and the PR could not be identified to check for the user's approval. "
+                f"{HOW} {HANDOFF}")
+    missing = sorted(k for k in prs if db is None or not may_ready(db, k))
     if missing:
-        return f"refused: {what} for {', '.join(missing)} without the user's recorded approval. {HOW}"
+        return (f"refused: {what} for {', '.join(missing)} without the user's recorded approval (an approval "
+                f"is used up once the PR left draft with it). {HOW} {HANDOFF}")
+    if allowed is not None:
+        allowed |= prs
     return None
 
 
-def check(args: list[str], real: str, db=None, stdin_text: str | None = None, _depth: int = 0) -> str | None:
-    """Why `gh <args>` must not run, or None when it may. `real` is the real gh (to look PRs up)."""
+def _checks_problem(cwd: str | None = None) -> str | None:
+    """Inside a run: why a PR may not be opened from this worktree yet (its local checks have not passed
+    on HEAD). Outside a run, nothing."""
+    run_dir = os.environ.get("TTP_RUN_DIR")
+    if not run_dir:
+        return None
+    try:
+        rec = json.loads((Path(run_dir) / CHECKS_FILE).read_text())
+    except (OSError, ValueError):
+        rec = None
+    if not isinstance(rec, dict):
+        return "refused: open a PR only after the local checks pass; none are recorded for this run. " + CHECKS_HOW
+    try:
+        head = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, cwd=cwd,
+                              timeout=30).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        head = ""
+    if not rec.get("passed"):
+        return "refused: the local checks recorded for this run failed. " + CHECKS_HOW
+    if not head or rec.get("head") != head:
+        return (f"refused: the local checks passed on {str(rec.get('head'))[:12]}, not on this worktree's HEAD "
+                f"{head[:12] or '(unknown)'}. " + CHECKS_HOW)
+    return None
+
+
+def check(args: list[str], real: str, db=None, stdin_text: str | None = None, _depth: int = 0,
+          allowed: set | None = None) -> str | None:
+    """Why `gh <args>` must not run, or None when it may. `real` is the real gh (to look PRs up).
+    PRs it lets out of draft on their approval are added to `allowed`, to spend once it ran."""
     if not args:
         return None
     cmd, rest = args[0], args[1:]
@@ -281,12 +431,14 @@ def check(args: list[str], real: str, db=None, stdin_text: str | None = None, _d
                 if re.search(r"\bpr\s+(ready|create)\b|\bapi\b|markPullRequestReadyForReview|draft", text):
                     return f"refused: the gh alias {cmd!r} runs a shell command that may change a PR's draft state"
                 return None
-            return check(_expand(expansion, rest), real, db, stdin_text, _depth + 1)
+            return check(_expand(expansion, rest), real, db, stdin_text, _depth + 1, allowed)
     if cmd == "pr" and rest:
         sub, more = rest[0], rest[1:]
         if sub == "create":
-            if any(a in ("-d", "--draft", "--draft=true", "--dry-run") for a in more):
+            if "--dry-run" in more:
                 return None
+            if any(a in ("-d", "--draft", "--draft=true") for a in more):
+                return _checks_problem()
             return "refused: PRs are opened as drafts only; add --draft. " + HOW
         if sub == "ready":
             if "--undo" in more:
@@ -295,9 +447,9 @@ def check(args: list[str], real: str, db=None, stdin_text: str | None = None, _d
             repo = (_opts(more, ("-R", "--repo")) or [None])[-1]
             view = ["pr", "view", *pos[:1], *(["-R", repo] if repo else []), "--json", "url", "-q", ".url"]
             key = pr_key(_gh(real, *view))
-            return _refuse_ready({key} if key else set(), db, "marking a PR ready for review")
+            return _refuse_ready({key} if key else set(), db, "marking a PR ready for review", allowed)
     if cmd == "api":
-        return _check_api(rest, real, db, stdin_text)
+        return _check_api(rest, real, db, stdin_text, allowed)
     return None
 
 
@@ -323,7 +475,7 @@ def _expand(expansion: str, rest: list[str]) -> list[str]:
     return parts + [a for i, a in enumerate(rest) if i not in used]
 
 
-def _check_api(args: list[str], real: str, db, stdin_text: str | None) -> str | None:
+def _check_api(args: list[str], real: str, db, stdin_text: str | None, allowed: set | None) -> str | None:
     fields = _opts(args, ("-f", "-F", "--field", "--raw-field"))
     inputs = _opts(args, ("--input",))
     body = ""
@@ -361,9 +513,11 @@ def _check_api(args: list[str], real: str, db, stdin_text: str | None) -> str | 
                 key = pr_key(_gh(real, "api", "graphql", "-f", f"query={q}", "-q", ".data.node.url"))
                 if key:
                     prs.add(key)
-            return _refuse_ready(prs, db, "marking a PR ready for review")
-        if re.search(r"\bcreatePullRequest\b", text) and not draft_true:
-            return "refused: PRs are opened as drafts only; pass draft: true to createPullRequest. " + HOW
+            return _refuse_ready(prs, db, "marking a PR ready for review", allowed)
+        if re.search(r"\bcreatePullRequest\b", text):
+            if not draft_true:
+                return "refused: PRs are opened as drafts only; pass draft: true to createPullRequest. " + HOW
+            return _checks_problem()
         return None
     m = REST_PR_RE.match(endpoint)
     if not m:
@@ -374,11 +528,11 @@ def _check_api(args: list[str], real: str, db, stdin_text: str | None) -> str | 
         if "/" in nwo:
             owner, repo = nwo.split("/", 1)
     if number is None:
-        if method == "POST" and not draft_true:
-            return "refused: PRs are opened as drafts only; send draft=true. " + HOW
+        if method == "POST":
+            return _checks_problem() if draft_true else "refused: PRs are opened as drafts only; send draft=true. " + HOW
         return None
     if method in ("PATCH", "POST", "PUT") and draft_false:
-        return _refuse_ready({f"{owner}/{repo}#{int(number)}".lower()}, db, "setting draft=false on a PR")
+        return _refuse_ready({f"{owner}/{repo}#{int(number)}".lower()}, db, "setting draft=false on a PR", allowed)
     return None
 
 
@@ -406,14 +560,22 @@ def main(argv: list[str], own_dir: str) -> int:
     if args[:1] == ["api"] and ("-" in _opts(args, ("--input",))
                                 or any(f.endswith("=@-") for f in _opts(args, ("-F", "--field")))):
         stdin_text = sys.stdin.read()
+    db, allowed = None, set()
     try:
-        why = check(args, real, _project_db(), stdin_text)
+        db = _project_db()
+        why = check(args, real, db, stdin_text, allowed=allowed)
     except Exception as e:   # fails closed only for the calls it guards
         guarded = args[:2] in (["pr", "ready"], ["pr", "create"]) or args[:1] == ["api"]
         why = f"refused: the PR draft guard failed ({e})" if guarded else None
     if why:
         print(f"gh (tt-project): {why}", file=sys.stderr)
         return 1
+    if allowed and db is not None:
+        # The approval is spent once the PR has left draft with it.
+        rc = subprocess.run([real, *args], input=stdin_text, text=True).returncode
+        if rc == 0:
+            spend(db, allowed)
+        return rc
     if stdin_text is not None:
         return subprocess.run([real, *args], input=stdin_text, text=True).returncode
     os.execv(real, [real, *args])

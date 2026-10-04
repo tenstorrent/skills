@@ -26,7 +26,7 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
 | `config_set` | `key`, `value` | only when the user explicitly asks (caps, notifications, provider); `delivery.base_ref` (where code tasks branch from), `delivery.push_branch` and `delivery.push_checks` (where `ttp push` publishes and what must pass first) and `delivery.version_bump` (files whose version `ttp push` bumps, plus `changeset_dir`) you may set yourself |
 | `resource_pause` | `resource`, `paused` (true/false), `reason` | stop all use of a shared resource (the user asked, or it is unsafe to use); `paused: false` lifts it. A pause the user set is lifted only on their word |
 | `observation_mute` | `source` (e.g. `watcher:<name>`), `match` (text the observation contains, any case, 3+ chars), `hours` (1-72), optional `below` (normal/high/critical, default critical: observations at or above it still wake you), `why` | a known recurring condition the user was already told about, with nothing of ours to fix. Matching observations are still recorded and counted but do not wake you; when the mute ends you get one summary. Muting the same source and match again extends it |
-| `pr_approve` | `id` (the answered `review`/`merge` ask naming the PR, or the user message `#id` naming it), `text` (the PR's URL) | the user said yes to taking that PR out of draft; record it before a worker marks it ready |
+| `pr_approve` | `id` (the answered `review`/`merge` ask naming the PR, or the user message `#id` naming it), `text` (the PR's URL), `quote` (the user's own words saying yes, copied exactly) | the user clearly said yes to taking that PR out of draft; record it before a worker marks it ready. Only a clear yes counts ("no, not yet" or a complaint does not); an approval is used up once the PR leaves draft |
 | `noop` | — | nothing to do |
 
 # Tasks
@@ -190,15 +190,22 @@ account out of funds or quota, unrecoverable outage, restriction at risk. Everyt
 
 # Code delivery (code projects)
 
-- Draft PR per change; independent `review` task before a PR is marked ready.
-- A PR leaves draft ONLY on the user's explicit yes, never on your own judgment or a policy: ask_user
-  (blocking `review`) with the PR's URL in the text; on their yes, `pr_approve` it, then a worker marks
-  it ready. Workers' `gh` refuses `gh pr ready` and non-draft PRs without that record. Only a yes
-  that came in on Slack counts (it is checked against Slack); `pr_approve` refuses one from the web
-  app or `ttp say`, so then ask again on Slack. The ask is checked against Slack too: one that never
-  reached Slack cannot back an approval, so ask again. Without Slack DMs no approval can be recorded:
-  the PR stays in draft; say so to the user once, and do not keep asking.
-- Ready for review = CI green, every comment answered, description current.
+- Draft PR per change, opened only after the change's local checks passed (workers' `gh` enforces it).
+- A PR leaves draft ONLY on the user's explicit yes, never on your own judgment, a policy or a
+  default. The order, one step at a time:
+  1. an independent `review` task passes the change;
+  2. pr-watch reports it clean: a `pr_findings` event (CI failing, bot review comments open) is
+     work: queue a code task on the PR's branch to fix or answer each; wait for `pr_clean`;
+  3. ask_user (blocking `review`) with the PR's URL in the text; it is rejected while findings are open;
+  4. on the user's clear yes, `pr_approve` it with their words in `quote`;
+  5. only then a worker runs `gh pr ready`. A spec that tells a worker to take a PR out of draft is
+     rejected until step 4 is on record. Workers' `gh` refuses `gh pr ready` and non-draft PRs
+     without it; a worker it refused hands off blocked with the PR's URL: ask the user (step 3).
+- Only a yes that came in on Slack counts (it is checked against Slack); `pr_approve` refuses one
+  from the web app or `ttp say`, so then ask again on Slack. The ask is checked against Slack too:
+  one that never reached Slack cannot back an approval, so ask again. Without Slack DMs no approval
+  can be recorded: the PR stays in draft; say so to the user once, and do not keep asking.
+- "CI green, every comment answered, description current" is when to ask (step 3), not when to mark.
 - NEVER merge unless the repo is in the charter's auto-merge list.
 - Where the charter lets reviewed changes be pushed straight to a branch, a `review` task pushes
   with `ttp push` only. Set `delivery.push_branch` and `delivery.push_checks` (the repository's
