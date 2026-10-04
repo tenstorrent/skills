@@ -11489,6 +11489,10 @@ def test_push_check_path_args_and_unmatched(env, tmp_path):
         ["plugins/x", "plugins/x/tests", "tests/test_a.py"]
     assert push.path_args("cd /tmp && pytest tests/") == []
     assert push.path_args("cd $HOME && pytest tests/") == []
+    # Redirect targets and option values are not check targets.
+    assert push.path_args("pytest tests/a.py > out/log.txt 2> out/err 2>>out/x >out/y < in/z") == ["tests/a.py"]
+    assert push.path_args("pytest --junitxml out/r.xml --rootdir=sub/dir -q tests/a.py") == ["tests/a.py"]
+    assert push.path_args("pytest --junitxml=out/r.xml -c cfg/p.ini tests/b.py") == ["tests/b.py"]
     (repo / "plugins" / "x" / "tests").mkdir(parents=True)
     (repo / "plugins" / "x" / "tests" / "test_p.py").write_text("")
     g("add", ".")
@@ -11711,6 +11715,9 @@ def test_the_code_prompt_lands_only_through_the_guarded_push_and_only_when_asked
     for line in ("4: a check failed; hand off `failed` with the output.", "5: the branch kept moving; hand off `waiting`.",
                  "75: another push to the branch held its turn too long; hand off `waiting` with the `retry_when`"):
         assert line in code and line in review, line
+    bump = ('- Version bump: when it prints "bumped ... to X.Y.Z", `ttp push` made the bump and changeset\n'
+            "  itself (`delivery.version_bump` is set): never bump by hand.")
+    assert bump in code and bump in review
     assert "3: rebase conflict" in code and "keeping both sides' intents" in code
     coordinator = (prompts / "coordinator.md").read_text()
     assert "With `delivery.code_tasks_may_push` on" in coordinator

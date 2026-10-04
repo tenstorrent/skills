@@ -23,6 +23,8 @@
   plugin version already on the branch, bump past it (and its changeset), commit, rerun.
   5: the branch kept moving; hand off `waiting`. 2 or 6: refused or rejected; hand off `blocked` with its message.
   75: another push to the branch held its turn too long; hand off `waiting` with the `retry_when` it printed.
+- Version bump: when it prints "bumped ... to X.Y.Z", `ttp push` made the bump and changeset
+  itself (`delivery.version_bump` is set): never bump by hand.
 
 ## Pull requests (when the task asks for delivery)
 

@@ -93,12 +93,18 @@ def checks_of(v: Any) -> list[str]:
     return check_list(v)
 
 _GLOB = re.compile(r"[*?\[]")
+_REDIRECT = re.compile(r"^[0-9&]*(>>?|<)")
+# Options whose value is the next word (an output file or setting, not a check target).
+VALUE_OPTS = {"--junitxml", "--junit-xml", "--rootdir", "--basetemp", "--confcutdir", "-c", "-o",
+              "--override-ini", "--cov", "--cov-report", "--cov-config", "--log-file", "--result-log",
+              "--html", "--output", "--report", "-p", "--ignore", "--deselect"}
 
 
 def path_args(cmd: str) -> list[str]:
     """Path-like arguments of a check command (globs, file paths such as pytest targets) relative to
     the repo root, without a pytest `::node` or `[param]` suffix. Options, `VAR=value` words and the
-    program itself are skipped. After `cd <dir>` later paths are taken relative to <dir> (the dir is
+    program itself are skipped, and so are option values (`--opt value`, `--opt=value`) and redirect
+    targets (`> out`, `2>out/x`). After `cd <dir>` later paths are taken relative to <dir> (the dir is
     listed too); after a `cd` that cannot be followed (absolute, `~`, `$VAR`, `-`, out of the repo)
     later paths are skipped."""
     try:
@@ -122,7 +128,12 @@ def path_args(cmd: str) -> list[str]:
             if cwd:
                 out.append(cwd)
             continue
+        if prev in VALUE_OPTS or (prev and _REDIRECT.match(prev) and not _REDIRECT.sub("", prev)):
+            prev = w
+            continue
         prev = w
+        if _REDIRECT.match(w):
+            continue
         if i == 0 or w.startswith("-") or "=" in w or "$" in w or w in BUILTINS \
                 or w in ("&&", "||", ";", "|"):
             continue
