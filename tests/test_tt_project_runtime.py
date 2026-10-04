@@ -12787,7 +12787,10 @@ def test_claude_hook_scans_only_what_runs(env, monkeypatch, tmp_path):
                 f"mkdir -p tmp; cat > tmp/fix.py <<'EOF'\n{edit}EOF\npython3 tmp/fix.py",
                 "grep -n 'gh pr ready' tests/samples.py", "cat tests/samples.py",
                 "git show HEAD:tests/samples.py > tests/samples.py 2>&1",
-                f"cat > r.json <<'EOF'\n{{\"s\": \"{prose}\"}}\nEOF\npython3 -c \"import json; json.load(open('r.json'))\""):
+                f"cat > r.json <<'EOF'\n{{\"s\": \"{prose}\"}}\nEOF\npython3 -c \"import json; json.load(open('r.json'))\"",
+                f"cat > r.json <<'EOF'\n{{\"s\": \"{prose}\"}}\nEOF\ncat r.json | python3 -m json.tool; cat r.json",
+                "PATH=/x gh pr view 7", "PATH=/x gh pr list -R a/b",
+                "PATH=/x gh api graphql -f query='query { viewer { login } }' --jq .data"):
         assert not denied(cmd), cmd
     for cmd in ("PATH=/opt/x:$PATH gh pr ready 7", "PATH=/opt/x gh pr create -t t",
                 "export PATH=/opt/x\ngh api repos/a/b/pulls/7 -F draft=false",
@@ -12799,7 +12802,24 @@ def test_claude_hook_scans_only_what_runs(env, monkeypatch, tmp_path):
                 "bash <<'EOF'\n/usr/bin/gh pr ready 7\nEOF", "cat <<'EOF' | sh\n/usr/bin/gh pr ready 7\nEOF",
                 "x=$(cat <<'EOF'\n/usr/bin/gh pr ready 7\nEOF\n); echo ok", "python3 tests/samples.py",
                 "echo '/usr/bin/gh pr ready 7' > x; bash < x", "printf '/usr/bin/gh pr ready 7' > x; source x",
-                "cd x\npython3 tests/samples.py"):
+                "cd x\npython3 tests/samples.py",
+                # gh behind shell words, under sudo, in inline code or with a query from a variable
+                "PATH=/x; { gh pr ready 7; }", "PATH=/x; if true; then gh pr ready 7; fi",
+                "export PATH=/x; for i in 1; do gh pr ready $i; done", "PATH=/x; ! gh pr ready 7",
+                "PATH=/x sudo gh pr ready 7", "PATH=/x gh pr -R a/b ready 7",
+                "export PATH=/x; python3 -c 'import os; os.system(\"gh pr ready 7\")'",
+                "Q='mutation { markPullRequestReadyForReview(input: {}) { x } }'; PATH=/x gh api graphql -f query=\"$Q\"",
+                # a body the same command posts or runs
+                "cat > q.json <<'EOF'\n{\"query\": \"mutation { markPullRequestReadyForReview(input: {}) { x } }\"}\nEOF\n"
+                "curl -H \"Authorization: bearer $GH_TOKEN\" https://api.github.com/graphql -d @q.json",
+                "echo '{\"query\": \"mutation { markPullRequestReadyForReview(input: {}) { x } }\"}' > q.json; "
+                "curl -H \"Authorization: bearer $GH_TOKEN\" https://api.github.com/graphql -d @q.json",
+                "cat > x <<'EOF'\n/usr/bin/gh pr ready 7\nEOF\ncat x | bash",
+                "cat > x <<'EOF'\n/usr/bin/gh pr ready 7\nEOF\ncat x | sh",
+                "cat > x <<'EOF'\n/usr/bin/gh pr ready 7\nEOF\nmv x y; bash y",
+                "echo '/usr/bin/gh pr ready 7' > a.sh; bash -o errexit a.sh",
+                "echo '/usr/bin/gh pr ready 7' > a.sh; eval \"$(cat a.sh)\"",
+                "echo '/usr/bin/gh pr ready 7' > a.sh; sudo bash a.sh"):
         assert denied(cmd), cmd
 
 

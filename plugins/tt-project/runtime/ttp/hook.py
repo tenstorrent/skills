@@ -15,11 +15,13 @@ worker's next own tool call.
 Before a Bash call it denies the obvious ways around the harness's PR draft guard (prguard.py):
 gh called by a path or from a variable, a gh further down PATH (`which -a`, `hash -p`, or a PATH
 that no longer starts with the run's own or `env -i` before a gh that writes: pr ready, pr create
-without --draft, api with a write method or a GraphQL mutation), an HTTP client sending a GitHub
-API request that creates a PR or takes one out of draft, and a script file run by the command that
-does any of these. It also denies `ttp say` and the web app's /api/say: a run must not post as the
-user. It checks only what runs: heredocs and echo/printf/cat text written to files that the
-command does not run, and files that are only named, read or edited, are data.
+without --draft, api with a write method or a GraphQL mutation, or a gh it cannot show is a read),
+an HTTP client sending a GitHub API request that creates a PR or takes one out of draft (also from
+a body the same command writes), and a script file run by the command that does any of these. It
+also denies `ttp say` and the web app's /api/say: a run must not post as the user. It checks only
+what runs: heredocs and echo/printf/cat text written to files that the command does not run (as an
+argument, piped into a shell, through eval or after a move), and files that are only named, read
+or edited, are data.
 
 It fails open: any error prints nothing, and the run goes on unchanged.
 """
@@ -115,15 +117,25 @@ WRITE_RE = re.compile(r"(?:^|\s)(?:-X\s*|--request[\s=]+|--method[\s=]+)[\"']?(?
                       r"|\b(?:POST|PATCH|PUT)\s+\S*(?:api\.github|/repos/)|method\s*[=:]\s*[\"'](?:POST|PATCH|PUT)"
                       r"|\.(?:post|patch|put|request)\s*\(", re.I)
 INTERPRETER_RE = re.compile(r"^(?:python[\d.]*|bash|sh|dash|zsh|ksh|node|nodejs|deno|bun|ruby|perl|tsx|ts-node)$")
-WRAPPERS = {"env", "nohup", "setsid", "nice", "exec", "command", "time", "stdbuf", "ionice", "timeout", "xargs"}
+WRAPPERS = {"env", "nohup", "setsid", "nice", "exec", "command", "time", "stdbuf", "ionice", "timeout", "xargs",
+            "sudo"}
+# Shell words that come before a command without being one: `{ gh ...; }`, `then gh ...`, `! gh ...`
+RESERVED = {"{", "}", "!", "if", "then", "else", "elif", "fi", "do", "done", "while", "until"}
+# A file's text run through a shell's -c or eval: `eval "$(cat a.sh)"`
+CAT_SUBST_RE = re.compile(r"\$\(\s*(?:cat\s+|<\s*)[\"']?([^\s\"')]+)|`\s*cat\s+[\"']?([^\s\"'`]+)")
+# Commands that copy or rename a file: what runs the new name runs the old one's text
+COPIES = {"mv", "cp", "ln", "install"}
 OPTS_WITH_VALUE = {"-u", "--unset", "-C", "--chdir", "-s", "--signal", "-k", "--kill-after", "-n", "--adjustment"}
 SCRIPT_MAX_BYTES = 1 << 20
 
 
-def _api_draft_change(text: str) -> bool:
-    """An HTTP client sending a request to the GitHub API that creates a PR or takes one out of draft."""
+def _api_draft_change(text: str, full: str = "") -> bool:
+    """An HTTP client sending a request to the GitHub API that creates a PR or takes one out of draft.
+    The client and the API are looked for in `text` (what runs); the draft change may also sit in a
+    body the same command writes (`full`) when the request sends data: `curl ... -d @q.json`."""
     api = GITHUB_API_RE.search(text) or (TOKEN_API_RE.search(text) and API_PATH_RE.search(text))
-    change = DRAFT_CHANGE_RE.search(text) or (PULLS_RE.search(text) and WRITE_RE.search(text))
+    write = WRITE_RE.search(text)
+    change = DRAFT_CHANGE_RE.search(text) or (write and (PULLS_RE.search(text) or DRAFT_CHANGE_RE.search(full)))
     return bool(api and change and HTTP_CLIENT_RE.search(text))
 
 
@@ -185,9 +197,32 @@ def _first_word(piece: str) -> str:
 
 @functools.lru_cache(maxsize=4)
 def _ran(commands: str) -> frozenset[str]:
-    """Names of the script files `commands` runs, as an argument or on an interpreter's stdin."""
-    return frozenset(os.path.basename(w) for w in [w for argv in _all_segments(commands) for w in _run_files(argv)]
-                     + STDIN_SCRIPT_RE.findall(commands))
+    """Names of the script files `commands` runs: as an argument, on an interpreter's stdin
+    (`bash < x`, `cat x | bash`), as the text of a `sh -c`/eval string (`eval "$(cat x)"`), or
+    under another name it is copied or moved to first (`mv x y; bash y`)."""
+    segments = _all_segments(commands)
+    ran = [w for argv in segments for w in _run_files(argv)] + STDIN_SCRIPT_RE.findall(commands)
+    for line in commands.split("\n"):
+        pieces = _pieces(line)
+        for (s, e, sep), (s2, e2, _) in zip(pieces, pieces[1:]):
+            nxt = _segments(line[s2:e2])
+            if sep == "|" and nxt and _reads_stdin_script(nxt[0]):
+                ran += [w for argv in _segments(line[s:e]) for w in argv[1:] if not w.startswith("-")]
+    for argv in segments:
+        name = os.path.basename(argv[0])
+        if name == "eval" or name in SHELLS:
+            ran += [a or b for a, b in CAT_SUBST_RE.findall(" ".join(argv[1:]))]
+    names = {os.path.basename(w) for w in ran}
+    copies = [[os.path.basename(w) for w in argv[1:] if not w.startswith("-")] for argv in segments
+              if os.path.basename(argv[0]) in COPIES]
+    grew = True
+    while grew:
+        grew = False
+        for *sources, target in (c for c in copies if len(c) > 1):
+            if target in names and not names.issuperset(sources):
+                names.update(sources)
+                grew = True
+    return frozenset(names)
 
 
 def _data_only(piece: str, sep: str, commands: str) -> bool:
@@ -202,7 +237,7 @@ def _data_only(piece: str, sep: str, commands: str) -> bool:
 def _split(text: str) -> tuple[str, str]:
     """(what runs as shell commands, what to scan) for a command line or a script. Heredoc bodies
     are commands only when a shell reads them; bodies an echo/cat only writes to a file are
-    dropped, and so are the quoted arguments of echo, printf and cat: data, not run."""
+    dropped from both, and so are the quoted arguments of echo, printf and cat: data, not run."""
     lines, bodies, pending = [], [], []
     for line in text.replace("\\\n", " ").split("\n"):
         if pending:
@@ -219,7 +254,7 @@ def _split(text: str) -> tuple[str, str]:
                 pending.append((m[3], m[1] == "-", len(bodies)))
                 bodies.append((len(lines) - 1, [], m.start()))
     commands = "\n".join(lines)
-    run, scan = list(lines), list(lines)
+    scan = list(lines)
     for i, line in enumerate(lines):
         stripped = line
         for s, e, sep in reversed(_pieces(line) if INERT_RE.search(line) else []):
@@ -230,6 +265,7 @@ def _split(text: str) -> tuple[str, str]:
                                for j, c in enumerate(piece))
                 stripped = stripped[:s] + kept + stripped[e:]
         scan[i] = stripped
+    run = list(scan)
     for i, body, pos in bodies:
         piece, sep = _piece_at(lines[i], pos)
         if _first_word(piece) in SHELLS:
@@ -242,7 +278,14 @@ def _split(text: str) -> tuple[str, str]:
 def _gh_write(argv: list[str]) -> bool:
     """gh `argv` can take a PR out of draft: pr ready, pr create without --draft, or api with a
     write method or a GraphQL mutation (reads are fine)."""
-    args = argv[1:]
+    args, i = [], 1
+    while i < len(argv):     # gh's -R/--repo works before the subcommand too: gh pr -R a/b ready 7
+        if argv[i] in ("-R", "--repo"):
+            i += 2
+            continue
+        if not argv[i].startswith("--repo="):
+            args.append(argv[i])
+        i += 1
     if args[:2] == ["pr", "ready"]:
         return True
     if args[:2] == ["pr", "create"]:
@@ -262,7 +305,8 @@ def _gh_write(argv: list[str]) -> bool:
                                                                             ["--header"], ["-q"], ["--jq"]):
             endpoint = a
     if endpoint == "graphql":
-        return any(re.search(r"\bmutation\b|=@|^--input", a) for a in rest)
+        # A query from a variable or a command substitution may be a mutation: `-f query="$Q"`
+        return any(re.search(r"\bmutation\b|=@|^--input|^query=.*\$", a) for a in rest)
     return (method or ("POST" if fields else "GET")).upper() not in ("GET", "HEAD")
 
 
@@ -279,22 +323,28 @@ def _all_segments(commands: str, depth: int = 0) -> list[list[str]]:
     return out
 
 
-def _gh_writes(commands: str) -> bool:
-    """A gh in command position in `commands` (or a `sh -c`/eval string there) runs a guarded write."""
-    return any(os.path.basename(argv[0]) == "gh" and _gh_write(argv) for argv in _all_segments(commands))
+def _gh_writes(commands: str, text: str) -> bool:
+    """gh may run a guarded write: a gh in command position in `commands` (or a `sh -c`/eval string
+    there) writes, or `text` names gh with a guarded word and has more gh words than the parsed gh
+    calls, all reads, account for (gh inside inline code, or where the parser does not see it)."""
+    calls = [argv for argv in _all_segments(commands) if os.path.basename(argv[0]) == "gh"]
+    if any(_gh_write(argv) for argv in calls):
+        return True
+    return bool(GUARDED_RE.search(text)) and len(GH_WORD_RE.findall(text)) > len(calls)
 
 
 def draft_bypass(text: str) -> str | None:
     """Why `text` (a command line or a script it runs) gets around the gh draft guard, else None."""
+    full = text
     commands, text = _split(text)
     if PATH_GH_RE.search(text):
         return ("call gh by its name only: the harness's gh checks that a PR leaves draft only with the "
                 "user's recorded approval")
     if (GUARDED_RE.search(text) and ((OTHER_GH_RE.search(text) and GH_WORD_RE.search(text)) or VAR_GH_RE.search(text))
-            or PATH_CHANGE_RE.search(text) and (GH_ARGV_RE.search(text) or _gh_writes(commands))):
+            or PATH_CHANGE_RE.search(text) and (GH_ARGV_RE.search(text) or _gh_writes(commands, text))):
         return ("call gh by its name, with PATH as the run set it: the harness's gh comes first and checks "
                 "that a PR leaves draft only with the user's recorded approval")
-    if _api_draft_change(text):
+    if _api_draft_change(text, full):
         return ("create or update PRs with gh, not a direct GitHub API call: a PR leaves draft only with "
                 "the user's recorded approval")
     return None
@@ -334,7 +384,7 @@ def _strip_prefix(argv: list[str]) -> list[str]:
         if w in OPTS_WITH_VALUE:   # env -u NAME, timeout -s KILL, nice -n 5 ...
             i += 2
         elif re.match(r"^\w+=", w) or w.startswith("-") or re.fullmatch(r"\d+[smhd]?", w) \
-                or os.path.basename(w) in WRAPPERS:
+                or os.path.basename(w) in WRAPPERS or w in RESERVED:
             i += 1
         elif w == "ttp" and argv[i + 1:i + 2] == ["lock"] and "--" in argv[i:]:
             i = argv.index("--", i) + 1
@@ -343,19 +393,42 @@ def _strip_prefix(argv: list[str]) -> list[str]:
     return argv[i:]
 
 
+def _interpreter_args(argv: list[str]) -> str | None:
+    """For an interpreter, the script file it runs, "" when it runs inline code (`-c`, `-m`) and
+    "-" when it reads its script from stdin; None for any other command."""
+    first, *rest = argv
+    name = os.path.basename(first)
+    if not INTERPRETER_RE.match(name):
+        return None
+    shell = re.match(r"[a-z]*sh$", name)
+    inline = ("-c", "-m") if shell or name.startswith("python") else ("-e", "-E", "--eval", "-p", "--print")
+    skip = False
+    for a in rest:
+        if skip:     # bash -o errexit, bash -O extglob: an option's value, not the script
+            skip = False
+        elif a in inline:
+            return ""
+        elif a == "-":
+            return "-"
+        elif shell and a in ("-o", "+o", "-O", "+O"):
+            skip = True
+        elif not a.startswith(("-", "+")):
+            return a
+    return "-"
+
+
+def _reads_stdin_script(argv: list[str]) -> bool:
+    return _interpreter_args(argv) == "-"
+
+
 def _run_files(argv: list[str]) -> list[str]:
     """The script file a simple command runs: `python3 x.py`, `bash -e x.sh`, `source x`, `./x`.
     `-c` and `-m` run no file (inline code is on the command line already), nor does `-` (stdin)."""
     first, *rest = argv
     name = os.path.basename(first)
-    if INTERPRETER_RE.match(name):
-        inline = ("-c", "-m") if re.match(r"python|[a-z]*sh$", name) else ("-e", "-E", "--eval", "-p", "--print")
-        for a in rest:
-            if a in inline or a == "-":
-                break
-            if not a.startswith("-"):
-                return [a]
-        return []
+    script = _interpreter_args(argv)
+    if script is not None:
+        return [script] if script not in ("", "-") else []
     if name in ("source", "."):
         return rest[:1]
     return [first] if "/" in first else []
