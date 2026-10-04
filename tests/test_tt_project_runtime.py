@@ -765,6 +765,29 @@ def test_unreadable_config_starts_no_model_work_and_alerts_once(env, monkeypatch
     assert p.db.one("SELECT id FROM messages WHERE ref='config' AND kind='resolved'")
 
 
+def test_unreadable_config_refuses_settings_cleanly(env, capsys, monkeypatch):
+    """With no project.json and no last good copy, `ttp config` set says why instead of a traceback,
+    and the web app still opens (on a port it does not save)."""
+    from ttp import cli, web
+    p = make(env)
+    p.config_path.unlink()
+    (p.state / "project.last-good.json").unlink(missing_ok=True)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["config", "demo", "budget.daily_usd", "5"])
+    assert e.value.code == 2 and "no last good copy" in capsys.readouterr().err
+    assert not p.config_path.exists()
+
+    class Stop(Exception):
+        pass
+
+    def no_server(*a, **k):
+        raise Stop()
+    monkeypatch.setattr(web, "ThreadingHTTPServer", no_server)
+    with pytest.raises(Stop):   # got past saving the port
+        web.serve(type("D", (), {"p": p})())
+    assert not p.config_path.exists()
+
+
 def test_task_provider_override_routes_on_the_last_good_config(env, monkeypatch):
     """A task that names its provider still takes that provider's tier from the project's routing,
     the last good one while project.json is missing."""

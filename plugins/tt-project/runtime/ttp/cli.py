@@ -1194,7 +1194,10 @@ def cmd_config(a) -> None:
             val = checks_of(val)
         except ValueError as e:
             die(str(e))
-    p.set_config(a.key, val)
+    try:
+        p.set_config(a.key, val)
+    except RuntimeError as e:   # project.json unreadable with no last good copy
+        die(str(e))
     print(f"{a.key} = {json.dumps(val)}")
 
 

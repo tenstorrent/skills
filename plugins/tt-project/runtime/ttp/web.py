@@ -534,6 +534,8 @@ class Handler(BaseHTTPRequestHandler):
                     p.set_config(key, USER_SETTABLE[key](body.get("value")))
                 except ValueError as e:
                     return self._send(400, {"error": str(e)})
+                except RuntimeError as e:   # project.json unreadable with no last good copy
+                    return self._send(409, {"error": str(e)})
                 return self._send(200, {"ok": True})
             return self._send(404, {"error": "unknown endpoint"})
         finally:
@@ -545,7 +547,10 @@ def serve(daemon) -> None:
     cfg = p.config()
     port = int(cfg.get("web", {}).get("port") or 0) or free_port()
     if not cfg.get("web", {}).get("port"):
-        p.set_config("web.port", port)
+        try:
+            p.set_config("web.port", port)
+        except RuntimeError:
+            pass   # project.json unreadable with no last good copy: serve on this port without saving it
     Handler.daemon_ref = daemon
     token(p)
     httpd = ThreadingHTTPServer((cfg.get("web", {}).get("bind", "127.0.0.1"), port), Handler)
