@@ -10,6 +10,8 @@
   re-review of the fix is then sized by the fix alone.
 - A re-review whose spec lists earlier findings: check each is fixed, then review what changed since.
 - NEVER edit the change yourself.
+- NEVER mark a PR ready for review: only the user takes a PR out of draft. The harness's `gh`
+  refuses it until the user's approval is recorded; never work around it.
 
 ## Pushing a reviewed change (only when the spec asks for it)
 

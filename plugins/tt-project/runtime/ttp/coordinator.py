@@ -18,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from . import machines, push, shared, upstream
+from . import machines, prguard, push, shared, upstream
 from . import screen as scr
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
@@ -28,7 +28,8 @@ from .project import (COORDINATOR_MEMORY_CHARS, WORKER_MEMORY_CHARS, Project, co
 from .runner import stop_runs
 
 ACTION_TYPES = ("reply", "task_add", "task_update", "ask_user", "resolve", "notify", "memory_add", "memory_forget",
-                "charter_update", "schedule_set", "config_set", "resource_pause", "observation_mute", "noop")
+                "charter_update", "schedule_set", "config_set", "resource_pause", "observation_mute", "pr_approve",
+                "noop")
 
 # A deferred task's `start_after`: `now`, a delay (`90m`, `3d`) or an ISO date or time (local
 # unless it names a zone). Plain character classes, so every provider's schema engine takes it.
@@ -636,11 +637,14 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 rec = (a.get("recommendation") or "").strip()
                 if rec:
                     text += f"{_REC_NOTE}{rec}"
-                db.post("out", text, chat=None, kind="ask", severity=_norm_severity(a.get("severity") or "high"))
+                db.post("out", text, chat=None, kind="ask", severity=_norm_severity(a.get("severity") or "high"),
+                        ref=f"{prguard.BLOCKING_REF}{a['blocking']}")
             elif t == "resolve":
                 n = db.x("UPDATE messages SET handled=1 WHERE id=? AND kind='ask'", (int(a["id"]),))
                 if not n:
                     raise ValueError(f"no open question #{a.get('id')}")
+            elif t == "pr_approve":
+                prguard.approve(db, str(a.get("text") or a.get("value") or ""), int(a.get("id") or 0))
             elif t == "notify":
                 db.post("out", a["text"], chat=None, kind="alert", severity=_norm_severity(a.get("severity")))
             elif t == "memory_add":

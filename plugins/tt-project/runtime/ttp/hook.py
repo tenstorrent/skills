@@ -12,12 +12,16 @@ about a task it does not own, and would be marked seen before the worker itself 
 hook stays silent inside a subagent (its payload carries `agent_id`) and leaves the update for the
 worker's next own tool call.
 
+Before a Bash call it denies the obvious ways around the harness's PR draft guard (prguard.py):
+gh called by its full path, or an HTTP client talking to the GitHub API about a PR's draft state.
+
 It fails open: any error prints nothing, and the run goes on unchanged.
 """
 from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Callable
@@ -61,7 +65,32 @@ def post_tool_use(payload: dict) -> tuple[dict | None, Callable[[], None] | None
                              "it wins:\n" + text}}, lambda: mark_seen(Path(run_dir), offset)
 
 
-HANDLERS = {"PostToolUse": post_tool_use}
+# gh by a path (skipping the harness's wrapper) running a command that can take a PR out of draft
+PATH_GH_RE = re.compile(r"(?:\S*/|\\)gh\s+(?:pr\s+(?:ready|create)|api)\b")
+# Any other client calling the GitHub API to mark a PR ready or create one
+HTTP_CLIENT_RE = re.compile(r"\b(?:curl|wget|httpie|http|xh|python3?|node|ruby|perl|fetch)\b(?!:)")
+DRAFT_CHANGE_RE = re.compile(r"markPullRequestReadyForReview|createPullRequest|[\"']?draft[\"']?\s*[=:]\s*false"
+                             r"|/pulls\b", re.I)
+GITHUB_API_RE = re.compile(r"api\.github\.com|/api/v3\b|/graphql\b", re.I)
+
+
+def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
+    if payload.get("tool_name") != "Bash" or not os.environ.get("TTP_RUN_DIR"):
+        return None, None
+    cmd = str((payload.get("tool_input") or {}).get("command") or "")
+    if PATH_GH_RE.search(cmd):
+        why = ("call gh by its name only: the harness's gh checks that a PR leaves draft only with the "
+               "user's recorded approval")
+    elif GITHUB_API_RE.search(cmd) and DRAFT_CHANGE_RE.search(cmd) and HTTP_CLIENT_RE.search(cmd):
+        why = ("create or update PRs with gh, not a direct GitHub API call: a PR leaves draft only with "
+               "the user's recorded approval")
+    else:
+        return None, None
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                   "permissionDecisionReason": f"tt-project: {why}."}}, None
+
+
+HANDLERS = {"PostToolUse": post_tool_use, "PreToolUse": pre_tool_use}
 
 
 def main(argv: list[str]) -> int:

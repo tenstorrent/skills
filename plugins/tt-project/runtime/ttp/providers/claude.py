@@ -258,15 +258,19 @@ def _read_json(path: Path) -> dict:
 
 
 def hook_settings() -> dict:
-    """Route tool-use events through `ttp.hook`, so coordinator updates reach a running worker.
+    """Route tool-use events through `ttp.hook`, so coordinator updates reach a running worker and
+    Bash calls cannot get around the PR draft guard.
 
     Passed as JSON on the command line: nothing is written to the user's settings files, and one
     project never changes another's behavior.
     """
     runtime = str(Path(__file__).resolve().parents[2])
-    cmd = f"{shlex.quote(sys.executable)} -m ttp.hook PostToolUse"
-    return {"hooks": {"PostToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": cmd,
-                                                                  "timeout": 20}]}]},
+    cmd = f"{shlex.quote(sys.executable)} -m ttp.hook"
+    return {"hooks": {"PostToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": f"{cmd} PostToolUse",
+                                                                  "timeout": 20}]}],
+                      # Denies Bash calls that would get around the harness's PR draft guard.
+                      "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": f"{cmd} PreToolUse",
+                                                                    "timeout": 20}]}]},
             "env": {"PYTHONPATH": runtime}}
 
 

@@ -1,0 +1,16 @@
+#!/bin/sh
+# Run as sh first: exec the interpreter the daemon named (TTP_PYTHON), else python3 from PATH.
+# Python reads the next line as a string.
+''''[ -x "${TTP_PYTHON:-}" ] || TTP_PYTHON=python3; exec "$TTP_PYTHON" "$0" "$@" # '''
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""gh for tt-project runs: refuses to take a PR out of draft without the user's recorded approval
+(see ttp/prguard.py), then runs the real gh further down PATH."""
+import os
+import sys
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(HERE), "runtime"))
+from ttp.prguard import main  # noqa: E402
+
+sys.exit(main(sys.argv, os.path.dirname(os.path.abspath(__file__))))

@@ -11791,3 +11791,150 @@ def test_the_code_prompt_lands_only_through_the_guarded_push_and_only_when_asked
     coordinator = (prompts / "coordinator.md").read_text()
     assert "With `delivery.code_tasks_may_push` on" in coordinator
     assert "instead of adding a\n  separate landing, cherry-pick or fast-forward task" in coordinator
+
+
+# --- PRs leave draft only with the user's recorded approval ---------------------------------------
+
+FAKE_GH = '''#!{python}
+import os, sys
+a = sys.argv[1:]
+if a[:2] == ["alias", "list"]:
+    print("rdy: pr ready")
+    sys.exit(0)
+if a[:2] == ["pr", "view"]:
+    pos = [x for x in a[2:] if not x.startswith("-")][:1]
+    n = pos[0] if pos and pos[0].isdigit() else "7"
+    print(f"https://github.com/acme/widgets/pull/{{n}}")
+    sys.exit(0)
+if a[:2] == ["api", "graphql"] and any("node(id:" in x for x in a):
+    print("https://github.com/acme/widgets/pull/7")
+    sys.exit(0)
+with open(os.environ["FAKE_GH_LOG"], "a") as f:
+    f.write(" ".join(a) + "\\n")
+'''
+
+READY_7 = ("query=mutation{markPullRequestReadyForReview(input:{pullRequestId:\"PR_kwDOabc123\"})"
+           "{clientMutationId}}")
+
+
+def _gh_runner(p, tmp_path):
+    fake = tmp_path / "realbin"
+    fake.mkdir()
+    (fake / "gh").write_text(FAKE_GH.format(python=sys.executable))
+    (fake / "gh").chmod(0o755)
+    log = tmp_path / "gh.log"
+    log.write_text("")
+    env = {**os.environ, "PATH": f"{p.harness / 'bin'}:{fake}:{os.environ['PATH']}", "TTP_PROJECT": str(p.base),
+           "TTP_PYTHON": sys.executable, "FAKE_GH_LOG": str(log)}
+    env.pop("PYTHONPATH", None)
+
+    def gh(*args):
+        r = subprocess.run(["gh", *args], capture_output=True, text=True, env=env, timeout=60)
+        ran = log.read_text().splitlines()
+        log.write_text("")
+        return r.returncode, r.stderr, ran
+    return gh
+
+
+def test_workers_gh_keeps_prs_in_draft_until_the_user_approves(env, tmp_path):
+    """A project marked its PRs ready for review on its own. Every run's PATH starts with the
+    harness's gh, which refuses that until the user's approval is recorded, for any provider."""
+    p = make(env)
+    from ttp import coordinator as coord
+    gh = _gh_runner(p, tmp_path)
+    url = "https://github.com/acme/widgets/pull/7"
+
+    refused = [("pr", "create", "--title", "t", "--body", "b"),
+               ("pr", "ready", "7"), ("pr", "ready"), ("pr", "ready", url), ("rdy", "7"),
+               ("api", "-X", "PATCH", "repos/acme/widgets/pulls/7", "-F", "draft=false"),
+               ("api", "repos/acme/widgets/pulls", "-f", "title=t", "-f", "head=b", "-f", "base=main"),
+               ("api", "graphql", "-f", READY_7),
+               ("api", "graphql", "-f", "query=mutation{createPullRequest(input:{title:\"t\"}){clientMutationId}}")]
+    for args in refused:
+        rc, err, ran = gh(*args)
+        assert rc == 1 and "refused" in err and ran == [], f"gh {' '.join(args)} was let through"
+    allowed = [("pr", "create", "--draft", "--title", "t"), ("pr", "create", "-d"), ("pr", "ready", "7", "--undo"),
+               ("pr", "list"), ("api", "repos/acme/widgets/pulls", "-F", "draft=true", "-f", "title=t"),
+               ("api", "repos/acme/widgets/pulls/7"), ("issue", "list")]
+    for args in allowed:
+        rc, err, ran = gh(*args)
+        assert rc == 0 and ran == [" ".join(args)], f"gh {' '.join(args)} was refused: {err}"
+
+    # The user's yes to a blocking review ask that names the PR is recorded, and lets it out of draft.
+    assert coord.apply(p, [{"type": "ask_user", "text": f"Mark {url} ready for review?", "blocking": "review",
+                            "recommendation": "yes"}]) == []
+    ask = p.db.one("SELECT id FROM messages WHERE kind='ask'")["id"]
+    p.db.post("in", "yes, go ahead", chat="web")
+    assert coord.apply(p, [{"type": "pr_approve", "id": ask, "text": url}]) == []
+    for args in [("pr", "ready", "7"), ("pr", "ready"), ("rdy", "7"), ("api", "graphql", "-f", READY_7),
+                 ("api", "-X", "PATCH", "repos/acme/widgets/pulls/7", "-F", "draft=false")]:
+        rc, err, ran = gh(*args)
+        assert rc == 0 and ran, f"gh {' '.join(args)} was refused after the user approved: {err}"
+    rc, err, ran = gh("pr", "ready", "8")
+    assert rc == 1 and "acme/widgets#8" in err and ran == [], "one PR's approval let another out of draft"
+    rc, err, ran = gh("pr", "create", "--title", "t")
+    assert rc == 1, "an approval let a PR be opened as non-draft"
+
+
+def test_pr_approve_needs_the_users_answer_naming_the_pr(env):
+    p = make(env)
+    from ttp import coordinator as coord, prguard
+    url = "https://github.com/acme/widgets/pull/7"
+
+    def approve(msg, pr=url):
+        return coord.apply(p, [{"type": "pr_approve", "id": msg, "text": pr}])
+
+    coord.apply(p, [{"type": "ask_user", "text": f"Grant access to the device for {url}?", "blocking": "access",
+                     "recommendation": "yes"}])
+    access = p.db.one("SELECT id FROM messages WHERE kind='ask' ORDER BY id DESC")["id"]
+    coord.apply(p, [{"type": "ask_user", "text": f"Ready {url} for review?", "blocking": "review",
+                     "recommendation": "yes"}])
+    review = p.db.one("SELECT id FROM messages WHERE kind='ask' ORDER BY id DESC")["id"]
+    coord.apply(p, [{"type": "ask_user", "text": "Merge the release PR?", "blocking": "merge",
+                     "recommendation": "yes"}])
+    vague = p.db.one("SELECT id FROM messages WHERE kind='ask' ORDER BY id DESC")["id"]
+    assert "not answered" in " ".join(approve(review)), "approved before the user answered"
+    p.db.post("in", "yes", chat="web")
+    assert "blocking review or merge" in " ".join(approve(access))
+    assert "does not name" in " ".join(approve(vague))
+    assert "names no PR" in " ".join(approve(review, "the big one"))
+    note = p.db.post("out", f"Opened {url}", chat=None, kind="alert")
+    assert approve(note), "an alert counted as an approval"
+    assert not prguard.approved(p.db, "acme/widgets#7")
+    assert approve(review) == []
+    assert prguard.approved(p.db, "acme/widgets#7")
+    said = p.db.post("in", "please mark acme/widgets#9 ready for review", chat="web")
+    assert approve(said, "https://github.com/acme/widgets/pull/9") == []
+    assert prguard.approved(p.db, "acme/widgets#9") and not prguard.approved(p.db, "acme/widgets#8")
+
+
+def test_claude_hook_denies_ways_around_the_gh_guard(env, monkeypatch, tmp_path):
+    from ttp import hook
+    from ttp.providers import get_provider
+    monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path))
+
+    def denied(cmd):
+        out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": cmd}})
+        return bool(out) and out["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    for cmd in ("/usr/bin/gh pr ready 7", "cd x && ~/bin/gh api graphql -f query=q", "\\gh pr create -t t",
+                "curl -X PATCH -H 'Authorization: token x' https://api.github.com/repos/a/b/pulls/7 -d '{\"draft\":false}'",
+                "curl https://api.github.com/graphql -d '{\"query\":\"mutation{markPullRequestReadyForReview}\"}'",
+                "python3 -c \"import requests; requests.post('https://api.github.com/repos/a/b/pulls')\""):
+        assert denied(cmd), cmd
+    for cmd in ("gh pr ready 7", "gh pr create --draft", "git status", "ls /usr/bin/gh", "gh api repos/a/b/pulls",
+                "curl https://api.github.com/repos/a/b", "grep -rn draft=false tests/"):
+        assert not denied(cmd), cmd
+    worker, _ = get_provider("claude").build(role="worker", model="opus", effort="low", cwd=".", budget_usd=None,
+                                             read_only=False, schema=None, restrictions={})
+    pre = json.loads(worker[worker.index("--settings") + 1])["hooks"]["PreToolUse"][0]
+    assert pre["matcher"] == "Bash" and pre["hooks"][0]["command"].endswith("ttp.hook PreToolUse")
+
+
+def test_prompts_say_only_the_user_takes_a_pr_out_of_draft():
+    prompts = RUNTIME.parent / "template" / "prompts"
+    for name in ("kind-code.md", "kind-review.md"):
+        text = " ".join((prompts / name).read_text().split())
+        assert "NEVER mark a PR ready for review" in text and "only the user takes a PR out of draft" in text, name
+    coord_text = " ".join((prompts / "coordinator.md").read_text().split())
+    assert "A PR leaves draft ONLY on the user's explicit yes" in coord_text and "`pr_approve`" in coord_text

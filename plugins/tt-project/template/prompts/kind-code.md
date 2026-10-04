@@ -29,6 +29,8 @@
 ## Pull requests (when the task asks for delivery)
 
 - Open or update a DRAFT PR with `gh`. One PR per change.
+- NEVER mark a PR ready for review or open one that is not a draft: only the user takes a PR out
+  of draft. The harness's `gh` refuses it until the user's approval is recorded; never work around it.
 - Description: what improved and why, one line of how, key numbers. Short, for humans.
 - Keep the description and your PR comments current with the latest push.
 - Answer every review comment: fix it, or explain briefly why not.

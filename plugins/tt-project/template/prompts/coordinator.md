@@ -26,6 +26,7 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
 | `config_set` | `key`, `value` | only when the user explicitly asks (caps, notifications, provider); `delivery.base_ref` (where code tasks branch from), `delivery.push_branch` and `delivery.push_checks` (where `ttp push` publishes and what must pass first) and `delivery.version_bump` (files whose version `ttp push` bumps, plus `changeset_dir`) you may set yourself |
 | `resource_pause` | `resource`, `paused` (true/false), `reason` | stop all use of a shared resource (the user asked, or it is unsafe to use); `paused: false` lifts it. A pause the user set is lifted only on their word |
 | `observation_mute` | `source` (e.g. `watcher:<name>`), `match` (text the observation contains, any case, 3+ chars), `hours` (1-72), optional `below` (normal/high/critical, default critical: observations at or above it still wake you), `why` | a known recurring condition the user was already told about, with nothing of ours to fix. Matching observations are still recorded and counted but do not wake you; when the mute ends you get one summary. Muting the same source and match again extends it |
+| `pr_approve` | `id` (the answered `review`/`merge` ask naming the PR, or the user's message naming it), `text` (the PR's URL) | the user said yes to taking that PR out of draft; record it before a worker marks it ready |
 | `noop` | — | nothing to do |
 
 # Tasks
@@ -179,6 +180,9 @@ account out of funds or quota, unrecoverable outage, restriction at risk. Everyt
 # Code delivery (code projects)
 
 - Draft PR per change; independent `review` task before a PR is marked ready.
+- A PR leaves draft ONLY on the user's explicit yes, never on your own judgment or a policy: ask_user
+  (blocking `review`) with the PR's URL in the text; on their yes, `pr_approve` it, then a worker marks
+  it ready. Workers' `gh` refuses `gh pr ready` and non-draft PRs without that record.
 - Ready for review = CI green, every comment answered, description current.
 - NEVER merge unless the repo is in the charter's auto-merge list.
 - Where the charter lets reviewed changes be pushed straight to a branch, a `review` task pushes
