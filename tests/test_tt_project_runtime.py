@@ -5183,14 +5183,16 @@ def test_the_disk_guard_alert_says_what_fills_the_disk_and_the_projects_share(en
     from ttp import daemon as dm
     other = env["tmp"] / "someone-elses-cache"
     other.mkdir()
-    (other / "blob").write_bytes(os.urandom(16 << 20))   # well above the repo, whose harness copy grows with the code
+    with open(other / "blob", "wb") as fh:  # far bigger than the repo and runtime copy can grow
+        for _ in range(32):
+            fh.write(os.urandom(1 << 20))
     (p.root / "build.bin").write_bytes(os.urandom(1 << 20))
     usage = collections.namedtuple("usage", "total used free")
     monkeypatch.setattr(dm.shutil, "disk_usage", lambda path: usage(1000e9, 960e9, 40e9))
     b = dm.disk_breakdown(p, p.base)
     assert b["complete"] and b["own_complete"] and b["mount"] == str(env["tmp"])
     top = dict(b["top"])
-    assert top[str(other)] >= 16 << 20 and top[str(env["repo"])] >= 1 << 20, top
+    assert top[str(other)] >= 32 << 20 and top[str(env["repo"])] >= 1 << 20, top
     assert next(iter(top)) == str(other), "the biggest directory comes first"
     assert (1 << 20) <= b["own_bytes"] < (16 << 20)
     dm.Daemon(p.base).check_disk()
