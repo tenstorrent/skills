@@ -204,8 +204,10 @@ Design notes, invariants and how to add a provider: [docs/design.md](docs/design
   off before reporting usage is booked at the elapsed share of its budget (flagged estimated).
   A run that wrote no output and reported no tokens is booked at $0 (except on an older Cursor
   build, which prints nothing until it ends).
-- Codex workers run in Codex's workspace-write sandbox, with the project's state folder and the
-  repository's git folder added as writable roots. Coordinator turns use its read-only sandbox.
+- Codex workers run in Codex's workspace-write sandbox, with the project's state folder, the
+  repository's git folder and the shared lock folder (`~/.tt-project/locks`, for `ttp lock` on
+  resources shared across projects) added as writable roots. Coordinator turns use its read-only
+  sandbox.
 - Codex and Cursor coordinator turns run from an empty scratch directory, so the project's
   AGENTS.md and rules stay out of them. Codex's shell and web search tools are off, and Cursor
   runs in ask mode, when the installed CLI offers those switches.
