@@ -345,7 +345,7 @@ def bootstrap(root: Path, name: str, brief: str, provider: str) -> Project:
     db.post("in", "Project created. Brief:\n" + (brief.strip() or "(none)") +
             "\n\nRead the charter, restate the goals, success criteria and restrictions as you understand "
             "them, list what you still need to know, and start the first tasks that do not depend on answers.",
-            chat=None, channel="system", kind="user")
+            chat=None, channel="system", kind="user", provenance="system")
     return p
 
 
@@ -555,7 +555,8 @@ def cmd_say(a) -> None:
         if a.client_id:
             seen = p.db.one("SELECT id FROM messages WHERE direction='in' AND ref=?", (f"client:{a.client_id}",))
         mid = seen["id"] if seen else p.db.post("in", text.strip(), chat=a.chat or None, channel="chat",
-                                                 kind="user", ref=f"client:{a.client_id}" if a.client_id else None)
+                                                 kind="user", ref=f"client:{a.client_id}" if a.client_id else None,
+                                                 provenance="cli-legacy")
         if a.chat:
             p.db.x("UPDATE chats SET last_active=? WHERE id=?", (time.time(), a.chat))
     if seen:

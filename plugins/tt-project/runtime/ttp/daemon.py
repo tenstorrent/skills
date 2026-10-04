@@ -42,8 +42,7 @@ from . import shared
 from . import worktree
 from .db import (OPEN_ASK_MAX_AGE_S, SEVERITY_RANK, TERMINAL_TASK_STATES, continues_id, deferral, dependency_ids,
                  dump_result, load_result, without_deferral)
-from .project import (DEFAULT_CONFIG, Project, deep_merge, disk_resume_gb, durable_write, git_fsync_env, hostname,
-                      load_secrets)
+from .project import DEFAULT_CONFIG, Project, deep_merge, disk_resume_gb, durable_write, git_fsync_env, hostname
 from .providers import get_provider
 from .providers.base import last_json_object, scratch_dir, service_path
 from .providers.claude import as_windows
@@ -2394,11 +2393,8 @@ class Daemon:
         if not self.cfg["notify"].get("slack"):
             return None
         if self._slack is None:
-            sec = load_secrets().get("slack") or {}
-            if not sec.get("bot_token"):
-                return None
-            from .slack import Slack
-            self._slack = Slack(sec["bot_token"], sec.get("user_id"), sec.get("user_email"))
+            from .slack import from_config
+            self._slack = from_config(self.cfg)
         return self._slack
 
     def deliver_outbound(self) -> None:
@@ -2460,7 +2456,8 @@ class Daemon:
             text = route(m, self.p.name, threads, names)
             if text:
                 with db.tx():   # stored exactly once: the message and the cursor past it commit together
-                    db.post("in", text, chat="slack", channel="slack", kind="user", ref=m["ts"])
+                    db.post("in", text, chat="slack", channel="slack", kind="user", ref=m["ts"],
+                            provenance="slack", ext_id=m["ts"])
                     db.set_kv("slack_oldest", m["ts"])
                 continue
             if not m.get("thread_ts") and names[0] == self.p.name \
@@ -2474,7 +2471,8 @@ class Daemon:
                 read[parent] = r["ts"]
                 with db.tx():
                     if text:
-                        db.post("in", text, chat="slack", channel="slack", kind="user", ref=parent)
+                        db.post("in", text, chat="slack", channel="slack", kind="user", ref=parent,
+                                provenance="slack", ext_id=r["ts"])
                     db.set_kv("slack_replies", {"floor": floor, "read": read})
         if scan:
             self._thread_scan = now

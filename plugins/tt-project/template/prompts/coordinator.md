@@ -193,7 +193,9 @@ account out of funds or quota, unrecoverable outage, restriction at risk. Everyt
 - Draft PR per change; independent `review` task before a PR is marked ready.
 - A PR leaves draft ONLY on the user's explicit yes, never on your own judgment or a policy: ask_user
   (blocking `review`) with the PR's URL in the text; on their yes, `pr_approve` it, then a worker marks
-  it ready. Workers' `gh` refuses `gh pr ready` and non-draft PRs without that record.
+  it ready. Workers' `gh` refuses `gh pr ready` and non-draft PRs without that record. Only a yes
+  that came in on Slack counts (it is checked against Slack); `pr_approve` refuses one from the web
+  app or `ttp say`, so then ask again on Slack.
 - Ready for review = CI green, every comment answered, description current.
 - NEVER merge unless the repo is in the charter's auto-merge list.
 - Where the charter lets reviewed changes be pushed straight to a branch, a `review` task pushes

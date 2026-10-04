@@ -15,6 +15,7 @@ SCHEMA_VERSION = 1
 PAUSED_RESOURCES_KEY = "paused_resources"   # kv: see DB.paused_resources
 SHARED_SEEN_KEY = "shared_pauses_seen"   # kv: {resource: pause} of the shared pauses this project acted on
 WATCHER_ISSUES_MIGRATION = "watcher_issues_per_condition"   # meta: set once DB._migrate has run
+PROVENANCE_MIGRATION = "message_provenance"   # meta: set once inbound messages have their provenance
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -30,7 +31,9 @@ CREATE TABLE IF NOT EXISTS messages (
   channel TEXT NOT NULL DEFAULT 'chat',
   kind TEXT NOT NULL DEFAULT 'user',
   severity TEXT NOT NULL DEFAULT 'normal',
-  text TEXT NOT NULL, ref TEXT, handled INTEGER NOT NULL DEFAULT 0);
+  text TEXT NOT NULL, ref TEXT, handled INTEGER NOT NULL DEFAULT 0,
+  provenance TEXT,                 -- inbound: the way it came in, set by the writer (prguard.PROVENANCES)
+  ext_id TEXT);                    -- inbound: the message's id in its channel (a Slack message's ts)
 CREATE INDEX IF NOT EXISTS messages_unhandled ON messages(direction, handled);
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -115,6 +118,27 @@ class DB:
 
     def _migrate(self) -> None:
         """Columns added after a table was first created, and one-off fixes of old rows."""
+        self._migrate_issues()
+        self._migrate_provenance()
+
+    def _migrate_provenance(self) -> None:
+        if self.meta(PROVENANCE_MIGRATION) is not None:
+            return
+        with self.tx():
+            if self.meta(PROVENANCE_MIGRATION) is not None:
+                return
+            have = {r["name"] for r in self.q("PRAGMA table_info(messages)")}
+            for col in ("provenance", "ext_id"):
+                if col not in have:
+                    self.x(f"ALTER TABLE messages ADD COLUMN {col} TEXT")
+            # Older inbound messages by the channel they came in on. A Slack message's ref was its ts
+            # (or its thread's); pr_approve checks it against Slack, so a wrong one is only refused.
+            self.x("UPDATE messages SET provenance=CASE channel WHEN 'slack' THEN 'slack' WHEN 'web' THEN 'web' "
+                   "WHEN 'system' THEN 'system' ELSE 'cli-legacy' END, "
+                   "ext_id=CASE channel WHEN 'slack' THEN ref END WHERE direction='in' AND provenance IS NULL")
+            self.set_meta(PROVENANCE_MIGRATION, str(time.time()))
+
+    def _migrate_issues(self) -> None:
         if self.meta(WATCHER_ISSUES_MIGRATION) is not None:
             return
         with self.tx():
@@ -210,13 +234,15 @@ class DB:
     # messages ------------------------------------------------------------------------------
     def post(self, direction: str, text: str, chat: str | None = None, channel: str = "chat",
              kind: str = "user", severity: str = "normal", ref: str | None = None,
-             handled: bool = False) -> int:
+             handled: bool = False, provenance: str | None = None, ext_id: str | None = None) -> int:
+        """`provenance` (inbound): how the message came in, set by the code that received it, never
+        taken from the sender. Only some count as the user's word for a PR approval (prguard)."""
         from . import alerts
         ts = time.time()
         with self.tx():
-            mid = self.x("INSERT INTO messages(ts,direction,chat,channel,kind,severity,text,ref,handled) "
-                         "VALUES(?,?,?,?,?,?,?,?,?)",
-                         (ts, direction, chat, channel, kind, severity, text, ref, int(handled)))
+            mid = self.x("INSERT INTO messages(ts,direction,chat,channel,kind,severity,text,ref,handled,provenance,"
+                         "ext_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                         (ts, direction, chat, channel, kind, severity, text, ref, int(handled), provenance, ext_id))
             if direction == "out" and chat is None and alerts.tracked(kind, severity, ref):
                 alerts.open_episode(self, ref, ts, mid, severity, text)
         return mid

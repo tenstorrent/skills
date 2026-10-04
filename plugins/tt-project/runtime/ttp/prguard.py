@@ -12,6 +12,10 @@ An approval record is written only by the coordinator's `pr_approve` action, whi
 `review` or `merge` ask that names the PR and a user message after it (or a user message that
 names the PR itself). It lives in the project database, under APPROVALS_KEY.
 
+Only a message that came in on a channel a run cannot write to counts (APPROVING). Every message
+ends up as a row in the project database, which a run can write, so a Slack message is read back
+from Slack by its ts: it must be the user's, say the same thing and come after the ask.
+
 Claude Code workers also get a PreToolUse hook (hook.py) that denies the obvious ways around this
 wrapper: gh called by its full path, or curl and the like talking to the GitHub API about drafts.
 """
@@ -29,6 +33,12 @@ from pathlib import Path
 APPROVALS_KEY = "pr_ready_approvals"   # kv: {"owner/repo#N": {"ask": id, "answer": id, "ts": t}}
 BLOCKING_REF = "blocking:"             # an ask message's ref: why the user must answer it
 APPROVING_REASONS = ("review", "merge")
+# An inbound message's provenance (messages.provenance), set by the code that received it:
+# slack: polled by the daemon from the user's DM; web: the web app (its token is a file a run can read);
+# web-session, cli-peer: a signed-in web session, `ttp say` through the daemon from outside any run;
+# cli-legacy: `ttp say` writing the database itself; system: the harness.
+PROVENANCES = ("slack", "web", "web-session", "cli-peer", "cli-legacy", "system")
+APPROVING = ("slack", "web-session", "cli-peer")
 # The pr-watch watcher (watchers.py) flags PRs out of draft with no approval record and puts
 # them back in draft:
 UNAPPROVED_KEY = "pr_ready_unapproved"     # kv: {"owner/repo#N": {"task": id, "url": u, "since": t, "seen": t}}
@@ -46,7 +56,7 @@ GH_COMMANDS = {"alias", "api", "attestation", "auth", "browse", "cache", "co", "
                "workflow", "agent-task", "copilot", "preview"}
 
 HOW = ("A PR leaves draft only after the user approves it: the coordinator asks the user (ask_user, "
-       "blocking review) naming the PR's URL and, on their yes, records it with pr_approve.")
+       "blocking review) naming the PR's URL and, on their yes on Slack, records it with pr_approve.")
 
 
 def pr_key(text: str) -> str | None:
@@ -64,35 +74,74 @@ def pr_keys(text: str) -> set[str]:
 
 # --- the approval record ----------------------------------------------------------------------
 
-def approve(db, pr: str, source_id: int, now: float | None = None) -> str:
+def approve(db, pr: str, source_id: int, now: float | None = None, slack=None) -> str:
     """Record the user's approval for `pr` (URL or owner/repo#N) from message `source_id`: an ask with
-    blocking review or merge that names the PR and has a user message after it, or a user message that
-    names the PR. Raises ValueError otherwise. Returns the PR's key."""
+    blocking review or merge that names the PR and whose first answer is the user's, or a user message
+    that names the PR. The user's message must have come in on an APPROVING channel; a Slack one is
+    checked against Slack with `slack` (slack.Slack). Raises ValueError otherwise. Returns the PR's key."""
     key = pr_key(pr)
     if not key:
         raise ValueError(f"pr_approve: {pr!r} names no PR; give its URL or owner/repo#N")
-    msg = db.one("SELECT id, direction, kind, text, ref FROM messages WHERE id=?", (int(source_id),))
+    msg = db.one("SELECT * FROM messages WHERE id=?", (int(source_id),))
     if not msg:
         raise ValueError(f"pr_approve: no message #{source_id}")
     if msg["direction"] == "out":
         reason = (msg["ref"] or "").removeprefix(BLOCKING_REF) if (msg["ref"] or "").startswith(BLOCKING_REF) else ""
         if msg["kind"] != "ask" or reason not in APPROVING_REASONS:
             raise ValueError(f"pr_approve: #{source_id} is not an ask with blocking review or merge")
-        answer = db.one("SELECT id FROM messages WHERE direction='in' AND id>? ORDER BY id LIMIT 1", (msg["id"],))
+        answer = db.one("SELECT * FROM messages WHERE direction='in' AND id>? ORDER BY id LIMIT 1", (msg["id"],))
         if not answer:
             raise ValueError(f"pr_approve: the user has not answered ask #{source_id} yet")
-        answer_id = answer["id"]
+        if answer["kind"] != "user":
+            raise ValueError(f"pr_approve: the answer to ask #{source_id}, #{answer['id']}, is not a message "
+                             f"from the user")
     else:
         if msg["kind"] != "user":
             raise ValueError(f"pr_approve: #{source_id} is not a message from the user")
-        answer_id = msg["id"]
+        answer = msg
     if key not in pr_keys(msg["text"]):
         raise ValueError(f"pr_approve: #{source_id} does not name {key}; the approval must be for that PR")
+    channel = answer.get("provenance")
+    if channel not in APPROVING:
+        raise ValueError(f"pr_approve: #{answer['id']} came in via {channel or 'an unknown channel'}, which does "
+                         f"not count as the user's approval (only {', '.join(APPROVING)}); ask the user again "
+                         f"and have them answer on Slack")
+    if channel == "slack":
+        _check_slack(answer, key if answer is msg else None, msg["ts"] if answer is not msg else None, slack)
     with db.tx():
         rec = db.kv(APPROVALS_KEY, {}) or {}
-        rec[key] = {"source": int(source_id), "answer": answer_id, "ts": now or time.time()}
+        rec[key] = {"source": int(source_id), "answer": answer["id"], "ts": now or time.time(),
+                    "channel": channel, "external_id": answer.get("ext_id")}
         db.set_kv(APPROVALS_KEY, rec)
     return key
+
+
+def _check_slack(m: dict, names: str | None, after: float | None, slack) -> None:
+    """Read message `m` back from Slack: it must exist there, be the user's, say what `m` says, name the
+    PR `names` (a message that approves by itself) and come after `after` (an ask's answer)."""
+    n, ts = m["id"], m.get("ext_id")
+    if not ts:
+        raise ValueError(f"pr_approve: #{n} has no Slack ts to check it against Slack")
+    if slack is None:
+        raise ValueError(f"pr_approve: #{n} came in via Slack, but Slack is not set up here to check it")
+    try:
+        found, uid = slack.message(ts), slack.resolve_user()
+    except Exception as e:
+        raise ValueError(f"pr_approve: could not read #{n} back from Slack ({e}); try again next turn") from None
+    if not found:
+        raise ValueError(f"pr_approve: Slack has no message {ts} for #{n}")
+    if found.get("user") != uid:
+        raise ValueError(f"pr_approve: Slack message {ts} for #{n} is not the user's")
+    from .slack import PREFIX
+    said = " ".join((found.get("text") or "").split())
+    stored = " ".join((m["text"] or "").split())
+    pre = PREFIX.match(said)
+    if stored != said and not (pre and " ".join(pre.group(2).split()) == stored):
+        raise ValueError(f"pr_approve: #{n} does not match what the user wrote on Slack ({ts})")
+    if names and names not in pr_keys(said):
+        raise ValueError(f"pr_approve: the user's Slack message {ts} does not name {names}")
+    if after is not None and float(ts) <= float(after):
+        raise ValueError(f"pr_approve: the user's Slack message {ts} is older than the ask it would answer")
 
 
 def approved(db, key: str) -> bool:

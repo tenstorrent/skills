@@ -120,6 +120,14 @@ class Slack:
                     out.append((parent["ts"], sorted(reps, key=lambda r: float(r["ts"]))))
         return out
 
+    def message(self, ts: str) -> dict | None:
+        """The DM message with this ts, top-level or in a thread, as Slack has it now; None if none."""
+        for m in self.call("conversations.replies", channel=self.dm_channel(), ts=ts, oldest=ts, latest=ts,
+                           inclusive=True, limit=10).get("messages", []):
+            if m.get("ts") == ts:
+                return m
+        return None
+
     def _pages(self, method: str, **params: Any) -> list[dict]:
         msgs: list[dict] = []
         cursor = None
@@ -130,6 +138,15 @@ class Slack:
             if not cursor:
                 break
         return msgs
+
+
+def from_config(cfg: dict) -> Slack | None:
+    """The user's Slack client when this project uses Slack, else None."""
+    if not cfg.get("notify", {}).get("slack"):
+        return None
+    from .project import load_secrets
+    sec = load_secrets().get("slack") or {}
+    return Slack(sec["bot_token"], sec.get("user_id"), sec.get("user_email")) if sec.get("bot_token") else None
 
 
 PREFIX = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]{0,62})\s*:\s*(.+)$", re.S)

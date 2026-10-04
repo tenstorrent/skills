@@ -12393,7 +12393,7 @@ def test_workers_gh_keeps_prs_in_draft_until_the_user_approves(env, tmp_path):
     assert coord.apply(p, [{"type": "ask_user", "text": f"Mark {url} ready for review?", "blocking": "review",
                             "recommendation": "yes"}]) == []
     ask = p.db.one("SELECT id FROM messages WHERE kind='ask'")["id"]
-    yes = p.db.post("in", "yes, go ahead", chat="web")
+    yes = p.db.post("in", "yes, go ahead", chat="web", provenance="web-session")
     # The coordinator sees each user message's id, to name it in pr_approve.
     assert f"[user message #{yes} via" in coord.digest(p, {}, [], [yes])
     assert coord.apply(p, [{"type": "pr_approve", "id": ask, "text": url}]) == []
@@ -12425,7 +12425,7 @@ def test_pr_approve_needs_the_users_answer_naming_the_pr(env):
                      "recommendation": "yes"}])
     vague = p.db.one("SELECT id FROM messages WHERE kind='ask' ORDER BY id DESC")["id"]
     assert "not answered" in " ".join(approve(review)), "approved before the user answered"
-    p.db.post("in", "yes", chat="web")
+    p.db.post("in", "yes", chat="web", provenance="cli-peer")
     assert "blocking review or merge" in " ".join(approve(access))
     assert "does not name" in " ".join(approve(vague))
     assert "names no PR" in " ".join(approve(review, "the big one"))
@@ -12434,9 +12434,113 @@ def test_pr_approve_needs_the_users_answer_naming_the_pr(env):
     assert not prguard.approved(p.db, "acme/widgets#7")
     assert approve(review) == []
     assert prguard.approved(p.db, "acme/widgets#7")
-    said = p.db.post("in", "please mark acme/widgets#9 ready for review", chat="web")
+    said = p.db.post("in", "please mark acme/widgets#9 ready for review", chat="web", provenance="web-session")
     assert approve(said, "https://github.com/acme/widgets/pull/9") == []
     assert prguard.approved(p.db, "acme/widgets#9") and not prguard.approved(p.db, "acme/widgets#8")
+
+
+def test_pr_approve_counts_only_channels_a_run_cannot_write(env):
+    """Every message ends up as a row a run could write, so only some channels count as the user's yes."""
+    p = make(env)
+    from ttp import coordinator as coord, prguard
+    url = "https://github.com/acme/widgets/pull/7"
+    for prov in (None, "web", "cli-legacy", "system"):
+        said = p.db.post("in", f"yes, mark {url} ready", chat="web", provenance=prov)
+        out = " ".join(coord.apply(p, [{"type": "pr_approve", "id": said, "text": url}]))
+        assert "does not count as the user's approval" in out, prov
+    assert not prguard.approved(p.db, "acme/widgets#7")
+    # The ask path too: the ask's first answer must be the user's, on an approving channel.
+    coord.apply(p, [{"type": "ask_user", "text": f"Ready {url} for review?", "blocking": "review",
+                     "recommendation": "yes"}])
+    ask = p.db.one("SELECT id FROM messages WHERE kind='ask' ORDER BY id DESC")["id"]
+    p.db.post("in", "yes", chat="web", kind="note", provenance="web-session")
+    out = " ".join(coord.apply(p, [{"type": "pr_approve", "id": ask, "text": url}]))
+    assert "is not a message from the user" in out, "a non-user answer counted as the user's yes"
+    coord.apply(p, [{"type": "ask_user", "text": f"Mark {url} ready now?", "blocking": "review",
+                     "recommendation": "yes"}])
+    ask = p.db.one("SELECT id FROM messages WHERE kind='ask' ORDER BY id DESC")["id"]
+    p.db.post("in", "yes", chat="cli", provenance="cli-legacy")
+    assert "does not count" in " ".join(coord.apply(p, [{"type": "pr_approve", "id": ask, "text": url}]))
+    assert not prguard.approved(p.db, "acme/widgets#7")
+
+
+def test_pr_approve_reads_a_slack_approval_back_from_slack(env, monkeypatch):
+    """A row saying it came from Slack is checked against Slack: a forged one (unknown ts, someone else's
+    message, other words, an old message) is refused; the user's real answer is recorded with its ts."""
+    p = make(env)
+    from ttp import coordinator as coord, prguard, slack as slackmod
+    sl = _fake_slack()
+    monkeypatch.setattr(slackmod, "from_config", lambda cfg: sl)
+    url = "https://github.com/acme/widgets/pull/7"
+
+    def approve(msg, pr=url):
+        return " ".join(coord.apply(p, [{"type": "pr_approve", "id": msg, "text": pr}]))
+
+    def slack_row(text, ts, ref=None):
+        return p.db.post("in", text, chat="slack", channel="slack", ref=ref or ts, provenance="slack", ext_id=ts)
+
+    now = time.time()
+    sl.msgs += [{"ts": f"{now - 50:.6f}", "user": "U2", "text": f"mark {url} ready"},
+                {"ts": f"{now - 40:.6f}", "user": "U1", "text": "demo: what is the status?"},
+                {"ts": f"{now - 30:.6f}", "user": "U1", "text": f"demo: mark {url} ready"}]
+    assert "Slack has no message" in approve(slack_row(f"mark {url} ready", f"{now - 10:.6f}"))
+    assert "not the user's" in approve(slack_row(f"mark {url} ready", f"{now - 50:.6f}"))
+    assert "does not match" in approve(slack_row(f"mark {url} ready", f"{now - 40:.6f}"))
+    assert "no Slack ts" in approve(p.db.post("in", f"mark {url} ready", chat="slack", channel="slack",
+                                              provenance="slack"))
+    monkeypatch.setattr(slackmod, "from_config", lambda cfg: None)
+    real = slack_row(f"mark {url} ready", f"{now - 30:.6f}")
+    assert "not set up" in approve(real)
+    monkeypatch.setattr(slackmod, "from_config", lambda cfg: sl)
+    assert not prguard.approved(p.db, "acme/widgets#7")
+    assert approve(real) == ""
+    rec = p.db.kv(prguard.APPROVALS_KEY)["acme/widgets#7"]
+    assert rec["channel"] == "slack" and rec["external_id"] == f"{now - 30:.6f}" and rec["answer"] == real
+
+    # An ask answered by an old Slack message (a replayed yes) is refused; a reply after it counts.
+    coord.apply(p, [{"type": "ask_user", "text": "Ready acme/widgets#9 for review?", "blocking": "review",
+                     "recommendation": "yes"}])
+    ask = p.db.one("SELECT id, ts FROM messages WHERE kind='ask' ORDER BY id DESC")
+    sl.msgs.append({"ts": f"{now - 20:.6f}", "user": "U1", "text": "yes"})
+    slack_row("yes", f"{now - 20:.6f}")
+    assert "older than the ask" in approve(ask["id"], "acme/widgets#9")
+    later = f"{ask['ts'] + 5:.6f}"
+    sl.msgs.append({"ts": later, "user": "U1", "text": "yes", "thread_ts": f"{now - 30:.6f}"})
+    coord.apply(p, [{"type": "ask_user", "text": "Ready acme/widgets#9 for review now?", "blocking": "review",
+                     "recommendation": "yes"}])
+    ask2 = p.db.one("SELECT id FROM messages WHERE kind='ask' ORDER BY id DESC")["id"]
+    p.db.x("UPDATE messages SET ts=? WHERE id=?", (ask["ts"], ask2))
+    slack_row("yes", later, ref=f"{now - 30:.6f}")
+    assert approve(ask2, "acme/widgets#9") == ""
+    assert p.db.kv(prguard.APPROVALS_KEY)["acme/widgets#9"]["external_id"] == later
+
+
+def test_inbound_messages_carry_the_channel_they_came_in_on(env, tmp_path, monkeypatch):
+    from ttp import cli
+    from ttp.db import DB
+    p = make(env)
+    cli.main(["say", "demo", "--", "hello"])
+    said = p.db.one("SELECT provenance FROM messages WHERE direction='in' ORDER BY id DESC LIMIT 1")
+    assert said["provenance"] == "cli-legacy"
+    d, sl, poll = _slack_daemon(p)
+    sl.msgs.append({"ts": f"{time.time() + 1:.6f}", "user": "U1", "text": "demo: from slack"})
+    poll()
+    got = p.db.one("SELECT provenance, ext_id FROM messages WHERE channel='slack' ORDER BY id DESC LIMIT 1")
+    assert got == {"provenance": "slack", "ext_id": sl.msgs[-1]["ts"]}
+    # A database from before provenance gets the columns, and older inbound messages get theirs.
+    old = tmp_path / "old.db"
+    con = sqlite3.connect(old)
+    con.executescript("CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, "
+                      "direction TEXT NOT NULL, chat TEXT, channel TEXT NOT NULL DEFAULT 'chat', "
+                      "kind TEXT NOT NULL DEFAULT 'user', severity TEXT NOT NULL DEFAULT 'normal', "
+                      "text TEXT NOT NULL, ref TEXT, handled INTEGER NOT NULL DEFAULT 0);"
+                      "INSERT INTO messages(ts,direction,channel,text,ref) VALUES (1,'in','slack','a','1.5'),"
+                      "(2,'in','web','b',NULL),(3,'in','chat','c',NULL),(4,'out','chat','d',NULL);")
+    con.commit()
+    con.close()
+    rows = DB(old).q("SELECT provenance, ext_id FROM messages ORDER BY id")
+    assert rows == [{"provenance": "slack", "ext_id": "1.5"}, {"provenance": "web", "ext_id": None},
+                    {"provenance": "cli-legacy", "ext_id": None}, {"provenance": None, "ext_id": None}]
 
 
 def test_claude_hook_denies_ways_around_the_gh_guard(env, monkeypatch, tmp_path):
@@ -12573,7 +12677,7 @@ def test_pr_watch_alerts_when_a_pr_leaves_draft_without_approval(env, monkeypatc
     ev = p.db.q("SELECT text FROM events WHERE kind='pr_unapproved_ready'")
     assert len(ev) == 1 and new in ev[0]["text"], "the coordinator should hear it once"
     # The user approves it after the fact: the alert clears at once.
-    said = p.db.post("in", f"yes, {new} can stay ready", chat="web")
+    said = p.db.post("in", f"yes, {new} can stay ready", chat="web", provenance="web-session")
     assert coord.apply(p, [{"type": "pr_approve", "id": said, "text": new}]) == []
     assert alerting() == []
     alerts.sweep(p.db)

@@ -470,7 +470,7 @@ class Handler(BaseHTTPRequestHandler):
                 text = (body.get("text") or "").strip()
                 if not text:
                     return self._send(400, {"error": "empty"})
-                mid = db.post("in", text, chat="web", channel="web", kind="user")
+                mid = db.post("in", text, chat="web", channel="web", kind="user", provenance="web")
                 db.x("INSERT OR IGNORE INTO chats(id,created,label,last_active) VALUES('web',?, 'web app', ?)",
                      (time.time(), time.time()))
                 return self._send(200, {"id": mid})
