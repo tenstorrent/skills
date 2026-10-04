@@ -12769,6 +12769,8 @@ def test_claude_hook_scans_only_what_runs(env, monkeypatch, tmp_path):
     monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path))
     (tmp_path / "tests").mkdir()
     (tmp_path / "tests" / "samples.py").write_text("CMDS = ['/usr/bin/gh pr ready 7', 'PATH=/x gh pr ready 7']\n")
+    (tmp_path / "ready.sh").write_text("gh pr ready 7\n")
+    (tmp_path / "view.sh").write_text("gh pr view 7\n")
 
     def denied(cmd):
         out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(tmp_path)})
@@ -12792,7 +12794,9 @@ def test_claude_hook_scans_only_what_runs(env, monkeypatch, tmp_path):
                 f"cat > r.json <<'EOF'\n{{\"s\": \"{prose}\"}}\nEOF\npython3 -c \"import json; json.load(open('r.json'))\"",
                 f"cat > r.json <<'EOF'\n{{\"s\": \"{prose}\"}}\nEOF\ncat r.json | python3 -m json.tool; cat r.json",
                 "PATH=/x gh pr view 7", "PATH=/x gh pr list -R a/b",
-                "PATH=/x gh api graphql -f query='query { viewer { login } }' --jq .data"):
+                "PATH=/x gh api graphql -f query='query { viewer { login } }' --jq .data",
+                # a script run with PATH as the run set it, or one that only reads
+                "bash ready.sh", "PATH=/x bash view.sh", "echo 'PATH=/x' > notes.md; bash ready.sh"):
         assert not denied(cmd), cmd
     for cmd in ("PATH=/opt/x:$PATH gh pr ready 7", "PATH=/opt/x gh pr create -t t",
                 "export PATH=/opt/x\ngh api repos/a/b/pulls/7 -F draft=false",
@@ -12821,7 +12825,10 @@ def test_claude_hook_scans_only_what_runs(env, monkeypatch, tmp_path):
                 "cat > x <<'EOF'\n/usr/bin/gh pr ready 7\nEOF\nmv x y; bash y",
                 "echo '/usr/bin/gh pr ready 7' > a.sh; bash -o errexit a.sh",
                 "echo '/usr/bin/gh pr ready 7' > a.sh; eval \"$(cat a.sh)\"",
-                "echo '/usr/bin/gh pr ready 7' > a.sh; sudo bash a.sh"):
+                "echo '/usr/bin/gh pr ready 7' > a.sh; sudo bash a.sh",
+                # a script run under the command's PATH change
+                "PATH=/x bash ready.sh", "export PATH=/x; sh ./ready.sh", "env -i bash ready.sh",
+                "PATH=/x; source ready.sh"):
         assert denied(cmd), cmd
 
 

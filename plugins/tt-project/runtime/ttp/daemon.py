@@ -2060,9 +2060,10 @@ class Daemon:
     def probe_waiting(self) -> None:
         """A waiting task may name a shell probe (`retry_when`) for the thing it waits on. The probe
         runs here, model-free and in the background. Exit 0 makes the task due at once. When its
-        `retry_after_s` timer runs out while the probe still exits 1 ("not yet"), the task sleeps
-        another `retry_after_s` instead of spending a worker run to find that out. Exit 255 (ssh could
-        not reach the host a remote marker lives on) counts as "not yet" too. A broken probe
+        `retry_after_s` timer runs out while the probe still says "not yet", the task sleeps another
+        `retry_after_s` instead of spending a worker run to find that out. "Not yet" is any exit in
+        NOT_YET_RCS: 1, 75 (a busy `ttp lock`) and 255 (ssh could not reach the host a remote marker
+        lives on). A broken probe
         (any other exit, a timeout, a probe that cannot start) wakes it at its timer so a worker can
         fix the probe, and `waiting.max_hold_s` after the hand-off it wakes whatever the probe says."""
         db, now = self.p.db, time.time()

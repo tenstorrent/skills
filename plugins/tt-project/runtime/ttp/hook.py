@@ -333,15 +333,16 @@ def _gh_writes(commands: str, text: str) -> bool:
     return bool(GUARDED_RE.search(text)) and len(GH_WORD_RE.findall(text)) > len(calls)
 
 
-def draft_bypass(text: str) -> str | None:
-    """Why `text` (a command line or a script it runs) gets around the gh draft guard, else None."""
+def draft_bypass(text: str, path_changed: bool = False) -> str | None:
+    """Why `text` (a command line or a script it runs) gets around the gh draft guard, else None.
+    `path_changed`: the command line that runs this script changes PATH (`PATH=/x bash s.sh`)."""
     full = text
     commands, text = _split(text)
     if PATH_GH_RE.search(text):
         return ("call gh by its name only: the harness's gh checks that a PR leaves draft only with the "
                 "user's recorded approval")
     if (GUARDED_RE.search(text) and ((OTHER_GH_RE.search(text) and GH_WORD_RE.search(text)) or VAR_GH_RE.search(text))
-            or PATH_CHANGE_RE.search(text) and (GH_ARGV_RE.search(text) or _gh_writes(commands, text))):
+            or (path_changed or PATH_CHANGE_RE.search(text)) and (GH_ARGV_RE.search(text) or _gh_writes(commands, text))):
         return ("call gh by its name, with PATH as the run set it: the harness's gh comes first and checks "
                 "that a PR leaves draft only with the user's recorded approval")
     if _api_draft_change(text, full):
@@ -453,16 +454,18 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
     if payload.get("tool_name") != "Bash" or not os.environ.get("TTP_RUN_DIR"):
         return None, None
     cmd = str((payload.get("tool_input") or {}).get("command") or "")
-    segments = _segments(_split(cmd)[0])
+    commands, scan = _split(cmd)
+    segments = _segments(commands)
     why = draft_bypass(cmd)
     if not why and (any(os.path.basename(s[0]) == "ttp" and s[1:2] == ["say"] for s in segments)
                     or (re.search(r"/api/say\b", cmd) and HTTP_CLIENT_RE.search(cmd))):
         # What a run posts as the user could count as the user's approval (pr_approve).
         why = "a run must not post messages as the user; report with `ttp note` and the hand-off"
     if not why:
+        path_changed = bool(PATH_CHANGE_RE.search(scan))
         for f in _scripts(segments, str(payload.get("cwd") or os.getcwd())):
             try:
-                why = draft_bypass(f.read_text(errors="replace"))
+                why = draft_bypass(f.read_text(errors="replace"), path_changed)
             except OSError:
                 continue
             if why:
