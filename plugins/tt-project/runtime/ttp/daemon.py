@@ -210,6 +210,7 @@ class Daemon:
         self._settle_until = 0.0   # monotonic time before which nothing new starts (the host just woke)
         self._sched_sig: tuple[int, int] | None = None   # harness/schedules.json (mtime, size) last checked
         self._sched_read = 0.0   # monotonic time it was last read
+        self._sched_problem: str | None = None   # what was wrong with it, last logged
         self._note_boot()
 
     # lifecycle ------------------------------------------------------------------------------------
@@ -304,8 +305,10 @@ class Daemon:
         if applied:
             log(self.p, f"applied {sched.FILE}")
             self.p.commit_harness([sched.file_path(self.p)], f"schedules: {sched.FILE} applied")
-        if problem:
+        if problem and problem != self._sched_problem:
             log(self.p, problem)
+        self._sched_problem = problem
+        if problem:
             key = "schedules_file:" + hashlib.sha1(problem.encode()).hexdigest()[:10]
             self.alert(key, f"{problem}. The schedules stay as they were until it is fixed.", severity="low",
                        every_s=ALERT_KEEP_S)
