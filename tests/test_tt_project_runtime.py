@@ -13263,6 +13263,41 @@ def test_pr_watch_drops_flags_for_cancelled_tasks_and_prs_it_cannot_read(env, mo
     watchers.watch_prs(d)
     assert p.db.kv(prguard.UNAPPROVED_KEY) == {} and alerting() == []
 
+def test_pr_watch_skips_comments_its_own_runs_marked(env, monkeypatch):
+    """A comment or review this project's runs post on their PR ends with the hidden <!-- ttp --> marker
+    and is not reported back as new review activity. The marker hides only comments from the account
+    that opened the PR; anyone else's comment still counts, marker or not."""
+    from ttp import watchers
+    from ttp.daemon import Daemon
+    p = make(env)
+    url = "https://github.com/acme/widgets/pull/7"
+    p.db.x("INSERT INTO tasks(title,kind,status,pr_url,created) VALUES(?,?,?,?,?)",
+           ("t", "code", "done", url, time.time()))
+    own, other = {"login": "runs"}, {"login": "reviewer"}
+    pr = {"url": url, "state": "OPEN", "title": "t", "isDraft": True, "author": own,
+          "comments": [{"author": other, "body": "Please rename this."}], "reviews": []}
+    monkeypatch.setattr(watchers, "_gh", lambda args, cwd: json.loads(json.dumps(pr)))
+    p.db.set_kv("pr_signatures", {})
+    d = Daemon(p.base)
+
+    def events():
+        return [e["text"] for e in p.db.q("SELECT text FROM events WHERE kind='pr_changed' ORDER BY id")]
+
+    watchers.watch_prs(d)   # baseline
+    assert watchers.pr_signature(pr)["n_human"] == 1
+    pr["comments"].append({"author": own, "body": "Renamed in abc123.\n<!-- ttp -->"})
+    pr["reviews"].append({"author": own, "body": "Looks fine.\n\n<!-- ttp -->", "state": "COMMENTED"})
+    watchers.watch_prs(d)
+    assert events() == []
+    # Someone else's marker does not hide their comment, nor does an unmarked one from the PR's account.
+    pr["comments"].append({"author": other, "body": "Also this. <!-- ttp -->"})
+    watchers.watch_prs(d)
+    assert len(events()) == 1
+    pr["comments"].append({"author": own, "body": "Typed by hand."})
+    watchers.watch_prs(d)
+    assert len(events()) == 2
+
+
 PR_WATCH_GH = '''#!{python}
 import json, os, sys
 a, path = sys.argv[1:], os.environ["FAKE_PRS"]

@@ -12,6 +12,8 @@
 - NEVER edit the change yourself.
 - NEVER mark a PR ready for review: only the user takes a PR out of draft. The harness's `gh`
   refuses it until the user's approval is recorded; never work around it.
+- Any PR comment or review you post ends with the hidden line `<!-- ttp -->`, so the PR watcher
+  does not report it back as someone else's comment.
 
 ## Pushing a reviewed change (only when the spec asks for it)
 

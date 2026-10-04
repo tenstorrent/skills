@@ -56,6 +56,16 @@ def _undo_ready(url: str, cwd: str) -> bool:
     return r.returncode == 0
 
 
+TTP_MARKER = "<!-- ttp -->"
+
+
+def _own(c: dict, pr: dict) -> bool:
+    """A comment or review this project's runs posted: it carries the hidden marker and comes from the
+    account that opened the PR (the runs' gh). A marker from anyone else does not hide their comment."""
+    login = (c.get("author") or {}).get("login", "")
+    return TTP_MARKER in str(c.get("body") or "") and bool(login) and login == (pr.get("author") or {}).get("login")
+
+
 def pr_signature(pr: dict) -> dict:
     checks = pr.get("statusCheckRollup") or []
     states = sorted({(c.get("conclusion") or c.get("state") or c.get("status") or "").upper() for c in checks})
@@ -65,7 +75,7 @@ def pr_signature(pr: dict) -> dict:
     pending = any((c.get("status") or c.get("state") or "").upper() in ("IN_PROGRESS", "QUEUED", "PENDING")
                   for c in checks)
     human = [c for c in (pr.get("comments") or []) + (pr.get("reviews") or [])
-             if not ((c.get("author") or {}).get("login", "").endswith("[bot]"))]
+             if not ((c.get("author") or {}).get("login", "").endswith("[bot]")) and not _own(c, pr)]
     activity = hashlib.sha1(json.dumps([(c.get("author") or {}).get("login", "") + str(c.get("body", ""))[:200]
                                         + str(c.get("state", "")) for c in human]).encode()).hexdigest()[:12]
     return {"state": pr.get("state"), "draft": pr.get("isDraft"), "decision": pr.get("reviewDecision"),
@@ -88,7 +98,7 @@ def watch_prs(daemon) -> str:
     changed = 0
     for t in rows:
         pr = _gh(["pr", "view", t["pr_url"], "--json", "state,isDraft,mergeable,reviewDecision,statusCheckRollup,"
-                  "comments,reviews,url,title"], root)
+                  "comments,reviews,url,title,author"], root)
         if pr is None:
             continue
         sig = pr_signature(pr)

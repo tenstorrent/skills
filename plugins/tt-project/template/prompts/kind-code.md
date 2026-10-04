@@ -42,5 +42,7 @@
 - Description: what improved and why, one line of how, key numbers. Short, for humans.
 - Keep the description and your PR comments current with the latest push.
 - Answer every review comment: fix it, or explain briefly why not.
+- Every PR comment or review you post ends with the hidden line `<!-- ttp -->`, so the PR watcher
+  does not report it back as someone else's comment.
 - NEVER merge, unless the charter lists this repo for auto-merge.
 - Put the PR URL in `result.json` → `pr`.
