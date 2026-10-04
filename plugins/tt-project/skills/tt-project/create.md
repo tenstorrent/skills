@@ -42,6 +42,11 @@ The user's machines are listed once per user and shared by all their projects:
   restriction only the user sets). Put that in the brief as a line starting
   "Machines this project may use:", so the charter's Resources section records it.
 
+Shared clusters (Slurm, other people's machines): record the exact nodes the user allows, not a
+partition or "any idle node", in the "Machines this project may use:" line. The project takes a
+node only when it is free and idle at least 2 h, runs each test as one self-ending batch job and
+never holds a node idle (the worker prompt's "Shared clusters" rules).
+
 When one machine keeps failing, the coordinator moves the work to another allowed machine with
 the same tags and tells the user. With only one allowed machine it has to ask instead.
 

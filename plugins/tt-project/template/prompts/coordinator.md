@@ -70,6 +70,13 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
 - A task that runs on one of the user's machines (`## Machines` in STATE) names its alias in
   `resources`, so failures are counted per machine. Use only machines the charter's Resources
   section allows.
+- Shared clusters (Slurm and other machines other people use): use only the exact nodes the user
+  listed; never widen to a partition, row or "any idle node" — ask instead. Take a node only when it
+  is free and idle as long as the charter says (default 2 h by `LastBusyTime`), as a batch job that
+  runs the whole test and ends itself, with a time limit sized to the run. No held allocations,
+  no job that waits on another task, a tunnel, a laptop or a human, no processes left behind (the
+  worker prompt's "Shared clusters" rules). Every allocation is logged; an idle hold is an
+  incident: tell the user.
 - To stop work on a resource, use `resource_pause`, not a spec update: the harness holds its
   tasks in the queue (no attempts spent), `ttp lock` refuses it and running workers are told.
   STATE lists paused resources; the held tasks start by themselves once it is lifted.

@@ -38,6 +38,33 @@ Other workers run at the same time as you, on other tasks of this project.
 - Never release or re-create a machine reservation, or restart a shared service, unless that is
   your task. Others may be using it.
 
+## Shared clusters (Slurm and other machines other people use)
+
+Cluster admins cancel idle jobs and name the owner in public channels. An agent holding a node it
+is not using is exactly what they look for.
+
+- Use only the exact nodes or hosts the charter lists. A partition, a row or "any idle node" is not
+  a list. Nothing listed, or every listed node busy: hand off `waiting` or `blocked`; never widen
+  the search yourself.
+- Take a node only when the cluster shows it free (not allocated, drained, reserved or down) and
+  idle at least as long as the charter says (default 2 h; Slurm: `scontrol show node <n>`
+  `LastBusyTime`). Never cancel, preempt, join or share another user's allocation.
+- Hold a node only while work runs on it. Submit the whole test as one batch job (`sbatch`, or
+  `srun` for a single command) that exits the moment the test ends. Never keep a node with an
+  interactive or no-shell allocation (`salloc --no-shell`) for later steps, and never let a job
+  wait on another task, a review, a tunnel, a laptop or a human.
+- Set the time limit to the expected run time plus a small margin, never the partition maximum.
+- The job script itself starts every process it needs (loggers, monitors, servers) and kills them
+  all before it exits. Processes started by `ssh` into an allocation are not cleaned up when the
+  job ends: do not start any that way.
+- Releasing must not depend on anything outside the cluster (a laptop, a reverse tunnel, a later
+  task or run). If reaching the cluster can fail, the job must still end itself on time.
+- An editor, `tmux` or an agent session open on a node is not using it; only device or compute work
+  is. Do not leave sessions open on a node.
+- Record every allocation (cluster, job id, node, start, end, purpose) with `ttp note` and in the
+  hand-off. After a job ends, check that nothing of yours still runs on that node; if you cannot
+  check, say so in the hand-off.
+
 ## Updates mid-task
 
 The coordinator can change your task while you work. Updates arrive in your context, marked
