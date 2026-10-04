@@ -4,7 +4,8 @@
 
 - `prs`: every pull request a task opened — draft/ready, CI result, new review activity, approval,
   merge. Emits events straight to the coordinator (they are already specific and actionable).
-  A PR that is out of draft without the user's recorded approval (prguard) also raises a high
+  A PR that is out of draft without the user's recorded approval (prguard) is put back in draft
+  with the daemon's own gh, outside any run, at most once an hour per PR. It also raises a high
   alert, which clears once it is back in draft, closed, merged or approved.
 - `logfile`: tails files named in the payload and screens new lines (rules, then Jev if enabled).
 """
@@ -20,6 +21,7 @@ from pathlib import Path
 from . import prguard
 
 DAY = 86400.0
+UNDO_EVERY_S = 3600.0   # pr-watch puts a PR back in draft at most this often
 
 
 def run_builtin(daemon, name: str, payload: dict) -> str:
@@ -42,6 +44,16 @@ def _gh(args: list[str], cwd: str) -> dict | None:
         return json.loads(out.stdout)
     except ValueError:
         return None
+
+
+def _undo_ready(url: str, cwd: str) -> bool:
+    """Put a PR back in draft. The daemon calls the gh on its own PATH, outside any run."""
+    try:
+        r = subprocess.run(["gh", "pr", "ready", url, "--undo"], capture_output=True, text=True, timeout=60,
+                           cwd=cwd, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0
 
 
 def pr_signature(pr: dict) -> dict:
@@ -95,6 +107,11 @@ def watch_prs(daemon) -> str:
         db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
              (time.time(), "pr", "pr_changed", sev,
               f"PR for task #{t['id']} ({pr.get('url')}): " + "; ".join(what), "queued", t["id"]))
+    # A flag whose task is gone (cancelled, say) or whose PR gh has not read for a day is dropped,
+    # so its alert clears.
+    tasks, now = {t["id"] for t in rows}, time.time()
+    flagged = {k: v for k, v in flagged.items()
+               if v.get("task") in tasks and now - float(v.get("seen") or v.get("since") or 0) < DAY}
     db.set_kv("pr_signatures", seen)
     db.set_kv(prguard.PREDATES_KEY, sorted(before))
     db.set_kv(prguard.UNAPPROVED_KEY, flagged)
@@ -103,9 +120,10 @@ def watch_prs(daemon) -> str:
 
 
 def _check_unapproved(daemon, t: dict, pr: dict, sig: dict, before: set, flagged: dict) -> None:
-    """Flag a PR that is out of draft without the user's recorded approval: a high alert for the
-    user and, the first time, an event for the coordinator. The flag (and the alert) clears once the
-    PR is back in draft, closed, merged or approved."""
+    """Handle a PR that is out of draft without the user's recorded approval: put it back in draft
+    (at most once an hour per PR), raise a high alert for the user and, the first time, queue an
+    event for the coordinator. The flag (and the alert) clears once the PR is back in draft,
+    closed, merged or approved."""
     db, url = daemon.p.db, t["pr_url"]
     key = prguard.pr_key(pr.get("url") or url)
     if not key:
@@ -117,17 +135,33 @@ def _check_unapproved(daemon, t: dict, pr: dict, sig: dict, before: set, flagged
     if url in before or prguard.approved(db, key):
         flagged.pop(key, None)
         return
+    shown, now = pr.get("url") or url, time.time()
+    tried = db.kv(prguard.UNDONE_KEY, {}) or {}
+    undone = False
+    if now - float(tried.get(key, 0)) >= UNDO_EVERY_S:
+        tried = {k: v for k, v in tried.items() if now - float(v) < DAY}
+        tried[key] = now
+        db.set_kv(prguard.UNDONE_KEY, tried)   # counts the attempt before it runs, so a crash does not repeat it
+        undone = _undo_ready(shown, str(daemon.p.root))
+    if undone:
+        said = ("pr-watch put it back in draft (gh pr ready --undo). Find out what took it out of draft. If the "
+                "user approves it, record it with pr_approve before it leaves draft again.")
+        told = "It was put back in draft. If it should be ready for review, say so."
+    else:
+        said = ("pr-watch did not put it back in draft this time (it did less than an hour ago, or gh failed). "
+                "Put it back in draft (gh pr ready --undo) unless the user approves it; on their yes, "
+                "record it with pr_approve.")
+        told = "The coordinator puts it back in draft unless you approve it."
     if key not in flagged:
         db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
-             (time.time(), "pr", "pr_unapproved_ready", "high",
-              f"PR for task #{t['id']} ({pr.get('url') or url}) is out of draft, but the user's approval is not "
-              "on record. Put it back in draft (gh pr ready --undo) unless the user approves it; on their yes, "
-              "record it with pr_approve.", "queued", t["id"]))
-    flagged[key] = {"task": t["id"], "url": pr.get("url") or url, "since": flagged.get(key, {}).get("since")
-                    or time.time()}
+             (now, "pr", "pr_unapproved_ready", "high",
+              f"PR for task #{t['id']} ({shown}) is out of draft, but the user's approval is not on record. "
+              + said, "queued", t["id"]))
+    flagged[key] = {"task": t["id"], "url": shown, "since": flagged.get(key, {}).get("since") or now,
+                    "seen": now, **({"undone": now} if undone else {})}
     daemon.alert(f"{prguard.UNAPPROVED_ALERT}:{key}",
-                 f"{pr.get('url') or url} (task #{t['id']}) left draft without your recorded approval. "
-                 "The coordinator puts it back in draft unless you approve it.", "high", every_s=DAY)
+                 f"{shown} (task #{t['id']}) left draft without your recorded approval. " + told, "high",
+                 every_s=DAY)
 
 
 def watch_logs(daemon, payload: dict) -> str:

@@ -12264,6 +12264,7 @@ def test_pr_watch_alerts_when_a_pr_leaves_draft_without_approval(env, monkeypatc
     state = {old: {"isDraft": False}, new: {"isDraft": True}}
     monkeypatch.setattr(watchers, "_gh", lambda args, cwd: {"url": args[2], "state": "OPEN", "title": "t",
                                                             **state[args[2]]})
+    monkeypatch.setattr(watchers, "_undo_ready", lambda url, cwd: False)   # gh could not put it back
     # PRs out of draft before this check existed are not flagged.
     p.db.set_kv("pr_signatures", {old: {"state": "OPEN", "draft": False}})
     d = Daemon(p.base)
@@ -12514,3 +12515,123 @@ def test_a_kept_tunnel_the_service_manager_refuses_is_named_without_touching_the
     out = capsys.readouterr().out
     assert e.value.code == weblink.UNVERIFIED and "#token=" not in out, out
     assert "NOT AVAILABLE (tunnel)" in out and "did not start" in out and "no user bus" in out, out
+
+
+def test_pr_watch_drops_flags_for_cancelled_tasks_and_prs_it_cannot_read(env, monkeypatch):
+    """A flagged PR whose task was cancelled, or that gh has not been able to read for a day, no longer
+    holds its high alert."""
+    from ttp import alerts, prguard, watchers
+    from ttp.daemon import Daemon
+    p = make(env)
+    a, b = "https://github.com/acme/widgets/pull/7", "https://github.com/acme/widgets/pull/8"
+    ids = [p.db.x("INSERT INTO tasks(title,kind,status,pr_url,created) VALUES(?,?,?,?,?)",
+                  ("t", "code", "done", url, time.time())) for url in (a, b)]
+    readable = {a: True, b: True}
+    monkeypatch.setattr(watchers, "_gh", lambda args, cwd: {"url": args[2], "state": "OPEN", "title": "t",
+                                                            "isDraft": False} if readable[args[2]] else None)
+    monkeypatch.setattr(watchers, "_undo_ready", lambda url, cwd: False)
+    p.db.set_kv("pr_signatures", {})
+    d = Daemon(p.base)
+
+    def alerting():
+        return sorted(m["ref"] for m in p.db.q("SELECT * FROM messages WHERE kind='alert' AND ref LIKE 'pr-ready:%'")
+                      if alerts.active(p.db, m["ref"], m["ts"], time.time()))
+
+    watchers.watch_prs(d)
+    assert alerting() == ["pr-ready:acme/widgets#7", "pr-ready:acme/widgets#8"]
+    # #7's task is cancelled: its flag goes on the next pass.
+    p.db.x("UPDATE tasks SET status='cancelled' WHERE id=?", (ids[0],))
+    # gh cannot read #8: the flag stays for a day, then goes.
+    readable[b] = False
+    watchers.watch_prs(d)
+    assert set(p.db.kv(prguard.UNAPPROVED_KEY)) == {"acme/widgets#8"}
+    assert alerting() == ["pr-ready:acme/widgets#8"]
+    flags = p.db.kv(prguard.UNAPPROVED_KEY)
+    flags["acme/widgets#8"]["seen"] -= watchers.DAY + 1
+    p.db.set_kv(prguard.UNAPPROVED_KEY, flags)
+    watchers.watch_prs(d)
+    assert p.db.kv(prguard.UNAPPROVED_KEY) == {} and alerting() == []
+
+PR_WATCH_GH = '''#!{python}
+import json, os, sys
+a, path = sys.argv[1:], os.environ["FAKE_PRS"]
+prs = json.load(open(path))
+with open(os.environ["FAKE_GH_LOG"], "a") as f:
+    f.write(" ".join(a) + "\\n")
+if a[:2] == ["pr", "view"]:
+    print(json.dumps({{"url": a[2], "state": "OPEN", "title": "t", "isDraft": prs[a[2]]}}))
+elif a[:2] == ["pr", "ready"] and "--undo" in a and not os.environ.get("FAKE_GH_FAIL"):
+    prs[a[2]] = True
+    json.dump(prs, open(path, "w"))
+else:
+    sys.exit(1)
+'''
+
+
+def test_pr_watch_puts_an_unapproved_ready_pr_back_in_draft(env, tmp_path, monkeypatch):
+    """A run took a PR out of draft around the harness's gh. The model-free pr-watch puts it back with
+    the daemon's own gh, at most once an hour per PR, and still alerts the user. PRs that were out
+    of draft before the guard, and approved ones, are left alone."""
+    from ttp import alerts, prguard, watchers
+    from ttp.daemon import Daemon
+    p = make(env)
+    old, new, ok = (f"https://github.com/acme/widgets/pull/{n}" for n in (3, 7, 9))
+    for url in (old, new, ok):
+        p.db.x("INSERT INTO tasks(title,kind,status,pr_url,created) VALUES(?,?,?,?,?)",
+               ("t", "code", "done", url, time.time()))
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    (fake / "gh").write_text(PR_WATCH_GH.format(python=sys.executable))
+    (fake / "gh").chmod(0o755)
+    prs, log = tmp_path / "prs.json", tmp_path / "gh.log"
+    prs.write_text(json.dumps({old: False, new: True, ok: False}))
+    log.write_text("")
+    monkeypatch.setenv("PATH", f"{fake}:{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_PRS", str(prs))
+    monkeypatch.setenv("FAKE_GH_LOG", str(log))
+    p.db.set_kv("pr_signatures", {old: {"state": "OPEN", "draft": False}})   # #3 predates the guard
+    p.db.set_kv(prguard.APPROVALS_KEY, {"acme/widgets#9": {"source": 1, "answer": 1, "ts": time.time()}})
+    d = Daemon(p.base)
+
+    def undos():
+        ran = [ln for ln in log.read_text().splitlines() if ln.startswith("pr ready")]
+        log.write_text("")
+        return ran
+
+    def leak():
+        prs.write_text(json.dumps({**json.loads(prs.read_text()), new: False}))
+
+    watchers.watch_prs(d)
+    assert undos() == [] and not p.db.q("SELECT id FROM events WHERE kind='pr_unapproved_ready'")
+    leak()
+    watchers.watch_prs(d)
+    assert undos() == [f"pr ready {new} --undo"], "only the unapproved PR that left draft after the guard"
+    assert json.loads(prs.read_text()) == {old: False, new: True, ok: False}
+    alert = p.db.one("SELECT * FROM messages WHERE kind='alert' AND ref='pr-ready:acme/widgets#7'")
+    assert alert["severity"] == "high" and new in alert["text"] and "put back in draft" in alert["text"]
+    ev = p.db.q("SELECT text, severity FROM events WHERE kind='pr_unapproved_ready'")
+    assert len(ev) == 1 and ev[0]["severity"] == "high" and "put it back in draft" in ev[0]["text"]
+    # Back in draft: the next pass clears the flag and the alert.
+    watchers.watch_prs(d)
+    assert p.db.kv(prguard.UNAPPROVED_KEY) == {} and undos() == []
+    alerts.sweep(p.db)
+    assert p.db.one("SELECT cleared FROM alerts WHERE key='pr-ready:acme/widgets#7'")["cleared"]
+    # Out of draft again within the hour: no second undo, and the coordinator is told to do it.
+    leak()
+    watchers.watch_prs(d)
+    watchers.watch_prs(d)
+    assert undos() == [] and set(p.db.kv(prguard.UNAPPROVED_KEY)) == {"acme/widgets#7"}
+    ev = p.db.q("SELECT text FROM events WHERE kind='pr_unapproved_ready' ORDER BY id")
+    assert len(ev) == 2 and "gh pr ready --undo" in ev[1]["text"] and "pr_approve" in ev[1]["text"]
+    # An hour on, it is put back again. A gh failure counts as the attempt too.
+    tried = p.db.kv(prguard.UNDONE_KEY)
+    p.db.set_kv(prguard.UNDONE_KEY, {k: v - watchers.UNDO_EVERY_S for k, v in tried.items()})
+    monkeypatch.setenv("FAKE_GH_FAIL", "1")
+    watchers.watch_prs(d)
+    assert undos() == [f"pr ready {new} --undo"] and json.loads(prs.read_text())[new] is False
+    watchers.watch_prs(d)
+    assert undos() == []
+    monkeypatch.delenv("FAKE_GH_FAIL")
+    p.db.set_kv(prguard.UNDONE_KEY, {k: v - watchers.UNDO_EVERY_S for k, v in p.db.kv(prguard.UNDONE_KEY).items()})
+    watchers.watch_prs(d)
+    assert undos() == [f"pr ready {new} --undo"] and json.loads(prs.read_text())[new] is True
