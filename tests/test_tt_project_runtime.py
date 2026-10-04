@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import secrets
 import shlex
 import os
 import pathlib
@@ -12128,11 +12129,14 @@ def test_config_problems_flag_unknown_keys_and_bad_checks(env, capsys):
     p.set_config("budget.max_pace_hold_s", 0)      # deprecated and ignored, but no alert
     p.set_config("budget.estimate_weights", {"output": 5})
     p.set_config("jev.url", "http://127.0.0.1:1")
-    p.set_config("delivery.push_checks", ["Make sure the tests pass"])
+    # Prose, not a command. Its first word must exist on no filesystem: a case-insensitive one
+    # (macOS APFS) finds `make` for "Make".
+    prose = f"Ensure{secrets.token_hex(6)} the tests pass"
+    p.set_config("delivery.push_checks", [prose])
     for key in ("budget.max_pace_hold_s", "jev.url", "budget.estimate_weights"):
         assert unknown_key_hint(key) is None, key
     probs = config_problems(p.raw_config())
-    assert "unknown key budget.made_up_knob" in probs[0] and "'Make' is not a program" in probs[1]
+    assert "unknown key budget.made_up_knob" in probs[0] and f"{prose.split()[0]!r} is not a program" in probs[1]
     assert len(probs) == 2   # name, id, root and other identity keys are known
     from ttp import cli
     with pytest.raises(SystemExit):
@@ -13368,3 +13372,53 @@ def test_setup_warns_when_installed_copy_is_older_than_checkout(tmp_path, monkey
     (plugin / "runtime" / "ttp" / "__init__.py").write_text('__version__ = "9.9.9"\n')
     monkeypatch.setattr(cli, "RUNTIME", plugin / "runtime")
     assert cli.stale_install_warning(sub) == ""
+
+
+def test_web_api_paths_use_their_own_connection_after_a_coordinator_turn(env):
+    """Every API path runs in a request thread, and the helpers it calls must read through that
+    thread's connection: the daemon's p.db belongs to the main thread, and SQLite refuses it
+    anywhere else. The release line used p.db to find the open upgrade task, so the page's data
+    failed whenever an upgrade waited on that task."""
+    p = make(env)
+    from ttp import release, web
+    p.db.set_kv("last_coordinator_turn", time.time() - 600)    # opens p.db in this thread
+    p.db.set_kv(release.KV_RELEASE, {"installed": "9.9.9 (abc1234)", "current": "0.0.1 (def5678)",
+                                     "key": "9.9.9 abc1234", "newer": True})
+    upgrade = p.db.add_task(release.UPGRADE_TASK_TITLE, "merge it", kind="harness", origin="user")
+    other = p.db.add_task("docs", "write them")
+    port = web.free_port(19760)
+    p.set_config("web.port", port)
+
+    class Stub:
+        pass
+    stub = Stub()
+    stub.p = p
+    threading.Thread(target=web.serve, args=(stub,), daemon=True).start()
+    base, tok = f"http://127.0.0.1:{port}", web.token(p)
+    for _ in range(50):
+        try:
+            urllib.request.urlopen(base + "/", timeout=1)
+            break
+        except OSError:
+            time.sleep(0.1)
+
+    def call(path, body=None):
+        req = urllib.request.Request(base + path, headers={"X-TTP-Token": tok, "Content-Type": "application/json"},
+                                     method="POST" if body is not None else "GET",
+                                     data=json.dumps(body).encode() if body is not None else None)
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode(errors="replace")
+
+    code, data = call("/api/state")
+    assert code == 200, data
+    assert f"the merge needs harness task #{upgrade}" in data["health"]["release"]
+    assert call("/api/messages")[0] == 200
+    assert call("/api/pause", {"resource": "board", "paused": True, "reason": "check"})[0] == 200
+    assert call("/api/pause", {"resource": "board", "paused": False})[0] == 200
+    assert call("/api/schedule/pr-watch", {"enabled": False})[0] == 200
+    assert call(f"/api/task/{other}", {"status": "cancelled"})[0] == 200
+    assert call("/api/config", {"key": "budget.daily_usd", "value": 7})[0] == 200
+    assert p.db.task(other)["status"] == "cancelled" and p.config()["budget"]["daily_usd"] == 7

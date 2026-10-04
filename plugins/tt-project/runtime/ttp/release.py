@@ -138,9 +138,10 @@ def _taken(path: Path) -> bool:
         return False
 
 
-def open_upgrade_task(p: Project) -> int | None:
-    t = p.db.one("SELECT id FROM tasks WHERE kind='harness' AND title=? AND status NOT IN "
-                 "('done','failed','cancelled') ORDER BY id LIMIT 1", (UPGRADE_TASK_TITLE,))
+def open_upgrade_task(p: Project, db=None) -> int | None:
+    # `db` is the caller's own connection when it runs on another thread (the web app).
+    t = (db or p.db).one("SELECT id FROM tasks WHERE kind='harness' AND title=? AND status NOT IN "
+                         "('done','failed','cancelled') ORDER BY id LIMIT 1", (UPGRADE_TASK_TITLE,))
     return int(t["id"]) if t else None
 
 
@@ -198,7 +199,7 @@ def line(p: Project, db, cfg: dict) -> str:
         return text + " (same version from another commit: not applied automatically)"
     if not (cfg.get("upgrade") or {}).get("auto", True):
         return text + f" (upgrade.auto is off: `ttp upgrade {p.name}` applies it)"
-    tid = open_upgrade_task(p)
+    tid = open_upgrade_task(p, db)
     if tid:
         return text + f" (the merge needs harness task #{tid})"
     rec = db.kv(KV_AUTO) or {}
