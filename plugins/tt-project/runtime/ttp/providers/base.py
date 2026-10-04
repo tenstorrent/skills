@@ -140,6 +140,11 @@ class Provider:
         metadata); [] when the agent has no write sandbox."""
         return []
 
+    def write_fence(self) -> str:
+        """Why this provider's workers can write outside their writable dirs, as built today; ""
+        when an OS sandbox fences them. Shown by `ttp doctor`; changes nothing."""
+        return "no write sandbox"
+
     def compact_env(self, tokens: int) -> dict[str, str]:
         """Environment that makes the agent compact its context near `tokens`; {} when it has no
         such switch or `tokens` is 0."""

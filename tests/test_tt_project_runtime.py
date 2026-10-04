@@ -1919,6 +1919,26 @@ def test_an_unknown_mcp_server_is_named_and_the_run_still_starts(env, monkeypatc
                             "value": "bad name!"}]), "a malformed name must be rejected"
 
 
+def test_doctor_names_unfenced_providers(env, monkeypatch, capsys):
+    p = make(env)
+    from ttp import cli
+    from ttp.providers import base, claude, codex, cursor
+    monkeypatch.setattr(cli, "need", lambda *a: p)
+    monkeypatch.setattr(base.Provider, "available", lambda self: True)
+    monkeypatch.setattr(base.Provider, "binary", lambda self: "/bin/" + self.name)
+    monkeypatch.setattr(claude.sys, "platform", "linux")
+    monkeypatch.setattr(claude, "find_binary", lambda name: None if name == "bwrap" else "/usr/bin/" + name)
+    assert codex.Codex().write_fence() == "", "workspace-write is a write fence"
+    cli.cmd_doctor(types.SimpleNamespace(name="demo"))
+    line = next(l for l in capsys.readouterr().out.splitlines() if l.startswith("unfenced providers"))
+    assert "claude (bypassPermissions without the Bash sandbox; the sandbox would need bwrap)" in line
+    assert "cursor (--force without --sandbox enabled)" in line
+    assert "codex" not in line and "fake" not in line
+    monkeypatch.setattr(base.Provider, "available", lambda self: False)
+    cli.cmd_doctor(types.SimpleNamespace(name="demo"))
+    assert "unfenced providers" not in capsys.readouterr().out, "uninstalled providers are not named"
+
+
 def test_the_runner_removes_private_files_when_the_agent_exits(env, tmp_path):
     run_dir = tmp_path / "run"
     run_dir.mkdir()

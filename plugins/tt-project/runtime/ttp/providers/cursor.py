@@ -6,7 +6,15 @@ are read when the build reports them; cost is estimated from the project's price
 
 Builds that offer `--output-format stream-json` stream one event per line, ending with the same
 result object `json` prints alone. Streaming keeps the output file growing while the agent works,
-so the runner's stall guard sees progress and its budget check sees spend before the run ends."""
+so the runner's stall guard sees progress and its budget check sees spend before the run ends.
+
+Write fence (from the docs; the CLI was not installed where this was probed). Workers run with
+`--force` and without `--sandbox enabled`, so they are unfenced today.
+
+| Question | Linux | macOS |
+| :- | :- | :- |
+| Fence writes to a list of dirs | yes with `--sandbox enabled`: Landlock + seccomp, kernel 6.2+ with unprivileged user namespaces; extra dirs in `.cursor/sandbox.json` `additionalReadwritePaths` | yes, Seatbelt |
+| Unix socket under `state/` from the sandbox | not documented | not documented |"""
 from __future__ import annotations
 
 import json
@@ -45,6 +53,9 @@ class Cursor(Provider):
         elif re.search(r"--mode\b[\s\S]{0,400}?\bask\b", help_text):   # its choices may wrap
             argv += ["--mode", "ask"]   # answers only: no edits and no commands
         return argv, {}
+
+    def write_fence(self) -> str:
+        return "--force without --sandbox enabled"
 
     def resume_args(self, session_id: str) -> list[str]:
         # `--resume [chatId]` continues a chat; the id is the session_id every stream event carries.

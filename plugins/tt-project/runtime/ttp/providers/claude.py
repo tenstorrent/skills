@@ -2,7 +2,22 @@
 # SPDX-License-Identifier: Apache-2.0
 """Claude Code (`claude -p`). Every run streams JSON: a `rate_limit_event` carrying the account's
 plan windows (utilization as a 0..1 fraction plus reset times), per-message usage, and a final
-`result` with the reported cost, the last message and any schema-validated output."""
+`result` with the reported cost, the last message and any schema-validated output.
+
+Write fence (probed on CLI 2.1.285; Linux measured, macOS from the docs). Workers run with
+bypassPermissions and no OS sandbox, so they are unfenced today.
+
+| Question | Linux | macOS |
+| :- | :- | :- |
+| Fence Bash writes to a list of dirs | yes, `sandbox.enabled` + `sandbox.filesystem.allowWrite`; needs `bubblewrap` and `socat` | yes, Seatbelt, nothing to install |
+| Sandbox missing a dependency | runs unsandboxed with a warning (measured); `sandbox.failIfUnavailable` refuses to start instead (measured, exit 1) | n/a |
+| `allowUnsandboxedCommands: false` | drops the `dangerouslyDisableSandbox` retry (docs); no help when the sandbox could not start (measured) | same (docs) |
+| Edit deny rules under bypassPermissions | hold for Write/Edit and plain shell redirects and `cp` (measured), but a write from `python3 -c` passed (measured): a check, not a fence | same rules (docs) |
+| Unix socket under `state/` from the sandbox | allowed unless the optional seccomp filter is installed, then `network.allowAllUnixSockets` (docs) | only paths in `network.allowUnixSockets` (docs) |
+
+File tools (Read, Edit, Write) run outside the sandbox and follow permission rules only, so a fence
+needs both the sandbox and Edit deny rules. `--setting-sources` drops a source's sandbox and Edit
+entries; `--settings` keeps them."""
 from __future__ import annotations
 
 import json
@@ -15,7 +30,7 @@ from pathlib import Path
 
 from . import register
 from ..budget import Window
-from .base import AUTH_RE, LIMIT_RE, Provider, RunUsage
+from .base import AUTH_RE, LIMIT_RE, Provider, RunUsage, find_binary
 
 EXCLUDE_DYNAMIC = "--exclude-dynamic-system-prompt-sections"
 APPEND_SYSTEM = "--append-system-prompt"
@@ -115,6 +130,13 @@ class Claude(Provider):
         if self.supports(APPEND_SYSTEM):
             return [APPEND_SYSTEM, Path(path).read_text()]
         return []
+
+    def write_fence(self) -> str:
+        gap = "bypassPermissions without the Bash sandbox"
+        if sys.platform.startswith("linux"):
+            missing = [b for b in ("bwrap", "socat") if not find_binary(b)]
+            gap += f"; the sandbox would need {' and '.join(missing)}" if missing else ""
+        return gap
 
     def isolation_args(self) -> list[str]:
         # Flag settings (the harness hook) and --plugin-dir load whatever the sources are.

@@ -3,7 +3,17 @@
 """OpenAI Codex CLI (`codex exec --json`). Codex reports tokens but no cost, has no budget flag,
 and exposes plan windows through `codex app-server` (`account/rateLimits/read`, no model tokens).
 Cost is therefore an estimate from a price table the project can edit. Tokens arrive only when a
-turn completes, so the runner's mid-run budget check sees completed turns only."""
+turn completes, so the runner's mid-run budget check sees completed turns only.
+
+Write fence (from the docs; Codex was not installed where this was probed). Workers run in
+`workspace-write`, so they are fenced: they write their cwd, temp dirs and `writable_args` roots.
+
+| Question | Linux | macOS |
+| :- | :- | :- |
+| Fence writes to a list of dirs | yes, `sandbox_workspace_write.writable_roots`; uses `bwrap` from PATH, else a bundled helper that needs unprivileged user namespaces (startup warning if it can't) | yes, Seatbelt |
+| Unix socket under `state/` from the sandbox | blocked by default; allow it with `permissions.<name>.network.unix_sockets` or `dangerously_allow_all_unix_sockets` | same |
+
+Reads are not fenced, and the roots today include all of the project's state."""
 from __future__ import annotations
 
 import hashlib
@@ -91,6 +101,9 @@ class Codex(Provider):
         # workspace-write only lets the worker write its cwd; result.json, `ttp note`, `ttp lock`
         # and commits in a worktree (whose git metadata lives in the main repository) are elsewhere.
         return ["-c", "sandbox_workspace_write.writable_roots=" + json.dumps([str(d) for d in dirs])] if dirs else []
+
+    def write_fence(self) -> str:
+        return ""   # workspace-write: Seatbelt on macOS, bubblewrap or the bundled helper on Linux
 
     def _events(self, output_path: Path):
         try:
