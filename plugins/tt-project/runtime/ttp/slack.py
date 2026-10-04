@@ -122,8 +122,14 @@ class Slack:
 
     def message(self, ts: str) -> dict | None:
         """The DM message with this ts, top-level or in a thread, as Slack has it now; None if none."""
-        for m in self.call("conversations.replies", channel=self.dm_channel(), ts=ts, oldest=ts, latest=ts,
-                           inclusive=True, limit=10).get("messages", []):
+        try:
+            got = self.call("conversations.replies", channel=self.dm_channel(), ts=ts, oldest=ts, latest=ts,
+                            inclusive=True, limit=10)
+        except SlackError as e:
+            if e.code in ("thread_not_found", "message_not_found"):
+                return None
+            raise
+        for m in got.get("messages", []):
             if m.get("ts") == ts:
                 return m
         return None

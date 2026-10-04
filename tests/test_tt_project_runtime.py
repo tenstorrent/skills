@@ -12470,6 +12470,13 @@ def test_pr_approve_reads_a_slack_approval_back_from_slack(env, monkeypatch):
     p = make(env)
     from ttp import coordinator as coord, prguard, slack as slackmod
     sl = _fake_slack()
+    fake_call = sl.call
+
+    def call(method, **kw):   # as Slack does for a ts it has no message for
+        if method == "conversations.replies" and not any(m["ts"] == kw["ts"] for m in sl.msgs):
+            raise slackmod.SlackError(f"{method}: thread_not_found", method, "thread_not_found")
+        return fake_call(method, **kw)
+    sl.call = call
     monkeypatch.setattr(slackmod, "from_config", lambda cfg: sl)
     url = "https://github.com/acme/widgets/pull/7"
 
