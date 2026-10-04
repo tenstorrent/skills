@@ -2003,7 +2003,10 @@ class Daemon:
                      (now, "daemon", "resource_trouble", "normal",
                       f"Resource {text}. Route around it: move its tasks to a healthy machine the charter "
                       f"allows (task_update `resources`), record the decision and notify the user; ask "
-                      f"(blocking access) only if the charter allows no alternative.", "queued"))
+                      f"(blocking access) only if the charter allows no alternative."
+                      if name in known else
+                      f"Resource {text}. It is a lock, not a machine, so there is nothing to route around: "
+                      f"find why its tasks fail and fix that.", "queued"))
             live = {n: told.get(n, now) for n in (*told, *new) if (seen.get(n) or {}).get("failures")}
             if live != told:
                 db.set_kv("resource_trouble", live)

@@ -302,8 +302,16 @@ def stats(db, now: float | None = None) -> dict[str, dict]:
                   "WHERE e.ts>? AND e.source LIKE 'task:%' "
                   "AND e.kind IN ('task_failed','task_blocked','task_waiting')", (since,)):
         bump(_labels(e), "waits" if e["kind"] == "task_waiting" else "handoffs")
-    for b in db.boots(since):
-        bump({str(h).split(":", 1)[0] for h in b.get("held") or [] if ":" in str(h)}, "reboots")
+    # Reboots count only against machines on the list (a lock such as push:<branch> is not a
+    # machine), and only when most of the host's reboots happened while it was held: a host that
+    # reboots on its own says nothing about what it held at the time.
+    boots = db.boots(since)
+    known = set(load())
+    held: dict[str, int] = {}
+    for b in boots:
+        for n in {str(h).split(":", 1)[0] for h in b.get("held") or [] if ":" in str(h)} & known:
+            held[n] = held.get(n, 0) + 1
+    bump([n for n, k in held.items() for _ in range(k) if 2 * k > len(boots)], "reboots")
     for s in stats.values():
         s["failures"] = s["runs"] + s["handoffs"] + s["reboots"]
     return stats

@@ -9208,6 +9208,24 @@ def test_the_digest_lists_machines_and_resources_that_keep_failing(env):
     assert "no other machine shares its tags" in coord.digest(p, {}, [], []), "a paused machine was offered"
 
 
+def test_reboots_count_only_for_listed_machines_held_through_most_reboots(env):
+    p = make(env)
+    from ttp import machines as mm
+    mm.add("box-a", tags="device")
+    boot = lambda held: p.db.x("INSERT INTO events(ts,source,kind,severity,text,data,status) VALUES(?,?,?,?,?,?,?)",
+                               (time.time(), "host", "boot", "normal", "reboot", json.dumps({"held": held}), "handled"))
+    for _ in range(2):
+        boot(["push: task #1 (run 2) since 10:02", "box-a: task #1 (run 2) since 10:02"])
+    for _ in range(9):
+        boot([])
+    seen = mm.stats(p.db)
+    assert "push" not in seen, "a logical lock is not a machine"
+    assert "box-a" not in seen, "2 of 11 reboots while held is the host's own rate"
+    for _ in range(9):
+        boot(["box-a: task #1 (run 2) since 10:02"])
+    assert mm.stats(p.db)["box-a"]["reboots"] == 11 and "push" not in mm.stats(p.db)
+
+
 def test_a_failing_resource_starts_one_coordinator_turn_per_episode(env):
     p = make(env)
     from ttp import machines as mm
