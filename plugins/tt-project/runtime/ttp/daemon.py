@@ -362,6 +362,7 @@ class Daemon:
         self.update_gates()
         coord.expire_asks(self.p, hold=any(g.level == "red" for g in self.gates.values()))
         scr.expire_mutes(self.p.db)
+        scr.close_watcher_issues(self.p.db, quiet_s=scr.WATCHER_QUIET_CLOSE_S)
         settling = self.settling()
         for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.read_upstream, self.retry_rejected,
                      self.maybe_coordinate, self.probe_waiting, self.dispatch, self.deliver_outbound):
@@ -1335,6 +1336,10 @@ class Daemon:
         text = (out.stdout or "").strip()
         if out.returncode not in (0, 1) and not text:
             text = f"watcher command failed rc={out.returncode}: {(out.stderr or '')[-500:]}"
+        if not text:
+            # Nothing to report: what this watcher reported before is over. A recurrence reopens it.
+            scr.close_watcher_issues(self.p.db, f"watcher:{s['name']}", why=scr.CLEAN_RUN_WHY)
+            return "ok (0 observations)"
         n = 0
         for obs in _observations(text):
             self.observe(f"watcher:{s['name']}", obs.get("text", ""), obs.get("severity"),

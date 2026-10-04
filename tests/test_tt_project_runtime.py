@@ -457,6 +457,109 @@ def test_command_watcher_repeats_wake_the_coordinator(env, monkeypatch):
     assert wakes() == 3
 
 
+def test_watcher_conditions_keep_one_issue_each_and_close_when_cleared(env):
+    p = make(env)
+    from ttp import screen as scr
+    cfg = p.config()
+
+    def see(text, sev="high"):
+        return scr.screen(p.db, cfg, "watcher:hw", text, sev, rewake_after_s=6 * 3600)
+
+    def issue(title_part):
+        return p.db.one("SELECT * FROM issues WHERE title LIKE ?", (f"%{title_part}%",))
+
+    first = see("broker box03 [abc1234 1.0.0]: hold x2 (device recovery x2); chip drop (chip 8,9,10); "
+                "failed health checks x3")
+    assert first.wake
+    # The same conditions with new counts, chip numbers and version: the same three issues, no wake.
+    again = see("broker box03 [def5678 1.0.1]: hold (device recovery); chip drop (chip 9); failed health checks x5")
+    assert not again.wake and again.fingerprint == first.fingerprint
+    rows = p.db.q("SELECT count, status FROM issues WHERE source='watcher:hw'")
+    assert len(rows) == 3 and {(r["count"], r["status"]) for r in rows} == {(2, "open")}
+    assert "x5" in issue("failed health checks")["title"]   # the title shows the latest sighting
+    # Digits inside identifiers still tell subjects apart.
+    assert see("broker box01 [abc1234 1.0.0]: chip drop (chip 1)").wake
+    # "now X" opens, "cleared: X" closes the same issue without waking, and "still: X" is the same issue.
+    assert see("broker box03 [def5678 1.0.1]: now unreachable over ssh").wake
+    assert not see("broker box03 [def5678 1.0.1]: still: unreachable over ssh").wake
+    gone = see("broker box03 [def5678 1.0.1]: cleared: unreachable over ssh")
+    row = issue("unreachable over ssh")
+    assert not gone.wake and row["status"] == "fixed" and row["cleared_why"] == scr.CLEARED_WHY and row["closed"]
+    # A recurrence reopens it; it wakes only at or above the wake floor.
+    assert not see("broker box03 [def5678 1.0.1]: now unreachable over ssh", "info").wake
+    assert issue("unreachable over ssh")["status"] == "ignored"
+    see("broker box03 [def5678 1.0.1]: cleared: unreachable over ssh")   # an ignored issue is left as it is
+    assert issue("unreachable over ssh")["status"] == "ignored"
+    # Kept quiet at info, then rated high by the watcher: wakes once, then is a known issue again.
+    up = see("broker box03 [def5678 1.0.1]: still: unreachable over ssh")
+    assert up.wake and up.reason == "now high" and issue("unreachable over ssh")["status"] == "open"
+    assert not see("broker box03 [def5678 1.0.1]: still: unreachable over ssh").wake
+    see("broker box03 [def5678 1.0.1]: cleared: unreachable over ssh")
+    back = see("broker box03 [def5678 1.0.1]: now unreachable over ssh")
+    assert back.wake and back.reason == "regressed after fix"
+    assert len(p.db.q("SELECT id FROM issues WHERE source='watcher:hw'")) == 5
+    assert not p.db.q("SELECT id FROM alerts") and not p.db.q("SELECT id FROM messages WHERE direction='out'")
+
+
+def test_watcher_issues_close_when_quiet_for_a_day_or_after_a_clean_run(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dm
+    from ttp import screen as scr
+    out = {"stdout": ""}
+    monkeypatch.setattr(dm.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, out["stdout"], ""))
+    d = dm.Daemon(p.base)
+    cfg = p.config()
+
+    def wakes():
+        return p.db.one("SELECT COUNT(*) AS n FROM events WHERE kind='observation'")["n"]
+
+    def status(source):
+        return p.db.one("SELECT status, cleared_why FROM issues WHERE source=?", (source,))
+
+    for src in ("watcher:old", "watcher:new", "log:app"):
+        scr.screen(p.db, cfg, src, "box-a: power-cycle failed", "high")
+    p.db.x("UPDATE issues SET last_seen=? WHERE source IN ('watcher:old', 'log:app')", (time.time() - 25 * 3600,))
+    d.tick()
+    assert status("watcher:old") == {"status": "fixed", "cleared_why": scr.QUIET_WHY}
+    assert status("watcher:new")["status"] == "open" and status("log:app")["status"] == "open"
+    # A run that reports nothing closes that watcher's open issues; a recurrence shows as a regression.
+    out["stdout"] = json.dumps({"text": "box-a: power-cycle failed", "severity": "high"})
+    d._run_command_watcher({"name": "hw"}, {"command": "x"})
+    d._run_command_watcher({"name": "hw"}, {"command": "x"})
+    assert wakes() == 1
+    out["stdout"] = ""
+    assert d._run_command_watcher({"name": "hw"}, {"command": "x"}) == "ok (0 observations)"
+    assert status("watcher:hw") == {"status": "fixed", "cleared_why": scr.CLEAN_RUN_WHY}
+    assert status("watcher:new")["status"] == "open"
+    out["stdout"] = json.dumps({"text": "box-a: power-cycle failed", "severity": "high"})
+    d._run_command_watcher({"name": "hw"}, {"command": "x"})
+    assert wakes() == 2 and status("watcher:hw") == {"status": "open", "cleared_why": None}
+    assert p.db.one("SELECT text FROM events WHERE kind='observation' ORDER BY id DESC")["text"].startswith("box-a")
+    assert not p.db.q("SELECT id FROM alerts")
+
+
+def test_migration_closes_old_watcher_issues_once(env, tmp_path):
+    import sqlite3
+    from ttp.db import DB, WATCHER_ISSUES_MIGRATION
+    path = tmp_path / "old.db"
+    c = sqlite3.connect(str(path))
+    c.execute("CREATE TABLE issues (id INTEGER PRIMARY KEY AUTOINCREMENT, fingerprint TEXT UNIQUE, source TEXT, "
+              "first_seen REAL, last_seen REAL, count INTEGER DEFAULT 1, title TEXT, severity TEXT DEFAULT "
+              "'normal', status TEXT DEFAULT 'open', task INTEGER, screen TEXT)")
+    for i, (src, st) in enumerate([("watcher:hw", "open"), ("watcher:hw", "open"), ("watcher:hw", "ignored"),
+                                   ("log:app", "open")]):
+        c.execute("INSERT INTO issues(fingerprint, source, title, status) VALUES(?,?,?,?)", (f"f{i}", src, "t", st))
+    c.commit()
+    c.close()
+    db = DB(path)
+    rows = db.q("SELECT source, status, cleared_why FROM issues ORDER BY id")
+    assert [r["status"] for r in rows] == ["fixed", "fixed", "ignored", "open"]
+    assert rows[0]["cleared_why"] and rows[3]["cleared_why"] is None and db.meta(WATCHER_ISSUES_MIGRATION)
+    db.x("UPDATE issues SET status='open' WHERE id=1")
+    db.close()
+    assert DB(path).one("SELECT status FROM issues WHERE id=1")["status"] == "open"   # runs once
+
+
 def test_observation_mute_counts_without_waking_and_ends_with_one_summary(env, monkeypatch):
     p = make(env)
     from ttp import coordinator as coord

@@ -82,23 +82,70 @@ def screen(db: DB, cfg: dict, source: str, text: str, hint: str | None = None, j
 
 def _screen(db: DB, cfg: dict, source: str, text: str, hint: str | None, jev,
             rewake_after_s: float | None, repeat: bool) -> Verdict:
-    fp = fingerprint(source, text)
     now = time.time()
     floor = SEVERITY_RANK.get(cfg.get("screen", {}).get("wake_min_severity", "normal"), 1)
+    judged: list[tuple[str, str, str]] = []
+
+    def judge() -> tuple[str, str, str]:   # once per observation, and only when an issue is new
+        if not judged:
+            judged.append(_judge(source, text, hint, jev))
+        return judged[0]
+
+    conditions = watcher_conditions(source, text)
+    if conditions is None:
+        title = text.strip().splitlines()[0][:160] if text.strip() else source
+        return _issue(db, fingerprint(source, text), source, title, None, hint, judge, floor, now,
+                      rewake_after_s, repeat)
+    verdicts = []
+    for subject, cond, cleared in conditions:
+        fp = condition_fingerprint(source, subject, cond)
+        if cleared:
+            verdicts.append(_clear(db, fp, now))
+            continue
+        title = (f"{subject}: {cond}" if subject else cond)[:160]
+        verdicts.append(_issue(db, fp, source, title, title, hint, judge, floor, now, rewake_after_s, repeat))
+    found = [v for v in verdicts if v.issue_id]
+    best = next((v for v in verdicts if v.wake), None) or (found or verdicts)[0]
+    best.severity = max((v.severity for v in found), key=lambda x: SEVERITY_RANK.get(x, 1), default=best.severity)
+    return best
+
+
+def _issue(db: DB, fp: str, source: str, title: str, retitle: str | None, hint: str | None, judge, floor: int,
+           now: float, rewake_after_s: float | None, repeat: bool) -> Verdict:
     row = db.one("SELECT * FROM issues WHERE fingerprint=?", (fp,))
     if row:
-        db.x("UPDATE issues SET last_seen=?, count=count+1 WHERE id=?", (now, row["id"]))
+        db.x("UPDATE issues SET last_seen=?, count=count+1, title=COALESCE(?, title) WHERE id=?",
+             (now, retitle, row["id"]))
+        rank = SEVERITY_RANK.get(row["severity"], 1)
+        seen_at = SEVERITY_RANK.get(hint or "", -1)
         if row["status"] == "fixed":
-            db.x("UPDATE issues SET status='open' WHERE id=?", (row["id"],))
-            return Verdict(True, row["severity"], "regressed after fix", fp, row["id"], "dedupe")
+            # Seen again after it was fixed or closed: it wakes when this sighting is at or above the floor.
+            sev = hint if seen_at >= 0 else row["severity"]
+            db.x("UPDATE issues SET status=?, severity=?, closed=NULL, cleared_why=NULL WHERE id=?",
+                 ("open" if sev != "info" else "ignored", sev, row["id"]))
+            return Verdict(SEVERITY_RANK.get(sev, 1) >= floor, sev, "regressed after fix", fp, row["id"], "dedupe")
+        if seen_at > rank and seen_at >= floor:
+            # The watcher now rates it higher than before (a condition kept quiet that turned serious).
+            db.x("UPDATE issues SET status='open', severity=? WHERE id=?", (hint, row["id"]))
+            return Verdict(True, str(hint), f"now {hint}", fp, row["id"], "dedupe")
         reason = "known issue"
-        if row["status"] == "open" and SEVERITY_RANK.get(row["severity"], 1) >= floor:
+        if row["status"] == "open" and rank >= floor:
             if repeat:
                 reason = "repeated"
             elif rewake_after_s is not None and now - float(row["last_seen"] or 0) > rewake_after_s:
                 reason = f"back after {(now - float(row['last_seen'] or 0)) / 3600:.1f} h quiet"
         return Verdict(reason != "known issue", row["severity"], reason, fp, row["id"], "dedupe")
 
+    severity, verdict_src, reason = judge()
+    issue_id = db.x("INSERT INTO issues(fingerprint,source,first_seen,last_seen,count,title,severity,status,screen) "
+                    "VALUES(?,?,?,?,1,?,?,?,?)", (fp, source, now, now, title, severity,
+                                                   "open" if severity != "info" else "ignored",
+                                                   json.dumps({"by": verdict_src, "reason": reason})))
+    return Verdict(SEVERITY_RANK.get(severity, 1) >= floor, severity, reason, fp, issue_id, verdict_src)
+
+
+def _judge(source: str, text: str, hint: str | None, jev) -> tuple[str, str, str]:
+    """Severity of a new issue: the watcher's hint, else rules, refined by Jev when configured."""
     severity = hint or rule_severity(text)
     verdict_src, reason = "rules", f"rule severity {severity}"
     if jev is not None and jev.enabled():
@@ -120,13 +167,74 @@ def _screen(db: DB, cfg: dict, source: str, text: str, hint: str | None, jev,
                 verdict_src, reason = "jev", f"jev actionable={p:.2f} severity={s:.2f}"
         except Exception as e:  # screening must never take the daemon down
             reason += f" (jev unavailable: {type(e).__name__})"
+    return severity, verdict_src, reason
 
-    title = text.strip().splitlines()[0][:160] if text.strip() else source
-    issue_id = db.x("INSERT INTO issues(fingerprint,source,first_seen,last_seen,count,title,severity,status,screen) "
-                    "VALUES(?,?,?,?,1,?,?,?,?)", (fp, source, now, now, title, severity,
-                                                   "open" if severity != "info" else "ignored",
-                                                   json.dumps({"by": verdict_src, "reason": reason})))
-    return Verdict(SEVERITY_RANK.get(severity, 1) >= floor, severity, reason, fp, issue_id, verdict_src)
+
+# Watcher conditions ---------------------------------------------------------------------------
+# A command watcher reports a line like "<subject>: <item>; <item>", where an item may start with
+# now / still / changed / cleared. Each item is kept as its own issue, keyed by source, subject and
+# the item's kind (counts and changing numbers masked), so a condition reported every run with new
+# counts stays one issue, and "cleared: <item>" closes the issue "now <item>" opened.
+_MARK = re.compile(r"^(now|still|changed|cleared)\b:?\s*", re.I)
+_COUNT = re.compile(r"\s+x\d+\b", re.I)             # "hold x3", "failed checks x2": a count, not an id
+_NUM_LIST = re.compile(r"<n>(\s*,\s*<n>)+")     # "chip 8,9,10" and "chip 3" are the same kind
+WATCHER_QUIET_CLOSE_S = 24 * 3600
+CLEARED_WHY = "the watcher reported it cleared"
+QUIET_WHY = "not seen for 24 h"
+CLEAN_RUN_WHY = "a watcher run reported nothing"
+
+
+def watcher_conditions(source: str, text: str) -> list[tuple[str, str, bool]] | None:
+    """(subject, item, cleared) for each item of a one-line command-watcher observation; None for
+    anything else, which keeps one issue per normalized text."""
+    line = text.strip()
+    if not source.startswith("watcher:") or not line or "\n" in line:
+        return None
+    subject, rest = "", line
+    if ": " in line:
+        head, tail = line.split(": ", 1)
+        if not _MARK.match(head + " "):
+            subject, rest = head.strip(), tail
+    out = []
+    for item in rest.split("; "):
+        item = item.strip()
+        m = _MARK.match(item)
+        cond = item[m.end():].strip() if m else item
+        if cond:
+            out.append((subject, cond, bool(m) and m.group(1).lower() == "cleared"))
+    return out or None
+
+
+def condition_kind(text: str) -> str:
+    return _NUM_LIST.sub("<n>", normalize(_COUNT.sub("", text)))
+
+
+def condition_fingerprint(source: str, subject: str, cond: str) -> str:
+    return hashlib.sha1(f"{source}\n{normalize(subject)}\n{condition_kind(cond)}".encode()).hexdigest()[:16]
+
+
+def _clear(db: DB, fp: str, now: float) -> Verdict:
+    row = db.one("SELECT id, severity, status FROM issues WHERE fingerprint=?", (fp,))
+    if row and row["status"] == "open":
+        db.x("UPDATE issues SET status='fixed', last_seen=?, closed=?, cleared_why=? WHERE id=?",
+             (now, now, CLEARED_WHY, row["id"]))
+    # A clear never wakes by itself; the items reported with it decide.
+    return Verdict(False, row["severity"] if row else "info", "cleared", fp, row["id"] if row else 0, "dedupe")
+
+
+def close_watcher_issues(db: DB, source: str | None = None, quiet_s: float | None = None,
+                         why: str = QUIET_WHY, now: float | None = None) -> int:
+    """Close open command-watcher issues: all of `source`'s, or those not seen for `quiet_s`.
+    Returns how many closed. Closing never wakes anyone; a later sighting reopens the issue."""
+    now = time.time() if now is None else now
+    sql, args = "UPDATE issues SET status='fixed', closed=?, cleared_why=? WHERE status='open'", [now, why]
+    if source is not None:
+        sql, args = sql + " AND source=?", args + [source]
+    else:
+        sql += " AND source LIKE 'watcher:%'"
+    if quiet_s is not None:
+        sql, args = sql + " AND last_seen<?", args + [now - quiet_s]
+    return db.conn.execute(sql, args).rowcount
 
 
 # Mutes ----------------------------------------------------------------------------------------

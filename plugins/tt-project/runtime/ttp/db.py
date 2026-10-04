@@ -14,6 +14,7 @@ from typing import Any, Callable, Iterable, Iterator, Mapping
 SCHEMA_VERSION = 1
 PAUSED_RESOURCES_KEY = "paused_resources"   # kv: see DB.paused_resources
 SHARED_SEEN_KEY = "shared_pauses_seen"   # kv: {resource: pause} of the shared pauses this project acted on
+WATCHER_ISSUES_MIGRATION = "watcher_issues_per_condition"   # meta: set once DB._migrate has run
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -62,7 +63,8 @@ CREATE INDEX IF NOT EXISTS events_status ON events(status);
 CREATE TABLE IF NOT EXISTS issues (
   id INTEGER PRIMARY KEY AUTOINCREMENT, fingerprint TEXT UNIQUE, source TEXT,
   first_seen REAL, last_seen REAL, count INTEGER DEFAULT 1, title TEXT,
-  severity TEXT DEFAULT 'normal', status TEXT DEFAULT 'open', task INTEGER, screen TEXT);
+  severity TEXT DEFAULT 'normal', status TEXT DEFAULT 'open', task INTEGER, screen TEXT,
+  closed REAL, cleared_why TEXT);
 
 CREATE TABLE IF NOT EXISTS schedules (
   name TEXT PRIMARY KEY, kind TEXT NOT NULL, every_s INTEGER NOT NULL, at TEXT,
@@ -109,6 +111,25 @@ class DB:
         self.conn.executescript(SCHEMA)
         if self.meta("schema_version") is None:
             self.set_meta("schema_version", str(SCHEMA_VERSION))
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Columns added after a table was first created, and one-off fixes of old rows."""
+        if self.meta(WATCHER_ISSUES_MIGRATION) is not None:
+            return
+        with self.tx():
+            if self.meta(WATCHER_ISSUES_MIGRATION) is not None:
+                return
+            have = {r["name"] for r in self.q("PRAGMA table_info(issues)")}
+            for col, typ in (("closed", "REAL"), ("cleared_why", "TEXT")):
+                if col not in have:
+                    self.x(f"ALTER TABLE issues ADD COLUMN {col} {typ}")
+            # Watcher issues used to be keyed by their whole text, so each run's counts made a new one
+            # that nothing ever closed. They are now kept one per condition (see screen.py).
+            self.x("UPDATE issues SET status='fixed', closed=?, cleared_why=? WHERE status='open' AND "
+                   "source LIKE 'watcher:%'", (time.time(), "closed by the one-off migration to one issue "
+                                                            "per watcher condition"))
+            self.set_meta(WATCHER_ISSUES_MIGRATION, str(time.time()))
 
     def close(self) -> None:
         self.conn.close()
