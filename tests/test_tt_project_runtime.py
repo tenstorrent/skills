@@ -7324,6 +7324,10 @@ def test_the_review_prompt_pushes_only_through_the_guarded_push():
     assert "`ttp push`" in text and "NEVER use `git push` directly" in text
     assert "longest tool timeout" in text and "NEVER run it detached or in the background" in text
     assert "75: another push to the branch held its turn too long; hand off `waiting` with the `retry_when`" in text
+    # Every exit code is handled in the exit-code bullet, before the version-bump bullet.
+    codes, bump = text.index("- Exit 0: pushed."), text.index("- Version bump:")
+    for code in ("5: the branch kept moving", "2 or 6: refused", "75: another push"):
+        assert codes < text.index(code) < bump, code
 
 
 def test_the_worker_time_rule_leaves_room_for_a_foreground_push():
