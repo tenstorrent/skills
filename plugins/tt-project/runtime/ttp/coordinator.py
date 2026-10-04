@@ -353,10 +353,14 @@ def _norm_severity(s: str | None) -> str:
     return s if s in SEVERITY_RANK else "normal"
 
 
-# Settings that spend the user's money or eat into their reserve. The coordinator may change them
-# only in a turn that carries the user's message: a turn woken by logs, pull requests or a worker's
-# hand-off can be steered by text from outside. Everything else it decides on its own.
-NEEDS_USER = {"budget.daily_usd", "budget.weekly_usd", "budget.reserve_pct"}
+# Settings the coordinator may change only in a turn that carries the user's message: a turn woken by
+# logs, pull requests or a worker's hand-off can be steered by text from outside. Each maps to the
+# ask_user blocking reason that fits it: the budget keys spend the user's money or eat into their
+# reserve; code_tasks_may_push lets work land without a separate review. Turning that flag off is the
+# safe direction and needs no one's word. Everything else the coordinator decides on its own.
+NEEDS_USER = {"budget.daily_usd": "spend", "budget.weekly_usd": "spend", "budget.reserve_pct": "spend",
+              "delivery.code_tasks_may_push": "review"}
+SAFE_WHEN_OFF = {"delivery.code_tasks_may_push"}
 
 
 def tasks_made(db, since: float, review: bool = False) -> list[float]:
@@ -700,10 +704,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     from .project import unknown_key_hint
                     hint = unknown_key_hint(key)
                     raise ValueError(hint or f"{key} is not user-settable from chat")
-                if key in NEEDS_USER and not user_turn:
-                    raise ValueError(f"{key} needs the user's approval: ask_user (blocking spend) with the exact value, and set "
-                                     f"it in the turn that carries their yes")
-                p.set_config(key, USER_SETTABLE[key](a.get("value")))
+                value = USER_SETTABLE[key](a.get("value"))
+                if key in NEEDS_USER and not user_turn and not (key in SAFE_WHEN_OFF and value is False):
+                    raise ValueError(f"{key} needs the user's approval: ask_user (blocking {NEEDS_USER[key]}) with the "
+                                     f"exact value, and set it in the turn that carries their yes")
+                p.set_config(key, value)
                 cfg = p.config()
             elif t == "resource_pause":
                 if not isinstance(a.get("paused"), bool):

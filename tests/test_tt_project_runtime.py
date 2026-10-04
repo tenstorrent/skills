@@ -11646,6 +11646,24 @@ def test_code_tasks_land_their_own_work_only_when_the_project_opts_in(env):
     assert coord.USER_SETTABLE["delivery.code_tasks_may_push"]("false") is False
 
 
+def test_code_tasks_may_push_is_turned_on_only_on_the_users_word(env):
+    """Text from outside must not let code tasks skip review; turning the flag off is always allowed."""
+    p = make(env)
+    from ttp import coordinator as coord
+    on = {"type": "config_set", "key": "delivery.code_tasks_may_push", "value": "true"}
+    off = {**on, "value": "false"}
+    notes = coord.apply(p, [on])
+    assert len(notes) == 1 and "ask_user (blocking review)" in notes[0], notes
+    assert p.config()["delivery"]["code_tasks_may_push"] is False
+    assert coord.apply(p, [on], user_turn=True) == []
+    assert p.config()["delivery"]["code_tasks_may_push"] is True
+    assert coord.apply(p, [off]) == []
+    assert p.config()["delivery"]["code_tasks_may_push"] is False
+    # The budget keys still name spend.
+    assert "ask_user (blocking spend)" in coord.apply(
+        p, [{"type": "config_set", "key": "budget.daily_usd", "value": "0"}])[0]
+
+
 def test_the_code_prompt_lands_only_through_the_guarded_push_and_only_when_asked():
     prompts = RUNTIME.parent / "template" / "prompts"
     code, review = (prompts / "kind-code.md").read_text(), (prompts / "kind-review.md").read_text()
