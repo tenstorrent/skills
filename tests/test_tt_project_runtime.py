@@ -11105,6 +11105,8 @@ def test_web_api_config_rejects_a_bad_value_with_400(env):
     assert code == 400 and "lots" in err["error"], err
     assert post({"key": "budget.max_parallel_workers", "value": 3}) == (200, None)
     assert p.config()["budget"]["max_parallel_workers"] == 3
+
+
 def test_worker_prompt_keeps_real_parenthesised_paragraphs(env):
     from ttp.prompts import charter_without_placeholders
     charter = ("# demo\n\n## Goals\n(to be restated by the coordinator from the brief)\n\n"
