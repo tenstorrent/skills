@@ -7806,44 +7806,73 @@ def _probe_until_done(p, probe, timeout=60):
         time.sleep(0.1)
 
 
+def _gated_check(started, gate):
+    """A check that touches started, then waits for gate (or for the test's folder to go away)."""
+    return f"touch {started}; while [ ! -e {gate} ] && [ -d {gate.parent} ]; do sleep 0.05; done"
+
+
+def _release_detached(gate, pids):
+    """Finalizer of a gated detached push: open the gate so a failed assertion leaves nothing
+    spinning, then end any detached push (its own session) that is still running."""
+    gate.touch()
+    deadline = time.time() + 10
+    for pid in pids:
+        while time.time() < deadline:
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                break
+            time.sleep(0.05)
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
 def test_a_detached_push_returns_at_once_and_its_marker_reports_the_pushed_sha_and_version(env, monkeypatch, capsys):
     started = env["tmp"] / "started"
     gate = env["tmp"] / "gate"
-    p, repo, origin, other = _bump_setup(env, monkeypatch, [f"touch {started}; while [ ! -e {gate} ]; do sleep 0.05; done"])
-    _commit(repo, "plugins/p/rt/x.py", "x = 1\n")
-    t0 = time.time()
-    rc, marker, probe = _detach(capsys)
-    assert rc == 0 and time.time() - t0 < 10, "--detach must return at once"
-    assert marker.parent == p.state / "pushes" and probe.endswith(f"ttp push --result {marker}")
-    m = json.loads(marker.read_text())
-    assert m["status"] == "running" and m["pid"] > 0 and m["target"] == "origin/proj" and m["log"]
-    deadline = time.time() + 30
-    while not started.exists() and time.time() < deadline:
-        time.sleep(0.05)
-    r = _probe(p, probe)
-    assert r.returncode == 1 and "still running" in r.stdout, r
-    assert _ttp("push", "--free") == 1, "the detached push holds the branch's turn"
-    from ttp import release
-    assert release.push_in_flight(p), "an upgrade must not swap the runtime under a detached push"
-    gate.touch()
-    r = _probe_until_done(p, probe)
-    pushed = _git_out(origin, "rev-parse", "proj")
-    assert r.returncode == 0 and f"pushed {pushed}" in r.stdout and "version 0.1.1" in r.stdout, r
-    m = json.loads(marker.read_text())
-    assert (m["status"], m["exit"], m["sha"], m["version"]) == ("pushed", 0, pushed, "0.1.1")
-    assert m["ended"] >= m["started"] and "bumped" in pathlib.Path(m["log"]).read_text()
-    assert _ttp("push", "--free") == 0 and not release.push_in_flight(p)
-    from ttp import push
-    assert not push._run_lock(marker).exists(), "a finished push leaves no lock file behind"
-    # A month later the next detached push tidies the finished marker and its log away.
-    month = time.time() - push.KEEP_S - 60
-    os.utime(marker, (month, month))
-    _commit(repo, "plugins/p/rt/y.py", "y = 1\n")
-    gate.unlink()
-    rc, second, probe2 = _detach(capsys)
-    assert rc == 0 and not marker.exists() and not pathlib.Path(m["log"]).exists() and second.exists()
-    gate.touch()
-    assert _probe_until_done(p, probe2).returncode == 0
+    p, repo, origin, other = _bump_setup(env, monkeypatch, [_gated_check(started, gate)])
+    pids = []
+    try:
+        _commit(repo, "plugins/p/rt/x.py", "x = 1\n")
+        t0 = time.time()
+        rc, marker, probe = _detach(capsys)
+        pids += [json.loads(marker.read_text())["pid"]] if marker else []
+        assert rc == 0 and time.time() - t0 < 10, "--detach must return at once"
+        assert marker.parent == p.state / "pushes" and probe.endswith(f"ttp push --result {marker}")
+        m = json.loads(marker.read_text())
+        assert m["status"] == "running" and m["pid"] > 0 and m["target"] == "origin/proj" and m["log"]
+        deadline = time.time() + 30
+        while not started.exists() and time.time() < deadline:
+            time.sleep(0.05)
+        r = _probe(p, probe)
+        assert r.returncode == 1 and "still running" in r.stdout, r
+        assert _ttp("push", "--free") == 1, "the detached push holds the branch's turn"
+        from ttp import release
+        assert release.push_in_flight(p), "an upgrade must not swap the runtime under a detached push"
+        gate.touch()
+        r = _probe_until_done(p, probe)
+        pushed = _git_out(origin, "rev-parse", "proj")
+        assert r.returncode == 0 and f"pushed {pushed}" in r.stdout and "version 0.1.1" in r.stdout, r
+        m = json.loads(marker.read_text())
+        assert (m["status"], m["exit"], m["sha"], m["version"]) == ("pushed", 0, pushed, "0.1.1")
+        assert m["ended"] >= m["started"] and "bumped" in pathlib.Path(m["log"]).read_text()
+        assert _ttp("push", "--free") == 0 and not release.push_in_flight(p)
+        from ttp import push
+        assert not push._run_lock(marker).exists(), "a finished push leaves no lock file behind"
+        # A month later the next detached push tidies the finished marker and its log away.
+        month = time.time() - push.KEEP_S - 60
+        os.utime(marker, (month, month))
+        _commit(repo, "plugins/p/rt/y.py", "y = 1\n")
+        gate.unlink()
+        rc, second, probe2 = _detach(capsys)
+        pids += [json.loads(second.read_text())["pid"]] if second else []
+        assert rc == 0 and not marker.exists() and not pathlib.Path(m["log"]).exists() and second.exists()
+        gate.touch()
+        assert _probe_until_done(p, probe2).returncode == 0
+    finally:
+        _release_detached(gate, pids)
 
 
 def test_a_detached_push_whose_check_fails_reports_the_exit_and_log_tail(env, monkeypatch, capsys):
