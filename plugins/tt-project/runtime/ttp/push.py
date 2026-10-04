@@ -702,10 +702,15 @@ def detach(p: Project, repo: Path) -> int:
         return REFUSED
     task = os.environ.get("TTP_TASK")
     rid = (f"t{task}-" if task else "") + time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"
-    marker = p.state / DETACHED / f"{rid}.json"
+    folder = p.state / DETACHED
+    folder.mkdir(parents=True, exist_ok=True)
+    base, n = rid, 1
+    while (folder / f"{rid}.json").exists():   # two pushes from one process within a second
+        n += 1
+        rid = f"{base}-{n}"
+    marker = folder / f"{rid}.json"
     log = marker.with_suffix(".log")
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    _prune(marker.parent, time.time())
+    _prune(folder, time.time())
     lock = locks.try_take([_run_lock(marker)], f"detached push {rid}", "ttp push --detach")
     if lock is None:
         print(f"ttp push: the run lock of {rid} is taken", file=sys.stderr)
