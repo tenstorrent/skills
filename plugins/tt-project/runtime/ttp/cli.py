@@ -1346,6 +1346,7 @@ def _upgrade(p: Project, auto: bool = False) -> None:
         _git(h, "worktree", "remove", "--force", str(tmp))
     merged, problem = _merge_upstream(h, p.state / "upgrade-merge", ident)
     if problem:
+        _ensure_git_ident(h)        # the task merges and commits in a fresh worktree of this repo
         tid = release.open_upgrade_task(p) or p.db.add_task(
             release.UPGRADE_TASK_TITLE, _UPGRADE_TASK.format(problem=problem, name=p.name),
             kind="harness", tier="standard", priority=2, origin="user")
@@ -1386,6 +1387,18 @@ The live harness was left untouched. In this harness repo:
 4. Commit, then in the harness: `git merge --ff-only <commit>`; remove <tmp>.
 5. `ttp restart {name}` (it rolls the runtime back if the daemon does not start).
 """
+
+
+def _ensure_git_ident(h: Path) -> None:
+    """Give the harness repo a local commit identity when git resolves none (no user.name/user.email
+    and no usable account name), so a plain `git merge` or `git commit` in it works for any run."""
+    for who in ("GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT"):
+        if subprocess.run(["git", "-C", str(h), "var", who], capture_output=True).returncode != 0:
+            for key, val in (("user.name", "tt-project"), ("user.email", "tt-project@localhost")):
+                if subprocess.run(["git", "-C", str(h), "config", key], capture_output=True,
+                                  text=True).stdout.strip() == "":
+                    _git(h, "config", key, val)    # only what is missing: a configured name or email stays
+            return
 
 
 def _merge_upstream(h: Path, tmp: Path, ident: list[str]) -> tuple[str, str]:

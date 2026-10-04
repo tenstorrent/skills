@@ -3984,6 +3984,37 @@ def test_a_conflicting_upgrade_leaves_the_harness_untouched_and_queues_a_task(en
     assert "upstream line" in (h / "prompts" / "worker.md").read_text() and restarts == [1]
 
 
+def test_the_queued_upgrade_task_can_merge_and_commit_without_a_git_identity(env, monkeypatch, tmp_path):
+    """No user.name/user.email anywhere and no usable account name: the task's own `git merge upstream`
+    in a fresh worktree must not fail with 'empty ident name'."""
+    p = make(env)
+    from ttp import cli, service
+    monkeypatch.setattr(service, "restart", lambda p: "restarted")
+    h = p.harness
+    (h / "prompts" / "kind-harness.md").write_text("# Harness task, this project's way\n")
+    _git_out(h, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "local prompt")
+    for var in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "EMAIL"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")             # no guessing from the account either
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "user.useConfigOnly")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "true")
+    assert subprocess.run(["git", "-C", str(h), "var", "GIT_COMMITTER_IDENT"], capture_output=True).returncode
+    _install_template(env, {"kind-harness.md": "# Harness task, upstream's way\n"})
+    with pytest.raises(SystemExit):
+        cli.main(["upgrade", "demo"])
+    assert p.db.one("SELECT * FROM tasks WHERE kind='harness'")
+    wt = tmp_path / "merge"
+    _git_out(h, "worktree", "add", "-q", "--detach", str(wt), "main")
+    r = subprocess.run(["git", "-C", str(wt), "merge", "upstream"], capture_output=True, text=True)
+    assert "ident" not in r.stderr and "CONFLICT" in r.stdout, r.stderr
+    (wt / "prompts" / "kind-harness.md").write_text("# Harness task, this project's way\n")
+    _git_out(wt, "add", "-A")
+    _git_out(wt, "commit", "-qm", "merge upstream")
+    assert _git_out(wt, "log", "-1", "--format=%an <%ae>") == "tt-project <tt-project@localhost>"
+
+
 def test_upgrade_reports_a_new_source_commit_at_the_same_version(env, monkeypatch, capsys):
     p = make(env)
     from ttp import __version__, cli, service
