@@ -9,6 +9,7 @@ import shlex
 import os
 import pathlib
 import signal
+import socket
 import sqlite3
 import stat
 import subprocess
@@ -674,17 +675,44 @@ def test_runner_enforces_wall_clock(env, tmp_path):
     assert info["stopped"] == "timeout" and time.time() - t0 < 60
 
 
+def _unused_port() -> int:
+    """A port the OS just handed out and nothing listens on."""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _start_web(p) -> int:
+    """Serve p's web app in a thread (as its daemon does) and return its port once bound.
+
+    A port picked ahead of time can be taken by another process (e.g. a parallel pytest run)
+    before web.serve binds it; that serve thread then dies and another server answers. So wait
+    until this server recorded its bind and pick a fresh port if it failed."""
+    from ttp import web
+    for _ in range(20):
+        port = _unused_port()
+        p.set_config("web.port", port)
+        p.db.set_kv("web", None)
+
+        class Stub:
+            pass
+        stub = Stub()
+        stub.p = p
+        t = threading.Thread(target=web.serve, args=(stub,), daemon=True)
+        t.start()
+        for _ in range(100):
+            if (p.db.kv("web") or {}).get("port") == port:
+                return port
+            if not t.is_alive():
+                break
+            time.sleep(0.02)
+    raise AssertionError("the web app could not bind a port")
+
+
 def test_web_api_requires_the_token(env):
     p = make(env)
     from ttp import web
-    port = web.free_port(19700)
-    p.set_config("web.port", port)
-
-    class Stub:
-        pass
-    stub = Stub()
-    stub.p = p
-    threading.Thread(target=web.serve, args=(stub,), daemon=True).start()
+    port = _start_web(p)
     base = f"http://127.0.0.1:{port}"
     for _ in range(50):
         try:
@@ -1120,18 +1148,11 @@ def test_config_refreshes_last_good_on_equal_mtime(env):
 def test_web_chat_shows_replies_to_every_chat(env):
     p = make(env)
     from ttp import web
-    port = web.free_port(19750)
-    p.set_config("web.port", port)
     p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)",
            (time.time(), "laptop", time.time()))
     p.db.post("in", "question from a terminal", chat="c1", kind="user")
     p.db.post("out", "answer to the terminal", chat="c1", kind="reply")
-
-    class Stub:
-        pass
-    stub = Stub()
-    stub.p = p
-    threading.Thread(target=web.serve, args=(stub,), daemon=True).start()
+    port = _start_web(p)
     req = urllib.request.Request(f"http://127.0.0.1:{port}/api/messages?after=0",
                                  headers={"X-TTP-Token": web.token(p)})
     for _ in range(50):
@@ -3384,18 +3405,11 @@ def load_result_summary(task) -> str:
 def test_web_cannot_requeue_a_running_task(env, tmp_path):
     p = make(env)
     from ttp import web
-    port = web.free_port(19800)
-    p.set_config("web.port", port)
     tid = p.db.add_task("long job", "spec", kind="work", tier="light", origin="user")
     p.db.update_task(tid, status="running")
     p.db.x("INSERT INTO runs(task,role,provider,started,status,dir,boot_id) VALUES(?,?,?,?,?,?,?)",
            (tid, "worker", "fake", time.time(), "running", str(tmp_path), "x"))
-
-    class Stub:
-        pass
-    stub = Stub()
-    stub.p = p
-    threading.Thread(target=web.serve, args=(stub,), daemon=True).start()
+    port = _start_web(p)
     req = urllib.request.Request(f"http://127.0.0.1:{port}/api/task/{tid}", method="POST",
                                  data=json.dumps({"status": "queued"}).encode(),
                                  headers={"X-TTP-Token": web.token(p), "Content-Type": "application/json"})
@@ -8924,14 +8938,7 @@ def test_health_does_not_count_a_task_on_a_paused_resource_as_ready(env):
 def test_web_api_pauses_and_resumes_a_resource(env):
     p = make(env)
     from ttp import web
-    port = web.free_port(19900)
-    p.set_config("web.port", port)
-
-    class Stub:
-        pass
-    stub = Stub()
-    stub.p = p
-    threading.Thread(target=web.serve, args=(stub,), daemon=True).start()
+    port = _start_web(p)
 
     def post(body):
         req = urllib.request.Request(f"http://127.0.0.1:{port}/api/pause", method="POST", data=json.dumps(body).encode(),
@@ -11980,14 +11987,7 @@ def test_a_monthly_alert_is_not_forgotten_after_a_week(env, monkeypatch):
 def test_web_api_config_rejects_a_bad_value_with_400(env):
     p = make(env)
     from ttp import web
-    port = web.free_port(19950)
-    p.set_config("web.port", port)
-
-    class Stub:
-        pass
-    stub = Stub()
-    stub.p = p
-    threading.Thread(target=web.serve, args=(stub,), daemon=True).start()
+    port = _start_web(p)
 
     def post(body):
         req = urllib.request.Request(f"http://127.0.0.1:{port}/api/config", method="POST", data=json.dumps(body).encode(),
@@ -12177,14 +12177,7 @@ def test_without_a_schedules_file_the_database_holds_them_until_exported(env, ca
 def test_web_schedule_changes_write_back_to_the_schedules_file(env):
     p = make(env)
     from ttp import web
-    port = web.free_port(19820)
-    p.set_config("web.port", port)
-
-    class Stub:
-        pass
-    stub = Stub()
-    stub.p = p
-    threading.Thread(target=web.serve, args=(stub,), daemon=True).start()
+    port = _start_web(p)
     req = urllib.request.Request(f"http://127.0.0.1:{port}/api/schedule/pr-watch", method="POST",
                                  data=json.dumps({"enabled": False}).encode(),
                                  headers={"X-TTP-Token": web.token(p), "Content-Type": "application/json"})
@@ -12557,14 +12550,7 @@ def test_web_state_works_once_the_coordinator_has_run(env):
     p = make(env)
     from ttp import web
     p.db.set_kv("last_coordinator_turn", time.time() - 600)    # opens p.db in this thread
-    port = web.free_port(19750)
-    p.set_config("web.port", port)
-
-    class Stub:
-        pass
-    stub = Stub()
-    stub.p = p
-    threading.Thread(target=web.serve, args=(stub,), daemon=True).start()
+    port = _start_web(p)
     base = f"http://127.0.0.1:{port}"
     for _ in range(50):
         try:
@@ -12581,14 +12567,7 @@ def test_web_state_works_once_the_coordinator_has_run(env):
 def _serve(p, start: int) -> int:
     """Serve p's web app in this process (as its daemon does); returns the port once it answers."""
     from ttp import web
-    port = web.free_port(start)
-    p.set_config("web.port", port)
-
-    class Stub:
-        pass
-    stub = Stub()
-    stub.p = p
-    threading.Thread(target=web.serve, args=(stub,), daemon=True).start()
+    port = _start_web(p)
     for _ in range(50):
         try:
             urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=1)
@@ -12635,7 +12614,7 @@ def test_connect_repairs_or_names_what_is_broken_instead_of_a_dead_link(env, mon
     from ttp import cli, service, weblink
     from ttp.web import token
     p = make(env)
-    p.set_config("web.port", __import__("ttp.web").web.free_port(19830))   # nothing answers there
+    p.set_config("web.port", _unused_port())   # nothing answers there
     monkeypatch.setattr(weblink, "_sleep", lambda s: None)
     monkeypatch.setattr(service, "installed", lambda p: None)
     with pytest.raises(SystemExit) as e:
