@@ -12448,6 +12448,16 @@ def test_pr_approve_counts_only_channels_a_run_cannot_write(env):
         said = p.db.post("in", f"yes, mark {url} ready", chat="web", provenance=prov)
         out = " ".join(coord.apply(p, [{"type": "pr_approve", "id": said, "text": url}]))
         assert "does not count as the user's approval" in out, prov
+        # No Slack here: the refusal says so instead of sending the coordinator to ask on Slack.
+        assert "Slack DMs are not set up" in out and "Do not ask again" in out, out
+    assert not prguard.approved(p.db, "acme/widgets#7")
+    said = p.db.post("in", f"yes, mark {url} ready", chat="web", provenance="cli-legacy")
+    try:
+        prguard.approve(p.db, url, said, slack=object())
+    except ValueError as e:
+        assert "answer on Slack" in str(e) and "not set up" not in str(e), e
+    else:
+        raise AssertionError("a cli-legacy yes counted as an approval")
     assert not prguard.approved(p.db, "acme/widgets#7")
     # The ask path too: the ask's first answer must be the user's, on an approving channel.
     coord.apply(p, [{"type": "ask_user", "text": f"Ready {url} for review?", "blocking": "review",

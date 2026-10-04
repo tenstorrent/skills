@@ -103,9 +103,15 @@ def approve(db, pr: str, source_id: int, now: float | None = None, slack=None) -
         raise ValueError(f"pr_approve: #{source_id} does not name {key}; the approval must be for that PR")
     channel = answer.get("provenance")
     if channel not in APPROVING:
-        raise ValueError(f"pr_approve: #{answer['id']} came in via {channel or 'an unknown channel'}, which does "
-                         f"not count as the user's approval (only {', '.join(APPROVING)}); ask the user again "
-                         f"and have them answer on Slack")
+        why = (f"pr_approve: #{answer['id']} came in via {channel or 'an unknown channel'}, which does not count "
+               f"as the user's approval (only {', '.join(APPROVING)})")
+        if slack is not None:
+            raise ValueError(f"{why}; ask the user again (ask_user, blocking review, naming the PR) and have "
+                             f"them answer on Slack")
+        raise ValueError(f"{why}. Slack DMs are not set up for this project, so no approval can be recorded "
+                         f"here yet and the PR stays in draft. Do not ask again: tell the user once (notify) "
+                         f"that approving a PR needs a Slack DM, which is set up with `ttp secret slack` and "
+                         f"notify.slack")
     if channel == "slack":
         _check_slack(answer, key if answer is msg else None, msg["ts"] if answer is not msg else None, slack)
     with db.tx():
