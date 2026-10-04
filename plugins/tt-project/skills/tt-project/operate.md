@@ -20,7 +20,7 @@
 | `ttp task <name> cancel <id>` | cancel a task and end its running worker |
 | `ttp doctor <name>` | providers, accounts, Jev, notifications, web |
 | `ttp alerts <name> --after N` | alerts since a message id |
-| `ttp web <name> --tunnel --keep` / `--unkeep` | keep the web app's tunnel up as a user service / remove it (remote projects; ask first) |
+| `ttp web <name> --tunnel --keep` / `--unkeep` | keep the web app's tunnel up as a user service / remove it (remote projects; a local view forward needs no ask) |
 
 ## What needs the user
 

@@ -72,11 +72,14 @@ ttp new <name> [--dir <root>] [--host <ssh-alias>] --describe-file <brief.md>
 
 - Remote host: the command ships the runtime over ssh and creates it there.
 - The daemon installs as a service: systemd user unit (+ linger) or launchd; cron fallback.
-- Print the `tt-project://…` line and the web link from the output.
+- Print the `tt-project://…` line and the verified web app link from the output. For a remote
+  project the command already opened the kept local forward and checked the link through it.
+- A `web app: NOT AVAILABLE (…)` line (exit 3) means the project was created but its web app did
+  not answer after repair. Say what it names as broken; give no link.
 
 ## 6. Then
 
 - `ttp connect <name> --label "<chat label>"` and start the listener (`hosts.md`).
 - The coordinator restates goals and asks what it still needs. Relay its message.
 - On the user's own workstation, run `ttp notifier install` and say so.
-- Remote project: open its web app with `ttp web <name> --tunnel --keep` and give the link.
+- Reply with the verified web app link `connect` printed last (never an unverified one).

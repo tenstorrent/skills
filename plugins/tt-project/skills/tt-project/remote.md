@@ -20,6 +20,9 @@
 - The ssh login must work without a prompt (key or agent). On Linux the unit starts at login;
   it runs at boot without a login only with lingering (`loginctl enable-linger`).
 - When the page cannot reach the daemon it says so and shows these commands as information.
+- `ttp new --host` and `ttp connect` for a remote project open the same kept forward themselves and
+  end with the link, checked through it (HTTP 200 naming the project). If it does not answer they
+  restart the kept tunnel, then the daemon there, and otherwise print what is broken instead.
 
 ## Persistent tunnel rules
 

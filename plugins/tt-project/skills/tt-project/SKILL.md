@@ -25,6 +25,7 @@ description: "Start, connect to, and talk with a long-running tt-project: a loca
 | 2. Name | Get the project name. `ttp find <name>` says whether it exists. |
 | 3a. New | Follow `create.md`. |
 | 3b. Existing | `ttp connect <name> --label "<short chat label>"`. Keep the printed `chat:` id. |
+| 3c. Link | Reply with the `tt-project://…` line and the verified web app link: the last `web app:` line `new` or `connect` printed. They open a remote project's kept local forward and check the link first. |
 | 4. Listen | Start the listener for this host: `hosts.md`. |
 | 5. Relay | User message for the project → `ttp say <name> --chat <id> "<message>"`. |
 | 6. Show | Print coordinator replies as they arrive, lightly formatted, no additions. Restart the listener with `--ack <last id shown>`. |
@@ -43,16 +44,21 @@ description: "Start, connect to, and talk with a long-running tt-project: a loca
 - Alerts arrive in every attached chat. Replies arrive only in the chat that asked.
 - A repeated message id was already shown. Skip it.
 - The user asks what is running, costs, or blockers → `ttp status <name>`.
+- Never give an unverified web app link. Give only a `web app: http…` line that `ttp new`,
+  `ttp connect` or `ttp web` just printed: they check it first (HTTP 200 naming this project,
+  through that exact port and token). Never build a link by hand or reuse an old one.
+- `web app: NOT AVAILABLE (…)` instead of a link: they already tried to repair it (kept tunnel,
+  daemon). Tell the user that statement plainly; give no link.
 
 ## Always print the project locator
 
-- After `new` or `connect`, show the `tt-project://…` line once.
+- After `new` or `connect`, show the `tt-project://…` line once, with the verified web app link.
 - Later chats find the project by it, even without the registry.
 
 ## Web app and notifications
 
-- `ttp web <name>` prints the link. Remote project → `ttp web <name> --tunnel --keep` opens a kept
-  local forward without asking (`remote.md`).
+- `ttp web <name>` prints the checked link. Remote project → `ttp web <name> --tunnel --keep` opens a
+  kept local forward without asking (`remote.md`).
 - The web app has a one-click "Turn on notifications" button.
 - On the user's own workstation, run `ttp notifier install` once and say so (desktop alerts).
 - Details and optional Slack: `notifications.md`.

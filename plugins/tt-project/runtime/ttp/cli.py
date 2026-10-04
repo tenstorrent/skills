@@ -782,7 +782,7 @@ def cmd_status(a) -> None:
 
 
 def cmd_web(a) -> None:
-    from . import tunnel
+    from . import tunnel, weblink
     if a.unkeep:
         print(tunnel.unkeep(a.name))
         return
@@ -792,7 +792,10 @@ def cmd_web(a) -> None:
     if p:
         if a.keep:
             print(f"{a.name} runs on this computer: there is no tunnel to keep")
-        print(web_line(p))
+        line, rc = weblink.local(p, weblink.link(p))
+        print(line)
+        if rc:
+            sys.exit(rc)
         return
     if not entry:
         die(f"no project {a.name!r}")
@@ -800,18 +803,21 @@ def cmd_web(a) -> None:
     remote_ttp = f"{entry['dir']}/{FOLDER}/harness/bin/ttp"
     r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", host, f"{remote_ttp} web {shlex.quote(a.name)}"],
                        capture_output=True, text=True)
-    m = re.search(r"http://127\.0\.0\.1:(\d+)/#token=([0-9a-f]+)", r.stdout)
+    m = weblink.LINK.search(r.stdout)
     if not m:
         die(f"could not read the web address from {host}: {(r.stderr or r.stdout).strip()[-200:]}")
     from .web import free_port
     remote_port, tok = int(m.group(1)), m.group(2)
     kept = tunnel.installed(a.name)
     if a.keep:
-        local, did = tunnel.keep(a.name, host, remote_port, free_port)
-        print(f"{did}: localhost:{local} → {host}:{remote_port}, restarted after reboots (at login) and network "
-              f"drops; `ttp web {a.name} --unkeep` removes it")
-    elif kept and kept["host"] == host and kept["remote"] == remote_port and kept["local"]:
-        local = kept["local"]   # the kept tunnel already forwards; a second one would only clash
+        line, rc = weblink.remote(a.name, entry, remote_port, tok)
+        print(line)
+        if rc:
+            sys.exit(rc)
+        return
+    opened = False
+    if kept and kept["host"] == host and kept["remote"] == remote_port and kept["local"]:
+        local, opened = kept["local"], True   # the kept tunnel already forwards; a second one would only clash
         print(f"the kept tunnel forwards localhost:{local} → {host}:{remote_port} ({kept['file']})")
     else:
         local = free_port(remote_port + 100)
@@ -819,10 +825,16 @@ def cmd_web(a) -> None:
         if a.tunnel:
             subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
             print(f"tunnel open (pid in background): localhost:{local} → {host}:{remote_port}")
+            opened = True
         else:
             print(f"The project runs on {host}. `ttp web {a.name} --tunnel --keep` opens this local forward and "
                   f"keeps it up:\n  {' '.join(cmd)}")
-    print(f"web app: http://127.0.0.1:{local}/#token={tok}")
+    url = f"http://127.0.0.1:{local}/#token={tok}"
+    kind, why = weblink.verify(url, a.name) if opened else ("", "")
+    if kind:
+        print(weblink.bad_line(kind, why, []))
+        sys.exit(weblink.UNVERIFIED)
+    print(weblink.ok_line(url) if opened else f"web app (once that forward is open): {url}")
 
 
 def cmd_note(a) -> None:
@@ -1485,7 +1497,8 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--version", action=_Version, nargs=0, help="show the version and source commit, then exit")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    s = sub.add_parser("new", help="create a project")
+    s = sub.add_parser("new", help="create a project; ends with its checked web app link (exit 3: the link "
+                       "did not answer and the line says what is broken)")
     s.add_argument("name")
     s.add_argument("--dir", help="project root (default: git top level of the current directory)")
     s.add_argument("--host", help="machine to run on (default: this one)")
@@ -1504,7 +1517,8 @@ def main(argv: list[str] | None = None) -> None:
                    "and reboots (adopts or replaces an existing com.tt-project.tunnel.<name> service)")
     s.add_argument("--unkeep", action="store_true", help="stop and remove the kept tunnel")
     s.set_defaults(fn=cmd_web)
-    for name, fn, hlp in (("connect", cmd_connect, "attach this chat to a project"),
+    for name, fn, hlp in (("connect", cmd_connect, "attach this chat to a project; ends with its checked web app link "
+                           "(exit 3: the link did not answer and the line says what is broken)"),
                           ("status", cmd_status, "one-screen status"),
                           ("logs", cmd_logs, "daemon log tail"), ("doctor", cmd_doctor, "diagnose setup"),
                           ("prune", cmd_prune, "tidy finished tasks' worktrees now (branches are kept)")):

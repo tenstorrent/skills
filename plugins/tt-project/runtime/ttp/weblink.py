@@ -126,19 +126,27 @@ def remote(name: str, entry: dict, remote_port: int, tok: str) -> tuple[str, int
     kind, why = verify(url, name)
     tried: list[str] = []
     if kind == "down":
-        tried.append(f"restarted the kept tunnel ({tunnel.restart(name)})")
+        again = tunnel.restart(name)
+        tried.append(f"restarted the kept tunnel ({again})")
         kind, why = verify(url, name)
+        if kind == "down" and "refused" in did + again:   # the service manager would not run it
+            return bad_line("tunnel", f"{why}; the kept tunnel did not start ({did})", tried), UNVERIFIED
     if kind == "down":
         cant = _ssh_ok(host)
         if cant:
             return bad_line("tunnel", f"{why}; ssh to {host} fails without a prompt ({cant})", tried), UNVERIFIED
         remote_ttp = f"{entry['dir']}/{FOLDER}/harness/bin/ttp"
-        r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", host,
-                            f"{remote_ttp} restart {shlex.quote(name)}"], capture_output=True, text=True)
-        tried.append(f"restarted the daemon on {host} ({(r.stdout or r.stderr).strip()[-160:] or r.returncode})")
+        try:
+            r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", host,
+                                f"{remote_ttp} restart {shlex.quote(name)}"], capture_output=True, text=True, timeout=300)
+            said = (r.stdout or r.stderr).strip()[-160:] or f"exit {r.returncode}"
+        except (OSError, subprocess.SubprocessError) as e:
+            said = str(e)[:160]
+        tried.append(f"restarted the daemon on {host} ({said})")
         kind, why = verify(url, name)
         if kind == "down":
             return bad_line("daemon", f"{why}; ssh to {host} works, so its daemon or web app is down", tried), UNVERIFIED
     if kind:
         return bad_line(kind, why, tried), UNVERIFIED
-    return f"{did}: localhost:{local_port} → {host}:{remote_port}\n" + ok_line(url), 0
+    return (f"{did}: localhost:{local_port} → {host}:{remote_port}, restarted after reboots (at login) and "
+            f"network drops; `ttp web {name} --unkeep` removes it\n" + ok_line(url)), 0

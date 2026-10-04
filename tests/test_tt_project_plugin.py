@@ -162,6 +162,21 @@ def test_local_web_forwards_open_without_asking_and_exposing_tunnels_ask():
         assert re.search(r"Never ask (or tell )?the user to do what (you or )?the project can do", text), prompt
 
 
+def test_new_and_connect_reply_with_a_verified_web_link():
+    """After `new` and `connect` the chat replies with the web app link those commands checked, next
+    to the locator line, and the relay never gives a link that was not checked."""
+    skill = " ".join((SKILLS / "tt-project" / "SKILL.md").read_text(encoding="utf-8").split())
+    row = next(r for r in (SKILLS / "tt-project" / "SKILL.md").read_text(encoding="utf-8").splitlines()
+               if r.startswith("| 3c."))
+    assert "`tt-project://…` line and the verified web app link" in row
+    assert "Never give an unverified web app link." in skill and "NOT AVAILABLE" in skill
+    assert "show the `tt-project://…` line once, with the verified web app link" in skill
+    create = " ".join((SKILLS / "tt-project" / "create.md").read_text(encoding="utf-8").split())
+    assert "verified web app link" in create and "give no link" in create
+    remote = " ".join((SKILLS / "tt-project" / "remote.md").read_text(encoding="utf-8").split())
+    assert "open the same kept forward themselves" in remote
+
+
 def test_worker_prompt_limits_search_scope():
     text = " ".join((PLUGIN / "template" / "prompts" / "worker.md").read_text(encoding="utf-8").split())
     assert "Never search / or the home folder" in text

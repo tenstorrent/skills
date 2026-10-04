@@ -9232,9 +9232,10 @@ def test_web_keep_installs_a_kept_local_forward_and_adopts_an_existing_one(env, 
     user service without asking. A com.tt-project.tunnel.<name> service set up by hand is adopted
     when it already forwards to the project, and otherwise replaced on its own local port."""
     import plistlib
-    from ttp import cli, tunnel
+    from ttp import cli, tunnel, weblink
     monkeypatch.setenv("HOME", str(tmp_path / "userhome"))
     monkeypatch.setattr(tunnel.sys, "platform", "darwin")
+    monkeypatch.setattr(weblink, "check", lambda url, name: ("", ""))   # the link answers (checked in its own tests)
     calls = []
     monkeypatch.setattr(tunnel, "_run", lambda *argv: calls.append(argv) or subprocess.CompletedProcess(argv, 1, "", ""))
     monkeypatch.setattr(cli, "resolve", lambda name: (None, {"host": "box", "dir": "/srv/p"}))
@@ -12445,3 +12446,17 @@ def test_remote_new_passes_on_the_far_machines_failed_check(env, monkeypatch, ca
     assert e.value.code == weblink.UNVERIFIED and "created far" in out
     assert "web app: NOT AVAILABLE (daemon)" in out and "(on box)" in out and out.count("web app:") == 1, out
     assert {k: load_registry()["projects"]["far"][k] for k in ("host", "dir")} == {"host": "box", "dir": "/srv/far"}
+
+
+def test_a_kept_tunnel_the_service_manager_refuses_is_named_without_touching_the_daemon(env, monkeypatch, tmp_path, capsys):
+    from ttp import cli, tunnel, weblink
+    p, port, calls, ssh = _remote(env, monkeypatch, tmp_path, "web app: http://127.0.0.1:18700/#token=abc123\n")
+    monkeypatch.setattr(tunnel, "_run", lambda *argv: subprocess.CompletedProcess(argv, 1, "", "no user bus"))
+    monkeypatch.setattr(weblink, "_sleep", lambda s: None)
+    monkeypatch.setattr(weblink, "check", lambda url, name: ("down", f"nothing answers on localhost:{port}"))
+    monkeypatch.setattr(weblink, "_ssh_ok", lambda host: pytest.fail("the daemon is not to blame"))
+    with pytest.raises(SystemExit) as e:
+        cli.main(["connect", "demo"])
+    out = capsys.readouterr().out
+    assert e.value.code == weblink.UNVERIFIED and "#token=" not in out, out
+    assert "NOT AVAILABLE (tunnel)" in out and "did not start" in out and "no user bus" in out, out
