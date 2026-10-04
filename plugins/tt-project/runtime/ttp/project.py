@@ -81,8 +81,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # to the coordinator once.
                     "defer_max_days": 14},
     "notify": {"slack": False, "slack_min_severity": "high", "chat_min_severity": "normal"},
+    # code_tasks_may_push: a code task whose spec asks it to land on delivery.push_branch may run
+    # `ttp push` itself, so no separate landing task is needed. Off: only review tasks push.
     "delivery": {"draft_prs": True, "review_before_pr": True, "auto_merge_repos": [],
-                 "push_allowed": True},
+                 "push_allowed": True, "code_tasks_may_push": False},
     # Review tasks run light when the diff under review touches no risky_paths glob and is doc-only
     # or at most light_max_lines non-doc lines; otherwise standard. Only the coordinator picks deep.
     "review": {"light_max_lines": 60, "risky_paths": []},
@@ -180,6 +182,13 @@ def _disk_problems(disk: Any) -> list[str]:
     return []
 
 
+def code_tasks_may_push(cfg: dict) -> bool:
+    """Whether code tasks may land their own work with `ttp push`: delivery.code_tasks_may_push is
+    true and delivery.push_branch is set."""
+    d = cfg.get("delivery") or {}
+    return d.get("code_tasks_may_push") is True and bool(str(d.get("push_branch") or "").strip())
+
+
 def config_problems(raw: dict) -> list[str]:
     """Unknown keys, non-command push_checks and a malformed version_bump in a project's own
     settings, one line each."""
@@ -197,6 +206,9 @@ def config_problems(raw: dict) -> list[str]:
     delivery = raw.get("delivery") or {}
     out += [f"delivery.push_checks: {p}" for p in check_problems(delivery.get("push_checks"))]
     out += bump_problems(delivery.get("version_bump"))
+    may_push = delivery.get("code_tasks_may_push", False)
+    if not isinstance(may_push, bool):
+        out.append(f"delivery.code_tasks_may_push: {may_push!r} is not true or false; code tasks do not push")
     out += _disk_problems(raw.get("disk"))
     return out
 

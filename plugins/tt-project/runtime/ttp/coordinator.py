@@ -23,7 +23,8 @@ from . import screen as scr
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
                  dependency_ids, dump_result, host_line, load_result, without_deferral)
-from .project import COORDINATOR_MEMORY_CHARS, WORKER_MEMORY_CHARS, Project, durable_append, durable_write
+from .project import (COORDINATOR_MEMORY_CHARS, WORKER_MEMORY_CHARS, Project, code_tasks_may_push, durable_append,
+                      durable_write)
 from .runner import stop_runs
 
 ACTION_TYPES = ("reply", "task_add", "task_update", "ask_user", "resolve", "notify", "memory_add", "memory_forget",
@@ -81,6 +82,8 @@ USER_SETTABLE = {
     "delivery.push_checks": lambda v: push.checks_of(v),
     # The files holding the version that `ttp push` bumps once above the tip, plus a changeset.
     "delivery.version_bump": lambda v: push.bump_of(v),
+    # Code tasks whose spec asks for it land on delivery.push_branch with `ttp push` themselves.
+    "delivery.code_tasks_may_push": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     # The runaway valve on task creation; the coordinator may raise it within MAX_TASKS_PER_DAY.
     # 0 stops new tasks.
     "coordinator.max_new_tasks_per_day": lambda v: max(0, min(int(v), MAX_TASKS_PER_DAY)),
@@ -257,6 +260,9 @@ def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int]) ->
         lines.append(f"## Shared resource {res}: projects give different slot counts ("
                      + ", ".join(f"{k} {n}" for k, n in sorted(got.items())) + f"); all use the smallest, "
                      f"{min(got.values())}")
+    if code_tasks_may_push(p.config()):
+        lines.append(f"## Delivery: code tasks may land on {p.config()['delivery']['push_branch']} with `ttp push` "
+                     f"(delivery.code_tasks_may_push): put the landing in the code task's spec, no separate task")
     lines += memory_digest_lines(memory_view(p, now))
     mem = memory_budget_line(p)
     if mem:

@@ -11605,3 +11605,60 @@ def test_web_schedule_changes_write_back_to_the_schedules_file(env):
     assert next(e for e in _sched_file(p) if e["name"] == "pr-watch")["enabled"] is False
     assert not p.db.one("SELECT enabled FROM schedules WHERE name='pr-watch'")["enabled"]
     assert _harness_log(p)[0] == "schedule pr-watch: changed in the web app"
+
+
+def test_code_tasks_land_their_own_work_only_when_the_project_opts_in(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.project import DEFAULT_CONFIG, code_tasks_may_push, config_problems, unknown_key_hint
+    from ttp.prompts import worker_task
+    assert DEFAULT_CONFIG["delivery"]["code_tasks_may_push"] is False
+    assert unknown_key_hint("delivery.code_tasks_may_push") is None
+    code = p.db.add_task("fix it", "s", kind="code", tier="light", origin="user")
+    review = p.db.add_task("review it", "s", kind="review", tier="light", origin="user")
+
+    def worker(tid):
+        return worker_task(p, p.db.task(tid), str(p.root), None)
+
+    def state():
+        return coord.digest(p, {}, [], [])
+
+    # Default: off, and nothing in the prompts says otherwise.
+    p.set_config("delivery.push_branch", "work")
+    assert not code_tasks_may_push(p.config()) and config_problems(p.raw_config()) == []
+    assert "land on work with ttp push=True" not in worker(code) and "## Delivery" not in state()
+    # Not a bool: reported, and still off.
+    p.set_config("delivery.code_tasks_may_push", "yes")
+    assert not code_tasks_may_push(p.config())
+    assert config_problems(p.raw_config()) == [
+        "delivery.code_tasks_may_push: 'yes' is not true or false; code tasks do not push"]
+    # On without a push branch: still off.
+    p.set_config("delivery.code_tasks_may_push", True)
+    p.set_config("delivery.push_branch", "")
+    assert not code_tasks_may_push(p.config()) and "land on work with ttp push=True" not in worker(code)
+    # On with a push branch: code tasks (not other kinds) are told, and so is the coordinator.
+    p.set_config("delivery.push_branch", "work")
+    assert code_tasks_may_push(p.config()) and config_problems(p.raw_config()) == []
+    assert "code tasks may land on work with ttp push=True" in worker(code)
+    assert "land on work with ttp push=True" not in worker(review)
+    assert "## Delivery: code tasks may land on work with `ttp push`" in state()
+    assert coord.USER_SETTABLE["delivery.code_tasks_may_push"]("true") is True
+    assert coord.USER_SETTABLE["delivery.code_tasks_may_push"]("false") is False
+
+
+def test_the_code_prompt_lands_only_through_the_guarded_push_and_only_when_asked():
+    prompts = RUNTIME.parent / "template" / "prompts"
+    code, review = (prompts / "kind-code.md").read_text(), (prompts / "kind-review.md").read_text()
+    assert "NEVER push to or force-push a shared branch, except as below" in code
+    assert ('"code tasks may land on <branch> with ttp push=True"\n  AND your spec asks you to land on that branch. '
+            "Otherwise never push to a shared branch.") in code
+    assert "NEVER use\n  `git push` to a shared branch" in code
+    assert "longest tool timeout" in code and "NEVER run it detached or in the background" in code
+    # The same exit-code table as the review prompt.
+    for line in ("4: a check failed; hand off `failed` with the output.", "5: the branch kept moving; hand off `waiting`.",
+                 "75: another push to the branch held its turn too long; hand off `waiting` with the `retry_when`"):
+        assert line in code and line in review, line
+    assert "3: rebase conflict" in code and "keeping both sides' intents" in code
+    coordinator = (prompts / "coordinator.md").read_text()
+    assert "With `delivery.code_tasks_may_push` on" in coordinator
+    assert "instead of adding a\n  separate landing, cherry-pick or fast-forward task" in coordinator

@@ -11,7 +11,7 @@ from pathlib import Path
 
 from .db import continues_id, load_result
 from .hook import unread_update
-from .project import WORKER_MEMORY_CHARS, Project
+from .project import WORKER_MEMORY_CHARS, Project, code_tasks_may_push
 from .worktree import project_venv
 
 
@@ -190,7 +190,9 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
         + venv_line
         + f"delivery policy: draft PRs={delivery.get('draft_prs', True)}, review before PR="
         f"{delivery.get('review_before_pr', True)}, auto-merge repos={delivery.get('auto_merge_repos') or 'none'}, "
-        f"push allowed={delivery.get('push_allowed', True)}\n"
+        f"push allowed={delivery.get('push_allowed', True)}"
+        + (f", code tasks may land on {delivery['push_branch']} with ttp push=True"
+           if kind == "code" and code_tasks_may_push(cfg) else "") + "\n"
         f"{history}\n## Spec\n{task['spec'] or task['title']}\n",
         restrictions_block(p)]
     return "\n\n".join(x for x in parts if x.strip())

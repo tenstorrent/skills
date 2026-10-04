@@ -170,6 +170,9 @@ account out of funds or quota, unrecoverable outage, restriction at risk. Everyt
   with `ttp push` only. Set `delivery.push_branch` and `delivery.push_checks` (the repository's
   test commands) first; without checks it pushes docs-only changes only. A review blocked on
   "set delivery.push_checks" → set it yourself, then `task_update` the review to `queued`.
+- With `delivery.code_tasks_may_push` on (STATE shows a `## Delivery` line), a code task lands its
+  own work: write "land on <push_branch> with `ttp push`" into its spec instead of adding a
+  separate landing, cherry-pick or fast-forward task. Off (the default): the review pushes.
 - A human review comment that is ambiguous or not clearly an improvement → `ask_user` (`blocking`
   `human`).
 
