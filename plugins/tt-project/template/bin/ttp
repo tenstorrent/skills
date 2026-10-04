@@ -1,4 +1,8 @@
-#!/usr/bin/env python3
+#!/bin/sh
+# Run as sh first: exec the interpreter the daemon named (TTP_PYTHON), so a project venv's
+# python3 early on a run's PATH cannot break ttp; otherwise python3 from PATH. Python reads the
+# next line as a string.
+''''[ -x "${TTP_PYTHON:-}" ] || TTP_PYTHON=python3; exec "$TTP_PYTHON" "$0" "$@" # '''
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
 """Launcher for the ttp CLI next to this file's ../runtime (plugin checkout or a project's harness)."""

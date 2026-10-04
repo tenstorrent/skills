@@ -1457,6 +1457,34 @@ def test_workers_in_a_fresh_worktree_reuse_the_project_venv(env):
     assert "VIRTUAL_ENV" not in run()
 
 
+def test_ttp_in_a_run_ignores_a_broken_project_venv_python(env):
+    """The venv's bin sits right after the harness bin on a run's PATH: `ttp` must still run under
+    the daemon's interpreter, not whatever `python3` the venv has."""
+    p = make(env)
+    from ttp import __version__
+    from ttp.daemon import Daemon
+    venv = _fake_venv(p.root / ".venv")
+    for name in ("python3", "python"):
+        (venv / "bin" / name).write_text("#!/bin/sh\necho broken venv python >&2\nexit 1\n")
+        (venv / "bin" / name).chmod(0o755)
+    d = Daemon(p.base)
+    tid = p.db.add_task("build it", "s", kind="code", tier="light", origin="user")
+    cwd, _ = d._workdir_for(p.db.task(tid))
+    rid = d.start_run("worker", "go", "claude", "light", cwd, task=p.db.task(tid))
+    (p.runs / str(rid) / "STOP").touch()
+    run_env = json.loads((p.runs / str(rid) / "run.json").read_text())["env"]
+    assert run_env["VIRTUAL_ENV"] == str(venv.resolve())
+    r = subprocess.run(["ttp", "--version"], env=run_env, cwd=cwd, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0 and __version__ in r.stdout + r.stderr, r.stderr
+    # Outside a run (no TTP_PYTHON, or a stale one) the launcher still falls back to python3.
+    for extra in ({}, {"TTP_PYTHON": str(p.root / "gone" / "python3")}):
+        plain = {k: v for k, v in run_env.items() if k not in ("TTP_PYTHON", "VIRTUAL_ENV")}
+        plain["PATH"] = run_env["PATH"].replace(str(venv.resolve() / "bin") + ":", "")
+        r = subprocess.run([str(p.harness / "bin" / "ttp"), "--version"], env={**plain, **extra}, cwd=cwd,
+                           capture_output=True, text=True, timeout=60)
+        assert r.returncode == 0 and __version__ in r.stdout + r.stderr, r.stderr
+
+
 def test_claude_runs_cannot_start_background_tasks_that_die_at_exit(env):
     from ttp.providers import get_provider
     _, worker_env = get_provider("claude").build(role="worker", model="opus", effort="low", cwd=".",

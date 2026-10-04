@@ -509,6 +509,7 @@ class Daemon:
             venv_vars = worktree.venv_env(venv, path) if venv else {}
             env = {**env, **venv_vars, "TTP_RUN_DIR": str(run_dir), "TTP_PROJECT": str(self.p.base),
                    "TTP_RUN_ID": str(run_id), "TTP_TASK": str(task["id"]) if task else "", "PYTHONPATH": runtime_dir,
+                   "TTP_PYTHON": sys.executable,   # `ttp` runs under this, not the venv's python3
                    "PATH": f"{self.p.harness / 'bin'}:{venv_vars.get('PATH', path)}"}
             env.update(git_fsync_env({**os.environ, **env}))   # a power cut must not corrupt workers' commits
             tout = timeout_s or self.cfg["budget"]["run_timeout_s"].get(tier, 3600)
