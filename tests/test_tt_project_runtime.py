@@ -12760,6 +12760,49 @@ def test_claude_hook_denies_gh_through_indirection_and_scripts(env, monkeypatch,
         assert not denied(cmd), cmd
 
 
+def test_claude_hook_scans_only_what_runs(env, monkeypatch, tmp_path):
+    """Prose written to a file, echoed text and files that are only edited or read are data: the
+    hook leaves them alone. A PATH change counts only when gh then runs a guarded write."""
+    from ttp import hook
+    monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path))
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "samples.py").write_text("CMDS = ['/usr/bin/gh pr ready 7', 'PATH=/x gh pr ready 7']\n")
+
+    def denied(cmd):
+        out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(tmp_path)})
+        return bool(out) and out["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    prose = ("Denied: `PATH=/opt/gh/bin:$PATH gh api -X PATCH repos/a/b/pulls/7` and `/usr/bin/gh pr ready 7`, "
+             "and `curl -X PATCH https://api.github.com/repos/a/b/pulls/7 -d '{\"draft\":false}'`.")
+    edit = ("from pathlib import Path\nf = Path(\"tests/samples.py\"); s = f.read_text()\n"
+            "f.write_text(s.replace(\"7\", \"8\"))\n")
+    for cmd in (f"ttp note done; cat > \"$TTP_RUN_DIR/result.json\" <<'EOF'\n{{\"summary\": \"{prose}\"}}\nEOF",
+                f"cat <<-EOF > notes.md\n\t{prose}\n\tEOF\ngit status", "echo 'blocked: PATH=/opt/x gh pr ready 7, `/usr/bin/gh api -X PATCH x`' >> notes.md",
+                "printf '%s\\n' \"see /usr/bin/gh pr ready 7\" >&2",
+                "PATH=/opt/x:$PATH gh api repos/a/b/pulls/7 --jq .draft",
+                "export PATH=/opt/x:/usr/bin; gh api -X GET repos/a/b/pulls -f state=open",
+                "PATH=/opt/x gh api graphql -f query='query { viewer { login } }'",
+                "env -i HOME=$HOME gh pr create --draft -t t", "sed -i 's/7/8/' tests/samples.py",
+                f"python3 - <<'EOF'\n{edit}EOF", f"python3 - tests/samples.py <<'EOF'\n{edit}EOF",
+                f"mkdir -p tmp; cat > tmp/fix.py <<'EOF'\n{edit}EOF\npython3 tmp/fix.py",
+                "grep -n 'gh pr ready' tests/samples.py", "cat tests/samples.py",
+                "git show HEAD:tests/samples.py > tests/samples.py 2>&1",
+                f"cat > r.json <<'EOF'\n{{\"s\": \"{prose}\"}}\nEOF\npython3 -c \"import json; json.load(open('r.json'))\""):
+        assert not denied(cmd), cmd
+    for cmd in ("PATH=/opt/x:$PATH gh pr ready 7", "PATH=/opt/x gh pr create -t t",
+                "export PATH=/opt/x\ngh api repos/a/b/pulls/7 -F draft=false",
+                "PATH=/opt/x gh api graphql -f query='mutation { markPullRequestReadyForReview(input: {}) { x } }'",
+                "PATH=/opt/x bash -c 'gh pr ready 7'", "env -i timeout 60 gh pr ready 7",
+                "PATH=/opt/x python3 -c \"import subprocess; subprocess.run(['gh', 'pr', 'ready', '7'])\"",
+                "echo '/usr/bin/gh pr ready 7' | bash", "echo '/usr/bin/gh pr ready 7' > x.sh; bash x.sh",
+                "echo $(bash -c '/usr/bin/gh pr ready 7')", "cat > x.sh <<'EOF'\n/usr/bin/gh pr ready 7\nEOF\nsh x.sh",
+                "bash <<'EOF'\n/usr/bin/gh pr ready 7\nEOF", "cat <<'EOF' | sh\n/usr/bin/gh pr ready 7\nEOF",
+                "x=$(cat <<'EOF'\n/usr/bin/gh pr ready 7\nEOF\n); echo ok", "python3 tests/samples.py",
+                "echo '/usr/bin/gh pr ready 7' > x; bash < x", "printf '/usr/bin/gh pr ready 7' > x; source x",
+                "cd x\npython3 tests/samples.py"):
+        assert denied(cmd), cmd
+
+
 def test_gh_found_through_command_v_is_still_the_guarded_one(env, tmp_path):
     """`$(command -v gh)` and `command gh` resolve to the harness's gh, which is first on PATH."""
     p = make(env)
