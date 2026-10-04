@@ -11903,6 +11903,7 @@ DURABLE_EXEMPT = {
     ("runner.py", '"progress.md", "a"'): "a wait notice in the progress log",
     ("cli.py", '"progress.md", "a"'): "a wait notice in the progress log",
     ("cli.py", "lock.write_text"): "names a process, which a reboot ends",
+    ("cli.py", 'open(log, "a")'): "the output log of `ttp checks`; its result is written with write_json",
     ("cli.py", "SOURCE_FILE).write_text"): "part of a copied runtime tree; committed or re-installed by setup",
     ("cli.py", '".gitignore").write_text'): "committed to the harness right after",
     ("cli.py", "shim.write_text"): "installed by `ttp setup`, which can be re-run",
@@ -12848,6 +12849,17 @@ def test_prompts_say_only_the_user_takes_a_pr_out_of_draft():
         assert "NEVER mark a PR ready for review" in text and "only the user takes a PR out of draft" in text, name
     coord_text = " ".join((prompts / "coordinator.md").read_text().split())
     assert "A PR leaves draft ONLY on the user's explicit yes" in coord_text and "`pr_approve`" in coord_text
+    worker = " ".join((prompts / "worker.md").read_text().split())
+    assert "NEVER mark a PR ready for review or open one that is not a draft" in worker
+    for name in ("worker.md", "kind-code.md", "kind-review.md"):
+        assert "hand off `blocked` with the PR's URL in `pr`" in " ".join((prompts / name).read_text().split()), name
+    assert "`ttp checks`" in " ".join((prompts / "kind-code.md").read_text().split())
+    # The order: review, findings cleared, ask the user, pr_approve with their words, then gh pr ready.
+    order = ["independent `review` task passes", "pr-watch reports it clean", "ask_user (blocking `review`)",
+             "`pr_approve` it with their words in `quote`", "a worker runs `gh pr ready`"]
+    at = [coord_text.index(o) for o in order]
+    assert at == sorted(at), "the coordinator's delivery steps are out of order"
+    assert "is when to ask (step 3), not when to mark" in coord_text
 
 
 def test_a_run_cannot_post_a_message_as_the_user(env, monkeypatch, tmp_path):
@@ -13471,3 +13483,164 @@ def test_web_api_paths_use_their_own_connection_after_a_coordinator_turn(env):
     assert call(f"/api/task/{other}", {"status": "cancelled"})[0] == 200
     assert call("/api/config", {"key": "budget.daily_usd", "value": 7})[0] == 200
     assert p.db.task(other)["status"] == "cancelled" and p.config()["budget"]["daily_usd"] == 7
+
+
+def test_pr_approve_counts_only_a_clear_yes_in_the_users_own_words(env):
+    """An answer that is not a yes, words the user never wrote, a reply the harness posted and an
+    answer already used once never let a PR out of draft."""
+    p = make(env)
+    from ttp import coordinator as coord, prguard
+    url = "https://github.com/acme/widgets/pull/7"
+
+    def approve(msg, quote):
+        return " ".join(coord.apply(p, [{"type": "pr_approve", "id": msg, "text": url, "quote": quote}]))
+
+    coord.apply(p, [{"type": "ask_user", "text": f"Take {url} out of draft?", "blocking": "review",
+                     "recommendation": "yes"}])
+    ask = p.db.one("SELECT id FROM messages WHERE kind='ask'")["id"]
+    p.db.post("out", "yes", chat="web", kind="reply")   # the harness's own words are not the user's
+    assert "not answered" in approve(ask, "yes")
+    for said in ("no, not yet", "acme/widgets#7 is broken", "yes once CI is green", "ok?"):
+        p.db.post("in", said, chat="web", provenance="web-session")
+        assert "not a clear yes" in approve(ask, said), said
+    assert "never wrote" in approve(ask, "yes, go ahead")
+    assert "needs `quote`" in approve(ask, "")
+    assert not prguard.approved(p.db, "acme/widgets#7")
+    yes = p.db.post("in", "Yes, go ahead", chat="web", provenance="web-session")
+    assert approve(ask, "yes, go ahead") == ""
+    rec = p.db.kv(prguard.APPROVALS_KEY)["acme/widgets#7"]
+    assert rec["answer"] == yes and rec["said"] == "Yes, go ahead" and rec["spent"] is None
+    # Used once, the same answer cannot approve it again.
+    prguard.spend(p.db, {"acme/widgets#7"})
+    assert not prguard.may_ready(p.db, "acme/widgets#7") and prguard.approved(p.db, "acme/widgets#7")
+    assert "fresh yes" in approve(ask, "yes, go ahead")
+
+
+def test_an_approval_is_spent_and_a_pr_back_in_draft_needs_a_fresh_yes(env, tmp_path, monkeypatch):
+    from ttp import coordinator as coord, prguard, watchers
+    from ttp.daemon import Daemon
+    p = make(env)
+    gh = _gh_runner(p, tmp_path)
+    url = "https://github.com/acme/widgets/pull/7"
+    p.db.x("INSERT INTO tasks(title,kind,status,pr_url,created) VALUES('t','code','done',?,?)", (url, time.time()))
+    said = p.db.post("in", f"yes, mark {url} ready", chat="web", provenance="web-session")
+    assert coord.apply(p, [{"type": "pr_approve", "id": said, "text": url, "quote": "yes"}]) == []
+    assert gh("pr", "ready", "7")[0] == 0
+    state = {"isDraft": False}
+    monkeypatch.setattr(watchers, "_gh", lambda args, cwd: None if args[0] == "api" else
+                        {"url": url, "state": "OPEN", "title": "t", **state})
+    d = Daemon(p.base)
+    watchers.watch_prs(d)
+    assert p.db.kv(prguard.UNAPPROVED_KEY) == {}, "a PR the user approved was flagged"
+    state["isDraft"] = True    # the user put it back in draft
+    watchers.watch_prs(d)
+    assert not prguard.approved(p.db, "acme/widgets#7")
+    rc, err, _ = gh("pr", "ready", "7")
+    assert rc == 1 and "hand off `blocked`" in err and "PR's URL" in err
+    assert "fresh yes" in " ".join(coord.apply(p, [{"type": "pr_approve", "id": said, "text": url,
+                                                    "quote": "yes"}]))
+
+
+def test_task_specs_that_take_a_pr_out_of_draft_need_the_users_approval(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    url = "https://github.com/acme/widgets/pull/7"
+    for spec in (f"Mark {url} ready for review.", "Run gh pr ready 7 in acme/widgets#7.",
+                 "Set draft=false on acme/widgets#7 via the API", "Update the description and mark it ready."):
+        out = " ".join(coord.apply(p, [{"type": "task_add", "title": "ready it", "kind": "code", "spec": spec}]))
+        assert "rejected" in out and "approval is not on record" in out, spec
+    assert not p.db.q("SELECT id FROM tasks")
+    for n, spec in enumerate((f"Put {url} back with gh pr ready --undo", "NEVER mark a PR ready for review",
+                              "Make the guard refuse gh pr ready without approval", f"Fix CI on {url}")):
+        assert coord.apply(p, [{"type": "task_add", "title": f"ok {n}", "kind": "code", "spec": spec}]) == [], spec
+    tid = p.db.one("SELECT id FROM tasks WHERE title='ok 3'")["id"]
+    out = " ".join(coord.apply(p, [{"type": "task_update", "id": tid, "spec": f"Then gh pr ready {url}"}]))
+    assert "rejected" in out and "Then gh pr ready" not in p.db.task(tid)["spec"]
+    said = p.db.post("in", f"yes, {url} can leave draft", chat="web", provenance="web-session")
+    assert coord.apply(p, [{"type": "pr_approve", "id": said, "text": url, "quote": "yes"}]) == []
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "spec": f"Then gh pr ready {url}"}]) == []
+
+
+def test_gh_opens_a_draft_pr_only_after_the_runs_checks_passed_on_head(env, tmp_path, monkeypatch):
+    from ttp import cli
+    p = make(env)
+    repo, run = tmp_path / "work", tmp_path / "run"
+    run.mkdir()
+    repo.mkdir()
+    git = ["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=t"]
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / "a.txt").write_text("a\n")
+    subprocess.run([*git, "add", "a.txt"], check=True)
+    subprocess.run([*git, "commit", "-qm", "a"], check=True)
+    gh = _gh_runner(p, tmp_path, run_dir=run, cwd=repo)
+    rc, err, ran = gh("pr", "create", "--draft", "--title", "t")
+    assert rc == 1 and ran == [] and "ttp checks" in err, "a draft PR opened with no checks on record"
+    monkeypatch.setenv("TTP_RUN_DIR", str(run))
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.chdir(repo)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--", "false"])
+    assert e.value.code == 1
+    assert gh("pr", "create", "--draft", "--title", "t")[0] == 1, "failed checks let a draft PR open"
+    cli.main(["checks", "--", "test", "-f", "a.txt"])
+    assert json.loads((run / "checks.json").read_text())["passed"] is True
+    rc, err, ran = gh("pr", "create", "--draft", "--title", "t")
+    assert rc == 0 and ran, err
+    assert gh("api", "repos/acme/widgets/pulls", "-F", "draft=true", "-f", "title=t")[0] == 0
+    (repo / "a.txt").write_text("b\n")
+    with pytest.raises(SystemExit):
+        cli.main(["checks", "--", "true"])   # an uncommitted change is not what the PR shows
+    subprocess.run([*git, "commit", "-qam", "b"], check=True)
+    rc, err, ran = gh("pr", "create", "--draft", "--title", "t")
+    assert rc == 1 and "not on this worktree's HEAD" in err, "checks on an older commit let a PR open"
+
+
+def test_pr_watch_turns_ci_failures_and_bot_comments_into_work_before_the_review_ask(env, monkeypatch):
+    from ttp import coordinator as coord, prguard, watchers
+    from ttp.daemon import Daemon
+    p = make(env)
+    url = "https://github.com/acme/widgets/pull/7"
+    p.db.x("INSERT INTO tasks(title,kind,status,pr_url,created) VALUES('t','code','done',?,?)", (url, time.time()))
+    bot, human = {"__typename": "Bot", "login": "review-bot"}, {"__typename": "User", "login": "dev"}
+    pr = {"url": url, "state": "OPEN", "isDraft": True, "title": "t",
+          "statusCheckRollup": [{"name": "tests", "conclusion": "FAILURE"}]}
+    thread = {"isResolved": False, "isOutdated": False, "comments": {"nodes": [{"author": bot, "url": "u1"}]}}
+    graph = {"data": {"repository": {"pullRequest": {"comments": {"nodes": []}, "reviews": {"nodes": []},
+                                                     "reviewThreads": {"nodes": [thread]}}}}}
+    monkeypatch.setattr(watchers, "_gh", lambda args, cwd: graph if args[0] == "api" else pr)
+    d = Daemon(p.base)
+
+    def events(kind):
+        return [e["text"] for e in p.db.q("SELECT text FROM events WHERE kind=? ORDER BY id", (kind,))]
+
+    def ask():
+        return coord.apply(p, [{"type": "ask_user", "text": f"Review draft {url}?", "blocking": "review",
+                                "recommendation": "yes"}])
+
+    watchers.watch_prs(d)
+    watchers.watch_prs(d)
+    found = events("pr_findings")
+    assert len(found) == 1 and "tests" in found[0] and "1 bot review comment" in found[0] and "code task" in found[0]
+    out = " ".join(ask())
+    assert "rejected" in out and "open findings" in out
+    pr["statusCheckRollup"] = [{"name": "tests", "conclusion": "SUCCESS"}]   # CI fixed; the bot comment is not
+    watchers.watch_prs(d)
+    assert len(events("pr_findings")) == 2 and "rejected" in " ".join(ask())
+    thread["comments"]["nodes"].append({"author": human, "url": "u2"})      # answered on the PR
+    pr["statusCheckRollup"] = [{"name": "tests", "status": "IN_PROGRESS"}]
+    watchers.watch_prs(d)
+    assert "still running" in " ".join(ask()) and not events("pr_clean")
+    pr["statusCheckRollup"] = [{"name": "tests", "conclusion": "SUCCESS"}]
+    watchers.watch_prs(d)
+    clean = events("pr_clean")
+    assert len(clean) == 1 and "ask the user for a draft review" in clean[0]
+    assert ask() == []
+    assert prguard.findings_problem(p.db, "Other PR acme/widgets#8") is None
+    # A bot's top-level comment counts until a person comments after it.
+    graph["data"]["repository"]["pullRequest"]["comments"]["nodes"] = [
+        {"author": bot, "createdAt": "2026-01-02T00:00:00Z", "url": "c1"},
+        {"author": human, "createdAt": "2026-01-01T00:00:00Z", "url": "c0"}]
+    assert watchers.bot_open(graph) == ["c1"]
+    graph["data"]["repository"]["pullRequest"]["comments"]["nodes"].append(
+        {"author": human, "createdAt": "2026-01-03T00:00:00Z", "url": "c2"})
+    assert watchers.bot_open(graph) == []
