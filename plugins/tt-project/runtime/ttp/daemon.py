@@ -33,6 +33,7 @@ from . import coordinator as coord
 from . import integrity
 from . import locks
 from . import machines
+from . import prguard
 from . import release
 from . import runner
 from . import schedule as sched
@@ -2406,16 +2407,21 @@ class Daemon:
         floor = SEVERITY_RANK.get(self.cfg["notify"].get("slack_min_severity", "high"), 2)
         last = int(db.kv("slack_last_out", 0))
         rows = db.q("SELECT * FROM messages WHERE direction='out' AND id>? ORDER BY id LIMIT 20", (last,))
+        # Only an ask that reached Slack can back a PR approval (prguard), so those go whatever their severity.
+        approval_asks = {prguard.BLOCKING_REF + r for r in prguard.APPROVING_REASONS}
         for m in rows:
-            to_slack = ((m["chat"] is None and SEVERITY_RANK.get(m["severity"], 1) >= floor and m["kind"] != "info"
+            wanted = SEVERITY_RANK.get(m["severity"], 1) >= floor or (m["kind"] == "ask" and m["ref"] in approval_asks)
+            to_slack = ((m["chat"] is None and wanted and m["kind"] != "info"
                          and not cleared(db, m, time.time())) or m["chat"] == "slack")
             if to_slack:
                 try:
                     thread = m["ref"] if m["chat"] == "slack" else None
                     ts = sl.post(self.p.name, m["text"], thread_ts=thread)
-                    threads = set(db.kv("slack_threads", []))
-                    threads.add(ts)
-                    db.set_kv("slack_threads", sorted(threads)[-500:])
+                    with db.tx():   # the post's ts: pr_approve reads an ask back from Slack by it
+                        db.x("UPDATE messages SET ext_id=? WHERE id=?", (ts, m["id"]))
+                        threads = set(db.kv("slack_threads", []))
+                        threads.add(ts)
+                        db.set_kv("slack_threads", sorted(threads)[-500:])
                 except Exception as e:
                     log(self.p, f"slack post failed: {e}")
                     if not sl.rejected_message(e):

@@ -49,6 +49,7 @@ class Slack:
         self.user_id = user_id
         self.user_email = user_email
         self._dm: str | None = None
+        self._bot: str | None = None
 
     def call(self, method: str, **params: Any) -> dict:
         data = urllib.parse.urlencode({k: v if isinstance(v, str) else json.dumps(v)
@@ -76,6 +77,12 @@ class Slack:
                 raise SlackError("no Slack user id or email configured")
             self.user_id = self.call("users.lookupByEmail", email=self.user_email)["user"]["id"]
         return self.user_id
+
+    def bot_id(self) -> str | None:
+        """The bot id of this token's app: its own posts carry it as `bot_id`."""
+        if not self._bot:
+            self._bot = self.call("auth.test").get("bot_id")
+        return self._bot
 
     def dm_channel(self) -> str:
         if not self._dm:

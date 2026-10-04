@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS messages (
   severity TEXT NOT NULL DEFAULT 'normal',
   text TEXT NOT NULL, ref TEXT, handled INTEGER NOT NULL DEFAULT 0,
   provenance TEXT,                 -- inbound: the way it came in, set by the writer (prguard.PROVENANCES)
-  ext_id TEXT);                    -- inbound: the message's id in its channel (a Slack message's ts)
+  ext_id TEXT);                    -- its id in its channel: a Slack message's ts (outbound: once posted)
 CREATE INDEX IF NOT EXISTS messages_unhandled ON messages(direction, handled);
 
 CREATE TABLE IF NOT EXISTS tasks (

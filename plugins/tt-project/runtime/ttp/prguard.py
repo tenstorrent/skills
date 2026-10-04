@@ -14,7 +14,10 @@ names the PR itself). It lives in the project database, under APPROVALS_KEY.
 
 Only a message that came in on a channel a run cannot write to counts (APPROVING). Every message
 ends up as a row in the project database, which a run can write, so a Slack message is read back
-from Slack by its ts: it must be the user's, say the same thing and come after the ask.
+from Slack by its ts: it must be the user's, say the same thing and come after the ask. The ask is
+read back too, by the Slack ts the daemon stored when it posted it: it must be this project's bot's
+post, say the same thing and name the PR, and the answer must be in its thread or the DM after it.
+An ask that never reached Slack cannot back an approval.
 
 Claude Code workers also get a PreToolUse hook (hook.py) that denies the obvious ways around this
 wrapper: gh called by its full path, or curl and the like talking to the GitHub API about drafts.
@@ -74,11 +77,12 @@ def pr_keys(text: str) -> set[str]:
 
 # --- the approval record ----------------------------------------------------------------------
 
-def approve(db, pr: str, source_id: int, now: float | None = None, slack=None) -> str:
+def approve(db, pr: str, source_id: int, now: float | None = None, slack=None, project: str | None = None) -> str:
     """Record the user's approval for `pr` (URL or owner/repo#N) from message `source_id`: an ask with
     blocking review or merge that names the PR and whose first answer is the user's, or a user message
     that names the PR. The user's message must have come in on an APPROVING channel; a Slack one is
-    checked against Slack with `slack` (slack.Slack). Raises ValueError otherwise. Returns the PR's key."""
+    checked against Slack with `slack` (slack.Slack), and so is the ask, which `project` posted.
+    Raises ValueError otherwise. Returns the PR's key."""
     key = pr_key(pr)
     if not key:
         raise ValueError(f"pr_approve: {pr!r} names no PR; give its URL or owner/repo#N")
@@ -112,8 +116,9 @@ def approve(db, pr: str, source_id: int, now: float | None = None, slack=None) -
                          f"here yet and the PR stays in draft. Do not ask again: tell the user once (notify) "
                          f"that approving a PR needs a Slack DM, which is set up with `ttp secret slack` and "
                          f"notify.slack")
+    ask_ts = _check_ask(msg, key, project, slack) if answer is not msg else None
     if channel == "slack":
-        _check_slack(answer, key if answer is msg else None, msg["ts"] if answer is not msg else None, slack)
+        _check_slack(answer, key if answer is msg else None, ask_ts, slack)
     with db.tx():
         rec = db.kv(APPROVALS_KEY, {}) or {}
         rec[key] = {"source": int(source_id), "answer": answer["id"], "ts": now or time.time(),
@@ -122,9 +127,49 @@ def approve(db, pr: str, source_id: int, now: float | None = None, slack=None) -
     return key
 
 
-def _check_slack(m: dict, names: str | None, after: float | None, slack) -> None:
+def _check_ask(ask: dict, key: str, project: str | None, slack) -> str:
+    """Read ask `ask` back from Slack by the ts stored when it was posted: it must be this project's
+    bot's post, say what the ask says and name the PR `key`. Returns its Slack ts."""
+    n, ts = ask["id"], ask.get("ext_id")
+    if not ts:
+        raise ValueError(f"pr_approve: ask #{n} has no Slack ts (it never reached Slack), so it cannot back an "
+                         f"approval; ask again (ask_user, blocking review, naming the PR) and have the user answer "
+                         f"on Slack, or approve the user's own message that names the PR")
+    if slack is None:
+        raise ValueError(f"pr_approve: ask #{n} was sent on Slack, but Slack is not set up here to check it")
+    try:
+        found, bot = slack.message(ts), slack.bot_id()
+    except Exception as e:
+        raise ValueError(f"pr_approve: could not read ask #{n} back from Slack ({e}); try again next turn") from None
+    if not found:
+        raise ValueError(f"pr_approve: Slack has no message {ts} for ask #{n}")
+    if not bot or found.get("bot_id") != bot:
+        raise ValueError(f"pr_approve: Slack message {ts} for ask #{n} was not sent by this project's bot")
+    from .slack import BOT_TAG
+    sent = [" ".join(t.split()) for t in _slack_plain(found.get("text") or "")]
+    tag = BOT_TAG.match(sent[0])
+    if not tag or (project and tag.group(1).lower() != project.lower()):
+        raise ValueError(f"pr_approve: Slack message {ts} for ask #{n} was not posted for this project")
+    stored = " ".join(f"{tag.group(0)}{ask['text']}"[:39000].split())   # as slack.Slack.post sends it
+    if stored not in sent:
+        raise ValueError(f"pr_approve: ask #{n} does not match what was sent on Slack ({ts})")
+    if key not in pr_keys(sent[0]):
+        raise ValueError(f"pr_approve: the ask sent on Slack ({ts}) does not name {key}")
+    return ts
+
+
+def _slack_plain(text: str) -> list[str]:
+    """A bot post's text as it was sent: Slack escapes &, < and > and turns links into <url> or <url|label>."""
+    def unescape(t: str) -> str:
+        return t.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+    unlinked = re.sub(r"<([^<>|]+)>", r"\1", re.sub(r"<([^<>|]+)\|([^<>]*)>", r"\2", text))
+    return [unescape(unlinked), unescape(text)]
+
+
+def _check_slack(m: dict, names: str | None, ask_ts: str | None, slack) -> None:
     """Read message `m` back from Slack: it must exist there, be the user's, say what `m` says, name the
-    PR `names` (a message that approves by itself) and come after `after` (an ask's answer)."""
+    PR `names` (a message that approves by itself), and come after the ask at Slack ts `ask_ts`, in its
+    thread or the DM (an ask's answer)."""
     n, ts = m["id"], m.get("ext_id")
     if not ts:
         raise ValueError(f"pr_approve: #{n} has no Slack ts to check it against Slack")
@@ -146,8 +191,13 @@ def _check_slack(m: dict, names: str | None, after: float | None, slack) -> None
         raise ValueError(f"pr_approve: #{n} does not match what the user wrote on Slack ({ts})")
     if names and names not in pr_keys(said):
         raise ValueError(f"pr_approve: the user's Slack message {ts} does not name {names}")
-    if after is not None and float(ts) <= float(after):
-        raise ValueError(f"pr_approve: the user's Slack message {ts} is older than the ask it would answer")
+    if ask_ts is not None:
+        if float(ts) <= float(ask_ts):
+            raise ValueError(f"pr_approve: the user's Slack message {ts} is older than the ask it would answer")
+        thread = found.get("thread_ts")
+        if thread and thread != ts and thread != ask_ts:
+            raise ValueError(f"pr_approve: the user's Slack message {ts} answers another thread, not the ask "
+                             f"({ask_ts})")
 
 
 def approved(db, key: str) -> bool:

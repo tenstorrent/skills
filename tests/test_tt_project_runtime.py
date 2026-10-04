@@ -7130,6 +7130,8 @@ def _fake_slack():
                 return {"messages": [m for m in self.msgs if m["ts"] == kw["ts"]] + [
                     r for r in self.msgs if r.get("thread_ts") == kw["ts"] and r["ts"] != kw["ts"]
                     and float(r["ts"]) > oldest]}
+            if method == "auth.test":
+                return {"user_id": "UB1", "bot_id": "B1"}
             return {}
 
         def post(self, project, text, thread_ts=None):
@@ -12400,7 +12402,10 @@ def test_workers_gh_keeps_prs_in_draft_until_the_user_approves(env, tmp_path):
     assert "provenance=web-session, can approve a PR: yes" in coord.digest(p, {}, [], [yes])
     legacy = p.db.post("in", "yes", chat="cli", provenance="cli-legacy")
     assert "provenance=cli-legacy, can approve a PR: no" in coord.digest(p, {}, [], [legacy])
-    assert coord.apply(p, [{"type": "pr_approve", "id": ask, "text": url}]) == []
+    # The ask never reached Slack, so it cannot back the approval; the user's own message naming the PR can.
+    assert "no Slack ts" in " ".join(coord.apply(p, [{"type": "pr_approve", "id": ask, "text": url}]))
+    said = p.db.post("in", f"yes, mark {url} ready", chat="web", provenance="web-session")
+    assert coord.apply(p, [{"type": "pr_approve", "id": said, "text": url}]) == []
     for args in [("pr", "ready", "7"), ("pr", "ready"), ("rdy", "7"), ("api", "graphql", "-f", READY_7),
                  ("api", "-X", "PATCH", "repos/acme/widgets/pulls/7", "-F", "draft=false")]:
         rc, err, ran = gh(*args)
@@ -12436,7 +12441,9 @@ def test_pr_approve_needs_the_users_answer_naming_the_pr(env):
     note = p.db.post("out", f"Opened {url}", chat=None, kind="alert")
     assert approve(note), "an alert counted as an approval"
     assert not prguard.approved(p.db, "acme/widgets#7")
-    assert approve(review) == []
+    assert "no Slack ts" in " ".join(approve(review)), "an ask that never reached Slack backed an approval"
+    assert not prguard.approved(p.db, "acme/widgets#7")
+    assert approve(p.db.post("in", f"yes, {url}", chat="web", provenance="cli-peer")) == []
     assert prguard.approved(p.db, "acme/widgets#7")
     said = p.db.post("in", "please mark acme/widgets#9 ready for review", chat="web", provenance="web-session")
     assert approve(said, "https://github.com/acme/widgets/pull/9") == []
@@ -12518,22 +12525,121 @@ def test_pr_approve_reads_a_slack_approval_back_from_slack(env, monkeypatch):
     rec = p.db.kv(prguard.APPROVALS_KEY)["acme/widgets#7"]
     assert rec["channel"] == "slack" and rec["external_id"] == f"{now - 30:.6f}" and rec["answer"] == real
 
-    # An ask answered by an old Slack message (a replayed yes) is refused; a reply after it counts.
-    coord.apply(p, [{"type": "ask_user", "text": "Ready acme/widgets#9 for review?", "blocking": "review",
-                     "recommendation": "yes"}])
-    ask = p.db.one("SELECT id, ts FROM messages WHERE kind='ask' ORDER BY id DESC")
-    sl.msgs.append({"ts": f"{now - 20:.6f}", "user": "U1", "text": "yes"})
-    slack_row("yes", f"{now - 20:.6f}")
+    # An ask is answered on Slack after it: in its thread or the DM, never by an older message (a replayed
+    # yes) or a reply in another thread. Review asks reach Slack below slack_min_severity, with their ts.
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    d.cfg["notify"]["slack"] = True
+    d._slack = sl
+
+    def asked(text, **kw):
+        coord.apply(p, [{"type": "ask_user", "text": text, "blocking": "review", "recommendation": "yes", **kw}])
+        d.deliver_outbound()
+        return p.db.one("SELECT id, ext_id FROM messages WHERE kind='ask' ORDER BY id DESC")
+
+    def answer(ask, dt, thread=None):
+        ts = f"{float(ask['ext_id']) + dt:.6f}"
+        sl.msgs.append({"ts": ts, "user": "U1", "text": "yes", **({"thread_ts": thread} if thread else {})})
+        slack_row("yes", ts, ref=thread)
+        return ts
+
+    ask = asked("Ready acme/widgets#9 for review?", severity="normal")
+    assert any(m["ts"] == ask["ext_id"] and m.get("bot_id") for m in sl.msgs), "the review ask missed Slack"
+    answer(ask, -0.5)
     assert "older than the ask" in approve(ask["id"], "acme/widgets#9")
-    later = f"{ask['ts'] + 5:.6f}"
-    sl.msgs.append({"ts": later, "user": "U1", "text": "yes", "thread_ts": f"{now - 30:.6f}"})
-    coord.apply(p, [{"type": "ask_user", "text": "Ready acme/widgets#9 for review now?", "blocking": "review",
-                     "recommendation": "yes"}])
-    ask2 = p.db.one("SELECT id FROM messages WHERE kind='ask' ORDER BY id DESC")["id"]
-    p.db.x("UPDATE messages SET ts=? WHERE id=?", (ask["ts"], ask2))
-    slack_row("yes", later, ref=f"{now - 30:.6f}")
-    assert approve(ask2, "acme/widgets#9") == ""
+    ask = asked("Ready acme/widgets#9 for review now?")
+    answer(ask, 0.5, thread=f"{now - 30:.6f}")
+    assert "answers another thread" in approve(ask["id"], "acme/widgets#9")
+    ask = asked("Mark acme/widgets#9 ready?")
+    later = answer(ask, 0.5, thread=ask["ext_id"])
+    assert approve(ask["id"], "acme/widgets#9") == ""
     assert p.db.kv(prguard.APPROVALS_KEY)["acme/widgets#9"]["external_id"] == later
+    ask = asked("Mark acme/widgets#10 ready?")
+    answer(ask, 0.5)                    # a top-level yes in the DM after the ask counts too
+    assert approve(ask["id"], "acme/widgets#10") == ""
+
+
+def test_pr_approve_reads_the_ask_back_from_slack(env, monkeypatch):
+    """A run that can write the database could add an ask row before a yes the user gave earlier. The ask
+    is read back from Slack by the ts the daemon stored when it posted it: a row with no Slack ts, with an
+    old ts, pointing at another post, another project's post or an ask for another PR is refused."""
+    p = make(env)
+    from ttp import coordinator as coord, prguard, slack as slackmod
+    from ttp.daemon import Daemon
+    sl = _fake_slack()
+    monkeypatch.setattr(slackmod, "from_config", lambda cfg: sl)
+    d = Daemon(p.base)
+    d.cfg["notify"]["slack"] = True
+    d._slack = sl
+    url = "https://github.com/acme/widgets/pull/7"
+
+    def approve(msg, pr=url):
+        return " ".join(coord.apply(p, [{"type": "pr_approve", "id": msg, "text": pr}]))
+
+    def yes(ts, thread=None):          # the user's real yes on Slack, and its row
+        sl.msgs.append({"ts": ts, "user": "U1", "text": "yes", **({"thread_ts": thread} if thread else {})})
+        return p.db.post("in", "yes", chat="slack", channel="slack", ref=thread or ts, provenance="slack",
+                         ext_id=ts)
+
+    def forged(text, ts=None, ext_id=None):
+        mid = p.db.post("out", text, chat=None, kind="ask", severity="high", ref="blocking:review")
+        p.db.x("UPDATE messages SET ext_id=?, ts=COALESCE(?, ts) WHERE id=?", (ext_id, ts, mid))
+        return mid
+
+    t0 = time.time() - 3600
+    yes(f"{t0:.6f}")                   # an old yes, given to something else
+    # A forged ask with an old ts and no Slack ts, followed by a copy of that old yes.
+    ask = forged(f"Ready {url} for review?", ts=t0 - 60)
+    p.db.post("in", "yes", chat="slack", channel="slack", ref=f"{t0:.6f}", provenance="slack", ext_id=f"{t0:.6f}")
+    assert "no Slack ts" in approve(ask)
+    # ...pointing at a Slack ts that has no message, or at the user's own message.
+    ask = forged(f"Ready {url} for review?", ext_id=f"{t0 - 60:.6f}")
+    yes(f"{t0 + 1:.6f}")
+    assert "Slack has no message" in approve(ask)
+    ask = forged(f"Ready {url} for review?", ext_id=f"{t0:.6f}")
+    yes(f"{t0 + 2:.6f}")
+    assert "not sent by this project's bot" in approve(ask)
+    # ...at another project's post, or at a post of this project that says something else.
+    other = sl.post("other", f"Ready {url} for review?")
+    ask = forged(f"Ready {url} for review?", ext_id=other)
+    yes(f"{float(other) + 0.5:.6f}", thread=other)
+    assert "not posted for this project" in approve(ask)
+    coord.apply(p, [{"type": "notify", "text": f"Opened {url}", "severity": "high"}])
+    d.deliver_outbound()
+    alert = p.db.one("SELECT ext_id FROM messages WHERE kind='alert' ORDER BY id DESC")["ext_id"]
+    ask = forged(f"Ready {url} for review?", ext_id=alert)
+    yes(f"{float(alert) + 0.5:.6f}", thread=alert)
+    assert "does not match" in approve(ask)
+    # ...at a real ask for another PR, reworded to name this one.
+    coord.apply(p, [{"type": "ask_user", "text": "Ready acme/widgets#8 for review?", "blocking": "review",
+                     "recommendation": "yes"}])
+    d.deliver_outbound()
+    real8 = p.db.one("SELECT id, ext_id FROM messages WHERE kind='ask' ORDER BY id DESC")
+    ask = forged(f"Ready {url} for review?", ext_id=real8["ext_id"])
+    yes(f"{float(real8['ext_id']) + 0.5:.6f}", thread=real8["ext_id"])
+    assert "does not match" in approve(ask)
+    assert not prguard.approved(p.db, "acme/widgets#7") and not prguard.approved(p.db, "acme/widgets#8")
+    # ...at a real ask for this PR, but answered by a yes from before it.
+    coord.apply(p, [{"type": "ask_user", "text": f"Ready {url} for review now? Tests & CI are green (<1 h old).",
+                     "blocking": "review",
+                     "recommendation": "yes"}])
+    d.deliver_outbound()
+    real7 = p.db.one("SELECT id, ext_id, text FROM messages WHERE kind='ask' ORDER BY id DESC")
+    ask = forged(real7["text"], ts=t0 - 60, ext_id=real7["ext_id"])
+    p.db.post("in", "yes", chat="slack", channel="slack", ref=f"{t0:.6f}", provenance="slack", ext_id=f"{t0:.6f}")
+    assert "older than the ask" in approve(ask)
+    assert not prguard.approved(p.db, "acme/widgets#7")
+    # A real ask, as Slack returns it (links in <>, &, < and > escaped), backs the user's yes after it.
+    coord.apply(p, [{"type": "ask_user", "text": f"Mark {url} ready? Tests & CI are green (<1 h old).",
+                     "blocking": "review", "recommendation": "yes"}])
+    d.deliver_outbound()
+    real7 = p.db.one("SELECT id, ext_id, text FROM messages WHERE kind='ask' ORDER BY id DESC")
+    post = next(m for m in sl.msgs if m["ts"] == real7["ext_id"])
+    escaped = real7["text"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    post["text"] = f"[{p.name}] " + escaped.replace(url, f"<{url}>")
+    yes(f"{float(real7['ext_id']) + 0.5:.6f}", thread=real7["ext_id"])
+    assert approve(real7["id"]) == "", "the user's yes to the real ask was refused"
+    assert prguard.approved(p.db, "acme/widgets#7") and not prguard.approved(p.db, "acme/widgets#8")
 
 
 def test_inbound_messages_carry_the_channel_they_came_in_on(env, tmp_path, monkeypatch):

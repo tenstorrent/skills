@@ -661,7 +661,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
             elif t == "pr_approve":
                 from .slack import from_config
                 prguard.approve(db, str(a.get("text") or a.get("value") or ""), int(a.get("id") or 0),
-                                slack=from_config(cfg))
+                                slack=from_config(cfg), project=p.name)
             elif t == "notify":
                 db.post("out", a["text"], chat=None, kind="alert", severity=_norm_severity(a.get("severity")))
             elif t == "memory_add":
