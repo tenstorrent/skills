@@ -60,8 +60,9 @@ def charter_sections(charter: str) -> list[tuple[str, list[str]]]:
 
 
 def _placeholder(par: str) -> bool:
-    """A paragraph the template left to be filled in: wholly in parentheses, such as "(none stated
-    yet)", or ending in "(none stated yet)"."""
+    """A paragraph the template left to be filled in: "(none stated yet)" (alone or ending a
+    paragraph), "(to be ...)" or "(... to be filled in)". Other parenthesised paragraphs are real
+    charter text and stay."""
     s = " ".join(par.split())
     if s.endswith("(none stated yet)"):
         return True
@@ -70,9 +71,9 @@ def _placeholder(par: str) -> bool:
     depth = 0
     for i, c in enumerate(s):
         depth += (c == "(") - (c == ")")
-        if depth == 0:
-            return i == len(s) - 1   # the opening parenthesis closes only at the end
-    return False
+        if depth == 0 and i != len(s) - 1:
+            return False   # the opening parenthesis must close only at the end
+    return s.startswith("(to be ") or s.endswith("to be filled in)")
 
 
 def charter_without_placeholders(charter: str) -> str:

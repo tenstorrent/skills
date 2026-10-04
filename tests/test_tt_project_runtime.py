@@ -1637,9 +1637,9 @@ def test_worker_prompt_drops_placeholders_and_keeps_restrictions_verbatim(env):
         "## Restrictions (added 2026-09-30)\nNever push to main (the user merges).\n  - (and never force-push)\n")
     system = worker_system(p)
     for gone in ("(to be restated", "(none stated yet)", "## Goals and success criteria", "## Resources",
-                 "(machines", "(drafts first)"):
+                 "(machines"):
         assert gone not in system, f"{gone!r} is still in the worker prompt"
-    assert "Keep it tidy." in system and "## Policies\n- Auto-merge repositories: none (the user merges)." in system
+    assert "Keep it tidy." in system and "## Policies\n(drafts first)\n\n- Auto-merge repositories: none (the user merges)." in system
     assert system.startswith("# BINDING RESTRICTIONS")
     assert "\nNever push to main (the user merges).\n  - (and never force-push)\n" in system
 
@@ -11105,3 +11105,11 @@ def test_web_api_config_rejects_a_bad_value_with_400(env):
     assert code == 400 and "lots" in err["error"], err
     assert post({"key": "budget.max_parallel_workers", "value": 3}) == (200, None)
     assert p.config()["budget"]["max_parallel_workers"] == 3
+def test_worker_prompt_keeps_real_parenthesised_paragraphs(env):
+    from ttp.prompts import charter_without_placeholders
+    charter = ("# demo\n\n## Goals\n(to be restated by the coordinator from the brief)\n\n"
+               "## Policies\n(Note: never run on weekends.)\n\n"
+               "## Resources\n(machines, devices — to be filled in)\n")
+    out = charter_without_placeholders(charter)
+    assert "(Note: never run on weekends.)" in out and "## Policies" in out
+    assert "to be restated" not in out and "to be filled in" not in out
