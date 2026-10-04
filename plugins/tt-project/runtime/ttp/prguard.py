@@ -29,6 +29,10 @@ from pathlib import Path
 APPROVALS_KEY = "pr_ready_approvals"   # kv: {"owner/repo#N": {"ask": id, "answer": id, "ts": t}}
 BLOCKING_REF = "blocking:"             # an ask message's ref: why the user must answer it
 APPROVING_REASONS = ("review", "merge")
+# The pr-watch watcher (watchers.py) flags PRs out of draft with no approval record:
+UNAPPROVED_KEY = "pr_ready_unapproved"     # kv: {"owner/repo#N": {"task": id, "url": u, "since": t}}
+UNAPPROVED_ALERT = "pr-ready"              # alert key "pr-ready:owner/repo#N", held while flagged
+PREDATES_KEY = "pr_ready_predates_guard"   # kv: PR URLs already out of draft when the check first ran
 
 PR_URL_RE = re.compile(r"https?://[^/\s]+/([\w.-]+)/([\w.-]+)/pull/(\d+)", re.I)
 PR_REF_RE = re.compile(r"(?<![\w./-])([\w.-]+)/([\w.-]+)#(\d+)\b")

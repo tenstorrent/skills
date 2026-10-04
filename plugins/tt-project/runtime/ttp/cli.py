@@ -475,6 +475,10 @@ def cmd_connect(a) -> None:
 
 
 def cmd_say(a) -> None:
+    if os.environ.get("TTP_RUN_ID") or os.environ.get("TTP_RUN_DIR"):
+        # A message posted here counts as the user's (pr_approve reads approvals from it), so a run
+        # must not post one. Runs report through `ttp note` and their hand-off.
+        die("ttp say posts a message as the user and is refused inside a run; use `ttp note` or the hand-off")
     p, entry = resolve(a.name)
     text = a.text if a.text != "-" else sys.stdin.read()
     if not text.strip():

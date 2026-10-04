@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import time
 
+from . import prguard
 from .db import DB, SEVERITY_RANK
 from .schedule import failing
 
@@ -29,6 +30,7 @@ CLEARED_TEXT = {
     "schedule": "Schedule {arg} runs again.",
     "release-older": "The installed tt-project is no longer older than this harness.",
     "integrity": "The harness and the task worktrees check out again.",
+    "pr-ready": "{arg} is back in draft, closed or approved.",
 }
 
 
@@ -84,6 +86,8 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
         # The next run that does not fail ends it, as does disabling or removing the schedule.
         row = db.one("SELECT last_status FROM schedules WHERE name=? AND enabled=1", (arg,))
         return bool(row) and failing(row["last_status"])
+    if kind == "pr-ready":   # the pr-watch watcher keeps the flag while the PR is out of draft unapproved
+        return arg in (db.kv(prguard.UNAPPROVED_KEY, {}) or {}) and not prguard.approved(db, arg)
     if key == "run-start":
         return not db.one("SELECT id FROM runs WHERE role!='coordinator' AND started>? LIMIT 1", (since,))
     return now - since < DAY
@@ -104,7 +108,7 @@ def active(db: DB, key: str, ts: float, now: float) -> bool:
 
 def _checkable(key: str) -> bool:
     return key.partition(":")[0] in ("auth", "limit", "budget", "disk", "coordinator", "run-start", "schedule",
-                                         "release-older", "integrity")
+                                         "release-older", "integrity", "pr-ready")
 
 
 def _since(ep: dict) -> float:

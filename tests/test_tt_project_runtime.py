@@ -11945,3 +11945,121 @@ def test_prompts_say_only_the_user_takes_a_pr_out_of_draft():
         assert "NEVER mark a PR ready for review" in text and "only the user takes a PR out of draft" in text, name
     coord_text = " ".join((prompts / "coordinator.md").read_text().split())
     assert "A PR leaves draft ONLY on the user's explicit yes" in coord_text and "`pr_approve`" in coord_text
+
+
+def test_a_run_cannot_post_a_message_as_the_user(env, monkeypatch, tmp_path):
+    """pr_approve reads the user's yes from inbound messages, so a run that could post one could
+    approve its own PR. `ttp say` refuses inside a run, and the Claude hook denies the ways around it."""
+    from ttp import cli, hook
+    p = make(env)
+    before = p.db.one("SELECT COUNT(*) AS n FROM messages WHERE direction='in'")["n"]
+    monkeypatch.setenv("TTP_RUN_ID", "41")
+    monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path))
+    assert _say(cli, "demo", "--", f"yes, mark {p.name} ready") == 2
+    assert p.db.one("SELECT COUNT(*) AS n FROM messages WHERE direction='in'")["n"] == before
+
+    def denied(cmd):
+        out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": cmd}})
+        return bool(out)
+    for cmd in ("env -u TTP_RUN_ID -u TTP_RUN_DIR ttp say demo -- yes", "cd x && ~/.local/bin/ttp say demo yes",
+                "curl -X POST -H \"Authorization: Bearer $(cat state/web.token)\" http://127.0.0.1:8000/api/say "
+                "-d '{\"text\":\"yes\"}'"):
+        assert denied(cmd), cmd
+    for cmd in ("ttp note 'never use ttp say here'", "grep -rn 'ttp say' skills/", "grep -n /api/say web.py",
+                "ttp status demo"):
+        assert not denied(cmd), cmd
+    monkeypatch.delenv("TTP_RUN_ID")
+    monkeypatch.delenv("TTP_RUN_DIR")
+    cli.main(["say", "demo", "--", "hello"])
+    assert p.db.one("SELECT COUNT(*) AS n FROM messages WHERE direction='in'")["n"] == before + 1
+
+
+def test_claude_hook_denies_gh_through_indirection_and_scripts(env, monkeypatch, tmp_path):
+    from ttp import hook
+    monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path))
+    (tmp_path / "ready.py").write_text("import os, requests\nrequests.patch('https://api.github.com/repos/a/b/pulls/7',"
+                                       " json={'draft': False}, headers={'Authorization': os.environ['GH_TOKEN']})\n")
+    (tmp_path / "abs.py").write_text("import subprocess\nsubprocess.run(['/usr/bin/gh', 'pr', 'ready', '7'])\n")
+    (tmp_path / "open.sh").write_text("curl -H \"Authorization: token $GITHUB_TOKEN\" -X POST "
+                                      "\"$GITHUB_API_URL/repos/a/b/pulls\" -d @pr.json\n")
+    (tmp_path / "fine.py").write_text("import json\nprint(json.dumps({'draft': False}))\n")
+    (tmp_path / "read.sh").write_text("curl -H \"Authorization: token $GH_TOKEN\" https://api.github.com/repos/a/b/pulls/7\n")
+
+    def denied(cmd):
+        out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(tmp_path)})
+        return bool(out) and out["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    for cmd in ('"/usr/bin/gh" pr ready 7', "G=/usr/bin/gh; $G pr ready 7", '"$(which -a gh | tail -n1)" pr ready 7',
+                '"$(whereis gh | cut -d" " -f2)" api graphql -f query=q', "PATH=/usr/bin gh pr ready 7",
+                "env PATH=/usr/bin:$PATH gh pr create -t t", "env -i gh pr ready 7", "hash -p /usr/bin/gh gh; gh pr ready 7",
+                "export PATH=/usr/local/bin:/usr/bin; gh api -X PATCH repos/a/b/pulls/7 -F draft=false",
+                "curl -X PATCH -H \"Authorization: bearer $GH_TOKEN\" \"$API/repos/a/b/pulls/7\" -d '{\"draft\":false}'",
+                "python3 ready.py", f"GH_TOKEN=x nohup python3 {tmp_path}/abs.py &", "bash -e open.sh",
+                "ttp lock gh -- python3 ready.py", "timeout -s KILL 60 python3 abs.py"):
+        assert denied(cmd), cmd
+    for cmd in ("gh pr ready 7", '"$(command -v gh)" pr ready 7', "PATH=$PATH:/opt/x gh pr create --draft",
+                "PATH=\"$PATH:/opt/x\" make", "which -a gh", "env -i make", "python3 fine.py", "bash read.sh",
+                "python3 -m pytest -q ready.py", "cat ready.py abs.py", "gh api repos/a/b/pulls/7",
+                "curl -H \"Authorization: token $GH_TOKEN\" https://api.github.com/repos/a/b/pulls/7",
+                "echo $HOME api", "git push origin HEAD"):
+        assert not denied(cmd), cmd
+
+
+def test_gh_found_through_command_v_is_still_the_guarded_one(env, tmp_path):
+    """`$(command -v gh)` and `command gh` resolve to the harness's gh, which is first on PATH."""
+    p = make(env)
+    _gh_runner(p, tmp_path)
+    fake = tmp_path / "realbin"
+    env_ = {**os.environ, "PATH": f"{p.harness / 'bin'}:{fake}:{os.environ['PATH']}", "TTP_PROJECT": str(p.base),
+            "TTP_PYTHON": sys.executable, "FAKE_GH_LOG": str(tmp_path / "gh.log")}
+    env_.pop("PYTHONPATH", None)
+    for cmd in ('"$(command -v gh)" pr ready 7', "command gh pr ready 7", 'G=$(which gh); "$G" pr ready 7'):
+        r = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, env=env_, timeout=60)
+        assert r.returncode == 1 and "refused" in r.stderr, cmd
+    assert (tmp_path / "gh.log").read_text() == ""
+
+
+def test_pr_watch_alerts_when_a_pr_leaves_draft_without_approval(env, monkeypatch):
+    from ttp import alerts, coordinator as coord, prguard, watchers
+    from ttp.daemon import Daemon
+    p = make(env)
+    old, new = "https://github.com/acme/widgets/pull/3", "https://github.com/acme/widgets/pull/7"
+    for n, url in ((1, old), (2, new)):
+        p.db.x("INSERT INTO tasks(title,kind,status,pr_url,created) VALUES(?,?,?,?,?)",
+               (f"t{n}", "code", "done", url, time.time()))
+    state = {old: {"isDraft": False}, new: {"isDraft": True}}
+    monkeypatch.setattr(watchers, "_gh", lambda args, cwd: {"url": args[2], "state": "OPEN", "title": "t",
+                                                            **state[args[2]]})
+    # PRs out of draft before this check existed are not flagged.
+    p.db.set_kv("pr_signatures", {old: {"state": "OPEN", "draft": False}})
+    d = Daemon(p.base)
+
+    def alerting():
+        return [m["text"] for m in p.db.q("SELECT * FROM messages WHERE kind='alert' AND ref LIKE 'pr-ready:%'")
+                if alerts.active(p.db, m["ref"], m["ts"], time.time())]
+
+    watchers.watch_prs(d)
+    assert alerting() == [] and not p.db.q("SELECT id FROM events WHERE kind='pr_unapproved_ready'")
+    state[new]["isDraft"] = False      # something took #7 out of draft with no approval on record
+    watchers.watch_prs(d)
+    watchers.watch_prs(d)
+    shown = alerting()
+    assert len(shown) == 1 and new in shown[0] and "approval" in shown[0]
+    ev = p.db.q("SELECT text FROM events WHERE kind='pr_unapproved_ready'")
+    assert len(ev) == 1 and new in ev[0]["text"], "the coordinator should hear it once"
+    # The user approves it after the fact: the alert clears at once.
+    said = p.db.post("in", f"yes, {new} can stay ready", chat="web")
+    assert coord.apply(p, [{"type": "pr_approve", "id": said, "text": new}]) == []
+    assert alerting() == []
+    alerts.sweep(p.db)
+    assert p.db.one("SELECT cleared FROM alerts WHERE key='pr-ready:acme/widgets#7'")["cleared"]
+    # Back in draft clears the flag too, and leaving draft again unapproved flags it again.
+    p.db.set_kv(prguard.APPROVALS_KEY, {})
+    state[new]["isDraft"] = True
+    watchers.watch_prs(d)
+    assert p.db.kv(prguard.UNAPPROVED_KEY) == {}
+    state[old]["isDraft"] = True
+    watchers.watch_prs(d)
+    state[old]["isDraft"] = False      # #3 was grandfathered only until it went back to draft
+    watchers.watch_prs(d)
+    assert set(p.db.kv(prguard.UNAPPROVED_KEY)) == {"acme/widgets#3"}
