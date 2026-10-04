@@ -5,7 +5,12 @@ project's checks passed on exactly the commit being pushed, and never with force
 
 Pushes of one project to one branch take turns: each holds the lock `push:<remote>/<branch>` from
 its first fetch to its push, so two reviewers never race each other through rounds. The lock is an
-OS file lock (locks.py): a killed push or a reboot frees it."""
+OS file lock (locks.py): a killed push or a reboot frees it. A waiting push waits as long as the
+last measured check run takes, with a margin (`delivery.push_wait_s` overrides it).
+
+With `delivery.version_bump` set, the push also owns the version bump: after each rebase it sets the
+listed files one patch version above the tip's and adds a changeset, in one commit of its own. The
+bump happens under the lock, so parallel pushes never race for one version."""
 from __future__ import annotations
 
 import json
@@ -22,13 +27,17 @@ from urllib.parse import quote
 
 from . import locks
 from .budget import DOC_SUFFIXES
-from .project import Project
+from .project import Project, durable_write, write_json
 
 # Exit codes, distinct so a worker can say why it did not push. BUSY: another push to the same
 # branch kept the lock past `delivery.push_wait_s`; the task hands back `waiting`.
 REFUSED, CONFLICT, CHECKS_FAILED, KEPT_MOVING, REJECTED, BUSY = 2, 3, 4, 5, 6, 75
 DEFAULT_ROUNDS = 3
-DEFAULT_WAIT_S = 300
+DEFAULT_WAIT_S = 900       # the lock wait with no measured check run, and its floor otherwise
+WAIT_MARGIN_S = 60          # on top of two check runs: the holder may start over once
+TIMINGS = "push_checks.json"   # under the project's state: how long the last full check run took
+BUMP_TRAILER = "Ttp-Version-Bump"   # marks the bump commit ttp push made, so a rerun replaces it
+VERSION_RE = re.compile(r"""(version(?:__)?["']?\s*[:=]\s*["'])(\d+)\.(\d+)\.(\d+)(["'])""", re.I)
 PROTECTED = {"HEAD", "main", "master"}
 NO_CHECKS = ("set delivery.push_checks to the commands that must pass on the exact commit before it "
              "is pushed (a list, or one per line, e.g. the repository's test suite); the coordinator "
@@ -192,6 +201,164 @@ def wait_of(v: Any) -> float:
         raise ValueError(f"delivery.push_wait_s must be a number of seconds, not {v!r}") from None
 
 
+def last_check_s(p: Project) -> float | None:
+    """Seconds the project's last full, passing check run took, or None when none was measured."""
+    try:
+        v = json.loads((p.state / TIMINGS).read_text()).get("last_s")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0 else None
+
+
+def record_check_s(p: Project, seconds: float) -> None:
+    write_json(p.state / TIMINGS, {"last_s": round(seconds, 1), "at": time.time()})
+
+
+def default_wait(last_s: float | None) -> float:
+    """The lock wait when `delivery.push_wait_s` is unset: long enough for the holder to run its
+    checks twice (it starts over when the branch moved), and never under DEFAULT_WAIT_S."""
+    return float(DEFAULT_WAIT_S) if last_s is None else max(float(DEFAULT_WAIT_S), 2 * last_s + WAIT_MARGIN_S)
+
+
+def bump_of(v: Any) -> dict | None:
+    """`delivery.version_bump` as {"files", "changeset_dir", "package", "paths"}, or None when unset;
+    ValueError when it is malformed. `files` are repo-relative files holding the version; `paths`
+    (default: the folder the files share) are where a change counts as one that needs a bump."""
+    if v is None or v == "" or v == {}:
+        return None
+    if isinstance(v, str):
+        try:
+            v = json.loads(v)
+        except ValueError:
+            raise ValueError(f"delivery.version_bump must be an object with `files`, not {v!r}") from None
+    if not isinstance(v, dict):
+        raise ValueError(f"delivery.version_bump must be an object with `files`, not {v!r}")
+    unknown = set(v) - {"files", "changeset_dir", "package", "paths"}
+    if unknown:
+        raise ValueError(f"delivery.version_bump: unknown keys {', '.join(sorted(unknown))}")
+
+    def rel_list(key: str) -> list[str]:
+        items = v.get(key) or []
+        if isinstance(items, str):
+            items = [items]
+        if not isinstance(items, list) or not all(isinstance(x, str) and x.strip() for x in items):
+            raise ValueError(f"delivery.version_bump.{key} must be a list of repo-relative paths")
+        out = [x.strip().strip("/") for x in items]
+        if any(x.startswith("..") or x.startswith("~") or not x for x in out) or any(x.startswith("/") for x in items):
+            raise ValueError(f"delivery.version_bump.{key} must be a list of repo-relative paths")
+        return out
+    files = rel_list("files")
+    if not files:
+        raise ValueError("delivery.version_bump.files must list the files that hold the version")
+    paths = rel_list("paths") or [os.path.commonpath(files) if len(files) > 1 else os.path.dirname(files[0])]
+    for key in ("changeset_dir", "package"):
+        if v.get(key) is not None and not isinstance(v[key], str):
+            raise ValueError(f"delivery.version_bump.{key} must be a string")
+    return {"files": files, "paths": paths, "package": (v.get("package") or "").strip(),
+            "changeset_dir": (v.get("changeset_dir") or "").strip().strip("/")}
+
+
+def bump_problems(v: Any) -> list[str]:
+    try:
+        bump_of(v)
+    except ValueError as e:
+        return [str(e)]
+    return []
+
+
+def _under(path: str, dirs: list[str]) -> bool:
+    return any(not d or path == d or path.startswith(d + "/") for d in dirs)
+
+
+def _drop_own_bump(repo: Path) -> None:
+    """Drop the bump commits an earlier round or run of ttp push left on top of HEAD; the next
+    rebase lands on a tip that may have taken that version, so the bump is made again after it."""
+    while re.search(rf"^{BUMP_TRAILER}: ", _git(repo, "log", "-1", "--format=%B").stdout, re.M):
+        if _git(repo, "rev-parse", "--verify", "--quiet", "HEAD~1").returncode != 0 \
+                or _git(repo, "reset", "-q", "--hard", "HEAD~1").returncode != 0:
+            return
+
+
+def _slug(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:60].strip("-") or "change"
+
+
+def bump(repo: Path, tip: str, cfg: dict, say: Callable[[str], None]) -> int:
+    """After a rebase onto `tip`: when the change touches `cfg["paths"]`, set every file in
+    `cfg["files"]` one patch version above the highest version they hold at tip, add a changeset
+    for the change when it brings none, and commit both as one `<package>: X.Y.Z (<subject>)`
+    commit. 0 when done or not needed; REFUSED when a file holds no version to bump."""
+    files, csdir = cfg["files"], cfg["changeset_dir"]
+    changed = _git(repo, "diff", "--name-only", "--no-renames", tip, "HEAD").stdout.split()
+    if not any(_under(f, cfg["paths"]) and f not in files and not (csdir and _under(f, [csdir]))
+               for f in changed):
+        return 0
+    at_tip = []
+    for f in files:
+        show = _git(repo, "show", f"{tip}:{f}")
+        m = VERSION_RE.search(show.stdout) if show.returncode == 0 else None
+        if m:
+            at_tip.append(tuple(int(x) for x in m.group(2, 3, 4)))
+    if not at_tip:
+        return 0                 # the versioned files are new here: their version is the change's own
+    major, minor, patch = max(at_tip)
+    new = f"{major}.{minor}.{patch + 1}"
+    package, texts = cfg["package"], {}
+    for f in files:            # all checked before any is written, so a refusal leaves the tree clean
+        path = repo / f
+        try:
+            text = path.read_text()
+        except OSError:
+            text = ""
+        if not VERSION_RE.search(text):
+            say(f"delivery.version_bump: {f} holds no version to bump; not pushing")
+            return REFUSED
+        text = VERSION_RE.sub(lambda m: f"{m.group(1)}{new}{m.group(5)}", text, count=1)
+        if f.endswith(".json"):
+            try:
+                doc = json.loads(text)
+                ok = doc.get("version") == new
+            except (ValueError, AttributeError):
+                doc, ok = {}, False
+            if not ok:
+                say(f"delivery.version_bump: the first version in {f} is not its top-level `version`; not pushing")
+                return REFUSED
+            package = package or str(doc.get("name") or "")
+        texts[path] = text
+    for path, text in texts.items():
+        durable_write(path, text)
+    log = _git(repo, "log", "--no-merges", "--reverse", "--format=%s", f"{tip}..HEAD").stdout.splitlines()
+    subjects = [re.sub(rf"^{re.escape(package)}: ", "", s) if package else s for s in log if s.strip()]
+    subject = subjects[-1] if subjects else "update"
+    title = f"{package}: {new} ({subject})" if package else f"{new} ({subject})"
+    added, wrote = [], False
+    if csdir:
+        added = [f for f in _git(repo, "diff", "--name-only", "--diff-filter=A", tip, "HEAD", "--",
+                                 csdir).stdout.split() if f.endswith(".md")]
+        if not added and package:
+            branch = _git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+            name = _slug(branch.rsplit("/", 1)[-1] if branch and branch != "HEAD" else subject)
+            body = (f"`{package}`: {subjects[0]}." if len(subjects) == 1
+                    else f"`{package}`:\n\n" + "\n".join(f"- {s}" for s in subjects))
+            cs = repo / csdir / f"{_slug(package)}-{name}.md"
+            cs.parent.mkdir(parents=True, exist_ok=True)
+            if cs.is_file():     # an earlier push of this branch: add what is new to its changeset
+                text = cs.read_text().rstrip("\n")
+                durable_write(cs, text + "".join(f"\n- {s}" for s in subjects if s not in text) + "\n")
+            else:
+                durable_write(cs, f'---\n"{package}": patch\n---\n\n{body}\n')
+            _git(repo, "add", "--", str(cs.relative_to(repo)))
+            wrote = True
+    _git(repo, "add", "--", *files)
+    if _git(repo, "diff", "--cached", "--quiet").returncode == 0:
+        return 0                 # the change already sits one version above the tip, with its changeset
+    if _git(repo, "commit", "-q", "-m", f"{title}\n\n{BUMP_TRAILER}: {new}").returncode != 0:
+        say("delivery.version_bump: the bump commit failed; not pushing")
+        return REFUSED
+    say(f"bumped {package or 'the version'} to {new}" + (" with a changeset" if wrote else ""))
+    return 0
+
+
 def lock_name(remote: str, branch: str) -> str:
     return f"push:{remote}/{branch}"
 
@@ -242,11 +409,13 @@ def take(p: Project, remote: str, branch: str, wait_s: float, poll_s: float = 1.
 
 def push(repo: Path, remote: str, branch: str, checks: list[str], rounds: int = DEFAULT_ROUNDS,
          say: Callable[[str], None] = lambda m: print(f"ttp push: {m}", file=sys.stderr),
-         hold: Callable[[], Any] | None = None) -> int:
+         hold: Callable[[], Any] | None = None, version_bump: dict | None = None,
+         timed: Callable[[float], None] | None = None) -> int:
     """Rebase HEAD onto remote/branch, run `checks` on the result, and push it if the remote did not
     move meanwhile; if it did, start over, at most `rounds` times. With no checks only a change that
     touches nothing but docs goes through. `hold` takes the push lock once the quick refusals
-    passed: it returns the held lock, or None when it stayed busy (BUSY)."""
+    passed: it returns the held lock, or None when it stayed busy (BUSY). `version_bump` (bump_of)
+    bumps the version after each rebase; `timed` gets the seconds of each full, passing check run."""
     repo = Path(_git(repo, "rev-parse", "--show-toplevel").stdout.strip() or repo)
     if _git(repo, "status", "--porcelain", "--untracked-files=no").stdout.strip():
         say("uncommitted changes; commit first")
@@ -259,20 +428,23 @@ def push(repo: Path, remote: str, branch: str, checks: list[str], rounds: int = 
     if hold and lock is None:
         return BUSY
     try:
-        return _rounds(repo, remote, branch, checks, rounds, say)
+        return _rounds(repo, remote, branch, checks, rounds, say, version_bump, timed)
     finally:
         if lock is not None:
             lock.close()
 
 
 def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int,
-            say: Callable[[str], None]) -> int:
+            say: Callable[[str], None], version_bump: dict | None = None,
+            timed: Callable[[float], None] | None = None) -> int:
     upstream = f"{remote}/{branch}"
     for rnd in range(1, rounds + 1):
         tip = _fetch(repo, remote, branch)
         if not tip:
             say(f"cannot fetch {upstream}")
             return REFUSED
+        if version_bump:
+            _drop_own_bump(repo)
         if not checks and (code := code_paths(repo, tip)):
             # Checked before the rebase, so a refused push leaves the branch as it was.
             more = f" and {len(code) - 3} more" if len(code) > 3 else ""
@@ -283,16 +455,21 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
             _git(repo, "rebase", "--abort")
             say(f"rebase onto {upstream} conflicts; resolve it keeping both sides' intents, then rerun")
             return CONFLICT
+        if version_bump and (r := bump(repo, tip, version_bump, say)):
+            return r
         head = _git(repo, "rev-parse", "HEAD").stdout.strip()
         if stale := stale_versions(repo, tip):
             say(f"{', '.join(stale)}: this change edits the plugin but keeps the version already on "
                 f"{upstream}; bump it past that (in every manifest, plus a changeset where the "
                 "repository wants one), commit, then rerun; not pushing")
             return CHECKS_FAILED
+        started = time.time()
         for cmd in checks:
             if subprocess.run(cmd, shell=True, cwd=repo).returncode != 0:
                 say(f"check failed on {head[:10]}: {cmd}; not pushing")
                 return CHECKS_FAILED
+        if checks and timed:
+            timed(time.time() - started)
         if _fetch(repo, remote, branch) != tip:
             say(f"{upstream} moved during the checks; round {rnd + 1}")
             continue
@@ -319,11 +496,14 @@ def run(p: Project, repo: Path) -> int:
     try:
         remote, branch = target(p, repo)
         rounds = rounds_of(d.get("push_rounds"))
-        wait_s = wait_of(d.get("push_wait_s"))
+        explicit = d.get("push_wait_s")
+        wait_s = default_wait(last_check_s(p)) if explicit in (None, "") else wait_of(explicit)
+        version_bump = bump_of(d.get("version_bump"))
     except ValueError as e:
         print(f"ttp push: {e}", file=sys.stderr)
         return REFUSED
-    return push(repo, remote, branch, checks, rounds, hold=lambda: take(p, remote, branch, wait_s))
+    return push(repo, remote, branch, checks, rounds, hold=lambda: take(p, remote, branch, wait_s),
+                version_bump=version_bump, timed=lambda s: record_check_s(p, s))
 
 
 def free(p: Project, repo: Path) -> int:

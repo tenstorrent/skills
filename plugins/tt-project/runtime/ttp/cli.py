@@ -768,7 +768,8 @@ def cmd_push(a) -> None:
     tree, rebase onto the latest tip, run `delivery.push_checks` on the final head, start over if
     the tip moved meanwhile, and push without force. The target is `delivery.push_branch`, never
     main, master or the remote's default branch. Pushes to one branch take turns; one that waits
-    longer than `delivery.push_wait_s` for its turn exits 75. `--free` only tells whether it is
+    longer than `delivery.push_wait_s` (unset: twice the last check run, at least 900 s) for its
+    turn exits 75. With `delivery.version_bump` it bumps the version after each rebase. `--free` only tells whether it is
     free (0) or taken (1). Exit codes are in `push.py`."""
     from . import push
     base = os.environ.get("TTP_PROJECT")

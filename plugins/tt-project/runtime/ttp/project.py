@@ -125,7 +125,7 @@ EXTRA_KEYS = {
                "max_pace_hold_s"},   # max_pace_hold_s: deprecated and ignored; accepted so old configs stay quiet
     "coordinator": {"max_review_tasks_per_day"},
     "notify": {"slack_poll_s"},
-    "delivery": {"base_ref", "push_branch", "push_checks", "push_rounds", "push_wait_s"},
+    "delivery": {"base_ref", "push_branch", "push_checks", "push_rounds", "push_wait_s", "version_bump"},
     "jev": {"via", "url", "model"},
 }
 OPEN_SECTIONS = {"resources"}           # any name below is fine
@@ -181,7 +181,8 @@ def _disk_problems(disk: Any) -> list[str]:
 
 
 def config_problems(raw: dict) -> list[str]:
-    """Unknown keys and non-command push_checks in a project's own settings, one line each."""
+    """Unknown keys, non-command push_checks and a malformed version_bump in a project's own
+    settings, one line each."""
     out: list[str] = []
 
     def walk(node: dict, path: list[str]) -> None:
@@ -192,8 +193,10 @@ def config_problems(raw: dict) -> list[str]:
             elif isinstance(v, dict) and _known_keys(path + [str(k)]) is not None:
                 walk(v, path + [str(k)])
     walk(raw, [])
-    from .push import check_problems    # push imports this module
-    out += [f"delivery.push_checks: {p}" for p in check_problems((raw.get("delivery") or {}).get("push_checks"))]
+    from .push import bump_problems, check_problems    # push imports this module
+    delivery = raw.get("delivery") or {}
+    out += [f"delivery.push_checks: {p}" for p in check_problems(delivery.get("push_checks"))]
+    out += bump_problems(delivery.get("version_bump"))
     out += _disk_problems(raw.get("disk"))
     return out
 

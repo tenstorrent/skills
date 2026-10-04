@@ -7428,6 +7428,132 @@ def test_a_killed_push_frees_the_branch(env, monkeypatch):
             pass
 
 
+def _bump_setup(env, monkeypatch, checks):
+    """_push_setup with a plugin `p` at 0.1.0 on the target, versioned in a manifest and a module,
+    and `delivery.version_bump` set to bump both and add a changeset."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, checks)
+    (repo / "plugins/p/.claude-plugin").mkdir(parents=True)
+    (repo / "plugins/p/rt").mkdir(parents=True)
+    (repo / "plugins/p/.claude-plugin/plugin.json").write_text(
+        json.dumps({"name": "p", "version": "0.1.0", "description": "d"}, indent=2) + "\n")
+    (repo / "plugins/p/rt/__init__.py").write_text('"""p"""\n__version__ = "0.1.0"\n')
+    _git_out(repo, "add", "plugins")
+    _git_out(repo, "commit", "-qm", "p 0.1.0")
+    _git_out(repo, "push", "-q", "origin", "HEAD:proj")
+    _git_out(other, "pull", "-q", "origin", "proj")
+    p.set_config("delivery.version_bump", {"files": ["plugins/p/.claude-plugin/plugin.json",
+                                                     "plugins/p/rt/__init__.py"], "changeset_dir": ".changeset"})
+    return p, repo, origin, other
+
+
+def _versions(origin):
+    return (json.loads(_git_out(origin, "show", "proj:plugins/p/.claude-plugin/plugin.json"))["version"],
+            _git_out(origin, "show", "proj:plugins/p/rt/__init__.py").split('"')[-2])
+
+
+def _bump_commits(origin):
+    return _git_out(origin, "log", "--format=%s", "--grep=^Ttp-Version-Bump: ", "proj").splitlines()
+
+
+def test_racing_pushes_with_version_bump_take_one_version_each_and_check_once(env, monkeypatch):
+    """Two reviews push plugin changes at once: the lock orders them, and each bumps once above the
+    tip it rebased onto, so neither finds its version taken and reruns its checks."""
+    log = env["tmp"] / "checks.log"
+    p, repo, origin, other = _bump_setup(env, monkeypatch, [f"echo start >> {log}; sleep 1; echo end >> {log}"])
+    _commit(repo, "plugins/p/mine.txt", "mine\n")
+    _commit(other, "plugins/p/theirs.txt", "theirs\n")
+    procs = [_push_proc(p, d, stdout=subprocess.PIPE, stderr=subprocess.STDOUT) for d in (repo, other)]
+    outs = [pr.communicate(timeout=60)[0] for pr in procs]
+    assert [pr.returncode for pr in procs] == [0, 0], outs
+    assert _versions(origin) == ("0.1.2", "0.1.2")
+    bumps = sorted(_bump_commits(origin))
+    assert [b[:9] for b in bumps] == ["p: 0.1.1 ", "p: 0.1.2 "], bumps
+    assert {b[9:] for b in bumps} == {"(edit plugins/p/mine.txt)", "(edit plugins/p/theirs.txt)"}, bumps
+    assert log.read_text().split() == ["start", "end"] * 2, "each push must run its checks once"
+    assert not any("round 2" in o for o in outs), outs
+    sets = _git_out(origin, "ls-tree", "--name-only", "proj", ".changeset/").split()
+    assert len(sets) == 2, sets
+    assert all(_git_out(origin, "show", f"proj:{c}").startswith('---\n"p": patch\n---') for c in sets)
+    # The manifest keeps its formatting; only the version changed.
+    assert _git_out(origin, "show", "proj:plugins/p/.claude-plugin/plugin.json") == \
+        json.dumps({"name": "p", "version": "0.1.2", "description": "d"}, indent=2)
+
+
+def test_version_bump_is_redone_once_above_a_tip_that_moved(env, monkeypatch, capsys):
+    """Someone pushes 0.1.1 during our checks: the next round drops our own 0.1.1 bump, rebases
+    and bumps to 0.1.2, so one bump commit of ours lands. A failed run's bump is replaced too."""
+    once = env["tmp"] / "moved"
+    move = (f"test -e {once} || (touch {once} && cd {env['tmp'] / 'other'} && echo x > plugins/p/late.txt"
+            f" && sed -i.bak 's/0.1.0/0.1.1/' plugins/p/.claude-plugin/plugin.json plugins/p/rt/__init__.py"
+            f" && rm plugins/p/.claude-plugin/plugin.json.bak plugins/p/rt/__init__.py.bak"
+            f" && git add -A plugins && git commit -qm 'p: 0.1.1 (late)' && git push -q origin HEAD:proj)")
+    gate = env["tmp"] / "pass"
+    p, repo, origin, other = _bump_setup(env, monkeypatch, [f"test -e {gate}", move])
+    _commit(repo, "plugins/p/mine.txt", "mine\n")
+    assert _ttp_push() == 4
+    assert _git_out(repo, "log", "-1", "--format=%s") == "p: 0.1.1 (edit plugins/p/mine.txt)"
+    gate.touch()
+    assert _ttp_push() == 0
+    assert "round 2" in capsys.readouterr().err
+    assert _versions(origin) == ("0.1.2", "0.1.2")
+    assert _bump_commits(origin) == ["p: 0.1.2 (edit plugins/p/mine.txt)"], "earlier bumps must be replaced"
+    (cs,) = _git_out(origin, "ls-tree", "--name-only", "proj", ".changeset/").split()
+    assert _git_out(origin, "show", f"proj:{cs}").endswith("`p`: edit plugins/p/mine.txt.")
+
+
+def test_version_bump_keeps_a_changeset_the_change_brings_and_skips_changes_outside_the_plugin(env, monkeypatch):
+    p, repo, origin, other = _bump_setup(env, monkeypatch, ["true"])
+    (repo / ".changeset").mkdir()
+    (repo / ".changeset/mine.md").write_text('---\n"p": patch\n---\n\nWritten by hand.\n')
+    _git_out(repo, "add", ".changeset")
+    _commit(repo, "plugins/p/mine.txt", "mine\n")
+    assert _ttp_push() == 0
+    assert _versions(origin) == ("0.1.1", "0.1.1")
+    assert _git_out(origin, "ls-tree", "--name-only", "proj", ".changeset/").split() == [".changeset/mine.md"]
+    _commit(repo, "outside.txt", "not the plugin\n")
+    assert _ttp_push() == 0
+    assert _versions(origin) == ("0.1.1", "0.1.1") and len(_bump_commits(origin)) == 1
+    # A listed file without a version refuses before writing anything, leaving the tree clean.
+    _commit(repo, "plugins/p/rt/__init__.py", '"""p"""\n')
+    _commit(repo, "plugins/p/mine.txt", "more\n")
+    assert _ttp_push() == 2
+    assert _git_out(repo, "status", "--porcelain") == ""
+
+
+def test_version_bump_config_is_validated():
+    from ttp import push
+    from ttp.project import config_problems
+    assert push.bump_of(None) is None and push.bump_of({}) is None
+    assert push.bump_of('{"files": ["a/x.json", "a/b/y.py"]}') == \
+        {"files": ["a/x.json", "a/b/y.py"], "paths": ["a"], "package": "", "changeset_dir": ""}
+    for bad in ("x.json", {"files": []}, {"files": ["/abs.json"]}, {"files": ["../up.json"]},
+                {"files": ["x.json"], "extra": 1}, [1]):
+        with pytest.raises(ValueError):
+            push.bump_of(bad)
+    assert config_problems({"delivery": {"version_bump": {"files": []}}}) == \
+        ["delivery.version_bump.files must list the files that hold the version"]
+    assert config_problems({"delivery": {"version_bump": {"files": ["a/x.json"]}}}) == []
+
+
+def test_the_default_push_wait_outlasts_the_measured_check_run(env, monkeypatch):
+    """The lock is held through the checks, so a waiter's default wait must cover them (measured
+    150-535 s, longer than the old fixed 300 s); an explicit push_wait_s still wins."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["sleep 1"])
+    from ttp import push
+    assert push.last_check_s(p) is None
+    _commit(repo, "mine.txt", "mine\n")
+    assert _ttp_push() == 0
+    assert 1 <= push.last_check_s(p) < 30, "a passing check run must be measured"
+    waits = []
+    monkeypatch.setattr(push, "take", lambda p, remote, branch, wait_s, **kw: waits.append(wait_s))
+    _commit(repo, "more.txt", "more\n")
+    assert _ttp_push() == 75 and waits[-1] == push.DEFAULT_WAIT_S == 900
+    push.record_check_s(p, 535)
+    assert _ttp_push() == 75 and waits[-1] == 2 * 535 + push.WAIT_MARGIN_S > 535
+    p.set_config("delivery.push_wait_s", 5)
+    assert _ttp_push() == 75 and waits[-1] == 5
+
+
 def _lost_deep_runs(p, tmp_path, boot, costs=(24.0, 29.0), handoff=None):
     """Deep runs of different tasks whose supervisors vanished ten minutes ago, as the reaper finds them."""
     now = time.time()

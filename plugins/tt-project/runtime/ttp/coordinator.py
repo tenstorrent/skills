@@ -79,6 +79,8 @@ USER_SETTABLE = {
     # the commands that must pass first.
     "delivery.push_branch": str,
     "delivery.push_checks": lambda v: push.checks_of(v),
+    # The files holding the version that `ttp push` bumps once above the tip, plus a changeset.
+    "delivery.version_bump": lambda v: push.bump_of(v),
     # The runaway valve on task creation; the coordinator may raise it within MAX_TASKS_PER_DAY.
     # 0 stops new tasks.
     "coordinator.max_new_tasks_per_day": lambda v: max(0, min(int(v), MAX_TASKS_PER_DAY)),

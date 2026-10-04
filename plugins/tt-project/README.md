@@ -127,8 +127,14 @@ and preferences you add later become part of the project's charter and memory.
   checks unless the change touches only docs (`*.md`, `*.rst`, `docs/`, ...), when
   `delivery.push_allowed` is false, and for `HEAD`, `main`, `master` or the
   remote's default branch. Pushes to one branch take turns under a lock that a killed push or a
-  reboot frees. One that waits longer than `delivery.push_wait_s` (default 300 s) exits 75 and
-  prints a `retry_when` for its hand-off: `ttp push --free`, which exits 0 once the turn is free.
+  reboot frees. One that waits longer than `delivery.push_wait_s` exits 75 and prints a
+  `retry_when` for its hand-off: `ttp push --free`, which exits 0 once the turn is free. Unset,
+  the wait is twice the last measured check run plus 60 s, and at least 900 s.
+- `delivery.version_bump` lets `ttp push` own the version bump, so parallel reviews never race for
+  one version: `{"files": [...], "changeset_dir": ".changeset"}` (optional `package`, and `paths`,
+  default the folder the files share). After each rebase, when the change touches `paths`, it
+  sets every listed file one patch version above the tip's and adds a changeset when the change
+  brings none, in one `<package>: X.Y.Z (<subject>)` commit; a later round replaces that commit.
 - A plan task starts from what is already known: prior work, the organization's docs and chats
   through the connectors you have, available skills, and public work. Skill plugins it recommends
   can be enabled for the project's workers only (`providers.claude.plugin_dirs`).
