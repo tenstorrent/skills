@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import posixpath
 import re
 import shlex
 import shutil
@@ -93,30 +94,54 @@ _GLOB = re.compile(r"[*?\[]")
 
 
 def path_args(cmd: str) -> list[str]:
-    """Path-like arguments of a check command (globs, file paths such as pytest targets), without a
-    pytest `::node` suffix. Options, `VAR=value` words and the program itself are skipped."""
+    """Path-like arguments of a check command (globs, file paths such as pytest targets) relative to
+    the repo root, without a pytest `::node` or `[param]` suffix. Options, `VAR=value` words and the
+    program itself are skipped. After `cd <dir>` later paths are taken relative to <dir> (the dir is
+    listed too); after a `cd` that cannot be followed (absolute, `~`, `$VAR`, `-`, out of the repo)
+    later paths are skipped."""
     try:
         words = shlex.split(cmd)
     except ValueError:
         return []
-    out = []
-    for w in words[1:]:
-        if w.startswith("-") or "=" in w or "$" in w or w in BUILTINS or w in ("&&", "||", ";", "|"):
+    out: list[str] = []
+    cwd: str | None = ""
+    prev = None
+    for i, w in enumerate(words):
+        if prev == "cd":
+            prev = w
+            if cwd is None or w.startswith(("-", "/", "~")) or "$" in w:
+                cwd = None
+                continue
+            d = posixpath.normpath(posixpath.join(cwd, w))
+            if d == ".." or d.startswith("../"):
+                cwd = None
+                continue
+            cwd = "" if d == "." else d
+            if cwd:
+                out.append(cwd)
+            continue
+        prev = w
+        if i == 0 or w.startswith("-") or "=" in w or "$" in w or w in BUILTINS \
+                or w in ("&&", "||", ";", "|"):
             continue
         w = w.split("::", 1)[0]
-        if w.startswith("./"):
-            w = w[2:]
-        if w and not w.startswith(("/", "~")) and ("/" in w or _GLOB.search(w)):
-            out.append(w.rstrip("/"))
+        w = re.sub(r"(\.py)\[[^\]]*\]$", r"\1", w)
+        if cwd is None or not w or w.startswith(("/", "~")) or not ("/" in w or _GLOB.search(w)):
+            continue
+        w = posixpath.normpath(posixpath.join(cwd, w))
+        if w != "." and w != ".." and not w.startswith("../"):
+            out.append(w)
     return out
 
 
 def unmatched_paths(repo: Path, remote: str, branch: str, checks: list[str]) -> tuple[str, list[str]]:
-    """(ref, ["cmd: path", ...]) for check path args that match no file on the push branch (the local
-    branch, else the remote's ref). ref is "" when neither can be read."""
+    """(ref, ["cmd: path", ...]) for check path args that match no file on the push branch: the
+    remote-tracking ref, which `ttp push` rebases onto, else the local branch. ref is "" when
+    neither can be read."""
     import fnmatch
-    for ref in (branch, f"{remote}/{branch}"):
-        ls = _git(repo, "ls-tree", "-r", "--name-only", ref)
+    for ref, full in ((f"{remote}/{branch}", f"refs/remotes/{remote}/{branch}"),
+                      (branch, f"refs/heads/{branch}")):
+        ls = _git(repo, "ls-tree", "-r", "--name-only", full)
         if ls.returncode == 0:
             break
     else:
@@ -124,8 +149,12 @@ def unmatched_paths(repo: Path, remote: str, branch: str, checks: list[str]) -> 
     files = ls.stdout.splitlines()
     out = []
     for cmd in checks:
+        gone: list[str] = []
         for a in path_args(cmd):
+            if any(a.startswith(g + "/") for g in gone):
+                continue  # under a missing `cd` dir, already reported
             if not any(f == a or f.startswith(a + "/") or fnmatch.fnmatchcase(f, a) for f in files):
+                gone.append(a)
                 out.append(f"{cmd!r}: {a!r}")
     return ref, out
 

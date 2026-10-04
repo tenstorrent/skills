@@ -11446,3 +11446,25 @@ def test_push_check_path_args_and_unmatched(env, tmp_path):
     assert ref == "work"
     assert missing == ["'pytest tests/test_a.py tests/test_gone.py': 'tests/test_gone.py'"]
     assert push.unmatched_paths(repo, "origin", "nope", checks) == ("", [])
+    # pytest parametrised ids are not globs
+    assert push.path_args("pytest tests/test_a.py[param-1] tests/test_a.py::test_x[a-b]") == \
+        ["tests/test_a.py", "tests/test_a.py"]
+    # after `cd <dir>` paths are relative to <dir>; the dir itself is checked too
+    assert push.path_args("cd plugins/x && pytest tests/ ../../tests/test_a.py") == \
+        ["plugins/x", "plugins/x/tests", "tests/test_a.py"]
+    assert push.path_args("cd /tmp && pytest tests/") == []
+    assert push.path_args("cd $HOME && pytest tests/") == []
+    (repo / "plugins" / "x" / "tests").mkdir(parents=True)
+    (repo / "plugins" / "x" / "tests" / "test_p.py").write_text("")
+    g("add", ".")
+    g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "p")
+    cd_checks = ["cd plugins/x && pytest tests/ tests/test_p.py[a]", "cd plugins/gone && pytest tests/"]
+    assert push.unmatched_paths(repo, "origin", "work", cd_checks)[1] == [
+        "'cd plugins/gone && pytest tests/': 'plugins/gone'"]
+    # the remote-tracking ref (what `ttp push` rebases onto) wins over a stale local branch
+    g("checkout", "-qb", "newer")
+    (repo / "tests" / "test_gone.py").write_text("")
+    g("add", ".")
+    g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "y")
+    g("update-ref", "refs/remotes/origin/work", "HEAD")
+    assert push.unmatched_paths(repo, "origin", "work", checks) == ("origin/work", [])
