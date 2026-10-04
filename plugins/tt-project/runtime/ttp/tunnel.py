@@ -133,6 +133,18 @@ def keep(name: str, host: str, remote: int, pick_port, platform: str | None = No
     return local, f"{verb} ({how}, {f})"
 
 
+def restart(name: str, platform: str | None = None) -> str:
+    """Restart the kept tunnel's ssh (a forward that stopped answering)."""
+    platform = platform or sys.platform
+    if not service_file(name, platform).is_file():
+        return "no kept tunnel"
+    if platform == "darwin":
+        r = _run("launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label(name)}")
+    else:
+        r = _run("systemctl", "--user", "restart", f"{label(name)}.service")
+    return "restarted" if r.returncode == 0 else f"refused: {r.stderr.strip()[:200]}"
+
+
 def unkeep(name: str, platform: str | None = None) -> str:
     platform = platform or sys.platform
     f = service_file(name, platform)

@@ -371,7 +371,11 @@ def cmd_new(a) -> None:
     _wait_for_daemon(p)
     print(MARKER.format(name=a.name, host=hostname(), dir=p.root))
     print(f"created {a.name} in {p.base} · daemon via {how}")
-    print(web_line(p))
+    from . import weblink
+    line, rc = weblink.local(p, weblink.link(p))
+    print(line)
+    if rc:
+        sys.exit(rc)
 
 
 def _default_root() -> Path:
@@ -439,10 +443,43 @@ def new_remote(a, brief: str) -> None:
     if a.no_service:
         args.append("--no-service")
     remote = " ".join(shlex.quote(x) if not x.startswith("~/") else x for x in args) + " --describe-file -"
-    r = subprocess.run(["ssh", "-o", "BatchMode=yes", host, remote], input=brief, text=True)
-    if r.returncode != 0:
+    from . import weblink
+    r = subprocess.run(["ssh", "-o", "BatchMode=yes", host, remote], input=brief, text=True, stdout=subprocess.PIPE)
+    _echo_without_web(r.stdout)
+    if r.returncode not in (0, weblink.UNVERIFIED):   # UNVERIFIED: created, but its web app failed the check there
         die(f"remote creation on {host} failed", r.returncode)
-    register(a.name, {"host": host, "dir": a.dir})
+    entry = {"host": host, "dir": a.dir}
+    register(a.name, entry)
+    line, rc = remote_web(a.name, entry, r.stdout)
+    print(line)
+    if rc:
+        sys.exit(rc)
+
+
+def _echo_without_web(out: str | None) -> None:
+    """Print a remote command's output without its web app line: that link is for the far machine's
+    own localhost, and the caller prints the one that works here."""
+    for ln in (out or "").splitlines():
+        if not ln.startswith("web app:"):
+            print(ln)
+
+
+def remote_web(name: str, entry: dict, out: str | None) -> tuple[str, int]:
+    """The checked local link to a remote project's web app, read from the web line its own `ttp new`
+    or `ttp connect` printed there (or asked for when an older runtime printed none)."""
+    from . import weblink
+    host = entry.get("ssh") or entry["host"]
+    there = next((ln for ln in (out or "").splitlines() if ln.startswith("web app:")), "")
+    if "NOT AVAILABLE" in there:    # its own check and repair on that machine failed: nothing to tunnel to
+        return f"{there} (on {host})", weblink.UNVERIFIED
+    m = weblink.LINK.search(there)
+    if not m:
+        r = _ssh(entry, ["web", name], capture=True)
+        m = weblink.LINK.search(r.stdout or "")
+        if not m:
+            why = ((r.stderr or r.stdout or "").strip().splitlines() or [f"exit {r.returncode}"])[-1]
+            return weblink.bad_line("web", f"could not read the web address from {host} ({why})", []), weblink.UNVERIFIED
+    return weblink.remote(name, entry, int(m.group(1)), m.group(2))
 
 
 def _wait_for_daemon(p: Project, timeout: float = 20) -> None:
@@ -454,15 +491,17 @@ def _wait_for_daemon(p: Project, timeout: float = 20) -> None:
 
 
 def web_line(p: Project) -> str:
-    from .web import token
-    port = (p.db.kv("web") or {}).get("port") or p.config().get("web", {}).get("port")
-    if not port:
-        return "web app: not running yet (check `ttp status`)"
-    return f"web app: http://127.0.0.1:{port}/#token={token(p)}"
+    from .weblink import link
+    url = link(p)
+    return f"web app: {url}" if url else "web app: not running yet (check `ttp status`)"
 
 
 # talking ------------------------------------------------------------------------------------------
 def cmd_connect(a) -> None:
+    p, entry = resolve(a.name)
+    if entry:
+        argv = ["connect", a.name, *(["--chat", a.chat] if a.chat else []), *(["--label", a.label] if a.label else [])]
+        sys.exit(connect_remote(a.name, entry, argv))
     p = need(a.name, sys.argv[1:])
     chat = a.chat or f"c{pysecrets.token_hex(3)}"
     p.db.x("INSERT INTO chats(id,created,label,host,last_active,last_read) VALUES(?,?,?,?,?,"
@@ -471,7 +510,32 @@ def cmd_connect(a) -> None:
     print(MARKER.format(name=p.name, host=hostname(), dir=p.root))
     print(f"chat: {chat}")
     print(status_text(p))
-    print(web_line(p))
+    from . import weblink
+    line, rc = weblink.local(p, weblink.link(p))
+    print(line)
+    if rc:
+        sys.exit(rc)
+
+
+def connect_remote(name: str, entry: dict, argv: list[str]) -> int:
+    """`ttp connect` on the project's machine, then the checked link through the kept local forward."""
+    from . import weblink
+    failed = flush_outbox(name, entry)
+    if failed is not None and failed.returncode == 255:
+        _unreachable(entry, failed.stderr)
+        return 255
+    r = _ssh(entry, argv, capture=True)
+    if r.returncode == 255:
+        _unreachable(entry, r.stderr)
+        return 255
+    if r.stderr:
+        sys.stderr.write(r.stderr)
+    _echo_without_web(r.stdout)
+    if r.returncode not in (0, weblink.UNVERIFIED):
+        return r.returncode
+    line, rc = remote_web(name, entry, r.stdout)
+    print(line)
+    return rc
 
 
 def cmd_say(a) -> None:

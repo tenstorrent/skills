@@ -12270,3 +12270,178 @@ def test_web_state_works_once_the_coordinator_has_run(env):
     data = json.loads(urllib.request.urlopen(req, timeout=10).read())
     assert data["project"]["name"] == "demo"
     assert "health" in data
+
+
+def _serve(p, start: int) -> int:
+    """Serve p's web app in this process (as its daemon does); returns the port once it answers."""
+    from ttp import web
+    port = web.free_port(start)
+    p.set_config("web.port", port)
+
+    class Stub:
+        pass
+    stub = Stub()
+    stub.p = p
+    threading.Thread(target=web.serve, args=(stub,), daemon=True).start()
+    for _ in range(50):
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=1)
+            return port
+        except OSError:
+            time.sleep(0.1)
+    raise AssertionError("the web app did not start")
+
+
+def test_connect_ends_with_a_web_link_checked_on_its_own_port_and_token(env, capsys):
+    """`ttp connect` ends with the web app link only once the state endpoint answered 200 on that
+    exact port with that token and named this project. A wrong token or another project's web app
+    on the port is reported, not linked."""
+    from ttp import cli, weblink
+    from ttp.web import token
+    p = make(env)
+    port = _serve(p, 19810)
+    cli.main(["connect", "demo", "--chat", "c1"])
+    out = capsys.readouterr().out
+    assert out.rstrip().splitlines()[-1] == f"web app: http://127.0.0.1:{port}/#token={token(p)}", out
+    assert weblink.check(f"http://127.0.0.1:{port}/#token=00ff", "demo")[0] == "token"
+    kind, why = weblink.check(f"http://127.0.0.1:{port}/#token={token(p)}", "other")
+    assert kind == "name" and "'demo'" in why, why
+
+
+def test_connect_retries_while_the_web_app_comes_up(env, monkeypatch, capsys):
+    from ttp import cli, weblink
+    p = make(env)
+    p.set_config("web.port", 19820)
+    answers = [("down", "nothing answers"), ("down", "nothing answers"), ("", "")]
+    seen, waits = [], []
+    monkeypatch.setattr(weblink, "check", lambda url, name: seen.append((url, name)) or answers.pop(0))
+    monkeypatch.setattr(weblink, "_sleep", waits.append)
+    cli.main(["connect", "demo", "--chat", "c1"])
+    out = capsys.readouterr().out
+    assert "web app: http://127.0.0.1:19820/#token=" in out and waits == [0.5, 1], (out, waits)
+    assert {s[1] for s in seen} == {"demo"}
+
+
+def test_connect_repairs_or_names_what_is_broken_instead_of_a_dead_link(env, monkeypatch, capsys):
+    """Nothing answers: a daemon kept by a service is restarted and the link checked again. A
+    daemon no service keeps stays stopped (starting it would start spending), and the line says
+    what is broken instead of giving the link; the exit code marks it."""
+    from ttp import cli, service, weblink
+    from ttp.web import token
+    p = make(env)
+    p.set_config("web.port", __import__("ttp.web").web.free_port(19830))   # nothing answers there
+    monkeypatch.setattr(weblink, "_sleep", lambda s: None)
+    monkeypatch.setattr(service, "installed", lambda p: None)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["connect", "demo", "--chat", "c1"])
+    out = capsys.readouterr().out
+    assert e.value.code == weblink.UNVERIFIED
+    assert "web app: NOT AVAILABLE (daemon)" in out and "#token=" not in out and "stays stopped" in out, out
+    # With a service: restarted, and the daemon's web app answers again.
+    monkeypatch.setattr(service, "installed", lambda p: {"kind": "systemd", "watchdog": True})
+    restarted = []
+
+    def restart(q):
+        restarted.append(q.name)
+        _serve(p, 19830)
+        return "restarted"
+    monkeypatch.setattr(service, "restart_service", restart)
+    line, rc = weblink.local(p, weblink.link(p))
+    url = weblink.link(p)   # the port the restarted daemon serves on
+    assert restarted == ["demo"] and rc == 0 and line == f"web app: {url}" and token(p) in url, line
+
+
+def _remote(env, monkeypatch, tmp_path, connect_out):
+    """A project on another machine: ssh is faked, the kept tunnel is installed for real (into a
+    test home) with systemctl faked, and the web app it would reach is served here."""
+    from ttp import cli, tunnel, web
+    monkeypatch.setenv("HOME", str(tmp_path / "userhome"))
+    monkeypatch.setattr(tunnel.sys, "platform", "linux")
+    calls = []
+    monkeypatch.setattr(tunnel, "_run", lambda *argv: calls.append(argv) or subprocess.CompletedProcess(argv, 0, "", ""))
+    entry = {"host": "box", "dir": "/srv/p"}
+    monkeypatch.setattr(cli, "resolve", lambda name: (None, entry))
+    p = make(env)
+    port = _serve(p, 19860)
+    monkeypatch.setattr(web, "free_port", lambda start=0: port)   # the tunnel's local end is where it is served
+    ssh = []
+    out = connect_out.format(tok=web.token(p))
+    monkeypatch.setattr(cli, "_ssh", lambda e, argv, capture=False: ssh.append(argv) or subprocess.CompletedProcess(
+        argv, 0, out, ""))
+    return p, port, calls, ssh
+
+
+def test_connect_to_a_remote_project_keeps_a_local_forward_and_checks_the_link(env, monkeypatch, tmp_path, capsys):
+    from ttp import cli, tunnel, web
+    p, port, calls, ssh = _remote(env, monkeypatch, tmp_path, "tt-project://demo@box:/srv/p\nchat: c1\nstatus\n"
+                                  "web app: http://127.0.0.1:18700/#token={tok}\n")
+    with pytest.raises(SystemExit) as e:
+        cli.main(["connect", "demo", "--chat", "c1"])
+    out = capsys.readouterr().out
+    assert e.value.code == 0 and ssh == [["connect", "demo", "--chat", "c1"]]
+    assert "chat: c1" in out and "18700/#token" not in out, "the far machine's own link does not work here"
+    assert "installed a kept tunnel" in out and f"web app: http://127.0.0.1:{port}/#token={web.token(p)}" in out, out
+    unit = tunnel.service_file("demo", "linux").read_text()
+    assert f"127.0.0.1:{port}:127.0.0.1:18700" in unit and unit.rstrip().endswith("WantedBy=default.target")
+    assert ("systemctl", "--user", "enable", "--now", "com.tt-project.tunnel.demo.service") in calls
+    # An older runtime there prints no web line: the address is asked for, as `ttp web` does.
+    monkeypatch.setattr(cli, "_ssh", lambda e, argv, capture=False: ssh.append(argv) or subprocess.CompletedProcess(
+        argv, 0, "chat: c1\n" if argv[0] == "connect" else f"web app: http://127.0.0.1:18700/#token={web.token(p)}\n", ""))
+    with pytest.raises(SystemExit) as e:
+        cli.main(["connect", "demo"])
+    out = capsys.readouterr().out
+    assert e.value.code == 0 and ssh[-1] == ["web", "demo"] and f"127.0.0.1:{port}/#token=" in out, out
+
+
+def test_a_remote_link_that_fails_is_repaired_then_reported(env, monkeypatch, tmp_path, capsys):
+    """Retry while the new tunnel comes up; then restart the kept tunnel; then, if ssh works, the
+    daemon there. Still nothing: say what is broken, with no link."""
+    from ttp import cli, weblink
+    p, port, calls, ssh = _remote(env, monkeypatch, tmp_path, "web app: http://127.0.0.1:18700/#token=abc123\n")
+    waits = []
+    monkeypatch.setattr(weblink, "_sleep", waits.append)
+    answers = [("down", "x")] * 3 + [("", "")]
+    monkeypatch.setattr(weblink, "check", lambda url, name: answers.pop(0))
+    with pytest.raises(SystemExit) as e:
+        cli.main(["connect", "demo"])
+    out = capsys.readouterr().out
+    assert e.value.code == 0 and waits == [0.5, 1, 2] and "#token=abc123" in out, out
+    # Down throughout, ssh refused: the tunnel is named, after a tunnel restart.
+    monkeypatch.setattr(weblink, "check", lambda url, name: ("down", f"nothing answers on localhost:{port}"))
+    monkeypatch.setattr(weblink, "_ssh_ok", lambda host: "Permission denied (publickey)")
+    calls.clear()
+    with pytest.raises(SystemExit) as e:
+        cli.main(["connect", "demo"])
+    out = capsys.readouterr().out
+    assert e.value.code == weblink.UNVERIFIED and "#token=" not in out, out
+    assert "NOT AVAILABLE (tunnel)" in out and "ssh to box fails" in out and "Permission denied" in out, out
+    assert ("systemctl", "--user", "restart", "com.tt-project.tunnel.demo.service") in calls
+    # ssh works: the daemon there is restarted, and then named.
+    monkeypatch.setattr(weblink, "_ssh_ok", lambda host: "")
+    ran = []
+    monkeypatch.setattr(weblink.subprocess, "run", lambda argv, **k: ran.append(argv) or subprocess.CompletedProcess(
+        argv, 0, "restarted; the daemon is running", ""))
+    with pytest.raises(SystemExit) as e:
+        cli.main(["connect", "demo"])
+    out = capsys.readouterr().out
+    assert e.value.code == weblink.UNVERIFIED and "NOT AVAILABLE (daemon)" in out and "#token=" not in out, out
+    assert ran and ran[0][-1] == "/srv/p/tt-project/harness/bin/ttp restart demo", ran
+
+
+def test_remote_new_passes_on_the_far_machines_failed_check(env, monkeypatch, capsys):
+    """`ttp new --host`: the project there was created but its own web check failed. It is registered,
+    and the far machine's statement of what is broken is passed on instead of a tunnel to nothing."""
+    from ttp import cli, machines, weblink
+    from ttp.project import load_registry
+    monkeypatch.setattr(cli, "ship_runtime", lambda host: "~/.tt-project/lib/current/bin/ttp")
+    monkeypatch.setattr(cli, "load_secrets", lambda: {})
+    monkeypatch.setattr(machines, "push", lambda host: "machines: none")
+    said = ("tt-project://far@box:/srv/far\ncreated far\n"
+            "web app: NOT AVAILABLE (daemon): nothing answers on localhost:18700. No link is given until it answers.\n")
+    monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, weblink.UNVERIFIED, said, None))
+    with pytest.raises(SystemExit) as e:
+        cli.main(["new", "far", "--host", "box", "--dir", "/srv/far"])
+    out = capsys.readouterr().out
+    assert e.value.code == weblink.UNVERIFIED and "created far" in out
+    assert "web app: NOT AVAILABLE (daemon)" in out and "(on box)" in out and out.count("web app:") == 1, out
+    assert {k: load_registry()["projects"]["far"][k] for k in ("host", "dir")} == {"host": "box", "dir": "/srv/far"}
