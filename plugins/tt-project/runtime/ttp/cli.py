@@ -902,7 +902,17 @@ def cmd_lock(a) -> None:
     from . import shared
     cfg = p.config()
     where = shared.locks_dir(p, a.resource, cfg)
-    paths = lk.slot_paths(where, a.resource, shared.slots(p, a.resource, cfg))
+
+    def _unwritable(e: OSError) -> None:
+        # Never a private lock instead: other holders would not see it. Say what is wrong.
+        die(f"cannot take the lock of {a.resource}: {where} is not writable here ({e.strerror or e}). "
+            f"The run's sandbox or file permissions must allow writing it; hand the task back as blocked "
+            f"and name this directory")
+
+    try:
+        paths = lk.slot_paths(where, a.resource, shared.slots(p, a.resource, cfg))
+    except OSError as e:
+        _unwritable(e)
     who = shared.holder(p, a.resource, f"task #{os.environ.get('TTP_TASK') or '?'} "
                                        f"(run {os.environ.get('TTP_RUN_ID') or '?'})", cfg)
     run_dir = Path(os.environ["TTP_RUN_DIR"]) if os.environ.get("TTP_RUN_DIR") else None
@@ -933,7 +943,11 @@ def cmd_lock(a) -> None:
     while True:
         _refuse_paused()
         reserved = lk.reserved_by(mark)
-        f = None if reserved else lk.try_take(paths, who, " ".join(cmd))
+        try:
+            f = None if reserved else lk.try_take(paths, who, " ".join(cmd))
+        except OSError as e:
+            _end_wait()
+            _unwritable(e)
         if f:
             _end_wait()
             waited = time.time() - started

@@ -5974,6 +5974,109 @@ def test_codex_workers_may_write_run_state_and_git_metadata(env, monkeypatch):
     (p.runs / str(crid) / "STOP").touch()
 
 
+def _codex_worker_roots(env, p, cwd):
+    """The writable roots the daemon gives a Codex worker in cwd."""
+    from ttp.providers import codex as codex_provider
+    from ttp.daemon import Daemon
+    real = codex_provider.Codex.binary
+    codex_provider.Codex.binary = lambda self: "/usr/bin/true"   # never a real agent
+    try:
+        d = Daemon(p.base)
+        tid = p.db.add_task("t", "s", kind="work", tier="light", origin="user")
+        rid = d.start_run("worker", "go", "codex", "light", str(cwd), task=p.db.task(tid))
+    finally:
+        codex_provider.Codex.binary = real
+    (p.runs / str(rid) / "STOP").touch()
+    argv = json.loads((p.runs / str(rid) / "run.json").read_text())["argv"]
+    roots = next(a for a in argv if a.startswith("sandbox_workspace_write.writable_roots="))
+    return json.loads(roots.split("=", 1)[1])
+
+
+def test_codex_workers_may_write_the_shared_lock_root_only(env):
+    # `ttp lock <machine>` on a machine shared across projects takes ~/.tt-project/locks/<machine>/
+    # <machine>.0.lock; a workspace-write sandbox made that read-only, so the lock failed.
+    p = make(env)
+    p.set_config("shared_resources", ["box1"])
+    from ttp import locks as lk
+    from ttp import shared
+    roots = _codex_worker_roots(env, p, p.base)
+    slot = lk.slot_paths(shared.locks_dir(p, "box1"), "box1", 1)[0]
+    assert slot == env["home"] / "locks" / "box1" / "box1.0.lock", "the shared lock root must not move"
+    assert any(slot.is_relative_to(r) for r in roots), roots
+    assert str(env["home"] / "locks") in roots and (env["home"] / "locks").is_dir()
+    assert str(env["home"]) not in roots, "only the lock root, not the rest of the user's tt-project home"
+
+
+def _codex_sandbox(cwd, roots):
+    """argv prefix that runs a command in Codex's workspace-write sandbox writing only cwd and
+    roots (not /tmp, where the test lives); None when no Codex sandbox works here."""
+    import shutil
+    exe = shutil.which("codex")
+    if not exe:
+        return None
+    argv = [exe, "sandbox", "-c", 'sandbox_mode="workspace-write"',
+            "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
+            "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
+            "-c", "sandbox_workspace_write.writable_roots=" + json.dumps([str(r) for r in roots]), "--"]
+    probe = pathlib.Path(cwd) / "probe"
+    try:
+        r = subprocess.run(argv + ["sh", "-c", f"touch {probe} && ! touch {pathlib.Path(cwd).parent}/outside"],
+                           cwd=cwd, capture_output=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return argv if r.returncode == 0 and probe.exists() else None
+
+
+def test_sandboxed_codex_worker_takes_a_shared_lock_and_sees_its_pause(env):
+    p = make(env)
+    p.set_config("shared_resources", ["box1"])
+    cwd = env["tmp"] / "sandbox-cwd"
+    cwd.mkdir()
+    roots = _codex_worker_roots(env, p, cwd)
+    sandbox = _codex_sandbox(cwd, roots)
+    if sandbox is None:
+        pytest.skip("no working Codex sandbox on this machine")
+    run_env = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost", TTP_PROJECT=str(p.base),
+                   PYTHONDONTWRITEBYTECODE="1")
+    lock = [sys.executable, str(TTP), "lock", "--timeout", "5", "box1", "--"]
+    slot = env["home"] / "locks" / "box1" / "box1.0.lock"
+    out = subprocess.run(sandbox + lock + ["true"], cwd=cwd, env=run_env, capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    assert json.loads(slot.read_text())["holder"].startswith(p.name + " "), "a shared holder names its project"
+    assert not (p.state / "locks").exists() or not list((p.state / "locks").glob("box1*")), "no private lock"
+    from ttp import coordinator as coord
+    coord.pause_resource(p, "box1", True, reason="maintenance", by="user")
+    out = subprocess.run(sandbox + lock + ["true"], cwd=cwd, env=run_env, capture_output=True, text=True)
+    assert out.returncode == 75 and "box1 is paused (maintenance)" in out.stderr, out.stderr
+    # A sandbox without the lock root fails loudly, and never falls back to a private lock.
+    coord.pause_resource(p, "box1", False, by="user")
+    narrow = _codex_sandbox(cwd, [r for r in roots if not pathlib.Path(r).is_relative_to(env["home"])])
+    import shutil
+    shutil.rmtree(env["home"] / "locks" / "box1")
+    out = subprocess.run(narrow + lock + ["true"], cwd=cwd, env=run_env, capture_output=True, text=True)
+    assert out.returncode == 2 and "not writable" in out.stderr and "Traceback" not in out.stderr, out.stderr
+    assert not (p.state / "locks").exists() or not list((p.state / "locks").glob("box1*")), "no private lock"
+
+
+def test_ttp_lock_says_plainly_when_the_shared_lock_is_not_writable(env):
+    if os.geteuid() == 0:
+        pytest.skip("root writes read-only directories")
+    p = make(env)
+    p.set_config("shared_resources", ["box1"])
+    root = env["home"] / "locks" / "box1"
+    root.mkdir(parents=True)
+    root.chmod(0o500)
+    try:
+        run_env = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost", TTP_PROJECT=str(p.base))
+        out = subprocess.run([sys.executable, str(TTP), "lock", "--timeout", "5", "box1", "--", "true"],
+                             env=run_env, capture_output=True, text=True)
+    finally:
+        root.chmod(0o700)
+    assert out.returncode == 2 and "not writable" in out.stderr and str(root) in out.stderr, out.stderr
+    assert "Traceback" not in out.stderr
+    assert not list((p.state / "locks").glob("box1*")) if (p.state / "locks").exists() else True
+
+
 def test_codex_and_cursor_price_tokens_with_project_rows(env, tmp_path):
     from ttp.providers import get_provider
     out = tmp_path / "o.jsonl"
