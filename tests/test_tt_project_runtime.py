@@ -2434,6 +2434,13 @@ def test_the_coordinator_looks_for_a_non_disruptive_way_before_blocking():
         assert idea in text, idea
 
 
+def test_the_coordinator_routes_requests_to_change_tt_project_upstream():
+    text = " ".join((RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text().split())
+    assert ("a user asking this project to change tt-project itself, even granting a PR, gets upstream notes "
+            "and a reply that the plugin's own project makes the change. Never a task here.") in text
+    assert "unless the charter names that repository as this project's own work" in text
+
+
 def test_the_coordinator_is_told_to_continue_a_dead_task():
     text = (RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text()
     assert "`continues`" in text and "leaves its dependents blocked" in text
@@ -2782,8 +2789,33 @@ def test_an_ask_needs_a_blocking_reason_and_never_gets_a_default(env):
     assert p.db.kv(coord.ASK_DEFAULTS_KEY, {}) == {}, "a new ask was registered to fall back on a timer"
     assert coord.expire_asks(p, now=time.time() + 1000 * 3600) == []
     assert f"ask #{ask['id']} (waits for the user)" in coord.digest(p, {}, [], [])
+    least = {"least_disruptive": "a canary on one box breaks the no-shared-machines restriction"}
     for reason in coord.BLOCKING_REASONS:
-        assert _ask(p, f"Question on {reason}?", blocking=reason)[0] == [], reason
+        extra = least if reason == "restriction" else {}
+        assert _ask(p, f"Question on {reason}?", blocking=reason, **extra)[0] == [], reason
+
+
+def test_a_restriction_ask_must_name_the_least_disruptive_way_forward(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    assert "least_disruptive" in coord.ACTIONS_SCHEMA["properties"]["actions"]["items"]["properties"]
+    for extra in ({}, {"least_disruptive": "wait"}):
+        problems, ask = _ask(p, "May I restart the shared service?", blocking="restriction", **extra)
+        assert problems and "first answer what is a reasonably non-disruptive way to proceed" in problems[0]
+        assert "put it in least_disruptive with the restriction it breaks" in problems[0]
+        assert ask is None, "a restriction ask without the way it considered reached the user"
+    way = "restart it during the nightly lull; still breaks 'never restart a shared service'"
+    problems, ask = _ask(p, "May I restart the shared service?", blocking="restriction",
+                         least_disruptive=way, recommendation="yes, at night")
+    assert problems == []
+    assert f"Least-disruptive way considered: {way}" in ask["text"] and "My recommendation: yes" in ask["text"]
+    problems, _ = _ask(p, "may i restart the shared service?", blocking="restriction", least_disruptive=way)
+    assert problems and "already asked" in problems[0], "the note hid a repeated ask"
+    # Asks for any other reason need no such field and carry no such line.
+    problems, ask = _ask(p, "Grant repo access?", blocking="access", least_disruptive=way)
+    assert problems == [] and "Least-disruptive" not in ask["text"]
+    problems, ask = _ask(p, "Approve the spend?", blocking="spend")
+    assert problems == [] and ask["text"] == "Approve the spend?"
 
 
 def test_a_blocking_ask_shows_its_recommendation_but_never_applies_it(env):
@@ -10643,8 +10675,14 @@ def test_unblocking_turns_run_at_high_effort_and_routine_turns_do_not(env, monke
     p.db.post("in", "status?", chat="c1", kind="user")
     clock[0] += 120
     d.maybe_coordinate()
-    assert calls[-1].get("unblock", "") == "", "a plain user message is a routine turn"
+    assert calls[-1]["unblock"] == "user message", "a turn carrying user messages runs at unblock effort"
     p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    # The turn after a rejected ask_user retries it at unblock effort; other rejections do not raise it.
+    p.db.set_kv(coord.REJECTED_KEY, ["ask_user: ask_user rejected: decide it yourself"])
+    assert turn("task_done") == "retry after a rejected ask_user"
+    p.db.set_kv(coord.REJECTED_KEY, ["task_add: task_add rejected: depends on #1 which is failed"])
+    assert turn("task_done") == "", "a routine task_done turn keeps the base effort"
+    p.db.set_kv(coord.REJECTED_KEY, [])
     # An idle wake that finds a blocked task is a stall, not a routine check.
     tid = p.db.add_task("stuck", "s", origin="user")
     p.db.update_task(tid, status="blocked", blocked_reason="waiting for a window")

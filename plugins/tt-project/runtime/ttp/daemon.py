@@ -1495,7 +1495,8 @@ class Daemon:
             return   # logged out: one run at a time checks the login, and this turn is not it
         try:
             prompt = coord.digest(self.p, gates, [e["id"] for e in evs], [m["id"] for m in msgs])
-            unblock = coord.unblock_reason(db, [e["id"] for e in evs], (w or {}).get("due"))
+            unblock = coord.unblock_reason(db, [e["id"] for e in evs], (w or {}).get("due"),
+                                          [m["id"] for m in msgs])
             self.start_run("coordinator", prompt, provider, c.get("tier", "light"), str(self.p.base),
                            read_only=True, schema=coord.ACTIONS_SCHEMA, system=coord.system_prompt(self.p),
                            budget_usd=float(c.get("turn_budget_usd", 1.0)),

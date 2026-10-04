@@ -55,6 +55,7 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "every": {"type": "string"}, "at": {"type": "string"}, "enabled": {"type": "boolean"},
             "key": {"type": "string"}, "value": {"type": "string"},
             "blocking": {"type": "string", "enum": list(BLOCKING_REASONS)}, "recommendation": {"type": "string"},
+            "least_disruptive": {"type": "string"},
             "resources": {"type": "array", "items": {"type": "string"}}, "exclusive": {"type": "boolean"},
             "continues": {"type": "integer"}, "resource": {"type": "string"}, "paused": {"type": "boolean"},
             "reason": {"type": "string"}, "supersedes": {"type": "array", "items": {"type": "string"}},
@@ -108,7 +109,8 @@ REJECTED_KEY = "rejected_actions"   # kv: the last turn's rejected actions, show
 # The daemon wakes the coordinator then, so the turn's undone work does not wait for an idle wake.
 RETRY_WAKE_KEY = "rejected_retry_wake"
 # Events that leave work stuck until the coordinator finds a way around it. A turn they start runs
-# at coordinator.unblock_effort, and so does an idle wake that finds blocked tasks or open asks.
+# at coordinator.unblock_effort, and so do turns carrying user messages, the turn after a rejected
+# ask_user, and an idle wake that finds blocked tasks or open asks.
 UNBLOCK_KINDS = frozenset({"task_blocked", "task_failed", "task_budget_exhausted", "resource_trouble",
                            "ask_timeout", "dead_dependency", "deferral_expired", "deferral_probe_broken"})
 EFFORT_ORDER = ("minimal", "low", "medium", "high", "xhigh", "max")
@@ -127,6 +129,8 @@ ASK_DEFAULTS_KEY = "ask_defaults"   # kv: {ask message id: recommendation}; no n
 _DEFAULT_NOTE = "\n\nIf there is no answer within "
 # Shown so the user can answer in one word; never applied without their answer.
 _REC_NOTE = "\n\nMy recommendation: "
+_LEAST_NOTE = "\n\nLeast-disruptive way considered: "
+LEAST_DISRUPTIVE_MIN = 40   # chars: a restriction ask names the way around it and the rule it breaks
 
 
 MEMORY_SNAPSHOT_KEY = "memory_snapshot"   # kv: the memory the coordinator's system prompt carries
@@ -630,11 +634,19 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if a.get("blocking") not in BLOCKING_REASONS:
                     raise ValueError(f"ask_user rejected: `blocking` must be one of {', '.join(BLOCKING_REASONS)}; "
                                      f"got {a.get('blocking')!r}. Anything else, decide it yourself")
+                least = str(a.get("least_disruptive") or "").strip()
+                if a["blocking"] == "restriction" and len(least) < LEAST_DISRUPTIVE_MIN:
+                    raise ValueError("ask_user rejected: first answer what is a reasonably non-disruptive way to "
+                                     "proceed. If it fits the restrictions, take it (task_add) and memory_add the "
+                                     "decision instead of asking. If not, put it in least_disruptive with the "
+                                     "restriction it breaks.")
                 text = a["text"].strip()
                 for o in db.q("SELECT id, text FROM messages WHERE kind='ask' AND handled=0"):
                     if _same_text(_ask_question(o["text"]), text):
                         raise ValueError(f"already asked as open ask #{o['id']}; it waits for the answer")
                 rec = (a.get("recommendation") or "").strip()
+                if a["blocking"] == "restriction":
+                    text += f"{_LEAST_NOTE}{least}"
                 if rec:
                     text += f"{_REC_NOTE}{rec}"
                 db.post("out", text, chat=None, kind="ask", severity=_norm_severity(a.get("severity") or "high"),
@@ -750,7 +762,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
 
 
 def _ask_question(text: str) -> str:
-    return text.split(_DEFAULT_NOTE)[0].split(_REC_NOTE)[0]
+    return text.split(_DEFAULT_NOTE)[0].split(_REC_NOTE)[0].split(_LEAST_NOTE)[0]
 
 
 def _same_text(a: str, b: str) -> bool:
@@ -853,14 +865,19 @@ def _is_dir(path: str) -> bool:
 MCP_NAME_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,100}$")
 
 
-def unblock_reason(db, event_ids: list[int], wake_due: str | None) -> str:
-    """Why the coming coordinator turn is about unblocking work, or "" for a routine one."""
+def unblock_reason(db, event_ids: list[int], wake_due: str | None, msg_ids: list[int] | None = None) -> str:
+    """Why the coming coordinator turn is about unblocking work, or "" for a routine one.
+    User messages count: the user writing usually means something waits on the project."""
     if event_ids:
         rows = db.q(f"SELECT DISTINCT kind FROM events WHERE id IN ({','.join('?' * len(event_ids))})",
                     list(event_ids))
         kinds = sorted(r["kind"] for r in rows if r["kind"] in UNBLOCK_KINDS)
         if kinds:
             return ", ".join(kinds)
+    if msg_ids:
+        return "user message"
+    if any(str(x).startswith("ask_user:") for x in db.kv(REJECTED_KEY, []) or []):
+        return "retry after a rejected ask_user"
     if wake_due == "idle":
         if db.one("SELECT id FROM tasks WHERE status='blocked'"):
             return "stalled on blocked tasks"
