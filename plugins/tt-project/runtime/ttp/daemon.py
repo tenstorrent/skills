@@ -521,7 +521,7 @@ class Daemon:
                            f"Workers run without these {provider} plugin directories, which do not exist: "
                            f"{', '.join(missing)}. Fix providers.{provider}.plugin_dirs in project.json.",
                            severity="normal", every_s=86400)
-            roots = [str(self.p.state)] + [d for d in [worktree.git_common_dir(Path(cwd))] if d]
+            roots = [str(self.p.state)] + worktree.git_dirs(Path(cwd))
             # `ttp lock` on a resource shared across projects takes its slot under the user's shared
             # lock root, outside the project: only that directory, not the rest of the user's
             # tt-project home. It must exist for the sandbox to grant it.

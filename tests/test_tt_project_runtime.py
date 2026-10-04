@@ -6007,6 +6007,7 @@ def test_codex_workers_may_write_run_state_and_git_metadata(env, monkeypatch):
     roots = next(a for a in argv if a.startswith("sandbox_workspace_write.writable_roots="))
     roots = json.loads(roots.split("=", 1)[1])
     assert str(p.state) in roots and str((env["repo"] / ".git").resolve()) in roots
+    assert str((env["repo"] / ".git" / "worktrees" / "wt").resolve()) in roots, "the worktree's own gitdir"
     assert spec["prices"] == {"some-model": [1.0, 0.1, 2.0]}, "the runner's budget check must use project prices"
     (p.runs / str(rid) / "STOP").touch()
     crid = d.start_run("coordinator", "decide", "codex", "light", str(p.base), read_only=True)
@@ -6096,6 +6097,32 @@ def test_sandboxed_codex_worker_takes_a_shared_lock_and_sees_its_pause(env):
     out = subprocess.run(narrow + lock + ["true"], cwd=cwd, env=run_env, capture_output=True, text=True)
     assert out.returncode == 2 and "not writable" in out.stderr and "Traceback" not in out.stderr, out.stderr
     assert not (p.state / "locks").exists() or not list((p.state / "locks").glob("box1*")), "no private lock"
+
+
+def test_sandboxed_codex_worker_can_git_add_in_a_linked_worktree(env):
+    # Codex makes the gitdir a worktree's `.git` file points to (<common>/worktrees/<name>) read-only
+    # even inside a writable common .git, so `git add` failed creating index.lock there (EROFS).
+    p = make(env)
+    wt = env["tmp"] / "wt-add"
+    subprocess.run(["git", "-C", str(env["repo"]), "worktree", "add", "-q", str(wt)], check=True)
+    gitdir = (env["repo"] / ".git" / "worktrees" / "wt-add").resolve()
+    roots = _codex_worker_roots(env, p, wt)
+    assert str(gitdir) in roots and str(p.state) in roots, roots
+    assert not any(pathlib.Path(r) != p.state and p.state.is_relative_to(r) for r in roots), \
+        "nothing above state/ becomes writable"
+    sandbox = _codex_sandbox(wt, roots)
+    if sandbox is None:
+        pytest.skip("no working Codex sandbox on this machine")
+    (wt / "new.txt").write_text("x")
+    add = subprocess.run(sandbox + ["git", "add", "new.txt"], cwd=wt, capture_output=True, text=True)
+    assert add.returncode == 0, add.stderr
+    assert "new.txt" in subprocess.run(["git", "-C", str(wt), "diff", "--cached", "--name-only"],
+                                       capture_output=True, text=True).stdout
+    # Without the gitdir root, as before the fix, the same add fails on index.lock.
+    old = _codex_sandbox(wt, [r for r in roots if r != str(gitdir)])
+    (wt / "other.txt").write_text("y")
+    add = subprocess.run(old + ["git", "add", "other.txt"], cwd=wt, capture_output=True, text=True)
+    assert add.returncode != 0 and "index.lock" in add.stderr, add.stderr
 
 
 def test_ttp_lock_says_plainly_when_the_shared_lock_is_not_writable(env):

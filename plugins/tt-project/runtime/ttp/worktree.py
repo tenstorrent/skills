@@ -27,14 +27,17 @@ def is_git(path: Path) -> bool:
         return False
 
 
-def git_common_dir(path: Path) -> str | None:
-    """The repository's shared .git directory; for a worktree it lies outside the worktree."""
+def git_dirs(path: Path) -> list[str]:
+    """The git metadata a commit in `path` writes: the worktree's own gitdir (its index, HEAD and
+    locks, under <common>/worktrees/<name>) and the shared .git directory, in that order, without
+    duplicates. Codex's sandbox makes the gitdir a worktree's `.git` file points to read-only, even
+    inside a writable common directory, so a worker must be granted it by name."""
     try:
-        out = _git(path, "rev-parse", "--git-common-dir", check=False)
+        out = _git(path, "rev-parse", "--git-dir", "--git-common-dir", check=False).splitlines()
     except (OSError, subprocess.SubprocessError):
-        return None
-    common = (Path(path) / out).resolve() if out else None
-    return str(common) if common and common.is_dir() else None
+        return []
+    found = [(Path(path) / line).resolve() for line in out[:2] if line]
+    return list(dict.fromkeys(str(d) for d in found if d.is_dir()))
 
 
 def slug(text: str) -> str:
