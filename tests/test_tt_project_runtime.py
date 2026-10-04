@@ -5183,16 +5183,16 @@ def test_the_disk_guard_alert_says_what_fills_the_disk_and_the_projects_share(en
     from ttp import daemon as dm
     other = env["tmp"] / "someone-elses-cache"
     other.mkdir()
-    (other / "blob").write_bytes(os.urandom(3 << 20))
+    (other / "blob").write_bytes(os.urandom(16 << 20))   # well above the repo, whose harness copy grows with the code
     (p.root / "build.bin").write_bytes(os.urandom(1 << 20))
     usage = collections.namedtuple("usage", "total used free")
     monkeypatch.setattr(dm.shutil, "disk_usage", lambda path: usage(1000e9, 960e9, 40e9))
     b = dm.disk_breakdown(p, p.base)
     assert b["complete"] and b["own_complete"] and b["mount"] == str(env["tmp"])
     top = dict(b["top"])
-    assert top[str(other)] >= 3 << 20 and top[str(env["repo"])] >= 1 << 20, top
+    assert top[str(other)] >= 16 << 20 and top[str(env["repo"])] >= 1 << 20, top
     assert next(iter(top)) == str(other), "the biggest directory comes first"
-    assert (1 << 20) <= b["own_bytes"] < (3 << 20)
+    assert (1 << 20) <= b["own_bytes"] < (16 << 20)
     dm.Daemon(p.base).check_disk()
     text = p.db.one("SELECT text FROM messages WHERE kind='alert' AND ref='disk'")["text"]
     assert f"This project's own data is 0.0 GB of the 960.0 GB used on {env['tmp']}" in text, text
