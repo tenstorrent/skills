@@ -26,7 +26,7 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
 | `config_set` | `key`, `value` | only when the user explicitly asks (caps, notifications, provider); `delivery.base_ref` (where code tasks branch from), `delivery.push_branch` and `delivery.push_checks` (where `ttp push` publishes and what must pass first) and `delivery.version_bump` (files whose version `ttp push` bumps, plus `changeset_dir`) you may set yourself |
 | `resource_pause` | `resource`, `paused` (true/false), `reason` | stop all use of a shared resource (the user asked, or it is unsafe to use); `paused: false` lifts it. A pause the user set is lifted only on their word |
 | `observation_mute` | `source` (e.g. `watcher:<name>`), `match` (text the observation contains, any case, 3+ chars), `hours` (1-72), optional `below` (normal/high/critical, default critical: observations at or above it still wake you), `why` | a known recurring condition the user was already told about, with nothing of ours to fix. Matching observations are still recorded and counted but do not wake you; when the mute ends you get one summary. Muting the same source and match again extends it |
-| `pr_approve` | `id` (the answered `review`/`merge` ask naming the PR, or the user's message naming it), `text` (the PR's URL) | the user said yes to taking that PR out of draft; record it before a worker marks it ready |
+| `pr_approve` | `id` (the answered `review`/`merge` ask naming the PR, or the user message `#id` naming it), `text` (the PR's URL) | the user said yes to taking that PR out of draft; record it before a worker marks it ready |
 | `noop` | — | nothing to do |
 
 # Tasks

@@ -11800,6 +11800,7 @@ import os, sys
 a = sys.argv[1:]
 if a[:2] == ["alias", "list"]:
     print("rdy: pr ready")
+    print("rapi: api $1 --method PATCH")
     sys.exit(0)
 if a[:2] == ["pr", "view"]:
     pos = [x for x in a[2:] if not x.startswith("-")][:1]
@@ -11843,8 +11844,12 @@ def test_workers_gh_keeps_prs_in_draft_until_the_user_approves(env, tmp_path):
     from ttp import coordinator as coord
     gh = _gh_runner(p, tmp_path)
     url = "https://github.com/acme/widgets/pull/7"
+    mutation = tmp_path / "ready.graphql"
+    mutation.write_text(READY_7.removeprefix("query="))
 
     refused = [("pr", "create", "--title", "t", "--body", "b"),
+               ("rapi", "repos/acme/widgets/pulls/7", "-F", "draft=false"),
+               ("api", "graphql", "-F", f"query=@{mutation}"),
                ("pr", "ready", "7"), ("pr", "ready"), ("pr", "ready", url), ("rdy", "7"),
                ("api", "-X", "PATCH", "repos/acme/widgets/pulls/7", "-F", "draft=false"),
                ("api", "repos/acme/widgets/pulls", "-f", "title=t", "-f", "head=b", "-f", "base=main"),
@@ -11864,7 +11869,9 @@ def test_workers_gh_keeps_prs_in_draft_until_the_user_approves(env, tmp_path):
     assert coord.apply(p, [{"type": "ask_user", "text": f"Mark {url} ready for review?", "blocking": "review",
                             "recommendation": "yes"}]) == []
     ask = p.db.one("SELECT id FROM messages WHERE kind='ask'")["id"]
-    p.db.post("in", "yes, go ahead", chat="web")
+    yes = p.db.post("in", "yes, go ahead", chat="web")
+    # The coordinator sees each user message's id, to name it in pr_approve.
+    assert f"[user message #{yes} via" in coord.digest(p, {}, [], [yes])
     assert coord.apply(p, [{"type": "pr_approve", "id": ask, "text": url}]) == []
     for args in [("pr", "ready", "7"), ("pr", "ready"), ("rdy", "7"), ("api", "graphql", "-f", READY_7),
                  ("api", "-X", "PATCH", "repos/acme/widgets/pulls/7", "-F", "draft=false")]:

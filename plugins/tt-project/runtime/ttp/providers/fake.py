@@ -73,7 +73,7 @@ def _main(role: str, args: list[str] | None = None) -> int:
         else:
             actions = []
             for line in prompt.splitlines():
-                if line.startswith("- [user message via"):
+                if line.startswith("- [user message "):
                     chat = line.split("chat=")[1].split("]")[0]
                     text = line.split("] ", 1)[1]
                     actions.append({"type": "reply", "chat": chat, "text": f"ack: {text}"})

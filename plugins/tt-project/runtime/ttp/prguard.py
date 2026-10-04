@@ -170,7 +170,7 @@ def check(args: list[str], real: str, db=None, stdin_text: str | None = None, _d
                 if re.search(r"\bpr\s+(ready|create)\b|\bapi\b|markPullRequestReadyForReview|draft", text):
                     return f"refused: the gh alias {cmd!r} runs a shell command that may change a PR's draft state"
                 return None
-            return check(shlex.split(expansion) + rest, real, db, stdin_text, _depth + 1)
+            return check(_expand(expansion, rest), real, db, stdin_text, _depth + 1)
     if cmd == "pr" and rest:
         sub, more = rest[0], rest[1:]
         if sub == "create":
@@ -198,6 +198,20 @@ def _alias(real: str, name: str) -> str | None:
     return None
 
 
+def _expand(expansion: str, rest: list[str]) -> list[str]:
+    """A gh alias's expansion with its `$1`.. placeholders filled from `rest`; the rest appended."""
+    used: set[int] = set()
+
+    def fill(m: re.Match) -> str:
+        n = int(m.group(1)) - 1
+        if 0 <= n < len(rest):
+            used.add(n)
+            return rest[n]
+        return m.group(0)
+    parts = [re.sub(r"\$(\d+)", fill, t) for t in shlex.split(expansion)]
+    return parts + [a for i, a in enumerate(rest) if i not in used]
+
+
 def _check_api(args: list[str], real: str, db, stdin_text: str | None) -> str | None:
     fields = _opts(args, ("-f", "-F", "--field", "--raw-field"))
     inputs = _opts(args, ("--input",))
@@ -210,6 +224,16 @@ def _check_api(args: list[str], real: str, db, stdin_text: str | None) -> str | 
                 body += Path(f).read_text(errors="replace")
             except OSError:
                 return f"refused: cannot read the --input file {f!r} to check it for a PR draft change"
+    for f in _opts(args, ("-F", "--field")):   # a typed field `key=@file` (or `@-`) reads its value
+        _, eq, val = f.partition("=")
+        if eq and val.startswith("@"):
+            if val == "@-":
+                body += " " + (stdin_text or "")
+                continue
+            try:
+                body += " " + Path(val[1:]).read_text(errors="replace")
+            except OSError:
+                return f"refused: cannot read the field file {val[1:]!r} to check it for a PR draft change"
     text = " ".join(fields) + " " + body
     pos = _positionals(args, ("-X", "--method", "-f", "-F", "--field", "--raw-field", "-H", "--header",
                               "--input", "-q", "--jq", "-t", "--template", "--hostname", "--cache", "-p",
@@ -268,7 +292,8 @@ def main(argv: list[str], own_dir: str) -> int:
         return 127
     args = argv[1:]
     stdin_text = None
-    if args[:1] == ["api"] and "-" in _opts(args, ("--input",)):
+    if args[:1] == ["api"] and ("-" in _opts(args, ("--input",))
+                                or any(f.endswith("=@-") for f in _opts(args, ("-F", "--field")))):
         stdin_text = sys.stdin.read()
     try:
         why = check(args, real, _project_db(), stdin_text)
