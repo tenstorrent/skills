@@ -11426,3 +11426,23 @@ def test_worker_prompt_keeps_real_parenthesised_paragraphs(env):
     out = charter_without_placeholders(charter)
     assert "(Note: never run on weekends.)" in out and "## Policies" in out
     assert "to be restated" not in out and "to be filled in" not in out
+
+
+def test_push_check_path_args_and_unmatched(env, tmp_path):
+    from ttp import push
+    assert push.path_args("python3 -m pytest -q tests/test_a.py::test_x tests/b_*.py") == \
+        ["tests/test_a.py", "tests/b_*.py"]
+    assert push.path_args("make check") == []
+    repo = tmp_path / "r"
+    repo.mkdir()
+    g = lambda *a: subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True)
+    g("init", "-q", "-b", "work")
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_a.py").write_text("")
+    g("add", ".")
+    g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x")
+    checks = ["pytest tests/test_a.py tests/test_gone.py", "ruff check tests/*.py", "pytest tests/"]
+    ref, missing = push.unmatched_paths(repo, "origin", "work", checks)
+    assert ref == "work"
+    assert missing == ["'pytest tests/test_a.py tests/test_gone.py': 'tests/test_gone.py'"]
+    assert push.unmatched_paths(repo, "origin", "nope", checks) == ("", [])

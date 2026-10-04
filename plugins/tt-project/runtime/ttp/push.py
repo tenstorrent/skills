@@ -89,6 +89,47 @@ def checks_of(v: Any) -> list[str]:
         raise ValueError("; ".join(bad))
     return check_list(v)
 
+_GLOB = re.compile(r"[*?\[]")
+
+
+def path_args(cmd: str) -> list[str]:
+    """Path-like arguments of a check command (globs, file paths such as pytest targets), without a
+    pytest `::node` suffix. Options, `VAR=value` words and the program itself are skipped."""
+    try:
+        words = shlex.split(cmd)
+    except ValueError:
+        return []
+    out = []
+    for w in words[1:]:
+        if w.startswith("-") or "=" in w or "$" in w or w in BUILTINS or w in ("&&", "||", ";", "|"):
+            continue
+        w = w.split("::", 1)[0]
+        if w.startswith("./"):
+            w = w[2:]
+        if w and not w.startswith(("/", "~")) and ("/" in w or _GLOB.search(w)):
+            out.append(w.rstrip("/"))
+    return out
+
+
+def unmatched_paths(repo: Path, remote: str, branch: str, checks: list[str]) -> tuple[str, list[str]]:
+    """(ref, ["cmd: path", ...]) for check path args that match no file on the push branch (the local
+    branch, else the remote's ref). ref is "" when neither can be read."""
+    import fnmatch
+    for ref in (branch, f"{remote}/{branch}"):
+        ls = _git(repo, "ls-tree", "-r", "--name-only", ref)
+        if ls.returncode == 0:
+            break
+    else:
+        return "", []
+    files = ls.stdout.splitlines()
+    out = []
+    for cmd in checks:
+        for a in path_args(cmd):
+            if not any(f == a or f.startswith(a + "/") or fnmatch.fnmatchcase(f, a) for f in files):
+                out.append(f"{cmd!r}: {a!r}")
+    return ref, out
+
+
 def _git(repo: Path, *args: str, quiet: bool = True) -> subprocess.CompletedProcess:
     """Run git; when not quiet its output goes to stderr, keeping stdout for the verdict."""
     if quiet:

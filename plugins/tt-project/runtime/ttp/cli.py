@@ -1371,6 +1371,16 @@ def cmd_doctor(a) -> None:
     from .project import config_problems
     for line in config_problems(p.raw_config()):
         print(f"project.json: {line}")
+    from . import push as _push
+    checks = _push.check_list((p.config().get("delivery") or {}).get("push_checks"))
+    if checks and (p.config().get("delivery") or {}).get("push_branch"):
+        try:
+            remote, branch = _push.target(p, p.root)
+            ref, missing = _push.unmatched_paths(p.root, remote, branch, checks)
+        except (ValueError, OSError):
+            ref, missing = "", []
+        for m in missing:
+            print(f"delivery.push_checks: {m} matches no file on {ref}; every push would fail on it")
 
 
 class _Version(argparse.Action):
