@@ -624,6 +624,7 @@ def free(p: Project, repo: Path) -> int:
 # crash, a kill, a reboot), and the probe then records it as failed. Its push lock goes the same way.
 DETACHED = "pushes"        # under the project's state: <id>.json (marker) and <id>.log per push
 LOG_TAIL = 20
+KEEP_S = 30 * 86400        # finished markers and logs older than this go when the next push starts
 
 
 def _run_lock(marker: Path) -> Path:
@@ -651,6 +652,28 @@ def _read(marker: Path) -> dict:
     except (OSError, ValueError):
         return {}
     return m if isinstance(m, dict) else {}
+
+
+def _forget_lock(marker: Path) -> None:
+    """Remove a finished push's run lock file; the probe reads a missing one as free."""
+    try:
+        _run_lock(marker).unlink()
+    except OSError:
+        pass
+
+
+def _prune(folder: Path, now: float) -> None:
+    for marker in folder.glob("*.json"):
+        try:
+            old = now - marker.stat().st_mtime > KEEP_S
+        except OSError:
+            continue
+        if old and _read(marker).get("status") != "running":
+            for f in (marker, marker.with_suffix(".log"), _run_lock(marker)):
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
 
 
 def _tail(path: str | None, n: int = LOG_TAIL) -> str:
@@ -682,6 +705,7 @@ def detach(p: Project, repo: Path) -> int:
     marker = p.state / DETACHED / f"{rid}.json"
     log = marker.with_suffix(".log")
     marker.parent.mkdir(parents=True, exist_ok=True)
+    _prune(marker.parent, time.time())
     lock = locks.try_take([_run_lock(marker)], f"detached push {rid}", "ttp push --detach")
     if lock is None:
         print(f"ttp push: the run lock of {rid} is taken", file=sys.stderr)
@@ -737,6 +761,7 @@ def run_detached(p: Project, repo: Path, marker: Path) -> int:
     m = _read(marker) or {"id": marker.stem, "pid": os.getpid(), "log": str(marker.with_suffix(".log"))}
     m.update(status="pushed" if rc == 0 else "failed", exit=rc, sha=sha, version=version, ended=time.time())
     write_json(marker, m)
+    _forget_lock(marker)       # the outcome is written: a missing lock file reads as finished
     return rc
 
 
@@ -758,6 +783,7 @@ def result(marker: Path) -> int:
         m.update(status="failed", exit=None, ended=time.time(),
                  reason="the push process ended without writing an outcome (killed, crashed or rebooted)")
         write_json(marker, m)
+        _forget_lock(marker)
     if m.get("status") == "pushed":
         v = f", version {m['version']}" if m.get("version") else ""
         print(f"ttp push: pushed {m.get('sha')} to {m.get('target')}{v}")

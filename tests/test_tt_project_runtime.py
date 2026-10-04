@@ -7819,6 +7819,17 @@ def test_a_detached_push_returns_at_once_and_its_marker_reports_the_pushed_sha_a
     assert (m["status"], m["exit"], m["sha"], m["version"]) == ("pushed", 0, pushed, "0.1.1")
     assert m["ended"] >= m["started"] and "bumped" in pathlib.Path(m["log"]).read_text()
     assert _ttp("push", "--free") == 0 and not release.push_in_flight(p)
+    from ttp import push
+    assert not push._run_lock(marker).exists(), "a finished push leaves no lock file behind"
+    # A month later the next detached push tidies the finished marker and its log away.
+    month = time.time() - push.KEEP_S - 60
+    os.utime(marker, (month, month))
+    _commit(repo, "plugins/p/rt/y.py", "y = 1\n")
+    gate.unlink()
+    rc, second, probe2 = _detach(capsys)
+    assert rc == 0 and not marker.exists() and not pathlib.Path(m["log"]).exists() and second.exists()
+    gate.touch()
+    assert _probe_until_done(p, probe2).returncode == 0
 
 
 def test_a_detached_push_whose_check_fails_reports_the_exit_and_log_tail(env, monkeypatch, capsys):
@@ -7863,6 +7874,8 @@ def test_a_dead_detached_push_reads_as_failed_and_frees_the_branch(env, monkeypa
         assert r.returncode == 0 and "not pushed" in r.stdout and "without writing an outcome" in r.stdout, r
         m = json.loads(marker.read_text())
         assert m["status"] == "failed" and m["exit"] is None and m["reason"]
+        from ttp import push
+        assert not push._run_lock(marker).exists()
         assert _probe(p, probe).returncode == 0
     finally:
         try:
