@@ -133,6 +133,11 @@ and preferences you add later become part of the project's charter and memory.
   reboot frees. One that waits longer than `delivery.push_wait_s` exits 75 and prints a
   `retry_when` for its hand-off: `ttp push --free`, which exits 0 once the turn is free. Unset,
   the wait is twice the last measured check run plus 60 s, at least 900 s and at most 2 h.
+- `ttp push --detach` runs the same push in a process of its own and returns at once, for
+  checks that outlast a worker's tool call. It prints a marker under `state/pushes/` and a
+  `retry_when` probe, `ttp push --result <marker>`: 1 while the push runs, 0 once it finished,
+  printing the pushed sha (and version) or the exit code and the log tail. A push killed by a
+  crash or a reboot frees its locks; the probe then records it as failed instead of waiting.
 - `delivery.version_bump` lets `ttp push` own the version bump, so parallel reviews never race for
   one version: `{"files": [...], "changeset_dir": ".changeset"}` (optional `package`, and `paths`,
   default the folder the files share). After each rebase, when the change touches `paths`, it

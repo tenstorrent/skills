@@ -35,6 +35,11 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("TTP_TEST_DISK_MOUNT", str(tmp_path))   # the disk guard's du stays in the test folder
     for var in ("TTP_RUN_DIR", "TTP_TASK", "TTP_RUN_ID", "TTP_PROJECT"):   # tests may run inside a live run
         monkeypatch.delenv(var, raising=False)
+    # A run's environment makes every git fsync its objects (project.git_fsync_env); test repositories
+    # need no power-loss durability, and on some filesystems each `git add` then takes 20x longer.
+    # Tests of those settings set and inspect them explicitly.
+    for var in [v for v in os.environ if v == "GIT_CONFIG_COUNT" or v.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))]:
+        monkeypatch.delenv(var)
     sys.path.insert(0, str(RUNTIME))
     for mod in [m for m in list(sys.modules) if m == "ttp" or m.startswith("ttp.")]:
         del sys.modules[mod]
@@ -48,6 +53,9 @@ def env(tmp_path, monkeypatch):
         conn.execute("PRAGMA synchronous=OFF")
         return conn
     monkeypatch.setattr(sqlite3, "connect", no_fsync)
+    # Likewise for state files: durable_write still writes, renames and calls os.fsync (tests that
+    # check the syncs wrap it), but the sync itself, slow on copy-on-write filesystems, is skipped.
+    monkeypatch.setattr(os, "fsync", lambda fd: None)
     repo = tmp_path / "repo"
     repo.mkdir()
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
@@ -11680,6 +11688,7 @@ DURABLE_EXEMPT = {
     ("project.py", 'open(path, "a")'): "inside durable_append",
     ("release.py", "os.replace(tmp, cur)"): "a symlink swap; the directory is synced after",
     ("release.py", "upgrade.log"): "a log",
+    ("push.py", 'open(log, "ab")'): "a detached push's log; its outcome goes to the marker, durably",
     ("daemon.py", "daemon.log"): "a log",
     ("daemon.py", "runner.log"): "a log",
     ("daemon.py", "pidfile.write_text"): "names a process, which a reboot ends",
