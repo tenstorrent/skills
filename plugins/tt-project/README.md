@@ -172,7 +172,8 @@ and preferences you add later become part of the project's charter and memory.
 
 Each project starts from this plugin's template and then improves its own harness from
 experience. When a newer tt-project is installed (`ttp setup` from the updated plugin; the skill does
-it on first use after an update), each project's daemon merges it into its own harness within an hour
+it on first use after an update; to deploy a branch tip, run `plugins/tt-project/bin/ttp setup` from a
+checkout at that tip, since the installed `ttp setup` reinstalls its own version and warns about it), each project's daemon merges it into its own harness within an hour
 and restarts, keeping running work. `ttp config <name> upgrade.auto false` turns that off;
 `ttp upgrade <name>` then merges by hand.
 

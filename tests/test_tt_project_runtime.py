@@ -12893,3 +12893,29 @@ def test_pr_watch_puts_an_unapproved_ready_pr_back_in_draft(env, tmp_path, monke
     p.db.set_kv(prguard.UNDONE_KEY, {k: v - watchers.UNDO_EVERY_S for k, v in p.db.kv(prguard.UNDONE_KEY).items()})
     watchers.watch_prs(d)
     assert undos() == [f"pr ready {new} --undo"] and json.loads(prs.read_text())[new] is True
+
+
+def test_setup_warns_when_installed_copy_is_older_than_checkout(tmp_path, monkeypatch, capsys):
+    from ttp import cli, project
+    home = tmp_path / "home"
+    installed = home / "lib" / "0.0.1" / "runtime"
+    installed.mkdir(parents=True)
+    monkeypatch.setattr(project, "HOME_DIR", home)
+    monkeypatch.setattr(cli, "RUNTIME", installed)
+    monkeypatch.setattr(cli, "__version__", "0.0.1")
+    plugin = tmp_path / "repo" / "plugins" / "tt-project"
+    (plugin / "runtime" / "ttp").mkdir(parents=True)
+    (plugin / "bin").mkdir()
+    (plugin / "bin" / "ttp").write_text("")
+    (plugin / "runtime" / "ttp" / "__init__.py").write_text('__version__ = "9.9.9"\n')
+    sub = tmp_path / "repo" / "docs"
+    sub.mkdir()
+    msg = cli.stale_install_warning(sub)
+    assert "9.9.9" in msg and f"{plugin / 'bin' / 'ttp'} setup" in msg
+    assert "9.9.9" in capsys.readouterr().err
+    # Same or older checkout, or running from the checkout itself: no warning.
+    (plugin / "runtime" / "ttp" / "__init__.py").write_text('__version__ = "0.0.1"\n')
+    assert cli.stale_install_warning(sub) == ""
+    (plugin / "runtime" / "ttp" / "__init__.py").write_text('__version__ = "9.9.9"\n')
+    monkeypatch.setattr(cli, "RUNTIME", plugin / "runtime")
+    assert cli.stale_install_warning(sub) == ""

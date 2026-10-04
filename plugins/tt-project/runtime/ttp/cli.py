@@ -1257,6 +1257,29 @@ def cmd_logs(a) -> None:
     print(f.read_text()[-a.bytes:] if f.exists() else "(no log yet)")
 
 
+def stale_install_warning(cwd: Path | None = None) -> str:
+    """Warn when an installed ttp runs setup inside a checkout that holds a newer plugin."""
+    from .project import HOME_DIR
+    from .release import is_newer, runtime_version
+    try:
+        if not RUNTIME.resolve().is_relative_to((HOME_DIR / "lib").resolve()):
+            return ""
+    except OSError:
+        return ""
+    here = (cwd or Path.cwd()).resolve()
+    for d in (here, *here.parents):
+        plugin = d / "plugins" / "tt-project"
+        if (plugin / "runtime").is_dir() and (plugin / "bin" / "ttp").exists():
+            newer = runtime_version(plugin / "runtime")
+            if is_newer(newer, __version__):
+                msg = (f"warning: this is the installed ttp {__version__}, but this checkout has {newer}; "
+                       f"to install the checkout run `{plugin / 'bin' / 'ttp'} setup`")
+                print(msg, file=sys.stderr)
+                return msg
+            return ""
+    return ""
+
+
 def cmd_setup(a) -> None:
     """Install this runtime as the user's stable `ttp` (plugin caches move on every update)."""
     from .project import HOME_DIR
@@ -1268,6 +1291,7 @@ def cmd_setup(a) -> None:
     if is_newer(installed, __version__) and not a.force:
         die(f"ttp {installed} is installed, newer than this ttp {__version__}: not downgrading it. "
             f"Run setup from the newer plugin, or add --force to install {__version__} anyway", 1)
+    stale_install_warning()
     commit = source_commit()
     before = recorded_commit(lib / "runtime") if (lib / "runtime").is_dir() else ""
     if RUNTIME.resolve() != (lib / "runtime").resolve():

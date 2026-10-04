@@ -21,7 +21,7 @@ description: "Start, connect to, and talk with a long-running tt-project: a loca
 
 | Step | Do |
 |---|---|
-| 1. Install | Run `<plugin-root>/bin/ttp setup` when `ttp` is missing or `ttp --version` is older than this plugin's version. Afterwards use `ttp`; projects pick up the new release by themselves. |
+| 1. Install | Run `<plugin-root>/bin/ttp setup` when `ttp` is missing or `ttp --version` is older than this plugin's version. To deploy a repository branch tip, run `plugins/tt-project/bin/ttp setup` from a checkout at that tip, not the installed `ttp setup` (it reinstalls its own version). Afterwards use `ttp`; projects pick up the new release by themselves. |
 | 2. Name | Get the project name. `ttp find <name>` says whether it exists. |
 | 3a. New | Follow `create.md`. |
 | 3b. Existing | `ttp connect <name> --label "<short chat label>"`. Keep the printed `chat:` id. |
