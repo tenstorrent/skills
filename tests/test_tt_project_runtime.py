@@ -12456,20 +12456,26 @@ def test_the_code_prompt_lands_only_through_the_guarded_push_and_only_when_asked
 
 # --- PRs leave draft only with the user's recorded approval ---------------------------------------
 
+HEAD = "a" * 40   # the head commit pr-watch read and the fake gh reports, unless a test moves it
+
 FAKE_GH = '''#!{python}
 import os, sys
 a = sys.argv[1:]
+head = os.environ.get("FAKE_GH_HEAD", "{head}")
 if a[:2] == ["alias", "list"]:
     print("rdy: pr ready")
     print("rapi: api $1 --method PATCH")
     sys.exit(0)
 if a[:2] == ["pr", "view"]:
-    pos = [x for x in a[2:] if not x.startswith("-")][:1]
+    pos = [x for x in a[2:] if not x.startswith("-") and "headRefOid" not in x][:1]
     n = pos[0] if pos and pos[0].isdigit() else "7"
-    print(f"https://github.com/acme/widgets/pull/{{n}}")
+    print(f"https://github.com/acme/widgets/pull/{{n}} {{head}}")
     sys.exit(0)
 if a[:2] == ["api", "graphql"] and any("node(id:" in x for x in a):
-    print("https://github.com/acme/widgets/pull/7")
+    print(f"https://github.com/acme/widgets/pull/7 {{head}}")
+    sys.exit(0)
+if a[:1] == ["api"] and a[-2:] == ["-q", ".head.sha"]:
+    print(head)
     sys.exit(0)
 with open(os.environ["FAKE_GH_LOG"], "a") as f:
     f.write(" ".join(a) + "\\n")
@@ -12482,7 +12488,7 @@ READY_7 = ("query=mutation{markPullRequestReadyForReview(input:{pullRequestId:\"
 def _gh_runner(p, tmp_path, run_dir=None, cwd=None):
     fake = tmp_path / "realbin"
     fake.mkdir(exist_ok=True)
-    (fake / "gh").write_text(FAKE_GH.format(python=sys.executable))
+    (fake / "gh").write_text(FAKE_GH.format(python=sys.executable, head=HEAD))
     (fake / "gh").chmod(0o755)
     log = tmp_path / "gh.log"
     log.write_text("")
@@ -12493,12 +12499,20 @@ def _gh_runner(p, tmp_path, run_dir=None, cwd=None):
     if run_dir:
         env["TTP_RUN_DIR"] = str(run_dir)
 
-    def gh(*args):
-        r = subprocess.run(["gh", *args], capture_output=True, text=True, env=env, timeout=60, cwd=cwd)
+    def gh(*args, head=None):
+        r = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=60, cwd=cwd,
+                           env={**env, **({"FAKE_GH_HEAD": head} if head else {})})
         ran = log.read_text().splitlines()
         log.write_text("")
         return r.returncode, r.stderr, ran
     return gh
+
+
+def _heads_seen(p, *keys, sha=HEAD, seen=0.0):
+    """pr-watch read these PRs' head commit `sha` at `seen` (what an approval binds to)."""
+    from ttp import prguard
+    p.db.set_kv(prguard.HEADS_KEY, {**(p.db.kv(prguard.HEADS_KEY, {}) or {}),
+                                    **{k: {"sha": sha, "seen": seen} for k in keys}})
 
 
 def test_workers_gh_keeps_prs_in_draft_until_the_user_approves(env, tmp_path):
@@ -12510,6 +12524,7 @@ def test_workers_gh_keeps_prs_in_draft_until_the_user_approves(env, tmp_path):
     url = "https://github.com/acme/widgets/pull/7"
     mutation = tmp_path / "ready.graphql"
     mutation.write_text(READY_7.removeprefix("query="))
+    _heads_seen(p, "acme/widgets#7")
 
     refused = [("pr", "create", "--title", "t", "--body", "b"),
                ("rapi", "repos/acme/widgets/pulls/7", "-F", "draft=false"),
@@ -12567,6 +12582,8 @@ def test_pr_approve_needs_the_users_answer_naming_the_pr(env):
 
     def approve(msg, pr=url, quote="yes"):
         return coord.apply(p, [{"type": "pr_approve", "id": msg, "text": pr, "quote": quote}])
+
+    _heads_seen(p, "acme/widgets#7", "acme/widgets#9")
 
     coord.apply(p, [{"type": "ask_user", "text": f"Grant access to the device for {url}?", "blocking": "access",
                      "recommendation": "yes"}])
@@ -13014,7 +13031,7 @@ def test_pr_watch_alerts_when_a_pr_leaves_draft_without_approval(env, monkeypatc
                (f"t{n}", "code", "done", url, time.time()))
     state = {old: {"isDraft": False}, new: {"isDraft": True}}
     monkeypatch.setattr(watchers, "_gh", lambda args, cwd: None if args[0] == "api" else
-                        {"url": args[2], "state": "OPEN", "title": "t", **state[args[2]]})
+                        {"url": args[2], "state": "OPEN", "title": "t", "headRefOid": HEAD, **state[args[2]]})
     monkeypatch.setattr(watchers, "_undo_ready", lambda url, cwd: False)   # gh could not put it back
     # PRs out of draft before this check existed are not flagged.
     p.db.set_kv("pr_signatures", {old: {"state": "OPEN", "draft": False}})
@@ -13495,6 +13512,8 @@ def test_pr_approve_counts_only_a_clear_yes_in_the_users_own_words(env):
     def approve(msg, quote):
         return " ".join(coord.apply(p, [{"type": "pr_approve", "id": msg, "text": url, "quote": quote}]))
 
+    _heads_seen(p, "acme/widgets#7")
+
     coord.apply(p, [{"type": "ask_user", "text": f"Take {url} out of draft?", "blocking": "review",
                      "recommendation": "yes"}])
     ask = p.db.one("SELECT id FROM messages WHERE kind='ask'")["id"]
@@ -13525,12 +13544,13 @@ def test_an_approval_is_spent_and_a_pr_back_in_draft_needs_a_fresh_yes(env, tmp_
     gh = _gh_runner(p, tmp_path)
     url = "https://github.com/acme/widgets/pull/7"
     p.db.x("INSERT INTO tasks(title,kind,status,pr_url,created) VALUES('t','code','done',?,?)", (url, time.time()))
+    _heads_seen(p, "acme/widgets#7")
     said = p.db.post("in", f"yes, mark {url} ready", chat="web", provenance="web-session")
     assert coord.apply(p, [{"type": "pr_approve", "id": said, "text": url, "quote": "yes"}]) == []
     assert gh("pr", "ready", "7")[0] == 0
     state = {"isDraft": False}
     monkeypatch.setattr(watchers, "_gh", lambda args, cwd: None if args[0] == "api" else
-                        {"url": url, "state": "OPEN", "title": "t", **state})
+                        {"url": url, "state": "OPEN", "title": "t", "headRefOid": HEAD, **state})
     d = Daemon(p.base)
     watchers.watch_prs(d)
     assert p.db.kv(prguard.UNAPPROVED_KEY) == {}, "a PR the user approved was flagged"
@@ -13558,9 +13578,59 @@ def test_task_specs_that_take_a_pr_out_of_draft_need_the_users_approval(env):
     tid = p.db.one("SELECT id FROM tasks WHERE title='ok 3'")["id"]
     out = " ".join(coord.apply(p, [{"type": "task_update", "id": tid, "spec": f"Then gh pr ready {url}"}]))
     assert "rejected" in out and "Then gh pr ready" not in p.db.task(tid)["spec"]
+    _heads_seen(p, "acme/widgets#7")
     said = p.db.post("in", f"yes, {url} can leave draft", chat="web", provenance="web-session")
     assert coord.apply(p, [{"type": "pr_approve", "id": said, "text": url, "quote": "yes"}]) == []
     assert coord.apply(p, [{"type": "task_update", "id": tid, "spec": f"Then gh pr ready {url}"}]) == []
+
+
+def test_an_approval_covers_only_the_commit_the_user_said_yes_to(env, tmp_path, monkeypatch):
+    """A yes was recorded, then more commits were pushed and the PR was marked ready with them. The
+    approval is bound to the PR's head as pr-watch last read it: a moved head is refused (and the
+    worker told to hand off blocked), and a head first seen after the yes cannot be approved with it."""
+    from ttp import coordinator as coord, prguard, watchers
+    from ttp.daemon import Daemon
+    p = make(env)
+    gh = _gh_runner(p, tmp_path)
+    url, moved = "https://github.com/acme/widgets/pull/7", "b" * 40
+    p.db.x("INSERT INTO tasks(title,kind,status,pr_url,created) VALUES('t','code','done',?,?)", (url, time.time()))
+    pr = {"url": url, "state": "OPEN", "title": "t", "isDraft": True, "headRefOid": HEAD}
+    monkeypatch.setattr(watchers, "_gh", lambda args, cwd: None if args[0] == "api" else dict(pr))
+
+    def approve(msg):
+        return " ".join(coord.apply(p, [{"type": "pr_approve", "id": msg, "text": url, "quote": "yes"}]))
+
+    early = p.db.post("in", f"yes, mark {url} ready", chat="web")
+    assert "has not read" in approve(early), "approved with no head commit on record"
+    d = Daemon(p.base)
+    watchers.watch_prs(d)          # pr-watch reads the head only after that yes
+    assert p.db.kv(prguard.HEADS_KEY)["acme/widgets#7"]["sha"] == HEAD
+    assert "new commits since the user's yes" in approve(early)
+    said = p.db.post("in", f"yes, mark {url} ready", chat="web")
+    assert approve(said) == ""
+    assert p.db.kv(prguard.APPROVALS_KEY)["acme/widgets#7"]["head"] == HEAD
+    # Commits pushed after the yes: every way of marking it ready is refused, and the approval stays unspent.
+    for args in [("pr", "ready", "7"), ("api", "graphql", "-f", READY_7),
+                 ("api", "-X", "PATCH", "repos/acme/widgets/pulls/7", "-F", "draft=false")]:
+        rc, err, ran = gh(*args, head=moved)
+        assert rc == 1 and ran == [], f"gh {' '.join(args)} let new commits out of draft"
+        assert "new commits since the user approved it" in err and "hand off `blocked`" in err and "PR's URL" in err
+    assert prguard.may_ready(p.db, "acme/widgets#7")
+    # pr-watch sees the new head after the yes: re-recording the same yes does not cover it.
+    pr["headRefOid"] = moved
+    watchers.watch_prs(d)
+    assert "new commits since the user's yes" in approve(said)
+    # The head the user said yes to is still the head: it may leave draft (once).
+    pr["headRefOid"] = HEAD
+    watchers.watch_prs(d)
+    yes = p.db.post("in", f"yes, mark {url} ready", chat="web")
+    assert approve(yes) == ""
+    rc, err, ran = gh("pr", "ready", "7")
+    assert rc == 0 and ran, err
+    # An approval recorded before heads were bound has no head and lets nothing out of draft.
+    p.db.set_kv(prguard.APPROVALS_KEY, {"acme/widgets#7": {"answer": 1, "spent": None}})
+    rc, err, ran = gh("pr", "ready", "7")
+    assert rc == 1 and ran == [] and "could not check that its head commit" in err
 
 
 def test_gh_opens_a_draft_pr_only_after_the_runs_checks_passed_on_head(env, tmp_path, monkeypatch):

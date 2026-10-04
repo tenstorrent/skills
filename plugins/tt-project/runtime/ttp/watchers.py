@@ -99,12 +99,16 @@ def watch_prs(daemon) -> str:
     before = set(before)
     flagged = dict(db.kv(prguard.UNAPPROVED_KEY, {}) or {})   # a PR gh could not read keeps its flag
     findings = dict(db.kv(prguard.FINDINGS_KEY, {}) or {})
+    heads = dict(db.kv(prguard.HEADS_KEY, {}) or {})
     changed = 0
     for t in rows:
         pr = _gh(["pr", "view", t["pr_url"], "--json", "state,isDraft,mergeable,reviewDecision,statusCheckRollup,"
-                  "comments,reviews,url,title,author"], root)
+                  "comments,reviews,url,title,author,headRefOid"], root)
         if pr is None:
             continue
+        key = prguard.pr_key(pr.get("url") or t["pr_url"])
+        if key and pr.get("headRefOid") and (heads.get(key) or {}).get("sha") != pr["headRefOid"]:
+            heads[key] = {"sha": pr["headRefOid"], "seen": time.time()}   # what an approval binds to
         sig = pr_signature(pr)
         _check_unapproved(daemon, t, pr, sig, before, flagged)
         _check_findings(daemon, t, pr, sig, findings, root)
@@ -131,6 +135,7 @@ def watch_prs(daemon) -> str:
     db.set_kv(prguard.PREDATES_KEY, sorted(before))
     db.set_kv(prguard.UNAPPROVED_KEY, flagged)
     db.set_kv(prguard.FINDINGS_KEY, findings)
+    db.set_kv(prguard.HEADS_KEY, heads)
     unapproved = f", {len(flagged)} out of draft unapproved" if flagged else ""
     return f"ok ({len(rows)} PRs, {changed} changed{unapproved})"
 

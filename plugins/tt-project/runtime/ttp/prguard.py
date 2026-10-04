@@ -14,7 +14,9 @@ An approval record is written only by the coordinator's `pr_approve` action. It 
 own words, quoted: a user message that names the PR, or the user's answer to a blocking `review` or
 `merge` ask that names it, and the words must be a clear yes (`clear_yes`). It lives in the project
 database, under APPROVALS_KEY, and is spent once a PR is marked ready with it: a PR put back in
-draft needs a fresh yes. `spec_problem` keeps the coordinator from handing out a task that tells a
+draft needs a fresh yes. It is bound to the PR's head commit as pr-watch last read it (HEADS_KEY):
+commits pushed after the user's yes are not covered, and the PR may not leave draft until they say
+yes again. `spec_problem` keeps the coordinator from handing out a task that tells a
 worker to take an unapproved PR out of draft.
 
 Only a message that came in on a channel a run cannot write to counts (APPROVING). Every message
@@ -39,7 +41,9 @@ import time
 from pathlib import Path
 
 APPROVALS_KEY = "pr_ready_approvals"   # kv: {"owner/repo#N": {"source": id, "answer": id, "said": text,
-#                                              "quote": text, "ts": t, "spent": t | None}}
+#                                              "quote": text, "head": sha, "ts": t, "spent": t | None}}
+HEADS_KEY = "pr_heads"                 # kv: {"owner/repo#N": {"sha": s, "seen": t}}, from pr-watch: each PR's
+#                                        head commit as last read, and when it was first seen
 USED_KEY = "pr_ready_used_answers"     # kv: {"owner/repo#N": [answer ids an approval was spent with]}
 BLOCKING_REF = "blocking:"             # an ask message's ref: why the user must answer it
 APPROVING_REASONS = ("review", "merge")
@@ -163,13 +167,22 @@ def approve(db, pr: str, source_id: int, quote: str, now: float | None = None, s
                          f"here yet and the PR stays in draft. Do not ask again: tell the user once (notify) "
                          f"that approving a PR needs a Slack DM, which is set up with `ttp secret slack` and "
                          f"notify.slack")
+    head = (db.kv(HEADS_KEY, {}) or {}).get(key) or {}
+    if not head.get("sha"):
+        raise ValueError(f"pr_approve: pr-watch has not read {key}'s head commit, so there is no telling which "
+                         f"commit the user said yes to. It reads the PRs tasks opened; once it has, ask the user "
+                         f"again with the PR's URL")
+    if (head.get("seen") or 0) > answer["ts"]:
+        raise ValueError(f"pr_approve: {key} has new commits since the user's yes (head {head['sha'][:12]}, first "
+                         f"seen after message #{answer['id']}); the yes does not cover them. Ask the user again "
+                         f"with the PR's URL")
     ask_ts = _check_ask(msg, key, project, slack) if answer is not msg else None
     if channel == "slack":
         _check_slack(answer, key if answer is msg else None, ask_ts, slack)
     with db.tx():
         rec = db.kv(APPROVALS_KEY, {}) or {}
         rec[key] = {"source": int(source_id), "answer": answer["id"], "said": answer["text"][:500],
-                    "quote": quote[:200], "ts": now or time.time(), "spent": None,
+                    "quote": quote[:200], "head": head["sha"], "ts": now or time.time(), "spent": None,
                     "channel": channel, "external_id": answer.get("ext_id")}
         db.set_kv(APPROVALS_KEY, rec)
     return key
@@ -379,7 +392,13 @@ def _gh(real: str, *args: str) -> str:
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
-def _refuse_ready(prs: set[str], db, what: str, allowed: set | None) -> str | None:
+def _sha(text: str) -> str | None:
+    m = re.search(r"\b[0-9a-f]{40}\b", text or "")
+    return m.group(0) if m else None
+
+
+def _refuse_ready(prs: set[str], db, what: str, allowed: set | None, heads: dict) -> str | None:
+    """`heads`: each PR's head commit now, as gh reports it."""
     if not prs:
         return (f"refused: {what}, and the PR could not be identified to check for the user's approval. "
                 f"{HOW} {HANDOFF}")
@@ -387,6 +406,16 @@ def _refuse_ready(prs: set[str], db, what: str, allowed: set | None) -> str | No
     if missing:
         return (f"refused: {what} for {', '.join(missing)} without the user's recorded approval (an approval "
                 f"is used up once the PR left draft with it). {HOW} {HANDOFF}")
+    recs = db.kv(APPROVALS_KEY, {}) or {}
+    for k in sorted(prs):
+        want, have = recs[k].get("head"), heads.get(k)
+        if not want or not have:
+            return (f"refused: {what} for {k}: could not check that its head commit is the one the user approved. "
+                    f"{HOW} {HANDOFF}")
+        if want != have:
+            return (f"refused: {what} for {k}: it has new commits since the user approved it (approved "
+                    f"{want[:12]}, head now {have[:12]}); the approval covers only what the user saw. {HOW} "
+                    f"{HANDOFF}")
     if allowed is not None:
         allowed |= prs
     return None
@@ -446,9 +475,12 @@ def check(args: list[str], real: str, db=None, stdin_text: str | None = None, _d
                 return None
             pos = _positionals(more, ("-R", "--repo"))
             repo = (_opts(more, ("-R", "--repo")) or [None])[-1]
-            view = ["pr", "view", *pos[:1], *(["-R", repo] if repo else []), "--json", "url", "-q", ".url"]
-            key = pr_key(_gh(real, *view))
-            return _refuse_ready({key} if key else set(), db, "marking a PR ready for review", allowed)
+            view = ["pr", "view", *pos[:1], *(["-R", repo] if repo else []), "--json", "url,headRefOid",
+                    "-q", '.url + " " + .headRefOid']
+            out = _gh(real, *view)
+            key = pr_key(out)
+            return _refuse_ready({key} if key else set(), db, "marking a PR ready for review", allowed,
+                                 {key: _sha(out)} if key else {})
     if cmd == "api":
         return _check_api(rest, real, db, stdin_text, allowed)
     return None
@@ -508,13 +540,16 @@ def _check_api(args: list[str], real: str, db, stdin_text: str | None, allowed: 
     draft_true = bool(re.search(r"(^|\s)draft=true\b|[\"']draft[\"']\s*:\s*true|\bdraft\s*:\s*true", text, re.I))
     if endpoint == "graphql":
         if re.search(r"markPullRequestReadyForReview", text):
-            prs = set()
+            prs, heads = set(), {}
             for node in set(NODE_ID_RE.findall(text)):
-                q = f'query{{node(id:"{node}"){{... on PullRequest{{url}}}}}}'
-                key = pr_key(_gh(real, "api", "graphql", "-f", f"query={q}", "-q", ".data.node.url"))
+                q = f'query{{node(id:"{node}"){{... on PullRequest{{url headRefOid}}}}}}'
+                out = _gh(real, "api", "graphql", "-f", f"query={q}",
+                          "-q", '.data.node.url + " " + .data.node.headRefOid')
+                key = pr_key(out)
                 if key:
                     prs.add(key)
-            return _refuse_ready(prs, db, "marking a PR ready for review", allowed)
+                    heads[key] = _sha(out)
+            return _refuse_ready(prs, db, "marking a PR ready for review", allowed, heads)
         if re.search(r"\bcreatePullRequest\b", text):
             if not draft_true:
                 return "refused: PRs are opened as drafts only; pass draft: true to createPullRequest. " + HOW
@@ -533,7 +568,10 @@ def _check_api(args: list[str], real: str, db, stdin_text: str | None, allowed: 
             return _checks_problem() if draft_true else "refused: PRs are opened as drafts only; send draft=true. " + HOW
         return None
     if method in ("PATCH", "POST", "PUT") and draft_false:
-        return _refuse_ready({f"{owner}/{repo}#{int(number)}".lower()}, db, "setting draft=false on a PR", allowed)
+        key = f"{owner}/{repo}#{int(number)}".lower()
+        host = [x for h in _opts(args, ("--hostname",))[-1:] for x in ("--hostname", h)]
+        head = _sha(_gh(real, "api", *host, f"repos/{owner}/{repo}/pulls/{number}", "-q", ".head.sha"))
+        return _refuse_ready({key}, db, "setting draft=false on a PR", allowed, {key: head})
     return None
 
 
