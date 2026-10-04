@@ -10549,11 +10549,17 @@ def test_actions_schema_validates_start_after_and_start_when():
     assert ok(start_when="test -f out/done") and not ok(start_when=1) and not ok(start_when=["true"])
 
 
-def _settle_deferred(d, tid):
-    d.probe_waiting()
-    if tid in d._probes:
-        d._probes[tid][0].wait(10)
+def _settle_deferred(d, tid, until=None):
+    """One probe round. Each round reaps a probe and may start the next, so a probe started before
+    the test changed the world can still say "not yet": with `until`, keep going up to ~10 s."""
+    deadline = time.time() + 10
+    while True:
         d.probe_waiting()
+        if tid in d._probes:
+            d._probes[tid][0].wait(10)
+            d.probe_waiting()
+        if until is None or until() or time.time() > deadline:
+            return
 
 
 def _events(p, tid, kind):
@@ -10576,7 +10582,7 @@ def test_a_start_when_task_starts_only_once_its_probe_passes(env, monkeypatch):
     assert not p.db.q("SELECT id FROM events WHERE task=?", (tid,)), "not yet is not news"
     assert not p.db.q("SELECT id FROM runs WHERE task=?", (tid,))
     flag.write_text("")
-    _settle_deferred(d, tid)
+    _settle_deferred(d, tid, until=lambda: _ready(p, tid))
     assert _ready(p, tid)
     assert not any(lb.split(":")[0] in ("start_when", "deferred_since") for lb in _labels(p, tid))
     assert f"task {tid} start_when passed" in (p.logs / "daemon.log").read_text()
