@@ -117,10 +117,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
 # sections, and settings that have no default. A key in neither is reported as unknown.
 META_KEYS = {"name", "id", "host", "root", "created", "tt_project_version", "pricing", "restrictions"}
 EXTRA_KEYS = {
-    "budget": {"max_waits", "hourly_floor_usd"},
+    "budget": {"max_waits", "hourly_floor_usd", "estimate_weights", "hourly_waste_usd", "hourly_coordinator_usd",
+               "max_pace_hold_s"},   # max_pace_hold_s: deprecated and ignored; accepted so old configs stay quiet
     "coordinator": {"max_review_tasks_per_day"},
     "notify": {"slack_poll_s"},
     "delivery": {"base_ref", "push_branch", "push_checks", "push_rounds", "push_wait_s"},
+    "jev": {"via", "url", "model"},
 }
 OPEN_SECTIONS = {"resources"}           # any name below is fine
 PROVIDER_KEYS = {"tiers", "plugin_dirs", "worker_isolation", "mcp_servers"}

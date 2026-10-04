@@ -523,7 +523,10 @@ class Handler(BaseHTTPRequestHandler):
                 key = body.get("key")
                 if key not in USER_SETTABLE:
                     return self._send(400, {"error": f"{key} not settable here"})
-                p.set_config(key, USER_SETTABLE[key](body.get("value")))
+                try:
+                    p.set_config(key, USER_SETTABLE[key](body.get("value")))
+                except ValueError as e:
+                    return self._send(400, {"error": str(e)})
                 return self._send(200, {"ok": True})
             return self._send(404, {"error": "unknown endpoint"})
         finally:

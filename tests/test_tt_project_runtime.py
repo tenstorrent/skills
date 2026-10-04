@@ -11005,13 +11005,69 @@ def test_config_problems_flag_unknown_keys_and_bad_checks(env, capsys):
     from ttp.project import config_problems, unknown_key_hint
     assert unknown_key_hint("budget.daily_usd") is None and unknown_key_hint("resources.device") is None
     assert unknown_key_hint("providers.claude.tiers") is None and unknown_key_hint("delivery.push_branch") is None
-    p.set_config("budget.max_pace_hold_s", 0)
+    p.set_config("budget.made_up_knob", 0)
+    p.set_config("budget.max_pace_hold_s", 0)      # deprecated and ignored, but no alert
+    p.set_config("budget.estimate_weights", {"output": 5})
+    p.set_config("jev.url", "http://127.0.0.1:1")
     p.set_config("delivery.push_checks", ["Make sure the tests pass"])
+    for key in ("budget.max_pace_hold_s", "jev.url", "budget.estimate_weights"):
+        assert unknown_key_hint(key) is None, key
     probs = config_problems(p.raw_config())
-    assert "unknown key budget.max_pace_hold_s" in probs[0] and "'Make' is not a program" in probs[1]
+    assert "unknown key budget.made_up_knob" in probs[0] and "'Make' is not a program" in probs[1]
     assert len(probs) == 2   # name, id, root and other identity keys are known
     from ttp import cli
     with pytest.raises(SystemExit):
         cli.main(["config", p.name, "budget.daly_usd", "5"])
     cli.main(["doctor", p.name])
-    assert "project.json: unknown key budget.max_pace_hold_s" in capsys.readouterr().out
+    assert "project.json: unknown key budget.made_up_knob" in capsys.readouterr().out
+
+
+def test_every_key_the_code_reads_is_known():
+    from ttp.coordinator import USER_SETTABLE
+    from ttp.project import unknown_key_hint
+    extra = ["budget.estimate_weights", "budget.hourly_waste_usd", "budget.hourly_coordinator_usd",
+             "budget.max_pace_hold_s", "jev.via", "jev.url", "jev.model"]
+    for key in [*USER_SETTABLE, *extra]:
+        assert unknown_key_hint(key) is None, key
+
+
+def test_a_monthly_alert_is_not_forgotten_after_a_week(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dm
+    d = dm.Daemon(p.base)
+    now = time.time()
+    monkeypatch.setattr(dm.time, "time", lambda: now)
+    d.alert("config_problems:abc", "project.json: unknown key x", severity="low", every_s=30 * 86400)
+    monkeypatch.setattr(dm.time, "time", lambda: now + 8 * 86400)
+    d.alert("disk", "Only 1.0 GB free")           # prunes alerts_sent
+    d.alert("config_problems:abc", "project.json: unknown key x", severity="low", every_s=30 * 86400)
+    assert len(p.db.q("SELECT id FROM messages WHERE ref='config_problems:abc'")) == 1
+
+
+def test_web_api_config_rejects_a_bad_value_with_400(env):
+    p = make(env)
+    from ttp import web
+    port = web.free_port(19950)
+    p.set_config("web.port", port)
+
+    class Stub:
+        pass
+    stub = Stub()
+    stub.p = p
+    threading.Thread(target=web.serve, args=(stub,), daemon=True).start()
+
+    def post(body):
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/api/config", method="POST", data=json.dumps(body).encode(),
+                                     headers={"X-TTP-Token": web.token(p), "Content-Type": "application/json"})
+        for _ in range(50):
+            try:
+                return urllib.request.urlopen(req, timeout=5).status, None
+            except urllib.error.HTTPError as e:
+                return e.code, json.loads(e.read())
+            except OSError:
+                time.sleep(0.1)
+        raise AssertionError("the web app did not start")
+    code, err = post({"key": "budget.max_parallel_workers", "value": "lots"})
+    assert code == 400 and "lots" in err["error"], err
+    assert post({"key": "budget.max_parallel_workers", "value": 3}) == (200, None)
+    assert p.config()["budget"]["max_parallel_workers"] == 3

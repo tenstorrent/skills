@@ -71,6 +71,7 @@ DISK_FLOOR_GB = 2        # below this even questions and plans wait
 DISK_DU_TIMEOUT_S = 30   # the guard alert's du breakdown stops after this, keeping what it measured
 DISK_DU_TOP = 6          # the biggest top-level directories it names
 KEEP_RECHECK_S = 6 * 3600   # a finished task's kept worktree is looked at again this often
+ALERT_KEEP_S = 30 * 86400   # alerts_sent keeps an entry this long: the longest every_s any alert uses
 SLEPT_MIN_S = 60        # a run whose wall clock ran this much ahead of its monotonic clock overlapped a host sleep
 SLEEPS_KEPT_S = 7 * 86400
 LOCAL_ONLY_EVERY_S = 3600   # how often done code tasks' branches are checked against the remotes
@@ -279,7 +280,7 @@ class Daemon:
             probs = config_problems(self.p.raw_config())
             if probs:
                 key = "config_problems:" + hashlib.sha1("\n".join(probs).encode()).hexdigest()[:10]
-                self.alert(key, "project.json: " + "; ".join(probs), severity="low", every_s=30 * 86400)
+                self.alert(key, "project.json: " + "; ".join(probs), severity="low", every_s=ALERT_KEEP_S)
         except Exception:
             log(self.p, "config check: " + traceback.format_exc().replace("\n", " | ")[:1000])
 
@@ -2281,7 +2282,9 @@ class Daemon:
             if now - float(sent.get(key, 0)) < every_s:
                 return
             sent[key] = now
-            db.set_kv("alerts_sent", {k: v for k, v in sent.items() if now - float(v) < 7 * 86400})
+            # Kept as long as the longest interval any alert uses, so a monthly one is not forgotten
+            # (and re-sent) after a week.
+            db.set_kv("alerts_sent", {k: v for k, v in sent.items() if now - float(v) < ALERT_KEEP_S})
             db.post("out", text, chat=None, kind="alert", severity=severity, ref=key)
 
     def sweep_alerts(self) -> None:
