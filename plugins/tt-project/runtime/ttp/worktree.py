@@ -335,6 +335,10 @@ FINISH_GRACE_S = 3600
 
 def held_by(p: Project, task: dict, open_tasks: list[dict], now: float) -> str | None:
     """Why a finished task's worktree must stay untouched for now, or None."""
+    from .push import running
+    path = (p.worktrees / f"t{task['id']}").resolve()
+    if any(Path(m.get("repo") or "/").resolve() == path for m in running(p)):
+        return "a detached `ttp push` runs in it"
     user = needed_by(task, open_tasks)
     if user:
         return f"task #{user['id']} ({user['status']}) may still use it"

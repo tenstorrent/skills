@@ -4585,6 +4585,22 @@ def test_a_glob_hand_off_entry_keeps_the_worktree(env, monkeypatch):
     assert not b.exists() and res[tb]["why"] is None
 
 
+def test_a_finished_worktree_stays_while_a_detached_push_runs_in_it(env, monkeypatch):
+    p = make(env)
+    _no_grace(monkeypatch)
+    from ttp import locks, push, worktree
+    tid, path, _ = _code_task(p, "change")
+    _commit_file(path, "change")
+    marker = p.state / push.DETACHED / "t1-x.json"
+    marker.parent.mkdir(parents=True)
+    marker.write_text(json.dumps({"status": "running", "repo": str(path), "pid": 1}))
+    held = locks.try_take([push._run_lock(marker)], "detached push t1-x")
+    (res,) = worktree.sweep(p)
+    assert path.exists() and res["held"] and "detached `ttp push`" in res["why"]
+    held.close()     # the push ended (or died): the worktree goes as usual
+    (res,) = worktree.sweep(p)
+    assert not path.exists() and res["why"] is None
+
 def test_a_finished_worktree_stays_while_an_unfinished_task_still_needs_it(env, monkeypatch):
     p = make(env)
     _no_grace(monkeypatch)
@@ -7632,19 +7648,21 @@ def test_push_checks_accept_the_forms_config_set_sends():
 def test_the_review_prompt_pushes_only_through_the_guarded_push():
     text = (RUNTIME.parent / "template" / "prompts" / "kind-review.md").read_text()
     assert "`ttp push`" in text and "NEVER use `git push` directly" in text
-    assert "longest tool timeout" in text and "NEVER run it detached or in the background" in text
+    # The checks outlast a tool call: the review pushes detached and waits on the printed probe.
+    assert "run `ttp push --detach`" in text and "`waiting` with that `retry_when`" in text
+    assert "NEVER put plain\n  `ttp push` in the background yourself" in text
     assert "75: another push to the branch held its turn too long; hand off `waiting` with the `retry_when`" in text
     # Every exit code is handled in the exit-code bullet, before the version-bump bullet.
-    codes, bump = text.index("- Exit 0: pushed."), text.index("- Version bump:")
+    codes, bump = text.index("  Exit 0: pushed."), text.index("- Version bump:")
     for code in ("5: the branch kept moving", "2 or 6: refused", "75: another push"):
         assert codes < text.index(code) < bump, code
 
 
-def test_the_worker_time_rule_leaves_room_for_a_foreground_push():
-    """worker.md's 5-minute rule must not contradict kind-review.md's foreground `ttp push`."""
+def test_the_worker_time_rule_sends_pushes_detached():
+    """worker.md's 5-minute rule must agree with the review and code prompts' detached `ttp push`."""
     text = (RUNTIME.parent / "template" / "prompts" / "worker.md").read_text()
     assert "Never block one tool call longer than about 5 minutes" in text
-    assert "where your task's rules\n  say to run a command in the foreground, such as `ttp push`" in text
+    assert "Push with `ttp push --detach`" in text and "such as `ttp push`" not in text
 
 
 def _ttp(*args):
@@ -7741,6 +7759,113 @@ def test_a_killed_push_frees_the_branch(env, monkeypatch):
         except OSError:
             pass
 
+
+
+def _detach(capsys):
+    """`ttp push --detach`: (exit code, marker path, probe command) from what it printed."""
+    rc = _ttp("push", "--detach")
+    out = capsys.readouterr().out
+    lines = dict(ln.split(": ", 1) for ln in out.splitlines() if ln.startswith(("marker: ", "retry_when: ")))
+    return rc, pathlib.Path(lines["marker"]) if "marker" in lines else None, lines.get("retry_when")
+
+
+def _probe(p, probe):
+    """Run the probe where the harness runs a retry_when: in the project root, without the run's env."""
+    penv = {k: v for k, v in os.environ.items() if not k.startswith("TTP_") or k == "TTP_HOME"}
+    return subprocess.run(probe, shell=True, cwd=str(p.root), env=penv, capture_output=True, text=True)
+
+
+def _probe_until_done(p, probe, timeout=60):
+    deadline = time.time() + timeout
+    while True:
+        r = _probe(p, probe)
+        if r.returncode != 1 or time.time() > deadline:
+            return r
+        time.sleep(0.1)
+
+
+def test_a_detached_push_returns_at_once_and_its_marker_reports_the_pushed_sha_and_version(env, monkeypatch, capsys):
+    started = env["tmp"] / "started"
+    gate = env["tmp"] / "gate"
+    p, repo, origin, other = _bump_setup(env, monkeypatch, [f"touch {started}; while [ ! -e {gate} ]; do sleep 0.05; done"])
+    _commit(repo, "plugins/p/rt/x.py", "x = 1\n")
+    t0 = time.time()
+    rc, marker, probe = _detach(capsys)
+    assert rc == 0 and time.time() - t0 < 10, "--detach must return at once"
+    assert marker.parent == p.state / "pushes" and probe.endswith(f"ttp push --result {marker}")
+    m = json.loads(marker.read_text())
+    assert m["status"] == "running" and m["pid"] > 0 and m["target"] == "origin/proj" and m["log"]
+    deadline = time.time() + 30
+    while not started.exists() and time.time() < deadline:
+        time.sleep(0.05)
+    r = _probe(p, probe)
+    assert r.returncode == 1 and "still running" in r.stdout, r
+    assert _ttp("push", "--free") == 1, "the detached push holds the branch's turn"
+    from ttp import release
+    assert release.push_in_flight(p), "an upgrade must not swap the runtime under a detached push"
+    gate.touch()
+    r = _probe_until_done(p, probe)
+    pushed = _git_out(origin, "rev-parse", "proj")
+    assert r.returncode == 0 and f"pushed {pushed}" in r.stdout and "version 0.1.1" in r.stdout, r
+    m = json.loads(marker.read_text())
+    assert (m["status"], m["exit"], m["sha"], m["version"]) == ("pushed", 0, pushed, "0.1.1")
+    assert m["ended"] >= m["started"] and "bumped" in pathlib.Path(m["log"]).read_text()
+    assert _ttp("push", "--free") == 0 and not release.push_in_flight(p)
+
+
+def test_a_detached_push_whose_check_fails_reports_the_exit_and_log_tail(env, monkeypatch, capsys):
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["echo the-check-said-no; false"])
+    before = _git_out(origin, "rev-parse", "proj")
+    _commit(repo, "mine.txt", "mine\n")
+    rc, marker, probe = _detach(capsys)
+    assert rc == 0
+    r = _probe_until_done(p, probe)
+    assert r.returncode == 0 and "not pushed (exit 4)" in r.stdout and "the-check-said-no" in r.stdout, r
+    m = json.loads(marker.read_text())
+    assert (m["status"], m["exit"], m["sha"]) == ("failed", 4, None)
+    assert _git_out(origin, "rev-parse", "proj") == before
+    assert _probe(p, probe).returncode == 0, "a finished push keeps answering 0"
+
+
+def test_a_detached_push_refuses_a_dirty_tree_at_once_without_a_marker(env, monkeypatch, capsys):
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    (repo / "README.md").write_text("dirty\n")
+    rc, marker, probe = _detach(capsys)
+    assert rc == 2 and marker is None and not (p.state / "pushes").exists()
+
+
+def test_a_dead_detached_push_reads_as_failed_and_frees_the_branch(env, monkeypatch, capsys):
+    started = env["tmp"] / "started"
+    p, repo, origin, other = _push_setup(env, monkeypatch, [f"touch {started}; sleep 60"])
+    _commit(repo, "mine.txt", "mine\n")
+    rc, marker, probe = _detach(capsys)
+    pid = json.loads(marker.read_text())["pid"]
+    try:
+        deadline = time.time() + 30
+        while not started.exists() and time.time() < deadline:
+            time.sleep(0.05)
+        assert started.exists() and _probe(p, probe).returncode == 1
+        assert _ttp("push", "--free") == 1
+        os.kill(pid, signal.SIGKILL)     # a crash or a reboot: no outcome is written
+        deadline = time.time() + 10
+        while _ttp("push", "--free") != 0 and time.time() < deadline:
+            time.sleep(0.05)
+        assert _ttp("push", "--free") == 0, "a dead push must free the branch"
+        r = _probe(p, probe)
+        assert r.returncode == 0 and "not pushed" in r.stdout and "without writing an outcome" in r.stdout, r
+        m = json.loads(marker.read_text())
+        assert m["status"] == "failed" and m["exit"] is None and m["reason"]
+        assert _probe(p, probe).returncode == 0
+    finally:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def test_the_push_probe_of_a_missing_marker_wakes_the_task_as_broken(env, monkeypatch):
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    assert _ttp("push", "--result", str(p.state / "pushes" / "nope.json")) == 2
 
 def _bump_setup(env, monkeypatch, checks):
     """_push_setup with a plugin `p` at 0.1.0 on the target, versioned in a manifest and a module,
@@ -12116,7 +12241,7 @@ def test_the_code_prompt_lands_only_through_the_guarded_push_and_only_when_asked
     assert ('"code tasks may land on <branch> with ttp push=True"\n  AND your spec asks you to land on that branch. '
             "Otherwise never push to a shared branch.") in code
     assert "NEVER use\n  `git push` to a shared branch" in code
-    assert "longest tool timeout" in code and "NEVER run it detached or in the background" in code
+    assert "run `ttp push --detach`" in code and "NEVER run it detached" not in code
     # The same exit-code table as the review prompt.
     for line in ("4: a check failed; hand off `failed` with the output.", "5: the branch kept moving; hand off `waiting`.",
                  "75: another push to the branch held its turn too long; hand off `waiting` with the `retry_when`"):

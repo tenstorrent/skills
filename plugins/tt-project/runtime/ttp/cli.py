@@ -851,14 +851,21 @@ def cmd_push(a) -> None:
     main, master or the remote's default branch. Pushes to one branch take turns; one that waits
     longer than `delivery.push_wait_s` (unset: twice the last check run, 900 s to 2 h) for its
     turn exits 75. With `delivery.version_bump` it bumps the version after each rebase. `--free` only tells whether it is
-    free (0) or taken (1). Exit codes are in `push.py`."""
+    free (0) or taken (1). `--detach` runs the push in a process of its own and prints its marker and
+    a `--result <marker>` probe (0 once finished or dead, 1 while running). Exit codes are in `push.py`."""
     from . import push
+    if a.result:
+        sys.exit(push.result(Path(a.result)))
     base = os.environ.get("TTP_PROJECT")
     p = Project(base) if base else next((c for d in [Path.cwd(), *Path.cwd().parents]
                                          if (c := Project(d)).exists()), None)
     if not p or not p.exists():
         die("ttp push: no tt-project project here (run it inside a run or a project's worktree)")
-    sys.exit(push.free(p, Path.cwd()) if a.free else push.run(p, Path.cwd()))
+    if a.free:
+        sys.exit(push.free(p, Path.cwd()))
+    if a.marker:
+        sys.exit(push.run_detached(p, Path.cwd(), Path(a.marker)))
+    sys.exit(push.detach(p, Path.cwd()) if a.detach else push.run(p, Path.cwd()))
 
 
 def cmd_lock(a) -> None:
@@ -1587,6 +1594,11 @@ def main(argv: list[str] | None = None) -> None:
     s = sub.add_parser("push", help="guarded push of this worktree to delivery.push_branch")
     s.add_argument("--free", action="store_true",
                    help="push nothing: exit 0 when no other push to the target branch is running, 1 while one is")
+    s.add_argument("--detach", action="store_true",
+                   help="push in a process of its own; print its marker and a --result probe, and return at once")
+    s.add_argument("--result", metavar="MARKER",
+                   help="push nothing: report a detached push; exit 0 once it finished (or died), 1 while it runs")
+    s.add_argument("--marker", help=argparse.SUPPRESS)   # the detached process itself
     s.set_defaults(fn=cmd_push)
 
     s = sub.add_parser("lock", help="(inside a run) hold a shared resource while one command runs")

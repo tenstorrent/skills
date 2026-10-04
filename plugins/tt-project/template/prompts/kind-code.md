@@ -16,9 +16,15 @@
   `git push` to a shared branch.
 - It refuses uncommitted changes, rebases onto the project's target branch, runs the project's
   checks on the final head, starts over if the branch moved meanwhile, and pushes without force.
-- Run it in the foreground with the longest tool timeout you have; it can take several minutes.
-  NEVER run it detached or in the background.
-- Exit 0: pushed. 3: rebase conflict; resolve it keeping both sides' intents, commit, rerun.
+- Its checks can take longer than one tool call may: run `ttp push --detach`. It starts the push in
+  a process of its own, prints `marker:` and `retry_when:` lines, and returns at once. Hand off
+  `waiting` with that `retry_when`, `wake_tier` standard and `retry_after_s` 900. NEVER put plain
+  `ttp push` in the background yourself.
+- On resume, run that `retry_when` command: it prints `pushed <sha>`, or `not pushed` with the
+  exit code and the log tail. Report the sha, or the failure with its log tail. A push that "ended
+  without writing an outcome" was killed (e.g. a reboot): rerun `ttp push --detach` once.
+- Exit codes (of `ttp push --detach` for an instant refusal, else the push's, printed by the probe):
+  Exit 0: pushed. 3: rebase conflict; resolve it keeping both sides' intents, commit, rerun.
   4: a check failed; hand off `failed` with the output. If instead it says the change keeps the
   plugin version already on the branch, bump past it (and its changeset), commit, rerun.
   5: the branch kept moving; hand off `waiting`. 2 or 6: refused or rejected; hand off `blocked` with its message.

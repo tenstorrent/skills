@@ -613,3 +613,168 @@ def free(p: Project, repo: Path) -> int:
     print(f"ttp push: a push holds its turn: {', '.join(locks.holders(held)) or 'another push'}",
           file=sys.stderr)
     return 1
+
+
+# Detached push ------------------------------------------------------------------------------------
+# `ttp push --detach` runs the same push in a process of its own and returns at once, so a worker
+# whose tool calls are capped shorter than the checks can hand off `waiting` and read the outcome
+# later. The process writes its outcome into a marker under the project's state. It holds a run lock
+# (an OS file lock, inherited from the launcher so it is held from the first instant) for its whole
+# life: a marker whose run lock is free and that holds no outcome belongs to a push that died (a
+# crash, a kill, a reboot), and the probe then records it as failed. Its push lock goes the same way.
+DETACHED = "pushes"        # under the project's state: <id>.json (marker) and <id>.log per push
+LOG_TAIL = 20
+
+
+def _run_lock(marker: Path) -> Path:
+    """The run lock of a detached push. Its name starts with `push:`, so an upgrade waits for it
+    (release.push_in_flight) and `ttp push --free` counts it, also while it waits for its turn."""
+    return marker.parent.parent / "locks" / f"push:run-{marker.stem}.0.lock"
+
+
+def _own_ttp(p: Project | None = None) -> str:
+    """The `ttp` of this runtime, so the probe runs the code that wrote the marker."""
+    ttp = Path(__file__).resolve().parents[2] / "bin" / "ttp"
+    if ttp.is_file():
+        return shlex.quote(str(ttp))
+    return free_probe(p).rsplit(" push", 1)[0] if p else "ttp"
+
+
+def result_probe(marker: Path, p: Project | None = None) -> str:
+    """A `retry_when` that exits 0 once the detached push of `marker` finished (or died), 1 before."""
+    return f"{_own_ttp(p)} push --result {shlex.quote(str(marker))}"
+
+
+def _read(marker: Path) -> dict:
+    try:
+        m = json.loads(marker.read_text())
+    except (OSError, ValueError):
+        return {}
+    return m if isinstance(m, dict) else {}
+
+
+def _tail(path: str | None, n: int = LOG_TAIL) -> str:
+    try:
+        return "\n".join(Path(path).read_text(errors="replace").splitlines()[-n:]) if path else ""
+    except OSError:
+        return ""
+
+
+def detach(p: Project, repo: Path) -> int:
+    """Start `ttp push` for `repo` in a process of its own and print its marker and probe. The quick
+    refusals (pushing not allowed, no target, uncommitted changes) answer at once, without a marker."""
+    d = p.config().get("delivery") or {}
+    allowed = True if d.get("push_allowed") is None else d.get("push_allowed")
+    if not (allowed is True or str(allowed).strip().lower() in ("1", "true", "yes", "on")):
+        print("ttp push: this project does not allow pushing (delivery.push_allowed)", file=sys.stderr)
+        return REFUSED
+    top = Path(_git(repo, "rev-parse", "--show-toplevel").stdout.strip() or repo)
+    try:
+        remote, branch = target(p, top)
+    except ValueError as e:
+        print(f"ttp push: {e}", file=sys.stderr)
+        return REFUSED
+    if _git(top, "status", "--porcelain", "--untracked-files=no").stdout.strip():
+        print("ttp push: uncommitted changes; commit first", file=sys.stderr)
+        return REFUSED
+    task = os.environ.get("TTP_TASK")
+    rid = (f"t{task}-" if task else "") + time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"
+    marker = p.state / DETACHED / f"{rid}.json"
+    log = marker.with_suffix(".log")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    lock = locks.try_take([_run_lock(marker)], f"detached push {rid}", "ttp push --detach")
+    if lock is None:
+        print(f"ttp push: the run lock of {rid} is taken", file=sys.stderr)
+        return REFUSED
+    env = {k: v for k, v in os.environ.items() if k != "TTP_RUN_DIR"}   # the run ends before the push
+    env.update(PYTHONPATH=str(Path(__file__).resolve().parents[1]), TTP_PROJECT=str(p.base))
+    try:
+        with open(log, "ab") as out:
+            child = subprocess.Popen([sys.executable, "-m", "ttp", "push", "--marker", str(marker)],
+                                     cwd=str(top), env=env, stdin=subprocess.PIPE, stdout=out,
+                                     stderr=subprocess.STDOUT, start_new_session=True,
+                                     pass_fds=(lock.fileno(),))
+        write_json(marker, {"id": rid, "status": "running", "pid": child.pid, "started": time.time(),
+                            "repo": str(top), "head": _git(top, "rev-parse", "HEAD").stdout.strip(),
+                            "target": f"{remote}/{branch}", "log": str(log), "lock": str(_run_lock(marker)),
+                            "task": task, "run": os.environ.get("TTP_RUN_ID")})
+        child.stdin.close()      # the go: the push starts once its marker is written
+    finally:
+        lock.close()             # the child holds the run lock from here on
+    print(f"ttp push: started in the background (pid {child.pid}), pushing {top} to {remote}/{branch}")
+    print(f"marker: {marker}")
+    print(f"log: {log}")
+    print(f"retry_when: {result_probe(marker, p)}")
+    return 0
+
+
+def run_detached(p: Project, repo: Path, marker: Path) -> int:
+    """The detached process: wait for the launcher's go, push, and write the outcome into `marker`."""
+    try:
+        sys.stdin.read()
+    except (OSError, ValueError):
+        pass
+    print(f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} detached push, marker {marker}", flush=True)
+    try:
+        rc = run(p, repo)
+    except Exception as e:     # recorded as a failure, never left as "running"
+        print(f"ttp push: {type(e).__name__}: {e}", file=sys.stderr)
+        rc = 1
+    top = Path(_git(repo, "rev-parse", "--show-toplevel").stdout.strip() or repo)
+    sha = version = None
+    if rc == 0:
+        sha = _git(top, "rev-parse", "HEAD").stdout.strip() or None
+        try:
+            cfg = bump_of((p.config().get("delivery") or {}).get("version_bump"))
+        except ValueError:
+            cfg = None
+        if cfg:
+            show = _git(top, "show", f"HEAD:{cfg['files'][0]}")
+            m = VERSION_RE.search(show.stdout) if show.returncode == 0 else None
+            version = ".".join(m.group(2, 3, 4)) if m else None
+    sys.stdout.flush()
+    sys.stderr.flush()
+    m = _read(marker) or {"id": marker.stem, "pid": os.getpid(), "log": str(marker.with_suffix(".log"))}
+    m.update(status="pushed" if rc == 0 else "failed", exit=rc, sha=sha, version=version, ended=time.time())
+    write_json(marker, m)
+    return rc
+
+
+def result(marker: Path) -> int:
+    """`ttp push --result <marker>`, the probe: 0 once the push finished (pushed, failed or died),
+    1 while it runs, 2 when there is no such marker. A push whose run lock is free but that wrote no
+    outcome died; it is recorded as failed here, so nobody waits for it."""
+    marker = Path(marker)
+    if not _read(marker):
+        print(f"ttp push: no detached push marker at {marker}", file=sys.stderr)
+        return REFUSED
+    alive = not locks.any_free([_run_lock(marker)])
+    m = _read(marker)          # read after the lock: the push writes its outcome before letting go
+    if m.get("status") == "running":
+        if alive:
+            took = time.time() - float(m.get("started") or time.time())
+            print(f"ttp push: still running (pid {m.get('pid')}, {took:.0f} s); log: {m.get('log')}")
+            return 1
+        m.update(status="failed", exit=None, ended=time.time(),
+                 reason="the push process ended without writing an outcome (killed, crashed or rebooted)")
+        write_json(marker, m)
+    if m.get("status") == "pushed":
+        v = f", version {m['version']}" if m.get("version") else ""
+        print(f"ttp push: pushed {m.get('sha')} to {m.get('target')}{v}")
+    else:
+        why = m.get("reason") or f"exit {m.get('exit')}"
+        print(f"ttp push: not pushed ({why}); log: {m.get('log')}")
+        tail = _tail(m.get("log"))
+        if tail:
+            print(tail)
+    return 0
+
+
+def running(p: Project) -> list[dict]:
+    """Markers of this project's detached pushes that are still running."""
+    out = []
+    for marker in sorted((p.state / DETACHED).glob("*.json")):
+        m = _read(marker)
+        if m.get("status") == "running" and not locks.any_free([_run_lock(marker)]):
+            out.append({**m, "marker": str(marker)})
+    return out
