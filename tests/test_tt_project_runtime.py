@@ -13500,12 +13500,14 @@ def test_pr_approve_counts_only_a_clear_yes_in_the_users_own_words(env):
     ask = p.db.one("SELECT id FROM messages WHERE kind='ask'")["id"]
     p.db.post("out", "yes", chat="web", kind="reply")   # the harness's own words are not the user's
     assert "not answered" in approve(ask, "yes")
-    for said in ("no, not yet", "acme/widgets#7 is broken", "yes once CI is green", "ok?"):
+    for said in ("no, not yet", "acme/widgets#7 is broken", "yes once CI is green", "ok?",
+                 "please look at acme/widgets#7 again", "rename x to y in acme/widgets#7"):
         p.db.post("in", said, chat="web", provenance="web-session")
         assert "not a clear yes" in approve(ask, said), said
     assert "never wrote" in approve(ask, "yes, go ahead")
     assert "needs `quote`" in approve(ask, "")
     assert not prguard.approved(p.db, "acme/widgets#7")
+    assert prguard.clear_yes("y") and prguard.clear_yes("Please mark it ready")
     yes = p.db.post("in", "Yes, go ahead", chat="web", provenance="web-session")
     assert approve(ask, "yes, go ahead") == ""
     rec = p.db.kv(prguard.APPROVALS_KEY)["acme/widgets#7"]

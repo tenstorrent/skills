@@ -78,8 +78,9 @@ CHECKS_HOW = ("Run `ttp checks` in this worktree (it runs the project's checks, 
               "`--`, and records the result for this commit), fix what fails, commit, then open the draft PR.")
 
 # A clear yes: words of assent, and nothing that negates, defers or makes it conditional.
-YES_RE = re.compile(r"\b(yes|yep|yeah|yup|y|ok|okay|sure|approved?|go ahead|go for it|lgtm|ship it|do it|"
-                    r"please|mark\b.*\bready|ready for review|out of draft|can (?:stay|go|be) ready)\b", re.I)
+# ("please" alone asks for something else; a lone "y" counts only as the whole answer.)
+YES_RE = re.compile(r"\b(yes|yep|yeah|yup|ok|okay|sure|approved?|go ahead|go for it|lgtm|ship it|do it|"
+                    r"mark\b.*\bready|ready for review|out of draft|can (?:stay|go|be) ready)\b|^\W*y\W*$", re.I)
 NOT_YES_RE = re.compile(r"\b(no|not|nope|nah|never|don'?t|do not|wait|hold|later|stop|broken|breaks?|"
                         r"fail\w*|cancel\w*|until|unless|after|before|once|if|but|first|instead)\b|n't\b|\?",
                         re.I)
