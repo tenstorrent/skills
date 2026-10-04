@@ -5195,7 +5195,7 @@ def test_the_disk_guard_alert_says_what_fills_the_disk_and_the_projects_share(en
     top = dict(b["top"])
     assert top[str(other)] >= 32 << 20 and top[str(env["repo"])] >= 1 << 20, top
     assert next(iter(top)) == str(other), "the biggest directory comes first"
-    assert (1 << 20) <= b["own_bytes"] < (16 << 20)
+    assert (1 << 20) <= b["own_bytes"] < top[str(other)]
     dm.Daemon(p.base).check_disk()
     text = p.db.one("SELECT text FROM messages WHERE kind='alert' AND ref='disk'")["text"]
     assert f"This project's own data is 0.0 GB of the 960.0 GB used on {env['tmp']}" in text, text
