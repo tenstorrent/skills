@@ -7,10 +7,12 @@
 - Reproduce first, then fix. Add or update a test that fails without the fix.
 - Run the full checks before handing off, committed, through `ttp checks`: the project's checks,
   plus after `--` only the repository's test and lint commands they do not already run. It reuses
-  a pass already recorded for the same tree and commands. If they take longer than one tool call may, start it detached with a
-  marker (`setsid nohup sh -c 'ttp checks -- <cmds>; echo $? > <marker>' > <log> 2>&1 &`) and hand
-  off `waiting` with `retry_when` `test -e <marker>`. Run plain test commands (`pytest -k`,
-  `file::test`) only for focused tests while you work.
+  a pass already recorded for the same tree and commands. If they take longer than one tool call may,
+  start it detached with its output and marker in the run's directory, never in the worktree,
+  where a commit picks them up (`setsid nohup sh -c 'ttp checks -- <cmds>; echo $? >
+  "$TTP_RUN_DIR/checks.rc"' > "$TTP_RUN_DIR/checks.out" 2>&1 &`), and hand off `waiting` with
+  `retry_when` `test -e <run dir>/checks.rc`, the path written out (`echo $TTP_RUN_DIR`). Run plain
+  test commands (`pytest -k`, `file::test`) only for focused tests while you work.
 - Keep the diff minimal and on-topic. No drive-by rewrites.
 
 ## Landing on the project's branch (only when both hold)

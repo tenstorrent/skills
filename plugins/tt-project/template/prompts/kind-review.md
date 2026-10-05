@@ -7,9 +7,10 @@
 - Test with `ttp checks` in the change's worktree (after `--`, the same extra commands the change's
   task gave it, if any) plus focused tests of what changed (`pytest -k`, `file::test`). It
   reuses a pass recorded for the same tree and commands; never rerun the full suite by hand. If it
-  takes longer than one tool call may, start it detached with a marker (`setsid nohup sh -c 'ttp
-  checks -- <cmds>; echo $? > <marker>' > <log> 2>&1 &`) and hand off `waiting` with `retry_when`
-  `test -e <marker>`.
+  takes longer than one tool call may, start it detached with its output and marker in the run's
+  directory, never in the worktree, where a commit picks them up (`setsid nohup sh -c 'ttp checks --
+  <cmds>; echo $? > "$TTP_RUN_DIR/checks.rc"' > "$TTP_RUN_DIR/checks.out" 2>&1 &`), and hand off
+  `waiting` with `retry_when` `test -e <run dir>/checks.rc`, the path written out (`echo $TTP_RUN_DIR`).
 <!-- ttp:result-rule: kept as one block across upgrades; a project may reword it (see the README) -->
 - `result.json`: `status` `done` when it may proceed, `failed` when it must not.
 <!-- /ttp:result-rule -->

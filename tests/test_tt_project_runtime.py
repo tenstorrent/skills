@@ -16576,8 +16576,20 @@ def test_the_push_never_reads_the_recorded_passes_of_ttp_checks():
     prompts = RUNTIME.parent / "template" / "prompts"
     for name in ("kind-code.md", "kind-review.md"):
         text = " ".join((prompts / name).read_text().split())
-        assert "`ttp checks`" in text and "test -e <marker>" in text and "`pytest -k`" in text, name
+        assert "`ttp checks`" in text and "test -e <run dir>/checks.rc" in text and "`pytest -k`" in text, name
 
+
+
+def test_detached_ttp_checks_keep_their_output_and_marker_out_of_the_worktree():
+    """A detached `ttp checks` writes its output and exit-code marker in the run's directory: a log
+    or marker in the worktree (tmp/checks.log) got committed once, and the retry_when probe runs in
+    the project root, where a relative marker path never appears."""
+    prompts = RUNTIME.parent / "template" / "prompts"
+    for name in ("kind-code.md", "kind-review.md"):
+        text = " ".join((prompts / name).read_text().split())
+        assert """echo $? > "$TTP_RUN_DIR/checks.rc"' > "$TTP_RUN_DIR/checks.out" 2>&1 &""" in text, name
+        assert "never in the worktree" in text and "(`echo $TTP_RUN_DIR`)" in text, name
+        assert "<log>" not in text and "> <marker>" not in text, name
 
 def test_status_does_not_warn_about_a_check_that_does_not_apply_on_the_branch(env, tmp_path):
     from ttp import push
