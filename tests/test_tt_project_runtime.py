@@ -10766,23 +10766,28 @@ def _gated_check(started, gate):
     return f"touch {started}; while [ ! -e {gate} ] && [ -d {gate.parent} ]; do sleep 0.05; done"
 
 
+def _wait_gone(pid, deadline):
+    """Wait until the detached push `pid` exited (it lets go of its run lock just after its outcome)."""
+    while time.time() < deadline:
+        try:   # the push process is this test's child: reap it, or its zombie answers kill(pid, 0)
+            if os.waitpid(pid, os.WNOHANG)[0]:
+                return
+        except ChildProcessError:
+            pass
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return
+        time.sleep(0.05)
+
+
 def _release_detached(gate, pids):
     """Finalizer of a gated detached push: open the gate so a failed assertion leaves nothing
     spinning, then end any detached push (its own session) that is still running."""
     gate.touch()
     deadline = time.time() + 10
     for pid in pids:
-        while time.time() < deadline:
-            try:   # the push process is this test's child: reap it, or its zombie answers kill(pid, 0)
-                if os.waitpid(pid, os.WNOHANG)[0]:
-                    break
-            except ChildProcessError:
-                pass
-            try:
-                os.kill(pid, 0)
-            except OSError:
-                break
-            time.sleep(0.05)
+        _wait_gone(pid, deadline)
         try:
             os.killpg(pid, signal.SIGKILL)
         except OSError:
@@ -10818,6 +10823,7 @@ def test_a_detached_push_returns_at_once_and_its_marker_reports_the_pushed_sha_a
         m = json.loads(marker.read_text())
         assert (m["status"], m["exit"], m["sha"], m["version"]) == ("pushed", 0, pushed, "0.1.1")
         assert m["ended"] >= m["started"] and "bumped" in pathlib.Path(m["log"]).read_text()
+        _wait_gone(m["pid"], time.time() + 10)   # the outcome is written a moment before the lock goes
         assert _ttp("push", "--free") == 0 and not release.push_in_flight(p)
         from ttp import push
         assert not push._run_lock(marker).exists(), "a finished push leaves no lock file behind"
