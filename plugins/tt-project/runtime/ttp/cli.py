@@ -1927,16 +1927,6 @@ def cmd_upgrade(a) -> None:
             print(mm.push(entry.get("ssh") or entry["host"]))
             sys.exit(forward(entry, sys.argv[1:]))
         p = need(a.name, sys.argv[1:])
-    tid = release.open_upgrade_task(p)
-    mine = bool(tid) and os.environ.get("TTP_TASK") == str(tid)
-    if tid and not mine:      # its worker is resolving the merge: a second resolution would race it
-        if a.auto:
-            release.finish(p, "held", why=f"harness task #{tid} finishes an earlier upgrade")
-        die(f"upgrade refused: harness task #{tid} is finishing an earlier template upgrade of {p.name}; "
-            f"nothing was changed. Rerun once it has ended.", 75)
-    if a.apply is None and mine:
-        die(f"task #{tid} finishes the merge in its own worktree and applies it with "
-            f"`ttp upgrade {p.name} --apply <commit>`", 2)
     held = locks.try_take([release.upgrade_lock(p)], f"ttp upgrade (pid {os.getpid()})", "ttp upgrade")
     if held is None:
         if a.auto:
@@ -1945,6 +1935,16 @@ def cmd_upgrade(a) -> None:
         die(f"upgrade refused: another upgrade of {p.name} is running"
             + (f" ({who[0]})" if who else "") + "; nothing was changed", 75)
     try:
+        tid = release.open_upgrade_task(p)      # read under the lock: an upgrade that just ended may have queued it
+        mine = bool(tid) and os.environ.get("TTP_TASK") == str(tid)
+        if tid and not mine:      # its worker is resolving the merge: a second resolution would race it
+            if a.auto:
+                release.finish(p, "held", why=f"harness task #{tid} finishes an earlier upgrade")
+            die(f"upgrade refused: harness task #{tid} is finishing an earlier template upgrade of {p.name}; "
+                f"nothing was changed. Rerun once it has ended.", 75)
+        if a.apply is None and mine:
+            die(f"task #{tid} finishes the merge in its own worktree and applies it with "
+                f"`ttp upgrade {p.name} --apply <commit>`", 2)
         release.guard_harness(p.harness)
         if a.apply is not None:
             _apply_upgrade(p, a.apply)
