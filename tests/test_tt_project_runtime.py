@@ -6345,7 +6345,7 @@ def _upgrade_after_local_drop(env, monkeypatch, module, name):
 
 
 def test_upgrade_keeps_a_runtime_edit_that_drops_a_name_nothing_needs(env, monkeypatch, capsys):
-    """gsplat-tt: a project removed an unused helper on purpose; the upgrade checked the whole file out
+    """A project removed an unused helper on purpose; the upgrade checked the whole file out
     from upstream as 'lost', wiping every other local edit in it."""
     p, cli = _upgrade_after_local_drop(env, monkeypatch, "release.py", "unused_helper")
     h = p.harness
