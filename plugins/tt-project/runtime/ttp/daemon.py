@@ -1139,6 +1139,10 @@ class Daemon:
                            blocked_reason="its resource stayed busy before the run could start; retries")
             return
         rstatus = result.get("status") if isinstance(result, dict) else None
+        if rstatus == "done" and task["kind"] == "review" and review_rejects(result):
+            # A project's own result rule (`done` plus a verdict): a change that must not proceed
+            # is a failed review, so its fix and re-review follow and nothing is approved.
+            rstatus, result = "failed", dict(result, status="failed")
         summary = str((result.get("summary") if isinstance(result, dict) else None)
                       or (usage.final_text or usage.error or "")[:1500])
         waiting = status == "ok" and rstatus == "waiting"
@@ -3082,6 +3086,19 @@ def _has_tokens(usage) -> bool:
 def _resume_never_started(note: dict, usage) -> bool:
     """A run that was to continue a lost session ended before its agent did anything."""
     return bool(note.get("resumes")) and not usage.cost_usd and not usage.output_tokens
+
+
+# `metrics.verdict` values that make a review handed off `done` a failed one (see review_rejects).
+REVIEW_REJECT_VERDICTS = frozenset({"changes_needed", "changes_requested", "rejected"})
+
+
+def review_rejects(result: dict) -> bool:
+    """A review's hand-off says the change must not proceed through `metrics.verdict`, for projects
+    whose kind-review.md reports `done` plus a verdict instead of `failed`."""
+    metrics = result.get("metrics")
+    verdict = metrics.get("verdict") if isinstance(metrics, dict) else None
+    return isinstance(verdict, str) and verdict.strip().lower().replace("-", "_").replace(" ", "_") \
+        in REVIEW_REJECT_VERDICTS
 
 
 def _read_result(path: Path) -> dict | None:

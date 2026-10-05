@@ -16628,15 +16628,15 @@ def test_set_when_drops_the_old_probe_verdict(env, monkeypatch):
     assert p.db.task(tid)["not_before"] == nb
 
 
-def _fail_review(env, p, rid, followups=()):
-    """Review `rid` ran and handed off `failed`, with `followups` as its fix specs."""
+def _fail_review(env, p, rid, followups=(), **handoff):
+    """Review `rid` ran and handed off `failed` (or `handoff`), with `followups` as its fix specs."""
     from ttp.daemon import Daemon
     from ttp.providers.base import RunUsage as Usage
     p.db.update_task(rid, status="running")
     run_dir = env["tmp"] / f"run-{rid}"
     run_dir.mkdir()
     (run_dir / "result.json").write_text(json.dumps(
-        {"status": "failed", "summary": "blocking findings", "followups": list(followups)}))
+        {"status": "failed", "summary": "blocking findings", "followups": list(followups), **handoff}))
     d = Daemon(p.base)
     d._finish_worker({"task": rid}, Usage(cost_usd=1.0), "ok", run_dir)
     d.reconcile_tasks()
@@ -16695,6 +16695,59 @@ def test_a_failed_review_with_fixes_moves_its_dependents_onto_the_re_review(env)
     assert third["status"] == "queued" and "Fix #" not in third["text"]
     w = p.db.task(waiter)
     assert w["status"] == "blocked" and w["blocked_reason"] == f"dependency #{re_rev2['id']} failed"
+
+
+def test_a_review_done_with_a_changes_needed_verdict_is_a_failed_review(env):
+    """A project whose result rule is `done` plus `metrics.verdict` gets the same fix flow as `failed`,
+    and approves nothing; `done` with another verdict, or from a non-review task, stays done."""
+    p = make(env)
+    from ttp.daemon import review_rejects
+    code, _, _, (rev,) = _finish_code(env, p, "feature", {"app.py": 40})
+    waiter = p.db.add_task("deploy it", "s", origin="coordinator", depends_on=[rev["id"]])
+    fups = [{"title": "add the missing test", "spec": "test_x must fail without the change"}]
+    failed = _fail_review(env, p, rev["id"], fups, status="done", metrics={"verdict": "changes_needed"},
+                          push=[{"branch": "ttp/x", "head": "a" * 40}])
+    assert failed is not None and p.db.task(rev["id"])["status"] == "failed"
+    assert json.loads(p.db.task(rev["id"])["result"])["status"] == "failed"
+    assert p.db.q("SELECT * FROM events WHERE task=? AND kind='push_queued'", (rev["id"],)) == []
+    (fix,) = p.db.q("SELECT * FROM tasks WHERE kind='code' AND origin='daemon'")
+    assert "test_x must fail" in fix["spec"] and p.db.task(waiter)["status"] == "queued"
+    assert all(review_rejects({"metrics": {"verdict": v}}) for v in ("changes_needed", "Changes-Requested", "rejected"))
+    assert not any(review_rejects(r) for r in ({"metrics": {"verdict": "ready"}}, {"metrics": {}}, {},
+                                               {"metrics": "changes_needed"}, {"verdict": "changes_needed"}))
+    _, _, _, (ok,) = _finish_code(env, p, "other", {"b.py": 5})
+    _fail_review(env, p, ok["id"], status="done", summary="fine", metrics={"verdict": "ready"})
+    assert p.db.task(ok["id"])["status"] == "done"
+    plain = p.db.add_task("not a review", "s", kind="question", origin="coordinator")
+    _fail_review(env, p, plain, status="done", summary="answered", metrics={"verdict": "changes_needed"})
+    assert p.db.task(plain)["status"] == "done"
+
+
+def test_the_review_result_rule_is_one_block_that_survives_upgrades(env, tmp_path):
+    """A project that rewords kind-review.md's result rule merges template upgrades that edit the
+    lines around it without a conflict, and the marker lines fencing it never reach the model."""
+    from ttp.prompts import strip_markers, worker_task
+    base = (RUNTIME.parent / "template" / "prompts" / "kind-review.md").read_text()
+    rule = "- `result.json`: `status` `done` when it may proceed, `failed` when it must not.\n"
+    start, end = base.index("<!-- ttp:result-rule"), base.index("<!-- /ttp:result-rule -->")
+    assert base[start:end].count("\n") == 2 and base[start:end].endswith(rule), "the block is not just the rule"
+    ours = base.replace(rule, "- `result.json`: `status` `done`, with `metrics.verdict` `ready` or `changes_needed`.\n")
+    lines = base.splitlines(keepends=True)
+    i = next(n for n, line in enumerate(lines) if line.startswith("<!-- ttp:result-rule"))
+    lines[i - 1] = lines[i - 1].rstrip("\n") + " (upstream fix)\n"
+    lines[i + 3] = lines[i + 3].rstrip("\n") + " (upstream fix)\n"
+    for name, text in (("base", base), ("ours", ours), ("theirs", "".join(lines))):
+        (tmp_path / name).write_text(text)
+    r = subprocess.run(["git", "merge-file", "-p", str(tmp_path / "ours"), str(tmp_path / "base"),
+                        str(tmp_path / "theirs")], capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout
+    assert "`metrics.verdict` `ready`" in r.stdout and r.stdout.count("(upstream fix)") == 2
+    assert strip_markers(base) == base.replace(base[start:base.index(rule, start)], "").replace(
+        "<!-- /ttp:result-rule -->\n", "")
+    assert "`<!-- ttp -->`" in strip_markers(base), "the PR comment marker is not a fence line"
+    p = make(env)
+    prompt = worker_task(p, p.db.task(p.db.add_task("review it", "s", kind="review", origin="user")), str(p.root), None)
+    assert rule.strip() in prompt and "ttp:result-rule" not in prompt
 
 
 def test_a_failed_review_without_fixes_still_blocks_its_dependents(env):

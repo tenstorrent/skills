@@ -95,6 +95,12 @@ and preferences you add later become part of the project's charter and memory.
   tasks waiting on the failed review wait on the re-review instead of being blocked (at most two
   rounds per stack; a failure without fix follow-ups still blocks them, and `upstream:` notes and
   deferred follow-ups stay with the coordinator).
+- A review's result: `done` lets the change proceed (its PR, push or push-queue approval and its
+  dependents), `failed` stops it and starts the fix flow above. A review handed off `done` with
+  `metrics.verdict` `changes_needed` (or `changes_requested`, `rejected`) counts as failed too, so a
+  project may word the rule that way. The rule sits in its own block of `prompts/kind-review.md`,
+  between `<!-- ttp:result-rule -->` marker lines the prompt leaves out: a project that rewords it
+  keeps its wording through template upgrades without merge conflicts.
 - Each tier maps to a model and effort per provider (`providers.<name>.tiers`). The coordinator
   runs at `coordinator.tier` (light) unless `coordinator.model` or `coordinator.effort` is set:
   those pin the coordinator alone, so moving the light tier to a cheaper model does not move it.

@@ -17,7 +17,15 @@ from .worktree import project_venv
 
 def _read(p: Project, name: str) -> str:
     f = p.harness / "prompts" / name
-    return f.read_text() if f.exists() else ""
+    return strip_markers(f.read_text()) if f.exists() else ""
+
+
+def strip_markers(text: str) -> str:
+    """`text` without its `<!-- ttp:... -->` / `<!-- /ttp:... -->` lines. They fence a block (such as
+    kind-review.md's result rule) so a project's own wording of it merges as one unit on upgrades;
+    the model never needs them."""
+    return "".join(line for line in text.splitlines(keepends=True)
+                   if not (line.startswith(("<!-- ttp:", "<!-- /ttp:")) and line.rstrip().endswith("-->")))
 
 
 # kind-review.md's two delivery sections; a review's prompt carries only the one its project uses.

@@ -10,10 +10,12 @@
   takes longer than one tool call may, start it detached with a marker (`setsid nohup sh -c 'ttp
   checks -- <cmds>; echo $? > <marker>' > <log> 2>&1 &`) and hand off `waiting` with `retry_when`
   `test -e <marker>`.
+<!-- ttp:result-rule: kept as one block across upgrades; a project may reword it (see the README) -->
 - `result.json`: `status` `done` when it may proceed, `failed` when it must not.
+<!-- /ttp:result-rule -->
 - `followups`: one entry per blocking problem, each a self-contained fix spec.
-- With `failed`, put the full hash of the head you reviewed in `metrics.reviewed_head`: the
-  re-review of the fix is then sized by the fix alone.
+- When it must not proceed, put the full hash of the head you reviewed in `metrics.reviewed_head`:
+  the re-review of the fix is then sized by the fix alone.
 - A re-review whose spec lists earlier findings: check each is fixed, then review what changed since.
 - NEVER edit the change yourself.
 - NEVER mark a PR ready for review: only the user takes a PR out of draft. The harness's `gh`
