@@ -10,7 +10,7 @@ import subprocess
 from pathlib import Path
 
 from .db import continues_id
-from .project import Project
+from .project import Project, durable_write
 
 
 def _git(cwd: Path, *args: str, check: bool = True) -> str:
@@ -137,10 +137,9 @@ def link_paths(p: Project, path: Path) -> list[str]:
             if not _ignores(path, rel):
                 common = Path(path) / _git(path, "rev-parse", "--git-common-dir")
                 exclude = common / "info" / "exclude"
-                exclude.parent.mkdir(parents=True, exist_ok=True)
                 text = exclude.read_text() if exclude.is_file() else ""
                 if f"/{rel}" not in text.splitlines():
-                    exclude.write_text(text + ("" if not text or text.endswith("\n") else "\n") + f"/{rel}\n")
+                    durable_write(exclude, text + ("" if not text or text.endswith("\n") else "\n") + f"/{rel}\n")
             done.append(rel)
         except (OSError, RuntimeError, subprocess.SubprocessError):
             if made:   # a link git might commit goes again
