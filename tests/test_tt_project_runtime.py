@@ -2551,6 +2551,42 @@ def test_a_clearly_over_restriction_is_retired_without_asking(env):
     assert told["severity"] == "low" and over in told["text"] and "No restriction on box A" in told["text"]
 
 
+def test_a_temporary_charter_update_keeps_its_own_section_and_over_retires_a_quoted_restriction(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import ends
+    p.charter_path.write_text("# demo\n\n## Brief (verbatim from the user)\nKeep it tidy.\n\n"
+                              "## Restrictions (binding on every task)\nNever merge.\nStay off box A while it is "
+                              "diagnosed.\n")
+    assert coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "text": "Hold releases.",
+                            "expires": "1d"}], turn=2) == []
+    assert coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "text": "Never push."}],
+                       turn=3) == []
+    charter = p.charter_path.read_text()
+    assert "Never merge.\nStay off box A while it is diagnosed.\n\nNever push.\n" in charter, "joined the temporary one"
+    assert "(added " in charter and "turn 2.0)\nHold releases.\nExpires: " in charter
+    assert "an end" in coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "quote": "Never push.",
+                                        "until": "the freeze ends"}], turn=4)[0]
+    assert any("expired" in x for x in ends.Ends(p).tick(time.time() + 2 * 86400))
+    charter = p.charter_path.read_text()
+    assert "Hold releases." not in charter and "Never merge." in charter and "Never push." in charter
+    # With only a temporary section of that name, a lasting update gets a plain section of its own.
+    assert coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": "Quiet hours.",
+                            "until": "the launch is over"}], turn=7) == []
+    assert coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": "Review first."}],
+                       turn=8) == []
+    assert "Until: the launch is over\n\n## Policies\nReview first.\n" in p.charter_path.read_text()
+    # Outside the user's turn, a quoted restriction goes only with `over`, and the user is told.
+    drop = {"type": "charter_update", "section": "Restrictions", "quote": "Stay off box A while it is diagnosed."}
+    assert "needs the user's word, or `over`" in coord.apply(p, [{**drop, "over": "done"}], turn=5)[0]
+    over = "the diagnosis of box A finished on 2026-09-05"
+    assert coord.apply(p, [{**drop, "over": over}], turn=6) == []
+    assert "box A" not in p.charter_path.read_text() and "Never merge." in p.charter_path.read_text()
+    assert f"Over: {over}" in (p.harness / coord.CHARTER_HISTORY).read_text()
+    told = p.db.one("SELECT * FROM messages WHERE kind='alert' ORDER BY id DESC LIMIT 1")
+    assert told["severity"] == "low" and over in told["text"] and "Stay off box A" in told["text"]
+
+
 def test_an_ask_recommending_yes_to_a_safe_step_is_rejected(env):
     p = make(env)
     stale = ("Retire the stale restriction \"Restrictions (added 2026-09-02)\"? A newer section says the "
