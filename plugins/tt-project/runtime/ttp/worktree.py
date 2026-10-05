@@ -127,12 +127,13 @@ def link_paths(p: Project, path: Path) -> list[str]:
         if not isinstance(rel, str) or not rel.strip("/") or Path(rel).is_absolute() or ".." in Path(rel).parts:
             continue
         rel = rel.strip("/")
-        src, dest = p.root / rel, path / rel
+        src, dest, made = p.root / rel, path / rel, False
         try:
             if (not src.exists() or os.path.lexists(dest) or not dest.parent.is_dir()
                     or not _ignores(p.root, rel) or _git(path, "ls-files", "--", rel, check=False)):
                 continue
             os.symlink(src.resolve(), dest, target_is_directory=src.is_dir())
+            made = True
             if not _ignores(path, rel):
                 common = Path(path) / _git(path, "rev-parse", "--git-common-dir")
                 exclude = common / "info" / "exclude"
@@ -142,7 +143,8 @@ def link_paths(p: Project, path: Path) -> list[str]:
                     exclude.write_text(text + ("" if not text or text.endswith("\n") else "\n") + f"/{rel}\n")
             done.append(rel)
         except (OSError, RuntimeError, subprocess.SubprocessError):
-            continue
+            if made:   # a link git might commit goes again
+                dest.unlink(missing_ok=True)
     return done
 
 
