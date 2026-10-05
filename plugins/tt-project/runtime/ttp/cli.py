@@ -816,8 +816,9 @@ def cmd_stats(a) -> None:
 
 
 def cmd_spend_today(a) -> None:
-    """This machine's projects' spend in [since, until) by provider and account key: what another
-    machine's global daily total asks for over ssh (globalcap.fetch). The account itself stays here.
+    """This machine's projects' spend in [since, until) by provider and account key, and its other
+    Claude Code sessions as estimated (globalcap.answer): what another machine's global daily total
+    asks for over ssh (globalcap.fetch). The account itself stays here.
     `--receive` keeps what a machine that cannot be asked pushes here instead (globalcap.push)."""
     from . import globalcap as gcap
     now = time.time()
@@ -828,11 +829,14 @@ def cmd_spend_today(a) -> None:
     if a.since is None:
         b = deep_merge(DEFAULT_CONFIG["budget"], load_account_settings().get("budget") or {})
         a.since, a.until, _ = gcap.window(b, now)
-    t = gcap.machine_totals(a.since, a.until if a.until is not None else now + gcap.DAY, now=now)
+    t = gcap.answer(a.since, a.until if a.until is not None else now + gcap.DAY, now=now)
     if a.json:
         print(json.dumps(t))
         return
-    print(f"{t['host']}: {len(t['projects'])} projects, {gcap.money(sum(r['usd'] for r in t['rows']))} since "
+    o = t.get(gcap.SESSIONS)
+    other = (f", other Claude Code sessions {gcap.money(o['usd'])} (estimated)" if o
+             else ", other Claude Code sessions unknown")
+    print(f"{t['host']}: {len(t['projects'])} projects, {gcap.money(sum(r['usd'] for r in t['rows']))}{other} since "
           f"{time.strftime('%Y-%m-%d %H:%M %Z', time.localtime(a.since))}" +
           "".join(f"\n  could not read {e}" for e in t["errors"]))
 

@@ -20852,6 +20852,145 @@ def test_a_machine_both_asked_and_pushing_counts_once_with_its_freshest_answer(e
     assert gcap.receive(_spend_record("box2", [(start, end, 1.0)]), "b2", now + 1)[0]["pulls"] is True
 
 
+def _with_sessions(record, usd, account="acct-a", unknown=False):
+    """A pushed record (bytes) whose every window carries the sender's other Claude Code sessions."""
+    from ttp import globalcap as gcap
+    rec = json.loads(record)
+    field = None if unknown else {"provider": "claude", "key": gcap.account_key("claude", account), "usd": usd,
+                                  "sessions": 2, "estimated": True}
+    for w in rec["windows"]:
+        w[gcap.SESSIONS] = field
+    return (json.dumps(rec) + "\n").encode()
+
+
+def test_each_machines_other_sessions_count_once_pulled_pushed_or_both(env, monkeypatch):
+    # Every machine's answer carries its own other Claude Code sessions beside its projects' spend, so
+    # all machines on the account add up the same total. One answer per machine, never pulled + pushed.
+    p = make(env)
+    from ttp import globalcap as gcap
+    from ttp.project import register
+    now = time.time()
+    start, end = now - 3600, now + 3600
+    monkeypatch.setattr(gcap, "OTHER_SOURCES", [lambda *a: (1.0, "other Claude Code sessions on this machine ($1.00)")])
+    register("far", {"host": "box2", "dir": "/srv/far"})
+    key = gcap.account_key("claude", "acct-a")
+
+    def answer(usd, sessions):
+        return {"host": "box2", "projects": ["far"], "rows": [{"provider": "claude", "key": key, "usd": usd}],
+                gcap.SESSIONS: {"provider": "claude", "key": key, "usd": sessions, "sessions": 3, "estimated": True}}
+    # Pulled only.
+    monkeypatch.setattr(gcap, "fetch", lambda t, s, e: answer(50.0, 5.0))
+    gcap.refresh(start, end, now)
+    t = gcap.total(p.db, "claude", start, end, now + 1, account="acct-a")
+    assert t["usd"] == 56.0 and t["remote_sessions_usd"] == 5.0 and t["sessions_missing"] == [], t
+    assert "other Claude Code sessions on this machine ($1.00)" in t["includes"]
+    assert "other Claude Code sessions on 1 other machine ($5.00, estimated)" in t["includes"], t["includes"]
+    # Pushed only, from a machine this one cannot ask.
+    assert gcap.receive(_with_sessions(_spend_record("laptop", [(start, end, 10.0)]), 3.0), "lap", now)[1] == 0
+    t = gcap.total(p.db, "claude", start, end, now + 2, account="acct-a")
+    assert t["usd"] == 69.0 and t["machines"] == ["box2", "lap"], t
+    assert "other Claude Code sessions on 2 other machines ($8.00, estimated)" in t["includes"], t["includes"]
+    # Both pulled and pushed: one answer, the newer, sessions included; never the two added.
+    gcap.receive(_with_sessions(_spend_record("box2", [(start, end, 70.0)]), 7.0), "b2", now + 60)
+    t = gcap.total(p.db, "claude", start, end, now + 120, account="acct-a")
+    assert t["usd"] == 1 + 77 + 13 and t["machines"] == ["box2", "lap"] and t["remote_sessions_usd"] == 10.0, t
+    gcap.refresh(start, end, now + gcap.REFRESH_S + 1)                          # asked later: newer
+    t = gcap.total(p.db, "claude", start, end, now + gcap.REFRESH_S + 2, account="acct-a")
+    assert t["usd"] == 1 + 55 + 13 and t["remote_sessions_usd"] == 8.0, t
+    # Sessions on another account are not this account's spend.
+    gcap.receive(_with_sessions(_spend_record("laptop", [(start, end, 10.0)]), 3.0, account="other"), "lap", now + 3)
+    t = gcap.total(p.db, "claude", start, end, now + gcap.REFRESH_S + 2, account="acct-a")
+    assert t["usd"] == 1 + 55 + 10 and t["remote_sessions_usd"] == 5.0 and t["sessions_missing"] == [], t
+
+
+def test_this_machines_own_answer_never_counts_again_when_it_comes_back(env, monkeypatch):
+    p = make(env)
+    from ttp import globalcap as gcap
+    now = time.time()
+    start, end = now - 3600, now + 3600
+    monkeypatch.setattr(gcap, "OTHER_SOURCES", [lambda *a: (1.0, "other Claude Code sessions on this machine ($1.00)")])
+    before = gcap.pushed_path().read_bytes() if gcap.pushed_path().exists() else None
+    ack, rc = gcap.receive(_with_sessions(_spend_record("testhost", [(start, end, 40.0)]), 9.0), "self", now)
+    assert rc == 2 and "error" in ack and (gcap.pushed_path().read_bytes() if gcap.pushed_path().exists() else None) == before
+    # Asked under another alias, it answers with this machine's own name: not counted again.
+    monkeypatch.setattr(gcap, "targets", lambda: ["loop"])
+    key = gcap.account_key("claude", "acct-a")
+    monkeypatch.setattr(gcap, "fetch", lambda t, s, e: {
+        "host": "testhost", "projects": ["x"], "rows": [{"provider": "claude", "key": key, "usd": 40.0}],
+        gcap.SESSIONS: {"provider": "claude", "key": key, "usd": 9.0, "sessions": 1, "estimated": True}})
+    gcap.refresh(start, end, now)
+    t = gcap.total(p.db, "claude", start, end, now + 1, account="acct-a")
+    assert t["usd"] == 1.0 and t["remote_sessions_usd"] == 0 and t["machines"] == [], t
+
+
+def test_an_answer_without_other_sessions_still_counts_and_says_they_are_missing(env, monkeypatch):
+    # An older tt-project sends no other-sessions field: its projects count, its sessions count 0 and
+    # the total says so. A sender whose logs are not read yet sends null: the same.
+    p = make(env)
+    from ttp import globalcap as gcap
+    from ttp.project import register
+    now = time.time()
+    start, end = now - 3600, now + 3600
+    monkeypatch.setattr(gcap, "OTHER_SOURCES", [lambda *a: (1.0, "other Claude Code sessions on this machine ($1.00)")])
+    register("far", {"host": "box2", "dir": "/srv/far"})
+    key = gcap.account_key("claude", "acct-a")
+    monkeypatch.setattr(gcap, "fetch", lambda t, s, e: {"host": "box2", "projects": ["far"],
+                                                        "rows": [{"provider": "claude", "key": key, "usd": 50.0}]})
+    gcap.refresh(start, end, now)
+    assert gcap.receive(_spend_record("oldlaptop", [(start, end, 10.0)]), "old", now)[1] == 0
+    assert gcap.receive(_with_sessions(_spend_record("newlaptop", [(start, end, 4.0)]), 0, unknown=True), "new", now)[1] == 0
+    t = gcap.total(p.db, "claude", start, end, now + 1, account="acct-a")
+    assert t["usd"] == 65.0 and t["remote_sessions_usd"] == 0 and t["sessions_missing"] == ["box2", "new", "old"], t
+    assert "not other Claude Code sessions on box2, new, old (an older tt-project there" in t["includes"], t["includes"]
+    # A malformed field rejects the whole record, pulled or pushed.
+    for bad in [{"provider": "claude", "key": key, "usd": -1.0}, {"provider": "claude", "key": "x", "usd": 1.0}, 5]:
+        rec = json.loads(_spend_record("laptop", [(start, end, 1.0)]))
+        rec["windows"][0][gcap.SESSIONS] = bad
+        assert gcap.receive((json.dumps(rec) + "\n").encode(), "lap", now)[1] == 2, bad
+        assert not gcap._whole({"host": "box2", "rows": [], gcap.SESSIONS: bad})
+    assert gcap._whole({"host": "box2", "rows": []}) and gcap._whole({"host": "box2", "rows": [], gcap.SESSIONS: None})
+
+
+def test_spend_today_and_the_push_carry_this_machines_other_sessions(env, tmp_path, monkeypatch, capsys):
+    p = make(env)
+    from ttp import budget as bud
+    from ttp import globalcap as gcap
+    from ttp import localspend as ls
+    from ttp import upstream
+    from ttp.cli import main
+    from ttp.project import register
+    est = {"usd": 4.25, "sessions": 2, "estimated": False, "unknown": []}
+    monkeypatch.setattr(ls, "estimate", lambda b, s, e, now=None: est)
+    monkeypatch.setattr(gcap, "account_of", lambda prov: "acct-a")
+    now = time.time()
+    main(["spend-today", "--since", str(now - 60), "--until", str(now + 60), "--json"])
+    out = json.loads(capsys.readouterr().out)
+    assert out[gcap.SESSIONS] == {"provider": "claude", "key": gcap.account_key("claude", "acct-a"), "usd": 4.25,
+                                  "sessions": 2, "estimated": True}, out
+    main(["spend-today", "--since", str(now - 60), "--until", str(now + 60)])
+    assert "other Claude Code sessions $4.25 (estimated)" in capsys.readouterr().out
+    # The push carries it in every window, and the receiver counts and labels it.
+    register("far", {"host": "server", "dir": "/srv/far"})
+    p.set_config("budget.global_daily_usd", 100)
+    monkeypatch.setattr(gcap, "fetch", lambda *a: (_ for _ in ()).throw(RuntimeError("ssh: no route")))
+    sent = []
+    monkeypatch.setattr(upstream, "ssh_pipe", lambda t, args, data, timeout: sent.append(data) or (b'{"accepted": 1}\n', ""))
+    assert gcap.push(p.config()["budget"], now) == 1
+    wins = json.loads(sent[0])["windows"]
+    assert wins and all(w[gcap.SESSIONS]["usd"] == 4.25 for w in wins), wins
+    monkeypatch.setenv("TTP_HOST", "server")
+    assert gcap.receive(sent[0], "lap", now)[1] == 0
+    monkeypatch.setattr(gcap, "targets", lambda: [])
+    monkeypatch.setattr(gcap, "OTHER_SOURCES", [])
+    g = bud.evaluate(p.db, p.config(), "claude", [], now + 1)
+    assert g.numbers["global_today"] == 4.25, g.numbers
+    assert "other Claude Code sessions on 1 other machine ($4.25, estimated)" in g.numbers["global_includes"], g.numbers
+    # Logs not read yet: null, said plainly.
+    est = None
+    main(["spend-today", "--since", str(now - 60), "--until", str(now + 60), "--json"])
+    assert json.loads(capsys.readouterr().out)[gcap.SESSIONS] is None
+
+
 def test_this_machine_pushes_its_spend_in_the_background_and_a_failed_push_never_blocks(env, monkeypatch):
     p = make(env)
     from ttp import budget as bud

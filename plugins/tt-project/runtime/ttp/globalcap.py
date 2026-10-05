@@ -23,6 +23,11 @@ The global total for a provider counts, for this day:
   `ttp spend-today --receive` here (push, receive). Pushed answers are kept per machine and window
   in ~/.tt-project/global-spend-pushed.json and count like pulled ones: aged by when they arrived,
   stale past STALE_S. A machine both pulled and pushed counts once, with its freshest answer;
+- each other machine's own other Claude Code sessions: every answer, pulled or pushed, carries the
+  sending machine's estimate of them (localspend) as `other_sessions`, beside its projects' rows. It
+  counts once per machine with that machine's answer, so never twice. An answer from an older
+  tt-project has no such field: it counts 0 for them and the total says those machines' sessions are
+  not in it;
 - other spend sources registered with `add_other_source` (a hook for spend outside tt-project, e.g.
   the user's own sessions; localspend adds this machine's other Claude Code sessions).
 
@@ -72,6 +77,7 @@ MAX_WINDOWS, MAX_ROWS, MAX_PROJECTS, MAX_PUSHERS = 4, 64, 200, 32
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@+-]{0,79}$")
 PROVIDER_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
 KEY_RE = re.compile(r"^[0-9a-f]{16}$")
+SESSIONS = "other_sessions"   # an answer's field: the machine's other Claude Code sessions, estimated
 
 # Extra spend sources: fn(provider, account, start, end) -> (usd, label). Each adds its dollars to the
 # global total and its label to what the total says it includes. A source that fails is left out and
@@ -228,6 +234,33 @@ def machine_totals(start: float, end: float, skip: str | None = None, now: float
     return out
 
 
+def answer(start: float, end: float, now: float | None = None) -> dict:
+    """What this machine tells another one about [start, end) (`ttp spend-today`, pulled or pushed):
+    machine_totals, plus its other Claude Code sessions as SESSIONS ({provider, key, usd, sessions,
+    estimated: true}), or None there while they are unknown (the local logs not read yet)."""
+    out = dict(machine_totals(start, end, now=now))
+    try:
+        from . import localspend
+        out[SESSIONS] = localspend.field(start, end, now)
+    except Exception:
+        out[SESSIONS] = None
+    return out
+
+
+def _sessions_ok(x) -> bool:
+    """An answer's SESSIONS value: None (unknown there), or one account's estimate within range."""
+    return x is None or (isinstance(x, dict) and isinstance(x.get("provider"), str) and PROVIDER_RE.match(x["provider"])
+                         and isinstance(x.get("key"), str) and KEY_RE.match(x["key"])
+                         and _num(x.get("usd")) and 0 <= x["usd"] < 1e6
+                         and (x.get("sessions") is None or _num(x["sessions"]) and 0 <= x["sessions"] < 1e6))
+
+
+def _sessions(x) -> dict | None:
+    """A checked SESSIONS value, as kept."""
+    return None if x is None else {"provider": x["provider"], "key": x["key"], "usd": float(x["usd"]),
+                                   "sessions": int(x.get("sessions") or 0), "estimated": True}
+
+
 # other machines ---------------------------------------------------------------------------------
 def cache_path() -> Path:
     return project.HOME_DIR / "global-spend.json"
@@ -261,10 +294,11 @@ def targets() -> list[str]:
 
 def _whole(data) -> bool:
     """An answer total() can count: the host's name, a list of projects and rows of a provider, an
-    account key and a finite dollar amount, as `ttp spend-today` gives."""
+    account key and a finite dollar amount, as `ttp spend-today` gives, and a well-formed SESSIONS
+    value if it has one."""
     rows = data.get("rows") if isinstance(data, dict) else None
     return (isinstance(rows, list) and isinstance(data.get("host") or "", str)
-            and isinstance(data.get("projects") or [], list)
+            and isinstance(data.get("projects") or [], list) and _sessions_ok(data.get(SESSIONS))
             and all(isinstance(r, dict) and {"provider", "key"} <= r.keys() and isinstance(r.get("usd") or 0, (int, float))
                     and math.isfinite(r.get("usd") or 0) for r in rows))
 
@@ -338,7 +372,8 @@ def refresh(start: float, end: float, now: float | None = None, force: bool = Fa
                 machines[t].update(tried=now, ok=False, error=str(e)[:200])
                 continue
             wins[_key(start, end)] = {"ts": now, "start": start, "end": end, "rows": got["rows"],
-                                      "projects": got.get("projects") or []}
+                                      "projects": got.get("projects") or [],
+                                      **({SESSIONS: _sessions(got[SESSIONS])} if SESSIONS in got else {})}
             machines[t] = {"host": got.get("host") or t, "tried": now, "ts": now, "ok": True, "windows": wins}
         for gone in set(machines) - set(targets()):
             del machines[gone]
@@ -442,6 +477,8 @@ def _valid_push(rec, now: float) -> dict | None:
         if not isinstance(names, list) or len(names) > MAX_PROJECTS or not all(
                 isinstance(n, str) and NAME_RE.match(n) for n in names):
             return None
+        if not _sessions_ok(w.get(SESSIONS)):
+            return None
         for r in rows:
             if not (isinstance(r, dict) and isinstance(r.get("provider"), str) and PROVIDER_RE.match(r["provider"])
                     and isinstance(r.get("key"), str) and KEY_RE.match(r["key"])
@@ -450,7 +487,8 @@ def _valid_push(rec, now: float) -> dict | None:
         if end > now:
             out[_key(start, end)] = {"ts": now, "start": start, "end": end, "projects": names,
                                      "rows": [{"provider": r["provider"], "key": r["key"], "usd": float(r["usd"])}
-                                              for r in rows]}
+                                              for r in rows],
+                                     **({SESSIONS: _sessions(w[SESSIONS])} if SESSIONS in w else {})}
     return {"host": host, "sent": float(rec["sent"]), "windows": out}
 
 
@@ -546,8 +584,8 @@ def push(budget: dict, now: float | None = None) -> int:
             if 0 <= float(s.get("tried") or 0) <= now < float(s.get("next") or 0):
                 continue
             if not data:
-                wins = [{"start": a, "end": b, **{k: v for k, v in machine_totals(a, b, now=now).items()
-                                                  if k in ("rows", "projects")}} for a, b in push_windows(budget, now)]
+                wins = [{"start": a, "end": b, **{k: v for k, v in answer(a, b, now=now).items()
+                                                  if k in ("rows", "projects", SESSIONS)}} for a, b in push_windows(budget, now)]
                 data = (json.dumps({"v": 1, "host": project.hostname(), "sent": now, "windows": wins}) + "\n").encode()
             out, err = upstream.ssh_pipe(t, f"spend-today --receive --via {shlex.quote(upstream.alias())}",
                                          data, PUSH_TIMEOUT_S)
@@ -604,6 +642,9 @@ def total(db, provider: str, start: float, end: float, now: float | None = None,
     rolling 24 h (`rolling`) it counts while it was read within STALE_S, even if the last try failed;
     an older one covers another window and is only named stale. A machine is stale when its last try
     failed or its answer for this window is missing or older than STALE_S.
+    Each other machine's answer also brings its own other Claude Code sessions (SESSIONS), counted
+    with that answer: `remote_sessions_usd` is their sum, `sessions_missing` names the machines whose
+    counted answer says nothing of them (an older tt-project) or has them unknown.
     `usd` is the total; `stale` names the machines whose number is stale; `includes` says what it
     counts, in words."""
     now = now or time.time()
@@ -614,7 +655,7 @@ def total(db, provider: str, start: float, end: float, now: float | None = None,
     here = machine_totals(start, end, skip=str(own), now=now, cached=True)
     usd += sum(r["usd"] for r in here["rows"] if _matches(r, provider, account))
     stale, errors, hosts, seen = [], list(here["errors"]), [], {project.hostname()}
-    remote_projects = 0
+    remote_projects, remote_sessions, n_sessions, missing = 0, 0.0, 0, []
     cache = load_cache().get("machines") or {}
     pushed = load_pushed(now)
     key = _key(start, end)
@@ -641,6 +682,13 @@ def total(db, provider: str, start: float, end: float, now: float | None = None,
         if w.get("rows") is not None and (age <= STALE_S or not rolling):   # a failed try keeps it
             usd += sum(float(r.get("usd") or 0) for r in w["rows"] if isinstance(r, dict) and _matches(r, provider, account))
             remote_projects += len(w.get("projects") or [])
+            o = w.get(SESSIONS)
+            if isinstance(o, dict) and _sessions_ok(o):
+                if _matches(o, provider, account):
+                    remote_sessions += o["usd"]
+                    n_sessions += 1
+            elif provider == "claude":       # an older tt-project there, or its logs not read yet
+                missing.append(name)
         seen.add(host or name)
         hosts.append(name)
     others = []
@@ -660,10 +708,19 @@ def total(db, provider: str, start: float, end: float, now: float | None = None,
         includes += (f" and {remote_projects} on {len(hosts)} other machine{'s' if len(hosts) != 1 else ''}"
                      + (f" ({len(stale)} stale)" if stale else ""))
     includes += "".join(f", {x}" for x in others)
-    includes += ("; not your own sessions outside tt-project" if not others else
-                 "; not your own sessions on other machines, nor web, desktop or cloud sessions")
+    usd += remote_sessions
+    if n_sessions:
+        includes += (f", other Claude Code sessions on {n_sessions} other machine{'s' if n_sessions != 1 else ''} "
+                     f"({money(remote_sessions)}, estimated)")
+    if not others and not n_sessions:
+        includes += "; not your own sessions outside tt-project"
+    else:
+        gap = (f"other Claude Code sessions on {', '.join(missing)} (an older tt-project there, or its logs "
+               f"not read yet), " if missing else "")
+        includes += f"; not {gap}sessions on machines without tt-project, nor web, desktop or cloud sessions"
     return {"usd": round(usd, 4), "stale": stale, "machines": hosts, "local_projects": n_local,
-            "remote_projects": remote_projects, "errors": errors, "includes": includes}
+            "remote_projects": remote_projects, "remote_sessions_usd": round(remote_sessions, 4),
+            "sessions_missing": missing, "errors": errors, "includes": includes}
 
 
 def money(usd: float) -> str:

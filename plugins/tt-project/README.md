@@ -101,9 +101,14 @@ and preferences you add later become part of the project's charter and memory.
   that says it already asks this one; less often after failures), in the background. Pushed answers
   are kept in `~/.tt-project/global-spend-pushed.json` and count like asked ones, stale after 30
   minutes the same way; a machine both asked and pushing counts once, with its newer answer.
+  Each answer, asked or pushed, also carries that machine's estimate of its other Claude Code
+  sessions (`other_sessions`: provider, account hash, dollars, `estimated: true`; `null` while its
+  logs are not read yet). It counts with that machine's answer, so once per machine, and the total
+  names it apart from this machine's own sessions. An answer from an older tt-project has no such
+  field: it still counts, its sessions count 0, and the total says they are missing.
   `budget.push_spend_to` (account-level) names the machines to push to instead, or `"none"` turns
   pushing off. If the total cannot be worked out at all, the
-  per-project caps stay in charge. Spend outside tt-project (your own sessions) is not seen; a
+  per-project caps stay in charge. Web, desktop and cloud sessions are not seen; another
   source can be added in code with `globalcap.add_other_source(fn)`, where
   `fn(provider, account, start, end)` returns `(usd, label)`.
 - Budget day: with `budget.day_start` set (`"HH:MM"`), "today" is a fixed day starting at that time
@@ -115,7 +120,8 @@ and preferences you add later become part of the project's charter and memory.
   `project.json` (a project may still override a key, except `budget.push_spend_to`, which is read
   from the account settings only). `ttp config --account KEY` reads one; an
   empty value removes it. `ttp spend-today [--json]` prints this machine's tt-project spend for the
-  budget day by provider and account hash; it is what other machines ask for.
+  budget day by provider and account hash, and its other Claude Code sessions as estimated; it is
+  what other machines ask for.
 - Work backs off in steps as spend rises, pauses at the cap, and tells you how to raise it.
 - A runaway guard pauses a project whose hourly spend jumps far above its own norm.
 - A review runs light when the diff it checks touches no `review.risky_paths` glob and is doc-only

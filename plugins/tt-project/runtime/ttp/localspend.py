@@ -431,6 +431,17 @@ def source(provider: str, account: str, start: float, end: float) -> tuple[float
 gcap.add_other_source(source)
 
 
+def field(start: float, end: float, now: float | None = None) -> dict | None:
+    """What `ttp spend-today` tells other machines about this machine's other Claude Code sessions in
+    [start, end) (globalcap.answer): the estimate with this machine's account key, so a machine on
+    another account leaves it out, or None while it is unknown."""
+    e = estimate(account_budget(), start, end, now)
+    if e is None:
+        return None
+    return {"provider": "claude", "key": gcap.account_key("claude", gcap.account_of("claude")),
+            "usd": e["usd"], "sessions": e["sessions"], "estimated": True}
+
+
 # calibration ------------------------------------------------------------------------------------
 def session_cost(session_id: str, root: Path | None = None) -> tuple[float, bool] | None:
     """The list price of one session's log (its subagents too), or None when there is no log."""
