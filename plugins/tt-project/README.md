@@ -288,5 +288,9 @@ Design notes, invariants and how to add a provider: [docs/design.md](docs/design
   plan-window meter; without ask mode it has no read-only mode either.
 - Cursor has no reasoning-effort flag; tiers map to model names.
 - Context compaction per tier (`budget.compact_window_tokens`) works on Claude Code and Codex.
+- Long command output stays out of a worker's context: `ttp clip -- <cmd>` and `ttp checks` keep
+  it in a file and show a test run's failures (else head and tail). On Claude Code, Bash output
+  past `budget.bash_output_max_chars` also goes to a file. A worker whose run re-reads more than
+  `budget.split_reread_tokens` of context is told once to hand the rest on as a follow-up.
 - Resuming a lost run's session works on Claude Code and Codex; Cursor starts fresh.
 - A laptop pauses while it sleeps. Use an always-on machine for round-the-clock work.
