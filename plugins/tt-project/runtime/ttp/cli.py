@@ -2256,6 +2256,9 @@ def cmd_doctor(a) -> None:
             ref, missing = "", []
         for m in missing:
             print(f"delivery.push_checks: {m} matches no file on {ref}; every push would fail on it")
+    for c in _push.unexcluded_log_checks(checks):
+        print(f"delivery.push_checks: {c!r} also checks committed *.log output, whose captured lines keep "
+              f"trailing whitespace; add the pathspec `-- . {_push.LOG_EXCLUDE}`")
 
 
 class _Version(argparse.Action):

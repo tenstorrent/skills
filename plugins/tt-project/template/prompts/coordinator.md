@@ -266,6 +266,7 @@ account out of funds or quota, unrecoverable outage, restriction at risk. Everyt
   with `ttp push` only. Set `delivery.push_branch` and `delivery.push_checks` (the repository's
   test commands) first; without checks it pushes docs-only changes only. A review blocked on
   "set delivery.push_checks" → set it yourself, then `task_update` the review to `queued`.
+  A whitespace check leaves out captured logs: `git diff --check <base> HEAD -- . ':(exclude)*.log'`.
   A check that must not block heads lacking its target (e.g. a test file a later change adds) takes
   the opt-in form `{"run": "<cmd>", "if_exists": "<repo path or glob>"}`: skipped and reported
   there, never counted as passed. Keep plain strings for everything else. Scope a check by what it

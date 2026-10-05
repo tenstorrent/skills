@@ -17356,6 +17356,47 @@ def test_push_check_path_args_and_unmatched(env, tmp_path):
     assert push.unmatched_paths(repo, "origin", "work", checks) == ("origin/work", [])
 
 
+def test_whitespace_check_skips_logs_and_no_diff_files(env, tmp_path, capsys):
+    """The documented `git diff --check` form leaves out committed run logs (their captured lines
+    keep trailing whitespace) and files .gitattributes marks -diff or binary, but still fails on
+    source; doctor names a configured whitespace check that would fail on logs."""
+    from ttp import push
+    repo = tmp_path / "r"
+    repo.mkdir()
+    g = lambda *a: subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t", *a],
+                                  check=True, capture_output=True)
+    g("init", "-q", "-b", "work")
+    g("commit", "-q", "--allow-empty", "-m", "base")
+    g("branch", "base")
+    check = push.whitespace_check("base")
+    run = lambda c: subprocess.run(c, shell=True, cwd=repo, capture_output=True, text=True)
+    (repo / "runs").mkdir()
+    (repo / "runs" / "device.log").write_text("step 1 ok   \nstep 2\t\n")
+    (repo / "out.txt").write_text("captured   \n")
+    (repo / "blob.dat").write_text("raw   \n")
+    (repo / ".gitattributes").write_text("out.txt -diff\nblob.dat binary\n")
+    g("add", ".")
+    g("commit", "-qm", "logs")
+    assert run("git diff --check base HEAD").returncode != 0   # the bare form fails on the log
+    r = run(check)
+    assert r.returncode == 0, r.stdout   # (a) the log and (c) the -diff and binary files are skipped
+    (repo / "src.py").write_text("x = 1   \n")
+    g("add", ".")
+    g("commit", "-qm", "src")
+    r = run(check)
+    assert r.returncode != 0 and "src.py" in r.stdout and ".log" not in r.stdout   # (b) source still fails
+    plain = "git diff --check origin/work HEAD"
+    assert push.unexcluded_log_checks([plain, push.whitespace_check("origin/work"), "pytest -q",
+                                       "git -C . diff --check a b -- . ':!*.log'", "git diff a b"]) == [plain]
+    p = make(env)
+    p.set_config("delivery.push_checks", [plain, "pytest -q"])
+    from ttp import cli
+    cli.main(["doctor", p.name])
+    out = capsys.readouterr().out
+    assert f"delivery.push_checks: {plain!r} also checks committed *.log output" in out
+    assert p.config()["delivery"]["push_checks"] == [plain, "pytest -q"]   # explicit checks stay as set
+
+
 # checks that declare when they apply (if_exists) ------------------------------------------------------
 NEW_TEST = "tests/new_test.sh"
 COND = {"run": f"sh {NEW_TEST}", "if_exists": NEW_TEST}

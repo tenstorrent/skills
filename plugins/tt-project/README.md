@@ -223,6 +223,11 @@ and preferences you add later become part of the project's charter and memory.
   skipped check is logged as `skipped (not applicable: ...)` by `ttp push`, the push queue and
   `ttp checks` (in `checks.log`), and never counts as passed: when every check is skipped the
   push or `ttp checks` fails. Plain string checks never skip; `after_push` takes the same form.
+- tt-project runs no whitespace check of its own. A `git diff --check <base> HEAD` in
+  `push_checks` also fails on committed run logs, whose captured lines keep trailing whitespace.
+  Leave them out with a pathspec: `git diff --check <base> HEAD -- . ':(exclude)*.log'`. Files
+  that `.gitattributes` marks `-diff` or `binary` are skipped by git already. Checks stay as
+  configured; `ttp doctor` names a `git diff --check` that does not leave out `*.log`.
 - `ttp checks -- <cmd>` adds a check. Several words run as that argv (`ttp checks -- pytest -q`);
   one quoted string runs through the shell (`ttp checks -- 'FOO=1 pytest -q && ruff check .'`).
 - Scope a mandatory check by what it covers, never by whether it would pass. Prefer `if_exists`

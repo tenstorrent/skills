@@ -313,6 +313,33 @@ def path_args(cmd: str) -> list[str]:
     return out
 
 
+# tt-project runs no whitespace check of its own. A `git diff --check` in push_checks also flags
+# captured output (device-run logs keep trailing whitespace); git itself already skips files that
+# .gitattributes marks `-diff` or `binary`. This pathspec leaves out the logs too.
+LOG_EXCLUDE = "':(exclude)*.log'"
+
+
+def whitespace_check(base: str) -> str:
+    """A `git diff --check` of `base`..HEAD that skips captured `*.log` output, for push_checks."""
+    return f"git diff --check {shlex.quote(base)} HEAD -- . {LOG_EXCLUDE}"
+
+
+def unexcluded_log_checks(checks: list[str]) -> list[str]:
+    """Checks running `git diff --check` that do not leave out `*.log` files: committed run logs
+    would fail them. They stay as configured; `ttp doctor` names them."""
+    out = []
+    for cmd in checks:
+        try:
+            words = shlex.split(cmd)
+        except ValueError:
+            continue
+        after = words[words.index("git") + 1:] if "git" in words else []
+        if "diff" in after and "--check" in after and not any(
+                w.startswith((":!", ":^", ":(exclude")) and "*.log" in w for w in after):
+            out.append(str(cmd))
+    return out
+
+
 def unmatched_paths(repo: Path, remote: str, branch: str, checks: list[str]) -> tuple[str, list[str]]:
     """(ref, ["cmd: path", ...]) for check path args that match no file on the push branch: the
     remote-tracking ref, which `ttp push` rebases onto, else the local branch. ref is "" when
