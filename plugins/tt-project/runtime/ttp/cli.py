@@ -1461,6 +1461,7 @@ def _upgrade(p: Project, auto: bool = False) -> None:
     if emptied:      # a crash cut these short: they are damage, not local edits to commit and keep
         _git(h, "checkout", "HEAD", "--", *emptied)
         print("restored files a crash left empty: " + ", ".join(emptied))
+    _restore_cut_runtime(h)
     if _git(h, "status", "--porcelain"):
         _git(h, "add", "-A")
         _git(h, *ident, "commit", "-q", "-m", "local harness changes before template upgrade")
@@ -1555,6 +1556,92 @@ def _emptied(h: Path, have: str | None, ref: str) -> list[str]:
     return sorted(f for f, n in sizes(have).items() if n == 0 and f in full)
 
 
+def _blob(h: Path, rev: str, path: str) -> bytes | None:
+    r = subprocess.run(["git", "-C", str(h), "show", f"{rev}:{path}"], capture_output=True)
+    return r.stdout if r.returncode == 0 else None
+
+
+def _top_names(src: bytes) -> set[str] | None:
+    """Top-level names a Python file defines, or None when it does not parse."""
+    import ast
+    try:
+        tree = ast.parse(src)
+    except (SyntaxError, ValueError):
+        return None
+    names = set()
+    for n in tree.body:
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(n.name)
+        elif isinstance(n, ast.Assign):
+            names.update(t.id for t in n.targets if isinstance(t, ast.Name))
+        elif isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name):
+            names.add(n.target.id)
+    return names
+
+
+def _why_cut(f: str, got: bytes | None, want: bytes, keep: set[str] | None = None) -> str:
+    """How `got` lost the runtime file `want` ("" when it did not): deleted, emptied, no longer parsing,
+    or missing top-level names `want` defines (only those in `keep`, when given)."""
+    if got is None:
+        return "deleted"
+    if not got.strip():
+        return "empty"
+    if not f.endswith(".py") or (need := _top_names(want)) is None:
+        return ""
+    names = _top_names(got)
+    if names is None:
+        return "cut short"
+    lost = need & (need if keep is None else keep) - names
+    return "lost " + ", ".join(sorted(lost)[:5]) if lost else ""
+
+
+def _cut_runtime(h: Path, have: str | None, ref: str) -> dict[str, str]:
+    """runtime/ files `ref` ships with content that `have` (a commit, or None for the files on disk)
+    lost, mapped to how (see _why_cut; on disk only names HEAD defines too count). A reboot partway
+    through an upgrade leaves this; committing it as a local change breaks `import ttp.daemon`
+    (e.g. `cannot import name 'poll_s'`)."""
+    diff = ["diff", "--name-only", "--no-renames"] + ([have, ref] if have else ["HEAD"]) + ["--", "runtime"]
+    cut = {}
+    for f in _git(h, *diff).splitlines():
+        want = _blob(h, ref, f)
+        if not want or not want.strip():
+            continue        # not in `ref`, or empty there: nothing to lose
+        if have is None:
+            p = h / f
+            got = p.read_bytes() if p.is_file() and not p.is_symlink() else None
+            why = _why_cut(f, got, want, _top_names(_blob(h, "HEAD", f) or b""))
+        else:
+            why = _why_cut(f, _blob(h, have, f), want)
+        if why:
+            cut[f] = why
+    return cut
+
+
+def _cut_list(cut: dict[str, str]) -> str:
+    return ", ".join(f"{f} ({why})" for f, why in sorted(cut.items()))
+
+
+def _restore_cut_runtime(h: Path) -> None:
+    """Before the upgrade commits local changes: put back runtime/ files that upstream still ships but
+    are deleted or cut short on disk, from HEAD (or upstream when HEAD's copy is cut too). Refuses the
+    upgrade, with nothing committed, when they cannot be put back."""
+    cut = _cut_runtime(h, None, "upstream")
+    if not cut:
+        return
+    for f in cut:
+        src = "upstream" if _why_cut(f, _blob(h, "HEAD", f), _blob(h, "upstream", f) or b"") else "HEAD"
+        r = subprocess.run(["git", "-C", str(h), "checkout", src, "--", f], capture_output=True, text=True)
+        if r.returncode != 0:
+            die(f"upgrade refused: {f} is {cut[f]} and could not be restored from {src}: "
+                f"{r.stderr.strip()[-300:]}. Nothing was committed; restore it, then rerun `ttp upgrade`.", 1)
+    left = _cut_runtime(h, None, "upstream")
+    if left:
+        die("upgrade refused: runtime files upstream ships are still deleted or cut short after restoring "
+            f"them: {_cut_list(left)}. Nothing was committed; restore them, then rerun `ttp upgrade`.", 1)
+    print("warning: restored runtime files a crash deleted or cut short instead of committing them: "
+          + _cut_list(cut))
+
+
 def _merge_upstream(h: Path, tmp: Path, ident: list[str]) -> tuple[str, str]:
     """Merge `upstream` into a scratch worktree of main and check the result compiles and imports.
     Returns (merge commit, "") or ("", what went wrong); the live harness is never touched here."""
@@ -1575,6 +1662,15 @@ def _merge_upstream(h: Path, tmp: Path, ident: list[str]) -> tuple[str, str]:
         if emptied:     # committed as "local changes" after a crash emptied them; nobody empties these on purpose
             _git(tmp, "checkout", "upstream", "--", *emptied)
             _git(tmp, *ident, "commit", "-q", "-m", "restore template files a crash left empty: " + ", ".join(emptied))
+        cut = _cut_runtime(tmp, "HEAD", "upstream")
+        if cut:         # deleted or cut short on main while upstream still ships them: the import would break
+            r = subprocess.run(["git", "-C", str(tmp), "checkout", "upstream", "--", *cut], capture_output=True,
+                               text=True)
+            if r.returncode != 0:
+                return "", (f"runtime files upstream ships are deleted or cut short on main and could not be "
+                            f"restored: {_cut_list(cut)}: {r.stderr.strip()[-300:]}")
+            _git(tmp, *ident, "commit", "-q", "-m", "restore runtime files main lost: " + _cut_list(cut))
+            print("warning: restored runtime files main had deleted or cut short: " + _cut_list(cut))
         env = {**os.environ, "PYTHONPATH": str(tmp / "runtime")}
         for check in ([sys.executable, "-m", "compileall", "-q", "runtime"],
                       [sys.executable, "-c", "import ttp.daemon, ttp.cli"]):

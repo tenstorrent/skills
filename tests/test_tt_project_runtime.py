@@ -4301,6 +4301,64 @@ def test_upgrade_restores_runtime_files_a_crash_left_empty(env, monkeypatch, com
     assert committed or "local harness changes" not in _git_out(h, "log", "--format=%s", "-3")
 
 
+def _cut_runtime_files(h):
+    """What a reboot partway through an upgrade left: files deleted, and __init__.py cut before poll_s."""
+    (h / "runtime" / "ttp" / "push.py").unlink()
+    (h / "runtime" / "ttp" / "SOURCE_COMMIT").unlink()
+    init = h / "runtime" / "ttp" / "__init__.py"
+    init.write_text(init.read_text().split("\n\n\ndef poll_s")[0] + "\n")
+
+
+@pytest.mark.parametrize("committed", [True, False])
+def test_upgrade_never_commits_runtime_files_a_crash_deleted_or_cut(env, monkeypatch, committed, capsys):
+    """An upgrade committed a tree where push.py and SOURCE_COMMIT were gone and __init__.py had lost
+    poll_s as "local harness changes"; the merged runtime then failed `import ttp.daemon`."""
+    p = make(env)
+    from ttp import cli, service
+    monkeypatch.setattr(service, "restart", lambda p: "restarted")
+    h = p.harness
+    _install_template(env)
+    (env["home"] / "lib" / "current" / "runtime" / "ttp" / "SOURCE_COMMIT").write_text("abc1234\n")
+    cli.main(["upgrade", "demo"])
+    _cut_runtime_files(h)
+    if committed:
+        _git_out(h, "add", "-A")
+        _git_out(h, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "local harness changes")
+    assert "cannot import name" in _imports(h / "runtime").stderr
+    capsys.readouterr()
+    cli.main(["upgrade", "demo"])
+    out = capsys.readouterr().out
+    assert "def poll_s" in (h / "runtime" / "ttp" / "__init__.py").read_text() and "lost poll_s" in out
+    assert (h / "runtime" / "ttp" / "push.py").read_text().strip() and "push.py (deleted)" in out
+    assert (h / "runtime" / "ttp" / "SOURCE_COMMIT").read_text() == "abc1234\n"
+    assert _imports(h / "runtime").returncode == 0 and not _git_out(h, "status", "--porcelain")
+    assert not p.db.one("SELECT * FROM tasks WHERE kind='harness'")
+    # No commit on main ever records the loss: it is put back before the local changes are committed.
+    if not committed:
+        assert not _git_out(h, "log", "--diff-filter=D", "--format=%s", "--", "runtime")
+        assert "local harness changes" not in _git_out(h, "log", "--format=%s", "-3")
+
+
+def test_upgrade_refuses_when_a_lost_runtime_file_cannot_be_restored(env, monkeypatch):
+    p = make(env)
+    from ttp import cli, service
+    monkeypatch.setattr(service, "restart", lambda p: "restarted")
+    h = p.harness
+    _install_template(env)
+    (env["home"] / "lib" / "current" / "runtime" / "ttp" / "SOURCE_COMMIT").write_text("abc1234\n")
+    cli.main(["upgrade", "demo"])
+    head = _git_out(h, "rev-parse", "HEAD")
+    _cut_runtime_files(h)
+    monkeypatch.setattr(cli, "_blob", lambda *a: None if a[1] == "HEAD" else b"x = 1\n")
+    real = subprocess.run
+    monkeypatch.setattr(subprocess, "run", lambda cmd, *a, **k: real(
+        [*cmd[:3], "checkout", "no-such-ref", *cmd[4:]] if cmd[3:4] == ["checkout"] else cmd, *a, **k))
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo"])
+    assert e.value.code == 1 and _git_out(h, "rev-parse", "HEAD") == head
+    assert not (h / "runtime" / "ttp" / "push.py").exists()
+
+
 def test_restart_rolls_back_a_runtime_the_daemon_cannot_start_with(env):
     import py_compile
     p = make(env)
