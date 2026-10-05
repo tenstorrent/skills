@@ -474,6 +474,55 @@ def refusal(repo: Path, remote: str, branch: str) -> str:
     return ""
 
 
+REMOTE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+BACKUP_TIMEOUT_S = 300
+
+
+def backup_problem(d: dict) -> str:
+    """Why `delivery.backup_remote` in the delivery settings `d` cannot be used, or "" when it is off
+    (unset or empty) or names a remote. It names a git remote, never a branch: main/master, the push
+    branch, the base_ref and anything with a slash (a remote/branch) are refused."""
+    v = d.get("backup_remote")
+    if v is None or v == "":
+        return ""
+    if not isinstance(v, str):
+        return f"delivery.backup_remote: {v!r} is not a git remote's name; nothing is backed up"
+    v = v.strip()
+    shared = {str(d.get(k) or "").strip() for k in ("push_branch", "base_ref")} - {""}
+    if v in PROTECTED or v in shared or v in {s.partition("/")[2] for s in shared}:
+        return (f"delivery.backup_remote: {v!r} names a branch (main, master, the push branch or the "
+                f"base_ref), not a git remote; nothing is backed up")
+    if not REMOTE_NAME.fullmatch(v):
+        return f"delivery.backup_remote: {v!r} is not a git remote's name; nothing is backed up"
+    return ""
+
+
+def backup(repo: Path, remote: str, branch: str, timeout_s: float = BACKUP_TIMEOUT_S) -> tuple[str, str]:
+    """Push a finished task's own branch (ttp/t<id>-...) to the same name on `remote`, fast-forward
+    only: never with force, never another branch. Returns (outcome, detail): "pushed" (head), "not_ff"
+    (the remote's copy has commits the local branch lacks; left alone), "refused" (not a task branch
+    or no such remote), "gone" (the branch no longer exists) or "failed" (git's error)."""
+    if not OWN_BRANCH.fullmatch(branch) or branch in PROTECTED:
+        return "refused", f"{branch} is not a task branch (ttp/t<id>-...)"
+    if remote not in _git(repo, "remote").stdout.split():
+        return "refused", f"there is no git remote named {remote}"
+    head = _git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}^{{commit}}").stdout.strip()
+    if not head:
+        return "gone", f"branch {branch} no longer exists"
+    ref = f"refs/heads/{branch}"
+    try:   # no leading + and no --force: git itself refuses anything but a fast-forward
+        out = subprocess.run(["git", "-C", str(repo), "push", "--porcelain", remote, f"{ref}:{ref}"],
+                             text=True, capture_output=True, timeout=timeout_s, stdin=subprocess.DEVNULL,
+                             env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+    except subprocess.TimeoutExpired:
+        return "failed", f"git push to {remote} timed out after {timeout_s:.0f} s"
+    if out.returncode == 0:
+        return "pushed", head
+    if any(ln.startswith("!") and "[rejected]" in ln for ln in out.stdout.splitlines()):
+        return "not_ff", f"{remote}/{branch} has commits {branch} lacks"
+    return "failed", (out.stderr.strip() or out.stdout.strip())[-300:]
+
+
 def is_doc(path: str) -> bool:
     """A documentation file: prose by its suffix, or anything under a `docs/` or `doc/` folder."""
     return path.lower().endswith(DOC_SUFFIXES) or any(d in ("docs", "doc") for d in path.split("/")[:-1])

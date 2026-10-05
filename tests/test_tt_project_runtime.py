@@ -7784,6 +7784,134 @@ def test_local_only_check_runs_off_the_tick_and_a_later_tick_applies_it(env, mon
     assert on_tick == [False], "the tick waited for git"
 
 
+def _backup_remote(env, name="backup"):
+    remote = env["tmp"] / f"{name}.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+    subprocess.run(["git", "-C", str(env["repo"]), "remote", "add", name, str(remote)], check=True)
+    return remote
+
+
+def _finish_backup(d):
+    """One backup_branches pass as the daemon runs it: started on one tick, applied on a later one."""
+    d.backup_branches()
+    job = d._backup_job
+    if job is not None:
+        assert job["done"].wait(60), "the backup pushes did not finish"
+        d.backup_branches()
+        assert d._backup_job is None
+
+
+def _remote_head(remote, branch):
+    out = subprocess.run(["git", "-C", str(remote), "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
+                         capture_output=True, text=True)
+    return out.stdout.strip()
+
+
+def test_backup_remote_is_off_by_default_and_pushes_nothing(env):
+    p = make(env)
+    from ttp import daemon as dm
+    assert "backup_remote" not in p.config()["delivery"]
+    remote = _backup_remote(env, "origin")
+    p.set_config("review.auto", False)
+    tid, path, branch = _code_task(p, "hand-off", status="queued")
+    _commit_file(path, "a")
+    d = _local_only_daemon(p)
+    d._local_only_due = time.time() + 3600
+    assert _run_until(d, p, lambda: p.db.task(tid)["status"] == "done")
+    _finish_backup(d)
+    _finish_local_only(d)
+    assert p.db.kv(dm.KV_BACKUP) is None and not _remote_head(remote, branch)
+    assert [e["task"] for e in _local_only_events(p)] == [tid]   # the local-only event stays as is
+
+
+def test_backup_remote_gets_a_finished_task_branch_and_skips_a_non_fast_forward(env):
+    p = make(env)
+    from ttp import daemon as dm
+    remote = _backup_remote(env)
+    p.set_config("delivery.backup_remote", "backup")
+    p.set_config("review.auto", False)
+    tid, path, branch = _code_task(p, "hand-off", status="queued")
+    _commit_file(path, "a")
+    d = _local_only_daemon(p)
+    d._local_only_due = time.time() + 3600
+    assert _run_until(d, p, lambda: p.db.task(tid)["status"] == "done")
+    _finish_local_only(d)   # a branch still to be backed up is not flagged meanwhile
+    assert not _local_only_events(p)
+    _finish_backup(d)
+    head = _git_out(path, "rev-parse", "HEAD")
+    assert _remote_head(remote, branch) == head and p.db.kv(dm.KV_BACKUP) is None
+    _finish_local_only(d)
+    assert not _local_only_events(p)   # the backup remote has it
+    # Another copy moved on there: the rewritten local branch is not a fast-forward and is not forced.
+    other = env["tmp"] / "other"
+    subprocess.run(["git", "clone", "-q", "-b", branch, str(remote), str(other)], check=True)
+    _commit_file(other, "theirs")
+    _git_out(other, "push", "-q", "origin", branch)
+    theirs = _remote_head(remote, branch)
+    _git_out(path, *_IDENT, "commit", "-q", "--amend", "-m", "rewritten")
+    d._queue_backup(p.db.task(tid))
+    _finish_backup(d)
+    assert _remote_head(remote, branch) == theirs and p.db.kv(dm.KV_BACKUP) is None
+    obs = p.db.q("SELECT text, task FROM events WHERE kind='observation'")
+    assert len(obs) == 1 and obs[0]["task"] == tid and "not a fast-forward" in obs[0]["text"], obs
+    assert "nothing was forced" in obs[0]["text"]
+
+
+def test_backup_remote_refuses_to_name_a_branch(env):
+    p = make(env)
+    from ttp import coordinator as coord, push
+    from ttp import daemon as dm
+    from ttp.project import config_problems
+    d = {"push_branch": "origin/team/work", "base_ref": "origin/dev"}
+    for bad in ("main", "master", "origin/team/work", "team/work", "origin/dev", "dev"):
+        assert "names a branch" in push.backup_problem({**d, "backup_remote": bad}) \
+            or "not a git remote" in push.backup_problem({**d, "backup_remote": bad}), bad
+        assert config_problems({"delivery": {**d, "backup_remote": bad}}), bad
+    assert push.backup_problem({**d, "backup_remote": "backup"}) == ""
+    assert push.backup_problem({**d, "backup_remote": ""}) == ""
+    assert push.backup(env["repo"], "backup", "main")[0] == "refused"   # only ttp/t<id>-... branches
+    p.set_config("delivery.base_ref", "dev")
+    bad = {"type": "config_set", "key": "delivery.backup_remote", "value": "dev"}
+    notes = coord.apply(p, [bad], user_turn=True)
+    assert notes and "names a branch" in notes[0], notes
+    assert "ask_user (blocking access)" in coord.apply(p, [{**bad, "value": "backup"}])[0]
+    assert coord.apply(p, [{**bad, "value": "backup"}], user_turn=True) == []
+    assert coord.apply(p, [{**bad, "value": ""}]) == []   # off needs no one's word
+    # A key that names a branch anyway (edited by hand) pushes nothing and drops the queue.
+    p.set_config("delivery.base_ref", "")
+    remote = _backup_remote(env, "main")
+    p.set_config("delivery.backup_remote", "main")
+    tid, path, branch = _code_task(p, "work")
+    _commit_file(path, "a")
+    dm_ = dm.Daemon(p.base)
+    dm_._queue_backup(p.db.task(tid))
+    _finish_backup(dm_)
+    assert p.db.kv(dm.KV_BACKUP) is None and not _remote_head(remote, branch)
+
+
+def test_dirty_main_checkout_at_hand_off_is_observed_once_per_path_set(env):
+    p = make(env)
+    from ttp import daemon as dm
+    d = dm.Daemon(p.base)
+    task = p.db.task(p.db.add_task("t", "s", kind="code", tier="light", origin="user"))
+    obs = lambda: p.db.q("SELECT text FROM events WHERE kind='observation'")
+    d._note_dirty_main(task)
+    assert not obs()
+    (env["repo"] / "README.md").write_text("edited\n")
+    (env["repo"] / "untracked.txt").write_text("not tracked\n")
+    d._note_dirty_main(task)
+    d._note_dirty_main(task)
+    assert len(obs()) == 1 and "README.md" in obs()[0]["text"] and "untracked" not in obs()[0]["text"]
+    assert "Nothing was committed or changed" in obs()[0]["text"]
+    assert (env["repo"] / "README.md").read_text() == "edited\n"
+    assert _git_out(env["repo"], "status", "--porcelain", "--untracked-files=no") == "M README.md"
+    _git_out(env["repo"], "checkout", "README.md")
+    d._note_dirty_main(task)
+    (env["repo"] / "README.md").write_text("edited again\n")
+    d._note_dirty_main(task)
+    assert len(obs()) == 2   # clean in between: the same paths count again
+
+
 def test_local_only_check_that_raises_in_its_thread_is_logged_and_not_left_running(env, monkeypatch):
     p = make(env)
     from ttp import daemon as dm

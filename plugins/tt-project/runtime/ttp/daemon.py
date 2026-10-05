@@ -54,7 +54,7 @@ from . import worktree
 from .db import (OPEN_ASK_MAX_AGE_S, SEVERITY_RANK, TERMINAL_TASK_STATES, continues_id, deferral, dependency_ids,
                  dump_result, load_result, without_deferral)
 from .project import (Project, deep_merge, layered, disk_resume_gb, durable_write, git_fsync_env, hostname,
-                      nice_level, zombie)
+                      nice_level, push_allowed, zombie)
 from .providers import get_provider
 from .providers.base import last_json_object, scratch_dir, service_path
 from .providers.claude import as_windows
@@ -115,6 +115,10 @@ KV_LOCAL_ONLY = "local_only"   # kv: {task id: {branch, head, ahead, since}} for
 KV_INTEGRITY = "integrity"   # kv: the last boot integrity check (see Daemon.check_integrity)
 INTEGRITY_RECHECK_S = 3600
 KV_LOCAL_ONLY_FROM = "local_only_from"   # kv: when the check first ran; tasks done before it are not checked
+KV_BACKUP = "backup_pending"   # kv: {task id: {branch, tries, next}} done code tasks' branches for delivery.backup_remote
+BACKUP_TRIES = 3            # a backup push that fails this often (network, auth) is given up with an observation
+BACKUP_RETRY_S = 900        # times the try count: the wait before a failed backup push is tried again
+KV_DIRTY_MAIN = "dirty_main"   # kv: key of the main checkout's dirty tracked paths last reported
 PUSH_REFS_EVERY_S = 600   # how often the push queue's pins (refs/ttp/push/<id>) of settled rows are pruned
 
 
@@ -237,6 +241,7 @@ class Daemon:
         self._push_refs_at = 0.0     # when the push queue's pins were last pruned
         self._local_only_ok: dict[str, str] = {}   # branch -> head found on a remote: not looked at again
         self._local_only_job: dict | None = None   # the check running in its thread, applied by a later tick
+        self._backup_job: dict | None = None   # the backup pushes running in their thread (backup_branches)
         if not isinstance(self.p.db.kv(KV_LOCAL_ONLY_FROM), (int, float)):
             self.p.db.set_kv(KV_LOCAL_ONLY_FROM, time.time())   # work done before the check existed is not flagged
         self._kept: dict[int, tuple[float, float, str]] = {}   # task id -> (task updated, checked, why kept)
@@ -453,7 +458,7 @@ class Daemon:
             self._last_cfg = now
             self.jev = Jev(self.cfg, db=self.p.db)
         for step in (self.reap_runs, self.wake_after_reboot, self.meter_running, self.reconcile_tasks, self.tend_pushes,
-                     self.prune_worktrees, self.check_local_only, self.check_disk, self.sweep_alerts,
+                     self.prune_worktrees, self.backup_branches, self.check_local_only, self.check_disk, self.sweep_alerts,
                      self.check_release, self.sync_shared_pauses, self.check_integrity, self.sync_schedules,
                      self.lint_charter):
             step()
@@ -1644,6 +1649,8 @@ class Daemon:
         effort.settle(db, task["id"], new, attempts)
         if new == "done" and task["kind"] == "code":
             self._local_only_due = 0.0   # is its work on a remote? checked this tick
+            self._queue_backup(task)
+        self._note_dirty_main(task)
         if waiting and new == "queued":
             db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                  (time.time(), f"task:{task['id']}", "task_waiting", "low",
@@ -2611,6 +2618,8 @@ class Daemon:
             reviews = db.q("SELECT id, status, spec, depends_on, labels FROM tasks WHERE kind='review' "
                            "AND status='done' AND updated>=?", (now - 2 * LOCAL_ONLY_DAYS * 86400,))
             tasks = [t for t in tasks if not worktree.needed_by(t, open_tasks) and not worktree.needed_by(t, reviews)]
+            backing = db.kv(KV_BACKUP) or {}   # a backup push still to come decides first
+            tasks = [t for t in tasks if str(t["id"]) not in backing]
         if not tasks and not told:
             return
         job = {"tasks": tasks, "reviews": reviews, "found": ({}, True, {}), "error": None, "done": threading.Event()}
@@ -2667,6 +2676,119 @@ class Daemon:
                           f"not wanted.", "queued", t["id"]))
             if live != told:
                 db.set_kv(KV_LOCAL_ONLY, live or None)
+
+    def _queue_backup(self, task: dict) -> None:
+        """With delivery.backup_remote set, line a done code task's branch up for backup_branches.
+        Off (the default), nothing is queued and nothing is pushed."""
+        d = self.cfg.get("delivery") or {}
+        branch = str(task.get("branch") or "")
+        if not str(d.get("backup_remote") or "").strip() or not branch:
+            return
+        db = self.p.db
+        pending = db.kv(KV_BACKUP) or {}
+        pending[str(task["id"])] = {"branch": branch, "tries": 0, "next": 0}
+        db.set_kv(KV_BACKUP, pending)
+
+    def backup_branches(self) -> None:
+        """Push each done code task's own branch to `delivery.backup_remote` (a git remote; off when
+        unset), so work that is on no remote yet has a copy off this machine. Fast-forward only, under
+        the same name: never with force, never to the push branch, main or the base_ref (push.backup).
+        A push that is not a fast-forward is skipped with one observation; one that fails is tried
+        again later, BACKUP_TRIES times in all. The queue (KV_BACKUP) survives restarts; the pushes run
+        in a thread and a later tick applies what they did. Turning the key off or forbidding pushes
+        (delivery.push_allowed) drops the queue without pushing. The local-only check leaves a queued
+        branch alone, and looks again once its backup ended."""
+        job = self._backup_job
+        if job is not None:
+            if job["done"].is_set():
+                self._backup_job = None
+                self._apply_backup(job)
+            return
+        db = self.p.db
+        pending = db.kv(KV_BACKUP) or {}
+        if not pending:
+            return
+        d = self.cfg.get("delivery") or {}
+        remote = str(d.get("backup_remote") or "").strip()
+        why = push.backup_problem(d) or ("" if push_allowed(d) else "delivery.push_allowed is off")
+        if not remote or why:
+            if why:
+                log(self.p, f"backup of {len(pending)} task branch(es) dropped: {why}")
+            db.set_kv(KV_BACKUP, None)
+            self._local_only_due = 0.0
+            return
+        now = time.time()
+        due = {k: v for k, v in pending.items() if float(v.get("next") or 0) <= now}
+        if not due:
+            return
+        job = {"remote": remote, "due": due, "out": {}, "done": threading.Event()}
+        root = self.p.root
+
+        def work() -> None:
+            for k, v in due.items():
+                try:
+                    job["out"][k] = push.backup(root, remote, v["branch"])
+                except Exception:
+                    job["out"][k] = ("failed", traceback.format_exc().replace("\n", " | ")[-300:])
+            job["done"].set()
+        self._backup_job = job
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_backup(self, job: dict) -> None:
+        """Record what a finished backup_branches pass did: drop pushed, skipped and refused branches
+        from the queue (the last two with an observation), and schedule failed ones' next try."""
+        db, now, remote = self.p.db, time.time(), job["remote"]
+        with db.tx():
+            pending = db.kv(KV_BACKUP) or {}
+            for k, (outcome, detail) in job["out"].items():
+                v = pending.get(k)
+                if v is None or v.get("branch") != job["due"][k]["branch"]:
+                    continue   # dropped or re-queued meanwhile
+                b = v["branch"]
+                if outcome == "failed" and v.get("tries", 0) + 1 < BACKUP_TRIES:
+                    v["tries"] = v.get("tries", 0) + 1
+                    v["next"] = now + BACKUP_RETRY_S * v["tries"]
+                    log(self.p, f"task {k}: backup of {b} to {remote} failed (try {v['tries']}): {detail}")
+                    continue
+                del pending[k]
+                if outcome == "pushed":
+                    self._local_only_ok[b] = detail
+                    log(self.p, f"task {k}: branch {b} backed up to {remote} at {detail[:10]}")
+                    continue
+                log(self.p, f"task {k}: branch {b} not backed up to {remote} ({outcome}): {detail}")
+                if outcome == "gone":
+                    continue
+                why = {"not_ff": "it is not a fast-forward, so it was skipped and nothing was forced",
+                       "refused": "the backup refused it",
+                       "failed": f"the push failed {BACKUP_TRIES} times"}[outcome]
+                db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                     (now, f"task:{k}", "observation", "normal",
+                      f"task #{k}'s branch {b} was not backed up to {remote} (delivery.backup_remote): {why} "
+                      f"({detail}).", "queued", int(k)))
+            db.set_kv(KV_BACKUP, pending or None)
+        self._local_only_due = 0.0   # what is still only here is flagged now
+
+    def _note_dirty_main(self, task: dict) -> None:
+        """At a hand-off, record one observation when the project's main checkout has uncommitted
+        changes to tracked paths: work there is on no branch and no remote. Once per set of paths
+        (KV_DIRTY_MAIN); a clean checkout resets it. Nothing is committed or changed."""
+        paths = worktree.dirty_tracked(self.p.root)
+        if paths is None:
+            return
+        db = self.p.db
+        key = hashlib.sha256("\0".join(paths).encode()).hexdigest()[:16] if paths else None
+        if key == db.kv(KV_DIRTY_MAIN):
+            return
+        db.set_kv(KV_DIRTY_MAIN, key)
+        if not paths:
+            return
+        shown = ", ".join(paths[:20]) + (f" and {len(paths) - 20} more" if len(paths) > 20 else "")
+        log(self.p, f"main checkout has uncommitted changes to {len(paths)} tracked path(s)")
+        db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+             (time.time(), "daemon", "observation", "low",
+              f"The project's main checkout has uncommitted changes to {len(paths)} tracked path"
+              f"{'' if len(paths) == 1 else 's'}, seen at #{task['id']}'s hand-off: {shown}. They are on no "
+              f"branch and no remote. Nothing was committed or changed.", "queued", task["id"]))
 
     def read_upstream(self) -> None:
         """With `upstream.ingest` on, new notes in the user's upstream inboxes become coordinator events

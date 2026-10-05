@@ -281,6 +281,13 @@ and preferences you add later become part of the project's charter and memory.
   waits, the running batch, the last push and its deploy), the web app a Push queue card, and
   `ttp push --queue` lists the entries and the last 10 batches. Only a rejected push, a failed
   `after_push` and batches that keep dying reach the top section, and only while they last.
+- `delivery.backup_remote` (off by default) names a git remote that each finished code task's
+  branch (`ttp/t<id>-...`) is pushed to under the same name, fast-forward only: never forced, never
+  to `main`, `master`, the push branch or `delivery.base_ref` (a value naming one is refused). A
+  push that is not a fast-forward is skipped with one observation. Setting it from chat needs the
+  user's word. Separately, a hand-off that finds uncommitted changes to tracked paths in the
+  project's main checkout records one observation naming them (once per set of paths); nothing
+  there is committed or changed.
 - A plan task starts from what is already known: prior work, the organization's docs and chats
   through the connectors you have, available skills, and public work. Skill plugins it recommends
   can be enabled for the project's workers only (`providers.claude.plugin_dirs`).

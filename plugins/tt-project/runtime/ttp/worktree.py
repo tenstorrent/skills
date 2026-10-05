@@ -617,6 +617,27 @@ def _closest_ancestor(p: Project, heads: list[str], ref: str) -> str | None:
 FETCH_TIMEOUT_S = 30   # the local-only check's fetch; an unreachable remote must not hold up the tick
 
 
+def dirty_tracked(repo: Path, timeout_s: float = 30) -> list[str] | None:
+    """The tracked paths with uncommitted changes (staged or not) in the checkout at `repo`, sorted;
+    untracked files and changes inside submodules are left out. None when `repo` is not a git work
+    tree or git fails or is slow. Reads only: nothing is staged, committed or changed."""
+    try:
+        out = subprocess.run(["git", "-C", str(repo), "status", "--porcelain=v1", "-z", "--untracked-files=no",
+                              "--ignore-submodules=dirty"], capture_output=True, text=True, timeout=timeout_s,
+                             stdin=subprocess.DEVNULL, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    paths, items = set(), iter(out.stdout.split("\0"))
+    for e in items:
+        if len(e) > 3:
+            paths.add(e[3:])
+            if e[0] in "RC":
+                next(items, None)   # a rename's or copy's source follows its new path
+    return sorted(paths)
+
+
 def local_only(repo: Path, branches: list[str], targets: list[str] = (), known: set = frozenset(),
                timeout_s: float = FETCH_TIMEOUT_S, pushed: set | frozenset = frozenset()) -> tuple[dict, bool, dict] | None:
     """Which of `branches` hold finished work whose only copy is on this machine. Returns ({branch:

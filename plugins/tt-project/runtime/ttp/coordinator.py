@@ -76,6 +76,14 @@ ACTIONS_SCHEMA: dict[str, Any] = {
 
 # Settings the coordinator may change on the user's explicit request. Anything else needs the
 # user to edit project.json (or the web app) themselves.
+def _backup_remote(v: Any) -> str:
+    """delivery.backup_remote as config_set takes it: a git remote's name, or "" (off)."""
+    v = "" if v is None or v is False else str(v).strip()
+    if why := push.backup_problem({"backup_remote": v}):
+        raise ValueError(why)
+    return v
+
+
 USER_SETTABLE = {
     "budget.daily_usd": float, "budget.weekly_usd": float, "budget.reserve_pct": float,
     "budget.global_daily_usd": float, "budget.day_start": str, "budget.timezone": str,
@@ -101,6 +109,8 @@ USER_SETTABLE = {
     "delivery.push_batch_max": lambda v: push_queue_number("push_batch_max", v),
     "delivery.after_push": lambda v: push.checks_of(v),
     "delivery.after_push_timeout_s": lambda v: push_queue_number("after_push_timeout_s", v),
+    # A git remote each finished code task's branch is backed up to, fast-forward only; "" turns it off.
+    "delivery.backup_remote": lambda v: _backup_remote(v),
     # Code tasks whose spec asks for it land on delivery.push_branch with `ttp push` themselves.
     "delivery.code_tasks_may_push": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     # The runaway valve on task creation; the coordinator may raise it within MAX_TASKS_PER_DAY.
@@ -468,8 +478,8 @@ def _norm_severity(s: str | None) -> str:
 # safe direction and needs no one's word. Everything else the coordinator decides on its own.
 NEEDS_USER = {"budget.daily_usd": "spend", "budget.weekly_usd": "spend", "budget.reserve_pct": "spend",
               "budget.global_daily_usd": "spend",
-              "delivery.code_tasks_may_push": "review"}
-SAFE_WHEN_OFF = {"delivery.code_tasks_may_push"}
+              "delivery.code_tasks_may_push": "review", "delivery.backup_remote": "access"}
+SAFE_WHEN_OFF = {"delivery.code_tasks_may_push", "delivery.backup_remote"}
 
 
 def tasks_made(db, since: float, review: bool = False) -> list[float]:
@@ -922,7 +932,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     hint = unknown_key_hint(key)
                     raise ValueError(hint or f"{key} is not user-settable from chat")
                 value = USER_SETTABLE[key](a.get("value"))
-                if key in NEEDS_USER and not user_turn and not (key in SAFE_WHEN_OFF and value is False):
+                if key == "delivery.backup_remote" and (why := push.backup_problem({**(cfg.get("delivery") or {}),
+                                                                                    "backup_remote": value})):
+                    raise ValueError(why)
+                if key in NEEDS_USER and not user_turn and not (key in SAFE_WHEN_OFF and value in (False, "")):
                     raise ValueError(f"{key} needs the user's approval: ask_user (blocking {NEEDS_USER[key]}) with the "
                                      f"exact value, and set it in the turn that carries their yes")
                 p.set_config(key, value)

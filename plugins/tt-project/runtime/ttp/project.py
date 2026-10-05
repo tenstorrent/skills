@@ -175,8 +175,10 @@ EXTRA_KEYS = {
     "coordinator": {"max_review_tasks_per_day", "charter_approval_days"},
     "notify": {"slack_poll_s"},
     # push_queue..after_push_timeout_s: the daemon-owned push queue (see PUSH_QUEUE_DEFAULTS).
+    # backup_remote: a git remote finished code tasks' branches are pushed to, fast-forward only (off: unset).
     "delivery": {"base_ref", "push_branch", "push_checks", "push_rounds", "push_wait_s", "version_bump",
-                 "push_queue", "push_batch_s", "push_batch_max", "after_push", "after_push_timeout_s"},
+                 "push_queue", "push_batch_s", "push_batch_max", "after_push", "after_push_timeout_s",
+                 "backup_remote"},
     "jev": {"via", "url", "model"},
 }
 OPEN_SECTIONS = {"resources"}           # any name below is fine
@@ -327,8 +329,9 @@ def config_problems(raw: dict) -> list[str]:
             elif isinstance(v, dict) and _known_keys(path + [str(k)]) is not None:
                 walk(v, path + [str(k)])
     walk(raw, [])
-    from .push import bump_problems, check_problems    # push imports this module
+    from .push import backup_problem, bump_problems, check_problems    # push imports this module
     delivery = raw.get("delivery") or {}
+    out += [why for why in [backup_problem(delivery)] if why]
     out += [f"delivery.push_checks: {p}" for p in check_problems(delivery.get("push_checks"))]
     out += bump_problems(delivery.get("version_bump"))
     may_push = delivery.get("code_tasks_may_push", False)

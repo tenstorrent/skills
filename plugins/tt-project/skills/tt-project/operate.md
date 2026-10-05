@@ -94,6 +94,9 @@
   Tasks an unfinished task still needs (a queued review or fix), tasks a done review names, and work
   done before the check first ran are left alone. Otherwise one coordinator event says so, and
   status and the web app count it until the work reaches a remote, the task is cancelled or it is
-  14 days old. Nothing is pushed automatically; a repository without a remote is skipped.
+  14 days old. Nothing is pushed automatically unless `delivery.backup_remote` names a git remote:
+  then each done code task's branch is pushed there, fast-forward only (never forced, never to main,
+  the push branch or the base_ref). A repository without a remote is skipped. A hand-off also
+  notes, once per set of paths, uncommitted changes to tracked files in the main checkout.
 - Coordinator failing repeatedly → an alert says so; messages are kept, not lost.
 - A worker that produces nothing for too long is stopped and retried (stall guard).
