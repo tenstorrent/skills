@@ -570,6 +570,26 @@ def test_migration_closes_old_watcher_issues_once(env, tmp_path):
     assert DB(path).one("SELECT status FROM issues WHERE id=1")["status"] == "open"   # runs once
 
 
+def test_the_push_queue_tables_are_added_to_an_existing_project_db_once(env, tmp_path):
+    from ttp.db import DB, PUSH_QUEUE_MIGRATION
+    path = tmp_path / "old.db"
+    db = DB(path)
+    tid = db.add_task("older work", "s", kind="review", status="review")
+    db.x("DROP TABLE push_queue")   # a project.db from before the push queue
+    db.x("DROP TABLE push_batches")
+    db.x("DELETE FROM meta WHERE key=?", (PUSH_QUEUE_MIGRATION,))
+    db.close()
+    db = DB(path)
+    assert db.meta(PUSH_QUEUE_MIGRATION) and db.task(tid)["status"] == "review"
+    db.x("INSERT INTO push_queue(task,branch,head,target,created,updated) VALUES(?,?,?,?,?,?)",
+         (tid, "b", "ab" * 20, "origin/proj", 1.0, 1.0))
+    db.x("INSERT INTO push_batches(id,marker,target,started) VALUES('b1','m','origin/proj',1.0)")
+    db.close()
+    db = DB(path)
+    assert db.one("SELECT status, tries FROM push_queue") == {"status": "approved", "tries": 0}
+    assert db.one("SELECT after_tries FROM push_batches")["after_tries"] == 0
+
+
 def test_observation_mute_counts_without_waking_and_ends_with_one_summary(env, monkeypatch):
     p = make(env)
     from ttp import coordinator as coord
@@ -4857,6 +4877,24 @@ def test_finished_worktrees_are_removed_at_task_end_only_when_nothing_is_lost(en
     assert not dirty.exists() and str(t_dirty) not in (p.db.kv("worktrees_kept") or {})
 
 
+def test_the_worktree_sweep_leaves_the_push_queue_checkouts_alone(env, monkeypatch):
+    """The batch's checkout (worktrees/push) and its after_push checkouts (worktrees/after_push-<id>)
+    belong to no task: the sweep removes a finished task's worktree next to them, never them."""
+    p = make(env)
+    _no_grace(monkeypatch)
+    from ttp import worktree
+    from ttp.daemon import Daemon
+    tid, path, _ = _code_task(p, "finished")
+    keep = [p.worktrees / "push", p.worktrees / "after_push-batch-20261005-120000-1"]
+    for wt in keep:
+        _git_out(p.root, "worktree", "add", "-q", "--detach", str(wt))
+    worktree.sweep(p)
+    Daemon(p.base).prune_worktrees(every_s=0)
+    assert not path.exists(), "the sweep did not run"
+    assert all((wt / "README.md").exists() for wt in keep)
+    assert all(str(wt) in _git_out(p.root, "worktree", "list") for wt in keep)
+
+
 def test_a_tracked_file_in_a_cache_named_directory_is_never_cleared(env):
     p = make(env)
     from ttp import worktree
@@ -5308,6 +5346,31 @@ def test_local_only_does_not_flag_work_a_reviewer_rebased_or_batched_onto_the_ta
     d.check_local_only()
     assert [e["task"] for e in _local_only_events(p)] == [lone]
     assert set(p.db.kv(dm.KV_LOCAL_ONLY)) == {str(lone)}
+
+
+def test_local_only_does_not_flag_work_the_push_queue_pushed(env):
+    """The queue pushed or landed the approved head of a branch, or a commit on top of it (the
+    review's fix): that work is on the push branch, though no remote has the branch's own head."""
+    p = make(env)
+    from ttp import worktree
+    _with_origin(env)
+    same, path, _ = _code_task(p, "pushed as approved")
+    _commit_file(path, "a")
+    head = _git_out(path, "rev-parse", "HEAD")
+    under, upath, _ = _code_task(p, "pushed with a fix on top")
+    _commit_file(upath, "b")
+    base = _git_out(upath, "rev-parse", "HEAD")
+    fix = _git_out(upath, *_IDENT, "commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "the review's fix")
+    lone, lpath, _ = _code_task(p, "never delivered")
+    _commit_file(lpath, "g")
+    now = time.time()
+    for task, approved, status in ((90, head, "pushed"), (91, fix, "landed"), (92, "cd" * 20, "conflict")):
+        p.db.x("INSERT INTO push_queue(task,branch,head,target,status,created,updated) VALUES(?,?,?,?,?,?,?)",
+               (task, "b", approved, "origin/proj", status, now, now))
+    d = _local_only_daemon(p)
+    d.check_local_only()
+    assert [e["task"] for e in _local_only_events(p)] == [lone]
+    assert worktree.delivered(p.root, base, "HEAD", pushed={fix}) and not worktree.delivered(p.root, base, "HEAD")
 
 
 def test_local_only_leaves_work_a_review_still_needs_or_has_reviewed(env):
@@ -8833,6 +8896,519 @@ def test_a_failed_timing_write_does_not_stop_the_push(env, monkeypatch, capsys):
     assert _ttp_push() == 0
     assert _git_out(repo, "rev-parse", "HEAD") == _git_out(origin, "rev-parse", "refs/heads/proj")
     assert "could not record" in capsys.readouterr().err
+
+
+# push queue: a passing review hands its approved commits to the daemon (pushq.py) ------------------
+_PQ_STUB = r'''
+import fcntl, json, os, sys, time
+marker, plan = sys.argv[1], json.load(open(sys.argv[2]))
+sys.stdin.read()   # the go: stdin closes once the marker is complete
+m = json.load(open(marker))
+
+
+def write(**kw):
+    m.update(kw)
+    with open(marker + ".tmp", "w") as f:
+        json.dump(m, f)
+    os.replace(marker + ".tmp", marker)
+
+
+def wait(name):
+    end = time.time() + 30
+    while name and not os.path.exists(name) and time.time() < end:
+        time.sleep(0.02)
+
+
+def drop(path):   # let go of the inherited run lock: a flock belongs to the open file
+    st = os.stat(path)
+    for fd in range(3, 256):
+        try:
+            s = os.fstat(fd)
+        except OSError:
+            continue
+        if (s.st_dev, s.st_ino) == (st.st_dev, st.st_ino):
+            os.close(fd)
+
+
+with open(marker[:-5] + ".starts", "a") as f:
+    f.write(m.get("phase", "?") + "\n")
+if m.get("outcome") is None:
+    wait(plan.get("release"))
+    if plan.get("die") == "push":
+        sys.exit(3)
+    rows = plan.get("rows") or {}
+    write(outcome=plan.get("outcome", "pushed"), tip=plan.get("tip"), pushed_sha=plan.get("sha"),
+          version=plan.get("version"), checks={"runs": 1, "seconds": 2.0}, ended=time.time(),
+          results=[{"id": e["id"], "status": rows.get(e["branch"], plan.get("row", "pushed")),
+                    "detail": plan.get("detail") or {}} for e in m["entries"]])
+    if not plan.get("after"):
+        write(phase="finished", status="done")
+        sys.exit(0)
+    lock = os.path.join(os.path.dirname(m["lock"]), "after_push:run-%s.0.lock" % m["id"])
+    fd = os.open(lock, os.O_CREAT | os.O_RDWR)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    old = m["lock"]
+    write(lock=lock, phase="after_push")
+    drop(old)
+    wait(plan.get("after_release"))
+    if plan.get("die") == "after":
+        sys.exit(3)
+    after = plan["after"]
+else:   # started again on a marker with an outcome: only the after_push step
+    if plan.get("die_resume"):
+        sys.exit(3)
+    after = plan.get("resume_after", "ok")
+write(after_push={"status": after, "exit": 0 if after == "ok" else 2, "started": time.time(), "ended": time.time(),
+                  "tail": "deploy said " + after}, phase="finished", status="done")
+'''
+
+
+def _pq(env, monkeypatch, plan=None, **delivery):
+    """A project whose push queue is on and pushes to origin/proj (see _push_setup), a done code task
+    with one commit on its branch, a review of it, and the batch process replaced by a stub that
+    writes the outcome `plan` describes into its marker."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    from ttp import pushq
+    p.set_config("delivery.push_queue", True)
+    for k, v in delivery.items():
+        p.set_config(f"delivery.{k}", v)
+    code, path, branch = _code_task(p, "feature")
+    _commit(path, "feature.txt", "feature\n")
+    stub, plan_file = env["tmp"] / "batch_stub.py", env["tmp"] / "plan.json"
+    stub.write_text(_PQ_STUB)
+    plan_file.write_text(json.dumps(plan or {}))
+    monkeypatch.setattr(pushq, "batch_argv", lambda marker: [sys.executable, str(stub), str(marker), str(plan_file)])
+    review = p.db.add_task("review feature", "review the feature", kind="review", tier="standard",
+                           origin="coordinator", depends_on=[code])
+    return types.SimpleNamespace(p=p, repo=repo, origin=origin, other=other, code=code, path=path, branch=branch,
+                                 head=_git_out(path, "rev-parse", "HEAD"), review=review, plan=plan_file)
+
+
+def _pq_plan(s, **plan):
+    s.plan.write_text(json.dumps(plan))
+
+
+def _pq_hand_off(env, s, push=None, task=None, **more):
+    """The review's run hands off done with `push` (default: its branch at its head)."""
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage as Usage
+    task = task or s.review
+    s.p.db.update_task(task, status="running")
+    run_dir = env["tmp"] / f"run-{task}-{time.monotonic_ns()}"
+    run_dir.mkdir()
+    result = {"status": "done", "summary": "looks good", **more}
+    if push is not False:
+        result["push"] = [{"branch": s.branch, "head": s.head}] if push is None else push
+    (run_dir / "result.json").write_text(json.dumps(result))
+    Daemon(s.p.base)._finish_worker({"task": task, "id": 7}, Usage(cost_usd=1.0), "ok", run_dir)
+    return s.p.db.task(task)
+
+
+def _pq_review(s, priority=3):
+    """Another review of the same branch whose approval waits in the queue."""
+    from ttp import pushq
+    rid = s.p.db.add_task("another review", "r", kind="review", origin="coordinator", priority=priority)
+    s.p.db.update_task(rid, status="pushing")
+    with s.p.db.tx():
+        [row] = pushq.approve(s.p, rid, None, {"entries": [{"branch": s.branch, "head": s.head}],
+                                               "target": "origin/proj"})
+    return rid, row
+
+
+def _pq_batch(s, wait=True):
+    """Start a batch of what is approved, as the tick does once one is due, and let it end."""
+    from ttp import pushq
+    rows, why = pushq.due(s.p, time.time() + 10 ** 6)   # past any window, pause or hold
+    assert rows, why
+    bid = pushq.start(s.p, rows, rows[0]["target"])
+    assert bid
+    if wait:
+        pushq._children[bid].wait(timeout=30)
+    return bid
+
+
+def _pq_tend(s):
+    from ttp.daemon import Daemon
+    Daemon(s.p.base).tend_pushes()
+
+
+def _pq_events(p, after=0, task=None):
+    return p.db.q("SELECT kind, status, text FROM events WHERE id>? AND (? IS NULL OR task=?) ORDER BY id",
+                  (after, task, task))
+
+
+def _pq_mark(p):
+    return p.db.one("SELECT COALESCE(MAX(id), 0) n FROM events")["n"]
+
+
+def test_a_passing_review_hands_its_approval_to_the_push_queue_without_waking_the_coordinator(env, monkeypatch):
+    s = _pq(env, monkeypatch)
+    mark = _pq_mark(s.p)
+    t = _pq_hand_off(env, s, followups=[{"title": "later", "spec": "do it later"}])
+    assert t["status"] == "pushing" and json.loads(t["result"])["push"] == [{"branch": s.branch, "head": s.head}]
+    [row] = s.p.db.q("SELECT * FROM push_queue")
+    assert (row["task"], row["run"], row["branch"], row["head"], row["target"], row["status"]) == (
+        s.review, 7, s.branch, s.head, "origin/proj", "approved")
+    assert _git_out(s.repo, "rev-parse", f"refs/ttp/push/{row['id']}") == s.head, "the approved commit is not pinned"
+    evs = _pq_events(s.p, mark)
+    assert [e["kind"] for e in evs if e["status"] == "queued"] == ["followup_proposed"], "only the follow-up is news"
+    [q] = [e for e in evs if e["kind"] == "push_queued"]
+    assert q["status"] == "handled" and s.head[:7] in q["text"] and "origin/proj" in q["text"]
+    assert not [e for e in evs if e["kind"].startswith("task_")]
+    assert s.p.db.one("SELECT COUNT(*) n FROM runs")["n"] == 0
+
+
+@pytest.mark.parametrize("case", ["short hash", "unknown commit", "unreviewed commit", "protected target", "no target"])
+def test_an_invalid_push_approval_runs_the_review_again_once_then_fails_it(env, monkeypatch, case):
+    s = _pq(env, monkeypatch)
+    head = {"short hash": s.head[:12], "unknown commit": "0123456789abcdef" * 2 + "01234567"}.get(case, s.head)
+    if case == "unreviewed commit":
+        _commit(s.repo, "elsewhere.txt", "not reviewed\n")
+        head = _git_out(s.repo, "rev-parse", "HEAD")
+    if case == "protected target":
+        s.p.set_config("delivery.push_branch", "origin/main")
+    if case == "no target":
+        s.p.set_config("delivery.push_branch", "")
+    mark = _pq_mark(s.p)
+    t = _pq_hand_off(env, s, push=[{"branch": s.branch, "head": head}])
+    assert t["status"] == "queued" and not s.p.db.q("SELECT id FROM push_queue")
+    assert json.loads(t["result"])["woke"].startswith("push approval invalid: ")
+    assert t["not_before"] <= time.time(), "the review should run again at once"
+    assert not [e for e in _pq_events(s.p, mark) if e["status"] == "queued"], "the retry woke the coordinator"
+    t = _pq_hand_off(env, s, push=[{"branch": s.branch, "head": head}])
+    assert t["status"] == "failed" and "push approval invalid again" in json.loads(t["result"])["summary"]
+    assert [e["kind"] for e in _pq_events(s.p, mark) if e["status"] == "queued"] == ["task_failed"]
+    assert not s.p.db.q("SELECT id FROM push_queue")
+
+
+def test_a_push_list_while_the_queue_is_off_is_ignored_and_logged(env, monkeypatch):
+    s = _pq(env, monkeypatch, push_queue=False)
+    t = _pq_hand_off(env, s)
+    assert t["status"] == "done" and not s.p.db.q("SELECT id FROM push_queue")
+    [done] = [e for e in _pq_events(s.p, task=s.review) if e["kind"] == "task_done"]
+    assert done["status"] == "queued" and "push list was ignored" in done["text"]
+    assert "push list was ignored" in (s.p.logs / "daemon.log").read_text()
+
+
+def test_a_batch_is_due_after_the_window_at_the_cap_for_priority_one_or_with_no_review_coming(env, monkeypatch):
+    from ttp import pushq
+    s = _pq(env, monkeypatch, push_batch_s=900, push_batch_max=3)
+    s.p.db.update_task(s.review, status="running")   # a review is still at work: approvals may wait for it
+    now = time.time()
+    first = [_pq_review(s)[1], _pq_review(s)[1]]
+    rows, why = pushq.due(s.p, now)
+    assert rows == [] and "waiting" in why
+    rows, why = pushq.due(s.p, now + 901)
+    assert [r["id"] for r in rows] == first and "waited" in why
+    later = [_pq_review(s)[1], _pq_review(s)[1]]
+    rows, why = pushq.due(s.p, now)
+    assert [r["id"] for r in rows] == first + later[:1] and "approvals" in why, "push_batch_max starts and caps a batch"
+    s.p.db.x("DELETE FROM push_queue WHERE id IN (?,?,?)", (*first, later[0]))
+    urgent = _pq_review(s, priority=1)[1]
+    rows, why = pushq.due(s.p, now)
+    assert [r["id"] for r in rows] == [urgent, later[1]] and "priority-1" in why, "the best priority goes first"
+    s.p.db.x("DELETE FROM push_queue WHERE id=?", (urgent,))
+    assert pushq.due(s.p, now)[0] == []
+    s.p.db.update_task(s.review, status="done")
+    rows, why = pushq.due(s.p, now)
+    assert [r["id"] for r in rows] == [later[1]] and "no review" in why
+
+
+@pytest.mark.parametrize("blocker", ["paused branch", "paused push", "live batch", "busy branch", "detached push",
+                                     "backoff", "other target", "not allowed"])
+def test_no_batch_starts_while_something_holds_the_push(env, monkeypatch, blocker):
+    from ttp import locks, push, pushq
+    from ttp.db import PAUSED_RESOURCES_KEY
+    s = _pq(env, monkeypatch)
+    rid, row = _pq_review(s, priority=1)
+    now = time.time()
+    assert pushq.due(s.p, now)[0], "the priority-1 approval alone is due"
+    held = None
+    if blocker.startswith("paused"):
+        name = push.lock_name("origin", "proj") if blocker == "paused branch" else "push"
+        s.p.db.set_kv(PAUSED_RESOURCES_KEY, {name: {"reason": "user", "since": now, "by": "user"}})
+    elif blocker == "live batch":   # its deploy included
+        s.p.db.x("INSERT INTO push_batches(id,marker,target,started,finalized) VALUES('b','m','origin/proj',?,?)",
+                 (now, now))
+    elif blocker == "busy branch":
+        held = locks.try_take(push.lock_paths(s.p, "origin", "proj"), "someone's ttp push")
+    elif blocker == "detached push":
+        held = locks.try_take([s.p.state / "locks" / "push:run-123.0.lock"], "a detached ttp push")
+    elif blocker == "backoff":
+        s.p.db.set_kv(pushq.KV, {"backoff_until": now + 60})
+    elif blocker == "other target":
+        s.p.set_config("delivery.push_branch", "origin/other")
+    else:
+        s.p.set_config("delivery.push_allowed", False)
+    try:
+        rows, why = pushq.due(s.p, now)
+        assert rows == [], why
+        assert pushq.schedule(s.p) is None and not s.p.db.q("SELECT id FROM push_batches WHERE id!='b'")
+    finally:
+        if held:
+            held.close()
+    if blocker == "other target":   # approvals for the old target go back to their reviews
+        t = s.p.db.task(rid)
+        assert t["status"] == "queued" and json.loads(t["result"])["woke"].startswith(
+            "push target changed: approved for origin/proj, the target is now origin/other")
+        assert s.p.db.one("SELECT status FROM push_queue WHERE id=?", (row,))["status"] == "cancelled"
+
+
+def test_a_due_batch_starts_one_detached_process_that_holds_its_run_lock(env, monkeypatch):
+    from ttp import locks, pushq
+    s = _pq(env, monkeypatch)
+    release = env["tmp"] / "go"
+    _pq_plan(s, release=str(release), sha="ab" * 20, version="1.2.3")
+    _pq_hand_off(env, s)
+    bid = pushq.schedule(s.p)   # no review is running or ready: due at once
+    assert bid
+    child = pushq._children[bid]
+    marker = s.p.state / "pushes" / f"{bid}.json"
+    m = json.loads(marker.read_text())
+    assert (m["kind"], m["status"], m["phase"], m["target"], m["repo"], m["pid"]) == (
+        "batch", "running", "push", "origin/proj", str(s.p.root), child.pid)
+    [e] = m["entries"]
+    assert (e["task"], e["branch"], e["head"], e["ref"]) == (s.review, s.branch, s.head, f"refs/ttp/push/{e['id']}")
+    assert m["lock"] == str(s.p.state / "locks" / f"push:run-{bid}.0.lock")
+    assert not locks.any_free([pathlib.Path(m["lock"])]), "the batch does not hold its run lock"
+    assert os.getsid(child.pid) == child.pid, "the batch should run in a session of its own"
+    assert s.p.db.one("SELECT status, batch FROM push_queue") == {"status": "batched", "batch": bid}
+    assert s.p.db.one("SELECT target, finalized FROM push_batches") == {"target": "origin/proj", "finalized": None}
+    assert pushq.due(s.p, time.time() + 10 ** 6)[0] == [], "one batch at a time"
+    assert pushq.finalize(s.p) == [] and s.p.db.task(s.review)["status"] == "pushing"
+    release.write_text("")
+    child.wait(timeout=30)
+    assert locks.any_free([pathlib.Path(m["lock"])])
+
+
+def test_a_pushed_batch_closes_the_review_done_without_any_model_run(env, monkeypatch):
+    from ttp import pushq
+    from ttp.daemon import Daemon
+    s = _pq(env, monkeypatch)
+    sha = "ab" * 20
+    _pq_plan(s, outcome="pushed", sha=sha, tip="cd" * 20, version="0.3.1")
+    _pq_hand_off(env, s)
+    mark, runs = _pq_mark(s.p), s.p.db.one("SELECT COUNT(*) n FROM runs")["n"]
+    s.p.db.set_kv("last_coordinator_turn", time.time())   # no idle wake while it runs: that is not the queue's
+    d = Daemon(s.p.base)
+    assert _run_until(d, s.p, lambda: s.p.db.task(s.review)["status"] == "done", timeout=60)
+    assert s.p.db.one("SELECT COUNT(*) n FROM runs")["n"] == runs, "the push cycle started a model run"
+    t = s.p.db.task(s.review)
+    res = json.loads(t["result"])
+    [bid] = [b["id"] for b in s.p.db.q("SELECT id FROM push_batches")]
+    assert res["pushed"] == [{"branch": s.branch, "head": s.head, "sha": sha, "version": "0.3.1", "batch": bid,
+                              "status": "pushed"}]
+    assert res["summary"] == f"looks good (pushed {sha[:7]} as 0.3.1)" and res["status"] == "done"
+    assert s.p.db.one("SELECT status, pushed_sha, version FROM push_queue") == {
+        "status": "pushed", "pushed_sha": sha, "version": "0.3.1"}
+    evs = _pq_events(s.p, mark)
+    assert [e["status"] for e in evs if e["kind"] == "task_done"] == ["handled"]
+    assert not [e for e in evs if e["status"] == "queued"], "a pushed review woke the coordinator"
+    assert subprocess.run(["git", "-C", str(s.repo), "show-ref", "--verify", "--quiet", "refs/ttp/push/1"]).returncode, \
+        "the pin of a pushed row of a finished task stays"
+    state = lambda: (s.p.db.q("SELECT * FROM push_queue"), s.p.db.q("SELECT * FROM push_batches"),  # noqa: E731
+                     s.p.db.q("SELECT id FROM events"), s.p.db.task(s.review))
+    before = state()
+    assert pushq.finalize(s.p) == [] and pushq.tend(s.p) == [] and state() == before, "a second finalize changed things"
+
+
+def test_a_conflicting_push_runs_the_review_again_with_the_conflict_and_what_landed(env, monkeypatch):
+    s = _pq(env, monkeypatch)
+    base, onto, tip = _git_out(s.repo, "rev-parse", f"{s.head}^"), "ef" * 20, "aa" * 20
+    _pq_plan(s, outcome="landed", tip=tip, rows={"base": "landed", s.branch: "conflict"},
+             detail={"files": ["feature.txt"], "onto": onto})
+    _pq_hand_off(env, s, push=[{"branch": "base", "head": base}, {"branch": s.branch, "head": s.head}])
+    mark = _pq_mark(s.p)
+    _pq_batch(s)
+    _pq_tend(s)
+    t = s.p.db.task(s.review)
+    assert t["status"] == "queued" and json.loads(t["result"])["woke"] == (
+        f"push conflict: {s.branch} at {s.head} conflicts with origin/proj at {onto} in feature.txt; "
+        f"already landed: base at {base[:7]} (landed as {tip[:7]})")
+    assert not [e for e in _pq_events(s.p, mark) if e["status"] == "queued"]
+    # The review settles it on a commit it did not review before: allowed, and the event lists it.
+    fix = _git_out(s.repo, "commit-tree", f"{s.head}^{{tree}}", "-p", s.head, "-m", "settle the conflict")
+    t = _pq_hand_off(env, s, push=[{"branch": s.branch, "head": fix}])
+    assert t["status"] == "pushing"
+    [q] = [e for e in _pq_events(s.p, mark) if e["kind"] == "push_queued"]
+    assert "settle the conflict" in q["text"] and q["status"] == "handled"
+
+
+def test_a_failed_push_check_fails_the_review_with_the_command_and_tail(env, monkeypatch):
+    s = _pq(env, monkeypatch)
+    _pq_plan(s, outcome="nothing", row="check_failed", detail={"cmd": "pytest -q", "tail": "1 failed, 2 passed"})
+    _pq_hand_off(env, s)
+    mark = _pq_mark(s.p)
+    _pq_batch(s)
+    _pq_tend(s)
+    t = s.p.db.task(s.review)
+    res = json.loads(t["result"])
+    assert t["status"] == "failed" and res["push_failed"]["cmd"] == "pytest -q"
+    [ev] = [e for e in _pq_events(s.p, mark) if e["status"] == "queued"]
+    assert ev["kind"] == "task_failed" and "pytest -q" in ev["text"] and "1 failed, 2 passed" in ev["text"]
+
+
+def test_a_broken_target_tip_is_reported_once_and_held_until_the_tip_changes(env, monkeypatch):
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    tip = _git_out(s.repo, "rev-parse", "refs/remotes/origin/proj")
+    _pq_plan(s, outcome="tip_failed", tip=tip, row="requeued", detail={"cmd": "make test", "tail": "the tip is red"})
+    _pq_hand_off(env, s)
+    mark = _pq_mark(s.p)
+    for _ in range(2):   # the same tip fails twice: one report
+        _pq_batch(s)
+        _pq_tend(s)
+    assert s.p.db.task(s.review)["status"] == "pushing"
+    assert s.p.db.one("SELECT status FROM push_queue")["status"] == "approved"
+    [ev] = [e for e in _pq_events(s.p, mark) if e["status"] == "queued"]
+    assert ev["kind"] == "push_tip_failed" and "make test" in ev["text"] and "the tip is red" in ev["text"]
+    rows, why = pushq.due(s.p, time.time() + 60)
+    assert rows == [] and "held" in why
+    assert pushq.due(s.p, time.time() + pushq.HOLD_S + 1)[0], "the hold ends after HOLD_S"
+    _commit(s.other, "theirs.txt", "theirs\n")
+    _git_out(s.other, "push", "-q", "origin", "HEAD:proj")
+    _git_out(s.repo, "fetch", "-q", "origin")
+    rows, why = pushq.due(s.p, time.time() + 60)
+    assert rows, f"a new tip should end the hold: {why}"
+    _pq_plan(s, outcome="tip_failed", tip=_git_out(s.repo, "rev-parse", "refs/remotes/origin/proj"), row="requeued",
+             detail={"cmd": "make test", "tail": "still red"})
+    _pq_batch(s)
+    _pq_tend(s)
+    assert [e["kind"] for e in _pq_events(s.p, mark) if e["status"] == "queued"] == ["push_tip_failed"] * 2
+
+
+@pytest.mark.parametrize("outcome, tries", [("moved", 1), ("busy", 0)])
+def test_a_batch_that_could_not_push_puts_its_approvals_back_without_a_model_run(env, monkeypatch, outcome, tries):
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    _pq_plan(s, outcome=outcome, row="requeued")
+    _pq_hand_off(env, s)
+    mark = _pq_mark(s.p)
+    _pq_batch(s)
+    _pq_tend(s)
+    assert s.p.db.one("SELECT status, tries FROM push_queue") == {"status": "approved", "tries": tries}
+    assert s.p.db.task(s.review)["status"] == "pushing"
+    assert not [e for e in _pq_events(s.p, mark) if e["status"] == "queued"]
+    assert s.p.db.one("SELECT COUNT(*) n FROM runs")["n"] == 0
+    assert pushq.due(s.p, time.time() + 10 ** 6)[0], "it goes out with the next batch"
+
+
+def test_dead_batches_retry_with_a_growing_pause_and_three_in_a_row_raise_an_alert(env, monkeypatch):
+    from ttp import alerts, pushq
+    s = _pq(env, monkeypatch)
+    _pq_plan(s, die="push")
+    _pq_hand_off(env, s)
+    mark = _pq_mark(s.p)
+    for n in (1, 2, 3):
+        before = time.time()
+        _pq_batch(s)
+        _pq_tend(s)
+        assert s.p.db.one("SELECT status, tries FROM push_queue") == {"status": "approved", "tries": n}
+        st = s.p.db.kv(pushq.KV)
+        assert st["deaths"] == n and st["backoff_until"] >= before + min(1800, 300 * n)
+        assert pushq.due(s.p, time.time())[0] == []
+        sent = s.p.db.q("SELECT severity FROM messages WHERE kind='alert' AND ref='push_queue_dying'")
+        assert len(sent) == (1 if n == 3 else 0)
+    assert [b["outcome"] for b in s.p.db.q("SELECT outcome FROM push_batches")] == ["died"] * 3
+    assert not [e for e in _pq_events(s.p, mark) if e["status"] == "queued"]
+    assert s.p.db.task(s.review)["status"] == "pushing" and s.p.db.one("SELECT COUNT(*) n FROM runs")["n"] == 0
+    assert alerts.holds(s.p.db, "push_queue_dying", before, time.time())
+    _pq_plan(s, outcome="pushed", sha="ab" * 20)
+    _pq_batch(s)
+    _pq_tend(s)
+    assert s.p.db.task(s.review)["status"] == "done"
+    assert [ep["key"] for ep in alerts.sweep(s.p.db)] == ["push_queue_dying"], "a finished batch clears the alert"
+
+
+def test_a_daemon_restart_mid_batch_finalizes_from_the_marker(env, monkeypatch):
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    release = env["tmp"] / "go"
+    _pq_plan(s, release=str(release), outcome="pushed", sha="ab" * 20, version="1.0.1")
+    _pq_hand_off(env, s)
+    bid = _pq_batch(s, wait=False)
+    _pq_tend(s)
+    assert s.p.db.task(s.review)["status"] == "pushing"
+    child = pushq._children.pop(bid)   # the daemon that started it is gone
+    release.write_text("")
+    child.wait(timeout=30)
+    _pq_tend(s)                        # a new daemon reads the marker
+    t = s.p.db.task(s.review)
+    assert t["status"] == "done" and json.loads(t["result"])["pushed"][0]["version"] == "1.0.1"
+
+
+def test_after_push_failures_are_reported_and_a_deploy_cut_short_runs_once_more(env, monkeypatch):
+    from ttp import alerts
+    s = _pq(env, monkeypatch, after_push="./deploy.sh")
+    _pq_plan(s, outcome="pushed", sha="ab" * 20, after="failed")
+    _pq_hand_off(env, s)
+    mark = _pq_mark(s.p)
+    _pq_batch(s)
+    _pq_tend(s)
+    assert s.p.db.task(s.review)["status"] == "done", "the review stays done whatever the deploy does"
+    assert s.p.db.one("SELECT after_push FROM push_batches")["after_push"] == "failed"
+    [ev] = [e for e in _pq_events(s.p, mark) if e["status"] == "queued"]
+    assert ev["kind"] == "after_push_failed" and "deploy said failed" in ev["text"]
+    assert s.p.db.one("SELECT severity FROM messages WHERE kind='alert' AND ref='after_push_failed'")["severity"] == "high"
+    # Cut short (a reboot) and cut short again when run once more: recorded as killed.
+    rid, _ = _pq_review(s)
+    _pq_plan(s, outcome="pushed", sha="cd" * 20, after="ok", die="after", die_resume=True)
+    bid = _pq_batch(s)
+    _pq_tend(s)   # applies the outcome and runs the after_push step once more
+    assert s.p.db.task(rid)["status"] == "done"
+    from ttp import pushq
+    pushq._children[bid].wait(timeout=30)
+    _pq_tend(s)
+    assert s.p.db.one("SELECT after_push, after_tries FROM push_batches WHERE id=?", (bid,)) == {
+        "after_push": "killed", "after_tries": 1}
+    assert (s.p.state / "pushes" / f"{bid}.starts").read_text().split() == ["push", "after_push"]
+    assert [e["kind"] for e in _pq_events(s.p, mark) if e["status"] == "queued"] == ["after_push_failed"] * 2
+    # Cut short once, then it works: one handled event, and the alert clears.
+    rid, _ = _pq_review(s)
+    _pq_plan(s, outcome="pushed", sha="ef" * 20, after="ok", die="after", resume_after="ok")
+    bid = _pq_batch(s)
+    _pq_tend(s)
+    pushq._children[bid].wait(timeout=30)
+    _pq_tend(s)
+    assert s.p.db.one("SELECT after_push FROM push_batches WHERE id=?", (bid,))["after_push"] == "ok"
+    assert [e["status"] for e in _pq_events(s.p, mark) if e["kind"] == "after_push_ok"] == ["handled"]
+    assert "after_push_failed" in [ep["key"] for ep in alerts.sweep(s.p.db)]
+
+
+def test_cancelling_or_requeueing_a_pushing_review_withdraws_its_approval(env, monkeypatch):
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    _pq_hand_off(env, s)
+    s.p.db.update_task(s.review, status="cancelled")
+    mark = _pq_mark(s.p)
+    _pq_tend(s)
+    assert s.p.db.one("SELECT status FROM push_queue")["status"] == "cancelled"
+    assert [(e["kind"], e["status"]) for e in _pq_events(s.p, mark)] == [("push_cancelled", "handled")]
+    assert pushq.schedule(s.p) is None
+    # A row already in a batch is not withdrawn: the batch reports it.
+    rid, row = _pq_review(s)
+    release = env["tmp"] / "go"
+    _pq_plan(s, release=str(release), outcome="pushed", sha="ab" * 20)
+    bid = _pq_batch(s, wait=False)
+    s.p.db.update_task(rid, status="queued")
+    _pq_tend(s)
+    assert s.p.db.one("SELECT status FROM push_queue WHERE id=?", (row,))["status"] == "batched"
+    release.write_text("")
+    pushq._children[bid].wait(timeout=30)
+    _pq_tend(s)
+    assert s.p.db.task(rid)["status"] == "queued"
+    [ev] = [e for e in _pq_events(s.p, mark) if e["kind"] == "push_reported"]
+    assert ev["status"] == "queued" and "pushed" in ev["text"], "work that landed for a requeued review is news"
+
+
+def test_turning_the_queue_off_sends_waiting_reviews_back_to_push_themselves(env, monkeypatch):
+    s = _pq(env, monkeypatch)
+    _pq_hand_off(env, s)
+    s.p.set_config("delivery.push_queue", False)
+    _pq_tend(s)
+    t = s.p.db.task(s.review)
+    assert t["status"] == "queued" and json.loads(t["result"])["woke"] == "push queue turned off: push with ttp push"
+    assert s.p.db.one("SELECT status FROM push_queue")["status"] == "cancelled"
 
 
 def _lost_deep_runs(p, tmp_path, boot, costs=(24.0, 29.0), handoff=None):
