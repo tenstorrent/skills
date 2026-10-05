@@ -1579,6 +1579,23 @@ CHARTER_LINT_KEY = "charter_lint"   # kv: {"stat", "hash"} of the charter last l
 _DATE_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
 # A Restrictions item that already points at the section holding its exception has been reconciled.
 _POINTS_AT_EXCEPTION_RE = re.compile(r"\b(except|unless)\b.*\bsections?\b", re.I)
+# What makes a Restrictions item a limit; an item without one (a note, a record) forbids nothing.
+_PROHIBITS_RE = re.compile(r"\b(never|no|not|only|must|always|keep|stay|avoid|without|forbid\w*|prohibit\w*)\b|n't\b", re.I)
+# A limiting word in a clause of a later sentence ("broker only", "never directly").
+_LIMIT_RE = re.compile(r"\b(never|only|not|no(?! longer\b))\b|n't\b", re.I)
+
+
+def _restates_limit(item: str, sentence: str) -> bool:
+    """Whether a loosening sentence keeps the item's own limit instead of widening it: one of its
+    clauses carries a limiting word next to a word the item is about ("X (broker only)"), or it
+    allows something within what the item's "only ..." still permits ("jobs may queue through each
+    broker" against "jobs only through each broker")."""
+    about = _rule_words(item)
+    if any(_LIMIT_RE.search(c) and _rule_words(c) & about for c in re.split(r"[,;:()]", sentence)):
+        return True
+    m = re.search(r"\bonly\b([^,;:()]*)", item, re.I)
+    limit = _rule_words(m.group(1)) if m else set()
+    return bool(limit) and 2 * len(limit & _rule_words(sentence)) >= len(limit)
 
 
 def charter_lint(p: Project) -> list[str]:
@@ -1587,7 +1604,9 @@ def charter_lint(p: Project) -> list[str]:
     earlier Restrictions item is about, while that item still stands. Workers obey the item as
     binding, so the later section does nothing. _restriction_conflicts catches this only when a
     coordinator charter_update adds the text in a user turn; a section edited in by hand, or added
-    before that check, is caught here. Same wording rule. One queued charter_conflict event per
+    before that check, is caught here. Same wording rule, made stricter: items that limit nothing,
+    items dated after the section, Resources sections and sentences that keep the item's own limit
+    are left alone. One queued charter_conflict event per
     (item, section) pair ever; the charter is never edited. No model. Returns the new warnings."""
     from .prompts import charter_sections
     path = p.charter_path
@@ -1606,21 +1625,26 @@ def charter_lint(p: Project) -> list[str]:
         p.db.set_kv(CHARTER_LINT_KEY, state)
         return []
     seen = set(state.get("seen") or [])
-    items: list[str] = []   # Restrictions items above the current section
+    items: list[tuple[str, str]] = []   # (item, latest date on it or its heading): Restrictions above this section
     out = []
     for heading, body in charter_sections(text):
         name = heading[3:].strip()
         if name.lower().startswith("restriction"):
-            items += [x for x in _sentences(body) if not (x.startswith("(") and x.endswith(")"))]
+            items += [(x, max(_DATE_RE.findall(f"{name} {x}"), default="")) for x in _sentences(body)
+                      if not (x.startswith("(") and x.endswith(")")) and _PROHIBITS_RE.search(x)]
             continue
-        if not heading or not items or not _DATE_RE.search(name):
+        # A Resources section lists what may be used, under the restrictions' own terms.
+        dated = max(_DATE_RE.findall(name), default="")
+        if not heading or not items or not dated or name.lower().startswith("resource"):
             continue
         for sentence in _sentences(body):
             if not _LOOSEN_RE.search(sentence):
                 continue
             words = _rule_words(sentence)
-            for item in items:
-                if _POINTS_AT_EXCEPTION_RE.search(item) or not _widens(item, words):
+            for item, since in items:
+                # An item dated after the section is the newer word, whatever the file order.
+                if (since > dated or _POINTS_AT_EXCEPTION_RE.search(item) or not _widens(item, words)
+                        or _restates_limit(item, sentence)):
                     continue
                 key = hashlib.sha256(f"{' '.join(item.split())}\n{' '.join(name.split())}".encode()).hexdigest()[:16]
                 if key in seen:

@@ -3448,6 +3448,30 @@ def test_charter_lint_flags_a_dated_section_that_contradicts_a_restriction(env):
     assert len(conflicts()) == 1 and "Never delete release tags" in conflicts()[0]
 
 
+def test_charter_lint_leaves_sections_that_keep_a_restrictions_limit(env):
+    p = make(env)
+    from ttp import coordinator as coord
+
+    def conflicts():
+        return [r["text"] for r in p.db.q("SELECT text FROM events WHERE kind='charter_conflict'")]
+
+    # A permission inside the item's own "only", a Resources line restating its qualifiers, and an
+    # older dated line against a newer dated item (file order is not time order): no event.
+    charter = ("# demo\n\n## Restrictions (binding on every task)\n- Device jobs only through each machine's broker.\n"
+               "- Keep disk lean on box-b: no large builds there.\n- The user lifted no-device mode on 2026-01-09.\n"
+               "\n## Policies (added 2026-01-04, turn 7.0)\nDevice test jobs may queue through each broker alongside "
+               "other work.\nbox-a stays in no-device mode until the user lifts it, and device jobs may wait.\n"
+               "\n## Resources (added 2026-01-05, turn 8.0)\nMachines this project may use: box-a (broker only), "
+               "box-b (broker only, disk lean).\n")
+    p.charter_path.write_text(charter)
+    assert coord.charter_lint(p) == [] and conflicts() == []
+    # (a) still holds next to them: a later dated section that widens a standing item.
+    p.charter_path.write_text(charter.replace("- Keep disk", "- Never push to main.\n- Keep disk")
+                              + "\n## Hotfixes (user, 2026-01-06)\nPushing to main is now allowed for hotfixes.\n")
+    found = coord.charter_lint(p)
+    assert len(found) == 1 and "Never push to main" in found[0] and conflicts() == found, found
+
+
 RESTR_CHARTER = ("# demo\n\n## Restrictions (binding on every task)\n- Never push to the main branch.\n"
                  "- Never merge.\n\n## Goals\nShip v1.\n\n## Restrictions (added 2026-10-01, turn 3.0)\n"
                  "Keep the docs generic.\n\n## Restrictions (added 2026-10-02, turn 5.0)\n"
