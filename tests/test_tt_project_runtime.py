@@ -14304,6 +14304,19 @@ def test_check_objects_are_validated_kept_in_config_and_plain_strings_stay_stric
     assert p.config()["delivery"]["push_checks"] == ["true", COND]
 
 
+def test_if_exists_with_a_trailing_slash_or_leading_dot_slash_still_matches(tmp_path):
+    from ttp import push
+    import subprocess
+    repo = tmp_path / "r"
+    (repo / "tests").mkdir(parents=True)
+    (repo / "tests" / "a.sh").write_text("true\n")
+    for cmd in (["init", "-q"], ["add", "."], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x"]):
+        subprocess.run(["git", *cmd], cwd=repo, check=True)
+    checks = push.check_list([{"run": "true", "if_exists": "tests/"}, {"run": "true", "if_exists": "./tests/a.sh"}])
+    assert [c.if_exists for c in checks] == ["tests", "tests/a.sh"]
+    assert [push.skip_reason(repo, "HEAD", c) for c in checks] == [None, None]
+
+
 def test_push_skips_only_an_opted_in_check_whose_file_is_absent_and_reports_it(env, monkeypatch, capsys):
     p, repo, origin, other = _push_setup(env, monkeypatch, ["true", COND])
     _commit(repo, "mine.txt", "mine\n")

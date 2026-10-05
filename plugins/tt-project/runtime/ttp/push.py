@@ -92,7 +92,9 @@ def _check(c: Any) -> Check | None:
 
 
 def _if_exists(c: dict) -> str:
-    return str(c.get("if_exists") or "").strip() if isinstance(c.get("if_exists"), str) else ""
+    """The check's `if_exists`, normalized so 'tests/' and './tests/a.sh' match ls-tree paths."""
+    p = str(c.get("if_exists") or "").strip() if isinstance(c.get("if_exists"), str) else ""
+    return posixpath.normpath(p) if p else ""
 
 
 def check_list(v: Any) -> list[Check]:
