@@ -1363,7 +1363,7 @@ def _charter_update(p: Project, section: str, text: str, quote: str, replaces: s
     retried = bool(key) and _has_line(hist, f", turn {key})")
     flat = " ".join(" ".join(line for h, b in sections for line in [h, *b]).split())
     if retried and (" ".join(text.split()) in flat if text else not _charter_quoted(sections, section, quote)
-                    if quote else not _charter_replaced(sections, replaces, quiet=True)):
+                    if quote else _charter_replaced(sections, replaces, quiet=True) is None):
         return section, "", ""
     extra, retired = "", ""
     by_word = user_turn or len(over) >= OVER_MIN
@@ -1391,10 +1391,10 @@ def _charter_update(p: Project, section: str, text: str, quote: str, replaces: s
         if t is None:
             raise ValueError(f"charter_update: no charter section {section!r} to remove or replace an item in; "
                              f"sections: " + "; ".join(n for n in names if n))
+        t, hits = _charter_quote_spot(sections, t, section, quote)
         if names[t].lower().startswith("restriction") and not by_word:
             raise ValueError(f"charter_update: removing or replacing a restriction {why}")
         body = "\n".join(sections[t][1])
-        hits = _quote_hits(body, quote)
         if len(hits) != 1:
             raise ValueError(f"charter_update: `quote` matches {len(hits)} times in {names[t]!r}; quote the exact "
                              f"text of one item, long enough to be unique there")
@@ -1472,7 +1472,7 @@ def _charter_target(names: list[str], section: str, ends_of: list[dict] | None =
     if exact:
         return exact[0]
     base = _DATED.sub("", want)
-    hits = [i for i, n in enumerate(names) if n and (re.sub(r"\s*\([^)]*\)$", "", n).lower() == base
+    hits = [i for i, n in enumerate(names) if n and (_base_heading(n) == base
                                                     or n.lower().startswith(base + " "))]
     undated = [i for i in hits if not _DATED.search(names[i])]
     return (undated or hits or [None])[0]
@@ -1481,12 +1481,51 @@ def _charter_target(names: list[str], section: str, ends_of: list[dict] | None =
 def _charter_quoted(sections: list[tuple[str, list[str]]], section: str, quote: str) -> bool:
     """Whether `quote` still matches exactly once in the section an update to `section` edits."""
     t = _charter_target([" ".join(h[3:].split()) for h, _ in sections], section)
-    return bool(quote) and t is not None and len(_quote_hits("\n".join(sections[t][1]), quote)) == 1
+    if not quote or t is None:
+        return False
+    try:
+        return len(_charter_quote_spot(sections, t, section, quote)[1]) == 1
+    except ValueError:   # in several legacy sections: still there
+        return True
+
+
+def _base_heading(name: str) -> str:
+    """A heading without its trailing parenthesised note, lower case: "Restrictions (added ...)" -> "restrictions"."""
+    return re.sub(r"\s*\([^)]*\)$", "", name).lower()
+
+
+def _charter_quote_spot(sections: list[tuple[str, list[str]]], t: int, section: str,
+                        quote: str) -> tuple[int, list[re.Match]]:
+    """The section a `quote` edit goes to, and where `quote` matches in it: section `t`, unless it
+    matches nowhere there; then the one other section with the same base heading (a legacy
+    "(added ...)" duplicate) holding its only match. Raises when it matches in several of those."""
+    hits = _quote_hits("\n".join(sections[t][1]), quote)
+    if hits:
+        return t, hits
+    names = [" ".join(h[3:].split()) for h, _ in sections]
+    bases = {_base_heading(names[t]), _base_heading(section)}
+    found = [(i, h) for i, n in enumerate(names) if i != t and n and _base_heading(n) in bases
+             for h in [_quote_hits("\n".join(sections[i][1]), quote)] if h]
+    if len(found) == 1 and len(found[0][1]) == 1:
+        return found[0]
+    if found:
+        raise ValueError(f"charter_update: `quote` matches 0 times in {names[t]!r} but in "
+                         + ", ".join(f"{names[i]!r} ({len(h)} times)" for i, h in found)
+                         + "; give that section's full heading as `section`, and quote one item long enough "
+                           "to be unique there")
+    return t, hits
 
 
 def _quote_hits(body: str, quote: str) -> list[re.Match]:
-    """Where `quote` occurs in `body`, line breaks and runs of spaces counting as one space."""
-    return list(re.finditer(r"\s+".join(map(re.escape, quote.split())), body)) if quote.split() else []
+    """Where `quote` occurs in `body`, line breaks and runs of spaces counting as one space. A quote
+    that starts or ends with a letter or digit matches only whole words there ("ever merge." does
+    not match inside "Never merge.")."""
+    words = quote.split()
+    if not words:
+        return []
+    pat = r"\s+".join(map(re.escape, words))
+    pat = (r"(?<!\w)" if re.match(r"\w", words[0]) else "") + pat + (r"(?!\w)" if re.search(r"\w$", words[-1]) else "")
+    return list(re.finditer(pat, body))
 
 
 def _cut(body: str, s: int, e: int, text: str) -> str:

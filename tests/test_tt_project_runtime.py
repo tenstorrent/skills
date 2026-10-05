@@ -2427,11 +2427,67 @@ def test_charter_update_quote_removes_or_replaces_one_item(env):
     # Not found, or ambiguous: rejected and nothing changes.
     before = p.charter_path.read_text()
     assert "matches 0 times" in coord.apply(p, [{**act, "quote": "Ship v1."}], turn=5)[0]
-    err = coord.apply(p, [{**act, "quote": "e"}], turn=6)[0]
+    err = coord.apply(p, [{**act, "quote": "."}], turn=6)[0]
     assert "`quote` matches" in err and "matches 0" not in err and "matches 1 " not in err
     assert "no charter section" in coord.apply(p, [{**act, "section": "Resources", "quote": "x"}], turn=7)[0]
     assert "Brief" in coord.apply(p, [{**act, "section": "Brief", "quote": "Keep it tidy."}], turn=8)[0]
     assert p.charter_path.read_text() == before
+
+
+def test_charter_update_quote_matches_whole_words_only(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    p.charter_path.write_text("# demo\n\n## Policies\nNever merge.\nPush daily.\n")
+    before = p.charter_path.read_text()
+    act = {"type": "charter_update", "section": "Policies", "quote": "ever merge."}
+    assert "matches 0 times" in coord.apply(p, [act], turn=1)[0]
+    assert "matches 0 times" in coord.apply(p, [{**act, "text": "Always merge."}], turn=2)[0]
+    assert "matches 0 times" in coord.apply(p, [{**act, "quote": "Push dail"}], turn=3)[0]
+    assert p.charter_path.read_text() == before, "a quote inside a word was cut"
+    assert coord.apply(p, [{**act, "quote": "Never merge", "text": "Never merge to main"}], turn=4) == []
+    assert "## Policies\nNever merge to main.\nPush daily.\n" in p.charter_path.read_text()
+
+
+def test_charter_update_quote_finds_its_item_in_a_legacy_dated_section(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    p.charter_path.write_text("# demo\n\n## Policies\nBe kind.\n\n"
+                              "## Policies (added 2026-09-01)\n- Push daily.\n- Tag it.\n\n"
+                              "## Policies (added 2026-09-02, turn 4.0)\nPush daily at noon.\nTag it.\n\n"
+                              "## Restrictions (binding on every task)\nNever merge.\n\n"
+                              "## Restrictions (added 2026-09-03)\nNever touch box A.\n")
+    hist = p.harness / coord.CHARTER_HISTORY
+    act = {"type": "charter_update", "section": "Policies", "quote": "Push daily at noon."}
+    for _ in range(2):   # a retried turn finds it gone and changes nothing more
+        assert coord.apply(p, [act], turn=1) == []
+    charter = p.charter_path.read_text()
+    assert "Push daily at noon." not in charter and "\n- Push daily.\n" in charter
+    assert hist.read_text().count("### Removed from Policies (added 2026-09-02, turn 4.0) (") == 1
+    # In several legacy sections: rejected, naming them.
+    err = coord.apply(p, [{**act, "quote": "Tag it."}], turn=2)[0]
+    assert "'Policies (added 2026-09-01)' (1 times)" in err and "'Policies (added 2026-09-02, turn 4.0)'" in err
+    assert p.charter_path.read_text() == charter
+    # The restriction check applies to the section edited.
+    drop = {"type": "charter_update", "section": "Restrictions", "quote": "Never touch box A."}
+    assert "needs the user's word" in coord.apply(p, [drop], turn=3)[0]
+    assert coord.apply(p, [drop], turn=5, user_turn=True) == []
+    charter = p.charter_path.read_text()
+    assert "Never touch box A." not in charter and "Never merge." in charter
+    assert "### Removed from Restrictions (added 2026-09-03) (" in hist.read_text()
+
+
+def test_charter_update_retried_turn_still_retires_the_first_section(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    legacy = "## Policies (added 2026-09-01)\nPush daily.\n\n## Goals\nShip v1.\n"
+    p.charter_path.write_text(legacy)
+    act = {"type": "charter_update", "replaces": "Policies (added 2026-09-01)"}
+    assert coord.apply(p, [act], turn=1) == []
+    assert "Push daily." not in p.charter_path.read_text()
+    p.charter_path.write_text(legacy)   # the first try logged its history but died before writing the charter
+    assert coord.apply(p, [act], turn=1) == []
+    assert p.charter_path.read_text() == "## Goals\nShip v1.\n", "the retry took index 0 as already replaced"
+    assert (p.harness / coord.CHARTER_HISTORY).read_text().count("Push daily.") == 1
 
 
 def test_charter_update_restriction_items_change_only_on_the_users_word(env, tmp_path):
