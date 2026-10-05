@@ -2184,8 +2184,12 @@ class Daemon:
                     db.update_task(task["id"], blocked_reason=held)
                 continue
             if self.net_held(provider) and not self._net_may_probe(provider):
-                continue   # its API host does not resolve: the task waits, attempts untouched
-            if note.startswith((PAUSED_NOTE, LOGGED_OUT_NOTE)):
+                # Its API host does not resolve: the task waits, attempts untouched.
+                held = f"{NET_HELD_NOTE} waiting for {provider}'s API host to resolve"
+                if note != held and (not note or note.startswith(NET_HELD_NOTE)):
+                    db.update_task(task["id"], blocked_reason=held)
+                continue
+            if note.startswith((PAUSED_NOTE, LOGGED_OUT_NOTE, NET_HELD_NOTE)):
                 db.update_task(task["id"], blocked_reason=None)
             gate = self.gates.get(provider) or bud.evaluate(db, self.cfg, provider, bud.plan_windows(db))
             if not gate.allow_new_work or busy.get(provider, 0) >= gate.max_parallel:
@@ -3472,6 +3476,7 @@ def _detached_jobs(run_dir: Path) -> list[dict]:
 
 PAUSED_NOTE = "waits for a paused resource:"
 LOGGED_OUT_NOTE = "held: logged out"
+NET_HELD_NOTE = "held: network,"
 LOGIN_CHECK_PASSED = "its login check passed"
 
 

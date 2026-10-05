@@ -21077,6 +21077,30 @@ def test_dispatch_holds_only_the_offline_provider(env, net, monkeypatch):
     assert p.db.task(held)["status"] == "queued" and p.db.task(free)["status"] == "running"
 
 
+def test_a_net_hold_says_why_and_clears_when_it_ends(env, net, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dm
+    d = dm.Daemon(p.base)
+    held = p.db.add_task("on the held provider", "s", kind="work", tier="light", origin="user")
+    other = p.db.add_task("held for another reason", "s", kind="work", tier="light", origin="user")
+    p.db.x("UPDATE tasks SET provider='claude' WHERE id IN (?,?)", (held, other))
+    p.db.update_task(other, blocked_reason="something else")
+    d._net_holds["claude"] = {"host": "api.anthropic.com", "since": time.monotonic(), "checked": time.monotonic(),
+                              "checking": False, "up": False, "probe": None}
+    monkeypatch.setattr(d, "start_run", lambda *a, **k: 1)
+    monkeypatch.setattr(d, "_resources_free", lambda *a, **k: False)   # nothing starts after the hold
+    d.update_gates()
+    d.dispatch()
+    t = p.db.task(held)
+    assert t["status"] == "queued" and int(t["attempts"] or 0) == 0
+    assert t["blocked_reason"] == "held: network, waiting for claude's API host to resolve"
+    assert p.db.task(other)["blocked_reason"] == "something else"
+    d._net_holds.pop("claude")
+    d.dispatch()
+    assert p.db.task(held)["blocked_reason"] is None and p.db.task(held)["status"] == "queued"
+    assert p.db.task(other)["blocked_reason"] == "something else"
+
+
 def test_a_proxied_host_is_never_held(env, net, monkeypatch):
     p = make(env)
     from ttp.daemon import Daemon
