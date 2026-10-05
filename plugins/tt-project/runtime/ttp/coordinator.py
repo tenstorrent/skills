@@ -1533,6 +1533,18 @@ def _rule_words(text: str) -> set[str]:
             if len(w) >= 4 and w not in _RULE_STOP}
 
 
+def _widens(item: str, words: set[str]) -> bool:
+    """Whether a loosening sentence with these rule words is about the restriction `item`: they share
+    at least two words, and at least half of the item's."""
+    about = _rule_words(item)
+    shared = about & words
+    return len(shared) >= 2 and 2 * len(shared) >= len(about)
+
+
+def _sentences(lines) -> list[str]:
+    return [x.strip(" -*") for line in lines for x in re.split(r"(?<=[.;!?])\s+", line.strip()) if x.strip(" -*")]
+
+
 def _restriction_conflicts(p: Project, before: str, added: list[tuple[str, str]]) -> list[str]:
     """Warn when a user turn added text that allows or narrows what an older restriction is about
     while no charter_update in it edited Restrictions (`quote` or `replaces`): the old item still
@@ -1543,17 +1555,14 @@ def _restriction_conflicts(p: Project, before: str, added: list[tuple[str, str]]
     changes nothing: no warning. Returns the warnings."""
     from .prompts import charter_restrictions
     now = " ".join(charter_restrictions(p.charter_path.read_text()).split())
-    olds = [x.strip(" -*") for line in before.splitlines()
-            for x in re.split(r"(?<=[.;!?])\s+", line.strip()) if x.strip(" -*")]
+    olds = _sentences(before.splitlines())
     out = []
     for target, text in added:
         if not _LOOSEN_RE.search(text):
             continue
         words = _rule_words(text)
         for old in olds:
-            about = _rule_words(old)
-            shared = about & words
-            if len(shared) >= 2 and 2 * len(shared) >= len(about) and " ".join(old.split()) in now:
+            if _widens(old, words) and " ".join(old.split()) in now:
                 out.append(f"The user's turn added to {target!r}: \"{clip(text, 200)}\", but the Restrictions "
                            f"item \"{clip(old, 200)}\" still stands unchanged, and workers obey it as binding. "
                            f"If the user changed that restriction, charter_update section Restrictions with "
@@ -1563,6 +1572,70 @@ def _restriction_conflicts(p: Project, before: str, added: list[tuple[str, str]]
     for x in out:
         p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
                (time.time(), "harness", "charter_conflict", "normal", x, "queued"))
+    return out
+
+
+CHARTER_LINT_KEY = "charter_lint"   # kv: {"stat", "hash"} of the charter last linted, "seen" pair keys flagged
+_DATE_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
+# A Restrictions item that already points at the section holding its exception has been reconciled.
+_POINTS_AT_EXCEPTION_RE = re.compile(r"\b(except|unless)\b.*\bsections?\b", re.I)
+
+
+def charter_lint(p: Project) -> list[str]:
+    """Whole-charter check, run on the daemon tick whenever the charter's hash changes: a dated
+    `## ...` section (heading with a date, e.g. "(user, 2026-01-02)") that allows or narrows what an
+    earlier Restrictions item is about, while that item still stands. Workers obey the item as
+    binding, so the later section does nothing. _restriction_conflicts catches this only when a
+    coordinator charter_update adds the text in a user turn; a section edited in by hand, or added
+    before that check, is caught here. Same wording rule. One queued charter_conflict event per
+    (item, section) pair ever; the charter is never edited. No model. Returns the new warnings."""
+    from .prompts import charter_sections
+    path = p.charter_path
+    try:
+        st = path.stat()
+    except OSError:
+        return []
+    state = p.db.kv(CHARTER_LINT_KEY) or {}
+    stat = [st.st_mtime_ns, st.st_size]
+    if state.get("stat") == stat:
+        return []
+    text = path.read_text()
+    digest = hashlib.sha256(text.encode()).hexdigest()
+    state["stat"] = stat
+    if state.get("hash") == digest:
+        p.db.set_kv(CHARTER_LINT_KEY, state)
+        return []
+    seen = set(state.get("seen") or [])
+    items: list[str] = []   # Restrictions items above the current section
+    out = []
+    for heading, body in charter_sections(text):
+        name = heading[3:].strip()
+        if name.lower().startswith("restriction"):
+            items += [x for x in _sentences(body) if not (x.startswith("(") and x.endswith(")"))]
+            continue
+        if not heading or not items or not _DATE_RE.search(name):
+            continue
+        for sentence in _sentences(body):
+            if not _LOOSEN_RE.search(sentence):
+                continue
+            words = _rule_words(sentence)
+            for item in items:
+                if _POINTS_AT_EXCEPTION_RE.search(item) or not _widens(item, words):
+                    continue
+                key = hashlib.sha256(f"{' '.join(item.split())}\n{' '.join(name.split())}".encode()).hexdigest()[:16]
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(f"The charter section {name!r} says \"{clip(sentence, 200)}\", but the Restrictions "
+                           f"item \"{clip(item, 200)}\" still stands unchanged, and workers obey it as binding. "
+                           f"If the user changed that restriction, charter_update section Restrictions with "
+                           f"`quote` set to that item and `text` the new wording (it may point at the dated "
+                           f"section for the exception). If both truly hold, leave them.")
+    for x in out:
+        p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+               (time.time(), "harness", "charter_conflict", "normal", x, "queued"))
+    state.update(hash=digest, seen=sorted(seen))
+    p.db.set_kv(CHARTER_LINT_KEY, state)
     return out
 
 

@@ -3404,6 +3404,51 @@ def test_an_appended_section_that_overrides_a_standing_restriction_is_flagged(en
         assert conflicts() == [], acts
 
 
+
+def test_charter_lint_flags_a_dated_section_that_contradicts_a_restriction(env):
+    p = make(env)
+    import os
+    from ttp import coordinator as coord
+
+    def conflicts():
+        return [r["text"] for r in p.db.q("SELECT text FROM events WHERE kind='charter_conflict'")]
+
+    base = ("# demo\n\n## Restrictions (binding on every task)\n- Never push to main.\n- Never merge.\n\n"
+            "## Goals\nShip v1.\n")
+    # (c) An unrelated dated section, a loosening in an undated section and a dated restriction: nothing.
+    p.charter_path.write_text(base + "\n## Web app (user, 2026-01-02)\nThe web app may show spend per task.\n"
+                              "\n## Policies\nPushing to main is allowed for hotfixes.\n"
+                              "\n## Restrictions (added 2026-01-03, turn 4.0)\n- Never delete release tags.\n")
+    assert coord.charter_lint(p) == [] and conflicts() == []
+    # (a) A later dated section that widens a standing item: one event naming both.
+    p.charter_path.write_text(base + "\n## Hotfixes (user, 2026-01-05)\nPushing to main is now allowed for hotfixes.\n")
+    assert len(coord.charter_lint(p)) == 1
+    found = conflicts()
+    assert len(found) == 1 and "Never push to main" in found[0] and "Hotfixes (user, 2026-01-05)" in found[0], found
+    # (b) The same charter again, unchanged or merely touched, or the pair again after an edit elsewhere: no event.
+    assert coord.charter_lint(p) == []
+    os.utime(p.charter_path, ns=(1, 1))
+    assert coord.charter_lint(p) == []
+    p.charter_path.write_text(p.charter_path.read_text() + "\nShip v2 too.\n")
+    assert coord.charter_lint(p) == [] and len(conflicts()) == 1
+    # An item that already points at the section with its exception is reconciled; a dated section
+    # above the Restrictions it would contradict is older than them.
+    p.db.x("DELETE FROM events")
+    p.db.set_kv(coord.CHARTER_LINT_KEY, None)
+    charter = ("# demo\n\n## Hotfixes (user, 2026-01-05)\nPushing to main is allowed for hotfixes.\n"
+               "\n## Restrictions (binding on every task)\n- Never push to main, except as the Hotfixes section allows.\n"
+               "\n## Releases (user, 2026-01-06)\nPushing to main is allowed on release days.\n")
+    p.charter_path.write_text(charter)
+    assert coord.charter_lint(p) == [] and conflicts() == []
+    assert p.charter_path.read_text() == charter, "the lint never edits the charter"
+    # The daemon tick runs it.
+    from ttp.daemon import Daemon
+    p.charter_path.write_text(base.replace("- Never merge.", "- Never delete release tags.")
+                              + "\n## Tags (user, 2026-01-07)\nDeleting release tags is now allowed after review.\n")
+    Daemon(p.base).lint_charter()
+    assert len(conflicts()) == 1 and "Never delete release tags" in conflicts()[0]
+
+
 RESTR_CHARTER = ("# demo\n\n## Restrictions (binding on every task)\n- Never push to the main branch.\n"
                  "- Never merge.\n\n## Goals\nShip v1.\n\n## Restrictions (added 2026-10-01, turn 3.0)\n"
                  "Keep the docs generic.\n\n## Restrictions (added 2026-10-02, turn 5.0)\n"

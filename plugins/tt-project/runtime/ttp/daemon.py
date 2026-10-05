@@ -454,7 +454,8 @@ class Daemon:
             self.jev = Jev(self.cfg, db=self.p.db)
         for step in (self.reap_runs, self.wake_after_reboot, self.meter_running, self.reconcile_tasks, self.tend_pushes,
                      self.prune_worktrees, self.check_local_only, self.check_disk, self.sweep_alerts,
-                     self.check_release, self.sync_shared_pauses, self.check_integrity, self.sync_schedules):
+                     self.check_release, self.sync_shared_pauses, self.check_integrity, self.sync_schedules,
+                     self.lint_charter):
             step()
             self._progress()
         if self.p.db.kv("paused", False):
@@ -2450,6 +2451,14 @@ class Daemon:
         else:
             db.set_kv("disk_low", None)
             log(self.p, f"disk space ok again: {free / 1e9:.1f} GB free under {path}")
+
+    def lint_charter(self) -> None:
+        """Flag dated charter sections that contradict a standing restriction (coord.charter_lint);
+        a stat call per tick, the scan only when the charter changed."""
+        try:
+            coord.charter_lint(self.p)
+        except Exception:
+            log(self.p, "charter lint: " + traceback.format_exc().replace("\n", " | ")[:1000])
 
     def check_integrity(self, start: bool = False) -> None:
         """On the first start of a new boot, check the harness for damage a power cut left and repair
