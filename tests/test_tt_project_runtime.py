@@ -13379,10 +13379,11 @@ def test_projects_that_give_a_shared_resource_different_slot_counts_use_the_smal
         deadline = time.time() + 20
         while time.time() < deadline and not (slot.exists() and slot.read_text()):
             time.sleep(0.05)
-        for e in (env_a, env_b):
-            out = subprocess.run([sys.executable, str(TTP), "lock", "--timeout", "1", "board", "--", "true"],
-                                 env=e, capture_output=True, text=True)
-            assert out.returncode == 75, "a second slot was taken on a board one project allows once"
+        # Both projects try at once: neither may take a second slot.
+        tries = [subprocess.Popen([sys.executable, str(TTP), "lock", "--timeout", "1", "board", "--", "true"],
+                                  env=e, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) for e in (env_a, env_b)]
+        for out in tries:
+            assert out.wait(timeout=60) == 75, "a second slot was taken on a board one project allows once"
         assert not (env["home"] / "locks" / "board" / "board.1.lock").exists()
         assert "projects give different slot counts (demo 2, other 1); all use 1" in status_text(a), status_text(a)
         assert "Shared resource board: projects give different slot counts" in coord.digest(b, {}, [], [])
