@@ -1933,10 +1933,13 @@ def test_newest_listener_claims_chat_before_old_one_exits(env):
     run_env = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost")
     lock = p.state / "listen-c1.pid"
     release = env["home"] / "release-old-listener"
-    # Stands in for an older listener that is slow to shut down: after SIGTERM it exits only once
-    # the test creates the release file, so it is still shutting down however slow the machine is.
+    seen = env["home"] / "lock-at-sigterm"
+    # Stands in for an older listener that is slow to shut down: when SIGTERM arrives it records
+    # what the lock names, then exits only once the test creates the release file, so it is still
+    # shutting down however slow the machine is.
     slow = ("import os,signal,sys,time\n"
             "def stop(*a):\n"
+            f"    open({str(seen)!r}, 'w').write(open({str(lock)!r}).read())\n"
             "    end = time.time() + 60\n"
             f"    while not os.path.exists({str(release)!r}) and time.time() < end:\n"
             "        time.sleep(0.05)\n"
@@ -1961,6 +1964,8 @@ def test_newest_listener_claims_chat_before_old_one_exits(env):
         # It exits only through its SIGTERM handler, so this also shows the new listener stopped it.
         old.wait(timeout=30)
         assert lock.read_text().strip() == str(new.pid)
+        # Ordering, not timing: the lock already named the new listener when the old one was told to stop.
+        assert seen.read_text().strip() == str(new.pid), "the older listener was stopped before the claim"
     finally:
         for proc in (new, old):
             if proc and proc.poll() is None:
