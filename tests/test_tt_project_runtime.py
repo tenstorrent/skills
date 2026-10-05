@@ -644,6 +644,134 @@ def test_jev_out_of_funds_alerts_and_screening_falls_back_to_rules(env):
     assert p.db.one("SELECT COUNT(*) n FROM events WHERE kind='observation' AND source='log:app'")["n"] == 1
 
 
+def test_effort_rules_start_short_lookups_light_and_everything_else_standard(env):
+    from ttp.effort import rules_tier
+    assert rules_tier({"kind": "question", "title": "Which boxes run the old broker?", "spec": "List them."}) == "light"
+    assert rules_tier({"kind": "work", "title": "Check the queue status", "spec": "Report its length."}) == "light"
+    assert rules_tier({"kind": "work", "title": "Check the queue and fix it", "spec": ""}) == "standard"
+    assert rules_tier({"kind": "work", "title": "Tidy notes", "spec": "Merge the two notes."}) == "standard"
+    assert rules_tier({"kind": "code", "title": "What breaks?", "spec": "x"}) == "standard"
+    assert rules_tier({"kind": "question", "title": "Why?", "spec": "x" * 900}) == "standard"
+
+
+class _EffortJev:
+    def __init__(self, score, cost=0.0002):
+        self.score, self.last_cost, self.calls = score, cost, 0
+
+    def enabled(self):
+        return True
+
+    def decide(self, state, questions, purpose="decide", timeout=20.0):
+        self.calls += 1
+        assert purpose == "effort" and "effort" in questions
+        return {"effort": {"score": self.score}}
+
+
+def test_jev_picks_effort_once_logs_it_with_the_run_and_deep_comes_only_on_a_retry(env, monkeypatch):
+    p = make(env)
+    from ttp import jevuse
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage as Usage
+    now = time.time()
+    for effort, cost in (("high", 3.0), ("high", 5.0), ("low", 1.0)):   # measured worker runs per tier
+        p.db.x("INSERT INTO runs(role,provider,model,effort,status,started,ended,cost_usd) "
+               "VALUES('worker','claude','opus',?,'ok',?,?,?)", (effort, now - 3600, now - 3500, cost))
+    d = Daemon(p.base)
+    d.jev = _EffortJev(0.2)
+    monkeypatch.setattr(d, "_workdir_for", lambda t: (str(p.base), None))
+    started = []
+    monkeypatch.setattr(d, "start_run", lambda *a, **k: started.append((a, k)) or 0)
+    q = p.db.add_task("Which boxes run the old broker?", "List them.", kind="question", tier="standard",
+                      origin="coordinator", provider="claude", budget_usd=8.0)
+    d.dispatch()
+    (args, kw), = started
+    assert args[3] == "light" and p.db.task(q)["tier"] == "light"
+    assert kw["note"]["pick"] == {"tier": "light", "by": "jev", "score": 0.2, "jev_call": kw["note"]["pick"]["jev_call"],
+                                  "from": "standard", "review": False}
+    row = p.db.one("SELECT * FROM jev_calls")
+    assert row["use"] == "effort" and row["ref"] == f"task:{q}" and row["avoided_usd"] == pytest.approx(3.0)
+    assert json.loads(row["decision"]) == {"effort": "light", "review": False, "spec_len": 10, "score": 0.2}
+    # Done on its first try: the pick was right.
+    run_dir = env["tmp"] / "run-q"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps({"status": "done", "summary": "two boxes"}))
+    d._finish_worker({"task": q}, Usage(cost_usd=0.5), "ok", run_dir)
+    assert p.db.one("SELECT outcome FROM jev_calls")["outcome"] == "right"
+    assert "task effort picking [effort]: 1 calls" in jevuse.lines(p.db, p.config())[0]
+
+    # A hard task: Jev never starts it at deep; it runs at standard and keeps its review.
+    d.jev = _EffortJev(2.9)
+    c = p.db.add_task("Redesign the scheduler", "Make it fair.", kind="code", tier="standard", origin="coordinator",
+                      provider="claude", budget_usd=8.0)
+    started.clear()
+    d.dispatch()
+    (args, kw), = started
+    assert args[3] == "standard" and kw["note"]["pick"]["review"] is True and kw["note"]["pick"]["by"] == "jev"
+    assert p.db.one("SELECT avoided_usd FROM jev_calls WHERE ref=?", (f"task:{c}",))["avoided_usd"] == 0
+    # Its run ends without a hand-off: the retry runs at deep, within what is left of its budget.
+    p.db.x("INSERT INTO runs(task,role,provider,status,started) VALUES(?,'worker','claude','ok',?)", (c, now))
+    run_dir = env["tmp"] / "run-c"
+    run_dir.mkdir()
+    d._finish_worker({"task": c}, Usage(cost_usd=2.0), "ok", run_dir)
+    t = p.db.task(c)
+    assert t["status"] == "queued" and t["attempts"] == 1
+    p.db.update_task(c, not_before=None, spent_usd=2.0)
+    started.clear()
+    d.jev.calls = 0
+    d.dispatch()
+    (args, kw), = started
+    assert args[3] == "deep" and kw["note"]["pick"] == {"tier": "deep", "from": "standard", "by": "retry", "review": True}
+    assert kw["budget_usd"] == pytest.approx(6.0) and d.jev.calls == 0 and p.db.task(c)["tier"] == "deep"
+    p.db.update_task(c, status="running")
+    run_dir = env["tmp"] / "run-c2"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps({"status": "done", "summary": "fair now"}))
+    d._finish_worker({"task": c}, Usage(cost_usd=4.0), "ok", run_dir)
+    row = p.db.one("SELECT outcome, note FROM jev_calls WHERE ref=?", (f"task:{c}",))
+    assert row["outcome"] == "wrong" and "after 2 attempt" in row["note"]
+
+
+def test_effort_falls_back_to_rules_and_leaves_other_tasks_alone(env, monkeypatch):
+    p = make(env)
+    from ttp import effort
+    p.set_config("jev.uses", {"effort": "off"})
+    cfg = p.config()
+    jev = _EffortJev(2.0)
+    q = p.db.add_task("Is the queue empty?", "Say yes or no.", kind="question", tier="standard", origin="coordinator")
+    assert effort.pick(p.db, cfg, p.db.task(q), "claude", jev) == {"tier": "light", "by": "rules", "from": "standard",
+                                                                 "review": False}
+    assert jev.calls == 0 and not p.db.q("SELECT 1 FROM jev_calls")
+
+    class Down(_EffortJev):
+        def decide(self, *a, **k):
+            raise OSError("down")
+    p.set_config("jev.uses", {"effort": "on"})
+    got = effort.pick(p.db, p.config(), p.db.task(q), "claude", Down(0))
+    assert got["by"] == "rules" and got["jev_error"] == "OSError"
+    # The user's tier, a deep or light pick by the coordinator, and reviews are kept as given.
+    for kw in ({"origin": "user", "tier": "standard"}, {"origin": "coordinator", "tier": "deep"},
+               {"origin": "coordinator", "tier": "light"}):
+        t = p.db.add_task(f"Is it up? {kw}", "x", kind="question", **kw)
+        assert effort.pick(p.db, cfg, p.db.task(t), "claude", jev) is None
+    r = p.db.add_task("Review #1", "x", kind="review", tier="standard", origin="daemon")
+    p.db.update_task(r, attempts=1, result=json.dumps({"status": "failed"}))
+    assert effort.pick(p.db, cfg, p.db.task(r), "claude", jev) is None
+    # A failed light try retries at standard; a task that continues a failed standard one starts at deep.
+    lt = p.db.add_task("Look it up", "x", kind="work", tier="light", origin="coordinator")
+    p.db.update_task(lt, attempts=1, result=json.dumps({"status": "failed"}))
+    assert effort.pick(p.db, cfg, p.db.task(lt), "claude", jev)["tier"] == "standard"
+    old = p.db.add_task("Port it", "x", kind="code", tier="standard", origin="coordinator")
+    p.db.update_task(old, status="failed")
+    new = p.db.add_task("Port it again", "x", kind="code", tier="standard", origin="coordinator",
+                        labels=[f"continues:{old}"])
+    assert effort.pick(p.db, cfg, p.db.task(new), "claude", jev)["by"] == "retry"
+    # A task that waited or was lost to the host is not retried deeper.
+    w = p.db.add_task("Port more", "x", kind="code", tier="standard", origin="coordinator")
+    p.db.update_task(w, attempts=1, result=json.dumps({"status": "lost"}))
+    p.db.x("INSERT INTO runs(task,role,status) VALUES(?,'worker','lost')", (w,))
+    assert effort.pick(p.db, cfg, p.db.task(w), "claude", jev) is None
+
+
 def test_command_watcher_repeats_wake_the_coordinator(env, monkeypatch):
     p = make(env)
     from ttp import daemon as dm

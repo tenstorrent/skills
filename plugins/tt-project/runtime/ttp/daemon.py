@@ -30,6 +30,7 @@ from pathlib import Path
 from . import alerts
 from . import budget as bud
 from . import coordinator as coord
+from . import effort
 from . import ends
 from . import integrity
 from . import jevuse
@@ -1303,6 +1304,7 @@ class Daemon:
                       f"{'~' if usage.estimated else ''}${usage.cost_usd:.2f})", "handled", task["id"]))
         else:
             db.update_task(task["id"], **upd)
+        effort.settle(db, task["id"], new, attempts)
         if new == "done" and task["kind"] == "code":
             self._local_only_due = 0.0   # is its work on a remote? checked this tick
         if waiting and new == "queued":
@@ -1867,6 +1869,9 @@ class Daemon:
                 continue
             if task["kind"] == "review":
                 task = self._size_review(task)
+            picked = self._pick_effort(task, provider)
+            if picked:
+                task = dict(task, tier=picked["tier"])
             wake = bud.wake_tier(task["tier"], load_result(task["result"]))
             tier = bud.clamp_tier(wake or task["tier"], gate)
             # Before _workdir_for, which would make a missing worktree afresh.
@@ -1883,6 +1888,8 @@ class Daemon:
                 note = {"spec_sha": spec_digest(task)}
                 if wake:
                     note["wake"] = {"tier": tier, "escalated": bool(load_result(task["result"]).get("escalated_wake"))}
+                if picked:
+                    note["pick"] = picked
                 if lost and lost["cwd"] == cwd:
                     # The session holds the task and its own work: a short prompt continues it.
                     prompt = worker_resume(self.p, task, lost)
@@ -1909,6 +1916,20 @@ class Daemon:
         for task in ready:
             if task["id"] not in reached:
                 self._unreserve(task)
+
+    def _pick_effort(self, task: dict, provider: str) -> dict | None:
+        """The task's tier for this start (see effort.pick), stored on the task; None leaves it as it is."""
+        try:
+            picked = effort.pick(self.p.db, self.cfg, task, provider, jev=self.jev)
+        except Exception as e:   # picking must never hold a task back
+            log(self.p, f"task {task['id']}: effort not picked: {e}")
+            return None
+        if not picked:
+            return None
+        if picked["tier"] != task["tier"]:
+            log(self.p, f"task {task['id']}: tier {task['tier']} -> {picked['tier']} ({picked['by']})")
+            self.p.db.update_task(task["id"], tier=picked["tier"])
+        return picked
 
     def _resumable(self, task: dict, provider: str) -> dict | None:
         """The task's last run, when the host took it away (reboot, sleep, lost supervisor) after

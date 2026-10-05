@@ -35,8 +35,12 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
   that opens or updates a PR, so a task asking for one is `code`, or task_add makes it so), `review`
   (independent check), `plan` (break a goal into tasks), `harness` (improve this project's harness),
   `work` (anything else, incl. non-code deliverables).
-- `tier`: `light` for lookups, triage, small edits; `standard` for normal engineering; `deep` only
-  for architecture, hard debugging, novel optimization. Respect the budget's `max_tier`.
+- `tier`: `light` for lookups, triage, small edits; `standard` (the default) for everything else.
+  `deep` (max effort) only when the user asks for it: a non-review task whose run fails or ends
+  without a hand-off retries one tier up by itself (deep only after standard), as does one that
+  `continues` a failed task, within its own budget. A `standard` task may start at `light` when its
+  spec is a short lookup (Jev or rules pick it; the pick is logged with the run). Respect the
+  budget's `max_tier`.
   A `review` gets its tier from the diff it names (branch or commit in the spec, or `depends_on`
   the code task): `light` when doc-only or small, `standard` otherwise. Set `deep` only to force it.
   A re-review after a failed one `continues` it or depends on the fix that does, and its spec
