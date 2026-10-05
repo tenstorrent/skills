@@ -1737,8 +1737,10 @@ The live harness was left untouched. In this harness repo:
 1. `git worktree add --detach <tmp> main`, then in <tmp>: `git merge upstream`.
 2. Resolve each conflict keeping this project's intent and taking upstream's fixes.
 3. Check in <tmp>: `python3 -m compileall -q runtime` and `PYTHONPATH=runtime python3 -c "import ttp.daemon, ttp.cli"`.
-4. Commit, then in the harness: `git merge --ff-only <commit>`; remove <tmp>.
-5. `ttp restart {name}` (it rolls the runtime back if the daemon does not start).
+4. Commit, then in <tmp>: `git merge main` (main may have moved meanwhile; resolve and check again).
+5. In the harness: `git merge --ff-only <commit>`, run on its own (never piped or masked).
+   If it succeeds, remove <tmp>. If it fails, keep <tmp> and hand off with its path and the error.
+6. `ttp restart {name}` (it rolls the runtime back if the daemon does not start).
 """
 
 

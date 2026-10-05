@@ -20153,3 +20153,12 @@ def test_account_level_budget_settings_apply_to_every_project_and_a_project_may_
     main(["config", "--account", "budget.timezone", ""])
     assert p.config()["budget"]["timezone"] == "UTC"
     assert (project.HOME_DIR / "settings.json").stat().st_mode & 0o077 == 0
+
+
+def test_upgrade_task_merges_main_before_ff_only_and_keeps_worktree_on_failure(env):
+    from ttp import cli
+    t = cli._UPGRADE_TASK
+    assert "git merge main" in t
+    assert t.index("git merge main") < t.index("--ff-only")
+    assert "|" not in t
+    assert "keep <tmp>" in t
