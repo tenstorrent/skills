@@ -241,10 +241,10 @@ def is_doc(path: str) -> bool:
     return path.lower().endswith(DOC_SUFFIXES) or any(d in ("docs", "doc") for d in path.split("/")[:-1])
 
 
-def code_paths(repo: Path, tip: str) -> list[str]:
-    """The files this change touches since it left `tip` that are not docs. --no-renames lists a
-    moved file under both names, so moving code into docs/ still counts as code."""
-    diff = _git(repo, "diff", "--name-only", "--no-renames", f"{tip}...HEAD")
+def code_paths(repo: Path, tip: str, head: str = "HEAD") -> list[str]:
+    """The files the change at `head` touches since it left `tip` that are not docs. --no-renames
+    lists a moved file under both names, so moving code into docs/ still counts as code."""
+    diff = _git(repo, "diff", "--name-only", "--no-renames", f"{tip}...{head}")
     if diff.returncode != 0:
         return ["(the diff could not be read)"]
     return [f for f in diff.stdout.splitlines() if f.strip() and not is_doc(f)]
@@ -395,16 +395,18 @@ def _slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:60].strip("-") or "change"
 
 
-def bump(repo: Path, tip: str, cfg: dict, say: Callable[[str], None]) -> int:
-    """After a rebase onto `tip`: when the change touches `cfg["paths"]`, set every file in
-    `cfg["files"]` one patch version above the highest version they hold at tip, add a changeset
-    for the change when it brings none, and commit both as one `<package>: X.Y.Z (<subject>)`
-    commit. 0 when done or not needed; REFUSED when a file holds no version to bump."""
+def needs_bump(repo: Path, tip: str, cfg: dict, head: str = "HEAD") -> bool:
+    """Whether `head` changes something under `cfg["paths"]` since `tip`, other than the version
+    files and changesets themselves."""
     files, csdir = cfg["files"], cfg["changeset_dir"]
-    changed = _git(repo, "diff", "--name-only", "--no-renames", tip, "HEAD").stdout.split()
-    if not any(_under(f, cfg["paths"]) and f not in files and not (csdir and _under(f, [csdir]))
-               for f in changed):
-        return 0
+    changed = _git(repo, "diff", "--name-only", "--no-renames", tip, head).stdout.split()
+    return any(_under(f, cfg["paths"]) and f not in files and not (csdir and _under(f, [csdir]))
+               for f in changed)
+
+
+def next_version(repo: Path, tip: str, files: list[str]) -> str | None:
+    """One patch version above the highest version `files` hold at `tip`; None when none holds one
+    there (the files are new: their version is the change's own)."""
     at_tip = []
     for f in files:
         show = _git(repo, "show", f"{tip}:{f}")
@@ -412,10 +414,16 @@ def bump(repo: Path, tip: str, cfg: dict, say: Callable[[str], None]) -> int:
         if m:
             at_tip.append(tuple(int(x) for x in m.group(2, 3, 4)))
     if not at_tip:
-        return 0                 # the versioned files are new here: their version is the change's own
+        return None
     major, minor, patch = max(at_tip)
-    new = f"{major}.{minor}.{patch + 1}"
-    package, texts = cfg["package"], {}
+    return f"{major}.{minor}.{patch + 1}"
+
+
+def set_version(repo: Path, files: list[str], new: str, package: str = "") -> str:
+    """Write version `new` over the first version each of `files` holds in the work tree, and
+    return the package name (`package`, else the first JSON file's `name`). ValueError, writing
+    nothing, when a file holds no version or a JSON file's first version is not its `version`."""
+    texts = {}
     for f in files:            # all checked before any is written, so a refusal leaves the tree clean
         path = repo / f
         try:
@@ -423,8 +431,7 @@ def bump(repo: Path, tip: str, cfg: dict, say: Callable[[str], None]) -> int:
         except OSError:
             text = ""
         if not VERSION_RE.search(text):
-            say(f"delivery.version_bump: {f} holds no version to bump; not pushing")
-            return REFUSED
+            raise ValueError(f"delivery.version_bump: {f} holds no version to bump")
         text = VERSION_RE.sub(lambda m: f"{m.group(1)}{new}{m.group(5)}", text, count=1)
         if f.endswith(".json"):
             try:
@@ -433,12 +440,30 @@ def bump(repo: Path, tip: str, cfg: dict, say: Callable[[str], None]) -> int:
             except (ValueError, AttributeError):
                 doc, ok = {}, False
             if not ok:
-                say(f"delivery.version_bump: the first version in {f} is not its top-level `version`; not pushing")
-                return REFUSED
+                raise ValueError(f"delivery.version_bump: the first version in {f} is not its top-level `version`")
             package = package or str(doc.get("name") or "")
         texts[path] = text
     for path, text in texts.items():
         durable_write(path, text)
+    return package
+
+
+def bump(repo: Path, tip: str, cfg: dict, say: Callable[[str], None]) -> int:
+    """After a rebase onto `tip`: when the change touches `cfg["paths"]`, set every file in
+    `cfg["files"]` one patch version above the highest version they hold at tip, add a changeset
+    for the change when it brings none, and commit both as one `<package>: X.Y.Z (<subject>)`
+    commit. 0 when done or not needed; REFUSED when a file holds no version to bump."""
+    files, csdir = cfg["files"], cfg["changeset_dir"]
+    if not needs_bump(repo, tip, cfg):
+        return 0
+    new = next_version(repo, tip, files)
+    if new is None:
+        return 0
+    try:
+        package = set_version(repo, files, new, cfg["package"])
+    except ValueError as e:
+        say(f"{e}; not pushing")
+        return REFUSED
     log = _git(repo, "log", "--no-merges", "--reverse", "--format=%s", f"{tip}..HEAD").stdout.splitlines()
     subjects = [re.sub(rf"^{re.escape(package)}: ", "", s) if package else s for s in log if s.strip()]
     subject = subjects[-1] if subjects else "update"
@@ -488,12 +513,14 @@ def free_probe(p: Project) -> str:
 
 
 def take(p: Project, remote: str, branch: str, wait_s: float, poll_s: float = 1.0,
-         say: Callable[[str], None] = lambda m: print(f"ttp push: {m}", file=sys.stderr)):
+         say: Callable[[str], None] = lambda m: print(f"ttp push: {m}", file=sys.stderr),
+         who: str | None = None):
     """The held push lock of remote/branch, waiting up to `wait_s` for it; None when it stayed busy.
-    Inside a run the wait is recorded, so it does not count against the run's wall clock."""
+    Inside a run the wait is recorded, so it does not count against the run's wall clock. `who`
+    labels the holder (default: the task and run, else the pid)."""
     paths = lock_paths(p, remote, branch)
-    who = (f"task #{os.environ['TTP_TASK']} (run {os.environ.get('TTP_RUN_ID') or '?'})"
-           if os.environ.get("TTP_TASK") else f"pid {os.getpid()}")
+    who = who or (f"task #{os.environ['TTP_TASK']} (run {os.environ.get('TTP_RUN_ID') or '?'})"
+                  if os.environ.get("TTP_TASK") else f"pid {os.getpid()}")
     f = locks.try_take(paths, who, "ttp push")
     if f:
         return f
@@ -1066,6 +1093,9 @@ def result(marker: Path) -> int:
     if not _read(marker):
         print(f"ttp push: no detached push marker at {marker}", file=sys.stderr)
         return REFUSED
+    if _read(marker).get("kind") == "batch":     # the push queue's batch process (batch.py)
+        from . import batch
+        return batch.summary(marker)
     try:
         m = _settle(marker)
         since = {"queued": "queued", "running": "started"}.get(m.get("status"))

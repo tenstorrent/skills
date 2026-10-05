@@ -8888,6 +8888,343 @@ def test_version_bump_config_is_validated():
     assert config_problems({"delivery": {"version_bump": {"files": ["a/x.json"]}}}) == []
 
 
+# push queue batches (batch.py) --------------------------------------------------------------------
+def _entry(repo, name, files):
+    """A reviewed branch `name` off the target's tip whose one commit writes `files` ({path: text});
+    its head."""
+    _git_out(repo, "fetch", "-q", "origin")
+    _git_out(repo, "checkout", "-q", "-B", name, "origin/proj")
+    for path, text in files.items():
+        (repo / path).parent.mkdir(parents=True, exist_ok=True)
+        (repo / path).write_text(text)
+        _git_out(repo, "add", path)
+    _git_out(repo, "commit", "-qm", f"{name}: edit {', '.join(files)}")
+    return _git_out(repo, "rev-parse", "HEAD")
+
+
+def _batch_marker(p, heads, bid="b1", target="origin/proj"):
+    """A batch marker as the push queue writes it: entry n (task 100 + n, branch e<n>) pushes heads[n-1]."""
+    from ttp.project import write_json
+    marker = p.state / "pushes" / f"{bid}.json"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    write_json(marker, {
+        "v": 1, "kind": "batch", "id": bid, "status": "running", "phase": "push", "pid": os.getpid(),
+        "started": time.time(), "repo": str(p.root), "target": target, "log": str(marker.with_suffix(".log")),
+        "lock": str(p.state / "locks" / f"push:run-{bid}.0.lock"),
+        "entries": [{"id": n, "task": 100 + n, "branch": f"e{n}", "head": h, "ref": f"refs/ttp/push/{n}"}
+                    for n, h in enumerate(heads, 1)]})
+    return marker
+
+
+def _run_batch(p, marker, monkeypatch):
+    """`ttp push --batch <marker>` in this process, its go given: (exit code, the marker after it)."""
+    from ttp import batch, push
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+    return batch.run_batch(p, marker), push._read(marker)
+
+
+def _statuses(m):
+    return [r["status"] for r in m["results"]]
+
+
+def test_a_push_batch_lands_its_entries_with_one_bump_one_changeset_and_one_check_run(env, monkeypatch):
+    """Three reviewed changes go out as one push: replayed in order onto the tip, one version bump,
+    one changeset for those that bring none, the checks run once, and the target only fast-forwards."""
+    log = env["tmp"] / "checks.log"
+    p, repo, origin, other = _bump_setup(env, monkeypatch, [f"git rev-parse HEAD >> {log}"])
+    before = _git_out(origin, "rev-parse", "proj")
+    heads = [_entry(repo, f"e{n}", {f"plugins/p/f{n}.txt": f"{n}\n"}) for n in (1, 2, 3)]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed" and _statuses(m) == ["pushed"] * 3, m
+    assert [r["task"] for r in m["results"]] == [101, 102, 103]
+    tip = _git_out(origin, "rev-parse", "proj")
+    assert log.read_text().split() == [tip], "the checks run once, on the commit that is pushed"
+    assert (m["pushed_sha"], m["tip"], m["version"], m["rounds"]) == (tip, before, "0.1.1", 1)
+    assert m["checks"]["runs"] == 1 and m["checks"]["flaky"] is False
+    assert _versions(origin) == ("0.1.1", "0.1.1")
+    assert _bump_commits(origin) == ["p: 0.1.1 (e1: edit plugins/p/f1.txt; +2 more)"]
+    assert _git_out(origin, "rev-list", "--count", f"{before}..proj") == "4"
+    assert _git_out(origin, "rev-list", "--merges", f"{before}..proj") == ""
+    assert _git_out(origin, "show", "proj:.changeset/p-b1.md") == (
+        '---\n"p": patch\n---\n\n`p`:\n\n- e1: edit plugins/p/f1.txt\n- e2: edit plugins/p/f2.txt\n'
+        "- e3: edit plugins/p/f3.txt")
+    assert m["phase"] == "finished" and m["after_push"] == {"status": "skipped"}
+    assert not list((p.state / "locks").glob("*run-b1*")), "no lock file of the batch is left behind"
+
+
+def test_a_push_batch_entry_already_on_the_target_is_landed_without_a_bump(env, monkeypatch):
+    p, repo, origin, other = _bump_setup(env, monkeypatch, ["true"])
+    h1 = _entry(repo, "e1", {"plugins/p/f1.txt": "1\n"})
+    _git_out(repo, "push", "-q", "origin", f"{h1}:refs/heads/proj")
+    rc, m = _run_batch(p, _batch_marker(p, [h1]), monkeypatch)
+    assert rc == 0 and m["outcome"] == "landed" and _statuses(m) == ["landed"], m
+    assert _git_out(origin, "rev-parse", "proj") == h1 and _bump_commits(origin) == []
+    # Delivered as another commit (rebased onto a tip that moved): landed too.
+    h2 = _entry(repo, "e2", {"plugins/p/f2.txt": "2\n"})
+    _entry(repo, "late", {"late.txt": "late\n"})
+    _git_out(repo, "cherry-pick", h2)
+    _git_out(repo, "push", "-q", "origin", "HEAD:proj")
+    before = _git_out(origin, "rev-parse", "proj")
+    rc, m = _run_batch(p, _batch_marker(p, [h2], bid="b2"), monkeypatch)
+    assert m["outcome"] == "landed" and _git_out(origin, "rev-parse", "proj") == before, m
+    # A head ending in a bump of its own (a push that failed after bumping) goes out with one bump: ours.
+    _entry(repo, "e3", {"plugins/p/f3.txt": "3\n"})
+    for f in ("plugins/p/.claude-plugin/plugin.json", "plugins/p/rt/__init__.py"):
+        (repo / f).write_text((repo / f).read_text().replace("0.1.0", "0.1.7"))
+    _git_out(repo, "commit", "-qam", "p: 0.1.7 (stale)\n\nTtp-Version-Bump: 0.1.7")
+    rc, m = _run_batch(p, _batch_marker(p, [_git_out(repo, "rev-parse", "HEAD")], bid="b3"), monkeypatch)
+    assert m["outcome"] == "pushed" and _versions(origin) == ("0.1.1", "0.1.1"), m
+    assert _bump_commits(origin) == ["p: 0.1.1 (e3: edit plugins/p/f3.txt)"]
+
+
+def test_a_push_batch_entry_with_a_real_conflict_stays_out_and_the_others_land(env, monkeypatch, capsys):
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    _commit(other, "notes.txt", "a\nb\nc\n")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    heads = [_entry(repo, "e1", {"notes.txt": "a\nB1\nc\n"}), _entry(repo, "e2", {"notes.txt": "a\nB2\nc\n"}),
+             _entry(repo, "e3", {"more.txt": "3\n"})]
+    marker = _batch_marker(p, heads)
+    rc, m = _run_batch(p, marker, monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed" and _statuses(m) == ["pushed", "conflict", "pushed"], m
+    assert m["results"][1]["detail"] == {"files": ["notes.txt"], "onto": heads[0]}
+    assert _git_out(origin, "show", "proj:notes.txt") == "a\nB1\nc"
+    assert _git_out(origin, "show", "proj:more.txt") == "3"
+    capsys.readouterr()
+    assert _ttp("push", "--result", str(marker)) == 0
+    out = capsys.readouterr().out
+    assert f"ttp push: batch b1: pushed, {m['pushed_sha'][:10]} to origin/proj" in out, out
+    assert "#2 task 102 e2: conflict in notes.txt" in out and "#3 task 103 e3: pushed" in out, out
+    # A batch whose process still holds its lock is running; one that died before its outcome is over.
+    from ttp import locks
+    live = _batch_marker(p, heads, bid="b2")
+    held = locks.try_take([p.state / "locks" / "push:run-b2.0.lock"], "push queue")
+    assert _ttp("push", "--result", str(live)) == 1 and "still running" in capsys.readouterr().out
+    held.close()
+    assert _ttp("push", "--result", str(live)) == 0 and "without an outcome" in capsys.readouterr().out
+
+
+def test_merge3_keeps_lines_both_sides_added_and_leaves_real_conflicts():
+    from ttp.batch import merge3
+    assert merge3("a\nX\n", "a\n", "a\nY\n") == "a\nX\nY\n"
+    assert merge3("a\nX\nb\n", "a\nb\n", "a\nY\nb\n") == "a\nX\nY\nb\n"
+    assert merge3("X\na\nb\n", "a\nb\n", "a\nb\nY\n") == "X\na\nb\nY\n", "a clean merge is kept as it is"
+    assert merge3("a\nX\n", "a\nb\n", "a\nY\n") is None, "both changed one line"
+    assert merge3("a\nX\n", "a", "a\nY\n") is None, "a last line without a newline is a change of it"
+    assert merge3("a\nX\n", "a\n", "a\n=======\nY\n") is None, "a line like a separator is ambiguous"
+    assert merge3("a\n=======\nX\n", "a\n", "a\nY\n") == "a\n=======\nX\nY\n"
+    old, ours = "def x():\n    pass\n", "def x():\n    pass\n\n\ndef a():\n    return 1\n"
+    for gap in ("", "\n\n\n"):
+        theirs = old + gap + "def b():\n    return 2\n"
+        assert merge3(ours, old, theirs, py=True) == ours + "\n\ndef b():\n    return 2\n", "PEP 8's two blank lines"
+        assert merge3(ours, old, theirs) == ours + gap + "def b():\n    return 2\n", "elsewhere each side's spacing"
+    assert merge3(ours, old, old + "Y = 2\n", py=True) == ours + "Y = 2\n"
+
+
+def test_a_push_batch_settles_version_lines_and_lines_both_sides_added(env, monkeypatch):
+    """Two changes each bumped the version by hand and each added a test at the end of one file; both
+    conflict, and neither conflict needs judgment. The batch takes its own version and keeps both
+    tests, and the checks (which run every test) judge the result."""
+    log = env["tmp"] / "tests.log"
+    run_tests = (f"python3 -c \"import runpy; ns = runpy.run_path('tests/test_x.py'); "
+                 f"names = sorted(n for n in ns if n.startswith('test_')); [ns[n]() for n in names]; "
+                 f"open('{log}', 'a').write(' '.join(names) + chr(10))\"")
+    p, repo, origin, other = _bump_setup(env, monkeypatch, [run_tests])
+    (other / "tests").mkdir()
+    _commit(other, "tests/test_x.py", "def test_a():\n    assert True\n")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    versioned = ("plugins/p/.claude-plugin/plugin.json", "plugins/p/rt/__init__.py")
+    base = {f: _git_out(origin, "show", f"proj:{f}") + "\n" for f in versioned}
+
+    def change(name, version, test):
+        files = {f: base[f].replace("0.1.0", version) for f in versioned}
+        files["tests/test_x.py"] = f"def test_a():\n    assert True\n\n\ndef {test}():\n    assert True\n"
+        files[f"plugins/p/{name}.txt"] = f"{name}\n"
+        return _entry(repo, name, files)
+    heads = [change("e1", "0.1.1", "test_b"), change("e2", "0.1.5", "test_c")]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed" and _statuses(m) == ["pushed", "pushed"], m
+    assert log.read_text().splitlines() == ["test_a test_b test_c"]
+    assert _git_out(origin, "show", "proj:tests/test_x.py") == (
+        "def test_a():\n    assert True\n\n\ndef test_b():\n    assert True\n\n\ndef test_c():\n    assert True")
+    assert _versions(origin) == ("0.1.1", "0.1.1") and len(_bump_commits(origin)) == 1
+
+
+def test_a_push_batch_does_not_settle_an_addition_that_repeats_a_top_level_name(env, monkeypatch):
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    _commit(other, "test_x.py", "def test_a():\n    assert True\n")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    heads = [_entry(repo, f"e{n}", {"test_x.py": f"def test_a():\n    assert True\n\n\ndef test_b():\n    assert {n}\n"})
+             for n in (1, 2)]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert _statuses(m) == ["pushed", "conflict"] and m["results"][1]["detail"]["files"] == ["test_x.py"], m
+    assert _git_out(origin, "show", "proj:test_x.py").endswith("assert 1")
+
+
+@pytest.mark.parametrize("bad", [1, 3, 4])
+def test_a_push_batch_blames_the_first_failing_entry_and_pushes_the_ones_before_it(env, monkeypatch, bad):
+    """Four entries, one of which breaks the checks: a binary search over prefixes finds it in at most
+    three more check runs (ceil(log2 4) + 1). The entries before it go, the later ones are requeued."""
+    log = env["tmp"] / "checks.log"
+    p, repo, origin, other = _bump_setup(env, monkeypatch, [f"echo run >> {log}", "test ! -e plugins/p/bad.txt"])
+    heads = [_entry(repo, f"e{n}", {f"plugins/p/{'bad' if n == bad else f'f{n}'}.txt": f"{n}\n"}) for n in (1, 2, 3, 4)]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert _statuses(m) == ["pushed"] * (bad - 1) + ["check_failed"] + ["requeued"] * (4 - bad), m
+    assert m["results"][bad - 1]["detail"]["cmd"] == "test ! -e plugins/p/bad.txt"
+    runs = len(log.read_text().split())
+    assert runs == m["checks"]["runs"] and runs - 1 <= 3, runs
+    if bad == 1:
+        assert rc == 0 and m["outcome"] == "nothing" and m["pushed_sha"] is None and _bump_commits(origin) == []
+        return
+    assert rc == 0 and m["outcome"] == "pushed" and _versions(origin) == ("0.1.1", "0.1.1")
+    more = f"; +{bad - 2} more" if bad > 2 else ""
+    assert _bump_commits(origin) == [f"p: 0.1.1 (e1: edit plugins/p/f1.txt{more})"]
+    names = _git_out(origin, "ls-tree", "--name-only", "proj", "plugins/p/").split()
+    assert [n for n in names if n.endswith(".txt")] == [f"plugins/p/f{n}.txt" for n in range(1, bad)]
+    assert f"e{bad - 1}: edit" in _git_out(origin, "show", "proj:.changeset/p-b1.md")
+    assert f"e{bad}:" not in _git_out(origin, "show", "proj:.changeset/p-b1.md")
+
+
+def test_a_push_batch_whose_target_fails_its_checks_alone_pushes_nothing(env, monkeypatch):
+    p, repo, origin, other = _bump_setup(env, monkeypatch, ["test ! -e broken.txt"])
+    _commit(other, "broken.txt", "x\n")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    before = _git_out(origin, "rev-parse", "proj")
+    heads = [_entry(repo, f"e{n}", {f"plugins/p/f{n}.txt": f"{n}\n"}) for n in (1, 2)]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert rc == 4 and m["outcome"] == "tip_failed" and _statuses(m) == ["requeued", "requeued"], m
+    assert m["tip_check"]["cmd"] == "test ! -e broken.txt" and m["checks"]["runs"] == 3
+    assert _git_out(origin, "rev-parse", "proj") == before and m["pushed_sha"] is None
+
+
+def test_a_push_batch_starts_over_when_the_target_moves_and_gives_up_when_it_keeps_moving(env, monkeypatch):
+    once = env["tmp"] / "moved"
+    move = (f"cd {env['tmp'] / 'other'} && git pull -q --rebase origin proj && echo x >> late.txt"
+            " && git add late.txt && git commit -qm late && git push -q origin HEAD:proj")
+    p, repo, origin, other = _push_setup(env, monkeypatch, [f"test -e {once} || (touch {once} && {move})"])
+    heads = [_entry(repo, f"e{n}", {f"f{n}.txt": f"{n}\n"}) for n in (1, 2)]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed" and m["rounds"] == 2 and m["checks"]["runs"] == 2, m
+    assert _git_out(origin, "show", "proj:late.txt") == "x" and _git_out(origin, "show", "proj:f2.txt") == "2"
+    assert m["tip"] == _git_out(origin, "rev-parse", "proj~2"), "round 2 replays onto the moved tip"
+    # A target that moves during every check run: after delivery.push_rounds the batch gives up.
+    p.set_config("delivery.push_checks", [move])
+    p.set_config("delivery.push_rounds", 2)
+    rc, m = _run_batch(p, _batch_marker(p, [_entry(repo, "e3", {"f3.txt": "3\n"})], bid="b2"), monkeypatch)
+    assert rc == 5 and m["outcome"] == "moved" and m["rounds"] == 2 and _statuses(m) == ["requeued"], m
+    assert "f3.txt" not in _git_out(origin, "ls-tree", "--name-only", "proj")
+
+
+def test_a_push_batch_finds_the_push_lock_busy_and_touches_nothing(env, monkeypatch):
+    from ttp import push
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    marker = _batch_marker(p, [_entry(repo, "e1", {"f1.txt": "1\n"})])
+    worktrees = _git_out(repo, "worktree", "list")
+    held = push.take(p, "origin", "proj", 0, who="someone else")
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+    try:
+        assert _ttp("push", "--batch", str(marker)) == 75
+    finally:
+        held.close()
+    m = push._read(marker)
+    assert m["outcome"] == "busy" and _statuses(m) == ["requeued"] and "someone else" in m["message"], m
+    assert _git_out(repo, "worktree", "list") == worktrees and not (p.worktrees / "push").exists()
+
+
+def test_a_push_batch_refuses_main_the_remotes_default_branch_and_a_changed_target(env, monkeypatch):
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    heads = [_entry(repo, "e1", {"f1.txt": "1\n"})]
+    before = _git_out(origin, "rev-parse", "proj")
+    p.set_config("delivery.push_branch", "origin/main")
+    rc, m = _run_batch(p, _batch_marker(p, heads, target="origin/main"), monkeypatch)
+    assert rc == 2 and m["outcome"] == "refused" and _statuses(m) == ["refused"], m
+    assert m["results"][0]["detail"]["message"].startswith("refusing to push to origin/main")
+    p.set_config("delivery.push_branch", "origin/proj")
+    subprocess.run(["git", "-C", str(origin), "symbolic-ref", "HEAD", "refs/heads/proj"], check=True)
+    rc, m = _run_batch(p, _batch_marker(p, heads, bid="b2"), monkeypatch)
+    assert rc == 2 and _statuses(m) == ["refused"] and "default branch" in m["message"], m
+    # The configured target changed after the batch was made: its entries wait for a batch to the new one.
+    rc, m = _run_batch(p, _batch_marker(p, heads, bid="b3", target="origin/old"), monkeypatch)
+    assert rc == 2 and m["outcome"] == "refused" and _statuses(m) == ["requeued"], m
+    assert _git_out(origin, "rev-parse", "proj") == before
+    assert subprocess.run(["git", "-C", str(origin), "rev-parse", "-q", "--verify", "main"]).returncode != 0
+
+
+def test_after_push_runs_at_the_pushed_commit_in_a_clean_checkout_with_the_push_locks_let_go(env, monkeypatch):
+    """The batch process inherits its run lock from the push queue. After the push it lets go of that
+    lock and of the push lock, so automatic upgrades do not wait for the deploy, and it runs
+    after_push at the pushed commit, in a fresh checkout, with the batch's facts in its environment."""
+    seen = env["tmp"] / "after_push.txt"
+    p, repo, origin, other = _bump_setup(env, monkeypatch, ["true"])
+    probe = (f"{sys.executable} -c \"import sys; sys.path.insert(0, '{RUNTIME}'); from pathlib import Path; "
+             f"from ttp import batch, locks, release; from ttp.project import Project; p = Project('{p.base}'); "
+             f"print('in_flight', release.push_in_flight(p)); print('held', locks.held(p.state / 'locks')); "
+             f"print('alive', batch.alive(Path('{p.state / 'pushes' / 'b1.json'}')))\"")
+    p.set_config("delivery.after_push", [
+        f"(env | grep '^TTP_' | sort; echo head $(git rev-parse HEAD); echo dirty $(git status --porcelain | wc -l);"
+        f" echo cwd $(pwd); ls {p.state / 'locks'}; {probe}) > {seen}"])
+    marker = _batch_marker(p, [_entry(repo, f"e{n}", {f"plugins/p/f{n}.txt": f"{n}\n"}) for n in (1, 2)])
+    from ttp import locks
+    run_lock = locks.try_take([p.state / "locks" / "push:run-b1.0.lock"], "push queue")
+    proc = subprocess.Popen([sys.executable, "-m", "ttp", "push", "--batch", str(marker)], cwd=str(repo),
+                            env={**os.environ, "PYTHONPATH": str(RUNTIME)}, stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, pass_fds=(run_lock.fileno(),))
+    run_lock.close()        # the child holds it now
+    out = proc.communicate("", timeout=120)[0]
+    assert proc.returncode == 0, out
+    m = json.loads(marker.read_text())
+    sha = _git_out(origin, "rev-parse", "proj")
+    assert m["pushed_sha"] == sha and m["after_push"]["status"] == "ok" and m["phase"] == "finished", m
+    lines = seen.read_text().splitlines()
+    for want in (f"TTP_PUSHED_SHA={sha}", "TTP_PUSHED_VERSION=0.1.1", "TTP_PUSH_TARGET=origin/proj",
+                 "TTP_PUSH_TASKS=101,102", f"TTP_PUSH_BATCH={marker}", f"TTP_PROJECT={p.base}", f"head {sha}",
+                 "dirty 0", f"cwd {p.worktrees / 'after_push-b1'}", "in_flight False", "alive True"):
+        assert want in lines, (want, lines)
+    assert "push:run-b1.0.lock" not in lines and any(x.startswith("held ['after_push:run-b1: ") for x in lines), lines
+    assert not (p.worktrees / "after_push-b1").exists() and "after_push-b1" not in _git_out(repo, "worktree", "list")
+    assert not list((p.state / "locks").glob("*run-b1*"))
+
+
+def test_after_push_failure_and_timeout_are_recorded_without_changing_the_push(env, monkeypatch):
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    p.set_config("delivery.after_push", ["echo deploying; exit 3"])
+    rc, m = _run_batch(p, _batch_marker(p, [_entry(repo, "e1", {"f1.txt": "1\n"})]), monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed" and m["phase"] == "finished", m
+    assert (m["after_push"]["status"], m["after_push"]["exit"], m["after_push"]["tail"]) == ("failed", 3, "deploying")
+    p.set_config("delivery.after_push", ["sleep 60 & wait"])
+    p.set_config("delivery.after_push_timeout_s", 1)
+    started = time.time()
+    rc, m = _run_batch(p, _batch_marker(p, [_entry(repo, "e2", {"f2.txt": "2\n"})], bid="b2"), monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed" and m["after_push"]["status"] == "timeout", m
+    # The whole process group is killed: a `sleep` left behind would hold the output open for 10 s more.
+    assert time.time() - started < 9
+    assert _git_out(origin, "show", "proj:f2.txt") == "2" and not (p.worktrees / "after_push-b2").exists()
+
+
+def test_a_batch_marker_with_an_outcome_resumes_only_its_after_push(env, monkeypatch):
+    from ttp.project import write_json
+    checks, deploys = env["tmp"] / "checks.log", env["tmp"] / "deploys.log"
+    p, repo, origin, other = _push_setup(env, monkeypatch, [f"echo check >> {checks}"])
+    p.set_config("delivery.after_push", [f"git rev-parse HEAD >> {deploys}"])
+    marker = _batch_marker(p, [_entry(repo, "e1", {"f1.txt": "1\n"})])
+    rc, m = _run_batch(p, marker, monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed" and m["after_push"]["status"] == "ok", m
+    tip = _git_out(origin, "rev-parse", "proj")
+    # The process died in the hand-over: the marker has its outcome but still names the run lock.
+    run_lock = p.state / "locks" / "push:run-b1.0.lock"
+    run_lock.write_text("")
+    write_json(marker, {**{k: v for k, v in m.items() if k not in ("after_push", "ended")},
+                        "status": "running", "phase": "push", "lock": str(run_lock)})
+    rc, m = _run_batch(p, marker, monkeypatch)
+    assert rc == 0 and m["phase"] == "finished" and m["after_push"]["status"] == "ok", m
+    assert checks.read_text().split() == ["check"], "a resumed batch neither checks nor pushes again"
+    assert deploys.read_text().split() == [tip, tip] and _git_out(origin, "rev-parse", "proj") == tip
+    assert not run_lock.exists()
+    # Its after_push ended but the process died before marking the batch finished: no second deploy.
+    write_json(marker, {**m, "status": "running", "phase": "after_push"})
+    rc, m = _run_batch(p, marker, monkeypatch)
+    assert rc == 0 and m["phase"] == "finished" and deploys.read_text().split() == [tip, tip], m
+
+
 def test_the_default_push_wait_outlasts_the_measured_check_run(env, monkeypatch):
     """The lock is held through the checks, so a waiter's default wait must cover them (measured
     150-535 s, longer than the old fixed 300 s); an explicit push_wait_s still wins."""
@@ -13294,6 +13631,7 @@ DURABLE_EXEMPT = {
     ("release.py", "os.replace(tmp, cur)"): "a symlink swap; the directory is synced after",
     ("release.py", "upgrade.log"): "a log",
     ("push.py", 'open(log, "ab")'): "a detached push's log; its outcome goes to the marker, durably",
+    ("batch.py", "path.write_bytes(text.encode())"): "git merge-file's inputs, in a temporary directory removed after",
     ("daemon.py", "daemon.log"): "a log",
     ("daemon.py", "runner.log"): "a log",
     ("daemon.py", "pidfile.write_text"): "names a process, which a reboot ends",

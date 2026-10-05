@@ -870,6 +870,9 @@ def cmd_push(a) -> None:
         sys.exit(push.free(p, Path.cwd()))
     if a.marker:
         sys.exit(push.run_detached(p, Path.cwd(), Path(a.marker), a.own))
+    if a.batch:
+        from . import batch
+        sys.exit(batch.run_batch(p, Path(a.batch)))
     sys.exit(push.detach(p, Path.cwd(), a.own) if a.detach else push.run(p, Path.cwd(), a.own))
 
 
@@ -1835,6 +1838,7 @@ def main(argv: list[str] | None = None) -> None:
                    help="publish this task's own ttp/t<id>-... branch under its name, as it is (checks, no rebase); "
                         "never delivery.push_branch")
     s.add_argument("--marker", help=argparse.SUPPRESS)   # the detached process itself
+    s.add_argument("--batch", metavar="MARKER", help=argparse.SUPPRESS)   # the push queue's batch process (batch.py)
     s.set_defaults(fn=cmd_push)
 
     s = sub.add_parser("checks", help="(inside a run) run the local checks on HEAD and record the result")
