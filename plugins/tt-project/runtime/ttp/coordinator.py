@@ -1048,6 +1048,17 @@ def expire_asks(p: Project, *, hold: bool = False, now: float | None = None) -> 
 
 
 RESOURCE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@+-]{0,79}")
+PUSH_LOCK_RE = re.compile(r"push:[A-Za-z0-9_.@+%-]{1,200}")   # the lock `ttp push` holds (push.py)
+
+
+def push_lock_name(name: str) -> str | None:
+    """The canonical lock name of `push:<remote>/<branch>` (or its %2F-encoded form), the one
+    `ttp push` holds, so a task can wait for a push's turn; None if `name` is not one."""
+    if not isinstance(name, str) or not name.startswith("push:"):
+        return None
+    from urllib.parse import quote, unquote
+    canon = "push:" + quote(unquote(name[5:].strip()), safe="")
+    return canon if PUSH_LOCK_RE.fullmatch(canon) else None
 
 
 def _resource_names(names, action: str, problems: list) -> list[str]:
@@ -1056,9 +1067,11 @@ def _resource_names(names, action: str, problems: list) -> list[str]:
     for r in names if isinstance(names, list) else [names]:
         if isinstance(r, str) and RESOURCE_RE.fullmatch(r):
             ok.append(r)
+        elif push_lock_name(r):
+            ok.append(push_lock_name(r))
         else:
             problems.append(f"{action}: resource {r!r} dropped: names are letters, digits and _.@+- "
-                            f"(max 80, starting with a letter or digit)")
+                            f"(max 80, starting with a letter or digit), or a push lock push:<remote>/<branch>")
     return ok
 
 

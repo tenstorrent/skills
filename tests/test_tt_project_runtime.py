@@ -9644,6 +9644,19 @@ def test_invalid_resource_names_are_reported_not_silently_dropped(env):
     assert json.loads(new["labels"]) == ["resource:ok1"]
 
 
+def test_task_resources_accept_push_lock_names_in_their_canonical_form(env):
+    p = make(env)
+    from ttp import coordinator as coord, locks, push
+    canon = "push:origin%2Fteam%2Ffeature"   # the scheduler's lock file is the one ttp push holds
+    assert locks.slot_paths(p.state / "locks", canon, 1) == push.lock_paths(p, "origin", "team/feature")
+    problems = coord.apply(p, [{"type": "task_add", "title": "rev", "spec": "x", "kind": "review",
+                                "resources": ["push:origin/team/feature", "push:origin%2Fteam%2Ffeature",
+                                              "push:"]}])
+    assert len(problems) == 1 and "'push:' dropped" in problems[0]
+    labels = json.loads(p.db.one("SELECT labels FROM tasks WHERE title='rev'")["labels"])
+    assert set(labels) == {"resource:" + canon}
+
+
 # self-clearing alerts, the "needs you now" split, the kept tunnel and the budget lines --------------
 def _episodes(p, key):
     return p.db.q("SELECT * FROM alerts WHERE key=? ORDER BY id", (key,))
