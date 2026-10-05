@@ -6314,6 +6314,69 @@ def test_upgrade_refuses_when_a_lost_runtime_file_cannot_be_restored(env, monkey
     assert not (h / "runtime" / "ttp" / "push.py").exists()
 
 
+def _drop_top_level(path, name):
+    """`path` without the top-level definition of `name`, plus an unrelated local edit."""
+    import ast
+    src = path.read_text()
+    node = next(n for n in ast.parse(src).body if name in {getattr(n, "name", None)}
+                | {getattr(t, "id", None) for t in getattr(n, "targets", [])})
+    lines = src.splitlines(keepends=True)
+    path.write_text("".join(lines[:node.lineno - 1] + lines[node.end_lineno:]) + "\nLOCAL_TUNING = 3\n")
+
+
+def _upgrade_after_local_drop(env, monkeypatch, module, name):
+    """A harness whose main dropped `name` from runtime/ttp/<module> on purpose, then a newer template."""
+    p = make(env)
+    from ttp import cli, service
+    monkeypatch.setattr(service, "restart", lambda p: "restarted")
+    lib = env["home"] / "lib" / "current" / "runtime" / "ttp"
+    extra = "\n\ndef unused_helper():\n    return 1\n"
+    _install_template(env)
+    (lib / "release.py").write_text((lib / "release.py").read_text() + extra)
+    cli.main(["upgrade", "demo"])
+    h = p.harness
+    _drop_top_level(h / "runtime" / "ttp" / module, name)
+    _git_out(h, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "drop " + name)
+    worker = (RUNTIME.parent / "template" / "prompts" / "worker.md").read_text()
+    _install_template(env, {"worker.md": worker + "\nupstream line\n"})
+    (lib / "release.py").write_text((lib / "release.py").read_text() + extra)
+    (lib / "SOURCE_COMMIT").write_text("bbbb2222\n")
+    return p, cli
+
+
+def test_upgrade_keeps_a_runtime_edit_that_drops_a_name_nothing_needs(env, monkeypatch, capsys):
+    """gsplat-tt: a project removed an unused helper on purpose; the upgrade checked the whole file out
+    from upstream as 'lost', wiping every other local edit in it."""
+    p, cli = _upgrade_after_local_drop(env, monkeypatch, "release.py", "unused_helper")
+    h = p.harness
+    capsys.readouterr()
+    cli.main(["upgrade", "demo", "--auto"])
+    out = capsys.readouterr().out
+    text = (h / "runtime" / "ttp" / "release.py").read_text()
+    assert "LOCAL_TUNING = 3" in text and "def unused_helper" not in text, "the local edits were wiped"
+    assert "kept runtime files" in out and "runtime/ttp/release.py (lost unused_helper)" in out
+    assert "upstream line" in (h / "prompts" / "worker.md").read_text()
+    assert "restore runtime files main lost" not in _git_out(h, "log", "--format=%s", "-6")
+    assert not p.db.one("SELECT * FROM tasks WHERE kind='harness'")
+    rec = p.db.kv("upgrade_auto")
+    assert rec["outcome"] == "applied" and "unused_helper" in rec["kept_lost"]
+    assert _imports(h / "runtime").returncode == 0
+
+
+def test_upgrade_still_restores_a_runtime_file_that_lost_a_name_the_daemon_imports(env, monkeypatch, capsys):
+    p, cli = _upgrade_after_local_drop(env, monkeypatch, "db.py", "OPEN_ASK_MAX_AGE_S")
+    h = p.harness
+    assert "OPEN_ASK_MAX_AGE_S" in _imports(h / "runtime").stderr
+    capsys.readouterr()
+    cli.main(["upgrade", "demo"])
+    out = capsys.readouterr().out
+    assert "runtime/ttp/db.py (lost OPEN_ASK_MAX_AGE_S)" in out and "kept runtime files" not in out
+    assert "OPEN_ASK_MAX_AGE_S = " in (h / "runtime" / "ttp" / "db.py").read_text()
+    assert any(s.startswith("restore runtime files main lost: runtime/ttp/db.py")
+               for s in _git_out(h, "log", "--format=%s", "-6").splitlines())
+    assert _imports(h / "runtime").returncode == 0 and not p.db.one("SELECT * FROM tasks WHERE kind='harness'")
+
+
 def _conflicting_upgrade(env, monkeypatch):
     """A project whose harness prompt conflicts with the installed template; restarts are recorded."""
     p = make(env)

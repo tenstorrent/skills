@@ -104,6 +104,9 @@ What each supported CLI offers, with doc links: [providers.md](providers.md).
   `main` changed runtime/, prompts/ or bin/ meanwhile. The task applies its resolution with
   `ttp upgrade <name> --apply <commit>` (fast-forward only). A reference-transaction hook in the
   harness repo refuses every other update of `main` that newly takes in `upstream`.
+  Runtime files `main` deleted, emptied or cut short are restored from `upstream`. A file that only
+  lacks top-level names `upstream` ships is kept (a deliberate local edit) unless the merged runtime
+  fails to compile or import without them; the upgrade warns and records the names.
 - Each daemon compares `~/.tt-project/lib/current` (version and source commit) with its own
   harness runtime at start and then hourly. While the installed release is newer (or the same
   version from another commit), `ttp status` and the web app show `tt-project <installed>

@@ -2006,7 +2006,8 @@ def _upgrade(p: Project, auto: bool = False) -> None:
             _git(tmp, *ident, "commit", "-q", "-m", f"tt-project template {new_v} ({new_c})")
     finally:
         _git(h, "worktree", "remove", "--force", str(tmp))
-    merged, problem = _merge_upstream(h, p.state / "upgrade-merge", ident, base)
+    kept: dict[str, str] = {}
+    merged, problem = _merge_upstream(h, p.state / "upgrade-merge", ident, base, kept)
     if problem:
         _ensure_git_ident(h)        # the task merges and commits in a fresh worktree of this repo
         tid = release.open_upgrade_task(p) or p.db.add_task(
@@ -2045,9 +2046,11 @@ def _upgrade(p: Project, auto: bool = False) -> None:
     if (_runtime_version(h / "runtime"), recorded_commit(h / "runtime")) != (new_v, new_c):
         release.finish(p, "failed", why="the daemon did not start with it, so the runtime was rolled back")
         return
-    release.finish(p, "applied")
+    release.finish(p, "applied", **({"kept_lost": _cut_list(kept)} if kept else {}))
     p.db.post("out", f"tt-project harness upgraded from {old_v} ({old_c}) to {new_v} ({new_c}); the daemon "
-              f"restarted and running work was kept.", chat=None, kind="alert", severity="low")
+              f"restarted and running work was kept."
+              + (f" Kept this project's runtime edits that drop names upstream ships: {_cut_list(kept)}." if kept
+                 else ""), chat=None, kind="alert", severity="low")
 
 
 def _moved_template(h: Path, base: str) -> str:
@@ -2247,9 +2250,35 @@ def _restore_cut_runtime(h: Path) -> None:
           + _cut_list(cut))
 
 
-def _merge_upstream(h: Path, tmp: Path, ident: list[str], base: str = "main") -> tuple[str, str]:
+def _runtime_problem(tmp: Path) -> str:
+    """Why the runtime in worktree `tmp` does not compile or import ("" when it does)."""
+    env = {**os.environ, "PYTHONPATH": str(tmp / "runtime")}
+    for check in ([sys.executable, "-m", "compileall", "-q", "runtime"],
+                  [sys.executable, "-c", "import ttp.daemon, ttp.cli"]):
+        c = subprocess.run(check, cwd=str(tmp), env=env, capture_output=True, text=True, timeout=300)
+        if c.returncode != 0:
+            return f"the merged runtime fails `{' '.join(check[1:])}`: " + (c.stderr or c.stdout).strip()[-400:]
+    return ""
+
+
+def _restore_from_upstream(tmp: Path, ident: list[str], cut: dict[str, str]) -> str:
+    """Check out and commit `cut`'s runtime files from upstream in worktree `tmp` ("" when done)."""
+    if not cut:
+        return ""
+    r = subprocess.run(["git", "-C", str(tmp), "checkout", "upstream", "--", *cut], capture_output=True, text=True)
+    if r.returncode != 0:
+        return (f"runtime files upstream ships are deleted or cut short on main and could not be "
+                f"restored: {_cut_list(cut)}: {r.stderr.strip()[-300:]}")
+    _git(tmp, *ident, "commit", "-q", "-m", "restore runtime files main lost: " + _cut_list(cut))
+    print("warning: restored runtime files main had deleted or cut short: " + _cut_list(cut))
+    return ""
+
+
+def _merge_upstream(h: Path, tmp: Path, ident: list[str], base: str = "main",
+                    kept: dict[str, str] | None = None) -> tuple[str, str]:
     """Merge `upstream` into a scratch worktree of main and check the result compiles and imports.
-    Returns (merge commit, "") or ("", what went wrong); the live harness is never touched here."""
+    Returns (merge commit, "") or ("", what went wrong); the live harness is never touched here.
+    Runtime files kept although they lack names upstream ships are added to `kept` (file -> how)."""
     subprocess.run(["git", "-C", str(h), "worktree", "remove", "--force", str(tmp)], capture_output=True)
     if tmp.exists():
         shutil.rmtree(tmp)
@@ -2268,20 +2297,26 @@ def _merge_upstream(h: Path, tmp: Path, ident: list[str], base: str = "main") ->
             _git(tmp, "checkout", "upstream", "--", *emptied)
             _git(tmp, *ident, "commit", "-q", "-m", "restore template files a crash left empty: " + ", ".join(emptied))
         cut = _cut_runtime(tmp, "HEAD", "upstream")
-        if cut:         # deleted or cut short on main while upstream still ships them: the import would break
-            r = subprocess.run(["git", "-C", str(tmp), "checkout", "upstream", "--", *cut], capture_output=True,
-                               text=True)
-            if r.returncode != 0:
-                return "", (f"runtime files upstream ships are deleted or cut short on main and could not be "
-                            f"restored: {_cut_list(cut)}: {r.stderr.strip()[-300:]}")
-            _git(tmp, *ident, "commit", "-q", "-m", "restore runtime files main lost: " + _cut_list(cut))
-            print("warning: restored runtime files main had deleted or cut short: " + _cut_list(cut))
-        env = {**os.environ, "PYTHONPATH": str(tmp / "runtime")}
-        for check in ([sys.executable, "-m", "compileall", "-q", "runtime"],
-                      [sys.executable, "-c", "import ttp.daemon, ttp.cli"]):
-            c = subprocess.run(check, cwd=str(tmp), env=env, capture_output=True, text=True, timeout=300)
-            if c.returncode != 0:
-                return "", f"the merged runtime fails `{' '.join(check[1:])}`: " + (c.stderr or c.stdout).strip()[-400:]
+        # Deleted, empty or unparseable files are damage. A file that only lacks top-level names upstream
+        # ships may be a deliberate local edit (a helper removed on purpose): it is put back only when
+        # the merged runtime does not compile or import without it, so its other local edits survive.
+        lost = {f: why for f, why in cut.items() if why.startswith("lost ")}
+        why = _restore_from_upstream(tmp, ident, {f: w for f, w in cut.items() if f not in lost})
+        if why:
+            return "", why
+        problem = _runtime_problem(tmp)
+        if problem and lost:
+            why = _restore_from_upstream(tmp, ident, lost)
+            if why:
+                return "", why
+            lost, problem = {}, _runtime_problem(tmp)
+        if problem:
+            return "", problem
+        if lost:
+            print("warning: kept runtime files main changed although they lack names upstream ships (the merged "
+                  "runtime compiles and imports without them): " + _cut_list(lost))
+            if kept is not None:
+                kept.update(lost)
         return _git(tmp, "rev-parse", "HEAD"), ""
     finally:
         subprocess.run(["git", "-C", str(h), "worktree", "remove", "--force", str(tmp)], capture_output=True)
