@@ -192,17 +192,21 @@ def _word_end(s: str, i: int) -> int:
 def check_problem(cmd: str) -> str | None:
     """Why `cmd` cannot be a check command (its first word is no program, path or builtin), or None.
     Leading VAR=value words are skipped; a bare assignment (`h=$(git rev-parse HEAD); ...`) is a
-    command of its own, judged by the command it substitutes, if any."""
+    command of its own, judged by the command it substitutes, if any; a prefix assignment's
+    substitution is judged the same way. Arithmetic $((...)) is no command."""
     rest = cmd.strip()
     while m := re.match(r"[A-Za-z_][A-Za-z0-9_]*=", rest):              # leading VAR=value
         end = _word_end(rest, m.end())
         if end < 0:
             return f"{cmd!r} does not parse as a shell command (unclosed quote or substitution)"
         value, rest = rest[m.end():end], rest[end:].lstrip(" \t")
+        sub = None if value.lstrip('"').startswith("$((") else \
+            re.fullmatch(r'"?\$\((.*)\)"?|"?`(.*)`"?', value, re.S)    # $((...)) is arithmetic
+        inner = sub and (sub.group(1) or sub.group(2) or "").strip()
+        if inner and (problem := check_problem(inner)):                   # bare or prefix alike
+            return problem
         if not rest or rest[0] in ";&|<>\n":
-            sub = re.fullmatch(r'"?\$\((.*)\)"?|"?`(.*)`"?', value, re.S)
-            inner = sub and (sub.group(1) or sub.group(2) or "").strip()
-            return check_problem(inner) if inner else None
+            return None
     try:
         words = shlex.split(rest)
     except ValueError as e:

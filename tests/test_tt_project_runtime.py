@@ -14099,6 +14099,9 @@ def test_config_set_rejects_sentence_push_checks_and_unknown_keys(env):
     "set -e; pytest -q",
     "x=1",
     'A=1 B="x y" pytest -q',
+    "n=$((1+2)); pytest -q",
+    'n="$(( 3 * 4 ))" && test "$n" = 12',
+    "h=$(git rev-parse HEAD) pytest -q",
 ])
 def test_check_problem_accepts_a_bare_assignment_holding_a_command_substitution(env, cmd):
     # A scoped check (`h=$(git rev-parse HEAD); ...`) is a command; shlex used to split the
@@ -14112,6 +14115,8 @@ def test_check_problem_accepts_a_bare_assignment_holding_a_command_substitution(
     ("h=$(Run the tests); true", "'Run' is not a program on PATH"),
     ("Run=all the tests", "'the' is not a program on PATH"),
     ("h=$(git rev-parse HEAD", "does not parse as a shell command"),
+    ("h=$(Run the tests) pytest -q", "'Run' is not a program on PATH"),
+    ('h="$(Run the tests)" pytest -q', "'Run' is not a program on PATH"),
 ])
 def test_check_problem_still_rejects_prose_and_unclosed_substitutions(env, cmd, why):
     from ttp.push import check_problem
