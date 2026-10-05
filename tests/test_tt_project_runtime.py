@@ -6774,6 +6774,21 @@ def _local_only_daemon(p):
     return dm.Daemon(p.base)
 
 
+def _finish_local_only(d):
+    """Wait for the local-only check running in its thread, then let a tick apply what it found."""
+    job = d._local_only_job
+    if job is not None:
+        assert job["done"].wait(60), "the local-only check did not finish"
+        d.check_local_only()
+        assert d._local_only_job is None
+
+
+def _check_local_only(d):
+    """One check_local_only as the daemon runs it: started on one tick, applied on a later one."""
+    d.check_local_only()
+    _finish_local_only(d)
+
+
 def _with_origin(env, clone=True):
     remote = env["tmp"] / "remote.git"
     if clone:
@@ -6799,7 +6814,7 @@ def test_local_only_flags_a_done_branch_on_no_remote_once_until_pushed(env):
     _commit_file(pushed, "c")
     _git_out(pushed, "push", "-q", "origin", f"HEAD:refs/heads/{pushed_branch}")
     d = _local_only_daemon(p)
-    d.check_local_only()
+    _check_local_only(d)
     ev = _local_only_events(p)
     assert [e["task"] for e in ev] == [tid], ev
     assert f"task #{tid}'s branch {branch} exists only on this machine, 2 commits ahead" in ev[0]["text"]
@@ -6807,11 +6822,11 @@ def test_local_only_flags_a_done_branch_on_no_remote_once_until_pushed(env):
         in status_text(p)
     assert health(p, p.db)["local_only"]
     d._local_only_due = 0
-    d.check_local_only()
+    _check_local_only(d)
     assert len(_local_only_events(p)) == 1   # one event, not one per check
     _git_out(path, "push", "-q", "origin", f"HEAD:refs/heads/{branch}")
     d._local_only_due = 0
-    d.check_local_only()
+    _check_local_only(d)
     assert p.db.kv(dm.KV_LOCAL_ONLY) is None and "only on this machine" not in status_text(p)
     assert len(_local_only_events(p)) == 1
 
@@ -6823,7 +6838,7 @@ def test_local_only_skips_a_repo_without_a_remote_and_drops_a_cancelled_task(env
     tid, path, branch = _code_task(p, "no remote")
     _commit_file(path, "a")
     d = _local_only_daemon(p)
-    d.check_local_only()
+    _check_local_only(d)
     assert not _local_only_events(p) and p.db.kv(dm.KV_LOCAL_ONLY) is None
     log = p.logs / "daemon.log"
     assert not log.exists() or "only on this machine" not in log.read_text() and "local-only" not in log.read_text()
@@ -6831,12 +6846,12 @@ def test_local_only_skips_a_repo_without_a_remote_and_drops_a_cancelled_task(env
     subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
     subprocess.run(["git", "-C", str(env["repo"]), "remote", "add", "origin", str(remote)], check=True)
     d._local_only_due = 0
-    d.check_local_only()
+    _check_local_only(d)
     assert len(_local_only_events(p)) == 1 and health(p, p.db)["local_only"]
     p.db.update_task(tid, status="cancelled")
     assert health(p, p.db)["local_only"] == ""   # at once, before the next check
     d._local_only_due = 0
-    d.check_local_only()
+    _check_local_only(d)
     assert p.db.kv(dm.KV_LOCAL_ONLY) is None
 
 
@@ -6852,6 +6867,7 @@ def test_local_only_is_checked_in_the_tick_a_code_task_hands_off_done(env):
     d = _local_only_daemon(p)
     d._local_only_due = time.time() + 3600   # the hourly check is not due
     assert _run_until(d, p, lambda: p.db.task(tid)["status"] == "done")
+    _finish_local_only(d)
     assert [e["task"] for e in _local_only_events(p)] == [tid]
 
 
@@ -6863,7 +6879,7 @@ def test_local_only_raises_no_new_flag_after_a_failed_fetch(env):
     tid, path, _ = _code_task(p, "offline")
     _commit_file(path, "a")
     d = _local_only_daemon(p)
-    d.check_local_only()
+    _check_local_only(d)
     assert not _local_only_events(p) and p.db.kv(dm.KV_LOCAL_ONLY) is None
 
 
@@ -6918,7 +6934,7 @@ def test_local_only_does_not_flag_work_a_reviewer_rebased_or_batched_onto_the_ta
     _reviewer_delivers(env, remote, b1, b2, amend=True)
     _reviewer_delivers(env, remote, b3, amend=True, later="lines.txt")
     d = _local_only_daemon(p)
-    d.check_local_only()
+    _check_local_only(d)
     assert [e["task"] for e in _local_only_events(p)] == [lone]
     assert set(p.db.kv(dm.KV_LOCAL_ONLY)) == {str(lone)}
 
@@ -6943,7 +6959,7 @@ def test_local_only_does_not_flag_work_the_push_queue_pushed(env):
         p.db.x("INSERT INTO push_queue(task,branch,head,target,status,created,updated) VALUES(?,?,?,?,?,?,?)",
                (task, "b", approved, "origin/proj", status, now, now))
     d = _local_only_daemon(p)
-    d.check_local_only()
+    _check_local_only(d)
     assert [e["task"] for e in _local_only_events(p)] == [lone]
     assert worktree.delivered(p.root, base, "HEAD", pushed={fix}) and not worktree.delivered(p.root, base, "HEAD")
 
@@ -6959,11 +6975,11 @@ def test_local_only_leaves_work_a_review_still_needs_or_has_reviewed(env):
     d._local_only_due = time.time() + 3600
     assert _run_until(d, p, lambda: p.db.task(tid)["status"] == "done")
     d._local_only_due = 0
-    d.check_local_only()
+    _check_local_only(d)
     assert not _local_only_events(p)   # the queued review will deliver it
     p.db.update_task(review, status="done")
     d._local_only_due = 0
-    d.check_local_only()
+    _check_local_only(d)
     assert not _local_only_events(p)   # reviewed: a reviewer pushed it in another form
     t2, path2, _ = _code_task(p, "named by commit")
     _commit_file(path2, "b")
@@ -6975,7 +6991,7 @@ def test_local_only_leaves_work_a_review_still_needs_or_has_reviewed(env):
     p.db.add_task("review", f"Review t{t3}.", kind="review", tier="light", origin="user")
     p.db.x("UPDATE tasks SET status='failed' WHERE spec=?", (f"Review t{t3}.",))
     d._local_only_due = 0
-    d.check_local_only()
+    _check_local_only(d)
     assert [e["task"] for e in _local_only_events(p)] == [t3]
 
 
@@ -6989,7 +7005,7 @@ def test_local_only_posts_no_burst_on_upgrade_and_flags_age_out(env):
         _commit_file(path, f"o{i}")
         old.append(tid)
     d = dm.Daemon(p.base)   # first start with the check: earlier work is not flagged
-    d.check_local_only()
+    _check_local_only(d)
     assert not _local_only_events(p) and p.db.kv(dm.KV_LOCAL_ONLY) is None
     since = p.db.kv(dm.KV_LOCAL_ONLY_FROM)
     dm.Daemon(p.base)
@@ -6998,14 +7014,165 @@ def test_local_only_posts_no_burst_on_upgrade_and_flags_age_out(env):
     tid, path, _ = _code_task(p, "new")
     _commit_file(path, "n")
     d._local_only_due = 0
-    d.check_local_only()
+    _check_local_only(d)
     assert [e["task"] for e in _local_only_events(p)] == [tid]
     p.db.x("UPDATE tasks SET updated=? WHERE id=?", (time.time() - (dm.LOCAL_ONLY_DAYS + 1) * 86400, tid))
     p.db.set_kv(dm.KV_LOCAL_ONLY_FROM, 0)
     d._local_only_due = 0
-    d.check_local_only()
+    _check_local_only(d)
     assert p.db.kv(dm.KV_LOCAL_ONLY) == {str(t): p.db.kv(dm.KV_LOCAL_ONLY)[str(t)] for t in old}
     assert len(_local_only_events(p)) == 1 + len(old)
+
+def _delivered_repo(env):
+    """A repository with a base commit on main, for worktree.delivered."""
+    r = env["tmp"] / "delivered"
+    r.mkdir()
+    _git_out(r, "init", "-q", "-b", "main")
+    return r, _commit_files(r, {"a": "1\n2\n3\n4\n5\n6\n7\n8\n", "b": "x\n"}, "base")
+
+
+def _commit_files(repo, files, msg):
+    for name, text in files.items():
+        (repo / name).write_text(text)
+    _git_out(repo, "add", "-A")
+    _git_out(repo, *_IDENT, "commit", "-qm", msg)
+    return _git_out(repo, "rev-parse", "HEAD")
+
+
+def _count_binary_diffs(monkeypatch, raise_on=None):
+    """Count the binary diffs git is asked for; a command holding `raise_on` times out instead."""
+    seen, real = [], subprocess.run
+
+    def run(cmd, *a, **kw):
+        if raise_on and raise_on in cmd:
+            raise subprocess.TimeoutExpired(cmd, 120)
+        if "--binary" in cmd:
+            seen.append(cmd)
+        return real(cmd, *a, **kw)
+    monkeypatch.setattr(subprocess, "run", run)
+    return seen
+
+
+def test_delivered_builds_no_binary_diff_when_the_ref_left_a_changed_file_alone(env, monkeypatch):
+    from ttp import worktree
+    repo, _ = _delivered_repo(env)
+    _git_out(repo, "checkout", "-qb", "feat")
+    head = _commit_files(repo, {"a": "1\n2\nNEW\n4\n5\n6\n7\n8\n"}, "feature work on a")
+    _git_out(repo, "checkout", "-q", "main")
+    _commit_files(repo, {"b": "y\n"}, "other work on b only")
+    diffs = _count_binary_diffs(monkeypatch)
+    assert worktree.delivered(repo, head, "main") is False
+    assert diffs == []
+
+
+def test_delivered_finds_batched_work_and_remembers_it_per_ref_commit(env, monkeypatch):
+    from ttp import worktree
+    repo, _ = _delivered_repo(env)
+    _git_out(repo, "checkout", "-qb", "feat")
+    head = _commit_files(repo, {"a": "1\n2\nNEW\n4\n5\n6\n7\n8\n"}, "feature work on a")
+    _git_out(repo, "checkout", "-q", "main")
+    _commit_files(repo, {"a": "1\n2\nNEW\n4\n5\n6\n7\nLATER\n"}, "batch: lots of work squashed together")
+    diffs = _count_binary_diffs(monkeypatch)
+    assert worktree.delivered(repo, head, "main") is True
+    assert len(diffs) == 1
+    assert worktree.delivered(repo, head, "main") is True
+    assert len(diffs) == 1                       # remembered for this (repo, head, ref commit)
+    _commit_files(repo, {"b": "z\n"}, "the ref moved on")
+    assert worktree.delivered(repo, head, "main") is True
+    assert len(diffs) == 2                       # a new ref commit is looked at again
+    assert worktree.delivered(repo, head, "no-such-ref") is False
+
+
+def test_delivered_cache_is_bounded(env, monkeypatch):
+    from ttp import worktree
+    repo, _ = _delivered_repo(env)
+    _git_out(repo, "checkout", "-qb", "feat")
+    head = _commit_files(repo, {"a": "changed\n"}, "feature work on a")
+    _git_out(repo, "checkout", "-q", "main")
+    monkeypatch.setattr(worktree, "_DELIVERED_MAX", 2)
+    worktree._DELIVERED.update({("r", "h1", "c"): True, ("r", "h2", "c"): True})
+    assert worktree.delivered(repo, head, "main") is False
+    assert list(worktree._DELIVERED) == [(str(repo), head, _git_out(repo, "rev-parse", "main"))]
+
+
+@pytest.mark.parametrize("slow", ["--binary", "cherry"])
+def test_delivered_counts_a_git_call_that_times_out_as_not_delivered(env, monkeypatch, slow):
+    from ttp import worktree
+    repo, _ = _delivered_repo(env)
+    _git_out(repo, "checkout", "-qb", "feat")
+    head = _commit_files(repo, {"a": "1\n2\nNEW\n4\n5\n6\n7\n8\n"}, "feature work on a")
+    _git_out(repo, "checkout", "-q", "main")
+    _commit_files(repo, {"a": "0\n1\n2\n3\n4\n5\n6\n7\n8\n"}, "unrelated change to a")
+    _count_binary_diffs(monkeypatch, raise_on=slow)
+    assert worktree.delivered(repo, head, "main") is False
+
+
+def _done_code_task_on(p, branch):
+    tid = p.db.add_task("example work", "s", kind="code", tier="light", origin="user")
+    p.db.update_task(tid, status="done", branch=branch)
+    return tid
+
+
+def test_local_only_check_runs_off_the_tick_and_a_later_tick_applies_it(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dm
+    tid = _done_code_task_on(p, "ttp/t1-example")
+    d = _local_only_daemon(p)
+    go, calls = threading.Event(), []
+
+    def slow(repo, branches, targets=(), known=frozenset(), timeout_s=0, pushed=frozenset()):
+        calls.append(branches)
+        go.wait(10)
+        return {"ttp/t1-example": ("abc1234", 2)}, True, {}
+    monkeypatch.setattr(dm.worktree, "local_only", slow)
+    monkeypatch.setattr(dm.worktree, "base_ref", lambda p: "main")
+    t0 = time.monotonic()
+    d.check_local_only()
+    assert time.monotonic() - t0 < 2             # the tick does not wait for git
+    d.check_local_only()                         # still running: neither applied nor started again
+    assert p.db.kv(dm.KV_LOCAL_ONLY) is None and d._local_only_job is not None
+    go.set()
+    _finish_local_only(d)
+    assert p.db.kv(dm.KV_LOCAL_ONLY)[str(tid)]["head"] == "abc1234"
+    assert [e["task"] for e in _local_only_events(p)] == [tid]
+    d.check_local_only()                         # not due again for an hour
+    assert len(calls) == 1 and d._local_only_job is None
+
+
+def test_local_only_check_that_raises_in_its_thread_is_logged_and_not_left_running(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dm
+    _done_code_task_on(p, "ttp/t1-example")
+    d = _local_only_daemon(p)
+    calls = []
+
+    def broken(repo, branches, **kw):
+        calls.append(branches)
+        raise RuntimeError("git exploded")
+    monkeypatch.setattr(dm.worktree, "local_only", broken)
+    monkeypatch.setattr(dm.worktree, "base_ref", lambda p: "main")
+    _check_local_only(d)
+    assert d._local_only_job is None and len(calls) == 1
+    assert "local-only branch check: Traceback" in (p.logs / "daemon.log").read_text()
+    assert "git exploded" in (p.logs / "daemon.log").read_text()
+    assert not _local_only_events(p) and p.db.kv(dm.KV_LOCAL_ONLY) is None
+    d._local_only_due = 0                        # the next check starts again when due
+    _check_local_only(d)
+    assert len(calls) == 2 and d._local_only_job is None
+
+
+def test_local_only_check_that_raises_before_its_thread_is_logged(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dm
+    _done_code_task_on(p, "ttp/t1-example")
+    d = _local_only_daemon(p)
+
+    def no_base(p):
+        raise RuntimeError("no base branch")
+    monkeypatch.setattr(dm.worktree, "base_ref", no_base)
+    d.check_local_only()
+    assert d._local_only_job is None
+    assert "no base branch" in (p.logs / "daemon.log").read_text()
 
 
 def test_low_disk_space_blocks_new_workers_and_alerts_once(env, monkeypatch):

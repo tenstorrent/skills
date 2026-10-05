@@ -676,16 +676,38 @@ def queue_pushed(repo: Path, head: str, pushed: set | frozenset) -> bool:
     return r.returncode == 0 and not r.stdout.strip()
 
 
+_DELIVERED: dict[tuple[str, str, str], bool] = {}   # (repo, head, ref commit) -> delivered(): both fixed, so is the answer
+_DELIVERED_MAX = 4096
+
+
 def delivered(repo: Path, head: str, ref: str, pushed: set | frozenset = frozenset()) -> bool:
     """Whether the changes of `head` since it left `ref` are already in `ref`: the push queue pushed
     or landed it (`pushed`, see queue_pushed), every commit has a patch-equivalent one there (`git
     cherry`: rebased or cherry-picked) or one with the same subject (at least 20 characters: rebased
     with conflicts, or amended), every file it changed is the same there (amended or squashed, maybe
     with other work), or its whole diff reverts cleanly from `ref`'s tree (batched, and later work
-    touched the same files elsewhere)."""
-    import tempfile
+    touched the same files elsewhere). Remembered per (repo, head, commit of `ref`). The revert is only
+    tried when `ref` changed every file `head` did since they parted (else it cannot apply): against
+    a far-behind branch of a large repository the binary diff can take minutes. A git call that times
+    out counts as not delivered."""
     if queue_pushed(repo, head, pushed):
         return True
+    ref_commit = _git(repo, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", check=False)
+    if not ref_commit:
+        return False
+    key = (str(repo), head, ref_commit)
+    if key not in _DELIVERED:
+        if len(_DELIVERED) >= _DELIVERED_MAX:
+            _DELIVERED.clear()
+        try:
+            _DELIVERED[key] = _delivered(repo, head, ref_commit)
+        except subprocess.TimeoutExpired:
+            _DELIVERED[key] = False   # too big to tell: not delivered, and the other branches still get checked
+    return _DELIVERED[key]
+
+
+def _delivered(repo: Path, head: str, ref: str) -> bool:
+    import tempfile
     base = _git(repo, "merge-base", ref, head, check=False)
     if not base:
         return False
@@ -700,6 +722,9 @@ def delivered(repo: Path, head: str, ref: str, pushed: set | frozenset = frozens
     files = [f for f in files if f]
     if not files or not _git(repo, "diff", "--no-renames", "--name-only", ref, head, "--", *files, check=False):
         return True
+    theirs = set(_git(repo, "diff", "--no-renames", "--name-only", "-z", base, ref, check=False).split("\0"))
+    if not set(files) <= theirs:
+        return False   # a file `ref` left as it was at `base` cannot hold `head`'s change to it
     patch = subprocess.run(["git", "-C", str(repo), "diff", "--binary", "--no-renames", base, head],
                            capture_output=True, timeout=120).stdout
     with tempfile.TemporaryDirectory() as tmp:

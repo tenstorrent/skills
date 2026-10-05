@@ -218,6 +218,7 @@ class Daemon:
         self._local_only_due = 0.0   # when done code tasks' branches are next checked for remote copies
         self._push_refs_at = 0.0     # when the push queue's pins were last pruned
         self._local_only_ok: dict[str, str] = {}   # branch -> head found on a remote: not looked at again
+        self._local_only_job: dict | None = None   # the check running in its thread, applied by a later tick
         if not isinstance(self.p.db.kv(KV_LOCAL_ONLY_FROM), (int, float)):
             self.p.db.set_kv(KV_LOCAL_ONLY_FROM, time.time())   # work done before the check existed is not flagged
         self._kept: dict[int, tuple[float, float, str]] = {}   # task id -> (task updated, checked, why kept)
@@ -2325,7 +2326,16 @@ class Daemon:
         posts one coordinator event; status and the web app count it until the work is pushed or
         merged, the task leaves done (cancelled) or falls out of the window. Nothing is pushed. A
         repository without a remote is skipped quietly. After a failed fetch the remote refs may be
-        old: flags may clear, but no new one is raised."""
+        old: flags may clear, but no new one is raised. The fetch and the git comparisons run in a
+        thread and a later tick applies what they found: in a large repository they can take minutes,
+        which held the tick and delayed every other part of it. While a check runs none starts; a
+        check that fails, in the thread or before it, is logged and the next one starts when due."""
+        job = self._local_only_job
+        if job is not None:
+            if job["done"].is_set():
+                self._local_only_job = None
+                self._apply_local_only(job)
+            return
         now = time.time()
         if now < self._local_only_due:
             return
@@ -2348,14 +2358,34 @@ class Daemon:
             tasks = [t for t in tasks if not worktree.needed_by(t, open_tasks) and not worktree.needed_by(t, reviews)]
         if not tasks and not told:
             return
+        job = {"tasks": tasks, "reviews": reviews, "found": ({}, True, {}), "error": None, "done": threading.Event()}
+        if not tasks:
+            job["done"].set()
+            return self._apply_local_only(job)
         try:
-            found = (worktree.local_only(self.p.root, [t["branch"] for t in tasks],
-                                         targets=[worktree.base_ref(self.p)],
-                                         known=set(self._local_only_ok.items()), pushed=pushq.pushed_heads(db))
-                     if tasks else ({}, True, {}))
+            branches, targets, known = [t["branch"] for t in tasks], [worktree.base_ref(self.p)], set(self._local_only_ok.items())
+            pushed = pushq.pushed_heads(self.p.db)
         except Exception:
             log(self.p, "local-only branch check: " + traceback.format_exc().replace("\n", " | ")[:1000])
             return
+
+        def work() -> None:
+            try:
+                job["found"] = worktree.local_only(self.p.root, branches, targets=targets, known=known, pushed=pushed)
+            except Exception:
+                job["error"] = traceback.format_exc().replace("\n", " | ")[:1000]
+            finally:
+                job["done"].set()
+        self._local_only_job = job
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_local_only(self, job: dict) -> None:
+        """Record what a finished check_local_only found: flag the new local-only branches, clear the rest."""
+        if job["error"]:
+            log(self.p, "local-only branch check: " + job["error"])
+            return
+        db, now, tasks, reviews, found = self.p.db, time.time(), job["tasks"], job["reviews"], job["found"]
+        told = db.kv(KV_LOCAL_ONLY) or {}
         if found is None:
             if told:
                 db.set_kv(KV_LOCAL_ONLY, None)
