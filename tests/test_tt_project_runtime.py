@@ -1315,7 +1315,7 @@ def test_listener_redelivers_until_acknowledged(env):
     again = subprocess.run(cmd + ["--once", "--ack", "0", "--timeout", "5"], env=run_env,
                            capture_output=True, text=True, timeout=30)
     assert "important" in again.stdout, "an unacknowledged message was not delivered again"
-    done = subprocess.run(cmd + ["--once", "--ack", str(mid), "--timeout", "1"], env=run_env,
+    done = subprocess.run(cmd + ["--once", "--ack", str(mid), "--timeout", "0.3"], env=run_env,
                           capture_output=True, text=True, timeout=30)
     assert "important" not in done.stdout, "an acknowledged message was delivered again"
     assert p.db.one("SELECT last_read FROM chats WHERE id='c1'")["last_read"] == mid
@@ -1328,7 +1328,7 @@ def test_listen_ack_is_clamped_to_known_messages(env):
     p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)",
            (time.time(), "t", time.time()))
     run_env = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost")
-    cmd = [sys.executable, str(TTP), "listen", "demo", "--chat", "c1", "--once", "--timeout", "1"]
+    cmd = [sys.executable, str(TTP), "listen", "demo", "--chat", "c1", "--once", "--timeout", "0.3"]
     mid = p.db.post("out", "first", chat="c1", kind="reply")
     top = p.db.one("SELECT MAX(id) m FROM messages")["m"]
     subprocess.run(cmd + ["--ack", str(top + 1000)], env=run_env, capture_output=True, text=True, timeout=30)
@@ -1345,7 +1345,7 @@ def test_listen_honours_the_project_chat_floor(env):
     p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)",
            (time.time(), "t", time.time()))
     run_env = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost")
-    cmd = [sys.executable, str(TTP), "listen", "demo", "--chat", "c1", "--once", "--timeout", "1"]
+    cmd = [sys.executable, str(TTP), "listen", "demo", "--chat", "c1", "--once", "--timeout", "0.3"]
     p.db.post("out", "routine note", kind="alert", severity="normal")
     p.set_config("notify.chat_min_severity", "high")
     out = subprocess.run(cmd, env=run_env, capture_output=True, text=True, timeout=30).stdout
