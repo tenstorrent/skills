@@ -4715,6 +4715,9 @@ def _stuck_daemon(env, monkeypatch, age):
     p = make(env)
     proc = subprocess.Popen(["sleep", "600"])
     monkeypatch.setattr(watchdog, "_is_daemon", lambda pid: pid == proc.pid and proc.poll() is None)
+    # The stand-in is this test's child: once ended it stays a zombie that kill(pid, 0) still finds
+    # until reaped. poll() reaps it, as init does for a real daemon.
+    monkeypatch.setattr(watchdog, "_alive", lambda pid: pid == proc.pid and proc.poll() is None)
     (p.state / "daemon.pid").write_text(str(proc.pid))
     hb = p.state / "heartbeat"
     hb.write_text(json.dumps({"pid": proc.pid, "started": time.time() - 3600}))
@@ -8538,6 +8541,11 @@ def _release_detached(gate, pids):
     deadline = time.time() + 10
     for pid in pids:
         while time.time() < deadline:
+            try:   # the push process is this test's child: reap it, or its zombie answers kill(pid, 0)
+                if os.waitpid(pid, os.WNOHANG)[0]:
+                    break
+            except ChildProcessError:
+                pass
             try:
                 os.kill(pid, 0)
             except OSError:
