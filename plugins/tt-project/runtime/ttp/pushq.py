@@ -514,6 +514,7 @@ def _died(p: Project, b: dict, m: dict, alert: Callable, why: str, now: float) -
         _event(db, None, "push_batch_died",
                f"push batch {b['id']} {why}; {len(rows)} approval{'s' if len(rows) != 1 else ''} back in the queue, "
                f"retried after {st['backoff_until'] - now:.0f} s", queued=False)
+    push._forget_lock(Path(b["marker"]))     # dead: nothing holds it; the next batch has its own
     if st["deaths"] >= DYING_AFTER:
         alert("push_queue_dying", f"The last {st['deaths']} push batches ended without finishing ({why}). The "
                                   f"approvals stay queued and are retried with a growing pause. Log: {m.get('log') or '?'}",
@@ -626,7 +627,7 @@ def _apply(p: Project, b: dict, m: dict, alert: Callable, now: float) -> None:
                 "refused" if outcome == "refused" else "requeued")
             detail = res.get("detail") if isinstance(res.get("detail"), dict) else None
             if outcome == "refused" and not detail:
-                detail = {"why": str(m.get("detail") or m.get("error") or "")[:2000] or None}
+                detail = {"why": str(m.get("message") or "")[:2000] or None}
             text = json.dumps(detail)[:8000] if detail else None
             if status in ("pushed", "landed"):
                 db.x("UPDATE push_queue SET status=?, pushed_sha=?, version=?, detail=?, updated=? WHERE id=?",
@@ -646,7 +647,7 @@ def _apply(p: Project, b: dict, m: dict, alert: Callable, now: float) -> None:
             st.pop("backoff_until", None)
         if outcome == "tip_failed" and tip and tip not in (st.get("tips_told") or []):
             st["tips_told"] = ((st.get("tips_told") or []) + [tip])[-TIPS_TOLD:]
-            d = m.get("detail") if isinstance(m.get("detail"), dict) else {}
+            d = m.get("tip_check") if isinstance(m.get("tip_check"), dict) else {}
             first = next((x.get("detail") for x in results.values() if isinstance(x.get("detail"), dict)
                           and x["detail"].get("cmd")), {}) or {}
             cmd = d.get("cmd") or first.get("cmd") or "the push checks"
@@ -655,7 +656,7 @@ def _apply(p: Project, b: dict, m: dict, alert: Callable, now: float) -> None:
         if outcome == "rejected":
             st["backoff_until"] = now + BACKOFF_MAX_S
             later.append(("push_rejected", f"The push queue's push to {b['target']} was rejected: "
-                                           f"{str(m.get('detail') or m.get('error') or _tail_of(m, None, 5))[:1500]}. "
+                                           f"{str(m.get('message') or _tail_of(m, None, 5))[:1500]}. "
                                            f"The approvals stay queued and are retried in {BACKOFF_MAX_S // 60} min.", "high"))
         db.set_kv(KV, st)
         for tid in dict.fromkeys(r["task"] for r in rows):
@@ -684,6 +685,8 @@ def _after(p: Project, b: dict, m: dict, status: str, alert: Callable, now: floa
             tail = _tail_of(m, ap)
             how = {"failed": f"failed (exit {ap.get('exit')})", "timeout": "timed out",
                    "killed": "stopped before it finished, also when run once more (host reboots?)"}[status]
+            if ap.get("cmd") and status != "killed":
+                how += f" in `{ap['cmd']}`"
             text = f"after_push of {what} (batch {b['id']}) {how}. The reviews stay done.\n{tail}"
             _event(db, None, "after_push_failed", text, queued=True, severity="high")
     if status in ("failed", "timeout", "killed"):
@@ -704,9 +707,11 @@ def _after_push_set(p: Project, cfg: dict | None) -> bool:
 def _resume(p: Project, b: dict, marker: Path, now: float) -> bool:
     """Run the after_push of a batch whose process died in it once more: the same
     `ttp push --batch <marker>`, which resumes at after_push since the marker has an outcome. It holds
-    a lock of its own (not `push:`, so upgrades do not wait for it) and the marker names it."""
+    the batch's after_push lock (not `push:`, so upgrades do not wait for it), passed down as at the
+    start, and the marker names it."""
+    from .batch import _after_lock
     db = p.db
-    lock_path = p.state / "locks" / f"after_push:resume-{b['id']}.0.lock"
+    lock_path = _after_lock(p, b["id"])
     lock = locks.try_take([lock_path], f"push batch {b['id']} after_push (resumed)", "the push queue")
     if lock is None:
         return False
@@ -751,7 +756,7 @@ def finalize(p: Project, cfg: dict | None = None, alert: Callable = lambda *a, *
             elif live:
                 continue
             else:
-                why = (f"failed: {str(m.get('detail') or m.get('error') or '')[:300]}" if m.get("outcome") == "error"
+                why = (f"failed: {str(m.get('message') or '')[:300]}" if m.get("outcome") == "error"
                        else "ended before writing an outcome (a reboot, a kill or a crash)" if m
                        else "lost its marker")
                 _died(p, b, m, alert, why, now_)

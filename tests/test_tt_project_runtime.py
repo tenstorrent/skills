@@ -8948,7 +8948,7 @@ def test_a_push_batch_lands_its_entries_with_one_bump_one_changeset_and_one_chec
     assert _git_out(origin, "show", "proj:.changeset/p-b1.md") == (
         '---\n"p": patch\n---\n\n`p`:\n\n- e1: edit plugins/p/f1.txt\n- e2: edit plugins/p/f2.txt\n'
         "- e3: edit plugins/p/f3.txt")
-    assert m["phase"] == "finished" and m["after_push"] == {"status": "skipped"}
+    assert m["phase"] == "finished" and m["after_push"] == {"status": "skipped", "reason": "delivery.after_push is not set"}
     assert not list((p.state / "locks").glob("*run-b1*")), "no lock file of the batch is left behind"
 
 
@@ -9409,11 +9409,13 @@ if m.get("outcome") is None:
         sys.exit(3)
     rows = plan.get("rows") or {}
     write(outcome=plan.get("outcome", "pushed"), tip=plan.get("tip"), pushed_sha=plan.get("sha"),
-          version=plan.get("version"), checks={"runs": 1, "seconds": 2.0}, ended=time.time(),
+          version=plan.get("version"), checks={"runs": 1, "seconds": 2.0}, rounds=1, message=plan.get("message"),
+          **({"tip_check": plan["tip_check"]} if "tip_check" in plan else {}),
           results=[{"id": e["id"], "status": rows.get(e["branch"], plan.get("row", "pushed")),
-                    "detail": plan.get("detail") or {}} for e in m["entries"]])
+                    "task": e["task"], "detail": plan.get("detail") or {}} for e in m["entries"]])
     if not plan.get("after"):
-        write(phase="finished", status="done")
+        write(phase="finished", status="finished", ended=time.time(),
+              after_push={"status": "skipped", "reason": "delivery.after_push is not set"})
         sys.exit(0)
     lock = os.path.join(os.path.dirname(m["lock"]), "after_push:run-%s.0.lock" % m["id"])
     fd = os.open(lock, os.O_CREAT | os.O_RDWR)
@@ -9430,7 +9432,7 @@ else:   # started again on a marker with an outcome: only the after_push step
         sys.exit(3)
     after = plan.get("resume_after", "ok")
 write(after_push={"status": after, "exit": 0 if after == "ok" else 2, "started": time.time(), "ended": time.time(),
-                  "tail": "deploy said " + after}, phase="finished", status="done")
+                  "cmd": "./deploy.sh", "tail": "deploy said " + after}, phase="finished", status="finished")
 '''
 
 
@@ -9739,7 +9741,8 @@ def test_a_broken_target_tip_is_reported_once_and_held_until_the_tip_changes(env
     from ttp import pushq
     s = _pq(env, monkeypatch)
     tip = _git_out(s.repo, "rev-parse", "refs/remotes/origin/proj")
-    _pq_plan(s, outcome="tip_failed", tip=tip, row="requeued", detail={"cmd": "make test", "tail": "the tip is red"})
+    _pq_plan(s, outcome="tip_failed", tip=tip, row="requeued", message="the tip of origin/proj fails its checks",
+             tip_check={"cmd": "make test", "tail": "the tip is red"})
     _pq_hand_off(env, s)
     mark = _pq_mark(s.p)
     for _ in range(2):   # the same tip fails twice: one report
@@ -9758,7 +9761,7 @@ def test_a_broken_target_tip_is_reported_once_and_held_until_the_tip_changes(env
     rows, why = pushq.due(s.p, time.time() + 60)
     assert rows, f"a new tip should end the hold: {why}"
     _pq_plan(s, outcome="tip_failed", tip=_git_out(s.repo, "rev-parse", "refs/remotes/origin/proj"), row="requeued",
-             detail={"cmd": "make test", "tail": "still red"})
+             tip_check={"cmd": "make test", "tail": "still red"})
     _pq_batch(s)
     _pq_tend(s)
     assert [e["kind"] for e in _pq_events(s.p, mark) if e["status"] == "queued"] == ["push_tip_failed"] * 2
@@ -9794,6 +9797,7 @@ def test_dead_batches_retry_with_a_growing_pause_and_three_in_a_row_raise_an_ale
         st = s.p.db.kv(pushq.KV)
         assert st["deaths"] == n and st["backoff_until"] >= before + min(1800, 300 * n)
         assert pushq.due(s.p, time.time())[0] == []
+        assert not list((s.p.state / "locks").glob("push:run-*")), "a dead batch's run lock file stays"
         sent = s.p.db.q("SELECT severity FROM messages WHERE kind='alert' AND ref='push_queue_dying'")
         assert len(sent) == (1 if n == 3 else 0)
     assert [b["outcome"] for b in s.p.db.q("SELECT outcome FROM push_batches")] == ["died"] * 3
@@ -9822,6 +9826,126 @@ def test_a_daemon_restart_mid_batch_finalizes_from_the_marker(env, monkeypatch):
     _pq_tend(s)                        # a new daemon reads the marker
     t = s.p.db.task(s.review)
     assert t["status"] == "done" and json.loads(t["result"])["pushed"][0]["version"] == "1.0.1"
+
+
+@pytest.mark.parametrize("outcome, row, detail, kind, want", [
+    ("rejected", "requeued", {}, "push_rejected", "remote said no"),
+    ("refused", "refused", {"message": "remote said no"}, "task_blocked", "push refused: remote said no"),
+    ("error", "requeued", {}, "push_batch_died", "failed: RuntimeError: remote said no")])
+def test_the_push_queue_reports_what_the_batch_wrote_in_its_marker(env, monkeypatch, outcome, row, detail, kind, want):
+    """The batch process explains itself in `message` (and per row in detail.message): the queue
+    passes those words on, not a guess from the log."""
+    s = _pq(env, monkeypatch)
+    _pq_plan(s, outcome=outcome, row=row, detail=detail,
+             message="RuntimeError: remote said no" if outcome == "error" else "remote said no")
+    _pq_hand_off(env, s)
+    mark = _pq_mark(s.p)
+    _pq_batch(s)
+    _pq_tend(s)
+    texts = [e["text"] for e in _pq_events(s.p, mark) if e["kind"] == kind]
+    texts += [m["text"] for m in s.p.db.q("SELECT text FROM messages WHERE kind='alert' AND ref=?", (kind,))]
+    assert texts and all(want in t for t in texts), texts
+
+
+def _pq_real(env, monkeypatch, **delivery):
+    """_pq with the real batch process (`ttp push --batch`) in place of the stub."""
+    from ttp import pushq
+    real = pushq.batch_argv
+    s = _pq(env, monkeypatch, **delivery)
+    monkeypatch.setattr(pushq, "batch_argv", real)
+    return s
+
+
+def test_the_push_queue_and_the_real_batch_process_agree_on_the_marker(env, monkeypatch):
+    """The daemon's side (pushq) starts the real `ttp push --batch`, which pushes the approved head;
+    finalize closes the review from the marker the batch wrote, and nothing of the batch is left."""
+    from ttp import pushq
+    s = _pq_real(env, monkeypatch)
+    _pq_hand_off(env, s)
+    bid = _pq_batch(s)
+    assert pushq._children[bid].returncode == 0, (s.p.state / "pushes" / f"{bid}.log").read_text()
+    m = json.loads((s.p.state / "pushes" / f"{bid}.json").read_text())
+    assert (m["status"], m["phase"], m["outcome"], m["rounds"]) == ("finished", "finished", "pushed", 1), m
+    assert [(r["task"], r["status"]) for r in m["results"]] == [(s.review, "pushed")]
+    _pq_tend(s)
+    sha = _git_out(s.origin, "rev-parse", "proj")
+    assert _git_out(s.origin, "show", "proj:feature.txt") == "feature"
+    t = s.p.db.task(s.review)
+    assert t["status"] == "done" and json.loads(t["result"])["pushed"][0]["sha"] == sha
+    assert s.p.db.one("SELECT outcome, pushed_sha, after_push FROM push_batches") == {
+        "outcome": "pushed", "pushed_sha": sha, "after_push": "skipped"}
+    assert not list((s.p.state / "locks").glob(f"*run-{bid}*"))
+
+
+def test_the_push_queue_resumes_a_cut_short_after_push_with_the_real_batch_process(env, monkeypatch):
+    """A batch that died in after_push (a reboot) leaves its marker with an outcome, phase after_push
+    and a free after_push:run lock. The queue starts the real batch once more under that same lock;
+    it deploys the pushed commit only and finishes the marker."""
+    from ttp import pushq
+    deploys = env["tmp"] / "deploys.log"
+    s = _pq_real(env, monkeypatch, after_push=[f"git rev-parse HEAD >> {deploys}"])
+    _pq_hand_off(env, s)
+    bid = _pq_batch(s)
+    marker = s.p.state / "pushes" / f"{bid}.json"
+    m = json.loads(marker.read_text())
+    sha = m["pushed_sha"]
+    assert m["after_push"]["status"] == "ok" and deploys.read_text().split() == [sha]
+    # Cut short: as the batch left it once it handed over to its after_push lock.
+    lock = s.p.state / "locks" / f"after_push:run-{bid}.0.lock"
+    lock.write_text("")
+    from ttp.project import write_json
+    write_json(marker, {**{k: v for k, v in m.items() if k not in ("after_push", "ended")},
+                        "status": "running", "phase": "after_push", "lock": str(lock)})
+    _pq_tend(s)                    # applies the outcome, then runs the after_push once more
+    assert s.p.db.task(s.review)["status"] == "done"
+    child = pushq._children[bid]
+    child.wait(timeout=60)
+    assert child.returncode == 0, (s.p.state / "pushes" / f"{bid}.log").read_text()
+    _pq_tend(s)
+    m = json.loads(marker.read_text())
+    assert (m["status"], m["phase"], m["after_push"]["status"]) == ("finished", "finished", "ok"), m
+    assert deploys.read_text().split() == [sha, sha] and _git_out(s.origin, "rev-parse", "proj") == sha
+    assert s.p.db.one("SELECT after_push, after_tries FROM push_batches") == {"after_push": "ok", "after_tries": 1}
+    assert not lock.exists()
+
+
+def test_a_push_batch_whose_run_lock_another_process_holds_exits_75_and_touches_nothing(env, monkeypatch):
+    from ttp import locks
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    marker = _batch_marker(p, [_entry(repo, "e1", {"f1.txt": "1\n"})])
+    before = marker.read_text()
+    held = locks.try_take([p.state / "locks" / "push:run-b1.0.lock"], "someone else")
+    try:     # a process of its own, as the queue starts it: this one's descriptor is not passed down
+        r = subprocess.run([sys.executable, "-m", "ttp", "push", "--batch", str(marker)], cwd=str(repo), input="",
+                           env={**os.environ, "PYTHONPATH": str(RUNTIME)}, capture_output=True, text=True,
+                           timeout=60)
+    finally:
+        held.close()
+    assert r.returncode == 75 and marker.read_text() == before, r.stdout + r.stderr
+    assert not (p.worktrees / "push").exists()
+
+
+def test_a_push_batch_commits_with_the_repositorys_own_git_identity(env, monkeypatch):
+    """Like ttp push, the batch takes the identity the repository resolves (its config), not one of
+    its own and not the environment of whoever started it."""
+    p, repo, origin, other = _bump_setup(env, monkeypatch, ["true"])
+    heads = [_entry(repo, f"e{n}", {f"plugins/p/f{n}.txt": f"{n}\n"}) for n in (1, 2)]
+    for var in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "EMAIL"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "user.useConfigOnly")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "true")
+    _git_out(repo, "config", "user.name", "Repo Ident")
+    _git_out(repo, "config", "user.email", "repo@example.invalid")
+    before = _git_out(origin, "rev-parse", "proj")
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed", m
+    log = _git_out(origin, "log", "--format=%an <%ae>|%cn <%ce>", f"{before}..proj").splitlines()
+    assert log[0] == "Repo Ident <repo@example.invalid>|Repo Ident <repo@example.invalid>", "the bump commit"
+    # e1 sits on the tip as it is; e2 is replayed onto it: its author stays, the repository commits it.
+    assert log[1:] == ["t <t@t>|Repo Ident <repo@example.invalid>", "t <t@t>|t <t@t>"], log
 
 
 def test_after_push_failures_are_reported_and_a_deploy_cut_short_runs_once_more(env, monkeypatch):

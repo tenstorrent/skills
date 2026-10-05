@@ -771,8 +771,10 @@ def after_push(p: Project, marker: Path, m: dict) -> dict:
     d = p.config().get("delivery") or {}
     cmds = push.check_list(d.get("after_push"))
     sha = m.get("pushed_sha")
-    if m.get("outcome") != "pushed" or not sha or not cmds:
-        return {"status": "skipped"}
+    if m.get("outcome") != "pushed" or not sha:
+        return {"status": "skipped", "reason": "nothing was pushed"}
+    if not cmds:
+        return {"status": "skipped", "reason": "delivery.after_push is not set"}
     timeout = _seconds(d.get("after_push_timeout_s"), DEFAULT_AFTER_PUSH_TIMEOUT_S)
     repo = Path(m.get("repo") or p.root)
     bid = str(m.get("id") or marker.stem)
