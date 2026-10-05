@@ -46,6 +46,8 @@
   after they passed on HEAD. Say in `summary` what ran and passed. One PR per change.
 - Publish your own branch with `ttp push --own --detach` (same probe and exit codes as above): it
   runs the checks on your HEAD and pushes it as it is under its own name, never a shared branch.
+  A branch your spec names instead of `ttp/t<id>-...` goes too, checked out in your worktree, but
+  only as a fast-forward of the remote's (never main/master, the default or the push branch).
 - NEVER mark a PR ready for review or open one that is not a draft: only the user takes a PR out
   of draft. The harness's `gh` refuses it until the user's approval is recorded; never work around it.
   If it refuses, hand off `blocked` with the PR's URL in `pr`: the coordinator asks the user.

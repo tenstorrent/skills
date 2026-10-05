@@ -2232,8 +2232,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--result", metavar="MARKER",
                    help="push nothing: report a detached push; exit 0 once it finished (or died), 1 while it runs")
     s.add_argument("--own", action="store_true",
-                   help="publish this task's own ttp/t<id>-... branch under its name, as it is (checks, no rebase); "
-                        "never delivery.push_branch")
+                   help="publish the checked-out branch under its name, as it is (checks, no rebase): this task's "
+                        "ttp/t<id>-... branch, or another named branch as a fast-forward only; "
+                        "never delivery.push_branch, main or the default branch")
     s.add_argument("--queue", action="store_true",
                    help="push nothing: list the push queue's entries and its last 10 batches")
     s.add_argument("--marker", help=argparse.SUPPRESS)   # the detached process itself

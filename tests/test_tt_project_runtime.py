@@ -10591,7 +10591,7 @@ def test_push_own_publishes_the_tasks_own_branch_as_it_is_and_never_a_shared_one
     monkeypatch.setenv("TTP_TASK", "31")
     assert _ttp("push", "--own") == 2 and "ttp/t31-" in capsys.readouterr().err
     monkeypatch.delenv("TTP_TASK")
-    for name in ("proj", "main", "feature"):
+    for name in ("proj", "main", "master"):
         _git_out(repo, "checkout", "-q", "-B", name)
         assert _ttp("push", "--own") == 2, name
     _git_out(repo, "checkout", "-q", "--detach")
@@ -10605,6 +10605,48 @@ def test_push_own_publishes_the_tasks_own_branch_as_it_is_and_never_a_shared_one
     # Pushing must still be allowed at all.
     p.set_config("delivery.push_allowed", False)
     assert _ttp("push", "--own") == 2
+
+
+def test_push_own_publishes_a_named_branch_only_as_a_fast_forward(env, monkeypatch, capsys):
+    log = env["tmp"] / "checked"
+    p, repo, origin, other = _push_setup(env, monkeypatch, [f"git rev-parse HEAD >> {log}"])
+    monkeypatch.setenv("TTP_TASK", "40")   # the worktree's own branch, named by the spec, not ttp/t40-...
+    _git_out(repo, "checkout", "-q", "-b", "someone/feature-x")
+    _commit(repo, "a.txt", "a\n")
+    first = _git_out(repo, "rev-parse", "HEAD")
+    assert _ttp("push", "--own") == 0, "new on the remote"
+    assert _git_out(origin, "rev-parse", "someone/feature-x") == first
+    _commit(repo, "b.txt", "b\n")
+    second = _git_out(repo, "rev-parse", "HEAD")
+    assert _ttp("push", "--own") == 0, "a fast-forward of the remote's tip"
+    assert _git_out(origin, "rev-parse", "someone/feature-x") == second
+    # Someone else moved it: diverged, refused before the checks run, the remote keeps theirs.
+    _git_out(other, "fetch", "-q", "origin", "someone/feature-x")
+    _git_out(other, "checkout", "-q", "-b", "fx", "FETCH_HEAD")
+    _commit(other, "theirs.txt", "theirs\n")
+    _git_out(other, "push", "-q", "origin", "HEAD:someone/feature-x")
+    theirs = _git_out(origin, "rev-parse", "someone/feature-x")
+    _commit(repo, "c.txt", "c\n")
+    capsys.readouterr()
+    assert _ttp("push", "--own") == 2 and "not an ancestor of HEAD" in capsys.readouterr().err
+    assert _git_out(origin, "rev-parse", "someone/feature-x") == theirs
+    assert log.read_text().split() == [first, second]
+    # The push target, main/master and the remote's default branch: refused, whatever their history.
+    for name in ("proj", "main", "master"):
+        _git_out(repo, "checkout", "-q", "-B", name, _git_out(origin, "rev-parse", "proj"))
+        assert _ttp("push", "--own") == 2 and "shared branch" in capsys.readouterr().err, name
+    _git_out(other, "push", "-q", "origin", "HEAD:refs/heads/trunk")
+    _git_out(origin, "symbolic-ref", "HEAD", "refs/heads/trunk")
+    _git_out(repo, "fetch", "-q", "origin", "trunk")
+    _git_out(repo, "checkout", "-q", "-B", "trunk", "FETCH_HEAD")
+    _commit(repo, "d.txt", "d\n")
+    assert _ttp("push", "--own") == 2 and "default branch" in capsys.readouterr().err
+    _git_out(repo, "checkout", "-q", "--detach")
+    assert _ttp("push", "--own") == 2 and "detached HEAD" in capsys.readouterr().err
+    refs = _git_out(origin, "for-each-ref", "--format=%(refname:short)", "refs/heads").split()
+    assert sorted(refs) == ["proj", "someone/feature-x", "trunk"]
+    assert _git_out(origin, "rev-parse", "trunk") == theirs
+    assert log.read_text().split() == [first, second], "no refused push ran its checks"
 
 
 def test_push_own_without_checks_publishes_docs_only_and_refuses_code(env, monkeypatch, capsys):

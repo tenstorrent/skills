@@ -369,22 +369,43 @@ def target(p: Project, repo: Path) -> tuple[str, str]:
 
 
 def own_target(p: Project, repo: Path) -> tuple[str, str]:
-    """(remote, branch) for `ttp push --own`: the checked-out branch, which must be a task's own
-    `ttp/t<id>-...` branch (inside a run: this task's), published under the same name on the remote
-    of `delivery.push_branch` (else origin). Never the push branch or the branch work starts from."""
+    """(remote, branch) for `ttp push --own`: the checked-out branch, published under the same name
+    on the remote of `delivery.push_branch` (else origin). A `ttp/t<id>-...` branch must be this
+    task's (inside a run); any other named branch (one a spec names, e.g. <user>/feature-x) may go
+    too, but only as a fast-forward (publish, ff_only). Never a detached HEAD, main/master, the push
+    branch or the branch work starts from; publish also refuses the remote's default branch."""
     branch = _git(repo, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
+    if not branch:
+        raise ValueError("--own publishes the checked-out branch, not a detached HEAD")
     m = OWN_BRANCH.fullmatch(branch)
-    if not m:
-        raise ValueError(f"--own publishes only a task's own branch (ttp/t<id>-...), not {branch or 'a detached HEAD'}")
     task = os.environ.get("TTP_TASK")
-    if task and m.group(1) != task:
+    if m and task and m.group(1) != task:
         raise ValueError(f"--own publishes only this task's own branch (ttp/t{task}-...), not {branch}")
     d = p.config().get("delivery") or {}
     remote, shared = target(p, repo) if str(d.get("push_branch") or "").strip() else ("origin", "")
     base = str(d.get("base_ref") or "").strip()
-    if branch in (shared, base, base.partition("/")[2]):
+    if branch in PROTECTED or branch in (shared, base, base.partition("/")[2]):
         raise ValueError(f"--own never pushes to a shared branch ({branch})")
     return remote, branch
+
+
+def behind(repo: Path, remote: str, branch: str) -> str:
+    """Why pushing HEAD to remote/branch would not be a fast-forward, or "" when the branch is new
+    there or its tip is an ancestor of HEAD. Fails closed when the remote cannot be read."""
+    ls = _git(repo, "ls-remote", "--heads", remote, f"refs/heads/{branch}")
+    if ls.returncode != 0:
+        return f"cannot reach {remote}: {ls.stderr.strip()}"
+    tip = next((ln.split("\t")[0] for ln in ls.stdout.splitlines()
+                if ln.endswith(f"\trefs/heads/{branch}")), "")
+    if not tip:
+        return ""
+    tip = _fetch(repo, remote, branch)   # the latest tip, should it have moved since
+    if not tip:
+        return f"cannot fetch {remote}/{branch} to compare with HEAD"
+    if _git(repo, "merge-base", "--is-ancestor", tip, "HEAD").returncode != 0:
+        return (f"{remote}/{branch} ({tip[:10]}) is not an ancestor of HEAD: --own only fast-forwards "
+                "a branch that is not a ttp/t<id>-... one, never rewrites it")
+    return ""
 
 
 def delivered_pr(p: Project, task: dict, head: str) -> str | None:
@@ -766,16 +787,17 @@ def push(repo: Path, remote: str, branch: str, checks: list[str], rounds: int = 
 def publish(repo: Path, remote: str, branch: str, checks: list[str],
             say: Callable[[str], None] = lambda m: print(f"ttp push: {m}", file=sys.stderr),
             hold: Callable[[], Any] | None = None, timed: Callable[[float], None] | None = None,
-            base: str | None = None) -> int:
+            base: str | None = None, ff_only: bool = False) -> int:
     """`ttp push --own`: run `checks` on HEAD as it is and push it to remote/branch, the task's own
     branch. No rebase and no version bump, so the pushed commit is the one reviewed; without force,
     so the remote takes only a fast-forward of what it has. Without checks, as for `ttp push`, only
-    a docs-only change since `base` (the project's push target) may go."""
+    a docs-only change since `base` (the project's push target) may go. `ff_only` (a branch that is
+    not a `ttp/t<id>-...` one) refuses before the checks unless it fast-forwards the remote's."""
     repo = Path(_git(repo, "rev-parse", "--show-toplevel").stdout.strip() or repo)
     if _git(repo, "status", "--porcelain", "--untracked-files=no").stdout.strip():
         say("uncommitted changes; commit first")
         return REFUSED
-    why = refusal(repo, remote, branch)
+    why = refusal(repo, remote, branch) or (behind(repo, remote, branch) if ff_only else "")
     if why:
         say(why)
         return REFUSED
@@ -945,7 +967,8 @@ def run(p: Project, repo: Path, own: bool = False) -> int:
             except ValueError:
                 pass
         return publish(repo, remote, branch, checks, hold=lambda: take(p, remote, branch, wait_s),
-                       timed=lambda s: record_check_s(p, s), base=base)
+                       timed=lambda s: record_check_s(p, s), base=base,
+                       ff_only=not OWN_BRANCH.fullmatch(branch))
     return push(repo, remote, branch, checks, rounds, hold=lambda: take(p, remote, branch, wait_s),
                 version_bump=version_bump, timed=lambda s: record_check_s(p, s))
 
