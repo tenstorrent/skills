@@ -209,6 +209,13 @@ def test_coordinator_rewrites_a_changed_restriction_in_place():
         assert phrase in rule, phrase
     # Next to the other charter_update guidance, under User instructions.
     assert coordinator.index("# User instructions") < start < coordinator.index("# Keep moving")
+    assert "merges the permanent Restrictions sections into one block" in rule
+    assert "full heading or number" in coordinator and "`Charter sections` line" in coordinator
+    start = coordinator.index("If that change is rejected")
+    carry = coordinator[start:coordinator.index(" - ", start)]
+    for phrase in ("the user's yes stays on record", "without asking again", "same section, target and text",
+                   "`coordinator.charter_approval_days`"):
+        assert phrase in carry, phrase
 
 
 # Wording that makes the user do, or approve, what tt-project can do itself.
