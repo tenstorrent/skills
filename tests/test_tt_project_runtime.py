@@ -8463,7 +8463,7 @@ def _push_proc(p, cwd, **kw):
 
 def test_concurrent_pushes_to_one_branch_take_turns_and_both_land(env, monkeypatch):
     log = env["tmp"] / "checks.log"
-    p, repo, origin, other = _push_setup(env, monkeypatch, [f"echo start >> {log}; sleep 2; echo end >> {log}"])
+    p, repo, origin, other = _push_setup(env, monkeypatch, [f"echo start >> {log}; sleep 1; echo end >> {log}"])
     second = env["tmp"] / "second"
     subprocess.run(["git", "clone", "-q", "-b", "proj", str(origin), str(second)], check=True)
     _commit(repo, "mine.txt", "mine\n")
