@@ -291,8 +291,20 @@ class DB:
         now = time.time()
         rows = self.q("SELECT * FROM tasks WHERE status='queued' AND (not_before IS NULL OR not_before<=?) "
                       "ORDER BY priority, id", (now,))
-        done = {r["id"] for r in self.q("SELECT id FROM tasks WHERE status='done'")}
-        return [r for r in rows if all(d in done for d in dependency_ids(r)) and "when" not in deferral(r)]
+        unmet = self.unmet_dependencies(rows)
+        return [r for r in rows if not unmet[r["id"]] and "when" not in deferral(r)]
+
+    def unmet_dependencies(self, tasks: list[dict]) -> dict[int, list]:
+        """Task id -> the dependencies it still waits on. Only 'done' satisfies a dependency, with
+        one exception: a review's dependency on the task it reviews, while that task waits in
+        'review'. Only the review can move it on, so waiting for 'done' would stall both; any
+        other prerequisite of the review still has to finish."""
+        states = {r["id"]: r for r in self.q("SELECT id, status, branch FROM tasks WHERE status IN ('done','review')")}
+        out: dict[int, list] = {}
+        for t in tasks:
+            out[t["id"]] = [d for d in dependency_ids(t) if d not in states or (states[d]["status"] != "done"
+                            and not (t.get("kind") == "review" and reviews_task(t, states[d])))]
+        return out
 
     def dead_dependencies(self) -> list[tuple[dict, Any, str]]:
         """Queued tasks waiting on a dependency that can no longer finish: (task, dependency, why)."""
@@ -322,8 +334,10 @@ class DB:
         if not since:
             return []
         waiting: dict[int, list[dict]] = {}
-        for t in self.q("SELECT * FROM tasks WHERE status='queued' AND depends_on NOT IN ('', '[]') ORDER BY id"):
-            for d in set(dependency_ids(t)):
+        rows = self.q("SELECT * FROM tasks WHERE status='queued' AND depends_on NOT IN ('', '[]') ORDER BY id")
+        unmet = self.unmet_dependencies(rows)
+        for t in rows:
+            for d in set(unmet[t["id"]]):
                 if d in since:
                     waiting.setdefault(d, []).append(t)
         return [(self.task(d), since[d], ts) for d, ts in sorted(waiting.items())]
@@ -414,6 +428,17 @@ def continues_id(task: dict) -> int | None:
         if isinstance(lb, str) and lb.startswith("continues:") and lb[10:].isdigit():
             return int(lb[10:])
     return None
+
+
+def reviews_task(review: dict, task: dict) -> bool:
+    """True when `review` names `task` as what it reviews: by its `auto_review:<id>` label, or by
+    the task's id (#12, t12, task 12) or branch in its title or spec."""
+    tid, branch = task["id"], task.get("branch")
+    if f'"auto_review:{tid}"' in (review.get("labels") or ""):
+        return True
+    named = re.compile(rf"(?<![\w.-])(?:#|t|task\s+){tid}(?!\d)"
+                       + (rf"|(?<![\w/.-]){re.escape(branch)}(?![\w/-])" if branch else ""), re.I)
+    return bool(named.search(f"{review.get('title') or ''}\n{review.get('spec') or ''}"))
 
 
 DEFER_LABELS = ("start_after", "start_when", "deferred_since")

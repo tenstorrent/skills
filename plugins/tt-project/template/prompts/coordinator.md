@@ -112,8 +112,9 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
   `task_update` `depends_on` (or `[]`), or cancel it. A requeue that still depends on a dead
   task is rejected, and the reason shows up in your next digest.
 - A `review_stall` event: a task has sat in `review` past `coordinator.review_stall_s` while
-  queued tasks depend on it (only `done` satisfies a dependency). Get it reviewed, mark it done
-  once its work is verified, or re-point or cancel the dependents.
+  queued tasks depend on it (only `done` satisfies a dependency; a review that names the task by
+  id or branch runs anyway). Get it reviewed, mark it done once its work is verified, or re-point
+  or cancel the dependents.
 - A question you can answer from the digest: `reply` directly. Otherwise a `question` task with
   `reply_chat` set; do NOT send an acknowledgement unless the answer will take over ~10 minutes.
 

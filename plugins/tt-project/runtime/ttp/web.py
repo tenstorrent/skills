@@ -19,9 +19,10 @@ from . import coordinator as coord
 from . import release
 from . import schedule as sched
 from . import upstream
-from .daemon import HEARTBEAT_STALE_S, KV_LOCAL_ONLY, LOGGED_OUT_NOTE, WATCHDOG_S, heartbeat, idle_wake
+from .daemon import HEARTBEAT_STALE_S, KV_LOCAL_ONLY, LOGGED_OUT_NOTE, WAIT_KEYS, WATCHDOG_S, heartbeat, idle_wake
 from .alerts import cleared  # noqa: F401  (readers import it from here)
-from .db import DB, SEVERITY_RANK, chat_floor, dump_result, host_line, load_result
+from .db import (DB, SEVERITY_RANK, chat_floor, continues_id, deferral, dependency_ids, dump_result, host_line,
+                 load_result)
 from .project import Project, durable_write
 from .providers import get_provider
 from .runner import stop_runs
@@ -357,16 +358,24 @@ def attention(db: DB, now: float) -> list[dict]:
 
 def state_payload(p: Project, db: DB) -> dict:
     now = time.time()
-    tasks = db.q("SELECT id,title,kind,status,priority,tier,provider,budget_usd,spent_usd,attempts,origin,branch,"
-                 "pr_url,blocked_reason,not_before,created,updated,result,labels FROM tasks WHERE status NOT IN ('done','failed',"
+    tasks = db.q("SELECT id,title,kind,status,priority,tier,provider,budget_usd,spent_usd,attempts,max_attempts,"
+                 "origin,branch,pr_url,blocked_reason,not_before,created,updated,result,labels,depends_on FROM tasks WHERE status NOT IN ('done','failed',"
                  "'cancelled') OR updated>? ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'blocked' THEN 1 "
                  "WHEN 'review' THEN 2 WHEN 'queued' THEN 3 ELSE 4 END, priority, id DESC LIMIT 200",
                  (now - 7 * 86400,))
     in_review = db.review_since()
+    # The dependency graph and start/retry conditions, so outside tools need not infer them.
+    unmet = db.unmet_dependencies(db.q("SELECT * FROM tasks WHERE status='queued'"))
     for t in tasks:
         t["review_since"] = in_review.get(t["id"])
-        t["result"] = str(load_result(t["result"]).get("summary") or "")[:600]
+        result = load_result(t["result"])
+        t["result"] = str(result.get("summary") or "")[:600]
         t["starts"] = coord.starts_text(t, now) if t["status"] == "queued" else ""
+        d = deferral(t)
+        t.update(depends_on=dependency_ids(t), waits_on=unmet.get(t["id"], []), continues=continues_id(t),
+                 start_after=d.get("after"), start_when=d.get("when"),
+                 retry={**{k: result[k] for k in WAIT_KEYS if k in result}, "next_try": t["not_before"]}
+                 if t["status"] == "queued" and result.get("status") == "waiting" else None)
         del t["labels"]
     runs = db.q("SELECT id,task,role,provider,model,effort,status,started,ended,cost_usd FROM runs "
                 "ORDER BY id DESC LIMIT 40")

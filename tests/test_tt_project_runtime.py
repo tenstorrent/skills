@@ -2739,6 +2739,69 @@ def test_a_dependency_left_in_review_too_long_is_raised_once_and_its_age_shown(e
     assert len(raised()) == 2
 
 
+def test_a_review_that_depends_on_the_task_it_reviews_runs_while_that_task_waits_in_review(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    impl = p.db.add_task("make it faster", "s", kind="code", origin="user", branch="ttp/t1-make-it-faster")
+    p.db.update_task(impl, status="review")
+    pre = p.db.add_task("set up the bench", "s", origin="user")
+    stack = p.db.add_task("stacked change", "s", kind="code", origin="user")
+    p.db.update_task(stack, status="review")
+    assert coord.apply(p, [
+        {"type": "task_add", "title": f"Review #{impl}: make it faster", "kind": "review", "spec": "check it",
+         "depends_on": [impl, pre]},
+        {"type": "task_add", "title": "Review the bench", "kind": "review", "depends_on": [impl],
+         "spec": "check ttp/t1-make-it-faster"},
+        {"type": "task_add", "title": "Review the stacked change", "kind": "review", "depends_on": [stack, impl],
+         "spec": f"review #{stack}, after the change under it is accepted"},
+        {"type": "task_add", "title": "Use it", "spec": f"build on #{impl}", "depends_on": [impl]}]) == []
+    by = {t["title"]: t["id"] for t in p.db.q("SELECT id, title FROM tasks")}
+    named, by_branch, stacked, user = (by[f"Review #{impl}: make it faster"], by["Review the bench"],
+                                       by["Review the stacked change"], by["Use it"])
+    unmet = p.db.unmet_dependencies([p.db.task(i) for i in (named, by_branch, stacked, user)])
+    # Its subject waiting in review is no prerequisite of the review; anything else still is.
+    assert unmet == {named: [pre], by_branch: [], stacked: [impl], user: [impl]}
+    assert [t["id"] for t in p.db.ready_tasks()] == [pre, by_branch]
+    p.db.update_task(pre, status="done")
+    assert [t["id"] for t in p.db.ready_tasks()] == [named, by_branch]
+    # A review its subject is waiting on is not reported as held back by that subject.
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+           (time.time() - 5 * 3600, f"task:{impl}", "task_review", "normal", "handed off", "handled", impl))
+    stalls = {rev["id"]: [t["id"] for t in deps] for rev, _, deps in p.db.stalled_reviews(3600, time.time())}
+    assert stalls == {impl: [stacked, user]}
+    # The subject still running is a real prerequisite: the review waits for its hand-off.
+    p.db.update_task(impl, status="running")
+    assert p.db.unmet_dependencies([p.db.task(named)]) == {named: [impl]}
+
+
+def test_status_json_exposes_each_tasks_dependencies_and_start_and_retry_conditions(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.db import dump_result
+    from ttp.web import state_payload
+    first = p.db.add_task("first", "s", origin="user")
+    old = p.db.add_task("old try", "s", origin="user")
+    p.db.update_task(old, status="failed")
+    assert coord.apply(p, [
+        {"type": "task_add", "title": "later", "depends_on": [first], "continues": old,
+         "start_after": "3h", "start_when": "test -e /tmp/ready"}]) == []
+    later = p.db.one("SELECT id FROM tasks WHERE title='later'")["id"]
+    retry_at = time.time() + 900
+    p.db.update_task(first, not_before=retry_at, result=dump_result(
+        {"status": "waiting", "summary": "busy", "retry_when": "test -e /tmp/free", "retry_after_s": 900,
+         "waiting_for": "the bench", "waits": 2}))
+    tasks = {t["id"]: t for t in json.loads(json.dumps(state_payload(p, p.db), default=str))["tasks"]}
+    t = tasks[later]
+    assert t["depends_on"] == [first] and t["waits_on"] == [first] and t["continues"] == old
+    assert abs(t["start_after"] - (time.time() + 3 * 3600)) < 60 and t["start_when"] == "test -e /tmp/ready"
+    assert t["retry"] is None and t["max_attempts"] == 3
+    f = tasks[first]
+    assert f["depends_on"] == [] and f["waits_on"] == [] and f["continues"] is None
+    assert f["start_after"] is None and f["start_when"] is None
+    assert f["retry"] == {"retry_when": "test -e /tmp/free", "retry_after_s": 900, "waiting_for": "the bench",
+                          "waits": 2, "next_try": retry_at}
+
+
 def test_a_review_task_nothing_waits_on_is_not_raised(env):
     p = make(env)
     from ttp.daemon import Daemon
