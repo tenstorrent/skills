@@ -1235,9 +1235,11 @@ class Daemon:
 
     def _check_price_table(self, r: dict, usage) -> None:
         """Price a finished Claude run's session log with the table that estimates other local
-        sessions, and raise a low alert when it drifts from the cost Claude Code reported."""
+        sessions, and raise a low alert when it drifts from the cost Claude Code reported. A resumed
+        run is skipped: its session log also holds the calls of the run it resumed."""
         if (r["provider"] != "claude" or usage.estimated or not usage.cost_usd or not usage.session_id
-                or float((self.cfg.get("budget") or {}).get("global_daily_usd") or 0) <= 0):
+                or float((self.cfg.get("budget") or {}).get("global_daily_usd") or 0) <= 0
+                or json.loads(r.get("note") or "{}").get("resumes")):
             return
         try:
             drift = localspend.calibrate(usage.session_id, usage.cost_usd)

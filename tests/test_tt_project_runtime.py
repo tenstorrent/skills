@@ -20937,6 +20937,13 @@ def test_the_price_table_is_checked_against_reported_run_costs(env, tmp_path, mo
     for i in range(6):   # the median of the last CALIBRATION_KEEP runs moves once most of them drift
         drift = ls.calibrate(f"r{i % 3}", 18.3 / 1.02)
     assert drift is not None and abs(drift - 0.02) < 0.001 and drift > ls.DRIFT, drift
+    # A long scan holds the cache lock: the check gives up after a short wait instead of stalling.
+    import fcntl
+    monkeypatch.setattr(ls, "CALIBRATION_WAIT_S", 0.1)
+    with open(ls.project.HOME_DIR / "session-spend.lock", "a") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        t0 = time.monotonic()   # flock: a second open of the file is a second holder, even in one process
+        assert ls.calibrate("r0", 18.3) is None and time.monotonic() - t0 < 5
 
 
 def test_a_claude_run_starts_with_its_own_session_id(env, monkeypatch):
@@ -20981,3 +20988,6 @@ def test_a_drifting_price_table_raises_a_low_alert(env, monkeypatch):
     monkeypatch.setattr(ls, "calibrate", lambda sid, usd: 0.005)
     d._check_price_table({"provider": "claude"}, usage)
     assert len(sent) == 1
+    asked.clear()
+    d._check_price_table({"provider": "claude", "note": json.dumps({"resumes": {"run": 1, "session": "s1"}})}, usage)
+    assert asked == [], "a resumed run's log also holds the run it resumed"

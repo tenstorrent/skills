@@ -78,6 +78,7 @@ MEMO_S = 30                  # one process reads the estimate again after this l
 DRIFT = 0.01                 # the price table is stale once it is this far off Claude Code's own cost
 DRIFT_RUNS = 3               # over at least this many runs
 CALIBRATION_KEEP = 10
+CALIBRATION_WAIT_S = 2.0     # calibrate() waits at most this long for the cache lock
 _SUFFIX = re.compile(r"^(-\d{8})?(\[[^\]]*\])?$")
 
 
@@ -462,7 +463,8 @@ def calibrate(session_id: str, reported_usd: float, now: float | None = None,
               root: Path | None = None) -> float | None:
     """Price a finished run's session log, compare it with the cost Claude Code reported, and keep
     the last CALIBRATION_KEEP pairs. Returns the median drift (priced / reported - 1) once there are
-    DRIFT_RUNS of them, else None. Runs with an unknown model, or too cheap to compare, are skipped."""
+    DRIFT_RUNS of them, else None. Runs with an unknown model, or too cheap to compare, are skipped,
+    and so is a run whose cache lock stays busy (a scan) for CALIBRATION_WAIT_S."""
     if reported_usd < 0.05:
         return None
     got = session_cost(session_id, root)
@@ -470,7 +472,15 @@ def calibrate(session_id: str, reported_usd: float, now: float | None = None,
         return None
     project.HOME_DIR.mkdir(parents=True, exist_ok=True)
     with open(project.HOME_DIR / "session-spend.lock", "a") as lk:
-        fcntl.flock(lk, fcntl.LOCK_EX)
+        give_up = time.monotonic() + CALIBRATION_WAIT_S
+        while True:   # a long scan holds the lock: skip this run rather than stall the daemon
+            try:
+                fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= give_up:
+                    return None
+                time.sleep(0.05)
         cache = load()
         pairs = [x for x in (cache.get("calibration") or []) if isinstance(x, list) and len(x) == 3]
         pairs = (pairs + [[now or time.time(), round(reported_usd, 6), round(got[0], 6)]])[-CALIBRATION_KEEP:]
