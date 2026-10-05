@@ -9003,7 +9003,7 @@ def test_a_push_batch_entry_with_a_real_conflict_stays_out_and_the_others_land(e
     assert _ttp("push", "--result", str(live)) == 0 and "without an outcome" in capsys.readouterr().out
 
 
-def test_merge3_keeps_lines_both_sides_added_and_leaves_real_conflicts():
+def test_merge3_keeps_lines_both_sides_added_and_leaves_real_conflicts(env):
     from ttp.batch import merge3
     assert merge3("a\nX\n", "a\n", "a\nY\n") == "a\nX\nY\n"
     assert merge3("a\nX\nb\n", "a\nb\n", "a\nY\nb\n") == "a\nX\nY\nb\n"
@@ -9018,6 +9018,33 @@ def test_merge3_keeps_lines_both_sides_added_and_leaves_real_conflicts():
         assert merge3(ours, old, theirs, py=True) == ours + "\n\ndef b():\n    return 2\n", "PEP 8's two blank lines"
         assert merge3(ours, old, theirs) == ours + gap + "def b():\n    return 2\n", "elsewhere each side's spacing"
     assert merge3(ours, old, old + "Y = 2\n", py=True) == ours + "Y = 2\n"
+
+
+def test_merge3_never_keeps_a_line_twice_or_moves_one_into_another_block(env):
+    """Keeping both additions is right only when they share no line: two changes adding one import,
+    or a change replayed onto a tip that holds it already, would leave that line twice. Lines of
+    brackets, punctuation or quotes alone repeat nothing, nor does a line in the body of a new
+    top-level Python def (its name is checked apart)."""
+    from ttp.batch import merge3
+    assert merge3("x\nA1\nB1\ny\n", "x\ny\n", "x\nB1\nB2\ny\n") is None, "a shared line in larger additions"
+    assert merge3("x\nA1\nB1\ny\n", "x\ny\n", "x\nB1\ny\n") is None, "theirs is in ours already"
+    assert merge3("x\nB1\ny\n", "x\ny\n", "x\nA1\nB1\ny\n") is None, "ours is in theirs"
+    assert merge3("x\nA1\n  - B1\ny\n", "x\ny\n", "x\n- B1\ny\n") is None, "indented alike or not"
+    assert merge3("x\nf(1,\n)\n'''\ny\n", "x\ny\n", "x\ng(2,\n)\n'''\ny\n") == "x\nf(1,\n)\n'''\ng(2,\n)\n'''\ny\n"
+    old = "import os\n\n\ndef x():\n    pass\n"
+    ours = old + "\n\n@pytest.mark.slow\ndef test_a(env):\n    p = make(env)\n    assert p\n"
+    theirs = old + "\n\n@pytest.mark.slow\ndef test_b(env):\n    p = make(env)\n    assert not p\n"
+    assert merge3(ours, old, theirs, py=True) == ours + theirs[len(old):], "two new tests"
+    assert merge3(ours, old, theirs) is None, "outside Python, a line is a line"
+    assert merge3(ours, old, old + "\n\ndef test_a(env):\n    return\n", py=True) is None, "a def both add"
+    assert merge3("import os\nimport re\n", "import os\n", "import os\nimport re\nimport sys\n", py=True) is None
+    assert merge3("@slow\n@a\ndef f():\n", "def f():\n", "@slow\n@b\ndef f():\n", py=True) is None, \
+        "a decorator both put on one old def"
+    # Theirs continues the block it was written in; after ours' new def it would land in that one.
+    assert merge3(ours, old, old + "    assert x\n", py=True) is None
+    assert merge3(old + "    assert x\n", old, ours, py=True) == old + "    assert x\n" + ours[len(old):]
+    assert merge3("- a\n## New\n", "- a\n", "- a\n  - under a\n") is None
+    assert merge3("- a\n  - b\n", "- a\n", "- a\n  - c\n") == "- a\n  - b\n  - c\n"
 
 
 def test_a_push_batch_settles_version_lines_and_lines_both_sides_added(env, monkeypatch):
@@ -9058,6 +9085,73 @@ def test_a_push_batch_does_not_settle_an_addition_that_repeats_a_top_level_name(
     rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
     assert _statuses(m) == ["pushed", "conflict"] and m["results"][1]["detail"]["files"] == ["test_x.py"], m
     assert _git_out(origin, "show", "proj:test_x.py").endswith("assert 1")
+
+
+def test_a_push_batch_never_pushes_again_an_entry_it_settled_and_pushed(env, monkeypatch):
+    """A fresh batch gets the entries of one that pushed and died before recording it (design §7).
+    The entry settled against the one before it went out as another patch (its context changed), so
+    git does not drop it as applied: its line is on the tip already, so it is a conflict now, never
+    a second push of its line and a second bump."""
+    p, repo, origin, other = _bump_setup(env, monkeypatch, ["true"])
+    _commit(other, "plugins/p/notes.txt", "a\nc\n")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    heads = [_entry(repo, f"e{n}", {"plugins/p/notes.txt": f"a\nX{n}\nc\n"}) for n in (1, 2)]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert rc == 0 and _statuses(m) == ["pushed", "pushed"], m
+    assert _git_out(origin, "show", "proj:plugins/p/notes.txt") == "a\nX1\nX2\nc"
+    tip = _git_out(origin, "rev-parse", "proj")
+    for bid, again in (("b2", heads), ("b3", heads[1:])):
+        rc, m = _run_batch(p, _batch_marker(p, again, bid=bid), monkeypatch)
+        assert rc == 0 and m["pushed_sha"] is None and _statuses(m)[-1] in ("landed", "conflict"), m
+        assert _git_out(origin, "rev-parse", "proj") == tip, "nothing goes out again"
+    assert _statuses(m) == ["conflict"] and m["results"][0]["detail"]["files"] == ["plugins/p/notes.txt"], m
+    assert _versions(origin) == ("0.1.1", "0.1.1") and len(_bump_commits(origin)) == 1
+
+
+def test_a_push_batch_rebuilds_a_worktree_a_crash_left_mid_rebase(env, monkeypatch, capsys):
+    """The batch process dies while it settles a conflict: the next batch with those entries finds
+    the push worktree mid-rebase, makes it anew and pushes them."""
+    p, repo, origin, other = _bump_setup(env, monkeypatch, ["true"])
+    _commit(other, "plugins/p/notes.txt", "a\nc\n")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    heads = [_entry(repo, f"e{n}", {"plugins/p/notes.txt": f"a\nX{n}\nc\n"}) for n in (1, 2)]
+    before = _git_out(origin, "rev-parse", "proj")
+    crash = ("import os, sys\nfrom ttp import batch, cli\n"
+             "batch.settle = lambda *a: os._exit(9)\ncli.main(['push', '--batch', sys.argv[1]])\n")
+    r = subprocess.run([sys.executable, "-c", crash, str(_batch_marker(p, heads))], cwd=str(repo), input="",
+                       capture_output=True, text=True, timeout=120, env={**os.environ, "PYTHONPATH": str(RUNTIME)})
+    from ttp import batch
+    wt = p.worktrees / "push"
+    assert r.returncode == 9 and batch._rebasing(wt), r.stdout + r.stderr
+    assert _git_out(origin, "rev-parse", "proj") == before
+    capsys.readouterr()
+    rc, m = _run_batch(p, _batch_marker(p, heads, bid="b2"), monkeypatch)
+    assert "preparing a fresh worktree" in capsys.readouterr().out
+    assert rc == 0 and m["outcome"] == "pushed" and _statuses(m) == ["pushed", "pushed"], m
+    assert _git_out(origin, "show", "proj:plugins/p/notes.txt") == "a\nX1\nX2\nc"
+    assert _versions(origin) == ("0.1.1", "0.1.1") and not batch._rebasing(wt)
+
+
+def test_the_daemon_leaves_a_push_batch_marker_to_the_batch(env, monkeypatch):
+    """push.tend settles detached pushes by their run lock. A batch lets go of that lock before its
+    after_push and writes its marker after it, so tend must not touch a batch marker: marking it
+    failed would race the batch's last write, and its deploy would run again."""
+    from ttp import locks, push
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    marker = _batch_marker(p, [_entry(repo, "e1", {"f1.txt": "1\n"})])
+    from ttp.project import write_json
+    ap_lock = p.state / "locks" / "after_push:run-b1.0.lock"
+    write_json(marker, {**push._read(marker), "phase": "after_push", "outcome": "pushed", "lock": str(ap_lock)})
+    before = marker.read_bytes()
+    held = locks.try_take([ap_lock], "push batch b1 (after_push)")
+    try:
+        assert locks.any_free([push._run_lock(marker)]), "the run lock is free, as in the after_push"
+        push.tend(p)
+        assert marker.read_bytes() == before and push._settle(marker) == push._read(marker)
+    finally:
+        held.close()
+    push.tend(p)          # the batch died: the push queue judges it (pushq.finalize), not tend
+    assert marker.read_bytes() == before
 
 
 @pytest.mark.parametrize("bad", [1, 3, 4])

@@ -1017,8 +1017,12 @@ def _dead_reason(m: dict) -> str:
 
 def _settle(marker: Path) -> dict:
     """The marker of a push that cannot run any more recorded as failed: one that runs with its run
-    lock free died; one queued longer than QUEUED_S was never started. Others come back as read."""
+    lock free died; one queued longer than QUEUED_S was never started. Others come back as read, and
+    so does a push queue batch's (batch.py): it lets go of its run lock before its after_push and
+    writes its marker after, so only the push queue judges it (pushq.finalize), never this."""
     m = _read(marker)
+    if m.get("kind") == "batch":
+        return m
     if m.get("status") == "running" and locks.any_free([_run_lock(marker)]):
         m = _read(marker)      # read after the lock: the push writes its outcome before letting go
         if m.get("status") == "running":
@@ -1050,7 +1054,7 @@ def tend(p: Project) -> None:
 
 def _tend_one(p: Project, marker: Path) -> None:
     m = _settle(marker)
-    if m.get("status") != "queued":
+    if m.get("status") != "queued" or m.get("kind") == "batch":
         return
     lock = locks.try_take([_run_lock(marker)], f"detached push {m.get('id')}", "ttp push --detach (daemon)")
     if lock is None:

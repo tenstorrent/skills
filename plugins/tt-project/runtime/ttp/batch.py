@@ -5,11 +5,11 @@
 The daemon writes a marker naming the reviewed changes to push (entries: a branch and its reviewed
 head), takes the batch's run lock and starts this process, which inherits the lock. The process
 replays the entries in order onto the target's tip in a worktree of its own (`worktrees/push`) and
-settles the conflicts that need no judgment: version lines, and both sides adding lines at one spot.
-It bumps the version once for all entries, runs the push checks once on the result and pushes it
-without force. When the checks fail, a binary search over prefixes finds the first failing entry, and
-the passing prefix is pushed. The outcome goes into the marker per entry; the daemon applies it to
-the reviews.
+settles the conflicts that need no judgment: version lines, and both sides adding different lines at
+one spot. It bumps the version once for all entries, runs the push checks once on the result and
+pushes it without force. When the checks fail, a binary search over prefixes finds the first failing
+entry, and the passing prefix is pushed. The outcome goes into the marker per entry; the daemon
+applies it to the reviews.
 
 After the push the process lets go of the push lock and of its `push:run-<id>` lock (automatic
 upgrades wait only for that one). It then runs `delivery.after_push` (a deploy) at the pushed commit,
@@ -222,9 +222,9 @@ def _sweep_after_push(p: Project, repo: Path) -> None:
 def merge3(ours: str, base: str, theirs: str, py: bool = False) -> str | None:
     """git's three-way merge of the texts, where each conflict in which both sides only added lines
     at one spot (an empty base section) keeps both: ours first, then theirs (in Python, see _seam).
-    None when any other conflict remains. The conflict markers carry a random tag, so file content
-    never passes for one; a hunk whose base-to-end part holds more than one separator line is not
-    read as an addition."""
+    None when any other conflict remains, or when keeping both could be wrong (_clash). The conflict
+    markers carry a random tag, so file content never passes for one; a hunk whose base-to-end part
+    holds more than one separator line is not read as an addition."""
     tag = secrets.token_hex(8)
     # built, not spelled out: a literal marker line would make this file read as a conflicted one
     start, mid, end = (f"{c * 7} {side}-{tag}" for c, side in (("<", "ours"), ("|", "base"), (">", "theirs")))
@@ -260,11 +260,60 @@ def merge3(ours: str, base: str, theirs: str, py: bool = False) -> str | None:
                 return None             # ambiguous: content that looks like the separator
             theirs_lines.append(lines[j])
             j += 1
-        if j >= len(lines):
+        if j >= len(lines) or _clash(mine, theirs_lines, py):
             return None
         res += _seam(mine, theirs_lines) if py else mine + theirs_lines
         i = j + 1
     return "".join(res)
+
+
+def _clash(mine: list[str], theirs: list[str], py: bool) -> bool:
+    """Whether keeping both added sections, ours first, could be wrong without anyone seeing it: they
+    share a line (_said), so the result would hold it twice (two changes adding one import, or one
+    change replayed onto a tip that holds it already); or theirs opens indented, inside the block it
+    was written for, while ours holds a line indented less, which ends that block before theirs."""
+    if _said(mine, py) & _said(theirs, py):
+        return True
+    first = next((line for line in theirs if line.strip()), None)
+    depth = _indent(first) if first else 0
+    return depth > 0 and any(_indent(line) < depth for line in mine if line.strip())
+
+
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip(" \t"))
+
+
+def _said(lines: list[str], py: bool) -> set[str]:
+    """The lines of one side's addition that the other's must not repeat, stripped: those holding a
+    letter or digit (brackets, punctuation or quotes alone repeat nothing). In Python, the decorators
+    and body of a top-level def or class that the addition opens are left out: the block is new as a
+    whole and settle refuses a repeated name, so `p = make(env)` in two new tests repeats nothing.
+    The def or class line itself counts."""
+    out: set[str] = set()
+    decorators: list[str] = []          # at the margin, until a def or class claims them
+    inside = False                      # in the body of a def or class opened here
+    for line in lines:
+        s = line.strip()
+        if not any(c.isalnum() for c in s):
+            continue
+        if not py:
+            out.add(s)
+        elif line[0] in " \t":
+            if decorators:
+                decorators.append(s)
+            elif not inside:
+                out.add(s)
+        elif s.startswith("@"):
+            decorators.append(s)
+            inside = False
+        else:
+            inside = bool(TOP_DEF.match(line))
+            if not inside:
+                out.update(decorators)
+            decorators = []
+            out.add(s)
+    out.update(decorators)
+    return out
 
 
 def _seam(mine: list[str], theirs: list[str]) -> list[str]:
@@ -297,11 +346,12 @@ def settle(wt: Path, path: str, version_files: list[str]) -> bool:
     """Settle the conflicted `path` of a stopped rebase in `wt`, if it needs no judgment, and write
     the result: True when settled. Ours (stage 2) is the batch head, theirs (stage 3) the entry.
     In a version file every stage first takes the batch head's version, so a version line alone
-    never conflicts. A pure addition keeps both sides, unless in a .py file that leaves a top-level
-    def or class name twice where neither side had it twice (it would silently shadow a test)."""
+    never conflicts. A pure addition keeps both sides (merge3), unless in a .py file that leaves a
+    top-level def or class name twice where neither side had it twice (it would silently shadow a
+    test). A file both sides created is never settled."""
     ours, base, theirs = _show(wt, 2, path), _show(wt, 1, path), _show(wt, 3, path)
-    if ours is None or theirs is None:
-        return False                    # deleted on one side
+    if ours is None or theirs is None or base is None:
+        return False                    # deleted on one side, or created on both
     try:
         o, b, t = ours.decode(), (base or b"").decode(), theirs.decode()
     except UnicodeDecodeError:
