@@ -45,6 +45,7 @@ import re
 import shlex
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -557,7 +558,8 @@ def _forward(now: float, budget_s: float) -> int:
         raw, size = _read_local(offset)
         if size < offset:                 # the inbox was cut or replaced: send it again; the target dedupes
             offset, (raw, size) = 0, _read_local(0)
-        batch, end, pos = [], offset, offset
+        batch, end, pos, nbytes = [], offset, offset, 0
+        cap = RECEIVE_BYTES - RECEIVE_BYTES // 32   # a margin under what the receiver reads
         for ln in raw[:raw.rfind(b"\n") + 1].splitlines(keepends=True):
             try:
                 n = json.loads(ln)
@@ -566,13 +568,20 @@ def _forward(now: float, budget_s: float) -> int:
             # Only this machine's own notes: one received from elsewhere (`via`) is never sent on again.
             if isinstance(n, dict) and n.get("fp") and not n.get("via") and n.get("host") == here and (
                     projects.get(n["to"]) == target if n.get("to") else reads):
-                if len(batch) == FORWARD_BATCH:
+                if len(ln) > cap:
+                    # The receiver would refuse any stream holding it: skip it, or it stalls the queue.
+                    st.update(skipped=int(st.get("skipped") or 0) + 1, error_at=now,
+                              last_error=f"skipped a note of {len(ln)} bytes (over the {cap} a send may carry)")
+                    print(f"ttp upstream: {target}: {st['last_error']}", file=sys.stderr)
+                elif len(batch) == FORWARD_BATCH or nbytes + len(ln) > cap:
                     break
-                batch.append(ln)
+                else:
+                    batch.append(ln)
+                    nbytes += len(ln)
             pos += len(ln)
             end = pos
         if not batch:
-            if end != int(st.get("cursor") or 0):
+            if end != int(st.get("cursor") or 0) or st != (targets_st.get(target) or {}):
                 targets_st[target] = {**st, "cursor": end}
                 save()
             continue

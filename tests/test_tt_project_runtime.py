@@ -15515,6 +15515,29 @@ def test_upstream_forwarding_stops_at_its_budget_and_starts_with_the_targets_lef
     assert len(calls) == 4, "a failed target was tried again within its back-off"
 
 
+def test_upstream_forward_batches_stay_under_the_receive_limit_and_skip_a_note_over_it(env, monkeypatch):
+    from ttp import upstream
+    from ttp.project import register
+    register("example-project", {"host": "example-host", "dir": "/w/example"})
+    sends = []
+
+    def receive(target, lines, timeout):
+        assert sum(map(len, lines)) <= upstream.RECEIVE_BYTES, "a send the receiver would refuse"
+        sends.append(len(lines))
+        return {"accepted": len(lines), "rejected": 0}, ""
+    monkeypatch.setattr(upstream, "_ssh_receive", receive)
+    monkeypatch.setattr(upstream, "RECEIVE_BYTES", 2000)
+    upstream.send("demo", 3, "example-project", "x" * 5000)     # over the limit by itself
+    for i in range(6):
+        upstream.send("demo", 3, "example-project", f"note {i} " + "y" * 300)
+    now = time.time()
+    total = sum(upstream.forward(now + i) for i in range(10))
+    sends = [n for n in sends if n]                              # not the empty probe
+    assert total == 6 and len(sends) >= 2, sends
+    st = json.loads(upstream.forward_path().read_text())["targets"]["example-host"]
+    assert st["skipped"] == 1 and "skipped a note of" in st["last_error"]
+
+
 def test_coordinators_pass_upstream_notes_on_only_while_no_project_reads_them(env):
     p = make(env)
     from ttp import upstream, coordinator as coord
