@@ -20165,8 +20165,31 @@ def test_the_global_total_and_the_project_caps_count_spend_by_one_rule(env, tmp_
     gcap._LOCAL.clear()
     rule = dbmod.counted_spend
     monkeypatch.setattr(dbmod, "counted_spend", lambda *a, **k: (lambda w: (w[0] + " AND estimated=0", w[1]))(rule(*a, **k)))
-    assert p.db.spent_since(now - 3600) == 2.0
+    assert p.db.spent_since(now - 3600) == 2.0 and p.db.spent_since(now - 3600, billed=True) == 2.0
     assert gcap.total(p.db, "claude", now - 3600, now + 3600, now, account="acct-a")["usd"] == 6.0
+
+
+def test_global_total_excludes_plan_spend_before_switch(env, tmp_path):
+    # The global total counts only billed spend, as the project caps do (billing.billed_by_account):
+    # plan account A's $240 before the switch to usage-billed B stays out, B's $15 counts, here and in
+    # another project on this machine, and so does B's run still going.
+    p = make(env)
+    from ttp import globalcap as gcap
+    now = time.time()
+    start, end = now - 86400, now + 3600
+    _plan_then_billed(p, now)
+    other = _other_project(tmp_path, "other")
+    other.spend("claude", 240.0, "task:1", account="acct-a | plan", ts=now - 10 * 3600)
+    other.x("INSERT INTO snapshots(ts,provider,account,window,utilization,resets_at) VALUES(?,?,?,?,?,?)",
+            (now - 10 * 3600, "claude", "acct-a | plan", "five_hour", 20.0, now - 5 * 3600))
+    other.spend("claude", 6.0, "task:2", account="acct-b | billed", ts=now - 1800)
+    _run(p, "acct-b | billed", now - 300, None, 2.5)
+    assert round(p.db.spent_since(start), 2) == 255.0, "the plan spend is in the ledger"
+    t = gcap.total(p.db, "claude", start, end, now, account="acct-b | billed")
+    assert t["usd"] == 23.5 and t["local_projects"] == 2, t
+    gcap._LOCAL.clear()
+    t = gcap.total(p.db, "claude", start, end, now, account="acct-a | plan")
+    assert t["usd"] == 0, t
 
 
 def test_the_rolling_global_window_asks_each_machine_once_per_refresh_and_keeps_counting(env, monkeypatch):

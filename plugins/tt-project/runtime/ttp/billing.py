@@ -115,13 +115,10 @@ def billed_by_account(conn: sqlite3.Connection, since: float, until: float | Non
     """Billed spend in [since, until) per (provider, account). `exclude` maps provider -> time up to
     which its rows are left out. With `running_at`, runs still going add what they were priced at
     so far, when their account was billed by use when they started."""
-    sql, args = ("SELECT provider, COALESCE(account,''), ts, usd FROM ledger WHERE ts>=? AND (? IS NULL OR ts<?) "
-                 "AND (? IS NULL OR provider=?)", [since, until, until, provider, provider])
-    for prov, cut in (exclude or {}).items():
-        sql, args = sql + " AND NOT (provider=? AND ts<=?)", args + [prov, cut]
-    if estimated_only:
-        sql += " AND estimated=1"
-    rows = [(p or "", a, float(ts), float(usd or 0)) for p, a, ts, usd in _q(conn, sql, args)]
+    from .db import counted_spend     # db imports this module; which ledger rows count is decided there
+    where, args = counted_spend(since, until, provider, exclude, estimated_only)
+    rows = [(p or "", a, float(ts), float(usd or 0)) for p, a, ts, usd in _q(
+        conn, f"SELECT provider, COALESCE(account,''), ts, usd FROM ledger WHERE {where}", args)]
     if running_at is not None:
         rows += [(p or "", a, float(st or running_at), float(usd or 0)) for p, a, st, usd in _q(
             conn, "SELECT provider, COALESCE(account,''), started, cost_usd FROM runs WHERE status='running' "

@@ -23,6 +23,8 @@ The global total for a provider counts, for this day:
 
 Only spend on the same provider and the same account counts: a Codex project, or a project logged
 in to another account, is not billed with this one. Rows with no account recorded count (fail safe).
+Only billed spend counts (billing.py): spend a plan paid for, e.g. before a switch to usage billing,
+stays out, as it does for the project caps.
 
 The settings live in the account-level file ~/.tt-project/settings.json (`ttp config --account KEY
 VALUE`), which every project on the machine reads; a project's own project.json may override them.
@@ -44,8 +46,7 @@ from pathlib import Path
 from typing import Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from . import project
-from . import db as dbmod
+from . import billing, project
 
 DAY = 86400.0
 REFRESH_S = 600            # each other machine is asked again this long after the last try
@@ -147,19 +148,12 @@ def _matches(row: dict, provider: str, account: str) -> bool:
 
 # this machine -----------------------------------------------------------------------------------
 def _rows(conn: sqlite3.Connection, start: float, end: float) -> list[dict]:
-    """Spend per (provider, account key) in [start, end), with running work as last priced."""
+    """Billed spend per (provider, account key) in [start, end), with running work as last priced:
+    the same rule as the project caps (billing.billed_by_account), so plan spend never counts."""
     out: dict[tuple, float] = {}
-    where, args = dbmod.counted_spend(start, end)     # the same rule as the project caps
-    for prov, acct, usd in conn.execute(
-            f"SELECT provider, COALESCE(account,''), SUM(usd) FROM ledger WHERE {where} "
-            "GROUP BY provider, account", args):
-        k = (prov, account_key(prov or "", acct))
-        out[k] = out.get(k, 0.0) + float(usd or 0)
-    for prov, acct, usd in conn.execute(
-            "SELECT provider, COALESCE(account,''), SUM(cost_usd) FROM runs WHERE status='running' "
-            "GROUP BY provider, account"):
-        k = (prov, account_key(prov or "", acct))
-        out[k] = out.get(k, 0.0) + float(usd or 0)
+    for (prov, acct), usd in billing.billed_by_account(conn, start, end, running_at=time.time()).items():
+        k = (prov, account_key(prov, acct))
+        out[k] = out.get(k, 0.0) + usd
     return [{"provider": p, "key": k, "usd": round(u, 4)} for (p, k), u in out.items()]
 
 
