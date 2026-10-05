@@ -188,7 +188,7 @@ def usage_line(n: dict, now: float) -> str:
     end = n.get("day_end") or n.get("global_resets_at")
     if end:
         line += f" - resets in {max(end - now, 0) / 3600:.1f} h"
-    stale = len(n.get("global_stale") or [])
+    stale = len(n.get("global_stale") or []) if "global_today" in n else 0
     if stale:
         line += f" ({stale} machine{'s' if stale != 1 else ''} stale)"
     return line
