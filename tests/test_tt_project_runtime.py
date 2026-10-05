@@ -20262,3 +20262,446 @@ def test_upgrade_task_merges_main_before_ff_only_and_keeps_worktree_on_failure(e
     assert t.index("git merge main") < t.index("--ff-only")
     assert "|" not in t
     assert "keep <tmp>" in t
+
+
+# Host sleep, stall guard and network loss ----------------------------------------------------------
+# Run clocks count awake time only; only real agent output is progress; a run cut off by a lost
+# network is lost, not an attempt, and holds new runs on its provider until the API host resolves.
+
+class _Clocks:
+    def __init__(self, monkeypatch, mod):
+        self.mono, self.wall = 1000.0, 1.79e9
+        monkeypatch.setattr(mod.time, "monotonic", lambda: self.mono)
+        monkeypatch.setattr(mod.time, "time", lambda: self.wall)
+
+    def step(self, mono, wall=None):
+        self.mono += mono
+        self.wall += mono if wall is None else wall
+
+
+def test_awake_clock_leaves_out_sleep_on_either_kind_of_monotonic_clock(env, monkeypatch):
+    from ttp import runner
+    c = _Clocks(monkeypatch, runner)
+    a = runner.AwakeClock()
+    c.step(5)
+    assert a.tick() == 5
+    c.step(0.1, wall=3600)            # a monotonic clock that stands still while the host sleeps
+    assert a.tick() == pytest.approx(5.1)
+    c.step(3600)                      # one that runs through a suspend
+    assert a.tick() == pytest.approx(5.1)
+    c.step(5, wall=-120)              # a wall clock set back counts nothing
+    assert a.tick() == pytest.approx(5.1)
+    c.step(5, wall=900)               # set forward: the monotonic advance counts
+    assert a.tick() == pytest.approx(10.1)
+
+
+def _slept(d, seconds):
+    d._tick_wall -= seconds          # the wall clock jumped ahead of the monotonic one by `seconds`
+    d._check_sleep()
+
+
+def test_a_long_sleep_is_one_event_and_one_low_alert_a_day(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    alerts = lambda: p.db.q("SELECT * FROM messages WHERE kind='alert' AND ref='host_slept'")   # noqa: E731
+    rid = p.db.x("INSERT INTO runs(task,role,provider,started,status) VALUES(1,'worker','fake',?, 'running')",
+                 (time.time(),))
+    _slept(d, 120)                    # short: the settle hold only
+    assert d.settling()
+    assert not p.db.q("SELECT id FROM events WHERE kind='host_slept'") and not alerts()
+    _slept(d, 1000)
+    _slept(d, 1000)                   # the next dark wake of the same closed lid
+    ev = p.db.q("SELECT * FROM events WHERE kind='host_slept'")
+    assert len(ev) == 1 and ev[0]["status"] == "record"
+    data = json.loads(ev[0]["data"])
+    assert data["sleeps"] == 2 and data["slept_s"] == pytest.approx(2000, abs=5) and data["runs"] == [rid]
+    al = alerts()
+    assert len(al) == 1 and al[0]["severity"] == "low"
+    assert "lid open" in al[0]["text"] and "external display" in al[0]["text"] and "always-on" in al[0]["text"]
+    # Awake for hours, then asleep again: a new event, still one alert a day.
+    p.db.x("UPDATE events SET data=? WHERE id=?", (json.dumps({**data, "woke": time.time() - 3 * 3600}), ev[0]["id"]))
+    _slept(d, 900)
+    assert len(p.db.q("SELECT id FROM events WHERE kind='host_slept'")) == 2 and len(alerts()) == 1
+
+
+def _finished_run(d, lines, *, slept_s=0.0, provider="claude", note=None, tier="standard"):
+    """A worker run on `provider` whose stream is `lines`, finished by the daemon."""
+    db = d.p.db
+    tid = db.add_task("build", "", kind="work", tier=tier, priority=3, budget_usd=8.0, labels=[])
+    db.update_task(tid, status="running")
+    rid = db.x("INSERT INTO runs(task,role,provider,model,started,status,boot_id,note) "
+               "VALUES(?,'worker',?,'opus',?,'running',?,?)",
+               (tid, provider, time.time() - 600, d.boot, json.dumps(note or {})))
+    run_dir = d.p.runs / str(rid)
+    run_dir.mkdir(parents=True)
+    db.x("UPDATE runs SET dir=? WHERE id=?", (str(run_dir), rid))
+    (run_dir / "output.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines))
+    (run_dir / "stderr.log").write_text("")
+    d.finish_run(db.one("SELECT * FROM runs WHERE id=?", (rid,)),
+                 {"rc": 1, "started": time.time() - 600 - slept_s, "ended": time.time(), "stopped": None,
+                  "slept_s": slept_s})
+    return db.one("SELECT * FROM runs WHERE id=?", (rid,)), db.task(tid)
+
+
+NOT_LOGGED_IN = [{"type": "assistant", "error": "authentication_failed",
+                  "message": {"model": "<synthetic>", "content": [{"type": "text", "text": "Not logged in"}]}},
+                 {"type": "result", "subtype": "success", "is_error": True, "result": "Not logged in · Please run /login",
+                  "num_turns": 3, "total_cost_usd": 0.5, "usage": {"input_tokens": 1, "output_tokens": 1}}]
+
+
+def test_logged_out_after_a_long_sleep_is_lost_to_the_sleep(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    run, task = _finished_run(d, NOT_LOGGED_IN, slept_s=8 * 3600)
+    assert run["status"] == "lost" and json.loads(run["note"])["lost_to_sleep"]
+    assert task["status"] == "queued" and int(task["attempts"] or 0) == 0
+    assert not p.db.q("SELECT id FROM messages WHERE ref='auth:claude'") and not p.db.kv("auth_breaker:claude")
+
+
+def test_logged_out_while_awake_still_alerts(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    run, _ = _finished_run(d, NOT_LOGGED_IN)
+    assert run["status"] == "auth"
+    assert p.db.q("SELECT id FROM messages WHERE ref='auth:claude'")
+
+
+def test_a_cut_off_run_is_not_charged_for_the_time_the_host_slept(env, tmp_path):
+    p = make(env)
+    from ttp import daemon as dm
+    (tmp_path / "run.json").write_text(json.dumps({"budget_usd": 10, "timeout_s": 3600, "argv": []}))
+    (tmp_path / "output.jsonl").write_text("not json\n")
+    info = {"rc": 1, "started": 1000.0, "ended": 1000.0 + 3600}
+    assert dm._cut_off_cost(tmp_path, info) == pytest.approx(10)
+    assert dm._cut_off_cost(tmp_path, {**info, "slept_s": 2700}) == pytest.approx(2.5)
+
+
+# The stall guard ------------------------------------------------------------------------------------
+
+BASH_ID = "toolu_bash"
+
+
+def _ev(**kw) -> str:
+    return json.dumps(kw) + "\n"
+
+
+def _tool_use(tid, timeout_ms=None):
+    inp = {"command": "ttp lock device-a -- ./run.sh"}
+    if timeout_ms is not None:
+        inp["timeout"] = timeout_ms
+    return _ev(type="assistant", message={"content": [{"type": "tool_use", "id": tid, "name": "Bash", "input": inp}]})
+
+
+def _tool_result(tid):
+    return _ev(type="user", message={"content": [{"type": "tool_result", "tool_use_id": tid, "content": "ok"}]})
+
+
+def _heartbeat(n, elapsed):
+    return _ev(type="tool_progress", tool_name="Bash", elapsed_time_seconds=elapsed, tool_use_id=f"{BASH_ID}-heartbeat-{n}")
+
+
+def test_heartbeats_and_retries_are_not_progress(env, tmp_path):
+    from ttp import runner
+    # One Bash call, then only heartbeats, a retry notice and a rate limit event while it hangs.
+    out = tmp_path / "output.jsonl"
+    out.write_text(_ev(type="system", subtype="init") + _tool_use(BASH_ID))
+    w = runner.ProgressWatch(out, tmp_path)
+    assert w.poll() is True
+    with open(out, "a") as f:
+        for n, s in enumerate((767, 797, 1726)):
+            f.write(_heartbeat(n, s))
+        f.write(_ev(type="system", subtype="api_retry", attempt=1, retry_delay_ms=545))
+        f.write(_ev(type="rate_limit_event"))
+    assert w.poll() is False
+    with open(out, "a") as f:
+        f.write(_tool_result(BASH_ID))
+    assert w.poll() is True
+
+
+def test_streamed_thinking_subagent_and_unknown_output_are_progress(env, tmp_path):
+    from ttp import runner
+    out = tmp_path / "output.jsonl"
+    out.write_text("")
+    w = runner.ProgressWatch(out, tmp_path)
+    assert w.poll() is False
+    out.write_text(_ev(type="system", subtype="thinking_tokens", estimated_tokens=50))
+    assert w.poll() is True
+    with open(out, "a") as f:
+        f.write(_ev(type="assistant", parent_tool_use_id="toolu_x", message={"content": [{"type": "text"}]}))
+    assert w.poll() is True
+    with open(out, "a") as f:   # another CLI's events, and plain text
+        f.write(_ev(type="item.completed", item={"type": "command_execution"}))
+    assert w.poll() is True
+    with open(out, "a") as f:
+        f.write("plain output\n")
+    assert w.poll() is True
+
+
+def test_a_partial_line_waits_for_its_end(env, tmp_path):
+    from ttp import runner
+    out = tmp_path / "output.jsonl"
+    line = _tool_result(BASH_ID)
+    out.write_text(line[:10])
+    w = runner.ProgressWatch(out, tmp_path)
+    assert w.poll() is False
+    with open(out, "a") as f:
+        f.write(line[10:])
+    assert w.poll() is True
+
+
+def test_a_progress_note_counts(env, tmp_path):
+    from ttp import runner
+    out = tmp_path / "output.jsonl"
+    out.write_text(_heartbeat(0, 30))
+    w = runner.ProgressWatch(out, tmp_path)
+    assert w.poll() is False
+    (tmp_path / "progress.md").write_text("waiting for device-a\n")
+    assert w.poll() is True
+    assert w.poll() is False
+
+
+def test_a_command_timeout_of_its_own_extends_the_limit(env, tmp_path):
+    from ttp import runner
+    out = tmp_path / "output.jsonl"
+    out.write_text(_tool_use(BASH_ID, timeout_ms=1_500_000))
+    w = runner.ProgressWatch(out, tmp_path)
+    w.poll()
+    assert w.limit(900) == 1500 + runner.TOOL_GRACE_S
+    assert w.limit(3600) == 3600
+    with open(out, "a") as f:
+        f.write(_tool_result(BASH_ID))
+    w.poll()
+    assert w.limit(900) == 900
+    out.write_text("")            # a shorter timeout never lowers the limit
+    w2 = runner.ProgressWatch(out, tmp_path)
+    out.write_text(_tool_use("t2", timeout_ms=120_000))
+    w2.poll()
+    assert w2.limit(900) == 900
+
+
+def test_the_supervisor_ends_a_run_that_only_heartbeats(env, tmp_path, monkeypatch):
+    from ttp import runner
+    monkeypatch.setenv("TTP_TEST_POLL_S", "0.1")
+    child = tmp_path / "child.py"
+    child.write_text(
+        "import json, sys, time\n"
+        "def w(**kw):\n"
+        "    sys.stdout.write(json.dumps(kw) + '\\n'); sys.stdout.flush()\n"
+        "w(type='assistant', message={'content': [{'type': 'tool_use', 'id': 't1', 'name': 'Bash', 'input': {}}]})\n"
+        "for n in range(200):\n"
+        "    w(type='tool_progress', tool_name='Bash', elapsed_time_seconds=n, tool_use_id='t1-heartbeat-%d' % n)\n"
+        "    time.sleep(0.1)\n")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "prompt.md").write_text("x")
+    (run_dir / "run.json").write_text(json.dumps({
+        "argv": [sys.executable, str(child)], "cwd": str(tmp_path), "provider": "fake",
+        "timeout_s": 60, "stall_s": 1}))
+    runner.supervise(run_dir)
+    info = json.loads((run_dir / "exit.json").read_text())
+    assert info["stopped"] == "stalled"
+    assert info["ended"] - info["started"] < 15
+
+
+def test_each_tiers_configured_stall_s_reaches_its_run(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    from ttp.project import DEFAULT_CONFIG
+    p.set_config("budget.stall_s", {"light": 700, "standard": 1800, "deep": 2700})
+    d = Daemon(p.base)
+    for tier, want in (("light", 700), ("standard", 1800), ("deep", 2700)):
+        rid = d.start_run("worker", "x", "fake", tier, str(p.root))
+        spec = json.loads((p.runs / str(rid) / "run.json").read_text())
+        assert spec["stall_s"] == want and "quiet_s" not in spec, (tier, spec.get("stall_s"))
+    assert "quiet_s" not in DEFAULT_CONFIG["budget"], "stall_s stays the one knob"
+
+
+# Network loss ---------------------------------------------------------------------------------------
+
+ENOTFOUND = "API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)"
+
+
+def _api_error(text):
+    return [{"type": "result", "subtype": "success", "is_error": True, "result": text, "num_turns": 1,
+             "total_cost_usd": 0.5, "usage": {"input_tokens": 0, "output_tokens": 0}}]
+
+
+@pytest.fixture()
+def net(monkeypatch):
+    """DNS answers from `up` (a set of hosts), and the lookup thread runs inline when told to."""
+    from ttp import daemon as dm
+    state = types.SimpleNamespace(up=set(), looked=[], pending=[])
+    monkeypatch.setattr(dm, "_resolves", lambda host: state.looked.append(host) or host in state.up)
+    monkeypatch.setattr(dm, "_background", state.pending.append)
+    for var in dm.PROXY_ENV:
+        monkeypatch.delenv(var, raising=False)
+
+    def run_lookups():
+        while state.pending:
+            state.pending.pop(0)()
+    state.run = run_lookups
+    return state
+
+
+def test_an_unreachable_api_is_lost_not_an_attempt_and_holds_its_provider(env, net):
+    p = make(env)
+    from ttp import daemon as dm
+    d = dm.Daemon(p.base)
+    run, task = _finished_run(d, _api_error(ENOTFOUND))
+    note = json.loads(run["note"])
+    assert run["status"] == "lost" and note["lost_to_network"] and note["not_waste"] == "network"
+    assert task["status"] == "queued" and int(task["attempts"] or 0) == 0
+    assert d.net_held("claude") and not d.net_held("codex") and not d.net_held("fake")
+    assert net.pending and not net.looked, "the lookup runs off the tick"
+    net.run()
+    assert net.looked == ["api.anthropic.com"] and d.net_held("claude")
+    assert not net.pending, "looked up again only after REACH_EVERY_S"
+    d._net_holds["claude"]["checked"] -= dm.REACH_EVERY_S
+    net.up.add("api.anthropic.com")
+    d.net_held("claude")
+    net.run()
+    assert not d.net_held("claude") and not d.net_held("claude")
+
+
+def test_other_failures_still_count_an_attempt_and_hold_nothing(env, net):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    run, task = _finished_run(d, _api_error("API Error: 500 Internal server error"))
+    assert run["status"] == "failed" and int(task["attempts"]) == 1
+    assert not d.net_held("claude")
+
+
+def test_a_lost_resume_keeps_its_session(env, net):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    run, _ = _finished_run(d, _api_error(ENOTFOUND), note={"resumes": {"run": 1, "session": "s1"}})
+    assert run["status"] == "lost" and json.loads(run["note"])["session_id"] == "s1"
+
+
+def test_network_losses_count_with_sleep_losses_toward_max_reboot_losses(env, net):
+    p = make(env)
+    from ttp.daemon import Daemon
+    p.set_config("budget.max_reboot_losses", 1)
+    d = Daemon(p.base)
+    run, task = _finished_run(d, NOT_LOGGED_IN, slept_s=3600)
+    assert run["status"] == "lost" and int(task["attempts"] or 0) == 0
+    rid = p.db.x("INSERT INTO runs(task,role,provider,model,started,status,boot_id,note) "
+                 "VALUES(?,'worker','claude','opus',?,'running',?,'{}')", (task["id"], time.time() - 60, d.boot))
+    p.db.update_task(task["id"], status="running")
+    run_dir = p.runs / str(rid)
+    run_dir.mkdir()
+    p.db.x("UPDATE runs SET dir=? WHERE id=?", (str(run_dir), rid))
+    (run_dir / "output.jsonl").write_text(json.dumps(_api_error(ENOTFOUND)[0]) + "\n")
+    (run_dir / "stderr.log").write_text("")
+    d.finish_run(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)),
+                 {"rc": 1, "started": time.time() - 60, "ended": time.time(), "stopped": None, "slept_s": 0})
+    assert json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (rid,))["note"])["lost_to_network"]
+    assert int(p.db.task(task["id"])["attempts"]) == 1, "past max_reboot_losses a loss counts an attempt"
+
+
+def test_a_sleep_holds_new_runs_until_the_api_resolves(env, net):
+    p = make(env)
+    from ttp.daemon import Daemon
+    p.set_config("core_provider", "claude")
+    d = Daemon(p.base)
+    _slept(d, 120)
+    assert d.net_held("claude")
+    net.up.add("api.anthropic.com")
+    net.run()
+    assert not d.net_held("claude")
+
+
+def test_a_held_provider_lets_one_run_try_after_the_cap(env, net, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dm
+    mono = [time.monotonic()]
+    monkeypatch.setattr(dm.time, "monotonic", lambda: mono[0])
+    d = dm.Daemon(p.base)
+    d.hold_offline("claude", "test")
+    net.run()
+    assert d.net_held("claude") and not d._net_may_probe("claude")
+    mono[0] += dm.NET_HOLD_MAX_S
+    assert d.net_held("claude") and d._net_may_probe("claude"), "DNS that never answers must not hold forever"
+    d._net_holds["claude"]["probe"] = mono[0]   # what start_run records for the run that tries
+    assert not d._net_may_probe("claude"), "one run tries, not the whole queue"
+    _finished_run(d, _api_error(ENOTFOUND))        # it could not reach the API either: the hold starts over
+    assert not d._net_may_probe("claude")
+    mono[0] += dm.NET_HOLD_MAX_S
+    assert d._net_may_probe("claude")
+    _finished_run(d, [{"type": "result", "subtype": "success", "is_error": False, "result": "ok", "num_turns": 1,
+                    "total_cost_usd": 0.5, "usage": {"input_tokens": 10, "output_tokens": 10}}])
+    assert not d.net_held("claude"), "a run that got through ends the hold"
+
+
+def test_start_run_on_a_held_provider_is_its_one_try(env, net):
+    p = make(env)
+    from ttp import daemon as dm
+    d = dm.Daemon(p.base)
+    d._net_holds["fake"] = {"host": "h", "since": time.monotonic() - dm.NET_HOLD_MAX_S, "checked": time.monotonic(),
+                            "checking": False, "up": False, "probe": 0.0}
+    assert d._net_may_probe("fake")
+    d.start_run("worker", "x", "fake", "light", str(p.root))
+    assert not d._net_may_probe("fake")
+
+
+def test_dispatch_holds_only_the_offline_provider(env, net, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dm
+    d = dm.Daemon(p.base)
+    held = p.db.add_task("on the held provider", "s", kind="work", tier="light", origin="user")
+    free = p.db.add_task("on another provider", "s", kind="work", tier="light", origin="user")
+    p.db.x("UPDATE tasks SET provider='claude' WHERE id=?", (held,))
+    d._net_holds["claude"] = {"host": "api.anthropic.com", "since": time.monotonic(), "checked": time.monotonic(),
+                              "checking": False, "up": False, "probe": 0.0}
+    started = []
+    monkeypatch.setattr(d, "start_run", lambda role, prompt, provider, *a, **k: started.append(provider) or 1)
+    d.update_gates()
+    d.dispatch()
+    assert started == ["fake"], started
+    assert p.db.task(held)["status"] == "queued" and p.db.task(free)["status"] == "running"
+
+
+def test_a_proxied_host_is_never_held(env, net, monkeypatch):
+    p = make(env)
+    from ttp.daemon import Daemon
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example:3128")
+    d = Daemon(p.base)
+    run, task = _finished_run(d, _api_error(ENOTFOUND))
+    assert run["status"] == "lost" and int(task["attempts"] or 0) == 0, "still not an attempt"
+    assert not d.net_held("claude") and not net.pending
+    _slept(d, 120)
+    assert not d.net_held("claude")
+
+
+def test_the_api_host_follows_the_providers_base_url(env, monkeypatch):
+    from ttp.providers import get_provider
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    assert get_provider("claude").reach_host() == "api.anthropic.com"
+    assert get_provider("codex").reach_host() == "api.openai.com"
+    assert get_provider("cursor").reach_host() == "api2.cursor.sh"
+    assert get_provider("fake").reach_host() == ""
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://gateway.example.com:8443/v1")
+    assert get_provider("claude").reach_host() == "gateway.example.com"
+    assert get_provider("codex").reach_host({"OPENAI_BASE_URL": "llm.example.org"}) == "llm.example.org"
+
+
+def test_a_coordinator_turn_lost_to_the_network_is_not_a_failed_turn(env, net, monkeypatch):
+    p = make(env)
+    from ttp import runner
+    from ttp.daemon import Daemon
+    monkeypatch.setattr(runner, "boot_id", lambda: "b")
+    d = Daemon(p.base)
+    now = time.time()
+    rid = _ended_run(p, None, {"rc": 1, "started": now - 120, "ended": now - 60, "slept_s": 0},
+                     role="coordinator", output=json.dumps(_api_error(ENOTFOUND)[0]) + "\n")
+    p.db.x("UPDATE runs SET provider='claude' WHERE id=?", (rid,))
+    d.reap_runs()
+    assert json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (rid,))["note"])["lost_to_network"]
+    assert int(p.db.kv("coordinator_failures", 0)) == 0
+    assert not p.db.kv("coordinator_backoff_until")
