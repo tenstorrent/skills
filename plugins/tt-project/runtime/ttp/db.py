@@ -88,6 +88,13 @@ CREATE INDEX IF NOT EXISTS snapshots_ts ON snapshots(ts);
 
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT, ts REAL);
 
+-- One row per Jev call: its use, decision, cost, estimated cost avoided and later outcome (jevuse.py).
+CREATE TABLE IF NOT EXISTS jev_calls (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, use TEXT NOT NULL, ref TEXT, decision TEXT,
+  cost_usd REAL NOT NULL DEFAULT 0, avoided_usd REAL NOT NULL DEFAULT 0, settle_at REAL,
+  outcome TEXT, outcome_ts REAL, note TEXT);
+CREATE INDEX IF NOT EXISTS jev_calls_use ON jev_calls(ts, use);
+
 -- One row per episode of a high alert with a condition key; cleared is set, never deleted.
 CREATE TABLE IF NOT EXISTS alerts (
   id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL, raised REAL NOT NULL, last REAL,

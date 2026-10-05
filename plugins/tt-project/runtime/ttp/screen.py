@@ -15,6 +15,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from . import jevuse
 from .db import DB, SEVERITY_RANK
 
 _VOLATILE = [
@@ -84,11 +85,11 @@ def _screen(db: DB, cfg: dict, source: str, text: str, hint: str | None, jev,
             rewake_after_s: float | None, repeat: bool) -> Verdict:
     now = time.time()
     floor = SEVERITY_RANK.get(cfg.get("screen", {}).get("wake_min_severity", "normal"), 1)
-    judged: list[tuple[str, str, str]] = []
+    judged: list[tuple[str, str, str, dict]] = []
 
-    def judge() -> tuple[str, str, str]:   # once per observation, and only when an issue is new
+    def judge() -> tuple[str, str, str, dict]:   # once per observation, and only when an issue is new
         if not judged:
-            judged.append(_judge(source, text, hint, jev))
+            judged.append(_judge(db, cfg, source, text, hint, jev, floor))
         return judged[0]
 
     conditions = watcher_conditions(source, text)
@@ -123,11 +124,12 @@ def _issue(db: DB, fp: str, source: str, title: str, retitle: str | None, hint: 
             sev = hint if seen_at >= 0 else row["severity"]
             db.x("UPDATE issues SET status=?, severity=?, closed=NULL, cleared_why=NULL WHERE id=?",
                  ("open" if sev != "info" else "ignored", sev, row["id"]))
-            return Verdict(SEVERITY_RANK.get(sev, 1) >= floor, sev, "regressed after fix", fp, row["id"], "dedupe")
+            v = Verdict(SEVERITY_RANK.get(sev, 1) >= floor, sev, "regressed after fix", fp, row["id"], "dedupe")
+            return _jev_missed(db, row, v)
         if seen_at > rank and seen_at >= floor:
             # The watcher now rates it higher than before (a condition kept quiet that turned serious).
             db.x("UPDATE issues SET status='open', severity=? WHERE id=?", (hint, row["id"]))
-            return Verdict(True, str(hint), f"now {hint}", fp, row["id"], "dedupe")
+            return _jev_missed(db, row, Verdict(True, str(hint), f"now {hint}", fp, row["id"], "dedupe"))
         reason = "known issue"
         if row["status"] == "open" and rank >= floor:
             if repeat:
@@ -136,19 +138,39 @@ def _issue(db: DB, fp: str, source: str, title: str, retitle: str | None, hint: 
                 reason = f"back after {(now - float(row['last_seen'] or 0)) / 3600:.1f} h quiet"
         return Verdict(reason != "known issue", row["severity"], reason, fp, row["id"], "dedupe")
 
-    severity, verdict_src, reason = judge()
+    severity, verdict_src, reason, info = judge()
     issue_id = db.x("INSERT INTO issues(fingerprint,source,first_seen,last_seen,count,title,severity,status,screen) "
                     "VALUES(?,?,?,?,1,?,?,?,?)", (fp, source, now, now, title, severity,
                                                    "open" if severity != "info" else "ignored",
-                                                   json.dumps({"by": verdict_src, "reason": reason})))
+                                                   json.dumps({"by": verdict_src, "reason": reason, **info})))
+    if info.get("jev_call"):
+        jevuse.set_ref(db, info["jev_call"], f"issue:{issue_id}")
     return Verdict(SEVERITY_RANK.get(severity, 1) >= floor, severity, reason, fp, issue_id, verdict_src)
 
 
-def _judge(source: str, text: str, hint: str | None, jev) -> tuple[str, str, str]:
-    """Severity of a new issue: the watcher's hint, else rules, refined by Jev when configured."""
-    severity = hint or rule_severity(text)
-    verdict_src, reason = "rules", f"rule severity {severity}"
-    if jev is not None and jev.enabled():
+JEV_USE = "screen"
+JEV_SETTLE_S = 3 * 86400   # a wake Jev skipped counts as right once its issue stayed quiet this long
+
+
+def _jev_missed(db: DB, row: dict, v: Verdict) -> Verdict:
+    """A known issue waking now that Jev kept quiet when it was new: that skip was wrong."""
+    if v.wake:
+        try:
+            seen = json.loads(row.get("screen") or "{}")
+        except ValueError:
+            seen = {}
+        if isinstance(seen, dict) and seen.get("jev_call") and seen.get("skipped"):
+            jevuse.resolve(db, int(seen["jev_call"]), False, v.reason)
+    return v
+
+
+def _judge(db: DB, cfg: dict, source: str, text: str, hint: str | None, jev,
+           floor: int) -> tuple[str, str, str, dict]:
+    """Severity of a new issue: the watcher's hint, else rules, refined by Jev when configured and
+    its screening use is on (see jevuse). Each Jev call is logged with the coordinator wake it skipped."""
+    rules = severity = hint or rule_severity(text)
+    verdict_src, reason, info = "rules", f"rule severity {severity}", {}
+    if jev is not None and jev.enabled() and jevuse.allowed(db, cfg, JEV_USE):
         try:
             ans = jev.decide(state=f"source: {source}\nobservation:\n{text[:6000]}", questions={
                 "actionable": {"type": "noul",
@@ -158,16 +180,25 @@ def _judge(source: str, text: str, hint: str | None, jev) -> tuple[str, str, str
                 "severity": {"type": "score", "instructions": "How severe is it for the project?",
                              "criteria": ["informational", "minor", "significant", "critical outage or data loss"]},
             }, purpose="screen")
+            decision: dict = {"rules": rules, "answer": None}
             if ans:
                 p = float(ans.get("actionable", {}).get("noul", 0.5))
                 s = float(ans.get("severity", {}).get("score", 1.0))
                 severity = ["info", "normal", "high", "critical"][max(0, min(3, round(s)))]
                 if p < 0.35:
                     severity = "info"
+                decision = {"rules": rules, "actionable": round(p, 2), "severity": severity,
+                            "wake": SEVERITY_RANK.get(severity, 1) >= floor}
                 verdict_src, reason = "jev", f"jev actionable={p:.2f} severity={s:.2f}"
+            if ans is not None:   # it was called and paid for
+                skipped = SEVERITY_RANK.get(rules, 1) >= floor > SEVERITY_RANK.get(severity, 1)
+                info = {"skipped": skipped, "jev_call": jevuse.record(
+                    db, JEV_USE, decision, getattr(jev, "last_cost", 0.0),
+                    avoided_usd=jevuse.mean_turn_cost(db, cfg) if skipped else 0.0,
+                    settle_s=JEV_SETTLE_S if skipped else None)}
         except Exception as e:  # screening must never take the daemon down
             reason += f" (jev unavailable: {type(e).__name__})"
-    return severity, verdict_src, reason
+    return severity, verdict_src, reason, info
 
 
 # Watcher conditions ---------------------------------------------------------------------------

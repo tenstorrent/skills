@@ -32,6 +32,7 @@ from . import budget as bud
 from . import coordinator as coord
 from . import ends
 from . import integrity
+from . import jevuse
 from . import locks
 from . import machines
 from . import prguard
@@ -433,6 +434,7 @@ class Daemon:
         coord.expire_asks(self.p, hold=any(g.level == "red" for g in self.gates.values()))
         scr.expire_mutes(self.p.db)
         scr.close_watcher_issues(self.p.db, quiet_s=scr.WATCHER_QUIET_CLOSE_S)
+        self.review_jev()
         settling = self.settling()
         for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.read_upstream, self.retry_rejected,
                      self.retire_ended, self.maybe_coordinate, self.probe_waiting, self.start_pushes, self.dispatch, self.deliver_outbound):
@@ -444,6 +446,15 @@ class Daemon:
                 continue
             step()
             self._progress()
+
+    def review_jev(self, every_s: float = 600) -> None:
+        """Switch off the Jev uses that do not save money (jevuse.review) and report each one once."""
+        now = time.time()
+        if now - getattr(self, "_jev_reviewed", 0.0) < every_s:
+            return
+        self._jev_reviewed = now
+        for use, s in jevuse.review(self.p.db, self.cfg, now):
+            self.alert(f"jev-off:{use}", jevuse.off_text(use, s, self.cfg), severity="low", every_s=0)
 
     def retire_ended(self) -> None:
         """Retire memory entries and charter sections whose end condition passed (see ends)."""
@@ -1570,6 +1581,11 @@ class Daemon:
         prompt_file = payload.get("prompt")
         if prompt_file and (self.p.harness / "prompts" / prompt_file).exists():
             spec = (self.p.harness / "prompts" / prompt_file).read_text() + "\n\n" + spec
+        jev_lines = jevuse.lines(db, self.cfg) if payload.get("jev_report", s["name"] == "daily-review") else []
+        if jev_lines:
+            spec += (f"\n\nJev uses over the last {jevuse.window_s(self.cfg) / 86400:g} d (calls, cost, estimated "
+                     f"savings, net, error rate; a use with no net saving is switched off by itself):\n"
+                     + "\n".join(f"- {line}" for line in jev_lines))
         db.add_task(f"[{s['name']}] {s['description'][:120] or 'recurring task'}", spec, kind=payload.get("kind", "work"),
                     tier=payload.get("tier", "standard"), priority=int(payload.get("priority", 4)),
                     budget_usd=s["budget_usd_day"], origin="schedule", labels=[s["name"]])

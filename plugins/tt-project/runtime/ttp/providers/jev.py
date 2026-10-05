@@ -44,6 +44,7 @@ class Jev:
         self.url = self.cfg.get("url") or sec.get("url") or ENDPOINTS.get(self.via, "")
         self.model = self.cfg.get("model") or DEFAULT_MODEL.get(self.via, "jev-latest")
         self._pause_until = 0.0
+        self.last_cost = 0.0   # what the latest decide() cost, for the use's ledger (jevuse.record)
 
     def enabled(self) -> bool:
         # "auto" (the default): on whenever the user has saved a key; a project can opt out with false.
@@ -72,6 +73,7 @@ class Jev:
         usage = data.get("usage") or {}
         # OpenRouter reports cost; TypeSafe reports tokens only (input priced, output free).
         cost = float(usage.get("cost") or 0.0) or int(usage.get("input_tokens") or 0) * INPUT_USD_PER_MTOK / 1e6
+        self.last_cost = cost
         if self.db is not None:
             self.db.spend("jev", cost, f"jev:{purpose}", account=self.via,
                           tokens_in=int(usage.get("input_tokens") or 0),

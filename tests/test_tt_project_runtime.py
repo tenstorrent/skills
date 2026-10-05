@@ -523,6 +523,103 @@ def test_screening_wakes_again_on_repeats_and_after_a_quiet_spell(env):
     assert not screen(p.db, cfg, "watcher:hw", text, repeat=True).wake
 
 
+class _FakeJev:
+    """Stands in for providers.jev.Jev: answers every screening question the same way."""
+
+    def __init__(self, actionable, severity, cost=0.0001):
+        self.actionable, self.severity, self.last_cost, self.calls = actionable, severity, cost, 0
+
+    def enabled(self):
+        return True
+
+    def decide(self, state, questions, purpose="decide"):
+        self.calls += 1
+        return {"actionable": {"noul": self.actionable}, "severity": {"score": self.severity}}
+
+
+def test_jev_screening_that_saves_nothing_is_switched_off_once_and_can_be_forced_back(env):
+    p = make(env)
+    from ttp import jevuse
+    from ttp.screen import screen
+    p.set_config("jev.min_calls", 3)
+    cfg = p.config()
+    jev = _FakeJev(0.95, 2.0)   # agrees with the rules: every wake still happens
+    for i in range(3):
+        assert screen(p.db, cfg, "log:app", f"ERROR: job {chr(97 + i)} failed", jev=jev).wake
+    rows = p.db.q("SELECT use, ref, cost_usd, avoided_usd, decision FROM jev_calls ORDER BY id")
+    assert [r["use"] for r in rows] == ["screen"] * 3 and all(r["avoided_usd"] == 0 for r in rows)
+    assert rows[0]["ref"].startswith("issue:") and json.loads(rows[0]["decision"])["wake"] is True
+    [line] = jevuse.lines(p.db, cfg)
+    assert "3 calls" in line and "est. saved $0.000" in line and "net -$0.000" in line and line.endswith("; on")
+    [(use, s)] = jevuse.review(p.db, cfg)
+    assert use == "screen" and s["net"] < 0
+    assert jevuse.review(p.db, cfg) == []   # reported once
+    assert "switched off" in jevuse.off_text(use, s, cfg) and "jev.uses.screen" in jevuse.off_text(use, s, cfg)
+    assert not jevuse.allowed(p.db, cfg, "screen") and "switched off (net" in jevuse.lines(p.db, cfg)[0]
+    screen(p.db, cfg, "log:app", "ERROR: job z failed", jev=jev)
+    assert jev.calls == 3   # the rules decide alone now
+    p.set_config("jev.uses", {"screen": "on"})
+    cfg = p.config()
+    assert jevuse.allowed(p.db, cfg, "screen") and jevuse.review(p.db, cfg) == []
+    assert p.db.kv(jevuse.OFF_KEY) == {} and "forced on" in jevuse.lines(p.db, cfg)[0]
+    p.set_config("jev.uses", {"screen": "off"})
+    assert not jevuse.allowed(p.db, p.config(), "screen")
+
+
+def test_jev_skipped_wake_is_priced_at_a_coordinator_turn_and_a_later_wake_marks_it_wrong(env):
+    p = make(env)
+    from ttp import jevuse
+    from ttp.screen import screen
+    now = time.time()
+    for cost in (0.3, 0.5, 0.0):   # unmetered turns do not count
+        p.db.x("INSERT INTO runs(role,status,started,ended,cost_usd) VALUES('coordinator','ok',?,?,?)",
+               (now - 3600, now - 3500, cost))
+    cfg = p.config()
+    assert jevuse.mean_turn_cost(p.db, cfg) == pytest.approx(0.4)
+    quiet = _FakeJev(0.1, 0.0)
+    v = screen(p.db, cfg, "watcher:hw", "box-a: link retry failed", jev=quiet)
+    assert not v.wake and v.screen == "jev"
+    [s] = jevuse.stats(p.db, cfg).values()
+    assert s["saved"] == pytest.approx(0.4) and s["net"] > 0 and s["right"] == s["wrong"] == 0
+    assert "error rate unknown" in jevuse.lines(p.db, cfg)[0]
+    # The watcher later rates it high: the coordinator wakes for it after all, so the skip was wrong.
+    again = screen(p.db, cfg, "watcher:hw", "box-a: link retry failed", "high", jev=quiet)
+    assert again.wake and again.issue_id == v.issue_id
+    row = p.db.one("SELECT outcome, note FROM jev_calls")
+    assert row["outcome"] == "wrong" and row["note"] == "now high"
+    s = jevuse.stats(p.db, cfg)["screen"]
+    assert s["saved"] == 0 and s["wrong"] == 1
+    # A skip whose issue stayed quiet past the settle time counts as right.
+    screen(p.db, cfg, "watcher:hw", "box-b: fan slow failed", jev=quiet)
+    assert jevuse.stats(p.db, cfg)["screen"]["right"] == 0
+    assert jevuse.stats(p.db, cfg, now=time.time() + 4 * 86400)["screen"]["right"] == 1
+    p.db.x("UPDATE jev_calls SET settle_at=? WHERE outcome IS NULL", (time.time() - 1,))
+    assert "errors 1/2 (50%)" in jevuse.lines(p.db, cfg)[0]
+    # The ledger is generic: any later use logs its picks and their outcomes the same way.
+    cid = jevuse.record(p.db, "effort", {"effort": "high"}, 0.0002, avoided_usd=1.5, ref="task:7")
+    assert jevuse.resolve(p.db, cid, True) and not jevuse.resolve(p.db, cid, False)
+    assert jevuse.stats(p.db, cfg)["effort"]["net"] == pytest.approx(1.5 - 0.0002)
+
+
+def test_daemon_reports_a_jev_use_switched_off_once_and_feeds_the_daily_review(env):
+    p = make(env)
+    from ttp import daemon as dm
+    from ttp import jevuse
+    p.set_config("jev.min_calls", 2)
+    for _ in range(2):
+        jevuse.record(p.db, "screen", {"wake": True}, 0.001)
+    d = dm.Daemon(p.base)
+    d.cfg = p.config()
+    d.review_jev(every_s=0)
+    d.review_jev(every_s=0)
+    sent = [m for m in p.db.q("SELECT text, severity FROM messages WHERE direction='out' AND ref='jev-off:screen'")]
+    assert len(sent) == 1 and sent[0]["severity"] == "low" and "watcher screening is switched off" in sent[0]["text"]
+    s = {"name": "daily-review", "budget_usd_day": None, "last_run": None, "description": "review"}
+    assert d._schedule_llm(s, {}) == "queued"
+    spec = p.db.one("SELECT spec FROM tasks WHERE origin='schedule'")["spec"]
+    assert "Jev uses over the last 7 d" in spec and "- watcher screening [screen]: 2 calls, cost $0.002" in spec
+
+
 def test_command_watcher_repeats_wake_the_coordinator(env, monkeypatch):
     p = make(env)
     from ttp import daemon as dm
