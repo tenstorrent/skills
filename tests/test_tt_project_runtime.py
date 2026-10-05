@@ -1972,6 +1972,23 @@ def test_newest_listener_claims_chat_before_old_one_exits(env):
                 proc.kill()
                 proc.wait(timeout=10)
 
+
+def test_process_checks_read_the_whole_command_line_under_a_narrow_terminal(env, monkeypatch):
+    """`ps -o command=` cuts at $COLUMNS (80 under pytest-xdist, or a narrow terminal), so a long
+    path hid 'listen' or 'daemon': an older listener was never replaced, a live daemon looked dead."""
+    from ttp import cli, daemon
+    monkeypatch.setenv("COLUMNS", "40")
+    pad = "x" * 200
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", pad,
+                              "ttp", "listen", "demo", "--chat", "c1", "daemon"])
+    try:
+        assert cli._listener_alive(child.pid, "c1"), "the listener check read a cut command line"
+        assert daemon._is_daemon(child.pid), "the daemon check read a cut command line"
+    finally:
+        child.kill()
+        child.wait()
+
+
 def test_listener_does_not_skip_a_reply_posted_between_its_reads(env, capsys):
     """A reply that lands after the unread query but before the high-water read is still shown."""
     p = make(env)

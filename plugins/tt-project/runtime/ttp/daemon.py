@@ -4022,7 +4022,7 @@ def _is_daemon(pid: int) -> bool:
     if not _alive(pid):
         return False
     try:
-        cmd = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True,
+        cmd = subprocess.run(["ps", "-ww", "-o", "command=", "-p", str(pid)], capture_output=True, text=True,
                              timeout=5).stdout
     except (OSError, subprocess.SubprocessError):
         return True

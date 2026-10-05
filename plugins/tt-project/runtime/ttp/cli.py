@@ -624,7 +624,7 @@ def _listener_alive(pid: int, chat: str) -> bool:
     if zombie(pid):
         return False
     try:
-        cmd = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True,
+        cmd = subprocess.run(["ps", "-ww", "-o", "command=", "-p", str(pid)], capture_output=True,
                              text=True, timeout=5).stdout
     except (OSError, subprocess.SubprocessError):
         return True
