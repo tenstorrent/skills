@@ -21124,6 +21124,33 @@ def test_a_net_hold_says_why_and_clears_when_it_ends(env, net, monkeypatch):
     assert p.db.task(other)["blocked_reason"] == "something else"
 
 
+def test_network_held_tasks_are_not_ready_in_health_status_or_the_turn_batch(env):
+    p = make(env)
+    from ttp import cli
+    from ttp.daemon import NET_HELD_NOTE, Daemon
+    from ttp.web import health
+    p.db.x("UPDATE events SET status='handled'")
+    p.db.x("UPDATE tasks SET status='done'")
+    held = p.db.add_task("on the held provider", "s", kind="work", tier="light", origin="user")
+    p.db.x("UPDATE tasks SET provider='claude' WHERE id=?", (held,))
+    p.db.update_task(held, blocked_reason=f"{NET_HELD_NOTE} waiting for claude's API host to resolve")
+    h = health(p, p.db)
+    assert "ready to start" not in h["why_idle"], h["why_idle"]
+    assert "1 task(s) held: network (claude); they start once the API host resolves" in h["why_idle"], h["why_idle"]
+    assert "ttp " not in h["why_idle"].split("held: network", 1)[1], "no command the harness runs itself"
+    assert [t["id"] for t in h["net_held"]] == [held]
+    assert f"#{held} held: network: on the held provider" in cli.status_text(p)
+    # The coordinator does not wait for a batch on the grounds that held work would fill the free slot.
+    p.set_config("budget.max_parallel_workers", 1)
+    d = Daemon(p.base)
+    d.gates = {}
+    evs = [{"ts": time.time() - 10, "kind": "task_done", "severity": "normal"}]
+    assert not d._batch_hold(evs, time.time())
+    p.db.update_task(held, blocked_reason=None)
+    assert d._batch_hold(evs, time.time()), "the same task without the hold fills the slot"
+    assert "1 task(s) ready to start" in health(p, p.db)["why_idle"]
+
+
 def test_a_proxied_host_is_never_held(env, net, monkeypatch):
     p = make(env)
     from ttp.daemon import Daemon

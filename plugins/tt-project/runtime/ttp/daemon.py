@@ -2173,7 +2173,7 @@ class Daemon:
             return True   # no slot is free; nothing the turn queues could start before one is
         paused = db.paused_resources()
         runnable = sum(1 for t in db.ready_tasks() if not coord.task_resources(t) & paused.keys()
-                       and not (t["blocked_reason"] or "").startswith((PAUSED_NOTE, LOGGED_OUT_NOTE)))
+                       and not (t["blocked_reason"] or "").startswith((PAUSED_NOTE, LOGGED_OUT_NOTE, NET_HELD_NOTE)))
         return busy + runnable >= slots
 
     # workers ----------------------------------------------------------------------------------------

@@ -20,8 +20,8 @@ from . import coordinator as coord
 from . import pushq, release
 from . import schedule as sched
 from . import upstream
-from .daemon import (AUTH_PROBE_S, HEARTBEAT_STALE_S, KV_LOCAL_ONLY, KV_WORKTREES_DIRTY, LOGGED_OUT_NOTE, WAIT_KEYS,
-                     WATCHDOG_S, heartbeat, idle_wake)
+from .daemon import (AUTH_PROBE_S, HEARTBEAT_STALE_S, KV_LOCAL_ONLY, KV_WORKTREES_DIRTY, LOGGED_OUT_NOTE, NET_HELD_NOTE,
+                     WAIT_KEYS, WATCHDOG_S, heartbeat, idle_wake)
 from .alerts import cleared  # noqa: F401  (readers import it from here)
 from .db import (DB, SEVERITY_RANK, chat_floor, continues_id, deferral, dependency_ids, dump_result, host_line,
                  load_result)
@@ -242,7 +242,11 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
     out = {b["provider"] for b in breakers}
     logged_out = [t for t in due if (t["blocked_reason"] or "").startswith(LOGGED_OUT_NOTE)
                   and (t["provider"] or core) in out]
-    ready = sum(1 for t in due if not task_resources(t) & {r["resource"] for r in paused_resources}) - len(logged_out)
+    # A task whose provider's API host does not resolve is held until it does (the daemon clears the note).
+    net_held = [t for t in due if (t["blocked_reason"] or "").startswith(NET_HELD_NOTE)]
+    held_ids = {t["id"] for t in logged_out + net_held}
+    ready = sum(1 for t in due if not task_resources(t) & {r["resource"] for r in paused_resources}
+                and t["id"] not in held_ids)
     blocked = db.one("SELECT COUNT(*) n FROM tasks WHERE status='blocked'")["n"]
     running = db.one("SELECT COUNT(*) n FROM runs WHERE status='running'")["n"]
     asks = db.q("SELECT id, ts, text FROM messages WHERE kind='ask' AND handled=0 ORDER BY id DESC LIMIT 5")
@@ -305,6 +309,10 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         provs = sorted({t["provider"] or core for t in logged_out})
         why.append(f"{len(logged_out)} task(s) held: logged out ({', '.join(provs)}); they start once a login "
                    f"check passes")
+    if net_held:
+        provs = sorted({t["provider"] or core for t in net_held})
+        why.append(f"{len(net_held)} task(s) held: network ({', '.join(provs)}); they start once the API host "
+                   f"resolves")
     if waiting:
         why.append(f"{len(waiting)} task(s) waiting, next try {at(waiting[0]['not_before'], now)}")
     if deferred:
@@ -348,6 +356,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         "providers_paused": paused_providers, "resources_paused": paused_resources, "waiting": waiting,
         "deferred": deferred,
         "logged_out": [{k: t[k] for k in ("id", "title", "provider")} for t in logged_out],
+        "net_held": [{k: t[k] for k in ("id", "title", "provider")} for t in net_held],
         "breakers": breakers,
         "asks": asks, "running": running, "working": working,
         "undelivered": undelivered,

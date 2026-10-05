@@ -743,6 +743,8 @@ def status_text(p: Project) -> str:
                      f"only questions and plans start")
     for t in h["logged_out"][:5]:
         lines.append(f"  #{t['id']} held: logged out: {t['title']}")
+    for t in h.get("net_held", [])[:5]:
+        lines.append(f"  #{t['id']} held: network: {t['title']}")
     for t in h["waiting"][:5]:
         why = re.sub(r";? *next try \S+$", "", t["blocked_reason"] or "").strip()
         lines.append(f"  #{t['id']} waiting, next try {at(t['not_before'], now)}: {t['title']}" + (f" — {why}" if why else ""))
