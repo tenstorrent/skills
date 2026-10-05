@@ -89,7 +89,10 @@ and preferences you add later become part of the project's charter and memory.
   daemon queues the review of each finished code task whose hand-off has no follow-ups, notes or
   findings itself (`review.auto`, on by default), and that hand-off starts no coordinator turn.
   Any other hand-off leaves the review to the coordinator's turn. `review.auto_notes` is added
-  to each such review's spec (for example, what to do after a push). A review the coordinator adds
+  to each such review's spec (for example, what to do after a push). When the task's PR already
+  carries the reviewed head (as pr-watch last read it, or as the task's own `ttp push --own`
+  pushed it), the work is delivered: the review is review only, with no push to
+  `delivery.push_branch` and no push-queue approval. A review the coordinator adds
   for the same work replaces the daemon's while it has not started. A review that fails with
   follow-ups gets one fix task on the reviewed branch and a re-review from the daemon, and the
   tasks waiting on the failed review wait on the re-review instead of being blocked (at most two
