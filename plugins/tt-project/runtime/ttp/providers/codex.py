@@ -236,7 +236,8 @@ class Codex(Provider):
             mins = int(w.get("windowDurationMins") or 0)
             name = "5h" if mins == 300 else "7d" if mins == 10080 else f"{mins}m"
             util = float(w.get("usedPercent") or 0)
-            wins.append(Window("codex", name, 100.0 if not allowed else util, w.get("resetsAt"), rl.get("planType") or ""))
+            # Keyed like the readings its runs report, so the gate matches them to the account.
+            wins.append(Window("codex", name, 100.0 if not allowed else util, w.get("resetsAt"), self.account()))
         return wins
 
 

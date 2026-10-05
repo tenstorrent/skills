@@ -453,6 +453,106 @@ def test_a_plan_stays_a_plan_when_readings_are_old(env):
     assert wins["five_hour"].utilization == 0.0 and wins["five_hour"].resets_at > now, "a reset window is empty"
     assert bud.evaluate(p.db, p.config(), "claude", list(wins.values()), now).regime == "windows"
 
+
+def _reading(p, ts, account, window, util, resets):
+    p.db.x("INSERT INTO snapshots(ts,provider,account,window,utilization,resets_at) VALUES(?,?,?,?,?,?)",
+           (ts, "claude", account, window, util, resets))
+
+
+def _run(p, account, started, ended=None, cost=0.0):
+    p.db.x("INSERT INTO runs(role,provider,account,started,ended,status,cost_usd) VALUES('worker','claude',?,?,?,?,?)",
+           (account, started, ended, "ok" if ended else "running", cost))
+
+
+def _old_plan(p, now):
+    """A plan account's readings, its spend and one completed weekly period (for the 7d average)."""
+    _run(p, "acct-a | plan", now - 7200, now - 3000, 60.0)
+    p.db.spend("claude", 60.0, "task:1", account="acct-a | plan", ts=now - 3000)
+    _reading(p, now - 9 * 86400, "acct-a | plan", "seven_day", 70.0, now - 8 * 86400)
+    for ago in (1800, 600):
+        _reading(p, now - ago, "acct-a | plan", "seven_day", 86.0, now + 2 * 86400)
+        _reading(p, now - ago, "acct-a | plan", "five_hour", 10.0, now + 3600)
+
+
+def test_plan_readings_of_another_plan_account_stop_counting_at_once(env):
+    """plan -> plan: the old account's windows leave the gate, pacing and budget line as soon as the
+    provider runs under another account, not a week later; the new account's readings take over."""
+    p = make(env)
+    from ttp import budget as bud
+    from ttp.web import budget_line
+    now = time.time()
+    _old_plan(p, now)
+    wins = bud.plan_windows(p.db, now)
+    assert {w.window: w.utilization for w in wins} == {"seven_day": 86.0, "five_hour": 10.0}
+    assert "7d 86%" in budget_line(p.db, now, "claude") and "7d avg 70%" in budget_line(p.db, now, "claude")
+    _run(p, "acct-b | plan", now - 60)                  # the next run starts under another account
+    assert bud.plan_windows(p.db, now) == [] and bud.windows_from_snapshots(p.db, now) == []
+    g = bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db, now), now)
+    assert g.regime == "caps" and any("another account" in r for r in g.reasons), g.reasons
+    assert g.numbers["spent_24h"] == 0 and g.level == "green", "the old plan's spend stays plan-billed"
+    line = budget_line(p.db, now, "claude", g.as_dict())
+    assert "86%" not in line and "avg" not in line and "actual" in line, line
+    assert bud.history(p.db)["window_peaks"] == []
+    # the new account reports: its windows count, and burn is measured from its readings alone
+    _reading(p, now - 30, "acct-b | plan", "seven_day", 20.0, now + 2 * 86400)
+    assert [(w.window, w.utilization) for w in bud.plan_windows(p.db, now)] == [("seven_day", 20.0)]
+    assert bud.burn_rate(p.db, "claude", "seven_day", now + 2 * 86400, now, "acct-b | plan") is None
+    assert bud.burn_rate(p.db, "claude", "seven_day", now + 2 * 86400, now) is not None, "both accounts mixed"
+    g = bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db, now), now)
+    assert g.regime == "windows" and g.numbers["utilization"] == 20.0, g.numbers
+    assert budget_line(p.db, now, "claude", g.as_dict()).startswith("7d 20% - resets in")
+
+
+def test_a_switch_to_a_usage_billed_account_drops_plan_windows_before_its_first_run(env):
+    """plan -> usage-billed: the daemon's look at the login is enough; the gate applies the dollar
+    caps to spend after the old plan's last reading, and the budget line shows no plan window."""
+    p = make(env)
+    from ttp import budget as bud
+    from ttp.web import budget_line
+    now = time.time()
+    _old_plan(p, now)
+    bud.note_account(p.db, "claude", "acct-a | org | usage-billed")
+    assert bud.current_accounts(p.db) == {"claude": "acct-a | org | usage-billed"}
+    assert bud.plan_windows(p.db, now) == []
+    p.db.spend("claude", 70.0, "task:2", account="acct-a | org | usage-billed", ts=now - 60)
+    g = bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db, now), now)
+    assert g.regime == "caps" and g.numbers["spent_24h"] == 70.0 and g.level == "yellow", (g.numbers, g.reasons)
+    line = budget_line(p.db, now, "claude", g.as_dict())
+    assert line == "24h $130.00 actual", line
+    # a run that started earlier under the plan account does not bring its windows back
+    _run(p, "acct-a | plan", now - 7300)
+    assert bud.plan_windows(p.db, now) == []
+
+
+def test_readings_without_an_account_count_until_another_account_or_usage_billing_shows(env):
+    """Legacy readings recorded before readings were keyed: they still count (an upgrade must not
+    drop a live plan), until a keyed reading arrives after them, or until paid runs of the current
+    account end after them without any reading (it is billed by use)."""
+    p = make(env)
+    from ttp import budget as bud
+    from ttp.web import budget_line
+    now = time.time()
+    _reading(p, now - 900, "", "seven_day", 86.0, now + 86400)
+    _reading(p, now - 900, "", "five_hour", 30.0, now + 3600)
+    _run(p, "acct-c | plan", now - 1200, now - 1000, 1.0)
+    assert {w.window for w in bud.plan_windows(p.db, now)} == {"seven_day", "five_hour"}
+    assert bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db, now), now).regime == "windows"
+    assert "7d 86%" in budget_line(p.db, now, "claude")
+    # the provider moves to another account and it reports: only keyed readings count from then on
+    _run(p, "acct-d | plan", now - 150)
+    _reading(p, now - 120, "acct-d | plan", "five_hour", 5.0, now + 3600)
+    assert [(w.window, w.utilization) for w in bud.plan_windows(p.db, now)] == [("five_hour", 5.0)]
+    assert "86%" not in budget_line(p.db, now, "claude")
+    p.db.x("DELETE FROM snapshots WHERE account!=''")
+    # no keyed reading, but the current account's paid runs report none: it is billed by use
+    _run(p, "acct-c | plan", now - 500, now - 300, 1.0)
+    assert {w.window for w in bud.plan_windows(p.db, now)} == {"seven_day", "five_hour"}, "one run is not proof"
+    _run(p, "acct-c | plan", now - 250, now - 100, 1.0)
+    assert bud.plan_windows(p.db, now) == []
+    g = bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db, now), now)
+    assert g.regime == "caps" and "86%" not in budget_line(p.db, now, "claude", g.as_dict())
+
+
 def test_runaway_guard_trips_on_a_spend_spike(env):
     p = make(env)
     from ttp import budget as bud

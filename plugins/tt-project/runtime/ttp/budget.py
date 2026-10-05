@@ -28,6 +28,8 @@ LEVELS = ("green", "yellow", "orange", "red")
 HOUR, DAY, WEEK = 3600.0, 86400.0, 7 * 86400.0
 SNAPSHOT_FRESH_S = 30 * 60
 PLAN_MEMORY_S = 7 * 86400      # a provider that reported plan windows this recently is on a plan
+# Where the daemon keeps the account each provider is logged in as (plan readings are keyed by it).
+ACCOUNT_KV = "plan_account:"
 # Length of each named window, used to measure burn over a sensible span and to roll a window over
 # when its reset has passed without a new reading. Unknown names fall back to a week.
 WINDOW_HOURS = {"five_hour": 5.0, "5h": 5.0, "seven_day": 168.0, "7d": 168.0, "seven_day_opus": 168.0,
@@ -147,9 +149,15 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
     limit = 100.0 - float(b.get("reserve_pct", 10))
 
     last = plan_providers(db, now)
-    lapsed = {p for p, ts in last.items() if now - ts > SNAPSHOT_FRESH_S and plan_lapsed(db, p, ts)}
+    # A provider whose readings all belong to another account (or predate a usage-billed one) has
+    # left that plan: its spend since the last of them counts toward the dollar caps at once.
+    moved = set(last) - {w.provider for w in plan_windows(db, now)}
+    lapsed = moved | {p for p, ts in last.items() if now - ts > SNAPSHOT_FRESH_S and plan_lapsed(db, p, ts)}
     plan = [w for w in windows if w.provider == provider and provider not in lapsed]
-    if provider in lapsed:
+    if provider in moved:
+        g.reasons.append(f"{provider} is on another account than its plan readings; its spend counts toward "
+                         f"the dollar caps")
+    elif provider in lapsed:
         g.reasons.append(f"{provider} stopped reporting plan windows; its spend counts toward the dollar caps")
     if plan:
         g.regime = "windows"
@@ -250,7 +258,7 @@ def _plan(db: DB, g: Gate, provider: str, plan: list[Window], line: float, most:
     allowed, rows = most, []
     for w in plan:
         hours_left = max((w.resets_at - now) / HOUR, 0.05) if w.resets_at else None
-        readings = _readings(db, provider, w.window, w.resets_at, now)
+        readings = _readings(db, provider, w.window, w.resets_at, now, w.account or None)
         burn = _slope(readings)
         mean = None if burn is None else avg_running(db, provider, float(readings[0]["ts"]), now)
         per = None if burn is None else burn / mean
@@ -303,20 +311,23 @@ def run_horizon(db: DB, provider: str, now: float) -> float:
     return max(lengths[len(lengths) // 2], 300.0) / HOUR
 
 
-def burn_rate(db: DB, provider: str, window: str, resets_at: float | None, now: float) -> float | None:
+def burn_rate(db: DB, provider: str, window: str, resets_at: float | None, now: float,
+              account: str | None = None) -> float | None:
     """Points of the window used per hour, from this project's readings in the current period.
 
     None until two readings at least five minutes apart exist: no reading, no guess.
     """
-    return _slope(_readings(db, provider, window, resets_at, now))
+    return _slope(_readings(db, provider, window, resets_at, now, account))
 
 
-def _readings(db: DB, provider: str, window: str, resets_at: float | None, now: float) -> list:
-    # Only readings of the current period count (same reset), so the span stops at its start.
+def _readings(db: DB, provider: str, window: str, resets_at: float | None, now: float,
+              account: str | None = None) -> list:
+    # Only readings of the current period count (same reset), so the span stops at its start; with
+    # an account, only that account's (another account's window is another window).
     span = min(WINDOW_HOURS.get(window, 168.0) * HOUR / 4, BURN_SPAN_MAX_S)
     return db.q("SELECT ts, utilization FROM snapshots WHERE provider=? AND window=? AND ts>=? AND "
-                "(resets_at=? OR (? IS NULL AND resets_at IS NULL)) ORDER BY ts",
-                (provider, window, now - span, resets_at, resets_at))
+                "(resets_at=? OR (? IS NULL AND resets_at IS NULL)) AND (? IS NULL OR COALESCE(account,'')=?) "
+                "ORDER BY ts", (provider, window, now - span, resets_at, resets_at, account, account))
 
 
 def _slope(rows: list) -> float | None:
@@ -348,17 +359,70 @@ def avg_running(db: DB, provider: str, since: float, now: float, floor: float = 
     return max(busy / (now - since), floor)
 
 
+def note_account(db: DB, provider: str, account: str) -> None:
+    """Record the account `provider` is logged in as now, so a switch counts before its next run."""
+    if account and (db.kv(ACCOUNT_KV + provider) or {}).get("account") != account:
+        db.set_kv(ACCOUNT_KV + provider, {"account": account, "ts": time.time()})
+
+
+def current_accounts(db: DB) -> dict[str, str]:
+    """The account each provider is on now: the newer of the daemon's last look and the account its
+    latest run started under (the provider's own account label: login, organization, billing)."""
+    seen: dict[str, tuple[float, str]] = {}
+    for r in db.q("SELECT provider, account, started FROM runs WHERE id IN (SELECT MAX(id) FROM runs "
+                  "WHERE account IS NOT NULL AND account!='' GROUP BY provider)"):
+        seen[r["provider"]] = (float(r["started"] or 0), r["account"])
+    for r in db.q("SELECT key, value FROM kv WHERE key LIKE ?", (ACCOUNT_KV + "%",)):
+        v = json.loads(r["value"] or "{}")
+        prov = r["key"][len(ACCOUNT_KV):]
+        if v.get("account") and float(v.get("ts") or 0) >= seen.get(prov, (0.0, ""))[0]:
+            seen[prov] = (float(v["ts"]), v["account"])
+    return {p: a for p, (_, a) in seen.items()}
+
+
+def _latest_readings(db: DB, since: float) -> list:
+    """The latest reading of every plan window since `since`, per provider, account and window."""
+    return db.q("SELECT s.* FROM snapshots s JOIN (SELECT provider, COALESCE(account,'') acct, window, MAX(ts) mts "
+                "FROM snapshots WHERE ts>=? GROUP BY provider, acct, window) m ON s.provider=m.provider AND "
+                "COALESCE(s.account,'')=m.acct AND s.window=m.window AND s.ts=m.mts", (since,))
+
+
+def live_readings(db: DB, rows: list) -> list:
+    """Of the latest readings `rows`, the one per provider and window that counts now.
+
+    Plan windows belong to an account: once the provider is on another one (another login or
+    organization, or a usage-billed account, which has no windows), the old account's readings stop
+    counting at once. Readings recorded without an account count until a keyed reading arrives after
+    them, or until PLAN_LAPSE_RUNS paid runs of the current account ended after them without a
+    reading (it is billed by use). With no account known, the latest keyed reading's account counts.
+    """
+    current, newest, best = current_accounts(db), {}, {}
+    for r in sorted(rows, key=lambda r: float(r["ts"])):
+        if r["account"]:
+            newest[r["provider"]] = (float(r["ts"]), r["account"])
+    for r in rows:
+        prov, ts = r["provider"], float(r["ts"])
+        if r["account"]:
+            ok = r["account"] == (current.get(prov) or newest[prov][1])
+        else:
+            ok = ts >= newest.get(prov, (0.0, ""))[0] and not (current.get(prov) and db.one(
+                "SELECT COUNT(*) n FROM runs WHERE provider=? AND account=? AND status='ok' AND ended>? AND cost_usd>0",
+                (prov, current[prov], ts))["n"] >= PLAN_LAPSE_RUNS)
+        key = (prov, r["window"])
+        if ok and (key not in best or ts > float(best[key]["ts"])):
+            best[key] = r
+    return list(best.values())
+
+
 def plan_windows(db: DB, now: float | None = None) -> list[Window]:
-    """The latest reading of every plan window reported in the last week.
+    """The latest reading of every plan window the provider's current account reported in the last week.
 
     Being on a plan is a fact about the account, so an old reading still says which regime applies;
     the headroom to the line works from the readings themselves. A window whose reset has passed since its last
     reading has started a new period: it counts as empty until the next reading says otherwise.
     """
     now = now or time.time()
-    rows = db.q("SELECT s.* FROM snapshots s JOIN (SELECT provider, window, MAX(ts) mts FROM snapshots "
-                "WHERE ts>=? GROUP BY provider, window) m ON s.provider=m.provider AND s.window=m.window "
-                "AND s.ts=m.mts", (now - PLAN_MEMORY_S,))
+    rows = live_readings(db, _latest_readings(db, now - PLAN_MEMORY_S))
     out = []
     for r in rows:
         util, resets = float(r["utilization"] or 0), r["resets_at"]
@@ -442,11 +506,10 @@ def review_tier(changes: dict[str, int | None], cfg: dict) -> str:
 
 
 def windows_from_snapshots(db: DB, now: float | None = None) -> list[Window]:
-    """Latest reading per (provider, window), ignoring readings too old to trust."""
+    """Latest reading per (provider, window) of the provider's current account, ignoring readings too
+    old to trust."""
     now = now or time.time()
-    rows = db.q("SELECT s.* FROM snapshots s JOIN (SELECT provider, window, MAX(ts) mts FROM snapshots "
-                "GROUP BY provider, window) m ON s.provider=m.provider AND s.window=m.window AND s.ts=m.mts "
-                "WHERE s.ts>=?", (now - SNAPSHOT_FRESH_S,))
+    rows = live_readings(db, _latest_readings(db, now - SNAPSHOT_FRESH_S))
     return [Window(r["provider"], r["window"], float(r["utilization"] or 0), r["resets_at"], r["account"] or "")
             for r in rows]
 
@@ -476,13 +539,16 @@ def record_windows(db: DB, windows: list[Window]) -> None:
 
 
 def history(db: DB, days: int = 14) -> dict:
-    """Daily spend and daily peak window utilization for the web app's two-week view."""
+    """Daily spend and daily peak window utilization for the web app's two-week view. The peaks are
+    those of the account each provider is on now; other accounts' readings stay in the database."""
     since = time.time() - days * DAY
     spend = db.q("SELECT date(ts,'unixepoch','localtime') d, provider, ROUND(SUM(usd),2) usd, "
                  "SUM(estimated) est FROM ledger WHERE ts>=? GROUP BY d, provider ORDER BY d", (since,))
-    peaks = db.q("SELECT date(ts,'unixepoch','localtime') d, provider, window, ROUND(MAX(utilization),1) peak, "
-                 "ROUND(AVG(utilization),1) avg FROM snapshots WHERE ts>=? GROUP BY d, provider, window ORDER BY d",
-                 (since,))
+    live = {(w.provider, w.account) for w in plan_windows(db)}
+    peaks = [{k: r[k] for k in ("d", "provider", "window", "peak", "avg")} for r in db.q(
+        "SELECT date(ts,'unixepoch','localtime') d, provider, COALESCE(account,'') acct, window, "
+        "ROUND(MAX(utilization),1) peak, ROUND(AVG(utilization),1) avg FROM snapshots WHERE ts>=? "
+        "GROUP BY d, provider, acct, window ORDER BY d", (since,)) if (r["provider"], r["acct"]) in live]
     by_source = db.q("SELECT source, provider, ROUND(SUM(usd),2) usd, COUNT(*) n FROM ledger WHERE ts>=? "
                      "GROUP BY source, provider ORDER BY usd DESC LIMIT 40", (time.time() - WEEK,))
     return {"daily_spend": spend, "window_peaks": peaks, "top_sources_7d": by_source}

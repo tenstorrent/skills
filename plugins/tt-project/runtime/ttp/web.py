@@ -112,13 +112,15 @@ def offline_help(name: str) -> str:
 FIVE_HOUR, SEVEN_DAY = ("five_hour", "5h"), ("seven_day", "7d")
 
 
-def window_peaks(db: DB, provider: str, names: tuple[str, ...], now: float, span_s: float) -> list[float]:
-    """The peak reading of each completed period of a plan window with readings in the last span_s.
-    A period is told apart by its reset: readings of one period jitter by seconds, periods are a
-    window's length apart."""
+def window_peaks(db: DB, provider: str, names: tuple[str, ...], now: float, span_s: float,
+                 account: str | None = None) -> list[float]:
+    """The peak reading of each completed period of a plan window with readings in the last span_s,
+    only `account`'s when given. A period is told apart by its reset: readings of one period jitter
+    by seconds, periods are a window's length apart."""
     rows = db.q(f"SELECT utilization, resets_at FROM snapshots WHERE provider=? AND window IN "
                 f"({','.join('?' * len(names))}) AND resets_at IS NOT NULL AND resets_at<=? AND ts>=? "
-                f"ORDER BY resets_at", (provider, *names, now, now - span_s))
+                f"AND (? IS NULL OR COALESCE(account,'')=?) ORDER BY resets_at",
+                (provider, *names, now, now - span_s, account, account))
     gap = bud.WINDOW_HOURS.get(names[0], 168.0) * 3600 / 2
     peaks: list[float] = []
     last = None
@@ -136,7 +138,8 @@ def budget_line(db: DB, now: float | None = None, core: str = "claude", gate: di
                 spent_24h: float | None = None) -> str:
     """The budget in one line, for the web app's header and `ttp status`:
     '5h 4% - resets in 3.9 h, 7d 21% - resets in 6.0 d, 24h $0.17 virtual, 5h avg 31%, 7d avg 72%'.
-    The windows and averages are the account's, from the plan readings; an average is the mean of
+    The windows and averages are the current account's, from its plan readings (none once the
+    provider moved to another account until that one reports); an average is the mean of
     each completed period's peak, 5-hour windows over 7 days and weekly ones over 3 weeks. The
     dollars are this project's last 24 h: 'virtual' (list-price equivalent) on a plan, 'actual' when
     billed by use. An item without data is left out. Pacing, targets and caps are in the Budget tab."""
@@ -154,8 +157,9 @@ def budget_line(db: DB, now: float | None = None, core: str = "claude", gate: di
     plan = gate["regime"] == "windows" if (gate or {}).get("regime") else bool(wins)
     spent = db.spent_since(now - DAY) if spent_24h is None else spent_24h
     parts.append(f"24h ${spent:.2f} {'virtual' if plan else 'actual'}")
+    account = next(iter(wins.values())).account if wins else None
     for label, names, span in (("5h avg", FIVE_HOUR, WEEK), ("7d avg", SEVEN_DAY, 3 * WEEK)):
-        peaks = window_peaks(db, prov, names, now, span) if prov else []
+        peaks = window_peaks(db, prov, names, now, span, account) if account is not None else []
         if peaks:
             parts.append(f"{label} {sum(peaks) / len(peaks):.0f}%")
     return ", ".join(parts)

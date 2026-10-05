@@ -1632,12 +1632,20 @@ class Daemon:
                                               "next_check": now + AUTH_CHECK_S[min(n, len(AUTH_CHECK_S) - 1)]})
 
     def update_gates(self) -> None:
+        provs = {self.cfg.get("core_provider", "claude"), *[t["provider"] for t in self.p.db.q(
+            "SELECT DISTINCT provider FROM tasks WHERE provider IS NOT NULL AND status IN ('queued','running')")]}
+        # Plan readings count only for the account each provider is logged in as now, so a switch
+        # of account drops the old plan's windows before the next run.
+        for prov in provs:
+            try:
+                bud.note_account(self.p.db, prov, get_provider(prov).account())
+            except Exception:
+                pass
         windows = bud.plan_windows(self.p.db)
         gates, news, red_sent = {}, [], {}
         # After a restart the last levels come from disk, so a change while the daemon was down is news.
         saved = {} if self.gates else (self.p.db.kv("gates") or {})
-        for prov in {self.cfg.get("core_provider", "claude"), *[t["provider"] for t in self.p.db.q(
-                "SELECT DISTINCT provider FROM tasks WHERE provider IS NOT NULL AND status IN ('queued','running')")]}:
+        for prov in provs:
             g = bud.evaluate(self.p.db, self.cfg, prov, windows)
             lim = self._provider_pause(prov)
             if lim and lim.get("until", 0) > time.time():
