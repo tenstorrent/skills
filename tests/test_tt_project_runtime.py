@@ -2947,6 +2947,8 @@ def test_claude_takes_the_cache_lifetime_and_a_breakpoint_after_the_stable_block
     assert prov.cache_env("1h") == {"CLAUDE_CODE_PROMPT_CACHE_TTL": "1h"}
     assert prov.cache_env("off") == {} and prov.cache_env("") == {}
     monkeypatch.setattr(claude, "_FLAGS", {claude.INPUT_FORMAT: True})
+    assert prov.cached_input("STABLE", "EVENTS", "1h") is None, "the CLI's own marks leave no room"
+    monkeypatch.setattr(claude.Claude, "own_cache_breakpoints", 3)   # an agent that leaves one free
     args, stdin = prov.cached_input("STABLE", "EVENTS", "1h")
     assert args == ["--input-format", "stream-json"]
     msg = json.loads(stdin)
@@ -2966,6 +2968,8 @@ def test_coordinator_turns_pass_the_cache_settings_through(env, monkeypatch):
     p = make(env)
     d = Daemon(p.base)
     head, context = coord.prompt_parts(p)
+
+    monkeypatch.setattr(claude.Claude, "own_cache_breakpoints", 3)   # an agent that leaves one free
 
     def start(ttl, supported=True):
         monkeypatch.setattr(claude, "_FLAGS", {claude.INPUT_FORMAT: supported})
@@ -2987,6 +2991,104 @@ def test_coordinator_turns_pass_the_cache_settings_through(env, monkeypatch):
         assert "--input-format" not in spec["argv"]
         assert spec["argv"][spec["argv"].index("--system-prompt") + 1] == coord.join_prompt(head, context)
         assert spec["env"].get("CLAUDE_CODE_PROMPT_CACHE_TTL") == (None if ttl == "off" else ttl)
+
+
+def test_cap_cache_breakpoints_keeps_the_stable_prefix_marks_and_logs_once():
+    from ttp.providers import base
+    mark = {"type": "ephemeral", "ttl": "1h"}
+    blocks = [{"type": "text", "text": f"b{i}", "cache_control": dict(mark)} for i in range(6)]
+    blocks.insert(2, {"type": "text", "text": "plain"})
+    logged: list[str] = []
+    out = base.cap_cache_breakpoints(blocks, source="test-six", log=logged.append)
+    assert [b["text"] for b in out if "cache_control" in b] == ["b0", "b1", "b2", "b3"]
+    assert [b["text"] for b in out] == [b["text"] for b in blocks], "no block is lost, only marks"
+    assert all("cache_control" in b for b in blocks if b["text"] != "plain"), "the input is not changed"
+    base.cap_cache_breakpoints(blocks, source="test-six", log=logged.append)
+    assert len(logged) == 1 and "dropped 2" in logged[0], logged
+    assert sum("cache_control" in b for b in base.cap_cache_breakpoints(blocks, 1)) == 1
+    assert not any("cache_control" in b for b in base.cap_cache_breakpoints(blocks, -2))
+    few = blocks[:3]
+    assert base.cap_cache_breakpoints(few, source="test-few", log=logged.append) == few and len(logged) == 1
+
+
+def test_cap_cache_breakpoints_never_raises():
+    from ttp.providers import base
+
+    def boom(_msg):
+        raise RuntimeError("log down")
+    marked = [{"text": "a", "cache_control": {}} for _ in range(5)]
+    assert sum("cache_control" in b for b in base.cap_cache_breakpoints(marked, source="test-boom", log=boom)) == 4
+    assert base.cap_cache_breakpoints(None) == []
+    assert base.cap_cache_breakpoints([None, "x", {"cache_control": {}}], limit="bad") == [None, "x", {}]
+
+
+def _coordinator_marks(run) -> int:
+    """cache_control marks the runtime put in a coordinator run's input."""
+    path = run / "input.jsonl"
+    if not path.exists():
+        return 0
+    return sum("cache_control" in b for b in json.loads(path.read_text())["message"]["content"])
+
+
+def test_largest_coordinator_turn_stays_within_four_cache_breakpoints(env, monkeypatch):
+    from ttp.providers import base, claude
+    from ttp.daemon import Daemon
+    from ttp import coordinator as coord
+    monkeypatch.setattr(claude.Claude, "binary", lambda self: "/usr/bin/true")   # never a real agent
+    monkeypatch.setattr(claude, "_FLAGS", {claude.INPUT_FORMAT: True})
+    p = make(env)
+    d = Daemon(p.base)
+    # Every optional block: memory of each kind, a user message, a steer on a running task, events.
+    for kind in ("fact", "decision", "preference", "resource"):
+        p.add_memory(f"a {kind} worth keeping", kind=kind)
+    tid = p.db.add_task("new work", "do it", kind="work", tier="light", origin="user")
+    p.db.post("in", "please also check the logs")
+    p.db.post("in", f"steer #{tid}: look at the newest logs first")
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+           (time.time(), "watcher", "task_failed", "high", "the build broke", "new", tid))
+    evs = [r["id"] for r in p.db.q("SELECT id FROM events")]
+    msgs = [r["id"] for r in p.db.q("SELECT id FROM messages")]
+    head, context = coord.prompt_parts(p)
+    prompt = coord.digest(p, {}, evs, msgs)
+    assert "worth keeping" in context and "check the logs" in prompt and "the build broke" in prompt
+    prov = claude.Claude()
+    for own in (prov.own_cache_breakpoints, 3):
+        monkeypatch.setattr(claude.Claude, "own_cache_breakpoints", own)
+        rid = d.start_run("coordinator", prompt, "claude", "standard", str(p.root), read_only=True,
+                          schema=coord.ACTIONS_SCHEMA, system=head, context=context, cache_ttl="1h")
+        run = p.runs / str(rid)
+        (run / "STOP").touch()
+        marks = _coordinator_marks(run)
+        assert marks + own <= base.MAX_CACHE_BREAKPOINTS, (own, marks)
+        argv = json.loads((run / "run.json").read_text())["argv"]
+        system = argv[argv.index("--system-prompt") + 1]
+        if marks:
+            assert system == head, "with a breakpoint to spare the stable block is its own"
+        else:
+            assert system == coord.join_prompt(head, context), "no room: the stable block ends the system prompt"
+
+
+def test_claude_leaves_its_own_breakpoints_room_on_later_calls(monkeypatch):
+    from ttp.providers import base, claude
+    assert claude.Claude.own_cache_breakpoints == base.MAX_CACHE_BREAKPOINTS, \
+        "measured: the CLI marks four blocks on every call after a run's first"
+    monkeypatch.setattr(claude, "_FLAGS", {claude.INPUT_FORMAT: True})
+    logged: list[str] = []
+    monkeypatch.setattr(base, "_TRIM_LOGGED", set())
+    assert claude.Claude().cached_input("STABLE", "EVENTS", "1h", log=logged.append) is None
+    assert len(logged) == 1 and "claude cached input" in logged[0]
+
+
+def test_no_provider_adds_cache_breakpoints_past_the_limit(monkeypatch):
+    from ttp.providers import _REGISTRY, base, claude, get_provider
+    monkeypatch.setattr(claude, "_FLAGS", {claude.INPUT_FORMAT: True})
+    for name in _REGISTRY:
+        prov = get_provider(name)
+        got = prov.cached_input("STABLE", "EVENTS", "1h")
+        marks = 0
+        if got:
+            marks = sum("cache_control" in b for b in json.loads(got[1])["message"]["content"])
+        assert marks + prov.own_cache_breakpoints <= base.MAX_CACHE_BREAKPOINTS, name
 
 
 def test_coordinator_cache_hit_rate_and_cost_per_turn(env):

@@ -24,6 +24,44 @@ LIMIT_RE = re.compile(r"(usage limit|limit reached|rate limit|quota exceeded|out
                       r"insufficient (credits|balance|funds)|spend(ing)? limit)", re.I)
 
 
+# The API takes at most this many cache_control breakpoints per request; one more fails the whole
+# call with a 400 ("A maximum of 4 blocks with cache_control may be provided").
+MAX_CACHE_BREAKPOINTS = 4
+_TRIM_LOGGED: set[str] = set()
+
+
+def cap_cache_breakpoints(blocks, limit: int = MAX_CACHE_BREAKPOINTS, source: str = "",
+                          log=None) -> list:
+    """Copies of `blocks` (content blocks, stable prefix first) with at most `limit` cache_control
+    marks: the earliest are kept, as they cover the most stable prefix, and the later, more volatile
+    ones are dropped. Logs once per `source` through `log` when it drops one. Never raises: on input
+    it cannot read, every mark is dropped."""
+    try:
+        limit, kept, dropped, out = max(int(limit), 0), 0, 0, []
+        for b in blocks:
+            if isinstance(b, dict) and "cache_control" in b:
+                if kept < limit:
+                    kept += 1
+                else:
+                    b = {k: v for k, v in b.items() if k != "cache_control"}
+                    dropped += 1
+            out.append(b)
+    except Exception:
+        try:
+            return [{k: v for k, v in b.items() if k != "cache_control"} if isinstance(b, dict) else b
+                    for b in blocks]
+        except Exception:
+            return []
+    if dropped and source not in _TRIM_LOGGED and log is not None:
+        _TRIM_LOGGED.add(source)
+        try:
+            log(f"prompt cache: {source} had {kept + dropped} cache breakpoints with room for {limit}; "
+                f"dropped {dropped} from the latest blocks")
+        except Exception:
+            pass
+    return out
+
+
 def find_binary(*names: str) -> str | None:
     for n in names:
         p = shutil.which(n)
@@ -72,6 +110,9 @@ class Provider:
     # Read-only turns run from scratch_dir(), not the project: this agent otherwise loads the
     # project's AGENTS.md or rules from its working directory into a decision-only turn.
     isolate_read_only = False
+    # Cache breakpoints the agent itself places on one request, at most (on any call of a run, not
+    # only the first): runtime-added marks get what is left of MAX_CACHE_BREAKPOINTS.
+    own_cache_breakpoints = 0
 
     def reach_host(self, env: dict | None = None) -> str:
         """The host this provider's runs reach its API at: the base URL's host when its variable is
@@ -188,10 +229,11 @@ class Provider:
         such switch or `ttl` is not one it takes."""
         return {}
 
-    def cached_input(self, stable: str, rest: str, ttl: str) -> tuple[list[str], str] | None:
+    def cached_input(self, stable: str, rest: str, ttl: str, log=None) -> tuple[list[str], str] | None:
         """Arguments and stdin for a prompt sent as two blocks with a cache breakpoint after
         `stable`, so a change in `rest` alone re-reads `stable` from the cache; None when the agent
-        cannot mark one (the caller then puts `stable` in the system prompt as before)."""
+        cannot mark one or has no breakpoint to spare (the caller then puts `stable` in the system
+        prompt as before). Blocks go through cap_cache_breakpoints; `log` takes its trim note."""
         return None
 
     def streams(self, argv: list[str]) -> bool:

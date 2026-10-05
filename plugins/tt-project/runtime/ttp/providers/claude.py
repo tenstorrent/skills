@@ -30,7 +30,8 @@ from pathlib import Path
 
 from . import register
 from ..budget import Window
-from .base import AUTH_RE, LIMIT_RE, Provider, RunUsage, cli_output, find_binary, status_check
+from .base import (AUTH_RE, LIMIT_RE, MAX_CACHE_BREAKPOINTS, Provider, RunUsage, cap_cache_breakpoints, cli_output,
+                   find_binary, status_check)
 
 EXCLUDE_DYNAMIC = "--exclude-dynamic-system-prompt-sections"
 APPEND_SYSTEM = "--append-system-prompt"
@@ -61,6 +62,10 @@ class Claude(Provider):
     name = "claude"
     binaries = ("claude",)
     api_host, api_base_env = "api.anthropic.com", "ANTHROPIC_BASE_URL"
+    # Measured (CLI 2.1.285, its system prompt and latest messages): three on a run's first call and
+    # four on every later one (after a tool result or a schema retry). A user block's own mark on top
+    # made those later calls fail with a 400 (found 5), losing the turn.
+    own_cache_breakpoints = 4
     login_hint = "run `claude` there and use /login"
 
     def credential_files(self) -> list[str]:
@@ -135,17 +140,20 @@ class Claude(Provider):
     def cache_env(self, ttl: str) -> dict[str, str]:
         return {"CLAUDE_CODE_PROMPT_CACHE_TTL": ttl} if ttl in CACHE_TTLS else {}
 
-    def cached_input(self, stable: str, rest: str, ttl: str) -> tuple[list[str], str] | None:
+    def cached_input(self, stable: str, rest: str, ttl: str, log=None) -> tuple[list[str], str] | None:
         # The CLI passes a user block's own cache_control through (checked live, CLI 2.1.285: a second
         # call that changed only the last block read the first from the cache; without the mark it
-        # missed). It marks its system prompt and the last block itself, so this is the one extra
-        # breakpoint of the API's four. Its lifetime must match the CLI's (a longer one may not follow
-        # a shorter one), so it is only set together with cache_env(ttl).
+        # missed). Its lifetime must match the CLI's (a longer one may not follow a shorter one), so it
+        # is only set together with cache_env(ttl). The mark counts against own_cache_breakpoints.
         if ttl not in CACHE_TTLS or not self.supports(INPUT_FORMAT):
             return None
-        message = {"type": "user", "message": {"role": "user", "content": [
-            {"type": "text", "text": stable, "cache_control": {"type": "ephemeral", "ttl": ttl}},
-            {"type": "text", "text": rest}]}}
+        blocks = cap_cache_breakpoints(
+            [{"type": "text", "text": stable, "cache_control": {"type": "ephemeral", "ttl": ttl}},
+             {"type": "text", "text": rest}],
+            MAX_CACHE_BREAKPOINTS - self.own_cache_breakpoints, source="claude cached input", log=log)
+        if not any(isinstance(b, dict) and "cache_control" in b for b in blocks):
+            return None   # no breakpoint to spare: `stable` ends the system prompt, under the CLI's own
+        message = {"type": "user", "message": {"role": "user", "content": blocks}}
         return [INPUT_FORMAT, "stream-json"], json.dumps(message) + "\n"
 
     def supports(self, flag: str) -> bool:

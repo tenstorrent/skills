@@ -777,7 +777,7 @@ class Daemon:
                 argv = prov.with_mcp_config(argv, Path(mcp_path))
             stdin = None
             if system is not None and context is not None:
-                cached = prov.cached_input(context, prompt, cache_ttl)
+                cached = prov.cached_input(context, prompt, cache_ttl, log=lambda m: log(self.p, m))
                 if cached:
                     argv, stdin = _before_stdin(argv, cached[0]), cached[1]
                 else:
