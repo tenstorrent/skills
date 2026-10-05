@@ -20638,12 +20638,26 @@ def test_a_held_provider_lets_one_run_try_after_the_cap(env, net, monkeypatch):
     assert not d.net_held("claude"), "a run that got through ends the hold"
 
 
+def test_a_hold_soon_after_boot_still_checks_and_lets_one_run_try(env, net, monkeypatch):
+    # The monotonic clock starts near 0 at boot: "never checked" and "never tried" must not read as 0.0.
+    p = make(env)
+    from ttp import daemon as dm
+    mono = [5.0]
+    monkeypatch.setattr(dm.time, "monotonic", lambda: mono[0])
+    d = dm.Daemon(p.base)
+    d.hold_offline("claude", "test")
+    assert d.net_held("claude") and net.pending, "the first lookup starts at once, whatever the uptime"
+    net.run()
+    mono[0] += dm.NET_HOLD_MAX_S
+    assert d.net_held("claude") and d._net_may_probe("claude")
+
+
 def test_start_run_on_a_held_provider_is_its_one_try(env, net):
     p = make(env)
     from ttp import daemon as dm
     d = dm.Daemon(p.base)
     d._net_holds["fake"] = {"host": "h", "since": time.monotonic() - dm.NET_HOLD_MAX_S, "checked": time.monotonic(),
-                            "checking": False, "up": False, "probe": 0.0}
+                            "checking": False, "up": False, "probe": None}
     assert d._net_may_probe("fake")
     d.start_run("worker", "x", "fake", "light", str(p.root))
     assert not d._net_may_probe("fake")
@@ -20657,7 +20671,7 @@ def test_dispatch_holds_only_the_offline_provider(env, net, monkeypatch):
     free = p.db.add_task("on another provider", "s", kind="work", tier="light", origin="user")
     p.db.x("UPDATE tasks SET provider='claude' WHERE id=?", (held,))
     d._net_holds["claude"] = {"host": "api.anthropic.com", "since": time.monotonic(), "checked": time.monotonic(),
-                              "checking": False, "up": False, "probe": 0.0}
+                              "checking": False, "up": False, "probe": None}
     started = []
     monkeypatch.setattr(d, "start_run", lambda role, prompt, provider, *a, **k: started.append(provider) or 1)
     d.update_gates()

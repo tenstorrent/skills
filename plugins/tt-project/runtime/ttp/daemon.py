@@ -583,8 +583,8 @@ class Daemon:
             host = ""
         if not host:
             return
-        self._net_holds[prov] = {"host": host, "since": time.monotonic(), "checked": 0.0, "checking": False,
-                                 "up": False, "probe": 0.0}
+        self._net_holds[prov] = {"host": host, "since": time.monotonic(), "checked": None, "checking": False,
+                                 "up": False, "probe": None}
         log(self.p, f"{prov}: {why}; no new runs start on it until {host} resolves")
 
     def net_held(self, prov: str) -> bool:
@@ -595,7 +595,7 @@ class Daemon:
         if not h:
             return False
         now = time.monotonic()
-        if not h["up"] and not h["checking"] and now - h["checked"] >= REACH_EVERY_S:
+        if not h["up"] and not h["checking"] and (h["checked"] is None or now - h["checked"] >= REACH_EVERY_S):
             h["checking"], h["checked"] = True, now
 
             def look(h=h) -> None:
@@ -613,7 +613,11 @@ class Daemon:
         """Whether one run on held `prov` may start to try the network: the hold (or its last such
         try) is NET_HOLD_MAX_S old. A run that starts on a held provider is that try (start_run)."""
         h = self._net_holds.get(prov)
-        return bool(h) and time.monotonic() - max(h["since"], h["probe"]) >= NET_HOLD_MAX_S
+        if not h:
+            return False
+        # No try yet: count from the hold. The monotonic clock starts near 0 at boot, so 0.0 is no "never".
+        last = h["since"] if h["probe"] is None else max(h["since"], h["probe"])
+        return time.monotonic() - last >= NET_HOLD_MAX_S
 
     def _end_net_hold(self, prov: str, why: str) -> None:
         if self._net_holds.pop(prov, None):
