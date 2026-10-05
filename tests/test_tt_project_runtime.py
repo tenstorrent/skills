@@ -15136,6 +15136,74 @@ def test_jev_coordinator_check_raises_routine_turns_and_logs_each_call_with_its_
     assert turn(jev)["unblock"] == "" and not jev.calls
 
 
+def test_jev_coordinator_check_claims_no_saving_it_did_not_make_and_bookkeeping_never_stops_a_turn(env, monkeypatch):
+    """A needs_thought call claims no saving when its turn is lost, shut down, logged out or failed;
+    an escalated turn's extra cost over a routine one comes off its saving (all of it when wrong);
+    and a failing settle or set_ref never stops a turn from ending or starting."""
+    p = make(env)
+    from types import SimpleNamespace
+    from ttp.daemon import Daemon
+    from ttp import coordcheck, jevuse
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    d = Daemon(p.base)
+    now = time.time()
+    for effort, cost in (("low", 0.02), ("low", 0.04), ("high", 0.20)):
+        p.db.x("INSERT INTO runs(role,provider,effort,started,ended,status,cost_usd) VALUES(?,?,?,?,?,?,?)",
+               ("coordinator", "fake", effort, now - 60, now - 30, "ok", cost))
+    dec = {"verdict": "needs_thought", "escalated": True, "rules_effort": "low", "effort": "high"}
+
+    def call():
+        return jevuse.record(p.db, "coord_effort", dec, 0.0001, avoided_usd=0.05)
+
+    def finish(cid, status, r=None, note=None, usage=None):
+        d._finish_coordinator({"id": 9, "dir": "x", **(r or {})},
+                              usage or SimpleNamespace(structured=None, final_text="", error="boom", cost_usd=0.0),
+                              status, {"coord_check": {"jev_call": cid, "verdict": "needs_thought"}, **(note or {})})
+        return p.db.one("SELECT outcome, avoided_usd, note FROM jev_calls WHERE id=?", (cid,))
+
+    for status, r, note in (("lost", {"dir": ""}, {}), ("shutdown", {}, {}), ("auth", {}, {}),
+                            ("ok", {}, {"lost_to_sleep": True}), ("failed", {}, {})):
+        row = finish(call(), status, r, note)
+        assert row["outcome"] is None and row["avoided_usd"] == 0, (status, dict(row))
+    assert jevuse.stats(p.db, p.config())["coord_effort"]["saved"] == 0, "unscored calls save nothing"
+    monkeypatch.setattr("ttp.coordinator.apply", lambda *a, **k: [])
+    acted = SimpleNamespace(structured={"actions": [{"type": "notify"}]}, final_text="", error="", cost_usd=0.11)
+    idle = SimpleNamespace(structured={"actions": []}, final_text="", error="", cost_usd=0.11)
+    row = finish(call(), "ok", usage=acted)   # routine turns cost 0.03 on average: 0.08 extra
+    assert row["outcome"] == "right" and row["avoided_usd"] == pytest.approx(0.05 - 0.08)
+    row = finish(call(), "ok", usage=idle)
+    assert row["outcome"] == "wrong" and row["avoided_usd"] == pytest.approx(-0.08)
+    s = jevuse.stats(p.db, p.config())["coord_effort"]
+    assert s["saved"] == pytest.approx(-0.11) and s["net"] < 0, "the extra cost counts against the use"
+    # A call that did not raise its turn is charged nothing extra.
+    cid = jevuse.record(p.db, "coord_effort", {**dec, "escalated": False}, 0.0001, avoided_usd=0.05)
+    assert finish(cid, "ok", usage=acted)["avoided_usd"] == pytest.approx(0.05)
+    # Bookkeeping errors are logged; the failed turn still counts, the turn still starts.
+
+    def boom(*a, **k):
+        raise RuntimeError("db locked")
+    monkeypatch.setattr(coordcheck, "settle", boom)
+    monkeypatch.setattr(coordcheck, "unscored", boom)
+    p.db.set_kv("coordinator_failures", 0)
+    finish(call(), "failed")
+    assert int(p.db.kv("coordinator_failures", 0)) == 1
+    finish(call(), "auth")
+    finish(call(), "ok", usage=acted)
+    assert p.db.kv("last_coordinator_summary") is not None
+    monkeypatch.setattr(jevuse, "set_ref", boom)
+    monkeypatch.setattr(d, "_coord_check", lambda *a, **k: {"jev_call": call(), "verdict": "routine",
+                                                             "reason": "stuck 0.10"})
+    monkeypatch.setattr(d, "start_run", lambda *a, **k: 77)
+    p.set_config("providers.fake.tiers.light.effort", "low")
+    d.cfg = p.config()
+    d.update_gates()
+    p.db.x("DELETE FROM kv WHERE key IN ('last_coordinator_turn','coordinator_backoff_until')")
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+           (time.time() - 100, "daemon", "task_done", "normal", "#4 done", "queued"))
+    d.maybe_coordinate()
+    assert p.db.kv("last_coordinator_turn") and int(p.db.kv("coordinator_failures", 0)) == 0, "a started turn is no failure"
+
+
 def coord_settable(key, value):
     from ttp.coordinator import USER_SETTABLE
     return USER_SETTABLE[key](value)

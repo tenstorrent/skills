@@ -11,11 +11,14 @@ outcome, an error included, leaves the rules' choice; JevOutOfFunds reaches the 
 Each call is logged in jev_calls with its verdict, the effort it led to and whether that escalated
 the turn, and once the turn ends (`settle`) with what the turn did. A needs_thought call is counted as
 saving one low-effort turn (the one that would have failed or handed off to a high one) when its turn
-acted; it is wrong when its turn did nothing. A routine call saves nothing; it is wrong when its turn
+acted, less what the raised turn cost above a routine one; it is wrong when its turn did nothing, and
+then that extra cost counts as a negative saving. A turn that failed, was lost, shut down or logged out
+leaves the call unscored with no saving. A routine call saves nothing; it is wrong when its turn
 failed or had actions rejected.
 """
 from __future__ import annotations
 
+import json
 import time
 
 from . import jevuse
@@ -86,8 +89,40 @@ def check(db: DB, cfg: dict, jev, text: str, rules_effort: str, high_effort: str
     return out
 
 
-def settle(db: DB, call_id: int, verdict: str, status: str, actions: list | None, problems: list[str]) -> None:
-    """Log what the checked turn did next to its call, and whether the verdict held up."""
+def routine_turn_cost(db: DB, cfg: dict, effort: str, now: float | None = None) -> float:
+    """The mean cost of a finished coordinator turn at `effort` (the rules' choice) over the window:
+    what the turn would have cost had Jev not raised it."""
+    now = time.time() if now is None else now
+    row = db.one("SELECT AVG(cost_usd) c FROM runs WHERE role='coordinator' AND status!='running' "
+                 "AND cost_usd>0 AND effort=? AND started>=?", (effort, now - jevuse.window_s(cfg)))
+    return float(row["c"]) if row and row["c"] else jevuse.mean_turn_cost(db, cfg, now)
+
+
+def extra_cost(db: DB, cfg: dict, call_id: int, turn_cost: float, now: float | None = None) -> float:
+    """What a raised turn cost above a routine one: its cost minus the mean turn at the call's
+    rules_effort (0 when the call did not raise the turn)."""
+    row = db.one("SELECT decision FROM jev_calls WHERE id=?", (call_id,))
+    try:
+        dec = json.loads(row["decision"]) if row else {}
+    except (TypeError, ValueError):
+        dec = {}
+    if not isinstance(dec, dict) or not dec.get("escalated"):
+        return 0.0
+    return max(0.0, float(turn_cost or 0) - routine_turn_cost(db, cfg, str(dec.get("rules_effort") or ""), now))
+
+
+def unscored(db: DB, call_id: int, status: str) -> None:
+    """A turn that failed, was lost, shut down or logged out says nothing about the verdict: the call
+    stays unscored and claims no saving."""
+    db.x("UPDATE jev_calls SET avoided_usd=0, note=? WHERE id=? AND outcome IS NULL",
+         (f"turn {status}; unscored", call_id))
+
+
+def settle(db: DB, call_id: int, verdict: str, status: str, actions: list | None, problems: list[str],
+           extra_usd: float = 0.0) -> None:
+    """Log what the checked turn did next to its call, and whether the verdict held up. `extra_usd` is
+    what the raised turn cost above a routine one (extra_cost): it comes off the call's saving, and a
+    wrong call is charged it as a negative saving."""
     kinds: dict[str, int] = {}
     for a in actions or []:
         k = str(a.get("type") if isinstance(a, dict) else a)
@@ -96,8 +131,13 @@ def settle(db: DB, call_id: int, verdict: str, status: str, actions: list | None
     note = f"turn {status}; {did}" + (f"; {len(problems)} rejected" if problems else "")
     if verdict == "needs_thought":
         if status != "ok":   # unscored: a failed turn says nothing about the verdict
-            db.x("UPDATE jev_calls SET note=? WHERE id=? AND outcome IS NULL", (note[:300], call_id))
+            db.x("UPDATE jev_calls SET avoided_usd=0, note=? WHERE id=? AND outcome IS NULL", (note[:300], call_id))
             return
-        jevuse.resolve(db, call_id, bool(kinds), note, now=time.time())
+        right = bool(kinds)
+        if jevuse.resolve(db, call_id, right, note, now=time.time()) and extra_usd > 0:
+            if right:
+                db.x("UPDATE jev_calls SET avoided_usd=avoided_usd-? WHERE id=?", (float(extra_usd), call_id))
+            else:
+                db.x("UPDATE jev_calls SET avoided_usd=? WHERE id=?", (-float(extra_usd), call_id))
     else:
         jevuse.resolve(db, call_id, status == "ok" and not problems, note, now=time.time())

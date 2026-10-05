@@ -1114,16 +1114,17 @@ class Daemon:
         db = self.p.db
         out = usage.structured if isinstance(usage.structured, dict) else last_json_object(usage.final_text or "")
         actions = (out or {}).get("actions")
+        checked = note.get("coord_check") or {}
         if (status == "lost" and not r["dir"]) or status == "shutdown" or note.get("lost_to_sleep"):
             # Never launched, ended by `ttp stop --kill`, or cut by a host sleep: not a failed turn.
             # Its messages and events stay queued for the next one.
+            self._settle_coord_check(checked, "lost to sleep" if note.get("lost_to_sleep") else status)
             return
         if status == "auth":
+            self._settle_coord_check(checked, status)
             return   # its breaker holds the next turn until the login is back; the messages stay queued
-        checked = note.get("coord_check") or {}
         if status != "ok" or not isinstance(actions, list):
-            if checked.get("jev_call"):
-                coordcheck.settle(db, int(checked["jev_call"]), checked.get("verdict", ""), status, None, [])
+            self._settle_coord_check(checked, status, None, [])
             self._coordinator_failed(f"{status} {usage.error[:200]}")
             return
         db.set_kv("coordinator_failures", 0)
@@ -1142,9 +1143,8 @@ class Daemon:
                                                **({"due": note["wake_due"]} if note.get("wake_due") else {})})
                 db.set_kv(coord.ESCALATIONS_KEY, {**counts, "n": int(counts.get("n", 0)) + 1, "batch": batch})
                 log(self.p, f"coordinator turn {r.get('id')} escalated to high effort: {why}")
-                if checked.get("jev_call"):   # Jev called it routine, and the turn found it was not
-                    coordcheck.settle(db, int(checked["jev_call"]), checked.get("verdict", ""), "escalated",
-                                      actions, [])
+                # Jev called it routine (if it was asked), and the turn found it was not
+                self._settle_coord_check(checked, "escalated", actions, [])
                 return   # its messages and events stay queued for the rerun
             db.set_kv(coord.ESCALATIONS_KEY, {**counts, "refused": int(counts.get("refused", 0)) + 1})
             log(self.p, f"coordinator turn {r.get('id')} asked to escalate again; it decides at this effort")
@@ -1158,9 +1158,26 @@ class Daemon:
         if evs:
             db.x(f"UPDATE events SET status='handled' WHERE id IN ({','.join('?' * len(evs))})", evs)
         self._record_rejections([x[:500] for x in problems])
-        if checked.get("jev_call"):
-            coordcheck.settle(db, int(checked["jev_call"]), checked.get("verdict", ""), status, actions, problems)
+        self._settle_coord_check(checked, status, actions, problems, float(getattr(usage, "cost_usd", 0) or 0))
         db.set_kv("last_coordinator_summary", {"ts": time.time(), "summary": (out or {}).get("summary", "")})
+
+    def _settle_coord_check(self, checked: dict, status: str, actions: list | None = None,
+                            problems: list[str] | None = None, turn_cost: float = 0.0) -> None:
+        """Log what a Jev-checked turn did next to its call (coordcheck.settle). Without `problems` the
+        turn ended with no result to score (lost, shut down, logged out). Bookkeeping never stops a
+        turn from ending."""
+        if not checked.get("jev_call"):
+            return
+        db, cid = self.p.db, int(checked["jev_call"])
+        try:
+            if problems is None:
+                coordcheck.unscored(db, cid, status)
+                return
+            extra = coordcheck.extra_cost(db, self.cfg, cid, turn_cost) if status == "ok" else 0.0
+            coordcheck.settle(db, cid, checked.get("verdict", ""), status, actions, problems, extra_usd=extra)
+        except Exception:
+            log(self.p, f"coordinator jev check {cid} not settled: "
+                + traceback.format_exc().replace("\n", " | ")[:1000])
 
     def _record_rejections(self, problems: list[str]) -> None:
         """Rejected actions reach the next turn's digest; they never start a turn by themselves.
@@ -1845,6 +1862,7 @@ class Daemon:
         logged_out = self._logged_out(provider)
         if logged_out and not self._may_probe(provider, now):
             return   # logged out: one run at a time checks the login, and this turn is not it
+        check = None
         try:
             prompt = coord.digest(self.p, gates, [e["id"] for e in evs], [m["id"] for m in msgs])
             due = (w or {}).get("due")
@@ -1873,13 +1891,19 @@ class Daemon:
                                  "triggers": triggers, **({"wake_due": due} if due else {}),
                                  **({"escalated": True} if esc else {}), **checked},
                            unblock=unblock)
-            if check:
-                jevuse.set_ref(db, check["jev_call"], f"run:{run_id}")
         except Exception as e:
             # A turn that cannot even start backs off like a failed turn instead of retrying every tick.
             log(self.p, "coordinator start failed: " + traceback.format_exc().replace("\n", " | ")[:2000])
+            if check:
+                self._settle_coord_check({"jev_call": check["jev_call"]}, "not started")
             self._coordinator_failed(f"could not start: {type(e).__name__}: {e}"[:250])
             return
+        if check:
+            try:
+                jevuse.set_ref(db, check["jev_call"], f"run:{run_id}")
+            except Exception:   # bookkeeping: the turn has started either way
+                log(self.p, "coordinator jev check ref not set: "
+                    + traceback.format_exc().replace("\n", " | ")[:1000])
         db.set_kv("last_coordinator_turn", now)
         db.set_kv(coord.EFFORT_SEEN_KEY, seen)
         if esc:

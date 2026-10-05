@@ -10,7 +10,8 @@ outcome where one becomes known (`resolve`). A call made with `settle_s` counts 
 long passed without an outcome; without it, a call's outcome is known only once resolved.
 
 Over a rolling window of `jev.window_days` with at least `jev.min_calls` calls, a use whose net
-saving (avoided cost of its right or unresolved calls, minus the cost of all its calls) is not
+saving (avoided cost of its right or unresolved calls, plus any negative saving, i.e. extra cost a
+call caused, minus the cost of all its calls) is not
 positive is switched off once and reported (`review`). `jev.uses.<use>` = "on" or "off" forces a
 use either way; "auto" (or unset) leaves it to the review.
 """
@@ -80,7 +81,7 @@ def set_ref(db: DB, call_id: int, ref: str) -> None:
 
 def resolve(db: DB, call_id: int, right: bool, note: str = "", now: float | None = None) -> bool:
     """Record a call's outcome once: whether its decision turned out right. A wrong call's avoided cost
-    no longer counts as saved. Returns whether this set it."""
+    no longer counts as saved (a negative one, extra cost it caused, still does). Returns whether this set it."""
     now = time.time() if now is None else now
     return db.conn.execute("UPDATE jev_calls SET outcome=?, outcome_ts=?, note=? WHERE id=? AND outcome IS NULL",
                            ("right" if right else "wrong", now, note[:300] or None, call_id)).rowcount > 0
@@ -98,7 +99,7 @@ def stats(db: DB, cfg: dict, now: float | None = None) -> dict[str, dict]:
     """Per use over the window: calls, cost, avoided (saved), net, right and wrong outcomes."""
     now = time.time() if now is None else now
     rows = db.q("SELECT use, COUNT(*) n, SUM(cost_usd) cost, "
-                "SUM(CASE WHEN outcome='wrong' THEN 0 ELSE avoided_usd END) saved, "
+                "SUM(CASE WHEN outcome='wrong' THEN MIN(avoided_usd, 0) ELSE avoided_usd END) saved, "
                 "SUM(outcome='wrong') n_wrong, "
                 "SUM(outcome='right' OR (outcome IS NULL AND settle_at IS NOT NULL AND settle_at<=?)) n_right "
                 "FROM jev_calls WHERE ts>=? GROUP BY use ORDER BY use", (now, now - window_s(cfg)))
