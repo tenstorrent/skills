@@ -93,6 +93,18 @@ def day_bounds(budget: dict, now: float) -> tuple[float, float] | None:
     return stamp(d), stamp(d + timedelta(days=1))
 
 
+def window(budget: dict, now: float) -> tuple[float, float, bool]:
+    """(start, end, rolling) of the global total's window. A budget day when `day_start` is set;
+    otherwise the rolling 24 h, with its start floored to REFRESH_S so it stays put across daemon
+    ticks (the refresh, the caches and the remote answers compare by it) and counts up to REFRESH_S
+    more than 24 h (fail safe). The rolling end lies a day ahead: spend is never in the future."""
+    day = day_bounds(budget, now)
+    if day:
+        return day[0], day[1], False
+    start = (now - DAY) // REFRESH_S * REFRESH_S
+    return start, start + 2 * DAY, True
+
+
 def setting_problems(budget: dict) -> list[str]:
     out = []
     raw = budget.get("day_start")
@@ -168,7 +180,7 @@ def local_projects(skip: str | None = None) -> list[tuple[str, Path]]:
     return out
 
 
-_LOCAL: dict[tuple, tuple[float, dict]] = {}
+_LOCAL: dict[tuple, tuple[float, float, float, dict]] = {}   # (home, skip) -> (read at, start, end, totals)
 
 
 def machine_totals(start: float, end: float, skip: str | None = None, now: float | None = None,
@@ -176,10 +188,10 @@ def machine_totals(start: float, end: float, skip: str | None = None, now: float
     """This machine's projects' spend in [start, end), by provider and account key. `skip` is the
     database of the asking project, which counts its own."""
     now = now or time.time()
-    key = (str(project.HOME_DIR), start, end, skip)
+    key = (str(project.HOME_DIR), skip)
     hit = _LOCAL.get(key)
-    if cached and hit and now - hit[0] < LOCAL_CACHE_S:
-        return hit[1]
+    if cached and hit and hit[1:3] == (start, end) and now - hit[0] < LOCAL_CACHE_S:
+        return hit[3]
     rows: dict[tuple, float] = {}
     names, errors = [], []
     for name, db in local_projects(skip):
@@ -194,7 +206,7 @@ def machine_totals(start: float, end: float, skip: str | None = None, now: float
             rows[k] = rows.get(k, 0.0) + r["usd"]
     out = {"host": project.hostname(), "start": start, "end": end, "projects": names, "errors": errors,
            "rows": [{"provider": p, "key": k, "usd": round(u, 4)} for (p, k), u in rows.items()]}
-    _LOCAL[key] = (now, out)
+    _LOCAL[key] = (now, start, end, out)
     return out
 
 
@@ -282,7 +294,7 @@ def refresh_async(budget: dict, now: float | None = None) -> None:
     t = _THREAD.get("t")
     if t and t.is_alive():
         return
-    start, end = day_bounds(budget, now) or (now - DAY, now + DAY)
+    start, end, _ = window(budget, now)
     cache = (load_cache().get("machines") or {})
     if not any(now - float((cache.get(x) or {}).get("tried") or 0) >= REFRESH_S
                or (cache.get(x) or {}).get("start") != start for x in targets()):
@@ -301,9 +313,12 @@ def _quiet(fn, *args) -> None:
 
 # the total ----------------------------------------------------------------------------------------
 def total(db, provider: str, start: float, end: float, now: float | None = None,
-          account: str | None = None) -> dict:
+          account: str | None = None, rolling: bool = False) -> dict:
     """The global spend of `provider` on this account in [start, end): this project (`db`), this
     machine's other projects, the other machines (cached, stale ones counted) and other sources.
+    For a budget day a machine's answer counts when it is for the same day, however old. For the
+    rolling 24 h (`rolling`) it counts while it is fresh (read within STALE_S); an older one covers
+    another window and is only named stale.
     `usd` is the total; `stale` names the machines whose number is stale; `includes` says what it
     counts, in words."""
     now = now or time.time()
@@ -323,7 +338,9 @@ def total(db, provider: str, start: float, end: float, now: float | None = None,
             continue
         if not fresh:
             stale.append(t)
-        if m.get("rows") is not None and m.get("start") is not None and abs(float(m["start"]) - start) < 60:
+        same = (fresh if rolling else
+                m.get("start") is not None and abs(float(m["start"]) - start) < 60)
+        if m.get("rows") is not None and same:
             usd += sum(float(r.get("usd") or 0) for r in m["rows"] if isinstance(r, dict) and _matches(r, provider, account))
             remote_projects += len(m.get("projects") or [])
         seen.add(m.get("host") or t)

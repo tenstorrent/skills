@@ -815,7 +815,7 @@ def cmd_spend_today(a) -> None:
     now = time.time()
     if a.since is None:
         b = deep_merge(DEFAULT_CONFIG["budget"], load_account_settings().get("budget") or {})
-        a.since, a.until = gcap.day_bounds(b, now) or (now - gcap.DAY, now + gcap.DAY)
+        a.since, a.until, _ = gcap.window(b, now)
     t = gcap.machine_totals(a.since, a.until if a.until is not None else now + gcap.DAY, now=now)
     if a.json:
         print(json.dumps(t))

@@ -259,9 +259,9 @@ def _global(db: DB, g: Gate, b: dict, provider: str, day: tuple[float, float] | 
     cap = float(b.get("global_daily_usd") or 0)
     if cap <= 0:
         return
-    start, end = day or (now - DAY, now)
+    start, end, rolling = gcap.window(b, now)
     try:
-        t = gcap.total(db, provider, start, end, now)
+        t = gcap.total(db, provider, start, end, now, rolling=rolling)
     except Exception as e:
         g.reasons.append(f"global daily total unavailable ({type(e).__name__}); the project caps still apply")
         return

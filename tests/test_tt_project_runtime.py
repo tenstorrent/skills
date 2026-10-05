@@ -19727,6 +19727,49 @@ def test_the_global_daily_total_counts_another_machine_fresh_and_then_stale(env,
     assert calls[0][:3] == ["ssh", "-o", "BatchMode=yes"] and "spend-today" in calls[0][-1], calls
 
 
+def test_the_rolling_global_window_asks_each_machine_once_per_refresh_and_keeps_counting(env, monkeypatch):
+    # With the global cap on and no budget day, the window must not move on every 3 s daemon tick:
+    # one ssh per machine per REFRESH_S, a bounded local cache, and the remote total still counted.
+    p = make(env)
+    from ttp import budget as bud
+    from ttp import globalcap as gcap
+    from ttp.project import register
+    register("far", {"host": "box2", "dir": "/srv/far"})
+    p.set_config("budget.global_daily_usd", 100)
+    b = p.config()["budget"]
+    assert b["day_start"] == ""
+    key = gcap.account_key("claude", "acct-a")
+    asked = []
+    monkeypatch.setattr(gcap, "fetch", lambda t, s, e: asked.append((t, s)) or {
+        "host": "box2", "rows": [{"provider": "claude", "key": key, "usd": 50.0}], "projects": ["far"]})
+    monkeypatch.setattr(gcap, "account_of", lambda prov: "acct-a")
+
+    class Inline:                       # run the background refresh at once, in order
+        def __init__(self, target, daemon):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+        def is_alive(self):
+            return False
+
+    monkeypatch.setattr(gcap.threading, "Thread", Inline)
+    gcap._LOCAL.clear()
+    t0 = (time.time() // gcap.REFRESH_S) * gcap.REFRESH_S + 1
+    ticks = [t0 + 3 * i for i in range(int(2 * gcap.REFRESH_S / 3))]
+    for now in ticks:
+        gcap.refresh_async(b, now)
+        g = bud.evaluate(p.db, p.config(), "claude", [], now)
+        assert g.numbers["global_today"] == 50.0, (now - t0, g.numbers)
+        assert len(gcap._LOCAL) <= 1, len(gcap._LOCAL)
+    assert len(asked) == 2 and len({s for _, s in asked}) == 2, asked   # one per REFRESH_S
+    # A rolling answer older than STALE_S covers another window: named stale, not counted.
+    start, end, rolling = gcap.window(b, ticks[-1] + gcap.STALE_S + 60)
+    t = gcap.total(p.db, "claude", start, end, ticks[-1] + gcap.STALE_S + 60, rolling=rolling)
+    assert rolling and t["stale"] == ["box2"] and t["usd"] == 0, t
+
+
 def test_spend_today_reports_this_machines_projects_without_the_account(env, tmp_path, capsys):
     make(env)
     from ttp.cli import main
