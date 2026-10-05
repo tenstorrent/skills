@@ -27,7 +27,8 @@
 
 - The top of `ttp status` and of the web app shows only open questions and problems active now.
   Everything else (FYI notes, decisions, reboots, cleared alerts) is in the feed below, newest first.
-- Alerts clear themselves and keep their history: logged out → the next successful run; budget red →
+- Alerts clear themselves and keep their history: logged out → a login check passes (until then no
+  run starts on that provider; the daemon asks its CLI's status, no model call); budget red →
   the gate leaves red; coordinator failures → a successful turn; disk low → space is back. Chats
   hear once that it cleared. A host reboot is information only.
 - The budget is a few plain lines: per plan window the percent used, time to reset and history
