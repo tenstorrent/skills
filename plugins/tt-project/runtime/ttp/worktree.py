@@ -469,7 +469,7 @@ FETCH_TIMEOUT_S = 30   # the local-only check's fetch; an unreachable remote mus
 
 
 def local_only(repo: Path, branches: list[str], targets: list[str] = (), known: set = frozenset(),
-               timeout_s: float = FETCH_TIMEOUT_S) -> tuple[dict, bool, dict] | None:
+               timeout_s: float = FETCH_TIMEOUT_S, pushed: set | frozenset = frozenset()) -> tuple[dict, bool, dict] | None:
     """Which of `branches` hold finished work whose only copy is on this machine. Returns ({branch:
     (head, commits on no remote)}, whether the fetch of every remote worked, {branch: head} of the
     others), after that fetch; with a failed fetch the remote refs may be old, so a branch may be
@@ -477,9 +477,10 @@ def local_only(repo: Path, branches: list[str], targets: list[str] = (), known: 
     head, or when its changes already are in one of `targets` (the branch it is delivered to, as
     `origin/<name>` or `<name>`, and each remote's default branch) although its head is not: a
     reviewer rebased, amended, squashed or batched it (see delivered). A (branch, head) in `known`
-    was found on a remote before and is not looked at again. A branch that no longer exists is left
-    out. None when `repo` is not a git repository or has no remote: there is nothing to compare
-    with. Pushes nothing."""
+    was found on a remote before and is not looked at again. So is a branch whose head the push
+    queue pushed or landed (`pushed`, see pushq.pushed_heads), or an ancestor of one. A branch that
+    no longer exists is left out. None when `repo` is not a git repository or has no remote: there
+    is nothing to compare with. Pushes nothing."""
     try:
         if not _git(repo, "remote", check=False).split():
             return None
@@ -503,7 +504,8 @@ def local_only(repo: Path, branches: list[str], targets: list[str] = (), known: 
         head = _git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{b}^{{commit}}", check=False)
         if not head:
             continue
-        if ((b, head) in known or _git(repo, "branch", "-r", "--contains", head, check=False)
+        if ((b, head) in known or queue_pushed(repo, head, pushed)
+                or _git(repo, "branch", "-r", "--contains", head, check=False)
                 or any(delivered(repo, head, ref) for ref in refs)):
             clean[b] = head
             continue
@@ -512,13 +514,29 @@ def local_only(repo: Path, branches: list[str], targets: list[str] = (), known: 
     return out, fetched, clean
 
 
-def delivered(repo: Path, head: str, ref: str) -> bool:
-    """Whether the changes of `head` since it left `ref` are already in `ref`: every commit has a
-    patch-equivalent one there (`git cherry`: rebased or cherry-picked) or one with the same subject
-    (at least 20 characters: rebased with conflicts, or amended), every file it changed is
-    the same there (amended or squashed, maybe with other work), or its whole diff reverts cleanly
-    from `ref`'s tree (batched, and later work touched the same files elsewhere)."""
+def queue_pushed(repo: Path, head: str, pushed: set | frozenset) -> bool:
+    """Whether the push queue pushed or landed `head` or a commit that contains it: `pushed` holds
+    the heads of its pushed and landed rows (pushq.pushed_heads). Heads git no longer has count
+    only by name."""
+    if not pushed:
+        return False
+    if head in pushed:
+        return True
+    r = subprocess.run(["git", "-C", str(repo), "rev-list", "--ignore-missing", "-n1", head, "--not", *sorted(pushed)],
+                       capture_output=True, text=True, timeout=120)
+    return r.returncode == 0 and not r.stdout.strip()
+
+
+def delivered(repo: Path, head: str, ref: str, pushed: set | frozenset = frozenset()) -> bool:
+    """Whether the changes of `head` since it left `ref` are already in `ref`: the push queue pushed
+    or landed it (`pushed`, see queue_pushed), every commit has a patch-equivalent one there (`git
+    cherry`: rebased or cherry-picked) or one with the same subject (at least 20 characters: rebased
+    with conflicts, or amended), every file it changed is the same there (amended or squashed, maybe
+    with other work), or its whole diff reverts cleanly from `ref`'s tree (batched, and later work
+    touched the same files elsewhere)."""
     import tempfile
+    if queue_pushed(repo, head, pushed):
+        return True
     base = _git(repo, "merge-base", ref, head, check=False)
     if not base:
         return False

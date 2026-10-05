@@ -35,6 +35,7 @@ from . import locks
 from . import machines
 from . import prguard
 from . import push
+from . import pushq
 from . import release
 from . import runner
 from . import schedule as sched
@@ -89,6 +90,7 @@ KV_LOCAL_ONLY = "local_only"   # kv: {task id: {branch, head, ahead, since}} for
 KV_INTEGRITY = "integrity"   # kv: the last boot integrity check (see Daemon.check_integrity)
 INTEGRITY_RECHECK_S = 3600
 KV_LOCAL_ONLY_FROM = "local_only_from"   # kv: when the check first ran; tasks done before it are not checked
+PUSH_REFS_EVERY_S = 600   # how often the push queue's pins (refs/ttp/push/<id>) of settled rows are pruned
 
 
 def log(p: Project, msg: str) -> None:
@@ -202,6 +204,7 @@ class Daemon:
         self._release_due = 0.0   # when the installed tt-project release is next compared with the harness
         self._pruned_upto = 0.0   # the latest finish the last worktree sweep saw
         self._local_only_due = 0.0   # when done code tasks' branches are next checked for remote copies
+        self._push_refs_at = 0.0     # when the push queue's pins were last pruned
         self._local_only_ok: dict[str, str] = {}   # branch -> head found on a remote: not looked at again
         if not isinstance(self.p.db.kv(KV_LOCAL_ONLY_FROM), (int, float)):
             self.p.db.set_kv(KV_LOCAL_ONLY_FROM, time.time())   # work done before the check existed is not flagged
@@ -413,10 +416,9 @@ class Daemon:
             self._load_config()
             self._last_cfg = now
             self.jev = Jev(self.cfg, db=self.p.db)
-        for step in (self.reap_runs, self.wake_after_reboot, self.meter_running, self.reconcile_tasks,
+        for step in (self.reap_runs, self.wake_after_reboot, self.meter_running, self.reconcile_tasks, self.tend_pushes,
                      self.prune_worktrees, self.check_local_only, self.check_disk, self.sweep_alerts,
-                     self.check_release, self.sync_shared_pauses, self.check_integrity, self.sync_schedules,
-                     self.tend_pushes):
+                     self.check_release, self.sync_shared_pauses, self.check_integrity, self.sync_schedules):
             step()
             self._progress()
         if self.p.db.kv("paused", False):
@@ -428,7 +430,7 @@ class Daemon:
         scr.close_watcher_issues(self.p.db, quiet_s=scr.WATCHER_QUIET_CLOSE_S)
         settling = self.settling()
         for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.read_upstream, self.retry_rejected,
-                     self.maybe_coordinate, self.probe_waiting, self.dispatch, self.deliver_outbound):
+                     self.maybe_coordinate, self.probe_waiting, self.start_pushes, self.dispatch, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
                 continue   # no routing to start model work with (see _load_config)
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
@@ -442,8 +444,29 @@ class Daemon:
         coord.sync_shared_pauses(self.p)
 
     def tend_pushes(self) -> None:
-        """Start the detached pushes queued from inside a sandbox; record the dead ones as failed."""
+        """Start the detached pushes queued from inside a sandbox; record the dead ones as failed. Then
+        the push queue's bookkeeping, also while paused: approvals whose review moved on, a queue
+        turned off, and batches that ended (pushq.tend). Pins of settled rows go now and then."""
         push.tend(self.p)
+        try:
+            changed = pushq.tend(self.p, self.cfg, self.alert, may_requeue=self.cfg_status != "unavailable")
+        except Exception:
+            log(self.p, "push queue: finalize failed\n" + traceback.format_exc())
+            return
+        now = time.time()
+        if changed or now - self._push_refs_at > PUSH_REFS_EVERY_S:
+            self._push_refs_at = now
+            try:
+                pushq.prune_refs(self.p)
+            except Exception:
+                log(self.p, "push queue: pruning pinned refs failed\n" + traceback.format_exc())
+
+    def start_pushes(self) -> None:
+        """Start a push batch when one is due (pushq.schedule): local checks only, no model."""
+        try:
+            pushq.schedule(self.p, self.cfg, log=lambda m: log(self.p, m))
+        except Exception:
+            log(self.p, "push queue: starting a batch failed\n" + traceback.format_exc())
 
     def _check_sleep(self) -> None:
         """Notice that the host slept: the wall clock jumped ahead of the monotonic one, which stands
@@ -1189,6 +1212,29 @@ class Daemon:
                 not_before = time.time() + _retry_s(result)
                 extra["waiting_since"] = time.time()
                 reason = f"waiting for {what}; next try {time.strftime('%H:%M', time.localtime(not_before))}"
+        # A review that passes may hand its approved commits to the push queue instead of pushing
+        # (delivery.push_queue): it waits as 'pushing' until a batch pushed them (pushq.py).
+        approval, push_note, push_quiet = None, "", False
+        entries = result.get("push") if isinstance(result, dict) else None
+        if new == "done" and entries not in (None, "", []):
+            check = (pushq.check_approval(self.p, task, entries, cfg=self.cfg) if task["kind"] == "review"
+                     else {"ignored": "only a review task approves pushes"})
+            if check.get("ignored"):
+                log(self.p, f"task {task['id']}: its push list was ignored: {check['ignored']}")
+                push_note = f" Its push list was ignored: {check['ignored']}."
+            elif check.get("invalid"):
+                why = check["invalid"]
+                extra["push_invalid"] = int(load_result(task["result"]).get("push_invalid") or 0) + 1
+                push_note = f" Push approval invalid: {why}."
+                if extra["push_invalid"] < 2:
+                    new, not_before, push_quiet = "queued", time.time(), True
+                    extra["woke"] = f"push approval invalid: {why}"
+                    reason = f"push approval invalid: {why}; its review runs again"
+                else:
+                    new = "failed"
+                    summary = f"push approval invalid again: {why}. {summary}"[:1500]
+            else:
+                approval, new = check, "pushing"
         if ended:
             extra["run_status"] = ended
         if wakes and new != "blocked":
@@ -1218,7 +1264,17 @@ class Daemon:
             upd["not_before"] = time.time() + 120 * attempts
         if isinstance(result, dict) and result.get("pr"):
             upd["pr_url"] = str(result["pr"])[:300]
-        db.update_task(task["id"], **upd)
+        if approval:
+            with db.tx():   # rows, pins and the status together: a failed pin leaves the run to be retried
+                pushq.approve(self.p, task["id"], r.get("id"), approval)
+                db.update_task(task["id"], **upd)
+                # Handled: nothing to decide until the batch reports (pushq.finalize).
+                db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                     (time.time(), f"task:{task['id']}", "push_queued", "normal",
+                      f"{pushq.queued_text(task, approval)} (run {ended or status}, "
+                      f"{'~' if usage.estimated else ''}${usage.cost_usd:.2f})", "handled", task["id"]))
+        else:
+            db.update_task(task["id"], **upd)
         if new == "done" and task["kind"] == "code":
             self._local_only_due = 0.0   # is its work on a remote? checked this tick
         if waiting and new == "queued":
@@ -1244,7 +1300,7 @@ class Daemon:
         # event, sized for the digest to show it whole, so an ordinary hand-off does not grow.
         where = _result_ref(self.p, run_dir if handoff is None else run_dir / RESULT_FILE)
         text = (f"#{task['id']} {task['title']} → {new} (run {ended or status}, {'~' if usage.estimated else ''}"
-                f"${usage.cost_usd:.2f}): {_cut(summary, 1200, where)}")
+                f"${usage.cost_usd:.2f}): {_cut(summary, 1200, where)}{push_note}")
         notes = ""
         if len(fups) > MAX_FOLLOWUPS:
             notes += (f"\nMore proposed follow-ups (their specs are in {where}): "
@@ -1261,7 +1317,7 @@ class Daemon:
         # A retry the daemon already scheduled, after a refusal (which has its own alert) or a run that
         # ended without a verdict, leaves nothing to decide: the final attempt's outcome starts the turn.
         # A timeout still does, since the task may need splitting before it times out again.
-        quiet = new == "queued" and status in ("limit", "auth", "failed", "lost", "stalled", "no_handoff")
+        quiet = new == "queued" and status in ("limit", "auth", "failed", "lost", "stalled", "no_handoff") or push_quiet
         # A finished code task's next step is its review. A hand-off with nothing else to decide (no
         # follow-ups or notes, normal severity) gets it from the daemon and starts no coordinator turn;
         # any other leaves the review to that turn, so the reviewer starts after it and sees its decisions.
@@ -1282,9 +1338,10 @@ class Daemon:
             text += (f"\nFix #{fix[0]} and re-review #{fix[1]} queued by the daemon"
                      + (f"; {moved} now wait on #{fix[1]}." if moved else "."))
         routine = (review is not None and plain) or fix is not None
-        db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
-             (time.time(), f"task:{task['id']}", f"task_{new}", sev, text,
-              "handled" if quiet or routine else "queued", task["id"]))
+        if not approval:   # an approval has its push_queued event; the batch's outcome closes the task
+            db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                 (time.time(), f"task:{task['id']}", f"task_{new}", sev, text,
+                  "handled" if quiet or routine else "queued", task["id"]))
         if notes:
             db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                  (time.time(), f"task:{task['id']}", "task_notes", "normal",
@@ -2010,7 +2067,7 @@ class Daemon:
         try:
             found = (worktree.local_only(self.p.root, [t["branch"] for t in tasks],
                                          targets=[worktree.base_ref(self.p)],
-                                         known=set(self._local_only_ok.items()))
+                                         known=set(self._local_only_ok.items()), pushed=pushq.pushed_heads(db))
                      if tasks else ({}, True, {}))
         except Exception:
             log(self.p, "local-only branch check: " + traceback.format_exc().replace("\n", " | ")[:1000])

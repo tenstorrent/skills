@@ -26,7 +26,7 @@ REF_PREFIX = "refs/ttp/push/"   # + row id: pins the approved commit until its r
 KV = "push_queue"               # kv: {"backoff_until", "deaths", "hold": {"tip", "rows", "until"}, "tips_told"}
 DEFAULT_BATCH_S = 900           # delivery.push_batch_s: the oldest approval waits at most this long
 DEFAULT_BATCH_MAX = 8           # delivery.push_batch_max: start at once with this many; also a batch's most
-HOLD_S = 1800                   # after tip_failed or moved, the same tip and rows wait this long unless either changes
+HOLD_S = 1800                   # after tip_failed, the same tip and rows wait this long unless either changes
 BACKOFF_STEP_S = 300            # a dead batch's rows wait 5 min per try ...
 BACKOFF_MAX_S = 1800            # ... and at most 30 min
 DYING_AFTER = 3                 # batches that die in a row before push_queue_dying is raised
@@ -154,9 +154,8 @@ def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None
         return {"invalid": why}
     if not isinstance(entries, list) or not entries or not all(isinstance(e, dict) for e in entries):
         return {"invalid": 'list the approved commits as "push": [{"branch": ..., "head": <40-hex sha>}]'}
-    last = p.db.one("SELECT status, head FROM push_queue WHERE task=? ORDER BY id DESC LIMIT 1", (task["id"],))
-    conflicted = [r["head"] for r in p.db.q("SELECT head FROM push_queue WHERE task=? AND status='conflict'",
-                                             (task["id"],))] if last and last["status"] == "conflict" else []
+    rows = p.db.q("SELECT status, head, created FROM push_queue WHERE task=? ORDER BY id", (task["id"],))
+    conflicted = [r["head"] for r in rows if r["created"] == rows[-1]["created"] and r["status"] == "conflict"]
     reviewed: list[str] | None = None
     out, added = [], {}
     for e in entries:
@@ -322,7 +321,7 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
     hold = st.get("hold") or {}
     if (hold and now < float(hold.get("until") or 0) and sorted(r["id"] for r in rows) == sorted(hold.get("rows") or [])
             and _tracking_tip(p, remote, branch) == hold.get("tip")):
-        return [], f"held: the same rows on the same tip {_short(hold.get('tip'))} {hold.get('why') or 'failed'}"
+        return [], f"held: the same approvals on the same tip {_short(hold.get('tip'))}, which failed its checks"
     d = _delivery(p, cfg)
     window = _num(d.get("push_batch_s"), DEFAULT_BATCH_S, float, 0)
     cap = int(_num(d.get("push_batch_max"), DEFAULT_BATCH_MAX, int, 1))
@@ -495,7 +494,7 @@ def _died(p: Project, b: dict, m: dict, alert: Callable, why: str, now: float) -
     if st["deaths"] >= DYING_AFTER:
         alert("push_queue_dying", f"The last {st['deaths']} push batches ended without finishing ({why}). The "
                                   f"approvals stay queued and are retried with a growing pause. Log: {m.get('log') or '?'}",
-              severity="normal")
+              severity="high")
 
 
 def _settle(p: Project, tid: int, b: dict, m: dict, now: float) -> None:
@@ -617,9 +616,8 @@ def _apply(p: Project, b: dict, m: dict, alert: Callable, now: float) -> None:
         st = _state(db)
         st["deaths"] = 0
         back = [r["id"] for r in db.q("SELECT id FROM push_queue WHERE batch=? AND status='approved'", (b["id"],))]
-        if outcome in ("moved", "tip_failed") and back:
-            st["hold"] = {"tip": tip, "rows": sorted(back), "until": now + HOLD_S,
-                          "why": "kept moving" if outcome == "moved" else "failed its checks"}
+        if outcome == "tip_failed" and back:
+            st["hold"] = {"tip": tip, "rows": sorted(back), "until": now + HOLD_S}
         elif outcome in ("pushed", "landed", "nothing"):
             st.pop("hold", None)
             st.pop("backoff_until", None)
@@ -662,12 +660,22 @@ def _after(p: Project, b: dict, m: dict, status: str, alert: Callable, now: floa
         elif status in ("failed", "timeout", "killed"):
             tail = _tail_of(m, ap)
             how = {"failed": f"failed (exit {ap.get('exit')})", "timeout": "timed out",
-                   "killed": "was killed twice (host reboots?)"}[status]
+                   "killed": "stopped before it finished, also when run once more (host reboots?)"}[status]
             text = f"after_push of {what} (batch {b['id']}) {how}. The reviews stay done.\n{tail}"
             _event(db, None, "after_push_failed", text, queued=True, severity="high")
     if status in ("failed", "timeout", "killed"):
         alert("after_push_failed", f"after_push of {what} (batch {b['id']}) {how}. Log: {m.get('log') or '?'}",
               severity="high")
+
+
+def _after_push_set(p: Project, cfg: dict | None) -> bool:
+    v = _delivery(p, cfg).get("after_push")
+    if v is None or str(v).strip().lower() in ("", "none"):
+        return False
+    try:
+        return bool(push.check_list(v))
+    except (TypeError, ValueError):
+        return True
 
 
 def _resume(p: Project, b: dict, marker: Path, now: float) -> bool:
@@ -728,7 +736,7 @@ def finalize(p: Project, cfg: dict | None = None, alert: Callable = lambda *a, *
             _after(p, b, m, status or "skipped", alert, now_)
         elif live:
             continue
-        elif m.get("outcome") != "pushed" or not push.checks_of(_delivery(p, cfg).get("after_push")):
+        elif m.get("outcome") != "pushed" or not _after_push_set(p, cfg):
             _after(p, b, m, "skipped", alert, now_)   # nothing to deploy
         elif int(b["after_tries"] or 0) < MAX_RESUMES:
             if _resume(p, b, marker, now_):
@@ -761,15 +769,20 @@ def prune_refs(p: Project) -> int:
     return gone
 
 
-def tend(p: Project, cfg: dict | None = None, alert: Callable = lambda *a, **k: None) -> list[str]:
+def tend(p: Project, cfg: dict | None = None, alert: Callable = lambda *a, **k: None,
+         may_requeue: bool = True) -> list[str]:
     """The tick's first-loop step: withdraw approvals whose review moved on, send reviews back when
-    the queue was turned off, and finalize batches. Cheap while the queue is empty."""
+    the queue was turned off (not while the settings cannot be read: `may_requeue` False), and
+    finalize batches. Cheap while the queue is empty."""
+    for bid in list(_children):
+        _reap(bid)
     db = p.db
     if not db.one("SELECT id FROM push_queue WHERE status IN ('approved','batched') LIMIT 1") and not db.one(
             "SELECT id FROM push_batches WHERE after_finalized IS NULL LIMIT 1"):
         return []
     cancel_orphans(p)
-    queue_off(p, cfg)
+    if may_requeue:
+        queue_off(p, cfg)
     return finalize(p, cfg, alert)
 
 

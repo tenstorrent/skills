@@ -45,6 +45,9 @@ CLEARED_TEXT = {
     "integrity": "The harness and the task worktrees check out again.",
     "pr-ready": "{arg} is back in draft, closed or approved.",
     "config": "project.json reads again; new work starts again.",
+    "push_rejected": "Pushes go through again: a push batch pushed.",
+    "after_push_failed": "after_push works again: the last one succeeded.",
+    "push_queue_dying": "Push batches finish again.",
 }
 
 
@@ -106,6 +109,15 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
         return arg in (db.kv(prguard.UNAPPROVED_KEY, {}) or {}) and not prguard.approved(db, arg)
     if key == "run-start":
         return not db.one("SELECT id FROM runs WHERE role!='coordinator' AND started>? LIMIT 1", (since,))
+    # The push queue (pushq.py): each lasts until a batch finalized after it was raised shows otherwise.
+    if key == "push_rejected":
+        return not db.one("SELECT id FROM push_batches WHERE outcome='pushed' AND finalized>=? LIMIT 1", (since,))
+    if key == "after_push_failed":
+        return not db.one("SELECT id FROM push_batches WHERE after_push='ok' AND after_finalized>=? LIMIT 1",
+                          (since,))
+    if key == "push_queue_dying":
+        return not db.one("SELECT id FROM push_batches WHERE outcome IS NOT NULL AND outcome NOT IN ('died','error') "
+                          "AND finalized>=? LIMIT 1", (since,))
     return now - since < DAY
 
 
@@ -124,7 +136,8 @@ def active(db: DB, key: str, ts: float, now: float) -> bool:
 
 def _checkable(key: str) -> bool:
     return key.partition(":")[0] in ("auth", "limit", "budget", "disk", "coordinator", "run-start", "schedule",
-                                         "release-older", "integrity", "pr-ready", "config")
+                                         "release-older", "integrity", "pr-ready", "config", "push_rejected",
+                                         "after_push_failed", "push_queue_dying")
 
 
 def _since(ep: dict) -> float:

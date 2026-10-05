@@ -703,7 +703,7 @@ def status_text(p: Project) -> str:
         lines.append(f"  running {since(w['started'], now)}: {what}" + (f" ({w['wake']} wake)" if w.get("wake") else "")
                      + (f" — {w['note']}" if w["note"] else ""))
     in_review = db.review_since()
-    for t in db.q("SELECT id,title,status,blocked_reason FROM tasks WHERE status IN ('blocked','review') "
+    for t in db.q("SELECT id,title,status,blocked_reason FROM tasks WHERE status IN ('blocked','review','pushing') "
                   "ORDER BY status, id LIMIT 8"):
         age = f" {since(in_review[t['id']], now)}" if t["id"] in in_review else ""
         lines.append(f"  #{t['id']} {t['status']}{age}: {t['title']}" + (f" — {t['blocked_reason']}" if t["blocked_reason"] else ""))

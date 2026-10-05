@@ -361,7 +361,7 @@ def state_payload(p: Project, db: DB) -> dict:
     tasks = db.q("SELECT id,title,kind,status,priority,tier,provider,budget_usd,spent_usd,attempts,max_attempts,"
                  "origin,branch,pr_url,blocked_reason,not_before,created,updated,result,labels,depends_on FROM tasks WHERE status NOT IN ('done','failed',"
                  "'cancelled') OR updated>? ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'blocked' THEN 1 "
-                 "WHEN 'review' THEN 2 WHEN 'queued' THEN 3 ELSE 4 END, priority, id DESC LIMIT 200",
+                 "WHEN 'review' THEN 2 WHEN 'pushing' THEN 2 WHEN 'queued' THEN 3 ELSE 4 END, priority, id DESC LIMIT 200",
                  (now - 7 * 86400,))
     in_review = db.review_since()
     # The dependency graph and start/retry conditions, so outside tools need not infer them.
