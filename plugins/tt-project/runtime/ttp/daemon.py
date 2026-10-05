@@ -263,6 +263,7 @@ class Daemon:
                 time.sleep(10)
             time.sleep(TICK_S)
         log(self.p, "daemon stop")
+        self._ends.stop()   # end-condition probes are rerun after the next start
         if _read_pid(pidfile) == os.getpid():
             pidfile.unlink(missing_ok=True)
         # Running workers are left alone: they write their results to disk and the next start
