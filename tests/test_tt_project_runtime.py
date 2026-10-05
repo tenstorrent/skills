@@ -2926,6 +2926,88 @@ def test_claude_workers_keep_the_system_prompt_cacheable_when_the_cli_can(env, m
         assert claude.EXCLUDE_DYNAMIC not in turn
 
 
+def test_coordinator_prompt_prefix_is_byte_stable_across_turns_with_different_events(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    p.add_memory("the build takes ten minutes", kind="fact")
+    head, context = coord.prompt_parts(p)
+    first = coord.digest(p, {}, [], [])
+    p.db.add_task("new work", "do it", kind="work", tier="light", origin="user")
+    p.db.post("in", "how is it going?")
+    assert coord.digest(p, {}, [], []) != first, "the second turn must see the new events"
+    assert coord.prompt_parts(p) == (head, context), "events changed the cached prefix"
+    assert coord.system_prompt(p) == coord.join_prompt(head, context)
+    assert "# Role" in head and "# CHARTER" not in head, "the charter churns more than the rules"
+    assert context.startswith("# CHARTER") and "the build takes ten minutes" in context
+
+
+def test_claude_takes_the_cache_lifetime_and_a_breakpoint_after_the_stable_block(monkeypatch):
+    from ttp.providers import claude, get_provider
+    prov = get_provider("claude")
+    assert prov.cache_env("1h") == {"CLAUDE_CODE_PROMPT_CACHE_TTL": "1h"}
+    assert prov.cache_env("off") == {} and prov.cache_env("") == {}
+    monkeypatch.setattr(claude, "_FLAGS", {claude.INPUT_FORMAT: True})
+    args, stdin = prov.cached_input("STABLE", "EVENTS", "1h")
+    assert args == ["--input-format", "stream-json"]
+    msg = json.loads(stdin)
+    blocks = msg["message"]["content"]
+    assert msg["type"] == "user" and [b["text"] for b in blocks] == ["STABLE", "EVENTS"]
+    assert blocks[0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"} and "cache_control" not in blocks[1]
+    assert prov.cached_input("STABLE", "EVENTS", "off") is None, "off leaves the lifetime to the agent"
+    monkeypatch.setattr(claude, "_FLAGS", {claude.INPUT_FORMAT: False})
+    assert prov.cached_input("STABLE", "EVENTS", "1h") is None, "an unsupported flag would break every turn"
+
+
+def test_coordinator_turns_pass_the_cache_settings_through(env, monkeypatch):
+    from ttp.providers import claude
+    from ttp.daemon import Daemon
+    from ttp import coordinator as coord
+    monkeypatch.setattr(claude.Claude, "binary", lambda self: "/usr/bin/true")   # never a real agent
+    p = make(env)
+    d = Daemon(p.base)
+    head, context = coord.prompt_parts(p)
+
+    def start(ttl, supported=True):
+        monkeypatch.setattr(claude, "_FLAGS", {claude.INPUT_FORMAT: supported})
+        rid = d.start_run("coordinator", "EVENTS", "claude", "standard", str(p.root), read_only=True,
+                          schema=coord.ACTIONS_SCHEMA, system=head, context=context, cache_ttl=ttl)
+        run = p.runs / str(rid)
+        (run / "STOP").touch()
+        return json.loads((run / "run.json").read_text()), run
+
+    spec, run = start("1h")
+    assert spec["env"].get("CLAUDE_CODE_PROMPT_CACHE_TTL") == "1h"
+    assert spec["stdin"] == "input.jsonl"
+    assert "--input-format" in spec["argv"] and spec["argv"][spec["argv"].index("--system-prompt") + 1] == head
+    blocks = json.loads((run / "input.jsonl").read_text())["message"]["content"]
+    assert [b["text"] for b in blocks] == [context, "EVENTS"]
+    for ttl, supported in (("off", True), ("1h", False)):
+        spec, run = start(ttl, supported)
+        assert "stdin" not in spec and not (run / "input.jsonl").exists()
+        assert "--input-format" not in spec["argv"]
+        assert spec["argv"][spec["argv"].index("--system-prompt") + 1] == coord.join_prompt(head, context)
+        assert spec["env"].get("CLAUDE_CODE_PROMPT_CACHE_TTL") == (None if ttl == "off" else ttl)
+
+
+def test_coordinator_cache_hit_rate_and_cost_per_turn(env):
+    p = make(env)
+    from ttp import budget as bud
+    now = time.time()
+    rows = [(now - 3600, 0.05, 100, 9000, 900),          # warm: 90% read
+            (now - 7200, 0.15, 100, 1000, 8900),         # missed: the charter changed
+            (now - 3 * 86400, 0.04, 100, 9800, 100)]     # older than a day
+    for started, cost, fresh, read, write in rows:
+        p.db.x("INSERT INTO runs(role,provider,started,ended,status,cost_usd,input_tokens,cache_read_tokens,"
+               "cache_write_tokens) VALUES('coordinator','claude',?,?,'done',?,?,?,?)",
+               (started, started + 60, cost, fresh, read, write))
+    p.db.x("INSERT INTO runs(role,provider,started,ended,status,cost_usd,input_tokens,cache_read_tokens) "
+           "VALUES('worker','claude',?,?,'done',1,10,0)", (now - 60, now))
+    c = bud.coordinator_cache(p.db, now)
+    assert c["24h"] == {"turns": 2, "hit_pct": 50, "miss_turns": 1, "usd_per_turn": 0.1}
+    assert c["7d"]["turns"] == 3 and c["7d"]["hit_pct"] == 66 and c["7d"]["miss_turns"] == 1
+    assert bud.history(p.db)["coordinator_cache"]["24h"]["turns"] == 2
+
+
 def test_charter_restrictions_lead_and_close_every_worker_prompt(env):
     p = make(env)
     p.charter_path.write_text("# demo\n\n## Goals\nGo fast.\n\n## Restrictions\n(none stated yet)\n\n"

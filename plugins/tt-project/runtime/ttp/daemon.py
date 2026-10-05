@@ -671,7 +671,11 @@ class Daemon:
     def start_run(self, role: str, prompt: str, provider: str, tier: str, cwd: str, *, task: dict | None = None,
                   budget_usd: float | None = None, timeout_s: float | None = None, read_only: bool = False,
                   schema: dict | None = None, system: str | None = None, append_system: str | None = None,
-                  note: dict | None = None, resume: str | None = None, unblock: str = "") -> int:
+                  note: dict | None = None, resume: str | None = None, unblock: str = "",
+                  context: str | None = None, cache_ttl: str = "") -> int:
+        """`context` (with `system`): stable text that follows the system prompt, sent as a block of
+        its own with a cache breakpoint after it where the provider can mark one (else it ends the
+        system prompt). `cache_ttl` (`5m`, `1h`) sets the provider's prompt cache lifetime."""
         if self.cfg_status == "unavailable":
             raise RuntimeError("project.json is unreadable with no last good copy: no model work starts")
         if provider in self._net_holds:
@@ -695,6 +699,7 @@ class Daemon:
             cwd = scratch_dir(str(self.p.base))
         argv, env = prov.build(role=role, model=model, effort=effort, cwd=cwd, budget_usd=budget_usd,
                                read_only=read_only, schema=schema, restrictions=restrictions)
+        env = {**env, **prov.cache_env(cache_ttl)}
         if role != "coordinator":
             window = self.cfg["budget"].get("compact_window_tokens") or 0   # 0: off for every tier
             window = window.get(tier) if isinstance(window, dict) else window
@@ -766,6 +771,13 @@ class Daemon:
                 with os.fdopen(fd, "w") as f:
                     json.dump({"mcpServers": mcp_servers}, f)
                 argv = prov.with_mcp_config(argv, Path(mcp_path))
+            stdin = None
+            if system is not None and context is not None:
+                cached = prov.cached_input(context, prompt, cache_ttl)
+                if cached:
+                    argv, stdin = _before_stdin(argv, cached[0]), cached[1]
+                else:
+                    system = coord.join_prompt(system, context)
             if system is not None:
                 (run_dir / "system.md").write_text(system)
                 if provider == "claude":
@@ -785,6 +797,8 @@ class Daemon:
                     prompt = append_system + "\n\n" + prompt
             argv = _before_stdin(argv, resume_extra)
             (run_dir / "prompt.md").write_text(prompt)
+            if stdin is not None:   # what the agent reads; prompt.md stays the readable digest
+                (run_dir / "input.jsonl").write_text(stdin)
             runtime_dir = str(Path(__file__).resolve().parent.parent)
             path = f"{service_path()}:{os.environ.get('PATH', '')}"
             # The project's venv, so a fresh worktree need not build one; `ttp` stays first.
@@ -801,7 +815,7 @@ class Daemon:
             tout = timeout_s or self.cfg["budget"]["run_timeout_s"].get(tier, 3600)
             stall = self.cfg["budget"].get("stall_s", {}).get(tier) if role != "coordinator" else None
             spec = {"argv": argv, "env": env, "cwd": cwd, "timeout_s": tout, "provider": provider, "stall_s": stall,
-                    "model": model, "prices": prices,
+                    "model": model, "prices": prices, **({"stdin": "input.jsonl"} if stdin is not None else {}),
                     "budget_usd": budget_usd if provider not in ("claude",) else None,
                     # What a run without its own budget is priced at when it reports no usage.
                     "default_budget_usd": self.cfg["budget"].get("task_default_usd", {}).get(tier, 8.0),
@@ -2061,8 +2075,10 @@ class Daemon:
             prompt += ("\n\nThis turn's effort: raised (" + unblock[:300] + ")." if raised else
                        "\n\nThis turn's effort: routine." + (" If this batch is harder than routine bookkeeping, "
                        "return only an `escalate` action: it reruns once at high effort." if can_raise else ""))
+            head, context = coord.prompt_parts(self.p)
             run_id = self.start_run("coordinator", prompt, provider, c.get("tier", "light"), str(self.p.base),
-                           read_only=True, schema=coord.ACTIONS_SCHEMA, system=coord.system_prompt(self.p),
+                           read_only=True, schema=coord.ACTIONS_SCHEMA, system=head, context=context,
+                           cache_ttl=str(c.get("cache_ttl", "1h") or ""),
                            budget_usd=float(c.get("turn_budget_usd", 1.0)),
                            timeout_s=float(c.get("turn_timeout_s", 600)),
                            note={"messages": [m["id"] for m in msgs], "events": [e["id"] for e in evs],

@@ -185,7 +185,7 @@ def supervise(run_dir: Path) -> int:
         return 1
     started, mono_start = time.time(), time.monotonic()
     awake = AwakeClock()
-    prompt = open(run_dir / "prompt.md", "rb")
+    prompt = open(run_dir / (spec.get("stdin") or "prompt.md"), "rb")
     out = open(out_path, "wb")
     err = open(run_dir / "stderr.log", "wb")
     nice = int(spec.get("nice") or 0)

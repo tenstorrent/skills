@@ -589,7 +589,8 @@ def history(db: DB, days: int = 14) -> dict:
         "GROUP BY d, provider, acct, window ORDER BY d", (since,)) if (r["provider"], r["acct"]) in live]
     by_source = db.q("SELECT source, provider, ROUND(SUM(usd),2) usd, COUNT(*) n FROM ledger WHERE ts>=? "
                      "GROUP BY source, provider ORDER BY usd DESC LIMIT 40", (time.time() - WEEK,))
-    return {"daily_spend": spend, "window_peaks": peaks, "top_sources_7d": by_source}
+    return {"daily_spend": spend, "window_peaks": peaks, "top_sources_7d": by_source,
+            "coordinator_cache": coordinator_cache(db)}
 
 
 def reread_stats(db: DB, days: float = 7, now: float | None = None, top: int = 10) -> dict:
@@ -640,3 +641,29 @@ def reread_text(s: dict) -> str:
     lines += [f"  run {t['run']} (#{t['task'] or '-'} {t['kind'] or t['role']}/{t['tier'] or '-'}/{t['effort'] or '-'}, "
               f"{t['minutes']} min, ${t['usd']:.2f}): {m(t['cache_read'])} {t['title']}".rstrip() for t in s["top"]]
     return "\n".join(lines)
+
+
+
+def cache_hit(read: float, write: float, fresh: float) -> float | None:
+    """Share of a call's prompt tokens read from the provider's cache, or None with no prompt."""
+    total = read + write + fresh
+    return read / total if total > 0 else None
+
+
+def coordinator_cache(db: DB, now: float | None = None) -> dict:
+    """Prompt cache use of coordinator turns over the last 24 h and 7 d: `hit_pct` is cache reads
+    over all prompt tokens, `miss_turns` the turns that read under half their prompt from it."""
+    now = now or time.time()
+    out = {}
+    for label, span in (("24h", DAY), ("7d", WEEK)):
+        rows = db.q("SELECT cost_usd, input_tokens, cache_read_tokens, cache_write_tokens FROM runs "
+                    "WHERE role='coordinator' AND started>=? AND status!='running' "
+                    "AND input_tokens + cache_read_tokens + cache_write_tokens > 0", (now - span,))
+        hits = [cache_hit(r["cache_read_tokens"] or 0, r["cache_write_tokens"] or 0, r["input_tokens"] or 0)
+                for r in rows]
+        total = cache_hit(*(sum(r[k] or 0 for r in rows) for k in
+                            ("cache_read_tokens", "cache_write_tokens", "input_tokens")))
+        out[label] = {"turns": len(rows), "hit_pct": round(100 * total) if total is not None else None,
+                      "miss_turns": sum(h < 0.5 for h in hits),
+                      "usd_per_turn": round(sum(r["cost_usd"] or 0 for r in rows) / len(rows), 4) if rows else None}
+    return out

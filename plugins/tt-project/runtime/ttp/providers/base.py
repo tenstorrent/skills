@@ -183,6 +183,17 @@ class Provider:
         rest in a file it is pointed to); `argv` unchanged when it has no such setting or `chars` is 0."""
         return argv
 
+    def cache_env(self, ttl: str) -> dict[str, str]:
+        """Environment that sets the prompt cache lifetime (`5m`, `1h`); {} when the agent has no
+        such switch or `ttl` is not one it takes."""
+        return {}
+
+    def cached_input(self, stable: str, rest: str, ttl: str) -> tuple[list[str], str] | None:
+        """Arguments and stdin for a prompt sent as two blocks with a cache breakpoint after
+        `stable`, so a change in `rest` alone re-reads `stable` from the cache; None when the agent
+        cannot mark one (the caller then puts `stable` in the system prompt as before)."""
+        return None
+
     def streams(self, argv: list[str]) -> bool:
         """Whether a run started with `argv` writes its output as it goes, so an empty output means
         the agent did nothing (rather than that it had not finished)."""

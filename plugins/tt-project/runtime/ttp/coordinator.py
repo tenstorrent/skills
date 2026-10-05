@@ -2,8 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """The coordinator turn: a short, tool-less, schema-bound decision over a digest of the project.
 
-Prompt layout is cache-friendly: the stable part (role, charter, memory) goes in the system
-prompt; the volatile part (state digest + new events) is the user message. The model returns
+Prompt layout is cache-friendly, most stable first: restrictions and role, then charter and the
+memory snapshot, then the volatile part (state digest + new events) as the user message. Where the
+provider can mark a cache breakpoint inside the user message, charter and memory lead it as a block
+of their own, so editing them does not re-pay the role prompt; elsewhere they end the system prompt. The model returns
 JSON actions; this module validates them and applies them to the database. Anything that needs
 reading files, running commands or thinking hard becomes a task for a worker instead.
 """
@@ -256,11 +258,24 @@ def memory_digest_lines(view: dict) -> list[str]:
             + [f"[{n}] retired, ignore" for n in view["retired"]])
 
 
-def system_prompt(p: Project, now: float | None = None) -> str:
-    """Stable across turns so the provider can cache it: memory comes from the snapshot."""
+def prompt_parts(p: Project, now: float | None = None) -> tuple[str, str]:
+    """The stable prompt as (head, context), most stable first so a change misses the cache only
+    from where it is: the restrictions and role change on upgrades and restriction edits; the
+    charter and the memory snapshot (`context`) more often. A provider that can mark a cache
+    breakpoint after `context` sends it as its own block after the system prompt (`head`)."""
     rules, role, charter = _prompt_head(p)
     memory = memory_view(p, now)["text"] or "(no memories yet)"
-    return f"{rules}{role}\n\n# CHARTER\n{charter}\n\n# MEMORY\n{memory}\n"
+    return f"{rules}{role}", f"# CHARTER\n{charter}\n\n# MEMORY\n{memory}\n"
+
+
+def system_prompt(p: Project, now: float | None = None) -> str:
+    """Stable across turns so the provider can cache it: memory comes from the snapshot."""
+    return join_prompt(*prompt_parts(p, now))
+
+
+def join_prompt(head: str, context: str) -> str:
+    """The whole system prompt, for a provider that cannot cache `context` as a block of its own."""
+    return f"{head}\n\n{context}"
 
 
 def clip(text: Any, n: int) -> str:

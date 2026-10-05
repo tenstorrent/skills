@@ -35,6 +35,10 @@ from .base import AUTH_RE, LIMIT_RE, Provider, RunUsage, cli_output, find_binary
 EXCLUDE_DYNAMIC = "--exclude-dynamic-system-prompt-sections"
 APPEND_SYSTEM = "--append-system-prompt"
 APPEND_SYSTEM_FILE = "--append-system-prompt[-file]"   # how `--help` names the (unlisted) file form
+INPUT_FORMAT = "--input-format"
+# The prompt cache lifetimes the CLI takes in CLAUDE_CODE_PROMPT_CACHE_TTL. Unset, it picks 1 h on a
+# plan within its limits and 5 min otherwise (API key, or a plan past its limits).
+CACHE_TTLS = ("5m", "1h")
 _FLAGS: dict[str, bool] = {}   # CLI flag support, probed once per daemon from `claude --help`
 USAGE_KEYS = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
 # Claude Code's bundled skills, which workers have never used: listed by name only (still callable),
@@ -127,6 +131,22 @@ class Claude(Provider):
             return argv
         settings["bashOutputMaxChars"] = min(max(int(chars), 4000), 128000)
         return [*argv[:i], json.dumps(settings), *argv[i + 1:]]
+
+    def cache_env(self, ttl: str) -> dict[str, str]:
+        return {"CLAUDE_CODE_PROMPT_CACHE_TTL": ttl} if ttl in CACHE_TTLS else {}
+
+    def cached_input(self, stable: str, rest: str, ttl: str) -> tuple[list[str], str] | None:
+        # The CLI passes a user block's own cache_control through (checked live, CLI 2.1.285: a second
+        # call that changed only the last block read the first from the cache; without the mark it
+        # missed). It marks its system prompt and the last block itself, so this is the one extra
+        # breakpoint of the API's four. Its lifetime must match the CLI's (a longer one may not follow
+        # a shorter one), so it is only set together with cache_env(ttl).
+        if ttl not in CACHE_TTLS or not self.supports(INPUT_FORMAT):
+            return None
+        message = {"type": "user", "message": {"role": "user", "content": [
+            {"type": "text", "text": stable, "cache_control": {"type": "ephemeral", "ttl": ttl}},
+            {"type": "text", "text": rest}]}}
+        return [INPUT_FORMAT, "stream-json"], json.dumps(message) + "\n"
 
     def supports(self, flag: str) -> bool:
         if flag not in _FLAGS:

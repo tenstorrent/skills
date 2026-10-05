@@ -98,6 +98,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # after this long without a turn (the cache is cold by then) or once the entries
                     # added or retired since outgrow memory_delta_chars; until then they go in the digest.
                     "memory_refresh_s": 3300, "memory_delta_chars": 3000,
+                    # Prompt cache lifetime of coordinator turns: "1h" (most turns come within the
+                    # hour; a write costs 2x input instead of 1.25x, a read 0.1x or less), "5m", or "off"
+                    # (the agent's own choice, and charter and memory stay in the system prompt).
+                    "cache_ttl": "1h",
                     "turn_budget_usd": 1.0, "turn_timeout_s": 600,
                     "ask_timeout_h": 1,
                     # A task deferred with `start_when` that has not started after this long is raised
