@@ -248,7 +248,7 @@ def scan(budget: dict, now: float | None = None, root: Path | None = None) -> di
     now = now or time.time()
     root = Path(root or logs_root())
     project.HOME_DIR.mkdir(parents=True, exist_ok=True)
-    with open(project.HOME_DIR / "session-spend.lock", "w") as lk:
+    with open(project.HOME_DIR / "session-spend.lock", "a") as lk:
         try:
             fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
@@ -469,7 +469,7 @@ def calibrate(session_id: str, reported_usd: float, now: float | None = None,
     if not got or got[1]:
         return None
     project.HOME_DIR.mkdir(parents=True, exist_ok=True)
-    with open(project.HOME_DIR / "session-spend.lock", "w") as lk:
+    with open(project.HOME_DIR / "session-spend.lock", "a") as lk:
         fcntl.flock(lk, fcntl.LOCK_EX)
         cache = load()
         pairs = [x for x in (cache.get("calibration") or []) if isinstance(x, list) and len(x) == 3]

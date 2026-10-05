@@ -16583,6 +16583,7 @@ DURABLE_EXEMPT = {
     ("locks.py", '.lock", "a")'): "a flock guard file, never written",
     ("shared.py", '.guard", "a")'): "a flock guard file, never written",
     ("globalcap.py", 'global-spend.lock", "a")'): "a flock guard file, never written",
+    ("localspend.py", 'session-spend.lock", "a")'): "a flock guard file, never written",
     ("hook.py", "OFFSET_FILE).write_text"): "a lost offset re-delivers messages, never drops one",
     ("watchdog.py", "mark.write_text"): "names a process, which a reboot ends",
     ("codex.py", "tmp.write_text(text)"): "a cache, rewritten whenever its content differs",
