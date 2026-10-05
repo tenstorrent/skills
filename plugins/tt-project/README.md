@@ -147,7 +147,10 @@ and preferences you add later become part of the project's charter and memory.
   checks that outlast a worker's tool call. It prints a marker under `state/pushes/` and a
   `retry_when` probe, `ttp push --result <marker>`: 1 while the push runs, 0 once it finished,
   printing the pushed sha (and version) or the exit code and the log tail. A push killed by a
-  crash or a reboot frees its locks; the probe then records it as failed instead of waiting.
+  crash or a reboot frees its locks; the probe (or the daemon) then records it as failed, saying
+  whether it died at startup, in a reboot or later, instead of waiting. From a sandbox that runs
+  each command in a PID namespace of its own (Codex on Linux), which kills a background process
+  when the command ends, the push is queued and the daemon starts it; the probe exits 1 meanwhile.
 - `delivery.version_bump` lets `ttp push` own the version bump, so parallel reviews never race for
   one version: `{"files": [...], "changeset_dir": ".changeset"}` (optional `package`, and `paths`,
   default the folder the files share). After each rebase, when the change touches `paths`, it

@@ -34,6 +34,7 @@ from . import integrity
 from . import locks
 from . import machines
 from . import prguard
+from . import push
 from . import release
 from . import runner
 from . import schedule as sched
@@ -414,7 +415,8 @@ class Daemon:
             self.jev = Jev(self.cfg, db=self.p.db)
         for step in (self.reap_runs, self.wake_after_reboot, self.meter_running, self.reconcile_tasks,
                      self.prune_worktrees, self.check_local_only, self.check_disk, self.sweep_alerts,
-                     self.check_release, self.sync_shared_pauses, self.check_integrity, self.sync_schedules):
+                     self.check_release, self.sync_shared_pauses, self.check_integrity, self.sync_schedules,
+                     self.tend_pushes):
             step()
             self._progress()
         if self.p.db.kv("paused", False):
@@ -438,6 +440,10 @@ class Daemon:
 
     def sync_shared_pauses(self) -> None:
         coord.sync_shared_pauses(self.p)
+
+    def tend_pushes(self) -> None:
+        """Start the detached pushes queued from inside a sandbox; record the dead ones as failed."""
+        push.tend(self.p)
 
     def _check_sleep(self) -> None:
         """Notice that the host slept: the wall clock jumped ahead of the monotonic one, which stands
@@ -586,6 +592,9 @@ class Daemon:
             env = {**env, **venv_vars, "TTP_RUN_DIR": str(run_dir), "TTP_PROJECT": str(self.p.base),
                    "TTP_RUN_ID": str(run_id), "TTP_TASK": str(task["id"]) if task else "", "PYTHONPATH": runtime_dir,
                    "TTP_PYTHON": sys.executable,   # `ttp` runs under this, not the venv's python3
+                   # A worker's sandbox may run commands in a PID namespace of their own, which ends
+                   # with the command: `ttp push --detach` compares and has the daemon start the push.
+                   **({"TTP_PIDNS": ns} if (ns := push.pid_ns()) else {}),
                    "PATH": f"{self.p.harness / 'bin'}:{venv_vars.get('PATH', path)}"}
             env.update(git_fsync_env({**os.environ, **env}))   # a power cut must not corrupt workers' commits
             tout = timeout_s or self.cfg["budget"]["run_timeout_s"].get(tier, 3600)

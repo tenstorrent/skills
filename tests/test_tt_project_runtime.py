@@ -8426,6 +8426,125 @@ def test_a_dead_detached_push_reads_as_failed_and_frees_the_branch(env, monkeypa
             pass
 
 
+def _wait_free(marker, timeout=10):
+    from ttp import push, locks
+    deadline = time.time() + timeout
+    while not locks.any_free([push._run_lock(marker)]) and time.time() < deadline:
+        time.sleep(0.05)
+
+
+def test_a_detached_push_killed_with_its_launcher_leaves_a_log_and_says_it_never_began(env, monkeypatch, capsys):
+    """A sandbox that ends the command's processes kills the push before it logs a line. The log
+    must still say what happened and the verdict must name the early death, also for the daemon."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    _commit(repo, "mine.txt", "mine\n")
+    rc, marker, probe = _detach(capsys)
+    pid = json.loads(marker.read_text())["pid"]
+    os.kill(pid, signal.SIGKILL)         # the sandbox ends with the command: no outcome, no output
+    _wait_free(marker)
+    from ttp import push
+    assert pathlib.Path(json.loads(marker.read_text())["log"]).read_text().strip(), "the log is never empty"
+    push.tend(p)                         # the daemon records the verdict without waiting for the probe
+    m = json.loads(marker.read_text())
+    assert m["status"] == "failed" and m["exit"] is None and "before it began" in m["reason"], m
+    r = _probe(p, probe)
+    assert r.returncode == 0 and "without writing an outcome before it began" in r.stdout, r
+    assert "starting the push process" in r.stdout, "the log tail comes with the verdict"
+
+
+def test_a_detached_push_from_a_sandboxed_command_is_queued_and_the_daemon_starts_it(env, monkeypatch, capsys):
+    """Inside a PID namespace other than the run's, nothing started survives the command: the push
+    is queued and the daemon starts it, with the run's task for `--own`."""
+    from ttp import push
+    if not push.pid_ns():
+        pytest.skip("no /proc/self/ns/pid")
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    _git_out(repo, "checkout", "-q", "-b", "ttp/t7-exp")
+    _commit(repo, "mine.txt", "mine\n")
+    monkeypatch.setenv("TTP_TASK", "7")
+    monkeypatch.setenv("TTP_PIDNS", "pid:[1]")   # the run's namespace, not this one
+    rc = _ttp("push", "--own", "--detach")
+    out = capsys.readouterr().out
+    marker = pathlib.Path(next(ln.split(": ", 1)[1] for ln in out.splitlines() if ln.startswith("marker: ")))
+    probe = next(ln.split(": ", 1)[1] for ln in out.splitlines() if ln.startswith("retry_when: "))
+    m = json.loads(marker.read_text())
+    assert rc == 0 and "queued" in out and m["status"] == "queued" and "pid" not in m, out
+    assert m["env"]["TTP_TASK"] == "7" and "TTP_PIDNS" not in m["env"]
+    r = _probe(p, probe)
+    assert r.returncode == 1 and "queued for the daemon" in r.stdout, r
+    assert [x["id"] for x in push.running(p)] == [m["id"]], "its worktree stays while it is queued"
+    monkeypatch.delenv("TTP_TASK")       # the daemon has none: the marker carries it
+    monkeypatch.delenv("TTP_PIDNS")
+    push.tend(p)
+    assert json.loads(marker.read_text())["status"] in ("running", "pushed")
+    r = _probe_until_done(p, probe)
+    head = _git_out(repo, "rev-parse", "HEAD")
+    assert r.returncode == 0 and f"pushed {head} to origin/ttp/t7-exp" in r.stdout, r
+    assert _git_out(origin, "rev-parse", "ttp/t7-exp") == head
+
+
+def test_a_queued_push_the_daemon_never_starts_reads_as_failed(env, monkeypatch, capsys):
+    from ttp import push
+    if not push.pid_ns():
+        pytest.skip("no /proc/self/ns/pid")
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    _commit(repo, "mine.txt", "mine\n")
+    monkeypatch.setenv("TTP_PIDNS", "pid:[1]")
+    rc, marker, probe = _detach(capsys)
+    m = json.loads(marker.read_text())
+    m["queued"] -= push.QUEUED_S + 60
+    marker.write_text(json.dumps(m))
+    r = _probe(p, probe)
+    assert r.returncode == 0 and "did not start the queued push" in r.stdout, r
+    push.tend(p)
+    assert json.loads(marker.read_text())["status"] == "failed", "a failed push is never started late"
+    assert _git_out(origin, "rev-parse", "proj") != _git_out(repo, "rev-parse", "HEAD")
+
+
+def test_a_stopped_detached_push_writes_its_outcome_with_the_signal(env, monkeypatch, capsys):
+    started, gate = env["tmp"] / "started", env["tmp"] / "gate"
+    p, repo, origin, other = _push_setup(env, monkeypatch, [_gated_check(started, gate)])
+    _commit(repo, "mine.txt", "mine\n")
+    rc, marker, probe = _detach(capsys)
+    pid = json.loads(marker.read_text())["pid"]
+    try:
+        deadline = time.time() + 30
+        while not started.exists() and time.time() < deadline:
+            time.sleep(0.05)
+        assert started.exists() and json.loads(marker.read_text())["alive"]
+        os.kill(pid, signal.SIGTERM)
+        r = _probe_until_done(p, probe)
+        assert r.returncode == 0 and "not pushed (stopped by SIGTERM)" in r.stdout, r
+        assert json.loads(marker.read_text())["exit"] == 1
+    finally:
+        _release_detached(gate, [pid])
+
+
+def test_a_push_that_died_in_a_reboot_says_so(env, monkeypatch):
+    from ttp import push
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    marker = p.state / push.DETACHED / "t1-x.json"
+    marker.parent.mkdir(parents=True)
+    marker.write_text(json.dumps({"id": "t1-x", "status": "running", "pid": 1, "boot": "an-earlier-boot",
+                                  "alive": time.time(), "log": str(marker.with_suffix(".log"))}))
+    push.tend(p)
+    assert "the host rebooted while it ran" in json.loads(marker.read_text())["reason"]
+
+
+def test_runs_carry_the_daemons_pid_namespace(env):
+    from ttp import push
+    from ttp.daemon import Daemon
+    if not push.pid_ns():
+        pytest.skip("no /proc/self/ns/pid")
+    p = make(env)
+    d = Daemon(p.base)
+    tid = p.db.add_task("build it", "s", kind="code", tier="light", origin="user")
+    cwd, _ = d._workdir_for(p.db.task(tid))
+    rid = d.start_run("worker", "go", "claude", "light", cwd, task=p.db.task(tid))
+    (p.runs / str(rid) / "STOP").touch()
+    assert json.loads((p.runs / str(rid) / "run.json").read_text())["env"]["TTP_PIDNS"] == push.pid_ns()
+
+
 def test_the_push_probe_of_a_missing_marker_wakes_the_task_as_broken(env, monkeypatch):
     p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
     assert _ttp("push", "--result", str(p.state / "pushes" / "nope.json")) == 2
@@ -10393,7 +10512,7 @@ def test_a_long_tick_tells_both_watchdogs_it_still_moves(env, monkeypatch):
     d._notify = addr
     steps = []
     for name in ("reap_runs", "wake_after_reboot", "meter_running", "reconcile_tasks", "prune_worktrees",
-                 "check_local_only", "check_disk", "sweep_alerts", "check_release", "sync_shared_pauses", "check_integrity", "sync_schedules", "_refresh_meters", "update_gates", "run_schedules", "poll_slack",
+                 "check_local_only", "check_disk", "sweep_alerts", "check_release", "sync_shared_pauses", "check_integrity", "sync_schedules", "tend_pushes", "_refresh_meters", "update_gates", "run_schedules", "poll_slack",
                  "check_resource_trouble", "read_upstream", "retry_rejected", "maybe_coordinate", "probe_waiting", "dispatch",
                  "deliver_outbound"):
         monkeypatch.setattr(d, name, lambda name=name: steps.append(name))
@@ -10413,7 +10532,7 @@ def test_a_long_tick_tells_both_watchdogs_it_still_moves(env, monkeypatch):
     finally:
         sock.close()
         cleanup()
-    assert len(steps) == 23 and pings == [b"WATCHDOG=1"] * 21, (steps, pings)
+    assert len(steps) == 24 and pings == [b"WATCHDOG=1"] * 22, (steps, pings)
     # Before its first completed tick the heartbeat is not written (`ttp restart` reads it as that
     # tick); the start marker carries the progress, which `ttp.watchdog` counts.
     assert not hb.exists()
