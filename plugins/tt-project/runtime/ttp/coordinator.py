@@ -29,7 +29,7 @@ from .runner import stop_runs
 
 ACTION_TYPES = ("reply", "task_add", "task_update", "ask_user", "resolve", "notify", "memory_add", "memory_forget",
                 "charter_update", "schedule_set", "config_set", "resource_pause", "observation_mute", "pr_approve",
-                "noop")
+                "escalate", "noop")
 
 # A deferred task's `start_after`: `now`, a delay (`90m`, `3d`) or an ISO date or time (local
 # unless it names a zone). Plain character classes, so every provider's schema engine takes it.
@@ -120,12 +120,29 @@ REJECTED_KEY = "rejected_actions"   # kv: the last turn's rejected actions, show
 # kv: {"at": ts, "why": text}: a rejected action whose blocking condition clears at a known time.
 # The daemon wakes the coordinator then, so the turn's undone work does not wait for an idle wake.
 RETRY_WAKE_KEY = "rejected_retry_wake"
-# Events that leave work stuck until the coordinator finds a way around it. A turn they start runs
-# at coordinator.unblock_effort, and so do turns carrying user messages, the turn after a rejected
-# ask_user, and an idle wake that finds blocked tasks or open asks.
-UNBLOCK_KINDS = frozenset({"task_blocked", "task_failed", "task_budget_exhausted", "resource_trouble",
-                           "ask_timeout", "dead_dependency", "deferral_expired", "deferral_probe_broken",
-                           "review_stall"})
+# What makes a coordinator turn tricky or blocking: such a turn runs at least at
+# coordinator.unblock_effort (effort_triggers). Events of these kinds, by the trigger they count as.
+# Everything else (a task done, notes, follow-ups, a retry wake) is routine and keeps the base effort.
+EFFORT_EVENT_TRIGGERS = {
+    # stuck work
+    "task_blocked": "stuck", "task_failed": "stuck", "task_review": "stuck", "dead_dependency": "stuck",
+    "deferral_expired": "stuck", "deferral_probe_broken": "stuck", "review_stall": "stuck",
+    "resource_trouble": "resource",
+    # costly or irreversible decisions
+    "task_budget_exhausted": "costly", "ask_timeout": "costly", "pr_findings": "costly", "pr_clean": "costly",
+    "pr_unapproved_ready": "costly", "after_push_failed": "costly", "push_batch_died": "costly",
+    "push_tip_failed": "costly",
+}
+UNBLOCK_KINDS = frozenset(EFFORT_EVENT_TRIGGERS)
+EFFORT_SEVERITIES = ("high", "critical")   # an event or alert this severe is never routine
+RESOURCE_WAITS_ONLY = "waits only"   # a resource_trouble line that only counts waits is not trouble
+# A user message naming a change of plan may contradict the charter or memory.
+CONFLICT_RE = re.compile(r"\b(change of plan|change(d)? (my|the) mind|supersed\w*|scrap (that|this|it)|"
+                         r"ignore (what|my|the) (i said|earlier|previous)|instead of|no longer|"
+                         r"forget (that|what i said)|overrid\w*|contrary to|reverse (that|the) decision)\b", re.I)
+EFFORT_SEEN_KEY = "effort_seen"   # kv: state-based triggers already raised once (held queue, red gates)
+ESCALATE_KEY = "escalate"   # kv: a routine turn's escalation; the next turn reruns its batch at high effort
+ESCALATIONS_KEY = "escalations"   # kv: {"n": routine turns escalated, "rejected": escalations refused}
 EFFORT_ORDER = ("minimal", "low", "medium", "high", "xhigh", "max")
 NOTES_KEY = "action_notes"   # kv: the last turn's notes on actions applied with a change; information only
 RECENT_OUT = 5                       # outbound messages the digest repeats, so turns do not resend them
@@ -846,8 +863,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
             elif t == "observation_mute":
                 scr.mute(db, a.get("source"), a.get("match"), a.get("hours"), a.get("below"),
                          a.get("why") or a.get("reason") or a.get("text") or "")
-            elif t in ("noop", None):
-                pass
+            elif t in ("noop", "escalate", None):
+                pass   # an escalation is the daemon's (Daemon._finish_coordinator); here it changes nothing
             else:
                 raise ValueError(f"unknown action {t!r}")
         except Exception as e:   # one bad action is reported back; it never aborts the turn
@@ -994,25 +1011,100 @@ def _is_dir(path: str) -> bool:
 MCP_NAME_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,100}$")
 
 
-def unblock_reason(db, event_ids: list[int], wake_due: str | None, msg_ids: list[int] | None = None) -> str:
-    """Why the coming coordinator turn is about unblocking work, or "" for a routine one.
-    User messages count: the user writing usually means something waits on the project."""
-    if event_ids:
-        rows = db.q(f"SELECT DISTINCT kind FROM events WHERE id IN ({','.join('?' * len(event_ids))})",
-                    list(event_ids))
-        kinds = sorted(r["kind"] for r in rows if r["kind"] in UNBLOCK_KINDS)
-        if kinds:
-            return ", ".join(kinds)
+def effort_triggers(db, cfg: dict, event_ids: list[int], wake_due: str | None,
+                    msg_ids: list[int] | None = None, gates: dict | None = None,
+                    now: float | None = None) -> tuple[list[str], dict]:
+    """Why the coming coordinator turn is tricky or blocking, as trigger labels ([] for a routine
+    one), and the state-based triggers' state for EFFORT_SEEN_KEY, saved once the turn starts so a
+    lasting state raises one turn, not every turn. All the rules live here; each label names its
+    rule, so turns can be counted by trigger."""
+    now = now or time.time()
+    c = cfg.get("coordinator") or {}
+    out: list[str] = []
+    seen_before = db.kv(EFFORT_SEEN_KEY, {}) or {}
+    seen: dict = {}
+
+    def add(label: str) -> None:
+        if label not in out:
+            out.append(label)
+    rows = db.q(f"SELECT kind, severity, text, task FROM events WHERE id IN ({','.join('?' * len(event_ids))})",
+                list(event_ids)) if event_ids else []
+    for r in sorted(rows, key=lambda r: r["kind"]):
+        if r["kind"] == "resource_trouble" and RESOURCE_WAITS_ONLY in (r["text"] or ""):
+            continue
+        if r["kind"] in EFFORT_EVENT_TRIGGERS:
+            add(r["kind"])
+    if any(r["kind"] == "task_failed" and r["task"] and (db.task(r["task"]) or {}).get("kind") == "review"
+           for r in rows):
+        add("failed review")
+    if any(r["severity"] in EFFORT_SEVERITIES for r in rows):
+        add("high severity event")
     if msg_ids:
-        return "user message"
-    if any(str(x).startswith("ask_user:") for x in db.kv(REJECTED_KEY, []) or []):
-        return "retry after a rejected ask_user"
+        add("user message")
+        texts = db.q(f"SELECT text FROM messages WHERE id IN ({','.join('?' * len(msg_ids))})", list(msg_ids))
+        if any(CONFLICT_RE.search(m["text"] or "") for m in texts):
+            add("change of plan")
+    rejected = [str(x) for x in db.kv(REJECTED_KEY, []) or []]
+    if any(x.startswith("ask_user:") for x in rejected):
+        add("retry after a rejected ask_user")
+    elif rejected:
+        add("rejected action")
+    last = float(db.kv("last_coordinator_turn", 0) or 0)
+    if db.one("SELECT 1 FROM messages WHERE direction='out' AND kind='alert' AND ts>? AND severity IN (%s)"
+              % ",".join("?" * len(EFFORT_SEVERITIES)), (last, *EFFORT_SEVERITIES)):
+        add("high severity alert")
+    # A task that keeps failing or coming back waiting, counted over 24 h for the tasks heard from
+    # since the last turn.
+    fails_at, waits_at = int(c.get("repeat_fails_24h", 2) or 0), int(c.get("repeat_waits_24h", 3) or 0)
+    since = now - 86400
+    for t in db.q("SELECT DISTINCT task FROM events WHERE task IS NOT NULL AND ts>?", (last,)):
+        fails = db.one("SELECT COUNT(*) n FROM runs WHERE task=? AND role!='coordinator' AND ended>? AND status IN "
+                       f"({','.join('?' * len(machines.BAD_RUNS))}) AND COALESCE(note,'') NOT LIKE '%lost_to_reboot%'",
+                       (t["task"], since, *machines.BAD_RUNS))["n"] + \
+            db.one("SELECT COUNT(*) n FROM events WHERE task=? AND kind='task_failed' AND ts>?", (t["task"], since))["n"]
+        waits = db.one("SELECT COUNT(*) n FROM events WHERE task=? AND kind='task_waiting' AND ts>?",
+                       (t["task"], since))["n"]
+        if fails_at and fails >= fails_at:
+            add("repeated failures")
+        if waits_at and waits >= waits_at:
+            add("repeated waits")
+    # Free worker slots while every queued task is held (a dependency, a deferral, a paused resource).
+    queued = db.q("SELECT * FROM tasks WHERE status='queued' ORDER BY id")
+    running = db.one("SELECT COUNT(*) n FROM runs WHERE role!='coordinator' AND status='running'")["n"]
+    slots = int((cfg.get("budget") or {}).get("max_parallel_workers", 6) or 0)
+    if queued and running < slots:
+        paused = db.paused_resources()
+        unmet = db.unmet_dependencies(queued)
+        held = [t["id"] for t in queued if unmet[t["id"]] or "when" in (d := deferral(t))
+                or float(d.get("after") or 0) > now or task_resources(t) & paused.keys()]
+        if len(held) == len(queued):
+            seen["held"] = held
+            if held != seen_before.get("held"):
+                add("idle slots, queued work held")
+    # The budget gate going red or leaving it is a spend decision.
+    red = sorted(k for k, g in (gates or {}).items() if (g or {}).get("level") == "red")
+    seen["red"] = red
+    if gates is not None and red != (seen_before.get("red") or []):
+        add("budget gate change")
     if wake_due == "idle":
         if db.one("SELECT id FROM tasks WHERE status='blocked'"):
-            return "stalled on blocked tasks"
+            add("stalled on blocked tasks")
         if db.one("SELECT id FROM messages WHERE kind='ask' AND handled=0"):
-            return "stalled on open asks"
-    return ""
+            add("stalled on open asks")
+    return out, seen
+
+
+def can_raise_effort(cfg: dict, tier: str, effort: str | None = None) -> bool:
+    """Whether a tricky turn would run at more than the coordinator's base `effort` (by default its
+    tier's): not when coordinator.effort pins it or coordinator.unblock_effort is empty."""
+    c = cfg.get("coordinator") or {}
+    floor = str(c.get("unblock_effort", "high") or "")
+    if str(c.get("effort") or "") or not floor:
+        return False
+    if effort is None:
+        effort = str(((cfg.get("providers") or {}).get(cfg.get("core_provider", "claude")) or {})
+                      .get("tiers", {}).get(tier, {}).get("effort", "") or "")
+    return raise_effort(effort, floor) != effort
 
 
 def raise_effort(effort: str, floor: str) -> str:

@@ -554,7 +554,8 @@ class Daemon:
             c = self.cfg.get("coordinator") or {}
             model = str(c.get("model") or "") or model
             effort = str(c.get("effort") or "") or effort
-            if unblock:   # a turn that must find a way past stuck work thinks harder (raise only)
+            if unblock and not str(c.get("effort") or ""):
+                # A tricky or blocking turn thinks harder (raise only); a pinned effort wins.
                 effort = coord.raise_effort(effort, str(c.get("unblock_effort", "high") or ""))
         prices = (self.cfg.get("pricing") or {}).get(provider) or {}
         prov = get_provider(provider).use(model, prices)
@@ -1068,6 +1069,24 @@ class Daemon:
             self._coordinator_failed(f"{status} {usage.error[:200]}")
             return
         db.set_kv("coordinator_failures", 0)
+        esc = [a for a in actions if isinstance(a, dict) and a.get("type") == "escalate"]
+        if esc:
+            actions = [a for a in actions if not (isinstance(a, dict) and a.get("type") == "escalate")]
+            counts = db.kv(coord.ESCALATIONS_KEY, {}) or {}
+            # Once per batch, from a routine turn only, and only when it would raise the effort: the
+            # rerun (or any raised turn) decides, so escalation cannot loop.
+            batch = [sorted(note.get("events") or []), sorted(note.get("messages") or [])]
+            if not note.get("escalated") and not note.get("unblock") and batch != counts.get("batch") and \
+                    coord.can_raise_effort(self.cfg, (self.cfg.get("coordinator") or {}).get("tier", "light"),
+                                           r.get("effort") or ""):
+                why = str(esc[0].get("why") or esc[0].get("reason") or esc[0].get("text") or "")[:300]
+                db.set_kv(coord.ESCALATE_KEY, {"run": r.get("id"), "why": why, "ts": time.time(),
+                                               **({"due": note["wake_due"]} if note.get("wake_due") else {})})
+                db.set_kv(coord.ESCALATIONS_KEY, {**counts, "n": int(counts.get("n", 0)) + 1, "batch": batch})
+                log(self.p, f"coordinator turn {r.get('id')} escalated to high effort: {why}")
+                return   # its messages and events stay queued for the rerun
+            db.set_kv(coord.ESCALATIONS_KEY, {**counts, "refused": int(counts.get("refused", 0)) + 1})
+            log(self.p, f"coordinator turn {r.get('id')} asked to escalate again; it decides at this effort")
         default_chat = note.get("default_chat")
         problems = coord.apply(self.p, actions, default_chat=default_chat, user_turn=bool(note.get("messages")),
                                turn=r.get("id"))
@@ -1729,7 +1748,11 @@ class Daemon:
         evs = queued[:int(c.get("max_events_per_turn", 40))]
         wake: dict = {}
         w: dict | None = None
-        if not msgs and not evs:
+        # A routine turn that found its batch harder than it looked: rerun it now, once, at high effort.
+        esc = db.kv(coord.ESCALATE_KEY) or {}
+        if esc:
+            w = {"due": esc.get("due")} if esc.get("due") else None
+        elif not msgs and not evs:
             last = float(db.kv("last_coordinator_turn", 0))
             if now - last <= min(float(c.get("idle_wake_s", 3600)), float(c.get("starve_wake_s", 300))):
                 return
@@ -1764,14 +1787,25 @@ class Daemon:
             return   # logged out: one run at a time checks the login, and this turn is not it
         try:
             prompt = coord.digest(self.p, gates, [e["id"] for e in evs], [m["id"] for m in msgs])
-            unblock = coord.unblock_reason(db, [e["id"] for e in evs], (w or {}).get("due"),
-                                          [m["id"] for m in msgs])
+            due = (w or {}).get("due")
+            triggers, seen = coord.effort_triggers(db, self.cfg, [e["id"] for e in evs], due,
+                                                   [m["id"] for m in msgs], gates, now)
+            if esc:
+                triggers = [f"escalated: {str(esc.get('why') or '')[:200]}".rstrip(": "), *triggers]
+            unblock = ", ".join(triggers)
+            raised = bool(unblock) and coord.can_raise_effort(self.cfg, c.get("tier", "light"))
+            prompt += ("\n\nThis turn's effort: raised (" + unblock[:300] + ")." if raised else
+                       "\n\nThis turn's effort: routine." + (" If this batch is harder than routine bookkeeping, "
+                       "return only an `escalate` action: it reruns once at high effort." if
+                       coord.can_raise_effort(self.cfg, c.get("tier", "light")) else ""))
             self.start_run("coordinator", prompt, provider, c.get("tier", "light"), str(self.p.base),
                            read_only=True, schema=coord.ACTIONS_SCHEMA, system=coord.system_prompt(self.p),
                            budget_usd=float(c.get("turn_budget_usd", 1.0)),
                            timeout_s=float(c.get("turn_timeout_s", 600)),
                            note={"messages": [m["id"] for m in msgs], "events": [e["id"] for e in evs],
-                                 "default_chat": default_chat, **({"unblock": unblock} if unblock else {})},
+                                 "default_chat": default_chat, **({"unblock": unblock} if unblock else {}),
+                                 "triggers": triggers, **({"wake_due": due} if due else {}),
+                                 **({"escalated": True} if esc else {})},
                            unblock=unblock)
         except Exception as e:
             # A turn that cannot even start backs off like a failed turn instead of retrying every tick.
@@ -1779,7 +1813,11 @@ class Daemon:
             self._coordinator_failed(f"could not start: {type(e).__name__}: {e}"[:250])
             return
         db.set_kv("last_coordinator_turn", now)
-        db.set_kv("idle_wake", wake)
+        db.set_kv(coord.EFFORT_SEEN_KEY, seen)
+        if esc:
+            db.x("DELETE FROM kv WHERE key=?", (coord.ESCALATE_KEY,))
+        else:
+            db.set_kv("idle_wake", wake)
         if logged_out:
             db.set_kv(f"auth_probe:{provider}", now)
 

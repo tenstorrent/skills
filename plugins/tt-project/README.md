@@ -105,9 +105,19 @@ and preferences you add later become part of the project's charter and memory.
   runs at `coordinator.tier` (light) unless `coordinator.model` or `coordinator.effort` is set:
   those pin the coordinator alone, so moving the light tier to a cheaper model does not move it.
   Empty (the default) follows the tier. The model names one of `core_provider`'s models.
-  A turn about stuck work (a blocked or failed task, resource trouble, an ask timing out, an idle
-  wake that finds blocked tasks or open asks) runs at least at `coordinator.unblock_effort` (high;
-  empty turns this off), so it looks harder for a non-disruptive way forward.
+  A tricky or blocking turn runs at least at `coordinator.unblock_effort` (high; empty turns this
+  off), so it looks harder for a non-disruptive way forward. Its triggers, kept in one table
+  (`coordinator.effort_triggers`) and recorded per turn in the run's note: a user message (and a
+  change of plan in it); a blocked, failed or needs-review task, a failed review, a dead dependency,
+  an expired or broken deferral or a stalled review; a task failing `coordinator.repeat_fails_24h`
+  (2) or waiting `coordinator.repeat_waits_24h` (3) times in 24 h; a rejected action; free worker
+  slots while every queued task is held; a high or critical event or alert; resource trouble (not
+  waits only); a costly or irreversible step (an ask timing out, a task's budget spent, PR findings
+  or a clean PR, a failed push, the budget gate entering or leaving red); an idle wake finding
+  blocked tasks or open asks. Routine bookkeeping stays at the base effort; such a turn that finds
+  its batch harder than it looked returns `escalate`, and the same batch reruns once at high
+  effort (never twice, and never from a raised turn; kv `escalations` counts them). A pinned
+  `coordinator.effort` wins over all of this.
 - The web app shows spend per day, per task and per recurring job, and plan-window peaks for the
   last two weeks.
 - The web app's header and `ttp status` show the budget in one line, for example

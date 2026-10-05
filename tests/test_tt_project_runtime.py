@@ -14602,12 +14602,13 @@ def test_unblocking_turns_run_at_high_effort_and_routine_turns_do_not(env, monke
     d.maybe_coordinate()
     assert calls[-1]["unblock"] == "user message", "a turn carrying user messages runs at unblock effort"
     p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
-    # The turn after a rejected ask_user retries it at unblock effort; other rejections do not raise it.
+    # The turn after a rejected ask_user retries it at unblock effort, and so does any other rejection.
     p.db.set_kv(coord.REJECTED_KEY, ["ask_user: ask_user rejected: decide it yourself"])
     assert turn("task_done") == "retry after a rejected ask_user"
     p.db.set_kv(coord.REJECTED_KEY, ["task_add: task_add rejected: depends on #1 which is failed"])
-    assert turn("task_done") == "", "a routine task_done turn keeps the base effort"
+    assert turn("task_done") == "rejected action"
     p.db.set_kv(coord.REJECTED_KEY, [])
+    assert turn("task_done") == "", "a routine task_done turn keeps the base effort"
     # An idle wake that finds a blocked task is a stall, not a routine check.
     tid = p.db.add_task("stuck", "s", origin="user")
     p.db.update_task(tid, status="blocked", blocked_reason="waiting for a window")
@@ -14632,6 +14633,161 @@ def test_unblocking_turns_run_at_high_effort_and_routine_turns_do_not(env, monke
             got.append(argv[argv.index("--effort") + 1])
             assert p.db.one("SELECT effort FROM runs WHERE id=?", (rid,))["effort"] == got[-1]
         assert got == want, (floor, got)
+
+
+def test_effort_triggers_raise_every_tricky_turn_and_leave_routine_ones_low(env):
+    """One table of rules: each trigger class raises the turn, a quiet batch does not."""
+    p = make(env)
+    from ttp import coordinator as coord
+    db, cfg = p.db, p.config()
+    db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    db.x("DELETE FROM messages WHERE direction='out'")
+    db.set_kv("last_coordinator_turn", time.time() - 60)
+
+    def ev(kind, severity="normal", text="x", task=None):
+        return db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                    (time.time(), "daemon", kind, severity, text, "queued", task))
+
+    def trig(evs=(), msgs=(), due=None, gates=None):
+        return coord.effort_triggers(db, cfg, list(evs), due, list(msgs), gates)[0]
+    # Quiet: routine progress only.
+    assert trig([ev("task_done"), ev("task_notes"), ev("followup_proposed"), ev("retry_wake")]) == []
+    assert trig(gates={}) == []
+    # Stuck work, needs_review, costly or irreversible steps: by event kind.
+    for kind in ("task_blocked", "task_failed", "task_review", "dead_dependency", "deferral_probe_broken",
+                 "review_stall", "task_budget_exhausted", "ask_timeout", "pr_findings", "pr_clean",
+                 "after_push_failed"):
+        assert trig([ev(kind)]) == [kind], kind
+    # A failed review, a high or critical event.
+    rev = db.add_task("review it", "s", kind="review", origin="user")
+    assert trig([ev("task_failed", task=rev)]) == ["task_failed", "failed review"]
+    db.update_task(rev, status="failed")
+    assert trig([ev("observation", "high")]) == ["high severity event"]
+    assert trig([ev("observation", "critical")]) == ["high severity event"]
+    # Resource trouble, but not a line that only counts waits.
+    assert trig([ev("resource_trouble", text="Resource m1: 3 runs crashed")]) == ["resource_trouble"]
+    assert trig([ev("resource_trouble", text="Resource m1: 4 waits; waits only: it may be busy")]) == []
+    # A user message, and a change of plan in it.
+    m = db.post("in", "status?", chat="c1", kind="user")
+    assert trig(msgs=[m]) == ["user message"]
+    m = db.post("in", "Change of plan: drop the old goal and do this instead", chat="c1", kind="user")
+    assert trig(msgs=[m]) == ["user message", "change of plan"]
+    # Rejected actions.
+    db.set_kv(coord.REJECTED_KEY, ["task_add: rejected: over the cap"])
+    assert trig() == ["rejected action"]
+    db.set_kv(coord.REJECTED_KEY, [])
+    # A high alert posted since the last turn.
+    db.post("out", "something broke", kind="alert", severity="high")
+    assert trig() == ["high severity alert"]
+    db.set_kv("last_coordinator_turn", time.time() + 1)
+    assert trig() == []
+    # A task failing twice or waiting three times in 24 h (configurable), once heard from since the last turn.
+    db.x("DELETE FROM messages WHERE direction='out'")
+    db.set_kv("last_coordinator_turn", time.time() - 60)
+    flaky = db.add_task("flaky", "s", origin="user")
+    for status in ("failed", "timeout"):
+        db.x("INSERT INTO runs(task,role,provider,started,ended,status) VALUES(?,?,?,?,?,?)",
+             (flaky, "worker", "claude", time.time() - 600, time.time() - 300, status))
+    db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+         (time.time(), f"task:{flaky}", "task_queued", "normal", "retry", "handled", flaky))
+    assert trig() == ["repeated failures"]
+    db.update_task(flaky, status="done")
+    assert coord.effort_triggers(db, {**cfg, "coordinator": {**cfg["coordinator"], "repeat_fails_24h": 3}},
+                                 [], None)[0] == []
+    patient = db.add_task("patient", "s", origin="user")
+    for _ in range(3):
+        db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+             (time.time(), f"task:{patient}", "task_waiting", "low", "waits", "handled", patient))
+    db.update_task(patient, status="done")
+    assert trig() == ["repeated failures", "repeated waits"]
+    db.set_kv("last_coordinator_turn", time.time() + 1)
+    # Free slots while every queued task is held: raised once per held set, not on every turn.
+    base = db.add_task("base", "s", origin="user")
+    db.update_task(base, status="blocked")
+    held = db.add_task("held", "s", origin="user", depends_on=[base])
+    got, seen = coord.effort_triggers(db, cfg, [], None)
+    assert got == ["idle slots, queued work held"] and seen["held"] == [held]
+    db.set_kv(coord.EFFORT_SEEN_KEY, seen)
+    assert trig() == []
+    db.update_task(held, status="cancelled")
+    # The budget gate entering or leaving red.
+    got, seen = coord.effort_triggers(db, cfg, [], None, [], {"claude": {"level": "red"}})
+    assert got == ["budget gate change"]
+    db.set_kv(coord.EFFORT_SEEN_KEY, seen)
+    assert trig(gates={"claude": {"level": "red"}}) == []
+    assert trig(gates={"claude": {"level": "green"}}) == ["budget gate change"]
+
+
+def test_a_routine_turn_escalates_once_and_the_rerun_cannot_escalate(env, monkeypatch):
+    p = make(env)
+    from types import SimpleNamespace
+    from ttp.daemon import Daemon
+    from ttp import coordinator as coord
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    d = Daemon(p.base)
+    d.update_gates()
+    clock = [time.time()]
+    calls = []
+    monkeypatch.setattr(d, "start_run", lambda *a, **k: calls.append((a, k)) or len(calls))
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+           (clock[0], "daemon", "task_done", "normal", "#1 done", "queued"))
+    clock[0] += 600
+    d.maybe_coordinate()
+    (args, k), = calls
+    assert k["unblock"] == "" and k["note"]["triggers"] == [] and "effort: routine" in args[1] \
+        and "`escalate`" in args[1]
+    esc = SimpleNamespace(structured={"actions": [{"type": "escalate", "why": "the hand-off contradicts the plan"},
+                                                  {"type": "notify", "text": "not applied"}], "summary": ""},
+                          error="", final_text="")
+    d._finish_coordinator({"dir": "x", "id": 1, "effort": "low"}, esc, "ok", k["note"])
+    assert p.db.one("SELECT COUNT(*) n FROM events WHERE status='queued'")["n"] == 1, "its batch stays queued"
+    assert not p.db.one("SELECT id FROM messages WHERE text='not applied'"), "an escalating turn decides nothing"
+    assert p.db.kv(coord.ESCALATIONS_KEY)["n"] == 1
+    # The rerun starts at once (no debounce, batch hold or idle wait), raised, with the same batch.
+    d.maybe_coordinate()
+    args, k = calls[-1]
+    assert len(calls) == 2 and k["note"]["escalated"] is True and k["note"]["events"] == calls[0][1]["note"]["events"]
+    assert k["unblock"].startswith("escalated: the hand-off contradicts the plan") and "effort: raised" in args[1]
+    assert not p.db.kv(coord.ESCALATE_KEY)
+    # The rerun asking to escalate again is refused: the rest of its actions apply, nothing reruns.
+    d._finish_coordinator({"dir": "x", "id": 2, "effort": "high"}, SimpleNamespace(structured={"actions": [
+        {"type": "escalate", "why": "again"}, {"type": "notify", "text": "decided"}], "summary": ""},
+        error="", final_text=""), "ok", k["note"])
+    assert p.db.one("SELECT id FROM messages WHERE text='decided'")
+    assert not p.db.kv(coord.ESCALATE_KEY) and p.db.kv(coord.ESCALATIONS_KEY)["refused"] == 1
+    assert p.db.one("SELECT COUNT(*) n FROM events WHERE status='queued'")["n"] == 0
+    # A routine turn over a batch already escalated once, or a raised turn, cannot escalate either.
+    for note in ({**calls[0][1]["note"]}, {"events": [99], "unblock": "task_failed"}):
+        d._finish_coordinator({"dir": "x", "id": 3, "effort": "low"}, esc, "ok", note)
+        assert not p.db.kv(coord.ESCALATE_KEY), note
+    assert p.db.kv(coord.ESCALATIONS_KEY) == {"n": 1, "refused": 3, "batch": [calls[0][1]["note"]["events"], []]}
+    clock[0] += 600
+    n = len(calls)
+    d.maybe_coordinate()
+    assert len(calls) == n, "nothing queued, no escalation: no turn"
+    # A pinned coordinator.effort wins: nothing raises it, so a routine turn may not escalate.
+    p.set_config("coordinator.effort", "low")
+    d.cfg = p.config()
+    assert not coord.can_raise_effort(d.cfg, "light")
+    d._finish_coordinator({"dir": "x", "id": 4, "effort": "low"}, esc, "ok", {"events": [100]})
+    assert not p.db.kv(coord.ESCALATE_KEY)
+
+
+def test_a_pinned_coordinator_effort_wins_over_the_triggers(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    p.set_config("providers.claude.tiers.light.effort", "low")
+    got = []
+    for pin in ("", "low", "medium"):
+        p.set_config("coordinator.effort", pin)
+        d = Daemon(p.base)
+        rid = d.start_run("coordinator", "go", "claude", "light", str(p.base), read_only=True,
+                          unblock="user message")
+        (p.runs / str(rid) / "STOP").touch()
+        argv = json.loads((p.runs / str(rid) / "run.json").read_text())["argv"]
+        got.append(argv[argv.index("--effort") + 1])
+    assert got == ["high", "low", "medium"]
 
 
 def test_idle_slot_wake_ignores_forgotten_open_asks(env):
