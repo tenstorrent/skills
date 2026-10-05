@@ -8069,6 +8069,48 @@ def test_the_review_prompt_pushes_only_through_the_guarded_push():
         assert codes < text.index(code) < bump, code
 
 
+def test_the_review_prompt_approves_into_the_push_queue_only_when_it_is_on(env):
+    text = (RUNTIME.parent / "template" / "prompts" / "kind-review.md").read_text()
+    queue = text[text.index("## Approving into the push queue (when the delivery line says push queue=True)"):]
+    assert '"push": [{"branch":' in queue and '"head": "<full hash you reviewed>"' in queue
+    assert "NEVER run `ttp push` or `git push`, and never bump versions" in queue
+    assert "`push conflict`: fetch, rebase the change onto the push branch's current tip" in queue
+    assert "keeping both sides' intents" in queue and "approve the new head" in queue
+    coord_md = (RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text()
+    assert 'ask the reviewer\n  to "approve for the push queue" and carry no push or deploy steps' in coord_md
+    assert "A `pushing` task is in the queue: leave it." in coord_md
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.prompts import worker_task
+    review = p.db.add_task("review it", "s", kind="review", tier="light", origin="user")
+    code = p.db.add_task("fix it", "s", kind="code", tier="light", origin="user")
+
+    def prompt(tid=review):
+        return worker_task(p, p.db.task(tid), str(p.root), None)
+
+    def policy(tid=review):
+        return next(x for x in prompt(tid).splitlines() if x.startswith("delivery policy:"))
+
+    # Off (the default): the --detach rules, no queue section, no queue flag.
+    p.set_config("delivery.push_branch", "work")
+    off = prompt()
+    assert "run `ttp push --detach`" in off and "## Approving into the push queue" not in off
+    assert "push queue" not in policy() and "## Delivery: push queue" not in coord.digest(p, {}, [], [])
+    # On without a push branch, or with pushing not allowed: still off.
+    p.set_config("delivery.push_queue", True)
+    p.set_config("delivery.push_branch", "")
+    assert "push queue" not in policy()
+    p.set_config("delivery.push_branch", "work")
+    p.set_config("delivery.push_allowed", False)
+    assert "push queue" not in policy() and "ttp push --detach" in prompt()
+    # On with a push branch: reviews (not code tasks) get the flag and only the queue section.
+    p.set_config("delivery.push_allowed", True)
+    on = prompt()
+    assert policy().endswith("push allowed=True, push queue=True") and "push queue" not in policy(code)
+    assert "## Approving into the push queue" in on and "ttp push --detach" not in on
+    assert "## Delivery: push queue on for work (delivery.push_queue)" in coord.digest(p, {}, [], [])
+
+
 def test_the_worker_time_rule_sends_pushes_detached():
     """worker.md's 5-minute rule must agree with the review and code prompts' detached `ttp push`."""
     text = (RUNTIME.parent / "template" / "prompts" / "worker.md").read_text()
@@ -12519,6 +12561,40 @@ def test_config_set_rejects_sentence_push_checks_and_unknown_keys(env):
     assert any("'Run' is not a program on PATH" in x for x in probs)
     assert any("unknown key budget.daly_usd (did you mean budget.daily_usd?)" in x for x in probs)
     assert p.config()["delivery"]["push_checks"] == ["true", "./run.sh -q", "X=1 sh -c :"]
+
+
+def test_config_set_accepts_the_push_queue_keys_and_rejects_a_sentence_after_push(env):
+    p = make(env)
+    from ttp.coordinator import NEEDS_USER, apply
+    from ttp.project import config_problems
+    keys = {"push_queue": ("on", True), "push_batch_s": ("0", 0.0), "push_batch_max": ("4", 4),
+            "after_push": ('["./deploy.sh --all"]', ["./deploy.sh --all"]), "after_push_timeout_s": ("600", 600.0)}
+    # Not on the user's word: none of the keys needs it.
+    assert apply(p, [{"type": "config_set", "key": f"delivery.{k}", "value": v} for k, (v, _) in keys.items()]) == []
+    assert not {f"delivery.{k}" for k in keys} & set(NEEDS_USER)
+    assert {k: p.config()["delivery"][k] for k in keys} == {k: want for k, (_, want) in keys.items()}
+    assert config_problems(p.raw_config()) == []
+    probs = apply(p, [{"type": "config_set", "key": "delivery.after_push", "value": "Deploy it to every machine"},
+                      {"type": "config_set", "key": "delivery.push_batch_max", "value": "0"}])
+    assert any("'Deploy' is not a program on PATH" in x for x in probs)
+    assert any("delivery.push_batch_max: '0' is not a whole number >= 1" in x for x in probs)
+    assert p.config()["delivery"]["after_push"] == ["./deploy.sh --all"] and p.config()["delivery"]["push_batch_max"] == 4
+
+
+@pytest.mark.parametrize("key,good,bad", [
+    ("push_queue", [True, False], ["yes", 1]),
+    ("push_batch_s", [0, 900, 1.5], [-1, "soon", True, None, float("nan"), float("inf")]),
+    ("push_batch_max", [1, 8, 8.0], [0, 2.5, "eight", False]),
+    ("after_push", [[], ["true", "./deploy.sh x"], "make deploy"], [["Deploy everything now"]]),
+    ("after_push_timeout_s", [1, 1800], [0, -5, "long"]),
+])
+def test_config_problems_check_each_push_queue_key(key, good, bad):
+    from ttp.project import config_problems
+    for v in good:
+        assert config_problems({"delivery": {key: v}}) == [], (key, v)
+    for v in bad:
+        probs = config_problems({"delivery": {key: v}})
+        assert len(probs) == 1 and probs[0].startswith(f"delivery.{key}: "), (key, v, probs)
 
 
 def test_config_problems_flag_unknown_keys_and_bad_checks(env, capsys):

@@ -139,7 +139,9 @@ EXTRA_KEYS = {
                "max_pace_hold_s"},   # max_pace_hold_s: deprecated and ignored; accepted so old configs stay quiet
     "coordinator": {"max_review_tasks_per_day"},
     "notify": {"slack_poll_s"},
-    "delivery": {"base_ref", "push_branch", "push_checks", "push_rounds", "push_wait_s", "version_bump"},
+    # push_queue..after_push_timeout_s: the daemon-owned push queue (see PUSH_QUEUE_DEFAULTS).
+    "delivery": {"base_ref", "push_branch", "push_checks", "push_rounds", "push_wait_s", "version_bump",
+                 "push_queue", "push_batch_s", "push_batch_max", "after_push", "after_push_timeout_s"},
     "jev": {"via", "url", "model"},
 }
 OPEN_SECTIONS = {"resources"}           # any name below is fine
@@ -201,9 +203,39 @@ def code_tasks_may_push(cfg: dict) -> bool:
     return d.get("code_tasks_may_push") is True and bool(str(d.get("push_branch") or "").strip())
 
 
+# delivery.push_queue on: reviews approve into the daemon's queue, which pushes approved heads in
+# batches (a batch starts once the oldest approval waited push_batch_s or push_batch_max are waiting)
+# and then runs after_push (commands like push_checks), killed after after_push_timeout_s.
+PUSH_QUEUE_DEFAULTS = {"push_queue": False, "push_batch_s": 900, "push_batch_max": 8, "after_push_timeout_s": 1800}
+# key: (minimum, whether the minimum itself is allowed, whole numbers only)
+PUSH_QUEUE_NUMBERS = {"push_batch_s": (0, True, False), "push_batch_max": (1, True, True),
+                      "after_push_timeout_s": (0, False, False)}
+
+
+def push_queue_number(key: str, v: Any) -> float | int:
+    """delivery.<key> (a PUSH_QUEUE_NUMBERS key) as a number in its range; ValueError otherwise."""
+    lo, closed, whole = PUSH_QUEUE_NUMBERS[key]
+    try:
+        n = float(v) if not isinstance(v, bool) else None
+    except (TypeError, ValueError):
+        n = None
+    if n is None or not abs(n) < float("inf") or (whole and n != int(n)) or n < lo or (n == lo and not closed):
+        raise ValueError(f"delivery.{key}: {v!r} is not {'a whole number' if whole else 'a number'} "
+                         f"{'>=' if closed else '>'} {lo} (default {PUSH_QUEUE_DEFAULTS[key]})")
+    return int(n) if whole else n
+
+
+def push_queue_on(cfg: dict) -> bool:
+    """Whether reviews approve into the daemon's push queue: delivery.push_queue is true, pushing is
+    allowed and delivery.push_branch is set."""
+    d = cfg.get("delivery") or {}
+    return d.get("push_queue") is True and d.get("push_allowed", True) is not False \
+        and bool(str(d.get("push_branch") or "").strip())
+
+
 def config_problems(raw: dict) -> list[str]:
-    """Unknown keys, non-command push_checks and a malformed version_bump in a project's own
-    settings, one line each."""
+    """Unknown keys, non-command push_checks or after_push, a malformed version_bump and push queue
+    settings out of range in a project's own settings, one line each."""
     out: list[str] = []
 
     def walk(node: dict, path: list[str]) -> None:
@@ -221,6 +253,16 @@ def config_problems(raw: dict) -> list[str]:
     may_push = delivery.get("code_tasks_may_push", False)
     if not isinstance(may_push, bool):
         out.append(f"delivery.code_tasks_may_push: {may_push!r} is not true or false; code tasks do not push")
+    queue = delivery.get("push_queue", False)
+    if not isinstance(queue, bool):
+        out.append(f"delivery.push_queue: {queue!r} is not true or false; reviews push with ttp push")
+    for key in PUSH_QUEUE_NUMBERS:
+        if key in delivery:
+            try:
+                push_queue_number(key, delivery[key])
+            except ValueError as e:
+                out.append(str(e))
+    out += [f"delivery.after_push: {p}" for p in check_problems(delivery.get("after_push"))]
     out += _disk_problems(raw.get("disk"))
     return out
 

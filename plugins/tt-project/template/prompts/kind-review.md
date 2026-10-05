@@ -16,7 +16,7 @@
 - Any PR comment or review you post ends with the hidden line `<!-- ttp -->`, so the PR watcher
   does not report it back as someone else's comment.
 
-## Pushing a reviewed change (only when the spec asks for it)
+## Pushing a reviewed change (only when the spec asks for it, without the push queue)
 
 - Push only with `ttp push`, run in the change's worktree. NEVER use `git push` directly.
 - It refuses uncommitted changes, rebases onto the project's target branch, runs the project's
@@ -38,3 +38,14 @@
 - Version bump: when it prints "bumped ... to X.Y.Z", `ttp push` made the bump and changeset
   itself (`delivery.version_bump` is set): never bump by hand. Only where it is unset and the
   project wants a bump, bump by hand once above the branch's version before pushing.
+
+## Approving into the push queue (when the delivery line says push queue=True)
+
+- Only when the spec asks for delivery to the push branch: hand off `done` with
+  `"push": [{"branch": "<the change's branch>", "head": "<full hash you reviewed>"}]`. The daemon
+  pushes approved heads in batches with one version bump, the checks and the deploy steps.
+- NEVER run `ttp push` or `git push`, and never bump versions or write the bump's changeset.
+- Woken because `push conflict`: fetch, rebase the change onto the push branch's current tip in
+  its worktree and resolve keeping both sides' intents (the one edit you may make). Run the
+  project's checks, commit, and approve the new head.
+- A failed check needs nothing from you: the daemon fails the task.

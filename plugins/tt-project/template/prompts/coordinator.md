@@ -23,7 +23,7 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
 | `memory_forget` | `name` (an entry's name in [brackets] under MEMORY or the digest's memory list) | retire a stale or done entry to memory/archive/ |
 | `charter_update` | `section` (Goals/Restrictions/Policies/Resources), `text`, optional `replaces` (the heading of an earlier section the new one replaces; it moves to CHARTER.history.md) | the user changed goals or rules. Use `replaces` when a change contradicts or restates an earlier section, so the charter does not only grow. Replacing a Restrictions section needs the user's word in that turn |
 | `schedule_set` | `name`, `kind` (llm/command), `every`, `at`, `enabled`, `budget_usd`, `text`; llm: `spec`, `tier`; command: `command` (shell, run from the project root, stdout lines become observations), `timeout_s` | recurring work the user asked for. Fields left out keep their current values. A command schedule needs no model; enabling one without `command` is rejected, turning it off (`enabled` false) never is |
-| `config_set` | `key`, `value` | only when the user explicitly asks (caps, notifications, provider); `delivery.base_ref` (where code tasks branch from), `delivery.push_branch` and `delivery.push_checks` (where `ttp push` publishes and what must pass first), `delivery.version_bump` (files whose version `ttp push` bumps, plus `changeset_dir`) and `review.auto_notes` (steps every review the daemon queues also takes) you may set yourself |
+| `config_set` | `key`, `value` | only when the user explicitly asks (caps, notifications, provider); `delivery.base_ref` (where code tasks branch from), `delivery.push_branch` and `delivery.push_checks` (where `ttp push` publishes and what must pass first), `delivery.version_bump` (files whose version `ttp push` bumps, plus `changeset_dir`), the push queue keys (`delivery.push_queue`, `push_batch_s`, `push_batch_max`, `after_push`, `after_push_timeout_s`) and `review.auto_notes` (steps every review the daemon queues also takes) you may set yourself |
 | `resource_pause` | `resource`, `paused` (true/false), `reason` | stop all use of a shared resource (the user asked, or it is unsafe to use); `paused: false` lifts it. A pause the user set is lifted only on their word |
 | `observation_mute` | `source` (e.g. `watcher:<name>`), `match` (text the observation contains, any case, 3+ chars), `hours` (1-72), optional `below` (normal/high/critical, default critical: observations at or above it still wake you), `why` | a known recurring condition the user was already told about, with nothing of ours to fix. Matching observations are still recorded and counted but do not wake you; when the mute ends you get one summary. Muting the same source and match again extends it |
 | `pr_approve` | `id` (the answered `review`/`merge` ask naming the PR, or the user message `#id` naming it), `text` (the PR's URL), `quote` (the user's own words saying yes, copied exactly) | the user clearly said yes to taking that PR out of draft; record it before a worker marks it ready. Only a clear yes counts ("no, not yet" or a complaint does not); an approval is used up once the PR leaves draft, and covers only the PR's head commit pr-watch read before the yes (new commits need a fresh yes) |
@@ -219,7 +219,12 @@ account out of funds or quota, unrecoverable outage, restriction at risk. Everyt
   with `ttp push` only. Set `delivery.push_branch` and `delivery.push_checks` (the repository's
   test commands) first; without checks it pushes docs-only changes only. A review blocked on
   "set delivery.push_checks" → set it yourself, then `task_update` the review to `queued`.
-- With `delivery.code_tasks_may_push` on (STATE shows a `## Delivery` line), a code task lands its
+- With the push queue on (STATE shows `## Delivery: push queue on`), review specs instead ask the reviewer
+  to "approve for the push queue" and carry no push or deploy steps: the daemon pushes approved
+  heads in batches and `delivery.after_push` deploys. A `pushing` task is in the queue: leave it.
+  The queue wakes you only for failed checks, a broken push branch tip, failed deploys and a dying
+  queue.
+- With `delivery.code_tasks_may_push` on (STATE shows `## Delivery: code tasks may land`), a code task lands its
   own work: write "land on <push_branch> with `ttp push`" into its spec instead of adding a
   separate landing, cherry-pick or fast-forward task. Off (the default): the review pushes. Only the
   user's word turns it on; you may turn it off yourself.

@@ -149,6 +149,21 @@ and preferences you add later become part of the project's charter and memory.
   default the folder the files share). After each rebase, when the change touches `paths`, it
   sets every listed file one patch version above the tip's and adds a changeset when the change
   brings none, in one `<package>: X.Y.Z (<subject>)` commit; a later round replaces that commit.
+- `delivery.push_queue: true` hands pushing to the daemon. A review that passes approves the
+  exact head it reviewed (`"push": [{"branch", "head"}]` in its hand-off) and becomes `pushing`; it
+  never runs `ttp push`. Without a model, the daemon replays the approved changes in order onto the
+  latest tip of `delivery.push_branch`, adds one version bump and changeset for the batch, runs
+  `delivery.push_checks` once and pushes without force. Then the reviews are `done`. A change that
+  no longer rebases goes back to its review to resolve the conflict; a failed check fails the
+  review and wakes the coordinator. Keys, all under `delivery`: `push_batch_s` (default 900: a
+  batch starts once the oldest approval waited this long; 0 = at once), `push_batch_max`
+  (default 8: start at once with this many; also the most one batch takes), `after_push`
+  (commands in the same form as `push_checks`, for example a deploy) and `after_push_timeout_s`
+  (default 1800). `after_push` runs after each push in a clean worktree at the pushed commit,
+  with `TTP_PUSHED_SHA`, `TTP_PUSHED_VERSION`, `TTP_PUSH_TARGET`, `TTP_PUSH_TASKS`,
+  `TTP_PUSH_BATCH` and `TTP_PROJECT` set. A failed `after_push` alerts the coordinator but never
+  fails the reviews: their change is already on the branch. Off (the default), each review
+  pushes with `ttp push --detach` as above.
 - A plan task starts from what is already known: prior work, the organization's docs and chats
   through the connectors you have, available skills, and public work. Skill plugins it recommends
   can be enabled for the project's workers only (`providers.claude.plugin_dirs`).

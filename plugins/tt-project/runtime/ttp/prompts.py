@@ -11,13 +11,28 @@ from pathlib import Path
 
 from .db import continues_id, load_result
 from .hook import unread_update
-from .project import WORKER_MEMORY_CHARS, Project, code_tasks_may_push
+from .project import WORKER_MEMORY_CHARS, Project, code_tasks_may_push, push_queue_on
 from .worktree import project_venv
 
 
 def _read(p: Project, name: str) -> str:
     f = p.harness / "prompts" / name
     return f.read_text() if f.exists() else ""
+
+
+# kind-review.md's two delivery sections; a review's prompt carries only the one its project uses.
+REVIEW_PUSH_SECTIONS = ("## Pushing a reviewed change", "## Approving into the push queue")
+
+
+def drop_section(text: str, heading: str) -> str:
+    """`text` without the `## ` section whose heading line starts with `heading`."""
+    out, skip = [], False
+    for line in text.splitlines(keepends=True):
+        if line.startswith("## "):
+            skip = line.startswith(heading)
+        if not skip:
+            out.append(line)
+    return "".join(out)
 
 
 def charter_restrictions(charter: str) -> str:
@@ -179,7 +194,7 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
                  "workers, so do not install into it; its editable installs import the project root's code, not "
                  "yours; need other packages? make a venv of your own in the working directory)\n") if venv else ""
     parts = [
-        _read(p, f"kind-{kind}.md"),
+        drop_section(_read(p, f"kind-{kind}.md"), REVIEW_PUSH_SECTIONS[0 if push_queue_on(cfg) else 1]),
         f"# YOUR TASK #{task['id']}: {task['title']}\n"
         f"kind: {kind} · tier: {task['tier']}" + (f" · this run: {run_tier} wake" if wake else "")
         + f" · attempt {int(task['attempts'] or 0) + 1} of "
@@ -192,7 +207,8 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
         f"{delivery.get('review_before_pr', True)}, auto-merge repos={delivery.get('auto_merge_repos') or 'none'}, "
         f"push allowed={delivery.get('push_allowed', True)}"
         + (f", code tasks may land on {delivery['push_branch']} with ttp push=True"
-           if kind == "code" and code_tasks_may_push(cfg) else "") + "\n"
+           if kind == "code" and code_tasks_may_push(cfg) else "")
+        + (", push queue=True" if kind == "review" and push_queue_on(cfg) else "") + "\n"
         f"{history}\n## Spec\n{task['spec'] or task['title']}\n",
         restrictions_block(p)]
     return "\n\n".join(x for x in parts if x.strip())
