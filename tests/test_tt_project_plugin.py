@@ -367,7 +367,7 @@ def test_shipped_text_never_uses_root_relative_harness_bin_paths():
 
 
 def test_worker_prompt_driver_chain_fails_fast_and_shared_watchers_lock():
-    root = Path(__file__).resolve().parents[1] / "plugins" / "tt-project"
+    root = PLUGIN
     worker = (root / "template" / "prompts" / "worker.md").read_text()
     assert "pipefail" in worker and "first non-zero" in worker
     harness = (root / "skills" / "tt-project-harness" / "SKILL.md").read_text()
