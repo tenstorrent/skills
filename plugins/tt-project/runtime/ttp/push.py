@@ -813,7 +813,7 @@ def push(repo: Path, remote: str, branch: str, checks: list[str], rounds: int = 
         say(f"{keep} is on {remote}; rebasing a detached copy, the branch stays as it is")
         _git(repo, "switch", "--detach", "--quiet")
     try:
-        return _rounds(repo, remote, branch, checks, rounds, say, version_bump, timed)
+        return _rounds(repo, remote, branch, checks, rounds, say, version_bump, timed, keep)
     finally:
         if keep:
             if Path(_git(repo, "rev-parse", "--absolute-git-dir").stdout.strip(), "rebase-merge").is_dir():
@@ -945,7 +945,7 @@ def _rebase(repo: Path, tip: str) -> bool:
 
 def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int,
             say: Callable[[str], None], version_bump: dict | None = None,
-            timed: Callable[[float], None] | None = None) -> int:
+            timed: Callable[[float], None] | None = None, keep: str = "") -> int:
     global last_pushed
     upstream = f"{remote}/{branch}"
     for rnd in range(1, rounds + 1):
@@ -963,7 +963,13 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
             return REFUSED
         if not _rebase(repo, tip):
             _git(repo, "rebase", "--abort")
-            say(f"rebase onto {upstream} conflicts; resolve it keeping both sides' intents, then rerun")
+            if keep:
+                # Rebasing the branch by hand would rewrite what the remote already has.
+                say(f"rebase onto {upstream} conflicts; {keep} is already on {remote}, so do not rebase it: "
+                    f"merge {upstream} into it (`git fetch {remote} {branch} && git merge {upstream}`), "
+                    "resolve keeping both sides' intents, commit, then rerun")
+            else:
+                say(f"rebase onto {upstream} conflicts; resolve it keeping both sides' intents, then rerun")
             return CONFLICT
         if version_bump and (r := bump(repo, tip, version_bump, say)):
             return r

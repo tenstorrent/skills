@@ -11110,6 +11110,23 @@ def test_push_never_rewrites_a_published_task_branch_and_rebases_an_unpublished_
         "proj", "ttp/t50-exp"]
 
 
+def test_push_conflict_on_a_published_branch_says_merge_not_rebase(env, monkeypatch, capsys):
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    monkeypatch.setenv("TTP_TASK", "52")
+    _git_out(repo, "checkout", "-q", "-b", "ttp/t52-clash")
+    _commit(repo, "clash.txt", "mine\n")
+    assert _ttp("push", "--own") == 0
+    mine = _git_out(repo, "rev-parse", "HEAD")
+    _commit(other, "clash.txt", "theirs\n")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    capsys.readouterr()
+    assert _ttp("push") == 3
+    err = capsys.readouterr().err
+    assert "do not rebase it" in err and "git merge origin/proj" in err, err
+    assert _git_out(repo, "symbolic-ref", "--short", "HEAD") == "ttp/t52-clash"
+    assert _git_out(repo, "rev-parse", "HEAD") == mine
+
+
 def test_push_own_without_checks_publishes_docs_only_and_refuses_code(env, monkeypatch, capsys):
     p, repo, origin, other = _push_setup(env, monkeypatch, [])
     p.set_config("delivery.push_checks", [])
