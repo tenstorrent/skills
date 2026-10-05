@@ -16843,6 +16843,7 @@ DURABLE_EXEMPT = {
     ("daemon.py", 'os.fdopen(fd, "w")'): "a private temporary MCP config, removed when the run ends",
     ("daemon.py", '"system.md"'): "a run's input, read at once; a reboot ends the run and its task is requeued",
     ("daemon.py", '"prompt.md"'): "a run's input, read at once; a reboot ends the run and its task is requeued",
+    ("daemon.py", '"input.jsonl"'): "a run's input, read at once; a reboot ends the run and its task is requeued",
     ("runner.py", '"STOP"'): "a signal to a live run",
     ("runner.py", '"child.pid"'): "names a process, which a reboot ends",
     ("runner.py", "open(out_path"): "the agent's output stream",
