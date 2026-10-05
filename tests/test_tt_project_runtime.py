@@ -800,7 +800,7 @@ def test_effort_falls_back_to_rules_and_leaves_other_tasks_alone(env, monkeypatc
     "whatever you think is best", "No need to ask for this", "don’t ask me about restarts",
     "Stop asking for tickets", "don't get blocked on things you can fix", "always unblock efficiently",
     "you don't need my approval for that"])
-def test_unblock_handback_phrases_match(text):
+def test_unblock_handback_phrases_match(env, text):
     from ttp import unblock
     assert unblock.handback(text)
 
@@ -808,12 +808,12 @@ def test_unblock_handback_phrases_match(text):
 @pytest.mark.parametrize("text", [
     "yes, approve the merge", "no, keep it as it is", "wait until the job ends", "I'll top up the account",
     "the decision is no", "ask the other team first"])
-def test_unblock_ordinary_answers_are_not_handbacks(text):
+def test_unblock_ordinary_answers_are_not_handbacks(env, text):
     from ttp import unblock
     assert unblock.handback(text) is None
 
 
-def test_unblock_answer_part_splits_a_message_by_the_asks_it_names():
+def test_unblock_answer_part_splits_a_message_by_the_asks_it_names(env):
     from ttp import unblock
     text = "#7: yes, merge it. #9, your call. See task #8 too."
     assert unblock.answer_part(text, 7, {7, 8, 9}).startswith("#7: yes") and "your call" not in \
@@ -7429,7 +7429,7 @@ def test_a_plain_hand_off_digest_does_not_grow(env, words, before):
     assert len(new) <= before * 1.05
 
 
-def test_clip_cuts_at_a_word_and_marks_the_cut():
+def test_clip_cuts_at_a_word_and_marks_the_cut(env):
     from ttp.coordinator import clip
     assert clip("short\n  text", 50) == "short text"
     assert clip(None, 10) == ""
@@ -8326,7 +8326,7 @@ def test_a_logged_out_alert_from_before_the_breaker_opens_it(env):
     ("cursor", "Commands:\n  status|whoami   Show auth status", 0, "Logged in", True),
     ("cursor", "Commands:\n  login", 0, "", None),
 ])
-def test_login_checks_ask_the_cli_status_without_a_model(monkeypatch, name, help_text, rc, out, want):
+def test_login_checks_ask_the_cli_status_without_a_model(env, monkeypatch, name, help_text, rc, out, want):
     from ttp.providers import base, claude, codex, cursor, get_provider
     prov = get_provider(name)
     monkeypatch.setattr(type(prov), "binary", lambda self: "/bin/agent-cli")
@@ -9703,7 +9703,7 @@ def test_push_refuses_when_the_remote_is_unreachable(env, monkeypatch, capsys):
     assert _git_out(origin, "rev-parse", "proj") == before
 
 
-def test_push_checks_accept_the_forms_config_set_sends():
+def test_push_checks_accept_the_forms_config_set_sends(env):
     sys.path.insert(0, str(RUNTIME))
     try:
         from ttp.push import check_list
@@ -10375,7 +10375,7 @@ def test_version_bump_keeps_a_changeset_the_change_brings_and_skips_changes_outs
     assert _git_out(repo, "status", "--porcelain") == ""
 
 
-def test_version_bump_config_is_validated():
+def test_version_bump_config_is_validated(env):
     from ttp import push
     from ttp.project import config_problems
     assert push.bump_of(None) is None and push.bump_of({}) is None
@@ -12136,7 +12136,7 @@ def test_a_login_that_creates_the_missing_credentials_file_ends_the_pause(env, m
     assert d._provider_pause("fake")
 
 
-def test_cursor_credential_file_follows_xdg_config_home(monkeypatch, tmp_path):
+def test_cursor_credential_file_follows_xdg_config_home(env, monkeypatch, tmp_path):
     from ttp.providers import get_provider
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     cursor = get_provider("cursor")
@@ -15464,7 +15464,7 @@ def test_task_add_rejects_bad_start_values(env, action, why):
     assert not p.db.one("SELECT id FROM tasks WHERE title='deferred'")
 
 
-def test_actions_schema_validates_start_after_and_start_when():
+def test_actions_schema_validates_start_after_and_start_when(env):
     jsonschema = pytest.importorskip("jsonschema")
     sys.path.insert(0, str(RUNTIME))
     try:
@@ -16097,7 +16097,7 @@ def test_config_set_accepts_the_push_queue_keys_and_rejects_a_sentence_after_pus
     ("after_push", [[], ["true", "./deploy.sh x"], "make deploy"], [["Deploy everything now"]]),
     ("after_push_timeout_s", [1, 1800], [0, -5, "long"]),
 ])
-def test_config_problems_check_each_push_queue_key(key, good, bad):
+def test_config_problems_check_each_push_queue_key(env, key, good, bad):
     from ttp.project import config_problems
     for v in good:
         assert config_problems({"delivery": {key: v}}) == [], (key, v)
@@ -16131,7 +16131,7 @@ def test_config_problems_flag_unknown_keys_and_bad_checks(env, capsys):
     assert "project.json: unknown key budget.made_up_knob" in capsys.readouterr().out
 
 
-def test_every_key_the_code_reads_is_known():
+def test_every_key_the_code_reads_is_known(env):
     from ttp.coordinator import USER_SETTABLE
     from ttp.project import unknown_key_hint
     extra = ["budget.estimate_weights", "budget.hourly_waste_usd", "budget.hourly_coordinator_usd",
@@ -16258,7 +16258,7 @@ def test_check_objects_are_validated_kept_in_config_and_plain_strings_stay_stric
     assert p.config()["delivery"]["push_checks"] == ["true", COND]
 
 
-def test_if_exists_with_a_trailing_slash_or_leading_dot_slash_still_matches(tmp_path):
+def test_if_exists_with_a_trailing_slash_or_leading_dot_slash_still_matches(env, tmp_path):
     from ttp import push
     import subprocess
     repo = tmp_path / "r"
@@ -16433,7 +16433,7 @@ def test_the_push_never_reads_the_recorded_passes_of_ttp_checks():
         assert "`ttp checks`" in text and "test -e <marker>" in text and "`pytest -k`" in text, name
 
 
-def test_status_does_not_warn_about_a_check_that_does_not_apply_on_the_branch(tmp_path):
+def test_status_does_not_warn_about_a_check_that_does_not_apply_on_the_branch(env, tmp_path):
     from ttp import push
     repo = tmp_path / "r"
     repo.mkdir()
@@ -17669,7 +17669,7 @@ def test_pr_watch_puts_an_unapproved_ready_pr_back_in_draft(env, tmp_path, monke
     assert undos() == [f"pr ready {new} --undo"] and json.loads(prs.read_text())[new] is True
 
 
-def test_setup_warns_when_installed_copy_is_older_than_checkout(tmp_path, monkeypatch, capsys):
+def test_setup_warns_when_installed_copy_is_older_than_checkout(env, tmp_path, monkeypatch, capsys):
     from ttp import cli, project
     home = tmp_path / "home"
     installed = home / "lib" / "0.0.1" / "runtime"
@@ -18540,7 +18540,7 @@ def test_a_failed_reviews_fix_takes_only_the_real_findings(env):
                   "proposed follow-up: retune later [start_after: 3600]": "queued"}
 
 
-def test_batch_inherited_takes_only_the_named_fd(tmp_path, monkeypatch):
+def test_batch_inherited_takes_only_the_named_fd(env, tmp_path, monkeypatch):
     """batch._inherited trusts only the descriptor in TTP_BATCH_LOCK_FD: a caller's own descriptor on
     the same lock file (batch run in-process) is never picked up or closed."""
     from ttp import batch
