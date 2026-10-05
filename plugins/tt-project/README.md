@@ -112,7 +112,8 @@ and preferences you add later become part of the project's charter and memory.
   cap count that day. Empty (the default) keeps the rolling 24 hours. Weekly caps stay rolling.
 - These keys (and `budget.push_spend_to`) are account-level: `ttp config --account KEY VALUE` writes them to
   `~/.tt-project/settings.json` (mode 0600), which every project on the machine reads under its own
-  `project.json` (a project may still override a key). `ttp config --account KEY` reads one; an
+  `project.json` (a project may still override a key, except `budget.push_spend_to`, which is read
+  from the account settings only). `ttp config --account KEY` reads one; an
   empty value removes it. `ttp spend-today [--json]` prints this machine's tt-project spend for the
   budget day by provider and account hash; it is what other machines ask for.
 - Work backs off in steps as spend rises, pauses at the cap, and tells you how to raise it.

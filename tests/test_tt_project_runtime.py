@@ -20501,7 +20501,8 @@ def test_a_pushed_spend_record_is_checked_and_kept_per_machine_and_window(env, m
                         (bad({"windows": [w0] * (gcap.MAX_WINDOWS + 1)}), "lap"),
                         (bad(win={"projects": ["x"] * (gcap.MAX_PROJECTS + 1)}), "lap"),
                         (bad(win={"rows": [{**row, "key": "not-a-key"}]}), "lap"),
-                        (b"{not json", "lap"), (b" " * (gcap.RECEIVE_BYTES + 1), "lap")]:
+                        (b"{not json", "lap"), (b"[" * 60000, "lap"),                   # too deep
+                        (b" " * (gcap.RECEIVE_BYTES + 1), "lap")]:
         ack, rc = gcap.receive(stream, via, now)
         assert rc == 2 and "error" in ack, (stream[:80], ack)
     assert gcap.pushed_path().read_bytes() == before
@@ -20662,6 +20663,24 @@ def _box2(env, monkeypatch, day_start):
     monkeypatch.setattr(gcap, "account_of", lambda prov: "acct-a")
     monkeypatch.setattr(gcap.threading, "Thread", _InlineThread)
     return p, p.config()["budget"], clock, asked, up
+
+
+def test_refresh_async_with_no_global_cap_never_uses_ssh(env, monkeypatch):
+    # global_daily_usd 0 turns the global cap off: no asking, no pushing.
+    make(env)
+    from ttp import globalcap as gcap
+    from ttp import upstream
+    calls = []
+    monkeypatch.setattr(upstream, "ssh_pipe", lambda *a, **k: calls.append(a) or (b"", b""))
+    monkeypatch.setattr(gcap, "targets", lambda: ["box"])
+    monkeypatch.setattr(gcap, "push_targets", lambda: ["box"])
+    now = time.time()
+    for i in range(5):
+        gcap.refresh_async({"global_daily_usd": 0}, now + 3 * i)
+    t = gcap._THREAD.get("t")
+    if t:
+        t.join(5)
+    assert calls == []
 
 
 @pytest.mark.parametrize("via", ["refresh", "refresh_async"])

@@ -475,7 +475,7 @@ def receive(stream: bytes, via: str, now: float | None = None) -> tuple[dict, in
         return {"error": "the record is too long; nothing was kept"}, 2
     try:
         got = _valid_push(json.loads(stream), now)
-    except ValueError:
+    except (ValueError, RecursionError):       # RecursionError: a deeply nested record
         got = None
     if got is None:
         return {"error": "not a spend record; nothing was kept"}, 2
