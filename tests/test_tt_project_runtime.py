@@ -4307,6 +4307,48 @@ def test_task_add_rejects_a_near_duplicate_naming_the_task(env):
     assert p.db.one("SELECT id FROM tasks WHERE title=?", (near["title"],))
 
 
+def test_actions_schema_lists_every_action_key_apply_reads():
+    # A provider that enforces the schema strictly drops a key it does not list, so every key apply()
+    # (or a helper it hands the action to) reads must be a property of ACTIONS_SCHEMA's action items.
+    import ast
+    from ttp import coordinator as coord
+    # Keys read on an action under a name other than its schema property, each with the reason. None yet.
+    read_under_another_name: dict[str, str] = {}
+    trees = {m: ast.parse((RUNTIME / "ttp" / f"{m}.py").read_text()) for m in ("coordinator", "ends")}
+    funcs = {(m, n.name): n for m, t in trees.items() for n in t.body if isinstance(n, ast.FunctionDef)}
+
+    def keys(fn: ast.FunctionDef, var: str, mod: str, seen: set) -> set[str]:
+        if (mod, fn.name) in seen:
+            return set()
+        seen.add((mod, fn.name))
+        out = set()
+        for n in ast.walk(fn):
+            if isinstance(n, ast.Subscript) and isinstance(n.value, ast.Name) and n.value.id == var \
+                    and isinstance(n.slice, ast.Constant) and isinstance(n.slice.value, str):
+                out.add(n.slice.value)
+            if not isinstance(n, ast.Call):
+                continue
+            f = n.func
+            if isinstance(f, ast.Attribute) and f.attr == "get" and isinstance(f.value, ast.Name) \
+                    and f.value.id == var and n.args and isinstance(n.args[0], ast.Constant):
+                out.add(n.args[0].value)
+            # Follow the action into helpers of these modules: `_start_args(a, ...)`, `ends.from_action(a)`.
+            for i, arg in enumerate(n.args):
+                if not (isinstance(arg, ast.Name) and arg.id == var):
+                    continue
+                target = (mod, f.id) if isinstance(f, ast.Name) else \
+                    (f.value.id, f.attr) if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) else None
+                if target in funcs:
+                    helper = funcs[target]
+                    out |= keys(helper, helper.args.args[i].arg, target[0], seen)
+        return out
+
+    read = keys(funcs[("coordinator", "apply")], "a", "coordinator", set())
+    assert {"force", "spec", "start_after", "until_probe"} <= read  # the scan reaches apply() and its helpers
+    listed = set(coord.ACTIONS_SCHEMA["properties"]["actions"]["items"]["properties"])
+    assert sorted(read - listed - set(read_under_another_name)) == []
+
+
 def test_task_add_near_duplicate_skips_the_continued_task_and_old_done_work(env):
     p = make(env)
     from ttp import coordinator as coord

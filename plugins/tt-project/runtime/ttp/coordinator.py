@@ -58,7 +58,7 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "every": {"type": "string"}, "at": {"type": "string"}, "enabled": {"type": "boolean"},
             "key": {"type": "string"}, "value": {"type": "string"},
             "blocking": {"type": "string", "enum": list(BLOCKING_REASONS)}, "recommendation": {"type": "string"},
-            "least_disruptive": {"type": "string"},
+            "least_disruptive": {"type": "string"}, "reversible": {"type": "boolean"}, "force": {"type": "boolean"},
             "resources": {"type": "array", "items": {"type": "string"}}, "exclusive": {"type": "boolean"},
             "needs_device": {"type": "boolean"},
             "continues": {"type": "integer"}, "resource": {"type": "string"}, "paused": {"type": "boolean"},
