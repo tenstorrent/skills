@@ -7996,6 +7996,23 @@ def test_push_own_publishes_the_tasks_own_branch_as_it_is_and_never_a_shared_one
     assert _ttp("push", "--own") == 2
 
 
+def test_push_own_without_checks_publishes_docs_only_and_refuses_code(env, monkeypatch, capsys):
+    p, repo, origin, other = _push_setup(env, monkeypatch, [])
+    p.set_config("delivery.push_checks", [])
+    _git_out(repo, "checkout", "-q", "-b", "ttp/t8-exp")
+    monkeypatch.setenv("TTP_TASK", "8")
+    _commit(repo, "notes.md", "docs\n")
+    assert _ttp("push", "--own") == 0
+    assert _git_out(origin, "rev-parse", "ttp/t8-exp") == _git_out(repo, "rev-parse", "HEAD")
+    docs = _git_out(origin, "rev-parse", "ttp/t8-exp")
+    _commit(repo, "tool.py", "x = 1\n")
+    capsys.readouterr()
+    assert _ttp("push", "--own") == 2
+    err = capsys.readouterr().err
+    assert "no checks configured" in err and "tool.py" in err
+    assert _git_out(origin, "rev-parse", "ttp/t8-exp") == docs
+
+
 def test_push_own_detached_publishes_the_own_branch_and_reports_it(env, monkeypatch, capsys):
     p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
     _git_out(repo, "checkout", "-q", "-b", "ttp/t7-exp")

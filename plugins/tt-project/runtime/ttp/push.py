@@ -547,10 +547,12 @@ def push(repo: Path, remote: str, branch: str, checks: list[str], rounds: int = 
 
 def publish(repo: Path, remote: str, branch: str, checks: list[str],
             say: Callable[[str], None] = lambda m: print(f"ttp push: {m}", file=sys.stderr),
-            hold: Callable[[], Any] | None = None, timed: Callable[[float], None] | None = None) -> int:
+            hold: Callable[[], Any] | None = None, timed: Callable[[float], None] | None = None,
+            base: str | None = None) -> int:
     """`ttp push --own`: run `checks` on HEAD as it is and push it to remote/branch, the task's own
     branch. No rebase and no version bump, so the pushed commit is the one reviewed; without force,
-    so the remote takes only a fast-forward of what it has."""
+    so the remote takes only a fast-forward of what it has. Without checks, as for `ttp push`, only
+    a docs-only change since `base` (the project's push target) may go."""
     repo = Path(_git(repo, "rev-parse", "--show-toplevel").stdout.strip() or repo)
     if _git(repo, "status", "--porcelain", "--untracked-files=no").stdout.strip():
         say("uncommitted changes; commit first")
@@ -558,6 +560,11 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
     why = refusal(repo, remote, branch)
     if why:
         say(why)
+        return REFUSED
+    if not checks and (code := code_paths(repo, base) if base else ["(no push target to compare with)"]):
+        more = f" and {len(code) - 3} more" if len(code) > 3 else ""
+        say(f"no checks configured, and this change touches more than docs ({', '.join(code[:3])}{more}): "
+            + NO_CHECKS)
         return REFUSED
     lock = hold() if hold else None
     if hold and lock is None:
@@ -654,8 +661,14 @@ def run(p: Project, repo: Path, own: bool = False) -> int:
         print(f"ttp push: {e}", file=sys.stderr)
         return REFUSED
     if own:
+        base = None
+        if not checks:   # the docs-only test needs the shared branch this work leaves from
+            try:
+                base = _fetch(repo, *target(p, repo)) or None
+            except ValueError:
+                pass
         return publish(repo, remote, branch, checks, hold=lambda: take(p, remote, branch, wait_s),
-                       timed=lambda s: record_check_s(p, s))
+                       timed=lambda s: record_check_s(p, s), base=base)
     return push(repo, remote, branch, checks, rounds, hold=lambda: take(p, remote, branch, wait_s),
                 version_bump=version_bump, timed=lambda s: record_check_s(p, s))
 
