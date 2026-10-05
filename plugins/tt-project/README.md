@@ -91,7 +91,15 @@ and preferences you add later become part of the project's charter and memory.
   --tags tt-project`). Other machines are asked over ssh (BatchMode, no prompts) with
   `ttp spend-today`, at most every 10 minutes; their answers are cached in
   `~/.tt-project/global-spend.json`. A machine not heard from for 30 minutes still counts with its
-  last answer for the same day and is shown as stale. If the total cannot be worked out at all, the
+  last answer for the same day and is shown as stale. A machine that can reach another but not the
+  other way round (a laptop that can reach a server, but not the server the laptop) pushes its own
+  `spend-today` there instead: with the global cap on, each machine sends it over ssh to
+  `ttp spend-today --receive` on every machine it asks, every 10 minutes (every 6 hours to a machine
+  that says it already asks this one; less often after failures), in the background. Pushed answers
+  are kept in `~/.tt-project/global-spend-pushed.json` and count like asked ones, stale after 30
+  minutes the same way; a machine both asked and pushing counts once, with its newer answer.
+  `budget.push_spend_to` (account-level) names the machines to push to instead, or `"none"` turns
+  pushing off. If the total cannot be worked out at all, the
   per-project caps stay in charge. Spend outside tt-project (your own sessions) is not seen; a
   source can be added in code with `globalcap.add_other_source(fn)`, where
   `fn(provider, account, start, end)` returns `(usd, label)`.
@@ -99,7 +107,7 @@ and preferences you add later become part of the project's charter and memory.
   in `budget.timezone` (an IANA name such as `Europe/Berlin`, default `UTC`; the host's own zone
   plays no part), 23 or 25 hours long across a daylight-saving change. The daily cap and the global
   cap count that day. Empty (the default) keeps the rolling 24 hours. Weekly caps stay rolling.
-- These three keys are account-level: `ttp config --account KEY VALUE` writes them to
+- These keys (and `budget.push_spend_to`) are account-level: `ttp config --account KEY VALUE` writes them to
   `~/.tt-project/settings.json` (mode 0600), which every project on the machine reads under its own
   `project.json` (a project may still override a key). `ttp config --account KEY` reads one; an
   empty value removes it. `ttp spend-today [--json]` prints this machine's tt-project spend for the

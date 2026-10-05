@@ -20295,6 +20295,170 @@ def test_the_rolling_global_window_asks_each_machine_once_per_refresh_and_keeps_
     assert rolling and t["stale"] == ["box2"] and t["usd"] == 0, t
 
 
+def _spend_record(host, wins, sent=None):
+    """A record as `globalcap.push` sends it: wins is [(start, end, usd on acct-a)]."""
+    from ttp import globalcap as gcap
+    key = gcap.account_key("claude", "acct-a")
+    return (json.dumps({"v": 1, "host": host, "sent": sent or time.time(), "windows": [
+        {"start": s, "end": e, "projects": ["far"], "rows": [{"provider": "claude", "key": key, "usd": u}]}
+        for s, e, u in wins]}) + "\n").encode()
+
+
+def test_a_pushed_spend_record_is_checked_and_kept_per_machine_and_window(env, monkeypatch, capsys):
+    # A machine this one cannot reach pushes its `spend-today` here. Only a whole, well-formed record
+    # within the caps is kept; anything else keeps nothing and exits 2.
+    make(env)
+    from ttp import cli
+    from ttp import globalcap as gcap
+    now = time.time()
+    day = (now - 3600, now + 3600)
+    ack, rc = gcap.receive(_spend_record("laptop", [(*day, 12.5), (now - 2 * 86400, now - 86400, 9.0)]), "lap", now)
+    assert rc == 0 and ack == {"accepted": 1, "pulls": False}, ack     # a day already over is dropped
+    m = gcap.load_pushed(now)["laptop"]
+    assert m["via"] == "lap" and m["ts"] == now and list(m["windows"]) == [gcap._key(*day)], m
+    assert m["windows"][gcap._key(*day)]["rows"][0]["usd"] == 12.5
+    before = gcap.pushed_path().read_bytes()
+    rec = json.loads(_spend_record("laptop", [(*day, 1.0)]))
+
+    w0 = rec["windows"][0]
+
+    def bad(top=None, win=None):
+        r = {**rec, **(top or {}), "windows": [{**w0, **(win or {})}]} if "windows" not in (top or {}) else {**rec, **top}
+        return (json.dumps(r) + "\n").encode()
+    row = w0["rows"][0]
+    for stream, via in [(bad(), "not an alias!"), (bad({"host": "testhost"}), "lap"),       # this machine's own
+                        (bad({"host": "a b"}), "lap"), (bad({"v": 2}), "lap"),
+                        (bad(win={"rows": [{**row, "usd": -1.0}]}), "lap"),
+                        (bad(win={"rows": [{**row, "usd": 1e300 * 10}]}), "lap"),            # inf
+                        (bad(win={"start": "0"}), "lap"), (bad(win={"end": day[0]}), "lap"),
+                        (bad({"windows": [w0] * (gcap.MAX_WINDOWS + 1)}), "lap"),
+                        (bad(win={"projects": ["x"] * (gcap.MAX_PROJECTS + 1)}), "lap"),
+                        (bad(win={"rows": [{**row, "key": "not-a-key"}]}), "lap"),
+                        (b"{not json", "lap"), (b" " * (gcap.RECEIVE_BYTES + 1), "lap")]:
+        ack, rc = gcap.receive(stream, via, now)
+        assert rc == 2 and "error" in ack, (stream[:80], ack)
+    assert gcap.pushed_path().read_bytes() == before
+    # A newer push replaces that window's answer; through the command, one JSON ack line.
+    monkeypatch.setattr(sys, "stdin", type("S", (), {"buffer": io.BytesIO(_spend_record("laptop", [(*day, 20.0)]))})())
+    with pytest.raises(SystemExit) as e:
+        cli.main(["spend-today", "--receive", "--via", "lap"])
+    assert e.value.code == 0 and json.loads(capsys.readouterr().out)["accepted"] == 1
+    assert gcap.load_pushed()["laptop"]["windows"][gcap._key(*day)]["rows"][0]["usd"] == 20.0
+    # A machine silent for PUSHED_KEEP_S is forgotten.
+    assert gcap.load_pushed(time.time() + gcap.PUSHED_KEEP_S + 1) == {}
+
+
+def test_a_pushed_number_counts_in_the_global_total_and_goes_stale(env, monkeypatch):
+    p = make(env)
+    from ttp import globalcap as gcap
+    now = time.time()
+    start, end = now - 3600, now + 3600
+    p.db.spend("claude", 1.0, "task:1", account="acct-a")
+    assert gcap.total(p.db, "claude", start, end, now, account="acct-a")["usd"] == 1.0   # nothing pushed: nothing invented
+    gcap.receive(_spend_record("laptop", [(start, end, 40.0)]), "lap", now)
+    t = gcap.total(p.db, "claude", start, end, now + 60, account="acct-a")
+    assert t["usd"] == 41.0 and t["machines"] == ["lap"] and t["stale"] == [] and t["remote_projects"] == 1, t
+    # Past STALE_S: a budget day keeps counting the last pushed number, shown stale.
+    later = now + gcap.STALE_S + 1
+    t = gcap.total(p.db, "claude", start, end, later, account="acct-a")
+    assert t["usd"] == 41.0 and t["stale"] == ["lap"] and "(1 stale)" in t["includes"], t
+    # The rolling 24 h counts it only while it is fresh, like a pulled answer.
+    rs, re_ = now - 86400, now + 86400
+    gcap.receive(_spend_record("laptop", [(rs, re_, 7.0)]), "lap", now)
+    assert gcap.total(p.db, "claude", rs, re_, now + 60, account="acct-a", rolling=True)["usd"] == 8.0
+    t = gcap.total(p.db, "claude", rs, re_, later, account="acct-a", rolling=True)
+    assert t["usd"] == 1.0 and t["stale"] == ["lap"], t
+    # Another day has no answer from it yet: stale, not counted.
+    t = gcap.total(p.db, "claude", end, end + 86400, now + 60, account="acct-a")
+    assert t["usd"] == 0 and t["stale"] == ["lap"], t
+
+
+def test_a_machine_both_asked_and_pushing_counts_once_with_its_freshest_answer(env, monkeypatch):
+    p = make(env)
+    from ttp import globalcap as gcap
+    from ttp.project import register
+    now = time.time()
+    start, end = now - 3600, now + 3600
+    register("far", {"host": "box2", "dir": "/srv/far"})
+    key = gcap.account_key("claude", "acct-a")
+    monkeypatch.setattr(gcap, "fetch", lambda t, s, e: {"host": "box2", "projects": ["far"],
+                                                        "rows": [{"provider": "claude", "key": key, "usd": 50.0}]})
+    gcap.refresh(start, end, now)
+    gcap.receive(_spend_record("box2", [(start, end, 70.0)]), "b2", now + 60)    # pushed later: newer
+    t = gcap.total(p.db, "claude", start, end, now + 120, account="acct-a")
+    assert t["usd"] == 70.0 and t["machines"] == ["box2"] and t["stale"] == [], t
+    gcap.refresh(start, end, now + gcap.REFRESH_S + 1)                          # asked later: newer
+    t = gcap.total(p.db, "claude", start, end, now + gcap.REFRESH_S + 2, account="acct-a")
+    assert t["usd"] == 50.0 and t["machines"] == ["box2"], t
+    # Never answered over ssh (it cannot be reached), but pushing: matched by its alias, fresh.
+    monkeypatch.setattr(gcap, "fetch", lambda *a: (_ for _ in ()).throw(RuntimeError("ssh: no route")))
+    gcap.cache_path().unlink()
+    gcap.refresh(start, end, now)
+    t = gcap.total(p.db, "claude", start, end, now + 120, account="acct-a")
+    assert t["usd"] == 70.0 and t["machines"] == ["box2"] and t["stale"] == [], t
+    # The receiver tells a pusher it already reads that machine itself.
+    gcap.cache_path().unlink()
+    monkeypatch.setattr(gcap, "fetch", lambda t, s, e: {"host": "box2", "projects": [], "rows": []})
+    gcap.refresh(start, end, now)
+    assert gcap.receive(_spend_record("box2", [(start, end, 1.0)]), "b2", now + 1)[0]["pulls"] is True
+
+
+def test_this_machine_pushes_its_spend_in_the_background_and_a_failed_push_never_blocks(env, monkeypatch):
+    p = make(env)
+    from ttp import budget as bud
+    from ttp import globalcap as gcap
+    from ttp import upstream
+    from ttp.project import register, set_account_setting
+    register("far", {"host": "server", "dir": "/srv/far"})
+    p.set_config("budget.global_daily_usd", 100)
+    p.set_config("budget.day_start", "08:00")
+    p.db.spend("claude", 3.0, "task:1", account="acct-a")
+    b = p.config()["budget"]
+    monkeypatch.setattr(gcap, "fetch", lambda *a: (_ for _ in ()).throw(RuntimeError("ssh: no route")))
+    calls = []
+
+    def pipe(target, args, data, timeout):        # the server: its own name, its own receive
+        calls.append((target, args))
+        monkeypatch.setenv("TTP_HOST", "server")
+        try:
+            ack, rc = gcap.receive(data, args.split()[-1])
+        finally:
+            monkeypatch.setenv("TTP_HOST", "testhost")
+        return ((json.dumps(ack) + "\n").encode(), "") if rc == 0 else (None, f"exit {rc}")
+    monkeypatch.setattr(upstream, "ssh_pipe", pipe)
+    now = time.time()
+    assert gcap.push(b, now) == 1
+    assert calls == [("server", "spend-today --receive --via testhost")], calls
+    got = gcap.load_pushed()["testhost"]["windows"]
+    assert gcap._key(*gcap.window(b, now)[:2]) in got and "rolling" in got, got   # its day and the rolling 24 h
+    assert got["rolling"]["rows"][0]["usd"] == 3.0
+    assert gcap.push(b, now + 60) == 0 and len(calls) == 1, "pushed again before REFRESH_S"
+    # A push that fails backs off and is retried later; it never raises.
+    monkeypatch.setattr(upstream, "ssh_pipe", lambda *a: (None, "exit 255: no route"))
+    t1 = now + gcap.REFRESH_S
+    assert gcap.push(b, t1) == 0
+    st = gcap._json(gcap.push_state_path())["targets"]["server"]
+    assert st["ok"] is False and st["fails"] == 1 and st["next"] == t1 + gcap.PUSH_BACKOFF_S[0], st
+    assert not gcap._push_due(t1 + 60)
+    # `none` turns pushing off; a list names the targets.
+    set_account_setting("budget.push_spend_to", "none")
+    assert gcap.push_targets() == []
+    set_account_setting("budget.push_spend_to", ["other"])
+    assert gcap.push_targets() == ["other"]
+    assert gcap.setting_problems({"push_spend_to": "everywhere"})
+    set_account_setting("budget.push_spend_to", None)
+    # A hung push runs in the background: the tick goes on and the gate is worked out meanwhile.
+    gate = threading.Event()
+    monkeypatch.setattr(upstream, "ssh_pipe", lambda *a: gate.wait(30) and (None, "late"))
+    gcap.push_state_path().unlink()
+    t0 = time.monotonic()
+    gcap.refresh_async(b, time.time())
+    g = bud.evaluate(p.db, p.config(), "claude", [], time.time())
+    assert time.monotonic() - t0 < 5 and "global_today" in g.numbers, g.numbers
+    gate.set()
+    gcap._THREAD["t"].join(10)
+
+
 class _InlineThread:
     """A threading.Thread that runs its target at once, so a background refresh happens in order."""
     def __init__(self, target, daemon):
