@@ -1711,6 +1711,153 @@ def test_web_app_elements_exist_in_the_page():
     assert not [i for i in ids if f'id="{i}"' not in html]
 
 
+RENDER_HARNESS = r"""
+const R = require(process.argv[1]);
+const ops = [];
+let writes = 0;
+class El {
+  constructor(tag) { this.tagName = tag; this.children = []; this.parent = null; this._inner = ""; this.textContent = ""; }
+  set innerHTML(h) { writes++; this.children.forEach((c) => { c.parent = null; }); this.children = []; this._inner = h; }
+  get innerHTML() { return this._inner; }
+  contains(n) { for (; n; n = n.parent) if (n === this) return true; return false; }
+  get firstElementChild() { return this.children[0] || null; }
+  get nextElementSibling() { const s = this.parent ? this.parent.children : []; return s[s.indexOf(this) + 1] || null; }
+  add(c) { c.parent = this; this.children.push(c); return c; }
+  removeChild(c) { this.children.splice(this.children.indexOf(c), 1); c.parent = null; ops.push(["remove", c._ttpKey]); }
+  replaceChild(n, c) { this.children[this.children.indexOf(c)] = n; n.parent = this; c.parent = null; ops.push(["replace", n._ttpKey]); }
+  insertBefore(n, ref) {
+    ops.push([n.parent ? "move" : "insert", n._ttpKey]);
+    if (n.parent) n.parent.children.splice(n.parent.children.indexOf(n), 1);
+    const i = ref ? this.children.indexOf(ref) : this.children.length;
+    this.children.splice(i, 0, n); n.parent = this;
+  }
+}
+R.make = (html) => { const n = new El("DIV"); n.html = html; return n; };
+const none = { sel: [], active: null };
+const rows = (o) => Object.keys(o).map((k) => ({ key: k, html: o[k] }));
+const keys = (el) => el.children.map((c) => c._ttpKey);
+const out = {};
+
+// A section: unchanged HTML is not written again.
+const sec = new El("DIV");
+out.first = R.patch(sec, "<p>a</p>", none);
+out.again = R.patch(sec, "<p>a</p>", none);
+out.writes = writes;
+
+// Rows: unchanged data writes nothing; one changed row replaces only that row.
+const list = new El("DIV");
+R.rows(list, rows({ 1: "a", 2: "b", 3: "c" }), none);
+const [n1, n2, n3] = list.children;
+ops.length = 0;
+out.unchanged = R.rows(list, rows({ 1: "a", 2: "b", 3: "c" }), none);
+out.unchanged_ops = ops.slice();
+out.changed = R.rows(list, rows({ 1: "a", 2: "B", 3: "c" }), none);
+out.kept_others = list.children[0] === n1 && list.children[2] === n3 && list.children[1] !== n2;
+out.changed_html = list.children[1].html;
+
+// A selection inside row 2: it is neither replaced nor moved, a new row still appears, and the
+// held update lands once the selection clears.
+const held2 = list.children[1], txt = held2.add(new El("#text"));
+const sel = { sel: [txt, txt], active: null };
+ops.length = 0;
+out.sel_changed = R.rows(list, rows({ 0: "new", 1: "a", 2: "BB", 3: "c" }), sel);
+out.sel_keys = keys(list);
+out.sel_kept = list.children[2] === held2;
+out.sel_ops = ops.slice();
+out.sel_pending = R.pending();
+R.flush(sel);
+out.sel_still = list.children[2] === held2;
+R.flush(none);
+out.after_release = list.children[2] !== held2 && list.children[2].html === "BB";
+out.after_pending = R.pending();
+
+// A held row whose data is gone stays until released; other rows still reorder.
+const held3 = list.children[3], t3 = held3.add(new El("#text"));
+const reordered = [{ key: "0", html: "new" }, { key: "2", html: "BB" }, { key: "1", html: "a" }];
+R.rows(list, reordered, { sel: [t3, t3], active: null });
+out.gone_kept = list.children.indexOf(held3) >= 0;
+out.reorder_held = keys(list);
+R.flush(none);
+out.reorder_after = keys(list);
+
+// A reorder around a held row moves the others, never the held one; held rows that would swap wait.
+const ord = new El("DIV"), seq = (...ks) => ks.map((k) => ({ key: k, html: k }));
+R.rows(ord, seq("a", "b", "c"), none);
+const hb = ord.children[1], tb = hb.add(new El("#text"));
+ops.length = 0;
+R.rows(ord, seq("b", "c", "a"), { sel: [tb, tb], active: null });
+out.around = keys(ord);
+out.around_moved = ops.filter((o) => o[0] === "move").map((o) => o[1]);
+const ha = ord.children[2], ta = ha.add(new El("#text"));
+R.rows(ord, seq("a", "b", "c"), { sel: [tb, ta], active: null });
+out.swap_waits = keys(ord);
+R.flush(none);
+out.swap_after = keys(ord);
+
+// An open <details> row stays open when its data changes.
+list.children[0].open = true;
+R.rows(list, [{ key: "0", html: "new!" }, { key: "2", html: "BB" }, { key: "1", html: "a" }], none);
+out.still_open = list.children[0].open === true;
+
+// A focused field inside a section holds the section until focus leaves.
+const form = new El("DIV");
+R.patch(form, "<input>", none);
+const input = form.add(new El("INPUT"));
+const w0 = writes;
+out.focus = R.patch(form, "<input value=2>", { sel: [], active: input });
+out.focus_writes = writes - w0;
+out.focus_kept = form.children[0] === input;
+R.flush(none);
+out.blur = form.innerHTML;
+
+// A payload that differs only in ticking fields has the same key.
+const st = (now, age, title) => ({ now, heartbeat: { age }, push_queue: { entries: [{ age_s: age }] }, tasks: [{ id: 1, title }] });
+out.same_key = R.key(st(1, 2, "x"), "m") === R.key(st(9, 30, "x"), "m");
+out.new_key = R.key(st(1, 2, "x"), "m") !== R.key(st(1, 2, "y"), "m");
+console.log(JSON.stringify(out));
+"""
+
+
+def test_web_render_keeps_unchanged_and_held_parts_of_the_page():
+    """The web app's refresh writes only changed sections and rows, and never the one holding the
+    user's text selection or focused field until they let go (render.js run under node)."""
+    import json
+    import shutil
+    import subprocess
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not installed")
+    r = subprocess.run([node, "-e", RENDER_HARNESS, str(RUNTIME / "ttp" / "web" / "render.js")],
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    o = json.loads(r.stdout)
+    assert (o["first"], o["again"], o["writes"]) == ("replaced", "same", 1), o
+    assert o["unchanged"] == [] and o["unchanged_ops"] == [], o
+    assert o["changed"] == ["2"] and o["kept_others"] and o["changed_html"] == "B", o
+    # Under a selection the held row stays put; the new row is inserted around it.
+    assert o["sel_changed"] == ["0"] and o["sel_keys"] == ["0", "1", "2", "3"] and o["sel_kept"], o
+    assert o["sel_ops"] == [["insert", "0"]] and o["sel_pending"] == 1 and o["sel_still"], o
+    assert o["after_release"] and o["after_pending"] == 0, o
+    assert o["gone_kept"] and o["reorder_held"] == ["0", "2", "1", "3"], o
+    assert o["reorder_after"] == ["0", "2", "1"], o
+    assert o["around"] == ["b", "c", "a"] and "b" not in o["around_moved"], o
+    assert o["swap_waits"] == ["b", "c", "a"] and o["swap_after"] == ["a", "b", "c"], o
+    assert o["still_open"], o
+    assert (o["focus"], o["focus_writes"], o["focus_kept"], o["blur"]) == ("held", 0, True, "<input value=2>"), o
+    assert o["same_key"] and o["new_key"], o
+
+
+def test_web_app_writes_the_page_through_render_js():
+    """refresh() patches through render.js (no whole-section innerHTML resets, ages filled on the
+    client) and the page loads render.js first."""
+    web = RUNTIME / "ttp" / "web"
+    js = (web / "app.js").read_text()
+    body = js[js.index("async function refresh()"):js.index("window.setSched")]
+    assert ".innerHTML" not in body and ".textContent =" not in body and "ago(" not in body.replace("ago(lastOk", ""), body
+    assert "R.key(st" in body and "R.rows(" in body
+    html = (web / "index.html").read_text()
+    assert html.index('src="render.js"') < html.index('src="app.js"')
+
 def _run_until(d, p, cond, timeout=60):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -10148,7 +10295,7 @@ def test_the_web_app_shows_the_push_queue_card_and_the_pushed_sha_of_a_review(en
     assert tasks[rid]["pushed"] == [{"branch": "ttp/t1-feature", "sha": sha, "version": "0.2.140", "status": "pushed"}]
     assert tasks[other]["status"] == "pushing" and tasks[other]["pushed"] is None
     app = (RUNTIME / "ttp" / "web" / "app.js").read_text()
-    assert "pushQueueHtml(st.push_queue)" in app and "t.pushed" in app
+    assert "pushQueueHtml(st.push_queue, " in app and "t.pushed" in app
     assert 'id="pqcard"' in (RUNTIME / "ttp" / "web" / "index.html").read_text()
 
 
@@ -11999,7 +12146,7 @@ def test_budget_line_says_virtual_on_a_plan_and_actual_when_billed_by_use(env):
     assert health(p, p.db, now=now)["spend"]["headline"] == budget_line(p.db, now, "fake", plan)
     # Spend still running is shown in the Budget tab, not in the header pill.
     js = (RUNTIME / "ttp" / "web" / "app.js").read_text()
-    pill = next(ln for ln in js.splitlines() if '$("#spend").textContent' in ln)
+    pill = next(ln for ln in js.splitlines() if 'text($("#spend")' in ln)
     assert "in_flight" not in pill and "h.spend.in_flight" in js, pill
 
 
