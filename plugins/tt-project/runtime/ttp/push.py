@@ -42,6 +42,7 @@ TIMINGS = "push_checks.json"   # under the project's state: how long the last fu
 BUMP_TRAILER = "Ttp-Version-Bump"   # marks the bump commit ttp push made, so a rerun replaces it
 VERSION_RE = re.compile(r"""(version(?:__)?["']?\s*[:=]\s*["'])(\d+)\.(\d+)\.(\d+)(["'])""", re.I)
 PROTECTED = {"HEAD", "main", "master"}
+OWN_BRANCH = re.compile(r"ttp/t(\d+)-\S+")   # a task's own branch, as worktree.ensure names it
 NO_CHECKS = ("set delivery.push_checks to the commands that must pass on the exact commit before it "
              "is pushed (a list, or one per line, e.g. the repository's test suite); the coordinator "
              "sets it with config_set")
@@ -199,6 +200,25 @@ def target(p: Project, repo: Path) -> tuple[str, str]:
     if not (rest and remote in _git(repo, "remote").stdout.split()):
         remote, rest = "origin", ref
     return remote, rest[len("refs/heads/"):] if rest.startswith("refs/heads/") else rest
+
+
+def own_target(p: Project, repo: Path) -> tuple[str, str]:
+    """(remote, branch) for `ttp push --own`: the checked-out branch, which must be a task's own
+    `ttp/t<id>-...` branch (inside a run: this task's), published under the same name on the remote
+    of `delivery.push_branch` (else origin). Never the push branch or the branch work starts from."""
+    branch = _git(repo, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
+    m = OWN_BRANCH.fullmatch(branch)
+    if not m:
+        raise ValueError(f"--own publishes only a task's own branch (ttp/t<id>-...), not {branch or 'a detached HEAD'}")
+    task = os.environ.get("TTP_TASK")
+    if task and m.group(1) != task:
+        raise ValueError(f"--own publishes only this task's own branch (ttp/t{task}-...), not {branch}")
+    d = p.config().get("delivery") or {}
+    remote, shared = target(p, repo) if str(d.get("push_branch") or "").strip() else ("origin", "")
+    base = str(d.get("base_ref") or "").strip()
+    if branch in (shared, base, base.partition("/")[2]):
+        raise ValueError(f"--own never pushes to a shared branch ({branch})")
+    return remote, branch
 
 
 def refusal(repo: Path, remote: str, branch: str) -> str:
@@ -525,6 +545,45 @@ def push(repo: Path, remote: str, branch: str, checks: list[str], rounds: int = 
             lock.close()
 
 
+def publish(repo: Path, remote: str, branch: str, checks: list[str],
+            say: Callable[[str], None] = lambda m: print(f"ttp push: {m}", file=sys.stderr),
+            hold: Callable[[], Any] | None = None, timed: Callable[[float], None] | None = None) -> int:
+    """`ttp push --own`: run `checks` on HEAD as it is and push it to remote/branch, the task's own
+    branch. No rebase and no version bump, so the pushed commit is the one reviewed; without force,
+    so the remote takes only a fast-forward of what it has."""
+    repo = Path(_git(repo, "rev-parse", "--show-toplevel").stdout.strip() or repo)
+    if _git(repo, "status", "--porcelain", "--untracked-files=no").stdout.strip():
+        say("uncommitted changes; commit first")
+        return REFUSED
+    why = refusal(repo, remote, branch)
+    if why:
+        say(why)
+        return REFUSED
+    lock = hold() if hold else None
+    if hold and lock is None:
+        return BUSY
+    try:
+        head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+        started = time.time()
+        for cmd in checks:
+            if subprocess.run(cmd, shell=True, cwd=repo).returncode != 0:
+                say(f"check failed on {head[:10]}: {cmd}; not pushing")
+                return CHECKS_FAILED
+        if checks and timed:
+            timed(time.time() - started)
+        if _git(repo, "rev-parse", "HEAD").stdout.strip() != head:
+            say(f"HEAD moved off {head[:10]} during the checks; not pushing")
+            return REFUSED
+        if _git(repo, "push", remote, f"{head}:refs/heads/{branch}", quiet=False).returncode == 0:
+            say(f"pushed {head[:10]} to {remote}/{branch}")
+            return 0
+        say(f"push to {remote}/{branch} was rejected (never forced: it must fast-forward what the remote has)")
+        return REJECTED
+    finally:
+        if lock is not None:
+            lock.close()
+
+
 def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int,
             say: Callable[[str], None], version_bump: dict | None = None,
             timed: Callable[[float], None] | None = None) -> int:
@@ -576,8 +635,9 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
     return KEPT_MOVING
 
 
-def run(p: Project, repo: Path) -> int:
-    """`ttp push` for a project: target, checks and rounds come from its `delivery` config."""
+def run(p: Project, repo: Path, own: bool = False) -> int:
+    """`ttp push` for a project: target, checks and rounds come from its `delivery` config. `own`
+    publishes the task's own branch instead (own_target, publish)."""
     d = p.config().get("delivery") or {}
     allowed = True if d.get("push_allowed") is None else d.get("push_allowed")
     if not (allowed is True or str(allowed).strip().lower() in ("1", "true", "yes", "on")):
@@ -585,7 +645,7 @@ def run(p: Project, repo: Path) -> int:
         return REFUSED
     checks = check_list(d.get("push_checks"))   # none: only a docs-only change may go (_rounds)
     try:
-        remote, branch = target(p, repo)
+        remote, branch = own_target(p, repo) if own else target(p, repo)
         rounds = rounds_of(d.get("push_rounds"))
         explicit = d.get("push_wait_s")
         wait_s = default_wait(last_check_s(p)) if explicit in (None, "") else wait_of(explicit)
@@ -593,6 +653,9 @@ def run(p: Project, repo: Path) -> int:
     except ValueError as e:
         print(f"ttp push: {e}", file=sys.stderr)
         return REFUSED
+    if own:
+        return publish(repo, remote, branch, checks, hold=lambda: take(p, remote, branch, wait_s),
+                       timed=lambda s: record_check_s(p, s))
     return push(repo, remote, branch, checks, rounds, hold=lambda: take(p, remote, branch, wait_s),
                 version_bump=version_bump, timed=lambda s: record_check_s(p, s))
 
@@ -683,7 +746,7 @@ def _tail(path: str | None, n: int = LOG_TAIL) -> str:
         return ""
 
 
-def detach(p: Project, repo: Path) -> int:
+def detach(p: Project, repo: Path, own: bool = False) -> int:
     """Start `ttp push` for `repo` in a process of its own and print its marker and probe. The quick
     refusals (pushing not allowed, no target, uncommitted changes) answer at once, without a marker."""
     d = p.config().get("delivery") or {}
@@ -693,7 +756,7 @@ def detach(p: Project, repo: Path) -> int:
         return REFUSED
     top = Path(_git(repo, "rev-parse", "--show-toplevel").stdout.strip() or repo)
     try:
-        remote, branch = target(p, top)
+        remote, branch = own_target(p, top) if own else target(p, top)
     except ValueError as e:
         print(f"ttp push: {e}", file=sys.stderr)
         return REFUSED
@@ -719,7 +782,8 @@ def detach(p: Project, repo: Path) -> int:
     env.update(PYTHONPATH=str(Path(__file__).resolve().parents[1]), TTP_PROJECT=str(p.base))
     try:
         with open(log, "ab") as out:
-            child = subprocess.Popen([sys.executable, "-m", "ttp", "push", "--marker", str(marker)],
+            child = subprocess.Popen([sys.executable, "-m", "ttp", "push", "--marker", str(marker),
+                                      *(["--own"] if own else [])],
                                      cwd=str(top), env=env, stdin=subprocess.PIPE, stdout=out,
                                      stderr=subprocess.STDOUT, start_new_session=True,
                                      pass_fds=(lock.fileno(),))
@@ -737,7 +801,7 @@ def detach(p: Project, repo: Path) -> int:
     return 0
 
 
-def run_detached(p: Project, repo: Path, marker: Path) -> int:
+def run_detached(p: Project, repo: Path, marker: Path, own: bool = False) -> int:
     """The detached process: wait for the launcher's go, push, and write the outcome into `marker`."""
     try:
         sys.stdin.read()
@@ -745,7 +809,7 @@ def run_detached(p: Project, repo: Path, marker: Path) -> int:
         pass
     print(f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} detached push, marker {marker}", flush=True)
     try:
-        rc = run(p, repo)
+        rc = run(p, repo, own)
     except Exception as e:     # recorded as a failure, never left as "running"
         print(f"ttp push: {type(e).__name__}: {e}", file=sys.stderr)
         rc = 1
@@ -753,6 +817,7 @@ def run_detached(p: Project, repo: Path, marker: Path) -> int:
     sha = version = None
     if rc == 0:
         sha = _git(top, "rev-parse", "HEAD").stdout.strip() or None
+    if rc == 0 and not own:
         try:
             cfg = bump_of((p.config().get("delivery") or {}).get("version_bump"))
         except ValueError:

@@ -853,7 +853,9 @@ def cmd_push(a) -> None:
     longer than `delivery.push_wait_s` (unset: twice the last check run, 900 s to 2 h) for its
     turn exits 75. With `delivery.version_bump` it bumps the version after each rebase. `--free` only tells whether it is
     free (0) or taken (1). `--detach` runs the push in a process of its own and prints its marker and
-    a `--result <marker>` probe (0 once finished or dead, 1 while running). Exit codes are in `push.py`."""
+    a `--result <marker>` probe (0 once finished or dead, 1 while running). `--own` publishes the
+    task's own `ttp/t<id>-...` branch under its own name instead, as it is: checks run on HEAD, no
+    rebase or bump, never the push branch or a shared one. Exit codes are in `push.py`."""
     from . import push
     if a.result:
         sys.exit(push.result(Path(a.result)))
@@ -865,8 +867,8 @@ def cmd_push(a) -> None:
     if a.free:
         sys.exit(push.free(p, Path.cwd()))
     if a.marker:
-        sys.exit(push.run_detached(p, Path.cwd(), Path(a.marker)))
-    sys.exit(push.detach(p, Path.cwd()) if a.detach else push.run(p, Path.cwd()))
+        sys.exit(push.run_detached(p, Path.cwd(), Path(a.marker), a.own))
+    sys.exit(push.detach(p, Path.cwd(), a.own) if a.detach else push.run(p, Path.cwd(), a.own))
 
 
 def cmd_lock(a) -> None:
@@ -1623,6 +1625,9 @@ def main(argv: list[str] | None = None) -> None:
                    help="push in a process of its own; print its marker and a --result probe, and return at once")
     s.add_argument("--result", metavar="MARKER",
                    help="push nothing: report a detached push; exit 0 once it finished (or died), 1 while it runs")
+    s.add_argument("--own", action="store_true",
+                   help="publish this task's own ttp/t<id>-... branch under its name, as it is (checks, no rebase); "
+                        "never delivery.push_branch")
     s.add_argument("--marker", help=argparse.SUPPRESS)   # the detached process itself
     s.set_defaults(fn=cmd_push)
 

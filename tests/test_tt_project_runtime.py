@@ -6125,6 +6125,39 @@ def test_sandboxed_codex_worker_can_git_add_in_a_linked_worktree(env):
     assert add.returncode != 0 and "index.lock" in add.stderr, add.stderr
 
 
+
+def test_sandboxed_codex_worker_writes_all_git_metadata_of_a_task_worktree(env, monkeypatch):
+    # A task worktree under the project (<root>/tt-project/worktrees/tN) failed `git merge --ff-only`
+    # with EROFS on <root>/.git/worktrees/tN/ORIG_HEAD.lock. Every metadata write a worker makes
+    # there (ORIG_HEAD, index, HEAD's reflog, branches, tags, packed-refs) must go through.
+    for var, val in (("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"),
+                     ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t")):
+        monkeypatch.setenv(var, val)
+    p = make(env)
+    repo = env["repo"]
+    _commit(repo, "ahead.txt", "x\n")
+    wt = p.worktrees / "t30"
+    subprocess.run(["git", "-C", str(repo), "worktree", "add", "-q", "-b", "ttp/t30-x", str(wt), "HEAD~1"],
+                   check=True, capture_output=True)
+    roots = _codex_worker_roots(env, p, wt)
+    sandbox = _codex_sandbox(wt, roots)
+    if sandbox is None:
+        pytest.skip("no working Codex sandbox on this machine")
+    target = _git_out(repo, "rev-parse", "HEAD")
+    script = ("set -e; git merge -q --ff-only " + target + "; echo y > y.txt; git add y.txt; "
+              "git commit -qm y; git branch side; git tag t1; git reset -q --soft HEAD~1; "
+              "git commit -qm again; git pack-refs --all; git reflog -1")
+    r = subprocess.run(sandbox + ["sh", "-c", script], cwd=wt, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert _git_out(wt, "rev-parse", "HEAD~1") == target and _git_out(wt, "log", "-1", "--format=%s") == "again"
+    assert _git_out(repo, "rev-parse", "side", "t1").count("\n") == 1
+    # Without the worktree's own gitdir, as before 0.2.101, the merge fails exactly as reported.
+    gitdir = _git_out(wt, "rev-parse", "--absolute-git-dir")
+    _git_out(wt, "reset", "-q", "--hard", "HEAD~2")
+    old = _codex_sandbox(wt, [r for r in roots if r != gitdir])
+    r = subprocess.run(old + ["git", "merge", "--ff-only", target], cwd=wt, capture_output=True, text=True)
+    assert r.returncode != 0 and "ORIG_HEAD.lock" in r.stderr, r.stderr
+
 def test_ttp_lock_says_plainly_when_the_shared_lock_is_not_writable(env):
     if os.geteuid() == 0:
         pytest.skip("root writes read-only directories")
@@ -7926,6 +7959,57 @@ def test_a_detached_push_refuses_a_dirty_tree_at_once_without_a_marker(env, monk
     rc, marker, probe = _detach(capsys)
     assert rc == 2 and marker is None and not (p.state / "pushes").exists()
 
+
+
+def test_push_own_publishes_the_tasks_own_branch_as_it_is_and_never_a_shared_one(env, monkeypatch, capsys):
+    log = env["tmp"] / "checked"
+    p, repo, origin, other = _push_setup(env, monkeypatch, [f"git rev-parse HEAD >> {log}"])
+    p.set_config("delivery.base_ref", "origin/proj")
+    _commit(other, "theirs.txt", "theirs\n")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    shared = _git_out(origin, "rev-parse", "proj")
+    _git_out(repo, "checkout", "-q", "-b", "ttp/t30-exp")
+    _commit(repo, "mine.txt", "mine\n")
+    head = _git_out(repo, "rev-parse", "HEAD")
+    monkeypatch.setenv("TTP_TASK", "30")
+    assert _ttp("push", "--own") == 0
+    # The reviewed commit itself: no rebase onto the moved shared branch, which stays untouched.
+    assert _git_out(origin, "rev-parse", "ttp/t30-exp") == head == _git_out(repo, "rev-parse", "HEAD")
+    assert log.read_text().split() == [head] and _git_out(origin, "rev-parse", "proj") == shared
+    # Another task's branch, a shared branch or main: refused before anything runs.
+    monkeypatch.setenv("TTP_TASK", "31")
+    assert _ttp("push", "--own") == 2 and "ttp/t31-" in capsys.readouterr().err
+    monkeypatch.delenv("TTP_TASK")
+    for name in ("proj", "main", "feature"):
+        _git_out(repo, "checkout", "-q", "-B", name)
+        assert _ttp("push", "--own") == 2, name
+    _git_out(repo, "checkout", "-q", "--detach")
+    assert _ttp("push", "--own") == 2 and "detached HEAD" in capsys.readouterr().err
+    assert _git_out(origin, "rev-parse", "proj") == shared
+    assert _git_out(origin, "for-each-ref", "--format=%(refname:short)", "refs/heads") == "proj\nttp/t30-exp"
+    # Never forced: a rewritten own branch is rejected and the remote keeps what it had.
+    _git_out(repo, "checkout", "-q", "ttp/t30-exp")
+    _git_out(repo, "commit", "-q", "--amend", "-m", "rewritten")
+    assert _ttp("push", "--own") == 6 and _git_out(origin, "rev-parse", "ttp/t30-exp") == head
+    # Pushing must still be allowed at all.
+    p.set_config("delivery.push_allowed", False)
+    assert _ttp("push", "--own") == 2
+
+
+def test_push_own_detached_publishes_the_own_branch_and_reports_it(env, monkeypatch, capsys):
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    _git_out(repo, "checkout", "-q", "-b", "ttp/t7-exp")
+    _commit(repo, "mine.txt", "mine\n")
+    monkeypatch.setenv("TTP_TASK", "7")
+    rc = _ttp("push", "--own", "--detach")
+    out = capsys.readouterr().out
+    probe = next(ln.split(": ", 1)[1] for ln in out.splitlines() if ln.startswith("retry_when: "))
+    assert rc == 0 and "origin/ttp/t7-exp" in out
+    r = _probe_until_done(p, probe)
+    head = _git_out(repo, "rev-parse", "HEAD")
+    assert r.returncode == 0 and f"pushed {head} to origin/ttp/t7-exp" in r.stdout, r
+    assert _git_out(origin, "rev-parse", "ttp/t7-exp") == head
+    assert _git_out(origin, "rev-parse", "proj") != head
 
 def test_a_dead_detached_push_reads_as_failed_and_frees_the_branch(env, monkeypatch, capsys):
     started = env["tmp"] / "started"
