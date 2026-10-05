@@ -718,11 +718,18 @@ class Batch:
             return STALE, msg
         if not checks:
             return None
+        todo, skipped = push.applicable(self.wt, head, checks, say)
+        for line in skipped:
+            if line not in self.checks.setdefault("skipped", []):
+                self.checks["skipped"].append(line)
+        if not todo:
+            say(f"{head[:10]}: {push.NONE_APPLY}")
+            return push.NONE_APPLY, ""
         say(f"checking {head[:10]}")
         started = time.time()
         self.checks["runs"] += 1
         try:
-            for cmd in checks:
+            for cmd in todo:
                 rc, tail, _ = _stream(cmd, self.wt)
                 if rc != 0:
                     say(f"check failed on {head[:10]}: {cmd}")
@@ -825,6 +832,9 @@ def after_push(p: Project, marker: Path, m: dict) -> dict:
     out = {"status": "ok", "exit": 0, "started": started, "tail": ""}
     try:
         for cmd in cmds:
+            if why := push.skip_reason(wt, sha, cmd):
+                say(f"after_push: {push.skipped_line(cmd, why)}")
+                continue
             left = started + timeout - time.time()
             if left <= 0:
                 out.update(status="timeout", exit=None, cmd=cmd)

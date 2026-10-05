@@ -143,6 +143,13 @@ and preferences you add later become part of the project's charter and memory.
   reboot frees. One that waits longer than `delivery.push_wait_s` exits 75 and prints a
   `retry_when` for its hand-off: `ttp push --free`, which exits 0 once the turn is free. Unset,
   the wait is twice the last measured check run plus 60 s, at least 900 s and at most 2 h.
+- A check is a command, which runs on every head. One that only makes sense once a file exists
+  (a test file a later change adds) can opt in to being skipped where it does not apply:
+  `{"run": "pytest tests/test_new.py", "if_exists": "tests/test_new.py"}`. `if_exists` is a
+  repo path or glob (a directory counts by its files) looked up in the commit being checked. A
+  skipped check is logged as `skipped (not applicable: ...)` by `ttp push`, the push queue and
+  `ttp checks` (in `checks.log`), and never counts as passed: when every check is skipped the
+  push or `ttp checks` fails. Plain string checks never skip; `after_push` takes the same form.
 - `ttp push --detach` runs the same push in a process of its own and returns at once, for
   checks that outlast a worker's tool call. It prints a marker under `state/pushes/` and a
   `retry_when` probe, `ttp push --result <marker>`: 1 while the push runs, 0 once it finished,

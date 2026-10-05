@@ -14250,6 +14250,113 @@ def test_push_check_path_args_and_unmatched(env, tmp_path):
     assert push.unmatched_paths(repo, "origin", "work", checks) == ("origin/work", [])
 
 
+# checks that declare when they apply (if_exists) ------------------------------------------------------
+NEW_TEST = "tests/new_test.sh"
+COND = {"run": f"sh {NEW_TEST}", "if_exists": NEW_TEST}
+
+
+def test_check_objects_are_validated_kept_in_config_and_plain_strings_stay_strict(env):
+    from ttp import push
+    from ttp.project import config_problems
+    checks = push.check_list(["true", COND, {"run": "true", "if_exists": "tests/*.sh"}])
+    assert checks == ["true", f"sh {NEW_TEST}", "true"]
+    assert [c.if_exists for c in checks] == ["", NEW_TEST, "tests/*.sh"]
+    assert push.check_list(json.dumps([COND]))[0].if_exists == NEW_TEST, "config_set sends JSON text"
+    assert push.checks_of(["true", COND]) == ["true", COND], "the opt-in form must survive config_set"
+    for bad in ({"if_exists": "x"}, {"run": "true", "if_exists": "/abs"}, {"run": "true", "if_exists": "../up"},
+                {"run": "true", "if_exists": ""}, {"run": "true", "paths": "x"}, {"run": "true", "if_exists": 3}):
+        with pytest.raises(ValueError):
+            push.checks_of([bad])
+        assert config_problems({"delivery": {"push_checks": [bad]}}), bad
+    # A malformed object never skips: it runs on every head, as a plain string does.
+    assert [c.if_exists for c in push.check_list([{"run": "true", "if_exists": "../up"},
+                                                   {"run": "true", "if_exists": "x", "extra": 1}])] == ["", ""]
+    p = make(env)
+    from ttp import cli
+    cli.main(["config", p.name, "delivery.push_checks", json.dumps(["true", COND])])
+    assert p.config()["delivery"]["push_checks"] == ["true", COND]
+
+
+def test_push_skips_only_an_opted_in_check_whose_file_is_absent_and_reports_it(env, monkeypatch, capsys):
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true", COND])
+    _commit(repo, "mine.txt", "mine\n")
+    assert _ttp_push() == 0, "a check whose target is absent at the head blocked the push"
+    err = capsys.readouterr().err
+    assert f"skipped (not applicable: {NEW_TEST} does not exist at" in err and f"sh {NEW_TEST}" in err
+    # Once the file exists the check applies, runs and can fail the push.
+    (repo / "tests").mkdir()
+    _commit(repo, NEW_TEST, "exit 1\n")
+    assert _ttp_push() == 4
+    assert "skipped" not in capsys.readouterr().err
+
+
+def test_push_keeps_plain_checks_strict_and_never_counts_skips_as_passes(env, monkeypatch, capsys):
+    p, repo, origin, other = _push_setup(env, monkeypatch, [f"sh {NEW_TEST}"])
+    before = _git_out(origin, "rev-parse", "proj")
+    _commit(repo, "mine.txt", "mine\n")
+    assert _ttp_push() == 4, "a plain check skipped when its file was missing"
+    p.set_config("delivery.push_checks", [COND])
+    capsys.readouterr()
+    assert _ttp_push() == 4, "a head where every check was skipped went out unchecked"
+    assert "every check was skipped as not applicable" in capsys.readouterr().err
+    assert _git_out(origin, "rev-parse", "proj") == before
+
+
+def test_a_push_batch_reports_skipped_checks(env, monkeypatch, capsys):
+    p, repo, origin, other = _bump_setup(env, monkeypatch, ["true", COND])
+    heads = [_entry(repo, "e1", {"plugins/p/f1.txt": "1\n"})]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed", m
+    assert m["checks"]["runs"] == 1
+    assert len(m["checks"]["skipped"]) == 1 and m["checks"]["skipped"][0].startswith(
+        f"skipped (not applicable: {NEW_TEST} does not exist at"), m["checks"]
+    assert "skipped (not applicable:" in capsys.readouterr().out, "the batch log must say so"
+
+
+def test_ttp_checks_logs_skipped_checks_and_fails_when_none_apply(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli
+    p = make(env)
+    repo, run = tmp_path / "work", tmp_path / "run"
+    run.mkdir()
+    repo.mkdir()
+    git = ["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=t"]
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / "a.txt").write_text("a\n")
+    subprocess.run([*git, "add", "a.txt"], check=True)
+    subprocess.run([*git, "commit", "-qm", "a"], check=True)
+    monkeypatch.setenv("TTP_RUN_DIR", str(run))
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.chdir(repo)
+    p.set_config("delivery.push_checks", [COND])
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks"])
+    assert e.value.code == 1, "every check skipped must not record a pass"
+    assert json.loads((run / "checks.json").read_text())["passed"] is False
+    cli.main(["checks", "--", "test", "-f", "a.txt"])
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and rec["commands"] == ["test -f a.txt"]
+    assert len(rec["skipped"]) == 1 and NEW_TEST in rec["skipped"][0]
+    log = (run / "checks.log").read_text()
+    assert f"skipped (not applicable: {NEW_TEST} does not exist at" in log
+    assert f"$ sh {NEW_TEST}" not in log
+    assert "1 skipped as not applicable" in capsys.readouterr().out
+
+
+def test_status_does_not_warn_about_a_check_that_does_not_apply_on_the_branch(tmp_path):
+    from ttp import push
+    repo = tmp_path / "r"
+    repo.mkdir()
+    g = lambda *a: subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True)
+    g("init", "-q", "-b", "work")
+    (repo / "a.txt").write_text("")
+    g("add", ".")
+    g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x")
+    checks = push.check_list([{"run": "pytest tests/test_new.py", "if_exists": "tests/test_new.py"},
+                              "pytest tests/test_gone.py"])
+    assert push.unmatched_paths(repo, "origin", "work", checks)[1] == [
+        "'pytest tests/test_gone.py': 'tests/test_gone.py'"]
+
+
 def _sched_file(p):
     return json.loads((p.harness / "schedules.json").read_text())
 

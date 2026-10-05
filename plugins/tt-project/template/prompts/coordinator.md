@@ -227,6 +227,9 @@ account out of funds or quota, unrecoverable outage, restriction at risk. Everyt
   with `ttp push` only. Set `delivery.push_branch` and `delivery.push_checks` (the repository's
   test commands) first; without checks it pushes docs-only changes only. A review blocked on
   "set delivery.push_checks" → set it yourself, then `task_update` the review to `queued`.
+  A check that must not block heads lacking its target (e.g. a test file a later change adds) takes
+  the opt-in form `{"run": "<cmd>", "if_exists": "<repo path or glob>"}`: skipped and reported
+  there, never counted as passed. Keep plain strings for everything else.
 - With the push queue on (STATE shows `## Delivery: push queue on`), review specs instead ask the reviewer
   to "approve for the push queue" and carry no push or deploy steps: the daemon pushes approved
   heads in batches and `delivery.after_push` deploys. A `pushing` task is in the queue: leave it.

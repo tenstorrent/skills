@@ -49,16 +49,95 @@ NO_CHECKS = ("set delivery.push_checks to the commands that must pass on the exa
              "sets it with config_set")
 
 
-def check_list(v: Any) -> list[str]:
-    """Check commands from a config value: a list, a JSON-encoded list, or one command per line."""
+class Check(str):
+    """One check command. A plain string runs on every head. The opt-in form
+    `{"run": "<cmd>", "if_exists": "<repo path or glob>"}` runs only on a head that has a file
+    matching `if_exists` (a directory counts by its files); elsewhere it is skipped as not
+    applicable, which is reported and never counted as passed."""
+    if_exists = ""
+
+    def config(self) -> str | dict:
+        """The form project.json keeps."""
+        return {"run": str(self), "if_exists": self.if_exists} if self.if_exists else str(self)
+
+
+CHECK_KEYS = {"run", "if_exists"}
+
+
+def _entries(v: Any) -> list:
+    """Check entries from a config value: a list, a JSON-encoded list, or one command per line."""
     if isinstance(v, str):
         text = v.strip()
         try:
             v = json.loads(text) if text.startswith("[") else text.splitlines()
         except ValueError:
             v = text.splitlines()
-    return [str(c).strip() for c in (v or []) if str(c).strip()]
+    if isinstance(v, dict):
+        v = [v]
+    return [c for c in (v or []) if isinstance(c, dict) or str(c).strip()]
 
+
+def _check(c: Any) -> Check | None:
+    if not isinstance(c, dict):
+        return Check(str(c).strip())
+    cmd = str(c.get("run") or "").strip()
+    if not cmd:
+        return None
+    out = Check(cmd)
+    cond = _if_exists(c)
+    # Strict: the check skips only when it validly opted in; anything malformed runs it everywhere.
+    if cond and not _form_problem(c):
+        out.if_exists = cond
+    return out
+
+
+def _if_exists(c: dict) -> str:
+    return str(c.get("if_exists") or "").strip() if isinstance(c.get("if_exists"), str) else ""
+
+
+def check_list(v: Any) -> list[Check]:
+    """Check commands from a config value (`_entries`), as `Check`s."""
+    return [c for c in map(_check, _entries(v)) if c]
+
+
+def matches(files: list[str], pattern: str) -> bool:
+    """Whether a repo path or glob matches one of `files` (repo-relative); a directory by its files."""
+    import fnmatch
+    return any(f == pattern or f.startswith(pattern + "/") or fnmatch.fnmatchcase(f, pattern) for f in files)
+
+
+def skip_reason(repo: Path, head: str, check: Check) -> str | None:
+    """Why `check` does not apply to `head` (its `if_exists` matches no file there), or None: it runs."""
+    if not getattr(check, "if_exists", ""):
+        return None
+    ls = _git(repo, "ls-tree", "-r", "--name-only", head)
+    if ls.returncode != 0:
+        return None   # cannot tell: run it
+    if matches(ls.stdout.splitlines(), check.if_exists):
+        return None
+    return f"{check.if_exists} does not exist at {head[:10]}"
+
+
+def skipped_line(check: Check, why: str) -> str:
+    return f"skipped (not applicable: {why}): {check}"
+
+
+NONE_APPLY = "every check was skipped as not applicable, so nothing checked it"
+
+
+def applicable(repo: Path, head: str, checks: list[Check],
+               say: Callable[[str], None]) -> tuple[list[Check], list[str]]:
+    """(checks to run on `head`, a `skipped_line` per check that does not apply there, each also said).
+    Callers treat "none to run" from a non-empty list as a failure (NONE_APPLY), never as a pass."""
+    todo, skipped = [], []
+    for c in checks:
+        why = skip_reason(repo, head, c)
+        if why:
+            skipped.append(skipped_line(c, why))
+            say(skipped[-1])
+        else:
+            todo.append(c)
+    return todo, skipped
 
 
 # Shell builtins and keywords a check may start with; anything else must be a program on PATH or a path.
@@ -83,16 +162,42 @@ def check_problem(cmd: str) -> str | None:
     return f"{cmd!r}: {first!r} is not a program on PATH, a path or a shell builtin; push_checks are commands"
 
 
+def _form_problem(c: dict) -> str | None:
+    """Why a check object is malformed: it takes "run" and "if_exists" (a repo-relative path or
+    glob) and nothing else."""
+    cmd = c.get("run")
+    if not isinstance(cmd, str) or not cmd.strip():
+        return f"{c!r}: a check object needs \"run\": the command"
+    extra = sorted(set(map(str, c)) - CHECK_KEYS)
+    if extra:
+        return f"{c!r}: unknown key(s) {', '.join(extra)}; a check object takes only run and if_exists"
+    cond = c.get("if_exists")
+    if cond is not None:
+        p = cond.strip() if isinstance(cond, str) else ""
+        norm = posixpath.normpath(p) if p else ""
+        if not p or p.startswith(("/", "~")) or norm in (".", "..") or norm.startswith("../"):
+            return f"{c!r}: if_exists must be a path or glob inside the repository"
+    return None
+
+
+def _entry_problem(c: Any) -> str | None:
+    """Why a check entry cannot be a check: not a command (check_problem) or a malformed object."""
+    if not isinstance(c, dict):
+        return check_problem(str(c).strip())
+    return _form_problem(c) or check_problem(str(c["run"]).strip())
+
+
 def check_problems(v: Any) -> list[str]:
-    return [p for p in map(check_problem, check_list(v)) if p]
+    return [p for p in map(_entry_problem, _entries(v)) if p]
 
 
-def checks_of(v: Any) -> list[str]:
-    """`check_list`, rejecting entries that are not commands (e.g. a sentence describing the checks)."""
+def checks_of(v: Any) -> list[str | dict]:
+    """The config value of `v`'s checks, rejecting entries that are not commands (e.g. a sentence
+    describing the checks) or malformed check objects."""
     bad = check_problems(v)
     if bad:
         raise ValueError("; ".join(bad))
-    return check_list(v)
+    return [c.config() for c in check_list(v)]
 
 _GLOB = re.compile(r"[*?\[]")
 _REDIRECT = re.compile(r"^[0-9&]*(>>?|<)")
@@ -153,7 +258,6 @@ def unmatched_paths(repo: Path, remote: str, branch: str, checks: list[str]) -> 
     """(ref, ["cmd: path", ...]) for check path args that match no file on the push branch: the
     remote-tracking ref, which `ttp push` rebases onto, else the local branch. ref is "" when
     neither can be read."""
-    import fnmatch
     for ref, full in ((f"{remote}/{branch}", f"refs/remotes/{remote}/{branch}"),
                       (branch, f"refs/heads/{branch}")):
         ls = _git(repo, "ls-tree", "-r", "--name-only", full)
@@ -164,11 +268,13 @@ def unmatched_paths(repo: Path, remote: str, branch: str, checks: list[str]) -> 
     files = ls.stdout.splitlines()
     out = []
     for cmd in checks:
+        if getattr(cmd, "if_exists", "") and not matches(files, cmd.if_exists):
+            continue  # not applicable there: it is skipped, not failed
         gone: list[str] = []
         for a in path_args(cmd):
             if any(a.startswith(g + "/") for g in gone):
                 continue  # under a missing `cd` dir, already reported
-            if not any(f == a or f.startswith(a + "/") or fnmatch.fnmatchcase(f, a) for f in files):
+            if not matches(files, a):
                 gone.append(a)
                 out.append(f"{cmd!r}: {a!r}")
     return ref, out
@@ -599,12 +705,16 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
         return BUSY
     try:
         head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+        todo, _ = applicable(repo, head, checks, say)
+        if checks and not todo:
+            say(f"{head[:10]}: {NONE_APPLY}; not pushing")
+            return CHECKS_FAILED
         started = time.time()
-        for cmd in checks:
+        for cmd in todo:
             if subprocess.run(cmd, shell=True, cwd=repo).returncode != 0:
                 say(f"check failed on {head[:10]}: {cmd}; not pushing")
                 return CHECKS_FAILED
-        if checks and timed:
+        if todo and timed:
             timed(time.time() - started)
         if _git(repo, "rev-parse", "HEAD").stdout.strip() != head:
             say(f"HEAD moved off {head[:10]} during the checks; not pushing")
@@ -699,12 +809,16 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
                 f"{upstream}; bump it past that (in every manifest, plus a changeset where the "
                 "repository wants one), commit, then rerun; not pushing")
             return CHECKS_FAILED
+        todo, _ = applicable(repo, head, checks, say)
+        if checks and not todo:
+            say(f"{head[:10]}: {NONE_APPLY}; not pushing")
+            return CHECKS_FAILED
         started = time.time()
-        for cmd in checks:
+        for cmd in todo:
             if subprocess.run(cmd, shell=True, cwd=repo).returncode != 0:
                 say(f"check failed on {head[:10]}: {cmd}; not pushing")
                 return CHECKS_FAILED
-        if checks and timed:
+        if todo and timed:
             timed(time.time() - started)
         if _fetch(repo, remote, branch) != tip:
             say(f"{upstream} moved during the checks; round {rnd + 1}")

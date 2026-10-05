@@ -902,19 +902,25 @@ def cmd_checks(a) -> None:
     log = Path(run_dir) / "checks.log"
     passed, failed = True, None
     with open(log, "a") as out:
-        for c in cmds:
+        todo, skipped = push.applicable(Path.cwd(), head, cmds, lambda m: (print(f"ttp checks: {m}"),
+                                                                           out.write(f"{m}\n")))
+        if not todo:
+            out.write(f"{push.NONE_APPLY}\n")
+            passed, failed = False, push.NONE_APPLY
+        for c in todo:
             out.write(f"$ {c}\n")
             out.flush()
             if subprocess.run(c, shell=True, stdout=out, stderr=subprocess.STDOUT).returncode != 0:
                 passed, failed = False, c
                 break
-    write_json(Path(run_dir) / prguard.CHECKS_FILE, {"head": head, "passed": passed, "commands": cmds,
-                                                     "ts": time.time()})
+    write_json(Path(run_dir) / prguard.CHECKS_FILE, {"head": head, "passed": passed, "commands": todo,
+                                                     "skipped": skipped, "ts": time.time()})
     if not passed:
         tail = log.read_text(errors="replace").splitlines()[-30:]
         print("\n".join(tail))
         die(f"ttp checks: {failed!r} failed on {head[:12]} (full output: {log})", 1)
-    print(f"ttp checks: {len(cmds)} check(s) passed on {head[:12]}; recorded for the draft PR")
+    more = f", {len(skipped)} skipped as not applicable" if skipped else ""
+    print(f"ttp checks: {len(todo)} check(s) passed on {head[:12]}{more}; recorded for the draft PR")
 
 
 def cmd_lock(a) -> None:
