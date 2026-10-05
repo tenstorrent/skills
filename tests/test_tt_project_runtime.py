@@ -15556,6 +15556,7 @@ DURABLE_EXEMPT = {
     ("cli.py", "tmp.write_text(str(os.getpid()))"): "names a process, which a reboot ends",
     ("cli.py", "os.replace(tmp, lock)"): "names a process, which a reboot ends",
     ("cli.py", 'open(log, "a")'): "the output log of `ttp checks`; its result is written with write_json",
+    ("cli.py", 'open(log, "w")'): "the output of `ttp clip`, for reading; the command's exit code is passed on",
     ("cli.py", "SOURCE_FILE).write_text"): "part of a copied runtime tree; committed or re-installed by setup",
     ("cli.py", '".gitignore").write_text'): "committed to the harness right after",
     ("cli.py", "shim.write_text"): "installed by `ttp setup`, which can be re-run",
@@ -18315,3 +18316,168 @@ def test_web_chealth_resume_uses_delegation():
     assert 'closest("[data-resume-resource]")' in js
     assert js.index('$("#chealth").addEventListener("click"') < js.index("async function refresh()")
     assert "resumeResource" not in body and 'querySelectorAll("[data-resume-resource]")' not in js
+
+
+PYTEST_LOG = "\n".join([*(f"tests/test_x.py::test_{i} PASSED" for i in range(400)),
+                        "=================================== FAILURES ===================================",
+                        "____________________________ test_broken ____________________________",
+                        "    def test_broken():", ">       assert add(1, 1) == 3", "E       assert 2 == 3",
+                        "tests/test_x.py:12: AssertionError",
+                        "=========================== short test summary info ============================",
+                        "FAILED tests/test_x.py::test_broken - assert 2 == 3",
+                        "========================= 1 failed, 400 passed in 3.21s ========================="])
+
+
+def test_trim_cuts_test_output_to_its_failures_and_other_output_to_head_and_tail():
+    from ttp import trim
+    short = trim.summary(PYTEST_LOG, "/run/out/clip-1.log")
+    assert "FAILED tests/test_x.py::test_broken - assert 2 == 3" in short and "E       assert 2 == 3" in short
+    assert "1 failed, 400 passed in 3.21s" in short and "PASSED" not in short, short
+    assert short.endswith("(full output, 409 lines: /run/out/clip-1.log)")
+    build = "\n".join(f"compiling unit {i}" for i in range(1000))
+    short = trim.summary(build, "/run/out/clip-2.log", max_lines=20)
+    lines = short.splitlines()
+    assert lines[0] == "compiling unit 0" and "compiling unit 999" in short and "980 lines left out" in short
+    assert len(lines) == 22, lines
+    assert trim.summary("ok\n", "/p") == "ok", "short output is passed on whole, without a path"
+    assert len(trim.summary("x" * 5000)) < 400, "one huge line is cut too"
+    # A test run that failed without a failure line (a crash at collection) falls back to head and tail.
+    crashed = "ImportError while loading conftest\n" + "\n".join(f"  frame {i}" for i in range(100)) + \
+        "\n1 error in 0.20s"
+    assert "ImportError" in trim.summary(crashed) and "1 error in 0.20s" in trim.summary(crashed)
+
+
+def test_ttp_checks_shows_only_the_failures_of_a_failed_test_run(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    (tmp_path / "pytest.log").write_text(PYTEST_LOG + "\n")
+    (run / "checks.log").write_text("FAILED tests/old.py::test_from_an_earlier_call\n")
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--", "sh", "-c", f"cat {tmp_path / 'pytest.log'}; exit 1"])
+    out = capsys.readouterr()
+    assert e.value.code == 1
+    assert "FAILED tests/test_x.py::test_broken" in out.out and "1 failed, 400 passed" in out.out
+    assert "PASSED" not in out.out and "test_from_an_earlier_call" not in out.out, out.out
+    assert str(run / "checks.log") in out.err and "test_399 PASSED" in (run / "checks.log").read_text()
+
+
+def test_ttp_clip_keeps_the_full_output_in_the_run_folder_and_passes_the_exit_code(env, tmp_path, monkeypatch,
+                                                                                 capsys):
+    run = tmp_path / "run"
+    run.mkdir()
+    monkeypatch.setenv("TTP_RUN_DIR", str(run))
+    (tmp_path / "pytest.log").write_text(PYTEST_LOG + "\n")
+    assert _ttp("clip", "--", "sh", "-c", f"cat {tmp_path / 'pytest.log'}; exit 3") == 3
+    out = capsys.readouterr().out
+    log = run / "out" / "clip-1.log"
+    assert log.read_text() == PYTEST_LOG + "\n"
+    assert "FAILED tests/test_x.py::test_broken" in out and "PASSED" not in out and str(log) in out
+    assert out.rstrip().endswith("(exit 3)")
+    assert _ttp("clip", "--", "echo", "hi there") == 0
+    assert capsys.readouterr().out == "hi there\n(exit 0)\n" and (run / "out" / "clip-2.log").exists()
+
+
+def test_claude_workers_keep_long_command_output_in_a_file(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+
+    def settings(role, read_only=False):
+        tid = p.db.add_task(f"t {role}", "s", kind="code", tier="standard", origin="user")
+        rid = d.start_run(role, "go", "claude", "standard", str(p.root), task=p.db.task(tid), read_only=read_only)
+        (p.runs / str(rid) / "STOP").touch()
+        argv = json.loads((p.runs / str(rid) / "run.json").read_text())["argv"]
+        return json.loads(argv[argv.index("--settings") + 1]) if "--settings" in argv else None
+
+    s = settings("worker")
+    assert s["bashOutputMaxChars"] == 12000 and "ttp.hook PostToolUse" in json.dumps(s), "the hook must stay"
+    assert settings("reviewer")["bashOutputMaxChars"] == 12000
+    p.set_config("budget.bash_output_max_chars", 500)
+    d.cfg = p.config()
+    assert settings("worker")["bashOutputMaxChars"] == 4000, "the CLI's floor"
+    p.set_config("budget.bash_output_max_chars", 0)
+    d.cfg = p.config()
+    assert "bashOutputMaxChars" not in settings("worker")
+    assert settings("coordinator", read_only=True) is None
+
+
+def test_a_worker_that_rereads_too_much_context_is_told_once_to_split(env, tmp_path):
+    p = make(env)
+    from ttp.daemon import Daemon
+    tid = p.db.add_task("long one", "spec", kind="code", tier="standard", origin="user")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    def turn(n, cache_read):
+        msg = {"type": "assistant", "message": {"id": f"m{n}", "content": [],
+                                                "usage": {"input_tokens": 10, "cache_read_input_tokens": cache_read}}}
+        with open(run_dir / "output.jsonl", "a") as f:
+            f.write(json.dumps(msg) + "\n")
+
+    rid = p.db.x("INSERT INTO runs(task,role,provider,model,started,status,dir,boot_id) VALUES(?,?,?,?,?,?,?,?)",
+                 (tid, "worker", "claude", "opus", time.time(), "running", str(run_dir), "x"))
+    d = Daemon(p.base)
+    turn(1, 1_500_000)
+    turn(2, 2_000_000)
+    d.meter_running()
+    assert p.db.one("SELECT cache_read_tokens FROM runs WHERE id=?", (rid,))["cache_read_tokens"] == 3_500_000
+    assert not (run_dir / "steer.md").exists(), "below the standard tier's 4 M line"
+    turn(3, 1_000_000)
+    d._metered.clear()
+    d.meter_running()
+    steer = (run_dir / "steer.md").read_text()
+    assert "re-read about 4.5 M tokens" in steer and "`continue:`" in steer and "commit" in steer
+    turn(4, 2_000_000)
+    d._metered.clear()
+    d.meter_running()
+    assert (run_dir / "steer.md").read_text() == steer, "told once per run"
+    from ttp import hook
+    assert "split line" in hook.unread_update(run_dir)[0], "the worker's hook hands it over"
+    p.set_config("budget.split_reread_tokens", 0)
+    d.cfg = p.config()
+    (run_dir / "steer.md").unlink()
+    d._metered.clear()
+    turn(5, 1)
+    d.meter_running()
+    assert not (run_dir / "steer.md").exists(), "0 turns it off"
+
+
+def test_ttp_stats_reports_reread_tokens_per_run_and_per_dollar_by_kind_and_tier(env, capsys):
+    p = make(env)
+    from ttp import budget as bud
+    now = time.time()
+    code = p.db.add_task("big code change", "s", kind="code", tier="deep", origin="user")
+    review = p.db.add_task("review it", "s", kind="review", tier="standard", origin="user")
+    for task, role, effort, usd, cr, out, age in ((code, "worker", "max", 6.0, 9_000_000, 100_000, 3600),
+                                                  (code, "worker", "max", 2.0, 3_000_000, 20_000, 7200),
+                                                  (review, "reviewer", "high", 1.0, 500_000, 10_000, 600),
+                                                  (None, "coordinator", "low", 0.1, 20_000, 1_000, 60),
+                                                  (code, "worker", "max", 9.0, 50_000_000, 1, 9 * 86400)):
+        p.db.x("INSERT INTO runs(task,role,provider,effort,started,ended,status,cost_usd,cache_read_tokens,"
+               "output_tokens) VALUES(?,?,?,?,?,?,?,?,?,?)",
+               (task, role, "claude", effort, now - age, now - age + 600, "done", usd, cr, out))
+    s = bud.reread_stats(p.db, 7, now=now)
+    assert s["runs"] == 4 and s["cache_read"] == 12_520_000 and s["usd"] == 9.1, "an old run counted"
+    assert s["per_run"] == 3_130_000 and s["per_usd"] == round(12_520_000 / 9.1)
+    # 1.252 M weighted re-read units of 1.252 M + 5 * 131 k output units
+    assert s["share"] == round(1_252_000 / (1_252_000 + 5 * 131_000), 3)
+    top = s["groups"][0]
+    assert (top["role"], top["kind"], top["tier"], top["effort"], top["runs"]) == ("worker", "code", "deep", "max", 2)
+    assert top["per_run"] == 6_000_000 and top["max"] == 9_000_000
+    assert [t["cache_read"] for t in s["top"]] == [9_000_000, 3_000_000, 500_000, 20_000]
+    assert s["top"][0]["title"] == "big code change" and s["top"][0]["minutes"] == 10
+    monkey = pytest.MonkeyPatch()
+    monkey.chdir(p.root)
+    try:
+        cli_rc = _ttp_main("stats", "--days", "7")
+    finally:
+        monkey.undo()
+    out = capsys.readouterr().out
+    assert cli_rc is None and "Context re-reads, last 7 days: 4 runs, $9.10, 12.52 M cache-read tokens" in out
+    assert "worker/code/deep/max: 2 runs, $8.00, 12.00 M (6.00 M per run, max 9.00 M)" in out
+    assert "big code change" in out
+
+
+def _ttp_main(*args):
+    from ttp import cli
+    return cli.main(list(args))

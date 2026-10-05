@@ -18,6 +18,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -796,6 +797,16 @@ def cmd_status(a) -> None:
         print(status_text(p))
 
 
+def cmd_stats(a) -> None:
+    """Context re-read (cache-read) tokens per run and per $, by role, kind, tier and effort."""
+    from . import budget as bud
+    p = need(a.name, sys.argv[1:]) if a.name else here()
+    if not p:
+        die("no tt-project project here; name one: `ttp stats <name>`")
+    s = bud.reread_stats(p.db, a.days, top=a.top)
+    print(json.dumps(s, indent=1) if a.json else bud.reread_text(s))
+
+
 def cmd_web(a) -> None:
     from . import tunnel, weblink
     if a.unkeep:
@@ -975,6 +986,7 @@ def cmd_checks(a) -> None:
     tree = subprocess.run([*git, "rev-parse", "HEAD^{tree}"], capture_output=True, text=True).stdout.strip()
     log = Path(run_dir) / "checks.log"
     passed, failed = True, None
+    start = log.stat().st_size if log.exists() else 0
     with open(log, "a") as out:
         todo, skipped = push.applicable(Path.cwd(), head, cmds, lambda m: (print(f"ttp checks: {m}"),
                                                                            out.write(f"{m}\n")))
@@ -996,8 +1008,10 @@ def cmd_checks(a) -> None:
     write_json(Path(run_dir) / prguard.CHECKS_FILE, {"head": head, "passed": passed, "commands": todo,
                                                      "skipped": skipped, "ts": time.time()})
     if not passed:
-        tail = log.read_text(errors="replace").splitlines()[-30:]
-        print("\n".join(tail))
+        from . import trim
+        with open(log, "rb") as f:   # this call's part of the log: a test run's failures, else head and tail
+            f.seek(start)
+            print(trim.summary(f.read().decode("utf-8", errors="replace")))
         die(f"ttp checks: {failed!r} failed on {head[:12]} (full output: {log})", 1)
     if hit:
         print(said)
@@ -1005,6 +1019,28 @@ def cmd_checks(a) -> None:
     _record_pass(p, tree, todo)
     more = f", {len(skipped)} skipped as not applicable" if skipped else ""
     print(f"ttp checks: {len(todo)} check(s) passed on {head[:12]}{more}; recorded for the draft PR")
+
+
+def cmd_clip(a) -> None:
+    """Run one command with its whole output in a file, and print only what a model needs: a test
+    run's failures, else the head and tail, plus the file's path. Exits with the command's code.
+    Inside a run the file goes in the run's folder (out/), else in a temporary one."""
+    from . import trim
+    cmd = a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd
+    if not cmd:
+        die("usage: ttp clip -- <command>")
+    run_dir = os.environ.get("TTP_RUN_DIR")
+    folder = Path(run_dir) / "out" if run_dir else Path(tempfile.mkdtemp(prefix="ttp-clip-"))
+    folder.mkdir(parents=True, exist_ok=True)
+    n = 1 + sum(1 for _ in folder.glob("clip-*.log"))
+    log = folder / f"clip-{n}.log"
+    with open(log, "w") as out:
+        rc = subprocess.run(shlex.join(cmd) if len(cmd) > 1 else cmd[0], shell=True, stdout=out,
+                            stderr=subprocess.STDOUT).returncode
+    text = log.read_text(errors="replace")
+    print(trim.summary(text, str(log), a.lines))
+    print(f"(exit {rc})")
+    sys.exit(rc)
 
 
 def cmd_lock(a) -> None:
@@ -1948,6 +1984,19 @@ def main(argv: list[str] | None = None) -> None:
                    help="run the checks even when they already passed on this tree")
     s.add_argument("cmd", nargs=argparse.REMAINDER, help="extra check command after --")
     s.set_defaults(fn=cmd_checks)
+
+    s = sub.add_parser("stats", help="context re-read (cache-read) tokens per run and per $, by kind and tier")
+    s.add_argument("name", nargs="?")
+    s.add_argument("--days", type=float, default=7)
+    s.add_argument("--top", type=int, default=10)
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_stats)
+
+    s = sub.add_parser("clip", help="run a command, keep its full output in a file and print a short "
+                                    "excerpt (a test run's failures) plus the path")
+    s.add_argument("--lines", type=int, default=40, help="at most this many lines of an ordinary excerpt")
+    s.add_argument("cmd", nargs=argparse.REMAINDER, help="the command, after --")
+    s.set_defaults(fn=cmd_clip)
 
     s = sub.add_parser("lock", help="(inside a run) hold a shared resource while one command runs")
     s.add_argument("resource")

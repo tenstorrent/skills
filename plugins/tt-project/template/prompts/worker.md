@@ -27,7 +27,8 @@
 
 - Run `ttp note "<one line>"` at each milestone. Humans read these live.
 - Make durable progress early: commit, write files. A killed run keeps what is on disk.
-- Send big command output (builds, test logs) to a file and read only the part you need.
+- Run builds and test suites as `ttp clip -- <command>`: the full output goes to a file and you
+  get the failures (or head and tail) and its path. Read only the part you need.
 
 ## Working in parallel
 
@@ -140,4 +141,8 @@ Before you finish, write `$TTP_RUN_DIR/result.json`:
 - Anything still running when you stop must be detached from your session
   (`setsid nohup <cmd> > <log> 2>&1 &`), or it is killed with you. Your own background tasks
   do not outlive the run.
+- Keep runs short: a run re-reads its whole context on every call. When the work is more than one
+  run should hold, or the harness says the run passed its split line, finish the step, commit and
+  hand off `done` with a `followups` entry titled `continue: ...` (what is done, branch and head,
+  what is left).
 - No `result.json`, no credit: a run that ends without one counts as an unfinished attempt.

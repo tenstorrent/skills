@@ -114,6 +114,19 @@ class Claude(Provider):
             return {}
         return {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": str(min(max(int(tokens), 100_000), 1_000_000))}
 
+    def cap_output(self, argv: list[str], chars: int) -> list[str]:
+        # `bashOutputMaxChars` (CLI 2.1.285): longer output of a successful command is saved to a file
+        # and the model gets a short preview plus the path. The CLI clamps it to 4000-128000.
+        if not chars or chars <= 0 or "--settings" not in argv:
+            return argv
+        i = argv.index("--settings") + 1
+        try:
+            settings = json.loads(argv[i])
+        except (IndexError, ValueError):
+            return argv
+        settings["bashOutputMaxChars"] = min(max(int(chars), 4000), 128000)
+        return [*argv[:i], json.dumps(settings), *argv[i + 1:]]
+
     def supports(self, flag: str) -> bool:
         if flag not in _FLAGS:
             try:

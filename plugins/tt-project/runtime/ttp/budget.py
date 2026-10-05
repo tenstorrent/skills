@@ -486,3 +486,53 @@ def history(db: DB, days: int = 14) -> dict:
     by_source = db.q("SELECT source, provider, ROUND(SUM(usd),2) usd, COUNT(*) n FROM ledger WHERE ts>=? "
                      "GROUP BY source, provider ORDER BY usd DESC LIMIT 40", (time.time() - WEEK,))
     return {"daily_spend": spend, "window_peaks": peaks, "top_sources_7d": by_source}
+
+
+def reread_stats(db: DB, days: float = 7, now: float | None = None, top: int = 10) -> dict:
+    """Context re-read (cache-read) tokens of the runs started in the last `days`: per run, per $,
+    their share of the weighted tokens, by role, task kind, tier and effort, and the top runs. A long
+    run re-reads its whole context on every call, so this is what trimming output and splitting long
+    tasks cut. `ttp stats` prints it; run it before and after a change to compare."""
+    now = now or time.time()
+    since = now - days * 86400
+    w = TOKEN_WEIGHTS
+    rows = db.q("SELECT r.id, r.task, r.role, r.effort, r.started, r.ended, r.cost_usd, r.input_tokens, "
+                "r.output_tokens, r.cache_read_tokens, r.cache_write_tokens, t.kind, t.tier, t.title "
+                "FROM runs r LEFT JOIN tasks t ON t.id=r.task WHERE r.started>=?", (since,))
+
+    def total(rs: list, k: str) -> float:
+        return sum(r[k] or 0 for r in rs)
+
+    def summary(rs: list) -> dict:
+        n, usd, cr = len(rs), total(rs, "cost_usd"), int(total(rs, "cache_read_tokens"))
+        units = (total(rs, "input_tokens") * w["input"] + total(rs, "output_tokens") * w["output"]
+                 + cr * w["cache_read"] + total(rs, "cache_write_tokens") * w["cache_write"])
+        return {"runs": n, "usd": round(usd, 2), "cache_read": cr, "per_run": round(cr / n) if n else 0,
+                "per_usd": round(cr / usd) if usd else 0, "max": max((r["cache_read_tokens"] or 0 for r in rs), default=0),
+                "share": round(cr * w["cache_read"] / units, 3) if units else 0.0}
+
+    groups: dict[tuple, list] = {}
+    for r in rows:
+        groups.setdefault((r["role"], r["kind"] or "-", r["tier"] or "-", r["effort"] or "-"), []).append(r)
+    by = [{"role": k[0], "kind": k[1], "tier": k[2], "effort": k[3], **summary(v)} for k, v in groups.items()]
+    by.sort(key=lambda g: -g["cache_read"])
+    worst = sorted(rows, key=lambda r: -(r["cache_read_tokens"] or 0))[:top]
+    return {"days": days, "since": since, **summary(rows), "groups": by,
+            "top": [{"run": r["id"], "task": r["task"], "role": r["role"], "kind": r["kind"], "tier": r["tier"],
+                     "effort": r["effort"], "usd": round(r["cost_usd"] or 0, 2), "cache_read": r["cache_read_tokens"] or 0,
+                     "minutes": round(((r["ended"] or now) - (r["started"] or now)) / 60),
+                     "title": (r["title"] or "")[:60]} for r in worst]}
+
+
+def reread_text(s: dict) -> str:
+    """`reread_stats` for people: totals, the groups and the top runs, one line each."""
+    m = lambda n: f"{n / 1e6:.2f} M"
+    lines = [f"Context re-reads, last {s['days']:g} days: {s['runs']} runs, ${s['usd']:.2f}, {m(s['cache_read'])} "
+             f"cache-read tokens ({m(s['per_run'])} per run, {m(s['per_usd'])} per $, {s['share']:.0%} of "
+             "weighted tokens)", "By role / kind / tier / effort:"]
+    lines += [f"  {g['role']}/{g['kind']}/{g['tier']}/{g['effort']}: {g['runs']} runs, ${g['usd']:.2f}, "
+              f"{m(g['cache_read'])} ({m(g['per_run'])} per run, max {m(g['max'])})" for g in s["groups"]]
+    lines.append("Top runs:")
+    lines += [f"  run {t['run']} (#{t['task'] or '-'} {t['kind'] or t['role']}/{t['tier'] or '-'}/{t['effort'] or '-'}, "
+              f"{t['minutes']} min, ${t['usd']:.2f}): {m(t['cache_read'])} {t['title']}".rstrip() for t in s["top"]]
+    return "\n".join(lines)

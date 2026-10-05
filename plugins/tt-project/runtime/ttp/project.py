@@ -49,6 +49,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # own default). Long runs otherwise re-read a huge context on every call. Claude Code
         # accepts 100k to 1M (smaller values become 100k) and compacts about 33k below the window.
         "compact_window_tokens": {"light": 100000, "standard": 150000, "deep": 200000},
+        # A worker whose run has re-read this many context tokens (cache reads, summed over its calls)
+        # is told once to finish its step and hand the rest on as a follow-up (0 = never).
+        "split_reread_tokens": {"light": 2000000, "standard": 4000000, "deep": 8000000},
+        # Claude Code keeps a Bash command's output inline up to this many characters (it accepts
+        # 4000-128000; its own default is 30000); longer output goes to a file, and the worker gets a
+        # short preview and the path. 0 leaves the agent's default.
+        "bash_output_max_chars": 12000,
         "exclusive_wait_s": 600,        # an exclusive run waiting for its resource gives up after this
         # A run that ends without reporting its cost is estimated from its tokens at the project's
         # own observed rate; until there is one, this $ per million weighted tokens (set high).

@@ -160,6 +160,11 @@ class Provider:
         is a flag or config override rather than an environment variable; [] if none or 0."""
         return []
 
+    def cap_output(self, argv: list[str], chars: int) -> list[str]:
+        """`argv` with the agent keeping a command's output inline only up to `chars` characters (the
+        rest in a file it is pointed to); `argv` unchanged when it has no such setting or `chars` is 0."""
+        return argv
+
     def streams(self, argv: list[str]) -> bool:
         """Whether a run started with `argv` writes its output as it goes, so an empty output means
         the agent did nothing (rather than that it had not finished)."""

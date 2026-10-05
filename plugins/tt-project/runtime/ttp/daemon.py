@@ -569,6 +569,7 @@ class Daemon:
             window = window.get(tier) if isinstance(window, dict) else window
             env = {**env, **prov.compact_env(int(window or 0))}
             argv = _before_stdin(argv, prov.compact_args(int(window or 0)))
+            argv = prov.cap_output(argv, int(self.cfg["budget"].get("bash_output_max_chars") or 0))
         mcp_servers: dict = {}
         resume_extra: list[str] = []
         private: list[str] = []   # files that may hold credentials, removed when the run ends
@@ -935,9 +936,31 @@ class Daemon:
             except Exception:
                 continue
             # The tokens also show a run on a logged-out provider got past the login (alerts.holds).
-            self.p.db.x("UPDATE runs SET cost_usd=?, cost_estimated=1, input_tokens=?, output_tokens=? "
-                        "WHERE id=? AND status='running'",
-                        (cost, usage.input_tokens or 0, usage.output_tokens or 0, r["id"]))
+            self.p.db.x("UPDATE runs SET cost_usd=?, cost_estimated=1, input_tokens=?, output_tokens=?, "
+                        "cache_read_tokens=? WHERE id=? AND status='running'",
+                        (cost, usage.input_tokens or 0, usage.output_tokens or 0, usage.cache_read_tokens or 0,
+                         r["id"]))
+            self._suggest_split(r, usage.cache_read_tokens or 0)
+
+    def _suggest_split(self, r: dict, reread: int) -> None:
+        """Once a worker's run has re-read more context than `budget.split_reread_tokens` allows for
+        its tier, tell it (through steer.md, once) to finish the step it is on and hand the rest on
+        as a follow-up: a fresh run starts from a small context instead of re-reading a huge one on
+        every call."""
+        if r["role"] == "coordinator" or not r["task"] or not r["dir"]:
+            return
+        limit = self.cfg["budget"].get("split_reread_tokens") or 0   # 0: off for every tier
+        if isinstance(limit, dict):
+            task = self.p.db.task(r["task"]) or {}
+            limit = limit.get(task.get("tier") or "standard") or 0
+        if not limit or reread < int(limit):
+            return
+        coord._append_update(Path(r["dir"]) / "steer.md", (
+            f"This run has re-read about {reread / 1e6:.1f} M tokens of context (the split line for its tier "
+            f"is {int(limit) / 1e6:.1f} M); every further call re-reads it all again. Finish the step you are "
+            "on, commit, and hand off: `done` with a `followups` entry (title starting `continue:`) whose "
+            "spec is self-contained (what is done, the branch and head, what is left), or `waiting` if "
+            "that fits. Do not start new large steps in this run."), f"split-{r['id']}")
 
     def _priced(self, r: dict, usage) -> float:
         if usage.estimated and not usage.cost_usd:
