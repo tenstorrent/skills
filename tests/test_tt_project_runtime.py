@@ -1007,9 +1007,10 @@ def test_an_open_alert_episode_is_not_rebroadcast_and_reminds_once_after_a_day(e
     assert len(_episodes(p, "auth:fake")) == 1
 
 
-def test_a_machine_wide_alert_is_broadcast_by_one_project_and_shown_quietly_by_the_others(env):
+def test_a_machine_wide_alert_is_broadcast_by_one_project_and_shown_quietly_by_the_others(env, monkeypatch):
     p = make(env)
-    from ttp import notifier
+    from ttp import alerts, notifier
+    monkeypatch.setattr(alerts, "owner_alive", lambda owner: True)   # no daemon runs in the test
     from ttp.cli import bootstrap
     from ttp.daemon import Daemon
     from ttp.web import attention
@@ -1042,6 +1043,69 @@ def test_a_machine_wide_alert_is_broadcast_by_one_project_and_shown_quietly_by_t
     Daemon(p.base).alert("auth:fake", "fake is logged out again", "high")
     assert [m["text"] for m in q.db.unread_for_chat("c1", 0)][-1] == "fake is logged out again"
     assert [m["text"] for m in p.db.unread_for_chat("c1", 0)][-1] == "Cleared: fake works again: a run succeeded after the logout alert."
+
+
+def _two_projects(env):
+    from ttp.cli import bootstrap
+    p = make(env)
+    repo2 = env["tmp"] / "repo2"
+    subprocess.run(["git", "clone", "-q", str(env["repo"]), str(repo2)], check=True)
+    q = bootstrap(repo2, "second", "Another project.", "fake")
+    for x in (p, q):
+        x.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)",
+               (time.time(), "t", time.time()))
+    return p, q
+
+
+def test_a_claim_from_an_earlier_logout_does_not_silence_the_next_one(env, monkeypatch):
+    # p broadcast the first logout and stays idle (its episode and claim stay open); q posted it
+    # quietly. The user logs in again and only q runs, so only q's episode clears.
+    from ttp import alerts
+    from ttp.daemon import Daemon
+    monkeypatch.setattr(alerts, "owner_alive", lambda owner: True)
+    p, q = _two_projects(env)
+    Daemon(p.base).alert("auth:fake", "fake is logged out", "high")
+    Daemon(q.base).alert("auth:fake", "fake is logged out", "high")
+    assert q.db.unread_for_chat("c1", 0) == []
+    stale = json.loads(alerts.claims_path().read_text())
+    q.db.x("INSERT INTO runs(role,provider,started,ended,status) VALUES('worker','fake',?,?,'ok')",
+           (time.time() + 1, time.time() + 1))
+    Daemon(q.base).sweep_alerts()
+    assert _episodes(p, "auth:fake")[0]["cleared"] is None and _episodes(q, "auth:fake")[0]["cleared"]
+    assert json.loads(alerts.claims_path().read_text()) == {}, "the clear drops the idle project's claim"
+    Daemon(q.base).alert("auth:fake", "fake is logged out again", "high")
+    assert [m["text"] for m in q.db.unread_for_chat("c1", 0)] == ["fake is logged out again"], \
+        "a new logout reached no chat"
+    # Even a claim the clear could not drop (an older runtime, a failed write) is stale for a
+    # project whose own episode cleared after it was taken.
+    q.db.x("INSERT INTO runs(role,provider,started,ended,status) VALUES('worker','fake',?,?,'ok')",
+           (time.time() + 2, time.time() + 2))
+    Daemon(q.base).sweep_alerts()
+    alerts.claims_path().write_text(json.dumps(stale))
+    Daemon(q.base).alert("auth:fake", "fake is logged out a third time", "high")
+    assert [m["text"] for m in q.db.unread_for_chat("c1", 0)][-1] == "fake is logged out a third time"
+
+
+def test_a_stopped_claimers_claim_does_not_silence_the_others(env, monkeypatch):
+    from ttp import alerts
+    from ttp.daemon import Daemon
+    p, q = _two_projects(env)
+    running = {str(p.base), str(q.base)}
+    monkeypatch.setattr(alerts, "owner_alive", lambda owner: owner in running)
+    start = time.time()
+    clock = {"t": start}
+    monkeypatch.setattr(time, "time", lambda: clock["t"])
+    Daemon(p.base).alert("auth:fake", "fake is logged out", "high")
+    Daemon(q.base).alert("auth:fake", "fake is logged out", "high")
+    assert q.db.unread_for_chat("c1", 0) == []
+    running.discard(str(p.base))   # p's daemon stops for good, still holding the claim
+    clock["t"] = start + alerts.REMIND_S + 1800   # before the claim's TTL runs out
+    assert clock["t"] - start < alerts.CLAIM_TTL
+    Daemon(q.base).alert("auth:fake", "fake is still logged out", "high")
+    assert [m["text"] for m in q.db.unread_for_chat("c1", 0)] == ["fake is still logged out"], \
+        "the day's reminder was left to a stopped project"
+    from ttp.project import hostname
+    assert json.loads(alerts.claims_path().read_text())[f"{hostname()}|auth:fake"]["owner"] == str(q.base)
 
 
 def test_productive_burst_is_not_a_runaway_but_waste_is(env):

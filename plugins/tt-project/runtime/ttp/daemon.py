@@ -2433,7 +2433,11 @@ class Daemon:
                 return
             if not ep and not tracked and now - last < every_s:
                 return
-            quiet = bool(claim_key) and not alerts.claim(claim_key, key, str(self.p.base), now)
+            if claim_key:
+                prev = db.one("SELECT MAX(cleared) AS c FROM alerts WHERE key=?", (key,))
+                quiet = not alerts.claim(claim_key, key, str(self.p.base), now, float(prev["c"] or 0) if prev else 0.0)
+            else:
+                quiet = False
             sent[key] = now
             # Kept as long as the longest interval any alert uses, so a monthly one is not forgotten
             # (and re-sent) after a week.
@@ -2457,12 +2461,26 @@ class Daemon:
                 return None
         return None
 
+    def _cleared_claims(self, key: str) -> list[str]:
+        """The claim keys a cleared machine-wide episode ends: the CLI's, or each filesystem this
+        project's disk guard watches (the low one is no longer recorded once it cleared)."""
+        if key.startswith("auth:"):
+            return [f"{hostname()}|{key}"]
+        out = []
+        for path in (self.p.base, self.p.worktrees):
+            try:
+                out.append(f"{hostname()}|disk|{os.stat(path).st_dev}")
+            except OSError:
+                pass
+        return out
+
     def sweep_alerts(self) -> None:
         """Close alert episodes whose condition cleared (stored with the time; the chats hear it once)."""
         for ep in alerts.sweep(self.p.db):
             log(self.p, f"alert cleared: {ep['key']} ({ep['cleared_why']})")
             if ep["key"].startswith("auth:") or ep["key"] == "disk":
-                alerts.release(ep["key"], str(self.p.base))   # the next project to see it broadcasts it
+                # Whoever holds the claim: the next project to see the condition again broadcasts it.
+                alerts.release(self._cleared_claims(ep["key"]), ep["cleared"])
             kind, _, prov = ep["key"].partition(":")
             if kind == "auth":
                 # Tasks dispatch skips for another reason (the disk guard) would keep a stale note.

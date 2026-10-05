@@ -173,9 +173,11 @@ def claims_path() -> Path:
     return HOME_DIR / "alert-claims.json"
 
 
-def claim(claim_key: str, key: str, owner: str, now: float) -> bool:
+def claim(claim_key: str, key: str, owner: str, now: float, cleared: float = 0.0) -> bool:
     """Take or renew this user's claim on broadcasting a machine-wide condition. False while another
-    project holds a live claim. A claim file that cannot be read or written never silences anyone."""
+    project holds a live claim. A claim is stale, and taken over, once it is older than the caller's
+    last cleared episode of the condition (it belongs to an earlier one) or its owner's daemon is
+    gone. A claim file that cannot be read or written never silences anyone."""
     path = claims_path()
     try:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -191,7 +193,8 @@ def claim(claim_key: str, key: str, owner: str, now: float) -> bool:
         data = {k: v for k, v in (data if isinstance(data, dict) else {}).items()
                 if isinstance(v, dict) and now - float(v.get("ts") or 0) < CLAIM_TTL}
         held = data.get(claim_key)
-        if held and held.get("owner") != owner:
+        if (held and held.get("owner") != owner and float(held.get("ts") or 0) > cleared
+                and owner_alive(str(held.get("owner")))):
             return False
         data[claim_key] = {"owner": owner, "alert": key, "ts": now}
         from .project import write_json
@@ -203,11 +206,12 @@ def claim(claim_key: str, key: str, owner: str, now: float) -> bool:
         os.close(fd)
 
 
-def release(key: str, owner: str) -> None:
-    """Drop this project's claims for an alert key once its episode cleared, so the next project
-    that sees the condition broadcasts it at once."""
+def release(claim_keys: list[str], cleared: float) -> None:
+    """Drop every claim on these machine-wide conditions taken before an episode of theirs cleared,
+    whoever holds it: the condition went away for all projects alike, so the next project that sees
+    it again broadcasts it at once, even while the old claimer sits idle or is stopped."""
     path = claims_path()
-    if not path.exists():
+    if not claim_keys or not path.exists():
         return
     try:
         fd = os.open(str(path.with_suffix(".lock")), os.O_RDWR | os.O_CREAT, 0o600)
@@ -219,8 +223,10 @@ def release(key: str, owner: str) -> None:
             data = json.loads(path.read_text())
         except (OSError, ValueError):
             return
+        if not isinstance(data, dict):
+            return
         keep = {k: v for k, v in data.items()
-                if not (isinstance(v, dict) and v.get("owner") == owner and v.get("alert") == key)}
+                if not (k in claim_keys and isinstance(v, dict) and float(v.get("ts") or 0) <= cleared)}
         if keep != data:
             from .project import write_json
             write_json(path, keep, 0o600)
@@ -228,6 +234,14 @@ def release(key: str, owner: str) -> None:
         pass
     finally:
         os.close(fd)
+
+
+def owner_alive(owner: str) -> bool:
+    """The project at `owner` has a running daemon: its pid file (removed when the daemon stops)
+    names a live one."""
+    from .daemon import _is_daemon, _read_pid
+    pid = _read_pid(Path(owner) / "state" / "daemon.pid")
+    return bool(pid) and _is_daemon(pid)
 
 
 KEYLESS_TTL = 3600   # seconds an alert without a condition key stays in the top section
