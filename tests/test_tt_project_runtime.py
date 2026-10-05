@@ -21936,6 +21936,30 @@ def test_a_non_cumulative_report_is_booked_in_full(env):
     assert d._net_of_session(r, u) == 8.0 and "session_cost_usd" not in u.extra
 
 
+def _net(d, r, reported, own_usd):
+    """Net a report against the session's $4.00 booking; this run's own tokens price at `own_usd`."""
+    u = _reported(reported, output_tokens=round(own_usd * 200_000))
+    return d._net_of_session(r, u), "session_cost_usd" in u.extra
+
+
+def test_resume_netting_thresholds(env):
+    """Pins the netting line: net only when 0 <= delta and delta >= own * AGREE - SLACK, then book
+    max(delta, own); otherwise book the full report."""
+    p = make(env)
+    p.set_config("budget.estimate_usd_per_mtok", 1.0)   # 200k output tokens price at $1.00
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    _, _, r = _session_runs(d, booked=4.0)
+    # Own $4.00, so the slack is minor: the line is $1.95.
+    assert _net(d, r, 5.95, 4.0) == (4.0, True), "a delta at the agree line was not netted"
+    assert _net(d, r, 5.94, 4.0) == (5.94, False), "a delta below the agree line was netted"
+    # Own $0.40: the line is $0.15, so only the slack lets a $0.16 delta net.
+    assert _net(d, r, 4.16, 0.4) == (0.4, True), "the slack did not let a small delta net"
+    assert _net(d, r, 4.14, 0.4) == (4.14, False), "a delta past the slack was netted"
+    # A report a little below what the session booked is this run's own cost, even with no own tokens.
+    assert _net(d, r, 3.99, 0.0) == (3.99, False), "a negative delta was netted"
+
+
 def test_a_finished_resume_books_the_session_delta_to_its_task(env):
     p = make(env)
     p.set_config("budget.estimate_usd_per_mtok", 1.0)
