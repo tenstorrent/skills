@@ -14534,3 +14534,95 @@ def test_set_when_drops_the_old_probe_verdict(env, monkeypatch):
     d._probes[tid][0].wait(10)
     d.probe_waiting()
     assert p.db.task(tid)["not_before"] == nb
+
+
+def _fail_review(env, p, rid, followups=()):
+    """Review `rid` ran and handed off `failed`, with `followups` as its fix specs."""
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage as Usage
+    p.db.update_task(rid, status="running")
+    run_dir = env["tmp"] / f"run-{rid}"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps(
+        {"status": "failed", "summary": "blocking findings", "followups": list(followups)}))
+    d = Daemon(p.base)
+    d._finish_worker({"task": rid}, Usage(cost_usd=1.0), "ok", run_dir)
+    d.reconcile_tasks()
+    return p.db.one("SELECT * FROM events WHERE task=? AND kind='task_failed'", (rid,))
+
+
+def test_a_failed_review_with_fixes_moves_its_dependents_onto_the_re_review(env):
+    p = make(env)
+    from ttp import worktree
+    from ttp.db import continues_id, dependency_ids
+    code, branch, _, (rev,) = _finish_code(env, p, "feature", {"app.py": 40})
+    waiter = p.db.add_task("deploy it", "s", origin="coordinator", depends_on=[rev["id"]])
+    fups = [{"title": "add the missing test", "spec": "test_x must fail without the change"},
+            {"title": "handle empty input", "spec": "parse('') raises"}]
+    failed = _fail_review(env, p, rev["id"], fups)
+    (fix,) = p.db.q("SELECT * FROM tasks WHERE kind='code' AND origin='daemon'")
+    (re_rev,) = p.db.q("SELECT * FROM tasks WHERE kind='review' AND id!=?", (rev["id"],))
+    assert fix["title"] == f"Fix review #{rev['id']}: feature" and continues_id(fix) == code
+    assert "test_x must fail" in fix["spec"] and "parse('') raises" in fix["spec"] and branch in fix["spec"]
+    assert dependency_ids(re_rev) == [fix["id"]] and continues_id(re_rev) == rev["id"]
+    assert fix["branch"] in re_rev["spec"] and "add the missing test" in re_rev["spec"]
+    assert "Review only" in re_rev["spec"], "the re-review dropped the failed review's own steps"
+    w = p.db.task(waiter)
+    assert w["status"] == "queued" and dependency_ids(w) == [re_rev["id"]], "the dependent was blocked"
+    assert failed["status"] == "handled", "a failed review the daemon handled still starts a coordinator turn"
+    assert f"Fix #{fix['id']} and re-review #{re_rev['id']}" in failed["text"] and f"#{waiter} now wait" in failed["text"]
+    assert {e["status"] for e in p.db.q("SELECT status FROM events WHERE kind='followup_proposed'")} == {"handled"}
+    # The fix builds on the reviewed branch, and its hand-off reuses the re-review instead of adding one.
+    path, fbranch = worktree.ensure(p, p.db.task(fix["id"]))
+    assert fbranch == fix["branch"] and (path / "app.py").exists()
+    (path / "test_x.py").write_text("def test_x(): pass\n")
+    _git_out(path, "add", ".")
+    _git_out(path, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "fix")
+    p.db.update_task(fix["id"], status="running")
+    run_dir = env["tmp"] / f"run-{fix['id']}"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps({"status": "done", "summary": "fixed"}))
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage as Usage
+    Daemon(p.base)._finish_worker({"task": fix["id"]}, Usage(cost_usd=1.0), "ok", run_dir)
+    done = p.db.one("SELECT * FROM events WHERE task=? AND kind='task_done'", (fix["id"],))
+    assert done["status"] == "handled" and f"Review #{re_rev['id']} was already queued" in done["text"]
+    assert len(p.db.q("SELECT id FROM tasks WHERE kind='review'")) == 2
+    # The re-review fails too: one more round on the fix's branch, then the coordinator decides.
+    _fail_review(env, p, re_rev["id"], fups[:1])
+    fix2 = p.db.one("SELECT * FROM tasks WHERE kind='code' AND origin='daemon' AND id!=?", (fix["id"],))
+    assert fix2 and continues_id(fix2) == fix["id"] and fix2["title"] == f"Fix review #{re_rev['id']}: feature"
+    re_rev2 = p.db.one("SELECT * FROM tasks WHERE kind='review' AND depends_on=?", (json.dumps([fix2["id"]]),))
+    assert re_rev2["title"] == f"Re-review #{re_rev['id']}: Review #{code}: feature"
+    assert dependency_ids(p.db.task(waiter)) == [re_rev2["id"]]
+    p.db.update_task(fix2["id"], status="done")
+    third = _fail_review(env, p, re_rev2["id"], fups[:1])
+    assert third["status"] == "queued" and "Fix #" not in third["text"]
+    w = p.db.task(waiter)
+    assert w["status"] == "blocked" and w["blocked_reason"] == f"dependency #{re_rev2['id']} failed"
+
+
+def test_a_failed_review_without_fixes_still_blocks_its_dependents(env):
+    p = make(env)
+    _, _, _, (rev,) = _finish_code(env, p, "feature", {"app.py": 40})
+    waiter = p.db.add_task("deploy it", "s", origin="coordinator", depends_on=[rev["id"]])
+    failed = _fail_review(env, p, rev["id"])
+    assert p.db.q("SELECT id FROM tasks WHERE origin='daemon' AND kind='code'") == []
+    assert failed["status"] == "queued" and "Fix #" not in failed["text"]
+    w = p.db.task(waiter)
+    assert w["status"] == "blocked" and w["blocked_reason"] == f"dependency #{rev['id']} failed"
+    # Fixes for a review of two unrelated branches: no single branch to fix on, so the coordinator decides.
+    a, _, _, _ = _finish_code(env, p, "change a", {"a.py": 5})
+    b, _, _, _ = _finish_code(env, p, "change b", {"b.py": 5})
+    both = p.db.add_task("Review a and b", "Review both.", kind="review", origin="coordinator", depends_on=[a, b])
+    waiter2 = p.db.add_task("after both", "s", origin="coordinator", depends_on=[both])
+    failed = _fail_review(env, p, both, [{"title": "fix a", "spec": "s"}])
+    assert failed["status"] == "queued" and p.db.task(waiter2)["status"] == "blocked"
+    assert p.db.q("SELECT id FROM tasks WHERE origin='daemon' AND kind='code'") == []
+    # Auto reviews off: the same.
+    p.set_config("review.auto", False)
+    _, _, _, _ = _finish_code(env, p, "change c", {"c.py": 5})
+    c_rev = p.db.add_task("Review c", "Review it.", kind="review", origin="coordinator",
+                          depends_on=[p.db.one("SELECT id FROM tasks WHERE title='change c'")["id"]])
+    failed = _fail_review(env, p, c_rev, [{"title": "fix c", "spec": "s"}])
+    assert failed["status"] == "queued" and p.db.q("SELECT id FROM tasks WHERE origin='daemon' AND kind='code'") == []

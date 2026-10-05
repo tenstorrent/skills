@@ -90,7 +90,10 @@ and preferences you add later become part of the project's charter and memory.
   findings itself (`review.auto`, on by default), and that hand-off starts no coordinator turn.
   Any other hand-off leaves the review to the coordinator's turn. `review.auto_notes` is added
   to each such review's spec (for example, what to do after a push). A review the coordinator adds
-  for the same work replaces the daemon's while it has not started.
+  for the same work replaces the daemon's while it has not started. A review that fails with
+  follow-ups gets one fix task on the reviewed branch and a re-review from the daemon, and the
+  tasks waiting on the failed review wait on the re-review instead of being blocked (at most two
+  rounds per stack; a failure without follow-ups still blocks them).
 - Each tier maps to a model and effort per provider (`providers.<name>.tiers`). The coordinator
   runs at `coordinator.tier` (light) unless `coordinator.model` or `coordinator.effort` is set:
   those pin the coordinator alone, so moving the light tier to a cheaper model does not move it.

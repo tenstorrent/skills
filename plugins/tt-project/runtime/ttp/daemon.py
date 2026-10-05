@@ -62,6 +62,9 @@ WAIT_KEYS = ("retry_when", "retry_after_s", "waiting_for", "wake_tier", "survive
 MAX_FOLLOWUPS, FOLLOWUP_SPEC_CHARS = 12, 4000   # per hand-off; each follow-up is its own event
 # What a review the daemon queues repeats of the code task's spec and hand-off.
 AUTO_REVIEW_SPEC_CHARS, AUTO_REVIEW_SUMMARY_CHARS = 2000, 1000
+# A failed review with fix specs gets its fix and re-review from the daemon this many rounds per stack;
+# the re-review repeats the failed review's spec (its push and after-push steps) up to this length.
+AUTO_FIX_ROUNDS, REVIEW_FIX_SPEC_CHARS = 2, 8000
 PROBE_EVERY_S = 180     # how often a waiting task's `retry_when` (or a deferred one's `start_when`) probe runs
 NOT_YET_RCS = (1, 75, 255)   # probe exits meaning "not yet": 1, EX_TEMPFAIL (a busy `ttp lock`), ssh unreachable
 PROBE_TIMEOUT_S = 60
@@ -1258,7 +1261,15 @@ class Daemon:
             if new == "done" and task["kind"] == "code" else None
         if review:
             text += f"\nReview #{review[0]} " + ("queued by the daemon." if review[1] else "was already queued.")
-        routine = review is not None and plain
+        # A review that failed with fix specs gets its fix and re-review from the daemon, and what waited
+        # on it waits on the re-review instead of being blocked. A failure without them still blocks.
+        fix = self._fix_failed_review(dict(task, **upd), fups, summary) \
+            if new == "failed" and task["kind"] == "review" and fups and len(fups) <= MAX_FOLLOWUPS else None
+        if fix:
+            moved = ", ".join(f"#{i}" for i in fix[2])
+            text += (f"\nFix #{fix[0]} and re-review #{fix[1]} queued by the daemon"
+                     + (f"; {moved} now wait on #{fix[1]}." if moved else "."))
+        routine = (review is not None and plain) or fix is not None
         db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
              (time.time(), f"task:{task['id']}", f"task_{new}", sev, text,
               "handled" if quiet or routine else "queued", task["id"]))
@@ -1273,7 +1284,8 @@ class Daemon:
             db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                  (time.time(), f"task:{task['id']}", "followup_proposed", "normal",
                   f"proposed follow-up: {str(f['title'])[:200]}{f' [{start}]' if start else ''} — "
-                  f"{_cut(str(f.get('spec', '')), FOLLOWUP_SPEC_CHARS, where)}", "queued", task["id"]))
+                  f"{_cut(str(f.get('spec', '')), FOLLOWUP_SPEC_CHARS, where)}", "handled" if fix else "queued",
+                  task["id"]))
 
     # money ----------------------------------------------------------------------------------------
     def _refresh_meters(self, every_s: float = 600) -> None:
@@ -2472,6 +2484,77 @@ class Daemon:
                           depends_on=[task["id"]], labels=labels)
         log(self.p, f"task {task['id']}: queued review #{rid} ({tier})")
         return rid, True
+
+    def _fix_failed_review(self, review: dict, fups: list[dict], summary: str) -> tuple[int, int, list[int]] | None:
+        """A review that failed with fix specs, handled the way the coordinator would: one code task
+        fixes them all on top of the reviewed branch, and a re-review that waits on it takes over the
+        failed review's dependents: (fix id, re-review id, the dependents moved). None when auto
+        reviews are off, the review covers no single code branch, AUTO_FIX_ROUNDS reviews of this
+        stack already failed, a task cap is reached or a task already continues it: the coordinator
+        then decides, and the dependents are blocked as before."""
+        cfg, db = self.cfg, self.p.db
+        d = cfg.get("delivery") or {}
+        if not (cfg.get("review") or {}).get("auto", True) or not (d.get("review_before_pr", True) or d.get("push_branch")):
+            return None
+        rounds, seen, c = 1, {review["id"]}, continues_id(review)
+        while c is not None and c not in seen and (t := db.task(c)):
+            seen.add(c)
+            rounds += t["kind"] == "review"
+            c = continues_id(t)
+        if rounds > AUTO_FIX_ROUNDS or db.one("SELECT id FROM tasks WHERE labels LIKE ?",
+                                              (f'%"continues:{review["id"]}"%',)):
+            return None
+        if coord.next_task_slot(db, coord.task_cap(cfg)) is not None \
+                or coord.next_task_slot(db, coord.task_cap(cfg, True), review=True) is not None:
+            return None
+        spec = review.get("spec") or ""
+        cands = [t for i in sorted(coord._covered(db, dependency_ids(review), spec))
+                 for t in [db.task(i)] if t and t["kind"] == "code" and t["branch"]]
+        try:
+            # A review of a stack (a fix on top of its change) is fixed on the stack's tip.
+            tips = [t for t in cands if all(o is t or worktree._closest_ancestor(self.p, [o["branch"]], t["branch"])
+                                            for o in cands)]
+            code = tips[0] if tips else None
+            head = worktree._git(self.p.root, "rev-parse", "--short=12", code["branch"]) if code else ""
+        except Exception as e:
+            log(self.p, f"review {review['id']}: no fix queued, its branch was not read: {e}")
+            return None
+        if not code or not head:
+            return None
+        base_title = re.sub(r"^(?:Fix review #\d+: )+", "", code["title"])
+        tier = code["tier"] if code["tier"] in bud.TIER_ORDER else "standard"
+        found = "\n".join(f"{n}. {str(f['title'])[:200]}: {coord.clip(f.get('spec'), FOLLOWUP_SPEC_CHARS)}"
+                          for n, f in enumerate(fups, 1))
+        with db.tx():
+            fid = db.add_task(f"Fix review #{review['id']}: {base_title}"[:200], "", kind="code", tier=tier,
+                              priority=review["priority"], origin="daemon",
+                              budget_usd=float(cfg["budget"]["task_default_usd"].get(tier, 8.0)),
+                              labels=[f"continues:{code['id']}", f"review_fix:{review['id']}"])
+            fbranch = f"ttp/t{fid}-{worktree.slug(base_title)}"
+            rid = db.add_task(f"Re-review #{review['id']}: " + re.sub(r"^(?:Re-review #\d+: )+", "", review["title"]),
+                              "\n".join([
+                                  f"Re-review after review #{review['id']} failed. Fix task #{fid} (branch {fbranch}, "
+                                  f"built on #{code['id']}'s branch {code['branch']} at {head}) addresses its findings:",
+                                  found,
+                                  f"Check each is fixed, then review what changed since. Where the earlier review's "
+                                  f"spec below names {code['branch']} or #{code['id']}'s worktree, use #{fid}'s branch "
+                                  f"and worktree.",
+                                  f"The earlier review's spec:\n{spec[:REVIEW_FIX_SPEC_CHARS]}"]),
+                              kind="review", tier=review["tier"], priority=review["priority"], origin="daemon",
+                              budget_usd=float(cfg["budget"]["task_default_usd"].get(review["tier"], 8.0)),
+                              depends_on=[fid], labels=[f"auto_review:{fid}", f"continues:{review['id']}"])
+            db.update_task(fid, branch=fbranch, spec="\n".join([
+                f"Fix the blocking findings of review #{review['id']} ({review['title']}) on code task "
+                f"#{code['id']} ({code['title']}).",
+                f"This task's branch starts from #{code['id']}'s branch {code['branch']} (head {head}): build on "
+                f"it. Leave the push to re-review #{rid}, which checks each finding once this task is done.",
+                f"Findings to fix:\n{found}",
+                f"The review's hand-off: {coord.clip(summary, AUTO_REVIEW_SUMMARY_CHARS)}"]))
+            moved = [t["id"] for t in coord._open_dependents(db, review["id"])]
+            coord._take_over_dependents(db, review["id"], rid)
+        log(self.p, f"review {review['id']} failed: queued fix #{fid} and re-review #{rid}"
+                    + (f"; moved {moved} onto it" if moved else ""))
+        return fid, rid, moved
 
     def _reviewed_heads(self, task: dict) -> list[str]:
         """Heads earlier reviews of this stack saw (their `metrics.reviewed_head`): reviews the task
