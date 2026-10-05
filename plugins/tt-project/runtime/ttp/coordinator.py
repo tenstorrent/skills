@@ -74,6 +74,7 @@ ACTIONS_SCHEMA: dict[str, Any] = {
 # user to edit project.json (or the web app) themselves.
 USER_SETTABLE = {
     "budget.daily_usd": float, "budget.weekly_usd": float, "budget.reserve_pct": float,
+    "budget.global_daily_usd": float, "budget.day_start": str, "budget.timezone": str,
     "budget.max_parallel_workers": int, "notify.slack": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     "notify.slack_min_severity": str, "notify.chat_min_severity": str, "core_provider": str,
     "coordinator.tier": str, "coordinator.model": str, "coordinator.effort": str,
@@ -443,6 +444,7 @@ def _norm_severity(s: str | None) -> str:
 # reserve; code_tasks_may_push lets work land without a separate review. Turning that flag off is the
 # safe direction and needs no one's word. Everything else the coordinator decides on its own.
 NEEDS_USER = {"budget.daily_usd": "spend", "budget.weekly_usd": "spend", "budget.reserve_pct": "spend",
+              "budget.global_daily_usd": "spend",
               "delivery.code_tasks_may_push": "review"}
 SAFE_WHEN_OFF = {"delivery.code_tasks_may_push"}
 

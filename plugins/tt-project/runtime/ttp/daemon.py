@@ -29,6 +29,7 @@ from pathlib import Path
 
 from . import alerts
 from . import budget as bud
+from . import globalcap as gcap
 from . import coordinator as coord
 from . import coordcheck
 from . import effort
@@ -1643,6 +1644,7 @@ class Daemon:
             except Exception:
                 pass
         windows = bud.plan_windows(self.p.db)
+        gcap.refresh_async(self.cfg.get("budget") or {})   # other machines' totals, in the background
         gates, news, red_sent = {}, [], {}
         # After a restart the last levels come from disk, so a change while the daemon was down is news.
         saved = {} if self.gates else (self.p.db.kv("gates") or {})
@@ -1663,7 +1665,9 @@ class Daemon:
                 red_sent[prov] = mark
             if first:
                 capped = any("cap reached" in r for r in g.reasons)
-                hint = "New work is paused; replies to you continue. " + (
+                hint = "New work is paused; running work finishes and replies to you continue. " + (
+                    "It starts again by itself when the budget day resets. "
+                    if any(r.startswith("global daily cap") for r in g.reasons) else "") + (
                     "You can raise the cap (carefully) by telling me, or in the web app."
                     if capped else "The web app's Budget tab shows what spent it.")
                 news.append((f"Budget for {prov} is now red: {'; '.join(g.reasons)}. " + hint,

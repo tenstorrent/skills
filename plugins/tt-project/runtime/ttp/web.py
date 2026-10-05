@@ -15,6 +15,7 @@ from urllib.parse import parse_qs, urlparse
 
 from . import alerts
 from . import budget as bud
+from . import globalcap as gcap
 from . import coordinator as coord
 from . import pushq, release
 from . import schedule as sched
@@ -96,8 +97,13 @@ def gate_detail(g: dict, now: float | None = None) -> str:
         return (f"account use: {'; '.join(parts)}. The project stops at {n.get('limit')}% "
                 f"(plan-billed, so the dollar caps do not apply)")
     est = f" (~${n['estimated_24h']:.2f} estimated)" if n.get("estimated_24h") else ""
-    return (f"${n.get('spent_24h', 0):.2f} of ${n.get('daily_cap', 0):.0f} per 24h{est}, "
-            f"${n.get('spent_7d', 0):.2f} of ${n.get('weekly_cap', 0):.0f} per 7d")
+    day = (f"${n['spent_today']:.2f} of ${n.get('daily_cap', 0):.0f} today" if "spent_today" in n
+           else f"${n.get('spent_24h', 0):.2f} of ${n.get('daily_cap', 0):.0f} per 24h")
+    out = f"{day}{est}, ${n.get('spent_7d', 0):.2f} of ${n.get('weekly_cap', 0):.0f} per 7d"
+    if "global_today" in n:
+        out += (f"; global {gcap.money(n['global_today'])} of ${float(n.get('global_cap') or 0):.0f} today: "
+                f"{n.get('global_includes') or 'this account'}")
+    return out
 
 
 def offline_help(name: str) -> str:
@@ -156,6 +162,9 @@ def budget_line(db: DB, now: float | None = None, core: str = "claude", gate: di
             parts.append(f"{label} {w.utilization:.0f}%" +
                          (f" - resets in {max(w.resets_at - now, 0) / secs:.1f} {unit}" if w.resets_at else ""))
     plan = gate["regime"] == "windows" if (gate or {}).get("regime") else bool(wins)
+    n = (gate or {}).get("numbers") or {}
+    if not plan and ("spent_today" in n or "global_today" in n):
+        return usage_line(n, now)
     spent = (db.spent_since(now - DAY) if spent_24h is None else spent_24h) if plan else \
         db.spent_since(now - DAY, billed=True)
     parts.append(f"24h ${spent:.2f} {'virtual' if plan else 'actual'}")
@@ -165,6 +174,24 @@ def budget_line(db: DB, now: float | None = None, core: str = "claude", gate: di
         if peaks:
             parts.append(f"{label} {sum(peaks) / len(peaks):.0f}%")
     return ", ".join(parts)
+
+
+def usage_line(n: dict, now: float) -> str:
+    """The one budget line of a usage-billed account, from its gate's numbers:
+    'today $1.20 this project, $85 of $200 global - resets in 6.5 h (1 machine stale)'.
+    'Today' is the budget day (budget.day_start in budget.timezone), else the last 24 h; the global
+    part is left out when budget.global_daily_usd is 0."""
+    mine = n["spent_today"] if "spent_today" in n else n.get("spent_24h", 0)
+    line = f"{'today' if 'spent_today' in n else '24h'} {gcap.money(mine)} this project"
+    if "global_today" in n:
+        line += f", {gcap.money(n['global_today'])} of ${float(n.get('global_cap') or 0):.0f} global"
+    end = n.get("day_end") or n.get("global_resets_at")
+    if end:
+        line += f" - resets in {max(end - now, 0) / 3600:.1f} h"
+    stale = len(n.get("global_stale") or [])
+    if stale:
+        line += f" ({stale} machine{'s' if stale != 1 else ''} stale)"
+    return line
 
 
 def last_note(run_dir: str | None) -> str:

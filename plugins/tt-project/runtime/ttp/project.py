@@ -41,6 +41,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "reserve_pct": 10,              # plan windows: never take the account past 100 - reserve
         "daily_usd": 100.0,             # applied when the plan reports no window (usage-billed)
         "weekly_usd": 200.0,
+        # Usage-billed: all of the account's tt-project spend today, every project on every machine
+        # tt-project can see (globalcap.py), stops new work at this many $ (0 = off). The day starts at
+        # day_start ("HH:MM"; "" = rolling 24 h) in timezone (IANA name, never the host's own zone).
+        # Usually set once per machine for every project: `ttp config --account KEY VALUE`.
+        "global_daily_usd": 200.0,
+        "day_start": "08:00",
+        "timezone": "UTC",
         "hourly_alarm_x": 4.0,          # spend rate this many times the 7-day hourly norm = runaway
         "max_parallel_workers": 6,          # on a plan, all of them run until the last stretch before the line
         "task_default_usd": {"light": 2.0, "standard": 8.0, "deep": 25.0},
@@ -330,6 +337,9 @@ def config_problems(raw: dict) -> list[str]:
                 out.append(str(e))
     out += [f"delivery.after_push: {p}" for p in check_problems(delivery.get("after_push"))]
     out += _disk_problems(raw.get("disk"))
+    if isinstance(raw.get("budget"), dict):
+        from .globalcap import setting_problems
+        out += setting_problems(raw["budget"])
     if isinstance(raw.get("runner"), dict) and "nice" in raw["runner"]:
         out += [why for why in [nice_level(raw["runner"])[1]] if why]
     return out
@@ -434,7 +444,7 @@ class Project:
         return (self.state / "project.db").is_file()
 
     def config(self) -> dict:
-        return deep_merge(DEFAULT_CONFIG, self.raw_config())
+        return deep_merge(deep_merge(DEFAULT_CONFIG, load_account_settings()), self.raw_config())
 
     def set_config(self, dotted: str, value: Any) -> None:
         raw = self.raw_config()
@@ -749,6 +759,41 @@ def unregister(name: str) -> None:
     reg = load_registry()
     if reg.get("projects", {}).pop(name, None) is not None:
         write_json(registry_path(), reg)
+
+
+# Account-level settings: one file per user and machine that every project reads, below the
+# project's own project.json, so the projects on a machine agree unless one overrides a key.
+ACCOUNT_KEYS = {"budget": {"global_daily_usd", "day_start", "timezone"}}
+
+
+def account_settings_path() -> Path:
+    return HOME_DIR / "settings.json"
+
+
+def load_account_settings() -> dict:
+    """The account-level settings, only the keys ACCOUNT_KEYS allows; {} when unreadable."""
+    try:
+        data = json.loads(account_settings_path().read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {sec: {k: v for k, v in data[sec].items() if k in keys}
+            for sec, keys in ACCOUNT_KEYS.items() if isinstance(data.get(sec), dict)}
+
+
+def set_account_setting(dotted: str, value: Any) -> None:
+    sec, _, key = dotted.partition(".")
+    if key not in ACCOUNT_KEYS.get(sec, set()):
+        allowed = ", ".join(f"{s}.{k}" for s, ks in ACCOUNT_KEYS.items() for k in sorted(ks))
+        raise ValueError(f"{dotted} is not an account-level setting; those are: {allowed}")
+    data = load_account_settings()
+    if value is None:
+        data.get(sec, {}).pop(key, None)
+    else:
+        data.setdefault(sec, {})[key] = value
+    HOME_DIR.mkdir(parents=True, exist_ok=True)
+    write_json(account_settings_path(), data, mode=0o600)
 
 
 def secrets_path() -> Path:

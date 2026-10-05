@@ -27,7 +27,8 @@ from .db import chat_floor
 from . import outbox
 from . import schedule as sched
 from .project import (FOLDER, NAME_RE, Project, hostname, load_registry, load_secrets, register, save_secret,
-                      durable_append, durable_write, write_json)
+                      durable_append, durable_write, write_json, ACCOUNT_KEYS, DEFAULT_CONFIG, deep_merge,
+                      load_account_settings, set_account_setting)
 
 RUNTIME = Path(__file__).resolve().parent.parent              # .../runtime (plugin or project copy)
 PLUGIN_ROOT = RUNTIME.parent                                   # plugin root, or a project's harness/
@@ -807,6 +808,23 @@ def cmd_stats(a) -> None:
     print(json.dumps(s, indent=1) if a.json else bud.reread_text(s))
 
 
+def cmd_spend_today(a) -> None:
+    """This machine's projects' spend in [since, until) by provider and account key: what another
+    machine's global daily total asks for over ssh (globalcap.fetch). The account itself stays here."""
+    from . import globalcap as gcap
+    now = time.time()
+    if a.since is None:
+        b = deep_merge(DEFAULT_CONFIG["budget"], load_account_settings().get("budget") or {})
+        a.since, a.until = gcap.day_bounds(b, now) or (now - gcap.DAY, now + gcap.DAY)
+    t = gcap.machine_totals(a.since, a.until if a.until is not None else now + gcap.DAY, now=now)
+    if a.json:
+        print(json.dumps(t))
+        return
+    print(f"{t['host']}: {len(t['projects'])} projects, {gcap.money(sum(r['usd'] for r in t['rows']))} since "
+          f"{time.strftime('%Y-%m-%d %H:%M %Z', time.localtime(a.since))}" +
+          "".join(f"\n  could not read {e}" for e in t["errors"]))
+
+
 def cmd_web(a) -> None:
     from . import tunnel, weblink
     if a.unkeep:
@@ -1443,7 +1461,38 @@ def _run_dir_alive(p: Project, run_id: int) -> bool:
         return False
 
 
+def cmd_account_config(key: str, value: str | None) -> None:
+    """Read or set an account-level setting (project.ACCOUNT_KEYS) in ~/.tt-project/settings.json."""
+    if value is None:
+        node = deep_merge(DEFAULT_CONFIG, load_account_settings())
+        for part in key.split("."):
+            node = node.get(part, {}) if isinstance(node, dict) else None
+        print(json.dumps(node, indent=1))
+        return
+    try:
+        val = json.loads(value)
+    except ValueError:
+        val = value
+    from .globalcap import setting_problems
+    sec, _, k = key.partition(".")
+    bad = setting_problems({k: val}) if sec == "budget" and val not in ("", None) else []
+    if bad:
+        die(bad[0])
+    try:
+        set_account_setting(key, None if val == "" else val)
+    except ValueError as e:
+        die(str(e))
+    print(f"{key} = {json.dumps(val)} (account-level, every project on this machine)" if val != ""
+          else f"{key} removed (account-level); the default applies")
+
+
 def cmd_config(a) -> None:
+    if a.account:
+        if a.value is not None:
+            die("usage: ttp config --account KEY [VALUE]")
+        return cmd_account_config(a.name, a.key)
+    if a.key is None:
+        die("usage: ttp config NAME KEY [VALUE]")
     p = need(a.name, sys.argv[1:])
     if a.value is None:
         node = p.config()
@@ -2027,6 +2076,13 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_stats)
 
+    s = sub.add_parser("spend-today", help="this machine's tt-project spend today, by provider and account "
+                                           "(for the global daily cap)")
+    s.add_argument("--since", type=float, help="from this Unix time (default: the budget day's start)")
+    s.add_argument("--until", type=float)
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_spend_today)
+
     s = sub.add_parser("clip", help="run a command, keep its full output in a file and print a short "
                                     "excerpt (a test run's failures) plus the path")
     s.add_argument("--lines", type=int, default=40, help="at most this many lines of an ordinary excerpt")
@@ -2114,10 +2170,14 @@ def main(argv: list[str] | None = None) -> None:
             s.add_argument("--kill", action="store_true", help="also end running workers; their tasks resume on start")
         s.set_defaults(fn=cmd_service)
 
-    s = sub.add_parser("config", help="read or set a config key (dotted)")
+    s = sub.add_parser("config", help="read or set a config key (dotted); with --account, the account-level "
+                                      "value every project on this machine reads: ttp config --account KEY [VALUE]")
     s.add_argument("name")
-    s.add_argument("key")
+    s.add_argument("key", nargs="?")
     s.add_argument("value", nargs="?")
+    s.add_argument("--account", action="store_true",
+                   help="the account-level setting (" + ", ".join(
+                       f"{sec}.{k}" for sec, ks in ACCOUNT_KEYS.items() for k in sorted(ks)) + "); '' removes it")
     s.set_defaults(fn=cmd_config)
 
     s = sub.add_parser("secret", help="store per-user credentials (read from stdin)")

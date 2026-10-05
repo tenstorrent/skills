@@ -9,9 +9,10 @@ Two regimes, chosen per provider from what the provider reports:
   after it starts, so near the line the project estimates what running work will still add, from
   measured burn, and stops starting runs once that would reach the line. It never takes the account
   past the line, because the remainder belongs to the user's own work;
-- dollar caps (usage-billed accounts report no window): rolling 24 h and 7 d caps on what THIS
-  project spends across all its providers not on plan windows, with the user's defaults when the
-  charter sets none.
+- dollar caps (usage-billed accounts report no window): a daily cap (the fixed budget day, or the
+  last 24 h) and a rolling 7 d cap on what THIS project spends across all its providers not on plan
+  windows, with the user's defaults when the charter sets none; and a global daily cap on what the
+  whole account spends today across every project tt-project can see (globalcap.py).
 A runaway check (spend rate far above this project's own norm) overrides both.
 """
 from __future__ import annotations
@@ -22,6 +23,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from . import globalcap as gcap
 from .billing import PLAN_LAPSE_RUNS, billed_by_account
 from .db import DB
 
@@ -182,14 +184,22 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
                           "estimated_24h": round(db.spent_since(now - DAY, exclude=windowed, estimated_only=True,
                                                                 billed=True), 2),
                           "daily_cap": day_cap, "weekly_cap": week_cap})
-        ratio = max(d / day_cap if day_cap else 0.0, w7 / week_cap if week_cap else 0.0)
+        # The daily cap counts the fixed budget day (budget.day_start in budget.timezone) once one is
+        # set; without one, the last 24 h. The weekly cap stays rolling.
+        day = gcap.day_bounds(b, now)
+        today, label = d, "24h"
+        if day:
+            today, label = db.spent_since(day[0], exclude=windowed, billed=True) + live, "today"
+            g.numbers.update({"spent_today": round(today, 2), "day_start": day[0], "day_end": day[1]})
+        ratio = max(today / day_cap if day_cap else 0.0, w7 / week_cap if week_cap else 0.0)
         g.numbers["cap_ratio"] = round(ratio, 3)
         if ratio >= 1.0:
-            _raise(g, "red", f"cap reached: ${d:.2f}/24h of ${day_cap:.0f}, ${w7:.2f}/7d of ${week_cap:.0f}")
+            _raise(g, "red", f"cap reached: ${today:.2f}/{label} of ${day_cap:.0f}, ${w7:.2f}/7d of ${week_cap:.0f}")
         elif ratio >= 0.85:
             _raise(g, "orange", f"{ratio:.0%} of cap used")
         elif ratio >= 0.6:
             _raise(g, "yellow", f"{ratio:.0%} of cap used")
+        _global(db, g, b, provider, day, now)
 
     # Runaway guard: catch loops, not busy projects. Three signals over the last hour:
     # - waste: spend on runs that ended without an outcome (failed, stalled, timed out, lost), except
@@ -239,6 +249,29 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
     elif g.level == "red":
         g.max_tier, g.max_parallel, g.allow_optional, g.allow_new_work = "light", 0, False, False
     return g
+
+
+def _global(db: DB, g: Gate, b: dict, provider: str, day: tuple[float, float] | None, now: float) -> None:
+    """Red once the account's spend today on `provider`, across every project tt-project can see
+    (globalcap.total), reaches budget.global_daily_usd (0 = off). It only ever closes the gate: a
+    total that cannot be worked out leaves the project caps alone in charge. Red ends at the day's
+    reset, when the total starts again from zero; its alert clears with it."""
+    cap = float(b.get("global_daily_usd") or 0)
+    if cap <= 0:
+        return
+    start, end = day or (now - DAY, now)
+    try:
+        t = gcap.total(db, provider, start, end, now)
+    except Exception as e:
+        g.reasons.append(f"global daily total unavailable ({type(e).__name__}); the project caps still apply")
+        return
+    g.numbers.update({"global_today": round(t["usd"], 2), "global_cap": cap, "global_stale": t["stale"],
+                      "global_includes": t["includes"], "global_resets_at": end if day else None})
+    if t["usd"] >= cap:
+        when = f"; new work resumes at the reset in {max(end - now, 0) / HOUR:.1f} h" if day else ""
+        stale = f" ({len(t['stale'])} machine{'s' if len(t['stale']) != 1 else ''} stale)" if t["stale"] else ""
+        _raise(g, "red", f"global daily cap reached: {gcap.money(t['usd'])} of ${cap:.0f} today across the "
+                         f"account{stale}{when}")
 
 
 def _plan(db: DB, g: Gate, provider: str, plan: list[Window], line: float, most: int, now: float) -> None:
