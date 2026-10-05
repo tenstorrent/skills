@@ -8,7 +8,9 @@
   which rolls `runtime/` back if the daemon cannot start with it. Check its output.
 - Change only this project's own harness: its `tt-project/` folder (harness and state). Never
   edit, or create a worktree or branch in, the tt-project plugin's source repository or any other
-  project's harness, even to port a fix you just made here.
+  project's harness, even to port a fix you just made here. Running `ttp setup` or
+  `ttp upgrade <name>` to deploy a release to another project on this machine is not editing its
+  harness; hand edits to its charter, memory, config, state or code are.
 - A lesson that would help every project (not just this one) goes in your hand-off as an
   upstream note: a `followups` entry titled `upstream: ...` that describes the problem, the
   evidence and the fix, for the tt-project maintainers.

@@ -178,6 +178,23 @@ def test_harness_tasks_stay_in_their_own_harness():
     assert "upstream notes for the tt-project maintainers, not work for this project" in coordinator
     # A project whose own work is the plugin (its charter says so) may still queue that work.
     assert "unless the charter names that repository as this project's own work" in coordinator
+    # Deploying a release with ttp setup/upgrade is not editing another project's harness.
+    for path in (prompts / "kind-harness.md", prompts / "worker.md", prompts / "coordinator.md",
+                 SKILLS / "tt-project-harness" / "SKILL.md"):
+        text = " ".join(path.read_text(encoding="utf-8").split())
+        assert "`ttp upgrade <name>`" in text and "is not editing" in text, f"{path.name}: deploying is allowed"
+        assert "hand edits to its charter, memory, config, state or code" in text, path.name
+
+
+def test_coordinator_retires_temporary_instructions_and_does_not_ask_needlessly():
+    """Temporary words get an end; a clearly-over restriction is retired, not asked about; a known,
+    safe, reversible fix is done and reported, never asked about with a yes recommendation."""
+    coordinator = " ".join((PLUGIN / "template" / "prompts" / "coordinator.md").read_text(encoding="utf-8").split())
+    for phrase in ("`expires`", "`until`", "`until_probe`", "retire it yourself", "`over`",
+                   "never send an ask whose recommendation is yes", "possibly over"):
+        assert phrase in coordinator, phrase
+    daily = (PLUGIN / "template" / "prompts" / "daily-review.md").read_text(encoding="utf-8")
+    assert "stale restriction" in daily and "`replaces`" in daily
 
 
 # Wording that makes the user do, or approve, what tt-project can do itself.

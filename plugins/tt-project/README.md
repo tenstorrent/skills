@@ -59,7 +59,7 @@ and preferences you add later become part of the project's charter and memory.
   (`budget.resume_lost`, default $0.50 or 10 min) continues its agent session in the same
   working directory with a short prompt, instead of starting over.
   When the coordinator rescopes a running task, the change reaches the worker mid-run.
-- **Memory and charter**: plain files in the project's harness, one fact per file.
+- **Memory and charter**: plain files in the project's harness, one fact per file. A temporary entry carries its end (a time, a plain-language condition or a probe); the daemon retires it to the archive or `CHARTER.history.md` once that passes and says so.
 - **Watchers**: pull requests (CI, reviews, mergeability) and logs, reporting only changes.
   With Jev enabled, new observations are screened by a cheap decision model first.
 

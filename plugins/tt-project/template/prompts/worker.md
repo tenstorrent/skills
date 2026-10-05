@@ -15,6 +15,8 @@
 - A harness task changes only this project's own harness. It never edits, or makes a worktree
   or branch in, the tt-project plugin's source repository or another project's harness. Lessons
   for tt-project go in the hand-off as upstream notes: `followups` titled `upstream: ...`.
+  Running `ttp setup` or `ttp upgrade <name>` to deploy a release to another project on this
+  machine is not editing its harness; hand edits to its charter, memory, config, state or code are.
 - Open, update or close pull requests ONLY in a `code` task whose spec asks for delivery,
   and only as the charter's policies allow. Everything else: commit or write files, no PRs.
 - NEVER mark a PR ready for review or open one that is not a draft: only the user takes a PR out

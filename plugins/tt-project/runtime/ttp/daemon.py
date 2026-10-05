@@ -30,6 +30,7 @@ from pathlib import Path
 from . import alerts
 from . import budget as bud
 from . import coordinator as coord
+from . import ends
 from . import integrity
 from . import locks
 from . import machines
@@ -216,6 +217,7 @@ class Daemon:
         self._tick_errors = 0
         self._probes: dict[int, tuple[subprocess.Popen, float, str]] = {}   # running: proc, started, probe
         self._probed: dict[int, float] = {}
+        self._ends = ends.Ends(self.p, log=lambda m: log(self.p, m))   # temporary instructions' end conditions
         self._probe_rc: dict[int, tuple[int | str, float, str]] = {}   # last verdict: exit code or why, when, probe
         self._reboot_told = False
         self._boot_woken = False
@@ -432,7 +434,7 @@ class Daemon:
         scr.close_watcher_issues(self.p.db, quiet_s=scr.WATCHER_QUIET_CLOSE_S)
         settling = self.settling()
         for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.read_upstream, self.retry_rejected,
-                     self.maybe_coordinate, self.probe_waiting, self.start_pushes, self.dispatch, self.deliver_outbound):
+                     self.retire_ended, self.maybe_coordinate, self.probe_waiting, self.start_pushes, self.dispatch, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
                 continue   # no routing to start model work with (see _load_config)
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
@@ -441,6 +443,13 @@ class Daemon:
                 continue
             step()
             self._progress()
+
+    def retire_ended(self) -> None:
+        """Retire memory entries and charter sections whose end condition passed (see ends)."""
+        try:
+            self._ends.tick()
+        except Exception:
+            log(self.p, "retiring ended instructions failed\n" + traceback.format_exc())
 
     def sync_shared_pauses(self) -> None:
         coord.sync_shared_pauses(self.p)

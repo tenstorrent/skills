@@ -430,10 +430,12 @@ class Project:
         except (OSError, subprocess.SubprocessError):
             return False
 
-    def add_memory(self, text: str, kind: str = "fact", title: str | None = None, key: str | None = None) -> Path:
+    def add_memory(self, text: str, kind: str = "fact", title: str | None = None, key: str | None = None,
+                   end: dict | None = None) -> Path:
         """One fact per file plus a one-line pointer in MEMORY.md, so the index stays cheap to load.
         A memory written again under the same `key` (a replayed coordinator turn) keeps its one
-        file and line."""
+        file and line. `end` (see ends.from_action) makes it temporary: the daemon retires it then."""
+        from .ends import front_matter
         self.memory_dir.mkdir(parents=True, exist_ok=True)
         text = text.strip()
         title = (title or text.splitlines()[0])[:80]
@@ -451,7 +453,8 @@ class Project:
             while path.exists() or (self.memory_dir / "archive" / path.name).exists():
                 path = self.memory_dir / f"{kind}-{slug}-{n}.md"
                 n += 1
-            durable_write(path, f"---\nkind: {kind}\ncreated: {_stamp(time.time())}\n{tag}---\n{text}\n")
+            durable_write(path, f"---\nkind: {kind}\ncreated: {_stamp(time.time())}\n{front_matter(end or {})}{tag}"
+                                f"---\n{text}\n")
         index = self.memory_index.read_text() if self.memory_index.exists() else ""
         if f"](memory/{path.name})" not in index:
             durable_append(self.memory_index, f"- [{title}](memory/{path.name}) ({kind})\n")
@@ -459,12 +462,14 @@ class Project:
         return path
 
     def _memory_entries(self) -> list[dict]:
-        """Live memory entries, oldest first: `name` (the file stem shown in prompts), `kind`, `line`.
+        """Live memory entries, oldest first: `name` (the file stem shown in prompts), `kind`, `line`,
+        and `end` (see ends) for a temporary one, whose line says when it ends.
         Ordered by the front matter's `created`, then name; the file's mtime stands in only where
         `created` is missing, so a checkout or copy that touches the files does not reorder them
         (which would change the coordinator's cached prompt)."""
         if not self.memory_dir.is_dir():
             return []
+        from .ends import describe, read_front_matter
         out = []
         for p in self.memory_dir.glob("*.md"):
             raw = p.read_text()
@@ -473,7 +478,9 @@ class Project:
             m = re.search(r"^kind:\s*(\S+)", head, re.M)
             kind = m.group(1) if m else p.stem.split("-", 1)[0]
             c = re.search(r"^created:\s*(\S+)", head, re.M)
-            out.append({"name": p.stem, "kind": kind, "line": f"[{p.stem}] {body.strip()}",
+            end = read_front_matter(head)
+            ends = f" ({describe(end)})" if end else ""
+            out.append({"name": p.stem, "kind": kind, "line": f"[{p.stem}] {body.strip()}{ends}", "end": end,
                         "order": (c.group(1) if c else _stamp(p.stat().st_mtime), p.stem)})
         out.sort(key=lambda e: e.pop("order"))
         return out

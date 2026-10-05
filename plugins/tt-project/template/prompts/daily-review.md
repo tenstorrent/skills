@@ -17,8 +17,10 @@ Assess the last day of this project, then hand off.
    deferred task and retires the entry in the same turn, so the deferral is never lost.
 7. Charter: read `tt-project/harness/CHARTER.md`. List each Restrictions section that a newer
    section on the same subject contradicts, quoting both headings, in the summary as
-   `stale restriction: "<old heading>" (contradicted by "<newer heading>")`. Do not edit the
-   charter: the coordinator asks the user and retires it with `charter_update` `replaces`.
+   `stale restriction: "<old heading>" (contradicted by "<newer heading>")`, and each section
+   whose own end (`Expires:`, `Until:`) has clearly passed as `stale restriction: "<heading>"
+   (over: <what ended it>)`. Do not edit the charter: the coordinator retires them with
+   `charter_update` `replaces`.
 
 `result.json` → `followups`: at most 5 concrete tasks, each worth its cost, plus the deferrals
 from step 6 (`{"title", "spec", "start_after", "start_when"}`). Use titles starting

@@ -2368,6 +2368,114 @@ def test_charter_update_headings_stay_unique_and_replaces_takes_a_section_number
     assert "matches 0" in coord.apply(p, [{**act, "replaces": "9"}], turn=9)[0]
 
 
+def test_temporary_memory_retires_itself_at_expiry_and_the_digest_says_so(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import ends
+    assert coord.apply(p, [{"type": "memory_add", "text": "Stay off box A while its owner tests it.",
+                            "memory_kind": "restriction", "expires": "2h", "until": "the owner says the test is done"}],
+                       turn=3) == []
+    name = next(e["name"] for e in p._memory_entries() if e.get("end"))
+    line = next(e["line"] for e in p._memory_entries() if e["name"] == name)
+    assert "ends 20" in line and "when the owner says the test is done" in line, "prompts do not show the end"
+    for bad, why in (("yesterday", "use a delay"), ("2020-01-01", "already past")):
+        assert why in coord.apply(p, [{"type": "memory_add", "text": "x", "expires": bad}])[0]
+    now = time.time()
+    e = ends.Ends(p)
+    assert e.tick(now + 3600) == [] and (p.memory_dir / f"{name}.md").exists(), "retired before its time"
+    p.db.set_kv("last_coordinator_turn", now)
+    retired = e.tick(now + 3 * 3600)
+    assert len(retired) == 1 and name in retired[0] and "expired" in retired[0]
+    assert not (p.memory_dir / f"{name}.md").exists()
+    assert (p.memory_dir / "archive" / f"{name}.md").exists() and name not in p.memory_index.read_text()
+    told = p.db.one("SELECT * FROM messages WHERE kind='alert' ORDER BY id DESC LIMIT 1")
+    assert told["severity"] == "low" and name in told["text"]
+    lines = ends.digest_lines(p, now, now + 3 * 3600 + 1)
+    assert len(lines) == 1 and lines[0].startswith("## Retired (end condition passed") and f"[{name}]" in lines[0]
+    assert ends.digest_lines(p, now + 4 * 3600, now + 4 * 3600) == [], "shown again after the turn that saw it"
+
+
+def test_temporary_charter_section_retires_when_its_probe_passes(env, tmp_path):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import ends
+    from ttp.prompts import charter_restrictions
+    flag = tmp_path / "done"
+    act = {"type": "charter_update", "section": "Restrictions", "text": "Leave the shared queue alone.",
+           "until": "the shared queue is drained", "until_probe": f"test -e {flag}"}
+    assert coord.apply(p, [act], turn=5) == []
+    charter = p.charter_path.read_text()
+    assert "Leave the shared queue alone.\nUntil: the shared queue is drained\nUntil probe: test -e " in charter
+    assert "Until: the shared queue is drained" in charter_restrictions(charter), "workers do not see the end"
+    e, now = ends.Ends(p), time.time()
+    assert e.tick(now) == []   # starts the probe: not yet
+    e._procs[next(iter(e._procs))][0].wait(10)
+    assert e.tick(now + 1) == [] and "Leave the shared queue alone." in p.charter_path.read_text()
+    flag.write_text("")
+    assert e.tick(now + 1 + ends.PROBE_EVERY_S) == []
+    e._procs[next(iter(e._procs))][0].wait(10)
+    retired = e.tick(now + 2 + ends.PROBE_EVERY_S)
+    assert len(retired) == 1 and "its until_probe passed" in retired[0]
+    assert "Leave the shared queue alone." not in p.charter_path.read_text()
+    hist = (p.harness / coord.CHARTER_HISTORY).read_text()
+    assert "Leave the shared queue alone." in hist and "(retired " in hist and "its until_probe passed)" in hist
+    log = subprocess.run(["git", "-C", str(p.harness), "status", "--porcelain"], capture_output=True, text=True).stdout
+    assert "CHARTER" not in log, "the retirement is not committed"
+    # An expiry retires a charter section the same way; the Brief never carries one.
+    assert coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": "Quiet hours.",
+                            "expires": "1d"}], turn=6) == []
+    assert any("expired" in x for x in ends.Ends(p).tick(now + 2 * 86400))
+    assert "Quiet hours." not in p.charter_path.read_text() and "Keep the README friendly." in p.charter_path.read_text()
+
+
+def test_an_end_only_a_model_can_judge_is_listed_as_possibly_over_once_a_day(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import ends
+    assert coord.apply(p, [{"type": "memory_add", "text": "Hold releases.", "memory_kind": "restriction",
+                            "until": "the freeze is lifted"}], turn=2) == []
+    now = time.time()
+    assert ends.Ends(p).tick(now + 30 * 86400) == [], "a plain-language end retired itself"
+    assert ends.digest_lines(p, now, now) == [], "listed before a day has passed"
+    lines = ends.digest_lines(p, now, now + ends.RECHECK_S)
+    assert lines[0].startswith("## Temporary instructions possibly over") and "until the freeze is lifted" in lines[1]
+    assert ends.digest_lines(p, now, now + ends.RECHECK_S + 60) == [], "listed again within the day"
+    assert "possibly over" in "\n".join(ends.digest_lines(p, now, now + 2 * ends.RECHECK_S + 1))
+
+
+def test_a_clearly_over_restriction_is_retired_without_asking(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    p.charter_path.write_text("# demo\n\n## Brief (verbatim from the user)\nKeep it tidy.\n\n"
+                              "## Restrictions (added 2026-09-02)\nNever touch box A while it is diagnosed.\n")
+    retire = {"type": "charter_update", "section": "Restrictions", "text": "No restriction on box A any more.",
+              "replaces": "Restrictions (added 2026-09-02)"}
+    assert "needs the user's word, or `over`" in coord.apply(p, [{**retire, "over": "done"}], turn=3)[0]
+    over = "the diagnosis of box A finished (resources section of 2026-09-05)"
+    assert coord.apply(p, [{**retire, "over": over}], turn=4) == []
+    assert "while it is diagnosed" not in p.charter_path.read_text()
+    assert f"over: {over})" in (p.harness / coord.CHARTER_HISTORY).read_text()
+    told = p.db.one("SELECT * FROM messages WHERE kind='alert' ORDER BY id DESC LIMIT 1")
+    assert told["severity"] == "low" and over in told["text"] and "No restriction on box A" in told["text"]
+
+
+def test_an_ask_recommending_yes_to_a_safe_step_is_rejected(env):
+    p = make(env)
+    stale = ("Retire the stale restriction \"Restrictions (added 2026-09-02)\"? A newer section says the "
+             "diagnosis is done.")
+    least = "keep obeying it; it breaks no restriction to leave it in place for now"
+    problems, ask = _ask(p, stale, blocking="restriction", recommendation="yes, retire it", least_disruptive=least)
+    assert problems and "retired, not asked about" in problems[0] and ask is None
+    problems, ask = _ask(p, "Delete the scratch branch on the fork?", blocking="irreversible",
+                         recommendation="Yes: it is reversible, the commits stay in the reflog")
+    assert problems and "you call reversible" in problems[0] and ask is None
+    # Truly unclear (no yes), a step that cannot be undone, and review asks still go out.
+    assert _ask(p, stale, blocking="restriction", recommendation="keep it until you confirm",
+                least_disruptive=least)[0] == []
+    assert _ask(p, "Publish the package?", blocking="irreversible", recommendation="yes, it is not reversible")[0] == []
+    assert _ask(p, "Grant the bot read access?", blocking="access", recommendation="yes, it can be undone")[0] == []
+
+
 def test_worker_prompt_drops_placeholders_and_keeps_restrictions_verbatim(env):
     p = make(env)
     from ttp.prompts import worker_system

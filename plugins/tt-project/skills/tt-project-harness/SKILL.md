@@ -47,7 +47,9 @@ description: "Improve a tt-project's own harness — its coordinator and worker 
   to the last version that ran (a new commit) and the user is alerted.
 - Measure after: same evidence, a day later. Revert what did not help.
 - Change only this project's own harness. Never edit, or create a worktree or branch in, the
-  tt-project plugin's source repository or another project's harness.
+  tt-project plugin's source repository or another project's harness. Running `ttp setup` or
+  `ttp upgrade <name>` to deploy a release to another project on this machine is not editing its
+  harness; hand edits to its charter, memory, config, state or code are.
 - A lesson every project would benefit from → an upstream note in the hand-off: a follow-up
   titled `upstream: …`.
 

@@ -18,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from . import machines, prguard, push, shared, upstream
+from . import ends, machines, prguard, push, shared, upstream
 from . import screen as scr
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
@@ -59,7 +59,8 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "resources": {"type": "array", "items": {"type": "string"}}, "exclusive": {"type": "boolean"},
             "continues": {"type": "integer"}, "resource": {"type": "string"}, "paused": {"type": "boolean"},
             "reason": {"type": "string"}, "supersedes": {"type": "array", "items": {"type": "string"}},
-            "replaces": {"type": "string"},
+            "replaces": {"type": "string"}, "over": {"type": "string"},
+            "expires": {"type": "string"}, "until": {"type": "string"}, "until_probe": {"type": "string"},
             "source": {"type": "string"}, "match": {"type": "string"}, "hours": {"type": "number"},
             "below": {"type": "string"}, "why": {"type": "string"}, "quote": {"type": "string"},
             "start_after": {"type": "string", "pattern": START_AFTER_RE}, "start_when": {"type": "string"}},
@@ -114,7 +115,7 @@ USER_SETTABLE = {
     "coordinator.ask_timeout_h": float,
 }
 
-CHARTER_HISTORY = "CHARTER.history.md"   # harness file: charter sections a newer one replaced
+CHARTER_HISTORY = ends.CHARTER_HISTORY   # harness file: charter sections replaced or retired
 REJECTED_KEY = "rejected_actions"   # kv: the last turn's rejected actions, shown in the next digest
 # kv: {"at": ts, "why": text}: a rejected action whose blocking condition clears at a known time.
 # The daemon wakes the coordinator then, so the turn's undone work does not wait for an idle wake.
@@ -150,6 +151,12 @@ _DEFAULT_NOTE = "\n\nIf there is no answer within "
 _REC_NOTE = "\n\nMy recommendation: "
 _LEAST_NOTE = "\n\nLeast-disruptive way considered: "
 LEAST_DISRUPTIVE_MIN = 40   # chars: a restriction ask names the way around it and the rule it breaks
+OVER_MIN = 20   # chars: retiring a restriction outside a user turn names the end that passed
+# An ask recommending yes to a step it calls reversible or safe to undo: that step is the coordinator's.
+_YES_RE = re.compile(r"^\W*(yes|y|ok|okay|go|approve|proceed)\b", re.I)
+_UNDOABLE_RE = re.compile(r"(?<!not )(?<!non-)\breversible\b|\bcan (easily )?be (undone|reverted|rolled back)\b|"
+                          r"\beasy to (undo|revert|roll back)\b|\bsafe(ly)? to (undo|revert|roll back)\b", re.I)
+_RETIRE_RE = re.compile(r"\bstale restriction|\bretir(e|es|ing)\b|\bno longer appl(y|ies)\b", re.I)
 
 
 MEMORY_SNAPSHOT_KEY = "memory_snapshot"   # kv: the memory the coordinator's system prompt carries
@@ -297,6 +304,7 @@ def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int]) ->
         lines.append(f"## Delivery: push queue on for {p.config()['delivery']['push_branch']} (delivery.push_queue): "
                      f"review specs say \"approve for the push queue\", with no push or deploy steps")
     lines += memory_digest_lines(memory_view(p, now))
+    lines += ends.digest_lines(p, float(db.kv("last_coordinator_turn", 0) or 0), now)
     mem = memory_budget_line(p)
     if mem:
         lines.append(mem)
@@ -707,6 +715,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                      "decision instead of asking. If not, put it in least_disruptive with the "
                                      "restriction it breaks.")
                 text = a["text"].strip()
+                why = _needless_ask(a, text)
+                if why:
+                    raise ValueError(f"ask_user rejected: {why}")
                 for o in db.q("SELECT id, text FROM messages WHERE kind='ask' AND handled=0"):
                     if _same_text(_ask_question(o["text"]), text):
                         raise ValueError(f"already asked as open ask #{o['id']}; it waits for the answer")
@@ -732,7 +743,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
             elif t == "notify":
                 db.post("out", a["text"], chat=None, kind="alert", severity=_norm_severity(a.get("severity")))
             elif t == "memory_add":
-                added = p.add_memory(a["text"], kind=a.get("memory_kind") or "fact", title=a.get("title"), key=key)
+                added = p.add_memory(a["text"], kind=a.get("memory_kind") or "fact", title=a.get("title"), key=key,
+                                     end=ends.from_action(a))
                 if (a.get("memory_kind") or "") == "restriction":
                     _tell_running_workers(db, f"New binding restriction: {a['text'].strip()}", key)
                 old = a.get("supersedes") or []
@@ -747,7 +759,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 memory_budget_check(p)
             elif t == "charter_update":
                 section = (a.get("section") or "Notes").strip().title()
-                text = a["text"].strip()
+                text = a["text"].strip() + ends.charter_tail(ends.from_action(a))
                 stamp = time.strftime("%Y-%m-%d") + (f", turn {key}" if key else "")
                 heading = f"## {section} (added {stamp})"
                 n, base = 2, heading[:-1]
@@ -759,7 +771,12 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if key and _has_line(p.charter_path, f", turn {key})"):
                     pass   # this turn's update is already in: a retried turn must not add it twice
                 elif a.get("replaces"):
-                    msg += f" (replaces {_charter_replace(p, str(a['replaces']), heading, text, user_turn)})"
+                    over = " ".join(str(a.get("over") or "").split())
+                    name = _charter_replace(p, str(a["replaces"]), heading, text, user_turn, over)
+                    msg += f" (replaces {name})"
+                    if name.lower().startswith("restriction") and not user_turn:
+                        db.post("out", f"Retired the charter restriction \"{name}\": {over}. Still in force: "
+                                       f"{clip(a['text'], 300)}", chat=None, kind="alert", severity="low")
                 else:
                     durable_append(p.charter_path, f"\n{heading}\n{text}\n")
                 p.commit_harness(files, msg)
@@ -1281,9 +1298,27 @@ def _append_update(steer: Path, text: str, key: str | None = None) -> None:
     durable_append(steer, f"\n## Update {time.strftime('%Y-%m-%d %H:%M')}{f' (turn {key})' if key else ''}\n{text.strip()}\n")
 
 
-def _charter_replace(p: Project, replaces: str, heading: str, text: str, user_turn: bool) -> str:
+def _needless_ask(a: dict, text: str) -> str:
+    """Why an ask is the coordinator's own call, or "". Review and merge asks always go out."""
+    if a.get("blocking") in ("review", "merge"):
+        return ""
+    rec = str(a.get("recommendation") or "")
+    if not _YES_RE.match(rec):
+        return ""
+    if a.get("blocking") == "restriction" and _RETIRE_RE.search(f"{text} {rec}"):
+        return ("a restriction that is clearly over is retired, not asked about: charter_update with `replaces` "
+                "(its heading), `text` (what still holds) and `over` (the end that passed); the user is told. "
+                "Ask only when it is truly unclear whether it is over, and then do not recommend yes")
+    if a.get("blocking") in ("restriction", "irreversible") and _UNDOABLE_RE.search(f"{text} {rec}"):
+        return ("you recommend yes to a step you call reversible: a known, safe, reversible fix is yours. Do it "
+                "(task_add or the action), memory_add the decision and notify at severity low")
+    return ""
+
+
+def _charter_replace(p: Project, replaces: str, heading: str, text: str, user_turn: bool, over: str = "") -> str:
     """Move the charter section headed `replaces` to CHARTER_HISTORY and add `heading` + `text` at
-    the end of the charter instead. Returns the replaced section's heading."""
+    the end of the charter instead. Returns the replaced section's heading. Outside a user turn a
+    restriction section is replaced only with `over`: the end condition that has clearly passed."""
     from .prompts import charter_sections
     want = " ".join(replaces.lstrip("#").split()).lower()
     sections = charter_sections(p.charter_path.read_text())
@@ -1300,15 +1335,14 @@ def _charter_replace(p: Project, replaces: str, heading: str, text: str, user_tu
     name = names[hits[0]]
     if name.lower().startswith("brief"):
         raise ValueError("charter_update: the Brief is the user's own words and is never replaced")
-    if name.lower().startswith("restriction") and not user_turn:
-        raise ValueError(f"charter_update: retiring the restriction section {name!r} needs the user's word: ask_user "
-                         f"(blocking restriction) naming it, and replace it in the turn that carries their yes")
+    if name.lower().startswith("restriction") and not user_turn and len(over) < OVER_MIN:
+        raise ValueError(f"charter_update: replacing the restriction section {name!r} needs the user's word, or "
+                         f"`over`: the end condition that has clearly passed (what ended it and when). If it is "
+                         f"truly unclear whether it is over, ask_user (blocking restriction)")
+    note = f"(replaced {time.strftime('%Y-%m-%d')} by \"{heading[3:]}\"" + (f"; over: {over}" if over else "") + ")"
     hist = p.harness / CHARTER_HISTORY
-    if not hist.exists():
-        durable_append(hist, "# Charter history\n\nSections replaced in CHARTER.md, oldest first.\n")
-    note = f"(replaced {time.strftime('%Y-%m-%d')} by \"{heading[3:]}\")"
-    if not (", turn " in heading and _has_line(hist, f"by \"{heading[3:]}\")")):   # a retried turn moves it once
-        durable_append(hist, f"\n{old_head}\n{note}\n" + "\n".join(old_body).strip("\n") + "\n")
+    if not (", turn " in heading and hist.exists() and f"by \"{heading[3:]}\"" in hist.read_text()):
+        ends.move_to_history(p, old_head, old_body, note)   # a retried turn moves it once
     kept = "\n".join(line for i, (h, b) in enumerate(sections) if i != hits[0] for line in ([h] if h else []) + b)
     durable_write(p.charter_path, f"{kept.rstrip()}\n\n{heading}\n{text}\n")
     return name
