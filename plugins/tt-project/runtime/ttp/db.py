@@ -58,7 +58,7 @@ CREATE TABLE IF NOT EXISTS runs (
   status TEXT NOT NULL DEFAULT 'running', exit_code INTEGER, progress_ts REAL,
   cost_usd REAL DEFAULT 0, cost_estimated INTEGER DEFAULT 0,
   input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0,
-  cache_read_tokens INTEGER DEFAULT 0, cache_write_tokens INTEGER DEFAULT 0, note TEXT);
+  cache_read_tokens INTEGER DEFAULT 0, cache_write_tokens INTEGER DEFAULT 0, note TEXT, session_id TEXT);
 CREATE INDEX IF NOT EXISTS runs_status ON runs(status);
 
 CREATE TABLE IF NOT EXISTS events (
@@ -149,6 +149,7 @@ class DB:
         self._migrate_provenance()
         self._migrate_push_queue()
         self._migrate_ledger_account()
+        self._migrate_run_session()
 
     def _migrate_ledger_account(self) -> None:
         """Ledger rows written without an account take the account of the run they booked: the run
@@ -166,6 +167,15 @@ class DB:
                 if run:
                     self.x("UPDATE ledger SET account=? WHERE id=?", (run["account"], row["id"]))
             self.set_meta(LEDGER_ACCOUNT_MIGRATION, str(time.time()))
+
+    def _migrate_run_session(self) -> None:
+        # The agent's session id of each run (localspend.py tells tt-project's sessions from the
+        # user's own by it). Older runs keep NULL; their output.jsonl still names it.
+        if "session_id" in {r["name"] for r in self.q("PRAGMA table_info(runs)")}:
+            return
+        with self.tx():
+            if "session_id" not in {r["name"] for r in self.q("PRAGMA table_info(runs)")}:
+                self.x("ALTER TABLE runs ADD COLUMN session_id TEXT")
 
     def _migrate_push_queue(self) -> None:
         if self.meta(PUSH_QUEUE_MIGRATION) is not None:

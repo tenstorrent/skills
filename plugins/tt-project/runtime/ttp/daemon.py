@@ -25,6 +25,7 @@ import tempfile
 import threading
 import time
 import traceback
+import uuid
 from pathlib import Path
 
 from . import alerts
@@ -730,11 +731,19 @@ class Daemon:
             # arguments go last: Codex takes them as a subcommand that must follow every option.
             resume_extra = prov.resume_args(resume) if resume else []
             argv = _before_stdin(argv, extra)
+        # The agent's session gets its id here, so the run's session is known (and left out of this
+        # machine's other Claude Code spend, localspend.py) before the agent writes a line of it.
+        session_id = resume if resume_extra else ""
+        if not resume_extra:
+            fresh = str(uuid.uuid4())
+            got = prov.session_args(fresh)
+            if got:
+                argv, session_id = _before_stdin(argv, got), fresh
         db = self.p.db
-        run_id = db.x("INSERT INTO runs(task,role,provider,model,effort,account,started,boot_id,status,note) "
-                      "VALUES(?,?,?,?,?,?,?,?,?,?)",
+        run_id = db.x("INSERT INTO runs(task,role,provider,model,effort,account,started,boot_id,status,note,"
+                      "session_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                       (task["id"] if task else None, role, provider, model, effort, prov.account(), time.time(),
-                       self.boot, "running", json.dumps(note or {})))
+                       self.boot, "running", json.dumps(note or {}), session_id or None))
         run_dir = self.p.runs / str(run_id)
         # Raising from here on means nothing was launched: the run row must not stay "running".
         try:
@@ -1181,10 +1190,11 @@ class Daemon:
         # half way leaves the run "running", and the next tick processes it again from disk.
         with db.tx():
             db.x("UPDATE runs SET ended=?, status=?, exit_code=?, cost_usd=?, cost_estimated=?, input_tokens=?, "
-                 "output_tokens=?, cache_read_tokens=?, cache_write_tokens=?, note=? WHERE id=?",
+                 "output_tokens=?, cache_read_tokens=?, cache_write_tokens=?, note=?, "
+                 "session_id=COALESCE(NULLIF(?,''), session_id) WHERE id=?",
                  (ended, status, exit_info.get("rc"), usage.cost_usd,
                   int(usage.estimated), usage.input_tokens, usage.output_tokens, usage.cache_read_tokens,
-                  usage.cache_write_tokens, json.dumps(note), r["id"]))
+                  usage.cache_write_tokens, json.dumps(note), usage.session_id or "", r["id"]))
             db.spend(r["provider"], usage.cost_usd, source, account=r["account"] or "", estimated=usage.estimated,
                      tokens_in=usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens,
                      tokens_out=usage.output_tokens, ts=ended)

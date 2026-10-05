@@ -764,7 +764,7 @@ def unregister(name: str) -> None:
 
 # Account-level settings: one file per user and machine that every project reads, below the
 # project's own project.json, so the projects on a machine agree unless one overrides a key.
-ACCOUNT_KEYS = {"budget": {"global_daily_usd", "day_start", "timezone"}}
+ACCOUNT_KEYS = {"budget": {"global_daily_usd", "day_start", "timezone"}, "pricing": {"claude"}}
 
 
 def layered(raw: dict) -> dict:

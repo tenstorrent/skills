@@ -24,6 +24,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from . import globalcap as gcap
+from . import localspend  # noqa: F401  (adds this machine's other Claude Code spend to the global total)
 from .billing import PLAN_LAPSE_RUNS, billed_by_account
 from .db import DB
 

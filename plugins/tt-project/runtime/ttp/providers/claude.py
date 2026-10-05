@@ -189,6 +189,9 @@ class Claude(Provider):
         i = argv.index("--strict-mcp-config") if "--strict-mcp-config" in argv else len(argv)
         return argv[:i] + ["--mcp-config", str(path)] + argv[i:]
 
+    def session_args(self, session_id: str) -> list[str]:
+        return ["--session-id", session_id] if session_id and self.supports("--session-id") else []
+
     def resume_args(self, session_id: str) -> list[str]:
         return ["--resume", session_id] if session_id and self.supports("--resume") else []
 

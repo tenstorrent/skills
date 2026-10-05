@@ -124,6 +124,11 @@ class Provider:
         """Arguments that load extra skill plugins for one run; [] when the agent cannot."""
         return []
 
+    def session_args(self, session_id: str) -> list[str]:
+        """Arguments that make a new run's agent session use `session_id`, so the session is known
+        before the agent writes anything; [] when the agent cannot."""
+        return []
+
     def resume_args(self, session_id: str) -> list[str]:
         """Arguments that continue the saved agent session `session_id` instead of starting a new
         one; [] when the agent cannot, and a lost run then starts fresh."""
