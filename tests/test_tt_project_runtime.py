@@ -7753,6 +7753,35 @@ def test_the_login_check_backs_off_and_closes_the_breaker_and_its_alert(env, mon
     assert p.db.one("SELECT COUNT(*) n FROM runs")["n"] == 0, "the login was checked with a model run"
 
 
+def test_a_refusal_right_after_a_passed_login_check_falls_back_to_one_probe_run(env, monkeypatch):
+    """A CLI whose status says logged in while the service still refuses it must not release the
+    whole queue to fail again after every check."""
+    p = make(env)
+    from ttp import alerts
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    login = env["tmp"] / "logged-in"
+    login.write_text("")
+    monkeypatch.setenv("TTP_FAKE_LOGIN", str(login))
+    d.open_breaker("fake", "401")
+    p.db.set_kv("auth_breaker:fake", {**alerts.breaker(p.db, "fake"), "next_check": time.time() - 1})
+    d.sweep_alerts()
+    assert alerts.breaker(p.db, "fake") is None
+    d.open_breaker("fake", "401 again")   # the next run was refused all the same
+    for _ in range(2):
+        p.db.set_kv("auth_breaker:fake", {**alerts.breaker(p.db, "fake"), "next_check": time.time() - 1})
+        d.sweep_alerts()
+    b = alerts.breaker(p.db, "fake")
+    assert b and b["distrust"] and b["probe"] and d._may_probe("fake", time.time())
+    # A run that gets through ends it, and the check is trusted again next time.
+    p.db.x("INSERT INTO runs(role,provider,started,ended,status) VALUES('worker','fake',?,?,'ok')",
+           (time.time(), time.time()))
+    d.sweep_alerts()
+    assert alerts.breaker(p.db, "fake") is None
+    d.open_breaker("fake", "logged out")
+    assert not alerts.breaker(p.db, "fake").get("distrust")
+
+
 def test_a_logged_out_alert_from_before_the_breaker_opens_it(env):
     p = make(env)
     from ttp import alerts

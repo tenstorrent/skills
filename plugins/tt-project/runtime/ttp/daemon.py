@@ -1450,15 +1450,21 @@ class Daemon:
         """Open `prov`'s auth breaker: no run starts on it (queued tasks keep their attempts) until
         check_logins sees it logged in again. Kept in the project's state, so a restart keeps it."""
         db = self.p.db
-        if alerts.breaker(db, prov):
+        prev = db.kv(alerts.BREAKER + prov) or {}
+        if prev.get("open"):
             return
         now = time.time() if at is None else at
         try:
             stamp = get_provider(prov).credentials_stamp()
         except Exception:
             stamp = ""
+        # Its CLI said logged in, yet a run was refused again before any got through: that check
+        # proves nothing for this logout, or every close would release the queue to fail once more.
+        distrust = prev.get("closed_why") == LOGIN_CHECK_PASSED and \
+            not alerts.login_proven(db, prov, float(prev.get("closed") or 0))
         db.set_kv(alerts.BREAKER + prov, {"open": True, "opened": now, "checks": 0, "creds": stamp,
-                                          "next_check": time.time() + AUTH_CHECK_S[0], "why": why[:200]})
+                                          "next_check": time.time() + AUTH_CHECK_S[0], "why": why[:200],
+                                          **({"distrust": True} if distrust else {})})
         log(self.p, f"{prov}: logged out; no runs start on it until a login check passes")
 
     def _close_breaker(self, prov: str, rec: dict, why: str) -> None:
@@ -1498,12 +1504,12 @@ class Daemon:
             if now < float(rec.get("next_check") or 0) and not changed:
                 continue
             try:
-                ok = agent.login_check() if agent else None
+                ok = agent.login_check() if agent and not rec.get("distrust") else None
             except Exception:
                 log(self.p, f"{prov}: login check failed\n" + traceback.format_exc())
                 ok = None
             if ok or (ok is None and changed):
-                self._close_breaker(prov, rec, "its login check passed" if ok else "its credentials changed")
+                self._close_breaker(prov, rec, LOGIN_CHECK_PASSED if ok else "its credentials changed")
                 continue
             n = int(rec.get("checks") or 0) + 1
             db.set_kv(alerts.BREAKER + prov, {**rec, "checks": n, "last_check": now, "creds": stamp, "probe": ok is None,
@@ -2984,6 +2990,7 @@ class Daemon:
 
 PAUSED_NOTE = "waits for a paused resource:"
 LOGGED_OUT_NOTE = "held: logged out"
+LOGIN_CHECK_PASSED = "its login check passed"
 
 
 def _names_commit(tasks: list[dict], head: str) -> bool:
