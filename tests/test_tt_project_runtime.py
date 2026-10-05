@@ -1972,6 +1972,60 @@ def test_workers_in_a_fresh_worktree_reuse_the_project_venv(env):
     assert "VIRTUAL_ENV" not in run()
 
 
+def test_a_new_worktree_links_the_checkouts_ignored_venv_and_removing_it_keeps_the_target(env):
+    p = make(env)
+    from ttp import worktree
+    ident = ("-c", "user.name=t", "-c", "user.email=t@t")
+    (p.root / ".gitignore").write_text(".venv/\nscratch/\n")
+    _git_out(p.root, "add", ".gitignore")
+    _git_out(p.root, *ident, "commit", "-qm", "ignore the venv")
+
+    def task(title):
+        path, _ = worktree.ensure(p, p.db.task(p.db.add_task(title, "s", kind="code", tier="light", origin="user")))
+        return path
+    # No venv in the checkout: nothing is linked.
+    bare = task("bare")
+    assert not os.path.lexists(bare / ".venv")
+    venv = _fake_venv(p.root / ".venv")
+    # The checkout's ignored .venv is linked into a new worktree. `.venv/` matches no symlink, so the link
+    # goes into info/exclude: the worktree stays clean and `git add -A` does not commit it.
+    path = task("linked")
+    assert (path / ".venv").is_symlink() and (path / ".venv").resolve() == venv.resolve()
+    assert (path / ".venv" / "bin" / "python").exists()
+    assert _git_out(path, "status", "--porcelain") == ""
+    _git_out(path, "add", "-A")
+    assert _git_out(path, "diff", "--cached", "--name-only") == ""
+    assert worktree.keep_reason(path) is None
+    # Existing paths are left alone; tracked or not-ignored entries and paths outside the root are never linked.
+    (p.root / "scratch").mkdir()
+    (p.root / "data").mkdir()
+    (p.root / "tracked.txt").write_text("v1")
+    _git_out(p.root, "add", "tracked.txt")
+    _git_out(p.root, *ident, "commit", "-qm", "tracked")
+    p.set_config("worktree.link_paths", [".venv", "scratch", "data", "tracked.txt", "../outside", "/tmp"])
+    own = task("own")
+    assert sorted(x.name for x in own.iterdir() if x.is_symlink()) == [".venv", "scratch"]
+    (own / "scratch").unlink()
+    (own / "scratch").mkdir()
+    (own / "scratch" / "mine").write_text("keep")
+    (own / ".venv").unlink()
+    _fake_venv(own / ".venv")
+    assert worktree.link_paths(p, own) == []
+    assert not (own / ".venv").is_symlink() and (own / "scratch" / "mine").read_text() == "keep"
+    assert (own / "tracked.txt").read_text() == "v1" and not (own / "tracked.txt").is_symlink()
+    p.set_config("worktree.link_paths", [])
+    assert not os.path.lexists(task("off") / ".venv")
+    # Removing a worktree, or clearing its caches, deletes the link and never the venv it points to.
+    tid = int(path.name[1:])
+    worktree.remove(p, tid)
+    assert not os.path.lexists(path) and (venv / "pyvenv.cfg").is_file() and (venv / "bin" / "python").is_file()
+    p.set_config("worktree.link_paths", [".venv"])
+    again = task("again")
+    assert (again / ".venv").is_symlink()
+    assert ".venv" in worktree.clear_caches(again)
+    assert not os.path.lexists(again / ".venv") and (venv / "pyvenv.cfg").is_file()
+
+
 def test_ttp_in_a_run_ignores_a_broken_project_venv_python(env):
     """The venv's bin sits right after the harness bin on a run's PATH: `ttp` must still run under
     the daemon's interpreter, not whatever `python3` the venv has."""

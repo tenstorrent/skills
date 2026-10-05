@@ -88,6 +88,7 @@ def ensure(p: Project, task: dict) -> tuple[Path, str]:
     branch = task.get("branch") or f"ttp/t{task['id']}-{slug(task['title'])}"
     path = p.worktrees / f"t{task['id']}"
     if path.exists() and is_git(path):
+        link_paths(p, path)
         return path, branch
     p.worktrees.mkdir(parents=True, exist_ok=True)
     exists = _git(p.root, "rev-parse", "--verify", "--quiet", branch, check=False)
@@ -96,7 +97,53 @@ def ensure(p: Project, task: dict) -> tuple[Path, str]:
     else:
         _git(p.root, "fetch", "--quiet", "origin", check=False)
         _git(p.root, "worktree", "add", "-b", branch, str(path), continued_head(p, task) or resolve_base(p))
+    link_paths(p, path)
     return path, branch
+
+
+LINK_PATHS = [".venv"]   # worktree.link_paths: the default
+
+
+def _ignores(repo: Path, rel: str) -> bool:
+    """Git ignores `rel` in `repo` (a tracked path never counts as ignored)."""
+    return subprocess.run(["git", "-C", str(repo), "check-ignore", "-q", "--", rel],
+                          capture_output=True, timeout=120).returncode == 0
+
+
+def link_paths(p: Project, path: Path) -> list[str]:
+    """Symlink the project checkout's git-ignored environment entries (`worktree.link_paths`,
+    relative paths) into the worktree at `path`, so a check that runs `.venv/bin/python` works in a
+    fresh worktree. An entry is linked only when it exists in the checkout, git ignores it there (so
+    it is not tracked) and nothing is at its place in the worktree, tracked or not. A rule like
+    `.venv/` matches directories only, not a link, so a link git would not ignore gets a `/<entry>`
+    line in the repository's info/exclude: `git add -A` never commits it and the worktree still
+    counts as clean. Removing the worktree deletes the link, never what it points to. Returns the
+    entries linked; failures are skipped."""
+    rels = (p.config().get("worktree") or {}).get("link_paths", LINK_PATHS)
+    if not isinstance(rels, list):
+        return []
+    done = []
+    for rel in rels:
+        if not isinstance(rel, str) or not rel.strip("/") or Path(rel).is_absolute() or ".." in Path(rel).parts:
+            continue
+        rel = rel.strip("/")
+        src, dest = p.root / rel, path / rel
+        try:
+            if (not src.exists() or os.path.lexists(dest) or not dest.parent.is_dir()
+                    or not _ignores(p.root, rel) or _git(path, "ls-files", "--", rel, check=False)):
+                continue
+            os.symlink(src.resolve(), dest, target_is_directory=src.is_dir())
+            if not _ignores(path, rel):
+                common = Path(path) / _git(path, "rev-parse", "--git-common-dir")
+                exclude = common / "info" / "exclude"
+                exclude.parent.mkdir(parents=True, exist_ok=True)
+                text = exclude.read_text() if exclude.is_file() else ""
+                if f"/{rel}" not in text.splitlines():
+                    exclude.write_text(text + ("" if not text or text.endswith("\n") else "\n") + f"/{rel}\n")
+            done.append(rel)
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            continue
+    return done
 
 
 VENV_NAMES = (".venv", "venv")

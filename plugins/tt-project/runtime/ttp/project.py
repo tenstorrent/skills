@@ -119,8 +119,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Workers and reviewers run with the project's Python venv active (VIRTUAL_ENV, PATH), so a
     # fresh task worktree does not rebuild one. "auto" finds .venv or venv in the project root; a
     # path (absolute, or relative to the project root) names one; "" turns it off. A working
-    # directory with a venv of its own keeps that one.
-    "worktree": {"venv": "auto"},
+    # directory with a venv of its own keeps that one. A new task worktree gets a symlink to each
+    # link_paths entry (relative to the project root) that exists and is git-ignored there and is
+    # missing in the worktree, so checks naming `.venv/bin/python` work; [] turns it off.
+    "worktree": {"venv": "auto", "link_paths": [".venv"]},
     # A command watcher's known open issue wakes the coordinator again once it was last seen more
     # than rewake_after_h ago (null = never), or every time its observation says "repeat": true.
     "screen": {"wake_min_severity": "normal", "rewake_after_h": 6},

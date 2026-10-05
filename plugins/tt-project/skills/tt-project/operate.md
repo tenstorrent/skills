@@ -78,6 +78,12 @@
   prompt names it), so a fresh worktree does not rebuild one. `worktree.venv`: `auto` (default) finds
   `.venv` or `venv` in the project root, a path names another, `""` turns it off. A worktree with a
   venv of its own keeps it; with no venv, runs start as before.
+- A new task worktree gets a symlink to each `worktree.link_paths` entry (default `[".venv"]`,
+  relative to the project root) that exists and is git-ignored in the project checkout and is
+  missing in the worktree, so a check such as `.venv/bin/python -m pytest` works there. Tracked
+  paths and existing files are never touched; the link is git-ignored (info/exclude if needed), and
+  removing the worktree deletes only the link. `[]` turns it off. Check commands can also use
+  `"$VIRTUAL_ENV"/bin/python`: workers and reviewers run with the project venv active.
 - Work only on this machine: when a code task hands off done, and hourly for code tasks done in the
   last 14 days, the daemon fetches (30 s timeout) and checks whether the task branch's work is on a
   remote: a remote-tracking branch contains its head, or its changes are already on the delivery
