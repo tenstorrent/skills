@@ -6,6 +6,13 @@ Every holder takes one slot file under state/locks: `ttp lock` for one command, 
 of an `exclusive:<name>` task for its whole run. A lock ends with the process that holds it, so a
 crash or a reboot never leaves a resource taken.
 
+Waiters queue in arrival order (a ticket file per waiting process under <resource>.queue): only the
+first `slots` live tickets may take a slot, so a waiter is never starved by later arrivals. A ticket
+whose process is gone is dropped.
+
+Resources named in config `device.locks` are one device: they all map to the first name's lock, so
+at most one command at a time is in the device phase, whatever name it locks by.
+
 An exclusive task that finds every slot held reserves the resource: new `ttp lock` commands wait
 until it has its slot, so commands that keep taking the lock in turn cannot starve it. Whoever
 reserves refreshes the reservation while it waits; one not refreshed for RESERVE_STALE_S no longer
@@ -16,12 +23,27 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import shlex
 import time
 from pathlib import Path
 
 from .project import durable_write
 
 RESERVE_STALE_S = 120
+
+
+def _device_list(cfg: dict) -> list[str]:
+    return [str(x) for x in ((cfg.get("device") or {}).get("locks") or [])]
+
+
+def device_locks(cfg: dict) -> set[str]:
+    return set(_device_list(cfg))
+
+
+def canonical(cfg: dict, resource: str) -> str:
+    """The lock a resource name is held by: every device name shares the first one's lock."""
+    dev = _device_list(cfg)
+    return dev[0] if resource in dev else resource
 
 
 def slot_paths(locks_dir: Path, resource: str, slots: int) -> list[Path]:
@@ -197,3 +219,107 @@ def _alive(pid: int) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def queue_dir(locks_dir: Path, resource: str) -> Path:
+    return Path(locks_dir) / f"{resource}.queue"
+
+
+_TICKETS: dict[Path, object] = {}   # this process's tickets: the open file that holds each one's lock
+
+
+def enqueue(locks_dir: Path, resource: str, holder: str) -> Path:
+    """A ticket for this process in the resource's arrival queue. Like a slot, it is an OS file lock
+    held by this process, so it ends with it (a crash, a kill, a reboot) whatever its pid becomes.
+    Not written durably: a power cut ends every waiter with it. Remove it with `dequeue`."""
+    d = queue_dir(locks_dir, resource)
+    d.mkdir(parents=True, exist_ok=True)
+    name = f"{time.time():017.6f}-{os.getpid()}"
+    # Locked under a hidden name first, then renamed in: `queued` never sees it unlocked.
+    tmp = d / f".{name}.tmp"
+    f = open(tmp, "a+")
+    fcntl.flock(f, fcntl.LOCK_EX)
+    f.write(holder)
+    f.flush()
+    path = d / name
+    os.rename(tmp, path)
+    _TICKETS[path] = f
+    return path
+
+
+def dequeue(ticket: Path | None) -> None:
+    if ticket is None:
+        return
+    try:
+        ticket.unlink()
+    except OSError:
+        pass
+    f = _TICKETS.pop(ticket, None)
+    if f is not None:
+        f.close()
+
+
+def _ticket_live(path: Path) -> bool:
+    try:
+        with open(path) as f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except OSError:
+                return True
+            return False
+    except OSError:
+        return False
+
+
+def queued(locks_dir: Path, resource: str) -> list[Path]:
+    """Live tickets in arrival order; tickets whose process is gone are removed."""
+    d = queue_dir(locks_dir, resource)
+    out = []
+    try:
+        names = sorted(n for n in os.listdir(d) if not n.startswith("."))
+    except OSError:
+        return out
+    for name in names:
+        path = d / name
+        if path in _TICKETS or _ticket_live(path):
+            out.append(path)
+        else:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+    return out
+
+
+def my_turn(locks_dir: Path, resource: str, ticket: Path, slots: int) -> bool:
+    """Whether this ticket is among the first `slots` waiters, so it may take a free slot."""
+    q = queued(locks_dir, resource)
+    return ticket not in q or q.index(ticket) < max(int(slots or 1), 1)
+
+
+def take_in_turn(locks_dir: Path, resource: str, ticket: Path, paths: list[Path], holder: str, what: str = ""):
+    """try_take, but only when this ticket's turn has come."""
+    if not my_turn(locks_dir, resource, ticket, len(paths)):
+        return None
+    return try_take(paths, holder, what)
+
+
+def probe(locks_dir: Path, resource: str, paths: list[Path]) -> bool:
+    """Free now, nobody waiting and not reserved: a task that gave up waiting can come back."""
+    return (any_free(paths) and not queued(locks_dir, resource)
+            and not reserved_by(reserve_path(locks_dir, resource)))
+
+
+def job_lock(rc: Path) -> Path:
+    """The lock a `ttp detach` job holds while any of its processes lives, next to its .rc file."""
+    return Path(rc).with_suffix(".lock")
+
+
+def job_ended(rc: Path) -> bool:
+    """Whether a detached job ended: it wrote its exit code, or its process is gone without one."""
+    return Path(rc).exists() or any_free([job_lock(rc)])
+
+
+def job_probe(rcs: list, ttp: str = "ttp") -> str:
+    """A `retry_when` that exits 0 once every one of these detached jobs ended, 1 before."""
+    return f"{ttp} detach --check " + " ".join(shlex.quote(str(r)) for r in rcs)

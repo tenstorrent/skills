@@ -21378,3 +21378,408 @@ def test_a_drifting_price_table_raises_a_low_alert(env, monkeypatch):
     asked.clear()
     d._check_price_table({"provider": "claude", "note": json.dumps({"resumes": {"run": 1, "session": "s1"}})}, usage)
     assert asked == [], "a resumed run's log also holds the run it resumed"
+
+
+# Device-aware scheduling: fair `ttp lock` queue, device lock aliases, --probe, nested locks,
+# `ttp detach` hand-offs and needs_device admission.
+DEVICE_CFG = {"locks": ["device-a", "device-b"], "max_tasks": 2}
+
+
+def _device_project(env, device=True):
+    p = make(env)
+    if device:
+        p.set_config("device", DEVICE_CFG)
+    return p
+
+
+def _ttp_run(p, *args, env=None, cwd=None, timeout=30):
+    e = {**os.environ, "TTP_PROJECT": str(p.base), **(env or {})}
+    for var in ("TTP_RUN_DIR", "TTP_LOCKS_HELD", "TTP_DETACHED"):
+        if var not in (env or {}):
+            e.pop(var, None)
+    return subprocess.run([sys.executable, str(TTP), *args], env=e, cwd=cwd or str(p.root),
+                          capture_output=True, text=True, timeout=timeout)
+
+
+def test_device_names_share_one_lock():
+    sys.path.insert(0, str(RUNTIME))
+    from ttp import locks as lk
+    cfg = {"device": DEVICE_CFG}
+    assert lk.canonical(cfg, "device-b") == "device-a" and lk.canonical(cfg, "device-a") == "device-a"
+    assert lk.canonical(cfg, "builddir") == "builddir"
+    assert lk.canonical({}, "device-b") == "device-b", "no device config: every name is its own lock"
+
+
+def test_lock_queue_is_first_come_first_served(env, tmp_path):
+    from ttp import locks as lk
+    first = lk.enqueue(tmp_path, "r", "a")
+    second = lk.enqueue(tmp_path, "r", "b")
+    paths = lk.slot_paths(tmp_path, "r", 1)
+    assert lk.take_in_turn(tmp_path, "r", second, paths, "b") is None   # not its turn, though free
+    f = lk.take_in_turn(tmp_path, "r", first, paths, "a")
+    assert f is not None
+    lk.dequeue(first)
+    assert lk.take_in_turn(tmp_path, "r", second, paths, "b") is None   # its turn, but held
+    f.close()
+    g = lk.take_in_turn(tmp_path, "r", second, paths, "b")
+    assert g is not None
+    g.close()
+    lk.dequeue(second)
+
+
+def test_lock_queue_drops_a_dead_waiter_and_keeps_fifo_order(env, tmp_path):
+    from ttp import locks as lk
+    # A waiter that died (killed, or the host restarted) leaves its ticket file behind, unlocked.
+    gone = subprocess.run([sys.executable, "-c", "import sys; sys.path.insert(0, sys.argv[1]); "
+                           "from ttp import locks; print(locks.enqueue(sys.argv[2], 'r', 'gone'))",
+                           str(RUNTIME), str(tmp_path)], capture_output=True, text=True, check=True)
+    dead = pathlib.Path(gone.stdout.strip())
+    assert dead.exists()
+    mine = lk.enqueue(tmp_path, "r", "me")
+    later = lk.enqueue(tmp_path, "r", "later")
+    assert lk.queued(tmp_path, "r") == [mine, later]
+    assert not dead.exists(), "the dead waiter's ticket is removed"
+    paths = lk.slot_paths(tmp_path, "r", 1)
+    assert lk.take_in_turn(tmp_path, "r", later, paths, "later") is None, "a later arrival waits its turn"
+    f = lk.take_in_turn(tmp_path, "r", mine, paths, "me")
+    assert f is not None, "the dead waiter ahead does not block the queue"
+    f.close()
+    lk.dequeue(mine)
+    lk.dequeue(later)
+    assert lk.queued(tmp_path, "r") == []
+
+
+def test_lock_queue_ticket_stays_live_whatever_its_pid(env, tmp_path):
+    from ttp import locks as lk
+    # Liveness is the ticket's lock, not its pid: a ticket of this process named after a dead pid
+    # (as after a reboot reused it) is still judged by whether its lock is held.
+    holder = subprocess.Popen([sys.executable, "-c", "import sys, time; sys.path.insert(0, sys.argv[1]); "
+                               "from ttp import locks; print(locks.enqueue(sys.argv[2], 'r', 'w'), flush=True); "
+                               "time.sleep(60)", str(RUNTIME), str(tmp_path)], stdout=subprocess.PIPE, text=True)
+    try:
+        ticket = pathlib.Path(holder.stdout.readline().strip())
+        assert lk.queued(tmp_path, "r") == [ticket]
+    finally:
+        holder.kill()
+        holder.wait()
+    assert lk.queued(tmp_path, "r") == []
+
+
+def test_waited_counts_overlaps_once(env, tmp_path):
+    from ttp import locks as lk
+    lk.record_wait(tmp_path, "1", 100, 160)
+    lk.record_wait(tmp_path, "2", 150, 200)
+    lk.record_wait(tmp_path, "3", 300, 310)
+    assert lk.waited(tmp_path, now=1000) == pytest.approx(110)
+
+
+def test_lock_probe_free_then_busy(env):
+    p = _device_project(env)
+    from ttp import locks as lk
+    assert _ttp_run(p, "lock", "--probe", "device-b").returncode == 0
+    held = lk.try_take(lk.slot_paths(p.state / "locks", "device-a", 1), "someone")
+    r = _ttp_run(p, "lock", "--probe", "device-b")
+    assert r.returncode == 75 and "busy" in r.stdout
+    held.close()
+    assert _ttp_run(p, "lock", "--probe", "device-b").returncode == 0
+
+
+def test_lock_probe_finds_the_project_from_cwd(env):
+    p = _device_project(env)
+    e = {k: v for k, v in os.environ.items() if k not in ("TTP_PROJECT", "TTP_RUN_DIR")}
+    r = subprocess.run([sys.executable, str(TTP), "lock", "--probe", "device-a"], cwd=str(p.root),
+                       env=e, capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+
+
+def test_lock_probe_busy_while_reserved_under_any_device_name(env):
+    p = _device_project(env)
+    from ttp import locks as lk
+    mark = lk.reserve_path(p.state / "locks", "device-a")
+    lk.reserve(mark, "an exclusive task")
+    r = _ttp_run(p, "lock", "--probe", "device-b")
+    assert r.returncode == 75 and "reserved for an exclusive task" in r.stdout
+    lk.unreserve(mark, "an exclusive task")
+    assert _ttp_run(p, "lock", "--probe", "device-b").returncode == 0
+
+
+def test_nested_device_locks_do_not_deadlock(env):
+    p = _device_project(env)
+    r = _ttp_run(p, "lock", "device-a", "--", sys.executable, str(TTP), "lock", "device-b", "--",
+                 sys.executable, "-c", "import os; print(os.environ['TTP_LOCKS_HELD'])", timeout=30)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "device-a"
+
+
+def test_nested_lock_of_the_same_resource_passes_through_without_device_config(env):
+    p = _device_project(env, device=False)
+    r = _ttp_run(p, "lock", "--timeout", "5", "board", "--", sys.executable, str(TTP), "lock", "--timeout", "5",
+                 "board", "--", "true", timeout=30)
+    assert r.returncode == 0, r.stderr
+    from ttp import locks as lk
+    assert lk.queued(p.state / "locks", "board") == [], "no ticket is left behind"
+
+
+def test_in_run_lock_wait_is_capped_and_recorded(env):
+    p = _device_project(env)
+    from ttp import locks as lk
+    run_dir = p.runs / "7"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text(json.dumps({"stall_s": 8}))
+    held = lk.try_take(lk.slot_paths(p.state / "locks", "device-a", 1), "someone")
+    t0 = time.time()
+    r = _ttp_run(p, "lock", "--timeout", "2400", "device-b", "--", "true", env={"TTP_RUN_DIR": str(run_dir)})
+    held.close()
+    assert r.returncode == 75
+    assert time.time() - t0 < 20
+    assert "retry_when `ttp lock --probe device-b`" in r.stderr
+    assert lk.waited(run_dir) >= 3
+    assert not lk.queued(p.state / "locks", "device-a")   # its ticket is gone
+
+
+def test_in_run_lock_wait_is_not_capped_in_a_detached_job(env):
+    p = _device_project(env)
+    from ttp import locks as lk
+    run_dir = p.runs / "8"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text(json.dumps({"stall_s": 2}))
+    held = lk.try_take(lk.slot_paths(p.state / "locks", "device-a", 1), "someone")
+    proc = subprocess.Popen([sys.executable, str(TTP), "lock", "device-a", "--", "true"],
+                            env={**os.environ, "TTP_PROJECT": str(p.base), "TTP_RUN_DIR": str(run_dir),
+                                 "TTP_DETACHED": "1"})
+    try:
+        time.sleep(3)
+        assert proc.poll() is None, "a detached job waits past half the run's stall limit"
+    finally:
+        held.close()
+    assert proc.wait(timeout=30) == 0
+
+
+def _wait_for(path, timeout=20):
+    deadline = time.time() + timeout
+    while time.time() < deadline and not path.exists():
+        time.sleep(0.05)
+    return path.exists()
+
+
+def test_detach_writes_rc_log_and_a_durable_registry(env):
+    p = _device_project(env, device=False)
+    run_dir = p.runs / "8"
+    run_dir.mkdir(parents=True)
+    r = _ttp_run(p, "detach", "job1", "--", "sh", "-c", "echo hi; exit 3", env={"TTP_RUN_DIR": str(run_dir)})
+    assert r.returncode == 0, r.stderr
+    rc = run_dir / "job1.rc"
+    assert _wait_for(rc)
+    assert rc.read_text().strip() == "3"
+    assert (run_dir / "job1.log").read_text().strip() == "hi"
+    jobs = json.loads((run_dir / "detached.json").read_text())
+    assert jobs[0]["name"] == "job1" and jobs[0]["rc"] == str(rc.resolve())
+    assert "detach --check" in r.stdout
+    check = _ttp_run(p, "detach", "--check", str(rc))
+    assert check.returncode == 0 and "exit 3" in check.stdout
+    again = _ttp_run(p, "detach", "job1", "--", "true", env={"TTP_RUN_DIR": str(run_dir)})
+    assert again.returncode != 0, "a name is used once per run"
+
+
+def test_detach_check_waits_while_running_and_wakes_when_the_job_dies(env):
+    p = _device_project(env, device=False)
+    run_dir = p.runs / "9"
+    run_dir.mkdir(parents=True)
+    started = run_dir / "started"
+    r = _ttp_run(p, "detach", "long", "--", "sh", "-c", f"touch {started}; sleep 60",
+                 env={"TTP_RUN_DIR": str(run_dir)})
+    assert r.returncode == 0, r.stderr
+    assert _wait_for(started)
+    rc = run_dir / "long.rc"
+    check = _ttp_run(p, "detach", "--check", str(rc))
+    assert check.returncode == 1 and "running" in check.stdout
+    # Killed (or the host restarted): no .rc is ever written, and the check still ends the wait.
+    pid = json.loads((run_dir / "detached.json").read_text())[0]["pid"]
+    os.killpg(pid, signal.SIGKILL)
+    deadline = time.time() + 20
+    while time.time() < deadline and _ttp_run(p, "detach", "--check", str(rc)).returncode != 0:
+        time.sleep(0.1)
+    check = _ttp_run(p, "detach", "--check", str(rc))
+    assert check.returncode == 0 and "gone without an exit code" in check.stdout
+    assert not rc.exists()
+
+
+def _dev_task(p, labels=(), status="queued", title="t", spec=""):
+    tid = p.db.add_task(title, spec, kind="code", tier="standard", priority=3, budget_usd=8.0, labels=list(labels))
+    if status != "queued":
+        p.db.update_task(tid, status=status)
+    return p.db.task(tid)
+
+
+def test_needs_device_tag(env):
+    from ttp.daemon import needs_device
+    cfg = {"device": DEVICE_CFG}
+    assert needs_device({"labels": json.dumps(["resource:device-b"])}, cfg)
+    assert needs_device({"labels": json.dumps(["needs_device"])}, cfg)
+    assert not needs_device({"labels": json.dumps(["resource:builddir"])}, cfg)
+    assert not needs_device({"labels": json.dumps(["needs_device"])}, {}), "opt-in: no device config, no tag"
+
+
+def test_device_tasks_admitted_up_to_max(env):
+    p = _device_project(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    _dev_task(p, ["needs_device"], status="running", title="a")
+    q = _dev_task(p, ["resource:device-a"], title="b")
+    free = _dev_task(p, [], title="c")
+    assert d._device_tasks_running() == 1 and d._device_max_tasks() == 2
+    _dev_task(p, ["resource:device-b"], status="running", title="d")
+    assert d._device_tasks_running() == 2
+    assert d._dispatchable()   # task c needs no device
+    p.db.update_task(free["id"], status="done")
+    assert not d._dispatchable()
+    assert q["status"] == "queued"
+
+
+def test_without_device_config_dispatch_is_unchanged(env):
+    p = _device_project(env, device=False)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    for title in ("a", "b", "c"):
+        _dev_task(p, ["needs_device"], status="running", title=title)
+    q = _dev_task(p, ["needs_device", "resource:device-b"], title="q")
+    assert d._device_tasks_running() == 0
+    assert d._dispatchable() and d._resources_free(q)
+    # Two names are two locks, each with its own slots.
+    _dev_task(p, ["exclusive:device-a"], status="running", title="x")
+    assert d._resources_free(_dev_task(p, ["exclusive:device-b"], title="y"))
+
+
+def test_device_aliases_share_one_slot_and_one_pause(env):
+    p = _device_project(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    _dev_task(p, ["exclusive:device-a"], status="running", title="x")
+    assert not d._resources_free(_dev_task(p, ["exclusive:device-b"], title="y"))
+    p.db.update_task(p.db.one("SELECT id FROM tasks WHERE title='x'")["id"], status="done")
+    z = _dev_task(p, ["resource:device-b"], title="z")
+    assert d._resources_free(z)
+    p.db.set_kv("paused_resources", {"device-a": {"reason": "maintenance", "since": time.time(), "by": "user"}})
+    assert not d._resources_free(z), "a pause of one device name holds tasks that name another"
+
+
+def _finish_dev(p, d, task, result=None, status="ok", jobs=None):
+    from ttp.providers.base import RunUsage as Usage
+    run_dir = p.runs / f"r{task['id']}"
+    run_dir.mkdir(parents=True)
+    if result is not None:
+        (run_dir / "result.json").write_text(json.dumps(result))
+    if jobs is not None:
+        (run_dir / "detached.json").write_text(json.dumps(jobs))
+    p.db.update_task(task["id"], status="running")
+    d._finish_worker({"task": task["id"], "note": None, "dir": str(run_dir)}, Usage(final_text="bye"), status, run_dir)
+    return p.db.task(task["id"]), run_dir
+
+
+def test_missing_handoff_after_detach_waits_on_the_job(env):
+    p = _device_project(env, device=False)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    t = _dev_task(p, title="bench")
+    rc = str(p.runs / "x" / "b.rc")
+    after, _ = _finish_dev(p, d, t, jobs=[{"name": "b", "rc": rc, "log": rc[:-3] + ".log"}])
+    res = json.loads(after["result"])
+    assert after["status"] == "queued" and int(after["attempts"] or 0) == 0
+    assert res["status"] == "waiting" and res["retry_when"].endswith(f"detach --check {rc}")
+    assert after["not_before"] > time.time()
+
+
+def test_timeout_after_detach_waits(env):
+    p = _device_project(env, device=False)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    t = _dev_task(p, title="bench2")
+    after, _ = _finish_dev(p, d, t, status="timeout", jobs=[{"name": "b", "rc": "/x/b.rc", "log": "/x/b.log"}])
+    assert after["status"] == "queued" and int(after["attempts"] or 0) == 0
+
+
+def test_missing_handoff_without_detach_still_counts(env):
+    p = _device_project(env, device=False)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    t = _dev_task(p, title="plain")
+    after, _ = _finish_dev(p, d, t)
+    assert json.loads(after["result"])["status"] == "no_handoff" and after["attempts"] == 1
+
+
+def test_waiting_without_probe_gets_the_detach_check(env):
+    p = _device_project(env, device=False)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    t = _dev_task(p, title="w")
+    after, _ = _finish_dev(p, d, t, result={"status": "waiting", "summary": "bench running"},
+                           jobs=[{"name": "b", "rc": "/x/b.rc", "log": "/x/b.log"},
+                                 {"name": "c", "rc": "/x/c.rc", "log": "/x/c.log"}])
+    assert json.loads(after["result"])["retry_when"].endswith("detach --check /x/b.rc /x/c.rc")
+
+
+def test_a_dead_detached_job_wakes_its_waiting_task(env):
+    p = _device_project(env, device=False)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    run_dir = p.runs / "10"
+    run_dir.mkdir(parents=True)
+    started = run_dir / "started"
+    r = _ttp_run(p, "detach", "bench", "--", "sh", "-c", f"touch {started}; sleep 60",
+                 env={"TTP_RUN_DIR": str(run_dir)})
+    assert r.returncode == 0, r.stderr
+    assert _wait_for(started)
+    jobs = json.loads((run_dir / "detached.json").read_text())
+    t = _dev_task(p, title="bench3")
+    after, _ = _finish_dev(p, d, t, jobs=jobs)
+    probe = json.loads(after["result"])["retry_when"]
+    run = lambda: subprocess.run(probe, shell=True, cwd=str(p.root), env=d._probe_env(),
+                                 capture_output=True, text=True, timeout=30).returncode
+    assert run() == 1, "the job still runs: the task stays asleep"
+    os.killpg(jobs[0]["pid"], signal.SIGKILL)
+    deadline = time.time() + 20
+    while time.time() < deadline and run() != 0:
+        time.sleep(0.1)
+    assert run() == 0, "gone without an .rc: the probe ends the wait instead of sleeping to max_hold_s"
+
+
+def test_probe_env_finds_ttp(env):
+    p = _device_project(env, device=False)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    e = d._probe_env()
+    assert e["TTP_PROJECT"] == str(d.p.base)
+    assert e["PATH"].startswith(str(d.p.harness / "bin"))
+    assert e["PYTHONPATH"] == str(RUNTIME.resolve())
+
+
+def test_task_add_tags_device_tasks(env):
+    p = _device_project(env)
+    from ttp import coordinator as coord
+    assert not coord.apply(p, [{"type": "task_add", "title": "bench", "spec": "x", "resources": ["device-b"]}])
+    t = p.db.one("SELECT labels FROM tasks WHERE title='bench'")
+    assert "needs_device" in json.loads(t["labels"])
+
+
+def _supervise_with_wait(tmp_path, monkeypatch, wait_start):
+    from ttp import locks as lk
+    from ttp import runner
+    monkeypatch.setattr(runner, "POLL_S", 0.2)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "prompt.md").write_text("")
+    (run_dir / "run.json").write_text(json.dumps({"argv": ["sh", "-c", "sleep 3"], "cwd": str(tmp_path),
+                                                  "timeout_s": 2, "provider": "fake"}))
+    if wait_start is not None:
+        # An open wait by a live process (this one): the run is queued for a lock right now.
+        lk.record_wait(run_dir, "w", wait_start, None)
+    runner.supervise(run_dir)
+    return json.loads((run_dir / "exit.json").read_text())
+
+
+def test_lock_wait_extends_run_deadline(env, tmp_path, monkeypatch):
+    assert _supervise_with_wait(tmp_path, monkeypatch, time.time() - 100)["stopped"] is None
+
+
+def test_run_deadline_without_lock_wait(env, tmp_path, monkeypatch):
+    assert _supervise_with_wait(tmp_path, monkeypatch, None)["stopped"] == "timeout"

@@ -8,6 +8,7 @@ machine, the command is forwarded over ssh to that machine's copy of the project
 from __future__ import annotations
 
 import argparse
+import atexit
 import getpass
 import json
 import os
@@ -1266,20 +1267,27 @@ def cmd_lock(a) -> None:
     the commands that touch it, and the rest of the task runs alongside other work. Slots come from
     the project's `resources` config (default 1); a running `exclusive:<resource>` task holds one for
     its whole run, and one waiting for a slot reserves the resource: new commands wait until it has
-    started. The lock is held until the command has ended, however it ends.
+    started. The lock is held until the command has ended, however it ends. Every name in config
+    `device.locks` is the one device lock. Waiters are served in arrival order, and a nested
+    `ttp lock` of a lock this command already holds just runs.
 
-    Inside a run, waiting is reported in the run's progress (a wait is not a stall) and gives up
-    after half the run's stall limit unless --timeout says otherwise (0: wait as long as it takes).
-    Giving up exits 75: the task hands back `waiting`. Time spent waiting does not count against
-    the run's wall clock, which grows by at most its own length this way.
+    Inside a run, waiting is reported in the run's progress (a wait is not a stall), does not count
+    toward the run's wall clock (which grows by at most its own length this way), and gives up after
+    half the run's stall limit (a longer --timeout is capped to that; 0 means that limit too). Giving
+    up exits 75: the task hands back `waiting` with retry_when `ttp lock --probe <resource>`. A paused
+    resource exits 75 as well. In a `ttp detach` job there is no cap.
+    `ttp lock --probe <resource>` exits 0 when the resource is free, not reserved and nobody queues
+    for it, else 75.
     """
     from . import locks as lk
     cmd = list(a.command or [])
     if cmd and cmd[0] == "--":
         cmd = cmd[1:]
-    if not cmd:
-        die("usage: ttp lock <resource> -- <command...>")
+    if not cmd and not a.probe:
+        die("usage: ttp lock <resource> -- <command...>  |  ttp lock --probe <resource>")
     base = os.environ.get("TTP_PROJECT")
+    if not base and a.probe:
+        base = next((str(d) for d in [Path.cwd(), *Path.cwd().parents] if Project(d).exists()), None)
     if not base:
         die("ttp lock only works inside a tt-project run (or with TTP_PROJECT set)")
     p = Project(base)
@@ -1287,7 +1295,9 @@ def cmd_lock(a) -> None:
     def _refuse_paused() -> None:
         # Checked before each try, so a pause set while this waits holds too.
         try:
-            held = p.db.paused_resources().get(a.resource)
+            paused = p.db.paused_resources()
+            # A pause of any of the device's names holds them all.
+            held = paused.get(a.resource) or next((v for k, v in paused.items() if lk.canonical(cfg, k) == res), None)
         except Exception as e:   # an unreadable database must not stop device commands
             print(f"ttp lock: could not check for a pause of {a.resource}: {e}", file=sys.stderr, flush=True)
             held = None
@@ -1299,7 +1309,8 @@ def cmd_lock(a) -> None:
 
     from . import shared
     cfg = p.config()
-    where = shared.locks_dir(p, a.resource, cfg)
+    res = lk.canonical(cfg, a.resource)
+    where = shared.locks_dir(p, res, cfg)
 
     def _unwritable(e: OSError) -> None:
         # Never a private lock instead: other holders would not see it. Say what is wrong.
@@ -1308,25 +1319,41 @@ def cmd_lock(a) -> None:
             f"and name this directory")
 
     try:
-        paths = lk.slot_paths(where, a.resource, shared.slots(p, a.resource, cfg))
+        paths = lk.slot_paths(where, res, shared.slots(p, res, cfg))
     except OSError as e:
         _unwritable(e)
-    who = shared.holder(p, a.resource, f"task #{os.environ.get('TTP_TASK') or '?'} "
-                                       f"(run {os.environ.get('TTP_RUN_ID') or '?'})", cfg)
+    if a.probe:
+        free = lk.probe(where, res, paths)
+        n, who_r = len(lk.queued(where, res)), lk.reserved_by(lk.reserve_path(where, res))
+        print(f"{a.resource}: " + ("free" if free else f"busy (held by {', '.join(lk.holders(paths)) or 'nobody'}"
+                                                      f"; {n} waiting{f'; reserved for {who_r}' if who_r else ''})"))
+        sys.exit(0 if free else 75)
+    who = shared.holder(p, res, f"task #{os.environ.get('TTP_TASK') or '?'} "
+                                f"(run {os.environ.get('TTP_RUN_ID') or '?'})", cfg)
+    held_locks = [x for x in os.environ.get("TTP_LOCKS_HELD", "").split(",") if x]
+    if res in held_locks:
+        sys.exit(subprocess.call(cmd))   # an enclosing `ttp lock` of this command holds it already
+    child_env = {**os.environ, "TTP_LOCKS_HELD": ",".join(held_locks + [res])}
+    detached = bool(os.environ.get("TTP_DETACHED"))
     run_dir = Path(os.environ["TTP_RUN_DIR"]) if os.environ.get("TTP_RUN_DIR") else None
     try:
         spec = json.loads((run_dir / "run.json").read_text()) if run_dir else {}
     except (OSError, ValueError):
         spec = {}
     waiting = False
-    if a.resource in {x.get("resource") for x in spec.get("exclusive") or []}:
+    if res in {lk.canonical(cfg, x.get("resource") or "") for x in spec.get("exclusive") or []}:
         # This run's task holds the resource for its whole run already.
         _refuse_paused()
-        sys.exit(subprocess.call(cmd))
+        sys.exit(subprocess.call(cmd, env=child_env))
     timeout = a.timeout
-    if timeout is None:
-        timeout = float(spec.get("stall_s") or 0) / 2
-    mark = lk.reserve_path(where, a.resource)
+    cap = float(spec.get("stall_s") or 0) / 2
+    if cap and not detached:
+        if timeout is not None and (timeout == 0 or timeout > cap):
+            print(f"ttp lock: --timeout {timeout:.0f} capped to {cap:.0f} s inside a run; if it runs out, "
+                  f"hand off `waiting` with retry_when `ttp lock --probe {a.resource}`", file=sys.stderr, flush=True)
+        timeout = cap if timeout is None or timeout == 0 else min(timeout, cap)
+    mark = lk.reserve_path(where, res)
+    wait_dir = None if detached else run_dir
     started, told = time.time(), 0.0
     wait_key = f"{os.getpid()}:{started}"
 
@@ -1336,25 +1363,32 @@ def cmd_lock(a) -> None:
         nonlocal waiting
         if waiting:
             waiting = False
-            lk.record_wait(run_dir, wait_key, started, time.time())
+            lk.record_wait(wait_dir, wait_key, started, time.time())
 
+    try:
+        ticket = lk.enqueue(where, res, who)
+    except OSError as e:
+        _unwritable(e)
+    atexit.register(lambda: lk.dequeue(ticket))   # however this ends; a dead process's ticket is dropped too
     while True:
         _refuse_paused()
         reserved = lk.reserved_by(mark)
         try:
-            f = None if reserved else lk.try_take(paths, who, " ".join(cmd))
+            f = None if reserved else lk.take_in_turn(where, res, ticket, paths, who, " ".join(cmd))
         except OSError as e:
             _end_wait()
             _unwritable(e)
         if f:
             _end_wait()
+            lk.dequeue(ticket)
+            ticket = None
             waited = time.time() - started
             if waited > 5:
                 print(f"ttp lock: got {a.resource} after {waited / 60:.1f} min", file=sys.stderr, flush=True)
             # The lock is held until the command itself has ended. A signal to this process (a
             # timeout, a cancel) is passed on to the command, and the lock is released only once
             # the command is gone, so nobody else ever gets the resource while it is still in use.
-            proc = subprocess.Popen(cmd)
+            proc = subprocess.Popen(cmd, env=child_env)
 
             def _forward(signum, _frame):
                 try:
@@ -1369,19 +1403,22 @@ def cmd_lock(a) -> None:
             finally:
                 f.close()
             sys.exit(rc)
-        if run_dir and not waiting:
+        if wait_dir and not waiting:
             # The run's wall clock stops while it waits here; the supervisor reads this record.
             # A signal ends the wait through _end_wait, so the record never stays open.
-            lk.record_wait(run_dir, wait_key, started, None)
+            lk.record_wait(wait_dir, wait_key, started, None)
             waiting = True
             for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
                 signal.signal(sig, lambda signum, _f: (_end_wait(), sys.exit(128 + signum)))
         if timeout and time.time() - started > timeout:
             _end_wait()
-            die(f"{a.resource} stayed busy for {timeout:.0f} s; hand the task back as waiting", 75)
+            die(f"{a.resource} stayed busy for {timeout:.0f} s. Hand the task back now: result.json status "
+                f"`waiting`, waiting_for `{a.resource}`, retry_when `ttp lock --probe {a.resource}`", 75)
         if time.time() - told >= 120:
+            ahead = len(lk.queued(where, res)) - 1
             line = (f"waiting for {a.resource} (reserved for {reserved})" if reserved else
-                    f"waiting for {a.resource} (held by {', '.join(lk.holders(paths)) or 'another task'})")
+                    f"waiting for {a.resource} (held by {', '.join(lk.holders(paths)) or 'another task'}"
+                    f"{f'; {ahead} ahead in queue' if ahead > 0 else ''})")
             print(f"ttp lock: {line}", file=sys.stderr, flush=True)
             if run_dir:
                 try:
@@ -1391,6 +1428,65 @@ def cmd_lock(a) -> None:
                     pass
             told = time.time()
         time.sleep(poll_s(3))
+
+def cmd_detach(a) -> None:
+    """Start a long job that outlives this run: `ttp detach <name> -- <command...>`.
+
+    Output goes to $TTP_RUN_DIR/<name>.log and the exit code to $TTP_RUN_DIR/<name>.rc once it
+    ends. Hand off `waiting` with the retry_when it prints, `ttp detach --check <rc path>`: it exits 0
+    once the job wrote its .rc, or once its process is gone without one (a kill, a reboot), else 1.
+    A run that ends without a hand-off after a detach is also brought back as waiting on its jobs."""
+    from . import locks as lk
+    from .push import _own_ttp
+    if a.check:
+        ended = True
+        for rc in map(Path, a.check):
+            if rc.exists():
+                print(f"{rc.stem}: ended, exit {rc.read_text().strip() or '?'}")
+            elif lk.job_ended(rc):
+                print(f"{rc.stem}: gone without an exit code (killed, or the host restarted); "
+                      f"see {rc.with_suffix('.log')}")
+            else:
+                ended = False
+                print(f"{rc.stem}: running")
+        sys.exit(0 if ended else 1)
+    cmd = list(a.command or [])
+    if cmd and cmd[0] == "--":
+        cmd = cmd[1:]
+    run_dir = os.environ.get("TTP_RUN_DIR")
+    if not cmd or not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", a.name or ""):
+        die("usage: ttp detach <name> -- <command...>  |  ttp detach --check <rc path...>   "
+            "(name: letters, digits, . _ -)")
+    if not run_dir:
+        die("ttp detach only works inside a tt-project run")
+    rd = Path(run_dir).resolve()
+    rc, logf = rd / f"{a.name}.rc", rd / f"{a.name}.log"
+    if rc.exists() or logf.exists():
+        die(f"a detached job named {a.name} already ran in this run; pick another name")
+    # The job inherits this lock and holds it while any of its processes lives, so a job gone without
+    # an .rc is told apart from one still running (lk.job_ended).
+    lock = lk.try_take([lk.job_lock(rc)], f"detached job {a.name}", " ".join(cmd))
+    if lock is None:
+        die(f"a detached job named {a.name} is still running in this run; pick another name")
+    wrapper = 'o="$1" r="$2"; shift 2; "$@" >"$o" 2>&1 </dev/null; c=$?; echo $c >"$r.tmp"; mv "$r.tmp" "$r"'
+    try:
+        proc = subprocess.Popen(["/bin/sh", "-c", wrapper, "sh", str(logf), str(rc), *cmd], cwd=os.getcwd(),
+                                env={**os.environ, "TTP_DETACHED": "1"}, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+                                pass_fds=(lock.fileno(),))
+    finally:
+        lock.close()
+    reg = rd / "detached.json"
+    try:
+        jobs = json.loads(reg.read_text())
+    except (OSError, ValueError):
+        jobs = []
+    jobs = jobs if isinstance(jobs, list) else []
+    jobs.append({"name": a.name, "rc": str(rc), "log": str(logf), "pid": proc.pid, "started": time.time(),
+                 "command": " ".join(cmd)[:300]})
+    durable_write(reg, json.dumps(jobs, indent=1))
+    print(f"detached {a.name} (pid {proc.pid})\nlog: {logf}\nrc:  {rc}\n"
+          f"hand off: status waiting, retry_when \"{lk.job_probe([rc], _own_ttp())}\"")
 
 
 # operating ----------------------------------------------------------------------------------------
@@ -2274,12 +2370,21 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_clip)
 
     s = sub.add_parser("lock", help="(inside a run) hold a shared resource while one command runs")
+    s.add_argument("--probe", action="store_true",
+                   help="exit 0 if the resource is free and nobody queues for it, else 75 (for retry_when)")
     s.add_argument("resource")
     s.add_argument("--timeout", type=float, default=None,
                    help="give up after this many seconds (exit 75); 0 waits as long as it takes; "
-                        "default inside a run: half its stall limit")
+                        "inside a run: at most half its stall limit")
     s.add_argument("command", nargs=argparse.REMAINDER)
     s.set_defaults(fn=cmd_lock)
+
+    s = sub.add_parser("detach", help="(inside a run) start a job that outlives the run; writes <name>.rc")
+    s.add_argument("--check", nargs="+", metavar="RC",
+                   help="exit 0 once every job of these .rc paths ended or is gone, else 1 (for retry_when)")
+    s.add_argument("name", nargs="?")
+    s.add_argument("command", nargs=argparse.REMAINDER)
+    s.set_defaults(fn=cmd_detach)
 
     for name, fn in (("list", cmd_list),):
         sub.add_parser(name).set_defaults(fn=fn)

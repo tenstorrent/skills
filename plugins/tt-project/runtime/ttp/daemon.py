@@ -819,7 +819,8 @@ class Daemon:
                     "budget_usd": budget_usd if provider not in ("claude",) else None,
                     # What a run without its own budget is priced at when it reports no usage.
                     "default_budget_usd": self.cfg["budget"].get("task_default_usd", {}).get(tier, 8.0),
-                    "exclusive": [{"resource": res, "paths": [str(x) for x in self._slot_paths(res)],
+                    "exclusive": [{"resource": res, "lock": locks.canonical(self.cfg, res),
+                                   "paths": [str(x) for x in self._slot_paths(res)],
                                    "reserve": str(self._reserve_path(res)),
                                    "holder": shared.holder(self.p, res, f"task #{task['id']}", self.cfg)}
                                   for res in _exclusive(task)] if task else [],
@@ -1447,6 +1448,20 @@ class Daemon:
             rstatus, result = "failed", dict(result, status="failed")
         summary = str((result.get("summary") if isinstance(result, dict) else None)
                       or (usage.final_text or usage.error or "")[:1500])
+        jobs = _detached_jobs(run_dir)
+        if jobs and (rstatus is None and status in ("ok", "timeout", "stalled")
+                     or rstatus == "waiting" and not result.get("retry_when")):
+            # A job this run detached is still the task's work in flight: the task waits until each
+            # job wrote its .rc or is gone (a kill, a reboot) instead of spending an attempt, and the
+            # next run is told where they are.
+            listing = "; ".join(f"{j['name']}: log {j['log']}, rc {j['rc']}" for j in jobs)
+            if rstatus is None:
+                summary = (f"run ended ({status}) without a hand-off after detaching jobs ({listing}). "
+                           f"Its last message: {summary}")[:1500]
+                result = {"status": "waiting", "summary": summary, "retry_after_s": 1800}
+                status, rstatus = "ok", "waiting"
+            result = {**result, "retry_when": locks.job_probe([j["rc"] for j in jobs], push._own_ttp(self.p)),
+                      "waiting_for": result.get("waiting_for") or f"detached jobs: {listing}"[:300]}
         waiting = status == "ok" and rstatus == "waiting"
         # A host reboot is not the task's failure: no attempt, no delay, unless the task keeps being
         # the run the host went down under.
@@ -2177,6 +2192,8 @@ class Daemon:
                 continue
             if task["origin"] in ("schedule", "harness") and not gate.allow_optional:
                 continue
+            if needs_device(task, self.cfg) and self._device_tasks_running() >= self._device_max_tasks():
+                continue
             remaining = (task["budget_usd"] or 0) - (task["spent_usd"] or 0)
             if task["budget_usd"] and remaining <= 0.05:
                 db.update_task(task["id"], status="blocked", blocked_reason="task budget exhausted")
@@ -2905,7 +2922,7 @@ class Daemon:
         try:
             proc = subprocess.Popen(probe, shell=True, cwd=str(self.p.root), stdin=subprocess.DEVNULL,
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                    start_new_session=True)
+                                    start_new_session=True, env=self._probe_env())
         except OSError as e:
             log(self.p, f"task {tid} {what} probe could not start: {e}")
             self._probe_rc[tid] = ("could not start", now, probe)
@@ -2957,6 +2974,12 @@ class Daemon:
                                                       and not gate.allow_optional))
         log(self.p, f"task {tid} retry_when {why}; {f'held by gate {gate.level}' if held else 'dispatching'}")
 
+    def _probe_env(self) -> dict:
+        """Probes run `ttp` (e.g. `ttp lock --probe device-a`) as a worker would."""
+        runtime_dir = str(Path(__file__).resolve().parent.parent)
+        return {**os.environ, "TTP_PROJECT": str(self.p.base), "PYTHONPATH": runtime_dir,
+                "PATH": f"{self.p.harness / 'bin'}:{service_path()}:{os.environ.get('PATH', '')}"}
+
     def _start_failed(self, task: dict, e: Exception) -> None:
         """Nothing was launched, so no attempt is spent. The task waits a minute before the next try,
         so a lasting cause (a full disk, a broken install) cannot spin; three failures in a row alert."""
@@ -2979,23 +3002,33 @@ class Daemon:
         the resource for some commands: those take the resource's lock (`ttp lock`) or its own queue,
         so the rest of the task runs in parallel with other work instead of waiting for the slot.
         With reserve, a task kept out only by `ttp lock` commands reserves the resource so new ones
-        wait; the reservation lapses unless the next dispatch refreshes it.
+        wait; the reservation lapses unless the next dispatch refreshes it. The names in config
+        `device.locks` are one resource with one slot.
 
         At most twice its slots run at once among the tasks that use a resource either way: more
         would only queue in `ttp lock` on a worker slot and a wall clock that other work could use."""
-        if coord.task_resources(task) & self.p.db.paused_resources().keys():
+        paused = self.p.db.paused_resources().keys()
+        if coord.task_resources(task) & paused:
             return False
+        if locks.device_locks(self.cfg) and ({locks.canonical(self.cfg, r) for r in coord.task_resources(task)}
+                                             & {locks.canonical(self.cfg, r) for r in paused}):
+            return False   # a pause of one device name holds the tasks that name another
+        running = self.p.db.q("SELECT labels FROM tasks WHERE status='running'")
+
+        def _locks_of(names: list[str]) -> set[str]:
+            return {locks.canonical(self.cfg, r) for r in names}
+
         for res in _shared(task):
-            users = self.p.db.one("SELECT COUNT(*) n FROM tasks WHERE status='running' AND (labels LIKE ? "
-                                  "OR labels LIKE ?)", (f'%"resource:{res}"%', f'%"exclusive:{res}"%'))["n"]
-            if users >= 2 * shared.slots(self.p, res, self.cfg):
+            lock = locks.canonical(self.cfg, res)
+            users = sum(1 for t in running if lock in _locks_of(_shared(t) + _exclusive(t)))
+            if users >= 2 * shared.slots(self.p, lock, self.cfg):
                 return False
         for res in _exclusive(task):
-            limit = shared.slots(self.p, res, self.cfg)
+            lock = locks.canonical(self.cfg, res)
+            limit = shared.slots(self.p, lock, self.cfg)
             # Running exclusive tasks count even before their supervisor has taken its slot; the
             # lock files show the slots `ttp lock` commands hold.
-            busy = self.p.db.one("SELECT COUNT(*) n FROM tasks WHERE status='running' AND labels LIKE ?",
-                                 (f'%"exclusive:{res}"%',))["n"]
+            busy = sum(1 for t in running if lock in _locks_of(_exclusive(t)))
             if busy >= limit:
                 return False
             if not locks.any_free(self._slot_paths(res)):
@@ -3004,15 +3037,31 @@ class Daemon:
                 return False
         return True
 
+    def _device_max_tasks(self) -> int:
+        try:
+            return max(int((self.cfg.get("device") or {}).get("max_tasks", 2) or 1), 1)
+        except (TypeError, ValueError):
+            return 2
+
+    def _device_tasks_running(self) -> int:
+        """Running tasks tagged needs_device. They prepare in parallel; `ttp lock` admits one at a
+        time to the device phase, in arrival order."""
+        return sum(1 for t in self.p.db.q("SELECT labels FROM tasks WHERE status='running'")
+                   if needs_device(t, self.cfg))
+
     def _slot_paths(self, res: str) -> list[Path]:
-        return locks.slot_paths(shared.locks_dir(self.p, res, self.cfg), res, shared.slots(self.p, res, self.cfg))
+        lock = locks.canonical(self.cfg, res)
+        return locks.slot_paths(shared.locks_dir(self.p, lock, self.cfg), lock, shared.slots(self.p, lock, self.cfg))
 
     def _reserve_path(self, res: str) -> Path:
-        return locks.reserve_path(shared.locks_dir(self.p, res, self.cfg), res)
+        lock = locks.canonical(self.cfg, res)
+        return locks.reserve_path(shared.locks_dir(self.p, lock, self.cfg), lock)
 
     def _dispatchable(self) -> bool:
         """Whether any queued task could start now (dependencies done, resources free)."""
-        return any(self._resources_free(t) for t in self.p.db.ready_tasks())
+        dev_full = self._device_tasks_running() >= self._device_max_tasks()
+        return any(self._resources_free(t) and not (dev_full and needs_device(t, self.cfg))
+                   for t in self.p.db.ready_tasks())
 
     def _size_review(self, task: dict) -> dict:
         """A review runs at the tier its diff needs, not the one it was queued with. Deep stays the
@@ -3400,6 +3449,25 @@ class Daemon:
                              stderr=subprocess.DEVNULL, start_new_session=True)
         except OSError:
             pass
+
+
+def needs_device(task: dict, cfg: dict) -> bool:
+    """Tagged `needs_device`, or names a device lock (config `device.locks`) as a resource. Only with
+    device locks configured: without them no task counts, and dispatch is as it always was."""
+    dev = locks.device_locks(cfg)
+    if not dev:
+        return False
+    labels = json.loads(task["labels"] or "[]")
+    return "needs_device" in labels or any(lb.split(":", 1)[1] in dev for lb in labels
+                                           if lb.startswith(("resource:", "exclusive:")))
+
+
+def _detached_jobs(run_dir: Path) -> list[dict]:
+    try:
+        jobs = json.loads((run_dir / "detached.json").read_text())
+    except (OSError, ValueError):
+        return []
+    return [j for j in jobs if isinstance(j, dict) and j.get("rc") and j.get("name")]
 
 
 PAUSED_NOTE = "waits for a paused resource:"

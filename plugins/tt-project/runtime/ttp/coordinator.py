@@ -20,6 +20,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from . import locks
 from . import ends, jevuse, machines, prguard, push, shared, upstream
 from . import screen as scr
 from . import schedule as sched
@@ -59,6 +60,7 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "blocking": {"type": "string", "enum": list(BLOCKING_REASONS)}, "recommendation": {"type": "string"},
             "least_disruptive": {"type": "string"},
             "resources": {"type": "array", "items": {"type": "string"}}, "exclusive": {"type": "boolean"},
+            "needs_device": {"type": "boolean"},
             "continues": {"type": "integer"}, "resource": {"type": "string"}, "paused": {"type": "boolean"},
             "reason": {"type": "string"}, "supersedes": {"type": "array", "items": {"type": "string"}},
             "replaces": {"type": "string"}, "over": {"type": "string"},
@@ -635,7 +637,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 tier = a.get("tier") if a.get("tier") in ("light", "standard", "deep") else "standard"
                 budget = a.get("budget_usd") or cfg["budget"]["task_default_usd"].get(tier, 8.0)
                 kind_label = "exclusive" if a.get("exclusive") else "resource"
-                labels = [f"{kind_label}:{r}" for r in _resource_names(a.get("resources") or [], t, problems)]
+                names = _resource_names(a.get("resources") or [], t, problems)
+                labels = [f"{kind_label}:{r}" for r in names]
+                if a.get("needs_device") or set(names) & locks.device_locks(cfg):
+                    labels.append("needs_device")
                 deps = _new_dependencies(db, None, a.get("depends_on") or [])
                 # The daemon would block a new task on a dead dependency at once.
                 dead = db.dead_dependency(deps)
@@ -717,8 +722,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     kind_label = "exclusive" if a.get("exclusive") else "resource"
                     keep = [lb for lb in json.loads(task["labels"] or "[]")
                             if not (isinstance(lb, str) and lb.split(":", 1)[0] in ("resource", "exclusive"))]
-                    upd["labels"] = keep + [f"{kind_label}:{r}"
-                                            for r in _resource_names(a["resources"], t, problems)]
+                    names = _resource_names(a["resources"], t, problems)
+                    upd["labels"] = keep + [f"{kind_label}:{r}" for r in names]
+                    if "needs_device" not in keep and set(names) & locks.device_locks(cfg):
+                        upd["labels"].append("needs_device")
                     if upd.get("status", task["status"]) == "queued" and task["not_before"] \
                             and deferral(task).get("after") != task["not_before"]:
                         # What it waited on was the old resource: it may start on the new one now.

@@ -163,7 +163,10 @@ def update_pause(res: str, change) -> tuple[dict | None, dict | None]:
 
 
 def own_slots(cfg: dict, res: str) -> int:
-    """The slot count this project's `resources` config gives the resource (1 when it gives none)."""
+    """The slot count this project's `resources` config gives the resource (1 when it gives none,
+    and always 1 for a device lock)."""
+    if res in locks.device_locks(cfg):
+        return 1
     try:
         return max(1, int((cfg.get("resources") or {}).get(res, 1) or 1))
     except (TypeError, ValueError):

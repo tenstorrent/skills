@@ -42,7 +42,8 @@ Other workers run at the same time as you, on other tasks of this project.
 - Shared things (a device, a reserved machine, a remote build directory) are used one command at a
   time: wrap each command that touches one in `ttp lock <resource> -- <command>`, and hold it only
   as long as that command needs. A device broker or queue that already serializes access is enough.
-  If `ttp lock` exits 75, the resource stayed busy or is paused: hand off `waiting` naming it.
+  If `ttp lock` exits 75, the resource stayed busy or is paused: hand off `waiting` naming it,
+  with `retry_when` `ttp lock --probe <resource>` (exits 0 once it is free).
 - Never release or re-create a machine reservation, or restart a shared service, unless that is
   your task. Others may be using it.
 - Stop only processes you started, by their pid. Never kill by name or pattern (`pkill -f`,
@@ -143,8 +144,9 @@ Before you finish, write `$TTP_RUN_DIR/result.json`:
   long build or job? Leave it running, note how to check on it, and hand off `waiting` with a
   `retry_after_s` that fits it.
 - Anything still running when you stop must be detached from your session
-  (`setsid nohup <cmd> > <log> 2>&1 &`), or it is killed with you. Your own background tasks
-  do not outlive the run.
+  (`ttp detach <name> -- <cmd>`, which writes `<name>.log` and `<name>.rc` in your run folder and
+  prints the `retry_when`; or `setsid nohup <cmd> > <log> 2>&1 &`), or it is killed with you.
+  Your own background tasks do not outlive the run.
 - Keep runs short: a run re-reads its whole context on every call. When the work is more than one
   run should hold, or the harness says the run passed its split line, finish the step, commit and
   hand off `done` with a `followups` entry titled `continue: ...` (what is done, branch and head,

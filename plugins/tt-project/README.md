@@ -172,7 +172,15 @@ and preferences you add later become part of the project's charter and memory.
 - A shared device or machine is taken per command, through its own queue (for example a device
   broker) or `ttp lock <resource> -- <command>`, so the rest of each task runs in parallel. A task
   marked exclusive holds the resource's lock for its whole run; while it waits for a slot, new
-  `ttp lock` commands wait behind it, so it is not starved. Locks and pauses are per project; a
+  `ttp lock` commands wait behind it, so it is not starved. `ttp lock` waiters take turns in arrival
+  order; a nested `ttp lock` of a resource the command already holds passes straight through; inside
+  a run a wait is capped at half the run's stall limit, then exits 75 so the task can wait on
+  `ttp lock --probe <resource>` (0 free, 75 busy) without a model. Config `device.locks` (opt-in)
+  names one device by several names: all share the first name's lock and pause, tasks that use one
+  get the `needs_device` label, and at most `device.max_tasks` of them run at once. A worker starts
+  a long job with `ttp detach <name> -- <command>`; a run that ends without a hand-off, or waiting
+  without a `retry_when`, then waits on `ttp detach --check`, which exits 0 once each job wrote its
+  exit code or its process is gone. Locks and pauses are per project; a
   resource that several projects on one machine use is declared shared (`shared_resources` in the
   config, or `ttp machines add <alias> --shared [names]`), and then all of them take turns on its
   slots, a pause of it holds in each, and `ttp status` shows which project holds or paused it.

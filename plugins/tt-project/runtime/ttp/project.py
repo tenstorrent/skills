@@ -81,6 +81,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # after its hand-off whatever the probe says.
     "waiting": {"max_hold_s": 21600},
     "resources": {},                    # shared-slot limits, e.g. {"device": 1}
+    # Lock names that all mean the one device (they share one `ttp lock` slot), and how many tasks
+    # tagged needs_device may run at once; `ttp lock` admits one of them at a time to the device.
+    "device": {"locks": [], "max_tasks": 2},
     "shared_resources": [],             # resources whose slots and pause all the user's projects share
     # model / effort, when set, override the coordinator tier's for the coordinator only.
     # unblock_effort: the least effort of a tricky or blocking turn (coordinator.effort_triggers);

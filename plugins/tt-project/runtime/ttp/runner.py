@@ -383,6 +383,8 @@ def _take_exclusive(run_dir: Path, wanted: list[dict], env: dict, deadline: floa
         # A shared resource's holder names the project as well (shared.holder).
         mine = res.get("holder") or task
         while True:
+            # Not in the `ttp lock` arrival queue: the reservation below already holds new commands
+            # off, and a queued command that is waiting on the reservation must not hold this off.
             f = locks.try_take(paths, who if mine == task else f"{mine}{who[len(task):]}", "exclusive")
             if f:
                 held.append(f)
