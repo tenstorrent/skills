@@ -33,6 +33,7 @@ USAGE_KEYS = ("inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteToken
 class Cursor(Provider):
     name = "cursor"
     binaries = ("agent", "cursor-agent")
+    api_host = "api2.cursor.sh"
     login_hint = "run `agent login` there"
     isolate_read_only = True
 

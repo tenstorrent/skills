@@ -11,6 +11,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlparse
 
 # Services start with a minimal PATH; agent CLIs usually live in the user's own bin directories.
 EXTRA_BIN_DIRS = ["~/.local/bin", "~/.npm-global/bin", "~/bin", "/opt/homebrew/bin", "/usr/local/bin",
@@ -61,12 +62,24 @@ class RunUsage:
 class Provider:
     name = "base"
     binaries: tuple[str, ...] = ()
+    # The API host a run needs to resolve: after a run could not reach it, new runs wait until it
+    # resolves (Daemon.net_held). api_base_env names the variable that points the CLI elsewhere.
+    api_host = ""
+    api_base_env = ""
     login_hint = "log in to the agent CLI there"   # how the user fixes "logged out" on this provider
     model = ""                       # the run's model and the project's price rows, for providers
     prices: dict = {}                # whose cost is estimated from tokens (see use())
     # Read-only turns run from scratch_dir(), not the project: this agent otherwise loads the
     # project's AGENTS.md or rules from its working directory into a decision-only turn.
     isolate_read_only = False
+
+    def reach_host(self, env: dict | None = None) -> str:
+        """The host this provider's runs reach its API at: the base URL's host when its variable is
+        set, else api_host. Empty: nothing to check."""
+        base = (os.environ if env is None else env).get(self.api_base_env, "") if self.api_base_env else ""
+        if base:
+            return urlparse(base if "://" in base else "https://" + base).hostname or ""
+        return self.api_host
 
     def use(self, model: str = "", prices: dict | None = None) -> "Provider":
         """Price this run's tokens with `model` and the project's `pricing.<provider>` rows."""

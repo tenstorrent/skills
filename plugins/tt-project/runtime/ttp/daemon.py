@@ -94,6 +94,15 @@ CONFIG_UNREADABLE_KEY = "config_unreadable"   # kv: project.json and its last go
 ALERT_KEEP_S = 30 * 86400   # alerts_sent keeps an entry this long: the longest every_s any alert uses
 SLEPT_MIN_S = 60        # a run whose wall clock ran this much ahead of its monotonic clock overlapped a host sleep
 SLEEPS_KEPT_S = 7 * 86400
+SLEPT_LONG_S = 600      # a sleep this long is recorded as a `host_slept` event and tells the user once a day
+SLEEP_EVENT_MERGE_S = 1800   # a sleep this soon after the last one (the dark wakes of a closed lid) extends its event
+# A run that ended because the provider's API could not be reached (DNS gone after a host sleep, a
+# network drop) is lost to the network, not an attempt; new runs on that provider wait (net_held).
+NET_LOST_RE = re.compile(r"Can't reach the API server|ENOTFOUND|EAI_AGAIN")
+REACH_EVERY_S = 30      # while a provider is held offline, how often its API host is resolved again
+REACH_TIMEOUT_S = 5
+NET_HOLD_MAX_S = 900    # a held provider still lets one run try this often: a lookup that keeps failing never holds forever
+PROXY_ENV = ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")   # set: the host resolves nothing itself
 LOCAL_ONLY_EVERY_S = 3600   # how often done code tasks' branches are checked against the remotes
 LOCAL_ONLY_DAYS = 14        # done code tasks finished this recently are checked (flagged ones until cleared)
 KV_LOCAL_ONLY = "local_only"   # kv: {task id: {branch, head, ahead, since}} for branches only on this machine
@@ -236,6 +245,9 @@ class Daemon:
         self._notify: str | None = None   # systemd's socket for the watchdog ping, when it runs us
         self._tick_wall, self._tick_mono = time.time(), time.monotonic()
         self._settle_until = 0.0   # monotonic time before which nothing new starts (the host just woke)
+        # provider -> {host, since, checked, checking, up, probe}: its API host must resolve before
+        # new runs start on it (net_held). In memory only: a restart tries the network afresh.
+        self._net_holds: dict[str, dict] = {}
         self._sched_sig: tuple[int, int] | None = None   # harness/schedules.json (mtime, size) last checked
         self._sched_read = 0.0   # monotonic time it was last read
         self._sched_problem: str | None = None   # what was wrong with it, last logged
@@ -446,13 +458,16 @@ class Daemon:
         scr.close_watcher_issues(self.p.db, quiet_s=scr.WATCHER_QUIET_CLOSE_S)
         self.review_jev()
         settling = self.settling()
+        core = self.cfg.get("core_provider") or "claude"
+        core_held = self.net_held(core) and not self._net_may_probe(core)
         for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.read_upstream, self.retry_rejected,
                      self.retire_ended, self.maybe_coordinate, self.probe_waiting, self.start_pushes, self.dispatch, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
                 continue   # no routing to start model work with (see _load_config)
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
-            if settling and (step == self.dispatch or step == self.maybe_coordinate and not self.p.db.one(
-                    "SELECT id FROM messages WHERE direction='in' AND handled=0")):
+            # So while the core provider's API host does not resolve; dispatch holds each provider itself.
+            if settling and step == self.dispatch or (settling or core_held) and step == self.maybe_coordinate \
+                    and not self.p.db.one("SELECT id FROM messages WHERE direction='in' AND handled=0"):
                 continue
             step()
             self._progress()
@@ -521,10 +536,88 @@ class Daemon:
         db.set_kv("settle_until", wall + settle)   # for status: when new work starts, if it stays awake
         log(self.p, f"host slept for {jump:.0f} s (tick gap {gap:.0f} s); "
                     f"nothing new starts for {settle:.0f} s of awake time")
+        # The network may not be back with the host: new runs wait until the API hosts resolve.
+        for prov in {self.cfg.get("core_provider") or "claude", *[t["provider"] for t in db.q(
+                "SELECT DISTINCT provider FROM tasks WHERE provider IS NOT NULL AND status='queued'")]}:
+            self.hold_offline(prov, "the host slept")
+        if jump >= SLEPT_LONG_S:
+            self._record_sleep(since, wall, jump)
+
+    def _record_sleep(self, since: float, woke: float, slept: float) -> None:
+        """A long sleep. Running runs need no clock change: their supervisors count timeout and stall
+        in awake time. Record it as one `host_slept` event per sleepy stretch (a closed lid wakes in
+        the dark many times), and tell the user once a day what keeps the project awake."""
+        db = self.p.db
+        runs = [r["id"] for r in db.q("SELECT id FROM runs WHERE status='running'")]
+        last = db.one("SELECT id, data FROM events WHERE kind='host_slept' ORDER BY id DESC LIMIT 1")
+        data = json.loads(last["data"] or "{}") if last else {}
+        if last and float(data.get("woke") or 0) >= since - SLEEP_EVENT_MERGE_S:
+            data.update(woke=woke, slept_s=round(float(data.get("slept_s") or 0) + slept),
+                        sleeps=int(data.get("sleeps") or 1) + 1,
+                        runs=sorted(set(data.get("runs") or []) | set(runs)))
+            db.x("UPDATE events SET text=?, data=? WHERE id=?",
+                 (_sleep_text(data), json.dumps(data), last["id"]))
+        else:
+            data = {"since": since, "woke": woke, "slept_s": round(slept), "sleeps": 1, "runs": runs}
+            db.x("INSERT INTO events(ts,source,kind,severity,text,data,status) VALUES(?,?,?,?,?,?,?)",
+                 (woke, "host", "host_slept", "normal", _sleep_text(data), json.dumps(data), "record"))
+        self.alert("host_slept",
+                   f"{hostname()} slept for {slept / 60:.0f} min and the project stood still meanwhile"
+                   f"{f' (runs {_ids(runs)} paused)' if runs else ''}. Keep-awake only stops idle sleep, "
+                   f"not a closed lid. To keep working the project needs one of: the lid open, power "
+                   f"plus an external display (clamshell mode), or an always-on host.",
+                   "low", every_s=86400)
 
     def settling(self) -> bool:
         """The host woke from a sleep less than wake_settle_s of awake time ago: hold new runs."""
         return time.monotonic() < self._settle_until
+
+    def hold_offline(self, prov: str, why: str) -> None:
+        """New runs on `prov` wait until its API host resolves again (net_held). A host that reaches
+        the API through a proxy resolves nothing itself, so it is never held."""
+        if _proxied():
+            return
+        try:
+            host = get_provider(prov).reach_host()
+        except Exception:
+            host = ""
+        if not host:
+            return
+        self._net_holds[prov] = {"host": host, "since": time.monotonic(), "checked": 0.0, "checking": False,
+                                 "up": False, "probe": 0.0}
+        log(self.p, f"{prov}: {why}; no new runs start on it until {host} resolves")
+
+    def net_held(self, prov: str) -> bool:
+        """Whether new runs on `prov` wait for its API host to resolve. The lookup runs in a thread of
+        its own, at most every REACH_EVERY_S, so a tick never waits on DNS. A hold that lasts
+        NET_HOLD_MAX_S lets one run try anyway (_net_may_probe); how it ends re-arms or ends it."""
+        h = self._net_holds.get(prov)
+        if not h:
+            return False
+        now = time.monotonic()
+        if not h["up"] and not h["checking"] and now - h["checked"] >= REACH_EVERY_S:
+            h["checking"], h["checked"] = True, now
+
+            def look(h=h) -> None:
+                try:
+                    h["up"] = _resolves(h["host"])
+                finally:
+                    h["checking"] = False
+            _background(look)
+        if h["up"]:
+            self._end_net_hold(prov, f"{h['host']} resolves")
+            return False
+        return True
+
+    def _net_may_probe(self, prov: str) -> bool:
+        """Whether one run on held `prov` may start to try the network: the hold (or its last such
+        try) is NET_HOLD_MAX_S old. A run that starts on a held provider is that try (start_run)."""
+        h = self._net_holds.get(prov)
+        return bool(h) and time.monotonic() - max(h["since"], h["probe"]) >= NET_HOLD_MAX_S
+
+    def _end_net_hold(self, prov: str, why: str) -> None:
+        if self._net_holds.pop(prov, None):
+            log(self.p, f"{prov}: {why}; new runs start on it again")
 
     def _slept_between(self, start: float, end: float) -> bool:
         return any(a < end and b > start for a, b in self.p.db.kv("host_sleeps", []) or [])
@@ -573,6 +666,8 @@ class Daemon:
                   note: dict | None = None, resume: str | None = None, unblock: str = "") -> int:
         if self.cfg_status == "unavailable":
             raise RuntimeError("project.json is unreadable with no last good copy: no model work starts")
+        if provider in self._net_holds:
+            self._net_holds[provider]["probe"] = time.monotonic()   # the one run that tries the network
         tiers = self.cfg["providers"].get(provider, {}).get("tiers", {})
         model = tiers.get(tier, {}).get("model", "")
         effort = tiers.get(tier, {}).get("effort", "")
@@ -1041,8 +1136,16 @@ class Daemon:
             cut_off, status = status, "ok"   # it handed off before the clock ran out: the work is done, not wasted
         if usage.limited:
             status = "limit"
-        if usage.auth_failed:
+        # A long sleep can drop the CLI's login under a run ("Not logged in" after hours of a closed
+        # lid). That run is lost to the sleep; a real log-out shows again on the next run.
+        slept_auth = usage.auth_failed and float(exit_info.get("slept_s") or 0) >= SLEPT_LONG_S
+        if usage.auth_failed and not slept_auth:
             status = "auth"
+        net_lost = status in SLEEP_CUT and bool(NET_LOST_RE.search(usage.error or ""))
+        if net_lost:
+            self.hold_offline(r["provider"], f"run {r['id']} could not reach its API")
+        elif r["provider"] in self._net_holds and (status == "ok" or _has_tokens(usage)):
+            self._end_net_hold(r["provider"], f"run {r['id']} reached its API")
         note = json.loads(r["note"] or "{}")
         if usage.session_id:
             note["session_id"] = usage.session_id   # a run the host takes away resumes it (_resumable)
@@ -1052,13 +1155,20 @@ class Daemon:
             note.update(not_waste="reboot", lost_to_reboot=self.boot, boot_at=self.boot_at)
         elif status in bud.WASTED and handed_off:
             note["not_waste"] = "handoff"
+        elif net_lost:
+            # The API host did not resolve: the network went away under the run, not the task.
+            note.update(not_waste="network", lost_to_network=True)
+            status = "lost"
         elif status == "failed" and _resume_never_started(note, usage):
             note["not_waste"] = "resume"   # nothing ran: the task starts fresh (_finish_worker)
-        elif status in SLEEP_CUT and self._slept_during(r, exit_info):
+        elif slept_auth or (status in SLEEP_CUT and self._slept_during(r, exit_info)):
             # A run that overlapped a host sleep did not time out or fail on its own: the host went
             # away under it. It is lost to the sleep, like a run lost to a reboot.
             note.update(not_waste="sleep", lost_to_sleep=True, slept_s=exit_info.get("slept_s"))
             status = "lost"
+        if status == "lost" and not note.get("session_id") and (note.get("resumes") or {}).get("session"):
+            # A resume the sleep or network cut keeps its session for the next resume, not a fresh start.
+            note["session_id"] = note["resumes"]["session"]
         source = self._source_for(r)
         # Spend is booked at the run's end, not when the daemon gets to it: a run reaped after
         # downtime must not count toward the current hour. A stamp from the future is clamped.
@@ -1089,7 +1199,7 @@ class Daemon:
                            f"{r['provider']} refused work: {usage.limit_note}. Heavy work on it is paused for an "
                            f"hour; the account ({r['account'] or 'unknown'}) may need more credits or a higher cap.",
                            "high")
-            if usage.auth_failed:
+            if usage.auth_failed and not slept_auth:
                 # Logged out is not a task failure and not worth retrying blindly: open the provider's
                 # breaker (no run starts on it), say exactly how to fix it, and let check_logins ask
                 # its CLI, without a model call, when it is logged in again.
@@ -1102,7 +1212,8 @@ class Daemon:
                 self._finish_coordinator(r, usage, status, note)
             else:
                 self._finish_worker(r, usage, status, run_dir, cut_off if status == "ok" else None,
-                                    rebooted=bool(note.get("lost_to_reboot")), slept=bool(note.get("lost_to_sleep")))
+                                    rebooted=bool(note.get("lost_to_reboot")),
+                                    slept=bool(note.get("lost_to_sleep") or note.get("lost_to_network")))
         log(p, f"run {r['id']} end status={status} cost=${usage.cost_usd:.3f}"
                f"{' (estimated)' if usage.estimated else ''} role={r['role']}")
 
@@ -1131,10 +1242,11 @@ class Daemon:
         out = usage.structured if isinstance(usage.structured, dict) else last_json_object(usage.final_text or "")
         actions = (out or {}).get("actions")
         checked = note.get("coord_check") or {}
-        if (status == "lost" and not r["dir"]) or status == "shutdown" or note.get("lost_to_sleep"):
-            # Never launched, ended by `ttp stop --kill`, or cut by a host sleep: not a failed turn.
-            # Its messages and events stay queued for the next one.
-            self._settle_coord_check(checked, "lost to sleep" if note.get("lost_to_sleep") else status)
+        lost_to = "sleep" if note.get("lost_to_sleep") else "network" if note.get("lost_to_network") else ""
+        if (status == "lost" and not r["dir"]) or status == "shutdown" or lost_to:
+            # Never launched, ended by `ttp stop --kill`, or cut by a host sleep or a lost network: not
+            # a failed turn. Its messages and events stay queued for the next one.
+            self._settle_coord_check(checked, f"lost to {lost_to}" if lost_to else status)
             return
         if status == "auth":
             self._settle_coord_check(checked, status)
@@ -1291,7 +1403,8 @@ class Daemon:
         # counts an attempt again, so a task that fails on its own while the host also slept cannot
         # retry for free forever.
         if status == "lost" and slept:
-            reboot_lost = self._reboot_losses(task["id"], "lost_to_sleep") <= int(
+            reboot_lost = self._reboot_losses(task["id"], "lost_to_sleep") + \
+                self._reboot_losses(task["id"], "lost_to_network") <= int(
                 self.cfg["budget"].get("max_reboot_losses", 3))
         no_handoff = status == "ok" and rstatus is None
         if waiting:
@@ -2000,6 +2113,8 @@ class Daemon:
                 if note != held:
                     db.update_task(task["id"], blocked_reason=held)
                 continue
+            if self.net_held(provider) and not self._net_may_probe(provider):
+                continue   # its API host does not resolve: the task waits, attempts untouched
             if note.startswith((PAUSED_NOTE, LOGGED_OUT_NOTE)):
                 db.update_task(task["id"], blocked_reason=None)
             gate = self.gates.get(provider) or bud.evaluate(db, self.cfg, provider, bud.plan_windows(db))
@@ -3342,6 +3457,7 @@ def _cut_off_cost(run_dir: Path, exit_info: dict, usage=None, prov=None) -> floa
     budget = float(spec.get("budget_usd") or spec.get("default_budget_usd") or 0)
     timeout = float(spec.get("timeout_s") or 0)
     elapsed = float(exit_info.get("ended") or time.time()) - float(exit_info.get("started") or 0)
+    elapsed -= float(exit_info.get("slept_s") or 0)   # a sleeping host spends nothing
     if budget <= 0 or timeout <= 0 or not exit_info.get("started"):
         return 0.0
     elapsed -= min(locks.waited(run_dir, float(exit_info.get("ended") or time.time())), timeout)
@@ -3401,6 +3517,41 @@ def _cut(text: str, n: int, where: str) -> str:
         return text
     note = f" … [cut; the whole text is in {where}]"
     return text[:max(0, n - len(note))] + note
+
+
+def _proxied() -> bool:
+    """Whether the agents reach their API through a proxy: the host then resolves nothing itself."""
+    return any(os.environ.get(k) for k in PROXY_ENV)
+
+
+def _background(fn) -> None:
+    threading.Thread(target=fn, daemon=True).start()
+
+
+def _resolves(host: str) -> bool:
+    """Whether `host` resolves within REACH_TIMEOUT_S (getaddrinfo has no timeout of its own)."""
+    ok: list[bool] = []
+
+    def look() -> None:
+        try:
+            socket.getaddrinfo(host, 443)
+            ok.append(True)
+        except OSError:
+            pass
+    t = threading.Thread(target=look, daemon=True)
+    t.start()
+    t.join(REACH_TIMEOUT_S)
+    return bool(ok)
+
+
+def _sleep_text(d: dict) -> str:
+    n = int(d.get("sleeps") or 1)
+    return (f"the host slept {float(d.get('slept_s') or 0) / 60:.0f} min"
+            f"{f' over {n} sleeps' if n > 1 else ''}; {len(d.get('runs') or [])} running run(s) paused")
+
+
+def _ids(ids: list) -> str:
+    return ", ".join(str(i) for i in ids)
 
 
 def _has_tokens(usage) -> bool:

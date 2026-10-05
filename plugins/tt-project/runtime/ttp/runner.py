@@ -7,9 +7,14 @@
 - refreshes <run_dir>/lease every 30 s while the child lives, so liveness never depends on a model
   remembering to report it;
 - enforces the wall-clock limit with TERM, then KILL 30 s later (a child that ignores TERM would
-  otherwise run on past its bound). The limit and the stall guard count monotonic time, which stands
-  still while the host sleeps: a laptop asleep for hours does not time a run out. exit.json records
-  how long the host slept during the run (`slept_s`);
+  otherwise run on past its bound). The limit and the stall guard count awake time (AwakeClock):
+  monotonic time, which stands still while some hosts sleep, less any gap between two polls longer
+  than SLEEP_GAP_S, so a host whose monotonic clock runs through a suspend does not time a run out
+  either. exit.json records how long the host slept during the run (`slept_s`);
+- ends a run whose agent has produced no progress (assistant message, tool result, streamed
+  thinking or progress note) for stall_s, or longer while a tool call that set its own timeout is
+  pending: the tool_progress heartbeats and retry notices Claude Code writes while a call hangs on a
+  network stall are not progress;
 - enforces the run's dollar budget mid-flight when the provider streams usage;
 - ends the child when <run_dir>/STOP appears (a cancel, or `ttp stop --kill` writing "shutdown");
 - starts the child `nice` levels below itself (run.json; workers and reviewers only), so all it
@@ -44,6 +49,8 @@ LEASE_EVERY_S = 30
 KILL_AFTER_S = 30
 POLL_S = 5
 BUDGET_EVERY_S = 10
+TOOL_GRACE_S = 60     # past a pending tool call's own timeout before its silence counts as a stall
+SLEEP_GAP_S = 600     # polls are POLL_S apart: a gap this long between two can only be a host sleep
 
 
 def boot_id() -> str:
@@ -177,6 +184,7 @@ def supervise(run_dir: Path) -> int:
         durable_write(run_dir / "exit.json", json.dumps(exit_info))
         return 1
     started, mono_start = time.time(), time.monotonic()
+    awake = AwakeClock()
     prompt = open(run_dir / "prompt.md", "rb")
     out = open(out_path, "wb")
     err = open(run_dir / "stderr.log", "wb")
@@ -211,22 +219,20 @@ def supervise(run_dir: Path) -> int:
         from .providers import get_provider  # local import: keeps startup cheap
         prov = get_provider(spec["provider"]).use(spec.get("model", ""), spec.get("prices"))
         last_lease = last_budget = 0.0
-        seen, active = _activity(out_path, run_dir), mono_start
+        progress, active = ProgressWatch(out_path, run_dir), 0.0
         while child.poll() is None:
-            now = time.time()
+            now, up = time.time(), awake.tick()
             if now - last_lease >= LEASE_EVERY_S:
                 _touch(lease)
                 last_lease = now
-            if time.monotonic() - mono_start > timeout_s + min(locks.waited(run_dir), timeout_s):
+            if up > timeout_s + min(locks.waited(run_dir), timeout_s):
                 threading.Thread(target=stop, args=("timeout",), daemon=True).start()
             if stall_s:
-                # Stalled = the agent has produced nothing (no stream event, no progress note) for
-                # stall_s of awake time. A tool call waiting on a long job stays inside one event, so
-                # stall_s must exceed the longest single command the task is expected to run.
-                mark = _activity(out_path, run_dir)
-                if mark != seen:
-                    seen, active = mark, time.monotonic()
-                elif time.monotonic() - active > stall_s:
+                # Stalled = no assistant message, tool result or progress note for stall_s of awake
+                # time, or for a pending tool call's own timeout (plus grace) when that is longer.
+                if progress.poll():
+                    active = up
+                elif up - active > progress.limit(stall_s):
                     threading.Thread(target=stop, args=("stalled",), daemon=True).start()
             if budget is not None and now - last_budget >= BUDGET_EVERY_S:
                 last_budget = now
@@ -244,13 +250,13 @@ def supervise(run_dir: Path) -> int:
     t = threading.Thread(target=watch, daemon=True)
     t.start()
     rc = child.wait()
-    ended, mono_end = time.time(), time.monotonic()
+    ended, mono_end, up = time.time(), time.monotonic(), awake.tick()
     remove_files(spec.get("private_files") or [])
     remove_tmp(run_dir, spec)
     for f in (prompt, out, err, *held):
         f.close()
     exit_info = {"rc": rc, "started": started, "ended": ended, "stopped": reason[0] if reason else None,
-                 "slept_s": round(max((ended - started) - (mono_end - mono_start), 0.0), 1), "nice": niceness}
+                 "slept_s": round(max((ended - started) - min(mono_end - mono_start, up), 0.0), 1), "nice": niceness}
     durable_write(run_dir / "exit.json", json.dumps(exit_info))
     return rc
 
@@ -263,16 +269,103 @@ def _niceness(pid: int) -> int | None:
         return None
 
 
-def _activity(out_path: Path, run_dir: Path) -> tuple:
-    """What the agent has produced so far: the size and mtime of its stream and progress notes."""
-    marks = []
-    for f in (out_path, run_dir / "progress.md"):
+# Stream events written while nothing moves: Claude Code's heartbeats for a running tool call and
+# rate limit notices. Of system events only streamed thinking is model output (not retries, hooks).
+NOISE_TYPES = ("tool_progress", "rate_limit_event", "keep_alive")
+SYSTEM_PROGRESS = ("thinking_tokens",)
+
+
+class AwakeClock:
+    """Seconds the host was awake since the clock was made. Each step between two ticks counts the
+    smaller of its monotonic and wall-clock advance (a wall clock set back or forward does not
+    count), and nothing when it is longer than gap_s: the ticks come every few seconds, so a gap
+    that long is the host asleep, also where the monotonic clock keeps running through a suspend."""
+
+    def __init__(self, gap_s: float = SLEEP_GAP_S):
+        self.gap_s, self.awake = gap_s, 0.0
+        self._mono, self._wall = time.monotonic(), time.time()
+        self._lock = threading.Lock()
+
+    def tick(self) -> float:
+        with self._lock:
+            mono, wall = time.monotonic(), time.time()
+            step = max(min(mono - self._mono, wall - self._wall), 0.0)
+            if step < self.gap_s:
+                self.awake += step
+            self._mono, self._wall = mono, wall
+            return self.awake
+
+
+class ProgressWatch:
+    """Reads the agent's stream as it grows and tells whether it made progress since the last look:
+    an assistant message, a tool result, streamed thinking or a new progress note. Lines that are not
+    JSON, and event types it does not know (other providers), count as progress. It also tracks the
+    tool calls still waiting for their result and the timeouts they set themselves."""
+
+    def __init__(self, out_path: Path, run_dir: Path):
+        self.out_path, self.note_path = out_path, run_dir / "progress.md"
+        self.offset, self.partial = 0, b""
+        self.note = self._note_mark()
+        self.pending: dict[str, float] = {}   # tool_use id -> its own timeout in seconds (0 = none)
+
+    def _note_mark(self):
         try:
-            st = f.stat()
-            marks.append((st.st_size, st.st_mtime))
+            st = self.note_path.stat()
+            return (st.st_size, st.st_mtime)
         except OSError:
-            marks.append(None)
-    return tuple(marks)
+            return None
+
+    def poll(self) -> bool:
+        moved = False
+        note = self._note_mark()
+        if note != self.note:
+            self.note, moved = note, True
+        try:
+            with open(self.out_path, "rb") as f:
+                f.seek(self.offset)
+                chunk = f.read()
+        except OSError:
+            return moved
+        self.offset += len(chunk)
+        lines = (self.partial + chunk).split(b"\n")
+        self.partial = lines.pop()
+        for line in lines:
+            if line.strip() and self._event(line):
+                moved = True
+        return moved
+
+    def limit(self, stall_s: float) -> float:
+        """How long silence may last now: stall_s, or a pending call's own timeout plus grace."""
+        longest = max(self.pending.values(), default=0.0)
+        return max(stall_s, longest + TOOL_GRACE_S) if longest else stall_s
+
+    def _event(self, line: bytes) -> bool:
+        try:
+            e = json.loads(line)
+        except ValueError:
+            return True
+        if not isinstance(e, dict):
+            return True
+        kind = e.get("type")
+        if kind in NOISE_TYPES:
+            return False
+        if kind == "system":
+            return e.get("subtype") in SYSTEM_PROGRESS
+        msg = e.get("message")
+        content = msg.get("content") if isinstance(msg, dict) else None
+        for block in content if isinstance(content, list) else []:
+            if not isinstance(block, dict):
+                continue
+            if kind == "assistant" and block.get("type") == "tool_use" and block.get("id"):
+                inp = block.get("input") if isinstance(block.get("input"), dict) else {}
+                try:
+                    own = float(inp.get("timeout") or 0) / 1000.0   # Claude Code tools take ms
+                except (TypeError, ValueError):
+                    own = 0.0
+                self.pending[block["id"]] = own
+            elif block.get("type") == "tool_result":
+                self.pending.pop(block.get("tool_use_id"), None)
+        return True
 
 
 def _take_exclusive(run_dir: Path, wanted: list[dict], env: dict, deadline: float) -> list | None:

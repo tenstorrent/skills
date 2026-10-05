@@ -56,6 +56,7 @@ WORKER_DENIED_TOOLS = ("Workflow", "ScheduleWakeup", "CronCreate", "CronDelete",
 class Claude(Provider):
     name = "claude"
     binaries = ("claude",)
+    api_host, api_base_env = "api.anthropic.com", "ANTHROPIC_BASE_URL"
     login_hint = "run `claude` there and use /login"
 
     def credential_files(self) -> list[str]:

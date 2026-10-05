@@ -39,6 +39,7 @@ MAX_ARG_BYTES = 120_000
 class Codex(Provider):
     name = "codex"
     binaries = ("codex",)
+    api_host, api_base_env = "api.openai.com", "OPENAI_BASE_URL"
     login_hint = "run `codex login` there"
     isolate_read_only = True
 
