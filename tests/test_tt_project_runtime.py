@@ -47,7 +47,15 @@ def _git_session(tmp_path_factory):
     subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
     subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "i"],
                    check=True)
-    return {"objects": objects / "objects", "repo": repo}
+    # The account's git settings, minus the automatic gc check each commit starts in a child git.
+    config = base / "gitconfig"
+    home = pathlib.Path(os.environ.get("HOME", "/"))
+    xdg = pathlib.Path(os.environ.get("XDG_CONFIG_HOME") or home / ".config")
+    own = [os.environ["GIT_CONFIG_GLOBAL"]] if os.environ.get("GIT_CONFIG_GLOBAL") else \
+        [str(f) for f in (xdg / "git" / "config", home / ".gitconfig") if f.is_file()]
+    config.write_text("".join(f"[include]\n\tpath = {f}\n" for f in own)
+                      + "[maintenance]\n\tauto = false\n[gc]\n\tauto = 0\n")
+    return {"objects": objects / "objects", "repo": repo, "config": config}
 
 
 @pytest.fixture()
@@ -101,6 +109,7 @@ def env(tmp_path, monkeypatch, _git_session):
         return _git_session["plugin_commit"]
     monkeypatch.setattr(cli, "_checkout_commit", checkout_commit)
     monkeypatch.setenv("GIT_ALTERNATE_OBJECT_DIRECTORIES", str(_git_session["objects"]))
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(_git_session["config"]))
     repo = tmp_path / "repo"   # a git repository with one commit of README.md
     shutil.copytree(_git_session["repo"], repo, symlinks=True)
     yield {"home": home, "repo": repo, "tmp": tmp_path}
