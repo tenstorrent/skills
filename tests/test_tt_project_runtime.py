@@ -19094,3 +19094,21 @@ def test_ttp_stats_reports_reread_tokens_per_run_and_per_dollar_by_kind_and_tier
 def _ttp_main(*args):
     from ttp import cli
     return cli.main(list(args))
+
+
+def test_ttp_checks_runs_one_quoted_extra_command_through_the_shell(env, tmp_path, monkeypatch):
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    rec = lambda: json.loads((run / "checks.json").read_text())
+    cli.main(["checks", "--fresh", "--", 'FOO=1 sh -c \'test "$FOO" = 1\' && test -f a.txt'])
+    assert rec()["passed"] is True
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--fresh", "--", "FOO=1 test -f missing.txt"])
+    assert e.value.code != 0 and rec()["passed"] is False, "a failing quoted command is a failure"
+    # Several words still run as argv: the spaces inside one word stay quoted.
+    cli.main(["checks", "--fresh", "--", "test", "-n", "a b"])
+    assert rec()["passed"] is True and rec()["commands"] == ["test -n 'a b'"]
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--fresh", "--", "no-such-program-ttp"])
+    assert e.value.code != 0 and rec()["passed"] is False
+    assert "not found" in (run / "checks.log").read_text()

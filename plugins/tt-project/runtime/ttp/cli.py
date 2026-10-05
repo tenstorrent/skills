@@ -972,7 +972,10 @@ def cmd_checks(a) -> None:
     if not (p and p.exists()):
         p = None
     extra = a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd
-    cmds = push.check_list((cfg.get("delivery") or {}).get("push_checks")) + ([shlex.join(extra)] if extra else [])
+    # One word after `--` is a shell command line as written (`ttp checks -- 'FOO=1 pytest -q'`);
+    # several words are argv, quoted so each stays one word.
+    mine = [extra[0] if len(extra) == 1 else shlex.join(extra)] if extra else []
+    cmds = push.check_list((cfg.get("delivery") or {}).get("push_checks")) + mine
     if not cmds:
         die("ttp checks: the project sets no delivery.push_checks; give the repository's test commands after "
             "`--`, e.g. ttp checks -- pytest -q")
@@ -1982,7 +1985,8 @@ def main(argv: list[str] | None = None) -> None:
     s = sub.add_parser("checks", help="(inside a run) run the local checks on HEAD and record the result")
     s.add_argument("--fresh", action="store_true",
                    help="run the checks even when they already passed on this tree")
-    s.add_argument("cmd", nargs=argparse.REMAINDER, help="extra check command after --")
+    s.add_argument("cmd", nargs=argparse.REMAINDER, help="extra check command after --: several words run as argv; one quoted string "
+                        "runs through the shell, e.g. ttp checks -- 'FOO=1 pytest -q && ruff check'")
     s.set_defaults(fn=cmd_checks)
 
     s = sub.add_parser("stats", help="context re-read (cache-read) tokens per run and per $, by kind and tier")

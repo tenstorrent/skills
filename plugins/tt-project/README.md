@@ -173,6 +173,8 @@ and preferences you add later become part of the project's charter and memory.
   skipped check is logged as `skipped (not applicable: ...)` by `ttp push`, the push queue and
   `ttp checks` (in `checks.log`), and never counts as passed: when every check is skipped the
   push or `ttp checks` fails. Plain string checks never skip; `after_push` takes the same form.
+- `ttp checks -- <cmd>` adds a check. Several words run as that argv (`ttp checks -- pytest -q`);
+  one quoted string runs through the shell (`ttp checks -- 'FOO=1 pytest -q && ruff check .'`).
 - Scope a mandatory check by what it covers, never by whether it would pass. Prefer `if_exists`
   on the file the check runs. Where no file marks the heads a check applies to (say a test that
   is missing at an independently reviewed head of another delivery branch), the fallback is a
