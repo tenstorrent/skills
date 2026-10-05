@@ -6371,6 +6371,43 @@ def test_only_the_upgrade_task_applies_its_merge_and_a_hand_merge_of_upstream_is
     assert (h / "prompts" / "worker.md").read_text() == "local rule\n"
 
 
+def test_upgrade_stops_clearly_on_an_unfinished_merge_in_the_live_harness(env, monkeypatch, capsys):
+    """A hand-run merge the guard hook refused left MERGE_HEAD and its files behind; the upgrade then
+    tried to commit them as local changes and died with the hook's refusal instead of saying why."""
+    p = make(env)
+    from ttp import cli, service
+    restarts = []
+    monkeypatch.setattr(service, "restart", lambda p: restarts.append(1) or "restarted")
+    h = p.harness
+    ident = ["-c", "user.name=t", "-c", "user.email=t@t"]
+    _git_out(h, "checkout", "-qb", "side")
+    (h / "prompts" / "worker.md").write_text("side change\n")
+    _git_out(h, *ident, "commit", "-qam", "side")
+    _git_out(h, "checkout", "-q", "-")
+    head = _git_out(h, "rev-parse", "HEAD")
+    _git_out(h, *ident, "merge", "-q", "--no-commit", "--no-ff", "side")
+    _install_template(env)
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo"])
+    err = capsys.readouterr().err
+    assert e.value.code == 1 and "unfinished merge" in err and "prompts/worker.md" in err
+    assert "merge --abort" in err and "unfinished merge" in (p.logs / "upgrade.log").read_text()
+    assert _git_out(h, "rev-parse", "HEAD") == head and _git_out(h, "rev-parse", "-q", "--verify", "MERGE_HEAD")
+    assert not restarts and not p.db.one("SELECT * FROM tasks WHERE kind='harness'")
+    # The automatic upgrade records the reason, so the status line shows it.
+    from ttp import release
+    p.db.set_kv(release.KV_AUTO, {"outcome": "running"})
+    with pytest.raises(SystemExit):
+        cli.main(["upgrade", "demo", "--auto", "--project-dir", str(p.base)])
+    rec = p.db.kv(release.KV_AUTO)
+    assert rec["outcome"] == "failed" and "unfinished merge" in rec["why"]
+    # Once the merge is aborted, the upgrade goes through.
+    _git_out(h, "merge", "--abort")
+    cli.main(["upgrade", "demo"])
+    assert restarts == [1] and (h / "prompts" / "worker.md").read_text() != "side change\n"
+
+
 def test_restart_rolls_back_a_runtime_the_daemon_cannot_start_with(env):
     import py_compile
     p = make(env)

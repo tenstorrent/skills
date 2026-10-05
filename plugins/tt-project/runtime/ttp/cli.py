@@ -1978,6 +1978,7 @@ def _upgrade(p: Project, auto: bool = False) -> None:
     else:
         print(f"installed template: ttp {new_v} ({new_c})")
     ident = ["-c", "user.name=tt-project", "-c", "user.email=tt-project@localhost"]
+    _refuse_unfinished_merge(p, auto)
     emptied = _emptied(h, None, "HEAD")
     if emptied:      # a crash cut these short: they are damage, not local edits to commit and keep
         _git(h, "checkout", "HEAD", "--", *emptied)
@@ -2086,6 +2087,30 @@ def _apply_upgrade(p: Project, commit: str) -> None:
     print(f"harness main is now {merged[:12]}; restarting the daemon")
     from . import service
     print(service.restart(p))
+
+
+def _refuse_unfinished_merge(p: Project, auto: bool) -> None:
+    """A hand-run `git merge` the guard hook refused leaves MERGE_HEAD and the merged files in the live
+    harness. Committing them as local changes is that same merge, so the hook would refuse it again:
+    stop here and say what is wrong and how to undo it."""
+    from . import release
+    h = p.harness
+    if subprocess.run(["git", "-C", str(h), "rev-parse", "-q", "--verify", "MERGE_HEAD"],
+                      capture_output=True).returncode != 0:
+        return
+    files = _git(h, "diff", "--name-only", "HEAD").splitlines()
+    shown = ", ".join(files[:20]) + (f" and {len(files) - 20} more" if len(files) > 20 else "")
+    msg = (f"upgrade not applied: an unfinished merge is in the live harness {h} (MERGE_HEAD is set)"
+           + (f"; files: {shown}" if shown else "")
+           + f". `git -C {shlex.quote(str(h))} merge --abort` restores HEAD; then rerun `ttp upgrade {p.name}`.")
+    if auto:            # stderr already goes to logs/upgrade.log; the status line shows the reason
+        release.finish(p, "failed", why="an unfinished merge is in the live harness; `git merge --abort` "
+                                        "there restores HEAD")
+    else:
+        p.logs.mkdir(parents=True, exist_ok=True)
+        with open(p.logs / "upgrade.log", "a") as log:
+            log.write(f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} ttp upgrade\n{msg}\n")
+    die(msg, 1)
 
 
 _UPGRADE_TASK = """`ttp upgrade` could not apply the new tt-project template on its own: {problem}
