@@ -17493,3 +17493,12 @@ def test_web_state_survives_a_hand_off_whose_pushed_is_not_a_list(env):
     p.db.update_task(tid, status="done", result=json.dumps({"status": "done", "summary": "ok", "pushed": True}))
     tasks = {t["id"]: t for t in state_payload(p, p.db)["tasks"]}
     assert tasks[tid]["pushed"] is None
+
+
+def test_web_chealth_resume_uses_delegation():
+    """Resume buttons in #chealth work after held updates: one delegated listener, no per-render binding."""
+    js = (RUNTIME / "ttp" / "web" / "app.js").read_text()
+    body = js[js.index("async function refresh()"):]
+    assert 'closest("[data-resume-resource]")' in js
+    assert js.index('$("#chealth").addEventListener("click"') < js.index("async function refresh()")
+    assert "resumeResource" not in body and 'querySelectorAll("[data-resume-resource]")' not in js

@@ -135,6 +135,13 @@ function healthHtml(h) {
 }
 
 let lastKey = "";
+// One delegated listener: rows patched later (held updates, R.flush) keep working.
+$("#chealth").addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-resume-resource]");
+  if (!b) return;
+  await api("/api/pause", { resource: b.dataset.resumeResource, paused: false }); refresh();
+});
+
 async function refresh() {
   let st;
   try { st = await api("/api/state"); } catch (e) {
@@ -192,8 +199,6 @@ async function refresh() {
   put($("#chealth"), healthHtml(h));
   $("#pqcard").hidden = !st.push_queue;
   if (st.push_queue) { text($("#pqline"), st.push_queue.line || ""); put($("#pq"), pushQueueHtml(st.push_queue, st.now || Date.now() / 1000)); }
-  $("#chealth").querySelectorAll("[data-resume-resource]").forEach((b) => b.onclick = async () => {
-    await api("/api/pause", { resource: b.dataset.resumeResource, paused: false }); refresh(); });
   announce(st.attention || [], st.project.name);
   document.title = `${unseen ? "(" + unseen + ") " : ""}${st.project.name} · tt-project`;
   board(st);
