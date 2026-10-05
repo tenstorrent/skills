@@ -81,6 +81,12 @@ def env(tmp_path, monkeypatch, _git_session):
     # Likewise for state files: durable_write still writes, renames and calls os.fsync (tests that
     # check the syncs wrap it), but the sync itself, slow on copy-on-write filesystems, is skipped.
     monkeypatch.setattr(os, "fsync", lambda fd: None)
+    # And for the harness's own commits, which pass the fsync settings per command; it doubles their
+    # cost. Tests of those settings set TTP_TEST_GIT_FSYNC to get them back.
+    from ttp import project
+    real_fsync_args = project.git_fsync_args
+    monkeypatch.setattr(project, "git_fsync_args",
+                        lambda: real_fsync_args() if os.environ.get("TTP_TEST_GIT_FSYNC") else [])
     monkeypatch.setenv("GIT_ALTERNATE_OBJECT_DIRECTORIES", str(_git_session["objects"]))
     repo = tmp_path / "repo"   # a git repository with one commit of README.md
     shutil.copytree(_git_session["repo"], repo, symlinks=True)
@@ -120,7 +126,7 @@ def test_fake_round_trip_reply_task_and_answer(env):
         done = p.db.q("SELECT id FROM tasks WHERE status='done'")
         if len(done) >= 2 and not p.db.q("SELECT id FROM runs WHERE status='running'"):
             break
-        time.sleep(0.5)
+        time.sleep(0.05)
     replies = p.db.unread_for_chat("c1", 0)
     assert any("ack: add a greeting" in r["text"] for r in replies)
     assert any("fake worker finished" in r["text"] for r in replies)
@@ -1183,20 +1189,20 @@ def test_one_listener_per_chat(env):
     try:
         deadline = time.time() + 15
         while time.time() < deadline and not lock.exists():
-            time.sleep(0.2)
+            time.sleep(0.05)
         assert lock.exists(), "the first listener never took the chat"
         second = subprocess.Popen(cmd, env=run_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             first.wait(timeout=15)
             deadline = time.time() + 10     # the new listener writes its id just after the old one dies
             while time.time() < deadline and lock.exists() and lock.read_text().strip() != str(second.pid):
-                time.sleep(0.1)
+                time.sleep(0.05)
             assert lock.read_text().strip() == str(second.pid), "the newest listener does not own the chat"
             p.db.post("out", "hello", chat="c1", kind="reply")
             out = ""
             deadline = time.time() + 15
             while time.time() < deadline and "hello" not in out:
-                time.sleep(0.3)
+                time.sleep(0.05)
                 out = p.db.one("SELECT last_read FROM chats WHERE id='c1'")["last_read"] and "hello" or ""
             assert out == "hello", "the newest listener did not receive the message"
         finally:
@@ -1216,7 +1222,7 @@ def test_one_listener_per_chat(env):
             os.kill(orphan, 0)
         except OSError:
             break
-        time.sleep(0.3)
+        time.sleep(0.05)
     else:
         os.kill(orphan, 15)
         raise AssertionError("an orphaned listener kept running")
@@ -1654,7 +1660,7 @@ def _run_until(d, p, cond, timeout=60):
         d.tick()
         if cond():
             return True
-        time.sleep(0.3)
+        time.sleep(0.05)
     return False
 
 
@@ -6320,7 +6326,7 @@ def _hold_exclusive(p, tmp_path, release):
                             env={**os.environ, "PYTHONPATH": str(RUNTIME)})
     deadline = time.time() + 20
     while time.time() < deadline and not (run_dir / "child.pid").exists():
-        time.sleep(0.1)
+        time.sleep(0.05)
     return proc, run_dir
 
 
@@ -6442,7 +6448,7 @@ def test_an_exclusive_run_that_loses_the_race_requeues_without_an_attempt(env, m
         deadline = time.time() + 60   # wait on the lock itself, not a fixed sleep: slow hosts start late
         while dmod.locks.any_free(d._slot_paths("board")):
             assert time.time() < deadline and holder.poll() is None, "the holder never took the lock"
-            time.sleep(0.1)
+            time.sleep(0.05)
         monkeypatch.setattr(dmod.locks, "any_free", lambda paths: True)   # the slot looked free at the tick
         t0 = time.time()
         assert _run_until(d, p, lambda: p.db.q("SELECT id FROM runs WHERE task=? AND status!='running'", (tid,)),
@@ -6860,7 +6866,7 @@ def _cli_run(env, monkeypatch, provider, stdout, *, stderr="", rc=0, result=None
     exit_file = p.runs / str(rid) / "exit.json"
     deadline = time.time() + 60
     while not exit_file.exists() and time.time() < deadline:
-        time.sleep(0.1)
+        time.sleep(0.05)
     assert exit_file.exists(), (p.runs / str(rid) / "runner.log").read_text()
     d.reap_runs()
     argv = json.loads((log_dir / "argv.json").read_text())
@@ -7311,7 +7317,7 @@ def _wait(cond, timeout=30.0):
     while time.time() < deadline:
         if cond():
             return True
-        time.sleep(0.1)
+        time.sleep(0.05)
     return cond()
 
 
@@ -8511,7 +8517,7 @@ def test_a_killed_push_frees_the_branch(env, monkeypatch):
     try:
         deadline = time.time() + 30
         while not started.exists() and time.time() < deadline:
-            time.sleep(0.1)
+            time.sleep(0.05)
         assert started.exists()
         assert _ttp("push", "--free") == 1
         proc.kill()     # only the push itself; its check lives on without the lock
@@ -8545,7 +8551,7 @@ def _probe_until_done(p, probe, timeout=60):
         r = _probe(p, probe)
         if r.returncode != 1 or time.time() > deadline:
             return r
-        time.sleep(0.1)
+        time.sleep(0.05)
 
 
 def _gated_check(started, gate):
@@ -11367,7 +11373,7 @@ def test_a_pause_set_while_ttp_lock_waits_ends_the_wait_with_75(env, tmp_path):
         slot = p.state / "locks" / "board.0.lock"
         deadline = time.time() + 20
         while time.time() < deadline and not (slot.exists() and slot.read_text()):
-            time.sleep(0.1)
+            time.sleep(0.05)
         waiter = subprocess.Popen([sys.executable, str(TTP), "lock", "--timeout", "0", "board", "--", "true"],
                                   env=run_env, stderr=subprocess.PIPE, text=True)
         time.sleep(1)
@@ -12365,7 +12371,7 @@ def _finish_runs(p, d, deadline_s=30):
     end = time.time() + deadline_s
     while time.time() < end and p.db.q("SELECT id FROM runs WHERE status='running'"):
         d.reap_runs()
-        time.sleep(0.1)
+        time.sleep(0.05)
     assert not p.db.q("SELECT id FROM runs WHERE status='running'")
 
 
@@ -14234,6 +14240,7 @@ def test_harness_commits_and_workers_sync_git_objects_without_touching_repo_conf
     p = make(env)
     from ttp import project
     from ttp.daemon import Daemon
+    monkeypatch.setenv("TTP_TEST_GIT_FSYNC", "1")
     monkeypatch.setattr(project, "_git_version", (2, 34, 1))
     assert project.git_fsync_config() == [("core.fsyncObjectFiles", "true")]
     monkeypatch.setattr(project, "_git_version", (2, 36, 0))
