@@ -16784,3 +16784,12 @@ def test_batch_inherited_takes_only_the_named_fd(tmp_path, monkeypatch):
         os.fstat(mine)                               # still open
     finally:
         os.close(mine)
+
+
+def test_web_state_survives_a_hand_off_whose_pushed_is_not_a_list(env):
+    from ttp.web import state_payload
+    p = make(env)
+    tid = p.db.add_task("a review", "r", kind="review", origin="coordinator")
+    p.db.update_task(tid, status="done", result=json.dumps({"status": "done", "summary": "ok", "pushed": True}))
+    tasks = {t["id"]: t for t in state_payload(p, p.db)["tasks"]}
+    assert tasks[tid]["pushed"] is None

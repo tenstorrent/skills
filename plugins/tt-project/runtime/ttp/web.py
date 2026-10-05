@@ -391,8 +391,9 @@ def state_payload(p: Project, db: DB) -> dict:
         t["review_since"] = in_review.get(t["id"])
         result = load_result(t["result"])
         t["result"] = str(result.get("summary") or "")[:600]
-        t["pushed"] = [{k: x.get(k) for k in ("branch", "sha", "version", "status")} for x in result.get("pushed") or []
-                       if isinstance(x, dict)] or None   # what the push queue pushed for a review
+        pushed = result.get("pushed")
+        t["pushed"] = [{k: x.get(k) for k in ("branch", "sha", "version", "status")} for x in pushed
+                       if isinstance(x, dict)] or None if isinstance(pushed, list) else None   # what the push queue pushed for a review
         t["starts"] = coord.starts_text(t, now) if t["status"] == "queued" else ""
         d = deferral(t)
         t.update(depends_on=dependency_ids(t), waits_on=unmet.get(t["id"], []), continues=continues_id(t),
