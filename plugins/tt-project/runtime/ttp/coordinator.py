@@ -154,8 +154,14 @@ LEAST_DISRUPTIVE_MIN = 40   # chars: a restriction ask names the way around it a
 OVER_MIN = 20   # chars: retiring a restriction outside a user turn names the end that passed
 # An ask recommending yes to a step it calls reversible or safe to undo: that step is the coordinator's.
 _YES_RE = re.compile(r"^\W*(yes|y|ok|okay|go|approve|proceed)\b", re.I)
-_UNDOABLE_RE = re.compile(r"(?<!not )(?<!non-)\breversible\b|\bcan (easily )?be (undone|reverted|rolled back)\b|"
+_UNDOABLE_RE = re.compile(r"\breversible\b|\bcan (easily )?be (undone|reverted|rolled back)\b|"
                           r"\beasy to (undo|revert|roll back)\b|\bsafe(ly)? to (undo|revert|roll back)\b", re.I)
+# Words that, a few words before an _UNDOABLE_RE match, turn it into "not (fully) reversible".
+_UNDO_HEDGES = {"not", "no", "never", "hardly", "barely", "scarcely", "only", "partly", "partially", "nor",
+                "without", "cannot", "neither", "nothing", "none"}
+_NOT_UNDOABLE_RE = re.compile(r"\birreversib|\bpermanent|\bone-way\b|\bno (way back|undo|rollback|going back)\b|"
+                              r"\b(cannot|can't|can not|could not|couldn't)\b( \w+){0,2} (be )?(undo|undone|revert|"
+                              r"reverted|roll(ed)? back)\b", re.I)
 _RETIRE_RE = re.compile(r"\bstale restriction|\bretir(e|es|ing)\b|\bno longer appl(y|ies)\b", re.I)
 
 
@@ -1309,10 +1315,26 @@ def _needless_ask(a: dict, text: str) -> str:
         return ("a restriction that is clearly over is retired, not asked about: charter_update with `replaces` "
                 "(its heading), `text` (what still holds) and `over` (the end that passed); the user is told. "
                 "Ask only when it is truly unclear whether it is over, and then do not recommend yes")
-    if a.get("blocking") in ("restriction", "irreversible") and _UNDOABLE_RE.search(f"{text} {rec}"):
+    if a.get("blocking") in ("restriction", "irreversible") and _calls_undoable(f"{text} {rec}"):
         return ("you recommend yes to a step you call reversible: a known, safe, reversible fix is yours. Do it "
                 "(task_add or the action), memory_add the decision and notify at severity low")
     return ""
+
+
+def _calls_undoable(text: str) -> bool:
+    """True only when the text plainly calls the step reversible: some "reversible" / "can be undone"
+    is not hedged by a negation or qualifier in the few words before it ("isn't", "not easily",
+    "only partly"), and nothing calls it irreversible. When unsure the ask goes out: a wrongly
+    rejected ask would push the coordinator to take an irreversible step itself."""
+    text = text.replace("\u2019", "'")
+    if _NOT_UNDOABLE_RE.search(text):
+        return False
+    for m in _UNDOABLE_RE.finditer(text):
+        clause = re.split(r"[.;:!?,()\n]", text[:m.start()])[-1]
+        words = [w.lower().strip("\"'*_") for w in clause.split()[-5:]]
+        if not any(w in _UNDO_HEDGES or w.endswith("n't") or w.startswith("non") for w in words):
+            return True
+    return False
 
 
 def _charter_replace(p: Project, replaces: str, heading: str, text: str, user_turn: bool, over: str = "") -> str:

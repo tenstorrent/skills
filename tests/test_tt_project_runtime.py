@@ -2469,10 +2469,27 @@ def test_an_ask_recommending_yes_to_a_safe_step_is_rejected(env):
     problems, ask = _ask(p, "Delete the scratch branch on the fork?", blocking="irreversible",
                          recommendation="Yes: it is reversible, the commits stay in the reflog")
     assert problems and "you call reversible" in problems[0] and ask is None
+    # A plain "reversible" is still rejected, including after a clause hedged otherwise.
+    for k, say in enumerate(("yes, this is reversible", "Yes. It can be undone with one command",
+                             "yes: not a big change, and it is reversible")):
+        problems, ask = _ask(p, f"Pause nightly job {k}?", blocking="irreversible", recommendation=say)
+        assert problems and "you call reversible" in problems[0] and ask is None, say
     # Truly unclear (no yes), a step that cannot be undone, and review asks still go out.
     assert _ask(p, stale, blocking="restriction", recommendation="keep it until you confirm",
                 least_disruptive=least)[0] == []
     assert _ask(p, "Publish the package?", blocking="irreversible", recommendation="yes, it is not reversible")[0] == []
+    # Any negation or hedge before "reversible" / "be undone", or "irreversible" anywhere, lets it go out.
+    for k, say in enumerate(("yes. It isn't reversible", "yes, though it is not easily reversible",
+                             "yes; it's not fully reversible", "yes, it is only partly reversible",
+                             "yes, but it cannot easily be undone", "yes; it is non-reversible",
+                             "yes, it is only partially reversible", "yes \u2014 it is never reversible",
+                             "yes, it is hardly reversible",
+                             "yes. Once pushed the tag is permanent, so reversible only by a new release")):
+        for blocking in ("irreversible", "restriction"):
+            assert _ask(p, f"Publish package {k} ({blocking})?", blocking=blocking, recommendation=say,
+                        least_disruptive=least)[0] == [], (blocking, say)
+    assert _ask(p, "Publish the package? It isn\u2019t reversible.", blocking="irreversible",
+                recommendation="yes, publish")[0] == []
     assert _ask(p, "Grant the bot read access?", blocking="access", recommendation="yes, it can be undone")[0] == []
 
 
