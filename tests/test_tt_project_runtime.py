@@ -15711,6 +15711,9 @@ def test_a_task_asked_to_deliver_a_pr_runs_as_code(env):
         assert task["kind"] == "code", spec
         note = " ".join(p.db.kv(coord.NOTES_KEY))
         assert f"#{task['id']} added as `code`, not `{kind}`" in note and "only code tasks" in note, note
+    # A condition or a time before the comma does not make it a rule.
+    for spec in ("If CI passes, open a draft PR.", "When done, open a draft PR."):
+        assert prguard.delivery_instruction(spec), spec
     # The title alone asks for it too.
     coord.apply(p, [{"type": "task_add", "title": "Deliver the fix as a draft PR", "spec": "see task 3"}])
     assert p.db.one("SELECT kind FROM tasks WHERE title='Deliver the fix as a draft PR'")["kind"] == "code"
@@ -15719,7 +15722,17 @@ def test_a_task_asked_to_deliver_a_pr_runs_as_code(env):
                  "Only code tasks may open PRs.", "The user will open the PR later; write the report.",
                  "Find out how to open a PR on a fork.", "Leave PR123 untouched; no force-push.",
                  "Summarize the review comments on https://github.com/acme/widgets/pull/7 in a report.",
-                 "Check whether the opened PR passes CI.")):
+                 "Check whether the opened PR passes CI.",
+                 # "open" as an adjective, and a bare plural, describe PRs; they do not ask for one.
+                 "Use GitHub sources to identify relevant open PRs and record their authors.",
+                 "Look at commits and PRs from the last 3 weeks (main and open PRs) for speedups.",
+                 "List the open pull requests.",
+                 # A negation carries through a comma list.
+                 "Do not force-push, open PRs or merge.", "Never push to main, open PRs or force-push.",
+                 "Do not force-push, open a PR or merge.", "Never push to main, open a draft PR or force-push.",
+                 # A PR as a modifier or a thing to read.
+                 "Send a PR status digest to the chat.", "Update the PR list in the weekly report.",
+                 "Open PR 12 in the browser and summarise it.", "Publish the summary in the PR thread.")):
         assert prguard.delivery_instruction(spec) is None, spec
         title = f"no pr {n}"
         coord.apply(p, [{"type": "task_add", "title": title, "kind": "work", "spec": spec}])
@@ -15737,6 +15750,8 @@ def test_a_task_asked_to_deliver_a_pr_runs_as_code(env):
     p.db.update_task(busy, status="running")
     coord.apply(p, [{"type": "task_update", "id": busy, "spec": "Then open a draft PR with it."}])
     assert p.db.task(busy)["kind"] == "work"
+    note = " ".join(p.db.kv(coord.NOTES_KEY))
+    assert f"#{busy} asks for PR delivery but is running as `work`" in note and "continues" in note, note
 
 
 def test_an_approval_covers_only_the_commit_the_user_said_yes_to(env, tmp_path, monkeypatch):

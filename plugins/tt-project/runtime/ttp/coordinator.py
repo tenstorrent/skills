@@ -680,6 +680,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         upd["kind"] = kind
                         notes.append(f"task_update: #{task['id']} is now `code`, not `{task['kind']}`: its spec asks "
                                      f"for PR delivery ({pr_ask!r}) and only code tasks open or update PRs")
+                    elif pr_ask:
+                        notes.append(f"task_update: #{task['id']} asks for PR delivery but is running as "
+                                     f"`{task['kind']}` and keeps that kind mid-run, so it cannot open the PR: "
+                                     f"cancel it and task_add a code task with continues={task['id']}")
                 db.update_task(task["id"], **upd)
                 if spec and task["status"] == "running":
                     for r in db.q("SELECT dir FROM runs WHERE task=? AND status='running'", (task["id"],)):
