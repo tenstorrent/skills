@@ -38,6 +38,7 @@ WORKTREE = "push"             # the batch's own checkout under the project's wor
 AFTER_PUSH = "after_push-"    # + batch id: the temporary checkout after_push runs in
 DEFAULT_AFTER_PUSH_TIMEOUT_S = 1800
 STALE = "(stale plugin version)"   # the `cmd` of a check failure that is push.stale_versions
+REPLAYED = "Ttp-Replayed-From"     # trailer of a commit the batch settled: the entry commit it replays
 TOP_DEF = re.compile(r"^(?:async[ \t]+def|def|class)[ \t]+([A-Za-z_]\w*)", re.M)
 TOP_START = re.compile(r"(?:@|(?:async[ \t]+)?def[ \t]|class[ \t])")
 EXIT = {"pushed": 0, "landed": 0, "nothing": 0, "busy": push.BUSY, "moved": push.KEPT_MOVING,
@@ -370,6 +371,26 @@ def settle(wt: Path, path: str, version_files: list[str]) -> bool:
     return True
 
 
+def _commit_replayed(wt: Path) -> None:
+    """Commit the settled step of a stopped rebase in `wt` as the commit it replays, plus a trailer
+    naming that commit. Settling changed its patch, so a later batch that gets the commit again (one
+    died between its push and its marker) finds it landed by the trailer where git cherry cannot.
+    A step that settled into nothing is left to the rebase, which drops it."""
+    orig = _git(wt, "rev-parse", "--verify", "--quiet", "REBASE_HEAD").stdout.strip()
+    if not orig or _git(wt, "diff", "--cached", "--quiet", "HEAD").returncode == 0:
+        return
+    msg = subprocess.run(["git", "-C", str(wt), "interpret-trailers", "--trailer", f"{REPLAYED}: {orig}"],
+                         input=_git(wt, "log", "-1", "--format=%B", orig).stdout, text=True,
+                         capture_output=True).stdout
+    who = _git(wt, "log", "-1", "--format=%an%x00%ae%x00%ad", "--date=raw", orig).stdout.strip().split("\0")
+    if not msg.strip() or len(who) != 3:
+        return                          # the rebase commits it with the message it has
+    subprocess.run(["git", "-C", str(wt), "commit", "-q", "--no-verify", "--cleanup=verbatim", "-F", "-"],
+                   input=msg, text=True, capture_output=True,
+                   env={**os.environ, "GIT_AUTHOR_NAME": who[0], "GIT_AUTHOR_EMAIL": who[1],
+                        "GIT_AUTHOR_DATE": who[2]})
+
+
 # The batch --------------------------------------------------------------------------------------------
 
 class Refused(Exception):
@@ -565,7 +586,7 @@ class Batch:
                 if not parent:
                     break
                 top = parent
-            if top == base:
+            if top == base or self._on_tip(tip, base, top):
                 say(f"entry {e.get('id')} ({e.get('branch')}): already on {self.target}")
                 self._set(i, "landed")
                 continue
@@ -598,6 +619,18 @@ class Batch:
                 h = new
         return carried
 
+    def _on_tip(self, tip: str, base: str, top: str) -> bool:
+        """Every commit of base..top is on `tip` already: as the same patch (git cherry), or replayed
+        there by a batch that settled its conflict (its REPLAYED trailer)."""
+        marks = [line.split() for line in _git(self.repo, "cherry", tip, top, base).stdout.splitlines()]
+        left = {m[1] for m in marks if len(m) == 2 and m[0] == "+"}
+        if not marks:
+            return False
+        if left:
+            log = _git(self.repo, "log", "--format=%B", f"{base}..{tip}").stdout
+            left -= set(re.findall(rf"^{REPLAYED}: ([0-9a-f]{{40,64}})[ \t]*$", log, re.M))
+        return not left
+
     def _rebase(self, onto: str, top: str) -> tuple[str, list[str] | None]:
         """Rebase the entry's commits up to `top` onto `onto` in the worktree, settling conflicts that
         need no judgment: (new head, None), or (onto, conflicted files) after aborting a real one."""
@@ -617,6 +650,7 @@ class Batch:
                 return onto, real or [f"(the rebase stopped: {_last(r.stderr or r.stdout, 3)})"]
             say(f"settled {', '.join(files)} (version lines, or lines both sides added)")
             _git(wt, "add", "--", *files)
+            _commit_replayed(wt)
             r = _git(wt, "rebase", "--continue")
             if r.returncode != 0 and _rebasing(wt) and _git(wt, "diff", "--cached", "--quiet", "HEAD").returncode == 0 \
                     and not _git(wt, "diff", "--name-only", "--diff-filter=U").stdout.strip():

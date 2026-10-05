@@ -9090,8 +9090,8 @@ def test_a_push_batch_does_not_settle_an_addition_that_repeats_a_top_level_name(
 def test_a_push_batch_never_pushes_again_an_entry_it_settled_and_pushed(env, monkeypatch):
     """A fresh batch gets the entries of one that pushed and died before recording it (design §7).
     The entry settled against the one before it went out as another patch (its context changed), so
-    git does not drop it as applied: its line is on the tip already, so it is a conflict now, never
-    a second push of its line and a second bump."""
+    git cherry does not match it; the trailer naming the commit it replays does: it is landed, never
+    a conflict for its review to look into, nor a second push of its line and a second bump."""
     p, repo, origin, other = _bump_setup(env, monkeypatch, ["true"])
     _commit(other, "plugins/p/notes.txt", "a\nc\n")
     _git_out(other, "push", "-q", "origin", "HEAD:proj")
@@ -9102,10 +9102,19 @@ def test_a_push_batch_never_pushes_again_an_entry_it_settled_and_pushed(env, mon
     tip = _git_out(origin, "rev-parse", "proj")
     for bid, again in (("b2", heads), ("b3", heads[1:])):
         rc, m = _run_batch(p, _batch_marker(p, again, bid=bid), monkeypatch)
-        assert rc == 0 and m["pushed_sha"] is None and _statuses(m)[-1] in ("landed", "conflict"), m
-        assert _git_out(origin, "rev-parse", "proj") == tip, "nothing goes out again"
-    assert _statuses(m) == ["conflict"] and m["results"][0]["detail"]["files"] == ["plugins/p/notes.txt"], m
+        assert rc == 0 and m["outcome"] == "landed" and _statuses(m) == ["landed"] * len(again), m
+        assert m["pushed_sha"] is None and _git_out(origin, "rev-parse", "proj") == tip, "nothing goes out again"
     assert _versions(origin) == ("0.1.1", "0.1.1") and len(_bump_commits(origin)) == 1
+    settled = _git_out(origin, "log", "-1", "--format=%B%x00%an%x00%ad", "proj^", "--", "plugins/p/notes.txt")
+    msg, author, date = settled.split("\0")
+    assert msg.splitlines()[0] == "e2: edit plugins/p/notes.txt" and f"Ttp-Replayed-From: {heads[1]}" in msg
+    assert (author, date) == tuple(_git_out(repo, "log", "-1", "--format=%an%x00%ad", heads[1]).split("\0"))
+    # Only a commit the trailer names counts: the same change made anew still conflicts.
+    _git_out(repo, "checkout", "-q", "-B", "e3", heads[1])
+    _git_out(repo, "commit", "-q", "--amend", "-m", "e3: the same line, another commit")
+    again = _git_out(repo, "rev-parse", "HEAD")
+    rc, m = _run_batch(p, _batch_marker(p, [again], bid="b4"), monkeypatch)
+    assert _statuses(m) == ["conflict"] and m["results"][0]["detail"]["files"] == ["plugins/p/notes.txt"], m
 
 
 def test_a_push_batch_rebuilds_a_worktree_a_crash_left_mid_rebase(env, monkeypatch, capsys):
