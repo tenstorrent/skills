@@ -51,7 +51,7 @@ from . import shared
 from . import worktree
 from .db import (OPEN_ASK_MAX_AGE_S, SEVERITY_RANK, TERMINAL_TASK_STATES, continues_id, deferral, dependency_ids,
                  dump_result, load_result, without_deferral)
-from .project import (DEFAULT_CONFIG, Project, deep_merge, disk_resume_gb, durable_write, git_fsync_env, hostname,
+from .project import (Project, deep_merge, layered, disk_resume_gb, durable_write, git_fsync_env, hostname,
                       nice_level)
 from .providers import get_provider
 from .providers.base import last_json_object, scratch_dir, service_path
@@ -310,7 +310,7 @@ class Daemon:
         established project starts no coordinator turn or worker run (both would route on the
         defaults) and says so in one alert, which clears once the file reads again."""
         raw, status = self.p.read_config()
-        self.cfg = deep_merge(DEFAULT_CONFIG, raw)
+        self.cfg = layered(raw)
         if status != self.cfg_status:
             log(self.p, {"ok": "project.json reads again",
                          "fallback": "project.json is missing or not valid JSON: its last good copy stays in force",

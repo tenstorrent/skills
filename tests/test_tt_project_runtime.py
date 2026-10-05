@@ -4506,6 +4506,7 @@ def test_estimates_use_the_projects_own_observed_rate(env):
 
 def test_dollar_caps_cover_the_whole_project(env):
     p = make(env)
+    p.set_config("budget.day_start", "")   # a rolling 24 h, whatever the hour the test runs
     from ttp import budget as bud
     two_hours_ago = time.time() - 7200          # outside the runaway guard's last hour
     for prov in ("claude", "codex"):
@@ -4524,6 +4525,7 @@ def test_dollar_caps_cover_the_whole_project(env):
 def test_plan_provider_spend_after_its_last_window_counts_toward_caps(env):
     # A provider that stops reporting windows may have moved to usage billing: its later spend counts.
     p = make(env)
+    p.set_config("budget.day_start", "")   # a rolling 24 h, whatever the hour the test runs
     from ttp import budget as bud
     now = time.time()
     p.db.x("INSERT INTO snapshots(ts,provider,account,window,utilization,resets_at) VALUES(?,?,?,?,?,?)",
@@ -19610,3 +19612,264 @@ def test_ttp_checks_runs_one_quoted_extra_command_through_the_shell(env, tmp_pat
         cli.main(["checks", "--fresh", "--", "no-such-program-ttp"])
     assert e.value.code != 0 and rec()["passed"] is False
     assert "not found" in (run / "checks.log").read_text()
+
+
+# global daily cap and the fixed budget day ---------------------------------------------------------
+def _other_project(tmp_path, name, host="testhost"):
+    """Another project's database on this machine, registered as `ttp list` would show it."""
+    from ttp.db import DB
+    from ttp.project import FOLDER, register
+    root = tmp_path / name
+    db = DB(root / FOLDER / "state" / "project.db")
+    register(name, {"host": host, "dir": str(root)})
+    return db
+
+
+def test_the_budget_day_starts_at_a_fixed_hour_in_its_zone_across_dst(env, monkeypatch):
+    from datetime import datetime, timezone
+    from ttp import budget as bud
+    from ttp import globalcap as gcap
+    monkeypatch.setenv("TZ", "UTC")   # the host's zone plays no part
+    time.tzset()
+    try:
+        b = {"day_start": "08:00", "timezone": "America/New_York"}
+        utc = lambda *a: datetime(*a, tzinfo=timezone.utc).timestamp()  # noqa: E731
+        # Clocks go back on 2026-11-01: 07:00 EST is before the day's start, so today began at
+        # 08:00 EDT the day before and is 25 h long.
+        start, end = gcap.day_bounds(b, utc(2026, 11, 1, 12, 0))
+        assert (start, end) == (utc(2026, 10, 31, 12, 0), utc(2026, 11, 1, 13, 0))
+        # Clocks go forward on 2026-03-08: that day is 23 h long.
+        start, end = gcap.day_bounds(b, utc(2026, 3, 7, 14, 0))
+        assert (start, end) == (utc(2026, 3, 7, 13, 0), utc(2026, 3, 8, 12, 0))
+        assert gcap.day_bounds({"day_start": "", "timezone": "UTC"}, utc(2026, 3, 7, 14, 0)) is None
+        assert gcap.day_bounds({"day_start": "08:00"}, utc(2026, 3, 7, 7, 0))[0] == utc(2026, 3, 6, 8, 0)   # UTC default
+        assert gcap.setting_problems({"timezone": "Mars/Base"}) and gcap.setting_problems({"day_start": "8am"})
+        # The project's daily cap counts this budget day, not the last 24 h.
+        p = make(env)
+        now = utc(2026, 11, 1, 14, 0)          # 09:00 EST: the day began an hour ago
+        p.set_config("budget.timezone", "America/New_York")
+        p.db.spend("fake", 90.0, "task:1", ts=now - 2 * 3600)   # yesterday's budget day
+        p.db.spend("fake", 30.0, "task:2", ts=now - 1800)
+        g = bud.evaluate(p.db, p.config(), "fake", [], now)
+        assert g.numbers["spent_today"] == 30.0 and g.level != "red", (g.level, g.reasons)
+        assert g.numbers["day_end"] == utc(2026, 11, 2, 13, 0)
+    finally:
+        monkeypatch.delenv("TZ")
+        time.tzset()
+
+
+def test_the_global_daily_total_sums_this_machines_projects_on_the_same_account(env, tmp_path):
+    p = make(env)
+    from ttp import globalcap as gcap
+    now = time.time()
+    start, end = now - 3600, now + 3600
+    p.db.spend("claude", 1.0, "task:1", account="acct-a")
+    other = _other_project(tmp_path, "other")
+    other.spend("claude", 2.0, "task:1", account="acct-a")
+    other.spend("claude", 4.0, "task:2", account="")              # unknown account: counted (fail safe)
+    other.spend("claude", 8.0, "task:3", account="acct-b")        # another account
+    other.spend("codex", 16.0, "task:4", account="acct-a")        # another provider
+    other.spend("claude", 32.0, "task:5", account="acct-a", ts=start - 60)   # before today
+    other.x("INSERT INTO runs(role,provider,account,started,status,cost_usd) VALUES('worker','claude','acct-a',?,"
+            "'running',0.5)", (now,))                              # running work as last priced
+    _other_project(tmp_path, "elsewhere", host="otherhost").spend("claude", 64.0, "t", account="acct-a")
+    t = gcap.total(p.db, "claude", start, end, now, account="acct-a")
+    # A machine not heard from yet counts as stale; this machine never reads its projects' files.
+    assert t["usd"] == 7.5 and t["local_projects"] == 2 and t["stale"] == ["otherhost"], t
+    assert "2 tt-project projects on this machine" in t["includes"]
+    assert "outside tt-project" in t["includes"]   # what the total does not see
+    # The hook for other spend adds to the total and says so.
+    gcap.add_other_source(lambda prov, acct, s, e: (2.5, "2 local sessions"))
+    t = gcap.total(p.db, "claude", start, end, now + gcap.LOCAL_CACHE_S + 1, account="acct-a")
+    assert t["usd"] == 10.0 and "2 local sessions" in t["includes"], t
+
+
+def test_the_global_daily_total_counts_another_machine_fresh_and_then_stale(env, tmp_path, monkeypatch):
+    p = make(env)
+    from ttp import globalcap as gcap
+    from ttp.project import register
+    now = time.time()
+    start, end = now - 3600, now + 3600
+    register("far", {"host": "box2", "dir": "/srv/far"})
+    key = gcap.account_key("claude", "acct-a")
+    real_fetch, asked = gcap.fetch, []
+
+    def fetch(target, s, e):
+        asked.append(target)
+        return {"host": "box2", "rows": [{"provider": "claude", "key": key, "usd": 50.0},
+                                         {"provider": "claude", "key": gcap.account_key("claude", "x"), "usd": 9.0}],
+                "projects": ["far"]}
+
+    monkeypatch.setattr(gcap, "fetch", fetch)
+    gcap.refresh(start, end, now)
+    assert asked == ["box2"]
+    t = gcap.total(p.db, "claude", start, end, now, account="acct-a")
+    assert t["usd"] == 50.0 and t["stale"] == [] and t["remote_projects"] == 1, t
+    gcap.refresh(start, end, now + 60)
+    assert asked == ["box2"], "asked again before REFRESH_S"
+    # The machine stops answering: its last total still counts, marked stale.
+    monkeypatch.setattr(gcap, "fetch", lambda *a: (_ for _ in ()).throw(RuntimeError("ssh: timed out")))
+    later = now + gcap.REFRESH_S + 1
+    gcap.refresh(start, end, later)
+    t = gcap.total(p.db, "claude", start, end, later, account="acct-a")
+    assert t["usd"] == 50.0 and t["stale"] == ["box2"] and "(1 stale)" in t["includes"], t
+    # An old answer is stale too; one from another budget day does not count.
+    monkeypatch.setattr(gcap, "fetch", fetch)
+    gcap.refresh(start, end, later, force=True)
+    assert gcap.total(p.db, "claude", start, end, later, account="acct-a")["stale"] == []
+    assert gcap.total(p.db, "claude", start, end, later + gcap.STALE_S + 1, account="acct-a")["stale"] == ["box2"]
+    t = gcap.total(p.db, "claude", end, end + 86400, later, account="acct-a")
+    assert t["usd"] == 0 and t["stale"] == [], t
+    # The other machine answers with `ttp spend-today` over ssh in batch mode, no new tunnel.
+    calls = []
+    monkeypatch.setattr(gcap.subprocess, "run", lambda cmd, **kw: calls.append(cmd) or types.SimpleNamespace(
+        returncode=0, stdout=json.dumps({"host": "box2", "rows": [], "projects": []}), stderr=""))
+    real_fetch("box2", start, end)
+    assert calls[0][:3] == ["ssh", "-o", "BatchMode=yes"] and "spend-today" in calls[0][-1], calls
+
+
+def test_spend_today_reports_this_machines_projects_without_the_account(env, tmp_path, capsys):
+    make(env)
+    from ttp.cli import main
+    from ttp import globalcap as gcap
+    other = _other_project(tmp_path, "other")
+    other.spend("claude", 2.0, "task:1", account="someone | org | usage")
+    now = time.time()
+    main(["spend-today", "--since", str(now - 60), "--until", str(now + 60), "--json"])
+    out = json.loads(capsys.readouterr().out)
+    assert out["host"] == "testhost" and set(out["projects"]) >= {"other"}, out
+    assert {"provider": "claude", "key": gcap.account_key("claude", "someone | org | usage"), "usd": 2.0} in out["rows"]
+    assert "someone" not in json.dumps(out)
+
+
+def _global_cap_setup(env, tmp_path, cap=10.0):
+    from ttp import project
+    p = make(env)
+    project.set_account_setting("budget.global_daily_usd", cap)
+    project.set_account_setting("budget.timezone", "America/New_York")
+    return p, _other_project(tmp_path, "other")
+
+
+def test_the_global_cap_stops_new_starts_but_not_running_work_or_replies(env, tmp_path, monkeypatch):
+    p, other = _global_cap_setup(env, tmp_path)
+    from ttp import budget as bud
+    from ttp import schedule as sched
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    starts = []
+    monkeypatch.setattr(d, "start_run", lambda *a, **k: starts.append(a))
+    other.spend("fake", 12.0, "task:1")
+    p.db.x("INSERT INTO runs(role,provider,started,status) VALUES('worker','fake',?,'running')", (time.time(),))
+    d.update_gates()
+    g = d.gates["fake"]
+    assert g.level == "red" and not g.allow_new_work and not g.allow_optional and g.max_parallel == 0, g.reasons
+    assert any(r.startswith("global daily cap reached: $12.00 of $10 today") for r in g.reasons), g.reasons
+    assert bud.evaluate(p.db, p.config(), "fake", []).level == "red"
+    # No task starts, no scheduled llm run; the running one goes on.
+    p.db.add_task("new work", "s", origin="user")
+    d.dispatch()
+    assert not [a for a in starts if a and a[0] != "coordinator"], starts
+    sched.upsert(p.db, "summary", "llm", "1d", payload={"spec": "sum up"})
+    p.db.x("UPDATE schedules SET next_run=? WHERE name='summary'", (time.time() - 1,))
+    d.run_schedules()
+    assert p.db.one("SELECT last_status FROM schedules WHERE name='summary'")["last_status"] == "skipped: budget red"
+    assert p.db.one("SELECT status FROM runs WHERE role='worker'")["status"] == "running"
+    # A message from the user still gets a coordinator turn.
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    p.db.x("UPDATE events SET status='done'")
+    p.set_config("coordinator.debounce_s", 0)
+    d.cfg = p.config()
+    p.db.post("in", "status?", chat="c1", kind="user")
+    starts.clear()
+    d.maybe_coordinate()
+    assert starts, "no coordinator turn for a user message under the global cap"
+
+
+def test_the_global_cap_alert_clears_by_itself_at_the_day_reset(env, tmp_path, monkeypatch):
+    p, other = _global_cap_setup(env, tmp_path)
+    from ttp import alerts
+    from ttp import globalcap as gcap
+    from ttp.daemon import Daemon
+    clock = [time.time()]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    d = Daemon(p.base)
+    d.update_gates()
+    other.spend("fake", 12.0, "task:1")
+    clock[0] += gcap.LOCAL_CACHE_S + 1      # the other projects' totals are read again
+    d.update_gates()
+    alert = p.db.one("SELECT ts, text FROM messages WHERE ref='budget:fake'")
+    assert alert and "starts again by itself when the budget day resets" in alert["text"], alert
+    assert alerts.holds(p.db, "budget:fake", alert["ts"], clock[0])
+    clock[0] = gcap.day_bounds(p.config()["budget"], clock[0])[1] + 60
+    d.update_gates()
+    assert d.gates["fake"].level != "red"
+    assert not alerts.holds(p.db, "budget:fake", alert["ts"], clock[0])
+
+
+def test_a_global_cap_of_zero_is_off(env, tmp_path):
+    p, other = _global_cap_setup(env, tmp_path, cap=0)
+    from ttp import budget as bud
+    other.spend("fake", 500.0, "task:1")
+    g = bud.evaluate(p.db, p.config(), "fake", [])
+    assert g.level == "green" and "global_today" not in g.numbers, (g.level, g.reasons)
+
+
+def test_an_unknown_global_total_leaves_the_project_caps_in_charge(env, tmp_path, monkeypatch):
+    p, other = _global_cap_setup(env, tmp_path)
+    from ttp import budget as bud
+    from ttp import globalcap as gcap
+    monkeypatch.setattr(gcap, "total", lambda *a, **k: (_ for _ in ()).throw(OSError("unreadable")))
+    g = bud.evaluate(p.db, p.config(), "fake", [])
+    assert g.level == "green" and any("the project caps still apply" in r for r in g.reasons), g.reasons
+    p.db.spend("fake", 150.0, "task:1", ts=time.time() - 60)
+    assert bud.evaluate(p.db, p.config(), "fake", []).level == "red"
+
+
+def test_the_budget_line_of_a_usage_billed_account_and_of_a_plan(env, tmp_path):
+    p, other = _global_cap_setup(env, tmp_path, cap=1000)
+    from ttp import budget as bud
+    from ttp import globalcap as gcap
+    from ttp.web import budget_line
+    now = time.time()
+    p.db.spend("fake", 1.2, "task:1", ts=now - 60)
+    other.spend("fake", 340.0, "task:1", ts=now - 60)
+    g = bud.evaluate(p.db, p.config(), "fake", [], now).as_dict()
+    line = budget_line(p.db, now, "fake", g)
+    assert re.fullmatch(r"today \$1\.20 this project, \$341 of \$1000 global - resets in \d+\.\d h", line), line
+    end = gcap.day_bounds(p.config()["budget"], now)[1]
+    assert line.endswith(f"resets in {(end - now) / 3600:.1f} h")
+    g["numbers"]["global_stale"] = ["box2"]
+    assert budget_line(p.db, now, "fake", g).endswith(" h (1 machine stale)")
+    # Global cap off: this project only.
+    del g["numbers"]["global_today"]
+    assert re.fullmatch(r"today \$1\.20 this project - resets in \d+\.\d h", budget_line(p.db, now, "fake", g))
+    # A plan account keeps its line.
+    p.db.x("INSERT INTO snapshots(ts,provider,account,window,utilization,resets_at) VALUES(?,?,?,?,?,?)",
+           (now - 60, "fake", "", "five_hour", 4, now + 3.9 * 3600))
+    plan = bud.evaluate(p.db, p.config(), "fake", bud.plan_windows(p.db, now), now).as_dict()
+    assert plan["regime"] == "windows"
+    assert budget_line(p.db, now, "fake", plan) == "5h 4% - resets in 3.9 h, 24h $1.20 virtual"
+
+
+def test_account_level_budget_settings_apply_to_every_project_and_a_project_may_override(env, capsys):
+    p = make(env)
+    from ttp import project
+    from ttp.cli import main
+    main(["config", "--account", "budget.global_daily_usd", "1000"])
+    main(["config", "--account", "budget.timezone", "America/New_York"])
+    assert p.config()["budget"]["global_daily_usd"] == 1000
+    assert p.config()["budget"]["timezone"] == "America/New_York"
+    p.set_config("budget.global_daily_usd", 300)
+    assert p.config()["budget"]["global_daily_usd"] == 300
+    with pytest.raises(SystemExit):
+        main(["config", "--account", "budget.timezone", "Mars/Base"])
+    with pytest.raises(SystemExit):
+        main(["config", "--account", "budget.daily_usd", "5"])   # per-project only
+    with pytest.raises(ValueError):
+        project.set_account_setting("runner.nice", 0)
+    capsys.readouterr()
+    main(["config", "--account", "budget.timezone"])
+    assert json.loads(capsys.readouterr().out) == "America/New_York"
+    main(["config", "--account", "budget.timezone", ""])
+    assert p.config()["budget"]["timezone"] == "UTC"
+    assert (project.HOME_DIR / "settings.json").stat().st_mode & 0o077 == 0

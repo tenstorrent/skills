@@ -444,7 +444,7 @@ class Project:
         return (self.state / "project.db").is_file()
 
     def config(self) -> dict:
-        return deep_merge(deep_merge(DEFAULT_CONFIG, load_account_settings()), self.raw_config())
+        return layered(self.raw_config())
 
     def set_config(self, dotted: str, value: Any) -> None:
         raw = self.raw_config()
@@ -764,6 +764,11 @@ def unregister(name: str) -> None:
 # Account-level settings: one file per user and machine that every project reads, below the
 # project's own project.json, so the projects on a machine agree unless one overrides a key.
 ACCOUNT_KEYS = {"budget": {"global_daily_usd", "day_start", "timezone"}}
+
+
+def layered(raw: dict) -> dict:
+    """A project's settings: the defaults, then the account-level ones, then its project.json."""
+    return deep_merge(deep_merge(DEFAULT_CONFIG, load_account_settings()), raw)
 
 
 def account_settings_path() -> Path:
