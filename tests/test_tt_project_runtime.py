@@ -518,10 +518,108 @@ def test_a_switch_to_a_usage_billed_account_drops_plan_windows_before_its_first_
     g = bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db, now), now)
     assert g.regime == "caps" and g.numbers["spent_24h"] == 70.0 and g.level == "yellow", (g.numbers, g.reasons)
     line = budget_line(p.db, now, "claude", g.as_dict())
-    assert line == "24h $130.00 actual", line
+    assert line == "24h $70.00 actual", "the old plan's spend was never billed: " + line
     # a run that started earlier under the plan account does not bring its windows back
     _run(p, "acct-a | plan", now - 7300)
     assert bud.plan_windows(p.db, now) == []
+
+
+def _plan_then_billed(p, now):
+    """Plan account A spends inside the 24 h window while it reports plan windows, then the provider
+    switches to usage-billed account B mid-window and B spends. B also spent once before the switch
+    (an earlier login), when B was already billed by use."""
+    from ttp import budget as bud
+    _run(p, "acct-b | billed", now - 20 * 3600, now - 19 * 3600, 3.0)
+    p.db.spend("claude", 3.0, "task:9", account="acct-b | billed", ts=now - 19 * 3600)
+    for h in range(18, 6, -1):   # A on its plan: readings with its runs, every hour
+        _reading(p, now - h * 3600, "acct-a | plan", "five_hour", 20.0, now + 3600)
+        _run(p, "acct-a | plan", now - h * 3600 - 600, now - h * 3600 + 60, 20.0)
+        p.db.spend("claude", 20.0, "task:1", account="acct-a | plan", ts=now - h * 3600 + 60)
+    bud.note_account(p.db, "claude", "acct-b | billed")
+    for h in (5, 3, 1):
+        _run(p, "acct-b | billed", now - h * 3600 - 600, now - h * 3600, 4.0)
+        p.db.spend("claude", 4.0, "task:2", account="acct-b | billed", ts=now - h * 3600)
+
+
+def test_account_switch_mid_window_counts_only_billed_spend(env):
+    """$240 spent on plan account A before the switch was never billed: only B's $15 counts toward
+    the daily and weekly caps, the gate and the budget line's 'actual', after A's windows are gone."""
+    p = make(env)
+    from ttp import budget as bud
+    from ttp.web import budget_line
+    now = time.time()
+    _plan_then_billed(p, now)
+    assert round(p.db.spent_since(now - 86400), 2) == 255.0
+    assert round(p.db.spent_since(now - 86400, billed=True), 2) == 15.0
+    assert bud.plan_windows(p.db, now) == []
+    g = bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db, now), now)
+    assert g.regime == "caps" and g.numbers["spent_24h"] == 15.0 and g.numbers["spent_7d"] == 15.0, g.numbers
+    assert g.level == "green" and g.allow_new_work, (g.level, g.reasons)
+    assert budget_line(p.db, now, "claude", g.as_dict()) == "24h $15.00 actual"
+    assert budget_line(p.db, now, "claude") == "24h $15.00 actual"
+    # B's run still going counts; a run that started under A before the switch does not
+    _run(p, "acct-b | billed", now - 300, None, 2.5)
+    _run(p, "acct-a | plan", now - 7 * 3600 - 300, None, 7.0)
+    assert bud.in_flight(p.db, billed_at=now) == 2.5 and bud.in_flight(p.db) == 9.5
+    g = bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db, now), now)
+    assert g.numbers["spent_24h"] == 17.5 and g.numbers["in_flight"] == 2.5, g.numbers
+    # a long run that started under A and ended after the switch stays plan spend
+    _run(p, "acct-a | plan", now - 7 * 3600 - 900, now - 2 * 3600, 50.0)
+    p.db.spend("claude", 50.0, "task:4", account="acct-a | plan", ts=now - 2 * 3600)
+    assert bud.evaluate(p.db, p.config(), "claude", [], now).numbers["spent_24h"] == 17.5
+    # the caps still bite on billed spend: B spends past the $100 daily cap
+    p.db.spend("claude", 90.0, "task:2", account="acct-b | billed", ts=now - 60)
+    g = bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db, now), now)
+    assert g.level == "red" and not g.allow_new_work and g.numbers["spent_24h"] == 107.5, g.numbers
+
+
+def test_a_switch_back_to_a_plan_keeps_the_billed_spend_billed(env):
+    """usage-billed B -> plan A: B's spend stays billed and A's new spend is plan spend, decided by
+    each row's account and time, not by the account the provider is on now."""
+    p = make(env)
+    from ttp import billing
+    now = time.time()
+    _plan_then_billed(p, now)
+    _run(p, "acct-a | plan", now - 1800, now - 600, 30.0)
+    p.db.spend("claude", 30.0, "task:3", account="acct-a | plan", ts=now - 600)
+    _reading(p, now - 600, "acct-a | plan", "five_hour", 25.0, now + 3600)
+    bud_spent = p.db.spent_since(now - 86400, billed=True)
+    assert round(bud_spent, 2) == 15.0, "B's spend stayed billed; A's spend before and after was plan"
+    assert billing.billed_by_account(p.db.conn, now - 86400) == {("claude", "acct-b | billed"): 15.0}
+    spans = billing.plan_spans(p.db.conn, now - 86400, "claude")
+    assert not billing.is_plan(spans, "claude", "acct-a | plan", now - 3 * 3600), "A was not in use then"
+    assert billing.is_plan(spans, "claude", "acct-a | plan", now - 10 * 3600)
+
+
+def test_ledger_rows_without_an_account_take_their_runs_or_follow_the_providers_plan(env):
+    """Old rows written without an account: the migration gives each the account of the run that
+    ended when it was booked; one no run explains is plan spend while the provider reported plan
+    windows then, and billed otherwise. Never billed just for having no account."""
+    p = make(env)
+    from ttp import db as dbm
+    now = time.time()
+    _reading(p, now - 6 * 3600, "acct-a | plan", "five_hour", 20.0, now + 3600)
+    _run(p, "acct-b | billed", now - 3 * 3600, now - 2 * 3600, 6.0)
+    for ts, usd in ((now - 2 * 3600, 6.0),          # B's run: inferred, billed
+                    (now - 6 * 3600 + 60, 40.0),    # no run, A on its plan then: plan
+                    (now - 4 * 3600, 5.0)):         # no run, no plan reading then: billed
+        p.db.x("INSERT INTO ledger(ts,provider,account,source,usd) VALUES(?,?,NULL,'task:1',?)", (ts, "claude", usd))
+    p.db.x("DELETE FROM meta WHERE key=?", (dbm.LEDGER_ACCOUNT_MIGRATION,))
+    p.db._migrate()
+    got = {round(r["usd"]): r["account"] or "" for r in p.db.q("SELECT usd, account FROM ledger")}
+    assert got == {6: "acct-b | billed", 40: "", 5: ""}, got
+    assert round(p.db.spent_since(now - 86400, billed=True), 2) == 11.0
+
+
+def test_a_lapsed_plan_counts_its_spend_after_its_last_reading(env):
+    """Paid runs of the same account that report no windows end its plan at the last reading."""
+    p = make(env)
+    now = time.time()
+    _reading(p, now - 5 * 3600, "acct-a | plan", "five_hour", 20.0, now + 3600)
+    for h in (4.9, 4.5, 3):
+        _run(p, "acct-a | plan", now - h * 3600 - 60, now - h * 3600, 8.0)
+        p.db.spend("claude", 8.0, "task:1", account="acct-a | plan", ts=now - h * 3600)
+    assert round(p.db.spent_since(now - 86400, billed=True), 2) == 24.0
 
 
 def test_readings_without_an_account_count_until_another_account_or_usage_billing_shows(env):
@@ -13373,8 +13471,9 @@ def test_budget_line_says_virtual_on_a_plan_and_actual_when_billed_by_use(env):
     line = budget_line(p.db, now, "fake", plan, 0.17)
     assert line == "5h 4% - resets in 3.9 h, 24h $0.17 virtual", line
     assert "90" not in line and "running" not in line, line
-    # A plan that lapsed to usage billing still has recent readings, but its gate says caps.
-    assert budget_line(p.db, now, "fake", caps).endswith("24h $0.17 actual")
+    # A plan that lapsed to usage billing still has recent readings, but its gate says caps. The
+    # $0.17 was spent while the account reported plan windows, so none of it was billed.
+    assert budget_line(p.db, now, "fake", caps).endswith("24h $0.00 actual")
     p.db.set_kv("gates", {"fake": plan})
     assert health(p, p.db, now=now)["spend"]["headline"] == budget_line(p.db, now, "fake", plan)
     # Spend still running is shown in the Budget tab, not in the header pill.

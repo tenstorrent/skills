@@ -22,6 +22,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from .billing import PLAN_LAPSE_RUNS, billed_by_account
 from .db import DB
 
 LEVELS = ("green", "yellow", "orange", "red")
@@ -34,12 +35,11 @@ ACCOUNT_KV = "plan_account:"
 # when its reset has passed without a new reading. Unknown names fall back to a week.
 WINDOW_HOURS = {"five_hour": 5.0, "5h": 5.0, "seven_day": 168.0, "7d": 168.0, "seven_day_opus": 168.0,
                 "seven_day_sonnet": 168.0}
-# Spend this long after a plan provider's last window reading still counts as plan-billed.
-PLAN_GRACE_S = HOUR
+# Spend up to billing.PLAN_GRACE_S after a plan provider's last window reading still counts as plan-billed.
 # A plan provider's windows arrive with each run or from a meter read every few minutes. Once its
-# last reading is stale and this many paid runs have ended since, it is billed by use (an API key,
-# an expired plan): the dollar caps apply again.
-PLAN_LAPSE_RUNS = 2
+# last reading is stale and PLAN_LAPSE_RUNS paid runs have ended since, it is billed by use (an API
+# key, an expired plan): the dollar caps apply again. Which spend was billed is decided per account
+# and per time in billing.py.
 # Relative price of each token class (input = 1), used only to apply an observed rate to a token
 # mix; not a price list. Override with budget.estimate_weights.
 TOKEN_WEIGHTS = {"input": 1.0, "output": 5.0, "cache_read": 0.1, "cache_write": 1.25}
@@ -84,9 +84,13 @@ def _raise(g: Gate, level: str, reason: str) -> None:
     g.reasons.append(reason)
 
 
-def in_flight(db: DB, provider: str | None = None, exclude: set[str] | None = None) -> float:
+def in_flight(db: DB, provider: str | None = None, exclude: set[str] | None = None,
+              billed_at: float | None = None) -> float:
     """Spend so far of runs still going, as the daemon last priced it; the ledger has it only
-    once they end."""
+    once they end. With `billed_at`, only runs whose account is billed by use at that time."""
+    if billed_at is not None:
+        got = billed_by_account(db.conn, billed_at, billed_at, provider=provider, running_at=billed_at)
+        return sum(usd for (p, _), usd in got.items() if p not in (exclude or set()))
     rows = db.q("SELECT provider, cost_usd FROM runs WHERE status='running' AND (? IS NULL OR provider=?)",
                 (provider, provider))
     return sum(float(r["cost_usd"] or 0) for r in rows if r["provider"] not in (exclude or set()))
@@ -166,17 +170,17 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
         # The caps bound the project's dollars, whichever provider spends them. Providers on plan
         # windows are bounded by their windows instead, so their spend does not count here.
         day_cap, week_cap = float(b.get("daily_usd") or 0), float(b.get("weekly_usd") or 0)
-        # Only spend up to a provider's last reading (plus grace) is plan-billed: a provider that
-        # stops reporting windows may have moved to usage billing. The windows passed in may be
-        # days old, so only a fresh reading covers spend up to now.
-        windowed = {p: ts if p in lapsed else now if now - ts <= SNAPSHOT_FRESH_S else ts + PLAN_GRACE_S
-                    for p, ts in last.items()}
-        windowed.update({w.provider: now for w in windows if w.provider not in last})
-        live = in_flight(db, exclude={p for p, until in windowed.items() if until >= now})
-        d = db.spent_since(now - DAY, exclude=windowed) + live
-        w7 = db.spent_since(now - WEEK, exclude=windowed) + live
+        # Only spend whose account was billed by use when it was spent counts (billing.py): spend of
+        # an account then on a plan stays plan spend after a switch drops its windows, and spend of
+        # a usage-billed account stays billed whenever it was. Windows passed in without a recorded
+        # reading cover their provider's spend up to now.
+        windowed = {w.provider: now for w in windows if w.provider not in last}
+        live = in_flight(db, exclude={p for p, until in windowed.items() if until >= now}, billed_at=now)
+        d = db.spent_since(now - DAY, exclude=windowed, billed=True) + live
+        w7 = db.spent_since(now - WEEK, exclude=windowed, billed=True) + live
         g.numbers.update({"spent_24h": round(d, 2), "spent_7d": round(w7, 2), "in_flight": round(live, 2),
-                          "estimated_24h": round(db.spent_since(now - DAY, exclude=windowed, estimated_only=True), 2),
+                          "estimated_24h": round(db.spent_since(now - DAY, exclude=windowed, estimated_only=True,
+                                                                billed=True), 2),
                           "daily_cap": day_cap, "weekly_cap": week_cap})
         ratio = max(d / day_cap if day_cap else 0.0, w7 / week_cap if week_cap else 0.0)
         g.numbers["cap_ratio"] = round(ratio, 3)

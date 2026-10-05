@@ -13,6 +13,7 @@ For people (and agents) changing tt-project itself. Users start with the plugin 
 | Workers | `runtime/ttp/prompts.py` + `template/prompts/worker.md`, `kind-*.md` | one task, one handoff (`result.json`) |
 | Mid-run updates | `runtime/ttp/hook.py` | rescopes reach a running worker: appended to `steer.md`, delivered once by a post-tool hook (Claude Code) or read between steps |
 | Budget | `runtime/ttp/budget.py` | gates per provider from plan windows or dollar caps, runaway guard |
+| Billed spend | `runtime/ttp/billing.py` | which spend was billed: per account and time, the one filter every dollar total uses |
 | Screening | `runtime/ttp/screen.py`, `providers/jev.py` | dedupe → rules → Jev → wake the coordinator or not |
 | Watchers, schedules | `runtime/ttp/watchers.py`, `schedule.py` | model-free probes that report changes only |
 | Providers | `runtime/ttp/providers/` | build argv, parse output, report account and plan windows |

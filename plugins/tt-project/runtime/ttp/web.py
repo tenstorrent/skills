@@ -142,7 +142,8 @@ def budget_line(db: DB, now: float | None = None, core: str = "claude", gate: di
     provider moved to another account until that one reports); an average is the mean of
     each completed period's peak, 5-hour windows over 7 days and weekly ones over 3 weeks. The
     dollars are this project's last 24 h: 'virtual' (list-price equivalent) on a plan, 'actual' when
-    billed by use. An item without data is left out. Pacing, targets and caps are in the Budget tab."""
+    billed by use, which counts only spend whose account was billed by use when it was spent
+    (billing.py), not an earlier plan account's. An item without data is left out. Pacing, targets and caps are in the Budget tab."""
     now = now or time.time()
     provs = [r["provider"] for r in db.q("SELECT DISTINCT provider FROM snapshots WHERE ts>=? ORDER BY provider",
                                          (now - 3 * WEEK,))]
@@ -155,7 +156,8 @@ def budget_line(db: DB, now: float | None = None, core: str = "claude", gate: di
             parts.append(f"{label} {w.utilization:.0f}%" +
                          (f" - resets in {max(w.resets_at - now, 0) / secs:.1f} {unit}" if w.resets_at else ""))
     plan = gate["regime"] == "windows" if (gate or {}).get("regime") else bool(wins)
-    spent = db.spent_since(now - DAY) if spent_24h is None else spent_24h
+    spent = (db.spent_since(now - DAY) if spent_24h is None else spent_24h) if plan else \
+        db.spent_since(now - DAY, billed=True)
     parts.append(f"24h ${spent:.2f} {'virtual' if plan else 'actual'}")
     account = next(iter(wins.values())).account if wins else None
     for label, names, span in (("5h avg", FIVE_HOUR, WEEK), ("7d avg", SEVEN_DAY, 3 * WEEK)):

@@ -11,12 +11,15 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping
 
+from . import billing
+
 SCHEMA_VERSION = 1
 PAUSED_RESOURCES_KEY = "paused_resources"   # kv: see DB.paused_resources
 SHARED_SEEN_KEY = "shared_pauses_seen"   # kv: {resource: pause} of the shared pauses this project acted on
 WATCHER_ISSUES_MIGRATION = "watcher_issues_per_condition"   # meta: set once DB._migrate has run
 PROVENANCE_MIGRATION = "message_provenance"   # meta: set once inbound messages have their provenance
 PUSH_QUEUE_MIGRATION = "push_queue"   # meta: set once the push queue's tables exist (see pushq.py)
+LEDGER_ACCOUNT_MIGRATION = "ledger_account"   # meta: set once old ledger rows got their run's account
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -145,6 +148,24 @@ class DB:
         self._migrate_issues()
         self._migrate_provenance()
         self._migrate_push_queue()
+        self._migrate_ledger_account()
+
+    def _migrate_ledger_account(self) -> None:
+        """Ledger rows written without an account take the account of the run they booked: the run
+        of the same provider that ended when the row was written (spend is booked at the run's end).
+        Rows no run explains keep none; billing.py decides them by the provider's plan readings."""
+        if self.meta(LEDGER_ACCOUNT_MIGRATION) is not None:
+            return
+        with self.tx():
+            if self.meta(LEDGER_ACCOUNT_MIGRATION) is not None:
+                return
+            for row in self.q("SELECT id, provider, ts FROM ledger WHERE COALESCE(account,'')=''"):
+                run = self.one("SELECT account FROM runs WHERE provider=? AND COALESCE(account,'')!='' AND "
+                               "ended BETWEEN ? AND ? ORDER BY ABS(ended-?) LIMIT 1",
+                               (row["provider"], row["ts"] - 2, row["ts"] + 2, row["ts"]))
+                if run:
+                    self.x("UPDATE ledger SET account=? WHERE id=?", (run["account"], row["id"]))
+            self.set_meta(LEDGER_ACCOUNT_MIGRATION, str(time.time()))
 
     def _migrate_push_queue(self) -> None:
         if self.meta(PUSH_QUEUE_MIGRATION) is not None:
@@ -405,7 +426,12 @@ class DB:
                (ts or time.time(), provider, account, source, float(usd or 0), int(estimated), tokens_in, tokens_out))
 
     def spent_since(self, since_ts: float, provider: str | None = None, exclude: Mapping[str, float] | None = None,
-                    estimated_only: bool = False) -> float:
+                    estimated_only: bool = False, billed: bool = False) -> float:
+        """Spend since `since_ts`. With `billed`, only spend whose account was billed by use when it
+        was spent (billing.py): what the dollar caps, the global cap and 'actual' count."""
+        if billed:
+            return sum(billing.billed_by_account(self.conn, since_ts, provider=provider, exclude=exclude,
+                                                 estimated_only=estimated_only).values())
         sql, args = "SELECT COALESCE(SUM(usd),0) s FROM ledger WHERE ts>=?", [since_ts]
         if provider:
             sql, args = sql + " AND provider=?", args + [provider]

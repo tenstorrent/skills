@@ -79,6 +79,8 @@ and preferences you add later become part of the project's charter and memory.
 - Usage-billed accounts: $100 per 24 hours and $200 per 7 days per project by default. A new run
   starts only if its budget fits in what is left of both caps. A plan account whose successful
   runs stop reporting plan windows falls under these caps too (failed or silent runs do not count).
+  The caps count only spend made on an account that was billed by use at the time: after a switch
+  from a plan account to a usage-billed one, the plan's earlier spend stays out.
 - Work backs off in steps as spend rises, pauses at the cap, and tells you how to raise it.
 - A runaway guard pauses a project whose hourly spend jumps far above its own norm.
 - A review runs light when the diff it checks touches no `review.risky_paths` glob and is doc-only
@@ -130,7 +132,8 @@ and preferences you add later become part of the project's charter and memory.
   `5h 4% - resets in 3.9 h, 7d 21% - resets in 6.0 d, 24h $0.17 virtual, 5h avg 31%, 7d avg 72%`.
   The windows and averages are the account's (an average is the mean of each completed window's
   peak: 5-hour windows over 7 days, weekly ones over 3 weeks). The dollars are this project's last
-  24 h: `virtual` (list-price equivalent) on a plan, `actual` when billed by use.
+  24 h: `virtual` (list-price equivalent) on a plan, `actual` when billed by use (only spend made
+  on a usage-billed account).
 
 ## Parallel work
 
