@@ -19776,7 +19776,7 @@ def test_the_global_daily_total_sums_this_machines_projects_on_the_same_account(
     # A machine not heard from yet counts as stale; this machine never reads its projects' files.
     assert t["usd"] == 7.5 and t["local_projects"] == 2 and t["stale"] == ["otherhost"], t
     assert "2 tt-project projects on this machine" in t["includes"]
-    assert "outside tt-project" in t["includes"]   # what the total does not see
+    assert "not your own sessions" in t["includes"]   # what the total does not see
     # The hook for other spend adds to the total and says so.
     gcap.add_other_source(lambda prov, acct, s, e: (2.5, "2 local sessions"))
     t = gcap.total(p.db, "claude", start, end, now + gcap.LOCAL_CACHE_S + 1, account="acct-a")
@@ -20719,3 +20719,264 @@ def test_a_coordinator_turn_lost_to_the_network_is_not_a_failed_turn(env, net, m
     assert json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (rid,))["note"])["lost_to_network"]
     assert int(p.db.kv("coordinator_failures", 0)) == 0
     assert not p.db.kv("coordinator_backoff_until")
+
+
+# other Claude Code sessions on this machine (estimated from the local logs) ----------------------
+def _claude_logs(tmp_path, monkeypatch):
+    root = tmp_path / "claude-config"
+    (root / "projects").mkdir(parents=True)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(root))
+    return root / "projects"
+
+
+def _call(sid, msg, ts, model="claude-sonnet-4-5-20250929", req=None, **usage):
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(ts))
+    return {"type": "assistant", "timestamp": stamp, "sessionId": sid, "requestId": req or f"req-{msg}",
+            "uuid": f"u-{msg}-{secrets.token_hex(4)}", "message": {"id": msg, "model": model, "usage": usage}}
+
+
+def _log(logs, sid, records, folder="-work-repo", sub=None):
+    d = logs / folder
+    path = d / sid / "subagents" / f"{sub}.jsonl" if sub else d / f"{sid}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a") as f:
+        for r in records:
+            f.write(json.dumps(r) + "\n")
+    return path
+
+
+def _far_day(now):
+    """Day settings whose day starts 12 h from `now`, so calls a few minutes old fall on today."""
+    return {"day_start": f"{(time.gmtime(now).tm_hour + 12) % 24:02d}:00", "timezone": "UTC"}
+
+
+def test_the_claude_price_table_prices_each_kind_of_token(env):
+    from ttp import localspend as ls
+    M = 1_000_000
+    usd, est = ls.price("claude-sonnet-4-5-20250929", {"input_tokens": M, "output_tokens": M, "cache_read_input_tokens": M,
+                                                       "cache_creation_input_tokens": 2 * M,
+                                                       "cache_creation": {"ephemeral_5m_input_tokens": M,
+                                                                          "ephemeral_1h_input_tokens": M}})
+    assert (round(usd, 6), est) == (3 + 15 + 0.3 + 3.75 + 6, False)
+    # No 5m/1h split recorded: the whole write is the 5-minute one.
+    assert ls.price("claude-opus-4-5", {"cache_creation_input_tokens": M})[0] == 6.25
+    assert ls.price("claude-opus-4-1-20250805", {"output_tokens": M})[0] == 75
+    assert ls.price("claude-opus-4-20250514", {"output_tokens": M})[0] == 75
+    assert ls.price("claude-opus-4-8[1m]", {"output_tokens": M})[0] == 25
+    assert ls.price("us.anthropic.claude-haiku-4-5@20251001", {"input_tokens": M})[0] == 1
+    # Web searches, fast mode and US-only inference.
+    assert round(ls.price("claude-haiku-4-5", {"server_tool_use": {"web_search_requests": 3}})[0], 6) == 0.03
+    assert ls.price("claude-opus-5-5", {"output_tokens": M, "speed": "fast"})[0] == 40
+    assert round(ls.price("claude-haiku-4-5", {"input_tokens": M, "inference_geo": "us"})[0], 6) == 1.1
+    # An unknown model gets the most expensive row and says it is a guess; overrides win.
+    usd, est = ls.price("claude-newmodel-9", {"output_tokens": M})
+    assert est and usd == max(r[1] for r in ls.PRICES.values())
+    assert ls.price("claude-newmodel-9", {"output_tokens": M}, overrides={"claude-newmodel-9": [1, 2, 3, 4, 5]}) == (2, False)
+    assert round(ls.price("claude-haiku-4-5", {"server_tool_use": {"web_search_requests": 1}},
+                          overrides={"web_search": 0.02})[0], 6) == 0.02
+
+
+def test_other_local_sessions_count_each_call_once_and_leave_out_tt_project_runs(env, tmp_path, monkeypatch):
+    from ttp import globalcap as gcap
+    from ttp import localspend as ls
+    logs = _claude_logs(tmp_path, monkeypatch)
+    p = make(env)
+    other = _other_project(tmp_path, "other")
+    now = time.time()
+    M = 1_000_000
+    # A user's session: one call written as two records (two content blocks), a <synthetic> one,
+    # and a subagent's call.
+    _log(logs, "mine-1", [_call("mine-1", "m1", now - 60, output_tokens=M), _call("mine-1", "m1", now - 59, output_tokens=M),
+                          _call("mine-1", "m0", now - 58, model="<synthetic>", output_tokens=M)])
+    _log(logs, "mine-1", [_call("mine-1", "m2", now - 50, input_tokens=M)], sub="agent-a")
+    # The same call copied into another file (a resumed or forked session) still counts once.
+    _log(logs, "mine-2", [_call("mine-1", "m1", now - 60, output_tokens=M)], folder="-other")
+    # Runs of both local tt-project projects, by runs.session_id, the run note and the init event.
+    _log(logs, "tt-a", [_call("tt-a", "t1", now - 40, output_tokens=M)])
+    _log(logs, "tt-b", [_call("tt-b", "t2", now - 40, output_tokens=M)], sub="agent-b")
+    _log(logs, "tt-c", [_call("tt-c", "t3", now - 40, output_tokens=M)])
+    p.db.x("INSERT INTO runs(role,provider,started,status,session_id) VALUES('worker','claude',?,'running','tt-a')", (now,))
+    other.x("INSERT INTO runs(role,provider,started,ended,status,note) VALUES('worker','claude',?,?,'ok',?)",
+            (now - 100, now - 30, json.dumps({"session_id": "tt-b"})))
+    rid = other.x("INSERT INTO runs(role,provider,started,ended,status) VALUES('worker','claude',?,?,'ok')",
+                  (now - 100, now - 30))
+    out = pathlib.Path(other.path).parent / "runs" / str(rid) / "output.jsonl"
+    out.parent.mkdir(parents=True)
+    out.write_text(json.dumps({"type": "system", "subtype": "init", "session_id": "tt-c"}) + "\n")
+    b = _far_day(now)
+    cache = ls.scan(b, now)
+    assert cache["ok"], cache
+    start, end = gcap.day_bounds(b, now)
+    e = ls.estimate(b, start, end, now)
+    assert e == {"usd": 15 + 3, "sessions": 1, "estimated": False, "unknown": []}, e
+    # The cache file holds no prompts or text, only ids, offsets and sums.
+    assert "content" not in ls.cache_path().read_text()
+
+
+def test_the_local_log_scan_reads_only_what_was_added(env, tmp_path, monkeypatch):
+    from ttp import globalcap as gcap
+    from ttp import localspend as ls
+    logs = _claude_logs(tmp_path, monkeypatch)
+    now = time.time()
+    b = _far_day(now)
+    start, end = gcap.day_bounds(b, now)
+    M = 1_000_000
+    path = _log(logs, "s1", [_call("s1", "m1", now - 60, output_tokens=M)])
+    with open(path, "a") as f:   # a record still being written waits for the next scan
+        f.write(json.dumps(_call("s1", "m2", now - 50, output_tokens=M))[:40])
+    ls.scan(b, now)
+    assert ls.estimate(b, start, end, now)["usd"] == 15
+    reads = []
+    real = ls._read_from
+    monkeypatch.setattr(ls, "_read_from", lambda p_, off: reads.append((p_, off)) or real(p_, off))
+    ls.scan(b, now + 1)
+    assert reads == [], "an unchanged file was read again"
+    path.write_bytes(path.read_bytes().rsplit(b"\n", 1)[0] + b"\n"
+                     + (json.dumps(_call("s1", "m2", now - 50, output_tokens=M)) + "\n").encode())
+    ls.scan(b, now + 2)
+    assert reads and reads[0][1] > 0, "the scan did not start where it stopped"
+    assert ls.estimate(b, start, end, now + 2 + ls.MEMO_S)["usd"] == 30
+    # A log rewritten from the start (replaced, or truncated and written again) is read again, but
+    # calls already counted stay counted once.
+    path.unlink()
+    _log(logs, "s1", [_call("s1", "m1", now - 60, output_tokens=M), _call("s1", "m3", now - 40, input_tokens=M)])
+    ls.scan(b, now + 3)
+    assert ls.estimate(b, start, end, now + 3 + 2 * ls.MEMO_S)["usd"] == 33
+    # Other day settings start the cache over; old days are dropped.
+    b2 = {**b, "day_start": f"{(int(b['day_start'][:2]) + 1) % 24:02d}:00"}
+    assert ls.scan(b2, now + 4)["mode"] == ls.mode(b2)
+    assert ls.estimate(b, start, end, now + 4 + 3 * ls.MEMO_S) is None, "an estimate for other day settings"
+    assert len(ls.load()["buckets"]) == 1
+
+
+def test_the_local_estimate_follows_the_budget_day_across_dst(env, tmp_path, monkeypatch):
+    from datetime import datetime, timezone
+    from ttp import globalcap as gcap
+    from ttp import localspend as ls
+    utc = lambda *a: datetime(*a, tzinfo=timezone.utc).timestamp()  # noqa: E731
+    b = {"day_start": "08:00", "timezone": "America/New_York"}
+    # Clocks go back on 2026-11-01: that budget day runs 12:00 UTC on 10-31 to 13:00 UTC on 11-01.
+    assert ls.bucket(b, utc(2026, 11, 1, 12, 59)) == utc(2026, 10, 31, 12, 0)
+    assert ls.bucket(b, utc(2026, 11, 1, 13, 0)) == utc(2026, 11, 1, 13, 0)
+    assert ls.bucket(b, utc(2026, 3, 8, 11, 59)) == utc(2026, 3, 7, 13, 0)   # 23 h day
+    assert ls.bucket(b, utc(2026, 3, 8, 12, 0)) == utc(2026, 3, 8, 12, 0)
+    # Without a day start the buckets are hours, for the rolling 24 h.
+    assert ls.bucket({}, utc(2026, 3, 8, 11, 59)) == utc(2026, 3, 8, 11, 0) and ls.mode({}) == "hour"
+    # Calls land in the budget day they were made in.
+    logs = _claude_logs(tmp_path, monkeypatch)
+    now = utc(2026, 11, 1, 14, 0)
+    M = 1_000_000
+    _log(logs, "s1", [_call("s1", "a", utc(2026, 11, 1, 12, 30), output_tokens=M),     # 07:30 EST: yesterday
+                      _call("s1", "b", utc(2026, 11, 1, 13, 30), input_tokens=M)])     # 08:30 EST: today
+    os.utime(logs / "-work-repo" / "s1.jsonl", (now, now))
+    ls.scan(b, now)
+    start, end = gcap.day_bounds(b, now)
+    assert ls.estimate(b, start, end, now)["usd"] == 3
+    y0, y1 = gcap.day_bounds(b, start - 1)
+    assert ls.estimate(b, y0, y1, now)["usd"] == 15
+
+
+def test_no_local_logs_leave_the_estimate_unknown_and_the_gate_alone(env, tmp_path, monkeypatch):
+    from ttp import budget as bud
+    from ttp import localspend as ls
+    from ttp import project
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "nowhere"))
+    p = make(env)
+    project.set_account_setting("budget.global_daily_usd", 10)
+    now = time.time()
+    b = ls.account_budget()
+    assert ls.scan(b, now)["ok"] is False
+    day = __import__("ttp.globalcap", fromlist=["day_bounds"]).day_bounds(b, now) or (now - 86400, now)
+    assert ls.estimate(b, day[0], day[1], now) is None
+    assert ls.source("claude", "", now - 60, now) == (0.0, ls.source("claude", "", now - 60, now)[1])
+    assert "unknown" in ls.source("claude", "", now - 60, now)[1] and ls.source("codex", "", 0, now) == (0.0, "")
+    g = bud.evaluate(p.db, p.config(), "claude", [], now)
+    assert g.level == "green" and g.numbers["global_today"] == 0, (g.level, g.reasons, g.numbers)
+    assert "other Claude Code sessions on this machine (unknown" in g.numbers["global_includes"]
+
+
+def test_two_projects_count_the_machines_other_sessions_once(env, tmp_path, monkeypatch):
+    from ttp import budget as bud
+    from ttp import globalcap as gcap
+    from ttp import localspend as ls
+    from ttp import project
+    logs = _claude_logs(tmp_path, monkeypatch)
+    p = make(env)
+    other = _other_project(tmp_path, "other")
+    now = time.time()
+    b = _far_day(now)
+    for k in ("day_start", "timezone"):
+        project.set_account_setting(f"budget.{k}", b[k])
+    project.set_account_setting("budget.global_daily_usd", 100)
+    p.db.spend("claude", 1.0, "task:1")
+    other.spend("claude", 2.0, "task:1")
+    _log(logs, "s1", [_call("s1", "m1", now - 60, output_tokens=1_000_000)])
+    ls.scan(ls.account_budget(), now)
+    start, end = gcap.day_bounds(b, now)
+    t = gcap.total(p.db, "claude", start, end, now)
+    assert t["usd"] == 18 and "other Claude Code sessions on this machine ($15" in t["includes"], t
+    assert "at list prices" in t["includes"] and "nor web, desktop or cloud sessions" in t["includes"]
+    g = bud.evaluate(p.db, p.config(), "claude", [], now)
+    assert g.numbers["global_today"] == 18, g.numbers
+
+
+def test_the_price_table_is_checked_against_reported_run_costs(env, tmp_path, monkeypatch):
+    from ttp import localspend as ls
+    logs = _claude_logs(tmp_path, monkeypatch)
+    now = time.time()
+    M = 1_000_000
+    for i in range(3):
+        _log(logs, f"r{i}", [_call(f"r{i}", "m", now, output_tokens=M, cache_read_input_tokens=M)])
+        _log(logs, f"r{i}", [_call(f"r{i}", "s", now, input_tokens=M)], sub="agent-x")
+    assert ls.session_cost("r0") == (15 + 0.3 + 3, False)
+    assert ls.calibrate("r0", 18.3) is None and ls.calibrate("r1", 18.3) is None, "fewer than DRIFT_RUNS runs"
+    assert abs(ls.calibrate("r2", 18.3)) < 0.001, "the table disagrees with the reported cost"
+    assert ls.calibrate("r0", 0.01) is None and ls.calibrate("no-such", 5) is None
+    # Prices went down 2% and the table did not follow: drift.
+    for i in range(6):   # the median of the last CALIBRATION_KEEP runs moves once most of them drift
+        drift = ls.calibrate(f"r{i % 3}", 18.3 / 1.02)
+    assert drift is not None and abs(drift - 0.02) < 0.001 and drift > ls.DRIFT, drift
+
+
+def test_a_claude_run_starts_with_its_own_session_id(env, monkeypatch):
+    p = make(env)
+    from ttp.daemon import Daemon
+    from ttp.providers import claude as cl
+    from ttp.providers.fake import Fake
+    monkeypatch.setitem(cl._FLAGS, "--session-id", True)
+    assert cl.Claude().session_args("abc") == ["--session-id", "abc"] and cl.Claude().session_args("") == []
+    monkeypatch.setitem(cl._FLAGS, "--session-id", False)
+    assert cl.Claude().session_args("abc") == []
+    monkeypatch.setattr(Fake, "session_args", lambda self, sid: ["--session-id", sid])
+    d = Daemon(p.base)
+    tid = p.db.add_task("build", "build the thing", kind="work", tier="light", origin="user")
+    d.dispatch()
+    run = p.db.one("SELECT * FROM runs WHERE task=? ORDER BY id DESC LIMIT 1", (tid,))
+    argv = json.loads((pathlib.Path(run["dir"]) / "run.json").read_text())["argv"]
+    i = argv.index("--session-id")
+    assert run["session_id"] == argv[i + 1] and len(run["session_id"]) == 36, (run["session_id"], argv)
+    _finish_runs(p, d)
+    assert p.db.one("SELECT session_id FROM runs WHERE id=?", (run["id"],))["session_id"]
+
+
+def test_a_drifting_price_table_raises_a_low_alert(env, monkeypatch):
+    p = make(env)
+    from ttp import localspend as ls
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    sent, asked = [], []
+    monkeypatch.setattr(d, "alert", lambda key, text, severity="high", every_s=0: sent.append((key, severity)))
+    monkeypatch.setattr(ls, "calibrate", lambda sid, usd: asked.append(sid) or 0.02)
+    usage = types.SimpleNamespace(estimated=False, cost_usd=1.0, session_id="s1")
+    d.cfg["budget"]["global_daily_usd"] = 0
+    d._check_price_table({"provider": "claude"}, usage)
+    assert asked == [] and sent == [], "checked without a global cap"
+    d.cfg["budget"]["global_daily_usd"] = 100
+    d._check_price_table({"provider": "fake"}, usage)
+    d._check_price_table({"provider": "claude"}, types.SimpleNamespace(estimated=True, cost_usd=1.0, session_id="s1"))
+    assert asked == []
+    d._check_price_table({"provider": "claude"}, usage)
+    assert asked == ["s1"] and sent == [("claude_price_table", "low")]
+    monkeypatch.setattr(ls, "calibrate", lambda sid, usd: 0.005)
+    d._check_price_table({"provider": "claude"}, usage)
+    assert len(sent) == 1

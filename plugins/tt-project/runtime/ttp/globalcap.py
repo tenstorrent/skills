@@ -18,7 +18,7 @@ The global total for a provider counts, for this day:
   cached in ~/.tt-project/global-spend.json with when it was read. A machine that cannot be reached
   keeps its last answer for the same day, which still counts and is shown as stale;
 - other spend sources registered with `add_other_source` (a hook for spend outside tt-project, e.g.
-  the user's own sessions; none ship yet).
+  the user's own sessions; localspend adds this machine's other Claude Code sessions).
 
 Only spend on the same provider and the same account counts: a Codex project, or a project logged
 in to another account, is not billed with this one. Rows with no account recorded count (fail safe).
@@ -379,7 +379,8 @@ def total(db, provider: str, start: float, end: float, now: float | None = None,
             errors.append(f"other source: {e}")
             continue
         usd += float(more or 0)
-        others.append(label)
+        if label:
+            others.append(label)
     n_local = 1 + len(here["projects"])
     includes = (f"{provider} spend on this account by {n_local} tt-project project{'s' if n_local != 1 else ''} "
                 f"on this machine")
@@ -387,7 +388,8 @@ def total(db, provider: str, start: float, end: float, now: float | None = None,
         includes += (f" and {remote_projects} on {len(hosts)} other machine{'s' if len(hosts) != 1 else ''}"
                      + (f" ({len(stale)} stale)" if stale else ""))
     includes += "".join(f", {x}" for x in others)
-    includes += "; not your own sessions outside tt-project" if not others else ""
+    includes += ("; not your own sessions outside tt-project" if not others else
+                 "; not your own sessions on other machines, nor web, desktop or cloud sessions")
     return {"usd": round(usd, 4), "stale": stale, "machines": hosts, "local_projects": n_local,
             "remote_projects": remote_projects, "errors": errors, "includes": includes}
 

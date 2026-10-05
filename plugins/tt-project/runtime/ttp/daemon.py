@@ -37,6 +37,7 @@ from . import effort
 from . import ends
 from . import integrity
 from . import jevuse
+from . import localspend
 from . import locks
 from . import machines
 from . import prguard
@@ -1228,8 +1229,27 @@ class Daemon:
                 self._finish_worker(r, usage, status, run_dir, cut_off if status == "ok" else None,
                                     rebooted=bool(note.get("lost_to_reboot")),
                                     slept=bool(note.get("lost_to_sleep") or note.get("lost_to_network")))
+        self._check_price_table(r, usage)
         log(p, f"run {r['id']} end status={status} cost=${usage.cost_usd:.3f}"
                f"{' (estimated)' if usage.estimated else ''} role={r['role']}")
+
+    def _check_price_table(self, r: dict, usage) -> None:
+        """Price a finished Claude run's session log with the table that estimates other local
+        sessions, and raise a low alert when it drifts from the cost Claude Code reported."""
+        if (r["provider"] != "claude" or usage.estimated or not usage.cost_usd or not usage.session_id
+                or float((self.cfg.get("budget") or {}).get("global_daily_usd") or 0) <= 0):
+            return
+        try:
+            drift = localspend.calibrate(usage.session_id, usage.cost_usd)
+        except Exception as e:  # noqa: BLE001 - a price check never breaks finishing a run
+            log(self.p, f"price table check failed: {e}")
+            return
+        if drift is not None and abs(drift) > localspend.DRIFT:
+            self.alert("claude_price_table",
+                       f"The Claude price table that estimates this machine's other Claude Code sessions is "
+                       f"{drift * 100:+.1f}% off the costs Claude Code reported for recent runs, so that "
+                       f"estimate is off too. Update the table in tt-project or the account-level pricing.claude setting.",
+                       "low", every_s=86400)
 
     def _slept_during(self, r: dict, exit_info: dict) -> bool:
         """Whether the host slept while the run was going: its supervisor saw the wall clock run
@@ -1772,6 +1792,7 @@ class Daemon:
                 pass
         windows = bud.plan_windows(self.p.db)
         gcap.refresh_async(self.cfg.get("budget") or {})   # other machines' totals, in the background
+        localspend.scan_async(self.cfg.get("budget") or {})   # other local Claude Code sessions
         gates, news, red_sent = {}, [], {}
         # After a restart the last levels come from disk, so a change while the daemon was down is news.
         saved = {} if self.gates else (self.p.db.kv("gates") or {})

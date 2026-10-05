@@ -274,7 +274,7 @@ def scan(budget: dict, now: float | None = None, root: Path | None = None) -> di
             off = int(was.get("off") or 0)
             if was.get("ino") != st.st_ino or st.st_size < off:
                 off = 0   # replaced or truncated: read again; counted calls stay counted once
-            if st.st_size > off:
+            if st.st_size > off and not (was.get("ino") == st.st_ino and was.get("size") == st.st_size):
                 try:
                     lines, off = _read_from(path, off)
                 except OSError:
