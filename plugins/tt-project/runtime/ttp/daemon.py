@@ -101,6 +101,10 @@ SLEEP_EVENT_MERGE_S = 1800   # a sleep this soon after the last one (the dark wa
 # A run that ended because the provider's API could not be reached (DNS gone after a host sleep, a
 # network drop) is lost to the network, not an attempt; new runs on that provider wait (net_held).
 NET_LOST_RE = re.compile(r"Can't reach the API server|ENOTFOUND|EAI_AGAIN")
+# A resumed session's reported cost is netted of what its earlier runs booked only when the
+# difference is at least this share of the run's own token-priced cost, less the slack (in dollars).
+SESSION_NET_AGREE = 0.5
+SESSION_NET_SLACK_USD = 0.05
 REACH_EVERY_S = 30      # while a provider is held offline, how often its API host is resolved again
 REACH_TIMEOUT_S = 5
 NET_HOLD_MAX_S = 900    # a held provider still lets one run try this often: a lookup that keeps failing never holds forever
@@ -1099,7 +1103,8 @@ class Daemon:
             self._metered[r["id"]] = (size, now)
             try:
                 usage = get_provider(r["provider"]).parse(out)
-                cost = self._priced(r, usage)
+                self._priced(r, usage)
+                cost = self._net_of_session(r, usage)
             except Exception:
                 continue
             # The tokens also show a run on a logged-out provider got past the login (alerts.holds).
@@ -1143,6 +1148,30 @@ class Daemon:
                 "cache_read": usage.cache_read_tokens, "cache_write": usage.cache_write_tokens})
         return usage.cost_usd
 
+    def _net_of_session(self, r: dict, usage) -> float:
+        """A resumed Claude Code session reports the whole session's total_cost_usd, not this run's:
+        book only what this run added beyond the earlier runs of the session. Netted only when the
+        report covers what those runs booked and the difference agrees with this run's own tokens
+        priced at the project's rate; even then never below that price. Otherwise the full report
+        is booked: over-booking is the safe failure, under-booking lets spend run away."""
+        session = (json.loads(r["note"] or "{}").get("resumes") or {}).get("session")
+        reported = float(usage.cost_usd or 0)
+        if not session or usage.estimated or reported <= 0:
+            return usage.cost_usd
+        booked = sum(float(o["cost_usd"] or 0) for o in self.p.db.q(
+            "SELECT cost_usd, note FROM runs WHERE id<? AND task IS ? AND note LIKE ?",
+            (r["id"], r["task"], f"%{session}%")) if json.loads(o["note"] or "{}").get("session_id") == session)
+        if booked <= 0:
+            return usage.cost_usd
+        own = bud.estimate_cost(self.p.db, self.cfg, r["provider"], r["model"] or "", {
+            "input": usage.input_tokens, "output": usage.output_tokens,
+            "cache_read": usage.cache_read_tokens, "cache_write": usage.cache_write_tokens})
+        delta = reported - booked
+        if delta >= -1e-6 and delta >= own * SESSION_NET_AGREE - SESSION_NET_SLACK_USD:
+            usage.extra["session_cost_usd"] = reported
+            usage.cost_usd = round(max(delta, own, 0.0), 6)
+        return usage.cost_usd
+
     def finish_run(self, r: dict, exit_info: dict) -> None:
         db, p = self.p.db, self.p
         run_dir = self._run_dir(r)
@@ -1150,6 +1179,7 @@ class Daemon:
         prov = get_provider(r["provider"]).use(r["model"] or "", (self.cfg.get("pricing") or {}).get(r["provider"]))
         usage = prov.parse(run_dir / "output.jsonl", run_dir / "stderr.log")
         self._priced(r, usage)
+        self._net_of_session(r, usage)
         stopped = exit_info.get("stopped")
         # A resume that failed on its own and reported no tokens never got going, even if it printed
         # events: it costs nothing, so it ends as the free fallback to a fresh start (_finish_worker).
@@ -1180,6 +1210,8 @@ class Daemon:
         note = json.loads(r["note"] or "{}")
         if usage.session_id:
             note["session_id"] = usage.session_id   # a run the host takes away resumes it (_resumable)
+        if "session_cost_usd" in usage.extra:
+            note["session_cost_usd"] = usage.extra["session_cost_usd"]   # reported; cost_usd is this run's
         # The runaway guard counts runs that ended without an outcome; a reboot, a host sleep or a
         # hand-off that stands is an outcome, not a loop.
         if status == "lost" and r["boot_id"] and r["boot_id"] != self.boot:
@@ -2303,8 +2335,15 @@ class Daemon:
         run_dir = Path(r["dir"])
         if not session or (_read_result(run_dir / RESULT_FILE) or {}).get("status") in HANDOFF_STATES:
             return None
-        took = float(r["ended"] or 0) - float(r["started"] or 0)
-        if float(r["cost_usd"] or 0) < float(want.get("min_usd", 0.5)) and took < float(want.get("min_s", 600)):
+        # A resume cut short before it did anything carries the work of the runs it continued.
+        cost, took, prev, seen = 0.0, 0.0, r, set()
+        while prev and prev["id"] not in seen:
+            seen.add(prev["id"])
+            cost += float(prev["cost_usd"] or 0)
+            took += float(prev["ended"] or 0) - float(prev["started"] or 0)
+            back = (json.loads(prev["note"] or "{}").get("resumes") or {}).get("run")
+            prev = self.p.db.one("SELECT * FROM runs WHERE id=?", (back,)) if back else None
+        if cost < float(want.get("min_usd", 0.5)) and took < float(want.get("min_s", 600)):
             return None
         spec = _read_result(run_dir / "run.json") or {}
         cwd, run_env = str(spec.get("cwd") or ""), spec.get("env") if isinstance(spec.get("env"), dict) else {}

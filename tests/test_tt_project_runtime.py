@@ -21869,3 +21869,184 @@ def test_lock_wait_extends_run_deadline(env, tmp_path, monkeypatch):
 
 def test_run_deadline_without_lock_wait(env, tmp_path, monkeypatch):
     assert _supervise_with_wait(tmp_path, monkeypatch, None)["stopped"] == "timeout"
+
+
+# Resumed sessions: cost over the resume chain ---------------------------------------------------------
+
+def _session_runs(d, *, booked=6.852397, session="S"):
+    """A task whose first run (session `session`) booked `booked`, and a running resume of it."""
+    db = d.p.db
+    tid = db.add_task("build", "", kind="work", tier="standard", priority=3, budget_usd=20.0, labels=[])
+    first = db.x("INSERT INTO runs(task,role,provider,model,started,ended,status,cost_usd,note) "
+                 "VALUES(?,'worker','claude','opus',?,?,'lost',?,?)",
+                 (tid, time.time() - 9000, time.time() - 1000, booked, json.dumps({"session_id": session})))
+    rid = db.x("INSERT INTO runs(task,role,provider,model,started,status,boot_id,note) "
+               "VALUES(?,'worker','claude','opus',?,'running',?,?)",
+               (tid, time.time() - 60, d.boot, json.dumps({"resumes": {"run": first, "session": session}})))
+    return tid, first, db.one("SELECT * FROM runs WHERE id=?", (rid,))
+
+
+def _reported(cost, output_tokens=0):
+    from ttp.providers.base import RunUsage
+    return RunUsage(cost_usd=cost, output_tokens=output_tokens)
+
+
+def test_resumed_run_books_only_its_own_cost(env):
+    """Claude Code reports a resumed session's whole total_cost_usd: only the part this run added is booked."""
+    p = make(env)
+    p.set_config("budget.estimate_usd_per_mtok", 1.0)   # 200k output tokens price at $1.00
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    _, _, r = _session_runs(d)
+    u = _reported(6.852397)
+    assert d._net_of_session(r, u) == 0.0, "a resume that added nothing repeated the earlier run's cost"
+    assert u.extra["session_cost_usd"] == 6.852397
+    u = _reported(8.0, output_tokens=200_000)
+    assert abs(d._net_of_session(r, u) - 1.147603) < 1e-6
+    # Netted, but never below what this run's own tokens cost.
+    u = _reported(8.0, output_tokens=400_000)
+    assert d._net_of_session(r, u) == 2.0
+
+
+def test_fresh_run_and_per_run_cost_untouched(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    tid, _, r = _session_runs(d)
+    u = _reported(2.0)   # below what the session booked: already this run's own cost
+    assert d._net_of_session(r, u) == 2.0 and "session_cost_usd" not in u.extra
+    fresh = dict(r, note="{}")
+    assert d._net_of_session(fresh, _reported(6.85)) == 6.85
+    other = dict(r, note=json.dumps({"resumes": {"run": 1, "session": "another"}}))
+    assert d._net_of_session(other, _reported(7.0)) == 7.0, "another session's spend was netted"
+    est = _reported(7.0)
+    est.estimated = True
+    assert d._net_of_session(r, est) == 7.0, "a token estimate is this run's own cost"
+
+
+def test_a_non_cumulative_report_is_booked_in_full(env):
+    """A report above what the session booked, whose difference this run's own tokens contradict, is
+    this run's own cost: netting it would under-book."""
+    p = make(env)
+    p.set_config("budget.estimate_usd_per_mtok", 1.0)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    _, _, r = _session_runs(d)
+    u = _reported(8.0, output_tokens=1_600_000)   # its tokens price at $8.00: the report is per-run
+    assert d._net_of_session(r, u) == 8.0 and "session_cost_usd" not in u.extra
+
+
+def test_a_finished_resume_books_the_session_delta_to_its_task(env):
+    p = make(env)
+    p.set_config("budget.estimate_usd_per_mtok", 1.0)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    tid, _, r = _session_runs(d, booked=6.0)
+    run_dir = d.p.runs / str(r["id"])
+    run_dir.mkdir(parents=True)
+    p.db.x("UPDATE runs SET dir=? WHERE id=?", (str(run_dir), r["id"]))
+    (run_dir / "output.jsonl").write_text(json.dumps({
+        "type": "result", "subtype": "success", "is_error": False, "result": "ok", "session_id": "S",
+        "total_cost_usd": 7.5, "usage": {"input_tokens": 10, "output_tokens": 300_000}}) + "\n")
+    (run_dir / "stderr.log").write_text("")
+    d.finish_run(p.db.one("SELECT * FROM runs WHERE id=?", (r["id"],)),
+                 {"rc": 0, "started": time.time() - 60, "ended": time.time(), "stopped": None, "slept_s": 0})
+    run = p.db.one("SELECT * FROM runs WHERE id=?", (r["id"],))
+    assert abs(run["cost_usd"] - 1.5) < 1e-6 and json.loads(run["note"])["session_cost_usd"] == 7.5
+    assert abs(p.db.task(tid)["spent_usd"] - 1.5) < 1e-6
+
+
+def test_a_running_resume_is_metered_net_of_its_session(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    _, _, r = _session_runs(d, booked=6.0)
+    run_dir = d.p.runs / str(r["id"])
+    run_dir.mkdir(parents=True)
+    p.db.x("UPDATE runs SET dir=? WHERE id=?", (str(run_dir), r["id"]))
+    (run_dir / "output.jsonl").write_text(json.dumps({
+        "type": "result", "subtype": "success", "is_error": False, "result": "ok", "session_id": "S",
+        "total_cost_usd": 6.0, "usage": {"input_tokens": 0, "output_tokens": 0}}) + "\n")
+    d.meter_running(every_s=0)
+    assert p.db.one("SELECT cost_usd FROM runs WHERE id=?", (r["id"],))["cost_usd"] == 0.0
+
+
+def test_a_resume_of_the_fake_books_the_session_total_once(env, tmp_path, monkeypatch):
+    """End to end with the fake provider, which reports the session's cumulative cost like Claude Code."""
+    p = make(env)
+    from ttp.daemon import Daemon
+    _sessions(env, monkeypatch, "s1")
+    d = Daemon(p.base)
+    d.boot_at = time.time() - 300
+    tid = p.db.add_task("build", "build the thing", kind="work", tier="light", origin="user")
+    _lost_with_session(p, d, tmp_path, tid, cost=0.6)
+    assert abs(p.db.task(tid)["spent_usd"] - 0.6) < 1e-6
+    monkeypatch.setenv("TTP_FAKE_COST", "0.9")   # the session's total after the resume
+    d.dispatch()
+    _finish_runs(p, d)
+    run = p.db.one("SELECT * FROM runs WHERE task=? ORDER BY id DESC LIMIT 1", (tid,))
+    assert json.loads(run["note"])["resumes"]["session"] == "s1"
+    assert abs(run["cost_usd"] - 0.3) < 1e-6 and abs(p.db.task(tid)["spent_usd"] - 0.9) < 1e-6
+
+
+# A resume cut by the network keeps its session and carries the work of the runs it continued.
+
+def _net_run(d, tid, status, started, ended, cost, note, cwd):
+    rid = d.p.db.x("INSERT INTO runs(task,role,provider,model,started,ended,status,cost_usd,boot_id,note) "
+                   "VALUES(?,'worker','claude','opus',?,?,?,?,?,?)",
+                   (tid, started, ended, status, cost, d.boot, json.dumps(note)))
+    run_dir = d.p.runs / str(rid)
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text(json.dumps({"cwd": str(cwd), "env": {}}))
+    d.p.db.x("UPDATE runs SET dir=? WHERE id=?", (str(run_dir), rid))
+    return rid, run_dir
+
+
+def _net_cut(run_dir):
+    ev = {"type": "result", "subtype": "success", "is_error": True, "result": ENOTFOUND, "num_turns": 1,
+          "total_cost_usd": 0, "usage": {"input_tokens": 0, "output_tokens": 0}}
+    (run_dir / "output.jsonl").write_text(json.dumps(ev) + "\n")
+    (run_dir / "stderr.log").write_text("")
+
+
+def test_resume_lost_to_network_keeps_session(env, tmp_path, net, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dm
+    d = dm.Daemon(p.base)
+    now = time.time()
+    tid = p.db.add_task("t", "", kind="work", tier="standard", priority=3, budget_usd=8.0, labels=[])
+    lost_note = {"session_id": "S", "not_waste": "sleep", "lost_to_sleep": True}
+    first, _ = _net_run(d, tid, "lost", now - 9000, now - 1000, 1.66, lost_note, tmp_path)
+    p.db.update_task(tid, status="running")
+    rid, run_dir = _net_run(d, tid, "running", now - 60, None, 0, {"resumes": {"run": first, "session": "S"}},
+                            tmp_path)
+    _net_cut(run_dir)   # the CLI failed before it reported a session or any tokens
+    d.finish_run(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)),
+                 {"rc": 1, "started": now - 60, "ended": now, "stopped": None, "slept_s": 0.0})
+    run, task = p.db.one("SELECT * FROM runs WHERE id=?", (rid,)), p.db.task(tid)
+    note = json.loads(run["note"])
+    assert run["status"] == "lost" and note["lost_to_network"] and note.get("not_waste") == "network"
+    assert note["session_id"] == "S"
+    assert task["status"] == "queued" and int(task["attempts"] or 0) == 0
+    # The next start resumes the same session: the cut resume carries the work of the run it continued.
+    monkeypatch.setattr(dm, "get_provider", lambda name: type("P", (), {
+        "resume_args": lambda self, s: ["--resume", s], "session_saved": lambda self, s, c, e=None: True})())
+    lost = d._resumable(p.db.task(tid), "claude")
+    assert lost and lost["session"] == "S" and lost["run"] == rid
+
+
+def test_resume_losses_still_capped(env, tmp_path, net):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    cap = int(d.cfg["budget"].get("max_reboot_losses", 3))
+    tid = p.db.add_task("t", "", kind="work", tier="standard", priority=3, budget_usd=8.0, labels=[])
+    for i in range(cap + 1):
+        now = time.time()
+        p.db.update_task(tid, status="running")
+        rid, run_dir = _net_run(d, tid, "running", now - 60 + i * 0.001, None, 0,
+                                {"resumes": {"run": 1, "session": "S"}}, tmp_path)
+        _net_cut(run_dir)
+        d.finish_run(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)),
+                     {"rc": 1, "started": now - 60, "ended": now, "stopped": None, "slept_s": 0.0})
+    assert int(p.db.task(tid)["attempts"] or 0) >= 1, "past the cap a network loss counts an attempt"
