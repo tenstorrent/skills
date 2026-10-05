@@ -41,7 +41,12 @@ against `main` to detect drift. Extract without starting the container —
 `docker create` + `docker cp`, never `docker run`:
 
 ```bash
-SPEC_IN_IMG=${MODEL_SPECS_JSON_PATH:-/home/container_app_user/model_specs/model_spec.json}
+# The image's OWN env var, never the caller's host shell env — a host-side
+# MODEL_SPECS_JSON_PATH (e.g. an override path) does not exist inside the image,
+# and docker cp against it fails.
+SPEC_IN_IMG=$(docker inspect "$IMG" --format '{{range .Config.Env}}{{println .}}{{end}}' \
+  | sed -n 's/^MODEL_SPECS_JSON_PATH=//p')
+SPEC_IN_IMG=${SPEC_IN_IMG:-/home/container_app_user/model_specs/model_spec.json}
 C=$(docker create "$IMG" true) && docker cp "$C:$SPEC_IN_IMG" $SCRATCH/image_spec.json; docker rm -f "$C" >/dev/null
 python3 -c "
 import json;d=json.load(open('$SCRATCH/image_spec.json'))
@@ -49,9 +54,8 @@ print('image_release=',d['release_version'],'schema=',d['schema_version'],'model
 ```
 
 The in-image path is the image's own `MODEL_SPECS_JSON_PATH` env var —
-verified `/home/container_app_user/model_specs/model_spec.json` on 0.20.0.
-Read it from the image rather than hard-coding:
-`docker inspect "$IMG" --format '{{range .Config.Env}}{{println .}}{{end}}' | grep MODEL_SPECS_JSON_PATH`.
+verified `/home/container_app_user/model_specs/model_spec.json` on 0.20.0, used
+above only as the fallback when the image declares no such var.
 
 **Two variable names exist and they are not interchangeable.** The image ENV
 is `MODEL_SPECS_JSON_PATH`. The failure signature that killed the 0.10.0 run

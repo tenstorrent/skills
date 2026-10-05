@@ -34,6 +34,41 @@ echo "==V4"; curl -s "$EP/v1/completions" -H 'Content-Type: application/json' -d
 
 echo "==V5"; curl -s "$EP/v1/completions" -H 'Content-Type: application/json' -d \
   '{"model":"'"$MODEL"'","prompt":"1 2 3 4 5 6 7 8","temperature":0,"max_tokens":10}'
+
+echo "==V6"; curl -s "$EP/v1/chat/completions" -H 'Content-Type: application/json' -d \
+  '{"model":"'"$MODEL"'","temperature":0,"max_tokens":700,"enable_thinking":false,"messages":[
+    {"role":"user","content":"Write a Python function fib(n) returning the first n Fibonacci numbers as a list, starting [1,1,2,3,...]. Reply with ONLY a fenced python code block, nothing else."}
+  ]}' -o "$SCRATCH/v6.json"
+python3 - "$SCRATCH/v6.json" <<'PY'
+import json, re, subprocess, sys, tempfile, textwrap
+reply = json.load(open(sys.argv[1]))['choices'][0]['message']['content']
+m = re.search(r"```(?:python)?\n(.*?)```", reply, re.S)
+if not m:
+    print("v6_check=no fenced code block in reply"); raise SystemExit
+code = m.group(1)
+# Static gate before anything executes: reject code that reaches outside pure
+# computation (I/O, network, process, dynamic exec) rather than running it blind.
+banned = ("import os", "import sys", "import subprocess", "import socket",
+          "open(", "eval(", "exec(", "__import__")
+hit = next((b for b in banned if b in code), None)
+if hit:
+    print(f"v6_check=REFUSED: generated code contains {hit!r}, not executed"); raise SystemExit
+probe = code + "\nprint(fib(10))"
+with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
+    f.write(probe); path = f.name
+# Execute in a separate, timeboxed subprocess -- never exec() in this process --
+# so a hang, crash, or unexpected resource use cannot touch the caller's state.
+try:
+    r = subprocess.run([sys.executable, "-I", path], capture_output=True, text=True, timeout=5)
+except subprocess.TimeoutExpired:
+    print("v6_check=REFUSED: timed out after 5s, not trusted"); raise SystemExit
+if r.returncode != 0:
+    print(f"v6_check=fails to run: {r.stderr.strip().splitlines()[-1] if r.stderr else 'unknown error'}")
+else:
+    want = [1,1,2,3,5,8,13,21,34,55]
+    got = eval(r.stdout.strip())  # a literal list the subprocess printed, not model output
+    print("v6_check=consistent" if got == want else f"v6_check=wrong output: {got}")
+PY
 ```
 
 ## Interpretation
@@ -74,9 +109,12 @@ echo "==V5"; curl -s "$EP/v1/completions" -H 'Content-Type: application/json' -d
   with `enable_thinking:false` (or a much larger budget); with thinking off
   the same prompt returned correct, consistent code. This defect was **not**
   in the original review — it was found by running the row.
-- V6: static-check the reply, don't eyeball it. Strip the code fence, `exec`
-  it, and call the function over a known range. "Looks like Fibonacci" is not
-  a check; `f(1..10) == [1,1,2,3,5,8,13,21,34,55]` is.
+- V6: static-check the reply, don't eyeball it, and never `exec()` a served
+  model's output in this process — a compromised or malfunctioning endpoint's
+  reply is untrusted input. Reject code that imports/opens/execs anything
+  outside pure computation, then run only the survivors in a timeboxed
+  subprocess and call the function over a known range. "Looks like Fibonacci"
+  is not a check; `f(1..10) == [1,1,2,3,5,8,13,21,34,55]` is.
 
 ## Status
 

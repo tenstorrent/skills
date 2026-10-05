@@ -25,7 +25,8 @@ Invoke `tt:verify` (Skill tool) when:
 
 Boundary: `tt:launch` owns everything before the server answers `/health`.
 `tt:verify` does not restart or reconfigure the server — a fix routes back to
-`tt:launch` (bad override) or `tt:run` (device-level recovery). `tt:retrieve`'s
+`tt:launch` (bad override) or `tt:run` (device-level recovery — **not yet
+shipped**; reset by hand with `tt-smi -r` until it exists). `tt:retrieve`'s
 captured spec entry is what V2/V9's "expected" values are checked against —
 read it rather than assuming the served config matches what was requested.
 
@@ -37,6 +38,7 @@ Shell state does not survive between Bash calls. Start every call with:
 SCRATCH=<session scratchpad>
 EP=${ENDPOINT:-http://localhost:8000}
 MODEL=<--model, or the model tt:launch reports running>
+DEV=<--device or D9, uppercase — needed for V23>
 CID=<container id from tt:launch, needed for V7,V9,V14,V21,V22>
 ```
 

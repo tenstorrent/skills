@@ -1,9 +1,9 @@
 ---
-"tt-deploy": minor
+"tt-serve-model": minor
 "tt-skills": minor
 ---
 
-Add the optional `tt-deploy` plugin with its `discover`, `retrieve`, `launch` and
+Add the optional `tt-serve-model` plugin with its `discover`, `retrieve`, `launch` and
 `verify` skills, covering all four stages of the model-deployment journey.
 
 `launch` diagnoses a model launch that is running, hanging, or has failed —
@@ -45,4 +45,4 @@ serve command). Read-only unless `--pull`.
 The shared `knowledge/` tree grows `hf-hub.md`, `hardware/boards.md` and
 `recipes/tt-inference-server/model-spec.md`, which the four skills cite.
 
-The finder catalogue gains `tt-deploy` alongside the other optional plugins.
+The finder catalogue gains `tt-serve-model` alongside the other optional plugins.

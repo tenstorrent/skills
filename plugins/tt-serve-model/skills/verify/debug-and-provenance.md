@@ -6,8 +6,8 @@ is needed — not part of the default happy-path pipeline.
 ## Commands
 
 ```bash
-echo "==V19"; curl -s "$EP/v1/completions" -d '{"model":"'"$MODEL"'","prompt":"'"$FAILING_PROMPT"'","temperature":0}'
-echo "==V20"; curl -s "$EP/v1/completions" -d '{"model":"'"$MODEL"'","prompt":"'"$FAILING_PROMPT"'"}'
+echo "==V19"; curl -s "$EP/v1/completions" -H 'Content-Type: application/json' -d '{"model":"'"$MODEL"'","prompt":"'"$FAILING_PROMPT"'","temperature":0}'
+echo "==V20"; curl -s "$EP/v1/completions" -H 'Content-Type: application/json' -d '{"model":"'"$MODEL"'","prompt":"'"$FAILING_PROMPT"'"}'
 echo "==V21"; diff <(python3 -c "import json;print(json.dumps(json.load(open('$OVERRIDE'))['model_specs']['$MODEL'],sort_keys=True))") \
                   <(python3 -c "import json;print(json.dumps(json.load(open('$SCRATCH/spec.json'))['model_specs']['$MODEL'],sort_keys=True))")
 
@@ -17,7 +17,9 @@ echo "==V22"; docker logs "$CID" 2>&1 \
   | sort -u | head -40
 
 echo "==V23"; E=$(ls $SCRATCH/entry_*.json 2>/dev/null | head -1)
-if [ -n "$E" ]; then
+if [ -z "${DEV:-}" ]; then
+  echo "V23 requires \$DEV (Resolve: --device or D9, uppercase) — not set"
+elif [ -n "$E" ]; then
   T=$(python3 -c "import json;t=json.load(open('$E'))['model_type'].lower();print('tts' if t=='text_to_speech' else t)")
   N=$(python3 -c "import json;print(json.load(open('$E'))['model_name'])")
   DOCP="docs/model_support/$T/${N}_${DEV,,}.md"
@@ -39,7 +41,7 @@ echo "==V25"; curl -s "https://api.github.com/repos/tenstorrent/tt-metal/compare
 | V20 | Is it the chat template? | re-run via `/v1/completions` instead of `/v1/chat/completions` | reproduces → not the template |
 | V21 | Is it my own override? | byte/structural diff of the injected spec entry vs upstream | `matches upstream` or names the diverging field |
 | V22 | Did the server warn quietly? | filtered grep of the container log | de-duplicated list of hits, or `none` |
-| V23 | Does the impl's own README validate this hardware? | fetch `docs/model_support/<model_type>/<model_name>_<dev>.md` | `validated on <DEV>` or `no page for <DEV> — validated elsewhere only, treat with suspicion` |
+| V23 | Does the impl's own README validate this hardware? | fetch `docs/model_support/<model_type>/<model_name>_<dev>.md` | `validated on <DEV>` / `no page for <DEV> — validated elsewhere only, treat with suspicion` / `requires $DEV — not set` |
 | V24 | Known upstream bug? | GitHub issue search for the symptom | list of issue numbers + state, or `none found` |
 | V25 | Does a published image contain the fix? | GitHub compare API, fix-SHA...**tt-metal**-SHA | `status: ahead/identical → contained` or `status: diverged → NOT contained`. NEVER decide this by comparing version-tag strings. |
 

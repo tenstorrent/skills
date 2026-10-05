@@ -78,10 +78,10 @@
       "category": "Developer Tools"
     },
     {
-      "name": "tt-deploy",
+      "name": "tt-serve-model",
       "source": {
         "source": "local",
-        "path": "./plugins/tt-deploy"
+        "path": "./plugins/tt-serve-model"
       },
       "policy": {
         "installation": "AVAILABLE",

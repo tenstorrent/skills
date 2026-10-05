@@ -107,7 +107,7 @@ Sources: docker logs <container> captured <ISO time>; static launch knowledge
 | Is it hanging, what step, what failure, timing, what got displaced, silent fallbacks (L1, L2, L4, L8, L9, L10) | `diagnose.md` |
 | Mandatory flags, override selection and safety (L3, L5, L6, L7) | `override.md` |
 | What the image/spec *should* look like (docker image tag, mandatory flags, gating) | invoke `tt:retrieve` |
-| Acting on a failure (reset, restart) | invoke `tt:run` |
+| Acting on a failure (reset, restart) | invoke `tt:run` — **not yet shipped**; until it exists, reset by hand (`tt-smi -r`, then relaunch) |
 | Server finally answers `/health` | hand off to `tt:verify` |
 
 ## Note on shared knowledge

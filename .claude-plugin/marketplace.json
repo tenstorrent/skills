@@ -36,8 +36,8 @@
       "description": "A coding agent with Tenstorrent operating principles: takes notes all the time, learns when needed, keeps the diff minimal."
     },
     {
-      "name": "tt-deploy",
-      "source": "./plugins/tt-deploy",
+      "name": "tt-serve-model",
+      "source": "./plugins/tt-serve-model",
       "description": "Diagnose a model launch and verify a running server on Tenstorrent hardware, deterministically and evidence-based."
     }
   ]

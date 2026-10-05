@@ -101,4 +101,4 @@ Comparisons (D11) state both sides and the verdict. Unknowns say `unknown:
 | Deployable models, gating, disk budget, clean-box | `models.md` |
 | Board type → ASIC count → device string | `knowledge/hardware/boards.md` |
 | Recording the table | invoke `tt:note` |
-| Acting on a reset verdict | invoke `tt:run` |
+| Acting on a reset verdict | invoke `tt:run` — **not yet shipped**; reset by hand with `tt-smi -r` until it exists |

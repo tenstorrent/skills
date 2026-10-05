@@ -100,7 +100,7 @@ Install or enable it only after the user chooses it:
 - **Claude Code:** run `/plugin install tt-buddy@tenstorrent-skills` after adding the
   `tenstorrent/skills` marketplace.
 
-## `tt-deploy`
+## `tt-serve-model`
 
 Use for any stage of deploying a model on Tenstorrent hardware, from an untouched host to a server
 answering `/health`. Four skills, one per stage:
@@ -131,7 +131,7 @@ running server is actually working. Route model bring-up (writing a new TTNN mod
 
 Install or enable it only after the user chooses it:
 
-- **Codex / ChatGPT desktop:** select `tt-deploy` under **Tenstorrent Skills** in the Plugins
+- **Codex / ChatGPT desktop:** select `tt-serve-model` under **Tenstorrent Skills** in the Plugins
   Directory.
-- **Claude Code:** run `/plugin install tt-deploy@tenstorrent-skills` after adding the
+- **Claude Code:** run `/plugin install tt-serve-model@tenstorrent-skills` after adding the
   `tenstorrent/skills` marketplace.

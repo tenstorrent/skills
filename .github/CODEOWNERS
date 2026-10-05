@@ -28,4 +28,4 @@
 /plugins/tt-buddy/ @ppetrovicTT
 
 # Model-deployment lifecycle (launch, verify; discover/retrieve to follow)
-/plugins/tt-deploy/ @ctr-fmamedov-crypto @ndalyTT
+/plugins/tt-serve-model/ @ctr-fmamedov-crypto @ndalyTT

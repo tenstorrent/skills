@@ -22,12 +22,23 @@ docker logs --timestamps --tail 200 "$CID" > "$SCRATCH/launch-tail.txt" 2>&1
 docker ps --format '{{.Names}}\t{{.Ports}}\t{{.Status}}' > "$SCRATCH/docker-ps.txt"
 
 cat "$SCRATCH/launch-state.txt"
-grep -vE 'loggers\.py|Avg prompt throughput' "$SCRATCH/launch-tail.txt" | tail -n 5
+# The last 200 raw lines can ALL be engine-stats on a long-running healthy
+# server (one every 10s = 2000s of nothing else) -- grepping that window for
+# non-stat lines then finds none. Grep the full captured log instead, so the
+# last real event is found regardless of how long the stats streak is.
+LAST_NON_STAT=$(grep -vE 'loggers\.py|Avg prompt throughput' "$SCRATCH/launch-log.txt" | tail -n 5)
+if [ -n "$LAST_NON_STAT" ]; then
+  echo "$LAST_NON_STAT"
+else
+  echo "no non-stat line in the full captured log: unavailable"
+fi
 ```
 
-`launch-tail.txt` is what L1 reads. A healthy server emits an engine-stats
-line every 10 s, so on a long-running container the full log reaches tens of
-thousands of lines and a plain `tail` of a grep returns nothing but stats.
+`launch-tail.txt` is the bounded window L2's stage-marker grep runs against
+(cheap, recent-history only). L1's "last non-stat line" question reads the
+full `launch-log.txt` instead, specifically because a healthy server emits an
+engine-stats line every 10 s, so on a long-running container the last 200
+lines can be stats end to end.
 
 ## Stage markers (L2)
 
@@ -63,7 +74,7 @@ also no distinct "shard read" stage.
 
 | ID | Question | Read | Answer format |
 |---|---|---|---|
-| L1 | Slow or hanging? | last non-stats line in `launch-tail.txt` vs now, against the stage table | `<stage> in progress, <n>s since last line (normal)` or `no output for <n>s at <stage> — investigate` |
+| L1 | Slow or hanging? | last non-stats line in the full `launch-log.txt` vs now, against the stage table | `<stage> in progress, <n>s since last line (normal)` / `no output for <n>s at <stage> — investigate` / `unavailable: no non-stat line in the full captured log` |
 | L2 | All launch steps | stage markers above; static chain only as fallback | ordered stage list with elapsed per stage, and the `has_builtin_warmup` branch stated |
 | L4 | Failure class | grep `$SCRATCH/launch-log.txt` against the signatures below | one of the named signatures + fix, or `unknown failure: <tail>` |
 | L8 | Timing / where it goes | elapsed since `started=` mapped onto the stage table | per-phase elapsed table, not a single range |
@@ -154,10 +165,14 @@ Before L10 existed these were only caught by `verify` V22, i.e. after
 
 - L1: silence is not failure. Kernel JIT/tilize is legitimately quiet for
   minutes at a time — always check the stage table before calling it stuck.
-- **L1 must read a bounded capture.** `docker logs` on a healthy server grew
-  to tens of thousands of engine-stats lines in 35 minutes; use `--tail` (or
-  `--since`) and filter `loggers.py` before taking the last line, or L1
-  reports the stats line as "the last thing that happened" forever.
+- **L1 must grep the full capture, not a `--tail`-bounded one.** `docker
+  logs` on a healthy server grew to tens of thousands of engine-stats lines
+  in 35 minutes, one every 10s — a `--tail 200` window can be stats end to
+  end, and filtering `loggers.py` out of *that* leaves nothing, so L1 would
+  report "unavailable" on a perfectly healthy server. Capture once (`docker
+  logs` to a file is one call, not repeated polling), then grep the saved
+  file for the last non-stat line; only that line reaches the agent's
+  context, so this stays bounded without being wrong.
 - L4: signatures are mostly mutually exclusive; if two match, report both and
   let the agent judge which is proximate. A match against none of them is
   itself a new signature to add here, not a dead end.
