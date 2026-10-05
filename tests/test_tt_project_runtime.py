@@ -8623,6 +8623,32 @@ def test_a_push_that_died_in_a_reboot_says_so(env, monkeypatch):
     assert "the host rebooted while it ran" in json.loads(marker.read_text())["reason"]
 
 
+def test_a_malformed_queued_push_marker_is_recorded_as_failed_and_the_tick_goes_on(env):
+    """A queued marker the daemon cannot use (a non-numeric queued time, no repo or log, an env that
+    is not a dict) is recorded as a failed push with the reason, and the rest of the tick still runs."""
+    from ttp import push
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    folder = p.state / push.DETACHED
+    folder.mkdir(parents=True)
+    now = time.time()
+    bad = {"a-queued": {"queued": "soon"},
+           "b-repo": {"queued": now, "log": str(folder / "b-repo.log")},
+           "c-log": {"queued": now, "repo": str(p.root)},
+           "d-env": {"queued": now, "repo": str(p.root), "log": str(folder / "d-env.log"), "env": ["X=1"]}}
+    for rid, m in bad.items():
+        (folder / f"{rid}.json").write_text(json.dumps({"id": rid, "status": "queued", **m}))
+    tid = p.db.add_task("after the pushes", "s", kind="work", tier="light", origin="user")
+    d.tick()
+    assert p.db.q("SELECT id FROM runs WHERE task=?", (tid,)), "a malformed push marker stopped the tick"
+    for rid in bad:
+        m = json.loads((folder / f"{rid}.json").read_text())
+        assert m["status"] == "failed" and m["exit"] is None and "malformed" in m["reason"], m
+    d.tick()                             # recorded once: never retried or raised again
+    assert all(json.loads((folder / f"{rid}.json").read_text())["status"] == "failed" for rid in bad)
+
+
 def test_runs_carry_the_daemons_pid_namespace(env):
     from ttp import push
     from ttp.daemon import Daemon

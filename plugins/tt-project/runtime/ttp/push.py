@@ -1015,26 +1015,47 @@ def tend(p: Project) -> None:
     """The daemon's part, each tick: start the queued pushes and record the dead ones as failed."""
     folder = p.state / DETACHED
     for marker in sorted(folder.glob("*.json")) if folder.is_dir() else []:
-        m = _settle(marker)
-        if m.get("status") != "queued":
-            continue
-        lock = locks.try_take([_run_lock(marker)], f"detached push {m.get('id')}", "ttp push --detach (daemon)")
-        if lock is None:
-            continue
         try:
-            m = _read(marker)
-            if m.get("status") != "queued":
-                continue
-            env = {**os.environ, **(m.get("env") or {})}
-            env.update(git_fsync_env(env))
-            try:
-                _start(p, marker, m, lock, env)
-            except OSError as e:   # its worktree went, say: recorded, never retried each tick
-                m.update(status="failed", exit=None, ended=time.time(),
-                         reason=f"the daemon could not start the push: {e}")
-                write_json(marker, m)
-        finally:
-            lock.close()
+            _tend_one(p, marker)
+        except Exception as e:   # a malformed marker: recorded as failed, never aborts the daemon's tick
+            _malformed(marker, e)
+
+
+def _tend_one(p: Project, marker: Path) -> None:
+    m = _settle(marker)
+    if m.get("status") != "queued":
+        return
+    lock = locks.try_take([_run_lock(marker)], f"detached push {m.get('id')}", "ttp push --detach (daemon)")
+    if lock is None:
+        return
+    try:
+        m = _read(marker)
+        if m.get("status") != "queued":
+            return
+        env = {**os.environ, **(m.get("env") or {})}
+        env.update(git_fsync_env(env))
+        try:
+            _start(p, marker, m, lock, env)
+        except OSError as e:   # its worktree went, say: recorded, never retried each tick
+            m.update(status="failed", exit=None, ended=time.time(),
+                     reason=f"the daemon could not start the push: {e}")
+            write_json(marker, m)
+    finally:
+        lock.close()
+
+
+def _malformed(marker: Path, e: Exception) -> None:
+    """Record a queued push the daemon could not handle as failed, so it is skipped from now on."""
+    m = _read(marker)
+    if m.get("status") != "queued":
+        return
+    m.update(status="failed", exit=None, ended=time.time(),
+             reason=f"the daemon could not start the push: malformed marker ({type(e).__name__}: {e})")
+    try:
+        write_json(marker, m)
+    except OSError:
+        pass
+    _forget_lock(marker)
 
 
 def result(marker: Path) -> int:
