@@ -313,15 +313,54 @@ def test_web_js_parses_on_old_node():
         assert r.returncode == 0, f"{f.name}: {r.stderr}"
 
 
+# A path token ending in harness/bin made only of literal relative segments: `harness/bin/ttp`,
+# `tt-project/harness/bin/ttp`, `./harness/bin`. A token anchored on a root (`/abs/...`, `~/...`,
+# `$TTP_PROJECT/...`, `${X}/...`, `{dir}/{FOLDER}/...`, `%s/...`) does not match, and neither does
+# code such as `p.harness / "bin"`.
+ROOT_RELATIVE_HARNESS_BIN = re.compile(r"(?<![\w$}/.%~-])(?:[\w.-]+/)*harness/bin\b")
+# (path relative to the plugin, exact line text stripped) -> why the line may say it. Keep it short.
+ROOT_RELATIVE_HARNESS_BIN_ALLOW: dict[tuple[str, str], str] = {}
+
+
+def shipped_text_files():
+    """Tracked plugin files that decode as text: prompts, skills, runtime .py and scripts."""
+    import subprocess
+    out = subprocess.run(["git", "ls-files", "-z", "--", "."], cwd=PLUGIN, capture_output=True,
+                         text=True, check=True).stdout
+    for rel in sorted(filter(None, out.split("\0"))):
+        path = PLUGIN / rel
+        if not path.is_file():
+            continue
+        try:
+            yield rel, path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+
+
+def test_root_relative_harness_bin_pattern():
+    for line in ("run tt-project/harness/bin/ttp note x", "`harness/bin/ttp lock`",
+                 'cmd = "tt-project/harness/bin/ttp"', "./harness/bin/gh", "x=harness/bin"):
+        assert ROOT_RELATIVE_HARNESS_BIN.search(line), line
+    for line in ('"$TTP_PROJECT/harness/bin/ttp" note', "${TTP_PROJECT}/harness/bin/ttp",
+                 "f\"{entry['dir']}/{FOLDER}/harness/bin/ttp\"", "f\"{root}/tt-project/harness/bin\"",
+                 "/abs/proj/tt-project/harness/bin/ttp", "~/proj/tt-project/harness/bin",
+                 "'%s/harness/bin' % root", 'ttp = p.harness / "bin" / "ttp"',
+                 "f\"{self.p.harness / 'bin'}:{path}\"", "<project>/harness/bin/ttp",
+                 "harness/binary"):
+        assert not ROOT_RELATIVE_HARNESS_BIN.search(line), line
+
+
 def test_shipped_text_never_uses_root_relative_harness_bin_paths():
     """Workers run in tt-project/worktrees/<task>, where `tt-project/harness/bin/...` does not
-    resolve; shipped prompts and skills must use "$TTP_PROJECT/harness/bin/..." instead."""
-    bad = re.compile(r'(?<![\w/}$"])tt-project/harness/bin/')
+    resolve; shipped prompts, skills, runtime strings and scripts must use
+    "$TTP_PROJECT/harness/bin/..." or a path anchored on the project root instead."""
+    files = dict(shipped_text_files())
+    # The scan must reach runtime code and suffixless scripts, not only prompt files.
+    assert "runtime/ttp/cli.py" in files and "template/bin/ttp" in files
     hits = []
-    for path in sorted(PLUGIN.rglob("*")):
-        if path.suffix not in {".md", ".txt", ".j2", ".tmpl", ".sh"} or not path.is_file():
-            continue
-        for n, line in enumerate(path.read_text(errors="replace").splitlines(), 1):
-            if bad.search(line):
-                hits.append(f"{path.relative_to(PLUGIN)}:{n}: {line.strip()}")
+    for rel, text in files.items():
+        for n, line in enumerate(text.splitlines(), 1):
+            if ROOT_RELATIVE_HARNESS_BIN.search(line) and \
+                    (rel, line.strip()) not in ROOT_RELATIVE_HARNESS_BIN_ALLOW:
+                hits.append(f"{rel}:{n}: {line.strip()}")
     assert not hits, "root-relative harness/bin paths:\n" + "\n".join(hits)
