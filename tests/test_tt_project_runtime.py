@@ -14878,7 +14878,7 @@ def test_notes_to_another_project_are_deduped_and_rate_limited(env, monkeypatch,
 def test_the_worker_hook_allows_a_note_to_another_project(env, monkeypatch, tmp_path):
     from ttp import hook
     monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path))
-    for cmd in ('ttp note --to trays "upstream: the hook blocks ttp say"',
+    for cmd in ('ttp note --to otherproj "upstream: the hook blocks ttp say"',
                 "ttp note --to other --severity low 'cache is stale'"):
         out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": cmd}})
         assert out is None, cmd
