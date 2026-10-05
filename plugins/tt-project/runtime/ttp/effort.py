@@ -20,11 +20,12 @@ import re
 import time
 
 from . import jevuse
-from .db import DB
+from .db import DB, dump_result
 
 JEV_USE = "effort"
 SHORT_SPEC = 800    # characters: a longer spec is not a lookup
 RETRY_FAILED = ("failed", "no_handoff")   # the previous run's outcomes a deep retry follows
+RAISED = "effort_raised_at"   # in the task's result: the attempt count its failed try was already raised at
 LOOKUP = re.compile(r"(?i)\b(check|look ?up|find|list|show|status|what|which|where|whether|how many|count|"
                     r"report|summari[sz]e|read|confirm|verify)\b")
 CHANGES = re.compile(r"(?i)\b(fix|implement|change|edit|write|refactor|add|remove|delete|update|deploy|push|"
@@ -57,7 +58,8 @@ UP = {"light": "standard", "standard": "deep"}
 def retry_tier(db: DB, task: dict) -> str | None:
     """One tier up when this start retries a light or standard try that failed (its last run handed off
     `failed` or ended without a hand-off, or the task continues one that failed): deep only after a
-    failed standard try. None otherwise."""
+    failed standard try. None otherwise. A failed try raises the tier once: a start that is requeued
+    without spending an attempt keeps the failed result, so `mark_raised` notes the raise in it."""
     up = UP.get(task.get("tier") or "")
     if task.get("kind") == "review" or not up:
         return None
@@ -65,14 +67,28 @@ def retry_tier(db: DB, task: dict) -> str | None:
         last = json.loads(task.get("result") or "{}")
     except (TypeError, ValueError):
         last = {}
-    if int(task.get("attempts") or 0) and isinstance(last, dict) and last.get("status") in RETRY_FAILED:
-        return up
+    attempts = int(task.get("attempts") or 0)
+    if attempts and isinstance(last, dict) and last.get("status") in RETRY_FAILED:
+        return up if last.get(RAISED) != attempts else None
     for label in _labels(task):
         if label.startswith("continues:") and label[10:].isdigit():
             old = db.task(int(label[10:]))
             if old and old["status"] == "failed" and old["tier"] == task["tier"]:
                 return up
     return None
+
+
+def mark_raised(task: dict) -> str | None:
+    """The task's result noting that its failed try has been raised, or None when the raise did not
+    come from its result (a continued task starts at its raised tier, which already stops a second raise)."""
+    try:
+        last = json.loads(task.get("result") or "{}")
+    except (TypeError, ValueError):
+        return None
+    attempts = int(task.get("attempts") or 0)
+    if not attempts or not isinstance(last, dict) or last.get("status") not in RETRY_FAILED:
+        return None
+    return dump_result({**last, RAISED: attempts})
 
 
 def tier_cost(db: DB, cfg: dict, provider: str, tier: str) -> float | None:

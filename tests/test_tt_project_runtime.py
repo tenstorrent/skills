@@ -731,6 +731,29 @@ def test_jev_picks_effort_once_logs_it_with_the_run_and_deep_comes_only_on_a_ret
     assert row["outcome"] == "wrong" and "after 2 attempt" in row["note"]
 
 
+def test_effort_retry_raises_once_per_failed_try_when_a_start_is_requeued(env, monkeypatch):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    d.jev = None
+    monkeypatch.setattr(d, "_workdir_for", lambda t: (str(p.base), None))
+    tiers = []
+
+    def start(*a, **k):
+        tiers.append(a[3])
+        if len(tiers) == 1:
+            raise OSError("no space left")
+        return 0
+    monkeypatch.setattr(d, "start_run", start)
+    t = p.db.add_task("Look it up", "x", kind="work", tier="light", origin="coordinator", provider="claude")
+    p.db.update_task(t, attempts=1, result=json.dumps({"status": "failed", "summary": "not found"}))
+    d.dispatch()   # raised to standard, but the run never starts: no attempt is spent
+    assert tiers == ["standard"] and p.db.task(t)["status"] == "queued" and p.db.task(t)["attempts"] == 1
+    p.db.update_task(t, not_before=None)
+    d.dispatch()
+    assert tiers == ["standard", "standard"] and p.db.task(t)["tier"] == "standard"
+
+
 def test_effort_falls_back_to_rules_and_leaves_other_tasks_alone(env, monkeypatch):
     p = make(env)
     from ttp import effort

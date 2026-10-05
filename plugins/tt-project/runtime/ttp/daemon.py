@@ -1928,7 +1928,8 @@ class Daemon:
             return None
         if picked["tier"] != task["tier"]:
             log(self.p, f"task {task['id']}: tier {task['tier']} -> {picked['tier']} ({picked['by']})")
-            self.p.db.update_task(task["id"], tier=picked["tier"])
+            marked = effort.mark_raised(task) if picked["by"] == "retry" else None
+            self.p.db.update_task(task["id"], tier=picked["tier"], **({"result": marked} if marked else {}))
         return picked
 
     def _resumable(self, task: dict, provider: str) -> dict | None:
