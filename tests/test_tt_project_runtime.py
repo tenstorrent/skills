@@ -7763,17 +7763,16 @@ def test_local_only_check_runs_off_the_tick_and_a_later_tick_applies_it(env, mon
     from ttp import daemon as dm
     tid = _done_code_task_on(p, "ttp/t1-example")
     d = _local_only_daemon(p)
-    go, calls = threading.Event(), []
+    go, calls, on_tick = threading.Event(), [], []
 
     def slow(repo, branches, targets=(), known=frozenset(), timeout_s=0, pushed=frozenset()):
         calls.append(branches)
+        on_tick.append(threading.current_thread() is threading.main_thread())
         go.wait(10)
         return {"ttp/t1-example": ("abc1234", 2)}, True, {}
     monkeypatch.setattr(dm.worktree, "local_only", slow)
     monkeypatch.setattr(dm.worktree, "base_ref", lambda p: "main")
-    t0 = time.monotonic()
     d.check_local_only()
-    assert time.monotonic() - t0 < 2             # the tick does not wait for git
     d.check_local_only()                         # still running: neither applied nor started again
     assert p.db.kv(dm.KV_LOCAL_ONLY) is None and d._local_only_job is not None
     go.set()
@@ -7782,6 +7781,7 @@ def test_local_only_check_runs_off_the_tick_and_a_later_tick_applies_it(env, mon
     assert [e["task"] for e in _local_only_events(p)] == [tid]
     d.check_local_only()                         # not due again for an hour
     assert len(calls) == 1 and d._local_only_job is None
+    assert on_tick == [False], "the tick waited for git"
 
 
 def test_local_only_check_that_raises_in_its_thread_is_logged_and_not_left_running(env, monkeypatch):
@@ -15929,7 +15929,7 @@ target=$2
 echo "$target" >> {shlex.quote(str(fake['log']))}
 mode=$(cat {shlex.quote(str(fake['mode']))} 2>/dev/null)
 [ "$mode" = down ] && {{ echo "ssh: connect to host $target: Network is unreachable" >&2; exit 255; }}
-[ "$mode" = hang ] && {{ sleep 30; exit 0; }}
+[ "$mode" = hang ] && {{ sleep 300; exit 0; }}
 mkdir -p {shlex.quote(str(remote))}/$target/.tt-project
 HOME={shlex.quote(str(remote))}/$target TTP_HOME={shlex.quote(str(remote))}/$target/.tt-project TTP_HOST=$target \\
   PATH={shlex.quote(str(bin_dir))}:$PATH sh -c "$last"
@@ -16065,16 +16065,28 @@ def test_a_hung_ssh_never_holds_up_the_daemon_tick(env, monkeypatch):
     fake["mode"].write_text("hang")
     monkeypatch.setattr(upstream, "FORWARD_EVERY_S", 0)
     monkeypatch.setattr(upstream, "FORWARD_TIMEOUT_S", 1)
+    # No wall-clock limits, so a loaded machine cannot fail it: the ssh is held until the tick has
+    # returned (off the tick's thread only; on it, it runs at once and the asserts below fail).
+    real, go, ran_on = upstream.ssh_pipe, threading.Event(), []
+
+    def held(*a):
+        ran_on.append((threading.current_thread(), a[0]))
+        if threading.current_thread() is not threading.main_thread():
+            go.wait(60)
+        return real(*a)
+    monkeypatch.setattr(upstream, "ssh_pipe", held)
     d = Daemon(p.base)
-    t0 = time.monotonic()
     d.forward_upstream()
-    assert time.monotonic() - t0 < 0.5, "the tick waited on ssh"
+    first = d._forwarder
+    assert first and first.is_alive(), "the tick waited on ssh"
     d.forward_upstream()                 # a pass still running is not started twice
-    d._forwarder.join(15)
-    assert not d._forwarder.is_alive() and time.monotonic() - t0 < 10, "the hung ssh was not cut off"
+    assert d._forwarder is first
+    go.set()
+    first.join(60)                       # the fake ssh hangs 300 s: only its 1 s timeout ends the pass
+    assert not first.is_alive(), "the hung ssh was not cut off"
+    assert ran_on == [(first, "example-host")], "ssh ran on the tick's thread, or more than once"
     st = json.loads(upstream.forward_path().read_text())["targets"]["example-host"]
     assert "no answer within 1 s" in st["last_error"] and not st.get("cursor")
-    assert _ssh_calls(fake) == ["example-host"]
 
 
 
@@ -21239,15 +21251,20 @@ def test_this_machine_pushes_its_spend_in_the_background_and_a_failed_push_never
     assert gcap.setting_problems({"push_spend_to": "everywhere"})
     set_account_setting("budget.push_spend_to", None)
     # A hung push runs in the background: the tick goes on and the gate is worked out meanwhile.
-    gate = threading.Event()
-    monkeypatch.setattr(upstream, "ssh_pipe", lambda *a: gate.wait(30) and (None, "late"))
+    gate, on_tick = threading.Event(), []
+
+    def hung(*a):
+        on_tick.append(threading.current_thread() is threading.main_thread())
+        return gate.wait(30) and (None, "late")
+    monkeypatch.setattr(upstream, "ssh_pipe", hung)
     gcap.push_state_path().unlink()
-    t0 = time.monotonic()
     gcap.refresh_async(b, time.time())
     g = bud.evaluate(p.db, p.config(), "claude", [], time.time())
-    assert time.monotonic() - t0 < 5 and "global_today" in g.numbers, g.numbers
+    assert "global_today" in g.numbers, g.numbers
+    assert gcap._THREAD["t"].is_alive(), "the tick waited for the push"
     gate.set()
     gcap._THREAD["t"].join(10)
+    assert on_tick == [False], "the push ran on the tick's thread"
 
 
 class _InlineThread:
