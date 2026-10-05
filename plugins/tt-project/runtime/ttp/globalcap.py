@@ -3,10 +3,11 @@
 """The account's day and the global daily cap: what every tt-project project billed to one account
 has spent today, on every machine tt-project can see.
 
-The day is fixed: it starts at `budget.day_start` ("HH:MM", default 08:00) in `budget.timezone` (an
-IANA zone, default UTC; never the host's own zone, since servers run on UTC) and lasts until the same
-wall-clock time the next day, so it is 23 or 25 hours long across a daylight-saving change. An empty
-`day_start` keeps the old rolling 24 hours. Weekly caps stay rolling 7 days.
+Once `budget.day_start` ("HH:MM") is set, the day is fixed: it starts at that time in
+`budget.timezone` (an IANA zone, default UTC; never the host's own zone, since servers run on UTC)
+and lasts until the same wall-clock time the next day, so it is 23 or 25 hours long across a
+daylight-saving change. The default, an empty `day_start`, keeps the rolling 24 hours. Weekly caps
+stay rolling 7 days. `budget.global_daily_usd` defaults to 0 (off).
 
 The global total for a provider counts, for this day:
 - this machine: every project in the registry (`ttp list`) whose host is this machine, read from its

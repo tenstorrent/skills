@@ -2090,9 +2090,8 @@ def test_status_shows_spend_waiting_retry_and_coordinator_health(env):
     lines = out.splitlines()
     assert len(lines) <= 25, out
     # The budget is one plain line; caps, top spenders and gate reasons are in the web app's Budget tab.
-    money = [ln for ln in lines if "$" in ln]
-    assert len(money) == 1 and re.fullmatch(
-        r"budget: today \$4\.50 this project, \$4\.50 of \$200 global - resets in \d+\.\d h", money[0]), out
+    assert "budget: 24h $4.50 actual" in lines, out
+    assert [ln for ln in lines if "$" in ln] == ["budget: 24h $4.50 actual"], out
     assert "top 7d" not in out and "spend:" not in out, out
     wait = [ln for ln in lines if "measure on a board" in ln]
     assert wait and "waiting, next try" in wait[0] and wait[0].count("next try") == 1, out
@@ -4506,7 +4505,6 @@ def test_estimates_use_the_projects_own_observed_rate(env):
 
 def test_dollar_caps_cover_the_whole_project(env):
     p = make(env)
-    p.set_config("budget.day_start", "")   # a rolling 24 h, whatever the hour the test runs
     from ttp import budget as bud
     two_hours_ago = time.time() - 7200          # outside the runaway guard's last hour
     for prov in ("claude", "codex"):
@@ -4525,7 +4523,6 @@ def test_dollar_caps_cover_the_whole_project(env):
 def test_plan_provider_spend_after_its_last_window_counts_toward_caps(env):
     # A provider that stops reporting windows may have moved to usage billing: its later spend counts.
     p = make(env)
-    p.set_config("budget.day_start", "")   # a rolling 24 h, whatever the hour the test runs
     from ttp import budget as bud
     now = time.time()
     p.db.x("INSERT INTO snapshots(ts,provider,account,window,utilization,resets_at) VALUES(?,?,?,?,?,?)",
@@ -19648,6 +19645,7 @@ def test_the_budget_day_starts_at_a_fixed_hour_in_its_zone_across_dst(env, monke
         p = make(env)
         now = utc(2026, 11, 1, 14, 0)          # 09:00 EST: the day began an hour ago
         p.set_config("budget.timezone", "America/New_York")
+        p.set_config("budget.day_start", "08:00")
         p.db.spend("fake", 90.0, "task:1", ts=now - 2 * 3600)   # yesterday's budget day
         p.db.spend("fake", 30.0, "task:2", ts=now - 1800)
         g = bud.evaluate(p.db, p.config(), "fake", [], now)
@@ -19747,6 +19745,7 @@ def _global_cap_setup(env, tmp_path, cap=10.0):
     p = make(env)
     project.set_account_setting("budget.global_daily_usd", cap)
     project.set_account_setting("budget.timezone", "America/New_York")
+    project.set_account_setting("budget.day_start", "08:00")
     return p, _other_project(tmp_path, "other")
 
 
@@ -19804,6 +19803,27 @@ def test_the_global_cap_alert_clears_by_itself_at_the_day_reset(env, tmp_path, m
     d.update_gates()
     assert d.gates["fake"].level != "red"
     assert not alerts.holds(p.db, "budget:fake", alert["ts"], clock[0])
+
+
+def test_without_budget_settings_the_caps_and_the_line_behave_as_before(env, tmp_path):
+    # Deploying the release changes nothing until someone sets the keys: no global cap, a rolling
+    # 24 h daily cap, and the old budget line.
+    p = make(env)
+    from ttp import budget as bud
+    from ttp.web import budget_line
+    b = p.config()["budget"]
+    assert (b["global_daily_usd"], b["day_start"], b["timezone"]) == (0, "", "UTC"), b
+    _other_project(tmp_path, "other").spend("fake", 5000.0, "task:1")   # other projects never count
+    now = time.time()
+    p.db.spend("fake", 50.0, "task:1", ts=now - 25 * 3600)        # outside the last 24 h
+    p.db.spend("fake", 30.0, "task:1", ts=now - 23 * 3600)        # inside it, whatever the hour
+    g = bud.evaluate(p.db, p.config(), "fake", [], now)
+    assert g.level == "green" and g.numbers["spent_24h"] == 30.0, (g.level, g.reasons)
+    assert not {"spent_today", "day_start", "global_today"} & set(g.numbers), g.numbers
+    assert budget_line(p.db, now, "fake", g.as_dict()) == "24h $30.00 actual"
+    p.db.spend("fake", 75.0, "task:1", ts=now - 7200)
+    g = bud.evaluate(p.db, p.config(), "fake", [], now)
+    assert g.level == "red" and any(r.startswith("cap reached: $105.00/24h of $100") for r in g.reasons), g.reasons
 
 
 def test_a_global_cap_of_zero_is_off(env, tmp_path):

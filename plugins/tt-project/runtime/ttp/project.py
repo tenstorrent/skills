@@ -44,9 +44,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # Usage-billed: all of the account's tt-project spend today, every project on every machine
         # tt-project can see (globalcap.py), stops new work at this many $ (0 = off). The day starts at
         # day_start ("HH:MM"; "" = rolling 24 h) in timezone (IANA name, never the host's own zone).
-        # Usually set once per machine for every project: `ttp config --account KEY VALUE`.
-        "global_daily_usd": 200.0,
-        "day_start": "08:00",
+        # Usually set once per machine for every project: `ttp config --account KEY VALUE`. Off and
+        # rolling by default, so a new release changes nothing until someone sets them.
+        "global_daily_usd": 0.0,
+        "day_start": "",
         "timezone": "UTC",
         "hourly_alarm_x": 4.0,          # spend rate this many times the 7-day hourly norm = runaway
         "max_parallel_workers": 6,          # on a plan, all of them run until the last stretch before the line
