@@ -9104,6 +9104,8 @@ def test_a_batch_is_due_after_the_window_at_the_cap_for_priority_one_or_with_no_
     first = [_pq_review(s)[1], _pq_review(s)[1]]
     rows, why = pushq.due(s.p, now)
     assert rows == [] and "waiting" in why
+    assert [(r["id"], r["branch"], r["target"], r["tries"]) for r in pushq.summary(s.p)["approved"]] == [
+        (first[0], s.branch, "origin/proj", 0), (first[1], s.branch, "origin/proj", 0)]
     rows, why = pushq.due(s.p, now + 901)
     assert [r["id"] for r in rows] == first and "waited" in why
     later = [_pq_review(s)[1], _pq_review(s)[1]]
@@ -9182,6 +9184,10 @@ def test_a_due_batch_starts_one_detached_process_that_holds_its_run_lock(env, mo
     assert s.p.db.one("SELECT target, finalized FROM push_batches") == {"target": "origin/proj", "finalized": None}
     assert pushq.due(s.p, time.time() + 10 ** 6)[0] == [], "one batch at a time"
     assert pushq.finalize(s.p) == [] and s.p.db.task(s.review)["status"] == "pushing"
+    sm = pushq.summary(s.p)
+    assert sm["on"] and sm["approved"] == [] and sm["last"] == []
+    assert (sm["live"]["id"], sm["live"]["phase"], sm["live"]["rows"], sm["live"]["target"]) == (bid, "push", 1,
+                                                                                               "origin/proj")
     release.write_text("")
     child.wait(timeout=30)
     assert locks.any_free([pathlib.Path(m["lock"])])
@@ -9212,6 +9218,10 @@ def test_a_pushed_batch_closes_the_review_done_without_any_model_run(env, monkey
     assert not [e for e in evs if e["status"] == "queued"], "a pushed review woke the coordinator"
     assert subprocess.run(["git", "-C", str(s.repo), "show-ref", "--verify", "--quiet", "refs/ttp/push/1"]).returncode, \
         "the pin of a pushed row of a finished task stays"
+    sm = pushq.summary(s.p)
+    assert sm["live"] is None and sm["approved"] == [] and sm["deaths"] == 0
+    assert [(b["id"], b["outcome"], b["pushed_sha"], b["version"], b["after_push"]) for b in sm["last"]] == [
+        (bid, "pushed", sha, "0.3.1", "skipped")]
     state = lambda: (s.p.db.q("SELECT * FROM push_queue"), s.p.db.q("SELECT * FROM push_batches"),  # noqa: E731
                      s.p.db.q("SELECT id FROM events"), s.p.db.task(s.review))
     before = state()
