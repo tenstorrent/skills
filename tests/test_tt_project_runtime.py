@@ -706,28 +706,35 @@ def _unused_port() -> int:
 def _start_web(p) -> int:
     """Serve p's web app in a thread (as its daemon does) and return its port once bound.
 
-    A port picked ahead of time can be taken by another process (e.g. a parallel pytest run)
-    before web.serve binds it; that serve thread then dies and another server answers. So wait
-    until this server recorded its bind and pick a fresh port if it failed."""
+    The server binds port 0 before its thread starts and keeps that socket: a port picked ahead of
+    time and freed again can be taken by a parallel pytest run before serve binds it, and the test
+    then talks to that run's server."""
     from ttp import web
-    for _ in range(20):
-        port = _unused_port()
-        p.set_config("web.port", port)
-        p.db.set_kv("web", None)
 
-        class Stub:
-            pass
-        stub = Stub()
-        stub.p = p
-        t = threading.Thread(target=web.serve, args=(stub,), daemon=True)
-        t.start()
-        for _ in range(100):
-            if (p.db.kv("web") or {}).get("port") == port:
-                return port
-            if not t.is_alive():
-                break
-            time.sleep(0.02)
-    raise AssertionError("the web app could not bind a port")
+    class Stub:
+        pass
+    stub = Stub()
+    stub.p = p
+    httpd = web.bind(stub, 0)
+    port = httpd.server_address[1]
+    p.set_config("web.port", port)
+    threading.Thread(target=web.serve, args=(stub, httpd), daemon=True).start()
+    return port
+
+
+def test_web_servers_started_together_never_share_a_port(env):
+    """Two web apps started at once each hold their own port and answer with their own project."""
+    from ttp import web
+    from ttp.cli import bootstrap
+    a = make(env)
+    repo2 = env["tmp"] / "repo2"
+    subprocess.run(["git", "clone", "-q", str(env["repo"]), str(repo2)], check=True)
+    b = bootstrap(repo2, "second", "Another project.", "fake")
+    ports = [_start_web(a), _start_web(b)]
+    assert ports[0] != ports[1]
+    for p, port in zip((a, b), ports):
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/api/state", headers={"X-TTP-Token": web.token(p)})
+        assert json.loads(urllib.request.urlopen(req, timeout=5).read())["project"]["name"] == p.name
 
 
 def test_web_api_requires_the_token(env):
@@ -14783,14 +14790,7 @@ def test_web_api_paths_use_their_own_connection_after_a_coordinator_turn(env):
                                      "key": "9.9.9 abc1234", "newer": True})
     upgrade = p.db.add_task(release.UPGRADE_TASK_TITLE, "merge it", kind="harness", origin="user")
     other = p.db.add_task("docs", "write them")
-    port = web.free_port(19760)
-    p.set_config("web.port", port)
-
-    class Stub:
-        pass
-    stub = Stub()
-    stub.p = p
-    threading.Thread(target=web.serve, args=(stub,), daemon=True).start()
+    port = _start_web(p)
     base, tok = f"http://127.0.0.1:{port}", web.token(p)
     for _ in range(50):
         try:

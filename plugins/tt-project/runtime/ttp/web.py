@@ -553,20 +553,30 @@ class Handler(BaseHTTPRequestHandler):
             db.close()
 
 
-def serve(daemon) -> None:
+def bind(daemon, port: int | None = None) -> ThreadingHTTPServer:
+    """Bind the web app's server: on the project's port (picked and saved if unset), or on `port`
+    as given (0: one the OS picks, held from now on, so nothing else can take it before serve)."""
     p = daemon.p
     cfg = p.config()
-    port = int(cfg.get("web", {}).get("port") or 0) or free_port()
-    if not cfg.get("web", {}).get("port"):
-        try:
-            p.set_config("web.port", port)
-        except RuntimeError:
-            pass   # project.json unreadable with no last good copy: serve on this port without saving it
-    Handler.daemon_ref = daemon
+    if port is None:
+        port = int(cfg.get("web", {}).get("port") or 0) or free_port()
+        if not cfg.get("web", {}).get("port"):
+            try:
+                p.set_config("web.port", port)
+            except RuntimeError:
+                pass   # project.json unreadable with no last good copy: serve on this port without saving it
     token(p)
-    httpd = ThreadingHTTPServer((cfg.get("web", {}).get("bind", "127.0.0.1"), port), Handler)
+    handler = type("Handler", (Handler,), {"daemon_ref": daemon})   # this server's own project, not the last one bound
+    httpd = ThreadingHTTPServer((cfg.get("web", {}).get("bind", "127.0.0.1"), port), handler)
     httpd.daemon_threads = True
+    return httpd
+
+
+def serve(daemon, httpd: ThreadingHTTPServer | None = None) -> None:
+    p = daemon.p
+    httpd = httpd or bind(daemon)
+    port = httpd.server_address[1]
     db = DB(p.state / "project.db")          # this thread's own connection; SQLite objects are per-thread
-    db.set_kv("web", {"port": port, "bind": cfg.get("web", {}).get("bind", "127.0.0.1")})
+    db.set_kv("web", {"port": port, "bind": p.config().get("web", {}).get("bind", "127.0.0.1")})
     db.close()
     httpd.serve_forever()
