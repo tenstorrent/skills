@@ -1178,9 +1178,7 @@ def _checks_child(a) -> int:
             with open(rc_file.parent / "checks.log", "a") as log:
                 log.write(f"ttp checks: stopped by signal {code - 128}\n")
     finally:
-        tmp = rc_file.with_name(rc_file.name + ".tmp")
-        tmp.write_text(f"{code}\n")
-        os.replace(tmp, rc_file)
+        durable_write(rc_file, f"{code}\n")
     return code if isinstance(code, int) else 1
 
 
@@ -1199,7 +1197,7 @@ def _checks_result(run_dir: Path) -> int:
         print(f"ttp checks: no detached checks recorded in {run_dir}")
         return 0
     else:
-        rc_file.write_text("killed\n")
+        durable_write(rc_file, "killed\n")
         print(f"ttp checks: the detached checks (pid {info.get('pid')}) ended without an exit code: something "
               "killed them; run `ttp checks --detach` again")
     try:
