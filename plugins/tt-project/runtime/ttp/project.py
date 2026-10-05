@@ -286,6 +286,18 @@ def lower_priority(n: int):
     return apply
 
 
+def renice(pid: int, n: int) -> None:
+    """Lower process `pid`'s CPU priority to `n` nice levels below this process, for a child that
+    waits for a go before it starts anything (preexec_fn is not safe in the daemon, which has
+    threads). Never raises: a failure leaves it at its priority."""
+    if n <= 0:
+        return
+    try:
+        os.setpriority(os.PRIO_PROCESS, pid, min(os.nice(0) + n, 19))
+    except OSError:
+        pass
+
+
 def config_problems(raw: dict) -> list[str]:
     """Unknown keys, non-command push_checks or after_push, a malformed version_bump and push queue
     settings out of range in a project's own settings, one line each."""

@@ -32,7 +32,7 @@ from urllib.parse import quote
 
 from . import locks
 from .budget import DOC_SUFFIXES
-from .project import Project, durable_write, git_fsync_env, lower_priority, nice_level, write_json
+from .project import Project, durable_write, git_fsync_env, nice_level, renice, write_json
 
 # Exit codes, distinct so a worker can say why it did not push. BUSY: another push to the same
 # branch kept the lock past `delivery.push_wait_s`; the task hands back `waiting`.
@@ -1055,7 +1055,8 @@ def _start(p: Project, marker: Path, m: dict, lock, env: dict, nice: int = 0) ->
                                   *(["--own"] if m.get("own") else [])],
                                  cwd=m["repo"], env=env, stdin=subprocess.PIPE, stdout=out,
                                  stderr=subprocess.STDOUT, start_new_session=True,
-                                 pass_fds=(lock.fileno(),), preexec_fn=lower_priority(nice))
+                                 pass_fds=(lock.fileno(),))
+    renice(child.pid, nice)  # before the go
     from .runner import boot_id
     m.update(status="running", pid=child.pid, started=time.time(), boot=boot_id())
     write_json(marker, m)
