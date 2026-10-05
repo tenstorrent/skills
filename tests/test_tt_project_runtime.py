@@ -2752,12 +2752,12 @@ def test_a_review_that_depends_on_the_task_it_reviews_runs_while_that_task_waits
          "depends_on": [impl, pre]},
         {"type": "task_add", "title": "Review the bench", "kind": "review", "depends_on": [impl],
          "spec": "check ttp/t1-make-it-faster"},
-        {"type": "task_add", "title": "Review the stacked change", "kind": "review", "depends_on": [stack, impl],
-         "spec": f"review #{stack}, after the change under it is accepted"},
+        {"type": "task_add", "title": f"Review #{stack}: stacked change", "kind": "review",
+         "depends_on": [stack, impl], "spec": f"stacked on #{impl}; wait until that is accepted"},
         {"type": "task_add", "title": "Use it", "spec": f"build on #{impl}", "depends_on": [impl]}]) == []
     by = {t["title"]: t["id"] for t in p.db.q("SELECT id, title FROM tasks")}
     named, by_branch, stacked, user = (by[f"Review #{impl}: make it faster"], by["Review the bench"],
-                                       by["Review the stacked change"], by["Use it"])
+                                       by[f"Review #{stack}: stacked change"], by["Use it"])
     unmet = p.db.unmet_dependencies([p.db.task(i) for i in (named, by_branch, stacked, user)])
     # Its subject waiting in review is no prerequisite of the review; anything else still is.
     assert unmet == {named: [pre], by_branch: [], stacked: [impl], user: [impl]}
@@ -2772,6 +2772,35 @@ def test_a_review_that_depends_on_the_task_it_reviews_runs_while_that_task_waits
     # The subject still running is a real prerequisite: the review waits for its hand-off.
     p.db.update_task(impl, status="running")
     assert p.db.unmet_dependencies([p.db.task(named)]) == {named: [impl]}
+
+
+def test_a_review_waits_on_tasks_its_spec_mentions_and_matches_only_its_titled_or_labelled_subject(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.db import review_subject
+    base = p.db.add_task("base change", "s", kind="code", origin="user", branch="ttp/t1-base")
+    top = p.db.add_task("top change", "s", kind="code", origin="user")
+    for i in (base, top):
+        p.db.update_task(i, status="review")
+    assert coord.apply(p, [
+        {"type": "task_add", "title": f"Review #{top}", "kind": "review", "depends_on": [top, base],
+         "spec": f"stacked on #{base}; wait until that is accepted"},
+        {"type": "task_add", "title": "Review the plan", "kind": "review", "depends_on": [top, base],
+         "spec": f"T{base}-T{top}: steps one to three. Its spec: build on task {base} and t{top}."},
+        {"type": "task_add", "title": "Second look", "kind": "review", "depends_on": [base],
+         "spec": f"T{top} landed on ttp/t1-base"}]) == []
+    by = {t["title"]: t["id"] for t in p.db.q("SELECT id, title FROM tasks")}
+    stacked, plan, by_branch = by[f"Review #{top}"], by["Review the plan"], by["Second look"]
+    # The stacked base is a real prerequisite: the review must not push its unreviewed commits.
+    unmet = p.db.unmet_dependencies([p.db.task(i) for i in (stacked, plan, by_branch)])
+    assert unmet == {stacked: [base], plan: [top, base], by_branch: []}
+    assert [t["id"] for t in p.db.ready_tasks()] == [by_branch]
+    p.db.update_task(base, status="done")
+    assert [t["id"] for t in p.db.ready_tasks()] == [stacked, by_branch]
+    # The label wins over the title; only a leading `Review #N` / `Review tN` names the subject.
+    assert review_subject({"title": f"Review #{top}", "labels": f'["auto_review:{base}"]'}) == base
+    assert review_subject({"title": f"review t{top}: x", "labels": "[]"}) == top
+    assert review_subject({"title": f"Re-check Review #{top}", "labels": "[]"}) is None
 
 
 def test_status_json_exposes_each_tasks_dependencies_and_start_and_retry_conditions(env):

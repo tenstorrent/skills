@@ -430,15 +430,32 @@ def continues_id(task: dict) -> int | None:
     return None
 
 
+REVIEW_TITLE = re.compile(r"\s*review\s+(?:#|t)(\d+)(?!\d)", re.I)
+
+
+def review_subject(review: dict) -> int | None:
+    """The id of the task a review reviews, from its `auto_review:<id>` label or a title that
+    starts with `Review #<id>` (or `Review t<id>`), the form the daemon and coordinator use."""
+    try:
+        labels = json.loads(review.get("labels") or "[]")
+    except (ValueError, TypeError):
+        labels = []
+    for lb in labels if isinstance(labels, list) else []:
+        if isinstance(lb, str) and lb.startswith("auto_review:") and lb[12:].isdigit():
+            return int(lb[12:])
+    m = REVIEW_TITLE.match(review.get("title") or "")
+    return int(m.group(1)) if m else None
+
+
 def reviews_task(review: dict, task: dict) -> bool:
-    """True when `review` names `task` as what it reviews: by its `auto_review:<id>` label, or by
-    the task's id (#12, t12, task 12) or branch in its title or spec."""
-    tid, branch = task["id"], task.get("branch")
-    if f'"auto_review:{tid}"' in (review.get("labels") or ""):
-        return True
-    named = re.compile(rf"(?<![\w.-])(?:#|t|task\s+){tid}(?!\d)"
-                       + (rf"|(?<![\w/.-]){re.escape(branch)}(?![\w/-])" if branch else ""), re.I)
-    return bool(named.search(f"{review.get('title') or ''}\n{review.get('spec') or ''}"))
+    """True when `review` reviews `task`: its subject (see review_subject) is the task or, only when
+    it names no subject that way, its spec names the task's branch. Ids mentioned anywhere else
+    (a stacked base, a plan step, a copied spec) never count."""
+    subject = review_subject(review)
+    if subject is not None:
+        return subject == task["id"]
+    branch = task.get("branch")
+    return bool(branch and re.search(rf"(?<![\w/.-]){re.escape(branch)}(?![\w/-])", review.get("spec") or ""))
 
 
 DEFER_LABELS = ("start_after", "start_when", "deferred_since")
