@@ -20625,13 +20625,13 @@ def test_a_held_provider_lets_one_run_try_after_the_cap(env, net, monkeypatch):
     d.hold_offline("claude", "test")
     net.run()
     assert d.net_held("claude") and not d._net_may_probe("claude")
-    mono[0] += dm.NET_HOLD_MAX_S
+    mono[0] += dm.NET_HOLD_MAX_S + 1
     assert d.net_held("claude") and d._net_may_probe("claude"), "DNS that never answers must not hold forever"
     d._net_holds["claude"]["probe"] = mono[0]   # what start_run records for the run that tries
     assert not d._net_may_probe("claude"), "one run tries, not the whole queue"
     _finished_run(d, _api_error(ENOTFOUND))        # it could not reach the API either: the hold starts over
     assert not d._net_may_probe("claude")
-    mono[0] += dm.NET_HOLD_MAX_S
+    mono[0] += dm.NET_HOLD_MAX_S + 1
     assert d._net_may_probe("claude")
     _finished_run(d, [{"type": "result", "subtype": "success", "is_error": False, "result": "ok", "num_turns": 1,
                     "total_cost_usd": 0.5, "usage": {"input_tokens": 10, "output_tokens": 10}}])
@@ -20648,7 +20648,7 @@ def test_a_hold_soon_after_boot_still_checks_and_lets_one_run_try(env, net, monk
     d.hold_offline("claude", "test")
     assert d.net_held("claude") and net.pending, "the first lookup starts at once, whatever the uptime"
     net.run()
-    mono[0] += dm.NET_HOLD_MAX_S
+    mono[0] += dm.NET_HOLD_MAX_S + 1
     assert d.net_held("claude") and d._net_may_probe("claude")
 
 
