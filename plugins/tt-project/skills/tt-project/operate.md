@@ -18,6 +18,7 @@
 | `ttp restart <name>` | restart the daemon and confirm it runs; a runtime it cannot start with is rolled back |
 | `ttp stop <name> [--kill]` | remove the service; keeps all data. Running workers finish unless `--kill` (their tasks resume on start) |
 | `ttp task <name> cancel <id>` | cancel a task and end its running worker |
+| `ttp task <name> set-when <id> "<cmd>"` | re-point the probe of a task that has not started: a waiting task's `retry_when`, else its `start_when`; `""` clears it. Refuses running and finished tasks |
 | `ttp doctor <name>` | providers, accounts, Jev, notifications, web |
 | `ttp alerts <name> --after N` | alerts since a message id |
 | `ttp web <name> --tunnel --keep` / `--unkeep` | keep the web app's tunnel up as a user service / remove it (remote projects; a local view forward needs no ask) |

@@ -1086,6 +1086,43 @@ def cmd_task(a) -> None:
         runs = stop_runs(p.db, p.runs, tid)
         print("cancelled" + (f"; ending its running run{'s' if len(runs) > 1 else ''} "
                              f"{', '.join(map(str, runs))}" if runs else ""))
+    elif a.action == "set-when":
+        if not a.title.strip().isdigit():
+            die(f"set-when needs a task id, not {a.title!r}")
+        try:
+            print(set_when(p.db, int(a.title), a.probe))
+        except ValueError as e:
+            die(str(e))
+
+
+def set_when(db, tid: int, probe: str | None) -> str:
+    """Re-point the probe of a task that has not started: a waiting task's `retry_when`, else its
+    `start_when` deferral. An empty probe clears it. Same checks as the coordinator's task_update."""
+    from .coordinator import _start_args, check_probe, defer_labels
+    from .db import TERMINAL_TASK_STATES, deferral, dump_result, load_result, without_deferral
+    if probe is None:
+        raise ValueError("set-when needs the probe command (\"\" clears it)")
+    with db.tx():   # BEGIN IMMEDIATE: the daemon cannot start the task between the check and the write
+        task = db.task(tid)
+        if not task:
+            raise ValueError(f"no task #{tid}")
+        if task["status"] in ("running", *TERMINAL_TASK_STATES):
+            raise ValueError(f"task #{tid} is {task['status']}: only a task that has not started can have "
+                             f"its probe changed; add a new one instead")
+        prev = load_result(task["result"])
+        if prev.get("status") == "waiting" and not deferral(task).get("when"):
+            check_probe(probe, "retry_when")
+            if probe.strip():
+                prev["retry_when"] = probe.strip()
+            else:
+                prev.pop("retry_when", None)
+            db.update_task(tid, result=dump_result(prev))
+            return f"task #{tid} retry_when " + (f"set: {probe.strip()}" if probe.strip()
+                                                 else "cleared; it wakes at its retry timer")
+        after, when = _start_args({"start_when": probe}, deferral(task))
+        db.update_task(tid, labels=without_deferral(json.loads(task["labels"] or "[]")) + defer_labels(after, when),
+                       not_before=after)
+        return f"task #{tid} start_when " + (f"set: {when}" if when else "cleared")
 
 
 def cmd_prune(a) -> None:
@@ -1695,10 +1732,11 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--dir", required=True)
     s.set_defaults(fn=cmd_adopt)
 
-    s = sub.add_parser("task", help="add/list/cancel tasks by hand")
+    s = sub.add_parser("task", help="add/list/cancel tasks by hand, or re-point a not-yet-started task's probe")
     s.add_argument("name")
-    s.add_argument("action", choices=["add", "list", "cancel"])
-    s.add_argument("title", nargs="?", default="")
+    s.add_argument("action", choices=["add", "list", "cancel", "set-when"])
+    s.add_argument("title", nargs="?", default="", help="add: the title; cancel/set-when: the task id")
+    s.add_argument("probe", nargs="?", help="set-when: the new retry_when/start_when command (\"\" clears it)")
     s.add_argument("--spec")
     s.add_argument("--kind", default="work")
     s.add_argument("--tier", default="standard")

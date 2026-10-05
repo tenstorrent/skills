@@ -450,9 +450,15 @@ def _start_args(a: dict, cur: dict) -> tuple[float | None, str | None]:
     when = a.get("start_when")
     if when is None:
         when = cur.get("when")
-    elif not isinstance(when, str) or len(when) > START_WHEN_CHARS:
-        raise ValueError(f"start_when must be one shell command of at most {START_WHEN_CHARS} characters")
+    else:
+        check_probe(when)
     return after, (when.strip() or None) if when else None
+
+
+def check_probe(probe, what: str = "start_when") -> None:
+    """A task's shell probe (start_when, or a waiting task's retry_when): one command, bounded."""
+    if not isinstance(probe, str) or len(probe) > START_WHEN_CHARS:
+        raise ValueError(f"{what} must be one shell command of at most {START_WHEN_CHARS} characters")
 
 
 def defer_labels(after: float | None, when: str | None) -> list[str]:

@@ -11790,6 +11790,69 @@ def test_a_start_when_not_met_after_defer_max_days_raises_one_event(env, monkeyp
     assert len(_events(p, tid, "deferral_expired")) == 1
 
 
+def test_ttp_task_set_when_repoints_a_waiting_tasks_retry_when(env, monkeypatch, capsys):
+    p = make(env)
+    from ttp import cli
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    tid = _due_waiting_task(p, "exit 1")
+    p.db.update_task(tid, not_before=time.time() + 3600)
+    cli.main(["task", "demo", "set-when", str(tid), "  true "])
+    assert f"task #{tid} retry_when set: true" in capsys.readouterr().out
+    assert json.loads(p.db.task(tid)["result"])["retry_when"] == "true"
+    assert _labels(p, tid) == [], "a waiting task's probe is its retry_when, not a start deferral"
+    d = dmod.Daemon(p.base)
+    _settle_probe(d, tid)
+    assert _ready(p, tid), "the daemon runs the new probe"
+    cli.main(["task", "demo", "set-when", str(tid), ""])
+    assert "retry_when" not in json.loads(p.db.task(tid)["result"])
+
+
+def test_ttp_task_set_when_sets_and_clears_a_queued_tasks_start_when(env, capsys):
+    p = make(env)
+    from ttp import cli
+    from ttp import coordinator as coord
+    coord.apply(p, [{"type": "task_add", "title": "later", "spec": "s", "start_after": "2h", "resources": ["board"]}])
+    tid = _added(p, "later")
+    after = p.db.task(tid)["not_before"]
+    cli.main(["task", "demo", "set-when", str(tid), "test -f out/done"])
+    assert f"task #{tid} start_when set: test -f out/done" in capsys.readouterr().out
+    labels = _labels(p, tid)
+    assert "start_when:test -f out/done" in labels and "resource:board" in labels
+    assert abs(p.db.task(tid)["not_before"] - after) < 1, "the start_after it had stays"
+    cli.main(["task", "demo", "set-when", str(tid), ""])
+    assert not any(lb.startswith("start_when:") for lb in _labels(p, tid))
+    assert "resource:board" in _labels(p, tid) and abs(p.db.task(tid)["not_before"] - after) < 1
+
+
+@pytest.mark.parametrize("status", ["running", "done", "failed", "cancelled"])
+def test_ttp_task_set_when_refuses_started_or_finished_tasks(env, capsys, status):
+    p = make(env)
+    from ttp import cli
+    tid = p.db.add_task("t", "s", kind="work", tier="light", origin="user")
+    p.db.update_task(tid, status=status)
+    before = p.db.task(tid)
+    with pytest.raises(SystemExit):
+        cli.main(["task", "demo", "set-when", str(tid), "true"])
+    assert f"task #{tid} is {status}: only a task that has not started" in capsys.readouterr().err
+    assert p.db.task(tid)["labels"] == before["labels"] and p.db.task(tid)["result"] == before["result"]
+
+
+@pytest.mark.parametrize("args, why", [(["7"], "needs the probe command"),
+                                       (["x", "true"], "needs a task id"),
+                                       (["999", "true"], "no task #999"),
+                                       (["{tid}", "x" * 1001], "retry_when must be one shell command")])
+def test_ttp_task_set_when_rejects_bad_input(env, capsys, args, why):
+    p = make(env)
+    from ttp import cli
+    tid = _due_waiting_task(p, "exit 1")
+    before = p.db.task(tid)["result"]
+    with pytest.raises(SystemExit):
+        cli.main(["task", "demo", "set-when", *[x.format(tid=tid) for x in args]])
+    assert why in capsys.readouterr().err
+    assert p.db.task(tid)["result"] == before
+
+
 def test_task_update_changes_or_clears_a_deferral(env):
     p = make(env)
     from ttp import coordinator as coord
