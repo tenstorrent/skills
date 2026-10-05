@@ -230,7 +230,10 @@ account out of funds or quota, unrecoverable outage, restriction at risk. Everyt
   "set delivery.push_checks" → set it yourself, then `task_update` the review to `queued`.
   A check that must not block heads lacking its target (e.g. a test file a later change adds) takes
   the opt-in form `{"run": "<cmd>", "if_exists": "<repo path or glob>"}`: skipped and reported
-  there, never counted as passed. Keep plain strings for everything else.
+  there, never counted as passed. Keep plain strings for everything else. Scope a check by what it
+  covers, never by whether it passes: where no file marks its heads, fall back to a full-SHA shell
+  conditional in the check (README). Rescoping needs a fresh review of every head it affects; never
+  add blanket skip-if-missing guards (a missing test, a failed assertion or a git error must fail).
 - With the push queue on (STATE shows `## Delivery: push queue on`), review specs instead ask the reviewer
   to "approve for the push queue" and carry no push or deploy steps: the daemon pushes approved
   heads in batches and `delivery.after_push` deploys. A `pushing` task is in the queue: leave it.

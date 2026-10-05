@@ -14091,6 +14091,33 @@ def test_config_set_rejects_sentence_push_checks_and_unknown_keys(env):
     assert p.config()["delivery"]["push_checks"] == ["true", "./run.sh -q", "X=1 sh -c :"]
 
 
+@pytest.mark.parametrize("cmd", [
+    'h=$(git rev-parse HEAD); test "$h" = 0000 || pytest -q',
+    'h="$(git rev-parse HEAD)" && test -n "$h"',
+    "h=`git rev-parse HEAD`; true",
+    "h=$(cd sub && git rev-parse $(echo HEAD)); pytest -q",
+    "set -e; pytest -q",
+    "x=1",
+    'A=1 B="x y" pytest -q',
+])
+def test_check_problem_accepts_a_bare_assignment_holding_a_command_substitution(env, cmd):
+    # A scoped check (`h=$(git rev-parse HEAD); ...`) is a command; shlex used to split the
+    # substitution into words and reject `rev-parse` as the first one.
+    from ttp.push import check_problem
+    assert check_problem(cmd) is None
+
+
+@pytest.mark.parametrize("cmd,why", [
+    ("Run all the tests", "'Run' is not a program on PATH"),
+    ("h=$(Run the tests); true", "'Run' is not a program on PATH"),
+    ("Run=all the tests", "'the' is not a program on PATH"),
+    ("h=$(git rev-parse HEAD", "does not parse as a shell command"),
+])
+def test_check_problem_still_rejects_prose_and_unclosed_substitutions(env, cmd, why):
+    from ttp.push import check_problem
+    assert why in (check_problem(cmd) or "")
+
+
 def test_config_set_accepts_the_push_queue_keys_and_rejects_a_sentence_after_push(env):
     p = make(env)
     from ttp.coordinator import NEEDS_USER, apply

@@ -146,14 +146,65 @@ BUILTINS = {".", ":", "[", "[[", "!", "(", "{", "bash", "sh", "cd", "command", "
             "unset", "while", "case", "time", "env"}
 
 
+def _word_end(s: str, i: int) -> int:
+    """Index just past the shell word starting at s[i], keeping quotes, `...`, $(...) and ${...}
+    whole; -1 when one of them is not closed."""
+    depth = 0                                      # open $( / ( inside a $(...)
+    while i < len(s):
+        c = s[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c in "'`":
+            j = s.find(c, i + 1)
+            if j < 0:
+                return -1
+            i = j + 1
+            continue
+        if c == '"':
+            j = i + 1
+            while j < len(s) and s[j] != '"':
+                j += 2 if s[j] == "\\" else 1
+            if j >= len(s):
+                return -1
+            i = j + 1
+            continue
+        if s.startswith("${", i):
+            j = s.find("}", i)
+            if j < 0:
+                return -1
+            i = j + 1
+            continue
+        if s.startswith("$(", i) or (c == "(" and depth):
+            depth += 1
+            i += 2 if c == "$" else 1
+            continue
+        if c == ")" and depth:
+            depth -= 1
+        elif not depth and (c.isspace() or c in ";&|<>()"):
+            return i
+        i += 1
+    return -1 if depth else i
+
+
 def check_problem(cmd: str) -> str | None:
-    """Why `cmd` cannot be a check command (its first word is no program, path or builtin), or None."""
+    """Why `cmd` cannot be a check command (its first word is no program, path or builtin), or None.
+    Leading VAR=value words are skipped; a bare assignment (`h=$(git rev-parse HEAD); ...`) is a
+    command of its own, judged by the command it substitutes, if any."""
+    rest = cmd.strip()
+    while m := re.match(r"[A-Za-z_][A-Za-z0-9_]*=", rest):              # leading VAR=value
+        end = _word_end(rest, m.end())
+        if end < 0:
+            return f"{cmd!r} does not parse as a shell command (unclosed quote or substitution)"
+        value, rest = rest[m.end():end], rest[end:].lstrip(" \t")
+        if not rest or rest[0] in ";&|<>\n":
+            sub = re.fullmatch(r'"?\$\((.*)\)"?|"?`(.*)`"?', value, re.S)
+            inner = sub and (sub.group(1) or sub.group(2) or "").strip()
+            return check_problem(inner) if inner else None
     try:
-        words = shlex.split(cmd)
+        words = shlex.split(rest)
     except ValueError as e:
         return f"{cmd!r} does not parse as a shell command ({e})"
-    while words and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[0]):   # leading VAR=value
-        words.pop(0)
     if not words:
         return None
     first = words[0]

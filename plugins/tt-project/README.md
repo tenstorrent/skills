@@ -150,6 +150,17 @@ and preferences you add later become part of the project's charter and memory.
   skipped check is logged as `skipped (not applicable: ...)` by `ttp push`, the push queue and
   `ttp checks` (in `checks.log`), and never counts as passed: when every check is skipped the
   push or `ttp checks` fails. Plain string checks never skip; `after_push` takes the same form.
+- Scope a mandatory check by what it covers, never by whether it would pass. Prefer `if_exists`
+  on the file the check runs. Where no file marks the heads a check applies to (say a test that
+  is missing at an independently reviewed head of another delivery branch), the fallback is a
+  shell conditional on the full SHA in the check itself:
+  `h=$(git rev-parse HEAD) || exit 1; [ "$h" = <full 40-character sha> ] || pytest -q tests/test_x.py`.
+  A leading assignment such as `h=$(...)` is accepted as a check's first command, like `set -e`.
+  Write the condition so that an error in it runs or fails the check, never skips it. Changing
+  a check's scope changes what a head was checked against: every head it affects needs a fresh
+  review, and earlier approvals do not carry over. Never add blanket "skip if the test file is
+  missing" guards (`[ -f tests/test_x.py ] || exit 0`, `|| true`): a missing test, a failed
+  assertion and a git error (an unset identity, a bad ref) must still fail the check.
 - `ttp push --detach` runs the same push in a process of its own and returns at once, for
   checks that outlast a worker's tool call. It prints a marker under `state/pushes/` and a
   `retry_when` probe, `ttp push --result <marker>`: 1 while the push runs, 0 once it finished,
