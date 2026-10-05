@@ -1066,13 +1066,17 @@ def result(marker: Path) -> int:
     if not _read(marker):
         print(f"ttp push: no detached push marker at {marker}", file=sys.stderr)
         return REFUSED
-    m = _settle(marker)
+    try:
+        m = _settle(marker)
+        took = time.time() - float(m.get("queued") or time.time()) if m.get("status") == "queued" else 0
+    except (TypeError, ValueError) as e:   # a malformed marker: a clear verdict, not a traceback
+        _malformed(marker, e)
+        m = _read(marker)
     if m.get("status") == "running":
         took = time.time() - float(m.get("started") or time.time())
         print(f"ttp push: still running (pid {m.get('pid')}, {took:.0f} s); log: {m.get('log')}")
         return 1
     if m.get("status") == "queued":
-        took = time.time() - float(m.get("queued") or time.time())
         print(f"ttp push: queued for the daemon ({took:.0f} s); log: {m.get('log')}")
         return 1
     if m.get("status") == "pushed":
