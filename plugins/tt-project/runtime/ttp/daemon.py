@@ -1158,9 +1158,12 @@ class Daemon:
         reported = float(usage.cost_usd or 0)
         if not session or usage.estimated or reported <= 0:
             return usage.cost_usd
+        # By runs.session_id; rows from before that column fall back to the session id in their note.
         booked = sum(float(o["cost_usd"] or 0) for o in self.p.db.q(
-            "SELECT cost_usd, note FROM runs WHERE id<? AND task IS ? AND note LIKE ?",
-            (r["id"], r["task"], f"%{session}%")) if json.loads(o["note"] or "{}").get("session_id") == session)
+            "SELECT cost_usd, session_id, note FROM runs WHERE id<? AND task IS ? AND "
+            "(session_id=? OR (session_id IS NULL AND note LIKE ?))",
+            (r["id"], r["task"], session, f"%{session}%"))
+            if o["session_id"] == session or json.loads(o["note"] or "{}").get("session_id") == session)
         if booked <= 0:
             return usage.cost_usd
         own = bud.estimate_cost(self.p.db, self.cfg, r["provider"], r["model"] or "", {

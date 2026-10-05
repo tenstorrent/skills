@@ -22247,6 +22247,32 @@ def test_a_non_cumulative_report_is_booked_in_full(env):
     assert d._net_of_session(r, u) == 8.0 and "session_cost_usd" not in u.extra
 
 
+def test_session_runs_found_by_column_and_old_note(env):
+    """Earlier runs of a session are found by runs.session_id; old rows without it by their note."""
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    db = d.p.db
+    tid, first, r = _session_runs(d, booked=2.0)   # an old row: session id only in its note
+    db.x("INSERT INTO runs(id,task,role,provider,model,started,ended,status,cost_usd,session_id,note) "
+         "VALUES(?,?,'worker','claude','opus',?,?,'lost',3.0,'S','{}')",
+         (first + 1000, tid, time.time() - 900, time.time() - 800))
+    db.x("UPDATE runs SET id=? WHERE id=?", (first + 2000, r["id"]))
+    r = dict(r, id=first + 2000)
+    u = _reported(5.0)
+    assert d._net_of_session(r, u) == 0.0 and u.extra["session_cost_usd"] == 5.0, "old and new rows not both counted"
+
+
+def test_session_id_substring_is_not_matched(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    tid, first, r = _session_runs(d, booked=4.0, session="S-long")
+    d.p.db.x("UPDATE runs SET session_id='S-long' WHERE id=?", (first,))
+    r = dict(r, note=json.dumps({"resumes": {"run": first, "session": "S"}}))
+    assert d._net_of_session(r, _reported(4.0)) == 4.0, "a longer session id containing this one was matched"
+
+
 def _net(d, r, reported, own_usd):
     """Net a report against the session's $4.00 booking; this run's own tokens price at `own_usd`."""
     u = _reported(reported, output_tokens=round(own_usd * 200_000))
