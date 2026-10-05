@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import contextlib
+import gettext
+import importlib.machinery
 import io
 import json
 import secrets
@@ -26,6 +28,37 @@ import pytest
 
 RUNTIME = pathlib.Path(__file__).resolve().parents[1] / "plugins" / "tt-project" / "runtime"
 TTP = pathlib.Path(__file__).resolve().parents[1] / "plugins" / "tt-project" / "bin" / "ttp"
+
+
+_CODE: dict = {}       # (path, mtime, size) -> code object of a runtime module
+_LOCALES: dict = {}    # gettext.find's arguments and locale settings -> its answer
+
+
+def _cached_get_code(real):
+    """Every test imports the runtime afresh; the modules' code objects are reused instead of being
+    read and unmarshalled each time. Each import still runs the module anew."""
+    def get_code(self, fullname):
+        path = self.get_filename(fullname)
+        if not path.startswith(str(RUNTIME) + os.sep):
+            return real(self, fullname)
+        st = os.stat(path)
+        key = (path, st.st_mtime_ns, st.st_size)
+        if key not in _CODE:
+            _CODE[key] = real(self, fullname)
+        return _CODE[key]
+    return get_code
+
+
+def _cached_find(real):
+    """argparse looks up a translation for each help string; every `ttp` command in-process builds its
+    whole parser, which is thousands of locale file lookups whose answer never changes."""
+    def find(domain, localedir=None, languages=None, all=False):
+        key = (domain, localedir, tuple(languages) if languages else None, all,
+               *(os.environ.get(v) for v in ("LANGUAGE", "LC_ALL", "LC_MESSAGES", "LANG")))
+        if key not in _LOCALES:
+            _LOCALES[key] = real(domain, localedir, languages, all)
+        return _LOCALES[key]
+    return find
 
 
 @pytest.fixture(scope="session")
@@ -76,6 +109,9 @@ def env(tmp_path, monkeypatch, _git_session):
     sys.path.insert(0, str(RUNTIME))
     for mod in [m for m in list(sys.modules) if m == "ttp" or m.startswith("ttp.")]:
         del sys.modules[mod]
+    monkeypatch.setattr(importlib.machinery.SourceFileLoader, "get_code",
+                        _cached_get_code(importlib.machinery.SourceFileLoader.get_code))
+    monkeypatch.setattr(gettext, "find", _cached_find(gettext.find))
     real_connect = sqlite3.connect
 
     def no_fsync(*args, **kwargs):
