@@ -18,6 +18,11 @@ The global total for a provider counts, for this day:
   cached in ~/.tt-project/global-spend.json, one per window (projects on one machine may count
   different days), with when each was read. A machine that cannot be reached keeps its last answer
   for the same day, which still counts and is shown as stale;
+- machines that cannot be reached from here but can reach this machine (a laptop that can reach a
+  server but not the other way round): they push their own `spend-today` answers over ssh into
+  `ttp spend-today --receive` here (push, receive). Pushed answers are kept per machine and window
+  in ~/.tt-project/global-spend-pushed.json and count like pulled ones: aged by when they arrived,
+  stale past STALE_S. A machine both pulled and pushed counts once, with its freshest answer;
 - other spend sources registered with `add_other_source` (a hook for spend outside tt-project, e.g.
   the user's own sessions; localspend adds this machine's other Claude Code sessions).
 
@@ -35,7 +40,9 @@ import fcntl
 import hashlib
 import json
 import math
+import os
 import re
+import shlex
 import sqlite3
 import subprocess
 import threading
@@ -56,6 +63,15 @@ TAG = "tt-project"         # machines-list tag of a machine that runs tt-project
 TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 REMOTE_TTP = "~/.tt-project/lib/current/bin/ttp"
 SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15"]
+PUSH_TIMEOUT_S = 30        # one push over ssh
+PUSH_BACKOFF_S = (REFRESH_S, 3600)   # after a failed push: first wait, doubling up to the last
+PUSH_PULLED_S = 6 * 3600   # a machine that already reads this one itself is pushed to this rarely
+PUSHED_KEEP_S = 2 * DAY    # a machine that pushed nothing for this long is forgotten
+RECEIVE_BYTES = 64 << 10   # the most `ttp spend-today --receive` reads
+MAX_WINDOWS, MAX_ROWS, MAX_PROJECTS, MAX_PUSHERS = 4, 64, 200, 32
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@+-]{0,79}$")
+PROVIDER_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
+KEY_RE = re.compile(r"^[0-9a-f]{16}$")
 
 # Extra spend sources: fn(provider, account, start, end) -> (usd, label). Each adds its dollars to the
 # global total and its label to what the total says it includes. A source that fails is left out and
@@ -121,6 +137,9 @@ def setting_problems(budget: dict) -> list[str]:
             raise ValueError
     except (TypeError, ValueError):
         out.append(f"budget.global_daily_usd: {budget.get('global_daily_usd')!r} is not a dollar amount >= 0")
+    v = budget.get("push_spend_to")
+    if v not in (None, "none") and not (isinstance(v, list) and all(isinstance(x, str) and NAME_RE.match(x) for x in v)):
+        out.append(f"budget.push_spend_to: {v!r} is not a list of ssh aliases or \"none\"")
     return out
 
 
@@ -204,7 +223,8 @@ def machine_totals(start: float, end: float, skip: str | None = None, now: float
             rows[k] = rows.get(k, 0.0) + r["usd"]
     out = {"host": project.hostname(), "start": start, "end": end, "projects": names, "errors": errors,
            "rows": [{"provider": p, "key": k, "usd": round(u, 4)} for (p, k), u in rows.items()]}
-    _LOCAL[key] = (now, start, end, out)
+    if cached:                      # one entry per caller, which asks with the same window each tick
+        _LOCAL[key] = (now, start, end, out)
     return out
 
 
@@ -327,7 +347,7 @@ def refresh(start: float, end: float, now: float | None = None, force: bool = Fa
 
 
 _THREAD: dict[str, threading.Thread] = {}
-_FAILED = {"at": 0.0}       # when this process's last background refresh failed
+_FAILED = {"at": 0.0, "push": 0.0}   # when this process's last background refresh (or push) failed
 
 
 def refresh_async(budget: dict, now: float | None = None) -> None:
@@ -340,9 +360,20 @@ def refresh_async(budget: dict, now: float | None = None) -> None:
         return
     start, end, _ = window(budget, now)
     cache = (load_cache().get("machines") or {})
-    if not any(_due(cache.get(x) or {}, start, end, now) for x in targets()):
+    pull = any(_due(cache.get(x) or {}, start, end, now) for x in targets())
+    send = not 0 <= now - _FAILED["push"] < REFRESH_S and _push_due(now)
+    if not pull and not send:
         return
-    t = threading.Thread(target=lambda: _refresh_quietly(start, end, now), daemon=True)
+
+    def work():
+        if pull:
+            _refresh_quietly(start, end, now)
+        if send:
+            try:
+                push(budget, now)
+            except Exception:
+                _FAILED["push"] = time.time()
+    t = threading.Thread(target=work, daemon=True)
     _THREAD["t"] = t
     t.start()
 
@@ -356,11 +387,219 @@ def _refresh_quietly(start: float, end: float, now: float) -> None:
         _FAILED["at"] = time.time()
 
 
+# pushed answers ----------------------------------------------------------------------------------
+def pushed_path() -> Path:
+    return project.HOME_DIR / "global-spend-pushed.json"
+
+
+def push_state_path() -> Path:
+    return project.HOME_DIR / "global-spend-push.json"
+
+
+def _json(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _flock(name: str, wait: bool) -> int | None:
+    """A guard file in ~/.tt-project held with flock: its descriptor, or None when another process
+    holds it and `wait` is off. The caller closes it."""
+    project.HOME_DIR.mkdir(parents=True, exist_ok=True)
+    fd = os.open(project.HOME_DIR / name, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def _num(x) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
+def _valid_push(rec, now: float) -> dict | None:
+    """A pushed record as {host, sent, windows: {key: answer}}, or None if it is not one: this
+    machine's own name, an unknown field type, an amount out of range or anything over the caps
+    rejects the whole record. Windows already over are dropped."""
+    if not isinstance(rec, dict) or rec.get("v") != 1 or not _num(rec.get("sent")):
+        return None
+    host, wins = rec.get("host"), rec.get("windows")
+    if not isinstance(host, str) or not NAME_RE.match(host) or host == project.hostname():
+        return None
+    if not isinstance(wins, list) or not 1 <= len(wins) <= MAX_WINDOWS:
+        return None
+    out = {}
+    for w in wins:
+        if not isinstance(w, dict) or not (_num(w.get("start")) and _num(w.get("end"))):
+            return None
+        start, end, rows, names = float(w["start"]), float(w["end"]), w.get("rows"), w.get("projects", [])
+        if not 0 < end - start <= 2 * DAY or not isinstance(rows, list) or len(rows) > MAX_ROWS:
+            return None
+        if not isinstance(names, list) or len(names) > MAX_PROJECTS or not all(
+                isinstance(n, str) and NAME_RE.match(n) for n in names):
+            return None
+        for r in rows:
+            if not (isinstance(r, dict) and isinstance(r.get("provider"), str) and PROVIDER_RE.match(r["provider"])
+                    and isinstance(r.get("key"), str) and KEY_RE.match(r["key"])
+                    and _num(r.get("usd")) and 0 <= r["usd"] < 1e6):
+                return None
+        if end > now:
+            out[_key(start, end)] = {"ts": now, "start": start, "end": end, "projects": names,
+                                     "rows": [{"provider": r["provider"], "key": r["key"], "usd": float(r["usd"])}
+                                              for r in rows]}
+    return {"host": host, "sent": float(rec["sent"]), "windows": out}
+
+
+def load_pushed(now: float | None = None) -> dict:
+    """Pushed answers by the pushing machine's host name, those heard from within PUSHED_KEEP_S."""
+    now = now or time.time()
+    got = _json(pushed_path()).get("machines") or {}
+    return {h: m for h, m in got.items() if isinstance(m, dict) and isinstance(m.get("windows"), dict)
+            and -REFRESH_S <= now - float(m.get("ts") or 0) <= PUSHED_KEEP_S}
+
+
+def receive(stream: bytes, via: str, now: float | None = None) -> tuple[dict, int]:
+    """`ttp spend-today --receive --via ALIAS`: keep the spend another machine pushed (one JSON record
+    on stdin, as push() sends) with this machine's pulled answers. Returns (the ack, the exit code).
+    The ack says whether this machine already reads the sender itself (`pulls`), so the sender can
+    push less."""
+    from .machines import ALIAS_RE
+    now = now or time.time()
+    if not ALIAS_RE.fullmatch(via or ""):
+        return {"error": "--via must be the sending machine's alias"}, 2
+    if len(stream) > RECEIVE_BYTES:
+        return {"error": "the record is too long; nothing was kept"}, 2
+    try:
+        got = _valid_push(json.loads(stream), now)
+    except ValueError:
+        got = None
+    if got is None:
+        return {"error": "not a spend record; nothing was kept"}, 2
+    fd = _flock("global-spend-pushed.lock", wait=True)
+    try:
+        doc = _json(pushed_path())
+        machines = {h: m for h, m in (doc.get("machines") or {}).items() if isinstance(m, dict)}
+        old = machines.get(got["host"]) or {}
+        wins = {k: w for k, w in (old.get("windows") or {}).items()
+                if isinstance(w, dict) and float(w.get("end") or 0) > now}
+        wins.update(got["windows"])
+        machines[got["host"]] = {"host": got["host"], "via": via, "ts": now, "sent": got["sent"], "windows": wins}
+        keep = sorted(machines, key=lambda h: float(machines[h].get("ts") or 0), reverse=True)[:MAX_PUSHERS]
+        project.write_json(pushed_path(), {"machines": {h: machines[h] for h in keep}}, mode=0o600)
+    finally:
+        os.close(fd)
+    pulls = any(m.get("host") == got["host"] and m.get("ok") and 0 <= now - float(m.get("ts") or 0) <= STALE_S
+                for m in (load_cache().get("machines") or {}).values() if isinstance(m, dict))
+    return {"accepted": len(got["windows"]), "pulls": pulls}, 0
+
+
+def push_targets() -> list[str]:
+    """Where this machine pushes its spend: the account-level `budget.push_spend_to` (a list of ssh
+    aliases, or "none"), else every machine the global total asks (targets())."""
+    v = (project.load_account_settings().get("budget") or {}).get("push_spend_to")
+    if v == "none":
+        return []
+    if isinstance(v, list):
+        return sorted({str(x) for x in v if isinstance(x, str) and NAME_RE.match(x)})
+    return targets()
+
+
+def _push_due(now: float) -> bool:
+    st = _json(push_state_path()).get("targets") or {}
+    return any(not 0 <= float((st.get(t) or {}).get("tried") or 0) <= now
+               or now >= float((st.get(t) or {}).get("next") or 0) for t in push_targets())
+
+
+def push_windows(budget: dict, now: float) -> list[tuple[float, float]]:
+    """The windows a push answers for: this project's, the account-level one and the rolling 24 h,
+    so a receiver counts whichever its projects use."""
+    acct = project.deep_merge(project.DEFAULT_CONFIG["budget"], project.load_account_settings().get("budget") or {})
+    out = []
+    for b in (budget, acct, {}):
+        start, end, _ = window(b, now)
+        if (start, end) not in out:
+            out.append((start, end))
+    return out[:MAX_WINDOWS]
+
+
+def push(budget: dict, now: float | None = None) -> int:
+    """Push this machine's spend (machine_totals, as `ttp spend-today` gives) to every push target
+    that is due, over ssh into `ttp spend-today --receive`. Each target is pushed to every REFRESH_S,
+    every PUSH_PULLED_S once it says it reads this machine itself, and with a doubling wait after a
+    failure. Only one process of this user pushes at a time; the others skip. Returns how many
+    targets took it. Runs in the background (refresh_async), never on the daemon tick."""
+    from . import upstream
+    now = now or time.time()
+    fd = _flock("global-spend-push.lock", wait=False)
+    if fd is None:
+        return 0
+    try:
+        st = {t: s for t, s in (_json(push_state_path()).get("targets") or {}).items() if isinstance(s, dict)}
+        names = push_targets()
+        data, sent = b"", 0
+        for t in names:
+            s = dict(st.get(t) or {})
+            if 0 <= float(s.get("tried") or 0) <= now < float(s.get("next") or 0):
+                continue
+            if not data:
+                wins = [{"start": a, "end": b, **{k: v for k, v in machine_totals(a, b, now=now).items()
+                                                  if k in ("rows", "projects")}} for a, b in push_windows(budget, now)]
+                data = (json.dumps({"v": 1, "host": project.hostname(), "sent": now, "windows": wins}) + "\n").encode()
+            out, err = upstream.ssh_pipe(t, f"spend-today --receive --via {shlex.quote(upstream.alias())}",
+                                         data, PUSH_TIMEOUT_S)
+            ack = None
+            if out is not None:
+                try:
+                    ack = json.loads(out.decode(errors="replace").strip().splitlines()[-1])
+                except (ValueError, IndexError):
+                    pass
+                if not isinstance(ack, dict) or not isinstance(ack.get("accepted"), int):
+                    ack, err = None, "no ack"
+            s["tried"] = now
+            if ack is None:
+                fails = int(s.get("fails") or 0) + 1
+                first, most = PUSH_BACKOFF_S
+                s.update(ok=False, fails=fails, error=err[:200], next=now + min(first * 2 ** (fails - 1), most))
+            else:
+                pulls = ack.get("pulls") is True
+                s.update(ok=True, fails=0, error="", last_ok=now, pulls=pulls,
+                         next=now + (PUSH_PULLED_S if pulls else REFRESH_S))
+                sent += 1
+            st[t] = s
+            project.write_json(push_state_path(), {"targets": {k: v for k, v in st.items() if k in names}}, mode=0o600)
+        return sent
+    finally:
+        os.close(fd)
+
+
+def _same_machine(target: str, m: dict, pushed: dict) -> dict | None:
+    """The pushed answers of the machine `target` names, if it pushes too: matched by the host name
+    its pulled answer gave, its alias, the machines list's or the registry's host name for it."""
+    names = {target, m.get("host")}
+    try:
+        from . import machines
+        names.add((machines.load().get(target) or {}).get("hostname"))
+    except Exception:
+        pass
+    names |= {e.get("host") for e in (project.load_registry().get("projects") or {}).values()
+              if isinstance(e, dict) and e.get("ssh") == target}
+    names.discard(None)
+    for h, p in pushed.items():
+        if h in names or p.get("via") == target:
+            return p
+    return None
+
+
 # the total ----------------------------------------------------------------------------------------
 def total(db, provider: str, start: float, end: float, now: float | None = None,
           account: str | None = None, rolling: bool = False) -> dict:
     """The global spend of `provider` on this account in [start, end): this project (`db`), this
-    machine's other projects, the other machines (cached, stale ones counted) and other sources.
+    machine's other projects, the other machines (cached or pushed here, stale ones counted) and other
+    sources.
     For a budget day a machine's answer counts when it is for the same day, however old. For the
     rolling 24 h (`rolling`) it counts while it was read within STALE_S, even if the last try failed;
     an older one covers another window and is only named stale. A machine is stale when its last try
@@ -377,19 +616,33 @@ def total(db, provider: str, start: float, end: float, now: float | None = None,
     stale, errors, hosts, seen = [], list(here["errors"]), [], {project.hostname()}
     remote_projects = 0
     cache = load_cache().get("machines") or {}
+    pushed = load_pushed(now)
+    key = _key(start, end)
+    # Each machine once: the ones asked over ssh, then the ones that only push here. A machine both
+    # asked and pushing counts with whichever answer for this window is newer.
+    found = []
     for t in targets():
         m = cache.get(t) or {}
-        w = _windows(m).get(_key(start, end)) or {}
+        w, ok = _windows(m).get(key) or {}, bool(m.get("ok"))
+        p = _same_machine(t, m, pushed)
+        if p:
+            pushed = {h: x for h, x in pushed.items() if x is not p}
+            pw = p["windows"].get(key) or {}
+            if pw.get("rows") is not None and float(pw.get("ts") or 0) > float(w.get("ts") or 0):
+                w, ok = pw, True
+        found.append((t, m.get("host") or (p or {}).get("host"), w, ok))
+    found += [(p.get("via") or h, h, p["windows"].get(key) or {}, True) for h, p in sorted(pushed.items())]
+    for name, host, w, ok in found:
         age = now - float(w.get("ts") or 0)
-        if m.get("host") in seen:
+        if host in seen:
             continue
-        if not (m.get("ok") and age <= STALE_S):
-            stale.append(t)
+        if not (ok and age <= STALE_S):
+            stale.append(name)
         if w.get("rows") is not None and (age <= STALE_S or not rolling):   # a failed try keeps it
             usd += sum(float(r.get("usd") or 0) for r in w["rows"] if isinstance(r, dict) and _matches(r, provider, account))
             remote_projects += len(w.get("projects") or [])
-        seen.add(m.get("host") or t)
-        hosts.append(t)
+        seen.add(host or name)
+        hosts.append(name)
     others = []
     for fn in OTHER_SOURCES:
         try:

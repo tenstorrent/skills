@@ -815,9 +815,14 @@ def cmd_stats(a) -> None:
 
 def cmd_spend_today(a) -> None:
     """This machine's projects' spend in [since, until) by provider and account key: what another
-    machine's global daily total asks for over ssh (globalcap.fetch). The account itself stays here."""
+    machine's global daily total asks for over ssh (globalcap.fetch). The account itself stays here.
+    `--receive` keeps what a machine that cannot be asked pushes here instead (globalcap.push)."""
     from . import globalcap as gcap
     now = time.time()
+    if a.receive:
+        ack, rc = gcap.receive(sys.stdin.buffer.read(gcap.RECEIVE_BYTES + 1), a.via or "", now)
+        print(json.dumps(ack, sort_keys=True))
+        raise SystemExit(rc)
     if a.since is None:
         b = deep_merge(DEFAULT_CONFIG["budget"], load_account_settings().get("budget") or {})
         a.since, a.until, _ = gcap.window(b, now)
@@ -2377,6 +2382,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--since", type=float, help="from this Unix time (default: the budget day's start)")
     s.add_argument("--until", type=float)
     s.add_argument("--json", action="store_true")
+    s.add_argument("--receive", action="store_true",
+                   help="keep the spend another machine pushes on stdin (it runs this over ssh)")
+    s.add_argument("--via", help="with --receive: the sending machine's alias")
     s.set_defaults(fn=cmd_spend_today)
 
     s = sub.add_parser("clip", help="run a command, keep its full output in a file and print a short "

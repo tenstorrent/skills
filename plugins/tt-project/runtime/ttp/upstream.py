@@ -461,11 +461,11 @@ def _remote_projects() -> dict[str, str]:
             if isinstance(e, dict) and e.get("host") and e["host"] != here}
 
 
-def _ssh_receive(target: str, lines: list[bytes], timeout: float) -> tuple[dict | None, str]:
-    """Send `lines` to `ttp upstream --receive` on `target`: (its ack, "") or (None, what went wrong).
-    A hung ssh is killed with everything it started when `timeout` runs out."""
-    cmd = (f"t=~/.tt-project/lib/current/bin/ttp; [ -x \"$t\" ] || t=ttp; "
-           f"exec \"$t\" upstream --receive --via {shlex.quote(alias())}")
+def ssh_pipe(target: str, args: str, data: bytes, timeout: float) -> tuple[bytes | None, str]:
+    """Run `ttp <args>` on `target` over ssh (batch mode, known hosts only) with `data` on its stdin:
+    (its output, "") or (None, what went wrong). A hung ssh is killed with everything it started
+    when `timeout` runs out. Shared by the notes forwarder and the global spend push (globalcap)."""
+    cmd = f"t=~/.tt-project/lib/current/bin/ttp; [ -x \"$t\" ] || t=ttp; exec \"$t\" {args}"
     try:
         proc = subprocess.Popen([*SSH, "-o", "StrictHostKeyChecking=yes", "--", target, f"sh -c {shlex.quote(cmd)}"],
                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -473,7 +473,7 @@ def _ssh_receive(target: str, lines: list[bytes], timeout: float) -> tuple[dict 
     except OSError as e:
         return None, f"ssh did not start: {e}"
     try:
-        out, err = proc.communicate(b"".join(lines), timeout=timeout)
+        out, err = proc.communicate(data, timeout=timeout)
     except subprocess.TimeoutExpired:
         try:
             os.killpg(proc.pid, signal.SIGKILL)
@@ -484,6 +484,14 @@ def _ssh_receive(target: str, lines: list[bytes], timeout: float) -> tuple[dict 
     if proc.returncode != 0:
         tail = " ".join(err.decode(errors="replace").split())[-200:]
         return None, f"exit {proc.returncode}: {tail}"
+    return out, ""
+
+
+def _ssh_receive(target: str, lines: list[bytes], timeout: float) -> tuple[dict | None, str]:
+    """Send `lines` to `ttp upstream --receive` on `target`: (its ack, "") or (None, what went wrong)."""
+    out, err = ssh_pipe(target, f"upstream --receive --via {shlex.quote(alias())}", b"".join(lines), timeout)
+    if out is None:
+        return None, err
     try:
         ack = json.loads(out.decode(errors="replace").strip().splitlines()[-1])
     except (ValueError, IndexError):
