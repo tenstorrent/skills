@@ -598,6 +598,7 @@ class Daemon:
         mcp_servers: dict = {}
         resume_extra: list[str] = []
         private: list[str] = []   # files that may hold credentials, removed when the run ends
+        sandboxed = False   # the agent fences the worker's writes (see Provider.writable_args)
         if not read_only:
             # Skill plugins this project enabled for its workers only (never the user's own setup).
             dirs = [str(Path(os.path.expanduser(d))) for d in
@@ -617,7 +618,9 @@ class Daemon:
                 roots += list(dict.fromkeys([str(shared.root()), str(shared.root().resolve())]))
             except OSError:
                 pass   # `ttp lock` then says plainly that it cannot write the shared lock
-            extra = prov.writable_args(roots) + prov.plugin_args([d for d in dirs if d not in missing])
+            fence = prov.writable_args(roots)
+            sandboxed = bool(fence)
+            extra = fence + prov.plugin_args([d for d in dirs if d not in missing])
             if self.cfg["providers"].get(provider, {}).get("worker_isolation"):
                 extra += prov.isolation_args()
                 mcp_servers = self._approved_mcp(prov, provider, cwd)
@@ -634,6 +637,13 @@ class Daemon:
         # Raising from here on means nothing was launched: the run row must not stay "running".
         try:
             run_dir.mkdir(parents=True, exist_ok=True)
+            # A fenced worker gets a temp dir of its own under the run dir (inside state/, a writable
+            # root; never in the worktree): on macOS git's xcrun shim otherwise fails to write its
+            # cache, and tools that honour TMPDIR stay off the shared /tmp.
+            tmp_env = {}
+            if sandboxed:
+                (run_dir / "tmp").mkdir(exist_ok=True)
+                tmp_env = {var: str(run_dir / "tmp") for var in ("TMPDIR", "TMP", "TEMP")}
             if mcp_servers:
                 # Outside the repo and the run directory, owner-only: server entries can carry tokens.
                 fd, mcp_path = tempfile.mkstemp(prefix=f"ttp-mcp-{run_id}-", suffix=".json")
@@ -665,7 +675,7 @@ class Daemon:
             # The project's venv, so a fresh worktree need not build one; `ttp` stays first.
             venv = worktree.project_venv(self.p, cwd) if role in ("worker", "reviewer") and not read_only else None
             venv_vars = worktree.venv_env(venv, path) if venv else {}
-            env = {**env, **venv_vars, "TTP_RUN_DIR": str(run_dir), "TTP_PROJECT": str(self.p.base),
+            env = {**env, **venv_vars, **tmp_env, "TTP_RUN_DIR": str(run_dir), "TTP_PROJECT": str(self.p.base),
                    "TTP_RUN_ID": str(run_id), "TTP_TASK": str(task["id"]) if task else "", "PYTHONPATH": runtime_dir,
                    "TTP_PYTHON": sys.executable,   # `ttp` runs under this, not the venv's python3
                    # A worker's sandbox may run commands in a PID namespace of their own, which ends

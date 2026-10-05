@@ -7838,6 +7838,12 @@ def test_codex_workers_may_write_run_state_and_git_metadata(env, monkeypatch):
 
 def _codex_worker_roots(env, p, cwd):
     """The writable roots the daemon gives a Codex worker in cwd."""
+    return _codex_worker_launch(env, p, cwd)[0]
+
+
+def _codex_worker_launch(env, p, cwd):
+    """The writable roots and the environment (as the runner hands it to the agent) the daemon gives
+    a Codex worker in cwd."""
     from ttp.providers import codex as codex_provider
     from ttp.daemon import Daemon
     real = codex_provider.Codex.binary
@@ -7849,9 +7855,38 @@ def _codex_worker_roots(env, p, cwd):
     finally:
         codex_provider.Codex.binary = real
     (p.runs / str(rid) / "STOP").touch()
-    argv = json.loads((p.runs / str(rid) / "run.json").read_text())["argv"]
-    roots = next(a for a in argv if a.startswith("sandbox_workspace_write.writable_roots="))
-    return json.loads(roots.split("=", 1)[1])
+    spec = json.loads((p.runs / str(rid) / "run.json").read_text())
+    roots = next(a for a in spec["argv"] if a.startswith("sandbox_workspace_write.writable_roots="))
+    return json.loads(roots.split("=", 1)[1]), {**os.environ, **spec["env"]}
+
+
+def test_sandboxed_workers_get_a_private_writable_temp_dir(env):
+    # On macOS git is an xcrun shim; in Codex's sandbox xcrun could not write its cache under /tmp
+    # (`couldn't create cache file /tmp/xcrun_db-...`), so git failed. A fenced worker gets its own
+    # temp dir in its run dir, inside its writable roots and outside the worktree.
+    p = make(env)
+    repo = env["repo"]
+    roots, run_env = _codex_worker_launch(env, p, repo)
+    tmp = pathlib.Path(run_env["TMPDIR"])
+    assert run_env["TMP"] == run_env["TEMP"] == str(tmp) and tmp.is_dir()
+    assert tmp.parent.parent == p.runs, "the run's own dir, under state/runs"
+    assert any(tmp.is_relative_to(r) for r in roots), roots
+    (tmp / "scratch").write_text("x")
+    assert subprocess.run(["git", "-C", str(repo), "status", "--porcelain"],
+                          capture_output=True, text=True).stdout == "", "never committed with the work"
+    # An unfenced provider (no writable roots) keeps the caller's temp dir.
+    from ttp.providers import claude as claude_provider
+    from ttp.daemon import Daemon
+    real = claude_provider.Claude.binary
+    claude_provider.Claude.binary = lambda self: "/usr/bin/true"   # never a real agent
+    try:
+        tid = p.db.add_task("t", "s", kind="work", tier="light", origin="user")
+        rid = Daemon(p.base).start_run("worker", "go", "claude", "light", str(repo), task=p.db.task(tid))
+    finally:
+        claude_provider.Claude.binary = real
+    (p.runs / str(rid) / "STOP").touch()
+    assert "TMPDIR" not in json.loads((p.runs / str(rid) / "run.json").read_text())["env"]
+    assert not (p.runs / str(rid) / "tmp").exists()
 
 
 def test_codex_workers_may_write_the_shared_lock_root_only(env):
@@ -7871,13 +7906,16 @@ def test_codex_workers_may_write_the_shared_lock_root_only(env):
 
 def _codex_sandbox(cwd, roots):
     """argv prefix that runs a command in Codex's workspace-write sandbox writing only cwd and
-    roots (not /tmp, where the test lives); None when no Codex sandbox works here."""
+    roots (not the temp dir the test lives in); None when no Codex sandbox works here. /tmp stays
+    writable, as for a real worker, when the test is elsewhere (macOS: under $TMPDIR): xcrun, which
+    git calls there, falls back to /tmp for its cache."""
     import shutil
     exe = shutil.which("codex")
     if not exe:
         return None
+    in_tmp = pathlib.Path(cwd).resolve().is_relative_to(pathlib.Path("/tmp").resolve())
     argv = [exe, "sandbox", "-c", 'sandbox_mode="workspace-write"',
-            "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
+            "-c", f"sandbox_workspace_write.exclude_slash_tmp={'true' if in_tmp else 'false'}",
             "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
             "-c", "sandbox_workspace_write.writable_roots=" + json.dumps([str(r) for r in roots]), "--"]
     probe = pathlib.Path(cwd) / "probe"
@@ -7927,7 +7965,7 @@ def test_sandboxed_codex_worker_can_git_add_in_a_linked_worktree(env):
     wt = env["tmp"] / "wt-add"
     subprocess.run(["git", "-C", str(env["repo"]), "worktree", "add", "-q", str(wt)], check=True)
     gitdir = (env["repo"] / ".git" / "worktrees" / "wt-add").resolve()
-    roots = _codex_worker_roots(env, p, wt)
+    roots, run_env = _codex_worker_launch(env, p, wt)
     assert str(gitdir) in roots and str(p.state) in roots, roots
     assert not any(pathlib.Path(r) != p.state and p.state.is_relative_to(r) for r in roots), \
         "nothing above state/ becomes writable"
@@ -7935,14 +7973,14 @@ def test_sandboxed_codex_worker_can_git_add_in_a_linked_worktree(env):
     if sandbox is None:
         pytest.skip("no working Codex sandbox on this machine")
     (wt / "new.txt").write_text("x")
-    add = subprocess.run(sandbox + ["git", "add", "new.txt"], cwd=wt, capture_output=True, text=True)
+    add = subprocess.run(sandbox + ["git", "add", "new.txt"], cwd=wt, env=run_env, capture_output=True, text=True)
     assert add.returncode == 0, add.stderr
     assert "new.txt" in subprocess.run(["git", "-C", str(wt), "diff", "--cached", "--name-only"],
                                        capture_output=True, text=True).stdout
     # Without the gitdir root, as before the fix, the same add fails on index.lock.
     old = _codex_sandbox(wt, [r for r in roots if r != str(gitdir)])
     (wt / "other.txt").write_text("y")
-    add = subprocess.run(old + ["git", "add", "other.txt"], cwd=wt, capture_output=True, text=True)
+    add = subprocess.run(old + ["git", "add", "other.txt"], cwd=wt, env=run_env, capture_output=True, text=True)
     assert add.returncode != 0 and "index.lock" in add.stderr, add.stderr
 
 
@@ -7960,7 +7998,7 @@ def test_sandboxed_codex_worker_writes_all_git_metadata_of_a_task_worktree(env, 
     wt = p.worktrees / "t30"
     subprocess.run(["git", "-C", str(repo), "worktree", "add", "-q", "-b", "ttp/t30-x", str(wt), "HEAD~1"],
                    check=True, capture_output=True)
-    roots = _codex_worker_roots(env, p, wt)
+    roots, run_env = _codex_worker_launch(env, p, wt)
     sandbox = _codex_sandbox(wt, roots)
     if sandbox is None:
         pytest.skip("no working Codex sandbox on this machine")
@@ -7968,7 +8006,7 @@ def test_sandboxed_codex_worker_writes_all_git_metadata_of_a_task_worktree(env, 
     script = ("set -e; git merge -q --ff-only " + target + "; echo y > y.txt; git add y.txt; "
               "git commit -qm y; git branch side; git tag t1; git reset -q --soft HEAD~1; "
               "git commit -qm again; git pack-refs --all; git reflog -1")
-    r = subprocess.run(sandbox + ["sh", "-c", script], cwd=wt, capture_output=True, text=True)
+    r = subprocess.run(sandbox + ["sh", "-c", script], cwd=wt, env=run_env, capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     assert _git_out(wt, "rev-parse", "HEAD~1") == target and _git_out(wt, "log", "-1", "--format=%s") == "again"
     assert _git_out(repo, "rev-parse", "side", "t1").count("\n") == 1
@@ -7976,7 +8014,7 @@ def test_sandboxed_codex_worker_writes_all_git_metadata_of_a_task_worktree(env, 
     gitdir = _git_out(wt, "rev-parse", "--absolute-git-dir")
     _git_out(wt, "reset", "-q", "--hard", "HEAD~2")
     old = _codex_sandbox(wt, [r for r in roots if r != gitdir])
-    r = subprocess.run(old + ["git", "merge", "--ff-only", target], cwd=wt, capture_output=True, text=True)
+    r = subprocess.run(old + ["git", "merge", "--ff-only", target], cwd=wt, env=run_env, capture_output=True, text=True)
     assert r.returncode != 0 and "ORIG_HEAD.lock" in r.stderr, r.stderr
 
 def test_ttp_lock_says_plainly_when_the_shared_lock_is_not_writable(env):
