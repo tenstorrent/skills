@@ -7855,7 +7855,13 @@ def _codex_worker_launch(env, p, cwd):
     finally:
         codex_provider.Codex.binary = real
     (p.runs / str(rid) / "STOP").touch()
+    deadline = time.time() + 30
+    while not (p.runs / str(rid) / "exit.json").exists() and time.time() < deadline:
+        time.sleep(0.05)
     spec = json.loads((p.runs / str(rid) / "run.json").read_text())
+    if spec.get("tmp_dir"):
+        # The runner removed it when the stand-in agent ended; a live worker has it.
+        pathlib.Path(spec["tmp_dir"]).mkdir(exist_ok=True)
     roots = next(a for a in spec["argv"] if a.startswith("sandbox_workspace_write.writable_roots="))
     return json.loads(roots.split("=", 1)[1]), {**os.environ, **spec["env"]}
 
@@ -8068,6 +8074,11 @@ log.mkdir(parents=True, exist_ok=True)
 (log / "argv.json").write_text(json.dumps(sys.argv))
 (log / "cwd.txt").write_text(os.getcwd())
 (log / "stdin.txt").write_text(sys.stdin.read())
+tmp = os.environ.get("TMPDIR", "")
+if os.environ.get("TTP_RUN_DIR") and tmp.startswith(os.environ["TTP_RUN_DIR"]):
+    (Path(tmp) / "scratch").mkdir()   # a run's own temp dir only, never the test's
+    (Path(tmp) / "scratch" / "basetemp.txt").write_text("x")
+    (log / "tmpdir.txt").write_text(tmp)
 if os.environ.get("FAKE_CLI_RESULT"):
     (Path(os.environ["TTP_RUN_DIR"]) / "result.json").write_text(os.environ["FAKE_CLI_RESULT"])
 pace, streaming = float(os.environ.get("FAKE_CLI_PACE") or 0), "stream-json" in sys.argv
@@ -8154,6 +8165,35 @@ def test_codex_worker_launches_on_stdin_and_hands_off(env, monkeypatch):
     assert run["input_tokens"] == 1000 and run["output_tokens"] == 500
     assert run["cost_usd"] == pytest.approx((1000 * 4.0 + 500 * 20.0) / 1e6), "priced from the default row"
     assert task["status"] == "done" and task["spent_usd"] == pytest.approx(run["cost_usd"])
+
+
+def test_sandboxed_worker_temp_dir_is_removed_when_the_run_ends(env, monkeypatch):
+    # Run dirs are kept, so a fenced worker's temp files (pytest basetemps, build scratch) that the
+    # OS used to clean from /tmp must not pile up in state/: the runner removes the dir at the end.
+    done = {"status": "done", "summary": "ok"}
+    p, run, task, _, _ = _cli_run(env, monkeypatch, "codex", _codex_events(*_codex_turn("all done")), result=done)
+    run_dir = p.runs / str(run["id"])
+    tmp = pathlib.Path((env["tmp"] / "fakecli" / "tmpdir.txt").read_text())
+    assert tmp == run_dir / "tmp", "the agent wrote its scratch into its own temp dir"
+    assert not tmp.exists(), "the run's temp dir outlived the run"
+    assert (run_dir / "run.json").exists() and (run_dir / "result.json").exists() and (run_dir / "exit.json").exists()
+    assert run["status"] == "ok" and task["status"] == "done"
+
+
+def test_remove_private_removes_only_the_run_temp_dir(env):
+    # The daemon's fallback for a runner that died; it never deletes outside the run dir.
+    from ttp import runner
+    run_dir = env["tmp"] / "runs" / "7"
+    (run_dir / "tmp" / "deep").mkdir(parents=True)
+    (run_dir / "tmp" / "deep" / "f").write_text("x")
+    outside = env["tmp"] / "keep"
+    outside.mkdir()
+    (run_dir / "run.json").write_text(json.dumps({"private_files": [], "tmp_dir": str(run_dir / "tmp")}))
+    runner.remove_private(run_dir)
+    assert not (run_dir / "tmp").exists() and (run_dir / "run.json").exists()
+    (run_dir / "run.json").write_text(json.dumps({"tmp_dir": str(outside)}))
+    runner.remove_private(run_dir)
+    assert outside.is_dir(), "a temp dir outside the run dir must never be removed"
 
 
 def test_codex_error_it_retried_does_not_fail_a_completed_turn(env, monkeypatch):

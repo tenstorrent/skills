@@ -639,7 +639,8 @@ class Daemon:
             run_dir.mkdir(parents=True, exist_ok=True)
             # A fenced worker gets a temp dir of its own under the run dir (inside state/, a writable
             # root; never in the worktree): on macOS git's xcrun shim otherwise fails to write its
-            # cache, and tools that honour TMPDIR stay off the shared /tmp.
+            # cache, and tools that honour TMPDIR stay off the shared /tmp. The runner removes it when
+            # the run ends (remove_private if the runner died).
             tmp_env = {}
             if sandboxed:
                 (run_dir / "tmp").mkdir(exist_ok=True)
@@ -695,7 +696,7 @@ class Daemon:
                                    "holder": shared.holder(self.p, res, f"task #{task['id']}", self.cfg)}
                                   for res in _exclusive(task)] if task else [],
                     "exclusive_wait_s": self.cfg["budget"].get("exclusive_wait_s", 600),
-                    "private_files": private}
+                    "private_files": private, "tmp_dir": tmp_env.get("TMPDIR")}
             durable_write(run_dir / "run.json", json.dumps(spec, indent=1))   # read again after a reboot
             with open(run_dir / "runner.log", "wb") as out:
                 proc = subprocess.Popen([sys.executable, "-m", "ttp.runner", str(run_dir)], cwd=runtime_dir,

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -127,11 +128,21 @@ def remove_files(paths: list[str]) -> None:
             pass
 
 
+def remove_tmp(run_dir: Path, spec: dict) -> None:
+    """Delete the run's private temp dir: run dirs are kept, so its scratch must not pile up there.
+    Only a dir directly inside the run dir is ever removed."""
+    tmp = spec.get("tmp_dir")
+    if tmp and Path(tmp).parent.resolve() == run_dir.resolve() and not Path(tmp).is_symlink():
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def remove_private(run_dir: Path) -> None:
-    """Delete the run's private files (a per-run MCP config may carry credentials)."""
+    """Delete the run's private files (a per-run MCP config may carry credentials) and temp dir."""
     try:
-        remove_files(json.loads((run_dir / "run.json").read_text()).get("private_files") or [])
-    except (OSError, ValueError):
+        spec = json.loads((run_dir / "run.json").read_text())
+        remove_files(spec.get("private_files") or [])
+        remove_tmp(run_dir, spec)
+    except (OSError, ValueError, AttributeError):
         pass
 
 
@@ -158,6 +169,7 @@ def supervise(run_dir: Path) -> int:
     held = _take_exclusive(run_dir, spec.get("exclusive") or [], spec.get("env", {}), started + wait_s)
     if held is None:
         remove_files(spec.get("private_files") or [])
+        remove_tmp(run_dir, spec)
         exit_info = {"rc": None, "started": started, "ended": time.time(),
                      "stopped": stop_reason(run_dir) or "resource_busy", "launched": False}
         durable_write(run_dir / "exit.json", json.dumps(exit_info))
@@ -228,6 +240,7 @@ def supervise(run_dir: Path) -> int:
     rc = child.wait()
     ended, mono_end = time.time(), time.monotonic()
     remove_files(spec.get("private_files") or [])
+    remove_tmp(run_dir, spec)
     for f in (prompt, out, err, *held):
         f.close()
     exit_info = {"rc": rc, "started": started, "ended": ended, "stopped": reason[0] if reason else None,
