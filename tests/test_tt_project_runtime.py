@@ -8730,6 +8730,39 @@ def test_the_push_result_probe_reports_a_malformed_queued_marker_as_failed(env, 
     assert push.result(marker) == 0
     assert "not pushed" in capsys.readouterr().out and "malformed" in json.loads(marker.read_text())["reason"]
 
+
+def test_the_push_result_probe_reports_a_malformed_marker_it_cannot_rewrite(env, capsys, monkeypatch):
+    """When the failed verdict cannot be written back, the probe still reports it, not a traceback."""
+    from ttp import push
+    p = make(env)
+    folder = p.state / push.DETACHED
+    folder.mkdir(parents=True)
+    marker = folder / "x.json"
+    marker.write_text(json.dumps({"id": "x", "status": "queued", "queued": "soon"}))
+    def unwritable(*a, **k):
+        raise OSError("read-only")
+    monkeypatch.setattr(push, "write_json", unwritable)
+    assert push.result(marker) == 0
+    out = capsys.readouterr().out
+    assert "not pushed (malformed marker" in out, out
+
+
+def test_the_push_result_probe_reports_a_running_marker_with_a_bad_start_as_failed(env, capsys):
+    """A running marker whose start time is not a number gets a verdict, not a traceback."""
+    from ttp import locks, push
+    p = make(env)
+    folder = p.state / push.DETACHED
+    folder.mkdir(parents=True)
+    marker = folder / "x.json"
+    marker.write_text(json.dumps({"id": "x", "status": "running", "started": "soon", "pid": 1}))
+    held = locks.try_take([push._run_lock(marker)], "detached push x")   # it really runs
+    try:
+        assert push.result(marker) == 0
+    finally:
+        held.close()
+    out = capsys.readouterr().out
+    assert "not pushed (malformed marker" in out, out
+
 def test_runs_carry_the_daemons_pid_namespace(env):
     from ttp import push
     from ttp.daemon import Daemon

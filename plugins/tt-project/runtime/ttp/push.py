@@ -1068,12 +1068,14 @@ def result(marker: Path) -> int:
         return REFUSED
     try:
         m = _settle(marker)
-        took = time.time() - float(m.get("queued") or time.time()) if m.get("status") == "queued" else 0
+        since = {"queued": "queued", "running": "started"}.get(m.get("status"))
+        took = time.time() - float(m.get(since) or time.time()) if since else 0
     except (TypeError, ValueError) as e:   # a malformed marker: a clear verdict, not a traceback
-        _malformed(marker, e)
-        m = _read(marker)
+        _malformed(marker, e)   # best effort: the verdict does not depend on the rewrite
+        m = {**_read(marker), "status": "failed", "exit": None,
+             "reason": f"malformed marker ({type(e).__name__}: {e})"}
+        took = 0
     if m.get("status") == "running":
-        took = time.time() - float(m.get("started") or time.time())
         print(f"ttp push: still running (pid {m.get('pid')}, {took:.0f} s); log: {m.get('log')}")
         return 1
     if m.get("status") == "queued":
