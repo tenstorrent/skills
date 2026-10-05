@@ -9804,6 +9804,173 @@ def test_a_pushed_batch_closes_the_review_done_without_any_model_run(env, monkey
     assert pushq.finalize(s.p) == [] and pushq.tend(s.p) == [] and state() == before, "a second finalize changed things"
 
 
+def _pq_rows(env, on=True):
+    """A plain project (no git remote) with the push queue on or off, for the displays: rows are
+    written straight into push_queue and push_batches."""
+    p = make(env)
+    if on:
+        p.set_config("delivery.push_queue", True)
+        p.set_config("delivery.push_branch", "origin/proj")
+    rid = p.db.add_task("review feature", "r", kind="review", origin="coordinator")
+    p.db.update_task(rid, status="pushing")
+    return p, rid
+
+
+def _pq_row(p, task, now, status="approved", age=360, batch=None, head="ab" * 20, **more):
+    p.db.x("INSERT INTO push_queue(task, branch, head, target, status, batch, created, updated, pushed_sha, version) "
+           "VALUES(?,?,?,?,?,?,?,?,?,?)", (task, "ttp/t1-feature", head, "origin/proj", status, batch, now - age, now,
+                                           more.get("sha"), more.get("version")))
+
+
+def _pq_batch_row(p, bid, now, age=120, phase=None, **cols):
+    marker = p.state / "pushes" / f"{bid}.json"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps({"id": bid, "phase": phase or "finished"}))
+    p.db.x("INSERT INTO push_batches(id, marker, target, started) VALUES(?,?,?,?)", (bid, str(marker), "origin/proj",
+                                                                                     now - age))
+    for k, v in cols.items():
+        p.db.x(f"UPDATE push_batches SET {k}=? WHERE id=?", (v, bid))
+
+
+@pytest.mark.parametrize("case", ["off", "empty", "approved", "running", "deploying", "finished", "failed"])
+def test_status_shows_one_push_queue_line_in_each_state_and_never_a_command(env, case):
+    from ttp import pushq
+    from ttp.cli import status_text
+    p, rid = _pq_rows(env, on=case != "off")
+    now = time.time()
+    sha = "cd" * 20
+    if case in ("approved", "running", "failed"):
+        _pq_row(p, rid, now, age=361)
+        _pq_row(p, rid, now, age=60, head="ef" * 20)
+    if case == "running":
+        _pq_batch_row(p, "b2", now, age=125, phase="push")
+        _pq_row(p, rid, now, status="batched", batch="b2", age=200)
+        _pq_row(p, rid, now, status="batched", batch="b2", age=150)
+    if case in ("deploying", "finished", "failed"):
+        _pq_batch_row(p, "b1", now, age=900, outcome="pushed", pushed_sha=sha, version="0.2.140", ended=now - 720,
+                      finalized=now - 715, check_runs=1, check_s=242.4,
+                      **({"after_push": "ok", "after_finalized": now - 700} if case != "deploying" else {}))
+        if case == "deploying":   # the push phase is over (finalized); after_push still runs
+            (p.state / "pushes" / "b1.json").write_text(json.dumps({"id": "b1", "phase": "after_push"}))
+            _pq_row(p, rid, now, status="pushed", batch="b1", age=1000, sha=sha, version="0.2.140")
+    if case == "failed":
+        _pq_batch_row(p, "b3", now, age=400, outcome="tip_failed", tip="aa" * 20, ended=now - 300,
+                      finalized=now - 290, after_push="skipped", after_finalized=now - 290, check_runs=1, check_s=30)
+    line = pushq.status_line(p, now)
+    want = {
+        "off": None,
+        "empty": "push queue: empty",
+        "approved": "push queue: 2 approved (oldest 6 min)",
+        "running": "push queue: 2 approved (oldest 6 min) · batch checking since 2 min (2 changes)",
+        "deploying": f"push queue: batch deploying since 15 min (1 change) · last pushed {sha[:7]} as 0.2.140 12 min ago",
+        "finished": f"push queue: empty · last pushed {sha[:7]} as 0.2.140 12 min ago · deploy ok",
+        "failed": f"push queue: 2 approved (oldest 6 min) · last batch the branch tip fails its checks 5 min ago · "
+                  f"last pushed {sha[:7]} as 0.2.140 12 min ago · deploy ok",
+    }[case]
+    assert line == want
+    assert [ln for ln in status_text(p).splitlines() if ln.startswith("push queue")] == ([want] if want else [])
+    if want:
+        assert "ttp " not in line and "`" not in line and " run " not in line, "the status line tells the user to act"
+
+
+def test_the_push_queue_line_stays_once_the_queue_is_off_while_it_has_rows(env):
+    from ttp import pushq
+    p, rid = _pq_rows(env, on=False)
+    now = time.time()
+    _pq_row(p, rid, now, age=60)
+    assert pushq.status_line(p, now) == "push queue (off): 1 approved (oldest 1 min)"
+
+
+def test_ttp_push_queue_lists_the_entries_and_the_last_ten_batches(env, monkeypatch, capsys):
+    from ttp import cli, pushq
+    p, rid = _pq_rows(env)
+    now = time.time()
+    sha = "cd" * 20
+    for i in range(12):
+        _pq_batch_row(p, f"b{i:02d}", now, age=7200 - i * 60, outcome="nothing", ended=now - 7000 + i * 60,
+                      finalized=now, after_push="skipped", after_finalized=now)
+    _pq_batch_row(p, "b20", now, age=900, outcome="pushed", pushed_sha=sha, version="0.2.140", ended=now - 720,
+                  finalized=now, check_runs=2, check_s=242.4, after_push="failed", after_finalized=now)
+    _pq_row(p, rid, now, status="pushed", batch="b20", age=1000, sha=sha, version="0.2.140")
+    _pq_row(p, rid, now, age=361, head="ef" * 20)
+    _pq_batch_row(p, "b21", now, age=30, phase="push")
+    _pq_row(p, rid, now, status="batched", batch="b21", age=100, head="12" * 20)
+    out = pushq.queue_text(p, now).splitlines()
+    assert out[0].startswith("push queue: 1 approved (oldest 6 min) · batch checking since 0 min (1 change) · "
+                             f"last pushed {sha[:7]} as 0.2.140 12 min ago · deploy failed"), out[0]
+    i = out.index("entries:")
+    assert out[i + 1:i + 4] == [
+        f"  #{rid} ttp/t1-feature 1212121 batched in b21, 1 min old: review feature",
+        f"  #{rid} ttp/t1-feature efefefe approved, 6 min old: review feature",
+        f"  #{rid} ttp/t1-feature abababa pushed in b20, 16 min old: review feature"]
+    j = out.index("batches, newest first:")
+    assert out[j + 1] == "  b21 running: checking since 0 min, 1 change"
+    assert out[j + 2] == f"  b20 12 min ago: pushed {sha[:7]} as 0.2.140, checks 2 runs in 242 s, deploy failed"
+    assert out[j + 3].startswith("  b11 ") and out[j + 3].endswith("ago: nothing to push, no deploy")
+    assert len(out) - j - 2 == 10, "the last 10 batches, plus the live one"
+    # the CLI flag prints the same, from the project's folder, and pushes nothing
+    monkeypatch.chdir(p.root)
+    monkeypatch.setattr(sys, "argv", ["ttp", "push", "--queue"])
+    cli.main()
+    printed = capsys.readouterr().out
+    assert "entries:" in printed and "b20 12 min ago: pushed" in printed
+
+
+def test_the_web_app_shows_the_push_queue_card_and_the_pushed_sha_of_a_review(env):
+    from ttp.web import state_payload
+    p, rid = _pq_rows(env)
+    assert state_payload(p, p.db)["push_queue"]["line"] == "push queue: empty"
+    now = time.time()
+    sha = "cd" * 20
+    _pq_batch_row(p, "b1", now, age=900, outcome="pushed", pushed_sha=sha, version="0.2.140", ended=now - 720,
+                  finalized=now, check_runs=1, check_s=200.0, after_push="ok", after_finalized=now)
+    _pq_row(p, rid, now, status="pushed", batch="b1", sha=sha, version="0.2.140")
+    p.db.update_task(rid, status="done", result=json.dumps({"status": "done", "summary": "ok", "pushed": [
+        {"branch": "ttp/t1-feature", "head": "ab" * 20, "sha": sha, "version": "0.2.140", "batch": "b1",
+         "status": "pushed"}]}))
+    other = p.db.add_task("another review", "r", kind="review", origin="coordinator")
+    p.db.update_task(other, status="pushing")
+    _pq_row(p, other, now, age=120, head="ef" * 20)
+    st = json.loads(json.dumps(state_payload(p, p.db), default=str))
+    q = st["push_queue"]
+    assert q["on"] and q["line"].startswith("push queue: 1 approved (oldest 2 min) · last pushed")
+    assert [(e["task"], e["head"], e["status"]) for e in q["entries"]] == [(other, "efefefe", "approved"),
+                                                                          (rid, "abababa", "pushed")]
+    assert [(b["id"], b["outcome"], b["pushed_sha"], b["version"], b["check_runs"], b["after_push"])
+            for b in q["last"]] == [("b1", "pushed", sha, "0.2.140", 1, "ok")]
+    tasks = {t["id"]: t for t in st["tasks"]}
+    assert tasks[rid]["pushed"] == [{"branch": "ttp/t1-feature", "sha": sha, "version": "0.2.140", "status": "pushed"}]
+    assert tasks[other]["status"] == "pushing" and tasks[other]["pushed"] is None
+    app = (RUNTIME / "ttp" / "web" / "app.js").read_text()
+    assert "pushQueueHtml(st.push_queue)" in app and "t.pushed" in app
+    assert 'id="pqcard"' in (RUNTIME / "ttp" / "web" / "index.html").read_text()
+
+
+def test_only_the_three_push_queue_alerts_reach_the_top_section_and_only_while_active(env):
+    from ttp import alerts
+    from ttp.daemon import Daemon
+    from ttp.web import state_payload
+    p, rid = _pq_rows(env)
+    d = Daemon(p.base)
+    now = time.time()
+    for key in ("push_rejected", "after_push_failed", "push_queue_dying"):
+        d.alert(key, f"{key} text", severity="high")
+    # The rest is news for the coordinator or the feed, never the top section.
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+           (now, "daemon", "push_tip_failed", "high", "the tip fails", "queued"))
+    p.db.post("out", "push batch b0 ended nothing", chat=None, kind="info", severity="normal")
+    top = lambda: sorted(m["text"] for m in state_payload(p, p.db)["attention"])  # noqa: E731
+    assert top() == ["after_push_failed text", "push_queue_dying text", "push_rejected text"]
+    later = time.time() + 1
+    _pq_batch_row(p, "b1", later, age=0, outcome="pushed", pushed_sha="cd" * 20, ended=later, finalized=later,
+                  after_push="ok", after_finalized=later)
+    assert top() == [], "a pushed and deployed batch clears all three"
+    assert sorted(ep["key"] for ep in alerts.sweep(p.db, later + 1)) == [
+        "after_push_failed", "push_queue_dying", "push_rejected"]
+    feed = [m for m in state_payload(p, p.db)["feed"] if m["state"] == "cleared"]
+    assert sorted(m["text"] for m in feed) == ["after_push_failed text", "push_queue_dying text", "push_rejected text"]
+
+
 def test_a_conflicting_push_runs_the_review_again_with_the_conflict_and_what_landed(env, monkeypatch):
     s = _pq(env, monkeypatch)
     base, onto, tip = _git_out(s.repo, "rev-parse", f"{s.head}^"), "ef" * 20, "aa" * 20

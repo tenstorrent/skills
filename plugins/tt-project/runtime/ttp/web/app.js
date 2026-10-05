@@ -46,6 +46,7 @@ function taskRow(t) {
   return `<details class="row"><summary><span class="id">#${t.id}</span> <span class="st st-${t.status}">${label}</span>
     <span class="title">${esc(t.title)}</span> <span class="meta">${esc(t.tier)} · ${money(t.spent_usd)}${t.budget_usd ? " / " + money(t.budget_usd) : ""} · ${ago(t.updated)} ago${t.pr_url ? ` · <a href="${esc(t.pr_url)}" target="_blank" rel="noopener">PR</a>` : ""}</span></summary>
     ${t.blocked_reason ? `<p><b>${noteLabel}:</b> ${esc(t.blocked_reason)}</p>` : ""}${t.result ? `<p>${esc(t.result)}</p>` : ""}
+    ${(t.pushed || []).map((x) => `<p class="meta">${x.status === "landed" ? "already on the branch" : "pushed"} ${esc((x.sha || "").slice(0, 7))}${x.version ? " as " + esc(x.version) : ""} (${esc(x.branch || "?")})</p>`).join("")}
     <p class="meta">origin ${esc(t.origin)} · kind ${esc(t.kind)} · attempts ${t.attempts}${t.branch ? " · branch " + esc(t.branch) : ""}</p>
     ${["queued", "running", "blocked", "pushing"].includes(t.status) ? `<button class="ghost" onclick="taskAct(${t.id},'cancelled')">Cancel</button>` : ""}
     ${["blocked", "failed"].includes(t.status) ? `<button class="ghost" onclick="taskAct(${t.id},'queued')">Retry</button>` : ""}</details>`;
@@ -102,6 +103,16 @@ const codes = (t) => esc(t).replace(/`([^`]+)`/g, "<code>$1</code>");
 function banner(html) {
   $("#banner").innerHTML = html;
   $("#banner").hidden = !html;
+}
+
+// The push queue card: what waits, the live batch, and the recent batches with their deploy.
+function pushQueueHtml(q) {
+  const ent = (q.entries || []).map((e) => `<div class="row"><span class="id">#${e.task}</span><span class="st st-${esc(e.status)}">${esc(e.status)}</span>` +
+    `<span class="title">${esc(e.title || "")}</span><span class="meta">${esc(e.branch || "?")} ${esc(e.head)} · ${ago(Date.now() / 1000 - e.age_s)} old${e.pushed_sha ? ` · ${esc(e.pushed_sha)}` : ""}</span></div>`).join("");
+  const b = (q.last || []).map((x) => `<div class="row"><span class="id">${esc(x.id)}</span><span class="st ${x.outcome === "pushed" ? "st-done" : ["pushed", "landed", "nothing"].includes(x.outcome) ? "" : "st-failed"}">${esc(x.outcome || "?")}</span>` +
+    `<span class="meta">${x.pushed_sha ? esc(x.pushed_sha.slice(0, 7)) + (x.version ? " as " + esc(x.version) : "") + " · " : ""}${x.check_runs != null ? `checks ${x.check_runs} run${x.check_runs === 1 ? "" : "s"}${x.check_s != null ? ` in ${Math.round(x.check_s)} s` : ""} · ` : ""}` +
+    `deploy ${esc(x.after_push || (q.live && q.live.id === x.id ? "running" : "pending"))} · ${ago(x.ended || x.started)} ago</span></div>`).join("");
+  return (ent ? `<h3>Entries</h3>${ent}` : `<p class="muted">Nothing waiting.</p>`) + (b ? `<h3>Recent batches</h3>${b}` : "");
 }
 
 function healthHtml(h) {
@@ -168,6 +179,8 @@ async function refresh() {
   $("#top").textContent = [h.spend.in_flight ? `~${money(h.spend.in_flight)} so far in running work` : "",
     h.spend.top_7d ? `Top spender, 7 days: ${h.spend.top_7d.source} ${money(h.spend.top_7d.usd)}` : ""].filter(Boolean).join(" · ");
   $("#chealth").innerHTML = healthHtml(h);
+  $("#pqcard").hidden = !st.push_queue;
+  if (st.push_queue) { $("#pqline").textContent = st.push_queue.line || ""; $("#pq").innerHTML = pushQueueHtml(st.push_queue); }
   $("#chealth").querySelectorAll("[data-resume-resource]").forEach((b) => b.onclick = async () => {
     await api("/api/pause", { resource: b.dataset.resumeResource, paused: false }); refresh(); });
   announce(st.attention || [], st.project.name);

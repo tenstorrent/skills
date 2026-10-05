@@ -833,11 +833,12 @@ def pushed_heads(db, since: float = 0) -> set[str]:
                                     (since,))}
 
 
-def summary(p: Project, now: float | None = None, last: int = 5) -> dict:
+def summary(p: Project, now: float | None = None, last: int = 5, db=None) -> dict:
     """The queue for status displays: approved rows with their ages, the live batch's phase and
-    age, and the last batches with outcome, sha, version and after_push."""
+    age, and the last batches with outcome, sha, version and after_push. `db` is the caller's
+    connection (the web app's threads each have their own); default p.db."""
     now = time.time() if now is None else now
-    db = p.db
+    db = db or p.db
     approved = [{"id": r["id"], "task": r["task"], "branch": r["branch"], "head": r["head"], "target": r["target"],
                  "tries": r["tries"], "age_s": round(now - r["created"], 1)}
                 for r in db.q("SELECT * FROM push_queue WHERE status='approved' ORDER BY id")]
@@ -852,6 +853,119 @@ def summary(p: Project, now: float | None = None, last: int = 5) -> dict:
                                   "check_runs", "check_s")}
                for r in db.q("SELECT * FROM push_batches WHERE finalized IS NOT NULL ORDER BY started DESC LIMIT ?",
                              (last,))]
+    pushed = db.one("SELECT id, pushed_sha, version, ended, after_push FROM push_batches WHERE outcome='pushed' "
+                    "AND pushed_sha IS NOT NULL ORDER BY started DESC LIMIT 1")
     st = _state(db)
-    return {"on": enabled(p), "approved": approved, "live": live, "last": batches,
+    return {"on": enabled(p), "approved": approved, "live": live, "last": batches, "last_pushed": pushed,
             "backoff_until": st.get("backoff_until"), "hold": st.get("hold"), "deaths": int(st.get("deaths") or 0)}
+
+
+# What a live batch is doing, a finished batch's outcome and its after_push, in words for the user.
+PHASE_WORDS = {"push": "checking", "after_push": "deploying", "finished": "finishing"}
+OUTCOME_WORDS = {"pushed": "pushed", "landed": "already on the branch", "nothing": "nothing to push",
+                 "conflict": "conflicted", "tip_failed": "the branch tip fails its checks", "moved": "the branch kept moving",
+                 "busy": "another push held the branch", "rejected": "rejected by the remote", "refused": "refused",
+                 "died": "ended before finishing", "error": "failed"}
+AFTER_WORDS = {"ok": "deploy ok", "failed": "deploy failed", "timeout": "deploy timed out",
+               "killed": "deploy cut short", "skipped": "no deploy"}
+
+
+def _age(s: float) -> str:
+    s = max(float(s), 0.0)
+    return f"{int(s // 60)} min" if s < 7200 else f"{s / 3600:.0f} h" if s < 172800 else f"{s / 86400:.0f} days"
+
+
+def _at(ts: float, now: float) -> str:
+    return time.strftime("%H:%M" if abs(ts - now) < 20 * 3600 else "%a %H:%M", time.localtime(ts))
+
+
+def shown(p: Project, db=None) -> bool:
+    """The queue appears in status displays: it is on, or it has rows from before it was turned off."""
+    db = db or p.db
+    return enabled(p) or bool(db.one("SELECT 1 FROM push_queue LIMIT 1") or db.one("SELECT 1 FROM push_batches LIMIT 1"))
+
+
+def status_line(p: Project, now: float | None = None, sm: dict | None = None, db=None) -> str | None:
+    """`ttp status`'s one line about the queue (None when it is not shown): what waits, the live batch,
+    the last push and its deploy. Plain facts; the daemon acts on all of it, so it names no command."""
+    if not shown(p, db):
+        return None
+    now = time.time() if now is None else now
+    sm = sm or summary(p, now, db=db)
+    parts = []
+    n = len(sm["approved"])
+    if n:
+        parts.append(f"{n} approved (oldest {_age(max(a['age_s'] for a in sm['approved']))})")
+    live = sm["live"]
+    if live:
+        k = live["rows"]
+        parts.append(f"batch {PHASE_WORDS.get(live['phase'], live['phase'])} since {_age(live['age_s'])} "
+                     f"({k} change{'s' if k != 1 else ''})")
+    if not n and not live:
+        parts.append("empty")
+    last = sm["last"][0] if sm["last"] else None
+    if last and last["outcome"] != "pushed" and not (live and live["id"] == last["id"]):
+        parts.append(f"last batch {OUTCOME_WORDS.get(last['outcome'], last['outcome'])} "
+                     f"{_age(now - (last['ended'] or last['started']))} ago")
+    hold = sm.get("hold") or {}
+    wait = max(float(sm.get("backoff_until") or 0), float(hold.get("until") or 0))
+    if wait > now and n and not live:
+        parts.append(f"next try {_at(wait, now)}")
+    lp = sm.get("last_pushed")
+    if lp:
+        parts.append(f"last pushed {_short(lp['pushed_sha'])}" + (f" as {lp['version']}" if lp["version"] else "")
+                     + (f" {_age(now - lp['ended'])} ago" if lp["ended"] else ""))
+        if lp["after_push"] in AFTER_WORDS and lp["after_push"] != "skipped":
+            parts.append(AFTER_WORDS[lp["after_push"]])   # while it deploys, the live part says so
+    return "push queue" + ("" if sm["on"] else " (off)") + ": " + " · ".join(parts)
+
+
+def entries(p: Project, sm: dict, now: float, limit: int = 50, db=None) -> list[dict]:
+    """The rows still in the queue and those of the batches in `sm` (a summary), newest first."""
+    ids = [b["id"] for b in sm["last"]] + ([sm["live"]["id"]] if sm["live"] else [])
+    rows = (db or p.db).q("SELECT q.*, t.title FROM push_queue q LEFT JOIN tasks t ON t.id=q.task WHERE q.status IN "
+                  f"('approved','batched') OR q.batch IN ({','.join('?' * len(ids)) or 'NULL'}) "
+                  "ORDER BY q.id DESC LIMIT ?", (*ids, limit))
+    return [{"id": r["id"], "task": r["task"], "title": r["title"], "branch": r["branch"], "head": _short(r["head"]),
+             "status": r["status"], "batch": r["batch"], "tries": r["tries"], "age_s": round(now - r["created"], 1),
+             "pushed_sha": _short(r["pushed_sha"]) if r["pushed_sha"] else None, "version": r["version"]}
+            for r in rows]
+
+
+def web(p: Project, db=None, now: float | None = None) -> dict | None:
+    """The web app's push queue card (None when it is not shown): the summary, the status line and
+    the entries, read through the caller's connection `db`."""
+    if not shown(p, db):
+        return None
+    now = time.time() if now is None else now
+    sm = summary(p, now, last=10, db=db)
+    return {**sm, "line": status_line(p, now, sm, db), "entries": entries(p, sm, now, db=db)}
+
+
+def queue_text(p: Project, now: float | None = None, last: int = 10) -> str:
+    """`ttp push --queue`: the open entries and the recent ones, then the last batches."""
+    now = time.time() if now is None else now
+    sm = summary(p, now, last=last)
+    lines = [status_line(p, now, sm) or "push queue: off, nothing queued yet"]
+    rows = entries(p, sm, now)
+    lines.append("entries:" if rows else "entries: none")
+    for r in rows:
+        lines.append(f"  #{r['task']} {r['branch'] or '?'} {r['head']} {r['status']}"
+                     + (f" (try {r['tries'] + 1})" if r["tries"] and r["status"] == "approved" else "")
+                     + (f" in {r['batch']}" if r["batch"] and r["status"] != "approved" else "")
+                     + f", {_age(r['age_s'])} old" + (f": {r['title']}" if r["title"] else ""))
+    lv = sm["live"]
+    lines.append("batches, newest first:" if sm["last"] or lv else "batches: none yet")
+    if lv and lv["id"] not in [b["id"] for b in sm["last"]]:   # still in its push phase
+        lines.append(f"  {lv['id']} running: {PHASE_WORDS.get(lv['phase'], lv['phase'])} since {_age(lv['age_s'])}, "
+                     f"{lv['rows']} change{'s' if lv['rows'] != 1 else ''}")
+    for b in sm["last"]:
+        what = OUTCOME_WORDS.get(b["outcome"], b["outcome"] or "?")
+        if b["pushed_sha"]:
+            what += f" {_short(b['pushed_sha'])}" + (f" as {b['version']}" if b["version"] else "")
+        checks = (f", checks {b['check_runs']} run{'s' if b['check_runs'] != 1 else ''}"
+                  + (f" in {b['check_s']:.0f} s" if b["check_s"] is not None else "")) if b["check_runs"] is not None else ""
+        deploy = AFTER_WORDS.get(b["after_push"], b["after_push"]) if b["after_push"] else (
+            f"deploying since {_age(lv['age_s'])}" if lv and lv["id"] == b["id"] else "deploy pending")
+        lines.append(f"  {b['id']} {_age(now - (b['ended'] or b['started']))} ago: {what}{checks}, {deploy}")
+    return "\n".join(lines)

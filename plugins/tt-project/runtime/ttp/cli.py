@@ -680,6 +680,10 @@ def status_text(p: Project) -> str:
     elif c["idle_held"]:
         coord += f" · idle check {c['idle_held']}"
     lines.append(coord)
+    from . import pushq
+    pq = pushq.status_line(p, now)
+    if pq:
+        lines.append(pq)
     for pp in h["providers_paused"]:
         lines.append(f"{pp['provider']} paused until {at(pp['until'], now)}: {pp['note']} — fix: {pp['fix']}")
     for pr in h["resources_paused"]:
@@ -859,7 +863,8 @@ def cmd_push(a) -> None:
     free (0) or taken (1). `--detach` runs the push in a process of its own and prints its marker and
     a `--result <marker>` probe (0 once finished or dead, 1 while running). `--own` publishes the
     task's own `ttp/t<id>-...` branch under its own name instead, as it is: checks run on HEAD, no
-    rebase or bump, never the push branch or a shared one. Exit codes are in `push.py`."""
+    rebase or bump, never the push branch or a shared one. `--queue` lists the push queue
+    (`delivery.push_queue`). Exit codes are in `push.py`."""
     from . import push
     if a.result:
         sys.exit(push.result(Path(a.result)))
@@ -868,6 +873,10 @@ def cmd_push(a) -> None:
                                          if (c := Project(d)).exists()), None)
     if not p or not p.exists():
         die("ttp push: no tt-project project here (run it inside a run or a project's worktree)")
+    if a.queue:
+        from . import pushq
+        print(pushq.queue_text(p))
+        return
     if a.free:
         sys.exit(push.free(p, Path.cwd()))
     if a.marker:
@@ -1922,6 +1931,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--own", action="store_true",
                    help="publish this task's own ttp/t<id>-... branch under its name, as it is (checks, no rebase); "
                         "never delivery.push_branch")
+    s.add_argument("--queue", action="store_true",
+                   help="push nothing: list the push queue's entries and its last 10 batches")
     s.add_argument("--marker", help=argparse.SUPPRESS)   # the detached process itself
     s.add_argument("--batch", metavar="MARKER", help=argparse.SUPPRESS)   # the push queue's batch process (batch.py)
     s.set_defaults(fn=cmd_push)

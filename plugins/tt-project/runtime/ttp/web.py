@@ -16,7 +16,7 @@ from urllib.parse import parse_qs, urlparse
 from . import alerts
 from . import budget as bud
 from . import coordinator as coord
-from . import release
+from . import pushq, release
 from . import schedule as sched
 from . import upstream
 from .daemon import HEARTBEAT_STALE_S, KV_LOCAL_ONLY, KV_WORKTREES_DIRTY, LOGGED_OUT_NOTE, WAIT_KEYS, WATCHDOG_S, heartbeat, idle_wake
@@ -391,6 +391,8 @@ def state_payload(p: Project, db: DB) -> dict:
         t["review_since"] = in_review.get(t["id"])
         result = load_result(t["result"])
         t["result"] = str(result.get("summary") or "")[:600]
+        t["pushed"] = [{k: x.get(k) for k in ("branch", "sha", "version", "status")} for x in result.get("pushed") or []
+                       if isinstance(x, dict)] or None   # what the push queue pushed for a review
         t["starts"] = coord.starts_text(t, now) if t["status"] == "queued" else ""
         d = deferral(t)
         t.update(depends_on=dependency_ids(t), waits_on=unmet.get(t["id"], []), continues=continues_id(t),
@@ -417,6 +419,7 @@ def state_payload(p: Project, db: DB) -> dict:
         "budget": bud.history(db),
         "coordinator": db.kv("last_coordinator_summary", {}),
         "health": health(p, db, now=now),
+        "push_queue": pushq.web(p, db, now),
         "accounts": db.q("SELECT provider, account, MAX(started) last FROM runs WHERE account IS NOT NULL "
                          "GROUP BY provider, account ORDER BY last DESC"),
         "now": now,

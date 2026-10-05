@@ -34,7 +34,7 @@ h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: v
 .row .meta { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
 .st { font-size: 11px; font-weight: 650; text-transform: uppercase; letter-spacing: .04em; }
 .st-running { color: var(--accent); } .st-blocked, .st-failed { color: var(--red); } .st-review { color: var(--yellow); }
-.st-done { color: var(--green); } .st-queued, .st-cancelled { color: var(--muted); }
+.st-done { color: var(--green); } .st-pushing { color: var(--accent); } .st-queued, .st-cancelled { color: var(--muted); }
 .attn { border-left: 4px solid var(--red); background: var(--card); padding: 10px 12px; margin-bottom: 8px; border-radius: 6px; }
 .attn .when { color: var(--muted); font-size: 12px; }
 .card.needs .attn { margin-bottom: 6px; }

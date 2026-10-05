@@ -188,7 +188,10 @@ and preferences you add later become part of the project's charter and memory.
   with `TTP_PUSHED_SHA`, `TTP_PUSHED_VERSION`, `TTP_PUSH_TARGET`, `TTP_PUSH_TASKS`,
   `TTP_PUSH_BATCH` and `TTP_PROJECT` set. A failed `after_push` alerts the coordinator but never
   fails the reviews: their change is already on the branch. Off (the default), each review
-  pushes with `ttp push --detach` as above.
+  pushes with `ttp push --detach` as above. `ttp status` shows one line about the queue (what
+  waits, the running batch, the last push and its deploy), the web app a Push queue card, and
+  `ttp push --queue` lists the entries and the last 10 batches. Only a rejected push, a failed
+  `after_push` and batches that keep dying reach the top section, and only while they last.
 - A plan task starts from what is already known: prior work, the organization's docs and chats
   through the connectors you have, available skills, and public work. Skill plugins it recommends
   can be enabled for the project's workers only (`providers.claude.plugin_dirs`).
