@@ -21503,6 +21503,17 @@ def test_lock_probe_busy_while_reserved_under_any_device_name(env):
     assert _ttp_run(p, "lock", "--probe", "device-b").returncode == 0
 
 
+def test_lock_probe_reports_a_pause_of_any_device_name_as_busy(env):
+    p = _device_project(env)
+    from ttp import coordinator
+    coordinator.pause_resource(p, "device-a", True, reason="maintenance")
+    for name in ("device-a", "device-b"):
+        r = _ttp_run(p, "lock", "--probe", name)
+        assert r.returncode == 75 and f"{name}: paused (maintenance)" in r.stdout, (name, r.stdout)
+    coordinator.pause_resource(p, "device-a", False)
+    for name in ("device-a", "device-b"):
+        assert _ttp_run(p, "lock", "--probe", name).returncode == 0, name
+
 def test_nested_device_locks_do_not_deadlock(env):
     p = _device_project(env)
     r = _ttp_run(p, "lock", "device-a", "--", sys.executable, str(TTP), "lock", "device-b", "--",
@@ -21554,6 +21565,34 @@ def test_in_run_lock_wait_is_not_capped_in_a_detached_job(env):
         held.close()
     assert proc.wait(timeout=30) == 0
 
+
+def test_in_run_lock_cap_holds_under_the_runs_agent_and_lifts_in_a_setsid_driver(env, tmp_path):
+    p = _device_project(env)
+    from ttp import locks as lk
+    run_dir = p.runs / "9"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text(json.dumps({"stall_s": 2}))
+    (run_dir / "child.pid").write_text(f"{os.getpid()}\n")   # this test stands in for the run's agent
+    held = lk.try_take(lk.slot_paths(p.state / "locks", "device-a", 1), "someone")
+    try:
+        r = _ttp_run(p, "lock", "device-b", "--", "true", env={"TTP_RUN_DIR": str(run_dir)})
+        assert r.returncode == 75, "a lock under the run's agent keeps the cap"
+        # A driver started with `setsid nohup` from the run: its shell exits, so it is re-parented.
+        rc = tmp_path / "driver.rc"
+        e = {**os.environ, "TTP_PROJECT": str(p.base), "TTP_RUN_DIR": str(run_dir), "TTP": str(TTP),
+             "PY": sys.executable, "RC": str(rc)}
+        e.pop("TTP_DETACHED", None)
+        e.pop("TTP_LOCKS_HELD", None)
+        shell = subprocess.Popen(["sh", "-c", 'setsid nohup sh -c \'"$PY" "$TTP" lock device-b -- true; '
+                                              'echo $? > "$RC"\' > /dev/null 2>&1 &'], env=e)
+        assert shell.wait(timeout=10) == 0
+        (run_dir / "child.pid").write_text(f"{shell.pid}\n")
+        time.sleep(3)
+        assert not rc.exists(), "the driver waits past half the run's stall limit"
+    finally:
+        held.close()
+    _wait_for(rc, timeout=30)
+    assert rc.read_text().strip() == "0"
 
 def _wait_for(path, timeout=20):
     deadline = time.time() + timeout

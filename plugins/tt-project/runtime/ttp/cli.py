@@ -1275,9 +1275,10 @@ def cmd_lock(a) -> None:
     toward the run's wall clock (which grows by at most its own length this way), and gives up after
     half the run's stall limit (a longer --timeout is capped to that; 0 means that limit too). Giving
     up exits 75: the task hands back `waiting` with retry_when `ttp lock --probe <resource>`. A paused
-    resource exits 75 as well. In a `ttp detach` job there is no cap.
-    `ttp lock --probe <resource>` exits 0 when the resource is free, not reserved and nobody queues
-    for it, else 75.
+    resource exits 75 as well. In a `ttp detach` job, or a `setsid nohup` driver that no longer runs
+    under the run's agent, there is no cap.
+    `ttp lock --probe <resource>` exits 0 when the resource is free, not paused, not reserved and
+    nobody queues for it, else 75.
     """
     from . import locks as lk
     cmd = list(a.command or [])
@@ -1292,15 +1293,18 @@ def cmd_lock(a) -> None:
         die("ttp lock only works inside a tt-project run (or with TTP_PROJECT set)")
     p = Project(base)
 
-    def _refuse_paused() -> None:
-        # Checked before each try, so a pause set while this waits holds too.
+    def _pause() -> dict | None:
         try:
             paused = p.db.paused_resources()
             # A pause of any of the device's names holds them all.
-            held = paused.get(a.resource) or next((v for k, v in paused.items() if lk.canonical(cfg, k) == res), None)
+            return paused.get(a.resource) or next((v for k, v in paused.items() if lk.canonical(cfg, k) == res), None)
         except Exception as e:   # an unreadable database must not stop device commands
             print(f"ttp lock: could not check for a pause of {a.resource}: {e}", file=sys.stderr, flush=True)
-            held = None
+            return None
+
+    def _refuse_paused() -> None:
+        # Checked before each try, so a pause set while this waits holds too.
+        held = _pause()
         if held is not None:
             if waiting:
                 _end_wait()
@@ -1323,6 +1327,9 @@ def cmd_lock(a) -> None:
     except OSError as e:
         _unwritable(e)
     if a.probe:
+        if (held := _pause()) is not None:   # a paused `ttp lock` exits 75, so its probe must too
+            print(f"{a.resource}: paused" + (f" ({held['reason']})" if held.get("reason") else ""))
+            sys.exit(75)
         free = lk.probe(where, res, paths)
         n, who_r = len(lk.queued(where, res)), lk.reserved_by(lk.reserve_path(where, res))
         print(f"{a.resource}: " + ("free" if free else f"busy (held by {', '.join(lk.holders(paths)) or 'nobody'}"
@@ -1347,10 +1354,12 @@ def cmd_lock(a) -> None:
         sys.exit(subprocess.call(cmd, env=child_env))
     timeout = a.timeout
     cap = float(spec.get("stall_s") or 0) / 2
+    capped = False
     if cap and not detached:
         if timeout is not None and (timeout == 0 or timeout > cap):
             print(f"ttp lock: --timeout {timeout:.0f} capped to {cap:.0f} s inside a run; if it runs out, "
                   f"hand off `waiting` with retry_when `ttp lock --probe {a.resource}`", file=sys.stderr, flush=True)
+        capped = not timeout or timeout > cap
         timeout = cap if timeout is None or timeout == 0 else min(timeout, cap)
     mark = lk.reserve_path(where, res)
     wait_dir = None if detached else run_dir
@@ -1410,6 +1419,14 @@ def cmd_lock(a) -> None:
             waiting = True
             for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
                 signal.signal(sig, lambda signum, _f: (_end_wait(), sys.exit(128 + signum)))
+        if capped and timeout and time.time() - started > timeout and not lk.in_run(run_dir):
+            # A driver started with `setsid nohup` outlives the run: the run's cap is not its own,
+            # and its wait is no longer the run's.
+            capped, timeout = False, a.timeout
+            _end_wait()
+            wait_dir = None
+            print(f"ttp lock: not under the run's agent; waiting for {a.resource} without the run's cap",
+                  file=sys.stderr, flush=True)
         if timeout and time.time() - started > timeout:
             _end_wait()
             die(f"{a.resource} stayed busy for {timeout:.0f} s. Hand the task back now: result.json status "
@@ -2371,7 +2388,7 @@ def main(argv: list[str] | None = None) -> None:
 
     s = sub.add_parser("lock", help="(inside a run) hold a shared resource while one command runs")
     s.add_argument("--probe", action="store_true",
-                   help="exit 0 if the resource is free and nobody queues for it, else 75 (for retry_when)")
+                   help="exit 0 if the resource is free, not paused and nobody queues for it, else 75 (for retry_when)")
     s.add_argument("resource")
     s.add_argument("--timeout", type=float, default=None,
                    help="give up after this many seconds (exit 75); 0 waits as long as it takes; "

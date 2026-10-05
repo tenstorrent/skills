@@ -24,6 +24,7 @@ import fcntl
 import json
 import os
 import shlex
+import subprocess
 import time
 from pathlib import Path
 
@@ -323,3 +324,44 @@ def job_ended(rc: Path) -> bool:
 def job_probe(rcs: list, ttp: str = "ttp") -> str:
     """A `retry_when` that exits 0 once every one of these detached jobs ended, 1 before."""
     return f"{ttp} detach --check " + " ".join(shlex.quote(str(r)) for r in rcs)
+
+
+def _parent(pid: int) -> int | None:
+    """The parent of process pid; None if it is gone or this cannot tell."""
+    try:   # Linux: field 4
+        return int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[1])
+    except (OSError, IndexError, ValueError):
+        pass
+    try:
+        out = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True,
+                             timeout=5).stdout.strip()
+        return int(out) if out else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def in_run(run_dir: Path | None) -> bool:
+    """Whether this process still runs under the run's agent (child.pid in the run's folder), so the
+    run supervises it. A `setsid nohup` driver is re-parented once its shell exits and then is not.
+    True whenever it cannot tell: another PID namespace (a sandbox), no record, an unreadable parent."""
+    try:
+        agent = int((run_dir / "child.pid").read_text().split()[0])
+    except (OSError, ValueError, IndexError, TypeError):
+        return True
+    if (ns := os.environ.get("TTP_PIDNS")):
+        try:
+            if os.readlink("/proc/self/ns/pid") != ns:
+                return True
+        except OSError:
+            pass
+    pid = os.getpid()
+    for _ in range(256):
+        if pid == agent:
+            return True
+        if pid <= 1:
+            return False
+        nxt = _parent(pid)
+        if nxt is None:
+            return True
+        pid = nxt
+    return True
