@@ -825,9 +825,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     try:
                         target, extra, retired = _charter_update(p, section, text, quote, replaces, key,
                                                                  user_turn or ok is not None, over, end, no_ok)
-                    except ValueError:
+                    except ValueError as e:
                         if user_turn:
-                            _record_charter_approval(p, messages or [], section, quote, replaces, text, end)
+                            _record_charter_approval(p, messages or [], section, quote, replaces, text, end, str(e))
                         raise
                     if ok is not None:
                         _use_charter_approval(p, ok["id"], key)
@@ -1538,7 +1538,7 @@ def _ws(text: str) -> str:
 
 
 def _record_charter_approval(p: Project, messages: list[int], section: str, quote: str, replaces: str,
-                             text: str, end: dict | None) -> None:
+                             text: str, end: dict | None, failed: str = "") -> None:
     """Record a charter change the user's turn asked for that failed to apply (an ambiguous heading,
     a quote that matched twice), so a retry in a later turn without a user message is still the
     user's word. Only from a user's own message of this turn: none from the harness itself
@@ -1567,7 +1567,7 @@ def _record_charter_approval(p: Project, messages: list[int], section: str, quot
         if any(all(x.get(k) == v for k, v in rec.items()) and not x.get("used") for x in have):
             return   # a retried turn records it once
         rec.update(id=hashlib.sha256(f"{said}{sha}{time.time()}".encode()).hexdigest()[:12], messages=said,
-                   ask=ask["id"] if ask else None, candidates=cands, ts=time.time(), used=None)
+                   ask=ask["id"] if ask else None, candidates=cands, failed=failed[:300], ts=time.time(), used=None)
         db.set_kv(CHARTER_APPROVALS_KEY, (have + [rec])[-20:])
 
 
@@ -1715,7 +1715,8 @@ def _charter_update(p: Project, section: str, text: str, quote: str, replaces: s
         names = [" ".join(h[3:].split()) for h, _ in sections]
         t = next((i for i, (h, _) in enumerate(sections) if h == target), None)
         if t is None and target:   # merged into the one Restrictions block
-            t = next(i for i, n in enumerate(names) if n.lower().startswith("restriction") and not _DATED.search(n))
+            t = next((i for i, n in enumerate(names) if n.lower().startswith("restriction")
+                      and not _DATED.search(n)), None)
     if not hist.exists():
         durable_append(hist, "# Charter history\n\nWhat was added to CHARTER.md, and what was removed or replaced "
                              "there, oldest first.\n")
