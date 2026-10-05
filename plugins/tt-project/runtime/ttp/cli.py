@@ -932,6 +932,7 @@ def _note_to(a) -> None:
     if got == "limited":
         die(f"not sent: this project already sent {upstream.NOTES_PER_HOUR} notes to other projects in the last hour")
     print(f"note for {a.to} " + ("already in its inbox" if got == "duplicate" else "filed in its inbox")
+          + f" as {upstream.note_id(a.to, a.text)}"
           + (f"; this machine's daemon sends it on to {far.get('ssh') or far['host']}" if far else ""))
 
 

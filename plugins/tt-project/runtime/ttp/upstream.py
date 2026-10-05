@@ -132,6 +132,11 @@ def append(name: str, task: int | None, followups) -> int:
     return out.count(b"\n")
 
 
+def note_id(to: str, text: str) -> str:
+    """The id (`fp`) of the inbox entry `send` files, or found already there, for this note."""
+    return fingerprint(f"to:{to}", " ".join(str(text).split())[:SPEC_CHARS])
+
+
 def send(source: str, task: int | None, to: str, text: str, severity: str = "normal",
          now: float | None = None) -> str:
     """File a worker's note for project `to` in this machine's inbox. Returns "sent", "duplicate" (the
@@ -140,7 +145,7 @@ def send(source: str, task: int | None, to: str, text: str, severity: str = "nor
     now = now or time.time()
     text = " ".join(str(text).split())[:SPEC_CHARS]     # one line: it cannot pose as another digest entry
     title = f"note to {to}"
-    fp = fingerprint(f"to:{to}", text)
+    fp = note_id(to, text)
     project.HOME_DIR.mkdir(parents=True, exist_ok=True)
     fd = os.open(path(), os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
     with os.fdopen(fd, "rb+") as f:
