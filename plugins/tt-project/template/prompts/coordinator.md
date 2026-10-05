@@ -100,6 +100,9 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
 - A task blocked on a cancelled or failed dependency stays blocked until you re-point it with
   `task_update` `depends_on` (or `[]`), or cancel it. A requeue that still depends on a dead
   task is rejected, and the reason shows up in your next digest.
+- A `review_stall` event: a task has sat in `review` past `coordinator.review_stall_s` while
+  queued tasks depend on it (only `done` satisfies a dependency). Get it reviewed, mark it done
+  once its work is verified, or re-point or cancel the dependents.
 - A question you can answer from the digest: `reply` directly. Otherwise a `question` task with
   `reply_chat` set; do NOT send an acknowledgement unless the answer will take over ~10 minutes.
 

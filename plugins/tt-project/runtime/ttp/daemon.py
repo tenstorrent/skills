@@ -801,6 +801,30 @@ class Daemon:
                       f"The coordinator can re-point it with task_update depends_on (an empty list clears it), "
                       f"requeue it once the dependency is redone, or cancel it.", "handled", t["id"]))
         self._raise_dead_dependency_blocks(now)
+        self._raise_review_stalls(now)
+
+    def _raise_review_stalls(self, now: float) -> None:
+        """Only 'done' satisfies a dependency, so a task left in 'review' holds its dependents back
+        without ever looking dead. Past coordinator.review_stall_s it is raised once per review stint."""
+        db = self.p.db
+        try:
+            stall_s = float(self.cfg["coordinator"].get("review_stall_s", 14400) or 0)
+        except (TypeError, ValueError):
+            stall_s = 14400.0
+        for rev, since, deps in db.stalled_reviews(stall_s, now):
+            fp = f"review_stall:{rev['id']}:{since:.0f}"
+            if db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+                continue
+            names = ", ".join(f"#{t['id']} {t['title'][:80]}" for t in deps[:5]) + (
+                f" and {len(deps) - 5} more" if len(deps) > 5 else "")
+            db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
+                 (now, "daemon", "review_stall", fp, "normal",
+                  f"#{rev['id']} {rev['title']} has been in review {(now - since) / 3600:.1f}h; queued {names} "
+                  f"depend on it and cannot start until it is done. Options: get it reviewed, mark it done with "
+                  f"task_update status done once its work is verified, requeue it, re-point the dependents with "
+                  f"task_update depends_on, or cancel them.", "queued", rev["id"]))
+            log(self.p, f"task {rev['id']} in review {(now - since) / 3600:.1f}h holds {len(deps)} task(s); "
+                        f"raised to the coordinator")
 
     def _raise_dead_dependency_blocks(self, now: float) -> None:
         """A block on a dead dependency does not wake the coordinator, so one it let pass a whole

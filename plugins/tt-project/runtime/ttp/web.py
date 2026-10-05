@@ -362,7 +362,9 @@ def state_payload(p: Project, db: DB) -> dict:
                  "'cancelled') OR updated>? ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'blocked' THEN 1 "
                  "WHEN 'review' THEN 2 WHEN 'queued' THEN 3 ELSE 4 END, priority, id DESC LIMIT 200",
                  (now - 7 * 86400,))
+    in_review = db.review_since()
     for t in tasks:
+        t["review_since"] = in_review.get(t["id"])
         t["result"] = str(load_result(t["result"]).get("summary") or "")[:600]
         t["starts"] = coord.starts_text(t, now) if t["status"] == "queued" else ""
         del t["labels"]

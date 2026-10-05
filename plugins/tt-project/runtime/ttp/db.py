@@ -305,6 +305,27 @@ class DB:
                 out.append((t, *dead))
         return out
 
+    def review_since(self) -> dict[int, float]:
+        """When each task now in 'review' entered it: its latest hand-off to review, else its last update."""
+        rows = self.q("SELECT t.id, t.updated, (SELECT MAX(e.ts) FROM events e WHERE e.task=t.id "
+                      "AND e.kind='task_review') AS since FROM tasks t WHERE t.status='review'")
+        return {r["id"]: r["since"] or r["updated"] for r in rows}
+
+    def stalled_reviews(self, stall_s: float, now: float) -> list[tuple[dict, float, list[dict]]]:
+        """Review tasks that queued tasks depend on, in review longer than `stall_s`:
+        (review task, since, its queued dependents). Nothing when `stall_s` is 0."""
+        if stall_s <= 0:
+            return []
+        since = {k: v for k, v in self.review_since().items() if now - v >= stall_s}
+        if not since:
+            return []
+        waiting: dict[int, list[dict]] = {}
+        for t in self.q("SELECT * FROM tasks WHERE status='queued' AND depends_on NOT IN ('', '[]') ORDER BY id"):
+            for d in set(dependency_ids(t)):
+                if d in since:
+                    waiting.setdefault(d, []).append(t)
+        return [(self.task(d), since[d], ts) for d, ts in sorted(waiting.items())]
+
     def dead_dependency(self, deps: list) -> tuple[Any, str] | None:
         """The first of `deps` that can no longer finish and why, or None."""
         states = {r["id"]: r["status"] for r in self.q("SELECT id, status FROM tasks")}

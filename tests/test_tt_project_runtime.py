@@ -2572,6 +2572,65 @@ def test_a_block_on_a_dead_dependency_left_after_a_turn_is_raised_once(env):
     assert f"#{dead}" in rows[0]["text"] and "continues" in rows[0]["text"]
 
 
+def test_a_dependency_left_in_review_too_long_is_raised_once_and_its_age_shown(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.cli import status_text
+    from ttp.daemon import Daemon
+    from ttp.web import state_payload
+    d = Daemon(p.base)
+    rev = p.db.add_task("needs a look", "s", origin="user")
+    p.db.update_task(rev, status="review")
+    child = p.db.add_task("child", "s", origin="user", depends_on=[rev])
+    other = p.db.add_task("other child", "s", origin="user", depends_on=[rev])
+
+    def raised():
+        return p.db.q("SELECT * FROM events WHERE kind='review_stall'")
+    d.tick()
+    assert not raised(), "raised before review_stall_s passed"
+    assert [t["id"] for t in p.db.ready_tasks()] == [], "review does not satisfy a dependency"
+    # Entered review 5 h ago: the hand-off event dates it, not the task's last update.
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+           (time.time() - 5 * 3600, f"task:{rev}", "task_review", "normal", "handed off", "handled", rev))
+    for _ in range(3):
+        d.tick()
+    rows = raised()
+    assert len(rows) == 1 and rows[0]["status"] == "queued" and rows[0]["task"] == rev
+    text = rows[0]["text"]
+    assert f"#{rev} needs a look has been in review 5.0h" in text and f"#{child} child" in text \
+        and f"#{other} other child" in text, text
+    assert "review_stall" in coord.UNBLOCK_KINDS
+    # Its age shows in the digest, ttp status and the web app.
+    assert f"#{rev} | review (5.0h in review)" in coord.digest(p, {}, [], [])
+    assert f"#{rev} review 5 h: needs a look" in status_text(p)
+    t = next(t for t in state_payload(p, p.db)["tasks"] if t["id"] == rev)
+    assert abs(t["review_since"] - (time.time() - 5 * 3600)) < 60
+    # A new review stint is raised again; 0 turns the check off.
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+           (time.time() - 4.5 * 3600, f"task:{rev}", "task_review", "normal", "again", "handled", rev))
+    d.cfg["coordinator"]["review_stall_s"] = 0
+    d.tick()
+    assert len(raised()) == 1
+    d.cfg["coordinator"]["review_stall_s"] = 4 * 3600
+    d.tick()
+    assert len(raised()) == 2
+
+
+def test_a_review_task_nothing_waits_on_is_not_raised(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    rev = p.db.add_task("alone", "s", origin="user")
+    p.db.update_task(rev, status="review")
+    p.db.x("UPDATE tasks SET updated=? WHERE id=?", (time.time() - 30 * 3600, rev))
+    done = p.db.add_task("finished", "s", origin="user", depends_on=[rev])
+    p.db.update_task(done, status="done")
+    p.db.x("UPDATE tasks SET updated=? WHERE id=?", (time.time() - 30 * 3600, rev))
+    d.tick()
+    assert not p.db.q("SELECT * FROM events WHERE kind='review_stall'")
+    assert p.db.review_since()[rev] < time.time() - 29 * 3600, "falls back to the task's last update"
+
+
 def test_the_coordinator_looks_for_a_non_disruptive_way_before_blocking():
     text = " ".join((RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text().split())
     assert "# Unblocking" in text and "what is a reasonably non-disruptive way to proceed?" in text

@@ -112,7 +112,8 @@ RETRY_WAKE_KEY = "rejected_retry_wake"
 # at coordinator.unblock_effort, and so do turns carrying user messages, the turn after a rejected
 # ask_user, and an idle wake that finds blocked tasks or open asks.
 UNBLOCK_KINDS = frozenset({"task_blocked", "task_failed", "task_budget_exhausted", "resource_trouble",
-                           "ask_timeout", "dead_dependency", "deferral_expired", "deferral_probe_broken"})
+                           "ask_timeout", "dead_dependency", "deferral_expired", "deferral_probe_broken",
+                           "review_stall"})
 EFFORT_ORDER = ("minimal", "low", "medium", "high", "xhigh", "max")
 NOTES_KEY = "action_notes"   # kv: the last turn's notes on actions applied with a change; information only
 RECENT_OUT = 5                       # outbound messages the digest repeats, so turns do not resend them
@@ -287,11 +288,13 @@ def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int]) ->
         lines.append(mem)
     lines.append("## Open tasks (id | status | tier | priority | age | title | last note)")
     rows = db.q("SELECT * FROM tasks WHERE status NOT IN ('done','failed','cancelled') ORDER BY priority, id LIMIT 60")
+    in_review = db.review_since()
     for t in rows:
         note = clip(t["blocked_reason"] or load_result(t["result"]).get("summary"), NOTE_CHARS)
         cont = continues_id(t)
         title = f"{t['title']} (continues #{cont})" if cont else t["title"]
-        starts = starts_text(t, now) if t["status"] == "queued" else ""
+        starts = (starts_text(t, now) if t["status"] == "queued" else
+                  f"{(now - in_review[t['id']]) / 3600:.1f}h in review" if t["id"] in in_review else "")
         lines.append(f"- #{t['id']} | {t['status']}{f' ({starts})' if starts else ''} | {t['tier']} | p{t['priority']} | "
                      f"{(now - t['created']) / 3600:.1f}h | {title} | {note}")
     if not rows:
