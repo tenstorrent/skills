@@ -289,14 +289,14 @@ def _windows(m: dict) -> dict:
 
 def _due(m: dict, start: float, end: float, now: float) -> bool:
     """Whether to ask a machine whose cache entry is `m` about [start, end): REFRESH_S after its
-    answer for that window, or at once when it has none. A failed last try holds every window off by
+    answer for that window, or at once when it has none or one for an earlier rolling start. A failed last try holds every window off by
     its time alone, so a machine that is down is asked once per REFRESH_S, not on every daemon tick.
     Answers are kept per window, so projects on this machine that count different days do not make
     each other ask again. A time stamped after `now` (the clock went back) holds nothing off."""
     if not m.get("ok") and 0 <= now - float(m.get("tried") or 0) < REFRESH_S:
         return False
     w = _windows(m).get(_key(start, end)) or {}
-    return not 0 <= now - float(w.get("ts") or 0) < REFRESH_S
+    return not 0 <= now - float(w.get("ts") or 0) < REFRESH_S or w.get("start") != start
 
 
 def refresh(start: float, end: float, now: float | None = None, force: bool = False) -> dict:
