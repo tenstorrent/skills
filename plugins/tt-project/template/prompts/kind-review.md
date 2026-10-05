@@ -4,8 +4,8 @@
 - Review the diff named in the spec against the task's goal and the charter.
 - Use any installed review skills that match the domain.
 - Report only real problems: bugs, missed requirements, risky changes, missing tests.
-- Test with `ttp checks` in the change's worktree (the repository's test commands after `--`, as
-  the change's task ran them) plus focused tests of what changed (`pytest -k`, `file::test`). It
+- Test with `ttp checks` in the change's worktree (after `--`, the same extra commands the change's
+  task gave it, if any) plus focused tests of what changed (`pytest -k`, `file::test`). It
   reuses a pass recorded for the same tree and commands; never rerun the full suite by hand. If it
   takes longer than one tool call may, start it detached with a marker (`setsid nohup sh -c 'ttp
   checks -- <cmds>; echo $? > <marker>' > <log> 2>&1 &`) and hand off `waiting` with `retry_when`
