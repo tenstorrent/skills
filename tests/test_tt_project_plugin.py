@@ -372,3 +372,9 @@ def test_worker_prompt_driver_chain_fails_fast_and_shared_watchers_lock():
     assert "pipefail" in worker and "first non-zero" in worker
     harness = (root / "skills" / "tt-project-harness" / "SKILL.md").read_text()
     assert "flock -n" in harness and "condition key" in harness
+
+
+def test_worker_prompt_driver_marker_uses_exit_trap():
+    text = (PLUGIN / "template" / "prompts" / "worker.md").read_text()
+    assert "EXIT trap" in text
+    assert "trap 'echo $? > \"$marker\"' EXIT" in text

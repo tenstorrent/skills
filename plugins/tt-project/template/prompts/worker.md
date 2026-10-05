@@ -120,6 +120,7 @@ Before you finish, write `$TTP_RUN_DIR/result.json`:
   The driver runs with `set -eo pipefail`, never pipes a step into tail/head, logs each step's
   exit code and writes the first non-zero one into the marker, so the next run sees the refusal.
   Size each step's timeout to that tool's limits before starting.
+  Under `set -e`, write that marker from an EXIT trap (`trap 'echo $? > "$marker"' EXIT`).
   For a job on another machine, start its driver there (`ssh <host> 'setsid nohup <driver> > <log>
   2>&1 &'`), keep the marker there, point `retry_when` at it (`ssh <host> test -e <marker>`) and
   set `"survives_reboot": true`: a reboot here does not end it.
