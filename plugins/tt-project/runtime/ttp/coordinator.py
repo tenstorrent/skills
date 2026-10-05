@@ -299,9 +299,15 @@ def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int]) ->
                           f"independent tasks ready to fill the free ones")
         else:
             est = f" (${n['estimated_24h']:.2f} of it estimated)" if n.get("estimated_24h") else ""
-            money = (f"project caps (usage-billed providers together): ${n.get('spent_24h', 0):.2f} of "
-                     f"${b.get('daily_usd')} per 24h"
+            day = (f"${n['spent_today']:.2f} of ${b.get('daily_usd')} today" if "spent_today" in n
+                   else f"${n.get('spent_24h', 0):.2f} of ${b.get('daily_usd')} per 24h")
+            money = (f"project caps (usage-billed providers together): {day}"
                      f"{est}, ${n.get('spent_7d', 0):.2f} of ${b.get('weekly_usd')} per 7 days")
+            if "global_today" in n:
+                stale = f", {len(n['global_stale'])} machine(s) stale" if n.get("global_stale") else ""
+                money += (f" · global daily cap (whole account): ${n['global_today']:.2f} of "
+                          f"${float(n.get('global_cap') or 0):.0f} today ({n.get('global_includes') or 'this account'}"
+                          f"{stale})")
         lines.append(f"- {prov}: {g['level']} ({'; '.join(g['reasons']) or 'ok'}) · {money} · max_tier={g['max_tier']} "
                      f"max_parallel={g['max_parallel']} optional_work={'yes' if g['allow_optional'] else 'no'}")
     lines.append(f"- per-task default budgets: {b.get('task_default_usd')}")

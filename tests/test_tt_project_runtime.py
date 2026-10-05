@@ -19826,6 +19826,24 @@ def test_without_budget_settings_the_caps_and_the_line_behave_as_before(env, tmp
     assert g.level == "red" and any(r.startswith("cap reached: $105.00/24h of $100") for r in g.reasons), g.reasons
 
 
+def test_the_coordinator_digest_shows_the_global_daily_total(env, tmp_path):
+    p, other = _global_cap_setup(env, tmp_path, cap=1000)
+    from ttp import budget as bud
+    from ttp import coordinator as coord
+    now = time.time()
+    p.db.spend("fake", 1.2, "task:1", ts=now - 60)
+    other.spend("fake", 340.0, "task:1", ts=now - 60)
+    g = bud.evaluate(p.db, p.config(), "fake", [], now).as_dict()
+    d = coord.digest(p, {"fake": g}, [], [])
+    assert "$1.20 of $100.0 today" in d and "global daily cap (whole account): $341.20 of $1000 today (" in d, d
+    # Off: the money line stays as before.
+    p.set_config("budget.global_daily_usd", 0)
+    p.set_config("budget.day_start", "")
+    g = bud.evaluate(p.db, p.config(), "fake", [], now).as_dict()
+    d = coord.digest(p, {"fake": g}, [], [])
+    assert "$1.20 of $100.0 per 24h" in d and "global daily cap" not in d, d
+
+
 def test_a_global_cap_of_zero_is_off(env, tmp_path):
     p, other = _global_cap_setup(env, tmp_path, cap=0)
     from ttp import budget as bud

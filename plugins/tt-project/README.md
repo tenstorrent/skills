@@ -81,6 +81,29 @@ and preferences you add later become part of the project's charter and memory.
   runs stop reporting plan windows falls under these caps too (failed or silent runs do not count).
   The caps count only spend made on an account that was billed by use at the time: after a switch
   from a plan account to a usage-billed one, the plan's earlier spend stays out.
+- Global daily cap (usage-billed, off by default): `budget.global_daily_usd` stops new work in every
+  project once the whole account's tt-project spend today reaches it (0, the default, turns it
+  off). Running work and replies to your messages go on; it clears by itself at the day's reset
+  (or, without a budget day, as spend leaves the last 24 h). Only spend on the same provider and the same account counts (an account is compared by a
+  hash, so its name never leaves the machine); rows with no account recorded count, to be safe.
+  The total covers every project `ttp list` shows on this machine, the machines of the registry's
+  projects elsewhere, and machines tagged `tt-project` in `ttp machines` (`ttp machines add <alias>
+  --tags tt-project`). Other machines are asked over ssh (BatchMode, no prompts) with
+  `ttp spend-today`, at most every 10 minutes; their answers are cached in
+  `~/.tt-project/global-spend.json`. A machine not heard from for 30 minutes still counts with its
+  last answer for the same day and is shown as stale. If the total cannot be worked out at all, the
+  per-project caps stay in charge. Spend outside tt-project (your own sessions) is not seen; a
+  source can be added in code with `globalcap.add_other_source(fn)`, where
+  `fn(provider, account, start, end)` returns `(usd, label)`.
+- Budget day: with `budget.day_start` set (`"HH:MM"`), "today" is a fixed day starting at that time
+  in `budget.timezone` (an IANA name such as `Europe/Berlin`, default `UTC`; the host's own zone
+  plays no part), 23 or 25 hours long across a daylight-saving change. The daily cap and the global
+  cap count that day. Empty (the default) keeps the rolling 24 hours. Weekly caps stay rolling.
+- These three keys are account-level: `ttp config --account KEY VALUE` writes them to
+  `~/.tt-project/settings.json` (mode 0600), which every project on the machine reads under its own
+  `project.json` (a project may still override a key). `ttp config --account KEY` reads one; an
+  empty value removes it. `ttp spend-today [--json]` prints this machine's tt-project spend for the
+  budget day by provider and account hash; it is what other machines ask for.
 - Work backs off in steps as spend rises, pauses at the cap, and tells you how to raise it.
 - A runaway guard pauses a project whose hourly spend jumps far above its own norm.
 - A review runs light when the diff it checks touches no `review.risky_paths` glob and is doc-only
@@ -133,7 +156,9 @@ and preferences you add later become part of the project's charter and memory.
   The windows and averages are the account's (an average is the mean of each completed window's
   peak: 5-hour windows over 7 days, weekly ones over 3 weeks). The dollars are this project's last
   24 h: `virtual` (list-price equivalent) on a plan, `actual` when billed by use (only spend made
-  on a usage-billed account).
+  on a usage-billed account). A usage-billed account with a budget day or a global cap shows
+  `today $1.20 this project, $85 of $1000 global - resets in 6.5 h` instead, with
+  `(1 machine stale)` when a machine's answer is old.
 
 ## Parallel work
 
@@ -248,7 +273,7 @@ and preferences you add later become part of the project's charter and memory.
 | `…/harness/` | the project's own harness (git): charter, memory, config, prompts, runtime |
 | `…/state/` | database, run directories, logs |
 | `…/worktrees/` | one git worktree per code task |
-| `~/.tt-project/` | per-user registry of projects, secrets (mode 0600), the `ttp` install |
+| `~/.tt-project/` | per-user registry of projects, secrets (mode 0600), the `ttp` install, account-level settings (`settings.json`), the global spend cache (`global-spend.json`) |
 
 Each project starts from this plugin's template and then improves its own harness from
 experience. When a newer tt-project is installed (`ttp setup` from the updated plugin; the skill does
