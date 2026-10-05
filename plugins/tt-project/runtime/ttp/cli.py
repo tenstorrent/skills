@@ -585,6 +585,11 @@ def cmd_listen(a) -> None:
         other = int(lock.read_text())
     except (OSError, ValueError):
         other = 0
+    # Claim the chat before stopping the older listener: while it shuts down, a third listener
+    # must find this one in the lock, and the older one's cleanup must not remove it.
+    tmp = lock.with_name(f"{lock.name}.{os.getpid()}")
+    tmp.write_text(str(os.getpid()))
+    os.replace(tmp, lock)
     if other and other != os.getpid() and _listener_alive(other, a.chat):
         try:
             os.kill(other, signal.SIGTERM)
@@ -595,7 +600,6 @@ def cmd_listen(a) -> None:
                 break
             time.sleep(0.1)
         print(f"ttp: replaced an older listener for chat {a.chat} (pid {other})", file=sys.stderr)
-    lock.write_text(str(os.getpid()))
     try:
         _listen_loop(p, db, a, after, floor)
     finally:

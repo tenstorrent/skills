@@ -1202,6 +1202,39 @@ def test_one_listener_per_chat(env):
         os.kill(orphan, 15)
         raise AssertionError("an orphaned listener kept running")
 
+
+def test_newest_listener_claims_chat_before_old_one_exits(env):
+    """The lock names the newest listener at once, even while an older one is slow to exit."""
+    p = make(env)
+    p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)",
+           (time.time(), "t", time.time()))
+    run_env = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost")
+    lock = p.state / "listen-c1.pid"
+    # Stands in for an older listener that takes 3s to shut down after SIGTERM.
+    slow = ("import signal,sys,time\n"
+            "signal.signal(signal.SIGTERM, lambda *a: (time.sleep(3), sys.exit(0)))\n"
+            "print('ready', flush=True)\n"
+            "time.sleep(60)\n")
+    old = subprocess.Popen([sys.executable, "-c", slow, "listen", "c1"], stdout=subprocess.PIPE, text=True)
+    new = None
+    try:
+        assert old.stdout.readline().strip() == "ready"
+        lock.write_text(str(old.pid))
+        new = subprocess.Popen([sys.executable, str(TTP), "listen", "demo", "--chat", "c1", "--timeout", "60"],
+                               env=run_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        deadline = time.time() + 2
+        while time.time() < deadline and lock.read_text().strip() != str(new.pid):
+            time.sleep(0.05)
+        assert lock.read_text().strip() == str(new.pid), "the lock still names the older listener"
+        assert old.poll() is None, "test premise: the older listener is still shutting down"
+        old.wait(timeout=15)
+        assert lock.read_text().strip() == str(new.pid)
+    finally:
+        for proc in (new, old):
+            if proc and proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=10)
+
 def test_listener_does_not_skip_a_reply_posted_between_its_reads(env, capsys):
     """A reply that lands after the unread query but before the high-water read is still shown."""
     p = make(env)
