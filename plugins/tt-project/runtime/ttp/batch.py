@@ -84,26 +84,19 @@ class _Fd:
             self.fd = None
 
 
+LOCK_FD_ENV = "TTP_BATCH_LOCK_FD"
+
+
 def _inherited(path: Path) -> int | None:
-    """The descriptor this process holds `path` open on (the launcher passed its lock down), or None."""
+    """The descriptor the launcher passed down on `path` (named in TTP_BATCH_LOCK_FD), or None. Only
+    that descriptor counts: another one open on the same file (e.g. a caller's own lock when this runs
+    in-process) is never taken or closed."""
     try:
-        st = path.stat()
-    except OSError:
+        fd = int(os.environ.get(LOCK_FD_ENV, ""))
+        st, fst = path.stat(), os.fstat(fd)
+    except (OSError, ValueError):
         return None
-    for folder in ("/dev/fd", "/proc/self/fd"):
-        try:
-            names = os.listdir(folder)
-        except OSError:
-            continue
-        for name in names:
-            try:
-                fst = os.fstat(int(name))
-            except (OSError, ValueError):
-                continue
-            if (fst.st_dev, fst.st_ino) == (st.st_dev, st.st_ino):
-                return int(name)
-        return None
-    return None
+    return fd if (fst.st_dev, fst.st_ino) == (st.st_dev, st.st_ino) else None
 
 
 def _hold(path: Path, holder: str):

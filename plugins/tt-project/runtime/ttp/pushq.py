@@ -377,8 +377,10 @@ def _spawn(p: Project, bid: str, marker: Path, lock) -> subprocess.Popen:
     """Start the batch process on `marker`, holding `lock` from its first instant (inherited, as
     push.detach does), in a session of its own so a daemon restart leaves it running. It starts once
     its stdin closes: the go, given after the marker is complete."""
+    env = _child_env(p)
+    env["TTP_BATCH_LOCK_FD"] = str(lock.fileno())   # batch._inherited trusts only this descriptor
     with open(marker.with_suffix(".log"), "ab") as out:
-        child = subprocess.Popen(batch_argv(marker), cwd=str(p.root), env=_child_env(p), stdin=subprocess.PIPE,
+        child = subprocess.Popen(batch_argv(marker), cwd=str(p.root), env=env, stdin=subprocess.PIPE,
                                  stdout=out, stderr=subprocess.STDOUT, start_new_session=True,
                                  pass_fds=(lock.fileno(),))
     _children[bid] = child

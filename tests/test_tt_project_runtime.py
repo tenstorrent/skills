@@ -9269,7 +9269,7 @@ def test_after_push_runs_at_the_pushed_commit_in_a_clean_checkout_with_the_push_
     from ttp import locks
     run_lock = locks.try_take([p.state / "locks" / "push:run-b1.0.lock"], "push queue")
     proc = subprocess.Popen([sys.executable, "-m", "ttp", "push", "--batch", str(marker)], cwd=str(repo),
-                            env={**os.environ, "PYTHONPATH": str(RUNTIME)}, stdin=subprocess.PIPE,
+                            env={**os.environ, "PYTHONPATH": str(RUNTIME), "TTP_BATCH_LOCK_FD": str(run_lock.fileno())}, stdin=subprocess.PIPE,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, pass_fds=(run_lock.fileno(),))
     run_lock.close()        # the child holds it now
     out = proc.communicate("", timeout=120)[0]
@@ -16188,3 +16188,28 @@ def test_a_failed_reviews_fix_takes_only_the_real_findings(env):
     assert ev == {"proposed follow-up: add the missing test": "handled",
                   "proposed follow-up: upstream: the review prompt could say X": "queued",
                   "proposed follow-up: retune later [start_after: 3600]": "queued"}
+
+
+def test_batch_inherited_takes_only_the_named_fd(tmp_path, monkeypatch):
+    """batch._inherited trusts only the descriptor in TTP_BATCH_LOCK_FD: a caller's own descriptor on
+    the same lock file (batch run in-process) is never picked up or closed."""
+    from ttp import batch
+    path = tmp_path / "push:run-b1.0.lock"
+    path.write_text("")
+    mine = os.open(path, os.O_RDWR)
+    try:
+        monkeypatch.delenv(batch.LOCK_FD_ENV, raising=False)
+        assert batch._inherited(path) is None
+        other = tmp_path / "other.lock"
+        other.write_text("")
+        passed = os.open(other, os.O_RDWR)
+        monkeypatch.setenv(batch.LOCK_FD_ENV, str(passed))
+        assert batch._inherited(path) is None        # named fd is on another file
+        assert batch._inherited(other) == passed
+        os.close(passed)
+        assert batch._inherited(other) is None       # named fd no longer open
+        monkeypatch.setenv(batch.LOCK_FD_ENV, str(mine))
+        assert batch._inherited(path) == mine
+        os.fstat(mine)                               # still open
+    finally:
+        os.close(mine)
