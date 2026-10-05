@@ -1288,9 +1288,11 @@ class Daemon:
     def _check_price_table(self, r: dict, usage) -> None:
         """Price a finished Claude run's session log with the table that estimates other local
         sessions, and raise a low alert when it drifts from the cost Claude Code reported. A resumed
-        run is skipped: its session log also holds the calls of the run it resumed."""
+        run is skipped: its session log also holds the calls of the run it resumed, and so is a run on
+        plan windows, where the global cap that table serves never applies."""
         if (r["provider"] != "claude" or usage.estimated or not usage.cost_usd or not usage.session_id
                 or float((self.cfg.get("budget") or {}).get("global_daily_usd") or 0) <= 0
+                or getattr(self.gates.get("claude"), "regime", "caps") != "caps"   # plan runs never count
                 or json.loads(r.get("note") or "{}").get("resumes")):
             return
         try:
@@ -1859,8 +1861,6 @@ class Daemon:
             except Exception:
                 pass
         windows = bud.plan_windows(self.p.db)
-        gcap.refresh_async(self.cfg.get("budget") or {})   # other machines' totals, in the background
-        localspend.scan_async(self.cfg.get("budget") or {})   # other local Claude Code sessions
         gates, news, red_sent = {}, [], {}
         # After a restart the last levels come from disk, so a change while the daemon was down is news.
         saved = {} if self.gates else (self.p.db.kv("gates") or {})
@@ -1889,6 +1889,11 @@ class Daemon:
                 news.append((f"Budget for {prov} is now red: {'; '.join(g.reasons)}. " + hint,
                              "high", f"budget:{prov}"))
             gates[prov] = g
+        # The global cap counts only for providers billed by usage: a project whose providers are all
+        # on plan windows needs no other machines' totals and no scan of local sessions.
+        if any(g.regime == "caps" for g in gates.values()):
+            gcap.refresh_async(self.cfg.get("budget") or {})   # other machines' totals, in the background
+            localspend.scan_async(self.cfg.get("budget") or {})   # other local Claude Code sessions
         # One transaction: saved gates without their alert would hide the change from every later
         # tick and restart. Gates first: a relay reading an alert before the gates show red would
         # count it as cleared.

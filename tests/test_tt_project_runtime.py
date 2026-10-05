@@ -21736,6 +21736,37 @@ def test_a_drifting_price_table_raises_a_low_alert(env, monkeypatch):
     asked.clear()
     d._check_price_table({"provider": "claude", "note": json.dumps({"resumes": {"run": 1, "session": "s1"}})}, usage)
     assert asked == [], "a resumed run's log also holds the run it resumed"
+    monkeypatch.setattr(ls, "calibrate", lambda sid, usd: asked.append(sid) or 0.005)
+    d.gates = {"claude": types.SimpleNamespace(regime="windows")}
+    d._check_price_table({"provider": "claude"}, usage)
+    assert asked == [], "a plan run never counts toward the global cap"
+    d.gates = {"claude": types.SimpleNamespace(regime="caps")}
+    d._check_price_table({"provider": "claude"}, usage)
+    assert asked == ["s1"]
+
+
+@pytest.mark.parametrize("regimes,runs", [({"claude": "windows"}, False), ({"claude": "caps"}, True),
+                                          ({"claude": "windows", "codex": "caps"}, True)])
+def test_global_cap_background_work_runs_only_with_a_usage_billed_provider(env, monkeypatch, regimes, runs):
+    """The global cap applies only to providers billed by usage: a project whose providers are all on
+    plan windows asks no other machines and scans no local sessions, even with the cap on."""
+    p = make(env)
+    from ttp import budget as bud, globalcap as gcap, localspend as ls
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    d.cfg["budget"]["global_daily_usd"] = 200
+    d.cfg["core_provider"] = "claude"
+    if "codex" in regimes:
+        p.db.add_task("other", "on codex", kind="work", tier="light", origin="user", provider="codex")
+    real = bud.evaluate
+    monkeypatch.setattr(bud, "evaluate", lambda db, cfg, prov, *a, **k: setattr(
+        g := real(db, cfg, prov, *a, **k), "regime", regimes[prov]) or g)
+    started = []
+    monkeypatch.setattr(gcap, "refresh_async", lambda b, *a: started.append("refresh"))
+    monkeypatch.setattr(ls, "scan_async", lambda b, *a: started.append("scan"))
+    d.update_gates()
+    assert set(d.gates) == set(regimes)
+    assert started == (["refresh", "scan"] if runs else []), started
 
 
 # Device-aware scheduling: fair `ttp lock` queue, device lock aliases, --probe, nested locks,
