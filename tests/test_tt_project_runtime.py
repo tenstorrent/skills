@@ -81,12 +81,25 @@ def env(tmp_path, monkeypatch, _git_session):
     # Likewise for state files: durable_write still writes, renames and calls os.fsync (tests that
     # check the syncs wrap it), but the sync itself, slow on copy-on-write filesystems, is skipped.
     monkeypatch.setattr(os, "fsync", lambda fd: None)
+    monkeypatch.setattr(os, "sync", lambda: None)   # setup and upgrade sync the whole disk
     # And for the harness's own commits, which pass the fsync settings per command; it doubles their
     # cost. Tests of those settings set TTP_TEST_GIT_FSYNC to get them back.
     from ttp import project
     real_fsync_args = project.git_fsync_args
     monkeypatch.setattr(project, "git_fsync_args",
                         lambda: real_fsync_args() if os.environ.get("TTP_TEST_GIT_FSYNC") else [])
+    # Every new project records the plugin checkout's commit, three git commands in the checkout;
+    # it does not change during a session, so it is looked up once. Other folders are looked up live.
+    from ttp import cli
+    real_checkout_commit = cli._checkout_commit
+
+    def checkout_commit(root):
+        if pathlib.Path(root).resolve() != RUNTIME.parent:
+            return real_checkout_commit(root)
+        if "plugin_commit" not in _git_session:
+            _git_session["plugin_commit"] = real_checkout_commit(root)
+        return _git_session["plugin_commit"]
+    monkeypatch.setattr(cli, "_checkout_commit", checkout_commit)
     monkeypatch.setenv("GIT_ALTERNATE_OBJECT_DIRECTORIES", str(_git_session["objects"]))
     repo = tmp_path / "repo"   # a git repository with one commit of README.md
     shutil.copytree(_git_session["repo"], repo, symlinks=True)
