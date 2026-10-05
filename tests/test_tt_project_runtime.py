@@ -2940,6 +2940,12 @@ def test_charter_restrictions_lead_and_close_every_worker_prompt(env):
     assert system.startswith("# BINDING RESTRICTIONS")
     assert system.count("Never merge to main.") == 1, "the coordinator reads the restrictions twice"
     assert "Draft PRs." in system
+    two = ("# demo\n\n## Goals\nGo fast.\n\n## Restrictions (binding on every task)\nNo host scanning.\n\n"
+           "## Policies\nDraft PRs.\n\n## Restrictions (added later)\nOnly charter-named resources.\n")
+    assert charter_restrictions(two) == "No host scanning.\nOnly charter-named resources."
+    assert charter_restrictions("") == ""
+    p.charter_path.write_text("")
+    assert "BINDING RESTRICTIONS" not in worker_prompt(p, p.db.task(tid), str(p.root), None)
 
 
 def test_charter_update_replaces_moves_the_old_section_to_history(env):
@@ -4087,6 +4093,50 @@ def test_continuing_a_blocked_task_cancels_it_and_may_reuse_its_title(env):
     new = p.db.one("SELECT id FROM tasks WHERE title='stuck' AND id!=?", (old,))["id"]
     assert p.db.task(old)["status"] == "cancelled" and f"#{new}" in p.db.task(old)["blocked_reason"]
     assert p.db.task(other)["status"] == "blocked"
+
+
+def test_task_add_rejects_a_near_duplicate_naming_the_task(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    spec = "The upload test fails one run in ten on CI. Find the race and fix it."
+    old = p.db.add_task("fix flaky upload test in CI", spec, origin="user")
+    p.db.update_task(old, status="waiting")
+    near = {"type": "task_add", "title": "fix the flaky upload test in CI",
+            "spec": "Upload test fails one run in ten on CI: find the race and fix it."}
+    problem = coord.apply(p, [near])[0]
+    assert problem.startswith(f"task_add: near duplicate of task #{old} (waiting)"), problem
+    assert "fix flaky upload test in CI" in problem and "force: true" in problem
+    assert p.db.q("SELECT COUNT(*) n FROM tasks")[0]["n"] == 1
+    # The exact-title rejection keeps its own message.
+    assert coord.apply(p, [{**near, "title": "fix flaky upload test in CI"}]) == [f"task_add: duplicate of open task #{old}"]
+    # Different numbers are different work, however alike the rest reads.
+    p.db.add_task("benchmark candidate 3", "Run the benchmark suite on the candidate build and report.", origin="user")
+    assert coord.apply(p, [{"type": "task_add", "title": "benchmark candidate 4",
+                            "spec": "Run the benchmark suite on the candidate build and report."}]) == []
+    # force: true adds it deliberately.
+    assert coord.apply(p, [{**near, "force": True}]) == []
+    assert p.db.one("SELECT id FROM tasks WHERE title=?", (near["title"],))
+
+
+def test_task_add_near_duplicate_skips_the_continued_task_and_old_done_work(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    spec = "Rotate the nightly logs and keep two weeks of them on disk."
+    old = p.db.add_task("rotate nightly logs", spec, origin="user")
+    p.db.update_task(old, status="blocked", blocked_reason="needs a rethink")
+    again = {"type": "task_add", "title": "rotate the nightly logs", "spec": spec}
+    assert coord.apply(p, [again])[0].startswith(f"task_add: near duplicate of task #{old}")
+    assert coord.apply(p, [{**again, "continues": old}]) == []
+    assert p.db.task(old)["status"] == "cancelled"
+    # Done recently: still compared. Done long ago: may be redone.
+    done = p.db.add_task("compact the cache", "Compact the build cache and drop entries unused for a month.",
+                         origin="user")
+    p.db.update_task(done, status="done")
+    redo = {"type": "task_add", "title": "compact the build cache",
+            "spec": "Compact the build cache and drop entries unused for a month."}
+    assert coord.apply(p, [redo])[0].startswith(f"task_add: near duplicate of task #{done} (done)")
+    p.db.x("UPDATE tasks SET updated=? WHERE id=?", (time.time() - (coord.SIMILAR_DONE_DAYS + 1) * 86400, done))
+    assert coord.apply(p, [redo]) == []
 
 
 def test_a_code_task_continues_from_the_dead_tasks_branch(env):

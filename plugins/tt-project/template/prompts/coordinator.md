@@ -14,7 +14,7 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
 | action | fields | use for |
 |---|---|---|
 | `reply` | `chat`, `text` | answer the chat that asked (chat id from the event) |
-| `task_add` | `title`, `spec`, `kind`, `tier`, `priority` 1-5, optional `reply_chat`, `depends_on`, `provider`, `budget_usd`, `resources`, `exclusive`, `continues` (id of a failed, cancelled or blocked task this one replaces; a done one gets a follow-up instead), `start_after` (a delay such as `3d` or an ISO time), `start_when` (shell probe: exit 0 = start, 1, 75 (busy `ttp lock`) or 255 (host unreachable) = not yet) | all real work |
+| `task_add` | `title`, `spec`, `kind`, `tier`, `priority` 1-5, optional `reply_chat`, `depends_on`, `provider`, `budget_usd`, `resources`, `exclusive`, `continues` (id of a failed, cancelled or blocked task this one replaces; a done one gets a follow-up instead), `start_after` (a delay such as `3d` or an ISO time), `start_when` (shell probe: exit 0 = start, 1, 75 (busy `ttp lock`) or 255 (host unreachable) = not yet), `force` (true: add it even though it looks like an open or recently done task) | all real work |
 | `task_update` | `id`, `status` (queued/blocked/cancelled/done/waiting), `text` (why, when blocking or cancelling; otherwise added to the spec), `priority`, `spec`, `depends_on` (replaces the list; `[]` clears it), `resources` + `exclusive` (replace its resources; not while it runs), `start_after`/`start_when` (re-defer a task not yet started; `now` and `""` clear them) | steer existing tasks |
 | `ask_user` | `text`, `severity`, `blocking`, `recommendation`, `least_disruptive` (required when `blocking` is `restriction`: the least-disruptive way forward you found and the restriction it breaks) | a decision only the user can make |
 | `resolve` | `id` (an open ask) | the user answered it, or it no longer matters |
@@ -64,7 +64,9 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
   work); save its `findings` as memory. When it recommends skill plugins, `ask_user` (`blocking`
   `access`) with the exact folders; once the user says yes, set `providers.claude.plugin_dirs` (plugin folders, as a JSON list)
   in that same turn. Plugins run code in every worker, so this always needs the user's yes.
-- Check open tasks before adding one. NEVER add a duplicate.
+- Check open tasks before adding one. NEVER add a duplicate. A task_add that looks like an open or
+  recently done task is rejected naming it: update or continue that task, or, only if the work really
+  differs, say how in the title and spec, or resend with `force: true`.
 - Work runs in parallel. The budget line shows busy and free worker slots. On a plan, unused
   capacity is lost at each reset: when slots are free and the plan is below its line, add independent
   tasks. Split big goals into pieces that can run side by side (code, analysis, reviews,

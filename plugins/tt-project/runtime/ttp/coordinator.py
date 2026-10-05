@@ -587,6 +587,12 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                              (title,))
                 if dup and str(dup["id"]) != str(a.get("continues")):
                     raise ValueError(f"duplicate of open task #{dup['id']}")
+                if not a.get("force"):
+                    same = similar_task(db, title, a.get("spec") or "", skip=a.get("continues"))
+                    if same:
+                        raise ValueError(f"near duplicate of task #{same['id']} ({same['status']}) "
+                                         f"'{same['title'][:120]}': update or continue it; if this is new work, say "
+                                         f"how it differs in the title and spec, or add force: true")
                 review = a.get("kind") == "review"
                 cap = task_cap(cfg, review)
                 free_at = next_task_slot(db, cap, review=review)
@@ -935,6 +941,44 @@ def _ask_question(text: str) -> str:
 
 def _same_text(a: str, b: str) -> bool:
     return " ".join(a.lower().split()) == " ".join(b.lower().split())
+
+
+SIMILAR_DONE_DAYS = 3   # a task done this recently is still compared against a new task_add
+_STOP = set("a an the of to for and or in on at by with from into vs via is be as it its this that".split())
+
+
+def _words(text: str) -> set[str]:
+    return {w for w in re.findall(r"[a-z0-9_]+(?:[.-][a-z0-9_]+)*", (text or "").lower()) if w not in _STOP}
+
+
+def _jaccard(a: set, b: set) -> float:
+    return len(a & b) / len(a | b) if a | b else 0.0
+
+
+def looks_same(title1: str, spec1: str, title2: str, spec2: str) -> bool:
+    """Same work under a near-identical title and spec. Titles that both name numbers (task ids,
+    iterations, candidates) and name different ones are different work, however alike they read."""
+    if _same_text(title1, title2):
+        return True
+    n1, n2 = (set(re.findall(r"\d[\w.-]*", t.lower())) for t in (title1, title2))
+    if n1 and n2 and n1 != n2:
+        return False
+    tj = _jaccard(_words(title1), _words(title2))
+    s1, s2 = _words(spec1), _words(spec2)
+    # A spec of a word or two says nothing about the work; judge by the title alone then.
+    sj = _jaccard(s1, s2) if s1 and s2 and len(s1 | s2) >= 4 else tj
+    return (tj >= 0.7 and sj >= 0.45) or (tj >= 0.4 and sj >= 0.7)
+
+
+def similar_task(db, title: str, spec: str, skip: Any = None) -> dict | None:
+    """An open task, or one done in the last SIMILAR_DONE_DAYS, that a new task_add would repeat.
+    Failed and cancelled ones may be redone; `skip` is the task the new one continues."""
+    since = time.time() - SIMILAR_DONE_DAYS * 86400
+    for t in db.q("SELECT id, title, spec, status FROM tasks WHERE status NOT IN ('done','failed','cancelled') "
+                  "OR (status='done' AND COALESCE(updated, created, 0) >= ?) ORDER BY id DESC", (since,)):
+        if str(t["id"]) != str(skip) and looks_same(title, spec, t["title"] or "", t["spec"] or ""):
+            return t
+    return None
 
 
 def _new_dependencies(db, task: dict | None, raw: Any) -> list[int]:
