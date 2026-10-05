@@ -7,7 +7,7 @@ Once `budget.day_start` ("HH:MM") is set, the day is fixed: it starts at that ti
 `budget.timezone` (an IANA zone, default UTC; never the host's own zone, since servers run on UTC)
 and lasts until the same wall-clock time the next day, so it is 23 or 25 hours long across a
 daylight-saving change. The default, an empty `day_start`, keeps the rolling 24 hours. Weekly caps
-stay rolling 7 days. `budget.global_daily_usd` defaults to 0 (off).
+stay rolling 7 days. `budget.global_daily_usd` defaults to $200 (0 = off).
 
 The global total for a provider counts, for this day:
 - this machine: every project in the registry (`ttp list`) whose host is this machine, read from its

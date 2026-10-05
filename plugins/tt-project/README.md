@@ -81,9 +81,12 @@ and preferences you add later become part of the project's charter and memory.
   runs stop reporting plan windows falls under these caps too (failed or silent runs do not count).
   The caps count only spend made on an account that was billed by use at the time: after a switch
   from a plan account to a usage-billed one, the plan's earlier spend stays out.
-- Global daily cap (usage-billed, off by default): `budget.global_daily_usd` stops new work in every
-  project once the whole account's tt-project spend today reaches it (0, the default, turns it
-  off). Running work and replies to your messages go on; it clears by itself at the day's reset
+- Global daily cap (usage-billed, $200/day by default): `budget.global_daily_usd` stops new work in
+  every usage-billed project on the account once the whole account's tt-project spend today reaches
+  it. "Today" is the rolling 24 hours unless `budget.day_start` is set. Change it for every project
+  on the machine with `ttp config --account budget.global_daily_usd 500` (or for one project with
+  `ttp config <name> budget.global_daily_usd 500`); 0 turns it off. Plan accounts are bounded by their
+  windows instead and never meet it. Running work and replies to your messages go on; it clears by itself at the day's reset
   (or, without a budget day, as spend leaves the last 24 h). Only spend on the same provider and the same account counts (an account is compared by a
   hash, so its name never leaves the machine); rows with no account recorded count, to be safe.
   The total covers every project `ttp list` shows on this machine, the machines of the registry's

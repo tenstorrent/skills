@@ -496,7 +496,7 @@ def test_plan_readings_of_another_plan_account_stop_counting_at_once(env):
     assert g.regime == "caps" and any("another account" in r for r in g.reasons), g.reasons
     assert g.numbers["spent_24h"] == 0 and g.level == "green", "the old plan's spend stays plan-billed"
     line = budget_line(p.db, now, "claude", g.as_dict())
-    assert "86%" not in line and "avg" not in line and "actual" in line, line
+    assert "86%" not in line and "avg" not in line and "this project" in line, line
     assert bud.history(p.db)["window_peaks"] == []
     # the new account reports: its windows count, and burn is measured from its readings alone
     _reading(p, now - 30, "acct-b | plan", "seven_day", 20.0, now + 2 * 86400)
@@ -523,7 +523,7 @@ def test_a_switch_to_a_usage_billed_account_drops_plan_windows_before_its_first_
     g = bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db, now), now)
     assert g.regime == "caps" and g.numbers["spent_24h"] == 70.0 and g.level == "yellow", (g.numbers, g.reasons)
     line = budget_line(p.db, now, "claude", g.as_dict())
-    assert line == "24h $70.00 actual", "the old plan's spend was never billed: " + line
+    assert line == "24h $70.00 this project, $0.00 of $200 global", "the old plan's spend was never billed: " + line
     # a run that started earlier under the plan account does not bring its windows back
     _run(p, "acct-a | plan", now - 7300)
     assert bud.plan_windows(p.db, now) == []
@@ -560,7 +560,7 @@ def test_account_switch_mid_window_counts_only_billed_spend(env):
     g = bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db, now), now)
     assert g.regime == "caps" and g.numbers["spent_24h"] == 15.0 and g.numbers["spent_7d"] == 15.0, g.numbers
     assert g.level == "green" and g.allow_new_work, (g.level, g.reasons)
-    assert budget_line(p.db, now, "claude", g.as_dict()) == "24h $15.00 actual"
+    assert budget_line(p.db, now, "claude", g.as_dict()) == "24h $15.00 this project, $0.00 of $200 global"
     assert budget_line(p.db, now, "claude") == "24h $15.00 actual"
     # B's run still going counts; a run that started under A before the switch does not
     _run(p, "acct-b | billed", now - 300, None, 2.5)
@@ -2094,8 +2094,8 @@ def test_status_shows_spend_waiting_retry_and_coordinator_health(env):
     lines = out.splitlines()
     assert len(lines) <= 25, out
     # The budget is one plain line; caps, top spenders and gate reasons are in the web app's Budget tab.
-    assert "budget: 24h $4.50 actual" in lines, out
-    assert [ln for ln in lines if "$" in ln] == ["budget: 24h $4.50 actual"], out
+    assert "budget: 24h $4.50 this project, $4.50 of $200 global" in lines, out
+    assert [ln for ln in lines if "$" in ln] == ["budget: 24h $4.50 this project, $4.50 of $200 global"], out
     assert "top 7d" not in out and "spend:" not in out, out
     wait = [ln for ln in lines if "measure on a board" in ln]
     assert wait and "waiting, next try" in wait[0] and wait[0].count("next try") == 1, out
@@ -20756,25 +20756,73 @@ def test_the_global_cap_alert_clears_by_itself_at_the_day_reset(env, tmp_path, m
     assert not alerts.holds(p.db, "budget:fake", alert["ts"], clock[0])
 
 
-def test_without_budget_settings_the_caps_and_the_line_behave_as_before(env, tmp_path):
-    # Deploying the release changes nothing until someone sets the keys: no global cap, a rolling
-    # 24 h daily cap, and the old budget line.
+def test_without_budget_settings_a_usage_billed_account_gets_a_200_global_cap(env, tmp_path):
+    # No setting anywhere: a $200 global cap over the rolling 24 h, the project caps as before.
     p = make(env)
     from ttp import budget as bud
     from ttp.web import budget_line
     b = p.config()["budget"]
-    assert (b["global_daily_usd"], b["day_start"], b["timezone"]) == (0, "", "UTC"), b
-    _other_project(tmp_path, "other").spend("fake", 5000.0, "task:1")   # other projects never count
+    assert (b["global_daily_usd"], b["day_start"], b["timezone"]) == (200, "", "UTC"), b
     now = time.time()
     p.db.spend("fake", 50.0, "task:1", ts=now - 25 * 3600)        # outside the last 24 h
     p.db.spend("fake", 30.0, "task:1", ts=now - 23 * 3600)        # inside it, whatever the hour
+    _other_project(tmp_path, "other").spend("fake", 150.0, "task:1", ts=now - 60)
     g = bud.evaluate(p.db, p.config(), "fake", [], now)
     assert g.level == "green" and g.numbers["spent_24h"] == 30.0, (g.level, g.reasons)
-    assert not {"spent_today", "day_start", "global_today"} & set(g.numbers), g.numbers
-    assert budget_line(p.db, now, "fake", g.as_dict()) == "24h $30.00 actual"
-    p.db.spend("fake", 75.0, "task:1", ts=now - 7200)
+    assert (g.numbers["global_cap"], g.numbers["global_today"]) == (200, 180.0), g.numbers
+    assert "spent_today" not in g.numbers, g.numbers
+    assert budget_line(p.db, now, "fake", g.as_dict()) == "24h $30.00 this project, $180 of $200 global"
+
+
+def test_the_default_global_cap_stops_new_work_at_200(env, tmp_path):
+    p = make(env)
+    from ttp import budget as bud
+    now = time.time()
+    p.db.spend("fake", 30.0, "task:1", ts=now - 60)
+    _other_project(tmp_path, "other").spend("fake", 175.0, "task:1", ts=now - 60)
     g = bud.evaluate(p.db, p.config(), "fake", [], now)
-    assert g.level == "red" and any(r.startswith("cap reached: $105.00/24h of $100") for r in g.reasons), g.reasons
+    assert g.level == "red" and not g.allow_new_work, (g.level, g.reasons)
+    assert any(r.startswith("global daily cap reached: $205 of $200 today") for r in g.reasons), g.reasons
+
+
+def test_the_default_global_cap_leaves_a_plan_account_alone(env, tmp_path):
+    p = make(env)
+    from ttp import budget as bud
+    now = time.time()
+    p.db.x("INSERT INTO snapshots(ts,provider,account,window,utilization,resets_at) VALUES(?,?,?,?,?,?)",
+           (now - 60, "fake", "", "five_hour", 4, now + 3.9 * 3600))
+    p.db.spend("fake", 30.0, "task:1", ts=now - 60)
+    _other_project(tmp_path, "other").spend("fake", 5000.0, "task:1", ts=now - 60)
+    g = bud.evaluate(p.db, p.config(), "fake", bud.plan_windows(p.db, now), now)
+    assert g.regime == "windows" and g.level != "red", (g.level, g.reasons)
+    assert "global_today" not in g.numbers and not any("global" in r for r in g.reasons), g.reasons
+
+
+def test_an_explicit_zero_turns_the_default_global_cap_off(env, tmp_path):
+    p = make(env)
+    from ttp import budget as bud
+    from ttp.web import budget_line
+    now = time.time()
+    p.db.spend("fake", 30.0, "task:1", ts=now - 60)
+    _other_project(tmp_path, "other").spend("fake", 5000.0, "task:1", ts=now - 60)
+    p.set_config("budget.global_daily_usd", 0)
+    g = bud.evaluate(p.db, p.config(), "fake", [], now)
+    assert g.level == "green" and "global_today" not in g.numbers, (g.level, g.reasons)
+    assert budget_line(p.db, now, "fake", g.as_dict()) == "24h $30.00 actual"
+
+
+def test_an_account_level_global_cap_overrides_the_default(env, tmp_path):
+    from ttp import project
+    p = make(env)
+    from ttp import budget as bud
+    now = time.time()
+    _other_project(tmp_path, "other").spend("fake", 500.0, "task:1", ts=now - 60)
+    project.set_account_setting("budget.global_daily_usd", 1000)
+    g = bud.evaluate(p.db, p.config(), "fake", [], now)
+    assert g.level == "green" and g.numbers["global_cap"] == 1000, (g.level, g.reasons)
+    project.set_account_setting("budget.global_daily_usd", 0)
+    g = bud.evaluate(p.db, p.config(), "fake", [], now)
+    assert g.level == "green" and "global_today" not in g.numbers, (g.level, g.reasons)
 
 
 def test_the_coordinator_digest_shows_the_global_daily_total(env, tmp_path):
