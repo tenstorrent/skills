@@ -950,17 +950,24 @@ class Daemon:
         if r["role"] == "coordinator" or not r["task"] or not r["dir"]:
             return
         limit = self.cfg["budget"].get("split_reread_tokens") or 0   # 0: off for every tier
+        task = self.p.db.task(r["task"]) or {}
         if isinstance(limit, dict):
-            task = self.p.db.task(r["task"]) or {}
             limit = limit.get(task.get("tier") or "standard") or 0
         if not limit or reread < int(limit):
             return
-        coord._append_update(Path(r["dir"]) / "steer.md", (
-            f"This run has re-read about {reread / 1e6:.1f} M tokens of context (the split line for its tier "
-            f"is {int(limit) / 1e6:.1f} M); every further call re-reads it all again. Finish the step you are "
-            "on, commit, and hand off: `done` with a `followups` entry (title starting `continue:`) whose "
-            "spec is self-contained (what is done, the branch and head, what is left), or `waiting` if "
-            "that fits. Do not start new large steps in this run."), f"split-{r['id']}")
+        head = (f"This run has re-read about {reread / 1e6:.1f} M tokens of context (the split line for its tier "
+                f"is {int(limit) / 1e6:.1f} M); every further call re-reads it all again. ")
+        if r["role"] == "reviewer" or task.get("kind") == "review":
+            # A review's `done` approves and its followups are blocking findings: it cannot hand half on.
+            text = head + ("A review does not split: finish it in as few further calls as you can, reading "
+                           "only what is still unchecked. If you already have blocking findings, hand off "
+                           "`failed` with them now. Never hand off `done` without having checked the whole change.")
+        else:
+            text = head + ("Finish the step you are on, commit, and hand off: `done` with a `followups` entry "
+                           "(title starting `continue:`) whose spec is self-contained (what is done, the branch "
+                           "and head, what is left), or `waiting` if that fits. Do not start new large steps in "
+                           "this run.")
+        coord._append_update(Path(r["dir"]) / "steer.md", text, f"split-{r['id']}")
 
     def _priced(self, r: dict, usage) -> float:
         if usage.estimated and not usage.cost_usd:

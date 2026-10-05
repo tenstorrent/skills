@@ -18328,7 +18328,7 @@ PYTEST_LOG = "\n".join([*(f"tests/test_x.py::test_{i} PASSED" for i in range(400
                         "========================= 1 failed, 400 passed in 3.21s ========================="])
 
 
-def test_trim_cuts_test_output_to_its_failures_and_other_output_to_head_and_tail():
+def test_trim_cuts_test_output_to_its_failures_and_other_output_to_head_and_tail(env):
     from ttp import trim
     short = trim.summary(PYTEST_LOG, "/run/out/clip-1.log")
     assert "FAILED tests/test_x.py::test_broken - assert 2 == 3" in short and "E       assert 2 == 3" in short
@@ -18440,6 +18440,24 @@ def test_a_worker_that_rereads_too_much_context_is_told_once_to_split(env, tmp_p
     turn(5, 1)
     d.meter_running()
     assert not (run_dir / "steer.md").exists(), "0 turns it off"
+
+
+def test_a_review_past_the_split_line_is_told_to_finish_its_verdict_not_to_hand_off_done(env, tmp_path):
+    p = make(env)
+    from ttp.daemon import Daemon
+    tid = p.db.add_task("review it", "spec", kind="review", tier="standard", origin="user")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    msg = {"type": "assistant", "message": {"id": "m1", "content": [],
+                                            "usage": {"input_tokens": 10, "cache_read_input_tokens": 5_000_000}}}
+    (run_dir / "output.jsonl").write_text(json.dumps(msg) + "\n")
+    p.db.x("INSERT INTO runs(task,role,provider,model,started,status,dir,boot_id) VALUES(?,?,?,?,?,?,?,?)",
+           (tid, "reviewer", "claude", "opus", time.time(), "running", str(run_dir), "x"))
+    Daemon(p.base).meter_running()
+    steer = (run_dir / "steer.md").read_text()
+    assert "re-read about 5.0 M tokens" in steer and "A review does not split" in steer
+    assert "`failed`" in steer and "Never hand off `done` without" in steer
+    assert "continue:" not in steer and "`waiting`" not in steer, steer
 
 
 def test_ttp_stats_reports_reread_tokens_per_run_and_per_dollar_by_kind_and_tier(env, capsys):

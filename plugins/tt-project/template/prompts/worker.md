@@ -144,5 +144,5 @@ Before you finish, write `$TTP_RUN_DIR/result.json`:
 - Keep runs short: a run re-reads its whole context on every call. When the work is more than one
   run should hold, or the harness says the run passed its split line, finish the step, commit and
   hand off `done` with a `followups` entry titled `continue: ...` (what is done, branch and head,
-  what is left).
+  what is left). A review does not split this way: it finishes its verdict.
 - No `result.json`, no credit: a run that ends without one counts as an unfinished attempt.
