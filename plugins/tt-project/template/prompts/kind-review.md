@@ -15,6 +15,8 @@
 - `result.json`: `status` `done` when it may proceed, `failed` when it must not.
 <!-- /ttp:result-rule -->
 - `followups`: one entry per blocking problem, each a self-contained fix spec.
+- A head the spec says is already delivered as a PR is review only: a pass is `done`, with no push
+  and no approval for the push queue, whatever the sections below say.
 - When it must not proceed, put the full hash of the head you reviewed in `metrics.reviewed_head`:
   the re-review of the fix is then sized by the fix alone.
 - A re-review whose spec lists earlier findings: check each is fixed, then review what changed since.

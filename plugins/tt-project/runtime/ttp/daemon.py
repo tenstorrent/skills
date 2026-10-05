@@ -2833,7 +2833,8 @@ class Daemon:
             if not add:
                 return None
             changes = worktree.diff_lines(self.p, [branch]) if branch else None
-            head = worktree._git(self.p.root, "rev-parse", "--short=12", branch) if changes else ""
+            full = worktree._git(self.p.root, "rev-parse", branch) if changes else ""
+            head = full[:12]
         except Exception as e:
             log(self.p, f"task {task['id']}: no review queued, its diff was not read: {e}")
             return None
@@ -2862,14 +2863,22 @@ class Daemon:
                          f"then review what changed since.")
         lines.append("Check that it does what its spec asks, is correct, keeps the charter's restrictions, and "
                      "that its tests fail without it.")
-        if d.get("push_branch") and d.get("push_allowed", True):
+        # A head its PR already carries is delivered: a pass closes the review, with no push to the
+        # push branch or approval for the push queue (that branch may be unrelated, or not exist yet).
+        delivered = push.delivered_pr(self.p, task, full)
+        pushes = bool(d.get("push_branch") and d.get("push_allowed", True)) and not delivered
+        if delivered:
+            lines.append(f"Its head is already delivered as PR {delivered}: review only. If it passes, hand off "
+                         f"`done`; do not run `ttp push` or approve it for the push queue. Leave the branch and "
+                         f"the PR as they are.")
+        elif pushes:
             lines.append(f"If it passes, push it with `ttp push` from the change's worktree (it publishes to "
                          f"{d['push_branch']}).")
         else:
             lines.append("Review only: leave the branch" + (" and the PR" if pr else "") + " as they are.")
         if str(rules.get("auto_notes") or "").strip():
             lines.append(str(rules["auto_notes"]).strip())
-        lines.append("Return the verdict and findings" + (", and the pushed commit." if d.get("push_branch") else "."))
+        lines.append("Return the verdict and findings" + (", and the pushed commit." if pushes else "."))
         labels = [f"auto_review:{task['id']}"] + ([f"continues:{prior['id']}"] if prior else [])
         rid = db.add_task(title, "\n".join(lines), kind="review", tier=tier, priority=2, origin="daemon",
                           budget_usd=float(cfg["budget"]["task_default_usd"].get(tier, 8.0)),

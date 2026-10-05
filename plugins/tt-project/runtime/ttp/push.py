@@ -387,6 +387,31 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
     return remote, branch
 
 
+def delivered_pr(p: Project, task: dict, head: str) -> str | None:
+    """The URL of the task's PR when it already carries `head` (a full hash), else None. The PR's
+    head as pr-watch last read it decides, and a PR it read as no longer open does not count; before
+    pr-watch read it, a `ttp push --own` of this task that pushed exactly `head` does. A review of
+    such a head is review only: the work is delivered, so a pass publishes nothing more."""
+    from . import prguard
+    url = str(task.get("pr_url") or "").strip()
+    key = prguard.pr_key(url) if url and head else None
+    if not key:
+        return None
+    state = ((p.db.kv("pr_signatures", {}) or {}).get(url) or {}).get("state")
+    if state and state != "OPEN":
+        return None
+    seen = ((p.db.kv(prguard.HEADS_KEY, {}) or {}).get(key) or {}).get("sha")
+    if seen:
+        return url if seen == head else None
+    folder = p.state / DETACHED
+    for marker in sorted(folder.glob("*.json")) if folder.is_dir() else []:
+        m = _read(marker)
+        if (m.get("own") and m.get("status") == "pushed" and m.get("sha") == head
+                and str(m.get("task") or "") == str(task.get("id"))):
+            return url
+    return None
+
+
 def refusal(repo: Path, remote: str, branch: str) -> str:
     """Why `branch` on `remote` must not be pushed to, or "" when it may. Fails closed when the
     remote cannot be asked for its default branch."""

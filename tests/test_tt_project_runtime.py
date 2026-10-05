@@ -18501,8 +18501,9 @@ def test_idle_slot_wake_backs_off_to_long_waits_while_every_queued_task_is_gated
     assert st and st["wait"] == float(c["idle_wake_s"]), st
 
 
-def _finish_code(env, p, title, files, result=None, labels=None):
-    """A code task that committed `files` (name -> lines) on its branch, then handed off."""
+def _finish_code(env, p, title, files, result=None, labels=None, before=None):
+    """A code task that committed `files` (name -> lines) on its branch, then handed off. `before`
+    is called with the task id and its branch's head just before the hand-off."""
     from ttp import worktree
     from ttp.daemon import Daemon
     from ttp.providers.base import RunUsage as Usage
@@ -18519,6 +18520,8 @@ def _finish_code(env, p, title, files, result=None, labels=None):
     run_dir = env["tmp"] / f"run-{tid}"
     run_dir.mkdir()
     (run_dir / "result.json").write_text(json.dumps(result or {"status": "done", "summary": f"{title} works"}))
+    if before:
+        before(tid, _git_out(path, "rev-parse", "HEAD").strip())
     Daemon(p.base)._finish_worker({"task": tid}, Usage(cost_usd=1.0), "ok", run_dir)
     done = p.db.one("SELECT * FROM events WHERE task=? AND kind='task_done'", (tid,))
     reviews = p.db.q("SELECT * FROM tasks WHERE kind='review' AND depends_on=?", (json.dumps([tid]),))
@@ -18546,6 +18549,68 @@ def test_the_daemon_queues_the_review_of_a_finished_code_task(env):
     p.set_config("review.risky_paths", ["state/*"])
     _, _, _, (risky,) = _finish_code(env, p, "risky", {"state/db.py": 3})
     assert risky["tier"] == "standard"
+
+
+def test_the_review_of_a_head_already_delivered_as_a_pr_publishes_nothing_more(env):
+    # A code task delivered its head as a draft PR; a push branch is configured too. A passing review
+    # of that head is review only: no `ttp push` toward a branch that may be unrelated or absent.
+    from ttp import prguard
+    p = make(env)
+    p.set_config("delivery.push_branch", "work")
+    url = "https://github.com/acme/app/pull/7"
+    pr = {"status": "done", "summary": "draft PR opened", "pr": url}
+
+    def watched(sha):
+        return lambda tid, head: p.db.set_kv(prguard.HEADS_KEY, {"acme/app#7": {"sha": sha(head), "seen": 1.0}})
+
+    def pushed_own(task=None, status="pushed"):
+        def write(tid, head):
+            p.db.set_kv(prguard.HEADS_KEY, {})   # pr-watch has not read the PR yet
+            folder = p.state / "pushes"
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / f"t{tid}-own.json").write_text(json.dumps(
+                {"own": True, "status": status, "sha": head, "task": str(task or tid), "exit": 0}))
+        return write
+
+    def spec(title, before):
+        _, _, _, (rev,) = _finish_code(env, p, title, {f"{title}.py": 5}, result=pr, before=before)
+        return rev["spec"]
+
+    # pr-watch read the PR at this head: delivered.
+    s = spec("seen", watched(lambda h: h))
+    assert f"already delivered as PR {url}" in s and "ttp push` from" not in s
+    assert s.rstrip().endswith("findings.") and "Leave the branch and the PR as they are" in s
+    # Not read yet, but this task's `ttp push --own` pushed exactly this head: delivered.
+    s = spec("own", pushed_own())
+    assert "already delivered" in s and "ttp push` from" not in s
+    # The PR carries another head, the own push failed or was another task's: the review pushes as before.
+    for title, before in (("moved", watched(lambda h: "0" * 40)), ("failed", pushed_own(status="failed")),
+                          ("other", pushed_own(task=999))):
+        s = spec(title, before)
+        assert "already delivered" not in s and "ttp push` from" in s and s.rstrip().endswith("the pushed commit."), title
+    # A PR pr-watch read as closed delivers nothing, whatever head it had.
+    p.db.set_kv("pr_signatures", {url: {"state": "CLOSED"}})
+    s = spec("closed", watched(lambda h: h))
+    assert "already delivered" not in s and "ttp push` from" in s
+    # No push branch: review only either way, and no pushed commit asked for.
+    p.db.set_kv("pr_signatures", {url: {"state": "OPEN"}})
+    p.set_config("delivery.push_branch", "")
+    s = spec("nobranch", watched(lambda h: h))
+    assert "already delivered" in s and "ttp push` from" not in s and s.rstrip().endswith("findings.")
+
+
+def test_the_review_prompt_and_coordinator_treat_a_head_in_a_pr_as_delivered(env):
+    from ttp.prompts import worker_task
+    p = make(env)
+    p.set_config("delivery.push_branch", "work")
+    review = p.db.add_task("review it", "s", kind="review", tier="light", origin="user")
+    for on in (False, True):   # kept whichever delivery section the review's prompt carries
+        p.set_config("delivery.push_queue", on)
+        text = " ".join(worker_task(p, p.db.task(review), str(p.root), None).split())
+        assert "already delivered as a PR is review only: a pass is `done`, with no push and no approval " \
+               "for the push queue" in text, on
+    coord_md = " ".join((RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text().split())
+    assert "A head already delivered as a PR (draft or open, same head) is delivered" in coord_md
 
 
 def test_a_code_hand_off_with_more_to_decide_still_wakes_the_coordinator(env):
