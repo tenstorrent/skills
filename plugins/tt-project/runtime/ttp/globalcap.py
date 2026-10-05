@@ -43,6 +43,7 @@ from typing import Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from . import project
+from . import db as dbmod
 
 DAY = 86400.0
 REFRESH_S = 600            # each other machine is asked again this long after the last try
@@ -146,9 +147,10 @@ def _matches(row: dict, provider: str, account: str) -> bool:
 def _rows(conn: sqlite3.Connection, start: float, end: float) -> list[dict]:
     """Spend per (provider, account key) in [start, end), with running work as last priced."""
     out: dict[tuple, float] = {}
+    where, args = dbmod.counted_spend(start, end)     # the same rule as the project caps
     for prov, acct, usd in conn.execute(
-            "SELECT provider, COALESCE(account,''), SUM(usd) FROM ledger WHERE ts>=? AND ts<? "
-            "GROUP BY provider, account", (start, end)):
+            f"SELECT provider, COALESCE(account,''), SUM(usd) FROM ledger WHERE {where} "
+            "GROUP BY provider, account", args):
         k = (prov, account_key(prov or "", acct))
         out[k] = out.get(k, 0.0) + float(usd or 0)
     for prov, acct, usd in conn.execute(

@@ -432,16 +432,26 @@ class DB:
         if billed:
             return sum(billing.billed_by_account(self.conn, since_ts, provider=provider, exclude=exclude,
                                                  estimated_only=estimated_only).values())
-        sql, args = "SELECT COALESCE(SUM(usd),0) s FROM ledger WHERE ts>=?", [since_ts]
-        if provider:
-            sql, args = sql + " AND provider=?", args + [provider]
-        # exclude maps provider -> time up to which its rows are left out.
-        for prov, until in (exclude or {}).items():
-            sql, args = sql + " AND NOT (provider=? AND ts<=?)", args + [prov, until]
-        if estimated_only:
-            sql += " AND estimated=1"
-        r = self.one(sql, args)
+        where, args = counted_spend(since_ts, provider=provider, exclude=exclude, estimated_only=estimated_only)
+        r = self.one(f"SELECT COALESCE(SUM(usd),0) s FROM ledger WHERE {where}", args)
         return float(r["s"]) if r else 0.0
+
+
+def counted_spend(since_ts: float, until_ts: float | None = None, provider: str | None = None,
+                  exclude: Mapping[str, float] | None = None, estimated_only: bool = False) -> tuple[str, list]:
+    """The WHERE clause and its arguments for the ledger rows that count as spend in
+    [since_ts, until_ts): the one rule both the project caps (DB.spent_since) and the global daily
+    total (globalcap) sum by. `exclude` maps provider -> time up to which its rows are left out."""
+    sql, args = "ts>=?", [since_ts]
+    if until_ts is not None:
+        sql, args = sql + " AND ts<?", args + [until_ts]
+    if provider:
+        sql, args = sql + " AND provider=?", args + [provider]
+    for prov, until in (exclude or {}).items():
+        sql, args = sql + " AND NOT (provider=? AND ts<=?)", args + [prov, until]
+    if estimated_only:
+        sql += " AND estimated=1"
+    return sql, args
 
 
 SEVERITY_RANK = {"info": 0, "low": 0, "normal": 1, "high": 2, "critical": 3}

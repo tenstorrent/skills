@@ -19727,6 +19727,23 @@ def test_the_global_daily_total_counts_another_machine_fresh_and_then_stale(env,
     assert calls[0][:3] == ["ssh", "-o", "BatchMode=yes"] and "spend-today" in calls[0][-1], calls
 
 
+def test_the_global_total_and_the_project_caps_count_spend_by_one_rule(env, tmp_path, monkeypatch):
+    # Which ledger rows count as spend is decided in one place (db.counted_spend), so a change to
+    # it applies to the project caps and the global daily total alike.
+    p = make(env)
+    from ttp import db as dbmod
+    from ttp import globalcap as gcap
+    now = time.time()
+    p.db.spend("claude", 1.0, "task:1", account="acct-a", estimated=True)
+    p.db.spend("claude", 2.0, "task:2", account="acct-a")
+    _other_project(tmp_path, "other").spend("claude", 4.0, "task:1", account="acct-a")
+    gcap._LOCAL.clear()
+    rule = dbmod.counted_spend
+    monkeypatch.setattr(dbmod, "counted_spend", lambda *a, **k: (lambda w: (w[0] + " AND estimated=0", w[1]))(rule(*a, **k)))
+    assert p.db.spent_since(now - 3600) == 2.0
+    assert gcap.total(p.db, "claude", now - 3600, now + 3600, now, account="acct-a")["usd"] == 6.0
+
+
 def test_the_rolling_global_window_asks_each_machine_once_per_refresh_and_keeps_counting(env, monkeypatch):
     # With the global cap on and no budget day, the window must not move on every 3 s daemon tick:
     # one ssh per machine per REFRESH_S, a bounded local cache, and the remote total still counted.
