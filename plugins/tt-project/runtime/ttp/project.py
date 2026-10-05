@@ -151,7 +151,7 @@ META_KEYS = {"name", "id", "host", "root", "created", "tt_project_version", "pri
 EXTRA_KEYS = {
     "budget": {"max_waits", "hourly_floor_usd", "estimate_weights", "hourly_waste_usd", "hourly_coordinator_usd",
                "max_pace_hold_s"},   # max_pace_hold_s: deprecated and ignored; accepted so old configs stay quiet
-    "coordinator": {"max_review_tasks_per_day"},
+    "coordinator": {"max_review_tasks_per_day", "charter_approval_days"},
     "notify": {"slack_poll_s"},
     # push_queue..after_push_timeout_s: the daemon-owned push queue (see PUSH_QUEUE_DEFAULTS).
     "delivery": {"base_ref", "push_branch", "push_checks", "push_rounds", "push_wait_s", "version_bump",
