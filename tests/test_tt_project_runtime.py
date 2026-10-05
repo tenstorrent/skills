@@ -20850,6 +20850,20 @@ def test_the_local_log_scan_reads_only_what_was_added(env, tmp_path, monkeypatch
     assert len(ls.load()["buckets"]) == 1
 
 
+def test_the_background_scan_runs_only_with_the_global_cap_on(env, tmp_path, monkeypatch):
+    from ttp import localspend as ls
+    logs = _claude_logs(tmp_path, monkeypatch)
+    now = time.time()
+    _log(logs, "s1", [_call("s1", "m1", now - 60, output_tokens=1_000_000)])
+    monkeypatch.setattr(ls, "_THREAD", {})
+    ls.scan_async({"global_daily_usd": 0}, now)
+    assert "t" not in ls._THREAD and not ls.load()
+    ls.scan_async({"global_daily_usd": 1}, now)
+    ls._THREAD["t"].join(10)
+    c = ls.load()
+    assert c.get("ok") and c.get("mode") == "hour", c
+
+
 def test_the_local_estimate_follows_the_budget_day_across_dst(env, tmp_path, monkeypatch):
     from datetime import datetime, timezone
     from ttp import globalcap as gcap

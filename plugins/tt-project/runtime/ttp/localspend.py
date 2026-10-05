@@ -321,9 +321,17 @@ def scan_async(budget: dict, now: float | None = None) -> None:
     c = load()
     if c.get("mode") == mode(budget) and now - float(c.get("scanned") or 0) < SCAN_S:
         return
-    t = threading.Thread(target=lambda: gcap._quiet(scan, dict(budget), now), daemon=True)
+    t = threading.Thread(target=lambda: _scan_quietly(dict(budget), now), daemon=True)
     _THREAD["t"] = t
     t.start()
+
+
+def _scan_quietly(budget: dict, now: float) -> None:
+    """scan() in the background. A failure leaves the cache as it was; the next due scan tries again."""
+    try:
+        scan(budget, now)
+    except Exception:
+        pass
 
 
 # tt-project's own runs --------------------------------------------------------------------------
