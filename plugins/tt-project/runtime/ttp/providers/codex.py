@@ -24,7 +24,7 @@ import subprocess
 from pathlib import Path
 
 from . import register
-from .base import AUTH_RE, LIMIT_RE, Provider, RunUsage, cli_output, price_row, stderr_tail
+from .base import AUTH_RE, LIMIT_RE, Provider, RunUsage, cli_output, price_row, status_check, stderr_tail
 
 # $ per million tokens: (input, cached input, output). Estimates only; the project may override
 # them in project.json under pricing.codex.<model>. Unknown models use the "default" row.
@@ -44,6 +44,13 @@ class Codex(Provider):
 
     def credential_files(self) -> list[str]:
         return [str(codex_home() / "auth.json")]
+
+    def login_check(self) -> bool | None:
+        b = self.binary()
+        if not b or "status" not in cli_output(b, "login", "--help"):
+            return None   # a CLI without `codex login status`
+        got = status_check([b, "login", "status"])
+        return None if got is None else got[0] == 0
 
     def resume_args(self, session_id: str) -> list[str]:
         # `codex exec [options] resume <SESSION_ID> -`: the daemon puts these last, just before the

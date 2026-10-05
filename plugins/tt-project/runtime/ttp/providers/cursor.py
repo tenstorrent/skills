@@ -23,7 +23,7 @@ import re
 from pathlib import Path
 
 from . import register
-from .base import AUTH_RE, LIMIT_RE, Provider, RunUsage, cli_output, price_row, stderr_tail
+from .base import AUTH_RE, LIMIT_RE, Provider, RunUsage, cli_output, price_row, status_check, stderr_tail
 
 PRICES = {"default": (3.0, 0.3, 15.0)}
 USAGE_KEYS = ("inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens")
@@ -40,6 +40,16 @@ class Cursor(Provider):
         # `agent login` writes auth.json under $XDG_CONFIG_HOME/cursor (default ~/.config/cursor) on
         # Linux; macOS keeps tokens in the Keychain, where the missing file just never changes.
         return [str(Path(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")) / "cursor" / "auth.json")]
+
+    def login_check(self) -> bool | None:
+        b = self.binary()
+        if not b or not re.search(r"^\s*status\b", cli_output(b, "--help"), re.M):
+            return None   # a CLI without `agent status`
+        got = status_check([b, "status"])
+        if got is None:
+            return None
+        return got[0] == 0 and not re.search(r"not (logged|authenticated)|login required|unauthenticated",
+                                             got[1], re.I)
 
     def build(self, *, role, model, effort, cwd, budget_usd, read_only, schema, restrictions):
         exe = self.binary() or "agent"

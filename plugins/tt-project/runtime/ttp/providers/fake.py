@@ -25,6 +25,10 @@ class Fake(Provider):
     def credential_files(self) -> list[str]:
         return [f] if (f := os.environ.get("TTP_FAKE_CREDENTIALS")) else []
 
+    def login_check(self) -> bool | None:
+        # With TTP_FAKE_LOGIN set to a path, the agent is logged in while that file exists.
+        return Path(f).exists() if (f := os.environ.get("TTP_FAKE_LOGIN")) else None
+
     def binary(self):
         return sys.executable
 

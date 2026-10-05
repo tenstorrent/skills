@@ -35,7 +35,7 @@ FEED_DAYS = 7
 # What the chat hears once an episode clears.
 CLEARED_TEXT = {
     "budget": "Budget for {arg} is out of red; new work starts again.",
-    "auth": "{arg} works again: a run succeeded after the logout alert.",
+    "auth": "{arg} is logged in again; its queued work starts.",
     "limit": "{arg} accepts work again.",
     "coordinator": "The coordinator is working again: a turn succeeded.",
     "disk": "Disk space is back above the guard; held tasks start again.",
@@ -71,23 +71,40 @@ def open_episode(db: DB, key: str, ts: float, message: int, severity: str, text:
              (key, ts, ts, message, severity, text[:2000]))
 
 
+BREAKER = "auth_breaker:"   # kv per provider: its auth breaker (Daemon.open_breaker, check_logins)
+
+
+def breaker(db: DB, provider: str) -> dict | None:
+    """The provider's open auth breaker: no run starts on it until a login check passes."""
+    rec = db.kv(BREAKER + provider) or {}
+    return rec if rec.get("open") else None
+
+
+def login_proven(db: DB, provider: str, since: float) -> bool:
+    """Whether a run on `provider` started at or after `since` got past the login: it succeeded, or
+    it is still running and spends or streams tokens (Daemon.meter_running). Age alone is no proof:
+    a CLI that hangs or retries while logged out would release the whole queue."""
+    return bool(db.one("SELECT id FROM runs WHERE provider=? AND started>=? AND (status='ok' OR status='running' "
+                       "AND (cost_usd>0 OR input_tokens>0 OR output_tokens>0)) LIMIT 1", (provider, since)))
+
+
 def holds(db: DB, key: str, since: float, now: float) -> bool:
     """Whether the condition behind an alert key is still true. `since` is when it was raised.
     Unknown keys cannot be checked and hold for a day after their last report."""
     kind, _, arg = key.partition(":")
-    if kind in ("auth", "limit"):
-        # The next successful run on the provider ends it. A logout is not over when its pause
-        # lapses (the pause only spaces out the probes); a quota limit is.
+    if kind == "auth":
+        # A logout holds while the provider's auth breaker is open; its closing ends the alert.
+        rec = db.kv(BREAKER + arg) or {}
+        if rec.get("open"):
+            return True
+        if float(rec.get("closed") or 0) >= since:
+            return False
+        return not login_proven(db, arg, since)   # an alert from before the breaker
+    if kind == "limit":
+        # The next successful run on the provider ends it, as does the end of its pause.
         if db.one("SELECT id FROM runs WHERE provider=? AND status='ok' AND started>=? LIMIT 1", (arg, since)):
             return False
-        if kind == "auth" and db.one(
-                "SELECT id FROM runs WHERE provider=? AND status='running' AND started>=? "
-                "AND (cost_usd>0 OR input_tokens>0 OR output_tokens>0) LIMIT 1", (arg, since)):
-            # A probe that spends or streams tokens (Daemon.meter_running) shows the login works;
-            # waiting for it to end would hold every other run for its whole run. Age alone is no
-            # proof: a CLI that hangs or retries while logged out would release the whole queue.
-            return False
-        return kind == "auth" or float((db.kv(f"limited:{arg}") or {}).get("until") or 0) > now
+        return float((db.kv(f"limited:{arg}") or {}).get("until") or 0) > now
     if kind == "budget":
         return (db.kv("gates", {}).get(arg) or {}).get("level") == "red"
     if key == "disk":

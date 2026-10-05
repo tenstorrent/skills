@@ -19,7 +19,8 @@ from . import coordinator as coord
 from . import pushq, release
 from . import schedule as sched
 from . import upstream
-from .daemon import HEARTBEAT_STALE_S, KV_LOCAL_ONLY, KV_WORKTREES_DIRTY, LOGGED_OUT_NOTE, WAIT_KEYS, WATCHDOG_S, heartbeat, idle_wake
+from .daemon import (AUTH_PROBE_S, HEARTBEAT_STALE_S, KV_LOCAL_ONLY, KV_WORKTREES_DIRTY, LOGGED_OUT_NOTE, WAIT_KEYS,
+                     WATCHDOG_S, heartbeat, idle_wake)
 from .alerts import cleared  # noqa: F401  (readers import it from here)
 from .db import (DB, SEVERITY_RANK, chat_floor, continues_id, deferral, dependency_ids, dump_result, host_line,
                  load_result)
@@ -203,8 +204,9 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
     # A task on a paused resource is held, not ready: it is listed under its resource instead.
     from .coordinator import task_resources
     due = db.ready_tasks()
-    # A task on a logged-out provider is held too: one run checks the login, the rest wait for it.
-    out = {r["key"].split(":", 1)[1] for r in db.q("SELECT key FROM alerts WHERE key LIKE 'auth:%' AND cleared IS NULL")}
+    # A task on a logged-out provider is held too, until its breaker closes.
+    breakers = breaker_lines(db, now)
+    out = {b["provider"] for b in breakers}
     logged_out = [t for t in due if (t["blocked_reason"] or "").startswith(LOGGED_OUT_NOTE)
                   and (t["provider"] or core) in out]
     ready = sum(1 for t in due if not task_resources(t) & {r["resource"] for r in paused_resources}) - len(logged_out)
@@ -268,8 +270,8 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
                    + f": its tasks wait (`ttp resume {p.name} --resource {pr['resource']}`)")
     if logged_out:
         provs = sorted({t["provider"] or core for t in logged_out})
-        why.append(f"{len(logged_out)} task(s) held: logged out ({', '.join(provs)}); they start once a run "
-                   f"on it succeeds")
+        why.append(f"{len(logged_out)} task(s) held: logged out ({', '.join(provs)}); they start once a login "
+                   f"check passes")
     if waiting:
         why.append(f"{len(waiting)} task(s) waiting, next try {at(waiting[0]['not_before'], now)}")
     if deferred:
@@ -313,6 +315,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         "providers_paused": paused_providers, "resources_paused": paused_resources, "waiting": waiting,
         "deferred": deferred,
         "logged_out": [{k: t[k] for k in ("id", "title", "provider")} for t in logged_out],
+        "breakers": breakers,
         "asks": asks, "running": running, "working": working,
         "undelivered": undelivered,
         "why_idle": "; ".join(why) if not running else "", "held": held,
@@ -324,6 +327,24 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         "uncommitted": uncommitted_line(db),
         "upstream": upstream.status_line(db, cfg),
     }
+
+
+def breaker_lines(db: DB, now: float) -> list[dict]:
+    """Each open auth breaker (Daemon.check_logins) in one plain line: since when, and when the
+    harness checks the login again. The fix is a login only the user can do, named by the alert."""
+    out = []
+    for r in db.q("SELECT key FROM kv WHERE key LIKE ? ORDER BY key", (alerts.BREAKER + "%",)):
+        prov = r["key"][len(alerts.BREAKER):]
+        b = alerts.breaker(db, prov)
+        if not b:
+            continue
+        nxt = (f"one run checks the login every {AUTH_PROBE_S // 60} min" if b.get("probe")
+               else f"next login check {at(max(float(b.get('next_check') or now), now), now)}")
+        out.append({"provider": prov, "opened": b.get("opened"), "next_check": b.get("next_check"),
+                    "checks": int(b.get("checks") or 0),
+                    "line": f"{prov} is logged out since {at(b.get('opened'), now)}: no runs start on it; {nxt}, "
+                            f"and work resumes by itself once it passes"})
+    return out
 
 
 def local_only_line(db: DB) -> str:

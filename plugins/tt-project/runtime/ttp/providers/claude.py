@@ -30,7 +30,7 @@ from pathlib import Path
 
 from . import register
 from ..budget import Window
-from .base import AUTH_RE, LIMIT_RE, Provider, RunUsage, find_binary
+from .base import AUTH_RE, LIMIT_RE, Provider, RunUsage, cli_output, find_binary, status_check
 
 EXCLUDE_DYNAMIC = "--exclude-dynamic-system-prompt-sections"
 APPEND_SYSTEM = "--append-system-prompt"
@@ -60,6 +60,19 @@ class Claude(Provider):
 
     def credential_files(self) -> list[str]:
         return [str(claude_config_dir() / ".credentials.json")]
+
+    def login_check(self) -> bool | None:
+        b = self.binary()
+        if not b or "status" not in cli_output(b, "auth", "--help"):
+            return None   # a CLI without `claude auth status`
+        got = status_check([b, "auth", "status", "--json"])
+        if got is None:
+            return None
+        rc, text = got
+        try:
+            return bool(json.loads(text[text.index("{"):text.rindex("}") + 1]).get("loggedIn"))
+        except ValueError:
+            return rc == 0
 
     def build(self, *, role, model, effort, cwd, budget_usd, read_only, schema, restrictions):
         argv = [self.binary() or "claude", "-p", "--output-format", "stream-json", "--verbose", "--no-chrome"]

@@ -1249,7 +1249,7 @@ def test_a_machine_wide_alert_is_broadcast_by_one_project_and_shown_quietly_by_t
     Daemon(q.base).alert("auth:fake", "fake is logged out again", "high")
     Daemon(p.base).alert("auth:fake", "fake is logged out again", "high")
     assert [m["text"] for m in q.db.unread_for_chat("c1", 0)][-1] == "fake is logged out again"
-    assert [m["text"] for m in p.db.unread_for_chat("c1", 0)][-1] == "Cleared: fake works again: a run succeeded after the logout alert."
+    assert [m["text"] for m in p.db.unread_for_chat("c1", 0)][-1] == "Cleared: fake is logged in again; its queued work starts."
 
 
 def _two_projects(env):
@@ -7692,6 +7692,104 @@ def test_cursor_logged_out_pauses_the_provider_without_an_attempt(env, monkeypat
     assert "agent login" in alert
 
 
+def test_an_auth_failure_opens_a_breaker_that_survives_a_restart_and_holds_only_its_provider(env, monkeypatch):
+    err = "Error: Authentication required. Please run 'agent login' first, or set CURSOR_API_KEY.\n"
+    p, run, task, _, _ = _cli_run(env, monkeypatch, "cursor", "", stderr=err, rc=1)
+    from ttp import alerts, cli
+    from ttp import budget as bud
+    from ttp.daemon import LOGGED_OUT_NOTE, Daemon
+    from ttp.providers import get_provider
+    assert run["status"] == "auth" and alerts.breaker(p.db, "cursor"), "the first auth failure opens the breaker"
+    p.db.update_task(task["id"], provider="cursor")
+    other = p.db.add_task("other", "s", kind="work", tier="light", origin="user")   # the core provider
+    d = Daemon(p.base)   # a restart: the breaker is read back from the project's state
+    started = []
+    monkeypatch.setattr(d, "start_run", lambda role, *a, **k: started.append(k["task"]["id"]) or 0)
+    monkeypatch.setattr(d, "_workdir_for", lambda task: (str(p.root), None))
+    for prov in ("fake", "cursor"):
+        d.gates[prov] = bud.Gate(prov, regime="windows", max_parallel=6)
+    monkeypatch.setattr(type(get_provider("cursor")), "login_check", lambda self: False)
+    for _ in range(3):
+        d.sweep_alerts()
+        d.dispatch()
+    assert started == [other], "a run started on the logged-out provider, or the other provider stopped"
+    held = p.db.task(task["id"])
+    assert held["status"] == "queued" and held["attempts"] == 0 and held["blocked_reason"].startswith(LOGGED_OUT_NOTE)
+    assert p.db.one("SELECT COUNT(*) n FROM runs")["n"] == 1, "a run checked the login"
+    line = [ln for ln in cli.status_text(p).splitlines() if ln.startswith("cursor is logged out")]
+    assert len(line) == 1 and "next login check" in line[0] and "`" not in line[0], line
+
+
+def test_the_login_check_backs_off_and_closes_the_breaker_and_its_alert(env, monkeypatch):
+    p = make(env)
+    from ttp import alerts
+    from ttp.daemon import AUTH_CHECK_S, Daemon
+    from ttp.providers import get_provider
+    from ttp.web import attention
+    d = Daemon(p.base)
+    login = env["tmp"] / "logged-in"
+    monkeypatch.setenv("TTP_FAKE_LOGIN", str(login))
+    d.open_breaker("fake", "401")
+    d.alert("auth:fake", "fake is logged out", "high")
+    checks = []
+    real = type(get_provider("fake")).login_check
+    monkeypatch.setattr(type(get_provider("fake")), "login_check", lambda self: checks.append(1) or real(self))
+    d.sweep_alerts()
+    assert checks == [], "checked before the first backoff step"
+    gaps = []
+    for _ in range(len(AUTH_CHECK_S) + 1):
+        b = alerts.breaker(p.db, "fake")
+        p.db.set_kv("auth_breaker:fake", {**b, "next_check": time.time() - 1})
+        d.sweep_alerts()
+        gaps.append(round(alerts.breaker(p.db, "fake")["next_check"] - time.time()))
+    assert gaps == [s for s in AUTH_CHECK_S[1:]] + [AUTH_CHECK_S[-1]] * 2, gaps
+    assert len(checks) == len(AUTH_CHECK_S) + 1 and attention(p.db, time.time())
+    login.write_text("")
+    p.db.set_kv("auth_breaker:fake", {**alerts.breaker(p.db, "fake"), "next_check": time.time() - 1})
+    d.sweep_alerts()
+    assert alerts.breaker(p.db, "fake") is None and not d._logged_out("fake")
+    assert p.db.one("SELECT cleared FROM alerts WHERE key='auth:fake'")["cleared"], "the alert outlived the breaker"
+    assert attention(p.db, time.time()) == []
+    assert p.db.one("SELECT COUNT(*) n FROM runs")["n"] == 0, "the login was checked with a model run"
+
+
+def test_a_logged_out_alert_from_before_the_breaker_opens_it(env):
+    p = make(env)
+    from ttp import alerts
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    d.alert("auth:fake", "fake is logged out", "high")
+    assert alerts.breaker(p.db, "fake") is None
+    d.sweep_alerts()
+    assert alerts.breaker(p.db, "fake"), "an upgrade dropped the logout"
+    assert p.db.one("SELECT cleared FROM alerts WHERE key='auth:fake'")["cleared"] is None
+
+
+@pytest.mark.parametrize("name,help_text,rc,out,want", [
+    ("claude", "Commands:\n  status [options]", 0, '{"loggedIn": true, "authMethod": "x"}', True),
+    ("claude", "Commands:\n  status [options]", 1, '{"loggedIn": false}', False),
+    ("claude", "Commands:\n  login", 0, "", None),
+    ("codex", "Commands:\n  status  Show login status", 0, "Logged in", True),
+    ("codex", "Commands:\n  status  Show login status", 1, "Not logged in", False),
+    ("cursor", "Commands:\n  status|whoami   Show auth status", 0, "Not logged in", False),
+    ("cursor", "Commands:\n  status|whoami   Show auth status", 0, "Logged in", True),
+    ("cursor", "Commands:\n  login", 0, "", None),
+])
+def test_login_checks_ask_the_cli_status_without_a_model(monkeypatch, name, help_text, rc, out, want):
+    from ttp.providers import base, claude, codex, cursor, get_provider
+    prov = get_provider(name)
+    monkeypatch.setattr(type(prov), "binary", lambda self: "/bin/agent-cli")
+    mods = (base, claude, codex, cursor)
+    for m in mods:
+        monkeypatch.setattr(m, "cli_output", lambda *argv: help_text, raising=False)
+    calls = []
+    for m in mods:
+        monkeypatch.setattr(m, "status_check", lambda argv, timeout_s=30: calls.append(argv) or (rc, out),
+                            raising=False)
+    assert prov.login_check() is want
+    assert all("status" in argv for argv in calls) and (calls or want is None)
+
+
 def test_cursor_read_only_run_does_not_force_writes(env, monkeypatch):
     _, run, _, argv, _ = _cli_run(env, monkeypatch, "cursor", _cursor_result('{"actions": []}'),
                                   role="coordinator", read_only=True)
@@ -12412,7 +12510,7 @@ def test_a_logged_out_alert_clears_on_the_next_successful_run_and_keeps_its_hist
     assert attention(p.db, time.time()) == []
     assert p.db.one("SELECT id FROM messages WHERE text='fake is logged out'"), "history was deleted"
     told = p.db.q("SELECT text, severity FROM messages WHERE kind='resolved'")
-    assert told == [{"text": "Cleared: fake works again: a run succeeded after the logout alert.",
+    assert told == [{"text": "Cleared: fake is logged in again; its queued work starts.",
                      "severity": "normal"}], told
     # The same condition again is a new episode, alerted at once rather than deduplicated away.
     d.alert("auth:fake", "fake is logged out again", "high", every_s=4 * 3600)
@@ -14298,8 +14396,9 @@ def test_status_says_when_the_budget_gate_holds_the_idle_wake(env, monkeypatch):
 
 
 def _logged_out_daemon(p, monkeypatch):
-    """A daemon whose core provider `fake` is logged out (open alert, pause lapsed), with three
-    queued tasks; start_run records the titles it would start."""
+    """A daemon whose core provider `fake` is logged out (open alert and breaker, pause lapsed) and
+    has no model-free login check, so one run checks it; with three queued tasks. start_run records
+    the titles it would start."""
     from ttp import budget as bud
     from ttp import coordinator as coord
     from ttp.daemon import Daemon
@@ -14315,6 +14414,8 @@ def _logged_out_daemon(p, monkeypatch):
     p.db.set_kv("limited:fake", {"until": time.time() + 900, "note": "logged out"})
     d.alert("auth:fake", "fake is logged out", "high", every_s=4 * 3600)
     p.db.set_kv("limited:fake", {"until": time.time() - 1, "note": "logged out"})
+    d.open_breaker("fake", at=time.time() - 60)
+    p.db.set_kv("auth_breaker:fake", {**p.db.kv("auth_breaker:fake"), "probe": True})
     return d, started
 
 
@@ -14409,6 +14510,7 @@ def test_a_hung_logged_out_probe_holds_the_queue_until_it_shows_spend(env, monke
     assert started == ["small"]
     now = time.time()
     p.db.x("UPDATE alerts SET raised=raised-3600 WHERE key='auth:fake'")
+    p.db.set_kv("auth_breaker:fake", {**p.db.kv("auth_breaker:fake"), "opened": now - 3600})
     p.db.set_kv("auth_probe:fake", now - 600)
     run_dir = tmp_path / "probe"
     run_dir.mkdir()

@@ -72,7 +72,8 @@ AUTO_FIX_ROUNDS, REVIEW_FIX_SPEC_CHARS = 2, 8000
 PROBE_EVERY_S = 180     # how often a waiting task's `retry_when` (or a deferred one's `start_when`) probe runs
 NOT_YET_RCS = (1, 75, 255)   # probe exits meaning "not yet": 1, EX_TEMPFAIL (a busy `ttp lock`), ssh unreachable
 PROBE_TIMEOUT_S = 60
-AUTH_PROBE_S = 900      # while a provider is logged out, one run on it checks the login this often
+AUTH_PROBE_S = 900      # while a provider without a login check is logged out, one run on it checks this often
+AUTH_CHECK_S = (60, 120, 300, 600, 1200, 1800)   # backoff of the model-free login checks of an open breaker
 ORPHAN_GRACE_S = 10     # TERM to KILL for an agent whose supervisor died
 HANDOFF_STATES = ("done", "blocked", "failed", "needs_review", "waiting")
 SLEEP_CUT = ("timeout", "stalled", "lost", "failed")   # ends a host sleep can cause
@@ -1015,14 +1016,14 @@ class Daemon:
                            f"hour; the account ({r['account'] or 'unknown'}) may need more credits or a higher cap.",
                            "high")
             if usage.auth_failed:
-                # Logged out is not a task failure and not worth retrying blindly: pause this provider,
-                # say exactly how to fix it, and probe again every 15 minutes with one run (_may_probe).
-                db.set_kv(f"limited:{r['provider']}", {"until": time.time() + AUTH_PROBE_S, "note": "logged out",
-                                                       "creds": prov.credentials_stamp()})
+                # Logged out is not a task failure and not worth retrying blindly: open the provider's
+                # breaker (no run starts on it), say exactly how to fix it, and let check_logins ask
+                # its CLI, without a model call, when it is logged in again.
+                self.open_breaker(r["provider"], (usage.final_text or usage.error)[:200])
                 self.alert(f"auth:{r['provider']}",
                            f"{r['provider']} on {hostname()} is logged out ({(usage.final_text or usage.error)[:120]}). "
-                           f"Log in once on that machine ({prov.login_hint}). "
-                           f"Work resumes by itself; queued messages are kept.", "high")
+                           f"Log in once on that machine ({prov.login_hint}). Nothing starts on it until then; "
+                           f"work resumes by itself once a login check passes, and queued work is kept.", "high")
             if r["role"] == "coordinator":
                 self._finish_coordinator(r, usage, status, note)
             else:
@@ -1060,8 +1061,7 @@ class Daemon:
             # Its messages and events stay queued for the next one.
             return
         if status == "auth":
-            db.set_kv("coordinator_backoff_until", time.time() + AUTH_PROBE_S)
-            return
+            return   # its breaker holds the next turn until the login is back; the messages stay queued
         if status != "ok" or not isinstance(actions, list):
             self._coordinator_failed(f"{status} {usage.error[:200]}")
             return
@@ -1429,19 +1429,85 @@ class Daemon:
         return None
 
     def _logged_out(self, prov: str) -> bool:
-        """Whether `prov` has an open logged-out alert; alerts.sweep closes it once a run succeeds."""
-        return bool(self.p.db.one("SELECT id FROM alerts WHERE key=? AND cleared IS NULL LIMIT 1", (f"auth:{prov}",)))
+        """Whether `prov`'s auth breaker is open (check_logins closes it)."""
+        return alerts.breaker(self.p.db, prov) is not None
 
     def _may_probe(self, prov: str, now: float) -> bool:
-        """While `prov` is logged out, whether one run on it may start now to check the login: its
-        pause is over, nothing runs on it, and the last check started AUTH_PROBE_S ago or more.
-        Starting every queued task instead would burn one failed run each per pause."""
+        """While `prov` is logged out, whether one run on it may start now to check the login: only for
+        a CLI without a model-free login check, when its pause is over, nothing runs on it, and the
+        last check started AUTH_PROBE_S ago or more. Starting every queued task instead would burn
+        one failed run each per pause."""
+        if not (alerts.breaker(self.p.db, prov) or {}).get("probe"):
+            return False   # its CLI's own status check decides (check_logins)
         lim = self._provider_pause(prov)
         if lim and lim.get("until", 0) > now:
             return False
         if self.p.db.one("SELECT id FROM runs WHERE provider=? AND status='running' LIMIT 1", (prov,)):
             return False
         return now >= float(self.p.db.kv(f"auth_probe:{prov}", 0) or 0) + AUTH_PROBE_S
+
+    def open_breaker(self, prov: str, why: str = "", at: float | None = None) -> None:
+        """Open `prov`'s auth breaker: no run starts on it (queued tasks keep their attempts) until
+        check_logins sees it logged in again. Kept in the project's state, so a restart keeps it."""
+        db = self.p.db
+        if alerts.breaker(db, prov):
+            return
+        now = time.time() if at is None else at
+        try:
+            stamp = get_provider(prov).credentials_stamp()
+        except Exception:
+            stamp = ""
+        db.set_kv(alerts.BREAKER + prov, {"open": True, "opened": now, "checks": 0, "creds": stamp,
+                                          "next_check": time.time() + AUTH_CHECK_S[0], "why": why[:200]})
+        log(self.p, f"{prov}: logged out; no runs start on it until a login check passes")
+
+    def _close_breaker(self, prov: str, rec: dict, why: str) -> None:
+        now = time.time()
+        self.p.db.set_kv(alerts.BREAKER + prov, {"open": False, "opened": rec.get("opened"), "closed": now,
+                                                 "checks": rec.get("checks", 0), "closed_why": why})
+        self.p.db.set_kv(f"auth_probe:{prov}", 0)
+        log(self.p, f"{prov}: {why}; runs start on it again")
+
+    def check_logins(self) -> None:
+        """Close each open auth breaker once its provider is logged in again: its CLI says so (a
+        model-free status check on the AUTH_CHECK_S backoff, at once when its credential files
+        change), or a run started since it opened got past the login. A CLI without a status check
+        says nothing; one run then checks the login every AUTH_PROBE_S (_may_probe)."""
+        db, now = self.p.db, time.time()
+        # A logged-out alert from before the breaker existed (an upgrade) opens it.
+        for ep in db.q("SELECT key, MIN(raised) raised FROM alerts WHERE key LIKE 'auth:%' AND cleared IS NULL "
+                       "GROUP BY key"):
+            prov = ep["key"].split(":", 1)[1]
+            rec = db.kv(alerts.BREAKER + prov) or {}
+            if not rec.get("open") and float(rec.get("closed") or 0) < ep["raised"]:
+                self.open_breaker(prov, "logged out", at=ep["raised"])
+        for row in db.q("SELECT key FROM kv WHERE key LIKE ?", (alerts.BREAKER + "%",)):
+            prov = row["key"][len(alerts.BREAKER):]
+            rec = alerts.breaker(db, prov)
+            if not rec:
+                continue
+            if alerts.login_proven(db, prov, float(rec.get("opened") or 0)):
+                self._close_breaker(prov, rec, "a run on it got past the login")
+                continue
+            try:
+                agent = get_provider(prov)
+                stamp = agent.credentials_stamp()
+            except Exception:
+                agent, stamp = None, ""
+            changed = bool(stamp) and stamp != rec.get("creds")
+            if now < float(rec.get("next_check") or 0) and not changed:
+                continue
+            try:
+                ok = agent.login_check() if agent else None
+            except Exception:
+                log(self.p, f"{prov}: login check failed\n" + traceback.format_exc())
+                ok = None
+            if ok or (ok is None and changed):
+                self._close_breaker(prov, rec, "its login check passed" if ok else "its credentials changed")
+                continue
+            n = int(rec.get("checks") or 0) + 1
+            db.set_kv(alerts.BREAKER + prov, {**rec, "checks": n, "last_check": now, "creds": stamp, "probe": ok is None,
+                                              "next_check": now + AUTH_CHECK_S[min(n, len(AUTH_CHECK_S) - 1)]})
 
     def update_gates(self) -> None:
         windows = bud.plan_windows(self.p.db)
@@ -1759,8 +1825,7 @@ class Daemon:
             provider = task["provider"] or core
             if logged_out[provider] and not self._may_probe(provider, now):
                 # Logged out: the queue keeps its tasks, attempts untouched, until a run succeeds.
-                held = (f"{LOGGED_OUT_NOTE} ({provider}); one run checks the login every "
-                        f"{AUTH_PROBE_S // 60} min, the rest start once it works")
+                held = (f"{LOGGED_OUT_NOTE} ({provider}); it starts once a login check passes")
                 if note != held:
                     db.update_task(task["id"], blocked_reason=held)
                 continue
@@ -2792,7 +2857,9 @@ class Daemon:
         return out
 
     def sweep_alerts(self) -> None:
-        """Close alert episodes whose condition cleared (stored with the time; the chats hear it once)."""
+        """Close alert episodes whose condition cleared (stored with the time; the chats hear it once).
+        Auth breakers go first: a logged-out alert lasts as long as its provider's breaker."""
+        self.check_logins()
         for ep in alerts.sweep(self.p.db):
             log(self.p, f"alert cleared: {ep['key']} ({ep['cleared_why']})")
             if ep["key"].startswith("auth:") or ep["key"] == "disk":

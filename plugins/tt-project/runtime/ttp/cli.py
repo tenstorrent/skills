@@ -688,6 +688,8 @@ def status_text(p: Project) -> str:
     pq = pushq.status_line(p, now)
     if pq:
         lines.append(pq)
+    for b in h.get("breakers") or []:
+        lines.append(b["line"])
     for pp in h["providers_paused"]:
         lines.append(f"{pp['provider']} paused until {at(pp['until'], now)}: {pp['note']} — fix: {pp['fix']}")
     for pr in h["resources_paused"]:

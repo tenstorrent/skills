@@ -94,6 +94,11 @@ class Provider:
     def available(self) -> bool:
         return self.binary() is not None
 
+    def login_check(self) -> bool | None:
+        """Whether the agent CLI is logged in, asked without a model call (its own status command):
+        True or False, or None when this CLI has no such check (a run then checks the login)."""
+        return None
+
     def build(self, *, role: str, model: str, effort: str, cwd: str, budget_usd: float | None,
               read_only: bool, schema: dict | None, restrictions: dict) -> tuple[list[str], dict]:
         """Return (argv, extra_env) for a headless run whose prompt arrives on stdin."""
@@ -186,6 +191,15 @@ def cli_output(*argv: str) -> str:
         except (OSError, subprocess.SubprocessError):
             _CLI_OUTPUT[argv] = ""
     return _CLI_OUTPUT[argv]
+
+
+def status_check(argv: list[str], timeout_s: float = 30) -> tuple[int, str] | None:
+    """Exit code and output of a quick, model-free status command; None when it cannot run."""
+    try:
+        out = subprocess.run(argv, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=timeout_s)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.returncode, out.stdout + out.stderr
 
 
 def scratch_dir(key: str) -> str:
