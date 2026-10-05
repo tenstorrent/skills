@@ -7,6 +7,7 @@ import io
 import json
 import secrets
 import shlex
+import shutil
 import os
 import pathlib
 import signal
@@ -27,8 +28,30 @@ RUNTIME = pathlib.Path(__file__).resolve().parents[1] / "plugins" / "tt-project"
 TTP = pathlib.Path(__file__).resolve().parents[1] / "plugins" / "tt-project" / "bin" / "ttp"
 
 
+@pytest.fixture(scope="session")
+def _git_session(tmp_path_factory):
+    """Made once per session: the starting repository each test copies, and an object store holding
+    every runtime and template file, which test repositories borrow (git alternates). A project's
+    first commit then finds its 2 MB of runtime already stored instead of compressing and writing it."""
+    base = tmp_path_factory.mktemp("git-session")
+    objects = base / "objects.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(objects)], check=True)
+    files = [str(f) for d in (RUNTIME, RUNTIME.parent / "template") for f in sorted(d.rglob("*"))
+             if f.is_file() and "__pycache__" not in f.parts]
+    subprocess.run(["git", f"--git-dir={objects}", "hash-object", "-w", "--stdin-paths"],
+                   input="\n".join(files), text=True, capture_output=True, check=True)
+    repo = base / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / "README.md").write_text("hello\n")
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "i"],
+                   check=True)
+    return {"objects": objects / "objects", "repo": repo}
+
+
 @pytest.fixture()
-def env(tmp_path, monkeypatch):
+def env(tmp_path, monkeypatch, _git_session):
     home = tmp_path / "home"
     monkeypatch.setenv("TTP_HOME", str(home))
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
@@ -58,13 +81,9 @@ def env(tmp_path, monkeypatch):
     # Likewise for state files: durable_write still writes, renames and calls os.fsync (tests that
     # check the syncs wrap it), but the sync itself, slow on copy-on-write filesystems, is skipped.
     monkeypatch.setattr(os, "fsync", lambda fd: None)
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    subprocess.run(["git", "init", "-q", str(repo)], check=True)
-    (repo / "README.md").write_text("hello\n")
-    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
-    subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "i"],
-                   check=True)
+    monkeypatch.setenv("GIT_ALTERNATE_OBJECT_DIRECTORIES", str(_git_session["objects"]))
+    repo = tmp_path / "repo"   # a git repository with one commit of README.md
+    shutil.copytree(_git_session["repo"], repo, symlinks=True)
     yield {"home": home, "repo": repo, "tmp": tmp_path}
     sys.path.remove(str(RUNTIME))
 
