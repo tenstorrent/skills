@@ -3472,6 +3472,17 @@ def test_charter_lint_leaves_sections_that_keep_a_restrictions_limit(env):
     assert len(found) == 1 and "Never push to main" in found[0] and conflicts() == found, found
 
 
+def test_charter_lint_flags_an_exception_worded_with_only(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    # "allowed only for X" widens "Never ..." even though the clause has a limiting word.
+    p.charter_path.write_text("# demo\n\n## Restrictions (binding on every task)\n- Never push to main.\n"
+                              "\n## Hotfixes (user, 2026-01-06)\nPushing to main is now allowed only for hotfixes.\n")
+    found = coord.charter_lint(p)
+    events = [r["text"] for r in p.db.q("SELECT text FROM events WHERE kind='charter_conflict'")]
+    assert len(found) == 1 and "Never push to main" in found[0] and events == found, found
+
+
 RESTR_CHARTER = ("# demo\n\n## Restrictions (binding on every task)\n- Never push to the main branch.\n"
                  "- Never merge.\n\n## Goals\nShip v1.\n\n## Restrictions (added 2026-10-01, turn 3.0)\n"
                  "Keep the docs generic.\n\n## Restrictions (added 2026-10-02, turn 5.0)\n"

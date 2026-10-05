@@ -1587,11 +1587,13 @@ _LIMIT_RE = re.compile(r"\b(never|only|not|no(?! longer\b))\b|n't\b", re.I)
 
 def _restates_limit(item: str, sentence: str) -> bool:
     """Whether a loosening sentence keeps the item's own limit instead of widening it: one of its
-    clauses carries a limiting word next to a word the item is about ("X (broker only)"), or it
+    clauses carries a limiting word, and no loosening one, next to a word the item is about
+    ("X (broker only)", but not "X is allowed only for Y"), or it
     allows something within what the item's "only ..." still permits ("jobs may queue through each
     broker" against "jobs only through each broker")."""
     about = _rule_words(item)
-    if any(_LIMIT_RE.search(c) and _rule_words(c) & about for c in re.split(r"[,;:()]", sentence)):
+    if any(_LIMIT_RE.search(c) and not _LOOSEN_RE.search(c) and _rule_words(c) & about
+           for c in re.split(r"[,;:()]", sentence)):
         return True
     m = re.search(r"\bonly\b([^,;:()]*)", item, re.I)
     limit = _rule_words(m.group(1)) if m else set()
