@@ -16039,6 +16039,44 @@ def test_pr_watch_skips_comments_its_own_runs_marked(env, monkeypatch):
     assert len(events()) == 2
 
 
+def test_pr_watch_skips_mergeable_unknown_flaps_and_honours_pr_mutes(env, monkeypatch):
+    """GitHub reports mergeable UNKNOWN while it recomputes. A change that only moves mergeable to or
+    from UNKNOWN queues nothing, and a real move through UNKNOWN still reports the known values. A
+    pr_changed event an active 'pr' mute covers is recorded and counted on the mute but does not wake."""
+    from ttp import screen, watchers
+    from ttp.daemon import Daemon
+    p = make(env)
+    url = "https://github.com/acme/widgets/pull/7"
+    p.db.x("INSERT INTO tasks(title,kind,status,pr_url,created) VALUES(?,?,?,?,?)",
+           ("t", "code", "done", url, time.time()))
+    pr = {"url": url, "state": "OPEN", "title": "t", "isDraft": True, "author": {"login": "runs"},
+          "mergeable": "MERGEABLE", "comments": [], "reviews": []}
+    monkeypatch.setattr(watchers, "_gh", lambda args, cwd: json.loads(json.dumps(pr)))
+    p.db.set_kv("pr_signatures", {})
+    d = Daemon(p.base)
+
+    def events():
+        return [(e["status"], e["text"]) for e in
+                p.db.q("SELECT status, text FROM events WHERE kind='pr_changed' ORDER BY id")]
+
+    watchers.watch_prs(d)   # baseline
+    for m in ("UNKNOWN", "MERGEABLE", "UNKNOWN", "UNKNOWN", "MERGEABLE"):
+        pr["mergeable"] = m
+        watchers.watch_prs(d)
+    assert events() == []
+    pr["mergeable"] = "UNKNOWN"
+    watchers.watch_prs(d)
+    pr["mergeable"] = "CONFLICTING"
+    watchers.watch_prs(d)
+    assert [(s, "MERGEABLE → CONFLICTING" in t) for s, t in events()] == [("queued", True)]
+    # A 'pr' mute covering the text: recorded and counted, not queued.
+    screen.mute(p.db, "pr", "acme/widgets/pull/7", 4, why="known")
+    pr["isDraft"] = False
+    watchers.watch_prs(d)
+    assert [s for s, _ in events()] == ["queued", "muted"]
+    assert screen.mutes(p.db)[0]["count"] == 1
+
+
 PR_WATCH_GH = '''#!{python}
 import json, os, sys
 a, path = sys.argv[1:], os.environ["FAKE_PRS"]

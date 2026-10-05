@@ -22,6 +22,7 @@ import time
 from pathlib import Path
 
 from . import prguard
+from . import screen as scr
 
 DAY = 86400.0
 UNDO_EVERY_S = 3600.0   # pr-watch puts a PR back in draft at most this often
@@ -113,9 +114,14 @@ def watch_prs(daemon) -> str:
         _check_unapproved(daemon, t, pr, sig, before, flagged)
         _check_findings(daemon, t, pr, sig, findings, root)
         old = seen.get(t["pr_url"])
+        if old and sig["mergeable"] == "UNKNOWN" and old.get("mergeable") not in (None, "UNKNOWN"):
+            sig = {**sig, "mergeable": old["mergeable"]}   # GitHub is recomputing: keep the last known value
         if sig == old:
             continue
         seen[t["pr_url"]] = sig
+        if old is not None and {k for k, v in sig.items() if old.get(k) != v} == {"mergeable"} \
+                and "UNKNOWN" in (old.get("mergeable"), sig["mergeable"]):
+            continue   # only mergeable moved to or from UNKNOWN: not news
         changed += 1
         if old is None:
             continue   # first sighting records a baseline; nothing new has happened yet
@@ -123,9 +129,11 @@ def watch_prs(daemon) -> str:
         if sig["activity"] != old.get("activity"):
             what.append(f"new review/comment activity ({sig['n_human']} human items)")
         sev = "high" if sig["state"] == "MERGED" or sig["decision"] == "CHANGES_REQUESTED" else "normal"
+        text = f"PR for task #{t['id']} ({pr.get('url')}): " + "; ".join(what)
+        # An active 'pr' mute covering it: recorded and counted there, but it does not wake the coordinator.
+        status = "muted" if scr.count_muted(db, "pr", text, sev) else "queued"
         db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
-             (time.time(), "pr", "pr_changed", sev,
-              f"PR for task #{t['id']} ({pr.get('url')}): " + "; ".join(what), "queued", t["id"]))
+             (time.time(), "pr", "pr_changed", sev, text, status, t["id"]))
     # A flag whose task is gone (cancelled, say) or whose PR gh has not read for a day is dropped,
     # so its alert clears.
     tasks, now = {t["id"] for t in rows}, time.time()
