@@ -142,6 +142,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Upstream notes (hand-off follow-ups titled `upstream: ...`) are filed in the user's inbox
     # ~/.tt-project/upstream.jsonl. With ingest on, this project's coordinator gets them as events.
     "upstream": {"ingest": False},
+    # Worker and reviewer runs, everything they start (detached checks, tests, reference models) and
+    # the pushes and push batches the daemon starts run this many nice levels below the daemon
+    # (0-19; 0 = normal priority), so they never slow the host's own work. The daemon and the
+    # coordinator's turns keep normal priority.
+    "runner": {"nice": 10},
 }
 
 
@@ -252,6 +257,35 @@ def push_queue_on(cfg: dict) -> bool:
     return d.get("push_queue") is True and push_allowed(d) and bool(str(d.get("push_branch") or "").strip())
 
 
+def nice_level(runner: Any) -> tuple[int, str | None]:
+    """runner.nice of a `runner` config section as a level 0-19, and a problem line when the value was
+    clamped or replaced by the default."""
+    default = DEFAULT_CONFIG["runner"]["nice"]
+    v = runner.get("nice", default) if isinstance(runner, dict) else default
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v != v or v != int(v):
+        return default, f"runner.nice: {v!r} is not a whole number 0-19; {default} is used"
+    if not 0 <= v <= 19:
+        n = min(max(int(v), 0), 19)
+        return n, f"runner.nice: {v!r} is outside 0-19; {n} is used"
+    return int(v), None
+
+
+def lower_priority(n: int):
+    """A Popen preexec_fn that lowers the child's CPU priority by `n` nice levels before it execs,
+    so all it starts inherits it; None when `n` is 0. Never stops the child: a failure leaves it
+    at the parent's priority, which the caller sees in its effective level. On Linux the I/O
+    priority follows the nice level unless set on its own."""
+    if n <= 0:
+        return None
+
+    def apply() -> None:
+        try:
+            os.nice(n)
+        except OSError:
+            pass
+    return apply
+
+
 def config_problems(raw: dict) -> list[str]:
     """Unknown keys, non-command push_checks or after_push, a malformed version_bump and push queue
     settings out of range in a project's own settings, one line each."""
@@ -283,6 +317,8 @@ def config_problems(raw: dict) -> list[str]:
                 out.append(str(e))
     out += [f"delivery.after_push: {p}" for p in check_problems(delivery.get("after_push"))]
     out += _disk_problems(raw.get("disk"))
+    if isinstance(raw.get("runner"), dict) and "nice" in raw["runner"]:
+        out += [why for why in [nice_level(raw["runner"])[1]] if why]
     return out
 
 def deep_merge(base: dict, over: dict) -> dict:

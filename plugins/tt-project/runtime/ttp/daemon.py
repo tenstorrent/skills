@@ -50,7 +50,8 @@ from . import shared
 from . import worktree
 from .db import (OPEN_ASK_MAX_AGE_S, SEVERITY_RANK, TERMINAL_TASK_STATES, continues_id, deferral, dependency_ids,
                  dump_result, load_result, without_deferral)
-from .project import DEFAULT_CONFIG, Project, deep_merge, disk_resume_gb, durable_write, git_fsync_env, hostname
+from .project import (DEFAULT_CONFIG, Project, deep_merge, disk_resume_gb, durable_write, git_fsync_env, hostname,
+                      nice_level)
 from .providers import get_provider
 from .providers.base import last_json_object, scratch_dir, service_path
 from .providers.claude import as_windows
@@ -696,7 +697,9 @@ class Daemon:
                                    "holder": shared.holder(self.p, res, f"task #{task['id']}", self.cfg)}
                                   for res in _exclusive(task)] if task else [],
                     "exclusive_wait_s": self.cfg["budget"].get("exclusive_wait_s", 600),
-                    "private_files": private, "tmp_dir": tmp_env.get("TMPDIR")}
+                    "private_files": private, "tmp_dir": tmp_env.get("TMPDIR"),
+                    # Workers and reviewers run niced, and all they start with them; the coordinator not.
+                    "nice": nice_level(self.cfg.get("runner"))[0] if role != "coordinator" else 0}
             durable_write(run_dir / "run.json", json.dumps(spec, indent=1))   # read again after a reboot
             with open(run_dir / "runner.log", "wb") as out:
                 proc = subprocess.Popen([sys.executable, "-m", "ttp.runner", str(run_dir)], cwd=runtime_dir,

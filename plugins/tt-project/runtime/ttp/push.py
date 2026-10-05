@@ -32,7 +32,7 @@ from urllib.parse import quote
 
 from . import locks
 from .budget import DOC_SUFFIXES
-from .project import Project, durable_write, git_fsync_env, write_json
+from .project import Project, durable_write, git_fsync_env, lower_priority, nice_level, write_json
 
 # Exit codes, distinct so a worker can say why it did not push. BUSY: another push to the same
 # branch kept the lock past `delivery.push_wait_s`; the task hands back `waiting`.
@@ -1043,9 +1043,9 @@ def _log_line(log: Path, text: str) -> None:
         os.fsync(out.fileno())
 
 
-def _start(p: Project, marker: Path, m: dict, lock, env: dict) -> int:
-    """Start the push process of `marker`, holding `lock` (its run lock, taken by the caller), write
-    the marker as running, then give the go. Returns the pid."""
+def _start(p: Project, marker: Path, m: dict, lock, env: dict, nice: int = 0) -> int:
+    """Start the push process of `marker`, holding `lock` (its run lock, taken by the caller), `nice`
+    levels below this process, write the marker as running, then give the go. Returns the pid."""
     log = Path(m["log"])
     env = {k: v for k, v in env.items() if k not in ("TTP_RUN_DIR", "TTP_PIDNS")}   # the run ends first
     env.update(PYTHONPATH=str(Path(__file__).resolve().parents[1]), TTP_PROJECT=str(p.base))
@@ -1055,7 +1055,7 @@ def _start(p: Project, marker: Path, m: dict, lock, env: dict) -> int:
                                   *(["--own"] if m.get("own") else [])],
                                  cwd=m["repo"], env=env, stdin=subprocess.PIPE, stdout=out,
                                  stderr=subprocess.STDOUT, start_new_session=True,
-                                 pass_fds=(lock.fileno(),))
+                                 pass_fds=(lock.fileno(),), preexec_fn=lower_priority(nice))
     from .runner import boot_id
     m.update(status="running", pid=child.pid, started=time.time(), boot=boot_id())
     write_json(marker, m)
@@ -1239,7 +1239,8 @@ def _tend_one(p: Project, marker: Path) -> None:
         env = {**os.environ, **(m.get("env") or {})}
         env.update(git_fsync_env(env))
         try:
-            _start(p, marker, m, lock, env)
+            # A worker's push runs niced like the worker it came from (one started there inherits it).
+            _start(p, marker, m, lock, env, nice_level(p.config().get("runner"))[0])
         except OSError as e:   # its worktree went, say: recorded, never retried each tick
             m.update(status="failed", exit=None, ended=time.time(),
                      reason=f"the daemon could not start the push: {e}")

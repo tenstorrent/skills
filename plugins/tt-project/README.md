@@ -134,6 +134,10 @@ and preferences you add later become part of the project's charter and memory.
 - Up to 6 workers per project run side by side (`budget.max_parallel_workers`); on a plan, all of
   them until the last stretch before the line. When a plan is below its line, slots sit idle and
   nothing is queued, the coordinator is asked for more work, less often each time it finds none.
+- Workers, reviewers, everything they start (detached checks, tests, reference models) and the
+  daemon's pushes run at low CPU priority, 10 nice levels below the daemon (`runner.nice`, 0-19;
+  0 = normal priority), so they never slow the machine's own work. The daemon and the coordinator
+  keep normal priority. Each run's `exit.json` records the level its agent ran at.
 - A shared device or machine is taken per command, through its own queue (for example a device
   broker) or `ttp lock <resource> -- <command>`, so the rest of each task runs in parallel. A task
   marked exclusive holds the resource's lock for its whole run; while it waits for a slot, new

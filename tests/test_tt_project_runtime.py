@@ -13448,6 +13448,76 @@ def test_a_host_sleep_does_not_time_out_or_stall_a_run(env, tmp_path, monkeypatc
     assert info["slept_s"] >= 7000, info
 
 
+# The agent prints its own nice level and its child's (a detached job it starts, say).
+_NICE_AGENT = ("import os, subprocess, sys; print(os.nice(0)); sys.stdout.flush(); "
+               "subprocess.run([sys.executable, '-c', 'import os; print(os.nice(0))'])")
+
+
+def _nice_run(tmp_path, nice):
+    from ttp import runner
+    run_dir = tmp_path / f"run-nice-{nice}"
+    run_dir.mkdir()
+    (run_dir / "prompt.md").write_text("x")
+    (run_dir / "run.json").write_text(json.dumps({
+        "argv": [sys.executable, "-c", _NICE_AGENT], "env": {}, "cwd": str(tmp_path),
+        "timeout_s": 60, "provider": "fake", "nice": nice}))
+    assert runner.supervise(run_dir) == 0
+    return ([int(x) for x in (run_dir / "output.jsonl").read_text().split()],
+            json.loads((run_dir / "exit.json").read_text())["nice"])
+
+
+def test_a_workers_agent_and_all_it_starts_run_niced_below_the_runner(env, tmp_path):
+    base = os.nice(0)
+    (agent, grandchild), recorded = _nice_run(tmp_path, 7)
+    assert agent == grandchild == recorded == min(base + 7, 19)
+    # runner.nice 0: the agent keeps the runner's priority.
+    (agent, grandchild), recorded = _nice_run(tmp_path, 0)
+    assert agent == grandchild == recorded == base
+
+
+def test_workers_and_reviewers_get_runner_nice_but_the_coordinator_does_not(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    from ttp.project import config_problems
+    d = Daemon(p.base)
+
+    def nice(role, cwd=None, **kw):
+        task = None
+        if role != "coordinator":
+            task = p.db.task(p.db.add_task(f"t {role}", "s", kind="review" if role == "reviewer" else "code",
+                                           tier="standard", origin="user"))
+        rid = d.start_run(role, "go", "fake", "standard", cwd or str(p.root), task=task, **kw)
+        (p.runs / str(rid) / "STOP").touch()
+        return json.loads((p.runs / str(rid) / "run.json").read_text())["nice"]
+
+    assert nice("worker") == nice("reviewer") == 10, "on by default"
+    assert nice("coordinator", str(p.base), read_only=True) == 0
+    for value, level, problem in [(5, 5, None), (0, 0, None), (25, 19, "outside 0-19; 19 is used"),
+                                  (-3, 0, "outside 0-19; 0 is used"), ("high", 10, "not a whole number 0-19"),
+                                  (2.5, 10, "not a whole number"), (True, 10, "not a whole number")]:
+        p.set_config("runner.nice", value)
+        d.cfg = p.config()
+        assert nice("worker") == level, value
+        probs = config_problems(p.raw_config())
+        assert (probs == []) if problem is None else (len(probs) == 1 and problem in probs[0]), (value, probs)
+
+
+def test_the_push_queues_batch_process_runs_niced(env, monkeypatch):
+    from ttp import pushq
+    p = make(env)
+    stub = env["tmp"] / "nice_stub.py"
+    stub.write_text("import os, sys\nsys.stdin.read()\nprint('nice', os.nice(0))\n")
+    monkeypatch.setattr(pushq, "batch_argv", lambda marker: [sys.executable, str(stub)])
+    marker = env["tmp"] / "batch.json"
+    for level in (4, 0):
+        p.set_config("runner.nice", level)
+        with open(env["tmp"] / "batch.lock", "w") as lock:
+            child = pushq._spawn(p, f"b{level}", marker, lock)
+        child.stdin.close()
+        assert child.wait(timeout=30) == 0
+        assert marker.with_suffix(".log").read_text().split()[-1] == str(min(os.nice(0) + level, 19))
+
+
 def _ended_run(p, tid, exit_info, role="worker", output=""):
     rid = p.db.x("INSERT INTO runs(task,role,provider,started,status,boot_id,dir) VALUES(?,?,?,?,?,?,?)",
                  (tid, role, "fake", exit_info["started"], "running", "b", ""))

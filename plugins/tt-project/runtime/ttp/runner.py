@@ -12,6 +12,8 @@
   how long the host slept during the run (`slept_s`);
 - enforces the run's dollar budget mid-flight when the provider streams usage;
 - ends the child when <run_dir>/STOP appears (a cancel, or `ttp stop --kill` writing "shutdown");
+- starts the child `nice` levels below itself (run.json; workers and reviewers only), so all it
+  starts runs niced too, and records the level the child ran at in exit.json (`nice`);
 - holds a slot of each resource an `exclusive:` task names from before the child starts until it
   has ended, the same locks `ttp lock` takes per command; the wait for them has its own bound
   (exclusive_wait_s), and the wall-clock limit starts once they are held;
@@ -36,7 +38,7 @@ import time
 from pathlib import Path
 
 from . import poll_s
-from .project import durable_write
+from .project import durable_write, lower_priority
 
 LEASE_EVERY_S = 30
 KILL_AFTER_S = 30
@@ -178,9 +180,13 @@ def supervise(run_dir: Path) -> int:
     prompt = open(run_dir / "prompt.md", "rb")
     out = open(out_path, "wb")
     err = open(run_dir / "stderr.log", "wb")
+    nice = int(spec.get("nice") or 0)
     child = subprocess.Popen(argv, stdin=prompt, stdout=out, stderr=err, cwd=cwd, env=env,
-                             start_new_session=True)
+                             start_new_session=True, preexec_fn=lower_priority(nice))
     (run_dir / "child.pid").write_text(f"{child.pid}\n{proc_start(child.pid) or ''}\n")
+    niceness = _niceness(child.pid)
+    if nice and niceness is not None and niceness < min(os.nice(0) + nice, 19):
+        print(f"runner: could not lower the agent's priority by {nice} (it runs at nice {niceness})", flush=True)
     reason: list[str] = []
 
     def stop(why: str) -> None:
@@ -244,9 +250,17 @@ def supervise(run_dir: Path) -> int:
     for f in (prompt, out, err, *held):
         f.close()
     exit_info = {"rc": rc, "started": started, "ended": ended, "stopped": reason[0] if reason else None,
-                 "slept_s": round(max((ended - started) - (mono_end - mono_start), 0.0), 1)}
+                 "slept_s": round(max((ended - started) - (mono_end - mono_start), 0.0), 1), "nice": niceness}
     durable_write(run_dir / "exit.json", json.dumps(exit_info))
     return rc
+
+
+def _niceness(pid: int) -> int | None:
+    """The nice level process `pid` runs at, or None when it cannot be read (it ended, say)."""
+    try:
+        return os.getpriority(os.PRIO_PROCESS, pid)
+    except OSError:
+        return None
 
 
 def _activity(out_path: Path, run_dir: Path) -> tuple:

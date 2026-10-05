@@ -20,7 +20,7 @@ from typing import Any, Callable
 
 from . import locks, push
 from .db import TERMINAL_TASK_STATES, dump_result, load_result
-from .project import Project, push_allowed, push_queue_on, write_json
+from .project import Project, lower_priority, nice_level, push_allowed, push_queue_on, write_json
 
 REF_PREFIX = "refs/ttp/push/"   # + row id: pins the approved commit until its row is settled
 KV = "push_queue"               # kv: {"backoff_until", "deaths", "hold": {"tip", "rows", "until"}, "tips_told"}
@@ -376,13 +376,15 @@ def _child_env(p: Project) -> dict:
 def _spawn(p: Project, bid: str, marker: Path, lock) -> subprocess.Popen:
     """Start the batch process on `marker`, holding `lock` from its first instant (inherited, as
     push.detach does), in a session of its own so a daemon restart leaves it running. It starts once
-    its stdin closes: the go, given after the marker is complete."""
+    its stdin closes: the go, given after the marker is complete. It runs niced like the workers
+    (runner.nice), checks and after_push commands included."""
     env = _child_env(p)
     env["TTP_BATCH_LOCK_FD"] = str(lock.fileno())   # batch._inherited trusts only this descriptor
     with open(marker.with_suffix(".log"), "ab") as out:
         child = subprocess.Popen(batch_argv(marker), cwd=str(p.root), env=env, stdin=subprocess.PIPE,
                                  stdout=out, stderr=subprocess.STDOUT, start_new_session=True,
-                                 pass_fds=(lock.fileno(),))
+                                 pass_fds=(lock.fileno(),),
+                                 preexec_fn=lower_priority(nice_level(p.config().get("runner"))[0]))
     _children[bid] = child
     return child
 
