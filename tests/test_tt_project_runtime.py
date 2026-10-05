@@ -19799,6 +19799,175 @@ def test_the_rolling_global_window_asks_each_machine_once_per_refresh_and_keeps_
     assert rolling and t["stale"] == ["box2"] and t["usd"] == 0, t
 
 
+class _InlineThread:
+    """A threading.Thread that runs its target at once, so a background refresh happens in order."""
+    def __init__(self, target, daemon):
+        self.target = target
+
+    def start(self):
+        self.target()
+
+    def is_alive(self):
+        return False
+
+
+def _box2(env, monkeypatch, day_start):
+    """A project with the global cap on, one other machine (box2) and a clock the test sets. Returns
+    the project, its budget settings, the clock, the times box2 was asked and whether it is up."""
+    p = make(env)
+    from ttp import globalcap as gcap
+    from ttp.project import register
+    register("far", {"host": "box2", "dir": "/srv/far"})
+    p.set_config("budget.global_daily_usd", 100)
+    p.set_config("budget.timezone", "America/New_York")
+    p.set_config("budget.day_start", day_start)
+    key = gcap.account_key("claude", "acct-a")
+    clock, asked, up = [0.0], [], [False]
+
+    def fetch(t, s, e):
+        asked.append(clock[0])
+        if not up[0]:
+            raise RuntimeError("ssh: connect to host box2 port 22: Connection timed out")
+        return {"host": "box2", "rows": [{"provider": "claude", "key": key, "usd": 50.0}], "projects": ["far"]}
+
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    monkeypatch.setattr(gcap, "fetch", fetch)
+    monkeypatch.setattr(gcap, "account_of", lambda prov: "acct-a")
+    monkeypatch.setattr(gcap.threading, "Thread", _InlineThread)
+    return p, p.config()["budget"], clock, asked, up
+
+
+@pytest.mark.parametrize("via", ["refresh", "refresh_async"])
+@pytest.mark.parametrize("day_start", ["", "08:00"])
+def test_a_machine_that_is_down_is_asked_once_per_refresh_and_again_once_it_is_back(env, monkeypatch, day_start, via):
+    # A failed try holds the machine off for REFRESH_S by its time alone. Before, a machine that never
+    # answered, or last answered for an earlier window or budget day, was asked over ssh on every 3 s
+    # daemon tick, by every project daemon on the machine: 400 times in 1200 s.
+    import math
+    from datetime import datetime, timezone
+    from ttp import budget as bud
+    from ttp import globalcap as gcap
+    p, b, clock, asked, up = _box2(env, monkeypatch, day_start)
+
+    def tick(now):
+        clock[0] = now
+        if via == "refresh":
+            gcap.refresh(*gcap.window(b, now)[:2], now)
+        else:
+            gcap.refresh_async(b, now)
+
+    def run(seconds):                       # the daemon's 3 s ticks from the clock on
+        first = clock[0] + 3
+        for i in range(int(seconds // 3)):
+            tick(first + 3 * i)
+
+    def asked_once_per_refresh():
+        assert 2 <= len(asked) <= math.ceil(1200 / gcap.REFRESH_S) + 1, (len(asked), asked[:4])
+        assert all(y - x >= gcap.REFRESH_S for x, y in zip(asked, asked[1:])), asked
+
+    def global_today(now):
+        return bud.evaluate(p.db, p.config(), "claude", [], now).numbers
+
+    # 08:00 in New York is 12:00 UTC in October: a new budget day and a new rolling window.
+    new = datetime(2026, 10, 6, 12, 0, tzinfo=timezone.utc).timestamp()
+    for at in (new, new + gcap.DAY, new + 2 * gcap.DAY):
+        assert gcap.window(b, at - 3)[0] != gcap.window(b, at)[0]
+    # Never answered, down for 1200 s across a window change.
+    clock[0] = new - 303
+    run(1200)
+    asked_once_per_refresh()
+    # Back between two tries: asked again within REFRESH_S, and its answer counts.
+    run(300)
+    up[0], back = True, clock[0] + 3
+    asked.clear()
+    run(gcap.REFRESH_S)
+    assert asked and asked[0] - back < gcap.REFRESH_S, (back, asked)
+    n = global_today(clock[0])
+    assert n["global_today"] == 50.0 and n["global_stale"] == [], n
+    # An answer for an earlier window or budget day is asked again on the new one's first tick.
+    nxt = new + gcap.DAY
+    tick(nxt - 3)
+    asked.clear()
+    tick(nxt)
+    assert asked == [nxt] and global_today(nxt)["global_today"] == 50.0, asked
+    # Last answered for an earlier window or budget day, then down: asked once per refresh.
+    tick(nxt + gcap.DAY - 3)
+    up[0] = False
+    asked.clear()
+    clock[0] = nxt + gcap.DAY - 3
+    run(1200)
+    assert asked[0] == nxt + gcap.DAY, asked[:2]
+    asked_once_per_refresh()
+    assert global_today(clock[0])["global_stale"] == ["box2"]
+
+
+def test_a_background_refresh_that_fails_waits_a_refresh_before_the_next(env, monkeypatch):
+    # The tries of a refresh that cannot save the cache (here a full disk) are on record nowhere, so
+    # the background refresh waits REFRESH_S before it asks the machines again.
+    import errno
+    from ttp import globalcap as gcap
+    p, b, clock, asked, up = _box2(env, monkeypatch, "")
+    up[0] = True
+
+    def full(*a, **k):
+        raise OSError(errno.ENOSPC, "No space left on device")
+    monkeypatch.setattr(gcap.project, "write_json", full)
+    t0 = 1_800_000_000
+    for i in range(400):
+        clock[0] = t0 + 3 * i
+        gcap.refresh_async(b, clock[0])
+    assert asked == [t0, t0 + gcap.REFRESH_S], asked
+
+
+def test_a_try_stamped_ahead_of_the_clock_holds_nothing_off(env, monkeypatch):
+    # After the clock goes back, a machine whose last try is stamped in the future is asked at once
+    # and then held off as usual, not left unasked until the clock catches up.
+    from ttp import globalcap as gcap
+    p, b, clock, asked, up = _box2(env, monkeypatch, "")
+    t0 = 1_800_000_000
+    clock[0] = t0 + 3600
+    gcap.refresh_async(b, clock[0])            # a failed try, then the clock goes back an hour
+    asked.clear()
+    for i in range(3):
+        clock[0] = t0 + 3 * i
+        gcap.refresh_async(b, clock[0])
+    assert asked == [t0], asked
+
+
+def test_a_malformed_answer_is_a_failed_try_and_the_global_total_still_counts(env, monkeypatch):
+    # A partial or malformed answer from another machine is not saved as its total, where it would
+    # make every global total fail (and leave only the project caps in charge).
+    p = make(env)
+    from ttp import budget as bud
+    from ttp import globalcap as gcap
+    from ttp.project import register
+    register("far", {"host": "box2", "dir": "/srv/far"})
+    p.set_config("budget.global_daily_usd", 100)
+    b = p.config()["budget"]
+    monkeypatch.setattr(gcap, "account_of", lambda prov: "acct-a")
+    key = gcap.account_key("claude", "acct-a")
+
+    def answer(data):
+        monkeypatch.setattr(gcap.subprocess, "run", lambda cmd, **kw: types.SimpleNamespace(
+            returncode=0, stdout=json.dumps(data), stderr=""))
+        now = time.time()
+        gcap.refresh(*gcap.window(b, now)[:2], now, force=True)
+        return gcap.load_cache()["machines"]["box2"], bud.evaluate(p.db, p.config(), "claude", [], now).numbers
+
+    for bad in ({"host": "box2", "rows": [{"usd": 5.0}], "projects": []},
+                {"host": "box2", "rows": [{"provider": "claude", "key": key, "usd": "lots"}], "projects": []},
+                {"host": ["box2"], "rows": [], "projects": []},
+                {"host": "box2", "rows": [], "projects": 3}):
+        m, n = answer(bad)
+        assert m["ok"] is False and m["error"] == "unexpected answer", (bad, m)
+        assert n.get("global_today") == 0 and n["global_stale"] == ["box2"], (bad, n)
+    # A whole answer counts, with a run of no provider as `ttp spend-today` reports one.
+    m, n = answer({"host": "box2", "rows": [{"provider": "claude", "key": key, "usd": 5.0},
+                                           {"provider": None, "key": gcap.account_key("", ""), "usd": 0.0}],
+                   "projects": ["far"]})
+    assert m["ok"] is True and n["global_today"] == 5.0 and n["global_stale"] == [], (m, n)
+
+
 def test_spend_today_reports_this_machines_projects_without_the_account(env, tmp_path, capsys):
     make(env)
     from ttp.cli import main

@@ -31,6 +31,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import math
 import re
 import sqlite3
 import subprocess
@@ -243,17 +244,38 @@ def targets() -> list[str]:
     return sorted(out)
 
 
+def _whole(data) -> bool:
+    """An answer total() can count: the host's name, a list of projects and rows of a provider, an
+    account key and a finite dollar amount, as `ttp spend-today` gives."""
+    rows = data.get("rows") if isinstance(data, dict) else None
+    return (isinstance(rows, list) and isinstance(data.get("host") or "", str)
+            and isinstance(data.get("projects") or [], list)
+            and all(isinstance(r, dict) and {"provider", "key"} <= r.keys() and isinstance(r.get("usd") or 0, (int, float))
+                    and math.isfinite(r.get("usd") or 0) for r in rows))
+
+
 def fetch(target: str, start: float, end: float) -> dict:
-    """Ask another machine for its projects' spend in [start, end). Raises on any failure."""
+    """Ask another machine for its projects' spend in [start, end). Raises on any failure, a partial
+    or malformed answer included."""
     cmd = f"{REMOTE_TTP} spend-today --since {start:.0f} --until {end:.0f} --json"
     r = subprocess.run([*SSH, target, cmd], capture_output=True, text=True, timeout=60,
                        stdin=subprocess.DEVNULL)
     if r.returncode != 0:
         raise RuntimeError(((r.stderr or "").strip().splitlines() or [f"exit {r.returncode}"])[-1][:200])
     data = json.loads(r.stdout)
-    if not isinstance(data, dict) or not isinstance(data.get("rows"), list):
+    if not _whole(data):
         raise RuntimeError("unexpected answer")
     return data
+
+
+def _due(m: dict, start: float, now: float) -> bool:
+    """Whether to ask a machine whose last try is `m`: REFRESH_S after that try, or at once when it
+    answered for an earlier window. A failed try holds it off by its time alone, so a machine that
+    is down is asked once per REFRESH_S, not on every daemon tick. A try stamped after `now` (the
+    clock went back) holds nothing off."""
+    if not 0 <= now - float(m.get("tried") or 0) < REFRESH_S:
+        return True
+    return bool(m.get("ok")) and m.get("start") != start
 
 
 def refresh(start: float, end: float, now: float | None = None, force: bool = False) -> dict:
@@ -270,7 +292,7 @@ def refresh(start: float, end: float, now: float | None = None, force: bool = Fa
         machines = cache.setdefault("machines", {})
         for t in targets():
             m = machines.get(t) or {}
-            if not force and now - float(m.get("tried") or 0) < REFRESH_S and m.get("start") == start:
+            if not force and not _due(m, start, now):
                 continue
             try:
                 got = fetch(t, start, end)
@@ -286,31 +308,33 @@ def refresh(start: float, end: float, now: float | None = None, force: bool = Fa
 
 
 _THREAD: dict[str, threading.Thread] = {}
+_FAILED = {"at": 0.0}       # when this process's last background refresh failed
 
 
 def refresh_async(budget: dict, now: float | None = None) -> None:
     """Start a refresh in the background when one is due and none is running: ssh may take seconds."""
     now = now or time.time()
-    if float(budget.get("global_daily_usd") or 0) <= 0:
+    if float(budget.get("global_daily_usd") or 0) <= 0 or 0 <= now - _FAILED["at"] < REFRESH_S:
         return
     t = _THREAD.get("t")
     if t and t.is_alive():
         return
     start, end, _ = window(budget, now)
     cache = (load_cache().get("machines") or {})
-    if not any(now - float((cache.get(x) or {}).get("tried") or 0) >= REFRESH_S
-               or (cache.get(x) or {}).get("start") != start for x in targets()):
+    if not any(_due(cache.get(x) or {}, start, now) for x in targets()):
         return
-    t = threading.Thread(target=lambda: _quiet(refresh, start, end), daemon=True)
+    t = threading.Thread(target=lambda: _refresh_quietly(start, end), daemon=True)
     _THREAD["t"] = t
     t.start()
 
 
-def _quiet(fn, *args) -> None:
+def _refresh_quietly(start: float, end: float) -> None:
+    """refresh() in the background. When it fails (say the disk is full and the cache cannot be
+    saved), its tries may be on record nowhere: this process waits REFRESH_S before the next."""
     try:
-        fn(*args)
+        refresh(start, end)
     except Exception:
-        pass
+        _FAILED["at"] = time.time()
 
 
 # the total ----------------------------------------------------------------------------------------
