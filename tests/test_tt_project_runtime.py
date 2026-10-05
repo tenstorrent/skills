@@ -15368,6 +15368,29 @@ def test_a_hung_ssh_never_holds_up_the_daemon_tick(env, monkeypatch):
     assert _ssh_calls(fake) == ["example-host"]
 
 
+
+def test_upstream_forwarding_stops_at_its_budget_and_starts_with_the_targets_left_over(env, monkeypatch):
+    from ttp import upstream
+    from ttp.project import register
+    for h in ("host-a", "host-b", "host-c", "host-d"):
+        register(f"project-{h}", {"host": h, "dir": f"/w/{h}"})
+    clock, calls = [1000.0], []
+
+    def hang(target, lines, timeout):
+        calls.append(target)
+        clock[0] += timeout                  # every machine hangs until its timeout
+        return None, f"no answer within {timeout:.0f} s"
+    monkeypatch.setattr(upstream, "_ssh_receive", hang)
+    monkeypatch.setattr(upstream, "_clock", lambda: clock[0])
+    now = time.time()
+    upstream.forward(now)
+    assert calls == ["host-a", "host-b"] and clock[0] - 1000 <= upstream.FORWARD_BUDGET_S
+    upstream.forward(now + 1)                # all four still to try: the ones not yet tried go first
+    assert calls[2:] == ["host-c", "host-d"]
+    upstream.forward(now + 2)
+    assert len(calls) == 4, "a failed target was tried again within its back-off"
+
+
 def test_coordinators_pass_upstream_notes_on_only_while_no_project_reads_them(env):
     p = make(env)
     from ttp import upstream, coordinator as coord

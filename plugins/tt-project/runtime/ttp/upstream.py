@@ -516,15 +516,18 @@ def _forward(now: float, budget_s: float) -> int:
     projects = _remote_projects()
     targets = configured if configured is not None else sorted(set(projects.values()))
     here = project.hostname()
-    sent, start = 0, _clock()
+    sent, start, tries = 0, _clock(), [0]
 
     def save():
         project.write_json(forward_path(), {"targets": targets_st}, mode=0o600)
 
+    def fits() -> bool:
+        return not tries[0] or _clock() - start + FORWARD_TIMEOUT_S <= budget_s
+
     def send(target: str, st: dict, lines: list[bytes]) -> dict | None:
-        left = budget_s - (_clock() - start)
+        tries[0] += 1
         st["tried"] = now
-        ack, err = _ssh_receive(target, lines, min(FORWARD_TIMEOUT_S, left))
+        ack, err = _ssh_receive(target, lines, FORWARD_TIMEOUT_S)
         if ack is None:
             fails = int(st.get("fails") or 0) + 1
             first, most = FORWARD_BACKOFF_S
@@ -543,7 +546,7 @@ def _forward(now: float, budget_s: float) -> int:
         st = dict(targets_st.get(target) or {})
         if now < float(st.get("next") or 0):
             continue
-        if budget_s - (_clock() - start) < 1:
+        if not fits():
             break                         # out of time this pass: the rest go first on the next
         # Ask a default target, now and then, whether a project reads the inbox there (an empty send),
         # before deciding which notes it gets: general notes go only where they are read.
@@ -573,7 +576,7 @@ def _forward(now: float, budget_s: float) -> int:
                 targets_st[target] = {**st, "cursor": end}
                 save()
             continue
-        if budget_s - (_clock() - start) < 1:
+        if not fits():
             break
         st_sent = dict(st)
         if send(target, st_sent, batch) is not None:
@@ -589,6 +592,8 @@ def forward_status(now: float | None = None) -> list[str]:
     targets_st = _json(forward_path()).get("targets") or {}
     configured = forward_to()
     names = configured if configured is not None else sorted(set(_remote_projects().values()) | set(targets_st))
+    if configured == []:
+        return ["upstream.forward_to is none: this machine sends no notes on"]
     if not names:
         return ["no machines to send upstream notes on to (no remote projects, and upstream.forward_to is not set)"]
 
