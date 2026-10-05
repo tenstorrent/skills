@@ -3404,7 +3404,6 @@ def test_an_appended_section_that_overrides_a_standing_restriction_is_flagged(en
         assert conflicts() == [], acts
 
 
-
 def test_charter_lint_flags_a_dated_section_that_contradicts_a_restriction(env):
     p = make(env)
     import os
@@ -14711,7 +14710,7 @@ def test_a_long_tick_tells_both_watchdogs_it_still_moves(env, monkeypatch):
     d._notify = addr
     steps = []
     for name in ("reap_runs", "wake_after_reboot", "meter_running", "reconcile_tasks", "tend_pushes", "prune_worktrees",
-                 "check_local_only", "check_disk", "sweep_alerts", "check_release", "sync_shared_pauses", "check_integrity", "sync_schedules", "_refresh_meters", "update_gates", "run_schedules", "poll_slack",
+                 "check_local_only", "check_disk", "sweep_alerts", "check_release", "sync_shared_pauses", "check_integrity", "sync_schedules", "lint_charter", "_refresh_meters", "update_gates", "run_schedules", "poll_slack",
                  "check_resource_trouble", "read_upstream", "forward_upstream", "retry_rejected", "retire_ended", "maybe_coordinate", "probe_waiting", "start_pushes",
                  "dispatch", "deliver_outbound"):
         monkeypatch.setattr(d, name, lambda name=name: steps.append(name))
@@ -14731,7 +14730,7 @@ def test_a_long_tick_tells_both_watchdogs_it_still_moves(env, monkeypatch):
     finally:
         sock.close()
         cleanup()
-    assert len(steps) == 27 and pings == [b"WATCHDOG=1"] * 25, (steps, pings)
+    assert len(steps) == 28 and pings == [b"WATCHDOG=1"] * 26, (steps, pings)
     # Before its first completed tick the heartbeat is not written (`ttp restart` reads it as that
     # tick); the start marker carries the progress, which `ttp.watchdog` counts.
     assert not hb.exists()
