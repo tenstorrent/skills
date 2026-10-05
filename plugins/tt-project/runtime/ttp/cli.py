@@ -867,7 +867,34 @@ def cmd_note(a) -> None:
     run_dir = os.environ.get("TTP_RUN_DIR")
     if not run_dir:
         die("ttp note only works inside a tt-project run")
+    if a.to:
+        _note_to(a)
     durable_append(Path(run_dir) / "progress.md", f"{time.strftime('%H:%M:%S')} {a.text}\n")
+
+
+def _note_to(a) -> None:
+    """`ttp note --to <project>`: a worker's note for another project on this machine, filed in the
+    user's upstream inbox with this run's project and task (upstream.send). Nothing of the other
+    project's is written; its daemon reads the note as untrusted data from this worker."""
+    from . import upstream
+    base = os.environ.get("TTP_PROJECT")
+    me = Project(base) if base else None
+    if not me or not me.exists():
+        die("ttp note --to: this run has no project (TTP_PROJECT)")
+    if a.to == me.name:
+        die("ttp note --to names this run's own project; report to it with `ttp note` and the hand-off")
+    if remote_entry(a.to):
+        die(f"project {a.to} runs on another machine; `ttp note --to` reaches projects on this one only. "
+            f"Put the note in the hand-off as a follow-up titled `upstream: ...` instead")
+    if not local_project(a.to):
+        die(f"unknown project {a.to}; `ttp list` shows the projects on this machine")
+    if not a.text.strip():
+        die("empty note")
+    task = os.environ.get("TTP_TASK") or ""
+    got = upstream.send(me.name, int(task) if task.isdigit() else None, a.to, a.text, a.severity)
+    if got == "limited":
+        die(f"not sent: this project already sent {upstream.NOTES_PER_HOUR} notes to other projects in the last hour")
+    print(f"note for {a.to} " + ("already in its inbox" if got == "duplicate" else "filed in its inbox"))
 
 
 def cmd_push(a) -> None:
@@ -1962,8 +1989,12 @@ def main(argv: list[str] | None = None) -> None:
                    help="mark messages up to ID read; later ones stay unread until acknowledged")
     s.set_defaults(fn=cmd_listen)
 
-    s = sub.add_parser("note", help="(inside a run) append a progress note")
+    s = sub.add_parser("note", help="(inside a run) append a progress note, or send one to another project")
     s.add_argument("text")
+    s.add_argument("--to", metavar="PROJECT",
+                   help="also file the note in the inbox of another project on this machine, as this worker's")
+    s.add_argument("--severity", choices=["low", "normal", "high"], default="normal",
+                   help="with --to: the severity of the event the other project's coordinator gets")
     s.set_defaults(fn=cmd_note)
 
     s = sub.add_parser("push", help="guarded push of this worktree to delivery.push_branch")

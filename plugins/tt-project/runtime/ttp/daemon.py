@@ -2385,9 +2385,10 @@ class Daemon:
 
     def read_upstream(self) -> None:
         """With `upstream.ingest` on, new notes in the user's upstream inboxes become coordinator events
-        (this machine's every minute, remote ones at most hourly); otherwise nothing is read."""
+        (this machine's every minute, remote ones at most hourly); otherwise only notes addressed to
+        this project (`ttp note --to`) in this machine's inbox are."""
         now = time.time()
-        if now - self._upstream_checked < upstream.LOCAL_EVERY_S or not (self.cfg.get("upstream") or {}).get("ingest"):
+        if now - self._upstream_checked < upstream.LOCAL_EVERY_S:
             return
         self._upstream_checked = now
         try:
