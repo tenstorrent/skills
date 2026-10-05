@@ -132,6 +132,8 @@ EFFORT_EVENT_TRIGGERS = {
     "task_budget_exhausted": "costly", "ask_timeout": "costly", "pr_findings": "costly", "pr_clean": "costly",
     "pr_unapproved_ready": "costly", "after_push_failed": "costly", "push_batch_died": "costly",
     "push_tip_failed": "costly",
+    # conflicting instructions: an appended rule a standing Restrictions item would override
+    "charter_conflict": "conflict",
 }
 UNBLOCK_KINDS = frozenset(EFFORT_EVENT_TRIGGERS)
 EFFORT_SEVERITIES = ("high", "critical")   # an event or alert this severe is never routine
@@ -545,6 +547,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
     text sent again by a later turn is still written."""
     db, problems, notes = p.db, [], []
     cfg = p.config()
+    # For the stale-restriction check (_restriction_conflicts): the restrictions before this turn's
+    # first charter_update, the text it added, and whether it edited a restriction in place.
+    restr_before: str | None = None
+    added: list[tuple[str, str]] = []
+    restr_edited = False
     replies: list[int] = []
     # config_set goes first so a cap raised in this turn counts for this turn's task_add actions.
     # The index stays the original one so replay keys do not change.
@@ -794,9 +801,17 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if key and _has_line(p.charter_path, f", turn {key})"):
                     pass   # this turn's update is already in its own dated section: a retry must not add it twice
                 else:
+                    if restr_before is None:
+                        from .prompts import charter_restrictions
+                        restr_before = charter_restrictions(p.charter_path.read_text())
                     target, extra, retired = _charter_update(p, section, text, quote, str(a.get("replaces") or ""),
                                                              key, user_turn, over, end)
                     msg += extra
+                    if (quote and target.lower().startswith("restriction")
+                            or extra.lower().startswith(" (replaces restriction")):
+                        restr_edited = True
+                    elif text and not quote:
+                        added.append((target, text))
                     if retired:
                         db.post("out", f"Retired the charter restriction {retired}: {over}."
                                        + (f" Still in force: {clip(text, 300)}" if text else ""),
@@ -869,6 +884,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 raise ValueError(f"unknown action {t!r}")
         except Exception as e:   # one bad action is reported back; it never aborts the turn
             problems.append(f"{t}: {e}")
+    if user_turn and added and not restr_edited and restr_before:
+        _restriction_conflicts(p, restr_before, added)
     db.set_kv(NOTES_KEY, notes)
     if problems and replies:
         # The reply may say the work is under way; the user must not read that when it is not.
@@ -1389,6 +1406,63 @@ def _tell_running_workers(db, text: str, key: str | None = None) -> None:
     for r in db.q("SELECT dir FROM runs WHERE status='running' AND role!='coordinator'"):
         if r["dir"] and Path(r["dir"]).is_dir():
             _append_update(Path(r["dir"], "steer.md"), text, key)
+
+
+# Words by which a new rule allows what it names, or narrows an old one ("may", "no longer", "except").
+_LOOSEN_RE = re.compile(r"\b(may|allow(s|ed|ing)?|permit(s|ted)?|fine to|ok(ay)? to|no longer|lift(s|ed)?|"
+                        r"except|exceptions?|unless|instead|can now|relax(es|ed)?|widen(s|ed)?)\b", re.I)
+# Rule and filler words that say nothing about what a restriction is about.
+_RULE_STOP = {"never", "always", "only", "must", "should", "would", "could", "with", "without", "from", "that",
+              "this", "these", "those", "when", "while", "them", "they", "their", "there", "then", "than", "each",
+              "every", "other", "into", "onto", "also", "unless", "except", "allow", "allowed", "permitted", "will",
+              "been", "being", "have", "does", "done", "after", "before", "until", "about", "what", "which",
+              "your", "more", "less", "some", "first", "even", "again", "still", "longer", "instead", "now"}
+
+
+def _stem(word: str) -> str:
+    for end in ("ing", "ed", "es", "s", "e"):
+        if word.endswith(end) and len(word) - len(end) >= 3:
+            return word[:-len(end)]
+    return word
+
+
+def _rule_words(text: str) -> set[str]:
+    """What a rule is about: its longer words, stemmed, rule and filler words left out."""
+    return {_stem(w) for w in re.findall(r"[a-z][a-z0-9-]*[a-z0-9]", text.lower())
+            if len(w) >= 4 and w not in _RULE_STOP}
+
+
+def _restriction_conflicts(p: Project, before: str, added: list[tuple[str, str]]) -> list[str]:
+    """Warn when a user turn added text that allows or narrows what an older restriction is about
+    while no charter_update in it edited Restrictions (`quote` or `replaces`): the old item still
+    stands, and workers obey it as binding. A warning in the next digest (a queued event), not a
+    rejection: telling a change from a rule that merely sits next to the old one is a guess from
+    wording, and a wrongly rejected update would drop the user's instruction for that turn. A new
+    rule with no allowing word, or about something no restriction names, adds a restriction and
+    changes nothing: no warning. Returns the warnings."""
+    from .prompts import charter_restrictions
+    now = " ".join(charter_restrictions(p.charter_path.read_text()).split())
+    olds = [x.strip(" -*") for line in before.splitlines()
+            for x in re.split(r"(?<=[.;!?])\s+", line.strip()) if x.strip(" -*")]
+    out = []
+    for target, text in added:
+        if not _LOOSEN_RE.search(text):
+            continue
+        words = _rule_words(text)
+        for old in olds:
+            about = _rule_words(old)
+            shared = about & words
+            if len(shared) >= 2 and 2 * len(shared) >= len(about) and " ".join(old.split()) in now:
+                out.append(f"The user's turn added to {target!r}: \"{clip(text, 200)}\", but the Restrictions "
+                           f"item \"{clip(old, 200)}\" still stands unchanged, and workers obey it as binding. "
+                           f"If the user changed that restriction, charter_update section Restrictions with "
+                           f"`quote` set to that item, `text` the new wording and `over` naming the user's message "
+                           f"that changed it. If both truly hold, leave them.")
+                break
+    for x in out:
+        p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+               (time.time(), "harness", "charter_conflict", "normal", x, "queued"))
+    return out
 
 
 def _append_update(steer: Path, text: str, key: str | None = None) -> None:

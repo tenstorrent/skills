@@ -2928,6 +2928,64 @@ def test_charter_update_restriction_items_change_only_on_the_users_word(env, tmp
     assert "Binding restriction retired: Never touch box A." in (run_dir / "steer.md").read_text()
 
 
+def test_a_users_change_to_a_restriction_rewrites_the_item_in_place(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.prompts import restrictions_block
+    p.charter_path.write_text("# demo\n\n## Restrictions (binding on every task)\n- Never push to the main branch.\n"
+                              "- Never merge.\n\n## Goals\nShip v1.\n")
+    # A temporary loosening: the permanent item is quoted and names the exception, the exception is dated.
+    acts = [{"type": "charter_update", "section": "Restrictions", "quote": "Never push to the main branch.",
+             "text": "Never push to the main branch, except as the temporary section allows."},
+            {"type": "charter_update", "section": "Restrictions",
+             "text": "Pushing hotfixes to the main branch is allowed.", "expires": "3d"}]
+    assert coord.apply(p, acts, turn=4, user_turn=True) == []
+    block = restrictions_block(p)
+    assert "- Never push to the main branch.\n" not in block + "\n"
+    assert "except as the temporary section allows" in block and "Pushing hotfixes" in block
+    hist = (p.harness / coord.CHARTER_HISTORY).read_text()
+    assert "### Replaced in Restrictions (binding on every task) (" in hist
+    assert "turn 4.0)\nNever push to the main branch.\nNow: Never push" in hist
+    assert not p.db.q("SELECT id FROM events WHERE kind='charter_conflict'"), "an in-place edit is not a conflict"
+
+
+def test_an_appended_section_that_overrides_a_standing_restriction_is_flagged(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    base = ("# demo\n\n## Restrictions (binding on every task)\n- Never push to the main branch.\n"
+            "- Keep content generic.\n\n## Policies\nReview first.\n")
+
+    def conflicts():
+        return [r["text"] for r in p.db.q("SELECT text FROM events WHERE kind='charter_conflict' AND status='queued'")]
+
+    # A dated section, or text in another section, that widens the old item: applied, and flagged.
+    for k, act in enumerate(({"section": "Restrictions", "text": "Pushing hotfixes to the main branch is allowed.",
+                              "until": "the release ships"},
+                             {"section": "Policies", "text": "Workers may push to the main branch for hotfixes."})):
+        p.db.x("DELETE FROM events")
+        p.charter_path.write_text(base)
+        assert coord.apply(p, [{"type": "charter_update", **act}], turn=10 + k, user_turn=True) == []
+        assert act["text"] in p.charter_path.read_text(), "the user's instruction is kept, not rejected"
+        found = conflicts()
+        assert len(found) == 1 and "Never push to the main branch." in found[0] and "`quote`" in found[0], found
+    assert "charter_conflict" in coord.UNBLOCK_KINDS
+    # Not flagged: a plain new restriction, an unrelated permission, the same change made in place,
+    # and anything outside a user turn.
+    for k, (acts, user) in enumerate((
+            ([{"section": "Restrictions", "text": "Never push to the main branch on release days."}], True),
+            ([{"section": "Restrictions", "text": "Never delete release tags.", "expires": "2d"}], True),
+            ([{"section": "Goals", "text": "Allow the web app to show spend per task."}], True),
+            ([{"section": "Restrictions", "quote": "Never push to the main branch.",
+               "text": "Never push to the main branch, except as the temporary section allows."},
+              {"section": "Restrictions", "text": "Pushing hotfixes to the main branch is allowed.",
+               "expires": "1d"}], True),
+            ([{"section": "Policies", "text": "Workers may push to the main branch for hotfixes."}], False))):
+        p.db.x("DELETE FROM events")
+        p.charter_path.write_text(base)
+        assert coord.apply(p, [{"type": "charter_update", **a} for a in acts], turn=20 + k, user_turn=user) == []
+        assert conflicts() == [], acts
+
+
 def test_temporary_memory_retires_itself_at_expiry_and_the_digest_says_so(env):
     p = make(env)
     from ttp import coordinator as coord

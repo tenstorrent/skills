@@ -197,6 +197,20 @@ def test_coordinator_retires_temporary_instructions_and_does_not_ask_needlessly(
     assert "stale restriction" in daily and "`replaces`" in daily
 
 
+def test_coordinator_rewrites_a_changed_restriction_in_place():
+    """A restriction the user changes is edited in Restrictions in that turn, never left standing
+    next to a new section that says otherwise: workers obey the Restrictions block verbatim."""
+    coordinator = " ".join((PLUGIN / "template" / "prompts" / "coordinator.md").read_text(encoding="utf-8").split())
+    start = coordinator.index("The user changes, narrows, widens or lifts a restriction")
+    rule = coordinator[start:coordinator.index(" - ", start)]
+    for phrase in ("in that same turn", "`quote` set to the old item", "`replaces`", "no `over`",
+                   "Never leave the old item standing next to a new section",
+                   "A temporary loosening of a permanent item also `quote`s that item"):
+        assert phrase in rule, phrase
+    # Next to the other charter_update guidance, under User instructions.
+    assert coordinator.index("# User instructions") < start < coordinator.index("# Keep moving")
+
+
 # Wording that makes the user do, or approve, what tt-project can do itself.
 ASKS_USER_TO_DO = [
     r"\b(ask|tell)(ing)? (the )?user to (run|do|open|install|type|start|restart|set up|enable)\b",

@@ -129,6 +129,14 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
 
 - A new goal, restriction or preference: `charter_update` or `memory_add`, then act on it.
 - Restrictions are binding on every task. When in doubt, the stricter reading wins.
+- The user changes, narrows, widens or lifts a restriction: rewrite it in Restrictions in that
+  same turn. `charter_update` (section Restrictions) with `quote` set to the old item and `text`
+  the new wording (empty to drop it), or `replaces` for a whole dated section; their word is
+  enough, no `over`. Never leave the old item standing next to a new section (dated, Goals,
+  Policies or other) that says otherwise: workers see Restrictions verbatim as binding and obey
+  the old item. A temporary loosening of a permanent item also `quote`s that item, `text` naming
+  the exception ("Never push to the main branch, except as the temporary section allows"), so
+  the two cannot both bind.
 - Temporary instructions: when the user's words are temporary ("while X", "until Y", "for now",
   "this week"), record the end with the entry: `expires` (a delay such as `3d` or an ISO time),
   `until` (the end in plain words) and, when a shell check can tell, `until_probe` (read-only,
