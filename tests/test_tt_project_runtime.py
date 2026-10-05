@@ -14514,3 +14514,23 @@ def test_the_daemons_re_review_continues_the_failed_review(env):
     p.db.update_task(re_rev["id"], status="failed")
     _, _, _, (third,) = _finish_code(env, p, "fix again", {"fix2.py": 5}, labels=[f"continues:{fix}"])
     assert continues_id(third) == re_rev["id"]
+
+
+def test_set_when_drops_the_old_probe_verdict(env, monkeypatch):
+    p = make(env)
+    from ttp import cli
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    nb = time.time() + 3600
+    tid = p.db.add_task("measure", "s", kind="work", tier="light", origin="user", not_before=nb)
+    p.db.update_task(tid, result=json.dumps({"status": "waiting", "retry_when": "true"}))
+    d.probe_waiting()
+    d._probes[tid][0].wait(10)
+    cli.set_when(p.db, tid, "false")
+    d.probe_waiting()
+    assert p.db.task(tid)["not_before"] == nb
+    assert d._probes[tid][2] == "false"
+    d._probes[tid][0].wait(10)
+    d.probe_waiting()
+    assert p.db.task(tid)["not_before"] == nb

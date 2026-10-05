@@ -205,9 +205,9 @@ class Daemon:
         self._disk_low = bool(self.p.db.kv("disk_low"))   # an episode outlives a restart: no second alert
         self._disk_free: float | None = None
         self._tick_errors = 0
-        self._probes: dict[int, tuple[subprocess.Popen, float]] = {}
+        self._probes: dict[int, tuple[subprocess.Popen, float, str]] = {}   # running: proc, started, probe
         self._probed: dict[int, float] = {}
-        self._probe_rc: dict[int, tuple[int | str, float]] = {}   # last verdict: exit code or why, when
+        self._probe_rc: dict[int, tuple[int | str, float, str]] = {}   # last verdict: exit code or why, when, probe
         self._reboot_told = False
         self._boot_woken = False
         self._held: list[str] | None = None   # lock holders the heartbeat file last recorded
@@ -2125,7 +2125,7 @@ class Daemon:
         (any other exit, a timeout, a probe that cannot start) wakes it at its timer so a worker can
         fix the probe, and `waiting.max_hold_s` after the hand-off it wakes whatever the probe says."""
         db, now = self.p.db, time.time()
-        for tid, (proc, started) in list(self._probes.items()):
+        for tid, (proc, started, probe) in list(self._probes.items()):
             rc = proc.poll()
             if rc is None and now - started < PROBE_TIMEOUT_S:
                 continue
@@ -2133,10 +2133,12 @@ class Daemon:
             if rc is None:
                 _kill_group(proc)
             task = db.task(tid)
+            if task and _current_probe(task) != probe:
+                continue   # re-pointed (`set-when`) while it ran: its verdict is not the new probe's
             if task and task["status"] == "queued" and deferral(task).get("when"):
                 self._start_verdict(task, "timeout" if rc is None else rc, now)
                 continue
-            self._probe_rc[tid] = ("timeout" if rc is None else rc, now)
+            self._probe_rc[tid] = ("timeout" if rc is None else rc, now, probe)
             if rc == 0:
                 task = db.task(tid)
                 if task and task["status"] == "queued" and (task["not_before"] or 0) > now:
@@ -2147,6 +2149,7 @@ class Daemon:
             if prev.get("status") != "waiting" or not isinstance(probe, str) or not probe.strip() \
                     or deferral(t).get("when"):
                 continue
+            self._drop_stale_probe(t["id"], probe)
             if t["not_before"] <= now:
                 # Hand-offs from before the hold, and tasks already woken, keep their timer.
                 if prev.get("woke") or not isinstance(prev.get("waiting_since"), (int, float)):
@@ -2176,11 +2179,24 @@ class Daemon:
             if now - since >= max_days * 86400:
                 self._deferral_event(t, since, "deferral_expired",
                                      f"its start_when has not passed in {max_days:g} days: {d['when'][:300]}")
+            self._drop_stale_probe(t["id"], d["when"])
             if t["id"] in self._probes or now - self._probed.get(t["id"], 0) < PROBE_EVERY_S:
                 continue
             self._start_probe(t["id"], d["when"], now, "start_when")
             if t["id"] not in self._probes:
                 self._start_verdict(t, self._probe_rc.pop(t["id"])[0], now)
+
+    def _drop_stale_probe(self, tid: int, probe: str) -> None:
+        """The task's probe was re-pointed (`ttp task set-when`): kill a run of the old one and forget
+        its verdict, so it is never credited to the new probe."""
+        run = self._probes.get(tid)
+        if run and run[2] != probe:
+            _kill_group(run[0])
+            del self._probes[tid]
+            self._probed.pop(tid, None)
+        if tid in self._probe_rc and self._probe_rc[tid][2] != probe:
+            del self._probe_rc[tid]
+            self._probed.pop(tid, None)
 
     def _start_verdict(self, task: dict, rc, now: float) -> None:
         d = deferral(task)
@@ -2263,9 +2279,9 @@ class Daemon:
                                     start_new_session=True)
         except OSError as e:
             log(self.p, f"task {tid} {what} probe could not start: {e}")
-            self._probe_rc[tid] = ("could not start", now)
+            self._probe_rc[tid] = ("could not start", now, probe)
             return
-        self._probes[tid] = (proc, now)
+        self._probes[tid] = (proc, now, probe)
 
     def _hold_waiting(self, task: dict, prev: dict, now: float) -> bool:
         """A waiting task whose timer ran out: wake it, or put it back to sleep while its probe says
@@ -2273,7 +2289,7 @@ class Daemon:
         tid = task["id"]
         max_hold = float((self.cfg.get("waiting") or {}).get("max_hold_s") or 6 * 3600)
         since = float(prev["waiting_since"])
-        rc, at = self._probe_rc.get(tid, (None, 0.0))
+        rc, at, _ = self._probe_rc.get(tid, (None, 0.0, ""))
         fresh = at >= since and now - at <= 2 * PROBE_EVERY_S
         if fresh and rc == 0:
             self._wake_waiting(task, "probe passed", now)
@@ -2936,6 +2952,16 @@ def _retry_s(result: dict) -> float:
         return min(max(float(result.get("retry_after_s") or 1800), 300.0), 6 * 3600.0)
     except (TypeError, ValueError):
         return 1800.0
+
+
+def _current_probe(task: dict) -> str | None:
+    """The probe the daemon should be running for a task now: its start_when, else its waiting
+    hand-off's retry_when."""
+    when = deferral(task).get("when")
+    if when:
+        return when
+    probe = load_result(task["result"]).get("retry_when")
+    return probe if isinstance(probe, str) else None
 
 
 def _kill_group(proc: subprocess.Popen) -> None:
