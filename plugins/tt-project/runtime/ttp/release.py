@@ -132,9 +132,11 @@ GUARD_HOOK = GUARD_MARK + """
 [ "$1" = prepared ] || exit 0
 [ -n "$TTP_HARNESS_UPGRADE" ] && exit 0
 up=$(git rev-parse -q --verify refs/heads/upstream) || exit 0
-z=0000000000000000000000000000000000000000
 while read -r old new ref; do
-  [ "$ref" = refs/heads/main ] && [ "$old" != $z ] && [ "$new" != $z ] || continue
+  [ "$ref" = refs/heads/main ] || continue
+  case $new in *[!0]*) ;; *) continue ;; esac
+  # `git update-ref <ref> <new>` with no old value sends the zero oid: check from main's real value.
+  case $old in *[!0]*) ;; *) old=$(git rev-parse -q --verify "$ref") || continue ;; esac
   git merge-base --is-ancestor "$up" "$new" 2>/dev/null || continue
   git merge-base --is-ancestor "$up" "$old" 2>/dev/null && continue
   echo "refused: only \\`ttp upgrade\\` merges the tt-project template (upstream) into main." >&2

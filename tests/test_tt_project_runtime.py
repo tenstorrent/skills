@@ -6565,6 +6565,35 @@ def test_upgrade_stops_clearly_on_an_unfinished_merge_in_the_live_harness(env, m
     assert restarts == [1] and (h / "prompts" / "worker.md").read_text() != "side change\n"
 
 
+def test_the_merge_guard_refuses_update_ref_onto_upstream_without_an_old_value(env, monkeypatch, tmp_path):
+    from ttp import release
+    monkeypatch.delenv(release.GUARD_ENV, raising=False)
+    h = tmp_path / "harness"
+    h.mkdir()
+    ident = ["-c", "user.name=t", "-c", "user.email=t@t"]
+    _git_out(h, "init", "-q", "-b", "main")
+    (h / "a").write_text("a\n")
+    _git_out(h, "add", "-A")
+    _git_out(h, *ident, "commit", "-qm", "local")
+    base = _git_out(h, "rev-parse", "HEAD")
+    up = _git_out(h, *ident, "commit-tree", "-m", "template", _git_out(h, "rev-parse", "HEAD^{tree}"))
+    _git_out(h, "update-ref", "refs/heads/upstream", up)
+    merge = _git_out(h, *ident, "commit-tree", "-p", base, "-p", up, "-m", "merge upstream",
+                     _git_out(h, "rev-parse", "HEAD^{tree}"))
+    local = _git_out(h, *ident, "commit-tree", "-p", base, "-m", "local work", _git_out(h, "rev-parse", "HEAD^{tree}"))
+    assert release.guard_harness(h)
+    # Git passes the zero oid as the old value when none is given: the guard checks main's real value.
+    for argv in (["update-ref", "refs/heads/main", merge], ["update-ref", "refs/heads/main", merge, base]):
+        r = subprocess.run(["git", "-C", str(h), *argv], capture_output=True, text=True)
+        assert r.returncode != 0 and "only `ttp upgrade`" in r.stderr
+        assert _git_out(h, "rev-parse", "main") == base
+    # A genuinely new ref, and main moving onto local work, still go through.
+    _git_out(h, "update-ref", "refs/heads/fresh", merge)
+    assert _git_out(h, "rev-parse", "fresh") == merge
+    _git_out(h, "update-ref", "refs/heads/main", local)
+    assert _git_out(h, "rev-parse", "main") == local
+
+
 def test_restart_rolls_back_a_runtime_the_daemon_cannot_start_with(env):
     import py_compile
     p = make(env)
