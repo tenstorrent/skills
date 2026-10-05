@@ -46,7 +46,7 @@ CLEARED_TEXT = {
     "pr-ready": "{arg} is back in draft, closed or approved.",
     "config": "project.json reads again; new work starts again.",
     "push_rejected": "Pushes go through again: a push batch pushed.",
-    "after_push_failed": "after_push works again: the last one succeeded.",
+    "after_push_failed": "after_push no longer fails: the last one succeeded, or after_push or the push queue is off.",
     "push_queue_dying": "Push batches finish again.",
 }
 
@@ -112,7 +112,9 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
     # The push queue (pushq.py): each lasts until a batch finalized after it was raised shows otherwise.
     if key == "push_rejected":
         return not db.one("SELECT id FROM push_batches WHERE outcome='pushed' AND finalized>=? LIMIT 1", (since,))
-    if key == "after_push_failed":
+    if key == "after_push_failed":   # also over once no after_push will run (pushq.AFTER_PUSH_OFF)
+        if db.kv("after_push_off"):
+            return False
         return not db.one("SELECT id FROM push_batches WHERE after_push='ok' AND after_finalized>=? LIMIT 1",
                           (since,))
     if key == "push_queue_dying":

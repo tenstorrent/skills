@@ -9431,6 +9431,89 @@ def test_after_push_failures_are_reported_and_a_deploy_cut_short_runs_once_more(
     assert "after_push_failed" in [ep["key"] for ep in alerts.sweep(s.p.db)]
 
 
+@pytest.mark.parametrize("delivery, on", [
+    ({"push_queue": True, "push_branch": "origin/proj"}, True),
+    ({"push_queue": True, "push_branch": "origin/proj", "push_allowed": "yes"}, True),
+    ({"push_queue": "yes", "push_branch": "origin/proj"}, False),
+    ({"push_queue": 1, "push_branch": "origin/proj"}, False),
+    ({"push_queue": True, "push_branch": " "}, False),
+    ({"push_queue": True}, False),
+    ({"push_queue": True, "push_branch": "origin/proj", "push_allowed": False}, False),
+    ({"push_queue": True, "push_branch": "origin/proj", "push_allowed": "no"}, False),
+    ({"push_queue": False, "push_branch": "origin/proj"}, False),
+])
+def test_the_daemon_and_the_review_prompt_agree_on_whether_the_push_queue_is_on(env, delivery, on):
+    from ttp import pushq
+    from ttp.project import push_queue_on
+    p = make(env)
+    cfg = {"delivery": delivery}
+    assert push_queue_on(cfg) is on and pushq.enabled(p, cfg) is on
+    for k, v in delivery.items():
+        p.set_config(f"delivery.{k}", v)
+    assert pushq.enabled(p) is on
+    review = p.db.add_task("review it", "s", kind="review", tier="light", origin="user")
+    from ttp.prompts import worker_task
+    policy = next(x for x in worker_task(p, p.db.task(review), str(p.root), None).splitlines()
+                  if x.startswith("delivery policy:"))
+    assert ("push queue=True" in policy) is on
+    if not on:   # an approval made anyway is not queued
+        check = pushq.check_approval(p, p.db.task(review), [{"branch": "b", "head": "ab" * 20}])
+        assert "entries" not in check, check
+
+
+def test_an_after_push_failed_alert_clears_once_after_push_is_unset_or_the_queue_is_off(env, monkeypatch):
+    from ttp import alerts, pushq
+    s = _pq(env, monkeypatch, after_push="./deploy.sh")
+    _pq_plan(s, outcome="pushed", sha="ab" * 20, after="failed")
+    _pq_hand_off(env, s)
+    _pq_batch(s)
+    _pq_tend(s)
+    assert s.p.db.one("SELECT after_push FROM push_batches")["after_push"] == "failed"
+    raised = s.p.db.one("SELECT raised FROM alerts WHERE key='after_push_failed' AND cleared IS NULL")["raised"]
+    assert alerts.sweep(s.p.db) == [] and alerts.holds(s.p.db, "after_push_failed", raised, time.time())
+    s.p.set_config("delivery.after_push", None)
+    _pq_tend(s)
+    assert s.p.db.kv(pushq.AFTER_PUSH_OFF) is True
+    assert [ep["key"] for ep in alerts.sweep(s.p.db)] == ["after_push_failed"], "after_push unset clears it"
+    s.p.set_config("delivery.after_push", "./deploy.sh")
+    _pq_tend(s)
+    assert s.p.db.kv(pushq.AFTER_PUSH_OFF) is False
+    assert alerts.holds(s.p.db, "after_push_failed", raised, time.time()), "set again, the failure still stands"
+    s.p.set_config("delivery.push_queue", False)
+    _pq_tend(s)
+    assert not alerts.holds(s.p.db, "after_push_failed", raised, time.time()), "the queue off clears it"
+
+
+def test_approvals_ask_the_remote_for_its_default_branch_once_per_hour_not_once_each(env, monkeypatch):
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    pushq._default_branches.clear()
+    asked, real = [], pushq._git
+
+    def git(p, *args, **kw):
+        if args[0] == "ls-remote":
+            asked.append(args)
+        return real(p, *args, **kw)
+    monkeypatch.setattr(pushq, "_git", git)
+    entries = [{"branch": s.branch, "head": s.head}]
+    for _ in range(5):
+        assert pushq.check_approval(s.p, s.p.db.task(s.review), entries).get("entries"), "approved"
+    assert len(asked) == 1, "five approvals in one tick, one ls-remote"
+    # The remote's default branch becomes the target: refused once the cached answer expires.
+    subprocess.run(["git", "-C", str(s.origin), "symbolic-ref", "HEAD", "refs/heads/proj"], check=True)
+    now = time.time()
+    assert pushq._default_branch(s.p, "origin", now + 60) != "proj" and len(asked) == 1
+    assert pushq._default_branch(s.p, "origin", now + pushq.DEFAULT_BRANCH_TTL_S + 1) == "proj" and len(asked) == 2
+    assert "the remote's default branch" in pushq.check_approval(s.p, s.p.db.task(s.review), entries)["invalid"]
+    # An unreachable remote does not refuse, and is asked again only after a short pause.
+    s.p.set_config("delivery.push_branch", "gone/proj")
+    for _ in range(3):
+        assert pushq._refusal(s.p, "gone", "proj") == ""
+    assert len(asked) == 3
+    assert pushq._default_branch(s.p, "gone", time.time() + pushq.DEFAULT_BRANCH_RETRY_S + 1) is None
+    assert len(asked) == 4
+
+
 def test_cancelling_or_requeueing_a_pushing_review_withdraws_its_approval(env, monkeypatch):
     from ttp import pushq
     s = _pq(env, monkeypatch)

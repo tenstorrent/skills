@@ -20,7 +20,7 @@ from typing import Any, Callable
 
 from . import locks, push
 from .db import TERMINAL_TASK_STATES, dump_result, load_result
-from .project import Project, write_json
+from .project import Project, push_allowed, push_queue_on, write_json
 
 REF_PREFIX = "refs/ttp/push/"   # + row id: pins the approved commit until its row is settled
 KV = "push_queue"               # kv: {"backoff_until", "deaths", "hold": {"tip", "rows", "until"}, "tips_told"}
@@ -32,20 +32,20 @@ BACKOFF_MAX_S = 1800            # ... and at most 30 min
 DYING_AFTER = 3                 # batches that die in a row before push_queue_dying is raised
 MAX_RESUMES = 1                 # respawns of an after_push that died (a reboot killed the deploy)
 REFUSAL_TIMEOUT_S = 30          # the approval asks the remote for its default branch; never hang the tick
+DEFAULT_BRANCH_TTL_S = 3600     # ... and remembers the answer per remote this long (one ask, not one per approval)
+DEFAULT_BRANCH_RETRY_S = 300    # an unreachable remote is asked again after this, not on every approval
+AFTER_PUSH_OFF = "after_push_off"   # kv: true while after_push is unset or the queue is off (alerts.holds)
 TIPS_TOLD = 20                  # tip_failed shas remembered, so each tip is reported once
 ROW_RESULTS = ("pushed", "landed", "conflict", "check_failed", "requeued", "refused")
 AFTER_STATES = ("ok", "failed", "timeout", "killed", "skipped")
 _HEX40 = re.compile(r"[0-9a-f]{40}")
 _children: dict[str, subprocess.Popen] = {}   # batch processes this daemon started, reaped by finalize
+_default_branches: dict[tuple[str, str], tuple[float, str | None]] = {}   # (root, remote): (until, branch)
 
 
 # settings -----------------------------------------------------------------------------------------
 def _delivery(p: Project, cfg: dict | None = None) -> dict:
     return (cfg if cfg is not None else p.config()).get("delivery") or {}
-
-
-def _on(v: Any) -> bool:
-    return v is True or str(v).strip().lower() in ("1", "true", "yes", "on")
 
 
 def _num(v: Any, default: float, cast: Callable, low: float):
@@ -56,9 +56,9 @@ def _num(v: Any, default: float, cast: Callable, low: float):
 
 
 def enabled(p: Project, cfg: dict | None = None) -> bool:
-    """The queue is on and the project allows pushing."""
-    d = _delivery(p, cfg)
-    return _on(d.get("push_queue")) and (d.get("push_allowed") is None or _on(d.get("push_allowed")))
+    """The queue is on, the project allows pushing and has a push branch: project.push_queue_on,
+    which also picks the review prompt's push section, so the daemon and the reviews agree."""
+    return push_queue_on({"delivery": _delivery(p, cfg)})
 
 
 def target(p: Project) -> tuple[str, str] | None:
@@ -74,20 +74,39 @@ def _git(p: Project, *args: str, timeout: float = 120, **kw) -> subprocess.Compl
                           stdin=subprocess.DEVNULL, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"}, **kw)
 
 
+def _default_branch(p: Project, remote: str, now: float | None = None) -> str | None:
+    """The remote's default branch, None when unknown. One `git ls-remote` (up to REFUSAL_TIMEOUT_S)
+    per remote and DEFAULT_BRANCH_TTL_S (DEFAULT_BRANCH_RETRY_S while it fails): many approvals in
+    one tick must not each wait on the network."""
+    now = time.time() if now is None else now
+    key = (str(p.root), remote)
+    hit = _default_branches.get(key)
+    if hit and hit[0] > now:
+        return hit[1]
+    try:
+        ls = _git(p, "ls-remote", "--symref", remote, "HEAD", timeout=REFUSAL_TIMEOUT_S)
+    except (OSError, subprocess.SubprocessError):
+        ls = None
+    if ls is None or ls.returncode != 0:
+        _default_branches[key] = (now + DEFAULT_BRANCH_RETRY_S, None)
+        return None
+    found = ""
+    for line in ls.stdout.splitlines():
+        ref = line[5:].split("\t")[0] if line.startswith("ref: ") else ""
+        if ref.startswith("refs/heads/"):
+            found = ref[len("refs/heads/"):]
+            break
+    _default_branches[key] = (now + DEFAULT_BRANCH_TTL_S, found)
+    return found
+
+
 def _refusal(p: Project, remote: str, branch: str) -> str:
     """push.refusal for the daemon: the same rules, bounded in time. An unreachable remote does not
     refuse here: the batch asks again before it pushes, and a network blip must not fail a review."""
     if branch in push.PROTECTED:
         return f"refusing to push to {remote}/{branch}"
-    try:
-        ls = _git(p, "ls-remote", "--symref", remote, "HEAD", timeout=REFUSAL_TIMEOUT_S)
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    if ls.returncode != 0:
-        return ""
-    for line in ls.stdout.splitlines():
-        if line.startswith("ref: ") and line[5:].split("\t")[0] == f"refs/heads/{branch}":
-            return f"refusing to push to {remote}/{branch}, the remote's default branch"
+    if _default_branch(p, remote) == branch:
+        return f"refusing to push to {remote}/{branch}, the remote's default branch"
     return ""
 
 
@@ -144,13 +163,13 @@ def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None
     name any commit; the commits it adds over the conflicting head are listed for the event."""
     from .worktree import reviewed_refs
     d = _delivery(p, cfg)
-    if not _on(d.get("push_queue")):
+    if d.get("push_queue") is not True:
         if isinstance(entries, list) and entries and all(isinstance(e, dict) and e.get("head") for e in entries):
             return {"invalid": "the push queue is off (delivery.push_queue): push with ttp push"}
         return {"ignored": "the push queue is off (delivery.push_queue)"}
-    if not (d.get("push_allowed") is None or _on(d.get("push_allowed"))):
+    if not push_allowed(d):
         return {"ignored": "this project does not allow pushing (delivery.push_allowed)"}
-    tgt = target(p)
+    tgt = target(p) if enabled(p, cfg) else None
     if not tgt:
         return {"invalid": "no target branch: set delivery.push_branch"}
     why = _refusal(p, *tgt)
@@ -707,6 +726,14 @@ def _resume(p: Project, b: dict, marker: Path, now: float) -> bool:
     return True
 
 
+def _note_after_push(p: Project, cfg: dict | None) -> None:
+    """Keep AFTER_PUSH_OFF current (written only when it changes): an after_push_failed alert also
+    clears once after_push is unset or the queue is off, since no after_push will run to succeed."""
+    off = not (enabled(p, cfg) and _after_push_set(p, cfg))
+    if bool(p.db.kv(AFTER_PUSH_OFF)) != off:
+        p.db.set_kv(AFTER_PUSH_OFF, off)
+
+
 def finalize(p: Project, cfg: dict | None = None, alert: Callable = lambda *a, **k: None,
              now: float | None = None) -> list[str]:
     """The tick's finalize step (also while paused), idempotent: for each batch not yet finalized,
@@ -781,6 +808,8 @@ def tend(p: Project, cfg: dict | None = None, alert: Callable = lambda *a, **k: 
     for bid in list(_children):
         _reap(bid)
     db = p.db
+    if may_requeue:
+        _note_after_push(p, cfg)
     if not db.one("SELECT id FROM push_queue WHERE status IN ('approved','batched') LIMIT 1") and not db.one(
             "SELECT id FROM push_batches WHERE after_finalized IS NULL LIMIT 1"):
         return []

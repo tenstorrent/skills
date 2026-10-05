@@ -225,12 +225,17 @@ def push_queue_number(key: str, v: Any) -> float | int:
     return int(n) if whole else n
 
 
+def push_allowed(d: dict) -> bool:
+    """delivery.push_allowed of the delivery settings `d` as `ttp push` reads it: unset allows."""
+    v = d.get("push_allowed")
+    return v is None or v is True or str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
 def push_queue_on(cfg: dict) -> bool:
     """Whether reviews approve into the daemon's push queue: delivery.push_queue is true, pushing is
-    allowed and delivery.push_branch is set."""
+    allowed and delivery.push_branch is set. The prompts and the daemon (pushq.enabled) both ask this."""
     d = cfg.get("delivery") or {}
-    return d.get("push_queue") is True and d.get("push_allowed", True) is not False \
-        and bool(str(d.get("push_branch") or "").strip())
+    return d.get("push_queue") is True and push_allowed(d) and bool(str(d.get("push_branch") or "").strip())
 
 
 def config_problems(raw: dict) -> list[str]:
