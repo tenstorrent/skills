@@ -11398,7 +11398,7 @@ def test_a_pause_set_while_ttp_lock_waits_ends_the_wait_with_75(env, tmp_path):
             time.sleep(0.05)
         waiter = subprocess.Popen([sys.executable, str(TTP), "lock", "--timeout", "0", "board", "--", "true"],
                                   env=run_env, stderr=subprocess.PIPE, text=True)
-        time.sleep(1)
+        assert "waiting for board" in waiter.stderr.readline()   # the pause comes while it waits
         coord.pause_resource(p, "board", True, by="user")
         _, err = waiter.communicate(timeout=30)
         assert waiter.returncode == 75 and "board is paused" in err, err
