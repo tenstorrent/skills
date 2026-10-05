@@ -1281,8 +1281,8 @@ def cmd_lock(a) -> None:
     toward the run's wall clock (which grows by at most its own length this way), and gives up after
     half the run's stall limit (a longer --timeout is capped to that; 0 means that limit too). Giving
     up exits 75: the task hands back `waiting` with retry_when `ttp lock --probe <resource>`. A paused
-    resource exits 75 as well. In a `ttp detach` job, or a `setsid nohup` driver that no longer runs
-    under the run's agent, there is no cap.
+    resource exits 75 as well. In a `ttp detach` job, or a background (`nohup ... &`) driver that no longer
+    runs under the run's agent, there is no cap.
     `ttp lock --probe <resource>` exits 0 when the resource is free, not paused, not reserved and
     nobody queues for it, else 75.
     """
@@ -1426,7 +1426,7 @@ def cmd_lock(a) -> None:
             for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
                 signal.signal(sig, lambda signum, _f: (_end_wait(), sys.exit(128 + signum)))
         if capped and timeout and time.time() - started > timeout and not lk.in_run(run_dir):
-            # A driver started with `setsid nohup` outlives the run: the run's cap is not its own,
+            # A driver started in the background (`nohup ... &`) outlives the run: the run's cap is not its own,
             # and its wait is no longer the run's.
             capped, timeout = False, a.timeout
             _end_wait()

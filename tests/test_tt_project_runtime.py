@@ -22360,7 +22360,7 @@ def test_in_run_lock_wait_is_not_capped_in_a_detached_job(env):
     assert proc.wait(timeout=30) == 0
 
 
-def test_in_run_lock_cap_holds_under_the_runs_agent_and_lifts_in_a_setsid_driver(env, tmp_path):
+def test_in_run_lock_cap_holds_under_the_runs_agent_and_lifts_in_a_background_driver(env, tmp_path):
     p = _device_project(env)
     from ttp import locks as lk
     run_dir = p.runs / "9"
@@ -22371,13 +22371,14 @@ def test_in_run_lock_cap_holds_under_the_runs_agent_and_lifts_in_a_setsid_driver
     try:
         r = _ttp_run(p, "lock", "device-b", "--", "true", env={"TTP_RUN_DIR": str(run_dir)})
         assert r.returncode == 75, "a lock under the run's agent keeps the cap"
-        # A driver started with `setsid nohup` from the run: its shell exits, so it is re-parented.
+        # A driver started with `nohup ... &` from the run (no `setsid`: macOS has none): its shell
+        # exits, so it is re-parented.
         rc = tmp_path / "driver.rc"
         e = {**os.environ, "TTP_PROJECT": str(p.base), "TTP_RUN_DIR": str(run_dir), "TTP": str(TTP),
              "PY": sys.executable, "RC": str(rc)}
         e.pop("TTP_DETACHED", None)
         e.pop("TTP_LOCKS_HELD", None)
-        shell = subprocess.Popen(["sh", "-c", 'setsid nohup sh -c \'"$PY" "$TTP" lock device-b -- true; '
+        shell = subprocess.Popen(["sh", "-c", 'nohup sh -c \'"$PY" "$TTP" lock device-b -- true; '
                                               'echo $? > "$RC"\' > /dev/null 2>&1 &'], env=e)
         assert shell.wait(timeout=10) == 0
         (run_dir / "child.pid").write_text(f"{shell.pid}\n")
@@ -22393,6 +22394,28 @@ def _wait_for_path(path, timeout=20):
     while time.time() < deadline and not path.exists():
         time.sleep(0.05)
     return path.exists()
+
+
+def test_detach_needs_no_setsid_binary_and_gives_the_job_its_own_session(env, tmp_path):
+    p = _device_project(env, device=False)
+    run_dir = p.runs / "8"
+    run_dir.mkdir(parents=True)
+    # Only what the job's wrapper needs is on PATH; no `setsid`, as on macOS.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for tool in ("sh", "mv"):
+        (bin_dir / tool).symlink_to(shutil.which(tool))
+    out = tmp_path / "ids"
+    probe = f"import os; open({str(out)!r}, 'w').write(f'{{os.getsid(0)}} {{os.getpgrp()}}')"
+    r = _ttp_run(p, "detach", "job1", "--", sys.executable, "-c", probe,
+                 env={"TTP_RUN_DIR": str(run_dir), "PATH": str(bin_dir)})
+    assert r.returncode == 0, r.stderr
+    rc = run_dir / "job1.rc"
+    assert _wait_for_path(rc)
+    assert rc.read_text().strip() == "0"
+    leader = json.loads((run_dir / "detached.json").read_text())[0]["pid"]
+    sid, pgrp = map(int, out.read_text().split())
+    assert sid == pgrp == leader and sid != os.getsid(0), "the job leads a session of its own"
 
 
 def test_detach_writes_rc_log_and_a_durable_registry(env):

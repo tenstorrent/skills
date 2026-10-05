@@ -342,7 +342,7 @@ def _parent(pid: int) -> int | None:
 
 def in_run(run_dir: Path | None) -> bool:
     """Whether this process still runs under the run's agent (child.pid in the run's folder), so the
-    run supervises it. A `setsid nohup` driver is re-parented once its shell exits and then is not.
+    run supervises it. A background (`nohup ... &`) driver is re-parented once its shell exits and then is not.
     True whenever it cannot tell: another PID namespace (a sandbox), no record, an unreadable parent."""
     try:
         agent = int((run_dir / "child.pid").read_text().split()[0])

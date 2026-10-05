@@ -186,7 +186,7 @@ and preferences you add later become part of the project's charter and memory.
   marked exclusive holds the resource's lock for its whole run; while it waits for a slot, new
   `ttp lock` commands wait behind it, so it is not starved. `ttp lock` waiters take turns in arrival
   order; a nested `ttp lock` of a resource the command already holds passes straight through; inside
-  a run a wait is capped at half the run's stall limit (not in a `ttp detach` job or a `setsid nohup`
+  a run a wait is capped at half the run's stall limit (not in a `ttp detach` job or a background
   driver that outlives the run), then exits 75 so the task can wait on `ttp lock --probe <resource>`
   (0 free, 75 busy or paused) without a model. Config `device.locks` (opt-in) names one device by several names: all share the first name's lock and pause, tasks that use one
   get the `needs_device` label, and at most `device.max_tasks` of them run at once. A worker starts
