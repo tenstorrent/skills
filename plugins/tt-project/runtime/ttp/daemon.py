@@ -30,6 +30,7 @@ from pathlib import Path
 from . import alerts
 from . import budget as bud
 from . import coordinator as coord
+from . import coordcheck
 from . import effort
 from . import ends
 from . import integrity
@@ -53,7 +54,7 @@ from .project import DEFAULT_CONFIG, Project, deep_merge, disk_resume_gb, durabl
 from .providers import get_provider
 from .providers.base import last_json_object, scratch_dir, service_path
 from .providers.claude import as_windows
-from .providers.jev import Jev
+from .providers.jev import Jev, JevOutOfFunds
 
 TICK_S = 3.0
 LEASE_STALE_S = 180
@@ -182,6 +183,9 @@ def disk_usage_line(b: dict, used: float) -> str:
         parts.append(f"du measured no top-level directory within {DISK_DU_TIMEOUT_S} s")
     return "; ".join(parts) + "."
 
+
+JEV_FUNDS_TEXT = ("The Jev account is out of credits. Screening and the other Jev checks fall back to rules "
+                  "(more model calls, same coverage). Top up the Jev account to restore the savings.")
 
 class Daemon:
     def __init__(self, base: str | Path):
@@ -538,6 +542,27 @@ class Daemon:
                        "(servers from a plugin cannot be listed).",
                        severity="low", every_s=86400)
         return found
+
+    def _coordinator_effort(self, provider: str, tier: str) -> str:
+        """The coordinator's effort before any unblock raise: coordinator.effort, else its tier's."""
+        tiers = self.cfg["providers"].get(provider, {}).get("tiers", {})
+        return str((self.cfg.get("coordinator") or {}).get("effort") or "") or tiers.get(tier, {}).get("effort", "")
+
+    def _coord_check(self, provider: str, tier: str, event_ids: list[int], wake_due: str | None) -> dict | None:
+        """Jev's 'routine or needs thought?' verdict on a turn the rules leave below unblock_effort
+        (coordcheck), or None: not needed, off, or failed (the rules' choice stands)."""
+        base = self._coordinator_effort(provider, tier)
+        high = coord.raise_effort(base, str(self.cfg["coordinator"].get("unblock_effort", "high") or ""))
+        if high == base:
+            return None   # already at unblock_effort: the check could not change it
+        try:
+            return coordcheck.check(self.p.db, self.cfg, self.jev,
+                                    coordcheck.summary(self.p.db, event_ids, wake_due), base, high)
+        except JevOutOfFunds:
+            self.alert("jev-funds", JEV_FUNDS_TEXT, "high")
+        except Exception:   # the check must never hold a turn back
+            log(self.p, "coordinator jev check failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
+        return None
 
     def start_run(self, role: str, prompt: str, provider: str, tier: str, cwd: str, *, task: dict | None = None,
                   budget_usd: float | None = None, timeout_s: float | None = None, read_only: bool = False,
@@ -1095,7 +1120,10 @@ class Daemon:
             return
         if status == "auth":
             return   # its breaker holds the next turn until the login is back; the messages stay queued
+        checked = note.get("coord_check") or {}
         if status != "ok" or not isinstance(actions, list):
+            if checked.get("jev_call"):
+                coordcheck.settle(db, int(checked["jev_call"]), checked.get("verdict", ""), status, None, [])
             self._coordinator_failed(f"{status} {usage.error[:200]}")
             return
         db.set_kv("coordinator_failures", 0)
@@ -1114,6 +1142,9 @@ class Daemon:
                                                **({"due": note["wake_due"]} if note.get("wake_due") else {})})
                 db.set_kv(coord.ESCALATIONS_KEY, {**counts, "n": int(counts.get("n", 0)) + 1, "batch": batch})
                 log(self.p, f"coordinator turn {r.get('id')} escalated to high effort: {why}")
+                if checked.get("jev_call"):   # Jev called it routine, and the turn found it was not
+                    coordcheck.settle(db, int(checked["jev_call"]), checked.get("verdict", ""), "escalated",
+                                      actions, [])
                 return   # its messages and events stay queued for the rerun
             db.set_kv(coord.ESCALATIONS_KEY, {**counts, "refused": int(counts.get("refused", 0)) + 1})
             log(self.p, f"coordinator turn {r.get('id')} asked to escalate again; it decides at this effort")
@@ -1127,6 +1158,8 @@ class Daemon:
         if evs:
             db.x(f"UPDATE events SET status='handled' WHERE id IN ({','.join('?' * len(evs))})", evs)
         self._record_rejections([x[:500] for x in problems])
+        if checked.get("jev_call"):
+            coordcheck.settle(db, int(checked["jev_call"]), checked.get("verdict", ""), status, actions, problems)
         db.set_kv("last_coordinator_summary", {"ts": time.time(), "summary": (out or {}).get("summary", "")})
 
     def _record_rejections(self, problems: list[str]) -> None:
@@ -1736,8 +1769,7 @@ class Daemon:
         again = {"rewake_after_s": rewake_after_s, "repeat": repeat}
         v = scr.screen(self.p.db, self.cfg, source, text, hint, jev=self.jev, **again)
         if v.jev_out_of_funds:
-            self.alert("jev-funds", "The Jev account is out of credits. Screening falls back to rules "
-                       "(more model calls, same coverage). Top up the Jev account to restore the savings.", "high")
+            self.alert("jev-funds", JEV_FUNDS_TEXT, "high")
         if v.wake:
             self.p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
                         (time.time(), source, "observation", v.fingerprint, v.severity, text[:4000], "queued"))
@@ -1820,21 +1852,29 @@ class Daemon:
                                                    [m["id"] for m in msgs], gates, now)
             if esc:
                 triggers = [f"escalated: {str(esc.get('why') or '')[:200]}".rstrip(": "), *triggers]
+            can_raise = coord.can_raise_effort(self.cfg, c.get("tier", "light"))
+            # Jev rates only a turn the rules leave routine and that a raise would change.
+            check = self._coord_check(provider, c.get("tier", "light"), [e["id"] for e in evs], due) \
+                if can_raise and not triggers else None
+            if check and check["verdict"] == "needs_thought":
+                triggers.append(f"jev: needs thought ({check['reason']})")
+            checked = {"coord_check": {"jev_call": check["jev_call"], "verdict": check["verdict"]}} if check else {}
             unblock = ", ".join(triggers)
-            raised = bool(unblock) and coord.can_raise_effort(self.cfg, c.get("tier", "light"))
+            raised = bool(unblock) and can_raise
             prompt += ("\n\nThis turn's effort: raised (" + unblock[:300] + ")." if raised else
                        "\n\nThis turn's effort: routine." + (" If this batch is harder than routine bookkeeping, "
-                       "return only an `escalate` action: it reruns once at high effort." if
-                       coord.can_raise_effort(self.cfg, c.get("tier", "light")) else ""))
-            self.start_run("coordinator", prompt, provider, c.get("tier", "light"), str(self.p.base),
+                       "return only an `escalate` action: it reruns once at high effort." if can_raise else ""))
+            run_id = self.start_run("coordinator", prompt, provider, c.get("tier", "light"), str(self.p.base),
                            read_only=True, schema=coord.ACTIONS_SCHEMA, system=coord.system_prompt(self.p),
                            budget_usd=float(c.get("turn_budget_usd", 1.0)),
                            timeout_s=float(c.get("turn_timeout_s", 600)),
                            note={"messages": [m["id"] for m in msgs], "events": [e["id"] for e in evs],
                                  "default_chat": default_chat, **({"unblock": unblock} if unblock else {}),
                                  "triggers": triggers, **({"wake_due": due} if due else {}),
-                                 **({"escalated": True} if esc else {})},
+                                 **({"escalated": True} if esc else {}), **checked},
                            unblock=unblock)
+            if check:
+                jevuse.set_ref(db, check["jev_call"], f"run:{run_id}")
         except Exception as e:
             # A turn that cannot even start backs off like a failed turn instead of retrying every tick.
             log(self.p, "coordinator start failed: " + traceback.format_exc().replace("\n", " | ")[:2000])

@@ -18,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from . import ends, machines, prguard, push, shared, upstream
+from . import ends, jevuse, machines, prguard, push, shared, upstream
 from . import screen as scr
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
@@ -78,6 +78,8 @@ USER_SETTABLE = {
     "notify.slack_min_severity": str, "notify.chat_min_severity": str, "core_provider": str,
     "coordinator.tier": str, "coordinator.model": str, "coordinator.effort": str,
     "coordinator.unblock_effort": str, "jev.enabled": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
+    # Jev's 'routine or needs thought?' check on coordinator turns (coordcheck): on, off or auto.
+    "jev.uses.coord_effort": lambda v: jevuse.mode({"jev": {"uses": {"x": v}}}, "x"),
     # Where code tasks branch from: the project's working branch once it has one.
     "delivery.base_ref": str,
     # Where `ttp push` publishes (required; never main, master or the remote's default branch) and

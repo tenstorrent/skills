@@ -25,7 +25,8 @@ from .db import DB
 OFF_KEY = "jev_uses_off"           # kv: {use: {"at", "why"}}: uses the review switched off
 WINDOW_DAYS, MIN_CALLS = 7, 30     # defaults of jev.window_days and jev.min_calls
 WAKE_COST_FALLBACK_USD = 0.05      # a coordinator turn's price while none was measured in the window
-LABELS = {"screen": "watcher screening", "effort": "task effort picking"}
+LABELS = {"screen": "watcher screening", "effort": "task effort picking",
+          "coord_effort": "coordinator effort check"}
 
 
 def _jcfg(cfg: dict) -> dict:

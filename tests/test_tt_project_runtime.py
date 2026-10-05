@@ -14900,6 +14900,122 @@ def test_a_pinned_coordinator_effort_wins_over_the_triggers(env):
     assert got == ["high", "low", "medium"]
 
 
+class _ThoughtJev:
+    """Stands in for providers.jev.Jev on the coordinator check: rates every reason `p`, or raises `err`."""
+
+    def __init__(self, p=0.1, err=None, cost=0.00005):
+        self.p, self.err, self.last_cost, self.calls = p, err, cost, []
+
+    def enabled(self):
+        return True
+
+    def decide(self, state, questions, purpose="decide", timeout=20.0):
+        self.calls.append(state)
+        if self.err:
+            raise self.err
+        return {k: {"noul": self.p} for k in questions}
+
+
+def test_jev_coordinator_check_raises_routine_turns_and_logs_each_call_with_its_outcome(env, monkeypatch):
+    """Jev's 'routine or needs thought?' check runs only on turns the rules leave below unblock_effort:
+    needs thought raises the turn, routine and errors keep the rules' choice, out of funds alerts."""
+    p = make(env)
+    from types import SimpleNamespace
+    from ttp.daemon import Daemon
+    from ttp import coordcheck, jevuse
+    from ttp.providers.jev import JevOutOfFunds, JevUnavailable
+    p.set_config("providers.fake.tiers.light.effort", "low")
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    d = Daemon(p.base)
+    d.update_gates()
+    clock = [time.time()]
+    calls = []
+    monkeypatch.setattr(d, "start_run", lambda *a, **k: calls.append(k) or 70 + len(calls))
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+
+    def turn(jev, kind="task_done"):
+        d.jev = jev
+        p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+               (clock[0], "daemon", kind, "normal", f"#4 deploy: {kind}", "queued"))
+        clock[0] += 400
+        d.maybe_coordinate()
+        p.db.x("UPDATE events SET status='handled'")
+        return calls[-1]
+
+    def last_call():
+        return p.db.one("SELECT * FROM jev_calls WHERE use='coord_effort' ORDER BY id DESC LIMIT 1")
+
+    jev = _ThoughtJev(p=0.8)
+    k = turn(jev)
+    assert k["unblock"].startswith("jev: needs thought (") and k["note"]["coord_check"]["verdict"] == "needs_thought"
+    assert "event task_done [normal]: #4 deploy: task_done" in jev.calls[-1] and "tasks:" in jev.calls[-1]
+    row = last_call()
+    dec = json.loads(row["decision"])
+    assert dec["verdict"] == "needs_thought" and dec["effort"] == "high" and dec["escalated"]
+    assert dec["rules_effort"] == "low" and row["ref"] == f"run:{70 + len(calls)}"
+    assert row["cost_usd"] == pytest.approx(0.00005) and row["avoided_usd"] > 0
+    k = turn(_ThoughtJev(p=0.1))
+    assert k["unblock"] == "" and k["note"]["coord_check"]["verdict"] == "routine"
+    dec = json.loads(last_call()["decision"])
+    assert dec["verdict"] == "routine" and dec["effort"] == "low" and not dec["escalated"]
+    assert last_call()["avoided_usd"] == 0
+    n = p.db.one("SELECT COUNT(*) n FROM jev_calls")["n"]
+    for err in (JevUnavailable("HTTP 500"), ValueError("bad answer")):
+        k = turn(_ThoughtJev(err=err))
+        assert k["unblock"] == "" and "coord_check" not in k["note"], "an error keeps the rules' choice"
+    assert p.db.one("SELECT COUNT(*) n FROM jev_calls")["n"] == n
+    k = turn(_ThoughtJev(err=JevOutOfFunds("no credits")))
+    assert k["unblock"] == "" and p.db.one("SELECT id FROM messages WHERE ref='jev-funds'"), "out of funds alerts"
+    # A turn the rules already raise, or a check switched off, costs no call.
+    jev = _ThoughtJev(p=0.8)
+    assert turn(jev, "task_blocked")["unblock"] == "task_blocked" and not jev.calls
+    p.set_config("jev.uses.coord_effort", "off")
+    d.cfg = p.config()
+    assert turn(jev)["unblock"] == "" and not jev.calls
+    # Each call is settled with what its turn did: a raised turn that acted was right, one that did
+    # nothing was wrong; a routine turn with rejected actions was wrong.
+    for verdict, actions, problems, right in (("needs_thought", [{"type": "notify"}], [], "right"),
+                                              ("needs_thought", [], [], "wrong"),
+                                              ("routine", [{"type": "task_add"}], ["task_add rejected: x"], "wrong"),
+                                              ("routine", [], [], "right")):
+        cid = jevuse.record(p.db, "coord_effort", {"verdict": verdict}, 0.00005)
+        coordcheck.settle(p.db, cid, verdict, "ok", actions, problems)
+        row = p.db.one("SELECT outcome, note FROM jev_calls WHERE id=?", (cid,))
+        assert row["outcome"] == right and row["note"].startswith("turn ok;"), (verdict, row)
+    cid = jevuse.record(p.db, "coord_effort", {"verdict": "needs_thought"}, 0.00005)
+    usage = SimpleNamespace(structured={"actions": [{"type": "noop_unknown"}]}, final_text="", error="")
+    monkeypatch.setattr("ttp.coordinator.apply", lambda *a, **k: [])
+    d._finish_coordinator({"id": 9, "dir": "x"}, usage, "ok",
+                          {"coord_check": {"jev_call": cid, "verdict": "needs_thought"}})
+    row = p.db.one("SELECT outcome, note FROM jev_calls WHERE id=?", (cid,))
+    assert row["outcome"] == "right" and "noop_unknown" in row["note"]
+    cid = jevuse.record(p.db, "coord_effort", {"verdict": "needs_thought"}, 0.00005)
+    d._finish_coordinator({"id": 10, "dir": "x"}, SimpleNamespace(structured=None, final_text="", error="boom"),
+                          "failed", {"coord_check": {"jev_call": cid, "verdict": "needs_thought"}})
+    row = p.db.one("SELECT outcome, note FROM jev_calls WHERE id=?", (cid,))
+    assert row["outcome"] is None and row["note"] == "turn failed; no actions", "a failed turn is not scored"
+    assert any(x.startswith("coordinator effort check [coord_effort]:") for x in jevuse.lines(p.db, p.config()))
+    assert coord_settable("jev.uses.coord_effort", "off") == "off" and coord_settable("jev.uses.coord_effort", "on") == "on"
+    # A routine call whose turn escalates was wrong; a pinned coordinator.effort is never raised, so no call.
+    cid = jevuse.record(p.db, "coord_effort", {"verdict": "routine"}, 0.00005)
+    usage = SimpleNamespace(structured={"actions": [{"type": "escalate", "why": "harder"}]}, final_text="", error="")
+    d._finish_coordinator({"id": 11, "dir": "x", "effort": "low"}, usage, "ok",
+                          {"events": [991], "coord_check": {"jev_call": cid, "verdict": "routine"}})
+    row = p.db.one("SELECT outcome, note FROM jev_calls WHERE id=?", (cid,))
+    assert p.db.kv("escalate") and row["outcome"] == "wrong" and row["note"].startswith("turn escalated")
+    p.db.x("DELETE FROM kv WHERE key='escalate'")
+    p.set_config("jev.uses.coord_effort", "on")
+    p.set_config("coordinator.effort", "low")
+    d.cfg = p.config()
+    jev = _ThoughtJev(p=0.8)
+    assert turn(jev)["unblock"] == "" and not jev.calls
+
+
+def coord_settable(key, value):
+    from ttp.coordinator import USER_SETTABLE
+    return USER_SETTABLE[key](value)
+
+
 def test_idle_slot_wake_ignores_forgotten_open_asks(env):
     from ttp import budget as bud
     from ttp.daemon import starve_state
