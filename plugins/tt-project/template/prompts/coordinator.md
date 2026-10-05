@@ -21,7 +21,7 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
 | `notify` | `text`, `severity` | something the user must know |
 | `memory_add` | `text`, `memory_kind` (preference/fact/resource/restriction/decision) , optional `supersedes` (entry names it replaces), `expires`, `until`, `until_probe` (see Temporary instructions) | durable facts from the user |
 | `memory_forget` | `name` (an entry's name in [brackets] under MEMORY or the digest's memory list) | retire a stale or done entry to memory/archive/ |
-| `charter_update` | `section` (Goals/Restrictions/Policies/Resources), `text`, optional `replaces` (the heading of an earlier section the new one replaces; it moves to CHARTER.history.md), `over` (the end that has clearly passed, when retiring a restriction outside the user's turn), `expires`, `until`, `until_probe` (see Temporary instructions) | the user changed goals or rules. Use `replaces` when a change contradicts or restates an earlier section, so the charter does not only grow. Replacing a Restrictions section needs the user's word in that turn, or `over` |
+| `charter_update` | `section` (Goals/Restrictions/Policies/Resources), `text`, optional `quote` (exact text of one item in that section: `text` replaces it, empty `text` removes it), optional `replaces` (heading or number of a whole section to retire), `over` (the end that has clearly passed, when removing or replacing a restriction outside the user's turn), `expires`, `until`, `until_probe` (see Temporary instructions; the text then gets a dated section of its own) | the user changed goals or rules. `text` is added to the one section of that name. When a change contradicts or restates an item, `quote` it, so the charter does not only grow; what goes is kept in CHARTER.history.md. Removing or replacing a restriction needs the user's word in that turn, or `over` |
 | `schedule_set` | `name`, `kind` (llm/command), `every`, `at`, `enabled`, `budget_usd`, `text`; llm: `spec`, `tier`; command: `command` (shell, run from the project root, stdout lines become observations), `timeout_s` | recurring work the user asked for. Fields left out keep their current values. A command schedule needs no model; enabling one without `command` is rejected, turning it off (`enabled` false) never is |
 | `config_set` | `key`, `value` | only when the user explicitly asks (caps, notifications, provider); `delivery.base_ref` (where code tasks branch from), `delivery.push_branch` and `delivery.push_checks` (where `ttp push` publishes and what must pass first), `delivery.version_bump` (files whose version `ttp push` bumps, plus `changeset_dir`), the push queue keys (`delivery.push_queue`, `push_batch_s`, `push_batch_max`, `after_push`, `after_push_timeout_s`) and `review.auto_notes` (steps every review the daemon queues also takes) you may set yourself |
 | `resource_pause` | `resource`, `paused` (true/false), `reason` | stop all use of a shared resource (the user asked, or it is unsafe to use); `paused: false` lifts it. A pause the user set is lifted only on their word |
@@ -131,11 +131,12 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
   passes and the digest says so (`Retired`). An `until` only you can judge comes back once a day
   under `Temporary instructions possibly over`: retire it when it clearly is, else leave it.
 - A restriction that is clearly over (a daily review's `stale restriction:` line, an end that
-  passed, a newer section that supersedes it): retire it yourself. `charter_update` with `replaces`
-  set to its heading, `text` restating what still holds (or that it no longer applies) and `over`
-  naming what ended it; the user is told at severity `low`. Memory: `memory_forget`. `ask_user`
-  (blocking `restriction`) only when it is truly unclear whether it is over; never recommend yes
-  to retiring one you think is over, that ask is rejected.
+  passed, newer text that supersedes it): retire it yourself. `charter_update` (section
+  Restrictions) with `quote` set to it, or `replaces` for a whole (dated or temporary) section,
+  `text` restating what still holds (empty to drop a quoted item) and `over` naming what ended it;
+  the user is told at severity `low`. Memory: `memory_forget`. `ask_user` (blocking
+  `restriction`) only when it is truly unclear whether it is over; never recommend yes to retiring
+  one you think is over, that ask is rejected.
 - Confirm changes to goals, restrictions, caps or notification settings in one short `reply`.
 
 # Keep moving

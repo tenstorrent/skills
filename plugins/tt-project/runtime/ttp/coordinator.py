@@ -764,30 +764,32 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 p.forget_memory(str(a.get("name") or ""))
                 memory_budget_check(p)
             elif t == "charter_update":
-                section = (a.get("section") or "Notes").strip().title()
-                text = a["text"].strip() + ends.charter_tail(ends.from_action(a))
-                stamp = time.strftime("%Y-%m-%d") + (f", turn {key}" if key else "")
-                heading = f"## {section} (added {stamp})"
-                n, base = 2, heading[:-1]
-                while not key and _has_line(p.charter_path, heading):
-                    heading, n = f"{base}, {n})", n + 1   # unique, so `replaces` can name one section
-                files, msg = [p.charter_path], f"charter ({section.lower()}): {text[:80]}"
-                if a.get("replaces"):
-                    files.append(p.harness / CHARTER_HISTORY)
+                section = " ".join((a.get("section") or "Notes").lstrip("#").split()) or "Notes"
+                text, quote = (a.get("text") or "").strip(), (a.get("quote") or "").strip()
+                if not (text or quote or a.get("replaces")):
+                    raise ValueError("charter_update: give `text`, or `quote` (with empty text) to remove an item")
+                end = ends.from_action(a)
+                if end and (quote or not text):
+                    raise ValueError("charter_update: an end (`expires`, `until`, `until_probe`) goes with new `text`, "
+                                     "not with `quote`")
+                over = " ".join(str(a.get("over") or "").split())
+                msg = f"charter ({section.lower()}): " + (text[:80] or f"removes {quote[:70]!r}")
                 if key and _has_line(p.charter_path, f", turn {key})"):
-                    pass   # this turn's update is already in: a retried turn must not add it twice
-                elif a.get("replaces"):
-                    over = " ".join(str(a.get("over") or "").split())
-                    name = _charter_replace(p, str(a["replaces"]), heading, text, user_turn, over)
-                    msg += f" (replaces {name})"
-                    if name.lower().startswith("restriction") and not user_turn:
-                        db.post("out", f"Retired the charter restriction \"{name}\": {over}. Still in force: "
-                                       f"{clip(a['text'], 300)}", chat=None, kind="alert", severity="low")
+                    pass   # this turn's update is already in its own dated section: a retry must not add it twice
                 else:
-                    durable_append(p.charter_path, f"\n{heading}\n{text}\n")
-                p.commit_harness(files, msg)
-                if section.startswith("Restriction"):
-                    _tell_running_workers(db, f"New binding restriction: {text}", key)
+                    target, extra, retired = _charter_update(p, section, text, quote, str(a.get("replaces") or ""),
+                                                             key, user_turn, over, end)
+                    msg += extra
+                    if retired:
+                        db.post("out", f"Retired the charter restriction {retired}: {over}."
+                                       + (f" Still in force: {clip(text, 300)}" if text else ""),
+                                chat=None, kind="alert", severity="low")
+                    if target.lower().startswith("restriction"):
+                        if text:
+                            _tell_running_workers(db, f"New binding restriction: {text}", key)
+                        elif quote:
+                            _tell_running_workers(db, f"Binding restriction retired: {quote}", key)
+                p.commit_harness([p.charter_path, p.harness / CHARTER_HISTORY], msg)
             elif t == "schedule_set":
                 sched.before_change(p)
                 old = db.one("SELECT * FROM schedules WHERE name=?", (a.get("name"),))
@@ -1312,8 +1314,9 @@ def _needless_ask(a: dict, text: str) -> str:
     if not _YES_RE.match(rec):
         return ""
     if a.get("blocking") == "restriction" and _RETIRE_RE.search(f"{text} {rec}"):
-        return ("a restriction that is clearly over is retired, not asked about: charter_update with `replaces` "
-                "(its heading), `text` (what still holds) and `over` (the end that passed); the user is told. "
+        return ("a restriction that is clearly over is retired, not asked about: charter_update with `quote` (the "
+                "item) or `replaces` (its section), `text` (what still holds) and `over` (the end that passed); the "
+                "user is told. "
                 "Ask only when it is truly unclear whether it is over, and then do not recommend yes")
     if a.get("blocking") in ("restriction", "irreversible") and _calls_undoable(f"{text} {rec}"):
         return ("you recommend yes to a step you call reversible: a known, safe, reversible fix is yours. Do it "
@@ -1337,37 +1340,186 @@ def _calls_undoable(text: str) -> bool:
     return False
 
 
-def _charter_replace(p: Project, replaces: str, heading: str, text: str, user_turn: bool, over: str = "") -> str:
-    """Move the charter section headed `replaces` to CHARTER_HISTORY and add `heading` + `text` at
-    the end of the charter instead. Returns the replaced section's heading. Outside a user turn a
-    restriction section is replaced only with `over`: the end condition that has clearly passed."""
+_DATED = re.compile(r"\s*\(added [^)]*\)$", re.I)   # legacy "## Policies (added 2026-09-30, turn 4.0)"
+
+
+def _charter_update(p: Project, section: str, text: str, quote: str, replaces: str, key: str | None,
+                    user_turn: bool, over: str = "", end: dict | None = None) -> tuple[str, str, str]:
+    """Apply one charter_update: retire the section `replaces` names, then edit the one section
+    `section` names. With `quote`, the single span of that section matching it is replaced by
+    `text` (or removed when `text` is empty); otherwise `text` is added at the section's end, and
+    the section is created when there is none. Text with an `end` (see ends.from_action) gets a
+    dated section of its own instead, so the daemon retires only it. Whatever is removed or
+    replaced, and every addition, goes to CHARTER_HISTORY, which also marks the turn done for a
+    retried turn. Outside a user turn a restriction is removed or replaced only with `over`: the
+    end condition that has clearly passed. Returns the edited section's name, a note for the
+    commit message and, when `over` retired a restriction, what it retired (else "")."""
     from .prompts import charter_sections
-    want = " ".join(replaces.lstrip("#").split()).lower()
     sections = charter_sections(p.charter_path.read_text())
+    hist = p.harness / CHARTER_HISTORY
+    stamp = time.strftime("%Y-%m-%d") + (f", turn {key}" if key else "")
+    log: list[str] = []
+    # Logged by an earlier try of this turn: write the charter only if that try died before it did.
+    retried = bool(key) and _has_line(hist, f", turn {key})")
+    flat = " ".join(" ".join(line for h, b in sections for line in [h, *b]).split())
+    if retried and (" ".join(text.split()) in flat if text else not _charter_quoted(sections, section, quote)
+                    if quote else not _charter_replaced(sections, replaces, quiet=True)):
+        return section, "", ""
+    extra, retired = "", ""
+    by_word = user_turn or len(over) >= OVER_MIN
+    why = ("needs the user's word, or `over`: the end condition that has clearly passed (what ended it and when). "
+           "If it is truly unclear whether it is over, ask_user (blocking restriction)")
+    if replaces:
+        i = _charter_replaced(sections, replaces)
+        old_head, old_body = sections[i]
+        name = " ".join(old_head[3:].split())
+        if name.lower().startswith("brief"):
+            raise ValueError("charter_update: the Brief is the user's own words and is never replaced")
+        if name.lower().startswith("restriction") and not by_word:
+            raise ValueError(f"charter_update: replacing the restriction section {name!r} {why}")
+        if name.lower().startswith("restriction") and not user_turn:
+            retired = f"section \"{name}\""
+        del sections[i]
+        log.append(f"{old_head}\n(replaced by an update to {section}, {stamp}" + (f"; over: {over}" if over else "")
+                   + ")\n" + "\n".join(old_body).strip("\n"))
+        extra = f" (replaces {name})"
+    names = [" ".join(h[3:].split()) for h, _ in sections]
+    t = _charter_target(names, section, [ends.charter_end(b) for _, b in sections], bool(quote))
+    if (text or quote) and t is not None and names[t].lower().startswith("brief"):
+        raise ValueError("charter_update: the Brief is the user's own words; put the update in another section")
+    if quote:
+        if t is None:
+            raise ValueError(f"charter_update: no charter section {section!r} to remove or replace an item in; "
+                             f"sections: " + "; ".join(n for n in names if n))
+        if names[t].lower().startswith("restriction") and not by_word:
+            raise ValueError(f"charter_update: removing or replacing a restriction {why}")
+        body = "\n".join(sections[t][1])
+        hits = _quote_hits(body, quote)
+        if len(hits) != 1:
+            raise ValueError(f"charter_update: `quote` matches {len(hits)} times in {names[t]!r}; quote the exact "
+                             f"text of one item, long enough to be unique there")
+        s, e = hits[0].span()
+        if names[t].lower().startswith("restriction") and not user_turn:
+            retired = f"\"{clip(' '.join(body[s:e].split()), 200)}\""
+        log.append(f"### {'Replaced in' if text else 'Removed from'} {names[t]} ({stamp})\n{body[s:e]}"
+                   + (f"\nNow: {text}" if text else "") + (f"\nOver: {over}" if over and not user_turn else ""))
+        sections[t] = (sections[t][0], _cut(body, s, e, text).split("\n"))
+    elif text and end:
+        name = _DATED.sub("", section)
+        name = name[:1].upper() + name[1:]
+        heading, n = f"## {name} (added {stamp})", 2
+        while heading[3:] in names:
+            heading, n = f"## {name} (added {stamp}, {n})", n + 1   # unique, so `replaces` can name it
+        sections.append((heading, (text + ends.charter_tail(end)).split("\n")))
+        t, names = len(sections) - 1, names + [heading[3:]]
+        log.append(f"### Added to {names[t]} ({stamp})\n{text}{ends.charter_tail(end)}")
+    elif text:
+        if t is None:
+            name = _DATED.sub("", section)
+            name = name[:1].upper() + name[1:]
+            sections.append((f"## {name}", []))
+            t, names = len(sections) - 1, names + [name]
+        body = _drop_placeholders(sections[t][1])
+        while body and not body[-1].strip():
+            body.pop()
+        bullets = bool(body) and body[-1].lstrip().startswith("- ") and text.startswith("- ")
+        sections[t] = (sections[t][0], body + ([] if bullets or not body else [""]) + text.split("\n"))
+        log.append(f"### Added to {names[t]} ({stamp})\n{text}")
+    if not hist.exists():
+        durable_append(hist, "# Charter history\n\nWhat was added to CHARTER.md, and what was removed or replaced "
+                             "there, oldest first.\n")
+    if not retried:
+        durable_append(hist, "".join(f"\n{entry}\n" for entry in log))
+    out = []
+    for k, (h, b) in enumerate(sections):
+        b = list(b)
+        while b and not b[-1].strip():
+            b.pop()
+        out += ([h] if h else []) + b + ([""] if k < len(sections) - 1 else [])
+    durable_write(p.charter_path, "\n".join(out).rstrip() + "\n")
+    return (names[t] if t is not None else section), extra, retired
+
+
+def _charter_replaced(sections: list[tuple[str, list[str]]], replaces: str, quiet: bool = False) -> int | None:
+    """The index of the one section `replaces` names: its heading, a heading prefix, or its number.
+    None when it names no one section and `quiet`; otherwise that raises."""
+    want = " ".join(replaces.lstrip("#").split()).lower()
     names = [" ".join(h[3:].split()) for h, _ in sections]
     headed = [i for i, n in enumerate(names) if n]
     hits = ([headed[int(want) - 1]] if want.isdigit() and 0 < int(want) <= len(headed) else
             [i for i in headed if names[i].lower() == want]
             or [i for i in headed if names[i].lower().startswith(want)])
+    if len(hits) != 1 and quiet:
+        return None
     if len(hits) != 1:
         raise ValueError(f"charter_update: `replaces` {replaces!r} matches {len(hits)} charter sections; give one "
                          f"heading as the charter shows it, or its number: "
                          + "; ".join(f"{k}. {names[i]}" for k, i in enumerate(headed, 1)))
-    old_head, old_body = sections[hits[0]]
-    name = names[hits[0]]
-    if name.lower().startswith("brief"):
-        raise ValueError("charter_update: the Brief is the user's own words and is never replaced")
-    if name.lower().startswith("restriction") and not user_turn and len(over) < OVER_MIN:
-        raise ValueError(f"charter_update: replacing the restriction section {name!r} needs the user's word, or "
-                         f"`over`: the end condition that has clearly passed (what ended it and when). If it is "
-                         f"truly unclear whether it is over, ask_user (blocking restriction)")
-    note = f"(replaced {time.strftime('%Y-%m-%d')} by \"{heading[3:]}\"" + (f"; over: {over}" if over else "") + ")"
-    hist = p.harness / CHARTER_HISTORY
-    if not (", turn " in heading and hist.exists() and f"by \"{heading[3:]}\"" in hist.read_text()):
-        ends.move_to_history(p, old_head, old_body, note)   # a retried turn moves it once
-    kept = "\n".join(line for i, (h, b) in enumerate(sections) if i != hits[0] for line in ([h] if h else []) + b)
-    durable_write(p.charter_path, f"{kept.rstrip()}\n\n{heading}\n{text}\n")
-    return name
+    return hits[0]
+
+
+def _charter_target(names: list[str], section: str, ends_of: list[dict] | None = None,
+                    quoting: bool = False) -> int | None:
+    """The one section an update to `section` goes to: the heading itself; else the section whose
+    heading is `section` plus a parenthesised note or more words ("Restrictions (binding ...)",
+    "Goals and success criteria"), preferring one that is not a legacy "(added ...)" section.
+    A temporary section (one whose body ends in an end, see ends.charter_end) takes no additions:
+    its end would retire them with it. Only `quoting` edits one."""
+    want = section.lower()
+    if ends_of is not None and not quoting:
+        names = [n if not ends_of[i] else "" for i, n in enumerate(names)]
+    exact = [i for i, n in enumerate(names) if n and n.lower() == want]
+    if exact:
+        return exact[0]
+    base = _DATED.sub("", want)
+    hits = [i for i, n in enumerate(names) if n and (re.sub(r"\s*\([^)]*\)$", "", n).lower() == base
+                                                    or n.lower().startswith(base + " "))]
+    undated = [i for i in hits if not _DATED.search(names[i])]
+    return (undated or hits or [None])[0]
+
+
+def _charter_quoted(sections: list[tuple[str, list[str]]], section: str, quote: str) -> bool:
+    """Whether `quote` still matches exactly once in the section an update to `section` edits."""
+    t = _charter_target([" ".join(h[3:].split()) for h, _ in sections], section)
+    return bool(quote) and t is not None and len(_quote_hits("\n".join(sections[t][1]), quote)) == 1
+
+
+def _quote_hits(body: str, quote: str) -> list[re.Match]:
+    """Where `quote` occurs in `body`, line breaks and runs of spaces counting as one space."""
+    return list(re.finditer(r"\s+".join(map(re.escape, quote.split())), body)) if quote.split() else []
+
+
+def _cut(body: str, s: int, e: int, text: str) -> str:
+    """`body` with body[s:e] replaced by `text`. A removal that empties its lines (a bullet
+    marker aside) takes the lines with it; one inside a line keeps a single space."""
+    if text:
+        return body[:s] + text + body[e:]
+    ls, le = body.rfind("\n", 0, s) + 1, body.find("\n", e)
+    le = len(body) if le < 0 else le
+    head, tail = body[ls:s], body[e:le]
+    if re.fullmatch(r"\s*(?:[-*+]|\d+[.)])?\s*", head) and not tail.strip():
+        out = body[:ls] + body[le + 1:]
+    else:
+        mid = head + tail.lstrip() if not head.strip() else head.rstrip() + (" " if tail.strip() else "") + tail.lstrip()
+        out = body[:ls] + mid + body[le:]
+    return re.sub(r"\n\s*\n(\s*\n)+", "\n\n", out)
+
+
+def _drop_placeholders(lines: list[str]) -> list[str]:
+    """`lines` without the whole paragraphs the template left to be filled in ("(none stated yet)"):
+    a real entry replaces them."""
+    from .prompts import _placeholder
+    out, par = [], []
+    for line in [*lines, ""]:
+        if line.strip():
+            par.append(line)
+            continue
+        s = " ".join(" ".join(par).split())
+        if not (s.startswith("(") and _placeholder(s)):
+            out += par
+        out.append(line)
+        par = []
+    return out[:-1]
 
 
 def _has_line(path: Path, ending: str) -> bool:

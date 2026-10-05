@@ -15,12 +15,12 @@ Assess the last day of this project, then hand off.
    `start_when` (a read-only shell probe from the project root: exit 0 = start, 1 = not yet,
    under a minute), and a spec that names the entry it replaces. The coordinator adds it as a
    deferred task and retires the entry in the same turn, so the deferral is never lost.
-7. Charter: read `tt-project/harness/CHARTER.md`. List each Restrictions section that a newer
-   section on the same subject contradicts, quoting both headings, in the summary as
-   `stale restriction: "<old heading>" (contradicted by "<newer heading>")`, and each section
-   whose own end (`Expires:`, `Until:`) has clearly passed as `stale restriction: "<heading>"
-   (over: <what ended it>)`. Do not edit the charter: the coordinator retires them with
-   `charter_update` `replaces`.
+7. Charter: read `tt-project/harness/CHARTER.md`. List each restriction that newer charter text on
+   the same subject contradicts, quoting both exactly, in the summary as
+   `stale restriction: "<old text>" (contradicted by "<newer text>")`, and each section whose own
+   end (`Expires:`, `Until:`) has clearly passed as `stale restriction: "<heading>" (over: <what
+   ended it>)`. Do not edit the charter: the coordinator retires them with `charter_update`
+   `quote` or `replaces`.
 
 `result.json` → `followups`: at most 5 concrete tasks, each worth its cost, plus the deferrals
 from step 6 (`{"title", "spec", "start_after", "start_when"}`). Use titles starting

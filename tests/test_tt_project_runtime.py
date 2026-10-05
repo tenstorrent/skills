@@ -2325,7 +2325,8 @@ def test_charter_update_replaces_moves_the_old_section_to_history(env):
     assert charter.rstrip().endswith("Push once a week.") and "Ship v1." in charter and "Never touch box A." in charter
     old = hist.read_text()
     assert old.count("## Policies (added 2026-09-01)\n") == 1 and "Push every day." in old
-    assert ', turn 7.0)")' in old, "the history does not say what replaced it"
+    assert "(replaced by an update to Policies, " in old and old.count(", turn 7.0)\n") == 2, \
+        "the history does not say what replaced it"
     log = subprocess.run(["git", "-C", str(p.harness), "status", "--porcelain"], capture_output=True, text=True).stdout
     assert "CHARTER" not in log, "the charter change is not committed"
     # Restrictions retire only on the user's word; the Brief and unknown headings never.
@@ -2340,32 +2341,123 @@ def test_charter_update_replaces_moves_the_old_section_to_history(env):
     assert p.charter_path.read_text().count("Box A is free to use.") == 1, "a rejected update was written"
 
 
-def test_charter_update_headings_stay_unique_and_replaces_takes_a_section_number(env):
+def test_charter_update_merges_into_the_one_existing_section(env):
     p = make(env)
     from ttp import coordinator as coord
-    p.charter_path.write_text("# demo\n\n## Brief (verbatim from the user)\nKeep it tidy.\n")
-    day = time.strftime("%Y-%m-%d")
-    for text in ("Push daily.", "Review first.", "Draft PRs only."):   # no turn key: same date, same section
-        assert coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": text}]) == []
-    heads = [line for line in p.charter_path.read_text().splitlines() if line.startswith("## Policies")]
-    assert heads == [f"## Policies (added {day})", f"## Policies (added {day}, 2)", f"## Policies (added {day}, 3)"]
-    # Each heading names exactly one section now.
-    act = {"type": "charter_update", "section": "Policies", "text": "Review by a second task.",
-           "replaces": f"Policies (added {day}, 2)"}
-    assert coord.apply(p, [act], turn=5) == []
+    for k, text in enumerate(("Push daily.", "Review first.", "Never merge.")):
+        assert coord.apply(p, [{"type": "charter_update", "section": "Policies" if k < 2 else "Restrictions",
+                                "text": text}], turn=k + 1) == []
+    assert coord.apply(p, [{"type": "charter_update", "section": "Notes", "text": "Board 2 is slow."}], turn=4) == []
     charter = p.charter_path.read_text()
-    assert "Review first." not in charter and "Push daily." in charter and "Draft PRs only." in charter
-    # A heading that matches several sections is refused with numbered choices; a number picks one.
-    act = {"type": "charter_update", "section": "Policies", "text": "Push weekly.", "replaces": "Policies"}
-    err = coord.apply(p, [act], turn=6)[0]
-    assert "matches 3" in err and "or its number" in err and f"2. Policies (added {day})" in err
-    assert "1. Brief" in err, "numbers skip the text above the first heading"
-    assert coord.apply(p, [{**act, "replaces": "2"}], turn=7) == []
+    heads = [line for line in charter.splitlines() if line.startswith("## ")]
+    assert heads == ["## Brief (verbatim from the user)", "## Goals and success criteria",
+                     "## Restrictions (binding on every task)", "## Policies", "## Resources", "## Notes"], heads
+    policies = charter.split("## Policies\n", 1)[1].split("\n## ", 1)[0]
+    assert policies.rstrip().endswith("never hold a node idle or touch another user's allocation.\n\nPush daily."
+                                      "\n\nReview first."), policies
+    restrictions = charter.split("## Restrictions (binding on every task)\n", 1)[1].split("\n## ", 1)[0]
+    assert restrictions.strip() == "Never merge.", "the template placeholder stayed next to a real restriction"
+    assert charter.rstrip().endswith("## Notes\nBoard 2 is slow.")
+    hist = (p.harness / coord.CHARTER_HISTORY).read_text()
+    assert "### Added to Policies (" in hist and "turn 2.0)\nReview first." in hist
+    # A retried turn adds nothing twice.
+    assert coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": "Review first."}], turn=2) == []
+    assert p.charter_path.read_text() == charter
+
+
+def test_charter_update_base_heading_goes_to_one_of_several_legacy_dated_sections(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    legacy = ("# demo\n\n## Brief (verbatim from the user)\nKeep it tidy.\n\n"
+              "## Policies (added 2026-09-01)\nPush daily.\n\n"
+              "## Policies (added 2026-09-02, turn 4.0)\nReview first.\n\n"
+              "## Goals (added 2026-09-03)\nShip v1.\n")
+    p.charter_path.write_text(legacy)
+    assert coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": "Draft PRs only."}],
+                       turn=5) == []
     charter = p.charter_path.read_text()
-    assert "Push daily." not in charter and "Push weekly." in charter and "Draft PRs only." in charter
+    assert "## Policies (added 2026-09-01)\nPush daily.\n\nDraft PRs only.\n\n## Policies (added" in charter
+    assert charter.count("## ") == 4, "a new section was added"
+    # An undated base section wins over the dated ones; a full dated heading still picks its own.
+    p.charter_path.write_text(legacy + "\n## Policies\nBe kind.\n")
+    assert coord.apply(p, [{"type": "charter_update", "section": "policies", "text": "Be brief."}], turn=6) == []
+    assert p.charter_path.read_text().rstrip().endswith("## Policies\nBe kind.\n\nBe brief.")
+    assert coord.apply(p, [{"type": "charter_update", "section": "Policies (added 2026-09-02, turn 4.0)",
+                            "text": "Review twice."}], turn=7) == []
+    assert "Review first.\n\nReview twice.\n\n## Goals" in p.charter_path.read_text()
+    # `replaces` still names one whole section, by heading or number, and refuses an ambiguous one.
+    err = coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": "x",
+                            "replaces": "Policies (added"}], turn=8)[0]
+    assert "matches 2" in err and "or its number" in err and "1. Brief" in err
+    assert coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": "Push weekly.",
+                            "replaces": "2"}], turn=9) == []
+    charter = p.charter_path.read_text()
+    assert "Push daily." not in charter and "Draft PRs only." not in charter
+    assert charter.rstrip().endswith("Be kind.\n\nBe brief.\n\nPush weekly."), "it did not merge into Policies"
     assert "Push daily." in (p.harness / coord.CHARTER_HISTORY).read_text()
-    assert "never replaced" in coord.apply(p, [{**act, "replaces": "1"}], turn=8)[0]
-    assert "matches 0" in coord.apply(p, [{**act, "replaces": "9"}], turn=9)[0]
+    assert "never replaced" in coord.apply(p, [{"type": "charter_update", "text": "x", "replaces": "1"}], turn=10)[0]
+    assert "matches 0" in coord.apply(p, [{"type": "charter_update", "text": "x", "replaces": "9"}], turn=11)[0]
+
+
+def test_charter_update_quote_removes_or_replaces_one_item(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    p.charter_path.write_text("# demo\n\n## Brief (verbatim from the user)\nKeep it tidy.\n\n"
+                              "## Policies\n- Push daily.\n- Review first, then push.\n- Draft PRs.\n\n"
+                              "Notify only for decisions. Label every number.\n\n"
+                              "## Restrictions\nNever touch box A.\nNever merge.\n\n## Goals\nShip v1.\n")
+    hist = p.harness / coord.CHARTER_HISTORY
+    act = {"type": "charter_update", "section": "Policies", "quote": "Review first,\n  then push."}
+    for _ in range(2):   # line breaks in the quote count as spaces; a retried turn removes it once
+        assert coord.apply(p, [act], turn=1) == []
+    charter = p.charter_path.read_text()
+    assert "## Policies\n- Push daily.\n- Draft PRs.\n\nNotify only" in charter, charter
+    assert hist.read_text().count("Review first, then push.") == 1
+    assert "### Removed from Policies (" in hist.read_text() and ", turn 1.0)\nReview first, then push." in hist.read_text()
+    # One sentence inside a paragraph goes and the paragraph stays whole.
+    assert coord.apply(p, [{**act, "quote": "Notify only for decisions."}], turn=2) == []
+    assert "\n\nLabel every number.\n\n## Restrictions" in p.charter_path.read_text()
+    # Replace in place.
+    assert coord.apply(p, [{**act, "quote": "Push daily.", "text": "Push weekly."}], turn=3) == []
+    assert "## Policies\n- Push weekly.\n- Draft PRs." in p.charter_path.read_text()
+    assert "### Replaced in Policies (" in hist.read_text() and "Push daily.\nNow: Push weekly." in hist.read_text()
+    assert coord.apply(p, [{**act, "quote": "Push weekly.", "text": "Push weekly. Tag it."}], turn=4) == []
+    assert coord.apply(p, [{**act, "quote": "Push weekly.", "text": "Push weekly. Tag it."}], turn=4) == []
+    assert p.charter_path.read_text().count("Tag it.") == 1, "a retried replace was applied twice"
+    # Not found, or ambiguous: rejected and nothing changes.
+    before = p.charter_path.read_text()
+    assert "matches 0 times" in coord.apply(p, [{**act, "quote": "Ship v1."}], turn=5)[0]
+    err = coord.apply(p, [{**act, "quote": "e"}], turn=6)[0]
+    assert "`quote` matches" in err and "matches 0" not in err and "matches 1 " not in err
+    assert "no charter section" in coord.apply(p, [{**act, "section": "Resources", "quote": "x"}], turn=7)[0]
+    assert "Brief" in coord.apply(p, [{**act, "section": "Brief", "quote": "Keep it tidy."}], turn=8)[0]
+    assert p.charter_path.read_text() == before
+
+
+def test_charter_update_restriction_items_change_only_on_the_users_word(env, tmp_path):
+    p = make(env)
+    from ttp import coordinator as coord
+    p.charter_path.write_text("# demo\n\n## Restrictions (binding on every task)\nNever touch box A.\n"
+                              "Never merge.\n\n## Goals\nShip v1.\n")
+    run_dir = tmp_path / "live"
+    run_dir.mkdir()
+    tid = p.db.add_task("long job", "s", kind="work", tier="light", origin="user")
+    p.db.x("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(?,?,?,?,?,?)",
+           (tid, "worker", "fake", time.time(), "running", str(run_dir)))
+    hist = p.harness / coord.CHARTER_HISTORY
+    drop = {"type": "charter_update", "section": "Restrictions", "quote": "Never touch box A."}
+    for act in (drop, {**drop, "text": "Never touch box B."}):
+        assert "needs the user's word" in coord.apply(p, [act], turn=1)[0]
+    assert "Never touch box A." in p.charter_path.read_text() and not hist.exists()
+    # Adding one needs no such word.
+    assert coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "text": "Never push."}],
+                       turn=2) == []
+    assert coord.apply(p, [drop], turn=3, user_turn=True) == []
+    charter = p.charter_path.read_text()
+    assert "Never touch box A." not in charter and "Never merge.\n\nNever push." in charter
+    assert "### Removed from Restrictions (binding on every task) (" in hist.read_text()
+    assert "turn 3.0)\nNever touch box A." in hist.read_text()
+    assert "Binding restriction retired: Never touch box A." in (run_dir / "steer.md").read_text()
 
 
 def test_temporary_memory_retires_itself_at_expiry_and_the_digest_says_so(env):
