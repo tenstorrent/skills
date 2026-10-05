@@ -4254,6 +4254,39 @@ def test_a_merged_runtime_that_does_not_import_is_not_applied(env, monkeypatch):
     assert "compileall" in p.db.one("SELECT spec FROM tasks WHERE kind='harness'")["spec"]
 
 
+def _imports(runtime):
+    return subprocess.run([sys.executable, "-c", "import ttp.daemon, ttp.cli"], capture_output=True, text=True,
+                          env={**os.environ, "PYTHONPATH": str(runtime)}, timeout=120)
+
+
+@pytest.mark.parametrize("committed", [True, False])
+def test_upgrade_restores_runtime_files_a_crash_left_empty(env, monkeypatch, committed):
+    """A reboot right after an upgrade left the files it wrote empty; the next upgrade committed them as
+    "local changes" and the merge kept them: version 'unknown', `cannot import name 'poll_s' from 'ttp'`."""
+    p = make(env)
+    from ttp import cli, service
+    monkeypatch.setattr(service, "restart", lambda p: "restarted")
+    synced = []
+    monkeypatch.setattr(os, "sync", lambda: synced.append(1))
+    h = p.harness
+    _install_template(env)
+    cli.main(["upgrade", "demo"])
+    cut = ["runtime/ttp/__init__.py", "runtime/ttp/push.py"]
+    for f in cut:
+        (h / f).write_text("")
+    if committed:
+        _git_out(h, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "local harness changes")
+    assert cli._runtime_version(h / "runtime") == "unknown" and "poll_s" in _imports(h / "runtime").stderr
+    synced.clear()
+    cli.main(["upgrade", "demo"])
+    assert "def poll_s" in (h / "runtime" / "ttp" / "__init__.py").read_text()
+    assert (h / "runtime" / "ttp" / "push.py").read_text().strip()
+    assert _imports(h / "runtime").returncode == 0 and not _git_out(h, "status", "--porcelain")
+    assert not p.db.one("SELECT * FROM tasks WHERE kind='harness'") and synced
+    # An uncommitted cut is put back, never recorded as a local edit.
+    assert committed or "local harness changes" not in _git_out(h, "log", "--format=%s", "-3")
+
+
 def test_restart_rolls_back_a_runtime_the_daemon_cannot_start_with(env):
     import py_compile
     p = make(env)

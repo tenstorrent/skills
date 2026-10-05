@@ -1455,6 +1455,10 @@ def _upgrade(p: Project, auto: bool = False) -> None:
     else:
         print(f"installed template: ttp {new_v} ({new_c})")
     ident = ["-c", "user.name=tt-project", "-c", "user.email=tt-project@localhost"]
+    emptied = _emptied(h, None, "HEAD")
+    if emptied:      # a crash cut these short: they are damage, not local edits to commit and keep
+        _git(h, "checkout", "HEAD", "--", *emptied)
+        print("restored files a crash left empty: " + ", ".join(emptied))
     if _git(h, "status", "--porcelain"):
         _git(h, "add", "-A")
         _git(h, *ident, "commit", "-q", "-m", "local harness changes before template upgrade")
@@ -1493,6 +1497,8 @@ def _upgrade(p: Project, auto: bool = False) -> None:
         if r.returncode != 0:
             subprocess.run(["git", "-C", str(h), "merge", "--abort"], capture_output=True)
             die(f"could not apply the checked upgrade to {h}: {r.stdout[-500:]}", 1)
+    if hasattr(os, "sync"):
+        os.sync()       # a reboot right after must not leave the files git just wrote empty
     print("harness up to date with the installed template; restarting the daemon")
     from . import service
     print(service.restart(p))
@@ -1529,6 +1535,24 @@ def _ensure_git_ident(h: Path) -> None:
             return
 
 
+def _emptied(h: Path, have: str | None, ref: str) -> list[str]:
+    """Template files (runtime, prompts, bin) that `have` (a commit, or None for the files on disk)
+    holds empty while `ref` has them with content. A crash or reboot right after a write leaves
+    exactly this, and the merge would then keep the empty file as if it were a local edit."""
+    def sizes(rev: str) -> dict[str, int]:
+        out = {}
+        for entry in _git(h, "ls-tree", "-r", "-l", "-z", rev, "--", "runtime", "prompts", "bin").split("\0"):
+            meta, _, path = entry.partition("\t")
+            if path and meta.split()[-1].isdigit():
+                out[path] = int(meta.split()[-1])
+        return out
+    full = {f for f, n in sizes(ref).items() if n}
+    if have is None:
+        return sorted(f for f in full if (h / f).is_file() and not (h / f).is_symlink()
+                      and (h / f).stat().st_size == 0)
+    return sorted(f for f, n in sizes(have).items() if n == 0 and f in full)
+
+
 def _merge_upstream(h: Path, tmp: Path, ident: list[str]) -> tuple[str, str]:
     """Merge `upstream` into a scratch worktree of main and check the result compiles and imports.
     Returns (merge commit, "") or ("", what went wrong); the live harness is never touched here."""
@@ -1545,6 +1569,10 @@ def _merge_upstream(h: Path, tmp: Path, ident: list[str]) -> tuple[str, str]:
                                    capture_output=True, text=True).stdout.split()
             return "", ("the merge conflicts in " + ", ".join(files) if files else
                         "the merge failed: " + (r.stderr or r.stdout).strip()[-400:])
+        emptied = _emptied(tmp, "HEAD", "upstream")
+        if emptied:     # committed as "local changes" after a crash emptied them; nobody empties these on purpose
+            _git(tmp, "checkout", "upstream", "--", *emptied)
+            _git(tmp, *ident, "commit", "-q", "-m", "restore template files a crash left empty: " + ", ".join(emptied))
         env = {**os.environ, "PYTHONPATH": str(tmp / "runtime")}
         for check in ([sys.executable, "-m", "compileall", "-q", "runtime"],
                       [sys.executable, "-c", "import ttp.daemon, ttp.cli"]):
