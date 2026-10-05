@@ -550,7 +550,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
     # For the stale-restriction check (_restriction_conflicts): the restrictions before this turn's
     # first charter_update, the text it added, and whether it edited a restriction in place.
     restr_before: str | None = None
-    added: list[tuple[str, str]] = []
+    rules_added: list[tuple[str, str]] = []
     restr_edited = False
     replies: list[int] = []
     # config_set goes first so a cap raised in this turn counts for this turn's task_add actions.
@@ -811,7 +811,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                             or extra.lower().startswith(" (replaces restriction")):
                         restr_edited = True
                     elif text and not quote:
-                        added.append((target, text))
+                        rules_added.append((target, text))
                     if retired:
                         db.post("out", f"Retired the charter restriction {retired}: {over}."
                                        + (f" Still in force: {clip(text, 300)}" if text else ""),
@@ -884,8 +884,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 raise ValueError(f"unknown action {t!r}")
         except Exception as e:   # one bad action is reported back; it never aborts the turn
             problems.append(f"{t}: {e}")
-    if user_turn and added and not restr_edited and restr_before:
-        _restriction_conflicts(p, restr_before, added)
+    if user_turn and rules_added and not restr_edited and restr_before:
+        _restriction_conflicts(p, restr_before, rules_added)
     db.set_kv(NOTES_KEY, notes)
     if problems and replies:
         # The reply may say the work is under way; the user must not read that when it is not.
