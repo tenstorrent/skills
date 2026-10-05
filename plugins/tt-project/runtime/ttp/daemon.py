@@ -53,7 +53,7 @@ from .project import DEFAULT_CONFIG, Project, deep_merge, disk_resume_gb, durabl
 from .providers import get_provider
 from .providers.base import last_json_object, scratch_dir, service_path
 from .providers.claude import as_windows
-from .providers.jev import Jev, JevOutOfFunds
+from .providers.jev import Jev
 
 TICK_S = 3.0
 LEASE_STALE_S = 180
@@ -1704,12 +1704,10 @@ class Daemon:
         if not text.strip():
             return
         again = {"rewake_after_s": rewake_after_s, "repeat": repeat}
-        try:
-            v = scr.screen(self.p.db, self.cfg, source, text, hint, jev=self.jev, **again)
-        except JevOutOfFunds:
+        v = scr.screen(self.p.db, self.cfg, source, text, hint, jev=self.jev, **again)
+        if v.jev_out_of_funds:
             self.alert("jev-funds", "The Jev account is out of credits. Screening falls back to rules "
                        "(more model calls, same coverage). Top up the Jev account to restore the savings.", "high")
-            v = scr.screen(self.p.db, self.cfg, source, text, hint, jev=None, **again)
         if v.wake:
             self.p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
                         (time.time(), source, "observation", v.fingerprint, v.severity, text[:4000], "queued"))

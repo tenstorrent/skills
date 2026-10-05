@@ -65,6 +65,7 @@ class Verdict:
     fingerprint: str
     issue_id: int
     screen: str = "rules"   # rules | jev | dedupe
+    jev_out_of_funds: bool = False   # Jev refused for lack of credits; the rules decided instead
 
 
 def screen(db: DB, cfg: dict, source: str, text: str, hint: str | None = None, jev=None,
@@ -96,8 +97,10 @@ def _screen(db: DB, cfg: dict, source: str, text: str, hint: str | None, jev,
     conditions = watcher_conditions(source, text)
     if conditions is None:
         title = text.strip().splitlines()[0][:160] if text.strip() else source
-        return _issue(db, fingerprint(source, text), source, title, None, hint, judge, floor, now,
-                      rewake_after_s, repeat)
+        v = _issue(db, fingerprint(source, text), source, title, None, hint, judge, floor, now,
+                   rewake_after_s, repeat)
+        v.jev_out_of_funds = any(j[3].get("jev_out_of_funds") for j in judged)
+        return v
     verdicts = []
     for subject, cond, cleared in conditions:
         fp = condition_fingerprint(source, subject, cond)
@@ -109,6 +112,7 @@ def _screen(db: DB, cfg: dict, source: str, text: str, hint: str | None, jev,
     found = [v for v in verdicts if v.issue_id]
     best = next((v for v in verdicts if v.wake), None) or (found or verdicts)[0]
     best.severity = max((v.severity for v in found), key=lambda x: SEVERITY_RANK.get(x, 1), default=best.severity)
+    best.jev_out_of_funds = any(j[3].get("jev_out_of_funds") for j in judged)
     return best
 
 
@@ -197,8 +201,10 @@ def _judge(db: DB, cfg: dict, source: str, text: str, hint: str | None, jev,
                     db, JEV_USE, decision, getattr(jev, "last_cost", 0.0),
                     avoided_usd=jevuse.mean_turn_cost(db, cfg) if skipped else 0.0,
                     settle_s=JEV_SETTLE_S if skipped else None)}
-        except JevOutOfFunds:   # the daemon alerts on it and screens again by rules alone
-            raise
+        except JevOutOfFunds:
+            # The rules decide in this same pass: screening again would count earlier items twice.
+            reason += " (jev out of funds)"
+            info = {"jev_out_of_funds": True}
         except Exception as e:  # screening must never take the daemon down
             reason += f" (jev unavailable: {type(e).__name__})"
     return severity, verdict_src, reason, info

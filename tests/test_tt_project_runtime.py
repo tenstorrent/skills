@@ -978,6 +978,34 @@ def test_watcher_conditions_keep_one_issue_each_and_close_when_cleared(env):
     assert not p.db.q("SELECT id FROM alerts") and not p.db.q("SELECT id FROM messages WHERE direction='out'")
 
 
+def test_jev_out_of_funds_mid_line_falls_back_to_rules_in_one_pass_and_alerts(env):
+    p = make(env)
+    from ttp import daemon as dm
+    from ttp.providers.jev import JevOutOfFunds
+
+    class Broke(_FakeJev):
+        def decide(self, state, questions, purpose="decide"):
+            self.calls += 1
+            raise JevOutOfFunds("no credits")
+
+    d = dm.Daemon(p.base)
+    d.cfg = p.config()
+    d.jev = None
+    d.observe("watcher:hw", "box-a: now link failed")
+    d.observe("watcher:hw", "box-a: cleared: link failed")
+    p.db.x("DELETE FROM events")
+    d.jev = Broke(0.9, 2.0)
+    # The fixed condition is reopened first; the new one then needs Jev, which is out of credits.
+    d.observe("watcher:hw", "box-a: now link failed; fan noise")
+    assert d.jev.calls == 1
+    assert p.db.one("SELECT COUNT(*) AS n FROM events WHERE kind='observation'")["n"] == 1
+    link = p.db.one("SELECT count, status FROM issues WHERE title LIKE '%link failed%'")
+    assert link["count"] == 2 and link["status"] == "open"
+    fan = p.db.one("SELECT count, screen FROM issues WHERE title LIKE '%fan noise%'")
+    assert fan["count"] == 1 and json.loads(fan["screen"])["by"] == "rules"
+    assert len(p.db.q("SELECT id FROM messages WHERE direction='out' AND ref='jev-funds'")) == 1
+
+
 def test_watcher_issues_close_when_quiet_for_a_day_or_after_a_clean_run(env, monkeypatch):
     p = make(env)
     from ttp import daemon as dm
