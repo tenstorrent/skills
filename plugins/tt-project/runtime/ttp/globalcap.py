@@ -14,9 +14,10 @@ The global total for a provider counts, for this day:
   database read-only, plus running work as last priced;
 - other machines: the hosts of the registry's projects on other machines, and machines-list entries
   tagged `tt-project`, reached by ssh (BatchMode, as `ttp` already reaches them) running
-  `ttp spend-today` there, which sums only that machine's own projects. Each machine's answer is
-  cached in ~/.tt-project/global-spend.json with when it was read. A machine that cannot be reached
-  keeps its last answer for the same day, which still counts and is shown as stale;
+  `ttp spend-today` there, which sums only that machine's own projects. Each machine's answers are
+  cached in ~/.tt-project/global-spend.json, one per window (projects on one machine may count
+  different days), with when each was read. A machine that cannot be reached keeps its last answer
+  for the same day, which still counts and is shown as stale;
 - other spend sources registered with `add_other_source` (a hook for spend outside tt-project, e.g.
   the user's own sessions; localspend adds this machine's other Claude Code sessions).
 
@@ -268,14 +269,34 @@ def fetch(target: str, start: float, end: float) -> dict:
     return data
 
 
-def _due(m: dict, start: float, now: float) -> bool:
-    """Whether to ask a machine whose last try is `m`: REFRESH_S after that try, or at once when it
-    answered for an earlier window. A failed try holds it off by its time alone, so a machine that
-    is down is asked once per REFRESH_S, not on every daemon tick. A try stamped after `now` (the
-    clock went back) holds nothing off."""
-    if not 0 <= now - float(m.get("tried") or 0) < REFRESH_S:
-        return True
-    return bool(m.get("ok")) and m.get("start") != start
+def _key(start: float, end: float) -> str:
+    """The cache key of a window's answer. All rolling windows share one: their start moves every
+    REFRESH_S and an answer counts by its age alone. A budget day is keyed by its start. A rolling
+    window spans two days (window()), a budget day at most 25 h."""
+    return "rolling" if end - start > 1.5 * DAY else f"{start:.0f}"
+
+
+def _windows(m: dict) -> dict:
+    """A machine's answers by window key; a cache entry from before they were kept per window holds
+    one answer at its top level."""
+    if isinstance(m.get("windows"), dict):
+        return m["windows"]
+    if m.get("rows") is not None and m.get("start") is not None and m.get("end") is not None:
+        return {_key(float(m["start"]), float(m["end"])): {k: m[k] for k in ("ts", "start", "end", "rows", "projects")
+                                                           if k in m}}
+    return {}
+
+
+def _due(m: dict, start: float, end: float, now: float) -> bool:
+    """Whether to ask a machine whose cache entry is `m` about [start, end): REFRESH_S after its
+    answer for that window, or at once when it has none. A failed last try holds every window off by
+    its time alone, so a machine that is down is asked once per REFRESH_S, not on every daemon tick.
+    Answers are kept per window, so projects on this machine that count different days do not make
+    each other ask again. A time stamped after `now` (the clock went back) holds nothing off."""
+    if not m.get("ok") and 0 <= now - float(m.get("tried") or 0) < REFRESH_S:
+        return False
+    w = _windows(m).get(_key(start, end)) or {}
+    return not 0 <= now - float(w.get("ts") or 0) < REFRESH_S
 
 
 def refresh(start: float, end: float, now: float | None = None, force: bool = False) -> dict:
@@ -292,15 +313,19 @@ def refresh(start: float, end: float, now: float | None = None, force: bool = Fa
         machines = cache.setdefault("machines", {})
         for t in targets():
             m = machines.get(t) or {}
-            if not force and not _due(m, start, now):
+            wins = {k: w for k, w in _windows(m).items() if float(w.get("end") or 0) > now}   # past days go
+            base = {k: m[k] for k in ("host", "tried", "ts", "ok", "error") if k in m}
+            machines[t] = {**base, "windows": wins}
+            if not force and not _due(m, start, end, now):
                 continue
             try:
                 got = fetch(t, start, end)
             except Exception as e:
-                machines[t] = {**m, "tried": now, "ok": False, "error": str(e)[:200]}
+                machines[t].update(tried=now, ok=False, error=str(e)[:200])
                 continue
-            machines[t] = {"tried": now, "ts": now, "ok": True, "host": got.get("host") or t, "start": start,
-                           "end": end, "rows": got["rows"], "projects": got.get("projects") or []}
+            wins[_key(start, end)] = {"ts": now, "start": start, "end": end, "rows": got["rows"],
+                                      "projects": got.get("projects") or []}
+            machines[t] = {"host": got.get("host") or t, "tried": now, "ts": now, "ok": True, "windows": wins}
         for gone in set(machines) - set(targets()):
             del machines[gone]
         project.write_json(cache_path(), cache, mode=0o600)
@@ -321,18 +346,18 @@ def refresh_async(budget: dict, now: float | None = None) -> None:
         return
     start, end, _ = window(budget, now)
     cache = (load_cache().get("machines") or {})
-    if not any(_due(cache.get(x) or {}, start, now) for x in targets()):
+    if not any(_due(cache.get(x) or {}, start, end, now) for x in targets()):
         return
-    t = threading.Thread(target=lambda: _refresh_quietly(start, end), daemon=True)
+    t = threading.Thread(target=lambda: _refresh_quietly(start, end, now), daemon=True)
     _THREAD["t"] = t
     t.start()
 
 
-def _refresh_quietly(start: float, end: float) -> None:
+def _refresh_quietly(start: float, end: float, now: float) -> None:
     """refresh() in the background. When it fails (say the disk is full and the cache cannot be
     saved), its tries may be on record nowhere: this process waits REFRESH_S before the next."""
     try:
-        refresh(start, end)
+        refresh(start, end, now)
     except Exception:
         _FAILED["at"] = time.time()
 
@@ -344,7 +369,8 @@ def total(db, provider: str, start: float, end: float, now: float | None = None,
     machine's other projects, the other machines (cached, stale ones counted) and other sources.
     For a budget day a machine's answer counts when it is for the same day, however old. For the
     rolling 24 h (`rolling`) it counts while it was read within STALE_S, even if the last try failed;
-    an older one covers another window and is only named stale.
+    an older one covers another window and is only named stale. A machine is stale when its last try
+    failed or its answer for this window is missing or older than STALE_S.
     `usd` is the total; `stale` names the machines whose number is stale; `includes` says what it
     counts, in words."""
     now = now or time.time()
@@ -359,16 +385,15 @@ def total(db, provider: str, start: float, end: float, now: float | None = None,
     cache = load_cache().get("machines") or {}
     for t in targets():
         m = cache.get(t) or {}
-        fresh = bool(m.get("ok")) and now - float(m.get("ts") or 0) <= STALE_S
+        w = _windows(m).get(_key(start, end)) or {}
+        age = now - float(w.get("ts") or 0)
         if m.get("host") in seen:
             continue
-        if not fresh:
+        if not (m.get("ok") and age <= STALE_S):
             stale.append(t)
-        same = (bool(m.get("ts")) and now - float(m["ts"]) <= STALE_S if rolling else   # a failed try keeps it
-                m.get("start") is not None and abs(float(m["start"]) - start) < 60)
-        if m.get("rows") is not None and same:
-            usd += sum(float(r.get("usd") or 0) for r in m["rows"] if isinstance(r, dict) and _matches(r, provider, account))
-            remote_projects += len(m.get("projects") or [])
+        if w.get("rows") is not None and (age <= STALE_S or not rolling):   # a failed try keeps it
+            usd += sum(float(r.get("usd") or 0) for r in w["rows"] if isinstance(r, dict) and _matches(r, provider, account))
+            remote_projects += len(w.get("projects") or [])
         seen.add(m.get("host") or t)
         hosts.append(t)
     others = []

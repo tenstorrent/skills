@@ -20018,7 +20018,7 @@ def test_the_global_daily_total_counts_another_machine_fresh_and_then_stale(env,
     assert gcap.total(p.db, "claude", start, end, later, account="acct-a")["stale"] == []
     assert gcap.total(p.db, "claude", start, end, later + gcap.STALE_S + 1, account="acct-a")["stale"] == ["box2"]
     t = gcap.total(p.db, "claude", end, end + 86400, later, account="acct-a")
-    assert t["usd"] == 0 and t["stale"] == [], t
+    assert t["usd"] == 0 and t["stale"] == ["box2"], t     # no answer for that day yet
     # The other machine answers with `ttp spend-today` over ssh in batch mode, no new tunnel.
     calls = []
     monkeypatch.setattr(gcap.subprocess, "run", lambda cmd, **kw: calls.append(cmd) or types.SimpleNamespace(
@@ -20232,6 +20232,55 @@ def test_a_try_stamped_ahead_of_the_clock_holds_nothing_off(env, monkeypatch):
         clock[0] = t0 + 3 * i
         gcap.refresh_async(b, clock[0])
     assert asked == [t0], asked
+
+
+def test_projects_counting_different_days_keep_their_own_answers_and_ask_once_per_refresh(env, monkeypatch):
+    # Projects on one machine may count different global windows (a per-project day_start or
+    # timezone, or one rolling). Each keeps its own answer from another machine: they do not make
+    # each other ask again on every daemon tick, and each total counts its own window's answer.
+    from datetime import datetime, timezone
+    p = make(env)
+    from ttp import globalcap as gcap
+    from ttp.project import register
+    register("far", {"host": "box2", "dir": "/srv/far"})
+    key = gcap.account_key("claude", "acct-a")
+    budgets = [{"global_daily_usd": 100, "day_start": "08:00", "timezone": "America/New_York"},
+               {"global_daily_usd": 100, "day_start": "00:00", "timezone": "UTC"},
+               {"global_daily_usd": 100, "day_start": ""}]
+    t0 = datetime(2026, 3, 4, 14, 0, 1, tzinfo=timezone.utc).timestamp()   # no day starts in the next 20 min
+    wins = [gcap.window(b, t0) for b in budgets]
+    usd = {gcap._key(s, e): 10.0 ** i for i, (s, e, _) in enumerate(wins)}
+    assert len(usd) == 3
+    asked = []
+    monkeypatch.setattr(gcap, "fetch", lambda t, s, e: asked.append((gcap._key(s, e), s)) or {
+        "host": "box2", "rows": [{"provider": "claude", "key": key, "usd": usd[gcap._key(s, e)]}], "projects": ["far"]})
+
+    class Inline:                       # run the background refresh at once, in order
+        def __init__(self, target, daemon):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+        def is_alive(self):
+            return False
+
+    monkeypatch.setattr(gcap.threading, "Thread", Inline)
+    gcap._LOCAL.clear()
+    for i in range(int(2 * gcap.REFRESH_S / 3)):          # 3 s ticks, the projects in turn
+        now = t0 + 3 * i
+        b = budgets[i % 3]
+        gcap.refresh_async(b, now)
+        start, end, rolling = gcap.window(b, now)
+        t = gcap.total(p.db, "claude", start, end, now, account="acct-a", rolling=rolling)
+        assert t["usd"] == usd[gcap._key(start, end)] and t["stale"] == [], (i, b, t)
+    per = {k: [s for kk, s in asked if kk == k] for k in usd}
+    assert all(len(v) == 2 for v in per.values()), asked     # one per window per REFRESH_S
+    m = gcap.load_cache()["machines"]["box2"]
+    assert set(m["windows"]) == set(usd), m
+    # A past day's answer is dropped at the next refresh: the UTC day is over, the New York one is not.
+    gcap.refresh(*wins[0][:2], wins[1][1] + 60, force=True)
+    assert set(gcap.load_cache()["machines"]["box2"]["windows"]) == {gcap._key(*wins[0][:2]), "rolling"}
 
 
 def test_a_malformed_answer_is_a_failed_try_and_the_global_total_still_counts(env, monkeypatch):
