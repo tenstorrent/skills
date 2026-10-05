@@ -1932,11 +1932,18 @@ def test_newest_listener_claims_chat_before_old_one_exits(env):
            (time.time(), "t", time.time()))
     run_env = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost")
     lock = p.state / "listen-c1.pid"
-    # Stands in for an older listener that takes 3s to shut down after SIGTERM.
-    slow = ("import signal,sys,time\n"
-            "signal.signal(signal.SIGTERM, lambda *a: (time.sleep(3), sys.exit(0)))\n"
+    release = env["home"] / "release-old-listener"
+    # Stands in for an older listener that is slow to shut down: after SIGTERM it exits only once
+    # the test creates the release file, so it is still shutting down however slow the machine is.
+    slow = ("import os,signal,sys,time\n"
+            "def stop(*a):\n"
+            "    end = time.time() + 60\n"
+            f"    while not os.path.exists({str(release)!r}) and time.time() < end:\n"
+            "        time.sleep(0.05)\n"
+            "    sys.exit(0)\n"
+            "signal.signal(signal.SIGTERM, stop)\n"
             "print('ready', flush=True)\n"
-            "time.sleep(60)\n")
+            "time.sleep(120)\n")
     old = subprocess.Popen([sys.executable, "-c", slow, "listen", "c1"], stdout=subprocess.PIPE, text=True)
     new = None
     try:
@@ -1944,12 +1951,15 @@ def test_newest_listener_claims_chat_before_old_one_exits(env):
         lock.write_text(str(old.pid))
         new = subprocess.Popen([sys.executable, str(TTP), "listen", "demo", "--chat", "c1", "--timeout", "60"],
                                env=run_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        deadline = time.time() + 2
-        while time.time() < deadline and lock.read_text().strip() != str(new.pid):
+        # Generous: under load the new listener's interpreter start alone can take seconds.
+        deadline = time.time() + 30
+        while time.time() < deadline and lock.read_text().strip() != str(new.pid) and new.poll() is None:
             time.sleep(0.05)
         assert lock.read_text().strip() == str(new.pid), "the lock still names the older listener"
         assert old.poll() is None, "test premise: the older listener is still shutting down"
-        old.wait(timeout=15)
+        release.touch()
+        # It exits only through its SIGTERM handler, so this also shows the new listener stopped it.
+        old.wait(timeout=30)
         assert lock.read_text().strip() == str(new.pid)
     finally:
         for proc in (new, old):
