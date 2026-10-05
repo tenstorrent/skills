@@ -17,6 +17,7 @@ from typing import Any
 
 from . import jevuse
 from .db import DB, SEVERITY_RANK
+from .providers.jev import JevOutOfFunds
 
 _VOLATILE = [
     (re.compile(r"\b[0-9a-f]{7,64}\b", re.I), "<hex>"),
@@ -196,6 +197,8 @@ def _judge(db: DB, cfg: dict, source: str, text: str, hint: str | None, jev,
                     db, JEV_USE, decision, getattr(jev, "last_cost", 0.0),
                     avoided_usd=jevuse.mean_turn_cost(db, cfg) if skipped else 0.0,
                     settle_s=JEV_SETTLE_S if skipped else None)}
+        except JevOutOfFunds:   # the daemon alerts on it and screens again by rules alone
+            raise
         except Exception as e:  # screening must never take the daemon down
             reason += f" (jev unavailable: {type(e).__name__})"
     return severity, verdict_src, reason, info

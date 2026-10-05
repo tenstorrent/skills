@@ -620,6 +620,30 @@ def test_daemon_reports_a_jev_use_switched_off_once_and_feeds_the_daily_review(e
     assert "Jev uses over the last 7 d" in spec and "- watcher screening [screen]: 2 calls, cost $0.002" in spec
 
 
+def test_jev_out_of_funds_alerts_and_screening_falls_back_to_rules(env):
+    p = make(env)
+    from ttp import daemon as dm
+    from ttp.providers.jev import JevOutOfFunds
+
+    class Broke:
+        calls = 0
+
+        def enabled(self):
+            return True
+
+        def decide(self, *a, **k):
+            self.calls += 1
+            raise JevOutOfFunds("no credits")
+
+    d = dm.Daemon(p.base)
+    d.cfg = p.config()
+    d.jev = Broke()
+    d.observe("log:app", "ERROR: job a failed")
+    assert d.jev.calls == 1
+    assert p.db.one("SELECT COUNT(*) n FROM messages WHERE direction='out' AND ref='jev-funds'")["n"] == 1
+    assert p.db.one("SELECT COUNT(*) n FROM events WHERE kind='observation' AND source='log:app'")["n"] == 1
+
+
 def test_command_watcher_repeats_wake_the_coordinator(env, monkeypatch):
     p = make(env)
     from ttp import daemon as dm
