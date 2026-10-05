@@ -13964,3 +13964,36 @@ def test_replay_reports_the_turns_batching_saves_without_idle_slots(env):
     out = replay.report(history(workers=1), 300, 2)
     assert out["turns_saved"] == 0 and out["held_s"] == 0, out
     assert replay.main([str(db.path), "--days", "1", "--slots", "2"]) == 0
+
+
+def test_idle_slot_wake_backs_off_to_long_waits_while_every_queued_task_is_gated(env, monkeypatch):
+    from ttp import budget as bud
+    from ttp import coordinator as coord
+    from ttp.daemon import starve_state
+    plan = [{"window": "seven_day", "utilization": 50.0, "resets_at": time.time() + 36000, "hours_left": 10.0,
+             "headroom": 40.0, "per_worker_per_h": 1.0}]
+    gate = bud.Gate(provider="fake", regime="windows", max_parallel=6, numbers={"plan": plan})
+    p, d, clock, starts = _wake_setup(env, monkeypatch, gate)
+    c = p.config()["coordinator"]
+    assert coord.apply(p, [{"type": "task_add", "title": "on a probe", "spec": "s", "start_when": "exit 1"},
+                           {"type": "task_add", "title": "in 3 days", "spec": "s", "start_after": "3d"}]) == []
+    _no_events(p)
+    t0 = clock[0]
+    while clock[0] < t0 + 86400:
+        d.maybe_coordinate()
+        if starts and p.db.kv("last_coordinator_turn") == clock[0]:
+            # Other turns (messages, events) in between start each wake's fingerprint afresh.
+            p.db.set_kv("idle_wake", {})
+        clock[0] += 60
+    assert starts and starts[0] - t0 >= float(c["idle_wake_s"]), \
+        "probe and time gates wake the coordinator themselves: no short idle-slot wakes meanwhile"
+    assert len(starts) <= 5, f"{len(starts)} idle-slot turns in a day for work that only waits on its gates"
+    # The gate opens and the queue empties: the idle-slot wake is capped at the idle wake again.
+    p.db.x("UPDATE tasks SET status='done'")
+    st = starve_state(p.db, p.config(), gate.as_dict(), clock[0])
+    assert st and st["wait"] <= float(c["idle_wake_s"]), st
+    # A new task starts the short wait afresh.
+    p.db.x("UPDATE tasks SET status='queued'")
+    assert coord.apply(p, [{"type": "task_add", "title": "later", "spec": "s", "start_when": "exit 1"}]) == []
+    st = starve_state(p.db, p.config(), gate.as_dict(), clock[0])
+    assert st and st["wait"] == float(c["idle_wake_s"]), st

@@ -2619,8 +2619,10 @@ def starve_state(db, cfg: dict, gate: dict | None, now: float) -> dict | None:
     for all of them (green), and nothing is ready or about to be. Ask the coordinator for more
     independent work well before the idle wake would. Usage-billed work costs money whether or
     not it runs, so only plans qualify. A turn that adds no task doubles the wait for the next
-    one, up to the idle wake; a new task resets it. Returns None when this wake does not apply,
-    else the wait after the last turn and the newest task id, stored as kv `starve` on firing."""
+    one, up to the idle wake; a new task resets it. While every queued task waits on its own probe
+    or time, those gates wake the coordinator when they open: the wait starts at the idle wake and
+    doubles up to a day. Returns None when this wake does not apply, else the wait after the last
+    turn and the newest task id, stored as kv `starve` on firing."""
     c = cfg["coordinator"]
     if gate is None or gate["regime"] != "windows" or gate["level"] != "green" or not gate["allow_new_work"]:
         return None
@@ -2636,11 +2638,12 @@ def starve_state(db, cfg: dict, gate: dict | None, now: float) -> dict | None:
         return None
     if coord.next_task_slot(db, coord.task_cap(cfg)) is not None:
         return None
-    base = float(c.get("starve_wake_s", 300))
+    idle_s = float(c.get("idle_wake_s", 3600))
+    base, cap = (idle_s, 86400.0) if held else (float(c.get("starve_wake_s", 300)), idle_s)
     newest = db.one("SELECT COALESCE(MAX(id),0) n FROM tasks")["n"]
     st = db.kv("starve") or {}
     wait = base if not st or newest > st.get("task", 0) else \
-        min(float(st.get("wait", base)) * 2, float(c.get("idle_wake_s", 3600)))
+        min(max(float(st.get("wait", base)) * 2, base), max(cap, base))
     return {"task": newest, "wait": wait}
 
 
