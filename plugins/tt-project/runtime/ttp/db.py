@@ -16,6 +16,7 @@ PAUSED_RESOURCES_KEY = "paused_resources"   # kv: see DB.paused_resources
 SHARED_SEEN_KEY = "shared_pauses_seen"   # kv: {resource: pause} of the shared pauses this project acted on
 WATCHER_ISSUES_MIGRATION = "watcher_issues_per_condition"   # meta: set once DB._migrate has run
 PROVENANCE_MIGRATION = "message_provenance"   # meta: set once inbound messages have their provenance
+PUSH_QUEUE_MIGRATION = "push_queue"   # meta: set once the push queue's tables exist (see pushq.py)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -95,6 +96,22 @@ CREATE INDEX IF NOT EXISTS alerts_key ON alerts(key, cleared);
 """
 
 TERMINAL_TASK_STATES = ("done", "failed", "cancelled")
+# The push queue (pushq.py). A review whose approval waits in it has the task status 'pushing'.
+PUSH_QUEUE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS push_queue(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task INTEGER NOT NULL, run INTEGER, branch TEXT NOT NULL, head TEXT NOT NULL, target TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'approved',
+  batch TEXT, tries INTEGER NOT NULL DEFAULT 0,
+  created REAL NOT NULL, updated REAL NOT NULL,
+  pushed_sha TEXT, version TEXT, detail TEXT);
+CREATE INDEX IF NOT EXISTS push_queue_status ON push_queue(status, id);
+CREATE TABLE IF NOT EXISTS push_batches(
+  id TEXT PRIMARY KEY, marker TEXT NOT NULL, target TEXT NOT NULL,
+  started REAL NOT NULL, ended REAL,
+  outcome TEXT, pushed_sha TEXT, version TEXT, tip TEXT, check_runs INTEGER, check_s REAL,
+  after_push TEXT, after_tries INTEGER NOT NULL DEFAULT 0, finalized REAL, after_finalized REAL);
+"""
 # Open asks older than this no longer hold back idle-slot wakes. They are still shown until answered.
 OPEN_ASK_MAX_AGE_S = 14 * 86400
 
@@ -120,6 +137,19 @@ class DB:
         """Columns added after a table was first created, and one-off fixes of old rows."""
         self._migrate_issues()
         self._migrate_provenance()
+        self._migrate_push_queue()
+
+    def _migrate_push_queue(self) -> None:
+        if self.meta(PUSH_QUEUE_MIGRATION) is not None:
+            return
+        with self.tx():
+            if self.meta(PUSH_QUEUE_MIGRATION) is not None:
+                return
+            # One statement at a time: executescript would commit the open transaction.
+            for stmt in PUSH_QUEUE_SCHEMA.split(";"):
+                if stmt.strip():
+                    self.x(stmt)
+            self.set_meta(PUSH_QUEUE_MIGRATION, str(time.time()))
 
     def _migrate_provenance(self) -> None:
         if self.meta(PROVENANCE_MIGRATION) is not None:
