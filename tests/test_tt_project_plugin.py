@@ -311,3 +311,17 @@ def test_web_js_parses_on_old_node():
     for f in files:
         r = subprocess.run([node, "--check", str(f)], capture_output=True, text=True)
         assert r.returncode == 0, f"{f.name}: {r.stderr}"
+
+
+def test_shipped_text_never_uses_root_relative_harness_bin_paths():
+    """Workers run in tt-project/worktrees/<task>, where `tt-project/harness/bin/...` does not
+    resolve; shipped prompts and skills must use "$TTP_PROJECT/harness/bin/..." instead."""
+    bad = re.compile(r'(?<![\w/}$"])tt-project/harness/bin/')
+    hits = []
+    for path in sorted(PLUGIN.rglob("*")):
+        if path.suffix not in {".md", ".txt", ".j2", ".tmpl", ".sh"} or not path.is_file():
+            continue
+        for n, line in enumerate(path.read_text(errors="replace").splitlines(), 1):
+            if bad.search(line):
+                hits.append(f"{path.relative_to(PLUGIN)}:{n}: {line.strip()}")
+    assert not hits, "root-relative harness/bin paths:\n" + "\n".join(hits)
