@@ -1,7 +1,9 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
 """Guarded push: publish the current commit onto the project's target branch only after the
-project's checks passed on exactly the commit being pushed, and never with force.
+project's checks passed on exactly the commit being pushed, and never with force. The push runs
+those checks itself every time: it never reads the passes `ttp checks` records (cli.CHECK_PASSES),
+so a forged record can at most skip a local re-run, never put a change on the branch.
 
 Pushes of one project to one branch take turns: each holds the lock `push:<remote>/<branch>` from
 its first fetch to its push, so two reviewers never race each other through rounds. The lock is an

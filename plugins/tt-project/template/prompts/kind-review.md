@@ -4,6 +4,12 @@
 - Review the diff named in the spec against the task's goal and the charter.
 - Use any installed review skills that match the domain.
 - Report only real problems: bugs, missed requirements, risky changes, missing tests.
+- Test with `ttp checks` in the change's worktree (the repository's test commands after `--`, as
+  the change's task ran them) plus focused tests of what changed (`pytest -k`, `file::test`). It
+  reuses a pass recorded for the same tree and commands; never rerun the full suite by hand. If it
+  takes longer than one tool call may, start it detached with a marker (`setsid nohup sh -c 'ttp
+  checks -- <cmds>; echo $? > <marker>' > <log> 2>&1 &`) and hand off `waiting` with `retry_when`
+  `test -e <marker>`.
 - `result.json`: `status` `done` when it may proceed, `failed` when it must not.
 - `followups`: one entry per blocking problem, each a self-contained fix spec.
 - With `failed`, put the full hash of the head you reviewed in `metrics.reviewed_head`: the

@@ -7,7 +7,7 @@ head), takes the batch's run lock and starts this process, which inherits the lo
 replays the entries in order onto the target's tip in a worktree of its own (`worktrees/push`) and
 settles the conflicts that need no judgment: version lines, and both sides adding different lines at
 one spot. It bumps the version once for all entries, runs the push checks once on the result and
-pushes it without force. When the checks fail, a binary search over prefixes finds the first failing
+pushes it without force. It always runs them itself and never reads the passes `ttp checks` records. When the checks fail, a binary search over prefixes finds the first failing
 entry, and the passing prefix is pushed. The outcome goes into the marker per entry; the daemon
 applies it to the reviews.
 

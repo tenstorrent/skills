@@ -878,10 +878,64 @@ def cmd_push(a) -> None:
     sys.exit(push.detach(p, Path.cwd(), a.own) if a.detach else push.run(p, Path.cwd(), a.own))
 
 
+CHECK_PASSES = "check_passes.json"   # under the project's state: {"passes": [{"tree", "commands", "run", "ts"}]}
+CHECK_PASSES_MAX = 200                # the newest entries kept
+
+
+def _commands_hash(cmds: list) -> str:
+    import hashlib
+    return hashlib.sha256(json.dumps([str(c) for c in cmds]).encode()).hexdigest()
+
+
+def _recorded_pass(p: Project | None, tree: str, cmds: list) -> dict | None:
+    """The recorded pass of exactly these commands, in this order, on this tree, or None."""
+    if not p or not tree:
+        return None
+    try:
+        passes = json.loads((p.state / CHECK_PASSES).read_text()).get("passes")
+    except (OSError, ValueError, AttributeError):
+        return None
+    key = _commands_hash(cmds)
+    for e in reversed(passes if isinstance(passes, list) else []):
+        if isinstance(e, dict) and e.get("tree") == tree and e.get("commands") == key:
+            return e
+    return None
+
+
+def _record_pass(p: Project | None, tree: str, cmds: list) -> None:
+    """Only passes are recorded. A failed write is said and never fails the checks."""
+    if not p or not tree:
+        return
+    import fcntl
+    path = p.state / CHECK_PASSES
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path.with_name(path.name + ".lock"), "a") as guard:
+            fcntl.flock(guard, fcntl.LOCK_EX)   # parallel runs of one project share the file
+            try:
+                passes = json.loads(path.read_text()).get("passes")
+            except (OSError, ValueError, AttributeError):
+                passes = None
+            passes = [e for e in passes if isinstance(e, dict)] if isinstance(passes, list) else []
+            passes.append({"tree": tree, "commands": _commands_hash(cmds),
+                           "run": os.environ.get("TTP_RUN_ID") or "?", "ts": time.time()})
+            write_json(path, {"passes": passes[-CHECK_PASSES_MAX:]})
+    except OSError as e:
+        print(f"ttp checks: could not record the pass in {path}: {e}", file=sys.stderr)
+
+
 def cmd_checks(a) -> None:
     """(inside a run) Run the local checks on this worktree's commit and record the result in the
     run's directory: the harness's gh opens a PR (even a draft) only after they passed on HEAD. The
-    checks are the project's `delivery.push_checks`, plus the commands given after `--`."""
+    checks are the project's `delivery.push_checks`, plus the commands given after `--`.
+
+    A pass is also recorded in the project's state, keyed on HEAD's tree and the ordered list of
+    the commands that apply there. When the same commands already passed on the same tree (a
+    reviewer checking a worker's commit, a rerun after a rebase that changed nothing), that pass is
+    reused and nothing runs again; `--fresh` always runs them. Failures are never recorded, so a
+    failure is never served as a pass. `ttp push` and the push queue never read this record and
+    always run their own checks on the exact commit they push: a forged record can at most skip a
+    local re-run, never let a change onto the branch."""
     from . import prguard, push
     run_dir = os.environ.get("TTP_RUN_DIR")
     if not run_dir:
@@ -889,6 +943,8 @@ def cmd_checks(a) -> None:
     base = os.environ.get("TTP_PROJECT")
     p = Project(base) if base else None
     cfg = p.config() if p and p.exists() else {}
+    if not (p and p.exists()):
+        p = None
     extra = a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd
     cmds = push.check_list((cfg.get("delivery") or {}).get("push_checks")) + ([shlex.join(extra)] if extra else [])
     if not cmds:
@@ -901,15 +957,22 @@ def cmd_checks(a) -> None:
     if subprocess.run([*git, "status", "--porcelain", "--untracked-files=no"], capture_output=True,
                       text=True).stdout.strip():
         die("ttp checks: commit first; the checks are recorded for a commit, and this worktree has changes")
+    tree = subprocess.run([*git, "rev-parse", "HEAD^{tree}"], capture_output=True, text=True).stdout.strip()
     log = Path(run_dir) / "checks.log"
     passed, failed = True, None
     with open(log, "a") as out:
         todo, skipped = push.applicable(Path.cwd(), head, cmds, lambda m: (print(f"ttp checks: {m}"),
                                                                            out.write(f"{m}\n")))
+        hit = _recorded_pass(p, tree, todo) if todo and not a.fresh else None
         if not todo:
             out.write(f"{push.NONE_APPLY}\n")
             passed, failed = False, push.NONE_APPLY
-        for c in todo:
+        elif hit:
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(hit.get("ts") or 0)))
+            said = (f"ttp checks: {len(todo)} check(s) passed on {tree[:12]} in run {hit.get('run') or '?'} "
+                    f"at {when} (recorded); --fresh runs them again")
+            out.write(f"{said}\n")
+        for c in [] if hit else todo:
             out.write(f"$ {c}\n")
             out.flush()
             if subprocess.run(c, shell=True, stdout=out, stderr=subprocess.STDOUT).returncode != 0:
@@ -921,6 +984,10 @@ def cmd_checks(a) -> None:
         tail = log.read_text(errors="replace").splitlines()[-30:]
         print("\n".join(tail))
         die(f"ttp checks: {failed!r} failed on {head[:12]} (full output: {log})", 1)
+    if hit:
+        print(said)
+        return
+    _record_pass(p, tree, todo)
     more = f", {len(skipped)} skipped as not applicable" if skipped else ""
     print(f"ttp checks: {len(todo)} check(s) passed on {head[:12]}{more}; recorded for the draft PR")
 
@@ -1860,6 +1927,8 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_push)
 
     s = sub.add_parser("checks", help="(inside a run) run the local checks on HEAD and record the result")
+    s.add_argument("--fresh", action="store_true",
+                   help="run the checks even when they already passed on this tree")
     s.add_argument("cmd", nargs=argparse.REMAINDER, help="extra check command after --")
     s.set_defaults(fn=cmd_checks)
 

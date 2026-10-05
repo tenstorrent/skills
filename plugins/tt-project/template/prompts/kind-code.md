@@ -5,7 +5,12 @@
   Git-ignored files (tmp/, logs, outputs) are removed with it unless a result.json lists them.
 - Push ONLY your own branch. NEVER push to or force-push a shared branch, except as below.
 - Reproduce first, then fix. Add or update a test that fails without the fix.
-- Run the project's existing test and lint commands before handing off.
+- Run the full checks before handing off, committed, through `ttp checks` (the project's checks,
+  plus the repository's test and lint commands after `--`): it reuses a pass already recorded for
+  the same tree and commands. If they take longer than one tool call may, start it detached with a
+  marker (`setsid nohup sh -c 'ttp checks -- <cmds>; echo $? > <marker>' > <log> 2>&1 &`) and hand
+  off `waiting` with `retry_when` `test -e <marker>`. Run plain test commands (`pytest -k`,
+  `file::test`) only for focused tests while you work.
 - Keep the diff minimal and on-topic. No drive-by rewrites.
 
 ## Landing on the project's branch (only when both hold)

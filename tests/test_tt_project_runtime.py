@@ -14481,6 +14481,103 @@ def test_ttp_checks_logs_skipped_checks_and_fails_when_none_apply(env, tmp_path,
     assert "1 skipped as not applicable" in capsys.readouterr().out
 
 
+def _checks_repo(env, tmp_path, monkeypatch):
+    p = make(env)
+    repo, run = tmp_path / "work", tmp_path / "run"
+    run.mkdir()
+    repo.mkdir()
+    git = ["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=t"]
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / "a.txt").write_text("a\n")
+    subprocess.run([*git, "add", "a.txt"], check=True)
+    subprocess.run([*git, "commit", "-qm", "a"], check=True)
+    monkeypatch.setenv("TTP_RUN_DIR", str(run))
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.setenv("TTP_RUN_ID", "41")
+    monkeypatch.chdir(repo)
+    return p, repo, run, git
+
+
+def test_ttp_checks_reuses_a_recorded_pass_only_for_the_same_tree_and_commands(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    count = tmp_path / "count"
+    check = ["sh", "-c", f"echo x >> {count}"]
+    ran = lambda: len(count.read_text().splitlines()) if count.exists() else 0
+    cli.main(["checks", "--", *check])
+    assert ran() == 1 and "recorded)" not in capsys.readouterr().out
+    # A new commit with the same tree (a rebase that changed nothing): the pass is reused, from another run.
+    monkeypatch.setenv("TTP_RUN_ID", "42")
+    subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "empty"], check=True)
+    head = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    tree = subprocess.run([*git, "rev-parse", "HEAD^{tree}"], capture_output=True, text=True).stdout.strip()
+    (run / "checks.json").unlink()
+    cli.main(["checks", "--", *check])
+    out = capsys.readouterr().out
+    assert ran() == 1, "a recorded pass on the same tree ran the checks again"
+    assert f"1 check(s) passed on {tree[:12]} in run 41 at " in out and "(recorded); --fresh runs them again" in out
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and rec["head"] == head and rec["commands"] == [shlex.join(check)]
+    # --fresh always runs them.
+    cli.main(["checks", "--fresh", "--", *check])
+    assert ran() == 2
+    # Other commands on the same tree: a miss.
+    cli.main(["checks", "--", *check, "again"])
+    assert ran() == 3
+    # A project check added before them: a miss.
+    p.set_config("delivery.push_checks", ["true"])
+    cli.main(["checks", "--", *check])
+    assert ran() == 4
+    # The same commands on another tree: a miss.
+    p.set_config("delivery.push_checks", [])
+    (repo / "a.txt").write_text("b\n")
+    subprocess.run([*git, "commit", "-qam", "b"], check=True)
+    cli.main(["checks", "--", *check])
+    assert ran() == 5
+
+
+def test_ttp_checks_never_serves_a_failure_as_a_pass(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    flag = tmp_path / "ok"
+    check = ["test", "-f", str(flag)]
+    for _ in range(2):
+        with pytest.raises(SystemExit) as e:
+            cli.main(["checks", "--", *check])
+        assert e.value.code == 1
+        assert json.loads((run / "checks.json").read_text())["passed"] is False
+    assert not (p.state / cli.CHECK_PASSES).exists() or not json.loads(
+        (p.state / cli.CHECK_PASSES).read_text())["passes"], "a failure was recorded as a pass"
+    flag.write_text("")
+    cli.main(["checks", "--", *check])
+    assert "(recorded)" not in capsys.readouterr().out
+    assert json.loads((run / "checks.json").read_text())["passed"] is True
+
+
+def test_ttp_checks_keeps_a_bounded_record_of_passes(env, tmp_path, monkeypatch):
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "CHECK_PASSES_MAX", 3)
+    for i in range(5):
+        cli.main(["checks", "--", "true", str(i)])
+    passes = json.loads((p.state / cli.CHECK_PASSES).read_text())["passes"]
+    assert len(passes) == 3 and all(e["run"] == "41" for e in passes)
+    count = tmp_path / "count"
+    cli.main(["checks", "--", "sh", "-c", f"echo x >> {count}", "0"])
+    assert count.exists(), "the oldest pass was kept past the bound"
+
+
+def test_the_push_never_reads_the_recorded_passes_of_ttp_checks():
+    for name in ("push.py", "batch.py"):
+        src = (RUNTIME / "ttp" / name).read_text()
+        assert "CHECK_PASSES" not in src.replace("(cli.CHECK_PASSES)", "") and "_recorded_pass" not in src, name
+    assert "never reads the passes `ttp checks` records" in " ".join((RUNTIME / "ttp" / "push.py").read_text().split())
+    prompts = RUNTIME.parent / "template" / "prompts"
+    for name in ("kind-code.md", "kind-review.md"):
+        text = " ".join((prompts / name).read_text().split())
+        assert "`ttp checks`" in text and "test -e <marker>" in text and "`pytest -k`" in text, name
+
+
 def test_status_does_not_warn_about_a_check_that_does_not_apply_on_the_branch(tmp_path):
     from ttp import push
     repo = tmp_path / "r"
