@@ -42,6 +42,7 @@ from . import pushq
 from . import release
 from . import runner
 from . import schedule as sched
+from . import unblock
 from . import upstream
 from . import screen as scr
 from . import shared
@@ -1660,6 +1661,11 @@ class Daemon:
             spec += (f"\n\nJev uses over the last {jevuse.window_s(self.cfg) / 86400:g} d (calls, cost, estimated "
                      f"savings, net, error rate; a use with no net saving is switched off by itself):\n"
                      + "\n".join(f"- {line}" for line in jev_lines))
+        if payload.get("unblock_report", s["name"] == "daily-review"):
+            try:
+                spec += "\n\nUnblocking quality:\n" + "\n".join(f"- {line}" for line in unblock.lines(db))
+            except Exception as e:   # a metric must not keep the review from starting
+                log(self.p, f"unblocking metrics failed: {type(e).__name__}: {e}")
         db.add_task(f"[{s['name']}] {s['description'][:120] or 'recurring task'}", spec, kind=payload.get("kind", "work"),
                     tier=payload.get("tier", "standard"), priority=int(payload.get("priority", 4)),
                     budget_usd=s["budget_usd_day"], origin="schedule", labels=[s["name"]])

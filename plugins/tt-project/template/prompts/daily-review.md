@@ -8,6 +8,11 @@ Assess the last day of this project, then hand off.
    use's net saving and error rate in one line; the daemon already switches off a use that saves nothing.
 3. Quality: failures, retries, flaky areas, slop or duplication introduced, architecture drift.
 4. Harness friction: where the user was needed, where the coordinator mis-planned, slow loops.
+   Unblocking quality: if this spec ends with `Unblocking quality` lines, report them in one short
+   section: time stuck (blocked, waiting, review: count, median, p90, longest), asks the user
+   handed back ("decide yourself") with their ids and blocking reasons, and the coordinator's
+   high/low turn split and escalations. A handed-back ask should not have been sent: say what rule
+   would have let the coordinator decide it, as a `harness:` follow-up when one is missing.
 5. Memory: retire entries that are stale, done or replaced: `ttp memory <name> --forget <entry>`
    (the name in [brackets]; it moves to memory/archive/). Keep restrictions, preferences and
    resources that still hold. Name what you retired in the summary.

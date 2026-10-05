@@ -795,6 +795,118 @@ def test_effort_falls_back_to_rules_and_leaves_other_tasks_alone(env, monkeypatc
     assert effort.pick(p.db, cfg, p.db.task(w), "claude", jev) is None
 
 
+@pytest.mark.parametrize("text", [
+    "Decide it yourself.", "your call", "That's up to you", "you decide", "Just do it", "use your judgement",
+    "whatever you think is best", "No need to ask for this", "don’t ask me about restarts",
+    "Stop asking for tickets", "don't get blocked on things you can fix", "always unblock efficiently",
+    "you don't need my approval for that"])
+def test_unblock_handback_phrases_match(text):
+    from ttp import unblock
+    assert unblock.handback(text)
+
+
+@pytest.mark.parametrize("text", [
+    "yes, approve the merge", "no, keep it as it is", "wait until the job ends", "I'll top up the account",
+    "the decision is no", "ask the other team first"])
+def test_unblock_ordinary_answers_are_not_handbacks(text):
+    from ttp import unblock
+    assert unblock.handback(text) is None
+
+
+def test_unblock_answer_part_splits_a_message_by_the_asks_it_names():
+    from ttp import unblock
+    text = "#7: yes, merge it. #9, your call. See task #8 too."
+    assert unblock.answer_part(text, 7, {7, 8, 9}).startswith("#7: yes") and "your call" not in \
+        unblock.answer_part(text, 7, {7, 8, 9})
+    assert "your call" in unblock.answer_part(text, 9, {7, 8, 9})
+    assert unblock.answer_part(text, 8, {7, 8, 9}) is None   # "task #8" names a task
+    assert unblock.answer_part("nothing here", 7, {7}) is None
+
+
+def test_unblock_stuck_episodes_end_when_the_task_moves_forward(env):
+    p = make(env)
+    from ttp import unblock
+    db, now = p.db, time.time()
+
+    def ev(tid, kind, ago):
+        db.x("INSERT INTO events(ts,source,kind,text,status,task) VALUES(?,?,?,?,?,?)",
+             (now - ago, "t", kind, "x", "handled", tid))
+
+    def run(tid, ago):
+        db.x("INSERT INTO runs(task,role,status,started) VALUES(?,?,?,?)", (tid, "worker", "ok", now - ago))
+
+    a = db.add_task("blocked then requeued and run")
+    ev(a, "task_blocked", 3600)
+    run(a, 1800)                     # 30 min stuck
+    b = db.add_task("waits through two wakes, then done")
+    ev(b, "task_waiting", 7200)
+    run(b, 5400)                     # a wake: still waiting
+    ev(b, "task_waiting", 5300)
+    run(b, 3700)
+    ev(b, "task_done", 3600)         # 1 h stuck
+    c = db.add_task("still blocked")
+    db.update_task(c, status="blocked")
+    ev(c, "task_blocked", 600)
+    d = db.add_task("needs review, then cancelled")
+    db.x("UPDATE tasks SET status='cancelled', updated=? WHERE id=?", (now - 100, d))
+    ev(d, "task_review", 1000)
+    e = db.add_task("blocked last week")
+    ev(e, "task_blocked", 3 * 86400)
+    run(e, 3 * 86400 - 60)
+    eps = {x["task"]: x for x in unblock.episodes(db, now - 86400, now)}
+    assert set(eps) == {a, b, c, d}
+    assert eps[a]["s"] == pytest.approx(1800, abs=1) and eps[a]["kind"] == "blocked" and not eps[a]["open"]
+    assert eps[b]["s"] == pytest.approx(3600, abs=1) and eps[b]["kind"] == "waiting"
+    assert eps[c]["open"] and eps[c]["s"] == pytest.approx(600, abs=1)
+    assert eps[d]["s"] == pytest.approx(900, abs=1) and not eps[d]["open"]
+    line = unblock.stuck_line([x for x in eps.values() if x["kind"] == "blocked"])
+    assert line.startswith(f"2 (1 still open), median 10 min, p90 30 min, longest #{a} ")
+    assert unblock.stuck_line([]) == "none"
+    assert len(unblock.episodes(db, now - 7 * 86400, now)) == 5
+
+
+def test_unblock_asks_handed_back_and_turn_split(env):
+    p = make(env)
+    from ttp import unblock
+    db, now = p.db, time.time()
+
+    def msg(direction, text, ago, kind="user", ref=None, ext=None):
+        return db.x("INSERT INTO messages(ts,direction,kind,text,ref,ext_id) VALUES(?,?,?,?,?,?)",
+                    (now - ago, direction, kind, text, ref, ext))
+
+    a1 = msg("out", "Retire the old line?", 5000, "ask", "blocking:restriction")
+    a2 = msg("out", "Approve the merge?", 4000, "ask", "blocking:merge", ext="171.1")
+    a3 = msg("out", "Top up funds?", 3000, "ask", "blocking:funds")
+    msg("in", f"#{a1}: up to you, it is clearly over.", 2000)
+    msg("in", "yes, merge it", 1500, ref="171.1")   # a thread reply
+    rows = {r["id"]: r for r in unblock.asks(db, now - 86400, now)}
+    assert rows[a1]["handback"] == "up to you" and rows[a1]["blocking"] == "restriction"
+    assert rows[a2]["answered"] and rows[a2]["handback"] is None and not rows[a3]["answered"]
+    line = unblock.asks_line(list(rows.values()))
+    assert line.startswith(f"3 sent, 2 with a linked answer, 1 handed back (33% of asks): #{a1} (restriction")
+    assert unblock.asks_line([]) == "no asks sent"
+    for effort, note in (("low", None), ("low", '{"escalated": true}'), ("high", '{"trigger": "task_blocked"}')):
+        db.x("INSERT INTO runs(role,status,started,effort,note) VALUES('coordinator','ok',?,?,?)", (now - 60, effort, note))
+    assert unblock.turns_line(db, now - 86400) == ("3 turns: 2 low, 1 high; 1 escalated low to high; "
+                                                   "high-effort triggers: task_blocked 1")
+    db.x("UPDATE runs SET note=NULL")   # fields not logged yet: still a report
+    assert unblock.turns_line(db, now - 86400) == "3 turns: 2 low, 1 high; escalations not logged"
+
+
+def test_the_daily_review_gets_the_unblocking_quality_lines(env):
+    p = make(env)
+    from ttp import daemon as dm
+    d = dm.Daemon(p.base)
+    d.cfg = p.config()
+    s = {"name": "daily-review", "budget_usd_day": None, "last_run": None, "description": "review"}
+    assert d._schedule_llm(s, {}) == "queued"
+    spec = p.db.one("SELECT spec FROM tasks WHERE origin='schedule'")["spec"]
+    assert "Unblocking quality:\n- stuck blocked, 24 h: none" in spec and "- asks, 7 d: no asks sent" in spec
+    assert "- coordinator, 24 h: no coordinator turns" in spec
+    p.db.x("DELETE FROM tasks")
+    assert d._schedule_llm(dict(s, name="audit"), {}) == "queued"
+    assert "Unblocking quality" not in p.db.one("SELECT spec FROM tasks WHERE origin='schedule'")["spec"]
+
 def test_command_watcher_repeats_wake_the_coordinator(env, monkeypatch):
     p = make(env)
     from ttp import daemon as dm
