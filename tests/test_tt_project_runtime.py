@@ -14161,7 +14161,7 @@ def test_a_long_tick_tells_both_watchdogs_it_still_moves(env, monkeypatch):
     steps = []
     for name in ("reap_runs", "wake_after_reboot", "meter_running", "reconcile_tasks", "tend_pushes", "prune_worktrees",
                  "check_local_only", "check_disk", "sweep_alerts", "check_release", "sync_shared_pauses", "check_integrity", "sync_schedules", "_refresh_meters", "update_gates", "run_schedules", "poll_slack",
-                 "check_resource_trouble", "read_upstream", "retry_rejected", "retire_ended", "maybe_coordinate", "probe_waiting", "start_pushes",
+                 "check_resource_trouble", "read_upstream", "forward_upstream", "retry_rejected", "retire_ended", "maybe_coordinate", "probe_waiting", "start_pushes",
                  "dispatch", "deliver_outbound"):
         monkeypatch.setattr(d, name, lambda name=name: steps.append(name))
     monkeypatch.setattr(dm.coord, "expire_asks", lambda *a, **k: [])
@@ -14180,7 +14180,7 @@ def test_a_long_tick_tells_both_watchdogs_it_still_moves(env, monkeypatch):
     finally:
         sock.close()
         cleanup()
-    assert len(steps) == 26 and pings == [b"WATCHDOG=1"] * 24, (steps, pings)
+    assert len(steps) == 27 and pings == [b"WATCHDOG=1"] * 25, (steps, pings)
     # Before its first completed tick the heartbeat is not written (`ttp restart` reads it as that
     # tick); the start marker carries the progress, which `ttp.watchdog` counts.
     assert not hb.exists()
@@ -15203,7 +15203,7 @@ def test_remote_upstream_reads_stop_at_the_tick_budget_and_resume_fairly(env, mo
 
 
 
-def _fake_ssh(env, monkeypatch) -> dict:
+def _fake_forward_ssh(env, monkeypatch) -> dict:
     """An `ssh` on PATH that runs the remote command locally, in a home of its own per target
     (tmp/remote/<target>), with that target as its host name; never a real host. `mode` file: `down`
     (exit 255), `hang` (sleeps), `drop-ack` (the target files the notes, the ack is lost)."""
@@ -15248,7 +15248,7 @@ def test_upstream_notes_written_offline_reach_the_reading_machine_once(env, monk
     lost ack (the target dedupes), each to where it belongs, and nothing received is sent on again."""
     from ttp import upstream
     from ttp.project import register
-    fake = _fake_ssh(env, monkeypatch)
+    fake = _fake_forward_ssh(env, monkeypatch)
     register("example-project", {"host": "example-host", "dir": "/w/example"})
     register("other-project", {"host": "other-host", "dir": "/w/other"})
     reader_home = fake["remote"] / "example-host" / ".tt-project"
@@ -15349,7 +15349,7 @@ def test_a_hung_ssh_never_holds_up_the_daemon_tick(env, monkeypatch):
     from ttp import upstream
     from ttp.daemon import Daemon
     from ttp.project import register
-    fake = _fake_ssh(env, monkeypatch)
+    fake = _fake_forward_ssh(env, monkeypatch)
     p = make(env)
     register("example-project", {"host": "example-host", "dir": "/w/example"})
     upstream.send("demo", 3, "example-project", "for you")
