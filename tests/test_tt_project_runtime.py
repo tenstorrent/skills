@@ -9058,7 +9058,8 @@ def test_a_passing_review_hands_its_approval_to_the_push_queue_without_waking_th
     assert s.p.db.one("SELECT COUNT(*) n FROM runs")["n"] == 0
 
 
-@pytest.mark.parametrize("case", ["short hash", "unknown commit", "unreviewed commit", "protected target", "no target"])
+@pytest.mark.parametrize("case", ["short hash", "unknown commit", "unreviewed commit", "protected target", "no target",
+                                  "queue off"])
 def test_an_invalid_push_approval_runs_the_review_again_once_then_fails_it(env, monkeypatch, case):
     s = _pq(env, monkeypatch)
     head = {"short hash": s.head[:12], "unknown commit": "0123456789abcdef" * 2 + "01234567"}.get(case, s.head)
@@ -9069,6 +9070,8 @@ def test_an_invalid_push_approval_runs_the_review_again_once_then_fails_it(env, 
         s.p.set_config("delivery.push_branch", "origin/main")
     if case == "no target":
         s.p.set_config("delivery.push_branch", "")
+    if case == "queue off":   # turned off while the review ran: it runs again and pushes itself
+        s.p.set_config("delivery.push_queue", False)
     mark = _pq_mark(s.p)
     t = _pq_hand_off(env, s, push=[{"branch": s.branch, "head": head}])
     assert t["status"] == "queued" and not s.p.db.q("SELECT id FROM push_queue")
@@ -9081,9 +9084,12 @@ def test_an_invalid_push_approval_runs_the_review_again_once_then_fails_it(env, 
     assert not s.p.db.q("SELECT id FROM push_queue")
 
 
-def test_a_push_list_while_the_queue_is_off_is_ignored_and_logged(env, monkeypatch):
-    s = _pq(env, monkeypatch, push_queue=False)
-    t = _pq_hand_off(env, s)
+@pytest.mark.parametrize("setting, push", [("push_allowed", None), ("push_queue", "pushed it")])
+def test_a_push_list_in_a_project_that_does_not_push_is_ignored_and_logged(env, monkeypatch, setting, push):
+    """No pushing at all, or a stray `push` field (not a list of approvals) while the queue is off,
+    as in every project that never turned it on: the review is done as before."""
+    s = _pq(env, monkeypatch, **{setting: False})
+    t = _pq_hand_off(env, s, push=push)
     assert t["status"] == "done" and not s.p.db.q("SELECT id FROM push_queue")
     [done] = [e for e in _pq_events(s.p, task=s.review) if e["kind"] == "task_done"]
     assert done["status"] == "queued" and "push list was ignored" in done["text"]
@@ -11216,10 +11222,10 @@ def test_a_long_tick_tells_both_watchdogs_it_still_moves(env, monkeypatch):
     d = dm.Daemon(p.base)
     d._notify = addr
     steps = []
-    for name in ("reap_runs", "wake_after_reboot", "meter_running", "reconcile_tasks", "prune_worktrees",
-                 "check_local_only", "check_disk", "sweep_alerts", "check_release", "sync_shared_pauses", "check_integrity", "sync_schedules", "tend_pushes", "_refresh_meters", "update_gates", "run_schedules", "poll_slack",
-                 "check_resource_trouble", "read_upstream", "retry_rejected", "maybe_coordinate", "probe_waiting", "dispatch",
-                 "deliver_outbound"):
+    for name in ("reap_runs", "wake_after_reboot", "meter_running", "reconcile_tasks", "tend_pushes", "prune_worktrees",
+                 "check_local_only", "check_disk", "sweep_alerts", "check_release", "sync_shared_pauses", "check_integrity", "sync_schedules", "_refresh_meters", "update_gates", "run_schedules", "poll_slack",
+                 "check_resource_trouble", "read_upstream", "retry_rejected", "maybe_coordinate", "probe_waiting", "start_pushes",
+                 "dispatch", "deliver_outbound"):
         monkeypatch.setattr(d, name, lambda name=name: steps.append(name))
     monkeypatch.setattr(dm.coord, "expire_asks", lambda *a, **k: [])
     monkeypatch.setattr(dm, "PROGRESS_EVERY_S", 0)   # each step stands for a slow one
@@ -11237,7 +11243,7 @@ def test_a_long_tick_tells_both_watchdogs_it_still_moves(env, monkeypatch):
     finally:
         sock.close()
         cleanup()
-    assert len(steps) == 24 and pings == [b"WATCHDOG=1"] * 22, (steps, pings)
+    assert len(steps) == 25 and pings == [b"WATCHDOG=1"] * 23, (steps, pings)
     # Before its first completed tick the heartbeat is not written (`ttp restart` reads it as that
     # tick); the start marker carries the progress, which `ttp.watchdog` counts.
     assert not hb.exists()

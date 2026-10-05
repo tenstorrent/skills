@@ -1224,6 +1224,7 @@ class Daemon:
                 push_note = f" Its push list was ignored: {check['ignored']}."
             elif check.get("invalid"):
                 why = check["invalid"]
+                log(self.p, f"task {task['id']}: push approval invalid: {why}")
                 extra["push_invalid"] = int(load_result(task["result"]).get("push_invalid") or 0) + 1
                 push_note = f" Push approval invalid: {why}."
                 if extra["push_invalid"] < 2:

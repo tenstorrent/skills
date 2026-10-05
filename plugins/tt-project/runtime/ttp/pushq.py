@@ -135,14 +135,18 @@ def _contains(p: Project, heads: list[str], commit: str) -> bool:
 
 
 def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None) -> dict:
-    """Validate a review's `push` list with fast local git: {"ignored": why} while the queue is off,
-    {"invalid": why}, or {"entries": [{"branch", "head"}], "target": "remote/branch", "added": {head:
+    """Validate a review's `push` list with fast local git: {"ignored": why} in a project that does
+    not push or, while the queue is off, for anything but a list of approvals; {"invalid": why} (also
+    for such a list while the queue is off: turned off while the review ran, it runs again and
+    pushes itself, as queue_off sends back approvals made before), or {"entries": [{"branch", "head"}], "target": "remote/branch", "added": {head:
     [commit lines]}}. Each head is a full hash of a commit in the project root that the review
     reviewed (worktree.reviewed_refs) or an ancestor of one. A re-approval after a push conflict may
     name any commit; the commits it adds over the conflicting head are listed for the event."""
     from .worktree import reviewed_refs
     d = _delivery(p, cfg)
     if not _on(d.get("push_queue")):
+        if isinstance(entries, list) and entries and all(isinstance(e, dict) and e.get("head") for e in entries):
+            return {"invalid": "the push queue is off (delivery.push_queue): push with ttp push"}
         return {"ignored": "the push queue is off (delivery.push_queue)"}
     if not (d.get("push_allowed") is None or _on(d.get("push_allowed"))):
         return {"ignored": "this project does not allow pushing (delivery.push_allowed)"}
