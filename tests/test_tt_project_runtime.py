@@ -12616,6 +12616,7 @@ def test_pr_approve_counts_only_channels_a_run_cannot_write(env):
     p = make(env)
     from ttp import coordinator as coord, prguard
     url = "https://github.com/acme/widgets/pull/7"
+    _heads_seen(p, *(f"acme/widgets#{n}" for n in (7, 8, 9, 10)))
     for prov in (None, "web", "cli-legacy", "system"):
         said = p.db.post("in", f"yes, mark {url} ready", chat="web", provenance=prov)
         out = " ".join(coord.apply(p, [{"type": "pr_approve", "id": said, "text": url, "quote": "ready"}]))
@@ -12662,6 +12663,7 @@ def test_pr_approve_reads_a_slack_approval_back_from_slack(env, monkeypatch):
     sl.call = call
     monkeypatch.setattr(slackmod, "from_config", lambda cfg: sl)
     url = "https://github.com/acme/widgets/pull/7"
+    _heads_seen(p, *(f"acme/widgets#{n}" for n in (7, 8, 9, 10)))
 
     def approve(msg, pr=url):          # quotes the user's message, or their "yes" to an ask
         row = p.db.one("SELECT direction, text FROM messages WHERE id=?", (msg,))
@@ -12736,6 +12738,7 @@ def test_pr_approve_reads_the_ask_back_from_slack(env, monkeypatch):
     d.cfg["notify"]["slack"] = True
     d._slack = sl
     url = "https://github.com/acme/widgets/pull/7"
+    _heads_seen(p, *(f"acme/widgets#{n}" for n in (7, 8, 9, 10)))
 
     def approve(msg, pr=url):          # quotes the user's message, or their "yes" to an ask
         row = p.db.one("SELECT direction, text FROM messages WHERE id=?", (msg,))
@@ -13527,14 +13530,16 @@ def test_pr_approve_counts_only_a_clear_yes_in_the_users_own_words(env):
     assert "needs `quote`" in approve(ask, "")
     assert not prguard.approved(p.db, "acme/widgets#7")
     assert prguard.clear_yes("y") and prguard.clear_yes("Please mark it ready")
-    yes = p.db.post("in", "Yes, go ahead", chat="web", provenance="web-session")
-    assert approve(ask, "yes, go ahead") == ""
+    p.db.post("in", "Yes, go ahead", chat="web", provenance="web-session")
+    assert "no Slack ts" in approve(ask, "yes, go ahead")   # this ask never reached Slack
+    yes = p.db.post("in", f"Yes, go ahead with {url}", chat="web", provenance="web-session")
+    assert approve(yes, "yes, go ahead") == ""
     rec = p.db.kv(prguard.APPROVALS_KEY)["acme/widgets#7"]
-    assert rec["answer"] == yes and rec["said"] == "Yes, go ahead" and rec["spent"] is None
+    assert rec["answer"] == yes and rec["said"] == f"Yes, go ahead with {url}" and rec["spent"] is None
     # Used once, the same answer cannot approve it again.
     prguard.spend(p.db, {"acme/widgets#7"})
     assert not prguard.may_ready(p.db, "acme/widgets#7") and prguard.approved(p.db, "acme/widgets#7")
-    assert "fresh yes" in approve(ask, "yes, go ahead")
+    assert "fresh yes" in approve(yes, "yes, go ahead")
 
 
 def test_an_approval_is_spent_and_a_pr_back_in_draft_needs_a_fresh_yes(env, tmp_path, monkeypatch):
@@ -13600,13 +13605,13 @@ def test_an_approval_covers_only_the_commit_the_user_said_yes_to(env, tmp_path, 
     def approve(msg):
         return " ".join(coord.apply(p, [{"type": "pr_approve", "id": msg, "text": url, "quote": "yes"}]))
 
-    early = p.db.post("in", f"yes, mark {url} ready", chat="web")
+    early = p.db.post("in", f"yes, mark {url} ready", chat="web", provenance="web-session")
     assert "has not read" in approve(early), "approved with no head commit on record"
     d = Daemon(p.base)
     watchers.watch_prs(d)          # pr-watch reads the head only after that yes
     assert p.db.kv(prguard.HEADS_KEY)["acme/widgets#7"]["sha"] == HEAD
     assert "new commits since the user's yes" in approve(early)
-    said = p.db.post("in", f"yes, mark {url} ready", chat="web")
+    said = p.db.post("in", f"yes, mark {url} ready", chat="web", provenance="web-session")
     assert approve(said) == ""
     assert p.db.kv(prguard.APPROVALS_KEY)["acme/widgets#7"]["head"] == HEAD
     # Commits pushed after the yes: every way of marking it ready is refused, and the approval stays unspent.
@@ -13623,7 +13628,7 @@ def test_an_approval_covers_only_the_commit_the_user_said_yes_to(env, tmp_path, 
     # The head the user said yes to is still the head: it may leave draft (once).
     pr["headRefOid"] = HEAD
     watchers.watch_prs(d)
-    yes = p.db.post("in", f"yes, mark {url} ready", chat="web")
+    yes = p.db.post("in", f"yes, mark {url} ready", chat="web", provenance="web-session")
     assert approve(yes) == ""
     rc, err, ran = gh("pr", "ready", "7")
     assert rc == 0 and ran, err
