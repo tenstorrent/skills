@@ -86,8 +86,9 @@ and preferences you add later become part of the project's charter and memory.
   coordinator picks deep. A re-review after a failed review is measured from the head that review
   recorded (`metrics.reviewed_head`), so a small fix on a large stack runs light.
 - When delivery has a review step (`delivery.review_before_pr` or a `delivery.push_branch`), the
-  daemon queues the review of each finished code task itself (`review.auto`, on by default), and
-  a hand-off with no follow-ups or notes starts no coordinator turn. `review.auto_notes` is added
+  daemon queues the review of each finished code task whose hand-off has no follow-ups, notes or
+  findings itself (`review.auto`, on by default), and that hand-off starts no coordinator turn.
+  Any other hand-off leaves the review to the coordinator's turn. `review.auto_notes` is added
   to each such review's spec (for example, what to do after a push). A review the coordinator adds
   for the same work replaces the daemon's while it has not started.
 - Each tier maps to a model and effort per provider (`providers.<name>.tiers`). The coordinator

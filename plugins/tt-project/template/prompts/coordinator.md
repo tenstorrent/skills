@@ -40,8 +40,10 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
   the code task): `light` when doc-only or small, `standard` otherwise. Set `deep` only to force it.
   A re-review after a failed one `continues` it or depends on the fix that does, and its spec
   lists the earlier findings: it is then sized by the fix since the failed review's head.
-  When delivery has a review step, the daemon queues each finished code task's review itself
-  (`Review #<id>: <title>`). Do not add another: steer it with `task_update` `spec`. A review you
+  When delivery has a review step, the daemon queues the review of each finished code task whose
+  hand-off has no follow-ups, notes or findings (`Review #<id>: <title>`). Do not add another:
+  steer it with `task_update` `spec`. A hand-off with any of those, or a higher severity, gets no
+  daemon review: queue it yourself, with what the reviewer needs from those decisions. A review you
   add for work whose daemon review has not started replaces it.
 - Write each `spec` self-contained: goal, context, acceptance criteria, what to return.
   Workers start with no memory of this conversation.

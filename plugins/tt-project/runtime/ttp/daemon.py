@@ -1250,12 +1250,15 @@ class Daemon:
         # ended without a verdict, leaves nothing to decide: the final attempt's outcome starts the turn.
         # A timeout still does, since the task may need splitting before it times out again.
         quiet = new == "queued" and status in ("limit", "auth", "failed", "lost", "stalled", "no_handoff")
-        # A finished code task's next step is its review: the daemon queues it, and a hand-off with
-        # nothing else to decide (no follow-ups or notes, normal severity) starts no coordinator turn.
-        review = self._auto_review(dict(task, **upd), summary) if new == "done" and task["kind"] == "code" else None
+        # A finished code task's next step is its review. A hand-off with nothing else to decide (no
+        # follow-ups or notes, normal severity) gets it from the daemon and starts no coordinator turn;
+        # any other leaves the review to that turn, so the reviewer starts after it and sees its decisions.
+        plain = not fups and not notes and sev == "normal"
+        review = self._auto_review(dict(task, **upd), summary, add=plain) \
+            if new == "done" and task["kind"] == "code" else None
         if review:
             text += f"\nReview #{review[0]} " + ("queued by the daemon." if review[1] else "was already queued.")
-        routine = review is not None and not fups and not notes and sev == "normal"
+        routine = review is not None and plain
         db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
              (time.time(), f"task:{task['id']}", f"task_{new}", sev, text,
               "handled" if quiet or routine else "queued", task["id"]))
@@ -2391,12 +2394,12 @@ class Daemon:
             self.p.db.update_task(task["id"], tier=tier)
         return dict(task, tier=tier)
 
-    def _auto_review(self, task: dict, summary: str) -> tuple[int, bool] | None:
+    def _auto_review(self, task: dict, summary: str, add: bool = True) -> tuple[int, bool] | None:
         """The review of a finished code task, queued here the way the coordinator would, so a
         routine hand-off needs no coordinator turn: (review id, whether it was added now). An open
         review that already covers the task (queued ahead by the coordinator) is that review. None
-        when delivery has no review step, the branch changes nothing, the review cap is reached or
-        the diff cannot be read: the coordinator then decides."""
+        when delivery has no review step, `add` is off and none is open, the branch changes nothing,
+        the review cap is reached or the diff cannot be read: the coordinator then decides."""
         cfg, db = self.cfg, self.p.db
         d = cfg.get("delivery") or {}
         rules = cfg.get("review") or {}
@@ -2407,6 +2410,8 @@ class Daemon:
             for t in db.q("SELECT * FROM tasks WHERE kind='review' AND status NOT IN ('done','failed','cancelled')"):
                 if task["id"] in dependency_ids(t) or (branch and branch in worktree.reviewed_refs(self.p, t)):
                     return t["id"], False
+            if not add:
+                return None
             changes = worktree.diff_lines(self.p, [branch]) if branch else None
             head = worktree._git(self.p.root, "rev-parse", "--short=12", branch) if changes else ""
         except Exception as e:

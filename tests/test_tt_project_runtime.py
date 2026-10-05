@@ -14172,12 +14172,13 @@ def test_the_daemon_queues_the_review_of_a_finished_code_task(env):
 
 def test_a_code_hand_off_with_more_to_decide_still_wakes_the_coordinator(env):
     p = make(env)
+    # Follow-ups or findings: the coordinator's turn queues the review, so the reviewer sees its decisions.
     fup = {"status": "done", "summary": "ok", "followups": [{"title": "next", "spec": "s"}]}
     _, _, done, reviews = _finish_code(env, p, "with follow-up", {"a.py": 5}, result=fup)
-    assert len(reviews) == 1 and done["status"] == "queued"
+    assert reviews == [] and done["status"] == "queued" and "Review #" not in done["text"]
     facts = {"status": "done", "summary": "ok", "findings": [{"fact": "x is slow", "source": "a.py"}]}
     _, _, done, reviews = _finish_code(env, p, "with findings", {"b.py": 5}, result=facts)
-    assert len(reviews) == 1 and done["status"] == "queued"
+    assert reviews == [] and done["status"] == "queued"
     # Nothing to review, or no review step in delivery: the coordinator decides.
     _, _, done, reviews = _finish_code(env, p, "no commits", {})
     assert reviews == [] and done["status"] == "queued"
@@ -14195,6 +14196,22 @@ def test_a_code_hand_off_with_more_to_decide_still_wakes_the_coordinator(env):
     p.set_config("coordinator.max_review_tasks_per_day", 0)
     _, _, done, reviews = _finish_code(env, p, "capped", {"f.py": 5})
     assert reviews == [] and done["status"] == "queued"
+
+
+def test_a_non_routine_hand_off_queues_no_review_that_holds_the_coordinator(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    p.db.x("UPDATE events SET status='handled'")
+    p.db.x("UPDATE tasks SET status='done'")
+    p.set_config("budget.max_parallel_workers", 1)
+    fup = {"status": "done", "summary": "ok", "followups": [{"title": "next", "spec": "s"}]}
+    _, _, done, reviews = _finish_code(env, p, "one slot", {"a.py": 5}, result=fup)
+    assert reviews == [] and p.db.ready_tasks() == []
+    d = Daemon(p.base)
+    d.update_gates()
+    queued = p.db.q("SELECT * FROM events WHERE status='queued'")
+    assert {e["kind"] for e in queued} >= {"task_done", "followup_proposed"}
+    assert not d._batch_hold(queued, time.time()), "a daemon review filled the free slot and held the turn"
 
 
 def test_the_daemon_adds_no_review_next_to_one_already_queued(env):

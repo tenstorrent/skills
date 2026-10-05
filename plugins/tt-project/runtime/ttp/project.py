@@ -96,8 +96,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
                  "push_allowed": True, "code_tasks_may_push": False},
     # Review tasks run light when the diff under review touches no risky_paths glob and is doc-only
     # or at most light_max_lines non-doc lines; otherwise standard. Only the coordinator picks deep.
-    # With `auto`, the daemon queues the review of each finished code task itself whenever delivery
-    # has a review step (review_before_pr or a push_branch); auto_notes ends each such review's spec.
+    # With `auto`, the daemon queues the review of each finished code task with a routine hand-off
+    # whenever delivery has a review step (review_before_pr or a push_branch); auto_notes ends each
+    # such review's spec.
     "review": {"light_max_lines": 60, "risky_paths": [], "auto": True, "auto_notes": ""},
     "jev": {"enabled": "auto"},
     "web": {"bind": "127.0.0.1", "port": 0},
