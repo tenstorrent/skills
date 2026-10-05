@@ -174,31 +174,119 @@ def keep_reason(path: Path) -> str | None:
     """Why this worktree must stay, or None when removing it loses nothing: no submodules set up in
     it, no uncommitted or untracked files, and its HEAD is on a local or remote branch (the task's
     own branch is never deleted, so its commits stay reachable)."""
-    def git(*args: str) -> subprocess.CompletedProcess:
-        return subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True, timeout=300)
+    return inspect(path)["why"]
+
+
+def inspect(path: Path) -> dict:
+    """keep_reason with what lies behind it: `why` (None: nothing to lose), `dirty` "untracked" (the
+    only dirty entries are untracked files, `untracked` lists them, HEAD is on a branch, no submodules)
+    or "tracked" (modified tracked files, `tracked` lists their paths, `fingerprint` hashes the
+    status and diff), else None."""
+    import hashlib
+
+    def git(*args: str, text: bool = True) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=text, timeout=300)
+    out = {"why": None, "dirty": None}
     # A submodule's repository lives in the worktree's own git directory (modules/), so commits made
     # in it exist nowhere else and removing the worktree would delete them. Such a worktree stays.
     gd = git("rev-parse", "--absolute-git-dir")
     if gd.returncode != 0:
-        return "git rev-parse failed"
+        return {**out, "why": "git rev-parse failed"}
     modules = Path(gd.stdout.strip()) / "modules"
     subs = git("submodule", "status")
     if subs.returncode != 0:
-        return "git submodule status failed"
+        return {**out, "why": "git submodule status failed"}
     inited = [ln.split()[1] for ln in subs.stdout.splitlines() if ln.strip() and not ln.startswith("-")]
     if inited or (modules.is_dir() and any(modules.iterdir())):
-        return ("has submodules set up (" + (", ".join(inited[:3]) or "modules/") + "); their commits may exist "
-                "only here, so it is never removed automatically")
+        return {**out, "why": "has submodules set up (" + (", ".join(inited[:3]) or "modules/") + "); their commits "
+                "may exist only here, so it is never removed automatically"}
     st = git("status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=none")
     if st.returncode != 0:
-        return "git status failed"
+        return {**out, "why": "git status failed"}
     dirty = st.stdout.splitlines()
-    if dirty:
-        return f"uncommitted changes in {len(dirty)} path(s), e.g. {dirty[0][3:].strip()[:80]}"
     held = git("for-each-ref", "--count=1", "--contains", "HEAD", "--format=%(refname)", "refs/heads", "refs/remotes")
     if held.returncode != 0:
-        return "git for-each-ref failed"
-    return None if held.stdout.strip() else "commits on no branch (detached HEAD)"
+        return {**out, "why": "git for-each-ref failed"}
+    detached = None if held.stdout.strip() else "commits on no branch (detached HEAD)"
+    if not dirty:
+        return {**out, "why": detached}
+    why = f"uncommitted changes in {len(dirty)} path(s), e.g. {dirty[0][3:].strip()[:80]}"
+    tracked = [ln[3:].strip() for ln in dirty if not ln.startswith("??")]
+    if tracked:
+        diff = git("diff", "HEAD", "--binary", text=False)
+        fp = hashlib.sha256(st.stdout.encode() + b"\0" + diff.stdout).hexdigest()[:16]
+        return {**out, "why": why, "dirty": "tracked", "tracked": tracked, "fingerprint": fp}
+    if detached:
+        return {**out, "why": f"{why}; {detached}"}
+    files = git("ls-files", "--others", "--exclude-standard", "-z")
+    if files.returncode != 0:
+        return {**out, "why": why}
+    return {**out, "why": why, "dirty": "untracked", "untracked": [e for e in files.stdout.split("\0") if e]}
+
+
+def move_leftovers(path: Path, rels: list[str], dest: Path) -> int:
+    """Move these untracked files (relative to the worktree) under `dest`, keeping their relative
+    paths; a name already there gets a numbered suffix. Returns how many moved."""
+    import shutil
+    moved = 0
+    for rel in rels:
+        src, to = path / rel, dest / rel
+        n = 1
+        while to.exists() or to.is_symlink():
+            to = dest / f"{rel}.{n}"
+            n += 1
+        to.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src), str(to))
+        moved += 1
+    return moved
+
+
+def _size(path: Path, rels: list[str]) -> int:
+    """Bytes these entries take (a directory: everything in it), links not followed."""
+    total = 0
+    for rel in rels:
+        full = path / rel
+        try:
+            if full.is_dir() and not full.is_symlink():
+                total += sum(f.lstat().st_size for f in full.rglob("*") if f.is_symlink() or f.is_file())
+            else:
+                total += full.lstat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def leftovers(p: Project, task_id: int, path: Path, rels: list[str], max_mb: float | None,
+              dry_run: bool = False) -> tuple[str | None, dict]:
+    """A finished task's worktree whose only dirty entries are untracked files (inspect): move them
+    to <its last run dir>/worktree-leftovers/ when they total at most `max_mb` (None: LEFTOVERS_MAX_MB;
+    0 or less: never). Returns (why it must stay or None, what moved or would move)."""
+    limit = LEFTOVERS_MAX_MB if max_mb is None else float(max_mb)
+    size = _size(path, rels)
+    info = {"files": len(rels), "bytes": size}
+    head = f"uncommitted untracked files only ({len(rels)}, {size / 1e6:.1f} MB, e.g. {rels[0][:80] if rels else '?'})"
+    if limit <= 0:
+        return f"{head}; moving them out is off (disk.worktree_leftovers_max_mb)", info
+    if size > limit * 1e6:
+        return f"{head}, over the {limit:g} MB limit for moving them out (disk.worktree_leftovers_max_mb)", info
+    run = last_run_dir(p, task_id)
+    if run is None:
+        return f"{head}; the task has no run directory to move them to", info
+    info["to"] = str(run / LEFTOVERS_DIR)
+    if dry_run:
+        return None, info
+    move_leftovers(path, rels, run / LEFTOVERS_DIR)
+    return keep_reason(path), info
+
+
+def last_run_dir(p: Project, task_id: int) -> Path | None:
+    r = p.db.one("SELECT id, dir FROM runs WHERE task=? ORDER BY id DESC LIMIT 1", (task_id,))
+    return (Path(r["dir"]) if r["dir"] else p.runs / str(r["id"])) if r else None
+
+
+LEFTOVERS_DIR = "worktree-leftovers"
+DIRTY_EVENT = "worktree_uncommitted"   # the coordinator's event for a finished worktree's tracked changes
+LEFTOVERS_MAX_MB = 50   # disk.worktree_leftovers_max_mb: untracked files up to this size move out
 
 
 # Build output and tool caches: regenerated on demand, often gigabytes. Only ignored entries are
@@ -345,7 +433,8 @@ def held_by(p: Project, task: dict, open_tasks: list[dict], now: float) -> str |
     user = needed_by(task, open_tasks)
     if user:
         return f"task #{user['id']} ({user['status']}) may still use it"
-    if p.db.one("SELECT id FROM events WHERE task=? AND status='queued' LIMIT 1", (task["id"],)):
+    if p.db.one("SELECT id FROM events WHERE task=? AND status='queued' AND kind!=? LIMIT 1",
+                (task["id"], DIRTY_EVENT)):
         return "the coordinator has not yet seen how it ended"
     if now - float(task["updated"] or now) < FINISH_GRACE_S:
         return f"it ended under {FINISH_GRACE_S // 60} min ago; kept for a review"
@@ -353,14 +442,18 @@ def held_by(p: Project, task: dict, open_tasks: list[dict], now: float) -> str |
 
 
 def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None,
-          skip=lambda task: False) -> list[dict]:
+          skip=lambda task: False, leftovers_max_mb: float | None = None, dry_run: bool = False) -> list[dict]:
     """Tidy the worktrees of finished tasks (done, failed, cancelled) with no run still going: clear
     their build and cache directories, then remove each one whose removal loses nothing (see
     keep_reason) and that holds no task's hand-off artifacts (see handoff_artifacts:
     `git worktree remove` deletes ignored files, where workers often leave them). A worktree that may still be wanted (see held_by: an unfinished task needs it, the
     coordinator has not seen the finish yet, or it ended under FINISH_GRACE_S ago) is left as it
-    is, and reported with `held` set. Branches stay, so a task that `continues` one starts from its
-    commits. One sweep at a time per project; a busy lock returns no results."""
+    is, and reported with `held` set. One whose only dirty entries are small untracked files has
+    them moved to its last run's directory first (see leftovers; reported in `moved`); one with
+    modified tracked files is kept and reported with `tracked` (paths) and `fingerprint`. Branches
+    stay, so a task that `continues` one starts from its commits. `dry_run` changes nothing and
+    reports what a sweep would do (`why` None: it would go). One sweep at a time per project; a
+    busy lock returns no results."""
     import fcntl
     import time
     from .db import TERMINAL_TASK_STATES
@@ -394,12 +487,20 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
             try:
                 entries = handoff_paths(p) if entries is None else entries
                 arts = handoff_artifacts(p, task["id"], path, entries=entries)
-                res["cleared"] = clear_caches(path, names, keep=arts)
-                res["why"] = keep_reason(path) or (
+                res["cleared"] = [] if dry_run else clear_caches(path, names, keep=arts)
+                info = inspect(path)
+                why = info["why"]
+                if info["dirty"] == "tracked":
+                    res.update(tracked=info["tracked"], fingerprint=info["fingerprint"])
+                elif info["dirty"] == "untracked" and not arts:
+                    why, moved = leftovers(p, task["id"], path, info["untracked"], leftovers_max_mb, dry_run)
+                    if "to" in moved:
+                        res["moved"] = moved
+                res["why"] = why or (
                     f"hand-off artifacts inside: {', '.join(arts[:3])}"[:200] + (f" (+{len(arts) - 3} more)"
                                                                                if len(arts) > 3 else "")
                     if arts else None)
-                if res["why"] is None:
+                if res["why"] is None and not dry_run:
                     remove(p, task["id"])
             except Exception as e:
                 res["why"] = f"error: {e}"[:300]

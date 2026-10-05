@@ -79,6 +79,8 @@ DISK_RESUME = 1.2        # the guard ends once free space is this many times its
 DISK_FLOOR_GB = 2        # below this even questions and plans wait
 DISK_DU_TIMEOUT_S = 30   # the guard alert's du breakdown stops after this, keeping what it measured
 DISK_DU_TOP = 6          # the biggest top-level directories it names
+KV_WORKTREES_LOGGED = "worktrees_logged"   # task -> the keep reason the daemon log last gave
+KV_WORKTREES_DIRTY = "worktrees_dirty"     # task -> modified tracked files a kept finished worktree holds
 KEEP_RECHECK_S = 6 * 3600   # a finished task's kept worktree is looked at again this often
 CONFIG_UNREADABLE_KEY = "config_unreadable"   # kv: project.json and its last good copy both unreadable
 ALERT_KEEP_S = 30 * 86400   # alerts_sent keeps an entry this long: the longest every_s any alert uses
@@ -2180,22 +2182,61 @@ class Daemon:
         def recent(task: dict) -> bool:
             memo = self._kept.get(task["id"])
             return bool(memo) and memo[0] == task["updated"] and now - memo[1] < KEEP_RECHECK_S
-        for r in worktree.sweep(self.p, older_than_s=days * 86400, names=cfg.get("cache_dirs"), skip=recent):
+        db = self.p.db
+        logged = db.kv(KV_WORKTREES_LOGGED) or {}      # task -> the keep reason last logged
+        dirty = db.kv(KV_WORKTREES_DIRTY) or {}        # task -> its kept tracked changes
+        for r in worktree.sweep(self.p, older_than_s=days * 86400, names=cfg.get("cache_dirs"), skip=recent,
+                                leftovers_max_mb=cfg.get("worktree_leftovers_max_mb")):
+            key = str(r["task"])
             if r["cleared"]:
                 log(self.p, f"worktree {r['path']} of task {r['task']}: removed {', '.join(r['cleared'][:10])}")
+            if r.get("moved"):
+                mv = r["moved"]
+                log(self.p, f"worktree {r['path']} of task {r['task']}: moved {mv['files']} untracked file(s) "
+                            f"({mv['bytes'] / 1e6:.1f} MB) to {mv['to']}")
+            if r.get("tracked"):
+                dirty[key] = self._uncommitted(r, dirty.get(key))
+            elif not r.get("held"):
+                dirty.pop(key, None)
             if r["why"] is None:
                 self._kept.pop(r["task"], None)
+                logged.pop(key, None)
                 log(self.p, f"worktree {r['path']} of task {r['task']} ({r['status']}) removed; "
                             f"branch {r['branch'] or '?'} kept")
             else:
-                if r["task"] not in self._kept:
+                if logged.get(key) != r["why"]:   # once per reason, across restarts too
+                    logged[key] = r["why"]
                     log(self.p, f"worktree {r['path']} of task {r['task']} kept: {r['why']}")
                 # Held (see worktree.held_by): checked again every sweep (no git work), so it goes soon after the hold ends.
                 self._kept[r["task"]] = (r["updated"], 0 if r.get("held") else now, r["why"])
         kept = {str(t): why for t, (_, _, why) in sorted(self._kept.items())
                 if (self.p.worktrees / f"t{t}").exists()}
-        if kept != (self.p.db.kv("worktrees_kept") or {}):
-            self.p.db.set_kv("worktrees_kept", kept or None)
+        if kept != (db.kv("worktrees_kept") or {}):
+            db.set_kv("worktrees_kept", kept or None)
+        for name, memo in ((KV_WORKTREES_LOGGED, logged), (KV_WORKTREES_DIRTY, dirty)):
+            memo = {k: v for k, v in memo.items() if (self.p.worktrees / f"t{k}").exists()}
+            if memo != (db.kv(name) or {}):
+                db.set_kv(name, memo or None)
+
+    def _uncommitted(self, r: dict, prev: dict | None) -> dict:
+        """A finished task's worktree holds modified tracked files: raise it to the coordinator once
+        per worktree and content (fingerprint); the worktree stays. Returns its KV_WORKTREES_DIRTY entry."""
+        db, now = self.p.db, time.time()
+        fp = f"{worktree.DIRTY_EVENT}:{r['task']}:{r['fingerprint']}"
+        paths = r["tracked"]
+        if not db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+            task = db.task(r["task"]) or {}
+            shown = ", ".join(paths[:5]) + (f" (+{len(paths) - 5} more)" if len(paths) > 5 else "")
+            db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
+                 (now, "daemon", worktree.DIRTY_EVENT, fp, "normal",
+                  f"#{r['task']} ({r['status']}) {(task.get('title') or '')[:80]} left uncommitted changes to tracked "
+                  f"files in its worktree {r['path']}: {shown}. The worktree is kept; it is never removed while "
+                  f"they are there. Decide: carry them on in a code task that continues #{r['task']} (commit them "
+                  f"on its branch {r['branch'] or '?'}), or discard them if they are not needed.", "queued", r["task"]))
+            log(self.p, f"worktree {r['path']} of task {r['task']}: uncommitted changes to {len(paths)} tracked "
+                        f"file(s); raised to the coordinator")
+        return {"status": r["status"], "paths": paths[:5], "count": len(paths), "fingerprint": r["fingerprint"],
+                "since": (prev or {}).get("since") if (prev or {}).get("fingerprint") == r["fingerprint"] else now}
 
     def probe_waiting(self) -> None:
         """A waiting task may name a shell probe (`retry_when`) for the thing it waits on. The probe

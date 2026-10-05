@@ -720,6 +720,8 @@ def status_text(p: Project) -> str:
         lines.append(h["release"])
     if h.get("local_only"):
         lines.append(h["local_only"])
+    if h.get("uncommitted"):
+        lines.append(h["uncommitted"])
     if h.get("upstream"):
         lines.append(h["upstream"])
     disk = db.kv("disk_low")
@@ -1138,18 +1140,26 @@ def set_when(db, tid: int, probe: str | None) -> str:
 
 def cmd_prune(a) -> None:
     """One sweep over finished tasks' worktrees, with the daemon's checks: clear build and cache
-    directories, remove the worktree when nothing is lost. Branches stay."""
+    directories, move small untracked leftovers to the task's last run directory, remove the worktree
+    when nothing is lost. Branches stay. --dry-run changes nothing and lists what would happen."""
     from . import worktree
     p = need(a.name, sys.argv[1:])
+    dry = getattr(a, "dry_run", False)
+    disk = p.config().get("disk", {})
     before = shutil.disk_usage(p.worktrees).free if p.worktrees.is_dir() else 0
-    res = worktree.sweep(p, names=p.config().get("disk", {}).get("cache_dirs"))
+    res = worktree.sweep(p, names=disk.get("cache_dirs"), leftovers_max_mb=disk.get("worktree_leftovers_max_mb"),
+                         dry_run=dry)
     for r in res:
         cleared = f"; cleared {', '.join(r['cleared'][:5])}" if r["cleared"] else ""
-        print(f"#{r['task']} ({r['status']}): " + ("removed, branch " + (r["branch"] or "?") + " kept"
+        mv = r.get("moved")
+        moved = (f"{'would move' if dry else 'moved'} {mv['files']} untracked file(s) ({mv['bytes'] / 1e6:.1f} MB) "
+                 f"to {mv['to']}; " if mv else "")
+        print(f"#{r['task']} ({r['status']}): " + (moved + ("would be removed" if dry else "removed") + ", branch "
+                                                   + (r["branch"] or "?") + " kept"
                                                    if r["why"] is None else f"kept: {r['why']}") + cleared)
     if not res:
         print("no finished task's worktree to tidy")
-    elif before:
+    elif before and not dry:
         print(f"freed {max(shutil.disk_usage(p.worktrees).free - before, 0) / 1e9:.1f} GB")
 
 
@@ -1809,6 +1819,8 @@ def main(argv: list[str] | None = None) -> None:
             s.add_argument("--label")
         if name == "status":
             s.add_argument("--json", action="store_true")
+        if name == "prune":
+            s.add_argument("--dry-run", action="store_true", help="change nothing; list what a sweep would do")
         if name == "logs":
             s.add_argument("--bytes", type=int, default=6000)
         s.set_defaults(fn=fn)

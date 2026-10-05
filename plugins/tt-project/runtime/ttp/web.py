@@ -19,7 +19,7 @@ from . import coordinator as coord
 from . import release
 from . import schedule as sched
 from . import upstream
-from .daemon import HEARTBEAT_STALE_S, KV_LOCAL_ONLY, LOGGED_OUT_NOTE, WAIT_KEYS, WATCHDOG_S, heartbeat, idle_wake
+from .daemon import HEARTBEAT_STALE_S, KV_LOCAL_ONLY, KV_WORKTREES_DIRTY, LOGGED_OUT_NOTE, WAIT_KEYS, WATCHDOG_S, heartbeat, idle_wake
 from .alerts import cleared  # noqa: F401  (readers import it from here)
 from .db import (DB, SEVERITY_RANK, chat_floor, continues_id, deferral, dependency_ids, dump_result, host_line,
                  load_result)
@@ -321,6 +321,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         "schedules_broken": sched.broken_line(db),
         "schedules_waiting": sched.waiting_line(db),
         "local_only": local_only_line(db),
+        "uncommitted": uncommitted_line(db),
         "upstream": upstream.status_line(db, cfg),
     }
 
@@ -340,6 +341,26 @@ def local_only_line(db: DB) -> str:
     more = f" and {len(items) - 5} more" if len(items) > 5 else ""
     return (f"{len(items)} done task{'' if len(items) == 1 else 's'} with work only on this machine "
             f"(branch not on any remote): {shown}{more}")
+
+
+def uncommitted_line(db: DB) -> str:
+    """Finished tasks' worktrees kept for modified tracked files (Daemon._uncommitted), in one line;
+    "" when there are none."""
+    kept = db.kv(KV_WORKTREES_DIRTY) or {}
+    if not kept:
+        return ""
+    ids = sorted(kept, key=int)
+    shown = ", ".join(f"#{k}" for k in ids[:8]) + (f" and {len(ids) - 8} more" if len(ids) > 8 else "")
+    return (f"{len(ids)} finished task worktree{'' if len(ids) == 1 else 's'} kept with uncommitted changes "
+            f"(raised to the coordinator): {shown}")
+
+
+def uncommitted_feed(db: DB) -> list[dict]:
+    """Feed rows (not the top section) for the worktrees uncommitted_line counts."""
+    return [{"id": None, "ts": v.get("since") or 0, "kind": "worktree", "severity": "normal", "state": "fyi",
+             "text": f"#{k} ({v.get('status')}) left uncommitted changes in {v.get('count')} tracked file(s), "
+                     f"e.g. {', '.join(v.get('paths') or [])}; its worktree is kept"}
+            for k, v in (db.kv(KV_WORKTREES_DIRTY) or {}).items()]
 
 
 def run_wake(note: str | None) -> str | None:
@@ -391,7 +412,7 @@ def state_payload(p: Project, db: DB) -> dict:
                        "WHERE status IN ('open','tracking') ORDER BY last_seen DESC LIMIT 100"),
         "schedules": sched.with_costs(db),
         "attention": attention(db, now),
-        "feed": alerts.feed(db, now),
+        "feed": sorted(alerts.feed(db, now) + uncommitted_feed(db), key=lambda m: -float(m["ts"] or 0)),
         "offline_help": offline_help(p.name),
         "budget": bud.history(db),
         "coordinator": db.kv("last_coordinator_summary", {}),

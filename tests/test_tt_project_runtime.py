@@ -4884,6 +4884,100 @@ def test_finished_worktrees_are_removed_at_task_end_only_when_nothing_is_lost(en
     assert not dirty.exists() and str(t_dirty) not in (p.db.kv("worktrees_kept") or {})
 
 
+def test_a_kept_worktree_is_logged_once_and_tracked_changes_raise_one_event(env, monkeypatch):
+    """The keep reason is logged when it changes, not every sweep, nor again after a restart. Modified
+    tracked files keep the worktree and reach the coordinator once per content; status and the web
+    feed show them, the top section does not."""
+    p = make(env)
+    _no_grace(monkeypatch)
+    from ttp import worktree
+    from ttp.cli import status_text
+    from ttp.daemon import Daemon
+    from ttp.web import state_payload
+    tid, path, _ = _code_task(p, "half done", status="failed")
+    _commit_file(path, "a")
+    (path / "a.txt").write_text("edited\n")
+    (path / "notes.md").write_text("scratch")
+
+    def events():
+        return p.db.q("SELECT * FROM events WHERE kind=?", (worktree.DIRTY_EVENT,))
+    Daemon(p.base).prune_worktrees()
+    Daemon(p.base).prune_worktrees(every_s=0)   # a restart forgets the in-memory memo
+    d = Daemon(p.base)
+    d.prune_worktrees()
+    assert path.exists() and (path / "a.txt").read_text() == "edited\n" and (path / "notes.md").exists()
+    log = (p.logs / "daemon.log").read_text()
+    assert log.count(f"task {tid} kept:") == 1, log
+    (ev,) = events()
+    assert ev["task"] == tid and ev["status"] == "queued" and "(failed)" in ev["text"] and "a.txt" in ev["text"]
+    assert "1 finished task worktree kept with uncommitted changes" in status_text(p)
+    st = state_payload(p, p.db)
+    assert any(m["kind"] == "worktree" and f"#{tid} (failed)" in m["text"] for m in st["feed"])
+    assert not any(f"#{tid}" in m["text"] for m in st["attention"])
+    # The event does not hold the worktree as "not yet seen" by the coordinator; new content is a new event.
+    assert "not yet seen" not in p.db.kv("worktrees_kept")[str(tid)]
+    (path / "a.txt").write_text("edited again\n")
+    p.db.update_task(tid, status="done")
+    d.prune_worktrees()
+    assert len(events()) == 2 and (p.logs / "daemon.log").read_text().count(f"task {tid} kept:") == 1
+    _git_out(path, "checkout", "--", "a.txt")   # now only the untracked note is left: it moves out
+    p.db.x("INSERT INTO runs(role,provider,started,status,task,dir) VALUES('worker','fake',?,'done',?,?)",
+           (time.time(), tid, str(p.runs / "77")))
+    p.db.update_task(tid, status="cancelled")
+    d.prune_worktrees()
+    assert not path.exists() and not p.db.kv("worktrees_dirty") and "uncommitted" not in status_text(p)
+
+
+def test_untracked_leftovers_move_to_the_last_run_and_the_worktree_goes(env, monkeypatch):
+    """A finished worktree whose only dirty entries are untracked files under the size limit: they move
+    to <last run dir>/worktree-leftovers/ with their relative paths, the worktree goes, the branch
+    stays. Over the limit it stays, logged once. Running and queued tasks' worktrees are untouched."""
+    p = make(env)
+    _no_grace(monkeypatch)
+    from ttp import worktree
+    from ttp.daemon import Daemon
+    tid, path, branch = _code_task(p, "done with scratch")
+    _commit_file(path, "work")
+    head = _git_out(path, "rev-parse", "HEAD")
+    (path / "tmp" / "sub").mkdir(parents=True)
+    (path / "tmp" / "sub" / "out.txt").write_text("scratch")
+    (path / "notes.md").write_text("notes")
+    for r in (1, 2):
+        p.db.x("INSERT INTO runs(role,provider,started,status,task,dir) VALUES('worker','fake',?,'done',?,?)",
+               (time.time(), tid, str(p.runs / f"r{r}")))
+    big_id, big, _ = _code_task(p, "done with a big file", status="cancelled")
+    p.db.x("INSERT INTO runs(role,provider,started,status,task) VALUES('worker','fake',?,'done',?)", (time.time(), big_id))
+    with open(big / "huge.bin", "wb") as fh:
+        fh.truncate(51 * 10**6)   # sparse: over the 50 MB default without using the disk
+    open_id, open_, _ = _code_task(p, "still queued", status="queued")
+    (open_ / "notes.md").write_text("mine")
+    run_id, running, _ = _code_task(p, "cancelled, run not ended", status="cancelled")
+    p.db.x("INSERT INTO runs(role,provider,started,status,task) VALUES('worker','fake',?,'running',?)",
+           (time.time(), run_id))
+    (running / "notes.md").write_text("mine")
+    dry = {r["task"]: r for r in worktree.sweep(p, dry_run=True)}
+    assert dry[tid]["why"] is None and dry[tid]["moved"]["files"] == 2 and path.exists()
+    assert "over the 50 MB limit" in dry[big_id]["why"] and open_id not in dry and run_id not in dry
+    d = Daemon(p.base)
+    d.prune_worktrees()
+    Daemon(p.base).prune_worktrees(every_s=0)
+    dest = p.runs / "r2" / worktree.LEFTOVERS_DIR
+    assert (dest / "tmp" / "sub" / "out.txt").read_text() == "scratch" and (dest / "notes.md").read_text() == "notes"
+    assert not path.exists() and _git_out(p.root, "rev-parse", branch) == head, "the branch was lost"
+    assert big.exists() and (big / "huge.bin").stat().st_size == 51 * 10**6
+    assert (open_ / "notes.md").read_text() == "mine" and (running / "notes.md").read_text() == "mine"
+    log = (p.logs / "daemon.log").read_text()
+    assert log.count(f"task {tid}: moved 2 untracked file(s)") == 1 and f"task {tid} (done) removed" in log
+    assert log.count(f"task {big_id} kept: uncommitted untracked files only") == 1, log
+    assert not p.db.q("SELECT id FROM events WHERE kind=?", (worktree.DIRTY_EVENT,))
+    # The limit is a setting; at 0 nothing moves.
+    t0, p0, _ = _code_task(p, "limit off")
+    (p0 / "x.txt").write_text("x")
+    p.set_config("disk.worktree_leftovers_max_mb", 0)
+    Daemon(p.base).prune_worktrees()
+    assert (p0 / "x.txt").exists() and "moving them out is off" in p.db.kv("worktrees_kept")[str(t0)]
+
+
 def test_the_worktree_sweep_leaves_the_push_queue_checkouts_alone(env, monkeypatch):
     """The batch's checkout (worktrees/push) and its after_push checkouts (worktrees/after_push-<id>)
     belong to no task: the sweep removes a finished task's worktree next to them, never them."""

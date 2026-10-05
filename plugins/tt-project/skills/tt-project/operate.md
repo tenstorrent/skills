@@ -63,13 +63,17 @@
   stopped after 30 s), so a full shared disk is not taken for project growth.
 - When a task ends (done, failed, cancelled), its worktree loses its git-ignored build and cache
   directories (`disk.cache_dirs`) and is removed once clean with HEAD on a branch. Branches are never
-  deleted, so `continues` still starts from the old commits. A dirty worktree is kept and listed, and
-  so is one with submodules set up (their commits may exist only there), and one holding git-ignored
+  deleted, so `continues` still starts from the old commits. One whose only dirty entries are untracked
+  files (HEAD on a branch) has them moved to its last run's `worktree-leftovers/` (relative paths kept)
+  and is removed, if they total at most `disk.worktree_leftovers_max_mb` (50; 0 never). One with
+  modified tracked files is kept and raised to the coordinator once per content (event
+  `worktree_uncommitted`); `ttp status` counts them and the web app lists them in the feed. Any other
+  dirty worktree is kept and listed, and so is one with submodules set up (their commits may exist only there), and one holding git-ignored
   files that any task's hand-off (`result.json` `artifacts`, globs too) lists; cache clearing skips those. A worktree is
   left untouched for at least an hour after its task ends, until the coordinator has seen the result,
   and while an unfinished task still needs it (it depends on or continues the task, or its spec names
   the task's branch, id or `worktrees/tN` path). `disk.worktree_retention_days` waits longer; 0 never tidies.
-  `ttp prune <name>` sweeps now.
+  `ttp prune <name>` sweeps now (`--dry-run` lists what it would do). Each keep reason is logged once.
 - Workers and reviewers run with the project's Python venv active (`VIRTUAL_ENV`, `PATH`; their
   prompt names it), so a fresh worktree does not rebuild one. `worktree.venv`: `auto` (default) finds
   `.venv` or `venv` in the project root, a path names another, `""` turns it off. A worktree with a
