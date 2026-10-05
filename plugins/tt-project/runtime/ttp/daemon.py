@@ -115,7 +115,7 @@ KV_LOCAL_ONLY = "local_only"   # kv: {task id: {branch, head, ahead, since}} for
 KV_INTEGRITY = "integrity"   # kv: the last boot integrity check (see Daemon.check_integrity)
 INTEGRITY_RECHECK_S = 3600
 KV_LOCAL_ONLY_FROM = "local_only_from"   # kv: when the check first ran; tasks done before it are not checked
-KV_BACKUP = "backup_pending"   # kv: {task id: {branch, tries, next}} done code tasks' branches for delivery.backup_remote
+KV_BACKUP = "backup_pending"   # kv: {task id: {branch, tries, next}}: branches for delivery.backup_remote
 BACKUP_TRIES = 3            # a backup push that fails this often (network, auth) is given up with an observation
 BACKUP_RETRY_S = 900        # times the try count: the wait before a failed backup push is tried again
 KV_DIRTY_MAIN = "dirty_main"   # kv: key of the main checkout's dirty tracked paths last reported
@@ -458,9 +458,9 @@ class Daemon:
             self._last_cfg = now
             self.jev = Jev(self.cfg, db=self.p.db)
         for step in (self.reap_runs, self.wake_after_reboot, self.meter_running, self.reconcile_tasks, self.tend_pushes,
-                     self.prune_worktrees, self.backup_branches, self.check_local_only, self.check_disk, self.sweep_alerts,
-                     self.check_release, self.sync_shared_pauses, self.check_integrity, self.sync_schedules,
-                     self.lint_charter):
+                     self.prune_worktrees, self.backup_branches, self.check_local_only, self.check_disk,
+                     self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_integrity,
+                     self.sync_schedules, self.lint_charter):
             step()
             self._progress()
         if self.p.db.kv("paused", False):
