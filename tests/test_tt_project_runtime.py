@@ -10934,6 +10934,60 @@ def test_push_own_publishes_a_named_branch_only_as_a_fast_forward(env, monkeypat
     assert log.read_text().split() == [first, second], "no refused push ran its checks"
 
 
+def test_push_never_rewrites_a_published_task_branch_and_rebases_an_unpublished_one_in_place(
+        env, monkeypatch, capsys):
+    from ttp import worktree
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    monkeypatch.setenv("TTP_TASK", "50")
+    _git_out(repo, "checkout", "-q", "-b", "ttp/t50-exp")
+    _commit(repo, "mine.txt", "mine\n")
+    assert _ttp("push", "--own") == 0
+    mine = _git_out(repo, "rev-parse", "HEAD")
+    _commit(other, "theirs.txt", "theirs\n")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    theirs = _git_out(origin, "rev-parse", "proj")
+    capsys.readouterr()
+    assert _ttp("push") == 0
+    assert "stays as it is" in capsys.readouterr().err
+    # The target took a rebased copy; the named branch, here and on the remote, is as it was.
+    landed = _git_out(origin, "rev-parse", "proj")
+    assert _git_out(origin, "rev-parse", f"{landed}~1") == theirs and landed != mine
+    assert _git_out(origin, "show", f"{landed}:mine.txt") == "mine"
+    assert _git_out(repo, "symbolic-ref", "--short", "HEAD") == "ttp/t50-exp"
+    assert _git_out(repo, "rev-parse", "HEAD") == mine == _git_out(origin, "rev-parse", "ttp/t50-exp")
+    # The worktree's delivered check still counts the work as in the target (patch-id match).
+    _git_out(repo, "fetch", "-q", "origin", "+refs/heads/proj:refs/remotes/origin/proj")
+    assert worktree.delivered(repo, mine, "origin/proj")
+    # New commits on the branch still publish as a fast-forward of the remote's copy.
+    _commit(repo, "more.txt", "more\n")
+    assert _ttp("push", "--own") == 0
+    assert _git_out(origin, "rev-parse", "ttp/t50-exp") == _git_out(repo, "rev-parse", "HEAD")
+    # A detached push reports the commit it pushed, not the branch's head.
+    _git_out(other, "pull", "-q", "--rebase", "origin", "proj")
+    _commit(other, "theirs2.txt", "theirs2\n")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    rc, marker, probe = _detach(capsys)
+    assert rc == 0
+    r = _probe_until_done(p, probe)
+    pushed = _git_out(origin, "rev-parse", "proj")
+    assert r.returncode == 0 and json.loads(marker.read_text())["sha"] == pushed, r
+    assert _git_out(repo, "symbolic-ref", "--short", "HEAD") == "ttp/t50-exp"
+    assert _git_out(origin, "rev-parse", "ttp/t50-exp") == _git_out(repo, "rev-parse", "HEAD") != pushed
+    # A branch the remote does not have is rebased in place, as before.
+    monkeypatch.setenv("TTP_TASK", "51")
+    _git_out(repo, "checkout", "-q", "-b", "ttp/t51-local", "origin/proj")
+    _commit(repo, "local.txt", "local\n")
+    _git_out(other, "pull", "-q", "--rebase", "origin", "proj")
+    _commit(other, "theirs3.txt", "theirs3\n")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    capsys.readouterr()
+    assert _ttp("push") == 0
+    assert "stays as it is" not in capsys.readouterr().err
+    assert _git_out(repo, "rev-parse", "ttp/t51-local") == _git_out(origin, "rev-parse", "proj")
+    assert _git_out(origin, "for-each-ref", "--format=%(refname:short)", "refs/heads").split() == [
+        "proj", "ttp/t50-exp"]
+
+
 def test_push_own_without_checks_publishes_docs_only_and_refuses_code(env, monkeypatch, capsys):
     p, repo, origin, other = _push_setup(env, monkeypatch, [])
     p.set_config("delivery.push_checks", [])

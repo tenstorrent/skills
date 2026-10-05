@@ -804,11 +804,41 @@ def push(repo: Path, remote: str, branch: str, checks: list[str], rounds: int = 
     lock = hold() if hold else None
     if hold and lock is None:
         return BUSY
+    global last_pushed
+    last_pushed = None
+    keep = published(repo, remote, branch)
+    if keep:
+        # The rebase would rewrite a branch the remote already has, and a later `ttp push --own` of
+        # it would be rejected; it runs on a detached HEAD and the branch stays as it was.
+        say(f"{keep} is on {remote}; rebasing a detached copy, the branch stays as it is")
+        _git(repo, "switch", "--detach", "--quiet")
     try:
         return _rounds(repo, remote, branch, checks, rounds, say, version_bump, timed)
     finally:
+        if keep:
+            if Path(_git(repo, "rev-parse", "--absolute-git-dir").stdout.strip(), "rebase-merge").is_dir():
+                _git(repo, "rebase", "--abort")
+            if _git(repo, "switch", "--quiet", keep).returncode != 0:
+                say(f"could not switch back to {keep}; HEAD is detached, the branch is unchanged")
         if lock is not None:
             lock.close()
+
+
+last_pushed: str | None = None   # the commit the last push() pushed; HEAD may be back on its branch
+
+
+def published(repo: Path, remote: str, target_branch: str) -> str:
+    """The checked-out branch when the remote has it and its tip there is an ancestor of HEAD (it was
+    published, e.g. with `ttp push --own`), else "". Not the push target itself: rebasing that onto
+    its own tip rewrites nothing."""
+    name = _git(repo, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
+    if not name or name == target_branch:
+        return ""
+    ls = _git(repo, "ls-remote", "--heads", remote, f"refs/heads/{name}")
+    tip = ls.stdout.split()[0] if ls.returncode == 0 and ls.stdout.strip() else ""
+    if tip and _git(repo, "merge-base", "--is-ancestor", tip, "HEAD").returncode == 0:
+        return name
+    return ""
 
 
 def publish(repo: Path, remote: str, branch: str, checks: list[str],
@@ -916,6 +946,7 @@ def _rebase(repo: Path, tip: str) -> bool:
 def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int,
             say: Callable[[str], None], version_bump: dict | None = None,
             timed: Callable[[float], None] | None = None) -> int:
+    global last_pushed
     upstream = f"{remote}/{branch}"
     for rnd in range(1, rounds + 1):
         tip = _fetch(repo, remote, branch)
@@ -958,6 +989,7 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
             continue
         # Without --force the remote refuses anything that is not a fast-forward of what we tested on.
         if _git(repo, "push", remote, f"{head}:refs/heads/{branch}", quiet=False).returncode == 0:
+            last_pushed = head
             say(f"pushed {head[:10]} to {upstream}")
             return 0
         if _fetch(repo, remote, branch) == tip:
@@ -1229,14 +1261,14 @@ def run_detached(p: Project, repo: Path, marker: Path, own: bool = False) -> int
     top = Path(_git(repo, "rev-parse", "--show-toplevel").stdout.strip() or repo)
     sha = version = None
     if rc == 0:
-        sha = _git(top, "rev-parse", "HEAD").stdout.strip() or None
+        sha = (None if own else last_pushed) or _git(top, "rev-parse", "HEAD").stdout.strip() or None
     if rc == 0 and not own:
         try:
             cfg = bump_of((p.config().get("delivery") or {}).get("version_bump"))
         except ValueError:
             cfg = None
         if cfg:
-            show = _git(top, "show", f"HEAD:{cfg['files'][0]}")
+            show = _git(top, "show", f"{sha or 'HEAD'}:{cfg['files'][0]}")
             m = VERSION_RE.search(show.stdout) if show.returncode == 0 else None
             version = ".".join(m.group(2, 3, 4)) if m else None
     sys.stdout.flush()
