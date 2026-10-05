@@ -122,8 +122,57 @@ def drift(p: Project) -> dict | None:
             "newer": _num(new_v) > _num(cur_v)}
 
 
+UPGRADE_RESOURCE = "harness-upgrade"     # `ttp lock --probe harness-upgrade` tells whether one runs
+GUARD_ENV = "TTP_HARNESS_UPGRADE"         # set only while `ttp upgrade` holds the lock and moves main
+GUARD_MARK = "# tt-project merge guard"
+# Git runs this before it moves any ref. Moving main onto a commit that newly takes in the template
+# branch is a merge of `upstream`: only `ttp upgrade` may do it, so a second process can never commit
+# its own resolution of the same merge (and drop local wiring) behind an upgrade's back.
+GUARD_HOOK = GUARD_MARK + """
+[ "$1" = prepared ] || exit 0
+[ -n "$TTP_HARNESS_UPGRADE" ] && exit 0
+up=$(git rev-parse -q --verify refs/heads/upstream) || exit 0
+z=0000000000000000000000000000000000000000
+while read -r old new ref; do
+  [ "$ref" = refs/heads/main ] && [ "$old" != $z ] && [ "$new" != $z ] || continue
+  git merge-base --is-ancestor "$up" "$new" 2>/dev/null || continue
+  git merge-base --is-ancestor "$up" "$old" 2>/dev/null && continue
+  echo "refused: only \\`ttp upgrade\\` merges the tt-project template (upstream) into main." >&2
+  echo "An upgrade task finishes a conflicting merge with \\`ttp upgrade <name> --apply <commit>\\`." >&2
+  exit 1
+done
+exit 0
+"""
+
+
 def upgrade_lock(p: Project) -> Path:
-    return p.state / "upgrade.lock"
+    """The same file as `ttp lock harness-upgrade` takes: held for a whole `ttp upgrade`, released by
+    the OS when its process ends, so a crash never wedges the project."""
+    return locks.slot_paths(p.state / "locks", UPGRADE_RESOURCE, 1)[0]
+
+
+def guard_harness(h: Path) -> bool:
+    """Install the merge guard as the harness repo's reference-transaction hook (git 2.28+; older git
+    skips it). A hook the project wrote itself is left alone. True when it is in place."""
+    r = subprocess.run(["git", "-C", str(h), "rev-parse", "--git-path", "hooks"], capture_output=True, text=True)
+    if r.returncode != 0:
+        return False
+    hooks = Path(r.stdout.strip())
+    hook = (hooks if hooks.is_absolute() else h / hooks) / "reference-transaction"
+    text = "#!/bin/sh\n" + GUARD_HOOK
+    try:
+        have = hook.read_text() if hook.exists() else ""
+        if have and GUARD_MARK not in have:
+            return False
+        if have != text:
+            hook.parent.mkdir(parents=True, exist_ok=True)
+            tmp = hook.with_name(hook.name + ".tmp")
+            tmp.write_text(text)
+            tmp.chmod(0o755)
+            os.replace(tmp, hook)
+        return True
+    except OSError:
+        return False
 
 
 def _taken(path: Path) -> bool:

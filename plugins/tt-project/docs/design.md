@@ -99,6 +99,11 @@ What each supported CLI offers, with doc links: [providers.md](providers.md).
 - `ttp upgrade <name>` commits the installed template on `upstream`, merges it into `main` in a
   scratch worktree, and fast-forwards the live harness only when the merge is clean and the
   runtime compiles and imports. Otherwise it queues a harness task and changes nothing.
+  It holds the `harness-upgrade` lock (state/locks, released by the OS when it exits) for the whole
+  merge, refuses while another upgrade runs or the upgrade task is open, and does not commit when
+  `main` changed runtime/, prompts/ or bin/ meanwhile. The task applies its resolution with
+  `ttp upgrade <name> --apply <commit>` (fast-forward only). A reference-transaction hook in the
+  harness repo refuses every other update of `main` that newly takes in `upstream`.
 - Each daemon compares `~/.tt-project/lib/current` (version and source commit) with its own
   harness runtime at start and then hourly. While the installed release is newer (or the same
   version from another commit), `ttp status` and the web app show `tt-project <installed>

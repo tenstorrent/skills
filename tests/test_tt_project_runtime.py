@@ -6066,10 +6066,15 @@ def test_a_conflicting_upgrade_leaves_the_harness_untouched_and_queues_a_task(en
     task = p.db.one("SELECT * FROM tasks WHERE kind='harness'")
     assert task and "kind-harness.md" in task["spec"] and not restarts
     assert len(_git_out(h, "worktree", "list").splitlines()) == 1
-    # Once upstream agrees with the project, the next upgrade merges and restarts.
+    # Once upstream agrees with the project, the next upgrade merges and restarts; while the task
+    # that finishes the earlier merge is open, a second upgrade would race it and is refused.
     worker = (RUNTIME.parent / "template" / "prompts" / "worker.md").read_text()
     _install_template(env, {"kind-harness.md": "# Harness task, this project's way\n",
                             "worker.md": worker + "\nupstream line\n"})
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo"])
+    assert e.value.code == 75 and _git_out(h, "rev-parse", "HEAD") == before and not restarts
+    p.db.update_task(task["id"], status="cancelled")
     cli.main(["upgrade", "demo"])
     assert "upstream line" in (h / "prompts" / "worker.md").read_text() and restarts == [1]
 
@@ -6228,6 +6233,142 @@ def test_upgrade_refuses_when_a_lost_runtime_file_cannot_be_restored(env, monkey
         cli.main(["upgrade", "demo"])
     assert e.value.code == 1 and _git_out(h, "rev-parse", "HEAD") == head
     assert not (h / "runtime" / "ttp" / "push.py").exists()
+
+
+def _conflicting_upgrade(env, monkeypatch):
+    """A project whose harness prompt conflicts with the installed template; restarts are recorded."""
+    p = make(env)
+    from ttp import service
+    restarts = []
+    monkeypatch.setattr(service, "restart", lambda p: restarts.append(1) or "restarted")
+    (p.harness / "prompts" / "kind-harness.md").write_text("# Harness task, this project's way\n")
+    _git_out(p.harness, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "local prompt")
+    _install_template(env, {"kind-harness.md": "# Harness task, upstream's way\n"})
+    return p, restarts
+
+
+def test_a_second_upgrade_is_refused_while_one_holds_the_harness_upgrade_lock(env, monkeypatch):
+    from ttp import cli, locks, release, service
+    p = make(env)
+    monkeypatch.setattr(service, "restart", lambda p: "restarted")
+    _install_template(env)
+    (env["home"] / "lib" / "current" / "runtime" / "ttp" / "SOURCE_COMMIT").write_text("abc1234\n")
+    assert release.upgrade_lock(p) == locks.slot_paths(p.state / "locks", "harness-upgrade", 1)[0], \
+        "the same lock `ttp lock harness-upgrade` takes"
+    before = _git_out(p.harness, "rev-parse", "HEAD")
+    held = locks.try_take([release.upgrade_lock(p)], "ttp upgrade (pid 1)", "ttp upgrade")
+    try:
+        with pytest.raises(SystemExit) as e:
+            cli.main(["upgrade", "demo"])
+        assert e.value.code == 75
+        assert _git_out(p.harness, "rev-parse", "HEAD") == before
+        assert _git_out(p.harness, "rev-parse", "upstream") != "" and not p.db.q("SELECT id FROM tasks")
+    finally:
+        held.close()
+    cli.main(["upgrade", "demo"])
+    assert _git_out(p.harness, "rev-parse", "HEAD") != before
+
+
+def test_the_upgrade_lock_is_released_after_a_failed_a_crashed_and_a_successful_upgrade(env, monkeypatch):
+    from ttp import cli, locks, release
+    p, restarts = _conflicting_upgrade(env, monkeypatch)
+
+    def free():
+        f = locks.try_take([release.upgrade_lock(p)], "test")
+        return f is not None and (f.close() or True)
+    with pytest.raises(SystemExit):
+        cli.main(["upgrade", "demo"])                   # conflicts: queues a task
+    assert free() and p.db.one("SELECT id FROM tasks WHERE kind='harness'")
+    p.db.update_task(p.db.one("SELECT id FROM tasks")["id"], status="cancelled")
+    real = cli._merge_upstream
+    monkeypatch.setattr(cli, "_merge_upstream", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    with pytest.raises(RuntimeError):
+        cli.main(["upgrade", "demo"])
+    assert free(), "an error mid-merge must not wedge the project"
+    monkeypatch.setattr(cli, "_merge_upstream", real)
+    _install_template(env, {"kind-harness.md": "# Harness task, this project's way\n"})
+    cli.main(["upgrade", "demo"])
+    assert restarts == [1] and free()
+
+
+def test_an_upgrade_whose_main_moved_under_the_merge_does_not_commit(env, monkeypatch):
+    """A second process changed the template's files on main while the upgrade merged: the checked
+    merge would drop that change, so the upgrade stops and reports instead."""
+    from ttp import cli, service
+    p = make(env)
+    restarts = []
+    monkeypatch.setattr(service, "restart", lambda p: restarts.append(1) or "restarted")
+    h = p.harness
+    worker = (RUNTIME.parent / "template" / "prompts" / "worker.md").read_text()
+    _install_template(env, {"worker.md": worker + "\nupstream line\n"})
+    real = cli._merge_upstream
+
+    def racing(*a, **k):
+        out = real(*a, **k)
+        (h / "runtime" / "ttp" / "local_wiring.py").write_text("LOCAL = True\n")
+        _git_out(h, "-c", "user.name=t", "-c", "user.email=t@t", "add", "-A")
+        _git_out(h, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "local wiring")
+        return out
+    monkeypatch.setattr(cli, "_merge_upstream", racing)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo"])
+    assert e.value.code == 1 and not restarts
+    assert _git_out(h, "log", "-1", "--format=%s") == "local wiring"
+    assert "upstream line" not in (h / "prompts" / "worker.md").read_text()
+    # A charter or memory commit of the daemon meanwhile is kept, and the upgrade goes through.
+    monkeypatch.setattr(cli, "_merge_upstream", lambda *a, **k: (
+        out := real(*a, **k), (h / "CHARTER.md").write_text("# changed\n"),
+        _git_out(h, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "charter"))[0])
+    cli.main(["upgrade", "demo"])
+    assert "upstream line" in (h / "prompts" / "worker.md").read_text() and restarts == [1]
+    assert (h / "CHARTER.md").read_text() == "# changed\n" and (h / "runtime" / "ttp" / "local_wiring.py").exists()
+
+
+def test_only_the_upgrade_task_applies_its_merge_and_a_hand_merge_of_upstream_is_refused(env, monkeypatch, tmp_path):
+    from ttp import cli
+    p, restarts = _conflicting_upgrade(env, monkeypatch)
+    h = p.harness
+    with pytest.raises(SystemExit):
+        cli.main(["upgrade", "demo"])
+    tid = p.db.one("SELECT id FROM tasks WHERE kind='harness'")["id"]
+    before = _git_out(h, "rev-parse", "HEAD")
+    ident = ["-c", "user.name=t", "-c", "user.email=t@t"]
+    # A second process merges upstream into the live main by hand: git refuses, main stays.
+    r = subprocess.run(["git", "-C", str(h), *ident, "merge", "-X", "theirs", "--no-edit", "upstream"],
+                       capture_output=True, text=True)
+    assert r.returncode != 0 and "only `ttp upgrade`" in r.stderr
+    assert _git_out(h, "rev-parse", "HEAD") == before
+    subprocess.run(["git", "-C", str(h), "merge", "--abort"], capture_output=True)
+    subprocess.run(["git", "-C", str(h), "reset", "-q", "--hard", before], capture_output=True)
+    # The task resolves in its own worktree, keeping the project's intent.
+    wt = tmp_path / "merge"
+    _git_out(h, "worktree", "add", "-q", "--detach", str(wt), "main")
+    subprocess.run(["git", "-C", str(wt), *ident, "merge", "upstream"], capture_output=True)
+    (wt / "prompts" / "kind-harness.md").write_text("# Harness task, this project's way\n")
+    _git_out(wt, "add", "-A")
+    _git_out(wt, *ident, "commit", "-qm", "merge upstream")
+    merged = _git_out(wt, "rev-parse", "HEAD")
+    monkeypatch.delenv("TTP_TASK", raising=False)
+    for argv in (["upgrade", "demo"], ["upgrade", "demo", "--apply", merged]):   # not the task's run
+        with pytest.raises(SystemExit) as e:
+            cli.main(argv)
+        assert e.value.code == 75 and _git_out(h, "rev-parse", "HEAD") == before
+    monkeypatch.setenv("TTP_TASK", str(tid))
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo"])                  # the task applies its own resolution, not a new one
+    assert e.value.code == 2
+    # main moved since the task merged: --apply stops instead of overwriting it.
+    (h / "prompts" / "worker.md").write_text("local rule\n")
+    _git_out(h, *ident, "commit", "-qam", "local rule")
+    moved = _git_out(h, "rev-parse", "HEAD")
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo", "--apply", merged])
+    assert e.value.code == 1 and _git_out(h, "rev-parse", "HEAD") == moved and not restarts
+    subprocess.run(["git", "-C", str(wt), *ident, "merge", "--no-edit", "main"], capture_output=True, check=True)
+    merged = _git_out(wt, "rev-parse", "HEAD")
+    cli.main(["upgrade", "demo", "--apply", merged])
+    assert _git_out(h, "rev-parse", "HEAD") == merged and restarts == [1]
+    assert (h / "prompts" / "worker.md").read_text() == "local rule\n"
 
 
 def test_restart_rolls_back_a_runtime_the_daemon_cannot_start_with(env):
@@ -21144,7 +21285,7 @@ def test_upgrade_task_merges_main_before_ff_only_and_keeps_worktree_on_failure(e
     from ttp import cli
     t = cli._UPGRADE_TASK
     assert "git merge main" in t
-    assert t.index("git merge main") < t.index("--ff-only")
+    assert t.index("git merge main") < t.index("--apply <commit>")    # applied under the upgrade lock
     assert "|" not in t
     assert "keep <tmp>" in t
 

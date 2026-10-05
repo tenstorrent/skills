@@ -323,6 +323,8 @@ def bootstrap(root: Path, name: str, brief: str, provider: str) -> Project:
     _git(p.harness, "-c", "user.name=tt-project", "-c", "user.email=tt-project@localhost", "commit", "-q",
          "-m", f"tt-project template {__version__}")
     _git(p.harness, "checkout", "-q", "-b", "main")
+    from . import release
+    release.guard_harness(p.harness)
     charter = (template / "CHARTER.md").read_text().replace("{{NAME}}", name).replace(
         "{{DATE}}", time.strftime("%Y-%m-%d")).replace("{{BRIEF}}", brief.strip() or "(no description given yet)")
     durable_write(p.charter_path, charter)
@@ -1925,11 +1927,29 @@ def cmd_upgrade(a) -> None:
             print(mm.push(entry.get("ssh") or entry["host"]))
             sys.exit(forward(entry, sys.argv[1:]))
         p = need(a.name, sys.argv[1:])
+    tid = release.open_upgrade_task(p)
+    mine = bool(tid) and os.environ.get("TTP_TASK") == str(tid)
+    if tid and not mine:      # its worker is resolving the merge: a second resolution would race it
+        if a.auto:
+            release.finish(p, "held", why=f"harness task #{tid} finishes an earlier upgrade")
+        die(f"upgrade refused: harness task #{tid} is finishing an earlier template upgrade of {p.name}; "
+            f"nothing was changed. Rerun once it has ended.", 75)
+    if a.apply is None and mine:
+        die(f"task #{tid} finishes the merge in its own worktree and applies it with "
+            f"`ttp upgrade {p.name} --apply <commit>`", 2)
     held = locks.try_take([release.upgrade_lock(p)], f"ttp upgrade (pid {os.getpid()})", "ttp upgrade")
     if held is None:
-        die(f"another upgrade of {p.name} is running", 75)
+        if a.auto:
+            release.finish(p, "held", why="another upgrade is running")
+        who = locks.holders([release.upgrade_lock(p)])
+        die(f"upgrade refused: another upgrade of {p.name} is running"
+            + (f" ({who[0]})" if who else "") + "; nothing was changed", 75)
     try:
-        _upgrade(p, a.auto)
+        release.guard_harness(p.harness)
+        if a.apply is not None:
+            _apply_upgrade(p, a.apply)
+        else:
+            _upgrade(p, a.auto)
     except SystemExit as e:
         if a.auto and e.code and (p.db.kv(release.KV_AUTO) or {}).get("outcome") == "running":
             release.finish(p, "failed", why=f"exit {e.code}; see logs/upgrade.log")
@@ -1966,6 +1986,7 @@ def _upgrade(p: Project, auto: bool = False) -> None:
     if _git(h, "status", "--porcelain"):
         _git(h, "add", "-A")
         _git(h, *ident, "commit", "-q", "-m", "local harness changes before template upgrade")
+    base = _git(h, "rev-parse", "HEAD")     # the merge is checked against this; main must not move meanwhile
     tmp = p.state / "upgrade-wt"
     if tmp.exists():
         shutil.rmtree(tmp)
@@ -1980,7 +2001,7 @@ def _upgrade(p: Project, auto: bool = False) -> None:
             _git(tmp, *ident, "commit", "-q", "-m", f"tt-project template {new_v} ({new_c})")
     finally:
         _git(h, "worktree", "remove", "--force", str(tmp))
-    merged, problem = _merge_upstream(h, p.state / "upgrade-merge", ident)
+    merged, problem = _merge_upstream(h, p.state / "upgrade-merge", ident, base)
     if problem:
         _ensure_git_ident(h)        # the task merges and commits in a fresh worktree of this repo
         tid = release.open_upgrade_task(p) or p.db.add_task(
@@ -1995,9 +2016,17 @@ def _upgrade(p: Project, auto: bool = False) -> None:
         release.finish(p, "held", why="a push is in flight")
         print("upgrade held: a push is in flight; the running harness is unchanged and the daemon retries later")
         sys.exit(75)
-    r = subprocess.run(["git", "-C", str(h), *ident, "merge", "--ff-only", merged], capture_output=True, text=True)
+    moved = _moved_template(h, base)
+    if moved:
+        if auto:
+            release.finish(p, "failed", why=moved[:300])
+        die(f"upgrade not applied; the running harness is unchanged. {moved}", 1)
+    genv = {**os.environ, release.GUARD_ENV: "1"}
+    r = subprocess.run(["git", "-C", str(h), *ident, "merge", "--ff-only", merged], capture_output=True, text=True,
+                       env=genv)
     if r.returncode != 0:   # the daemon committed charter or memory meanwhile: those touch other files
-        r = subprocess.run(["git", "-C", str(h), *ident, "merge", "--no-edit", merged], capture_output=True, text=True)
+        r = subprocess.run(["git", "-C", str(h), *ident, "merge", "--no-edit", merged], capture_output=True,
+                           text=True, env=genv)
         if r.returncode != 0:
             subprocess.run(["git", "-C", str(h), "merge", "--abort"], capture_output=True)
             die(f"could not apply the checked upgrade to {h}: {r.stdout[-500:]}", 1)
@@ -2016,6 +2045,49 @@ def _upgrade(p: Project, auto: bool = False) -> None:
               f"restarted and running work was kept.", chat=None, kind="alert", severity="low")
 
 
+def _moved_template(h: Path, base: str) -> str:
+    """Why main may not take the checked merge ("" = it may): since `base` someone else changed the
+    template's files on it, or merged upstream into it. Only charter, memory and config commits of the
+    daemon may land meanwhile; the merge then keeps them. Anything else would be overwritten."""
+    head = _git(h, "rev-parse", "HEAD")
+    if head == base:
+        return ""
+    if subprocess.run(["git", "-C", str(h), "merge-base", "--is-ancestor", base, head]).returncode != 0:
+        return f"main moved from {base[:12]} to {head[:12]} and no longer contains it"
+    touched = _git(h, "diff", "--name-only", base, head, "--", "runtime", "prompts", "bin").split()
+    if touched:
+        return (f"main moved from {base[:12]} to {head[:12]} while the template was merged, changing "
+                f"{', '.join(touched[:5])}; rerun `ttp upgrade` to merge again")
+    return ""
+
+
+def _apply_upgrade(p: Project, commit: str) -> None:
+    """`ttp upgrade <name> --apply <commit>`: the last step of an upgrade task. Fast-forwards main to the
+    task's checked merge, under the upgrade lock, only when it takes in the current template and main
+    has not moved past it; then restarts the daemon like any upgrade."""
+    from . import release
+    h = p.harness
+    r = subprocess.run(["git", "-C", str(h), "rev-parse", "-q", "--verify", commit + "^{commit}"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        die(f"--apply: {commit} is not a commit of {h}", 2)
+    merged = r.stdout.strip()
+    if subprocess.run(["git", "-C", str(h), "merge-base", "--is-ancestor", "upstream", merged]).returncode != 0:
+        die(f"--apply refused: {commit} does not contain the current template (upstream); merge it again", 1)
+    if subprocess.run(["git", "-C", str(h), "merge-base", "--is-ancestor", "HEAD", merged]).returncode != 0:
+        die(f"--apply refused: main moved and {commit} does not contain it; nothing was changed. In the "
+            f"worktree: `git merge main`, check again, commit, then rerun with the new commit.", 1)
+    r = subprocess.run(["git", "-C", str(h), "merge", "--ff-only", merged], capture_output=True, text=True,
+                       env={**os.environ, release.GUARD_ENV: "1"})
+    if r.returncode != 0:
+        die(f"--apply: could not fast-forward main to {commit}: {(r.stderr or r.stdout).strip()[-400:]}", 1)
+    if hasattr(os, "sync"):
+        os.sync()
+    print(f"harness main is now {merged[:12]}; restarting the daemon")
+    from . import service
+    print(service.restart(p))
+
+
 _UPGRADE_TASK = """`ttp upgrade` could not apply the new tt-project template on its own: {problem}
 
 The live harness was left untouched. In this harness repo:
@@ -2023,9 +2095,10 @@ The live harness was left untouched. In this harness repo:
 2. Resolve each conflict keeping this project's intent and taking upstream's fixes.
 3. Check in <tmp>: `python3 -m compileall -q runtime` and `PYTHONPATH=runtime python3 -c "import ttp.daemon, ttp.cli"`.
 4. Commit, then in <tmp>: `git merge main` (main may have moved meanwhile; resolve and check again).
-5. In the harness: `git merge --ff-only <commit>`, run on its own (never piped or masked).
+5. `ttp upgrade {name} --apply <commit>`, run on its own (never piped or masked). It fast-forwards main
+   to <commit> under the upgrade lock and restarts the daemon (it rolls the runtime back if the daemon
+   does not start). Never merge upstream into main any other way: the harness refuses it.
    If it succeeds, remove <tmp>. If it fails, keep <tmp> and hand off with its path and the error.
-6. `ttp restart {name}` (it rolls the runtime back if the daemon does not start).
 """
 
 
@@ -2145,14 +2218,14 @@ def _restore_cut_runtime(h: Path) -> None:
           + _cut_list(cut))
 
 
-def _merge_upstream(h: Path, tmp: Path, ident: list[str]) -> tuple[str, str]:
+def _merge_upstream(h: Path, tmp: Path, ident: list[str], base: str = "main") -> tuple[str, str]:
     """Merge `upstream` into a scratch worktree of main and check the result compiles and imports.
     Returns (merge commit, "") or ("", what went wrong); the live harness is never touched here."""
     subprocess.run(["git", "-C", str(h), "worktree", "remove", "--force", str(tmp)], capture_output=True)
     if tmp.exists():
         shutil.rmtree(tmp)
     subprocess.run(["git", "-C", str(h), "worktree", "prune"], capture_output=True)
-    _git(h, "worktree", "add", "-q", "--detach", str(tmp), "main")
+    _git(h, "worktree", "add", "-q", "--detach", str(tmp), base)
     try:
         r = subprocess.run(["git", "-C", str(tmp), *ident, "merge", "--no-edit", "upstream"], capture_output=True,
                            text=True)
@@ -2514,6 +2587,8 @@ def main(argv: list[str] | None = None) -> None:
     s = sub.add_parser("upgrade", help="merge the installed tt-project template into a project's harness")
     s.add_argument("name")
     s.add_argument("--auto", action="store_true", help=argparse.SUPPRESS)          # the daemon's own upgrade
+    s.add_argument("--apply", metavar="COMMIT",
+                   help="an upgrade task's last step: fast-forward main to its checked merge and restart")
     s.add_argument("--project-dir", help=argparse.SUPPRESS)
     s.set_defaults(fn=cmd_upgrade)
 
