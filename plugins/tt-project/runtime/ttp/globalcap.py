@@ -319,8 +319,8 @@ def total(db, provider: str, start: float, end: float, now: float | None = None,
     """The global spend of `provider` on this account in [start, end): this project (`db`), this
     machine's other projects, the other machines (cached, stale ones counted) and other sources.
     For a budget day a machine's answer counts when it is for the same day, however old. For the
-    rolling 24 h (`rolling`) it counts while it is fresh (read within STALE_S); an older one covers
-    another window and is only named stale.
+    rolling 24 h (`rolling`) it counts while it was read within STALE_S, even if the last try failed;
+    an older one covers another window and is only named stale.
     `usd` is the total; `stale` names the machines whose number is stale; `includes` says what it
     counts, in words."""
     now = now or time.time()
@@ -340,7 +340,7 @@ def total(db, provider: str, start: float, end: float, now: float | None = None,
             continue
         if not fresh:
             stale.append(t)
-        same = (fresh if rolling else
+        same = (bool(m.get("ts")) and now - float(m["ts"]) <= STALE_S if rolling else   # a failed try keeps it
                 m.get("start") is not None and abs(float(m["start"]) - start) < 60)
         if m.get("rows") is not None and same:
             usd += sum(float(r.get("usd") or 0) for r in m["rows"] if isinstance(r, dict) and _matches(r, provider, account))

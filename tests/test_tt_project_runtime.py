@@ -19781,6 +19781,18 @@ def test_the_rolling_global_window_asks_each_machine_once_per_refresh_and_keeps_
         assert g.numbers["global_today"] == 50.0, (now - t0, g.numbers)
         assert len(gcap._LOCAL) <= 1, len(gcap._LOCAL)
     assert len(asked) == 2 and len({s for _, s in asked}) == 2, asked   # one per REFRESH_S
+    # One failed ssh try keeps the last answer counted while it is within STALE_S, named stale.
+    def down(t, s, e):
+        raise RuntimeError("ssh timed out")
+    monkeypatch.setattr(gcap, "fetch", down)
+    later = ticks[-1] + gcap.REFRESH_S + 1
+    gcap.refresh_async(b, later)
+    m = gcap.load_cache()["machines"]["box2"]
+    assert m["ok"] is False and later - m["ts"] <= gcap.STALE_S, m
+    start, end, rolling = gcap.window(b, later)
+    t = gcap.total(p.db, "claude", start, end, later, rolling=rolling)
+    assert rolling and t["stale"] == ["box2"] and t["usd"] == 50.0, t
+    assert bud.evaluate(p.db, p.config(), "claude", [], later).numbers["global_today"] == 50.0
     # A rolling answer older than STALE_S covers another window: named stale, not counted.
     start, end, rolling = gcap.window(b, ticks[-1] + gcap.STALE_S + 60)
     t = gcap.total(p.db, "claude", start, end, ticks[-1] + gcap.STALE_S + 60, rolling=rolling)
