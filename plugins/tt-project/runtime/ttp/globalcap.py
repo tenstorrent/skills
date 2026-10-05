@@ -247,7 +247,7 @@ def refresh(start: float, end: float, now: float | None = None, force: bool = Fa
     time does this (a lock in ~/.tt-project); the others read the cache."""
     now = now or time.time()
     project.HOME_DIR.mkdir(parents=True, exist_ok=True)
-    with open(project.HOME_DIR / "global-spend.lock", "w") as lk:
+    with open(project.HOME_DIR / "global-spend.lock", "a") as lk:
         try:
             fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
