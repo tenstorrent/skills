@@ -4100,6 +4100,20 @@ def test_setup_writes_the_forced_downgrade_marker_before_it_switches_lib_current
     assert (lib / "current").resolve() == (lib / __version__).resolve()
 
 
+def test_setup_syncs_the_copied_lib_to_disk_before_switching_lib_current(env, tmp_path, monkeypatch):
+    from ttp import cli
+    _install_template(env)
+    lib = env["home"] / "lib"
+    (lib / "current").rename(lib / "old")
+    (lib / "current").symlink_to(lib / "old")
+    seen = []
+    monkeypatch.setattr(cli.os, "sync", lambda: seen.append((lib / "current").resolve()), raising=False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        cli.main(["setup", "--bin-dir", str(tmp_path / "bin"), "--force"])
+    assert seen == [(lib / "old").resolve()]    # synced before lib/current points at the new copy
+    assert (lib / "current").resolve() == (lib / cli.__version__).resolve()
+
+
 @pytest.mark.parametrize("there,ships", [("newer", False), ("same", False), ("older", True), ("none", True)])
 def test_ship_runtime_never_replaces_a_newer_or_equal_remote_install(env, monkeypatch, there, ships):
     from ttp import __version__, cli

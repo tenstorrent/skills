@@ -1385,6 +1385,8 @@ def cmd_setup(a) -> None:
         for f in (lib / "bin").iterdir():
             f.chmod(0o755)
     (lib / "runtime" / "ttp" / SOURCE_FILE).write_text(commit + "\n")
+    if hasattr(os, "sync"):    # a reboot now must not leave empty files that upgrades take in as upstream
+        os.sync()
     # The marker goes first: a daemon check between the two steps must not undo a deliberate downgrade.
     if is_newer(installed, __version__):    # a deliberate downgrade: daemons must not undo it
         durable_write(forced_mark(), __version__ + "\n")
