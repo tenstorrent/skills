@@ -750,6 +750,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 text = a["text"].strip()
                 stamp = time.strftime("%Y-%m-%d") + (f", turn {key}" if key else "")
                 heading = f"## {section} (added {stamp})"
+                n, base = 2, heading[:-1]
+                while not key and _has_line(p.charter_path, heading):
+                    heading, n = f"{base}, {n})", n + 1   # unique, so `replaces` can name one section
                 files, msg = [p.charter_path], f"charter ({section.lower()}): {text[:80]}"
                 if a.get("replaces"):
                     files.append(p.harness / CHARTER_HISTORY)
@@ -1285,11 +1288,14 @@ def _charter_replace(p: Project, replaces: str, heading: str, text: str, user_tu
     want = " ".join(replaces.lstrip("#").split()).lower()
     sections = charter_sections(p.charter_path.read_text())
     names = [" ".join(h[3:].split()) for h, _ in sections]
-    hits = ([i for i, n in enumerate(names) if n and n.lower() == want]
-            or [i for i, n in enumerate(names) if n and n.lower().startswith(want)])
+    headed = [i for i, n in enumerate(names) if n]
+    hits = ([headed[int(want) - 1]] if want.isdigit() and 0 < int(want) <= len(headed) else
+            [i for i in headed if names[i].lower() == want]
+            or [i for i in headed if names[i].lower().startswith(want)])
     if len(hits) != 1:
         raise ValueError(f"charter_update: `replaces` {replaces!r} matches {len(hits)} charter sections; give one "
-                         f"heading as the charter shows it: " + "; ".join(n for n in names if n))
+                         f"heading as the charter shows it, or its number: "
+                         + "; ".join(f"{k}. {names[i]}" for k, i in enumerate(headed, 1)))
     old_head, old_body = sections[hits[0]]
     name = names[hits[0]]
     if name.lower().startswith("brief"):

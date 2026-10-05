@@ -2193,6 +2193,34 @@ def test_charter_update_replaces_moves_the_old_section_to_history(env):
     assert p.charter_path.read_text().count("Box A is free to use.") == 1, "a rejected update was written"
 
 
+def test_charter_update_headings_stay_unique_and_replaces_takes_a_section_number(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    p.charter_path.write_text("# demo\n\n## Brief (verbatim from the user)\nKeep it tidy.\n")
+    day = time.strftime("%Y-%m-%d")
+    for text in ("Push daily.", "Review first.", "Draft PRs only."):   # no turn key: same date, same section
+        assert coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": text}]) == []
+    heads = [line for line in p.charter_path.read_text().splitlines() if line.startswith("## Policies")]
+    assert heads == [f"## Policies (added {day})", f"## Policies (added {day}, 2)", f"## Policies (added {day}, 3)"]
+    # Each heading names exactly one section now.
+    act = {"type": "charter_update", "section": "Policies", "text": "Review by a second task.",
+           "replaces": f"Policies (added {day}, 2)"}
+    assert coord.apply(p, [act], turn=5) == []
+    charter = p.charter_path.read_text()
+    assert "Review first." not in charter and "Push daily." in charter and "Draft PRs only." in charter
+    # A heading that matches several sections is refused with numbered choices; a number picks one.
+    act = {"type": "charter_update", "section": "Policies", "text": "Push weekly.", "replaces": "Policies"}
+    err = coord.apply(p, [act], turn=6)[0]
+    assert "matches 3" in err and "or its number" in err and f"2. Policies (added {day})" in err
+    assert "1. Brief" in err, "numbers skip the text above the first heading"
+    assert coord.apply(p, [{**act, "replaces": "2"}], turn=7) == []
+    charter = p.charter_path.read_text()
+    assert "Push daily." not in charter and "Push weekly." in charter and "Draft PRs only." in charter
+    assert "Push daily." in (p.harness / coord.CHARTER_HISTORY).read_text()
+    assert "never replaced" in coord.apply(p, [{**act, "replaces": "1"}], turn=8)[0]
+    assert "matches 0" in coord.apply(p, [{**act, "replaces": "9"}], turn=9)[0]
+
+
 def test_worker_prompt_drops_placeholders_and_keeps_restrictions_verbatim(env):
     p = make(env)
     from ttp.prompts import worker_system
