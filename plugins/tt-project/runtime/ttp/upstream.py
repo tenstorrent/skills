@@ -566,6 +566,7 @@ def _forward(now: float, budget_s: float) -> int:
         raw, size = _read_local(offset)
         if size < offset:                 # the inbox was cut or replaced: send it again; the target dedupes
             offset, (raw, size) = 0, _read_local(0)
+            st.pop("skipped_at", None)
         batch, end, pos, nbytes = [], offset, offset, 0
         cap = RECEIVE_BYTES - RECEIVE_BYTES // 32   # a margin under what the receiver reads
         for ln in raw[:raw.rfind(b"\n") + 1].splitlines(keepends=True):
@@ -578,7 +579,12 @@ def _forward(now: float, budget_s: float) -> int:
                     projects.get(n["to"]) == target if n.get("to") else reads):
                 if len(ln) > cap:
                     # The receiver would refuse any stream holding it: skip it, or it stalls the queue.
-                    st.update(skipped=int(st.get("skipped") or 0) + 1, error_at=now,
+                    # Counted once: a failed send leaves the cursor before it, so later passes see it again.
+                    if pos < int(st.get("skipped_at", -1)):
+                        pos += len(ln)
+                        end = pos
+                        continue
+                    st.update(skipped_at=pos + 1, skipped=int(st.get("skipped") or 0) + 1, error_at=now,
                               last_error=f"skipped a note of {len(ln)} bytes (over the {cap} a send may carry)")
                     print(f"ttp upstream: {target}: {st['last_error']}", file=sys.stderr)
                 elif len(batch) == FORWARD_BATCH or nbytes + len(ln) > cap:
@@ -623,6 +629,8 @@ def forward_status(now: float | None = None) -> list[str]:
                 f"{int(st.get('accepted') or 0)} filed, {int(st.get('rejected') or 0)} rejected")
         if st.get("reader"):
             line += f", read there by {st['reader']}"
+        if st.get("skipped"):
+            line += f", {int(st['skipped'])} skipped (too big to send)"
         if st.get("fails"):
             line += (f"; failing ({st['fails']}x, last {ago(st.get('error_at'))}: {st.get('last_error')}), "
                      f"next try in {max(0.0, (float(st.get('next') or 0) - now) / 60):.1f} min")

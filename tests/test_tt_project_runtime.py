@@ -15536,6 +15536,30 @@ def test_upstream_forward_batches_stay_under_the_receive_limit_and_skip_a_note_o
     assert total == 6 and len(sends) >= 2, sends
     st = json.loads(upstream.forward_path().read_text())["targets"]["example-host"]
     assert st["skipped"] == 1 and "skipped a note of" in st["last_error"]
+    assert "1 skipped (too big to send)" in "\n".join(upstream.forward_status(now + 20))
+
+
+def test_upstream_forward_counts_a_skipped_note_once_when_the_send_after_it_fails(env, monkeypatch):
+    from ttp import upstream
+    from ttp.project import register
+    register("example-project", {"host": "example-host", "dir": "/w/example"})
+    ok = [False]
+
+    def receive(target, lines, timeout):
+        if lines and not ok[0]:
+            return None, "unreachable"
+        return {"accepted": len(lines), "rejected": 0}, ""
+    monkeypatch.setattr(upstream, "_ssh_receive", receive)
+    monkeypatch.setattr(upstream, "RECEIVE_BYTES", 2000)
+    upstream.send("demo", 3, "example-project", "x" * 5000)
+    upstream.send("demo", 3, "example-project", "small note")
+    now = time.time()
+    for i in range(3):                                           # each send fails; back-off is skipped over
+        upstream.forward(now + i * 10000)
+    ok[0] = True
+    assert upstream.forward(now + 40000) == 1
+    st = json.loads(upstream.forward_path().read_text())["targets"]["example-host"]
+    assert st["skipped"] == 1, st
 
 
 def test_coordinators_pass_upstream_notes_on_only_while_no_project_reads_them(env):
