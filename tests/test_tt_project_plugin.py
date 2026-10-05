@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import pathlib
 import re
 import sys
 
+import pytest
 import yaml
 
 PLUGIN = pathlib.Path(__file__).resolve().parents[1] / "plugins" / "tt-project"
@@ -15,12 +17,54 @@ SKILLS = PLUGIN / "skills"
 RUNTIME = PLUGIN / "runtime" / "ttp"
 MANIFESTS = [PLUGIN / d / "plugin.json" for d in (".claude-plugin", ".codex-plugin", ".cursor-plugin")]
 
-# Anything that would tie the open-source plugin to one company's network or one person's setup.
+# Generic secret shapes and personal paths that must never ship in the open-source plugin.
 FORBIDDEN = [
-    r"\.local\.tenstorrent\.com", r"tenstorrent\.enterprise\.slack", r"atlassian\.net", r"aus-gitlab",
-    r"\bg\d\dblx\d\d\b", r"\bf\d\dcs\d\d\b", r"\bblx0\d\b", r"\bcs0\d\b", r"smarton", r"steel_3d",
-    r"xox[bpa]-[0-9A-Za-z]", r"sk-ant-", r"/home/[a-z]+/", r"/Users/[a-z]+/",
+    r"xox[abprs]-[0-9A-Za-z]", r"sk-ant-", r"\bsk-[A-Za-z0-9]{32,}", r"\bgh[pousr]_[A-Za-z0-9]{30,}",
+    r"github_pat_", r"\bglpat-[0-9A-Za-z_-]{20}", r"\bAKIA[0-9A-Z]{16}\b", r"\bAIza[0-9A-Za-z_-]{35}\b",
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----", r"/home/[a-z]+/", r"/Users/[a-z]+/",
 ]
+
+# Setup-specific patterns (internal domains, host names, user names, project names) never live in
+# this repository. Each maintainer keeps them in a local file outside it: $TTP_LEAK_PATTERNS_FILE,
+# else $XDG_CONFIG_HOME/tt-project/leak-patterns.txt (default ~/.config/tt-project/leak-patterns.txt).
+# One regex per line, compiled on its own (so a leading (?i) works); blank lines and lines starting
+# with # are ignored. Without the file that check is skipped with a visible reason; a malformed
+# pattern fails it.
+LEAK_PATTERNS_ENV = "TTP_LEAK_PATTERNS_FILE"
+TESTS = pathlib.Path(__file__).resolve().parent
+
+
+def local_leak_patterns_file() -> pathlib.Path:
+    if os.environ.get(LEAK_PATTERNS_ENV):
+        return pathlib.Path(os.environ[LEAK_PATTERNS_ENV]).expanduser()
+    config = os.environ.get("XDG_CONFIG_HOME") or pathlib.Path.home() / ".config"
+    return pathlib.Path(config) / "tt-project" / "leak-patterns.txt"
+
+
+def load_leak_patterns(path: pathlib.Path) -> list:
+    patterns = []
+    for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            patterns.append(re.compile(line))
+        except re.error as e:
+            raise AssertionError(f"{path}:{n}: malformed leak pattern: {e}") from None
+    return patterns
+
+
+def assert_no_leaks(patterns: list, files) -> None:
+    for f in files:
+        text = f.read_text(encoding="utf-8", errors="replace")
+        for pattern in patterns:
+            m = pattern.search(text)
+            assert not m, f"{f}: contains {m.group(0)!r}"
+
+
+def plugin_text_files(root: pathlib.Path = PLUGIN):
+    return [f for f in sorted(root.rglob("*"))
+            if f.is_file() and f.suffix in {".py", ".md", ".json", ".js", ".html", ".css", ""}]
 
 
 def frontmatter(path: pathlib.Path) -> dict:
@@ -76,13 +120,41 @@ def test_runtime_is_standard_library_only_and_python39_compatible():
             assert "from __future__ import annotations" in src, f"{py}: PEP 604 unions need the future import on 3.9"
 
 
-def test_no_setup_specific_or_private_details():
-    pattern = re.compile("|".join(FORBIDDEN))
-    for f in PLUGIN.rglob("*"):
-        if f.is_file() and f.suffix in {".py", ".md", ".json", ".js", ".html", ".css", ""}:
-            text = f.read_text(encoding="utf-8", errors="replace")
-            m = pattern.search(text)
-            assert not m, f"{f.relative_to(PLUGIN)}: contains {m.group(0)!r}"
+def test_no_secrets_or_personal_paths():
+    assert_no_leaks([re.compile(p) for p in FORBIDDEN], plugin_text_files())
+
+
+def test_no_setup_specific_details_from_local_patterns():
+    path = local_leak_patterns_file()
+    if not path.is_file():
+        pytest.skip(f"setup-specific leak check skipped: no local pattern file at {path} "
+                    f"(set {LEAK_PATTERNS_ENV} or create it)")
+    patterns = load_leak_patterns(path)
+    assert_no_leaks(patterns, plugin_text_files() + sorted(TESTS.glob("test_tt_project_*.py")))
+
+
+def test_local_leak_patterns_are_found_and_checked(tmp_path, monkeypatch):
+    monkeypatch.setenv(LEAK_PATTERNS_ENV, str(tmp_path / "patterns.txt"))
+    assert local_leak_patterns_file() == tmp_path / "patterns.txt"
+    monkeypatch.delenv(LEAK_PATTERNS_ENV)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    assert local_leak_patterns_file() == tmp_path / "cfg" / "tt-project" / "leak-patterns.txt"
+
+    tree = tmp_path / "plugin"
+    (tree / "docs").mkdir(parents=True)
+    (tree / "docs" / "notes.md").write_text("runs on Example-Box-7 every night\n")
+    patterns_file = tmp_path / "patterns.txt"
+    patterns_file.write_text("# planted\n\n(?i)example-box-\\d\n")
+    patterns = load_leak_patterns(patterns_file)
+    assert len(patterns) == 1
+    with pytest.raises(AssertionError, match="Example-Box-7"):
+        assert_no_leaks(patterns, plugin_text_files(tree))
+    (tree / "docs" / "notes.md").write_text("runs on a build box every night\n")
+    assert_no_leaks(patterns, plugin_text_files(tree))
+
+    patterns_file.write_text("fine\n(unclosed\n")
+    with pytest.raises(AssertionError, match=r"patterns\.txt:2: malformed leak pattern"):
+        load_leak_patterns(patterns_file)
 
 
 def test_launchers_are_executable():
