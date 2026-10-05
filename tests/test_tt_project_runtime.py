@@ -21591,10 +21591,10 @@ def test_in_run_lock_cap_holds_under_the_runs_agent_and_lifts_in_a_setsid_driver
         assert not rc.exists(), "the driver waits past half the run's stall limit"
     finally:
         held.close()
-    _wait_for(rc, timeout=30)
+    _wait_for_path(rc, timeout=30)
     assert rc.read_text().strip() == "0"
 
-def _wait_for(path, timeout=20):
+def _wait_for_path(path, timeout=20):
     deadline = time.time() + timeout
     while time.time() < deadline and not path.exists():
         time.sleep(0.05)
@@ -21608,7 +21608,7 @@ def test_detach_writes_rc_log_and_a_durable_registry(env):
     r = _ttp_run(p, "detach", "job1", "--", "sh", "-c", "echo hi; exit 3", env={"TTP_RUN_DIR": str(run_dir)})
     assert r.returncode == 0, r.stderr
     rc = run_dir / "job1.rc"
-    assert _wait_for(rc)
+    assert _wait_for_path(rc)
     assert rc.read_text().strip() == "3"
     assert (run_dir / "job1.log").read_text().strip() == "hi"
     jobs = json.loads((run_dir / "detached.json").read_text())
@@ -21628,7 +21628,7 @@ def test_detach_check_waits_while_running_and_wakes_when_the_job_dies(env):
     r = _ttp_run(p, "detach", "long", "--", "sh", "-c", f"touch {started}; sleep 60",
                  env={"TTP_RUN_DIR": str(run_dir)})
     assert r.returncode == 0, r.stderr
-    assert _wait_for(started)
+    assert _wait_for_path(started)
     rc = run_dir / "long.rc"
     check = _ttp_run(p, "detach", "--check", str(rc))
     assert check.returncode == 1 and "running" in check.stdout
@@ -21767,7 +21767,7 @@ def test_a_dead_detached_job_wakes_its_waiting_task(env):
     r = _ttp_run(p, "detach", "bench", "--", "sh", "-c", f"touch {started}; sleep 60",
                  env={"TTP_RUN_DIR": str(run_dir)})
     assert r.returncode == 0, r.stderr
-    assert _wait_for(started)
+    assert _wait_for_path(started)
     jobs = json.loads((run_dir / "detached.json").read_text())
     t = _dev_task(p, title="bench3")
     after, _ = _finish_dev(p, d, t, jobs=jobs)
