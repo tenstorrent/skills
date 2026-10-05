@@ -13494,7 +13494,9 @@ def test_workers_and_reviewers_get_runner_nice_but_the_coordinator_does_not(env)
     assert nice("coordinator", str(p.base), read_only=True) == 0
     for value, level, problem in [(5, 5, None), (0, 0, None), (25, 19, "outside 0-19; 19 is used"),
                                   (-3, 0, "outside 0-19; 0 is used"), ("high", 10, "not a whole number 0-19"),
-                                  (2.5, 10, "not a whole number"), (True, 10, "not a whole number")]:
+                                  (2.5, 10, "not a whole number"), (True, 10, "not a whole number"),
+                                  (float("inf"), 10, "not a whole number"), (float("-inf"), 10, "not a whole number"),
+                                  (float("nan"), 10, "not a whole number")]:
         p.set_config("runner.nice", value)
         d.cfg = p.config()
         assert nice("worker") == level, value

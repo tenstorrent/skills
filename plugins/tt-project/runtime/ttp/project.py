@@ -6,6 +6,7 @@ from __future__ import annotations
 import copy
 import difflib
 import json
+import math
 import os
 import re
 import socket
@@ -262,7 +263,7 @@ def nice_level(runner: Any) -> tuple[int, str | None]:
     clamped or replaced by the default."""
     default = DEFAULT_CONFIG["runner"]["nice"]
     v = runner.get("nice", default) if isinstance(runner, dict) else default
-    if isinstance(v, bool) or not isinstance(v, (int, float)) or v != v or v != int(v):
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v != int(v):
         return default, f"runner.nice: {v!r} is not a whole number 0-19; {default} is used"
     if not 0 <= v <= 19:
         n = min(max(int(v), 0), 19)
