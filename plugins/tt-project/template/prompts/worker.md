@@ -45,6 +45,8 @@ Other workers run at the same time as you, on other tasks of this project.
   If `ttp lock` exits 75, the resource stayed busy or is paused: hand off `waiting` naming it.
 - Never release or re-create a machine reservation, or restart a shared service, unless that is
   your task. Others may be using it.
+- Stop only processes you started, by their pid. Never kill by name or pattern (`pkill -f`,
+  `killall`): other workers and projects run the same commands, and you would end theirs.
 
 ## Shared clusters (Slurm and other machines other people use)
 

@@ -1006,11 +1006,19 @@ def cmd_checks(a) -> None:
     reused and nothing runs again; `--fresh` always runs them. Failures are never recorded, so a
     failure is never served as a pass. `ttp push` and the push queue never read this record and
     always run their own checks on the exact commit they push: a forged record can at most skip a
-    local re-run, never let a change onto the branch."""
+    local re-run, never let a change onto the branch.
+
+    `--detach` runs them in a session of their own that writes checks.rc in the run's directory
+    however it ends, and prints a `--result` probe for `retry_when` that also answers once they were
+    killed outright. Starting it again stops the run's earlier detached checks."""
     from . import prguard, push
+    if a.result:
+        sys.exit(_checks_result(Path(a.result)))
     run_dir = os.environ.get("TTP_RUN_DIR")
     if not run_dir:
         die("ttp checks only works inside a tt-project run")
+    if a.rc:
+        sys.exit(_checks_child(a))
     base = os.environ.get("TTP_PROJECT")
     p = Project(base) if base else None
     cfg = p.config() if p and p.exists() else {}
@@ -1032,6 +1040,9 @@ def cmd_checks(a) -> None:
                       text=True).stdout.strip():
         die("ttp checks: commit first; the checks are recorded for a commit, and this worktree has changes")
     tree = subprocess.run([*git, "rev-parse", "HEAD^{tree}"], capture_output=True, text=True).stdout.strip()
+    if a.detach:
+        _checks_detach(a, Path(run_dir), p)
+        return
     log = Path(run_dir) / "checks.log"
     passed, failed = True, None
     start = log.stat().st_size if log.exists() else 0
@@ -1050,7 +1061,16 @@ def cmd_checks(a) -> None:
         for c in [] if hit else todo:
             out.write(f"$ {c}\n")
             out.flush()
-            if subprocess.run(c, shell=True, stdout=out, stderr=subprocess.STDOUT).returncode != 0:
+            # A detached run gives each check a group of its own, so a stop ends it with ttp checks.
+            group = bool(getattr(a, "own_group", False))
+            proc = subprocess.Popen(c, shell=True, stdout=out, stderr=subprocess.STDOUT, start_new_session=group)
+            try:
+                rc = proc.wait()
+            except BaseException:
+                if group:
+                    _end_check(proc)
+                raise
+            if rc != 0:
                 passed, failed = False, c
                 break
     write_json(Path(run_dir) / prguard.CHECKS_FILE, {"head": head, "passed": passed, "commands": todo,
@@ -1067,6 +1087,128 @@ def cmd_checks(a) -> None:
     _record_pass(p, tree, todo)
     more = f", {len(skipped)} skipped as not applicable" if skipped else ""
     print(f"ttp checks: {len(todo)} check(s) passed on {head[:12]}{more}; recorded for the draft PR")
+
+
+CHECKS_RC, CHECKS_PID, CHECKS_OUT = "checks.rc", "checks.pid", "checks.out"   # in the run's directory
+
+
+def _end_check(proc: subprocess.Popen) -> None:
+    """End a check run in its own group: TERM, then KILL if it is still there after 5 s."""
+    for sig, wait in ((signal.SIGTERM, 5), (signal.SIGKILL, 5)):
+        try:
+            os.killpg(proc.pid, sig)
+        except OSError:
+            break
+        try:
+            proc.wait(timeout=wait)
+            break
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def _checks_alive(info: dict) -> bool:
+    """The detached checks recorded in `info` still run: same pid and start, not a zombie."""
+    from .runner import proc_start
+    pid, started = info.get("pid"), info.get("started")
+    if not isinstance(pid, int) or not started or proc_start(pid) != started:
+        return False
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
+    except (OSError, IndexError):
+        return True
+
+
+def _read_checks_pid(run_dir: Path) -> dict:
+    try:
+        info = json.loads((run_dir / CHECKS_PID).read_text())
+    except (OSError, ValueError):
+        return {}
+    return info if isinstance(info, dict) else {}
+
+
+def _checks_detach(a, run_dir: Path, p: Project | None) -> None:
+    """Start `ttp checks` in a session of its own. It writes checks.rc however it ends (a stop by
+    TERM, HUP or INT included); the printed `--result` probe also wakes the task when it was killed
+    outright. This run's earlier detached checks are stopped first, so nobody needs `pkill`."""
+    from . import push
+    from .runner import proc_start
+    old = _read_checks_pid(run_dir)
+    if _checks_alive(old):
+        try:
+            os.killpg(old["pid"], signal.SIGTERM)
+        except OSError:
+            pass
+        deadline = time.time() + 15
+        while _checks_alive(old) and time.time() < deadline:
+            time.sleep(0.1)
+        if _checks_alive(old):
+            try:
+                os.killpg(old["pid"], signal.SIGKILL)
+            except OSError:
+                pass
+    (run_dir / CHECKS_RC).unlink(missing_ok=True)
+    env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1]))
+    with open(run_dir / CHECKS_OUT, "wb") as out:
+        child = subprocess.Popen([sys.executable, "-m", "ttp", "checks", "--rc", str(run_dir / CHECKS_RC),
+                                  *(["--fresh"] if a.fresh else []), *a.cmd],
+                                 cwd=Path.cwd(), env=env, stdin=subprocess.DEVNULL, stdout=out,
+                                 stderr=subprocess.STDOUT, start_new_session=True)
+    write_json(run_dir / CHECKS_PID, {"pid": child.pid, "started": proc_start(child.pid), "ts": time.time()})
+    print(f"ttp checks: started in the background (pid {child.pid}); output in {run_dir / CHECKS_OUT}, "
+          f"exit code in {run_dir / CHECKS_RC}")
+    print(f"retry_when: {push._own_ttp(p)} checks --result {shlex.quote(str(run_dir))}")
+
+
+def _checks_child(a) -> int:
+    """The detached `ttp checks`: run them, then write the exit code to `--rc` however it ends."""
+    rc_file = Path(a.rc)
+
+    def stop(sig, _frame):
+        raise SystemExit(128 + sig)
+
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(sig, stop)
+    code: int | str = 1
+    try:
+        cmd_checks(argparse.Namespace(**{**vars(a), "rc": None, "detach": False, "own_group": True}))
+        code = 0
+    except SystemExit as e:
+        code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
+        if code > 128:
+            with open(rc_file.parent / "checks.log", "a") as log:
+                log.write(f"ttp checks: stopped by signal {code - 128}\n")
+    finally:
+        tmp = rc_file.with_name(rc_file.name + ".tmp")
+        tmp.write_text(f"{code}\n")
+        os.replace(tmp, rc_file)
+    return code if isinstance(code, int) else 1
+
+
+def _checks_result(run_dir: Path) -> int:
+    """`retry_when` probe of detached checks: 0 once checks.rc exists or the checks died without
+    writing it (it then writes `killed` there), 1 while they run."""
+    rc_file = run_dir / CHECKS_RC
+    info = _read_checks_pid(run_dir)
+    alive = _checks_alive(info)
+    if not rc_file.exists() and alive:
+        print(f"ttp checks: running (pid {info['pid']})")
+        return 1
+    if rc_file.exists():
+        print(f"ttp checks: finished with exit code {rc_file.read_text().strip()}")
+    elif not info:
+        print(f"ttp checks: no detached checks recorded in {run_dir}")
+        return 0
+    else:
+        rc_file.write_text("killed\n")
+        print(f"ttp checks: the detached checks (pid {info.get('pid')}) ended without an exit code: something "
+              "killed them; run `ttp checks --detach` again")
+    try:
+        tail = (run_dir / CHECKS_OUT).read_text(errors="replace").splitlines()[-20:]
+    except OSError:
+        tail = []
+    if tail:
+        print("\n".join(tail))
+    return 0
 
 
 def cmd_clip(a) -> None:
@@ -2067,6 +2209,11 @@ def main(argv: list[str] | None = None) -> None:
     s = sub.add_parser("checks", help="(inside a run) run the local checks on HEAD and record the result")
     s.add_argument("--fresh", action="store_true",
                    help="run the checks even when they already passed on this tree")
+    s.add_argument("--detach", action="store_true",
+                   help="run them in a process of their own; print a retry_when that exits 0 once they finished or died")
+    s.add_argument("--result", metavar="RUN_DIR",
+                   help="run nothing: exit 0 once a run's detached checks finished or died, 1 while they run")
+    s.add_argument("--rc", help=argparse.SUPPRESS)   # the detached process itself: where it writes its exit code
     s.add_argument("cmd", nargs=argparse.REMAINDER, help="extra check command after --: several words run as argv; one quoted string "
                         "runs through the shell, e.g. ttp checks -- 'FOO=1 pytest -q && ruff check'")
     s.set_defaults(fn=cmd_checks)

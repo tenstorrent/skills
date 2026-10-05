@@ -8,10 +8,10 @@
 - Run the full checks before handing off, committed, through `ttp checks`: the project's checks,
   plus after `--` only the repository's test and lint commands they do not already run. It reuses
   a pass already recorded for the same tree and commands. If they take longer than one tool call may,
-  start it detached with its output and marker in the run's directory, never in the worktree,
-  where a commit picks them up (`setsid nohup sh -c 'ttp checks -- <cmds>; echo $? >
-  "$TTP_RUN_DIR/checks.rc"' > "$TTP_RUN_DIR/checks.out" 2>&1 &`), and hand off `waiting` with
-  `retry_when` `test -e <run dir>/checks.rc`, the path written out (`echo $TTP_RUN_DIR`). Run plain
+  run `ttp checks --detach -- <cmds>`: its output and exit code go to the run's directory, never
+  the worktree, where a commit picks them up. Hand off `waiting` with the `retry_when` it prints;
+  that probe also wakes the task if the checks were killed. Running it again stops this run's
+  earlier detached checks. Run plain
   test commands (`pytest -k`, `file::test`) only for focused tests while you work.
 - Keep the diff minimal and on-topic. No drive-by rewrites.
 

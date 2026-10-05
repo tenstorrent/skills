@@ -17181,7 +17181,7 @@ def test_the_push_never_reads_the_recorded_passes_of_ttp_checks():
     prompts = RUNTIME.parent / "template" / "prompts"
     for name in ("kind-code.md", "kind-review.md"):
         text = " ".join((prompts / name).read_text().split())
-        assert "`ttp checks`" in text and "test -e <run dir>/checks.rc" in text and "`pytest -k`" in text, name
+        assert "`ttp checks`" in text and "`ttp checks --detach -- <cmds>`" in text and "`pytest -k`" in text, name
 
 
 
@@ -17192,9 +17192,107 @@ def test_detached_ttp_checks_keep_their_output_and_marker_out_of_the_worktree():
     prompts = RUNTIME.parent / "template" / "prompts"
     for name in ("kind-code.md", "kind-review.md"):
         text = " ".join((prompts / name).read_text().split())
-        assert """echo $? > "$TTP_RUN_DIR/checks.rc"' > "$TTP_RUN_DIR/checks.out" 2>&1 &""" in text, name
-        assert "never in the worktree" in text and "(`echo $TTP_RUN_DIR`)" in text, name
-        assert "<log>" not in text and "> <marker>" not in text, name
+        assert "`ttp checks --detach -- <cmds>`" in text and "the `retry_when` it prints" in text, name
+        assert "never the worktree" in text and "also wakes the task if the checks were killed" in text, name
+        assert "setsid nohup sh -c 'ttp checks" not in text and "<log>" not in text and "> <marker>" not in text, name
+    worker = " ".join((prompts / "worker.md").read_text().split())
+    assert "Never kill by name or pattern (`pkill -f`, `killall`)" in worker
+
+
+def _wait_for(cond, timeout=30):
+    deadline = time.time() + timeout
+    while not cond() and time.time() < deadline:
+        time.sleep(0.05)
+    return cond()
+
+
+def _detached_checks(run, capsys, *check):
+    from ttp import cli
+    cli.main(["checks", "--detach", "--", *check])
+    out = capsys.readouterr().out
+    probe = next(x for x in out.splitlines() if x.startswith("retry_when: "))[len("retry_when: "):]
+    assert probe.endswith(f" checks --result {shlex.quote(str(run))}"), out
+    return json.loads((run / "checks.pid").read_text())["pid"]
+
+
+def _gone_pid(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    try:   # a zombie of this test process counts as gone
+        return pathlib.Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z"
+    except (OSError, IndexError):
+        return False
+
+
+def test_detached_ttp_checks_write_their_exit_code_when_another_worker_pkills_them(env, tmp_path, monkeypatch, capsys):
+    """A worker's `pkill -f "ttp checks"` sent TERM to another run's `sh -c 'ttp checks; echo $? >
+    checks.rc'` and its ttp checks: the wrapper died too, no checks.rc was written, and the waiting
+    task slept until its retry_after_s. A detached `ttp checks` writes checks.rc on TERM, ends the
+    check it ran (no orphan writing on), and its probe answers at once."""
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    started, child = tmp_path / "started", tmp_path / "child.pid"
+    pid = _detached_checks(run, capsys, "sh", "-c", f"echo $$ > {child}; touch {started}; sleep 60")
+    try:
+        assert _wait_for(started.exists), (run / "checks.out").read_text()
+        assert _ttp("checks", "--result", str(run)) == 1
+        assert "running" in capsys.readouterr().out
+        os.kill(pid, signal.SIGTERM)                       # what `pkill -f "ttp checks"` does
+        assert _wait_for(lambda: (run / "checks.rc").exists(), 15), "no exit code after a TERM"
+        assert (run / "checks.rc").read_text().strip() == str(128 + signal.SIGTERM)
+        assert _wait_for(lambda: _gone_pid(int(child.read_text())), 10), "the check outlived ttp checks"
+        assert _ttp("checks", "--result", str(run)) == 0
+        assert "finished with exit code 143" in capsys.readouterr().out
+        assert "stopped by signal 15" in (run / "checks.log").read_text()
+    finally:
+        for k in (pid, int(child.read_text()) if child.exists() else 0):
+            try:
+                if k:
+                    os.killpg(k, signal.SIGKILL)
+            except OSError:
+                pass
+
+
+def test_the_detached_checks_probe_wakes_the_task_when_they_were_killed_outright(env, tmp_path, monkeypatch, capsys):
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    started = tmp_path / "started"
+    pid = _detached_checks(run, capsys, "sh", "-c", f"touch {started}; sleep 60")
+    try:
+        assert _wait_for(started.exists)
+        os.killpg(pid, signal.SIGKILL)                     # nothing can trap this: no checks.rc
+        assert _wait_for(lambda: _gone_pid(pid), 10)
+        assert not (run / "checks.rc").exists()
+        assert _ttp("checks", "--result", str(run)) == 0, "a dead check run left its task asleep"
+        assert "ended without an exit code" in capsys.readouterr().out
+        assert (run / "checks.rc").read_text().strip() == "killed"
+    finally:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def test_detached_ttp_checks_finish_record_the_pass_and_a_rerun_stops_the_earlier_one(env, tmp_path, monkeypatch, capsys):
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    started = tmp_path / "started"
+    first = _detached_checks(run, capsys, "sh", "-c", f"touch {started}; sleep 60")
+    try:
+        assert _wait_for(started.exists)
+        second = _detached_checks(run, capsys, "true")     # stops the first itself: no pkill needed
+        assert _gone_pid(first), "a rerun left the run's earlier checks running"
+        assert second != first
+        assert _wait_for(lambda: (run / "checks.rc").exists(), 30)
+        assert (run / "checks.rc").read_text().strip() == "0"
+        assert json.loads((run / "checks.json").read_text())["passed"] is True
+        assert _ttp("checks", "--result", str(run)) == 0
+        assert "finished with exit code 0" in capsys.readouterr().out
+    finally:
+        try:
+            os.killpg(first, signal.SIGKILL)
+        except OSError:
+            pass
+    assert _ttp("checks", "--result", str(tmp_path / "nothing")) == 0, "no record must not keep a task asleep"
 
 def test_status_does_not_warn_about_a_check_that_does_not_apply_on_the_branch(env, tmp_path):
     from ttp import push
