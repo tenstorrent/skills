@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 
 from . import locks
-from .project import HOME_DIR, Project, fsync_dir
+from .project import HOME_DIR, Project, durable_write, fsync_dir
 
 CHECK_S = 3600          # how often the daemon compares the installed release with its harness
 HELD_RECHECK_S = 300    # a release held back by a push or an upgrade in flight is looked at again this soon
@@ -165,11 +165,7 @@ def guard_harness(h: Path) -> bool:
         if have and GUARD_MARK not in have:
             return False
         if have != text:
-            hook.parent.mkdir(parents=True, exist_ok=True)
-            tmp = hook.with_name(hook.name + ".tmp")
-            tmp.write_text(text)
-            tmp.chmod(0o755)
-            os.replace(tmp, hook)
+            durable_write(hook, text, mode=0o755)
         return True
     except OSError:
         return False
