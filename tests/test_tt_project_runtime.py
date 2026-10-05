@@ -17327,6 +17327,7 @@ DURABLE_EXEMPT = {
     ("cli.py", "CHECKS_OUT, \"wb\")"): "the output of detached `ttp checks`; its exit code goes to checks.rc, durably",
     ("cli.py", '"checks.log", "a")'): "the output log of `ttp checks`; a stop notice",
     ("cli.py", 'open(log, "w")'): "the output of `ttp clip`, for reading; the command's exit code is passed on",
+    ("cli.py", '"upgrade.log", "a")'): "a log",
     ("cli.py", "SOURCE_FILE).write_text"): "part of a copied runtime tree; committed or re-installed by setup",
     ("cli.py", '".gitignore").write_text'): "committed to the harness right after",
     ("cli.py", "shim.write_text"): "installed by `ttp setup`, which can be re-run",
