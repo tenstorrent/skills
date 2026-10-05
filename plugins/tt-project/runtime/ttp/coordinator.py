@@ -115,9 +115,17 @@ USER_SETTABLE = {
     # Hours before an unanswered ask registered with a default falls back to it; 0 turns it off.
     # New asks never get a default, so this only drains asks registered with one.
     "coordinator.ask_timeout_h": float,
+    # Days a user's yes to a charter change that failed to apply stays valid for a retry (_charter_approval).
+    "coordinator.charter_approval_days": float,
 }
 
 CHARTER_HISTORY = ends.CHARTER_HISTORY   # harness file: charter sections replaced or retired
+# kv: [{"id", "messages", "ask", "section", "quote", "replaces", "candidates", "text", "sha", "ts",
+#       "failed", "used"}]: charter changes made in the user's turn that failed to apply. A later
+# turn without a user message may apply the same change once (_charter_approval). Written only
+# by apply() in a turn the daemon started for user messages; not a PR approval (prguard).
+CHARTER_APPROVALS_KEY = "charter_approvals"
+CHARTER_APPROVAL_DAYS = 7.0
 REJECTED_KEY = "rejected_actions"   # kv: the last turn's rejected actions, shown in the next digest
 # kv: {"at": ts, "why": text}: a rejected action whose blocking condition clears at a known time.
 # The daemon wakes the coordinator then, so the turn's undone work does not wait for an idle wake.
@@ -367,6 +375,9 @@ def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int]) ->
     for s in recurring:
         lines.append(f"- {s['name']} ({s['kind']}, every {s['every_s'] // 60} min, "
                      f"{'on' if s['enabled'] else 'off'}, 7d cost ${s['cost_7d']}): {clip(s['description'], 100)}")
+    heads = charter_headings(p)
+    if heads:
+        lines.append(f"## Charter sections (exact headings and numbers, for charter_update `replaces`): {heads}")
     # Open asks of any age: one still waits on the user however long ago it was sent.
     muted = scr.mutes(db, now)
     if muted:
@@ -540,9 +551,11 @@ def _clock(ts: float) -> str:
 
 
 def apply(p: Project, actions: list[dict], default_chat: str | None = None, user_turn: bool = False,
-          turn: int | None = None) -> list[str]:
+          turn: int | None = None, messages: list[int] | None = None) -> list[str]:
     """Apply validated actions. Returns human-readable notes about rejected ones, fed back next turn.
     Notes on actions applied with a change (NOTES_KEY) reach the next digest as information only.
+    `messages`: the user messages the daemon started this turn for (a charter change they approved
+    that fails here stays approved for a retry, see _charter_approval).
 
     A turn cut off before its database transaction commits is applied again from its output. Its
     file writes carry `turn`.<action index> so the replay does not repeat them, while the same
@@ -806,8 +819,20 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     if restr_before is None:
                         from .prompts import charter_restrictions
                         restr_before = charter_restrictions(p.charter_path.read_text())
-                    target, extra, retired = _charter_update(p, section, text, quote, str(a.get("replaces") or ""),
-                                                             key, user_turn, over, end)
+                    replaces = str(a.get("replaces") or "")
+                    ok, no_ok = (None, "") if user_turn else _charter_approval(p, section, quote, replaces, text)
+                    text = ok["text"].strip() if ok else text   # the words the user said yes to
+                    try:
+                        target, extra, retired = _charter_update(p, section, text, quote, replaces, key,
+                                                                 user_turn or ok is not None, over, end, no_ok)
+                    except ValueError:
+                        if user_turn:
+                            _record_charter_approval(p, messages or [], section, quote, replaces, text, end)
+                        raise
+                    if ok is not None:
+                        _use_charter_approval(p, ok["id"], key)
+                        notes.append(f"charter_update: applied on the user's yes in message "
+                                     f"#{', #'.join(map(str, ok['messages']))}, recorded when it first failed")
                     msg += extra
                     if (quote and target.lower().startswith("restriction")
                             or extra.lower().startswith(" (replaces restriction")):
@@ -1508,11 +1533,95 @@ def _calls_undoable(text: str) -> bool:
     return False
 
 
+def _ws(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _record_charter_approval(p: Project, messages: list[int], section: str, quote: str, replaces: str,
+                             text: str, end: dict | None) -> None:
+    """Record a charter change the user's turn asked for that failed to apply (an ambiguous heading,
+    a quote that matched twice), so a retry in a later turn without a user message is still the
+    user's word. Only from a user's own message of this turn: none from the harness itself
+    (provenance system). A change with an end is not carried (its end was relative to that turn)."""
+    if end or not messages:
+        return
+    db = p.db
+    rows = db.q(f"SELECT id, provenance FROM messages WHERE id IN ({','.join('?' * len(messages))}) "
+                f"AND direction='in' AND kind='user'", list(messages))
+    said = [r["id"] for r in rows if (r["provenance"] or "") != "system"]
+    if not said:
+        return
+    from .prompts import charter_sections
+    try:
+        sections = charter_sections(p.charter_path.read_text())
+    except FileNotFoundError:
+        sections = []
+    cands = [" ".join(sections[i][0][3:].split()) for i in _replaces_hits(sections, replaces)] if replaces else []
+    ask = db.one("SELECT id FROM messages WHERE kind='ask' AND direction='out' AND id<? ORDER BY id DESC LIMIT 1",
+                 (min(said),))
+    sha = hashlib.sha256(_ws(text).encode()).hexdigest()
+    rec = {"section": _ws(section).lower(), "quote": _ws(quote), "replaces": _ws(replaces.lstrip("#")),
+           "text": text, "sha": sha}
+    with db.tx():
+        have = db.kv(CHARTER_APPROVALS_KEY, []) or []
+        if any(all(x.get(k) == v for k, v in rec.items()) and not x.get("used") for x in have):
+            return   # a retried turn records it once
+        rec.update(id=hashlib.sha256(f"{said}{sha}{time.time()}".encode()).hexdigest()[:12], messages=said,
+                   ask=ask["id"] if ask else None, candidates=cands, ts=time.time(), used=None)
+        db.set_kv(CHARTER_APPROVALS_KEY, (have + [rec])[-20:])
+
+
+def _charter_approval(p: Project, section: str, quote: str, replaces: str, text: str) -> tuple[dict | None, str]:
+    """The recorded, unused, unexpired approval (see _record_charter_approval) this change matches
+    exactly: same section, same `quote` or the same section `replaces` names (by any of the names
+    that resolve to it, or one of the headings an ambiguous one matched), the same text up to
+    whitespace. Else (None, why none counts)."""
+    have = p.db.kv(CHARTER_APPROVALS_KEY, []) or []
+    if not have:
+        return None, "No approval of the user's is on record for this change"
+    try:
+        days = float(p.config()["coordinator"].get("charter_approval_days", CHARTER_APPROVAL_DAYS))
+    except (KeyError, TypeError, ValueError):
+        days = CHARTER_APPROVAL_DAYS
+    from .prompts import charter_sections
+    sections = charter_sections(p.charter_path.read_text())
+    hits = _replaces_hits(sections, replaces) if replaces else []
+    now_name = " ".join(sections[hits[0]][0][3:].split()) if len(hits) == 1 else None
+    why, found = "No approval of the user's is on record for this change (same section and quote or replaces)", ""
+    for rec in reversed(have):   # newest first; a refusal says why the newest one for this target fails
+        if rec["section"] != _ws(section).lower() or rec["quote"] != _ws(quote):
+            continue
+        if (rec["replaces"] or replaces) and not (rec["replaces"].lower() == _ws(replaces.lstrip("#")).lower()
+                                                 or now_name is not None and now_name in rec["candidates"]):
+            continue
+        ids = ", #".join(map(str, rec["messages"]))
+        if rec["sha"] != hashlib.sha256(_ws(text).encode()).hexdigest():
+            found = found or (f"The user's yes in message #{ids} was for other text: "
+                              f"{clip(_ws(rec['text']), 300)!r}; send that text exactly, or ask again for this one")
+        elif rec.get("used"):
+            found = found or f"The user's yes in message #{ids} was already used once"
+        elif time.time() - rec["ts"] > days * 86400:
+            found = found or f"The user's yes in message #{ids} expired after {days:g} days; ask again"
+        else:
+            return rec, ""
+    return None, found or why
+
+
+def _use_charter_approval(p: Project, rid: str, key: str | None) -> None:
+    with p.db.tx():
+        have = p.db.kv(CHARTER_APPROVALS_KEY, []) or []
+        for rec in have:
+            if rec.get("id") == rid:
+                rec["used"] = {"ts": time.time(), "turn": key}
+        p.db.set_kv(CHARTER_APPROVALS_KEY, have)
+
+
 _DATED = re.compile(r"\s*\(added [^)]*\)$", re.I)   # legacy "## Policies (added 2026-09-30, turn 4.0)"
 
 
 def _charter_update(p: Project, section: str, text: str, quote: str, replaces: str, key: str | None,
-                    user_turn: bool, over: str = "", end: dict | None = None) -> tuple[str, str, str]:
+                    user_turn: bool, over: str = "", end: dict | None = None,
+                    no_approval: str = "") -> tuple[str, str, str]:
     """Apply one charter_update: retire the section `replaces` names, then edit the one section
     `section` names. With `quote`, the single span of that section matching it is replaced by
     `text` (or removed when `text` is empty); otherwise `text` is added at the section's end, and
@@ -1520,8 +1629,11 @@ def _charter_update(p: Project, section: str, text: str, quote: str, replaces: s
     dated section of its own instead, so the daemon retires only it. Whatever is removed or
     replaced, and every addition, goes to CHARTER_HISTORY, which also marks the turn done for a
     retried turn. Outside a user turn a restriction is removed or replaced only with `over`: the
-    end condition that has clearly passed. Returns the edited section's name, a note for the
-    commit message and, when `over` retired a restriction, what it retired (else "")."""
+    end condition that has clearly passed (`no_approval` says why no recorded approval of the
+    user's covered it). A restriction the user's word changes or lifts (`quote` or `replaces`)
+    also merges every permanent Restrictions section into one block (_merge_restrictions).
+    Returns the edited section's name, a note for the commit message and, when `over` retired a
+    restriction, what it retired (else "")."""
     from .prompts import charter_sections
     sections = charter_sections(p.charter_path.read_text())
     hist = p.harness / CHARTER_HISTORY
@@ -1536,7 +1648,9 @@ def _charter_update(p: Project, section: str, text: str, quote: str, replaces: s
     extra, retired = "", ""
     by_word = user_turn or len(over) >= OVER_MIN
     why = ("needs the user's word, or `over`: the end condition that has clearly passed (what ended it and when). "
-           "If it is truly unclear whether it is over, ask_user (blocking restriction)")
+           "If it is truly unclear whether it is over, ask_user (blocking restriction)"
+           + (f". {no_approval}" if no_approval else ""))
+    lifted = False   # the user's word changed or lifted a restriction
     if replaces:
         i = _charter_replaced(sections, replaces)
         old_head, old_body = sections[i]
@@ -1547,6 +1661,7 @@ def _charter_update(p: Project, section: str, text: str, quote: str, replaces: s
             raise ValueError(f"charter_update: replacing the restriction section {name!r} {why}")
         if name.lower().startswith("restriction") and not user_turn:
             retired = f"section \"{name}\""
+        lifted = user_turn and name.lower().startswith("restriction")
         del sections[i]
         log.append(f"{old_head}\n(replaced by an update to {section}, {stamp}" + (f"; over: {over}" if over else "")
                    + ")\n" + "\n".join(old_body).strip("\n"))
@@ -1569,6 +1684,7 @@ def _charter_update(p: Project, section: str, text: str, quote: str, replaces: s
         s, e = hits[0].span()
         if names[t].lower().startswith("restriction") and not user_turn:
             retired = f"\"{clip(' '.join(body[s:e].split()), 200)}\""
+        lifted = user_turn and names[t].lower().startswith("restriction")
         log.append(f"### {'Replaced in' if text else 'Removed from'} {names[t]} ({stamp})\n{body[s:e]}"
                    + (f"\nNow: {text}" if text else "") + (f"\nOver: {over}" if over and not user_turn else ""))
         sections[t] = (sections[t][0], _cut(body, s, e, text).split("\n"))
@@ -1593,6 +1709,13 @@ def _charter_update(p: Project, section: str, text: str, quote: str, replaces: s
         bullets = bool(body) and body[-1].lstrip().startswith("- ") and text.startswith("- ")
         sections[t] = (sections[t][0], body + ([] if bullets or not body else [""]) + text.split("\n"))
         log.append(f"### Added to {names[t]} ({stamp})\n{text}")
+    if lifted:
+        target = sections[t][0] if t is not None else None
+        sections = _merge_restrictions(sections, log, stamp)
+        names = [" ".join(h[3:].split()) for h, _ in sections]
+        t = next((i for i, (h, _) in enumerate(sections) if h == target), None)
+        if t is None and target:   # merged into the one Restrictions block
+            t = next(i for i, n in enumerate(names) if n.lower().startswith("restriction") and not _DATED.search(n))
     if not hist.exists():
         durable_append(hist, "# Charter history\n\nWhat was added to CHARTER.md, and what was removed or replaced "
                              "there, oldest first.\n")
@@ -1608,22 +1731,85 @@ def _charter_update(p: Project, section: str, text: str, quote: str, replaces: s
     return (names[t] if t is not None else section), extra, retired
 
 
-def _charter_replaced(sections: list[tuple[str, list[str]]], replaces: str, quiet: bool = False) -> int | None:
-    """The index of the one section `replaces` names: its heading, a heading prefix, or its number.
-    None when it names no one section and `quiet`; otherwise that raises."""
-    want = " ".join(replaces.lstrip("#").split()).lower()
+def _merge_restrictions(sections: list[tuple[str, list[str]]], log: list[str],
+                        stamp: str) -> list[tuple[str, list[str]]]:
+    """Merge every permanent Restrictions section (the base one and dated "(added ...)" ones) into
+    one block under the base heading, so workers get a single binding list. Each item is kept
+    once; a prose paragraph becomes one bullet. Temporary sections (with an `Expires:`, `Until:`
+    or `Until probe:` end) stay separate: the daemon retires a section as a whole when its end
+    passes (ends.py), so their items keep their end only in a section of their own. The merge is
+    logged in `log` (for CHARTER_HISTORY), with the moved text."""
+    names = [" ".join(h[3:].split()) for h, _ in sections]
+    idx = [i for i, (h, b) in enumerate(sections)
+           if names[i].lower().startswith("restriction") and not ends.charter_end(b)]
+    if len(idx) < 2:
+        return sections
+    base = next((i for i in idx if not _DATED.search(names[i])), idx[0])
+    head = sections[base][0]
+    if _DATED.search(names[base]):
+        head = "## " + _DATED.sub("", names[base])
+    body = _drop_placeholders(list(sections[base][1]))
+    while body and not body[-1].strip():
+        body.pop()
+    have = {" ".join(x.strip().lstrip("-*+ ").split()).lower() for x in body if x.strip()}
+    moved = []
+    for i in idx:
+        if i == base:
+            continue
+        moved.append(f"{names[i]}:\n" + "\n".join(sections[i][1]).strip("\n"))
+        for par in "\n".join(_drop_placeholders(list(sections[i][1]))).split("\n\n"):
+            lines = [x for x in par.split("\n") if x.strip()]
+            if not lines:
+                continue
+            if not any(re.match(r"\s*(?:[-*+]|\d+[.)])\s", x) for x in lines):
+                lines = ["- " + " ".join(" ".join(lines).split())]
+            new = [x for x in lines if " ".join(x.strip().lstrip("-*+ ").split()).lower() not in have]
+            have |= {" ".join(x.strip().lstrip("-*+ ").split()).lower() for x in new}
+            if new and body and not re.match(r"\s*(?:[-*+]|\d+[.)])\s", body[-1]):
+                body.append("")
+            body += new
+    log.append(f"### Merged into {_DATED.sub('', names[base])} ({stamp})\n" + "\n\n".join(moved))
+    return [(head, body) if i == base else sec for i, sec in enumerate(sections) if i == base or i not in idx]
+
+
+def _replaces_hits(sections: list[tuple[str, list[str]]], replaces: str) -> list[int]:
+    """The sections `replaces` names: its number, its full heading (as the charter or the digest's
+    heading line shows it, with or without `## ` or quotes), else every heading it starts."""
+    want = " ".join(replaces.strip().strip("\"'`").lstrip("#").split()).lower()
     names = [" ".join(h[3:].split()) for h, _ in sections]
     headed = [i for i, n in enumerate(names) if n]
-    hits = ([headed[int(want) - 1]] if want.isdigit() and 0 < int(want) <= len(headed) else
-            [i for i in headed if names[i].lower() == want]
-            or [i for i in headed if names[i].lower().startswith(want)])
+    if want.rstrip(".").isdigit():
+        k = int(want.rstrip("."))
+        return [headed[k - 1]] if 0 < k <= len(headed) else []
+    return ([i for i in headed if names[i].lower() == want]
+            or [i for i in headed if want and names[i].lower().startswith(want)])
+
+
+def _charter_replaced(sections: list[tuple[str, list[str]]], replaces: str, quiet: bool = False) -> int | None:
+    """The index of the one section `replaces` names (see _replaces_hits). None when it names no
+    one section and `quiet`; otherwise that raises, listing the candidates."""
+    hits = _replaces_hits(sections, replaces)
     if len(hits) != 1 and quiet:
         return None
     if len(hits) != 1:
-        raise ValueError(f"charter_update: `replaces` {replaces!r} matches {len(hits)} charter sections; give one "
-                         f"heading as the charter shows it, or its number: "
-                         + "; ".join(f"{k}. {names[i]}" for k, i in enumerate(headed, 1)))
+        names = [" ".join(h[3:].split()) for h, _ in sections]
+        number = {i: k for k, i in enumerate((i for i, n in enumerate(names) if n), 1)}
+        listed = hits or list(number)
+        raise ValueError(f"charter_update: `replaces` {replaces!r} matches {len(hits)} charter sections; give the "
+                         f"full heading or the number of one of " + ("these" if hits else "the charter's")
+                         + ": " + "; ".join(f"{number[i]}. {names[i]}" for i in listed))
     return hits[0]
+
+
+def charter_headings(p: Project) -> str:
+    """The charter's section headings, numbered as `replaces` takes them, on one line."""
+    from .prompts import charter_sections
+    try:
+        sections = charter_sections(p.charter_path.read_text())
+    except FileNotFoundError:
+        return ""
+    names = [n for n in (" ".join(h[3:].split()) for h, _ in sections) if n]
+    return " · ".join(f"{k}. {n}" for k, n in enumerate(names, 1))
 
 
 def _charter_target(names: list[str], section: str, ends_of: list[dict] | None = None,

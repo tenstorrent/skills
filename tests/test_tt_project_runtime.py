@@ -2824,7 +2824,8 @@ def test_charter_update_base_heading_goes_to_one_of_several_legacy_dated_section
     # `replaces` still names one whole section, by heading or number, and refuses an ambiguous one.
     err = coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": "x",
                             "replaces": "Policies (added"}], turn=8)[0]
-    assert "matches 2" in err and "or its number" in err and "1. Brief" in err
+    assert "matches 2" in err and "the full heading or the number" in err and "1. Brief" not in err
+    assert "2. Policies (added 2026-09-01); 3. Policies (added 2026-09-02, turn 4.0)" in err
     assert coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": "Push weekly.",
                             "replaces": "2"}], turn=9) == []
     charter = p.charter_path.read_text()
@@ -3008,6 +3009,130 @@ def test_an_appended_section_that_overrides_a_standing_restriction_is_flagged(en
         p.charter_path.write_text(base)
         assert coord.apply(p, [{"type": "charter_update", **a} for a in acts], turn=20 + k, user_turn=user) == []
         assert conflicts() == [], acts
+
+
+RESTR_CHARTER = ("# demo\n\n## Restrictions (binding on every task)\n- Never push to the main branch.\n"
+                 "- Never merge.\n\n## Goals\nShip v1.\n\n## Restrictions (added 2026-10-01, turn 3.0)\n"
+                 "Keep the docs generic.\n\n## Restrictions (added 2026-10-02, turn 5.0)\n"
+                 "- Never delete release tags.\n- Never merge.\n")
+
+
+def test_a_users_yes_to_a_charter_change_stays_valid_until_it_is_applied(env):
+    p = make(env)
+    from ttp import coordinator as coord, prguard
+    db = p.db
+    p.charter_path.write_text(RESTR_CHARTER)
+    ask = db.post("out", "May I drop the docs rule?", kind="ask")
+    yes = db.post("in", "yes, drop it", chat=None, channel="web", kind="user", provenance="web-session")
+    new = "Keep the docs generic, except for the setup guide."
+    act = {"type": "charter_update", "section": "Restrictions", "replaces": "Restrictions (added", "text": new}
+    # The user's turn: an ambiguous prefix is rejected with the candidates only, and the yes is recorded.
+    err = coord.apply(p, [act], turn=10, user_turn=True, messages=[yes])
+    assert len(err) == 1 and "matches 2" in err[0], err
+    assert "3. Restrictions (added 2026-10-01, turn 3.0); 4. Restrictions (added 2026-10-02, turn 5.0)" in err[0]
+    assert "Goals" not in err[0]
+    recs = db.kv(coord.CHARTER_APPROVALS_KEY)
+    assert len(recs) == 1 and recs[0]["messages"] == [yes] and recs[0]["ask"] == ask and recs[0]["text"] == new
+    assert recs[0]["sha"] and recs[0]["used"] is None and not db.kv(prguard.APPROVALS_KEY), "never a PR approval"
+    # A later turn without a user message: other text, then no record for another target, are refused.
+    retry = {**act, "replaces": "Restrictions (added 2026-10-01, turn 3.0)"}
+    err = coord.apply(p, [{**retry, "text": "Keep the docs generic."}], turn=11)
+    assert len(err) == 1 and "needs the user's word" in err[0] and "was for other text" in err[0], err
+    err = coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "quote": "Never push to the main "
+                           "branch.", "text": new}], turn=12)
+    assert len(err) == 1 and "No approval of the user's is on record" in err[0], err
+    # The same change by its full heading, text differing only in whitespace: applied, and used up.
+    assert coord.apply(p, [{**retry, "text": "  Keep the docs generic,\n except for the setup guide. "}],
+                       turn=13) == []
+    assert "Keep the docs generic, except for the setup guide." in p.charter_path.read_text()
+    assert "Keep the docs generic.\n" not in p.charter_path.read_text()
+    assert db.kv(coord.CHARTER_APPROVALS_KEY)[0]["used"]["turn"] == "13.0"
+    assert any("recorded when it first failed" in x for x in db.kv(coord.NOTES_KEY))
+    # Used once: the same retry again is refused, and says why.
+    p.charter_path.write_text(RESTR_CHARTER)
+    err = coord.apply(p, [retry], turn=14)
+    assert len(err) == 1 and "already used once" in err[0], err
+    # Expired: past coordinator.charter_approval_days.
+    coord.apply(p, [act], turn=15, user_turn=True, messages=[yes])
+    recs = db.kv(coord.CHARTER_APPROVALS_KEY)
+    recs[-1]["ts"] -= 8 * 86400
+    db.set_kv(coord.CHARTER_APPROVALS_KEY, recs)
+    err = coord.apply(p, [{**retry, "replaces": "3"}], turn=16)
+    assert len(err) == 1 and "expired after 7 days" in err[0], err
+    assert "coordinator.charter_approval_days" in coord.USER_SETTABLE
+    assert "Keep the docs generic.\n" in p.charter_path.read_text()
+
+
+def test_only_the_users_own_turn_records_a_charter_approval(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    db = p.db
+    p.charter_path.write_text(RESTR_CHARTER)
+    act = {"type": "charter_update", "section": "Restrictions", "replaces": "Restrictions (added", "text": "x y z",
+           "approval": "yes", "messages": [1]}
+    yes = db.post("in", "yes", chat=None, channel="web", kind="user", provenance="web")
+    system = db.post("in", "Project created.", chat=None, channel="system", kind="user", provenance="system")
+    note = db.post("out", "yes", kind="reply")
+    # A turn without user messages (whatever the action claims), the harness's own message, or an
+    # outbound one: nothing is recorded, so a later retry is refused.
+    coord.apply(p, [act], turn=20, messages=[yes])
+    coord.apply(p, [act], turn=21, user_turn=True, messages=[system, note])
+    coord.apply(p, [act], turn=22, user_turn=True)
+    assert not db.kv(coord.CHARTER_APPROVALS_KEY)
+    err = coord.apply(p, [{**act, "replaces": "3"}], turn=23)
+    assert len(err) == 1 and "No approval of the user's is on record" in err[0], err
+    # A retried user turn records its failure once.
+    coord.apply(p, [act], turn=24, user_turn=True, messages=[yes])
+    coord.apply(p, [act], turn=24, user_turn=True, messages=[yes])
+    assert len(db.kv(coord.CHARTER_APPROVALS_KEY)) == 1
+
+
+def test_charter_update_replaces_takes_full_headings_and_the_digest_lists_them(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    p.charter_path.write_text(RESTR_CHARTER)
+    d = coord.digest(p, {}, [], [])
+    line = next(x for x in d.splitlines() if x.startswith("## Charter sections"))
+    assert line.endswith("1. Restrictions (binding on every task) · 2. Goals · 3. Restrictions (added 2026-10-01, "
+                         "turn 3.0) · 4. Restrictions (added 2026-10-02, turn 5.0)"), line
+    for k, name in enumerate(("## Restrictions (added 2026-10-02, turn 5.0)", "`restrictions (added 2026-10-02, "
+                              "turn 5.0)`", "4.")):
+        p.charter_path.write_text(RESTR_CHARTER)
+        assert coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "replaces": name,
+                                "text": "Never delete tags."}], turn=30 + k, user_turn=True) == [], name
+        charter = p.charter_path.read_text()
+        assert "Never delete release tags." not in charter and "Never delete tags." in charter
+
+
+def test_lifting_a_restriction_merges_the_restrictions_sections_into_one_block(env):
+    p = make(env)
+    from ttp import coordinator as coord, ends
+    from ttp.prompts import charter_sections
+    p.charter_path.write_text(RESTR_CHARTER + "\n## Restrictions (added 2026-10-03, turn 7.0)\n"
+                              "Never touch the shared box.\nUntil: the release ships\n")
+    assert coord.apply(p, [{"type": "charter_update", "section": "Restrictions",
+                            "quote": "Never push to the main branch.", "text": ""}], turn=40, user_turn=True) == []
+    charter = p.charter_path.read_text()
+    heads = [h for h, _ in charter_sections(charter) if h.startswith("## Restrictions")]
+    # One permanent block holding every item still binding, once; the temporary section keeps its end.
+    assert heads == ["## Restrictions (binding on every task)", "## Restrictions (added 2026-10-03, turn 7.0)"]
+    block = charter.split("## Restrictions (binding on every task)\n")[1].split("\n## ")[0]
+    assert block.strip() == "- Never merge.\n- Keep the docs generic.\n- Never delete release tags.", block
+    assert "Never push to the main branch." not in charter
+    assert [t["end"]["until"] for t in ends.temporaries(p)] == ["the release ships"]
+    hist = (p.harness / coord.CHARTER_HISTORY).read_text()
+    assert "Removed from Restrictions (binding on every task)" in hist and "Never push to the main branch." in hist
+    assert "### Merged into Restrictions (binding on every task) (" in hist
+    assert "Restrictions (added 2026-10-01, turn 3.0):\nKeep the docs generic." in hist
+    # Adding a rule merges nothing; without the user's word (with `over`) nothing is merged either.
+    p.charter_path.write_text(RESTR_CHARTER)
+    assert coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "text": "- Never rebase."}],
+                       turn=41, user_turn=True) == []
+    assert p.charter_path.read_text().count("## Restrictions") == 3
+    assert coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "quote": "Never delete release tags.",
+                            "text": "", "over": "the release shipped on 2026-10-04 and the tags were archived"}],
+                       turn=42) == []
+    assert p.charter_path.read_text().count("## Restrictions") == 3
 
 
 def test_temporary_memory_retires_itself_at_expiry_and_the_digest_says_so(env):
