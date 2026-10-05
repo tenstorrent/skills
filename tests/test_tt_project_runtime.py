@@ -22631,6 +22631,54 @@ def test_resume_lost_to_network_keeps_session(env, tmp_path, net, monkeypatch):
     assert lost and lost["session"] == "S" and lost["run"] == rid
 
 
+def _resume_cut(d, tmp_path, slept):
+    """A resume of session S that fails on its own with no tokens, with or without a host sleep under it."""
+    p, now = d.p, time.time()
+    tid = p.db.add_task("t", "", kind="work", tier="standard", priority=3, budget_usd=8.0, labels=[])
+    lost_note = {"session_id": "S", "not_waste": "sleep", "lost_to_sleep": True}
+    first, _ = _net_run(d, tid, "lost", now - 9000, now - 1000, 1.66, lost_note, tmp_path)
+    p.db.update_task(tid, status="running")
+    rid, run_dir = _net_run(d, tid, "running", now - 600, None, 0, {"resumes": {"run": first, "session": "S"}},
+                            tmp_path)
+    ev = {"type": "result", "subtype": "success", "is_error": True, "result": "API Error: 500 Internal server error",
+          "num_turns": 1, "total_cost_usd": 0, "usage": {"input_tokens": 0, "output_tokens": 0}}
+    (run_dir / "output.jsonl").write_text(json.dumps(ev) + "\n")
+    (run_dir / "stderr.log").write_text("")
+    if slept:
+        p.db.set_kv("host_sleeps", [[now - 500, now - 100]])
+    d.finish_run(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)),
+                 {"rc": 1, "started": now - 600, "ended": now, "stopped": None, "slept_s": 0.0})
+    return p.db.one("SELECT * FROM runs WHERE id=?", (rid,)), p.db.task(tid)
+
+
+def test_a_resume_cut_by_a_host_sleep_keeps_its_session(env, tmp_path, net, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dm
+    d = dm.Daemon(p.base)
+    run, task = _resume_cut(d, tmp_path, slept=True)
+    note = json.loads(run["note"])
+    assert run["status"] == "lost" and note["lost_to_sleep"] and note.get("not_waste") == "sleep", note
+    assert note["session_id"] == "S"
+    assert task["status"] == "queued" and int(task["attempts"] or 0) == 0, dict(task)
+    monkeypatch.setattr(dm, "get_provider", lambda name: type("P", (), {
+        "resume_args": lambda self, s: ["--resume", s], "session_saved": lambda self, s, c, e=None: True})())
+    lost = d._resumable(p.db.task(task["id"]), "claude")
+    assert lost and lost["session"] == "S" and lost["run"] == run["id"]
+
+
+def test_a_resume_that_fails_without_a_sleep_still_starts_fresh(env, tmp_path, net, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dm
+    d = dm.Daemon(p.base)
+    run, task = _resume_cut(d, tmp_path, slept=False)
+    note = json.loads(run["note"])
+    assert run["status"] == "failed" and note.get("not_waste") == "resume" and not note.get("lost_to_sleep"), note
+    assert task["status"] == "queued" and int(task["attempts"] or 0) == 0, dict(task)
+    monkeypatch.setattr(dm, "get_provider", lambda name: type("P", (), {
+        "resume_args": lambda self, s: ["--resume", s], "session_saved": lambda self, s, c, e=None: True})())
+    assert d._resumable(p.db.task(task["id"]), "claude") is None
+
+
 def test_resume_losses_still_capped(env, tmp_path, net):
     p = make(env)
     from ttp.daemon import Daemon

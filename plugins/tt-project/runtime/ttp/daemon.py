@@ -1184,10 +1184,15 @@ class Daemon:
         self._priced(r, usage)
         self._net_of_session(r, usage)
         stopped = exit_info.get("stopped")
+        # A long sleep can drop the CLI's login under a run ("Not logged in" after hours of a closed
+        # lid). That run is lost to the sleep; a real log-out shows again on the next run.
+        slept_auth = usage.auth_failed and float(exit_info.get("slept_s") or 0) >= SLEPT_LONG_S
+        slept = slept_auth or self._slept_during(r, exit_info)
         # A resume that failed on its own and reported no tokens never got going, even if it printed
         # events: it costs nothing, so it ends as the free fallback to a fresh start (_finish_worker).
-        failed_resume = not stopped and (exit_info.get("rc") != 0 or usage.error) and not _has_tokens(usage) \
-            and _resume_never_started(json.loads(r["note"] or "{}"), usage)
+        # One a host sleep cut is lost to the sleep instead, and keeps its session.
+        failed_resume = not stopped and not slept and (exit_info.get("rc") != 0 or usage.error) \
+            and not _has_tokens(usage) and _resume_never_started(json.loads(r["note"] or "{}"), usage)
         if usage.estimated and not usage.cost_usd and not failed_resume:
             usage.cost_usd = _cut_off_cost(run_dir, exit_info, usage, prov)
         status = "ok" if exit_info.get("rc") == 0 and not usage.error else "failed"
@@ -1200,9 +1205,6 @@ class Daemon:
             cut_off, status = status, "ok"   # it handed off before the clock ran out: the work is done, not wasted
         if usage.limited:
             status = "limit"
-        # A long sleep can drop the CLI's login under a run ("Not logged in" after hours of a closed
-        # lid). That run is lost to the sleep; a real log-out shows again on the next run.
-        slept_auth = usage.auth_failed and float(exit_info.get("slept_s") or 0) >= SLEPT_LONG_S
         if usage.auth_failed and not slept_auth:
             status = "auth"
         net_lost = status in SLEEP_CUT and bool(NET_LOST_RE.search(usage.error or ""))
@@ -1225,13 +1227,14 @@ class Daemon:
             # The API host did not resolve: the network went away under the run, not the task.
             note.update(not_waste="network", lost_to_network=True)
             status = "lost"
-        elif status == "failed" and _resume_never_started(note, usage):
-            note["not_waste"] = "resume"   # nothing ran: the task starts fresh (_finish_worker)
-        elif slept_auth or (status in SLEEP_CUT and self._slept_during(r, exit_info)):
+        elif slept_auth or (status in SLEEP_CUT and slept):
             # A run that overlapped a host sleep did not time out or fail on its own: the host went
-            # away under it. It is lost to the sleep, like a run lost to a reboot.
+            # away under it. It is lost to the sleep, like a run lost to a reboot. A resume cut this
+            # way keeps its session (below), so this comes before the fresh-start fallback.
             note.update(not_waste="sleep", lost_to_sleep=True, slept_s=exit_info.get("slept_s"))
             status = "lost"
+        elif status == "failed" and _resume_never_started(note, usage):
+            note["not_waste"] = "resume"   # nothing ran: the task starts fresh (_finish_worker)
         if status == "lost" and not note.get("session_id") and (note.get("resumes") or {}).get("session"):
             # A resume the sleep or network cut keeps its session for the next resume, not a fresh start.
             note["session_id"] = note["resumes"]["session"]
