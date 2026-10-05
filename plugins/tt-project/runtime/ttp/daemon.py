@@ -1263,8 +1263,11 @@ class Daemon:
             text += f"\nReview #{review[0]} " + ("queued by the daemon." if review[1] else "was already queued.")
         # A review that failed with fix specs gets its fix and re-review from the daemon, and what waited
         # on it waits on the re-review instead of being blocked. A failure without them still blocks.
-        fix = self._fix_failed_review(dict(task, **upd), fups, summary) \
-            if new == "failed" and task["kind"] == "review" and fups and len(fups) <= MAX_FOLLOWUPS else None
+        # Upstream notes and deferred follow-ups are not fixes: they stay with the coordinator.
+        fixes = [f for f in fups if not upstream.is_note(f) and not f.get("start_after") and not f.get("start_when")]
+        fix = self._fix_failed_review(dict(task, **upd), fixes, summary) \
+            if new == "failed" and task["kind"] == "review" and fixes and len(fups) <= MAX_FOLLOWUPS else None
+        folded = {id(f) for f in fixes} if fix else set()
         if fix:
             moved = ", ".join(f"#{i}" for i in fix[2])
             text += (f"\nFix #{fix[0]} and re-review #{fix[1]} queued by the daemon"
@@ -1284,8 +1287,8 @@ class Daemon:
             db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                  (time.time(), f"task:{task['id']}", "followup_proposed", "normal",
                   f"proposed follow-up: {str(f['title'])[:200]}{f' [{start}]' if start else ''} — "
-                  f"{_cut(str(f.get('spec', '')), FOLLOWUP_SPEC_CHARS, where)}", "handled" if fix else "queued",
-                  task["id"]))
+                  f"{_cut(str(f.get('spec', '')), FOLLOWUP_SPEC_CHARS, where)}",
+                  "handled" if id(f) in folded else "queued", task["id"]))
 
     # money ----------------------------------------------------------------------------------------
     def _refresh_meters(self, every_s: float = 600) -> None:
@@ -2496,10 +2499,12 @@ class Daemon:
         d = cfg.get("delivery") or {}
         if not (cfg.get("review") or {}).get("auto", True) or not (d.get("review_before_pr", True) or d.get("push_branch")):
             return None
-        rounds, seen, c = 1, {review["id"]}, continues_id(review)
+        # A re-review repeats the stack's first review's spec, not the nested specs of the rounds since.
+        rounds, seen, c, first = 1, {review["id"]}, continues_id(review), review
         while c is not None and c not in seen and (t := db.task(c)):
             seen.add(c)
-            rounds += t["kind"] == "review"
+            if t["kind"] == "review":
+                rounds, first = rounds + 1, t
             c = continues_id(t)
         if rounds > AUTO_FIX_ROUNDS or db.one("SELECT id FROM tasks WHERE labels LIKE ?",
                                               (f'%"continues:{review["id"]}"%',)):
@@ -2536,10 +2541,11 @@ class Daemon:
                                   f"Re-review after review #{review['id']} failed. Fix task #{fid} (branch {fbranch}, "
                                   f"built on #{code['id']}'s branch {code['branch']} at {head}) addresses its findings:",
                                   found,
-                                  f"Check each is fixed, then review what changed since. Where the earlier review's "
-                                  f"spec below names {code['branch']} or #{code['id']}'s worktree, use #{fid}'s branch "
-                                  f"and worktree.",
-                                  f"The earlier review's spec:\n{spec[:REVIEW_FIX_SPEC_CHARS]}"]),
+                                  f"Check each is fixed, then review what changed since. Where the first review's "
+                                  f"spec below names a branch or worktree of this stack (such as {code['branch']} or "
+                                  f"#{code['id']}'s worktree), use #{fid}'s branch and worktree.",
+                                  f"The first review's spec (#{first['id']}):\n"
+                                  f"{(first.get('spec') or '')[:REVIEW_FIX_SPEC_CHARS]}"]),
                               kind="review", tier=review["tier"], priority=review["priority"], origin="daemon",
                               budget_usd=float(cfg["budget"]["task_default_usd"].get(review["tier"], 8.0)),
                               depends_on=[fid], labels=[f"auto_review:{fid}", f"continues:{review['id']}"])

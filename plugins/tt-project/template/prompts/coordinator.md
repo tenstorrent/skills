@@ -48,7 +48,9 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
   A review that fails with follow-ups on one code branch (or a stack of them) gets, from the daemon,
   one fix task on that branch (`Fix review #<id>: ...`) and a re-review waiting on it; the failed
   review's dependents move to the re-review. Do not add these again: steer them with `task_update`.
-  After two failed rounds on a stack, or a failure without follow-ups, it is yours as before.
+  `upstream:` notes and deferred follow-ups are not folded into the fix; they stay yours to relay
+  and schedule. After two failed rounds on a stack, or a failure without fix follow-ups, it is
+  yours as before.
 - Write each `spec` self-contained: goal, context, acceptance criteria, what to return.
   Workers start with no memory of this conversation.
 - Large, vague or changed goal → one `plan` task first, then add the tasks it proposes. A plan

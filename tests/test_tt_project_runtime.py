@@ -14594,6 +14594,9 @@ def test_a_failed_review_with_fixes_moves_its_dependents_onto_the_re_review(env)
     assert fix2 and continues_id(fix2) == fix["id"] and fix2["title"] == f"Fix review #{re_rev['id']}: feature"
     re_rev2 = p.db.one("SELECT * FROM tasks WHERE kind='review' AND depends_on=?", (json.dumps([fix2["id"]]),))
     assert re_rev2["title"] == f"Re-review #{re_rev['id']}: Review #{code}: feature"
+    # Round two repeats the first review's spec, not round one's re-review spec nested inside it.
+    assert re_rev2["spec"].count("Review only") == 1 and f"Re-review after review #{rev['id']}" not in re_rev2["spec"]
+    assert f"The first review's spec (#{rev['id']})" in re_rev2["spec"]
     assert dependency_ids(p.db.task(waiter)) == [re_rev2["id"]]
     p.db.update_task(fix2["id"], status="done")
     third = _fail_review(env, p, re_rev2["id"], fups[:1])
@@ -14626,3 +14629,41 @@ def test_a_failed_review_without_fixes_still_blocks_its_dependents(env):
                           depends_on=[p.db.one("SELECT id FROM tasks WHERE title='change c'")["id"]])
     failed = _fail_review(env, p, c_rev, [{"title": "fix c", "spec": "s"}])
     assert failed["status"] == "queued" and p.db.q("SELECT id FROM tasks WHERE origin='daemon' AND kind='code'") == []
+
+
+def test_a_failed_review_with_only_notes_or_deferred_follow_ups_still_blocks(env):
+    """An `upstream:` note or a deferred follow-up is not a fix: no daemon fix, the dependents stay
+    blocked and every event stays queued for the coordinator."""
+    p = make(env)
+    for fup in ({"title": "upstream: the prompt could say X", "spec": "a lesson for tt-project"},
+                {"title": "later: retune it", "spec": "s", "start_after": 600},
+                {"title": "when ready: rerun it", "spec": "s", "start_when": "test -e done"}):
+        _, _, _, (rev,) = _finish_code(env, p, f"feature {fup['title'][:5]}", {"app.py": 40})
+        waiter = p.db.add_task("deploy it", "s", origin="coordinator", depends_on=[rev["id"]])
+        failed = _fail_review(env, p, rev["id"], [fup])
+        assert p.db.q("SELECT id FROM tasks WHERE origin='daemon' AND kind='code'") == [], fup["title"]
+        assert failed["status"] == "queued" and "Fix #" not in failed["text"]
+        w = p.db.task(waiter)
+        assert w["status"] == "blocked" and w["blocked_reason"] == f"dependency #{rev['id']} failed"
+        assert [e["status"] for e in p.db.q("SELECT status FROM events WHERE task=? AND kind='followup_proposed'",
+                                            (rev["id"],))] == ["queued"]
+
+
+def test_a_failed_reviews_fix_takes_only_the_real_findings(env):
+    p = make(env)
+    _, _, _, (rev,) = _finish_code(env, p, "feature", {"app.py": 40})
+    waiter = p.db.add_task("deploy it", "s", origin="coordinator", depends_on=[rev["id"]])
+    failed = _fail_review(env, p, rev["id"], [
+        {"title": "add the missing test", "spec": "test_x must fail without the change"},
+        {"title": "upstream: the review prompt could say X", "spec": "a lesson for tt-project"},
+        {"title": "retune later", "spec": "after the soak", "start_after": 3600}])
+    (fix,) = p.db.q("SELECT * FROM tasks WHERE kind='code' AND origin='daemon'")
+    re_rev = p.db.one("SELECT * FROM tasks WHERE kind='review' AND id!=?", (rev["id"],))
+    assert "test_x must fail" in fix["spec"] and "a lesson for tt-project" not in fix["spec"]
+    assert "after the soak" not in fix["spec"] and "a lesson for tt-project" not in re_rev["spec"]
+    assert failed["status"] == "handled" and p.db.task(waiter)["status"] == "queued"
+    ev = {e["text"].split(" — ")[0]: e["status"] for e in
+          p.db.q("SELECT text, status FROM events WHERE task=? AND kind='followup_proposed'", (rev["id"],))}
+    assert ev == {"proposed follow-up: add the missing test": "handled",
+                  "proposed follow-up: upstream: the review prompt could say X": "queued",
+                  "proposed follow-up: retune later [start_after: 3600]": "queued"}
