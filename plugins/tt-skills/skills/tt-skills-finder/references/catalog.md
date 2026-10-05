@@ -99,3 +99,39 @@ Install or enable it only after the user chooses it:
   Directory.
 - **Claude Code:** run `/plugin install tt-buddy@tenstorrent-skills` after adding the
   `tenstorrent/skills` marketplace.
+
+## `tt-serve-model`
+
+Use for any stage of deploying a model on Tenstorrent hardware, from an untouched host to a server
+answering `/health`. Four skills, one per stage:
+
+- `discover`, which answers what this host is and what it can deploy — host facts, driver, boards vs
+  ASICs, hugepages, docker, HF cache, port 8000, device holders, the `--tt-device` string derived
+  from board serials, firmware minimums, idle telemetry, reset verdict, deployable models, disk,
+  clean-box — from fixed commands and the upstream spec. Read-only.
+- `retrieve`, which resolves one model before it is pulled or launched — HF existence and gating,
+  the tt-inference-server spec entry (image, commits, status, ceilings, known issues), image-vs-repo
+  spec drift, GHCR tag/size/ancestry, run.py vs direct docker, and the tt-model-manager bundle path
+  with the exact pull and serve commands. Read-only unless `--pull`.
+- `launch`, which diagnoses a launch that is running, hanging, or has failed — stage/hang/failure
+  classification, mandatory docker flags, minimum-override selection and safety, realistic timing,
+  and displaced services — from the launching container's own log and state.
+- `verify`, which checks a live server is actually healthy, correct, and performant — health,
+  served model/context, generation correctness, mesh utilization, throughput/batching, and
+  reasoning-model quirks — and narrows down the root cause when a check fails.
+
+Every answer traces to a listed command's output, a captured log, a live request/response, or a
+listed static rule; nothing is answered from memory or product pages.
+
+Recommend it when the user asks what is on this machine or what it can deploy, which `--tt-device`
+to pass, whether a model exists or is gated, which image/commits/limits apply, how to pull a model,
+whether a launch is hanging or failed, what flags it needs, how long it should take, or whether a
+running server is actually working. Route model bring-up (writing a new TTNN model) to
+`tt-model-bringup` instead.
+
+Install or enable it only after the user chooses it:
+
+- **Codex / ChatGPT desktop:** select `tt-serve-model` under **Tenstorrent Skills** in the Plugins
+  Directory.
+- **Claude Code:** run `/plugin install tt-serve-model@tenstorrent-skills` after adding the
+  `tenstorrent/skills` marketplace.
