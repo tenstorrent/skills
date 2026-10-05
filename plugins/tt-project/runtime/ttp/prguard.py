@@ -320,6 +320,34 @@ DISCUSSES_RE = re.compile(r"\b(never|not|refuse\w*|reject\w*|den(?:y|ies|ied)|gu
                           r"pr_approve|undo)\b|n't\b", re.I)
 
 
+_PR = r"(?:pull\s+requests?|PRs?)(?:\s*#?\d+)?\b"
+# An instruction to open, update or publish a PR: "deliver X as one draft PR", "open a draft PR",
+# "gh pr create", "push the branch for a PR". Only a code task may do any of that.
+DELIVERY_RE = re.compile(
+    rf"\b(?:deliver|publish|ship|submit|propose|land)\w*\b[^.;\n]{{0,160}}?\b(?:as|via|through|in|into)\s+"
+    rf"(?:(?:a|an|one|its|the|their|our|your|own|owned|new|draft|single|separate)\s+)*{_PR}|"
+    rf"\b(?:open|raise|create|file|submit|publish|send|update|refresh)\s+"
+    rf"(?:(?:a|an|one|its|the|their|our|your|this|own|owned|new|draft|single|separate)\s+)*{_PR}|"
+    rf"\bgh\s+pr\s+(?:create|edit)\b|\bttp\s+push\b[^\n;|&]*\s--own\b|"
+    rf"\bpush\w*\s+(?:the|its|your|this|a|our)\s+(?:own\s+)?branch\b[^.;\n]{{0,60}}?\bfor\s+"
+    rf"(?:(?:a|an|the|its|draft)\s+)*{_PR}", re.I)
+# Words before the instruction in its clause that make it a rule, a question or someone else's job.
+NOT_DELIVERY_RE = re.compile(r"\b(never|not|no|without|refus\w*|reject\w*|forbid\w*|cannot|only|whether|how|why|"
+                             r"if|user|i|we|they|someone|human|reviewer|coordinator|maintainers?)\b|n't\b", re.I)
+
+
+def delivery_instruction(text: str) -> str | None:
+    """The clause of `text` that tells a worker to open, update or publish a pull request, or None.
+    A clause that forbids it, asks about it, or gives it to someone else does not count."""
+    bare = PR_URL_RE.sub("the PR", text or "")   # a URL's dots are not a clause's end
+    for m in DELIVERY_RE.finditer(bare):
+        start = max(bare.rfind(c, 0, m.start()) for c in ".;:,!?\n(") + 1
+        if not NOT_DELIVERY_RE.search(bare[start:m.start()]):
+            end = min([i for i in (bare.find(c, m.end()) for c in ".;\n") if i >= 0] or [len(bare)])
+            return bare[start:end].strip()[:120]
+    return None
+
+
 def spec_problem(db, spec: str) -> str | None:
     """Why a task spec must not be handed out: it tells a worker to take a PR out of draft and that
     PR has no unspent approval. None when it may."""

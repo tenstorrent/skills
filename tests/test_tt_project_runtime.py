@@ -15693,6 +15693,52 @@ def test_task_specs_that_take_a_pr_out_of_draft_need_the_users_approval(env):
     assert coord.apply(p, [{"type": "task_update", "id": tid, "spec": f"Then gh pr ready {url}"}]) == []
 
 
+def test_a_task_asked_to_deliver_a_pr_runs_as_code(env):
+    """A `work` task whose spec asked for a draft PR was refused by its worker (only code tasks open
+    PRs) and produced nothing. task_add and a spec update now make such a task `code`, and say why."""
+    p = make(env)
+    from ttp import coordinator as coord, prguard
+    asks = ("Deliver the reviewed harness as one draft PR using supported guarded publication.",
+            "Publish the reviewed repair as a draft PR after the review passes.",
+            "Fix the parser, then open a draft PR against main, never mark it ready.",
+            "Update the PR description with the new numbers.", "Run gh pr create --draft.",
+            "Publish the branch with ttp push --own --detach.")
+    for n, spec in enumerate(asks):
+        kind = "question" if n % 2 else "work"
+        out = coord.apply(p, [{"type": "task_add", "title": f"deliver {n}", "kind": kind, "spec": spec}])
+        assert out == [], out
+        task = p.db.one("SELECT * FROM tasks WHERE title=?", (f"deliver {n}",))
+        assert task["kind"] == "code", spec
+        note = " ".join(p.db.kv(coord.NOTES_KEY))
+        assert f"#{task['id']} added as `code`, not `{kind}`" in note and "only code tasks" in note, note
+    # The title alone asks for it too.
+    coord.apply(p, [{"type": "task_add", "title": "Deliver the fix as a draft PR", "spec": "see task 3"}])
+    assert p.db.one("SELECT kind FROM tasks WHERE title='Deliver the fix as a draft PR'")["kind"] == "code"
+    # Rules about PRs, questions about them and someone else's PR are not a request to deliver one.
+    for n, spec in enumerate(("Never open pull requests (the user opens the PR).", "Do not open a PR.",
+                 "Only code tasks may open PRs.", "The user will open the PR later; write the report.",
+                 "Find out how to open a PR on a fork.", "Leave PR123 untouched; no force-push.",
+                 "Summarize the review comments on https://github.com/acme/widgets/pull/7 in a report.",
+                 "Check whether the opened PR passes CI.")):
+        assert prguard.delivery_instruction(spec) is None, spec
+        title = f"no pr {n}"
+        coord.apply(p, [{"type": "task_add", "title": title, "kind": "work", "spec": spec}])
+        assert p.db.one("SELECT kind FROM tasks WHERE title=?", (title,))["kind"] == "work", spec
+    # Reviews, plans and harness tasks keep their kind.
+    for kind in ("review", "plan", "harness"):
+        coord.apply(p, [{"type": "task_add", "title": f"k {kind}", "kind": kind, "spec": asks[0]}])
+        assert p.db.one("SELECT kind FROM tasks WHERE title=?", (f"k {kind}",))["kind"] == kind
+    # A spec update asking for it switches a queued task; a running one keeps its kind mid-run.
+    tid = p.db.add_task("report", "write the report", kind="work", tier="light", origin="user")
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "spec": "Then open a draft PR with it."}]) == []
+    assert p.db.task(tid)["kind"] == "code"
+    assert f"#{tid} is now `code`, not `work`" in " ".join(p.db.kv(coord.NOTES_KEY))
+    busy = p.db.add_task("busy", "write the report", kind="work", tier="light", origin="user")
+    p.db.update_task(busy, status="running")
+    coord.apply(p, [{"type": "task_update", "id": busy, "spec": "Then open a draft PR with it."}])
+    assert p.db.task(busy)["kind"] == "work"
+
+
 def test_an_approval_covers_only_the_commit_the_user_said_yes_to(env, tmp_path, monkeypatch):
     """A yes was recorded, then more commits were pushed and the PR was marked ready with them. The
     approval is bound to the PR's head as pr-watch last read it: a moved head is refused (and the

@@ -582,8 +582,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 why = prguard.spec_problem(db, a.get("spec") or "")
                 if why:
                     raise ValueError(f"task_add rejected: {why}")
+                kind, pr_ask = _delivery_kind(a.get("kind") or "work", title + "\n" + (a.get("spec") or ""))
                 with db.tx():
-                    new_id = db.add_task(title, a.get("spec") or "", kind=a.get("kind") or "work", tier=tier,
+                    new_id = db.add_task(title, a.get("spec") or "", kind=kind, tier=tier,
                                          priority=int(a.get("priority") or 3), provider=a.get("provider") or None,
                                          budget_usd=float(budget), depends_on=deps,
                                          reply_chat=a.get("reply_chat") or None, origin="coordinator",
@@ -599,6 +600,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                             db.update_task(old["id"], status="cancelled", blocked_reason=f"continued by #{new_id}")
                 if followup:
                     notes.append(f"task_add: #{followup['id']} is done; added #{new_id} as its follow-up")
+                if pr_ask:
+                    notes.append(f"task_add: #{new_id} added as `code`, not `{a.get('kind') or 'work'}`: it asks for "
+                                 f"PR delivery ({pr_ask!r}) and only code tasks open or update PRs")
             elif t == "task_update":
                 task = db.task(int(a["id"]))
                 if not task:
@@ -671,6 +675,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     if why:
                         raise ValueError(f"#{task['id']} rejected: {why}")
                     upd["spec"] = task["spec"] + "\n\n## Update\n" + spec
+                    kind, pr_ask = _delivery_kind(task["kind"], spec)
+                    if pr_ask and upd.get("status", task["status"]) in ("queued", "blocked", "waiting"):   # not mid-run
+                        upd["kind"] = kind
+                        notes.append(f"task_update: #{task['id']} is now `code`, not `{task['kind']}`: its spec asks "
+                                     f"for PR delivery ({pr_ask!r}) and only code tasks open or update PRs")
                 db.update_task(task["id"], **upd)
                 if spec and task["status"] == "running":
                     for r in db.q("SELECT dir FROM runs WHERE task=? AND status='running'", (task["id"],)):
@@ -818,6 +827,13 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
         db.x(f"UPDATE messages SET text=text||? WHERE id IN ({','.join('?' * len(replies))})",
              [f"\n\n(not done: {note})", *replies])
     return problems
+
+
+def _delivery_kind(kind: str, text: str) -> tuple[str, str | None]:
+    """The kind a task runs as, and the clause that changed it: a `work` or `question` task asked to
+    open, update or publish a PR is a `code` task, the only kind that may (worker prompt)."""
+    ask = prguard.delivery_instruction(text) if kind in ("work", "question") else None
+    return ("code", ask) if ask else (kind, None)
 
 
 def _ask_question(text: str) -> str:

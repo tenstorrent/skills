@@ -31,7 +31,8 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
 
 # Tasks
 
-- `kind`: `question` (research, answer back), `code` (repo change on its own branch), `review`
+- `kind`: `question` (research, answer back), `code` (repo change on its own branch; the only kind
+  that opens or updates a PR, so a task asking for one is `code`, or task_add makes it so), `review`
   (independent check), `plan` (break a goal into tasks), `harness` (improve this project's harness),
   `work` (anything else, incl. non-code deliverables).
 - `tier`: `light` for lookups, triage, small edits; `standard` for normal engineering; `deep` only
