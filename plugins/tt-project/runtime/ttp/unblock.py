@@ -210,12 +210,14 @@ def _note(raw: Any) -> dict:
 
 
 def _triggers(note: dict) -> list[str]:
-    """A turn's trigger labels, each cut to 40 chars; "escalated: <why>" becomes "escalated"."""
+    """A turn's trigger labels: each entry's text before the first ':' or '(', cut to 40 chars,
+    so "jev: needs thought (stuck 0.80)" counts as "jev" and "escalated: <why>" as "escalated"."""
     trigs = note.get("triggers")
-    if isinstance(trigs, list):
-        return ["escalated" if str(t).startswith("escalated") else str(t)[:40] for t in trigs if t]
-    trig = note.get("trigger") or note.get("unblock")
-    return [str(trig)[:40]] if trig else []
+    if not isinstance(trigs, list):
+        trig = note.get("trigger") or note.get("unblock")
+        trigs = [trig] if trig else []
+    labels = (re.split(r"[:(]", str(t), maxsplit=1)[0].strip()[:40] for t in trigs if t)
+    return [lab for lab in labels if lab]
 
 
 def triggers_line(db: DB, since: float) -> str:
@@ -239,7 +241,8 @@ def triggers_line(db: DB, since: float) -> str:
             f"routine {routine[0]} ({100 * routine[0] / n:.0f}%, ${routine[1]:.2f})")
     if per:
         line += "; per trigger: " + ", ".join(f"{k} {v}" for k, v in sorted(per.items(), key=lambda kv: (-kv[1], kv[0])))
-    esc = db.kv("escalations", {}) or {}
+    from .coordinator import ESCALATIONS_KEY
+    esc = db.kv(ESCALATIONS_KEY, {}) or {}
     line += f"; escalations: {int(esc.get('n', 0))} (refused {int(esc.get('refused', 0))})"
     return line
 

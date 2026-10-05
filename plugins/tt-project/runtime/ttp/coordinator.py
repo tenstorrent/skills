@@ -144,7 +144,7 @@ CONFLICT_RE = re.compile(r"\b(change of plan|change(d)? (my|the) mind|supersed\w
                          r"forget (that|what i said)|overrid\w*|contrary to|reverse (that|the) decision)\b", re.I)
 EFFORT_SEEN_KEY = "effort_seen"   # kv: state-based triggers already raised once (held queue, red gates)
 ESCALATE_KEY = "escalate"   # kv: a routine turn's escalation; the next turn reruns its batch at high effort
-ESCALATIONS_KEY = "escalations"   # kv: {"n": routine turns escalated, "rejected": escalations refused}
+ESCALATIONS_KEY = "escalations"   # kv: {"n": routine turns escalated, "refused": escalations refused}
 EFFORT_ORDER = ("minimal", "low", "medium", "high", "xhigh", "max")
 NOTES_KEY = "action_notes"   # kv: the last turn's notes on actions applied with a change; information only
 RECENT_OUT = 5                       # outbound messages the digest repeats, so turns do not resend them

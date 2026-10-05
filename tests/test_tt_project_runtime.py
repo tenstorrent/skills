@@ -902,15 +902,17 @@ def test_unblock_counts_each_logged_trigger_and_the_escalated_bucket(env):
             ("high", '{"triggers": ["task_blocked", "user_message"], "unblock": "task_blocked, user_message"}', 0.5),
             ("high", '{"triggers": ["escalated: harder than it looked", "task_blocked"], "escalated": true}', 0.25),
             ("high", '{"unblock": "alert_high"}', 0.25),   # an older note: no list
+            ("high", '{"triggers": ["jev: needs thought (stuck 0.80)"]}', 0.05),
+            ("high", '{"triggers": ["jev: routine (stuck 0.10)"]}', 0.05),
             ("low", '{"triggers": []}', 0.1)):
         db.x("INSERT INTO runs(role,status,started,effort,note,cost_usd) VALUES('coordinator','ok',?,?,?,?)",
              (now - 60, effort, note, cost))
     assert unblock.turns_line(db, now - 86400) == (
-        "4 turns: 3 high, 1 low; 1 escalated low to high; "
-        "high-effort triggers: task_blocked 2, user_message 1, escalated 1, alert_high 1")
+        "6 turns: 5 high, 1 low; 1 escalated low to high; "
+        "high-effort triggers: task_blocked 2, jev 2, user_message 1, escalated 1, alert_high 1")
     db.set_kv("escalations", {"n": 2, "refused": 1})
     assert unblock.triggers_line(db, now - 86400) == (
-        "raised 3 (75%, $1.00), routine 1 (25%, $0.10); per trigger: task_blocked 2, alert_high 1, "
+        "raised 5 (83%, $1.10), routine 1 (17%, $0.10); per trigger: jev 2, task_blocked 2, alert_high 1, "
         "escalated 1, user_message 1; escalations: 2 (refused 1)")
     assert unblock.triggers_line(db, now + 10) == "no coordinator turns"
 
