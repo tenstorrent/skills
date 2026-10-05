@@ -178,7 +178,9 @@ def asks_line(rows: list[dict]) -> str:
 
 
 def turns_line(db: DB, since: float) -> str:
-    """The coordinator's high/low turn split and, where its turns log them, escalations and triggers."""
+    """The coordinator's high/low turn split and, where its turns log them, escalations and triggers.
+    A note's `triggers` list counts each trigger on its own; an "escalated: <why>" entry counts
+    under "escalated". Notes without that list fall back to `trigger` or `unblock`."""
     rows = db.q("SELECT effort, note FROM runs WHERE role='coordinator' AND started>=?", (since,))
     if not rows:
         return "no coordinator turns"
@@ -186,22 +188,59 @@ def turns_line(db: DB, since: float) -> str:
     escalated, logged, why = 0, False, {}
     for r in rows:
         split[r["effort"] or "default"] = split.get(r["effort"] or "default", 0) + 1
-        try:
-            note: Any = json.loads(r["note"] or "{}")
-        except ValueError:
-            note = {}
-        if not isinstance(note, dict):
-            continue
+        note = _note(r["note"])
         keys = [k for k in note if "escalat" in str(k)]
         logged = logged or bool(keys)
         escalated += any(bool(note[k]) for k in keys)
-        trig = note.get("trigger") or note.get("unblock")
-        if trig:
-            why[str(trig)[:40]] = why.get(str(trig)[:40], 0) + 1
+        for t in _triggers(note):
+            why[t] = why.get(t, 0) + 1
     line = f"{len(rows)} turns: " + ", ".join(f"{n} {k}" for k, n in sorted(split.items(), key=lambda kv: -kv[1]))
     line += f"; {escalated} escalated low to high" if logged else "; escalations not logged"
     if why:
         line += "; high-effort triggers: " + ", ".join(f"{k} {n}" for k, n in sorted(why.items(), key=lambda kv: -kv[1])[:5])
+    return line
+
+
+def _note(raw: Any) -> dict:
+    try:
+        note: Any = json.loads(raw or "{}")
+    except ValueError:
+        return {}
+    return note if isinstance(note, dict) else {}
+
+
+def _triggers(note: dict) -> list[str]:
+    """A turn's trigger labels, each cut to 40 chars; "escalated: <why>" becomes "escalated"."""
+    trigs = note.get("triggers")
+    if isinstance(trigs, list):
+        return ["escalated" if str(t).startswith("escalated") else str(t)[:40] for t in trigs if t]
+    trig = note.get("trigger") or note.get("unblock")
+    return [str(trig)[:40]] if trig else []
+
+
+def triggers_line(db: DB, since: float) -> str:
+    """Coordinator turns per trigger label, the raised vs routine share with their cost, and the
+    `escalations` counts (routine turns escalated, escalations refused)."""
+    rows = db.q("SELECT note, cost_usd FROM runs WHERE role='coordinator' AND started>=?", (since,))
+    if not rows:
+        return "no coordinator turns"
+    per: dict[str, int] = {}
+    raised = [0, 0.0]
+    routine = [0, 0.0]
+    for r in rows:
+        trigs = _triggers(_note(r["note"]))
+        side = raised if trigs else routine
+        side[0] += 1
+        side[1] += float(r["cost_usd"] or 0)
+        for t in trigs:
+            per[t] = per.get(t, 0) + 1
+    n = len(rows)
+    line = (f"raised {raised[0]} ({100 * raised[0] / n:.0f}%, ${raised[1]:.2f}), "
+            f"routine {routine[0]} ({100 * routine[0] / n:.0f}%, ${routine[1]:.2f})")
+    if per:
+        line += "; per trigger: " + ", ".join(f"{k} {v}" for k, v in sorted(per.items(), key=lambda kv: (-kv[1], kv[0])))
+    esc = db.kv("escalations", {}) or {}
+    line += f"; escalations: {int(esc.get('n', 0))} (refused {int(esc.get('refused', 0))})"
     return line
 
 
@@ -216,4 +255,5 @@ def lines(db: DB, now: float | None = None) -> list[str]:
     for label, span in WINDOWS:
         out.append(f"asks, {label}: {asks_line(asks(db, now - span, now))}")
     out.append(f"coordinator, 24 h: {turns_line(db, now - 86400)}")
+    out.append(f"coordinator triggers, 24 h: {triggers_line(db, now - 86400)}")
     return out

@@ -893,6 +893,27 @@ def test_unblock_asks_handed_back_and_turn_split(env):
     assert unblock.turns_line(db, now - 86400) == "3 turns: 2 low, 1 high; escalations not logged"
 
 
+
+def test_unblock_counts_each_logged_trigger_and_the_escalated_bucket(env):
+    p = make(env)
+    from ttp import unblock
+    db, now = p.db, time.time()
+    for effort, note, cost in (
+            ("high", '{"triggers": ["task_blocked", "user_message"], "unblock": "task_blocked, user_message"}', 0.5),
+            ("high", '{"triggers": ["escalated: harder than it looked", "task_blocked"], "escalated": true}', 0.25),
+            ("high", '{"unblock": "alert_high"}', 0.25),   # an older note: no list
+            ("low", '{"triggers": []}', 0.1)):
+        db.x("INSERT INTO runs(role,status,started,effort,note,cost_usd) VALUES('coordinator','ok',?,?,?,?)",
+             (now - 60, effort, note, cost))
+    assert unblock.turns_line(db, now - 86400) == (
+        "4 turns: 3 high, 1 low; 1 escalated low to high; "
+        "high-effort triggers: task_blocked 2, user_message 1, escalated 1, alert_high 1")
+    db.set_kv("escalations", {"n": 2, "refused": 1})
+    assert unblock.triggers_line(db, now - 86400) == (
+        "raised 3 (75%, $1.00), routine 1 (25%, $0.10); per trigger: task_blocked 2, alert_high 1, "
+        "escalated 1, user_message 1; escalations: 2 (refused 1)")
+    assert unblock.triggers_line(db, now + 10) == "no coordinator turns"
+
 def test_the_daily_review_gets_the_unblocking_quality_lines(env):
     p = make(env)
     from ttp import daemon as dm
@@ -903,6 +924,7 @@ def test_the_daily_review_gets_the_unblocking_quality_lines(env):
     spec = p.db.one("SELECT spec FROM tasks WHERE origin='schedule'")["spec"]
     assert "Unblocking quality:\n- stuck blocked, 24 h: none" in spec and "- asks, 7 d: no asks sent" in spec
     assert "- coordinator, 24 h: no coordinator turns" in spec
+    assert "- coordinator triggers, 24 h: no coordinator turns" in spec
     p.db.x("DELETE FROM tasks")
     assert d._schedule_llm(dict(s, name="audit"), {}) == "queued"
     assert "Unblocking quality" not in p.db.one("SELECT spec FROM tasks WHERE origin='schedule'")["spec"]
