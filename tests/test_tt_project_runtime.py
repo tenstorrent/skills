@@ -7840,6 +7840,42 @@ def test_push_refuses_a_dirty_tree_a_failed_check_and_a_conflict(env, monkeypatc
     assert _git_out(origin, "rev-parse", "proj") == moved != before
 
 
+def test_push_keeps_a_conflict_the_branch_already_resolved_in_a_merge(env, monkeypatch):
+    """A review merged two branches that both edit README.md and resolved the conflict. A plain
+    rebase drops the merge and replays both sides, so the resolved conflict came back (exit 3)."""
+    log = env["tmp"] / "checked"
+    p, repo, origin, other = _push_setup(env, monkeypatch, [f"git rev-parse HEAD >> {log}"])
+    _git_out(repo, "checkout", "-qb", "side")
+    _commit(repo, "README.md", "theirs\n")
+    _git_out(repo, "checkout", "-q", "-")
+    _commit(repo, "README.md", "mine\n")
+    assert subprocess.run(["git", "-C", str(repo), "merge", "-q", "side"], capture_output=True).returncode
+    (repo / "README.md").write_text("mine and theirs\n")
+    _git_out(repo, "commit", "-qam", "combine side")
+    merged = _git_out(repo, "rev-parse", "HEAD")
+    # A conflict the merge did not resolve still stops the push, with the rebase aborted.
+    _commit(other, "README.md", "late edit\n")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    assert _ttp_push() == 3
+    assert not (repo / _git_out(repo, "rev-parse", "--git-path", "rebase-merge")).exists()
+    assert _git_out(repo, "rev-parse", "HEAD") == merged
+
+    _git_out(other, "revert", "--no-edit", "HEAD")
+    _commit(other, "late.txt", "late\n")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    moved = _git_out(origin, "rev-parse", "proj")
+    assert _ttp_push() == 0
+    pushed = _git_out(origin, "rev-parse", "proj")
+    assert log.read_text().split() == [pushed], "the checks must run on exactly the pushed commit"
+    assert _git_out(origin, "show", "proj:README.md") == "mine and theirs", "the resolution was lost"
+    assert _git_out(origin, "show", "proj:late.txt") == "late", "the other side's commit was lost"
+    subjects = _git_out(origin, "log", "--format=%s", f"{moved}..proj").splitlines()
+    assert sorted(subjects) == ["combine side", "edit README.md", "edit README.md"]
+    for side in _git_out(origin, "rev-list", "--merges", "--parents", "-1", "proj").split()[1:]:
+        assert _git_out(origin, "merge-base", "--is-ancestor", moved, side) == "", "each side is rebased"
+    assert len(_git_out(repo, "worktree", "list").splitlines()) == 1, "the scratch worktree is gone"
+
+
 def _plugin_commit(path, version, name, text):
     """Commit a file of plugin `p` and set both its manifests to `version`."""
     for m in (".claude-plugin", ".codex-plugin"):

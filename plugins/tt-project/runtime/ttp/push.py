@@ -591,6 +591,57 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
             lock.close()
 
 
+RERERE = ("-c", "rerere.enabled=true", "-c", "rerere.autoUpdate=true")
+MAX_REPLAYED = 50   # merge stops a rebase may get past on recorded resolutions
+
+
+def _learn_merges(repo: Path, merges: list[list[str]]) -> None:
+    """Record each merge's conflict resolution with git rerere, as git's rerere-train does: redo the
+    merge in a scratch worktree, then show rerere the merge's committed result. The record lives in
+    the repository's shared rr-cache, where the rebase finds it."""
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="ttp-push-rerere-") as tmp:
+        scratch = Path(tmp) / "wt"
+        if _git(repo, "worktree", "add", "-q", "--detach", "--no-checkout", str(scratch), "HEAD").returncode:
+            return
+        try:
+            for commit, first, *others in merges:
+                if _git(scratch, "checkout", "-q", "--detach", "-f", first).returncode:
+                    continue
+                if _git(scratch, *RERERE, "merge", "-q", "--no-commit", "--no-ff", *others).returncode:
+                    _git(scratch, *RERERE, "rerere")
+                    _git(scratch, "checkout", "-q", commit, "--", ".")
+                    _git(scratch, *RERERE, "rerere")
+                _git(scratch, "merge", "--abort")
+                _git(scratch, "reset", "-q", "--hard")
+        finally:
+            _git(repo, "worktree", "remove", "--force", str(scratch))
+            _git(repo, "worktree", "prune")
+
+
+def _rebase(repo: Path, tip: str) -> bool:
+    """Rebase HEAD onto `tip`. A branch with merge commits (a review combining several branches)
+    keeps them (--rebase-merges), and the conflicts they resolved are resolved again the same way
+    rather than coming back; a conflict nothing resolved still stops it. False on a conflict, with
+    the rebase left for the caller to abort."""
+    merges = [line.split() for line in
+              _git(repo, "rev-list", "--merges", "--parents", "HEAD", f"^{tip}").stdout.splitlines()]
+    if not merges:
+        return _git(repo, "rebase", tip, quiet=False).returncode == 0
+    _learn_merges(repo, merges)
+    if _git(repo, *RERERE, "rebase", "--rebase-merges", tip, quiet=False).returncode == 0:
+        return True
+    editor = {**os.environ, "GIT_EDITOR": "true"}   # keep each recreated merge's own message
+    for _ in range(MAX_REPLAYED):
+        if not Path(_git(repo, "rev-parse", "--absolute-git-dir").stdout.strip(), "rebase-merge").is_dir() \
+                or _git(repo, "diff", "--name-only", "--diff-filter=U").stdout.strip():
+            return False   # no rebase stopped, or a conflict no recorded resolution covers
+        if subprocess.run(["git", "-C", str(repo), *RERERE, "rebase", "--continue"], env=editor,
+                          text=True, stdout=2).returncode == 0:
+            return True
+    return False
+
+
 def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int,
             say: Callable[[str], None], version_bump: dict | None = None,
             timed: Callable[[float], None] | None = None) -> int:
@@ -608,7 +659,7 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
             say(f"no checks configured, and this change touches more than docs ({', '.join(code[:3])}{more}): "
                 + NO_CHECKS)
             return REFUSED
-        if _git(repo, "rebase", tip, quiet=False).returncode != 0:
+        if not _rebase(repo, tip):
             _git(repo, "rebase", "--abort")
             say(f"rebase onto {upstream} conflicts; resolve it keeping both sides' intents, then rerun")
             return CONFLICT
