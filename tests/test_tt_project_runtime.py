@@ -145,6 +145,10 @@ def env(tmp_path, monkeypatch, _git_session):
             _git_session["plugin_commit"] = real_checkout_commit(root)
         return _git_session["plugin_commit"]
     monkeypatch.setattr(cli, "_checkout_commit", checkout_commit)
+    # A daemon tick never sends upstream notes on over ssh in a test that registers a remote project;
+    # the tests of forwarding turn it back on, with a fake ssh.
+    from ttp import upstream
+    monkeypatch.setattr(upstream, "FORWARD_EVERY_S", float("inf"))
     monkeypatch.setenv("GIT_ALTERNATE_OBJECT_DIRECTORIES", str(_git_session["objects"]))
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(_git_session["config"]))
     repo = tmp_path / "repo"   # a git repository with one commit of README.md
@@ -15064,10 +15068,16 @@ def test_a_note_to_another_project_is_refused_when_it_cannot_be_delivered(env, m
     assert _note(cli, "--to", "nosuch", "hello") != 0
     assert "unknown project nosuch" in capsys.readouterr().err
     register("far", {"host": "farbox", "dir": "/w/far"})
+    upstream.set_forward_to([])          # this machine sends no notes on: one for a remote project cannot go
     assert _note(cli, "--to", "far", "hello") != 0
-    assert "runs on another machine" in capsys.readouterr().err
+    assert "does not send notes there" in capsys.readouterr().err
     assert _note(cli, "--to", "demo", "hello") != 0, "its own project"
     assert not upstream.path().exists()
+    # By default it goes: the daemon sends it on to the machine that runs that project.
+    upstream.set_forward_to(None)
+    assert _note(cli, "--to", "far", "hello") == 0
+    assert "sends it on to farbox" in capsys.readouterr().out
+    assert [n["to"] for n in _upstream_inbox(env)] == ["far"]
 
 
 def test_notes_to_another_project_are_deduped_and_rate_limited(env, monkeypatch, capsys):
@@ -15190,6 +15200,172 @@ def test_remote_upstream_reads_stop_at_the_tick_budget_and_resume_fairly(env, mo
     unregister("far-hostC")
     upstream.ingest(p, p.config(), now + 3760)
     assert calls[6:] == ["hostD"]
+
+
+
+def _fake_ssh(env, monkeypatch) -> dict:
+    """An `ssh` on PATH that runs the remote command locally, in a home of its own per target
+    (tmp/remote/<target>), with that target as its host name; never a real host. `mode` file: `down`
+    (exit 255), `hang` (sleeps), `drop-ack` (the target files the notes, the ack is lost)."""
+    bin_dir, remote = env["tmp"] / "fake-bin", env["tmp"] / "remote"
+    bin_dir.mkdir(exist_ok=True)
+    remote.mkdir(exist_ok=True)
+    fake = {"bin": bin_dir, "remote": remote, "log": env["tmp"] / "ssh.log", "mode": env["tmp"] / "ssh.mode"}
+    (bin_dir / "ttp").write_text(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} "
+                                 f"{shlex.quote(str(RUNTIME.parent / 'bin' / 'ttp'))} \"$@\"\n")
+    (bin_dir / "ssh").write_text(f"""#!/bin/sh
+for last; do :; done
+while [ "$1" != "--" ]; do shift; done
+target=$2
+echo "$target" >> {shlex.quote(str(fake['log']))}
+mode=$(cat {shlex.quote(str(fake['mode']))} 2>/dev/null)
+[ "$mode" = down ] && {{ echo "ssh: connect to host $target: Network is unreachable" >&2; exit 255; }}
+[ "$mode" = hang ] && {{ sleep 30; exit 0; }}
+mkdir -p {shlex.quote(str(remote))}/$target/.tt-project
+HOME={shlex.quote(str(remote))}/$target TTP_HOME={shlex.quote(str(remote))}/$target/.tt-project TTP_HOST=$target \\
+  PATH={shlex.quote(str(bin_dir))}:$PATH sh -c "$last"
+rc=$?
+[ "$mode" = drop-ack ] && exit 255
+exit $rc
+""")
+    for x in ("ttp", "ssh"):
+        (bin_dir / x).chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    return fake
+
+
+def _remote_inbox(fake, target):
+    f = fake["remote"] / target / ".tt-project" / "upstream.jsonl"
+    return [json.loads(x) for x in f.read_text().splitlines()] if f.exists() else []
+
+
+def _ssh_calls(fake):
+    return fake["log"].read_text().split() if fake["log"].exists() else []
+
+
+def test_upstream_notes_written_offline_reach_the_reading_machine_once(env, monkeypatch):
+    """A machine the reader cannot reach sends its own notes on over ssh: after being offline, after a
+    lost ack (the target dedupes), each to where it belongs, and nothing received is sent on again."""
+    from ttp import upstream
+    from ttp.project import register
+    fake = _fake_ssh(env, monkeypatch)
+    register("example-project", {"host": "example-host", "dir": "/w/example"})
+    register("other-project", {"host": "other-host", "dir": "/w/other"})
+    reader_home = fake["remote"] / "example-host" / ".tt-project"
+    reader_home.mkdir(parents=True)
+    (reader_home / "upstream-reader.json").write_text(json.dumps(
+        {"project": "reader-project", "host": "example-host", "ts": time.time()}))
+    upstream.append("demo", 3, [{"title": "upstream: status hides waits", "spec": "show them"}])
+    assert upstream.send("demo", 3, "example-project", "for you") == "sent"
+    assert upstream.send("demo", 3, "other-project", "for the other") == "sent"
+    # Offline: nothing moves, the failure is recorded, and the target waits out its back-off.
+    fake["mode"].write_text("down")
+    now = time.time()
+    assert upstream.forward(now) == 0
+    st = json.loads(upstream.forward_path().read_text())["targets"]
+    assert st["example-host"]["fails"] == 1 and not st["example-host"].get("cursor")
+    assert "Network is unreachable" in st["example-host"]["last_error"]
+    assert any("failing" in x and "unreachable" in x for x in upstream.forward_status(now))
+    calls = len(_ssh_calls(fake))
+    assert upstream.forward(now + 30) == 0 and len(_ssh_calls(fake)) == calls, "tried again within its back-off"
+    # Back online: a reading machine gets the general note and the one addressed to its project;
+    # the machine without a reader gets only the note for its own project.
+    fake["mode"].write_text("ok")
+    assert upstream.forward(now + 3600) == 3
+    got = _remote_inbox(fake, "example-host")
+    assert sorted(n["title"] for n in got) == ["note to example-project", "upstream: status hides waits"]
+    assert all(n["via"] == "testhost" and n["host"] == "testhost" and n["project"] == "demo" for n in got)
+    assert [n["to"] for n in _remote_inbox(fake, "other-host")] == ["other-project"]
+    # The cursor is on disk: a restarted daemon sends nothing again and contacts no one.
+    size = upstream.path().stat().st_size
+    assert all(t["cursor"] == size for t in json.loads(upstream.forward_path().read_text())["targets"].values())
+    calls = len(_ssh_calls(fake))
+    for mod in [m for m in list(sys.modules) if m == "ttp" or m.startswith("ttp.")]:
+        del sys.modules[mod]
+    from ttp import upstream
+    assert upstream.forward(now + 3700) == 0 and len(_ssh_calls(fake)) == calls
+    assert "read there by reader-project" in "\n".join(upstream.forward_status(now + 3700))
+    # A lost ack: the target filed the note, the cursor stays, the resend is counted a duplicate.
+    upstream.append("demo", 4, [{"title": "upstream: second", "spec": "s"}])
+    fake["mode"].write_text("drop-ack")
+    assert upstream.forward(now + 3800) == 0
+    fake["mode"].write_text("ok")
+    assert upstream.forward(now + 3800 + 3600) == 1
+    assert [n["title"] for n in _remote_inbox(fake, "example-host")].count("upstream: second") == 1
+    assert json.loads(upstream.forward_path().read_text())["targets"]["example-host"]["cursor"] == \
+        upstream.path().stat().st_size
+    # A note this machine received from another is never sent on again.
+    line = {"ts": 1, "project": "far-project", "host": "far-host", "task": None, "title": "upstream: from afar",
+            "spec": "x", "fp": upstream.fingerprint("upstream: from afar", "x")}
+    ack, rc = upstream.receive((json.dumps(line) + "\n").encode(), "far-host")
+    assert (rc, ack["accepted"]) == (0, 1)
+    calls = len(_ssh_calls(fake))
+    assert upstream.forward(now + 9000) == 0 and len(_ssh_calls(fake)) == calls
+    # The coordinators here know the notes are read on the other machine.
+    p = make(env)
+    assert "sent on to example-host, where project reader-project reads" in upstream.digest_line(p, p.config())
+
+
+def test_upstream_receive_rejects_malformed_and_oversize_notes(env, monkeypatch, capsys):
+    from ttp import cli, upstream
+
+    def line(title="upstream: ok", spec="s", **kw):
+        n = {"ts": 1.0, "project": "example-project", "host": "example-host", "task": 5, "title": title,
+             "spec": spec, "fp": upstream.fingerprint(title, spec), **kw}
+        return (json.dumps(n) + "\n").encode()
+    good = line()
+    # A stream cut short, or with a line that is not JSON, files nothing at all.
+    for bad in (good + good[:-1], good + b"{not json\n"):
+        ack, rc = upstream.receive(bad, "example-host")
+        assert rc != 0 and "error" in ack
+    assert not upstream.path().exists()
+    assert upstream.receive(good, "not an alias!")[1] != 0
+    # Lines that are not notes, over the caps or with a fingerprint their text does not give are
+    # rejected one by one; the rest are filed once, stamped with the sender.
+    long_spec = "x" * (upstream.SPEC_CHARS + 1)
+    forged = json.loads(line("upstream: other"))
+    forged["fp"] = upstream.fingerprint("upstream: ok", "s")
+    ack, rc = upstream.receive(good + line("not an upstream note") + line(spec=long_spec) + line(project="a b")
+                               + (json.dumps(forged) + "\n").encode() + b"[1]\n" + good, "example-host")
+    assert rc == 0 and (ack["accepted"], ack["duplicates"], ack["rejected"]) == (1, 1, 5)
+    assert ack["last_fp"] == upstream.fingerprint("upstream: ok", "s")
+    assert [(n["title"], n["via"]) for n in _upstream_inbox(env)] == [("upstream: ok", "example-host")]
+    # Addressed notes keep their fields; unknown ones are dropped.
+    text = "hello there"
+    to = (json.dumps({"ts": 2, "project": "example-project", "host": "example-host", "task": None, "to": "demo",
+                      "from": "worker", "severity": "high", "title": "note to demo", "spec": text, "run": "x",
+                      "fp": upstream.fingerprint("to:demo", text)}) + "\n").encode()
+    # Through the command: one JSON ack line on stdout.
+    monkeypatch.setattr(sys, "stdin", type("S", (), {"buffer": io.BytesIO(to)})())
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upstream", "--receive", "--via", "example-host"])
+    assert e.value.code == 0
+    assert json.loads(capsys.readouterr().out)["accepted"] == 1
+    got = _upstream_inbox(env)[-1]
+    assert (got["to"], got["severity"], got["via"], "run" in got) == ("demo", "high", "example-host", False)
+
+
+def test_a_hung_ssh_never_holds_up_the_daemon_tick(env, monkeypatch):
+    from ttp import upstream
+    from ttp.daemon import Daemon
+    from ttp.project import register
+    fake = _fake_ssh(env, monkeypatch)
+    p = make(env)
+    register("example-project", {"host": "example-host", "dir": "/w/example"})
+    upstream.send("demo", 3, "example-project", "for you")
+    fake["mode"].write_text("hang")
+    monkeypatch.setattr(upstream, "FORWARD_EVERY_S", 0)
+    monkeypatch.setattr(upstream, "FORWARD_TIMEOUT_S", 1)
+    d = Daemon(p.base)
+    t0 = time.monotonic()
+    d.forward_upstream()
+    assert time.monotonic() - t0 < 0.5, "the tick waited on ssh"
+    d.forward_upstream()                 # a pass still running is not started twice
+    d._forwarder.join(15)
+    assert not d._forwarder.is_alive() and time.monotonic() - t0 < 10, "the hung ssh was not cut off"
+    st = json.loads(upstream.forward_path().read_text())["targets"]["example-host"]
+    assert "no answer within 1 s" in st["last_error"] and not st.get("cursor")
+    assert _ssh_calls(fake) == ["example-host"]
 
 
 def test_coordinators_pass_upstream_notes_on_only_while_no_project_reads_them(env):

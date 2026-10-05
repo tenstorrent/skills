@@ -214,6 +214,8 @@ class Daemon:
         self._last_cfg = 0.0
         self._trouble_checked = 0.0
         self._upstream_checked = 0.0
+        self._forwarded = 0.0
+        self._forwarder: threading.Thread | None = None
         self._last_slack = 0.0
         self._thread_scan = 0.0
         self._slack_rejects: dict[int, int] = {}   # outbound message id -> times Slack refused it
@@ -462,8 +464,8 @@ class Daemon:
         settling = self.settling()
         core = self.cfg.get("core_provider") or "claude"
         core_held = self.net_held(core) and not self._net_may_probe(core)
-        for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.read_upstream, self.retry_rejected,
-                     self.retire_ended, self.maybe_coordinate, self.probe_waiting, self.start_pushes, self.dispatch, self.deliver_outbound):
+        for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.read_upstream,
+                     self.forward_upstream, self.retry_rejected, self.retire_ended, self.maybe_coordinate, self.probe_waiting, self.start_pushes, self.dispatch, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
                 continue   # no routing to start model work with (see _load_config)
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
@@ -2584,6 +2586,26 @@ class Daemon:
             return
         if n:
             log(self.p, f"{n} new upstream note(s) for the coordinator")
+
+    def forward_upstream(self) -> None:
+        """Send this machine's new upstream notes on to the machines that cannot reach it (upstream.forward),
+        in a thread: a slow or hung ssh never holds up the tick. One pass at a time per daemon; the
+        daemons of this user's other projects skip a pass while one runs."""
+        now = time.time()
+        if now - self._forwarded < upstream.FORWARD_EVERY_S or (self._forwarder and self._forwarder.is_alive()):
+            return
+        self._forwarded = now
+
+        def work():
+            try:
+                n = upstream.forward(now)
+            except (OSError, ValueError) as e:
+                log(self.p, f"sending upstream notes on failed: {type(e).__name__}: {e}")
+                return
+            if n:
+                log(self.p, f"{n} upstream note(s) sent on to other machines")
+        self._forwarder = threading.Thread(target=work, daemon=True, name="upstream-forward")
+        self._forwarder.start()
 
     def check_resource_trouble(self, every_s: float = 60) -> None:
         """A resource whose tasks keep failing (machines.trouble) starts a coordinator turn once per

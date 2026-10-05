@@ -891,9 +891,10 @@ def cmd_note(a) -> None:
 
 
 def _note_to(a) -> None:
-    """`ttp note --to <project>`: a worker's note for another project on this machine, filed in the
-    user's upstream inbox with this run's project and task (upstream.send). Nothing of the other
-    project's is written; its daemon reads the note as untrusted data from this worker."""
+    """`ttp note --to <project>`: a worker's note for another project, filed in the user's upstream
+    inbox with this run's project and task (upstream.send); one on another machine is sent on there by
+    the daemon (upstream.forward). Nothing of the other project's is written; its daemon reads the
+    note as untrusted data from this worker."""
     from . import upstream
     base = os.environ.get("TTP_PROJECT")
     me = Project(base) if base else None
@@ -901,10 +902,12 @@ def _note_to(a) -> None:
         die("ttp note --to: this run has no project (TTP_PROJECT)")
     if a.to == me.name:
         die("ttp note --to names this run's own project; report to it with `ttp note` and the hand-off")
-    if remote_entry(a.to):
-        die(f"project {a.to} runs on another machine; `ttp note --to` reaches projects on this one only. "
+    far = remote_entry(a.to)
+    targets = upstream.forward_to()
+    if far and targets is not None and (far.get("ssh") or far["host"]) not in targets:
+        die(f"project {a.to} runs on another machine, and upstream.forward_to does not send notes there. "
             f"Put the note in the hand-off as a follow-up titled `upstream: ...` instead")
-    if not local_project(a.to):
+    if not far and not local_project(a.to):
         die(f"unknown project {a.to}; `ttp list` shows the projects on this machine")
     if not a.text.strip():
         die("empty note")
@@ -912,8 +915,33 @@ def _note_to(a) -> None:
     got = upstream.send(me.name, int(task) if task.isdigit() else None, a.to, a.text, a.severity)
     if got == "limited":
         die(f"not sent: this project already sent {upstream.NOTES_PER_HOUR} notes to other projects in the last hour")
-    print(f"note for {a.to} " + ("already in its inbox" if got == "duplicate" else "filed in its inbox"))
+    print(f"note for {a.to} " + ("already in its inbox" if got == "duplicate" else "filed in its inbox")
+          + (f"; this machine's daemon sends it on to {far.get('ssh') or far['host']}" if far else ""))
 
+
+def cmd_upstream(a) -> None:
+    """The user's upstream inbox across machines: `--receive` files notes another machine sends over
+    ssh (JSON lines on stdin; prints one JSON ack line), `--forward-status` shows each target this
+    machine sends its notes on to, and `--forward-to` sets those targets (`default`: the machines of
+    the remote projects; `none`: send nothing)."""
+    from . import upstream
+    if a.receive:
+        ack, rc = upstream.receive(sys.stdin.buffer.read(upstream.RECEIVE_BYTES + 1), a.via or "")
+        print(json.dumps(ack, sort_keys=True))
+        raise SystemExit(rc)
+    if a.forward_to is not None:
+        v = a.forward_to.strip()
+        try:
+            upstream.set_forward_to(None if v == "default" else [] if v == "none"
+                                    else [x for x in v.replace(",", " ").split() if x])
+        except ValueError as e:
+            die(str(e))
+        got = upstream.forward_to()
+        print("upstream notes go to " + ("the machines of the remote projects" if got is None
+                                         else ", ".join(got) if got else "no other machine"))
+        return
+    for line in upstream.forward_status():
+        print(line)
 
 def cmd_push(a) -> None:
     """Publish this worktree's commits onto the project's target branch, guarded: refuse a dirty
@@ -2183,10 +2211,18 @@ def main(argv: list[str] | None = None) -> None:
     s = sub.add_parser("note", help="(inside a run) append a progress note, or send one to another project")
     s.add_argument("text")
     s.add_argument("--to", metavar="PROJECT",
-                   help="also file the note in the inbox of another project on this machine, as this worker's")
+                   help="also file the note in the inbox of another project, as this worker's")
     s.add_argument("--severity", choices=["low", "normal", "high"], default="normal",
                    help="with --to: the severity of the event the other project's coordinator gets")
     s.set_defaults(fn=cmd_note)
+
+    s = sub.add_parser("upstream", help="upstream notes across machines: receive, forwarding status and targets")
+    s.add_argument("--receive", action="store_true", help="file notes sent over ssh (JSON lines on stdin); prints an ack")
+    s.add_argument("--via", metavar="ALIAS", help="with --receive: the sending machine's alias")
+    s.add_argument("--forward-status", action="store_true", help="per target: cursor, last ok, last error (the default)")
+    s.add_argument("--forward-to", metavar="ALIASES",
+                   help="machines to send this machine's notes on to (comma-separated), 'default' or 'none'")
+    s.set_defaults(fn=cmd_upstream)
 
     s = sub.add_parser("push", help="guarded push of this worktree to delivery.push_branch")
     s.add_argument("--free", action="store_true",
