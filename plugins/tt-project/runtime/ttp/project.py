@@ -359,6 +359,26 @@ def deep_merge(base: dict, over: dict) -> dict:
     return out
 
 
+_PROC = Path("/proc/self/stat").exists()
+
+
+def zombie(pid: int) -> bool:
+    """True if pid has ended but is not reaped yet: kill(pid, 0) still finds it, yet nothing runs.
+    It is read, never reaped, so whoever owns the process still gets its exit code. Linux reads
+    /proc; elsewhere (macOS) `ps` reports the state."""
+    if _PROC:
+        try:
+            return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z"
+        except (OSError, IndexError):
+            return False
+    try:
+        out = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True,
+                             timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return out.startswith("Z")
+
+
 def hostname() -> str:
     """This machine's short name, restricted to characters that survive markers, ssh and URLs."""
     raw = os.environ.get("TTP_HOST") or socket.gethostname().split(".")[0]

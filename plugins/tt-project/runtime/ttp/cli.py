@@ -29,7 +29,7 @@ from . import outbox
 from . import schedule as sched
 from .project import (FOLDER, NAME_RE, Project, hostname, load_registry, load_secrets, register, save_secret,
                       durable_append, durable_write, write_json, ACCOUNT_KEYS, DEFAULT_CONFIG, deep_merge,
-                      load_account_settings, set_account_setting)
+                      load_account_settings, set_account_setting, zombie)
 
 RUNTIME = Path(__file__).resolve().parent.parent              # .../runtime (plugin or project copy)
 PLUGIN_ROOT = RUNTIME.parent                                   # plugin root, or a project's harness/
@@ -619,6 +619,8 @@ def _listener_alive(pid: int, chat: str) -> bool:
         os.kill(pid, 0)
     except OSError:
         return False
+    if zombie(pid):
+        return False
     try:
         cmd = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True,
                              text=True, timeout=5).stdout
@@ -1141,12 +1143,7 @@ def _checks_alive(info: dict) -> bool:
     """The detached checks recorded in `info` still run: same pid and start, not a zombie."""
     from .runner import proc_start
     pid, started = info.get("pid"), info.get("started")
-    if not isinstance(pid, int) or not started or proc_start(pid) != started:
-        return False
-    try:
-        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
-    except (OSError, IndexError):
-        return True
+    return isinstance(pid, int) and bool(started) and proc_start(pid) == started and not zombie(pid)
 
 
 def _read_checks_pid(run_dir: Path) -> dict:

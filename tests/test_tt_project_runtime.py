@@ -17566,14 +17566,39 @@ def _detached_checks(run, capsys, *check):
 
 
 def _gone_pid(pid):
+    from ttp.daemon import _alive
+    try:   # the detached checks are this test's child: reap them, or their zombie answers kill(pid, 0)
+        os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        pass
+    return not _alive(pid)
+
+
+@pytest.mark.parametrize("proc", [True, False], ids=["proc", "ps"])
+def test_a_zombie_child_counts_as_gone(monkeypatch, proc):
+    """A killed child stays a zombie until it is reaped and kill(pid, 0) still finds it. On macOS,
+    which has no /proc, the probe of detached checks it had killed kept saying they ran."""
+    from ttp import cli, daemon, locks, project
+    from ttp.runner import proc_start
+    if proc and not project._PROC:
+        pytest.skip("no /proc here")
+    monkeypatch.setattr(project, "_PROC", proc)      # False: the `ps` path macOS takes
+    child = subprocess.Popen(["sleep", "60"])
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return True
-    try:   # a zombie of this test process counts as gone
-        return pathlib.Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z"
-    except (OSError, IndexError):
-        return False
+        assert daemon._alive(child.pid) and not project.zombie(child.pid)
+        info = {"pid": child.pid, "started": proc_start(child.pid)}
+        assert cli._checks_alive(info)
+        os.kill(child.pid, signal.SIGKILL)
+        assert _wait_for(lambda: project.zombie(child.pid), 10), "the killed child is not a zombie"
+        os.kill(child.pid, 0)                         # not reaped: kill(pid, 0) still finds it
+        assert not daemon._alive(child.pid)
+        assert not locks._alive(child.pid)
+        assert not cli._checks_alive(info)
+        assert not cli._listener_alive(child.pid, "chat")
+    finally:
+        child.kill()
+        child.wait()
+    assert child.returncode == -signal.SIGKILL, "the check reaped the child and took its exit code"
 
 
 def test_detached_ttp_checks_write_their_exit_code_when_another_worker_pkills_them(env, tmp_path, monkeypatch, capsys):

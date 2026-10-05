@@ -54,7 +54,7 @@ from . import worktree
 from .db import (OPEN_ASK_MAX_AGE_S, SEVERITY_RANK, TERMINAL_TASK_STATES, continues_id, deferral, dependency_ids,
                  dump_result, load_result, without_deferral)
 from .project import (Project, deep_merge, layered, disk_resume_gb, durable_write, git_fsync_env, hostname,
-                      nice_level)
+                      nice_level, zombie)
 from .providers import get_provider
 from .providers.base import last_json_object, scratch_dir, service_path
 from .providers.claude import as_windows
@@ -3927,13 +3927,14 @@ def sd_notify(msg: str, addr: str | None) -> bool:
 
 
 def _alive(pid: int) -> bool:
+    """pid runs: kill(pid, 0) finds it and it is not a zombie (ended, not reaped yet)."""
     try:
         os.kill(pid, 0)
-        return True
     except ProcessLookupError:
         return False
     except PermissionError:
         return True
+    return not zombie(pid)
 
 
 def main() -> int:

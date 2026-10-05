@@ -28,7 +28,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from .project import durable_write
+from .project import durable_write, zombie
 
 RESERVE_STALE_S = 120
 
@@ -219,7 +219,7 @@ def _alive(pid: int) -> bool:
         return False
     except PermissionError:
         return True
-    return True
+    return not zombie(pid)
 
 
 def queue_dir(locks_dir: Path, resource: str) -> Path:
