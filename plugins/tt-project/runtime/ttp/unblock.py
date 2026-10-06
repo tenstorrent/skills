@@ -9,6 +9,11 @@ of it starts (a blocked or review task only; a waiting task's wakes keep waiting
 failed, requeued or pushed, or its status left the stuck state (cancelled, re-pointed). Consecutive
 stuck hand-offs are one episode. An episode still open counts with its age so far.
 
+Waits are self or external (classify_wait). A self-wait is the task's own progress: its detached
+`ttp checks` or `ttp detach` jobs, the push queue, or a time window it planned itself. It neither
+starts a stuck episode nor counts toward the coordinator's 'repeated waits' trigger or a resource's
+waits, and it ends a waiting episode (the task moved on). The daily review lists self-waits apart.
+
 Handed-back asks: a user message answers an ask when it names it (`#<id>`) after it was sent, or
 replies in its chat thread. The answer's part about that ask is matched against HANDBACK, a short
 phrase list of answers that give the decision back to the project.
@@ -27,6 +32,19 @@ STUCK = {"task_blocked": "blocked", "task_waiting": "waiting", "task_review": "r
 MOVED = frozenset({"task_done", "task_failed", "task_queued", "task_requeued", "push_queued"})
 ENDED = frozenset({"done", "failed", "cancelled", "pushing"})   # a status that ends any episode
 ANSWER_MAX_AGE_S = 14 * 86400   # a mention of an ask id later than this is not its answer
+
+# What a waiting hand-off's `retry_when` probes, when it is the task's own work: by the `ttp` subcommand.
+SELF_PROBES = (("checks", re.compile(r"\bchecks\s+--result\b")),
+               ("detached jobs", re.compile(r"\bdetach\s+--check\b")),
+               ("push queue", re.compile(r"\bpush\s+--(result|free)\b")))
+EXTERNAL_PROBE = re.compile(r"\block\s+--probe\b")   # a shared resource: someone else holds it
+# A time window the task planned itself (a measurement or soak period), in its `waiting_for`.
+PLANNED_WINDOW = re.compile(
+    r"\b(planned|scheduled|own|measurement|measuring|observation|observing|monitoring|soak|burn-in|bake|"
+    r"settling|cool-?down|data[- ]collection)\s+(time\s+)?(window|period|interval|run)\b"
+    r"|\b(window|period|delay)\s+(it|I|the task|this task|we)\s+(set|planned|chose)\b"
+    r"|\bstart_(after|when)\b", re.I)
+WAIT_KINDS = ("self", "external")
 
 # Answers that hand the decision back: the ask should not have been sent.
 HANDBACK = tuple(re.compile(p, re.I) for p in (
@@ -63,6 +81,37 @@ def handback(text: str) -> str | None:
     return None
 
 
+def classify_wait(result: dict | None) -> tuple[str, str]:
+    """(kind, why) of a waiting hand-off: kind 'self' when the task waits on its own progress (its
+    detached checks or jobs, the push queue, a time window or start_after/start_when it set), else
+    'external' (a busy resource or lock, another task, a human, a review). The hand-off's own
+    `wait_kind` wins; an unknown wait counts as external, so a real one still raises effort."""
+    r = result if isinstance(result, dict) else {}
+    own = str(r.get("wait_kind") or "").strip().lower()
+    if own in WAIT_KINDS:
+        return own, "hand-off"
+    probe = str(r.get("retry_when") or "")
+    if EXTERNAL_PROBE.search(probe):
+        return "external", "lock"
+    for why, rx in SELF_PROBES:
+        if rx.search(probe):
+            return "self", why
+    if PLANNED_WINDOW.search(str(r.get("waiting_for") or "")):
+        return "self", "planned window"
+    return "external", "other"
+
+
+def wait_data(raw: Any) -> dict:
+    """A task_waiting event's `data`: {"wait": self|external, "why": ...}; {} for older events."""
+    d = _note(raw)
+    return d if d.get("wait") in WAIT_KINDS else {}
+
+
+def is_self_wait(raw: Any) -> bool:
+    """Whether a task_waiting event's `data` marks it a self-wait (older events count as external)."""
+    return wait_data(raw).get("wait") == "self"
+
+
 def answer_part(text: str, ask_id: int, ask_ids: set[int]) -> str | None:
     """The part of a message about ask `ask_id`: from its `#id` to the next ask id it names, or
     None when it does not name it. A `#id` right after "task" or "PR" names something else."""
@@ -93,8 +142,10 @@ def episodes(db: DB, since: float, now: float | None = None) -> list[dict]:
         task = db.task(tid)
         if not task:
             continue
-        marks = [(e["ts"], e["kind"]) for e in db.q(
-            f"SELECT ts, kind FROM events WHERE task=? AND kind IN ({','.join('?' * len(kinds))})", (tid, *kinds))]
+        # A self-wait is the task moving on: it ends a waiting episode and starts none.
+        marks = [(e["ts"], "self_wait" if e["kind"] == "task_waiting" and is_self_wait(e["data"]) else e["kind"])
+                 for e in db.q(f"SELECT ts, kind, data FROM events WHERE task=? AND kind IN "
+                               f"({','.join('?' * len(kinds))})", (tid, *kinds))]
         marks += [(r["started"], "run") for r in db.q(
             "SELECT started FROM runs WHERE task=? AND role!='coordinator' AND started IS NOT NULL", (tid,))]
         marks.sort()
@@ -104,7 +155,8 @@ def episodes(db: DB, since: float, now: float | None = None) -> list[dict]:
                 if ep is None:
                     ep = {"task": tid, "title": task["title"], "kind": STUCK[kind], "start": ts, "mode": STUCK[kind]}
                 ep["mode"] = STUCK[kind]
-            elif ep and (kind in MOVED or (kind == "run" and ep["mode"] != "waiting")):
+            elif ep and (kind in MOVED or (kind == "self_wait" and ep["mode"] == "waiting")
+                         or (kind == "run" and ep["mode"] != "waiting")):
                 ep["end"] = ts
                 out.append(ep)
                 ep = None
@@ -119,6 +171,24 @@ def episodes(db: DB, since: float, now: float | None = None) -> list[dict]:
         ep["s"] = max(0.0, (ep["end"] if not ep["open"] else now) - ep["start"])
         ep.pop("mode", None)
     return [ep for ep in out if ep["start"] >= since]
+
+
+def self_waits(db: DB, since: float) -> list[dict]:
+    """Self-waits handed off since `since`: {task, why}."""
+    return [{"task": e["task"], "why": wait_data(e["data"]).get("why") or "other"}
+            for e in db.q("SELECT task, data FROM events WHERE kind='task_waiting' AND ts>=? AND task IS NOT NULL",
+                          (since,)) if is_self_wait(e["data"])]
+
+
+def self_waits_line(rows: list[dict]) -> str:
+    """How many self-waits, by how many tasks, and on what."""
+    if not rows:
+        return "none"
+    per: dict[str, int] = {}
+    for r in rows:
+        per[r["why"]] = per.get(r["why"], 0) + 1
+    return (f"{len(rows)} by {len({r['task'] for r in rows})} tasks (not counted as stuck): "
+            + ", ".join(f"{k} {n}" for k, n in sorted(per.items(), key=lambda kv: (-kv[1], kv[0]))))
 
 
 def _dur(s: float) -> str:
@@ -255,6 +325,7 @@ def lines(db: DB, now: float | None = None) -> list[str]:
         eps = episodes(db, now - span, now)
         for kind in STUCK.values():
             out.append(f"stuck {kind}, {label}: {stuck_line([e for e in eps if e['kind'] == kind])}")
+        out.append(f"self-waits, {label}: {self_waits_line(self_waits(db, now - span))}")
     for label, span in WINDOWS:
         out.append(f"asks, {label}: {asks_line(asks(db, now - span, now))}")
     out.append(f"coordinator, 24 h: {turns_line(db, now - 86400)}")

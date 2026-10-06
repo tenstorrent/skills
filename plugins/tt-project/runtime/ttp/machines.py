@@ -298,9 +298,13 @@ def stats(db, now: float | None = None) -> dict[str, dict]:
         bump(_labels(r), "runs")
     # Only what the task's own runs reported: a block the daemon set on a dead dependency says
     # nothing about the resource.
-    for e in db.q("SELECT e.kind, t.labels FROM events e JOIN tasks t ON t.id=e.task "
+    # A self-wait (its own checks, jobs, push or planned window) says nothing about the resource either.
+    from .unblock import is_self_wait
+    for e in db.q("SELECT e.kind, e.data, t.labels FROM events e JOIN tasks t ON t.id=e.task "
                   "WHERE e.ts>? AND e.source LIKE 'task:%' "
                   "AND e.kind IN ('task_failed','task_blocked','task_waiting')", (since,)):
+        if e["kind"] == "task_waiting" and is_self_wait(e["data"]):
+            continue
         bump(_labels(e), "waits" if e["kind"] == "task_waiting" else "handoffs")
     # Reboots count only against machines on the list (a lock such as push:<branch> is not a
     # machine), and only when most of the host's reboots happened while it was held: a host that

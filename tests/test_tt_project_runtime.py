@@ -1188,6 +1188,101 @@ def test_unblock_counts_each_logged_trigger_and_the_escalated_bucket(env):
         "escalated 1, user_message 1; escalations: 2 (refused 1)")
     assert unblock.triggers_line(db, now + 10) == "no coordinator turns"
 
+@pytest.mark.parametrize("result,want", [
+    ({"retry_when": "/x/bin/ttp checks --result /runs/7"}, ("self", "checks")),
+    ({"retry_when": "ttp detach --check /runs/7/build.rc"}, ("self", "detached jobs")),
+    ({"retry_when": "ttp push --result /runs/7/push.json"}, ("self", "push queue")),
+    ({"retry_when": "ttp push --free"}, ("self", "push queue")),
+    ({"waiting_for": "the planned 48 h measurement window", "retry_after_s": 172800}, ("self", "planned window")),
+    ({"waiting_for": "the soak period I set"}, ("self", "planned window")),
+    ({"waiting_for": "board-a", "retry_when": "ttp lock --probe board-a"}, ("external", "lock")),
+    ({"waiting_for": "a free board"}, ("external", "other")),
+    ({"waiting_for": "the user's review"}, ("external", "other")),
+    ({"waiting_for": "task #12", "retry_when": "test -e /tmp/x"}, ("external", "other")),
+    ({"waiting_for": "my measurement window", "retry_when": "ttp lock --probe m"}, ("external", "lock")),
+    ({"retry_when": "ttp checks --result /r", "wait_kind": "external"}, ("external", "hand-off")),
+    ({"waiting_for": "a lull at night", "wait_kind": "Self"}, ("self", "hand-off")),
+    ({}, ("external", "other")), (None, ("external", "other")),
+])
+def test_a_wait_is_self_or_external(env, result, want):
+    from ttp import unblock
+    assert unblock.classify_wait(result) == want
+
+
+def test_self_waits_are_not_stuck_and_the_daily_review_lists_them_apart(env):
+    p = make(env)
+    from ttp import machines, unblock
+    db, now = p.db, time.time()
+
+    def wait(tid, ago, result):
+        kind, why = unblock.classify_wait(result)
+        db.x("INSERT INTO events(ts,source,kind,text,data,status,task) VALUES(?,?,?,?,?,?,?)",
+             (now - ago, f"task:{tid}", "task_waiting", "x", json.dumps({"wait": kind, "why": why}), "handled", tid))
+
+    checks = {"retry_when": "ttp checks --result /r"}
+    window = db.add_task("measures for 48 h", "s", origin="user")
+    wait(window, 7200, {"waiting_for": "its planned 48 h measurement window"})
+    tester = db.add_task("waits on its own checks", "s", origin="user", labels=["resource:board-a"])
+    for ago in (5000, 4000, 3000, 2000):
+        wait(tester, ago, checks)
+    locked = db.add_task("waits on a lock, then on its checks", "s", origin="user", labels=["resource:board-a"])
+    wait(locked, 6000, {"retry_when": "ttp lock --probe board-a"})
+    wait(locked, 2400, checks)            # got the board: the external wait ended here
+    db.x("INSERT INTO events(ts,source,kind,text,status,task) VALUES(?,?,?,?,?,?)",
+         (now - 600, "t", "task_waiting", "x", "handled", db.add_task("an older event without data")))
+    eps = {x["task"]: x for x in unblock.episodes(db, now - 86400, now)}
+    assert window not in eps and tester not in eps
+    assert eps[locked]["s"] == pytest.approx(3600, abs=1) and not eps[locked]["open"]
+    assert len(eps) == 2   # the event without data counts as external
+    lines = unblock.lines(db, now)
+    assert f"stuck waiting, 24 h: 2 (1 still open), median 10 min, p90 1.0 h, longest #{locked} " in "\n".join(lines)
+    assert "self-waits, 24 h: 6 by 3 tasks (not counted as stuck): checks 5, planned window 1" in lines
+    assert machines.stats(db, now)["board-a"]["waits"] == 1
+
+
+def test_many_self_waits_keep_the_turn_routine_and_repeated_external_waits_raise_it(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import unblock
+    db, cfg = p.db, p.config()
+    db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    db.x("DELETE FROM messages WHERE direction='out'")
+    db.set_kv("last_coordinator_turn", time.time() - 60)
+
+    def wait(tid, result):
+        kind, why = unblock.classify_wait(result)
+        db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
+             (time.time(), f"task:{tid}", "task_waiting", "low", "waits",
+              json.dumps({"wait": kind, "why": why}), "handled", tid))
+
+    busy = db.add_task("checks, pushes and a planned window", "s", origin="user")
+    for r in [{"retry_when": "ttp checks --result /r"}] * 5 + [{"retry_when": "ttp detach --check /r/a.rc"}] * 3 + \
+             [{"retry_when": "ttp push --result /r/m"}, {"retry_when": "ttp push --free"},
+              {"waiting_for": "a 48 h measurement window it set"}]:
+        wait(busy, r)
+    assert coord.effort_triggers(db, cfg, [], None)[0] == []
+    stuck = db.add_task("waits on a board", "s", origin="user")
+    for _ in range(2):
+        wait(stuck, {"waiting_for": "board-a", "retry_when": "ttp lock --probe board-a"})
+    assert coord.effort_triggers(db, cfg, [], None)[0] == []
+    wait(stuck, {"waiting_for": "another task's review"})
+    assert coord.effort_triggers(db, cfg, [], None)[0] == ["repeated waits"]
+
+
+def test_the_daemon_records_whether_a_wait_is_self_or_external(env, monkeypatch, tmp_path):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    for result, want in (({"waiting_for": "a free board", "retry_after_s": 600}, {"wait": "external", "why": "other"}),
+                         ({"retry_when": "ttp checks --result /r", "retry_after_s": 600},
+                          {"wait": "self", "why": "checks"})):
+        monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps({"status": "waiting", "summary": "later", **result}))
+        tid = p.db.add_task(f"waits {want['why']}", "s", kind="work", tier="light", origin="user")
+        assert _run_until(d, p, lambda: p.db.one("SELECT id FROM events WHERE kind='task_waiting' AND task=?", (tid,)))
+        ev = p.db.one("SELECT data FROM events WHERE kind='task_waiting' AND task=?", (tid,))
+        assert json.loads(ev["data"]) == want
+
+
 def test_the_daily_review_gets_the_unblocking_quality_lines(env):
     p = make(env)
     from ttp import daemon as dm

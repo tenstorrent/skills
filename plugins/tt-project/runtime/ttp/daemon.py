@@ -1661,9 +1661,12 @@ class Daemon:
             self._queue_backup(task)
         self._note_dirty_main(task)
         if waiting and new == "queued":
-            db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+            # Self or external (unblock.classify_wait): only external waits count as stuck work.
+            kind, why = ("self", "escalated wake") if extra.get("escalated_wake") else unblock.classify_wait(result)
+            db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
                  (time.time(), f"task:{task['id']}", "task_waiting", "low",
-                  f"#{task['id']} {task['title']}: {reason}", "handled", task["id"]))
+                  f"#{task['id']} {task['title']}: {reason}", json.dumps({"wait": kind, "why": why}),
+                  "handled", task["id"]))
             return
         if task["reply_chat"] and new in ("done", "failed", "blocked"):
             text = summary if new == "done" else f"(task #{task['id']} {new}) {summary}"

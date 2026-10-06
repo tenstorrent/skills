@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from . import locks
-from . import ends, jevuse, machines, prguard, push, shared, upstream
+from . import ends, jevuse, machines, prguard, push, shared, unblock, upstream
 from . import screen as scr
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
@@ -1194,8 +1194,9 @@ def effort_triggers(db, cfg: dict, event_ids: list[int], wake_due: str | None,
                        f"({','.join('?' * len(machines.BAD_RUNS))}) AND COALESCE(note,'') NOT LIKE '%lost_to_reboot%'",
                        (t["task"], since, *machines.BAD_RUNS))["n"] + \
             db.one("SELECT COUNT(*) n FROM events WHERE task=? AND kind='task_failed' AND ts>?", (t["task"], since))["n"]
-        waits = db.one("SELECT COUNT(*) n FROM events WHERE task=? AND kind='task_waiting' AND ts>?",
-                       (t["task"], since))["n"]
+        # Only external waits: a task waiting on its own checks, jobs, push or planned window is progress.
+        waits = sum(not unblock.is_self_wait(e["data"]) for e in db.q(
+            "SELECT data FROM events WHERE task=? AND kind='task_waiting' AND ts>?", (t["task"], since)))
         if fails_at and fails >= fails_at:
             add("repeated failures")
         if waits_at and waits >= waits_at:
