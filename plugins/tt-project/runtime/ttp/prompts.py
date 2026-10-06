@@ -254,8 +254,9 @@ def worker_resume(p: Project, task: dict, lost: dict) -> str:
     session already holds the task and its own work."""
     at = lost.get("ended")
     when = time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(at)) if isinstance(at, (int, float)) else "recently"
-    why = {"reboot": "the host rebooted", "sleep": "the host slept"}.get(lost.get("cause"), "its supervisor was lost")
-    free = lost.get("cause") in ("reboot", "sleep")
+    why = {"reboot": "the host rebooted", "sleep": "the host slept",
+           "network": "the network went away"}.get(lost.get("cause"), "its supervisor was lost")
+    free = lost.get("cause") in ("reboot", "sleep", "network")
     text = (f"# Continue task #{task['id']}: {task['title']}\n"
             f"Your run was cut off at about {when}: {why}. This continues your session"
             + (" and does not count as an attempt" if free else "")

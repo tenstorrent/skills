@@ -24416,6 +24416,37 @@ def test_resume_lost_to_network_keeps_session(env, tmp_path, net, monkeypatch):
         "resume_args": lambda self, s: ["--resume", s], "session_saved": lambda self, s, c, e=None: True})())
     lost = d._resumable(p.db.task(tid), "claude")
     assert lost and lost["session"] == "S" and lost["run"] == rid
+    assert lost["cause"] == "network", "a network loss resumed as a lost supervisor"
+
+
+def test_a_network_loss_after_a_sleep_keeps_the_sleep_and_logs_it(env, net):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    run, task = _finished_run(d, _api_error(ENOTFOUND), slept_s=4 * 3600)
+    note = json.loads(run["note"])
+    assert run["status"] == "lost" and note["lost_to_network"] and note["not_waste"] == "network"
+    assert note["slept_s"] == 4 * 3600, "a run that mostly slept reads as hours stuck"
+    assert int(task["attempts"] or 0) == 0
+    log = (p.logs / "daemon.log").read_text()
+    assert f"run {run['id']} end status=lost" in log and "(host asleep 240 of its 250 min)" in log
+    # Without a sleep: no sleep recorded, nothing added to the end line.
+    run, _ = _finished_run(d, _api_error(ENOTFOUND))
+    assert "slept_s" not in json.loads(run["note"])
+    line = [x for x in (p.logs / "daemon.log").read_text().splitlines() if f"run {run['id']} end " in x]
+    assert line and "host asleep" not in line[-1]
+
+
+def test_a_resume_after_a_network_loss_says_so_and_is_free(env, tmp_path):
+    p = make(env)
+    from ttp.prompts import worker_resume
+    tid = p.db.add_task("build", "build the thing", kind="work", tier="light", origin="user")
+    task = p.db.task(tid)
+    text = worker_resume(p, task, {"cause": "network", "ended": time.time(), "dir": str(tmp_path)})
+    assert "the network went away" in text and "does not count as an attempt" in text
+    assert "supervisor was lost" not in text
+    text = worker_resume(p, task, {"cause": "lost", "ended": time.time(), "dir": str(tmp_path)})
+    assert "its supervisor was lost" in text and "does not count as an attempt" not in text
 
 
 def _resume_cut(d, tmp_path, slept):

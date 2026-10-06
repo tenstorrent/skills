@@ -1241,6 +1241,8 @@ class Daemon:
         elif net_lost:
             # The API host did not resolve: the network went away under the run, not the task.
             note.update(not_waste="network", lost_to_network=True)
+            if slept:
+                note["slept_s"] = exit_info.get("slept_s")   # most of its time asleep, not stuck
             status = "lost"
         elif slept_auth or (status in SLEEP_CUT and slept):
             # A run that overlapped a host sleep did not time out or fail on its own: the host went
@@ -1300,8 +1302,14 @@ class Daemon:
                                     rebooted=bool(note.get("lost_to_reboot")),
                                     slept=bool(note.get("lost_to_sleep") or note.get("lost_to_network")))
         self._check_price_table(r, usage)
+        asleep = float(exit_info.get("slept_s") or 0)
+        if asleep >= SLEPT_LONG_S:
+            took = max(ended - float(exit_info.get("started") or r["started"] or ended), asleep)
+            asleep_note = f" (host asleep {asleep / 60:.0f} of its {took / 60:.0f} min)"
+        else:
+            asleep_note = ""
         log(p, f"run {r['id']} end status={status} cost=${usage.cost_usd:.3f}"
-               f"{' (estimated)' if usage.estimated else ''} role={r['role']}")
+               f"{' (estimated)' if usage.estimated else ''} role={r['role']}{asleep_note}")
 
     def _check_price_table(self, r: dict, usage) -> None:
         """Price a finished Claude run's session log with the table that estimates other local
@@ -2382,7 +2390,8 @@ class Daemon:
         if not cwd or not Path(cwd).is_dir() or not prov.resume_args(session) or \
                 not prov.session_saved(session, cwd, run_env):
             return None
-        cause = "reboot" if note.get("lost_to_reboot") else "sleep" if note.get("lost_to_sleep") else "lost"
+        cause = "reboot" if note.get("lost_to_reboot") else "sleep" if note.get("lost_to_sleep") \
+            else "network" if note.get("lost_to_network") else "lost"
         return {"run": r["id"], "session": session, "cwd": cwd, "dir": str(run_dir), "ended": r["ended"],
                 "cause": cause, "spec_sha": note.get("spec_sha")}
 
