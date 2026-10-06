@@ -294,6 +294,13 @@ def test_worker_prompt_limits_search_scope():
         assert cmd in text, cmd
 
 
+def test_worker_prompt_ci_wait_wakes_on_a_hung_job():
+    text = " ".join((PLUGIN / "template" / "prompts" / "worker.md").read_text(encoding="utf-8").split())
+    for part in ("`ttp ci --repo <owner/repo> --branch <branch>`", "exits 0 when a job hangs", "`hung:` line",
+                 "`--no-hang`"):
+        assert part in text, part
+
+
 def test_web_js_parses_on_old_node():
     """The web app must stay ES2019 so older system node and browsers can run it."""
     import shutil

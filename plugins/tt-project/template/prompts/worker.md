@@ -115,6 +115,9 @@ Before you finish, write `$TTP_RUN_DIR/result.json`:
   once the wait is over whatever the outcome (the job finished or failed), and 1 while it is not:
   while it exits 1 (or 75, a busy `ttp lock`, or 255, ssh not reaching the host) the task stays asleep past `retry_after_s`;
   any other exit wakes it as broken.
+  Waiting on GitHub CI: use `ttp ci --repo <owner/repo> --branch <branch>` (or `--run <id>`) as
+  `retry_when`. It also exits 0 when a job hangs (in progress past 3x its recent median). On waking,
+  run it again and report any `hung:` line in your hand-off; to keep waiting after that, add `--no-hang`.
   For a wait with several steps (build, then device run), chain them in one detached driver script
   that writes a final marker, and point `retry_when` at that marker.
   The driver runs with `set -eo pipefail`, never pipes a step into tail/head, logs each step's

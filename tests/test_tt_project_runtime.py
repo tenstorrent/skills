@@ -23557,3 +23557,88 @@ def test_resume_losses_still_capped(env, tmp_path, net):
         d.finish_run(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)),
                      {"rc": 1, "started": now - 60, "ended": now, "stopped": None, "slept_s": 0.0})
     assert int(p.db.task(tid)["attempts"] or 0) >= 1, "past the cap a network loss counts an attempt"
+
+
+def _ci_iso(t):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+
+
+def _ci_gh(now, job_started, past_mins=(10, 12, 14), live=True):
+    """A fake gh for `ttp ci`: one run of commit abc on branch b (in progress with one job started
+    `job_started` seconds ago, or completed) and past successful runs whose 'test' job took `past_mins`."""
+    run = {"databaseId": 9, "status": "in_progress" if live else "completed", "conclusion": "" if live else "failure",
+           "headSha": "abc123", "workflowName": "CI", "url": "u/9", "createdAt": _ci_iso(now - job_started)}
+    past = [{"databaseId": 100 + i, "status": "completed", "conclusion": "success", "headSha": f"old{i}",
+             "workflowName": "CI", "url": f"u/{100 + i}", "createdAt": _ci_iso(now - 86400 * (i + 1))}
+            for i in range(len(past_mins))]
+    calls = []
+
+    def gh(args):
+        calls.append(args)
+        if args[:2] == ["run", "list"]:
+            return [dict(r) for r in past] if "--status" in args else [dict(run), *[dict(r) for r in past]]
+        rid = int(args[2])
+        if rid == 9:
+            return {"jobs": [{"name": "test", "status": "in_progress", "startedAt": _ci_iso(now - job_started),
+                              "completedAt": None, "url": "u/9/job"}]}
+        m = past_mins[rid - 100]
+        return {"jobs": [{"name": "test", "status": "completed", "conclusion": "success",
+                          "startedAt": _ci_iso(now - 3600), "completedAt": _ci_iso(now - 3600 + m * 60)}]}
+    return gh, calls
+
+
+def test_ci_probe_wakes_on_a_job_past_three_times_the_branch_median(env, monkeypatch, capsys):
+    """tt-buddy note #127: a task waiting on CI woke only once the run completed, so a hung job kept
+    it asleep until GitHub's 6 h job limit. Past 3x the job's median (12 min here) it exits 0 and says why."""
+    from ttp import ciwait, cli
+    now = time.time()
+    gh, calls = _ci_gh(now, job_started=30 * 60)
+    monkeypatch.setattr(ciwait, "_gh", gh)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["ci", "--repo", "o/r", "--branch", "b"])
+    out = capsys.readouterr().out
+    assert e.value.code == 1 and out.startswith("running: CI job 'test' 30 min of limit 36 min"), out
+    assert any(c[:2] == ["run", "list"] and "--branch" in c and "--status" in c for c in calls), calls
+    gh, _ = _ci_gh(now, job_started=40 * 60)
+    monkeypatch.setattr(ciwait, "_gh", gh)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["ci", "--repo", "o/r", "--branch", "b"])
+    out = capsys.readouterr().out
+    assert e.value.code == 0 and out.startswith("hung: CI job 'test' in progress 40 min, limit 36 min "
+                                                "(3x this job's median 12 min) u/9/job"), out
+    with pytest.raises(SystemExit) as e:                    # a task that saw the hang can wait on completion only
+        cli.main(["ci", "--repo", "o/r", "--branch", "b", "--no-hang"])
+    assert e.value.code == 1, capsys.readouterr().out
+
+
+def test_ci_probe_floor_default_and_completion(env, monkeypatch, capsys):
+    from ttp import ciwait
+    now = time.time()
+    gh, _ = _ci_gh(now, job_started=8 * 60, past_mins=(1, 1, 1))     # 3x 1 min, but never under the floor
+    monkeypatch.setattr(ciwait, "_gh", gh)
+    rc, lines = ciwait.probe(repo="o/r", branch="b")
+    assert rc == 1 and "limit 10 min (3x this job's median 1 min, floor 10 min)" in lines[0], lines
+    gh, _ = _ci_gh(now, job_started=60 * 60, past_mins=())           # no finished run anywhere: the default
+    monkeypatch.setattr(ciwait, "_gh", gh)
+    rc, lines = ciwait.probe(repo="o/r", branch="b")
+    assert rc == 1 and "limit 90 min (no finished run known)" in lines[0], lines
+    rc, lines = ciwait.probe(repo="o/r", branch="b", default_min=45)
+    assert rc == 0 and lines[0].startswith("hung:"), lines
+    gh, calls = _ci_gh(now, job_started=0, live=False)                # completed, whatever the result
+    monkeypatch.setattr(ciwait, "_gh", gh)
+    assert ciwait.probe(repo="o/r", branch="b") == (0, ["done: CI failure u/9"])
+    assert len(calls) == 1, "a finished run needs no job or history lookups"
+    monkeypatch.setattr(ciwait, "_gh", lambda args: None)             # gh cannot answer: not yet
+    assert ciwait.probe(repo="o/r", branch="b")[0] == 75
+    monkeypatch.setattr(ciwait, "_gh", lambda args: [])
+    assert ciwait.probe(repo="o/r", branch="b") == (1, ["waiting: no run yet"])
+
+
+def test_ci_probe_targets_the_newest_commit_per_workflow(env):
+    from ttp import ciwait
+    runs = [{"databaseId": 1, "headSha": "aaa", "workflowName": "CI", "createdAt": "2026-01-01T00:00:00Z"},
+            {"databaseId": 2, "headSha": "bbb", "workflowName": "CI", "createdAt": "2026-01-02T00:00:00Z"},
+            {"databaseId": 3, "headSha": "bbb", "workflowName": "Lint", "createdAt": "2026-01-02T00:00:01Z"},
+            {"databaseId": 4, "headSha": "bbb", "workflowName": "CI", "createdAt": "2026-01-01T12:00:00Z"}]
+    assert sorted(r["databaseId"] for r in ciwait.targets(runs, None)) == [2, 3]
+    assert [r["databaseId"] for r in ciwait.targets(runs, "aa")] == [1]

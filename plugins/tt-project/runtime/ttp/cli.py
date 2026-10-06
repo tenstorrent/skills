@@ -1518,6 +1518,18 @@ def cmd_detach(a) -> None:
 
 
 # operating ----------------------------------------------------------------------------------------
+def cmd_ci(a) -> None:
+    """CI probe for `retry_when`: exit 0 once the commit's GitHub Actions runs completed or one of
+    their jobs hung (in progress past 3x its recent median), 1 while they run, 75 when gh cannot
+    answer. Prints one line per run (`done:`, `hung:`, `running:`); see ciwait."""
+    from . import ciwait
+    rc, lines = ciwait.probe(repo=a.repo, branch=a.branch, sha=a.sha, workflow=a.workflow, run=a.run,
+                             hang=not a.no_hang, factor=a.factor, floor_min=a.floor_min, default_min=a.default_min)
+    for line in lines:
+        print(line)
+    sys.exit(rc)
+
+
 def cmd_list(a) -> None:
     reg = load_registry().get("projects", {})
     if not reg:
@@ -2576,6 +2588,21 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("name", nargs="?")
     s.add_argument("command", nargs=argparse.REMAINDER)
     s.set_defaults(fn=cmd_detach)
+
+    from . import ciwait
+    s = sub.add_parser("ci", help="exit 0 once a commit's CI runs completed or a job hung, 1 while they run, "
+                                  "75 if gh cannot answer (for retry_when)")
+    s.add_argument("--repo", help="owner/repo (default: the repository of the current directory)")
+    s.add_argument("--branch", help="the branch whose newest commit's runs to wait for")
+    s.add_argument("--sha", help="wait for this commit's runs instead of the branch's newest")
+    s.add_argument("--workflow", help="only this workflow")
+    s.add_argument("--run", help="wait for this one run id")
+    s.add_argument("--no-hang", action="store_true", help="wait for completion only, never wake on a hung job")
+    s.add_argument("--factor", type=float, default=ciwait.FACTOR, help="a job is hung past this many times its median")
+    s.add_argument("--floor-min", type=float, default=ciwait.FLOOR_MIN, help="never call a job hung before this many minutes")
+    s.add_argument("--default-min", type=float, default=ciwait.DEFAULT_MIN,
+                   help="the limit in minutes when no finished run of the workflow is known")
+    s.set_defaults(fn=cmd_ci)
 
     for name, fn in (("list", cmd_list),):
         sub.add_parser(name).set_defaults(fn=fn)
