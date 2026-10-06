@@ -1251,9 +1251,10 @@ def test_many_self_waits_keep_the_turn_routine_and_repeated_external_waits_raise
 
     def wait(tid, result):
         kind, why = unblock.classify_wait(result)
+        what = result.get("waiting_for") or "later"
         db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
-             (time.time(), f"task:{tid}", "task_waiting", "low", "waits",
-              json.dumps({"wait": kind, "why": why}), "handled", tid))
+             (time.time(), f"task:{tid}", "task_waiting", "low", f"#{tid} t: waiting for {what}",
+              json.dumps({"wait": kind, "why": why, "for": what}), "handled", tid))
 
     busy = db.add_task("checks, pushes and a planned window", "s", origin="user")
     for r in [{"retry_when": "ttp checks --result /r"}] * 5 + [{"retry_when": "ttp detach --check /r/a.rc"}] * 3 + \
@@ -1267,15 +1268,94 @@ def test_many_self_waits_keep_the_turn_routine_and_repeated_external_waits_raise
     assert coord.effort_triggers(db, cfg, [], None)[0] == []
     wait(stuck, {"waiting_for": "another task's review"})
     assert coord.effort_triggers(db, cfg, [], None)[0] == ["repeated waits"]
+    # Repeated external waits on the same thing raise at the count backstop.
+    db.x("INSERT INTO events(ts,source,kind,text,status,task) VALUES(?,?,?,?,?,?)",
+         (time.time(), f"task:{stuck}", "task_done", "done", "handled", stuck))
+    loop = db.add_task("waits on a board, again and again", "s", origin="user")
+    for n in range(8):
+        wait(loop, {"waiting_for": f"board-a (try {n})", "retry_when": "ttp lock --probe board-a"})
+        assert coord.effort_triggers(db, cfg, [], None)[0] == ([] if n < 7 else ["repeated waits"])
+
+
+def test_repeated_waits_raise_on_a_new_reason_an_old_stint_or_the_count_not_on_wakes_or_noise(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import unblock
+    db, cfg = p.db, p.config()
+    db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    db.x("DELETE FROM messages WHERE direction='out'")
+    now = time.time()
+    db.set_kv("last_coordinator_turn", now - 60)
+
+    def wait(tid, what, ago=0.0, data=True):
+        text = f"#{tid} t: {what}" if what.startswith("woke at") else f"#{tid} t: waiting for {what}; next try 12:34"
+        kind = "self" if what.startswith("woke at") else "external"
+        db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
+             (now - ago, f"task:{tid}", "task_waiting", "low", text,
+              json.dumps({"wait": kind, "why": "other", "for": what}) if data else None, "handled", tid))
+
+    def trig():
+        got, seen = coord.effort_triggers(db, cfg, [], None, now=now)
+        return got, seen
+
+    # Times, shas, run ids and counts are noise: the same wait, so no raise.
+    t = db.add_task("waits on a test run", "s", origin="user")
+    wait(t, "test run r101 at 3f9a1c2 (started 2026-10-05T10:00Z)", 7200)
+    wait(t, "test run r102 at 9b8e7f6 (started 2026-10-05T11:30Z)", 3600)
+    assert unblock.wait_reason(db.one("SELECT text, data FROM events WHERE task=? ORDER BY id DESC", (t,))) == \
+        "test run r0 at (started )"
+    assert trig()[0] == []
+    # (a) Cheap wakes that found work don't count and don't break the stint, with or without data.
+    for data in (True, False):
+        wait(t, "woke at light and found work; runs again now at standard", 1800, data=data)
+    wait(t, "test run r103 at 1a2b3c4d (started 2026-10-05T12:45Z)", 50)
+    got, seen = trig()
+    assert got == [] and seen["waits"][str(t)]["reason"] == "test run r0 at (started )"
+    db.set_kv(coord.EFFORT_SEEN_KEY, seen)
+    # (b) A changed reason raises once: the next turn compares with what the last one saw.
+    wait(t, "a free board", 30)
+    got, seen = trig()
+    assert got == ["repeated waits"] and seen["waits"][str(t)]["reason"] == "a free board"
+    db.set_kv(coord.EFFORT_SEEN_KEY, seen)
+    wait(t, "a free board", 20)
+    assert trig()[0] == []
+    # (b) A stint of external waits that began over 24 h ago raises once; a self-wait ends the stint.
+    old = db.add_task("waits on a human", "s", origin="user")
+    wait(old, "the hardware team", 90000)
+    wait(old, "the hardware team", 30)
+    got, seen = trig()
+    assert got == ["repeated waits"] and seen["waits"][str(old)]["aged"]
+    db.set_kv(coord.EFFORT_SEEN_KEY, seen)
+    wait(old, "the hardware team", 10)
+    assert trig()[0] == []
+    db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
+         (now - 5, f"task:{old}", "task_waiting", "low", "checks", json.dumps({"wait": "self", "why": "checks"}),
+          "handled", old))
+    got, seen = trig()
+    assert got == [] and str(old) not in seen["waits"]
+    # (c) The count backstop (coordinator.repeat_waits_24h, 8 by default; 0 turns it off).
+    db.set_kv(coord.EFFORT_SEEN_KEY, seen)
+    loop = db.add_task("loops on one board", "s", origin="user")
+    for n in range(7):
+        wait(loop, "board-a", 3000 - n)
+    assert trig()[0] == []
+    wait(loop, "board-a", 1)
+    assert trig()[0] == ["repeated waits"]
+    off = {**cfg, "coordinator": {**cfg["coordinator"], "repeat_waits_24h": 0}}
+    assert coord.effort_triggers(db, off, [], None, now=now)[0] == []
+    # A finished task's entry is dropped.
+    db.update_task(t, status="done")
+    assert str(t) not in trig()[1]["waits"]
 
 
 def test_the_daemon_records_whether_a_wait_is_self_or_external(env, monkeypatch, tmp_path):
     p = make(env)
     from ttp.daemon import Daemon
     d = Daemon(p.base)
-    for result, want in (({"waiting_for": "a free board", "retry_after_s": 600}, {"wait": "external", "why": "other"}),
+    for result, want in (({"waiting_for": "a free board", "retry_after_s": 600},
+                          {"wait": "external", "why": "other", "for": "a free board"}),
                          ({"retry_when": "ttp checks --result /r", "retry_after_s": 600},
-                          {"wait": "self", "why": "checks"})):
+                          {"wait": "self", "why": "checks", "for": "later"})):
         monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps({"status": "waiting", "summary": "later", **result}))
         tid = p.db.add_task(f"waits {want['why']}", "s", kind="work", tier="light", origin="user")
         assert _run_until(d, p, lambda: p.db.one("SELECT id FROM events WHERE kind='task_waiting' AND task=?", (tid,)))
@@ -17156,7 +17236,7 @@ def test_effort_triggers_raise_every_tricky_turn_and_leave_routine_ones_low(env)
     assert trig() == ["high severity alert"]
     db.set_kv("last_coordinator_turn", time.time() + 1)
     assert trig() == []
-    # A task failing twice or waiting three times in 24 h (configurable), once heard from since the last turn.
+    # A task failing twice or waiting eight times in 24 h (configurable), once heard from since the last turn.
     db.x("DELETE FROM messages WHERE direction='out'")
     db.set_kv("last_coordinator_turn", time.time() - 60)
     flaky = db.add_task("flaky", "s", origin="user")
@@ -17170,7 +17250,7 @@ def test_effort_triggers_raise_every_tricky_turn_and_leave_routine_ones_low(env)
     assert coord.effort_triggers(db, {**cfg, "coordinator": {**cfg["coordinator"], "repeat_fails_24h": 3}},
                                  [], None)[0] == []
     patient = db.add_task("patient", "s", origin="user")
-    for _ in range(3):
+    for _ in range(8):
         db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
              (time.time(), f"task:{patient}", "task_waiting", "low", "waits", "handled", patient))
     db.update_task(patient, status="done")

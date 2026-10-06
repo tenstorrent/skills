@@ -1665,7 +1665,7 @@ class Daemon:
             kind, why = ("self", "escalated wake") if extra.get("escalated_wake") else unblock.classify_wait(result)
             db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
                  (time.time(), f"task:{task['id']}", "task_waiting", "low",
-                  f"#{task['id']} {task['title']}: {reason}", json.dumps({"wait": kind, "why": why}),
+                  f"#{task['id']} {task['title']}: {reason}", json.dumps({"wait": kind, "why": why, "for": what}),
                   "handled", task["id"]))
             return
         if task["reply_chat"] and new in ("done", "failed", "blocked"):

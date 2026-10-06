@@ -156,9 +156,10 @@ and preferences you add later become part of the project's charter and memory.
   (`coordinator.effort_triggers`) and recorded per turn in the run's note: a user message (and a
   change of plan in it); a blocked, failed or needs-review task, a failed review, a dead dependency,
   an expired or broken deferral or a stalled review; a task failing `coordinator.repeat_fails_24h`
-  (2) or waiting `coordinator.repeat_waits_24h` (3) times in 24 h; a rejected action; free worker
-  slots while every queued task is held; a high or critical event or alert; resource trouble (not
-  waits only); a costly or irreversible step (an ask timing out, a task's budget spent, PR findings
+  (2) times in 24 h; a task's external waits (not its own checks, jobs, push or planned window)
+  changing reason, going on for 24 h, or reaching `coordinator.repeat_waits_24h` (8) in 24 h; a
+  rejected action; free worker slots while every queued task is held; a high or critical event or
+  alert; resource trouble (not waits only); a costly or irreversible step (an ask timing out, a task's budget spent, PR findings
   or a clean PR, a failed push, the budget gate entering or leaving red); an idle wake finding
   blocked tasks or open asks. Routine bookkeeping stays at the base effort; such a turn that finds
   its batch harder than it looked returns `escalate`, and the same batch reruns once at high

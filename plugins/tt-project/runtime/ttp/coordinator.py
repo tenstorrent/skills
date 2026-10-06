@@ -168,7 +168,11 @@ RESOURCE_WAITS_ONLY = "waits only"   # a resource_trouble line that only counts 
 CONFLICT_RE = re.compile(r"\b(change of plan|change(d)? (my|the) mind|supersed\w*|scrap (that|this|it)|"
                          r"ignore (what|my|the) (i said|earlier|previous)|instead of|no longer|"
                          r"forget (that|what i said)|overrid\w*|contrary to|reverse (that|the) decision)\b", re.I)
-EFFORT_SEEN_KEY = "effort_seen"   # kv: state-based triggers already raised once (held queue, red gates)
+EFFORT_SEEN_KEY = "effort_seen"   # kv: state-based triggers already raised once (held queue, red gates, waits)
+# A task's stint of external waits ends at any other hand-off (wait_raises); looked back this far.
+STINT_KINDS = ("task_waiting", "task_blocked", "task_review", "task_done", "task_failed", "task_queued",
+               "task_requeued", "push_queued")
+STINT_LOOKBACK_S = 14 * 86400
 ESCALATE_KEY = "escalate"   # kv: a routine turn's escalation; the next turn reruns its batch at high effort
 ESCALATIONS_KEY = "escalations"   # kv: {"n": routine turns escalated, "refused": escalations refused}
 EFFORT_ORDER = ("minimal", "low", "medium", "high", "xhigh", "max")
@@ -1186,21 +1190,23 @@ def effort_triggers(db, cfg: dict, event_ids: list[int], wake_due: str | None,
               % ",".join("?" * len(EFFORT_SEVERITIES)), (last, *EFFORT_SEVERITIES)):
         add("high severity alert")
     # A task that keeps failing or coming back waiting, counted over 24 h for the tasks heard from
-    # since the last turn.
-    fails_at, waits_at = int(c.get("repeat_fails_24h", 2) or 0), int(c.get("repeat_waits_24h", 3) or 0)
+    # since the last turn. Waits: only external ones (unblock.counted_wait). They raise when the
+    # task's normalized wait reason changes, once when its current stint of waits passes 24 h, and
+    # at repeat_waits_24h waits in 24 h as a backstop for real loops.
+    fails_at, waits_at = int(c.get("repeat_fails_24h", 2) or 0), int(c.get("repeat_waits_24h", 8) or 0)
     since = now - 86400
+    waits_seen = dict(seen_before.get("waits") or {})
     for t in db.q("SELECT DISTINCT task FROM events WHERE task IS NOT NULL AND ts>?", (last,)):
         fails = db.one("SELECT COUNT(*) n FROM runs WHERE task=? AND role!='coordinator' AND ended>? AND status IN "
                        f"({','.join('?' * len(machines.BAD_RUNS))}) AND COALESCE(note,'') NOT LIKE '%lost_to_reboot%'",
                        (t["task"], since, *machines.BAD_RUNS))["n"] + \
             db.one("SELECT COUNT(*) n FROM events WHERE task=? AND kind='task_failed' AND ts>?", (t["task"], since))["n"]
-        # Only external waits: a task waiting on its own checks, jobs, push or planned window is progress.
-        waits = sum(not unblock.is_self_wait(e["data"]) for e in db.q(
-            "SELECT data FROM events WHERE task=? AND kind='task_waiting' AND ts>?", (t["task"], since)))
         if fails_at and fails >= fails_at:
             add("repeated failures")
-        if waits_at and waits >= waits_at:
+        if wait_raises(db, t["task"], waits_seen, waits_at, now):
             add("repeated waits")
+    seen["waits"] = {k: v for k, v in waits_seen.items()   # a finished task's waits are over
+                     if (db.task(int(k)) or {}).get("status") not in TERMINAL_TASK_STATES}
     # Free worker slots while every queued task is held (a dependency, a deferral, a paused resource).
     queued = db.q("SELECT * FROM tasks WHERE status='queued' ORDER BY id")
     running = db.one("SELECT COUNT(*) n FROM runs WHERE role!='coordinator' AND status='running'")["n"]
@@ -1225,6 +1231,37 @@ def effort_triggers(db, cfg: dict, event_ids: list[int], wake_due: str | None,
         if db.one("SELECT id FROM messages WHERE kind='ask' AND handled=0"):
             add("stalled on open asks")
     return out, seen
+
+
+def wait_raises(db, tid: int, waits_seen: dict, waits_at: int, now: float) -> bool:
+    """Whether task `tid`'s external waits make a tricky turn, updating its entry in `waits_seen`
+    ({reason, since, aged}): its normalized wait reason changed from its previous wait (the one
+    seen by the last turn, else the previous in the stint), its stint (external waits in a row,
+    the same wait's cheap wakes skipped; a self-wait or any other hand-off ends it) began over
+    24 h ago (once per stint), or `waits_at` or more external waits in 24 h (0: no backstop)."""
+    rows = db.q("SELECT ts, kind, text, data FROM events WHERE task=? AND ts>? AND kind IN "
+                f"({','.join('?' * len(STINT_KINDS))}) ORDER BY ts DESC, id DESC",
+                (tid, now - STINT_LOOKBACK_S, *STINT_KINDS))
+    stint = []
+    for e in rows:
+        if e["kind"] == "task_waiting" and unblock.ESCALATED_WAKE.search(e["text"] or ""):
+            continue
+        if e["kind"] != "task_waiting" or not unblock.counted_wait(e):
+            break
+        stint.append(e)
+    key = str(tid)
+    if not stint:
+        waits_seen.pop(key, None)
+        return False
+    before = waits_seen.get(key) or {}
+    reason, start = unblock.wait_reason(stint[0]), stint[-1]["ts"]
+    if before.get("since") != start:
+        before = {}   # a new stint: what an earlier one waited for does not compare
+    prev = before.get("reason") or (unblock.wait_reason(stint[1]) if len(stint) > 1 else reason)
+    aged = now - start > 86400
+    waits_seen[key] = {"reason": reason, "since": start, "aged": aged}
+    count = sum(1 for e in rows if e["ts"] > now - 86400 and e["kind"] == "task_waiting" and unblock.counted_wait(e))
+    return reason != prev or (aged and not before.get("aged")) or bool(waits_at and count >= waits_at)
 
 
 def can_raise_effort(cfg: dict, tier: str, effort: str | None = None) -> bool:

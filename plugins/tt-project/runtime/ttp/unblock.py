@@ -45,6 +45,15 @@ PLANNED_WINDOW = re.compile(
     r"|\b(window|period|delay)\s+(it|I|the task|this task|we)\s+(set|planned|chose)\b"
     r"|\bstart_(after|when)\b", re.I)
 WAIT_KINDS = ("self", "external")
+# A cheap wake that found work and runs again at once: the same wait going on, never a new one.
+ESCALATED_WAKE = re.compile(r"\bwoke at \w+ and found work; runs again now\b")
+# Tokens that change from one wait to the next without the reason changing: the next-try time,
+# timestamps, times, shas and run ids, then any other number.
+REASON_NOISE = (re.compile(r";\s*next try\b.*$", re.I),
+                re.compile(r"\b\d{4}-\d{2}-\d{2}([T ]\d{1,2}:\d{2}(:\d{2})?(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?"),
+                re.compile(r"\b\d{1,2}:\d{2}(:\d{2})?\b"),
+                re.compile(r"\b(?=[0-9a-f]*\d)[0-9a-f]{7,64}\b", re.I),
+                re.compile(r"\d+"))
 
 # Answers that hand the decision back: the ask should not have been sent.
 HANDBACK = tuple(re.compile(p, re.I) for p in (
@@ -110,6 +119,22 @@ def wait_data(raw: Any) -> dict:
 def is_self_wait(raw: Any) -> bool:
     """Whether a task_waiting event's `data` marks it a self-wait (older events count as external)."""
     return wait_data(raw).get("wait") == "self"
+
+
+def counted_wait(ev: Any) -> bool:
+    """Whether a task_waiting event (a row with `data` and `text`) is an external wait that counts
+    as stuck: not a self-wait, and not a cheap wake that found work (older events lack the data)."""
+    return not is_self_wait(ev["data"]) and not ESCALATED_WAKE.search(ev["text"] or "")
+
+
+def wait_reason(ev: Any) -> str:
+    """What a task_waiting event waits for, normalized so waits differing only in times, shas, run
+    ids or counts compare equal: its `data.for`, else its text after "#id title: "."""
+    raw = str(_note(ev["data"]).get("for") or (ev["text"] or "").split(": ", 1)[-1])
+    raw = re.sub(r"^waiting for\s+", "", raw.strip(), flags=re.I)
+    for rx in REASON_NOISE:
+        raw = rx.sub("0" if rx.pattern == r"\d+" else "", raw)
+    return " ".join(raw.lower().split())[:200]
 
 
 def answer_part(text: str, ask_id: int, ask_ids: set[int]) -> str | None:

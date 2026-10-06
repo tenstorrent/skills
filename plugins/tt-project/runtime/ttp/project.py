@@ -87,10 +87,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "shared_resources": [],             # resources whose slots and pause all the user's projects share
     # model / effort, when set, override the coordinator tier's for the coordinator only.
     # unblock_effort: the least effort of a tricky or blocking turn (coordinator.effort_triggers);
-    # "" keeps those at the coordinator's usual effort. A task failing repeat_fails_24h or waiting
-    # repeat_waits_24h times in 24 h makes one (0 turns that rule off).
+    # "" keeps those at the coordinator's usual effort. A task failing repeat_fails_24h times in
+    # 24 h makes one, and so do its external waits when their reason changes, when they have gone on
+    # for 24 h, or at repeat_waits_24h in 24 h (0 turns either count off).
     "coordinator": {"tier": "light", "model": "", "effort": "", "unblock_effort": "high",
-                    "repeat_fails_24h": 2, "repeat_waits_24h": 3,
+                    "repeat_fails_24h": 2, "repeat_waits_24h": 8,
                     "debounce_s": 15, "max_events_per_turn": 40,
                     "max_turns_per_hour": 30, "max_new_tasks_per_day": 200, "idle_wake_s": 3600,
                     "starve_wake_s": 300,
