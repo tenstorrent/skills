@@ -142,12 +142,16 @@ def _resource_line(task: dict) -> str:
 
 
 def _runner_line(cfg: dict) -> str:
+    from .project import device_timeout_max
+    ceiling = device_timeout_max(cfg)[0]
+    out = (f"device job timeouts: at most {ceiling} s each (runner.device_timeout_max_s), whatever runs the "
+           "job; split a longer run into shorter jobs\n") if ceiling else ""
     runners = (cfg.get("device") or {}).get("runners") or {}
     if not isinstance(runners, dict) or not runners:
-        return ""
+        return out
     names = ", ".join(f"{n} (on {(r or {}).get('host') or 'this machine'})" for n, r in sorted(runners.items()))
     return (f"device runners: {names}; queue every device job with `ttp devq submit`, never a detached "
-            "driver of your own\n")
+            "driver of your own\n") + out
 
 
 def worker_system(p: Project) -> str:

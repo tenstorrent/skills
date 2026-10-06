@@ -29,7 +29,7 @@ from . import outbox
 from . import schedule as sched
 from .project import (FOLDER, NAME_RE, Project, hostname, load_registry, load_secrets, register, save_secret,
                       durable_append, durable_write, write_json, ACCOUNT_KEYS, DEFAULT_CONFIG, deep_merge,
-                      load_account_settings, set_account_setting, zombie)
+                      load_account_settings, set_account_setting, zombie, device_timeout_max)
 
 RUNTIME = Path(__file__).resolve().parent.parent              # .../runtime (plugin or project copy)
 PLUGIN_ROOT = RUNTIME.parent                                   # plugin root, or a project's harness/
@@ -1526,7 +1526,8 @@ def cmd_devq(a) -> None:
     """The project's serial device-job runners (config `device.runners.<name>`; see devq.py).
 
     `ttp devq submit <runner> --id <id> [--config <key>] [--timeout <s>] [--workdir <dir>] -- <command>`
-    queues one job on the runner's host and starts the runner if it is down; it prints the retry_when,
+    queues one job on the runner's host and starts the runner if it is down (with runner.device_timeout_max_s
+    set, it refuses a longer --timeout and gives a job without one that ceiling); it prints the retry_when,
     `ttp devq probe <runner> <id>`, which exits 0 once the job has its done marker, or once no runner is
     alive while the job waits (the waking run then calls `ttp devq start <runner>` and waits again), and
     1 while it runs. `status <runner> [<id>]` shows the queue or one job's marker; `clear <runner> <config>`
@@ -1566,8 +1567,16 @@ def cmd_devq(a) -> None:
         if not o.id or not rest or extra:
             die(usage)
         a.id = o.id
+        timeout = o.timeout
+        ceiling = device_timeout_max(p.config())[0]
+        if ceiling and timeout > ceiling:
+            die(f"devq submit: --timeout {timeout} is above the project's device-job ceiling of {ceiling} s "
+                f"(runner.device_timeout_max_s); split the run into shorter jobs")
+        if ceiling and not timeout and not 0 < float(devq.settings(rc)["job_timeout_s"] or 0) <= ceiling:
+            timeout = ceiling
+            print(f"devq submit: no --timeout; the job gets the project's device-job ceiling of {ceiling} s")
         spec = {"id": o.id, "config": o.config or o.id, "cmd": rest[0] if len(rest) == 1 else shlex.join(rest),
-                "task": os.environ.get("TTP_TASK", ""), "workdir": o.workdir, "timeout_s": o.timeout}
+                "task": os.environ.get("TTP_TASK", ""), "workdir": o.workdir, "timeout_s": timeout}
         args, install, limit = [cfg_json, json.dumps(spec)], True, 120
     elif a.op == "start":
         args, install, limit = [cfg_json], True, 120

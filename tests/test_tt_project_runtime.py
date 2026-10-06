@@ -24816,6 +24816,53 @@ def test_ttp_devq_cli_submits_locally_and_the_config_and_prompt_name_the_runner(
     assert "device runners" not in worker_task(p, p.db.task(tid), str(p.root), None)
 
 
+def test_device_timeout_ceiling_clamps_or_refuses_devq_timeouts_and_reaches_the_worker(env, tmp_path):
+    p = make(env)
+    d = tmp_path / "rq"
+    p.set_config("device", {"runners": {"dev": {"dir": str(d), **DEVQ_FAST}}})
+    p.set_config("runner.device_timeout_max_s", 600)
+    try:
+        r = _ttp_run(p, "devq", "submit", "dev", "--id", "t9-long", "--timeout", "2700", "--", "true")
+        assert r.returncode != 0 and "above the project's device-job ceiling of 600 s" in r.stderr
+        assert not (d / "queue").exists() or not list((d / "queue").iterdir()), "a refused job is not queued"
+        r = _ttp_run(p, "devq", "submit", "dev", "--id", "t9-none", "--", "sh", "-c", "echo $TTP_DEVQ_TIMEOUT_S")
+        assert r.returncode == 0, r.stderr
+        assert "gets the project's device-job ceiling of 600 s" in r.stdout
+        m = _devq_marker(d, "t9-none")
+        assert m["status"] == "done" and pathlib.Path(m["log"]).read_text().strip() == "600"
+        r = _ttp_run(p, "devq", "submit", "dev", "--id", "t9-short", "--timeout", "300", "--",
+                     "sh", "-c", "echo $TTP_DEVQ_TIMEOUT_S")
+        assert r.returncode == 0 and "ceiling" not in r.stdout, r.stderr
+        assert pathlib.Path(_devq_marker(d, "t9-short")["log"]).read_text().strip() == "300"
+        # A runner default within the ceiling is kept; one above it is replaced by the ceiling.
+        p.set_config("device", {"runners": {"dev": {"dir": str(d), **DEVQ_FAST, "job_timeout_s": 120}}})
+        r = _ttp_run(p, "devq", "submit", "dev", "--id", "t9-def", "--", "sh", "-c", "echo $TTP_DEVQ_TIMEOUT_S")
+        assert r.returncode == 0 and "ceiling" not in r.stdout, r.stderr
+        assert pathlib.Path(_devq_marker(d, "t9-def")["log"]).read_text().strip() == "120"
+    finally:
+        with contextlib.suppress(OSError, ValueError):
+            os.kill(int((d / "runner.pid").read_text()), signal.SIGKILL)
+    from ttp.project import config_problems, device_timeout_max
+    from ttp.prompts import worker_task
+    assert device_timeout_max({}) == (0, None)
+    assert device_timeout_max({"runner": {"device_timeout_max_s": 600}}) == (600, None)
+    for bad in (0, -5, "600", True):
+        n, why = device_timeout_max({"runner": {"device_timeout_max_s": bad}})
+        assert n == 0 and "runner.device_timeout_max_s" in why
+    assert config_problems({"runner": {"device_timeout_max_s": 600}}) == []
+    assert config_problems({"runner": {"device_timeout_max_s": 600},
+                            "device": {"runners": {"dev": {"job_timeout_s": 1500}}}}) == [
+        "device.runners.dev.job_timeout_s: 1500 is above runner.device_timeout_max_s (600); "
+        "jobs without their own --timeout get 600"]
+    tid = p.db.add_task("run it", "s", kind="work", tier="light", origin="user")
+    head = worker_task(p, p.db.task(tid), str(p.root), None)
+    assert "device job timeouts: at most 600 s each" in head and "device runners: dev" in head
+    p.set_config("device", {"runners": {}})
+    assert "device job timeouts: at most 600 s each" in worker_task(p, p.db.task(tid), str(p.root), None)
+    p.set_config("runner.device_timeout_max_s", None)
+    assert "device job timeouts" not in worker_task(p, p.db.task(tid), str(p.root), None)
+
+
 class _FakeCaffeinate:
     """Stands in for the caffeinate child: records its argv and whether it was ended and reaped."""
     started: list = []

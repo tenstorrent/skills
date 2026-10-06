@@ -456,7 +456,8 @@ class Runner:
             p = subprocess.Popen(["/bin/sh", "-c", wrapper, "sh", str(logf), str(rcf), spec["cmd"]],
                                  cwd=spec.get("workdir") or str(Path.home()), stdin=subprocess.DEVNULL,
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
-                                 env={**os.environ, "TTP_DEVQ_JOB": job, "TTP_DEVQ_CONFIG": str(spec["config"])},
+                                 env={**os.environ, "TTP_DEVQ_JOB": job, "TTP_DEVQ_CONFIG": str(spec["config"]),
+                                      "TTP_DEVQ_TIMEOUT_S": str(int(self.limit(spec)))},
                                  pass_fds=(lock.fileno(),))
         finally:
             lock.close()
@@ -467,12 +468,17 @@ class Runner:
         self.set_state(f"{job}: running attempt {n}")
         self._child = p
 
+    def limit(self, spec: dict) -> float:
+        """A job's time limit in seconds (0 = none): its own timeout_s, else the runner's job_timeout_s.
+        The job sees it as TTP_DEVQ_TIMEOUT_S, to size the timeouts of what it starts within it."""
+        return float(spec.get("timeout_s") or self.cfg["job_timeout_s"] or 0)
+
     def wait(self, job: str, spec: dict, st: dict) -> tuple:
         """(rc, how) of the current attempt: how is "" (it ended), "timeout" or "interrupted" (it is
         gone without an exit code: killed, or the host restarted)."""
         cur = st["cur"]
         rcf, lockf = Path(cur["rc"]), Path(cur["lock"])
-        limit = float(spec.get("timeout_s") or self.cfg["job_timeout_s"] or 0)
+        limit = self.limit(spec)
         child = self._child
         while True:
             if child is not None:
@@ -552,7 +558,7 @@ class Runner:
                 continue
             _rm(self.d / "configs" / spec["config"])
             if how == "timeout":
-                self.finish(job, st, "failed", rc, f"timed out after {float(spec.get('timeout_s') or self.cfg['job_timeout_s']):.0f} s")
+                self.finish(job, st, "failed", rc, f"timed out after {self.limit(spec):.0f} s")
             elif rc == 0:
                 self.finish(job, st, "done", 0, "completed")
             else:

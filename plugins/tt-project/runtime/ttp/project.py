@@ -190,6 +190,8 @@ EXTRA_KEYS = {
                  "after_push_timeout_s", "backup_remote"},
     "jev": {"via", "url", "model"},
     "power": {"keep_awake"},
+    # device_timeout_max_s: a ceiling on device-job timeouts (off: unset); see device_timeout_max.
+    "runner": {"device_timeout_max_s"},
 }
 OPEN_SECTIONS = {"resources"}           # any name below is fine
 PROVIDER_KEYS = {"tiers", "plugin_dirs", "worker_isolation", "mcp_servers"}
@@ -301,6 +303,20 @@ def nice_level(runner: Any) -> tuple[int, str | None]:
     return int(v), None
 
 
+def device_timeout_max(cfg: dict) -> tuple[int, str | None]:
+    """runner.device_timeout_max_s as whole seconds (0 = no ceiling), and a problem line when the value
+    is not a number > 0. When set, no device job the harness queues may run longer: `ttp devq submit`
+    refuses a longer --timeout and gives a job without one the ceiling, and workers are told to size
+    every device timeout within it."""
+    runner = cfg.get("runner") if isinstance(cfg, dict) else None
+    v = runner.get("device_timeout_max_s") if isinstance(runner, dict) else None
+    if v is None:
+        return 0, None
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 1:
+        return 0, f"runner.device_timeout_max_s: {v!r} is not a number of seconds >= 1; no ceiling is used"
+    return int(v), None
+
+
 def lower_priority(n: int):
     """A Popen preexec_fn that lowers the child's CPU priority by `n` nice levels before it execs,
     so all it starts inherits it; None when `n` is 0. Never stops the child: a failure leaves it
@@ -351,8 +367,14 @@ def config_problems(raw: dict) -> list[str]:
     runners = (raw.get("device") or {}).get("runners")
     if runners is not None and not isinstance(runners, dict):
         out.append("device.runners: not a table of runners by name")
+    ceiling, why = device_timeout_max(raw)
+    out += [why] if why else []
     for name, rcfg in (runners if isinstance(runners, dict) else {}).items():
         out += runner_problems(name, rcfg)
+        jt = rcfg.get("job_timeout_s") if isinstance(rcfg, dict) else None
+        if ceiling and isinstance(jt, (int, float)) and not isinstance(jt, bool) and jt > ceiling:
+            out.append(f"device.runners.{name}.job_timeout_s: {jt} is above runner.device_timeout_max_s "
+                       f"({ceiling}); jobs without their own --timeout get {ceiling}")
     may_push = delivery.get("code_tasks_may_push", False)
     if not isinstance(may_push, bool):
         out.append(f"delivery.code_tasks_may_push: {may_push!r} is not true or false; code tasks do not push")

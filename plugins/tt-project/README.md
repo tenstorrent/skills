@@ -211,7 +211,7 @@ and preferences you add later become part of the project's charter and memory.
   machine), `dir` (its state folder there), `health` (a command that must pass before each job),
   `drop_check` (a command that tells a device drop from a plain failure), `max_drops` (default 2),
   `health_wait_s`, `job_timeout_s` and `idle_exit_s`. A task queues each device job with
-  `ttp devq submit <runner> --id <id> [--config <key>] -- <command>` and waits on
+  `ttp devq submit <runner> --id <id> [--config <key>] [--timeout <s>] -- <command>` and waits on
   `ttp devq probe <runner> <id>`, which exits 0 once the job's done marker is written (done, failed
   or skipped, with exit code and log) or once no runner is alive while the job waits. The runner is
   started under a lock (a second start does nothing), runs jobs in arrival order, runs a job again
@@ -220,6 +220,10 @@ and preferences you add later become part of the project's charter and memory.
   `legacy_driver` (a regex for the command line of the project's old per-task drivers) closes the
   race between the two paths: while one of the user's processes matches it, the runner does not
   start or start a job, and the probe keeps a task with a pending job waiting until it ends.
+  Config `runner.device_timeout_max_s` (opt-in) caps device-job timeouts: `ttp devq submit` refuses a
+  longer `--timeout` and gives a job without one the ceiling when the runner's `job_timeout_s` is
+  unset or above it; each job sees its limit as `TTP_DEVQ_TIMEOUT_S`, and workers are told to keep
+  every device timeout (broker jobs, driver steps) within the ceiling and split longer runs.
   Locks and pauses are per project; a
   resource that several projects on one machine use is declared shared (`shared_resources` in the
   config, or `ttp machines add <alias> --shared [names]`), and then all of them take turns on its
