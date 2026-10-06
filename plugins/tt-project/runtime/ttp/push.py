@@ -432,6 +432,58 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
     return remote, branch
 
 
+def _may_land(p: Project, task: str, owner: str, branch: str) -> bool:
+    """Whether task `task` may land `branch`, task `owner`'s ttp/t<id>-... branch: its own, one the
+    task carries as its branch, the change a review checks (reviews push in the change's worktree)
+    or a task it depends on or continues."""
+    if owner == task:
+        return True
+    try:
+        t = p.db.task(int(task))
+    except (ValueError, TypeError):
+        return False
+    if not t:
+        return False
+    if t.get("kind") == "review" or str(t.get("branch") or "") == branch:
+        return True
+    try:
+        refs = [str(x) for x in json.loads(t.get("depends_on") or "[]")]
+        refs += [str(x).partition(":")[2] for x in json.loads(t.get("labels") or "[]")
+                 if str(x).startswith(("auto_review:", "continues:"))]
+    except (ValueError, TypeError):
+        return False
+    return owner in refs
+
+
+def _on_remote(repo: Path, remote: str, branch: str) -> bool:
+    ls = _git(repo, "ls-remote", "--heads", remote, f"refs/heads/{branch}")
+    return ls.returncode == 0 and any(ln.endswith(f"\trefs/heads/{branch}") for ln in ls.stdout.splitlines())
+
+
+def resolve(p: Project, repo: Path, own: bool = False) -> tuple[str, str, bool]:
+    """(remote, branch, own) for `ttp push`. `--own` is own_target. Otherwise the target is
+    `delivery.push_branch`, but inside a run a worktree on another task's ttp/t<id>-... branch is
+    refused (it would land that task's work: _may_land), and with no push_branch set this task's
+    own branch, once on the remote, is the default target (published as with --own)."""
+    if own:
+        return (*own_target(p, repo), True)
+    branch = _git(repo, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
+    m = OWN_BRANCH.fullmatch(branch)
+    task = os.environ.get("TTP_TASK")
+    if m and task and not _may_land(p, task, m.group(1), branch):
+        raise ValueError(f"this worktree has task #{m.group(1)}'s branch {branch} checked out, not "
+                         f"task #{task}'s own (ttp/t{task}-...): ttp push lands only this task's work. "
+                         f"Run it in this task's own worktree")
+    d = p.config().get("delivery") or {}
+    if not str(d.get("push_branch") or "").strip() and m and m.group(1) == task:
+        remote, own_branch = own_target(p, repo)
+        if _on_remote(repo, remote, own_branch):
+            print(f"ttp push: no delivery.push_branch; {remote}/{branch} is this task's own branch, "
+                  f"publishing it as with --own", file=sys.stderr)
+            return remote, own_branch, True
+    return (*target(p, repo), False)
+
+
 def behind(repo: Path, remote: str, branch: str) -> str:
     """Why pushing HEAD to remote/branch would not be a fast-forward, or "" when the branch is new
     there or its tip is an ancestor of HEAD. Fails closed when the remote cannot be read."""
@@ -1084,7 +1136,7 @@ def run(p: Project, repo: Path, own: bool = False) -> int:
         return 0
     checks = check_list(d.get("push_checks"))   # none: only a docs-only change may go (_rounds)
     try:
-        remote, branch = own_target(p, repo) if own else target(p, repo)
+        remote, branch, own = resolve(p, repo, own)
         rounds = rounds_of(d.get("push_rounds"))
         explicit = d.get("push_wait_s")
         wait_s = default_wait(last_check_s(p)) if explicit in (None, "") else wait_of(explicit)
@@ -1259,7 +1311,7 @@ def detach(p: Project, repo: Path, own: bool = False) -> int:
         print(f"ttp push: {LOCAL_HARNESS}", file=sys.stderr)
         return 0
     try:
-        remote, branch = own_target(p, top) if own else target(p, top)
+        remote, branch, own = resolve(p, top, own)
     except ValueError as e:
         print(f"ttp push: {e}", file=sys.stderr)
         return REFUSED

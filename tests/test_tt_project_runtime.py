@@ -11838,6 +11838,58 @@ def test_push_own_detached_publishes_the_own_branch_and_reports_it(env, monkeypa
     assert _git_out(origin, "rev-parse", "ttp/t7-exp") == head
     assert _git_out(origin, "rev-parse", "proj") != head
 
+
+def test_push_refuses_a_worktree_on_another_tasks_branch_at_once(env, monkeypatch, capsys):
+    from ttp import push
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    _git_out(repo, "checkout", "-q", "-b", "ttp/t149-fix")
+    _commit(repo, "mine.txt", "mine\n")
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/ttp/t149-fix")   # published with --own
+    shared = _git_out(origin, "rev-parse", "proj")
+    worker = p.db.add_task("device check", kind="work")
+    monkeypatch.setenv("TTP_TASK", str(worker))
+    for args in (["push"], ["push", "--detach"]):
+        assert _ttp(*args) == 2, args
+        err = capsys.readouterr().err
+        assert "task #149's branch ttp/t149-fix" in err and f"ttp/t{worker}-" in err, err
+    assert not (p.state / "pushes").exists() and _git_out(origin, "rev-parse", "proj") == shared
+    # The review of that change, a task built on it, or one that carries it as its branch may.
+    review = p.db.add_task("review", kind="review")
+    after = p.db.add_task("after", kind="code", depends_on=[149])
+    carrier = p.db.add_task("carrier", kind="code", branch="ttp/t149-fix")
+    for tid in (review, after, carrier):
+        monkeypatch.setenv("TTP_TASK", str(tid))
+        assert push.resolve(p, repo) == ("origin", "proj", False), tid
+    monkeypatch.delenv("TTP_TASK")          # outside a run: the configured target as before
+    assert push.resolve(p, repo) == ("origin", "proj", False)
+
+
+def test_push_defaults_to_the_tasks_own_branch_on_the_remote_without_a_push_branch(env, monkeypatch, capsys):
+    from ttp import push
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    shared = _git_out(origin, "rev-parse", "proj")
+    p.set_config("delivery.push_branch", "")
+    _git_out(repo, "checkout", "-q", "-b", "ttp/t60-exp")
+    _commit(repo, "mine.txt", "mine\n")
+    monkeypatch.setenv("TTP_TASK", "60")
+    # Not on the remote yet: nothing to default to, the usual refusal.
+    assert _ttp("push") == 2 and "set delivery.push_branch" in capsys.readouterr().err
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/ttp/t60-exp")
+    _commit(repo, "more.txt", "more\n")
+    head = _git_out(repo, "rev-parse", "HEAD")
+    assert push.resolve(p, repo) == ("origin", "ttp/t60-exp", True)
+    rc = _ttp("push", "--detach")
+    out = capsys.readouterr().out
+    probe = next(ln.split(": ", 1)[1] for ln in out.splitlines() if ln.startswith("retry_when: "))
+    assert rc == 0 and "origin/ttp/t60-exp" in out
+    r = _probe_until_done(p, probe)
+    assert r.returncode == 0 and f"pushed {head} to origin/ttp/t60-exp" in r.stdout, r
+    assert _git_out(origin, "rev-parse", "ttp/t60-exp") == head and _git_out(origin, "rev-parse", "proj") == shared
+    # A configured push branch still wins over the own branch.
+    p.set_config("delivery.push_branch", "origin/proj")
+    assert push.resolve(p, repo) == ("origin", "proj", False)
+    assert _ttp("push") == 0 and _git_out(origin, "rev-parse", "proj") == head
+
 def test_a_dead_detached_push_reads_as_failed_and_frees_the_branch(env, monkeypatch, capsys):
     started = env["tmp"] / "started"
     p, repo, origin, other = _push_setup(env, monkeypatch, [f"touch {started}; sleep 60"])

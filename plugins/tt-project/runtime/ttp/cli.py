@@ -970,7 +970,9 @@ def cmd_push(a) -> None:
     free (0) or taken (1). `--detach` runs the push in a process of its own and prints its marker and
     a `--result <marker>` probe (0 once finished or dead, 1 while running). `--own` publishes the
     task's own `ttp/t<id>-...` branch under its own name instead, as it is: checks run on HEAD, no
-    rebase or bump, never the push branch or a shared one. `--queue` lists the push queue
+    rebase or bump, never the push branch or a shared one; with no push branch set, that is also the
+    default once the branch is on the remote. Inside a run, a worktree on another task's branch is
+    refused (push.resolve). `--queue` lists the push queue
     (`delivery.push_queue`). Exit codes are in `push.py`."""
     from . import push
     if a.result:
