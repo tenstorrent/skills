@@ -134,7 +134,8 @@ Before you finish, write `$TTP_RUN_DIR/result.json`:
   (build and set up first: those are not device jobs). It prints the `retry_when`; with several jobs,
   submit them in order and wait on the last. On wake, `ttp devq status <runner> <id>` shows its marker
   (done, failed or skipped, exit code, log, drops). No marker and no runner alive: run
-  `ttp devq start <runner>` and hand off `waiting` again on the same probe.
+  `ttp devq start <runner>` and hand off `waiting` again on the same probe (also when it says an old
+  per-task driver still runs: the runner starts on a later wake).
   A host reboot wakes waiting tasks at once; add `"survives_reboot": true` if yours does not die with it.
   The next run is a cheap light wake unless you set `wake_tier`; pick standard only if it will do real work.
 - `blocked` only when access, a credential, funds or a resource you cannot get is missing, or the

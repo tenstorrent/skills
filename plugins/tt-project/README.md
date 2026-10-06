@@ -211,6 +211,9 @@ and preferences you add later become part of the project's charter and memory.
   started under a lock (a second start does nothing), runs jobs in arrival order, runs a job again
   after a drop or a host reboot, and skips a config that dropped `max_drops` times in a row until
   `ttp devq clear <runner> <config>`; drops go to its `drops.log`. `ttp devq status` shows the queue.
+  `legacy_driver` (a regex for the command line of the project's old per-task drivers) closes the
+  race between the two paths: while one of the user's processes matches it, the runner does not
+  start or start a job, and the probe keeps a task with a pending job waiting until it ends.
   Locks and pauses are per project; a
   resource that several projects on one machine use is declared shared (`shared_resources` in the
   config, or `ttp machines add <alias> --shared [names]`), and then all of them take turns on its

@@ -24396,6 +24396,30 @@ def test_devq_probe_exit_codes(devq_dir):
     assert sorted(p.name for p in d.iterdir()) == ["queue", "runner.lock"], "the probe writes nothing"
 
 
+def test_devq_runner_and_probe_wait_while_an_old_per_task_driver_runs(devq_dir, tmp_path):
+    # Both the runner and an old detached driver could pass "no other job of ours" at once: the runner
+    # does not start while one of the user's processes matches legacy_driver, and the probe keeps the
+    # task asleep until the driver ends.
+    d, marker = devq_dir, f"old-driver-{os.getpid()}-{time.time_ns()}"
+    cfg = {**DEVQ_FAST, "legacy_driver": f"{marker}\\.sh"}
+    driver = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", f"{marker}.sh"])
+    try:
+        sub = _devq("submit", d, json.dumps(cfg), json.dumps({"id": "t9-a", "cmd": f"touch {tmp_path / 'ran'}"}))
+        assert sub.returncode == 0 and "queued t9-a" in sub.stdout and "old per-task driver" in sub.stdout
+        assert not (d / "runner.pid").exists()
+        refused = _devq("start", d, json.dumps(cfg))
+        assert refused.returncode == 3 and str(driver.pid) in refused.stdout
+        probe = _devq("probe", d, "t9-a")
+        assert probe.returncode == 1 and "old per-task driver" in probe.stdout, "keep sleeping"
+    finally:
+        driver.kill()
+        driver.wait()
+    woke = _devq("probe", d, "t9-a")
+    assert woke.returncode == 0 and "no runner is alive" in woke.stdout
+    assert _devq("start", d, json.dumps(cfg)).returncode == 0
+    assert _devq_marker(d, "t9-a")["status"] == "done" and (tmp_path / "ran").exists()
+
+
 def test_devq_restart_requeues_a_job_a_reboot_killed_and_adopts_one_still_running(devq_dir, tmp_path):
     d, flag = devq_dir, tmp_path / "flag"
     # Reboot: runner and job both die. The probe wakes the task; start runs the job again as a drop.
@@ -24453,6 +24477,7 @@ def test_ttp_devq_cli_submits_locally_and_the_config_and_prompt_name_the_runner(
     assert "cat >" in devq.host_call("dev", {}, "submit", ["{}", "{}"], install=True)[-1]
     assert config_problems({"device": {"runners": {"dev": {"helth": "x", "max_drops": -1}}}}) == [
         "device.runners.dev.helth: unknown key", "device.runners.dev.max_drops: -1 is not a number >= 0"]
+    assert "legacy_driver: not a regex" in " ".join(devq.config_problems("r", {"legacy_driver": "("}))
     tid = p.db.add_task("run it", "s", kind="work", tier="light", origin="user")
     assert "device runners: dev (on this machine)" in worker_task(p, p.db.task(tid), str(p.root), None)
     p.set_config("device", {"runners": {}})

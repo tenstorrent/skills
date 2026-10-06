@@ -41,6 +41,10 @@ RUNNER_DEFAULTS = {
     "job_timeout_s": 0,        # default per-job limit (0 = none); a job's own timeout_s wins
     "idle_exit_s": 1800,       # the runner exits after this long with nothing queued; submit restarts it
     "poll_s": 10,              # between checks on a running job
+    # A regex matching the command line of the project's old per-task drivers ("" = none). While one
+    # of the user's processes matches, the runner does not start and starts no job, and the probe keeps
+    # a task with a pending job asleep: both checking "no other job of ours" at once could pass.
+    "legacy_driver": "",
 }
 ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
 NAME_RE = ID_RE
@@ -62,6 +66,11 @@ def config_problems(name: str, cfg) -> list:
             out.append(f"{where}.{k}: {v!r} is not a number >= 0")
         elif isinstance(RUNNER_DEFAULTS[k], str) and not isinstance(v, str):
             out.append(f"{where}.{k}: {v!r} is not a string")
+    if isinstance(cfg.get("legacy_driver"), str) and cfg["legacy_driver"]:
+        try:
+            re.compile(cfg["legacy_driver"])
+        except re.error as e:
+            out.append(f"{where}.legacy_driver: not a regex ({e})")
     if isinstance(cfg.get("host"), str) and cfg["host"].startswith("-"):
         out.append(f"{where}.host: must not start with '-'")
     return out
@@ -177,6 +186,36 @@ def runner_alive(d: Path) -> bool:
     return not _free(d / "runner.lock")
 
 
+def legacy_drivers(d: Path, pattern: str) -> list:
+    """This user's processes whose command line matches `pattern`: "<pid> <command>" each. Leaves out
+    this process and its ancestors (whose command lines may carry the pattern as config), the runner's
+    own processes and its jobs (their process groups)."""
+    if not pattern:
+        return []
+    try:
+        rx = re.compile(pattern)
+        out = subprocess.run(["ps", "-ww", "-U", str(os.getuid()), "-o", "pid=", "-o", "ppid=", "-o", "pgid=",
+                              "-o", "command="], capture_output=True, text=True, timeout=30).stdout
+    except (OSError, re.error, subprocess.SubprocessError):
+        return []
+    procs = {}
+    for line in out.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) == 4 and all(x.isdigit() for x in parts[:3]):
+            procs[int(parts[0])] = (int(parts[1]), int(parts[2]), parts[3])
+    mine, pid = set(), os.getpid()
+    while pid and pid not in mine:
+        mine.add(pid)
+        pid = procs.get(pid, (0,))[0]
+    jobs = set()
+    for st in (d / "running").glob("*.state.json"):
+        cur = _load(st).get("cur") or {}
+        if isinstance(cur.get("pid"), int):
+            jobs.add(cur["pid"])
+    return [f"{p} {cmd[:160]}" for p, (_, pgid, cmd) in sorted(procs.items())
+            if p not in mine and pgid not in jobs and "devq.py" not in cmd and rx.search(cmd)]
+
+
 def probe(d: Path, job: str) -> int:
     """retry_when probe, read-only: 0 once job's marker exists, the job is unknown, or it is pending with
     no runner alive (the waking run restarts it with `ttp devq start`); 1 while a live runner has it."""
@@ -189,6 +228,10 @@ def probe(d: Path, job: str) -> int:
         print(f"{job}: unknown to the runner in {d}")
         return 0
     if not runner_alive(d):
+        legacy = legacy_drivers(d, settings(_load(d / "config.json"))["legacy_driver"])
+        if legacy:
+            print(f"{job}: {at}; no runner yet: an old per-task driver still runs ({legacy[0]})")
+            return 1
         print(f"{job}: {at}, but no runner is alive: run `ttp devq start` and wait again")
         return 0
     print(f"{job}: {at}")
@@ -220,7 +263,8 @@ def submit(d: Path, cfg: dict, spec: dict) -> int:
     _write(d / "queue" / f"{time.time_ns():020d}-{job}.json", json.dumps(spec, indent=1))
     ahead = len(list((d / "queue").glob("*.json"))) - 1 + len(_running(d))
     print(f"queued {job} ({ahead} ahead)")
-    return start(d, cfg)
+    rc = start(d, cfg)
+    return 0 if rc == 3 else rc
 
 
 def start(d: Path, cfg: dict) -> int:
@@ -230,6 +274,11 @@ def start(d: Path, cfg: dict) -> int:
     if runner_alive(d):
         print(f"runner already running (pid {(d / 'runner.pid').read_text().strip() if (d / 'runner.pid').exists() else '?'})")
         return 0
+    legacy = legacy_drivers(d, settings(cfg)["legacy_driver"])
+    if legacy:
+        print(f"runner not started: an old per-task driver still runs ({legacy[0]}); the probe keeps the task "
+              "asleep until it ends, and the runner starts on the first wake after that")
+        return 3
     with open(d / "runner.out", "a") as out:
         proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "run", str(d)], cwd=str(d),
                                 stdin=subprocess.DEVNULL, stdout=out, stderr=out, start_new_session=True)
@@ -336,6 +385,19 @@ class Runner:
                     return f"the health gate refused for {self.cfg['health_wait_s']:.0f} s ({why})"
             time.sleep(self.cfg["health_poll_s"])
 
+    def no_legacy(self, job: str) -> None:
+        """Wait while an old per-task driver runs: it may start a device job of its own at any time."""
+        told = False
+        while True:
+            legacy = legacy_drivers(self.d, self.cfg["legacy_driver"])
+            if not legacy:
+                return
+            if not told:
+                self.log(f"{job}: waiting: an old per-task driver still runs ({legacy[0]})")
+                told = True
+            self.set_state(f"{job}: waiting: an old per-task driver still runs ({legacy[0]})")
+            time.sleep(self.cfg["health_poll_s"])
+
     def finish(self, job: str, st: dict, status: str, rc, reason: str) -> None:
         spec = _load(self.d / "running" / f"{job}.json")
         marker = {"id": job, "status": status, "rc": rc, "log": st.get("log", ""), "reason": reason,
@@ -435,6 +497,7 @@ class Runner:
                                 f"config {spec['config']} dropped {len(drops)} times in a row; "
                                 f"`ttp devq clear <runner> {spec['config']}` allows it again")
                     return
+                self.no_legacy(job)
                 why = self.healthy(need, job)
                 if why:
                     self.finish(job, st, "skipped", None, why)
