@@ -2702,6 +2702,9 @@ def test_a_mechanical_next_step_wakes_at_light_and_that_run_finishes_it(env, mon
     assert bud.wake_tier("deep", {"status": "waiting", "next_step": "push"}) == "light"
     assert bud.wake_tier("standard", wait) == "standard"
     assert bud.wake_tier("standard", {**wait, "next_step": "  "}) == "standard", "a blank step is no step"
+    esc = {"status": "waiting", "retry_after_s": 0, "wake_tier": "standard", "next_step": "push",
+           "escalated_wake": True}
+    assert bud.wake_tier("standard", esc) == "standard", "an escalated wake runs at the task's tier"
     monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps({"status": "done", "summary": "checks green; pushed"}))
     tiers = {"light": {"effort": "low"}, "standard": {"effort": "high"}, "deep": {"effort": "max"}}
     p.set_config("providers.fake.tiers", tiers)
@@ -2722,6 +2725,31 @@ def test_a_mechanical_next_step_wakes_at_light_and_that_run_finishes_it(env, mon
     assert json.loads(other["note"])["wake"]["tier"] == "standard"
     assert other["effort"] == "high"
     assert p.db.task(mech)["attempts"] == 1
+
+
+def test_a_mechanical_wake_that_escalates_but_keeps_next_step_reruns_at_the_tasks_tier(env, monkeypatch):
+    """A light run for a mechanical step that hit a conflict escalates; if it keeps next_step in its
+    hand-off, the escalated rerun still runs at the task's tier and effort, not light again."""
+    p = make(env)
+    from ttp.daemon import Daemon
+    from ttp.db import dump_result
+    monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps(
+        {"status": "waiting", "summary": "the rebase conflicts", "waiting_for": "nothing", "retry_after_s": 0,
+         "wake_tier": "standard", "next_step": "push"}))
+    p.set_config("providers.fake.tiers", {"light": {"effort": "low"}, "standard": {"effort": "high"},
+                                          "deep": {"effort": "max"}})
+    tid = p.db.add_task("review and push", "s", kind="work", tier="standard", origin="user")
+    p.db.update_task(tid, result=dump_result({"status": "waiting", "summary": "checks started",
+                                              "waiting_for": "the checks", "next_step": "push"}))
+    d = Daemon(p.base)
+
+    def runs():
+        return p.db.q("SELECT status, effort, note FROM runs WHERE task=? AND role='worker' ORDER BY id", (tid,))
+
+    assert _run_until(d, p, lambda: len(runs()) == 2 and all(r["status"] != "running" for r in runs()))
+    assert [json.loads(r["note"])["wake"] for r in runs()] == [
+        {"tier": "light", "escalated": False}, {"tier": "standard", "escalated": True}]
+    assert [r["effort"] for r in runs()] == ["low", "high"]
 
 
 def test_a_mechanical_wake_prompt_says_to_do_the_step_and_a_refused_wake_keeps_it(env):

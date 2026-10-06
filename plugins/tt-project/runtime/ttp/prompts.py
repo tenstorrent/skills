@@ -191,7 +191,8 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
                     "is over, do that step in this run and hand off its outcome. Only if it stops being mechanical "
                     "(a conflict to resolve, a failure to judge)"
                     + (f", hand off `waiting` with `retry_after_s: 0` and `wake_tier: \"{task['tier']}\"`: the task "
-                       "runs again now at its own tier, without costing an attempt.\n" if run_tier != task["tier"]
+                       "runs again now at its own tier, without costing an attempt; leave out `next_step` then.\n"
+                       if run_tier != task["tier"]
                        else ", go on with it in this run.\n"))
     elif wake and run_tier != task["tier"] and not wake.get("escalated"):
         history += (f"This run is a {run_tier} wake: check whether the wait is over. If it is and substantial "

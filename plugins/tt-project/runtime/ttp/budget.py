@@ -517,11 +517,12 @@ def wake_tier(tier: str, prev: dict) -> str | None:
     when the run is no wake. Most wakes only check whether the wait is over, so a hand-off that
     names what it waits on wakes at light unless it asks for a `wake_tier`; never above the task's
     own tier. A hand-off whose `next_step` names the one mechanical step left (say `push`) wakes at
-    light whatever it asked: that run does the step itself."""
+    light whatever it asked: that run does the step itself, unless that light run escalated
+    (`escalated_wake`): then the step is no longer mechanical and the hand-off's `wake_tier` wins."""
     if not isinstance(prev, dict) or prev.get("status") != "waiting":
         return None
     tier = tier if tier in TIER_ORDER else "standard"
-    want = "light" if next_step(prev) else prev.get("wake_tier")
+    want = "light" if next_step(prev) and not prev.get("escalated_wake") else prev.get("wake_tier")
     if want not in TIER_ORDER:
         want = "light" if prev.get("retry_when") or prev.get("waiting_for") else tier
     return min(want, tier, key=TIER_ORDER.index)
