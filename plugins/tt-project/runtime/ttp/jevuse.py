@@ -9,10 +9,11 @@ coordinator wake?) and any later one, such as picking a task's effort. Each call
 outcome where one becomes known (`resolve`). A call made with `settle_s` counts as right once that
 long passed without an outcome; without it, a call's outcome is known only once resolved.
 
-Over a rolling window of `jev.window_days` with at least `jev.min_calls` calls, a use whose net
-saving (avoided cost of its right or unresolved calls, plus any negative saving, i.e. extra cost a
-call caused, minus the cost of all its calls) is not
-positive is switched off once and reported (`review`). `jev.uses.<use>` = "on" or "off" forces a
+Over a rolling window of `jev.window_days`, a use whose net saving (avoided cost of its right or
+unresolved calls, plus any negative saving, i.e. extra cost a call caused, minus the cost of all its
+calls) is not positive is switched off once and reported (`review`). It is judged once it made
+`jev.min_calls` calls in the window, or once its first call is a full window old (a use called
+rarely is judged on what it did; one that saved nothing measurable is not positive). `jev.uses.<use>` = "on" or "off" forces a
 use either way; "auto" (or unset) leaves it to the review.
 """
 from __future__ import annotations
@@ -87,12 +88,29 @@ def resolve(db: DB, call_id: int, right: bool, note: str = "", now: float | None
                            ("right" if right else "wrong", now, note[:300] or None, call_id)).rowcount > 0
 
 
-def mean_turn_cost(db: DB, cfg: dict, now: float | None = None) -> float:
-    """The mean cost of a finished coordinator turn over the window: the price of a wake avoided."""
+def mean_turn_cost(db: DB, cfg: dict, now: float | None = None, effort: str | None = None) -> float:
+    """The mean cost of a finished coordinator turn over the window (at `effort` when given): the
+    price of a wake avoided. WAKE_COST_FALLBACK_USD while no such turn was measured."""
     now = time.time() if now is None else now
-    row = db.one("SELECT AVG(cost_usd) c FROM runs WHERE role='coordinator' AND status!='running' "
-                 "AND cost_usd>0 AND started>=?", (now - window_s(cfg),))
+    sql = ("SELECT AVG(cost_usd) c FROM runs WHERE role='coordinator' AND status!='running' "
+           "AND cost_usd>0 AND started>=?")
+    args: tuple = (now - window_s(cfg),)
+    if effort is not None:
+        sql, args = sql + " AND COALESCE(effort,'')=?", args + (effort,)
+    row = db.one(sql, args)
     return float(row["c"]) if row and row["c"] else WAKE_COST_FALLBACK_USD
+
+
+def coordinator_effort(cfg: dict) -> str:
+    """The coordinator's low (unraised) effort: coordinator.effort, else its tier's on the core provider."""
+    c = cfg.get("coordinator") or {}
+    tiers = ((cfg.get("providers") or {}).get(cfg.get("core_provider") or "claude") or {}).get("tiers") or {}
+    return str(c.get("effort") or "") or str((tiers.get(c.get("tier") or "light") or {}).get("effort") or "")
+
+
+def low_turn_cost(db: DB, cfg: dict, now: float | None = None) -> float:
+    """The mean cost of a low-effort coordinator turn: what a wake Jev kept from happening would have cost."""
+    return mean_turn_cost(db, cfg, now, effort=coordinator_effort(cfg))
 
 
 def stats(db: DB, cfg: dict, now: float | None = None) -> dict[str, dict]:
@@ -117,8 +135,12 @@ def review(db: DB, cfg: dict, now: float | None = None) -> list[tuple[str, dict]
         off = db.kv(OFF_KEY, {}) or {}
         cleared = {u for u in off if mode(cfg, u) == "on"}
         for use, s in stats(db, cfg, now).items():
-            if use in off or mode(cfg, use) != "auto" or s["calls"] < min_calls(cfg) or s["net"] > 0:
+            if use in off or mode(cfg, use) != "auto" or s["net"] > 0:
                 continue
+            if s["calls"] < min_calls(cfg):
+                first = db.one("SELECT MIN(ts) t FROM jev_calls WHERE use=?", (use,))
+                if not first or first["t"] is None or now - float(first["t"]) < window_s(cfg):
+                    continue
             off[use] = {"at": now, "why": f"net {_usd(s['net'])} over {s['calls']} calls"}
             out.append((use, s))
         if out or cleared:

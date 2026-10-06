@@ -775,8 +775,9 @@ def test_jev_skipped_wake_is_priced_at_a_coordinator_turn_and_a_later_wake_marks
     from ttp.screen import screen
     now = time.time()
     for cost in (0.3, 0.5, 0.0):   # unmetered turns do not count
-        p.db.x("INSERT INTO runs(role,status,started,ended,cost_usd) VALUES('coordinator','ok',?,?,?)",
+        p.db.x("INSERT INTO runs(role,status,started,ended,cost_usd,effort) VALUES('coordinator','ok',?,?,?,'low')",
                (now - 3600, now - 3500, cost))
+    p.set_config("coordinator.effort", "low")
     cfg = p.config()
     assert jevuse.mean_turn_cost(p.db, cfg) == pytest.approx(0.4)
     quiet = _FakeJev(0.1, 0.0)
@@ -802,6 +803,74 @@ def test_jev_skipped_wake_is_priced_at_a_coordinator_turn_and_a_later_wake_marks
     cid = jevuse.record(p.db, "effort", {"effort": "high"}, 0.0002, avoided_usd=1.5, ref="task:7")
     assert jevuse.resolve(p.db, cid, True) and not jevuse.resolve(p.db, cid, False)
     assert jevuse.stats(p.db, cfg)["effort"]["net"] == pytest.approx(1.5 - 0.0002)
+
+
+def test_jev_screening_skip_is_priced_at_a_low_turn_settles_against_later_wakes_and_tasks(env):
+    p = make(env)
+    from ttp import daemon as dm
+    from ttp import jevuse
+    from ttp import screen as scr
+    now = time.time()
+    p.set_config("coordinator.effort", "low")
+    cfg = p.config()
+    quiet = _FakeJev(0.1, 0.0)
+    # No low-effort turn measured yet: the documented constant prices the skipped wake.
+    a = scr.screen(p.db, cfg, "watcher:hw", "box-a: link retry failed", jev=quiet)
+    assert not a.wake and p.db.one("SELECT avoided_usd FROM jev_calls")["avoided_usd"] == jevuse.WAKE_COST_FALLBACK_USD
+    # A raised turn does not count: only the coordinator's low (unraised) effort prices a skip.
+    for cost, effort in ((0.2, "low"), (0.4, "low"), (2.0, "high")):
+        p.db.x("INSERT INTO runs(role,status,started,ended,cost_usd,effort) VALUES('coordinator','ok',?,?,?,?)",
+               (now - 3600, now - 3500, cost, effort))
+    assert jevuse.coordinator_effort(cfg) == "low"
+    assert jevuse.low_turn_cost(p.db, cfg) == pytest.approx(0.3)
+    b = scr.screen(p.db, cfg, "watcher:hw", "box-b: fan speed check failed", jev=quiet)
+    c = scr.screen(p.db, cfg, "watcher:hw", "box-c: disk scrub failed", jev=quiet)
+    d = scr.screen(p.db, cfg, "watcher:hw", "box-d: clock sync failed", jev=quiet)
+    calls = {r["ref"]: r for r in p.db.q("SELECT * FROM jev_calls")}
+    assert calls[f"issue:{b.issue_id}"]["avoided_usd"] == pytest.approx(0.3)
+    # Within the window: a's condition woke the coordinator anyway, a task quotes b's title.
+    p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
+           (time.time() + 1, "watcher:hw", "observation", a.fingerprint, "high", "box-a: link retry failed", "done"))
+    p.db.x("INSERT INTO tasks(created,title,spec) VALUES(?,?,?)",
+           (time.time() + 1, "Check fans", "The watcher said: box-b: fan speed check failed. Look into it."))
+    assert scr.settle_jev(p.db, time.time() + 5) == 2
+    out = {r["ref"]: r for r in p.db.q("SELECT ref, outcome, note FROM jev_calls")}
+    assert out[f"issue:{a.issue_id}"]["outcome"] == "wrong" and "woke the coordinator" in out[f"issue:{a.issue_id}"]["note"]
+    assert out[f"issue:{b.issue_id}"]["outcome"] == "wrong" and "was about the issue" in out[f"issue:{b.issue_id}"]["note"]
+    assert out[f"issue:{c.issue_id}"]["outcome"] is None and out[f"issue:{d.issue_id}"]["outcome"] is None
+    # After the window: a task about c, or a wake of d, comes too late to count against the skip.
+    late = now + scr.JEV_SETTLE_S + 3600
+    p.db.x("INSERT INTO tasks(created,title,spec) VALUES(?,?,?)", (late - 60, "box-c: disk scrub failed", ""))
+    p.db.x("UPDATE issues SET status='fixed' WHERE id=?", (d.issue_id,))
+    p.db.x("UPDATE jev_calls SET settle_at=? WHERE outcome IS NULL", (time.time() - 1,))
+    assert scr.screen(p.db, cfg, "watcher:hw", "box-d: clock sync failed", "high", jev=quiet).wake
+    assert p.db.one("SELECT outcome FROM jev_calls WHERE ref=?", (f"issue:{d.issue_id}",))["outcome"] is None
+    d_ = dm.Daemon(p.base)
+    d_.cfg = cfg
+    d_.review_jev(every_s=0)   # the daemon settles before it reviews
+    s = jevuse.stats(p.db, cfg)["screen"]
+    assert (s["right"], s["wrong"]) == (2, 2)
+    assert s["saved"] == pytest.approx(0.6) and "errors 2/4 (50%)" in jevuse.lines(p.db, cfg)[0]
+    assert p.db.one("SELECT note FROM jev_calls WHERE ref=?", (f"issue:{c.issue_id}",))["note"] == "stayed quiet"
+
+
+def test_jev_use_called_rarely_is_judged_once_its_first_call_is_a_window_old(env):
+    p = make(env)
+    from ttp import jevuse
+    cfg = p.config()
+    now = time.time()
+    week = jevuse.window_s(cfg)
+    # Fewer calls than min_calls and nothing saved: not judged until a full window has passed.
+    for _ in range(3):
+        jevuse.record(p.db, "screen", {"wake": True}, 0.001, now=now - 3600)
+    assert jevuse.review(p.db, cfg, now) == []
+    jevuse.record(p.db, "screen", {"wake": True}, 0.001, now=now - week - 60)   # a first call, a window ago
+    [(use, s)] = jevuse.review(p.db, cfg, now)
+    assert use == "screen" and s["calls"] == 3 and s["saved"] == 0 and not jevuse.allowed(p.db, cfg, "screen")
+    # A rare use that does save stays on.
+    jevuse.record(p.db, "effort", {"effort": "low"}, 0.001, avoided_usd=0.5, now=now - week - 60)
+    jevuse.record(p.db, "effort", {"effort": "low"}, 0.001, avoided_usd=0.5, now=now - 60)
+    assert jevuse.review(p.db, cfg, now) == [] and jevuse.allowed(p.db, cfg, "effort")
 
 
 def test_daemon_reports_a_jev_use_switched_off_once_and_feeds_the_daily_review(env):

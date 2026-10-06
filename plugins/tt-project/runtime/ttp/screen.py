@@ -155,24 +155,64 @@ def _issue(db: DB, fp: str, source: str, title: str, retitle: str | None, hint: 
 
 JEV_USE = "screen"
 JEV_SETTLE_S = 3 * 86400   # a wake Jev skipped counts as right once its issue stayed quiet this long
+TASK_MATCH_MIN = 12        # an issue title this long or longer, found in a task's title or spec, makes it about it
 
 
 def _jev_missed(db: DB, row: dict, v: Verdict) -> Verdict:
-    """A known issue waking now that Jev kept quiet when it was new: that skip was wrong."""
+    """A known issue waking now, within the settle window, that Jev kept quiet when it was new: that
+    skip was wrong."""
     if v.wake:
         try:
             seen = json.loads(row.get("screen") or "{}")
         except ValueError:
             seen = {}
         if isinstance(seen, dict) and seen.get("jev_call") and seen.get("skipped"):
-            jevuse.resolve(db, int(seen["jev_call"]), False, v.reason)
+            call = db.one("SELECT settle_at FROM jev_calls WHERE id=?", (int(seen["jev_call"]),))
+            if call and (call["settle_at"] is None or time.time() <= float(call["settle_at"])):
+                jevuse.resolve(db, int(seen["jev_call"]), False, v.reason)
     return v
+
+
+def settle_jev(db: DB, now: float | None = None) -> int:
+    """Settle the open screening calls that kept a wake from happening. A skip is a miss when, within
+    its settle window, the issue woke the coordinator after all (an event with its fingerprint) or a
+    task was about it (the issue names the task, or the task's title or spec quotes the issue's
+    title); it is right once the window passed without either. Returns how many it settled."""
+    now = time.time() if now is None else now
+    n = 0
+    for c in db.q("SELECT id, ts, ref, settle_at FROM jev_calls WHERE use=? AND outcome IS NULL "
+                  "AND settle_at IS NOT NULL AND ref LIKE 'issue:%'", (JEV_USE,)):
+        try:
+            issue = db.one("SELECT * FROM issues WHERE id=?", (int(str(c["ref"]).split(":", 1)[1]),))
+        except ValueError:
+            issue = None
+        if not issue:
+            continue
+        start, end = float(c["ts"]), min(now, float(c["settle_at"]))
+        why = ""
+        ev = db.one("SELECT ts FROM events WHERE fingerprint=? AND ts>? AND ts<=? ORDER BY ts LIMIT 1",
+                    (issue["fingerprint"], start, end))
+        if ev:
+            why = f"the issue woke the coordinator {(float(ev['ts']) - start) / 3600:.1f} h later"
+        else:
+            title = (issue["title"] or "").strip().lower()
+            for t in db.q("SELECT id, title, spec FROM tasks WHERE created>? AND created<=?", (start, end)):
+                if t["id"] == issue["task"] or (len(title) >= TASK_MATCH_MIN and title in
+                                                f"{t['title'] or ''}\n{t['spec'] or ''}".lower()):
+                    why = f"task #{t['id']} was about the issue"
+                    break
+        if why:
+            n += jevuse.resolve(db, int(c["id"]), False, why, now=now)
+        elif now > float(c["settle_at"]):
+            n += jevuse.resolve(db, int(c["id"]), True, "stayed quiet", now=now)
+    return n
 
 
 def _judge(db: DB, cfg: dict, source: str, text: str, hint: str | None, jev,
            floor: int) -> tuple[str, str, str, dict]:
     """Severity of a new issue: the watcher's hint, else rules, refined by Jev when configured and
-    its screening use is on (see jevuse). Each Jev call is logged with the coordinator wake it skipped."""
+    its screening use is on (see jevuse). Each Jev call is logged with the coordinator wake it skipped,
+    priced at a low-effort coordinator turn, and settled later (settle_jev)."""
     rules = severity = hint or rule_severity(text)
     verdict_src, reason, info = "rules", f"rule severity {severity}", {}
     if jev is not None and jev.enabled() and jevuse.allowed(db, cfg, JEV_USE):
@@ -199,7 +239,7 @@ def _judge(db: DB, cfg: dict, source: str, text: str, hint: str | None, jev,
                 skipped = SEVERITY_RANK.get(rules, 1) >= floor > SEVERITY_RANK.get(severity, 1)
                 info = {"skipped": skipped, "jev_call": jevuse.record(
                     db, JEV_USE, decision, getattr(jev, "last_cost", 0.0),
-                    avoided_usd=jevuse.mean_turn_cost(db, cfg) if skipped else 0.0,
+                    avoided_usd=jevuse.low_turn_cost(db, cfg) if skipped else 0.0,
                     settle_s=JEV_SETTLE_S if skipped else None)}
         except JevOutOfFunds:
             # The rules decide in this same pass: screening again would count earlier items twice.

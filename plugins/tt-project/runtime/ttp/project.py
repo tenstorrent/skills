@@ -124,8 +124,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # whenever delivery has a review step (review_before_pr or a push_branch); auto_notes ends each
     # such review's spec.
     "review": {"light_max_lines": 60, "risky_paths": [], "auto": True, "auto_notes": ""},
-    # Each Jev use (e.g. "screen") is switched off once its net saving over window_days, with at
-    # least min_calls calls, is not positive; uses.<use> = "on" or "off" forces it (see jevuse.py).
+    # Each Jev use (e.g. "screen") is switched off once its net saving over window_days is not
+    # positive, judged after min_calls calls or once its first call is a window old; uses.<use> =
+    # "on" or "off" forces it (see jevuse.py).
     "jev": {"enabled": "auto", "window_days": 7, "min_calls": 30, "uses": {}},
     "web": {"bind": "127.0.0.1", "port": 0},
     "power": {"keep_awake": "on_ac"},

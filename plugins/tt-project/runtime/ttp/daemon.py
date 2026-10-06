@@ -487,11 +487,13 @@ class Daemon:
             self._progress()
 
     def review_jev(self, every_s: float = 600) -> None:
-        """Switch off the Jev uses that do not save money (jevuse.review) and report each one once."""
+        """Settle screening calls (scr.settle_jev), then switch off the Jev uses that do not save money
+        (jevuse.review) and report each one once."""
         now = time.time()
         if now - getattr(self, "_jev_reviewed", 0.0) < every_s:
             return
         self._jev_reviewed = now
+        scr.settle_jev(self.p.db, now)
         for use, s in jevuse.review(self.p.db, self.cfg, now):
             self.alert(f"jev-off:{use}", jevuse.off_text(use, s, self.cfg), severity="low", every_s=0)
 
