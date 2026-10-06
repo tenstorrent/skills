@@ -23588,7 +23588,7 @@ def _ci_gh(now, job_started, past_mins=(10, 12, 14), live=True):
 
 
 def test_ci_probe_wakes_on_a_job_past_three_times_the_branch_median(env, monkeypatch, capsys):
-    """tt-buddy note #127: a task waiting on CI woke only once the run completed, so a hung job kept
+    """A task waiting on CI woke only once the run completed, so a hung job kept
     it asleep until GitHub's 6 h job limit. Past 3x the job's median (12 min here) it exits 0 and says why."""
     from ttp import ciwait, cli
     now = time.time()
