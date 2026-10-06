@@ -949,8 +949,8 @@ def push(repo: Path, remote: str, branch: str, checks: list[str], rounds: int = 
          timed: Callable[[float], None] | None = None, exclude: list[str] | None = None) -> int:
     """Rebase HEAD onto remote/branch, run `checks` on the result, and push it if the remote did not
     move meanwhile; if it did, start over, at most `rounds` times. With no checks only a change that
-    touches nothing but docs goes through, and a change adding or modifying a file `exclude` matches
-    (delivery.push_exclude_paths, `excluded`) does not. `hold` takes the push lock once the quick refusals
+    touches nothing but docs goes through, and none that adds or modifies a file `exclude` matches
+    (delivery.push_exclude_paths, `excluded`). `hold` takes the push lock once the quick refusals
     passed: it returns the held lock, or None when it stayed busy (BUSY). `version_bump` (bump_of)
     bumps the version after each rebase; `timed` gets the seconds of each full, passing check run."""
     repo = Path(_git(repo, "rev-parse", "--show-toplevel").stdout.strip() or repo)
