@@ -125,9 +125,36 @@ def _utc(t: float | None = None) -> str:
 
 
 def _write(path: Path, text: str) -> None:
+    """project.durable_write's standard-library twin (this file runs alone on the device host): a power
+    cut leaves the old content or the new, never a half-written file."""
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(text)
+    with open(tmp, "w") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, path)
+    _sync_dir(path.parent)
+
+
+def _sync_dir(d: Path) -> None:
+    try:
+        fd = os.open(d, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _append(path: Path, line: str) -> None:
+    """Append one line and sync it: the drop counts decide when a config's jobs are skipped."""
+    with open(path, "a") as f:
+        f.write(line)
+        f.flush()
+        os.fsync(f.fileno())
 
 
 def _load(path: Path) -> dict:
@@ -471,10 +498,8 @@ class Runner:
     def record_drop(self, job: str, spec: dict, st: dict, rc, how: str, evidence: str) -> None:
         line = (f"utc={_utc()} job={job} task={spec.get('task', '')} config={spec['config']} attempt={st['cur']['n']} "
                 f"rc={rc} kind={how or 'drop'} evidence=\"{evidence[:300]}\"")
-        with open(self.d / "drops.log", "a") as f:
-            f.write(line + "\n")
-        with open(self.d / "configs" / spec["config"], "a") as f:
-            f.write(f"{_utc()} {job} attempt {st['cur']['n']}\n")
+        _append(self.d / "drops.log", line + "\n")
+        _append(self.d / "configs" / spec["config"], f"{_utc()} {job} attempt {st['cur']['n']}\n")
         st.setdefault("drops", []).append(f"{_utc()} attempt {st['cur']['n']} rc={rc} {how or 'drop'}")
         self.log(f"{job}: DROP attempt {st['cur']['n']} rc={rc} {how or ''} {evidence[:200]}")
 
