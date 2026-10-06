@@ -6421,6 +6421,62 @@ def _conflicting_upgrade(env, monkeypatch):
     return p, restarts
 
 
+def test_an_upgrade_settles_conflicts_that_need_no_judgment_without_a_task(env, monkeypatch, capsys):
+    """Both sides added a section at one spot, or upstream ships the project's own fix: `ttp upgrade`
+    finishes the merge itself and queues no model task."""
+    p = make(env)
+    from ttp import cli, service
+    restarts = []
+    monkeypatch.setattr(service, "restart", lambda p: restarts.append(1) or "restarted")
+    h = p.harness
+    worker = (h / "prompts" / "worker.md").read_text()
+    review = (h / "prompts" / "kind-harness.md").read_text()
+    (h / "prompts" / "worker.md").write_text(worker + "\n## Long waits\nThis project's own rule.\n")
+    (h / "prompts" / "kind-harness.md").write_text(review + "Never edit the live harness.\n")
+    _git_out(h, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "local prompts")
+    _install_template(env, {"worker.md": worker + "\n## Shared clusters\nUpstream's new rule.\n",
+                            "kind-harness.md": review + "Never edit the live harness.\nCheck it first.\n"})
+    cli.main(["upgrade", "demo"])
+    out = capsys.readouterr().out
+    assert "settled the template merge's conflicts" in out and "worker.md" in out
+    text = (h / "prompts" / "worker.md").read_text()
+    assert text.index("This project's own rule.") < text.index("Upstream's new rule.") and "<<<<<<<" not in text
+    assert (h / "prompts" / "kind-harness.md").read_text() == review + "Never edit the live harness.\nCheck it first.\n"
+    assert restarts == [1] and not p.db.q("SELECT id FROM tasks WHERE kind='harness'")
+    assert not _git_out(h, "status", "--porcelain") and len(_git_out(h, "worktree", "list").splitlines()) == 1
+
+
+def test_a_conflicting_upgrade_queues_at_most_one_task_a_day(env, monkeypatch, capsys):
+    """Each release would otherwise queue its own model task for the same conflict: within a day of
+    the last one, the upgrade only records that it waits, and the daemon tries again after."""
+    from ttp import cli, release
+    p, restarts = _conflicting_upgrade(env, monkeypatch)
+    with pytest.raises(SystemExit):
+        cli.main(["upgrade", "demo"])
+    first = p.db.one("SELECT id FROM tasks WHERE kind='harness'")["id"]
+    p.db.update_task(first, status="done")
+    commit = env["home"] / "lib" / "current" / "runtime" / "ttp" / "SOURCE_COMMIT"
+    commit.write_text("bbbb2222\n")      # the next release, the same conflict
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo"])
+    assert e.value.code == 1 and f"Harness task #{first} took on a template merge" in capsys.readouterr().out
+    assert [t["id"] for t in p.db.q("SELECT id FROM tasks WHERE kind='harness'")] == [first] and not restarts
+    rec = p.db.kv(release.KV_AUTO)
+    assert rec["outcome"] == "deferred" and rec["key"].endswith(" bbbb2222") and rec["until"] > time.time()
+    d = {"key": rec["key"]}
+    assert "less than a day ago" in release.hold_reason(p, d)
+    p.db.set_kv(release.KV_RELEASE, {"installed": "x (bbbb2222)", "current": "y", "key": rec["key"], "newer": True})
+    assert "next try after" in release.line(p, p.db, {})
+    # a day later the conflict gets a task of its own again
+    p.db.x("UPDATE tasks SET created=created-? WHERE id=?", (release.TASK_EVERY_S + 60, first))
+    p.db.set_kv(release.KV_AUTO, {**rec, "until": time.time() - 1})
+    assert release.hold_reason(p, d) == ""
+    with pytest.raises(SystemExit):
+        cli.main(["upgrade", "demo"])
+    assert len(p.db.q("SELECT id FROM tasks WHERE kind='harness'")) == 2
+
+
 def test_a_second_upgrade_is_refused_while_one_holds_the_harness_upgrade_lock(env, monkeypatch):
     from ttp import cli, locks, release, service
     p = make(env)
@@ -11892,6 +11948,23 @@ def test_merge3_keeps_lines_both_sides_added_and_leaves_real_conflicts(env):
         assert merge3(ours, old, theirs, py=True) == ours + "\n\ndef b():\n    return 2\n", "PEP 8's two blank lines"
         assert merge3(ours, old, theirs) == ours + gap + "def b():\n    return 2\n", "elsewhere each side's spacing"
     assert merge3(ours, old, old + "Y = 2\n", py=True) == ours + "Y = 2\n"
+
+
+def test_merge3_taken_in_takes_theirs_only_where_it_holds_our_change(env):
+    """`taken_in` (template upgrades): a conflict whose local change upstream already ships takes
+    upstream's side; any other conflict is still left for judgment, and the default is unchanged."""
+    from ttp.batch import merge3
+    base, ours = "a\nline1\nline2\nz\n", "a\nline1 fixed\nline2\nz\n"
+    theirs = "a\nline1 fixed\nline2 improved\nz\n"
+    assert merge3(ours, base, theirs) is None
+    assert merge3(ours, base, theirs, taken_in=True) == theirs
+    assert merge3("a\nX fix\nz\n", "a\nz\n", "a\nW\nX fix\nz\n", taken_in=True) == "a\nW\nX fix\nz\n"
+    assert merge3("a\nX\nz\n", "a\nz\n", "a\nY\nz\n", taken_in=True) == "a\nX\nY\nz\n", "additions keep both"
+    assert merge3("a\nmine\nz\n", "a\nold\nz\n", "a\nnew\nz\n", taken_in=True) is None, "both changed it"
+    assert merge3("a\nz\n", "a\nold\nz\n", "a\nold new\nz\n", taken_in=True) is None, \
+        "ours removed a line theirs changed"
+    assert merge3("a\nfix\nz\n", "a\nold\nz\n", "a\nfix\nold\nz\n", taken_in=True) is None, \
+        "theirs keeps a line ours removed"
 
 
 def test_merge3_never_keeps_a_line_twice_or_moves_one_into_another_block(env):

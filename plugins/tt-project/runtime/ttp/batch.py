@@ -213,12 +213,13 @@ def _sweep_after_push(p: Project, repo: Path) -> None:
 
 # Conflicts that need no judgment ---------------------------------------------------------------------
 
-def merge3(ours: str, base: str, theirs: str, py: bool = False) -> str | None:
+def merge3(ours: str, base: str, theirs: str, py: bool = False, taken_in: bool = False) -> str | None:
     """git's three-way merge of the texts, where each conflict in which both sides only added lines
     at one spot (an empty base section) keeps both: ours first, then theirs (in Python, see _seam).
-    None when any other conflict remains, or when keeping both could be wrong (_clash). The conflict
-    markers carry a random tag, so file content never passes for one; a hunk whose base-to-end part
-    holds more than one separator line is not read as an addition."""
+    With `taken_in`, a conflict whose change on our side theirs already holds (_taken_in) takes
+    theirs. None when any other conflict remains, or when keeping both could be wrong (_clash). The
+    conflict markers carry a random tag, so file content never passes for one; a hunk whose
+    base-to-end part holds more than one separator line is not read."""
     tag = secrets.token_hex(8)
     # built, not spelled out: a literal marker line would make this file read as a conflicted one
     start, mid, end = (f"{c * 7} {side}-{tag}" for c, side in (("<", "ours"), ("|", "base"), (">", "theirs")))
@@ -246,19 +247,39 @@ def merge3(ours: str, base: str, theirs: str, py: bool = False) -> str | None:
         while j < len(lines) and lines[j].rstrip("\r\n") != mid:
             mine.append(lines[j])
             j += 1
-        if j + 1 >= len(lines) or lines[j + 1].rstrip("\r\n") != sep:
+        j, old = j + 1, []
+        while j < len(lines) and lines[j].rstrip("\r\n") != sep:
+            old.append(lines[j])
+            j += 1
+        if old and not taken_in:
             return None                 # the base section is not empty: a real conflict
-        j, theirs_lines = j + 2, []
+        j, theirs_lines = j + 1, []
         while j < len(lines) and lines[j].rstrip("\r\n") != end:
             if lines[j].rstrip("\r\n") == sep:
                 return None             # ambiguous: content that looks like the separator
             theirs_lines.append(lines[j])
             j += 1
-        if j >= len(lines) or _clash(mine, theirs_lines, py):
+        if j >= len(lines):
             return None
-        res += _seam(mine, theirs_lines) if py else mine + theirs_lines
+        if taken_in and _taken_in(mine, old, theirs_lines):
+            res += theirs_lines
+        elif old or _clash(mine, theirs_lines, py):     # a real conflict
+            return None
+        else:
+            res += _seam(mine, theirs_lines) if py else mine + theirs_lines
         i = j + 1
     return "".join(res)
+
+
+def _taken_in(mine: list[str], old: list[str], theirs: list[str]) -> bool:
+    """Whether theirs already holds our side's change of the `old` lines (a local fix the other side
+    shipped too): ours added a line, every line ours added is in theirs, and no line ours removed
+    is. A change of ours that only removes lines is left for judgment: theirs may have edited them.
+    Lines compare stripped; lines without a letter or digit are left out."""
+    def said(lines: list[str]) -> set[str]:
+        return {s for s in (line.strip() for line in lines) if any(c.isalnum() for c in s)}
+    m, o, t = said(mine), said(old), said(theirs)
+    return bool(m - o) and (m - o) <= t and not (o - m) & t
 
 
 def _clash(mine: list[str], theirs: list[str], py: bool) -> bool:
@@ -336,13 +357,13 @@ def _show(wt: Path, stage: int, path: str) -> bytes | None:
     return r.stdout if r.returncode == 0 else None
 
 
-def settle(wt: Path, path: str, version_files: list[str]) -> bool:
+def settle(wt: Path, path: str, version_files: list[str], taken_in: bool = False) -> bool:
     """Settle the conflicted `path` of a stopped rebase in `wt`, if it needs no judgment, and write
     the result: True when settled. Ours (stage 2) is the batch head, theirs (stage 3) the entry.
     In a version file every stage first takes the batch head's version, so a version line alone
     never conflicts. A pure addition keeps both sides (merge3), unless in a .py file that leaves a
     top-level def or class name twice where neither side had it twice (it would silently shadow a
-    test). A file both sides created is never settled."""
+    test). `taken_in` is merge3's. A file both sides created is never settled."""
     ours, base, theirs = _show(wt, 2, path), _show(wt, 1, path), _show(wt, 3, path)
     if ours is None or theirs is None or base is None:
         return False                    # deleted on one side, or created on both
@@ -355,7 +376,7 @@ def settle(wt: Path, path: str, version_files: list[str]) -> bool:
     if path in version_files and (mv := push.VERSION_RE.search(o)):
         v = ".".join(mv.group(2, 3, 4))
         b, t = (push.VERSION_RE.sub(lambda m: f"{m.group(1)}{v}{m.group(5)}", x, count=1) for x in (b, t))
-    merged = merge3(o, b, t, py=path.endswith(".py"))
+    merged = merge3(o, b, t, py=path.endswith(".py"), taken_in=taken_in)
     if merged is None:
         return False
     if path.endswith(".py") and _duplicates(merged) - _duplicates(o) - _duplicates(t):

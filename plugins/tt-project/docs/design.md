@@ -113,8 +113,10 @@ What each supported CLI offers, with doc links: [providers.md](providers.md).
   available, harness on <current>`. With `upgrade.auto` on (the default) the daemon runs the
   installed `ttp upgrade <name> --auto` for its own project only, detached, when no push and no
   other upgrade is in flight. That restarts the daemon (workers are kept) and posts one low
-  notify. Each release is tried once: a merge conflict leaves one harness task and no hourly
-  retries. `ttp config <name> upgrade.auto false` opts out; `ttp upgrade <name>` then applies it.
+  notify. Each release is tried once: conflicts that need no judgment (both sides only added at
+  one spot, or upstream already ships the project's change) are settled without a model; any
+  other conflict leaves one harness task and no hourly retries. At most one such task is queued
+  a day; a conflict within a day of the last one waits and is tried again after it. `ttp config <name> upgrade.auto false` opts out; `ttp upgrade <name>` then applies it.
 - How a release reaches `lib/current`: `ttp setup`, run from a plugin's root, copies that plugin
   into `~/.tt-project/lib/<version>` and points `lib/current` at it. It refuses to replace a
   newer installed version unless run with `--force`, which leaves a `lib/forced-downgrade` marker

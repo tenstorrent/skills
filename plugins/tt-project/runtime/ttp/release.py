@@ -21,6 +21,7 @@ from .project import HOME_DIR, Project, durable_write, fsync_dir
 CHECK_S = 3600          # how often the daemon compares the installed release with its harness
 HELD_RECHECK_S = 300    # a release held back by a push or an upgrade in flight is looked at again this soon
 UPGRADE_TASK_TITLE = "Finish the tt-project template upgrade"
+TASK_EVERY_S = 86400    # at most one upgrade task per project this often; a conflict meanwhile waits
 KV_RELEASE, KV_AUTO = "release", "upgrade_auto"
 
 
@@ -192,6 +193,20 @@ def open_upgrade_task(p: Project, db=None) -> int | None:
     return int(t["id"]) if t else None
 
 
+def recent_upgrade_task(p: Project) -> dict | None:
+    """The newest upgrade task queued less than TASK_EVERY_S ago, whatever its status."""
+    t = p.db.one("SELECT id, created FROM tasks WHERE kind='harness' AND title=? AND created > ? "
+                 "ORDER BY id DESC LIMIT 1", (UPGRADE_TASK_TITLE, time.time() - TASK_EVERY_S))
+    return dict(t) if t else None
+
+
+def defer(p: Project, auto: bool, key: str, frm: str, to: str, until: float, why: str) -> None:
+    """A conflicting merge queues no task before `until`: record it so the daemon tries this
+    release again then (hold_reason), and status says why it waits."""
+    rec = (p.db.kv(KV_AUTO) or {}) if auto else {"key": key, "from": frm, "to": to, "ts": time.time()}
+    p.db.set_kv(KV_AUTO, {**rec, "outcome": "deferred", "ended": time.time(), "until": until, "why": why})
+
+
 def push_in_flight(p: Project) -> bool:
     return any(h.startswith("push:") for h in locks.held(p.state / "locks"))
 
@@ -206,6 +221,10 @@ def hold_reason(p: Project, d: dict) -> str:
     if tid:
         return f"harness task #{tid} finishes an earlier upgrade"
     rec = p.db.kv(KV_AUTO) or {}
+    if rec.get("key") == d["key"] and rec.get("outcome") == "deferred":
+        if time.time() < float(rec.get("until") or 0):
+            return "the merge needs a harness task and one ran less than a day ago"
+        return ""
     if rec.get("key") == d["key"] and rec.get("outcome") != "held":
         return "already tried for this release"
     return ""
@@ -255,6 +274,9 @@ def line(p: Project, db, cfg: dict) -> str:
             if _taken(upgrade_lock(p)) or time.time() - float(rec.get("ts") or 0) < 900:
                 return text + " (upgrading now)"
             return text + " (the automatic upgrade did not finish: see logs/upgrade.log)"
+        if rec.get("outcome") == "deferred":
+            at = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(rec.get("until") or 0)))
+            return text + f" (the merge needs judgment; one harness task a day at most, next try after {at})"
         if rec.get("outcome") == "failed":
             return text + f" (the automatic upgrade failed: {rec.get('why') or 'see logs/upgrade.log'})"
     return text

@@ -2011,7 +2011,18 @@ def _upgrade(p: Project, auto: bool = False) -> None:
     merged, problem = _merge_upstream(h, p.state / "upgrade-merge", ident, base, kept)
     if problem:
         _ensure_git_ident(h)        # the task merges and commits in a fresh worktree of this repo
-        tid = release.open_upgrade_task(p) or p.db.add_task(
+        tid = release.open_upgrade_task(p)
+        last = None if tid else release.recent_upgrade_task(p)
+        if last:        # at most one model task a day: each release would otherwise queue its own
+            until = float(last["created"]) + release.TASK_EVERY_S
+            release.defer(p, auto, f"{new_v} {new_c}", f"{old_v} ({old_c})", f"{new_v} ({new_c})", until,
+                          problem[:300])
+            print(f"upgrade not applied; the running harness is unchanged. {problem}\nHarness task "
+                  f"#{last['id']} took on a template merge less than a day ago, so none is queued now; with "
+                  f"upgrade.auto on the daemon tries again after "
+                  f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(until))}.")
+            sys.exit(1)
+        tid = tid or p.db.add_task(
             release.UPGRADE_TASK_TITLE, _UPGRADE_TASK.format(problem=problem, name=p.name),
             kind="harness", tier="standard", priority=2, origin="user")
         if auto:
@@ -2275,6 +2286,20 @@ def _restore_from_upstream(tmp: Path, ident: list[str], cut: dict[str, str]) -> 
     return ""
 
 
+def _settle_merge(tmp: Path, ident: list[str], files: list[str]) -> str:
+    """Finish the stopped merge of upstream in worktree `tmp` without a model when no conflict needs
+    judgment (batch.settle): both sides only added lines at one spot, or upstream already holds the
+    project's change. Commits it and returns ""; else names the files left (nothing is committed)."""
+    from .batch import settle
+    left = [f for f in files if not settle(tmp, f, [], taken_in=True)]
+    if left or not files:
+        return "the merge conflicts in " + ", ".join(left)
+    _git(tmp, "add", "--", *files)
+    _git(tmp, *ident, "commit", "-q", "--no-edit", "--no-verify")
+    print("settled the template merge's conflicts, which needed no judgment: " + ", ".join(files))
+    return ""
+
+
 def _merge_upstream(h: Path, tmp: Path, ident: list[str], base: str = "main",
                     kept: dict[str, str] | None = None) -> tuple[str, str]:
     """Merge `upstream` into a scratch worktree of main and check the result compiles and imports.
@@ -2291,8 +2316,9 @@ def _merge_upstream(h: Path, tmp: Path, ident: list[str], base: str = "main",
         if r.returncode != 0:
             files = subprocess.run(["git", "-C", str(tmp), "diff", "--name-only", "--diff-filter=U"],
                                    capture_output=True, text=True).stdout.split()
-            return "", ("the merge conflicts in " + ", ".join(files) if files else
-                        "the merge failed: " + (r.stderr or r.stdout).strip()[-400:])
+            why = _settle_merge(tmp, ident, files)
+            if why:
+                return "", (why if files else "the merge failed: " + (r.stderr or r.stdout).strip()[-400:])
         emptied = _emptied(tmp, "HEAD", "upstream")
         if emptied:     # committed as "local changes" after a crash emptied them; nobody empties these on purpose
             _git(tmp, "checkout", "upstream", "--", *emptied)

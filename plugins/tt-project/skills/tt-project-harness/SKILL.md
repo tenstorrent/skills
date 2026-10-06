@@ -63,8 +63,10 @@ description: "Improve a tt-project's own harness — its coordinator and worker 
 ## Template updates
 
 - `ttp upgrade <name>` merges the installed tt-project template in a scratch worktree, checks the
-  runtime compiles and imports, then fast-forwards this harness. Otherwise the harness is left
-  as it was and a harness task is queued to finish the merge.
+  runtime compiles and imports, then fast-forwards this harness. It settles conflicts that need no
+  judgment itself (both sides only added at one spot, or upstream already ships the change).
+  Otherwise the harness is left as it was and a harness task is queued to finish the merge, at
+  most one a day.
 - Conflicts: keep this project's intent, take upstream fixes. Resolve them in a scratch worktree,
   never in the live harness, and apply the result with `ttp upgrade <name> --apply <commit>`.
 - One merge at a time: `ttp upgrade` holds the `harness-upgrade` lock for the whole merge, refuses
