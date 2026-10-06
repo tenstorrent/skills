@@ -19,7 +19,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import locks, push
-from .db import TERMINAL_TASK_STATES, dump_result, load_result
+from .db import (TERMINAL_TASK_STATES, continues_id, dependency_ids, dump_result, load_result, review_subject,
+                 reviews_task)
 from .project import Project, nice_level, push_allowed, push_queue_on, renice, write_json
 
 REF_PREFIX = "refs/ttp/push/"   # + row id: pins the approved commit until its row is settled
@@ -618,7 +619,84 @@ def _settle(p: Project, tid: int, b: dict, m: dict, now: float) -> None:
         _event(db, task, "task_done", f"#{tid} {task['title']} → done ({tail}, batch {b['id']}): {summary[:1200]}",
                queued=False)
         _reply(db, task, "done", result["summary"])
+        settle_reviewed(db, now, only=_covers(db, task, rows))
     # else: some of its rows are still approved or batched; it keeps waiting.
+
+
+# reviewed code tasks ------------------------------------------------------------------------------
+def _covers(db, review: dict, rows: list[dict], code: list[dict] | None = None) -> set[int]:
+    """The tasks whose work a review's push ships: its parent and dependencies, the task its title or
+    label names, the code tasks whose branch it pushed or (naming no subject) its spec names, and the
+    tasks each of those continues (a fix carries the change it fixes)."""
+    ids = {d for d in dependency_ids(review) if isinstance(d, int)}
+    ids |= {i for i in (review.get("parent"), review_subject(review)) if isinstance(i, int)}
+    branches = {r["branch"] for r in rows if r["branch"]}
+    if code is None:
+        code = db.q("SELECT id, branch, labels FROM tasks WHERE kind='code' AND branch IS NOT NULL AND branch!=''")
+    ids |= {t["id"] for t in code if t["branch"] in branches or reviews_task(review, t)}
+    out: set[int] = set()
+    while ids:
+        i = ids.pop()
+        if i not in out:
+            out.add(i)
+            t = db.one("SELECT labels FROM tasks WHERE id=? AND kind='code'", (i,))
+            if t and (c := continues_id(t)) is not None:
+                ids.add(c)
+    return out
+
+
+def settle_reviewed(db, now: float | None = None, only: set[int] | None = None) -> list[int]:
+    """Close the code tasks left in 'review' whose work shipped: the latest review covering one (see
+    _covers) is done, and the push queue pushed or landed its approval since the task entered review.
+    A review that settles a push conflict on a branch of its own ships the task as well. `only`
+    limits it to those task ids. Returns the ids closed. No git, no model."""
+    now = time.time() if now is None else now
+    todo = [t for t in db.q("SELECT * FROM tasks WHERE kind='code' AND status='review' ORDER BY id")
+            if only is None or t["id"] in only]
+    if not todo:
+        return []
+    since = db.review_since()
+    code = db.q("SELECT id, branch, labels FROM tasks WHERE kind='code' AND branch IS NOT NULL AND branch!=''")
+    reviews = db.q("SELECT * FROM tasks WHERE kind='review' AND status!='cancelled' AND id>? ORDER BY id DESC",
+                   (min(t["id"] for t in todo),))
+    rows: dict[int, list[dict]] = {}
+    for r in db.q("SELECT * FROM push_queue WHERE task IN (%s) ORDER BY id" % ",".join("?" * len(reviews)),
+                  [r["id"] for r in reviews]) if reviews else []:
+        rows.setdefault(r["task"], []).append(r)
+    covers: dict[int, set[int]] = {}
+    closed = []
+    for t in todo:
+        latest = None
+        for r in reviews:
+            if r["id"] not in covers:
+                covers[r["id"]] = _covers(db, r, rows.get(r["id"], []), code)
+            if t["id"] in covers[r["id"]]:
+                latest = r
+                break
+        if not latest or latest["status"] != "done":
+            continue
+        shipped = [x for x in rows.get(latest["id"], []) if x["status"] in ("pushed", "landed")
+                   and float(x["updated"] or 0) >= float(since.get(t["id"]) or 0)]
+        if not shipped:
+            continue
+        last = max(shipped, key=lambda x: x["id"])
+        tail = (f"shipped by review #{latest['id']}: " + (
+            f"pushed {_short(last['pushed_sha'])}" + (f" as {last['version']}" if last["version"] else "")
+            if last["status"] == "pushed" else f"already on {last['target']} at {_short(last['pushed_sha'])}"))
+        prev = load_result(t["result"])
+        summary = str(prev.get("summary") or "")
+        result = {**prev, "status": "done", "summary": f"{summary.rstrip()} ({tail})".strip()[:1500],
+                  "shipped_by": latest["id"],
+                  "pushed": [{"branch": x["branch"], "head": x["head"], "sha": x["pushed_sha"], "version": x["version"],
+                              "batch": x["batch"], "status": x["status"]} for x in shipped]}
+        with db.tx():
+            if not db.conn.execute("UPDATE tasks SET status='done', blocked_reason=NULL, result=?, updated=? "
+                                   "WHERE id=? AND status='review'", (dump_result(result), now, t["id"])).rowcount:
+                continue
+            _event(db, t, "task_done", f"#{t['id']} {t['title']} → done ({tail})", queued=False)
+            _reply(db, t, "done", result["summary"])
+        closed.append(t["id"])
+    return closed
 
 
 def _apply(p: Project, b: dict, m: dict, alert: Callable, now: float) -> None:

@@ -510,7 +510,8 @@ class Daemon:
     def tend_pushes(self) -> None:
         """Start the detached pushes queued from inside a sandbox; record the dead ones as failed. Then
         the push queue's bookkeeping, also while paused: approvals whose review moved on, a queue
-        turned off, and batches that ended (pushq.tend). Pins of settled rows go now and then."""
+        turned off, and batches that ended (pushq.tend). Now and then, pins of settled rows go and code
+        tasks left in 'review' after their review pushed their work are closed (pushq.settle_reviewed)."""
         push.tend(self.p)
         try:
             changed = pushq.tend(self.p, self.cfg, self.alert, may_requeue=self.cfg_status != "unavailable")
@@ -524,6 +525,12 @@ class Daemon:
                 pushq.prune_refs(self.p)
             except Exception:
                 log(self.p, "push queue: pruning pinned refs failed\n" + traceback.format_exc())
+            try:
+                closed = pushq.settle_reviewed(self.p.db, now)
+                if closed:
+                    log(self.p, f"push queue: closed code tasks {closed}: their latest review pushed their work")
+            except Exception:
+                log(self.p, "push queue: closing shipped code tasks failed\n" + traceback.format_exc())
 
     def start_pushes(self) -> None:
         """Start a push batch when one is due (pushq.schedule): local checks only, no model."""

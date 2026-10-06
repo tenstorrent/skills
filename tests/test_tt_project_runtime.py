@@ -12948,6 +12948,79 @@ def test_a_conflicting_push_runs_the_review_again_with_the_conflict_and_what_lan
     assert "settle the conflict" in q["text"] and q["status"] == "handled"
 
 
+def test_a_code_task_in_review_is_closed_when_a_review_that_settled_its_push_conflict_pushes_it(env, monkeypatch):
+    """The code task waits in 'review'; its review's approval conflicts, and another review, named
+    after the code task, settles the conflict and pushes: the code task is done with that push."""
+    s = _pq(env, monkeypatch)
+    s.p.db.update_task(s.code, status="review", result=json.dumps({"status": "needs_review", "summary": "built it"}))
+    _pq_plan(s, outcome="nothing", rows={s.branch: "conflict"}, detail={"files": ["feature.txt"], "onto": "ef" * 20})
+    _pq_hand_off(env, s)
+    _pq_batch(s)
+    _pq_tend(s)
+    assert s.p.db.task(s.review)["status"] == "queued" and s.p.db.task(s.code)["status"] == "review"
+    s.p.db.update_task(s.review, status="cancelled")
+    fix = _git_out(s.repo, "commit-tree", f"{s.head}^{{tree}}", "-p", s.head, "-m", "settle the conflict")
+    settle = s.p.db.add_task(f"Review #{s.code}: settle the push conflict", f"{s.branch} rebased as {fix}: push it",
+                             kind="review", tier="standard", origin="coordinator")
+    sha = "cd" * 20
+    _pq_plan(s, outcome="pushed", sha=sha, version="0.3.1")
+    own = [{"branch": f"ttp/t{settle}-settle", "head": fix}]   # pushed on a branch of its own
+    assert _pq_hand_off(env, s, push=own, task=settle)["status"] == "pushing"
+    mark = _pq_mark(s.p)
+    _pq_batch(s)
+    _pq_tend(s)
+    assert s.p.db.task(settle)["status"] == "done"
+    t = s.p.db.task(s.code)
+    res = json.loads(t["result"])
+    assert t["status"] == "done" and res["shipped_by"] == settle
+    assert [(x["sha"], x["version"], x["status"]) for x in res["pushed"]] == [(sha, "0.3.1", "pushed")]
+    assert res["summary"] == f"built it (shipped by review #{settle}: pushed {sha[:7]} as 0.3.1)"
+    [ev] = [e for e in _pq_events(s.p, mark, task=s.code)]
+    assert ev["kind"] == "task_done" and ev["status"] == "handled", "a shipped task is no news for the coordinator"
+
+
+def test_the_daemon_closes_code_tasks_left_in_review_whose_latest_review_pushed_them(env):
+    """Clean-up of tasks left behind: only a task whose latest covering review is done and pushed its
+    work after the task entered review is closed, once."""
+    from ttp import pushq
+    from ttp.daemon import Daemon
+    p, _ = _pq_rows(env)
+    db, now = p.db, time.time()
+
+    def code(name, at):
+        tid = db.add_task(name, "s", kind="code", tier="light", origin="user")
+        db.update_task(tid, status="review", branch=f"ttp/t{tid}-{name}")
+        db.x("UPDATE tasks SET updated=? WHERE id=?", (at, tid))
+        return tid
+
+    def review(title, status, row=None, at=now, **kw):
+        rid = db.add_task(title, "r", kind="review", origin="coordinator", **kw)
+        db.update_task(rid, status=status)
+        if row:
+            db.x("INSERT INTO push_queue(task, branch, head, target, status, batch, created, updated, pushed_sha, "
+                 "version) VALUES(?,?,?,?,?,?,?,?,?,?)", (rid, row, "ab" * 20, "origin/proj", "pushed", "b1",
+                                                          at - 60, at, "cd" * 20, "0.3.2"))
+        return rid
+
+    shipped, by_branch, by_dep = code("shipped", now - 500), code("branch", now - 500), code("dep", now - 500)
+    reopened, pending, unreviewed = code("reopened", now - 100), code("pending", now - 500), code("none", now - 500)
+    review(f"Review #{shipped}: x", "failed")                          # an earlier round, failed on a conflict
+    done = review(f"Review #{shipped}: settle the conflict", "done", f"ttp/t{shipped}-shipped")
+    review("land it", "done", f"ttp/t{by_branch}-branch")             # pushed the task's branch
+    review("review the stack", "done", "ttp/other", depends_on=[by_dep])
+    review(f"Review #{reopened}: x", "done", f"ttp/t{reopened}-reopened", at=now - 300)   # before it re-entered review
+    review(f"Review #{pending}: x", "done", f"ttp/t{pending}-pending")
+    review(f"Review #{pending}: again", "queued")                                          # a newer review still open
+    Daemon(p.base).tend_pushes()
+    st = {i: db.task(i)["status"] for i in (shipped, by_branch, by_dep, reopened, pending, unreviewed)}
+    assert st == {shipped: "done", by_branch: "done", by_dep: "done", reopened: "review", pending: "review",
+                  unreviewed: "review"}
+    res = json.loads(db.task(shipped)["result"])
+    assert res["shipped_by"] == done and res["pushed"][0]["sha"] == "cd" * 20 and res["pushed"][0]["version"] == "0.3.2"
+    assert len(db.q("SELECT id FROM events WHERE kind='task_done'")) == 3
+    assert pushq.settle_reviewed(db) == [] and len(db.q("SELECT id FROM events WHERE kind='task_done'")) == 3
+
+
 def test_a_failed_push_check_fails_the_review_with_the_command_and_tail(env, monkeypatch):
     s = _pq(env, monkeypatch)
     _pq_plan(s, outcome="nothing", row="check_failed", detail={"cmd": "pytest -q", "tail": "1 failed, 2 passed"})
