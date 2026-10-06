@@ -107,6 +107,7 @@ USER_SETTABLE = {
     "delivery.push_queue": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     "delivery.push_batch_s": lambda v: push_queue_number("push_batch_s", v),
     "delivery.push_batch_max": lambda v: push_queue_number("push_batch_max", v),
+    "delivery.push_min_gap_s": lambda v: push_queue_number("push_min_gap_s", v),
     "delivery.after_push": lambda v: push.checks_of(v),
     "delivery.after_push_timeout_s": lambda v: push_queue_number("after_push_timeout_s", v),
     # A git remote each finished code task's branch is backed up to, fast-forward only; "" turns it off.

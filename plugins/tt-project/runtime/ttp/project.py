@@ -177,7 +177,7 @@ EXTRA_KEYS = {
     # push_queue..after_push_timeout_s: the daemon-owned push queue (see PUSH_QUEUE_DEFAULTS).
     # backup_remote: a git remote finished code tasks' branches are pushed to, fast-forward only (off: unset).
     "delivery": {"base_ref", "push_branch", "push_checks", "push_rounds", "push_wait_s", "version_bump",
-                 "push_queue", "push_batch_s", "push_batch_max", "after_push", "after_push_timeout_s",
+                 "push_queue", "push_batch_s", "push_batch_max", "push_min_gap_s", "after_push", "after_push_timeout_s",
                  "backup_remote"},
     "jev": {"via", "url", "model"},
 }
@@ -241,11 +241,14 @@ def code_tasks_may_push(cfg: dict) -> bool:
 
 
 # delivery.push_queue on: reviews approve into the daemon's queue, which pushes approved heads in
-# batches (a batch starts once the oldest approval waited push_batch_s or push_batch_max are waiting)
+# batches (a batch starts once the oldest approval waited push_batch_s or push_batch_max are waiting,
+# but not before push_min_gap_s passed since the last batch ended unless it is full or priority 1)
 # and then runs after_push (commands like push_checks), killed after after_push_timeout_s.
-PUSH_QUEUE_DEFAULTS = {"push_queue": False, "push_batch_s": 900, "push_batch_max": 8, "after_push_timeout_s": 1800}
+PUSH_QUEUE_DEFAULTS = {"push_queue": False, "push_batch_s": 900, "push_batch_max": 8, "push_min_gap_s": 1800,
+                       "after_push_timeout_s": 1800}
 # key: (minimum, whether the minimum itself is allowed, whole numbers only)
 PUSH_QUEUE_NUMBERS = {"push_batch_s": (0, True, False), "push_batch_max": (1, True, True),
+                      "push_min_gap_s": (0, True, False),
                       "after_push_timeout_s": (0, False, False)}
 
 

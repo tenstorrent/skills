@@ -12551,6 +12551,39 @@ def test_a_batch_is_due_after_the_window_at_the_cap_for_priority_one_or_with_no_
     assert [r["id"] for r in rows] == [later[1]] and "no review" in why
 
 
+def test_a_batch_waits_push_min_gap_s_after_the_last_one_ended_unless_full_or_priority_one(env, monkeypatch):
+    from ttp import project, pushq
+    s = _pq(env, monkeypatch, push_batch_s=0, push_batch_max=3)
+    rows = [_pq_review(s)[1]]
+    now = time.time() + 1   # past every approval's creation: push_batch_s=0 starts at once
+    assert pushq.due(s.p, now)[0], "no batch ran before: nothing to wait for"
+    # The last batch died before writing an outcome (a reboot): finalize recorded when it ended.
+    s.p.db.x("INSERT INTO push_batches(id,marker,target,started,ended,finalized,after_finalized,outcome) "
+             "VALUES('b1','m','origin/proj',?,?,?,?,'died')", (now - 4000, now - 600, now - 600, now - 600))
+    got, why = pushq.due(s.p, now)
+    assert got == [] and "1200 s left of the 1800 s gap" in why, "the default gap counts from the recorded end"
+    assert pushq.schedule(s.p) is None
+    assert [r["id"] for r in pushq.due(s.p, now + 1200)[0]] == rows, "the wait is bounded by the gap"
+    assert [r["id"] for r in pushq.due(s.p, now + 10 ** 6)[0]] == rows
+    rows.append(_pq_review(s, priority=1)[1])
+    got, why = pushq.due(s.p, now)
+    assert [r["id"] for r in got] == rows[::-1] and "priority-1" in why, "an urgent approval starts at once"
+    s.p.db.x("DELETE FROM push_queue WHERE id=?", (rows.pop(),))
+    rows += [_pq_review(s)[1], _pq_review(s)[1]]
+    got, why = pushq.due(s.p, now)
+    assert [r["id"] for r in got] == rows and "3 approvals" in why, "push_batch_max still forces a start"
+    s.p.set_config("delivery.push_min_gap_s", 0)
+    s.p.db.x("DELETE FROM push_queue WHERE id=?", (rows.pop(),))
+    assert pushq.due(s.p, now)[0], "0 turns the gap off"
+    s.p.set_config("delivery.push_min_gap_s", 300)
+    assert pushq.due(s.p, now)[0], "the gap is configurable"
+    s.p.db.x("UPDATE push_batches SET ended=?", (now + 3600,))
+    assert pushq.due(s.p, now)[0], "an end in the future (the clock went back) never holds the queue"
+    assert project.push_queue_number("push_min_gap_s", "0") == 0
+    with pytest.raises(ValueError, match="push_min_gap_s.*default 1800"):
+        project.push_queue_number("push_min_gap_s", -1)
+
+
 @pytest.mark.parametrize("blocker", ["paused branch", "paused push", "live batch", "busy branch", "detached push",
                                      "backoff", "other target", "not allowed"])
 def test_no_batch_starts_while_something_holds_the_push(env, monkeypatch, blocker):

@@ -271,7 +271,10 @@ and preferences you add later become part of the project's charter and memory.
   no longer rebases goes back to its review to resolve the conflict; a failed check fails the
   review and wakes the coordinator. Keys, all under `delivery`: `push_batch_s` (default 900: a
   batch starts once the oldest approval waited this long; 0 = at once), `push_batch_max`
-  (default 8: start at once with this many; also the most one batch takes), `after_push`
+  (default 8: start at once with this many; also the most one batch takes), `push_min_gap_s`
+  (default 1800: a batch starts only once the last one ended at least this long ago, measured
+  from its recorded end so a restart or a failed batch never stretches the wait; a full batch or
+  a priority-1 review's approval starts at once; 0 = off), `after_push`
   (commands in the same form as `push_checks`, for example a deploy) and `after_push_timeout_s`
   (default 1800). `after_push` runs after each push in a clean worktree at the pushed commit,
   with `TTP_PUSHED_SHA`, `TTP_PUSHED_VERSION`, `TTP_PUSH_TARGET`, `TTP_PUSH_TASKS`,

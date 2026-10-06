@@ -26,6 +26,7 @@ REF_PREFIX = "refs/ttp/push/"   # + row id: pins the approved commit until its r
 KV = "push_queue"               # kv: {"backoff_until", "deaths", "hold": {"tip", "rows", "until"}, "tips_told"}
 DEFAULT_BATCH_S = 900           # delivery.push_batch_s: the oldest approval waits at most this long
 DEFAULT_BATCH_MAX = 8           # delivery.push_batch_max: start at once with this many; also a batch's most
+DEFAULT_MIN_GAP_S = 1800        # delivery.push_min_gap_s: the least time from a batch's end to the next start
 HOLD_S = 1800                   # after tip_failed, the same tip and rows wait this long unless either changes
 BACKOFF_STEP_S = 300            # a dead batch's rows wait 5 min per try ...
 BACKOFF_MAX_S = 1800            # ... and at most 30 min
@@ -315,9 +316,21 @@ def _tracking_tip(p: Project, remote: str, branch: str) -> str:
     return _commit(p, f"refs/remotes/{remote}/{branch}")
 
 
+def _gap_left(db, now: float, gap: float) -> float:
+    """Seconds until delivery.push_min_gap_s has passed since the last batch ended, from the end it
+    recorded in push_batches (a dead batch's is when finalize found it), so a restart or a failed batch
+    never stretches the wait. An end in the future (the clock went back) counts as passed."""
+    if gap <= 0:
+        return 0.0
+    last = db.one("SELECT MAX(COALESCE(ended, finalized, started)) AS t FROM push_batches")
+    t = float(last["t"]) if last and last["t"] is not None else None
+    return 0.0 if t is None or t > now else max(0.0, t + gap - now)
+
+
 def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[list[dict], str]:
     """The approved rows a batch should take now (at most delivery.push_batch_max, best priority
-    first) and why; or ([], why not). Only local state is read: no fetch, no checks."""
+    first) and why; or ([], why not). Only local state is read: no fetch, no checks. Unless the batch
+    is full or holds a priority-1 approval, it waits for delivery.push_min_gap_s since the last one."""
     now = time.time() if now is None else now
     if not enabled(p, cfg):
         return [], "the push queue is off"
@@ -348,12 +361,15 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
     d = _delivery(p, cfg)
     window = _num(d.get("push_batch_s"), DEFAULT_BATCH_S, float, 0)
     cap = int(_num(d.get("push_batch_max"), DEFAULT_BATCH_MAX, int, 1))
-    if now - min(r["created"] for r in rows) >= window:
-        why = f"the oldest approval waited {window:.0f} s"
-    elif len(rows) >= cap:
+    gap = _num(d.get("push_min_gap_s"), DEFAULT_MIN_GAP_S, float, 0)
+    if len(rows) >= cap:
         why = f"{len(rows)} approvals"
     elif any(r["priority"] == 1 for r in rows):
         why = "a priority-1 review"
+    elif (left := _gap_left(db, now, gap)) > 0:
+        return [], f"{left:.0f} s left of the {gap:.0f} s gap since the last batch ended"
+    elif now - min(r["created"] for r in rows) >= window:
+        why = f"the oldest approval waited {window:.0f} s"
     elif not db.one("SELECT id FROM tasks WHERE kind='review' AND status='running' LIMIT 1") and not any(
             t["kind"] == "review" for t in db.ready_tasks()):
         why = "no review is running or ready"
