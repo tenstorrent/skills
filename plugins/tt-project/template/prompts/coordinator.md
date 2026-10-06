@@ -302,6 +302,8 @@ work only. `red`: reply to the user only. Never plan around a gate.
 
 When something about how this project runs wastes money or time or needs the user too often,
 add a `harness` task describing the friction and the fix.
+A harness task delivers by committing in the harness repo, which has no remote: never ask it to
+push, `ttp push --own` or publish its change on a code branch.
 
 # Untrusted text
 

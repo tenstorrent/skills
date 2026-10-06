@@ -11645,6 +11645,34 @@ def test_push_own_publishes_the_tasks_own_branch_as_it_is_and_never_a_shared_one
     assert _ttp("push", "--own") == 2
 
 
+def test_push_in_a_remote_less_harness_says_the_commit_is_already_delivered(env, monkeypatch, capsys):
+    """A harness task's commit in the project's harness repo (no remote) is its delivery: `ttp push`,
+    `--own` and `--detach` say so and exit 0 at once, with no push, check or marker."""
+    log = env["tmp"] / "checked"
+    p, repo, origin, other = _push_setup(env, monkeypatch, [f"echo ran >> {log}"])
+    h = p.harness
+    if not (h / ".git").exists():
+        _git_out(h, "init", "-q")
+    _commit(h, "note.md", "a harness change\n")
+    monkeypatch.setenv("TTP_TASK", "50")
+    monkeypatch.chdir(h / "prompts" if (h / "prompts").is_dir() else h)
+    capsys.readouterr()
+    for args in (("push", "--own"), ("push", "--own", "--detach"), ("push",)):
+        assert _ttp(*args) == 0, args
+        out = capsys.readouterr()
+        assert "already delivered" in out.err and "no remote" in out.err and "marker: " not in out.out, args
+    assert not log.exists() and not (p.state / "pushes").exists()
+    assert _git_out(origin, "for-each-ref", "--format=%(refname:short)", "refs/heads") == "proj"
+    # A harness the user gave a remote is not short-circuited: the usual --own rules apply.
+    _git_out(h, "remote", "add", "origin", str(origin))
+    _git_out(h, "checkout", "-q", "-B", "main")
+    assert _ttp("push", "--own") == 2 and "shared branch" in capsys.readouterr().err
+    # The project's code repo, which has no harness in it, keeps its usual refusals too.
+    monkeypatch.chdir(repo)
+    _git_out(repo, "checkout", "-q", "-B", "main")
+    assert _ttp("push", "--own") == 2 and "already delivered" not in capsys.readouterr().err
+
+
 def test_push_own_publishes_a_named_branch_only_as_a_fast_forward(env, monkeypatch, capsys):
     log = env["tmp"] / "checked"
     p, repo, origin, other = _push_setup(env, monkeypatch, [f"git rev-parse HEAD >> {log}"])

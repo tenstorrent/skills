@@ -395,6 +395,22 @@ def target(p: Project, repo: Path) -> tuple[str, str]:
     return remote, rest[len("refs/heads/"):] if rest.startswith("refs/heads/") else rest
 
 
+LOCAL_HARNESS = ("nothing to push: this is the project's harness, a local git repo with no remote. "
+                 "A commit here is already delivered: the daemon reads the harness from this repo. "
+                 "Hand off with the commit's hash; never copy harness files into a code branch to publish them.")
+
+
+def local_harness(p: Project, repo: Path) -> bool:
+    """Whether `repo` is the project's own harness repo and has no git remote: a commit there is
+    delivered as it is, and there is nowhere to push it."""
+    top = _git(repo, "rev-parse", "--show-toplevel").stdout.strip()
+    try:
+        same = bool(top) and Path(top).resolve() == p.harness.resolve()
+    except OSError:
+        return False
+    return same and not _git(repo, "remote").stdout.split()
+
+
 def own_target(p: Project, repo: Path) -> tuple[str, str]:
     """(remote, branch) for `ttp push --own`: the checked-out branch, published under the same name
     on the remote of `delivery.push_branch` (else origin). A `ttp/t<id>-...` branch must be this
@@ -1063,6 +1079,9 @@ def run(p: Project, repo: Path, own: bool = False) -> int:
     if not (allowed is True or str(allowed).strip().lower() in ("1", "true", "yes", "on")):
         print("ttp push: this project does not allow pushing (delivery.push_allowed)", file=sys.stderr)
         return REFUSED
+    if local_harness(p, repo):
+        print(f"ttp push: {LOCAL_HARNESS}", file=sys.stderr)
+        return 0
     checks = check_list(d.get("push_checks"))   # none: only a docs-only change may go (_rounds)
     try:
         remote, branch = own_target(p, repo) if own else target(p, repo)
@@ -1236,6 +1255,9 @@ def detach(p: Project, repo: Path, own: bool = False) -> int:
         print("ttp push: this project does not allow pushing (delivery.push_allowed)", file=sys.stderr)
         return REFUSED
     top = Path(_git(repo, "rev-parse", "--show-toplevel").stdout.strip() or repo)
+    if local_harness(p, top):
+        print(f"ttp push: {LOCAL_HARNESS}", file=sys.stderr)
+        return 0
     try:
         remote, branch = own_target(p, top) if own else target(p, top)
     except ValueError as e:

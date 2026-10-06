@@ -186,6 +186,19 @@ def test_harness_tasks_stay_in_their_own_harness():
         assert "hand edits to its charter, memory, config, state or code" in text, path.name
 
 
+def test_harness_tasks_deliver_by_a_local_commit_not_a_push():
+    """The harness is a local repo with no remote: a harness task's commit is its delivery. Neither
+    the task nor the coordinator's specs ask it to `ttp push --own` or to copy files into a code branch."""
+    prompts = PLUGIN / "template" / "prompts"
+    harness = " ".join((prompts / "kind-harness.md").read_text(encoding="utf-8").split())
+    assert "commit in the harness repo is the delivery" in harness
+    assert "do not `ttp push` or `ttp push --own` it" in harness
+    assert "never copy harness files into a code branch" in harness
+    assert "`delivery.backup_remote` backs up code tasks' branches, not the harness" in harness
+    coordinator = " ".join((prompts / "coordinator.md").read_text(encoding="utf-8").split())
+    assert "never ask it to push, `ttp push --own` or publish its change on a code branch" in coordinator
+
+
 def test_coordinator_retires_temporary_instructions_and_does_not_ask_needlessly():
     """Temporary words get an end; a clearly-over restriction is retired, not asked about; a known,
     safe, reversible fix is done and reported, never asked about with a yes recommendation."""
