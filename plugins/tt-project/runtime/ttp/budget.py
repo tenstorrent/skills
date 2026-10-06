@@ -540,12 +540,17 @@ DOC_SUFFIXES = (".md", ".markdown", ".rst", ".adoc")
 
 def review_tier(changes: dict[str, int | None], cfg: dict) -> str:
     """Light for a doc-only diff or a small one that touches no risky path, standard otherwise.
-    Doc lines do not count toward the size: prose next to a small code change is not risk."""
+    Doc lines do not count toward the size: prose next to a small code change is not risk. With
+    light_paths set, a non-doc file must also match one of its globs for the diff to go light."""
     rules = cfg.get("review", {})
     risky = rules.get("risky_paths") or []
     if any(fnmatch.fnmatch(path, g) for path in changes for g in risky):
         return "standard"
-    code = [n for path, n in changes.items() if not path.lower().endswith(DOC_SUFFIXES)]
+    code = {path: n for path, n in changes.items() if not path.lower().endswith(DOC_SUFFIXES)}
+    allowed = rules.get("light_paths") or []
+    if allowed and not all(any(fnmatch.fnmatch(path, g) for g in allowed) for path in code):
+        return "standard"
+    code = list(code.values())
     if any(n is None for n in code):
         return "standard"
     return "light" if sum(code) <= int(rules.get("light_max_lines", 60)) else "standard"

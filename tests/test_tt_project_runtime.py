@@ -13844,6 +13844,17 @@ def test_review_tier_follows_the_size_and_risk_of_the_diff(env):
     assert review_tier({"docs/state/guide.md": 1}, {"review": {"risky_paths": ["docs/state/*"]}}) == "standard"
 
 
+def test_review_tier_light_paths_is_an_allow_list(env):
+    from ttp.budget import review_tier
+    cfg = {"review": {"light_paths": ["tests/*", "scripts/*.sh"], "risky_paths": ["tests/state/*"]}}
+    assert review_tier({"tests/test_app.py": 20, "scripts/run.sh": 5, "README.md": 300}, cfg) == "light"
+    assert review_tier({"docs/guide.md": 500}, cfg) == "light"
+    assert review_tier({"tests/test_app.py": 20, "src/app.py": 1}, cfg) == "standard"
+    assert review_tier({"tests/test_app.py": 61}, cfg) == "standard"
+    assert review_tier({"tests/state/db.py": 1}, cfg) == "standard"
+    assert review_tier({"src/app.py": 1}, {"review": {"light_paths": []}}) == "light"
+
+
 def test_a_review_runs_at_the_tier_its_diff_needs(env, monkeypatch):
     p = make(env)
     from ttp import daemon as dmod

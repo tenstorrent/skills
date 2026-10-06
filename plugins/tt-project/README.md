@@ -126,7 +126,8 @@ and preferences you add later become part of the project's charter and memory.
 - A runaway guard pauses a project whose hourly spend jumps far above its own norm.
 - A review runs light when the diff it checks touches no `review.risky_paths` glob and is doc-only
   or small (`review.light_max_lines` non-doc lines, default 60), standard otherwise; only the
-  coordinator picks deep. A re-review after a failed review is measured from the head that review
+  coordinator picks deep. An optional `review.light_paths` glob list narrows light further: every
+  non-doc file must match one of its globs (unset or empty: any path may go light). A re-review after a failed review is measured from the head that review
   recorded (`metrics.reviewed_head`), so a small fix on a large stack runs light.
 - When delivery has a review step (`delivery.review_before_pr` or a `delivery.push_branch`), the
   daemon queues the review of each finished code task whose hand-off has no follow-ups, notes or
