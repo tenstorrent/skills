@@ -349,7 +349,9 @@ experience. When a newer tt-project is installed (`ttp setup` from the updated p
 it on first use after an update; to deploy a branch tip, run `plugins/tt-project/bin/ttp setup` from a
 checkout at that tip, since the installed `ttp setup` reinstalls its own version and warns about it), each project's daemon merges it into its own harness within an hour
 and restarts, keeping running work. `ttp config <name> upgrade.auto false` turns that off;
-`ttp upgrade <name>` then merges by hand.
+`ttp upgrade <name>` then merges by hand. `ttp upgrade` exits 75 when it changed nothing and the
+project finishes the upgrade itself (a merge conflict handed to its harness task, or retried by its
+daemon under `upgrade.auto`), so a deploy script can count it as deferred; exit 1 is a real failure.
 
 ## Notifications
 

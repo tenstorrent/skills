@@ -6783,7 +6783,9 @@ def test_a_conflicting_upgrade_queues_at_most_one_task_a_day(env, monkeypatch, c
     capsys.readouterr()
     with pytest.raises(SystemExit) as e:
         cli.main(["upgrade", "demo"])
-    assert e.value.code == 1 and f"Harness task #{first} took on a template merge" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert e.value.code == 75 and f"Harness task #{first} took on a template merge" in out
+    assert "upgrade deferred" in out and "tries again after" in out
     assert [t["id"] for t in p.db.q("SELECT id FROM tasks WHERE kind='harness'")] == [first] and not restarts
     rec = p.db.kv(release.KV_AUTO)
     assert rec["outcome"] == "deferred" and rec["key"].endswith(" bbbb2222") and rec["until"] > time.time()
@@ -6798,6 +6800,74 @@ def test_a_conflicting_upgrade_queues_at_most_one_task_a_day(env, monkeypatch, c
     with pytest.raises(SystemExit):
         cli.main(["upgrade", "demo"])
     assert len(p.db.q("SELECT id FROM tasks WHERE kind='harness'")) == 2
+
+
+def _deferred_conflict(env, monkeypatch, name="demo"):
+    """A project whose template merge conflicts again within a day of its last harness task (done)."""
+    import shutil
+    from ttp import cli
+    if name != "demo":      # one project per repository
+        shutil.copytree(env["repo"], env["tmp"] / f"repo-{name}", symlinks=True)
+        env = {**env, "repo": env["tmp"] / f"repo-{name}"}
+    p = make(env, name)
+    from ttp import service
+    monkeypatch.setattr(service, "restart", lambda p: pytest.fail("a conflicting upgrade restarted the daemon"))
+    (p.harness / "prompts" / "kind-harness.md").write_text("# Harness task, this project's way\n")
+    _git_out(p.harness, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "local prompt")
+    _install_template(env, {"kind-harness.md": "# Harness task, upstream's way\n"})
+    with pytest.raises(SystemExit):
+        cli.main(["upgrade", name])
+    first = p.db.one("SELECT id FROM tasks WHERE kind='harness'")["id"]
+    p.db.update_task(first, status="done")
+    (env["home"] / "lib" / "current" / "runtime" / "ttp" / "SOURCE_COMMIT").write_text("bbbb2222\n")
+    return p, first
+
+
+def test_a_conflict_handed_to_a_harness_task_is_deferred_with_exit_75(env, monkeypatch, capsys):
+    """The project's own harness task takes the merge on: nothing failed, so a deploy counts it as deferred."""
+    from ttp import cli
+    p, restarts = _conflicting_upgrade(env, monkeypatch)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo"])
+    tid = p.db.one("SELECT id FROM tasks WHERE kind='harness'")["id"]
+    assert e.value.code == 75 and f"Harness task #{tid} finishes it" in capsys.readouterr().out and not restarts
+
+
+def test_a_conflict_nothing_retries_with_upgrade_auto_off_exits_1(env, monkeypatch, capsys):
+    """upgrade.auto off and no open harness task: nobody takes the merge on, so it is a failure."""
+    from ttp import cli
+    p, first = _deferred_conflict(env, monkeypatch)
+    p.set_config("upgrade.auto", False)
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo"])
+    out = capsys.readouterr().out
+    assert e.value.code == 1 and "upgrade.auto is off, so nothing retries it" in out and "deferred" not in out
+    assert [t["id"] for t in p.db.q("SELECT id FROM tasks WHERE kind='harness'")] == [first]
+
+
+def test_a_deploy_counts_deferred_upgrades_and_still_reports_a_real_failure(env, monkeypatch, tmp_path):
+    """An after_push deploy that upgrades every project, counting exit 75 as deferred: a conflict its
+    project retries itself fails nothing; one that nobody takes on, next to it, is still reported."""
+    _deferred_conflict(env, monkeypatch, "alpha")
+    beta, _ = _deferred_conflict(env, monkeypatch, "beta")
+    deploy = tmp_path / "deploy.sh"
+    deploy.write_text(
+        'failed=""\n'
+        'for p in "$@"; do\n'
+        f'  "{sys.executable}" "{TTP}" upgrade "$p"; e=$?\n'
+        '  if [ $e -eq 0 ]; then :\n'
+        '  elif [ $e -eq 75 ]; then echo "deploy: $p deferred"\n'
+        '  else echo "deploy: $p failed (exit $e)"; failed="$failed $p"; fi\n'
+        'done\n'
+        '[ -z "$failed" ] || { echo "upgrade failed for:$failed"; exit 1; }\n')
+    plain = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    r = subprocess.run(["sh", str(deploy), "alpha"], capture_output=True, text=True, env=plain)
+    assert r.returncode == 0 and "deploy: alpha deferred" in r.stdout and "failed" not in r.stdout, r
+    beta.set_config("upgrade.auto", False)
+    r = subprocess.run(["sh", str(deploy), "alpha", "beta"], capture_output=True, text=True, env=plain)
+    assert r.returncode == 1 and "deploy: alpha deferred" in r.stdout, r
+    assert "deploy: beta failed (exit 1)" in r.stdout and "upgrade failed for: beta" in r.stdout, r
 
 
 def test_a_second_upgrade_is_refused_while_one_holds_the_harness_upgrade_lock(env, monkeypatch):

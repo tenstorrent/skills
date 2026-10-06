@@ -2006,7 +2006,10 @@ def cmd_setup(a) -> None:
 def cmd_upgrade(a) -> None:
     """Merge the installed template into a project's harness. The harness repo keeps pristine
     template snapshots on its `upstream` branch, so this is an ordinary three-way merge. `--auto` is
-    the daemon's own call (release.py): it records the outcome and sends one low notify when applied."""
+    the daemon's own call (release.py): it records the outcome and sends one low notify when applied.
+    Exit 75 = deferred, nothing changed and the project finishes it itself (another upgrade or a harness
+    task holds it, a push is in flight, or a conflicting merge waits for a harness task or for the daemon's
+    retry under upgrade.auto). Exit 1 = failed, including a conflict nothing will retry (upgrade.auto off)."""
     from . import locks, release
     if a.project_dir:      # the daemon names its own folder: never another project of the same name
         p = Project(a.project_dir)
@@ -2105,10 +2108,15 @@ def _upgrade(p: Project, auto: bool = False) -> None:
             until = float(last["created"]) + release.TASK_EVERY_S
             release.defer(p, auto, f"{new_v} {new_c}", f"{old_v} ({old_c})", f"{new_v} ({new_c})", until,
                           problem[:300])
-            print(f"upgrade not applied; the running harness is unchanged. {problem}\nHarness task "
-                  f"#{last['id']} took on a template merge less than a day ago, so none is queued now; with "
-                  f"upgrade.auto on the daemon tries again after "
-                  f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(until))}.")
+            at = time.strftime('%Y-%m-%d %H:%M', time.localtime(until))
+            took = (f"upgrade not applied; the running harness is unchanged. {problem}\nHarness task "
+                    f"#{last['id']} took on a template merge less than a day ago, so none is queued now; ")
+            # Exit 75 (deferred) only when the project takes it on itself: its daemon retries after `until`.
+            if auto or (p.config().get("upgrade") or {}).get("auto", True):
+                print(took + f"upgrade deferred: with upgrade.auto on the daemon tries again after {at}.")
+                sys.exit(75)
+            print(took + f"upgrade.auto is off, so nothing retries it: rerun `ttp upgrade {p.name}` after {at} "
+                         f"to queue a harness task for the merge.")
             sys.exit(1)
         tid = tid or p.db.add_task(
             release.UPGRADE_TASK_TITLE, _UPGRADE_TASK.format(problem=problem, name=p.name),
@@ -2116,8 +2124,8 @@ def _upgrade(p: Project, auto: bool = False) -> None:
         if auto:
             release.finish(p, "conflict", task=tid, why=problem[:300])
         print(f"upgrade not applied; the running harness is unchanged. {problem}\nHarness task #{tid} "
-              f"finishes it.")
-        sys.exit(1)
+              f"finishes it (upgrade deferred to that task).")
+        sys.exit(75)        # deferred: the project's own harness task takes it on
     if auto and release.push_in_flight(p):   # a push started while this merged: never swap under it
         release.finish(p, "held", why="a push is in flight")
         print("upgrade held: a push is in flight; the running harness is unchanged and the daemon retries later")
