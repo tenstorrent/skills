@@ -234,6 +234,16 @@ and preferences you add later become part of the project's charter and memory.
   skipped check is logged as `skipped (not applicable: ...)` by `ttp push`, the push queue and
   `ttp checks` (in `checks.log`), and never counts as passed: when every check is skipped the
   push or `ttp checks` fails. Plain string checks never skip; `after_push` takes the same form.
+- Checks run with `TTP_PUSH_MODE` set to `target` (`ttp push` or the push queue, to
+  `delivery.push_branch`), `own` (`ttp push --own`) or `checks` (`ttp checks`), and `TTP_PUSH_TIP`
+  set to the tip of the branch pushed to as fetched before the checks (empty for a new branch and
+  for `ttp checks`). A check that should only gate the push branch tests
+  `[ "$TTP_PUSH_MODE" != target ] || ...`.
+- `delivery.push_exclude_paths` (globs, off by default) keeps files off the push branch, such as
+  task notes or `tmp/`: `["tmp/**", "notes/*.md"]`. `ttp push` and the push queue refuse a change
+  when any commit it brings adds or modifies a matching file, and name the files; a commit that
+  deletes one passes. A pattern matches a path, a directory by its files, or as an fnmatch glob
+  whose `*` also crosses `/`. `ttp push --own` is not affected.
 - tt-project runs no whitespace check of its own. A `git diff --check <base> HEAD` in
   `push_checks` also fails on committed run logs, whose captured lines keep trailing whitespace.
   Leave them out with a pathspec: `git diff --check <base> HEAD -- . ':(exclude)*.log'`. Files

@@ -126,6 +126,40 @@ def skipped_line(check: Check, why: str) -> str:
     return f"skipped (not applicable: {why}): {check}"
 
 
+def check_env(mode: str, tip: str = "") -> dict[str, str]:
+    """The environment push_checks run in. TTP_PUSH_MODE says what they gate: `target` (`ttp push`
+    or the push queue, to delivery.push_branch), `own` (`ttp push --own`, the task's own branch) or
+    `checks` (`ttp checks`, which pushes nothing). TTP_PUSH_TIP is the tip of the branch pushed to,
+    as fetched before the checks; empty when there is none (a new branch, or `ttp checks`)."""
+    return {**os.environ, "TTP_PUSH_MODE": mode, "TTP_PUSH_TIP": tip or ""}
+
+
+def exclude_list(v: Any) -> list[str]:
+    """`delivery.push_exclude_paths` as repo-relative globs (a list, a JSON list or one per line);
+    empty, the default, turns the guard off."""
+    return [posixpath.normpath(str(g).strip()) for g in _entries(v) if not isinstance(g, dict)]
+
+
+def excluded(repo: Path, tip: str, head: str, globs: list[str]) -> list[str]:
+    """Files a commit of `head` not yet on `tip` adds or modifies (a deletion is fine) that match
+    one of `globs` (`matches`: a path, a directory by its files, or an fnmatch glob whose `*` also
+    crosses `/`). Each commit counts, not only the end result: a file added and later deleted would
+    still reach the branch's history. Commits whose patch `tip` already has are left out."""
+    if not globs:
+        return []
+    log = _git(repo, "-c", "core.quotePath=false", "log", "--no-merges", "--right-only", "--cherry-pick",
+               "--no-renames", "--diff-filter=AMT", "--name-only", "--format=", f"{tip}...{head}")
+    return [f for f in dict.fromkeys(log.stdout.splitlines()) if f and any(matches([f], g) for g in globs)]
+
+
+def excluded_refusal(files: list[str], upstream: str) -> str:
+    more = f" and {len(files) - 5} more" if len(files) > 5 else ""
+    return (f"this change adds or modifies files that delivery.push_exclude_paths keeps off {upstream} "
+            f"({', '.join(files[:5])}{more}); take them out of the commits that add them (a later "
+            "delete still leaves them in its history), or publish the branch with `ttp push --own`; "
+            "not pushing")
+
+
 NONE_APPLY = "every check was skipped as not applicable, so nothing checked it"
 
 
@@ -380,6 +414,14 @@ def _fetch(repo: Path, remote: str, branch: str) -> str:
             quiet=False).returncode != 0:
         return ""
     return _git(repo, "rev-parse", "--verify", "--quiet", f"refs/remotes/{remote}/{branch}").stdout.strip()
+
+
+def _existing_tip(repo: Path, remote: str, branch: str) -> str:
+    """The remote branch's tip, fetched, or "" when the remote has no such branch or cannot be read."""
+    ls = _git(repo, "ls-remote", "--heads", remote, f"refs/heads/{branch}")
+    if ls.returncode != 0 or not any(ln.endswith(f"\trefs/heads/{branch}") for ln in ls.stdout.splitlines()):
+        return ""
+    return _fetch(repo, remote, branch)
 
 
 def target(p: Project, repo: Path) -> tuple[str, str]:
@@ -904,10 +946,11 @@ def take(p: Project, remote: str, branch: str, wait_s: float, poll_s: float = 1.
 def push(repo: Path, remote: str, branch: str, checks: list[str], rounds: int = DEFAULT_ROUNDS,
          say: Callable[[str], None] = lambda m: print(f"ttp push: {m}", file=sys.stderr),
          hold: Callable[[], Any] | None = None, version_bump: dict | None = None,
-         timed: Callable[[float], None] | None = None) -> int:
+         timed: Callable[[float], None] | None = None, exclude: list[str] | None = None) -> int:
     """Rebase HEAD onto remote/branch, run `checks` on the result, and push it if the remote did not
     move meanwhile; if it did, start over, at most `rounds` times. With no checks only a change that
-    touches nothing but docs goes through. `hold` takes the push lock once the quick refusals
+    touches nothing but docs goes through, and a change adding or modifying a file `exclude` matches
+    (delivery.push_exclude_paths, `excluded`) does not. `hold` takes the push lock once the quick refusals
     passed: it returns the held lock, or None when it stayed busy (BUSY). `version_bump` (bump_of)
     bumps the version after each rebase; `timed` gets the seconds of each full, passing check run."""
     repo = Path(_git(repo, "rev-parse", "--show-toplevel").stdout.strip() or repo)
@@ -930,7 +973,7 @@ def push(repo: Path, remote: str, branch: str, checks: list[str], rounds: int = 
         say(f"{keep} is on {remote}; rebasing a detached copy, the branch stays as it is")
         _git(repo, "switch", "--detach", "--quiet")
     try:
-        return _rounds(repo, remote, branch, checks, rounds, say, version_bump, timed, keep)
+        return _rounds(repo, remote, branch, checks, rounds, say, version_bump, timed, keep, exclude)
     finally:
         if keep:
             if Path(_git(repo, "rev-parse", "--absolute-git-dir").stdout.strip(), "rebase-merge").is_dir():
@@ -990,8 +1033,9 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
             say(f"{head[:10]}: {NONE_APPLY}; not pushing")
             return CHECKS_FAILED
         started = time.time()
+        env = check_env("own", _existing_tip(repo, remote, branch) if todo else "")
         for cmd in todo:
-            if subprocess.run(cmd, shell=True, cwd=repo).returncode != 0:
+            if subprocess.run(cmd, shell=True, cwd=repo, env=env).returncode != 0:
                 say(f"check failed on {head[:10]}: {cmd}; not pushing")
                 return CHECKS_FAILED
         if todo and timed:
@@ -1062,7 +1106,8 @@ def _rebase(repo: Path, tip: str) -> bool:
 
 def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int,
             say: Callable[[str], None], version_bump: dict | None = None,
-            timed: Callable[[float], None] | None = None, keep: str = "") -> int:
+            timed: Callable[[float], None] | None = None, keep: str = "",
+            exclude: list[str] | None = None) -> int:
     global last_pushed
     upstream = f"{remote}/{branch}"
     for rnd in range(1, rounds + 1):
@@ -1077,6 +1122,9 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
             more = f" and {len(code) - 3} more" if len(code) > 3 else ""
             say(f"no checks configured, and this change touches more than docs ({', '.join(code[:3])}{more}): "
                 + NO_CHECKS)
+            return REFUSED
+        if bad := excluded(repo, tip, "HEAD", exclude or []):
+            say(excluded_refusal(bad, upstream))
             return REFUSED
         if not _rebase(repo, tip):
             _git(repo, "rebase", "--abort")
@@ -1101,8 +1149,9 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
             say(f"{head[:10]}: {NONE_APPLY}; not pushing")
             return CHECKS_FAILED
         started = time.time()
+        env = check_env("target", tip)
         for cmd in todo:
-            if subprocess.run(cmd, shell=True, cwd=repo).returncode != 0:
+            if subprocess.run(cmd, shell=True, cwd=repo, env=env).returncode != 0:
                 say(f"check failed on {head[:10]}: {cmd}; not pushing")
                 return CHECKS_FAILED
         if todo and timed:
@@ -1144,7 +1193,7 @@ def run(p: Project, repo: Path, own: bool = False) -> int:
     except ValueError as e:
         print(f"ttp push: {e}", file=sys.stderr)
         return REFUSED
-    if own:
+    if own:   # delivery.push_exclude_paths guards the push branch only
         base = None
         if not checks:   # the docs-only test needs the shared branch this work leaves from
             try:
@@ -1155,7 +1204,8 @@ def run(p: Project, repo: Path, own: bool = False) -> int:
                        timed=lambda s: record_check_s(p, s), base=base,
                        ff_only=not OWN_BRANCH.fullmatch(branch))
     return push(repo, remote, branch, checks, rounds, hold=lambda: take(p, remote, branch, wait_s),
-                version_bump=version_bump, timed=lambda s: record_check_s(p, s))
+                version_bump=version_bump, timed=lambda s: record_check_s(p, s),
+                exclude=exclude_list(d.get("push_exclude_paths")))
 
 
 def free(p: Project, repo: Path) -> int:

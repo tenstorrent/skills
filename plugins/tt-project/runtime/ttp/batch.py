@@ -614,6 +614,9 @@ class Batch:
                 self._set(i, "refused", message=f"no checks configured, and this change touches more than "
                                                 f"docs ({', '.join(code[:3])}{more}): " + push.NO_CHECKS)
                 continue
+            if bad := push.excluded(self.repo, tip, top, push.exclude_list(self.d.get("push_exclude_paths"))):
+                self._set(i, "refused", message=push.excluded_refusal(bad, self.target))
+                continue
             new, files = self._rebase(h, top)
             if files is not None:
                 say(f"entry {e.get('id')} ({e.get('branch')}) conflicts with {h[:10]} in {', '.join(files)}")
@@ -751,7 +754,7 @@ class Batch:
         self.checks["runs"] += 1
         try:
             for cmd in todo:
-                rc, tail, _ = _stream(cmd, self.wt)
+                rc, tail, _ = _stream(cmd, self.wt, env=push.check_env("target", self.tip))
                 if rc != 0:
                     say(f"check failed on {head[:10]}: {cmd}")
                     return cmd, tail

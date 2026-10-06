@@ -179,9 +179,9 @@ EXTRA_KEYS = {
     "notify": {"slack_poll_s"},
     # push_queue..after_push_timeout_s: the daemon-owned push queue (see PUSH_QUEUE_DEFAULTS).
     # backup_remote: a git remote finished code tasks' branches are pushed to, fast-forward only (off: unset).
-    "delivery": {"base_ref", "push_branch", "push_checks", "push_rounds", "push_wait_s", "version_bump",
-                 "push_queue", "push_batch_s", "push_batch_max", "push_min_gap_s", "after_push", "after_push_timeout_s",
-                 "backup_remote"},
+    "delivery": {"base_ref", "push_branch", "push_checks", "push_exclude_paths", "push_rounds", "push_wait_s",
+                 "version_bump", "push_queue", "push_batch_s", "push_batch_max", "push_min_gap_s", "after_push",
+                 "after_push_timeout_s", "backup_remote"},
     "jev": {"via", "url", "model"},
 }
 OPEN_SECTIONS = {"resources"}           # any name below is fine

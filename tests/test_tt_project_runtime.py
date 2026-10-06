@@ -12221,6 +12221,94 @@ def test_version_bump_config_is_validated(env):
     assert config_problems({"delivery": {"version_bump": {"files": ["a/x.json"]}}}) == []
 
 
+def test_push_checks_see_the_push_mode_and_the_tip_they_push_onto(env, monkeypatch, tmp_path):
+    log = env["tmp"] / "modes"
+    p, repo, origin, other = _push_setup(env, monkeypatch, [f'echo "$TTP_PUSH_MODE ${{TTP_PUSH_TIP:-none}}" >> {log}'])
+    seen = lambda: log.read_text().splitlines()[-1]
+    _commit(other, "theirs.txt", "theirs\n")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    tip = _git_out(origin, "rev-parse", "proj")
+    _commit(repo, "mine.txt", "mine\n")
+    assert _ttp_push() == 0 and seen() == f"target {tip}"
+    # --own: a branch the remote does not have yet has no tip; once published, its tip there.
+    _git_out(repo, "checkout", "-q", "-b", "ttp/t30-exp")
+    monkeypatch.setenv("TTP_TASK", "30")
+    _commit(repo, "own.txt", "1\n")
+    assert _ttp("push", "--own") == 0 and seen() == "own none"
+    first = _git_out(repo, "rev-parse", "HEAD")
+    _commit(repo, "own.txt", "2\n")
+    assert _ttp("push", "--own") == 0 and seen() == f"own {first}"
+    # ttp checks pushes nothing: no tip.
+    monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path))
+    from ttp import cli
+    cli.main(["checks", "--fresh"])
+    assert seen() == "checks none"
+
+
+def test_push_exclude_paths_is_off_by_default(env, monkeypatch):
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    (repo / "tmp").mkdir()
+    _commit(repo, "tmp/scratch.txt", "x\n")
+    assert _ttp_push() == 0 and _git_out(origin, "show", "proj:tmp/scratch.txt") == "x"
+
+
+def test_push_exclude_paths_refuses_adds_and_edits_on_the_push_branch_only(env, monkeypatch, capsys):
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    (other / "notes").mkdir()
+    _commit(other, "notes/old.md", "old\n")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    _git_out(repo, "pull", "-q", "origin", "proj")
+    p.set_config("delivery.push_exclude_paths", ["tmp", "notes/*.md"])
+    before = _git_out(origin, "rev-parse", "proj")
+    # Deleting a matching file passes.
+    _git_out(repo, "rm", "-q", "notes/old.md")
+    _git_out(repo, "commit", "-qm", "drop the note")
+    assert _ttp_push() == 0
+    assert _git_out(origin, "ls-tree", "--name-only", "proj", "notes/") == ""
+    before = _git_out(origin, "rev-parse", "proj")
+    # An add, even one a later commit deletes again, is refused before anything moves.
+    _git_out(repo, "checkout", "-q", "-b", "ttp/t30-exp")
+    (repo / "tmp").mkdir()
+    _commit(repo, "tmp/scratch.txt", "x\n")
+    _commit(repo, "tool.py", "print(1)\n")
+    _git_out(repo, "rm", "-q", "tmp/scratch.txt")
+    _git_out(repo, "commit", "-qm", "drop scratch")
+    head = _git_out(repo, "rev-parse", "HEAD")
+    assert _ttp_push() == 2
+    err = capsys.readouterr().err
+    assert "tmp/scratch.txt" in err and "tool.py" not in err and "ttp push --own" in err
+    assert _git_out(origin, "rev-parse", "proj") == before and _git_out(repo, "rev-parse", "HEAD") == head
+    # --own is not affected.
+    monkeypatch.setenv("TTP_TASK", "30")
+    assert _ttp("push", "--own") == 0 and _git_out(origin, "rev-parse", "ttp/t30-exp") == head
+    # A modified file is refused too (put there while the guard was off); the key may be a string.
+    p.set_config("delivery.push_exclude_paths", [])
+    _git_out(repo, "checkout", "-q", "-B", "edit", before)
+    (repo / "notes").mkdir(exist_ok=True)
+    _commit(repo, "notes/kept.md", "a\n")
+    assert _ttp_push() == 0
+    p.set_config("delivery.push_exclude_paths", "notes/*.md")
+    _commit(repo, "notes/kept.md", "b\n")
+    assert _ttp_push() == 2 and "notes/kept.md" in capsys.readouterr().err
+
+
+def test_push_excluded_helper_ignores_deletions_and_patches_already_on_the_tip(env, monkeypatch):
+    from ttp import push
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    tip = _git_out(repo, "rev-parse", "HEAD")
+    assert push.exclude_list(None) == [] and push.exclude_list("") == []
+    assert push.exclude_list('["./tmp/", "notes/*.md"]') == ["tmp", "notes/*.md"]
+    (repo / "tmp").mkdir()
+    _commit(repo, "tmp/a.txt", "a\n")
+    _commit(repo, "x.py", "1\n")
+    assert push.excluded(repo, tip, "HEAD", ["tmp"]) == ["tmp/a.txt"]
+    assert push.excluded(repo, tip, "HEAD", []) == []
+    assert push.excluded(repo, "HEAD~1", "HEAD", ["tmp"]) == []
+    _git_out(repo, "rm", "-q", "tmp/a.txt")
+    _git_out(repo, "commit", "-qm", "rm")
+    assert push.excluded(repo, "HEAD~1", "HEAD", ["tmp/**"]) == []
+
+
 # push queue batches (batch.py) --------------------------------------------------------------------
 def _entry(repo, name, files):
     """A reviewed branch `name` off the target's tip whose one commit writes `files` ({path: text});
@@ -12283,6 +12371,21 @@ def test_a_push_batch_lands_its_entries_with_one_bump_one_changeset_and_one_chec
         "- e3: edit plugins/p/f3.txt")
     assert m["phase"] == "finished" and m["after_push"] == {"status": "skipped", "reason": "delivery.after_push is not set"}
     assert not list((p.state / "locks").glob("*run-b1*")), "no lock file of the batch is left behind"
+
+
+def test_a_push_batch_refuses_an_entry_adding_an_excluded_path_and_runs_checks_as_target(env, monkeypatch):
+    log = env["tmp"] / "modes"
+    p, repo, origin, other = _bump_setup(env, monkeypatch, [f'echo "$TTP_PUSH_MODE $TTP_PUSH_TIP" >> {log}'])
+    p.set_config("delivery.push_exclude_paths", ["tmp"])
+    before = _git_out(origin, "rev-parse", "proj")
+    heads = [_entry(repo, "e1", {"plugins/p/f1.txt": "1\n", "tmp/notes.md": "n\n"}),
+             _entry(repo, "e2", {"plugins/p/f2.txt": "2\n"})]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert _statuses(m) == ["refused", "pushed"], m
+    msg = m["results"][0]["detail"]["message"]
+    assert "tmp/notes.md" in msg and "ttp push --own" in msg
+    assert _git_out(origin, "ls-tree", "-r", "--name-only", "proj", "tmp") == ""
+    assert log.read_text().split() == ["target", before]
 
 
 def test_a_push_batch_entry_already_on_the_target_is_landed_without_a_bump(env, monkeypatch):
