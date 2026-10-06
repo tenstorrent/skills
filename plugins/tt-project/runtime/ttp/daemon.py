@@ -2146,7 +2146,6 @@ class Daemon:
             return   # logged out: one run at a time checks the login, and this turn is not it
         check = None
         try:
-            prompt = coord.digest(self.p, gates, [e["id"] for e in evs], [m["id"] for m in msgs])
             due = (w or {}).get("due")
             triggers, seen = coord.effort_triggers(db, self.cfg, [e["id"] for e in evs], due,
                                                    [m["id"] for m in msgs], gates, now)
@@ -2161,6 +2160,11 @@ class Daemon:
             checked = {"coord_check": {"jev_call": check["jev_call"], "verdict": check["verdict"]}} if check else {}
             unblock = ", ".join(triggers)
             raised = bool(unblock) and can_raise
+            # A routine turn sees background sections the previous turn saw as one line each; a
+            # turn with any effort trigger sees everything.
+            parts, shown = coord.digest_parts(self.p, gates, [e["id"] for e in evs], [m["id"] for m in msgs],
+                                              None if unblock else (db.kv(coord.DIGEST_SEEN_KEY) or {}))
+            prompt = "\n".join(text for _, text in parts)
             prompt += ("\n\nThis turn's effort: raised (" + unblock[:300] + ")." if raised else
                        "\n\nThis turn's effort: routine." + (" If this batch is harder than routine bookkeeping, "
                        "return only an `escalate` action: it reruns once at high effort." if can_raise else ""))
@@ -2173,7 +2177,8 @@ class Daemon:
                            note={"messages": [m["id"] for m in msgs], "events": [e["id"] for e in evs],
                                  "default_chat": default_chat, **({"unblock": unblock} if unblock else {}),
                                  "triggers": triggers, **({"wake_due": due} if due else {}),
-                                 **({"escalated": True} if esc else {}), **checked},
+                                 **({"escalated": True} if esc else {}), **checked,
+                                 "digest": coord.digest_size(parts)},
                            unblock=unblock)
         except Exception as e:
             # A turn that cannot even start backs off like a failed turn instead of retrying every tick.
@@ -2190,6 +2195,7 @@ class Daemon:
                     + traceback.format_exc().replace("\n", " | ")[:1000])
         db.set_kv("last_coordinator_turn", now)
         db.set_kv(coord.EFFORT_SEEN_KEY, seen)
+        db.set_kv(coord.DIGEST_SEEN_KEY, shown)
         if esc:
             db.x("DELETE FROM kv WHERE key=?", (coord.ESCALATE_KEY,))
         else:

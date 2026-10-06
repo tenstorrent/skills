@@ -3296,6 +3296,109 @@ def test_coordinator_prompt_prefix_is_byte_stable_across_turns_with_different_ev
     assert context.startswith("# CHARTER") and "the build takes ten minutes" in context
 
 
+def test_the_standing_sections_lead_the_cached_prompt_in_a_fixed_order_and_leave_the_digest(env):
+    """Charter headings, delivery rules and the machines list change only with the charter or the
+    settings: they sit in the cached context (charter, standing, memory, in that order), byte-stable
+    across turns, instead of being written to the cache again with every digest."""
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import machines as mm
+    mm.add("box-a", tags="device", note="main board")
+    p.set_config("delivery.push_branch", "work")
+    p.set_config("delivery.push_queue", True)
+    p.add_memory("the build takes ten minutes", kind="fact")
+    head, context = coord.prompt_parts(p)
+    order = [context.index(x) for x in ("# CHARTER", "# STANDING", "## Charter sections", "## Delivery: push queue",
+                                        "## Machines", "- box-a [device]: main board", "# MEMORY")]
+    assert order == sorted(order), context
+    first = coord.digest(p, {}, [], [])
+    tid = p.db.add_task("new work", "do it", kind="work", tier="light", origin="user")
+    p.db.update_task(tid, status="done", result=json.dumps({"summary": "did it"}))
+    p.db.post("in", "how is it going?")
+    p.db.post("out", "on it", kind="reply")
+    assert coord.digest(p, {}, [], []) != first and coord.prompt_parts(p) == (head, context)
+    for d in (first, coord.digest(p, {}, [], [])):
+        assert not any(x in d for x in ("## Charter sections", "## Delivery", "## Machines", "main board")), d
+
+
+def test_a_routine_digest_collapses_unchanged_background_and_keeps_what_decides_whole(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import screen as scr
+    db = p.db
+    scr.mute(db, "watcher:hw", "tray dropped", 24, why="known; handled by the hardware team " + "x" * 300)
+    _memories(p, [("restriction" if i % 2 else "preference", f"RULE-{i} " + "y" * 900) for i in range(10)]
+              + [("fact", "OLD-FACT")])
+    coord.pause_resource(p, "box-b", True, reason="firmware", by="user")
+    tid = db.add_task("open work", "s", origin="user")
+    ask = db.post("out", "Which board should the soak use?", kind="ask")
+    ev = db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+              (time.time(), "daemon", "observation", "normal", "a new thing happened", "queued"))
+    gates = {"claude": {"level": "green", "reasons": [], "numbers": {}, "max_tier": "deep", "max_parallel": 6,
+                        "allow_optional": True, "allow_new_work": True, "regime": "dollars"}}
+    full, seen = coord.digest_parts(p, gates, [ev], [])
+    keys = [k for k, _ in full]
+    assert set(coord.COLLAPSIBLE) <= set(keys) and set(seen) == set(coord.COLLAPSIBLE)
+    full_text = "\n".join(t for _, t in full)
+    # The next routine turn, nothing changed: each background section is one line, with no reasons.
+    short, again = coord.digest_parts(p, gates, [ev], [], seen)
+    assert again == seen and [k for k, _ in short] == keys, "a section was dropped or reordered"
+    text = dict(short)
+    for key in coord.COLLAPSIBLE:
+        assert "(as last turn" in text[key] and "\n" not in text[key], key
+        assert len(text[key]) < len(dict(full)[key]), key
+    assert "watcher:hw 'tray dropped': 0 muted" in text["muted"] and "hardware team" not in text["muted"]
+    assert "daily-review on" in text["recurring"]
+    # Never collapsed: the budget gate, paused resources, open tasks, open asks and new events.
+    for key in ("budget", "paused", "tasks", "asks", "events"):
+        assert text[key] == dict(full)[key], key
+    body = "\n".join(text.values())
+    for need in ("green", "box-b: paused", f"#{tid} | queued", f"ask #{ask}", "a new thing happened"):
+        assert need in body, need
+    assert len(body) < len(full_text)
+    # A changed section is shown whole again; so is everything when no `seen` is given (a raised turn).
+    db.x("UPDATE schedules SET enabled=0 WHERE name='daily-review'")
+    changed, _ = coord.digest_parts(p, gates, [ev], [], seen)
+    assert "(as last turn" not in dict(changed)["recurring"] and "(as last turn" in dict(changed)["muted"]
+    scr.mute(db, "watcher:hw", "tray dropped", 24, why="a new reason")
+    assert "a new reason" in dict(coord.digest_parts(p, gates, [ev], [], seen)[0])["muted"]
+    assert "(as last turn" not in coord.digest(p, gates, [ev], [])
+    # The size the daemon records: per section, in total and in estimated tokens.
+    size = coord.digest_size(short)
+    assert size["chars"] == len(body) and size["tokens"] == (len(body) + 3) // 4
+    assert set(size["sections"]) == set(keys)
+
+
+def test_a_coordinator_turn_records_its_digest_size_and_routine_turns_collapse(env, monkeypatch):
+    p = make(env)
+    from ttp.daemon import Daemon
+    from ttp import coordinator as coord
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    d = Daemon(p.base)
+    d.update_gates()
+    clock = [time.time()]
+    calls = []
+    monkeypatch.setattr(d, "start_run", lambda role, prompt, *a, **k: calls.append((prompt, k)) or 1)
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+
+    def turn(kind):
+        p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+               (clock[0], "daemon", kind, "normal", "x", "queued"))
+        clock[0] += 600
+        d.maybe_coordinate()
+        p.db.x("UPDATE events SET status='handled'")
+        return calls[-1]
+
+    prompt, k = turn("task_done")
+    assert "## Recurring\n" in prompt and k["note"]["digest"]["tokens"] == (k["note"]["digest"]["chars"] + 3) // 4
+    assert set(p.db.kv(coord.DIGEST_SEEN_KEY)) >= {"recurring"}
+    prompt, k = turn("task_done")
+    assert "## Recurring (as last turn)" in prompt, "an unchanged section was repeated on a routine turn"
+    assert k["note"]["digest"]["sections"]["recurring"] < 200
+    prompt, k = turn("task_failed")
+    assert k["unblock"] and "## Recurring\n" in prompt, "a raised turn must see everything"
+
+
 def test_claude_takes_the_cache_lifetime_and_a_breakpoint_after_the_stable_block(monkeypatch):
     from ttp.providers import claude, get_provider
     prov = get_provider("claude")
@@ -3453,14 +3556,17 @@ def test_coordinator_cache_hit_rate_and_cost_per_turn(env):
     rows = [(now - 3600, 0.05, 100, 9000, 900),          # warm: 90% read
             (now - 7200, 0.15, 100, 1000, 8900),         # missed: the charter changed
             (now - 3 * 86400, 0.04, 100, 9800, 100)]     # older than a day
-    for started, cost, fresh, read, write in rows:
+    for k, (started, cost, fresh, read, write) in enumerate(rows):
+        note = json.dumps({"digest": {"chars": 4000, "tokens": 1000}} if k == 0 else {})
         p.db.x("INSERT INTO runs(role,provider,started,ended,status,cost_usd,input_tokens,cache_read_tokens,"
-               "cache_write_tokens) VALUES('coordinator','claude',?,?,'done',?,?,?,?)",
-               (started, started + 60, cost, fresh, read, write))
+               "cache_write_tokens,note) VALUES('coordinator','claude',?,?,'done',?,?,?,?,?)",
+               (started, started + 60, cost, fresh, read, write, note))
     p.db.x("INSERT INTO runs(role,provider,started,ended,status,cost_usd,input_tokens,cache_read_tokens) "
            "VALUES('worker','claude',?,?,'done',1,10,0)", (now - 60, now))
     c = bud.coordinator_cache(p.db, now)
-    assert c["24h"] == {"turns": 2, "hit_pct": 50, "miss_turns": 1, "usd_per_turn": 0.1}
+    # Cache writes per turn are kept apart from the miss rate; the digest size only where recorded.
+    assert c["24h"] == {"turns": 2, "hit_pct": 50, "miss_turns": 1, "usd_per_turn": 0.1, "write_per_turn": 4900,
+                        "digest_tokens": 1000}
     assert c["7d"]["turns"] == 3 and c["7d"]["hit_pct"] == 66 and c["7d"]["miss_turns"] == 1
     assert bud.history(p.db)["coordinator_cache"]["24h"]["turns"] == 2
 
@@ -3918,7 +4024,7 @@ def test_charter_update_replaces_takes_full_headings_and_the_digest_lists_them(e
     p = make(env)
     from ttp import coordinator as coord
     p.charter_path.write_text(RESTR_CHARTER)
-    d = coord.digest(p, {}, [], [])
+    d = coord.system_prompt(p)   # stable: in the cached prompt, not the digest
     line = next(x for x in d.splitlines() if x.startswith("## Charter sections"))
     assert line.endswith("1. Restrictions (binding on every task) · 2. Goals · 3. Restrictions (added 2026-10-01, "
                          "turn 3.0) · 4. Restrictions (added 2026-10-02, turn 5.0)"), line
@@ -9184,7 +9290,10 @@ def test_the_digest_cuts_background_rows_but_keeps_new_events_whole(env):
     finished = background.split("## Recently finished")[1].split("\n## ")[0].splitlines()[1:]
     assert len(finished) == coord.FINISHED_ROWS
     assert f"#{done} done: fresh task — see new events" in finished[0], "the hand-off was repeated"
-    assert all(len(row) < coord.FINISHED_CHARS + 40 and row.endswith("…") for row in finished[1:])
+    detail = finished[1:coord.FINISHED_DETAIL]
+    assert detail and all(len(row) < coord.FINISHED_CHARS + 40 and row.endswith("…") for row in detail)
+    assert all(re.fullmatch(r"- #\d+ done: old task \d+", row) for row in finished[coord.FINISHED_DETAIL:]), \
+        "older rows repeat their summaries"
     sent = background.split("## Recently sent to the user")[1].splitlines()[1]
     assert sent.endswith("word…") and len(sent) < coord.SENT_CHARS + 40
     assert "## Recurring" not in d and "## Chats attached" not in d, "empty sections are still shown"
@@ -11657,7 +11766,7 @@ def test_the_review_prompt_approves_into_the_push_queue_only_when_it_is_on(env):
     p.set_config("delivery.push_branch", "work")
     off = prompt()
     assert "run `ttp push --detach`" in off and "## Approving into the push queue" not in off
-    assert "push queue" not in policy() and "## Delivery: push queue" not in coord.digest(p, {}, [], [])
+    assert "push queue" not in policy() and "## Delivery: push queue" not in coord.prompt_parts(p)[1]
     # On without a push branch, or with pushing not allowed: still off.
     p.set_config("delivery.push_queue", True)
     p.set_config("delivery.push_branch", "")
@@ -11670,7 +11779,7 @@ def test_the_review_prompt_approves_into_the_push_queue_only_when_it_is_on(env):
     on = prompt()
     assert policy().endswith("push allowed=True, push queue=True") and "push queue" not in policy(code)
     assert "## Approving into the push queue" in on and "ttp push --detach" not in on
-    assert "## Delivery: push queue on for work (delivery.push_queue)" in coord.digest(p, {}, [], [])
+    assert "## Delivery: push queue on for work (delivery.push_queue)" in coord.system_prompt(p)
 
 
 def test_the_worker_time_rule_sends_pushes_detached():
@@ -15236,7 +15345,7 @@ def test_the_digest_lists_machines_and_resources_that_keep_failing(env):
     from ttp import coordinator as coord
     from ttp import machines as mm
     dig = coord.digest(p, {}, [], [])
-    assert "## Machines" not in dig and "## Resource trouble" not in dig
+    assert "## Machines" not in coord.prompt_parts(p)[1] and "## Resource trouble" not in dig
     mm.add("box-a", tags="device", note="main board")
     mm.add("box-b", tags="device")
     mm.add("box-c", tags="cpu")
@@ -15244,8 +15353,9 @@ def test_the_digest_lists_machines_and_resources_that_keep_failing(env):
     other = p.db.add_task("build", "s", kind="work", tier="light", origin="user", labels=["resource:box-c"])
     _bad_runs(p, tid, 1)
     _bad_runs(p, other, 1, status="lost", ago=2 * 86400)   # older than a day: not counted
-    dig = coord.digest(p, {}, [], [])
-    assert "## Machines" in dig and "- box-a [device]: main board" in dig and "- box-c [cpu]" in dig
+    dig, system = coord.digest(p, {}, [], []), coord.system_prompt(p)
+    assert "## Machines" in system and "- box-a [device]: main board" in system and "- box-c [cpu]" in system
+    assert "## Machines" not in dig, "the stable list is written to the cache again every turn"
     assert "## Resource trouble" not in dig, "one failure is not trouble yet"
     _bad_runs(p, tid, 1, status="stalled")
     p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
@@ -19657,7 +19767,7 @@ def test_code_tasks_land_their_own_work_only_when_the_project_opts_in(env):
         return worker_task(p, p.db.task(tid), str(p.root), None)
 
     def state():
-        return coord.digest(p, {}, [], [])
+        return coord.system_prompt(p)
 
     # Default: off, and nothing in the prompts says otherwise.
     p.set_config("delivery.push_branch", "work")

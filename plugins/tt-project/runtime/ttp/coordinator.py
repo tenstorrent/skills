@@ -181,7 +181,16 @@ RECENT_OUT = 5                       # outbound messages the digest repeats, so 
 # Digest row lengths. Background rows are cut; new events, asks and open-task notes carry decisions.
 NOTE_CHARS = 140
 FINISHED_ROWS, FINISHED_CHARS = 10, 120
+FINISHED_DETAIL = 3                  # newest finished tasks shown with a summary; older ones by title
+TITLE_CHARS = 120
 SENT_CHARS = 100
+MUTE_CHARS = 200
+# Every coordinator turn is a fresh session whose digest the provider writes to its cache whole.
+# A routine turn sees these background sections as one line while they are as the previous turn
+# saw them (`digest_seen`). The budget gate, open asks and tasks, new events, paused resources and
+# memory changes are always shown whole; so is everything on a turn at raised effort.
+DIGEST_SEEN_KEY = "digest_seen"   # kv: {section: hash of what the previous turn's digest showed}
+COLLAPSIBLE = ("recurring", "muted", "memory_budget")
 EVENT_CHARS = 1500
 # A plan's product arrives as these events; the daemon sizes them to fit, so they show whole.
 EVENT_CHARS_BY_KIND = {"followup_proposed": 4300, "task_notes": 6000, "upstream_note": 4300}
@@ -275,14 +284,34 @@ def memory_digest_lines(view: dict) -> list[str]:
             + [f"[{n}] retired, ignore" for n in view["retired"]])
 
 
+def standing_lines(p: Project) -> list[str]:
+    """What the coordinator needs every turn that changes only with the charter or the settings:
+    the charter's headings, the delivery rules and the machines list. It sits in the cached prompt,
+    so turns read it from the cache instead of writing it again with each digest."""
+    cfg, lines = p.config(), []
+    heads = charter_headings(p)
+    if heads:
+        lines.append(f"## Charter sections (exact headings and numbers, for charter_update `replaces`): {heads}")
+    if code_tasks_may_push(cfg):
+        lines.append(f"## Delivery: code tasks may land on {cfg['delivery']['push_branch']} with `ttp push` "
+                     f"(delivery.code_tasks_may_push): put the landing in the code task's spec, no separate task")
+    if push_queue_on(cfg):
+        lines.append(f"## Delivery: push queue on for {cfg['delivery']['push_branch']} (delivery.push_queue): "
+                     f"review specs say \"approve for the push queue\", with no push or deploy steps")
+    return lines + machines.list_lines()
+
+
 def prompt_parts(p: Project, now: float | None = None) -> tuple[str, str]:
     """The stable prompt as (head, context), most stable first so a change misses the cache only
     from where it is: the restrictions and role change on upgrades and restriction edits; the
-    charter and the memory snapshot (`context`) more often. A provider that can mark a cache
-    breakpoint after `context` sends it as its own block after the system prompt (`head`)."""
+    charter, the standing settings and the memory snapshot (`context`) more often. A provider that
+    can mark a cache breakpoint after `context` sends it as its own block after the system prompt
+    (`head`)."""
     rules, role, charter = _prompt_head(p)
+    standing = "\n".join(standing_lines(p))
+    standing = f"# STANDING\n{standing}\n\n" if standing else ""
     memory = memory_view(p, now)["text"] or "(no memories yet)"
-    return f"{rules}{role}", f"# CHARTER\n{charter}\n\n# MEMORY\n{memory}\n"
+    return f"{rules}{role}", f"# CHARTER\n{charter}\n\n{standing}# MEMORY\n{memory}\n"
 
 
 def system_prompt(p: Project, now: float | None = None) -> str:
@@ -307,9 +336,31 @@ def clip(text: Any, n: int) -> str:
     return cut.rstrip(" ,;:") + "…"
 
 
-def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int]) -> str:
+def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int], seen: dict | None = None) -> str:
+    return "\n".join(text for _, text in digest_parts(p, gates, event_ids, msg_ids, seen)[0])
+
+
+def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int],
+                 seen: dict | None = None) -> tuple[list[tuple[str, str]], dict[str, str]]:
+    """The turn's digest as (section, text) pairs in order, and the hash of each COLLAPSIBLE section
+    shown in full, to store as `seen` for the next turn. With `seen` (a routine turn), a collapsible
+    section whose hash is unchanged is shown as one line."""
     db = p.db
     now = time.time()
+    shown: list[tuple[str, list[str]]] = []
+    shas: dict[str, str] = {}
+
+    def section(key: str, body: list[str], ident: str | None = None, short: str | None = None) -> None:
+        """`ident`: what makes a collapsible section different for the coordinator (no counters or
+        clocks); `short`: its one line when it is as the previous turn saw it."""
+        if not body:
+            return
+        if key in COLLAPSIBLE and ident is not None:
+            shas[key] = _sha(ident)
+            if seen is not None and short and seen.get(key) == shas[key]:
+                body = [short]
+        shown.append((key, body))
+
     lines = [f"# STATE at {time.strftime('%Y-%m-%d %H:%M %Z')}",
              "## Project budget (authoritative; your own turn's small spend limit is NOT this budget)"]
     b = p.config()["budget"]
@@ -343,6 +394,8 @@ def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int]) ->
         lines.append(f"- {prov}: {g['level']} ({'; '.join(g['reasons']) or 'ok'}) · {money} · max_tier={g['max_tier']} "
                      f"max_parallel={g['max_parallel']} optional_work={'yes' if g['allow_optional'] else 'no'}")
     lines.append(f"- per-task default budgets: {b.get('task_default_usd')}")
+    section("budget", lines)
+    lines = []
     boots = db.boots(now - 86400)
     if boots:
         at_each = "; ".join(f"{time.strftime('%H:%M', time.localtime(x['ts']))} "
@@ -356,9 +409,13 @@ def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int]) ->
                  + (f". {clip(low['usage'], 600)}" if low.get("usage") else "")
                  if low else f"ok (guard below {disk.get('threshold_gb')} GB)")
         kept = db.kv("worktrees_kept") or {}
+        # Why each is kept matters only when space runs low.
         held = ("; finished tasks' worktrees kept: " + clip(", ".join(f"#{t} ({why})" for t, why in kept.items()), 400)
-                if kept else "")
+                if kept and low else f"; {len(kept)} finished tasks' worktrees kept (hand-off artifacts or open "
+                f"tasks): " + clip(", ".join(f"#{t}" for t in kept), 200) if kept else "")
         lines.append(f"## Disk: {disk.get('free_gb')} GB free of {disk.get('total_gb')} GB; {guard}{held}")
+    section("host", lines)
+    lines = []
     paused = db.paused_resources()
     if paused:
         lines.append("## Paused resources (tasks using one are not dispatched; `ttp lock` refuses it)")
@@ -366,35 +423,33 @@ def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int]) ->
             lines.append(f"- {name}: paused {(now - float(v.get('since') or now)) / 3600:.1f}h ago by "
                          f"{v.get('by') or 'user'}" + (f" in project {v.get('project')} (shared by all projects)"
                                                       if v.get("shared") else "") + (f": {clip(v['reason'], NOTE_CHARS)}" if v.get("reason") else ""))
-    lines += machines.digest_lines(db, paused, now)
+    section("paused", lines)
+    section("resources", machines.digest_lines(db, paused, now))
+    lines = []
     for res, got in shared.mismatches(p).items():
         lines.append(f"## Shared resource {res}: projects give different slot counts ("
                      + ", ".join(f"{k} {n}" for k, n in sorted(got.items())) + f"); all use the smallest, "
                      f"{min(got.values())}")
-    if code_tasks_may_push(p.config()):
-        lines.append(f"## Delivery: code tasks may land on {p.config()['delivery']['push_branch']} with `ttp push` "
-                     f"(delivery.code_tasks_may_push): put the landing in the code task's spec, no separate task")
-    if push_queue_on(p.config()):
-        lines.append(f"## Delivery: push queue on for {p.config()['delivery']['push_branch']} (delivery.push_queue): "
-                     f"review specs say \"approve for the push queue\", with no push or deploy steps")
-    lines += memory_digest_lines(memory_view(p, now))
-    lines += ends.digest_lines(p, float(db.kv("last_coordinator_turn", 0) or 0), now)
+    section("shared", lines)
+    section("memory_added", memory_digest_lines(memory_view(p, now)))
+    section("ends", ends.digest_lines(p, float(db.kv("last_coordinator_turn", 0) or 0), now))
     mem = memory_budget_line(p)
     if mem:
-        lines.append(mem)
-    lines.append("## Open tasks (id | status | tier | priority | age | title | last note)")
+        section("memory_budget", [mem], mem, mem.split(";")[0] + " (as last turn)")
+    lines = ["## Open tasks (id | status | tier | priority | age | title | last note)"]
     rows = db.q("SELECT * FROM tasks WHERE status NOT IN ('done','failed','cancelled') ORDER BY priority, id LIMIT 60")
     in_review = db.review_since()
     for t in rows:
         note = clip(t["blocked_reason"] or load_result(t["result"]).get("summary"), NOTE_CHARS)
         cont = continues_id(t)
-        title = f"{t['title']} (continues #{cont})" if cont else t["title"]
+        title = clip(t["title"], TITLE_CHARS) + (f" (continues #{cont})" if cont else "")
         starts = (starts_text(t, now) if t["status"] == "queued" else
                   f"{(now - in_review[t['id']]) / 3600:.1f}h in review" if t["id"] in in_review else "")
         lines.append(f"- #{t['id']} | {t['status']}{f' ({starts})' if starts else ''} | {t['tier']} | p{t['priority']} | "
                      f"{(now - t['created']) / 3600:.1f}h | {title} | {note}")
     if not rows:
         lines.append("- (none)")
+    section("tasks", lines)
     events = (db.q(f"SELECT * FROM events WHERE id IN ({','.join('?' * len(event_ids))}) ORDER BY id", event_ids)
               if event_ids else [])
     # A task finishing this turn has its full hand-off under NEW EVENTS. Only a hand-off counts:
@@ -402,27 +457,32 @@ def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int]) ->
     in_events = {e["source"] for e in events if e["kind"] in HANDOFF_KINDS}
     finished = db.q("SELECT * FROM tasks WHERE status IN ('done','failed','cancelled') AND updated>? "
                     "ORDER BY updated DESC LIMIT ?", (now - 172800, FINISHED_ROWS))
-    if finished:
-        lines.append("## Recently finished (last 48h, newest first)")
-    for t in finished:
+    lines = ["## Recently finished (last 48h, newest first; older ones by title)"] if finished else []
+    for k, t in enumerate(finished):
         summary = ("see new events" if f"task:{t['id']}" in in_events
-                   else clip(load_result(t["result"]).get("summary"), FINISHED_CHARS))
-        lines.append(f"- #{t['id']} {t['status']}: {t['title']} — {summary}")
+                   else clip(load_result(t["result"]).get("summary"), FINISHED_CHARS) if k < FINISHED_DETAIL else "")
+        lines.append(f"- #{t['id']} {t['status']}: {clip(t['title'], TITLE_CHARS)}" + (f" — {summary}" if summary else ""))
+    section("finished", lines)
     recurring = sched.with_costs(db)
-    if recurring:
-        lines.append("## Recurring")
+    lines = ["## Recurring"] if recurring else []
     for s in recurring:
         lines.append(f"- {s['name']} ({s['kind']}, every {s['every_s'] // 60} min, "
                      f"{'on' if s['enabled'] else 'off'}, 7d cost ${s['cost_7d']}): {clip(s['description'], 100)}")
-    heads = charter_headings(p)
-    if heads:
-        lines.append(f"## Charter sections (exact headings and numbers, for charter_update `replaces`): {heads}")
-    # Open asks of any age: one still waits on the user however long ago it was sent.
+    section("recurring", lines, json.dumps([[s["name"], s["kind"], s["every_s"], bool(s["enabled"]),
+                                             s["description"]] for s in recurring]),
+            "## Recurring (as last turn): " + ", ".join(f"{s['name']} {'on' if s['enabled'] else 'off'}"
+                                                        for s in recurring))
     muted = scr.mutes(db, now)
-    if muted:
-        lines.append("## Muted observations (recorded and counted, never wake you; one summary event when each ends)")
+    lines = ["## Muted observations (recorded and counted, never wake you; one summary event when each ends)"] \
+        if muted else []
     for m in muted:
-        lines.append(f"- {clip(scr.mute_line(m, now), 300)}")
+        lines.append(f"- {clip(scr.mute_line(m, now), MUTE_CHARS)}")
+    section("muted", lines, json.dumps([[m["source"], m["match"], m["below"], m["until"], m.get("why")] for m in muted]),
+            "## Muted observations (as last turn; never wake you): "
+            + "; ".join(f"{m['source']} {m['match']!r}: {int(m['count'])} muted, ends in "
+                        f"{max(0.0, (float(m['until']) - now) / 3600):.1f} h" for m in muted))
+    # Open asks of any age: one still waits on the user however long ago it was sent.
+    lines = []
     blockers = db.q("SELECT * FROM messages WHERE kind='ask' AND handled=0 ORDER BY id DESC LIMIT 10")
     if blockers:
         lines.append("## Open questions to the user (resolve each once answered)")
@@ -435,22 +495,28 @@ def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int]) ->
             else:
                 when = "waits for the user"
             lines.append(f"- ask #{b['id']} ({when}): {b['text'][:300]}")
+    section("asks", lines)
+    lines = []
     sent = db.q("SELECT * FROM messages WHERE direction='out' AND kind IN ('reply','ask','alert') "
                 "ORDER BY id DESC LIMIT ?", (RECENT_OUT,))
     if sent:
         lines.append("## Recently sent to the user (do not repeat these)")
         for m in reversed(sent):
             lines.append(f"- {m['kind']} #{m['id']}, {(now - m['ts']) / 3600:.1f}h ago: {clip(m['text'], SENT_CHARS)}")
+    section("sent", lines)
+    lines = []
     chats = db.q("SELECT id, label, last_active FROM chats ORDER BY last_active DESC LIMIT 10")
     if chats:
         lines.append("## Chats attached")
     for c in chats:
         lines.append(f"- {c['id']} ({c['label'] or 'chat'}), active {(now - (c['last_active'] or now)) / 60:.0f} min ago")
-
+    section("chats", lines)
+    lines = []
     if any(e["kind"] == "upstream_note" or e["kind"] in ("followup_proposed", "task_notes")
            and "upstream:" in e["text"].lower() for e in events):
         lines.append(upstream.digest_line(p, p.config()))
-    lines.append("\n# NEW EVENTS")
+    section("upstream", lines)
+    lines = ["\n# NEW EVENTS"]
     if msg_ids:
         for m in db.q(f"SELECT * FROM messages WHERE id IN ({','.join('?' * len(msg_ids))}) ORDER BY id", msg_ids):
             prov = m["provenance"] or "unknown"
@@ -469,7 +535,16 @@ def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int]) ->
     if not msg_ids and not event_ids and not rejected:
         lines.append("- (none: periodic check — keep work flowing if the charter has unfinished goals)")
     lines.append("\nRespond with the JSON actions object only.")
-    return "\n".join(lines)
+    section("events", lines)
+    return [(key, "\n".join(body)) for key, body in shown], shas
+
+
+def digest_size(parts: list[tuple[str, str]]) -> dict:
+    """A digest's size for the run's note: characters per section, in total, and estimated tokens
+    (about four characters each), which a turn writes to the provider's cache."""
+    sizes = {key: len(text) + 1 for key, text in parts}
+    chars = sum(sizes.values()) - 1 if sizes else 0
+    return {"chars": chars, "tokens": (chars + 3) // 4, "sections": sizes}
 
 
 def _norm_severity(s: str | None) -> str:

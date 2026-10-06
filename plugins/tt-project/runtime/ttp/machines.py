@@ -350,8 +350,8 @@ def trouble_line(name: str, s: dict, machines: dict[str, dict], avoid: set[str])
     return f"{name}: {', '.join(parts)}{on}{alt}{hint}"
 
 
-def digest_lines(db, paused: dict | None = None, now: float | None = None) -> list[str]:
-    """The Machines and Resource trouble sections of the coordinator's digest; [] when both are empty."""
+def list_lines() -> list[str]:
+    """The Machines section of the coordinator's cached prompt; [] when the list is empty."""
     machines, lines = load(), []
     if machines:
         lines.append("## Machines (the user's list; use only those the charter's Resources allows; "
@@ -360,6 +360,12 @@ def digest_lines(db, paused: dict | None = None, now: float | None = None) -> li
             lines.append(f"- {line(alias, machines[alias])}")
         if len(machines) > DIGEST_MACHINES:
             lines.append(f"- … and {len(machines) - DIGEST_MACHINES} more (`ttp machines list`)")
+    return lines
+
+
+def digest_lines(db, paused: dict | None = None, now: float | None = None) -> list[str]:
+    """The Resource trouble section of the coordinator's digest; [] when there is none."""
+    machines, lines = load(), []
     bad = trouble(db, now)
     if bad:
         avoid = set(bad) | set(paused or {})

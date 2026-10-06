@@ -657,6 +657,14 @@ def reread_text(s: dict) -> str:
 
 
 
+def _note(raw) -> dict:
+    try:
+        note = json.loads(raw or "{}")
+    except ValueError:
+        return {}
+    return note if isinstance(note, dict) else {}
+
+
 def cache_hit(read: float, write: float, fresh: float) -> float | None:
     """Share of a call's prompt tokens read from the provider's cache, or None with no prompt."""
     total = read + write + fresh
@@ -665,11 +673,14 @@ def cache_hit(read: float, write: float, fresh: float) -> float | None:
 
 def coordinator_cache(db: DB, now: float | None = None) -> dict:
     """Prompt cache use of coordinator turns over the last 24 h and 7 d: `hit_pct` is cache reads
-    over all prompt tokens, `miss_turns` the turns that read under half their prompt from it."""
+    over all prompt tokens, `miss_turns` the turns that read under half their prompt from it.
+    Apart from misses, `write_per_turn` is the mean of cache-write tokens per turn, which a warm
+    turn spends on its digest, and `digest_tokens` the mean estimated digest size of the turns that
+    recorded one."""
     now = now or time.time()
     out = {}
     for label, span in (("24h", DAY), ("7d", WEEK)):
-        rows = db.q("SELECT cost_usd, input_tokens, cache_read_tokens, cache_write_tokens FROM runs "
+        rows = db.q("SELECT cost_usd, input_tokens, cache_read_tokens, cache_write_tokens, note FROM runs "
                     "WHERE role='coordinator' AND started>=? AND status!='running' "
                     "AND input_tokens + cache_read_tokens + cache_write_tokens > 0", (now - span,))
         hits = [cache_hit(r["cache_read_tokens"] or 0, r["cache_write_tokens"] or 0, r["input_tokens"] or 0)
@@ -678,5 +689,10 @@ def coordinator_cache(db: DB, now: float | None = None) -> dict:
                             ("cache_read_tokens", "cache_write_tokens", "input_tokens")))
         out[label] = {"turns": len(rows), "hit_pct": round(100 * total) if total is not None else None,
                       "miss_turns": sum(h < 0.5 for h in hits),
-                      "usd_per_turn": round(sum(r["cost_usd"] or 0 for r in rows) / len(rows), 4) if rows else None}
+                      "usd_per_turn": round(sum(r["cost_usd"] or 0 for r in rows) / len(rows), 4) if rows else None,
+                      "write_per_turn": round(sum(r["cache_write_tokens"] or 0 for r in rows) / len(rows))
+                      if rows else None}
+        sizes = [d["tokens"] for d in (_note(r["note"]).get("digest") for r in rows)
+                 if isinstance(d, dict) and isinstance(d.get("tokens"), int)]
+        out[label]["digest_tokens"] = round(sum(sizes) / len(sizes)) if sizes else None
     return out
