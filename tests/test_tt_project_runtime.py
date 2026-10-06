@@ -19766,8 +19766,8 @@ def test_code_tasks_land_their_own_work_only_when_the_project_opts_in(env):
     def worker(tid):
         return worker_task(p, p.db.task(tid), str(p.root), None)
 
-    def state():
-        return coord.system_prompt(p)
+    def state():   # the STANDING block; the prompt's rules always name `## Delivery` as an example
+        return "\n".join(coord.standing_lines(p))
 
     # Default: off, and nothing in the prompts says otherwise.
     p.set_config("delivery.push_branch", "work")
@@ -19788,6 +19788,7 @@ def test_code_tasks_land_their_own_work_only_when_the_project_opts_in(env):
     assert "code tasks may land on work with ttp push=True" in worker(code)
     assert "land on work with ttp push=True" not in worker(review)
     assert "## Delivery: code tasks may land on work with `ttp push`" in state()
+    assert "## Delivery: code tasks may land on work with `ttp push`" in coord.system_prompt(p)
     assert coord.USER_SETTABLE["delivery.code_tasks_may_push"]("true") is True
     assert coord.USER_SETTABLE["delivery.code_tasks_may_push"]("false") is False
 
