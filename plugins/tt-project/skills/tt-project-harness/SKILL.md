@@ -73,5 +73,7 @@ description: "Improve a tt-project's own harness — its coordinator and worker 
 - Conflicts: keep this project's intent, take upstream fixes. Resolve them in a scratch worktree,
   never in the live harness, and apply the result with `ttp upgrade <name> --apply <commit>`.
 - One merge at a time: `ttp upgrade` holds the `harness-upgrade` lock for the whole merge, refuses
-  while another upgrade runs or the upgrade task is open, and stops if `main` changed the template's
-  files meanwhile. The harness repo refuses any other merge of `upstream` into `main`.
+  while another upgrade runs, and stops if `main` changed the template's files meanwhile. An open
+  upgrade task holds the live harness until it ends: a newer release moves `upstream` and retargets
+  that task (exit 75) instead of queuing another. The harness repo refuses any other merge of
+  `upstream` into `main`.

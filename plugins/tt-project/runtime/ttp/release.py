@@ -8,6 +8,7 @@ must not trigger an unattended upgrade."""
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import re
 import subprocess
@@ -200,6 +201,42 @@ def open_upgrade_task(p: Project, db=None) -> int | None:
     return int(t["id"]) if t else None
 
 
+def finish_lock(p: Project) -> Path:
+    """Names the harness task that finishes a template merge, and the release it targets. While that
+    task is open it holds the live harness: no other `ttp upgrade` merges into main, a newer release
+    retargets the task instead, and only the task's own `--apply` lands the merge. The task's status is
+    the lock's life: once it is done, failed, cancelled or gone (also after a crash or a restart) the
+    record is stale and counts as released."""
+    return p.state / "locks" / f"{UPGRADE_RESOURCE}.task"
+
+
+def take_finish_lock(p: Project, task: int, key: str, target: str) -> None:
+    """Called under the upgrade lock (`ttp upgrade`), like every write of this record."""
+    durable_write(finish_lock(p), json.dumps({"task": int(task), "key": key, "target": target,
+                                              "since": time.time()}) + "\n")
+
+
+def finish_holder(p: Project, db=None, clean: bool = False) -> dict | None:
+    """The open finish task that holds the live harness, {"task", "key", "target"}; None when none does.
+    A record whose task has ended counts as released and, with `clean` (only under the upgrade lock),
+    is removed. An open finish task without a record (queued by an older release) holds it too, its
+    target unknown (key None)."""
+    db = db or p.db
+    path = finish_lock(p)
+    try:
+        rec = json.loads(path.read_text() or "{}")
+    except (OSError, ValueError):
+        rec = {}
+    if rec.get("task"):
+        t = db.one("SELECT status FROM tasks WHERE id=?", (int(rec["task"]),))
+        if t and t["status"] not in ("done", "failed", "cancelled"):
+            return {"task": int(rec["task"]), "key": rec.get("key"), "target": rec.get("target")}
+    if clean and path.exists():
+        path.unlink(missing_ok=True)
+    tid = open_upgrade_task(p, db)
+    return {"task": tid, "key": None, "target": None} if tid else None
+
+
 def recent_upgrade_task(p: Project) -> dict | None:
     """The newest upgrade task queued less than TASK_EVERY_S ago, whatever its status."""
     t = p.db.one("SELECT id, created FROM tasks WHERE kind='harness' AND title=? AND created > ? "
@@ -271,10 +308,12 @@ def hold_reason(p: Project, d: dict) -> str:
         return "an upgrade is in flight"
     if push_in_flight(p):
         return "a push is in flight"
-    tid = open_upgrade_task(p)
-    if tid:
-        return f"harness task #{tid} finishes an earlier upgrade"
     rec = p.db.kv(KV_AUTO) or {}
+    h = finish_holder(p)
+    if h:       # a newer release than it targets: `ttp upgrade --auto` retargets the task (once per release)
+        if h["key"] == d["key"] or rec.get("key") == d["key"]:
+            return f"harness task #{h['task']} finishes an earlier upgrade"
+        return ""
     if rec.get("key") == d["key"] and rec.get("outcome") == "deferred":
         if time.time() < float(rec.get("until") or 0):
             return "the merge needs a harness task and one ran less than a day ago"
@@ -319,9 +358,9 @@ def line(p: Project, db, cfg: dict) -> str:
         return text + " (same version from another commit: not applied automatically)"
     if not (cfg.get("upgrade") or {}).get("auto", True):
         return text + f" (upgrade.auto is off: `ttp upgrade {p.name}` applies it)"
-    tid = open_upgrade_task(p, db)
-    if tid:
-        return text + f" (the merge needs harness task #{tid})"
+    h = finish_holder(p, db)
+    if h:
+        return text + f" (the merge needs harness task #{h['task']})"
     rec = db.kv(KV_AUTO) or {}
     if rec.get("key") == d["key"]:
         if rec.get("outcome") == "running":

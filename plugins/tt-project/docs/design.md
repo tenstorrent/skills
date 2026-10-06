@@ -100,8 +100,11 @@ What each supported CLI offers, with doc links: [providers.md](providers.md).
   scratch worktree, and fast-forwards the live harness only when the merge is clean and the
   runtime compiles and imports. Otherwise it queues a harness task and changes nothing.
   It holds the `harness-upgrade` lock (state/locks, released by the OS when it exits) for the whole
-  merge, refuses while another upgrade runs or the upgrade task is open, and does not commit when
-  `main` changed runtime/, prompts/ or bin/ meanwhile. The task applies its resolution with
+  merge, refuses while another upgrade runs, and does not commit when `main` changed runtime/,
+  prompts/ or bin/ meanwhile. The open upgrade task holds the live harness until it ends
+  (state/locks/harness-upgrade.task; stale once the task is done, failed, cancelled or gone): a
+  later `ttp upgrade` commits the newer template on `upstream`, retargets that task (its spec and
+  its running worker's steer.md) and exits 75, never merging into `main`. The task applies its resolution with
   `ttp upgrade <name> --apply <commit>` (fast-forward only). A reference-transaction hook in the
   harness repo refuses every other update of `main` that newly takes in `upstream`.
   Runtime files `main` deleted, emptied or cut short are restored from `upstream`. A file that only

@@ -2032,8 +2032,13 @@ def cmd_upgrade(a) -> None:
         die(f"upgrade refused: another upgrade of {p.name} is running"
             + (f" ({who[0]})" if who else "") + "; nothing was changed", 75)
     try:
-        tid = release.open_upgrade_task(p)      # read under the lock: an upgrade that just ended may have queued it
+        # Read under the lock: an upgrade that just ended may have queued it. A stale record goes here.
+        holder = release.finish_holder(p, clean=True)
+        tid = holder["task"] if holder else None
         mine = bool(tid) and os.environ.get("TTP_TASK") == str(tid)
+        if tid and not mine and a.apply is None:    # the open task takes this release on: one merge, not two
+            release.guard_harness(p.harness)
+            _retarget_upgrade_task(p, holder, a.auto)
         if tid and not mine:      # its worker is resolving the merge: a second resolution would race it
             release.note_deferred(p, task=tid)
             if a.auto:
@@ -2086,25 +2091,13 @@ def _upgrade(p: Project, auto: bool = False) -> None:
         _git(h, "add", "-A")
         _git(h, *ident, "commit", "-q", "-m", "local harness changes before template upgrade")
     base = _git(h, "rev-parse", "HEAD")     # the merge is checked against this; main must not move meanwhile
-    tmp = p.state / "upgrade-wt"
-    if tmp.exists():
-        shutil.rmtree(tmp)
-    _git(h, "worktree", "add", "-q", str(tmp), "upstream")
-    try:
-        for part, dst in (("runtime", "runtime"), ("template/prompts", "prompts"), ("template/bin", "bin")):
-            if (tmp / dst).exists():
-                shutil.rmtree(tmp / dst)
-            _copy_tree(src / part, tmp / dst)
-        _git(tmp, "add", "-A")
-        if _git(tmp, "status", "--porcelain"):
-            _git(tmp, *ident, "commit", "-q", "-m", f"tt-project template {new_v} ({new_c})")
-    finally:
-        _git(h, "worktree", "remove", "--force", str(tmp))
+    _snapshot_upstream(p, src, new_v, new_c, ident)
     kept: dict[str, str] = {}
     merged, problem = _merge_upstream(h, p.state / "upgrade-merge", ident, base, kept)
     if problem:
         _ensure_git_ident(h)        # the task merges and commits in a fresh worktree of this repo
-        tid = release.open_upgrade_task(p)
+        holder = release.finish_holder(p)
+        tid = holder["task"] if holder else None
         last = None if tid else release.recent_upgrade_task(p)
         if last:        # at most one model task a day: each release would otherwise queue its own
             until = float(last["created"]) + release.TASK_EVERY_S
@@ -2123,9 +2116,11 @@ def _upgrade(p: Project, auto: bool = False) -> None:
             print(took + f"{why}, so nothing retries it: rerun `ttp upgrade {p.name}` after {at} "
                          f"to queue a harness task for the merge.")
             sys.exit(1)
+        target = f"{new_v} ({new_c})"
         tid = tid or p.db.add_task(
-            release.UPGRADE_TASK_TITLE, _UPGRADE_TASK.format(problem=problem, name=p.name),
+            release.UPGRADE_TASK_TITLE, _UPGRADE_TASK.format(problem=problem, name=p.name, target=target),
             kind="harness", tier="standard", priority=2, origin="user")
+        release.take_finish_lock(p, tid, f"{new_v} {new_c}", target)     # it holds the live harness until it ends
         release.note_deferred(p, problem, tid)
         if auto:
             release.finish(p, "conflict", task=tid, why=problem[:300])
@@ -2166,6 +2161,71 @@ def _upgrade(p: Project, auto: bool = False) -> None:
               f"restarted and running work was kept."
               + (f" Kept this project's runtime edits that drop names upstream ships: {_cut_list(kept)}." if kept
                  else ""), chat=None, kind="alert", severity="low")
+
+
+def _snapshot_upstream(p: Project, src: Path, new_v: str, new_c: str, ident: list[str]) -> None:
+    """Commit the installed template onto the harness's `upstream` branch (pristine snapshots); main is
+    not touched. No commit when upstream already holds it."""
+    h = p.harness
+    tmp = p.state / "upgrade-wt"
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    _git(h, "worktree", "add", "-q", str(tmp), "upstream")
+    try:
+        for part, dst in (("runtime", "runtime"), ("template/prompts", "prompts"), ("template/bin", "bin")):
+            if (tmp / dst).exists():
+                shutil.rmtree(tmp / dst)
+            _copy_tree(src / part, tmp / dst)
+        _git(tmp, "add", "-A")
+        if _git(tmp, "status", "--porcelain"):
+            _git(tmp, *ident, "commit", "-q", "-m", f"tt-project template {new_v} ({new_c})")
+    finally:
+        _git(h, "worktree", "remove", "--force", str(tmp))
+
+
+_TARGET_RE = re.compile(r"^Target release: .*$", re.M)
+
+
+def _retarget_upgrade_task(p: Project, holder: dict, auto: bool) -> None:
+    """A `ttp upgrade` while harness task holder["task"] finishes a template merge: the installed
+    release goes onto `upstream` (main and the live harness stay as they are) and that task takes it
+    on, so one task finishes the merge for every release meanwhile instead of one task each. A running
+    worker is told through its steer.md; its `--apply` of a merge without the new upstream is refused.
+    Exits 75 (deferred): the open task lands it."""
+    from . import release
+    from .coordinator import _append_update
+    from .project import HOME_DIR
+    src = HOME_DIR / "lib" / "current"
+    tid = holder["task"]
+    if not (src / "runtime").is_dir():
+        return
+    h = p.harness
+    new_v, new_c = _runtime_version(src / "runtime"), recorded_commit(src / "runtime")
+    key, target = f"{new_v} {new_c}", f"{new_v} ({new_c})"
+    before = _git(h, "rev-parse", "upstream")
+    _snapshot_upstream(p, src, new_v, new_c, ["-c", "user.name=tt-project", "-c", "user.email=tt-project@localhost"])
+    moved = _git(h, "rev-parse", "upstream") != before
+    if holder.get("key") != key:
+        task = p.db.task(tid) or {}
+        spec = task.get("spec") or ""
+        line = f"Target release: tt-project {target}"
+        spec = _TARGET_RE.sub(line, spec, 1) if _TARGET_RE.search(spec) else f"{spec.rstrip()}\n\n{line}\n"
+        if moved:
+            upd = (f"Retargeted to tt-project {target}: `upstream` now holds it. Merge `upstream` again in your "
+                   f"worktree (`--apply` refuses a merge without it), resolve, check, then apply.")
+            spec += f"\n## Update\n{upd}\n"
+            for r in p.db.q("SELECT id, dir FROM runs WHERE task=? AND status='running'", (tid,)):
+                if r["dir"]:
+                    _append_update(Path(r["dir"], "steer.md"), upd, f"retarget-{tid}-{new_c}")
+        p.db.update_task(tid, spec=spec)
+        release.take_finish_lock(p, tid, key, target)
+    release.note_deferred(p, task=tid)
+    if auto:
+        release.finish(p, "conflict", task=tid, why=f"harness task #{tid} takes this release on")
+    print(f"upgrade not applied; the running harness is unchanged. Harness task #{tid} is finishing the "
+          f"template merge" + (f" and now targets {target}" if moved or holder.get("key") != key else "")
+          + " (upgrade deferred to that task).")
+    sys.exit(75)
 
 
 def _moved_template(h: Path, base: str) -> str:
@@ -2238,7 +2298,11 @@ def _refuse_unfinished_merge(p: Project, auto: bool) -> None:
 
 _UPGRADE_TASK = """`ttp upgrade` could not apply the new tt-project template on its own: {problem}
 
-The live harness was left untouched. In this harness repo:
+Target release: tt-project {target}
+
+The live harness was left untouched, and this task holds it until it ends: a newer release meanwhile
+moves `upstream` and retargets this task (merge `upstream` again) instead of queuing another.
+In this harness repo:
 1. `git worktree add --detach <tmp> main`, then in <tmp>: `git merge upstream`.
 2. Resolve each conflict keeping this project's intent and taking upstream's fixes.
 3. Check in <tmp>: `python3 -m compileall -q runtime` and `PYTHONPATH=runtime python3 -c "import ttp.daemon, ttp.cli"`.

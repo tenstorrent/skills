@@ -7097,6 +7097,124 @@ def test_only_the_upgrade_task_applies_its_merge_and_a_hand_merge_of_upstream_is
     assert (h / "prompts" / "worker.md").read_text() == "local rule\n"
 
 
+def _upstream_version(h):
+    import re
+    return re.search(r'__version__ = "([^"]+)"', _git_out(h, "show", "upstream:runtime/ttp/__init__.py"))[1]
+
+
+def test_a_newer_release_retargets_the_open_finish_task_instead_of_queuing_another(env, monkeypatch, tmp_path, capsys):
+    """Release after release while one harness task finishes the merge: the same task takes each on
+    (its spec, its running worker and `upstream` move to the newest), main is never merged into, and
+    a merge the task made against the older template can no longer be applied."""
+    from ttp import cli, release
+    p, restarts = _conflicting_upgrade(env, monkeypatch)
+    h = p.harness
+    with pytest.raises(SystemExit):
+        cli.main(["upgrade", "demo"])
+    tid = p.db.one("SELECT id FROM tasks WHERE kind='harness'")["id"]
+    first = release.finish_holder(p)
+    assert first["task"] == tid and "Target release: tt-project " in p.db.task(tid)["spec"]
+    before = _git_out(h, "rev-parse", "HEAD")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    p.db.x("INSERT INTO runs(task, role, status, dir, started) VALUES(?,?,?,?,?)",
+           (tid, "worker", "running", str(run_dir), time.time()))
+    ident = ["-c", "user.name=t", "-c", "user.email=t@t"]
+    wt = tmp_path / "merge"      # the task's merge against the older template
+    _git_out(h, "worktree", "add", "-q", "--detach", str(wt), "main")
+    subprocess.run(["git", "-C", str(wt), *ident, "merge", "upstream"], capture_output=True)
+    (wt / "prompts" / "kind-harness.md").write_text("# Harness task, this project's way\n")
+    _git_out(wt, "add", "-A")
+    _git_out(wt, *ident, "commit", "-qm", "merge upstream")
+    old_merge = _git_out(wt, "rev-parse", "HEAD")
+    _next_release(env)
+    new_v = release.runtime_version(env["home"] / "lib" / "current" / "runtime")
+    monkeypatch.delenv("TTP_TASK", raising=False)
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo"])
+    assert e.value.code == 75 and f"#{tid} is finishing the template merge and now targets" in capsys.readouterr().out
+    assert [t["id"] for t in p.db.q("SELECT id FROM tasks WHERE kind='harness'")] == [tid]
+    spec = p.db.task(tid)["spec"]
+    assert f"Target release: tt-project {new_v} (bbbb2222)" in spec and spec.count("Target release:") == 1
+    assert spec.count("Retargeted to") == 1 and "Retargeted to" in (run_dir / "steer.md").read_text()
+    assert _git_out(h, "rev-parse", "HEAD") == before and not restarts and _upstream_version(h) == new_v
+    assert release.finish_holder(p) == {"task": tid, "key": f"{new_v} bbbb2222", "target": f"{new_v} (bbbb2222)"}
+    with pytest.raises(SystemExit) as e:        # the same release again: nothing new to tell the task
+        cli.main(["upgrade", "demo"])
+    assert e.value.code == 75 and p.db.task(tid)["spec"] == spec
+    assert (run_dir / "steer.md").read_text().count("Retargeted to") == 1
+    monkeypatch.setenv("TTP_TASK", str(tid))
+    with pytest.raises(SystemExit) as e:        # the task's merge of the older template is not applied
+        cli.main(["upgrade", "demo", "--apply", old_merge])
+    assert e.value.code == 1 and _git_out(h, "rev-parse", "HEAD") == before and not restarts
+    subprocess.run(["git", "-C", str(wt), *ident, "merge", "--no-edit", "upstream"], capture_output=True)
+    (wt / "prompts" / "kind-harness.md").write_text("# Harness task, this project's way\n")
+    _git_out(wt, "add", "-A")
+    subprocess.run(["git", "-C", str(wt), *ident, "commit", "-qm", "merge the newer upstream"], capture_output=True)
+    cli.main(["upgrade", "demo", "--apply", _git_out(wt, "rev-parse", "HEAD")])
+    assert release.runtime_version(h / "runtime") == new_v and restarts == [1]
+
+
+@pytest.mark.parametrize("end", ["done", "failed", "cancelled", "gone"])
+def test_the_finish_task_locks_the_live_harness_until_it_ends(env, monkeypatch, end):
+    """While the finish task is open no other upgrade merges into main, not even one that would merge
+    cleanly now, and no other task applies a merge. Its end releases the lock, also when that end was
+    recorded by a restart after a crash (the record outlives every process) or the task is gone."""
+    from ttp import cli, release
+    p, restarts = _conflicting_upgrade(env, monkeypatch)
+    h = p.harness
+    with pytest.raises(SystemExit):
+        cli.main(["upgrade", "demo"])
+    tid = p.db.one("SELECT id FROM tasks WHERE kind='harness'")["id"]
+    before = _git_out(h, "rev-parse", "HEAD")
+    assert release.finish_lock(p).is_file()
+    # Upstream now agrees with the project: the merge would be clean, but the task holds the harness.
+    _install_template(env, {"kind-harness.md": "# Harness task, this project's way\n"})
+    monkeypatch.delenv("TTP_TASK", raising=False)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo"])
+    assert e.value.code == 75 and _git_out(h, "rev-parse", "HEAD") == before and not restarts
+    other = p.db.add_task("Another harness task", "x", kind="harness")
+    monkeypatch.setenv("TTP_TASK", str(other))
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo", "--apply", "upstream"])
+    assert e.value.code == 75 and _git_out(h, "rev-parse", "HEAD") == before
+    monkeypatch.delenv("TTP_TASK", raising=False)
+    # A crash and a restart: the task is back in the queue, so it still holds the harness.
+    p.db.update_task(tid, status="queued")
+    assert release.finish_holder(p)["task"] == tid and release.hold_reason(p, {"key": release.finish_holder(p)["key"]})
+    if end == "gone":
+        p.db.x("DELETE FROM tasks WHERE id=?", (tid,))
+    else:
+        p.db.update_task(tid, status=end)
+    assert release.finish_holder(p) is None and release.finish_lock(p).is_file()   # stale: counts as released
+    cli.main(["upgrade", "demo"])
+    assert restarts == [1] and not release.finish_lock(p).exists()     # cleaned under the upgrade lock
+
+
+def test_with_no_open_finish_task_a_conflict_queues_a_task_that_takes_the_lock(env, monkeypatch, capsys):
+    """No open finish task: a conflict queues one as before (exit 75) and only then is the harness held;
+    once it ended more than a day ago, the next conflict queues a new task that takes the lock over."""
+    from ttp import cli, release
+    p, restarts = _conflicting_upgrade(env, monkeypatch)
+    assert release.finish_holder(p) is None and not release.finish_lock(p).exists()
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo"])
+    tid = p.db.one("SELECT id FROM tasks WHERE kind='harness'")["id"]
+    out = capsys.readouterr().out
+    assert e.value.code == 75 and f"Harness task #{tid} finishes it" in out and "now targets" not in out
+    assert release.finish_holder(p)["task"] == tid and not restarts
+    p.db.update_task(tid, status="failed")
+    p.db.x("UPDATE tasks SET created=? WHERE id=?", (time.time() - 2 * release.TASK_EVERY_S, tid))
+    _next_release(env)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo"])
+    tids = [t["id"] for t in p.db.q("SELECT id FROM tasks WHERE kind='harness' ORDER BY id")]
+    assert e.value.code == 75 and len(tids) == 2 and release.finish_holder(p)["task"] == tids[1]
+    assert "Retargeted" not in p.db.task(tids[1])["spec"]
+
+
 def test_upgrade_stops_clearly_on_an_unfinished_merge_in_the_live_harness(env, monkeypatch, capsys):
     """A hand-run merge the guard hook refused left MERGE_HEAD and its files behind; the upgrade then
     tried to commit them as local changes and died with the hook's refusal instead of saying why."""
@@ -16466,11 +16584,14 @@ def test_a_conflicting_auto_upgrade_queues_one_task_and_is_not_retried(env, monk
     tasks = p.db.q("SELECT id FROM tasks WHERE kind='harness'")
     assert len(tasks) == 1 and p.db.kv("upgrade_auto")["outcome"] == "conflict"
     assert f"the merge needs harness task #{tasks[0]['id']}" in status_text(p)
-    for commit in ("bbbb2222", "cccc3333"):   # the next hour, and a newer release meanwhile
+    for commit in ("bbbb2222", "cccc3333", "cccc3333"):   # the next hour, a newer release, the next hour
         (lib / "runtime" / "ttp" / "SOURCE_COMMIT").write_text(commit + "\n")
         d._release_due = 0
         d.check_release()
-    assert launches == [p.base] and len(p.db.q("SELECT id FROM tasks WHERE kind='harness'")) == 1
+    # The newer release retargets the open task once (no merge into main, no new task); then it holds.
+    assert launches == [p.base] * 2 and len(p.db.q("SELECT id FROM tasks WHERE kind='harness'")) == 1
+    assert "Target release: tt-project " in p.db.task(tasks[0]["id"])["spec"]
+    assert "(cccc3333)" in p.db.task(tasks[0]["id"])["spec"] and _git_out(h, "rev-parse", "HEAD") == before
     assert not p.db.q("SELECT id FROM messages WHERE text LIKE 'tt-project harness upgraded%'")
 
 
