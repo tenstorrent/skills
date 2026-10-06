@@ -12895,7 +12895,7 @@ def test_a_failed_push_check_fails_the_review_with_the_command_and_tail(env, mon
 
 def test_a_broken_target_tip_is_reported_once_and_held_until_the_tip_changes(env, monkeypatch):
     from ttp import pushq
-    s = _pq(env, monkeypatch)
+    s = _pq(env, monkeypatch, push_min_gap_s=0)   # the hold alone, no gap
     tip = _git_out(s.repo, "rev-parse", "refs/remotes/origin/proj")
     _pq_plan(s, outcome="tip_failed", tip=tip, row="requeued", message="the tip of origin/proj fails its checks",
              tip_check={"cmd": "make test", "tail": "the tip is red"})
