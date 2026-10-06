@@ -1520,6 +1520,79 @@ def cmd_detach(a) -> None:
           f"hand off: status waiting, retry_when \"{lk.job_probe([rc], _own_ttp())}\"")
 
 
+def cmd_devq(a) -> None:
+    """The project's serial device-job runners (config `device.runners.<name>`; see devq.py).
+
+    `ttp devq submit <runner> --id <id> [--config <key>] [--timeout <s>] [--workdir <dir>] -- <command>`
+    queues one job on the runner's host and starts the runner if it is down; it prints the retry_when,
+    `ttp devq probe <runner> <id>`, which exits 0 once the job has its done marker, or once no runner is
+    alive while the job waits (the waking run then calls `ttp devq start <runner>` and waits again), and
+    1 while it runs. `status <runner> [<id>]` shows the queue or one job's marker; `clear <runner> <config>`
+    allows a config skipped for its drops again; `list` names the runners."""
+    from . import devq
+    p = here()
+    runners = (((p.config().get("device") or {}).get("runners")) or {}) if p else {}
+    if a.op == "list":
+        if not runners:
+            print("no device runners configured (config device.runners)")
+        for name, rc in sorted(runners.items()):
+            s = devq.settings(rc)
+            print(f"{name}\t{s['host'] or 'this machine'}:{devq.runner_dir(name, s)}")
+        return
+    if not p:
+        die("no tt-project project here")
+    if not a.runner or a.runner not in runners:
+        die(f"no device runner named {a.runner!r}; configured: {', '.join(sorted(runners)) or 'none'}")
+    rc = runners[a.runner]
+    bad = devq.config_problems(a.runner, rc)
+    if bad:
+        die("; ".join(bad))
+    cfg_json = json.dumps(devq.settings(rc))
+    rest = list(a.rest or [])
+    if a.op == "submit":
+        usage = ("usage: ttp devq submit <runner> --id <id> [--config <key>] [--timeout <s>] [--workdir <dir>] "
+                 "-- <command...>")
+        opts, rest = (rest[:rest.index("--")], rest[rest.index("--") + 1:]) if "--" in rest else (rest, [])
+        sp = argparse.ArgumentParser(prog="ttp devq submit", add_help=False)
+        for flag in ("--id", "--config", "--workdir"):
+            sp.add_argument(flag, default="")
+        sp.add_argument("--timeout", type=int, default=0)
+        try:
+            o, extra = sp.parse_known_args(opts)
+        except SystemExit:
+            die(usage)
+        if not o.id or not rest or extra:
+            die(usage)
+        a.id = o.id
+        spec = {"id": o.id, "config": o.config or o.id, "cmd": rest[0] if len(rest) == 1 else shlex.join(rest),
+                "task": os.environ.get("TTP_TASK", ""), "workdir": o.workdir, "timeout_s": o.timeout}
+        args, install, limit = [cfg_json, json.dumps(spec)], True, 120
+    elif a.op == "start":
+        args, install, limit = [cfg_json], True, 120
+    elif a.op in ("probe", "clear"):
+        if len(rest) != 1:
+            die(f"usage: ttp devq {a.op} <runner> <{'id' if a.op == 'probe' else 'config'}>")
+        args, install, limit = rest, False, 50 if a.op == "probe" else 120
+    else:
+        args, install, limit = rest[:1], False, 120
+    argv = devq.host_call(a.runner, rc, a.op, args, install)
+    try:
+        r = subprocess.run(argv, input=devq.source(), text=True, timeout=limit)
+    except subprocess.TimeoutExpired:
+        print(f"ttp devq: the runner's host did not answer within {limit} s", file=sys.stderr)
+        sys.exit(75 if a.op == "probe" else 1)
+    if a.op == "submit" and r.returncode == 0:
+        remote = bool(devq.settings(rc)["host"])
+        print(f"hand off: status waiting, retry_when \"{_own_ttp_word(p)} devq probe {a.runner} {a.id}\", "
+              f"wake_tier light{', survives_reboot true' if remote else ''}")
+    sys.exit(r.returncode)
+
+
+def _own_ttp_word(p: Project | None) -> str:
+    from .push import _own_ttp
+    return _own_ttp(p)
+
+
 # operating ----------------------------------------------------------------------------------------
 def cmd_ci(a) -> None:
     """CI probe for `retry_when`: exit 0 once the commit's GitHub Actions runs completed or one of
@@ -2606,6 +2679,14 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--default-min", type=float, default=ciwait.DEFAULT_MIN,
                    help="the limit in minutes when no finished run of the workflow is known")
     s.set_defaults(fn=cmd_ci)
+
+    s = sub.add_parser("devq", help="queue jobs on the project's serial device-job runner (config device.runners)")
+    s.add_argument("op", choices=["submit", "probe", "start", "status", "clear", "list"])
+    s.add_argument("runner", nargs="?")
+    s.add_argument("rest", nargs=argparse.REMAINDER,
+                   help="submit: --id <unique id> [--config <drop-rule key; default the id>] [--timeout <s>] "
+                        "[--workdir <dir on the host>] -- <command>; probe: <id>; status: [<id>]; clear: <config>")
+    s.set_defaults(fn=cmd_devq)
 
     for name, fn in (("list", cmd_list),):
         sub.add_parser(name).set_defaults(fn=fn)

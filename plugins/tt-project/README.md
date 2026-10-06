@@ -200,7 +200,18 @@ and preferences you add later become part of the project's charter and memory.
   get the `needs_device` label, and at most `device.max_tasks` of them run at once. A worker starts
   a long job with `ttp detach <name> -- <command>`; a run that ends without a hand-off, or waiting
   without a `retry_when`, then waits on `ttp detach --check`, which exits 0 once each job wrote its
-  exit code or its process is gone. Locks and pauses are per project; a
+  exit code or its process is gone. Config `device.runners.<name>` (opt-in) sets up one serial
+  device-job runner per device host instead of a driver per task: `host` (ssh alias; empty = this
+  machine), `dir` (its state folder there), `health` (a command that must pass before each job),
+  `drop_check` (a command that tells a device drop from a plain failure), `max_drops` (default 2),
+  `health_wait_s`, `job_timeout_s` and `idle_exit_s`. A task queues each device job with
+  `ttp devq submit <runner> --id <id> [--config <key>] -- <command>` and waits on
+  `ttp devq probe <runner> <id>`, which exits 0 once the job's done marker is written (done, failed
+  or skipped, with exit code and log) or once no runner is alive while the job waits. The runner is
+  started under a lock (a second start does nothing), runs jobs in arrival order, runs a job again
+  after a drop or a host reboot, and skips a config that dropped `max_drops` times in a row until
+  `ttp devq clear <runner> <config>`; drops go to its `drops.log`. `ttp devq status` shows the queue.
+  Locks and pauses are per project; a
   resource that several projects on one machine use is declared shared (`shared_resources` in the
   config, or `ttp machines add <alias> --shared [names]`), and then all of them take turns on its
   slots, a pause of it holds in each, and `ttp status` shows which project holds or paused it.

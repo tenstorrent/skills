@@ -24265,3 +24265,195 @@ def test_ci_probe_targets_the_newest_commit_per_workflow(env):
             {"databaseId": 4, "headSha": "bbb", "workflowName": "CI", "createdAt": "2026-01-01T12:00:00Z"}]
     assert sorted(r["databaseId"] for r in ciwait.targets(runs, None)) == [2, 3]
     assert [r["databaseId"] for r in ciwait.targets(runs, "aa")] == [1]
+
+
+# Serial device-job runner (`ttp devq`, devq.py): fake jobs, health gates and drop checks only.
+DEVQ = RUNTIME / "ttp" / "devq.py"
+DEVQ_FAST = {"poll_s": 0.05, "health_poll_s": 0.05, "idle_exit_s": 30, "health_timeout_s": 10}
+
+
+@pytest.fixture
+def devq_dir(tmp_path):
+    """A runner state folder; any runner or job still alive at the end is stopped by its own pid."""
+    d = tmp_path / "devq"
+    yield d
+    for pidf in [d / "runner.pid"]:
+        try:
+            os.kill(int(pidf.read_text()), signal.SIGKILL)
+        except (OSError, ValueError):
+            pass
+    for st in (d / "running").glob("*.state.json") if (d / "running").exists() else []:
+        pid = (json.loads(st.read_text()).get("cur") or {}).get("pid")
+        if pid:
+            with contextlib.suppress(OSError):
+                os.killpg(pid, signal.SIGKILL)
+
+
+def _devq(*args, timeout=30):
+    return subprocess.run([sys.executable, str(DEVQ), *[str(a) for a in args]], capture_output=True, text=True,
+                          timeout=timeout)
+
+
+def _devq_submit(d, cfg, job, cmd, **spec):
+    r = _devq("submit", d, json.dumps({**DEVQ_FAST, **cfg}), json.dumps({"id": job, "cmd": cmd, **spec}))
+    assert r.returncode == 0, r.stderr
+    return r
+
+
+def _devq_marker(d, job, timeout=20):
+    assert _wait_for_path(d / "done" / f"{job}.json", timeout), (d / "runner.log").read_text()
+    return json.loads((d / "done" / f"{job}.json").read_text())
+
+
+def _devq_runner_pids(d):
+    return [line for line in (d / "runner.log").read_text().splitlines() if "runner started" in line]
+
+
+def test_devq_start_is_idempotent_one_runner_holds_the_lock(devq_dir):
+    d = devq_dir
+    first = _devq("start", d, json.dumps(DEVQ_FAST))
+    assert first.returncode == 0 and "runner started" in first.stdout, first.stderr
+    second = _devq("start", d, json.dumps(DEVQ_FAST))
+    assert second.returncode == 0 and "already running" in second.stdout
+    pid = int((d / "runner.pid").read_text())
+    assert len(_devq_runner_pids(d)) == 1
+    # A runner started by hand while one is up exits at once without touching anything.
+    assert _devq("run", d).returncode == 0
+    assert len(_devq_runner_pids(d)) == 1 and int((d / "runner.pid").read_text()) == pid
+    os.kill(pid, 0)
+
+
+def test_devq_runs_jobs_in_order_once_the_health_gate_passes_and_writes_done_markers(devq_dir, tmp_path):
+    d, gate, order = devq_dir, tmp_path / "gate", tmp_path / "order"
+    cfg = {"health": f"test -e {gate} || {{ echo device not ready; exit 1; }}"}
+    for job, rc in (("t1-a", 0), ("t2-b", 0), ("t1-c", 3)):
+        _devq_submit(d, cfg, job, f"echo {job} >> {order}; echo out-{job}; exit {rc}", task="t1")
+    time.sleep(0.5)
+    assert not order.exists(), "the gate refuses: nothing runs"
+    assert "waiting: health check exit 1: device not ready" in (d / "state").read_text()
+    assert _devq("probe", d, "t2-b").returncode == 1, "queued under a live runner"
+    gate.touch()
+    markers = {job: _devq_marker(d, job) for job in ("t1-a", "t2-b", "t1-c")}
+    assert order.read_text().split() == ["t1-a", "t2-b", "t1-c"]
+    assert [(m["status"], m["rc"]) for m in markers.values()] == [("done", 0), ("done", 0), ("failed", 3)]
+    assert pathlib.Path(markers["t2-b"]["log"]).read_text().strip() == "out-t2-b"
+    assert markers["t1-a"]["task"] == "t1" and markers["t1-a"]["attempts"] == 1 and markers["t1-a"]["drops"] == []
+    probe = _devq("probe", d, "t1-c")
+    assert probe.returncode == 0 and "failed rc=3" in probe.stdout
+    again = _devq("submit", d, json.dumps(DEVQ_FAST), json.dumps({"id": "t1-a", "cmd": "true"}))
+    assert again.returncode == 2 and "already used" in again.stderr
+    assert not list((d / "running").iterdir()), "nothing left behind once every job finished"
+
+
+def test_devq_requeues_a_dropped_job_and_skips_a_config_after_max_drops(devq_dir, tmp_path):
+    d, count = devq_dir, tmp_path / "count"
+    cfg = {"drop_check": 'grep -q DEVICE-LOST "$TTP_DEVQ_LOG" && echo "lost chips in $TTP_DEVQ_JOB"'}
+    # Drops once, then passes: run again, done, the drop recorded and the config's count cleared.
+    flaky = (f"n=$(cat {count} 2>/dev/null || echo 0); echo $((n + 1)) > {count}; "
+             f"[ $n -ge 1 ] || {{ echo DEVICE-LOST; exit 1; }}")
+    _devq_submit(d, cfg, "flaky-1", flaky, config="cfg-a")
+    m = _devq_marker(d, "flaky-1")
+    assert m["status"] == "done" and m["attempts"] == 2 and len(m["drops"]) == 1
+    assert "lost chips in flaky-1" in (d / "drops.log").read_text()
+    assert not (d / "configs" / "cfg-a").exists()
+    # A plain failure is no drop: not run again.
+    _devq_submit(d, cfg, "plain-1", "exit 5", config="cfg-p")
+    assert (_devq_marker(d, "plain-1")["status"], _devq_marker(d, "plain-1")["attempts"]) == ("failed", 1)
+    # Drops every time: skipped after max_drops (2), and a later job of that config is skipped unrun.
+    _devq_submit(d, cfg, "bad-1", "echo DEVICE-LOST; exit 1", config="cfg-b")
+    m = _devq_marker(d, "bad-1")
+    assert m["status"] == "skipped" and m["attempts"] == 2 and len(m["drops"]) == 2
+    assert "cfg-b dropped 2 times in a row" in m["reason"]
+    _devq_submit(d, cfg, "bad-2", f"touch {tmp_path / 'ran'}", config="cfg-b")
+    assert _devq_marker(d, "bad-2")["status"] == "skipped" and not (tmp_path / "ran").exists()
+    assert "cleared" in _devq("clear", d, "cfg-b").stdout
+    _devq_submit(d, cfg, "bad-3", f"touch {tmp_path / 'ran'}", config="cfg-b")
+    assert _devq_marker(d, "bad-3")["status"] == "done"
+
+
+def test_devq_health_gate_refusal_skips_the_job_after_health_wait(devq_dir, tmp_path):
+    d = devq_dir
+    _devq_submit(d, {"health": "echo broker held; exit 4", "health_wait_s": 0.3}, "held-1",
+                 f"touch {tmp_path / 'ran'}")
+    m = _devq_marker(d, "held-1")
+    assert m["status"] == "skipped" and "health gate refused" in m["reason"] and "broker held" in m["reason"]
+    assert m["attempts"] == 0 and not (tmp_path / "ran").exists()
+
+
+def test_devq_probe_exit_codes(devq_dir):
+    import fcntl
+    d = devq_dir
+    assert _devq("probe", d, "nope").returncode == 0, "unknown job: wake and look"
+    (d / "queue").mkdir(parents=True)
+    (d / "queue" / "00000000000000000001-t5-x.json").write_text(json.dumps({"id": "t5-x", "cmd": "true"}))
+    (d / "queue" / "00000000000000000002-x.json").write_text(json.dumps({"id": "x", "cmd": "true"}))
+    dead = _devq("probe", d, "t5-x")
+    assert dead.returncode == 0 and "no runner is alive" in dead.stdout, "pending with the runner dead: wake"
+    with open(d / "runner.lock", "a") as lock:   # a live runner holds this lock
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert _devq("probe", d, "t5-x").returncode == 1
+        assert _devq("probe", d, "x").returncode == 1, "a job id that ends another's is still its own"
+    assert sorted(p.name for p in d.iterdir()) == ["queue", "runner.lock"], "the probe writes nothing"
+
+
+def test_devq_restart_requeues_a_job_a_reboot_killed_and_adopts_one_still_running(devq_dir, tmp_path):
+    d, flag = devq_dir, tmp_path / "flag"
+    # Reboot: runner and job both die. The probe wakes the task; start runs the job again as a drop.
+    _devq_submit(d, {}, "long-1", f"[ -e {flag} ] && exit 0; touch {tmp_path / 'started'}; sleep 60")
+    assert _wait_for_path(tmp_path / "started")
+    st = json.loads((d / "running" / "long-1.state.json").read_text())
+    os.kill(int((d / "runner.pid").read_text()), signal.SIGKILL)
+    os.killpg(st["cur"]["pid"], signal.SIGKILL)
+    deadline = time.time() + 10
+    while time.time() < deadline and _devq("probe", d, "long-1").returncode != 0:
+        time.sleep(0.05)
+    assert "no runner is alive" in _devq("probe", d, "long-1").stdout
+    flag.touch()
+    assert _devq("start", d, json.dumps(DEVQ_FAST)).returncode == 0
+    m = _devq_marker(d, "long-1")
+    assert m["status"] == "done" and m["attempts"] == 2 and "interrupted" in m["drops"][0]
+    assert "kind=interrupted" in (d / "drops.log").read_text()
+    # Only the runner dies: its successor waits for the job and takes its exit code, no drop.
+    go = tmp_path / "go"
+    _devq_submit(d, {}, "long-2", f"touch {tmp_path / 'started2'}; while [ ! -e {go} ]; do sleep 0.05; done; exit 7")
+    assert _wait_for_path(tmp_path / "started2")
+    os.kill(int((d / "runner.pid").read_text()), signal.SIGKILL)
+    assert _devq("start", d, json.dumps(DEVQ_FAST)).returncode == 0
+    go.touch()
+    m = _devq_marker(d, "long-2")
+    assert (m["status"], m["rc"], m["attempts"], m["drops"]) == ("failed", 7, 1, [])
+
+
+def test_ttp_devq_cli_submits_locally_and_the_config_and_prompt_name_the_runner(env, tmp_path):
+    p = make(env)
+    d = tmp_path / "rq"
+    p.set_config("device", {"runners": {"dev": {"dir": str(d), **DEVQ_FAST}}})
+    try:
+        r = _ttp_run(p, "devq", "submit", "dev", "--id", "t9-a", "--config", "c9", "--",
+                     "sh", "-c", "echo hello from $TTP_DEVQ_JOB", env={"TTP_TASK": "9"})
+        assert r.returncode == 0, r.stderr
+        assert "queued t9-a" in r.stdout and "devq probe dev t9-a" in r.stdout and "survives_reboot" not in r.stdout
+        m = _devq_marker(d, "t9-a")
+        assert m["status"] == "done" and m["task"] == "9" and m["config"] == "c9"
+        assert pathlib.Path(m["log"]).read_text().strip() == "hello from t9-a"
+        assert (d / "devq.py").read_text() == DEVQ.read_text(), "the runner runs from its own copy"
+        assert _ttp_run(p, "devq", "probe", "dev", "t9-a").returncode == 0
+        assert "done" in _ttp_run(p, "devq", "status", "dev", "t9-a").stdout
+        assert "dev\tthis machine" in _ttp_run(p, "devq", "list").stdout
+        assert _ttp_run(p, "devq", "probe", "other", "x").returncode == 2
+    finally:
+        with contextlib.suppress(OSError, ValueError):
+            os.kill(int((d / "runner.pid").read_text()), signal.SIGKILL)
+    from ttp import devq
+    from ttp.project import config_problems
+    from ttp.prompts import worker_task
+    argv = devq.host_call("dev", {"host": "box", "dir": "~/q dir"}, "probe", ["t1"], install=False)
+    assert argv[:3] == ["ssh", "-o", "BatchMode=yes"] and argv[-2] == "box"
+    assert argv[-1] == "exec python3 - probe \"$HOME\"/'q dir' t1"
+    assert "cat >" in devq.host_call("dev", {}, "submit", ["{}", "{}"], install=True)[-1]
+    assert config_problems({"device": {"runners": {"dev": {"helth": "x", "max_drops": -1}}}}) == [
+        "device.runners.dev.helth: unknown key", "device.runners.dev.max_drops: -1 is not a number >= 0"]
+    tid = p.db.add_task("run it", "s", kind="work", tier="light", origin="user")
+    assert "device runners: dev (on this machine)" in worker_task(p, p.db.task(tid), str(p.root), None)
+    p.set_config("device", {"runners": {}})
+    assert "device runners" not in worker_task(p, p.db.task(tid), str(p.root), None)

@@ -83,7 +83,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "resources": {},                    # shared-slot limits, e.g. {"device": 1}
     # Lock names that all mean the one device (they share one `ttp lock` slot), and how many tasks
     # tagged needs_device may run at once; `ttp lock` admits one of them at a time to the device.
-    "device": {"locks": [], "max_tasks": 2},
+    # runners: serial device-job runners by name, each {"host", "dir", "health", "drop_check", ...}
+    # (devq.RUNNER_DEFAULTS); tasks queue device jobs on one with `ttp devq submit` instead of each
+    # running its own detached driver. Empty: none, and workers keep the detached-driver path.
+    "device": {"locks": [], "max_tasks": 2, "runners": {}},
     "shared_resources": [],             # resources whose slots and pause all the user's projects share
     # model / effort, when set, override the coordinator tier's for the coordinator only.
     # unblock_effort: the least effort of a tricky or blocking turn (coordinator.effort_triggers);
@@ -340,6 +343,12 @@ def config_problems(raw: dict) -> list[str]:
     out += [why for why in [backup_problem(delivery)] if why]
     out += [f"delivery.push_checks: {p}" for p in check_problems(delivery.get("push_checks"))]
     out += bump_problems(delivery.get("version_bump"))
+    from .devq import config_problems as runner_problems
+    runners = (raw.get("device") or {}).get("runners")
+    if runners is not None and not isinstance(runners, dict):
+        out.append("device.runners: not a table of runners by name")
+    for name, rcfg in (runners if isinstance(runners, dict) else {}).items():
+        out += runner_problems(name, rcfg)
     may_push = delivery.get("code_tasks_may_push", False)
     if not isinstance(may_push, bool):
         out.append(f"delivery.code_tasks_may_push: {may_push!r} is not true or false; code tasks do not push")

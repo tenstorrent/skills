@@ -141,6 +141,15 @@ def _resource_line(task: dict) -> str:
     return out
 
 
+def _runner_line(cfg: dict) -> str:
+    runners = (cfg.get("device") or {}).get("runners") or {}
+    if not isinstance(runners, dict) or not runners:
+        return ""
+    names = ", ".join(f"{n} (on {(r or {}).get('host') or 'this machine'})" for n, r in sorted(runners.items()))
+    return (f"device runners: {names}; queue every device job with `ttp devq submit`, never a detached "
+            "driver of your own\n")
+
+
 def worker_system(p: Project) -> str:
     """The part of a worker's prompt shared by every task, whatever its kind or tier, until the
     charter or memory changes: sent as the system prompt where the agent allows it, so the provider
@@ -219,6 +228,7 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
         f"{task['max_attempts']} · budget ${task['budget_usd'] or 0:.2f} (spent ${task['spent_usd'] or 0:.2f})\n"
         f"working directory: {cwd}" + (f" · branch: {branch}" if branch else "") + "\n"
         + _resource_line(task)
+        + _runner_line(cfg)
         + f"project root: {p.root}\n"
         + venv_line
         + f"delivery policy: draft PRs={delivery.get('draft_prs', True)}, review before PR="
