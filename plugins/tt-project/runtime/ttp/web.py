@@ -13,7 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from . import alerts
+from . import alerts, awake
 from . import budget as bud
 from . import globalcap as gcap
 from . import coordinator as coord
@@ -362,6 +362,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         "undelivered": undelivered,
         "why_idle": "; ".join(why) if not running else "", "held": held,
         "host": host_line(db.boots(now - DAY)),
+        "idle_sleep": awake.line(db.kv(awake.KV), (db.kv("daemon", {}) or {}).get("pid")) if alive else "",
         "release": release.line(p, db, cfg),
         "schedules_broken": sched.broken_line(db),
         "schedules_waiting": sched.waiting_line(db),

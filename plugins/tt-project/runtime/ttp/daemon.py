@@ -29,6 +29,7 @@ import uuid
 from pathlib import Path
 
 from . import alerts
+from . import awake
 from . import budget as bud
 from . import globalcap as gcap
 from . import coordinator as coord
@@ -264,6 +265,7 @@ class Daemon:
         self._sched_sig: tuple[int, int] | None = None   # harness/schedules.json (mtime, size) last checked
         self._sched_read = 0.0   # monotonic time it was last read
         self._sched_problem: str | None = None   # what was wrong with it, last logged
+        self._idle = awake.IdleHold(record=lambda state: self.p.db.set_kv(awake.KV, state))
         self._note_boot()
 
     # lifecycle ------------------------------------------------------------------------------------
@@ -285,7 +287,6 @@ class Daemon:
         self.sync_schedules(start=True)
         from .web import serve
         threading.Thread(target=serve, args=(self,), daemon=True).start()
-        self._keep_awake()
         self.check_integrity(start=True)
         while not self.stopping:
             try:
@@ -299,6 +300,7 @@ class Daemon:
                 time.sleep(10)
             time.sleep(TICK_S)
         log(self.p, "daemon stop")
+        self._idle.release()
         self._ends.stop()   # end-condition probes are rerun after the next start
         if _read_pid(pidfile) == os.getpid():
             pidfile.unlink(missing_ok=True)
@@ -463,6 +465,7 @@ class Daemon:
                      self.sync_schedules, self.lint_charter):
             step()
             self._progress()
+        self._idle.update(self.cfg, self._has_work)
         if self.p.db.kv("paused", False):
             return
         self._refresh_meters()
@@ -3644,18 +3647,16 @@ class Daemon:
             db.set_kv("slack_replies", {"floor": oldest, "read": {k: v for k, v in read.items() if float(k) >= keep}})
 
     # misc -------------------------------------------------------------------------------------------
-    def _keep_awake(self) -> None:
-        """On a Mac, hold off idle sleep while the daemon runs (on AC power only, by default)."""
-        mode = self.cfg.get("power", {}).get("keep_awake", "on_ac")
-        if sys.platform != "darwin" or mode in (False, "off", "never"):
-            return
-        flag = "-s" if mode == "on_ac" else "-i"
-        try:
-            subprocess.Popen(["caffeinate", flag, "-w", str(os.getpid())], stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, start_new_session=True)
-        except OSError:
-            pass
-
+    def _has_work(self) -> bool:
+        """Work that keeps a Mac awake (awake.IdleHold): a running run or push, or, unpaused, a queued
+        task that could start now under an open gate. Deferred, waiting, paused and blocked tasks do not count."""
+        db = self.p.db
+        if db.one("SELECT 1 FROM runs WHERE status='running' LIMIT 1") or \
+                db.one("SELECT 1 FROM tasks WHERE status='pushing' LIMIT 1"):
+            return True
+        if db.kv("paused", False) or self.gates and not any(g.allow_new_work for g in self.gates.values()):
+            return False
+        return self._dispatchable()
 
 def needs_device(task: dict, cfg: dict) -> bool:
     """Tagged `needs_device`, or names a device lock (config `device.locks`) as a resource. Only with

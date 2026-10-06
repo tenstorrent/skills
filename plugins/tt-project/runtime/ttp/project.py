@@ -134,7 +134,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # "on" or "off" forces it (see jevuse.py).
     "jev": {"enabled": "auto", "window_days": 7, "min_calls": 30, "uses": {}},
     "web": {"bind": "127.0.0.1", "port": 0},
-    "power": {"keep_awake": "on_ac"},
+    "power": {},                        # keep_awake: replaced by runner.prevent_idle_sleep; "off" still turns it off
     # Disk guard: with free space under the project folder below the smaller of min_free_pct of the
     # disk and min_free_gb (either 0 = off), only question and plan tasks start; a machines-list entry's
     # own min_free_gb replaces min_free_gb on that machine (see machines.py). Once tripped, the guard
@@ -168,7 +168,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # the pushes and push batches the daemon starts run this many nice levels below the daemon
     # (0-19; 0 = normal priority), so they never slow the host's own work. The daemon and the
     # coordinator's turns keep normal priority.
-    "runner": {"nice": 10},
+    # prevent_idle_sleep (auto/on/off): on macOS, while the project has work and the machine is on AC
+    # power, the daemon keeps the machine from idle-sleeping (`caffeinate -i`; a closed lid or a sleep
+    # the user asks for still sleeps it). auto = on for workstations (a Mac is one); other platforms never.
+    "runner": {"nice": 10, "prevent_idle_sleep": "auto"},
 }
 
 
@@ -186,6 +189,7 @@ EXTRA_KEYS = {
                  "version_bump", "push_queue", "push_batch_s", "push_batch_max", "push_min_gap_s", "after_push",
                  "after_push_timeout_s", "backup_remote"},
     "jev": {"via", "url", "model"},
+    "power": {"keep_awake"},
 }
 OPEN_SECTIONS = {"resources"}           # any name below is fine
 PROVIDER_KEYS = {"tiers", "plugin_dirs", "worker_isolation", "mcp_servers"}
@@ -368,6 +372,9 @@ def config_problems(raw: dict) -> list[str]:
         out += setting_problems(raw["budget"])
     if isinstance(raw.get("runner"), dict) and "nice" in raw["runner"]:
         out += [why for why in [nice_level(raw["runner"])[1]] if why]
+    v = (raw.get("runner") or {}).get("prevent_idle_sleep") if isinstance(raw.get("runner"), dict) else None
+    if v is not None and not isinstance(v, bool) and str(v).strip().lower() not in ("auto", "on", "off"):
+        out.append(f"runner.prevent_idle_sleep: {v!r} is not auto, on or off; auto is used")
     return out
 
 def deep_merge(base: dict, over: dict) -> dict:

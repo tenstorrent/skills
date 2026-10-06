@@ -189,6 +189,12 @@ and preferences you add later become part of the project's charter and memory.
   daemon's pushes run at low CPU priority, 10 nice levels below the daemon (`runner.nice`, 0-19;
   0 = normal priority), so they never slow the machine's own work. The daemon and the coordinator
   keep normal priority. Each run's `exit.json` records the level its agent ran at.
+- On macOS, while the project has work (a running run or push, or queued work that can start now)
+  and the machine is on AC power, the daemon keeps it from idle-sleeping with `caffeinate -i`, tied
+  to the daemon's process so it ends with it. A closed lid or a sleep you ask for still sleeps the
+  machine. It lets go when the work ends, on battery, or with `runner.prevent_idle_sleep` set to
+  `off` (`auto`, the default, is on for a Mac; other platforms never hold one). `ttp status` and
+  the web app say when it is held, or why not while there is work.
 - A shared device or machine is taken per command, through its own queue (for example a device
   broker) or `ttp lock <resource> -- <command>`, so the rest of each task runs in parallel. A task
   marked exclusive holds the resource's lock for its whole run; while it waits for a slot, new

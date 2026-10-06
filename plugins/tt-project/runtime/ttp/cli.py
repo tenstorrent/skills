@@ -733,6 +733,8 @@ def status_text(p: Project) -> str:
         lines.append(f"muted: {scr.mute_line(m, now)}")
     if h.get("host"):
         lines.append(h["host"])
+    if h.get("idle_sleep"):
+        lines.append(h["idle_sleep"])
     if h.get("release"):
         lines.append(h["release"])
     if h.get("local_only"):

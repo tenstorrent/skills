@@ -24814,3 +24814,181 @@ def test_ttp_devq_cli_submits_locally_and_the_config_and_prompt_name_the_runner(
     assert "device runners: dev (on this machine)" in worker_task(p, p.db.task(tid), str(p.root), None)
     p.set_config("device", {"runners": {}})
     assert "device runners" not in worker_task(p, p.db.task(tid), str(p.root), None)
+
+
+class _FakeCaffeinate:
+    """Stands in for the caffeinate child: records its argv and whether it was ended and reaped."""
+    started: list = []
+
+    def __init__(self, argv, **kw):
+        self.argv, self.kw, self.pid = argv, kw, 4242 + len(_FakeCaffeinate.started)
+        self.ended = self.reaped = False
+        _FakeCaffeinate.started.append(self)
+
+    def poll(self):
+        return 0 if self.ended else None
+
+    def terminate(self):
+        self.ended = True
+
+    def kill(self):
+        self.ended = True
+
+    def wait(self, timeout=None):
+        self.reaped = True
+        return 0
+
+
+def _idle_hold(platform="darwin", ac=True):
+    from ttp import awake
+    _FakeCaffeinate.started = []
+    power = {"ac": ac, "reads": 0}
+
+    def read():
+        power["reads"] += 1
+        return power["ac"]
+    shown = []
+    h = awake.IdleHold(platform=platform, power=read, spawn=_FakeCaffeinate, pid=777, record=shown.append)
+    h._fresh = lambda: setattr(h, "_ac", None)   # forget the cached power reading, as after POWER_EVERY_S
+    return h, power, shown
+
+
+def test_idle_sleep_held_on_ac_with_work_by_caffeinate_i_tied_to_the_daemon(env):
+    h, _, shown = _idle_hold()
+    h.update({}, lambda: True)
+    [c] = _FakeCaffeinate.started
+    assert c.argv == ["caffeinate", "-i", "-w", "777"]
+    assert not {"-s", "-d", "-u", "-m"} & set(c.argv), "only idle sleep is held: lid close and user sleep stay"
+    assert c.kw.get("start_new_session") is True
+    assert shown == [{"daemon": 777, "held": True, "pid": c.pid, "why": ""}]
+
+
+@pytest.mark.parametrize("platform,ac,work,cfg,why", [
+    ("darwin", False, True, {}, "on battery power"),
+    ("darwin", True, False, {}, ""),
+    ("darwin", True, True, {"runner": {"prevent_idle_sleep": "off"}}, "off by config (runner.prevent_idle_sleep)"),
+    ("darwin", True, True, {"runner": {"prevent_idle_sleep": False}}, "off by config (runner.prevent_idle_sleep)"),
+    ("darwin", True, True, {"power": {"keep_awake": "off"}}, "off by config (runner.prevent_idle_sleep)"),
+    ("linux", True, True, {}, None),
+])
+def test_idle_sleep_not_held_on_battery_without_work_config_off_or_off_macos(env, platform, ac, work, cfg, why):
+    h, power, shown = _idle_hold(platform, ac)
+    checked = []
+    h.update(cfg, lambda: checked.append(1) or work)
+    assert _FakeCaffeinate.started == []
+    if why is None:
+        assert shown == [] and checked == [] and power["reads"] == 0, "nothing is read or spawned off macOS"
+    else:
+        assert shown == ([{"daemon": 777, "held": False, "pid": None, "why": why}] if why else [])
+
+
+def test_idle_sleep_released_when_work_ends_or_on_battery_and_never_held_twice(env):
+    h, power, shown = _idle_hold()
+    for _ in range(5):
+        h.update({}, lambda: True)
+    assert len(_FakeCaffeinate.started) == 1, "one assertion at a time"
+    first = _FakeCaffeinate.started[0]
+    assert power["reads"] == 1, "the power source is read at most every POWER_EVERY_S"
+    h.update({}, lambda: False)
+    assert first.ended and first.reaped and h.proc is None
+    assert shown[-1] is None
+    h.update({}, lambda: True)
+    second = _FakeCaffeinate.started[-1]
+    assert len(_FakeCaffeinate.started) == 2 and not second.ended
+    power["ac"] = False
+    h._fresh()
+    h.update({}, lambda: True)
+    assert second.ended and second.reaped and h.proc is None
+    assert shown[-1]["why"] == "on battery power" and not shown[-1]["held"]
+    h.update({"runner": {"prevent_idle_sleep": "on"}}, lambda: True)
+    assert len(_FakeCaffeinate.started) == 2
+    power["ac"] = True
+    h._fresh()
+    h.update({}, lambda: True)
+    third = _FakeCaffeinate.started[-1]
+    third.ended = True   # someone killed it: the next tick holds again
+    h.update({}, lambda: True)
+    assert len(_FakeCaffeinate.started) == 4 and not _FakeCaffeinate.started[-1].ended
+    h.release()
+    assert _FakeCaffeinate.started[-1].ended and _FakeCaffeinate.started[-1].reaped and shown[-1] is None
+
+
+def test_idle_sleep_power_source_unreadable_counts_as_battery(env):
+    from ttp import awake
+    ac = "Now drawing from 'AC Power'\n -InternalBattery-0 (id=1)\t100%; charged; 0:00 remaining present: true\n"
+    batt = "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=1)\t80%; discharging\n"
+    ok = lambda out, rc=0: (lambda argv, **kw: subprocess.CompletedProcess(argv, rc, out, ""))
+    assert awake.on_ac_power(ok(ac))
+    assert not awake.on_ac_power(ok(batt))
+    assert not awake.on_ac_power(ok(ac, rc=1))
+
+    def missing(argv, **kw):
+        raise FileNotFoundError(2, "No such file or directory")
+    assert not awake.on_ac_power(missing)
+
+    def slow(argv, **kw):
+        raise subprocess.TimeoutExpired(argv, 10)
+    assert not awake.on_ac_power(slow)
+
+
+def test_idle_sleep_work_is_running_or_startable_work_only(env):
+    p = make(env)
+    from ttp import daemon as dm
+    d = dm.Daemon(p.base)
+    d.cfg = p.config()
+    assert not d._has_work()
+    tid = p.db.add_task("later", "s", kind="work", tier="light", origin="user", not_before=time.time() + 3600,
+                        labels=[f"start_after:{time.time() + 3600}"])
+    p.db.add_task("probe", "s", kind="work", tier="light", origin="user", labels=["start_when:false"])
+    p.db.add_task("stuck", "s", kind="work", tier="light", origin="user", status="blocked")
+    assert not d._has_work(), "deferred and blocked tasks keep no machine awake"
+    p.db.update_task(tid, not_before=None, labels="[]")
+    assert d._has_work()
+    p.db.kv("paused") or p.db.set_kv("paused", True)
+    assert not d._has_work(), "a paused project starts nothing new"
+    p.db.x("INSERT INTO runs(role,provider,started,status) VALUES('worker','fake',?,'running')", (time.time(),))
+    assert d._has_work(), "running work is work, paused or not"
+
+
+def test_idle_sleep_released_on_daemon_shutdown_and_shown_in_status(env, monkeypatch):
+    p = make(env)
+    from ttp import awake, daemon as dm, web
+    from ttp.cli import status_text
+    d = dm.Daemon(p.base)
+    _FakeCaffeinate.started = []
+    d._idle = awake.IdleHold(platform="darwin", power=lambda: True, spawn=_FakeCaffeinate,
+                             record=lambda state: p.db.set_kv(awake.KV, state))
+    seen = []
+
+    def tick():
+        d._idle.update(d.cfg, lambda: True)
+        seen.append(status_text(p))
+        d.stopping = True
+
+    monkeypatch.setattr(d, "tick", tick)
+    monkeypatch.setattr(web, "serve", lambda daemon: None)
+    monkeypatch.setattr(dm.signal, "signal", lambda *a: None)
+    monkeypatch.setattr(dm.time, "sleep", lambda s: None)
+    assert d.run() == 0
+    [c] = _FakeCaffeinate.started
+    assert f"idle sleep: held while there is work (caffeinate pid {c.pid})" in seen[0]
+    assert c.ended and c.reaped, "shutdown ends and reaps the assertion"
+    assert p.db.kv(awake.KV) is None
+    assert "idle sleep" not in status_text(p)
+    pid = os.getpid()
+    p.db.set_kv("daemon", {"pid": pid, "host": p.db.kv("daemon")["host"], "started": time.time()})
+    p.db.set_kv(awake.KV, {"daemon": pid, "held": False, "pid": None, "why": "on battery power"})
+    assert "idle sleep: not held: on battery power" in status_text(p)
+    assert web.health(p, p.db)["idle_sleep"] == "idle sleep: not held: on battery power"
+    p.db.set_kv(awake.KV, {"daemon": pid + 1, "held": True, "pid": 5, "why": ""})
+    assert "idle sleep" not in status_text(p), "another daemon's leftover record is not shown"
+
+
+def test_idle_sleep_config_key_is_known_and_checked(env):
+    from ttp import project as pj
+    assert pj.DEFAULT_CONFIG["runner"]["prevent_idle_sleep"] == "auto"
+    assert pj.unknown_key_hint("runner.prevent_idle_sleep") is None
+    assert pj.unknown_key_hint("power.keep_awake") is None, "older configs stay quiet"
+    assert "runner.prevent_idle_sleep: 'sometimes' is not auto, on or off; auto is used" in \
+        pj.config_problems({"runner": {"prevent_idle_sleep": "sometimes"}})
+    assert not [x for x in pj.config_problems({"runner": {"prevent_idle_sleep": "off"}}) if "idle" in x]
