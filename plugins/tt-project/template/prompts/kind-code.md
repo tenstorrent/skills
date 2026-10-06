@@ -5,6 +5,7 @@
   Git-ignored files (tmp/, logs, outputs) are removed with it unless a result.json lists them.
 - Push ONLY your own branch. NEVER push to or force-push a shared branch, except as below.
 - Reproduce first, then fix. Add or update a test that fails without the fix.
+  Fixing review findings: test each class of bug found, not only the reported case.
 - Run the full checks before handing off, committed, through `ttp checks`: the project's checks,
   plus after `--` only the repository's test and lint commands they do not already run. It reuses
   a pass already recorded for the same tree and commands. If they take longer than one tool call may,

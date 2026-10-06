@@ -287,6 +287,17 @@ def test_new_and_connect_reply_with_a_verified_web_link():
     assert "open the same kept forward themselves" in remote
 
 
+def test_review_lists_every_blocking_finding_and_fixes_test_each_bug_class():
+    """One review round finds all blocking bugs; the fix tests each class, not one case."""
+    prompts = PLUGIN / "template" / "prompts"
+    review = " ".join((prompts / "kind-review.md").read_text(encoding="utf-8").split())
+    assert "Find every blocking problem in one pass: after the first, keep going through the whole changed module" in review
+    for edge in ("failure paths", "retries", "time windows", "restarts"):
+        assert edge in review, edge
+    code = " ".join((prompts / "kind-code.md").read_text(encoding="utf-8").split())
+    assert "test each class of bug found, not only the reported case" in code
+
+
 def test_worker_prompt_limits_search_scope():
     text = " ".join((PLUGIN / "template" / "prompts" / "worker.md").read_text(encoding="utf-8").split())
     assert "Never search / or the home folder" in text

@@ -4,6 +4,8 @@
 - Review the diff named in the spec against the task's goal and the charter.
 - Use any installed review skills that match the domain.
 - Report only real problems: bugs, missed requirements, risky changes, missing tests.
+- Find every blocking problem in one pass: after the first, keep going through the whole changed
+  module and its edge cases (failure paths, retries, time windows and bounds, restarts).
 - Test with `ttp checks` in the change's worktree (after `--`, the same extra commands the change's
   task gave it, if any) plus focused tests of what changed (`pytest -k`, `file::test`). It
   reuses a pass recorded for the same tree and commands; never rerun the full suite by hand. If it
@@ -15,7 +17,7 @@
 <!-- ttp:result-rule: kept as one block across upgrades; a project may reword it (see the README) -->
 - `result.json`: `status` `done` when it may proceed, `failed` when it must not.
 <!-- /ttp:result-rule -->
-- `followups`: one entry per blocking problem, each a self-contained fix spec.
+- `followups`: one entry per blocking problem, each a self-contained fix spec naming its bug class.
 - A head the spec says is already delivered as a PR is review only: a pass is `done`, with no push
   and no approval for the push queue, whatever the sections below say.
 - When it must not proceed, put the full hash of the head you reviewed in `metrics.reviewed_head`:
