@@ -9,6 +9,7 @@ import json
 import time
 from pathlib import Path
 
+from . import budget as bud
 from .db import continues_id, load_result
 from .hook import unread_update
 from .project import WORKER_MEMORY_CHARS, Project, code_tasks_may_push, push_queue_on
@@ -184,7 +185,15 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
             history += f"Woken because: {prev['woke']}.\n"
         history += _reboot_note(prev.get("reboot"))
     run_tier = (wake or {}).get("tier") or task["tier"]
-    if wake and run_tier != task["tier"] and not wake.get("escalated"):
+    step = bud.next_step(prev) if wake else ""
+    if step and not wake.get("escalated"):
+        history += (f"This run is a {run_tier} wake for one mechanical step the last run left: {step}. If the wait "
+                    "is over, do that step in this run and hand off its outcome. Only if it stops being mechanical "
+                    "(a conflict to resolve, a failure to judge)"
+                    + (f", hand off `waiting` with `retry_after_s: 0` and `wake_tier: \"{task['tier']}\"`: the task "
+                       "runs again now at its own tier, without costing an attempt.\n" if run_tier != task["tier"]
+                       else ", go on with it in this run.\n"))
+    elif wake and run_tier != task["tier"] and not wake.get("escalated"):
         history += (f"This run is a {run_tier} wake: check whether the wait is over. If it is and substantial "
                     f"work remains, hand off `waiting` with `retry_after_s: 0` and `wake_tier: \"{task['tier']}\"` "
                     f"at once: the task runs again now at its own tier, without costing an attempt.\n")

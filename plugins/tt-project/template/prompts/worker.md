@@ -100,6 +100,7 @@ Before you finish, write `$TTP_RUN_DIR/result.json`:
  "retry_after_s": 1800,
  "retry_when": "only when waiting: a quick shell check that exits 0 once the wait is over",
  "wake_tier": "only when waiting: light (the next run only checks) or standard (real work follows)",
+ "next_step": "only when waiting: the one mechanical step left after it (e.g. push); a light wake does it",
  "pr": "URL if you opened or updated one",
  "artifacts": ["paths or URLs"],
  "metrics": {"name": "value"},

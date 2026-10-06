@@ -10,6 +10,8 @@
   takes longer than one tool call may, run `ttp checks --detach -- <cmds>`: its output and exit code
   go to the run's directory, never the worktree, where a commit picks them up. Hand off `waiting`
   with the `retry_when` it prints; that probe also wakes the task if the checks were killed.
+  When only the verdict and its push (or approval) are left once they pass, add `next_step` "push":
+  the light wake then finishes the review itself.
 <!-- ttp:result-rule: kept as one block across upgrades; a project may reword it (see the README) -->
 - `result.json`: `status` `done` when it may proceed, `failed` when it must not.
 <!-- /ttp:result-rule -->
@@ -33,7 +35,7 @@
   checks on the final head, starts over if the branch moved meanwhile, and pushes without force.
 - Its checks can take longer than one tool call may: run `ttp push --detach`. It starts the push in
   a process of its own, prints `marker:` and `retry_when:` lines, and returns at once. Hand off
-  `waiting` with that `retry_when`, `wake_tier` standard and `retry_after_s` 900. NEVER put plain
+  `waiting` with that `retry_when`, `next_step` "report the push" and `retry_after_s` 900. NEVER put plain
   `ttp push` in the background yourself.
 - On resume, run that `retry_when` command: it prints `pushed <sha>`, or `not pushed` with the
   exit code and the log tail. Report the sha, or the failure with its log tail. A push that "ended

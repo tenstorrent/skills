@@ -25,7 +25,7 @@
   checks on the final head, starts over if the branch moved meanwhile, and pushes without force.
 - Its checks can take longer than one tool call may: run `ttp push --detach`. It starts the push in
   a process of its own, prints `marker:` and `retry_when:` lines, and returns at once. Hand off
-  `waiting` with that `retry_when`, `wake_tier` standard and `retry_after_s` 900. NEVER put plain
+  `waiting` with that `retry_when`, `next_step` "report the push" and `retry_after_s` 900. NEVER put plain
   `ttp push` in the background yourself.
 - On resume, run that `retry_when` command: it prints `pushed <sha>`, or `not pushed` with the
   exit code and the log tail. Report the sha, or the failure with its log tail. A push that "ended

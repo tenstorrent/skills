@@ -68,7 +68,7 @@ PROGRESS_EVERY_S = 30   # how often a long tick tells the watchdogs it is still 
 WATCHER_MAX_S = HEARTBEAT_STALE_S - 60   # a command watcher's timeout_s is capped here, well below WATCHDOG_S
 RESULT_FILE = "result.json"
 # What a waiting hand-off keeps across a run the account refused (limit, auth).
-WAIT_KEYS = ("retry_when", "retry_after_s", "waiting_for", "wake_tier", "survives_reboot", "waits",
+WAIT_KEYS = ("retry_when", "retry_after_s", "waiting_for", "wake_tier", "next_step", "survives_reboot", "waits",
              "waiting_since")
 MAX_FOLLOWUPS, FOLLOWUP_SPEC_CHARS = 12, 4000   # per hand-off; each follow-up is its own event
 # What a review the daemon queues repeats of the code task's spec and hand-off.

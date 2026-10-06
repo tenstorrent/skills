@@ -2690,6 +2690,57 @@ def test_a_light_wake_escalates_once_at_once_and_free(env, monkeypatch):
     assert not json.loads(t["result"]).get("escalated_wake")
 
 
+def test_a_mechanical_next_step_wakes_at_light_and_that_run_finishes_it(env, monkeypatch):
+    """A review whose detached checks finished, with only its push left (next_step), takes one light
+    run that pushes and is done: no light check plus a rerun at the task's tier and effort."""
+    p = make(env)
+    from ttp import budget as bud
+    from ttp.daemon import Daemon
+    from ttp.db import dump_result
+    wait = {"status": "waiting", "summary": "checks started", "waiting_for": "the checks", "wake_tier": "standard"}
+    assert bud.wake_tier("standard", {**wait, "next_step": "push"}) == "light", "next_step outranks wake_tier"
+    assert bud.wake_tier("deep", {"status": "waiting", "next_step": "push"}) == "light"
+    assert bud.wake_tier("standard", wait) == "standard"
+    assert bud.wake_tier("standard", {**wait, "next_step": "  "}) == "standard", "a blank step is no step"
+    monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps({"status": "done", "summary": "checks green; pushed"}))
+    tiers = {"light": {"effort": "low"}, "standard": {"effort": "high"}, "deep": {"effort": "max"}}
+    p.set_config("providers.fake.tiers", tiers)
+    mech = p.db.add_task("review and push", "s", kind="work", tier="standard", origin="user")
+    p.db.update_task(mech, result=dump_result({**wait, "next_step": "push"}))
+    plain = p.db.add_task("review and push, unmarked", "s", kind="work", tier="standard", origin="user")
+    p.db.update_task(plain, result=dump_result(wait))
+    d = Daemon(p.base)
+
+    def runs(tid):
+        return p.db.q("SELECT status, effort, note FROM runs WHERE task=? AND role='worker' ORDER BY id", (tid,))
+
+    assert _run_until(d, p, lambda: all(p.db.task(t)["status"] == "done" for t in (mech, plain)))
+    (one,) = runs(mech)
+    assert json.loads(one["note"])["wake"] == {"tier": "light", "escalated": False}
+    assert one["effort"] == "low"
+    (other,) = runs(plain)
+    assert json.loads(other["note"])["wake"]["tier"] == "standard"
+    assert other["effort"] == "high"
+    assert p.db.task(mech)["attempts"] == 1
+
+
+def test_a_mechanical_wake_prompt_says_to_do_the_step_and_a_refused_wake_keeps_it(env):
+    p = make(env)
+    from ttp.daemon import WAIT_KEYS
+    from ttp.db import dump_result
+    from ttp.prompts import worker_task
+    assert "next_step" in WAIT_KEYS, "a wake the account refused stays a mechanical wake"
+    tid = p.db.add_task("review", "s", kind="review", tier="standard", origin="user")
+    p.db.update_task(tid, result=dump_result({"status": "waiting", "summary": "checks started",
+                                              "retry_when": "test -e rc", "next_step": "push"}))
+    out = worker_task(p, p.db.task(tid), str(p.root), None, wake={"tier": "light", "escalated": False})
+    assert "one mechanical step the last run left: push" in out and "do that step in this run" in out
+    assert 'wake_tier: "standard"' in out, "it may still escalate when the step stops being mechanical"
+    assert "check whether the wait is over. If it is and substantial" not in out
+    out = worker_task(p, p.db.task(tid), str(p.root), None, wake={"tier": "standard", "escalated": True})
+    assert "mechanical step" not in out, "the escalated rerun is real work"
+
+
 def test_status_and_the_web_app_show_a_runs_wake_tier(env, tmp_path):
     p = make(env)
     from ttp.cli import status_text

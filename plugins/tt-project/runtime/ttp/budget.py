@@ -516,14 +516,21 @@ def wake_tier(tier: str, prev: dict) -> str | None:
     """The tier of the run that wakes a task whose last hand-off (`prev`) was `waiting`, or None
     when the run is no wake. Most wakes only check whether the wait is over, so a hand-off that
     names what it waits on wakes at light unless it asks for a `wake_tier`; never above the task's
-    own tier."""
+    own tier. A hand-off whose `next_step` names the one mechanical step left (say `push`) wakes at
+    light whatever it asked: that run does the step itself."""
     if not isinstance(prev, dict) or prev.get("status") != "waiting":
         return None
     tier = tier if tier in TIER_ORDER else "standard"
-    want = prev.get("wake_tier")
+    want = "light" if next_step(prev) else prev.get("wake_tier")
     if want not in TIER_ORDER:
         want = "light" if prev.get("retry_when") or prev.get("waiting_for") else tier
     return min(want, tier, key=TIER_ORDER.index)
+
+
+def next_step(prev: dict) -> str:
+    """The mechanical step a waiting hand-off left for after its wait (`next_step`), or ''."""
+    step = prev.get("next_step") if isinstance(prev, dict) else None
+    return " ".join(step.split())[:200] if isinstance(step, str) else ""
 
 
 # Not .txt: CMakeLists.txt and requirements.txt are build and dependency changes.
