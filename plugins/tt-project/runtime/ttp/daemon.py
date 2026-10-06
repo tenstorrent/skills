@@ -3658,6 +3658,7 @@ class Daemon:
             return False
         return self._dispatchable()
 
+
 def needs_device(task: dict, cfg: dict) -> bool:
     """Tagged `needs_device`, or names a device lock (config `device.locks`) as a resource. Only with
     device locks configured: without them no task counts, and dispatch is as it always was."""
