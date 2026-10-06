@@ -24716,7 +24716,7 @@ def test_devq_probe_exit_codes(devq_dir):
     import fcntl
     d = devq_dir
     assert _devq("probe", d, "nope").returncode == 0, "unknown job: wake and look"
-    (d / "queue").mkdir(parents=True)
+    (d / "queue").mkdir(parents=True, exist_ok=True)
     (d / "queue" / "00000000000000000001-t5-x.json").write_text(json.dumps({"id": "t5-x", "cmd": "true"}))
     (d / "queue" / "00000000000000000002-x.json").write_text(json.dumps({"id": "x", "cmd": "true"}))
     dead = _devq("probe", d, "t5-x")
@@ -24778,6 +24778,89 @@ def test_devq_restart_requeues_a_job_a_reboot_killed_and_adopts_one_still_runnin
     go.touch()
     m = _devq_marker(d, "long-2")
     assert (m["status"], m["rc"], m["attempts"], m["drops"]) == ("failed", 7, 1, [])
+
+
+def test_devq_reservation_cap_refuses_at_submit_and_fails_older_over_cap_jobs_unstarted(env, devq_dir, tmp_path):
+    d, ran = devq_dir, tmp_path / "ran"
+    cap = {"reservation_cap_s": 600}
+    refused = _devq("submit", d, json.dumps({**DEVQ_FAST, **cap}),
+                    json.dumps({"id": "big-1", "cmd": f"touch {ran}", "timeout_s": 1500}))
+    assert refused.returncode == 2 and "reservation cap of 600 s" in refused.stderr and "--timeout 600" in refused.stderr
+    assert _devq("probe", d, "big-1").stdout.startswith("big-1: unknown"), "nothing was queued"
+    default_over = _devq("submit", d, json.dumps({**DEVQ_FAST, **cap, "job_timeout_s": 900}),
+                         json.dumps({"id": "big-2", "cmd": f"touch {ran}"}))
+    assert default_over.returncode == 2 and "900 s" in default_over.stderr
+    # A job queued before the cap was set or lowered is failed unstarted; a job within the cap, and one with
+    # no limit of its own, run, the latter under the cap.
+    (d / "queue").mkdir(parents=True, exist_ok=True)
+    (d / "queue" / f"{time.time_ns():020d}-old-1.json").write_text(
+        json.dumps({"id": "old-1", "cmd": f"touch {ran}", "timeout_s": 1500, "config": "old-1"}))
+    _devq_submit(d, cap, "ok-1", "echo limit=$TTP_DEVQ_TIMEOUT_S", timeout_s=300)
+    _devq_submit(d, cap, "ok-2", "echo limit=$TTP_DEVQ_TIMEOUT_S")
+    m = _devq_marker(d, "old-1")
+    assert (m["status"], m["attempts"], m["rc"]) == ("failed", 0, None)
+    assert "not started" in m["reason"] and "reservation cap of 600 s" in m["reason"]
+    assert not ran.exists(), "an over-cap job is never started"
+    assert pathlib.Path(_devq_marker(d, "ok-1")["log"]).read_text().strip() == "limit=300"
+    assert pathlib.Path(_devq_marker(d, "ok-2")["log"]).read_text().strip() == "limit=600"
+    from ttp import devq
+    assert devq.config_problems("r", {"reservation_cap_s": 600, "job_timeout_s": 900}) == [
+        "device.runners.r.job_timeout_s: 900 is above reservation_cap_s 600"]
+    assert devq.config_problems("r", {"reservation_cap_s": 600, "job_timeout_s": 600}) == []
+
+
+def test_devq_install_stages_and_renames_never_overwrites_a_running_copy(env, tmp_path):
+    from ttp import devq
+    d = tmp_path / "q"
+    d.mkdir()
+    old = d / "devq.py"
+    old.write_text("# the copy a runner is reading\n" * 50)
+    reader = open(old)
+    inode = old.stat().st_ino
+    script = devq.host_call("dev", {"dir": str(d)}, "status", [], install=True)[-1]
+    assert f"cat > {d}/.devq.py.$$ && mv -f {d}/.devq.py.$$ {d}/devq.py" in script
+    r = subprocess.run(["/bin/sh", "-c", script], input=devq.source(), text=True, capture_output=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+    assert old.read_text() == devq.source() and old.stat().st_ino != inode, "renamed into place, a new file"
+    assert reader.read() == "# the copy a runner is reading\n" * 50, "a running reader keeps the old copy whole"
+    reader.close()
+    assert sorted(x.name for x in d.iterdir() if x.name.startswith(".devq")) == [], "no staged file left"
+
+
+def test_devq_runner_stopped_with_term_ends_its_health_check_and_frees_the_lock_at_once(devq_dir, tmp_path):
+    d, hpid = devq_dir, tmp_path / "health.pid"
+    _devq_submit(d, {"health": f"echo $$ > {hpid}; exec sleep 60"}, "h-1", "true")
+    assert _wait_for_path(hpid) and hpid.read_text().strip()
+    pid, child = int((d / "runner.pid").read_text()), int(hpid.read_text())
+    os.kill(pid, signal.SIGTERM)
+    deadline = time.time() + 10
+    while time.time() < deadline and (_pid_running(child) or not _devq_lock_free(d)):
+        time.sleep(0.05)
+    assert not _pid_running(child), "the health check (its sleep) ended with the runner"
+    assert _devq_lock_free(d), "runner.lock is free right away"
+    assert "runner stopped by signal" in (d / "runner.log").read_text()
+    assert _devq("probe", d, "h-1").returncode == 0, "the job waits and no runner is alive: wake and restart"
+
+
+def _pid_running(pid):
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    with contextlib.suppress(OSError):
+        if pathlib.Path(f"/proc/{pid}/stat").read_text().split(")")[-1].split()[0] == "Z":
+            return False
+    return True
+
+
+def _devq_lock_free(d):
+    import fcntl
+    with open(d / "runner.lock") as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False
+    return True
 
 
 def test_ttp_devq_cli_submits_locally_and_the_config_and_prompt_name_the_runner(env, tmp_path):

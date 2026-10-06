@@ -18,6 +18,7 @@ Layout of the state folder: queue/<seq>-<id>.json (waiting, in name order), runn
 """
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import json
 import os
@@ -39,6 +40,10 @@ RUNNER_DEFAULTS = {
     "drop_check": "",          # shell command run after a job failed; exit 0 = it was a device drop
     "max_drops": 2,            # drops in a row of one config before its jobs are skipped
     "job_timeout_s": 0,        # default per-job limit (0 = none); a job's own timeout_s wins
+    # The box's reservation cap (0 = none): the longest a job may hold the device. Submit refuses a job
+    # whose limit (its timeout_s, else job_timeout_s) is above it, a job queued before the cap was set or
+    # lowered is failed unstarted, and a job with no limit of its own gets the cap as its limit.
+    "reservation_cap_s": 0,
     "idle_exit_s": 1800,       # the runner exits after this long with nothing queued; submit restarts it
     "poll_s": 10,              # between checks on a running job
     # A regex matching the command line of the project's old per-task drivers ("" = none). While one
@@ -71,6 +76,9 @@ def config_problems(name: str, cfg) -> list:
             re.compile(cfg["legacy_driver"])
         except re.error as e:
             out.append(f"{where}.legacy_driver: not a regex ({e})")
+    cap, default = cfg.get("reservation_cap_s"), cfg.get("job_timeout_s")
+    if all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in (cap, default)) and 0 < cap < default:
+        out.append(f"{where}.job_timeout_s: {default} is above reservation_cap_s {cap}")
     if isinstance(cfg.get("host"), str) and cfg["host"].startswith("-"):
         out.append(f"{where}.host: must not start with '-'")
     return out
@@ -116,6 +124,20 @@ def source() -> str:
 
 
 # host side: everything below runs on the device host ------------------------------------------------
+def job_limit(spec: dict, cfg: dict) -> float:
+    """The job's time limit in seconds (0 = none): its timeout_s, else job_timeout_s, else the cap."""
+    return float(spec.get("timeout_s") or cfg["job_timeout_s"] or cfg["reservation_cap_s"] or 0)
+
+
+def over_cap(spec: dict, cfg: dict) -> str:
+    """Why the job may not run under the box's reservation cap, or ""."""
+    cap, limit = float(cfg["reservation_cap_s"] or 0), job_limit(spec, cfg)
+    if cap and limit > cap:
+        return (f"its limit of {limit:.0f} s is above this box's reservation cap of {cap:.0f} s; "
+                f"submit it again with --timeout {cap:.0f} or less")
+    return ""
+
+
 def _now() -> float:
     return time.time()
 
@@ -283,6 +305,10 @@ def submit(d: Path, cfg: dict, spec: dict) -> int:
     if wd and not Path(wd).is_dir():
         print(f"devq submit: workdir {wd} does not exist on this host", file=sys.stderr)
         return 2
+    too_long = over_cap(spec, settings(cfg))
+    if too_long:
+        print(f"devq submit: refused: {too_long}", file=sys.stderr)
+        return 2
     if where_is(d, job) != "unknown":
         print(f"devq submit: id {job} was already used here; pick a new one (e.g. {job}-r2)", file=sys.stderr)
         return 2
@@ -363,6 +389,26 @@ class Runner:
         self.d = d
         self.cfg = settings(_load(d / "config.json"))
         self._child = None
+        self._helper = None     # the health or drop check under way: ended with the runner
+
+    def stop(self, signum, frame) -> None:
+        """TERM, INT or HUP: end the health or drop check under way (its own process group) and exit at
+        once, so nothing of the runner outlives it. Jobs keep running: the next runner adopts them."""
+        if self._helper is not None:
+            _kill_group(self._helper.pid)
+        self.log(f"runner stopped by signal {signum}")
+        raise SystemExit(0)
+
+    @contextlib.contextmanager
+    def steady(self):
+        """Hold off TERM, INT and HUP while the queue's files move, so a stop never leaves a job half moved
+        or started without a record; a signal that came meanwhile acts on the way out."""
+        sigs = {signal.SIGTERM, signal.SIGINT, signal.SIGHUP}
+        old = signal.pthread_sigmask(signal.SIG_BLOCK, sigs)
+        try:
+            yield
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, old)
 
     def log(self, msg: str) -> None:
         with open(self.d / "runner.log", "a") as f:
@@ -379,12 +425,15 @@ class Runner:
                                  env={**os.environ, **(env or {})}, start_new_session=True)
         except OSError as e:
             return 127, str(e)
+        self._helper = p
         try:
             out, _ = p.communicate(timeout=timeout or None)
         except subprocess.TimeoutExpired:
             _kill_group(p.pid)
             p.communicate()
             return 124, f"timed out after {timeout:.0f} s"
+        finally:
+            self._helper = None
         lines = [x for x in (out or "").splitlines() if x.strip()]
         return p.returncode, (lines[-1][:300] if lines else "")
 
@@ -426,6 +475,10 @@ class Runner:
             time.sleep(self.cfg["health_poll_s"])
 
     def finish(self, job: str, st: dict, status: str, rc, reason: str) -> None:
+        with self.steady():
+            self._finish(job, st, status, rc, reason)
+
+    def _finish(self, job: str, st: dict, status: str, rc, reason: str) -> None:
         spec = _load(self.d / "running" / f"{job}.json")
         marker = {"id": job, "status": status, "rc": rc, "log": st.get("log", ""), "reason": reason,
                   "task": spec.get("task", ""), "config": spec.get("config", job),
@@ -443,6 +496,10 @@ class Runner:
         _write(self.d / "running" / f"{job}.state.json", json.dumps(st, indent=1))
 
     def launch(self, job: str, spec: dict, st: dict) -> None:
+        with self.steady():
+            self._launch(job, spec, st)
+
+    def _launch(self, job: str, spec: dict, st: dict) -> None:
         """Start one attempt in a session of its own. It inherits a lock it holds while it lives, so a
         runner started after this one died can tell a job still running from one a reboot killed."""
         n = st.get("attempts", 0) + 1
@@ -469,9 +526,10 @@ class Runner:
         self._child = p
 
     def limit(self, spec: dict) -> float:
-        """A job's time limit in seconds (0 = none): its own timeout_s, else the runner's job_timeout_s.
-        The job sees it as TTP_DEVQ_TIMEOUT_S, to size the timeouts of what it starts within it."""
-        return float(spec.get("timeout_s") or self.cfg["job_timeout_s"] or 0)
+        """A job's time limit in seconds (0 = none): its own timeout_s, else the runner's job_timeout_s,
+        else the box's reservation cap. The job sees it as TTP_DEVQ_TIMEOUT_S, to size the timeouts of
+        what it starts within it."""
+        return job_limit(spec, self.cfg)
 
     def wait(self, job: str, spec: dict, st: dict) -> tuple:
         """(rc, how) of the current attempt: how is "" (it ended), "timeout" or "interrupted" (it is
@@ -522,6 +580,10 @@ class Runner:
             self.log(f"{job}: resuming after a runner restart")
         while True:
             if not st.get("cur"):
+                too_long = over_cap(spec, self.cfg)
+                if too_long:
+                    self.finish(job, st, "failed", None, f"not started: {too_long}")
+                    return
                 drops = self.drops_in_a_row(spec["config"])
                 if len(drops) >= int(self.cfg["max_drops"] or 0) > 0:
                     self.finish(job, st, "skipped", None,
@@ -551,9 +613,10 @@ class Runner:
                 evidence = out if drc == 0 else ""
                 how = "drop" if drc == 0 else how
             if how in ("interrupted", "drop"):
-                self.record_drop(job, spec, st, rc, how, evidence)
-                st["cur"] = None
-                self.save(job, st)
+                with self.steady():
+                    self.record_drop(job, spec, st, rc, how, evidence)
+                    st["cur"] = None
+                    self.save(job, st)
                 need = 2
                 continue
             _rm(self.d / "configs" / spec["config"])
@@ -572,8 +635,9 @@ class Runner:
             return running[0]
         for q in sorted((self.d / "queue").glob("*.json")):
             job = q.stem.split("-", 1)[1]
-            q.replace(self.d / "running" / f"{job}.json")
-            self.log(f"{job}: dequeued")
+            with self.steady():
+                q.replace(self.d / "running" / f"{job}.json")
+                self.log(f"{job}: dequeued")
             return job
         return ""
 
@@ -584,6 +648,8 @@ class Runner:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             return 0
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            signal.signal(sig, self.stop)
         _write(self.d / "runner.pid", f"{os.getpid()}\n")
         self.log(f"runner started (pid {os.getpid()})")
         idle_since = _now()

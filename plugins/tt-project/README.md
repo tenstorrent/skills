@@ -210,7 +210,13 @@ and preferences you add later become part of the project's charter and memory.
   device-job runner per device host instead of a driver per task: `host` (ssh alias; empty = this
   machine), `dir` (its state folder there), `health` (a command that must pass before each job),
   `drop_check` (a command that tells a device drop from a plain failure), `max_drops` (default 2),
-  `health_wait_s`, `job_timeout_s` and `idle_exit_s`. A task queues each device job with
+  `health_wait_s`, `job_timeout_s`, `reservation_cap_s` and `idle_exit_s`. With `reservation_cap_s`
+  (the box's longest allowed device reservation) submit refuses a job whose limit is above it, a job
+  queued before the cap was lowered is failed without being started, and a job with no limit of its
+  own runs under the cap. `ttp devq` installs the
+  runner on the host under a temporary name and renames it into place, never over a running copy; a
+  runner stopped with TERM ends its health or drop check with it (jobs keep running and the next
+  runner adopts them). A task queues each device job with
   `ttp devq submit <runner> --id <id> [--config <key>] [--timeout <s>] -- <command>` and waits on
   `ttp devq probe <runner> <id>`, which exits 0 once the job's done marker is written (done, failed
   or skipped, with exit code and log) or once no runner is alive while the job waits. The runner is
@@ -222,7 +228,8 @@ and preferences you add later become part of the project's charter and memory.
   start or start a job, and the probe keeps a task with a pending job waiting until it ends.
   Config `runner.device_timeout_max_s` (opt-in) caps device-job timeouts: `ttp devq submit` refuses a
   longer `--timeout` and gives a job without one the ceiling when the runner's `job_timeout_s` is
-  unset or above it; each job sees its limit as `TTP_DEVQ_TIMEOUT_S`, and workers are told to keep
+  unset or above it; each job sees its limit (also under a runner's `reservation_cap_s`) as
+  `TTP_DEVQ_TIMEOUT_S`, and workers are told to keep
   every device timeout (broker jobs, driver steps) within the ceiling and split longer runs.
   Locks and pauses are per project; a
   resource that several projects on one machine use is declared shared (`shared_resources` in the

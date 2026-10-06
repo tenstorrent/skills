@@ -128,10 +128,16 @@ Before you finish, write `$TTP_RUN_DIR/result.json`:
   Under `set -e`, write that marker from an EXIT trap (`trap 'echo $? > "$marker"' EXIT`).
   For a job on another machine, start its driver there (`ssh <host> 'setsid nohup <driver> > <log>
   2>&1 &'`), keep the marker there, point `retry_when` at it (`ssh <host> test -e <marker>`) and
-  set `"survives_reboot": true`: a reboot here does not end it.
+  set `"survives_reboot": true`: a reboot here does not end it. Copy a driver or runner script to a
+  host under a temporary name in the same folder and rename it into place (`mv`): bash reads a running
+  script as it goes, so overwriting one in place (scp, cp) corrupts it. To stop a driver you started,
+  kill its process group (`kill -- -<pgid>`), not only the bash pid: a child such as a `sleep` keeps
+  its inherited lock fd until it ends.
   When your task header lists device runners, a device job goes through one of them instead of a
   driver: `ttp devq submit <runner> --id <unique id> [--config <key>] [--timeout <s>] [--workdir <dir>] -- <command>`
-  (build and set up first: those are not device jobs). It prints the `retry_when`; with several jobs,
+  (build and set up first: those are not device jobs). A runner with a reservation cap refuses a
+  `--timeout` above it; size the job, and any reservation its command makes, to fit. It prints the
+  `retry_when`; with several jobs,
   submit them in order and wait on the last. On wake, `ttp devq status <runner> <id>` shows its marker
   (done, failed or skipped, exit code, log, drops). No marker and no runner alive: run
   `ttp devq start <runner>` and hand off `waiting` again on the same probe (also when it says an old
