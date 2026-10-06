@@ -2009,7 +2009,8 @@ def cmd_upgrade(a) -> None:
     the daemon's own call (release.py): it records the outcome and sends one low notify when applied.
     Exit 75 = deferred, nothing changed and the project finishes it itself (another upgrade or a harness
     task holds it, a push is in flight, or a conflicting merge waits for a harness task or for the daemon's
-    retry under upgrade.auto). Exit 1 = failed, including a conflict nothing will retry (upgrade.auto off)."""
+    retry, which comes only for a newer version under upgrade.auto). Exit 1 = failed, including a conflict
+    nothing will retry (upgrade.auto off, or the same version from another commit)."""
     from . import locks, release
     if a.project_dir:      # the daemon names its own folder: never another project of the same name
         p = Project(a.project_dir)
@@ -2112,10 +2113,12 @@ def _upgrade(p: Project, auto: bool = False) -> None:
             took = (f"upgrade not applied; the running harness is unchanged. {problem}\nHarness task "
                     f"#{last['id']} took on a template merge less than a day ago, so none is queued now; ")
             # Exit 75 (deferred) only when the project takes it on itself: its daemon retries after `until`.
-            if auto or (p.config().get("upgrade") or {}).get("auto", True):
+            if release.retried({"newer": release.is_newer(new_v, old_v)}, p.config()):
                 print(took + f"upgrade deferred: with upgrade.auto on the daemon tries again after {at}.")
                 sys.exit(75)
-            print(took + f"upgrade.auto is off, so nothing retries it: rerun `ttp upgrade {p.name}` after {at} "
+            why = ("upgrade.auto is off" if release.is_newer(new_v, old_v)
+                   else f"the daemon retries only a newer version, and this is {new_v} again from another commit")
+            print(took + f"{why}, so nothing retries it: rerun `ttp upgrade {p.name}` after {at} "
                          f"to queue a harness task for the merge.")
             sys.exit(1)
         tid = tid or p.db.add_task(

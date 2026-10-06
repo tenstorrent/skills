@@ -351,7 +351,8 @@ checkout at that tip, since the installed `ttp setup` reinstalls its own version
 and restarts, keeping running work. `ttp config <name> upgrade.auto false` turns that off;
 `ttp upgrade <name>` then merges by hand. `ttp upgrade` exits 75 when it changed nothing and the
 project finishes the upgrade itself (a merge conflict handed to its harness task, or retried by its
-daemon under `upgrade.auto`), so a deploy script can count it as deferred; exit 1 is a real failure.
+daemon under `upgrade.auto`, which retries only a newer version), so a deploy script can count it as
+deferred; exit 1 is a real failure, such as a conflict nothing retries.
 
 ## Notifications
 

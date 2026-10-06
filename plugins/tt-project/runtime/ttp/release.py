@@ -123,6 +123,13 @@ def drift(p: Project) -> dict | None:
             "newer": _num(new_v) > _num(cur_v)}
 
 
+def retried(d: dict | None, cfg: dict) -> bool:
+    """The daemon tries an automatic upgrade to drift `d` (check_release): only a strictly newer version,
+    and only with upgrade.auto on. A paused project still does once unpaused. `ttp upgrade` counts a
+    conflict as deferred on the same rule, so the two cannot disagree."""
+    return bool(d and d.get("newer") and (cfg.get("upgrade") or {}).get("auto", True))
+
+
 UPGRADE_RESOURCE = "harness-upgrade"     # `ttp lock --probe harness-upgrade` tells whether one runs
 GUARD_ENV = "TTP_HARNESS_UPGRADE"         # set only while `ttp upgrade` holds the lock and moves main
 GUARD_MARK = "# tt-project merge guard"

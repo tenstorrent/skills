@@ -6778,8 +6778,7 @@ def test_a_conflicting_upgrade_queues_at_most_one_task_a_day(env, monkeypatch, c
         cli.main(["upgrade", "demo"])
     first = p.db.one("SELECT id FROM tasks WHERE kind='harness'")["id"]
     p.db.update_task(first, status="done")
-    commit = env["home"] / "lib" / "current" / "runtime" / "ttp" / "SOURCE_COMMIT"
-    commit.write_text("bbbb2222\n")      # the next release, the same conflict
+    _next_release(env)      # the next release, the same conflict
     capsys.readouterr()
     with pytest.raises(SystemExit) as e:
         cli.main(["upgrade", "demo"])
@@ -6802,7 +6801,19 @@ def test_a_conflicting_upgrade_queues_at_most_one_task_a_day(env, monkeypatch, c
     assert len(p.db.q("SELECT id FROM tasks WHERE kind='harness'")) == 2
 
 
-def _deferred_conflict(env, monkeypatch, name="demo"):
+def _next_release(env, newer=True):
+    """The installed release becomes the next one: a new source commit and, with `newer`, a numerically
+    newer version (the only drift the daemon retries)."""
+    import re
+    runtime = env["home"] / "lib" / "current" / "runtime" / "ttp"
+    (runtime / "SOURCE_COMMIT").write_text("bbbb2222\n")
+    if newer:
+        init = runtime / "__init__.py"
+        init.write_text(re.sub(r'__version__ = "(\d+)\.(\d+)\.(\d+)"',
+                               lambda m: f'__version__ = "{m[1]}.{m[2]}.{int(m[3]) + 1}"', init.read_text(), 1))
+
+
+def _deferred_conflict(env, monkeypatch, name="demo", newer=True):
     """A project whose template merge conflicts again within a day of its last harness task (done)."""
     import shutil
     from ttp import cli
@@ -6819,7 +6830,7 @@ def _deferred_conflict(env, monkeypatch, name="demo"):
         cli.main(["upgrade", name])
     first = p.db.one("SELECT id FROM tasks WHERE kind='harness'")["id"]
     p.db.update_task(first, status="done")
-    (env["home"] / "lib" / "current" / "runtime" / "ttp" / "SOURCE_COMMIT").write_text("bbbb2222\n")
+    _next_release(env, newer)
     return p, first
 
 
@@ -6843,6 +6854,32 @@ def test_a_conflict_nothing_retries_with_upgrade_auto_off_exits_1(env, monkeypat
         cli.main(["upgrade", "demo"])
     out = capsys.readouterr().out
     assert e.value.code == 1 and "upgrade.auto is off, so nothing retries it" in out and "deferred" not in out
+    assert [t["id"] for t in p.db.q("SELECT id FROM tasks WHERE kind='harness'")] == [first]
+
+
+def test_a_conflict_on_a_newer_version_is_deferred_as_the_daemon_retries_it(env, monkeypatch, capsys):
+    from ttp import cli, release
+    p, first = _deferred_conflict(env, monkeypatch)
+    assert release.retried(release.drift(p), p.config()), "the daemon's own gate"
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo"])
+    out = capsys.readouterr().out
+    assert e.value.code == 75 and "upgrade deferred" in out and "tries again after" in out
+
+
+def test_a_same_version_conflict_from_another_commit_is_a_failure_nothing_retries(env, monkeypatch, capsys):
+    """The daemon retries only a newer version: a branch tip with no version bump that conflicts within
+    a day of the last harness task is never retried, so it must not be counted as deferred."""
+    from ttp import cli, release
+    p, first = _deferred_conflict(env, monkeypatch, newer=False)
+    assert release.drift(p) and not release.retried(release.drift(p), p.config()), "the daemon's own gate"
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo"])
+    out = capsys.readouterr().out
+    assert e.value.code == 1 and "deferred" not in out and "nothing retries it" in out
+    assert "retries only a newer version" in out and "rerun `ttp upgrade demo` after" in out
     assert [t["id"] for t in p.db.q("SELECT id FROM tasks WHERE kind='harness'")] == [first]
 
 

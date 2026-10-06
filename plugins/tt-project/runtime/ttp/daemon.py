@@ -2532,8 +2532,7 @@ class Daemon:
             db.set_kv(release.KV_RELEASE, d)
             if d:
                 log(self.p, f"tt-project {d['installed']} installed; harness on {d['current']}")
-        if not d or not d.get("newer") or not (self.cfg.get("upgrade") or {}).get("auto", True) \
-                or db.kv("paused", False):
+        if not release.retried(d, self.cfg) or db.kv("paused", False):
             return
         why = release.hold_reason(self.p, d)
         if why:
