@@ -214,6 +214,53 @@ def defer(p: Project, auto: bool, key: str, frm: str, to: str, until: float, why
     p.db.set_kv(KV_AUTO, {**rec, "outcome": "deferred", "ended": time.time(), "until": until, "why": why})
 
 
+KV_STUCK = "upgrade_stuck"      # the template-merge conflict that keeps an upgrade deferred, while it lasts
+STUCK_AFTER_S = 2 * 86400       # the same conflict deferred this long is reported once
+STUCK_RETRIES = 2               # ... or once this many harness tasks that took it on ended without landing it
+
+
+def _conflict_sig(why: str) -> str:
+    """The same conflict across releases: the conflicting files, else the problem without numbers."""
+    m = re.match(r"the merge conflicts in (.+)", why)
+    if m:
+        return "conflicts in " + ", ".join(sorted(f.strip() for f in m.group(1).split(",")))
+    return re.sub(r"\b[0-9a-f]{7,40}\b|\d+", "#", why)[:200]
+
+
+def note_deferred(p: Project, why: str = "", task: int | None = None) -> None:
+    """Every deferred upgrade passes here: `why` is the merge's problem ("" = an open harness task holds
+    the upgrade, so no merge ran and the conflict on record stands). Once the same conflict has been
+    deferred past STUCK_AFTER_S, or STUCK_RETRIES harness tasks ended without landing it, one normal
+    observation tells the coordinator; later deferrals of that conflict stay quiet."""
+    now = time.time()
+    rec = p.db.kv(KV_STUCK) or {}
+    if why and rec.get("sig") != _conflict_sig(why):
+        rec = {"sig": _conflict_sig(why), "why": why[:300], "first": now, "tasks": []}
+    if not rec:
+        return
+    if task and int(task) not in rec["tasks"]:
+        rec["tasks"].append(int(task))
+    rec["last"] = now
+    ended = [t for t in rec["tasks"] if (p.db.one("SELECT status FROM tasks WHERE id=?", (t,)) or {"status": "done"})
+             ["status"] in ("done", "failed", "cancelled")]
+    age = now - float(rec["first"])
+    if not rec.get("reported") and (age >= STUCK_AFTER_S or len(ended) >= STUCK_RETRIES):
+        tasks = ", ".join(f"#{t}" for t in ended)
+        p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+               (now, "upgrade", "observation", "normal",
+                f"`ttp upgrade` has deferred this project's template upgrade for {age / 86400:.1f} days on the same "
+                f"merge problem: {rec['why']}"
+                + (f" Harness tasks {tasks} ended without landing it." if ended else "")
+                + " Reported once; later deferrals of this conflict stay quiet.", "queued"))
+        rec["reported"] = now
+    p.db.set_kv(KV_STUCK, rec)
+
+
+def clear_stuck(p: Project) -> None:
+    """The harness took in the template: no conflict is outstanding."""
+    p.db.x("DELETE FROM kv WHERE key=?", (KV_STUCK,))
+
+
 def push_in_flight(p: Project) -> bool:
     return any(h.startswith("push:") for h in locks.held(p.state / "locks"))
 

@@ -2035,6 +2035,7 @@ def cmd_upgrade(a) -> None:
         tid = release.open_upgrade_task(p)      # read under the lock: an upgrade that just ended may have queued it
         mine = bool(tid) and os.environ.get("TTP_TASK") == str(tid)
         if tid and not mine:      # its worker is resolving the merge: a second resolution would race it
+            release.note_deferred(p, task=tid)
             if a.auto:
                 release.finish(p, "held", why=f"harness task #{tid} finishes an earlier upgrade")
             die(f"upgrade refused: harness task #{tid} is finishing an earlier template upgrade of {p.name}; "
@@ -2107,6 +2108,7 @@ def _upgrade(p: Project, auto: bool = False) -> None:
         last = None if tid else release.recent_upgrade_task(p)
         if last:        # at most one model task a day: each release would otherwise queue its own
             until = float(last["created"]) + release.TASK_EVERY_S
+            release.note_deferred(p, problem, last["id"])
             release.defer(p, auto, f"{new_v} {new_c}", f"{old_v} ({old_c})", f"{new_v} ({new_c})", until,
                           problem[:300])
             at = time.strftime('%Y-%m-%d %H:%M', time.localtime(until))
@@ -2124,6 +2126,7 @@ def _upgrade(p: Project, auto: bool = False) -> None:
         tid = tid or p.db.add_task(
             release.UPGRADE_TASK_TITLE, _UPGRADE_TASK.format(problem=problem, name=p.name),
             kind="harness", tier="standard", priority=2, origin="user")
+        release.note_deferred(p, problem, tid)
         if auto:
             release.finish(p, "conflict", task=tid, why=problem[:300])
         print(f"upgrade not applied; the running harness is unchanged. {problem}\nHarness task #{tid} "
@@ -2149,6 +2152,7 @@ def _upgrade(p: Project, auto: bool = False) -> None:
             die(f"could not apply the checked upgrade to {h}: {r.stdout[-500:]}", 1)
     if hasattr(os, "sync"):
         os.sync()       # a reboot right after must not leave the files git just wrote empty
+    release.clear_stuck(p)
     print("harness up to date with the installed template; restarting the daemon")
     from . import service
     print(service.restart(p))
@@ -2202,6 +2206,7 @@ def _apply_upgrade(p: Project, commit: str) -> None:
         die(f"--apply: could not fast-forward main to {commit}: {(r.stderr or r.stdout).strip()[-400:]}", 1)
     if hasattr(os, "sync"):
         os.sync()
+    release.clear_stuck(p)
     print(f"harness main is now {merged[:12]}; restarting the daemon")
     from . import service
     print(service.restart(p))

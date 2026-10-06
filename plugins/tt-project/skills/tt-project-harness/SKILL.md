@@ -68,6 +68,8 @@ description: "Improve a tt-project's own harness — its coordinator and worker 
   Otherwise the harness is left as it was and a harness task is queued to finish the merge, at
   most one a day. It then exits 75 (deferred, not failed) while that task or the daemon's retry under
   `upgrade.auto` takes it on (the daemon retries only a newer version); when nothing does, it exits 1.
+  The same conflict deferred past 48 h, or after two harness tasks that did not land it, is
+  reported once as a normal observation.
 - Conflicts: keep this project's intent, take upstream fixes. Resolve them in a scratch worktree,
   never in the live harness, and apply the result with `ttp upgrade <name> --apply <commit>`.
 - One merge at a time: `ttp upgrade` holds the `harness-upgrade` lock for the whole merge, refuses

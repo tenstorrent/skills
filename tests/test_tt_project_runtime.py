@@ -6907,6 +6907,72 @@ def test_a_deploy_counts_deferred_upgrades_and_still_reports_a_real_failure(env,
     assert "deploy: beta failed (exit 1)" in r.stdout and "upgrade failed for: beta" in r.stdout, r
 
 
+def _stuck_events(p):
+    return p.db.q("SELECT severity, text FROM events WHERE source='upgrade' AND kind='observation'")
+
+
+def test_the_same_deferred_conflict_past_48h_is_reported_once_as_a_normal_observation(env, monkeypatch, capsys):
+    """Every push's deploy defers the same conflict quietly; once it has lasted past 48 h the coordinator
+    hears of it once, at normal severity, and the deferrals after that (also while a harness task holds
+    the upgrade) add nothing."""
+    from ttp import cli, release
+    p, first = _deferred_conflict(env, monkeypatch)
+    for _ in range(2):
+        with pytest.raises(SystemExit) as e:
+            cli.main(["upgrade", "demo"])
+        assert e.value.code == 75
+    rec = p.db.kv(release.KV_STUCK)
+    assert rec["sig"] == "conflicts in prompts/kind-harness.md" and rec["tasks"] == [first] and not _stuck_events(p)
+    p.db.set_kv(release.KV_STUCK, {**rec, "first": time.time() - release.STUCK_AFTER_S - 3600})
+    with pytest.raises(SystemExit):
+        cli.main(["upgrade", "demo"])
+    ev = _stuck_events(p)
+    assert len(ev) == 1 and ev[0]["severity"] == "normal", ev
+    assert "2.0 days" in ev[0]["text"] and "prompts/kind-harness.md" in ev[0]["text"]
+    with pytest.raises(SystemExit):
+        cli.main(["upgrade", "demo"])
+    tid = p.db.add_task(release.UPGRADE_TASK_TITLE, "merge", kind="harness")
+    with pytest.raises(SystemExit) as e:      # an open harness task holds it: no merge runs, still quiet
+        cli.main(["upgrade", "demo"])
+    assert e.value.code == 75 and len(_stuck_events(p)) == 1 and tid in p.db.kv(release.KV_STUCK)["tasks"]
+
+
+def test_two_failed_harness_retries_of_the_same_conflict_are_reported_once(env, monkeypatch, capsys):
+    """Well inside 48 h, the second harness task that ends without landing the merge reports it once."""
+    from ttp import cli, release
+    p, _ = _conflicting_upgrade(env, monkeypatch)
+    tids = []
+    for n in range(4):
+        with pytest.raises(SystemExit):
+            cli.main(["upgrade", "demo"])
+        tid = p.db.one("SELECT id FROM tasks WHERE kind='harness' ORDER BY id DESC")["id"]
+        if tid not in tids:
+            tids.append(tid)
+        assert len(_stuck_events(p)) == (1 if n >= 2 else 0), n
+        p.db.update_task(tid, status="failed")
+        p.db.x("UPDATE tasks SET created=? WHERE id=?", (time.time() - 2 * release.TASK_EVERY_S, tid))
+    assert len(tids) == 4
+    text = _stuck_events(p)[0]["text"]
+    assert f"#{tids[0]}, #{tids[1]} ended without landing it" in text and "0.0 days" in text
+
+
+def test_a_landed_upgrade_or_another_conflict_starts_the_stuck_clock_over(env, monkeypatch, capsys):
+    from ttp import cli, release
+    p, restarts = _conflicting_upgrade(env, monkeypatch)
+    release.note_deferred(p, "the merge conflicts in prompts/a.md, prompts/b.md", 7)
+    old = p.db.kv(release.KV_STUCK)
+    release.note_deferred(p, "the merge conflicts in prompts/b.md, prompts/a.md")       # same files
+    assert p.db.kv(release.KV_STUCK)["first"] == old["first"] and p.db.kv(release.KV_STUCK)["tasks"] == [7]
+    release.note_deferred(p, "the merged runtime fails `python -c x`: line 12")
+    rec = p.db.kv(release.KV_STUCK)
+    assert rec["first"] > old["first"] and rec["tasks"] == [] and rec["sig"].endswith("line #")
+    # The project settles the conflict its own way; the next upgrade lands and nothing is outstanding.
+    (p.harness / "prompts" / "kind-harness.md").write_text("# Harness task, upstream's way\n")
+    _git_out(p.harness, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "take upstream's")
+    cli.main(["upgrade", "demo"])
+    assert restarts and p.db.kv(release.KV_STUCK) is None and not _stuck_events(p)
+
+
 def test_a_second_upgrade_is_refused_while_one_holds_the_harness_upgrade_lock(env, monkeypatch):
     from ttp import cli, locks, release, service
     p = make(env)
