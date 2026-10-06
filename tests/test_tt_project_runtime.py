@@ -11396,6 +11396,26 @@ def test_push_own_without_checks_publishes_docs_only_and_refuses_code(env, monke
     assert _git_out(origin, "rev-parse", "ttp/t8-exp") == docs
 
 
+def test_push_own_detached_without_checks_refuses_code_at_once_and_detaches_docs_only(env, monkeypatch, capsys):
+    p, repo, origin, other = _push_setup(env, monkeypatch, [])
+    p.set_config("delivery.push_checks", [])
+    _git_out(repo, "checkout", "-q", "-b", "ttp/t9-exp")
+    monkeypatch.setenv("TTP_TASK", "9")
+    _commit(repo, "tool.py", "x = 1\n")
+    capsys.readouterr()
+    assert _ttp("push", "--own", "--detach") == 2
+    io = capsys.readouterr()
+    assert "no checks configured" in io.err and "tool.py" in io.err and "retry_when" not in io.out
+    assert not (p.state / "pushes").exists() or not list((p.state / "pushes").glob("*.json"))
+    _git_out(repo, "reset", "-q", "--hard", "HEAD~1")
+    _commit(repo, "notes.md", "docs\n")
+    assert _ttp("push", "--own", "--detach") == 0
+    probe = next(ln.split(": ", 1)[1] for ln in capsys.readouterr().out.splitlines()
+                 if ln.startswith("retry_when: "))
+    r = _probe_until_done(p, probe)
+    assert r.returncode == 0 and _git_out(origin, "rev-parse", "ttp/t9-exp") == _git_out(repo, "rev-parse", "HEAD")
+
+
 def test_push_own_detached_publishes_the_own_branch_and_reports_it(env, monkeypatch, capsys):
     p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
     _git_out(repo, "checkout", "-q", "-b", "ttp/t7-exp")

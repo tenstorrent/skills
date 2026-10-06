@@ -1228,7 +1228,7 @@ def _start(p: Project, marker: Path, m: dict, lock, env: dict, nice: int = 0) ->
 
 def detach(p: Project, repo: Path, own: bool = False) -> int:
     """Start `ttp push` for `repo` in a process of its own and print its marker and probe. The quick
-    refusals (pushing not allowed, no target, uncommitted changes) answer at once, without a marker.
+    refusals (pushing not allowed, no target, uncommitted changes, no checks for a code change) answer at once, without a marker.
     From inside a sandbox that would kill that process with the command, the daemon starts it."""
     d = p.config().get("delivery") or {}
     allowed = True if d.get("push_allowed") is None else d.get("push_allowed")
@@ -1244,6 +1244,16 @@ def detach(p: Project, repo: Path, own: bool = False) -> int:
     if _git(top, "status", "--porcelain", "--untracked-files=no").stdout.strip():
         print("ttp push: uncommitted changes; commit first", file=sys.stderr)
         return REFUSED
+    if not check_list(d.get("push_checks")):   # refuse now, not after the task handed off waiting
+        try:
+            base = _fetch(top, *target(p, top)) or None
+        except ValueError:
+            base = None
+        if code := code_paths(top, base) if base else ["(no push target to compare with)"]:
+            more = f" and {len(code) - 3} more" if len(code) > 3 else ""
+            print(f"ttp push: no checks configured, and this change touches more than docs "
+                  f"({', '.join(code[:3])}{more}): " + NO_CHECKS, file=sys.stderr)
+            return REFUSED
     task = os.environ.get("TTP_TASK")
     rid = (f"t{task}-" if task else "") + time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"
     folder = p.state / DETACHED
