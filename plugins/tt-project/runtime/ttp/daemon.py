@@ -77,6 +77,11 @@ WAIT_KEYS = ("retry_when", "retry_after_s", "waiting_for", "wake_tier", "next_st
 MAX_FOLLOWUPS, FOLLOWUP_SPEC_CHARS = 12, 4000   # per hand-off; each follow-up is its own event
 # What a review the daemon queues repeats of the code task's spec and hand-off.
 AUTO_REVIEW_SPEC_CHARS, AUTO_REVIEW_SUMMARY_CHARS = 2000, 1000
+# With the push queue on, the daemon starts the project's checks on a code task's head as it queues
+# its review (Daemon._precheck): their folder under the project's state, how long the review waits
+# for them before it starts anyway, and how long finished ones are kept.
+PRECHECKS_DIR, PRECHECK_LABEL = "prechecks", "precheck:"
+PRECHECK_HOLD_S, PRECHECK_KEEP_S = 3600, 7 * 86400
 # A failed review with fix specs gets its fix and re-review from the daemon this many rounds per stack;
 # the re-review repeats the failed review's spec (its push and after-push steps) up to this length.
 AUTO_FIX_ROUNDS, REVIEW_FIX_SPEC_CHARS = 2, 8000
@@ -2350,7 +2355,7 @@ class Daemon:
             ready = [t for t in ready if not logged_out[t["provider"] or core]] + \
                 sorted(out, key=lambda t: rank.get(t["tier"], len(rank)))
         for task in ready:
-            if self._disk_holds(task):
+            if self._disk_holds(task) or self._precheck_holds(task, now):
                 continue
             # A paused resource holds its tasks in the queue, attempts untouched, until it resumes.
             hit = sorted(coord.task_resources(task) & paused.keys())
@@ -3511,15 +3516,92 @@ class Daemon:
                          f"{d['push_branch']}).")
         else:
             lines.append("Review only: leave the branch" + (" and the PR" if pr else "") + " as they are.")
+        checks = self._precheck(task, full) if pushes else None
+        if checks:
+            lines.append(f"The daemon started the project's checks (`ttp checks`) on head {head} in "
+                         f"{self.p.worktrees / ('t' + str(task['id']))} as it queued this review, and starts the review "
+                         f"once they end: `ttp checks --result {checks}` prints their exit code and output tail "
+                         f"({checks / 'checks.log'} has it all). A pass is recorded, so `ttp checks` there reuses it. "
+                         f"The push queue runs the full checks again on the commit it pushes: run only focused tests "
+                         f"of what changed.")
         if str(rules.get("auto_notes") or "").strip():
             lines.append(str(rules["auto_notes"]).strip())
         lines.append("Return the verdict and findings" + (", and the pushed commit." if pushes else "."))
-        labels = [f"auto_review:{task['id']}"] + ([f"continues:{prior['id']}"] if prior else [])
+        labels = [f"auto_review:{task['id']}"] + ([f"continues:{prior['id']}"] if prior else []) \
+            + ([PRECHECK_LABEL + checks.name] if checks else [])
         rid = db.add_task(title, "\n".join(lines), kind="review", tier=tier, priority=2, origin="daemon",
                           budget_usd=float(cfg["budget"]["task_default_usd"].get(tier, 8.0)),
                           depends_on=[task["id"]], labels=labels)
         log(self.p, f"task {task['id']}: queued review #{rid} ({tier})")
         return rid, True
+
+    def _precheck(self, task: dict, full: str) -> Path | None:
+        """With the push queue on, the project's checks (`ttp checks --detach`) started on the code
+        task's head in its worktree as its review is queued, so the reviewer reads their result in its
+        first run instead of running the suite itself and handing off waiting; the pass they record
+        lets the reviewer's own `ttp checks` there reuse it. The folder they write to (as a run's
+        directory), or None when nothing started: the queue is off, the project sets no checks, or
+        the worktree is gone or holds another head."""
+        d = self.cfg.get("delivery") or {}
+        if not full or not pushq.enabled(self.p, self.cfg) or not push.check_list(d.get("push_checks")):
+            return None
+        path = self.p.worktrees / f"t{task['id']}"
+        try:
+            if not worktree.is_git(path) or worktree._git(path, "rev-parse", "HEAD") != full:
+                return None
+        except Exception:
+            return None
+        base = self.p.state / PRECHECKS_DIR
+        self._prune_prechecks(base)
+        out = base / f"t{task['id']}-{full[:12]}"
+        runtime_dir = str(Path(__file__).resolve().parent.parent)
+        bin_path = f"{service_path()}:{os.environ.get('PATH', '')}"
+        venv = worktree.project_venv(self.p, path)
+        venv_vars = worktree.venv_env(venv, bin_path) if venv else {}
+        # As a reviewer's run would: the project's venv, `ttp` first, niced like workers.
+        env = {**os.environ, **venv_vars, "TTP_RUN_DIR": str(out), "TTP_PROJECT": str(self.p.base),
+               "TTP_RUN_ID": f"precheck-t{task['id']}", "TTP_TASK": str(task["id"]), "PYTHONPATH": runtime_dir,
+               "PATH": f"{self.p.harness / 'bin'}:{venv_vars.get('PATH', bin_path)}"}
+        level = nice_level(self.cfg.get("runner"))[0]
+        argv = (["nice", "-n", str(level)] if level else []) + [sys.executable, "-m", "ttp", "checks", "--detach"]
+        try:
+            out.mkdir(parents=True, exist_ok=True)
+            r = subprocess.run(argv, cwd=path, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                               timeout=PROBE_TIMEOUT_S)
+        except (OSError, subprocess.SubprocessError) as e:
+            log(self.p, f"task {task['id']}: checks not started for its review: {e}")
+            return None
+        if r.returncode:
+            log(self.p, f"task {task['id']}: checks not started for its review: {(r.stderr or r.stdout).strip()[:300]}")
+            return None
+        log(self.p, f"task {task['id']}: started the checks on {full[:12]} for its review ({out})")
+        return out
+
+    @staticmethod
+    def _prune_prechecks(base: Path) -> None:
+        """Pre-started checks that ended over PRECHECK_KEEP_S ago go; running ones stay."""
+        from .cli import _checks_alive, _read_checks_pid
+        try:
+            old = [x for x in base.iterdir() if x.is_dir() and time.time() - x.stat().st_mtime > PRECHECK_KEEP_S]
+        except OSError:
+            return
+        for x in old:
+            if not _checks_alive(_read_checks_pid(x)):
+                shutil.rmtree(x, ignore_errors=True)
+
+    def _precheck_holds(self, task: dict, now: float) -> bool:
+        """A review waits for the checks the daemon started on its head (_precheck) while they run,
+        at most PRECHECK_HOLD_S after they started: the reviewer then reads their result at once."""
+        if task["kind"] != "review":
+            return False
+        name = next((x[len(PRECHECK_LABEL):] for x in push._labels(task) if x.startswith(PRECHECK_LABEL)), "")
+        if not name or "/" in name:
+            return False
+        from .cli import CHECKS_RC, _checks_alive, _read_checks_pid
+        out = self.p.state / PRECHECKS_DIR / name
+        info = _read_checks_pid(out)
+        return (not (out / CHECKS_RC).exists() and _checks_alive(info)
+                and now - float(info.get("ts") or 0) < PRECHECK_HOLD_S)
 
     def _fix_failed_review(self, review: dict, fups: list[dict], summary: str) -> tuple[int, int, list[int]] | None:
         """A review that failed with fix specs, handled the way the coordinator would: one code task

@@ -12690,6 +12690,10 @@ def test_the_review_prompt_approves_into_the_push_queue_only_when_it_is_on(env):
     assert "NEVER run `ttp push` or `git push`, and never bump versions" in queue
     assert "`push conflict`: fetch, rebase the change onto the push branch's current tip" in queue
     assert "keeping both sides' intents" in queue and "approve the new head" in queue
+    # The queue runs the full checks: reviewers run focused tests and read the daemon's pre-started ones.
+    assert "never run the full suite yourself or hand off `waiting` on it" in queue
+    assert "focused tests of what changed" in queue and "`ttp checks --result <folder>`" in queue
+    assert "Run the project's checks" not in queue
     coord_md = (RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text()
     assert 'ask the reviewer\n  to "approve for the push queue" and carry no push or deploy steps' in coord_md
     assert "A `pushing` task is in the queue: leave it." in coord_md
@@ -23083,6 +23087,51 @@ def test_the_daemon_queues_the_review_of_a_finished_code_task(env):
     p.set_config("review.risky_paths", ["state/*"])
     _, _, _, (risky,) = _finish_code(env, p, "risky", {"state/db.py": 3})
     assert risky["tier"] == "standard"
+
+
+def test_with_the_push_queue_on_the_daemon_starts_the_checks_as_it_queues_the_review(env):
+    # Reviewers ended waiting on `ttp checks` they started themselves. With the push queue on, the
+    # daemon starts them on the head as it queues the review, holds the review while they run, and
+    # their recorded pass lets the reviewer's own `ttp checks` there reuse it.
+    from ttp import cli
+    from ttp.daemon import PRECHECK_HOLD_S, PRECHECK_LABEL, PRECHECKS_DIR, Daemon
+    from ttp.runner import proc_start
+    p = make(env)
+    p.set_config("delivery.push_branch", "work")
+    p.set_config("delivery.push_checks", ["test -f app.py"])
+    # Queue off: nothing starts, the review is not held.
+    _, _, _, (off,) = _finish_code(env, p, "queue off", {"app.py": 3})
+    assert "ttp checks --result" not in off["spec"] and PRECHECK_LABEL not in off["labels"]
+    assert not (p.state / PRECHECKS_DIR).exists()
+    p.set_config("delivery.push_queue", True)
+    tid, branch, _, (rev,) = _finish_code(env, p, "queue on", {"app.py": 3})
+    head = _git_out(p.root, "rev-parse", branch).strip()
+    out = p.state / PRECHECKS_DIR / f"t{tid}-{head[:12]}"
+    assert f"{PRECHECK_LABEL}{out.name}" in json.loads(rev["labels"])
+    assert f"ttp checks --result {out}" in rev["spec"] and "run only focused tests" in rev["spec"]
+    deadline = time.time() + 30
+    while not (out / cli.CHECKS_RC).exists() and time.time() < deadline:
+        time.sleep(0.1)
+    assert (out / cli.CHECKS_RC).read_text().strip() == "0", (out / cli.CHECKS_OUT).read_text()
+    tree = _git_out(p.root, "rev-parse", f"{head}^{{tree}}").strip()
+    assert cli._recorded_pass(p, tree, ["test -f app.py"]), "the reviewer's `ttp checks` could not reuse the pass"
+    d, now = Daemon(p.base), time.time()
+    task = p.db.task(rev["id"])
+    assert not d._precheck_holds(task, now), "finished checks hold the review"
+    # While they run the review waits, at most PRECHECK_HOLD_S; checks that died hold nothing.
+    (out / cli.CHECKS_RC).unlink()
+    alive = {"pid": os.getpid(), "started": proc_start(os.getpid()), "ts": now}
+    (out / cli.CHECKS_PID).write_text(json.dumps(alive))
+    assert d._precheck_holds(task, now)
+    assert not d._precheck_holds(task, now + PRECHECK_HOLD_S + 1)
+    assert not d._precheck_holds(dict(task, kind="code"), now)
+    (out / cli.CHECKS_PID).write_text(json.dumps(dict(alive, started="other")))
+    assert not d._precheck_holds(task, now)
+    # A worktree that moved past the reviewed head, or no project checks: nothing starts.
+    assert d._precheck(p.db.task(tid), "0" * 40) is None
+    p.set_config("delivery.push_checks", [])
+    _, _, _, (none,) = _finish_code(env, p, "no checks", {"app.py": 3})
+    assert PRECHECK_LABEL not in none["labels"] and "ttp checks --result" not in none["spec"]
 
 
 def test_the_review_of_a_head_already_delivered_as_a_pr_publishes_nothing_more(env):

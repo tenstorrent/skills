@@ -59,7 +59,12 @@
   `"push": [{"branch": "<the change's branch>", "head": "<full hash you reviewed>"}]`. The daemon
   pushes approved heads in batches with one version bump, the checks and the deploy steps.
 - NEVER run `ttp push` or `git push`, and never bump versions or write the bump's changeset.
+- Testing, in place of the `ttp checks` step above: the queue runs the project's full checks on the
+  exact commit it pushes, so never run the full suite yourself or hand off `waiting` on it. Run only
+  focused tests of what changed, and reuse the check results that exist: the spec names the checks
+  the daemon started on the head as it queued this review (`ttp checks --result <folder>` prints
+  them). Checks that failed on the head are a blocking finding.
 - Woken because `push conflict`: fetch, rebase the change onto the push branch's current tip in
-  its worktree and resolve keeping both sides' intents (the one edit you may make). Run the
-  project's checks, commit, and approve the new head.
+  its worktree and resolve keeping both sides' intents (the one edit you may make). Run focused
+  tests of what the resolution touched, commit, and approve the new head.
 - A failed check needs nothing from you: the daemon fails the task.
