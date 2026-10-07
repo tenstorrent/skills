@@ -313,7 +313,8 @@ def submit(d: Path, cfg: dict, spec: dict) -> int:
         print(f"devq submit: id {job} was already used here; pick a new one (e.g. {job}-r2)", file=sys.stderr)
         return 2
     spec["submitted"] = _now()
-    # The settings go down before the job: an idle runner may dequeue it at once and must see them.
+    # The settings go down before the job: an idle runner may dequeue it at once and must see them
+    # (it rereads them for each job it takes, see loop).
     _write(d / "config.json", json.dumps(settings(cfg), indent=1))
     _write(d / "queue" / f"{time.time_ns():020d}-{job}.json", json.dumps(spec, indent=1))
     ahead = len(list((d / "queue").glob("*.json"))) - 1 + len(_running(d))
@@ -678,6 +679,7 @@ class Runner:
                 # Read again after the dequeue: submit writes the settings before the job, so a job
                 # queued since the read above runs with the settings of its own submit.
                 self.cfg = settings(_load(self.d / "config.json"))
+                self.cfg = settings(_load(self.d / "config.json"))   # as written by the submit that queued it
                 self.run_job(job)
                 idle_since = _now()
                 continue

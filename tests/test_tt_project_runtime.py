@@ -26157,6 +26157,36 @@ def test_devq_runner_records_an_attempt_before_the_job_starts_so_a_successor_can
         os.killpg(pid, 0)
 
 
+def test_devq_submit_writes_the_runner_settings_before_it_queues_the_job(env, devq_dir, monkeypatch):
+    """A runner already up picks a queued job at once: the settings sent with it must be on disk first,
+    and the runner rereads them for each job it takes, or the job runs under the previous settings."""
+    from ttp import devq
+    order = []
+    real = devq._write
+    monkeypatch.setattr(devq, "_write", lambda path, text: (order.append(path.parent.name + "/" + path.name),
+                                                            real(path, text)))
+    monkeypatch.setattr(devq, "start", lambda d, cfg: 0)
+    assert devq.submit(devq_dir, {"job_timeout_s": 120}, {"id": "j1", "cmd": "true"}) == 0
+    queued = [i for i, f in enumerate(order) if f.startswith("queue/")]
+    assert queued and "devq/config.json" in order[:queued[0]], order
+    assert json.loads((devq_dir / "config.json").read_text())["job_timeout_s"] == 120
+    # A submit lands between the runner's read of its settings and its dequeue: the job still gets them.
+    devq._write(devq_dir / "config.json", json.dumps(devq.settings({"idle_exit_s": 0, "job_timeout_s": 5})))
+    runner, seen, jobs = devq.Runner(devq_dir), [], ["j1"]
+
+    def next_job():
+        if jobs:
+            devq._write(devq_dir / "config.json", json.dumps(devq.settings({"idle_exit_s": 0, "job_timeout_s": 120})))
+        return jobs.pop() if jobs else ""
+    monkeypatch.setattr(runner, "next_job", next_job)
+    monkeypatch.setattr(runner, "run_job", lambda job: seen.append((job, runner.limit({}))))
+    monkeypatch.setattr(devq.signal, "signal", lambda *a: None)
+    try:
+        assert runner.loop() == 0 and seen == [("j1", 120)]
+    finally:
+        (devq_dir / "runner.pid").unlink()     # this test's own pid: the fixture must not kill it
+
+
 def test_devq_restart_requeues_a_job_a_reboot_killed_and_adopts_one_still_running(devq_dir, tmp_path):
     d, flag = devq_dir, tmp_path / "flag"
     # Reboot: runner and job both die. The probe wakes the task; start runs the job again as a drop.
