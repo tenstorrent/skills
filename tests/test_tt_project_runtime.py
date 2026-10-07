@@ -1119,6 +1119,99 @@ def test_effort_falls_back_to_rules_and_leaves_other_tasks_alone(env, monkeypatc
     assert effort.pick(p.db, cfg, p.db.task(w), "claude", jev) is None
 
 
+def test_device_tasks_retry_at_standard_unless_a_run_hands_off_needs_deep(env, monkeypatch):
+    p = make(env)
+    from ttp import effort, machines
+    monkeypatch.setattr(machines, "load", lambda: {"box1": {"tags": ["device", "x86"]}, "build1": {"tags": ["x86"]}})
+    cfg = p.config()
+    failed = {"status": "failed", "summary": "chip dropped mid-job"}
+    deep_ask = {**failed, "needs_deep": "the hang reproduces without drops; needs a deeper look"}
+    device_labels = (["resource:box1-device"], ["exclusive:lab-device"], ["needs_device"], ["resource:box1"])
+    for labels in device_labels:
+        t = p.db.add_task(f"Run the job {labels}", "x", kind="work", tier="standard", origin="coordinator",
+                          labels=labels)
+        assert effort.device_task(p.db.task(t))
+        # A failed or hand-off-less standard try of a device task retries at standard.
+        for result in (failed, {"status": "no_handoff"}, {**failed, "needs_deep": "  "}):
+            p.db.update_task(t, attempts=1, result=json.dumps(result))
+            assert effort.retry_tier(p.db, p.db.task(t)) is None
+            assert effort.pick(p.db, cfg, p.db.task(t), "claude", None) is None
+        # Its hand-off asks for deep: the retry runs deep.
+        p.db.update_task(t, result=json.dumps(deep_ask))
+        assert effort.pick(p.db, cfg, p.db.task(t), "claude", None) == {
+            "tier": "deep", "from": "standard", "by": "retry", "review": False}
+    # A failed light device try still goes up to standard: only deep is gated.
+    lt = p.db.add_task("Check the box", "x", kind="work", tier="light", origin="coordinator",
+                       labels=["resource:box1-device"])
+    p.db.update_task(lt, attempts=1, result=json.dumps(failed))
+    assert effort.retry_tier(p.db, p.db.task(lt)) == "standard"
+    # Non-device tasks (no resource, a plain resource, a machine without the device tag) are unchanged.
+    for labels in ([], ["resource:build1"], ["resource:lab-printer"], ["exclusive:unknown"]):
+        t = p.db.add_task(f"Port it {labels}", "x", kind="code", tier="standard", origin="coordinator", labels=labels)
+        assert not effort.device_task(p.db.task(t))
+        p.db.update_task(t, attempts=1, result=json.dumps(failed))
+        assert effort.retry_tier(p.db, p.db.task(t)) == "deep"
+    # A device task that continues a failed standard one starts deep only when that one asked for it.
+    old = p.db.add_task("Run it", "x", kind="work", tier="standard", origin="coordinator",
+                        labels=["resource:box1-device"])
+    p.db.update_task(old, status="failed", result=json.dumps(failed))
+    new = p.db.add_task("Run it again", "x", kind="work", tier="standard", origin="coordinator",
+                        labels=["resource:box1-device", f"continues:{old}"])
+    assert effort.retry_tier(p.db, p.db.task(new)) is None
+    p.db.update_task(old, result=json.dumps(deep_ask))
+    assert effort.retry_tier(p.db, p.db.task(new)) == "deep"
+    # An unreadable machines list never holds a task back: it is just not a device task.
+    monkeypatch.setattr(machines, "load", lambda: (_ for _ in ()).throw(OSError("unreadable")))
+    t = p.db.add_task("Run on box1", "x", kind="work", tier="standard", origin="coordinator", labels=["resource:box1"])
+    assert not effort.device_task(p.db.task(t))
+
+
+def test_coordinator_deep_device_tasks_start_at_standard_unless_asked_for_deep(env, monkeypatch):
+    p = make(env)
+    from ttp import effort
+    from ttp.daemon import Daemon
+    cfg = p.config()
+    t = p.db.add_task("Profile the job", "x", kind="work", tier="deep", origin="coordinator",
+                      labels=["resource:box1-device"])
+    assert effort.pick(p.db, cfg, p.db.task(t), "claude", None) == {
+        "tier": "standard", "from": "deep", "by": "device", "review": False}
+    # The daemon starts it at standard and stores that on the task.
+    d = Daemon(p.base)
+    d.jev = None
+    monkeypatch.setattr(d, "_workdir_for", lambda tk: (str(p.base), None))
+    started = []
+    monkeypatch.setattr(d, "start_run", lambda *a, **k: started.append(a[3]) or 0)
+    d.dispatch()
+    assert started == ["standard"] and p.db.task(t)["tier"] == "standard"
+    # Kept at deep: the user asked for it, the user queued it, a non-device task, or a later start.
+    old = p.db.add_task("Profile", "x", kind="work", tier="standard", origin="coordinator",
+                        labels=["resource:box1-device"])
+    p.db.update_task(old, status="failed", result=json.dumps({"status": "failed", "needs_deep": "a real hang"}))
+    kept = [{"origin": "coordinator", "labels": ["resource:box1-device", effort.USER_DEEP]},
+            {"origin": "user", "labels": ["resource:box1-device"]},
+            {"origin": "coordinator", "labels": ["resource:build1"]},
+            {"origin": "coordinator", "labels": ["resource:box1-device", f"continues:{old}"]}]
+    for kw in kept:
+        k = p.db.add_task(f"Profile {kw}", "x", kind="work", tier="deep", **kw)
+        assert effort.pick(p.db, cfg, p.db.task(k), "claude", None) is None, kw
+    later = p.db.add_task("Profile later", "x", kind="work", tier="deep", origin="coordinator",
+                          labels=["resource:box1-device"])
+    p.db.update_task(later, attempts=1, result=json.dumps({"status": "waiting"}))
+    assert effort.pick(p.db, cfg, p.db.task(later), "claude", None) is None
+    # task_add records the user's ask as a label, only on a deep task.
+    from ttp import coordinator as co
+    notes = co.apply(p, [
+        {"type": "task_add", "title": "Hunt the hang", "spec": "x", "tier": "deep", "resources": ["box1-device"],
+         "user_deep": True},
+        {"type": "task_add", "title": "Run the sweep", "spec": "x", "tier": "standard", "resources": ["box1-device"],
+         "user_deep": True}])
+    assert not [n for n in notes if "rejected" in n], notes
+    hunt = p.db.one("SELECT * FROM tasks WHERE title='Hunt the hang'")
+    sweep = p.db.one("SELECT * FROM tasks WHERE title='Run the sweep'")
+    assert effort.USER_DEEP in json.loads(hunt["labels"]) and effort.USER_DEEP not in json.loads(sweep["labels"])
+    assert effort.pick(p.db, cfg, dict(hunt), "claude", None) is None
+
+
 @pytest.mark.parametrize("text", [
     "Decide it yourself.", "your call", "That's up to you", "you decide", "Just do it", "use your judgement",
     "whatever you think is best", "No need to ask for this", "don’t ask me about restarts",

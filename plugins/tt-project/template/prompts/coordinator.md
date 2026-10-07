@@ -17,7 +17,7 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
 | action | fields | use for |
 |---|---|---|
 | `reply` | `chat`, `text` | answer the chat that asked (chat id from the event) |
-| `task_add` | `title`, `spec`, `kind`, `tier`, `priority` 1-5, optional `reply_chat`, `depends_on`, `provider`, `budget_usd`, `resources`, `exclusive`, `continues` (id of a failed, cancelled or blocked task this one replaces; a done one gets a follow-up instead), `start_after` (a delay such as `3d` or an ISO time), `start_when` (shell probe: exit 0 = start, 1, 75 (busy `ttp lock`) or 255 (host unreachable) = not yet), `force` (true: add it even though it looks like an open or recently done task) | all real work |
+| `task_add` | `title`, `spec`, `kind`, `tier`, `priority` 1-5, optional `reply_chat`, `depends_on`, `provider`, `budget_usd`, `resources`, `exclusive`, `user_deep` (true: the user asked for `deep`), `continues` (id of a failed, cancelled or blocked task this one replaces; a done one gets a follow-up instead), `start_after` (a delay such as `3d` or an ISO time), `start_when` (shell probe: exit 0 = start, 1, 75 (busy `ttp lock`) or 255 (host unreachable) = not yet), `force` (true: add it even though it looks like an open or recently done task) | all real work |
 | `task_update` | `id`, `status` (queued/blocked/cancelled/done/waiting), `text` (why, when blocking or cancelling; otherwise added to the spec), `priority`, `spec`, `depends_on` (replaces the list; `[]` clears it), `resources` + `exclusive` (replace its resources; not while it runs), `start_after`/`start_when` (re-defer a task not yet started; `now` and `""` clear them) | steer existing tasks |
 | `ask_user` | `text`, `severity`, `blocking`, `recommendation`, `least_disruptive` (required when `blocking` is `restriction`: the least-disruptive way forward you found and the restriction it breaks) | a decision only the user can make |
 | `resolve` | `id` (an open ask) | the user answered it, or it no longer matters |
@@ -42,7 +42,11 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
 - `tier`: `light` for lookups, triage, small edits; `standard` (the default) for everything else.
   `deep` (max effort) only when the user asks for it: a non-review task whose run fails or ends
   without a hand-off retries one tier up by itself (deep only after standard), as does one that
-  `continues` a failed task, within its own budget. A `standard` task may start at `light` when its
+  `continues` a failed task, within its own budget. A device task (`needs_device`, a `*-device`
+  resource or a machine tagged `device`) fails from drops and reboots, not too little effort: it
+  retries at `standard` unless the failed run handed off `needs_deep`, and one queued at `deep`
+  starts at `standard` unless you set `user_deep` (the user asked for deep) or it `continues` a
+  `needs_deep` try. A `standard` task may start at `light` when its
   spec is a short lookup (Jev or rules pick it; the pick is logged with the run). Respect the
   budget's `max_tier`.
   A `review` gets its tier from the diff it names (branch or commit in the spec, or `depends_on`

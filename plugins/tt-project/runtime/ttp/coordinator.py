@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from . import locks
-from . import ends, jevuse, machines, prguard, push, shared, unblock, upstream
+from . import effort, ends, jevuse, machines, prguard, push, shared, unblock, upstream
 from . import screen as scr
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
@@ -60,7 +60,7 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "blocking": {"type": "string", "enum": list(BLOCKING_REASONS)}, "recommendation": {"type": "string"},
             "least_disruptive": {"type": "string"}, "reversible": {"type": "boolean"}, "force": {"type": "boolean"},
             "resources": {"type": "array", "items": {"type": "string"}}, "exclusive": {"type": "boolean"},
-            "needs_device": {"type": "boolean"},
+            "needs_device": {"type": "boolean"}, "user_deep": {"type": "boolean"},
             "continues": {"type": "integer"}, "resource": {"type": "string"}, "paused": {"type": "boolean"},
             "reason": {"type": "string"}, "supersedes": {"type": "array", "items": {"type": "string"}},
             "replaces": {"type": "string"}, "over": {"type": "string"},
@@ -732,6 +732,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 labels = [f"{kind_label}:{r}" for r in names]
                 if a.get("needs_device") or set(names) & locks.device_locks(cfg):
                     labels.append("needs_device")
+                if tier == "deep" and a.get("user_deep"):
+                    labels.append(effort.USER_DEEP)   # a device task keeps deep on its first start
                 deps = _new_dependencies(db, None, a.get("depends_on") or [])
                 # The daemon would block a new task on a dead dependency at once.
                 dead = db.dead_dependency(deps)

@@ -102,6 +102,7 @@ Before you finish, write `$TTP_RUN_DIR/result.json`:
  "wake_tier": "only when waiting: light (the next run only checks) or standard (real work follows)",
  "next_step": "only when waiting: the one mechanical step left after it (e.g. push); a light wake does it",
  "wait_kind": "only when waiting: self (your own detached checks or jobs, a time window you planned) or external",
+ "needs_deep": "only on a device task: the problem you could not solve at this tier; its retry runs deep",
  "pr": "URL if you opened or updated one",
  "artifacts": ["paths or URLs"],
  "metrics": {"name": "value"},

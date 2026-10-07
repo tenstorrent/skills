@@ -7,7 +7,9 @@ Defaults: standard (high effort). A task the coordinator queued at standard may 
 its spec is a short lookup: Jev scores it where its `effort` use is allowed (see jevuse), else simple
 rules do. Neither picks deep on a first try: deep (max effort) comes only from whoever queued the task
 (the user asked) or from a retry after a failed or hand-off-less standard run, and that run stays within
-the task's own remaining budget, which is never raised. Every code task keeps its review (the daemon
+the task's own remaining budget, which is never raised. A device task fails from drops and reboots, not
+too little effort: it goes deep only when a run hands off `needs_deep`, and one the coordinator queued at
+deep starts at standard unless the user asked for deep (`user_deep`) or it continues a `needs_deep` try. Every code task keeps its review (the daemon
 queues it); the pick only records it.
 
 The pick is logged in the run's note, next to its outcome, and a Jev pick in jev_calls with the measured
@@ -19,7 +21,7 @@ import json
 import re
 import time
 
-from . import jevuse
+from . import jevuse, machines
 from .db import DB, dump_result
 
 JEV_USE = "effort"
@@ -53,12 +55,54 @@ def _labels(task: dict) -> list[str]:
 
 
 UP = {"light": "standard", "standard": "deep"}
+NEEDS_DEEP = "needs_deep"   # hand-off key: the problem a standard run could not solve at its tier
+USER_DEEP = "user_deep"     # label: the user asked for deep, so a device task keeps it on its first start
+
+
+def _resource_names(task: dict) -> list[str]:
+    return [lb.split(":", 1)[1] for lb in _labels(task) if lb.startswith(("resource:", "exclusive:"))]
+
+
+def device_task(task: dict) -> bool:
+    """Tagged `needs_device`, or names a `*-device` resource or a machine tagged `device`."""
+    if "needs_device" in _labels(task):
+        return True
+    names = _resource_names(task)
+    if any(n.endswith("-device") for n in names):
+        return True
+    if not names:
+        return False
+    try:
+        known = machines.load()
+        return any("device" in machines.tag_list((known.get(n) or {}).get("tags")) for n in names)
+    except Exception:   # an unreadable machines list must never hold a task back
+        return False
+
+
+def wants_deep(result) -> bool:
+    """The hand-off sets `needs_deep` to a non-empty reason."""
+    if isinstance(result, str):
+        try:
+            result = json.loads(result or "{}")
+        except (TypeError, ValueError):
+            return False
+    return isinstance(result, dict) and bool(str(result.get(NEEDS_DEEP) or "").strip())
+
+
+def _continued(db: DB, task: dict) -> list[dict]:
+    out = []
+    for label in _labels(task):
+        if label.startswith("continues:") and label[10:].isdigit():
+            old = db.task(int(label[10:]))
+            if old:
+                out.append(old)
+    return out
 
 
 def retry_tier(db: DB, task: dict) -> str | None:
     """One tier up when this start retries a light or standard try that failed (its last run handed off
     `failed` or ended without a hand-off, or the task continues one that failed): deep only after a
-    failed standard try. None otherwise. A failed try raises the tier once: a start that is requeued
+    failed standard try, and for a device task only when that try handed off `needs_deep`. None otherwise. A failed try raises the tier once: a start that is requeued
     without spending an attempt keeps the failed result, so `mark_raised` notes the raise in it."""
     up = UP.get(task.get("tier") or "")
     if task.get("kind") == "review" or not up:
@@ -68,13 +112,14 @@ def retry_tier(db: DB, task: dict) -> str | None:
     except (TypeError, ValueError):
         last = {}
     attempts = int(task.get("attempts") or 0)
+    gated = up == "deep" and device_task(task)
     if attempts and isinstance(last, dict) and last.get("status") in RETRY_FAILED:
+        if gated and not wants_deep(last):
+            return None
         return up if last.get(RAISED) != attempts else None
-    for label in _labels(task):
-        if label.startswith("continues:") and label[10:].isdigit():
-            old = db.task(int(label[10:]))
-            if old and old["status"] == "failed" and old["tier"] == task["tier"]:
-                return up
+    for old in _continued(db, task):
+        if old["status"] == "failed" and old["tier"] == task["tier"] and not (gated and not wants_deep(old["result"])):
+            return up
     return None
 
 
@@ -130,13 +175,19 @@ def _jev_tier(db: DB, cfg: dict, task: dict, provider: str, jev) -> dict | None:
 def pick(db: DB, cfg: dict, task: dict, provider: str, jev=None) -> dict | None:
     """The tier this start of `task` runs at, with how it was picked, or None to leave the task as it
     is. Picks on the first start of a non-review task the coordinator queued at standard, and on a
-    retry after a failed light or standard try. The caller stores `tier` on the task and the dict in the run note."""
+    retry after a failed light or standard try. A device task the coordinator queued at deep starts at
+    standard unless the user asked for deep or it continues a try that handed off `needs_deep`. The caller stores `tier` on the task and the dict in the run note."""
     if task.get("kind") == "review":
         return None
     review = task.get("kind") == "code"
     up = retry_tier(db, task)
     if up:
         return {"tier": up, "from": task["tier"], "by": "retry", "review": review}
+    first = task.get("origin") == "coordinator" and not int(task.get("attempts") or 0) \
+        and not db.one("SELECT 1 FROM runs WHERE task=? AND role!='coordinator' LIMIT 1", (task["id"],))
+    if task.get("tier") == "deep" and first and USER_DEEP not in _labels(task) and device_task(task) \
+            and not any(wants_deep(old["result"]) for old in _continued(db, task)):
+        return {"tier": "standard", "from": "deep", "by": "device", "review": review}
     if task.get("tier") != "standard" or task.get("origin") != "coordinator" or int(task.get("attempts") or 0):
         return None
     if db.one("SELECT 1 FROM runs WHERE task=? AND role!='coordinator' LIMIT 1", (task["id"],)):
