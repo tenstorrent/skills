@@ -4,7 +4,9 @@
 
 A user service on the viewer's computer runs `ssh -N -L` and restarts it whenever it exits: after
 a reboot (at login), a network drop or a sleep. ServerAliveInterval makes a dead connection exit
-instead of hanging. macOS: a launchd agent (KeepAlive, ThrottleInterval between restarts). Linux:
+instead of hanging. ControlMaster=no and ControlPath=none make it own its forward: as a client of a
+shared master from the user's ssh config it would hand the forward over and exit, and the forward
+would die with that master. macOS: a launchd agent (KeepAlive, ThrottleInterval between restarts). Linux:
 a systemd user unit (Restart=always with a growing delay, never giving up). The service is named
 com.tt-project.tunnel.<name>; installing again adopts or replaces it, and `--unkeep` removes it.
 The ssh login must work without a prompt (a key, or an agent the service can reach).
@@ -22,6 +24,8 @@ from pathlib import Path
 
 from .project import HOME_DIR, durable_write
 
+# The forward's own connection, never a shared master's (an agent without both is replaced).
+OWN = (re.compile(r"ControlMaster[=\s]+no\b", re.I), re.compile(r"ControlPath[=\s]+none\b", re.I))
 # Ours, and the shapes a hand-made service uses: `-L 8800:localhost:8700`, `-L127.0.0.1:8800:...`.
 FORWARD = re.compile(r"-L\s*(?:(?:127\.0\.0\.1|localhost):)?(\d+):(?:127\.0\.0\.1|localhost):(\d+)")
 
@@ -34,7 +38,7 @@ def ssh_argv(host: str, local: int, remote: int, ssh: str | None = None) -> list
     """The forward: this computer's localhost:local to the project machine's localhost:remote."""
     return [ssh or shutil.which("ssh") or "ssh", "-N", "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes",
             "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=3", "-o", "ConnectTimeout=20",
-            "-L", f"127.0.0.1:{local}:127.0.0.1:{remote}", host]
+            "-o", "ControlMaster=no", "-o", "ControlPath=none", "-L", f"127.0.0.1:{local}:127.0.0.1:{remote}", host]
 
 
 def systemd_unit(name: str, argv: list[str]) -> str:
@@ -61,7 +65,8 @@ def service_file(name: str, platform: str | None = None) -> Path:
 
 
 def installed(name: str, platform: str | None = None) -> dict | None:
-    """The kept tunnel's forward as installed: {"file", "host", "local", "remote"}, or None."""
+    """The kept tunnel's forward as installed: {"file", "host", "local", "remote", "own"}, or None.
+    "own": its ssh keeps its own connection (not a client of a shared ControlMaster)."""
     f = service_file(name, platform)
     if not f.is_file():
         return None
@@ -72,11 +77,12 @@ def installed(name: str, platform: str | None = None) -> dict | None:
             line = next((ln for ln in f.read_text().splitlines() if ln.startswith("ExecStart=")), "")
             argv = shlex.split(line[len("ExecStart="):])
     except (OSError, ValueError, plistlib.InvalidFileException):
-        return {"file": str(f), "host": "", "local": 0, "remote": 0}
+        return {"file": str(f), "host": "", "local": 0, "remote": 0, "own": False}
     words = " ".join(argv).split()   # also sees into `sh -c "exec ssh ... host"`
-    m = FORWARD.search(" ".join(words))
+    line = " ".join(words)
+    m = FORWARD.search(line)
     return {"file": str(f), "host": words[-1] if words else "", "local": int(m.group(1)) if m else 0,
-            "remote": int(m.group(2)) if m else 0}
+            "remote": int(m.group(2)) if m else 0, "own": all(o.search(line) for o in OWN)}
 
 
 def _run(*argv: str) -> subprocess.CompletedProcess:
@@ -110,11 +116,11 @@ def _start(name: str, platform: str) -> str:
 def keep(name: str, host: str, remote: int, pick_port, platform: str | None = None) -> tuple[int, str]:
     """Install, adopt or replace the kept tunnel; returns (local port, what was done).
     `pick_port(preferred)` returns a free local port. A service already forwarding to the same
-    host and port is adopted as is (and started if it was stopped); any other is stopped and
-    replaced, keeping its local port when that is free, so the page's address stays the same."""
+    host and port on its own connection is adopted as is (and started if it was stopped); any other
+    (also one that would ride a shared ControlMaster) is stopped and replaced, keeping its local port when that is free, so the page's address stays the same."""
     platform = platform or sys.platform
     have = installed(name, platform)
-    if have and have["host"] == host and have["remote"] == remote and have["local"]:
+    if have and have["host"] == host and have["remote"] == remote and have["local"] and have["own"]:
         how = _start(name, platform)
         return have["local"], f"adopted the kept tunnel already installed ({how}, {have['file']})"
     if have:

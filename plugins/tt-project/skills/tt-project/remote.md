@@ -28,6 +28,9 @@
 
 - `ExitOnForwardFailure=yes`: a forward that cannot bind must fail loudly.
 - `ServerAliveInterval=30`, `ServerAliveCountMax=3`: drop dead links fast.
+- `ControlMaster=no`, `ControlPath=none`: the tunnel owns its connection. As a client of a shared
+  master it would hand the forward over and exit (the supervisor respawns it in a loop), and the
+  forward would die with that master.
 - Supervisor restarts it (`KeepAlive` / `Restart=always`).
 - A tunnel that connects but binds nothing is broken. Verify from the far end.
 

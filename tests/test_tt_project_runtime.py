@@ -17033,7 +17033,7 @@ def test_kept_tunnel_service_files_and_adopt_replace_remove(env, tmp_path, monke
     unit = tunnel.systemd_unit("demo", argv)
     for want in ("Restart=always", "RestartSec=5", "RestartMaxDelaySec=300", "StartLimitIntervalSec=0",
                  "ServerAliveInterval=30", "ExitOnForwardFailure=yes", "BatchMode=yes",
-                 "-L 127.0.0.1:18800:127.0.0.1:18700 the-host", "WantedBy=default.target"):
+                 "-o ControlMaster=no -o ControlPath=none", "-L 127.0.0.1:18800:127.0.0.1:18700 the-host", "WantedBy=default.target"):
         assert want in unit, (want, unit)
     plist = tunnel.launchd_plist("demo", argv)
     assert plist["Label"] == "com.tt-project.tunnel.demo" and plist["KeepAlive"] is True
@@ -17050,7 +17050,7 @@ def test_kept_tunnel_service_files_and_adopt_replace_remove(env, tmp_path, monke
         f = tunnel.service_file("demo", platform)
         assert f.name.startswith("com.tt-project.tunnel.demo") and f.is_file(), f
         assert local == 18800 and did.startswith("installed a kept tunnel"), did
-        assert tunnel.installed("demo", platform)["local"] == 18800
+        assert tunnel.installed("demo", platform)["local"] == 18800 and tunnel.installed("demo", platform)["own"]
         before = f.read_bytes()
         local, did = tunnel.keep("demo", "the-host", 18700, pick, platform=platform)
         assert did.startswith("adopted") and local == 18800 and f.read_bytes() == before, did
@@ -17060,6 +17060,16 @@ def test_kept_tunnel_service_files_and_adopt_replace_remove(env, tmp_path, monke
         assert tunnel.installed("demo", platform)["remote"] == 18701
         stops = [c for c in calls if "bootout" in c or "disable" in c]
         assert len(stops) == 1, "the old forward was not stopped before its replacement"
+        # One written before agents owned their forward (it would ride a shared ControlMaster): replaced
+        # on its own port, so already-installed tunnels get the fix when --keep runs again.
+        old = f.read_bytes()
+        for o in (b"ControlMaster=no", b"ControlPath=none"):
+            old = old.replace(b"<string>-o</string>\n\t\t<string>" + o + b"</string>\n\t\t", b"") \
+                .replace(b"-o " + o + b" ", b"")
+        f.write_bytes(old)
+        assert not tunnel.installed("demo", platform)["own"]
+        local, did = tunnel.keep("demo", "the-host", 18701, pick, platform=platform)
+        assert did.startswith("replaced") and local == 18800 and tunnel.installed("demo", platform)["own"], did
         assert tunnel.unkeep("demo", platform).startswith("removed") and not f.exists()
         assert tunnel.unkeep("demo", platform) == "no kept tunnel for demo"
 
@@ -17117,9 +17127,9 @@ def test_web_keep_installs_a_kept_local_forward_and_adopts_an_existing_one(env, 
         a, 0, "web app: http://127.0.0.1:18700/#token=abc123\n", ""))
     plist = tmp_path / "userhome" / "Library" / "LaunchAgents" / "com.tt-project.tunnel.demo.plist"
     plist.parent.mkdir(parents=True)
-    # Set up by hand earlier, through a shell, forwarding to the right port: adopted as is.
+    # Set up by hand earlier, through a shell, forwarding to the right port on its own connection: adopted as is.
     hand = {"Label": "com.tt-project.tunnel.demo", "KeepAlive": True, "ProgramArguments":
-            ["/bin/sh", "-c", "exec ssh -N -L 18999:localhost:18700 box"]}
+            ["/bin/sh", "-c", "exec ssh -N -o ControlMaster=no -o ControlPath=none -L 18999:localhost:18700 box"]}
     plist.write_bytes(plistlib.dumps(hand))
     cli.main(["web", "demo", "--tunnel", "--keep"])
     out = capsys.readouterr().out
@@ -17127,7 +17137,7 @@ def test_web_keep_installs_a_kept_local_forward_and_adopts_an_existing_one(env, 
     assert "http://127.0.0.1:18999/#token=abc123" in out
     assert plistlib.loads(plist.read_bytes()) == hand
     # Forwarding to an old port: replaced, keeping the local port so the link stays the same.
-    hand["ProgramArguments"][-1] = "exec ssh -N -L 18999:127.0.0.1:18650 box"
+    hand["ProgramArguments"][-1] = "exec ssh -N -o ControlMaster=no -o ControlPath=none -L 18999:127.0.0.1:18650 box"
     plist.write_bytes(plistlib.dumps(hand))
     calls.clear()
     cli.main(["web", "demo", "--tunnel", "--keep"])
@@ -17137,6 +17147,14 @@ def test_web_keep_installs_a_kept_local_forward_and_adopts_an_existing_one(env, 
     argv = job["ProgramArguments"]
     assert job["KeepAlive"] and job["RunAtLoad"] and argv[-1] == "box"
     assert "127.0.0.1:18999:127.0.0.1:18700" in argv and "ExitOnForwardFailure=yes" in argv and "BatchMode=yes" in argv
+    assert "ControlMaster=no" in argv and "ControlPath=none" in argv, argv
+    # The right port, but riding a shared ControlMaster from the ssh config: replaced on its port too.
+    hand["ProgramArguments"][-1] = "exec ssh -N -L 18999:localhost:18700 box"
+    plist.write_bytes(plistlib.dumps(hand))
+    cli.main(["web", "demo", "--tunnel", "--keep"])
+    out = capsys.readouterr().out
+    assert "replaced the kept tunnel" in out and "http://127.0.0.1:18999/#token=abc123" in out, out
+    assert "ControlPath=none" in plistlib.loads(plist.read_bytes())["ProgramArguments"]
     assert calls[0] == ("launchctl", "bootout", f"gui/{os.getuid()}/com.tt-project.tunnel.demo")
     assert ("launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist)) in calls
     # A kept tunnel already forwards: plain `ttp web` reuses its port and opens nothing.
