@@ -503,25 +503,35 @@ class Runner:
 
     def _launch(self, job: str, spec: dict, st: dict) -> None:
         """Start one attempt in a session of its own. It inherits a lock it holds while it lives, so a
-        runner started after this one died can tell a job still running from one a reboot killed."""
+        runner started after this one died can tell a job still running from one a reboot killed. The
+        attempt is recorded before the job starts, so a runner that dies at any point leaves its
+        successor a job to adopt, never one it cannot see; the job writes its pid into the lock file."""
         n = st.get("attempts", 0) + 1
         logf, rcf, lockf = (self.d / "logs" / f"{job}.{n}.log", self.d / "running" / f"{job}.{n}.rc",
                             self.d / "running" / f"{job}.{n}.lock")
         lock = open(lockf, "a")
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        wrapper = ('o="$1" r="$2" c="$3"; /bin/sh -c "$c" >>"$o" 2>&1 </dev/null; e=$?; '
+        wrapper = ('o="$1" r="$2" c="$3" l="$4"; echo $$ >"$l"; /bin/sh -c "$c" >>"$o" 2>&1 </dev/null; e=$?; '
                    'echo $e >"$r.tmp"; mv "$r.tmp" "$r"')
+        before = {k: st[k] for k in ("attempts", "log", "cur") if k in st}
+        st.update(attempts=n, log=str(logf), cur={"n": n, "pid": None, "rc": str(rcf), "lock": str(lockf),
+                                                  "log": str(logf), "started": _now()})
         try:
-            p = subprocess.Popen(["/bin/sh", "-c", wrapper, "sh", str(logf), str(rcf), spec["cmd"]],
+            self.save(job, st)
+            p = subprocess.Popen(["/bin/sh", "-c", wrapper, "sh", str(logf), str(rcf), spec["cmd"], str(lockf)],
                                  cwd=spec.get("workdir") or str(Path.home()), stdin=subprocess.DEVNULL,
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
                                  env={**os.environ, "TTP_DEVQ_JOB": job, "TTP_DEVQ_CONFIG": str(spec["config"]),
                                       "TTP_DEVQ_TIMEOUT_S": str(int(self.limit(spec)))},
                                  pass_fds=(lock.fileno(),))
+        except OSError:
+            for k in ("attempts", "log", "cur"):
+                st.pop(k, None)
+            st.update(before)
+            raise
         finally:
             lock.close()
-        st.update(attempts=n, log=str(logf), cur={"n": n, "pid": p.pid, "rc": str(rcf), "lock": str(lockf),
-                                                  "log": str(logf), "started": _now()})
+        st["cur"]["pid"] = p.pid
         self.save(job, st)
         self.log(f"{job}: attempt {n} started (pid {p.pid})")
         self.set_state(f"{job}: running attempt {n}")
@@ -553,7 +563,9 @@ class Runner:
                     continue
                 return None, "interrupted"
             if limit and _now() - cur["started"] >= limit:
-                _kill_group(cur["pid"])
+                pid = cur.get("pid") or _lock_pid(lockf)
+                if pid:
+                    _kill_group(pid)
                 return 124, "timeout"
             time.sleep(self.cfg["poll_s"])
 
@@ -580,6 +592,9 @@ class Runner:
         need = 1
         if st.get("cur"):
             self.log(f"{job}: resuming after a runner restart")
+            if not st["cur"].get("pid") and _lock_pid(Path(st["cur"]["lock"])):
+                st["cur"]["pid"] = _lock_pid(Path(st["cur"]["lock"]))
+                self.save(job, st)
         while True:
             if not st.get("cur"):
                 too_long = over_cap(spec, self.cfg)
@@ -667,6 +682,14 @@ class Runner:
                 self.log(f"idle {self.cfg['idle_exit_s']:.0f} s, exiting")
                 return 0
             time.sleep(self.cfg["poll_s"])
+
+
+def _lock_pid(lock: Path) -> int | None:
+    """The pid a job wrote into its lock file: the one record of it when its runner died before saving it."""
+    try:
+        return int(lock.read_text().strip()) or None
+    except (OSError, ValueError):
+        return None
 
 
 def _kill_group(pid: int) -> None:

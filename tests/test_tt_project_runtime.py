@@ -25577,14 +25577,70 @@ def test_devq_runner_and_probe_wait_while_an_old_per_task_driver_runs(devq_dir, 
     assert _devq_marker(d, "t9-a")["status"] == "done" and (tmp_path / "ran").exists()
 
 
+def _devq_job_pid(d, job, timeout=20):
+    """The running job's pid once its runner has recorded it."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        pid = (_devq_state(d, job).get("cur") or {}).get("pid")
+        if pid:
+            return pid
+        time.sleep(0.02)
+    raise AssertionError(f"{job}: no pid recorded")
+
+
+def _devq_state(d, job):
+    try:
+        return json.loads((d / "running" / f"{job}.state.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def test_devq_runner_records_an_attempt_before_the_job_starts_so_a_successor_can_adopt_it(devq_dir, tmp_path):
+    """A runner killed between starting a job and saving its pid left nothing to adopt: the successor
+    started the attempt again, found its lock held, and failed the job without its exit code."""
+    d, go, seen = devq_dir, tmp_path / "go", tmp_path / "seen"
+    _devq_submit(d, {}, "rec-1", f"cat {d}/running/rec-1.state.json > {seen}.t; mv {seen}.t {seen}; "
+                 f"while [ ! -e {go} ]; do sleep 0.05; done; exit 7")
+    assert _wait_for_path(seen)
+    pid = _devq_job_pid(d, "rec-1")
+    st = json.loads(seen.read_text() or "{}")
+    assert st.get("attempts") == 1 and st["cur"]["n"] == 1, "the attempt is on disk before the job runs"
+    # The window: the runner dies after starting the job and before saving its pid.
+    os.kill(int((d / "runner.pid").read_text()), signal.SIGKILL)
+    st = _devq_state(d, "rec-1")
+    st["cur"]["pid"] = None
+    (d / "running" / "rec-1.state.json").write_text(json.dumps(st))
+    assert _devq("start", d, json.dumps(DEVQ_FAST)).returncode == 0
+    deadline = time.time() + 20
+    while time.time() < deadline and not (_devq_state(d, "rec-1").get("cur") or {}).get("pid"):
+        time.sleep(0.02)
+    assert _devq_state(d, "rec-1")["cur"]["pid"] == pid, "the successor reads the pid the job wrote"
+    go.touch()
+    m = _devq_marker(d, "rec-1")
+    assert (m["status"], m["rc"], m["attempts"], m["drops"]) == ("failed", 7, 1, [])
+    # Same window, then the job overruns its limit: the successor still finds it and ends it.
+    _devq_submit(d, {}, "rec-2", f"touch {tmp_path / 'started'}; exec sleep 60", timeout_s=2)
+    assert _wait_for_path(tmp_path / "started")
+    pid = _devq_job_pid(d, "rec-2")
+    os.kill(int((d / "runner.pid").read_text()), signal.SIGKILL)
+    st = _devq_state(d, "rec-2")
+    st["cur"]["pid"] = None
+    (d / "running" / "rec-2.state.json").write_text(json.dumps(st))
+    assert _devq("start", d, json.dumps(DEVQ_FAST)).returncode == 0
+    m = _devq_marker(d, "rec-2")
+    assert (m["status"], m["rc"]) == ("failed", 124) and "timed out" in m["reason"]
+    with pytest.raises(OSError):
+        os.killpg(pid, 0)
+
+
 def test_devq_restart_requeues_a_job_a_reboot_killed_and_adopts_one_still_running(devq_dir, tmp_path):
     d, flag = devq_dir, tmp_path / "flag"
     # Reboot: runner and job both die. The probe wakes the task; start runs the job again as a drop.
     _devq_submit(d, {}, "long-1", f"[ -e {flag} ] && exit 0; touch {tmp_path / 'started'}; sleep 60")
     assert _wait_for_path(tmp_path / "started")
-    st = json.loads((d / "running" / "long-1.state.json").read_text())
+    pid = _devq_job_pid(d, "long-1")
     os.kill(int((d / "runner.pid").read_text()), signal.SIGKILL)
-    os.killpg(st["cur"]["pid"], signal.SIGKILL)
+    os.killpg(pid, signal.SIGKILL)
     deadline = time.time() + 10
     while time.time() < deadline and _devq("probe", d, "long-1").returncode != 0:
         time.sleep(0.05)
