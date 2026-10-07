@@ -35,7 +35,8 @@ JEV_USE = "coord_effort"
 THRESHOLD = 0.7       # default of coordinator.jev_threshold
 WAIT_H = 6.0          # default of coordinator.jev_wait_h
 WORTH_KINDS = ("task_failed", "task_blocked")
-RAISED_KEY = "coord_check_raised"   # kv: event ("e<id>") and message ("m<id>") keys Jev raised a turn for
+RAISED_KEY = "coord_check_raised"   # kv: event ("e<id>"), message ("m<id>") and wait stint
+                                    # ("w<task>:<stint start>") keys Jev raised a turn for
 RAISED_KEEP = 500
 SUMMARY_CHARS = 4000
 EVENT_CHARS = 300
@@ -81,10 +82,12 @@ def _num(cfg: dict, key: str, default: float) -> float:
 
 def worth_asking(db: DB, cfg: dict, event_ids: list[int], msg_ids: list[int] | None = None,
                  now: float | None = None) -> tuple[list[str], str]:
-    """The keys of what makes the turn worth Jev's call ("e<id>" events, "m<id>" messages) that Jev
-    has not raised a turn for yet, and why: a new task_failed or task_blocked event, a high or critical
-    event, a user message, or a task_waiting event of a task whose external waits began over
-    coordinator.jev_wait_h ago. ([], why not) when there is none."""
+    """The keys of what makes the turn worth Jev's call ("e<id>" events, "m<id>" messages,
+    "w<task>:<stint start>" waits) that Jev has not raised a turn for yet, and why: a new task_failed
+    or task_blocked event, a high or critical event, a user message, or a task_waiting event of a task
+    whose stint of external waits began over coordinator.jev_wait_h ago (keyed by the stint, so a task
+    that keeps re-waiting raises once per stint; the rules raise a changed wait reason). ([], why not)
+    when there is none."""
     now = time.time() if now is None else now
     keys: list[str] = [f"m{i}" for i in msg_ids or []]
     why = {"user message"} if keys else set()
@@ -92,15 +95,19 @@ def worth_asking(db: DB, cfg: dict, event_ids: list[int], msg_ids: list[int] | N
                 "ORDER BY id", list(event_ids)) if event_ids else []
     wait_s = _num(cfg, "jev_wait_h", WAIT_H) * 3600
     for r in rows:
+        key = f"e{r['id']}"
         if r["kind"] in WORTH_KINDS:
             why.add(r["kind"])
         elif r["severity"] in coord.EFFORT_SEVERITIES:
             why.add(f"{r['severity']} event")
-        elif r["kind"] == "task_waiting" and r["task"] and                 (stint := coord.wait_stint(db, r["task"], now)[1]) and now - stint[-1]["ts"] >= wait_s:
+        elif (r["kind"] == "task_waiting" and r["task"]
+              and (stint := coord.wait_stint(db, r["task"], now)[1]) and now - stint[-1]["ts"] >= wait_s):
             why.add(f"waiting over {wait_s / 3600:g} h")
+            key = f"w{r['task']}:{stint[-1]['ts']}"   # one raise per stint, however often it re-waits
         else:
             continue
-        keys.append(f"e{r['id']}")
+        if key not in keys:
+            keys.append(key)
     if not keys:
         return [], "no failed or blocked task, high event, user message or long wait"
     raised = set(db.kv(RAISED_KEY, []) or [])

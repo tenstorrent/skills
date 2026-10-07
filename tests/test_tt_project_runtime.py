@@ -18630,6 +18630,7 @@ def test_jev_coordinator_check_raises_routine_turns_and_logs_each_call_with_its_
     assert dec["verdict"] == "needs_thought" and dec["effort"] == "high" and dec["escalated"]
     assert dec["rules_effort"] == "low" and row["ref"] == f"run:{70 + len(calls)}"
     assert row["cost_usd"] == pytest.approx(0.00005) and row["avoided_usd"] > 0
+    p.db.set_kv(coordcheck.RAISED_KEY, [])   # task #4's stint raised once; forget it so later turns ask again
     k = turn(_ThoughtJev(p=0.1))
     assert k["unblock"] == "" and k["note"]["coord_check"]["verdict"] == "routine"
     dec = json.loads(last_call()["decision"])
@@ -18689,7 +18690,8 @@ def test_jev_coordinator_check_raises_routine_turns_and_logs_each_call_with_its_
 
 def test_jev_coordinator_check_skips_routine_events_never_raises_twice_and_uses_its_threshold(env, monkeypatch):
     """Jev is called only on new escalation-worthy events (a skip is logged in the turn's note, not as a
-    call), never raises a second turn for the same events, and raises at coordinator.jev_threshold (0.7)."""
+    call), never raises a second turn for the same events or the same stint of waits, and raises at
+    coordinator.jev_threshold (0.7)."""
     p = make(env)
     from ttp.daemon import Daemon
     from ttp import coordcheck
@@ -18742,17 +18744,30 @@ def test_jev_coordinator_check_skips_routine_events_never_raises_twice_and_uses_
     assert k["unblock"] == "" and len(jev.calls) == 1 and n_calls() == 1
     assert k["note"]["coord_check"] == {"jev_call": None, "verdict": "skipped",
                                         "skipped": "already raised for these events"}
-    # A new worthy event alongside them is asked about again.
+    # Another re-wait in the same stint is the same long wait: keyed by task and stint start, it was
+    # raised already, so the turn skips the call.
+    start = p.db.one("SELECT MIN(ts) t FROM events WHERE task=6")["t"]
+    assert f"w6:{start}" in p.db.kv(coordcheck.RAISED_KEY)
     event("task_waiting", task=6)
+    k = turn(jev)
+    assert k["unblock"] == "" and len(jev.calls) == 1 and n_calls() == 1
+    assert k["note"]["coord_check"]["skipped"] == "already raised for these events"
+
+    def long_wait(task):
+        event("task_waiting", task=task, ago=3 * 3600, status="handled")
+        event("task_waiting", task=task)
+
+    # Another task's long wait is new and asked about again.
+    long_wait(7)
     assert turn(jev)["unblock"].startswith("jev: needs thought (") and len(jev.calls) == 2
     # The threshold: 0.6 is routine at the default 0.7 and needs thought at a configured 0.5.
     assert coordcheck.THRESHOLD == 0.7
-    event("task_waiting", task=6)
+    long_wait(8)
     k = turn(_ThoughtJev(p=0.6))
     assert k["unblock"] == "" and k["note"]["coord_check"]["verdict"] == "routine"
     p.set_config("coordinator.jev_threshold", 0.5)
     d.cfg = p.config()
-    event("task_waiting", task=6)
+    event("task_waiting", task=8)
     assert turn(_ThoughtJev(p=0.6))["note"]["coord_check"]["verdict"] == "needs_thought"
     # Failed or blocked tasks, high events and user messages are worth asking about too (the rules
     # already raise such turns, so they are checked on worth_asking directly).
