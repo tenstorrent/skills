@@ -908,6 +908,24 @@ def cmd_note(a) -> None:
     durable_append(Path(run_dir) / "progress.md", f"{time.strftime('%H:%M:%S')} {a.text}\n")
 
 
+def cmd_notify(a) -> None:
+    """`ttp notify`: a worker's message for the user. The run cannot reach the daemon's database, so
+    it is appended to the run's notify file, and the daemon posts it as an alert when the run ends
+    (daemon.relay_worker_notifies): low or normal severity only, a few per run, an identical text
+    once. High severity stays the coordinator's."""
+    from .daemon import NOTIFY_FILE
+    run_dir = os.environ.get("TTP_RUN_DIR")
+    if not run_dir:
+        die("ttp notify only works inside a tt-project run")
+    text = a.text.strip()
+    if not text:
+        die("empty notify")
+    durable_append(Path(run_dir) / NOTIFY_FILE, json.dumps({"ts": time.time(), "severity": a.severity,
+                                                           "text": text}) + "\n")
+    durable_append(Path(run_dir) / "progress.md", f"{time.strftime('%H:%M:%S')} notify: {text[:200]}\n")
+    print("queued for the user: it is sent when this run ends; say so in the hand-off")
+
+
 def _note_to(a) -> None:
     """`ttp note --to <project>`: a worker's note for another project, filed in the user's upstream
     inbox with this run's project and task (upstream.send); one on another machine is sent on there by
@@ -2707,6 +2725,12 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--severity", choices=["low", "normal", "high"], default="normal",
                    help="with --to: the severity of the event the other project's coordinator gets")
     s.set_defaults(fn=cmd_note)
+
+    s = sub.add_parser("notify", help="(inside a run) tell the user something; sent when the run ends")
+    s.add_argument("text")
+    s.add_argument("--severity", choices=["low", "normal"], default="normal",
+                   help="high and critical stay the coordinator's")
+    s.set_defaults(fn=cmd_notify)
 
     s = sub.add_parser("upstream", help="upstream notes across machines: receive, forwarding status and targets")
     s.add_argument("--receive", action="store_true", help="file notes sent over ssh (JSON lines on stdin); prints an ack")

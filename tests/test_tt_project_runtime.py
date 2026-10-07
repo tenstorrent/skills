@@ -17938,6 +17938,58 @@ def test_the_worker_hook_allows_a_note_to_another_project(env, monkeypatch, tmp_
     assert "ttp note --to" in out["hookSpecificOutput"]["permissionDecisionReason"]
 
 
+def test_a_worker_notify_reaches_the_user_once_when_its_run_ends(env, monkeypatch, capsys):
+    """`ttp notify`: a run cannot write the daemon's database, so the text waits in the run folder
+    and the daemon posts it as an alert when the run ends. Low or normal only, a few per run, an
+    identical text once, and a second finish posts nothing again."""
+    from ttp import cli, daemon
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage as Usage
+
+    def notify(*args) -> int:
+        try:
+            cli.main(["notify", *args])
+        except SystemExit as e:
+            return int(e.code or 0)
+        return 0
+    p = make(env)
+    assert notify("outside a run") == 2
+    tid = p.db.add_task("milestone", "spec", kind="work", tier="standard", origin="coordinator")
+    p.db.update_task(tid, status="running")
+    run_dir = _note_run(env, monkeypatch, p, task=str(tid))
+    assert notify("--severity", "high", "x") == 2, "high severity stays the coordinator's"
+    assert notify("  ") != 0
+    assert notify("goal met:\n 5.7 s") == 0
+    assert "sent when this run ends" in capsys.readouterr().out
+    assert notify("--severity", "low", "goal met:\n 5.7 s") == 0
+    for i in range(daemon.NOTIFIES_PER_RUN):
+        assert notify("--severity", "low", f"extra {i}") == 0
+    assert "notify: goal met" in (run_dir / "progress.md").read_text()
+    assert not p.db.one("SELECT id FROM messages WHERE kind='alert'"), "posted before the run ended"
+    (run_dir / "result.json").write_text(json.dumps({"status": "done", "summary": "sent the notify"}))
+    d = Daemon(p.base)
+    d._finish_worker({"task": tid}, Usage(cost_usd=0.1), "ok", run_dir)
+    got = p.db.q("SELECT text, severity, chat, direction FROM messages WHERE kind='alert' ORDER BY id")
+    assert [(m["text"], m["severity"]) for m in got] == [
+        (f"#{tid} milestone: goal met: 5.7 s", "normal"),
+        *[(f"#{tid} milestone: extra {i}", "low") for i in range(daemon.NOTIFIES_PER_RUN - 1)]]
+    assert all(m["chat"] is None and m["direction"] == "out" for m in got)
+    # A tampered line cannot raise its severity; a finish seen twice posts nothing new.
+    (run_dir / daemon.NOTIFY_FILE).write_text(json.dumps({"text": "loud", "severity": "critical"}) + "\nnot json\n")
+    assert daemon.relay_worker_notifies(p, p.db.task(tid), run_dir) == 1
+    assert p.db.one("SELECT severity FROM messages WHERE text LIKE '%: loud'")["severity"] == "normal"
+    assert daemon.relay_worker_notifies(p, p.db.task(tid), run_dir) == 0
+
+
+def test_the_worker_hook_allows_a_notify_and_points_ttp_say_at_it(env, monkeypatch, tmp_path):
+    from ttp import hook
+    monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path))
+    out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": 'ttp notify "goal met"'}})
+    assert out is None
+    out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "ttp say demo hi"}})
+    assert "ttp notify" in out["hookSpecificOutput"]["permissionDecisionReason"]
+
+
 def test_remote_upstream_inboxes_are_read_over_ssh_at_most_hourly(env, monkeypatch):
     p = make(env)
     from ttp import upstream

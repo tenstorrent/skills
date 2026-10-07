@@ -10,7 +10,7 @@ note proposed twice (by a retry, or by two projects) is kept once.
 A project with `upstream.ingest: true` (off by default) reads the inbox: each note it has not seen
 becomes an `upstream_note` event for its coordinator. Its read cursor (a byte offset per inbox, and
 the fingerprints it has seen) lives in its own database; it never writes to another project's state.
-The inboxes on the machines this user's remote projects run on (`ttp create --host`) are read over
+The inboxes on the machines this user's remote projects run on (`ttp new --host`) are read over
 ssh at most once an hour, for at most REMOTE_BUDGET_S per daemon tick: hosts left over when the
 time runs out are read first on the next tick, so slow or hung machines never hold up dispatch for
 long and every machine is read once per round. The ingesting project marks each inbox it read with

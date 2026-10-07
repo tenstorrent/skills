@@ -69,6 +69,8 @@ WATCHDOG_S = 2 * HEARTBEAT_STALE_S   # no tick progress this long: the service r
 PROGRESS_EVERY_S = 30   # how often a long tick tells the watchdogs it is still moving
 WATCHER_MAX_S = HEARTBEAT_STALE_S - 60   # a command watcher's timeout_s is capped here, well below WATCHDOG_S
 RESULT_FILE = "result.json"
+NOTIFY_FILE = "notify.jsonl"      # `ttp notify` lines a run left for the user (relay_worker_notifies)
+NOTIFIES_PER_RUN = 3
 # What a waiting hand-off keeps across a run the account refused (limit, auth).
 WAIT_KEYS = ("retry_when", "retry_after_s", "waiting_for", "wake_tier", "next_step", "survives_reboot", "waits",
              "waiting_since")
@@ -1502,6 +1504,7 @@ class Daemon:
         task = db.task(r["task"]) if r["task"] else None
         if not task:
             return
+        relay_worker_notifies(self.p, task, run_dir)
         handoff = _read_result(run_dir / RESULT_FILE)
         result = handoff or last_json_object(usage.final_text or "") or {}
         if task["status"] == "cancelled":
@@ -4089,6 +4092,41 @@ def _reboot_wakes(task: dict) -> int:
         return max(0, int(load_result(task["result"]).get("reboot_wakes") or 0))
     except (TypeError, ValueError):
         return 0
+
+
+def relay_worker_notifies(p: Project, task: dict, run_dir: Path) -> int:
+    """Post the `ttp notify` lines a worker run left as alerts, the way the coordinator's `notify`
+    action does: at most low or normal severity, the first NOTIFIES_PER_RUN, a text already sent in
+    the last day not again. The file is renamed once posted, so a second finish does not repost."""
+    db, f = p.db, run_dir / NOTIFY_FILE
+    try:
+        lines = f.read_text(errors="replace").splitlines()
+    except OSError:
+        return 0
+    sent = 0
+    for line in lines:
+        try:
+            n = json.loads(line)
+        except ValueError:
+            continue
+        body = " ".join(str(n.get("text") or "").split())[:2000] if isinstance(n, dict) else ""
+        if not body:
+            continue
+        if sent >= NOTIFIES_PER_RUN:
+            log(p, f"task #{task['id']}: dropped `ttp notify` lines past {NOTIFIES_PER_RUN} in run {run_dir.name}")
+            break
+        text = f"#{task['id']} {task['title'][:80]}: {body}"
+        if db.one("SELECT id FROM messages WHERE direction='out' AND kind='alert' AND text=? AND ts>?",
+                  (text, time.time() - 86400)):
+            continue
+        sev = n.get("severity") if n.get("severity") in ("low", "normal") else "normal"
+        db.post("out", text, chat=None, kind="alert", severity=sev)
+        sent += 1
+    try:
+        f.rename(f.with_name(NOTIFY_FILE + ".sent"))
+    except OSError:
+        pass
+    return sent
 
 
 def _last_notes(run_dir: Path, n: int = 5) -> list[str]:

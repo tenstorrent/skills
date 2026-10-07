@@ -28,6 +28,8 @@
 ## Progress
 
 - Run `ttp note "<one line>"` at each milestone. Humans read these live.
+- Only when your spec asks you to tell the user something: `ttp notify "<text>"` (`--severity low`
+  or `normal`). It is sent when your run ends. Say in your hand-off that you sent it.
 - Make durable progress early: commit, write files. A killed run keeps what is on disk.
 - Run builds and test suites as `ttp clip -- <command>`: the full output goes to a file and you
   get the failures (or head and tail) and its path. Read only the part you need.

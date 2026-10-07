@@ -409,3 +409,34 @@ def test_worker_prompt_driver_marker_uses_exit_trap():
     text = (PLUGIN / "template" / "prompts" / "worker.md").read_text()
     assert "EXIT trap" in text
     assert "trap 'echo $? > \"$marker\"' EXIT" in text
+
+
+def test_docs_and_prompts_name_only_real_ttp_subcommands():
+    """A prompt or skill that names a `ttp <word>` the CLI lacks sends workers to an invalid choice."""
+    sys.path.insert(0, str(RUNTIME.parent))
+    try:
+        from ttp import cli
+        import argparse
+        seen: list = []
+        real = argparse.ArgumentParser.parse_args
+
+        def grab(self, args=None, namespace=None):
+            seen.append(self)
+            raise SystemExit(0)
+        argparse.ArgumentParser.parse_args = grab
+        try:
+            cli.main(["status"])
+        except SystemExit:
+            pass
+        finally:
+            argparse.ArgumentParser.parse_args = real
+    finally:
+        sys.path.remove(str(RUNTIME.parent))
+    sub = next(a for a in seen[0]._actions if isinstance(a, argparse._SubParsersAction))
+    commands = set(sub.choices)
+    assert {"note", "notify", "push"} <= commands
+    files = [f for f in PLUGIN.rglob("*") if f.suffix in (".md", ".py", ".json", ".sh") and f.is_file()]
+    bad = sorted({f"{f.relative_to(PLUGIN)}: ttp {m}"
+                  for f in files for m in re.findall(r"`ttp ([a-z][a-z-]*)", f.read_text(encoding="utf-8", errors="replace"))
+                  if m not in commands})
+    assert not bad, bad

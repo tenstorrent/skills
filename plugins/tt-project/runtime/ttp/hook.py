@@ -461,6 +461,7 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
                     or (re.search(r"/api/say\b", cmd) and HTTP_CLIENT_RE.search(cmd))):
         # What a run posts as the user could count as the user's approval (pr_approve).
         why = ("a run must not post messages as the user; report with `ttp note` and the hand-off, "
+                   "tell the user with `ttp notify \"<text>\"`, "
                    "and reach another project with `ttp note --to <project> \"<text>\"`")
     if not why:
         path_changed = bool(PATH_CHANGE_RE.search(scan))
