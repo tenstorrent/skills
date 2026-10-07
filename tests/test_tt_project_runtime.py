@@ -7632,6 +7632,83 @@ def test_the_requested_restart_runs_from_the_host_and_writes_its_result(env, mon
     assert service._restart_result(p, at)["text"] == "rolled back to abc"
 
 
+def _upgrade_probe(p) -> int:
+    """The retry_when the upgrade task gives a worker whose restart was deferred, run as the harness runs it."""
+    from ttp import cli
+    line = next(x for x in cli._UPGRADE_TASK.splitlines() if "restart.request.taken" in x)
+    probe = line.split("`")[1].format(state=shlex.quote(str(p.state)))
+    return subprocess.run(probe, shell=True).returncode
+
+
+def test_a_restart_helper_that_cannot_start_is_reaped_with_a_failed_result(env, monkeypatch):
+    from ttp import service
+    p = make(env)
+    broken = env["tmp"] / "broken-runtime"
+    (broken / "ttp").mkdir(parents=True)
+    (broken / "ttp" / "__init__.py").write_text("raise ImportError('the new runtime is broken')\n")
+    monkeypatch.setattr(service, "_env", lambda p: {"PYTHONPATH": str(broken)})
+    started = time.time() - 3600
+    at = time.time()
+    (p.state / "restart.request").write_text(json.dumps({"at": at, "pid": 1, "why": "upgrade"}))
+    assert service.take_restart_request(p, started)
+    assert _upgrade_probe(p) != 0, "the probe must keep waiting while the restart runs"
+    assert service.reap_restart_request(p, started) is None, "a running helper is left alone"
+    assert service._helpers[str(p.base)].wait(timeout=60) != 0
+    assert service.reap_restart_request(p, started) == "failed"
+    res = service._restart_result(p, at)
+    assert res["outcome"] == "failed" and "could not start" in res["text"] and "the new runtime is broken" in res["text"]
+    assert not (p.state / "restart.request.taken").exists() and _upgrade_probe(p) == 0
+    alerts = p.db.q("SELECT text FROM messages WHERE kind='alert' AND severity='high'")
+    assert len(alerts) == 1 and "could not start" in alerts[0]["text"]
+    assert service.reap_restart_request(p, started) is None and len(
+        p.db.q("SELECT id FROM messages WHERE kind='alert'")) == 1, "reported once"
+
+
+def test_a_restart_helper_interrupted_without_a_handle_is_reaped_after_its_bound(env, monkeypatch):
+    from ttp import service
+    p = make(env)
+    started = time.time() - 7200
+    at = time.time() - service.HELPER_BOUND_S - 60
+    (p.state / "restart.request.taken").write_text(json.dumps({"at": at, "pid": 1, "taken": at}))
+    (p.logs / "restart.log").parent.mkdir(parents=True, exist_ok=True)
+    (p.logs / "restart.log").write_text(f"--- x restart requested by pid 1: upgrade\n{service.HELPER_STARTED} (pid 9)\n")
+    assert service.reap_restart_request(p, started) == "failed"
+    res = service._restart_result(p, at)
+    assert "was interrupted" in res["text"] and service.HELPER_STARTED in res["text"]
+    assert not (p.state / "restart.request.taken").exists()
+    # Within the bound, with no handle (it cannot be told whether the helper still runs), it waits.
+    (p.state / "restart.request.taken").write_text(json.dumps({"at": time.time(), "taken": time.time()}))
+    assert service.reap_restart_request(p, started) is None and (p.state / "restart.request.taken").exists()
+
+
+def test_a_daemon_started_after_the_request_was_taken_clears_the_leftover_claim(env, monkeypatch):
+    from ttp import daemon as dm, service, web
+    p = make(env)
+    at = time.time() - 120
+    (p.state / "restart.request.taken").write_text(json.dumps({"at": at, "pid": 1, "taken": at + 1}))
+    d = dm.Daemon(p.base)
+    monkeypatch.setattr(d, "tick", lambda: setattr(d, "stopping", True))
+    monkeypatch.setattr(web, "serve", lambda daemon: None)
+    monkeypatch.setattr(dm.signal, "signal", lambda *a: None)
+    monkeypatch.setattr(dm.time, "sleep", lambda s: None)
+    assert d.run() == 0
+    res = service._restart_result(p, at)
+    assert res and res["outcome"] == "running" and res["reaped"], res
+    assert not (p.state / "restart.request.taken").exists() and _upgrade_probe(p) == 0
+    assert not p.db.one("SELECT id FROM messages WHERE kind='alert'"), "a restart that happened is no alert"
+    # A result the helper wrote before it died is kept; only the claim goes.
+    (p.state / "restart.request.taken").write_text(json.dumps({"at": at, "taken": at + 1}))
+    (p.state / "restart.result").write_text(json.dumps({"at": at, "outcome": "rolled_back", "text": "rb"}))
+    assert service.reap_restart_request(p, time.time()) is None
+    assert service._restart_result(p, at)["outcome"] == "rolled_back"
+    assert not (p.state / "restart.request.taken").exists()
+
+
+def test_the_upgrade_task_tells_the_woken_worker_to_read_the_restart_result():
+    from ttp import cli
+    assert "{state}/restart.result" in cli._UPGRADE_TASK
+
+
 def test_a_sandboxed_restart_is_deferred_while_the_daemon_has_not_taken_the_request(env, monkeypatch):
     from ttp import service
     p, head, _ = _sandboxed_systemd(env, monkeypatch)

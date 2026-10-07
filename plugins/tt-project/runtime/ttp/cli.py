@@ -2339,7 +2339,9 @@ In this harness repo:
    Where the service manager is out of reach (a sandbox), it asks the running daemon to restart itself.
    Exit 0: done, remove <tmp>. Exit 75: main is applied and the restart deferred; the old daemon runs on
    and restarts when it takes the request: remove <tmp> and hand off `waiting` with retry_when
-   `test ! -e {state}/restart.request -a ! -e {state}/restart.request.taken`.
+   `test ! -e {state}/restart.request -a ! -e {state}/restart.request.taken`. When it wakes you, read
+   {state}/restart.result: its `outcome` (running, busy, failed, rolled_back) and `text` say how the
+   restart went; report a failure or a rollback with that text.
    Exit 1 or other: keep <tmp> and hand off with its path and the error (it says whether the restart
    was unavailable or the new daemon failed).
 """

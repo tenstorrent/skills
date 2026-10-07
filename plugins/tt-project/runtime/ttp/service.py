@@ -305,6 +305,12 @@ def _git(h: Path, *args: str) -> subprocess.CompletedProcess:
 # runs `python -m ttp.service` (with the harness runtime on disk) detached, and that restart, made from
 # the host with the service manager in reach, writes RESTART_RESULT.
 RESTART_REQUEST, RESTART_RESULT = "restart.request", "restart.result"
+# A helper that dies without a result (its runtime fails to import, a kill, a reboot) is reaped by the
+# daemon: its own handle says it ended, or its claim outlived HELPER_BOUND_S, longer than a restart's own
+# waits (a new daemon's first tick, twice with a rollback, plus the service manager's time).
+HELPER_BOUND_S = 2 * (60 + 300) + 300
+HELPER_STARTED = "restart helper running"     # main() logs it first: the helper got past its imports
+_helpers: dict[str, subprocess.Popen] = {}    # the daemon's handle on the helper it started, per project
 # The service manager could not be reached from here, as opposed to it trying and the daemon failing.
 _UNREACHABLE_RE = re.compile(r"failed to connect to bus|failed to get d-bus connection|DBUS_SESSION_BUS_ADDRESS|"
                              r"XDG_RUNTIME_DIR|operation not permitted|permission denied|not authori[sz]ed|"
@@ -404,20 +410,79 @@ def take_restart_request(p: Project, started: float) -> bool:
         return False
     taken = p.state / (RESTART_REQUEST + ".taken")
     os.replace(req, taken)
+    durable_write(taken, json.dumps({**info, "taken": time.time()}))   # before the helper exists to remove it
     p.logs.mkdir(parents=True, exist_ok=True)
     with open(p.logs / "restart.log", "a") as log:
         log.write(f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} restart requested by pid {info.get('pid', '?')}: "
                   f"{str(info.get('why') or '')[-300:]}\n")
         log.flush()
-        subprocess.Popen([sys.executable, "-m", "ttp.service", str(p.base)], cwd=str(p.base),
-                         env={**os.environ, **_env(p)}, stdin=subprocess.DEVNULL, stdout=log,
-                         stderr=subprocess.STDOUT, start_new_session=True)
+        _helpers[str(p.base)] = subprocess.Popen(
+            [sys.executable, "-m", "ttp.service", str(p.base)], cwd=str(p.base), env={**os.environ, **_env(p)},
+            stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
     return True
+
+
+def reap_restart_request(p: Project, started: float) -> str | None:
+    """The daemon's side, once per tick after a good one: a taken request whose helper ended without a
+    result is finished here, so the requester's probe fires. A daemon started after the request was taken
+    is the restart: outcome running. Otherwise the helper could not start or was interrupted while the old
+    daemon runs on: outcome failed, with the tail of logs/restart.log and one high alert. Returns the
+    outcome written, or None."""
+    taken = p.state / (RESTART_REQUEST + ".taken")
+    try:
+        info = json.loads(taken.read_text())
+        took = float(info.get("taken") or taken.stat().st_mtime)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, TypeError, AttributeError):
+        info, took = {}, 0.0
+    if not isinstance(info, dict):
+        info = {}
+    at = info.get("at")
+    if at is not None and _restart_result(p, float(at)):
+        taken.unlink(missing_ok=True)      # the helper reported, then ended before removing its claim
+        _helpers.pop(str(p.base), None)
+        return None
+    proc = _helpers.get(str(p.base))
+    rc = proc.poll() if proc else None
+    age = time.time() - took
+    log = _restart_log_tail(p)
+    if started > took:
+        outcome = "running"
+        text = (f"the daemon (pid {os.getpid()}) started after the restart request was taken and completes "
+                f"its ticks with the runtime on disk; the restart helper left no result")
+    elif age < HELPER_BOUND_S and (proc is None or rc is None):
+        return None                        # still restarting
+    else:
+        outcome = "failed"
+        how = ("could not start (it never got past its imports)" if HELPER_STARTED not in log
+               else "was interrupted before it reported")
+        ended = (f"exited with code {rc}" if rc is not None else
+                 f"is still running after {age:.0f}s" if proc is not None else f"left no result after {age:.0f}s")
+        text = (f"The restart helper {how}: it {ended}. The old daemon (pid {os.getpid()}) still runs the "
+                f"previous runtime; nothing was restarted or rolled back. logs/restart.log: {log or 'empty'}")
+        p.db.post("out", f"The requested daemon restart failed. {text}", chat=None, kind="alert", severity="high")
+    durable_write(p.state / RESTART_RESULT, json.dumps({"at": at, "finished": time.time(), "outcome": outcome,
+                                                        "text": text, "reaped": True}))
+    taken.unlink(missing_ok=True)
+    _helpers.pop(str(p.base), None)
+    return outcome
+
+
+def _restart_log_tail(p: Project, n: int = 1500) -> str:
+    """logs/restart.log since the last request's header, at most the last n characters."""
+    try:
+        text = (p.logs / "restart.log").read_text(errors="replace")
+    except OSError:
+        return ""
+    i = text.rfind("--- ")
+    return text[i if i >= 0 else 0:].strip()[-n:]
 
 
 def main() -> int:
     """The restart a request asked for, run by the daemon detached (see take_restart_request)."""
     p = Project(sys.argv[1] if len(sys.argv) > 1 else os.getcwd())
+    print(f"{HELPER_STARTED} (pid {os.getpid()})", flush=True)
     taken = p.state / (RESTART_REQUEST + ".taken")
     try:
         info = json.loads(taken.read_text())
