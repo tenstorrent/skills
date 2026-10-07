@@ -20217,6 +20217,72 @@ def test_push_keeps_plain_checks_strict_and_never_counts_skips_as_passes(env, mo
     assert _git_out(origin, "rev-parse", "proj") == before
 
 
+def test_push_own_runs_extra_checks_recorded_on_the_same_head_when_every_project_check_is_skipped(
+        env, monkeypatch, capsys, tmp_path):
+    from ttp import cli
+    log = tmp_path / "ran"
+    p, repo, origin, other = _push_setup(env, monkeypatch, [COND])
+    run = tmp_path / "run"
+    run.mkdir()
+    monkeypatch.setenv("TTP_RUN_DIR", str(run))
+    monkeypatch.setenv("TTP_TASK", "60")
+    _git_out(repo, "checkout", "-q", "-b", "ttp/t60-exp")
+    _commit(repo, "mine.txt", "mine\n")
+    head = _git_out(repo, "rev-parse", "HEAD")
+    # All skipped, nothing recorded: refused, and the message says how to fix it.
+    capsys.readouterr()
+    assert _ttp("push", "--own") == 4, "a head where every check was skipped went out unchecked"
+    err = capsys.readouterr().err
+    assert "every check was skipped as not applicable" in err and "ttp checks -- <cmd>" in err, err
+    assert "delivery.push_checks" in err and _git_out(origin, "branch", "--list", "ttp/t60-exp") == ""
+    # A passing extra on this head counts, and the push runs it again itself on that exact commit.
+    cli.main(["checks", "--", f"git rev-parse HEAD >> {log}"])
+    capsys.readouterr()
+    assert _ttp("push", "--own") == 0
+    assert "every project check was skipped; running the 1 command(s)" in capsys.readouterr().err
+    assert _git_out(origin, "rev-parse", "ttp/t60-exp") == head
+    assert log.read_text().split() == [head, head], "the recorded check must also run on the pushed commit"
+    # A record of another head does not count.
+    _commit(repo, "more.txt", "more\n")
+    capsys.readouterr()
+    assert _ttp("push", "--own") == 4 and "ttp checks -- <cmd>" in capsys.readouterr().err
+    assert _git_out(origin, "rev-parse", "ttp/t60-exp") == head
+    # A failing extra on this head does not count either.
+    with pytest.raises(SystemExit):
+        cli.main(["checks", "--", "false"])
+    capsys.readouterr()
+    assert _ttp("push", "--own") == 4 and "ttp checks -- <cmd>" in capsys.readouterr().err
+    # A recorded extra that fails when the push reruns it stops the push.
+    rec = run / "checks.json"
+    rec.write_text(json.dumps({"head": _git_out(repo, "rev-parse", "HEAD"), "passed": True,
+                               "commands": ["false"], "skipped": [], "ts": 0}))
+    assert _ttp("push", "--own") == 4 and "check failed" in capsys.readouterr().err
+    # Recorded commands that are only the project's own checks count for nothing.
+    rec.write_text(json.dumps({"head": _git_out(repo, "rev-parse", "HEAD"), "passed": True,
+                               "commands": [str(COND["run"])], "skipped": [], "ts": 0}))
+    assert _ttp("push", "--own") == 4
+    assert _git_out(origin, "rev-parse", "ttp/t60-exp") == head
+    # A detached push carries the run's record: its process runs without TTP_RUN_DIR.
+    cli.main(["checks", "--", "true"])
+    capsys.readouterr()
+    assert _ttp("push", "--own", "--detach") == 0
+    out = capsys.readouterr().out
+    marker = pathlib.Path(next(x for x in out.splitlines() if x.startswith("marker: "))[len("marker: "):])
+    probe = next(x for x in out.splitlines() if x.startswith("retry_when: "))[len("retry_when: "):]
+    assert json.loads(marker.read_text())["recorded_checks"]["commands"] == ["true"]
+    r = _probe_until_done(p, probe)
+    assert r.returncode == 0, r
+    assert _git_out(origin, "rev-parse", "ttp/t60-exp") == _git_out(repo, "rev-parse", "HEAD")
+
+
+def test_push_where_every_check_is_skipped_says_how_to_fix_it(env, monkeypatch, capsys):
+    p, repo, origin, other = _push_setup(env, monkeypatch, [COND])
+    _commit(repo, "mine.txt", "mine\n")
+    capsys.readouterr()
+    assert _ttp_push() == 4
+    assert "add a delivery.push_checks entry that applies" in capsys.readouterr().err
+
+
 def test_a_push_batch_reports_skipped_checks(env, monkeypatch, capsys):
     p, repo, origin, other = _bump_setup(env, monkeypatch, ["true", COND])
     heads = [_entry(repo, "e1", {"plugins/p/f1.txt": "1\n"})]

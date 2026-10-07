@@ -161,6 +161,33 @@ def excluded_refusal(files: list[str], upstream: str) -> str:
 
 
 NONE_APPLY = "every check was skipped as not applicable, so nothing checked it"
+NONE_APPLY_FIX = "add a delivery.push_checks entry that applies to this change"
+NONE_APPLY_OWN_FIX = ("run the repository's tests on this commit with `ttp checks -- <cmd>` (`ttp push --own` "
+                      "runs the commands it recorded passing there), or " + NONE_APPLY_FIX)
+RECORDED = "checks.json"   # in a run's directory, as `ttp checks` writes it (prguard.CHECKS_FILE)
+
+
+def recorded_checks(run_dir: str | Path | None) -> dict | None:
+    """What `ttp checks` last recorded in the run's directory when it passed: {"head", "commands"}, or None
+    (no run, no record, a failed or malformed one)."""
+    try:
+        rec = json.loads((Path(run_dir) / RECORDED).read_text()) if run_dir else None
+    except (OSError, ValueError):
+        return None
+    if not (isinstance(rec, dict) and rec.get("passed") is True and isinstance(rec.get("head"), str)
+            and isinstance(rec.get("commands"), list)):
+        return None
+    return {"head": rec["head"], "commands": [str(c) for c in rec["commands"] if str(c).strip()]}
+
+
+def recorded_extras(recorded: dict | None, head: str, checks: list[Check]) -> list[str]:
+    """The commands beyond the project's `checks` that `ttp checks -- <cmd>` recorded passing on exactly
+    `head`: what `ttp push --own` runs when every project check is skipped there. A record of another
+    head, or of nothing but project checks, gives none."""
+    if not recorded or not head or recorded.get("head") != head:
+        return []
+    own = {str(c) for c in checks}
+    return [c for c in recorded.get("commands") or [] if c not in own]
 
 
 def applicable(repo: Path, head: str, checks: list[Check],
@@ -1004,12 +1031,14 @@ def published(repo: Path, remote: str, target_branch: str) -> str:
 def publish(repo: Path, remote: str, branch: str, checks: list[str],
             say: Callable[[str], None] = lambda m: print(f"ttp push: {m}", file=sys.stderr),
             hold: Callable[[], Any] | None = None, timed: Callable[[float], None] | None = None,
-            base: str | None = None, ff_only: bool = False) -> int:
+            base: str | None = None, ff_only: bool = False, recorded: dict | None = None) -> int:
     """`ttp push --own`: run `checks` on HEAD as it is and push it to remote/branch, the task's own
     branch. No rebase and no version bump, so the pushed commit is the one reviewed; without force,
     so the remote takes only a fast-forward of what it has. Without checks, as for `ttp push`, only
     a docs-only change since `base` (the project's push target) may go. `ff_only` (a branch that is
-    not a `ttp/t<id>-...` one) refuses before the checks unless it fast-forwards the remote's."""
+    not a `ttp/t<id>-...` one) refuses before the checks unless it fast-forwards the remote's.
+    When every check is skipped on HEAD, the extra commands `recorded` (recorded_checks) passing on
+    exactly HEAD run instead, and must pass again; with none, nothing checked it and it is refused."""
     repo = Path(_git(repo, "rev-parse", "--show-toplevel").stdout.strip() or repo)
     if _git(repo, "status", "--porcelain", "--untracked-files=no").stdout.strip():
         say("uncommitted changes; commit first")
@@ -1030,8 +1059,12 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
         head = _git(repo, "rev-parse", "HEAD").stdout.strip()
         todo, _ = applicable(repo, head, checks, say)
         if checks and not todo:
-            say(f"{head[:10]}: {NONE_APPLY}; not pushing")
-            return CHECKS_FAILED
+            todo = recorded_extras(recorded, head, checks)
+            if not todo:
+                say(f"{head[:10]}: {NONE_APPLY}; not pushing: {NONE_APPLY_OWN_FIX}")
+                return CHECKS_FAILED
+            say(f"{head[:10]}: every project check was skipped; running the {len(todo)} command(s) "
+                f"`ttp checks` recorded passing on this commit: {'; '.join(todo)}")
         started = time.time()
         env = check_env("own", _existing_tip(repo, remote, branch) if todo else "")
         for cmd in todo:
@@ -1146,7 +1179,7 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
             return CHECKS_FAILED
         todo, _ = applicable(repo, head, checks, say)
         if checks and not todo:
-            say(f"{head[:10]}: {NONE_APPLY}; not pushing")
+            say(f"{head[:10]}: {NONE_APPLY}; not pushing: {NONE_APPLY_FIX}")
             return CHECKS_FAILED
         started = time.time()
         env = check_env("target", tip)
@@ -1172,9 +1205,10 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
     return KEPT_MOVING
 
 
-def run(p: Project, repo: Path, own: bool = False) -> int:
+def run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None) -> int:
     """`ttp push` for a project: target, checks and rounds come from its `delivery` config. `own`
-    publishes the task's own branch instead (own_target, publish)."""
+    publishes the task's own branch instead (own_target, publish), with the checks `recorded` (by
+    default those of the run's `ttp checks`) for when every project check is skipped."""
     d = p.config().get("delivery") or {}
     allowed = True if d.get("push_allowed") is None else d.get("push_allowed")
     if not (allowed is True or str(allowed).strip().lower() in ("1", "true", "yes", "on")):
@@ -1202,7 +1236,8 @@ def run(p: Project, repo: Path, own: bool = False) -> int:
                 pass
         return publish(repo, remote, branch, checks, hold=lambda: take(p, remote, branch, wait_s),
                        timed=lambda s: record_check_s(p, s), base=base,
-                       ff_only=not OWN_BRANCH.fullmatch(branch))
+                       ff_only=not OWN_BRANCH.fullmatch(branch),
+                       recorded=recorded or recorded_checks(os.environ.get("TTP_RUN_DIR")))
     return push(repo, remote, branch, checks, rounds, hold=lambda: take(p, remote, branch, wait_s),
                 version_bump=version_bump, timed=lambda s: record_check_s(p, s),
                 exclude=exclude_list(d.get("push_exclude_paths")))
@@ -1392,6 +1427,8 @@ def detach(p: Project, repo: Path, own: bool = False) -> int:
     m = {"id": rid, "repo": str(top), "head": _git(top, "rev-parse", "HEAD").stdout.strip(),
          "target": f"{remote}/{branch}", "log": str(log), "lock": str(_run_lock(marker)),
          "task": task, "run": os.environ.get("TTP_RUN_ID"), "own": own}
+    if own and (rec := recorded_checks(os.environ.get("TTP_RUN_DIR"))):
+        m["recorded_checks"] = rec   # the push process runs without TTP_RUN_DIR
     if _boxed():
         m.update(status="queued", queued=time.time(),
                  env={k: os.environ[k] for k in os.environ if k in QUEUE_ENV or k.startswith("GIT_CONFIG_")})
@@ -1440,7 +1477,8 @@ def run_detached(p: Project, repo: Path, marker: Path, own: bool = False) -> int
     for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         signal.signal(sig, _stop)
     try:
-        rc = run(p, repo, own)
+        rec = m.get("recorded_checks")
+        rc = run(p, repo, own, rec if isinstance(rec, dict) else None)
     except Exception as e:     # recorded as a failure, never left as "running"
         print(f"ttp push: {type(e).__name__}: {e}", file=sys.stderr)
         reason = str(e) if isinstance(e, _Stopped) else None
