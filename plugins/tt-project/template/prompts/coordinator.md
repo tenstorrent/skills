@@ -46,9 +46,9 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
   spec is a short lookup (Jev or rules pick it; the pick is logged with the run). Respect the
   budget's `max_tier`.
   A `review` gets its tier from the diff it names (branch or commit in the spec, or `depends_on`
-  the code task): `light` when doc-only or small, `standard` otherwise. Set `deep` only to force it.
-  A re-review after a failed one `continues` it or depends on the fix that does, and its spec
-  lists the earlier findings: it is then sized by the fix since the failed review's head.
+  the code task): `light` when docs and tests only or small and clear of risky code, `standard`
+  otherwise. Set `deep` only to force it. A re-review after a failed one `continues` it or depends
+  on the fix that does, and its spec lists the earlier findings: it always runs `standard`.
   When delivery has a review step, the daemon queues the review of each finished code task whose
   hand-off has no follow-ups, notes or findings (`Review #<id>: <title>`). Do not add another:
   steer it with `task_update` `spec`. A hand-off with any of those, or a higher severity, gets no

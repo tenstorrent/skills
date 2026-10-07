@@ -14957,7 +14957,7 @@ def test_review_tier_follows_the_size_and_risk_of_the_diff(env):
     assert review_tier({"src/state/db.py": 2}, cfg) == "standard"
     assert review_tier({"assets/logo.png": None}, cfg) == "standard"
     assert review_tier({"src/app.py": 60}, {}) == "light"
-    assert review_tier({"CMakeLists.txt": 61}, {}) == "standard"
+    assert review_tier({"CMakeLists.txt": 81}, {}) == "standard"
     assert review_tier({"docs/state/guide.md": 1}, {"review": {"risky_paths": ["docs/state/*"]}}) == "standard"
 
 
@@ -14967,9 +14967,33 @@ def test_review_tier_light_paths_is_an_allow_list(env):
     assert review_tier({"tests/test_app.py": 20, "scripts/run.sh": 5, "README.md": 300}, cfg) == "light"
     assert review_tier({"docs/guide.md": 500}, cfg) == "light"
     assert review_tier({"tests/test_app.py": 20, "src/app.py": 1}, cfg) == "standard"
-    assert review_tier({"tests/test_app.py": 61}, cfg) == "standard"
+    assert review_tier({"scripts/run.sh": 81}, cfg) == "standard"
     assert review_tier({"tests/state/db.py": 1}, cfg) == "standard"
     assert review_tier({"src/app.py": 1}, {"review": {"light_paths": []}}) == "light"
+
+
+def test_review_pick_names_the_rule_and_keeps_risky_code_standard(env):
+    from ttp.budget import review_pick
+    from ttp.project import DEFAULT_CONFIG
+    cfg = {"review": DEFAULT_CONFIG["review"]}
+    # Tests, docs, changesets and template wording only: light at any size.
+    assert review_pick({"tests/test_db.py": 900, ".changeset/x.md": 5, "template/prompts/worker.md": 300}, cfg) \
+        == ("light", "tests and docs only")
+    assert review_pick({"src/app_test.go": 400, "web/app.test.js": 200}, cfg)[0] == "light"
+    assert review_pick({"README.md": 900}, cfg) == ("light", "docs only")
+    # Small code outside the risky names: light up to 80 lines, standard above.
+    assert review_pick({"src/app.py": 50, "tests/test_app.py": 30}, cfg) == ("light", "80 lines <= 80")
+    assert review_pick({"src/app.py": 51, "tests/test_app.py": 30}, cfg) == ("standard", "81 lines > 80")
+    # State, database, push, spend and upgrade code: standard however small.
+    for path in ("runtime/ttp/db.py", "runtime/ttp/push.py", "runtime/ttp/pushq.py", "runtime/ttp/budget.py",
+                 "src/billing.py", "app/localspend.py", "src/state.py", "src/game_state.rs", "migrations/0001.sql",
+                 "src/schema.sql", "src/upgrade.sh", "src/user_db.py"):
+        assert review_pick({path: 1}, cfg) == ("standard", f"risky name {path}"), path
+    assert review_pick({"src/db.py": 1}, {"review": {"risky_names": []}})[0] == "light"
+    assert review_pick({"src/app.py": 1}, {"review": {"risky_names": ["app*"]}})[0] == "standard"
+    assert review_pick({"tests/test_x.py": 1}, {"review": {"risky_paths": ["tests/*"]}}) \
+        == ("standard", "risky path tests/test_x.py")
+    assert review_pick({"src/logo.png": None}, cfg) == ("standard", "binary file")
 
 
 def test_a_review_runs_at_the_tier_its_diff_needs(env, monkeypatch):
@@ -14978,8 +15002,9 @@ def test_a_review_runs_at_the_tier_its_diff_needs(env, monkeypatch):
     from ttp import worktree
     d = dmod.Daemon(p.base)
     started = {}
-    monkeypatch.setattr(d, "start_run", lambda role, prompt, provider, tier, cwd, **k: started.update(
-        {k["task"]["id"]: (role, tier)}))
+    notes = {}
+    monkeypatch.setattr(d, "start_run", lambda role, prompt, provider, tier, cwd, **k: (started.update(
+        {k["task"]["id"]: (role, tier)}), notes.update({k["task"]["id"]: k["note"]})))
     ident = ["-c", "user.name=t", "-c", "user.email=t@t"]
 
     def change(title, files):
@@ -15007,6 +15032,11 @@ def test_a_review_runs_at_the_tier_its_diff_needs(env, monkeypatch):
     p.db.update_task(retried, attempts=1)
     d.dispatch()
     assert started[by_branch] == ("reviewer", "light") and p.db.task(by_branch)["tier"] == "light"
+    assert notes[by_branch]["review_tier"] == {"tier": "light", "from": "standard", "rule": "20 lines <= 80",
+                                               "files": 2, "lines": 520}
+    assert notes[by_commit]["review_tier"]["rule"] == "200 lines > 80"
+    assert "review_tier" not in notes[forced] and "review_tier" not in notes[unknown]
+    assert notes[retried]["review_tier"]["rule"] == "retry (20 lines <= 80)"
     assert started[by_dep][1] == "light"
     assert started[by_commit][1] == "standard" and p.db.task(by_commit)["tier"] == "standard"
     assert started[forced][1] == "deep"
@@ -15019,73 +15049,42 @@ def test_a_review_runs_at_the_tier_its_diff_needs(env, monkeypatch):
     assert started[risky][1] == "standard"
 
 
-def test_a_re_review_is_sized_by_the_fix_since_the_failed_review(env):
+def test_a_re_review_after_a_failed_review_runs_standard(env):
     p = make(env)
     from ttp import worktree
     from ttp.daemon import Daemon
-    from ttp.db import dump_result
     d = Daemon(p.base)
-    ident = ["-c", "user.name=t", "-c", "user.email=t@t"]
     first = p.db.add_task("stack", "s", kind="code", tier="standard", origin="user")
     path, branch = worktree.ensure(p, p.db.task(first))
-
-    def commit(name, lines, msg):
-        f = path / name
-        f.write_text((f.read_text() if f.exists() else "") + "".join(f"{msg} {i}\n" for i in range(lines)))
-        _git_out(path, "add", ".")
-        _git_out(path, *ident, "commit", "-qm", msg)
-        return _git_out(path, "rev-parse", "HEAD")
-
-    reviewed = commit("app.py", 600, "stack")
+    (path / "app.py").write_text("".join(f"x{i} = {i}\n" for i in range(30)))
+    _git_out(path, "add", ".")
+    _git_out(path, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "stack")
     p.db.update_task(first, status="done", branch=branch)
 
-    def failed_review(head):
-        rid = p.db.add_task(f"review {head}", f"Review branch {branch}.", kind="review", origin="coordinator")
-        p.db.update_task(rid, status="failed", result=dump_result(
-            {"summary": "blocked", "status": "failed", "metrics": {"reviewed_head": head}}))
+    def review(old=None, status="failed", via_fix=True):
+        rid = p.db.add_task("review", f"Review branch {branch}.", kind="review", tier="light", origin="coordinator",
+                            labels=[f"continues:{old}"] if old and not via_fix else [],
+                            depends_on=[first] if not via_fix or not old else [])
+        if old and via_fix:
+            fix = p.db.add_task(f"fix {old}", "s", kind="code", origin="coordinator", labels=[f"continues:{old}"])
+            p.db.update_task(fix, status="done", branch=branch)
+            p.db.update_task(rid, depends_on=json.dumps([fix]))
+        p.db.update_task(rid, status=status)
         return rid
 
-    def re_review(old, via_fix=True):
-        labels = [f"continues:{old}"]
-        if not via_fix:
-            return p.db.add_task(f"re-review {old}", "Earlier findings: x.", kind="review", tier="standard",
-                                 origin="coordinator", labels=labels, depends_on=[first])
-        fix = p.db.add_task(f"fix {old}", "s", kind="code", origin="coordinator", labels=labels)
-        p.db.update_task(fix, status="done", branch=branch)
-        return p.db.add_task(f"re-review {old}", "Earlier findings: x.", kind="review", tier="standard",
-                             origin="coordinator", depends_on=[fix])
-
-    blocked = failed_review(reviewed)
-    commit("app.py", 30, "fix")
-    rev = re_review(blocked)
-    assert d._size_review(p.db.task(rev))["tier"] == "light", "a 30-line fix on a 600-line stack"
-    assert d._size_review(p.db.task(re_review(blocked, via_fix=False)))["tier"] == "light"
-    assert d._size_review(p.db.task(p.db.add_task("fresh", f"Review branch {branch}.", kind="review",
-                                                  origin="coordinator")))["tier"] == "standard"
-    # Nothing new since the failed review: the whole stack decides.
-    same = failed_review(_git_out(path, "rev-parse", "HEAD"))
-    assert d._size_review(p.db.task(re_review(same, via_fix=False)))["tier"] == "standard"
-
-    p.set_config("review.risky_paths", ["state/*"])
-    d.cfg = p.config()
-    (path / "state").mkdir()
-    blocked = failed_review(_git_out(path, "rev-parse", "HEAD"))
-    commit("state/db.py", 5, "risky")
-    assert d._size_review(p.db.task(re_review(blocked)))["tier"] == "standard", "a fix on a risky path"
-    p.set_config("review.risky_paths", [])
-    d.cfg = p.config()
-
-    # A head the branch no longer descends from (rewritten history), or none recorded: the whole stack.
-    other = p.db.add_task("other", "s", kind="code", origin="user")
-    opath, _ = worktree.ensure(p, p.db.task(other))
-    (opath / "x.py").write_text("x = 1\n")
-    _git_out(opath, "add", ".")
-    _git_out(opath, *ident, "commit", "-qm", "other")
-    stray = failed_review(_git_out(opath, "rev-parse", "HEAD"))
-    commit("app.py", 10, "more")
-    assert d._size_review(p.db.task(re_review(stray)))["tier"] == "standard"
-    none = failed_review(None)
-    assert d._size_review(p.db.task(re_review(none)))["tier"] == "standard"
+    fresh = review(status="queued")
+    assert d._size_review(p.db.task(fresh))[0]["tier"] == "light", "a 30-line change"
+    blocked = review()
+    for via_fix in (True, False):
+        task, pick = d._size_review(p.db.task(review(blocked, "queued", via_fix)))
+        assert task["tier"] == "standard" and pick["rule"] == f"re-review after failed review #{blocked}", via_fix
+    # A review after one that passed is no re-review: its diff decides.
+    passed = review(status="done")
+    assert d._size_review(p.db.task(review(passed, "queued", False)))[0]["tier"] == "light"
+    # Deep stays deep.
+    deep = review(blocked, "queued", False)
+    p.db.update_task(deep, tier="deep")
+    assert d._size_review(p.db.task(deep)) == (p.db.task(deep), None)
 
 
 def test_a_failed_review_records_the_head_it_reviewed():
@@ -15535,9 +15534,9 @@ def test_a_light_review_stays_light_after_a_reboot_loss(env, tmp_path):
     _git_out(path, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "small")
     p.db.update_task(tid, status="done", branch=branch)
     rev = p.db.add_task("review", f"Review branch {branch}.", kind="review", tier="light", origin="coordinator")
-    assert d._size_review(p.db.task(rev))["tier"] == "light"
+    assert d._size_review(p.db.task(rev))[0]["tier"] == "light"
     _lost_to_reboot(p, d, tmp_path, rev)
-    assert d._size_review(p.db.task(rev))["tier"] == "light", "a reboot loss lifted the review's tier"
+    assert d._size_review(p.db.task(rev))[0]["tier"] == "light", "a reboot loss lifted the review's tier"
 
 
 def test_the_resume_after_a_reboot_says_so_with_the_last_notes(env, tmp_path):
@@ -22276,6 +22275,7 @@ def test_the_daemons_re_review_continues_the_failed_review(env):
     p.db.update_task(rev["id"], status="failed", result=dump_result({"summary": "missing test", "status": "failed"}))
     fix, _, done, (re_rev,) = _finish_code(env, p, "fix it", {"fix.py": 5}, labels=[f"continues:{rev['id']}"])
     assert continues_id(re_rev) == rev["id"] and f"Review #{rev['id']} failed" in re_rev["spec"]
+    assert re_rev["tier"] == "standard", "a re-review of a failed review was queued light"
     # A fix that continues the code task (not the review) is re-reviewed the same way.
     p.db.update_task(re_rev["id"], status="failed")
     _, _, _, (third,) = _finish_code(env, p, "fix again", {"fix2.py": 5}, labels=[f"continues:{fix}"])
@@ -22331,6 +22331,7 @@ def test_a_failed_review_with_fixes_moves_its_dependents_onto_the_re_review(env)
     assert fix["title"] == f"Fix review #{rev['id']}: feature" and continues_id(fix) == code
     assert "test_x must fail" in fix["spec"] and "parse('') raises" in fix["spec"] and branch in fix["spec"]
     assert dependency_ids(re_rev) == [fix["id"]] and continues_id(re_rev) == rev["id"]
+    assert rev["tier"] == "light" and re_rev["tier"] == "standard", "a re-review of a failed review was queued light"
     assert fix["branch"] in re_rev["spec"] and "add the missing test" in re_rev["spec"]
     assert "Review only" in re_rev["spec"], "the re-review dropped the failed review's own steps"
     w = p.db.task(waiter)

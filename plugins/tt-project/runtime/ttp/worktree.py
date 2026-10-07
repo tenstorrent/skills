@@ -580,18 +580,15 @@ def reviewed_refs(p: Project, task: dict) -> list[str]:
     return list(dict.fromkeys(refs))
 
 
-def diff_lines(p: Project, refs: list[str], since: list[str] | None = None) -> dict[str, int | None] | None:
+def diff_lines(p: Project, refs: list[str]) -> dict[str, int | None] | None:
     """Lines changed per file by `refs` since they left the base branch (None for a binary file),
-    or None when they change nothing measurable, such as a commit already on the base.
-    With `since` (heads an earlier review saw), a ref descending from one of them is measured from
-    the closest such head instead: only what changed after that review."""
+    or None when they change nothing measurable, such as a commit already on the base."""
     base = resolve_base(p)
     out: dict[str, int | None] = {}
     for ref in refs:
         if not _git(p.root, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", check=False):
             continue
-        start = _closest_ancestor(p, since or [], ref) or base
-        for line in _git(p.root, "diff", "--numstat", "--no-renames", f"{start}...{ref}").splitlines():
+        for line in _git(p.root, "diff", "--numstat", "--no-renames", f"{base}...{ref}").splitlines():
             added, deleted, path = line.split("\t", 2)
             prev = out.get(path, 0)
             n = None if added == "-" else int(added) + int(deleted)

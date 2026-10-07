@@ -2330,8 +2330,9 @@ class Daemon:
             reached.add(task["id"])
             if not self._resources_free(task, reserve=True):
                 continue
+            review_pick = None
             if task["kind"] == "review":
-                task = self._size_review(task)
+                task, review_pick = self._size_review(task)
             picked = self._pick_effort(task, provider)
             if picked:
                 task = dict(task, tier=picked["tier"])
@@ -2353,6 +2354,8 @@ class Daemon:
                     note["wake"] = {"tier": tier, "escalated": bool(load_result(task["result"]).get("escalated_wake"))}
                 if picked:
                     note["pick"] = picked
+                if review_pick:
+                    note["review_tier"] = review_pick
                 if lost and lost["cwd"] == cwd:
                     # The session holds the task and its own work: a short prompt continues it.
                     prompt = worker_resume(self.p, task, lost)
@@ -3340,30 +3343,34 @@ class Daemon:
         return any(self._resources_free(t) and not (dev_full and needs_device(t, self.cfg))
                    for t in self.p.db.ready_tasks())
 
-    def _size_review(self, task: dict) -> dict:
-        """A review runs at the tier its diff needs, not the one it was queued with. Deep stays the
-        coordinator's call. A retry never drops to light: the light try may be why it
+    def _size_review(self, task: dict) -> tuple[dict, dict | None]:
+        """A review runs at the tier its diff needs, not the one it was queued with: the task at that
+        tier, and the rule's pick for the run's note (None when it was not measured). Deep stays the
+        coordinator's call. A re-review after a failed review and a retry never run light: the
+        failed review shows the change needs the closer look, and the light try may be why it
         failed. A diff that cannot be measured keeps the tier the task was given."""
         if task["tier"] == "deep":
-            return task
-        try:
-            refs = worktree.reviewed_refs(self.p, task)
-            since = self._reviewed_heads(task)
-            # A re-review is sized by the fix since the blocked review; nothing new, the whole stack.
-            changes = (since and worktree.diff_lines(self.p, refs, since)) or worktree.diff_lines(self.p, refs)
-        except Exception as e:
-            log(self.p, f"task {task['id']}: review diff not measured: {e}")
-            return task
-        if changes is None:
-            return task
-        tier = bud.review_tier(changes, self.cfg)
-        if tier == "light" and task["attempts"]:
-            tier = "standard"
+            return task, None
+        prior = self._failed_review_before(task)
+        if prior is not None:
+            tier, why, changes = "standard", f"re-review after failed review #{prior}", {}
+        else:
+            try:
+                changes = worktree.diff_lines(self.p, worktree.reviewed_refs(self.p, task))
+            except Exception as e:
+                log(self.p, f"task {task['id']}: review diff not measured: {e}")
+                return task, None
+            if changes is None:
+                return task, None
+            tier, why = bud.review_pick(changes, self.cfg)
+            if tier == "light" and task["attempts"]:
+                tier, why = "standard", f"retry ({why})"
+        pick = {"tier": tier, "from": task["tier"], "rule": why, "files": len(changes),
+                "lines": sum(n or 0 for n in changes.values())}
         if tier != task["tier"]:
-            log(self.p, f"task {task['id']}: review tier {task['tier']} -> {tier} "
-                        f"({len(changes)} files, {sum(n or 0 for n in changes.values())} lines)")
+            log(self.p, f"task {task['id']}: review tier {task['tier']} -> {tier} ({why})")
             self.p.db.update_task(task["id"], tier=tier)
-        return dict(task, tier=tier)
+        return dict(task, tier=tier), pick
 
     def _auto_review(self, task: dict, summary: str, add: bool = True) -> tuple[int, bool] | None:
         """The review of a finished code task, queued here the way the coordinator would, so a
@@ -3396,14 +3403,14 @@ class Daemon:
         if dup:
             return dup["id"], False
         # A fix after a failed review is re-reviewed as its continuation: the reviewer gets the earlier
-        # findings, and the review is sized by what changed since the head they were found on.
+        # findings, and the review runs standard: a failed review shows the change needs the closer look.
         chain, c = {task["id"]}, continues_id(task)
         while c is not None and c not in chain:
             chain.add(c)
             c = continues_id(db.task(c) or {"labels": "[]"})
         prior = next((r for r in db.q("SELECT * FROM tasks WHERE kind='review' AND status='failed' ORDER BY id DESC")
                       if r["id"] in chain or chain & set(dependency_ids(r))), None)
-        tier = bud.review_tier(changes, cfg)
+        tier = "standard" if prior else bud.review_tier(changes, cfg)
         pr = task.get("pr_url")
         lines = [f"Independently review the change of code task #{task['id']} ({task['title']}): branch {branch}, "
                  f"head {head}" + (f", PR {pr}" if pr else "") + ".",
@@ -3477,6 +3484,7 @@ class Daemon:
             return None
         base_title = re.sub(r"^(?:Fix review #\d+: )+", "", code["title"])
         tier = code["tier"] if code["tier"] in bud.TIER_ORDER else "standard"
+        rtier = "deep" if review["tier"] == "deep" else "standard"   # a re-review never runs light
         found = "\n".join(f"{n}. {str(f['title'])[:200]}: {coord.clip(f.get('spec'), FOLLOWUP_SPEC_CHARS)}"
                           for n, f in enumerate(fups, 1))
         with db.tx():
@@ -3495,8 +3503,8 @@ class Daemon:
                                   f"#{code['id']}'s worktree), use #{fid}'s branch and worktree.",
                                   f"The first review's spec (#{first['id']}):\n"
                                   f"{(first.get('spec') or '')[:REVIEW_FIX_SPEC_CHARS]}"]),
-                              kind="review", tier=review["tier"], priority=review["priority"], origin="daemon",
-                              budget_usd=float(cfg["budget"]["task_default_usd"].get(review["tier"], 8.0)),
+                              kind="review", tier=rtier, priority=review["priority"], origin="daemon",
+                              budget_usd=float(cfg["budget"]["task_default_usd"].get(rtier, 8.0)),
                               depends_on=[fid], labels=[f"auto_review:{fid}", f"continues:{review['id']}"])
             db.update_task(fid, branch=fbranch, spec="\n".join([
                 f"Fix the blocking findings of review #{review['id']} ({review['title']}) on code task "
@@ -3511,10 +3519,10 @@ class Daemon:
                     + (f"; moved {moved} onto it" if moved else ""))
         return fid, rid, moved
 
-    def _reviewed_heads(self, task: dict) -> list[str]:
-        """Heads earlier reviews of this stack saw (their `metrics.reviewed_head`): reviews the task
-        continues, directly or through the fix it depends on (a `continues:` chain)."""
-        heads, seen = [], {task["id"]}
+    def _failed_review_before(self, task: dict) -> int | None:
+        """The id of a failed review this task continues, directly or through the fix it depends on
+        (a `continues:` chain), or None: the task is then no re-review."""
+        seen = {task["id"]}
         todo = [continues_id(task)] + [continues_id(t) for i in dependency_ids(task) if i is not None
                                        for t in [self.p.db.task(i)] if t]
         while todo:
@@ -3523,12 +3531,10 @@ class Daemon:
             if not t:
                 continue
             seen.add(tid)
-            metrics = load_result(t["result"]).get("metrics") if t["kind"] == "review" else None
-            head = metrics.get("reviewed_head") if isinstance(metrics, dict) else None
-            if isinstance(head, str) and re.fullmatch(r"[0-9a-f]{7,40}", head.strip()):
-                heads.append(head.strip())
+            if t["kind"] == "review" and t["status"] == "failed":
+                return tid
             todo.append(continues_id(t))
-        return heads
+        return None
 
     def _workdir_for(self, task: dict) -> tuple[str, str | None]:
         if task["kind"] == "harness":

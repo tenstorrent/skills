@@ -538,22 +538,54 @@ def next_step(prev: dict) -> str:
 DOC_SUFFIXES = (".md", ".markdown", ".rst", ".adoc")
 
 
-def review_tier(changes: dict[str, int | None], cfg: dict) -> str:
-    """Light for a doc-only diff or a small one that touches no risky path, standard otherwise.
-    Doc lines do not count toward the size: prose next to a small code change is not risk. With
-    light_paths set, a non-doc file must also match one of its globs for the diff to go light."""
+# Test files: a directory of these names, or a file name of these globs.
+TEST_DIRS = {"test", "tests", "__tests__"}
+TEST_NAMES = ("test_*", "*_test.*", "*.test.*", "*_spec.*", "*.spec.*", "conftest.py")
+# A code file whose path has a part matching one of these globs holds state, the database, a push,
+# spend or an upgrade: its review runs standard however small the change. `review.risky_names`
+# replaces the list ([] turns it off); `review.risky_paths` adds a project's own paths.
+RISKY_NAMES = ("*state*", "db", "db.*", "*_db.*", "*database*", "*schema*", "*migrat*", "push*", "*budget*",
+               "*billing*", "*spend*", "*upgrade*")
+
+
+def is_test_path(path: str) -> bool:
+    parts = path.lower().split("/")
+    return bool(TEST_DIRS & set(parts[:-1])) or any(fnmatch.fnmatch(parts[-1], g) for g in TEST_NAMES)
+
+
+def review_pick(changes: dict[str, int | None], cfg: dict) -> tuple[str, str]:
+    """The tier a review of `changes` (path -> changed lines, None for a binary file) needs and the
+    rule that picked it. Standard for a risky path or name; light when only docs and tests change,
+    or when at most light_max_lines non-doc lines change; standard otherwise. Doc lines do not
+    count toward the size: prose next to a small code change is not risk. With light_paths set, a
+    non-doc file must also match one of its globs for the diff to go light."""
     rules = cfg.get("review", {})
     risky = rules.get("risky_paths") or []
-    if any(fnmatch.fnmatch(path, g) for path in changes for g in risky):
-        return "standard"
+    hit = next((path for path in changes if any(fnmatch.fnmatch(path, g) for g in risky)), None)
+    if hit:
+        return "standard", f"risky path {hit}"
     code = {path: n for path, n in changes.items() if not path.lower().endswith(DOC_SUFFIXES)}
+    names = rules.get("risky_names")
+    names = RISKY_NAMES if names is None else names
+    hit = next((path for path in code if not is_test_path(path)
+                and any(fnmatch.fnmatch(part, g) for part in path.lower().split("/") for g in names)), None)
+    if hit:
+        return "standard", f"risky name {hit}"
+    if not code:
+        return "light", "docs only"
     allowed = rules.get("light_paths") or []
     if allowed and not all(any(fnmatch.fnmatch(path, g) for g in allowed) for path in code):
-        return "standard"
-    code = list(code.values())
-    if any(n is None for n in code):
-        return "standard"
-    return "light" if sum(code) <= int(rules.get("light_max_lines", 60)) else "standard"
+        return "standard", "outside light_paths"
+    if all(is_test_path(path) for path in code):
+        return "light", "tests and docs only"
+    if any(n is None for n in code.values()):
+        return "standard", "binary file"
+    lines, limit = sum(code.values()), int(rules.get("light_max_lines", 80))
+    return ("light", f"{lines} lines <= {limit}") if lines <= limit else ("standard", f"{lines} lines > {limit}")
+
+
+def review_tier(changes: dict[str, int | None], cfg: dict) -> str:
+    return review_pick(changes, cfg)[0]
 
 
 def windows_from_snapshots(db: DB, now: float | None = None) -> list[Window]:

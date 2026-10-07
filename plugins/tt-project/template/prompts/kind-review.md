@@ -21,7 +21,7 @@
 - A head the spec says is already delivered as a PR is review only: a pass is `done`, with no push
   and no approval for the push queue, whatever the sections below say.
 - When it must not proceed, put the full hash of the head you reviewed in `metrics.reviewed_head`:
-  the re-review of the fix is then sized by the fix alone.
+  the re-review of the fix then sees what changed since.
 - A re-review whose spec lists earlier findings: check each is fixed, then review what changed since.
 - NEVER edit the change yourself.
 - NEVER mark a PR ready for review: only the user takes a PR out of draft. The harness's `gh`

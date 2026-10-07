@@ -124,11 +124,14 @@ and preferences you add later become part of the project's charter and memory.
   what other machines ask for.
 - Work backs off in steps as spend rises, pauses at the cap, and tells you how to raise it.
 - A runaway guard pauses a project whose hourly spend jumps far above its own norm.
-- A review runs light when the diff it checks touches no `review.risky_paths` glob and is doc-only
-  or small (`review.light_max_lines` non-doc lines, default 60), standard otherwise; only the
-  coordinator picks deep. An optional `review.light_paths` glob list narrows light further: every
-  non-doc file must match one of its globs (unset or empty: any path may go light). A re-review after a failed review is measured from the head that review
-  recorded (`metrics.reviewed_head`), so a small fix on a large stack runs light.
+- A review runs light when the diff it checks touches no `review.risky_paths` glob and no code file
+  with a risky name (`review.risky_names`: state, database, schema, migration, push, budget, billing,
+  spend and upgrade files by default; `[]` turns it off), and is docs and tests only or small
+  (`review.light_max_lines` non-doc lines, default 80); standard otherwise. Every re-review after a
+  failed review and every retry runs standard; only the coordinator picks deep. An optional
+  `review.light_paths` glob list narrows light further: every non-doc file must match one of its
+  globs (unset or empty: any path may go light). The review run's note records the pick and the
+  rule behind it (`review_tier`).
 - When delivery has a review step (`delivery.review_before_pr` or a `delivery.push_branch`), the
   daemon queues the review of each finished code task whose hand-off has no follow-ups, notes or
   findings itself (`review.auto`, on by default), and that hand-off starts no coordinator turn.
