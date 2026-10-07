@@ -26103,6 +26103,7 @@ def test_devq_restart_requeues_a_job_a_reboot_killed_and_adopts_one_still_runnin
     go = tmp_path / "go"
     _devq_submit(d, {}, "long-2", f"touch {tmp_path / 'started2'}; while [ ! -e {go} ]; do sleep 0.05; done; exit 7")
     assert _wait_for_path(tmp_path / "started2")
+    _devq_job_pid(d, "long-2")
     os.kill(int((d / "runner.pid").read_text()), signal.SIGKILL)
     assert _devq("start", d, json.dumps(DEVQ_FAST)).returncode == 0
     go.touch()
