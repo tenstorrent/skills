@@ -259,6 +259,7 @@ _MARK = re.compile(r"^(now|still|changed|cleared)\b:?\s*", re.I)
 _COUNT = re.compile(r"\s+x\d+\b", re.I)             # "hold x3", "failed checks x2": a count, not an id
 _NUM_LIST = re.compile(r"<n>(\s*,\s*<n>)+")     # "chip 8,9,10" and "chip 3" are the same kind
 WATCHER_QUIET_CLOSE_S = 24 * 3600
+QUIET_RUNS = 3   # a slower watcher's issue closes after this many of its periods unseen, not 24 h
 CLEARED_WHY = "the watcher reported it cleared"
 QUIET_WHY = "not seen for 24 h"
 CLEAN_RUN_WHY = "a watcher run reported nothing"
@@ -303,18 +304,34 @@ def _clear(db: DB, fp: str, now: float) -> Verdict:
 
 
 def close_watcher_issues(db: DB, source: str | None = None, quiet_s: float | None = None,
-                         why: str = QUIET_WHY, now: float | None = None) -> int:
-    """Close open command-watcher issues: all of `source`'s, or those not seen for `quiet_s`.
-    Returns how many closed. Closing never wakes anyone; a later sighting reopens the issue."""
+                         why: str = QUIET_WHY, now: float | None = None, skip: Any = ()) -> int:
+    """Close open command-watcher issues: all of `source`'s, or those not seen for `quiet_s`, except
+    those of the sources in `skip`. Returns how many closed. Closing never wakes anyone; a later
+    sighting reopens the issue."""
     now = time.time() if now is None else now
     sql, args = "UPDATE issues SET status='fixed', closed=?, cleared_why=? WHERE status='open'", [now, why]
     if source is not None:
         sql, args = sql + " AND source=?", args + [source]
     else:
         sql += " AND source LIKE 'watcher:%'"
+    skip = list(skip)
+    if skip:
+        sql, args = sql + f" AND source NOT IN ({','.join('?' * len(skip))})", args + skip
     if quiet_s is not None:
         sql, args = sql + " AND last_seen<?", args + [now - quiet_s]
     return db.conn.execute(sql, args).rowcount
+
+
+def close_quiet_watcher_issues(db: DB, periods: dict[str, float], now: float | None = None) -> int:
+    """Close command-watcher issues not seen for 24 h, or for QUIET_RUNS periods of a watcher that runs
+    less often (`periods`: source -> seconds between runs). A daily watcher that prints a pending item
+    every run (or misses a run) keeps it open, so it never closes and reopens with a wake each day."""
+    slow = {src: QUIET_RUNS * float(every) for src, every in periods.items()
+            if QUIET_RUNS * float(every) > WATCHER_QUIET_CLOSE_S}
+    n = close_watcher_issues(db, quiet_s=WATCHER_QUIET_CLOSE_S, now=now, skip=slow)
+    for src, quiet in slow.items():
+        n += close_watcher_issues(db, src, quiet_s=quiet, why=f"not seen for {quiet / 3600:g} h", now=now)
+    return n
 
 
 # Mutes ----------------------------------------------------------------------------------------

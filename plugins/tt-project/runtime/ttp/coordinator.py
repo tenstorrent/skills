@@ -987,12 +987,16 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     # The daemon runs payload.command; a schedule without one would report "no command" forever.
                     # Turning one off needs no command, so a broken schedule can always be switched off.
                     payload = {**kept, **{k: a[k] for k in ("command", "timeout_s") if a.get(k)}}
+                    if "rewake_after_h" in a:   # null: a known issue never wakes again by time alone
+                        payload["rewake_after_h"] = _hours_or_none(a, "rewake_after_h")
                     if enabled and not str(payload.get("command") or "").strip():
                         raise ValueError(f"schedule_set {a.get('name')!r} rejected: kind command needs `command`, "
                                          f"the shell command to run (and optionally `timeout_s`)")
                 elif kind == "llm":
                     payload = {**kept, "spec": a.get("spec") or kept.get("spec") or "",
                                "tier": a.get("tier") or kept.get("tier") or "standard"}
+                    if "debounce_h" in a:   # null or 0: no debounce
+                        payload["debounce_h"] = _hours_or_none(a, "debounce_h")
                 elif kind == "watcher" and old:
                     payload = kept   # a built-in probe: only its timing and switch change
                 else:
@@ -1634,6 +1638,20 @@ def memory_budget_check(p: Project) -> None:
         p.db.set_kv(MEMORY_ALERT_KEY, True)
     elif flagged and not over["pinned_over"]:
         p.db.set_kv(MEMORY_ALERT_KEY, False)
+
+
+def _hours_or_none(a: dict, key: str) -> float | None:
+    """schedule_set's `key`: hours (a number, at least 0) or null."""
+    v = a.get(key)
+    if v is None:
+        return None
+    try:
+        hours = float(v)
+    except (TypeError, ValueError):
+        hours = -1.0
+    if hours < 0 or hours != hours:
+        raise ValueError(f"schedule_set {a.get('name')!r} rejected: `{key}` must be hours (a number, 0 or more) or null")
+    return hours
 
 
 def _tell_running_workers(db, text: str, key: str | None = None) -> None:

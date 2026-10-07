@@ -6026,6 +6026,228 @@ def test_other_llm_schedule_skips_still_wait_a_full_period(env):
     assert sched.waiting_line(p.db) == ""
 
 
+def _review_due(p, last_run=None):
+    p.db.x("UPDATE schedules SET last_run=?, next_run=? WHERE name='daily-review'", (last_run, time.time() - 1))
+
+
+def _review_done(p, tid, ended):
+    p.db.update_task(tid, status="done")
+    p.db.x("INSERT INTO runs(task,role,provider,started,ended,status) VALUES(?,?,?,?,?,?)",
+           (tid, "worker", "fake", ended - 300, ended, "ok"))
+
+
+def _reviews(p):
+    return [r["id"] for r in p.db.q("SELECT id FROM tasks WHERE origin='schedule' AND labels=? ORDER BY id",
+                                    (json.dumps(["daily-review"]),))]
+
+
+def test_a_daily_review_done_on_unchanged_evidence_is_not_repeated_within_the_debounce(env):
+    p = make(env)
+    from ttp import schedule as sched
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    d.gates = {}
+    work = p.db.add_task("real work", "x", kind="work", tier="light", origin="user")
+    _review_due(p)
+    d.run_schedules()
+    [first] = _reviews(p)
+    assert p.db.kv(sched.DEBOUNCE_KEY + "daily-review")["task"] == first
+    _review_done(p, first, time.time() - 3600)
+    # A second trigger (a late retry, then the regular slot) an hour after it ended, nothing changed.
+    _review_due(p)
+    d.run_schedules()
+    s = p.db.one("SELECT * FROM schedules WHERE name='daily-review'")
+    assert s["last_status"].startswith("skipped: last run done 1.0 h ago on unchanged evidence"), s["last_status"]
+    assert _reviews(p) == [first] and s["next_run"] > time.time() + 3600
+    # The debounce counts from the run's end, not from skipped triggers: past it, the review runs.
+    p.db.x("UPDATE runs SET ended=? WHERE task=?", (time.time() - 3 * 3600, first))
+    _review_due(p)
+    d.run_schedules()
+    assert len(_reviews(p)) == 2
+    # Changed evidence runs at once: a task moved, or the user wrote.
+    for change in (lambda: p.db.update_task(work, status="done", result=json.dumps({"summary": "shipped"})),
+                   lambda: p.db.x("INSERT INTO messages(direction, chat, text, ts, handled) VALUES('in', 'c', 'how is it going?', ?, 0)",
+                                  (time.time(),))):
+        last = _reviews(p)[-1]
+        _review_done(p, last, time.time() - 60)
+        change()
+        _review_due(p, time.time() - 1800)
+        d.run_schedules()
+        assert p.db.one("SELECT last_status FROM schedules WHERE name='daily-review'")["last_status"] == "queued"
+        assert _reviews(p)[-1] != last
+
+
+def test_the_review_evidence_is_taken_at_enqueue_and_ignores_accounting(env):
+    p = make(env)
+    from ttp import schedule as sched
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    d.gates = {}
+    work = p.db.add_task("real work", "x", kind="work", tier="light", origin="user")
+    _review_due(p)
+    d.run_schedules()
+    [first] = _reviews(p)
+    # Spend and timestamps alone are no change.
+    before = sched.evidence(p.db)
+    p.db.x("UPDATE tasks SET spent_usd=1.5, updated=?, attempts=2 WHERE id=?", (time.time(), work))
+    p.db.x("INSERT INTO ledger(ts,source,usd) VALUES(?,?,?)", (time.time(), "worker", 0.4))
+    assert sched.evidence(p.db) == before
+    # A worker finishing while the review runs is new: the next trigger reviews it.
+    p.db.update_task(work, status="done", result=json.dumps({"summary": "landed"}))
+    _review_done(p, first, time.time() - 60)
+    _review_due(p, time.time() - 600)
+    d.run_schedules()
+    assert len(_reviews(p)) == 2
+
+
+def test_a_failed_review_never_earns_the_debounce_and_it_is_configurable(env):
+    p = make(env)
+    from ttp import schedule as sched
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    d.gates = {}
+    p.db.add_task("real work", "x", kind="work", tier="light", origin="user")
+    _review_due(p)
+    d.run_schedules()
+    [first] = _reviews(p)
+    for status in ("failed", "cancelled"):
+        # It ended a minute ago on the evidence it was queued on, and a worker ran since (not idle).
+        _review_done(p, _reviews(p)[-1], time.time() - 60)
+        p.db.update_task(_reviews(p)[-1], status=status)
+        p.db.x("INSERT INTO runs(task,role,provider,started,status) VALUES(?,?,?,?,?)",
+               (None, "worker", "fake", time.time(), "ok"))
+        assert p.db.kv(sched.DEBOUNCE_KEY + "daily-review")["evidence"] == sched.evidence(p.db)
+        n = len(_reviews(p))
+        _review_due(p, time.time() - 30)
+        d.run_schedules()
+        assert len(_reviews(p)) == n + 1, status
+    assert sched.debounce_s("daily-review", {}) == 7200
+    assert sched.debounce_s("daily-review", {"debounce_h": None}) == 0
+    assert sched.debounce_s("daily-review", {"debounce_h": 0}) == 0
+    assert sched.debounce_s("audit", {}) == 0 and sched.debounce_s("audit", {"debounce_h": 5}) == 5 * 3600
+    # A longer debounce holds a run done 3 h ago; none at all lets it run.
+    last = _reviews(p)[-1]
+    _review_done(p, last, time.time() - 3 * 3600)
+    for debounce, runs in ((5, False), (None, True)):
+        sched.upsert(p.db, "daily-review", "llm", "1d", "04:30",
+                     payload={"prompt": "daily-review.md", "debounce_h": debounce, "skip_if_idle": False})
+        _review_due(p, time.time() - 30)
+        d.run_schedules()
+        assert (_reviews(p)[-1] != last) is runs, debounce
+
+
+def test_a_debounced_schedule_keeps_its_period_while_its_run_is_open_or_its_budget_used(env):
+    p = make(env)
+    from ttp import schedule as sched
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    d.gates = {}
+    p.db.add_task("real work", "x", kind="work", tier="light", origin="user")
+    _review_due(p)
+    d.run_schedules()
+    [first] = _reviews(p)
+    last = time.time() - 86400
+    _review_due(p, last)
+    before = time.time()
+    d.run_schedules()
+    s = p.db.one("SELECT * FROM schedules WHERE name='daily-review'")
+    assert s["last_status"] == "deferred: previous run still open"
+    assert s["last_run"] == last and before + 1800 - 5 <= s["next_run"] <= time.time() + 1800
+    _review_done(p, first, time.time() - 5 * 3600)
+    p.db.x("INSERT INTO ledger(ts,source,usd) VALUES(?,?,?)", (time.time() - 600, "schedule:daily-review", 9.0))
+    _review_due(p, last)
+    d.run_schedules()
+    s = p.db.one("SELECT * FROM schedules WHERE name='daily-review'")
+    assert s["last_status"] == "deferred: daily budget used" and s["last_run"] == last
+    assert sched.waiting_line(p.db) == "" and not sched.failing(s["last_status"])
+
+
+def test_a_worker_that_finishes_after_the_last_review_counts_as_activity(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    since = time.time() - 3600
+    p.db.x("UPDATE messages SET ts=?", (since - 86400,))
+    tid = p.db.add_task("long job", "x", kind="work", tier="light", origin="user")
+    run = p.db.x("INSERT INTO runs(task,role,provider,started,status) VALUES(?,?,?,?,?)",
+                 (tid, "worker", "fake", since - 7200, "running"))
+    assert not d._active_since(since, "daily-review")
+    p.db.x("UPDATE runs SET ended=?, status='ok' WHERE id=?", (time.time() - 60, run))
+    assert d._active_since(since, "daily-review")
+
+
+def test_a_daily_receipt_watcher_keeps_its_pending_item_quiet_until_it_changes(env, tmp_path):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import screen as scr
+    from ttp.daemon import Daemon
+    out = tmp_path / "receipts.txt"
+    tok_a, tok_b = "evidence_" + "a1" * 20, "evidence_" + "b2" * 20
+    assert coord.apply(p, [{"type": "schedule_set", "name": "receipts", "kind": "command", "every": "1d",
+                            "command": f"cat {out}; test -s {out}", "rewake_after_h": None}]) == []
+    s = p.db.one("SELECT * FROM schedules WHERE name='receipts'")
+    assert json.loads(s["payload"])["rewake_after_h"] is None
+    d = Daemon(p.base)
+    d.gates = {}
+
+    def run(text, rc_cmd=None):
+        out.write_text(text)
+        row = p.db.one("SELECT * FROM schedules WHERE name='receipts'")
+        payload = json.loads(row["payload"])
+        if rc_cmd:
+            payload = {**payload, "command": rc_cmd}
+        n = p.db.one("SELECT COUNT(*) n FROM events WHERE source='watcher:receipts'")["n"]
+        status = d._run_command_watcher(row, payload)
+        return status, p.db.one("SELECT COUNT(*) n FROM events WHERE source='watcher:receipts'")["n"] - n
+
+    def age(hours):   # as if the last sighting were this long ago
+        p.db.x("UPDATE issues SET last_seen=last_seen-? WHERE source='watcher:receipts'", (hours * 3600,))
+
+    line = json.dumps({"text": f"owner outcome: task done; {tok_a}; owner must reassess",
+                       "severity": "normal"}) + "\n"
+    assert run(line)[1] == 1, "a new receipt wakes"
+    # The next day, and after a failed run and a producer retry the day after: open, and quiet.
+    age(25)
+    d.cfg = p.config()
+    scr.close_quiet_watcher_issues(p.db, {"watcher:receipts": 86400})
+    assert not p.db.q("SELECT id FROM issues WHERE source='watcher:receipts' AND status!='open'")
+    assert run(line)[1] == 0
+    age(25)
+    assert run("", rc_cmd="exit 3")[0].startswith("ok")
+    age(25)
+    scr.close_quiet_watcher_issues(p.db, {"watcher:receipts": 86400})
+    assert p.db.one("SELECT COUNT(*) n FROM issues WHERE source='watcher:receipts' AND status='open' "
+                    "AND title LIKE '%evidence_a1%'")["n"] == 1
+    assert run(line)[1] == 0 and run(line)[1] == 0
+    # The same outcome with new evidence (a changed success) wakes, though bare hashes are masked.
+    assert run(line.replace(tok_a, tok_b))[1] == 1
+    assert scr.condition_fingerprint("watcher:x", "owner outcome", "a1" * 20) == \
+        scr.condition_fingerprint("watcher:x", "owner outcome", "b2" * 20), "bare tokens would stay one issue"
+    # A fast watcher's issues still close after 24 h quiet; a daily one's after three days.
+    p.db.x("INSERT INTO issues(fingerprint,source,first_seen,last_seen,title,status) VALUES(?,?,?,?,?,?)",
+           ("fast1", "watcher:fast", 0, time.time() - 25 * 3600, "x", "open"))
+    age(73)
+    assert scr.close_quiet_watcher_issues(p.db, {"watcher:receipts": 86400, "watcher:fast": 300}) >= 2
+    assert p.db.one("SELECT status FROM issues WHERE fingerprint='fast1'")["status"] == "fixed"
+    assert {r["cleared_why"] for r in p.db.q("SELECT cleared_why FROM issues WHERE source='watcher:receipts'")} \
+        == {"not seen for 72 h"}
+
+
+def test_schedule_set_takes_rewake_and_debounce_hours_or_null(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    assert coord.apply(p, [{"type": "schedule_set", "name": "probe", "kind": "command", "command": "true",
+                            "every": "1d", "rewake_after_h": 48},
+                           {"type": "schedule_set", "name": "audit", "kind": "llm", "spec": "x", "every": "1d",
+                            "debounce_h": None}]) == []
+    pay = lambda n: json.loads(p.db.one("SELECT payload FROM schedules WHERE name=?", (n,))["payload"])
+    assert pay("probe")["rewake_after_h"] == 48 and pay("audit")["debounce_h"] is None
+    assert coord.apply(p, [{"type": "schedule_set", "name": "probe", "kind": "command", "every": "2d"}]) == []
+    assert pay("probe")["rewake_after_h"] == 48, "a field left out keeps its value"
+    problems = coord.apply(p, [{"type": "schedule_set", "name": "probe", "kind": "command", "rewake_after_h": "soon"}])
+    assert problems and "rewake_after_h" in problems[0]
+
+
 def load_result_summary(task) -> str:
     return json.loads(task["result"] or "{}").get("summary", "")
 

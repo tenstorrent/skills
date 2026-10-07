@@ -475,7 +475,8 @@ class Daemon:
         self.update_gates()
         coord.expire_asks(self.p, hold=any(g.level == "red" for g in self.gates.values()))
         scr.expire_mutes(self.p.db)
-        scr.close_watcher_issues(self.p.db, quiet_s=scr.WATCHER_QUIET_CLOSE_S)
+        scr.close_quiet_watcher_issues(self.p.db, {f"watcher:{r['name']}": r["every_s"] for r in self.p.db.q(
+            "SELECT name, every_s FROM schedules WHERE kind='command' AND enabled=1")})
         self.review_jev()
         settling = self.settling()
         core = self.cfg.get("core_provider") or "claude"
@@ -2039,11 +2040,16 @@ class Daemon:
         gate = self.gates.get(core)
         if gate and not gate.allow_optional:
             return f"skipped: budget {gate.level}"
+        # A debounced schedule keeps its period owed while it waits on its budget or its own open run.
+        held = "deferred" if sched.debounce_s(s["name"], payload) else "skipped"
         if s["budget_usd_day"] is not None and sched.spent_today(db, s["name"]) >= float(s["budget_usd_day"]):
-            return "skipped: daily budget used"
+            return f"{held}: daily budget used"
         if db.one("SELECT id FROM tasks WHERE origin='schedule' AND labels=? AND status NOT IN "
                   "('done','failed','cancelled')", (json.dumps([s["name"]]),)):
-            return "skipped: previous run still open"
+            return f"{held}: previous run still open"
+        duplicate, evidence = sched.debounce_gate(db, s["name"], payload)
+        if duplicate:
+            return duplicate
         # A review of a period with no work and no user message would report that nothing moved.
         # The built-in daily review opts in by name, so projects created before the flag get it too.
         if payload.get("skip_if_idle", s["name"] == "daily-review") and s["last_run"] and not self._active_since(
@@ -2063,19 +2069,24 @@ class Daemon:
                 spec += "\n\nUnblocking quality:\n" + "\n".join(f"- {line}" for line in unblock.lines(db))
             except Exception as e:   # a metric must not keep the review from starting
                 log(self.p, f"unblocking metrics failed: {type(e).__name__}: {e}")
-        db.add_task(f"[{s['name']}] {s['description'][:120] or 'recurring task'}", spec, kind=payload.get("kind", "work"),
-                    tier=payload.get("tier", "standard"), priority=int(payload.get("priority", 4)),
-                    budget_usd=s["budget_usd_day"], origin="schedule", labels=[s["name"]])
+        with db.tx():   # the evidence is the state at enqueue: what changes during the run stays new
+            tid = db.add_task(f"[{s['name']}] {s['description'][:120] or 'recurring task'}", spec,
+                              kind=payload.get("kind", "work"), tier=payload.get("tier", "standard"),
+                              priority=int(payload.get("priority", 4)), budget_usd=s["budget_usd_day"],
+                              origin="schedule", labels=[s["name"]])
+            if evidence is not None:
+                sched.record_evidence(db, s["name"], tid, evidence)
         return "queued"
 
     def _active_since(self, since: float, schedule: str) -> bool:
-        """Whether any worker ran, other than this schedule's own, or the user wrote, since `since`."""
+        """Whether any worker ran or finished, other than this schedule's own, or the user wrote, since
+        `since`. A worker that started before and finished after counts: its outcome is new."""
         db = self.p.db
         return bool(db.one("SELECT id FROM messages WHERE direction='in' AND ts>?", (since,))
                     or db.one("SELECT runs.id FROM runs LEFT JOIN tasks ON tasks.id=runs.task "
-                              "WHERE runs.role!='coordinator' AND runs.started>? AND NOT "
+                              "WHERE runs.role!='coordinator' AND (runs.started>? OR runs.ended>?) AND NOT "
                               "(COALESCE(tasks.origin,'')='schedule' AND COALESCE(tasks.labels,'')=?)",
-                              (since, json.dumps([schedule]))))
+                              (since, since, json.dumps([schedule]))))
 
     def observe(self, source: str, text: str, hint: str | None = None, rewake_after_s: float | None = None,
                 repeat: bool = False) -> None:

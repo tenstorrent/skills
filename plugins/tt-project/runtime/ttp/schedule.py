@@ -10,6 +10,13 @@ A schedule that was missed while the machine slept runs once on wake, never once
 An llm schedule skipped because the budget gate holds optional work keeps its period open and
 retries every half hour (or its own period, if shorter) until the gate allows it.
 
+An llm schedule with a debounce (`debounce_h`; the daily review has 2 h by default) records the
+owner/user evidence it was queued on. A trigger within the debounce of that run's successful end,
+on the same evidence, is skipped: the review would repeat itself. A failed or cancelled run never
+earns it, and evidence that changed (a task moved, the user wrote) runs again. Such a schedule
+also keeps its period owed while its previous run is open or its daily budget is used, and
+retries every half hour instead of a full period on.
+
 A project may keep its schedules in `harness/schedules.json` (the format of the template's
 recurring.json), so every change to them is a commit in the harness. Once that file exists it is
 the source of truth: the daemon applies it at start and whenever it changes (a schedule missing
@@ -80,9 +87,14 @@ def budget_skipped(status: str | None) -> bool:
     return bool(status) and status.startswith("skipped: budget ")
 
 
+def deferred(status: str | None) -> bool:
+    """The run is owed but waits on its own open run or its daily budget (debounced schedules)."""
+    return bool(status) and status.startswith("deferred: ")
+
+
 def mark_ran(db: DB, sched: dict, status: str, now: float | None = None) -> None:
     now = now or time.time()
-    if budget_skipped(status):
+    if budget_skipped(status) or deferred(status):
         # Keep last_run so the period still counts as not run, and retry soon instead of a full period on.
         db.x("UPDATE schedules SET last_status=?, next_run=? WHERE name=?",
              (status, now + min(BUDGET_RETRY_S, sched["every_s"]), sched["name"]))
@@ -267,3 +279,52 @@ def write_file(p: Any, message: str, create: bool = False) -> bool:
     db.set_kv(_APPLIED, _sha(text))
     p.commit_harness([path], message)
     return True
+
+
+# Debounce of unchanged completions ------------------------------------------------------------
+DEBOUNCE_KEY = "schedule_evidence:"   # kv per schedule: {"task", "evidence"} of the run last queued
+DEFAULT_DEBOUNCE_H = {"daily-review": 2.0}
+
+
+def debounce_s(name: str, payload: dict) -> float:
+    """The schedule's debounce in seconds; 0 when it has none (`debounce_h` null or 0 turns it off)."""
+    hours = payload.get("debounce_h", DEFAULT_DEBOUNCE_H.get(name))
+    try:
+        return max(0.0, float(hours) * 3600) if hours is not None else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def evidence(db: DB) -> str:
+    """A digest of what a review looks at: the tasks the owner and user care about (not schedules'
+    own runs) with their outcome, constraints and deferrals, and the last message from the user.
+    Spend and timestamps are left out, so accounting alone never counts as a change."""
+    tasks = db.q("SELECT id, status, spec, result, blocked_reason, depends_on, not_before FROM tasks "
+                 "WHERE origin!='schedule' ORDER BY id")
+    user = db.one("SELECT MAX(id) id FROM messages WHERE direction='in'")
+    return _sha(json.dumps([tasks, user and user["id"]], sort_keys=True, default=str))
+
+
+def debounce_gate(db: DB, name: str, payload: dict, now: float | None = None) -> tuple[str, str | None]:
+    """(skip reason or "", the evidence digest to record with a run queued now; None without a debounce).
+
+    Only a run that ended done, within the debounce, on the evidence it was queued on, makes a
+    trigger a duplicate. A missing or older record never does."""
+    window = debounce_s(name, payload)
+    if not window:
+        return "", None
+    now = time.time() if now is None else now
+    digest = evidence(db)
+    last = db.kv(DEBOUNCE_KEY + name) or {}
+    task = db.task(int(last["task"])) if isinstance(last, dict) and str(last.get("task", "")).isdigit() else None
+    if not task or task["status"] != "done" or last.get("evidence") != digest:
+        return "", digest
+    run = db.one("SELECT MAX(ended) e FROM runs WHERE task=? AND ended IS NOT NULL", (task["id"],))
+    ended = float(run["e"]) if run and run["e"] else None
+    if ended is None or not 0 <= now - ended < window:
+        return "", digest
+    return f"skipped: last run done {(now - ended) / 3600:.1f} h ago on unchanged evidence", digest
+
+
+def record_evidence(db: DB, name: str, task_id: int, digest: str) -> None:
+    db.set_kv(DEBOUNCE_KEY + name, {"task": task_id, "evidence": digest})
