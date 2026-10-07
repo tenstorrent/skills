@@ -18990,6 +18990,8 @@ DURABLE_EXEMPT = {
     ("project.py", 'open(path, "a")'): "inside durable_append",
     ("release.py", "os.replace(tmp, cur)"): "a symlink swap; the directory is synced after",
     ("release.py", "upgrade.log"): "a log",
+    ("service.py", "restart.log"): "a log",
+    ("service.py", "os.replace(req, taken)"): "claims a restart request for one process; a reboot restarts the daemon anyway",
     ("push.py", 'open(log, "ab")'): "a detached push's log; its outcome goes to the marker, durably",
     ("batch.py", "path.write_bytes(text.encode())"): "git merge-file's inputs, in a temporary directory removed after",
     ("daemon.py", "daemon.log"): "a log",
