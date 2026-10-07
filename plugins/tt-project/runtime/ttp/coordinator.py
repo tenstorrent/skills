@@ -1283,9 +1283,10 @@ def effort_triggers(db, cfg: dict, event_ids: list[int], wake_due: str | None,
               % ",".join("?" * len(EFFORT_SEVERITIES)), (last, *EFFORT_SEVERITIES)):
         add("high severity alert")
     # A task that keeps failing or coming back waiting, counted over 24 h for the tasks heard from
-    # since the last turn. Waits: only external ones (unblock.counted_wait). They raise when the
-    # task's normalized wait reason changes, once when its current stint of waits passes 24 h, and
-    # at repeat_waits_24h waits in 24 h as a backstop for real loops.
+    # since the last turn. Waits: only external ones (unblock.counted_wait), and not routine waits on
+    # live jobs or locks (more than live_waits_max on the same ones in 24 h, or a stalled job log, count).
+    # They raise when the task's normalized wait reason changes, once when its current stint of waits
+    # passes 24 h, and at repeat_waits_24h waits in 24 h as a backstop for real loops.
     fails_at, waits_at = int(c.get("repeat_fails_24h", 2) or 0), int(c.get("repeat_waits_24h", 8) or 0)
     since = now - 86400
     waits_seen = dict(seen_before.get("waits") or {})
@@ -1296,7 +1297,7 @@ def effort_triggers(db, cfg: dict, event_ids: list[int], wake_due: str | None,
             db.one("SELECT COUNT(*) n FROM events WHERE task=? AND kind='task_failed' AND ts>?", (t["task"], since))["n"]
         if fails_at and fails >= fails_at:
             add("repeated failures")
-        if wait_raises(db, t["task"], waits_seen, waits_at, now):
+        if wait_raises(db, t["task"], waits_seen, waits_at, now, live_max(cfg)):
             add("repeated waits")
     seen["waits"] = {k: v for k, v in waits_seen.items()   # a finished task's waits are over
                      if (db.task(int(k)) or {}).get("status") not in TERMINAL_TASK_STATES}
@@ -1326,13 +1327,22 @@ def effort_triggers(db, cfg: dict, event_ids: list[int], wake_due: str | None,
     return out, seen
 
 
-def wait_raises(db, tid: int, waits_seen: dict, waits_at: int, now: float) -> bool:
+def live_max(cfg: dict) -> int:
+    """coordinator.live_waits_max: waits on the same live jobs or locks in 24 h that stay routine."""
+    try:
+        return max(0, int((cfg.get("coordinator") or {}).get("live_waits_max", unblock.LIVE_WAITS_MAX)))
+    except (TypeError, ValueError):
+        return unblock.LIVE_WAITS_MAX
+
+
+def wait_raises(db, tid: int, waits_seen: dict, waits_at: int, now: float,
+                live: int = unblock.LIVE_WAITS_MAX) -> bool:
     """Whether task `tid`'s external waits make a tricky turn, updating its entry in `waits_seen`
     ({reason, since, aged}): its normalized wait reason changed from its previous wait (the one
     seen by the last turn, else the previous in the stint), its stint (external waits in a row,
     the same wait's cheap wakes skipped; a self-wait or any other hand-off ends it) began over
     24 h ago (once per stint), or `waits_at` or more external waits in 24 h (0: no backstop)."""
-    rows, stint = wait_stint(db, tid, now)
+    rows, stint = wait_stint(db, tid, now, live)
     key = str(tid)
     if not stint:
         waits_seen.pop(key, None)
@@ -1344,21 +1354,23 @@ def wait_raises(db, tid: int, waits_seen: dict, waits_at: int, now: float) -> bo
     prev = before.get("reason") or (unblock.wait_reason(stint[1]) if len(stint) > 1 else reason)
     aged = now - start > 86400
     waits_seen[key] = {"reason": reason, "since": start, "aged": aged}
-    count = sum(1 for e in rows if e["ts"] > now - 86400 and e["kind"] == "task_waiting" and unblock.counted_wait(e))
+    count = sum(1 for i, e in enumerate(rows) if e["ts"] > now - 86400 and e["kind"] == "task_waiting"
+                and unblock.counted_wait(e, rows[i + 1:], live))
     return reason != prev or (aged and not before.get("aged")) or bool(waits_at and count >= waits_at)
 
 
-def wait_stint(db, tid: int, now: float) -> tuple[list, list]:
-    """Task `tid`'s recent hand-off events, newest first, and its current stint of external waits
-    (newest first; the same wait's cheap wakes skipped): empty when its last hand-off was no such wait."""
+def wait_stint(db, tid: int, now: float, live: int = unblock.LIVE_WAITS_MAX) -> tuple[list, list]:
+    """Task `tid`'s recent hand-off events, newest first, and its current stint of counted waits
+    (unblock.counted_wait, `live` its live_max; newest first; the same wait's cheap wakes skipped):
+    empty when its last hand-off was no such wait."""
     rows = db.q("SELECT ts, kind, text, data FROM events WHERE task=? AND ts>? AND kind IN "
                 f"({','.join('?' * len(STINT_KINDS))}) ORDER BY ts DESC, id DESC",
                 (tid, now - STINT_LOOKBACK_S, *STINT_KINDS))
     stint = []
-    for e in rows:
+    for i, e in enumerate(rows):
         if e["kind"] == "task_waiting" and unblock.ESCALATED_WAKE.search(e["text"] or ""):
             continue
-        if e["kind"] != "task_waiting" or not unblock.counted_wait(e):
+        if e["kind"] != "task_waiting" or not unblock.counted_wait(e, rows[i + 1:], live):
             break
         stint.append(e)
     return rows, stint

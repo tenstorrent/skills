@@ -106,7 +106,8 @@ def worth_asking(db: DB, cfg: dict, event_ids: list[int], msg_ids: list[int] | N
         elif r["severity"] in coord.EFFORT_SEVERITIES:
             why.add(f"{r['severity']} event")
         elif (r["kind"] == "task_waiting" and r["task"]
-              and (stint := coord.wait_stint(db, r["task"], now)[1]) and now - stint[-1]["ts"] >= wait_s):
+              and (stint := coord.wait_stint(db, r["task"], now, coord.live_max(cfg))[1])
+              and now - stint[-1]["ts"] >= wait_s):
             why.add(f"waiting over {wait_s / 3600:g} h")
             key = f"w{r['task']}:{stint[-1]['ts']}"   # one raise per stint, however often it re-waits
         else:

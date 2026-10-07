@@ -1745,10 +1745,18 @@ class Daemon:
         if waiting and new == "queued":
             # Self or external (unblock.classify_wait): only external waits count as stuck work.
             kind, why = ("self", "escalated wake") if extra.get("escalated_wake") else unblock.classify_wait(result)
+            data: dict = {"wait": kind, "why": why, "for": what}
+            if not extra.get("escalated_wake"):
+                try:   # its live jobs or locks (unblock.live_wait), read before the job can end
+                    live = unblock.live_wait(self.p, result)
+                except Exception as e:   # the record of the wait matters more
+                    log(self.p, f"could not read the live work #{task['id']} waits on: {e}")
+                    live = None
+                if live:
+                    data["live"] = live
             db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
                  (time.time(), f"task:{task['id']}", "task_waiting", "low",
-                  f"#{task['id']} {task['title']}: {reason}", json.dumps({"wait": kind, "why": why, "for": what}),
-                  "handled", task["id"]))
+                  f"#{task['id']} {task['title']}: {reason}", json.dumps(data), "handled", task["id"]))
             return
         if task["reply_chat"] and new in ("done", "failed", "blocked"):
             text = summary if new == "done" else f"(task #{task['id']} {new}) {summary}"

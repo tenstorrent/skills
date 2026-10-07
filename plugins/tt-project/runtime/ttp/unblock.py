@@ -14,6 +14,11 @@ Waits are self or external (classify_wait). A self-wait is the task's own progre
 starts a stuck episode nor counts toward the coordinator's 'repeated waits' trigger or a resource's
 waits, and it ends a waiting episode (the task moved on). The daily review lists self-waits apart.
 
+A wait whose retry_when only probes `ttp detach --check` jobs or `ttp lock --probe` resources is a wait
+on live work (live_wait). While the job runs (or the resource is not paused) such a wait is routine for
+the 'repeated waits' trigger, external or not, until the same jobs or locks were waited on more than
+coordinator.live_waits_max times in 24 h or, for jobs, their logs stopped growing since the last wait.
+
 Handed-back asks: a user message answers an ask when it names it (`#<id>`) after it was sent, or
 replies in its chat thread. The answer's part about that ask is matched against HANDBACK, a short
 phrase list of answers that give the decision back to the project.
@@ -21,8 +26,11 @@ phrase list of answers that give the decision back to the project.
 from __future__ import annotations
 
 import json
+import os
 import re
+import shlex
 import time
+from pathlib import Path
 from typing import Any
 
 from .db import DB
@@ -45,6 +53,8 @@ PLANNED_WINDOW = re.compile(
     r"|\b(window|period|delay)\s+(it|I|the task|this task|we)\s+(set|planned|chose)\b"
     r"|\bstart_(after|when)\b", re.I)
 WAIT_KINDS = ("self", "external")
+LIVE_WAITS_MAX = 6   # coordinator.live_waits_max: waits on the same live jobs or locks in 24 h that stay routine
+_SHELL_OPS = frozenset({"&&", "||", ";", "|", "&"})
 # A cheap wake that found work and runs again at once: the same wait going on, never a new one.
 ESCALATED_WAKE = re.compile(r"\bwoke at \w+ and found work; runs again now\b")
 # Tokens that change from one wait to the next without the reason changing: the next-try time,
@@ -121,10 +131,94 @@ def is_self_wait(raw: Any) -> bool:
     return wait_data(raw).get("wait") == "self"
 
 
-def counted_wait(ev: Any) -> bool:
-    """Whether a task_waiting event (a row with `data` and `text`) is an external wait that counts
-    as stuck: not a self-wait, and not a cheap wake that found work (older events lack the data)."""
-    return not is_self_wait(ev["data"]) and not ESCALATED_WAKE.search(ev["text"] or "")
+def counted_wait(ev: Any, older: Any = (), live_max: int = LIVE_WAITS_MAX) -> bool:
+    """Whether a task_waiting event (a row with `data` and `text`) counts toward 'repeated waits':
+    not a cheap wake that found work, and not routine live work (live_routine, given the task's
+    `older` waits, newest first); else an external wait counts and a self-wait does not (older
+    events lack the data and count as external)."""
+    if ESCALATED_WAKE.search(ev["text"] or ""):
+        return False
+    routine = live_routine(ev, older, live_max)
+    if routine is not None:
+        return not routine
+    return not is_self_wait(ev["data"])
+
+
+def wait_probes(retry_when: Any) -> tuple[list[str], list[str]] | None:
+    """The rc paths of `ttp detach --check` and the resources of `ttp lock --probe` in a retry_when,
+    when every command in it is one of these two; None otherwise."""
+    try:
+        toks = shlex.split(str(retry_when or ""))
+    except ValueError:
+        return None
+    rcs: list[str] = []
+    res: list[str] = []
+    cmd: list[str] = []
+    for tok in toks + [";"]:
+        if tok not in _SHELL_OPS:
+            cmd.append(tok)
+            continue
+        at = next((i for i, t in enumerate(cmd[1:], 1) if os.path.basename(cmd[i - 1]) == "ttp"
+                   and t in ("detach", "lock")), None)   # `ttp`, a path to it or `python3 -m ttp`
+        args = cmd[at:] if at else []
+        if len(args) >= 3 and args[:2] == ["detach", "--check"] and not any(a.startswith("-") for a in args[2:]):
+            rcs += args[2:]
+        elif len(args) == 3 and args[:2] == ["lock", "--probe"]:
+            res.append(args[2])
+        elif cmd:
+            return None
+        cmd = []
+    return (rcs, res) if rcs or res else None
+
+
+def live_wait(p: Any, result: dict | None) -> dict | None:
+    """What a waiting hand-off's live work is, for the task_waiting event's `data.live`: {"key",
+    "alive", "log"}; None when its retry_when probes anything else (wait_probes). `key` names the
+    jobs and locks; `alive` is whether a job still runs or no resource is paused; `log` is the jobs'
+    log bytes now (None without jobs). Read here, at the hand-off: later the job may be gone."""
+    probes = wait_probes((result or {}).get("retry_when") if isinstance(result, dict) else None)
+    if not probes:
+        return None
+    from . import locks as lk
+    rcs, res = probes
+    cfg = p.config()
+    paths = [Path(r) if os.path.isabs(r) else Path(p.base) / r for r in rcs]
+    locked = sorted({lk.canonical(cfg, r) for r in res})
+    alive = True
+    if paths:
+        alive = not all(lk.job_ended(x) for x in paths)
+    if locked:
+        paused = {lk.canonical(cfg, k) for k in p.db.paused_resources()}
+        alive = alive and not paused & set(locked)
+    log = None
+    if paths:
+        log = 0
+        for x in paths:
+            try:
+                log += x.with_suffix(".log").stat().st_size
+            except OSError:
+                pass
+    key = " ".join([f"job:{x}" for x in sorted(map(str, paths))] + [f"lock:{r}" for r in locked])
+    return {"key": key[:500], "alive": alive, "log": log}
+
+
+def live_routine(ev: Any, older: Any = (), live_max: int = LIVE_WAITS_MAX) -> bool | None:
+    """For a wait on live work that was alive at its hand-off: True while it is routine, False once
+    the same work was waited on more than `live_max` times in the 24 h before it (`older`: the
+    task's earlier events, newest first; 0 makes none routine) or its jobs' log did not grow since
+    the previous wait on them. None for any other wait."""
+    live = _note(ev["data"]).get("live")
+    if not isinstance(live, dict) or not live.get("alive") or not live.get("key"):
+        return None
+    if not live_max:
+        return False
+    same = [_note(o["data"]).get("live") or {} for o in older
+            if o["kind"] == "task_waiting" and o["ts"] > ev["ts"] - 86400]
+    same = [o for o in same if isinstance(o, dict) and o.get("key") == live["key"]]
+    if len(same) + 1 > live_max:
+        return False
+    before, now = (same[0].get("log") if same else None), live.get("log")
+    return not (isinstance(before, int) and isinstance(now, int) and now <= before)
 
 
 def wait_reason(ev: Any) -> str:

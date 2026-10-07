@@ -1512,6 +1512,102 @@ def test_the_daemon_records_whether_a_wait_is_self_or_external(env, monkeypatch,
         assert json.loads(ev["data"]) == want
 
 
+def test_waits_on_live_detach_jobs_or_locks_stay_routine_until_capped_or_stalled(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import unblock
+    db = p.db
+    db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    db.x("DELETE FROM messages WHERE direction='out'")
+    now = time.time()
+    db.set_kv("last_coordinator_turn", now - 60)
+    cfg = p.config()
+    cfg = {**cfg, "coordinator": {**cfg["coordinator"], "repeat_waits_24h": 3, "live_waits_max": 2}}
+    assert unblock.wait_probes("ttp detach --check /r/a.rc '/r/b c.rc'") == (["/r/a.rc", "/r/b c.rc"], [])
+    assert unblock.wait_probes("/x/bin/ttp lock --probe dev-a && python3 -m ttp lock --probe dev-b") == \
+        ([], ["dev-a", "dev-b"])
+    for other in ("ttp lock --probe dev-a && ssh h test -e /m", "ttp checks --result /r", "ttp detach --check", ""):
+        assert unblock.wait_probes(other) is None
+
+    def wait(tid, kind, live, ago):
+        db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
+             (now - ago, f"task:{tid}", "task_waiting", "low", f"#{tid} t: waiting for dev-a",
+              json.dumps({"wait": kind, "why": "lock" if kind == "external" else "detached jobs",
+                          "for": "dev-a", **({"live": live} if live else {})}), "handled", tid))
+
+    def trig():
+        return coord.effort_triggers(db, cfg, [], None, now=now)[0]
+
+    def finish(tid):
+        db.x("INSERT INTO events(ts,source,kind,text,status,task) VALUES(?,?,?,?,?,?)",
+             (now - 25, f"task:{tid}", "task_done", "done", "handled", tid))
+
+    # A lock that is not paused: its first live_waits_max waits are routine, the rest count as before.
+    lock = {"key": "lock:dev-a", "alive": True, "log": None}
+    t = db.add_task("waits its turn on a device", "s", origin="user")
+    for n in range(4):
+        wait(t, "external", lock, 100 - n)
+        assert trig() == []
+    wait(t, "external", lock, 50)
+    assert trig() == ["repeated waits"]
+    off = {**cfg, "coordinator": {**cfg["coordinator"], "live_waits_max": 0}}   # 0: all count, as before
+    t0 = db.add_task("the same without the skip", "s", origin="user")
+    for n in range(3):
+        wait(t0, "external", lock, 40 - n)
+    assert "repeated waits" in coord.effort_triggers(db, off, [], None, now=now)[0]
+    finish(t)
+    finish(t0)
+    # A paused lock is not live work: its waits count from the first.
+    paused = db.add_task("waits on a paused device", "s", origin="user")
+    for n in range(3):
+        wait(paused, "external", {**lock, "alive": False}, 30 - n)
+    assert trig() == ["repeated waits"]
+    finish(paused)
+    # A detached job whose log grows stays routine (a self-wait); one whose log stopped counts.
+    job = db.add_task("waits on its detached driver", "s", origin="user")
+    for n, size in enumerate((10, 20)):
+        wait(job, "self", {"key": "job:/r/a.rc", "alive": True, "log": size}, 20 - n)
+    assert trig() == []
+    rows, stint = coord.wait_stint(db, job, now, 2)
+    assert stint == []
+    wait(job, "self", {"key": "job:/r/a.rc", "alive": True, "log": 20}, 10)   # no new output
+    rows, stint = coord.wait_stint(db, job, now, 2)
+    assert len(stint) == 1 and unblock.counted_wait(rows[0], rows[1:], 2)
+    # A job that already ended at the hand-off is a plain self-wait again: not counted.
+    ended = db.add_task("its job ended", "s", origin="user")
+    wait(ended, "self", {"key": "job:/r/b.rc", "alive": False, "log": 5}, 5)
+    assert coord.wait_stint(db, ended, now, 2)[1] == []
+
+
+def test_the_daemon_records_the_live_work_a_wait_probes(env, monkeypatch, tmp_path):
+    p = make(env)
+    from ttp import locks as lk
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    rc = tmp_path / "drv.rc"
+    rc.with_suffix(".log").write_text("step 1\n")
+    held = lk.try_take([lk.job_lock(rc)], "test job")
+    try:
+        cases = ((f"ttp detach --check {rc}", {"key": f"job:{rc}", "alive": True, "log": 7}),
+                 ("ttp lock --probe dev-a", {"key": "lock:dev-a", "alive": True, "log": None}),
+                 ("ttp lock --probe dev-b", {"key": "lock:dev-b", "alive": False, "log": None}),
+                 ("ssh h test -e /m", None))
+        p.db.set_kv("paused_resources", {"dev-b": {"reason": "maintenance", "since": time.time()}})
+        for probe, want in cases:
+            monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps({"status": "waiting", "summary": "later",
+                                                              "retry_when": probe, "retry_after_s": 600}))
+            tid = p.db.add_task(f"waits on {probe}", "s", kind="work", tier="light", origin="user")
+            assert _run_until(d, p, lambda: p.db.one("SELECT id FROM events WHERE kind='task_waiting' AND task=?",
+                                                     (tid,)))
+            data = json.loads(p.db.one("SELECT data FROM events WHERE kind='task_waiting' AND task=?", (tid,))["data"])
+            assert data.get("live") == want, probe
+    finally:
+        held.close()
+    from ttp import unblock
+    p.db.x("DELETE FROM events")
+    assert unblock.live_wait(p, {"retry_when": f"ttp detach --check {rc}"})["alive"] is False   # its process is gone
+
+
 def test_the_daily_review_gets_the_unblocking_quality_lines(env):
     p = make(env)
     from ttp import daemon as dm
