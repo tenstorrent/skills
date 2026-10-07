@@ -18569,11 +18569,11 @@ def test_a_routine_turn_escalates_once_and_the_rerun_cannot_escalate(env, monkey
     assert k["unblock"] == "" and k["note"]["triggers"] == [] and "effort: routine" in args[1] \
         and "`escalate`" in args[1]
     esc = SimpleNamespace(structured={"actions": [{"type": "escalate", "why": "the hand-off contradicts the plan"},
-                                                  {"type": "notify", "text": "not applied"}], "summary": ""},
+                                                  {"type": "noop"}], "summary": ""},
                           error="", final_text="")
     d._finish_coordinator({"dir": "x", "id": 1, "effort": "low"}, esc, "ok", k["note"])
     assert p.db.one("SELECT COUNT(*) n FROM events WHERE status='queued'")["n"] == 1, "its batch stays queued"
-    assert not p.db.one("SELECT id FROM messages WHERE text='not applied'"), "an escalating turn decides nothing"
+    assert not p.db.kv(coord.REJECTED_KEY), "a taken escalation is no rejection"
     assert p.db.kv(coord.ESCALATIONS_KEY)["n"] == 1
     # The rerun starts at once (no debounce, batch hold or idle wait), raised, with the same batch.
     d.maybe_coordinate()
@@ -18588,11 +18588,16 @@ def test_a_routine_turn_escalates_once_and_the_rerun_cannot_escalate(env, monkey
     assert p.db.one("SELECT id FROM messages WHERE text='decided'")
     assert not p.db.kv(coord.ESCALATE_KEY) and p.db.kv(coord.ESCALATIONS_KEY)["refused"] == 1
     assert p.db.one("SELECT COUNT(*) n FROM events WHERE status='queued'")["n"] == 0
+    assert p.db.kv(coord.REJECTED_KEY) == [
+        "escalate: refused (it came with other actions; escalate must be returned alone); decide at this effort"]
     # A routine turn over a batch already escalated once, or a raised turn, cannot escalate either.
     for note in ({**calls[0][1]["note"]}, {"events": [99], "unblock": "task_failed"}):
         d._finish_coordinator({"dir": "x", "id": 3, "effort": "low"}, esc, "ok", note)
         assert not p.db.kv(coord.ESCALATE_KEY), note
-    assert p.db.kv(coord.ESCALATIONS_KEY) == {"n": 1, "refused": 3, "batch": [calls[0][1]["note"]["events"], []]}
+    got = p.db.kv(coord.ESCALATIONS_KEY)
+    assert (got["n"], got["refused"], got["batch"]) == (1, 3, [calls[0][1]["note"]["events"], []])
+    assert p.db.kv(coord.REJECTED_KEY) == ["escalate: refused (this turn already ran at raised effort); "
+                                           "decide at this effort"]
     clock[0] += 600
     n = len(calls)
     d.maybe_coordinate()
@@ -18603,6 +18608,89 @@ def test_a_routine_turn_escalates_once_and_the_rerun_cannot_escalate(env, monkey
     assert not coord.can_raise_effort(d.cfg, "light")
     d._finish_coordinator({"dir": "x", "id": 4, "effort": "low"}, esc, "ok", {"events": [100]})
     assert not p.db.kv(coord.ESCALATE_KEY)
+
+
+def _escalate_turn(env, monkeypatch, pin=""):
+    """A daemon whose turns are recorded instead of started, with one queued routine event."""
+    p = make(env)
+    from ttp.daemon import Daemon
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    if pin:
+        p.set_config("coordinator.effort", pin)
+    d = Daemon(p.base)
+    d.update_gates()
+    clock = [time.time()]
+    calls = []
+    monkeypatch.setattr(d, "start_run", lambda *a, **k: calls.append((a, k)) or len(calls))
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+           (clock[0], "daemon", "task_done", "normal", "#1 done", "queued"))
+    clock[0] += 600
+    return p, d, clock, calls
+
+
+def test_a_pinned_routine_turn_is_not_offered_escalate_and_a_returned_one_is_rejected(env, monkeypatch):
+    from types import SimpleNamespace
+    from ttp import coordinator as coord
+    p, d, clock, calls = _escalate_turn(env, monkeypatch, pin="low")
+    d.maybe_coordinate()
+    (args, k), = calls
+    assert "`escalate`" not in args[1] and "effort: routine" not in args[1], "a pinned effort cannot be raised"
+    only = SimpleNamespace(structured={"actions": [{"type": "escalate", "why": "harder"}], "summary": ""},
+                           error="", final_text="")
+    d._finish_coordinator({"dir": "x", "id": 1, "effort": "low"}, only, "ok", k["note"])
+    assert not p.db.kv(coord.ESCALATE_KEY)
+    rejected = p.db.kv(coord.REJECTED_KEY)
+    assert rejected == ["escalate: refused (the coordinator's effort is pinned and cannot be raised); "
+                        "decide at this effort"]
+    assert p.db.one("SELECT id FROM events WHERE kind='rejected_actions'")
+    # It decided nothing, so its batch is not lost: the next turn gets it, with the refusal in STATE.
+    assert p.db.one("SELECT COUNT(*) n FROM events WHERE status='queued'")["n"] == 1
+    parts, _ = coord.digest_parts(p, {}, k["note"]["events"], [], None)
+    assert "escalate: refused (the coordinator's effort is pinned" in "\n".join(t for _, t in parts), \
+        "the next digest shows the refusal"
+
+
+def test_escalate_is_not_offered_on_a_raised_batch_or_one_escalated_before(env, monkeypatch):
+    from ttp import coordinator as coord
+    p, d, clock, calls = _escalate_turn(env, monkeypatch)
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+           (clock[0] - 600, "daemon", "task_blocked", "normal", "#2 blocked", "queued"))
+    d.maybe_coordinate()
+    (args, k), = calls
+    assert k["unblock"] and "effort: raised" in args[1] and "`escalate`" not in args[1]
+    # A routine batch that was escalated once (its rerun handed it back) is not offered it again.
+    p.db.x("UPDATE events SET status='handled'")
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+           (clock[0], "daemon", "task_done", "normal", "#3 done", "queued"))
+    eid = p.db.one("SELECT MAX(id) id FROM events WHERE status='queued'")["id"]
+    p.db.set_kv(coord.ESCALATIONS_KEY, {"n": 1, "batch": [[eid], []]})
+    clock[0] += 600
+    d.maybe_coordinate()
+    args, k = calls[-1]
+    assert len(calls) == 2 and not k["unblock"] and "`escalate`" not in args[1]
+
+
+def test_a_repeated_refused_escalate_requeues_its_batch_once(env, monkeypatch):
+    from types import SimpleNamespace
+    from ttp import coordinator as coord
+    p, d, clock, calls = _escalate_turn(env, monkeypatch, pin="low")
+    only = SimpleNamespace(structured={"actions": [{"type": "escalate", "why": "harder"}], "summary": ""},
+                           error="", final_text="")
+    queued = lambda: p.db.one("SELECT COUNT(*) n FROM events WHERE status='queued'")["n"]
+    d.maybe_coordinate()
+    d._finish_coordinator({"dir": "x", "id": 1, "effort": "low"}, only, "ok", calls[-1][1]["note"])
+    assert queued() == 1, "requeued once"
+    clock[0] += 600
+    d.maybe_coordinate()
+    assert len(calls) == 2 and calls[-1][1]["note"]["events"] == calls[0][1]["note"]["events"]
+    d._finish_coordinator({"dir": "x", "id": 2, "effort": "low"}, only, "ok", calls[-1][1]["note"])
+    assert queued() == 0, "the same batch refused again is handled, not requeued forever"
+    assert p.db.kv(coord.ESCALATIONS_KEY)["refused"] == 2
+    assert p.db.one("SELECT id FROM events WHERE kind='rejected_repeat'"), "the repeat is flagged once"
+    clock[0] += 600
+    d.maybe_coordinate()
+    assert len(calls) == 2, "no loop: nothing queued, no new turn"
 
 
 def test_a_pinned_coordinator_effort_wins_over_the_triggers(env):

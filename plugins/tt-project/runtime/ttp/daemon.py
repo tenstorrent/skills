@@ -1383,15 +1383,16 @@ class Daemon:
             return
         db.set_kv("coordinator_failures", 0)
         esc = [a for a in actions if isinstance(a, dict) and a.get("type") == "escalate"]
+        refused: list[str] = []
+        requeue = False
         if esc:
             actions = [a for a in actions if not (isinstance(a, dict) and a.get("type") == "escalate")]
             counts = db.kv(coord.ESCALATIONS_KEY, {}) or {}
-            # Once per batch, from a routine turn only, and only when it would raise the effort: the
-            # rerun (or any raised turn) decides, so escalation cannot loop.
+            # Once per batch, from a routine turn only, alone, and only when it would raise the effort:
+            # the rerun (or any raised turn) decides, so escalation cannot loop.
             batch = [sorted(note.get("events") or []), sorted(note.get("messages") or [])]
-            if not note.get("escalated") and not note.get("unblock") and batch != counts.get("batch") and \
-                    coord.can_raise_effort(self.cfg, (self.cfg.get("coordinator") or {}).get("tier", "light"),
-                                           r.get("effort") or ""):
+            why_not = self._escalate_refusal(r, note, actions, batch, counts)
+            if not why_not:
                 why = str(esc[0].get("why") or esc[0].get("reason") or esc[0].get("text") or "")[:300]
                 db.set_kv(coord.ESCALATE_KEY, {"run": r.get("id"), "why": why, "ts": time.time(),
                                                **({"due": note["wake_due"]} if note.get("wake_due") else {})})
@@ -1400,8 +1401,22 @@ class Daemon:
                 # Jev called it routine (if it was asked), and the turn found it was not
                 self._settle_coord_check(checked, "escalated", actions, [])
                 return   # its messages and events stay queued for the rerun
-            db.set_kv(coord.ESCALATIONS_KEY, {**counts, "refused": int(counts.get("refused", 0)) + 1})
-            log(self.p, f"coordinator turn {r.get('id')} asked to escalate again; it decides at this effort")
+            refused = [f"escalate: refused ({why_not}); decide at this effort"]
+            # A turn that returned only a refused escalate decided nothing: its batch goes to the next
+            # turn once, with the refusal in its digest. An item requeued before is handled as usual.
+            ids = set(batch[0]) | {f"m{i}" for i in batch[1]}
+            before = set(counts.get("requeued") or [])
+            requeue = not actions and bool(ids) and not (ids & before)
+            db.set_kv(coord.ESCALATIONS_KEY, {**counts, "refused": int(counts.get("refused", 0)) + 1,
+                                              "requeued": sorted(ids, key=str) if requeue else
+                                              counts.get("requeued") or []})
+            log(self.p, f"coordinator turn {r.get('id')} escalation refused ({why_not})"
+                + ("; its batch goes to the next turn" if requeue else ""))
+        if requeue:
+            self._record_rejections(refused)
+            self._settle_coord_check(checked, status, actions, refused, float(getattr(usage, "cost_usd", 0) or 0))
+            db.set_kv("last_coordinator_summary", {"ts": time.time(), "summary": (out or {}).get("summary", "")})
+            return
         default_chat = note.get("default_chat")
         problems = coord.apply(self.p, actions, default_chat=default_chat, user_turn=bool(note.get("messages")),
                                turn=r.get("id"), messages=note.get("messages") or [])
@@ -1411,9 +1426,25 @@ class Daemon:
         evs = note.get("events", [])
         if evs:
             db.x(f"UPDATE events SET status='handled' WHERE id IN ({','.join('?' * len(evs))})", evs)
+        problems = refused + list(problems)
         self._record_rejections([x[:500] for x in problems])
         self._settle_coord_check(checked, status, actions, problems, float(getattr(usage, "cost_usd", 0) or 0))
         db.set_kv("last_coordinator_summary", {"ts": time.time(), "summary": (out or {}).get("summary", "")})
+
+    def _escalate_refusal(self, r: dict, note: dict, actions: list, batch: list, counts: dict) -> str:
+        """Why a turn's `escalate` is refused, or "" when its batch reruns at high effort."""
+        if [a for a in actions if not (isinstance(a, dict) and a.get("type") == "noop")]:
+            return "it came with other actions; escalate must be returned alone"
+        tier = (self.cfg.get("coordinator") or {}).get("tier", "light")
+        if not coord.can_raise_effort(self.cfg, tier):
+            return "the coordinator's effort is pinned and cannot be raised"
+        if note.get("escalated") or note.get("unblock"):
+            return "this turn already ran at raised effort"
+        if batch == counts.get("batch"):
+            return "this batch was already escalated once"
+        if not coord.can_raise_effort(self.cfg, tier, r.get("effort") or ""):
+            return "this turn already ran at the highest effort a raise gives"
+        return ""
 
     def _settle_coord_check(self, checked: dict, status: str, actions: list | None = None,
                             problems: list[str] | None = None, turn_cost: float = 0.0) -> None:
@@ -2194,9 +2225,14 @@ class Daemon:
             parts, shown = coord.digest_parts(self.p, gates, [e["id"] for e in evs], [m["id"] for m in msgs],
                                               None if unblock else (db.kv(coord.DIGEST_SEEN_KEY) or {}))
             prompt = "\n".join(text for _, text in parts)
+            # `escalate` is offered only where the daemon would take it: a routine turn that a raise
+            # would change, not a rerun, over a batch not escalated before (Daemon._escalate_refusal).
+            batch = [sorted(e["id"] for e in evs), sorted(m["id"] for m in msgs)]
+            offer = can_raise and not unblock and not esc and \
+                batch != (db.kv(coord.ESCALATIONS_KEY, {}) or {}).get("batch")
             prompt += ("\n\nThis turn's effort: raised (" + unblock[:300] + ")." if raised else
-                       "\n\nThis turn's effort: routine." + (" If this batch is harder than routine bookkeeping, "
-                       "return only an `escalate` action: it reruns once at high effort." if can_raise else ""))
+                       "\n\nThis turn's effort: routine. If this batch is harder than routine bookkeeping, "
+                       "return only an `escalate` action: it reruns once at high effort." if offer else "")
             head, context = coord.prompt_parts(self.p)
             run_id = self.start_run("coordinator", prompt, provider, c.get("tier", "light"), str(self.p.base),
                            read_only=True, schema=coord.ACTIONS_SCHEMA, system=head, context=context,
