@@ -18914,11 +18914,12 @@ def test_escalate_is_not_offered_on_a_raised_batch_or_one_escalated_before(env, 
     assert len(calls) == 2 and not k["unblock"] and "`escalate`" not in args[1]
 
 
-def test_a_repeated_refused_escalate_requeues_its_batch_once(env, monkeypatch):
+@pytest.mark.parametrize("extra", [[], [{"type": "noop"}]])
+def test_a_repeated_refused_escalate_requeues_its_batch_once(env, monkeypatch, extra):
     from types import SimpleNamespace
     from ttp import coordinator as coord
     p, d, clock, calls = _escalate_turn(env, monkeypatch, pin="low")
-    only = SimpleNamespace(structured={"actions": [{"type": "escalate", "why": "harder"}], "summary": ""},
+    only = SimpleNamespace(structured={"actions": [{"type": "escalate", "why": "harder"}, *extra], "summary": ""},
                            error="", final_text="")
     queued = lambda: p.db.one("SELECT COUNT(*) n FROM events WHERE status='queued'")["n"]
     d.maybe_coordinate()

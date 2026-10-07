@@ -212,6 +212,11 @@ def disk_usage_line(b: dict, used: float) -> str:
 JEV_FUNDS_TEXT = ("The Jev account is out of credits. Screening and the other Jev checks fall back to rules "
                   "(more model calls, same coverage). Top up the Jev account to restore the savings.")
 
+def _decisions(actions: list) -> list:
+    """A coordinator turn's actions other than `noop`: what it decided."""
+    return [a for a in actions if not (isinstance(a, dict) and a.get("type") == "noop")]
+
+
 class Daemon:
     def __init__(self, base: str | Path):
         self.p = Project(base)
@@ -1411,7 +1416,7 @@ class Daemon:
             # turn once, with the refusal in its digest. An item requeued before is handled as usual.
             ids = set(batch[0]) | {f"m{i}" for i in batch[1]}
             before = set(counts.get("requeued") or [])
-            requeue = not actions and bool(ids) and not (ids & before)
+            requeue = not _decisions(actions) and bool(ids) and not (ids & before)
             db.set_kv(coord.ESCALATIONS_KEY, {**counts, "refused": int(counts.get("refused", 0)) + 1,
                                               "requeued": sorted(ids, key=str) if requeue else
                                               counts.get("requeued") or []})
@@ -1438,7 +1443,7 @@ class Daemon:
 
     def _escalate_refusal(self, r: dict, note: dict, actions: list, batch: list, counts: dict) -> str:
         """Why a turn's `escalate` is refused, or "" when its batch reruns at high effort."""
-        if [a for a in actions if not (isinstance(a, dict) and a.get("type") == "noop")]:
+        if _decisions(actions):
             return "it came with other actions; escalate must be returned alone"
         tier = (self.cfg.get("coordinator") or {}).get("tier", "light")
         if not coord.can_raise_effort(self.cfg, tier):
