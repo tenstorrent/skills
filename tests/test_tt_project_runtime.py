@@ -14987,8 +14987,14 @@ def test_review_pick_names_the_rule_and_keeps_risky_code_standard(env):
     # State, database, push, spend and upgrade code: standard however small.
     for path in ("runtime/ttp/db.py", "runtime/ttp/push.py", "runtime/ttp/pushq.py", "runtime/ttp/budget.py",
                  "src/billing.py", "app/localspend.py", "src/state.py", "src/game_state.rs", "migrations/0001.sql",
-                 "src/schema.sql", "src/upgrade.sh", "src/user_db.py"):
+                 "src/schema.sql", "src/upgrade.sh", "src/user_db.py", "plugins/tt-project/runtime/ttp/release.py",
+                 "plugins/tt-project/runtime/ttp/globalcap.py", "src/spend_cap.py"):
         assert review_pick({path: 1}, cfg) == ("standard", f"risky name {path}"), path
+    for path in ("plugins/tt-project/runtime/ttp/release.py", "plugins/tt-project/runtime/ttp/globalcap.py"):
+        assert review_pick({path: 30}, cfg) == ("standard", f"risky name {path}"), path
+    # The cap glob does not catch names that only contain "cap".
+    for path in ("src/capture.py", "src/escape.py", "src/caption.js"):
+        assert review_pick({path: 1}, cfg)[0] == "light", path
     assert review_pick({"src/db.py": 1}, {"review": {"risky_names": []}})[0] == "light"
     assert review_pick({"src/app.py": 1}, {"review": {"risky_names": ["app*"]}})[0] == "standard"
     assert review_pick({"tests/test_x.py": 1}, {"review": {"risky_paths": ["tests/*"]}}) \

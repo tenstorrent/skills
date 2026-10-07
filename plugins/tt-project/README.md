@@ -126,8 +126,8 @@ and preferences you add later become part of the project's charter and memory.
 - A runaway guard pauses a project whose hourly spend jumps far above its own norm.
 - A review runs light when the diff it checks touches no `review.risky_paths` glob and no code file
   with a risky name (`review.risky_names`: state, database, schema, migration, push, budget, billing,
-  spend and upgrade files by default; `[]` turns it off), and is docs and tests only or small
-  (`review.light_max_lines` non-doc lines, default 80); standard otherwise. Every re-review after a
+  spend, spend cap, release and upgrade files by default; `[]` turns it off), and is docs and tests
+  only or small (`review.light_max_lines` non-doc lines, default 80); standard otherwise. Every re-review after a
   failed review and every retry runs standard; only the coordinator picks deep. An optional
   `review.light_paths` glob list narrows light further: every non-doc file must match one of its
   globs (unset or empty: any path may go light). The review run's note records the pick and the

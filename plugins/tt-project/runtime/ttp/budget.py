@@ -542,10 +542,10 @@ DOC_SUFFIXES = (".md", ".markdown", ".rst", ".adoc")
 TEST_DIRS = {"test", "tests", "__tests__"}
 TEST_NAMES = ("test_*", "*_test.*", "*.test.*", "*_spec.*", "*.spec.*", "conftest.py")
 # A code file whose path has a part matching one of these globs holds state, the database, a push,
-# spend or an upgrade: its review runs standard however small the change. `review.risky_names`
+# spend, a spend cap, a release or an upgrade: its review runs standard however small the change. `review.risky_names`
 # replaces the list ([] turns it off); `review.risky_paths` adds a project's own paths.
 RISKY_NAMES = ("*state*", "db", "db.*", "*_db.*", "*database*", "*schema*", "*migrat*", "push*", "*budget*",
-               "*billing*", "*spend*", "*upgrade*")
+               "*billing*", "*spend*", "*cap.*", "*upgrade*", "*release*")
 
 
 def is_test_path(path: str) -> bool:
