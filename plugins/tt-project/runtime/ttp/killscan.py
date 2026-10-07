@@ -7,7 +7,9 @@ includes the worker's own tool shell when its command mentions the name. A scrip
 kills by pattern can so end the worker that runs it, or other workers and projects. A separate
 session or process group does not help: the match is by command line, not by group. The safe way to
 run such a script is with those commands shimmed out (`ttp killscan --shim <dir>`); a call by
-absolute path (`/usr/bin/pkill`) bypasses a shim, so it is flagged as such and must be edited out.
+absolute path (`/usr/bin/pkill`) bypasses a shim, so it is flagged as such and must be edited out,
+and so must `ps | grep` feeding kill. `pkill -P <pid>` (only that process's children) is not flagged;
+note that a shim stands in for it too, which leaves those children running.
 """
 from __future__ import annotations
 
@@ -18,29 +20,37 @@ from pathlib import Path
 # the commands that kill by name or pattern; a word of their own, not part of a path or word
 _CMD = r"(?<![\w./-])(?:/\S*/)?"
 _END = r"(?![\w.-])"
+_ARGS = r"(?=[^\n;|&]*\s"
 _RULES = [
     ("pkill -f matches every command line containing the pattern",
-     re.compile(_CMD + r"pkill" + _END + r"(?=[^\n;|&]*\s(?:-\w*f\w*|--full)\b)")),
+     re.compile(_CMD + r"pkill" + _END + _ARGS + r"(?:-\w*f\w*|--full)\b)")),
     ("pkill kills every process with that name", re.compile(_CMD + r"pkill" + _END)),
     ("killall kills every process with that name", re.compile(_CMD + r"killall" + _END)),
-    ("kill fed by pgrep/pidof kills by name or pattern",
-     re.compile(r"(?<![\w.-])kill\b[^\n;|&]*(?:\$\(|`)\s*(?:/\S*/)?(?:pgrep|pidof)\b"
-                r"|(?<![\w.-])(?:pgrep|pidof)\b[^\n;&]*\|\s*xargs\b[^\n;|&]*\bkill\b")),
+    # however its pids reach kill (a variable, a loop, xargs, a later line): all are shimmed
+    ("pgrep/pidof picks processes by name or pattern; a kill of its pids is a pattern kill",
+     re.compile(_CMD + r"(?:pgrep|pidof)" + _END)),
 ]
+# `pkill -P <pid>` kills only that process's children, not by name
+_PARENT = re.compile(_CMD + r"pkill" + _END + _ARGS + r"(?:-P|--parent)\b)")
+# ps output filtered by pattern, in a script that kills: no PATH shim stops this one
+_PS = ("ps | grep picks processes by pattern and a PATH shim does not stop a kill of its pids: "
+       "edit it out", re.compile(r"(?<![\w./-])(?:/\S*/)?ps" + _END + r"[^\n;&]*\|\s*(?:\S*/)?(?:e?grep|awk)\b"))
+_KILL = re.compile(r"(?<![\w.-])kill" + _END)
 _ABSOLUTE = re.compile(r"/\S*/(?:pkill|killall|pgrep|pidof)\b")
 SHIMMED = ("pkill", "killall", "pgrep", "pidof")
 
 
 def scan(text: str) -> list:
     """[(line number, reason, line)] for each line that kills by name or pattern. Comment lines
-    are skipped; one reason per line, the most specific."""
+    are skipped; one reason per line, the most specific. Every pgrep/pidof call is flagged, since
+    its pids can reach kill on any later line; `ps | grep` is flagged when the script kills at all."""
+    code = [(n, line.lstrip()) for n, line in enumerate(text.splitlines(), 1)]
+    code = [(n, c) for n, c in code if not c.startswith("#")]
+    kills = any(_KILL.search(c) for _, c in code)
     found = []
-    for n, line in enumerate(text.splitlines(), 1):
-        code = line.lstrip()
-        if code.startswith("#"):
-            continue
-        for reason, rule in _RULES:
-            m = rule.search(code)
+    for n, line in code:
+        for reason, rule in _RULES + ([_PS] if kills else []):
+            m = next((m for m in rule.finditer(line) if not _PARENT.match(line, m.start())), None)
             if m:
                 if _ABSOLUTE.search(m.group(0)):
                     reason += " (by absolute path: a PATH shim does not stop it)"

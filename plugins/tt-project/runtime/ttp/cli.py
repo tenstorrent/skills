@@ -1310,7 +1310,7 @@ def cmd_clip(a) -> None:
 
 
 def cmd_killscan(a) -> None:
-    """Check scripts for kills by name or pattern (`pkill -f`, `killall`, `kill $(pgrep -f ...)`) before
+    """Check scripts for kills by name or pattern (`pkill`, `killall`, `pgrep`/`pidof`, `ps | grep`) before
     running them: such a kill can match the worker's own tool shell. Exits 1 when one is found.
     `--shim <dir>` writes logging stand-ins for those commands; put <dir> first on PATH to run the
     script without them killing anything."""
@@ -2828,9 +2828,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("cmd", nargs=argparse.REMAINDER, help="the command, after --")
     s.set_defaults(fn=cmd_clip)
 
-    s = sub.add_parser("killscan", help="flag kills by name or pattern (pkill -f, killall, kill $(pgrep ...)) "
+    s = sub.add_parser("killscan", help="flag kills by name or pattern (pkill, killall, pgrep/pidof, ps | grep into kill) "
                                         "in scripts before running them; --shim writes stand-ins that only log")
-    s.add_argument("files", nargs="*", help="scripts to check; exits 1 if one kills by name or pattern")
+    s.add_argument("files", nargs="*", help="scripts to check; exits 1 if one kills by name or pattern, 2 if one cannot be read")
     s.add_argument("--shim", metavar="DIR", help="write logging stand-ins for pkill, killall, pgrep and pidof "
                                                  "into DIR (put DIR first on PATH)")
     s.set_defaults(fn=cmd_killscan)

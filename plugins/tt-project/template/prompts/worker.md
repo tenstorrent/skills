@@ -53,9 +53,10 @@ Other workers run at the same time as you, on other tasks of this project.
 - The same goes for scripts and test stubs you run. `pkill -f <name>` also matches your own tool
   shell when its command line holds <name>, and a separate session or process group does not
   protect it. Before running a script, check it with `ttp killscan <script>`: it flags `pkill`,
-  `killall` and `kill $(pgrep -f ...)`. If it finds one, run the script with logging stand-ins
-  first on PATH (`ttp killscan --shim <dir>`, then `PATH=<dir>:"$PATH" <script>`), and edit out
-  any call it marks as by absolute path.
+  `killall`, every `pgrep` or `pidof` (as in `kill $(pgrep -f ...)`) and `ps | grep` feeding a kill.
+  If it finds one, run the script with logging stand-ins first on PATH (`ttp killscan --shim <dir>`,
+  then `PATH=<dir>:"$PATH" <script>`), and edit out any `ps | grep` and any call it marks as by
+  absolute path: a stand-in cannot stop those.
 
 ## Shared clusters (Slurm and other machines other people use)
 

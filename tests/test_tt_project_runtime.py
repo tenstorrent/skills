@@ -27017,18 +27017,31 @@ KILLING_SCRIPT = "\n".join([
     "pkill -9f ttp-killscan-none", "pkill --full ttp-killscan-none", "killall ttp-killscan-none",
     "kill $(pgrep -f ttp-killscan-none)", "kill -9 `pidof ttp-killscan-none`",
     "pgrep -f ttp-killscan-none | xargs kill", "pkill ttp-killscan-none", "/usr/bin/pkill -f ttp-killscan-none",
+    "PID=$(pgrep -f ttp-killscan-none); kill \"$PID\"", "pids=$(pgrep -f ttp-killscan-none)", "kill $pids",
+    "for p in $(pgrep -f ttp-killscan-none); do kill $p; done",
+    "pgrep -f ttp-killscan-none | while read p; do kill \"$p\"; done", "pkill -P $$",
     "echo skill; kill \"$pid\"; ./pkill-helper; my-killall-notes", "exit 0"])
 
 
 def test_killscan_flags_every_kill_by_name_or_pattern_and_nothing_else(env):
     from ttp import killscan
     hits = {n: reason for n, reason, _ in killscan.scan(KILLING_SCRIPT)}
-    assert sorted(hits) == list(range(3, 12)), hits
+    # pgrep's pids reach kill through a variable, a later line, a loop or a pipe: the pgrep is flagged
+    assert sorted(hits) == [*range(3, 14), 15, 16], hits
     assert all("pkill -f" in hits[n] for n in (3, 4, 5, 11)), hits
-    assert "killall" in hits[6] and "pgrep/pidof" in hits[7] and "pgrep/pidof" in hits[8] and "pgrep/pidof" in hits[9]
+    assert "killall" in hits[6] and all("pgrep/pidof" in hits[n] for n in (7, 8, 9, 12, 13, 15, 16)), hits
     assert "pkill kills every process with that name" in hits[10]
     assert "absolute path" in hits[11] and "absolute path" not in hits[3]
     assert killscan.scan("kill \"$pid\"\nwait \"$pid\"\n") == []
+    # `pkill -P <pid>` kills only that process's children; a pattern kill after it on the line still counts
+    assert killscan.scan("pkill -P $$\npkill --parent \"$pid\" -f srv\n") == []
+    assert [n for n, _, _ in killscan.scan("pkill -P $$; pkill -f srv\n")] == [1]
+    # ps | grep feeding kill: a PATH shim cannot stop it, so the worker is told to edit it out
+    ps = killscan.scan("kill -9 $(ps aux | grep srv | awk '{print $2}')\n"
+                       "ps -ef | grep srv | grep -v grep | awk '{print $2}' | xargs kill\n"
+                       "pids=$(/bin/ps -eo pid,args | grep srv)\nkill $pids\n")
+    assert [n for n, _, _ in ps] == [1, 2, 3] and all("edit it out" in r for _, r, _ in ps), ps
+    assert killscan.scan("ps aux | grep srv\n") == [], "a ps | grep in a script that kills nothing is fine"
 
 
 def test_ttp_killscan_exits_1_on_a_hit_and_its_shims_kill_nothing(env, tmp_path):
@@ -27040,10 +27053,10 @@ def test_ttp_killscan_exits_1_on_a_hit_and_its_shims_kill_nothing(env, tmp_path)
     def ttp(*args):
         return subprocess.run([sys.executable, str(TTP), "killscan", *args], capture_output=True, text=True)
     r = ttp(str(script))
-    assert r.returncode == 1 and "stub.sh:3: pkill -f" in r.stdout and "9 kill(s)" in r.stdout, r.stdout
+    assert r.returncode == 1 and "stub.sh:3: pkill -f" in r.stdout and "13 kill(s)" in r.stdout, r.stdout
     r = ttp(str(clean))
     assert r.returncode == 0 and "no kills" in r.stdout, r.stdout
-    assert ttp(str(tmp_path / "missing.sh")).returncode != 0
+    assert ttp(str(tmp_path / "missing.sh")).returncode == 2, "unreadable is not a hit"
     shims = tmp_path / "shims"
     r = ttp("--shim", str(shims))
     assert r.returncode == 0 and f"PATH={shims}:" in r.stdout, r.stdout
