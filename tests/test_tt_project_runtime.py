@@ -100,7 +100,8 @@ def env(tmp_path, monkeypatch, _git_session):
     monkeypatch.setenv("TTP_HOST", "testhost")
     monkeypatch.setenv("TTP_TEST_POLL_S", "0.05")   # wait loops (runner, ttp lock, listen) check often
     monkeypatch.setenv("TTP_TEST_DISK_MOUNT", str(tmp_path))   # the disk guard's du stays in the test folder
-    for var in ("TTP_RUN_DIR", "TTP_TASK", "TTP_RUN_ID", "TTP_PROJECT"):   # tests may run inside a live run
+    # Tests may run inside a live run, under `ttp detach` (no in-run lock-wait cap) or `ttp lock`.
+    for var in ("TTP_RUN_DIR", "TTP_TASK", "TTP_RUN_ID", "TTP_PROJECT", "TTP_DETACHED", "TTP_LOCKS_HELD"):
         monkeypatch.delenv(var, raising=False)
     # A run's environment makes every git fsync its objects (project.git_fsync_env); test repositories
     # need no power-loss durability, and on some filesystems each `git add` then takes 20x longer.
