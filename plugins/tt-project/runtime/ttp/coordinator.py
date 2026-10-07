@@ -991,6 +991,14 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     payload = {**kept, **{k: a[k] for k in ("command", "timeout_s") if a.get(k)}}
                     if "rewake_after_h" in a:   # null: a known issue never wakes again by time alone
                         payload["rewake_after_h"] = _hours_or_none(a, "rewake_after_h")
+                    if "issue_lifecycle" in a:   # explicit_clear: receipts stay pending until acknowledged
+                        life = a.get("issue_lifecycle") or None
+                        if life not in (None, "default", scr.EXPLICIT_CLEAR):
+                            raise ValueError(f"schedule_set {a.get('name')!r} rejected: `issue_lifecycle` must be "
+                                             f"{scr.EXPLICIT_CLEAR!r}, 'default' or null; got {life!r}")
+                        payload.pop("issue_lifecycle", None)
+                        if life == scr.EXPLICIT_CLEAR:
+                            payload["issue_lifecycle"] = life
                     if enabled and not str(payload.get("command") or "").strip():
                         raise ValueError(f"schedule_set {a.get('name')!r} rejected: kind command needs `command`, "
                                          f"the shell command to run (and optionally `timeout_s`)")

@@ -69,14 +69,15 @@ class Verdict:
 
 
 def screen(db: DB, cfg: dict, source: str, text: str, hint: str | None = None, jev=None,
-           rewake_after_s: float | None = None, repeat: bool = False) -> Verdict:
+           rewake_after_s: float | None = None, repeat: bool = False, lifecycle: str | None = None) -> Verdict:
     """Record the observation as an issue and say whether the coordinator should wake for it.
 
     A known open issue wakes again when `repeat` is set (the watcher says each report is a new
     event), or when it was last seen more than `rewake_after_s` ago (it came back after a quiet
     spell). Without either, a known open issue stays quiet. An observation an active mute covers
-    is recorded and counted but never wakes (see mute)."""
-    v = _screen(db, cfg, source, text, hint, jev, rewake_after_s, repeat)
+    is recorded and counted but never wakes (see mute). `lifecycle` (RECEIPT or ERROR, from a
+    receipt source) is kept on the issue with its subject; see settle_receipts."""
+    v = _screen(db, cfg, source, text, hint, jev, rewake_after_s, repeat, lifecycle)
     m = count_muted(db, source, text, v.severity)
     if m and v.wake:
         v.wake, v.reason = False, f"muted ({v.reason})"
@@ -84,7 +85,7 @@ def screen(db: DB, cfg: dict, source: str, text: str, hint: str | None = None, j
 
 
 def _screen(db: DB, cfg: dict, source: str, text: str, hint: str | None, jev,
-            rewake_after_s: float | None, repeat: bool) -> Verdict:
+            rewake_after_s: float | None, repeat: bool, lifecycle: str | None = None) -> Verdict:
     now = time.time()
     floor = SEVERITY_RANK.get(cfg.get("screen", {}).get("wake_min_severity", "normal"), 1)
     judged: list[tuple[str, str, str, dict]] = []
@@ -98,7 +99,7 @@ def _screen(db: DB, cfg: dict, source: str, text: str, hint: str | None, jev,
     if conditions is None:
         title = text.strip().splitlines()[0][:160] if text.strip() else source
         v = _issue(db, fingerprint(source, text), source, title, None, hint, judge, floor, now,
-                   rewake_after_s, repeat)
+                   rewake_after_s, repeat, lifecycle)
         v.jev_out_of_funds = any(j[3].get("jev_out_of_funds") for j in judged)
         return v
     verdicts = []
@@ -108,7 +109,8 @@ def _screen(db: DB, cfg: dict, source: str, text: str, hint: str | None, jev,
             verdicts.append(_clear(db, fp, now))
             continue
         title = (f"{subject}: {cond}" if subject else cond)[:160]
-        verdicts.append(_issue(db, fp, source, title, title, hint, judge, floor, now, rewake_after_s, repeat))
+        verdicts.append(_issue(db, fp, source, title, title, hint, judge, floor, now, rewake_after_s, repeat,
+                               lifecycle, normalize(subject)))
     found = [v for v in verdicts if v.issue_id]
     best = next((v for v in verdicts if v.wake), None) or (found or verdicts)[0]
     best.severity = max((v.severity for v in found), key=lambda x: SEVERITY_RANK.get(x, 1), default=best.severity)
@@ -117,11 +119,12 @@ def _screen(db: DB, cfg: dict, source: str, text: str, hint: str | None, jev,
 
 
 def _issue(db: DB, fp: str, source: str, title: str, retitle: str | None, hint: str | None, judge, floor: int,
-           now: float, rewake_after_s: float | None, repeat: bool) -> Verdict:
+           now: float, rewake_after_s: float | None, repeat: bool, lifecycle: str | None = None,
+           subject: str | None = None) -> Verdict:
     row = db.one("SELECT * FROM issues WHERE fingerprint=?", (fp,))
     if row:
-        db.x("UPDATE issues SET last_seen=?, count=count+1, title=COALESCE(?, title) WHERE id=?",
-             (now, retitle, row["id"]))
+        db.x("UPDATE issues SET last_seen=?, count=count+1, title=COALESCE(?, title), lifecycle=?, subject=? "
+             "WHERE id=?", (now, retitle, lifecycle, subject, row["id"]))
         rank = SEVERITY_RANK.get(row["severity"], 1)
         seen_at = SEVERITY_RANK.get(hint or "", -1)
         if row["status"] == "fixed":
@@ -144,10 +147,10 @@ def _issue(db: DB, fp: str, source: str, title: str, retitle: str | None, hint: 
         return Verdict(reason != "known issue", row["severity"], reason, fp, row["id"], "dedupe")
 
     severity, verdict_src, reason, info = judge()
-    issue_id = db.x("INSERT INTO issues(fingerprint,source,first_seen,last_seen,count,title,severity,status,screen) "
-                    "VALUES(?,?,?,?,1,?,?,?,?)", (fp, source, now, now, title, severity,
-                                                   "open" if severity != "info" else "ignored",
-                                                   json.dumps({"by": verdict_src, "reason": reason, **info})))
+    issue_id = db.x("INSERT INTO issues(fingerprint,source,first_seen,last_seen,count,title,severity,status,screen,"
+                    "lifecycle,subject) VALUES(?,?,?,?,1,?,?,?,?,?,?)",
+                    (fp, source, now, now, title, severity, "open" if severity != "info" else "ignored",
+                     json.dumps({"by": verdict_src, "reason": reason, **info}), lifecycle, subject))
     if info.get("jev_call"):
         jevuse.set_ref(db, info["jev_call"], f"issue:{issue_id}")
     return Verdict(SEVERITY_RANK.get(severity, 1) >= floor, severity, reason, fp, issue_id, verdict_src)
@@ -266,6 +269,13 @@ QUIET_RUNS = 3   # a slower watcher's issue closes after this many of its period
 CLEARED_WHY = "the watcher reported it cleared"
 QUIET_WHY = "not seen for 24 h"
 CLEAN_RUN_WHY = "a watcher run reported nothing"
+# Receipt sources: a command schedule with issue_lifecycle "explicit_clear" reports items that stay
+# pending until acknowledged (receipts), so the quiet sweep leaves them open. Its run failures are
+# errors instead: they expire as usual and a successful run that does not report them clears them.
+EXPLICIT_CLEAR = "explicit_clear"
+RECEIPT, ERROR = "receipt", "error"
+REPAIRED_WHY = "a successful watcher run no longer reported it"
+REPLACED_WHY = "a newer outcome for the same subject replaced it"
 
 
 def watcher_conditions(source: str, text: str) -> list[tuple[str, str, bool]] | None:
@@ -307,10 +317,11 @@ def _clear(db: DB, fp: str, now: float) -> Verdict:
 
 
 def close_watcher_issues(db: DB, source: str | None = None, quiet_s: float | None = None,
-                         why: str = QUIET_WHY, now: float | None = None, skip: Any = ()) -> int:
+                         why: str = QUIET_WHY, now: float | None = None, skip: Any = (),
+                         keep_receipts: Any = ()) -> int:
     """Close open command-watcher issues: all of `source`'s, or those not seen for `quiet_s`, except
-    those of the sources in `skip`. Returns how many closed. Closing never wakes anyone; a later
-    sighting reopens the issue."""
+    those of the sources in `skip` and the receipts of the sources in `keep_receipts`. Returns how
+    many closed. Closing never wakes anyone; a later sighting reopens the issue."""
     now = time.time() if now is None else now
     sql, args = "UPDATE issues SET status='fixed', closed=?, cleared_why=? WHERE status='open'", [now, why]
     if source is not None:
@@ -320,20 +331,44 @@ def close_watcher_issues(db: DB, source: str | None = None, quiet_s: float | Non
     skip = list(skip)
     if skip:
         sql, args = sql + f" AND source NOT IN ({','.join('?' * len(skip))})", args + skip
+    keep = list(keep_receipts)
+    if keep:
+        sql, args = (sql + f" AND NOT (COALESCE(lifecycle,'')=? AND source IN ({','.join('?' * len(keep))}))",
+                     args + [RECEIPT] + keep)
     if quiet_s is not None:
         sql, args = sql + " AND last_seen<?", args + [now - quiet_s]
     return db.conn.execute(sql, args).rowcount
 
 
-def close_quiet_watcher_issues(db: DB, periods: dict[str, float], now: float | None = None) -> int:
+def close_quiet_watcher_issues(db: DB, periods: dict[str, float], now: float | None = None,
+                               receipts: Any = ()) -> int:
     """Close command-watcher issues not seen for 24 h, or for QUIET_RUNS periods of a watcher that runs
     less often (`periods`: source -> seconds between runs). A daily watcher that prints a pending item
-    every run (or misses a run) keeps it open, so it never closes and reopens with a wake each day."""
+    every run (or misses a run) keeps it open, so it never closes and reopens with a wake each day.
+    The receipts of the sources in `receipts` (explicit_clear) never close by time, however long the
+    daemon was down; their errors and everything else of theirs do."""
     slow = {src: QUIET_RUNS * float(every) for src, every in periods.items()
             if QUIET_RUNS * float(every) > WATCHER_QUIET_CLOSE_S}
-    n = close_watcher_issues(db, quiet_s=WATCHER_QUIET_CLOSE_S, now=now, skip=slow)
+    keep = list(receipts)
+    n = close_watcher_issues(db, quiet_s=WATCHER_QUIET_CLOSE_S, now=now, skip=slow, keep_receipts=keep)
     for src, quiet in slow.items():
-        n += close_watcher_issues(db, src, quiet_s=quiet, why=f"not seen for {quiet / 3600:g} h", now=now)
+        n += close_watcher_issues(db, src, quiet_s=quiet, why=f"not seen for {quiet / 3600:g} h", now=now,
+                                  keep_receipts=keep)
+    return n
+
+
+def settle_receipts(db: DB, source: str, since: float, subjects: Any, now: float | None = None) -> int:
+    """After a successful run of a receipt source that reported something (it began at `since`): close
+    the errors it no longer reported (repaired) and the receipts of each subject it reported that it no
+    longer reported (a newer outcome replaced them). Receipts of subjects it did not mention stay
+    pending. A closed one reported again reopens and wakes. Returns how many closed."""
+    now = time.time() if now is None else now
+    base = "UPDATE issues SET status='fixed', closed=?, cleared_why=? WHERE status='open' AND source=? AND last_seen<?"
+    n = db.conn.execute(base + " AND lifecycle=?", (now, REPAIRED_WHY, source, since, ERROR)).rowcount
+    subjects = sorted(set(subjects))
+    if subjects:
+        n += db.conn.execute(base + f" AND lifecycle=? AND subject IN ({','.join('?' * len(subjects))})",
+                             (now, REPLACED_WHY, source, since, RECEIPT, *subjects)).rowcount
     return n
 
 

@@ -485,8 +485,7 @@ class Daemon:
         self.update_gates()
         coord.expire_asks(self.p, hold=any(g.level == "red" for g in self.gates.values()))
         scr.expire_mutes(self.p.db)
-        scr.close_quiet_watcher_issues(self.p.db, {f"watcher:{r['name']}": r["every_s"] for r in self.p.db.q(
-            "SELECT name, every_s FROM schedules WHERE kind='command' AND enabled=1")})
+        self.sweep_watcher_issues()
         self.review_jev()
         settling = self.settling()
         core = self.cfg.get("core_provider") or "claude"
@@ -2046,34 +2045,57 @@ class Daemon:
                if status == "no command" else status)
         self.alert(key, f"Schedule {s['name']} failed twice in a row and does nothing until fixed: {why}", "high")
 
+    def sweep_watcher_issues(self) -> int:
+        """Close quiet command-watcher issues (each tick, before the schedules run). The receipts of
+        explicit_clear schedules stay open: see screen.settle_receipts."""
+        rows = self.p.db.q("SELECT name, every_s, payload FROM schedules WHERE kind='command' AND enabled=1")
+        return scr.close_quiet_watcher_issues(
+            self.p.db, {f"watcher:{r['name']}": r["every_s"] for r in rows},
+            receipts=[f"watcher:{r['name']}" for r in rows if _explicit_clear(r["payload"])])
+
     def _run_command_watcher(self, s: dict, payload: dict) -> str:
         cmd = payload.get("command")
         if not cmd:
             return "no command"
+        source = f"watcher:{s['name']}"
+        # A receipt source: what it reports stays pending until acknowledged; its failures are errors.
+        receipt, error = ((scr.RECEIPT, scr.ERROR) if payload.get("issue_lifecycle") == scr.EXPLICIT_CLEAR
+                          else (None, None))
         hours = payload.get("rewake_after_h", (self.cfg.get("screen") or {}).get("rewake_after_h", 6))
         try:
             rewake = float(hours) * 3600 if hours is not None else None
         except (TypeError, ValueError):
             rewake = 6 * 3600
+        started = time.time()
         try:
             out = subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=str(self.p.root),
                                  timeout=_watcher_timeout(payload), env={**os.environ, "PATH": service_path()})
         except subprocess.TimeoutExpired:
-            self.observe(f"watcher:{s['name']}", f"watcher command timed out: {cmd}", "normal",
-                         rewake_after_s=rewake)
+            self.observe(source, f"watcher command timed out: {cmd}", "normal", rewake_after_s=rewake,
+                         lifecycle=error)
             return "timeout"
         text = (out.stdout or "").strip()
-        if out.returncode not in (0, 1) and not text:
+        ok = out.returncode in (0, 1)
+        failed = not ok and not text   # the daemon reports the failure itself
+        if failed:
             text = f"watcher command failed rc={out.returncode}: {(out.stderr or '')[-500:]}"
         if not text:
             # Nothing to report: what this watcher reported before is over. A recurrence reopens it.
-            scr.close_watcher_issues(self.p.db, f"watcher:{s['name']}", why=scr.CLEAN_RUN_WHY)
+            scr.close_watcher_issues(self.p.db, source, why=scr.CLEAN_RUN_WHY)
             return "ok (0 observations)"
-        n = 0
+        n, subjects = 0, set()
         for obs in _observations(text):
-            self.observe(f"watcher:{s['name']}", obs.get("text", ""), obs.get("severity"),
-                         rewake_after_s=rewake, repeat=obs.get("repeat") is True)
+            body = obs.get("text", "")
+            # A receipt source's own failure lines ("error": true) are errors, not receipts.
+            kind = error if failed or obs.get("error") is True else receipt
+            self.observe(source, body, obs.get("severity"), rewake_after_s=rewake,
+                         repeat=obs.get("repeat") is True, lifecycle=kind)
+            if kind == scr.RECEIPT:
+                subjects.update(scr.normalize(subj) for subj, _, cleared in scr.watcher_conditions(source, body) or ()
+                                if not cleared)
             n += 1
+        if receipt and ok:
+            scr.settle_receipts(self.p.db, source, started, subjects)
         return f"ok ({n} observations)"
 
     def _schedule_llm(self, s: dict, payload: dict) -> str:
@@ -2131,10 +2153,10 @@ class Daemon:
                               (since, since, json.dumps([schedule]))))
 
     def observe(self, source: str, text: str, hint: str | None = None, rewake_after_s: float | None = None,
-                repeat: bool = False) -> None:
+                repeat: bool = False, lifecycle: str | None = None) -> None:
         if not text.strip():
             return
-        again = {"rewake_after_s": rewake_after_s, "repeat": repeat}
+        again = {"rewake_after_s": rewake_after_s, "repeat": repeat, "lifecycle": lifecycle}
         v = scr.screen(self.p.db, self.cfg, source, text, hint, jev=self.jev, **again)
         if v.jev_out_of_funds:
             self.alert("jev-funds", JEV_FUNDS_TEXT, "high")
@@ -3956,6 +3978,14 @@ def _with_system_prompt(provider: str, argv: list[str], path: Path) -> list[str]
     if provider == "claude":
         return argv + ["--safe-mode", "--strict-mcp-config", "--tools", "", "--system-prompt", path.read_text()]
     return argv
+
+
+def _explicit_clear(payload: str | None) -> bool:
+    """Whether a command schedule's stored payload opts into the receipt lifecycle."""
+    try:
+        return (json.loads(payload or "{}") or {}).get("issue_lifecycle") == scr.EXPLICIT_CLEAR
+    except (ValueError, AttributeError):
+        return False
 
 
 def _observations(text: str) -> list[dict]:

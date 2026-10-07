@@ -71,7 +71,7 @@ CREATE TABLE IF NOT EXISTS issues (
   id INTEGER PRIMARY KEY AUTOINCREMENT, fingerprint TEXT UNIQUE, source TEXT,
   first_seen REAL, last_seen REAL, count INTEGER DEFAULT 1, title TEXT,
   severity TEXT DEFAULT 'normal', status TEXT DEFAULT 'open', task INTEGER, screen TEXT,
-  closed REAL, cleared_why TEXT);
+  closed REAL, cleared_why TEXT, lifecycle TEXT, subject TEXT);
 
 CREATE TABLE IF NOT EXISTS schedules (
   name TEXT PRIMARY KEY, kind TEXT NOT NULL, every_s INTEGER NOT NULL, at TEXT,
@@ -152,6 +152,7 @@ class DB:
         self._migrate_ledger_account()
         self._migrate_run_session()
         self._migrate_jev_changed()
+        self._migrate_issue_lifecycle()
 
     def _migrate_ledger_account(self) -> None:
         """Ledger rows written without an account take the account of the run they booked: the run
@@ -186,6 +187,17 @@ class DB:
         with self.tx():
             if "changed" not in {r["name"] for r in self.q("PRAGMA table_info(jev_calls)")}:
                 self.x("ALTER TABLE jev_calls ADD COLUMN changed INTEGER")
+
+    def _migrate_issue_lifecycle(self) -> None:
+        # Receipt sources (a command schedule with issue_lifecycle explicit_clear) mark each issue a
+        # receipt or an error, with the subject it was reported under (see screen.py).
+        if "lifecycle" in {r["name"] for r in self.q("PRAGMA table_info(issues)")}:
+            return
+        with self.tx():
+            have = {r["name"] for r in self.q("PRAGMA table_info(issues)")}
+            for col in ("lifecycle", "subject"):
+                if col not in have:
+                    self.x(f"ALTER TABLE issues ADD COLUMN {col} TEXT")
 
     def _migrate_push_queue(self) -> None:
         if self.meta(PUSH_QUEUE_MIGRATION) is not None:
