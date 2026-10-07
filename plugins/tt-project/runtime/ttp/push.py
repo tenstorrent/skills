@@ -1157,11 +1157,19 @@ def _learn_merges(repo: Path, merges: list[list[str]]) -> None:
             _git(repo, "worktree", "prune")
 
 
+def descends(repo: Path, tip: str, head: str) -> bool:
+    """Whether `head` already has `tip` in its history, so it lands on it as a fast-forward."""
+    return _git(repo, "merge-base", "--is-ancestor", tip, head).returncode == 0
+
+
 def _rebase(repo: Path, tip: str) -> bool:
     """Rebase HEAD onto `tip`. A branch with merge commits (a review combining several branches)
     keeps them (--rebase-merges), and the conflicts they resolved are resolved again the same way
     rather than coming back; a conflict nothing resolved still stops it. False on a conflict, with
-    the rebase left for the caller to abort."""
+    the rebase left for the caller to abort. HEAD already on `tip` stays as it is (a fast-forward):
+    rebasing it could only rewrite its commits."""
+    if descends(repo, tip, "HEAD"):
+        return True
     merges = [line.split() for line in
               _git(repo, "rev-list", "--merges", "--parents", "HEAD", f"^{tip}").stdout.splitlines()]
     if not merges:

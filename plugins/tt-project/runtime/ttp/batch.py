@@ -735,10 +735,16 @@ class Batch:
         """Rebase the entry's commits up to `top` onto `onto` in the worktree, settling conflicts that
         need no judgment (the push checks then run on the result, as on any other): (new head, None),
         or (onto, conflicted files) after aborting a real one. The files and kinds settled go to
-        self._settling."""
+        self._settling. An entry already on `onto` goes as it is, and one with merges keeps them
+        (--rebase-merges): a plain rebase flattens a merge landing and rewrites its commits, so their
+        tags drop out."""
         wt = self.wt
         version_files = self.cfg["files"] if self.cfg else []
-        r = _git(wt, "rebase", "--no-keep-empty", onto, top)
+        if push.descends(wt, onto, top):
+            self._checkout(top)
+            return top, None
+        merges = ["--rebase-merges"] if _git(wt, "rev-list", "--merges", "-1", top, f"^{onto}").stdout.strip() else []
+        r = _git(wt, "rebase", "--no-keep-empty", *merges, onto, top)
         for _ in range(10000):
             if r.returncode == 0:
                 return _git(wt, "rev-parse", "HEAD").stdout.strip(), None

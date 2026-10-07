@@ -12586,6 +12586,47 @@ def test_push_keeps_a_conflict_the_branch_already_resolved_in_a_merge(env, monke
     assert len(_git_out(repo, "worktree", "list").splitlines()) == 1, "the scratch worktree is gone"
 
 
+def _tagged_merge(repo):
+    """A --no-ff merge of a task branch whose first commit is tagged; returns (merge, tagged)."""
+    _git_out(repo, "checkout", "-qb", "task")
+    _commit(repo, "a.txt", "a\n")
+    _git_out(repo, "tag", "task-done")
+    _commit(repo, "b.txt", "b\n")
+    _git_out(repo, "checkout", "-q", "-")
+    _git_out(repo, "merge", "-q", "--no-ff", "-m", "land task", "task")
+    return _git_out(repo, "rev-parse", "HEAD"), _git_out(repo, "rev-parse", "task-done")
+
+
+def test_push_lands_a_descendant_merge_as_it_is(env, monkeypatch):
+    """HEAD already descends from the target: no rebase, so a --no-ff landing keeps its merge and
+    the tagged task commits stay ancestors of the pushed branch."""
+    log = env["tmp"] / "checked"
+    p, repo, origin, other = _push_setup(env, monkeypatch, [f"git rev-parse HEAD >> {log}"])
+    _commit(repo, "base.txt", "base\n")   # a linear commit before the merge, as a review adds
+    merged, tagged = _tagged_merge(repo)
+    assert _ttp_push() == 0
+    assert _git_out(origin, "rev-parse", "proj") == merged == _git_out(repo, "rev-parse", "HEAD")
+    assert log.read_text().split() == [merged]
+    assert _git_out(origin, "merge-base", "--is-ancestor", tagged, "proj") == ""
+    assert _git_out(origin, "rev-list", "--merges", "--count", "proj") == "1"
+
+
+def test_push_rebases_a_stale_merge_keeping_it(env, monkeypatch):
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    merged, tagged = _tagged_merge(repo)
+    _commit(other, "late.txt", "late\n")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    moved = _git_out(origin, "rev-parse", "proj")
+    assert _ttp_push() == 0
+    pushed = _git_out(origin, "rev-parse", "proj")
+    assert pushed != merged and _git_out(origin, "merge-base", "--is-ancestor", moved, pushed) == ""
+    merges = _git_out(origin, "log", "--merges", "--format=%s", f"{moved}..proj").splitlines()
+    assert merges == ["land task"], "the merge was flattened"
+    assert sorted(_git_out(origin, "log", "--no-merges", "--format=%s", f"{moved}..proj").splitlines()) \
+        == ["edit a.txt", "edit b.txt"]
+    assert _git_out(origin, "show", "proj:b.txt") == "b" and _git_out(origin, "show", "proj:late.txt") == "late"
+
+
 def _plugin_commit(path, version, name, text):
     """Commit a file of plugin `p` and set both its manifests to `version`."""
     for m in (".claude-plugin", ".codex-plugin"):
@@ -13814,6 +13855,41 @@ def test_a_push_batch_lands_its_entries_with_one_bump_one_changeset_and_one_chec
         "- e3: edit plugins/p/f3.txt")
     assert m["phase"] == "finished" and m["after_push"] == {"status": "skipped", "reason": "delivery.after_push is not set"}
     assert not list((p.state / "locks").glob("*run-b1*")), "no lock file of the batch is left behind"
+
+
+def _merge_entry(repo, name):
+    """Entry `name`: a --no-ff merge, on origin/proj, of a task branch whose first commit is tagged."""
+    _entry(repo, f"{name}-task", {f"plugins/p/{name}a.txt": "a\n"})
+    _git_out(repo, "tag", f"{name}-done")
+    _commit(repo, f"plugins/p/{name}b.txt", "b\n")
+    _git_out(repo, "checkout", "-q", "-B", name, "origin/proj")
+    _git_out(repo, "merge", "-q", "--no-ff", "-m", f"land {name}", f"{name}-task")
+    return _git_out(repo, "rev-parse", "HEAD"), _git_out(repo, "rev-parse", f"{name}-done")
+
+
+def test_a_push_batch_keeps_a_merge_landing_and_its_tagged_commits(env, monkeypatch):
+    """An entry that already descends from the tip goes out as it is, with its merge (no flattening
+    rebase, so a tag on its commits stays an ancestor); one needing a rebase keeps its merge too."""
+    p, repo, origin, other = _bump_setup(env, monkeypatch, ["true"])
+    before = _git_out(origin, "rev-parse", "proj")
+    h1, tagged = _merge_entry(repo, "e1")
+    rc, m = _run_batch(p, _batch_marker(p, [h1]), monkeypatch)
+    assert rc == 0 and _statuses(m) == ["pushed"], m
+    assert _git_out(origin, "rev-parse", "proj^") == h1, "the entry goes out as it is, under the bump"
+    assert _git_out(origin, "merge-base", "--is-ancestor", tagged, "proj") == ""
+    assert _git_out(origin, "log", "--merges", "--format=%s", f"{before}..proj") == "land e1"
+
+    h2, _ = _merge_entry(repo, "e2")
+    _git_out(other, "pull", "-q", "origin", "proj")
+    _commit(other, "late.txt", "late\n")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    moved = _git_out(origin, "rev-parse", "proj")
+    rc, m = _run_batch(p, _batch_marker(p, [h2], bid="b2"), monkeypatch)
+    assert rc == 0 and _statuses(m) == ["pushed"], m
+    assert _git_out(origin, "log", "--merges", "--format=%s", f"{moved}..proj") == "land e2", "flattened"
+    assert sorted(_git_out(origin, "log", "--no-merges", "--format=%s", f"{moved}..proj").splitlines())[:2] \
+        == ["e2-task: edit plugins/p/e2a.txt", "edit plugins/p/e2b.txt"]
+    assert _git_out(origin, "show", "proj:plugins/p/e2b.txt") == "b"
 
 
 def test_a_push_batch_refuses_an_entry_adding_an_excluded_path_and_runs_checks_as_target(env, monkeypatch):
