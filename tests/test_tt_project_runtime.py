@@ -20195,6 +20195,7 @@ DURABLE_EXEMPT = {
     ("codex.py", "tmp.write_text(text)"): "a cache, rewritten whenever its content differs",
     ("codex.py", "os.replace(tmp, path)"): "a cache, rewritten whenever its content differs",
     ("fake.py", '"result.json").write_text'): "the test provider",
+    ("killscan.py", "path.write_text"): "a worker's throwaway shim scripts, re-written by each `ttp killscan --shim`",
 }
 
 
