@@ -20149,6 +20149,7 @@ DURABLE_EXEMPT = {
     ("release.py", "upgrade.log"): "a log",
     ("service.py", "restart.log"): "a log",
     ("service.py", "os.replace(req, taken)"): "claims a restart request for one process; a reboot restarts the daemon anyway",
+    ("upstream.py", 'os.replace(src, src.with_name(QUEUED_FILE + ".filed"))'): "marks a run's queued notes filed; a rename lost to a crash only repeats sends that are dropped as duplicates",
     ("push.py", 'open(log, "ab")'): "a detached push's log; its outcome goes to the marker, durably",
     ("batch.py", "path.write_bytes(text.encode())"): "git merge-file's inputs, in a temporary directory removed after",
     ("daemon.py", "daemon.log"): "a log",
