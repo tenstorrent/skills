@@ -50,6 +50,12 @@ Other workers run at the same time as you, on other tasks of this project.
   your task. Others may be using it.
 - Stop only processes you started, by their pid. Never kill by name or pattern (`pkill -f`,
   `killall`): other workers and projects run the same commands, and you would end theirs.
+- The same goes for scripts and test stubs you run. `pkill -f <name>` also matches your own tool
+  shell when its command line holds <name>, and a separate session or process group does not
+  protect it. Before running a script, check it with `ttp killscan <script>`: it flags `pkill`,
+  `killall` and `kill $(pgrep -f ...)`. If it finds one, run the script with logging stand-ins
+  first on PATH (`ttp killscan --shim <dir>`, then `PATH=<dir>:"$PATH" <script>`), and edit out
+  any call it marks as by absolute path.
 
 ## Shared clusters (Slurm and other machines other people use)
 

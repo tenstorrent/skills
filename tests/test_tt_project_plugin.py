@@ -440,3 +440,10 @@ def test_docs_and_prompts_name_only_real_ttp_subcommands():
                   for f in files for m in re.findall(r"`ttp ([a-z][a-z-]*)", f.read_text(encoding="utf-8", errors="replace"))
                   if m not in commands})
     assert not bad, bad
+
+
+def test_worker_prompt_covers_pattern_kills_in_scripts_it_runs():
+    text = " ".join((PLUGIN / "template" / "prompts" / "worker.md").read_text(encoding="utf-8").split())
+    for part in ("scripts and test stubs you run", "`ttp killscan <script>`", "`ttp killscan --shim <dir>`",
+                 "`kill $(pgrep -f ...)`", "a separate session or process group does not protect it"):
+        assert part in text, part

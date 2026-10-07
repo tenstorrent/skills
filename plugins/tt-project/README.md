@@ -429,5 +429,8 @@ Design notes, invariants and how to add a provider: [docs/design.md](docs/design
   it in a file and show a test run's failures (else head and tail). On Claude Code, Bash output
   past `budget.bash_output_max_chars` also goes to a file. A worker whose run re-reads more than
   `budget.split_reread_tokens` of context is told once to hand the rest on as a follow-up.
+- `ttp killscan <script>` flags kills by name or pattern (`pkill -f`, `killall`,
+  `kill $(pgrep -f ...)`) before a worker runs a script; `--shim <dir>` writes stand-ins that
+  only log those calls. A pattern kill in a script can match the worker's own tool shell.
 - Resuming a lost run's session works on Claude Code and Codex; Cursor starts fresh.
 - A laptop pauses while it sleeps. Use an always-on machine for round-the-clock work.

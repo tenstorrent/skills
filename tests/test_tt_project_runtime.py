@@ -27009,3 +27009,48 @@ def test_idle_sleep_config_key_is_known_and_checked(env):
     assert "runner.prevent_idle_sleep: 'sometimes' is not auto, on or off; auto is used" in \
         pj.config_problems({"runner": {"prevent_idle_sleep": "sometimes"}})
     assert not [x for x in pj.config_problems({"runner": {"prevent_idle_sleep": "off"}}) if "idle" in x]
+
+
+KILLING_SCRIPT = "\n".join([
+    "#!/bin/sh", "# pkill -f in a comment is fine", "pkill -u \"$USER\" -f ttp-killscan-none",
+    "pkill -9f ttp-killscan-none", "pkill --full ttp-killscan-none", "killall ttp-killscan-none",
+    "kill $(pgrep -f ttp-killscan-none)", "kill -9 `pidof ttp-killscan-none`",
+    "pgrep -f ttp-killscan-none | xargs kill", "pkill ttp-killscan-none", "/usr/bin/pkill -f ttp-killscan-none",
+    "echo skill; kill \"$pid\"; ./pkill-helper; my-killall-notes", "exit 0"])
+
+
+def test_killscan_flags_every_kill_by_name_or_pattern_and_nothing_else(env):
+    from ttp import killscan
+    hits = {n: reason for n, reason, _ in killscan.scan(KILLING_SCRIPT)}
+    assert sorted(hits) == list(range(3, 12)), hits
+    assert all("pkill -f" in hits[n] for n in (3, 4, 5, 11)), hits
+    assert "killall" in hits[6] and "pgrep/pidof" in hits[7] and "pgrep/pidof" in hits[8] and "pgrep/pidof" in hits[9]
+    assert "pkill kills every process with that name" in hits[10]
+    assert "absolute path" in hits[11] and "absolute path" not in hits[3]
+    assert killscan.scan("kill \"$pid\"\nwait \"$pid\"\n") == []
+
+
+def test_ttp_killscan_exits_1_on_a_hit_and_its_shims_kill_nothing(env, tmp_path):
+    script = tmp_path / "stub.sh"
+    script.write_text(KILLING_SCRIPT.replace("/usr/bin/pkill", "pkill") + "\n")
+    clean = tmp_path / "clean.sh"
+    clean.write_text("#!/bin/sh\nkill \"$1\"\n")
+
+    def ttp(*args):
+        return subprocess.run([sys.executable, str(TTP), "killscan", *args], capture_output=True, text=True)
+    r = ttp(str(script))
+    assert r.returncode == 1 and "stub.sh:3: pkill -f" in r.stdout and "9 kill(s)" in r.stdout, r.stdout
+    r = ttp(str(clean))
+    assert r.returncode == 0 and "no kills" in r.stdout, r.stdout
+    assert ttp(str(tmp_path / "missing.sh")).returncode != 0
+    shims = tmp_path / "shims"
+    r = ttp("--shim", str(shims))
+    assert r.returncode == 0 and f"PATH={shims}:" in r.stdout, r.stdout
+    # With the shims first on PATH the script runs to its end and every kill is only logged.
+    r = subprocess.run(["sh", str(script)], capture_output=True, text=True,
+                       env={**os.environ, "PATH": f"{shims}:{os.environ['PATH']}"})
+    assert r.returncode == 0, r.stderr
+    log = (shims / "killscan.log").read_text().splitlines()
+    assert "pkill -u " + os.environ.get("USER", "") + " -f ttp-killscan-none" in log, log
+    assert "killall ttp-killscan-none" in log and "pgrep -f ttp-killscan-none" in log and \
+        "pidof ttp-killscan-none" in log, log

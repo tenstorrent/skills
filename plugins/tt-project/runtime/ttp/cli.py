@@ -1309,6 +1309,34 @@ def cmd_clip(a) -> None:
     sys.exit(rc)
 
 
+def cmd_killscan(a) -> None:
+    """Check scripts for kills by name or pattern (`pkill -f`, `killall`, `kill $(pgrep -f ...)`) before
+    running them: such a kill can match the worker's own tool shell. Exits 1 when one is found.
+    `--shim <dir>` writes logging stand-ins for those commands; put <dir> first on PATH to run the
+    script without them killing anything."""
+    from . import killscan
+    if a.shim:
+        folder = Path(a.shim).resolve()
+        killscan.write_shims(folder)
+        print(f"shims for {', '.join(killscan.SHIMMED)} in {folder}; calls are logged to "
+              f"{folder / 'killscan.log'}. Run the script with: PATH={shlex.quote(str(folder))}:\"$PATH\" <script>")
+    hits = 0
+    for name in a.files:
+        try:
+            text = Path(name).read_text(errors="replace")
+        except OSError as e:
+            die(f"ttp killscan: cannot read {name}: {e.strerror or e}")
+        for n, reason, line in killscan.scan(text):
+            hits += 1
+            print(f"{name}:{n}: {reason}: {line}")
+    if a.files:
+        print(f"ttp killscan: {hits} kill(s) by name or pattern found" if hits else
+              "ttp killscan: no kills by name or pattern found")
+    elif not a.shim:
+        die("usage: ttp killscan <script>... [--shim <dir>]")
+    sys.exit(1 if hits else 0)
+
+
 def cmd_lock(a) -> None:
     """Hold one slot of a shared resource while a command runs: `ttp lock <resource> -- <cmd...>`.
 
@@ -2799,6 +2827,13 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--lines", type=int, default=40, help="at most this many lines of an ordinary excerpt")
     s.add_argument("cmd", nargs=argparse.REMAINDER, help="the command, after --")
     s.set_defaults(fn=cmd_clip)
+
+    s = sub.add_parser("killscan", help="flag kills by name or pattern (pkill -f, killall, kill $(pgrep ...)) "
+                                        "in scripts before running them; --shim writes stand-ins that only log")
+    s.add_argument("files", nargs="*", help="scripts to check; exits 1 if one kills by name or pattern")
+    s.add_argument("--shim", metavar="DIR", help="write logging stand-ins for pkill, killall, pgrep and pidof "
+                                                 "into DIR (put DIR first on PATH)")
+    s.set_defaults(fn=cmd_killscan)
 
     s = sub.add_parser("lock", help="(inside a run) hold a shared resource while one command runs")
     s.add_argument("--probe", action="store_true",
