@@ -23,6 +23,8 @@ files it in the same inbox with a `to` field, its source project, host and task,
 gets it as an `upstream_note` event marked as another project's worker's data, never as the user's
 message, an approval or an answer. Identical text to the same project is filed once, and a project
 files at most NOTES_PER_HOUR addressed notes an hour, so a looping worker cannot flood the inbox.
+A worker whose sandbox cannot write the inbox leaves the note in its run's directory instead
+(QUEUED_FILE); its project's daemon files it, with the run's project and task, when the run ends.
 
 Reading over ssh needs the reader to reach the writer, which a laptop behind NAT does not allow. So
 each daemon also forwards this machine's own notes: a thread (never the tick itself) pipes the new
@@ -162,6 +164,49 @@ def send(source: str, task: int | None, to: str, text: str, severity: str = "nor
                              else "normal", "title": title, "spec": text, "fp": fp}, sort_keys=True) + "\n").encode())
         f.flush()
     return "sent"
+
+
+QUEUED_FILE = "notes-to.jsonl"   # in a run's directory: notes a sandboxed worker could not file itself
+QUEUED_MAX = 50                  # queued notes one run may leave
+
+
+def queue(run_dir: Path, to: str, text: str, severity: str = "normal") -> None:
+    """Keep a worker's note for project `to` in its run's directory, for a worker whose sandbox cannot
+    write the inbox: its daemon files it with `send_queued` when the run ends."""
+    line = json.dumps({"to": to, "text": " ".join(str(text).split())[:SPEC_CHARS], "severity": severity},
+                      sort_keys=True) + "\n"
+    fd = os.open(Path(run_dir) / QUEUED_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.write(fd, line.encode())
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def send_queued(run_dir: Path, source: str, task: int | None) -> dict[str, int]:
+    """File the notes a run queued (`queue`) as `send` would have, with the project and task the daemon
+    knows the run by, not what the file says. The file is renamed once done, so a later pass does not
+    send them again; a crash before that only repeats sends `send` drops as duplicates.
+    Returns how many were sent, duplicate, limited or invalid."""
+    src = Path(run_dir) / QUEUED_FILE
+    got = {"sent": 0, "duplicate": 0, "limited": 0, "invalid": 0}
+    try:
+        raw = src.read_bytes()
+    except FileNotFoundError:
+        return got
+    for ln in raw.splitlines()[:QUEUED_MAX]:
+        try:
+            n = json.loads(ln)
+        except ValueError:
+            n = None
+        to = str(n.get("to") or "").strip() if isinstance(n, dict) else ""
+        text = str(n.get("text") or "").strip() if isinstance(n, dict) else ""
+        if not to or to == source or not text or not re.fullmatch(r"[\w.-]{1,100}", to):
+            got["invalid"] += 1
+            continue
+        got[send(source, task, to, text, str(n.get("severity") or "normal"))] += 1
+    os.replace(src, src.with_name(QUEUED_FILE + ".filed"))
+    return got
 
 
 def _event(n: dict) -> tuple[str, str]:

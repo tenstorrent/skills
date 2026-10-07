@@ -104,7 +104,7 @@ def watch_prs(daemon) -> str:
     changed = 0
     for t in rows:
         pr = _gh(["pr", "view", t["pr_url"], "--json", "state,isDraft,mergeable,reviewDecision,statusCheckRollup,"
-                  "comments,reviews,url,title,author,headRefOid"], root)
+                  "comments,reviews,url,title,author,headRefOid,headRefName"], root)
         if pr is None:
             continue
         key = prguard.pr_key(pr.get("url") or t["pr_url"])
@@ -246,31 +246,49 @@ def _check_findings(daemon, t: dict, pr: dict, sig: dict, findings: dict, root: 
                 "-F", f"number={number}"], root)
     old = findings.get(key) or {}
     bots = bot_open(data) if data is not None else old.get("bot", [])   # unread: keep what was known
-    rec = {"task": t["id"], "url": url, "failing": sig["failing"], "pending": sig["checks"] == "pending",
-           "bot_open": len(bots), "bot": bots[:10], "notified": old.get("notified")}
+    rec = {"task": t["id"], "url": url, "branch": pr.get("headRefName") or old.get("branch"),
+           "failing": sig["failing"], "pending": sig["checks"] == "pending",
+           "bot_open": len(bots), "bot": bots[:10], "notified": old.get("notified"), "owner": old.get("owner")}
     findings[key] = rec
     if rec["pending"]:
         return
     dirty = bool(rec["failing"] or rec["bot_open"])
+    what = "; ".join([*(["CI failing: " + ", ".join(rec["failing"])] if rec["failing"] else []),
+                      *([f"{len(bots)} bot review comment(s) neither fixed nor answered: "
+                         + ", ".join(bots[:5])] if bots else [])])
+    # Open findings always have one owner: an open task on the PR, else a fix task the daemon queues
+    # once the task that delivered it is done (Daemon.pr_findings_owner). pr-watch only reports them.
+    owner, made = daemon.pr_findings_owner(key, rec, what) if dirty and hasattr(daemon, "pr_findings_owner") \
+        else (None, False)
+    lost = dirty and not owner and rec["owner"] is not None
+    rec["owner"] = owner["id"] if owner else None
     mark = json.dumps([rec["failing"], sorted(bots)]) if dirty else "clean"
-    if mark == rec["notified"] or (not dirty and rec["notified"] is None):
+    if not made and not lost and (mark == rec["notified"] or (not dirty and rec["notified"] is None)):
         rec["notified"] = mark   # a PR clean when first seen needs no news: its task's hand-off said so
         return
     rec["notified"] = mark
-    if dirty:
-        what = "; ".join([*(["CI failing: " + ", ".join(rec["failing"])] if rec["failing"] else []),
-                          *([f"{len(bots)} bot review comment(s) neither fixed nor answered: "
-                             + ", ".join(bots[:5])] if bots else [])])
-        text = (f"PR for task #{t['id']} ({url}) has open findings: {what}. This is work: queue a code task "
-                f"(on the PR's branch) to fix or answer each and get CI green. Do not ask the user to review "
-                f"it until pr-watch reports it clean.")
+    status = "queued"
+    if made:
+        text = (f"PR for task #{t['id']} ({url}) has open findings: {what}. No open task owned them, so the daemon "
+                f"queued code task #{owner['id']} on the PR's branch to fix or answer each. Queue no other task "
+                f"for them. Do not ask the user to review it until pr-watch reports it clean.")
+        status = "handled"
+    elif owner:
+        text = (f"PR for task #{t['id']} ({url}) has open findings: {what}. Open task #{owner['id']} "
+                f"({owner['status']}) owns them: queue no other task for them. Do not ask the user to review it "
+                f"until pr-watch reports it clean.")
+        status = "queued" if owner["status"] == "blocked" else "handled"
+    elif dirty:
+        text = (f"PR for task #{t['id']} ({url}) has open findings: {what}. This is work"
+                + (" and no open task owns them now" if lost else "")
+                + ": queue a code task (on the PR's branch) to fix or answer each and get CI green. Do not ask "
+                  "the user to review it until pr-watch reports it clean.")
     else:
         text = (f"PR for task #{t['id']} ({url}) is clean: CI green and every bot review comment fixed or "
                 f"answered. If its review task passed, ask the user for a draft review now (ask_user, "
                 f"blocking review, with its URL).")
     db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
-         (time.time(), "pr", "pr_findings" if dirty else "pr_clean", "normal", text, "queued", t["id"]))
-
+         (time.time(), "pr", "pr_findings" if dirty else "pr_clean", "normal", text, status, t["id"]))
 
 def watch_logs(daemon, payload: dict) -> str:
     db = daemon.p.db

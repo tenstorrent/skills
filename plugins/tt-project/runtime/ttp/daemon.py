@@ -80,6 +80,8 @@ AUTO_REVIEW_SPEC_CHARS, AUTO_REVIEW_SUMMARY_CHARS = 2000, 1000
 # A failed review with fix specs gets its fix and re-review from the daemon this many rounds per stack;
 # the re-review repeats the failed review's spec (its push and after-push steps) up to this length.
 AUTO_FIX_ROUNDS, REVIEW_FIX_SPEC_CHARS = 2, 8000
+# A PR whose open findings outlive the task that delivered it gets this many fix tasks from the daemon.
+PR_FIX_ROUNDS = 2
 PROBE_EVERY_S = 180     # how often a waiting task's `retry_when` (or a deferred one's `start_when`) probe runs
 NOT_YET_RCS = (1, 75, 255)   # probe exits meaning "not yet": 1, EX_TEMPFAIL (a busy `ttp lock`), ssh unreachable
 PROBE_TIMEOUT_S = 60
@@ -1509,6 +1511,12 @@ class Daemon:
         if not task:
             return
         relay_worker_notifies(self.p, task, run_dir)
+        try:   # notes for other projects a sandboxed worker could not file itself (ttp note --to)
+            sent = upstream.send_queued(run_dir, self.p.name, task["id"])
+            if any(sent.values()):
+                log(self.p, f"run {r.get('id')} of #{task['id']}: queued notes to other projects: {sent}")
+        except OSError as e:
+            log(self.p, f"could not file the queued notes of #{task['id']}: {e}")
         handoff = _read_result(run_dir / RESULT_FILE)
         result = handoff or last_json_object(usage.final_text or "") or {}
         if task["status"] == "cancelled":
@@ -3587,6 +3595,53 @@ class Daemon:
         log(self.p, f"review {review['id']} failed: queued fix #{fid} and re-review #{rid}"
                     + (f"; moved {moved} onto it" if moved else ""))
         return fid, rid, moved
+
+    def pr_findings_owner(self, key: str, rec: dict, what: str) -> tuple[dict | None, bool]:
+        """The one open task that owns a PR's open findings (pr-watch's record `rec` for PR `key`),
+        and whether it was queued now. An open code task that delivers the PR, names it in its spec or
+        works on its branch owns them. With none, and the task that delivered it done, the daemon
+        queues one code task on the PR's branch to fix or answer each, so findings never outlive their
+        owner. None, nothing queued, when that task did not finish done, PR_FIX_ROUNDS such tasks did
+        not clear them or the task cap is reached: the coordinator then decides."""
+        db = self.p.db
+        branch = str(rec.get("branch") or "")
+        for t in db.q("SELECT * FROM tasks WHERE kind='code' AND status NOT IN (?,?,?) ORDER BY id",
+                      TERMINAL_TASK_STATES):
+            if prguard.pr_key(t["pr_url"] or "") == key or key in prguard.pr_keys(t["spec"] or "") \
+                    or (branch and t["branch"] == branch) or f'"pr_fix:{key}"' in (t["labels"] or ""):
+                return t, False
+        src = db.task(int(rec.get("task") or 0))
+        if not src or src["status"] != "done":
+            return None, False
+        rounds = db.one("SELECT COUNT(*) n FROM tasks WHERE labels LIKE ?", (f'%"pr_fix:{key}"%',))["n"]
+        if rounds >= PR_FIX_ROUNDS or coord.next_task_slot(db, coord.task_cap(self.cfg)) is not None:
+            return None, False
+        branch = branch or src["branch"] or ""
+        try:   # a branch another worktree holds cannot be checked out again: then build on its head
+            held = branch and f"branch refs/heads/{branch}" in worktree._git(
+                self.p.root, "worktree", "list", "--porcelain").splitlines()
+        except Exception:
+            held = True
+        base_title = re.sub(r"^(?:Fix PR findings: )+", "", src["title"])
+        tier = src["tier"] if src["tier"] in bud.TIER_ORDER else "standard"
+        url = rec.get("url") or key
+        on = (f"This task's branch is the PR's branch {branch}: build on it" if branch and not held else
+              f"This task's branch starts from #{src['id']}'s branch head" + (f"; the PR's branch is {branch}" if branch else ""))
+        spec = "\n".join([
+            f"Pull request {url} still has open findings after task #{src['id']} ({src['title']}) finished: {what}.",
+            "This task owns them now; no other task does. Fix or answer each bot review comment on the PR "
+            "(answers end with the hidden line <!-- ttp -->) and get CI green.",
+            f"{on}. Deliver to that PR: publish onto its branch with `ttp push --own --detach`, keep it a draft "
+            "and its description current, and open no new PR.",
+            f"Put {url} in the hand-off's `pr`."])
+        with db.tx():
+            fid = db.add_task(f"Fix PR findings: {base_title}"[:200], spec, kind="code", tier=tier,
+                              priority=src["priority"], origin="daemon",
+                              budget_usd=float(self.cfg["budget"]["task_default_usd"].get(tier, 8.0)),
+                              branch=branch if branch and not held else None,
+                              labels=[f"continues:{src['id']}", f"pr_fix:{key}"])
+        log(self.p, f"{key}: open findings outlived task {src['id']}; queued fix #{fid}")
+        return db.task(fid), True
 
     def _failed_review_before(self, task: dict) -> int | None:
         """The id of a failed review this task continues, directly or through the fix it depends on

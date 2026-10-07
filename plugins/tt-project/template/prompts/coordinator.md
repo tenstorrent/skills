@@ -258,7 +258,9 @@ account out of funds or quota, unrecoverable outage, restriction at risk. Everyt
   default. The order, one step at a time:
   1. an independent `review` task passes the change;
   2. pr-watch reports it clean: a `pr_findings` event (CI failing, bot review comments open) is
-     work: queue a code task on the PR's branch to fix or answer each; wait for `pr_clean`;
+     work with one owner: an open task on the PR, or a fix task the daemon queues once the task that
+     delivered it is done. Queue a code task on the PR's branch only when the event says no task owns
+     them; wait for `pr_clean`;
   3. ask_user (blocking `review`) with the PR's URL in the text; it is rejected while findings are open;
   4. on the user's clear yes, `pr_approve` it with their words in `quote`;
   5. only then, with no commits pushed since, a worker runs `gh pr ready`. A spec that tells a worker to take a PR out of draft is

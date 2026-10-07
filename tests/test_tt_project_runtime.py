@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import gettext
 import importlib.machinery
 import io
@@ -18115,6 +18116,55 @@ def test_notes_to_another_project_are_deduped_and_rate_limited(env, monkeypatch,
     assert upstream.ingest(q, q.config()) == upstream.NOTES_PER_HOUR + 1
 
 
+def test_a_sandboxed_worker_that_cannot_write_the_inbox_still_sends_its_note(env, monkeypatch, capsys):
+    """`ttp note --to` from a worker whose sandbox cannot write the user's inbox (a read-only home):
+    the note waits in the run's directory and the daemon files it when the run ends, with the
+    project and task it knows the run by, not what the file claims. Filed once, never again."""
+    from ttp import cli, upstream
+    from ttp.cli import bootstrap
+    from ttp.daemon import Daemon
+    from ttp.project import register
+    from ttp.providers.base import RunUsage as Usage
+    src = make(env)
+    repo2 = env["tmp"] / "repo2"
+    subprocess.run(["git", "clone", "-q", str(env["repo"]), str(repo2)], check=True)
+    dst = bootstrap(repo2, "second", "Another project.", "fake")
+    register("second", {"host": "testhost", "dir": str(dst.root)})
+    tid = src.db.add_task("t", "s", kind="work")
+    run_dir = _note_run(env, monkeypatch, src, str(tid))
+    real_open = os.open
+
+    def ro_open(path, flags, *a):
+        if str(path) == str(upstream.path()) and flags & (os.O_WRONLY | os.O_RDWR):
+            raise OSError(errno.EROFS, "Read-only file system", str(path))
+        return real_open(path, flags, *a)
+
+    monkeypatch.setattr(os, "open", ro_open)
+    assert _note(cli, "--to", "second", "the cache  is stale") == 0
+    out = capsys.readouterr().out
+    assert "queued in this run's directory" in out and "Read-only file system" in out
+    assert upstream.note_id("second", "the cache is stale") in out
+    assert not upstream.path().exists()
+    assert "the cache  is stale" in (run_dir / "progress.md").read_text()
+    # The worker cannot pose as another project or task: the daemon files it as this run's.
+    with open(run_dir / upstream.QUEUED_FILE, "a") as f:
+        f.write(json.dumps({"to": "demo", "text": "to itself"}) + "\nnot json\n")
+    monkeypatch.setattr(os, "open", real_open)
+    (run_dir / "result.json").write_text(json.dumps({"status": "done", "summary": "ok"}))
+    Daemon(src.base)._finish_worker({"task": tid}, Usage(cost_usd=0.1), "ok", run_dir)
+    (n,) = _upstream_inbox(env)
+    assert (n["project"], n["task"], n["to"], n["from"], n["spec"]) == ("demo", tid, "second", "worker",
+                                                                         "the cache is stale")
+    assert n["fp"] == upstream.note_id("second", "the cache is stale")
+    assert not (run_dir / upstream.QUEUED_FILE).exists() and (run_dir / (upstream.QUEUED_FILE + ".filed")).exists()
+    assert upstream.send_queued(run_dir, "demo", tid) == {"sent": 0, "duplicate": 0, "limited": 0, "invalid": 0}
+    assert len(_upstream_inbox(env)) == 1
+    d = Daemon(dst.base)
+    d.read_upstream()
+    (ev,) = dst.db.q("SELECT text FROM events WHERE kind='upstream_note'")
+    assert "from a worker of demo #%d" % tid in ev["text"] and "the cache is stale" in ev["text"]
+
+
 def test_the_worker_hook_allows_a_note_to_another_project(env, monkeypatch, tmp_path):
     from ttp import hook
     monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path))
@@ -22585,6 +22635,81 @@ def test_pr_watch_turns_ci_failures_and_bot_comments_into_work_before_the_review
     graph["data"]["repository"]["pullRequest"]["comments"]["nodes"].append(
         {"author": human, "createdAt": "2026-01-03T00:00:00Z", "url": "c2"})
     assert watchers.bot_open(graph) == []
+
+
+def test_pr_findings_keep_one_owner_when_the_task_that_delivered_the_pr_finishes(env, monkeypatch):
+    """Open findings on a PR whose delivering task is done get exactly one owner: while a task on the
+    PR is open it owns them and no second one is queued; once none is, the daemon queues one code task
+    on the PR's branch (even when pr-watch already reported the same findings), a bounded number of
+    times. pr-watch only reports; the coordinator is told who owns them."""
+    from ttp import daemon as dm, watchers
+    from ttp.daemon import Daemon
+    p = make(env)
+    url = "https://github.com/acme/widgets/pull/7"
+    src = p.db.add_task("Speed up the loader", "s", kind="code", tier="deep", priority=2)
+    p.db.update_task(src, status="running", pr_url=url, branch=f"ttp/t{src}-speed-up-the-loader")
+    bot = {"__typename": "Bot", "login": "review-bot"}
+    pr = {"url": url, "state": "OPEN", "isDraft": True, "title": "t", "headRefName": f"ttp/t{src}-speed-up-the-loader",
+          "statusCheckRollup": [{"name": "tests", "conclusion": "FAILURE"}]}
+    thread = {"isResolved": False, "isOutdated": False, "comments": {"nodes": [{"author": bot, "url": "u1"}]}}
+    graph = {"data": {"repository": {"pullRequest": {"comments": {"nodes": []}, "reviews": {"nodes": []},
+                                                     "reviewThreads": {"nodes": [thread]}}}}}
+    monkeypatch.setattr(watchers, "_gh", lambda args, cwd: graph if args[0] == "api" else pr)
+    d = Daemon(p.base)
+
+    def events():
+        return [(e["status"], e["text"]) for e in p.db.q("SELECT status, text FROM events WHERE kind='pr_findings' ORDER BY id")]
+
+    def fixes():
+        return p.db.q("SELECT * FROM tasks WHERE labels LIKE '%pr_fix:%' ORDER BY id")
+
+    watchers.watch_prs(d)
+    ((st, text),) = events()
+    assert f"Open task #{src} (running) owns them" in text and st == "handled" and not fixes()
+    # The delivering task finishes with the same findings open: nothing new to report, but they need an owner.
+    p.db.update_task(src, status="done")
+    watchers.watch_prs(d)
+    (fix,) = fixes()
+    assert (fix["kind"], fix["tier"], fix["priority"], fix["origin"], fix["branch"]) == (
+        "code", "deep", 2, "daemon", f"ttp/t{src}-speed-up-the-loader")
+    assert f'"continues:{src}"' in fix["labels"] and url in fix["spec"] and "u1" in fix["spec"]
+    assert "open no new PR" in fix["spec"] and "ttp push --own" in fix["spec"]
+    st, text = events()[-1]
+    assert st == "handled" and f"queued code task #{fix['id']}" in text and "Queue no other task" in text
+    watchers.watch_prs(d)
+    watchers.watch_prs(d)
+    assert len(fixes()) == 1 and len(events()) == 2, "a second owner was queued"
+    # A task the coordinator queued for the PR (its spec names it) is an owner too.
+    p.db.update_task(fix["id"], status="cancelled")
+    other = p.db.add_task("Answer the bot on acme/widgets#7", "Fix acme/widgets#7.", kind="code")
+    watchers.watch_prs(d)
+    assert len(fixes()) == 1 and p.db.task(other)["status"] == "queued"
+    # Bounded: after PR_FIX_ROUNDS daemon fixes the findings go back to the coordinator, once.
+    p.db.update_task(other, status="done")
+    for _ in range(dm.PR_FIX_ROUNDS + 2):
+        watchers.watch_prs(d)
+        for f in fixes():
+            if f["status"] == "queued":
+                p.db.update_task(f["id"], status="done")
+    assert len(fixes()) == dm.PR_FIX_ROUNDS
+    st, text = events()[-1]
+    assert st == "queued" and "no open task owns them now" in text and "queue a code task" in text
+    n = len(events())
+    watchers.watch_prs(d)
+    assert len(events()) == n
+    # A branch another worktree still holds is not checked out again: the fix builds on its head.
+    p.db.x("UPDATE tasks SET labels='[]' WHERE labels LIKE '%pr_fix:%'")
+    subprocess.run(["git", "-C", str(p.root), "branch", pr["headRefName"]], check=True)
+    subprocess.run(["git", "-C", str(p.root), "worktree", "add", "-q", str(env["tmp"] / "held"), pr["headRefName"]],
+                   check=True)
+    watchers.watch_prs(d)
+    (fix,) = fixes()
+    assert fix["branch"] is None and f'"continues:{src}"' in fix["labels"] and pr["headRefName"] in fix["spec"]
+    # A delivering task that failed is the coordinator's call: no fix is queued for it.
+    p.db.x("DELETE FROM tasks WHERE id=?", (fix["id"],))
+    p.db.update_task(src, status="failed")
+    watchers.watch_prs(d)
+    assert not fixes()
 
 
 def _batch_setup(env, monkeypatch, busy):
