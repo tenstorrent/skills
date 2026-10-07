@@ -677,16 +677,19 @@ class Daemon:
         tiers = self.cfg["providers"].get(provider, {}).get("tiers", {})
         return str((self.cfg.get("coordinator") or {}).get("effort") or "") or tiers.get(tier, {}).get("effort", "")
 
-    def _coord_check(self, provider: str, tier: str, event_ids: list[int], wake_due: str | None) -> dict | None:
+    def _coord_check(self, provider: str, tier: str, event_ids: list[int], wake_due: str | None,
+                     msg_ids: list[int] | None = None) -> dict | None:
         """Jev's 'routine or needs thought?' verdict on a turn the rules leave below unblock_effort
-        (coordcheck), or None: not needed, off, or failed (the rules' choice stands)."""
+        (coordcheck), 'skipped' when nothing was worth asking, or None: not needed, off, or failed
+        (the rules' choice stands)."""
         base = self._coordinator_effort(provider, tier)
         high = coord.raise_effort(base, str(self.cfg["coordinator"].get("unblock_effort", "high") or ""))
         if high == base:
             return None   # already at unblock_effort: the check could not change it
         try:
             return coordcheck.check(self.p.db, self.cfg, self.jev,
-                                    coordcheck.summary(self.p.db, event_ids, wake_due), base, high)
+                                    coordcheck.summary(self.p.db, event_ids, wake_due), base, high,
+                                    event_ids, msg_ids)
         except JevOutOfFunds:
             self.alert("jev-funds", JEV_FUNDS_TEXT, "high")
         except Exception:   # the check must never hold a turn back
@@ -2156,11 +2159,13 @@ class Daemon:
                 triggers = [f"escalated: {str(esc.get('why') or '')[:200]}".rstrip(": "), *triggers]
             can_raise = coord.can_raise_effort(self.cfg, c.get("tier", "light"))
             # Jev rates only a turn the rules leave routine and that a raise would change.
-            check = self._coord_check(provider, c.get("tier", "light"), [e["id"] for e in evs], due) \
-                if can_raise and not triggers else None
+            check = self._coord_check(provider, c.get("tier", "light"), [e["id"] for e in evs], due,
+                                      [m["id"] for m in msgs]) if can_raise and not triggers else None
             if check and check["verdict"] == "needs_thought":
                 triggers.append(f"jev: needs thought ({check['reason']})")
-            checked = {"coord_check": {"jev_call": check["jev_call"], "verdict": check["verdict"]}} if check else {}
+            checked = {"coord_check": {"jev_call": check["jev_call"], "verdict": check["verdict"],
+                                       **({"skipped": check["reason"]} if check["verdict"] == "skipped" else {})}} \
+                if check else {}
             unblock = ", ".join(triggers)
             raised = bool(unblock) and can_raise
             # A routine turn sees background sections the previous turn saw as one line each; a
@@ -2187,10 +2192,10 @@ class Daemon:
             # A turn that cannot even start backs off like a failed turn instead of retrying every tick.
             log(self.p, "coordinator start failed: " + traceback.format_exc().replace("\n", " | ")[:2000])
             if check:
-                self._settle_coord_check({"jev_call": check["jev_call"]}, "not started")
+                self._settle_coord_check({"jev_call": check.get("jev_call")}, "not started")
             self._coordinator_failed(f"could not start: {type(e).__name__}: {e}"[:250])
             return
-        if check:
+        if check and check.get("jev_call"):
             try:
                 jevuse.set_ref(db, check["jev_call"], f"run:{run_id}")
             except Exception:   # bookkeeping: the turn has started either way

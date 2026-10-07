@@ -95,6 +95,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # for 24 h, or at repeat_waits_24h in 24 h (0 turns either count off).
     "coordinator": {"tier": "light", "model": "", "effort": "", "unblock_effort": "high",
                     "repeat_fails_24h": 2, "repeat_waits_24h": 8,
+                    # Jev's check (coordcheck) runs only on new failed or blocked tasks, high or
+                    # critical events, user messages and external waits older than jev_wait_h; any
+                    # reason it rates at jev_threshold or above raises the turn.
+                    "jev_threshold": 0.7, "jev_wait_h": 6,
                     "debounce_s": 15, "max_events_per_turn": 40,
                     "max_turns_per_hour": 30, "max_new_tasks_per_day": 200, "idle_wake_s": 3600,
                     "starve_wake_s": 300,

@@ -18254,10 +18254,17 @@ def test_jev_coordinator_check_raises_routine_turns_and_logs_each_call_with_its_
     monkeypatch.setattr(d, "start_run", lambda *a, **k: calls.append(k) or 70 + len(calls))
     monkeypatch.setattr(time, "time", lambda: clock[0])
 
-    def turn(jev, kind="task_done"):
+    # Jev is asked only about something worth escalating that the rules leave routine: here task #4's
+    # external wait, which began 7 h ago (past coordinator.jev_wait_h, short of the 24 h rule).
+    p.set_config("coordinator.repeat_waits_24h", 0)
+    d.cfg = p.config()
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+           (clock[0] - 7 * 3600, "daemon", "task_waiting", "normal", "#4 deploy: task_waiting", "handled", 4))
+
+    def turn(jev, kind="task_waiting"):
         d.jev = jev
-        p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
-               (clock[0], "daemon", kind, "normal", f"#4 deploy: {kind}", "queued"))
+        p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+               (clock[0], "daemon", kind, "normal", f"#4 deploy: {kind}", "queued", 4))
         clock[0] += 400
         d.maybe_coordinate()
         p.db.x("UPDATE events SET status='handled'")
@@ -18269,7 +18276,7 @@ def test_jev_coordinator_check_raises_routine_turns_and_logs_each_call_with_its_
     jev = _ThoughtJev(p=0.8)
     k = turn(jev)
     assert k["unblock"].startswith("jev: needs thought (") and k["note"]["coord_check"]["verdict"] == "needs_thought"
-    assert "event task_done [normal]: #4 deploy: task_done" in jev.calls[-1] and "tasks:" in jev.calls[-1]
+    assert "event task_waiting [normal]: #4 deploy: task_waiting" in jev.calls[-1] and "tasks:" in jev.calls[-1]
     row = last_call()
     dec = json.loads(row["decision"])
     assert dec["verdict"] == "needs_thought" and dec["effort"] == "high" and dec["escalated"]
@@ -18330,6 +18337,83 @@ def test_jev_coordinator_check_raises_routine_turns_and_logs_each_call_with_its_
     d.cfg = p.config()
     jev = _ThoughtJev(p=0.8)
     assert turn(jev)["unblock"] == "" and not jev.calls
+
+
+def test_jev_coordinator_check_skips_routine_events_never_raises_twice_and_uses_its_threshold(env, monkeypatch):
+    """Jev is called only on new escalation-worthy events (a skip is logged in the turn's note, not as a
+    call), never raises a second turn for the same events, and raises at coordinator.jev_threshold (0.7)."""
+    p = make(env)
+    from ttp.daemon import Daemon
+    from ttp import coordcheck
+    p.set_config("providers.fake.tiers.light.effort", "low")
+    p.set_config("coordinator.repeat_waits_24h", 0)
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    d = Daemon(p.base)
+    d.update_gates()
+    clock = [time.time()]
+    calls = []
+    monkeypatch.setattr(d, "start_run", lambda *a, **k: calls.append(k) or 70 + len(calls))
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+
+    def event(kind, task=5, ago=0.0, severity="normal", status="queued"):
+        return p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                      (clock[0] - ago, "daemon", kind, severity, f"#{task} build: {kind}", status, task))
+
+    def turn(jev, handle=True):
+        d.jev = jev
+        clock[0] += 400
+        d.maybe_coordinate()
+        if handle:
+            p.db.x("UPDATE events SET status='handled'")
+        return calls[-1]
+
+    def n_calls():
+        return p.db.one("SELECT COUNT(*) n FROM jev_calls WHERE use='coord_effort'")["n"]
+
+    # Routine events (done, follow-ups, a fresh or short wait) cost no call; the note says it was skipped.
+    jev = _ThoughtJev(p=0.9)
+    for kind in ("task_done", "followup_proposed", "task_waiting"):
+        event(kind)
+        k = turn(jev)
+        assert k["unblock"] == "" and not jev.calls, kind
+        assert k["note"]["coord_check"]["verdict"] == "skipped" and k["note"]["coord_check"]["jev_call"] is None
+        assert k["note"]["coord_check"]["skipped"].startswith("no failed or blocked task")
+    assert n_calls() == 0, "a skipped check is not logged as a call, so it is neither charged nor scored"
+    # A wait older than coordinator.jev_wait_h is worth asking about; one under it is not.
+    p.db.x("DELETE FROM events")
+    event("task_waiting", task=6, ago=3 * 3600, status="handled")
+    event("task_waiting", task=6)
+    assert turn(jev)["note"]["coord_check"]["verdict"] == "skipped" and not jev.calls
+    p.set_config("coordinator.jev_wait_h", 2)
+    d.cfg = p.config()
+    event("task_waiting", task=6)
+    k = turn(jev, handle=False)
+    assert k["unblock"].startswith("jev: needs thought (") and len(jev.calls) == 1 and n_calls() == 1
+    # The same events (still queued: the raised turn failed or escalated) never raise a second turn.
+    k = turn(jev, handle=False)
+    assert k["unblock"] == "" and len(jev.calls) == 1 and n_calls() == 1
+    assert k["note"]["coord_check"] == {"jev_call": None, "verdict": "skipped",
+                                        "skipped": "already raised for these events"}
+    # A new worthy event alongside them is asked about again.
+    event("task_waiting", task=6)
+    assert turn(jev)["unblock"].startswith("jev: needs thought (") and len(jev.calls) == 2
+    # The threshold: 0.6 is routine at the default 0.7 and needs thought at a configured 0.5.
+    assert coordcheck.THRESHOLD == 0.7
+    event("task_waiting", task=6)
+    k = turn(_ThoughtJev(p=0.6))
+    assert k["unblock"] == "" and k["note"]["coord_check"]["verdict"] == "routine"
+    p.set_config("coordinator.jev_threshold", 0.5)
+    d.cfg = p.config()
+    event("task_waiting", task=6)
+    assert turn(_ThoughtJev(p=0.6))["note"]["coord_check"]["verdict"] == "needs_thought"
+    # Failed or blocked tasks, high events and user messages are worth asking about too (the rules
+    # already raise such turns, so they are checked on worth_asking directly).
+    cfg = p.config()
+    for kind, sev in (("task_failed", "normal"), ("task_blocked", "normal"), ("observation", "high")):
+        keys, why = coordcheck.worth_asking(p.db, cfg, [event(kind, severity=sev)])
+        assert len(keys) == 1 and why, (kind, sev)
+    assert coordcheck.worth_asking(p.db, cfg, [], [42]) == (["m42"], "user message")
+    assert coordcheck.worth_asking(p.db, cfg, [event("task_done")])[0] == []
 
 
 def test_jev_coordinator_check_claims_no_saving_it_did_not_make_and_bookkeeping_never_stops_a_turn(env, monkeypatch):

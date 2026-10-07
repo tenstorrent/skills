@@ -1314,16 +1314,7 @@ def wait_raises(db, tid: int, waits_seen: dict, waits_at: int, now: float) -> bo
     seen by the last turn, else the previous in the stint), its stint (external waits in a row,
     the same wait's cheap wakes skipped; a self-wait or any other hand-off ends it) began over
     24 h ago (once per stint), or `waits_at` or more external waits in 24 h (0: no backstop)."""
-    rows = db.q("SELECT ts, kind, text, data FROM events WHERE task=? AND ts>? AND kind IN "
-                f"({','.join('?' * len(STINT_KINDS))}) ORDER BY ts DESC, id DESC",
-                (tid, now - STINT_LOOKBACK_S, *STINT_KINDS))
-    stint = []
-    for e in rows:
-        if e["kind"] == "task_waiting" and unblock.ESCALATED_WAKE.search(e["text"] or ""):
-            continue
-        if e["kind"] != "task_waiting" or not unblock.counted_wait(e):
-            break
-        stint.append(e)
+    rows, stint = wait_stint(db, tid, now)
     key = str(tid)
     if not stint:
         waits_seen.pop(key, None)
@@ -1337,6 +1328,22 @@ def wait_raises(db, tid: int, waits_seen: dict, waits_at: int, now: float) -> bo
     waits_seen[key] = {"reason": reason, "since": start, "aged": aged}
     count = sum(1 for e in rows if e["ts"] > now - 86400 and e["kind"] == "task_waiting" and unblock.counted_wait(e))
     return reason != prev or (aged and not before.get("aged")) or bool(waits_at and count >= waits_at)
+
+
+def wait_stint(db, tid: int, now: float) -> tuple[list, list]:
+    """Task `tid`'s recent hand-off events, newest first, and its current stint of external waits
+    (newest first; the same wait's cheap wakes skipped): empty when its last hand-off was no such wait."""
+    rows = db.q("SELECT ts, kind, text, data FROM events WHERE task=? AND ts>? AND kind IN "
+                f"({','.join('?' * len(STINT_KINDS))}) ORDER BY ts DESC, id DESC",
+                (tid, now - STINT_LOOKBACK_S, *STINT_KINDS))
+    stint = []
+    for e in rows:
+        if e["kind"] == "task_waiting" and unblock.ESCALATED_WAKE.search(e["text"] or ""):
+            continue
+        if e["kind"] != "task_waiting" or not unblock.counted_wait(e):
+            break
+        stint.append(e)
+    return rows, stint
 
 
 def can_raise_effort(cfg: dict, tier: str, effort: str | None = None) -> bool:

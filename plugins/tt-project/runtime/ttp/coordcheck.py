@@ -3,10 +3,16 @@
 """Jev's 'routine or needs thought?' check on a coordinator turn: one more trigger for a high-effort turn.
 
 It runs only on a turn the rules (coordinator.effort_triggers) left below coordinator.unblock_effort,
-where its `coord_effort` use is allowed (see jevuse; `jev.uses.coord_effort` = "off" turns it off).
+where its `coord_effort` use is allowed (see jevuse; `jev.uses.coord_effort` = "off" turns it off),
+and only when the turn has something worth escalating that Jev has not raised a turn for already
+(`worth_asking`): a new failed or blocked task, a high or critical event, a user message, or an external
+wait older than coordinator.jev_wait_h. Otherwise the call is skipped, logged in the turn's note as
+skipped and not in jev_calls, so it is neither charged nor scored.
 Jev reads a compact summary of what the turn will see and rates four reasons a turn may need thought;
-any one at THRESHOLD or above makes it 'needs_thought' and the turn runs at unblock_effort. Every other
-outcome, an error included, leaves the rules' choice; JevOutOfFunds reaches the caller for its alert.
+any one at coordinator.jev_threshold (THRESHOLD) or above makes it 'needs_thought' and the turn runs at
+unblock_effort; the events and messages it raised for are remembered (RAISED_KEY) and never raise
+another turn. Every other outcome, an error included, leaves the rules' choice; JevOutOfFunds reaches
+the caller for its alert.
 
 Each call is logged in jev_calls with its verdict, the effort it led to and whether that escalated
 the turn, and once the turn ends (`settle`) with what the turn did. A needs_thought call is counted as
@@ -21,11 +27,16 @@ from __future__ import annotations
 import json
 import time
 
+from . import coordinator as coord
 from . import jevuse
 from .db import DB
 
 JEV_USE = "coord_effort"
-THRESHOLD = 0.5
+THRESHOLD = 0.7       # default of coordinator.jev_threshold
+WAIT_H = 6.0          # default of coordinator.jev_wait_h
+WORTH_KINDS = ("task_failed", "task_blocked")
+RAISED_KEY = "coord_check_raised"   # kv: event ("e<id>") and message ("m<id>") keys Jev raised a turn for
+RAISED_KEEP = 500
 SUMMARY_CHARS = 4000
 EVENT_CHARS = 300
 REASONS = {
@@ -61,12 +72,53 @@ def summary(db: DB, event_ids: list[int], wake_due: str | None = None) -> str:
     return "\n".join(lines)[:SUMMARY_CHARS]
 
 
-def check(db: DB, cfg: dict, jev, text: str, rules_effort: str, high_effort: str) -> dict | None:
+def _num(cfg: dict, key: str, default: float) -> float:
+    try:
+        return float((cfg.get("coordinator") or {}).get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def worth_asking(db: DB, cfg: dict, event_ids: list[int], msg_ids: list[int] | None = None,
+                 now: float | None = None) -> tuple[list[str], str]:
+    """The keys of what makes the turn worth Jev's call ("e<id>" events, "m<id>" messages) that Jev
+    has not raised a turn for yet, and why: a new task_failed or task_blocked event, a high or critical
+    event, a user message, or a task_waiting event of a task whose external waits began over
+    coordinator.jev_wait_h ago. ([], why not) when there is none."""
+    now = time.time() if now is None else now
+    keys: list[str] = [f"m{i}" for i in msg_ids or []]
+    why = {"user message"} if keys else set()
+    rows = db.q(f"SELECT id, kind, severity, task FROM events WHERE id IN ({','.join('?' * len(event_ids))}) "
+                "ORDER BY id", list(event_ids)) if event_ids else []
+    wait_s = _num(cfg, "jev_wait_h", WAIT_H) * 3600
+    for r in rows:
+        if r["kind"] in WORTH_KINDS:
+            why.add(r["kind"])
+        elif r["severity"] in coord.EFFORT_SEVERITIES:
+            why.add(f"{r['severity']} event")
+        elif r["kind"] == "task_waiting" and r["task"] and                 (stint := coord.wait_stint(db, r["task"], now)[1]) and now - stint[-1]["ts"] >= wait_s:
+            why.add(f"waiting over {wait_s / 3600:g} h")
+        else:
+            continue
+        keys.append(f"e{r['id']}")
+    if not keys:
+        return [], "no failed or blocked task, high event, user message or long wait"
+    raised = set(db.kv(RAISED_KEY, []) or [])
+    new = [k for k in keys if k not in raised]
+    return (new, ", ".join(sorted(why))) if new else ([], "already raised for these events")
+
+
+def check(db: DB, cfg: dict, jev, text: str, rules_effort: str, high_effort: str,
+          event_ids: list[int] | None = None, msg_ids: list[int] | None = None) -> dict | None:
     """Jev's verdict on a turn the rules leave at `rules_effort`: {"verdict", "reason", "effort",
-    "escalated", "jev_call"}, or None when the check is off or Jev gave no answer. Any error but
+    "escalated", "jev_call"}, {"verdict": "skipped", "reason"} (no call: nothing worth asking about,
+    see worth_asking), or None when the check is off or Jev gave no answer. Any error but
     JevOutOfFunds is the caller's to treat as None."""
     if jev is None or not jev.enabled() or not jevuse.allowed(db, cfg, JEV_USE):
         return None
+    keys, why = worth_asking(db, cfg, list(event_ids or []), msg_ids)
+    if not keys:
+        return {"verdict": "skipped", "reason": why, "jev_call": None, "escalated": False}
     ans = jev.decide(text, {k: {"type": "noul", "instructions": q, "criteria": {"true": t, "false": f}}
                             for k, (q, t, f) in REASONS.items()}, purpose=JEV_USE, timeout=10.0)
     if ans is None:
@@ -80,12 +132,15 @@ def check(db: DB, cfg: dict, jev, text: str, rules_effort: str, high_effort: str
     if not ps:
         return None
     top = max(ps, key=ps.get)
-    thought = ps[top] >= THRESHOLD
+    thought = ps[top] >= _num(cfg, "jev_threshold", THRESHOLD)
     effort = high_effort if thought else rules_effort
     out = {"verdict": "needs_thought" if thought else "routine", "reason": f"{top} {ps[top]:.2f}",
            "p": ps, "rules_effort": rules_effort, "effort": effort, "escalated": effort != rules_effort}
     out["jev_call"] = jevuse.record(db, JEV_USE, out, getattr(jev, "last_cost", 0.0),
                                     avoided_usd=jevuse.mean_turn_cost(db, cfg) if thought else 0.0)
+    if thought:
+        raised = [k for k in db.kv(RAISED_KEY, []) or [] if k not in keys] + keys
+        db.set_kv(RAISED_KEY, raised[-RAISED_KEEP:])
     return out
 
 

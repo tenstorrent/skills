@@ -165,8 +165,11 @@ and preferences you add later become part of the project's charter and memory.
   blocked tasks or open asks. Routine bookkeeping stays at the base effort; such a turn that finds
   its batch harder than it looked returns `escalate`, and the same batch reruns once at high
   effort (never twice, and never from a raised turn; kv `escalations` counts them). A pinned
-  `coordinator.effort` wins over all of this. With a Jev key, Jev also rates every turn the triggers
-  leave below high 'routine' or 'needs thought'; needs thought raises the turn the same way. Each
+  `coordinator.effort` wins over all of this. With a Jev key, Jev also rates a turn the triggers
+  leave below high 'routine' or 'needs thought', but only when it has a new failed or blocked task,
+  high or critical event, user message, or an external wait older than `coordinator.jev_wait_h` (6);
+  other turns skip the call and say so in their note. A reason rated at `coordinator.jev_threshold`
+  (0.7) or above raises the turn the same way, and the same events never raise a second turn. Each
   call is logged with the effort it led to and what the turn did, and reported in the daily review;
   `jev.uses.coord_effort` = `off` turns the check off.
 - The web app shows spend per day, per task and per recurring job, and plan-window peaks for the
