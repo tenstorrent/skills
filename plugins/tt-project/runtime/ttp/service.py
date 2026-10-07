@@ -19,6 +19,7 @@ import plistlib
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -425,9 +426,9 @@ def take_restart_request(p: Project, started: float) -> bool:
 def reap_restart_request(p: Project, started: float) -> str | None:
     """The daemon's side, once per tick after a good one: a taken request whose helper ended without a
     result is finished here, so the requester's probe fires. A daemon started after the request was taken
-    is the restart: outcome running. Otherwise the helper could not start or was interrupted while the old
-    daemon runs on: outcome failed, with the tail of logs/restart.log and one high alert. Returns the
-    outcome written, or None."""
+    is the restart: outcome running. Otherwise the helper could not start, was interrupted, or hung past
+    HELPER_BOUND_S (its process group is killed first) while the old daemon runs on: outcome failed, with
+    the tail of logs/restart.log and one high alert. Returns the outcome written, or None."""
     taken = p.state / (RESTART_REQUEST + ".taken")
     try:
         info = json.loads(taken.read_text())
@@ -455,10 +456,17 @@ def reap_restart_request(p: Project, started: float) -> str | None:
         return None                        # still restarting
     else:
         outcome = "failed"
-        how = ("could not start (it never got past its imports)" if HELPER_STARTED not in log
+        hung = proc is not None and rc is None
+        if hung:                           # its own session (start_new_session): stop it before reporting
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait(timeout=10)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        how = ("hung" if hung else "could not start (it never got past its imports)" if HELPER_STARTED not in log
                else "was interrupted before it reported")
-        ended = (f"exited with code {rc}" if rc is not None else
-                 f"is still running after {age:.0f}s" if proc is not None else f"left no result after {age:.0f}s")
+        ended = (f"was still running after {age:.0f}s and was stopped" if hung else
+                 f"exited with code {rc}" if rc is not None else f"left no result after {age:.0f}s")
         text = (f"The restart helper {how}: it {ended}. The old daemon (pid {os.getpid()}) still runs the "
                 f"previous runtime; nothing was restarted or rolled back. logs/restart.log: {log or 'empty'}")
         p.db.post("out", f"The requested daemon restart failed. {text}", chat=None, kind="alert", severity="high")

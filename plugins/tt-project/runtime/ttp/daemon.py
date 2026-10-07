@@ -293,7 +293,10 @@ class Daemon:
             try:
                 self.tick()
                 self._beat()
-                service.reap_restart_request(self.p, self._started)   # a restart helper that left no result
+                try:
+                    service.reap_restart_request(self.p, self._started)   # a restart helper that left no result
+                except Exception:  # never in the way of a new restart request
+                    log(self.p, "restart reap error: " + traceback.format_exc().replace("\n", " | ")[:2000])
                 service.take_restart_request(self.p, self._started)   # a sandboxed `ttp upgrade --apply` asked
             except Exception:  # a bad tick must never kill the daemon
                 log(self.p, "tick error: " + traceback.format_exc().replace("\n", " | ")[:2000])

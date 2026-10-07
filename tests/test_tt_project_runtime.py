@@ -7992,6 +7992,65 @@ def test_a_restart_helper_interrupted_without_a_handle_is_reaped_after_its_bound
     assert service.reap_restart_request(p, started) is None and (p.state / "restart.request.taken").exists()
 
 
+def test_a_restart_helper_hung_past_its_bound_is_killed_with_its_group_and_labelled_hung(env, monkeypatch):
+    from ttp import service
+    p = make(env)
+    at = time.time() - service.HELPER_BOUND_S - 60
+    (p.state / "restart.request.taken").write_text(json.dumps({"at": at, "pid": 1, "taken": at}))
+    kid = env["tmp"] / "hung-child.pid"
+    proc = subprocess.Popen(["sh", "-c", f"sleep 600 & echo $! > {shlex.quote(str(kid))}; wait"],
+                            start_new_session=True)
+    monkeypatch.setitem(service._helpers, str(p.base), proc)
+    deadline = time.time() + 10
+    while not (kid.exists() and kid.read_text().strip()) and time.time() < deadline:
+        time.sleep(0.05)
+    child = int(kid.read_text())
+    try:
+        assert service.reap_restart_request(p, time.time() - 7200) == "failed"
+        assert proc.poll() is not None, "the hung helper must be stopped before it is reported"
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                os.kill(child, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("the helper's own children must go with its process group")
+        res = service._restart_result(p, at)
+        assert "hung" in res["text"] and "was stopped" in res["text"] and "was interrupted" not in res["text"]
+        assert "nothing was restarted or rolled back" in res["text"]
+        assert not (p.state / "restart.request.taken").exists() and str(p.base) not in service._helpers
+    finally:
+        for pid in (proc.pid, child):
+            try:
+                os.kill(pid, 9)
+            except OSError:
+                pass
+        proc.wait(timeout=10)
+
+
+def test_a_failing_restart_reap_never_stops_a_new_restart_request(env, monkeypatch):
+    from ttp import daemon as dm, service, web
+    p = make(env)
+    d = dm.Daemon(p.base)
+    taken = []
+
+    def boom(p, started):
+        raise RuntimeError("reap broke")
+
+    monkeypatch.setattr(d, "tick", lambda: setattr(d, "stopping", True))
+    monkeypatch.setattr(service, "reap_restart_request", boom)
+    monkeypatch.setattr(service, "take_restart_request", lambda p, started: taken.append(started) or True)
+    monkeypatch.setattr(web, "serve", lambda daemon: None)
+    monkeypatch.setattr(dm.signal, "signal", lambda *a: None)
+    monkeypatch.setattr(dm.time, "sleep", lambda s: None)
+    assert d.run() == 0
+    assert taken == [d._started], "the restart request is still taken"
+    text = (p.logs / "daemon.log").read_text()
+    assert "restart reap error" in text and "reap broke" in text and "tick error" not in text
+
+
 def test_a_daemon_started_after_the_request_was_taken_clears_the_leftover_claim(env, monkeypatch):
     from ttp import daemon as dm, service, web
     p = make(env)
