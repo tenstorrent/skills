@@ -1081,9 +1081,13 @@ def cmd_checks(a) -> None:
     if not cmds:
         die("ttp checks: the project sets no delivery.push_checks; give the repository's test commands after "
             "`--`, e.g. ttp checks -- pytest -q")
-    git = ["git", "-C", str(Path.cwd())]
+    # The checks run at the top of the worktree being checked, as `ttp push` runs them, wherever in
+    # it this was started: a repo-relative check started in a subdirectory would test the wrong place.
+    top = subprocess.run(["git", "-C", str(Path.cwd()), "rev-parse", "--show-toplevel"], capture_output=True,
+                         text=True).stdout.strip()
+    git = ["git", "-C", top or str(Path.cwd())]
     head = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
-    if not head:
+    if not top or not head:
         die("ttp checks: run it in the change's git worktree")
     if subprocess.run([*git, "status", "--porcelain", "--untracked-files=no"], capture_output=True,
                       text=True).stdout.strip():
@@ -1096,7 +1100,8 @@ def cmd_checks(a) -> None:
     passed, failed = True, None
     start = log.stat().st_size if log.exists() else 0
     with open(log, "a") as out:
-        todo, skipped = push.applicable(Path.cwd(), head, cmds, lambda m: (print(f"ttp checks: {m}"),
+        out.write(f"ttp checks: in {top} on {head[:12]}\n")
+        todo, skipped = push.applicable(Path(top), head, cmds, lambda m: (print(f"ttp checks: {m}"),
                                                                            out.write(f"{m}\n")))
         hit = _recorded_pass(p, tree, todo) if todo and not a.fresh else None
         if not todo:
@@ -1112,8 +1117,8 @@ def cmd_checks(a) -> None:
             out.flush()
             # A detached run gives each check a group of its own, so a stop ends it with ttp checks.
             group = bool(getattr(a, "own_group", False))
-            proc = subprocess.Popen(c, shell=True, stdout=out, stderr=subprocess.STDOUT, start_new_session=group,
-                                    env=push.check_env("checks"))
+            proc = subprocess.Popen(c, shell=True, cwd=top, stdout=out, stderr=subprocess.STDOUT,
+                                    start_new_session=group, env={**push.check_env("checks"), "PWD": top})
             try:
                 rc = proc.wait()
             except BaseException:
@@ -1123,8 +1128,8 @@ def cmd_checks(a) -> None:
             if rc != 0:
                 passed, failed = False, c
                 break
-    write_json(Path(run_dir) / prguard.CHECKS_FILE, {"head": head, "passed": passed, "commands": todo,
-                                                     "skipped": skipped, "ts": time.time()})
+    write_json(Path(run_dir) / prguard.CHECKS_FILE, {"head": head, "worktree": top, "passed": passed,
+                                                     "commands": todo, "skipped": skipped, "ts": time.time()})
     if not passed:
         from . import trim
         with open(log, "rb") as f:   # this call's part of the log: a test run's failures, else head and tail
