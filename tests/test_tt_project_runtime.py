@@ -13872,6 +13872,66 @@ def test_a_push_batch_settles_version_lines_and_lines_both_sides_added(env, monk
     assert _versions(origin) == ("0.1.1", "0.1.1") and len(_bump_commits(origin)) == 1
 
 
+def test_merge3_hunks_takes_both_changes_only_where_they_touch_different_lines(env):
+    """git calls changes of adjacent lines a conflict. With `hunks` (the push batch), a conflict whose
+    two sides changed different lines of the base takes both; one where they changed the same line,
+    or where one inserts at the edge of the other's change, or both add one line, stays a conflict."""
+    from ttp.batch import merge3
+    base = "a\nb\nc\nd\n"
+    ours, theirs = "A\nb\nc\nd\n", "a\nB\nc\nd\n"
+    assert merge3(ours, base, theirs) is None, "without hunks, git's conflict stands"
+    kinds = set()
+    assert merge3(ours, base, theirs, hunks=True, kinds=kinds) == "A\nB\nc\nd\n" and kinds == {"hunks"}
+    assert merge3("a\nb\nc\n", "a\nb\nX\nc\n", "a\nB\nX\nc\n", hunks=True) == "a\nB\nc\n", "a deletion next to an edit"
+    assert merge3("a\nX\nb\n", "a\nb\n", "a\nB\n", hunks=True) is None, "an insertion at the edge of an edit"
+    assert merge3("a\nX\n", "a\nb\n", "a\nY\n", hunks=True) is None, "both changed one line"
+    assert merge3("A\nimport os\nb\n", "a\nb\n", "a\nB\nimport os\n", hunks=True) is None, "both add one line"
+    kinds = set()
+    assert merge3("a\nX\n", "a\n", "a\nY\n", hunks=True, kinds=kinds) == "a\nX\nY\n" and kinds == {"added"}
+    py = "def f(x):\n    if x:\n        return 1\n    return 0\n"
+    assert merge3(py.replace("if x:", "if x and y:"), py, py.replace("return 1", "return 2"), py=True, hunks=True) \
+        == "def f(x):\n    if x and y:\n        return 2\n    return 0\n"
+
+
+def test_a_push_batch_takes_both_changes_of_adjacent_lines_and_sends_back_only_a_real_overlap(env, monkeypatch, capsys):
+    """Three changes of one file: the first two edit adjacent lines (a conflict to git, none in fact),
+    the third edits the line the first changed. The batch takes both of the first two, runs the checks
+    on the result and pushes it; only the third goes back. The marker and the log count it all."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    _commit(other, "notes.txt", "a\nb\nc\n")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    heads = [_entry(repo, "e1", {"notes.txt": "A1\nb\nc\n"}), _entry(repo, "e2", {"notes.txt": "a\nB2\nc\n"}),
+             _entry(repo, "e3", {"notes.txt": "A3\nb\nc\n"})]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert m["outcome"] == "pushed" and _statuses(m) == ["pushed", "pushed", "conflict"], m
+    assert _git_out(origin, "show", "proj:notes.txt") == "A1\nB2\nc"
+    assert m["results"][1]["detail"] == {"settled": ["notes.txt"], "settled_by": ["hunks"]}
+    assert "settled" not in m["results"][0]["detail"] and m["results"][2]["detail"]["files"] == ["notes.txt"]
+    assert m["conflicts"] == {"entries": 3, "conflicted": 2, "auto_resolved": 1, "by_hunks": 1, "sent_back": 1}
+    out = capsys.readouterr().out
+    assert "settled notes.txt (changes of different lines)" in out
+    assert "conflicts: 2 of 3 entries, 1 settled without judgment (1 by changes of different lines), 1 sent back" in out
+
+
+def test_the_push_queue_counts_conflicts_and_those_its_batches_resolved(env):
+    from ttp import pushq
+    p, rid = _pq_rows(env)
+    now = time.time()
+    assert pushq.conflict_stats(p.db, now - 3600)["entries"] == 0
+    for status, detail in (("pushed", None), ("pushed", {"settled": ["a.py"], "settled_by": ["hunks"]}),
+                           ("check_failed", {"cmd": "pytest", "settled": ["b.py"], "settled_by": ["added"]}),
+                           ("conflict", {"files": ["c.py"]}), ("approved", None)):
+        _pq_row(p, rid, now, status=status, batch="b1")
+        p.db.x("UPDATE push_queue SET detail=? WHERE id=(SELECT MAX(id) FROM push_queue)",
+               (json.dumps(detail) if detail else None,))
+    _pq_row(p, rid, now, status="conflict", batch="b0")
+    p.db.x("UPDATE push_queue SET updated=? WHERE id=(SELECT MAX(id) FROM push_queue)", (now - 8 * 86400,))
+    want = {"entries": 4, "conflicted": 3, "auto_resolved": 2, "sent_back": 1, "conflict_pct": 75, "sent_back_pct": 25}
+    assert pushq.summary(p, now)["conflicts"] == want, "a week's settled rows; the older one and approved ones are out"
+    assert "last 7 days: 4 entries done, 3 conflicted (75%), 2 resolved in the batch, 1 sent back (25%)" \
+        in pushq.queue_text(p, now).splitlines()
+
+
 def test_a_push_batch_does_not_settle_an_addition_that_repeats_a_top_level_name(env, monkeypatch):
     p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
     _commit(other, "test_x.py", "def test_a():\n    assert True\n")
@@ -13922,7 +13982,7 @@ def test_a_push_batch_rebuilds_a_worktree_a_crash_left_mid_rebase(env, monkeypat
     heads = [_entry(repo, f"e{n}", {"plugins/p/notes.txt": f"a\nX{n}\nc\n"}) for n in (1, 2)]
     before = _git_out(origin, "rev-parse", "proj")
     crash = ("import os, sys\nfrom ttp import batch, cli\n"
-             "batch.settle = lambda *a: os._exit(9)\ncli.main(['push', '--batch', sys.argv[1]])\n")
+             "batch.settle = lambda *a, **k: os._exit(9)\ncli.main(['push', '--batch', sys.argv[1]])\n")
     r = subprocess.run([sys.executable, "-c", crash, str(_batch_marker(p, heads))], cwd=str(repo), input="",
                        capture_output=True, text=True, timeout=120, env={**os.environ, "PYTHONPATH": str(RUNTIME)})
     from ttp import batch

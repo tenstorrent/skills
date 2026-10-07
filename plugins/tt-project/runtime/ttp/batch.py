@@ -5,8 +5,9 @@
 The daemon writes a marker naming the reviewed changes to push (entries: a branch and its reviewed
 head), takes the batch's run lock and starts this process, which inherits the lock. The process
 replays the entries in order onto the target's tip in a worktree of its own (`worktrees/push`) and
-settles the conflicts that need no judgment: version lines, and both sides adding different lines at
-one spot. It bumps the version once for all entries, runs the push checks once on the result and
+settles the conflicts that need no judgment: version lines, both sides adding different lines at
+one spot, and both sides changing different lines that git calls a conflict only because they are
+adjacent. The marker counts the entries that conflicted, were settled and were sent back. It bumps the version once for all entries, runs the push checks once on the result and
 pushes it without force. It always runs them itself and never reads the passes `ttp checks` records. When the checks fail, a binary search over prefixes finds the first failing
 entry, and the passing prefix is pushed. The outcome goes into the marker per entry; the daemon
 applies it to the reviews.
@@ -17,6 +18,7 @@ under a lock of its own, `after_push:run-<id>`. A marker that has an outcome but
 not finish is resumed: only the after_push step runs."""
 from __future__ import annotations
 
+import difflib
 import fcntl
 import os
 import re
@@ -38,6 +40,8 @@ WORKTREE = "push"             # the batch's own checkout under the project's wor
 AFTER_PUSH = "after_push-"    # + batch id: the temporary checkout after_push runs in
 DEFAULT_AFTER_PUSH_TIMEOUT_S = 1800
 STALE = "(stale plugin version)"   # the `cmd` of a check failure that is push.stale_versions
+SETTLED_WORDS = {"version": "version lines", "added": "lines both sides added",
+                 "hunks": "changes of different lines", "taken_in": "a change the other side holds"}
 REPLAYED = "Ttp-Replayed-From"     # trailer of a commit the batch settled: the entry commit it replays
 TOP_DEF = re.compile(r"^(?:async[ \t]+def|def|class)[ \t]+([A-Za-z_]\w*)", re.M)
 TOP_START = re.compile(r"(?:@|(?:async[ \t]+)?def[ \t]|class[ \t])")
@@ -213,13 +217,16 @@ def _sweep_after_push(p: Project, repo: Path) -> None:
 
 # Conflicts that need no judgment ---------------------------------------------------------------------
 
-def merge3(ours: str, base: str, theirs: str, py: bool = False, taken_in: bool = False) -> str | None:
+def merge3(ours: str, base: str, theirs: str, py: bool = False, taken_in: bool = False,
+           hunks: bool = False, kinds: set | None = None) -> str | None:
     """git's three-way merge of the texts, where each conflict in which both sides only added lines
     at one spot (an empty base section) keeps both: ours first, then theirs (in Python, see _seam).
     With `taken_in`, a conflict whose change on our side theirs already holds (_taken_in) takes
-    theirs. None when any other conflict remains, or when keeping both could be wrong (_clash). The
-    conflict markers carry a random tag, so file content never passes for one; a hunk whose
-    base-to-end part holds more than one separator line is not read."""
+    theirs. With `hunks`, a conflict where the two sides changed different lines of the base section
+    (git calls adjacent changes a conflict) takes both changes (_hunks). None when any other conflict
+    remains, or when keeping both could be wrong (_clash). `kinds` collects how each conflict was
+    settled ("added", "taken_in", "hunks"). The conflict markers carry a random tag, so file content
+    never passes for one; a hunk whose base-to-end part holds more than one separator line is not read."""
     tag = secrets.token_hex(8)
     # built, not spelled out: a literal marker line would make this file read as a conflicted one
     start, mid, end = (f"{c * 7} {side}-{tag}" for c, side in (("<", "ours"), ("|", "base"), (">", "theirs")))
@@ -251,7 +258,7 @@ def merge3(ours: str, base: str, theirs: str, py: bool = False, taken_in: bool =
         while j < len(lines) and lines[j].rstrip("\r\n") != sep:
             old.append(lines[j])
             j += 1
-        if old and not taken_in:
+        if old and not (taken_in or hunks):
             return None                 # the base section is not empty: a real conflict
         j, theirs_lines = j + 1, []
         while j < len(lines) and lines[j].rstrip("\r\n") != end:
@@ -263,12 +270,45 @@ def merge3(ours: str, base: str, theirs: str, py: bool = False, taken_in: bool =
             return None
         if taken_in and _taken_in(mine, old, theirs_lines):
             res += theirs_lines
-        elif old or _clash(mine, theirs_lines, py):     # a real conflict
-            return None
-        else:
+            how = "taken_in"
+        elif not old and not _clash(mine, theirs_lines, py):
             res += _seam(mine, theirs_lines) if py else mine + theirs_lines
+            how = "added"
+        elif old and hunks and (both := _hunks(mine, old, theirs_lines, py)) is not None:
+            res += both
+            how = "hunks"
+        else:                           # a real conflict
+            return None
+        if kinds is not None:
+            kinds.add(how)
         i = j + 1
     return "".join(res)
+
+
+def _hunks(mine: list[str], old: list[str], theirs: list[str], py: bool) -> list[str] | None:
+    """Both sides' changes of the `old` lines of one conflict, when they touch different lines: each
+    side's edits (line diff against old) share no old line, and neither inserts lines at the edge of
+    or inside an edit of the other (the order would be a guess). None on an overlap, or when the
+    lines the two sides added share one (_said: the result would hold it twice)."""
+    def edits(side: list[str]) -> list[tuple[int, int, list[str]]]:
+        sm = difflib.SequenceMatcher(None, old, side, autojunk=False)
+        return [(i1, i2, side[j1:j2]) for tag, i1, i2, j1, j2 in sm.get_opcodes() if tag != "equal"]
+    a, b = edits(mine), edits(theirs)
+    if not a or not b:
+        return None
+    for i1, i2, _ in a:
+        for j1, j2, _ in b:
+            if i1 < j2 and j1 < i2:                     # both changed an old line
+                return None
+            if (i1 == i2 and j1 <= i1 <= j2) or (j1 == j2 and i1 <= j1 <= i2):
+                return None                             # an insertion where the other edits
+    if _said([x for *_, new in a for x in new], py) & _said([x for *_, new in b for x in new], py):
+        return None
+    out, pos = [], 0
+    for i1, i2, new in sorted(a + b, key=lambda e: e[:2]):
+        out += old[pos:i1] + new
+        pos = i2
+    return out + old[pos:]
 
 
 def _taken_in(mine: list[str], old: list[str], theirs: list[str]) -> bool:
@@ -357,13 +397,15 @@ def _show(wt: Path, stage: int, path: str) -> bytes | None:
     return r.stdout if r.returncode == 0 else None
 
 
-def settle(wt: Path, path: str, version_files: list[str], taken_in: bool = False) -> bool:
+def settle(wt: Path, path: str, version_files: list[str], taken_in: bool = False, hunks: bool = False,
+           kinds: set | None = None) -> bool:
     """Settle the conflicted `path` of a stopped rebase in `wt`, if it needs no judgment, and write
     the result: True when settled. Ours (stage 2) is the batch head, theirs (stage 3) the entry.
     In a version file every stage first takes the batch head's version, so a version line alone
     never conflicts. A pure addition keeps both sides (merge3), unless in a .py file that leaves a
     top-level def or class name twice where neither side had it twice (it would silently shadow a
-    test). `taken_in` is merge3's. A file both sides created is never settled."""
+    test). `taken_in`, `hunks` and `kinds` are merge3's; a version line taken adds "version" to
+    `kinds`. A file both sides created is never settled."""
     ours, base, theirs = _show(wt, 2, path), _show(wt, 1, path), _show(wt, 3, path)
     if ours is None or theirs is None or base is None:
         return False                    # deleted on one side, or created on both
@@ -373,15 +415,21 @@ def settle(wt: Path, path: str, version_files: list[str], taken_in: bool = False
         return False
     if "\0" in o + b + t:
         return False
+    how: set = set()
     if path in version_files and (mv := push.VERSION_RE.search(o)):
         v = ".".join(mv.group(2, 3, 4))
-        b, t = (push.VERSION_RE.sub(lambda m: f"{m.group(1)}{v}{m.group(5)}", x, count=1) for x in (b, t))
-    merged = merge3(o, b, t, py=path.endswith(".py"), taken_in=taken_in)
+        vb, vt = (push.VERSION_RE.sub(lambda m: f"{m.group(1)}{v}{m.group(5)}", x, count=1) for x in (b, t))
+        if (vb, vt) != (b, t):
+            how.add("version")
+        b, t = vb, vt
+    merged = merge3(o, b, t, py=path.endswith(".py"), taken_in=taken_in, hunks=hunks, kinds=how)
     if merged is None:
         return False
     if path.endswith(".py") and _duplicates(merged) - _duplicates(o) - _duplicates(t):
         return False
     durable_write(wt / path, merged)
+    if kinds is not None:
+        kinds |= how
     return True
 
 
@@ -431,6 +479,8 @@ class Batch:
         self.target_lock = None
         self.detail_tip: dict | None = None     # the tip's own failing check, for tip_failed
         self.info: dict[int, dict] = {}
+        self.settled: dict[int, dict] = {}     # entry index -> the conflicts its replay settled
+        self._settling: tuple[list[str], set] = ([], set())   # files and kinds of the replay running
 
     # results
 
@@ -438,8 +488,19 @@ class Batch:
         self.status[i], self.detail[i] = status, detail
 
     def results(self) -> list[dict]:
+        """Each entry's outcome; the detail of one whose replay settled conflicts names them
+        ("settled": files, "settled_by": kinds), so a check failure after it can be traced to it."""
         return [{"id": e.get("id"), "task": e.get("task"), "status": self.status.get(i, "requeued"),
-                 "detail": self.detail.get(i, {})} for i, e in enumerate(self.entries)]
+                 "detail": {**self.detail.get(i, {}), **self.settled.get(i, {})}} for i, e in enumerate(self.entries)]
+
+    def conflicts(self) -> dict:
+        """The round's conflict counts, for the marker and the log: entries replayed, those that hit a
+        conflict, those whose conflicts all settled without judgment, and those settled by taking
+        both sides' changes of different lines ("hunks")."""
+        real = sum(1 for st in self.status.values() if st == "conflict")
+        hunks = sum(1 for d in self.settled.values() if "hunks" in d["settled_by"])
+        return {"entries": len(self.entries), "conflicted": real + len(self.settled),
+                "auto_resolved": len(self.settled), "by_hunks": hunks, "sent_back": real}
 
     def _all(self, status: str, outcome: str, message: str = "", keep: tuple = ()) -> str:
         """Every entry not in a status of `keep` gets `status`; returns `outcome`."""
@@ -581,7 +642,7 @@ class Batch:
         carried entries as (index, batch head after it); the others get their status here."""
         carried: list[tuple[int, str]] = []
         h = tip
-        self.info = {}
+        self.info, self.settled = {}, {}
         csdir = self.cfg["changeset_dir"] if self.cfg else ""
         for i, e in enumerate(self.entries):
             sha = str(e.get("head") or "")
@@ -617,7 +678,10 @@ class Batch:
             if bad := push.excluded(self.repo, tip, top, push.exclude_list(self.d.get("push_exclude_paths"))):
                 self._set(i, "refused", message=push.excluded_refusal(bad, self.target))
                 continue
+            self._settling = ([], set())
             new, files = self._rebase(h, top)
+            if files is None and self._settling[0]:
+                self.settled[i] = {"settled": sorted(set(self._settling[0])), "settled_by": sorted(self._settling[1])}
             if files is not None:
                 say(f"entry {e.get('id')} ({e.get('branch')}) conflicts with {h[:10]} in {', '.join(files)}")
                 self._set(i, "conflict", files=files, onto=h, _after=len(carried))
@@ -650,7 +714,9 @@ class Batch:
 
     def _rebase(self, onto: str, top: str) -> tuple[str, list[str] | None]:
         """Rebase the entry's commits up to `top` onto `onto` in the worktree, settling conflicts that
-        need no judgment: (new head, None), or (onto, conflicted files) after aborting a real one."""
+        need no judgment (the push checks then run on the result, as on any other): (new head, None),
+        or (onto, conflicted files) after aborting a real one. The files and kinds settled go to
+        self._settling."""
         wt = self.wt
         version_files = self.cfg["files"] if self.cfg else []
         r = _git(wt, "rebase", "--no-keep-empty", onto, top)
@@ -660,12 +726,16 @@ class Batch:
             stopped = _rebasing(wt)
             files = [f for f in _git(wt, "diff", "--name-only", "-z", "--diff-filter=U").stdout.split("\0")
                      if f] if stopped else []
-            real = [f for f in files if not settle(wt, f, version_files)]
+            kinds: set = set()
+            real = [f for f in files if not settle(wt, f, version_files, hunks=True, kinds=kinds)]
             if real or not files:       # a real conflict, or a stop that is no conflict at all
                 if stopped:
                     _git(wt, "rebase", "--abort")
                 return onto, real or [f"(the rebase stopped: {_last(r.stderr or r.stdout, 3)})"]
-            say(f"settled {', '.join(files)} (version lines, or lines both sides added)")
+            how = ", ".join(SETTLED_WORDS.get(k, k) for k in sorted(kinds)) or "a clean three-way merge"
+            say(f"settled {', '.join(files)} ({how})")
+            self._settling[0].extend(files)
+            self._settling[1].update(kinds)
             _git(wt, "add", "--", *files)
             _commit_replayed(wt)
             r = _git(wt, "rebase", "--continue")
@@ -917,8 +987,13 @@ def run_batch(p: Project, marker: Path) -> int:
     except Exception as e:      # recorded, never left without an outcome
         outcome = b.error(e)
     m = push._read(marker) or m
+    conflicts = b.conflicts()
     m.update(outcome=outcome, tip=b.tip, pushed_sha=b.pushed_sha, version=b.version, results=b.results(),
-             checks=b.checks, rounds=b.rounds, message=b.message or None)
+             checks=b.checks, rounds=b.rounds, message=b.message or None, conflicts=conflicts)
+    if conflicts["conflicted"]:
+        say(f"conflicts: {conflicts['conflicted']} of {conflicts['entries']} entries, {conflicts['auto_resolved']} "
+            f"settled without judgment ({conflicts['by_hunks']} by changes of different lines), "
+            f"{conflicts['sent_back']} sent back")
     if outcome == "tip_failed":
         m["tip_check"] = b.detail_tip
     write_json(marker, m)

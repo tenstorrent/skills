@@ -316,8 +316,11 @@ and preferences you add later become part of the project's charter and memory.
   exact head it reviewed (`"push": [{"branch", "head"}]` in its hand-off) and becomes `pushing`; it
   never runs `ttp push`. Without a model, the daemon replays the approved changes in order onto the
   latest tip of `delivery.push_branch`, adds one version bump and changeset for the batch, runs
-  `delivery.push_checks` once and pushes without force. Then the reviews are `done`. A change that
-  no longer rebases goes back to its review to resolve the conflict; a failed check fails the
+  `delivery.push_checks` once and pushes without force. Then the reviews are `done`. Conflicts
+  that need no judgment are settled in the batch and judged by those checks: version lines, lines
+  both sides added at one spot, and changes of different lines that git calls a conflict only
+  because they are adjacent. A change that really overlaps another goes back to its review to
+  resolve the conflict; a failed check fails the
   review and wakes the coordinator. Keys, all under `delivery`: `push_batch_s` (default 900: a
   batch starts once the oldest approval waited this long; 0 = at once), `push_batch_max`
   (default 8: start at once with this many; also the most one batch takes), `push_min_gap_s`
@@ -331,7 +334,8 @@ and preferences you add later become part of the project's charter and memory.
   fails the reviews: their change is already on the branch. Off (the default), each review
   pushes with `ttp push --detach` as above. `ttp status` shows one line about the queue (what
   waits, the running batch, the last push and its deploy), the web app a Push queue card, and
-  `ttp push --queue` lists the entries and the last 10 batches. Only a rejected push, a failed
+  `ttp push --queue` lists the entries, the last 7 days' conflict counts (conflicted, resolved in
+  the batch, sent back) and the last 10 batches. Only a rejected push, a failed
   `after_push` and batches that keep dying reach the top section, and only while they last.
 - `delivery.backup_remote` (off by default) names a git remote that each finished code task's
   branch (`ttp/t<id>-...`) is pushed to under the same name, fast-forward only: never forced, never

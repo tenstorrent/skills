@@ -40,6 +40,7 @@ AFTER_PUSH_OFF = "after_push_off"   # kv: true while after_push is unset or the 
 TIPS_TOLD = 20                  # tip_failed shas remembered, so each tip is reported once
 ROW_RESULTS = ("pushed", "landed", "conflict", "check_failed", "requeued", "refused")
 AFTER_STATES = ("ok", "failed", "timeout", "killed", "skipped")
+STATS_S = 7 * 86400            # the conflict counts `ttp push --queue` and the web app show cover this long
 _HEX40 = re.compile(r"[0-9a-f]{40}")
 _children: dict[str, subprocess.Popen] = {}   # batch processes this daemon started, reaped by finalize
 _default_branches: dict[tuple[str, str], tuple[float, str | None]] = {}   # (root, remote): (until, branch)
@@ -929,6 +930,25 @@ def pushed_heads(db, since: float = 0) -> set[str]:
                                     (since,))}
 
 
+def conflict_stats(db, since: float) -> dict:
+    """How the queue's entries that a batch settled since `since` fared with conflicts: entries,
+    those that conflicted, those the batch resolved itself (their detail names what it "settled"),
+    those sent back for a new rebase and review, and both rates in whole percents."""
+    rows = db.q("SELECT status, detail FROM push_queue WHERE updated>=? AND status IN "
+                "('pushed','landed','conflict','check_failed','refused')", (since,))
+    auto = 0
+    for r in rows:
+        try:
+            d = json.loads(r["detail"]) if r["detail"] else {}
+        except ValueError:
+            d = {}
+        auto += bool(isinstance(d, dict) and d.get("settled"))
+    back = sum(1 for r in rows if r["status"] == "conflict")
+    n = len(rows)
+    return {"entries": n, "conflicted": back + auto, "auto_resolved": auto, "sent_back": back,
+            "conflict_pct": round(100 * (back + auto) / n) if n else 0, "sent_back_pct": round(100 * back / n) if n else 0}
+
+
 def summary(p: Project, now: float | None = None, last: int = 5, db=None) -> dict:
     """The queue for status displays: approved rows with their ages, the live batch's phase and
     age, and the last batches with outcome, sha, version and after_push. `db` is the caller's
@@ -953,7 +973,8 @@ def summary(p: Project, now: float | None = None, last: int = 5, db=None) -> dic
                     "AND pushed_sha IS NOT NULL ORDER BY started DESC LIMIT 1")
     st = _state(db)
     return {"on": enabled(p), "approved": approved, "live": live, "last": batches, "last_pushed": pushed,
-            "backoff_until": st.get("backoff_until"), "hold": st.get("hold"), "deaths": int(st.get("deaths") or 0)}
+            "backoff_until": st.get("backoff_until"), "hold": st.get("hold"), "deaths": int(st.get("deaths") or 0),
+            "conflicts": conflict_stats(db, now - STATS_S)}
 
 
 # What a live batch is doing, a finished batch's outcome and its after_push, in words for the user.
@@ -1050,6 +1071,11 @@ def queue_text(p: Project, now: float | None = None, last: int = 10) -> str:
                      + (f" (try {r['tries'] + 1})" if r["tries"] and r["status"] == "approved" else "")
                      + (f" in {r['batch']}" if r["batch"] and r["status"] != "approved" else "")
                      + f", {_age(r['age_s'])} old" + (f": {r['title']}" if r["title"] else ""))
+    c = sm["conflicts"]
+    if c["entries"]:
+        lines.append(f"last {STATS_S // 86400} days: {c['entries']} entr{'ies' if c['entries'] != 1 else 'y'} done, "
+                     f"{c['conflicted']} conflicted ({c['conflict_pct']}%), {c['auto_resolved']} resolved in the batch, "
+                     f"{c['sent_back']} sent back ({c['sent_back_pct']}%)")
     lv = sm["live"]
     lines.append("batches, newest first:" if sm["last"] or lv else "batches: none yet")
     if lv and lv["id"] not in [b["id"] for b in sm["last"]]:   # still in its push phase
