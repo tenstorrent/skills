@@ -3436,8 +3436,11 @@ def test_a_routine_digest_collapses_unchanged_background_and_keeps_what_decides_
     assert "watcher:hw 'tray dropped': 0 muted" in text["muted"] and "hardware team" not in text["muted"]
     assert "daily-review on" in text["recurring"]
     # Never collapsed: the budget gate, paused resources, open tasks, open asks and new events.
+    # (The STATE header's clock may tick over a minute between the two calls.)
+    def unstamped(t):
+        return "\n".join(line for line in t.split("\n") if not line.startswith("# STATE at "))
     for key in ("budget", "paused", "tasks", "asks", "events"):
-        assert text[key] == dict(full)[key], key
+        assert unstamped(text[key]) == unstamped(dict(full)[key]), key
     body = "\n".join(text.values())
     for need in ("green", "box-b: paused", f"#{tid} | queued", f"ask #{ask}", "a new thing happened"):
         assert need in body, need
