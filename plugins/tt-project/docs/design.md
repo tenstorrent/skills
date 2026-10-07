@@ -48,8 +48,8 @@ in `state/runs/<id>/`, so a daemon restart never loses a result.
 7. A limit or logout pauses a provider with one clear alert; it is never counted as task failure.
    Neither is a `waiting` hand-off (busy machine or queue): the task retries later, up to
    `budget.max_waits` times, then asks the user. While its `retry_when` probe exits 1 ("not yet")
-   or 255 (ssh could not reach the host) it sleeps on without a run, for at most
-   `waiting.max_hold_s` after the hand-off.
+   or 255 (ssh could not reach the host) it sleeps on without a run; past `waiting.max_hold_s`
+   after the hand-off it still sleeps, and the coordinator is asked once to fix the probe or cancel.
 8. The project folder ignores itself; nothing of a project is ever committed to the user's repo.
 9. Secrets live only in `~/.tt-project/secrets.json` (0600). Never in argv, logs or projects.
 10. The runtime is standard-library Python ≥ 3.9. Web assets are static files.

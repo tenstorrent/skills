@@ -2865,6 +2865,38 @@ def test_a_light_wake_escalates_once_at_once_and_free(env, monkeypatch):
     assert not json.loads(t["result"]).get("escalated_wake")
 
 
+def test_an_escalated_wake_that_keeps_a_retry_when_runs_only_once_its_probe_passes(env, monkeypatch):
+    """A light wake that found work for after its probe passes escalates, but the probe says when:
+    no escalated run while it says "not yet", one as soon as it exits 0."""
+    p = make(env)
+    from ttp import daemon as dmod
+    from ttp.db import dump_result
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0.2)
+    flag = env["tmp"] / "built.flag"
+    monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps(
+        {"status": "waiting", "summary": "measure once the build is done", "waiting_for": "the build",
+         "retry_after_s": 0, "wake_tier": "standard", "retry_when": f"test -f {flag}"}))
+    tid = p.db.add_task("measure after the build", "s", kind="work", tier="standard", origin="user")
+    p.db.update_task(tid, result=dump_result({"status": "waiting", "summary": "build started",
+                                              "waiting_for": "the build", "waits": 2}))
+    d = dmod.Daemon(p.base)
+
+    def runs():
+        return p.db.q("SELECT status, note FROM runs WHERE task=? AND role='worker' ORDER BY id", (tid,))
+
+    assert _run_until(d, p, lambda: len(runs()) == 1 and p.db.task(tid)["status"] == "queued"
+                      and runs()[0]["status"] != "running")
+    t = p.db.task(tid)
+    res = json.loads(t["result"])
+    assert res.get("escalated_wake") and "woke" not in res and res["waits"] == 2
+    assert t["not_before"] > time.time() and "once its probe passes" in t["blocked_reason"]
+    assert not _run_until(d, p, lambda: len(runs()) > 1, timeout=1.5), "no escalated run while it says not yet"
+    flag.write_text("")
+    monkeypatch.delenv("TTP_FAKE_RESULT")
+    assert _run_until(d, p, lambda: len(runs()) == 2)
+    assert json.loads(runs()[1]["note"])["wake"] == {"tier": "standard", "escalated": True}
+
+
 def test_a_mechanical_next_step_wakes_at_light_and_that_run_finishes_it(env, monkeypatch):
     """A review whose detached checks finished, with only its push left (next_step), takes one light
     run that pushes and is done: no light check plus a rerun at the task's tier and effort."""
@@ -14962,10 +14994,9 @@ def test_a_broken_probe_wakes_the_task_at_its_timer(env, probe, why):
     assert f"Woken because: {why}." in worker_task(p, p.db.task(tid), str(p.root), None)
 
 
-def test_an_unreachable_host_probe_keeps_the_task_asleep_until_the_hold_cap(env):
+def test_an_unreachable_host_probe_keeps_the_task_asleep_past_the_hold_cap(env):
     p = make(env)
     from ttp import daemon as dmod
-    from ttp.prompts import worker_task
     d = dmod.Daemon(p.base)
     tid = _due_waiting_task(p, "exit 255")
     _settle_probe(d, tid)
@@ -14980,8 +15011,8 @@ def test_an_unreachable_host_probe_keeps_the_task_asleep_until_the_hold_cap(env)
                                              "waiting_since": time.time() - 6 * 3600 - 1}),
                      not_before=time.time() - 1)
     _settle_probe(d, tid)
-    assert _ready(p, tid)
-    assert "Woken because: held 6 h, probe still failing." in worker_task(p, p.db.task(tid), str(p.root), None)
+    assert not _ready(p, tid) and "woke" not in json.loads(p.db.task(tid)["result"])
+    assert len(p.db.q("SELECT id FROM events WHERE task=? AND kind='wait_stale'", (tid,))) == 1
 
 
 def test_a_timed_out_probe_is_broken(env, monkeypatch):
@@ -15013,23 +15044,111 @@ def test_a_probe_that_cannot_start_is_broken(env, monkeypatch):
     assert _ready(p, tid) and json.loads(p.db.task(tid)["result"])["woke"] == "probe broken: could not start"
 
 
-def test_a_waiting_task_wakes_at_the_hold_cap_whatever_its_probe_says(env):
+@pytest.mark.parametrize("probe", ["exit 1", "exit 75", "exit 255"])
+def test_past_the_hold_cap_a_not_yet_probe_keeps_the_task_asleep_and_asks_the_coordinator_once(env, probe):
+    """A model run cannot make a "not yet" probe pass: past max_hold_s the task sleeps on and the
+    coordinator gets one wait_stale event per wait, not one per check."""
     p = make(env)
+    from ttp import coordinator as coord
     from ttp import daemon as dmod
-    from ttp.prompts import worker_task
     d = dmod.Daemon(p.base)
-    tid = _due_waiting_task(p, "exit 1", since_ago=5.5 * 3600)
+    tid = _due_waiting_task(p, probe, since_ago=5.5 * 3600)
     _settle_probe(d, tid)
     p.db.update_task(tid, not_before=time.time() - 1)
     d.probe_waiting()
     left = p.db.task(tid)["not_before"] - time.time()
-    assert 0 < left <= 0.5 * 3600 + 5, "the extension must stop at the cap"
-    p.db.update_task(tid, result=json.dumps({**json.loads(p.db.task(tid)["result"]),
-                                             "waiting_since": time.time() - 6 * 3600 - 1}),
+    assert 0 < left <= 0.5 * 3600 + 5, "before the cap the extension stops at the cap"
+    assert not p.db.q("SELECT id FROM events WHERE task=? AND kind='wait_stale'", (tid,))
+    since = time.time() - 6 * 3600 - 1
+    p.db.update_task(tid, result=json.dumps({**json.loads(p.db.task(tid)["result"]), "waiting_since": since}))
+    for _ in range(3):          # three checks past the cap, each with a fresh verdict
+        d._probe_rc.pop(tid, None)
+        d._probed.pop(tid, None)
+        _settle_probe(d, tid)
+        p.db.update_task(tid, not_before=time.time() - 1)
+        d.probe_waiting()
+        task = p.db.task(tid)
+        assert not _ready(p, tid) and task["not_before"] > time.time() + 800, "no worker run past the cap"
+        assert "woke" not in json.loads(task["result"])
+    ev = p.db.q("SELECT * FROM events WHERE task=? AND kind='wait_stale'", (tid,))
+    assert len(ev) == 1 and ev[0]["status"] == "queued" and "keeps sleeping" in ev[0]["text"]
+    assert f"set-when {tid}" in ev[0]["text"] and probe in ev[0]["text"]
+    assert coord.EFFORT_EVENT_TRIGGERS["wait_stale"] == "stuck", "deciding on a stale wait needs thought"
+    # A new wait (a new hand-off) gets its own event.
+    p.db.update_task(tid, result=json.dumps({**json.loads(p.db.task(tid)["result"]), "waiting_since": since - 60}),
                      not_before=time.time() - 1)
+    d.probe_waiting()
+    assert len(p.db.q("SELECT id FROM events WHERE task=? AND kind='wait_stale'", (tid,))) == 2
+
+
+def test_past_the_hold_cap_a_passing_probe_still_wakes_the_task(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dmod
+    from ttp.prompts import worker_task
+    flag = env["tmp"] / "done.flag"
+    d = dmod.Daemon(p.base)
+    tid = _due_waiting_task(p, f"test -f {flag}", since_ago=6 * 3600 + 1)
+    _settle_probe(d, tid)
+    p.db.update_task(tid, not_before=time.time() - 1)
+    d.probe_waiting()
+    assert not _ready(p, tid)
+    flag.write_text("")
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
     _settle_probe(d, tid)
     assert _ready(p, tid)
-    assert "Woken because: held 6 h, probe still failing." in worker_task(p, p.db.task(tid), str(p.root), None)
+    assert "Woken because: probe passed." in worker_task(p, p.db.task(tid), str(p.root), None)
+
+
+def test_waiting_tasks_with_the_same_probe_share_its_runs(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dmod
+    from ttp.prompts import worker_task
+    flag = env["tmp"] / "board.flag"
+    calls = []
+    real = dmod.subprocess.Popen
+
+    def popen(cmd, *a, **k):
+        calls.append(cmd)
+        return real(cmd, *a, **k)
+    monkeypatch.setattr(dmod.subprocess, "Popen", popen)
+    d = dmod.Daemon(p.base)
+    same = [_due_waiting_task(p, f"test -f {flag}") for _ in range(3)]
+    other = _due_waiting_task(p, "exit 1")
+    for tid in (*same, other):
+        p.db.update_task(tid, not_before=time.time() + 3600)
+    d.probe_waiting()
+    assert sorted(calls) == sorted([f"test -f {flag}", "exit 1"]), "one run per distinct command"
+    for tid in (*same, other):
+        d._probes[tid][0].wait(10)
+    d.probe_waiting()
+    assert not any(_ready(p, t) for t in (*same, other))
+    assert all(d._probe_rc[t][0] == 1 for t in (*same, other))
+    flag.write_text("")
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    calls.clear()
+    d.probe_waiting()
+    assert calls.count(f"test -f {flag}") == 1
+    for tid in same:
+        d._probes[tid][0].wait(10)
+    d.probe_waiting()
+    assert all(_ready(p, t) for t in same) and not _ready(p, other)
+    assert "Woken because: probe passed." in worker_task(p, p.db.task(same[-1]), str(p.root), None)
+
+
+def test_a_shared_probe_run_is_kept_when_one_task_re_points_its_probe(env):
+    p = make(env)
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    a, b = _due_waiting_task(p, "sleep 5; exit 1"), _due_waiting_task(p, "sleep 5; exit 1")
+    for tid in (a, b):
+        p.db.update_task(tid, not_before=time.time() + 3600)
+    d.probe_waiting()
+    run = d._probes[b]
+    assert d._probes[a] is run
+    d._drop_stale_probe(a, "exit 1")
+    assert a not in d._probes and run[0].poll() is None, "b still needs its verdict"
+    d._drop_stale_probe(b, "exit 1")
+    assert run[0].poll() is not None, "no one shares it now: killed"
 
 
 def test_a_waiting_task_without_a_probe_keeps_its_timer(env):

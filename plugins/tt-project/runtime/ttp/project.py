@@ -77,8 +77,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # a laptop's brief maintenance wakes start no runs that the next sleep would cut.
         "wake_settle_s": 300,
     },
-    # A waiting task whose `retry_when` probe still says "not yet" sleeps on, but wakes this long
-    # after its hand-off whatever the probe says.
+    # A waiting task whose `retry_when` probe still says "not yet" sleeps on. This long after its
+    # hand-off the coordinator is asked once (`wait_stale`) to fix the probe or cancel; it still sleeps.
     "waiting": {"max_hold_s": 21600},
     "resources": {},                    # shared-slot limits, e.g. {"device": 1}
     # Lock names that all mean the one device (they share one `ttp lock` slot), and how many tasks

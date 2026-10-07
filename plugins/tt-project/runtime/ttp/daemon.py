@@ -1587,7 +1587,15 @@ class Daemon:
                 waits = 1
             what = str(result.get("waiting_for") or summary)[:300]
             extra["waits"] = waits
-            if escalate:
+            gate_probe = result.get("retry_when") if escalate else None
+            gate_probe = gate_probe.strip() if isinstance(gate_probe, str) and gate_probe.strip() else None
+            if escalate and gate_probe:
+                # It found work for after its probe passes: the probe says when, not a model run.
+                not_before = time.time() + PROBE_TIMEOUT_S
+                extra["escalated_wake"] = True
+                extra["waiting_since"] = time.time()
+                reason = f"woke at {wake['tier']} and asked for {up}; runs at {up} once its probe passes"
+            elif escalate:
                 not_before = time.time()
                 extra["escalated_wake"] = True
                 extra["woke"] = f"the {wake['tier']} wake found work and asked for {up}"
@@ -1677,6 +1685,8 @@ class Daemon:
             self._local_only_due = 0.0   # is its work on a remote? checked this tick
             self._queue_backup(task)
         self._note_dirty_main(task)
+        if waiting and new == "queued" and extra.get("escalated_wake") and gate_probe:
+            self._start_probe(task["id"], gate_probe, time.time())
         if waiting and new == "queued":
             # Self or external (unblock.classify_wait): only external waits count as stuck work.
             kind, why = ("self", "escalated wake") if extra.get("escalated_wake") else unblock.classify_wait(result)
@@ -2992,7 +3002,9 @@ class Daemon:
         NOT_YET_RCS: 1, 75 (a busy `ttp lock`) and 255 (ssh could not reach the host a remote marker
         lives on). A broken probe
         (any other exit, a timeout, a probe that cannot start) wakes it at its timer so a worker can
-        fix the probe, and `waiting.max_hold_s` after the hand-off it wakes whatever the probe says."""
+        fix the probe. Past `waiting.max_hold_s` after the hand-off a "not yet" keeps it asleep too (a
+        model run cannot make the probe pass) and raises one `wait_stale` event for the coordinator.
+        Tasks with the same probe share its runs."""
         db, now = self.p.db, time.time()
         for tid, (proc, started, probe) in list(self._probes.items()):
             rc = proc.poll()
@@ -3028,6 +3040,10 @@ class Daemon:
             elif t["id"] in self._probes or now - self._probed.get(t["id"], 0) < PROBE_EVERY_S:
                 continue
             self._start_probe(t["id"], probe, now)
+            got = self._probe_rc.get(t["id"])
+            if t["id"] not in self._probes and got and got[0] == 0 and got[2] == probe \
+                    and (t["not_before"] or 0) > now:
+                self._wake_waiting(db.task(t["id"]) or t, "probe passed", now)   # a shared verdict
         self.probe_deferred(now)
 
     def probe_deferred(self, now: float) -> None:
@@ -3060,7 +3076,8 @@ class Daemon:
         its verdict, so it is never credited to the new probe."""
         run = self._probes.get(tid)
         if run and run[2] != probe:
-            _kill_group(run[0])
+            if not any(o != tid and r[0] is run[0] for o, r in self._probes.items()):
+                _kill_group(run[0])   # unless shared: the other task still needs its verdict
             del self._probes[tid]
             self._probed.pop(tid, None)
         if tid in self._probe_rc and self._probe_rc[tid][2] != probe:
@@ -3142,6 +3159,15 @@ class Daemon:
 
     def _start_probe(self, tid: int, probe: str, now: float, what: str = "retry_when") -> None:
         self._probed[tid] = now
+        # One run per distinct command per probe cycle: tasks waiting on the same thing share it.
+        for other, run in self._probes.items():
+            if other != tid and run[2] == probe:
+                self._probes[tid] = run
+                return
+        for other, got in self._probe_rc.items():
+            if other != tid and got[2] == probe and now - got[1] < PROBE_EVERY_S:
+                self._probe_rc[tid] = got
+                return
         try:
             proc = subprocess.Popen(probe, shell=True, cwd=str(self.p.root), stdin=subprocess.DEVNULL,
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -3164,12 +3190,14 @@ class Daemon:
             self._wake_waiting(task, "probe passed", now)
         elif fresh and rc not in NOT_YET_RCS:
             self._wake_waiting(task, f"probe broken: {rc if isinstance(rc, str) else f'exit {rc}'}", now)
-        elif now >= since + max_hold:
-            self._wake_waiting(task, f"held {max_hold / 3600:g} h, probe still failing", now)
         elif fresh:
             # 75 is EX_TEMPFAIL (e.g. a busy `ttp lock`); 255 is ssh failing to reach the host
-            # (a reboot or a network blip). Both mean "not yet".
-            nb = min(now + _retry_s(prev), since + max_hold)
+            # (a reboot or a network blip). Both mean "not yet". A model run cannot make a "not yet"
+            # probe pass, so past `max_hold_s` the coordinator decides instead of a wake.
+            held = now >= since + max_hold
+            if held:
+                self._stale_wait_event(task, prev, since, max_hold)
+            nb = now + _retry_s(prev) if held else min(now + _retry_s(prev), since + max_hold)
             what = str(prev.get("waiting_for") or prev.get("summary") or "")[:300]
             says = "host unreachable" if rc == 255 else "not yet"
             db = self.p.db
@@ -3184,6 +3212,21 @@ class Daemon:
             self.p.db.update_task(tid, not_before=now + PROBE_TIMEOUT_S)
             return tid not in self._probes
         return False
+
+    def _stale_wait_event(self, task: dict, prev: dict, since: float, max_hold: float) -> None:
+        """Once per wait: its probe has said "not yet" for `max_hold_s`. The task keeps sleeping."""
+        db = self.p.db
+        fp = f"wait_stale:{task['id']}:{since:.0f}"
+        if db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+            return
+        what = str(prev.get("waiting_for") or prev.get("summary") or "")[:300]
+        db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
+             (time.time(), "daemon", "wait_stale", fp, "normal",
+              f"#{task['id']} {task['title']} has waited {max_hold / 3600:g} h for {what}; its probe still says "
+              f"not yet ({str(prev.get('retry_when') or '')[:200]}). It keeps sleeping and no worker run is spent. "
+              f"Decide: fix its probe (`ttp task set-when {task['id']} \"<cmd>\"`), clear it (\"\") so it wakes "
+              f"at its timer, or cancel the task.", "queued", task["id"]))
+        log(self.p, f"task {task['id']} probe not yet after {max_hold / 3600:g} h; raised to the coordinator")
 
     def _wake_waiting(self, task: dict, why: str, now: float) -> None:
         """Make a waiting task due now and tell its next run why it woke."""
