@@ -4749,9 +4749,21 @@ def test_a_long_handoff_stays_valid_json_and_the_next_turn_runs(env, monkeypatch
         "followups": [{"title": f"follow-up {i}", "spec": "s"} for i in range(8)]}))
     tid = p.db.add_task("big report", "write a lot", kind="work", tier="light", origin="user")
     p.set_config("coordinator.debounce_s", 0)
+    # Only the hand-off drives the coordinator: the bootstrap message's own turn would run alongside
+    # the worker and could pass (or, failing, back off) the check below by itself.
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
     d = Daemon(p.base)
-    assert _run_until(d, p, lambda: p.db.task(tid)["status"] == "done" and p.db.one(
-        "SELECT id FROM runs WHERE role='coordinator' AND status='ok'")), "no coordinator turn after a long hand-off"
+
+    def handoff_turn_ok():
+        done = p.db.one("SELECT id FROM events WHERE kind='task_done' AND task=?", (tid,))
+        return done and any(done["id"] in json.loads(r["note"] or "{}").get("events", []) for r in p.db.q(
+            "SELECT note FROM runs WHERE role='coordinator' AND status='ok'"))
+    assert _run_until(d, p, handoff_turn_ok), (
+        "no coordinator turn after a long hand-off: "
+        f"{[(r['id'], r['role'], r['status']) for r in p.db.q('SELECT id, role, status FROM runs')]}, "
+        f"failures {p.db.kv('coordinator_failures', 0)}, "
+        f"daemon log: {(p.logs / 'daemon.log').read_text()[-2000:] if (p.logs / 'daemon.log').exists() else ''}")
+    assert p.db.task(tid)["status"] == "done"
     stored = p.db.task(tid)["result"]
     assert len(stored) <= 20000 and json.loads(stored)["summary"].startswith("measured x")
     fups = [e["text"] for e in p.db.q("SELECT text FROM events WHERE kind='followup_proposed' AND task=?", (tid,))]
