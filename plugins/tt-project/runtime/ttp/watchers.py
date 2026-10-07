@@ -275,8 +275,10 @@ def _check_findings(daemon, t: dict, pr: dict, sig: dict, findings: dict, root: 
         status = "handled"
     elif owner:
         text = (f"PR for task #{t['id']} ({url}) has open findings: {what}. Open task #{owner['id']} "
-                f"({owner['status']}) owns them: queue no other task for them. Do not ask the user to review it "
-                f"until pr-watch reports it clean.")
+                f"({owner['status']}) owns them"
+                + (" (a review of its change; the daemon queues their fix once its review chain ends)"
+                   if owner["kind"] == "review" else "")
+                + ": queue no other task for them. Do not ask the user to review it until pr-watch reports it clean.")
         status = "queued" if owner["status"] == "blocked" else "handled"
     elif dirty:
         text = (f"PR for task #{t['id']} ({url}) has open findings: {what}. This is work"

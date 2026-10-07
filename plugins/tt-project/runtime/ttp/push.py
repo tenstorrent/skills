@@ -483,15 +483,21 @@ def local_harness(p: Project, repo: Path) -> bool:
 def own_target(p: Project, repo: Path) -> tuple[str, str]:
     """(remote, branch) for `ttp push --own`: the checked-out branch, published under the same name
     on the remote of `delivery.push_branch` (else origin). A `ttp/t<id>-...` branch must be this
-    task's (inside a run); any other named branch (one a spec names, e.g. <user>/feature-x) may go
-    too, but only as a fast-forward (publish, ff_only). Never a detached HEAD, main/master, the push
-    branch or the branch work starts from; publish also refuses the remote's default branch."""
+    task's (inside a run), or one the task carries as its branch or continues (_carries: a fix on a
+    finished task's PR); any other named branch (one a spec names, e.g. <user>/feature-x) may go
+    too. Both only as a fast-forward (publish, ff_only: own_ff_only). A task labelled
+    `pr_branch:<branch>` on its own ttp/t<id>-... branch (the PR's branch was held by another
+    worktree) publishes its head onto that branch instead. Never a detached HEAD, main/master, the
+    push branch or the branch work starts from; publish also refuses the remote's default branch."""
     branch = _git(repo, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
     if not branch:
         raise ValueError("--own publishes the checked-out branch, not a detached HEAD")
     m = OWN_BRANCH.fullmatch(branch)
     task = os.environ.get("TTP_TASK")
-    if m and task and m.group(1) != task:
+    onto = _labelled(p, task, "pr_branch") if task else ""
+    if m and onto and m.group(1) == task:
+        branch = onto
+    elif m and task and m.group(1) != task and not _carries(p, task, m.group(1), branch):
         raise ValueError(f"--own publishes only this task's own branch (ttp/t{task}-...), not {branch}")
     d = p.config().get("delivery") or {}
     remote, shared = target(p, repo) if str(d.get("push_branch") or "").strip() else ("origin", "")
@@ -499,6 +505,43 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
     if branch in PROTECTED or branch in (shared, base, base.partition("/")[2]):
         raise ValueError(f"--own never pushes to a shared branch ({branch})")
     return remote, branch
+
+
+def own_ff_only(branch: str) -> bool:
+    """Whether `ttp push --own` to `branch` must fast-forward the remote's before its checks: every
+    branch but the running task's own ttp/t<id>-... one (any of them outside a run)."""
+    m = OWN_BRANCH.fullmatch(branch)
+    task = os.environ.get("TTP_TASK")
+    return not (m and (not task or m.group(1) == task))
+
+
+def _task_row(p: Project, task: str | None) -> dict | None:
+    try:
+        return p.db.task(int(task or ""))
+    except (ValueError, TypeError):
+        return None
+
+
+def _labels(t: dict | None) -> list[str]:
+    try:
+        return [str(x) for x in json.loads((t or {}).get("labels") or "[]")]
+    except (ValueError, TypeError):
+        return []
+
+
+def _labelled(p: Project, task: str | None, name: str) -> str:
+    """The value of task `task`'s first `<name>:<value>` label, or ""."""
+    return next((x.partition(":")[2] for x in _labels(_task_row(p, task)) if x.startswith(f"{name}:")), "")
+
+
+def _carries(p: Project, task: str, owner: str, branch: str) -> bool:
+    """Whether task `task` may publish task `owner`'s ttp/t<id>-... `branch` with --own: it carries
+    it as its branch or `pr_branch:` label, or continues `owner` (a fix on a finished task's PR)."""
+    t = _task_row(p, task)
+    if not t:
+        return False
+    labels = _labels(t)
+    return str(t.get("branch") or "") == branch or f"pr_branch:{branch}" in labels or f"continues:{owner}" in labels
 
 
 def _may_land(p: Project, task: str, owner: str, branch: str) -> bool:
@@ -568,7 +611,7 @@ def behind(repo: Path, remote: str, branch: str) -> str:
         return f"cannot fetch {remote}/{branch} to compare with HEAD"
     if _git(repo, "merge-base", "--is-ancestor", tip, "HEAD").returncode != 0:
         return (f"{remote}/{branch} ({tip[:10]}) is not an ancestor of HEAD: --own only fast-forwards "
-                "a branch that is not a ttp/t<id>-... one, never rewrites it")
+                "a branch that is not this task's own ttp/t<id>-... one, never rewrites it")
     return ""
 
 
@@ -1036,7 +1079,7 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
     branch. No rebase and no version bump, so the pushed commit is the one reviewed; without force,
     so the remote takes only a fast-forward of what it has. Without checks, as for `ttp push`, only
     a docs-only change since `base` (the project's push target) may go. `ff_only` (a branch that is
-    not a `ttp/t<id>-...` one) refuses before the checks unless it fast-forwards the remote's.
+    not this task's own `ttp/t<id>-...` one) refuses before the checks unless it fast-forwards the remote's.
     When every check is skipped on HEAD, the extra commands `recorded` (recorded_checks) passing on
     exactly HEAD run instead, and must pass again; with none, nothing checked it and it is refused."""
     repo = Path(_git(repo, "rev-parse", "--show-toplevel").stdout.strip() or repo)
@@ -1236,7 +1279,7 @@ def run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None)
                 pass
         return publish(repo, remote, branch, checks, hold=lambda: take(p, remote, branch, wait_s),
                        timed=lambda s: record_check_s(p, s), base=base,
-                       ff_only=not OWN_BRANCH.fullmatch(branch),
+                       ff_only=own_ff_only(branch),
                        recorded=recorded or recorded_checks(os.environ.get("TTP_RUN_DIR")))
     return push(repo, remote, branch, checks, rounds, hold=lambda: take(p, remote, branch, wait_s),
                 version_bump=version_bump, timed=lambda s: record_check_s(p, s),

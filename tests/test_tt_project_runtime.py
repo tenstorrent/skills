@@ -22713,6 +22713,113 @@ def test_pr_findings_keep_one_owner_when_the_task_that_delivered_the_pr_finishes
     assert not fixes()
 
 
+def test_a_pr_fix_task_publishes_onto_the_prs_branch_whether_it_is_free_or_held(env, monkeypatch, capsys):
+    """The daemon's PR-fix task delivers with `ttp push --own` onto the PR's branch, the finished task's
+    ttp/t<id>-... branch: from a worktree on that branch when it is free, and from its own branch onto
+    the PR's when another worktree holds it. Fast-forward only, never a new remote branch."""
+    from ttp import push, worktree
+    from ttp.daemon import Daemon
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    url = "https://github.com/acme/widgets/pull/7"
+    src = p.db.add_task("Speed up the loader", "s", kind="code")
+    pr_branch = f"ttp/t{src}-speed-up-the-loader"
+    p.db.update_task(src, status="done", pr_url=url, branch=pr_branch)
+    _git_out(repo, "branch", pr_branch)
+    other_wt = env["tmp"] / "pr"
+    _git_out(repo, "worktree", "add", "-q", str(other_wt), pr_branch)
+    _commit(other_wt, "pr.txt", "pr\n")
+    _git_out(other_wt, "push", "-q", "origin", f"HEAD:refs/heads/{pr_branch}")
+    _git_out(repo, "worktree", "remove", str(other_wt))
+    d = Daemon(p.base)
+    rec = {"task": src, "branch": pr_branch, "url": url}
+
+    def publish(fix):
+        path, branch = worktree.ensure(p, fix)
+        _commit(path, f"fix{fix['id']}.txt", "fix\n")
+        monkeypatch.chdir(path)
+        monkeypatch.setenv("TTP_TASK", str(fix["id"]))
+        assert push.resolve(p, path, own=True) == ("origin", pr_branch, True), branch
+        assert _ttp("push", "--own") == 0, capsys.readouterr().err
+        assert _git_out(origin, "rev-parse", pr_branch) == _git_out(path, "rev-parse", "HEAD")
+        return path, branch
+
+    # Free: the fix works on the PR's branch itself.
+    fix, made = d.pr_findings_owner("acme/widgets#7", rec, "CI failing: tests")
+    assert made and fix["branch"] == pr_branch
+    path, branch = publish(fix)
+    assert branch == pr_branch
+    p.db.update_task(fix["id"], status="done")
+    monkeypatch.chdir(repo)
+    # Held: another worktree keeps the PR's branch; the fix's own branch is published onto the PR's.
+    fix, made = d.pr_findings_owner("acme/widgets#7", rec, "CI failing: tests")
+    assert made and fix["branch"] is None and f'"pr_branch:{pr_branch}"' in fix["labels"]
+    assert "checked out elsewhere" in fix["spec"]
+    path2, branch2 = publish(fix)
+    assert branch2 == f"ttp/t{fix['id']}-fix-pr-findings-speed-up-the-loader"
+    remote = _git_out(origin, "for-each-ref", "--format=%(refname:short)", "refs/heads").split()
+    assert branch2 not in remote and pr_branch in remote
+    # Never a rewrite: a head that does not fast-forward the PR's branch is refused before the checks.
+    _git_out(path2, "reset", "-q", "--hard", "HEAD~2")
+    _commit(path2, "other.txt", "x\n")
+    tip = _git_out(origin, "rev-parse", pr_branch)
+    assert _ttp("push", "--own") == 2 and "not an ancestor" in capsys.readouterr().err
+    assert _git_out(origin, "rev-parse", pr_branch) == tip
+    # Another task, neither carrying nor continuing the PR's branch, still may not publish it.
+    monkeypatch.chdir(path)
+    monkeypatch.setenv("TTP_TASK", str(p.db.add_task("unrelated", kind="code")))
+    with pytest.raises(ValueError):
+        push.own_target(p, path)
+
+
+def test_pr_findings_wait_for_the_delivering_tasks_review_chain_and_a_pr_has_one_fixer(env, monkeypatch):
+    """While the done task's review, or the daemon's fix and re-review of it, is open, PR findings
+    queue no PR fix: that stack owns them. A review that fails while a PR fix is open hands its
+    findings to that fix (and a re-review waits on it) instead of queuing a second fixer."""
+    from ttp.daemon import Daemon
+    p = make(env)
+    url = "https://github.com/acme/widgets/pull/7"
+    src = p.db.add_task("Speed up the loader", "s", kind="code")
+    pr_branch = f"ttp/t{src}-speed-up-the-loader"
+    subprocess.run(["git", "-C", str(p.root), "branch", pr_branch], check=True)
+    p.db.update_task(src, status="done", pr_url=url, branch=pr_branch)
+    review = p.db.add_task(f"Review #{src}", "r", kind="review", depends_on=[src], labels=[f"auto_review:{src}"])
+    d = Daemon(p.base)
+    rec, key = {"task": src, "branch": pr_branch, "url": url}, "acme/widgets#7"
+
+    def fixers():
+        return [t for t in p.db.q("SELECT * FROM tasks WHERE kind='code' AND status NOT IN ('done','failed','cancelled')")]
+
+    # (a) The auto-review is open: it owns the findings, no PR fix.
+    owner, made = d.pr_findings_owner(key, rec, "CI failing: tests")
+    assert owner["id"] == review and not made and not fixers()
+    # Its fix and re-review (the daemon's chain) own them too, until the chain ends.
+    p.db.update_task(review, status="failed")
+    rf = p.db.add_task(f"Fix review #{review}", "f", kind="code", labels=[f"continues:{src}", f"review_fix:{review}"])
+    rr = p.db.add_task(f"Re-review #{review}", "r", kind="review", depends_on=[rf],
+                       labels=[f"auto_review:{rf}", f"continues:{review}"])
+    p.db.update_task(rf, status="done")
+    owner, made = d.pr_findings_owner(key, rec, "CI failing: tests")
+    assert owner["id"] == rr and not made
+    p.db.update_task(rr, status="done")
+    owner, made = d.pr_findings_owner(key, rec, "CI failing: tests")
+    assert made and [t["id"] for t in fixers()] == [owner["id"]]
+    prfix = owner["id"]
+    # (b) A review of the change fails while the PR fix is open: the fix takes its findings.
+    late = p.db.add_task(f"Review #{src} again", "r", kind="review", depends_on=[src],
+                         labels=[f"auto_review:{src}"])
+    after = p.db.add_task("after", "a", kind="work", depends_on=[late])
+    p.db.update_task(late, status="failed")
+    out = d._fix_failed_review(p.db.task(late), [{"title": "Loader leaks", "spec": "close the file"}], "leaks")
+    assert out is not None
+    fid, rid, moved = out
+    assert fid == prfix and [t["id"] for t in fixers()] == [prfix], "a second fixer was queued for the PR"
+    fix = p.db.task(prfix)
+    assert "Loader leaks" in fix["spec"] and "CI failing" in fix["spec"] and f'"review_fix:{late}"' in fix["labels"]
+    assert p.db.task(rid)["depends_on"] == f"[{prfix}]" and moved == [after]
+    # And it is not repeated for the same review.
+    assert d._fix_failed_review(p.db.task(late), [{"title": "Loader leaks", "spec": "x"}], "leaks") is None
+
+
 def _batch_setup(env, monkeypatch, busy):
     p = make(env)
     from ttp.daemon import Daemon

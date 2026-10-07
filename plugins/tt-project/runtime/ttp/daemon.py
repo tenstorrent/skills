@@ -3564,12 +3564,24 @@ class Daemon:
         rtier = "deep" if review["tier"] == "deep" else "standard"   # a re-review never runs light
         found = "\n".join(f"{n}. {str(f['title'])[:200]}: {coord.clip(f.get('spec'), FOLLOWUP_SPEC_CHARS)}"
                           for n, f in enumerate(fups, 1))
+        # An open fix of the PR's findings (pr_findings_owner) on this stack takes these findings too:
+        # a PR has one fixer.
+        root, key = self._stack_root(code), prguard.pr_key(code.get("pr_url") or "")
+        prfix = next((t for t in db.q("SELECT * FROM tasks WHERE kind='code' AND status NOT IN (?,?,?) "
+                                      "AND labels LIKE '%pr_fix:%' ORDER BY id",
+                                      TERMINAL_TASK_STATES)
+                      if '"pr_fix:' in t["labels"] and (self._stack_root(t) == root
+                                                       or (key and f'"pr_fix:{key}"' in t["labels"]))), None)
         with db.tx():
-            fid = db.add_task(f"Fix review #{review['id']}: {base_title}"[:200], "", kind="code", tier=tier,
-                              priority=review["priority"], origin="daemon",
-                              budget_usd=float(cfg["budget"]["task_default_usd"].get(tier, 8.0)),
-                              labels=[f"continues:{code['id']}", f"review_fix:{review['id']}"])
-            fbranch = f"ttp/t{fid}-{worktree.slug(base_title)}"
+            if prfix:
+                fid = prfix["id"]
+                fbranch = prfix["branch"] or f"ttp/t{fid}-{worktree.slug(prfix['title'])}"
+            else:
+                fid = db.add_task(f"Fix review #{review['id']}: {base_title}"[:200], "", kind="code", tier=tier,
+                                  priority=review["priority"], origin="daemon",
+                                  budget_usd=float(cfg["budget"]["task_default_usd"].get(tier, 8.0)),
+                                  labels=[f"continues:{code['id']}", f"review_fix:{review['id']}"])
+                fbranch = f"ttp/t{fid}-{worktree.slug(base_title)}"
             rid = db.add_task(f"Re-review #{review['id']}: " + re.sub(r"^(?:Re-review #\d+: )+", "", review["title"]),
                               "\n".join([
                                   f"Re-review after review #{review['id']} failed. Fix task #{fid} (branch {fbranch}, "
@@ -3583,16 +3595,30 @@ class Daemon:
                               kind="review", tier=rtier, priority=review["priority"], origin="daemon",
                               budget_usd=float(cfg["budget"]["task_default_usd"].get(rtier, 8.0)),
                               depends_on=[fid], labels=[f"auto_review:{fid}", f"continues:{review['id']}"])
-            db.update_task(fid, branch=fbranch, spec="\n".join([
-                f"Fix the blocking findings of review #{review['id']} ({review['title']}) on code task "
-                f"#{code['id']} ({code['title']}).",
-                f"This task's branch starts from #{code['id']}'s branch {code['branch']} (head {head}): build on "
-                f"it. Leave the push to re-review #{rid}, which checks each finding once this task is done.",
-                f"Findings to fix:\n{found}",
-                f"The review's hand-off: {coord.clip(summary, AUTO_REVIEW_SUMMARY_CHARS)}"]))
+            if prfix:
+                extra = "\n".join([
+                    f"Review #{review['id']} ({review['title']}) of code task #{code['id']} (branch "
+                    f"{code['branch']}, head {head}) failed too. This task is the PR's one fixer: fix its blocking "
+                    f"findings as well. Re-review #{rid} checks each once this task is done.",
+                    f"Findings to fix:\n{found}",
+                    f"The review's hand-off: {coord.clip(summary, AUTO_REVIEW_SUMMARY_CHARS)}"])
+                db.update_task(fid, spec=f"{prfix['spec'] or ''}\n{extra}",
+                               labels=[*json.loads(prfix["labels"] or "[]"), f"review_fix:{review['id']}"])
+                for r in db.q("SELECT dir FROM runs WHERE task=? AND status='running'", (fid,)):
+                    if r["dir"]:
+                        coord._append_update(Path(r["dir"], "steer.md"), extra, f"review-fix-{review['id']}")
+            else:
+                db.update_task(fid, branch=fbranch, spec="\n".join([
+                    f"Fix the blocking findings of review #{review['id']} ({review['title']}) on code task "
+                    f"#{code['id']} ({code['title']}).",
+                    f"This task's branch starts from #{code['id']}'s branch {code['branch']} (head {head}): build on "
+                    f"it. Leave the push to re-review #{rid}, which checks each finding once this task is done.",
+                    f"Findings to fix:\n{found}",
+                    f"The review's hand-off: {coord.clip(summary, AUTO_REVIEW_SUMMARY_CHARS)}"]))
             moved = [t["id"] for t in coord._open_dependents(db, review["id"])]
             coord._take_over_dependents(db, review["id"], rid)
-        log(self.p, f"review {review['id']} failed: queued fix #{fid} and re-review #{rid}"
+        log(self.p, f"review {review['id']} failed: "
+                    + (f"PR fix #{fid} takes its findings" if prfix else f"queued fix #{fid}") + f" and re-review #{rid}"
                     + (f"; moved {moved} onto it" if moved else ""))
         return fid, rid, moved
 
@@ -3613,6 +3639,10 @@ class Daemon:
         src = db.task(int(rec.get("task") or 0))
         if not src or src["status"] != "done":
             return None, False
+        # The delivering task's open review, or a fix or re-review of its stack, comes first: a PR fix
+        # queued beside it would be a second owner (and a failed review queues its own fix).
+        if stack := self._open_stack(src["id"]):
+            return stack[0], False
         rounds = db.one("SELECT COUNT(*) n FROM tasks WHERE labels LIKE ?", (f'%"pr_fix:{key}"%',))["n"]
         if rounds >= PR_FIX_ROUNDS or coord.next_task_slot(db, coord.task_cap(self.cfg)) is not None:
             return None, False
@@ -3626,7 +3656,9 @@ class Daemon:
         tier = src["tier"] if src["tier"] in bud.TIER_ORDER else "standard"
         url = rec.get("url") or key
         on = (f"This task's branch is the PR's branch {branch}: build on it" if branch and not held else
-              f"This task's branch starts from #{src['id']}'s branch head" + (f"; the PR's branch is {branch}" if branch else ""))
+              f"This task's branch starts from #{src['id']}'s branch head" + (
+                  f"; the PR's branch {branch} is checked out elsewhere, and `ttp push --own` publishes this "
+                  f"task's head onto it (fast-forward only)" if branch else ""))
         spec = "\n".join([
             f"Pull request {url} still has open findings after task #{src['id']} ({src['title']}) finished: {what}.",
             "This task owns them now; no other task does. Fix or answer each bot review comment on the PR "
@@ -3639,9 +3671,33 @@ class Daemon:
                               priority=src["priority"], origin="daemon",
                               budget_usd=float(self.cfg["budget"]["task_default_usd"].get(tier, 8.0)),
                               branch=branch if branch and not held else None,
-                              labels=[f"continues:{src['id']}", f"pr_fix:{key}"])
+                              labels=[f"continues:{src['id']}", f"pr_fix:{key}"]
+                              + ([f"pr_branch:{branch}"] if branch else []))
         log(self.p, f"{key}: open findings outlived task {src['id']}; queued fix #{fid}")
         return db.task(fid), True
+
+    def _open_stack(self, root: int) -> list[dict]:
+        """Open tasks of task `root`'s stack, oldest first: its reviews (`auto_review:<id>`) and the
+        tasks that continue it or one of them, directly or through the chain (fixes, re-reviews)."""
+        db, seen, todo, out = self.p.db, {root}, [root], []
+        while todo:
+            i = todo.pop()
+            for t in db.q("SELECT * FROM tasks WHERE labels LIKE ? OR labels LIKE ?",
+                          (f'%"continues:{i}"%', f'%"auto_review:{i}"%')):
+                if t["id"] not in seen:
+                    seen.add(t["id"])
+                    todo.append(t["id"])
+                    if t["status"] not in TERMINAL_TASK_STATES:
+                        out.append(t)
+        return sorted(out, key=lambda t: t["id"])
+
+    def _stack_root(self, task: dict) -> int:
+        """The first task of `task`'s `continues:` chain."""
+        seen, t = {task["id"]}, task
+        while (c := continues_id(t)) is not None and c not in seen and (n := self.p.db.task(c)):
+            seen.add(c)
+            t = n
+        return t["id"]
 
     def _failed_review_before(self, task: dict) -> int | None:
         """The id of a failed review this task continues, directly or through the fix it depends on
