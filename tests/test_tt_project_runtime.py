@@ -828,6 +828,7 @@ def test_jev_screening_skip_is_priced_at_a_low_turn_settles_against_later_wakes_
     d = scr.screen(p.db, cfg, "watcher:hw", "box-d: clock sync failed", jev=quiet)
     calls = {r["ref"]: r for r in p.db.q("SELECT * FROM jev_calls")}
     assert calls[f"issue:{b.issue_id}"]["avoided_usd"] == pytest.approx(0.3)
+    assert calls[f"issue:{b.issue_id}"]["changed"] == 1, "a skipped wake changed the rules' decision"
     # Within the window: a's condition woke the coordinator anyway, a task quotes b's title.
     p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
            (time.time() + 1, "watcher:hw", "observation", a.fingerprint, "high", "box-a: link retry failed", "done"))
@@ -871,6 +872,55 @@ def test_jev_use_called_rarely_is_judged_once_its_first_call_is_a_window_old(env
     jevuse.record(p.db, "effort", {"effort": "low"}, 0.001, avoided_usd=0.5, now=now - week - 60)
     jevuse.record(p.db, "effort", {"effort": "low"}, 0.001, avoided_usd=0.5, now=now - 60)
     assert jevuse.review(p.db, cfg, now) == [] and jevuse.allowed(p.db, cfg, "effort")
+
+
+def test_jev_use_that_never_changes_the_rules_decision_is_switched_off_after_idle_calls(env):
+    """A use whose idle_calls known calls all made the rules' own decision goes off, with that reason in
+    the daily line; one call that changed a decision keeps it on; a raised coordinator turn scored
+    'no change' changed nothing. Screening records whether it skipped or raised a wake."""
+    p = make(env)
+    from ttp import jevuse
+    from ttp import screen as scr
+    cfg = p.config()
+    assert jevuse.idle_calls(cfg) == 20
+    for _ in range(19):
+        jevuse.record(p.db, "screen", {"wake": True}, 0.001, changed=False)
+        jevuse.record(p.db, "effort", {"effort": "standard"}, 0.001, changed=False)
+    jevuse.record(p.db, "screen", {"wake": True}, 0.001)   # unknown: neither counts nor keeps it on
+    assert jevuse.review(p.db, cfg) == []
+    jevuse.record(p.db, "screen", {"wake": True}, 0.001, changed=False)
+    jevuse.record(p.db, "effort", {"effort": "light"}, 0.001, avoided_usd=0.0, changed=True)
+    jevuse.record(p.db, "effort", {"effort": "standard"}, 0.001, changed=False)
+    [(use, s)] = jevuse.review(p.db, cfg)
+    assert use == "screen" and s["unchanged"] == 20 and s["changed"] == 0 and not jevuse.allowed(p.db, cfg, "screen")
+    assert jevuse.allowed(p.db, cfg, "effort"), "one changed decision keeps it on"
+    assert "none of its 20 calls changed the rules' decision" in jevuse.off_text(use, s, cfg)
+    line = next(x for x in jevuse.lines(p.db, cfg) if x.startswith("watcher screening"))
+    assert "switched off (no call changed the rules' decision in 20 calls)" in line
+    assert "changed the rules' decision 0/20" in line
+    # Coordinator effort: every call raised the turn, and every raised turn only did routine work.
+    for _ in range(20):
+        cid = jevuse.record(p.db, "coord_effort", {"verdict": "needs_thought", "escalated": True}, 0.001,
+                            avoided_usd=0.05, changed=True)
+        assert jevuse.review(p.db, cfg) == [], "an unsettled raise counts as a change"
+        _settle_routine_raise(p.db, cid)
+    [(use, s)] = jevuse.review(p.db, cfg)
+    assert use == "coord_effort" and s["no_change"] == 20 and s["saved"] == pytest.approx(-0.2)
+    p.set_config("jev.uses.screen", "on")   # forced on: no idle switch-off
+    assert jevuse.allowed(p.db, p.config(), "screen")
+    # Screening: agreeing with the rules is no change; raising a wake the rules would not is one.
+    p.set_config("jev.uses.screen", "auto")
+    p.db.set_kv(jevuse.OFF_KEY, {})
+    cfg = p.config()
+    scr.screen(p.db, cfg, "watcher:hw", "box-e: link retry failed", "high", jev=_FakeJev(0.9, 2.0))
+    scr.screen(p.db, cfg, "watcher:hw", "box-f: all fine", "info", jev=_FakeJev(0.9, 3.0))
+    a, b = p.db.q("SELECT changed FROM jev_calls WHERE use='screen' ORDER BY id DESC LIMIT 2")
+    assert (b["changed"], a["changed"]) == (0, 1)
+
+
+def _settle_routine_raise(db, cid):
+    from ttp import coordcheck
+    coordcheck.settle(db, cid, "needs_thought", "ok", [{"type": "task_add"}, {"type": "reply"}], [], extra_usd=0.01)
 
 
 def test_daemon_reports_a_jev_use_switched_off_once_and_feeds_the_daily_review(env):
@@ -962,6 +1012,7 @@ def test_jev_picks_effort_once_logs_it_with_the_run_and_deep_comes_only_on_a_ret
                                   "from": "standard", "review": False}
     row = p.db.one("SELECT * FROM jev_calls")
     assert row["use"] == "effort" and row["ref"] == f"task:{q}" and row["avoided_usd"] == pytest.approx(3.0)
+    assert row["changed"] == 0, "the rules pick light for a short question too"
     assert json.loads(row["decision"]) == {"effort": "light", "review": False, "spec_len": 10, "score": 0.2}
     # Done on its first try: the pick was right.
     run_dir = env["tmp"] / "run-q"
@@ -980,6 +1031,7 @@ def test_jev_picks_effort_once_logs_it_with_the_run_and_deep_comes_only_on_a_ret
     (args, kw), = started
     assert args[3] == "standard" and kw["note"]["pick"]["review"] is True and kw["note"]["pick"]["by"] == "jev"
     assert p.db.one("SELECT avoided_usd FROM jev_calls WHERE ref=?", (f"task:{c}",))["avoided_usd"] == 0
+    assert p.db.one("SELECT changed FROM jev_calls WHERE ref=?", (f"task:{c}",))["changed"] == 0
     # Its run ends without a hand-off: the retry runs at deep, within what is left of its budget.
     p.db.x("INSERT INTO runs(task,role,provider,status,started) VALUES(?,'worker','claude','ok',?)", (c, now))
     run_dir = env["tmp"] / "run-c"
@@ -18649,9 +18701,12 @@ def test_jev_coordinator_check_raises_routine_turns_and_logs_each_call_with_its_
     p.set_config("jev.uses.coord_effort", "off")
     d.cfg = p.config()
     assert turn(jev)["unblock"] == "" and not jev.calls
-    # Each call is settled with what its turn did: a raised turn that acted was right, one that did
-    # nothing was wrong; a routine turn with rejected actions was wrong.
-    for verdict, actions, problems, right in (("needs_thought", [{"type": "notify"}], [], "right"),
+    # Each call is settled with what its turn did: a raised turn that acted beyond routine bookkeeping
+    # was right, one that only did what a low-effort turn does was no change, one that did nothing was
+    # wrong; a routine turn with rejected actions was wrong.
+    for verdict, actions, problems, right in (("needs_thought", [{"type": "charter_update"}], [], "right"),
+                                              ("needs_thought", [{"type": "notify"}, {"type": "task_add"}], [],
+                                               "no change"),
                                               ("needs_thought", [], [], "wrong"),
                                               ("routine", [{"type": "task_add"}], ["task_add rejected: x"], "wrong"),
                                               ("routine", [], [], "right")):
@@ -18810,7 +18865,9 @@ def test_jev_coordinator_check_claims_no_saving_it_did_not_make_and_bookkeeping_
         assert row["outcome"] is None and row["avoided_usd"] == 0, (status, dict(row))
     assert jevuse.stats(p.db, p.config())["coord_effort"]["saved"] == 0, "unscored calls save nothing"
     monkeypatch.setattr("ttp.coordinator.apply", lambda *a, **k: [])
-    acted = SimpleNamespace(structured={"actions": [{"type": "notify"}]}, final_text="", error="", cost_usd=0.11)
+    acted = SimpleNamespace(structured={"actions": [{"type": "config_set"}]}, final_text="", error="", cost_usd=0.11)
+    routine = SimpleNamespace(structured={"actions": [{"type": "task_add"}, {"type": "memory_add"}]},
+                              final_text="", error="", cost_usd=0.11)
     idle = SimpleNamespace(structured={"actions": []}, final_text="", error="", cost_usd=0.11)
     row = finish(call(), "ok", usage=acted)   # routine turns cost 0.03 on average: 0.08 extra
     assert row["outcome"] == "right" and row["avoided_usd"] == pytest.approx(0.05 - 0.08)
@@ -18818,6 +18875,12 @@ def test_jev_coordinator_check_claims_no_saving_it_did_not_make_and_bookkeeping_
     assert row["outcome"] == "wrong" and row["avoided_usd"] == pytest.approx(-0.08)
     s = jevuse.stats(p.db, p.config())["coord_effort"]
     assert s["saved"] == pytest.approx(-0.11) and s["net"] < 0, "the extra cost counts against the use"
+    # A raised turn that only did what a low-effort turn does: no change, saves nothing, pays the extra.
+    row = finish(call(), "ok", usage=routine)
+    assert row["outcome"] == "no change" and row["avoided_usd"] == pytest.approx(-0.08)
+    s = jevuse.stats(p.db, p.config())["coord_effort"]
+    assert s["saved"] == pytest.approx(-0.19) and s["no_change"] == 1 and s["right"] == 1
+    assert "no change 1" in jevuse.lines(p.db, p.config())[0]
     # A call that did not raise its turn is charged nothing extra.
     cid = jevuse.record(p.db, "coord_effort", {**dec, "escalated": False}, 0.0001, avoided_usd=0.05)
     assert finish(cid, "ok", usage=acted)["avoided_usd"] == pytest.approx(0.05)

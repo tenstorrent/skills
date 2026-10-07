@@ -123,7 +123,7 @@ def _jev_tier(db: DB, cfg: dict, task: dict, provider: str, jev) -> dict | None:
         avoided = max(0.0, given - picked) if given is not None and picked is not None else 0.0
     cid = jevuse.record(db, JEV_USE, {"effort": tier, "review": review, "spec_len": len(task.get("spec") or ""),
                                       "score": score}, getattr(jev, "last_cost", 0.0), avoided_usd=avoided,
-                        ref=f"task:{task['id']}")
+                        ref=f"task:{task['id']}", changed=tier != rules_tier(task))
     return {"tier": tier, "by": "jev", "score": score, "jev_call": cid}
 
 

@@ -91,11 +91,12 @@ CREATE INDEX IF NOT EXISTS snapshots_ts ON snapshots(ts);
 
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT, ts REAL);
 
--- One row per Jev call: its use, decision, cost, estimated cost avoided and later outcome (jevuse.py).
+-- One row per Jev call: its use, decision, cost, estimated cost avoided, whether it changed the rules'
+-- decision (NULL: not known) and later outcome (jevuse.py).
 CREATE TABLE IF NOT EXISTS jev_calls (
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, use TEXT NOT NULL, ref TEXT, decision TEXT,
   cost_usd REAL NOT NULL DEFAULT 0, avoided_usd REAL NOT NULL DEFAULT 0, settle_at REAL,
-  outcome TEXT, outcome_ts REAL, note TEXT);
+  outcome TEXT, outcome_ts REAL, note TEXT, changed INTEGER);
 CREATE INDEX IF NOT EXISTS jev_calls_use ON jev_calls(ts, use);
 
 -- One row per episode of a high alert with a condition key; cleared is set, never deleted.
@@ -150,6 +151,7 @@ class DB:
         self._migrate_push_queue()
         self._migrate_ledger_account()
         self._migrate_run_session()
+        self._migrate_jev_changed()
 
     def _migrate_ledger_account(self) -> None:
         """Ledger rows written without an account take the account of the run they booked: the run
@@ -176,6 +178,14 @@ class DB:
         with self.tx():
             if "session_id" not in {r["name"] for r in self.q("PRAGMA table_info(runs)")}:
                 self.x("ALTER TABLE runs ADD COLUMN session_id TEXT")
+
+    def _migrate_jev_changed(self) -> None:
+        # Whether a Jev call changed the rules' decision (jevuse.review). Older calls keep NULL: not known.
+        if "changed" in {r["name"] for r in self.q("PRAGMA table_info(jev_calls)")}:
+            return
+        with self.tx():
+            if "changed" not in {r["name"] for r in self.q("PRAGMA table_info(jev_calls)")}:
+                self.x("ALTER TABLE jev_calls ADD COLUMN changed INTEGER")
 
     def _migrate_push_queue(self) -> None:
         if self.meta(PUSH_QUEUE_MIGRATION) is not None:

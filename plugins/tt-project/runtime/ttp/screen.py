@@ -236,11 +236,14 @@ def _judge(db: DB, cfg: dict, source: str, text: str, hint: str | None, jev,
                             "wake": SEVERITY_RANK.get(severity, 1) >= floor}
                 verdict_src, reason = "jev", f"jev actionable={p:.2f} severity={s:.2f}"
             if ans is not None:   # it was called and paid for
-                skipped = SEVERITY_RANK.get(rules, 1) >= floor > SEVERITY_RANK.get(severity, 1)
+                rules_wake = SEVERITY_RANK.get(rules, 1) >= floor
+                jev_wake = SEVERITY_RANK.get(severity, 1) >= floor
+                skipped = rules_wake and not jev_wake
+                # It changed the decision only when it skipped a wake or raised one the rules would not have.
                 info = {"skipped": skipped, "jev_call": jevuse.record(
                     db, JEV_USE, decision, getattr(jev, "last_cost", 0.0),
                     avoided_usd=jevuse.low_turn_cost(db, cfg) if skipped else 0.0,
-                    settle_s=JEV_SETTLE_S if skipped else None)}
+                    settle_s=JEV_SETTLE_S if skipped else None, changed=rules_wake != jev_wake)}
         except JevOutOfFunds:
             # The rules decide in this same pass: screening again would count earlier items twice.
             reason += " (jev out of funds)"

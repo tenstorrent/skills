@@ -17,8 +17,10 @@ the caller for its alert.
 Each call is logged in jev_calls with its verdict, the effort it led to and whether that escalated
 the turn, and once the turn ends (`settle`) with what the turn did. A needs_thought call is counted as
 saving one low-effort turn (the one that would have failed or handed off to a high one) when its turn
-acted, less what the raised turn cost above a routine one; it is wrong when its turn did nothing, and
-then that extra cost counts as a negative saving. A turn that failed, was lost, shut down or logged out
+took an action beyond routine bookkeeping (ROUTINE_ACTIONS), less what the raised turn cost above a
+routine one. When its turn took only routine actions, a low-effort turn would have acted the same: the
+call is scored 'no change' and saves nothing, and that extra cost counts as a negative saving. It is
+wrong when its turn did nothing, with the same negative saving. A turn that failed, was lost, shut down or logged out
 leaves the call unscored with no saving. A routine call saves nothing; it is wrong when its turn
 failed or had actions rejected.
 """
@@ -39,6 +41,9 @@ RAISED_KEY = "coord_check_raised"   # kv: event ("e<id>"), message ("m<id>") and
                                     # ("w<task>:<stint start>") keys Jev raised a turn for
 RAISED_KEEP = 500
 SUMMARY_CHARS = 4000
+# What a routine (low-effort) turn does: queue the obvious next step, acknowledge, record. A raised turn
+# that took only these acted as a low-effort turn would have.
+ROUTINE_ACTIONS = frozenset(("noop", "reply", "notify", "resolve", "task_add", "task_update", "memory_add"))
 EVENT_CHARS = 300
 REASONS = {
     "stuck": ("Is work stuck: a failure, a block, a repeated problem or something waiting with no way forward?",
@@ -144,7 +149,8 @@ def check(db: DB, cfg: dict, jev, text: str, rules_effort: str, high_effort: str
     out = {"verdict": "needs_thought" if thought else "routine", "reason": f"{top} {ps[top]:.2f}",
            "p": ps, "rules_effort": rules_effort, "effort": effort, "escalated": effort != rules_effort}
     out["jev_call"] = jevuse.record(db, JEV_USE, out, getattr(jev, "last_cost", 0.0),
-                                    avoided_usd=jevuse.mean_turn_cost(db, cfg) if thought else 0.0)
+                                    avoided_usd=jevuse.mean_turn_cost(db, cfg) if thought else 0.0,
+                                    changed=out["escalated"])
     if thought:
         raised = [k for k in db.kv(RAISED_KEY, []) or [] if k not in keys] + keys
         db.set_kv(RAISED_KEY, raised[-RAISED_KEEP:])
@@ -196,8 +202,10 @@ def settle(db: DB, call_id: int, verdict: str, status: str, actions: list | None
             db.x("UPDATE jev_calls SET avoided_usd=0, note=? WHERE id=? AND outcome IS NULL", (note[:300], call_id))
             return
         right = bool(kinds)
+        if right and set(kinds) <= ROUTINE_ACTIONS:   # acted as a low-effort turn would have
+            right = jevuse.NO_CHANGE
         if jevuse.resolve(db, call_id, right, note, now=time.time()) and extra_usd > 0:
-            if right:
+            if right is True:
                 db.x("UPDATE jev_calls SET avoided_usd=avoided_usd-? WHERE id=?", (float(extra_usd), call_id))
             else:
                 db.x("UPDATE jev_calls SET avoided_usd=? WHERE id=?", (-float(extra_usd), call_id))

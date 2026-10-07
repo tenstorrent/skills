@@ -136,9 +136,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # such review's spec.
     "review": {"light_max_lines": 80, "risky_paths": [], "light_paths": [], "auto": True, "auto_notes": ""},
     # Each Jev use (e.g. "screen") is switched off once its net saving over window_days is not
-    # positive, judged after min_calls calls or once its first call is a window old; uses.<use> =
-    # "on" or "off" forces it (see jevuse.py).
-    "jev": {"enabled": "auto", "window_days": 7, "min_calls": 30, "uses": {}},
+    # positive, judged after min_calls calls or once its first call is a window old, or once idle_calls
+    # calls in the window changed none of the rules' decisions; uses.<use> = "on" or "off" forces it
+    # (see jevuse.py).
+    "jev": {"enabled": "auto", "window_days": 7, "min_calls": 30, "idle_calls": 20, "uses": {}},
     "web": {"bind": "127.0.0.1", "port": 0},
     "power": {},                        # keep_awake: replaced by runner.prevent_idle_sleep; "off" still turns it off
     # Disk guard: with free space under the project folder below the smaller of min_free_pct of the
