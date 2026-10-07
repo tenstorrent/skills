@@ -25885,6 +25885,37 @@ def test_devq_start_is_idempotent_one_runner_holds_the_lock(devq_dir):
     os.kill(pid, 0)
 
 
+def test_devq_a_job_runs_under_the_config_it_was_submitted_with(env, devq_dir, monkeypatch):
+    """Submit writes the config before the queue entry, and the runner rereads it after the dequeue, so a
+    submit landing between the runner's poll and its dequeue never runs under the settings before it."""
+    from ttp import devq
+    d = devq_dir
+    wrote = []
+    real_write = devq._write
+    monkeypatch.setattr(devq, "_write", lambda path, text: (wrote.append(path.name), real_write(path, text)))
+    monkeypatch.setattr(devq, "start", lambda d, cfg: 0)
+    assert devq.submit(d, {"job_timeout_s": 120}, {"id": "j1", "cmd": "true"}) == 0
+    assert wrote.index("config.json") < next(i for i, n in enumerate(wrote) if n.endswith("-j1.json"))
+    devq._write(d / "config.json", json.dumps(devq.settings({"job_timeout_s": 5})))
+    seen = []
+
+    def dequeue(self):  # the newer submit lands after the poll's config read
+        if seen:
+            raise KeyboardInterrupt
+        devq._write(d / "config.json", json.dumps(devq.settings({"job_timeout_s": 120})))
+        return "j1"
+
+    monkeypatch.setattr(devq.Runner, "next_job", dequeue)
+    monkeypatch.setattr(devq.Runner, "run_job", lambda self, job: seen.append(self.cfg["job_timeout_s"]))
+    monkeypatch.setattr(devq.signal, "signal", lambda *a: None)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            devq.Runner(d).loop()
+    finally:
+        (d / "runner.pid").unlink()   # it holds this test's own pid, which the fixture would kill
+    assert seen == [120]
+
+
 def test_devq_runs_jobs_in_order_once_the_health_gate_passes_and_writes_done_markers(devq_dir, tmp_path):
     d, gate, order = devq_dir, tmp_path / "gate", tmp_path / "order"
     cfg = {"health": f"test -e {gate} || {{ echo device not ready; exit 1; }}"}

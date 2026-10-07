@@ -674,6 +674,7 @@ class Runner:
             self.cfg = settings(_load(self.d / "config.json"))
             job = self.next_job()
             if job:
+                self.cfg = settings(_load(self.d / "config.json"))  # as of the dequeue, not the poll before it
                 self.run_job(job)
                 idle_since = _now()
                 continue
