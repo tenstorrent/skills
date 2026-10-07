@@ -313,6 +313,8 @@ def submit(d: Path, cfg: dict, spec: dict) -> int:
         print(f"devq submit: id {job} was already used here; pick a new one (e.g. {job}-r2)", file=sys.stderr)
         return 2
     spec["submitted"] = _now()
+    # The settings go down before the job: an idle runner may dequeue it at once and must see them.
+    _write(d / "config.json", json.dumps(settings(cfg), indent=1))
     _write(d / "queue" / f"{time.time_ns():020d}-{job}.json", json.dumps(spec, indent=1))
     ahead = len(list((d / "queue").glob("*.json"))) - 1 + len(_running(d))
     print(f"queued {job} ({ahead} ahead)")
