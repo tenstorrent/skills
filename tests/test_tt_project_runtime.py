@@ -6394,6 +6394,194 @@ def test_a_daily_receipt_watcher_keeps_its_pending_item_quiet_until_it_changes(e
         == {"not seen for 72 h"}
 
 
+def _receipt_rig(env, tmp_path, name="receipts", lifecycle="explicit_clear"):
+    """A project with a daily command schedule that prints the file `out`, and helpers that run it
+    the way the daemon's tick does (the quiet sweep first, then the due schedules)."""
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    out = tmp_path / f"{name}.txt"
+    out.write_text("")
+    act = {"type": "schedule_set", "name": name, "kind": "command", "every": "1d",
+           "command": f"cat {out}; test -s {out}", "rewake_after_h": None}
+    if lifecycle:
+        act["issue_lifecycle"] = lifecycle
+    assert coord.apply(p, [act]) == []
+    rig = {"d": Daemon(p.base), "src": f"watcher:{name}"}
+    rig["d"].gates = {}
+
+    def db():
+        return rig["d"].p.db
+
+    def events():
+        return db().one("SELECT COUNT(*) n FROM events WHERE source=?", (rig["src"],))["n"]
+
+    def tick(text=None, command=None):
+        """One tick: sweep, then the schedule (due now). Returns (status, new events)."""
+        if text is not None:
+            out.write_text(text)
+        if command:
+            row = db().one("SELECT payload FROM schedules WHERE name=?", (name,))
+            db().x("UPDATE schedules SET payload=? WHERE name=?",
+                   (json.dumps({**json.loads(row["payload"]), "command": command}), name))
+        n = events()
+        db().x("UPDATE schedules SET next_run=? WHERE name=?", (time.time() - 1, name))
+        rig["d"].sweep_watcher_issues()
+        rig["d"].run_schedules()
+        if command:   # back to the producer
+            row = db().one("SELECT payload FROM schedules WHERE name=?", (name,))
+            db().x("UPDATE schedules SET payload=? WHERE name=?",
+                   (json.dumps({**json.loads(row["payload"]), "command": f"cat {out}; test -s {out}"}), name))
+        return db().one("SELECT last_status FROM schedules WHERE name=?", (name,))["last_status"], events() - n
+
+    def age(hours):   # as if every sighting of this source were this much older
+        db().x("UPDATE issues SET last_seen=last_seen-? WHERE source=?", (hours * 3600, rig["src"]))
+
+    def restart():   # the daemon and its database go away and come back
+        rig["d"].p.db.close()
+        rig["d"] = Daemon(p.base)
+        rig["d"].gates = {}
+
+    def open_titles():
+        return {r["title"] for r in db().q("SELECT title FROM issues WHERE source=? AND status='open'",
+                                           (rig["src"],))}
+
+    rig.update(p=p, db=db, tick=tick, age=age, restart=restart, open_titles=open_titles, out=out)
+    return rig
+
+
+def _line(text, **kw):
+    return json.dumps({"text": text, "severity": "normal", **kw}) + "\n"
+
+
+def test_explicit_clear_receipts_stay_pending_through_the_quiet_sweep_downtime_and_restarts(env, tmp_path):
+    from ttp import daemon as dmod
+    from ttp import screen as scr
+    r = _receipt_rig(env, tmp_path)
+    tick, age = r["tick"], r["age"]
+    # The tick sweeps quiet issues before it runs the day's commands.
+    import inspect
+    body = inspect.getsource(dmod.Daemon.tick)
+    assert body.index("self.sweep_watcher_issues()") < body.index("self.run_schedules")
+    a, b = "job7: done; evidence_" + "a1" * 20, "job8: done; evidence_" + "c3" * 20
+    assert tick(_line(a) + _line(b)) == ("ok (2 observations)", 2), "each new receipt line wakes once"
+    pending = r["open_titles"]()
+    assert len(pending) == 4 and all(row["lifecycle"] == "receipt" for row in r["db"]().q(
+        "SELECT lifecycle FROM issues WHERE source=?", (r["src"],)))
+    # A day, then four days of downtime and a restart: the sweep that runs first closes none of them,
+    # and the same receipts reported again stay quiet.
+    age(25)
+    assert tick()[1] == 0 and r["open_titles"]() == pending
+    age(4 * 24)
+    r["restart"]()
+    assert r["d"].sweep_watcher_issues() == 0 and r["open_titles"]() == pending
+    assert tick()[1] == 0 and r["open_titles"]() == pending
+    # A producer that fails and retries: its failure is an error (it wakes); the retry repairs it and
+    # the receipts stay pending without a wake.
+    age(25)
+    status, woke = tick(command="echo boom >&2; exit 3")
+    assert woke == 1 and r["open_titles"]() >= pending
+    err = r["db"]().one("SELECT * FROM issues WHERE source=? AND lifecycle='error'", (r["src"],))
+    assert err["status"] == "open" and "rc=3" in err["title"]
+    assert tick()[1] == 0 and r["open_titles"]() == pending
+    assert r["db"]().one("SELECT * FROM issues WHERE id=?", (err["id"],))["cleared_why"] == scr.REPAIRED_WHY
+    # A changed outcome for one subject wakes and replaces that subject's old items only.
+    failed = "job7: failed; evidence_" + "b2" * 20
+    assert tick(_line(failed) + _line(b))[1] == 1
+    assert {t for t in r["open_titles"]() if t.startswith("job7")} == {"job7: failed", "job7: evidence_" + "b2" * 20}
+    assert {t for t in r["open_titles"]() if t.startswith("job8")} == {t for t in pending if t.startswith("job8")}
+    assert {x["cleared_why"] for x in r["db"]().q("SELECT cleared_why FROM issues WHERE source=? AND status='fixed' "
+                                                     "AND lifecycle='receipt'", (r["src"],))} == {scr.REPLACED_WHY}
+    # Job 8 not reported by a run keeps pending; a later return of job7 to done wakes again.
+    assert tick(_line(failed))[1] == 0 and any(t.startswith("job8") for t in r["open_titles"]())
+    assert tick(_line(a))[1] == 1
+    # Explicit acknowledgement: `cleared:` closes an item, a run printing nothing closes the rest.
+    assert tick(_line("job8: cleared: done; cleared: evidence_" + "c3" * 20) + _line(a))[1] == 0
+    assert not any(t.startswith("job8") for t in r["open_titles"]())
+    assert tick("")[0] == "ok (0 observations)" and r["open_titles"]() == set()
+
+
+def test_explicit_clear_errors_recover_and_a_later_recurrence_wakes(env, tmp_path):
+    from ttp import screen as scr
+    r = _receipt_rig(env, tmp_path)
+    tick, age = r["tick"], r["age"]
+    receipt = _line("job 1: done; evidence_" + "a1" * 20)
+    own_error = _line("accountant: failed to read the ledger", error=True, severity="high")
+    for restart in (False, True):
+        # The producer's own failure line, then a successful non-empty run without it, then the same
+        # failure more than a day later (across a restart in the second round): a fresh event.
+        assert tick(receipt + own_error)[1] >= 1
+        assert tick(receipt)[1] == 0
+        row = r["db"]().one("SELECT * FROM issues WHERE source=? AND lifecycle='error'", (r["src"],))
+        assert row["status"] == "fixed" and row["cleared_why"] == scr.REPAIRED_WHY
+        assert any(t.startswith("job 1") for t in r["open_titles"]()), "the receipt stays pending"
+        age(30)
+        if restart:
+            r["restart"]()
+        assert tick(receipt + own_error)[1] == 1, "the same failure after recovery is news"
+        # A run that still reports the failure repairs nothing: it stays open and quiet.
+        assert tick(receipt + own_error)[1] == 0
+        assert r["db"]().one("SELECT status FROM issues WHERE id=?", (row["id"],))["status"] == "open"
+        assert tick(receipt)[1] == 0
+    # The daemon's own failure report (exit code, no output) recovers the same way, across a restart.
+    assert tick(command="exit 4")[1] == 1
+    assert tick(receipt)[1] == 0
+    age(30)
+    r["restart"]()
+    assert tick(command="exit 4")[1] == 1
+    # An error nothing repairs is not exempt from expiry: the quiet sweep closes it (3 daily periods)
+    # while the receipt stays.
+    age(73)
+    assert r["d"].sweep_watcher_issues() == 1
+    assert {x["lifecycle"] for x in r["db"]().q("SELECT lifecycle FROM issues WHERE source=? AND status='open'",
+                                                  (r["src"],))} == {"receipt"}
+
+
+def test_ordinary_expiry_stays_for_sources_that_did_not_opt_in(env, tmp_path):
+    from ttp import coordinator as coord
+    r = _receipt_rig(env, tmp_path, name="plain", lifecycle=None)
+    p, db = r["p"], r["db"]
+    line = _line("job 1: done; evidence_" + "a1" * 20)
+    assert r["tick"](line)[1] == 1
+    assert {x["lifecycle"] for x in db().q("SELECT lifecycle FROM issues WHERE source=?", (r["src"],))} == {None}
+    r["age"](73)
+    assert r["d"].sweep_watcher_issues() == 2 and r["open_titles"]() == set()
+    assert r["tick"](line)[1] == 1, "reopened after expiry, as before"
+    # A fast watcher's items still close after 24 h, beside an explicit_clear source.
+    assert coord.apply(p, [{"type": "schedule_set", "name": "plain", "issue_lifecycle": "explicit_clear"}]) == []
+    assert r["tick"](line)[1] == 0, "its next run marks the open items receipts"
+    db().x("INSERT INTO issues(fingerprint,source,first_seen,last_seen,title,status) VALUES(?,?,?,?,?,?)",
+           ("fast1", "watcher:fast", 0, time.time() - 25 * 3600, "x", "open"))
+    r["age"](100)
+    assert r["d"].sweep_watcher_issues() == 1
+    assert db().one("SELECT status FROM issues WHERE fingerprint='fast1'")["status"] == "fixed"
+    assert len(r["open_titles"]()) == 2 and r["tick"](line)[1] == 0
+    # Turning the option off brings ordinary expiry back; a bad value is rejected.
+    assert coord.apply(p, [{"type": "schedule_set", "name": "plain", "issue_lifecycle": None}]) == []
+    assert "issue_lifecycle" not in json.loads(db().one("SELECT payload FROM schedules WHERE name='plain'")["payload"])
+    r["age"](73)
+    assert r["d"].sweep_watcher_issues() == 2
+    errs = coord.apply(p, [{"type": "schedule_set", "name": "plain", "issue_lifecycle": "forever"}])
+    assert errs and "issue_lifecycle" in str(errs[0])
+
+
+def test_issue_lifecycle_columns_are_added_to_an_old_database(env, tmp_path):
+    from ttp.db import DB
+    path = tmp_path / "old.db"
+    c = sqlite3.connect(path)
+    c.execute("CREATE TABLE issues (id INTEGER PRIMARY KEY AUTOINCREMENT, fingerprint TEXT UNIQUE, source TEXT, "
+              "first_seen REAL, last_seen REAL, count INTEGER DEFAULT 1, title TEXT, severity TEXT DEFAULT 'normal', "
+              "status TEXT DEFAULT 'open', task INTEGER, screen TEXT, closed REAL, cleared_why TEXT)")
+    c.execute("INSERT INTO issues(fingerprint,source,title) VALUES('f','watcher:x','t')")
+    c.commit()
+    c.close()
+    db = DB(path)
+    cols = {r["name"] for r in db.q("PRAGMA table_info(issues)")}
+    assert {"lifecycle", "subject"} <= cols
+    assert db.one("SELECT lifecycle FROM issues WHERE fingerprint='f'")["lifecycle"] is None
+    db.close()
+
+
 def test_schedule_set_takes_rewake_and_debounce_hours_or_null(env):
     p = make(env)
     from ttp import coordinator as coord
