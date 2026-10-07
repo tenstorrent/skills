@@ -285,7 +285,8 @@ def turns_line(db: DB, since: float) -> str:
         split[r["effort"] or "default"] = split.get(r["effort"] or "default", 0) + 1
         note = _note(r["note"])
         keys = [k for k in note if "escalat" in str(k)]
-        logged = logged or bool(keys)
+        # releases that can escalate write a `triggers` list on every turn, so it marks the log
+        logged = logged or bool(keys) or isinstance(note.get("triggers"), list)
         escalated += any(bool(note[k]) for k in keys)
         for t in _triggers(note):
             why[t] = why.get(t, 0) + 1

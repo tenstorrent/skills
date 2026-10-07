@@ -1163,6 +1163,8 @@ def test_unblock_asks_handed_back_and_turn_split(env):
                                                    "high-effort triggers: task_blocked 1")
     db.x("UPDATE runs SET note=NULL")   # fields not logged yet: still a report
     assert unblock.turns_line(db, now - 86400) == "3 turns: 2 low, 1 high; escalations not logged"
+    db.x("UPDATE runs SET note=? WHERE effort='low'", ('{"triggers": []}',))   # logged, none escalated
+    assert unblock.turns_line(db, now - 86400) == "3 turns: 2 low, 1 high; 0 escalated low to high"
 
 
 
