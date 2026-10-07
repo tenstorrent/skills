@@ -35,6 +35,7 @@ skills.** If a diff genuinely spans more than two domains, it is usually two rev
 | Trace capture or replay, program cache | `tt-trace-review` |
 | Dtype, fidelity, `*_cache_dtype`, precision config | `tt-precision-review` |
 | `generator_vllm.py`, vLLM plugin registration, tt-inference-server | `tt-vllm-serving-review` |
+| `tools/triage/**`, `tools/tt-triage.py`, `tools/tests/triage/**` (including `hang_apps/` kernels) | `tt-triage-review` |
 | `tests/**` — or any diff whose behaviour change needs a test | `tt-test-coverage-review` |
 | A PR body or comment asserting a speedup or a perf number | `tt-perf-claim-review` |
 | Any diff (cheap, runs alongside) | `tt-comment-hygiene-review` |
@@ -44,6 +45,13 @@ skills.** If a diff genuinely spans more than two domains, it is usually two rev
 **Route on what changed, not on where the file lives.** A `.py` file under `models/` that edits a
 program config is a memory-config change; a `.cpp` under `ttnn/` that only renames a symbol needs
 no domain skill at all.
+
+**Triage files have their own rules.** Kernels under `tools/tests/triage/hang_apps/` hang on purpose,
+for triage tests: they never select `ttnn-op-kernel-review`. Test changes under `tools/tests/triage/`
+do not select `tt-test-coverage-review`, because `tt-triage-review` owns those expectations. A diff
+that touches only triage files gets `tt-triage-review` alone. In a mixed diff, every other matching
+domain skill comes first, and `tt-triage-review` takes a slot only if one is left. Triage is
+diagnostic tooling, while the rest of the diff is the product.
 
 **Kernel changes almost always pair.** `ttnn-op-kernel-review` and `tt-l1-memory-review` are the
 common pair: a new CB is both a structural question and a footprint question.

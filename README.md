@@ -42,7 +42,7 @@ automatically for matching tasks; you can also ask your agent to make them expli
 | Plugin | Purpose |
 |---|---|
 | `tt-skills` | The finder: recommends relevant plugins and helps you install them with your approval |
-| `tt-review-skills` | PR and diff review for TTNN, Metalium, LLK, models, serving, multi-chip, trace, precision, testing, and L1 changes |
+| `tt-review-skills` | PR and diff review for TTNN, Metalium, LLK, models, serving, multi-chip, trace, precision, testing, L1, and tt-triage changes |
 | `tt-autodebug` | AutoDebug and AutoTriage investigate code issues and hangs; AutoFix tests hypotheses and repairs the cause |
 | `tt-model-bringup` | Eleven stages from HF decoder through TTNN/vLLM benchmarking, with chunked-prefill guidance, prefill/TTFT optimization, trace warmup/reuse and allocation validation, targeted path/serving checks, and fixed standard accuracy subsets plus 4K-input vLLM benchmarks at concurrency 1 and 32. Includes a standalone TTI release skill. Requires `tt-autodebug`. |
 | `tt-debug-tools` | Drive the Tenstorrent debug tools and read their output: tt-triage, dprint, watcher, asserts, etc. See [`plugins/tt-debug-tools/README.md`](plugins/tt-debug-tools/README.md) |
@@ -199,6 +199,7 @@ rules, and the do-not-flag guards that every other skill assumes and does not re
 | Skill | Reviews |
 |---|---|
 | `tt-l1-memory-review` | Buffer inventory discipline, data-movement tiers, CB sizing, accumulator capacity |
+| `tt-triage-review` | tt-triage (post-hang diagnostics) by its maintainers' principles: trustworthy output from a broken system, fail loudly, framework owns plumbing, one source of truth, output for the reader, only necessary code |
 
 ### llk — low-level kernels
 
@@ -242,6 +243,7 @@ Primary author is the top contributor to that path by commit count.
 | [`tt-metal`](https://github.com/tenstorrent/tt-metal) — `.github/bug_checker` | [@stevendae](https://github.com/stevendae) | Rules distilled from ~1,398 merged fix PRs: program-cache correctness, op validation, CCL ring buffers, stale LLK config. Strong evidence of which failures *recur* |
 | [`tt-metal`](https://github.com/tenstorrent/tt-metal) — `tech_reports/Handling_Special_Value` | [@ttmtrajkovic](https://github.com/ttmtrajkovic) | NaN/Inf/denormal semantics and the FPU/SFPU divergence |
 | [`tt-metal`](https://github.com/tenstorrent/tt-metal) — `docs/source/tt-metalium/tools`, `tt_metal/impl/debug`, `tt_metal/tools`, `tt_metal/hw/inc/api/debug` | *see note below* | The `tt-debug-tools` plugin: watcher, DPRINT, NoC debug dump, asserts and the LLK sanitizer, Inspector, triage, the device profiler, and TTNN's host-side debug flags |
+| [`tt-metal`](https://github.com/tenstorrent/tt-metal) — `tools/triage` review history | [@tt-vjovanovic](https://github.com/tt-vjovanovic) | The `tt-triage-review` checklist, distilled from a year of maintainer review on `tools/triage` (also [@adjordjevic-TT](https://github.com/adjordjevic-TT), [@jbaumanTT](https://github.com/jbaumanTT), [@onenezicTT](https://github.com/onenezicTT)) and the `tt-triage.md` script contract |
 | [`tenstorrent/tt-exalens`](https://github.com/tenstorrent/tt-exalens) | *see note below* | The `tt-exalens` skill: the command set, the server/remote and GDB modes, JTAG, and NoC selection |
 
 ### Structure and tooling

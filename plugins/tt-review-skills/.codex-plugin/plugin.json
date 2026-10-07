@@ -1,6 +1,6 @@
 {
   "name": "tt-review-skills",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Tenstorrent domain-knowledge code-review skills for gh-aw, Claude Code, and Codex.",
   "author": {
     "name": "Tenstorrent"
@@ -17,7 +17,7 @@
   "interface": {
     "displayName": "Tenstorrent Review Skills",
     "shortDescription": "Domain-aware review for tt-metal and TTNN",
-    "longDescription": "Reviews Tenstorrent changes with focused knowledge of TTNN, Metalium, LLK, model, serving, multi-chip, trace, precision, testing, and L1 concerns.",
+    "longDescription": "Reviews Tenstorrent changes with focused knowledge of TTNN, Metalium, LLK, model, serving, multi-chip, trace, precision, testing, L1, and tt-triage concerns.",
     "developerName": "Tenstorrent",
     "category": "Developer Tools",
     "capabilities": [
