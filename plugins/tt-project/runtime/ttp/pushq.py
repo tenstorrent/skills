@@ -591,6 +591,11 @@ def _settle(p: Project, tid: int, b: dict, m: dict, now: float) -> None:
         files = ", ".join(str(f) for f in (d.get("files") or [])[:20]) or "?"
         woke = (f"push conflict: {r['branch'] or '?'} at {r['head']} conflicts with {target} at "
                 f"{d.get('onto') or m.get('tip') or '?'} in {files}")
+        if d.get("cmd"):
+            tail = _tail_of({}, d, 5)
+            woke += f"; its checks failed after the batch merged changes of different lines: {d['cmd']}"
+            if tail:
+                woke += f" ({tail[-300:]})"
         done = [x for x in current if x["status"] in ("pushed", "landed")]
         if done:
             woke += "; already landed: " + ", ".join(f"{x['branch'] or '?'} at {_short(x['head'])} ({x['status']} as "
@@ -936,14 +941,18 @@ def conflict_stats(db, since: float) -> dict:
     those sent back for a new rebase and review, and both rates in whole percents."""
     rows = db.q("SELECT status, detail FROM push_queue WHERE updated>=? AND status IN "
                 "('pushed','landed','conflict','check_failed','refused')", (since,))
-    auto = 0
+    auto = back = 0
     for r in rows:
         try:
             d = json.loads(r["detail"]) if r["detail"] else {}
         except ValueError:
             d = {}
-        auto += bool(isinstance(d, dict) and d.get("settled") and r["status"] != "conflict")   # sent back: not resolved
-    back = sum(1 for r in rows if r["status"] == "conflict")
+        d = d if isinstance(d, dict) else {}
+        files = d.get("files") or []
+        if r["status"] == "conflict" and files and str(files[0]).startswith("(the rebase"):
+            continue  # the rebase stopped or did not finish: not a conflict, as in Batch.conflicts()
+        auto += bool(d.get("settled") and r["status"] != "conflict")   # sent back: not resolved
+        back += r["status"] == "conflict"
     n = len(rows)
     return {"entries": n, "conflicted": back + auto, "auto_resolved": auto, "sent_back": back,
             "conflict_pct": round(100 * (back + auto) / n) if n else 0, "sent_back_pct": round(100 * back / n) if n else 0}

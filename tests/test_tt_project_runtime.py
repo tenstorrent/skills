@@ -14154,6 +14154,13 @@ def test_the_push_queue_counts_conflicts_and_those_its_batches_resolved(env):
     assert pushq.summary(p, now)["conflicts"] == want, "a week's settled rows; the older one and approved ones are out"
     assert "last 7 days: 5 entries done, 4 conflicted (80%), 2 resolved in the batch, 2 sent back (40%)" \
         in pushq.queue_text(p, now).splitlines()
+    # A rebase that stopped or did not finish is no conflict, as in Batch.conflicts().
+    for files in (["(the rebase stopped: boom)"], ["(the rebase did not finish)"]):
+        _pq_row(p, rid, now, status="conflict", batch="b2")
+        p.db.x("UPDATE push_queue SET detail=? WHERE id=(SELECT MAX(id) FROM push_queue)",
+               (json.dumps({"files": files}),))
+    got = pushq.conflict_stats(p.db, now - 3600)
+    assert (got["entries"], got["conflicted"], got["sent_back"]) == (7, 4, 2), got
 
 
 def test_a_push_batch_does_not_settle_an_addition_that_repeats_a_top_level_name(env, monkeypatch):
@@ -14988,6 +14995,19 @@ def test_only_the_three_push_queue_alerts_reach_the_top_section_and_only_while_a
         "after_push_failed", "push_queue_dying", "push_rejected"]
     feed = [m for m in state_payload(p, p.db)["feed"] if m["state"] == "cleared"]
     assert sorted(m["text"] for m in feed) == ["after_push_failed text", "push_queue_dying text", "push_rejected text"]
+
+
+def test_a_push_conflict_from_failed_checks_after_a_hunks_merge_names_the_check(env, monkeypatch):
+    s = _pq(env, monkeypatch)
+    onto = "ef" * 20
+    _pq_plan(s, outcome="conflict", tip=onto, rows={s.branch: "conflict"},
+             detail={"files": ["feature.txt"], "onto": onto, "cmd": "pytest -q", "tail": "x\nE  assert 1 == 2"})
+    _pq_hand_off(env, s, push=[{"branch": s.branch, "head": s.head}])
+    _pq_batch(s)
+    _pq_tend(s)
+    woke = json.loads(s.p.db.task(s.review)["result"])["woke"]
+    assert "its checks failed after the batch merged changes of different lines: pytest -q" in woke, woke
+    assert "assert 1 == 2" in woke
 
 
 def test_a_conflicting_push_runs_the_review_again_with_the_conflict_and_what_landed(env, monkeypatch):
