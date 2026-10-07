@@ -4097,7 +4097,7 @@ def _reboot_wakes(task: dict) -> int:
 def relay_worker_notifies(p: Project, task: dict, run_dir: Path) -> int:
     """Post the `ttp notify` lines a worker run left as alerts, the way the coordinator's `notify`
     action does: at most low or normal severity, the first NOTIFIES_PER_RUN, a text already sent in
-    the last day not again. The file is renamed once posted, so a second finish does not repost."""
+    the last day not again. The file is renamed once the posts commit, so a second finish does not repost."""
     db, f = p.db, run_dir / NOTIFY_FILE
     try:
         lines = f.read_text(errors="replace").splitlines()
@@ -4122,10 +4122,14 @@ def relay_worker_notifies(p: Project, task: dict, run_dir: Path) -> int:
         sev = n.get("severity") if n.get("severity") in ("low", "normal") else "normal"
         db.post("out", text, chat=None, kind="alert", severity=sev)
         sent += 1
-    try:
-        f.rename(f.with_name(NOTIFY_FILE + ".sent"))
-    except OSError:
-        pass
+    def mark_sent() -> None:
+        try:
+            f.rename(f.with_name(NOTIFY_FILE + ".sent"))
+        except OSError:
+            pass
+
+    # Only once the posts commit: a rolled-back run end leaves the file to be posted next time.
+    db.after_commit(mark_sent)
     return sent
 
 

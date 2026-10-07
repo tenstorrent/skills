@@ -17981,6 +17981,29 @@ def test_a_worker_notify_reaches_the_user_once_when_its_run_ends(env, monkeypatc
     assert daemon.relay_worker_notifies(p, p.db.task(tid), run_dir) == 0
 
 
+def test_a_worker_notify_survives_a_rolled_back_run_end(env, monkeypatch):
+    """The run end posts the notify inside its transaction. If that rolls back (an error later, or
+    the daemon stopping half way), the file must stay, so the next finish posts it once."""
+    from ttp import daemon
+    p = make(env)
+    tid = p.db.add_task("milestone", "spec", kind="work", tier="standard", origin="coordinator")
+    run_dir = _note_run(env, monkeypatch, p, task=str(tid))
+    f = run_dir / daemon.NOTIFY_FILE
+    f.write_text(json.dumps({"text": "goal met", "severity": "low"}) + "\n")
+    with pytest.raises(RuntimeError):
+        with p.db.tx():
+            assert daemon.relay_worker_notifies(p, p.db.task(tid), run_dir) == 1
+            raise RuntimeError("run end failed later")
+    assert not p.db.one("SELECT id FROM messages WHERE kind='alert'")
+    assert f.exists() and not f.with_name(daemon.NOTIFY_FILE + ".sent").exists()
+    with p.db.tx():
+        assert daemon.relay_worker_notifies(p, p.db.task(tid), run_dir) == 1
+        assert f.exists(), "renamed before the posts committed"
+    assert [m["text"] for m in p.db.q("SELECT text FROM messages WHERE kind='alert'")] == [f"#{tid} milestone: goal met"]
+    assert not f.exists() and f.with_name(daemon.NOTIFY_FILE + ".sent").exists()
+    assert daemon.relay_worker_notifies(p, p.db.task(tid), run_dir) == 0
+
+
 def test_the_worker_hook_allows_a_notify_and_points_ttp_say_at_it(env, monkeypatch, tmp_path):
     from ttp import hook
     monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path))
