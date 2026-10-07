@@ -1817,7 +1817,7 @@ def cmd_service(a) -> None:
                 pass
         print(stop_workers(p, a.kill))
     else:
-        print(service.restart(p))
+        _exit_for_restart(service.restart(p))
 
 
 def stop_workers(p: Project, kill: bool, wait_s: float = 60) -> str:
@@ -2021,7 +2021,9 @@ def cmd_upgrade(a) -> None:
     Exit 75 = deferred, nothing changed and the project finishes it itself (another upgrade or a harness
     task holds it, a push is in flight, or a conflicting merge waits for a harness task or for the daemon's
     retry, which comes only for a newer version under upgrade.auto). Exit 1 = failed, including a conflict
-    nothing will retry (upgrade.auto off, or the same version from another commit)."""
+    nothing will retry (upgrade.auto off, or the same version from another commit). After main moved, the
+    restart decides: exit 75 = the restart is deferred (the old daemon runs on and restarts when it takes
+    the request a sandboxed caller left it), exit 1 = it failed or the runtime was rolled back."""
     from . import locks, release
     if a.project_dir:      # the daemon names its own folder: never another project of the same name
         p = Project(a.project_dir)
@@ -2129,7 +2131,8 @@ def _upgrade(p: Project, auto: bool = False) -> None:
             sys.exit(1)
         target = f"{new_v} ({new_c})"
         tid = tid or p.db.add_task(
-            release.UPGRADE_TASK_TITLE, _UPGRADE_TASK.format(problem=problem, name=p.name, target=target),
+            release.UPGRADE_TASK_TITLE, _UPGRADE_TASK.format(problem=problem, name=p.name, target=target,
+                                                             state=shlex.quote(str(p.state))),
             kind="harness", tier="standard", priority=2, origin="user")
         release.take_finish_lock(p, tid, f"{new_v} {new_c}", target)     # it holds the live harness until it ends
         release.note_deferred(p, problem, tid)
@@ -2161,9 +2164,11 @@ def _upgrade(p: Project, auto: bool = False) -> None:
     release.clear_stuck(p)
     print("harness up to date with the installed template; restarting the daemon")
     from . import service
-    print(service.restart(p))
+    res = service.restart(p)
     if not auto:
+        _exit_for_restart(res)
         return
+    print(res)
     if (_runtime_version(h / "runtime"), recorded_commit(h / "runtime")) != (new_v, new_c):
         release.finish(p, "failed", why="the daemon did not start with it, so the runtime was rolled back")
         return
@@ -2280,7 +2285,17 @@ def _apply_upgrade(p: Project, commit: str) -> None:
     release.clear_stuck(p)
     print(f"harness main is now {merged[:12]}; restarting the daemon")
     from . import service
-    print(service.restart(p))
+    _exit_for_restart(service.restart(p))
+
+
+def _exit_for_restart(res) -> None:
+    """Print a restart's report; exit 75 when it is deferred (the old daemon runs on and restarts when it
+    takes the request) and 1 when it failed or rolled back, never 0 for either."""
+    print(res)
+    code = {"deferred": 75, "failed": 1, "rolled_back": 1}.get(getattr(res, "outcome", "running"), 0)
+    if code:
+        print(f"restart {res.outcome.replace('_', ' ')} (exit {code})", file=sys.stderr)
+        sys.exit(code)
 
 
 def _refuse_unfinished_merge(p: Project, auto: bool) -> None:
@@ -2321,7 +2336,12 @@ In this harness repo:
 5. `ttp upgrade {name} --apply <commit>`, run on its own (never piped or masked). It fast-forwards main
    to <commit> under the upgrade lock and restarts the daemon (it rolls the runtime back if the daemon
    does not start). Never merge upstream into main any other way: the harness refuses it.
-   If it succeeds, remove <tmp>. If it fails, keep <tmp> and hand off with its path and the error.
+   Where the service manager is out of reach (a sandbox), it asks the running daemon to restart itself.
+   Exit 0: done, remove <tmp>. Exit 75: main is applied and the restart deferred; the old daemon runs on
+   and restarts when it takes the request: remove <tmp> and hand off `waiting` with retry_when
+   `test ! -e {state}/restart.request -a ! -e {state}/restart.request.taken`.
+   Exit 1 or other: keep <tmp> and hand off with its path and the error (it says whether the restart
+   was unavailable or the new daemon failed).
 """
 
 

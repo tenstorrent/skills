@@ -7523,6 +7523,207 @@ def test_a_cron_restart_waits_for_the_old_daemon_and_never_rolls_it_back(env, mo
     assert not p.db.one("SELECT id FROM messages WHERE kind='alert' AND text LIKE '%rolled back%'")
 
 
+BUS_DOWN = "Failed to connect to bus: No data available"
+
+
+def _sandboxed_systemd(env, monkeypatch, stderr=BUS_DOWN, takes=True, age=1.0):
+    """A systemd project seen from a sandboxed worker: `systemctl --user` fails with `stderr`, the
+    daemon's pid is not visible, and its heartbeat file (age s old) is the only sign it runs."""
+    p = make(env)
+    from ttp import daemon as dm, service
+    monkeypatch.setenv("HOME", str(env["tmp"] / "userhome"))
+    monkeypatch.setattr(service.sys, "platform", "linux")
+    service._unit(p).parent.mkdir(parents=True, exist_ok=True)
+    service._unit(p).write_text(service._unit_text(p))
+    calls = []
+
+    def run(*a):
+        calls.append(a)
+        rc = 1 if a[:3] == ("systemctl", "--user", "restart") else 0
+        return subprocess.CompletedProcess(a, rc, "", stderr if rc else "")
+
+    monkeypatch.setattr(service, "_run", run)
+    monkeypatch.setattr(dm, "_alive", lambda pid: False)       # another pid namespace
+    (p.state / "daemon.pid").write_text("4242")
+    hb = p.state / "heartbeat"
+    hb.write_text(json.dumps({"pid": 4242, "started": time.time() - 3600,
+                              **({"takes": ["restart_requests"]} if takes else {})}))
+    os.utime(hb, (time.time() - age, time.time() - age))
+    h = p.harness
+    good = _git_out(h, "rev-parse", "HEAD")
+    p.db.set_kv("harness_good", {"commit": good})
+    return p, _runtime_change(h), calls
+
+
+def _no_rollback(p, head):
+    assert _git_out(p.harness, "rev-parse", "HEAD") == head, "a healthy daemon's runtime was rolled back"
+    assert not p.db.one("SELECT id FROM messages WHERE kind='alert' AND text LIKE '%rolled back%'")
+
+
+def test_a_sandboxed_restart_asks_the_running_daemon_and_reports_its_outcome(env, monkeypatch):
+    import threading
+    from ttp import service
+    p, head, calls = _sandboxed_systemd(env, monkeypatch)
+    spawned = []
+    real_popen = subprocess.Popen
+    monkeypatch.setattr(service.subprocess, "Popen", lambda argv, **kw: spawned.append((argv, kw))
+                        if "ttp.service" in argv else real_popen(argv, **kw))
+
+    def daemon_side():      # the daemon's next tick takes the request; its restart from the host reports back
+        deadline = time.time() + 10
+        while time.time() < deadline and not service.take_restart_request(p, started=time.time() - 3600):
+            time.sleep(0.05)
+        at = json.loads((p.state / "restart.request.taken").read_text())["at"]
+        (p.state / "restart.result").write_text(json.dumps({"at": at, "outcome": "running",
+                                                            "text": "restarted; the daemon is running"}))
+
+    t = threading.Thread(target=daemon_side)
+    t.start()
+    res = service.restart(p, wait_s=5)
+    t.join()
+    assert res.outcome == "running" and "restarted itself on request" in res and BUS_DOWN in res, res
+    _no_rollback(p, head)
+    argv, kw = spawned[0]
+    assert argv[1:3] == ["-m", "ttp.service"] and kw["start_new_session"]
+    assert kw["env"]["PYTHONPATH"] == str(p.harness / "runtime"), "the restart must run the runtime on disk"
+    # An older request (made before this daemon started) is done: dropped, not carried out again.
+    (p.state / "restart.request").write_text(json.dumps({"at": time.time() - 60}))
+    assert not service.take_restart_request(p, started=time.time()) and not (p.state / "restart.request").exists()
+    assert len(spawned) == 1
+
+
+def test_the_daemon_announces_and_takes_restart_requests_each_tick(env, monkeypatch):
+    from ttp import daemon as dm, service, web
+    p = make(env)
+    d = dm.Daemon(p.base)
+    taken = []
+
+    def tick():
+        if not taken:
+            (p.state / "restart.request").write_text(json.dumps({"at": time.time(), "pid": 1}))
+        d.stopping = len(taken) >= 1
+
+    monkeypatch.setattr(d, "tick", tick)
+    monkeypatch.setattr(service, "take_restart_request", lambda p, started: taken.append(started) or True)
+    monkeypatch.setattr(web, "serve", lambda daemon: None)
+    monkeypatch.setattr(dm.signal, "signal", lambda *a: None)
+    monkeypatch.setattr(dm.time, "sleep", lambda s: None)
+    assert d.run() == 0
+    assert taken and set(taken) == {d._started}
+    assert "restart_requests" in json.loads((p.state / "heartbeat").read_text())["takes"]
+
+
+def test_the_requested_restart_runs_from_the_host_and_writes_its_result(env, monkeypatch):
+    from ttp import service
+    p = make(env)
+    at = time.time()
+    (p.state / "restart.request.taken").write_text(json.dumps({"at": at, "pid": 1}))
+    seen = []
+
+    def fake(p, requested=False):
+        seen.append(requested)
+        return service._said("rolled back to abc", "rolled_back")
+
+    monkeypatch.setattr(service, "restart", fake)
+    monkeypatch.setattr(service.sys, "argv", ["x", str(p.base)])
+    assert service.main() == 1 and seen == [True], "the host-side restart must never ask the daemon again"
+    res = json.loads((p.state / "restart.result").read_text())
+    assert res["at"] == at and res["outcome"] == "rolled_back" and not (p.state / "restart.request.taken").exists()
+    assert service._restart_result(p, at)["text"] == "rolled back to abc"
+
+
+def test_a_sandboxed_restart_is_deferred_while_the_daemon_has_not_taken_the_request(env, monkeypatch):
+    from ttp import service
+    p, head, _ = _sandboxed_systemd(env, monkeypatch)
+    res = service.restart(p, wait_s=0.3)
+    assert res.outcome == "deferred" and "Nothing was rolled back" in res and BUS_DOWN in res, res
+    assert (p.state / "restart.request").exists(), "the daemon carries the request out after its long step"
+    _no_rollback(p, head)
+
+
+def test_a_sandboxed_restart_of_a_daemon_older_than_requests_fails_without_rollback(env, monkeypatch):
+    from ttp import service
+    p, head, _ = _sandboxed_systemd(env, monkeypatch, takes=False)
+    t0 = time.time()
+    res = service.restart(p, wait_s=30)
+    assert time.time() - t0 < 5, "nothing will take the request: no point waiting for it"
+    assert res.outcome == "failed" and "older than restart requests" in res and BUS_DOWN in res, res
+    _no_rollback(p, head)
+
+
+def test_an_unreachable_service_manager_with_no_live_daemon_is_not_taken_for_a_bad_runtime(env, monkeypatch):
+    from ttp import service
+    p, head, _ = _sandboxed_systemd(env, monkeypatch, age=3600)
+    res = service.restart(p, wait_s=0.3)
+    assert res.outcome == "failed" and "Restart unavailable from here" in res and BUS_DOWN in res, res
+    assert not (p.state / "restart.request").exists()
+    _no_rollback(p, head)
+
+
+def test_a_refused_restart_keeps_the_managers_output_and_a_live_old_daemon(env, monkeypatch):
+    from ttp import service
+    out = "Job for x.service failed because the control process exited with error code.\nSee journalctl -xeu."
+    p, head, _ = _sandboxed_systemd(env, monkeypatch, stderr=out)
+    res = service.restart(p, wait_s=0.3)
+    assert res.outcome == "failed" and out in res and "not restarted" in res, res
+    assert not (p.state / "restart.request").exists(), "the manager was reached: asking the daemon is no help"
+    _no_rollback(p, head)
+
+
+def test_a_new_daemon_that_fails_under_the_manager_is_rolled_back_with_its_output(env, monkeypatch):
+    from ttp import service
+    out = "Job for x.service failed because the control process exited with error code."
+    p, head, calls = _sandboxed_systemd(env, monkeypatch, stderr=out, age=3600)   # the old daemon is gone
+    res = service.restart(p, wait_s=0.3, tick_wait_s=0.3)
+    assert res.outcome == "rolled_back" and out in res, res
+    assert _git_out(p.harness, "rev-parse", "HEAD") != head
+
+
+def test_an_old_daemon_still_ticking_after_the_restart_is_never_rolled_back(env, monkeypatch):
+    # The pid of the old daemon cannot be seen (a sandbox's own pid namespace) and the restart could not
+    # end it: its heartbeat, still moving after the restart, shows it is alive and healthy.
+    import threading
+    from ttp import daemon as dm, service
+    p = make(env)
+    monkeypatch.setattr(dm, "_alive", lambda pid: False)
+    (p.state / "daemon.pid").write_text("4242")
+    hb = p.state / "heartbeat"
+    hb.write_text(json.dumps({"pid": 4242, "started": time.time() - 3600}))
+    p.db.set_kv("harness_good", {"commit": _git_out(p.harness, "rev-parse", "HEAD")})
+    head = _runtime_change(p.harness)
+    threading.Timer(0.2, lambda: os.utime(hb, None)).start()
+    res = service.restart(p, wait_s=0.5, restart_fn=lambda p: "restarted")
+    assert res.outcome == "deferred" and "old daemon has not exited" in res, res
+    _no_rollback(p, head)
+
+
+@pytest.mark.parametrize("outcome,code", [("deferred", 75), ("failed", 1), ("rolled_back", 1), ("running", 0)])
+def test_upgrade_apply_never_exits_0_on_a_deferred_or_failed_restart(env, monkeypatch, tmp_path, outcome, code):
+    from ttp import cli, service
+    p, _ = _conflicting_upgrade(env, monkeypatch)
+    h = p.harness
+    with pytest.raises(SystemExit):
+        cli.main(["upgrade", "demo"])
+    tid = p.db.one("SELECT id FROM tasks WHERE kind='harness'")["id"]
+    assert f"test ! -e {p.state}/restart.request" in p.db.one("SELECT spec FROM tasks WHERE id=?", (tid,))["spec"]
+    ident = ["-c", "user.name=t", "-c", "user.email=t@t"]
+    wt = tmp_path / "merge"
+    _git_out(h, "worktree", "add", "-q", "--detach", str(wt), "main")
+    subprocess.run(["git", "-C", str(wt), *ident, "merge", "-X", "theirs", "upstream"], capture_output=True)
+    _git_out(wt, "add", "-A")
+    subprocess.run(["git", "-C", str(wt), *ident, "commit", "-qm", "merge upstream"], capture_output=True)
+    merged = _git_out(wt, "rev-parse", "HEAD")
+    monkeypatch.setenv("TTP_TASK", str(tid))
+    monkeypatch.setattr(service, "restart", lambda p: service._said(f"restart {outcome}", outcome))
+    if code:
+        with pytest.raises(SystemExit) as e:
+            cli.main(["upgrade", "demo", "--apply", merged])
+        assert e.value.code == code
+    else:
+        cli.main(["upgrade", "demo", "--apply", merged])
+    assert _git_out(h, "rev-parse", "HEAD") == merged
+
+
 @pytest.mark.parametrize("kickstart_rc", [0, 1])
 def test_a_macos_restart_uses_the_launchd_agent_and_falls_back_when_it_is_not_loaded(env, monkeypatch, kickstart_rc):
     p = make(env)

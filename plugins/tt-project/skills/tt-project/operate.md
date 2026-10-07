@@ -17,7 +17,7 @@
 | `ttp lock <r> -- <cmd>` / `ttp lock --probe <r>` / `ttp detach <job> -- <cmd>` | run one command holding resource `<r>` (waiters in arrival order; 75 when busy or paused) / exit 0 if `<r>` is free now, 75 if not / start a job that outlives the worker's run; the task then waits on `ttp detach --check` |
 | `ttp ci --branch <b>` / `--run <id>` | `retry_when` for GitHub CI: exit 0 once the commit's runs completed or a job hung (past 3x its recent median, floor 10 min, 90 min with no history), 1 while they run, 75 if gh cannot answer; prints `done:`/`hung:`/`running:` per run |
 | `ttp upgrade <name>` | merge the installed tt-project release into the harness and restart; the daemon does this by itself unless `upgrade.auto` is false |
-| `ttp restart <name>` | restart the daemon and confirm it runs; a runtime it cannot start with is rolled back |
+| `ttp restart <name>` | restart the daemon and confirm it runs; a runtime it cannot start with is rolled back; from a sandbox it asks the running daemon to restart (exit 75 while deferred, 1 on failure) |
 | `ttp stop <name> [--kill]` | remove the service; keeps all data. Running workers finish unless `--kill` (their tasks resume on start) |
 | `ttp task <name> cancel <id>` | cancel a task and end its running worker |
 | `ttp task <name> set-when <id> "<cmd>"` | re-point the probe of a task that has not started: a waiting task's `retry_when`, else its `start_when`; `""` clears it. Refuses running and finished tasks |

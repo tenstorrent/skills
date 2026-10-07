@@ -13,6 +13,7 @@ WatchdogSec (the daemon pings it after each tick and between the steps of a long
 """
 from __future__ import annotations
 
+import json
 import os
 import plistlib
 import re
@@ -272,8 +273,11 @@ def restart_service(p: Project) -> str:
         # The agent is not loaded (its bootstrap failed): restart the daemon by hand like cron does.
     unit = _unit(p)
     if unit.exists():
-        r = _run("systemctl", "--user", "restart", unit.name)
-        return "restarted" if r.returncode == 0 else r.stderr.strip()[:200]
+        try:
+            r = _run("systemctl", "--user", "restart", unit.name)
+        except (OSError, subprocess.SubprocessError) as e:
+            return f"could not run systemctl --user restart: {e}"
+        return "restarted" if r.returncode == 0 else _manager_said("systemctl --user restart", r)
     from .daemon import HEARTBEAT_STALE_S, _alive, _read_pid
     pid = _read_pid(p.state / "daemon.pid")
     if pid:
@@ -294,6 +298,140 @@ def restart_service(p: Project) -> str:
 def _git(h: Path, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["git", "-C", str(h), "-c", "user.name=tt-project", "-c", "user.email=tt-project@localhost",
                            *args], capture_output=True, text=True, timeout=120)
+
+
+# A caller that cannot reach the service manager (a sandboxed worker: no user bus, no signals to the
+# daemon) asks the running daemon to restart instead: it writes RESTART_REQUEST in state/, the daemon
+# runs `python -m ttp.service` (with the harness runtime on disk) detached, and that restart, made from
+# the host with the service manager in reach, writes RESTART_RESULT.
+RESTART_REQUEST, RESTART_RESULT = "restart.request", "restart.result"
+# The service manager could not be reached from here, as opposed to it trying and the daemon failing.
+_UNREACHABLE_RE = re.compile(r"failed to connect to bus|failed to get d-bus connection|DBUS_SESSION_BUS_ADDRESS|"
+                             r"XDG_RUNTIME_DIR|operation not permitted|permission denied|not authori[sz]ed|"
+                             r"access denied|could not run", re.I)
+
+
+class Restarted(str):
+    """restart()'s report. `outcome`: running, busy (alive, still in its first tick), deferred (the
+    restart has not happened yet; the old daemon runs on), rolled_back, or failed."""
+    outcome = "running"
+
+
+def _said(text: str, outcome: str) -> Restarted:
+    r = Restarted(text)
+    r.outcome = outcome
+    return r
+
+
+def _manager_said(cmd: str, r: subprocess.CompletedProcess) -> str:
+    """The service manager's whole failure output, kept for the report (it is what says why)."""
+    out = "\n".join(x.strip() for x in (r.stderr or "", r.stdout or "") if x and x.strip())
+    return f"{cmd} failed (exit {r.returncode}): {out[-2000:] or 'no output'}"
+
+
+def unreachable(msg: str) -> bool:
+    """msg, a failed restart_service's report, says the service manager could not be reached from here."""
+    return bool(_UNREACHABLE_RE.search(msg or ""))
+
+
+def old_daemon_beats(p: Project, since: float, after: float | None = None) -> dict | None:
+    """The heartbeat of a daemon started before `since` that still ticks: it showed progress within
+    HEARTBEAT_STALE_S, and after `after` when given. Read from the file, so it works where the
+    daemon's pid cannot be seen (a sandbox with its own pid namespace)."""
+    from .daemon import HEARTBEAT_STALE_S, heartbeat
+    hb = heartbeat(p)
+    if not hb or float(hb.get("started") or 0) >= since or hb["age"] >= HEARTBEAT_STALE_S:
+        return None
+    if after is not None and time.time() - hb["age"] <= after:
+        return None
+    return hb
+
+
+def request_restart(p: Project, why: str, wait_s: float = 60, result_wait_s: float | None = None) -> Restarted:
+    """Ask the running daemon to restart itself from the host, and wait for the outcome: a new daemon
+    ticking, or the result the daemon's restart wrote. The request stays when nothing took it yet:
+    the daemon carries it out when its current tick ends."""
+    from .daemon import heartbeat
+    at = time.time()
+    req = p.state / RESTART_REQUEST
+    durable_write(req, json.dumps({"at": at, "pid": os.getpid(), "why": why[-2000:]}))
+    hb = heartbeat(p) or {}
+    if "restart_requests" not in (hb.get("takes") or []):
+        return _said(f"{why}. The running daemon (pid {hb.get('pid', '?')}) is older than restart requests, so "
+                     f"nothing here can restart it: it keeps running the previous runtime, and the change "
+                     f"takes effect at its next restart from the host (a `ttp restart {p.name}` or `ttp upgrade` "
+                     f"run there, a crash or a reboot). The request is left in {req}; nothing was rolled back",
+                     "failed")
+    result_wait_s = 2 * wait_s if result_wait_s is None else result_wait_s
+    taken_by = at + wait_s
+    while True:
+        res = _restart_result(p, at)
+        if res:
+            return _said(f"{why}. The daemon restarted itself on request: {res.get('text', '')}",
+                         res.get("outcome") or "failed")
+        now = time.time()
+        if req.exists() and now >= taken_by:
+            return _said(f"{why}. Restart requested from the running daemon (pid {hb.get('pid', '?')}): it has "
+                         f"not taken the request after {now - at:.0f}s (a long tick step) and restarts when that "
+                         f"step ends. Nothing was rolled back. Check `ttp status {p.name}`", "deferred")
+        if not req.exists() and now >= taken_by + result_wait_s:
+            return _said(f"{why}. The daemon took the restart request but has reported no outcome after "
+                         f"{now - at:.0f}s; it is still restarting. Check `ttp status {p.name}`", "deferred")
+        time.sleep(poll_s(1))
+
+
+def _restart_result(p: Project, at: float) -> dict | None:
+    try:
+        res = json.loads((p.state / RESTART_RESULT).read_text())
+    except (OSError, ValueError):
+        return None
+    return res if isinstance(res, dict) and abs(float(res.get("at") or 0) - at) < 1e-3 else None
+
+
+def take_restart_request(p: Project, started: float) -> bool:
+    """The daemon's side, once per tick: carry out a restart request made since this daemon started,
+    from a detached `python -m ttp.service` run with the harness runtime on disk. An older request is
+    done (this daemon is the restart) and is dropped."""
+    req = p.state / RESTART_REQUEST
+    try:
+        info = json.loads(req.read_text())
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError):
+        info = {}
+    if float(info.get("at") or 0) < started:
+        req.unlink(missing_ok=True)
+        return False
+    taken = p.state / (RESTART_REQUEST + ".taken")
+    os.replace(req, taken)
+    p.logs.mkdir(parents=True, exist_ok=True)
+    with open(p.logs / "restart.log", "a") as log:
+        log.write(f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} restart requested by pid {info.get('pid', '?')}: "
+                  f"{str(info.get('why') or '')[-300:]}\n")
+        log.flush()
+        subprocess.Popen([sys.executable, "-m", "ttp.service", str(p.base)], cwd=str(p.base),
+                         env={**os.environ, **_env(p)}, stdin=subprocess.DEVNULL, stdout=log,
+                         stderr=subprocess.STDOUT, start_new_session=True)
+    return True
+
+
+def main() -> int:
+    """The restart a request asked for, run by the daemon detached (see take_restart_request)."""
+    p = Project(sys.argv[1] if len(sys.argv) > 1 else os.getcwd())
+    taken = p.state / (RESTART_REQUEST + ".taken")
+    try:
+        info = json.loads(taken.read_text())
+    except (OSError, ValueError):
+        info = {}
+    try:
+        res = restart(p, requested=True)
+        out = {"outcome": res.outcome, "text": str(res)}
+    except Exception as e:  # the requester waits for a result: always leave one
+        out = {"outcome": "failed", "text": f"the restart raised {type(e).__name__}: {e}"}
+    durable_write(p.state / RESTART_RESULT, json.dumps({"at": info.get("at"), "finished": time.time(), **out}))
+    taken.unlink(missing_ok=True)
+    print(out["text"])
+    return 0 if out["outcome"] in ("running", "busy") else 1
 
 
 def wait_for_start(p: Project, since: float, wait_s: float, tick_wait_s: float | None = None,
@@ -320,36 +458,49 @@ def wait_for_start(p: Project, since: float, wait_s: float, tick_wait_s: float |
                 return "busy"
         elif now >= waits_from + wait_s:
             old = _read_pid(p.state / "daemon.pid")
-            return "busy" if old and _is_daemon(old) else "broken"
+            return "busy" if old and _is_daemon(old) or old_daemon_beats(p, since, after=since) else "broken"
         time.sleep(poll_s(1))
 
 
-def restart(p: Project, wait_s: float = 60, restart_fn=None, tick_wait_s: float | None = None) -> str:
+def restart(p: Project, wait_s: float = 60, restart_fn=None, tick_wait_s: float | None = None,
+            requested: bool = False) -> Restarted:
     """Restart the daemon and confirm it ticks. If it is broken (never started, exited, or its first
     tick keeps failing) and the harness runtime changed since the commit a daemon last ran well on,
     put runtime/ back to that commit as a new commit (history, charter, memory and prompts untouched),
-    restart again and alert. A daemon that is alive but still in a slow first tick is left alone."""
+    restart again and alert. A daemon that is alive but still in a slow first tick is left alone.
+    When the service manager refuses while the old daemon still ticks, nothing restarted: no rollback.
+    If it could not be reached from here (a sandbox), the running daemon is asked to restart itself
+    (unless this is that restart, `requested`). The result's `outcome` says how it went."""
     from .daemon import start_marker
     restart_fn = restart_fn or restart_service
     t0 = time.time()
     msg = restart_fn(p)
+    if msg != "restarted" and old_daemon_beats(p, t0):
+        if unreachable(msg) and not requested:
+            return request_restart(p, f"The service manager could not be reached from here ({msg})", wait_s)
+        return _said(f"The daemon was not restarted: {msg}. The old daemon still runs the previous runtime; "
+                     f"nothing was rolled back", "failed")
+    if msg != "restarted" and unreachable(msg):
+        return _said(f"Restart unavailable from here: {msg}. No daemon heartbeat is fresh either, so it may be "
+                     f"down; its service restarts it from the host. Nothing was rolled back: the new runtime "
+                     f"was never started, so nothing shows it is at fault", "failed")
     state = wait_for_start(p, t0, wait_s, tick_wait_s, waits_from=time.time())
     if state == "running":
-        return f"{msg}; the daemon is running"
+        return _said(f"{msg}; the daemon is running", "running")
     if state == "busy":
         st = start_marker(p)
         if not (st and float(st.get("started") or 0) >= t0):
-            return (f"{msg}; but the old daemon has not exited after {time.time() - t0:.0f}s, so the new one "
-                    f"has not started yet. Check `ttp status {p.name}` shortly")
-        return (f"{msg}; the daemon is up but still in its first tick after {time.time() - t0:.0f}s. "
-                f"Check `ttp status {p.name}` shortly")
+            return _said(f"{msg}; but the old daemon has not exited after {time.time() - t0:.0f}s, so the new one "
+                         f"has not started yet. Check `ttp status {p.name}` shortly", "deferred")
+        return _said(f"{msg}; the daemon is up but still in its first tick after {time.time() - t0:.0f}s. "
+                     f"Check `ttp status {p.name}` shortly", "busy")
     h = p.harness
     good = (p.db.kv("harness_good") or {}).get("commit")
     changed = _git(h, "log", "--format=%h %s", f"{good}..HEAD", "--", "runtime").stdout.strip() if good else ""
     dirty = _git(h, "status", "--porcelain", "--", "runtime").stdout.strip() if good else ""
     if not changed and not dirty:
-        return (f"{msg}; but the daemon did not start or its first tick failed. Check `ttp logs {p.name}`"
-                + ("" if good else " (no known-good harness commit to fall back to)"))
+        return _said(f"{msg}; but the daemon did not start or its first tick failed. Check `ttp logs {p.name}`"
+                     + ("" if good else " (no known-good harness commit to fall back to)"), "failed")
     if dirty:
         _git(h, "add", "-A", "--", "runtime")
         _git(h, "commit", "-q", "-m", "runtime edits in place when the daemon failed to start")
@@ -363,6 +514,11 @@ def restart(p: Project, wait_s: float = 60, restart_fn=None, tick_wait_s: float 
     commits = "; ".join(changed.splitlines()[:10])
     text = (f"The daemon did not start after a runtime change, so the harness runtime was rolled back to "
             f"{good[:10]}, the last version that ran (a new commit; nothing was deleted). Rolled back: {commits}. "
+            + ("" if msg == "restarted" else f"The service manager said: {msg}. ")
             + ("The daemon is running again." if back else f"It still does not start: check `ttp logs {p.name}`."))
     p.db.post("out", text, chat=None, kind="alert", severity="high")
-    return text
+    return _said(text, "rolled_back")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

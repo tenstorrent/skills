@@ -47,6 +47,7 @@ from . import pushq
 from . import release
 from . import runner
 from . import schedule as sched
+from . import service
 from . import unblock
 from . import upstream
 from . import screen as scr
@@ -292,6 +293,7 @@ class Daemon:
             try:
                 self.tick()
                 self._beat()
+                service.take_restart_request(self.p, self._started)   # a sandboxed `ttp upgrade --apply` asked
             except Exception:  # a bad tick must never kill the daemon
                 log(self.p, "tick error: " + traceback.format_exc().replace("\n", " | ")[:2000])
                 if not self._healthy:
@@ -418,7 +420,7 @@ class Daemon:
         held = shared.held(self.p, self.cfg)
         if not self._healthy or held != self._held:
             durable_write(hb, json.dumps({"pid": os.getpid(), "host": hostname(), "started": self._started,
-                                          "boot": self.boot, "held": held}))
+                                          "boot": self.boot, "held": held, "takes": ["restart_requests"]}))
             self._held = held
         else:
             os.utime(hb, None)
