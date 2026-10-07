@@ -226,7 +226,9 @@ def merge3(ours: str, base: str, theirs: str, py: bool = False, taken_in: bool =
     (git calls adjacent changes a conflict) takes both changes (_hunks). None when any other conflict
     remains, or when keeping both could be wrong (_clash). `kinds` collects how each conflict was
     settled ("added", "taken_in", "hunks"). The conflict markers carry a random tag, so file content
-    never passes for one; a hunk whose base-to-end part holds more than one separator line is not read."""
+    never passes for one; a hunk whose base-to-end part holds more than one separator line is not read.
+    git ends every side of a conflict at the end of the file with a newline; the result ends as the
+    sides had it (the side that changed it from the base wins)."""
     tag = secrets.token_hex(8)
     # built, not spelled out: a literal marker line would make this file read as a conflicted one
     start, mid, end = (f"{c * 7} {side}-{tag}" for c, side in (("<", "ours"), ("|", "base"), (">", "theirs")))
@@ -244,7 +246,7 @@ def merge3(ours: str, base: str, theirs: str, py: bool = False, taken_in: bool =
     out = r.stdout.decode(errors="replace")
     if r.returncode == 0:
         return out
-    lines, res, i = out.splitlines(keepends=True), [], 0
+    lines, res, i, at_end = out.splitlines(keepends=True), [], 0, False
     while i < len(lines):
         if lines[i].rstrip("\r\n") != start:
             res.append(lines[i])
@@ -281,8 +283,13 @@ def merge3(ours: str, base: str, theirs: str, py: bool = False, taken_in: bool =
             return None
         if kinds is not None:
             kinds.add(how)
-        i = j + 1
-    return "".join(res)
+        at_end, i = j == len(lines) - 1, j + 1
+    merged = "".join(res)
+    nl = [t.endswith("\n") for t in (ours, base, theirs)]
+    eol = lines[-1][len(lines[-1].rstrip("\r\n")):]     # the newline git ends its lines with
+    if at_end and not (nl[2] if nl[0] == nl[1] else nl[0]) and eol and merged.endswith(eol):
+        merged = merged[:-len(eol)]
+    return merged
 
 
 def _hunks(mine: list[str], old: list[str], theirs: list[str], py: bool) -> list[str] | None:
@@ -480,6 +487,7 @@ class Batch:
         self.detail_tip: dict | None = None     # the tip's own failing check, for tip_failed
         self.info: dict[int, dict] = {}
         self.settled: dict[int, dict] = {}     # entry index -> the conflicts its replay settled
+        self.conflicted: set[int] = set()      # entries whose replay hit a conflict it did not settle
         self._settling: tuple[list[str], set] = ([], set())   # files and kinds of the replay running
 
     # results
@@ -495,12 +503,14 @@ class Batch:
 
     def conflicts(self) -> dict:
         """The round's conflict counts, for the marker and the log: entries replayed, those that hit a
-        conflict, those whose conflicts all settled without judgment, and those settled by taking
-        both sides' changes of different lines ("hunks")."""
-        real = sum(1 for st in self.status.values() if st == "conflict")
-        hunks = sum(1 for d in self.settled.values() if "hunks" in d["settled_by"])
-        return {"entries": len(self.entries), "conflicted": real + len(self.settled),
-                "auto_resolved": len(self.settled), "by_hunks": hunks, "sent_back": real}
+        conflict (also when requeued after it; a rebase stop that is no conflict is none), those whose
+        conflicts all settled without judgment and went on, those of them settled by taking both
+        sides' changes of different lines ("hunks"), and those sent back (status conflict)."""
+        back = {i for i in self.conflicted | set(self.settled) if self.status.get(i) == "conflict"}
+        kept = [d for i, d in self.settled.items() if i not in back]
+        return {"entries": len(self.entries), "conflicted": len(self.conflicted) + len(self.settled),
+                "auto_resolved": len(kept), "by_hunks": sum(1 for d in kept if "hunks" in d["settled_by"]),
+                "sent_back": len(back)}
 
     def _all(self, status: str, outcome: str, message: str = "", keep: tuple = ()) -> str:
         """Every entry not in a status of `keep` gets `status`; returns `outcome`."""
@@ -617,12 +627,19 @@ class Batch:
 
     def _close(self, k: int, outcome: str, carried: list | None = None, failed: tuple | None = None) -> str:
         """Settle every entry once the first `k` carried entries are pushed: the one after them is
-        check_failed when `failed` names its failure, and later ones are requeued. An entry that
-        added nothing on top of carried entries (a rider), or conflicted with them, follows them:
-        if they did not go, it is requeued, as it may apply to the tip as it is."""
+        check_failed when `failed` names its failure, and later ones are requeued; one whose replay
+        settled a conflict by taking both sides' changes ("hunks") is sent back as a conflict instead,
+        as that merge may be what fails. An entry that added nothing on top of carried entries (a
+        rider), or conflicted with them, follows them: if they did not go, it is requeued, as it may
+        apply to the tip as it is."""
         for n, (i, _) in enumerate(carried or [], 1):
             if n <= k:
                 self._set(i, "pushed")
+            elif n == k + 1 and failed and failed[0] not in (STALE, push.NONE_APPLY) \
+                    and "hunks" in self.settled.get(i, {}).get("settled_by", []):
+                say(f"entry {self.entries[i].get('id')}: its checks failed after the batch merged changes of "
+                    "different lines; sent back for a rebase")
+                self._set(i, "conflict", files=self.settled[i]["settled"], cmd=failed[0], tail=failed[1])
             elif n == k + 1 and failed:
                 self._set(i, "check_failed", cmd=failed[0], tail=failed[1])
             else:
@@ -642,7 +659,7 @@ class Batch:
         carried entries as (index, batch head after it); the others get their status here."""
         carried: list[tuple[int, str]] = []
         h = tip
-        self.info, self.settled = {}, {}
+        self.info, self.settled, self.conflicted = {}, {}, set()
         csdir = self.cfg["changeset_dir"] if self.cfg else ""
         for i, e in enumerate(self.entries):
             sha = str(e.get("head") or "")
@@ -685,6 +702,8 @@ class Batch:
             if files is not None:
                 say(f"entry {e.get('id')} ({e.get('branch')}) conflicts with {h[:10]} in {', '.join(files)}")
                 self._set(i, "conflict", files=files, onto=h, _after=len(carried))
+                if not files[0].startswith("(the rebase"):
+                    self.conflicted.add(i)
             elif new == h:
                 on_tip = h == tip or not any(line.startswith("+") for line in _git(
                     self.repo, "cherry", tip, top, base).stdout.splitlines())

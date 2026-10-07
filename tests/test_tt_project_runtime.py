@@ -13897,6 +13897,18 @@ def test_merge3_hunks_takes_both_changes_only_where_they_touch_different_lines(e
         == "def f(x):\n    if x and y:\n        return 2\n    return 0\n"
 
 
+def test_merge3_keeps_the_final_newline_as_the_sides_had_it(env):
+    """git ends each side of a conflict at the end of the file with a newline. The settled result ends
+    as the sides had it: without one where none had it, with one where a side added it."""
+    from ttp.batch import merge3
+    assert merge3("a\nb", "a\nc", "z\nc", hunks=True) == "z\nb"
+    assert merge3("a\r\nb", "a\r\nc", "z\r\nc", hunks=True) == "z\r\nb"
+    assert merge3("a\nb\n", "a\nc\n", "z\nc\n", hunks=True) == "z\nb\n"
+    assert merge3("a\nb", "a\nc", "z\nc\n", hunks=True) == "z\nb\n", "theirs added the newline"
+    assert merge3("a\nb", "a\nc\n", "z\nc\n", hunks=True) == "z\nb", "ours took it away"
+    assert merge3("A\nb\nc", "a\nb\nc", "a\nb\nC", hunks=True) == "A\nb\nC", "no conflict: git's own result"
+
+
 def test_a_push_batch_takes_both_changes_of_adjacent_lines_and_sends_back_only_a_real_overlap(env, monkeypatch, capsys):
     """Three changes of one file: the first two edit adjacent lines (a conflict to git, none in fact),
     the third edits the line the first changed. The batch takes both of the first two, runs the checks
@@ -13917,6 +13929,41 @@ def test_a_push_batch_takes_both_changes_of_adjacent_lines_and_sends_back_only_a
     assert "conflicts: 2 of 3 entries, 1 settled without judgment (1 by changes of different lines), 1 sent back" in out
 
 
+def test_a_push_batch_sends_back_an_entry_whose_merged_changes_fail_the_checks(env, monkeypatch):
+    """The checks fail only on the result of taking both sides' changes of different lines: the entry
+    whose replay merged them goes back as a conflict (the merge may be the cause), not check_failed,
+    and counts as sent back, not as resolved."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["! grep -q A1 notes.txt || ! grep -q B2 notes.txt"])
+    _commit(other, "notes.txt", "a\nb\nc\n")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    heads = [_entry(repo, "e1", {"notes.txt": "A1\nb\nc\n"}), _entry(repo, "e2", {"notes.txt": "a\nB2\nc\n"})]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert m["outcome"] == "pushed" and _statuses(m) == ["pushed", "conflict"], m
+    d = m["results"][1]["detail"]
+    assert d["files"] == ["notes.txt"] and d["settled_by"] == ["hunks"] and d["cmd"].startswith("! grep"), d
+    assert _git_out(origin, "show", "proj:notes.txt") == "A1\nb\nc"
+    assert m["conflicts"] == {"entries": 2, "conflicted": 1, "auto_resolved": 0, "by_hunks": 0, "sent_back": 1}
+
+
+def test_a_push_batch_counts_requeued_conflicts_and_not_rebase_stops(env, monkeypatch):
+    """An entry that conflicts with one that then fails its checks is requeued, and still counts as
+    conflicted; a rebase that stops without a conflict is sent back but counts as none."""
+    from ttp import batch
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["test ! -e bad.txt"])
+    _commit(other, "notes.txt", "a\nb\nc\n")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    heads = [_entry(repo, "e1", {"more.txt": "1\n"}), _entry(repo, "e2", {"notes.txt": "a\nB2\nc\n", "bad.txt": "2\n"}),
+             _entry(repo, "e3", {"notes.txt": "a\nB3\nc\n"})]
+    rebase = batch.Batch._rebase
+
+    def stop_e1(self, onto, top):
+        return (onto, ["(the rebase stopped: hook said no)"]) if top == heads[0] else rebase(self, onto, top)
+    monkeypatch.setattr(batch.Batch, "_rebase", stop_e1)
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert _statuses(m) == ["conflict", "check_failed", "requeued"], m
+    assert m["conflicts"] == {"entries": 3, "conflicted": 1, "auto_resolved": 0, "by_hunks": 0, "sent_back": 0}
+
+
 def test_the_push_queue_counts_conflicts_and_those_its_batches_resolved(env):
     from ttp import pushq
     p, rid = _pq_rows(env)
@@ -13924,15 +13971,16 @@ def test_the_push_queue_counts_conflicts_and_those_its_batches_resolved(env):
     assert pushq.conflict_stats(p.db, now - 3600)["entries"] == 0
     for status, detail in (("pushed", None), ("pushed", {"settled": ["a.py"], "settled_by": ["hunks"]}),
                            ("check_failed", {"cmd": "pytest", "settled": ["b.py"], "settled_by": ["added"]}),
-                           ("conflict", {"files": ["c.py"]}), ("approved", None)):
+                           ("conflict", {"files": ["c.py"]}), ("approved", None),
+                           ("conflict", {"files": ["d.py"], "settled": ["d.py"], "settled_by": ["hunks"]})):
         _pq_row(p, rid, now, status=status, batch="b1")
         p.db.x("UPDATE push_queue SET detail=? WHERE id=(SELECT MAX(id) FROM push_queue)",
                (json.dumps(detail) if detail else None,))
     _pq_row(p, rid, now, status="conflict", batch="b0")
     p.db.x("UPDATE push_queue SET updated=? WHERE id=(SELECT MAX(id) FROM push_queue)", (now - 8 * 86400,))
-    want = {"entries": 4, "conflicted": 3, "auto_resolved": 2, "sent_back": 1, "conflict_pct": 75, "sent_back_pct": 25}
+    want = {"entries": 5, "conflicted": 4, "auto_resolved": 2, "sent_back": 2, "conflict_pct": 80, "sent_back_pct": 40}
     assert pushq.summary(p, now)["conflicts"] == want, "a week's settled rows; the older one and approved ones are out"
-    assert "last 7 days: 4 entries done, 3 conflicted (75%), 2 resolved in the batch, 1 sent back (25%)" \
+    assert "last 7 days: 5 entries done, 4 conflicted (80%), 2 resolved in the batch, 2 sent back (40%)" \
         in pushq.queue_text(p, now).splitlines()
 
 

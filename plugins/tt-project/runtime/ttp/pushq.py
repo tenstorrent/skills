@@ -942,7 +942,7 @@ def conflict_stats(db, since: float) -> dict:
             d = json.loads(r["detail"]) if r["detail"] else {}
         except ValueError:
             d = {}
-        auto += bool(isinstance(d, dict) and d.get("settled"))
+        auto += bool(isinstance(d, dict) and d.get("settled") and r["status"] != "conflict")   # sent back: not resolved
     back = sum(1 for r in rows if r["status"] == "conflict")
     n = len(rows)
     return {"entries": n, "conflicted": back + auto, "auto_resolved": auto, "sent_back": back,
