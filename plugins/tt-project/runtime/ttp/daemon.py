@@ -2339,8 +2339,10 @@ class Daemon:
         if busy >= slots:
             return True   # no slot is free; nothing the turn queues could start before one is
         paused = db.paused_resources()
+        # A review held for the checks the daemon started on its head (_precheck_holds) fills no slot yet.
         runnable = sum(1 for t in db.ready_tasks() if not coord.task_resources(t) & paused.keys()
-                       and not (t["blocked_reason"] or "").startswith((PAUSED_NOTE, LOGGED_OUT_NOTE, NET_HELD_NOTE)))
+                       and not (t["blocked_reason"] or "").startswith((PAUSED_NOTE, LOGGED_OUT_NOTE, NET_HELD_NOTE))
+                       and not self._precheck_holds(t, now))
         return busy + runnable >= slots
 
     # workers ----------------------------------------------------------------------------------------
@@ -3477,6 +3479,7 @@ class Daemon:
         try:
             for t in db.q("SELECT * FROM tasks WHERE kind='review' AND status NOT IN ('done','failed','cancelled')"):
                 if task["id"] in dependency_ids(t) or (branch and branch in worktree.reviewed_refs(self.p, t)):
+                    self._precheck_open(task, t)
                     return t["id"], False
             if not add:
                 return None
@@ -3526,12 +3529,7 @@ class Daemon:
             lines.append("Review only: leave the branch" + (" and the PR" if pr else "") + " as they are.")
         checks = self._precheck(task, full) if pushes else None
         if checks:
-            lines.append(f"The daemon started the project's checks (`ttp checks`) on head {head} in "
-                         f"{self.p.worktrees / ('t' + str(task['id']))} as it queued this review, and starts the review "
-                         f"once they end: `ttp checks --result {checks}` prints their exit code and output tail "
-                         f"({checks / 'checks.log'} has it all). A pass is recorded, so `ttp checks` there reuses it. "
-                         f"The push queue runs the full checks again on the commit it pushes: run only focused tests "
-                         f"of what changed.")
+            lines.append(self._precheck_line(task, head, checks))
         if str(rules.get("auto_notes") or "").strip():
             lines.append(str(rules["auto_notes"]).strip())
         lines.append("Return the verdict and findings" + (", and the pushed commit." if pushes else "."))
@@ -3542,6 +3540,42 @@ class Daemon:
                           depends_on=[task["id"]], labels=labels)
         log(self.p, f"task {task['id']}: queued review #{rid} ({tier})")
         return rid, True
+
+    def _precheck_line(self, task: dict, head: str, checks: Path) -> str:
+        """The review spec's line on the checks _precheck started on the code task's head."""
+        return (f"The daemon started the project's checks (`ttp checks`) on head {head} in "
+                f"{self.p.worktrees / ('t' + str(task['id']))} as #{task['id']} finished, and starts this review "
+                f"once they end: `ttp checks --result {checks}` prints their exit code and output tail "
+                f"({checks / 'checks.log'} has it all). A pass is recorded, so `ttp checks` there reuses it. "
+                f"The push queue runs the full checks again on the commit it pushes: run only focused tests "
+                f"of what changed.")
+
+    def _precheck_open(self, task: dict, review: dict) -> None:
+        """An open review queued before the code task finished (the re-review _fix_failed_review
+        queues with its fix, or one the coordinator queued ahead) gets the checks started on the head
+        it will review, as a review _auto_review queues does: once per head, while it is still queued."""
+        d = self.cfg.get("delivery") or {}
+        branch = task.get("branch")
+        if review["status"] != "queued" or review["kind"] != "review" or not branch \
+                or not (d.get("push_branch") and d.get("push_allowed", True)):
+            return
+        try:
+            full = worktree._git(self.p.root, "rev-parse", branch)
+            if push.delivered_pr(self.p, task, full):
+                return
+        except Exception as e:
+            log(self.p, f"task {task['id']}: checks not started for review #{review['id']}: {e}")
+            return
+        labels = push._labels(review)
+        if f"{PRECHECK_LABEL}t{task['id']}-{full[:12]}" in labels:
+            return
+        checks = self._precheck(task, full)
+        if not checks:
+            return
+        self.p.db.update_task(review["id"],
+                              spec=f"{review.get('spec') or ''}\n{self._precheck_line(task, full[:12], checks)}",
+                              labels=[x for x in labels if not x.startswith(PRECHECK_LABEL)]
+                              + [PRECHECK_LABEL + checks.name])
 
     def _precheck(self, task: dict, full: str) -> Path | None:
         """With the push queue on, the project's checks (`ttp checks --detach`) started on the code

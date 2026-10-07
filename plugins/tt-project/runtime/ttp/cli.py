@@ -1024,7 +1024,7 @@ def cmd_push(a) -> None:
     sys.exit(push.detach(p, Path.cwd(), a.own) if a.detach else push.run(p, Path.cwd(), a.own))
 
 
-CHECK_PASSES = "check_passes.json"   # under the project's state: {"passes": [{"tree", "commands", "run", "ts"}]}
+CHECK_PASSES = "check_passes.json"   # under the project's state: {"passes": [{"tree", "commands", "prefixes", "run", "ts"}]}
 CHECK_PASSES_MAX = 200                # the newest entries kept
 
 
@@ -1034,7 +1034,9 @@ def _commands_hash(cmds: list) -> str:
 
 
 def _recorded_pass(p: Project | None, tree: str, cmds: list) -> dict | None:
-    """The recorded pass of exactly these commands, in this order, on this tree, or None."""
+    """The recorded pass of exactly these commands, in this order, on this tree, or None. A pass of
+    more commands that start with these is one of these too: they ran first, in order, and passed (the
+    daemon's pre-started checks run the project's checks alone; a worker ran them with its own after `--`)."""
     if not p or not tree:
         return None
     try:
@@ -1043,7 +1045,8 @@ def _recorded_pass(p: Project | None, tree: str, cmds: list) -> dict | None:
         return None
     key = _commands_hash(cmds)
     for e in reversed(passes if isinstance(passes, list) else []):
-        if isinstance(e, dict) and e.get("tree") == tree and e.get("commands") == key:
+        if isinstance(e, dict) and e.get("tree") == tree and (e.get("commands") == key
+                                                               or key in (e.get("prefixes") or ())):
             return e
     return None
 
@@ -1064,6 +1067,7 @@ def _record_pass(p: Project | None, tree: str, cmds: list) -> None:
                 passes = None
             passes = [e for e in passes if isinstance(e, dict)] if isinstance(passes, list) else []
             passes.append({"tree": tree, "commands": _commands_hash(cmds),
+                           "prefixes": [_commands_hash(cmds[:n]) for n in range(1, len(cmds))],
                            "run": os.environ.get("TTP_RUN_ID") or "?", "ts": time.time()})
             write_json(path, {"passes": passes[-CHECK_PASSES_MAX:]})
     except OSError as e:
@@ -1076,9 +1080,9 @@ def cmd_checks(a) -> None:
     checks are the project's `delivery.push_checks`, plus the commands given after `--`.
 
     A pass is also recorded in the project's state, keyed on HEAD's tree and the ordered list of
-    the commands that apply there. When the same commands already passed on the same tree (a
-    reviewer checking a worker's commit, a rerun after a rebase that changed nothing), that pass is
-    reused and nothing runs again; `--fresh` always runs them. Failures are never recorded, so a
+    the commands that apply there. When the same commands, or more that start with them, already
+    passed on the same tree (a reviewer checking a worker's commit, a rerun after a rebase that changed
+    nothing), that pass is reused and nothing runs again; `--fresh` always runs them. Failures are never recorded, so a
     failure is never served as a pass. `ttp push` and the push queue never read this record and
     always run their own checks on the exact commit they push: a forged record can at most skip a
     local re-run, never let a change onto the branch. Where every project check is skipped on a commit,

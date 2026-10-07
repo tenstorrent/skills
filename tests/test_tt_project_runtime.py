@@ -23354,6 +23354,98 @@ def test_with_the_push_queue_on_the_daemon_starts_the_checks_as_it_queues_the_re
     assert PRECHECK_LABEL not in none["labels"] and "ttp checks --result" not in none["spec"]
 
 
+def _wait_precheck(out: Path) -> str:
+    from ttp import cli
+    deadline = time.time() + 30
+    while not (out / cli.CHECKS_RC).exists() and time.time() < deadline:
+        time.sleep(0.1)
+    return (out / cli.CHECKS_RC).read_text().strip()
+
+
+def test_a_pass_of_more_commands_answers_for_the_commands_they_start_with(env):
+    # The daemon's pre-started checks run delivery.push_checks alone; the code task recorded its pass
+    # of them with its own commands after `--`. That pass answers for push_checks: nothing reruns.
+    from ttp import cli
+    from ttp.daemon import PRECHECKS_DIR
+    p = make(env)
+    cli._record_pass(p, "t" * 40, ["a", "b"])
+    assert cli._recorded_pass(p, "t" * 40, ["a"]) and cli._recorded_pass(p, "t" * 40, ["a", "b"])
+    assert not cli._recorded_pass(p, "t" * 40, ["b"]), "a pass of a later command alone was reused"
+    assert not cli._recorded_pass(p, "t" * 40, ["a", "b", "c"])
+    assert not cli._recorded_pass(p, "u" * 40, ["a"])
+    # Through the daemon: a project check that would fail if it ran is answered by the recorded pass.
+    p.set_config("delivery.push_branch", "work")
+    p.set_config("delivery.push_queue", True)
+    p.set_config("delivery.push_checks", ["false"])
+
+    def worker_checks(tid, head):
+        cli._record_pass(p, _git_out(p.root, "rev-parse", f"{head}^{{tree}}").strip(), ["false", "pytest -q"])
+    tid, branch, _, (rev,) = _finish_code(env, p, "reuse", {"app.py": 3}, before=worker_checks)
+    head = _git_out(p.root, "rev-parse", branch).strip()
+    out = p.state / PRECHECKS_DIR / f"t{tid}-{head[:12]}"
+    assert _wait_precheck(out) == "0", (out / "checks.log").read_text()
+    assert "(recorded)" in (out / "checks.log").read_text()
+
+
+def test_a_re_review_gets_its_checks_started_when_the_fix_finishes(env):
+    # _fix_failed_review queues the re-review before the fix has a head; the fix's hand-off finds it
+    # open and starts the checks on the fix's head for it, as for a review queued then.
+    from ttp import worktree
+    from ttp.daemon import PRECHECK_LABEL, PRECHECKS_DIR, Daemon
+    from ttp.providers.base import RunUsage as Usage
+    p = make(env)
+    p.set_config("delivery.push_branch", "work")
+    p.set_config("delivery.push_queue", True)
+    p.set_config("delivery.push_checks", ["test -f app.py"])
+    _, _, _, (rev,) = _finish_code(env, p, "feature", {"app.py": 40})
+    _fail_review(env, p, rev["id"], [{"title": "add the missing test", "spec": "test_x"}])
+    (fix,) = p.db.q("SELECT * FROM tasks WHERE kind='code' AND origin='daemon'")
+    (re_rev,) = p.db.q("SELECT * FROM tasks WHERE kind='review' AND id!=?", (rev["id"],))
+    assert not any(x.startswith(PRECHECK_LABEL) for x in json.loads(re_rev["labels"]))
+    path, _ = worktree.ensure(p, p.db.task(fix["id"]))
+    (path / "test_x.py").write_text("def test_x(): pass\n")
+    _git_out(path, "add", ".")
+    _git_out(path, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "fix")
+    head = _git_out(path, "rev-parse", "HEAD").strip()
+    p.db.update_task(fix["id"], status="running")
+    run_dir = env["tmp"] / f"run-{fix['id']}"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps({"status": "done", "summary": "fixed"}))
+    Daemon(p.base)._finish_worker({"task": fix["id"]}, Usage(cost_usd=1.0), "ok", run_dir)
+    re_rev = p.db.task(re_rev["id"])
+    out = p.state / PRECHECKS_DIR / f"t{fix['id']}-{head[:12]}"
+    assert json.loads(re_rev["labels"]).count(f"{PRECHECK_LABEL}{out.name}") == 1, re_rev["labels"]
+    assert f"ttp checks --result {out}" in re_rev["spec"] and "Re-review after review" in re_rev["spec"]
+    assert _wait_precheck(out) == "0"
+    # Once per head: finding the review again starts nothing more.
+    spec = re_rev["spec"]
+    Daemon(p.base)._precheck_open(p.db.task(fix["id"]), re_rev)
+    assert p.db.task(re_rev["id"])["spec"] == spec
+
+
+def test_a_review_held_for_its_checks_does_not_fill_a_slot_for_the_turn_batch(env):
+    from ttp import cli
+    from ttp.daemon import PRECHECK_LABEL, PRECHECKS_DIR, Daemon
+    from ttp.runner import proc_start
+    p = make(env)
+    p.db.x("UPDATE events SET status='handled'")
+    p.db.x("UPDATE tasks SET status='done'")
+    p.set_config("budget.max_parallel_workers", 1)
+    out = p.state / PRECHECKS_DIR / "t1-abc"
+    out.mkdir(parents=True)
+    (out / cli.CHECKS_PID).write_text(json.dumps({"pid": os.getpid(), "started": proc_start(os.getpid()),
+                                                  "ts": time.time()}))
+    rid = p.db.add_task("Review #1: x", "s", kind="review", tier="standard", origin="daemon",
+                        labels=[PRECHECK_LABEL + out.name])
+    d = Daemon(p.base)
+    d.gates = {}
+    evs = [{"ts": time.time() - 10, "kind": "task_done", "severity": "normal"}]
+    assert d._precheck_holds(p.db.task(rid), time.time())
+    assert not d._batch_hold(evs, time.time()), "a review held for its checks filled the free slot"
+    (out / cli.CHECKS_RC).write_text("0\n")
+    assert d._batch_hold(evs, time.time()), "the same review, its checks done, fills the slot"
+
+
 def test_the_review_of_a_head_already_delivered_as_a_pr_publishes_nothing_more(env):
     # A code task delivered its head as a draft PR; a push branch is configured too. A passing review
     # of that head is review only: no `ttp push` toward a branch that may be unrelated or absent.
