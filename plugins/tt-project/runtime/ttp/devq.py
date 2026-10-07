@@ -675,6 +675,9 @@ class Runner:
             job = self.next_job()
             if job:
                 self.cfg = settings(_load(self.d / "config.json"))  # as of the dequeue, not the poll before it
+                # Read again after the dequeue: submit writes the settings before the job, so a job
+                # queued since the read above runs with the settings of its own submit.
+                self.cfg = settings(_load(self.d / "config.json"))
                 self.run_job(job)
                 idle_since = _now()
                 continue

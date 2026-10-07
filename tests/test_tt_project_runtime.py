@@ -26263,6 +26263,35 @@ def test_device_timeout_ceiling_clamps_or_refuses_devq_timeouts_and_reaches_the_
     assert "device job timeouts" not in worker_task(p, p.db.task(tid), str(p.root), None)
 
 
+def test_devq_runner_runs_a_job_queued_after_its_settings_read_with_that_submits_settings(env, tmp_path,
+                                                                                         monkeypatch):
+    from ttp import devq
+    d = tmp_path / "rq"
+    devq._dirs(d)
+    devq._write(d / "config.json", json.dumps(devq.settings({"job_timeout_s": 0})))
+    r = devq.Runner(d)
+    real_next, seen = r.next_job, []
+
+    def submit_then_dequeue():
+        # A submit lands between the loop's settings read and its dequeue: settings first, then the job.
+        devq._write(d / "config.json", json.dumps(devq.settings({"job_timeout_s": 120})))
+        devq._write(d / "queue" / f"{time.time_ns():020d}-j1.json", json.dumps({"id": "j1", "cmd": "true"}))
+        return real_next()
+
+    class Ran(Exception):
+        pass
+
+    def run_job(job):
+        seen.append((job, r.limit(json.loads((d / "running" / f"{job}.json").read_text()))))
+        raise Ran
+    monkeypatch.setattr(r, "next_job", submit_then_dequeue)
+    monkeypatch.setattr(r, "run_job", run_job)
+    monkeypatch.setattr(devq.signal, "signal", lambda *a: None)
+    with pytest.raises(Ran):
+        r.loop()
+    assert seen == [("j1", 120.0)], "the job ran with the settings from before its submit"
+
+
 class _FakeCaffeinate:
     """Stands in for the caffeinate child: records its argv and whether it was ended and reaped."""
     started: list = []
