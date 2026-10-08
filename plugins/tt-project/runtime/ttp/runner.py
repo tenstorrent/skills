@@ -16,7 +16,10 @@
   pending: the tool_progress heartbeats and retry notices Claude Code writes while a call hangs on a
   network stall are not progress;
 - enforces the run's dollar budget mid-flight when the provider streams usage;
-- ends the child when <run_dir>/STOP appears (a cancel, or `ttp stop --kill` writing "shutdown");
+- ends the child when <run_dir>/STOP appears (a cancel, or `ttp stop --kill` writing "shutdown") or
+  the run dir is deleted, and never starts it when the STOP came first;
+- ends the child when the runner itself dies (killed outright): on Linux the kernel sends it SIGTERM
+  (PR_SET_PDEATHSIG), elsewhere a watchdog process ends its process group;
 - starts the child `nice` levels below itself (run.json; workers and reviewers only), so all it
   starts runs niced too, and records the level the child ran at in exit.json (`nice`);
 - holds a slot of each resource an `exclusive:` task names from before the child starts until it
@@ -52,6 +55,29 @@ POLL_S = 5
 BUDGET_EVERY_S = 10
 TOOL_GRACE_S = 60     # past a pending tool call's own timeout before its silence counts as a stall
 SLEEP_GAP_S = 600     # polls are POLL_S apart: a gap this long between two can only be a host sleep
+PDEATHSIG = sys.platform.startswith("linux")   # else (macOS) a watchdog ends the agent if the runner dies
+PR_SET_PDEATHSIG = 1
+
+# Started with the agent where PDEATHSIG is off: waits on a pipe the runner holds open. A word on it
+# is a normal end; end of file without one means the runner died, and the agent's group is ended.
+_WATCHDOG = """
+import os, signal, sys, time
+pgid, grace = int(sys.argv[1]), float(sys.argv[2])
+if sys.stdin.buffer.read():
+    sys.exit(0)
+for sig in (signal.SIGTERM, signal.SIGKILL):
+    try:
+        os.killpg(pgid, sig)
+    except OSError:
+        sys.exit(0)
+    end = time.time() + grace
+    while time.time() < end:
+        time.sleep(0.5)
+        try:
+            os.killpg(pgid, 0)
+        except OSError:
+            sys.exit(0)
+"""
 
 
 def boot_id() -> str:
@@ -126,8 +152,57 @@ def stop_reason(run_dir: Path) -> str | None:
     try:
         text = (run_dir / "STOP").read_text().strip()
     except OSError:
-        return None
+        # The run dir itself is gone (deleted under a live run, e.g. a test's temp dir): nobody can
+        # read its output or hand-off any more, so the agent must not run on unattended.
+        return None if run_dir.is_dir() else "stopped"
     return "shutdown" if text == "shutdown" else "stopped"
+
+
+def _write_exit(run_dir: Path, info: dict) -> None:
+    """Record how the run ended; never creates a run dir that was deleted (durable_write would)."""
+    if run_dir.is_dir():
+        try:
+            durable_write(run_dir / "exit.json", json.dumps(info))
+        except FileNotFoundError:
+            pass
+
+
+def _agent_preexec(nice: int):
+    """The agent's preexec_fn and whether it arms PR_SET_PDEATHSIG: its nice level, and on Linux a
+    SIGTERM from the kernel the moment the runner dies. The signal follows the thread that started
+    the child, here the main thread, which lives as long as the runner."""
+    lower = lower_priority(nice)
+    if not PDEATHSIG:
+        return lower, False
+    try:
+        import ctypes
+        prctl = ctypes.CDLL(None, use_errno=True).prctl
+    except (OSError, AttributeError):
+        return lower, False
+    parent = os.getpid()
+
+    def apply() -> None:
+        if lower:
+            lower()
+        prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
+        if os.getppid() != parent:   # the runner died before the signal was armed
+            os._exit(1)
+    return apply, True
+
+
+def _start_watchdog(pgid: int):
+    """Where PDEATHSIG is not armed: a process of its own that ends the agent's process group when
+    the runner dies. Returns the pipe's write end and the process (None, None if it cannot start)."""
+    r, w = os.pipe()
+    try:
+        proc = subprocess.Popen([sys.executable, "-c", _WATCHDOG, str(pgid), str(KILL_AFTER_S)], stdin=r,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        os.close(w)
+        return None, None
+    finally:
+        os.close(r)
+    return w, proc
 
 
 def remove_files(paths: list[str]) -> None:
@@ -165,26 +240,39 @@ def supervise(run_dir: Path) -> int:
         # Empty or cut short (a power cut while it was written): nothing to run. The daemon books a
         # failed run that never launched, so its task is retried.
         now = time.time()
-        durable_write(run_dir / "exit.json", json.dumps({"rc": None, "started": now, "ended": now, "launched": False,
-                                                         "error": f"run.json unreadable: {e}"[:300]}))
+        _write_exit(run_dir, {"rc": None, "started": now, "ended": now, "launched": False,
+                              "error": f"run.json unreadable: {e}"[:300]})
         return 1
     argv, env_extra, cwd = spec["argv"], spec.get("env", {}), spec["cwd"]
     timeout_s, budget = float(spec.get("timeout_s", 3600)), spec.get("budget_usd")
     stall_s = float(spec.get("stall_s") or 0)
     env = {**os.environ, **env_extra}
     lease, out_path = run_dir / "lease", run_dir / "output.jsonl"
-    _touch(lease)
     started = time.time()
-    wait_s = min(float(spec.get("exclusive_wait_s") or 600), timeout_s)
+    # A stop that came before the agent started (a cancel right after start_run): it never starts.
+    held = None if stop_reason(run_dir) else []
     inherited: list[str] = []
-    held = _take_exclusive(run_dir, spec.get("exclusive") or [], spec.get("env", {}), started + wait_s,
-                           spec.get("holds"), inherited)
+    if held is not None:
+        _touch(lease)
+        wait_s = min(float(spec.get("exclusive_wait_s") or 600), timeout_s)
+        held = _take_exclusive(run_dir, spec.get("exclusive") or [], spec.get("env", {}), started + wait_s,
+                               spec.get("holds"), inherited)
+    if held is not None and stop_reason(run_dir):
+        if held:
+            # The slots may have been handed over from an earlier run's keeper: its jobs keep them.
+            try:
+                from . import hold
+                hold.keep(run_dir, spec, held, spec.get("exclusive") or [], inherited)
+            except Exception as e:
+                print(f"runner: could not keep the run's resources for its detached jobs: {e}", flush=True)
+        for h in held:
+            h.close()
+        held = None
     if held is None:
         remove_files(spec.get("private_files") or [])
         remove_tmp(run_dir, spec)
-        exit_info = {"rc": None, "started": started, "ended": time.time(),
-                     "stopped": stop_reason(run_dir) or "resource_busy", "launched": False}
-        durable_write(run_dir / "exit.json", json.dumps(exit_info))
+        _write_exit(run_dir, {"rc": None, "started": started, "ended": time.time(),
+                              "stopped": stop_reason(run_dir) or "resource_busy", "launched": False})
         return 1
     started, mono_start = time.time(), time.monotonic()
     awake = AwakeClock()
@@ -192,8 +280,10 @@ def supervise(run_dir: Path) -> int:
     out = open(out_path, "wb")
     err = open(run_dir / "stderr.log", "wb")
     nice = int(spec.get("nice") or 0)
+    preexec, armed = _agent_preexec(nice)
     child = subprocess.Popen(argv, stdin=prompt, stdout=out, stderr=err, cwd=cwd, env=env,
-                             start_new_session=True, preexec_fn=lower_priority(nice))
+                             start_new_session=True, preexec_fn=preexec)
+    guard, watchdog = (None, None) if armed else _start_watchdog(child.pid)
     (run_dir / "child.pid").write_text(f"{child.pid}\n{proc_start(child.pid) or ''}\n")
     niceness = _niceness(child.pid)
     if nice and niceness is not None and niceness < min(os.nice(0) + nice, 19):
@@ -226,7 +316,10 @@ def supervise(run_dir: Path) -> int:
         while child.poll() is None:
             now, up = time.time(), awake.tick()
             if now - last_lease >= LEASE_EVERY_S:
-                _touch(lease)
+                try:
+                    _touch(lease)
+                except OSError:   # the run dir is gone: stop_reason below ends the agent
+                    pass
                 last_lease = now
             if up > timeout_s + min(locks.waited(run_dir), timeout_s):
                 threading.Thread(target=stop, args=("timeout",), daemon=True).start()
@@ -254,6 +347,16 @@ def supervise(run_dir: Path) -> int:
     t.start()
     rc = child.wait()
     ended, mono_end, up = time.time(), time.monotonic(), awake.tick()
+    if guard is not None:   # a normal end: the watchdog leaves the group alone
+        try:
+            os.write(guard, b"done")
+        except OSError:
+            pass
+        os.close(guard)
+        try:
+            watchdog.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
     remove_files(spec.get("private_files") or [])
     remove_tmp(run_dir, spec)
     if held:
@@ -267,7 +370,7 @@ def supervise(run_dir: Path) -> int:
         f.close()
     exit_info = {"rc": rc, "started": started, "ended": ended, "stopped": reason[0] if reason else None,
                  "slept_s": round(max((ended - started) - min(mono_end - mono_start, up), 0.0), 1), "nice": niceness}
-    durable_write(run_dir / "exit.json", json.dumps(exit_info))
+    _write_exit(run_dir, exit_info)
     return rc
 
 

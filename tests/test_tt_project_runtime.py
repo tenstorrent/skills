@@ -1907,6 +1907,119 @@ def test_runner_enforces_wall_clock(env, tmp_path):
     assert info["stopped"] == "timeout" and time.time() - t0 < 60
 
 
+def _runner_dir(tmp_path, argv, timeout_s=600):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "prompt.md").write_text("x")
+    (run_dir / "run.json").write_text(json.dumps({"argv": argv, "env": {}, "cwd": str(tmp_path),
+                                                  "timeout_s": timeout_s, "provider": "fake"}))
+    return run_dir
+
+
+def _pid_gone(pid: int) -> bool:
+    """Process pid has ended (a zombie waiting for its new parent to reap it counts as ended)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    try:
+        return pathlib.Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z"
+    except OSError:
+        state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout
+        return not state.strip() or state.strip().startswith("Z")
+
+
+def _wait_for(pred, timeout=30.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if pred():
+            return True
+        time.sleep(0.05)
+    return pred()
+
+
+def test_runner_never_launches_an_agent_whose_stop_came_first(env, tmp_path):
+    # A run stopped right after start_run (a cancel, or a test touching STOP) must not start its agent.
+    launched = tmp_path / "launched"
+    run_dir = _runner_dir(tmp_path, ["sh", "-c", f"touch {launched}; sleep 60"])
+    (run_dir / "STOP").write_text("cancel")
+    subprocess.run([sys.executable, "-m", "ttp.runner", str(run_dir)], cwd=str(RUNTIME),
+                   env={**os.environ, "PYTHONPATH": str(RUNTIME)}, timeout=60)
+    info = json.loads((run_dir / "exit.json").read_text())
+    assert info["launched"] is False and info["stopped"] == "stopped"
+    assert not launched.exists() and not (run_dir / "child.pid").exists()
+
+
+def test_runner_ends_its_agent_when_the_run_dir_is_deleted(env, tmp_path):
+    # Nobody can read a deleted run's output or hand-off: its agent must not run on unattended, and the
+    # runner must not create the directory again for its exit record.
+    pid_file = tmp_path / "agent.pid"
+    run_dir = _runner_dir(tmp_path, ["sh", "-c", f"echo $$ > {pid_file}; exec sleep 120"])
+    proc = subprocess.Popen([sys.executable, "-m", "ttp.runner", str(run_dir)], cwd=str(RUNTIME),
+                            env={**os.environ, "PYTHONPATH": str(RUNTIME)})
+    try:
+        assert _wait_for(lambda: pid_file.exists() and pid_file.read_text().strip())
+        agent = int(pid_file.read_text())
+        shutil.rmtree(run_dir)
+        proc.wait(timeout=30)
+        assert _wait_for(lambda: _pid_gone(agent), 10)
+        assert not run_dir.exists()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+@pytest.mark.parametrize("pdeathsig", [True, False], ids=["pdeathsig", "watchdog"])
+def test_agent_ends_when_its_runner_dies(env, tmp_path, pdeathsig):
+    # A runner killed outright (OOM killer, kill -9) must not leave its agent running unattended:
+    # on Linux the kernel signals it (PR_SET_PDEATHSIG); elsewhere a watchdog ends its process group.
+    if pdeathsig and not sys.platform.startswith("linux"):
+        pytest.skip("PR_SET_PDEATHSIG is Linux only")
+    pid_file, tool_file = tmp_path / "agent.pid", tmp_path / "tool.pid"
+    script = f"sleep 120 & echo $! > {tool_file}; echo $$ > {pid_file}; wait"
+    run_dir = _runner_dir(tmp_path, ["sh", "-c", script])
+    code = ("import sys; from pathlib import Path; from ttp import runner; "
+            f"runner.PDEATHSIG = {pdeathsig}; sys.exit(runner.supervise(Path(sys.argv[1])))")
+    proc = subprocess.Popen([sys.executable, "-c", code, str(run_dir)], cwd=str(RUNTIME),
+                            env={**os.environ, "PYTHONPATH": str(RUNTIME)})
+    agent = tool = None
+    try:
+        assert _wait_for(lambda: pid_file.exists() and pid_file.read_text().strip()
+                         and tool_file.exists() and tool_file.read_text().strip())
+        agent, tool = int(pid_file.read_text()), int(tool_file.read_text())
+        proc.kill()
+        proc.wait()
+        assert _wait_for(lambda: _pid_gone(agent), 15), "the agent outlived its runner"
+        if not pdeathsig:   # the watchdog ends the agent's whole process group, its tools too
+            assert _wait_for(lambda: _pid_gone(tool), 15), "the agent's tool outlived its runner"
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        for pid in (agent, tool):
+            with contextlib.suppress(OSError, TypeError):
+                os.kill(pid, signal.SIGKILL)
+
+
+def test_runner_watchdog_leaves_the_group_alone_after_a_normal_end(env, tmp_path):
+    # A run that ends normally tells its watchdog so: nothing of the group is signalled afterwards.
+    tool_file = tmp_path / "tool.pid"
+    run_dir = _runner_dir(tmp_path, ["sh", "-c", f"sleep 120 & echo $! > {tool_file}"])
+    code = ("import sys; from pathlib import Path; from ttp import runner; "
+            "runner.PDEATHSIG = False; sys.exit(runner.supervise(Path(sys.argv[1])))")
+    tool = None
+    try:
+        assert subprocess.run([sys.executable, "-c", code, str(run_dir)], cwd=str(RUNTIME), timeout=60,
+                              env={**os.environ, "PYTHONPATH": str(RUNTIME)}).returncode == 0
+        tool = int(tool_file.read_text())
+        time.sleep(1)
+        assert not _pid_gone(tool)
+    finally:
+        with contextlib.suppress(OSError, TypeError):
+            os.kill(tool, signal.SIGKILL)
+
+
 def _unused_port() -> int:
     """A port the OS just handed out and nothing listens on."""
     with socket.socket() as s:
