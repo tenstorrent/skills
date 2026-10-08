@@ -1372,12 +1372,12 @@ def run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None)
         return REFUSED
     if own:   # delivery.push_exclude_paths guards the push branch only
         base = None
-        # The docs-only test, and if_changed scopes, need the shared branch this work leaves from.
-        if not checks or any(c.if_changed for c in checks):
-            try:
-                base = _fetch(repo, *target(p, repo)) or None
-            except ValueError:
-                pass
+        # The docs-only test, if_changed scopes and the project's own checks may all compare with the
+        # shared branch this work leaves from: always fetch it (cheap), so none sees a stale base.
+        try:
+            base = _fetch(repo, *target(p, repo)) or None
+        except ValueError:
+            pass
         return publish(repo, remote, branch, checks, hold=lambda: take(p, remote, branch, wait_s),
                        timed=lambda s: record_check_s(p, s), base=base,
                        ff_only=own_ff_only(branch),

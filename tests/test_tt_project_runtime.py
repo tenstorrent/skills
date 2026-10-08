@@ -13794,6 +13794,21 @@ def test_push_own_publishes_the_tasks_own_branch_as_it_is_and_never_a_shared_one
     assert _ttp("push", "--own") == 2
 
 
+def test_push_own_with_plain_checks_still_fetches_the_push_target_base(env, monkeypatch):
+    """--own fetches the push target before its checks even when no check is if_changed-scoped, so a
+    check or publish step comparing with the base never sees a stale or missing one."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    _commit(other, "theirs.txt", "theirs\n")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    shared = _git_out(origin, "rev-parse", "proj")
+    assert _git_out(repo, "rev-parse", "origin/proj") != shared
+    _git_out(repo, "checkout", "-q", "-b", "ttp/t32-exp")
+    _commit(repo, "mine.txt", "mine\n")
+    monkeypatch.setenv("TTP_TASK", "32")
+    assert _ttp("push", "--own") == 0
+    assert _git_out(repo, "rev-parse", "origin/proj") == shared
+
+
 def test_push_in_a_remote_less_harness_says_the_commit_is_already_delivered(env, monkeypatch, capsys):
     """A harness task's commit in the project's harness repo (no remote) is its delivery: `ttp push`,
     `--own` and `--detach` say so and exit 0 at once, with no push, check or marker."""
