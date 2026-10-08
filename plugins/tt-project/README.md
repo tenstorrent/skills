@@ -320,6 +320,10 @@ and preferences you add later become part of the project's charter and memory.
   shell conditional on the full SHA in the check itself:
   `h=$(git rev-parse HEAD) || exit 1; [ "$h" = <full 40-character sha> ] || pytest -q tests/test_x.py`.
   A leading assignment such as `h=$(...)` is accepted as a check's first command, like `set -e`.
+  Assign first, then compare: `set -e` does not catch a failed command inside a substitution
+  in a test, so `[ "$(git rev-parse --verify HEAD)" = "$expected" ]` just compares an empty
+  string when git fails. Write `head=$(git rev-parse --verify HEAD) || exit 1` and then test
+  `"$head"`.
   Write the condition so that an error in it runs or fails the check, never skips it. Changing
   a check's scope changes what a head was checked against: every head it affects needs a fresh
   review, and earlier approvals do not carry over. Never add blanket "skip if the test file is

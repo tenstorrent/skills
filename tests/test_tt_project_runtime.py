@@ -29104,6 +29104,10 @@ def test_check_commands_have_first_failure_semantics(env, tmp_path):
     assert run("true; true") == 0
     assert run("true | true") == 0
     assert run("false || true") == 0
+    # A git error inside a substitution in a test is not caught by -e; assigning first is.
+    git = "git -C " + str(tmp_path) + " rev-parse --verify HEAD"
+    assert run(f'[ "$({git})" = "" ] && echo skipped') == 0
+    assert run(f'head=$({git}) || exit 1; [ "$head" = "" ] && echo skipped') != 0
 
 
 def test_every_push_checks_call_site_fails_a_masked_failure(env, tmp_path, monkeypatch, capsys):
