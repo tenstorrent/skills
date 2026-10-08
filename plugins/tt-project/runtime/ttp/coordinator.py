@@ -2133,18 +2133,63 @@ def _restriction_items(charter: str) -> list[tuple[str, str, int]]:
     return out
 
 
+# For the lint, "can" before an action ("workers can push") is a permission in a ban's clauses
+# (_lint_readings); before anything else ("what the harness can do itself") it is ability.
+_CAN_ACT_RE = re.compile(r"\bcan(?=(?:\s+(?:also|still|just|always|freely|even))*\s+([a-z][\w-]*))", re.I)
+
+
+def _lint_readings(sentence: str) -> list[tuple[str, str]]:
+    """What a Restrictions sentence says, for the lint: (text, stance) pairs. A sentence that forbids
+    (_stance) is read clause by clause (_CLAUSE_SPLIT_RE), so a ban in one clause never hides an
+    allowance in another ("No ticket needed and workers can push to main"): when a clause allows, each
+    clause with a stance is a reading of its own, with the clauses after it that have none ("Never
+    push to main or release branches"). "can <action>" counts as "may" there, and the conditional and
+    "only" exemptions (_unconditional) are read over the whole sentence first. Any other sentence,
+    and a ban with no allowing clause, is one reading, whole."""
+    st = _stance(sentence)
+    if st != "forbid":
+        return [(sentence, st)]
+
+    def may(m: re.Match) -> str:
+        w = m.group(1).lower()
+        return "may" if _ACTIONS.get(_stem(w)) or _ACTIONS.get(w) else m.group(0)
+    s = _NO_LONGER_BANNED_RE.sub(" allowed ", _CAN_ACT_RE.sub(may, _NEG_PERMIT_RE.sub(" never ", sentence)))
+    s = _unconditional(s)
+    groups: list[list] = []   # [start, end, stance]
+    for a, b in _spans(s):
+        cst = _stance(s[a:b])
+        if groups and (not cst or not groups[-1][2]):
+            groups[-1][1:] = [b, groups[-1][2] or cst]
+        else:
+            groups.append([a, b, cst])
+    if not any(g[2] == "allow" for g in groups):
+        return [(sentence, st)]
+    return [(s[a:b].strip(), gst) for a, b, gst in groups if gst]
+
+
+def _spans(text: str) -> list[tuple[int, int]]:
+    """The (start, end) of each clause of `text` (_clauses)."""
+    out, pos = [], 0
+    for x in _CLAUSE_SPLIT_RE.finditer(text):
+        out.append((pos, x.start()))
+        pos = x.end()
+    out.append((pos, len(text)))
+    return [(a, b) for a, b in out if text[a:b].strip(" .!?")]
+
+
 def restriction_pairs(charter: str) -> list[dict]:
     """Model-free lint: pairs of Restrictions items, across every Restrictions section, where one
     forbids what the other allows (_contradicts). Workers obey both as binding, so the stricter one
     wins and the allowing one does nothing. Each pair once, with a stable `key`; sentences of one
-    item are never paired (an item may state its own exception in a second sentence)."""
-    items = [(s, sec, n, _stance(s)) for s, sec, n in _restriction_items(charter)]
+    item are never paired (an item may state its own exception in a second sentence). A ban's
+    clauses are read one by one (_lint_readings)."""
+    items = [(s, sec, n, rst, r) for s, sec, n in _restriction_items(charter) for r, rst in _lint_readings(s)]
     out, keys = [], set()
-    for f, fsec, fn, fst in items:
+    for f, fsec, fn, fst, fr in items:
         if fst != "forbid":
             continue
-        for a, asec, an, ast in items:
-            if ast != "allow" or an == fn or not _contradicts(f, a):
+        for a, asec, an, ast, ar in items:
+            if ast != "allow" or an == fn or not _contradicts(fr, ar):
                 continue
             key = hashlib.sha256(f"{' '.join(f.split())}\n{' '.join(a.split())}".encode()).hexdigest()[:12]
             if key not in keys:

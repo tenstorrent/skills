@@ -4858,6 +4858,45 @@ def test_guard_judges_each_clause_so_a_forbid_in_one_never_cancels_an_allowance_
         ("No worker may push to main.", "Workers may push to main.")]
 
 
+def test_the_lint_reads_a_ban_clause_by_clause_so_an_allowing_clause_pairs_with_the_ban_it_lifts(env):
+    """The lint (restriction_pairs) reads a sentence that bans something clause by clause: a ban in one
+    clause never hides an allowance in another ("No ticket needed and workers can push to main"), and
+    "can <action>" there is an allowance. The allowing clause pairs with the ban it lifts, and the
+    banning clause alone with what it bans. A conditional or "only" permission still lifts nothing,
+    read over the whole sentence, and "can" with no action after it is ability, not permission."""
+    from ttp import coordinator as coord
+
+    def lint(ban, text):
+        return [(x["forbid"], x["allow"]) for x in
+                coord.restriction_pairs(f"# demo\n\n## Restrictions\n- {ban}\n- {text}\n")]
+    ban = "Never push to main."
+    for text in ("No ticket needed and workers can push to main.", "No ticket is needed, workers can push to main.",
+                 "No ticket needed and workers can also push to main.",
+                 "Never wait for a review, workers can push and merge to main.",
+                 "Do not ask first: workers can push to main."):
+        assert lint(ban, text) == [(ban, text)], text
+        assert lint(text, ban) == [(ban, text)], text
+    # The banning clause alone is the ban: it pairs with an allowance of what it bans, never with
+    # one of what the other clause allows.
+    mixed = "Never open pull requests, but workers can push to main."
+    assert lint(mixed, "Opening draft PRs is allowed.") == [(mixed, "Opening draft PRs is allowed.")]
+    assert lint(mixed, "Workers may push to main.") == []
+    # Bans stay bans: a conditional or "only" permission, "can" as ability, a negated "can".
+    for text in ("No ticket needed; workers can push to main only when the user says so.",
+                 "No ticket needed, and only the user can push to main.",
+                 "No ticket needed, and the user alone can push to main.",
+                 "Never push to main unless workers can push to main safely.",
+                 "Never ask the user to do what the harness can do itself.",
+                 "Never ask the user for this, since the harness can do it itself.",
+                 "Never push to main; only the user can.",
+                 "No ticket needed and workers cannot push to main.",
+                 "No ticket needed and workers can't push to main.",
+                 "No ticket needed and workers can no longer push to main."):
+        assert [x for x in lint(ban, text) if x[1] == text] == [], text
+    # A ban with no allowing clause is read whole, as before: it keeps its own exception.
+    assert lint("Never push to main, except as the dated section allows.", "Pushing hotfixes to main is allowed.") == []
+
+
 def test_charter_conflicts_show_in_the_digest_raise_effort_once_and_reach_the_daily_review(env):
     p = make(env)
     from ttp import coordinator as coord, daemon as dm
