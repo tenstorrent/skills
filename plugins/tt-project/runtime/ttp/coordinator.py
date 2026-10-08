@@ -1877,9 +1877,14 @@ _CLAUSE_SPLIT_RE = re.compile(rf"[,;:—–]|\s-+\s|(?<![\w'’-])(?:{'|'.join(_
 # Contradicting Restrictions items (restriction_pairs, _append_conflicts). A permission said with a
 # negation ("is not allowed", "may not", "may never"), or given to no one ("No worker may", "Nobody may",
 # "None of the agents are allowed to", but not "Nobody but the user may", nor "No restriction remains
-# and workers may", whose "no" ends with its clause), forbids; "no longer forbidden" allows.
-_NO_SUBJECT = (rf"(?:\s+(?!(?:but|except|save|besides|apart|beyond|than|{'|'.join(_JOINS)})(?![\w'’-]))"
-               r"\w[\w'-]*){0,4}?\s+(?:may|can|shall|should|must|will|(?:is|are)\s+(?:allowed|permitted)\s+to)\b")
+# and workers may", whose "no" ends with its clause), forbids; "no longer forbidden" allows. Inside
+# the subject "and"/"or" join only an actor noun to one more noun ("No worker or agent may", "No
+# workers and no tasks may"): after any other word they open a new clause.
+_SUBJECT_NOUN = (r"(?:worker|agent|task|job|bot|user|owner|maintainer|human|admin|operator|coordinator|reviewer|"
+                 r"team|lead|person|people|one|body|tool|script|process|service|subagent|contributor|developer)s?")
+_NO_SUBJECT = (rf"(?:\s+(?:{_SUBJECT_NOUN}\s+(?:and|or)\s+(?:no\s+)?(?:other\s+)?\w[\w'-]*(?![\w'’-])"
+               rf"|(?!(?:but|except|save|besides|apart|beyond|than|{'|'.join(_JOINS)})(?![\w'’-]))\w[\w'-]*)){{0,4}}?"
+               r"\s+(?:may|can|shall|should|must|will|(?:is|are)\s+(?:allowed|permitted)\s+to)\b")
 _NEG_PERMIT_RE = re.compile(r"\b(?:not|never)\s+(?:be\s+)?(?:allowed|permitted|fine|ok(?:ay)?)\b|\b(?:may|can)(?:\s*not|\s+never)\b|"
                             r"n't\s+(?:be\s+)?(?:allowed|permitted|fine)\b|"
                             rf"(?:^|(?<=[,;:(]))\s*(?:no|nobody|none)\b{_NO_SUBJECT}", re.I)
@@ -2219,10 +2224,38 @@ def charter_conflict_lines(pairs: list[dict]) -> list[str]:
                f"({x['allow_section']})" for x in pairs])
 
 
+# A lift said as no one minding ("No problem if workers push", "No objection to workers pushing", "No
+# one objects anymore when workers push", "No rule stops workers from pushing"): the guard reads it as
+# "may" (_as_permission).
+_NO_ONE = r"(?:no\s+(?:one|rule|restriction|policy|reason|thing)|nobody|nothing)\s+(?:\w+ly\s+)?"
+_NO_OBJECTION_RE = re.compile(
+    r"\bno\s+(?:problem|objection|issue|concern|harm|worry|worries)s?\s+(?:with|to|if|when|in|about)\b"
+    rf"|\b{_NO_ONE}(?:objects?|minds?|cares?)(?:\s+(?:anymore|now|any\s+more|any\s+longer))?"
+    r"(?:\s+(?:to|if|when|that)\b)?"
+    rf"|\b{_NO_ONE}(?:stops?|prevents?|blocks?|bars?|keeps?)(?:\s+any\s+more|\s+anymore)?"
+    r"(?P<who>(?:\s+\w[\w'-]*){1,2}?)\s+from\b", re.I)
+
+
+def _as_permission(sentence: str) -> str:
+    """The sentence with a lift said as no one minding (_NO_OBJECTION_RE) as "may": "No rule stops
+    workers from pushing" reads "workers may pushing"."""
+    return _NO_OBJECTION_RE.sub(lambda m: f"{m['who'] or ''} may", sentence)
+
+
+# A permission given to no one (_NO_SUBJECT): the "and"/"or" in its subject joins no clauses.
+_NO_ONE_MAY_RE = re.compile(rf"\b(?:no|nobody|none)\b{_NO_SUBJECT}", re.I)
+
+
 def _clauses(sentence: str) -> list[str]:
     """A sentence's clauses: its text between commas, semicolons, colons, dashes and the words that join
-    clauses (_JOINS)."""
-    return [c for c in (x.strip() for x in _CLAUSE_SPLIT_RE.split(sentence)) if c.strip(" .!?")]
+    clauses (_JOINS), except a join inside the subject of "No ... may" ("No worker or agent may")."""
+    keep = [m.span() for m in _NO_ONE_MAY_RE.finditer(sentence)]
+    parts, start = [], 0
+    for m in _CLAUSE_SPLIT_RE.finditer(sentence):
+        if not any(a < m.start() and m.end() < b for a, b in keep):
+            parts.append(sentence[start:m.start()])
+            start = m.end()
+    return [c for c in (x.strip() for x in parts + [sentence[start:]]) if c.strip(" .!?")]
 
 
 def _append_conflicts(charter: str, section: str, text: str) -> list[tuple[str, str]]:
@@ -2242,7 +2275,8 @@ def _append_conflicts(charter: str, section: str, text: str) -> list[tuple[str, 
         return []
     out: list[tuple[str, str]] = []
     whole = _sentences(text.splitlines())
-    new = list(dict.fromkeys([*whole, *(c for s in whole for c in _clauses(s))]))
+    new = list(dict.fromkeys([*whole, *(c for s in whole for c in _clauses(s)),
+                              *(c for s in whole for c in _clauses(_as_permission(s)) if c not in whole)]))
     for item, sec, _ in _restriction_items(charter):
         st = _stance(item)
         for s in new:

@@ -4897,6 +4897,47 @@ def test_the_lint_reads_a_ban_clause_by_clause_so_an_allowing_clause_pairs_with_
     assert lint("Never push to main, except as the dated section allows.", "Pushing hotfixes to main is allowed.") == []
 
 
+def test_no_x_or_y_may_bans_and_lifts_said_as_no_objection(env):
+    """"and"/"or" join nouns inside the subject of "No ... may" ("No worker or agent may X" bans X, so
+    an allowance of X next to it is flagged and paired), but after any other word they still open a
+    new clause. A lift said as no one minding ("No problem if", "No objection to", "No one objects
+    when", "No rule stops ... from") allows the action, and the guard flags it."""
+    p = make(env)
+    from ttp import coordinator as coord
+
+    def guard(ban, text, turn):
+        p.charter_path.write_text(f"# demo\n\n## Restrictions\n- {ban}\n")
+        return coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": text}],
+                           turn=turn, user_turn=True)
+
+    def lint(ban, text):
+        return [(x["forbid"], x["allow"]) for x in
+                coord.restriction_pairs(f"# demo\n\n## Restrictions\n- {ban}\n- {text}\n")]
+    bans = ("No worker or agent may push to main.", "No workers or tasks may push to main.",
+            "No worker and no agent may push to main.", "No user or other bot is allowed to push to main.")
+    for k, ban in enumerate(bans):
+        assert coord._stance(ban) == "forbid", ban
+        assert lint(ban, "Workers may push to main.") == [(ban, "Workers may push to main.")], ban
+        err = guard(ban, "Workers may push to main.", 10 + k)
+        assert len(err) == 1 and f"\"{ban}\" (section 'Restrictions')" in err[0], (ban, err)
+        assert guard("Never push to main.", ban, 20 + k) == [], ban
+    for text in ("No restriction remains and workers may push to main.", "No review is left or workers may push to main.",
+                 "No worker remains and tasks may push to main."):
+        assert coord._stance(text) != "forbid", text
+        assert lint(text, "Workers may push to main.") == [], text
+    short, long = "Never push to main.", "Never push to main without the user's explicit word."
+    lifts = ("No problem if workers push to main.", "No objection to workers pushing to main.",
+             "No one objects anymore when workers push to main.", "No rule stops workers from pushing to main.",
+             "There is no issue with agents pushing to main.", "Nobody minds if workers push to main.")
+    for k, (ban, text) in enumerate([(b, t) for b in (short, long) for t in lifts]):
+        err = guard(ban, text, 30 + k)
+        assert len(err) == 1 and f"\"{ban}\" (section 'Restrictions')" in err[0], (ban, text, err)
+    # About another action, or still a ban, it lifts nothing.
+    for k, text in enumerate(("No problem if workers run the tests.", "No rule stops workers from opening draft PRs.",
+                              "No objection to workers pushing to their own branch, but never to main.")):
+        assert guard(short, text, 50 + k) == [], text
+
+
 def test_charter_conflicts_show_in_the_digest_raise_effort_once_and_reach_the_daily_review(env):
     p = make(env)
     from ttp import coordinator as coord, daemon as dm
