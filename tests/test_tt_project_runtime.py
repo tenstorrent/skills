@@ -6509,7 +6509,9 @@ def test_a_daily_review_done_on_unchanged_evidence_is_not_repeated_within_the_de
     d.run_schedules()
     s = p.db.one("SELECT * FROM schedules WHERE name='daily-review'")
     assert s["last_status"].startswith("skipped: last run done 1.0 h ago on unchanged evidence"), s["last_status"]
-    assert _reviews(p) == [first] and s["next_run"] > time.time() + 3600
+    # The skip waits for the next regular slot (which may be under an hour away), not a quick retry.
+    assert _reviews(p) == [first] and s["next_run"] == sched.next_run(s["every_s"], s["at"], s["last_run"])
+    assert s["next_run"] > s["last_run"]
     # The debounce counts from the run's end, not from skipped triggers: past it, the review runs.
     p.db.x("UPDATE runs SET ended=? WHERE task=?", (time.time() - 3 * 3600, first))
     _review_due(p)
