@@ -388,7 +388,7 @@ class Daemon:
         is no command, so a typo or a sentence there does not fail a push much later."""
         try:
             from .project import config_problems
-            probs = config_problems(self.p.raw_config())
+            probs = config_problems(self.p.raw_config(), self.p.root)
             if probs:
                 key = "config_problems:" + hashlib.sha1("\n".join(probs).encode()).hexdigest()[:10]
                 self.alert(key, "project.json: " + "; ".join(probs), severity="low", every_s=ALERT_KEEP_S)
@@ -3868,7 +3868,12 @@ class Daemon:
         # A change that must not reach the push branch (its diff is all push-excluded, or its spec or
         # hand-off forbids it) is review only too: a pass would push what the push refuses or the spec bans.
         off = "" if delivered or not d.get("push_branch") else push.kept_off(task, changes, d)
-        pushes = bool(d.get("push_branch") and d.get("push_allowed", True)) and not delivered and not off
+        # A push branch no push can ever reach (main/master, or a code repo without the remote) makes
+        # every review review only: a push step there would only exit 2 and block the review.
+        never = "" if delivered or off or not (d.get("push_branch") and d.get("push_allowed", True)) \
+            else push.push_branch_problem(d["push_branch"], self.p.root)
+        pushes = bool(d.get("push_branch") and d.get("push_allowed", True)) and not delivered and not off \
+            and not never
         if delivered:
             lines.append(f"Its head is already delivered as PR {delivered}: review only. If it passes, hand off "
                          f"`done`; do not run `ttp push` or approve it for the push queue. Leave the branch and "
@@ -3877,6 +3882,10 @@ class Daemon:
             lines.append(f"It must not reach {d['push_branch']}: {off}. Review only: if it passes, hand off "
                          f"`done`; do not run `ttp push` or approve it for the push queue. Leave the branch"
                          + (" and the PR" if pr else "") + " as they are.")
+        elif never:
+            lines.append(f"Nothing can be pushed: {never.removeprefix('delivery.push_branch: ')}. Review only: if it "
+                         f"passes, hand off `done`; do not run `ttp push` or approve it for the push queue. Leave "
+                         f"the branch" + (" and the PR" if pr else "") + " as they are.")
         elif pushes:
             lines.append(f"If it passes, push it with `ttp push` from the change's worktree (it publishes to "
                          f"{d['push_branch']}).")
@@ -3889,7 +3898,7 @@ class Daemon:
             lines.append(str(rules["auto_notes"]).strip())
         lines.append("Return the verdict and findings" + (", and the pushed commit." if pushes else "."))
         labels = [f"auto_review:{task['id']}"] + ([f"continues:{prior['id']}"] if prior else []) \
-            + ([PRECHECK_LABEL + checks.name] if checks else []) + ([push.REVIEW_ONLY_LABEL] if off else [])
+            + ([PRECHECK_LABEL + checks.name] if checks else []) + ([push.REVIEW_ONLY_LABEL] if off or never else [])
         rid = db.add_task(title, "\n".join(lines), kind="review", tier=tier, priority=2, origin="daemon",
                           budget_usd=float(cfg["budget"]["task_default_usd"].get(tier, 8.0)),
                           depends_on=[task["id"]], labels=labels)

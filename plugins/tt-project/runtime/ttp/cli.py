@@ -2711,7 +2711,7 @@ def cmd_doctor(a) -> None:
           f" · enabled in project: {p.config()['notify'].get('slack')}")
     print(web_line(p))
     from .project import config_problems
-    for line in config_problems(p.raw_config()):
+    for line in config_problems(p.raw_config(), p.root):
         print(f"project.json: {line}")
     from . import push as _push
     checks = _push.check_list((p.config().get("delivery") or {}).get("push_checks"))

@@ -24845,6 +24845,7 @@ def _finish_code(env, p, title, files, result=None, labels=None, before=None):
 
 def test_the_daemon_queues_the_review_of_a_finished_code_task(env):
     p = make(env)
+    _with_origin(env, clone=False)   # a repo with no remote never pushes: review only
     tid, branch, done, reviews = _finish_code(env, p, "small fix", {"app.py": 20, "NOTES.md": 300})
     assert len(reviews) == 1, "no review queued"
     rev = reviews[0]
@@ -24874,6 +24875,7 @@ def test_with_the_push_queue_on_the_daemon_starts_the_checks_as_it_queues_the_re
     from ttp.daemon import PRECHECK_HOLD_S, PRECHECK_LABEL, PRECHECKS_DIR, Daemon
     from ttp.runner import proc_start
     p = make(env)
+    _with_origin(env, clone=False)   # a repo with no remote never pushes: review only
     p.set_config("delivery.push_branch", "work")
     p.set_config("delivery.push_checks", ["test -f app.py"])
     # Queue off: nothing starts, the review is not held.
@@ -24951,6 +24953,7 @@ def test_a_re_review_gets_its_checks_started_when_the_fix_finishes(env):
     from ttp.daemon import PRECHECK_LABEL, PRECHECKS_DIR, Daemon
     from ttp.providers.base import RunUsage as Usage
     p = make(env)
+    _with_origin(env, clone=False)   # a repo with no remote never pushes: review only
     p.set_config("delivery.push_branch", "work")
     p.set_config("delivery.push_queue", True)
     p.set_config("delivery.push_checks", ["test -f app.py"])
@@ -25008,6 +25011,7 @@ def test_the_review_of_a_head_already_delivered_as_a_pr_publishes_nothing_more(e
     # of that head is review only: no `ttp push` toward a branch that may be unrelated or absent.
     from ttp import prguard
     p = make(env)
+    _with_origin(env, clone=False)   # a repo with no remote never pushes: review only
     p.set_config("delivery.push_branch", "work")
     url = "https://github.com/acme/app/pull/7"
     pr = {"status": "done", "summary": "draft PR opened", "pr": url}
@@ -25073,6 +25077,7 @@ def test_the_review_of_a_change_that_must_not_reach_the_push_branch_has_no_push_
     # branch, gets a review-only spec: no `ttp push` and no push-queue approval, with the reason.
     from ttp import push, pushq
     p = make(env)
+    _with_origin(env, clone=False)   # a repo with no remote never pushes: review only
     p.set_config("delivery.push_branch", "work")
     p.set_config("delivery.push_exclude_paths", ["notes", "*.log"])
     monkeypatch.setattr(pushq, "enabled", lambda *a, **k: False)   # no prechecks: the spec text is the subject
@@ -25134,6 +25139,64 @@ def test_the_review_of_a_change_that_must_not_reach_the_push_branch_has_no_push_
     p.set_config("delivery.push_branch", "")
     rev = review("no branch", {"notes/c.md": 5})
     assert "Review only" in rev["spec"] and push.REVIEW_ONLY_LABEL not in json.loads(rev["labels"])
+
+
+def test_a_push_branch_no_push_can_reach_is_flagged_and_its_reviews_are_review_only(env, monkeypatch, capsys):
+    # delivery.push_branch names main/master (ttp push always refuses it), or the code repo has no
+    # remote: every review push would exit 2. The config check and doctor say so, and the review
+    # spec has no push step.
+    from ttp import cli, push, pushq
+    from ttp.project import config_problems
+    p = make(env)
+    monkeypatch.setattr(pushq, "enabled", lambda *a, **k: False)   # no prechecks: the spec text is the subject
+    # No repo to ask: only the name, its first part read either way.
+    for ref in ("main", "master", "origin/main", "upstream/master", "refs/heads/main", "origin/refs/heads/master"):
+        assert "always refuses" in push.push_branch_problem(ref), ref
+    for ref in ("", None, "work", "origin/work", "maintenance", "main-next"):
+        assert push.push_branch_problem(ref) == "", ref
+    # A repo with no remote: any push branch.
+    assert "no git remote" in push.push_branch_problem("work", p.root)
+    assert any("no git remote" in x for x in config_problems({"delivery": {"push_branch": "work"}}, p.root))
+    assert config_problems({"delivery": {"push_branch": "work"}}) == []
+    # Not a git repo: only the name.
+    assert push.push_branch_problem("work", env["tmp"] / "nowhere") == ""
+
+    def review(title):
+        _, _, _, (rev,) = _finish_code(env, p, title, {f"{title}.py": 3})
+        return rev
+
+    def review_only(rev, why):
+        return "ttp push` from" not in rev["spec"] and "Review only" in rev["spec"] and why in rev["spec"] \
+            and push.REVIEW_ONLY_LABEL in json.loads(rev["labels"]) and rev["spec"].rstrip().endswith("findings.")
+
+    p.set_config("delivery.push_branch", "work")
+    for on in (False, True):
+        p.set_config("delivery.push_queue", on)
+        assert review_only(review(f"noremote{on}"), "no git remote"), on
+    cli.main(["doctor", p.name])
+    assert "project.json: delivery.push_branch: the code repo has no git remote" in capsys.readouterr().out
+    # With a remote: a protected branch, bare or behind the remote's name, never pushes either.
+    _with_origin(env, clone=False)
+    _git_out(p.root, "remote", "add", "upstream", str(env["tmp"] / "remote.git"))
+    for i, ref in enumerate(("main", "origin/master", "upstream/main")):
+        p.set_config("delivery.push_branch", ref)
+        assert review_only(review(f"protected{i}"), "a branch ttp push always refuses"), ref
+        assert any("always refuses" in x for x in config_problems(p.raw_config(), p.root)), ref
+    cli.main(["doctor", p.name])
+    assert "project.json: delivery.push_branch: upstream/main is main, a branch ttp push always refuses" \
+        in capsys.readouterr().out
+    # A remote the name does not use: origin is the fallback, and missing it never pushes.
+    p.set_config("delivery.push_branch", "work")
+    _git_out(p.root, "remote", "remove", "origin")
+    assert review_only(review("noorigin"), "which is not a git remote")
+    # A branch of its own on a remote the repo has: the review pushes as before; "team/main" is a
+    # branch of origin, not main.
+    _git_out(p.root, "remote", "add", "origin", str(env["tmp"] / "remote.git"))
+    for i, ref in enumerate(("work", "upstream/work", "team/main")):
+        p.set_config("delivery.push_branch", ref)
+        rev = review(f"ok{i}")
+        assert "ttp push` from" in rev["spec"] and push.REVIEW_ONLY_LABEL not in json.loads(rev["labels"]), ref
+        assert not any("push_branch" in x for x in config_problems(p.raw_config(), p.root)), ref
 
 
 def test_a_review_only_stack_stays_review_only_through_its_fix_and_the_push_queue_ignores_its_approval(

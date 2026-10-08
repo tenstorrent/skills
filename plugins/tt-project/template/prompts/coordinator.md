@@ -295,6 +295,8 @@ account out of funds or quota, unrecoverable outage, restriction at risk. Everyt
   branch (notes only), or whose spec or hand-off marks it: review only, no push or push-queue step.
   When a change must stay off the push branch, put a line `no_push: <why>` in its spec; prose
   saying so is not read.
+- While `delivery.push_branch` can never be pushed to (main or master, or a code repo with no git
+  remote; the config alert and `ttp doctor` name it), every review is review only: no push step.
 - With the push queue on (STANDING shows `## Delivery: push queue on`), review specs instead ask the reviewer
   to "approve for the push queue" and carry no push or deploy steps: the daemon pushes approved
   heads in batches and `delivery.after_push` deploys. A `pushing` task is in the queue: leave it.

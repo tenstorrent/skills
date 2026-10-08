@@ -362,9 +362,10 @@ def renice(pid: int, n: int) -> None:
         pass
 
 
-def config_problems(raw: dict) -> list[str]:
-    """Unknown keys, non-command push_checks or after_push, a malformed version_bump and push queue
-    settings out of range in a project's own settings, one line each."""
+def config_problems(raw: dict, root: Path | None = None) -> list[str]:
+    """Unknown keys, non-command push_checks or after_push, a malformed version_bump, push queue
+    settings out of range and a push branch that can never be pushed to (push_branch_problem; with
+    `root`, the code repo, its remotes are checked too) in a project's own settings, one line each."""
     out: list[str] = []
 
     def walk(node: dict, path: list[str]) -> None:
@@ -375,9 +376,11 @@ def config_problems(raw: dict) -> list[str]:
             elif isinstance(v, dict) and _known_keys(path + [str(k)]) is not None:
                 walk(v, path + [str(k)])
     walk(raw, [])
-    from .push import backup_problem, bump_problems, check_problems, fast_forward_check   # push imports this module
+    from .push import (backup_problem, bump_problems, check_problems, fast_forward_check,   # push imports this module
+                       push_branch_problem)
     delivery = raw.get("delivery") or {}
     out += [why for why in [backup_problem(delivery)] if why]
+    out += [why for why in [push_branch_problem(delivery.get("push_branch"), root)] if why]
     try:
         fast_forward_check(delivery.get("fast_forward_also"), str(delivery.get("push_branch") or ""))
     except ValueError as e:

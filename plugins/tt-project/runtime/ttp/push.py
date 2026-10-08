@@ -603,8 +603,14 @@ def target(p: Project, repo: Path) -> tuple[str, str]:
     ref = str(d.get("push_branch") or "").strip()
     if not ref:
         raise ValueError("no target branch: set delivery.push_branch")
+    return _split_target(ref, _git(repo, "remote").stdout.split())
+
+
+def _split_target(ref: str, remotes: list[str]) -> tuple[str, str]:
+    """(remote, branch) of a `delivery.push_branch` value, given the repo's remotes: `<remote>/<branch>`
+    when its first part is one of them, else the whole value is a branch of origin."""
     remote, _, rest = ref.partition("/")
-    if not (rest and remote in _git(repo, "remote").stdout.split()):
+    if not (rest and remote in remotes):
         remote, rest = "origin", ref
     return remote, rest[len("refs/heads/"):] if rest.startswith("refs/heads/") else rest
 
@@ -683,6 +689,36 @@ def landing(sha: str | None, pushed: str, r: dict | None = None, version: str | 
     work is meant to reach another branch, whether it is there (reach_words)."""
     return (f"pushed {(sha or '?')[:7]}" + (f" as {version}" if version else "")
             + (f" to {pushed}" if pushed else "") + reach_words(r))
+
+
+def push_branch_problem(push_branch: Any, repo: Path | None = None) -> str:
+    """Why `delivery.push_branch` can never be pushed to, whatever the change, or "" when it may be:
+    it names a branch `refusal` always refuses (PROTECTED), or `repo` (the code repo) has no git
+    remote, or none of the name the push would use. Local git only: the remote's default branch is
+    refused where the remote is asked (refusal, pushq._refusal). Without `repo` (or outside a git
+    repo) only the name is checked, its first part read as a remote or as part of the branch.
+    `ttp doctor` and the config check report it; reviews of such a project are review only."""
+    ref = str(push_branch or "").strip()
+    if not ref:
+        return ""
+    r = _git(repo, "remote") if repo is not None else None
+    remotes = r.stdout.split() if r is not None and r.returncode == 0 else None
+    if remotes == []:
+        return (f"delivery.push_branch: the code repo has no git remote, so {ref} can never be pushed to; "
+                f"reviews are review only (add a remote, or clear delivery.push_branch)")
+    if remotes is None:
+        names = [_split_target(ref, [])[1], _split_target(ref, [ref.partition("/")[0]])[1]]
+    else:
+        remote, branch = _split_target(ref, remotes)
+        if remote not in remotes:
+            return (f"delivery.push_branch: {ref} pushes to {remote}, which is not a git remote of the code "
+                    f"repo (it has {', '.join(remotes)}), so it can never be pushed to; reviews are review only")
+        names = [branch]
+    hit = next((b for b in names if b in PROTECTED), "")
+    if hit:
+        return (f"delivery.push_branch: {ref} is {hit}, a branch ttp push always refuses, so every review push "
+                f"would fail; reviews are review only (name a branch of its own)")
+    return ""
 
 
 LOCAL_HARNESS = ("nothing to push: this is the project's harness, a local git repo with no remote. "
