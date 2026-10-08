@@ -4710,6 +4710,36 @@ def test_guard_flags_lifts_with_an_inverted_modal_a_passive_verb_is_fine_ok_or_n
         assert guard(text, 90 + k) == [], text
 
 
+def test_actor_words_are_no_rule_target_and_an_inverted_may_skips_any_actor(env):
+    """Who acts ("let", "workers", "agents", pronouns) is never what a rule is about, so a ban worded
+    "Never let workers X" pairs only with a lift of X. An inverted "may" skips any actor before its
+    verb ("may the coordinator push", "may tasks push")."""
+    p = make(env)
+    from ttp import coordinator as coord
+
+    def lint(ban, text):
+        return [(x["forbid"], x["allow"]) for x in
+                coord.restriction_pairs(f"# demo\n\n## Restrictions\n- {ban}\n- {text}\n")]
+
+    def guard(ban, text, turn):
+        p.charter_path.write_text(f"# demo\n\n## Restrictions\n- {ban}\n")
+        return coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": text}],
+                           turn=turn, user_turn=True)
+    for k, (ban, text) in enumerate((
+            ("Never let workers push to main.", "Workers may push to the work branch."),
+            ("Never let workers touch the shared folder.", "Workers may push to their own branch."),
+            ("Never let workers delete files on the shared box.", "Workers may write logs to their run folder."))):
+        assert lint(ban, text) == [], text
+        assert guard(ban, text, 10 + k) == [], text
+    for k, (ban, text) in enumerate((
+            ("Never let workers push to main.", "Workers may push to main."),
+            ("Never push to main.", "Only after review may the coordinator push to main."),
+            ("Never push to main.", "Only after review may tasks push to main."))):
+        assert lint(ban, text) == [(ban, text)], text
+        err = guard(ban, text, 20 + k)
+        assert len(err) == 1 and f"\"{ban}\" (section 'Restrictions')" in err[0], (text, err)
+
+
 def test_charter_conflicts_show_in_the_digest_raise_effort_once_and_reach_the_daily_review(env):
     p = make(env)
     from ttp import coordinator as coord, daemon as dm

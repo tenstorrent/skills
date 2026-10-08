@@ -1909,9 +1909,15 @@ _LIMITED_PERMIT_RE = re.compile(
 # words skipped before it ("never directly push").
 _MAIN_VERB_RE = re.compile(r"\b(?:never|do not|does not|must not|cannot|(?:don|doesn|mustn|can)'t|no|may|can now|"
                            r"(?:allowed|permitted|fine|ok(?:ay)?) to)\s+((?:[\w-]+\s*(?:,|\bor\b|\band\b)?\s*)+)", re.I)
-_VERB_SKIP = {"ever", "again", "be", "a", "an", "the", "any", "longer", "even", "yet", "now", "also", "just", "still",
-              # who acts, or who lets them, before the verb ("may workers push", "may let agents push")
-              "let", "worker", "workers", "agent", "agents", "i", "we", "you", "they"}
+# Who acts, or who lets them, before the verb ("may workers push", "may let agents push"): never an
+# action, and never what a rule is about (_rule_target).
+_ACTOR_SKIP = {"let", "worker", "workers", "agent", "agents", "i", "we", "you", "they", "me", "us", "them"}
+_VERB_SKIP = {"ever", "again", "be", "a", "an", "the", "any", "longer", "even", "yet", "now", "also", "just",
+              "still"} | _ACTOR_SKIP
+# The subject of an inverted "may" ("Only after review may the coordinator push"), skipped before its verb.
+_INVERTED_SKIP = {"this", "that", "these", "those", "our", "your", "their", "my", "its"} | {
+    w + s for w in ("user", "owner", "maintainer", "human", "admin", "operator", "coordinator", "reviewer",
+                    "team", "task", "job", "bot") for s in ("", "s")}
 # A passive helper verb ("may be done"): the action is the sentence's subject ("Pushing to main").
 _PASSIVE_VERBS = {"done", "performed", "carried", "made"}
 # An item that names its own exception ("except as the dated section allows") has been reconciled.
@@ -1969,8 +1975,9 @@ def _main_verbs(sentence: str) -> set[str] | None:
     if not m:
         return None
     acts: set[str] = set()
+    inverted = m.group(0).lower().startswith("may")
     for w in re.split(r"\s*(?:,|\bor\b|\band\b)\s*|\s+", m.group(1).lower()):
-        if not w or w in _VERB_SKIP or w.endswith("ly") and not acts:
+        if not w or w in _VERB_SKIP or (w.endswith("ly") or inverted and w in _INVERTED_SKIP) and not acts:
             continue
         if w in ("pr", "prs", "pull"):
             return {"open"}
@@ -2001,7 +2008,7 @@ def _rule_target(sentence: str) -> tuple[set[str], set[str]]:
             if main is None:
                 acts |= fam
         elif (len(w) >= 3 or "/" in w or w.isdigit()) and w not in _RULE_STOP and stem not in _STANCE_WORDS \
-                and w not in _STANCE_WORDS and w not in _SHORT_STOP:
+                and w not in _STANCE_WORDS and w not in _SHORT_STOP and w not in _ACTOR_SKIP:
             objs.add(stem)
     return acts, objs
 
