@@ -117,7 +117,7 @@ function pushQueueHtml(q, now) {
   const ent = (q.entries || []).map((e) => `<div class="row"><span class="id">#${e.task}</span><span class="st st-${esc(e.status)}">${esc(e.status)}</span>` +
     `<span class="title">${esc(e.title || "")}</span><span class="meta">${esc(e.branch || "?")} ${esc(e.head)} · ${agoH(Math.round(now - e.age_s))} old${e.pushed_sha ? ` · ${esc(e.pushed_sha)}` : ""}</span></div>`).join("");
   const b = (q.last || []).map((x) => `<div class="row"><span class="id">${esc(x.id)}</span><span class="st ${x.outcome === "pushed" ? "st-done" : ["pushed", "landed", "nothing"].includes(x.outcome) ? "" : "st-failed"}">${esc(x.outcome || "?")}</span>` +
-    `<span class="meta">${x.pushed_sha ? esc(x.pushed_sha.slice(0, 7)) + (x.version ? " as " + esc(x.version) : "") + " · " : ""}${x.check_runs != null ? `checks ${x.check_runs} run${x.check_runs === 1 ? "" : "s"}${x.check_s != null ? ` in ${Math.round(x.check_s)} s` : ""} · ` : ""}` +
+    `<span class="meta">${x.landing ? esc(x.landing) + " · " : x.pushed_sha ? esc(x.pushed_sha.slice(0, 7)) + (x.version ? " as " + esc(x.version) : "") + " · " : ""}${x.check_runs != null ? `checks ${x.check_runs} run${x.check_runs === 1 ? "" : "s"}${x.check_s != null ? ` in ${Math.round(x.check_s)} s` : ""} · ` : ""}` +
     `deploy ${esc(x.after_push || (q.live && q.live.id === x.id ? "running" : "pending"))} · ${agoH(x.ended || x.started)} ago</span></div>`).join("");
   return (ent ? `<h3>Entries</h3>${ent}` : `<p class="muted">Nothing waiting.</p>`) + (b ? `<h3>Recent batches</h3>${b}` : "");
 }

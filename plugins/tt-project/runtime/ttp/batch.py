@@ -480,6 +480,7 @@ class Batch:
         self.detail: dict[int, dict] = {}
         self.checks = {"runs": 0, "seconds": 0.0, "flaky": False}
         self.tip = self.pushed_sha = self.version = None
+        self.reach: dict | None = None          # push.reach of what it pushed or found landed
         self.message = ""
         self.rounds = 0
         self.cfg: dict | None = None
@@ -1030,10 +1031,21 @@ def run_batch(p: Project, marker: Path) -> int:
             ff = push.fast_forward(b.repo, b.remote, b.pushed_sha, also, b.branch, say=say)
         except Exception as e:
             ff = [f"not ff {x}: {type(e).__name__}: {e}" for x in also]
+    # The reach check comes before the outcome is written: finalize settles a marker as soon as it has
+    # one, so a later reach would miss the review's summary. Its fetch is bounded and it never raises.
+    if outcome in ("pushed", "landed"):
+        try:
+            b.reach = push.reach(p, b.repo, b.target, b.pushed_sha or b.tip)
+        except Exception as e:      # a fact for the notice; never in the way of the outcome
+            say(f"cannot tell whether it is on the branch it is meant to reach: {type(e).__name__}: {e}")
+        if b.reach:
+            say(push.landing(b.pushed_sha or b.tip, b.target, b.reach)
+                if b.pushed_sha else f"already on {b.target}{push.reach_words(b.reach)}")
     m = push._read(marker) or m
     conflicts = b.conflicts()
     m.update(outcome=outcome, tip=b.tip, pushed_sha=b.pushed_sha, version=b.version, results=b.results(),
-             checks=b.checks, rounds=b.rounds, message=b.message or None, conflicts=conflicts)
+             checks=b.checks, rounds=b.rounds, message=b.message or None, conflicts=conflicts,
+             reach=b.reach or None)
     if ff:
         m["fast_forward"] = ff
     if conflicts["conflicted"]:
@@ -1123,7 +1135,8 @@ def summary(marker: Path) -> int:
         return 0
     sha = m.get("pushed_sha")
     head = f"batch {bid}: {outcome}" + (f", {str(sha)[:10]}" if sha else "") \
-        + (f" as {m['version']}" if sha and m.get("version") else "") + f" to {m.get('target')}"
+        + (f" as {m['version']}" if sha and m.get("version") else "") + f" to {m.get('target')}" \
+        + (push.reach_words(m.get("reach")) if outcome in ("pushed", "landed") else "")
     print(f"ttp push: {head}" + (f" ({m['message']})" if m.get("message") and outcome != "pushed" else ""))
     for line in m.get("fast_forward") or []:
         print(f"  {'warning: ' if push.ff_warnings([line]) else ''}{line}")

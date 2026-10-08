@@ -13978,6 +13978,7 @@ def test_push_in_a_remote_less_harness_says_the_commit_is_already_delivered(env,
         assert _ttp(*args) == 0, args
         out = capsys.readouterr()
         assert "already delivered" in out.err and "no remote" in out.err and "marker: " not in out.out, args
+        assert "nothing to push: this is the project's harness" in out.err, args
     assert not log.exists() and not (p.state / "pushes").exists()
     assert _git_out(origin, "for-each-ref", "--format=%(refname:short)", "refs/heads") == "proj"
     # A harness the user gave a remote is not short-circuited: the usual --own rules apply.
@@ -15364,6 +15365,7 @@ if m.get("outcome") is None:
           version=plan.get("version"), checks={"runs": 1, "seconds": 2.0}, rounds=1, message=plan.get("message"),
           **({"tip_check": plan["tip_check"]} if "tip_check" in plan else {}),
           **({"fast_forward": plan["ff"]} if "ff" in plan else {}),
+          **({"reach": plan["reach"]} if "reach" in plan else {}),
           results=[{"id": e["id"], "status": rows.get(e["branch"], plan.get("row", "pushed")),
                     "task": e["task"], "detail": plan.get("detail") or {}} for e in m["entries"]])
     if not plan.get("after"):
@@ -15669,7 +15671,7 @@ def test_a_pushed_batch_closes_the_review_done_without_any_model_run(env, monkey
     [bid] = [b["id"] for b in s.p.db.q("SELECT id FROM push_batches")]
     assert res["pushed"] == [{"branch": s.branch, "head": s.head, "sha": sha, "version": "0.3.1", "batch": bid,
                               "status": "pushed"}]
-    assert res["summary"] == f"looks good (pushed {sha[:7]} as 0.3.1)" and res["status"] == "done"
+    assert res["summary"] == f"looks good (pushed {sha[:7]} as 0.3.1 to origin/proj)" and res["status"] == "done"
     assert s.p.db.one("SELECT status, pushed_sha, version FROM push_queue") == {
         "status": "pushed", "pushed_sha": sha, "version": "0.3.1"}
     evs = _pq_events(s.p, mark)
@@ -15766,10 +15768,10 @@ def test_status_shows_one_push_queue_line_in_each_state_and_never_a_command(env,
         "empty": "push queue: empty",
         "approved": "push queue: 2 approved (oldest 6 min)",
         "running": "push queue: 2 approved (oldest 6 min) · batch checking since 2 min (2 changes)",
-        "deploying": f"push queue: batch deploying since 15 min (1 change) · last pushed {sha[:7]} as 0.2.140 12 min ago",
-        "finished": f"push queue: empty · last pushed {sha[:7]} as 0.2.140 12 min ago · deploy ok",
+        "deploying": f"push queue: batch deploying since 15 min (1 change) · last pushed {sha[:7]} as 0.2.140 to origin/proj 12 min ago",
+        "finished": f"push queue: empty · last pushed {sha[:7]} as 0.2.140 to origin/proj 12 min ago · deploy ok",
         "failed": f"push queue: 2 approved (oldest 6 min) · last batch the branch tip fails its checks 5 min ago · "
-                  f"last pushed {sha[:7]} as 0.2.140 12 min ago · deploy ok",
+                  f"last pushed {sha[:7]} as 0.2.140 to origin/proj 12 min ago · deploy ok",
     }[case]
     assert line == want
     assert [ln for ln in status_text(p).splitlines() if ln.startswith("push queue")] == ([want] if want else [])
@@ -15783,6 +15785,172 @@ def test_the_push_queue_line_stays_once_the_queue_is_off_while_it_has_rows(env):
     now = time.time()
     _pq_row(p, rid, now, age=60)
     assert pushq.status_line(p, now) == "push queue (off): 1 approved (oldest 1 min)"
+
+
+def test_a_push_notice_names_the_branch_and_sha_and_says_when_the_work_is_not_yet_on_its_intended_target(
+        env, monkeypatch, capsys):
+    """'pushed' must never read as landed: with delivery.base_ref naming another branch than the one
+    pushed, `ttp push` names the branch and short sha and says the work is not on that branch yet,
+    how far behind it is, and never assumes a branch it cannot read was reached."""
+    from ttp import push
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/main")
+    assert push.intended(p, repo, "origin/proj") == "", "the push branch itself names no other target"
+    assert push.reach(p, repo, "origin/proj", _git_out(repo, "rev-parse", "HEAD")) is None
+    for same in ("proj", "origin/proj", "refs/remotes/origin/proj", "refs/heads/proj", "ab" * 20):
+        p.set_config("delivery.base_ref", same)
+        assert push.intended(p, repo, "origin/proj") == "", same
+    p.set_config("delivery.base_ref", "origin/main")
+    _commit(repo, "a.txt", "a\n")
+    _commit(repo, "b.txt", "b\n")
+    capsys.readouterr()
+    assert _ttp_push() == 0
+    head = _git_out(origin, "rev-parse", "proj")
+    err = capsys.readouterr().err
+    assert f"pushed {head[:7]} to origin/proj, not yet on origin/main (origin/main is 2 commits behind)" in err, err
+    assert push.last_reach == {"ref": "origin/main", "on": False, "behind": 2}
+    # --own publishes another branch: the push branch is what the work is meant to reach.
+    assert push.intended(p, repo, "origin/ttp/t7-exp") == "origin/proj"
+    # The target catches up: the same push is on it too.
+    _git_out(repo, "push", "-q", "origin", f"{head}:refs/heads/main")
+    r = push.reach(p, repo, "origin/proj", head)
+    assert r == {"ref": "origin/main", "on": True, "behind": 0}
+    assert push.landing(head, "origin/proj", r, "0.1.1") == f"pushed {head[:7]} as 0.1.1 to origin/proj, also on origin/main"
+    # A target that cannot be read is never taken as reached.
+    p.set_config("delivery.base_ref", "origin/gone")
+    assert push.landing(head, "origin/proj", push.reach(p, repo, "origin/proj", head)) == (
+        f"pushed {head[:7]} to origin/proj, not yet seen on origin/gone (it could not be read)")
+    # The detached push's verdict says it as well.
+    marker = p.state / "pushes" / "x.json"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps({"id": "x", "status": "pushed", "exit": 0, "sha": head, "target": "origin/proj",
+                                  "reach": {"ref": "origin/main", "on": False, "behind": 1}}))
+    capsys.readouterr()
+    assert push.result(marker) == 0
+    assert capsys.readouterr().out.strip() == (
+        f"ttp push: pushed {head} to origin/proj, not yet on origin/main (origin/main is 1 commit behind)")
+
+
+def test_a_push_batch_records_whether_what_it_pushed_is_on_the_intended_target(env, monkeypatch, capsys):
+    """A batch to the push branch, with delivery.base_ref naming another branch, records in its marker
+    that the pushed commit is not on that branch yet, and its result says so; with no other branch
+    named it records nothing."""
+    from ttp import batch
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/main")
+    h1 = _entry(repo, "e1", {"one.txt": "1\n"})
+    rc, m = _run_batch(p, _batch_marker(p, [h1]), monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed" and m["reach"] is None, m
+    p.set_config("delivery.base_ref", "origin/main")
+    h2 = _entry(repo, "e2", {"two.txt": "2\n"})
+    capsys.readouterr()
+    rc, m = _run_batch(p, _batch_marker(p, [h2], bid="b2"), monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed", m
+    assert m["reach"] == {"ref": "origin/main", "on": False, "behind": 2}, m
+    sha = _git_out(origin, "rev-parse", "proj")
+    out = capsys.readouterr().out
+    assert f"pushed {sha[:7]} to origin/proj, not yet on origin/main (origin/main is 2 commits behind)" in out, out
+    assert batch.summary(p.state / "pushes" / "b2.json") == 0
+    out = capsys.readouterr().out
+    assert f"to origin/proj, not yet on origin/main (origin/main is 2 commits behind)" in out.splitlines()[0], out
+
+
+def test_a_reach_check_that_times_out_or_raises_never_changes_a_push_that_landed(env, monkeypatch, capsys):
+    """The reach check runs after the push landed: its fetch is bounded, prompt-free and stdin-free, a
+    timeout reads as 'could not be read', and an exception leaves `ttp push` at 0 and a batch's
+    marker at outcome 'pushed' with no reach."""
+    from ttp import push
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/main")
+    p.set_config("delivery.base_ref", "origin/main")
+    real, seen = subprocess.run, []
+
+    def stalled(cmd, *a, **kw):
+        if "fetch" in cmd and "refs/remotes/origin/main" in cmd[-1]:
+            seen.append(kw)
+            raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+        return real(cmd, *a, **kw)
+    monkeypatch.setattr(push.subprocess, "run", stalled)
+    _commit(repo, "a.txt", "a\n")
+    capsys.readouterr()
+    assert _ttp_push() == 0
+    assert push.last_reach == {"ref": "origin/main", "on": None, "behind": None}
+    assert "not yet seen on origin/main (it could not be read)" in capsys.readouterr().err
+    kw = seen[0]
+    assert kw["timeout"] == push.REACH_FETCH_S <= 60 and kw["stdin"] == subprocess.DEVNULL, kw
+    assert kw["env"]["GIT_TERMINAL_PROMPT"] == "0", kw
+    rc, m = _run_batch(p, _batch_marker(p, [_entry(repo, "e1", {"one.txt": "1\n"})]), monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed" and m["reach"]["on"] is None, m
+    monkeypatch.setattr(push.subprocess, "run", real)
+
+    def broken(*a, **kw):
+        raise RuntimeError("no git")
+    monkeypatch.setattr(push, "reach", broken)
+    _commit(repo, "b.txt", "b\n")
+    capsys.readouterr()
+    assert _ttp_push() == 0 and push.last_reach is None
+    assert "cannot tell whether it is on the branch it is meant to reach: RuntimeError" in capsys.readouterr().err
+    rc, m = _run_batch(p, _batch_marker(p, [_entry(repo, "e2", {"two.txt": "2\n"})], bid="b2"), monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed" and m["reach"] is None, m
+
+
+def test_a_pushed_batch_tells_the_review_status_and_web_app_it_is_not_yet_on_the_intended_target(env, monkeypatch):
+    """The review's summary, its done event, `ttp status`'s queue line, `ttp push --queue` and the web
+    app's batch row all name the branch and short sha and say the work is not yet on the branch it is
+    meant to reach, instead of letting 'pushed' read as landed."""
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    sha = "ab" * 20
+    reach = {"ref": "origin/main", "on": False, "behind": 4}
+    _pq_plan(s, outcome="pushed", sha=sha, tip="cd" * 20, version="0.3.1", reach=reach)
+    _pq_hand_off(env, s)
+    mark = _pq_mark(s.p)
+    _pq_batch(s)
+    _pq_tend(s)
+    words = f"pushed {sha[:7]} as 0.3.1 to origin/proj, not yet on origin/main (origin/main is 4 commits behind)"
+    t = s.p.db.task(s.review)
+    assert t["status"] == "done" and json.loads(t["result"])["summary"] == f"looks good ({words})"
+    [ev] = [e for e in _pq_events(s.p, mark) if e["kind"] == "task_done"]
+    assert f"({words}, batch " in ev["text"], ev
+    now = time.time()
+    sm = pushq.summary(s.p, now)
+    assert sm["last"][0]["landing"] == words and sm["last_pushed"]["reach"] == reach
+    line = pushq.status_line(s.p, now, sm)
+    assert f"last pushed {sha[:7]} as 0.3.1 to origin/proj " in line and \
+        "ago, not yet on origin/main (origin/main is 4 commits behind)" in line, line
+    assert any(ln.endswith("ago: " + words + ", checks 1 run in 2 s, no deploy") for ln in
+               pushq.queue_text(s.p, now).splitlines()), pushq.queue_text(s.p, now)
+    assert pushq.web(s.p, now=now)["last"][0]["landing"] == words
+
+
+def test_a_batch_records_its_reach_with_its_outcome_so_a_tick_meanwhile_cannot_settle_without_it(env, monkeypatch):
+    """finalize settles a marker as soon as it has an outcome, even while the batch runs: the reach
+    check runs before the outcome is written, so a tick during its fetch finds nothing to settle and
+    the review's one-shot summary still says the work is not yet on the intended target."""
+    from ttp import batch, push, pushq
+    s = _pq(env, monkeypatch)
+    _git_out(s.repo, "push", "-q", "origin", "HEAD:refs/heads/main")
+    s.p.set_config("delivery.base_ref", "origin/main")
+    monkeypatch.setattr(pushq, "batch_argv", lambda marker: [sys.executable, "-c", "pass"])
+    _pq_hand_off(env, s)
+    bid = _pq_batch(s)
+    marker = pathlib.Path(s.p.db.one("SELECT marker FROM push_batches WHERE id=?", (bid,))["marker"])
+    real, seen = push.reach, []
+
+    def reach(*a, **kw):
+        seen.append(push._read(marker).get("outcome"))
+        _pq_tend(s)                 # a daemon tick while the fetch runs
+        seen.append(s.p.db.task(s.review)["status"])
+        return real(*a, **kw)
+    monkeypatch.setattr(push, "reach", reach)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+    assert batch.run_batch(s.p, marker) == 0
+    assert seen == [None, "pushing"], seen
+    m = push._read(marker)
+    assert m["outcome"] == "pushed" and m["reach"]["ref"] == "origin/main" and m["reach"]["on"] is False, m
+    _pq_tend(s)
+    t = s.p.db.task(s.review)
+    assert t["status"] == "done" and "not yet on origin/main" in json.loads(t["result"])["summary"], t
 
 
 def test_ttp_push_queue_lists_the_entries_and_the_last_ten_batches(env, monkeypatch, capsys):
@@ -15801,7 +15969,7 @@ def test_ttp_push_queue_lists_the_entries_and_the_last_ten_batches(env, monkeypa
     _pq_row(p, rid, now, status="batched", batch="b21", age=100, head="12" * 20)
     out = pushq.queue_text(p, now).splitlines()
     assert out[0].startswith("push queue: 1 approved (oldest 6 min) · batch checking since 0 min (1 change) · "
-                             f"last pushed {sha[:7]} as 0.2.140 12 min ago · deploy failed"), out[0]
+                             f"last pushed {sha[:7]} as 0.2.140 to origin/proj 12 min ago · deploy failed"), out[0]
     i = out.index("entries:")
     assert out[i + 1:i + 4] == [
         f"  #{rid} ttp/t1-feature 1212121 batched in b21, 1 min old: review feature",
@@ -15809,7 +15977,7 @@ def test_ttp_push_queue_lists_the_entries_and_the_last_ten_batches(env, monkeypa
         f"  #{rid} ttp/t1-feature abababa pushed in b20, 16 min old: review feature"]
     j = out.index("batches, newest first:")
     assert out[j + 1] == "  b21 running: checking since 0 min, 1 change"
-    assert out[j + 2] == f"  b20 12 min ago: pushed {sha[:7]} as 0.2.140, checks 2 runs in 242 s, deploy failed"
+    assert out[j + 2] == f"  b20 12 min ago: pushed {sha[:7]} as 0.2.140 to origin/proj, checks 2 runs in 242 s, deploy failed"
     assert out[j + 3].startswith("  b11 ") and out[j + 3].endswith("ago: nothing to push, no deploy")
     assert len(out) - j - 2 == 10, "the last 10 batches, plus the live one"
     # the CLI flag prints the same, from the project's folder, and pushes nothing
@@ -15936,7 +16104,7 @@ def test_a_code_task_in_review_is_closed_when_a_review_that_settled_its_push_con
     res = json.loads(t["result"])
     assert t["status"] == "done" and res["shipped_by"] == settle
     assert [(x["sha"], x["version"], x["status"]) for x in res["pushed"]] == [(sha, "0.3.1", "pushed")]
-    assert res["summary"] == f"built it (shipped by review #{settle}: pushed {sha[:7]} as 0.3.1)"
+    assert res["summary"] == f"built it (shipped by review #{settle}: pushed {sha[:7]} as 0.3.1 to origin/proj)"
     [ev] = [e for e in _pq_events(s.p, mark, task=s.code)]
     assert ev["kind"] == "task_done" and ev["status"] == "handled", "a shipped task is no news for the coordinator"
 

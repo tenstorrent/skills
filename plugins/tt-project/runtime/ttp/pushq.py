@@ -139,6 +139,25 @@ def _short(sha: str | None) -> str:
     return (sha or "?")[:7]
 
 
+def _reach(db, batch: str | None, b: dict | None = None, m: dict | None = None) -> dict | None:
+    """push.reach as batch `batch` recorded it in its marker (`m` when `b` is that batch): whether
+    what it pushed is on the branch the work is meant to reach. None when unknown or not asked."""
+    if b is not None and m is not None and batch == b["id"]:
+        r = m.get("reach")
+    else:
+        row = db.one("SELECT marker FROM push_batches WHERE id=?", (batch,)) if batch else None
+        r = _read(Path(row["marker"])).get("reach") if row else None
+    return r if isinstance(r, dict) else None
+
+
+def _landing(row: dict, target: str, reach: dict | None) -> str:
+    """A pushed or landed row in words: the exact branch and short sha, and whether it is on the
+    branch it is meant to reach (push.reach_words), so "pushed" never reads as landed there."""
+    if row["status"] == "pushed":
+        return push.landing(row["pushed_sha"], target, reach, row["version"])
+    return f"already on {target} at {_short(row['pushed_sha'])}" + push.reach_words(reach)
+
+
 # approval -----------------------------------------------------------------------------------------
 def _commit(p: Project, ref: str) -> str:
     r = _git(p, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
@@ -616,8 +635,8 @@ def _settle(p: Project, tid: int, b: dict, m: dict, now: float) -> None:
         done = [x for x in rows if x["status"] in ("pushed", "landed")]
         last = max(done, key=lambda x: x["id"])
         new = [x for x in current if x["status"] == "pushed"]
-        tail = (f"pushed {_short(last['pushed_sha'])}" + (f" as {last['version']}" if last["version"] else "")
-                if new else f"already on {target} at {_short(last['pushed_sha'])}")
+        tail = _landing({**last, "status": "pushed" if new else "landed"}, last["target"] or target,
+                        _reach(db, last["batch"], b, m))
         ff = [str(x) for x in m.get("fast_forward") or []] if new else []
         if ff:   # delivery.fast_forward_also, as read back from the remote
             tail += "; " + "; ".join(f"warning: {x}" if x in push.ff_warnings([x]) else x for x in ff)
@@ -693,9 +712,7 @@ def settle_reviewed(db, now: float | None = None, only: set[int] | None = None) 
         if not shipped:
             continue
         last = max(shipped, key=lambda x: x["id"])
-        tail = (f"shipped by review #{latest['id']}: " + (
-            f"pushed {_short(last['pushed_sha'])}" + (f" as {last['version']}" if last["version"] else "")
-            if last["status"] == "pushed" else f"already on {last['target']} at {_short(last['pushed_sha'])}"))
+        tail = f"shipped by review #{latest['id']}: " + _landing(last, last["target"], _reach(db, last["batch"]))
         prev = load_result(t["result"])
         summary = str(prev.get("summary") or "")
         result = {**prev, "status": "done", "summary": f"{summary.rstrip()} ({tail})".strip()[:1500],
@@ -989,8 +1006,16 @@ def summary(p: Project, now: float | None = None, last: int = 5, db=None) -> dic
                                   "check_runs", "check_s")}
                for r in db.q("SELECT * FROM push_batches WHERE finalized IS NOT NULL ORDER BY started DESC LIMIT ?",
                              (last,))]
-    pushed = db.one("SELECT id, pushed_sha, version, ended, after_push FROM push_batches WHERE outcome='pushed' "
+    for x in batches:
+        x["reach"] = _reach(db, x["id"]) if x["outcome"] in ("pushed", "landed") else None
+        x["landing"] = (push.landing(x["pushed_sha"], x["target"], x["reach"], x["version"]) if x["pushed_sha"] and
+                        x["outcome"] == "pushed" else f"already on {x['target']}{push.reach_words(x['reach'])}"
+                        if x["outcome"] == "landed" else None)
+    pushed = db.one("SELECT id, target, pushed_sha, version, ended, after_push FROM push_batches WHERE outcome='pushed' "
                     "AND pushed_sha IS NOT NULL ORDER BY started DESC LIMIT 1")
+    known = {x["id"]: x["reach"] for x in batches}
+    if pushed:
+        pushed["reach"] = known[pushed["id"]] if pushed["id"] in known else _reach(db, pushed["id"])
     st = _state(db)
     return {"on": enabled(p), "approved": approved, "live": live, "last": batches, "last_pushed": pushed,
             "backoff_until": st.get("backoff_until"), "hold": st.get("hold"), "deaths": int(st.get("deaths") or 0),
@@ -1050,8 +1075,8 @@ def status_line(p: Project, now: float | None = None, sm: dict | None = None, db
         parts.append(f"next try {_at(wait, now)}")
     lp = sm.get("last_pushed")
     if lp:
-        parts.append(f"last pushed {_short(lp['pushed_sha'])}" + (f" as {lp['version']}" if lp["version"] else "")
-                     + (f" {_age(now - lp['ended'])} ago" if lp["ended"] else ""))
+        parts.append("last " + push.landing(lp["pushed_sha"], lp.get("target") or "", None, lp["version"])
+                     + (f" {_age(now - lp['ended'])} ago" if lp["ended"] else "") + push.reach_words(lp.get("reach")))
         if lp["after_push"] in AFTER_WORDS and lp["after_push"] != "skipped":
             parts.append(AFTER_WORDS[lp["after_push"]])   # while it deploys, the live part says so
     return "push queue" + ("" if sm["on"] else " (off)") + ": " + " · ".join(parts)
@@ -1103,7 +1128,9 @@ def queue_text(p: Project, now: float | None = None, last: int = 10) -> str:
                      f"{lv['rows']} change{'s' if lv['rows'] != 1 else ''}")
     for b in sm["last"]:
         what = OUTCOME_WORDS.get(b["outcome"], b["outcome"] or "?")
-        if b["pushed_sha"]:
+        if b.get("landing"):
+            what = b["landing"]
+        elif b["pushed_sha"]:
             what += f" {_short(b['pushed_sha'])}" + (f" as {b['version']}" if b["version"] else "")
         checks = (f", checks {b['check_runs']} run{'s' if b['check_runs'] != 1 else ''}"
                   + (f" in {b['check_s']:.0f} s" if b["check_s"] is not None else "")) if b["check_runs"] is not None else ""

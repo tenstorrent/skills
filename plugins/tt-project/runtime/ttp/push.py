@@ -609,6 +609,82 @@ def target(p: Project, repo: Path) -> tuple[str, str]:
     return remote, rest[len("refs/heads/"):] if rest.startswith("refs/heads/") else rest
 
 
+def ref_name(repo: Path, ref: str) -> str:
+    """`ref` (branch, remote/branch, refs/heads/... or refs/remotes/...) as remote/branch, on origin
+    when it names no remote of `repo`."""
+    ref = ref.strip().removeprefix("refs/remotes/")
+    remote, _, rest = ref.partition("/")
+    if not (rest and remote in _git(repo, "remote").stdout.split()):
+        remote, rest = "origin", ref
+    return f"{remote}/{rest.removeprefix('refs/heads/')}"
+
+
+def intended(p: Project, repo: Path, pushed: str) -> str:
+    """The branch work pushed to `pushed` (remote/branch) is meant to reach when that is another
+    one: the first of `delivery.push_branch` and `delivery.base_ref` naming a different branch, as
+    remote/branch; "" when neither does (a commit hash as base_ref names no branch)."""
+    d = p.config().get("delivery") or {}
+    for key in ("push_branch", "base_ref"):
+        ref = str(d.get(key) or "").strip()
+        if ref and not re.fullmatch(r"[0-9a-f]{7,64}", ref) and (name := ref_name(repo, ref)) != pushed:
+            return name
+    return ""
+
+
+REACH_FETCH_S = 60   # reach() runs after a push has landed: its fetch may never hold that up for long
+
+
+def _fetch_bounded(repo: Path, remote: str, branch: str) -> str:
+    """_fetch with no prompt, no stdin and at most REACH_FETCH_S: "" when it times out."""
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    try:
+        if subprocess.run(["git", "-C", str(repo), "fetch", remote,
+                           f"+refs/heads/{branch}:refs/remotes/{remote}/{branch}"],
+                          stdin=subprocess.DEVNULL, stdout=2, text=True, env=env,
+                          timeout=REACH_FETCH_S).returncode != 0:
+            return ""
+    except subprocess.TimeoutExpired:
+        return ""
+    return _git(repo, "rev-parse", "--verify", "--quiet", f"refs/remotes/{remote}/{branch}").stdout.strip()
+
+
+def reach(p: Project, repo: Path, pushed: str, sha: str | None) -> dict | None:
+    """Whether `sha`, pushed to `pushed`, is on the branch it is meant to reach (intended) as well:
+    {"ref", "on" (None when that branch cannot be read), "behind" (commits of `sha` it lacks)}; None
+    when no other branch is named. Fetches that branch."""
+    ref = intended(p, repo, pushed)
+    if not (ref and sha):
+        return None
+    remote, _, branch = ref.partition("/")
+    tip = _fetch_bounded(repo, remote, branch)
+    if not tip:
+        return {"ref": ref, "on": None, "behind": None}
+    n = _git(repo, "rev-list", "--count", f"{tip}..{sha}").stdout.strip()
+    return {"ref": ref, "on": _git(repo, "merge-base", "--is-ancestor", sha, tip).returncode == 0,
+            "behind": int(n) if n.isdigit() else None}
+
+
+def reach_words(r: dict | None) -> str:
+    """What `reach` found, to follow "pushed <sha> to <branch>": never lets a push read as landed on a
+    branch it has not reached."""
+    if not isinstance(r, dict) or not r.get("ref"):
+        return ""
+    if r.get("on"):
+        return f", also on {r['ref']}"
+    if r.get("on") is None:
+        return f", not yet seen on {r['ref']} (it could not be read)"
+    n = r.get("behind")
+    return f", not yet on {r['ref']}" + (f" ({r['ref']} is {n} commit{'s' if n != 1 else ''} behind)"
+                                         if isinstance(n, int) and n > 0 else "")
+
+
+def landing(sha: str | None, pushed: str, r: dict | None = None, version: str | None = None) -> str:
+    """A push in words for the user: the short sha, version, the exact branch it went to and, when the
+    work is meant to reach another branch, whether it is there (reach_words)."""
+    return (f"pushed {(sha or '?')[:7]}" + (f" as {version}" if version else "")
+            + (f" to {pushed}" if pushed else "") + reach_words(r))
+
+
 LOCAL_HARNESS = ("nothing to push: this is the project's harness, a local git repo with no remote. "
                  "A commit here is already delivered: the daemon reads the harness from this repo. "
                  "Hand off with the commit's hash; never copy harness files into a code branch to publish them.")
@@ -1228,6 +1304,7 @@ def push(repo: Path, remote: str, branch: str, checks: list[str], rounds: int = 
 
 
 last_pushed: str | None = None   # the commit the last push() pushed; HEAD may be back on its branch
+last_reach: dict | None = None   # reach() of the last run(): whether it is on the branch it is meant to reach
 
 
 def published(repo: Path, remote: str, target_branch: str) -> str:
@@ -1465,6 +1542,8 @@ def run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None)
     except ValueError as e:
         print(f"ttp push: {e}", file=sys.stderr)
         return REFUSED
+    global last_ff, last_reach
+    last_ff, last_reach = [], None
     if own:   # delivery.push_exclude_paths guards the push branch only
         base = None
         # The docs-only test, if_changed scopes and the project's own checks may all compare with the
@@ -1473,17 +1552,25 @@ def run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None)
             base = _fetch(repo, *target(p, repo)) or None
         except ValueError:
             pass
-        return publish(repo, remote, branch, checks, hold=lambda: take(p, remote, branch, wait_s),
-                       timed=lambda s: record_check_s(p, s), base=base,
-                       ff_only=own_ff_only(branch),
-                       recorded=recorded or recorded_checks(os.environ.get("TTP_RUN_DIR")))
-    global last_ff
-    last_ff = []
-    rc = push(repo, remote, branch, checks, rounds, hold=lambda: take(p, remote, branch, wait_s),
-              version_bump=version_bump, timed=lambda s: record_check_s(p, s),
-              exclude=exclude_list(d.get("push_exclude_paths")))
-    if rc == 0 and last_pushed and (also := fast_forward_list(d.get("fast_forward_also"))):
-        last_ff = fast_forward(repo, remote, last_pushed, also, branch)
+        rc = publish(repo, remote, branch, checks, hold=lambda: take(p, remote, branch, wait_s),
+                     timed=lambda s: record_check_s(p, s), base=base,
+                     ff_only=own_ff_only(branch),
+                     recorded=recorded or recorded_checks(os.environ.get("TTP_RUN_DIR")))
+    else:
+        rc = push(repo, remote, branch, checks, rounds, hold=lambda: take(p, remote, branch, wait_s),
+                  version_bump=version_bump, timed=lambda s: record_check_s(p, s),
+                  exclude=exclude_list(d.get("push_exclude_paths")))
+        if rc == 0 and last_pushed and (also := fast_forward_list(d.get("fast_forward_also"))):
+            last_ff = fast_forward(repo, remote, last_pushed, also, branch)
+    if rc == 0:
+        sha = (None if own else last_pushed) or _git(repo, "rev-parse", "HEAD").stdout.strip()
+        try:
+            last_reach = reach(p, repo, f"{remote}/{branch}", sha)
+        except Exception as e:      # a fact for the notice; never changes what the push did
+            print(f"ttp push: cannot tell whether it is on the branch it is meant to reach: "
+                  f"{type(e).__name__}: {e}", file=sys.stderr)
+        if last_reach:
+            print(f"ttp push: {landing(sha, f'{remote}/{branch}', last_reach)}", file=sys.stderr)
     return rc
 
 
@@ -1755,6 +1842,8 @@ def run_detached(p: Project, repo: Path, marker: Path, own: bool = False) -> int
     m.update(status="pushed" if rc == 0 else "failed", exit=rc, sha=sha, version=version, ended=time.time())
     if rc == 0 and not own and last_ff:
         m["fast_forward"] = last_ff
+    if rc == 0 and last_reach:
+        m["reach"] = last_reach
     if reason:
         m["reason"] = reason
     write_json(marker, m)
@@ -1875,7 +1964,7 @@ def result(marker: Path) -> int:
         return 1
     if m.get("status") == "pushed":
         v = f", version {m['version']}" if m.get("version") else ""
-        print(f"ttp push: pushed {m.get('sha')} to {m.get('target')}{v}")
+        print(f"ttp push: pushed {m.get('sha')} to {m.get('target')}{v}{reach_words(m.get('reach'))}")
         for line in m.get("fast_forward") or []:
             print(f"ttp push: {'warning: ' if line in ff_warnings([line]) else ''}{line}")
     else:
