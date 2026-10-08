@@ -10604,6 +10604,169 @@ def test_a_waiting_exclusive_task_reserves_its_resource(env, tmp_path):
     assert not mark.exists(), "the run kept the reservation after taking its slot"
 
 
+def _exclusive_run_detaching(p, task_id, run_id, run_dir, job_cmd, wait=True):
+    """A run supervisor of exclusive task `task_id` holding the board, whose agent detaches `job_cmd`
+    and ends at once, as a worker that hands off `waiting` on its job does."""
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    run_dir.mkdir(parents=True)
+    (run_dir / "prompt.md").write_text("x")
+    (run_dir / "run.json").write_text(json.dumps({
+        "argv": [sys.executable, str(TTP), "detach", "job", "--", *job_cmd],
+        "env": {"TTP_TASK": str(task_id), "TTP_RUN_ID": str(run_id), "TTP_RUN_DIR": str(run_dir),
+                "TTP_PROJECT": str(p.base)},
+        "cwd": str(p.root), "timeout_s": 60, "provider": "fake", "holds": str(p.state / "holds"),
+        "exclusive": [{"resource": "board", "paths": [str(x) for x in d._slot_paths("board")],
+                       "reserve": str(d._reserve_path("board")), "holder": f"task #{task_id}"}]}))
+    proc = subprocess.Popen([sys.executable, "-m", "ttp.runner", str(run_dir)], cwd=str(RUNTIME),
+                            env={**os.environ, "PYTHONPATH": str(RUNTIME)})
+    if wait:
+        assert proc.wait(timeout=60) == 0
+    return proc
+
+
+def _board_task(p, title):
+    from ttp import coordinator as coord
+    assert coord.apply(p, [{"type": "task_add", "title": title, "spec": "s", "tier": "light",
+                            "resources": ["board"], "exclusive": True}]) == []
+    return p.db.one("SELECT * FROM tasks WHERE title=?", (title,))
+
+
+def _until_true(cond, timeout=20):
+    deadline = time.time() + timeout
+    while time.time() < deadline and not cond():
+        time.sleep(0.05)
+    return cond()
+
+
+def test_an_exclusive_hold_outlives_the_run_while_its_detached_job_runs_and_ends_with_its_rc(env, tmp_path):
+    p = make(env)
+    from ttp import hold, locks
+    from ttp.daemon import Daemon
+    mine, other = _board_task(p, "flash"), _board_task(p, "other")
+    run_dir, release = p.runs / "41", tmp_path / "release"
+    _exclusive_run_detaching(p, mine["id"], 41, run_dir, _until(release))
+    d = Daemon(p.base)
+    paths = d._slot_paths("board")
+    try:
+        # The agent has ended, its job has not: the board stays the task's, for others and ttp lock alike.
+        assert (run_dir / "exit.json").exists() and not (run_dir / "job.rc").exists()
+        assert not locks.any_free(paths), "the run's hold lapsed while its detached job still ran"
+        assert locks.held_labels(paths) == [f"task #{mine['id']} (run 41), detached jobs"]
+        assert not d._resources_free(other), "another exclusive task could take the board from a live job"
+        rc = subprocess.run([sys.executable, str(TTP), "lock", "--timeout", "0.5", "board", "--", "true"],
+                            env=dict(os.environ, TTP_PROJECT=str(p.base))).returncode
+        assert rc == 75, "ttp lock got the board while a detached job of its exclusive run still ran"
+        rec = hold.read(run_dir)
+        assert rec["state"] == "holding" and rec["jobs"] == [str((run_dir / "job.rc").resolve())]
+        d.tend_holds()
+        assert not locks.any_free(paths), "tending a live keeper let its hold go"
+    finally:
+        release.touch()
+    assert _until_true(lambda: (run_dir / "job.rc").exists())
+    assert _until_true(lambda: locks.any_free(paths)), "the hold outlived the job's .rc"
+    assert hold.read(run_dir)["state"] == "released"
+    d.tend_holds()
+    ev = p.db.one("SELECT * FROM events WHERE kind='hold_released'")
+    assert ev and ev["task"] == mine["id"] and "every detached job of the run ended" in ev["text"]
+    assert not list((p.state / "holds").glob("*.json")), "an ended hold stayed registered"
+    assert d._resources_free(other)
+
+
+def test_a_run_without_live_detached_jobs_lets_its_exclusive_hold_go_at_once(env, tmp_path):
+    p = make(env)
+    from ttp import hold, locks
+    from ttp.daemon import Daemon
+    mine = _board_task(p, "flash")
+    run_dir = p.runs / "42"
+    _exclusive_run_detaching(p, mine["id"], 42, run_dir, ["true"])
+    assert _until_true(lambda: (run_dir / "job.rc").exists())
+    paths = Daemon(p.base)._slot_paths("board")
+    # The job may still be running when the agent ends; then its keeper lets go within a poll.
+    assert _until_true(lambda: locks.any_free(paths))
+    assert (hold.read(run_dir) or {}).get("state") in (None, "released")
+
+
+def test_an_exclusive_hold_kept_for_a_detached_job_ends_when_the_job_dies(env, tmp_path):
+    p = make(env)
+    from ttp import hold, locks
+    from ttp.daemon import Daemon
+    mine = _board_task(p, "flash")
+    run_dir = p.runs / "43"
+    _exclusive_run_detaching(p, mine["id"], 43, run_dir, ["sleep", "600"])
+    paths = Daemon(p.base)._slot_paths("board")
+    assert not locks.any_free(paths)
+    pid = json.loads((run_dir / "detached.json").read_text())[0]["pid"]
+    os.killpg(pid, signal.SIGKILL)   # killed: it never writes its .rc
+    assert _until_true(lambda: locks.any_free(paths)), "a dead job's hold was never released"
+    assert not (run_dir / "job.rc").exists() and hold.read(run_dir)["state"] == "released"
+
+
+def test_an_exclusive_hold_for_a_detached_job_survives_a_daemon_restart_and_a_dead_keeper(env, tmp_path):
+    p = make(env)
+    from ttp import hold, locks
+    from ttp.daemon import Daemon
+    mine, other = _board_task(p, "flash"), _board_task(p, "other")
+    run_dir, release = p.runs / "44", tmp_path / "release"
+    _exclusive_run_detaching(p, mine["id"], 44, run_dir, _until(release))
+    paths = Daemon(p.base)._slot_paths("board")
+    try:
+        keeper = hold.read(run_dir)["keeper"]
+        # A daemon restart: the keeper is no child of the daemon, and a new daemon leaves it be.
+        d = Daemon(p.base)
+        d.tend_holds()
+        assert hold.read(run_dir)["keeper"] == keeper and not locks.any_free(paths)
+        assert not d._resources_free(other)
+        # The keeper dies (`ttp stop --kill`, a crash) while the job runs: the next tend takes the board again.
+        os.killpg(keeper, signal.SIGKILL)
+        assert _until_true(lambda: locks.any_free(paths))
+        d = Daemon(p.base)
+        d.tend_holds()
+        rec = hold.read(run_dir)
+        assert rec["state"] == "holding" and rec["keeper"] != keeper and rec["rebuilt"] == 1
+        assert not locks.any_free(paths), "a dead keeper's hold was not rebuilt from the detach state"
+        assert p.db.one("SELECT 1 FROM events WHERE kind='hold_rebuilt'")
+        assert not d._resources_free(other)
+    finally:
+        release.touch()
+    assert _until_true(lambda: locks.any_free(paths)), "the rebuilt hold outlived the job"
+    # A keeper gone with its jobs (a reboot) is released on the next tend, not rebuilt.
+    run_dir2 = p.runs / "45"
+    _exclusive_run_detaching(p, mine["id"], 45, run_dir2, ["sleep", "600"])
+    rec = hold.read(run_dir2)
+    os.killpg(rec["keeper"], signal.SIGKILL)
+    os.killpg(json.loads((run_dir2 / "detached.json").read_text())[0]["pid"], signal.SIGKILL)
+    assert _until_true(lambda: locks.any_free(paths))
+    assert _until_true(lambda: locks.job_ended(pathlib.Path(rec["jobs"][0])))
+    Daemon(p.base).tend_holds()
+    assert hold.read(run_dir2)["state"] == "released" and locks.any_free(paths)
+    assert "while no keeper ran" in p.db.one("SELECT text FROM events WHERE kind='hold_released' "
+                                             "ORDER BY id DESC LIMIT 1")["text"]
+
+
+def test_a_later_run_of_the_same_task_takes_over_the_hold_its_detached_job_keeps(env, tmp_path):
+    p = make(env)
+    from ttp import hold, locks
+    from ttp.daemon import Daemon
+    mine = _board_task(p, "flash")
+    run_dir, release = p.runs / "46", tmp_path / "release"
+    _exclusive_run_detaching(p, mine["id"], 46, run_dir, _until(release))
+    d = Daemon(p.base)
+    paths = d._slot_paths("board")
+    try:
+        assert not locks.any_free(paths)
+        assert d._resources_free(mine), "a task was kept out by the hold kept for its own job"
+        # Its next run takes the board over; the job still runs when that run ends, so the hold goes on.
+        _exclusive_run_detaching(p, mine["id"], 47, p.runs / "47", ["true"])
+        assert hold.read(run_dir)["state"] == "handed_over"
+        rec = hold.read(p.runs / "47")
+        assert rec["state"] == "holding" and str((run_dir / "job.rc").resolve()) in rec["jobs"]
+        assert not locks.any_free(paths), "the board lapsed between the two runs of the task"
+    finally:
+        release.touch()
+    assert _until_true(lambda: locks.any_free(paths)), "the handed-over hold outlived the earlier run's job"
+
+
 def test_a_stale_reservation_never_wedges_the_resource(env):
     p = make(env)
     from ttp import locks

@@ -97,6 +97,23 @@ def holders(paths: list[Path]) -> list[str]:
     return out
 
 
+def held_labels(paths: list[Path]) -> list[str]:
+    """The holder labels of the slots among paths whose lock is taken right now."""
+    out = []
+    for path in paths:
+        try:
+            with open(path) as f:
+                try:
+                    fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                    continue
+                except OSError:
+                    pass
+            out.append(str(json.loads(path.read_text() or "{}").get("holder") or ""))
+        except (OSError, ValueError, AttributeError):
+            continue
+    return out
+
+
 def held(locks_dir: Path) -> list[str]:
     """Who holds each resource right now, and who has one reserved: "device: task #3 (run 9) since
     10:02". A slot file keeps its label after release, so only slots whose lock is taken count;

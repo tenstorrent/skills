@@ -1533,7 +1533,8 @@ def cmd_detach(a) -> None:
     Output goes to $TTP_RUN_DIR/<name>.log and the exit code to $TTP_RUN_DIR/<name>.rc once it
     ends. Hand off `waiting` with the retry_when it prints, `ttp detach --check <rc path>`: it exits 0
     once the job wrote its .rc, or once its process is gone without one (a kill, a reboot), else 1.
-    A run that ends without a hand-off after a detach is also brought back as waiting on its jobs."""
+    A run that ends without a hand-off after a detach is also brought back as waiting on its jobs. The
+    resources an `exclusive:` task holds for its whole run stay held until its jobs end (hold.py)."""
     from . import locks as lk
     from .push import _own_ttp
     if a.check:

@@ -21,7 +21,8 @@
   starts runs niced too, and records the level the child ran at in exit.json (`nice`);
 - holds a slot of each resource an `exclusive:` task names from before the child starts until it
   has ended, the same locks `ttp lock` takes per command; the wait for them has its own bound
-  (exclusive_wait_s), and the wall-clock limit starts once they are held;
+  (exclusive_wait_s), and the wall-clock limit starts once they are held. While a job the agent
+  detached still runs, a keeper holds them on until it ends (hold.py);
 - extends the wall-clock limit by the time the agent's `ttp lock` commands spent waiting, so work
   queued behind a shared device is not cut off for the queue; at most by the limit itself, since a
   wait in the background (or with --timeout 0) must not lift the only spend bound of providers
@@ -175,7 +176,9 @@ def supervise(run_dir: Path) -> int:
     _touch(lease)
     started = time.time()
     wait_s = min(float(spec.get("exclusive_wait_s") or 600), timeout_s)
-    held = _take_exclusive(run_dir, spec.get("exclusive") or [], spec.get("env", {}), started + wait_s)
+    inherited: list[str] = []
+    held = _take_exclusive(run_dir, spec.get("exclusive") or [], spec.get("env", {}), started + wait_s,
+                           spec.get("holds"), inherited)
     if held is None:
         remove_files(spec.get("private_files") or [])
         remove_tmp(run_dir, spec)
@@ -253,6 +256,13 @@ def supervise(run_dir: Path) -> int:
     ended, mono_end, up = time.time(), time.monotonic(), awake.tick()
     remove_files(spec.get("private_files") or [])
     remove_tmp(run_dir, spec)
+    if held:
+        # A job the agent detached may still use the resources: a keeper takes the open slots over.
+        try:
+            from . import hold
+            hold.keep(run_dir, spec, held, spec.get("exclusive") or [], inherited)
+        except Exception as e:
+            print(f"runner: could not keep the run's resources for its detached jobs: {e}", flush=True)
     for f in (prompt, out, err, *held):
         f.close()
     exit_info = {"rc": rc, "started": started, "ended": ended, "stopped": reason[0] if reason else None,
@@ -368,15 +378,17 @@ class ProgressWatch:
         return True
 
 
-def _take_exclusive(run_dir: Path, wanted: list[dict], env: dict, deadline: float) -> list | None:
+def _take_exclusive(run_dir: Path, wanted: list[dict], env: dict, deadline: float, holds: str | None = None,
+                    inherited: list | None = None) -> list | None:
     """One slot of each resource, waiting while `ttp lock` commands hold them all. The daemon starts
     an exclusive task only when a slot is free, so a wait here is a race it lost; the resource stays
-    reserved while it waits, so new `ttp lock` commands let it in. The wait ends at the deadline or
-    on a stop; None when it ended without the slots."""
-    from . import locks
+    reserved while it waits, so new `ttp lock` commands let it in. A slot an earlier run of the same
+    task keeps for its detached jobs (hold.py) is handed over, and those jobs go to `inherited`. The
+    wait ends at the deadline or on a stop; None when it ended without the slots."""
+    from . import hold, locks
     task = f"task #{env.get('TTP_TASK') or '?'}"
     who = f"{task} (run {env.get('TTP_RUN_ID') or '?'}), whole run"
-    held, told = [], 0.0
+    held, told, asked = [], 0.0, set()
     for res in wanted:
         paths = [Path(x) for x in res["paths"]]
         mark = Path(res["reserve"]) if res.get("reserve") else None
@@ -391,6 +403,10 @@ def _take_exclusive(run_dir: Path, wanted: list[dict], env: dict, deadline: floa
                 if mark:
                     locks.unreserve(mark, mine)
                 break
+            if inherited is not None and res["resource"] not in asked:
+                asked.add(res["resource"])
+                inherited += [j for j in hold.take_over(holds, mine, res["resource"], str(env.get("TTP_RUN_ID") or "?"))
+                              if j not in inherited]
             if stop_reason(run_dir) or time.time() > deadline:
                 for h in held:
                     h.close()

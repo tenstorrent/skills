@@ -137,7 +137,7 @@ def _resource_line(task: dict) -> str:
         out += (f"shared resources: {', '.join(shared)}; run each command that touches one as "
                 f"`ttp lock <name> -- <command>` (or through its own queue)\n")
     if held:
-        out += f"held for this whole run: {', '.join(held)}\n"
+        out += f"held for this whole run (and on while a job you `ttp detach` runs): {', '.join(held)}\n"
     return out
 
 

@@ -36,6 +36,7 @@ from . import coordinator as coord
 from . import coordcheck
 from . import effort
 from . import ends
+from . import hold
 from . import integrity
 from . import jevuse
 from . import localspend
@@ -483,7 +484,7 @@ class Daemon:
         for step in (self.reap_runs, self.wake_after_reboot, self.meter_running, self.reconcile_tasks, self.tend_pushes,
                      self.prune_worktrees, self.backup_branches, self.check_local_only, self.check_disk,
                      self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_integrity,
-                     self.sync_schedules, self.lint_charter):
+                     self.sync_schedules, self.lint_charter, self.tend_holds):
             step()
             self._progress()
         self._idle.update(self.cfg, self._has_work)
@@ -520,6 +521,25 @@ class Daemon:
         scr.settle_jev(self.p.db, now)
         for use, s in jevuse.review(self.p.db, self.cfg, now):
             self.alert(f"jev-off:{use}", jevuse.off_text(use, s, self.cfg), severity="low", every_s=0)
+
+    def tend_holds(self) -> None:
+        """Log each whole-run hold kept for detached jobs once it ends, and rebuild one whose keeper
+        died while its jobs still run (hold.tend)."""
+        try:
+            changed = hold.tend(self.p.state / "holds")
+        except Exception:
+            log(self.p, "detached-job holds: tending failed\n" + traceback.format_exc())
+            return
+        for rec in changed:
+            res = ", ".join(str(r.get("resource")) for r in rec.get("resources") or [])
+            what = (f"kept again for its detached jobs: its keeper had died (keeper pid {rec.get('keeper')})"
+                    if rec["state"] == "rebuilt" else rec.get("why") or rec["state"])
+            text = f"run {rec.get('run')} of task #{rec.get('task')}: {res} {what}"
+            log(self.p, f"hold: {text}")
+            task = int(rec["task"]) if str(rec.get("task") or "").isdigit() else None
+            self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                        (time.time(), "daemon", f"hold_{rec['state']}", "normal" if rec["state"] == "lost" else "low",
+                         text[:500], "handled", task))
 
     def retire_ended(self) -> None:
         """Retire memory entries and charter sections whose end condition passed (see ends)."""
@@ -872,6 +892,7 @@ class Daemon:
                                    "holder": shared.holder(self.p, res, f"task #{task['id']}", self.cfg)}
                                   for res in _exclusive(task)] if task else [],
                     "exclusive_wait_s": self.cfg["budget"].get("exclusive_wait_s", 600),
+                    "holds": str(self.p.state / "holds"),   # where a hold kept for detached jobs is registered
                     "private_files": private, "tmp_dir": tmp_env.get("TMPDIR"),
                     # Workers and reviewers run niced, and all they start with them; the coordinator not.
                     "nice": nice_level(self.cfg.get("runner"))[0] if role != "coordinator" else 0}
@@ -3448,9 +3469,13 @@ class Daemon:
             busy = sum(1 for t in running if lock in _locks_of(_exclusive(t)))
             if busy >= limit:
                 return False
-            if not locks.any_free(self._slot_paths(res)):
+            paths = self._slot_paths(res)
+            if not locks.any_free(paths):
+                mine = shared.holder(self.p, res, f"task #{task['id']}", self.cfg)
+                if any(hold.own_keeper(lb, mine) for lb in locks.held_labels(paths)):
+                    continue   # kept for this task's own detached jobs: its run takes the slot over
                 if reserve:
-                    locks.reserve(self._reserve_path(res), shared.holder(self.p, res, f"task #{task['id']}", self.cfg))
+                    locks.reserve(self._reserve_path(res), mine)
                 return False
         return True
 
