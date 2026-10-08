@@ -28337,11 +28337,12 @@ def test_a_run_that_leaves_the_project_root_off_its_branch_or_newly_dirty_alerts
     d.clear_root_checkout(force=True)
     d.check_root_checkout(row, json.loads(row["note"])["root"])
     assert len(alerts(f"root-checkout:{racer}")) == 1 and not resolved(f"root-checkout:{racer}")
-    # Throttled between sweeps; back on its branch, the next sweep clears it.
+    # A later run that puts the root back is no fault of its own, and the next sweep clears the alert.
+    fixer = p.db.add_task("fixer", "s", kind="work", tier="light", origin="user")
+    row = _root_run(p, d, fixer)
     _git_out(repo, "checkout", "-q", base)
-    d.sweep_alerts()
-    assert not resolved(f"root-checkout:{racer}"), "checked at most every ROOT_RECHECK_S"
-    d._root_checked = 0.0
+    _end_run(p, d, row)
+    assert not alerts(f"root-checkout:{fixer}")
     d.sweep_alerts()
     assert len(resolved(f"root-checkout:{racer}")) == 1 and not p.db.kv(dm.ROOT_CHECKOUT_KEY)
 
@@ -28354,10 +28355,22 @@ def test_a_run_that_leaves_the_project_root_off_its_branch_or_newly_dirty_alerts
     got = alerts(f"root-checkout:{messy}")
     assert len(got) == 1 and "README.md" in got[0]["text"] and "scratch.txt" not in got[0]["text"]
     assert "instead of" not in got[0]["text"], "still on its branch"
-    # Survives a daemon restart, and clears once the path is clean.
+    # Survives a daemon restart, and clears once the path is clean, looked at every ROOT_RECHECK_S.
     d2 = dm.Daemon(p.base)
     d2.clear_root_checkout(force=True)
     assert not resolved(f"root-checkout:{messy}")
     _git_out(repo, "checkout", "README.md")
-    d2.clear_root_checkout(force=True)
+    d2.sweep_alerts()
+    assert not resolved(f"root-checkout:{messy}"), "checked at most every ROOT_RECHECK_S"
+    d2._root_checked = 0.0
+    d2.sweep_alerts()
     assert len(resolved(f"root-checkout:{messy}")) == 1 and not p.db.kv(dm.ROOT_CHECKOUT_KEY)
+    # A run that moves the root onto the project's base branch is no fault either.
+    p.set_config("delivery.base_ref", base)
+    d = dm.Daemon(p.base)
+    _git_out(repo, "checkout", "-q", "-b", "side")
+    homing = p.db.add_task("homing", "s", kind="work", tier="light", origin="user")
+    row = _root_run(p, d, homing)
+    _git_out(repo, "checkout", "-q", base)
+    _end_run(p, d, row)
+    assert not alerts(f"root-checkout:{homing}") and not p.db.kv(dm.ROOT_CHECKOUT_KEY)

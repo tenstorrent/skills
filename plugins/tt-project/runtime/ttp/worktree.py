@@ -72,6 +72,11 @@ def base_ref(p: Project) -> str:
     origin/<name> when the remote has it (a local branch of that name may be behind; ensure()
     fetches first), else the local name; the remote's default branch (origin/HEAD); the
     checked-out branch."""
+    return named_base(p) or _git(p.root, "rev-parse", "--abbrev-ref", "HEAD")
+
+
+def named_base(p: Project) -> str:
+    """base_ref without its last fallback (the checked-out branch): "" when nothing names a base."""
     d = p.config().get("delivery") or {}
     if d.get("base_ref"):
         return d["base_ref"]
@@ -79,8 +84,7 @@ def base_ref(p: Project) -> str:
         for cand in (f"origin/{ref}", ref) if ref else ():
             if _has(p, cand):
                 return cand
-    head = _git(p.root, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD", check=False)
-    return head or _git(p.root, "rev-parse", "--abbrev-ref", "HEAD")
+    return _git(p.root, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD", check=False)
 
 
 def ensure(p: Project, task: dict) -> tuple[Path, str]:

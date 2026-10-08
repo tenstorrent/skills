@@ -599,14 +599,22 @@ class Daemon:
         now_at = worktree.checkout_state(self.p.root)
         if not now_at:
             return
+        db = self.p.db
+        seen = db.kv(ROOT_CHECKOUT_KEY, {}) or {}
+        if seen:
+            self._root_checked = 0.0   # the next sweep sees at once whether this run put it back
         was, now = before.get("branch") or before.get("head"), now_at["branch"] or now_at["head"]
-        off = bool(was) and now != was
+        # Moving the root back to the base branch, or to where an open alert wants it, is no fault.
+        try:
+            home = {worktree.named_base(self.p).removeprefix("origin/")} - {""}
+        except Exception:
+            home = set()
+        home |= {i.get("branch") for i in seen.values() if i.get("branch")}
+        off = bool(was) and now != was and now not in home
         new = (sorted(set(now_at["dirty"]) - set(before["dirty"]))
                if before.get("dirty") is not None and now_at["dirty"] is not None else [])
         if not off and not new:
             return
-        db = self.p.db
-        seen = db.kv(ROOT_CHECKOUT_KEY, {}) or {}
         tid = str(r["task"])
         if tid in seen:
             return
