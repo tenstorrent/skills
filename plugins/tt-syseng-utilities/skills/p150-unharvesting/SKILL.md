@@ -108,14 +108,14 @@ if [ -e "$OUT" ]; then
 else
   tt-update-tensix-disable-count --input "$IN" --output "$OUT" \
     --board P150A-1 --board P150B-1 --board P150C-1 \
-    --disable-count $N --verbose 2>&1 | tee "$L" > /dev/null \
-    || { echo "patch FAILED, see $L"; rm -f "$OUT"; }
+    --disable-count $N --verbose 2>&1 | tee "$L" > /dev/null; RC=$?; echo rc=$RC
+  [ $RC -eq 0 ] || { echo "patch FAILED, see $L"; rm -f "$OUT"; }
   grep -E 'Processing|Current|Updated|Verified|rror' "$L"
 fi
 python $SKILL_DIR/scripts/read_fwbundle_harvesting.py "$OUT"
 ```
 
-- Patch failed: stop.
+- `rc` not 0: stop.
 - `$OUT` existed: flash only if reader shows count `N`.
 - No `--board`: patches every board, not only P150.
 - Per board expect `Current` -> `Updated ... N` -> `Verified ... N`.
