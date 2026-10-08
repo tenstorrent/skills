@@ -277,6 +277,11 @@ account out of funds or quota, unrecoverable outage, restriction at risk. Everyt
   5. only then, with no commits pushed since, a worker runs `gh pr ready`. A spec that tells a worker to take a PR out of draft is
      rejected until step 4 is on record. Workers' `gh` refuses `gh pr ready` and non-draft PRs
      without it; a worker it refused hands off blocked with the PR's URL: ask the user (step 3).
+- Nothing in the harness ever puts a PR back in draft or changes its reviewers: the user may share
+  its GitHub account, and their own actions there win. A PR that leaves draft with no run's gh call
+  behind it is recorded as the user's approval (a `pr_ready_by_user` feed line; nothing to do). A
+  `pr_unapproved_ready` event means a run's gh marked it ready or requested reviewers without
+  approval: find out how that run got around the guard; leave the PR's draft state to the user.
 - Only a yes that came in on Slack counts (it is checked against Slack); `pr_approve` refuses one
   from the web app or `ttp say`, so then ask again on Slack. The ask is checked against Slack too:
   one that never reached Slack cannot back an approval, so ask again. Without Slack DMs no approval

@@ -31,6 +31,11 @@ An ask that never reached Slack cannot back an approval.
 
 Claude Code workers also get a PreToolUse hook (hook.py) that denies the obvious ways around this
 wrapper: gh called by its full path, or curl and the like talking to the GitHub API about drafts.
+
+Inside a run the wrapper appends each call that marks a PR ready or requests human reviewers, run or
+refused, to GH_LOG in the project's state. The user and the harness may share one GitHub account, so
+GitHub cannot say who took a PR out of draft: pr-watch (watchers.py) reads this log instead. It never
+puts a PR back in draft or touches its reviewers.
 """
 from __future__ import annotations
 
@@ -56,12 +61,15 @@ APPROVING_REASONS = ("review", "merge")
 # cli-legacy: `ttp say` writing the database itself; system: the harness.
 PROVENANCES = ("slack", "web", "web-session", "cli-peer", "cli-legacy", "system")
 APPROVING = ("slack", "web-session", "cli-peer")
-# The pr-watch watcher (watchers.py) flags PRs out of draft with no approval record and puts
-# them back in draft:
-UNAPPROVED_KEY = "pr_ready_unapproved"     # kv: {"owner/repo#N": {"task": id, "url": u, "since": t, "seen": t}}
+# The pr-watch watcher (watchers.py) flags PRs a run took out of draft with no approval record
+# (GH_LOG names the run); one the runs did not touch is recorded as the user's own approval (GITHUB):
+UNAPPROVED_KEY = "pr_ready_unapproved"     # kv: {"owner/repo#N": {"task": id, "url": u, "run": r, "since": t, "seen": t}}
 UNAPPROVED_ALERT = "pr-ready"              # alert key "pr-ready:owner/repo#N", held while flagged
 PREDATES_KEY = "pr_ready_predates_guard"   # kv: PR URLs already out of draft when the check first ran
-UNDONE_KEY = "pr_ready_undone"             # kv: {"owner/repo#N": t}, when pr-watch last put it back in draft
+DRAFT_SEEN_KEY = "pr_draft_seen"           # kv: {"owner/repo#N": t}, when pr-watch last saw it in draft
+GH_LOG = "gh-guard.jsonl"   # in the project's state dir: {"ts", "run", "task", "action": "ready" | "reviewers",
+#                             "prs": [keys], "refused": b, "rc": n | None, "cmd": text}, one line per call
+GITHUB = "github"           # an approval's channel when the user took the PR out of draft on GitHub
 # The pr-watch watcher records each open PR's open findings (failing CI, bot review comments not
 # fixed or answered); a review or merge ask for a PR waits until they are cleared.
 FINDINGS_KEY = "pr_findings"   # kv: {"owner/repo#N": {"task": id, "url": u, "failing": [..], "pending": b,
@@ -334,6 +342,57 @@ def drop_spent(db, key: str) -> None:
             db.set_kv(APPROVALS_KEY, rec)
 
 
+def approve_from_github(db, key: str, head: str | None, now: float | None = None) -> None:
+    """Record that the user took `key` out of draft on GitHub themselves: no run's gh call did. It is
+    the record pr_approve writes, already spent (the PR has left draft with it), so a run still may
+    not mark it ready with it, and it goes once the PR is back in draft."""
+    now = now or time.time()
+    with db.tx():
+        rec = db.kv(APPROVALS_KEY, {}) or {}
+        rec[key] = {"source": None, "answer": None, "said": "taken out of draft on GitHub, not by a run",
+                    "quote": "", "head": head, "ts": now, "spent": now, "channel": GITHUB, "external_id": None}
+        db.set_kv(APPROVALS_KEY, rec)
+
+
+def gh_log_path(state_dir) -> Path:
+    return Path(state_dir) / GH_LOG
+
+
+def log_call(state_dir, seen: list, args: list[str], refused: bool, rc: int | None = None) -> None:
+    """Append a run's attempts to mark a PR ready or request human reviewers to GH_LOG. Never raises:
+    the log is evidence for pr-watch, not a gate."""
+    run = os.environ.get("TTP_RUN_ID")
+    if not seen or not run:
+        return
+    try:
+        cmd = shlex.join(args)[:300]
+        with open(gh_log_path(state_dir), "a") as f:
+            for action, prs in seen:
+                f.write(json.dumps({"ts": time.time(), "run": run, "task": os.environ.get("TTP_TASK") or None,
+                                    "action": action, "prs": prs, "refused": refused, "rc": rc, "cmd": cmd}) + "\n")
+    except (OSError, ValueError):
+        pass
+
+
+def worker_calls(state_dir, key: str, since: float) -> list[dict]:
+    """Runs' gh calls since `since` that marked `key` ready or requested reviewers on it, run or
+    refused, newest last. A call whose PR could not be identified counts for every PR."""
+    try:
+        lines = gh_log_path(state_dir).read_text(errors="replace").splitlines()
+    except OSError:
+        return []
+    out = []
+    for line in lines:
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(rec, dict) and float(rec.get("ts") or 0) >= since \
+                and (key in (rec.get("prs") or []) or not rec.get("prs")):
+            out.append(rec)
+    return out
+
+
 def findings_problem(db, text: str) -> str | None:
     """Why the user may not be asked to review a PR that `text` names yet: pr-watch saw failing or
     pending CI, or bot review comments neither fixed nor answered. None when it may."""
@@ -495,8 +554,11 @@ def _sha(text: str) -> str | None:
     return m.group(0) if m else None
 
 
-def _refuse_ready(prs: set[str], db, what: str, allowed: set | None, heads: dict) -> str | None:
-    """`heads`: each PR's head commit now, as gh reports it."""
+def _refuse_ready(prs: set[str], db, what: str, allowed: set | None, heads: dict,
+                  seen: list | None = None) -> str | None:
+    """`heads`: each PR's head commit now, as gh reports it. The attempt is noted in `seen`."""
+    if seen is not None:
+        seen.append(("ready", sorted(prs)))
     if not prs:
         return (f"refused: {what}, and the PR could not be identified to check for the user's approval. "
                 f"{HOW} {HANDOFF}")
@@ -544,10 +606,17 @@ def _checks_problem(cwd: str | None = None) -> str | None:
     return None
 
 
+def _no_reviewers(seen: list | None, text: str) -> str:
+    if seen is not None:
+        seen.append(("reviewers", sorted(pr_keys(text))))
+    return NO_REVIEWERS
+
+
 def check(args: list[str], real: str, db=None, stdin_text: str | None = None, _depth: int = 0,
-          allowed: set | None = None) -> str | None:
+          allowed: set | None = None, seen: list | None = None) -> str | None:
     """Why `gh <args>` must not run, or None when it may. `real` is the real gh (to look PRs up).
-    PRs it lets out of draft on their approval are added to `allowed`, to spend once it ran."""
+    PRs it lets out of draft on their approval are added to `allowed`, to spend once it ran. Each
+    attempt to mark a PR ready or request human reviewers is added to `seen` as (action, PR keys)."""
     if not args:
         return None
     cmd, rest = args[0], args[1:]
@@ -559,12 +628,12 @@ def check(args: list[str], real: str, db=None, stdin_text: str | None = None, _d
                 if re.search(r"\bpr\s+(ready|create)\b|\bapi\b|markPullRequestReadyForReview|draft|reviewer", text):
                     return f"refused: the gh alias {cmd!r} runs a shell command that may change a PR's draft state"
                 return None
-            return check(_expand(expansion, rest), real, db, stdin_text, _depth + 1, allowed)
+            return check(_expand(expansion, rest), real, db, stdin_text, _depth + 1, allowed, seen)
     if cmd == "pr" and rest:
         sub, more = rest[0], rest[1:]
         if sub == "create":
             if _humans(_opts(more, ("--reviewer",)) + _short_reviewers(more)):
-                return NO_REVIEWERS
+                return _no_reviewers(seen, "")
             if "--dry-run" in more:
                 return None
             if any(a in ("-d", "--draft", "--draft=true") for a in more):
@@ -580,11 +649,11 @@ def check(args: list[str], real: str, db=None, stdin_text: str | None = None, _d
             out = _gh(real, *view)
             key = pr_key(out)
             return _refuse_ready({key} if key else set(), db, "marking a PR ready for review", allowed,
-                                 {key: _sha(out)} if key else {})
+                                 {key: _sha(out)} if key else {}, seen)
         if sub == "edit" and _humans(_opts(more, ("--add-reviewer",))):
-            return NO_REVIEWERS
+            return _no_reviewers(seen, " ".join(more))
     if cmd == "api":
-        return _check_api(rest, real, db, stdin_text, allowed)
+        return _check_api(rest, real, db, stdin_text, allowed, seen)
     return None
 
 
@@ -610,7 +679,8 @@ def _expand(expansion: str, rest: list[str]) -> list[str]:
     return parts + [a for i, a in enumerate(rest) if i not in used]
 
 
-def _check_api(args: list[str], real: str, db, stdin_text: str | None, allowed: set | None) -> str | None:
+def _check_api(args: list[str], real: str, db, stdin_text: str | None, allowed: set | None,
+               seen: list | None = None) -> str | None:
     fields = _opts(args, ("-f", "-F", "--field", "--raw-field"))
     inputs = _opts(args, ("--input",))
     body = ""
@@ -641,9 +711,10 @@ def _check_api(args: list[str], real: str, db, stdin_text: str | None, allowed: 
     draft_false = bool(re.search(r"(^|\s)draft=false\b|[\"']draft[\"']\s*:\s*false", text, re.I))
     draft_true = bool(re.search(r"(^|\s)draft=true\b|[\"']draft[\"']\s*:\s*true|\bdraft\s*:\s*true", text, re.I))
     if endpoint == "graphql" and re.search(r"\brequestReviews", text):
-        return NO_REVIEWERS
+        return _no_reviewers(seen, text)
     if REVIEWERS_REST_RE.match(endpoint) and method == "POST" and _reviewer_humans(fields, body):
-        return NO_REVIEWERS
+        m = REST_PR_RE.match(endpoint.rsplit("/requested_reviewers", 1)[0])
+        return _no_reviewers(seen, f"{m.group(1)}/{m.group(2)}#{m.group(3)}" if m else "")
     if endpoint == "graphql":
         if re.search(r"markPullRequestReadyForReview", text):
             prs, heads = set(), {}
@@ -655,7 +726,7 @@ def _check_api(args: list[str], real: str, db, stdin_text: str | None, allowed: 
                 if key:
                     prs.add(key)
                     heads[key] = _sha(out)
-            return _refuse_ready(prs, db, "marking a PR ready for review", allowed, heads)
+            return _refuse_ready(prs, db, "marking a PR ready for review", allowed, heads, seen)
         if re.search(r"\bcreatePullRequest\b", text):
             if not draft_true:
                 return "refused: PRs are opened as drafts only; pass draft: true to createPullRequest. " + HOW
@@ -677,7 +748,7 @@ def _check_api(args: list[str], real: str, db, stdin_text: str | None, allowed: 
         key = f"{owner}/{repo}#{int(number)}".lower()
         host = [x for h in _opts(args, ("--hostname",))[-1:] for x in ("--hostname", h)]
         head = _sha(_gh(real, "api", *host, f"repos/{owner}/{repo}/pulls/{number}", "-q", ".head.sha"))
-        return _refuse_ready({key}, db, "setting draft=false on a PR", allowed, {key: head})
+        return _refuse_ready({key}, db, "setting draft=false on a PR", allowed, {key: head}, seen)
     return None
 
 
@@ -726,19 +797,25 @@ def main(argv: list[str], own_dir: str) -> int:
     if args[:1] == ["api"] and ("-" in _opts(args, ("--input",))
                                 or any(f.endswith("=@-") for f in _opts(args, ("-F", "--field")))):
         stdin_text = sys.stdin.read()
-    db, allowed = None, set()
+    db, allowed, seen = None, set(), []
     try:
         db = _project_db()
-        why = check(args, real, db, stdin_text, allowed=allowed)
+        why = check(args, real, db, stdin_text, allowed=allowed, seen=seen)
     except Exception as e:   # fails closed only for the calls it guards
         guarded = args[:2] in (["pr", "ready"], ["pr", "create"]) or args[:1] == ["api"]
         why = f"refused: the PR draft guard failed ({e})" if guarded else None
+        if args[:2] == ["pr", "ready"] and "--undo" not in args:
+            seen.append(("ready", sorted(pr_keys(" ".join(args)))))
+    state = Path(db.path).parent if db is not None else None
     if why:
+        if state is not None:
+            log_call(state, seen, args, refused=True)
         print(f"gh (tt-project): {why}", file=sys.stderr)
         return 1
     if allowed and db is not None:
         # The approval is spent once the PR has left draft with it.
         rc = subprocess.run([real, *args], input=stdin_text, text=True).returncode
+        log_call(state, seen, args, refused=False, rc=rc)
         if rc == 0:
             spend(db, allowed)
         return rc
