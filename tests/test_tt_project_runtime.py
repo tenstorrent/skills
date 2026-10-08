@@ -22850,6 +22850,123 @@ def test_ttp_checks_logs_skipped_checks_and_fails_when_none_apply(env, tmp_path,
 SCOPED = {"run": "sh fail.sh", "if_changed": ["src/**", "fail.sh"]}
 
 
+def _venv_repo(tmp_path, name="work", pytest_too=True):
+    """A git repo with a .venv whose python records how it was called (a stand-in for a real venv)."""
+    repo = tmp_path / name
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    git = ["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=t"]
+    (repo / ".gitignore").write_text(".venv/\n")
+    (repo / "mypkg").mkdir()
+    (repo / "mypkg" / "__init__.py").write_text("")
+    subprocess.run([*git, "add", "."], check=True)
+    subprocess.run([*git, "commit", "-qm", "a"], check=True)
+    bin_ = repo / ".venv" / "bin"
+    bin_.mkdir(parents=True)
+    py = bin_ / "python"
+    py.write_text(f'#!/bin/sh\necho "$@" >> {tmp_path / "venv-ran"}\n')
+    py.chmod(0o755)
+    if pytest_too:
+        (bin_ / "pytest").write_text("#!/bin/sh\n")
+    return repo, py
+
+
+def test_check_commands_run_bare_pytest_with_the_repositorys_venv(tmp_path):
+    from ttp import push
+    repo, py = _venv_repo(tmp_path)
+    q = shlex.quote(str(py))
+    assert push.venv_cmd("pytest -q", repo) == f"{q} -m pytest -q"
+    assert push.venv_cmd("python3 -m pytest -q tests/a.py", repo) == f"{q} -m pytest -q tests/a.py"
+    assert push.venv_cmd("FOO=1 py.test -x && ruff check", repo) == f"FOO=1 {q} -m pytest -x && ruff check"
+    assert push.venv_cmd("cd sub && pytest", repo) == f"cd sub && {q} -m pytest"
+    for other in ("make test", "echo pytest", "pytest-benchmark run", "python3 tools/x.py"):
+        assert push.venv_cmd(other, repo) == other
+    # A linked worktree has no copy of the ignored venv: the main checkout's is used.
+    wt = tmp_path / "wt"
+    subprocess.run(["git", "-C", str(repo), "worktree", "add", "-q", "-b", "x", str(wt)], check=True)
+    assert push.venv_cmd("pytest -q", wt) == f"{q} -m pytest -q"
+    # No venv, or one without pytest: the command stays as written.
+    bare, _ = _venv_repo(tmp_path, "nopytest", pytest_too=False)
+    assert push.venv_cmd("pytest -q", bare) == "pytest -q"
+    plain = tmp_path / "plain"
+    subprocess.run(["git", "init", "-q", str(plain)], check=True)
+    assert push.venv_cmd("pytest -q", plain) == "pytest -q"
+    assert push.check_argv("pytest -q")[-1] == "pytest -q"   # without a worktree: as written
+
+
+def test_ttp_checks_runs_a_bare_pytest_with_the_venv(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli
+    p = make(env)
+    repo, _ = _venv_repo(tmp_path)
+    run = tmp_path / "run"
+    run.mkdir()
+    monkeypatch.setenv("TTP_RUN_DIR", str(run))
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.chdir(repo)
+    cli.main(["checks", "--", "pytest -q"])
+    assert (tmp_path / "venv-ran").read_text().split() == ["-m", "pytest", "-q"]
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and rec["commands"] == ["pytest -q"]   # recorded as written
+
+
+CONFTEST_FAIL = ("ImportError while loading conftest '/w/tests/conftest.py'.\n"
+                 "tests/conftest.py:3: in <module>\n    import {mod}\n"
+                 "E   ModuleNotFoundError: No module named '{mod}'\n")
+
+
+def test_env_problem_tells_missing_dependencies_from_code_failures(tmp_path):
+    from ttp import push
+    repo, _ = _venv_repo(tmp_path)
+    why = push.env_problem(CONFTEST_FAIL.format(mod="numpy"), repo)
+    assert why and "numpy" in why and push.ENV_FIX in why
+    collect = ("==== ERRORS ====\n___ ERROR collecting tests/test_a.py ___\nImportError while importing test "
+               "module '/w/tests/test_a.py'.\nE   ModuleNotFoundError: No module named 'yaml.loader'\n")
+    assert "yaml" in push.env_problem(collect, repo)
+    assert push.ENV_FIX in push.env_problem("/usr/bin/python3: No module named pytest\n", repo)
+    assert push.ENV_FIX in push.env_problem("bash: line 1: pytest: command not found\n", repo)
+    # The repository's own module failing to import is the head's code, as is any other failure.
+    assert push.env_problem(CONFTEST_FAIL.format(mod="mypkg.sub"), repo) is None
+    assert push.env_problem("E   AssertionError: 1 != 2\n1 failed in 0.1s\n", repo) is None
+    assert push.env_problem("No module named 'numpy'\n", repo) is None   # not a collection or import failure
+
+
+def test_ttp_checks_reports_an_import_time_failure_as_an_environment_problem(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli
+    p = make(env)
+    repo, _ = _venv_repo(tmp_path)
+    run = tmp_path / "run"
+    run.mkdir()
+    monkeypatch.setenv("TTP_RUN_DIR", str(run))
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.chdir(repo)
+    out = tmp_path / "out.txt"
+    out.write_text(CONFTEST_FAIL.format(mod="numpy"))
+    failing = f"cat {out}; exit 4"
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--", failing])
+    assert e.value.code == 1
+    err = capsys.readouterr().err
+    assert "environment problem, not the head's code" in err and "numpy" in err, err
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is False and "numpy" in rec["env_problem"] and "venv" in rec["env_problem"]
+    cli.main(["doctor", p.name])
+    said = capsys.readouterr().out
+    assert f"delivery.push_checks: {failing!r} failed at import" in said and "point delivery checks at a venv" in said
+    # A code failure is said as one, and clears doctor's line; so does a pass.
+    with pytest.raises(SystemExit):
+        cli.main(["checks", "--", "false"])
+    assert "environment problem" not in capsys.readouterr().err
+    assert "env_problem" not in json.loads((run / "checks.json").read_text())
+    cli.main(["doctor", p.name])
+    assert "failed at import" not in capsys.readouterr().out
+    with pytest.raises(SystemExit):
+        cli.main(["checks", "--", failing])
+    cli.main(["checks", "--", "true"])
+    cli.main(["doctor", p.name])
+    assert "failed at import" not in capsys.readouterr().out
+
+
+
 def test_if_changed_is_validated_kept_in_config_and_malformed_scopes_never_skip(env):
     from ttp import push
     from ttp.project import config_problems

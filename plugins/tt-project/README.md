@@ -322,6 +322,11 @@ and preferences you add later become part of the project's charter and memory.
   Leave them out with a pathspec: `git diff --check <base> HEAD -- . ':(exclude)*.log'`. Files
   that `.gitattributes` marks `-diff` or `binary` are skipped by git already. Checks stay as
   configured; `ttp doctor` names a `git diff --check` that does not leave out `*.log`.
+- A bare pytest in a check (`pytest`, `py.test`, `python3 -m pytest`) runs as
+  `<venv>/bin/python -m pytest` when the repository has a `.venv/` or `venv/` with pytest in it
+  (in the worktree, else in its main checkout). A check that fails at import because a package is
+  not installed is reported by `ttp checks` and `ttp doctor` as an environment problem, not as the
+  head's code: point the check at a venv.
 - `ttp checks -- <cmd>` adds a check. Several words run as that argv (`ttp checks -- pytest -q`);
   one quoted string runs through the shell (`ttp checks -- 'FOO=1 pytest -q && ruff check .'`).
 - In Claude Code workers and reviewers, a Bash call that runs one of the configured pytest checks

@@ -191,11 +191,84 @@ def outside_scope(checks: list[Check], skipped: list[str]) -> bool:
     return bool(checks) and len(skipped) == len(checks) and all(getattr(s, "scoped", False) for s in skipped)
 
 
-def check_argv(cmd: str) -> list[str]:
+def check_argv(cmd: str, top: str | Path | None = None) -> list[str]:
     """How a check command runs: first-failure semantics, so `a; b` fails when `a` fails and a
-    pipeline fails when any stage does (bash `-e -o pipefail`; plain `sh -e` where bash is missing)."""
+    pipeline fails when any stage does (bash `-e -o pipefail`; plain `sh -e` where bash is missing).
+    With `top` (the worktree it runs in), a bare pytest runs with the repository's venv (venv_cmd)."""
+    cmd = venv_cmd(cmd, top) if top else cmd
     bash = shutil.which("bash")
     return [bash, "-e", "-o", "pipefail", "-c", cmd] if bash else ["sh", "-e", "-c", cmd]
+
+
+VENV_DIRS = (".venv", "venv")
+# A pytest run at a command's start: after the line's start or a separator, and VAR=value words.
+_PYTEST_RUN = re.compile(r"(^|&&|\|\||[;|(\n])(\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*)"
+                         r"(?:pytest|py\.test|python3?\s+-m\s+pytest)(?=\s|$|[;&|)])")
+
+
+def venv_python(top: str | Path) -> Path | None:
+    """The python of the repository's venv (.venv/ or venv/, with pytest installed in it) in the
+    worktree `top`, else in its main checkout (a linked worktree has no copy of an ignored venv), or None."""
+    bases = [Path(top)]
+    r = subprocess.run(["git", "-C", str(top), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                       capture_output=True, text=True)
+    common = Path(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip() else None
+    if common and common.name == ".git" and common.parent not in bases:
+        bases.append(common.parent)
+    for base in bases:
+        for d in VENV_DIRS:
+            py, bin_ = base / d / "bin" / "python", base / d / "bin"
+            if os.access(py, os.X_OK) and (bin_ / "pytest").exists():
+                return py
+    return None
+
+
+def venv_cmd(cmd: str, top: str | Path) -> str:
+    """`cmd` with each bare pytest run (`pytest`, `py.test`, `python[3] -m pytest`) made
+    `<venv>/bin/python -m pytest` when the repository has a venv (venv_python); else `cmd` as it is.
+    A bare pytest otherwise runs with whatever python is on PATH, which may lack the repo's dependencies."""
+    if not _PYTEST_RUN.search(cmd):
+        return cmd
+    py = venv_python(top)
+    if not py:
+        return cmd
+    return _PYTEST_RUN.sub(lambda m: f"{m.group(1)}{m.group(2)}{shlex.quote(str(py))} -m pytest", cmd)
+
+
+ENV_FIX = "check command lacks dependencies: point delivery checks at a venv"
+_NO_MODULE = re.compile(r"(?:ModuleNotFoundError|ImportError): No module named '?([A-Za-z0-9_.]+)'?")
+_NO_PYTEST = re.compile(r"No module named '?pytest'?$|\bpy(?:test|\.test): (?:command )?not found", re.M)
+
+
+def env_problem(output: str, top: str | Path) -> str | None:
+    """Why a failed check failed at import for want of an installed package (an environment problem,
+    not the head's code), or None. Said for pytest itself missing, and for a conftest or test module
+    that could not be collected because a module the repository does not contain is not installed."""
+    if _NO_PYTEST.search(output):
+        return f"pytest is not installed for the python the check ran with; {ENV_FIX}"
+    if not re.search(r"ImportError while (?:loading conftest|importing test module)|^ERROR collecting|"
+                     r"^E\s+(?:ModuleNotFound|Import)Error", output, re.M):
+        return None
+    missing = []
+    for name in dict.fromkeys(m.group(1).split(".")[0] for m in _NO_MODULE.finditer(output)):
+        if not _in_repo(name, top):
+            missing.append(name)
+    if not missing:
+        return None
+    return f"{', '.join(missing)} not installed for the python the check ran with; {ENV_FIX}"
+
+
+def _in_repo(name: str, top: str | Path) -> bool:
+    """The repository has a module or package `name` (its own code, so a failed import is the head's)."""
+    r = _git(Path(top), "ls-files")
+    if r.returncode != 0:
+        return True   # cannot tell: not said to be the environment
+    for f in r.stdout.splitlines():
+        parts = f.split("/")
+        if name in parts[:-1] or parts[-1] in (f"{name}.py", f"{name}.pyi") or \
+                parts[-1].startswith(f"{name}.") and parts[-1].endswith((".so", ".pyd")):
+            return True
+    return False
 
 
 def check_env(mode: str, tip: str = "") -> dict[str, str]:
@@ -1405,7 +1478,7 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
         started = time.time()
         env = check_env("own", _existing_tip(repo, remote, branch) if todo else "")
         for cmd in todo:
-            if subprocess.run(check_argv(cmd), cwd=repo, env=env).returncode != 0:
+            if subprocess.run(check_argv(cmd, repo), cwd=repo, env=env).returncode != 0:
                 say(f"check failed on {head[:10]}: {cmd}; not pushing")
                 return CHECKS_FAILED
         if todo and timed:
@@ -1535,7 +1608,7 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
         started = time.time()
         env = check_env("target", tip)
         for cmd in todo:
-            if subprocess.run(check_argv(cmd), cwd=repo, env=env).returncode != 0:
+            if subprocess.run(check_argv(cmd, repo), cwd=repo, env=env).returncode != 0:
                 say(f"check failed on {head[:10]}: {cmd}; not pushing")
                 return CHECKS_FAILED
         if todo and timed:

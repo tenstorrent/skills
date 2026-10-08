@@ -857,7 +857,8 @@ class Batch:
         self.checks["runs"] += 1
         try:
             for cmd in todo:
-                rc, tail, _ = _stream(push.check_argv(cmd), self.wt, env=push.check_env("target", self.tip))
+                rc, tail, _ = _stream(push.check_argv(cmd, self.wt), self.wt,
+                                      env=push.check_env("target", self.tip))
                 if rc != 0:
                     say(f"check failed on {head[:10]}: {cmd}")
                     return cmd, tail

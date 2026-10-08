@@ -1075,6 +1075,37 @@ def _record_pass(p: Project | None, tree: str, cmds: list) -> None:
         print(f"ttp checks: could not record the pass in {path}: {e}", file=sys.stderr)
 
 
+CHECKS_ENV = "checks_env.json"   # under the project's state: the last check that failed at import, for doctor
+
+
+def _note_checks_env(p: Project | None, cmd: str | None, problem: str | None, head: str) -> None:
+    """Keep the last import-time failure of a check for `ttp doctor`; any other outcome clears it."""
+    if not p:
+        return
+    path = p.state / CHECKS_ENV
+    try:
+        if problem:
+            write_json(path, {"command": cmd, "problem": problem, "head": head,
+                              "run": os.environ.get("TTP_RUN_ID") or "?", "ts": time.time()})
+        else:
+            path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def checks_env_line(p: Project) -> str | None:
+    """`ttp doctor`'s line for a check that last failed at import (CHECKS_ENV), or None."""
+    try:
+        e = json.loads((p.state / CHECKS_ENV).read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(e, dict) or not e.get("problem"):
+        return None
+    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(e.get("ts") or 0)))
+    return (f"delivery.push_checks: {e.get('command')!r} failed at import in run {e.get('run') or '?'} at {when} "
+            f"(an environment problem, not the code): {e['problem']}")
+
+
 def cmd_checks(a) -> None:
     """(inside a run) Run the local checks on this worktree's commit and record the result in the
     run's directory: the harness's gh opens a PR (even a draft) only after they passed on HEAD. The
@@ -1158,7 +1189,7 @@ def cmd_checks(a) -> None:
             out.flush()
             # A detached run gives each check a group of its own, so a stop ends it with ttp checks.
             group = bool(getattr(a, "own_group", False))
-            proc = subprocess.Popen(push.check_argv(c), cwd=top, stdout=out, stderr=subprocess.STDOUT,
+            proc = subprocess.Popen(push.check_argv(c, top), cwd=top, stdout=out, stderr=subprocess.STDOUT,
                                     start_new_session=group, env={**push.check_env("checks"), "PWD": top})
             try:
                 rc = proc.wait()
@@ -1169,13 +1200,22 @@ def cmd_checks(a) -> None:
             if rc != 0:
                 passed, failed = False, c
                 break
+    env_problem = None
+    if not passed:
+        with open(log, "rb") as f:   # this call's part of the log
+            f.seek(start)
+            text = f.read().decode("utf-8", errors="replace")
+        env_problem = push.env_problem(text, top) if failed in todo else None
     write_json(Path(run_dir) / prguard.CHECKS_FILE, {"head": head, "worktree": top, "passed": passed,
-                                                     "commands": todo, "skipped": skipped, "ts": time.time()})
+                                                     "commands": todo, "skipped": skipped, "ts": time.time(),
+                                                     **({"env_problem": env_problem} if env_problem else {})})
+    _note_checks_env(p, str(failed) if env_problem else None, env_problem, head)
     if not passed:
         from . import trim
-        with open(log, "rb") as f:   # this call's part of the log: a test run's failures, else head and tail
-            f.seek(start)
-            print(trim.summary(f.read().decode("utf-8", errors="replace")))
+        print(trim.summary(text))   # a test run's failures, else head and tail
+        if env_problem:
+            die(f"ttp checks: {failed!r} failed at import on {head[:12]}: an environment problem, not the "
+                f"head's code: {env_problem} (full output: {log})", 1)
         die(f"ttp checks: {failed!r} failed on {head[:12]} (full output: {log})", 1)
     if hit:
         print(said)
@@ -2723,6 +2763,8 @@ def cmd_doctor(a) -> None:
             ref, missing = "", []
         for m in missing:
             print(f"delivery.push_checks: {m} matches no file on {ref}; every push would fail on it")
+    if line := checks_env_line(p):
+        print(line)
     for c in _push.unexcluded_log_checks(checks):
         print(f"delivery.push_checks: {c!r} also checks committed *.log output, whose captured lines keep "
               f"trailing whitespace; add the pathspec `-- . {_push.LOG_EXCLUDE}`")
