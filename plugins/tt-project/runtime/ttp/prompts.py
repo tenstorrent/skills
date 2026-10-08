@@ -13,7 +13,7 @@ from . import budget as bud
 from .db import continues_id, load_result
 from .hook import unread_update
 from .project import WORKER_MEMORY_CHARS, Project, code_tasks_may_push, push_queue_on
-from .worktree import project_venv
+from .worktree import gets_worktree, own_worktree, project_venv
 
 
 def _read(p: Project, name: str) -> str:
@@ -219,10 +219,10 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
     old_id = continues_id(task)
     old = p.db.task(old_id) if old_id else None
     if old:
-        on = f" on branch {old['branch']}" if old["kind"] == "code" and old["branch"] else ""
+        on = f" on branch {old['branch']}" if own_worktree(old) and old["branch"] else ""
         was = str(load_result(old["result"]).get("summary") or old["blocked_reason"] or "")[:1500]
         history += (f"\nThis task continues #{old['id']} {old['title']} ({old['status']}){on}"
-                    + (", and starts from that branch's head" if on and kind == "code" else "")
+                    + (", and starts from that branch's head" if on and (branch or gets_worktree(p, kind)) else "")
                     + (f". Its last summary: {was}" if was else "") + "\n")
     delivery = cfg.get("delivery", {})
     venv = project_venv(p, cwd)

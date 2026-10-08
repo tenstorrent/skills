@@ -28758,3 +28758,27 @@ def test_a_work_task_with_its_own_worktree_is_guarded_like_a_code_task(env, monk
     assert p.db.task(work)["status"] == "done"
     assert str(work) in (p.db.kv(dm.KV_BACKUP) or {}), p.db.kv(dm.KV_BACKUP)
     assert not p.db.q("SELECT id FROM tasks WHERE kind='review' AND id!=?", (review,)), "no review for a work task"
+
+
+def test_a_continued_own_worktree_work_task_starts_from_the_old_branch(env):
+    p = make(env)
+    from ttp.prompts import worker_task
+    p.set_config("worktree.kinds", ["work"])
+    old = p.db.add_task("tidy notes", "s", kind="work", tier="light", origin="user")
+    p.db.update_task(old, branch=f"ttp/t{old}-tidy-notes", status="done")
+    new = p.db.add_task("continue: tidy notes", "s", kind="work", tier="light", origin="user",
+                        labels=[f"continues:{old}"])
+    prompt = worker_task(p, p.db.task(new), str(p.root), f"ttp/t{old}-tidy-notes")
+    assert f"on branch ttp/t{old}-tidy-notes, and starts from that branch's head" in prompt, prompt
+    # Code tasks as before.
+    oc = p.db.add_task("fix", "s", kind="code", tier="light", origin="user")
+    p.db.update_task(oc, branch=f"ttp/t{oc}-fix", status="done")
+    nc = p.db.add_task("continue: fix", "s", kind="code", tier="light", origin="user", labels=[f"continues:{oc}"])
+    assert f"on branch ttp/t{oc}-fix, and starts from that branch's head" in worker_task(
+        p, p.db.task(nc), str(p.root), f"ttp/t{oc}-fix")
+    # A work task without a worktree of its own: no branch claim.
+    p.set_config("worktree.kinds", [])
+    o2 = p.db.add_task("plain", "s", kind="work", tier="light", origin="user")
+    p.db.update_task(o2, branch="feature-x", status="done")
+    n2 = p.db.add_task("continue: plain", "s", kind="work", tier="light", origin="user", labels=[f"continues:{o2}"])
+    assert "on branch feature-x" not in worker_task(p, p.db.task(n2), str(p.root), None)
