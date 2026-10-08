@@ -1878,12 +1878,18 @@ _CLAUSE_SPLIT_RE = re.compile(rf"[,;:—–]|\s-+\s|(?<![\w'’-])(?:{'|'.join(_
 # negation ("is not allowed", "may not", "may never"), or given to no one ("No worker may", "Nobody may",
 # "None of the agents are allowed to", but not "Nobody but the user may", nor "No restriction remains
 # and workers may", whose "no" ends with its clause), forbids; "no longer forbidden" allows. Inside
-# the subject "and"/"or" join only an actor noun to one more noun ("No worker or agent may", "No
-# workers and no tasks may"): after any other word they open a new clause.
+# the subject "and"/"or" join two nouns only when an actor noun heads it, right after "No" or after
+# "other" or one plain adjective ("No worker or agent may", "No workers and no tasks may", "No user or
+# other bot may"): anywhere else ("No review by a maintainer and agents may") they open a new clause.
 _SUBJECT_NOUN = (r"(?:worker|agent|task|job|bot|user|owner|maintainer|human|admin|operator|coordinator|reviewer|"
                  r"team|lead|person|people|one|body|tool|script|process|service|subagent|contributor|developer)s?")
-_NO_SUBJECT = (rf"(?:\s+(?:{_SUBJECT_NOUN}\s+(?:and|or)\s+(?:no\s+)?(?:other\s+)?\w[\w'-]*(?![\w'’-])"
-               rf"|(?!(?:but|except|save|besides|apart|beyond|than|{'|'.join(_JOINS)})(?![\w'’-]))\w[\w'-]*)){{0,4}}?"
+_SUBJECT_WORD = (rf"(?!(?:but|except|save|besides|apart|beyond|than|{'|'.join(_JOINS)})(?![\w'’-]))\w[\w'-]*")
+_NOT_ADJECTIVE = (r"(?:by|from|for|of|with|without|within|to|in|into|on|onto|at|about|under|over|via|through|"
+                  r"per|against|among|between|toward|towards|upon|across|behind|beside|near|off|out|up|down|"
+                  r"around|like|the|a|an|any|this|that|these|those|our|your|their|my|its|his|her|every|each|"
+                  r"some|all|no)(?![\w'’-])")
+_NO_SUBJECT = (rf"(?:(?:\s+(?!{_NOT_ADJECTIVE}){_SUBJECT_WORD})?\s+{_SUBJECT_NOUN}\s+(?:and|or)\s+(?:no\s+)?"
+               rf"(?:other\s+)?\w[\w'-]*(?![\w'’-])(?:\s+{_SUBJECT_WORD}){{0,2}}?|(?:\s+{_SUBJECT_WORD}){{0,4}}?)"
                r"\s+(?:may|can|shall|should|must|will|(?:is|are)\s+(?:allowed|permitted)\s+to)\b")
 _NEG_PERMIT_RE = re.compile(r"\b(?:not|never)\s+(?:be\s+)?(?:allowed|permitted|fine|ok(?:ay)?)\b|\b(?:may|can)(?:\s*not|\s+never)\b|"
                             r"n't\s+(?:be\s+)?(?:allowed|permitted|fine)\b|"
@@ -2233,13 +2239,23 @@ _NO_OBJECTION_RE = re.compile(
     rf"|\b{_NO_ONE}(?:objects?|minds?|cares?)(?:\s+(?:anymore|now|any\s+more|any\s+longer))?"
     r"(?:\s+(?:to|if|when|that)\b)?"
     rf"|\b{_NO_ONE}(?:stops?|prevents?|blocks?|bars?|keeps?)(?:\s+any\s+more|\s+anymore)?"
-    r"(?P<who>(?:\s+\w[\w'-]*){1,2}?)\s+from\b", re.I)
+    rf"(?P<who>(?:\s+(?!(?:{'|'.join(j for j in _JOINS if j not in ('and', 'or'))})(?![\w'’-]))\w[\w'-]*){{1,5}}?)"
+    r"\s+from\b", re.I)
+# A negation in the clause after it ("No problem if workers never push"): the sentence keeps a ban.
+_NEGATION_RE = re.compile(r"\b(?:not|never|no longer)\b|n['’]t\b", re.I)
 
 
 def _as_permission(sentence: str) -> str:
     """The sentence with a lift said as no one minding (_NO_OBJECTION_RE) as "may": "No rule stops
-    workers from pushing" reads "workers may pushing"."""
-    return _NO_OBJECTION_RE.sub(lambda m: f"{m['who'] or ''} may", sentence)
+    workers from pushing" reads "workers may pushing". One whose clause negates the action ("No
+    problem if workers never push") stays as it is: it reinforces a ban."""
+    def sub(m: re.Match) -> str:
+        rest = sentence[m.end():]
+        end = _CLAUSE_SPLIT_RE.search(rest)
+        if _NEGATION_RE.search(rest[:end.start() if end else len(rest)]):
+            return m[0]
+        return f"{m['who'] or ''} may"
+    return _NO_OBJECTION_RE.sub(sub, sentence)
 
 
 # A permission given to no one (_NO_SUBJECT): the "and"/"or" in its subject joins no clauses.

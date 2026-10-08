@@ -4928,14 +4928,22 @@ def test_no_x_or_y_may_bans_and_lifts_said_as_no_objection(env):
     short, long = "Never push to main.", "Never push to main without the user's explicit word."
     lifts = ("No problem if workers push to main.", "No objection to workers pushing to main.",
              "No one objects anymore when workers push to main.", "No rule stops workers from pushing to main.",
-             "There is no issue with agents pushing to main.", "Nobody minds if workers push to main.")
+             "There is no issue with agents pushing to main.", "Nobody minds if workers push to main.",
+             "No rule stops the coordinator or workers from pushing to main.",
+             # The subject join holds only for an actor noun heading the subject: after a
+             # preposition or determiner, "and"/"or" opens a new clause that allows.
+             "No review by a maintainer and agents may push to main.",
+             "No sign-off from the user and workers may push to main.",
+             "No approval from any reviewer or agents may push to main.",
+             "No wait for the owner and workers may push to main.")
     for k, (ban, text) in enumerate([(b, t) for b in (short, long) for t in lifts]):
         err = guard(ban, text, 30 + k)
         assert len(err) == 1 and f"\"{ban}\" (section 'Restrictions')" in err[0], (ban, text, err)
     # About another action, or still a ban, it lifts nothing.
     for k, text in enumerate(("No problem if workers run the tests.", "No rule stops workers from opening draft PRs.",
-                              "No objection to workers pushing to their own branch, but never to main.")):
-        assert guard(short, text, 50 + k) == [], text
+                              "No objection to workers pushing to their own branch, but never to main.",
+                              "No problem if workers never push to main.", "No problem if workers do not push to main.")):
+        assert guard(short, text, 60 + k) == [], text
 
 
 def test_charter_conflicts_show_in_the_digest_raise_effort_once_and_reach_the_daily_review(env):
