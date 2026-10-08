@@ -1,0 +1,11 @@
+{
+  "name": "tt-syseng-utilities",
+  "version": "0.1.0",
+  "description": "System-engineering utilities for Tenstorrent hosts: firmware and harvesting inspection, patching, flashing and validation. Includes P150 Tensix unharvesting.",
+  "author": {
+    "name": "tenstorrent"
+  },
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/tenstorrent/skills",
+  "skills": "./skills/"
+}

@@ -34,6 +34,11 @@
       "name": "tt-buddy",
       "source": "./plugins/tt-buddy",
       "description": "A coding agent with Tenstorrent operating principles: takes notes all the time, learns when needed, keeps the diff minimal."
+    },
+    {
+      "name": "tt-syseng-utilities",
+      "source": "./plugins/tt-syseng-utilities",
+      "description": "System-engineering utilities for Tenstorrent hosts: firmware and harvesting inspection, patching, flashing and validation. Includes P150 Tensix unharvesting."
     }
   ]
 }

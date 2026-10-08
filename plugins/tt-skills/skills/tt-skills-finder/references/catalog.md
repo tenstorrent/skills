@@ -99,3 +99,19 @@ Install or enable it only after the user chooses it:
   Directory.
 - **Claude Code:** run `/plugin install tt-buddy@tenstorrent-skills` after adding the
   `tenstorrent/skills` marketplace.
+
+## `tt-syseng-utilities`
+
+System-engineering utilities for Tenstorrent hosts. One skill per task.
+
+- `p150-unharvesting`: read, patch, flash, verify P150 Tensix disable count.
+- **Can flash firmware. Affects every user of the host.**
+- Recommend when user wants to unharvest a P150.
+- Recommend when Blackhole worker grid is smaller than expected.
+
+Install or enable it only after the user chooses it:
+
+- **Codex / ChatGPT desktop:** select `tt-syseng-utilities` under **Tenstorrent Skills** in the
+  Plugins Directory.
+- **Claude Code:** run `/plugin install tt-syseng-utilities@tenstorrent-skills` after adding the
+  `tenstorrent/skills` marketplace.

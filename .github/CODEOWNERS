@@ -26,3 +26,6 @@
 
 # Tenstorrent operating principles
 /plugins/tt-buddy/ @ppetrovicTT
+
+# System-engineering utilities (firmware, harvesting)
+/plugins/tt-syseng-utilities/ @mbezuljTT
