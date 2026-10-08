@@ -4813,6 +4813,51 @@ def test_a_permission_given_to_no_one_adds_a_ban_and_only_workers_pass_an_action
     assert guard(ban, text, 13) == []
 
 
+def test_guard_judges_each_clause_so_a_forbid_in_one_never_cancels_an_allowance_in_another(env):
+    """The guard judges an appended sentence whole and each clause on its own, split at commas,
+    semicolons, colons, dashes and joining words ("and", "so", "then", "since", ...): a clause that
+    allows a forbidden action is flagged whatever the other clauses say, a bare "can" allowing too.
+    The subject of "No ... may" never runs across a join, so "No restriction remains and workers may
+    push" is no ban, while "No worker may push" still is. Against the longer ban only the clause
+    reading catches the lift: the whole sentence shares too few words with it."""
+    p = make(env)
+    from ttp import coordinator as coord
+
+    def guard(ban, text, turn):
+        p.charter_path.write_text(f"# demo\n\n## Restrictions\n- {ban}\n")
+        return coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": text}],
+                           turn=turn, user_turn=True)
+    short, long = "Never push to main.", "Never push to main without the user's explicit word."
+    for k, (ban, text) in enumerate([(short, t) for t in (
+            "No restriction remains and workers may push to main.", "No ticket needed and workers can push to main.",
+            "No more waiting and workers can push to main.", "No more waiting: workers can push to main.",
+            "No more waiting - workers can push to main.", "Nobody objects since workers can push to main.",
+            "Workers can push to main.", "Never push to main, but hotfixes can go there.")]
+            + [(long, t) for t in (
+            "No restriction remains and workers may push to main.", "No ticket is needed, so workers may push to main.",
+            "No more waiting; workers can push to main.", "No review remains then workers may push to main.",
+            "Nothing blocks it any more and workers can push to main.")]):
+        err = guard(ban, text, 10 + k)
+        assert len(err) == 1 and f"\"{ban}\" (section 'Restrictions')" in err[0], (text, err)
+    # A permission given to no one, or negated ("can't", "cannot", "can never"), adds a ban in any
+    # clause; a "can" allowing another action lifts nothing.
+    for k, text in enumerate(("No worker may push to main.", "Nobody may push to main.",
+                              "None of the agents are allowed to push to main.",
+                              "Reviews are done; no worker may push to main.", "Workers can't push to main.",
+                              "Workers cannot push to main.", "Workers can never push to main.",
+                              "Workers can not push to main.", "Workers can't push to main, and they cannot merge either.",
+                              "Workers can run the tests and push to their own branch.")):
+        assert guard(short, text, 40 + k) == [], text
+    # The lint reads a joined "No ... and workers may X" as no ban, so it no longer pairs it with an
+    # allowance of X; "No worker may X" still pairs.
+    def lint(ban, text):
+        return [(x["forbid"], x["allow"]) for x in
+                coord.restriction_pairs(f"# demo\n\n## Restrictions\n- {ban}\n- {text}\n")]
+    assert lint("No restriction remains and workers may push to main.", "Workers may push to main.") == []
+    assert lint("No worker may push to main.", "Workers may push to main.") == [
+        ("No worker may push to main.", "Workers may push to main.")]
+
+
 def test_charter_conflicts_show_in_the_digest_raise_effort_once_and_reach_the_daily_review(env):
     p = make(env)
     from ttp import coordinator as coord, daemon as dm

@@ -1868,12 +1868,18 @@ def charter_lint(p: Project) -> list[str]:
     return out
 
 
+# Words that join two clauses: the subject of "No ... may" never runs across one (_NO_SUBJECT), and the
+# guard judges each clause on its own (_clauses).
+_JOINS = ("and", "or", "so", "then", "but", "yet", "while", "because", "since", "now", "if", "when", "once",
+          "after", "before", "until", "as", "though", "although", "unless", "whereas", "where", "whenever",
+          "hence", "thus", "therefore")
+_CLAUSE_SPLIT_RE = re.compile(rf"[,;:—–]|\s-+\s|(?<![\w'’-])(?:{'|'.join(_JOINS)})(?![\w'’-])", re.I)
 # Contradicting Restrictions items (restriction_pairs, _append_conflicts). A permission said with a
 # negation ("is not allowed", "may not", "may never"), or given to no one ("No worker may", "Nobody may",
-# "None of the agents are allowed to", but not "Nobody but the user may"), forbids; "no longer
-# forbidden" allows.
-_NO_SUBJECT = (r"(?:\s+(?!(?:but|except|save|besides|apart|beyond|than)\b)[\w'-]+){0,4}?\s+"
-               r"(?:may|can|shall|should|must|will|(?:is|are)\s+(?:allowed|permitted)\s+to)\b")
+# "None of the agents are allowed to", but not "Nobody but the user may", nor "No restriction remains
+# and workers may", whose "no" ends with its clause), forbids; "no longer forbidden" allows.
+_NO_SUBJECT = (rf"(?:\s+(?!(?:but|except|save|besides|apart|beyond|than|{'|'.join(_JOINS)})(?![\w'’-]))"
+               r"\w[\w'-]*){0,4}?\s+(?:may|can|shall|should|must|will|(?:is|are)\s+(?:allowed|permitted)\s+to)\b")
 _NEG_PERMIT_RE = re.compile(r"\b(?:not|never)\s+(?:be\s+)?(?:allowed|permitted|fine|ok(?:ay)?)\b|\b(?:may|can)(?:\s*not|\s+never)\b|"
                             r"n't\s+(?:be\s+)?(?:allowed|permitted|fine)\b|"
                             rf"(?:^|(?<=[,;:(]))\s*(?:no|nobody|none)\b{_NO_SUBJECT}", re.I)
@@ -1882,6 +1888,8 @@ _FORBIDS_RE = re.compile(r"\b(?:never|do not|does not|must not|cannot|forbidden|
                          r"|\b(?:don|doesn|mustn|can)'t\b", re.I)
 _ALLOWS_RE = re.compile(r"\b(?:allowed|permitted|may|(?:is|are)(?:\s+(?:also|still|now|again|just))*\s+(?:fine|ok(?:ay)?)|"
                         r"fine to|ok(?:ay)? to|lift(?:s|ed)?|can now|no longer)\b", re.I)
+# For the guard (_append_conflicts), a bare "can" not negated is a permission too ("workers can push").
+_CAN_RE = re.compile(r"\bcan\b(?!\s*(?:not|never)\b|\s+no\s+longer\b|['’]t\b)", re.I)
 # For the lint (restriction_pairs), a permission inside a conditional clause ("where PRs are allowed",
 # "once allowed", "if ... is ever allowed") lifts nothing. Nor does one whose "only"/"alone" names who
 # may act ("Only the user may ...", "the user alone may ...", "allowed for the user only", "by the user
@@ -1971,10 +1979,11 @@ def _unconditional(sentence: str) -> str:
 def _stance(sentence: str, exempt: bool = True) -> str:
     """"forbid", "allow", or "" for a sentence that says neither or both. A permission in a conditional
     or limiting clause (_unconditional) allows nothing, unless `exempt` is off: then every permission
-    word that is not negated allows."""
+    word that is not negated allows, a bare "can" too (_CAN_RE)."""
     s = _NO_LONGER_BANNED_RE.sub(" allowed ", _NEG_PERMIT_RE.sub(" never ", sentence))
     s = _unconditional(s) if exempt else s
-    forbids, allows = bool(_FORBIDS_RE.search(s)), bool(_ALLOWS_RE.search(s))
+    forbids = bool(_FORBIDS_RE.search(s))
+    allows = bool(_ALLOWS_RE.search(s) or not exempt and _CAN_RE.search(s))
     return "forbid" if forbids and not allows else "allow" if allows and not forbids else ""
 
 
@@ -2165,6 +2174,12 @@ def charter_conflict_lines(pairs: list[dict]) -> list[str]:
                f"({x['allow_section']})" for x in pairs])
 
 
+def _clauses(sentence: str) -> list[str]:
+    """A sentence's clauses: its text between commas, semicolons, colons, dashes and the words that join
+    clauses (_JOINS)."""
+    return [c for c in (x.strip() for x in _CLAUSE_SPLIT_RE.split(sentence)) if c.strip(" .!?")]
+
+
 def _append_conflicts(charter: str, section: str, text: str) -> list[tuple[str, str]]:
     """The standing Restrictions items an appended `text` would contradict, as (item, its section):
     text for Restrictions (dated or temporary too), Goals or Policies that allows what an item
@@ -2172,20 +2187,25 @@ def _append_conflicts(charter: str, section: str, text: str) -> list[tuple[str, 
     forbidding item ("Never X, except Y", "Never X, but Y may") in a sentence about it (_widens).
     It flags when in doubt: a permission counts wherever it sits, in a conditional clause or limited
     to who may act or when too (no _unconditional), a ban on workers binds every actor (no actor
-    exemption in _contradicts), and a clause keeping the item's limit does not clear the sentence. A
-    false hit costs one resend (`quote`, or `both_hold`); a miss leaves a stale ban standing, and
-    workers obey it. A negated permission ("may not", "is not allowed") loosens nothing."""
+    exemption in _contradicts), and a clause keeping the item's limit does not clear the sentence. Each
+    sentence is judged whole, and each of its clauses (_clauses) on its own for what it allows or
+    loosens: a forbid in one clause never cancels an allowance in another ("No review is needed and
+    workers may push to main" lifts a ban on pushing to main). A false hit costs one resend (`quote`, or
+    `both_hold`); a miss leaves a stale ban standing, and workers obey it. A negated permission ("may
+    not", "is not allowed") loosens nothing."""
     if not _DATED.sub("", section).lower().startswith(("restriction", "goal", "polic")):
         return []
     out: list[tuple[str, str]] = []
-    new = _sentences(text.splitlines())
+    whole = _sentences(text.splitlines())
+    new = list(dict.fromkeys([*whole, *(c for s in whole for c in _clauses(s))]))
     for item, sec, _ in _restriction_items(charter):
         st = _stance(item)
         for s in new:
             ns = _stance(s, exempt=False)
+            loose = _NEG_PERMIT_RE.sub(" never ", s)
             if (st == "forbid" and ns == "allow" and _contradicts(item, s, exempt=False)
-                    or st == "allow" and _stance(s) == "forbid" and _contradicts(s, item, exempt=False)
-                    or st == "forbid" and ns != "allow" and _LOOSEN_RE.search(_NEG_PERMIT_RE.sub(" never ", s))
+                    or st == "allow" and s in whole and _stance(s) == "forbid" and _contradicts(s, item, exempt=False)
+                    or st == "forbid" and ns != "allow" and (_LOOSEN_RE.search(loose) or _CAN_RE.search(loose))
                     and not _OWN_EXCEPTION_RE.search(item) and _widens(item, _rule_words(s))):
                 if (item, sec) not in out:
                     out.append((item, sec))
