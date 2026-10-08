@@ -144,15 +144,83 @@ def _words(cmd: str) -> list:
         return []
 
 
+def _split_ops(w: str) -> list:
+    """Glued operators apart (`);` -> `)`, `;`); a word that is not all operators is returned as is."""
+    if not set(w) <= set("();|&"):              # a word, or one quoted that only starts with an operator
+        return [w]
+    out = []
+    while w:
+        op = next(o for o in sorted(_OPS, key=len, reverse=True) if w.startswith(o))
+        out.append(op)
+        w = w[len(op):]
+    return out
+
+
 def _segments(cmd: str) -> list:
+    """Simple commands of `cmd`, in order; a subshell's `(` and `)` come as segments of their own."""
     out, cur = [], []
-    for w in _words(cmd):
+    for w in (x for word in _words(cmd) for x in _split_ops(word)):
         if w in _OPS:
             out.append(cur)
+            out.append([w] if w in ("(", ")") else [])
             cur = []
         else:
             cur.append(w)
     return [s for s in out + [cur] if s]
+
+
+# Options that take a value; a short option is matched only on its own (`-n 5`, not `-n5`).
+_WRAPPER_ARGS = {"env": "uC", "timeout": "sk", "nice": "n", "stdbuf": "ioe", "exec": "a"}
+_WRAPPER_LONG_ARGS = {"--unset", "--chdir", "--signal", "--kill-after", "--adjustment", "--input",
+                      "--output", "--error"}
+_SH_FLAGS, _SH_ARGS = set("abefhkmnptuvxBCEHPTlirD"), set("oO")
+_PY_FLAGS, _PY_ARGS = set("bBdEiIOqsSuvxPR"), set("WXQ")
+_SH_LONG = {"--norc", "--noprofile", "--login", "--posix", "--verbose", "--restricted", "--noediting",
+            "--debugger", "--protected"}
+
+
+def _interpreter_args(args: list, kind: str) -> tuple:
+    """(operands, command string or None) of a shell's ("sh") or python's ("file") arguments. Option
+    words are dropped with the values they take (`-o pipefail`, `-W ignore`); a shell's `c` in any
+    short-option word (`-lc`, `-xec`) makes its first operand the command string. Anything not
+    understood (an unknown option, stdin, `-m`, python's `-c`) gives no operands: the check is skipped
+    rather than a valid command refused."""
+    rest, command = list(args), False
+    while rest and rest[0][:1] in "-+" and rest[0] not in ("-", "+"):
+        opt, rest = rest[0], rest[1:]
+        if opt == "--":
+            break
+        if opt.startswith("--"):
+            if kind == "sh" and opt in ("--rcfile", "--init-file") and rest:
+                rest = rest[1:]
+            elif not (kind == "sh" and opt in _SH_LONG):
+                return [], None
+            continue
+        if kind == "file" and opt[0] == "+":
+            return [], None
+        letters = opt[1:]
+        for j, ch in enumerate(letters):
+            if kind == "sh" and ch == "c":
+                command = True
+            elif kind == "sh" and ch in _SH_ARGS:
+                if not rest:
+                    return [], None
+                rest = rest[1:]
+            elif kind == "sh" and ch in _SH_FLAGS:
+                pass
+            elif kind == "file" and ch in _PY_ARGS:
+                if j == len(letters) - 1:        # `-W ignore`; `-Wignore` carries its value
+                    if not rest:
+                        return [], None
+                    rest = rest[1:]
+                break
+            elif kind == "file" and ch in _PY_FLAGS:
+                pass
+            else:                                # -s (stdin), python -c/-m, or not known
+                return [], None
+    if command:
+        return [], (rest[0] if rest else None)
+    return ([], None) if rest[:1] == ["-"] else (rest, None)
 
 
 def _join(cwd: str | None, path: str) -> str | None:
@@ -168,8 +236,14 @@ def called_scripts(cmd: str, workdir: str = "", depth: int = 0) -> list:
     `cd` earlier in the command. kind is "sh" (a shell script), "?" (run directly: a shell script only if
     its #! line says so) or "file" (another interpreter's script). Words whose value only the host knows
     ($VAR, `...`, globs) are left out, as are bare names found through PATH."""
-    found, cwd = [], workdir or "~"
+    found, cwd, saved = [], workdir or "~", []
     for seg in _segments(cmd):
+        if seg == ["("]:                          # a subshell: a cd inside it ends with it
+            saved.append(cwd)
+            continue
+        if seg == [")"]:                          # unmatched (a case pattern): the folder is unknown
+            cwd = saved.pop() if saved else None
+            continue
         words, i = [], 0
         while i < len(seg):                      # drop redirections and their targets
             if _REDIRECTS.match(seg[i]):
@@ -181,31 +255,39 @@ def called_scripts(cmd: str, workdir: str = "", depth: int = 0) -> list:
             words = words[1:]
         while words and words[0].rsplit("/", 1)[-1] in _WRAPPERS:
             wrapper, words = words[0].rsplit("/", 1)[-1], words[1:]
+            takes = _WRAPPER_ARGS.get(wrapper, "")
             while words and (words[0].startswith("-") or (wrapper == "env" and "=" in words[0])):
-                words = words[1:]
+                opt, words = words[0], words[1:]
+                if wrapper == "env" and (opt.startswith("-S") or opt.startswith("--split")):
+                    words = []                   # its command is one string: not looked into
+                elif ((not opt.startswith("--") and len(opt) == 2 and opt[1] in takes)
+                      or opt in _WRAPPER_LONG_ARGS):
+                    words = words[1:]            # the option's value
             if wrapper == "timeout" and words:
                 words = words[1:]                # its duration
         if not words or words[0] in ("for", "case", "function"):
             continue
         head, base = words[0], words[0].rsplit("/", 1)[-1]
-        if head == "cd":
+        if head in ("cd", "pushd"):
             target = words[1] if len(words) > 1 else "~"
-            cwd = None if _UNKNOWN.search(target) or target == "-" else _join(cwd, target)
+            if head == "pushd":
+                saved.append(cwd)
+            cwd = (None if _UNKNOWN.search(target) or target.startswith(("-", "+")) or (head == "pushd" and
+                   len(words) < 2) else _join(cwd, target))
+            continue
+        if head == "popd":
+            cwd = saved.pop() if saved and len(words) == 1 else None
             continue
         if _UNKNOWN.search(head):
             continue
         script, kind = None, "?"
-        if head in ("source", ".") or base in _SHELLS or _PYTHONS.match(base):
+        if head in ("source", "."):
+            script, kind = (words[1] if len(words) > 1 and not words[1].startswith("-") else None), "sh"
+        elif base in _SHELLS or _PYTHONS.match(base):
             kind = "file" if _PYTHONS.match(base) else "sh"
-            rest = words[1:]
-            while rest and rest[0].startswith("-"):
-                opt, rest = rest[0], rest[1:]
-                if kind == "sh" and opt == "-c" and rest:
-                    if depth < 2 and cwd is not None:
-                        found += [x for x in called_scripts(rest[0], cwd, depth + 1) if x not in found]
-                    rest = []
-                elif kind == "file" and opt in ("-c", "-m"):
-                    rest = []
+            rest, command = _interpreter_args(words[1:], kind)
+            if command is not None and depth < 2 and cwd is not None:
+                found += [x for x in called_scripts(command, cwd, depth + 1) if x not in found]
             script = rest[0] if rest else None
         elif "/" in head:
             script = head

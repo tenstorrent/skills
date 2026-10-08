@@ -28339,6 +28339,24 @@ def test_devq_called_scripts_finds_the_scripts_a_job_command_runs():
     assert called_scripts("source ~/env.sh; make") == [("~/env.sh", "sh")]
     for unknown in ("echo hi", "$HOME/x.sh", "cd $D && ./x.sh", "python3 -m foo", "run.sh", "./a 'b"):
         assert called_scripts(unknown, "/w") == [], unknown
+    # Option words: combined flags with c take a command string, options with a value consume it.
+    assert called_scripts('bash -lc "cd /w && ./run.sh"', "/x") == [("/w/run.sh", "sh")]
+    assert called_scripts("bash -xec './run.sh'", "/w") == [("/w/run.sh", "sh")]
+    assert called_scripts("bash -eo pipefail -c './run.sh'", "/w") == [("/w/run.sh", "sh")]
+    assert called_scripts("bash -o pipefail ./run.sh", "/w") == [("/w/run.sh", "sh")]
+    assert called_scripts("bash +O extglob --norc ./run.sh", "/w") == [("/w/run.sh", "sh")]
+    assert called_scripts("python3 -W ignore x.py", "/w") == [("/w/x.py", "file")]
+    assert called_scripts("python3 -X dev -Wignore -u x.py", "/w") == [("/w/x.py", "file")]
+    assert called_scripts("timeout -k 5 600 nice -n 10 env -u A -C /a ./x.sh", "/w") == [("/w/x.sh", "sh")]
+    # Subshells and pushd: a cd inside ends with them; glued operators split.
+    assert called_scripts("(cd /a && ./x.sh); ./y.sh", "/w") == [("/a/x.sh", "sh"), ("/w/y.sh", "sh")]
+    assert called_scripts("pushd /a && ./x.sh && popd && ./y.sh", "/w") == [
+        ("/a/x.sh", "sh"), ("/w/y.sh", "sh")]
+    # Not understood: skipped (a missed check), never a refusal of a valid command.
+    for unsure in ('sh -ec "echo hi"', "python3 -uc 'print(1)'", "python3 -um pkg.mod", "bash -s ./x.sh",
+                   "bash --weird ./x.sh", "python3 --foo x.py", "python3 - < x.py", "bash -o",
+                   "env -S './x.sh a' ./y.sh", "echo '|./x.sh'"):
+        assert called_scripts(unsure, "/w") == [], unsure
 
 
 def test_devq_lint_refuses_missing_or_broken_scripts_and_warns_on_another_tasks_id(tmp_path, monkeypatch):
