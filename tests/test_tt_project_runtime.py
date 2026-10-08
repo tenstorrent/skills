@@ -23644,13 +23644,19 @@ def test_an_ask_that_only_seeks_leave_to_open_a_draft_pr_is_rejected(env):
                 "Open the draft PR now, or wait for the freeze to end?"]
     for text in rejected:
         p = make(env)
-        problems, ask = _ask(p, text, blocking="review", recommendation="yes")
-        assert problems and "draft PRs need no permission: open it" in problems[0] and ask is None, text
+        for blocking in ("human", "access"):
+            problems, ask = _ask(p, text, blocking=blocking, recommendation="yes")
+            assert problems and "draft PRs need no permission: open it" in problems[0] and ask is None, (text, blocking)
     sent = [("Is https://github.com/acme/widgets/pull/7 ready to leave draft?", "review"),
             ("May I merge the draft PR https://github.com/acme/widgets/pull/7?", "merge"),
             ("The charter says never open PRs; may I open a draft PR?", "restriction"),
             ("Should I request reviewers on the draft PR?", "human"),
-            ("I opened draft PR acme/widgets#7; please review it.", "review")]
+            ("I opened draft PR acme/widgets#7; please review it.", "review"),
+            ("Please review the open draft PR https://github.com/acme/widgets/pull/7?", "review"),
+            ("Could you review the update to draft PR https://github.com/acme/widgets/pull/7?", "review"),
+            # review wording is more than leave to open, whatever the blocking
+            ("Please review the open draft PR https://github.com/acme/widgets/pull/7?", "human"),
+            ("Could you take a look at the update to draft PR acme/widgets#7?", "human")]
     for text, blocking in sent:
         p = make(env)
         problems, ask = _ask(p, text, blocking=blocking, least_disruptive="x" * 80)

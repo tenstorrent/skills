@@ -403,9 +403,10 @@ DRAFT_OPEN_RE = re.compile(r"\b(?:open|opening|create|creating|raise|raising|fil
 PERMISSION_RE = re.compile(r"\?|\b(?:permission|may\s+(?:i|we)|can\s+(?:i|we)|should\s+(?:i|we)|shall|ok(?:ay)?\s+to|"
                            r"go[- ]ahead|green\s+light|approv\w*|allow\w*|confirm\w*|sign[- ]off)\b", re.I)
 # Anything beyond opening one: leaving draft, merging, a restriction or freeze that forbids PRs,
-# reviewers or another person. Those asks go out as before.
+# a review or reviewers, or another person. Those asks go out as before.
 DRAFT_ASK_MORE_RE = re.compile(r"\b(?:ready|merg\w*|undraft\w*|restrict\w*|forbid\w*|prohibit\w*|charter|"
-                               r"never|reviewers?|out\s+of\s+draft|leaves?\s+draft|leaving\s+draft)\b", re.I)
+                               r"never|review\w*|take\s+a\s+look|look\s+at|out\s+of\s+draft|leaves?\s+draft|"
+                               r"leaving\s+draft)\b", re.I)
 
 
 def draft_permission_ask(text: str) -> bool:

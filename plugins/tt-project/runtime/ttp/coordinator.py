@@ -897,7 +897,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                      "decision instead of asking. If not, put it in least_disruptive with the "
                                      "restriction it breaks.")
                 text = a["text"].strip()
-                if a["blocking"] != "restriction" and prguard.draft_permission_ask(text):
+                if (a["blocking"] not in ("restriction", "review", "merge")    # a review or merge ask is never leave to open
+                        and prguard.draft_permission_ask(text)):
                     raise ValueError("ask_user rejected: draft PRs need no permission: open it. Opening and updating a "
                                      "draft PR is always allowed, even under a code freeze; only leaving draft needs "
                                      "the user's yes")
