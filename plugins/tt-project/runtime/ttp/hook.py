@@ -502,7 +502,7 @@ PYTEST_VALUE_OPTS = {"-k", "-m", "-p", "-c", "-o", "-r", "-n", "-W", "--tb", "--
                      "--reruns", "--randomly-seed", "--html", "--config-file", "--inifile"}
 # pytest options that select part of what the targets name, or run none of it
 PYTEST_SELECT_OPTS = {"-k", "-m", "--lf", "--last-failed", "--sw", "--stepwise", "--stepwise-skip", "--deselect",
-                      "--ignore", "--ignore-glob", "--co", "--collect-only", "--collectonly", "--fixtures",
+                      "--sw-skip", "--ignore", "--ignore-glob", "--co", "--collect-only", "--collectonly", "--fixtures",
                       "--fixtures-per-test", "--markers", "-h", "--help", "--version", "-V", "--setup-plan",
                       "--setup-only", "--trace-config", "--count", "--lfnf", "--last-failed-no-failures"}
 PYTHON_VALUE_OPTS = {"-W", "-X", "-Q"}
@@ -541,7 +541,24 @@ def _pytest_parts(args: list[str], rel: str) -> tuple[set[str], set[tuple[str, s
     while i < len(args):
         a = args[i]
         opt, eq, val = a.partition("=")
-        if a.startswith("-") and a != "-":
+        if a.startswith("-") and not a.startswith("--") and len(a) > 2:
+            # bundled short options: `-xk expr`, `-kexpr`, `-qxkfoo`; a value option takes the rest
+            for j, c in enumerate(a[1:], 1):
+                o = "-" + c
+                if not c.isalnum():
+                    select.add(("?", a))   # unclear: count as narrower, so it passes
+                    break
+                if o in PYTEST_VALUE_OPTS:
+                    val = a[j + 1:]
+                    if not val:
+                        val = args[i + 1] if i + 1 < len(args) else ""
+                        i += 1
+                    if o in PYTEST_SELECT_OPTS:
+                        select.add((o, val))
+                    break
+                if o in PYTEST_SELECT_OPTS:
+                    select.add((o, ""))
+        elif a.startswith("-") and a != "-":
             if not eq and opt in PYTEST_VALUE_OPTS:
                 val = args[i + 1] if i + 1 < len(args) else ""
                 i += 1
@@ -576,6 +593,36 @@ def _relativize(args: list[str], top: str) -> list[str]:
             else a for a in args]
 
 
+CD_COMMANDS = ("cd", "pushd")
+
+
+def _cd_target(argv: list[str]) -> str | None:
+    """The directory a `cd`/`pushd` goes to as written, or None when it is not a literal path
+    (a variable, `-`, `~`, a substitution, no argument)."""
+    args = [a for a in argv[1:] if a not in ("-L", "-P", "-e", "-@", "--")]
+    if len(args) != 1 or not args[0] or args[0] == "-" or args[0].startswith(("~", "+", "-")) \
+            or re.search(r"[$`*?\[]", args[0]):
+        return None
+    return args[0]
+
+
+def _pytest_dirs(segments: list[list[str]], cwd: str | None):
+    """(each pytest run's arguments, the directory it runs in) in order, following each `cd`/`pushd`
+    before it from `cwd`. The directory is None once it is unclear (a non-literal target, `popd`, a
+    relative target from an unknown start): such a run is not judged."""
+    for seg in segments:
+        if os.path.basename(seg[0]) in CD_COMMANDS:
+            t = _cd_target(seg)
+            cwd = None if t is None or (cwd is None and not os.path.isabs(t)) \
+                else os.path.normpath(os.path.join(cwd or "/", t))
+        elif os.path.basename(seg[0]) == "popd":
+            cwd = None
+        else:
+            args = _pytest_args(seg)
+            if args is not None:
+                yield args, cwd
+
+
 def _check_runs() -> list[tuple[str, set[str], set[tuple[str, str]]]]:
     """(the check, its paths, its selecting options) for each pytest run in the project's configured
     checks (`delivery.push_checks`, what `ttp checks` runs). Read fresh: a project may change them."""
@@ -588,12 +635,13 @@ def _check_runs() -> list[tuple[str, set[str], set[tuple[str, str]]]]:
     if not p.exists():
         return []
     out = []
+    top = "/top"   # checks run from the repository's top; a cd out of it makes the run unclear
     for c in check_list((p.config().get("delivery") or {}).get("push_checks")):
-        for argv in _segments(str(c)):
-            args = _pytest_args(argv)
-            if args is not None:
-                paths, select = _pytest_parts(args, ".")
-                out.append((str(c), paths, select))
+        for args, d in _pytest_dirs(_segments(str(c)), top):
+            if d is None or not (d + "/").startswith(top + "/"):
+                continue
+            paths, select = _pytest_parts(args, os.path.relpath(d, top))
+            out.append((str(c), paths, select))
     return out
 
 
@@ -605,14 +653,19 @@ def full_suite(cmd: str, segments: list[list[str]], cwd: str) -> str | None:
     logged to the run's refusals.jsonl."""
     if os.environ.get(FULL_SUITE_OK) == "1" or FULL_SUITE_OK_RE.search(cmd):
         return None
-    runs = [(s, a) for s, a in ((s, _pytest_args(s)) for s in segments) if a is not None]
+    runs = list(_pytest_dirs(segments, cwd))
     if not runs:
         return None
     checks = _check_runs()
     if not checks:
         return None
-    top, rel = _repo_rel(cwd)
-    for _seg, args in runs:
+    home = _repo_rel(cwd)[0]
+    for args, d in runs:
+        if d is None:
+            continue
+        top, rel = _repo_rel(d)
+        if top != home:   # another repository, or none: not this project's checks
+            continue
         paths, select = _pytest_parts(_relativize(args, top), rel)
         for check, cpaths, cselect in checks:
             if select <= cselect and _covers(paths, cpaths):

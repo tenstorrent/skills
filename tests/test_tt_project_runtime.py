@@ -23256,17 +23256,21 @@ def test_worker_hook_refuses_a_direct_full_suite_run_and_logs_it(env, monkeypatc
                 "python3 -m pytest -q tests",
                 "python3 -m pytest -q",                      # no paths: the whole repository
                 f"python3 -m pytest -q {repo}/tests/test_a.py ./tests/test_b.py",
-                "cd x; FOO=1 timeout 900 python3 -m pytest -q tests/test_a.py tests/test_b.py 2>&1 | tail -5",
+                "FOO=1 timeout 900 python3 -m pytest -q tests/test_a.py tests/test_b.py 2>&1 | tail -5",
+                f"cd {repo}; FOO=1 timeout 900 {SUITE} 2>&1 | tail -5",
+                "cd sub && cd .. && python3 -m pytest -q tests",
                 f"ttp clip -- {SUITE}",
                 f"ttp lock dev -- {SUITE}",
                 f"git add -A && git commit -qm x && {SUITE}"):
         assert denied(cmd), cmd
     assert denied("python3 -m pytest -q ../tests/test_a.py ../tests/test_b.py", repo / "sub")
+    # A cd to the repository's top from a subdirectory runs the suite there.
+    assert denied(f"cd {repo} && {SUITE}", repo / "sub") and denied(f"pushd .. && {SUITE}", repo / "sub")
     out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": SUITE}, "cwd": str(repo)})
     why = out["hookSpecificOutput"]["permissionDecisionReason"]
     assert "`ttp checks`" in why and "reuses a pass" in why and "TTP_ALLOW_FULL_SUITE=1" in why and SUITE in why
     lines = [json.loads(x) for x in (run / hook.REFUSALS_FILE).read_text().splitlines()]
-    assert len(lines) == 13 and {x["kind"] for x in lines} == {"full_suite"} and lines[0]["command"] == SUITE
+    assert len(lines) == 17 and {x["kind"] for x in lines} == {"full_suite"} and lines[0]["command"] == SUITE
     assert lines[0]["check"] == SUITE
 
 
@@ -23276,6 +23280,17 @@ def test_worker_hook_lets_targeted_and_other_runs_through(env, monkeypatch, tmp_
                 "pytest tests/test_b.py -x",
                 "python3 -m pytest -q tests/test_a.py tests/test_b.py -k hook",
                 "python3 -m pytest -q tests/test_a.py tests/test_b.py -k=hook",
+                # short options with an attached value, or bundled with flags
+                "python3 -m pytest -q tests/test_a.py tests/test_b.py -kfoo",
+                "python3 -m pytest -q tests/test_a.py tests/test_b.py -mslow",
+                "python3 -m pytest -q tests/test_a.py tests/test_b.py -xk foo",
+                "python3 -m pytest -qxkfoo tests/test_a.py tests/test_b.py",
+                "python3 -m pytest -q tests/test_a.py tests/test_b.py --sw-skip",
+                # a cd before the run: its paths are the new directory's
+                "cd sub && pytest -q", "cd x; python3 -m pytest -q tests/test_a.py tests/test_b.py",
+                "(cd /tmp/other && pytest -q)", f"cd /elsewhere && {SUITE}",
+                f"cd $DIR && {SUITE}", f"cd - && {SUITE}", f"cd ~ && {SUITE}", f"cd && {SUITE}",
+                f"pushd sub && popd && {SUITE}",
                 "python3 -m pytest -q tests/test_a.py::test_one tests/test_b.py",
                 "python3 -m pytest -q tests/test_a.py tests/test_b.py --lf",
                 "python3 -m pytest -q tests/test_a.py tests/test_b.py -m 'not slow'",
@@ -23294,6 +23309,10 @@ def test_worker_hook_lets_targeted_and_other_runs_through(env, monkeypatch, tmp_
     # From a subdirectory, its paths are its own: tests/ there is not the repository's tests/.
     assert not denied("python3 -m pytest -q tests/test_a.py tests/test_b.py", repo / "sub")
     assert not denied("python3 -m pytest -q", repo / "sub")
+    # Bundled flags that select nothing still make a full run; so does an attached -n value.
+    assert denied("python3 -m pytest -qx tests/test_a.py tests/test_b.py")
+    assert denied("python3 -m pytest -n4 -qq tests/test_a.py tests/test_b.py")
+    (run / hook.REFUSALS_FILE).unlink()
     assert not (run / hook.REFUSALS_FILE).exists()
     # A check that selects by itself: the same selection is the full check, another one is not.
     hook, repo, run, denied = _suite_hook(env, monkeypatch, tmp_path / "m", ["pytest -q -m 'not slow' tests"])
@@ -23317,6 +23336,11 @@ def test_worker_hook_full_suite_guard_follows_the_projects_checks_and_has_an_esc
     p.set_config("delivery.push_checks", [{"run": "cd . && /x/bin/python -m pytest models/unit", "if_exists": "models"}])
     assert not denied(SUITE)
     assert denied("pytest models/unit") and denied("python3 -m pytest models") and not denied("pytest models/unit/a.py")
+    # A check that changes directory first: its paths are under that directory.
+    p.set_config("delivery.push_checks", ["cd plugins/x && python3 -m pytest -q tests"])
+    assert denied("pytest plugins/x/tests") and denied("cd plugins/x && pytest tests") and not denied("pytest tests")
+    p.set_config("delivery.push_checks", ["cd $X && pytest tests", "cd /abs && pytest tests", "cd .. && pytest"])
+    assert not denied("pytest") and not denied("pytest tests")
     p.set_config("delivery.push_checks", ["make lint"])
     assert not denied(SUITE) and not denied("pytest")
     # Outside a project, or outside a run, nothing is refused.
