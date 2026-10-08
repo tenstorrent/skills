@@ -386,6 +386,15 @@ and preferences you add later become part of the project's charter and memory.
   user's word. Separately, a hand-off that finds uncommitted changes to tracked paths in the
   project's main checkout records one observation naming them (once per set of paths); nothing
   there is committed or changed.
+- `delivery.fast_forward_also` (branch names, off by default) keeps more branches in step with
+  the push branch, such as a `main` that holds the last good state: after each successful `ttp push`
+  or push queue batch, each listed branch on the push remote is moved to the pushed commit, never
+  forced and only when its tip there is an ancestor of that commit. The result is read back from
+  the remote and recorded in the push outcome, the probe and the landing notice as
+  `ff <branch> <sha>` or `not ff <branch>: <reason>` (not an ancestor, missing, rejected). A
+  `not ff` is a warning and never undoes the main push. The push branch itself and invalid names
+  are refused. Like other delivery keys that widen where work lands, setting it needs the user's
+  word, and a charter that forbids pushing to a listed branch wins: leave that branch out.
 - A plan task starts from what is already known: prior work, the organization's docs and chats
   through the connectors you have, available skills, and public work. Skill plugins it recommends
   can be enabled for the project's workers only (`providers.claude.plugin_dirs`).

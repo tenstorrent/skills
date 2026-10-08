@@ -618,9 +618,14 @@ def _settle(p: Project, tid: int, b: dict, m: dict, now: float) -> None:
         new = [x for x in current if x["status"] == "pushed"]
         tail = (f"pushed {_short(last['pushed_sha'])}" + (f" as {last['version']}" if last["version"] else "")
                 if new else f"already on {target} at {_short(last['pushed_sha'])}")
+        ff = [str(x) for x in m.get("fast_forward") or []] if new else []
+        if ff:   # delivery.fast_forward_also, as read back from the remote
+            tail += "; " + "; ".join(f"warning: {x}" if x in push.ff_warnings([x]) else x for x in ff)
         result = {**prev, "status": "done", "summary": f"{summary.rstrip()} ({tail})".strip()[:1500],
                   "pushed": [{"branch": x["branch"], "head": x["head"], "sha": x["pushed_sha"], "version": x["version"],
                               "batch": x["batch"], "status": x["status"]} for x in done]}
+        if ff:
+            result["fast_forward"] = ff
         result.pop("woke", None)
         db.update_task(tid, status="done", blocked_reason=None, result=dump_result(result))
         # Handled: the coordinator sees it in its next turn's task list; no turn is spent on it.
@@ -759,6 +764,10 @@ def _apply(p: Project, b: dict, m: dict, alert: Callable, now: float) -> None:
             cmd = d.get("cmd") or first.get("cmd") or "the push checks"
             _event(db, None, "push_tip_failed", f"the push branch tip {_short(tip)} of {b['target']} fails its checks: "
                                                 f"`{cmd}`\n{_tail_of(m, d or first)}", queued=True, severity="high")
+        if warn := push.ff_warnings(m.get("fast_forward")):
+            _event(db, None, "push_not_ff", f"push batch {b['id']} pushed {_short(sha)} to {b['target']}, but "
+                                            f"delivery.fast_forward_also did not move every branch: "
+                                            + "; ".join(warn), queued=True)
         if outcome == "rejected":
             st["backoff_until"] = now + BACKOFF_MAX_S
             later.append(("push_rejected", f"The push queue's push to {b['target']} was rejected: "

@@ -115,6 +115,8 @@ USER_SETTABLE = {
     "delivery.after_push_timeout_s": lambda v: push_queue_number("after_push_timeout_s", v),
     # A git remote each finished code task's branch is backed up to, fast-forward only; "" turns it off.
     "delivery.backup_remote": lambda v: _backup_remote(v),
+    # Branches each push also fast-forwards to the pushed commit (e.g. a 'last best' main); [] turns it off.
+    "delivery.fast_forward_also": lambda v: v,   # checked against delivery.push_branch in config_set
     # Code tasks whose spec asks for it land on delivery.push_branch with `ttp push` themselves.
     "delivery.code_tasks_may_push": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     # The runaway valve on task creation; the coordinator may raise it within MAX_TASKS_PER_DAY.
@@ -563,8 +565,9 @@ def _norm_severity(s: str | None) -> str:
 # safe direction and needs no one's word. Everything else the coordinator decides on its own.
 NEEDS_USER = {"budget.daily_usd": "spend", "budget.weekly_usd": "spend", "budget.reserve_pct": "spend",
               "budget.global_daily_usd": "spend",
-              "delivery.code_tasks_may_push": "review", "delivery.backup_remote": "access"}
-SAFE_WHEN_OFF = {"delivery.code_tasks_may_push", "delivery.backup_remote"}
+              "delivery.code_tasks_may_push": "review", "delivery.backup_remote": "access",
+              "delivery.fast_forward_also": "restriction"}
+SAFE_WHEN_OFF = {"delivery.code_tasks_may_push", "delivery.backup_remote", "delivery.fast_forward_also"}
 
 
 def tasks_made(db, since: float, review: bool = False) -> list[float]:
@@ -1035,7 +1038,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if key == "delivery.backup_remote" and (why := push.backup_problem({**(cfg.get("delivery") or {}),
                                                                                     "backup_remote": value})):
                     raise ValueError(why)
-                if key in NEEDS_USER and not user_turn and not (key in SAFE_WHEN_OFF and value in (False, "")):
+                if key == "delivery.fast_forward_also":
+                    value = push.fast_forward_check(value, str((cfg.get("delivery") or {}).get("push_branch") or ""))
+                if key in NEEDS_USER and not user_turn and not (key in SAFE_WHEN_OFF and value in (False, "", [])):
                     raise ValueError(f"{key} needs the user's approval: ask_user (blocking {NEEDS_USER[key]}) with the "
                                      f"exact value, and set it in the turn that carries their yes")
                 p.set_config(key, value)

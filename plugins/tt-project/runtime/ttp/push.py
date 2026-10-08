@@ -212,6 +212,66 @@ def exclude_list(v: Any) -> list[str]:
     return [posixpath.normpath(str(g).strip()) for g in _entries(v) if not isinstance(g, dict)]
 
 
+def fast_forward_list(v: Any) -> list[str]:
+    """`delivery.fast_forward_also` as branch names (a list, a JSON list or one per line); empty, the
+    default, turns it off."""
+    return list(dict.fromkeys(str(b).strip() for b in _entries(v) if not isinstance(b, dict) and str(b).strip()))
+
+
+def fast_forward_problem(branch: str, push_branch: str) -> str:
+    """Why `branch` may not be in `delivery.fast_forward_also`, or "" when it may. `push_branch` is
+    the resolved branch, or the raw setting (`<remote>/<branch>` or `<branch>`)."""
+    if branch == push_branch or push_branch.endswith(f"/{branch}"):
+        return "it is the push branch itself (delivery.push_branch)"
+    if branch.startswith("-") or subprocess.run(["git", "check-ref-format", f"refs/heads/{branch}"],
+                                                capture_output=True).returncode != 0:
+        return "not a valid branch name"
+    return ""
+
+
+def fast_forward_check(v: Any, push_branch: str) -> list[str]:
+    """`delivery.fast_forward_also` as config_set takes it; ValueError naming the first bad branch."""
+    names = fast_forward_list(v)
+    for b in names:
+        if why := fast_forward_problem(b, push_branch):
+            raise ValueError(f"delivery.fast_forward_also: {b!r}: {why}")
+    return names
+
+
+def fast_forward(repo: Path, remote: str, sha: str, branches: list[str], push_branch: str,
+                 say: Callable[[str], None] = lambda m: print(f"ttp push: {m}", file=sys.stderr)) -> list[str]:
+    """After `sha` reached `push_branch`, move each of `branches` (delivery.fast_forward_also) on
+    `remote` to it, without force and only when its tip there is an ancestor of `sha`. Each outcome
+    is read back from the remote with ls-remote: `ff <branch> <sha>`, or `not ff <branch>: <reason>`.
+    A `not ff` never undoes the main push; the caller reports it as a warning."""
+    out = []
+    for b in branches:
+        if why := fast_forward_problem(b, push_branch):
+            line = f"not ff {b}: {why}"
+        elif not (tip := _existing_tip(repo, remote, b)):
+            line = f"not ff {b}: {remote}/{b} does not exist or cannot be read"
+        elif tip != sha and not descends(repo, tip, sha):
+            line = f"not ff {b}: {remote}/{b} at {tip[:10]} is not an ancestor of {sha[:10]}; left as it is"
+        else:
+            r = _git(repo, "push", remote, f"{sha}:refs/heads/{b}") if tip != sha else None
+            ls = _git(repo, "ls-remote", "--heads", remote, f"refs/heads/{b}")
+            now = next((ln.split()[0] for ln in ls.stdout.splitlines() if ln.endswith(f"\trefs/heads/{b}")), "")
+            if now == sha:
+                line = f"ff {b} {sha}"
+            elif r is not None and r.returncode != 0:
+                line = f"not ff {b}: the push was rejected: {' / '.join(r.stderr.strip().splitlines()[-3:])[-300:]}"
+            else:
+                line = f"not ff {b}: {remote}/{b} reads {now[:10] or '(nothing)'} after the push, not {sha[:10]}"
+        say(line if line.startswith("ff ") else f"warning: {line}")
+        out.append(line)
+    return out
+
+
+def ff_warnings(lines: Any) -> list[str]:
+    """The `not ff` lines of a recorded fast_forward outcome."""
+    return [str(x) for x in lines or [] if str(x).startswith("not ff ")]
+
+
 def excluded(repo: Path, tip: str, head: str, globs: list[str]) -> list[str]:
     """Files a commit of `head` not yet on `tip` adds or modifies (a deletion is fine) that match
     one of `globs` (`matches`: a path, a directory by its files, or an fnmatch glob whose `*` also
@@ -1417,9 +1477,17 @@ def run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None)
                        timed=lambda s: record_check_s(p, s), base=base,
                        ff_only=own_ff_only(branch),
                        recorded=recorded or recorded_checks(os.environ.get("TTP_RUN_DIR")))
-    return push(repo, remote, branch, checks, rounds, hold=lambda: take(p, remote, branch, wait_s),
-                version_bump=version_bump, timed=lambda s: record_check_s(p, s),
-                exclude=exclude_list(d.get("push_exclude_paths")))
+    global last_ff
+    last_ff = []
+    rc = push(repo, remote, branch, checks, rounds, hold=lambda: take(p, remote, branch, wait_s),
+              version_bump=version_bump, timed=lambda s: record_check_s(p, s),
+              exclude=exclude_list(d.get("push_exclude_paths")))
+    if rc == 0 and last_pushed and (also := fast_forward_list(d.get("fast_forward_also"))):
+        last_ff = fast_forward(repo, remote, last_pushed, also, branch)
+    return rc
+
+
+last_ff: list[str] = []   # the fast_forward outcome of the last run(): `ff ...` / `not ff ...` lines
 
 
 def free(p: Project, repo: Path) -> int:
@@ -1685,6 +1753,8 @@ def run_detached(p: Project, repo: Path, marker: Path, own: bool = False) -> int
         pass
     m = _read(marker) or {"id": marker.stem, "pid": os.getpid(), "log": str(marker.with_suffix(".log"))}
     m.update(status="pushed" if rc == 0 else "failed", exit=rc, sha=sha, version=version, ended=time.time())
+    if rc == 0 and not own and last_ff:
+        m["fast_forward"] = last_ff
     if reason:
         m["reason"] = reason
     write_json(marker, m)
@@ -1806,6 +1876,8 @@ def result(marker: Path) -> int:
     if m.get("status") == "pushed":
         v = f", version {m['version']}" if m.get("version") else ""
         print(f"ttp push: pushed {m.get('sha')} to {m.get('target')}{v}")
+        for line in m.get("fast_forward") or []:
+            print(f"ttp push: {'warning: ' if line in ff_warnings([line]) else ''}{line}")
     else:
         why = m.get("reason") or f"exit {m.get('exit')}"
         print(f"ttp push: not pushed ({why}); log: {m.get('log')}")

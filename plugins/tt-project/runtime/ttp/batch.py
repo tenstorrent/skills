@@ -1024,10 +1024,18 @@ def run_batch(p: Project, marker: Path) -> int:
         outcome = b.push_phase()
     except Exception as e:      # recorded, never left without an outcome
         outcome = b.error(e)
+    ff = []
+    if b.pushed_sha and (also := push.fast_forward_list(b.d.get("fast_forward_also"))):
+        try:                    # still under the target's push lock; a failure never undoes the push
+            ff = push.fast_forward(b.repo, b.remote, b.pushed_sha, also, b.branch, say=say)
+        except Exception as e:
+            ff = [f"not ff {x}: {type(e).__name__}: {e}" for x in also]
     m = push._read(marker) or m
     conflicts = b.conflicts()
     m.update(outcome=outcome, tip=b.tip, pushed_sha=b.pushed_sha, version=b.version, results=b.results(),
              checks=b.checks, rounds=b.rounds, message=b.message or None, conflicts=conflicts)
+    if ff:
+        m["fast_forward"] = ff
     if conflicts["conflicted"]:
         say(f"conflicts: {conflicts['conflicted']} of {conflicts['entries']} entries, {conflicts['auto_resolved']} "
             f"settled without judgment ({conflicts['by_hunks']} by changes of different lines), "
@@ -1117,6 +1125,8 @@ def summary(marker: Path) -> int:
     head = f"batch {bid}: {outcome}" + (f", {str(sha)[:10]}" if sha else "") \
         + (f" as {m['version']}" if sha and m.get("version") else "") + f" to {m.get('target')}"
     print(f"ttp push: {head}" + (f" ({m['message']})" if m.get("message") and outcome != "pushed" else ""))
+    for line in m.get("fast_forward") or []:
+        print(f"  {'warning: ' if push.ff_warnings([line]) else ''}{line}")
     entries = {e.get("id"): e for e in m.get("entries") or [] if isinstance(e, dict)}
     for r in m.get("results") or []:
         e = entries.get(r.get("id")) or {}

@@ -13243,6 +13243,84 @@ def test_push_rebases_onto_the_moved_target_checks_the_result_and_pushes_without
     assert _git_out(origin, "rev-list", "--count", "proj") == "3", "history must stay linear"
 
 
+def _ff_setup(env, monkeypatch, also):
+    """_push_setup plus a `main` on origin at the target's tip, kept in step by delivery.fast_forward_also."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/main")
+    if also is not None:
+        p.set_config("delivery.fast_forward_also", also)
+    return p, repo, origin, other
+
+
+def test_push_fast_forwards_an_extra_branch_and_reads_it_back_from_the_remote(env, monkeypatch, capsys):
+    from ttp import push
+    p, repo, origin, other = _ff_setup(env, monkeypatch, ["main"])
+    _commit(repo, "mine.txt", "mine\n")
+    assert push.run(p, repo) == 0
+    sha = _git_out(origin, "rev-parse", "proj")
+    assert _git_out(origin, "rev-parse", "main") == sha
+    assert push.last_ff == [f"ff main {sha}"]
+    # The detached marker records it, and the probe reports the remote's state.
+    marker = p.state / "pushes" / "x.json"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps({"id": "x", "status": "pushed", "sha": sha, "target": "origin/proj",
+                                  "fast_forward": [f"ff main {sha}", "not ff old: rejected"]}))
+    capsys.readouterr()
+    assert push.result(marker) == 0
+    out = capsys.readouterr().out
+    assert f"ttp push: ff main {sha}" in out and "ttp push: warning: not ff old: rejected" in out
+
+
+def test_push_leaves_a_diverged_extra_branch_alone_and_says_not_ff(env, monkeypatch):
+    from ttp import push
+    p, repo, origin, other = _ff_setup(env, monkeypatch, ["main"])
+    _commit(other, "hotfix.txt", "fix\n")
+    _git_out(other, "push", "-q", "origin", "HEAD:main")
+    main = _git_out(origin, "rev-parse", "main")
+    _commit(repo, "mine.txt", "mine\n")
+    assert push.run(p, repo) == 0, "a not-ff never fails the main push"
+    sha = _git_out(origin, "rev-parse", "proj")
+    assert sha != main and _git_out(origin, "rev-parse", "main") == main, "the remote branch stays as it was"
+    assert len(push.last_ff) == 1 and push.last_ff[0].startswith("not ff main: ") \
+        and "not an ancestor" in push.last_ff[0], push.last_ff
+    assert push.ff_warnings(push.last_ff) == push.last_ff
+
+
+def test_push_without_fast_forward_also_moves_nothing_else(env, monkeypatch):
+    from ttp import push
+    p, repo, origin, other = _ff_setup(env, monkeypatch, None)
+    main = _git_out(origin, "rev-parse", "main")
+    for also in (None, [], ""):
+        if also is not None:
+            p.set_config("delivery.fast_forward_also", also)
+        _commit(repo, "mine.txt", f"{also!r}\n")
+        assert push.run(p, repo) == 0
+        assert _git_out(origin, "rev-parse", "main") == main and push.last_ff == []
+
+
+def test_fast_forward_also_refuses_the_push_branch_and_bad_names(env, monkeypatch):
+    from ttp import push
+    from ttp import coordinator as coord
+    from ttp.project import config_problems
+    p, repo, origin, other = _ff_setup(env, monkeypatch, ["proj", "a..b", "main"])
+    _commit(repo, "mine.txt", "mine\n")
+    assert push.run(p, repo) == 0
+    sha = _git_out(origin, "rev-parse", "proj")
+    assert push.last_ff == ["not ff proj: it is the push branch itself (delivery.push_branch)",
+                            "not ff a..b: not a valid branch name", f"ff main {sha}"]
+    for bad in ("proj", "origin/proj", "a..b", "-x"):
+        with pytest.raises(ValueError):
+            push.fast_forward_check([bad], "origin/proj")
+        assert config_problems({"delivery": {"push_branch": "origin/proj", "fast_forward_also": [bad]}}), bad
+    assert push.fast_forward_check('["main", "main", " release "]', "origin/proj") == ["main", "release"]
+    # From chat it needs the user's word; turning it off does not.
+    bad = {"type": "config_set", "key": "delivery.fast_forward_also", "value": ["main"]}
+    assert "ask_user (blocking restriction)" in coord.apply(p, [bad])[0]
+    assert "push branch" in coord.apply(p, [{**bad, "value": ["proj"]}], user_turn=True)[0]
+    assert coord.apply(p, [bad], user_turn=True) == [] and p.config()["delivery"]["fast_forward_also"] == ["main"]
+    assert coord.apply(p, [{**bad, "value": []}]) == []
+
+
 def test_push_starts_over_when_the_target_moves_during_the_checks(env, monkeypatch):
     log, once = env["tmp"] / "checked", env["tmp"] / "moved"
     p, repo, origin, other = _push_setup(env, monkeypatch, [])
@@ -14612,6 +14690,29 @@ def test_a_push_batch_lands_its_entries_with_one_bump_one_changeset_and_one_chec
     assert not list((p.state / "locks").glob("*run-b1*")), "no lock file of the batch is left behind"
 
 
+def test_a_push_batch_fast_forwards_the_extra_branches_it_is_given(env, monkeypatch, capsys):
+    from ttp import batch
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/main")
+    _git_out(other, "fetch", "-q", "origin")
+    _git_out(other, "checkout", "-q", "-b", "old", "origin/main")
+    _commit(other, "old.txt", "old\n")
+    _git_out(other, "push", "-q", "origin", "HEAD:refs/heads/old")
+    old = _git_out(origin, "rev-parse", "old")
+    p.set_config("delivery.fast_forward_also", ["main", "old"])
+    heads = [_entry(repo, "e1", {"f1.txt": "1\n"})]
+    marker = _batch_marker(p, heads)
+    rc, m = _run_batch(p, marker, monkeypatch)
+    sha = _git_out(origin, "rev-parse", "proj")
+    assert rc == 0 and m["outcome"] == "pushed" and m["pushed_sha"] == sha, m
+    assert _git_out(origin, "rev-parse", "main") == sha and _git_out(origin, "rev-parse", "old") == old
+    assert m["fast_forward"][0] == f"ff main {sha}" and m["fast_forward"][1].startswith("not ff old: "), m
+    capsys.readouterr()
+    assert batch.summary(marker) == 0
+    out = capsys.readouterr().out
+    assert f"  ff main {sha}" in out and "  warning: not ff old: " in out
+
+
 def _merge_entry(repo, name):
     """Entry `name`: a --no-ff merge, on origin/proj, of a task branch whose first commit is tagged."""
     _entry(repo, f"{name}-task", {f"plugins/p/{name}a.txt": "a\n"})
@@ -15262,6 +15363,7 @@ if m.get("outcome") is None:
     write(outcome=plan.get("outcome", "pushed"), tip=plan.get("tip"), pushed_sha=plan.get("sha"),
           version=plan.get("version"), checks={"runs": 1, "seconds": 2.0}, rounds=1, message=plan.get("message"),
           **({"tip_check": plan["tip_check"]} if "tip_check" in plan else {}),
+          **({"fast_forward": plan["ff"]} if "ff" in plan else {}),
           results=[{"id": e["id"], "status": rows.get(e["branch"], plan.get("row", "pushed")),
                     "task": e["task"], "detail": plan.get("detail") or {}} for e in m["entries"]])
     if not plan.get("after"):
@@ -15583,6 +15685,27 @@ def test_a_pushed_batch_closes_the_review_done_without_any_model_run(env, monkey
                      s.p.db.q("SELECT id FROM events"), s.p.db.task(s.review))
     before = state()
     assert pushq.finalize(s.p) == [] and pushq.tend(s.p) == [] and state() == before, "a second finalize changed things"
+
+
+def test_a_pushed_batch_reports_fast_forward_also_in_its_notice_and_warns_on_not_ff(env, monkeypatch):
+    from ttp.daemon import Daemon
+    s = _pq(env, monkeypatch)
+    sha = "ab" * 20
+    _pq_plan(s, outcome="pushed", sha=sha, tip="cd" * 20, version="0.3.1",
+             ff=[f"ff main {sha}", "not ff release: origin/release at 1234567890 is not an ancestor"])
+    _pq_hand_off(env, s)
+    mark = _pq_mark(s.p)
+    s.p.db.set_kv("last_coordinator_turn", time.time())
+    d = Daemon(s.p.base)
+    assert _run_until(d, s.p, lambda: s.p.db.task(s.review)["status"] == "done", timeout=60)
+    res = json.loads(s.p.db.task(s.review)["result"])
+    assert res["fast_forward"] == [f"ff main {sha}", "not ff release: origin/release at 1234567890 is not an ancestor"]
+    assert f"ff main {sha}; warning: not ff release:" in res["summary"]
+    evs = _pq_events(s.p, mark)
+    [done] = [e for e in evs if e["kind"] == "task_done"]
+    assert "warning: not ff release" in done["text"]
+    [warn] = [e for e in evs if e["kind"] == "push_not_ff"]
+    assert warn["status"] == "queued" and "not ff release" in warn["text"] and f"ff main {sha}" not in warn["text"]
 
 
 def _pq_rows(env, on=True):
