@@ -231,6 +231,11 @@ and preferences you add later become part of the project's charter and memory.
   started under a lock (a second start does nothing), runs jobs in arrival order, runs a job again
   after a drop or a host reboot, and skips a config that dropped `max_drops` times in a row until
   `ttp devq clear <runner> <config>`; drops go to its `drops.log`. `ttp devq status` shows the queue.
+  Before it queues a job, `ttp devq submit` lints its command so a job that would fail at once never
+  takes a slot: it refuses a command `bash -n` rejects and a script the command calls that is missing
+  on the runner's host or not valid shell there (checked over ssh in batch mode, read-only; an
+  unreachable host only warns), and warns when a script path, the job id or the workdir names a task
+  other than the submitting one. `--no-lint` skips the check.
   `legacy_driver` (a regex for the command line of the project's old per-task drivers) closes the
   race between the two paths: while one of the user's processes matches it, the runner does not
   start or start a job, and the probe keeps a task with a pending job waiting until it ends.

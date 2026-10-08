@@ -123,6 +123,169 @@ def source() -> str:
     return Path(__file__).read_text()
 
 
+# project side: `ttp devq submit` lints a job's command before it takes a slot ------------------------
+_SHELLS = {"bash", "sh", "dash", "zsh", "ksh"}
+_PYTHONS = re.compile(r"python[0-9.]*$")
+_WRAPPERS = {"exec", "nohup", "time", "nice", "setsid", "env", "timeout", "stdbuf", "command"}
+_KEYWORDS = {"then", "do", "else", "elif", "if", "while", "until", "!", "{", "}", "done", "fi"}
+_OPS = {"&&", "||", ";", "|", "&", "(", ")", ";;", "|&", ";&"}
+_REDIRECTS = re.compile(r"[0-9]*[<>]+&?$")
+_UNKNOWN = re.compile(r"[$`*?\[{]")
+_TASK_ID = re.compile(r"(?<![A-Za-z0-9])(?:t|task)[-_]?([0-9]+)(?![A-Za-z0-9])")
+
+
+def _words(cmd: str) -> list:
+    import shlex
+    lex = shlex.shlex(cmd.replace("\n", " ; "), posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    try:
+        return list(lex)
+    except ValueError:
+        return []
+
+
+def _segments(cmd: str) -> list:
+    out, cur = [], []
+    for w in _words(cmd):
+        if w in _OPS:
+            out.append(cur)
+            cur = []
+        else:
+            cur.append(w)
+    return [s for s in out + [cur] if s]
+
+
+def _join(cwd: str | None, path: str) -> str | None:
+    import posixpath
+    if path.startswith("/") or path == "~" or path.startswith("~/"):
+        return posixpath.normpath(path) if path.startswith("/") else path
+    return posixpath.normpath(posixpath.join(cwd, path)) if cwd is not None else None
+
+
+def called_scripts(cmd: str, workdir: str = "", depth: int = 0) -> list:
+    """(path, kind) for each script `cmd` runs or hands to an interpreter, as the host's runner will look
+    for it: relative paths are joined to the job's start folder (its workdir, else ~) or to a literal
+    `cd` earlier in the command. kind is "sh" (a shell script), "?" (run directly: a shell script only if
+    its #! line says so) or "file" (another interpreter's script). Words whose value only the host knows
+    ($VAR, `...`, globs) are left out, as are bare names found through PATH."""
+    found, cwd = [], workdir or "~"
+    for seg in _segments(cmd):
+        words, i = [], 0
+        while i < len(seg):                      # drop redirections and their targets
+            if _REDIRECTS.match(seg[i]):
+                i += 2
+                continue
+            words.append(seg[i])
+            i += 1
+        while words and (words[0] in _KEYWORDS or re.match(r"[A-Za-z_][A-Za-z0-9_]*=", words[0])):
+            words = words[1:]
+        while words and words[0].rsplit("/", 1)[-1] in _WRAPPERS:
+            wrapper, words = words[0].rsplit("/", 1)[-1], words[1:]
+            while words and (words[0].startswith("-") or (wrapper == "env" and "=" in words[0])):
+                words = words[1:]
+            if wrapper == "timeout" and words:
+                words = words[1:]                # its duration
+        if not words or words[0] in ("for", "case", "function"):
+            continue
+        head, base = words[0], words[0].rsplit("/", 1)[-1]
+        if head == "cd":
+            target = words[1] if len(words) > 1 else "~"
+            cwd = None if _UNKNOWN.search(target) or target == "-" else _join(cwd, target)
+            continue
+        if _UNKNOWN.search(head):
+            continue
+        script, kind = None, "?"
+        if head in ("source", ".") or base in _SHELLS or _PYTHONS.match(base):
+            kind = "file" if _PYTHONS.match(base) else "sh"
+            rest = words[1:]
+            while rest and rest[0].startswith("-"):
+                opt, rest = rest[0], rest[1:]
+                if kind == "sh" and opt == "-c" and rest:
+                    if depth < 2 and cwd is not None:
+                        found += [x for x in called_scripts(rest[0], cwd, depth + 1) if x not in found]
+                    rest = []
+                elif kind == "file" and opt in ("-c", "-m"):
+                    rest = []
+            script = rest[0] if rest else None
+        elif "/" in head:
+            script = head
+        if not script or _UNKNOWN.search(script) or (script.startswith("~") and not
+                                                      (script == "~" or script.startswith("~/"))):
+            continue
+        if kind == "?" and script.endswith((".sh", ".bash")):
+            kind = "sh"
+        path = _join(cwd, script)
+        if path and (path, kind) not in found:
+            found.append((path, kind))
+    return found
+
+
+def _check_script(path: str, kind: str, i: int) -> str:
+    """Shell that prints `M <i>` if the file is missing and `S <i> <error>` if bash -n refuses it."""
+    test = ("[ x = x ]" if kind == "sh" else "[ x = y ]" if kind == "file" else
+            "head -n 1 \"$f\" 2>/dev/null | grep -Eq '^#!.*[/ ]((ba|da|k|z)?sh)([[:space:]]|$)'")
+    return (f'f={_shell_path(path)}; if [ ! -f "$f" ]; then echo "M {i}"; '
+            f'elif [ -n "$b" ] && {test}; then e=$(bash -n "$f" 2>&1) || '
+            f'echo "S {i} $(printf %s "$e" | head -n 3 | tr "\\n" " ")"; fi')
+
+
+def lint(cmd: str, cfg: dict, job: str = "", workdir: str = "", task: str = "") -> tuple:
+    """(errors, warnings) for a job's command before `ttp devq submit` queues it. Errors: the command is
+    not valid shell (bash -n), or a script it calls is missing on the runner's host or not valid shell
+    there. The host is asked over ssh (BatchMode, a short timeout, read-only); an unreachable host is a
+    warning, and shell scripts present here under the same absolute path are checked here instead.
+    Warnings: a task id in a script path, the job id or the workdir that is not the submitting task's."""
+    errors, warnings = [], []
+    try:
+        r = subprocess.run(["bash", "-n", "-c", cmd], capture_output=True, text=True, timeout=30)
+        if r.returncode:
+            errors.append(f"the command is not valid shell (bash -n): {' '.join(r.stderr.split())[:300]}")
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    scripts = called_scripts(cmd, workdir)
+    if scripts:
+        s = settings(cfg)
+        snippet = "command -v bash >/dev/null 2>&1 && b=1; " + "; ".join(
+            _check_script(p, k, i) for i, (p, k) in enumerate(scripts)) + "; exit 0"
+        argv = (["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", s["host"], snippet] if s["host"]
+                else ["/bin/sh", "-c", snippet])
+        where = f"host {s['host']}" if s["host"] else "this machine"
+        try:
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+            ok = r.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            r, ok = None, False
+        if ok:
+            for line in r.stdout.splitlines():
+                tag, _, rest = line.partition(" ")
+                n, _, msg = rest.partition(" ")
+                if tag in ("M", "S") and n.isdigit() and int(n) < len(scripts):
+                    path = scripts[int(n)][0]
+                    errors.append(f"{path} does not exist on {where}" if tag == "M" else
+                                  f"{path} is not valid shell (bash -n on {where}): {msg.strip()[:300]}")
+        else:
+            why = f"exit {r.returncode}: {' '.join(r.stderr.split())[:200]}" if r else "no answer in 30 s"
+            warnings.append(f"could not check the scripts on {where} ({why}); they were not checked there")
+            for path, kind in scripts:
+                if kind != "file" and path.startswith("/") and Path(path).is_file() and (
+                        kind == "sh" or re.match(r"#!.*[/ ]((ba|da|k|z)?sh)(\s|$)",
+                                                 Path(path).read_text(errors="replace").split("\n", 1)[0])):
+                    try:
+                        r2 = subprocess.run(["bash", "-n", path], capture_output=True, text=True, timeout=30)
+                    except (OSError, subprocess.TimeoutExpired):
+                        continue
+                    if r2.returncode:
+                        errors.append(f"{path} is not valid shell (bash -n on this machine): "
+                                      f"{' '.join(r2.stderr.split())[:300]}")
+    if task:
+        for label, text in ([("job id", job), ("workdir", workdir)] + [("script", p) for p, _ in scripts]):
+            other = sorted({m for m in _TASK_ID.findall(text or "") if m.lstrip("0") != str(task).lstrip("0")})
+            if other:
+                warnings.append(f"the {label} {text} names task {', '.join(other)}, but this is task {task}: "
+                                f"copied from another task? (ignore this if it is not a task id)")
+    return errors, warnings
+
+
 # host side: everything below runs on the device host ------------------------------------------------
 def job_limit(spec: dict, cfg: dict) -> float:
     """The job's time limit in seconds (0 = none): its timeout_s, else job_timeout_s, else the cap."""

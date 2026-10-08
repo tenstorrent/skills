@@ -28312,6 +28312,94 @@ def test_ttp_devq_cli_submits_locally_and_the_config_and_prompt_name_the_runner(
     assert "device runners" not in worker_task(p, p.db.task(tid), str(p.root), None)
 
 
+def _fake_ssh(tmp_path):
+    """A stand-in `ssh` on PATH: logs its arguments and runs the remote command here, or exits 255 like
+    an unreachable host while the file `down` exists. No real host is ever contacted."""
+    b = tmp_path / "fakebin"
+    b.mkdir(exist_ok=True)
+    ssh = b / "ssh"
+    ssh.write_text(f'''#!/bin/sh
+echo "$@" >> {tmp_path}/ssh.log
+[ -e {tmp_path}/down ] && {{ echo "ssh: connect to host box port 22: Connection timed out" >&2; exit 255; }}
+for a; do last=$a; done
+exec /bin/sh -c "$last"
+''')
+    ssh.chmod(0o755)
+    return b
+
+
+def test_devq_called_scripts_finds_the_scripts_a_job_command_runs():
+    from ttp.devq import called_scripts
+    assert called_scripts("./run.sh a b", "/w") == [("/w/run.sh", "sh")]
+    assert called_scripts("cd /opt/x && bash -x scripts/go.sh 3 > out.log 2>&1", "/w") == [
+        ("/opt/x/scripts/go.sh", "sh")]
+    assert called_scripts("FOO=1 timeout 600 /a/drv", "") == [("/a/drv", "?")], "an executable: #! decides"
+    assert called_scripts("python3 -u tools/t.py --x") == [("~/tools/t.py", "file")], "no workdir: from ~"
+    assert called_scripts("sh -c 'cd /w && ./t12/run.sh'") == [("/w/t12/run.sh", "sh")]
+    assert called_scripts("source ~/env.sh; make") == [("~/env.sh", "sh")]
+    for unknown in ("echo hi", "$HOME/x.sh", "cd $D && ./x.sh", "python3 -m foo", "run.sh", "./a 'b"):
+        assert called_scripts(unknown, "/w") == [], unknown
+
+
+def test_devq_lint_refuses_missing_or_broken_scripts_and_warns_on_another_tasks_id(tmp_path, monkeypatch):
+    from ttp import devq
+    good, bad, py = tmp_path / "good.sh", tmp_path / "bad.sh", tmp_path / "x.py"
+    good.write_text("#!/bin/bash\necho ok\n")
+    bad.write_text("#!/bin/bash\nif true; then\n")
+    py.write_text("if:\n")
+    exe = tmp_path / "drv"
+    exe.write_text("#!/usr/bin/env bash\nfor x in; do\n")
+    w = str(tmp_path)
+    # This machine (no host): bash -n on the command, files checked here.
+    assert devq.lint(f"cd {w} && ./good.sh && python3 x.py", {}) == ([], [])
+    errs, _ = devq.lint("./missing.sh", {}, workdir=w)
+    assert errs == [f"{w}/missing.sh does not exist on this machine"]
+    errs, _ = devq.lint(f"bash {bad}; {exe}", {})
+    assert len(errs) == 2 and all("is not valid shell (bash -n on this machine)" in e for e in errs), errs
+    errs, _ = devq.lint("if true; then echo", {})
+    assert errs and "the command is not valid shell (bash -n)" in errs[0]
+    # A remote host, through a fake ssh: batch mode and a short connect timeout, checked there.
+    monkeypatch.setenv("PATH", f"{_fake_ssh(tmp_path)}:{os.environ['PATH']}")
+    errs, warns = devq.lint(f"{w}/missing.sh && {good}", {"host": "box"})
+    assert errs == [f"{w}/missing.sh does not exist on host box"] and warns == []
+    log = (tmp_path / "ssh.log").read_text()
+    assert "BatchMode=yes" in log and "ConnectTimeout=10" in log and " box " in log
+    # Unreachable: a warning, never a refusal; shell scripts here under the same path still get bash -n.
+    (tmp_path / "down").write_text("")
+    errs, warns = devq.lint(f"{w}/missing.sh && {good}", {"host": "box"})
+    assert errs == [] and len(warns) == 1 and "could not check the scripts on host box (exit 255" in warns[0]
+    errs, _ = devq.lint(f"bash {bad}", {"host": "box"})
+    assert len(errs) == 1 and "bash -n on this machine" in errs[0]
+    # Another task's id in a script path, the job id or the workdir: a warning only.
+    errs, warns = devq.lint(f"{w}/wt/t17/run.sh", {"host": "box"}, job="t17-a", workdir="/w/task-17", task="23")
+    assert errs == [] and sum("names task 17, but this is task 23" in x for x in warns) == 3, warns
+    _, warns = devq.lint(f"{w}/wt/t23/run.sh", {"host": "box"}, job="t23-a", task="23")
+    assert not any("names task" in x for x in warns)
+    _, warns = devq.lint("true", {}, job="t17-a")
+    assert warns == [], "no submitting task, nothing to compare"
+
+
+def test_ttp_devq_submit_refuses_a_job_whose_script_is_missing_on_the_host_unless_no_lint(env, tmp_path):
+    p = make(env)
+    d = tmp_path / "rq"
+    p.set_config("device", {"runners": {"dev": {"host": "box", "dir": str(d), **DEVQ_FAST}}})
+    path = {"PATH": f"{_fake_ssh(tmp_path)}:{os.environ['PATH']}", "TTP_TASK": "9"}
+    try:
+        r = _ttp_run(p, "devq", "submit", "dev", "--id", "t9-a", "--workdir", str(tmp_path), "--",
+                     "./scripts/t4/drive.sh", env=path)
+        assert r.returncode != 0 and "refused, the job would fail at once" in r.stderr, r.stderr
+        assert f"{tmp_path}/scripts/t4/drive.sh does not exist on host box" in r.stderr and "--no-lint" in r.stderr
+        assert "names task 4, but this is task 9" in r.stderr
+        assert not (d / "queue").exists() or not list((d / "queue").iterdir()), "a refused job is not queued"
+        r = _ttp_run(p, "devq", "submit", "dev", "--id", "t9-b", "--workdir", str(tmp_path), "--no-lint", "--",
+                     "./scripts/t4/drive.sh", env=path)
+        assert r.returncode == 0 and "queued t9-b" in r.stdout and "warning" not in r.stderr, r.stderr
+        assert _devq_marker(d, "t9-b")["rc"] == 127, "the override queues it as it is"
+    finally:
+        with contextlib.suppress(OSError, ValueError):
+            os.kill(int((d / "runner.pid").read_text()), signal.SIGKILL)
+
+
 def test_device_timeout_ceiling_clamps_or_refuses_devq_timeouts_and_reaches_the_worker(env, tmp_path):
     p = make(env)
     d = tmp_path / "rq"

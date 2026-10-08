@@ -1617,7 +1617,9 @@ def cmd_detach(a) -> None:
 def cmd_devq(a) -> None:
     """The project's serial device-job runners (config `device.runners.<name>`; see devq.py).
 
-    `ttp devq submit <runner> --id <id> [--config <key>] [--timeout <s>] [--workdir <dir>] -- <command>`
+    `ttp devq submit <runner> --id <id> [--config <key>] [--timeout <s>] [--workdir <dir>] [--no-lint] -- <command>`
+    lints the command first (devq.lint: bash -n, the scripts it calls exist on the host, a task id not
+    this task's; --no-lint skips it), then
     queues one job on the runner's host and starts the runner if it is down (with runner.device_timeout_max_s
     set, it refuses a longer --timeout and gives a job without one that ceiling); it prints the retry_when,
     `ttp devq probe <runner> <id>`, which exits 0 once the job has its done marker, or once no runner is
@@ -1646,12 +1648,13 @@ def cmd_devq(a) -> None:
     rest = list(a.rest or [])
     if a.op == "submit":
         usage = ("usage: ttp devq submit <runner> --id <id> [--config <key>] [--timeout <s>] [--workdir <dir>] "
-                 "-- <command...>")
+                 "[--no-lint] -- <command...>")
         opts, rest = (rest[:rest.index("--")], rest[rest.index("--") + 1:]) if "--" in rest else (rest, [])
         sp = argparse.ArgumentParser(prog="ttp devq submit", add_help=False)
         for flag in ("--id", "--config", "--workdir"):
             sp.add_argument(flag, default="")
         sp.add_argument("--timeout", type=int, default=0)
+        sp.add_argument("--no-lint", action="store_true")
         try:
             o, extra = sp.parse_known_args(opts)
         except SystemExit:
@@ -1669,6 +1672,13 @@ def cmd_devq(a) -> None:
             print(f"devq submit: no --timeout; the job gets the project's device-job ceiling of {ceiling} s")
         spec = {"id": o.id, "config": o.config or o.id, "cmd": rest[0] if len(rest) == 1 else shlex.join(rest),
                 "task": os.environ.get("TTP_TASK", ""), "workdir": o.workdir, "timeout_s": timeout}
+        if not o.no_lint:
+            errors, warnings = devq.lint(spec["cmd"], rc, o.id, o.workdir, spec["task"])
+            for w in warnings:
+                print(f"devq submit: warning: {w}", file=sys.stderr)
+            if errors:
+                die("devq submit: refused, the job would fail at once: " + "; ".join(errors)
+                    + " (fix the command, or pass --no-lint if this check is wrong)")
         args, install, limit = [cfg_json, json.dumps(spec)], True, 120
     elif a.op == "start":
         args, install, limit = [cfg_json], True, 120
@@ -2903,7 +2913,7 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("runner", nargs="?")
     s.add_argument("rest", nargs=argparse.REMAINDER,
                    help="submit: --id <unique id> [--config <drop-rule key; default the id>] [--timeout <s>] "
-                        "[--workdir <dir on the host>] -- <command>; probe: <id>; status: [<id>]; clear: <config>")
+                        "[--workdir <dir on the host>] [--no-lint] -- <command>; probe: <id>; status: [<id>]; clear: <config>")
     s.set_defaults(fn=cmd_devq)
 
     for name, fn in (("list", cmd_list),):
