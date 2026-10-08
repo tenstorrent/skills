@@ -24772,8 +24772,9 @@ def test_the_review_prompt_and_coordinator_treat_a_head_in_a_pr_as_delivered(env
                "a pass is `done`, with no push and no approval for the push queue" in text, on
     coord_md = " ".join((RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text().split())
     assert "A head already delivered as a PR (draft or open, same head) is delivered" in coord_md
-    assert "a change whose spec forbids the push branch, or whose whole diff `delivery.push_exclude_paths` " \
-           "keeps off it (notes only): review only, no push or push-queue step" in coord_md
+    assert "a change whose whole diff `delivery.push_exclude_paths` keeps off the push branch (notes only), " \
+           "or whose spec or hand-off marks it: review only, no push or push-queue step" in coord_md
+    assert "put a line `no_push: <why>` in its spec" in coord_md
 
 
 def test_the_review_of_a_change_that_must_not_reach_the_push_branch_has_no_push_step(env, monkeypatch):
