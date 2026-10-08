@@ -1872,6 +1872,17 @@ _FORBIDS_RE = re.compile(r"\b(?:never|do not|does not|must not|cannot|forbidden|
                          r"|\b(?:don|doesn|mustn|can)'t\b", re.I)
 _ALLOWS_RE = re.compile(r"\b(?:allowed|permitted|may|(?:is|are) fine|fine to|ok(?:ay)? to|lift(?:s|ed)?|can now|"
                         r"no longer)\b", re.I)
+# A permission inside a conditional clause ("where PRs are allowed", "once allowed", "if ... is ever
+# allowed") or limited to a condition ("allowed only on the user's word", "may only ...") lifts nothing.
+_PERMIT = r"(?:allowed|permitted|lift(?:s|ed)?|may|fine|ok(?:ay)?)"
+_CONDITIONAL_PERMIT_RE = re.compile(r"\b(?:where|once|if|when|whenever|until|unless|provided|as long as)\b"
+                                    rf"[^,.;:!?()]*?\b{_PERMIT}\b", re.I)
+_LIMITED_PERMIT_RE = re.compile(rf"\b{_PERMIT}\s+(?:be\s+)?only\b|\bonly\s+(?:be\s+)?{_PERMIT}\b", re.I)
+# The words after which a rule's main verb comes ("never push", "may run", "allowed to merge"), and
+# words skipped before it ("never directly push").
+_MAIN_VERB_RE = re.compile(r"\b(?:never|do not|does not|must not|cannot|(?:don|doesn|mustn|can)'t|no|may|can now|"
+                           r"(?:allowed|permitted|fine|ok(?:ay)?) to)\s+((?:[\w-]+\s*(?:,|\bor\b|\band\b)?\s*)+)", re.I)
+_VERB_SKIP = {"ever", "again", "be", "a", "an", "the", "any", "longer", "even", "yet", "now", "also", "just", "still"}
 # An item that names its own exception ("except as the dated section allows") has been reconciled.
 _OWN_EXCEPTION_RE = re.compile(r"\b(?:except|unless|other than|apart from|save for|excluding)\b", re.I)
 # Actions, by what they do. A generic change ("modify", "write") covers every action that changes
@@ -1902,26 +1913,58 @@ _SHORT_STOP = {"the", "and", "for", "not", "may", "can", "its", "own", "are", "w
                "any", "you", "our", "per", "via", "now", "too", "yet", "one"}
 
 
+def _unconditional(sentence: str) -> str:
+    """The sentence without its conditional or limited permissions (_CONDITIONAL_PERMIT_RE)."""
+    return _LIMITED_PERMIT_RE.sub(" ", _CONDITIONAL_PERMIT_RE.sub(" ", sentence))
+
+
 def _stance(sentence: str) -> str:
     """"forbid", "allow", or "" for a sentence that says neither or both."""
-    s = _NO_LONGER_BANNED_RE.sub(" allowed ", _NEG_PERMIT_RE.sub(" never ", sentence))
+    s = _unconditional(_NO_LONGER_BANNED_RE.sub(" allowed ", _NEG_PERMIT_RE.sub(" never ", sentence)))
     forbids, allows = bool(_FORBIDS_RE.search(s)), bool(_ALLOWS_RE.search(s))
     return "forbid" if forbids and not allows else "allow" if allows and not forbids else ""
 
 
-def _rule_target(sentence: str) -> tuple[set[str], set[str]]:
-    """A rule's (action families, object words): what it does, and what to (a branch, path, repo, box)."""
-    words = re.findall(r"[a-z0-9][\w./-]*[a-z0-9]|[a-z0-9]", sentence.lower().replace("'s ", " "))
+def _main_verbs(sentence: str) -> set[str] | None:
+    """The action families of a rule's main verb, the one after its stance word ("never disturb",
+    "may run", "allowed to merge"), with the verbs joined to it ("never touch or push"); a verb that
+    is no known action is its own family. None when no stance word is followed by a verb ("Pushing
+    to main is allowed"). A participle used as a modifier ("running jobs") is never the action."""
+    m = _MAIN_VERB_RE.search(sentence)
+    if not m:
+        return None
     acts: set[str] = set()
+    for w in re.split(r"\s*(?:,|\bor\b|\band\b)\s*|\s+", m.group(1).lower()):
+        if not w or w in _VERB_SKIP or w.endswith("ly") and not acts:
+            continue
+        if w in ("pr", "prs", "pull"):
+            return {"open"}
+        if not acts and (w in _STANCE_WORDS or _stem(w) in _STANCE_WORDS):
+            return None   # "is never allowed", "no longer forbidden": the stance, not a verb
+        fam = _ACTIONS.get(_stem(w)) or _ACTIONS.get(w)
+        if not fam:
+            return acts or {_stem(w)}
+        acts |= fam
+    return acts or None
+
+
+def _rule_target(sentence: str) -> tuple[set[str], set[str]]:
+    """A rule's (action families, object words): what it does (its main verb, _main_verbs, else every
+    action word), and what to (a branch, path, repo, box)."""
+    words = re.findall(r"[a-z0-9][\w./-]*[a-z0-9]|[a-z0-9]", sentence.lower().replace("'s ", " "))
+    main = _main_verbs(sentence)
+    acts: set[str] = set(main or ())
     objs: set[str] = set()
     for w in words:
         if w in ("pr", "prs") or w == "pull" and "pull request" in sentence.lower():
-            acts.add("open")   # "open a PR", "no PRs": the action is opening one
+            if main is None:
+                acts.add("open")   # "open a PR", "no PRs": the action is opening one
             continue
         stem = _stem(w)
         fam = _ACTIONS.get(stem) or _ACTIONS.get(w)
         if fam:
-            acts |= fam
+            if main is None:
+                acts |= fam
         elif (len(w) >= 3 or "/" in w or w.isdigit()) and w not in _RULE_STOP and stem not in _STANCE_WORDS \
                 and w not in _STANCE_WORDS and w not in _SHORT_STOP:
             objs.add(stem)
@@ -2002,10 +2045,11 @@ def charter_conflict_lines(pairs: list[dict]) -> list[str]:
     if not pairs:
         return []
     return (["## Charter conflicts (Restrictions items that contradict each other; workers obey both, so the "
-             "stricter wins). Retire the stale side now: newer text the user approved supersedes it, so "
-             "charter_update its section with `quote` set to it, `text` what still holds (empty to drop it) "
-             "and `over` naming the user's newer word. If both truly hold, rewrite the forbidding one to name "
-             "its exception (\"..., except as <the other> allows\")."]
+             "stricter wins). Settle each pair by what the user said, one of two equal fixes: if the user's "
+             "newer word replaced one side, charter_update its section with `quote` set to it, `text` what "
+             "still holds (empty to drop it) and `over` naming that word; if both hold (one is the other's "
+             "exception or condition), rewrite the forbidding one to name its exception (\"..., except as "
+             "<the other> allows\"). Never drop a restriction the user did not change."]
             + [f"- \"{clip(x['forbid'], 200)}\" ({x['forbid_section']}) vs \"{clip(x['allow'], 200)}\" "
                f"({x['allow_section']})" for x in pairs])
 
@@ -2026,7 +2070,7 @@ def _append_conflicts(charter: str, section: str, text: str) -> list[tuple[str, 
             ns = _stance(s)
             if (st == "forbid" and ns == "allow" and _contradicts(item, s)
                     or st == "allow" and ns == "forbid" and _contradicts(s, item)
-                    or st == "forbid" and ns != "allow" and _LOOSEN_RE.search(s)
+                    or st == "forbid" and ns != "allow" and _LOOSEN_RE.search(_unconditional(s))
                     and not _OWN_EXCEPTION_RE.search(item) and _widens(item, _rule_words(s))
                     and not _restates_limit(item, s)):
                 if (item, sec) not in out:
@@ -2058,11 +2102,14 @@ def _reject_contradicting_append(p: Project, section: str, text: str, user_turn:
     raise ValueError(
         f"charter_update: {clip(text, 200)!r} contradicts the Restrictions item "
         + "; ".join(f"\"{clip(i, 200)}\" (section {s!r})" for i, s in hits)
-        + ", which would stay standing, and workers obey it as binding. Change that item instead: resend "
-          f"with section {first[1]!r}, `quote` \"{first[0]}\" and this `text`"
+        + ", which would stay standing, and workers obey it as binding. Pick by what the user meant, two "
+          "equal fixes: if this text replaces that item, resend with section "
+          f"{first[1]!r}, `quote` \"{first[0]}\" and this `text`"
         + (" (the user's yes is on record for it)" if said else ", with `over` naming the user's word that changed it")
-        + (". Retire the other items with `quote` and `over` too" if len(hits) > 1 else "")
-        + ". If both truly hold, resend with `both_hold`: true")
+        + (", and retire the other items with `quote` and `over` too" if len(hits) > 1 else "")
+        + "; if both hold (this is the item's exception or condition, or not about the same thing), resend "
+          "with `both_hold`: true, or rewrite the item to name its exception. Never drop a restriction the "
+          "user did not change")
 
 
 def _append_update(steer: Path, text: str, key: str | None = None) -> None:

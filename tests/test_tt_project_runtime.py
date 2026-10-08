@@ -4541,6 +4541,21 @@ def test_an_append_that_contradicts_a_standing_restriction_is_rejected_quoting_i
         p.charter_path.write_text(base)
         assert coord.apply(p, [{"type": "charter_update", **a} for a in acts], turn=40 + k, user_turn=user) == []
         assert conflicts() == [], acts
+    # A permission inside a conditional or limiting clause lifts nothing, and a participle used as a
+    # modifier ("running jobs") is not the rule's action: none of these is rejected.
+    p.charter_path.write_text("# demo\n\n## Restrictions\n- Never open pull requests.\n- Never push to main.\n"
+                              "- Never disturb the other project's running jobs.\n")
+    for k, text in enumerate(("PR flow, for any repo where PRs are allowed: open a draft PR once tested.",
+                              "Once PRs are allowed, open drafts first.",
+                              "If pushing to main is ever allowed, the user says so first.",
+                              "Workers may run jobs on the device when it is free.")):
+        assert coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": text}],
+                           turn=50 + k, user_turn=True) == [], text
+    # The rejection offers keeping both as an equal fix, not a fallback after replacing the item.
+    p.charter_path.write_text(base)
+    err = coord.apply(p, [{"type": "charter_update", "section": "Policies",
+                           "text": "Workers may push to the main branch for hotfixes."}], turn=60, user_turn=True)
+    assert "two equal fixes" in err[0] and "Never drop a restriction the user did not change" in err[0], err
 
 def test_restriction_pairs_flags_contradicting_restrictions_items_and_only_those(env):
     from ttp.coordinator import restriction_pairs
@@ -4572,7 +4587,11 @@ def test_restriction_pairs_flags_contradicting_restrictions_items_and_only_those
                  "- Push only to branch dev/x of org/repo. Never push to main. Never open pull requests.\n"
                  "- Keep content generic: no hostnames, internal URLs or credentials.\n"
                  "- Never force-push to dev/x. Always fetch and rebase before pushing.\n"
-                 "- Resource pauses are lifted only on the user's explicit word.\n"):
+                 "- Resource pauses are lifted only on the user's explicit word.\n",
+                 # a permission limited to a condition is a restriction, not a lift
+                 "- Never use a paused device.\n- Device pauses are lifted only on the user's explicit word.\n",
+                 "- Never push to main.\n- Pushing to main is allowed only on the user's explicit word.\n",
+                 "- Never disturb the other project's running jobs.\n- Workers may run jobs on the device.\n"):
         assert pairs(body) == [], body
 
 
@@ -4584,7 +4603,7 @@ def test_charter_conflicts_show_in_the_digest_raise_effort_once_and_reach_the_da
                               "## Restrictions (added 2026-10-05, turn 3.0)\n- Pushing to main is allowed.\n")
     text = coord.digest(p, {}, [], [])
     head = "## Charter conflicts (Restrictions items that contradict each other"
-    assert head in text and "`quote`" in text and "`over`" in text
+    assert head in text and "`quote`" in text and "`over`" in text and "two equal fixes" in text
     assert ("- \"Never modify main.\" (Restrictions) vs \"Pushing to main is allowed.\" "
             "(Restrictions (added 2026-10-05, turn 3.0))") in text
     found = coord.charter_conflicts(p)
