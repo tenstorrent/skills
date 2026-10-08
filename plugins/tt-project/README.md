@@ -139,7 +139,13 @@ and preferences you add later become part of the project's charter and memory.
   to each such review's spec (for example, what to do after a push). When the task's PR already
   carries the reviewed head (as pr-watch last read it, or as the task's own `ttp push --own`
   pushed it), the work is delivered: the review is review only, with no push to
-  `delivery.push_branch` and no push-queue approval. A review the coordinator adds
+  `delivery.push_branch` and no push-queue approval. So is the review of a change that must not
+  reach the push branch: every file its diff since the base changes matches
+  `delivery.push_exclude_paths`, its hand-off sets `no_push` (true or the reason), or its spec or
+  hand-off summary forbids it in plain words ("must not be pushed to the push branch", "never push
+  this to <push branch>", "keep it off the push branch"; a bare "do not push", or one followed by
+  "yourself" or "directly", is not read as one). The review's spec says why, its fix and re-review
+  stay review only, and the push queue ignores its approval. A review the coordinator adds
   for the same work replaces the daemon's while it has not started. A review that fails with
   follow-ups gets one fix task on the reviewed branch and a re-review from the daemon, and the
   tasks waiting on the failed review wait on the re-review instead of being blocked (at most two

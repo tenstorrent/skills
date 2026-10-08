@@ -19,6 +19,8 @@
   never the full suite: each fix changes the tree, so a full run per fix is wasted. Run `ttp checks`
   once at the end, committed, before the hand-off. A direct full-suite run is refused.
 - Keep the diff minimal and on-topic. No drive-by rewrites.
+- A change your spec says must not reach the push branch: put `"no_push": "<why>"` in result.json,
+  so its review is review only.
 
 ## Landing on the project's branch (only when both hold)
 

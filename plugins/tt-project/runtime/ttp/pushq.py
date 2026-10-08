@@ -172,6 +172,8 @@ def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None
         return {"ignored": "the push queue is off (delivery.push_queue)"}
     if not push_allowed(d):
         return {"ignored": "this project does not allow pushing (delivery.push_allowed)"}
+    if push.REVIEW_ONLY_LABEL in push._labels(task):
+        return {"ignored": "this review is review only: its change must not reach the push branch"}
     tgt = target(p) if enabled(p, cfg) else None
     if not tgt:
         return {"invalid": "no target branch: set delivery.push_branch"}

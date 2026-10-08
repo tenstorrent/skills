@@ -725,6 +725,42 @@ def delivered_pr(p: Project, task: dict, head: str) -> str | None:
     return None
 
 
+REVIEW_ONLY_LABEL = "review_only"   # a review whose change must not reach the push branch (kept_off)
+_NO_PUSH_VERB = (r"(?:do not|don't|never|must not|mustn't|should not|shall not|may not|cannot|can't)\s+"
+                 r"(?:be\s+)?(?:push(?:ed)?|land(?:ed)?|reach)\s+(?:(?:it|this|this change|the change|them)\s+)?"
+                 r"(?:(?:to|on|onto|into)\s+)?")
+_NO_PUSH_OFF = r"(?:keep|kept|keeps)\s+(?:(?:it|this|this change|the change|them)\s+)?off\s+"
+# "yourself", "directly", ... make it the usual rule that the review, not the worker, pushes.
+_NO_PUSH_NOT = r"(?![\w/-])(?!\s+(?:yourself|directly|by hand|manually|with git|until|before|unless|except))"
+
+
+def kept_off(task: dict, changes: dict | None, d: dict) -> str:
+    """Why a code task's change must not reach `delivery.push_branch`, or "" when it may: every path
+    of its diff since the base (`changes`, worktree.diff_lines) matches `delivery.push_exclude_paths`,
+    its hand-off sets `no_push` (true or the reason), or its spec or hand-off summary forbids the push
+    branch in plain words ("must not be pushed to the push branch", "never push this to <branch>",
+    "keep it off the push branch"). A bare "do not push", or one followed by "yourself" or
+    "directly", is the usual rule that the review pushes, not a prohibition. Its review is then
+    review only: no `ttp push` and no push-queue approval."""
+    globs = exclude_list(d.get("push_exclude_paths"))
+    if changes and globs and all(any(matches([f], g) for g in globs) for f in changes):
+        return "every file it changes is one delivery.push_exclude_paths keeps off the push branch"
+    from .db import load_result
+    result = load_result(task.get("result"))
+    flag = result.get("no_push")
+    if flag not in (None, False, "", 0):
+        return "its hand-off says it must not reach the push branch" + (
+            f" ({str(flag)[:200]})" if isinstance(flag, str) else "")
+    branch = str(d.get("push_branch") or "").strip()
+    names = "|".join(map(re.escape, filter(None, ("push branch", branch, branch and f"origin/{branch}"))))
+    rx = re.compile(rf"\b(?:{_NO_PUSH_VERB}|{_NO_PUSH_OFF})(?:the\s+)?(?:{names}){_NO_PUSH_NOT}", re.I)
+    for what, text in (("spec", task.get("spec")), ("hand-off", result.get("summary"))):
+        m = rx.search(str(text or ""))
+        if m:
+            return f"its {what} says {' '.join(m.group(0).split())!r}"
+    return ""
+
+
 def refusal(repo: Path, remote: str, branch: str) -> str:
     """Why `branch` on `remote` must not be pushed to, or "" when it may. Fails closed when the
     remote cannot be asked for its default branch."""

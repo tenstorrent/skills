@@ -3865,11 +3865,18 @@ class Daemon:
         # A head its PR already carries is delivered: a pass closes the review, with no push to the
         # push branch or approval for the push queue (that branch may be unrelated, or not exist yet).
         delivered = push.delivered_pr(self.p, task, full)
-        pushes = bool(d.get("push_branch") and d.get("push_allowed", True)) and not delivered
+        # A change that must not reach the push branch (its diff is all push-excluded, or its spec or
+        # hand-off forbids it) is review only too: a pass would push what the push refuses or the spec bans.
+        off = "" if delivered or not d.get("push_branch") else push.kept_off(task, changes, d)
+        pushes = bool(d.get("push_branch") and d.get("push_allowed", True)) and not delivered and not off
         if delivered:
             lines.append(f"Its head is already delivered as PR {delivered}: review only. If it passes, hand off "
                          f"`done`; do not run `ttp push` or approve it for the push queue. Leave the branch and "
                          f"the PR as they are.")
+        elif off:
+            lines.append(f"It must not reach {d['push_branch']}: {off}. Review only: if it passes, hand off "
+                         f"`done`; do not run `ttp push` or approve it for the push queue. Leave the branch"
+                         + (" and the PR" if pr else "") + " as they are.")
         elif pushes:
             lines.append(f"If it passes, push it with `ttp push` from the change's worktree (it publishes to "
                          f"{d['push_branch']}).")
@@ -3882,7 +3889,7 @@ class Daemon:
             lines.append(str(rules["auto_notes"]).strip())
         lines.append("Return the verdict and findings" + (", and the pushed commit." if pushes else "."))
         labels = [f"auto_review:{task['id']}"] + ([f"continues:{prior['id']}"] if prior else []) \
-            + ([PRECHECK_LABEL + checks.name] if checks else [])
+            + ([PRECHECK_LABEL + checks.name] if checks else []) + ([push.REVIEW_ONLY_LABEL] if off else [])
         rid = db.add_task(title, "\n".join(lines), kind="review", tier=tier, priority=2, origin="daemon",
                           budget_usd=float(cfg["budget"]["task_default_usd"].get(tier, 8.0)),
                           depends_on=[task["id"]], labels=labels)
@@ -3905,7 +3912,8 @@ class Daemon:
         d = self.cfg.get("delivery") or {}
         branch = task.get("branch")
         if review["status"] != "queued" or review["kind"] != "review" or not branch \
-                or not (d.get("push_branch") and d.get("push_allowed", True)):
+                or not (d.get("push_branch") and d.get("push_allowed", True)) \
+                or push.REVIEW_ONLY_LABEL in push._labels(review):
             return
         try:
             full = worktree._git(self.p.root, "rev-parse", branch)
@@ -4032,6 +4040,8 @@ class Daemon:
         if not code or not head:
             return None
         base_title = re.sub(r"^(?:Fix review #\d+: )+", "", code["title"])
+        # A stack kept off the push branch stays review only through its fix and re-review.
+        only = push.REVIEW_ONLY_LABEL in push._labels(review) + push._labels(first)
         tier = code["tier"] if code["tier"] in bud.TIER_ORDER else "standard"
         rtier = "deep" if review["tier"] == "deep" else "standard"   # a re-review never runs light
         found = "\n".join(f"{n}. {str(f['title'])[:200]}: {coord.clip(f.get('spec'), FOLLOWUP_SPEC_CHARS)}"
@@ -4066,7 +4076,8 @@ class Daemon:
                                   f"{(first.get('spec') or '')[:REVIEW_FIX_SPEC_CHARS]}"]),
                               kind="review", tier=rtier, priority=review["priority"], origin="daemon",
                               budget_usd=float(cfg["budget"]["task_default_usd"].get(rtier, 8.0)),
-                              depends_on=[fid], labels=[f"auto_review:{fid}", f"continues:{review['id']}"])
+                              depends_on=[fid], labels=[f"auto_review:{fid}", f"continues:{review['id']}"]
+                              + ([push.REVIEW_ONLY_LABEL] if only else []))
             if prfix:
                 extra = "\n".join([
                     f"Review #{review['id']} ({review['title']}) of code task #{code['id']} (branch "
@@ -4084,7 +4095,9 @@ class Daemon:
                     f"Fix the blocking findings of review #{review['id']} ({review['title']}) on code task "
                     f"#{code['id']} ({code['title']}).",
                     f"This task's branch starts from #{code['id']}'s branch {code['branch']} (head {head}): build on "
-                    f"it. Leave the push to re-review #{rid}, which checks each finding once this task is done.",
+                    f"it. " + (f"It must not reach the push branch: do not push it. Re-review #{rid} checks each "
+                               f"finding once this task is done." if only else
+                               f"Leave the push to re-review #{rid}, which checks each finding once this task is done."),
                     f"Findings to fix:\n{found}",
                     f"The review's hand-off: {coord.clip(summary, AUTO_REVIEW_SUMMARY_CHARS)}"]))
             moved = [t["id"] for t in coord._open_dependents(db, review["id"])]

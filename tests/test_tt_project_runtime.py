@@ -24768,10 +24768,84 @@ def test_the_review_prompt_and_coordinator_treat_a_head_in_a_pr_as_delivered(env
     for on in (False, True):   # kept whichever delivery section the review's prompt carries
         p.set_config("delivery.push_queue", on)
         text = " ".join(worker_task(p, p.db.task(review), str(p.root), None).split())
-        assert "already delivered as a PR is review only: a pass is `done`, with no push and no approval " \
-               "for the push queue" in text, on
+        assert "already delivered as a PR, or a change it says must not reach the push branch, is review only: " \
+               "a pass is `done`, with no push and no approval for the push queue" in text, on
     coord_md = " ".join((RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text().split())
     assert "A head already delivered as a PR (draft or open, same head) is delivered" in coord_md
+    assert "a change whose spec forbids the push branch, or whose whole diff `delivery.push_exclude_paths` " \
+           "keeps off it (notes only): review only, no push or push-queue step" in coord_md
+
+
+def test_the_review_of_a_change_that_must_not_reach_the_push_branch_has_no_push_step(env, monkeypatch):
+    # A notes-only change (every file push-excluded), or one its spec or hand-off keeps off the push
+    # branch, gets a review-only spec: no `ttp push` and no push-queue approval, with the reason.
+    from ttp import push, pushq
+    p = make(env)
+    p.set_config("delivery.push_branch", "work")
+    p.set_config("delivery.push_exclude_paths", ["notes", "*.log"])
+    monkeypatch.setattr(pushq, "enabled", lambda *a, **k: False)   # no prechecks: the spec text is the subject
+
+    def review(title, files, spec=None, result=None):
+        before = (lambda tid, head: p.db.update_task(tid, spec=spec)) if spec else None
+        _, _, _, (rev,) = _finish_code(env, p, title, files, result=result, before=before)
+        return rev
+
+    def review_only(rev):
+        return "ttp push` from" not in rev["spec"] and "Review only" in rev["spec"] \
+            and push.REVIEW_ONLY_LABEL in json.loads(rev["labels"]) and rev["spec"].rstrip().endswith("findings.")
+
+    def pushes(rev):
+        return "ttp push` from" in rev["spec"] and push.REVIEW_ONLY_LABEL not in json.loads(rev["labels"])
+
+    for on in (False, True):
+        p.set_config("delivery.push_queue", on)
+        rev = review(f"notes {on}", {"notes/a.md": 5, "run.log": 2})
+        assert review_only(rev) and "delivery.push_exclude_paths keeps off" in rev["spec"], (on, rev["spec"])
+        assert pushes(review(f"mixed {on}", {"notes/b.md": 5, "app.py": 3})), on
+        rev = review(f"forbidden {on}", {"c.py": 3}, spec="Write the notes. They must not be pushed to the push branch.")
+        assert review_only(rev) and "must not be pushed to the push branch" in rev["spec"], on
+        rev = review(f"by name {on}", {"d.py": 3}, spec="Never push this to work.")
+        assert review_only(rev), on
+        rev = review(f"flag {on}", {"e.py": 3}, result={"status": "done", "summary": "ok", "no_push": "a local tool"})
+        assert review_only(rev) and "a local tool" in rev["spec"], on
+        rev = review(f"summary {on}", {"f.py": 3},
+                     result={"status": "done", "summary": "Done; keep it off the push branch."})
+        assert review_only(rev), on
+        # The usual rule that the review pushes, not the worker, is not a prohibition.
+        for i, usual in enumerate(("Do not push.", "Never push to the push branch yourself.",
+                                   "Do not push to work directly; the review pushes it.", "Never push to main.",
+                                   "Never push to the push branches of other projects.")):
+            assert pushes(review(f"usual {on} {i}", {f"g{i}.py": 3}, spec=usual)), (on, usual)
+    # No push branch: review only as before, without the reason.
+    p.set_config("delivery.push_branch", "")
+    rev = review("no branch", {"notes/c.md": 5})
+    assert "Review only" in rev["spec"] and push.REVIEW_ONLY_LABEL not in json.loads(rev["labels"])
+
+
+def test_a_review_only_stack_stays_review_only_through_its_fix_and_the_push_queue_ignores_its_approval(
+        env, monkeypatch):
+    from ttp import push, pushq
+    from ttp.daemon import Daemon
+    s = _pq(env, monkeypatch)
+    entries = [{"branch": s.branch, "head": s.head}]
+    assert pushq.check_approval(s.p, s.p.db.task(s.review), entries).get("entries"), "approved"
+    s.p.db.update_task(s.review, labels=[push.REVIEW_ONLY_LABEL])
+    check = pushq.check_approval(s.p, s.p.db.task(s.review), entries)
+    assert "review only" in check.get("ignored", ""), check
+    # A failed review-only review: its fix is told not to push, its re-review stays review only.
+    s.p.db.update_task(s.review, status="failed")
+    d = Daemon(s.p.base)
+    out = d._fix_failed_review(s.p.db.task(s.review), [{"title": "bug", "spec": "fix it"}], "one bug")
+    assert out, "no fix queued"
+    fid, rid, _ = out
+    assert "do not push it" in s.p.db.task(fid)["spec"] and "Leave the push" not in s.p.db.task(fid)["spec"]
+    assert push.REVIEW_ONLY_LABEL in json.loads(s.p.db.task(rid)["labels"])
+    # Its checks are not started for the push queue either.
+    started = []
+    monkeypatch.setattr(Daemon, "_precheck", lambda self, task, full: started.append(task["id"]))
+    s.p.db.update_task(fid, branch=s.branch)
+    d._precheck_open(s.p.db.task(fid), s.p.db.task(rid))
+    assert started == []
 
 
 def test_a_code_hand_off_with_more_to_decide_still_wakes_the_coordinator(env):
