@@ -28347,7 +28347,13 @@ def test_devq_called_scripts_finds_the_scripts_a_job_command_runs():
     assert called_scripts("bash +O extglob --norc ./run.sh", "/w") == [("/w/run.sh", "sh")]
     assert called_scripts("python3 -W ignore x.py", "/w") == [("/w/x.py", "file")]
     assert called_scripts("python3 -X dev -Wignore -u x.py", "/w") == [("/w/x.py", "file")]
-    assert called_scripts("timeout -k 5 600 nice -n 10 env -u A -C /a ./x.sh", "/w") == [("/w/x.sh", "sh")]
+    assert called_scripts("timeout -k 5 600 nice -n 10 env -u A -C /a ./x.sh", "/w") == [("/a/x.sh", "sh")]
+    assert called_scripts("env --chdir=/a ./x.sh", "/w") == [("/a/x.sh", "sh")]
+    assert called_scripts("env --chdir /a ./x.sh", "/w") == [("/a/x.sh", "sh")]
+    assert called_scripts("env -C/a bash -c ./x.sh", "/w") == [("/a/x.sh", "sh")]
+    assert called_scripts("env -C b ./x.sh; ./y.sh", "/w") == [("/w/b/x.sh", "sh"), ("/w/y.sh", "sh")]
+    assert called_scripts("env -C $D ./x.sh", "/w") == []
+    assert called_scripts("env -C $D /abs/x.sh", "/w") == [("/abs/x.sh", "sh")]
     # Subshells and pushd: a cd inside ends with them; glued operators split.
     assert called_scripts("(cd /a && ./x.sh); ./y.sh", "/w") == [("/a/x.sh", "sh"), ("/w/y.sh", "sh")]
     assert called_scripts("pushd /a && ./x.sh && popd && ./y.sh", "/w") == [

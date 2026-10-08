@@ -253,6 +253,7 @@ def called_scripts(cmd: str, workdir: str = "", depth: int = 0) -> list:
             i += 1
         while words and (words[0] in _KEYWORDS or re.match(r"[A-Za-z_][A-Za-z0-9_]*=", words[0])):
             words = words[1:]
+        here = cwd                               # env -C changes the folder for this command only
         while words and words[0].rsplit("/", 1)[-1] in _WRAPPERS:
             wrapper, words = words[0].rsplit("/", 1)[-1], words[1:]
             takes = _WRAPPER_ARGS.get(wrapper, "")
@@ -260,9 +261,19 @@ def called_scripts(cmd: str, workdir: str = "", depth: int = 0) -> list:
                 opt, words = words[0], words[1:]
                 if wrapper == "env" and (opt.startswith("-S") or opt.startswith("--split")):
                     words = []                   # its command is one string: not looked into
+                    continue
+                chdir = None
+                if wrapper == "env" and opt.startswith("--chdir="):
+                    chdir = opt.split("=", 1)[1]
                 elif ((not opt.startswith("--") and len(opt) == 2 and opt[1] in takes)
                       or opt in _WRAPPER_LONG_ARGS):
+                    if wrapper == "env" and opt in ("-C", "--chdir"):
+                        chdir = words[0] if words else ""
                     words = words[1:]            # the option's value
+                elif wrapper == "env" and opt.startswith("-C") and not opt.startswith("--"):
+                    chdir = opt[2:]
+                if chdir is not None:
+                    here = None if not chdir or _UNKNOWN.search(chdir) else _join(here, chdir)
             if wrapper == "timeout" and words:
                 words = words[1:]                # its duration
         if not words or words[0] in ("for", "case", "function"):
@@ -286,8 +297,8 @@ def called_scripts(cmd: str, workdir: str = "", depth: int = 0) -> list:
         elif base in _SHELLS or _PYTHONS.match(base):
             kind = "file" if _PYTHONS.match(base) else "sh"
             rest, command = _interpreter_args(words[1:], kind)
-            if command is not None and depth < 2 and cwd is not None:
-                found += [x for x in called_scripts(command, cwd, depth + 1) if x not in found]
+            if command is not None and depth < 2 and here is not None:
+                found += [x for x in called_scripts(command, here, depth + 1) if x not in found]
             script = rest[0] if rest else None
         elif "/" in head:
             script = head
@@ -296,7 +307,7 @@ def called_scripts(cmd: str, workdir: str = "", depth: int = 0) -> list:
             continue
         if kind == "?" and script.endswith((".sh", ".bash")):
             kind = "sh"
-        path = _join(cwd, script)
+        path = _join(here, script)
         if path and (path, kind) not in found:
             found.append((path, kind))
     return found
