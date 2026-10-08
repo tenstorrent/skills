@@ -61,6 +61,7 @@ from .providers import get_provider
 from .providers.base import last_json_object, scratch_dir, service_path
 from .providers.claude import as_windows
 from .providers.jev import Jev, JevOutOfFunds
+from .prompts import RUN_DIR_MARK
 
 TICK_S = 3.0
 LEASE_STALE_S = 180
@@ -798,6 +799,7 @@ class Daemon:
                       (task["id"] if task else None, role, provider, model, effort, prov.account(), time.time(),
                        self.boot, "running", json.dumps(note or {}), session_id or None))
         run_dir = self.p.runs / str(run_id)
+        prompt = prompt.replace(RUN_DIR_MARK, str(run_dir))
         # Raising from here on means nothing was launched: the run row must not stay "running".
         try:
             run_dir.mkdir(parents=True, exist_ok=True)
@@ -1509,6 +1511,41 @@ class Daemon:
             self.alert("coordinator", f"The coordinator failed {fails} turns in a row (last: {why}). "
                        f"Messages are queued, not lost.", "high")
 
+    def _adopt_misplaced_handoff(self, r: dict, task: dict, run_dir: Path) -> None:
+        """A worker that copied a path from its context may write its hand-off to an earlier run dir
+        of its task. One written there after this run started is this run's: it is copied in and
+        counts. Only the same task's run dirs and only files newer than the run, so a stale hand-off
+        is never taken."""
+        started = float(r.get("started") or 0)
+        if not started:
+            return
+        rows = self.p.db.q("SELECT id, dir FROM runs WHERE task=? AND id<? ORDER BY id DESC",
+                           (task["id"], r["id"]))
+        found: list[tuple[float, Path]] = []
+        for row in rows:
+            path = self._run_dir(row) / RESULT_FILE
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            if mtime > started and _read_result(path) is not None:
+                found.append((mtime, path))
+        if not found:
+            return
+        src = max(found)[1]
+        try:
+            run_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, run_dir / RESULT_FILE)
+        except OSError as e:
+            log(self.p, f"run {r['id']} of #{task['id']}: could not adopt the hand-off at {src}: {e}")
+            return
+        log(self.p, f"warning: run {r['id']} of #{task['id']} wrote its hand-off to {src}, an earlier "
+                    f"run's dir; adopted it")
+        self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                    (time.time(), "daemon", "handoff_misplaced", "low",
+                     f"#{task['id']} run {r['id']} wrote its hand-off to {src} instead of its own run dir; "
+                     f"adopted it", "handled", task["id"]))
+
     def _finish_worker(self, r: dict, usage, status: str, run_dir: Path, ended: str | None = None,
                        rebooted: bool = False, slept: bool = False) -> None:
         db = self.p.db
@@ -1522,6 +1559,8 @@ class Daemon:
                 log(self.p, f"run {r.get('id')} of #{task['id']}: queued notes to other projects: {sent}")
         except OSError as e:
             log(self.p, f"could not file the queued notes of #{task['id']}: {e}")
+        if not (run_dir / RESULT_FILE).exists():
+            self._adopt_misplaced_handoff(r, task, run_dir)
         handoff = _read_result(run_dir / RESULT_FILE)
         result = handoff or last_json_object(usage.final_text or "") or {}
         if task["status"] == "cancelled":

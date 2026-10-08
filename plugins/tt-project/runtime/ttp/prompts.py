@@ -184,6 +184,11 @@ def _reboot_note(reboot) -> str:
     return out
 
 
+# Stands in a worker prompt for its run's own directory, which exists only once the run is recorded:
+# start_run puts the path in.
+RUN_DIR_MARK = "<this run's dir>"
+
+
 def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict | None = None) -> str:
     """The per-task part of a worker's prompt, after worker_system(): the rules for its kind, the
     task itself, and the restrictions again at the end. `wake` (the daemon's run note) marks a run
@@ -231,6 +236,8 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
         + f" · attempt {int(task['attempts'] or 0) + 1} of "
         f"{task['max_attempts']} · budget ${task['budget_usd'] or 0:.2f} (spent ${task['spent_usd'] or 0:.2f})\n"
         f"working directory: {cwd}" + (f" · branch: {branch}" if branch else "") + "\n"
+        f"run dir: {RUN_DIR_MARK} ($TTP_RUN_DIR): the hand-off goes only to its result.json, never to a run "
+        "dir named in earlier context\n"
         + _resource_line(task)
         + _runner_line(cfg)
         + f"project root: {p.root}\n"
@@ -270,8 +277,8 @@ def worker_resume(p: Project, task: dict, lost: dict) -> str:
             "the job logs, then carry on where you left off; do not redo finished work.\n")
     old_dir = lost.get("dir")
     if old_dir:
-        text += (f"This run has a new run directory: write the hand-off to $TTP_RUN_DIR/result.json "
-                 f"(run `echo $TTP_RUN_DIR`), not under {old_dir}.\n")
+        text += (f"This run has a new run directory, {RUN_DIR_MARK}: write the hand-off only to "
+                 f"$TTP_RUN_DIR/result.json, not under {old_dir} or any run dir named in earlier context.\n")
     update = []
     if lost.get("spec_sha") and lost["spec_sha"] != spec_digest(task):
         update.append(f"The spec changed:\n{task['spec'] or task['title']}")

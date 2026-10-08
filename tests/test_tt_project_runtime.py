@@ -26326,6 +26326,85 @@ def test_missing_handoff_without_detach_still_counts(env):
     assert json.loads(after["result"])["status"] == "no_handoff" and after["attempts"] == 1
 
 
+def _misplaced_handoff(p, d, write, task=None):
+    """A run of `task` (a new one if None) after an earlier run 1; `write(earlier_dirs, started)`
+    places hand-offs, then the run finishes without its own."""
+    from ttp.providers.base import RunUsage as Usage
+    t = task or _dev_task(p, title="woken")
+    old = p.db.x("INSERT INTO runs(task,role,started,status,dir) VALUES(?,?,?,?,?)",
+                 (t["id"], "worker", time.time() - 3600, "ok", str(p.runs / "old")))
+    started = time.time() - 60
+    rid = p.db.x("INSERT INTO runs(task,role,started,status) VALUES(?,?,?,?)", (t["id"], "worker", started, "running"))
+    run_dir = p.runs / str(rid)
+    run_dir.mkdir(parents=True)
+    (p.runs / "old").mkdir(parents=True)
+    write({"old": p.runs / "old", "old_id": old}, started)
+    p.db.update_task(t["id"], status="running")
+    d._finish_worker(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)), Usage(final_text="bye"), "ok", run_dir)
+    return p.db.task(t["id"]), run_dir
+
+
+def test_a_handoff_written_to_an_earlier_run_dir_after_the_run_started_is_adopted(env):
+    p = _device_project(env, device=False)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    after, run_dir = _misplaced_handoff(p, d, lambda dirs, started: (dirs["old"] / "result.json").write_text(
+        json.dumps({"status": "done", "summary": "bench finished"})))
+    assert after["status"] == "done" and json.loads(after["result"])["status"] == "done", after["result"]
+    assert json.loads((run_dir / "result.json").read_text())["summary"] == "bench finished"
+    ev = p.db.one("SELECT text FROM events WHERE kind='handoff_misplaced'")
+    assert ev and str(p.runs / "old" / "result.json") in ev["text"]
+    assert "adopted it" in (p.logs / "daemon.log").read_text()
+
+
+def test_a_stale_handoff_in_an_earlier_run_dir_is_not_adopted(env):
+    p = _device_project(env, device=False)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+
+    def stale(dirs, started):
+        f = dirs["old"] / "result.json"
+        f.write_text(json.dumps({"status": "done", "summary": "the earlier run's own"}))
+        os.utime(f, (started - 600, started - 600))
+    after, run_dir = _misplaced_handoff(p, d, stale)
+    assert json.loads(after["result"])["status"] == "no_handoff" and after["attempts"] == 1
+    assert not (run_dir / "result.json").exists()
+    assert not p.db.one("SELECT 1 FROM events WHERE kind='handoff_misplaced'")
+
+
+def test_a_newer_handoff_in_another_tasks_run_dir_is_not_adopted(env):
+    p = _device_project(env, device=False)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    other = _dev_task(p, title="other")
+
+    def elsewhere(dirs, started):
+        rid = p.db.x("INSERT INTO runs(task,role,started,status,dir) VALUES(?,?,?,?,?)",
+                     (other["id"], "worker", started - 30, "ok", str(p.runs / "theirs")))
+        (p.runs / "theirs").mkdir()
+        (p.runs / "theirs" / "result.json").write_text(json.dumps({"status": "done", "summary": "not mine"}))
+        assert rid
+    after, run_dir = _misplaced_handoff(p, d, elsewhere)
+    assert json.loads(after["result"])["status"] == "no_handoff" and after["attempts"] == 1
+    assert not (run_dir / "result.json").exists()
+
+
+def test_worker_prompts_name_this_runs_dir_for_the_handoff(env, monkeypatch, tmp_path):
+    p = make(env)
+    from ttp.prompts import RUN_DIR_MARK, worker_resume, worker_task
+    tid = p.db.add_task("build", "build the thing", kind="work", tier="light", origin="user")
+    task = p.db.task(tid)
+    text = worker_task(p, task, str(p.root), None, wake={"tier": "light"})
+    assert f"run dir: {RUN_DIR_MARK} ($TTP_RUN_DIR)" in text
+    assert "never to a run dir named in earlier context" in text
+    text = worker_resume(p, task, {"cause": "reboot", "ended": time.time(), "dir": str(tmp_path)})
+    assert f"new run directory, {RUN_DIR_MARK}" in text and f"not under {tmp_path}" in text
+    assert "never write to a run folder named in earlier context" in (p.harness / "prompts" / "worker.md").read_text()
+    # start_run puts the run's own directory in place of the mark.
+    _, run_dir, prompt = _dispatch_claude_worker(p, monkeypatch, {})
+    assert f"run dir: {run_dir} ($TTP_RUN_DIR)" in prompt and RUN_DIR_MARK not in prompt
+
+
 def test_waiting_without_probe_gets_the_detach_check(env):
     p = _device_project(env, device=False)
     from ttp.daemon import Daemon

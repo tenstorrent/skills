@@ -99,7 +99,8 @@ hand-off.
 
 ## Handoff (required)
 
-Before you finish, write `$TTP_RUN_DIR/result.json`:
+Before you finish, write `$TTP_RUN_DIR/result.json`, in this run's own folder (it is new each run;
+never write to a run folder named in earlier context):
 
 ```json
 {"status": "done | waiting | blocked | failed | needs_review",
