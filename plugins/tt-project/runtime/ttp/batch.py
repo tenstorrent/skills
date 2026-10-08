@@ -837,10 +837,17 @@ class Batch:
             return STALE, msg
         if not checks:
             return None
-        todo, skipped = push.applicable(self.wt, head, checks, say)
+        try:
+            todo, skipped = push.applicable(self.wt, head, checks, say, self.tip or "")
+        except push.ScopeError as e:
+            say(f"{head[:10]}: {e}")
+            return str(e.check), str(e)
         for line in skipped:
             if line not in self.checks.setdefault("skipped", []):
-                self.checks["skipped"].append(line)
+                self.checks["skipped"].append(str(line))
+        if not todo and push.outside_scope(checks, skipped):
+            say(f"{head[:10]}: {push.OUT_OF_SCOPE}")
+            return None
         if not todo:
             say(f"{head[:10]}: {push.NONE_APPLY}")
             return push.NONE_APPLY, ""
@@ -951,7 +958,13 @@ def after_push(p: Project, marker: Path, m: dict) -> dict:
     out = {"status": "ok", "exit": 0, "started": started, "tail": ""}
     try:
         for cmd in cmds:
-            if why := push.skip_reason(wt, sha, cmd):
+            try:
+                why = push.skip_reason(wt, sha, cmd, str(m.get("tip") or ""))
+            except push.ScopeError as e:
+                say(f"after_push: {e}")
+                out.update(status="failed", exit=None, cmd=cmd, tail=str(e))
+                break
+            if why:
                 say(f"after_push: {push.skipped_line(cmd, why)}")
                 continue
             left = started + timeout - time.time()

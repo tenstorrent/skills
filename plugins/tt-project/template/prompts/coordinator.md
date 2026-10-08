@@ -279,7 +279,9 @@ account out of funds or quota, unrecoverable outage, restriction at risk. Everyt
   A whitespace check leaves out captured logs: `git diff --check <base> HEAD -- . ':(exclude)*.log'`.
   A check that must not block heads lacking its target (e.g. a test file a later change adds) takes
   the opt-in form `{"run": "<cmd>", "if_exists": "<repo path or glob>"}`: skipped and reported
-  there, never counted as passed. Keep plain strings for everything else. Scope a check by what it
+  there, never counted as passed. A check that covers only some paths (code tests on a branch that
+  may carry only notes) takes `"if_changed": "<glob or list>"`: skipped where the diff since the
+  push target touches none of them. Keep plain strings for everything else. Scope a check by what it
   covers, never by whether it passes: where no file marks its heads, fall back to a full-SHA shell
   conditional in the check (README). Rescoping needs a fresh review of every head it affects; never
   add blanket skip-if-missing guards (a missing test, a failed assertion or a git error must fail).

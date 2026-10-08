@@ -55,15 +55,26 @@ class Check(str):
     """One check command. A plain string runs on every head. The opt-in form
     `{"run": "<cmd>", "if_exists": "<repo path or glob>"}` runs only on a head that has a file
     matching `if_exists` (a directory counts by its files); elsewhere it is skipped as not
-    applicable, which is reported and never counted as passed."""
+    applicable, which is reported and never counted as passed. `"if_changed": "<glob>"` (or a list
+    of globs) scopes a check by what it covers: it is skipped on a head whose diff since the push
+    target touches no matching path, and a head where every check is skipped that way changes
+    nothing any check covers (`outside_scope`)."""
     if_exists = ""
+    if_changed: tuple[str, ...] = ()
 
     def config(self) -> str | dict:
         """The form project.json keeps."""
-        return {"run": str(self), "if_exists": self.if_exists} if self.if_exists else str(self)
+        if not (self.if_exists or self.if_changed):
+            return str(self)
+        out: dict = {"run": str(self)}
+        if self.if_exists:
+            out["if_exists"] = self.if_exists
+        if self.if_changed:
+            out["if_changed"] = self.if_changed[0] if len(self.if_changed) == 1 else list(self.if_changed)
+        return out
 
 
-CHECK_KEYS = {"run", "if_exists"}
+CHECK_KEYS = {"run", "if_exists", "if_changed"}
 
 
 def _entries(v: Any) -> list:
@@ -86,10 +97,10 @@ def _check(c: Any) -> Check | None:
     if not cmd:
         return None
     out = Check(cmd)
-    cond = _if_exists(c)
     # Strict: the check skips only when it validly opted in; anything malformed runs it everywhere.
-    if cond and not _form_problem(c):
-        out.if_exists = cond
+    if not _form_problem(c):
+        out.if_exists = _if_exists(c)
+        out.if_changed = _if_changed(c)
     return out
 
 
@@ -97,6 +108,13 @@ def _if_exists(c: dict) -> str:
     """The check's `if_exists`, normalized so 'tests/' and './tests/a.sh' match ls-tree paths."""
     p = str(c.get("if_exists") or "").strip() if isinstance(c.get("if_exists"), str) else ""
     return posixpath.normpath(p) if p else ""
+
+
+def _if_changed(c: dict) -> tuple[str, ...]:
+    """The check's `if_changed` globs (one string or a list), normalized as `_if_exists`."""
+    v = c.get("if_changed")
+    globs = [v] if isinstance(v, str) else v if isinstance(v, list) else []
+    return tuple(posixpath.normpath(g.strip()) for g in globs if isinstance(g, str) and g.strip())
 
 
 def check_list(v: Any) -> list[Check]:
@@ -110,8 +128,47 @@ def matches(files: list[str], pattern: str) -> bool:
     return any(f == pattern or f.startswith(pattern + "/") or fnmatch.fnmatchcase(f, pattern) for f in files)
 
 
-def skip_reason(repo: Path, head: str, check: Check) -> str | None:
-    """Why `check` does not apply to `head` (its `if_exists` matches no file there), or None: it runs."""
+class ScopeError(Exception):
+    """The diff an `if_changed` check is scoped by could not be read: the check fails, never skips."""
+
+    def __init__(self, check: Check, why: str):
+        super().__init__(f"{why}; failing {check}")
+        self.check = check
+
+
+class Skipped(str):
+    """A `skipped_line`; `scoped` when the check was skipped because the diff is outside its
+    `if_changed` scope."""
+    scoped = False
+
+
+def skip_reason(repo: Path, head: str, check: Check, base: str = "") -> str | None:
+    """Why `check` does not apply to `head`, or None: it runs. `if_changed` is looked up in the diff
+    from `base` (the push target) to `head`; without a base it is not applied, and a diff git cannot
+    give raises ScopeError. `if_exists` is looked up in `head`'s files."""
+    return _changed_reason(repo, head, check, base) or _exists_reason(repo, head, check)
+
+
+def _changed_reason(repo: Path, head: str, check: Check, base: str) -> str | None:
+    globs = getattr(check, "if_changed", ())
+    if not (globs and base):
+        return None
+    diff = _git(repo, "-c", "core.quotePath=false", "diff", "--name-only", "--no-renames", f"{base}...{head}")
+    if diff.returncode != 0:
+        raise ScopeError(check, f"cannot tell what {head[:10]} changes since {base[:10]} "
+                                f"({_tail(diff.stderr) or f'git diff exit {diff.returncode}'})")
+    files = [f for f in diff.stdout.splitlines() if f]
+    if any(matches(files, g) for g in globs):
+        return None
+    return f"{head[:10]} changes nothing under {', '.join(globs)} since {base[:10]}"
+
+
+def _tail(text: str) -> str:
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    return lines[-1] if lines else ""
+
+
+def _exists_reason(repo: Path, head: str, check: Check) -> str | None:
     if not getattr(check, "if_exists", ""):
         return None
     ls = _git(repo, "ls-tree", "-r", "--name-only", head)
@@ -124,6 +181,14 @@ def skip_reason(repo: Path, head: str, check: Check) -> str | None:
 
 def skipped_line(check: Check, why: str) -> str:
     return f"skipped (not applicable: {why}): {check}"
+
+
+def outside_scope(checks: list[Check], skipped: list[str]) -> bool:
+    """Every check was skipped because the change touches none of its `if_changed` paths: the change
+    is outside what any check covers, as a docs-only change is when no checks are set. A check
+    skipped by `if_exists` (its file is missing) says nothing about the change, so it keeps the
+    head unchecked (NONE_APPLY)."""
+    return bool(checks) and len(skipped) == len(checks) and all(getattr(s, "scoped", False) for s in skipped)
 
 
 def check_env(mode: str, tip: str = "") -> dict[str, str]:
@@ -162,6 +227,8 @@ def excluded_refusal(files: list[str], upstream: str) -> str:
 
 NONE_APPLY = "every check was skipped as not applicable, so nothing checked it"
 NONE_APPLY_FIX = "add a delivery.push_checks entry that applies to this change"
+OUT_OF_SCOPE = ("every check was skipped by its if_changed scope: this change touches nothing any check "
+                "covers, so it goes unchecked")
 NONE_APPLY_OWN_FIX = ("run the repository's tests on this commit with `ttp checks -- <cmd>` (`ttp push --own` "
                       "runs the commands it recorded passing there), or " + NONE_APPLY_FIX)
 RECORDED = "checks.json"   # in a run's directory, as `ttp checks` writes it (prguard.CHECKS_FILE)
@@ -190,16 +257,20 @@ def recorded_extras(recorded: dict | None, head: str, checks: list[Check]) -> li
     return [c for c in recorded.get("commands") or [] if c not in own]
 
 
-def applicable(repo: Path, head: str, checks: list[Check],
-               say: Callable[[str], None]) -> tuple[list[Check], list[str]]:
-    """(checks to run on `head`, a `skipped_line` per check that does not apply there, each also said).
-    Callers treat "none to run" from a non-empty list as a failure (NONE_APPLY), never as a pass."""
+def applicable(repo: Path, head: str, checks: list[Check], say: Callable[[str], None],
+               base: str = "") -> tuple[list[Check], list[str]]:
+    """(checks to run on `head`, a `Skipped` line per check that does not apply there, each also said).
+    `base` is the push target `if_changed` compares with. Callers treat "none to run" from a non-empty
+    list as a failure (NONE_APPLY), never as a pass, unless `outside_scope`. Raises ScopeError."""
     todo, skipped = [], []
     for c in checks:
-        why = skip_reason(repo, head, c)
+        changed = _changed_reason(repo, head, c, base)
+        why = changed or _exists_reason(repo, head, c)
         if why:
-            skipped.append(skipped_line(c, why))
-            say(skipped[-1])
+            line = Skipped(skipped_line(c, why))
+            line.scoped = bool(changed)
+            skipped.append(line)
+            say(line)
         else:
             todo.append(c)
     return todo, skipped
@@ -283,21 +354,28 @@ def check_problem(cmd: str) -> str | None:
 
 
 def _form_problem(c: dict) -> str | None:
-    """Why a check object is malformed: it takes "run" and "if_exists" (a repo-relative path or
-    glob) and nothing else."""
+    """Why a check object is malformed: it takes "run", "if_exists" (a repo-relative path or glob)
+    and "if_changed" (one such glob or a non-empty list of them) and nothing else."""
     cmd = c.get("run")
     if not isinstance(cmd, str) or not cmd.strip():
         return f"{c!r}: a check object needs \"run\": the command"
     extra = sorted(set(map(str, c)) - CHECK_KEYS)
     if extra:
-        return f"{c!r}: unknown key(s) {', '.join(extra)}; a check object takes only run and if_exists"
+        return f"{c!r}: unknown key(s) {', '.join(extra)}; a check object takes only run, if_exists and if_changed"
     cond = c.get("if_exists")
-    if cond is not None:
-        p = cond.strip() if isinstance(cond, str) else ""
-        norm = posixpath.normpath(p) if p else ""
-        if not p or p.startswith(("/", "~")) or norm in (".", "..") or norm.startswith("../"):
-            return f"{c!r}: if_exists must be a path or glob inside the repository"
+    if cond is not None and not _inside(cond):
+        return f"{c!r}: if_exists must be a path or glob inside the repository"
+    cond = c.get("if_changed")
+    if cond is not None and not (_inside(cond) or (isinstance(cond, list) and cond and all(map(_inside, cond)))):
+        return f"{c!r}: if_changed must be a path or glob inside the repository, or a list of them"
     return None
+
+
+def _inside(v: Any) -> bool:
+    """`v` is a repo-relative path or glob: not empty, absolute, home-relative or leaving the repo."""
+    p = v.strip() if isinstance(v, str) else ""
+    norm = posixpath.normpath(p) if p else ""
+    return bool(p) and not p.startswith(("/", "~")) and norm not in (".", "..") and not norm.startswith("../")
 
 
 def _entry_problem(c: Any) -> str | None:
@@ -1081,7 +1159,8 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
     a docs-only change since `base` (the project's push target) may go. `ff_only` (a branch that is
     not this task's own `ttp/t<id>-...` one) refuses before the checks unless it fast-forwards the remote's.
     When every check is skipped on HEAD, the extra commands `recorded` (recorded_checks) passing on
-    exactly HEAD run instead, and must pass again; with none, nothing checked it and it is refused."""
+    exactly HEAD run instead, and must pass again; with none, nothing checked it and it is refused,
+    unless every check was skipped by its `if_changed` scope (`outside_scope`, compared with `base`)."""
     repo = Path(_git(repo, "rev-parse", "--show-toplevel").stdout.strip() or repo)
     if _git(repo, "status", "--porcelain", "--untracked-files=no").stdout.strip():
         say("uncommitted changes; commit first")
@@ -1100,14 +1179,21 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
         return BUSY
     try:
         head = _git(repo, "rev-parse", "HEAD").stdout.strip()
-        todo, _ = applicable(repo, head, checks, say)
+        try:
+            todo, skipped = applicable(repo, head, checks, say, base or "")
+        except ScopeError as e:
+            say(f"{e}; not pushing")
+            return CHECKS_FAILED
         if checks and not todo:
             todo = recorded_extras(recorded, head, checks)
-            if not todo:
+            if not todo and outside_scope(checks, skipped):
+                say(f"{head[:10]}: {OUT_OF_SCOPE}")
+            elif not todo:
                 say(f"{head[:10]}: {NONE_APPLY}; not pushing: {NONE_APPLY_OWN_FIX}")
                 return CHECKS_FAILED
-            say(f"{head[:10]}: every project check was skipped; running the {len(todo)} command(s) "
-                f"`ttp checks` recorded passing on this commit: {'; '.join(todo)}")
+            else:
+                say(f"{head[:10]}: every project check was skipped; running the {len(todo)} command(s) "
+                    f"`ttp checks` recorded passing on this commit: {'; '.join(todo)}")
         started = time.time()
         env = check_env("own", _existing_tip(repo, remote, branch) if todo else "")
         for cmd in todo:
@@ -1228,8 +1314,14 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
                 f"{upstream}; bump it past that (in every manifest, plus a changeset where the "
                 "repository wants one), commit, then rerun; not pushing")
             return CHECKS_FAILED
-        todo, _ = applicable(repo, head, checks, say)
-        if checks and not todo:
+        try:
+            todo, skipped = applicable(repo, head, checks, say, tip)
+        except ScopeError as e:
+            say(f"{e}; not pushing")
+            return CHECKS_FAILED
+        if checks and not todo and outside_scope(checks, skipped):
+            say(f"{head[:10]}: {OUT_OF_SCOPE}")
+        elif checks and not todo:
             say(f"{head[:10]}: {NONE_APPLY}; not pushing: {NONE_APPLY_FIX}")
             return CHECKS_FAILED
         started = time.time()
@@ -1280,7 +1372,8 @@ def run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None)
         return REFUSED
     if own:   # delivery.push_exclude_paths guards the push branch only
         base = None
-        if not checks:   # the docs-only test needs the shared branch this work leaves from
+        # The docs-only test, and if_changed scopes, need the shared branch this work leaves from.
+        if not checks or any(c.if_changed for c in checks):
             try:
                 base = _fetch(repo, *target(p, repo)) or None
             except ValueError:

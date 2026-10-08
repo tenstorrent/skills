@@ -1133,10 +1133,18 @@ def cmd_checks(a) -> None:
     start = log.stat().st_size if log.exists() else 0
     with open(log, "a") as out:
         out.write(f"ttp checks: in {top} on {head[:12]}\n")
-        todo, skipped = push.applicable(Path(top), head, cmds, lambda m: (print(f"ttp checks: {m}"),
-                                                                           out.write(f"{m}\n")))
+        try:
+            todo, skipped = push.applicable(Path(top), head, cmds, lambda m: (print(f"ttp checks: {m}"),
+                                                                               out.write(f"{m}\n")),
+                                            _checks_base(p, Path(top), cmds))
+        except push.ScopeError as e:
+            out.write(f"{e}\n")
+            todo, skipped, passed, failed = [], [], False, str(e.check)
         hit = _recorded_pass(p, tree, todo) if todo and not a.fresh else None
-        if not todo:
+        if not todo and passed and push.outside_scope(cmds, skipped):
+            out.write(f"{push.OUT_OF_SCOPE}\n")
+            print(f"ttp checks: {push.OUT_OF_SCOPE}")
+        elif not todo and passed:
             out.write(f"{push.NONE_APPLY}\n")
             passed, failed = False, push.NONE_APPLY
         elif hit:
@@ -1174,6 +1182,21 @@ def cmd_checks(a) -> None:
     _record_pass(p, tree, todo)
     more = f", {len(skipped)} skipped as not applicable" if skipped else ""
     print(f"ttp checks: {len(todo)} check(s) passed on {head[:12]}{more}; recorded for the draft PR")
+
+
+def _checks_base(p: Project | None, top: Path, cmds: list) -> str:
+    """What `ttp checks` compares `if_changed` scopes with: the push target as last fetched, or ""
+    (no project, no push target or no copy of it here), and then those checks run."""
+    from . import push
+    if not (p and any(getattr(c, "if_changed", ()) for c in cmds)):
+        return ""
+    try:
+        remote, branch = push.target(p, top)
+    except ValueError:
+        return ""
+    r = subprocess.run(["git", "-C", str(top), "rev-parse", "--verify", "-q", f"refs/remotes/{remote}/{branch}"],
+                       capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else ""
 
 
 CHECKS_RC, CHECKS_PID, CHECKS_OUT = "checks.rc", "checks.pid", "checks.out"   # in the run's directory

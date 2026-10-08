@@ -21360,6 +21360,142 @@ def test_ttp_checks_logs_skipped_checks_and_fails_when_none_apply(env, tmp_path,
     assert "1 skipped as not applicable" in capsys.readouterr().out
 
 
+# checks scoped by what they cover (if_changed) ------------------------------------------------------
+SCOPED = {"run": "sh fail.sh", "if_changed": ["src/**", "fail.sh"]}
+
+
+def test_if_changed_is_validated_kept_in_config_and_malformed_scopes_never_skip(env):
+    from ttp import push
+    from ttp.project import config_problems
+    checks = push.check_list([SCOPED, {"run": "true", "if_changed": "./src/"}])
+    assert [c.if_changed for c in checks] == [("src/**", "fail.sh"), ("src",)]
+    assert push.checks_of([SCOPED, {"run": "true", "if_changed": "src"}]) == [SCOPED, {"run": "true", "if_changed": "src"}]
+    assert push.check_list([{**COND, "if_changed": "src"}])[0].config() == {**COND, "if_changed": "src"}
+    for bad in ({"run": "true", "if_changed": ""}, {"run": "true", "if_changed": []}, {"run": "true", "if_changed": "/abs"},
+                {"run": "true", "if_changed": ["src", "../up"]}, {"run": "true", "if_changed": 3},
+                {"run": "true", "if_changed": [""]}):
+        with pytest.raises(ValueError):
+            push.checks_of([bad])
+        assert config_problems({"delivery": {"push_checks": [bad]}}), bad
+        assert push.check_list([bad])[0].if_changed == (), "a malformed scope must run the check everywhere"
+
+
+def test_push_runs_an_if_changed_check_only_when_the_diff_touches_its_paths(env, monkeypatch, capsys):
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true", SCOPED])
+    _commit(repo, "fail.sh", "exit 1\n")
+    assert _ttp_push() == 4, "a diff touching the check's path must run it, and its failure stops the push"
+    assert "skipped" not in capsys.readouterr().err
+    _git_out(repo, "reset", "-q", "--hard", "origin/proj")
+    _git_out(other, "pull", "-q")
+    _commit(other, "fail.sh", "exit 1\n")   # on the branch already: not this change's diff
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    _git_out(repo, "pull", "-q", "origin", "proj")
+    _commit(repo, "notes.txt", "notes\n")
+    assert _ttp_push() == 0, "a notes-only change was blocked by a check scoped to code"
+    err = capsys.readouterr().err
+    assert "skipped (not applicable:" in err and "changes nothing under src/**, fail.sh since" in err, err
+    # The glob crosses subdirectories, and a move out of scope still counts as touching it.
+    (repo / "src" / "a").mkdir(parents=True)
+    _commit(repo, "src/a/x.py", "x\n")
+    assert _ttp_push() == 4
+    from ttp import push
+    _git_out(repo, "reset", "-q", "--hard", "origin/proj")
+    (repo / "src").mkdir()
+    _commit(repo, "src/x.py", "x\n")
+    base = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "mv", "src/x.py", "x.py")
+    _git_out(repo, "commit", "-qm", "move")
+    check = push.check_list([SCOPED])
+    assert push.applicable(repo, "HEAD", check, print, base)[0] == check
+    assert push.skip_reason(repo, "HEAD", check[0], base) is None   # after_push scopes the same way
+
+
+def test_a_head_outside_every_checks_scope_goes_but_an_if_exists_skip_keeps_it_unchecked(env, monkeypatch, capsys):
+    p, repo, origin, other = _push_setup(env, monkeypatch, [SCOPED])
+    _commit(repo, "notes.txt", "notes\n")
+    capsys.readouterr()
+    assert _ttp_push() == 0
+    assert "touches nothing any check covers, so it goes unchecked" in capsys.readouterr().err
+    assert _git_out(origin, "rev-parse", "proj") == _git_out(repo, "rev-parse", "HEAD")
+    p.set_config("delivery.push_checks", [SCOPED, COND])
+    _commit(repo, "more.txt", "more\n")
+    assert _ttp_push() == 4, "a check skipped because its file is missing says nothing about the diff"
+    assert "every check was skipped as not applicable" in capsys.readouterr().err
+
+
+def test_an_if_changed_check_fails_when_git_cannot_give_the_diff(env, monkeypatch, tmp_path):
+    from ttp import push
+    p, repo, origin, other = _push_setup(env, monkeypatch, [SCOPED])
+    _commit(repo, "notes.txt", "notes\n")
+    said = []
+    check = push.check_list([SCOPED])
+    for base in ("0" * 40, "no-such-ref"):
+        with pytest.raises(push.ScopeError) as e:
+            push.applicable(repo, "HEAD", check, said.append, base)
+        assert "cannot tell what HEAD changes since" in str(e.value) and e.value.check == "sh fail.sh"
+    assert said == []
+    # No push target to compare with: the check is not scoped, so it runs.
+    assert push.applicable(repo, "HEAD", check, said.append, "") == (check, [])
+    # Unrelated history (no merge base) is an error too, not "nothing changed".
+    lone = tmp_path / "lone"
+    subprocess.run(["git", "init", "-q", str(lone)], check=True)
+    _commit(lone, "x.txt", "x\n")
+    _git_out(repo, "fetch", "-q", str(lone), "HEAD:refs/heads/lone")
+    with pytest.raises(push.ScopeError):
+        push.applicable(repo, "HEAD", check, said.append, "lone")
+
+
+def test_push_own_skips_an_out_of_scope_check_and_still_runs_one_in_scope(env, monkeypatch, capsys, tmp_path):
+    p, repo, origin, other = _push_setup(env, monkeypatch, [SCOPED])
+    run = tmp_path / "run"
+    run.mkdir()
+    monkeypatch.setenv("TTP_RUN_DIR", str(run))
+    monkeypatch.setenv("TTP_TASK", "61")
+    _git_out(repo, "checkout", "-q", "-b", "ttp/t61-notes")
+    _commit(repo, "notes.txt", "notes\n")
+    capsys.readouterr()
+    assert _ttp("push", "--own") == 0, "a notes-only branch was refused by a check scoped to code"
+    assert "goes unchecked" in capsys.readouterr().err
+    assert _git_out(origin, "rev-parse", "ttp/t61-notes") == _git_out(repo, "rev-parse", "HEAD")
+    _commit(repo, "fail.sh", "exit 5\n")
+    assert _ttp("push", "--own") == 4, "a pytest-style exit 5 on a head in scope counted as a pass"
+    assert "check failed" in capsys.readouterr().err
+
+
+def test_a_push_batch_skips_out_of_scope_checks_and_fails_in_scope_ones(env, monkeypatch, capsys):
+    p, repo, origin, other = _bump_setup(env, monkeypatch, ["true", {"run": "false", "if_changed": "src"}])
+    heads = [_entry(repo, "e1", {"plugins/p/f1.txt": "1\n"})]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed", m
+    assert m["checks"]["skipped"][0].startswith("skipped (not applicable:") and "src since" in m["checks"]["skipped"][0]
+    p.set_config("delivery.push_checks", [{"run": "false", "if_changed": "plugins/p/**"}])
+    heads = [_entry(repo, "e2", {"plugins/p/f2.txt": "2\n"})]
+    rc, m = _run_batch(p, _batch_marker(p, heads, bid="b2"), monkeypatch)
+    assert m["outcome"] != "pushed", m
+
+
+def test_ttp_checks_scopes_if_changed_by_the_push_target_it_has(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    p.set_config("delivery.push_checks", [{"run": "false", "if_changed": "src"}])
+    with pytest.raises(SystemExit):   # no copy of the push target here: the check runs
+        cli.main(["checks"])
+    p.set_config("delivery.push_branch", "origin/proj")
+    subprocess.run([*git, "remote", "add", "origin", str(tmp_path / "none.git")], check=True)
+    subprocess.run([*git, "update-ref", "refs/remotes/origin/proj", "HEAD"], check=True)
+    subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "notes"], check=True)
+    capsys.readouterr()
+    cli.main(["checks"])
+    assert "goes unchecked" in capsys.readouterr().out
+    assert json.loads((run / "checks.json").read_text())["passed"] is True
+    (repo / "src").write_text("x\n")
+    subprocess.run([*git, "add", "src"], check=True)
+    subprocess.run([*git, "commit", "-qm", "src"], check=True)
+    with pytest.raises(SystemExit):
+        cli.main(["checks"])
+    assert json.loads((run / "checks.json").read_text())["passed"] is False
+
+
 def _checks_repo(env, tmp_path, monkeypatch):
     p = make(env)
     repo, run = tmp_path / "work", tmp_path / "run"

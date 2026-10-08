@@ -273,6 +273,19 @@ and preferences you add later become part of the project's charter and memory.
   skipped check is logged as `skipped (not applicable: ...)` by `ttp push`, the push queue and
   `ttp checks` (in `checks.log`), and never counts as passed: when every check is skipped the
   push or `ttp checks` fails. Plain string checks never skip; `after_push` takes the same form.
+- A check that covers only some paths can be scoped by them:
+  `{"run": "pytest -q tests", "if_changed": ["src/**", "tests/**"]}` (one glob or a list, matched
+  as `delivery.push_exclude_paths` is). It is skipped, and logged as `skipped (not applicable:
+  ... changes nothing under ...)`, when the diff from the push target to the head being checked
+  (`git diff --no-renames <target>...<head>`, so a moved file counts under both names) touches no
+  matching path, and runs normally otherwise. The push target is the fetched tip for `ttp push`,
+  `ttp push --own` and the push queue, the pushed batch's previous tip for `after_push`, and the
+  local copy of `delivery.push_branch` for `ttp checks`; with none to compare with, the check
+  runs. A diff git cannot give (a missing ref, no merge base) fails the check. A head on which
+  every check is skipped this way touches nothing any check covers, so it goes unchecked, as a
+  docs-only change does without checks: a notes-only branch passes `ttp push --own` without a
+  catch-all check. If any of the skips came from `if_exists` instead, nothing checked the head and
+  it fails as above. A check may set both keys; it then runs only where both say it applies.
 - Checks run with `TTP_PUSH_MODE` set to `target` (`ttp push` or the push queue, to
   `delivery.push_branch`), `own` (`ttp push --own`) or `checks` (`ttp checks`), and `TTP_PUSH_TIP`
   set to the tip of the branch pushed to as fetched before the checks (empty for a new branch and
@@ -290,8 +303,8 @@ and preferences you add later become part of the project's charter and memory.
   configured; `ttp doctor` names a `git diff --check` that does not leave out `*.log`.
 - `ttp checks -- <cmd>` adds a check. Several words run as that argv (`ttp checks -- pytest -q`);
   one quoted string runs through the shell (`ttp checks -- 'FOO=1 pytest -q && ruff check .'`).
-- Scope a mandatory check by what it covers, never by whether it would pass. Prefer `if_exists`
-  on the file the check runs. Where no file marks the heads a check applies to (say a test that
+- Scope a mandatory check by what it covers, never by whether it would pass. Prefer `if_changed`
+  on the paths the check covers, or `if_exists` on the file it runs. Where no file marks the heads a check applies to (say a test that
   is missing at an independently reviewed head of another delivery branch), the fallback is a
   shell conditional on the full SHA in the check itself:
   `h=$(git rev-parse HEAD) || exit 1; [ "$h" = <full 40-character sha> ] || pytest -q tests/test_x.py`.
