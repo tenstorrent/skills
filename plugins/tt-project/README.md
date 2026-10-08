@@ -252,6 +252,8 @@ and preferences you add later become part of the project's charter and memory.
   `delivery.base_ref`; `delivery.push_branch`, then a branch the charter names as
   `branch <name>`, each only if it exists here or on origin; the remote's default branch
   (`origin/HEAD`); the checked-out branch.
+  Other kinds run in the project root unless `worktree.kinds` lists them (say `["work"]`); a run
+  that leaves the root on another branch or with new uncommitted changes raises an alert naming it.
 - Where reviewed changes go straight to a shared branch, `ttp push` publishes them guarded: it
   refuses uncommitted changes, rebases onto the latest tip, runs `delivery.push_checks` on the
   exact commit it pushes, starts over if the branch moved meanwhile, and never forces. A

@@ -102,6 +102,17 @@ def ensure(p: Project, task: dict) -> tuple[Path, str]:
 
 
 LINK_PATHS = [".venv"]   # worktree.link_paths: the default
+NEVER_OWN_KINDS = ("review", "harness")   # reviews work in the change's worktree, harness tasks in the harness
+
+
+def gets_worktree(p: Project, kind: str) -> bool:
+    """Whether a task of this kind runs in a worktree of its own: code always; another kind when
+    `worktree.kinds` lists it (off by default: a fresh worktree lacks the root's untracked build
+    trees, outputs and submodule checkouts that such tasks often use). Never review or harness."""
+    if kind == "code":
+        return True
+    kinds = (p.config().get("worktree") or {}).get("kinds")
+    return kind not in NEVER_OWN_KINDS and isinstance(kinds, list) and kind in kinds
 
 
 def _ignores(repo: Path, rel: str) -> bool:
@@ -633,6 +644,28 @@ def dirty_tracked(repo: Path, timeout_s: float = 30) -> list[str] | None:
             if e[0] in "RC":
                 next(items, None)   # a rename's or copy's source follows its new path
     return sorted(paths)
+
+
+CHECKOUT_DIRTY_MAX = 2000   # checkout_state: past this many dirty paths, `dirty` is None (not compared)
+
+
+def checkout_state(repo: Path, timeout_s: float = 30) -> dict | None:
+    """Where the checkout at `repo` stands: `branch` (its short name, "" when HEAD is detached),
+    `head` (the commit) and `dirty` (dirty_tracked; None past CHECKOUT_DIRTY_MAX or when git
+    failed). None when `repo` is not a git work tree or git fails. Reads only."""
+    env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
+    try:
+        head = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", "HEAD"],
+                              capture_output=True, text=True, timeout=timeout_s, stdin=subprocess.DEVNULL, env=env)
+        if head.returncode != 0:
+            return None
+        branch = subprocess.run(["git", "-C", str(repo), "symbolic-ref", "--quiet", "--short", "HEAD"],
+                                capture_output=True, text=True, timeout=timeout_s, stdin=subprocess.DEVNULL, env=env)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    dirty = dirty_tracked(repo, timeout_s)
+    return {"branch": branch.stdout.strip() if branch.returncode == 0 else "", "head": head.stdout.strip(),
+            "dirty": dirty if dirty is not None and len(dirty) <= CHECKOUT_DIRTY_MAX else None}
 
 
 def local_only(repo: Path, branches: list[str], targets: list[str] = (), known: set = frozenset(),

@@ -165,8 +165,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # path (absolute, or relative to the project root) names one; "" turns it off. A working
     # directory with a venv of its own keeps that one. A new task worktree gets a symlink to each
     # link_paths entry (relative to the project root) that exists and is git-ignored there and is
-    # missing in the worktree, so checks naming `.venv/bin/python` work; [] turns it off.
-    "worktree": {"venv": "auto", "link_paths": [".venv"]},
+    # missing in the worktree, so checks naming `.venv/bin/python` work; [] turns it off. Code tasks
+    # always run in a worktree of their own; `kinds` adds other task kinds (say ["work"]) so they
+    # do not edit the project root's checkout (never review or harness).
+    "worktree": {"venv": "auto", "link_paths": [".venv"], "kinds": []},
     # A command watcher's known open issue wakes the coordinator again once it was last seen more
     # than rewake_after_h ago (null = never), or every time its observation says "repeat": true.
     "screen": {"wake_min_severity": "normal", "rewake_after_h": 6},
@@ -401,6 +403,11 @@ def config_problems(raw: dict) -> list[str]:
                 out.append(str(e))
     out += [f"delivery.after_push: {p}" for p in check_problems(delivery.get("after_push"))]
     out += _disk_problems(raw.get("disk"))
+    kinds = (raw.get("worktree") or {}).get("kinds") if isinstance(raw.get("worktree"), dict) else None
+    if kinds is not None and (not isinstance(kinds, list) or not all(isinstance(k, str) for k in kinds)):
+        out.append(f"worktree.kinds: {kinds!r} is not a list of task kinds; only code tasks get worktrees")
+    elif kinds and set(kinds) & {"review", "harness"}:
+        out.append("worktree.kinds: review and harness tasks never get a worktree of their own; they are skipped")
     if isinstance(raw.get("budget"), dict):
         from .globalcap import setting_problems
         out += setting_problems(raw["budget"])

@@ -236,7 +236,9 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
         + f" · attempt {int(task['attempts'] or 0) + 1} of "
         f"{task['max_attempts']} · budget ${task['budget_usd'] or 0:.2f} (spent ${task['spent_usd'] or 0:.2f})\n"
         f"working directory: {cwd}" + (f" · branch: {branch}" if branch else "") + "\n"
-        f"run dir: {RUN_DIR_MARK} ($TTP_RUN_DIR): the hand-off goes only to its result.json, never to a run "
+        + (f"This is a git worktree of your own (worktree.kinds): commit changes to tracked files on {branch}; "
+           "it is not merged anywhere by itself.\n" if branch and kind != "code" else "")
+        + f"run dir: {RUN_DIR_MARK} ($TTP_RUN_DIR): the hand-off goes only to its result.json, never to a run "
         "dir named in earlier context\n"
         + _resource_line(task)
         + _runner_line(cfg)

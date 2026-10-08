@@ -28245,3 +28245,119 @@ def test_no_test_resolves_or_starts_a_real_agent_cli(env, tmp_path_factory):
     assert base.find_binary("claude") == str(real)
     assert len(env["real_agents"]) == 3 and env["real_agents"][-1] == f"resolved {real}"
     env["real_agents"].clear()   # caught on purpose
+
+
+def test_work_tasks_get_their_own_worktree_only_when_worktree_kinds_lists_them(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dm
+    from ttp.project import config_problems
+    from ttp.prompts import worker_task
+    work = p.db.add_task("tidy notes", "s", kind="work", tier="light", origin="user")
+    review = p.db.add_task("review it", "s", kind="review", tier="light", origin="user")
+    # The default: only code tasks get a worktree; a work task runs in the project root.
+    assert dm.Daemon(p.base)._workdir_for(p.db.task(work)) == (str(p.root), None)
+    p.set_config("worktree.kinds", ["work", "review"])
+    d = dm.Daemon(p.base)
+    cwd, branch = d._workdir_for(p.db.task(work))
+    assert cwd == str(p.worktrees / f"t{work}") and branch.startswith(f"ttp/t{work}-"), (cwd, branch)
+    assert _git_out(cwd, "rev-parse", "--abbrev-ref", "HEAD") == branch
+    assert d._workdir_for(p.db.task(review)) == (str(p.root), None), "a review never gets one"
+    prompt = worker_task(p, p.db.task(work), cwd, branch)
+    assert f"commit changes to tracked files on {branch}" in prompt
+    assert "worktree of your own" not in worker_task(p, p.db.task(work), str(p.root), None)
+    # Dispatch puts the run there, with the branch on the task.
+    p.db.update_task(review, status="cancelled")
+    class Proc:
+        pid = 4242
+    real = subprocess.Popen
+    monkeypatch.setattr(dm.subprocess, "Popen",
+                        lambda argv, *a, **k: Proc() if "ttp.runner" in argv else real(argv, *a, **k))
+    p.set_config("core_provider", "claude")
+    dm.Daemon(p.base).dispatch()
+    run = p.db.one("SELECT dir FROM runs WHERE task=?", (work,))
+    assert run, p.db.task(work)["blocked_reason"]
+    assert json.loads((pathlib.Path(run["dir"]) / "run.json").read_text())["cwd"] == cwd
+    assert p.db.task(work)["branch"] == branch
+    assert config_problems({"worktree": {"kinds": "work"}}) and config_problems({"worktree": {"kinds": ["review"]}})
+    assert not config_problems({"worktree": {"kinds": ["work"]}})
+
+
+def _root_run(p, d, tid):
+    """A worker run of `tid` started through the daemon (its runner not launched), as the reaper sees it."""
+    rid = d.start_run("worker", "go", "claude", "light", str(p.root), task=p.db.task(tid))
+    return p.db.one("SELECT * FROM runs WHERE id=?", (rid,))
+
+
+def _end_run(p, d, row):
+    run_dir = p.runs / str(row["id"])
+    (run_dir / "output.jsonl").write_text("")
+    (run_dir / "result.json").write_text(json.dumps({"status": "done", "summary": "did it"}))
+    d.finish_run(row, {"rc": 0})
+
+
+def test_a_run_that_leaves_the_project_root_off_its_branch_or_newly_dirty_alerts_and_clears(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dm
+
+    class Proc:
+        pid = 4242
+    real = subprocess.Popen
+    monkeypatch.setattr(dm.subprocess, "Popen",
+                        lambda argv, *a, **k: Proc() if "ttp.runner" in argv else real(argv, *a, **k))
+    repo = env["repo"]
+    base = _git_out(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    d = dm.Daemon(p.base)
+    alerts = lambda key: p.db.q("SELECT * FROM messages WHERE kind='alert' AND ref=?", (key,))
+    resolved = lambda key: p.db.q("SELECT * FROM messages WHERE kind='resolved' AND ref=?", (key,))
+
+    # A run that changes nothing in the root: no alert. One already dirty before it is not its doing.
+    (repo / "README.md").write_text("dirty before\n")
+    quiet = p.db.add_task("quiet", "s", kind="work", tier="light", origin="user")
+    row = _root_run(p, d, quiet)
+    assert json.loads(row["note"])["root"]["branch"] == base
+    _end_run(p, d, row)
+    assert not alerts(f"root-checkout:{quiet}") and not p.db.kv(dm.ROOT_CHECKOUT_KEY)
+    _git_out(repo, "checkout", "README.md")
+
+    # A run that switches the root to its own branch, with another task's run alongside.
+    other = p.db.add_task("other", "s", kind="work", tier="light", origin="user")
+    _root_run(p, d, other)
+    racer = p.db.add_task("racer", "s", kind="work", tier="light", origin="user")
+    row = _root_run(p, d, racer)
+    _git_out(repo, "checkout", "-q", "-b", "my-branch")
+    _end_run(p, d, row)
+    got = alerts(f"root-checkout:{racer}")
+    assert len(got) == 1 and got[0]["severity"] == "low", got
+    text = got[0]["text"]
+    assert f"#{racer}" in text and "branch my-branch" in text and f"branch {base}" in text and f"#{other}" in text
+    assert "Nothing was changed" in text
+    assert p.db.one("SELECT 1 FROM events WHERE kind='observation' AND task=? AND text LIKE '%root%'", (racer,))
+    assert _git_out(repo, "rev-parse", "--abbrev-ref", "HEAD") == "my-branch", "the checkout is left alone"
+    # Not cleared while the root stays off; a recheck does not repeat it.
+    d.clear_root_checkout(force=True)
+    d.check_root_checkout(row, json.loads(row["note"])["root"])
+    assert len(alerts(f"root-checkout:{racer}")) == 1 and not resolved(f"root-checkout:{racer}")
+    # Throttled between sweeps; back on its branch, the next sweep clears it.
+    _git_out(repo, "checkout", "-q", base)
+    d.sweep_alerts()
+    assert not resolved(f"root-checkout:{racer}"), "checked at most every ROOT_RECHECK_S"
+    d._root_checked = 0.0
+    d.sweep_alerts()
+    assert len(resolved(f"root-checkout:{racer}")) == 1 and not p.db.kv(dm.ROOT_CHECKOUT_KEY)
+
+    # A run that leaves new uncommitted changes to tracked files (untracked files do not count).
+    messy = p.db.add_task("messy", "s", kind="work", tier="light", origin="user")
+    row = _root_run(p, d, messy)
+    (repo / "README.md").write_text("edited in the root\n")
+    (repo / "scratch.txt").write_text("untracked\n")
+    _end_run(p, d, row)
+    got = alerts(f"root-checkout:{messy}")
+    assert len(got) == 1 and "README.md" in got[0]["text"] and "scratch.txt" not in got[0]["text"]
+    assert "instead of" not in got[0]["text"], "still on its branch"
+    # Survives a daemon restart, and clears once the path is clean.
+    d2 = dm.Daemon(p.base)
+    d2.clear_root_checkout(force=True)
+    assert not resolved(f"root-checkout:{messy}")
+    _git_out(repo, "checkout", "README.md")
+    d2.clear_root_checkout(force=True)
+    assert len(resolved(f"root-checkout:{messy}")) == 1 and not p.db.kv(dm.ROOT_CHECKOUT_KEY)

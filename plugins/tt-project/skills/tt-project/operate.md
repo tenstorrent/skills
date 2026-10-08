@@ -99,5 +99,12 @@
   then each done code task's branch is pushed there, fast-forward only (never forced, never to main,
   the push branch or the base_ref). A repository without a remote is skipped. A hand-off also
   notes, once per set of paths, uncommitted changes to tracked files in the main checkout.
+- Project root left changed by a run → one low alert (`root-checkout:<task>`, plus a coordinator
+  event) when a worker or reviewer run ends with the root's checkout on another branch than as it
+  started, or with tracked paths newly uncommitted; it names the task and the tasks running
+  alongside it, changes nothing, and clears once the checkout is back and those paths are clean.
+  Code tasks always get their own worktree; `worktree.kinds` (default `[]`) gives other kinds one
+  too (say `["work"]`; never review or harness). Off by default because a fresh worktree lacks the
+  root's untracked build trees, outputs and submodule checkouts that work tasks often use.
 - Coordinator failing repeatedly → an alert says so; messages are kept, not lost.
 - A worker that produces nothing for too long is stopped and retried (stall guard).

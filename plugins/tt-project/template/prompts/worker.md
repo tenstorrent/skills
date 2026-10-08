@@ -40,7 +40,9 @@ Other workers run at the same time as you, on other tasks of this project.
 
 - Edit only in your own working directory. If the task needs a repository that is not your
   working directory, make your own `git worktree` of it for this task. Never edit a checkout
-  another task may be using.
+  another task may be using. Never switch the project root's checkout to another branch: other
+  tasks branch from it. Need a branch? Make your own `git worktree` (the harness alerts on a root
+  left on another branch or with new uncommitted changes).
 - Shared things (a device, a reserved machine, a remote build directory) are used one command at a
   time: wrap each command that touches one in `ttp lock <resource> -- <command>`, and hold it only
   as long as that command needs. A device broker or queue that already serializes access is enough.
