@@ -4483,28 +4483,49 @@ def test_a_users_change_to_a_restriction_rewrites_the_item_in_place(env):
     assert not p.db.q("SELECT id FROM events WHERE kind='charter_conflict'"), "an in-place edit is not a conflict"
 
 
-def test_an_appended_section_that_overrides_a_standing_restriction_is_flagged(env):
+def test_an_append_that_contradicts_a_standing_restriction_is_rejected_quoting_it(env):
     p = make(env)
     from ttp import coordinator as coord
+    db = p.db
     base = ("# demo\n\n## Restrictions (binding on every task)\n- Never push to the main branch.\n"
             "- Keep content generic.\n\n## Policies\nReview first.\n")
 
     def conflicts():
-        return [r["text"] for r in p.db.q("SELECT text FROM events WHERE kind='charter_conflict' AND status='queued'")]
+        return [r["text"] for r in db.q("SELECT text FROM events WHERE kind='charter_conflict' AND status='queued'")]
 
-    # A dated section, or text in another section, that widens the old item: applied, and flagged.
-    for k, act in enumerate(({"section": "Restrictions", "text": "Pushing hotfixes to the main branch is allowed.",
-                              "until": "the release ships"},
-                             {"section": "Policies", "text": "Workers may push to the main branch for hotfixes."})):
-        p.db.x("DELETE FROM events")
+    # A dated section, or text in another section, that widens the old item: rejected, quoting it,
+    # in the user's turn and outside it alike; the charter is left as it was.
+    for k, (act, user) in enumerate((
+            ({"section": "Restrictions", "text": "Pushing hotfixes to the main branch is allowed.",
+              "until": "the release ships"}, True),
+            ({"section": "Policies", "text": "Workers may push to the main branch for hotfixes."}, True),
+            ({"section": "Goals", "text": "Pushing to the main branch is fine now."}, False))):
+        db.x("DELETE FROM events")
         p.charter_path.write_text(base)
-        assert coord.apply(p, [{"type": "charter_update", **act}], turn=10 + k, user_turn=True) == []
-        assert act["text"] in p.charter_path.read_text(), "the user's instruction is kept, not rejected"
-        found = conflicts()
-        assert len(found) == 1 and "Never push to the main branch." in found[0] and "`quote`" in found[0], found
+        err = coord.apply(p, [{"type": "charter_update", **act}], turn=10 + k, user_turn=user)
+        assert len(err) == 1 and "contradicts the Restrictions item \"Never push to the main branch.\"" in err[0], err
+        assert "`quote` \"Never push to the main branch.\"" in err[0] and "both_hold" in err[0], err
+        assert p.charter_path.read_text() == base and conflicts() == []
     assert "charter_conflict" in coord.UNBLOCK_KINDS
-    # Not flagged: a plain new restriction, an unrelated permission, the same change made in place,
-    # and anything outside a user turn.
+    # The live case: a lift appended next to the old ban. The user's yes is kept on record, so the
+    # resend that quotes the old item goes through in a later turn without asking again.
+    p.charter_path.write_text("# demo\n\n## Restrictions\n- Never modify main.\n- Never merge.\n")
+    yes = db.post("in", "pushing to main is allowed now", chat=None, channel="web", kind="user",
+                  provenance="web-session")
+    lift = {"type": "charter_update", "section": "Restrictions", "text": "Pushing to main is allowed."}
+    err = coord.apply(p, [lift], turn=30, user_turn=True, messages=[yes])
+    assert len(err) == 1 and "\"Never modify main.\"" in err[0] and "user's yes is on record" in err[0], err
+    assert "Pushing to main" not in p.charter_path.read_text()
+    assert coord.apply(p, [{**lift, "quote": "Never modify main."}], turn=31) == []
+    charter = p.charter_path.read_text()
+    assert "Never modify main." not in charter and "- Pushing to main is allowed.\n- Never merge." in charter
+    assert coord.restriction_pairs(charter) == []
+    # Without the user's word on record, the quoted resend still needs `over`.
+    p.charter_path.write_text("# demo\n\n## Restrictions\n- Never modify main.\n")
+    assert len(coord.apply(p, [lift], turn=32)) == 1
+    assert "needs the user's word" in coord.apply(p, [{**lift, "quote": "Never modify main."}], turn=33)[0]
+    # Not rejected or flagged: a plain new restriction, an unrelated permission, the same change made
+    # in place, a stricter rule on another target, and an append the coordinator says both hold.
     for k, (acts, user) in enumerate((
             ([{"section": "Restrictions", "text": "Never push to the main branch on release days."}], True),
             ([{"section": "Restrictions", "text": "Never delete release tags.", "expires": "2d"}], True),
@@ -4513,11 +4534,79 @@ def test_an_appended_section_that_overrides_a_standing_restriction_is_flagged(en
                "text": "Never push to the main branch, except as the temporary section allows."},
               {"section": "Restrictions", "text": "Pushing hotfixes to the main branch is allowed.",
                "expires": "1d"}], True),
-            ([{"section": "Policies", "text": "Workers may push to the main branch for hotfixes."}], False))):
-        p.db.x("DELETE FROM events")
+            ([{"section": "Policies", "text": "Pushing to the release branch is allowed."}], False),
+            ([{"section": "Policies", "text": "Workers may push to the main branch for hotfixes.",
+               "both_hold": True}], True))):
+        db.x("DELETE FROM events")
         p.charter_path.write_text(base)
-        assert coord.apply(p, [{"type": "charter_update", **a} for a in acts], turn=20 + k, user_turn=user) == []
+        assert coord.apply(p, [{"type": "charter_update", **a} for a in acts], turn=40 + k, user_turn=user) == []
         assert conflicts() == [], acts
+
+def test_restriction_pairs_flags_contradicting_restrictions_items_and_only_those(env):
+    from ttp.coordinator import restriction_pairs
+
+    def pairs(body, extra=""):
+        return [(x["forbid"], x["allow"]) for x in restriction_pairs(f"# demo\n\n## Restrictions\n{body}{extra}")]
+    dated = "\n## Restrictions (added 2026-10-05, turn 3.0)\n"
+    # True positives: a lift left next to the ban it lifts, across a dated section too, in either
+    # wording ("is not allowed" forbids, "no longer forbidden" allows), and a blanket ban on an action.
+    assert pairs("- Never modify main.\n", dated + "- Pushing to main is allowed.\n") == [
+        ("Never modify main.", "Pushing to main is allowed.")]
+    assert pairs("- Deploying to box A is not allowed.\n- Deploying to box A is fine now.\n") == [
+        ("Deploying to box A is not allowed.", "Deploying to box A is fine now.")]
+    assert len(pairs("- Do not push to the docs repo.\n- Pushing to the docs repo is no longer forbidden.\n")) == 1
+    assert len(pairs("- Never open pull requests (the user opens the PR).\n- Opening draft PRs is allowed.\n")) == 1
+    assert len(pairs("- Never force-push.\n", "\n## Restrictions (added 2026-10-06)\nForce-pushing to own "
+                     "branches is fine.\nUntil: the migration ends\n")) == 1
+    # No false positives: the ban names its exception; another target (branch, box, repo); another
+    # action on the same target; a general allowance next to a ban on one target; one item stating its
+    # own exception in a second sentence; prohibitions only.
+    for body in ("- Never push to main, except as the dated section allows.\n- Pushing hotfixes to main is allowed.\n",
+                 "- Never push to main.\n- Pushing to branch feature/x is allowed.\n",
+                 "- Never push to the main branch.\n- Pushing to the release branch is allowed.\n",
+                 "- Never modify the shared folder of project B.\n- Pushing to branch team/project-a is allowed.\n",
+                 "- Never reboot box A.\n- Running jobs on box A is allowed.\n",
+                 "- Never merge.\n- Pushing hotfixes to the main branch is allowed.\n",
+                 "- Never push to main.\n- Pushing is allowed.\n",
+                 "- Never push to main. Pushing tags to main is allowed.\n",
+                 "- Push only to branch dev/x of org/repo. Never push to main. Never open pull requests.\n"
+                 "- Keep content generic: no hostnames, internal URLs or credentials.\n"
+                 "- Never force-push to dev/x. Always fetch and rebase before pushing.\n"
+                 "- Resource pauses are lifted only on the user's explicit word.\n"):
+        assert pairs(body) == [], body
+
+
+def test_charter_conflicts_show_in_the_digest_raise_effort_once_and_reach_the_daily_review(env):
+    p = make(env)
+    from ttp import coordinator as coord, daemon as dm
+    db, cfg = p.db, p.config()
+    p.charter_path.write_text("# demo\n\n## Restrictions\n- Never modify main.\n- Keep it generic.\n\n"
+                              "## Restrictions (added 2026-10-05, turn 3.0)\n- Pushing to main is allowed.\n")
+    text = coord.digest(p, {}, [], [])
+    head = "## Charter conflicts (Restrictions items that contradict each other"
+    assert head in text and "`quote`" in text and "`over`" in text
+    assert ("- \"Never modify main.\" (Restrictions) vs \"Pushing to main is allowed.\" "
+            "(Restrictions (added 2026-10-05, turn 3.0))") in text
+    found = coord.charter_conflicts(p)
+    trig, seen = coord.effort_triggers(db, cfg, [], None, [], None, conflicts=found)
+    assert trig == ["charter conflict"]
+    db.set_kv(coord.EFFORT_SEEN_KEY, seen)
+    assert coord.effort_triggers(db, cfg, [], None, [], None, conflicts=found)[0] == [], "raised once per pair"
+    d = dm.Daemon(p.base)
+    d.cfg = cfg
+    s = {"name": "daily-review", "budget_usd_day": None, "last_run": None, "description": "review"}
+    assert d._schedule_llm(s, {}) == "queued"
+    spec = db.one("SELECT spec FROM tasks WHERE origin='schedule'")["spec"]
+    assert "Charter conflicts (Restrictions items that contradict each other" in spec
+    assert "- \"Never modify main.\" (Restrictions) vs \"Pushing to main is allowed.\"" in spec
+    # Retired with `quote` and `over`: the section goes, and nothing raises.
+    assert coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "quote": "Never modify main.",
+                            "text": "", "over": "the user lifted it on 2026-10-05 (turn 3.0)"}], turn=9) == []
+    assert head not in coord.digest(p, {}, [], []) and coord.charter_conflicts(p) == []
+    assert coord.effort_triggers(db, cfg, [], None, [], None, conflicts=[])[0] == []
+    db.x("DELETE FROM tasks")
+    assert d._schedule_llm(s, {}) == "queued"
+    assert "Charter conflicts" not in db.one("SELECT spec FROM tasks WHERE origin='schedule'")["spec"]
 
 
 def test_charter_lint_flags_a_dated_section_that_contradicts_a_restriction(env):

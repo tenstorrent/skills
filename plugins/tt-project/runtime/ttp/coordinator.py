@@ -1747,11 +1747,10 @@ def _sentences(lines) -> list[str]:
 def _restriction_conflicts(p: Project, before: str, added: list[tuple[str, str]]) -> list[str]:
     """Warn when a user turn added text that allows or narrows what an older restriction is about
     while no charter_update in it edited Restrictions (`quote` or `replaces`): the old item still
-    stands, and workers obey it as binding. A warning in the next digest (a queued event), not a
-    rejection: telling a change from a rule that merely sits next to the old one is a guess from
-    wording, and a wrongly rejected update would drop the user's instruction for that turn. A new
-    rule with no allowing word, or about something no restriction names, adds a restriction and
-    changes nothing: no warning. Returns the warnings."""
+    stands, and workers obey it as binding. A warning in the next digest (a queued event) for what
+    the guard (_reject_contradicting_append) let through on wording alone; text sent with
+    `both_hold` is not warned about. A new rule with no allowing word, or about something no
+    restriction names, adds a restriction and changes nothing: no warning. Returns the warnings."""
     from .prompts import charter_restrictions
     now = " ".join(charter_restrictions(p.charter_path.read_text()).split())
     olds = _sentences(before.splitlines())
@@ -1875,18 +1874,29 @@ _ALLOWS_RE = re.compile(r"\b(?:allowed|permitted|may|(?:is|are) fine|fine to|ok(
                         r"no longer)\b", re.I)
 # An item that names its own exception ("except as the dated section allows") has been reconciled.
 _OWN_EXCEPTION_RE = re.compile(r"\b(?:except|unless|other than|apart from|save for|excluding)\b", re.I)
-# Actions, by what they do: two items with actions conflict only when the actions share a family.
-_ACTIONS = {"push": {"push", "write"}, "force-push": {"push", "write"}, "modify": {"write"}, "edit": {"write"},
+# Actions, by what they do. A generic change ("modify", "write") covers every action that changes
+# something (_WRITES); two specific ones conflict only when they are the same.
+_ACTIONS = {"push": {"push"}, "force-push": {"push"}, "modify": {"write"}, "edit": {"write"},
             "touch": {"write"}, "alter": {"write"}, "writ": {"write"}, "rewrit": {"write"}, "commit": {"write"},
-            "merg": {"merge", "write"}, "delet": {"delete", "write"}, "remov": {"delete", "write"},
+            "merg": {"merge"}, "delet": {"delete"}, "remov": {"delete"},
             "open": {"open"}, "creat": {"open"}, "deploy": {"deploy"}, "releas": {"deploy"},
             "publish": {"deploy"}, "install": {"install"}, "upgrad": {"install"}, "run": {"run"},
             "runn": {"run"}, "us": {"run"}, "start": {"run"}, "submit": {"run"}, "restart": {"stop"},
             "reboot": {"stop"}, "kill": {"stop"}, "cancel": {"stop"}, "stop": {"stop"}}
+_WRITES = {"write", "push", "merge", "delete"}
+
+
+def _same_action(a: set[str], b: set[str]) -> bool:
+    return bool(a & b or "write" in a and b & _WRITES or "write" in b and a & _WRITES)
+
+
 # Words that name the rule, not its target.
 _STANCE_WORDS = {"allow", "permitt", "fine", "okay", "lift", "forbidden", "prohibit", "bann", "longer", "never",
                  "change", "work", "thing", "anything", "something", "everything", "user", "explicit", "word",
-                 "directly", "ever", "any", "pull", "request", "requests"}
+                 "directly", "ever", "any", "pull", "request", "requests",
+                 # kinds of target: "the main branch" and "the release branch" share no target
+                 "branch", "branche", "repo", "repository", "folder", "directory", "file", "path", "box",
+                 "machine", "node", "host", "server", "service", "project"}
 
 _SHORT_STOP = {"the", "and", "for", "not", "may", "can", "its", "own", "are", "was", "has", "had", "all", "but",
                "any", "you", "our", "per", "via", "now", "too", "yet", "one"}
@@ -1920,18 +1930,18 @@ def _rule_target(sentence: str) -> tuple[set[str], set[str]]:
 
 def _contradicts(forbid: str, allow: str) -> bool:
     """Whether a forbidding rule and an allowing one are about the same thing: their objects overlap
-    (at least half of the smaller set) and, when both name an action, the actions share a family; or
-    the forbidding rule names no object (a blanket ban) and the actions share a family. A general
+    (at least half of the smaller set) and, when both name an action, it is the same one (_same_action);
+    or the forbidding rule names no object (a blanket ban) and the actions are the same. A general
     allowance next to a ban on one object is that ban's exception, not a conflict. A forbidding rule that names its own exception
     ("except as ... allows") is reconciled and never conflicts."""
     if _OWN_EXCEPTION_RE.search(forbid):
         return False
     fa, fo = _rule_target(forbid)
     aa, ao = _rule_target(allow)
-    if fa and aa and not fa & aa:
+    if fa and aa and not _same_action(fa, aa):
         return False
     if not fo:   # a blanket ban on an action contradicts any allowance of it
-        return bool(fa & aa)
+        return _same_action(fa, aa)
     shared = fo & ao
     return bool(shared) and 2 * len(shared) >= min(len(fo), len(ao))
 
@@ -2003,8 +2013,9 @@ def charter_conflict_lines(pairs: list[dict]) -> list[str]:
 def _append_conflicts(charter: str, section: str, text: str) -> list[tuple[str, str]]:
     """The standing Restrictions items an appended `text` would contradict, as (item, its section):
     text for Restrictions (dated or temporary too), Goals or Policies that allows what an item
-    forbids or forbids what it allows (_contradicts), or loosens or narrows an item ("except",
-    "no longer") in a sentence that does not keep its limit (_widens, _restates_limit)."""
+    forbids or forbids what it allows (_contradicts, which tells targets apart), or narrows a
+    forbidding item ("Never X except Y") in a sentence that does not keep its limit (_widens,
+    _restates_limit)."""
     if not _DATED.sub("", section).lower().startswith(("restriction", "goal", "polic")):
         return []
     out: list[tuple[str, str]] = []
@@ -2015,8 +2026,9 @@ def _append_conflicts(charter: str, section: str, text: str) -> list[tuple[str, 
             ns = _stance(s)
             if (st == "forbid" and ns == "allow" and _contradicts(item, s)
                     or st == "allow" and ns == "forbid" and _contradicts(s, item)
-                    or st == "forbid" and _LOOSEN_RE.search(s) and not _OWN_EXCEPTION_RE.search(item)
-                    and _widens(item, _rule_words(s)) and not _restates_limit(item, s)):
+                    or st == "forbid" and ns != "allow" and _LOOSEN_RE.search(s)
+                    and not _OWN_EXCEPTION_RE.search(item) and _widens(item, _rule_words(s))
+                    and not _restates_limit(item, s)):
                 if (item, sec) not in out:
                     out.append((item, sec))
                 break
