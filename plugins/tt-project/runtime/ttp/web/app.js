@@ -95,7 +95,7 @@ function board(st) {
   // An item is its text, cut to fit, then an optional HTML tail (an age).
   const cols = [
     ["you", "Waiting on you", st.tasks.filter((t) => t.status === "blocked").map((t) => [`#${t.id} ${t.title}${t.blocked_reason ? ` — ${t.blocked_reason}` : ""}`])
-      .concat(asks.map((m) => [`${m.text}`, "", `ask #${m.id}, ${agoH(m.ts)} ago: `]))],
+      .concat(asks.map((m) => [`${m.text}`, "", `ask ${m.id}, ${agoH(m.ts)} ago: `]))],
     ["review", "Ready for review", st.tasks.filter((t) => t.status === "review" || (t.pr_url && t.status === "done")).map((t) => [`#${t.id} ${t.title}`, t.review_since ? ` (in review ${agoH(t.review_since)})` : ""])],
     ["work", "Working", st.tasks.filter((t) => t.status === "running").map((t) => [`#${t.id} ${t.title}`])],
     ["queued", "Queued", st.tasks.filter((t) => t.status === "queued").map((t) => [`#${t.id} ${t.title}${deferred(t) ? ` (${t.starts})` : waiting(t) ? ` (waiting, next try ${at(t.not_before)})` : ""}`])],
@@ -208,7 +208,7 @@ async function refresh() {
   document.title = `${unseen ? "(" + unseen + ") " : ""}${st.project.name} · tt-project`;
   board(st);
   const muted = (s) => [{ key: "empty", html: `<p class="muted">${s}</p>` }];
-  const attn = (st.attention || []).map((m) => ({ key: `${m.kind}:${m.id}`, html: `<div class="attn"><span class="when">${agoH(m.ts)} ago · ${m.kind === "ask" ? "question #" + m.id : "problem"}</span><div>${esc(m.text)}</div></div>` }));
+  const attn = (st.attention || []).map((m) => ({ key: `${m.kind}:${m.id}`, html: `<div class="attn"><span class="when">${agoH(m.ts)} ago · ${m.kind === "ask" ? "ask " + m.id : "problem"}</span><div>${esc(m.text)}</div></div>` }));
   R.rows($("#attention"), attn.length ? attn : muted("Nothing needs you right now."));
   const feed = (st.feed || []).map((m) => ({ key: m.id != null ? `id:${m.id}` : `${m.kind}:${m.ts}:${m.text}`, html: `<div class="row"><span class="when">${agoH(m.ts)} ago</span>` +
     `<span class="meta">${m.state === "cleared" ? "cleared" + (m.cleared_at ? " " + at(m.cleared_at) : "") : esc(m.kind === "alert" ? "note" : m.kind)}</span>` +

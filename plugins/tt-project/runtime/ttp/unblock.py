@@ -19,9 +19,14 @@ on live work (live_wait). While the job runs (or the resource is not paused) suc
 the 'repeated waits' trigger, external or not, until the same jobs or locks were waited on more than
 coordinator.live_waits_max times in 24 h or, for jobs, their logs stopped growing since the last wait.
 
-Handed-back asks: a user message answers an ask when it names it (`#<id>`) after it was sent, or
-replies in its chat thread. The answer's part about that ask is matched against HANDBACK, a short
-phrase list of answers that give the decision back to the project.
+Handed-back asks: a user message answers an ask when, after the ask was sent, it names it (`ask <id>`
+or `#<id>`), replies in its chat thread, or the coordinator resolved the ask in the turn that message
+started (record_resolve). A plain message that does none of these, in the ask's chat (any chat for a
+broadcast ask) and not in another thread, answers the one ask then open: sent before it, no answer
+linked yet and not resolved before it. With several open, it answers the newest only when that is the
+only one sent since the user's previous message in that chat (a plain reply answers what was just
+asked); otherwise it is linked to none. The answer's part about that ask is matched against
+HANDBACK, a short phrase list of answers that give the decision back to the project.
 """
 from __future__ import annotations
 
@@ -40,6 +45,11 @@ STUCK = {"task_blocked": "blocked", "task_waiting": "waiting", "task_review": "r
 MOVED = frozenset({"task_done", "task_failed", "task_queued", "task_requeued", "push_queued"})
 ENDED = frozenset({"done", "failed", "cancelled", "pushing"})   # a status that ends any episode
 ANSWER_MAX_AGE_S = 14 * 86400   # a mention of an ask id later than this is not its answer
+RESOLVED_KEY = "ask_resolved"   # kv: {ask id: {"ts": resolved at, "messages": the user messages of that turn}}
+RESOLVED_KEEP = 500
+# How an answer was linked to its ask, as the daily review names it.
+LINKED_BY = {"named": "named", "thread": "in its thread", "resolved": "resolved on it",
+             "only_open": "the only open ask", "newest": "the newest ask"}
 
 # What a waiting hand-off's `retry_when` probes, when it is the task's own work: by the `ttp` subcommand.
 SELF_PROBES = (("checks", re.compile(r"\bchecks\s+--result\b")),
@@ -86,7 +96,7 @@ HANDBACK = tuple(re.compile(p, re.I) for p in (
     r"\bhandle it yourself\b",
     r"\bi trust (you|your)\b",
 ))
-_MENTION = re.compile(r"(?<![\w/])#(\d+)\b")
+_MENTION = re.compile(r"(?:(?<![\w/])#|\bask\s+#?)(\d+)\b", re.I)   # "#12", "ask 12", "ask #12"
 _NOT_ASK = re.compile(r"\b(task|pr|issue|run|pull request)\s*$", re.I)
 
 
@@ -231,11 +241,15 @@ def wait_reason(ev: Any) -> str:
     return " ".join(raw.lower().split())[:200]
 
 
+def _ask_mentions(text: str, ask_ids: set[int]) -> list[re.Match]:
+    return [m for m in _MENTION.finditer(text or "") if int(m.group(1)) in ask_ids
+            and not _NOT_ASK.search(text[:m.start()])]
+
+
 def answer_part(text: str, ask_id: int, ask_ids: set[int]) -> str | None:
-    """The part of a message about ask `ask_id`: from its `#id` to the next ask id it names, or
-    None when it does not name it. A `#id` right after "task" or "PR" names something else."""
-    found = [m for m in _MENTION.finditer(text or "") if int(m.group(1)) in ask_ids
-             and not _NOT_ASK.search(text[:m.start()])]
+    """The part of a message about ask `ask_id`: from its `ask id` or `#id` to the next ask id it
+    names, or None when it does not name it. A `#id` right after "task" or "PR" names something else."""
+    found = _ask_mentions(text, ask_ids)
     for i, m in enumerate(found):
         if int(m.group(1)) == ask_id:
             end = next((n.start() for n in found[i + 1:] if int(n.group(1)) != ask_id), len(text))
@@ -325,33 +339,75 @@ def stuck_line(eps: list[dict]) -> str:
             f"longest #{top['task']} {top['title'][:70]} {_dur(top['s'])}{' (still open)' if top['open'] else ''}")
 
 
+def record_resolve(db: DB, ask_id: int, messages: list[int]) -> None:
+    """Remember that the coordinator resolved `ask_id` now, in a turn started for `messages` (the
+    user messages it answered; none for a turn of its own). asks() links those messages to it."""
+    rec = db.kv(RESOLVED_KEY, {}) or {}
+    rec[str(ask_id)] = {"ts": time.time(), "messages": [int(m) for m in messages]}
+    db.set_kv(RESOLVED_KEY, dict(sorted(rec.items(), key=lambda kv: int(kv[0]))[-RESOLVED_KEEP:]))
+
+
 def asks(db: DB, since: float, now: float | None = None) -> list[dict]:
-    """Asks sent since `since`: {id, blocking, answered, handback (the phrase or None)}."""
+    """Asks sent since `since`: {id, blocking, answered, handback (the phrase or None), how (the
+    first rule that linked an answer: named, thread, resolved, only_open or newest; None)}."""
     now = time.time() if now is None else now
-    sent = db.q("SELECT id, ts, ref, ext_id FROM messages WHERE direction='out' AND kind='ask' AND ts>=? ORDER BY id",
-                (since,))
-    if not sent:
+    # Older asks still count as open when a plain reply is matched, so it is not given to a newer one.
+    sent = db.q("SELECT id, ts, ref, ext_id, chat FROM messages WHERE direction='out' AND kind='ask' AND ts>=? "
+                "ORDER BY id", (since - ANSWER_MAX_AGE_S,))
+    if not any(a["ts"] >= since for a in sent):
         return []
     every = {r["id"] for r in db.q("SELECT id FROM messages WHERE direction='out' AND kind='ask'")}
-    replies = db.q("SELECT ts, text, ref FROM messages WHERE direction='in' AND kind='user' AND ts>=? ORDER BY id",
-                   (sent[0]["ts"],))
-    out = []
-    for a in sent:
-        ref = a["ref"] or ""
-        row = {"id": a["id"], "blocking": ref.split(":", 1)[1] if ref.startswith("blocking:") else "unset",
-               "answered": False, "handback": None}
-        for m in replies:
-            if not a["ts"] < m["ts"] <= a["ts"] + ANSWER_MAX_AGE_S:
+    replies = db.q("SELECT id, ts, text, ref, chat, ext_id FROM messages WHERE direction='in' AND kind='user' "
+                   "AND ts>? ORDER BY id", (sent[0]["ts"],))
+    resolved = db.kv(RESOLVED_KEY, {}) or {}
+    rows = {a["id"]: {"id": a["id"], "blocking": (a["ref"] or "").split(":", 1)[1]
+                      if (a["ref"] or "").startswith("blocking:") else "unset",
+                      "answered": False, "handback": None, "how": None, "first": None} for a in sent}
+
+    def link(a: dict, m: dict, part: str, how: str) -> None:
+        row = rows[a["id"]]
+        row["answered"] = True
+        row["handback"] = row["handback"] or handback(part)
+        row["how"] = row["how"] or how
+        row["first"] = min(row["first"] or m["ts"], m["ts"])
+
+    def in_window(a: dict, m: dict) -> bool:
+        return a["ts"] < m["ts"] <= a["ts"] + ANSWER_MAX_AGE_S
+
+    def answered_before(a: dict, m: dict) -> bool:
+        return rows[a["id"]]["first"] is not None and rows[a["id"]]["first"] < m["ts"]
+
+    def closed_before(a: dict, m: dict) -> bool:
+        return float((resolved.get(str(a["id"])) or {}).get("ts") or m["ts"]) < m["ts"]
+
+    claimed = set()   # replies about a particular ask, or in another thread: never a plain answer
+    for m in replies:
+        elsewhere = bool(m["ext_id"] and m["ref"] and m["ref"] != m["ext_id"])   # a reply in a thread
+        if elsewhere or _ask_mentions(m["text"], every):
+            claimed.add(m["id"])
+        for a in sent:
+            if not in_window(a, m):
                 continue
-            part = answer_part(m["text"], a["id"], every)
+            part, how = answer_part(m["text"], a["id"], every), "named"
             if part is None and a["ext_id"] and m["ref"] == a["ext_id"]:
-                part = m["text"]   # a reply in the ask's chat thread
-            if part is None:
-                continue
-            row["answered"] = True
-            row["handback"] = row["handback"] or handback(part)
-        out.append(row)
-    return out
+                part, how = m["text"], "thread"
+            if part is None and m["id"] in (resolved.get(str(a["id"])) or {}).get("messages", []):
+                part, how = m["text"], "resolved"
+            if part is not None:
+                claimed.add(m["id"])
+                link(a, m, part, how)
+    last_in: dict = {}   # chat -> ts of the user's previous message there
+    for m in replies:
+        prev, last_in[m["chat"]] = last_in.get(m["chat"]), m["ts"]
+        if m["id"] in claimed:
+            continue
+        open_ = [a for a in sent if in_window(a, m) and a["chat"] in (None, m["chat"])
+                 and not answered_before(a, m) and not closed_before(a, m)]
+        if len(open_) == 1:
+            link(open_[0], m, m["text"], "only_open")
+        elif open_ and prev is not None and sum(a["ts"] > prev for a in open_) == 1 and open_[-1]["ts"] > prev:
+            link(open_[-1], m, m["text"], "newest")
+    return [{k: v for k, v in rows[a["id"]].items() if k != "first"} for a in sent if a["ts"] >= since]
 
 
 def asks_line(rows: list[dict]) -> str:
@@ -359,10 +415,13 @@ def asks_line(rows: list[dict]) -> str:
         return "no asks sent"
     back = [r for r in rows if r["handback"]]
     answered = sum(r["answered"] for r in rows)
-    line = (f"{len(rows)} sent, {answered} with a linked answer, {len(back)} handed back "
+    hows = [r["how"] for r in rows if r.get("how")]
+    by = ", ".join(f"{hows.count(h)} {label}" for h, label in LINKED_BY.items() if h in hows)
+    by = f" ({by})" if by else ""
+    line = (f"{len(rows)} sent, {answered} with a linked answer{by}, {len(back)} handed back "
             f"({100 * len(back) / len(rows):.0f}% of asks)")
     if back:
-        line += ": " + ", ".join(f"#{r['id']} ({r['blocking']}; \"{r['handback']}\")" for r in back)
+        line += ": " + ", ".join(f"ask {r['id']} ({r['blocking']}; \"{r['handback']}\")" for r in back)
     return line
 
 

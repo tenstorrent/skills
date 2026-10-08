@@ -643,7 +643,8 @@ def _listen_loop(p: Project, db, a, after: int, floor: str) -> None:
         top = db.one("SELECT COALESCE(MAX(id),0) m FROM messages")["m"]
         msgs = [m for m in db.unread_for_chat(a.chat, after, floor, upto=top) if not cleared(db, m, time.time())]
         for m in msgs:
-            who = "coordinator" if m["chat"] else f"{p.name} ({m['kind']}, {m['severity']})"
+            kind = f"ask {m['id']}" if m["kind"] == "ask" else m["kind"]   # "ask N": "#N" reads as a task
+            who = "coordinator" if m["chat"] else f"{p.name} ({kind}, {m['severity']})"
             print(f"[#{m['id']} {who}] {m['text']}", flush=True)
         if top > after:
             after = top
@@ -674,7 +675,7 @@ def status_text(p: Project) -> str:
     lines = [head]
     for m in attention(db, now)[:6]:
         text = " ".join(m["text"].split())
-        what = f"ask #{m['id']}" if m["kind"] == "ask" else "alert"
+        what = f"ask {m['id']}" if m["kind"] == "ask" else "alert"
         lines.append(f"  needs you ({what}, {since(m['ts'], now)} ago): {text[:300]}")
     lines.append("budget: " + h["spend"]["headline"])
     c = h["coordinator"]

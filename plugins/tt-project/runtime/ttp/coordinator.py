@@ -913,6 +913,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 n = db.x("UPDATE messages SET handled=1 WHERE id=? AND kind='ask'", (int(a["id"]),))
                 if not n:
                     raise ValueError(f"no open question #{a.get('id')}")
+                unblock.record_resolve(db, int(a["id"]), messages or [])
             elif t == "pr_approve":
                 from .slack import from_config
                 prguard.approve(db, str(a.get("text") or a.get("value") or ""), int(a.get("id") or 0),
@@ -1467,7 +1468,7 @@ def expire_asks(p: Project, *, hold: bool = False, now: float | None = None) -> 
                            key=lambda n: SEVERITY_RANK.get(n, -1))
             db.x("UPDATE messages SET handled=1 WHERE id=?", (ask["id"],))
             question = ask["text"].split(_DEFAULT_NOTE)[0][:300]
-            db.post("out", f"No answer to ask #{k} after {hours:g}h, so I went with the recommendation: {rec}\n"
+            db.post("out", f"No answer to ask {k} after {hours:g}h, so I went with the recommendation: {rec}\n"
                            f"It can be reversed: reply to change it.\nThe question was: {question}",
                     chat=None, kind="alert", severity=severity)
             db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",

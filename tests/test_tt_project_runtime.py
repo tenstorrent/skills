@@ -1298,6 +1298,97 @@ def test_unblock_answer_part_splits_a_message_by_the_asks_it_names(env):
     assert "your call" in unblock.answer_part(text, 9, {7, 8, 9})
     assert unblock.answer_part(text, 8, {7, 8, 9}) is None   # "task #8" names a task
     assert unblock.answer_part("nothing here", 7, {7}) is None
+    # The user-facing form "ask N" (and "ask #N") names an ask too.
+    text = "Ask 7: yes. ask #9: your call."
+    assert unblock.answer_part(text, 7, {7, 9}) == "Ask 7: yes. "
+    assert unblock.answer_part(text, 9, {7, 9}).startswith("ask #9: your call")
+    assert unblock.answer_part("I will ask 3 people", 7, {7}) is None
+
+
+def _ask_db(env):
+    p = make(env)
+    p.db.x("DELETE FROM messages")   # the project's brief, posted as the user's first message
+    now = time.time()
+
+    def msg(direction, text, ago, kind="user", chat=None, ref=None, ext=None):
+        return p.db.x("INSERT INTO messages(ts,direction,chat,kind,text,ref,ext_id) VALUES(?,?,?,?,?,?,?)",
+                      (now - ago, direction, chat, kind, text, ref, ext))
+    return p, now, msg
+
+
+def test_unblock_a_plain_reply_answers_the_only_open_ask(env):
+    from ttp import unblock
+    p, now, msg = _ask_db(env)
+    a = msg("out", "Approve the release?", 5000, "ask", ref="blocking:review")   # broadcast: any chat answers
+    msg("in", "a note from before the ask", 6000, chat="web")
+    msg("in", "your call", 4000, chat="web")
+    rows = {r["id"]: r for r in unblock.asks(p.db, now - 86400, now)}
+    assert rows[a]["answered"] and rows[a]["how"] == "only_open" and rows[a]["handback"] == "your call"
+    assert "1 with a linked answer (1 the only open ask)" in unblock.asks_line(list(rows.values()))
+
+
+def test_unblock_a_plain_reply_answers_only_an_ask_in_its_own_chat(env):
+    from ttp import unblock
+    p, now, msg = _ask_db(env)
+    a = msg("out", "Which board?", 5000, "ask", chat="c1")
+    msg("in", "board two", 4000, chat="c2")   # another chat: not about this ask
+    assert not unblock.asks(p.db, now - 86400, now)[0]["answered"]
+    msg("in", "board two", 3000, chat="c1")
+    row = unblock.asks(p.db, now - 86400, now)[0]
+    assert row["id"] == a and row["answered"] and row["how"] == "only_open"
+
+
+def test_unblock_a_reply_in_another_thread_or_about_another_ask_is_not_a_plain_answer(env):
+    from ttp import unblock
+    p, now, msg = _ask_db(env)
+    old = msg("out", "Old question?", 9000, "ask")
+    msg("in", f"ask {old}: no", 8000)   # answers the old ask by name
+    a = msg("out", "New question?", 5000, "ask", ext="200.1")
+    msg("in", "about that build", 4000, chat="slack", ref="150.1", ext="160.1")   # a reply in another thread
+    msg("in", f"and #{old} again: your call", 3000)   # names the old ask, not the open one
+    rows = {r["id"]: r for r in unblock.asks(p.db, now - 86400, now)}
+    assert rows[old]["how"] == "named" and not rows[a]["answered"]
+    # Answered asks are no longer open: the next plain reply goes to the one still open.
+    msg("in", "yes", 2000)
+    rows = {r["id"]: r for r in unblock.asks(p.db, now - 86400, now)}
+    assert rows[a]["how"] == "only_open" and rows[a]["handback"] is None and rows[old]["handback"] == "your call"
+
+
+def test_unblock_with_several_open_asks_the_resolve_record_links_the_reply(env):
+    from ttp import coordinator as coord, unblock
+    p, now, msg = _ask_db(env)
+    a1 = msg("out", "First?", 5000, "ask")
+    a2 = msg("out", "Second?", 4000, "ask")
+    m = msg("in", "go ahead", 3000)
+    rows = {r["id"]: r for r in unblock.asks(p.db, now - 86400, now)}
+    assert not rows[a1]["answered"] and not rows[a2]["answered"], "an ambiguous reply was linked"
+    assert coord.apply(p, [{"type": "resolve", "id": a1}], messages=[m]) == []
+    rows = {r["id"]: r for r in unblock.asks(p.db, now - 86400, now)}
+    assert rows[a1]["how"] == "resolved" and not rows[a2]["answered"]
+    # A turn of the coordinator's own records no answer, only that the ask is closed from then on.
+    assert coord.apply(p, [{"type": "resolve", "id": a2}]) == []
+    assert p.db.kv(unblock.RESOLVED_KEY)[str(a2)]["messages"] == []
+    msg("in", "later chat", -10)
+    rows = {r["id"]: r for r in unblock.asks(p.db, now - 86400, now + 60)}
+    assert not rows[a2]["answered"], "a reply after the ask was resolved was linked to it"
+
+
+def test_unblock_with_several_open_asks_the_newest_answers_only_when_unambiguous(env):
+    from ttp import unblock
+    p, now, msg = _ask_db(env)
+    a0 = msg("out", "Zeroth?", 7000, "ask")
+    a1 = msg("out", "First?", 6000, "ask")
+    msg("in", f"ask {a0}: yes", 5000, chat="web")   # the user wrote after the first ask, about another
+    a2 = msg("out", "Second?", 4000, "ask")
+    msg("in", "yes, do it", 3000, chat="web")      # the only ask sent since then is the second
+    rows = {r["id"]: r for r in unblock.asks(p.db, now - 86400, now)}
+    assert not rows[a1]["answered"] and rows[a2]["how"] == "newest"
+    # Two asks sent since the user's previous message: the reply could be either, so neither.
+    a3 = msg("out", "Third?", 2500, "ask")
+    a4 = msg("out", "Fourth?", 2400, "ask")
+    msg("in", "ok", 2000, chat="web")
+    rows = {r["id"]: r for r in unblock.asks(p.db, now - 86400, now)}
+    assert not rows[a3]["answered"] and not rows[a4]["answered"]
 
 
 def test_unblock_stuck_episodes_end_when_the_task_moves_forward(env):
@@ -1346,6 +1437,7 @@ def test_unblock_asks_handed_back_and_turn_split(env):
     p = make(env)
     from ttp import unblock
     db, now = p.db, time.time()
+    db.x("DELETE FROM messages")   # the project's brief, posted as the user's first message
 
     def msg(direction, text, ago, kind="user", ref=None, ext=None):
         return db.x("INSERT INTO messages(ts,direction,kind,text,ref,ext_id) VALUES(?,?,?,?,?,?)",
@@ -1360,7 +1452,9 @@ def test_unblock_asks_handed_back_and_turn_split(env):
     assert rows[a1]["handback"] == "up to you" and rows[a1]["blocking"] == "restriction"
     assert rows[a2]["answered"] and rows[a2]["handback"] is None and not rows[a3]["answered"]
     line = unblock.asks_line(list(rows.values()))
-    assert line.startswith(f"3 sent, 2 with a linked answer, 1 handed back (33% of asks): #{a1} (restriction")
+    assert rows[a1]["how"] == "named" and rows[a2]["how"] == "thread" and rows[a3]["how"] is None
+    assert line.startswith(f"3 sent, 2 with a linked answer (1 named, 1 in its thread), 1 handed back "
+                           f"(33% of asks): ask {a1} (restriction"), line
     assert unblock.asks_line([]) == "no asks sent"
     for effort, note in (("low", None), ("low", '{"escalated": true}'), ("high", '{"trigger": "task_blocked"}')):
         db.x("INSERT INTO runs(role,status,started,effort,note) VALUES('coordinator','ok',?,?,?)", (now - 60, effort, note))
@@ -2729,6 +2823,9 @@ def test_listen_honours_the_project_chat_floor(env):
     p.db.post("out", "urgent note", kind="alert", severity="high")
     out = subprocess.run(cmd, env=run_env, capture_output=True, text=True, timeout=30).stdout
     assert "urgent note" in out and "routine note" not in out
+    ask = p.db.post("out", "Which board?", kind="ask", severity="high")
+    out = subprocess.run(cmd, env=run_env, capture_output=True, text=True, timeout=30).stdout
+    assert f"[#{ask} demo (ask {ask}, high)] Which board?" in out, out   # "ask N", not "#N" (a task)
 
 
 def test_config_refreshes_last_good_on_equal_mtime(env):
@@ -2796,7 +2893,7 @@ def test_status_shows_spend_waiting_retry_and_coordinator_health(env):
     idle = [ln for ln in lines if ln.startswith("idle: ")]
     assert idle and "daemon is not running" in idle[0] and "waiting on you" in idle[0], out
     ask = [ln for ln in lines if "Which board should I use?" in ln]
-    assert ask and ask[0].startswith("  needs you (ask #") and " min ago): " in ask[0], out
+    assert ask and ask[0].startswith("  needs you (ask ") and "(ask #" not in out and " min ago): " in ask[0], out
 
 
 def test_plan_window_spend_shows_every_window_its_reset_and_that_caps_do_not_apply(env):
@@ -6082,6 +6179,7 @@ def test_a_legacy_ask_with_a_default_still_drains_after_the_timeout(env):
     assert p.db.one("SELECT handled FROM messages WHERE id=?", (ask["id"],))["handled"] == 1
     told = p.db.one("SELECT * FROM messages WHERE kind='alert' ORDER BY id DESC LIMIT 1")
     assert "use option A" in told["text"] and "Option A or B?" in told["text"] and told["chat"] is None
+    assert f"ask {ask['id']} " in told["text"] and "#" not in told["text"], told["text"]   # "#N" reads as a task
     assert told["severity"] == ask["severity"]
     ev = p.db.one("SELECT * FROM events WHERE kind='ask_timeout'")
     assert ev["status"] == "queued" and "use option A" in ev["text"]
@@ -17423,7 +17521,7 @@ def test_the_top_section_holds_only_what_needs_the_user_and_the_rest_is_a_feed(e
     assert feed[1]["state"] == "cleared" and feed[1]["cleared_at"], feed[1]
     assert feed[2]["state"] == "fyi"
     lines = status_text(p).splitlines()
-    assert lines[1].startswith("  needs you (ask #") and lines[2].startswith("  needs you (alert, "), lines
+    assert lines[1].startswith("  needs you (ask ") and "(ask #" not in lines[1] and lines[2].startswith("  needs you (alert, "), lines
     assert "recent:" in lines and "Only 1.0 GB free" not in "\n".join(lines[:lines.index("recent:")]), lines
     assert any("(cleared " in ln and "Only 1.0 GB free" in ln for ln in lines[lines.index("recent:"):]), lines
 
