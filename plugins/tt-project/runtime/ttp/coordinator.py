@@ -1304,16 +1304,19 @@ def effort_triggers(db, cfg: dict, event_ids: list[int], wake_due: str | None,
             add("repeated waits")
     seen["waits"] = {k: v for k, v in waits_seen.items()   # a finished task's waits are over
                      if (db.task(int(k)) or {}).get("status") not in TERMINAL_TASK_STATES}
-    # Free worker slots while every queued task is held (a dependency, a deferral, a paused resource).
+    # Free worker slots while every queued task is held (a dependency, a paused resource) or
+    # deferred on purpose, at least one of them held: a queue of planned deferrals alone is routine
+    # (deferral_expired, deferral_probe_broken and dead_dependency catch the ones that go wrong).
     queued = db.q("SELECT * FROM tasks WHERE status='queued' ORDER BY id")
     running = db.one("SELECT COUNT(*) n FROM runs WHERE role!='coordinator' AND status='running'")["n"]
     slots = int((cfg.get("budget") or {}).get("max_parallel_workers", 6) or 0)
     if queued and running < slots:
         paused = db.paused_resources()
         unmet = db.unmet_dependencies(queued)
-        held = [t["id"] for t in queued if unmet[t["id"]] or "when" in (d := deferral(t))
-                or float(d.get("after") or 0) > now or task_resources(t) & paused.keys()]
-        if len(held) == len(queued):
+        held = [t["id"] for t in queued if unmet[t["id"]] or task_resources(t) & paused.keys()]
+        deferred = [t["id"] for t in queued if t["id"] not in held
+                    and ("when" in (d := deferral(t)) or float(d.get("after") or 0) > now)]
+        if held and len(held) + len(deferred) == len(queued):
             seen["held"] = held
             if held != seen_before.get("held"):
                 add("idle slots, queued work held")
@@ -1327,7 +1330,9 @@ def effort_triggers(db, cfg: dict, event_ids: list[int], wake_due: str | None,
             add("stalled on blocked tasks")
         if db.one("SELECT id FROM messages WHERE kind='ask' AND handled=0"):
             add("stalled on open asks")
-    return out, seen
+    skip = c.get("effort_skip_triggers") or []
+    skip = {str(x) for x in skip} if isinstance(skip, list) else set()
+    return [x for x in out if x not in skip], seen
 
 
 def live_max(cfg: dict) -> int:

@@ -20240,6 +20240,51 @@ def test_effort_triggers_raise_every_tricky_turn_and_leave_routine_ones_low(env)
     assert trig(gates={"claude": {"level": "green"}}) == ["budget gate change"]
 
 
+def test_planned_deferrals_do_not_count_as_held_work_but_real_holds_still_raise(env):
+    """'idle slots, queued work held' is for work that cannot start, not for work deferred on
+    purpose: a queue of start_after/start_when tasks raises nothing; a paused resource still does,
+    deferred tasks beside it included; a failed dependency still raises dead_dependency."""
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    from ttp.db import PAUSED_RESOURCES_KEY
+    db, cfg = p.db, p.config()
+    db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    db.x("DELETE FROM messages WHERE direction='out'")
+    db.x("UPDATE tasks SET status='done' WHERE status='queued'")
+    db.set_kv("last_coordinator_turn", time.time() + 1)
+    later = time.time() + 3 * 3600
+    db.add_task("after", "s", origin="user", not_before=later, labels=[f"start_after:{later}"])
+    db.add_task("when", "s", origin="user", labels=["start_when:test -e /nonexistent"])
+    got, seen = coord.effort_triggers(db, cfg, [], None)
+    assert got == [] and "held" not in seen
+    # A task on a paused resource is really held, and the deferred ones beside it do not hide it.
+    db.set_kv(PAUSED_RESOURCES_KEY, {"box": {"reason": "user", "since": time.time(), "by": "user"}})
+    boxed = db.add_task("boxed", "s", origin="user", labels=["resource:box"])
+    got, seen = coord.effort_triggers(db, cfg, [], None)
+    assert got == ["idle slots, queued work held"] and seen["held"] == [boxed]
+    # A ready task beside them means the slots have work: no trigger.
+    ready = db.add_task("ready", "s", origin="user")
+    assert coord.effort_triggers(db, cfg, [], None)[0] == []
+    db.update_task(ready, status="cancelled")
+    # coordinator.effort_skip_triggers turns a trigger off by its label.
+    skip = {**cfg, "coordinator": {**cfg["coordinator"], "effort_skip_triggers": ["idle slots, queued work held"]}}
+    assert coord.effort_triggers(db, skip, [], None)[0] == []
+    db.set_kv(PAUSED_RESOURCES_KEY, {})
+    db.update_task(boxed, status="cancelled")
+    # An unmet dependency on a failed task still raises dead_dependency.
+    d = Daemon(p.base)
+    dead = db.add_task("dead", "s", origin="user")
+    db.update_task(dead, status="failed")
+    child = db.add_task("child", "s", origin="user", depends_on=[dead])
+    d.tick()
+    now = time.time()
+    db.x("INSERT INTO runs(task,role,started,ended,status) VALUES(NULL,'coordinator',?,?,'ok')", (now + 1, now + 2))
+    d.tick()
+    evs = [r["id"] for r in db.q("SELECT id FROM events WHERE kind='dead_dependency' AND task=?", (child,))]
+    assert evs and "dead_dependency" in coord.effort_triggers(db, cfg, evs, None)[0]
+
+
 def test_a_routine_turn_escalates_once_and_the_rerun_cannot_escalate(env, monkeypatch):
     p = make(env)
     from types import SimpleNamespace

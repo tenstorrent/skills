@@ -164,13 +164,15 @@ and preferences you add later become part of the project's charter and memory.
   changing reason, going on for 24 h, or reaching `coordinator.repeat_waits_24h` (8) in 24 h, where
   a wait on a live `ttp detach` job or an unpaused `ttp lock` resource counts only past
   `coordinator.live_waits_max` (6) waits on the same ones in 24 h or once the job's log stops growing; a
-  rejected action; free worker slots while every queued task is held; a high or critical event or
-  alert; resource trouble (not waits only); a costly or irreversible step (an ask timing out, a task's budget spent, PR findings
+  rejected action; free worker slots while every queued task is held by a dependency or a paused
+  resource or deferred on purpose (`start_after`, `start_when`), at least one of them held (planned
+  deferrals alone are routine); a high or critical event or alert; resource trouble (not waits only); a costly or irreversible step (an ask timing out, a task's budget spent, PR findings
   or a clean PR, a failed push, the budget gate entering or leaving red); an idle wake finding
   blocked tasks or open asks. Routine bookkeeping stays at the base effort; such a turn that finds
   its batch harder than it looked returns `escalate`, and the same batch reruns once at high
   effort (never twice, and never from a raised turn; kv `escalations` counts them). A pinned
-  `coordinator.effort` wins over all of this. With a Jev key, Jev also rates a turn the triggers
+  `coordinator.effort` wins over all of this. `coordinator.effort_skip_triggers` (none by default)
+  lists trigger labels, as recorded in the note, that never raise a turn. With a Jev key, Jev also rates a turn the triggers
   leave below high 'routine' or 'needs thought', but only when it has a new failed or blocked task,
   high or critical event, user message, or an external wait older than `coordinator.jev_wait_h` (6);
   other turns skip the call and say so in their note. A reason rated at `coordinator.jev_threshold`
