@@ -66,7 +66,7 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "needs_device": {"type": "boolean"}, "user_deep": {"type": "boolean"},
             "continues": {"type": "integer"}, "resource": {"type": "string"}, "paused": {"type": "boolean"},
             "reason": {"type": "string"}, "supersedes": {"type": "array", "items": {"type": "string"}},
-            "replaces": {"type": "string"}, "over": {"type": "string"},
+            "replaces": {"type": "string"}, "over": {"type": "string"}, "both_hold": {"type": "boolean"},
             "expires": {"type": "string"}, "until": {"type": "string"}, "until_probe": {"type": "string"},
             "source": {"type": "string"}, "match": {"type": "string"}, "hours": {"type": "number"},
             "below": {"type": "string"}, "why": {"type": "string"}, "quote": {"type": "string"},
@@ -439,6 +439,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
                      f"{min(got.values())}")
     section("shared", lines)
     section("memory_added", memory_digest_lines(memory_view(p, now)))
+    section("charter_conflicts", charter_conflict_lines(charter_conflicts(p)))
     section("ends", ends.digest_lines(p, float(db.kv("last_coordinator_turn", 0) or 0), now))
     mem = memory_budget_line(p)
     if mem:
@@ -959,6 +960,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     replaces = str(a.get("replaces") or "")
                     ok, no_ok = (None, "") if user_turn else _charter_approval(p, section, quote, replaces, text)
                     text = ok["text"].strip() if ok else text   # the words the user said yes to
+                    if text and not (quote or replaces or a.get("both_hold")):
+                        _reject_contradicting_append(p, section, text, user_turn, messages, ok)
                     try:
                         target, extra, retired = _charter_update(p, section, text, quote, replaces, key,
                                                                  user_turn or ok is not None, over, end, no_ok)
@@ -974,7 +977,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     if (quote and target.lower().startswith("restriction")
                             or extra.lower().startswith(" (replaces restriction")):
                         restr_edited = True
-                    elif text and not quote:
+                    elif text and not quote and not a.get("both_hold"):
                         rules_added.append((target, text))
                     if retired:
                         db.post("out", f"Retired the charter restriction {retired}: {over}."
@@ -1249,11 +1252,12 @@ MCP_NAME_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,100}$")
 
 def effort_triggers(db, cfg: dict, event_ids: list[int], wake_due: str | None,
                     msg_ids: list[int] | None = None, gates: dict | None = None,
-                    now: float | None = None) -> tuple[list[str], dict]:
+                    now: float | None = None, conflicts: list[dict] | None = None) -> tuple[list[str], dict]:
     """Why the coming coordinator turn is tricky or blocking, as trigger labels ([] for a routine
     one), and the state-based triggers' state for EFFORT_SEEN_KEY, saved once the turn starts so a
     lasting state raises one turn, not every turn. All the rules live here; each label names its
-    rule, so turns can be counted by trigger."""
+    rule, so turns can be counted by trigger. `conflicts`: the charter's contradicting Restrictions
+    pairs (restriction_pairs); a pair not seen before raises the turn whose digest shows it."""
     now = now or time.time()
     c = cfg.get("coordinator") or {}
     out: list[str] = []
@@ -1325,6 +1329,10 @@ def effort_triggers(db, cfg: dict, event_ids: list[int], wake_due: str | None,
             seen["held"] = held
             if held != seen_before.get("held"):
                 add("idle slots, queued work held")
+    keys = sorted(x["key"] for x in conflicts or [])
+    seen["charter_conflicts"] = keys
+    if set(keys) - set(seen_before.get("charter_conflicts") or []):
+        add("charter conflict")
     # The budget gate going red or leaving it is a spend decision.
     red = sorted(k for k, g in (gates or {}).items() if (g or {}).get("level") == "red")
     seen["red"] = red
@@ -1854,6 +1862,195 @@ def charter_lint(p: Project) -> list[str]:
     state.update(hash=digest, seen=sorted(seen))
     p.db.set_kv(CHARTER_LINT_KEY, state)
     return out
+
+
+# Contradicting Restrictions items (restriction_pairs, _append_conflicts). A permission said with a
+# negation ("is not allowed", "may not") forbids; "no longer forbidden" allows.
+_NEG_PERMIT_RE = re.compile(r"\b(?:not|never)\s+(?:be\s+)?(?:allowed|permitted|fine|ok(?:ay)?)\b|\b(?:may|can)\s*not\b|"
+                            r"n't\s+(?:be\s+)?(?:allowed|permitted|fine)\b", re.I)
+_NO_LONGER_BANNED_RE = re.compile(r"\bno longer\s+(?:forbidden|prohibited|banned|off[- ]limits|restricted)\b", re.I)
+_FORBIDS_RE = re.compile(r"\b(?:never|do not|does not|must not|cannot|forbidden|prohibited|banned|no(?! longer\b))\b"
+                         r"|\b(?:don|doesn|mustn|can)'t\b", re.I)
+_ALLOWS_RE = re.compile(r"\b(?:allowed|permitted|may|(?:is|are) fine|fine to|ok(?:ay)? to|lift(?:s|ed)?|can now|"
+                        r"no longer)\b", re.I)
+# An item that names its own exception ("except as the dated section allows") has been reconciled.
+_OWN_EXCEPTION_RE = re.compile(r"\b(?:except|unless|other than|apart from|save for|excluding)\b", re.I)
+# Actions, by what they do: two items with actions conflict only when the actions share a family.
+_ACTIONS = {"push": {"push", "write"}, "force-push": {"push", "write"}, "modify": {"write"}, "edit": {"write"},
+            "touch": {"write"}, "alter": {"write"}, "writ": {"write"}, "rewrit": {"write"}, "commit": {"write"},
+            "merg": {"merge", "write"}, "delet": {"delete", "write"}, "remov": {"delete", "write"},
+            "open": {"open"}, "creat": {"open"}, "deploy": {"deploy"}, "releas": {"deploy"},
+            "publish": {"deploy"}, "install": {"install"}, "upgrad": {"install"}, "run": {"run"},
+            "runn": {"run"}, "us": {"run"}, "start": {"run"}, "submit": {"run"}, "restart": {"stop"},
+            "reboot": {"stop"}, "kill": {"stop"}, "cancel": {"stop"}, "stop": {"stop"}}
+# Words that name the rule, not its target.
+_STANCE_WORDS = {"allow", "permitt", "fine", "okay", "lift", "forbidden", "prohibit", "bann", "longer", "never",
+                 "change", "work", "thing", "anything", "something", "everything", "user", "explicit", "word",
+                 "directly", "ever", "any", "pull", "request", "requests"}
+
+_SHORT_STOP = {"the", "and", "for", "not", "may", "can", "its", "own", "are", "was", "has", "had", "all", "but",
+               "any", "you", "our", "per", "via", "now", "too", "yet", "one"}
+
+
+def _stance(sentence: str) -> str:
+    """"forbid", "allow", or "" for a sentence that says neither or both."""
+    s = _NO_LONGER_BANNED_RE.sub(" allowed ", _NEG_PERMIT_RE.sub(" never ", sentence))
+    forbids, allows = bool(_FORBIDS_RE.search(s)), bool(_ALLOWS_RE.search(s))
+    return "forbid" if forbids and not allows else "allow" if allows and not forbids else ""
+
+
+def _rule_target(sentence: str) -> tuple[set[str], set[str]]:
+    """A rule's (action families, object words): what it does, and what to (a branch, path, repo, box)."""
+    words = re.findall(r"[a-z0-9][\w./-]*[a-z0-9]|[a-z0-9]", sentence.lower().replace("'s ", " "))
+    acts: set[str] = set()
+    objs: set[str] = set()
+    for w in words:
+        if w in ("pr", "prs") or w == "pull" and "pull request" in sentence.lower():
+            acts.add("open")   # "open a PR", "no PRs": the action is opening one
+            continue
+        stem = _stem(w)
+        fam = _ACTIONS.get(stem) or _ACTIONS.get(w)
+        if fam:
+            acts |= fam
+        elif (len(w) >= 3 or "/" in w or w.isdigit()) and w not in _RULE_STOP and stem not in _STANCE_WORDS \
+                and w not in _STANCE_WORDS and w not in _SHORT_STOP:
+            objs.add(stem)
+    return acts, objs
+
+
+def _contradicts(forbid: str, allow: str) -> bool:
+    """Whether a forbidding rule and an allowing one are about the same thing: their objects overlap
+    (at least half of the smaller set) and, when both name an action, the actions share a family; or
+    the forbidding rule names no object (a blanket ban) and the actions share a family. A general
+    allowance next to a ban on one object is that ban's exception, not a conflict. A forbidding rule that names its own exception
+    ("except as ... allows") is reconciled and never conflicts."""
+    if _OWN_EXCEPTION_RE.search(forbid):
+        return False
+    fa, fo = _rule_target(forbid)
+    aa, ao = _rule_target(allow)
+    if fa and aa and not fa & aa:
+        return False
+    if not fo:   # a blanket ban on an action contradicts any allowance of it
+        return bool(fa & aa)
+    shared = fo & ao
+    return bool(shared) and 2 * len(shared) >= min(len(fo), len(ao))
+
+
+def _restriction_items(charter: str) -> list[tuple[str, str, int]]:
+    """Every sentence of every Restrictions section (dated and temporary ones too), as (sentence,
+    section name, item number): sentences of one bullet or paragraph share the number."""
+    from .prompts import charter_sections
+    out: list[tuple[str, str, int]] = []
+    item = 0
+    for heading, body in charter_sections(charter):
+        name = " ".join(heading[3:].split())
+        if not name.lower().startswith("restriction"):
+            continue
+        cur: list[str] = []
+        for line in body + [""]:
+            bullet = re.match(r"\s*(?:[-*+]|\d+[.)])\s", line)
+            if (bullet or not line.strip()) and cur:
+                par = " ".join(" ".join(cur).split())
+                if not (par.startswith("(") and par.endswith(")")):
+                    item += 1
+                    out += [(x, name, item) for x in _sentences([par])]
+                cur = []
+            if line.strip():
+                cur.append(line.strip())
+    return out
+
+
+def restriction_pairs(charter: str) -> list[dict]:
+    """Model-free lint: pairs of Restrictions items, across every Restrictions section, where one
+    forbids what the other allows (_contradicts). Workers obey both as binding, so the stricter one
+    wins and the allowing one does nothing. Each pair once, with a stable `key`; sentences of one
+    item are never paired (an item may state its own exception in a second sentence)."""
+    items = [(s, sec, n, _stance(s)) for s, sec, n in _restriction_items(charter)]
+    out, keys = [], set()
+    for f, fsec, fn, fst in items:
+        if fst != "forbid":
+            continue
+        for a, asec, an, ast in items:
+            if ast != "allow" or an == fn or not _contradicts(f, a):
+                continue
+            key = hashlib.sha256(f"{' '.join(f.split())}\n{' '.join(a.split())}".encode()).hexdigest()[:12]
+            if key not in keys:
+                keys.add(key)
+                out.append({"forbid": f, "forbid_section": fsec, "allow": a, "allow_section": asec, "key": key})
+    return out
+
+
+def charter_conflicts(p: Project) -> list[dict]:
+    try:
+        return restriction_pairs(p.charter_path.read_text())
+    except OSError:
+        return []
+
+
+def charter_conflict_lines(pairs: list[dict]) -> list[str]:
+    """The digest's `## Charter conflicts` section (also listed in the daily review)."""
+    if not pairs:
+        return []
+    return (["## Charter conflicts (Restrictions items that contradict each other; workers obey both, so the "
+             "stricter wins). Retire the stale side now: newer text the user approved supersedes it, so "
+             "charter_update its section with `quote` set to it, `text` what still holds (empty to drop it) "
+             "and `over` naming the user's newer word. If both truly hold, rewrite the forbidding one to name "
+             "its exception (\"..., except as <the other> allows\")."]
+            + [f"- \"{clip(x['forbid'], 200)}\" ({x['forbid_section']}) vs \"{clip(x['allow'], 200)}\" "
+               f"({x['allow_section']})" for x in pairs])
+
+
+def _append_conflicts(charter: str, section: str, text: str) -> list[tuple[str, str]]:
+    """The standing Restrictions items an appended `text` would contradict, as (item, its section):
+    text for Restrictions (dated or temporary too), Goals or Policies that allows what an item
+    forbids or forbids what it allows (_contradicts), or loosens or narrows an item ("except",
+    "no longer") in a sentence that does not keep its limit (_widens, _restates_limit)."""
+    if not _DATED.sub("", section).lower().startswith(("restriction", "goal", "polic")):
+        return []
+    out: list[tuple[str, str]] = []
+    new = _sentences(text.splitlines())
+    for item, sec, _ in _restriction_items(charter):
+        st = _stance(item)
+        for s in new:
+            ns = _stance(s)
+            if (st == "forbid" and ns == "allow" and _contradicts(item, s)
+                    or st == "allow" and ns == "forbid" and _contradicts(s, item)
+                    or st == "forbid" and _LOOSEN_RE.search(s) and not _OWN_EXCEPTION_RE.search(item)
+                    and _widens(item, _rule_words(s)) and not _restates_limit(item, s)):
+                if (item, sec) not in out:
+                    out.append((item, sec))
+                break
+    return out
+
+
+def _reject_contradicting_append(p: Project, section: str, text: str, user_turn: bool,
+                                 messages: list[int] | None, ok: dict | None) -> None:
+    """Refuse a charter_update that appends `text` while a Restrictions item it contradicts would
+    stay standing (_append_conflicts): workers obey that item as binding, so the change would do
+    nothing. The rejection quotes the item. When the user's word is behind the change (this turn's
+    messages, or the approval it already carried), that word is recorded for the quoted resend of
+    each item (_record_charter_approval), so the fix goes through in a later turn without asking
+    again. Text already in the charter (a retried turn) passes."""
+    charter = p.charter_path.read_text()
+    if " ".join(text.split()) in " ".join(charter.split()):
+        return
+    hits = _append_conflicts(charter, section, text)
+    if not hits:
+        return
+    said = list(messages or []) if user_turn else list((ok or {}).get("messages") or [])
+    for item, sec in hits:
+        for name in dict.fromkeys([sec, _DATED.sub("", sec)]):
+            _record_charter_approval(p, said, name, item, "", text, None,
+                                     "the old Restrictions item it contradicts still stood")
+    first = hits[0]
+    raise ValueError(
+        f"charter_update: {clip(text, 200)!r} contradicts the Restrictions item "
+        + "; ".join(f"\"{clip(i, 200)}\" (section {s!r})" for i, s in hits)
+        + ", which would stay standing, and workers obey it as binding. Change that item instead: resend "
+          f"with section {first[1]!r}, `quote` \"{first[0]}\" and this `text`"
+        + (" (the user's yes is on record for it)" if said else ", with `over` naming the user's word that changed it")
+        + (". Retire the other items with `quote` and `over` too" if len(hits) > 1 else "")
+        + ". If both truly hold, resend with `both_hold`: true")
 
 
 def _append_update(steer: Path, text: str, key: str | None = None) -> None:

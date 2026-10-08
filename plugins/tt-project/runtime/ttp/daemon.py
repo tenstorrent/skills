@@ -2425,6 +2425,13 @@ class Daemon:
                     spec += f"\n\nDelivery: {line}."
             except Exception as e:   # nor must a missing or broken push marker
                 log(self.p, f"intended target line failed: {type(e).__name__}: {e}")
+        if payload.get("charter_report", s["name"] == "daily-review"):
+            found = coord.charter_conflicts(self.p)
+            if found:
+                spec += ("\n\nCharter conflicts (Restrictions items that contradict each other; list them, and say "
+                         "whether the coordinator retired the stale side):\n"
+                         + "\n".join(f"- \"{x['forbid']}\" ({x['forbid_section']}) vs \"{x['allow']}\" "
+                                      f"({x['allow_section']})" for x in found))
         with db.tx():   # the evidence is the state at enqueue: what changes during the run stays new
             tid = db.add_task(f"[{s['name']}] {s['description'][:120] or 'recurring task'}", spec,
                               kind=payload.get("kind", "work"), tier=payload.get("tier", "standard"),
@@ -2531,7 +2538,8 @@ class Daemon:
         try:
             due = (w or {}).get("due")
             triggers, seen = coord.effort_triggers(db, self.cfg, [e["id"] for e in evs], due,
-                                                   [m["id"] for m in msgs], gates, now)
+                                                   [m["id"] for m in msgs], gates, now,
+                                                   coord.charter_conflicts(self.p))
             if esc:
                 triggers = [f"escalated: {str(esc.get('why') or '')[:200]}".rstrip(": "), *triggers]
             can_raise = coord.can_raise_effort(self.cfg, c.get("tier", "light"))
