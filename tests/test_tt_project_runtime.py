@@ -24933,6 +24933,7 @@ def test_a_pass_of_more_commands_answers_for_the_commands_they_start_with(env):
     assert not cli._recorded_pass(p, "t" * 40, ["a", "b", "c"])
     assert not cli._recorded_pass(p, "u" * 40, ["a"])
     # Through the daemon: a project check that would fail if it ran is answered by the recorded pass.
+    _with_origin(env, clone=False)   # a repo with no remote never pushes: review only
     p.set_config("delivery.push_branch", "work")
     p.set_config("delivery.push_queue", True)
     p.set_config("delivery.push_checks", ["false"])
