@@ -24806,6 +24806,9 @@ def test_the_review_of_a_change_that_must_not_reach_the_push_branch_has_no_push_
         assert review_only(rev) and "must not be pushed to the push branch" in rev["spec"], on
         rev = review(f"by name {on}", {"d.py": 3}, spec="Never push this to work.")
         assert review_only(rev), on
+        for i, ban in enumerate(("This change must not reach the push branch.",
+                                 "These notes must not be pushed to work.", "Keep this change off origin/work.")):
+            assert review_only(review(f"ban {on} {i}", {f"d{i}.py": 3}, spec=ban)), (on, ban)
         rev = review(f"flag {on}", {"e.py": 3}, result={"status": "done", "summary": "ok", "no_push": "a local tool"})
         assert review_only(rev) and "a local tool" in rev["spec"], on
         rev = review(f"summary {on}", {"f.py": 3},
@@ -24814,7 +24817,14 @@ def test_the_review_of_a_change_that_must_not_reach_the_push_branch_has_no_push_
         # The usual rule that the review pushes, not the worker, is not a prohibition.
         for i, usual in enumerate(("Do not push.", "Never push to the push branch yourself.",
                                    "Do not push to work directly; the review pushes it.", "Never push to main.",
-                                   "Never push to the push branches of other projects.")):
+                                   "Never push to the push branches of other projects.",
+                                   "Only a change whose whole diff is kept off the push branch by "
+                                   "delivery.push_exclude_paths is review only.",
+                                   "With the push queue on, workers never push to the push branch; the daemon does.",
+                                   "Do not push to the push branch: the review pushes it.",
+                                   "Workers must not push to the push branch themselves.",
+                                   "Fix: a notes commit cannot reach the push branch, so drop it.",
+                                   "Never push it to the push branch yourself.")):
             assert pushes(review(f"usual {on} {i}", {f"g{i}.py": 3}, spec=usual)), (on, usual)
     # No push branch: review only as before, without the reason.
     p.set_config("delivery.push_branch", "")

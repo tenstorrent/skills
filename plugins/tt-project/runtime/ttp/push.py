@@ -726,22 +726,28 @@ def delivered_pr(p: Project, task: dict, head: str) -> str | None:
 
 
 REVIEW_ONLY_LABEL = "review_only"   # a review whose change must not reach the push branch (kept_off)
-_NO_PUSH_VERB = (r"(?:do not|don't|never|must not|mustn't|should not|shall not|may not|cannot|can't)\s+"
-                 r"(?:be\s+)?(?:push(?:ed)?|land(?:ed)?|reach)\s+(?:(?:it|this|this change|the change|them)\s+)?"
-                 r"(?:(?:to|on|onto|into)\s+)?")
-_NO_PUSH_OFF = r"(?:keep|kept|keeps)\s+(?:(?:it|this|this change|the change|them)\s+)?off\s+"
-# "yourself", "directly", ... make it the usual rule that the review, not the worker, pushes.
-_NO_PUSH_NOT = r"(?![\w/-])(?!\s+(?:yourself|directly|by hand|manually|with git|until|before|unless|except))"
+# Only a ban whose subject is the change itself counts; sentences describing how the harness pushes
+# ("workers never push to the push branch", "is kept off the push branch by ...") do not.
+_NO_PUSH_WHAT = (r"(?:it|this|this change|the change|these changes|this work|this commit|these commits"
+                 r"|these notes|the notes|they|them)")
+_NO_PUSH_BAN = (rf"(?:{_NO_PUSH_WHAT}\s+(?:must not|mustn't|must never|should not|shall not|may not)\s+"
+                r"(?:be\s+(?:pushed|landed)\s+(?:to|on|onto|into)|reach)\s+"
+                rf"|(?:do not|don't|never)\s+(?:push|land)\s+{_NO_PUSH_WHAT}\s+(?:to|on|onto|into)\s+"
+                rf"|keep\s+{_NO_PUSH_WHAT}\s+off\s+)")
+_NO_PUSH_NOT = r"(?![\w/-])(?!\s+(?:yourself|directly|themselves|by hand|manually|with git|until|before|unless|except))"
 
 
 def kept_off(task: dict, changes: dict | None, d: dict) -> str:
     """Why a code task's change must not reach `delivery.push_branch`, or "" when it may: every path
     of its diff since the base (`changes`, worktree.diff_lines) matches `delivery.push_exclude_paths`,
-    its hand-off sets `no_push` (true or the reason), or its spec or hand-off summary forbids the push
-    branch in plain words ("must not be pushed to the push branch", "never push this to <branch>",
-    "keep it off the push branch"). A bare "do not push", or one followed by "yourself" or
-    "directly", is the usual rule that the review pushes, not a prohibition. Its review is then
-    review only: no `ttp push` and no push-queue approval."""
+    its hand-off sets `no_push` (true or the reason), or its spec or hand-off summary bans the change
+    itself from the push branch: "<it|this (change|work|commit)|the change|these (changes|commits|
+    notes)|the notes|they> must not (be pushed to|reach) <push branch or its name>" (also must never,
+    should/shall/may not), "do not|don't|never push <it|this|...> to <branch>" or "keep <it|this|...>
+    off <branch>". Sentences without such a subject ("workers never push to the push branch", "do
+    not push to the push branch: the review pushes it", "is kept off the push branch by ...", "cannot
+    reach the push branch"), and a ban followed by yourself/themselves/directly/..., do not count.
+    Its review is then review only: no `ttp push` and no push-queue approval."""
     globs = exclude_list(d.get("push_exclude_paths"))
     if changes and globs and all(any(matches([f], g) for g in globs) for f in changes):
         return "every file it changes is one delivery.push_exclude_paths keeps off the push branch"
@@ -753,7 +759,7 @@ def kept_off(task: dict, changes: dict | None, d: dict) -> str:
             f" ({str(flag)[:200]})" if isinstance(flag, str) else "")
     branch = str(d.get("push_branch") or "").strip()
     names = "|".join(map(re.escape, filter(None, ("push branch", branch, branch and f"origin/{branch}"))))
-    rx = re.compile(rf"\b(?:{_NO_PUSH_VERB}|{_NO_PUSH_OFF})(?:the\s+)?(?:{names}){_NO_PUSH_NOT}", re.I)
+    rx = re.compile(rf"\b{_NO_PUSH_BAN}(?:the\s+)?(?:{names}){_NO_PUSH_NOT}", re.I)
     for what, text in (("spec", task.get("spec")), ("hand-off", result.get("summary"))):
         m = rx.search(str(text or ""))
         if m:

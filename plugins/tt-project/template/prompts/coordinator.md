@@ -293,6 +293,8 @@ account out of funds or quota, unrecoverable outage, restriction at risk. Everyt
   to the push branch as well.
 - So is a review of a change whose spec forbids the push branch, or whose whole diff
   `delivery.push_exclude_paths` keeps off it (notes only): review only, no push or push-queue step.
+  Such a spec names the change as what is banned ("this change must not be pushed to the push
+  branch"); a sentence about how pushing works ("workers never push to the push branch") is not one.
 - With the push queue on (STANDING shows `## Delivery: push queue on`), review specs instead ask the reviewer
   to "approve for the push queue" and carry no push or deploy steps: the daemon pushes approved
   heads in batches and `delivery.after_push` deploys. A `pushing` task is in the queue: leave it.

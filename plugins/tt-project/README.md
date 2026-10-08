@@ -142,9 +142,12 @@ and preferences you add later become part of the project's charter and memory.
   `delivery.push_branch` and no push-queue approval. So is the review of a change that must not
   reach the push branch: every file its diff since the base changes matches
   `delivery.push_exclude_paths`, its hand-off sets `no_push` (true or the reason), or its spec or
-  hand-off summary forbids it in plain words ("must not be pushed to the push branch", "never push
-  this to <push branch>", "keep it off the push branch"; a bare "do not push", or one followed by
-  "yourself" or "directly", is not read as one). The review's spec says why, its fix and re-review
+  hand-off summary bans the change itself from it: "this change (or it, the change, these notes,
+  they, ...) must not be pushed to / must not reach the push branch" (or its name), "never push this
+  to <push branch>" or "keep it off the push branch". Sentences without such a subject ("workers
+  never push to the push branch", "do not push to the push branch: the review pushes it", "kept off
+  the push branch by delivery.push_exclude_paths", "cannot reach the push branch"), and a ban
+  followed by "yourself", "themselves" or "directly", are not read as one. The review's spec says why, its fix and re-review
   stay review only, and the push queue ignores its approval. A review the coordinator adds
   for the same work replaces the daemon's while it has not started. A review that fails with
   follow-ups gets one fix task on the reviewed branch and a re-review from the daemon, and the
