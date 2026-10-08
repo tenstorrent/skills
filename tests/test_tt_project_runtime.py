@@ -2030,8 +2030,9 @@ def test_runner_ends_its_agent_when_the_run_dir_is_deleted(env, tmp_path):
 
 @pytest.mark.parametrize("pdeathsig", [True, False], ids=["pdeathsig", "watchdog"])
 def test_agent_ends_when_its_runner_dies(env, tmp_path, pdeathsig):
-    # A runner killed outright (OOM killer, kill -9) must not leave its agent running unattended:
-    # on Linux the kernel signals it (PR_SET_PDEATHSIG); elsewhere a watchdog ends its process group.
+    # A runner killed outright (OOM killer, kill -9) must not leave its agent or the agent's tools
+    # running unattended: a watchdog ends the whole process group, also where the kernel already
+    # signals the agent itself (PR_SET_PDEATHSIG, which reaches neither the tools nor a KILL).
     if pdeathsig and not sys.platform.startswith("linux"):
         pytest.skip("PR_SET_PDEATHSIG is Linux only")
     pid_file, tool_file = tmp_path / "agent.pid", tmp_path / "tool.pid"
@@ -2049,8 +2050,7 @@ def test_agent_ends_when_its_runner_dies(env, tmp_path, pdeathsig):
         proc.kill()
         proc.wait()
         assert _wait_for(lambda: _pid_gone(agent), 15), "the agent outlived its runner"
-        if not pdeathsig:   # the watchdog ends the agent's whole process group, its tools too
-            assert _wait_for(lambda: _pid_gone(tool), 15), "the agent's tool outlived its runner"
+        assert _wait_for(lambda: _pid_gone(tool), 15), "the agent's tool outlived its runner"
     finally:
         if proc.poll() is None:
             proc.kill()
@@ -12218,6 +12218,44 @@ def test_the_reaper_never_kills_a_process_that_reused_the_agents_pid(env, tmp_pa
     finally:
         other.kill()
         other.wait()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="the leaderless group is found through /proc")
+@pytest.mark.parametrize("ours", [True, False], ids=["this-run", "another-run"])
+def test_the_reaper_ends_the_tools_of_an_agent_that_already_exited(env, tmp_path, ours):
+    # Runner and agent both gone (a watchdog that could not run): the agent's tools still run in its
+    # process group. The reaper ends that group, but only when a member carries this run's dir.
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    tid = p.db.add_task("job", "s", kind="work", tier="light", origin="user")
+    p.db.update_task(tid, status="running")
+    run_dir, tool_file = tmp_path / "run", tmp_path / "tool.pid"
+    run_dir.mkdir()
+    (run_dir / "output.jsonl").write_text("")
+    leader = subprocess.Popen(["sh", "-c", f"sleep 120 & echo $! > {tool_file}"], start_new_session=True,
+                              env={**os.environ, "TTP_RUN_DIR": str(run_dir if ours else tmp_path / "other")})
+    leader.wait()
+    tool = None
+    try:
+        assert _wait(lambda: tool_file.exists() and tool_file.read_text().strip())
+        tool = int(tool_file.read_text())
+        assert os.getpgid(tool) == leader.pid
+        (run_dir / "child.pid").write_text(f"{leader.pid}\n1\n")
+        (run_dir / "lease").touch()
+        old = time.time() - 600
+        os.utime(run_dir / "lease", (old, old))
+        p.db.x("INSERT INTO runs(task,role,provider,started,status,dir,boot_id) VALUES(?,?,?,?,?,?,?)",
+               (tid, "worker", "fake", old, "running", str(run_dir), d.boot))
+        d.reap_runs()
+        if ours:
+            assert _wait(lambda: _gone(tool), 15), "the agent's tool kept running after its agent and runner"
+        else:
+            time.sleep(0.5)
+            assert not _gone(tool), "the reaper ended a group that is not this run's"
+    finally:
+        with contextlib.suppress(OSError, TypeError):
+            os.kill(tool, signal.SIGKILL)
 
 
 def test_a_run_killed_before_its_launch_spends_no_attempt(env):

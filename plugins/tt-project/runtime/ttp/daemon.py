@@ -1075,6 +1075,9 @@ class Daemon:
         if _is_agent(pid, started):
             log(self.p, f"run {r['id']} lost its supervisor; ending its agent (pid {pid})")
             _end_group(pid, ORPHAN_GRACE_S)
+        elif _run_group_left(pid, self._run_dir(r)):
+            log(self.p, f"run {r['id']} lost its supervisor and its agent; ending the agent's tools (group {pid})")
+            _end_group(pid, ORPHAN_GRACE_S)
 
     def _abandon_run(self, r: dict) -> None:
         """Last resort for a run whose end keeps failing to process: close it so it cannot block the
@@ -4454,6 +4457,30 @@ def _is_agent(pid: int, started: str) -> bool:
         return bool(started) and os.getsid(pid) == pid and runner.proc_start(pid) == started
     except OSError:
         return False
+
+
+def _run_group_left(pgid: int, run_dir: Path) -> bool:
+    """The agent (leader of session and group pgid) is gone, but tools it started still run in its
+    group. The kernel keeps a pid that is still a group's id from being reused, so a process in
+    session and group pgid that carries this run's TTP_RUN_DIR can only be one of them. Linux only
+    (/proc); elsewhere the runner's watchdog is the only one that ends them."""
+    if os.path.exists(f"/proc/{pgid}"):
+        return False   # the leader lives on: _is_agent already said it is not the agent
+    want = b"TTP_RUN_DIR=" + os.fsencode(str(run_dir))
+    try:
+        procs = [d for d in os.listdir("/proc") if d.isdigit()]
+    except OSError:
+        return False
+    for d in procs:
+        try:
+            fields = Path(f"/proc/{d}/stat").read_text().rsplit(")", 1)[1].split()
+            if int(fields[2]) != pgid or int(fields[3]) != pgid:
+                continue
+            if want in Path(f"/proc/{d}/environ").read_bytes().split(b"\0"):
+                return True
+        except (OSError, IndexError, ValueError):
+            continue
+    return False
 
 
 def _end_group(pgid: int, grace_s: float) -> None:

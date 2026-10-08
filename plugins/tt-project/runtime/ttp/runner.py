@@ -18,8 +18,9 @@
 - enforces the run's dollar budget mid-flight when the provider streams usage;
 - ends the child when <run_dir>/STOP appears (a cancel, or `ttp stop --kill` writing "shutdown") or
   the run dir is deleted, and never starts it when the STOP came first;
-- ends the child when the runner itself dies (killed outright): on Linux the kernel sends it SIGTERM
-  (PR_SET_PDEATHSIG), elsewhere a watchdog process ends its process group;
+- ends the child's whole process group, its tools too, TERM then KILL, when the runner itself dies
+  (killed outright): a watchdog process does it on every platform, and on Linux the kernel also
+  sends the child SIGTERM at once (PR_SET_PDEATHSIG);
 - starts the child `nice` levels below itself (run.json; workers and reviewers only), so all it
   starts runs niced too, and records the level the child ran at in exit.json (`nice`);
 - holds a slot of each resource an `exclusive:` task names from before the child starts until it
@@ -55,11 +56,12 @@ POLL_S = 5
 BUDGET_EVERY_S = 10
 TOOL_GRACE_S = 60     # past a pending tool call's own timeout before its silence counts as a stall
 SLEEP_GAP_S = 600     # polls are POLL_S apart: a gap this long between two can only be a host sleep
-PDEATHSIG = sys.platform.startswith("linux")   # else (macOS) a watchdog ends the agent if the runner dies
+PDEATHSIG = sys.platform.startswith("linux")   # the kernel also signals the agent itself if the runner dies
 PR_SET_PDEATHSIG = 1
 
-# Started with the agent where PDEATHSIG is off: waits on a pipe the runner holds open. A word on it
-# is a normal end; end of file without one means the runner died, and the agent's group is ended.
+# Started with every agent: waits on a pipe the runner holds open. A word on it is a normal end; end of
+# file without one means the runner died, and the agent's group is ended, TERM then KILL. PDEATHSIG
+# alone is not enough: it signals only the agent, not the tools in its group, and never escalates.
 _WATCHDOG = """
 import os, signal, sys, time
 pgid, grace = int(sys.argv[1]), float(sys.argv[2])
@@ -169,8 +171,9 @@ def _write_exit(run_dir: Path, info: dict) -> None:
 
 def _agent_preexec(nice: int):
     """The agent's preexec_fn and whether it arms PR_SET_PDEATHSIG: its nice level, and on Linux a
-    SIGTERM from the kernel the moment the runner dies. The signal follows the thread that started
-    the child, here the main thread, which lives as long as the runner."""
+    SIGTERM from the kernel to the agent the moment the runner dies (the watchdog ends the rest of
+    its group). The signal follows the thread that started the child, here the main thread, which
+    lives as long as the runner."""
     lower = lower_priority(nice)
     if not PDEATHSIG:
         return lower, False
@@ -191,8 +194,7 @@ def _agent_preexec(nice: int):
 
 
 def _start_watchdog(pgid: int):
-    """Where PDEATHSIG is not armed: a process of its own that ends the agent's process group when
-    the runner dies. Returns the pipe's write end and the process (None, None if it cannot start)."""
+    """A process of its own that ends the agent's process group when the runner dies. Returns the pipe's write end and the process (None, None if it cannot start)."""
     r, w = os.pipe()
     try:
         proc = subprocess.Popen([sys.executable, "-c", _WATCHDOG, str(pgid), str(KILL_AFTER_S)], stdin=r,
@@ -280,10 +282,10 @@ def supervise(run_dir: Path) -> int:
     out = open(out_path, "wb")
     err = open(run_dir / "stderr.log", "wb")
     nice = int(spec.get("nice") or 0)
-    preexec, armed = _agent_preexec(nice)
+    preexec, _ = _agent_preexec(nice)
     child = subprocess.Popen(argv, stdin=prompt, stdout=out, stderr=err, cwd=cwd, env=env,
                              start_new_session=True, preexec_fn=preexec)
-    guard, watchdog = (None, None) if armed else _start_watchdog(child.pid)
+    guard, watchdog = _start_watchdog(child.pid)
     (run_dir / "child.pid").write_text(f"{child.pid}\n{proc_start(child.pid) or ''}\n")
     niceness = _niceness(child.pid)
     if nice and niceness is not None and niceness < min(os.nice(0) + nice, 19):
