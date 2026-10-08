@@ -4551,6 +4551,15 @@ def test_an_append_that_contradicts_a_standing_restriction_is_rejected_quoting_i
                               "Workers may run jobs on the device when it is free.")):
         assert coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": text}],
                            turn=50 + k, user_turn=True) == [], text
+    # A permission reserved to who may act is a limit, not a lift.
+    p.charter_path.write_text("# demo\n\n## Restrictions\n- Never open pull requests.\n- Never push to main.\n"
+                              "- Never use a paused device.\n")
+    for k, text in enumerate(("Only the user may push to main.", "The user alone may push to main.",
+                              "Pushing to main is allowed for the user only.",
+                              "Main may be pushed to by the user alone.", "Only the user may open pull requests.",
+                              "Only the user lifts device pauses.", "Only the user may lift a device pause.")):
+        assert coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": text}],
+                           turn=70 + k, user_turn=True) == [], text
     # The rejection offers keeping both as an equal fix, not a fallback after replacing the item.
     p.charter_path.write_text(base)
     err = coord.apply(p, [{"type": "charter_update", "section": "Policies",
@@ -4591,7 +4600,15 @@ def test_restriction_pairs_flags_contradicting_restrictions_items_and_only_those
                  # a permission limited to a condition is a restriction, not a lift
                  "- Never use a paused device.\n- Device pauses are lifted only on the user's explicit word.\n",
                  "- Never push to main.\n- Pushing to main is allowed only on the user's explicit word.\n",
-                 "- Never disturb the other project's running jobs.\n- Workers may run jobs on the device.\n"):
+                 "- Never disturb the other project's running jobs.\n- Workers may run jobs on the device.\n",
+                 # a permission reserved to who may act is a restriction, not a lift
+                 "- Never push to main.\n- Only the user may push to main.\n",
+                 "- Never push to main.\n- The user alone may push to main.\n",
+                 "- Never push to main.\n- Pushing to main is allowed for the user only.\n",
+                 "- Never push to main.\n- Main may be pushed to by the user alone.\n",
+                 "- Never open pull requests.\n- Only the user may open pull requests.\n",
+                 "- Never use a paused device.\n- Only the user lifts device pauses.\n",
+                 "- Never use a paused device.\n- Only the user may lift a device pause.\n"):
         assert pairs(body) == [], body
 
 

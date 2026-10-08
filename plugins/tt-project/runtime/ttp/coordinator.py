@@ -1873,11 +1873,16 @@ _FORBIDS_RE = re.compile(r"\b(?:never|do not|does not|must not|cannot|forbidden|
 _ALLOWS_RE = re.compile(r"\b(?:allowed|permitted|may|(?:is|are) fine|fine to|ok(?:ay)? to|lift(?:s|ed)?|can now|"
                         r"no longer)\b", re.I)
 # A permission inside a conditional clause ("where PRs are allowed", "once allowed", "if ... is ever
-# allowed") or limited to a condition ("allowed only on the user's word", "may only ...") lifts nothing.
+# allowed") or limited to a condition ("allowed only on the user's word", "may only ...") or to who
+# may act ("Only the user may ...", "the user alone may ...", "allowed for the user only", "by the
+# user alone") lifts nothing.
 _PERMIT = r"(?:allowed|permitted|lift(?:s|ed)?|may|fine|ok(?:ay)?)"
 _CONDITIONAL_PERMIT_RE = re.compile(r"\b(?:where|once|if|when|whenever|until|unless|provided|as long as)\b"
                                     rf"[^,.;:!?()]*?\b{_PERMIT}\b", re.I)
-_LIMITED_PERMIT_RE = re.compile(rf"\b{_PERMIT}\s+(?:be\s+)?only\b|\bonly\s+(?:be\s+)?{_PERMIT}\b", re.I)
+_LIMITED_PERMIT_RE = re.compile(rf"\b{_PERMIT}\s+(?:be\s+)?only\b|\bonly\s+(?:be\s+)?{_PERMIT}\b"
+                                rf"|(?:^|(?<=[,;:]))\s*only\b[^,.;:!?()]*\b{_PERMIT}\b"
+                                rf"|\balone\b[^,.;:!?()]*\b{_PERMIT}\b"
+                                rf"|\b{_PERMIT}\b[^,.;:!?()]*?\b(?:only|alone)\s*(?=[,.;:!?()]|$)", re.I)
 # The words after which a rule's main verb comes ("never push", "may run", "allowed to merge"), and
 # words skipped before it ("never directly push").
 _MAIN_VERB_RE = re.compile(r"\b(?:never|do not|does not|must not|cannot|(?:don|doesn|mustn|can)'t|no|may|can now|"
