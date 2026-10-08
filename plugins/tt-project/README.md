@@ -316,6 +316,11 @@ and preferences you add later become part of the project's charter and memory.
   configured; `ttp doctor` names a `git diff --check` that does not leave out `*.log`.
 - `ttp checks -- <cmd>` adds a check. Several words run as that argv (`ttp checks -- pytest -q`);
   one quoted string runs through the shell (`ttp checks -- 'FOO=1 pytest -q && ruff check .'`).
+- In Claude Code workers and reviewers, a Bash call that runs one of the configured pytest checks
+  in full (every path it names, or a directory above them, and no `-k`, `-m`, `--lf` or node id
+  it does not have) is refused with a pointer to `ttp checks`, which reuses a recorded pass.
+  Focused runs pass. `TTP_ALLOW_FULL_SUITE=1` before the command (or in the run's environment)
+  lets one through; each refusal is a line in the run's `refusals.jsonl`.
 - Scope a mandatory check by what it covers, never by whether it would pass. Prefer `if_changed`
   on the paths the check covers, or `if_exists` on the file it runs. Where no file marks the heads a check applies to (say a test that
   is missing at an independently reviewed head of another delivery branch), the fallback is a

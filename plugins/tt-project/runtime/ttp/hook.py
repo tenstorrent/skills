@@ -23,6 +23,11 @@ what runs: heredocs and echo/printf/cat text written to files that the command d
 argument, piped into a shell, through eval or after a move), and files that are only named, read
 or edited, are data.
 
+It also denies a Bash call that runs one of the project's configured pytest checks
+(`delivery.push_checks`) in full, and points at `ttp checks`, which reuses a pass recorded for the
+same tree (full_suite). Focused runs pass, and so does `TTP_ALLOW_FULL_SUITE=1`; each refusal is
+logged to the run's refusals.jsonl.
+
 It fails open: any error prints nothing, and the run goes on unchanged.
 """
 from __future__ import annotations
@@ -30,6 +35,7 @@ from __future__ import annotations
 import functools
 import json
 import os
+import posixpath
 import re
 import sys
 from pathlib import Path
@@ -387,7 +393,7 @@ def _strip_prefix(argv: list[str]) -> list[str]:
         elif re.match(r"^\w+=", w) or w.startswith("-") or re.fullmatch(r"\d+[smhd]?", w) \
                 or os.path.basename(w) in WRAPPERS or w in RESERVED:
             i += 1
-        elif w == "ttp" and argv[i + 1:i + 2] == ["lock"] and "--" in argv[i:]:
+        elif w == "ttp" and argv[i + 1:i + 2] in (["lock"], ["clip"], ["detach"]) and "--" in argv[i:]:
             i = argv.index("--", i) + 1
         else:
             break
@@ -474,9 +480,159 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
                 why = f"{f.name}: {why}"
                 break
     if not why:
+        why = full_suite(cmd, segments, str(payload.get("cwd") or os.getcwd()))
+    if not why:
         return None, None
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                    "permissionDecisionReason": f"tt-project: {why}."}}, None
+
+
+# Full runs of the project's required checks go through `ttp checks`, which reuses a pass recorded
+# for the same tree. Set to 1 for the run, or put `TTP_ALLOW_FULL_SUITE=1` before the command.
+FULL_SUITE_OK = "TTP_ALLOW_FULL_SUITE"
+FULL_SUITE_OK_RE = re.compile(r"(?:^|[\s;&|(])(?:export\s+)?" + FULL_SUITE_OK + r"=[\"']?1\b")
+# Each refusal, one JSON line in the run's directory, so they can be counted.
+REFUSALS_FILE = "refusals.jsonl"
+# pytest options that take the next word as their value (`--opt=value` carries its own)
+PYTEST_VALUE_OPTS = {"-k", "-m", "-p", "-c", "-o", "-r", "-n", "-W", "--tb", "--deselect", "--ignore", "--ignore-glob",
+                     "--rootdir", "--confcutdir", "--basetemp", "--junitxml", "--junit-xml", "--maxfail",
+                     "--durations", "--durations-min", "--timeout", "--log-level", "--log-file", "--log-cli-level",
+                     "--cov", "--cov-report", "--cov-config", "--pythonwarnings", "--import-mode", "--capture",
+                     "--override-ini", "--dist", "--color", "--code-highlight", "--junit-prefix", "--count",
+                     "--reruns", "--randomly-seed", "--html", "--config-file", "--inifile"}
+# pytest options that select part of what the targets name, or run none of it
+PYTEST_SELECT_OPTS = {"-k", "-m", "--lf", "--last-failed", "--sw", "--stepwise", "--stepwise-skip", "--deselect",
+                      "--ignore", "--ignore-glob", "--co", "--collect-only", "--collectonly", "--fixtures",
+                      "--fixtures-per-test", "--markers", "-h", "--help", "--version", "-V", "--setup-plan",
+                      "--setup-only", "--trace-config", "--count", "--lfnf", "--last-failed-no-failures"}
+PYTHON_VALUE_OPTS = {"-W", "-X", "-Q"}
+
+
+def _pytest_args(argv: list[str]) -> list[str] | None:
+    """The arguments of a pytest run (`pytest`, `py.test`, `python -m pytest`), else None."""
+    if not argv:
+        return None
+    name = os.path.basename(argv[0])
+    if name in ("pytest", "py.test"):
+        return argv[1:]
+    if not re.fullmatch(r"python[\d.]*", name):
+        return None
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a == "-m":
+            return argv[i + 2:] if argv[i + 1:i + 2] == ["pytest"] else None
+        if a in PYTHON_VALUE_OPTS:
+            i += 2
+        elif a.startswith("-") and a != "-":
+            i += 1
+        else:
+            return None   # a script or stdin: not pytest itself
+    return None
+
+
+def _pytest_parts(args: list[str], rel: str) -> tuple[set[str], set[tuple[str, str]]]:
+    """(the paths a pytest run names, relative to the repository's top, "." when it names none;
+    its selecting options as (option, value)). An option not known to take a value is a flag: its
+    value then counts as one more path, which can only make a run look narrower, never wider."""
+    paths: set[str] = set()
+    select: set[tuple[str, str]] = set()
+    i = 0
+    while i < len(args):
+        a = args[i]
+        opt, eq, val = a.partition("=")
+        if a.startswith("-") and a != "-":
+            if not eq and opt in PYTEST_VALUE_OPTS:
+                val = args[i + 1] if i + 1 < len(args) else ""
+                i += 1
+            if opt in PYTEST_SELECT_OPTS:
+                select.add((opt, val))
+        elif "::" in a:
+            select.add(("::", a))   # a node id: one test or class
+        else:
+            paths.add(a)
+        i += 1
+    return {posixpath.normpath(posixpath.join(rel, p)) for p in (paths or {"."})}, select
+
+
+def _covers(run: set[str], check: set[str]) -> bool:
+    """Whether a run naming `run` also runs everything a check naming `check` runs: each of the
+    check's paths is one of the run's, or under one of its directories."""
+    return all(any(c == r or r == "." or c.startswith(r.rstrip("/") + "/") for r in run) for c in check)
+
+
+def _repo_rel(cwd: str) -> tuple[str, str]:
+    """(the git top of `cwd`, `cwd` relative to it); ("", ".") outside a repository."""
+    d = Path(cwd)
+    for top in (d, *d.parents):
+        if (top / ".git").exists():
+            return str(top), os.path.relpath(d, top)
+    return "", "."
+
+
+def _relativize(args: list[str], top: str) -> list[str]:
+    """Absolute paths under the repository's top as repo-relative ones."""
+    return [os.path.relpath(a, top) if top and os.path.isabs(a) and (a + "/").startswith(top.rstrip("/") + "/")
+            else a for a in args]
+
+
+def _check_runs() -> list[tuple[str, set[str], set[tuple[str, str]]]]:
+    """(the check, its paths, its selecting options) for each pytest run in the project's configured
+    checks (`delivery.push_checks`, what `ttp checks` runs). Read fresh: a project may change them."""
+    base = os.environ.get("TTP_PROJECT")
+    if not base:
+        return []
+    from .project import Project
+    from .push import check_list
+    p = Project(base)
+    if not p.exists():
+        return []
+    out = []
+    for c in check_list((p.config().get("delivery") or {}).get("push_checks")):
+        for argv in _segments(str(c)):
+            args = _pytest_args(argv)
+            if args is not None:
+                paths, select = _pytest_parts(args, ".")
+                out.append((str(c), paths, select))
+    return out
+
+
+def full_suite(cmd: str, segments: list[list[str]], cwd: str) -> str | None:
+    """Why `cmd` is refused when it runs one of the project's configured pytest checks in full,
+    else None. A run counts as full when it names every path the check names (or a directory above
+    them) and selects nothing the check does not (`-k`, `-m`, `--lf`, a node id ...). Anything
+    unclear passes: refusing a focused run costs more than missing a full one. Each refusal is
+    logged to the run's refusals.jsonl."""
+    if os.environ.get(FULL_SUITE_OK) == "1" or FULL_SUITE_OK_RE.search(cmd):
+        return None
+    runs = [(s, a) for s, a in ((s, _pytest_args(s)) for s in segments) if a is not None]
+    if not runs:
+        return None
+    checks = _check_runs()
+    if not checks:
+        return None
+    top, rel = _repo_rel(cwd)
+    for _seg, args in runs:
+        paths, select = _pytest_parts(_relativize(args, top), rel)
+        for check, cpaths, cselect in checks:
+            if select <= cselect and _covers(paths, cpaths):
+                _log_refusal(cmd, check)
+                return (f"this runs the project's full check `{check}`. While you work, run only the tests "
+                        "you changed (a file, `-k <expr>`, `file::test`); run the full checks once, committed, "
+                        "with `ttp checks` (it reuses a pass already recorded for the same tree; "
+                        "`ttp checks --detach` when they take long). If you truly need it here, put "
+                        f"`{FULL_SUITE_OK}=1` before the command")
+    return None
+
+
+def _log_refusal(cmd: str, check: str) -> None:
+    import time
+    try:
+        with open(Path(os.environ["TTP_RUN_DIR"]) / REFUSALS_FILE, "a") as f:
+            f.write(json.dumps({"ts": time.time(), "kind": "full_suite", "check": check,
+                                "command": cmd[:500]}) + "\n")
+    except OSError:
+        pass
 
 
 HANDLERS = {"PostToolUse": post_tool_use, "PreToolUse": pre_tool_use}

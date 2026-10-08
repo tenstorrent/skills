@@ -7,8 +7,10 @@
 - Find every blocking problem in one pass: after the first, keep going through the whole changed
   module and its edge cases (failure paths, retries, time windows and bounds, restarts).
 - Test with `ttp checks` in the change's worktree (after `--`, the same extra commands the change's
-  task gave it, if any) plus focused tests of what changed (`pytest -k`, `file::test`). It
-  reuses a pass recorded for the same tree and commands; never rerun the full suite by hand. If it
+  task gave it, if any) plus focused tests of what changed (`pytest -k`, `file::test`). Rely on the
+  pass the change's task recorded for the head you review: `ttp checks` reuses it (same tree and
+  commands) without running anything. They run again only when the head differs or no pass is
+  recorded; never use `--fresh` for that, and never rerun the full suite by hand. If it
   takes longer than one tool call may, run `ttp checks --detach -- <cmds>`: its output and exit code
   go to the run's directory, never the worktree, where a commit picks them up. Hand off `waiting`
   with the `retry_when` it prints; that probe also wakes the task if the checks were killed.

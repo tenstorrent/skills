@@ -23225,6 +23225,136 @@ def test_claude_hook_scans_only_what_runs(env, monkeypatch, tmp_path):
         assert denied(cmd), cmd
 
 
+SUITE = "python3 -m pytest -q tests/test_a.py tests/test_b.py"
+
+
+def _suite_hook(env, monkeypatch, tmp_path, checks):
+    """A run of a project whose push_checks are `checks`, in a repository at tmp_path/repo."""
+    from ttp import hook
+    p = make(env)
+    p.set_config("delivery.push_checks", checks)
+    repo, run = tmp_path / "wt", tmp_path / "run"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "sub").mkdir()
+    run.mkdir()
+    monkeypatch.setenv("TTP_RUN_DIR", str(run))
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.delenv(hook.FULL_SUITE_OK, raising=False)
+
+    def denied(cmd, cwd=repo):
+        out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(cwd)})
+        return bool(out) and out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    return hook, repo, run, denied
+
+
+def test_worker_hook_refuses_a_direct_full_suite_run_and_logs_it(env, monkeypatch, tmp_path):
+    hook, repo, run, denied = _suite_hook(env, monkeypatch, tmp_path, [SUITE, "claude plugin validate x --strict"])
+    for cmd in (SUITE,
+                "pytest tests/test_a.py tests/test_b.py",
+                "python -m pytest tests/test_b.py tests/test_a.py -x --tb=short",
+                "/opt/venv/bin/python3.12 -X dev -m pytest -q -p no:cacheprovider tests/",
+                "python3 -m pytest -q tests",
+                "python3 -m pytest -q",                      # no paths: the whole repository
+                f"python3 -m pytest -q {repo}/tests/test_a.py ./tests/test_b.py",
+                "cd x; FOO=1 timeout 900 python3 -m pytest -q tests/test_a.py tests/test_b.py 2>&1 | tail -5",
+                f"ttp clip -- {SUITE}",
+                f"ttp lock dev -- {SUITE}",
+                f"git add -A && git commit -qm x && {SUITE}"):
+        assert denied(cmd), cmd
+    assert denied("python3 -m pytest -q ../tests/test_a.py ../tests/test_b.py", repo / "sub")
+    out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": SUITE}, "cwd": str(repo)})
+    why = out["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "`ttp checks`" in why and "reuses a pass" in why and "TTP_ALLOW_FULL_SUITE=1" in why and SUITE in why
+    lines = [json.loads(x) for x in (run / hook.REFUSALS_FILE).read_text().splitlines()]
+    assert len(lines) == 13 and {x["kind"] for x in lines} == {"full_suite"} and lines[0]["command"] == SUITE
+    assert lines[0]["check"] == SUITE
+
+
+def test_worker_hook_lets_targeted_and_other_runs_through(env, monkeypatch, tmp_path):
+    hook, repo, run, denied = _suite_hook(env, monkeypatch, tmp_path, [SUITE])
+    for cmd in ("python3 -m pytest -q tests/test_a.py",
+                "pytest tests/test_b.py -x",
+                "python3 -m pytest -q tests/test_a.py tests/test_b.py -k hook",
+                "python3 -m pytest -q tests/test_a.py tests/test_b.py -k=hook",
+                "python3 -m pytest -q tests/test_a.py::test_one tests/test_b.py",
+                "python3 -m pytest -q tests/test_a.py tests/test_b.py --lf",
+                "python3 -m pytest -q tests/test_a.py tests/test_b.py -m 'not slow'",
+                "python3 -m pytest -q tests/test_a.py tests/test_b.py --deselect tests/test_a.py::t",
+                "python3 -m pytest -q tests/test_a.py tests/test_b.py --collect-only",
+                "python3 -m pytest -q tests/test_c.py",
+                "python3 -m pytest -q tests/test_a.py tests/other",
+                "python3 -m pytest --version",
+                "python3 x.py tests/test_a.py tests/test_b.py",
+                "python3 -c 'import pytest' tests/test_a.py tests/test_b.py",
+                "ttp checks", "ttp checks --detach -- python3 -m pytest -q tests/test_c.py",
+                "echo 'python3 -m pytest -q tests/test_a.py tests/test_b.py'",
+                "grep -n pytest tests/test_a.py tests/test_b.py",
+                "git status"):
+        assert not denied(cmd), cmd
+    # From a subdirectory, its paths are its own: tests/ there is not the repository's tests/.
+    assert not denied("python3 -m pytest -q tests/test_a.py tests/test_b.py", repo / "sub")
+    assert not denied("python3 -m pytest -q", repo / "sub")
+    assert not (run / hook.REFUSALS_FILE).exists()
+    # A check that selects by itself: the same selection is the full check, another one is not.
+    hook, repo, run, denied = _suite_hook(env, monkeypatch, tmp_path / "m", ["pytest -q -m 'not slow' tests"])
+    assert denied("pytest -m 'not slow' tests") and not denied("pytest -m 'not slow' -k x tests")
+    assert not denied("pytest tests -m slow")
+
+
+def test_worker_hook_full_suite_guard_follows_the_projects_checks_and_has_an_escape_hatch(env, monkeypatch, tmp_path):
+    hook, repo, run, denied = _suite_hook(env, monkeypatch, tmp_path, [SUITE])
+    assert denied(SUITE)
+    # The escape hatch: on the command line, or for the whole run.
+    assert not denied(f"TTP_ALLOW_FULL_SUITE=1 {SUITE}")
+    assert not denied(f"export TTP_ALLOW_FULL_SUITE=1; {SUITE}")
+    assert denied(f"TTP_ALLOW_FULL_SUITE=0 {SUITE}")
+    monkeypatch.setenv(hook.FULL_SUITE_OK, "1")
+    assert not denied(SUITE)
+    monkeypatch.delenv(hook.FULL_SUITE_OK)
+    # Read fresh from the project's settings: other checks, other refusals; none, none.
+    from ttp.project import Project
+    p = Project(os.environ["TTP_PROJECT"])
+    p.set_config("delivery.push_checks", [{"run": "cd . && /x/bin/python -m pytest models/unit", "if_exists": "models"}])
+    assert not denied(SUITE)
+    assert denied("pytest models/unit") and denied("python3 -m pytest models") and not denied("pytest models/unit/a.py")
+    p.set_config("delivery.push_checks", ["make lint"])
+    assert not denied(SUITE) and not denied("pytest")
+    # Outside a project, or outside a run, nothing is refused.
+    monkeypatch.delenv("TTP_PROJECT")
+    assert not denied("pytest models/unit")
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.delenv("TTP_RUN_DIR")
+    assert not denied("pytest models/unit")
+
+
+def test_ttp_checks_lets_a_reviewer_reuse_the_workers_pass_and_reruns_on_another_head(env, tmp_path, monkeypatch, capsys):
+    """The reviewer's path: the worker's recorded pass serves the same head in the reviewer's own
+    worktree without running anything; a different head runs them."""
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    count = tmp_path / "count"
+    check = ["sh", "-c", f"echo x >> {count}"]
+    ran = lambda: len(count.read_text().splitlines()) if count.exists() else 0
+    cli.main(["checks", "--", *check])
+    assert ran() == 1
+    head = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    review, rrun = tmp_path / "review", tmp_path / "rrun"
+    rrun.mkdir()
+    subprocess.run([*git, "worktree", "add", "-q", "--detach", str(review), head], check=True)
+    monkeypatch.setenv("TTP_RUN_DIR", str(rrun))
+    monkeypatch.setenv("TTP_RUN_ID", "77")
+    monkeypatch.chdir(review)
+    capsys.readouterr()
+    cli.main(["checks", "--", *check])
+    assert ran() == 1 and "in run 41" in capsys.readouterr().out
+    assert json.loads((rrun / "checks.json").read_text())["head"] == head
+    (review / "a.txt").write_text("b\n")
+    rgit = ["git", "-C", str(review), "-c", "user.email=t@example.com", "-c", "user.name=t"]
+    subprocess.run([*rgit, "commit", "-qam", "b"], check=True)
+    cli.main(["checks", "--", *check])
+    assert ran() == 2 and "(recorded)" not in capsys.readouterr().out
+
+
 def test_gh_found_through_command_v_is_still_the_guarded_one(env, tmp_path):
     """`$(command -v gh)` and `command gh` resolve to the harness's gh, which is first on PATH."""
     p = make(env)

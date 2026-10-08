@@ -454,3 +454,17 @@ def test_suite_keeps_pytest_temp_dirs_small(pytestconfig):
     # host the default (keep every tmp_path of the last 3 sessions) fills /tmp and slows boot cleanup.
     assert pytestconfig.getini("tmp_path_retention_policy") == "failed"
     assert int(pytestconfig.getini("tmp_path_retention_count")) <= 1
+
+
+def test_code_and_review_prompts_keep_full_suite_runs_to_ttp_checks():
+    prompts = PLUGIN / "template" / "prompts"
+    code = " ".join((prompts / "kind-code.md").read_text(encoding="utf-8").split())
+    for part in ("While you iterate, run only the tests your change affects", "never the full suite",
+                 "Run `ttp checks` once at the end, committed, before the hand-off",
+                 "A direct full-suite run is refused"):
+        assert part in code, part
+    review = " ".join((prompts / "kind-review.md").read_text(encoding="utf-8").split())
+    for part in ("Rely on the pass the change's task recorded for the head you review",
+                 "They run again only when the head differs or no pass is recorded",
+                 "never rerun the full suite by hand"):
+        assert part in review, part

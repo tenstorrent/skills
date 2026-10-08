@@ -14,8 +14,10 @@
   that probe also wakes the task if the checks were killed. If nothing is left after them but
   recording the result, put that final hand-off (`done` or `needs_review`) in `on_pass`: a pass on
   the same head records it without a model run; a failure wakes the task at its tier with the output.
-  Running it again stops this run's earlier detached checks. Run plain
-  test commands (`pytest -k`, `file::test`) only for focused tests while you work.
+  Running it again stops this run's earlier detached checks.
+- While you iterate, run only the tests your change affects (a file, `pytest -k`, `file::test`),
+  never the full suite: each fix changes the tree, so a full run per fix is wasted. Run `ttp checks`
+  once at the end, committed, before the hand-off. A direct full-suite run is refused.
 - Keep the diff minimal and on-topic. No drive-by rewrites.
 
 ## Landing on the project's branch (only when both hold)
