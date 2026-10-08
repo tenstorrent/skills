@@ -56,10 +56,9 @@ TTP_MARKER = "<!-- ttp -->"
 
 
 def _own(c: dict, pr: dict) -> bool:
-    """A comment or review this project's runs posted: it carries the hidden marker and comes from the
-    account that opened the PR (the runs' gh). A marker from anyone else does not hide their comment."""
-    login = (c.get("author") or {}).get("login", "")
-    return TTP_MARKER in str(c.get("body") or "") and bool(login) and login == (pr.get("author") or {}).get("login")
+    """A comment or review a tt-project run posted: it carries the hidden marker, whatever the author
+    (the runs' gh account may not be the one that opened the PR). Unmarked comments always count."""
+    return TTP_MARKER in str(c.get("body") or "")
 
 
 def pr_signature(pr: dict) -> dict:

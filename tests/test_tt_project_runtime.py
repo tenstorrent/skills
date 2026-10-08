@@ -24614,8 +24614,8 @@ def test_pr_watch_drops_flags_for_cancelled_tasks_and_prs_it_cannot_read(env, mo
 
 def test_pr_watch_skips_comments_its_own_runs_marked(env, monkeypatch):
     """A comment or review this project's runs post on their PR ends with the hidden <!-- ttp --> marker
-    and is not reported back as new review activity. The marker hides only comments from the account
-    that opened the PR; anyone else's comment still counts, marker or not."""
+    and is not reported back as new review activity, whatever the author (the shared account may not
+    be the PR's opener). An unmarked comment from the same account still counts."""
     from ttp import watchers
     from ttp.daemon import Daemon
     p = make(env)
@@ -24638,13 +24638,14 @@ def test_pr_watch_skips_comments_its_own_runs_marked(env, monkeypatch):
     pr["reviews"].append({"author": own, "body": "Looks fine.\n\n<!-- ttp -->", "state": "COMMENTED"})
     watchers.watch_prs(d)
     assert events() == []
-    # Someone else's marker does not hide their comment, nor does an unmarked one from the PR's account.
-    pr["comments"].append({"author": other, "body": "Also this. <!-- ttp -->"})
+    # A marked reply through an account that did not open the PR is the harness's own too.
+    pr["comments"].append({"author": other, "body": "Fixed. <!-- ttp -->"})
     watchers.watch_prs(d)
-    assert len(events()) == 1
-    pr["comments"].append({"author": own, "body": "Typed by hand."})
+    assert events() == [] and watchers.pr_signature(pr)["n_human"] == 1
+    # An unmarked comment from the same account counts.
+    pr["comments"].append({"author": other, "body": "Typed by hand."})
     watchers.watch_prs(d)
-    assert len(events()) == 2
+    assert len(events()) == 1 and watchers.pr_signature(pr)["n_human"] == 2
 
 
 def test_pr_watch_skips_mergeable_unknown_flaps_and_honours_pr_mutes(env, monkeypatch):
