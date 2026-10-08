@@ -23601,6 +23601,77 @@ def test_claude_hook_denies_ways_around_the_gh_guard(env, monkeypatch, tmp_path)
     assert pre["matcher"] == "Bash" and pre["hooks"][0]["command"].endswith("ttp.hook PreToolUse")
 
 
+def test_workers_gh_never_requests_human_reviewers(env, tmp_path):
+    """The user asks for reviews: a run's gh refuses to request human reviewers or teams, in every
+    spelling, and lets bot reviewers and removals through."""
+    p = make(env)
+    gh = _gh_runner(p, tmp_path)
+    body = tmp_path / "rr.json"
+    body.write_text('{"reviewers": ["alice"]}')
+    refused = [("pr", "create", "--draft", "--reviewer", "alice"), ("pr", "create", "-d", "--reviewer=org/core"),
+               ("pr", "create", "-d", "-r", "alice"), ("pr", "create", "-dr", "alice"), ("pr", "create", "-dralice"),
+               ("pr", "create", "-d", "-r", "copilot,alice"), ("pr", "create", "--dry-run", "-r", "alice"),
+               ("pr", "edit", "7", "--add-reviewer", "alice"), ("pr", "edit", "7", "--add-reviewer=org/core"),
+               ("api", "repos/acme/widgets/pulls/7/requested_reviewers", "-f", "reviewers[]=alice"),
+               ("api", "-X", "POST", "repos/acme/widgets/pulls/7/requested_reviewers", "-f", "team_reviewers[]=core"),
+               ("api", "-X", "POST", "repos/acme/widgets/pulls/7/requested_reviewers"),
+               ("api", "repos/acme/widgets/pulls/7/requested_reviewers", "--input", str(body)),
+               ("api", "graphql", "-f", "query=mutation{requestReviews(input:{pullRequestId:\"PR_kwDOabc\","
+                                        "userIds:[\"U_1\"]}){clientMutationId}}")]
+    for args in refused:
+        rc, err, ran = gh(*args)
+        assert rc == 1 and "never request human reviewers" in err and ran == [], f"gh {' '.join(args)} was let through"
+    allowed = [("pr", "edit", "7", "--add-reviewer", "copilot-pull-request-reviewer[bot]"),
+               ("pr", "edit", "7", "--remove-reviewer", "alice"), ("pr", "edit", "7", "--title", "-r x"),
+               ("api", "-X", "DELETE", "repos/acme/widgets/pulls/7/requested_reviewers", "-f", "reviewers[]=alice"),
+               ("api", "repos/acme/widgets/pulls/7/requested_reviewers"),
+               ("api", "-X", "POST", "repos/acme/widgets/pulls/7/requested_reviewers", "-f",
+                "reviewers[]=copilot-pull-request-reviewer[bot]")]
+    for args in allowed:
+        rc, err, ran = gh(*args)
+        assert rc == 0 and ran == [" ".join(args)], f"gh {' '.join(args)} was refused: {err}"
+    # An option's value that starts with -r is not a reviewer.
+    from ttp import prguard
+    assert prguard.check(["pr", "create", "-d", "--dry-run", "-b", "-r alice", "-t", "-rx"], "/bin/false") is None
+
+
+def test_an_ask_that_only_seeks_leave_to_open_a_draft_pr_is_rejected(env):
+    """Opening or updating a draft PR never needs the user's permission. Asks about leaving draft,
+    merging, reviewers or a restriction that forbids PRs still go out."""
+    rejected = ["May I open a draft PR for the fix?",
+                "Permission to open a draft PR on acme/widgets while the code freeze holds?",
+                "Should I update the draft PR https://github.com/acme/widgets/pull/7 with the new commit?",
+                "Open the draft PR now, or wait for the freeze to end?"]
+    for text in rejected:
+        p = make(env)
+        problems, ask = _ask(p, text, blocking="review", recommendation="yes")
+        assert problems and "draft PRs need no permission: open it" in problems[0] and ask is None, text
+    sent = [("Is https://github.com/acme/widgets/pull/7 ready to leave draft?", "review"),
+            ("May I merge the draft PR https://github.com/acme/widgets/pull/7?", "merge"),
+            ("The charter says never open PRs; may I open a draft PR?", "restriction"),
+            ("Should I request reviewers on the draft PR?", "human"),
+            ("I opened draft PR acme/widgets#7; please review it.", "review")]
+    for text, blocking in sent:
+        p = make(env)
+        problems, ask = _ask(p, text, blocking=blocking, least_disruptive="x" * 80)
+        assert not any("draft PRs need no permission" in x for x in problems) and ask is not None, (text, problems)
+
+
+def test_rules_say_draft_prs_need_no_permission_and_no_reviewers_are_requested():
+    template = RUNTIME.parent / "template"
+    charter = " ".join((template / "CHARTER.md").read_text().split())
+    assert ("Pull requests: opening and updating draft PRs is always allowed and needs no permission or ask, even "
+            "under a code freeze. Never request human reviewers.") in charter
+    assert "the PR leaves draft only on the user's explicit OK" in charter
+    coord_text = " ".join((template / "prompts" / "coordinator.md").read_text().split())
+    assert "Opening and updating draft PRs is always allowed: never ask about it" in coord_text
+    assert "not even under a project's own code freeze" in coord_text and "Never request human reviewers" in coord_text
+    worker = " ".join((template / "prompts" / "worker.md").read_text().split())
+    assert "Open or update the draft PR without asking" in worker
+    for how in ("gh pr create --reviewer", "gh pr edit --add-reviewer", "requested_reviewers"):
+        assert how in worker, how
+
+
 def test_prompts_say_only_the_user_takes_a_pr_out_of_draft():
     prompts = RUNTIME.parent / "template" / "prompts"
     for name in ("kind-code.md", "kind-review.md"):

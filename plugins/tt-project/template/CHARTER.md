@@ -16,7 +16,9 @@ Created {{DATE}}. The coordinator keeps this file current; the user's words win 
 
 ## Policies
 
-- Pull requests: draft first; independent review before ready; the user merges.
+- Pull requests: opening and updating draft PRs is always allowed and needs no permission or ask,
+  even under a code freeze. Never request human reviewers. An independent review passes the
+  change, and the PR leaves draft only on the user's explicit OK. The user merges.
 - Auto-merge repositories: none.
 - Notify the user only for decisions, reviews, merges, funds and outages.
 - Shared clusters (Slurm, other people's machines): only the exact nodes listed under Resources;

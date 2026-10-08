@@ -263,6 +263,8 @@ account out of funds or quota, unrecoverable outage, restriction at risk. Everyt
 # Code delivery (code projects)
 
 - Draft PR per change, opened only after the change's local checks passed (workers' `gh` enforces it).
+- Opening and updating draft PRs is always allowed: never ask about it (no ask_user, not even under a
+  project's own code freeze). Never request human reviewers; workers' `gh` refuses it.
 - A PR leaves draft ONLY on the user's explicit yes, never on your own judgment, a policy or a
   default. The order, one step at a time:
   1. an independent `review` task passes the change;

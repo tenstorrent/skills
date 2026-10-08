@@ -8,7 +8,10 @@ It refuses, whatever the agent or provider:
 - inside a run, opening a PR (even a draft) before the run's local checks passed on the commit it
   is opened from (`ttp checks` records that in the run's CHECKS_FILE);
 - `gh pr ready` (but not `--undo`), and REST or GraphQL calls that mark a PR ready,
-  unless the PR has an unspent approval record.
+  unless the PR has an unspent approval record;
+- requests for human reviewers (`gh pr create --reviewer`, `gh pr edit --add-reviewer`, REST POSTs to
+  a PR's requested_reviewers and GraphQL requestReviews): the user asks for reviews, never a run.
+  Bot reviewers (a login ending in `[bot]`, Copilot) may be requested.
 
 An approval record is written only by the coordinator's `pr_approve` action. It needs the user's
 own words, quoted: a user message that names the PR, or the user's answer to a blocking `review` or
@@ -76,6 +79,44 @@ GH_COMMANDS = {"alias", "api", "attestation", "auth", "browse", "cache", "co", "
 
 HOW = ("A PR leaves draft only after the user approves it: the coordinator asks the user (ask_user, "
        "blocking review) naming the PR's URL and, on their yes on Slack, records it with pr_approve.")
+NO_REVIEWERS = ("refused: never request human reviewers on a PR; the user asks for reviews themselves. "
+                "Leave the PR as a draft without reviewers and go on.")
+BOT_REVIEWER_RE = re.compile(r"@?copilot|[\w.-]+\[bot\]", re.I)
+REVIEWERS_REST_RE = re.compile(r"^/?repos/[^/]+/[^/]+/pulls/\d+/requested_reviewers/?$")
+# `gh pr create` short flags that take no value, so `-dr alice` is --draft --reviewer alice
+PR_CREATE_BOOLS = "defw"
+PR_CREATE_LONG_BOOLS = {"--draft", "--editor", "--fill", "--fill-first", "--fill-verbose", "--web", "--dry-run",
+                        "--no-maintainer-edit", "--help"}
+
+
+def _humans(names: list[str]) -> list[str]:
+    """The reviewer names in `names` (comma lists too) that are not bots."""
+    return [n for v in names for n in (x.strip() for x in v.split(",")) if n and not BOT_REVIEWER_RE.fullmatch(n)]
+
+
+def _short_reviewers(args: list[str]) -> list[str]:
+    """`gh pr create` reviewer values given as `-r`, also joined to bool flags (`-dr x`, `-dfrx`)."""
+    out, skip = [], False
+    for i, a in enumerate(args):
+        if skip:   # the value of the option before it
+            skip = False
+            continue
+        if a == "--":
+            break
+        if a.startswith("--"):
+            skip = "=" not in a and a not in PR_CREATE_LONG_BOOLS
+            continue
+        if not a.startswith("-") or a == "-":
+            continue
+        skip = a[-1] not in PR_CREATE_BOOLS and all(c in PR_CREATE_BOOLS for c in a[1:-1])
+        for j, c in enumerate(a[1:], 1):
+            if c == "r":
+                out.append(a[j + 1:] or (args[i + 1] if i + 1 < len(args) else ""))
+            if c not in PR_CREATE_BOOLS:
+                break
+    return out
+
+
 HANDOFF = ("Do not retry or work around it: hand off `blocked` with the PR's URL in `pr` and say it waits for "
            "the user's approval to leave draft; the coordinator asks the user.")
 CHECKS_HOW = ("Run `ttp checks` in this worktree (it runs the project's checks, or the ones you give after "
@@ -356,6 +397,26 @@ def delivery_instruction(text: str) -> str | None:
     return None
 
 
+# An ask that only seeks leave to open or update a draft PR: a draft PR needs no one's permission.
+DRAFT_OPEN_RE = re.compile(r"\b(?:open|opening|create|creating|raise|raising|file|filing|update|updating|push|pushing)"
+                           r"\b(?:\s+(?!draft\b)[\w'-]+){0,3}?\s+(?:a\s+|the\s+)?draft\s+(?:PR|pull\s+request)s?\b", re.I)
+PERMISSION_RE = re.compile(r"\?|\b(?:permission|may\s+(?:i|we)|can\s+(?:i|we)|should\s+(?:i|we)|shall|ok(?:ay)?\s+to|"
+                           r"go[- ]ahead|green\s+light|approv\w*|allow\w*|confirm\w*|sign[- ]off)\b", re.I)
+# Anything beyond opening one: leaving draft, merging, a restriction or freeze that forbids PRs,
+# reviewers or another person. Those asks go out as before.
+DRAFT_ASK_MORE_RE = re.compile(r"\b(?:ready|merg\w*|undraft\w*|restrict\w*|forbid\w*|prohibit\w*|charter|"
+                               r"never|reviewers?|out\s+of\s+draft|leaves?\s+draft|leaving\s+draft)\b", re.I)
+
+
+def draft_permission_ask(text: str) -> bool:
+    """`text` (an ask) only asks leave to open or update a draft PR."""
+    bare = PR_URL_RE.sub("the PR", text or "")
+    if DRAFT_ASK_MORE_RE.search(bare):
+        return False
+    return any(DRAFT_OPEN_RE.search(s) and PERMISSION_RE.search(s)
+               for s in re.split(r"(?<=[.!?])\s+|\n", bare))
+
+
 def spec_problem(db, spec: str) -> str | None:
     """Why a task spec must not be handed out: it tells a worker to take a PR out of draft and that
     PR has no unspent approval. None when it may."""
@@ -494,13 +555,15 @@ def check(args: list[str], real: str, db=None, stdin_text: str | None = None, _d
         if expansion is not None:
             if expansion.startswith("!"):
                 text = expansion + " " + " ".join(rest)
-                if re.search(r"\bpr\s+(ready|create)\b|\bapi\b|markPullRequestReadyForReview|draft", text):
+                if re.search(r"\bpr\s+(ready|create)\b|\bapi\b|markPullRequestReadyForReview|draft|reviewer", text):
                     return f"refused: the gh alias {cmd!r} runs a shell command that may change a PR's draft state"
                 return None
             return check(_expand(expansion, rest), real, db, stdin_text, _depth + 1, allowed)
     if cmd == "pr" and rest:
         sub, more = rest[0], rest[1:]
         if sub == "create":
+            if _humans(_opts(more, ("--reviewer",)) + _short_reviewers(more)):
+                return NO_REVIEWERS
             if "--dry-run" in more:
                 return None
             if any(a in ("-d", "--draft", "--draft=true") for a in more):
@@ -517,6 +580,8 @@ def check(args: list[str], real: str, db=None, stdin_text: str | None = None, _d
             key = pr_key(out)
             return _refuse_ready({key} if key else set(), db, "marking a PR ready for review", allowed,
                                  {key: _sha(out)} if key else {})
+        if sub == "edit" and _humans(_opts(more, ("--add-reviewer",))):
+            return NO_REVIEWERS
     if cmd == "api":
         return _check_api(rest, real, db, stdin_text, allowed)
     return None
@@ -574,6 +639,10 @@ def _check_api(args: list[str], real: str, db, stdin_text: str | None, allowed: 
     method = ((_opts(args, ("-X", "--method")) or [""])[-1] or ("POST" if fields or inputs else "GET")).upper()
     draft_false = bool(re.search(r"(^|\s)draft=false\b|[\"']draft[\"']\s*:\s*false", text, re.I))
     draft_true = bool(re.search(r"(^|\s)draft=true\b|[\"']draft[\"']\s*:\s*true|\bdraft\s*:\s*true", text, re.I))
+    if endpoint == "graphql" and re.search(r"\brequestReviews", text):
+        return NO_REVIEWERS
+    if REVIEWERS_REST_RE.match(endpoint) and method == "POST" and _reviewer_humans(fields, body):
+        return NO_REVIEWERS
     if endpoint == "graphql":
         if re.search(r"markPullRequestReadyForReview", text):
             prs, heads = set(), {}
@@ -609,6 +678,27 @@ def _check_api(args: list[str], real: str, db, stdin_text: str | None, allowed: 
         head = _sha(_gh(real, "api", *host, f"repos/{owner}/{repo}/pulls/{number}", "-q", ".head.sha"))
         return _refuse_ready({key}, db, "setting draft=false on a PR", allowed, {key: head})
     return None
+
+
+def _reviewer_humans(fields: list[str], body: str) -> bool:
+    """A requested_reviewers POST names a human or a team, or names no one it can read (refused)."""
+    names, teams = [], []
+    for f in fields:
+        k, _, v = f.partition("=")
+        if re.fullmatch(r"reviewers(\[\])?", k.strip()):
+            names.append(v)
+        elif re.fullmatch(r"team_reviewers(\[\])?", k.strip()):
+            teams.append(v)
+    if body.strip():
+        try:
+            data = json.loads(body)
+        except ValueError:
+            return True
+        if not isinstance(data, dict):
+            return True
+        names += [str(x) for x in data.get("reviewers") or []]
+        teams += [str(x) for x in data.get("team_reviewers") or []]
+    return bool(teams) or not names or bool(_humans(names))
 
 
 # --- the wrapper ------------------------------------------------------------------------------

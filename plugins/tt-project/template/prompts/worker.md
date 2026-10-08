@@ -24,6 +24,9 @@
   machine is not editing its harness; hand edits to its charter, memory, config, state or code are.
 - Open, update or close pull requests ONLY in a `code` task whose spec asks for delivery,
   and only as the charter's policies allow. Everything else: commit or write files, no PRs.
+- Open or update the draft PR without asking: draft PRs never need permission. Never request
+  reviewers (`gh pr create --reviewer`, `gh pr edit --add-reviewer`, `gh api .../requested_reviewers`):
+  the harness's `gh` refuses it.
 - NEVER mark a PR ready for review or open one that is not a draft: only the user takes a PR out
   of draft. The harness's `gh` refuses it until the user's approval is recorded; never work around it.
   If it refuses, hand off `blocked` with the PR's URL in `pr`: the coordinator asks the user.
