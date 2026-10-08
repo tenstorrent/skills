@@ -28374,3 +28374,87 @@ def test_a_run_that_leaves_the_project_root_off_its_branch_or_newly_dirty_alerts
     _git_out(repo, "checkout", "-q", base)
     _end_run(p, d, row)
     assert not alerts(f"root-checkout:{homing}") and not p.db.kv(dm.ROOT_CHECKOUT_KEY)
+
+
+def test_one_root_change_seen_by_two_runs_raises_one_alert_naming_the_run_in_the_root(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dm
+
+    class Proc:
+        pid = 4242
+    real = subprocess.Popen
+    monkeypatch.setattr(dm.subprocess, "Popen",
+                        lambda argv, *a, **k: Proc() if "ttp.runner" in argv else real(argv, *a, **k))
+    p.set_config("review.auto", False)
+    repo = env["repo"]
+    d = dm.Daemon(p.base)
+    alerts = lambda: p.db.q("SELECT * FROM messages WHERE kind='alert' AND ref LIKE 'root-checkout:%'")
+    observations = lambda: p.db.q("SELECT * FROM events WHERE kind='observation' "
+                                  "AND (text LIKE '%root%' OR text LIKE '%main checkout%')")
+    # A code task in its own worktree and a work task in the project root run together.
+    code = p.db.add_task("in a worktree", "s", kind="code", tier="light", origin="user")
+    cwd, branch = d._workdir_for(p.db.task(code))
+    p.db.update_task(code, status="running", branch=branch)
+    a = p.db.one("SELECT * FROM runs WHERE id=?",
+                 (d.start_run("worker", "go", "claude", "light", cwd, task=p.db.task(code)),))
+    work = p.db.add_task("in the root", "s", kind="work", tier="light", origin="user")
+    b = _root_run(p, d, work)
+    (repo / "README.md").write_text("edited in the root\n")
+    # The worktree run ends first, then the one in the root: one alert, the root run named as its cause.
+    _end_run(p, d, a)
+    _end_run(p, d, b)
+    got = alerts()
+    assert len(got) == 1 and got[0]["ref"] == f"root-checkout:{work}", [g["ref"] for g in got]
+    text = got[0]["text"]
+    assert f"task #{work} (in the root) worked in the project root" in text and "README.md" in text, text
+    assert f"also running then, not in the project root: #{code}" in text, text
+    assert len(observations()) == 1, [o["text"] for o in observations()]
+    # The same run in the root ending on its own still names itself.
+    _git_out(repo, "checkout", "README.md")
+    d.clear_root_checkout(force=True)
+    assert not p.db.kv(dm.ROOT_CHECKOUT_KEY)
+    c = _root_run(p, d, work)
+    (repo / "README.md").write_text("again\n")
+    _end_run(p, d, c)
+    assert f"after run {c['id']} of task #{work} (in the root), which worked in the project root" \
+        in alerts()[-1]["text"]
+
+
+def test_a_work_task_with_its_own_worktree_is_guarded_like_a_code_task(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dm, integrity, worktree
+    _with_origin(env)
+    p.set_config("worktree.kinds", ["work"])
+    work = p.db.add_task("work in a worktree", "s", kind="work", tier="light", origin="user")
+    path, branch = worktree.ensure(p, p.db.task(work))
+    p.db.update_task(work, status="done", branch=branch)
+    _commit_file(path, "a")
+    in_root = p.db.add_task("work in the root", "s", kind="work", tier="light", origin="user")
+    p.db.update_task(in_root, status="done")
+    # Its commits on that branch alone are flagged by the local-only check.
+    d = _local_only_daemon(p)
+    _check_local_only(d)
+    assert [e["task"] for e in _local_only_events(p)] == [work]
+    assert worktree.own_worktree(p.db.task(work)) and not worktree.own_worktree(p.db.task(in_root))
+    review = p.db.add_task("review", "s", kind="review", tier="light", origin="user")
+    p.db.update_task(review, branch=f"ttp/t{review}-x")
+    assert not worktree.own_worktree(p.db.task(review)), "a review works in the change's worktree"
+    # A task that continues it starts from its branch.
+    head = _git_out(path, "rev-parse", "HEAD")
+    more = p.db.add_task("more", "s", kind="work", tier="light", origin="user", labels=[f"continues:{work}"])
+    assert worktree.continued_head(p, p.db.task(more)) == head
+    # A done one is lined up for the backup push; an unfinished one's worktree is in the integrity check.
+    p.set_config("delivery.backup_remote", "origin")
+    d.cfg = p.config()
+    p.db.update_task(work, status="running")
+    row = p.db.one("SELECT * FROM runs WHERE id=?", (d.start_run("worker", "go", "claude", "light", str(path),
+                                                                 task=p.db.task(work)),))
+    checked = []
+    monkeypatch.setattr(integrity, "check", lambda proj, wts: checked.extend(t for t, _ in wts)
+                        or {"seconds": 0, "fsck": "ok", "restored": [], "bad": [], "worktrees": []})
+    d.check_integrity(start=True)
+    assert checked == [work], checked
+    _end_run(p, d, row)
+    assert p.db.task(work)["status"] == "done"
+    assert str(work) in (p.db.kv(dm.KV_BACKUP) or {}), p.db.kv(dm.KV_BACKUP)
+    assert not p.db.q("SELECT id FROM tasks WHERE kind='review' AND id!=?", (review,)), "no review for a work task"

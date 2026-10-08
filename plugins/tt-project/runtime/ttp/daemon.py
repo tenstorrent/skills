@@ -588,15 +588,18 @@ class Daemon:
         if stale != seen:
             db.set_kv(STALE_HOLDS_KEY, stale)
 
-    def check_root_checkout(self, r: dict, before: dict | None) -> None:
+    def check_root_checkout(self, r: dict, before: dict | None, now_at: dict | None = None) -> None:
         """After a worker or reviewer run: when the project root's checkout is on another branch (or
         commit, if it was detached) than as the run started, or has tracked paths with uncommitted
-        changes it did not have then, raise one low alert naming the task (and the tasks that ran
-        alongside it) and tell the coordinator. Nothing in the checkout is changed; the alert clears
-        once the checkout is back and those paths are clean (clear_root_checkout)."""
+        changes it did not have then, raise one low alert and tell the coordinator. One per
+        condition: a branch or paths an open alert already reports are not alerted again by the
+        other runs that saw them. It names as the likely cause the runs whose working directory was
+        the project root (run.json cwd), else the run that ended; the rest are only 'also running'.
+        Nothing in the checkout is changed; the alert clears once the checkout is back and those
+        paths are clean (clear_root_checkout). `now_at`: the checkout's state, read by the caller."""
         if not before or not r.get("task"):
             return
-        now_at = worktree.checkout_state(self.p.root)
+        now_at = now_at or worktree.checkout_state(self.p.root)
         if not now_at:
             return
         db = self.p.db
@@ -610,35 +613,61 @@ class Daemon:
         except Exception:
             home = set()
         home |= {i.get("branch") for i in seen.values() if i.get("branch")}
-        off = bool(was) and now != was and now not in home
-        new = (sorted(set(now_at["dirty"]) - set(before["dirty"]))
+        off = bool(was) and now != was and now not in home and not any(i.get("at") == now for i in seen.values())
+        known = {x for i in seen.values() for x in i.get("new") or []}
+        new = (sorted(set(now_at["dirty"]) - set(before["dirty"]) - known)
                if before.get("dirty") is not None and now_at["dirty"] is not None else [])
         if not off and not new:
             return
-        tid = str(r["task"])
-        if tid in seen:
+        rows = db.q("SELECT id, task, dir FROM runs WHERE role!='coordinator' AND task IS NOT NULL "
+                    "AND (id=? OR (started<? AND (status='running' OR ended>=?))) ORDER BY id",
+                    (r["id"], time.time(), float(r["started"] or 0)))
+        root = os.path.realpath(self.p.root)
+        in_root, others = [], []
+        for o in rows:
+            spec = _read_result(self._run_dir(o) / "run.json") or {}
+            t = int(o["task"])
+            (in_root if spec.get("cwd") and os.path.realpath(str(spec["cwd"])) == root else others).append(t)
+        mine = int(r["task"])
+        cause = sorted(set(in_root), key=lambda t: t != mine) or [mine]
+        alongside = sorted(set(others) - set(cause))
+        tid = str(cause[0])
+        if tid in seen:   # the same task changed more: one alert per task, which now covers it too
+            info = seen[tid]
+            info["new"] = sorted(set(info.get("new") or []) | set(new))[:200]
+            if off and not info.get("branch"):
+                info.update(branch=was, at=now)
+            db.set_kv(ROOT_CHECKOUT_KEY, seen)
             return
-        task = db.task(r["task"]) or {"id": r["task"], "title": ""}
-        alongside = sorted({int(o["task"]) for o in db.q(
-            "SELECT task FROM runs WHERE role!='coordinator' AND task IS NOT NULL AND task!=? AND started<? "
-            "AND (status='running' OR ended>=?)", (r["task"], time.time(), float(r["started"] or 0)))})
+        task = db.task(int(tid)) or {"id": int(tid), "title": ""}
+        title = str(task["title"])[:80]
+        if not in_root:
+            who = f"after run {r['id']} of task #{tid} ({title}); no run then worked in the project root"
+        elif int(tid) == mine:
+            who = f"after run {r['id']} of task #{tid} ({title}), which worked in the project root"
+        else:
+            who = f"while task #{tid} ({title}) worked in the project root (seen as run {r['id']} of #{mine} ended)"
+        if len(cause) > 1:
+            who += f"; also in the project root then: {', '.join('#' + str(t) for t in cause[1:10])}"
         where = (f"on {'branch ' + now_at['branch'] if now_at['branch'] else 'a detached HEAD at ' + now_at['head'][:12]}"
                  f" instead of {'branch ' + before['branch'] if before.get('branch') else before.get('head', '')[:12]}"
                  if off else "")
         shown = ", ".join(new[:10]) + (f" and {len(new) - 10} more" if len(new) > 10 else "")
         dirty = f"with uncommitted changes to {len(new)} tracked path{'' if len(new) == 1 else 's'} it did not have before: {shown}" if new else ""
         text = (f"The project root's checkout ({self.p.root}) was left {' and '.join(x for x in (where, dirty) if x)} "
-                f"after run {r['id']} of task #{task['id']} ({str(task['title'])[:80]})"
-                + (f"; also running then: {', '.join('#' + str(t) for t in alongside[:10])}" if alongside else "")
+                f"{who}"
+                + (f"; also running then, not in the project root: {', '.join('#' + str(t) for t in alongside[:10])}"
+                   if alongside else "")
                 + ". Other tasks branch from and land on the project's base branch, so work in the root can race "
                   "with them and is on no remote. Nothing was changed; this clears once the checkout is back"
                 + (f" on {before['branch'] or before['head'][:12]}" if off else "")
                 + (" and those paths are clean" if new else "") + ".")
         seen[tid] = {"key": f"root-checkout:{tid}", "run": r["id"], "branch": was if off else None,
-                     "new": new[:200], "since": time.time()}
+                     "at": now if off else None, "new": new[:200], "since": time.time()}
         db.set_kv(ROOT_CHECKOUT_KEY, seen)
-        log(self.p, f"run {r['id']} of #{tid} left the project root's checkout {where or ''}"
-                    f"{' ' if where and new else ''}{f'with {len(new)} newly dirty path(s)' if new else ''}")
+        log(self.p, f"run {r['id']} of #{mine} saw the project root's checkout left {where or ''}"
+                    f"{' ' if where and new else ''}{f'with {len(new)} newly dirty path(s)' if new else ''}; "
+                    f"alerted as #{tid}'s")
         self.alert(seen[tid]["key"], text, severity="low", every_s=0)
         db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
              (time.time(), "daemon", "observation", "normal", text[:1500], "queued", int(tid)))
@@ -1457,6 +1486,13 @@ class Daemon:
         # Spend is booked at the run's end, not when the daemon gets to it: a run reaped after
         # downtime must not count toward the current hour. A stamp from the future is clamped.
         ended = min(float(exit_info.get("ended") or time.time()), time.time())
+        # Where the project root's checkout stands now (check_root_checkout), read before the
+        # transaction: git can take a while in a large repository.
+        root_before = note.get("root") if r["role"] != "coordinator" and r["task"] else None
+        try:
+            root_now = worktree.checkout_state(p.root) if root_before else None
+        except Exception:
+            root_now = None
         # The run's end, its spend and what it did to its task commit together: a daemon stopped
         # half way leaves the run "running", and the next tick processes it again from disk.
         with db.tx():
@@ -1496,13 +1532,16 @@ class Daemon:
             if r["role"] == "coordinator":
                 self._finish_coordinator(r, usage, status, note)
             else:
+                # Before the hand-off, so its note on the root's dirty paths (_note_dirty_main) skips
+                # what this alert already reported.
+                try:
+                    if root_now:
+                        self.check_root_checkout(r, root_before, root_now)
+                except Exception:   # a report only: the run's end stands
+                    log(p, f"run {r['id']}: checking the project root's checkout failed\n" + traceback.format_exc())
                 self._finish_worker(r, usage, status, run_dir, cut_off if status == "ok" else None,
                                     rebooted=bool(note.get("lost_to_reboot")),
                                     slept=bool(note.get("lost_to_sleep") or note.get("lost_to_network")))
-                try:
-                    self.check_root_checkout(r, note.get("root"))
-                except Exception:   # a report only: the run's end stands
-                    log(p, f"run {r['id']}: checking the project root's checkout failed\n" + traceback.format_exc())
         self._check_price_table(r, usage)
         asleep = float(exit_info.get("slept_s") or 0)
         if asleep >= SLEPT_LONG_S:
@@ -1949,7 +1988,7 @@ class Daemon:
         else:
             db.update_task(task["id"], **upd)
         effort.settle(db, task["id"], new, attempts)
-        if new == "done" and task["kind"] == "code":
+        if new == "done" and worktree.own_worktree(task):
             self._local_only_due = 0.0   # is its work on a remote? checked this tick
             self._queue_backup(task)
         self._note_dirty_main(task)
@@ -2849,7 +2888,7 @@ class Daemon:
         if not due:
             return
         try:
-            ids = [r["id"] for r in db.q("SELECT id FROM tasks WHERE kind='code' AND status NOT IN "
+            ids = [r["id"] for r in db.q(f"SELECT id FROM tasks WHERE {worktree.OWN_WORKTREE_SQL} AND status NOT IN "
                                          f"({','.join('?' * len(TERMINAL_TASK_STATES))})", TERMINAL_TASK_STATES)]
             res = integrity.check(self.p, [(t, self.p.worktrees / f"t{t}") for t in ids])
         except Exception:
@@ -2974,7 +3013,7 @@ class Daemon:
             since = now
             db.set_kv(KV_LOCAL_ONLY_FROM, since)
         told = db.kv(KV_LOCAL_ONLY) or {}
-        tasks = db.q("SELECT id, title, branch, updated FROM tasks WHERE kind='code' AND status='done' "
+        tasks = db.q(f"SELECT id, title, branch, updated FROM tasks WHERE {worktree.OWN_WORKTREE_SQL} AND status='done' "
                      "AND branch IS NOT NULL AND branch!='' AND updated>=?",
                      (max(since, now - LOCAL_ONLY_DAYS * 86400),))
         reviews = []
@@ -3137,7 +3176,9 @@ class Daemon:
     def _note_dirty_main(self, task: dict) -> None:
         """At a hand-off, record one observation when the project's main checkout has uncommitted
         changes to tracked paths: work there is on no branch and no remote. Once per set of paths
-        (KV_DIRTY_MAIN); a clean checkout resets it. Nothing is committed or changed."""
+        (KV_DIRTY_MAIN); a clean checkout resets it. Paths an open root-checkout alert names
+        (check_root_checkout) are left out: that alert told the coordinator already. Nothing is
+        committed or changed."""
         paths = worktree.dirty_tracked(self.p.root)
         if paths is None:
             return
@@ -3146,6 +3187,8 @@ class Daemon:
         if key == db.kv(KV_DIRTY_MAIN):
             return
         db.set_kv(KV_DIRTY_MAIN, key)
+        told = {x for i in (db.kv(ROOT_CHECKOUT_KEY, {}) or {}).values() for x in i.get("new") or []}
+        paths = [x for x in paths if x not in told]
         if not paths:
             return
         shown = ", ".join(paths[:20]) + (f" and {len(paths) - 20} more" if len(paths) > 20 else "")

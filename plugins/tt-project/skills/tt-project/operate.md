@@ -101,10 +101,12 @@
   notes, once per set of paths, uncommitted changes to tracked files in the main checkout.
 - Project root left changed by a run → one low alert (`root-checkout:<task>`, plus a coordinator
   event) when a worker or reviewer run ends with the root's checkout on another branch than as it
-  started, or with tracked paths newly uncommitted; it names the task and the tasks running
-  alongside it, changes nothing, and clears once the checkout is back and those paths are clean.
+  started, or with tracked paths newly uncommitted. One alert per change, not per run that saw it:
+  it blames the runs that worked in the project root (else the run that ended) and lists the rest
+  as also running; it changes nothing and clears once the checkout is back and those paths are clean.
   Code tasks always get their own worktree; `worktree.kinds` (default `[]`) gives other kinds one
   too (say `["work"]`; never review or harness). Off by default because a fresh worktree lacks the
-  root's untracked build trees, outputs and submodule checkouts that work tasks often use.
+  root's untracked build trees, outputs and submodule checkouts that work tasks often use. Such a
+  task's branch gets the local-only, backup and integrity checks of a code task, but no review.
 - Coordinator failing repeatedly → an alert says so; messages are kept, not lost.
 - A worker that produces nothing for too long is stopped and retried (stall guard).

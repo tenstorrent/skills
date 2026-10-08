@@ -119,6 +119,18 @@ def gets_worktree(p: Project, kind: str) -> bool:
     return kind not in NEVER_OWN_KINDS and isinstance(kinds, list) and kind in kinds
 
 
+# The tasks that ran in a worktree of their own, as SQL over tasks: code, and another kind
+# gets_worktree gave one (its branch is ttp/t<id>-...). Their commits are on that branch only.
+OWN_WORKTREE_SQL = "(kind='code' OR (kind NOT IN ('review','harness') AND branch LIKE 'ttp/t' || id || '-%'))"
+
+
+def own_worktree(task) -> bool:
+    """OWN_WORKTREE_SQL for one task row."""
+    t = dict(task)
+    return t.get("kind") == "code" or (t.get("kind") not in NEVER_OWN_KINDS
+                                       and str(t.get("branch") or "").startswith(f"ttp/t{t.get('id')}-"))
+
+
 def _ignores(repo: Path, rel: str) -> bool:
     """Git ignores `rel` in `repo` (a tracked path never counts as ignored)."""
     return subprocess.run(["git", "-C", str(repo), "check-ignore", "-q", "--", rel],
@@ -194,11 +206,12 @@ def venv_env(venv: Path, path: str) -> dict[str, str]:
 
 
 def continued_head(p: Project, task: dict) -> str | None:
-    """The head of the branch of the code task this one continues, so its commits carry over.
+    """The head of the branch of the task this one continues (one that ran in a worktree of its
+    own, own_worktree), so its commits carry over.
     A branch of its own lets the old worktree stay checked out until it is pruned."""
     old_id = continues_id(task)
     old = p.db.task(old_id) if old_id else None
-    if not old or old["kind"] != "code" or not old["branch"]:
+    if not old or not own_worktree(old) or not old["branch"]:
         return None
     for cand in (old["branch"], f"origin/{old['branch']}"):
         head = _git(p.root, "rev-parse", "--verify", "--quiet", f"{cand}^{{commit}}", check=False)
