@@ -26389,6 +26389,36 @@ def test_a_newer_handoff_in_another_tasks_run_dir_is_not_adopted(env):
     assert not (run_dir / "result.json").exists()
 
 
+@pytest.mark.parametrize("stopped,run_status", [("timeout", "ok"), ("stalled", "stalled")])
+def test_a_run_cut_off_after_a_misplaced_handoff_is_not_counted_as_waste(env, stopped, run_status):
+    p = make(env)
+    from ttp import budget as bud
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    tid = p.db.add_task("measure", "s", kind="work", tier="light", origin="user")
+    p.db.update_task(tid, status="running")
+    p.db.x("INSERT INTO runs(task,role,provider,model,started,status,dir) VALUES(?,'worker','codex','',?,'ok',?)",
+           (tid, time.time() - 7200, str(p.runs / "old")))
+    (p.runs / "old").mkdir(parents=True)
+    started = time.time() - 3600
+    rid = p.db.x("INSERT INTO runs(task,role,provider,model,started,status) VALUES(?,'worker','codex','',?,'running')",
+                 (tid, started))
+    run_dir = p.runs / str(rid)
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text(json.dumps({"budget_usd": 8.0, "timeout_s": 3600}))
+    (run_dir / "output.jsonl").write_text("")
+    (p.runs / "old" / "result.json").write_text(json.dumps({"status": "done", "summary": "measured 42"}))
+    d.finish_run(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)),
+                 {"rc": -15, "started": started, "ended": time.time(), "stopped": stopped})
+    assert p.db.task(tid)["status"] == "done"
+    run = p.db.one("SELECT status, note FROM runs WHERE id=?", (rid,))
+    assert run["status"] == run_status, run["status"]
+    if run_status in bud.WASTED:
+        assert json.loads(run["note"])["not_waste"] == "handoff", run["note"]
+    assert p.db.one("SELECT COUNT(*) n FROM events WHERE kind='handoff_misplaced'")["n"] == 1
+    assert not any("failed or stalled" in r for r in bud.evaluate(p.db, p.config(), "codex", []).reasons)
+
+
 def test_worker_prompts_name_this_runs_dir_for_the_handoff(env, monkeypatch, tmp_path):
     p = make(env)
     from ttp.prompts import RUN_DIR_MARK, worker_resume, worker_task

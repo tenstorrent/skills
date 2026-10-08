@@ -1242,6 +1242,12 @@ class Daemon:
         if stopped in ("timeout", "budget", "stopped", "lost", "stalled", "shutdown", "resource_busy"):
             status = stopped if stopped != "stopped" else "killed"
         cut_off = None
+        if r["role"] != "coordinator" and r["task"] and not (run_dir / RESULT_FILE).exists():
+            # Before handed_off: a hand-off misplaced in an earlier run dir also spares this run the
+            # waste count. Once copied in, _finish_worker finds it and does not adopt it again.
+            task = db.task(r["task"])
+            if task:
+                self._adopt_misplaced_handoff(r, task, run_dir)
         handed_off = r["role"] != "coordinator" and \
             (_read_result(run_dir / RESULT_FILE) or {}).get("status") in HANDOFF_STATES
         if status == "timeout" and handed_off:
