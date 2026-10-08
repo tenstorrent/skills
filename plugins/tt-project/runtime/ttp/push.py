@@ -726,28 +726,17 @@ def delivered_pr(p: Project, task: dict, head: str) -> str | None:
 
 
 REVIEW_ONLY_LABEL = "review_only"   # a review whose change must not reach the push branch (kept_off)
-# Only a ban whose subject is the change itself counts; sentences describing how the harness pushes
-# ("workers never push to the push branch", "is kept off the push branch by ...") do not.
-_NO_PUSH_WHAT = (r"(?:it|this|this change|the change|these changes|this work|this commit|these commits"
-                 r"|these notes|the notes|they|them)")
-_NO_PUSH_BAN = (rf"(?:{_NO_PUSH_WHAT}\s+(?:must not|mustn't|must never|should not|shall not|may not)\s+"
-                r"(?:be\s+(?:pushed|landed)\s+(?:to|on|onto|into)|reach)\s+"
-                rf"|(?:do not|don't|never)\s+(?:push|land)\s+{_NO_PUSH_WHAT}\s+(?:to|on|onto|into)\s+"
-                rf"|keep\s+{_NO_PUSH_WHAT}\s+off\s+)")
-_NO_PUSH_NOT = r"(?![\w/-])(?!\s+(?:yourself|directly|themselves|by hand|manually|with git|until|before|unless|except))"
+# A spec keeps its change off the push branch only with an explicit marker line, never by its prose:
+# free text cannot tell a ban from a sentence that reports, quotes or conditions one.
+_NO_PUSH_MARKER = re.compile(r"^[ \t]*no_push:[ \t]*(.*?)[ \t]*$", re.M)
 
 
 def kept_off(task: dict, changes: dict | None, d: dict) -> str:
     """Why a code task's change must not reach `delivery.push_branch`, or "" when it may: every path
     of its diff since the base (`changes`, worktree.diff_lines) matches `delivery.push_exclude_paths`,
-    its hand-off sets `no_push` (true or the reason), or its spec or hand-off summary bans the change
-    itself from the push branch: "<it|this (change|work|commit)|the change|these (changes|commits|
-    notes)|the notes|they> must not (be pushed to|reach) <push branch or its name>" (also must never,
-    should/shall/may not), "do not|don't|never push <it|this|...> to <branch>" or "keep <it|this|...>
-    off <branch>". Sentences without such a subject ("workers never push to the push branch", "do
-    not push to the push branch: the review pushes it", "is kept off the push branch by ...", "cannot
-    reach the push branch"), and a ban followed by yourself/themselves/directly/..., do not count.
-    Its review is then review only: no `ttp push` and no push-queue approval."""
+    its hand-off sets `no_push` (true or the reason), or its spec has a line starting `no_push:` (the
+    reason follows; false/no/0 does not count). Prose in the spec or hand-off summary is never read
+    as a ban. Its review is then review only: no `ttp push` and no push-queue approval."""
     globs = exclude_list(d.get("push_exclude_paths"))
     if changes and globs and all(any(matches([f], g) for g in globs) for f in changes):
         return "every file it changes is one delivery.push_exclude_paths keeps off the push branch"
@@ -757,13 +746,10 @@ def kept_off(task: dict, changes: dict | None, d: dict) -> str:
     if flag not in (None, False, "", 0):
         return "its hand-off says it must not reach the push branch" + (
             f" ({str(flag)[:200]})" if isinstance(flag, str) else "")
-    branch = str(d.get("push_branch") or "").strip()
-    names = "|".join(map(re.escape, filter(None, ("push branch", branch, branch and f"origin/{branch}"))))
-    rx = re.compile(rf"\b{_NO_PUSH_BAN}(?:the\s+)?(?:{names}){_NO_PUSH_NOT}", re.I)
-    for what, text in (("spec", task.get("spec")), ("hand-off", result.get("summary"))):
-        m = rx.search(str(text or ""))
-        if m:
-            return f"its {what} says {' '.join(m.group(0).split())!r}"
+    for m in _NO_PUSH_MARKER.finditer(str(task.get("spec") or "")):
+        why = m.group(1).strip("`\"' ")
+        if why.lower() not in ("false", "no", "0"):
+            return "its spec says it must not reach the push branch" + (f" ({why[:200]})" if why else "")
     return ""
 
 

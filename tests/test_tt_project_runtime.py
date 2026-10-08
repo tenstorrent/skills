@@ -24802,18 +24802,12 @@ def test_the_review_of_a_change_that_must_not_reach_the_push_branch_has_no_push_
         rev = review(f"notes {on}", {"notes/a.md": 5, "run.log": 2})
         assert review_only(rev) and "delivery.push_exclude_paths keeps off" in rev["spec"], (on, rev["spec"])
         assert pushes(review(f"mixed {on}", {"notes/b.md": 5, "app.py": 3})), on
-        rev = review(f"forbidden {on}", {"c.py": 3}, spec="Write the notes. They must not be pushed to the push branch.")
-        assert review_only(rev) and "must not be pushed to the push branch" in rev["spec"], on
-        rev = review(f"by name {on}", {"d.py": 3}, spec="Never push this to work.")
-        assert review_only(rev), on
-        for i, ban in enumerate(("This change must not reach the push branch.",
-                                 "These notes must not be pushed to work.", "Keep this change off origin/work.")):
+        rev = review(f"forbidden {on}", {"c.py": 3}, spec="Write the notes.\nno_push: notes stay local\n")
+        assert review_only(rev) and "notes stay local" in rev["spec"], on
+        for i, ban in enumerate(("no_push:", "  no_push: `a local tool`", "Fix it.\n\nno_push: true\nThen stop.")):
             assert review_only(review(f"ban {on} {i}", {f"d{i}.py": 3}, spec=ban)), (on, ban)
         rev = review(f"flag {on}", {"e.py": 3}, result={"status": "done", "summary": "ok", "no_push": "a local tool"})
         assert review_only(rev) and "a local tool" in rev["spec"], on
-        rev = review(f"summary {on}", {"f.py": 3},
-                     result={"status": "done", "summary": "Done; keep it off the push branch."})
-        assert review_only(rev), on
         # The usual rule that the review pushes, not the worker, is not a prohibition.
         for i, usual in enumerate(("Do not push.", "Never push to the push branch yourself.",
                                    "Do not push to work directly; the review pushes it.", "Never push to main.",
@@ -24824,8 +24818,26 @@ def test_the_review_of_a_change_that_must_not_reach_the_push_branch_has_no_push_
                                    "Do not push to the push branch: the review pushes it.",
                                    "Workers must not push to the push branch themselves.",
                                    "Fix: a notes commit cannot reach the push branch, so drop it.",
-                                   "Never push it to the push branch yourself.")):
+                                   "Never push it to the push branch yourself.",
+                                   # Prose is never a ban, not even one naming the change: only the marker line.
+                                   "Write the notes. They must not be pushed to the push branch.",
+                                   "Never push this to work.", "This change must not reach the push branch.",
+                                   "These notes must not be pushed to work.", "Keep this change off origin/work.",
+                                   "or (b) the code task's spec or hand-off says the change must not be pushed "
+                                   "to the push branch",
+                                   "A review of a change whose spec says it must not reach the push branch is "
+                                   "review only.",
+                                   "Detect when the hand-off says this change must not be pushed to the push branch.",
+                                   "If it must not reach the push branch, the review is review only.",
+                                   'Such a spec names the change as what is banned ("this change must not be '
+                                   'pushed to the push branch")',
+                                   "Rely on one explicit spec marker on its own line, e.g. a line starting "
+                                   "`no_push:` (the reason follows).",
+                                   "no_push: false", "Set no_push: true in the hand-off.")):
             assert pushes(review(f"usual {on} {i}", {f"g{i}.py": 3}, spec=usual)), (on, usual)
+        rev = review(f"summary {on}", {"f.py": 3},
+                     result={"status": "done", "summary": "Done; keep it off the push branch."})
+        assert pushes(rev), on
     # No push branch: review only as before, without the reason.
     p.set_config("delivery.push_branch", "")
     rev = review("no branch", {"notes/c.md": 5})
