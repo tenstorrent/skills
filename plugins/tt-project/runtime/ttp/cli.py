@@ -1158,7 +1158,7 @@ def cmd_checks(a) -> None:
             out.flush()
             # A detached run gives each check a group of its own, so a stop ends it with ttp checks.
             group = bool(getattr(a, "own_group", False))
-            proc = subprocess.Popen(c, shell=True, cwd=top, stdout=out, stderr=subprocess.STDOUT,
+            proc = subprocess.Popen(push.check_argv(c), cwd=top, stdout=out, stderr=subprocess.STDOUT,
                                     start_new_session=group, env={**push.check_env("checks"), "PWD": top})
             try:
                 rc = proc.wait()

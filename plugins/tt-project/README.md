@@ -303,6 +303,10 @@ and preferences you add later become part of the project's charter and memory.
   when any commit it brings adds or modifies a matching file, and name the files; a commit that
   deletes one passes. A pattern matches a path, a directory by its files, or as an fnmatch glob
   whose `*` also crosses `/`. `ttp push --own` is not affected.
+- Each check runs with first-failure semantics (bash `-e -o pipefail`, `sh -e` without bash), so
+  `a; b` or `a | b` fails when `a` fails. Still prefer one required command per entry. A coverage
+  map keyed by full commit SHA must reject unknown heads and fail when a required input is missing;
+  never skip a check because of an earlier pass or failure, and add a negative control that must fail.
 - tt-project runs no whitespace check of its own. A `git diff --check <base> HEAD` in
   `push_checks` also fails on committed run logs, whose captured lines keep trailing whitespace.
   Leave them out with a pathspec: `git diff --check <base> HEAD -- . ':(exclude)*.log'`. Files

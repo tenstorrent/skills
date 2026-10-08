@@ -191,6 +191,13 @@ def outside_scope(checks: list[Check], skipped: list[str]) -> bool:
     return bool(checks) and len(skipped) == len(checks) and all(getattr(s, "scoped", False) for s in skipped)
 
 
+def check_argv(cmd: str) -> list[str]:
+    """How a check command runs: first-failure semantics, so `a; b` fails when `a` fails and a
+    pipeline fails when any stage does (bash `-e -o pipefail`; plain `sh -e` where bash is missing)."""
+    bash = shutil.which("bash")
+    return [bash, "-e", "-o", "pipefail", "-c", cmd] if bash else ["sh", "-e", "-c", cmd]
+
+
 def check_env(mode: str, tip: str = "") -> dict[str, str]:
     """The environment push_checks run in. TTP_PUSH_MODE says what they gate: `target` (`ttp push`
     or the push queue, to delivery.push_branch), `own` (`ttp push --own`, the task's own branch) or
@@ -1197,7 +1204,7 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
         started = time.time()
         env = check_env("own", _existing_tip(repo, remote, branch) if todo else "")
         for cmd in todo:
-            if subprocess.run(cmd, shell=True, cwd=repo, env=env).returncode != 0:
+            if subprocess.run(check_argv(cmd), cwd=repo, env=env).returncode != 0:
                 say(f"check failed on {head[:10]}: {cmd}; not pushing")
                 return CHECKS_FAILED
         if todo and timed:
@@ -1327,7 +1334,7 @@ def _rounds(repo: Path, remote: str, branch: str, checks: list[str], rounds: int
         started = time.time()
         env = check_env("target", tip)
         for cmd in todo:
-            if subprocess.run(cmd, shell=True, cwd=repo, env=env).returncode != 0:
+            if subprocess.run(check_argv(cmd), cwd=repo, env=env).returncode != 0:
                 say(f"check failed on {head[:10]}: {cmd}; not pushing")
                 return CHECKS_FAILED
         if todo and timed:

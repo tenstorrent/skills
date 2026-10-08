@@ -29091,3 +29091,16 @@ def test_a_continued_own_worktree_work_task_starts_from_the_old_branch(env):
     p.db.update_task(o2, branch="feature-x", status="done")
     n2 = p.db.add_task("continue: plain", "s", kind="work", tier="light", origin="user", labels=[f"continues:{o2}"])
     assert "on branch feature-x" not in worker_task(p, p.db.task(n2), str(p.root), None)
+
+
+def test_check_commands_have_first_failure_semantics(tmp_path):
+    # A multi-command check whose earlier command fails must fail even when the last one passes.
+    from ttp import push
+    run = lambda c: subprocess.run(push.check_argv(c), cwd=tmp_path).returncode
+    assert run("false; true") != 0
+    assert run("false | true") != 0
+    assert run(f"test -e {tmp_path}/missing\ntrue") != 0
+    # Negative controls: passing lists pass, and an explicit `|| true` still opts out.
+    assert run("true; true") == 0
+    assert run("true | true") == 0
+    assert run("false || true") == 0
