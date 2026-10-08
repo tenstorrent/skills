@@ -2327,21 +2327,23 @@ class Daemon:
         self.alert(key, f"Schedule {s['name']} failed twice in a row and does nothing until fixed: {why}", "high")
 
     def sweep_watcher_issues(self) -> int:
-        """Close quiet command-watcher issues (each tick, before the schedules run). The receipts of
-        explicit_clear schedules stay open: see screen.settle_receipts."""
+        """Close quiet command-watcher issues and errors (each tick, before the schedules run). The
+        receipts of explicit_clear schedules stay open: see screen.settle_receipts."""
         rows = self.p.db.q("SELECT name, every_s, payload FROM schedules WHERE kind='command' AND enabled=1")
+        periods = {src: r["every_s"] for r in rows
+                   for src in (f"watcher:{r['name']}", scr.error_source(f"watcher:{r['name']}"))}
         return scr.close_quiet_watcher_issues(
-            self.p.db, {f"watcher:{r['name']}": r["every_s"] for r in rows},
-            receipts=[f"watcher:{r['name']}" for r in rows if _explicit_clear(r["payload"])])
+            self.p.db, periods, receipts=[f"watcher:{r['name']}" for r in rows if _explicit_clear(r["payload"])])
 
     def _run_command_watcher(self, s: dict, payload: dict) -> str:
         cmd = payload.get("command")
         if not cmd:
             return "no command"
         source = f"watcher:{s['name']}"
-        # A receipt source: what it reports stays pending until acknowledged; its failures are errors.
-        receipt, error = ((scr.RECEIPT, scr.ERROR) if payload.get("issue_lifecycle") == scr.EXPLICIT_CLEAR
-                          else (None, None))
+        # Its own failures are errors under a source of their own, so that no rule of its reports covers
+        # them; a receipt source's reports stay pending until acknowledged.
+        errors = scr.error_source(source)
+        receipt = scr.RECEIPT if payload.get("issue_lifecycle") == scr.EXPLICIT_CLEAR else None
         hours = payload.get("rewake_after_h", (self.cfg.get("screen") or {}).get("rewake_after_h", 6))
         try:
             rewake = float(hours) * 3600 if hours is not None else None
@@ -2352,8 +2354,8 @@ class Daemon:
             out = subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=str(self.p.root),
                                  timeout=_watcher_timeout(payload), env={**os.environ, "PATH": service_path()})
         except subprocess.TimeoutExpired:
-            self.observe(source, f"watcher command timed out: {cmd}", "normal", rewake_after_s=rewake,
-                         lifecycle=error)
+            self.observe(errors, f"watcher command timed out: {cmd}", "normal", rewake_after_s=rewake,
+                         lifecycle=scr.ERROR)
             return "timeout"
         text = (out.stdout or "").strip()
         ok = out.returncode in (0, 1)
@@ -2363,19 +2365,21 @@ class Daemon:
         if not text:
             # Nothing to report: what this watcher reported before is over. A recurrence reopens it.
             scr.close_watcher_issues(self.p.db, source, why=scr.CLEAN_RUN_WHY)
+            scr.settle_receipts(self.p.db, source, started, ())   # and its errors are repaired
             return "ok (0 observations)"
         n, subjects = 0, set()
         for obs in _observations(text):
             body = obs.get("text", "")
-            # A receipt source's own failure lines ("error": true) are errors, not receipts.
-            kind = error if failed or obs.get("error") is True else receipt
-            self.observe(source, body, obs.get("severity"), rewake_after_s=rewake,
+            # Its own failure lines ("error": true) are errors, not reports.
+            error = failed or obs.get("error") is True
+            kind = scr.ERROR if error else receipt
+            self.observe(errors if error else source, body, obs.get("severity"), rewake_after_s=rewake,
                          repeat=obs.get("repeat") is True, lifecycle=kind)
             if kind == scr.RECEIPT:
                 subjects.update(scr.normalize(subj) for subj, _, cleared in scr.watcher_conditions(source, body) or ()
                                 if not cleared)
             n += 1
-        if receipt and ok:
+        if ok:
             scr.settle_receipts(self.p.db, source, started, subjects)
         return f"ok ({n} observations)"
 

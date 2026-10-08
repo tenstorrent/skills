@@ -6919,14 +6919,14 @@ def _receipt_rig(env, tmp_path, name="receipts", lifecycle="explicit_clear"):
     if lifecycle:
         act["issue_lifecycle"] = lifecycle
     assert coord.apply(p, [act]) == []
-    rig = {"d": Daemon(p.base), "src": f"watcher:{name}"}
+    rig = {"d": Daemon(p.base), "src": f"watcher:{name}", "err": f"watcher-error:{name}"}
     rig["d"].gates = {}
 
     def db():
         return rig["d"].p.db
 
-    def events():
-        return db().one("SELECT COUNT(*) n FROM events WHERE source=?", (rig["src"],))["n"]
+    def events():   # its reports' and its errors' wakes
+        return db().one("SELECT COUNT(*) n FROM events WHERE source IN (?,?)", (rig["src"], rig["err"]))["n"]
 
     def tick(text=None, command=None):
         """One tick: sweep, then the schedule (due now). Returns (status, new events)."""
@@ -6946,8 +6946,8 @@ def _receipt_rig(env, tmp_path, name="receipts", lifecycle="explicit_clear"):
                    (json.dumps({**json.loads(row["payload"]), "command": f"cat {out}; test -s {out}"}), name))
         return db().one("SELECT last_status FROM schedules WHERE name=?", (name,))["last_status"], events() - n
 
-    def age(hours):   # as if every sighting of this source were this much older
-        db().x("UPDATE issues SET last_seen=last_seen-? WHERE source=?", (hours * 3600, rig["src"]))
+    def age(hours):   # as if every sighting of this watcher were this much older
+        db().x("UPDATE issues SET last_seen=last_seen-? WHERE source IN (?,?)", (hours * 3600, rig["src"], rig["err"]))
 
     def restart():   # the daemon and its database go away and come back
         rig["d"].p.db.close()
@@ -6993,7 +6993,7 @@ def test_explicit_clear_receipts_stay_pending_through_the_quiet_sweep_downtime_a
     age(25)
     status, woke = tick(command="echo boom >&2; exit 3")
     assert woke == 1 and r["open_titles"]() >= pending
-    err = r["db"]().one("SELECT * FROM issues WHERE source=? AND lifecycle='error'", (r["src"],))
+    err = r["db"]().one("SELECT * FROM issues WHERE source=? AND lifecycle='error'", (r["err"],))
     assert err["status"] == "open" and "rc=3" in err["title"]
     assert tick()[1] == 0 and r["open_titles"]() == pending
     assert r["db"]().one("SELECT * FROM issues WHERE id=?", (err["id"],))["cleared_why"] == scr.REPAIRED_WHY
@@ -7024,7 +7024,7 @@ def test_explicit_clear_errors_recover_and_a_later_recurrence_wakes(env, tmp_pat
         # failure more than a day later (across a restart in the second round): a fresh event.
         assert tick(receipt + own_error)[1] >= 1
         assert tick(receipt)[1] == 0
-        row = r["db"]().one("SELECT * FROM issues WHERE source=? AND lifecycle='error'", (r["src"],))
+        row = r["db"]().one("SELECT * FROM issues WHERE source=? AND lifecycle='error'", (r["err"],))
         assert row["status"] == "fixed" and row["cleared_why"] == scr.REPAIRED_WHY
         assert any(t.startswith("job 1") for t in r["open_titles"]()), "the receipt stays pending"
         age(30)
@@ -7047,6 +7047,81 @@ def test_explicit_clear_errors_recover_and_a_later_recurrence_wakes(env, tmp_pat
     assert r["d"].sweep_watcher_issues() == 1
     assert {x["lifecycle"] for x in r["db"]().q("SELECT lifecycle FROM issues WHERE source=? AND status='open'",
                                                   (r["src"],))} == {"receipt"}
+
+
+def test_command_errors_have_their_own_source_beside_explicit_clear_receipts(env, tmp_path):
+    from ttp import coordinator as coord
+    from ttp import screen as scr
+    r = _receipt_rig(env, tmp_path)
+    tick, db, src, err = r["tick"], r["db"], r["src"], r["err"]
+
+    def open_errors():
+        return db().q("SELECT * FROM issues WHERE source=? AND status='open'", (err,))
+
+    receipt = _line("job 1: done; evidence_" + "a1" * 20)
+    assert tick(receipt)[1] == 1
+    pending = r["open_titles"]()
+    # A failing command after a run with receipts surfaces under watcher-error:<name>, which no receipt
+    # rule (expiry exemption, null rewake, a mute of the receipts) covers.
+    assert coord.apply(r["p"], [{"type": "observation_mute", "source": src, "match": "watcher command",
+                                 "hours": 24}]) == []
+    assert tick(command="echo boom >&2; exit 3")[1] == 1
+    assert [e["lifecycle"] for e in open_errors()] == ["error"] and "rc=3" in open_errors()[0]["title"]
+    assert not db().one("SELECT id FROM issues WHERE source=? AND title LIKE '%rc=3%'", (src,))
+    assert r["open_titles"]() == pending
+    # It recurs quietly while open; a successful run (exit 0) clears it, receipts untouched.
+    assert tick(command="echo boom >&2; exit 3")[1] == 0 and len(open_errors()) == 1
+    assert tick(command=f"cat {r['out']}")[0] == "ok (1 observations)"
+    assert open_errors() == [] and r["open_titles"]() == pending
+    assert db().one("SELECT cleared_why FROM issues WHERE source=?", (err,))["cleared_why"] == scr.REPAIRED_WHY
+    # The same failure again is news, and so is a timeout; a run exiting 0 with nothing to report clears
+    # both and, being an acknowledgement, the receipts too.
+    assert tick(command="echo boom >&2; exit 3")[1] == 1
+    row = db().one("SELECT payload FROM schedules WHERE name='receipts'")
+    db().x("UPDATE schedules SET payload=? WHERE name='receipts'",
+           (json.dumps({**json.loads(row["payload"]), "timeout_s": 1}), ))
+    assert tick(command="sleep 3") == ("timeout", 1)
+    assert len(open_errors()) == 2 and r["open_titles"]() == pending
+    assert tick(command="true")[0] == "ok (0 observations)"
+    assert open_errors() == [] and r["open_titles"]() == set()
+
+
+def test_command_errors_clear_on_success_and_expire_while_receipts_wait_for_acknowledgement(env, tmp_path):
+    from ttp import coordinator as coord
+    r = _receipt_rig(env, tmp_path)
+    tick, db, err = r["tick"], r["db"], r["err"]
+    receipt = _line("job 1: done; evidence_" + "a1" * 20)
+    assert tick(receipt)[1] == 1
+    pending = r["open_titles"]()
+    # An error nothing repairs expires after three daily periods; the receipts wait, across a restart.
+    assert tick(command="exit 4")[1] == 1
+    r["age"](73)
+    r["restart"]()
+    assert r["d"].sweep_watcher_issues() == 1
+    assert not db().one("SELECT id FROM issues WHERE source=? AND status='open'", (err,))
+    assert r["open_titles"]() == pending
+    # Only the owner's acknowledgement closes a receipt.
+    assert tick(receipt)[1] == 0 and r["open_titles"]() == pending
+    assert tick(_line("job 1: cleared: done; cleared: evidence_" + "a1" * 20))[1] == 0
+    assert r["open_titles"]() == set()
+    # Removing the policy brings ordinary expiry back for its receipts.
+    assert tick(receipt)[1] == 1 and r["open_titles"]() == pending
+    assert coord.apply(r["p"], [{"type": "schedule_set", "name": "receipts", "issue_lifecycle": None}]) == []
+    r["age"](73)
+    assert r["d"].sweep_watcher_issues() == 2 and r["open_titles"]() == set()
+
+
+def test_plain_command_watcher_errors_clear_on_the_next_successful_run(env, tmp_path):
+    r = _receipt_rig(env, tmp_path, name="plain", lifecycle=None)
+    tick, db, err = r["tick"], r["db"], r["err"]
+    line = _line("disk 1: nearly full")
+    assert tick(line)[1] == 1
+    assert tick(command="echo boom >&2; exit 2")[1] == 1
+    assert db().one("SELECT status FROM issues WHERE source=?", (err,))["status"] == "open"
+    # A run that exits 0 and still reports its own items repairs the error and leaves the items open.
+    assert tick(command=f"cat {r['out']}")[1] == 0
+    assert db().one("SELECT status FROM issues WHERE source=?", (err,))["status"] == "fixed"
+    assert r["open_titles"]() == {"disk 1: nearly full"}
 
 
 def test_ordinary_expiry_stays_for_sources_that_did_not_opt_in(env, tmp_path):

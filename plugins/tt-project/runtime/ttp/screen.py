@@ -270,12 +270,18 @@ CLEARED_WHY = "the watcher reported it cleared"
 QUIET_WHY = "not seen for 24 h"
 CLEAN_RUN_WHY = "a watcher run reported nothing"
 # Receipt sources: a command schedule with issue_lifecycle "explicit_clear" reports items that stay
-# pending until acknowledged (receipts), so the quiet sweep leaves them open. Its run failures are
-# errors instead: they expire as usual and a successful run that does not report them clears them.
+# pending until acknowledged (receipts), so the quiet sweep leaves them open. A command watcher's own
+# failures are errors under a source of their own (error_source), so no receipt rule covers them: they
+# expire as usual and the next successful run that does not report them clears them.
 EXPLICIT_CLEAR = "explicit_clear"
 RECEIPT, ERROR = "receipt", "error"
 REPAIRED_WHY = "a successful watcher run no longer reported it"
 REPLACED_WHY = "a newer outcome for the same subject replaced it"
+
+
+def error_source(source: str) -> str:
+    """Where command watcher `source` (watcher:<name>) records its own failures: watcher-error:<name>."""
+    return "watcher-error:" + source.split(":", 1)[1]
 
 
 def watcher_conditions(source: str, text: str) -> list[tuple[str, str, bool]] | None:
@@ -327,7 +333,7 @@ def close_watcher_issues(db: DB, source: str | None = None, quiet_s: float | Non
     if source is not None:
         sql, args = sql + " AND source=?", args + [source]
     else:
-        sql += " AND source LIKE 'watcher:%'"
+        sql += " AND (source LIKE 'watcher:%' OR source LIKE 'watcher-error:%')"
     skip = list(skip)
     if skip:
         sql, args = sql + f" AND source NOT IN ({','.join('?' * len(skip))})", args + skip
@@ -358,17 +364,20 @@ def close_quiet_watcher_issues(db: DB, periods: dict[str, float], now: float | N
 
 
 def settle_receipts(db: DB, source: str, since: float, subjects: Any, now: float | None = None) -> int:
-    """After a successful run of a receipt source that reported something (it began at `since`): close
-    the errors it no longer reported (repaired) and the receipts of each subject it reported that it no
-    longer reported (a newer outcome replaced them). Receipts of subjects it did not mention stay
-    pending. A closed one reported again reopens and wakes. Returns how many closed."""
+    """After a successful run of command watcher `source` (it began at `since`): close the errors it no
+    longer reported (repaired; under error_source, or under `source` from before errors had their own)
+    and, for a receipt source, the receipts of each subject it reported that it no longer reported (a
+    newer outcome replaced them). Receipts of subjects it did not mention stay pending. A closed one
+    reported again reopens and wakes. Returns how many closed."""
     now = time.time() if now is None else now
-    base = "UPDATE issues SET status='fixed', closed=?, cleared_why=? WHERE status='open' AND source=? AND last_seen<?"
-    n = db.conn.execute(base + " AND lifecycle=?", (now, REPAIRED_WHY, source, since, ERROR)).rowcount
+    base = "UPDATE issues SET status='fixed', closed=?, cleared_why=? WHERE status='open' AND last_seen<?"
+    n = db.conn.execute(base + " AND source IN (?,?) AND lifecycle=?",
+                        (now, REPAIRED_WHY, since, error_source(source), source, ERROR)).rowcount
     subjects = sorted(set(subjects))
     if subjects:
-        n += db.conn.execute(base + f" AND lifecycle=? AND subject IN ({','.join('?' * len(subjects))})",
-                             (now, REPLACED_WHY, source, since, RECEIPT, *subjects)).rowcount
+        marks = ",".join("?" * len(subjects))
+        n += db.conn.execute(base + f" AND source=? AND lifecycle=? AND subject IN ({marks})",
+                             (now, REPLACED_WHY, since, source, RECEIPT, *subjects)).rowcount
     return n
 
 
