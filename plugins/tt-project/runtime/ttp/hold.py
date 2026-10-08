@@ -173,6 +173,24 @@ def watch(run_dir: Path, fds: list[int]) -> int:
         return 0
 
 
+def holding(registry: Path) -> list[dict]:
+    """The holds in the registry still kept for detached jobs, each with its `run_dir`."""
+    out: list[dict] = []
+    try:
+        entries = sorted(Path(registry).glob("*.json"))
+    except OSError:
+        return out
+    for entry in entries:
+        try:
+            rd = Path(json.loads(entry.read_text())["run_dir"])
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        rec = read(rd)
+        if rec and rec.get("state") == "holding":
+            out.append({**rec, "run_dir": str(rd)})
+    return out
+
+
 def tend(registry: Path) -> list[dict]:
     """Settle the holds in the registry: a dead keeper's whose jobs ended is released, one whose jobs
     still run is taken again by a new keeper (or recorded lost if someone else holds a slot now). Returns

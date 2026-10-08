@@ -10766,6 +10766,55 @@ def test_an_exclusive_hold_for_a_detached_job_survives_a_daemon_restart_and_a_de
                                              "ORDER BY id DESC LIMIT 1")["text"]
 
 
+def test_a_hold_kept_for_a_closed_task_alerts_once_low_never_releases_and_clears_once_released(env, tmp_path):
+    p = make(env)
+    from ttp import hold, locks
+    from ttp.daemon import Daemon, STALE_HOLDS_KEY
+    mine = _board_task(p, "flash")
+    run_dir, release = p.runs / "46", tmp_path / "release"
+    _exclusive_run_detaching(p, mine["id"], 46, run_dir, _until(release))
+    paths = Daemon(p.base)._slot_paths("board")
+
+    def alerts():
+        return p.db.q("SELECT * FROM messages WHERE kind='alert' AND ref='hold-stale:46'")
+
+    def age(hours):   # the hold has been kept this long
+        rec = hold.read(run_dir)
+        rec["since"] = time.time() - hours * 3600
+        (run_dir / hold.RECORD).write_text(json.dumps(rec))
+
+    try:
+        age(7)
+        Daemon(p.base).tend_holds()
+        assert not alerts(), "a hold kept for an open task's jobs was alerted"
+        p.db.update_task(mine["id"], status="done")
+        age(5)
+        Daemon(p.base).tend_holds()
+        assert not alerts(), "a hold alerted before the default 6 h"
+        p.set_config("budget.stale_hold_alert_s", 4 * 3600)   # configurable
+        d = Daemon(p.base)
+        d.tend_holds()
+        d.tend_holds()
+        got = alerts()
+        assert len(got) == 1 and got[0]["severity"] == "low", got
+        rc = str((run_dir / "job.rc").resolve())
+        assert f"#{mine['id']}" in got[0]["text"] and "board" in got[0]["text"] and rc in got[0]["text"]
+        # Never released: the job may still use the board.
+        assert hold.read(run_dir)["state"] == "holding" and not locks.any_free(paths)
+        assert not (run_dir / "job.rc").exists()
+        Daemon(p.base).tend_holds()   # a daemon restart does not repeat it
+        assert len(alerts()) == 1
+    finally:
+        release.touch()
+    assert _until_true(lambda: locks.any_free(paths))
+    Daemon(p.base).tend_holds()
+    cleared = p.db.q("SELECT * FROM messages WHERE kind='resolved' AND ref='hold-stale:46'")
+    assert len(cleared) == 1 and "released" in cleared[0]["text"], cleared
+    assert not p.db.kv(STALE_HOLDS_KEY)
+    Daemon(p.base).tend_holds()
+    assert len(p.db.q("SELECT 1 FROM messages WHERE ref='hold-stale:46'")) == 2
+
+
 def test_a_later_run_of_the_same_task_takes_over_the_hold_its_detached_job_keeps(env, tmp_path):
     p = make(env)
     from ttp import hold, locks

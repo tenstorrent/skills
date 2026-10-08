@@ -107,6 +107,7 @@ KV_WORKTREES_DIRTY = "worktrees_dirty"     # task -> modified tracked files a ke
 KEEP_RECHECK_S = 6 * 3600   # a finished task's kept worktree is looked at again this often
 CONFIG_UNREADABLE_KEY = "config_unreadable"   # kv: project.json and its last good copy both unreadable
 ALERT_KEEP_S = 30 * 86400   # alerts_sent keeps an entry this long: the longest every_s any alert uses
+STALE_HOLDS_KEY = "holds_stale"   # kv: run -> its hold alerted as kept for a closed task (Daemon.alert_stale_holds)
 SLEPT_MIN_S = 60        # a run whose wall clock ran this much ahead of its monotonic clock overlapped a host sleep
 SLEEPS_KEPT_S = 7 * 86400
 SLEPT_LONG_S = 600      # a sleep this long is recorded as a `host_slept` event and tells the user once a day
@@ -540,6 +541,49 @@ class Daemon:
             self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                         (time.time(), "daemon", f"hold_{rec['state']}", "normal" if rec["state"] == "lost" else "low",
                          text[:500], "handled", task))
+        self.alert_stale_holds()
+
+    def alert_stale_holds(self) -> None:
+        """One low alert per hold kept for detached jobs of a done, failed or cancelled task once it has
+        held its resource longer than budget.stale_hold_alert_s: such a hold may starve the resource
+        unseen. It is never released here (a job may still use the resource); the alert clears itself
+        once the hold ends or its task is open again."""
+        db, now = self.p.db, time.time()
+        limit = float(self.cfg["budget"].get("stale_hold_alert_s", 21600) or 0)
+        seen = db.kv(STALE_HOLDS_KEY, {}) or {}
+        stale: dict[str, dict] = {}
+        for rec in hold.holding(self.p.state / "holds") if limit > 0 else []:
+            run = str(rec.get("run") or Path(rec["run_dir"]).name)
+            task = db.one("SELECT id,title,status FROM tasks WHERE id=?",
+                          (int(rec["task"]),)) if str(rec.get("task") or "").isdigit() else None
+            held_s = now - float(rec.get("since") or now)
+            if not task or task["status"] not in ("done", "failed", "cancelled") or held_s < limit:
+                continue
+            res = ", ".join(str(r.get("resource")) for r in rec.get("resources") or [])
+            stale[run] = seen.get(run) or {"key": f"hold-stale:{run}", "task": task["id"], "resources": res,
+                                           "run_dir": rec["run_dir"]}
+            if run in seen:
+                continue
+            jobs = hold.live(rec.get("jobs") or []) or list(rec.get("jobs") or [])
+            self.alert(stale[run]["key"],
+                       f"Task #{task['id']} ({task['title'][:80]}) is {task['status']}, but run {run} has held "
+                       f"{res} for its detached jobs for {held_s / 3600:.1f} h; others needing it wait. Jobs: "
+                       f"{', '.join(jobs) or 'none recorded'}. The hold ends once each job writes its .rc or "
+                       f"ends; nothing is released automatically, as a job may still use it.",
+                       severity="low", every_s=0)
+        for run, info in seen.items():
+            if run in stale:
+                continue
+            rec = hold.read(Path(info.get("run_dir") or "")) or {}
+            why = ("is released" if rec.get("state") != "holding"
+                   else f"belongs to an open task again (#{info.get('task')})")
+            db.post("out", f"Cleared: the hold of run {run} on {info.get('resources')} {why}.", chat=None,
+                    kind="resolved", severity="low", ref=info.get("key"))
+            sent = db.kv("alerts_sent", {}) or {}
+            if sent.pop(info.get("key"), None) is not None:
+                db.set_kv("alerts_sent", sent)   # the same hold may alert again
+        if stale != seen:
+            db.set_kv(STALE_HOLDS_KEY, stale)
 
     def retire_ended(self) -> None:
         """Retire memory entries and charter sections whose end condition passed (see ends)."""
