@@ -4741,10 +4741,14 @@ def test_actor_words_are_no_rule_target_and_an_inverted_may_skips_any_actor(env)
 
 
 def test_a_ban_on_one_actor_does_not_pair_with_another_actors_allowance(env):
-    """A ban that names who it binds ("Workers must not push", "Never let agents open PRs") is no
-    blanket ban: an allowance for a different actor ("The coordinator may push") does not contradict
-    it. It still pairs with the same actor's allowance, an allowance naming no actor, and a ban naming
-    no actor pairs with any actor's allowance. A named actor after an inverted "may" is skipped too."""
+    """For the lint, a ban that names who it binds ("Workers must not push", "Never let agents open
+    PRs", "Never ask agents to open PRs") is no blanket ban: an allowance for a different actor ("The
+    coordinator may push") does not contradict it, unless it names workers anywhere ("The user may
+    allow workers to push", "... and let workers do so too"). It still pairs with the same actor's
+    allowance, an allowance naming no actor, and a ban naming no actor pairs with any actor's
+    allowance. A verb that lets or makes workers act passes its action on ("may tell workers to
+    push"), a named actor after an inverted "may" is skipped, and a permission given to no one ("No
+    worker may push") forbids. The guard makes no actor exemption: it flags every one of these."""
     p = make(env)
     from ttp import coordinator as coord
 
@@ -4759,9 +4763,12 @@ def test_a_ban_on_one_actor_does_not_pair_with_another_actors_allowance(env):
     for k, (ban, text) in enumerate((
             ("Workers must not push.", "The coordinator may push to the work branch."),
             ("Never let workers push.", "The coordinator may push to the work branch."),
-            ("Never let agents open pull requests.", "The coordinator may open draft PRs on the fork."))):
+            ("Never let agents open pull requests.", "The coordinator may open draft PRs on the fork."),
+            ("Never tell workers to push.", "The coordinator may push to the work branch."),
+            ("Never ask agents to open pull requests.", "The coordinator may open draft PRs on the fork."))):
         assert lint(ban, text) == [], text
-        assert guard(ban, text, 10 + k) == [], text
+        err = guard(ban, text, 10 + k)
+        assert len(err) == 1 and f"\"{ban}\" (section 'Restrictions')" in err[0], (text, err)
     for k, (ban, text) in enumerate((
             ("Workers must not push.", "Workers may push to the work branch."),
             ("Never push.", "The coordinator may push to the work branch."),
@@ -4769,10 +4776,41 @@ def test_a_ban_on_one_actor_does_not_pair_with_another_actors_allowance(env):
             ("Never let agents open pull requests.", "Workers may open draft PRs on the fork."),
             ("Workers must not push.", "Pushing to the work branch is allowed."),
             ("Never push to main without the user's word.", "The coordinator may push to main."),
-            ("Never push to main.", "Only after review may Dependabot push to main."))):
+            ("Never push to main.", "Only after review may Dependabot push to main."),
+            ("Workers must not push to main.", "The user may allow workers to push to main."),
+            ("Workers must not open PRs.", "The coordinator may open draft PRs and let workers do so too."),
+            ("Workers must not push to main.", "The coordinator may tell workers to push to main."),
+            ("Workers must not push to main.", "The coordinator may have workers push to main."),
+            ("Workers must not push to main.", "The coordinator may ask workers to push to main."),
+            ("Never push to main.", "Only after review may the coordinator tell workers to push to main."),
+            ("Never tell workers to push to main.", "Workers may push to main."),
+            ("No worker may push to main.", "Workers may push to main."),
+            ("Nobody may push to main.", "The coordinator may push to main."),
+            ("None of the agents are allowed to push to main.", "Agents may push to main."))):
         assert lint(ban, text) == [(ban, text)], text
         err = guard(ban, text, 20 + k)
         assert len(err) == 1 and f"\"{ban}\" (section 'Restrictions')" in err[0], (text, err)
+
+
+def test_a_permission_given_to_no_one_adds_a_ban_and_only_workers_pass_an_action_on(env):
+    """"No worker may X" and "Nobody may X" forbid X: appended next to a ban on X they add a ban, which
+    the guard lets through, while "Nobody but the user may X" still allows X and is flagged. A verb
+    passes its action on only to workers: "Never ask the user to run commands" is about asking, and an
+    allowance to run commands does not contradict it."""
+    p = make(env)
+    from ttp import coordinator as coord
+
+    def guard(ban, text, turn):
+        p.charter_path.write_text(f"# demo\n\n## Restrictions\n- {ban}\n")
+        return coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": text}],
+                           turn=turn, user_turn=True)
+    assert guard("Never push to main.", "No worker may push to main.", 10) == []
+    assert guard("Never push to main.", "Nobody may push to main.", 11) == []
+    err = guard("Never push to main.", "Nobody but the user may push to main.", 12)
+    assert len(err) == 1 and "\"Never push to main.\" (section 'Restrictions')" in err[0], err
+    ban, text = "Never ask the user to run commands the harness can run.", "Workers may run commands."
+    assert coord.restriction_pairs(f"# demo\n\n## Restrictions\n- {ban}\n- {text}\n") == []
+    assert guard(ban, text, 13) == []
 
 
 def test_charter_conflicts_show_in_the_digest_raise_effort_once_and_reach_the_daily_review(env):
