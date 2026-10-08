@@ -447,3 +447,10 @@ def test_worker_prompt_covers_pattern_kills_in_scripts_it_runs():
     for part in ("scripts and test stubs you run", "`ttp killscan <script>`", "`ttp killscan --shim <dir>`",
                  "`kill $(pgrep -f ...)`", "a separate session or process group does not protect it"):
         assert part in text, part
+
+
+def test_suite_keeps_pytest_temp_dirs_small(pytestconfig):
+    # The runtime suite makes hundreds of thousands of files under the pytest temp root; on a shared
+    # host the default (keep every tmp_path of the last 3 sessions) fills /tmp and slows boot cleanup.
+    assert pytestconfig.getini("tmp_path_retention_policy") == "failed"
+    assert int(pytestconfig.getini("tmp_path_retention_count")) <= 1
