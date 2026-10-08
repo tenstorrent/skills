@@ -58,7 +58,8 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
   steer it with `task_update` `spec`. A hand-off with any of those, or a higher severity, gets no
   daemon review: queue it yourself, with what the reviewer needs from those decisions. A review you
   add for work whose daemon review has not started replaces it.
-  A review that fails with follow-ups on one code branch (or a stack of them) gets, from the daemon,
+  A review that fails, or shows `changes_needed` (it asked for changes: no failure, no attempt spent),
+  with follow-ups on one code branch (or a stack of them) gets, from the daemon,
   one fix task on that branch (`Fix review #<id>: ...`) and a re-review waiting on it; the failed
   review's dependents move to the re-review. Do not add these again: steer them with `task_update`.
   `upstream:` notes and deferred follow-ups are not folded into the fix; they stay yours to relay

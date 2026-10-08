@@ -24522,7 +24522,7 @@ def _fail_review(env, p, rid, followups=(), **handoff):
     d = Daemon(p.base)
     d._finish_worker({"task": rid}, Usage(cost_usd=1.0), "ok", run_dir)
     d.reconcile_tasks()
-    return p.db.one("SELECT * FROM events WHERE task=? AND kind='task_failed'", (rid,))
+    return p.db.one("SELECT * FROM events WHERE task=? AND kind IN ('task_failed','task_changes_needed')", (rid,))
 
 
 def test_a_failed_review_with_fixes_moves_its_dependents_onto_the_re_review(env):
@@ -24580,7 +24580,7 @@ def test_a_failed_review_with_fixes_moves_its_dependents_onto_the_re_review(env)
     assert w["status"] == "blocked" and w["blocked_reason"] == f"dependency #{re_rev2['id']} failed"
 
 
-def test_a_review_done_with_a_changes_needed_verdict_is_a_failed_review(env):
+def test_a_review_done_with_a_changes_needed_verdict_gates_like_a_failed_review(env):
     """A project whose result rule is `done` plus `metrics.verdict` gets the same fix flow as `failed`,
     and approves nothing; `done` with another verdict, or from a non-review task, stays done."""
     p = make(env)
@@ -24588,10 +24588,10 @@ def test_a_review_done_with_a_changes_needed_verdict_is_a_failed_review(env):
     code, _, _, (rev,) = _finish_code(env, p, "feature", {"app.py": 40})
     waiter = p.db.add_task("deploy it", "s", origin="coordinator", depends_on=[rev["id"]])
     fups = [{"title": "add the missing test", "spec": "test_x must fail without the change"}]
-    failed = _fail_review(env, p, rev["id"], fups, status="done", metrics={"verdict": "changes_needed"},
-                          push=[{"branch": "ttp/x", "head": "a" * 40}])
-    assert failed is not None and p.db.task(rev["id"])["status"] == "failed"
-    assert json.loads(p.db.task(rev["id"])["result"])["status"] == "failed"
+    ev = _fail_review(env, p, rev["id"], fups, status="done", metrics={"verdict": "changes_needed"},
+                      push=[{"branch": "ttp/x", "head": "a" * 40}])
+    assert ev is not None and ev["kind"] == "task_changes_needed" and p.db.task(rev["id"])["status"] == "failed"
+    assert json.loads(p.db.task(rev["id"])["result"])["status"] == "changes_needed"
     assert p.db.q("SELECT * FROM events WHERE task=? AND kind='push_queued'", (rev["id"],)) == []
     (fix,) = p.db.q("SELECT * FROM tasks WHERE kind='code' AND origin='daemon'")
     assert "test_x must fail" in fix["spec"] and p.db.task(waiter)["status"] == "queued"
@@ -24604,6 +24604,58 @@ def test_a_review_done_with_a_changes_needed_verdict_is_a_failed_review(env):
     plain = p.db.add_task("not a review", "s", kind="question", origin="coordinator")
     _fail_review(env, p, plain, status="done", summary="answered", metrics={"verdict": "changes_needed"})
     assert p.db.task(plain)["status"] == "done"
+
+
+def test_a_review_that_asks_for_changes_is_its_own_outcome_not_a_failure(env):
+    """A review handed off `done` with a changes_needed verdict worked: it spends no attempt, never
+    retries, shows and counts as changes_needed, and raises no repeated-failure or resource trigger.
+    The change stays gated: its fix and re-review follow, and the re-review runs standard."""
+    p = make(env)
+    from ttp import coordinator as coord, coordcheck, effort, machines
+    from ttp.cli import status_text
+    from ttp.db import task_outcome
+    from ttp.web import state_payload
+    code, _, _, (rev,) = _finish_code(env, p, "feature", {"app.py": 40})
+    p.db.x("INSERT INTO jev_calls(ts,use,ref,cost_usd) VALUES(?,?,?,?)",
+           (time.time(), effort.JEV_USE, f"task:{rev['id']}", 0.0))
+    p.db.update_task(rev["id"], labels=json.dumps(json.loads(rev["labels"] or "[]") + ["resource:box"]))
+    fups = [{"title": "add the missing test", "spec": "test_x must fail without the change"}]
+    before = time.time() - 1
+    ev = _fail_review(env, p, rev["id"], fups, status="done", metrics={"verdict": "changes_needed"})
+    t = p.db.task(rev["id"])
+    assert t["status"] == "failed" and t["attempts"] == 0, "a review that asked for changes spent an attempt"
+    assert task_outcome(t) == "changes_needed" and t["not_before"] is None
+    assert "→ changes_needed" in ev["text"] and not p.db.q("SELECT id FROM events WHERE kind='task_failed'")
+    assert p.db.one("SELECT outcome FROM jev_calls WHERE ref=?", (f"task:{rev['id']}",))["outcome"] == "right", \
+        "the effort pick of a review that worked was marked wrong"
+    # Gated as before: the fix and a standard re-review are queued, nothing approved.
+    (fix,) = p.db.q("SELECT * FROM tasks WHERE kind='code' AND origin='daemon'")
+    (re_rev,) = p.db.q("SELECT * FROM tasks WHERE kind='review' AND id!=?", (rev["id"],))
+    assert re_rev["tier"] == "standard" and effort.retry_tier(p.db, re_rev) is None
+    assert effort.retry_tier(p.db, fix) is None, "a fix after a review that asked for changes was tiered up"
+    # Shown and counted on its own, never as failed.
+    counts = p.db.status_counts()
+    assert counts.get("changes_needed") == 1 and "failed" not in counts, counts
+    assert "changes_needed 1" in status_text(p).splitlines()[0]
+    assert coordcheck.summary(p.db, []).count("changes_needed 1") == 1
+    st = state_payload(p, p.db)
+    assert st["task_counts"].get("changes_needed") == 1
+    assert next(x for x in st["tasks"] if x["id"] == rev["id"])["outcome"] == "changes_needed"
+    p.db.set_kv("last_coordinator_turn", before)
+    assert f"- #{rev['id']} changes_needed:" in coord.digest(p, {}, [], [])
+    # Not a failure for the coordinator's repeated-failure or resource-trouble rules; its findings
+    # still make a turn that handles them a high-effort one.
+    fails = p.db.one("SELECT COUNT(*) n FROM events WHERE task=? AND kind='task_failed'", (rev["id"],))["n"]
+    assert fails == 0
+    trig = coord.effort_triggers(p.db, {"coordinator": {"repeat_fails_24h": 1}}, [ev["id"]], None)[0]
+    assert "repeated failures" not in trig and "failed review" in trig, trig
+    assert "box" not in machines.stats(p.db), "a review that asked for changes counted as resource trouble"
+    # A review that cannot run still fails as before.
+    _, _, _, (bad,) = _finish_code(env, p, "other", {"b.py": 5})
+    p.db.update_task(bad["id"], labels=json.dumps(json.loads(bad["labels"] or "[]") + ["resource:box"]))
+    _fail_review(env, p, bad["id"], status="failed", summary="could not run the checks")
+    assert task_outcome(p.db.task(bad["id"])) == "failed" and p.db.status_counts().get("failed") == 1
+    assert p.db.task(bad["id"])["attempts"] == 1 and machines.stats(p.db)["box"]["handoffs"] == 1
 
 
 def test_the_review_result_rule_is_one_block_that_survives_upgrades(env, tmp_path):

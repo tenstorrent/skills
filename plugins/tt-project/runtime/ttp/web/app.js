@@ -47,15 +47,15 @@ const heldAs = (t) => t.status !== "queued" ? "" : (t.blocked_reason || "").star
 const held = (t) => !!heldAs(t);
 
 function taskRow(t) {
-  const label = deferred(t) ? esc(t.starts) : waiting(t) ? "waiting" : held(t) ? heldAs(t) : t.review_since ? `review ${agoH(t.review_since)}` : t.status === "pushing" ? "approved, pushing" : esc(t.status);
+  const label = deferred(t) ? esc(t.starts) : waiting(t) ? "waiting" : held(t) ? heldAs(t) : t.review_since ? `review ${agoH(t.review_since)}` : t.status === "pushing" ? "approved, pushing" : t.outcome === "changes_needed" ? "changes needed" : esc(t.status);
   const noteLabel = t.status === "blocked" ? "Blocked" : waiting(t) ? "Waiting" : held(t) ? "Held" : "Note";
-  return `<details class="row"><summary><span class="id">#${t.id}</span> <span class="st st-${t.status}">${label}</span>
+  return `<details class="row"><summary><span class="id">#${t.id}</span> <span class="st st-${t.outcome || t.status}">${label}</span>
     <span class="title">${esc(t.title)}</span> <span class="meta">${esc(t.tier)} · ${money(t.spent_usd)}${t.budget_usd ? " / " + money(t.budget_usd) : ""} · ${agoH(t.updated)} ago${t.pr_url ? ` · <a href="${esc(t.pr_url)}" target="_blank" rel="noopener">PR</a>` : ""}</span></summary>
     ${t.blocked_reason ? `<p><b>${noteLabel}:</b> ${esc(t.blocked_reason)}</p>` : ""}${t.result ? `<p>${esc(t.result)}</p>` : ""}
     ${(t.pushed || []).map((x) => `<p class="meta">${x.status === "landed" ? "already on the branch" : "pushed"} ${esc((x.sha || "").slice(0, 7))}${x.version ? " as " + esc(x.version) : ""} (${esc(x.branch || "?")})</p>`).join("")}
     <p class="meta">origin ${esc(t.origin)} · kind ${esc(t.kind)} · attempts ${t.attempts}${t.branch ? " · branch " + esc(t.branch) : ""}</p>
     ${["queued", "running", "blocked", "pushing"].includes(t.status) ? `<button class="ghost" onclick="taskAct(${t.id},'cancelled')">Cancel</button>` : ""}
-    ${["blocked", "failed"].includes(t.status) ? `<button class="ghost" onclick="taskAct(${t.id},'queued')">Retry</button>` : ""}</details>`;
+    ${["blocked", "failed"].includes(t.outcome || t.status) ? `<button class="ghost" onclick="taskAct(${t.id},'queued')">Retry</button>` : ""}</details>`;
 }
 window.taskAct = async (id, status) => { const r = await api(`/api/task/${id}`, { status }); if (r.error) alert(r.error); refresh(); };
 

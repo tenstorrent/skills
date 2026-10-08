@@ -42,7 +42,7 @@ from .db import DB
 
 WINDOWS = (("24 h", 86400), ("7 d", 7 * 86400))
 STUCK = {"task_blocked": "blocked", "task_waiting": "waiting", "task_review": "review"}
-MOVED = frozenset({"task_done", "task_failed", "task_queued", "task_requeued", "push_queued"})
+MOVED = frozenset({"task_done", "task_failed", "task_changes_needed", "task_queued", "task_requeued", "push_queued"})
 ENDED = frozenset({"done", "failed", "cancelled", "pushing"})   # a status that ends any episode
 ANSWER_MAX_AGE_S = 14 * 86400   # a mention of an ask id later than this is not its answer
 RESOLVED_KEY = "ask_resolved"   # kv: {ask id: {"ts": resolved at, "messages": the user messages of that turn}}

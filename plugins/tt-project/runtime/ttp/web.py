@@ -24,7 +24,7 @@ from .daemon import (AUTH_PROBE_S, HEARTBEAT_STALE_S, KV_LOCAL_ONLY, KV_WORKTREE
                      WAIT_KEYS, WATCHDOG_S, heartbeat, idle_wake)
 from .alerts import cleared  # noqa: F401  (readers import it from here)
 from .db import (DB, SEVERITY_RANK, chat_floor, continues_id, deferral, dependency_ids, dump_result, host_line,
-                 load_result)
+                 load_result, task_outcome)
 from .project import Project, durable_write
 from .providers import get_provider
 from .runner import stop_runs
@@ -453,6 +453,7 @@ def state_payload(p: Project, db: DB) -> dict:
     unmet = db.unmet_dependencies(db.q("SELECT * FROM tasks WHERE status='queued'"))
     for t in tasks:
         t["review_since"] = in_review.get(t["id"])
+        t["outcome"] = task_outcome(t)   # changes_needed for a review that asked for changes
         result = load_result(t["result"])
         t["result"] = str(result.get("summary") or "")[:600]
         pushed = result.get("pushed")
@@ -474,7 +475,7 @@ def state_payload(p: Project, db: DB) -> dict:
         "heartbeat": heartbeat(p), "heartbeat_stale_s": HEARTBEAT_STALE_S, "watchdog_s": WATCHDOG_S,
         "service": installed(p), "disk_low": db.kv("disk_low"),
         "disk": db.kv("disk"), "worktrees_kept": db.kv("worktrees_kept"),
-        "tasks": tasks, "runs": runs,
+        "tasks": tasks, "task_counts": db.status_counts(), "runs": runs,
         "issues": db.q("SELECT id,source,title,severity,status,count,first_seen,last_seen,task FROM issues "
                        "WHERE status IN ('open','tracking') ORDER BY last_seen DESC LIMIT 100"),
         "schedules": sched.with_costs(db),

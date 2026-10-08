@@ -10,6 +10,7 @@ Assess the last day of this project, then hand off.
    that re-read most. Coordinator prompt cache (`budget.coordinator_cache`: hit %, turns that missed,
    $ per turn, 24 h against 7 d): say if the hit rate fell.
 3. Quality: failures, retries, flaky areas, slop or duplication introduced, architecture drift.
+   Count reviews that asked for changes (`changes_needed`) apart from failures: those reviews worked.
 4. Harness friction: where the user was needed, where the coordinator mis-planned, slow loops.
    Unblocking quality: if this spec ends with `Unblocking quality` lines, report them in one short
    section: time stuck (blocked, waiting, review: count, median, p90, longest), asks the user

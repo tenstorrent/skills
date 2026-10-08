@@ -36,7 +36,7 @@ from .db import DB
 JEV_USE = "coord_effort"
 THRESHOLD = 0.7       # default of coordinator.jev_threshold
 WAIT_H = 6.0          # default of coordinator.jev_wait_h
-WORTH_KINDS = ("task_failed", "task_blocked")
+WORTH_KINDS = ("task_failed", "task_changes_needed", "task_blocked")
 RAISED_KEY = "coord_check_raised"   # kv: event ("e<id>"), message ("m<id>") and wait stint
                                     # ("w<task>:<stint start>") keys Jev raised a turn for
 RAISED_KEEP = 500
@@ -69,7 +69,7 @@ def summary(db: DB, event_ids: list[int], wake_due: str | None = None) -> str:
                     "ORDER BY id", list(event_ids))
         lines += [f"event {r['kind']} [{r['severity']}]: {' '.join(str(r['text']).split())[:EVENT_CHARS]}"
                   for r in rows]
-    counts = {r["status"]: r["n"] for r in db.q("SELECT status, COUNT(*) n FROM tasks GROUP BY status")}
+    counts = db.status_counts()
     lines.append("tasks: " + (", ".join(f"{k} {v}" for k, v in sorted(counts.items())) or "none"))
     asks = db.one("SELECT COUNT(*) n FROM messages WHERE kind='ask' AND handled=0")["n"]
     rejected = len(db.kv("rejected_actions", []) or [])

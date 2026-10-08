@@ -55,7 +55,7 @@ from . import upstream
 from . import screen as scr
 from . import shared
 from . import worktree
-from .db import (OPEN_ASK_MAX_AGE_S, SEVERITY_RANK, TERMINAL_TASK_STATES, continues_id, deferral, dependency_ids,
+from .db import (CHANGES_NEEDED, OPEN_ASK_MAX_AGE_S, SEVERITY_RANK, TERMINAL_TASK_STATES, continues_id, deferral, dependency_ids,
                  dump_result, load_result, without_deferral)
 from .project import (Project, deep_merge, layered, disk_resume_gb, durable_write, git_fsync_env, hostname,
                       nice_level, push_allowed, zombie)
@@ -1823,10 +1823,12 @@ class Daemon:
                            blocked_reason="its resource stayed busy before the run could start; retries")
             return
         rstatus = result.get("status") if isinstance(result, dict) else None
-        if rstatus == "done" and task["kind"] == "review" and review_rejects(result):
-            # A project's own result rule (`done` plus a verdict): a change that must not proceed
-            # is a failed review, so its fix and re-review follow and nothing is approved.
-            rstatus, result = "failed", dict(result, status="failed")
+        # A project's own result rule (`done` plus a verdict): the change must not proceed. The task is
+        # stored failed, so its fix and re-review follow and nothing is approved, but the review itself
+        # worked: it shows as changes_needed and spends no attempt (db.CHANGES_NEEDED).
+        rejects = rstatus == "done" and task["kind"] == "review" and review_rejects(result)
+        if rejects:
+            rstatus, result = "failed", dict(result, status=CHANGES_NEEDED)
         summary = str((result.get("summary") if isinstance(result, dict) else None)
                       or (usage.final_text or usage.error or "")[:1500])
         jobs = _detached_jobs(run_dir)
@@ -1868,7 +1870,8 @@ class Daemon:
             new = "queued"   # not an attempt: the account refused or the host went down, the task did not fail
         else:
             new = "failed"
-        attempts = int(task["attempts"] or 0) + (0 if status in ("limit", "auth") or waiting or reboot_lost else 1)
+        attempts = int(task["attempts"] or 0) + (0 if status in ("limit", "auth") or waiting or reboot_lost
+                                                  or rejects else 1)
         if new == "failed" and attempts < int(task["max_attempts"] or 3) and status in ("failed", "lost", "timeout",
                                                                                      "stalled", "no_handoff"):
             new = "queued"
@@ -1989,7 +1992,7 @@ class Daemon:
                       f"{'~' if usage.estimated else ''}${usage.cost_usd:.2f})", "handled", task["id"]))
         else:
             db.update_task(task["id"], **upd)
-        effort.settle(db, task["id"], new, attempts)
+        effort.settle(db, task["id"], "done" if rejects else new, attempts)
         if new == "done" and worktree.own_worktree(task):
             self._local_only_due = 0.0   # is its work on a remote? checked this tick
             self._queue_backup(task)
@@ -2012,8 +2015,9 @@ class Daemon:
                  (time.time(), f"task:{task['id']}", "task_waiting", "low",
                   f"#{task['id']} {task['title']}: {reason}", json.dumps(data), "handled", task["id"]))
             return
+        outcome = CHANGES_NEEDED if rejects else new
         if task["reply_chat"] and new in ("done", "failed", "blocked"):
-            text = summary if new == "done" else f"(task #{task['id']} {new}) {summary}"
+            text = summary if new == "done" else f"(task #{task['id']} {outcome}) {summary}"
             need = upd.get("blocked_reason") if new == "blocked" else None
             if need and need not in summary:
                 text += f"\nNeeds from you: {need}"
@@ -2029,7 +2033,7 @@ class Daemon:
         # A plan's findings, plugin advice and follow-up specs are its product: each part gets its own
         # event, sized for the digest to show it whole, so an ordinary hand-off does not grow.
         where = _result_ref(self.p, run_dir if handoff is None else run_dir / RESULT_FILE)
-        text = (f"#{task['id']} {task['title']} → {new} (run {ended or status}, {'~' if usage.estimated else ''}"
+        text = (f"#{task['id']} {task['title']} → {outcome} (run {ended or status}, {'~' if usage.estimated else ''}"
                 f"${usage.cost_usd:.2f}): {_cut(summary, 1200, where)}{push_note}")
         notes = ""
         if len(fups) > MAX_FOLLOWUPS:
@@ -2070,7 +2074,7 @@ class Daemon:
         routine = (review is not None and plain) or fix is not None
         if not approval:   # an approval has its push_queued event; the batch's outcome closes the task
             db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
-                 (time.time(), f"task:{task['id']}", f"task_{new}", sev, text,
+                 (time.time(), f"task:{task['id']}", f"task_{outcome}", sev, text,
                   "handled" if quiet or routine else "queued", task["id"]))
         if notes:
             db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
@@ -4640,7 +4644,7 @@ def _resume_never_started(note: dict, usage) -> bool:
     return bool(note.get("resumes")) and not usage.cost_usd and not usage.output_tokens
 
 
-# `metrics.verdict` values that make a review handed off `done` a failed one (see review_rejects).
+# `metrics.verdict` values that make a review handed off `done` one that asked for changes (see review_rejects).
 REVIEW_REJECT_VERDICTS = frozenset({"changes_needed", "changes_requested", "rejected"})
 
 

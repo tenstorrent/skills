@@ -107,6 +107,10 @@ CREATE INDEX IF NOT EXISTS alerts_key ON alerts(key, cleared);
 """
 
 TERMINAL_TASK_STATES = ("done", "failed", "cancelled")
+# A review that asked for changes is a review that worked. It is stored 'failed', so the change it
+# reviewed stays gated (its fix and re-review follow), and its hand-off status says changes_needed:
+# readers show and count it on its own, never as a failure (task_outcome, DB.status_counts).
+CHANGES_NEEDED = "changes_needed"
 # The push queue (pushq.py). A review whose approval waits in it has the task status 'pushing'.
 PUSH_QUEUE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS push_queue(
@@ -375,6 +379,19 @@ class DB:
     def task(self, task_id: int) -> dict | None:
         return self.one("SELECT * FROM tasks WHERE id=?", (task_id,))
 
+    def status_counts(self) -> dict[str, int]:
+        """Tasks by status, with reviews that asked for changes counted as changes_needed, not failed."""
+        counts = {r["status"]: r["n"] for r in self.q("SELECT status, COUNT(*) n FROM tasks GROUP BY status")}
+        n = sum(task_outcome(t) == CHANGES_NEEDED for t in self.q(
+            "SELECT status, kind, result FROM tasks WHERE status='failed' AND kind='review' AND result LIKE ?",
+            (f"%{CHANGES_NEEDED}%",)))
+        if n:
+            counts["failed"] -= n
+            if not counts["failed"]:
+                del counts["failed"]
+            counts[CHANGES_NEEDED] = n
+        return counts
+
     def ready_tasks(self) -> list[dict]:
         """Queued tasks whose dependencies are all finished, best priority first. A task deferred
         with `start_when` is not ready until its probe passes (see deferral)."""
@@ -637,6 +654,14 @@ def _clip(value: Any, cap: int) -> Any:
     if isinstance(value, dict):
         return {k: _clip(v, cap) for k, v in list(value.items())[:cap]}
     return value
+
+
+def task_outcome(task: dict) -> str:
+    """The task's status as readers show it: changes_needed for a review that asked for changes."""
+    if task.get("status") == "failed" and task.get("kind") == "review" \
+            and load_result(task.get("result")).get("status") == CHANGES_NEEDED:
+        return CHANGES_NEEDED
+    return task.get("status") or ""
 
 
 def load_result(text: str | None) -> dict:

@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 
 from . import __version__, poll_s
-from .db import chat_floor
+from .db import chat_floor, task_outcome
 from . import outbox
 from . import schedule as sched
 from .project import (FOLDER, NAME_RE, Project, hostname, load_registry, load_secrets, register, save_secret,
@@ -669,7 +669,7 @@ def status_text(p: Project) -> str:
     state = daemon_state(p)
     h = health(p, db, alive=state == "running")
     now = time.time()
-    counts = {r["status"]: r["n"] for r in db.q("SELECT status, COUNT(*) n FROM tasks GROUP BY status")}
+    counts = db.status_counts()
     head = f"{p.name}: daemon {state}" + (" (paused)" if db.kv("paused") else "")
     head += " · tasks: " + (", ".join(f"{k} {v}" for k, v in sorted(counts.items())) if counts else "none yet")
     lines = [head]
@@ -1739,8 +1739,8 @@ def cmd_task(a) -> None:
         tid = p.db.add_task(a.title, a.spec or "", kind=a.kind, tier=a.tier, priority=a.priority, origin="user")
         print(f"task #{tid} queued")
     elif a.action == "list":
-        for t in p.db.q("SELECT id,status,tier,title FROM tasks ORDER BY id DESC LIMIT 50"):
-            print(f"#{t['id']}\t{t['status']}\t{t['tier']}\t{t['title']}")
+        for t in p.db.q("SELECT id,status,kind,result,tier,title FROM tasks ORDER BY id DESC LIMIT 50"):
+            print(f"#{t['id']}\t{task_outcome(t)}\t{t['tier']}\t{t['title']}")
     elif a.action == "cancel":
         from .runner import stop_runs
         tid = int(a.title)

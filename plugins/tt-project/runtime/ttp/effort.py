@@ -22,7 +22,7 @@ import re
 import time
 
 from . import jevuse, machines
-from .db import DB, dump_result
+from .db import DB, dump_result, task_outcome
 
 JEV_USE = "effort"
 SHORT_SPEC = 800    # characters: a longer spec is not a lookup
@@ -117,8 +117,8 @@ def retry_tier(db: DB, task: dict) -> str | None:
         if gated and not wants_deep(last):
             return None
         return up if last.get(RAISED) != attempts else None
-    for old in _continued(db, task):
-        if old["status"] == "failed" and old["tier"] == task["tier"] and not (gated and not wants_deep(old["result"])):
+    for old in _continued(db, task):   # a fix after a review that asked for changes is no retry
+        if task_outcome(old) == "failed" and old["tier"] == task["tier"] and not (gated and not wants_deep(old["result"])):
             return up
     return None
 

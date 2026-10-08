@@ -25,7 +25,7 @@ from . import effort, ends, jevuse, machines, prguard, push, shared, unblock, up
 from . import screen as scr
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
-                 dependency_ids, dump_result, host_line, load_result, without_deferral)
+                 dependency_ids, dump_result, host_line, load_result, task_outcome, without_deferral)
 from .project import (COORDINATOR_MEMORY_CHARS, WORKER_MEMORY_CHARS, Project, code_tasks_may_push, durable_append,
                       durable_write, push_queue_number, push_queue_on)
 from .runner import stop_runs
@@ -154,7 +154,8 @@ RETRY_WAKE_KEY = "rejected_retry_wake"
 # Everything else (a task done, notes, follow-ups, a retry wake) is routine and keeps the base effort.
 EFFORT_EVENT_TRIGGERS = {
     # stuck work
-    "task_blocked": "stuck", "task_failed": "stuck", "task_review": "stuck", "dead_dependency": "stuck",
+    "task_blocked": "stuck", "task_failed": "stuck", "task_changes_needed": "stuck", "task_review": "stuck",
+    "dead_dependency": "stuck",
     "deferral_expired": "stuck", "deferral_probe_broken": "stuck", "review_stall": "stuck",
     "wait_stale": "stuck",
     "resource_trouble": "resource",
@@ -174,8 +175,8 @@ CONFLICT_RE = re.compile(r"\b(change of plan|change(d)? (my|the) mind|supersed\w
                          r"forget (that|what i said)|overrid\w*|contrary to|reverse (that|the) decision)\b", re.I)
 EFFORT_SEEN_KEY = "effort_seen"   # kv: state-based triggers already raised once (held queue, red gates, waits)
 # A task's stint of external waits ends at any other hand-off (wait_raises); looked back this far.
-STINT_KINDS = ("task_waiting", "task_blocked", "task_review", "task_done", "task_failed", "task_queued",
-               "task_requeued", "push_queued")
+STINT_KINDS = ("task_waiting", "task_blocked", "task_review", "task_done", "task_failed", "task_changes_needed",
+               "task_queued", "task_requeued", "push_queued")
 STINT_LOOKBACK_S = 14 * 86400
 ESCALATE_KEY = "escalate"   # kv: a routine turn's escalation; the next turn reruns its batch at high effort
 ESCALATIONS_KEY = "escalations"   # kv: {"n": routine turns escalated, "refused": escalations refused}
@@ -198,7 +199,7 @@ COLLAPSIBLE = ("recurring", "muted", "memory_budget")
 EVENT_CHARS = 1500
 # A plan's product arrives as these events; the daemon sizes them to fit, so they show whole.
 EVENT_CHARS_BY_KIND = {"followup_proposed": 4300, "task_notes": 6000, "upstream_note": 4300}
-HANDOFF_KINDS = ("task_done", "task_failed", "task_cancelled", "cancelled_but_done")
+HANDOFF_KINDS = ("task_done", "task_failed", "task_changes_needed", "task_cancelled", "cancelled_but_done")
 # Events that may wait up to coordinator.batch_s for company while no worker slot would sit idle.
 # Failed, blocked and review hand-offs, high or critical events and user messages wake at once.
 BATCH_KINDS = ("task_done", "followup_proposed", "task_notes", "observation")
@@ -465,7 +466,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     for k, t in enumerate(finished):
         summary = ("see new events" if f"task:{t['id']}" in in_events
                    else clip(load_result(t["result"]).get("summary"), FINISHED_CHARS) if k < FINISHED_DETAIL else "")
-        lines.append(f"- #{t['id']} {t['status']}: {clip(t['title'], TITLE_CHARS)}" + (f" — {summary}" if summary else ""))
+        lines.append(f"- #{t['id']} {task_outcome(t)}: {clip(t['title'], TITLE_CHARS)}" + (f" — {summary}" if summary else ""))
     section("finished", lines)
     recurring = sched.with_costs(db)
     lines = ["## Recurring"] if recurring else []
@@ -1264,8 +1265,9 @@ def effort_triggers(db, cfg: dict, event_ids: list[int], wake_due: str | None,
             continue
         if r["kind"] in EFFORT_EVENT_TRIGGERS:
             add(r["kind"])
-    if any(r["kind"] == "task_failed" and r["task"] and (db.task(r["task"]) or {}).get("kind") == "review"
-           for r in rows):
+    # A review that asked for changes is not a failure, but what to do with its findings is a decision.
+    if any(r["kind"] in ("task_failed", "task_changes_needed") and r["task"]
+           and (db.task(r["task"]) or {}).get("kind") == "review" for r in rows):
         add("failed review")
     if any(r["severity"] in EFFORT_SEVERITIES for r in rows):
         add("high severity event")
