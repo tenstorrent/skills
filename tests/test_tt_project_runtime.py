@@ -4914,6 +4914,28 @@ def test_a_lost_run_ends_at_its_last_sign_of_life(env, tmp_path):
     assert row["status"] == "lost" and abs(row["ended"] - (now - 3600)) < 5
 
 
+def test_a_run_that_ends_while_it_is_reaped_ends_ok_not_lost(env, tmp_path):
+    """The runner writes exit.json and exits between the reaper's look for exit.json and its liveness
+    check: the run ended normally and must not be recorded as lost."""
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    now = time.time()
+    run_dir = tmp_path / "ending"
+    run_dir.mkdir()
+    (run_dir / "output.jsonl").write_text("{}")
+    rid = p.db.x("INSERT INTO runs(role,provider,started,status,dir,boot_id,pid) VALUES(?,?,?,?,?,?,?)",
+                 ("coordinator", "fake", now - 5, "running", str(run_dir), d.boot, 0))
+    real_alive = d._run_alive
+
+    def runner_ends_now(r):
+        (run_dir / "exit.json").write_text(json.dumps({"rc": 0, "started": now - 5, "ended": now, "stopped": None}))
+        return real_alive(r)
+    d._run_alive = runner_ends_now
+    d.reap_runs()
+    assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == "ok"
+
+
 def test_a_failed_start_leaves_the_task_queued_without_spending_an_attempt(env, monkeypatch):
     p = make(env)
     from ttp import daemon as dmod

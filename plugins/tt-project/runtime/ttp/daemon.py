@@ -943,10 +943,14 @@ class Daemon:
     def reap_runs(self) -> None:
         for r in self.p.db.q("SELECT * FROM runs WHERE status='running'"):
             try:
+                # Liveness first: a runner writes exit.json before it exits, so a run found dead here
+                # has its exit.json by the look below. The other order calls a run that ends between
+                # the two looks lost.
+                alive = self._run_alive(r)
                 exit_file = self._run_dir(r) / "exit.json"
                 if exit_file.exists():
                     self.finish_run(r, _read_result(exit_file) or {"rc": -1, "stopped": "lost", "ended": time.time()})
-                elif not self._run_alive(r):
+                elif not alive:
                     self._end_orphan(r)
                     self.finish_run(r, {"rc": -1, "stopped": "lost", "ended": self._last_sign_of_life(r)})
                 self._reap_errors.pop(r["id"], None)
