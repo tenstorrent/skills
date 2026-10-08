@@ -6492,7 +6492,14 @@ def _reviews(p):
                                     (json.dumps(["daily-review"]),))]
 
 
-def test_a_daily_review_done_on_unchanged_evidence_is_not_repeated_within_the_debounce(env):
+@pytest.mark.parametrize("clock_at", ["00:10", "04:01", "12:00", "23:50"])
+def test_a_daily_review_done_on_unchanged_evidence_is_not_repeated_within_the_debounce(env, monkeypatch, clock_at):
+    # The wall clock is pinned to a time of day: the review's regular slot (04:30) may fall inside the debounce.
+    from datetime import datetime
+    real = time.time
+    hh, mm = (int(x) for x in clock_at.split(":"))
+    offset = [datetime.now().replace(hour=hh, minute=mm, second=0, microsecond=0).timestamp() - real()]
+    monkeypatch.setattr(time, "time", lambda: real() + offset[0])
     p = make(env)
     from ttp import schedule as sched
     from ttp.daemon import Daemon
@@ -6509,9 +6516,17 @@ def test_a_daily_review_done_on_unchanged_evidence_is_not_repeated_within_the_de
     d.run_schedules()
     s = p.db.one("SELECT * FROM schedules WHERE name='daily-review'")
     assert s["last_status"].startswith("skipped: last run done 1.0 h ago on unchanged evidence"), s["last_status"]
-    # The skip waits for the next regular slot (which may be under an hour away), not a quick retry.
-    assert _reviews(p) == [first] and s["next_run"] == sched.next_run(s["every_s"], s["at"], s["last_run"])
+    # The skip counts as the period's run: the next trigger is the regular slot, not a quick retry.
+    assert _reviews(p) == [first] and s["last_run"] > time.time() - 60
+    assert s["next_run"] == sched.next_run(s["every_s"], s["at"], s["last_run"]) > time.time()
     assert s["next_run"] > s["last_run"]
+    if s["next_run"] < time.time() + 3600:
+        # That slot falls inside the debounce: it wakes, skips again, and moves on a full period.
+        offset[0] += s["next_run"] - time.time() + 1
+        d.run_schedules()
+        s = p.db.one("SELECT * FROM schedules WHERE name='daily-review'")
+        assert s["last_status"].startswith("skipped: last run done 1."), s["last_status"]
+        assert _reviews(p) == [first] and s["next_run"] > time.time() + 86400 - 3600
     # The debounce counts from the run's end, not from skipped triggers: past it, the review runs.
     p.db.x("UPDATE runs SET ended=? WHERE task=?", (time.time() - 3 * 3600, first))
     _review_due(p)
