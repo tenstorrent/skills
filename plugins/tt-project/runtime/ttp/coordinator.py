@@ -1875,8 +1875,8 @@ _NEG_PERMIT_RE = re.compile(r"\b(?:not|never)\s+(?:be\s+)?(?:allowed|permitted|f
 _NO_LONGER_BANNED_RE = re.compile(r"\bno longer\s+(?:forbidden|prohibited|banned|off[- ]limits|restricted)\b", re.I)
 _FORBIDS_RE = re.compile(r"\b(?:never|do not|does not|must not|cannot|forbidden|prohibited|banned|no(?! longer\b))\b"
                          r"|\b(?:don|doesn|mustn|can)'t\b", re.I)
-_ALLOWS_RE = re.compile(r"\b(?:allowed|permitted|may|(?:is|are) fine|fine to|ok(?:ay)? to|lift(?:s|ed)?|can now|"
-                        r"no longer)\b", re.I)
+_ALLOWS_RE = re.compile(r"\b(?:allowed|permitted|may|(?:is|are)(?:\s+(?:also|still|now|again|just))*\s+(?:fine|ok(?:ay)?)|"
+                        r"fine to|ok(?:ay)? to|lift(?:s|ed)?|can now|no longer)\b", re.I)
 # For the lint (restriction_pairs), a permission inside a conditional clause ("where PRs are allowed",
 # "once allowed", "if ... is ever allowed") lifts nothing. Nor does one whose "only"/"alone" names who
 # may act ("Only the user may ...", "the user alone may ...", "allowed for the user only", "by the user
@@ -1909,7 +1909,11 @@ _LIMITED_PERMIT_RE = re.compile(
 # words skipped before it ("never directly push").
 _MAIN_VERB_RE = re.compile(r"\b(?:never|do not|does not|must not|cannot|(?:don|doesn|mustn|can)'t|no|may|can now|"
                            r"(?:allowed|permitted|fine|ok(?:ay)?) to)\s+((?:[\w-]+\s*(?:,|\bor\b|\band\b)?\s*)+)", re.I)
-_VERB_SKIP = {"ever", "again", "be", "a", "an", "the", "any", "longer", "even", "yet", "now", "also", "just", "still"}
+_VERB_SKIP = {"ever", "again", "be", "a", "an", "the", "any", "longer", "even", "yet", "now", "also", "just", "still",
+              # who acts, or who lets them, before the verb ("may workers push", "may let agents push")
+              "let", "worker", "workers", "agent", "agents", "i", "we", "you", "they"}
+# A passive helper verb ("may be done"): the action is the sentence's subject ("Pushing to main").
+_PASSIVE_VERBS = {"done", "performed", "carried", "made"}
 # An item that names its own exception ("except as the dated section allows") has been reconciled.
 _OWN_EXCEPTION_RE = re.compile(r"\b(?:except|unless|other than|apart from|save for|excluding)\b", re.I)
 # Actions, by what they do. A generic change ("modify", "write") covers every action that changes
@@ -1930,6 +1934,7 @@ def _same_action(a: set[str], b: set[str]) -> bool:
 
 # Words that name the rule, not its target.
 _STANCE_WORDS = {"allow", "permitt", "fine", "okay", "lift", "forbidden", "prohibit", "bann", "longer", "never",
+                 "off-limit",
                  "change", "work", "thing", "anything", "something", "everything", "user", "explicit", "word",
                  "directly", "ever", "any", "pull", "request", "requests",
                  # kinds of target: "the main branch" and "the release branch" share no target
@@ -1969,7 +1974,7 @@ def _main_verbs(sentence: str) -> set[str] | None:
             continue
         if w in ("pr", "prs", "pull"):
             return {"open"}
-        if not acts and (w in _STANCE_WORDS or _stem(w) in _STANCE_WORDS):
+        if not acts and (w in _STANCE_WORDS or _stem(w) in _STANCE_WORDS or w in _PASSIVE_VERBS):
             return None   # "is never allowed", "no longer forbidden": the stance, not a verb
         fam = _ACTIONS.get(_stem(w)) or _ACTIONS.get(w)
         if not fam:

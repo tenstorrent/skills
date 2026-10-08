@@ -4683,6 +4683,33 @@ def test_only_or_alone_is_a_limit_only_when_it_names_an_actor_so_a_scoped_lift_i
         assert lint(ban, text) == [], text
 
 
+def test_guard_flags_lifts_with_an_inverted_modal_a_passive_verb_is_fine_ok_or_no_action(env):
+    """The guard finds the action of a lift whose actor stands after the modal ("may workers push",
+    "may let workers push"), whose verb is a passive helper ("may be done"), whose permission is
+    "is also fine" or a bare "is OK", or that names no action at all ("Main is no longer
+    off-limits"). A lift of something else still passes."""
+    p = make(env)
+    from ttp import coordinator as coord
+    bans = "# demo\n\n## Restrictions\n- Never push to main.\n- Never open pull requests.\n"
+
+    def guard(text, turn):
+        p.charter_path.write_text(bans)
+        return coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": text}],
+                           turn=turn, user_turn=True)
+    for k, text in enumerate(("Only after the user approves may workers push to main.",
+                              "Only when the user says so may workers push to main.",
+                              "Pushing to main may be done only when the user says so.",
+                              "Pushing to main is also fine only after the user approves.",
+                              "Pushing to main is OK once the user approves.",
+                              "The user may let workers push to main.", "Main is no longer off-limits.")):
+        err = guard(text, 70 + k)
+        assert len(err) == 1 and "\"Never push to main.\" (section 'Restrictions')" in err[0], (text, err)
+        assert err[0].count("(section ") == 1, (text, err)
+    for k, text in enumerate(("Workers may push to their own branch.", "Release tags are OK once CI passes.",
+                              "The docs folder is no longer off-limits.", "Workers may run the tests.")):
+        assert guard(text, 90 + k) == [], text
+
+
 def test_charter_conflicts_show_in_the_digest_raise_effort_once_and_reach_the_daily_review(env):
     p = make(env)
     from ttp import coordinator as coord, daemon as dm
