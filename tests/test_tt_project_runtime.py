@@ -63,6 +63,62 @@ def _cached_find(real):
     return find
 
 
+# Every agent CLI a provider resolves (providers/*.py `binaries`). The env fixture puts stand-ins for
+# them first on PATH, and fails a test that resolves or starts one outside its own folder: a test that
+# reaches start_run with a real provider would otherwise start a real, billed agent.
+PROVIDER_BINARIES = ("claude", "codex", "agent", "cursor-agent")
+FAKE_PROVIDER = """#!/bin/sh
+# Stands in for an agent CLI in tests: no test ever starts a real one.
+[ "$1" = --version ] && echo "0.0.0 (test stand-in)"
+exit 0
+"""
+
+
+def _real_provider(argv, env, allowed: pathlib.Path) -> str | None:
+    """The agent CLI outside `allowed` that argv would start or names, else None."""
+    first = argv if isinstance(argv, (str, bytes, os.PathLike)) else (argv[0] if argv else "")
+    first = os.fsdecode(first)
+    if os.path.basename(first) not in PROVIDER_BINARIES:
+        return None
+    path = first if os.sep in first else shutil.which(first, path=(env or os.environ).get("PATH"))
+    if not path or not os.path.isfile(path):
+        return None
+    real = os.path.realpath(path)
+    return None if real.startswith(os.path.realpath(allowed) + os.sep) else real
+
+
+def _no_real_providers(tmp_path, monkeypatch) -> list:
+    """Stand-ins for every agent CLI first on PATH, and guards that record (and for Popen, refuse) a
+    real one being resolved or started. Returns the list of what was caught."""
+    fake_bin = tmp_path / "provider-bin"
+    fake_bin.mkdir()
+    for name in PROVIDER_BINARIES:
+        (fake_bin / name).write_text(FAKE_PROVIDER)
+        (fake_bin / name).chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}")
+    caught: list = []
+    real_popen = subprocess.Popen
+
+    class NoRealProvider(real_popen):
+        def __init__(self, args, *a, **kw):
+            bad = _real_provider(args, kw.get("env"), tmp_path)
+            if bad:
+                caught.append(f"started {bad}")
+                raise AssertionError(f"a test started a real agent CLI: {bad}")
+            super().__init__(args, *a, **kw)
+    monkeypatch.setattr(subprocess, "Popen", NoRealProvider)
+    from ttp.providers import base
+    real_find = base.find_binary
+
+    def find_binary(*names):
+        got = real_find(*names)
+        if got and _real_provider([got], None, tmp_path):
+            caught.append(f"resolved {got}")
+        return got
+    monkeypatch.setattr(base, "find_binary", find_binary)
+    return caught
+
+
 @pytest.fixture(scope="session")
 def _git_session(tmp_path_factory):
     """Made once per session: the starting repository each test copies, and an object store holding
@@ -155,8 +211,10 @@ def env(tmp_path, monkeypatch, _git_session):
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(_git_session["config"]))
     repo = tmp_path / "repo"   # a git repository with one commit of README.md
     shutil.copytree(_git_session["repo"], repo, symlinks=True)
-    yield {"home": home, "repo": repo, "tmp": tmp_path}
+    real_agents = _no_real_providers(tmp_path, monkeypatch)
+    yield {"home": home, "repo": repo, "tmp": tmp_path, "real_agents": real_agents}
     sys.path.remove(str(RUNTIME))
+    assert not real_agents, f"a test reached a real agent CLI: {real_agents}"
 
 
 def make(env, name="demo"):
@@ -28119,3 +28177,33 @@ def test_ttp_killscan_exits_1_on_a_hit_and_its_shims_kill_nothing(env, tmp_path)
     assert "pkill -u " + os.environ.get("USER", "") + " -f ttp-killscan-none" in log, log
     assert "killall ttp-killscan-none" in log and "pgrep -f ttp-killscan-none" in log and \
         "pidof ttp-killscan-none" in log, log
+
+
+def test_no_test_resolves_or_starts_a_real_agent_cli(env, tmp_path_factory):
+    p = make(env)
+    from ttp.daemon import Daemon
+    from ttp.providers import get_provider
+    fakes = env["tmp"] / "provider-bin"
+    for name in ("claude", "codex", "cursor"):
+        assert pathlib.Path(get_provider(name).binary()).parent == fakes, name
+    d = Daemon(p.base)
+    tid = p.db.add_task("t", "s", kind="code", tier="light", origin="user")
+    for name in ("claude", "codex", "cursor"):
+        rid = d.start_run("worker", "go", name, "light", str(p.root), task=p.db.task(tid))
+        (p.runs / str(rid) / "STOP").touch()
+        argv = json.loads((p.runs / str(rid) / "run.json").read_text())["argv"]
+        assert pathlib.Path(argv[0]).parent == fakes, (name, argv[0])
+    # The guards catch a real one, wherever a test would reach it from.
+    elsewhere = tmp_path_factory.mktemp("elsewhere")
+    real = elsewhere / "claude"
+    real.write_text(FAKE_PROVIDER)
+    real.chmod(0o755)
+    with pytest.raises(AssertionError, match="real agent CLI"):
+        subprocess.run([str(real), "--version"], capture_output=True)
+    with pytest.raises(AssertionError, match="real agent CLI"):
+        subprocess.Popen(["claude"], env={"PATH": str(elsewhere)})
+    from ttp.providers import base
+    os.environ["PATH"] = f"{elsewhere}{os.pathsep}{os.environ['PATH']}"
+    assert base.find_binary("claude") == str(real)
+    assert len(env["real_agents"]) == 3 and env["real_agents"][-1] == f"resolved {real}"
+    env["real_agents"].clear()   # caught on purpose
