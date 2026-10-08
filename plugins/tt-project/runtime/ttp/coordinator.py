@@ -1873,16 +1873,27 @@ _FORBIDS_RE = re.compile(r"\b(?:never|do not|does not|must not|cannot|forbidden|
 _ALLOWS_RE = re.compile(r"\b(?:allowed|permitted|may|(?:is|are) fine|fine to|ok(?:ay)? to|lift(?:s|ed)?|can now|"
                         r"no longer)\b", re.I)
 # A permission inside a conditional clause ("where PRs are allowed", "once allowed", "if ... is ever
-# allowed") or limited to a condition ("allowed only on the user's word", "may only ...") or to who
-# may act ("Only the user may ...", "the user alone may ...", "allowed for the user only", "by the
-# user alone") lifts nothing.
+# allowed") lifts nothing. Nor does one whose "only"/"alone" names who may act ("Only the user may
+# ...", "the user alone may ...", "allowed for the user only", "by the user alone") or whose word it
+# waits for ("lifted only on the user's word", "may only be lifted by the user"). Any other
+# "only"/"alone" scopes a lift and leaves it one ("allowed for hotfixes only", "Only pushing to main
+# is allowed", "main alone", "allowed only for hotfixes"): when in doubt, flag.
 _PERMIT = r"(?:allowed|permitted|lift(?:s|ed)?|may|fine|ok(?:ay)?)"
 _CONDITIONAL_PERMIT_RE = re.compile(r"\b(?:where|once|if|when|whenever|until|unless|provided|as long as)\b"
                                     rf"[^,.;:!?()]*?\b{_PERMIT}\b", re.I)
-_LIMITED_PERMIT_RE = re.compile(rf"\b{_PERMIT}\s+(?:be\s+)?only\b|\bonly\s+(?:be\s+)?{_PERMIT}\b"
-                                rf"|(?:^|(?<=[,;:]))\s*only\b[^,.;:!?()]*\b{_PERMIT}\b"
-                                rf"|\balone\b[^,.;:!?()]*\b{_PERMIT}\b"
-                                rf"|\b{_PERMIT}\b[^,.;:!?()]*?\b(?:only|alone)\s*(?=[,.;:!?()]|$)", re.I)
+# An actor: a pronoun or a generic actor noun, after at most a determiner or possessive. A closed
+# list, so a gerund, an action or a scope ("pushing", "release tags", "the docs repo") is never one.
+_ACTOR = (r"(?:(?:the|a|an|this|that|these|those|our|your|their|my|its)\s+)?(?:i|we|you|they|me|us|them|"
+          r"(?:user|owner|maintainer|human|admin|operator|coordinator|reviewer|team|lead)s?)(?![\w-])")
+_ACTORS = rf"{_ACTOR}(?:\s+or\s+{_ACTOR})*"
+_IN_CLAUSE = r"(?:(?!\b(?:and|but)\b)[^,.;:!?()])*?"   # words of one clause: no stop, no "and"/"but"
+_LIMITED_PERMIT_RE = re.compile(
+    rf"(?:\bonly\s+{_ACTORS}(?!['’])|\b{_ACTORS}\s+alone)\s+(?:(?:is|are|can)\s+)?{_PERMIT}\b"
+    rf"(?:{_IN_CLAUSE}\b{_PERMIT}\b)*"
+    rf"|\b{_PERMIT}\b{_IN_CLAUSE}\b(?:by|for)\s+{_ACTORS}\s+(?:only|alone)\b"
+    rf"|\b(?:{_PERMIT}\b{_IN_CLAUSE}\bonly\s+(?:be\s+)?(?:{_PERMIT}\s+)?|only\s+(?:be\s+)?{_PERMIT}\s+)"
+    rf"(?:(?:on|upon|with)\s+{_ACTORS}['’]s?(?!\w)|(?:after|when|if|once)\s+{_ACTORS}"
+    rf"|(?:by|for|to)\s+{_ACTORS}(?=\s*(?:[,.;:!?()]|\b(?:and|but)\b|$)))", re.I)
 # The words after which a rule's main verb comes ("never push", "may run", "allowed to merge"), and
 # words skipped before it ("never directly push").
 _MAIN_VERB_RE = re.compile(r"\b(?:never|do not|does not|must not|cannot|(?:don|doesn|mustn|can)'t|no|may|can now|"

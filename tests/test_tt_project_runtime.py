@@ -4612,6 +4612,44 @@ def test_restriction_pairs_flags_contradicting_restrictions_items_and_only_those
         assert pairs(body) == [], body
 
 
+def test_only_or_alone_is_a_limit_only_when_it_names_an_actor_so_a_scoped_lift_is_flagged(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    bans = "# demo\n\n## Restrictions\n- Never push to main.\n- Never open pull requests.\n- Never use a paused device.\n"
+
+    def lint(ban, text):
+        return [(x["forbid"], x["allow"]) for x in
+                coord.restriction_pairs(f"# demo\n\n## Restrictions\n- {ban}\n- {text}\n")]
+
+    def guard(text, turn):
+        p.charter_path.write_text(bans)
+        return coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": text}],
+                           turn=turn, user_turn=True)
+    # "only"/"alone" on a scope (hotfixes, release tags, the docs repo, pushing, main, the device), in
+    # either word order, or across "and", leaves a lift a lift: the guard rejects it quoting the ban
+    # it contradicts, and the lint pairs the two.
+    for k, (ban, text) in enumerate([("Never push to main.", t) for t in (
+            "Pushing to main is allowed for hotfixes only.", "Workers may push to main for release tags only.",
+            "Only pushing to main is allowed.", "Pushing to main alone is allowed.",
+            "Leave the device alone and workers may push to main.", "Pushing to main is allowed only for hotfixes.",
+            "Pushing to main is only allowed for hotfixes.", "Main alone may be pushed to.",
+            "Only the user and workers may push to main.", "Leave the user alone and workers may push to main.")]
+            + [("Never open pull requests.", "Draft pull requests are allowed for the docs repo only.")]):
+        err = guard(text, 10 + k)
+        assert len(err) == 1 and f"\"{ban}\" (section 'Restrictions')" in err[0], (text, err)
+        assert err[0].count("(section ") == 1, (text, err)
+        assert lint(ban, text) == [(ban, text)], text
+    # "only"/"alone" naming who may act, or whose word the permission waits for, is a limit: neither.
+    for k, (ban, text) in enumerate([("Never push to main.", t) for t in (
+            "Only the user or a maintainer may push to main.", "Only the user is allowed to push to main.",
+            "Main may be pushed to by maintainers alone.", "Pushing to main is only allowed for maintainers.",
+            "Pushing to main is allowed only when the user says so.")]
+            + [("Never use a paused device.", t) for t in (
+            "Device pauses may only be lifted by the user.", "Device pauses are only lifted on the user’s word.")]):
+        assert guard(text, 40 + k) == [], text
+        assert lint(ban, text) == [], text
+
+
 def test_charter_conflicts_show_in_the_digest_raise_effort_once_and_reach_the_daily_review(env):
     p = make(env)
     from ttp import coordinator as coord, daemon as dm
