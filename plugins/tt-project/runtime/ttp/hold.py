@@ -86,18 +86,19 @@ def keep(run_dir: Path, spec: dict, held: list, wanted: list[dict], inherited: l
         return None
     env = spec.get("env") or {}
     task, run = str(env.get("TTP_TASK") or "?"), str(env.get("TTP_RUN_ID") or Path(run_dir).name)
-    holder = (wanted[0].get("holder") if wanted else None) or f"task #{task}"
     lock = locks.try_take([Path(run_dir) / LIVE], f"keeper of run {run}")
     if lock is None:
         return None
-    lbl = label(holder, run)
-    for f in held:   # the same open file: relabelled, never let go
+    resources = []
+    for w, f in zip(wanted, held):   # the same open file: relabelled, never let go
+        holder = w.get("holder") or f"task #{task}"   # a shared resource's names the project too
+        resources.append({"resource": w.get("resource"), "path": f.name, "holder": holder,
+                          "label": label(holder, run)})
         f.seek(0)
         f.truncate()
-        f.write(json.dumps({"holder": lbl, "since": time.time(), "command": LABEL}))
+        f.write(json.dumps({"holder": label(holder, run), "since": time.time(), "command": LABEL}))
         f.flush()
-    rec = {"task": task, "run": run, "holder": holder, "label": lbl, "since": time.time(), "state": "holding",
-           "resources": [{"resource": w.get("resource"), "path": f.name} for w, f in zip(wanted, held)],
+    rec = {"task": task, "run": run, "since": time.time(), "state": "holding", "resources": resources,
            "jobs": jobs}
     _write(run_dir, rec)
     Path(registry).mkdir(parents=True, exist_ok=True)
@@ -130,8 +131,8 @@ def take_over(registry: str | None, holder: str, resource: str, run: str) -> lis
         except (OSError, ValueError, KeyError, TypeError):
             continue
         rec = read(rd)
-        if not rec or rec.get("state") != "holding" or rec.get("holder") != holder \
-                or resource not in {r.get("resource") for r in rec.get("resources") or []}:
+        if not rec or rec.get("state") != "holding" or not any(
+                r.get("resource") == resource and r.get("holder") == holder for r in rec.get("resources") or []):
             continue
         if not (rd / HANDOVER).exists():
             durable_write(rd / HANDOVER, run)
@@ -197,7 +198,7 @@ def tend(registry: Path) -> list[dict]:
                 lock.close()
                 _settle(rd, rec, "released", "released: its detached jobs ended while no keeper ran")
             else:
-                slots = [locks.try_take([Path(r["path"])], rec.get("label") or LABEL, LABEL)
+                slots = [locks.try_take([Path(r["path"])], r.get("label") or LABEL, LABEL)
                          for r in rec.get("resources") or []]
                 if all(slots):
                     try:
