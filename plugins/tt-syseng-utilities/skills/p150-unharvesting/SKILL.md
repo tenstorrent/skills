@@ -49,11 +49,11 @@ Not for P100, P300, Galaxy: core math differs.
 ## 0. Environment
 
 - Activate tt-metal's `python_env`.
-- No `pip` in the venv: use `uv pip`.
+- Venv has no `pip`. Use `uv pip`.
 
 ```bash
 LOG_DIR=${LOG_DIR:-~/logs}; mkdir -p "$LOG_DIR"
-pip install tt-update-tensix-disable-count
+uv pip install tt-update-tensix-disable-count
 tt-flash --version          # need >= 3.6.0
 ```
 
@@ -61,10 +61,10 @@ Patch tool needs `protoc`. If `which protoc` is empty:
 
 ```bash
 PIN=$(grep -E '^protobuf==' <tt-metal>/tt_metal/python_env/requirements-dev.txt)
-pip install grpcio-tools "$PIN"
+uv pip install grpcio-tools "$PIN"
 B=$VIRTUAL_ENV/bin
 [ -e "$B/protoc" ] || { printf '#!/bin/sh\nexec "%s/python" -m grpc_tools.protoc "$@"\n' "$B" > "$B/protoc"; chmod +x "$B/protoc"; }
-pip check
+uv pip check
 ```
 
 - MUST pass the protobuf pin.
@@ -102,14 +102,21 @@ N=0             # 0 = 140 cores, 1 = 130, 2 = 120
 IN=~/fw_pack-$VER.fwbundle
 OUT=~/fw_pack-$VER-dc$N.fwbundle
 L=$LOG_DIR/tensix_dc${N}_${VER}_$(date +%Y%m%d_%H%M%S).log
-[ -e "$OUT" ] && echo "exists, not overwriting: $OUT" || \
-tt-update-tensix-disable-count --input "$IN" --output "$OUT" \
-  --board P150A-1 --board P150B-1 --board P150C-1 \
-  --disable-count $N --verbose 2>&1 | tee "$L" > /dev/null
-grep -E 'Processing|Current|Updated|Verified|rror' "$L"
+set -o pipefail
+if [ -e "$OUT" ]; then
+  echo "exists, not patching: $OUT"
+else
+  tt-update-tensix-disable-count --input "$IN" --output "$OUT" \
+    --board P150A-1 --board P150B-1 --board P150C-1 \
+    --disable-count $N --verbose 2>&1 | tee "$L" > /dev/null \
+    || { echo "patch FAILED, see $L"; rm -f "$OUT"; }
+  grep -E 'Processing|Current|Updated|Verified|rror' "$L"
+fi
 python $SKILL_DIR/scripts/read_fwbundle_harvesting.py "$OUT"
 ```
 
+- Patch failed: stop.
+- `$OUT` existed: flash only if reader shows count `N`.
 - No `--board`: patches every board, not only P150.
 - Per board expect `Current` -> `Updated ... N` -> `Verified ... N`.
 - Output is not byte-identical across runs. Expected.
@@ -117,15 +124,25 @@ python $SKILL_DIR/scripts/read_fwbundle_harvesting.py "$OUT"
 ## 4. Flash (user confirmation first)
 
 ```bash
-pgrep -af 'pytest|ttnn|tt_metal|tt-smi'     # must be empty
+# processes holding a device open; must print nothing
+for p in /proc/[0-9]*; do ls -l $p/fd 2>/dev/null | grep -q /dev/tenstorrent \
+  && echo "${p#/proc/} $(tr '\0' ' ' < $p/cmdline)"; done
 L=$LOG_DIR/tt-flash_$(date +%Y%m%d_%H%M%S).log
-tt-flash flash --force "$OUT" 2>&1 | tee "$L" > /dev/null
+set -o pipefail
+tt-flash flash --force "$OUT" 2>&1 | tee "$L" > /dev/null; echo rc=$?
 tail -5 "$L"; grep -cE 'Firmware verification.*SUCCESS' "$L"
 ```
 
+- Busy check sees only your processes without root.
+- Run it with `sudo` or ask user to confirm idle.
+- Any device user listed: stop.
+- Flash passes only if all three hold:
+  - `rc=0`.
+  - `FLASH SUCCESS` in log.
+  - One verification line per chip.
+- Any fails: stop, do not validate, tell the user.
 - `--force` needed for same version or downgrade.
 - tt-flash resets all chips itself.
-- Expect `FLASH SUCCESS` and one verification line per chip.
 - "does not say which hardware it supports": warning only.
 
 ## 5. Validate
@@ -139,7 +156,8 @@ grep -E '__main__' "$L"
 
 - Opens full mesh; one 1x1 submesh per device.
 - Fails unless worker grid is `(14 - N - 1) x 10`.
-- Fails unless 8 DRAM cores per device.
+- Fails unless DRAM grid is `8 x 1`.
+- Both scripts fail when no chip or device found.
 - Old count after `FLASH SUCCESS`: run `tt-smi -r`.
 - Still wrong: stop, tell the user.
 

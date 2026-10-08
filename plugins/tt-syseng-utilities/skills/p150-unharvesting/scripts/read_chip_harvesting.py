@@ -6,7 +6,7 @@ Uses pyluwen (ships with tt-smi / tt-flash and with tt-metal's python_env). Repo
 what the running firmware enabled, which is what tt-metal will see on the next open.
 
 Usage: read_chip_harvesting.py [--expect-disable-count N]
-Exit code 1 if --expect-disable-count is given and any chip disagrees.
+Exit code 1 if no chip is found, or if --expect-disable-count is given and any chip disagrees.
 """
 
 import argparse
@@ -27,8 +27,12 @@ def main():
     ap.add_argument("--expect-disable-count", type=int, help="fail unless every chip matches")
     args = ap.parse_args()
 
+    chips = pyluwen.detect_chips()
+    if not chips:
+        print("no chips found")
+        sys.exit(1)
     ok = True
-    for i, chip in enumerate(pyluwen.detect_chips()):
+    for i, chip in enumerate(chips):
         t = chip.get_telemetry()
         cols = bin(t.tensix_enabled_col).count("1")
         disable = P150_TENSIX_COLUMNS - cols

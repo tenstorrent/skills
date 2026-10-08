@@ -8,7 +8,7 @@ P150 device against the expected grid:
   worker grid = (14 - N - 1) x 10   # Blackhole's default dispatch takes one Tensix column
   dram grid   = 8 x 1               # P150 has 8 DRAM channels
 
-Exit code 1 on any mismatch.
+Exit code 1 on any mismatch or when no device is found.
 """
 
 import argparse
@@ -20,7 +20,7 @@ from loguru import logger
 P150_TENSIX_COLUMNS = 14
 ROWS_PER_COLUMN = 10
 DISPATCH_COLUMNS = 1
-P150_DRAM_CHANNELS = 8
+P150_DRAM_GRID = (8, 1)
 
 
 def main():
@@ -34,10 +34,12 @@ def main():
 
     mesh_device = ttnn.open_mesh_device()
     ok = True
+    num_devices = 0
     try:
         logger.info(f"mesh shape {mesh_device.shape}, {mesh_device.get_num_devices()} devices")
         # A mesh reports one grid for all its devices; a 1x1 submesh per device gives per-device values.
         for submesh in mesh_device.create_submeshes(ttnn.MeshShape(1, 1)):
+            num_devices += 1
             device_id = submesh.get_device_ids()[0]
             worker = submesh.compute_with_storage_grid_size()
             dram = submesh.dram_grid_size()
@@ -49,13 +51,17 @@ def main():
                 if (worker.x, worker.y) != expected_worker:
                     logger.error(f"device {device_id}: expected worker grid {expected_worker[0]}x{expected_worker[1]}")
                     ok = False
-                if dram.x * dram.y != P150_DRAM_CHANNELS:
-                    logger.error(f"device {device_id}: expected {P150_DRAM_CHANNELS} dram cores")
+                if (dram.x, dram.y) != P150_DRAM_GRID:
+                    logger.error(f"device {device_id}: expected dram grid {P150_DRAM_GRID[0]}x{P150_DRAM_GRID[1]}")
                     ok = False
     finally:
         ttnn.close_mesh_device(mesh_device)
 
-    if expected_worker is not None:
+    if num_devices == 0:
+        logger.error("no devices found")
+        ok = False
+
+    if expected_worker is not None or not ok:
         logger.info("PASS" if ok else "FAIL")
     sys.exit(0 if ok else 1)
 
