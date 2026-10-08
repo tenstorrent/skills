@@ -29794,3 +29794,33 @@ def test_every_push_checks_call_site_fails_a_masked_failure(env, tmp_path, monke
     with pytest.raises(SystemExit):
         cli.main(["checks"])
     assert json.loads((crun / "checks.json").read_text())["passed"] is False
+
+
+def test_daily_review_target_line_reads_the_last_pushed_batch_reach(env, tmp_path):
+    from ttp import pushq
+    from ttp.db import DB
+    db = DB(tmp_path / "t.db")
+    assert pushq.target_line(db) is None   # nothing pushed yet
+
+    def batch(i, reach, marker=True, started=1.0):
+        m = tmp_path / f"{i}.json"
+        if marker:
+            m.write_text(json.dumps({"reach": reach} if reach is not None else {}))
+        db.x("INSERT INTO push_batches(id,marker,target,started,ended,finalized,outcome,pushed_sha) "
+             "VALUES(?,?,?,?,?,?,'pushed','ab12345')", (i, str(m), "origin/proj", started, started, started))
+
+    batch("none", None)   # same branch: push.reach recorded nothing
+    assert pushq.target_line(db) is None
+    batch("gone", {"ref": "origin/main", "on": False, "behind": 2}, marker=False, started=2.0)
+    assert pushq.target_line(db) is None
+    batch("behind", {"ref": "origin/main", "on": False, "behind": 4}, started=3.0)
+    assert pushq.target_line(db) == ("Intended target origin/main is 4 commits behind origin/proj "
+                                     "(as of the last push, 1970-01-01 00:00Z)")
+    batch("one", {"ref": "origin/main", "on": False, "behind": 1}, started=4.0)
+    assert "is 1 commit behind" in pushq.target_line(db)
+    batch("on", {"ref": "origin/main", "on": True, "behind": 0}, started=5.0)
+    assert "origin/main is up to date with origin/proj" in pushq.target_line(db)
+    batch("unread", {"ref": "origin/main", "on": None, "behind": None}, started=6.0)
+    assert pushq.target_line(db).startswith("Intended target origin/main could not be read at the last push")
+    batch("same", {"ref": "origin/proj", "on": True, "behind": 0}, started=7.0)
+    assert pushq.target_line(db) is None

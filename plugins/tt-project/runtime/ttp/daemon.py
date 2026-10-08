@@ -2418,6 +2418,13 @@ class Daemon:
                 spec += "\n\nUnblocking quality:\n" + "\n".join(f"- {line}" for line in unblock.lines(db))
             except Exception as e:   # a metric must not keep the review from starting
                 log(self.p, f"unblocking metrics failed: {type(e).__name__}: {e}")
+        if s["name"] == "daily-review":
+            try:
+                line = pushq.target_line(db)
+                if line:
+                    spec += f"\n\nDelivery: {line}."
+            except Exception as e:   # nor must a missing or broken push marker
+                log(self.p, f"intended target line failed: {type(e).__name__}: {e}")
         with db.tx():   # the evidence is the state at enqueue: what changes during the run stays new
             tid = db.add_task(f"[{s['name']}] {s['description'][:120] or 'recurring task'}", spec,
                               kind=payload.get("kind", "work"), tier=payload.get("tier", "standard"),

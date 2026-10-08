@@ -158,6 +158,24 @@ def _landing(row: dict, target: str, reach: dict | None) -> str:
     return f"already on {target} at {_short(row['pushed_sha'])}" + push.reach_words(reach)
 
 
+def target_line(db) -> str | None:
+    """The daily review's line on how far the intended target (delivery.base_ref) is behind the push
+    branch, from the reach the last pushed batch recorded in its marker: no git, no model. None when
+    no batch recorded a reach (the branches are the same, no marker, or nothing pushed yet)."""
+    row = db.one("SELECT id, target, ended, started FROM push_batches WHERE outcome IN ('pushed','landed') "
+                 "ORDER BY started DESC LIMIT 1")
+    r = _reach(db, row["id"]) if row else None
+    if not r or not r.get("ref") or r["ref"] == row["target"]:
+        return None
+    when = time.strftime("%Y-%m-%d %H:%MZ", time.gmtime(row["ended"] or row["started"]))
+    if r.get("on") is None:
+        return f"Intended target {r['ref']} could not be read at the last push to {row['target']} ({when})"
+    n = r.get("behind") if not r.get("on") else 0
+    what = (f"is {n} commit{'s' if n != 1 else ''} behind" if isinstance(n, int) and n > 0
+            else "is not yet up to date with" if not r.get("on") else "is up to date with")
+    return f"Intended target {r['ref']} {what} {row['target']} (as of the last push, {when})"
+
+
 # approval -----------------------------------------------------------------------------------------
 def _commit(p: Project, ref: str) -> str:
     r = _git(p, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
