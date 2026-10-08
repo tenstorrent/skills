@@ -1,0 +1,37 @@
+{
+  "name": "tt-syseng-utilities",
+  "version": "0.1.0",
+  "description": "System-engineering utilities for Tenstorrent hosts: firmware and harvesting inspection, patching, flashing and validation. Includes P150 Tensix unharvesting.",
+  "author": {
+    "name": "Tenstorrent"
+  },
+  "homepage": "https://github.com/tenstorrent/skills",
+  "repository": "https://github.com/tenstorrent/skills",
+  "license": "Apache-2.0",
+  "keywords": [
+    "tenstorrent",
+    "blackhole",
+    "p150",
+    "firmware",
+    "harvesting",
+    "syseng"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Tenstorrent SysEng Utilities",
+    "shortDescription": "System-engineering utilities for Tenstorrent hosts: firmware and harvesting inspection, patching, flashing and validation. Includes P150 Tensix unharvesting.",
+    "longDescription": "System-engineering utilities for Tenstorrent hosts. One skill per task. p150-unharvesting: read, patch, flash and verify the Tensix column disable count on Blackhole P150 cards. Flashing needs user confirmation.",
+    "developerName": "Tenstorrent",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Firmware bundle inspection",
+      "Tensix disable count patching",
+      "Firmware flashing",
+      "Core count validation"
+    ],
+    "websiteURL": "https://github.com/tenstorrent/skills",
+    "defaultPrompt": [
+      "Unharvest the P150 cards on this host to 140 Tensix cores."
+    ]
+  }
+}
