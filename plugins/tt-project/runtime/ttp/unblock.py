@@ -7,7 +7,11 @@ Stuck time: an episode starts when a task is handed off blocked, waiting or for 
 task behind a dead dependency is set blocked too) and ends when the task next moves forward: a run
 of it starts (a blocked or review task only; a waiting task's wakes keep waiting), it is done,
 failed, requeued or pushed, or its status left the stuck state (cancelled, re-pointed). Consecutive
-stuck hand-offs are one episode. An episode still open counts with its age so far.
+stuck hand-offs are one episode; its per-state intervals (blocked, then review, ...) are reported
+apart from the whole episode, so time in one state is not the episode's full age. Episodes and
+intervals are a start cohort (started in the window; an open one counts with its age so far). What
+is stuck now, whenever it started, is the inventory, reported on its own; a stuck task without the
+history to date it shows its age as unknown, never as zero.
 
 Waits are self or external (classify_wait). A self-wait is the task's own progress: its detached
 `ttp checks` or `ttp detach` jobs, the push queue, or a time window it planned itself. It neither
@@ -63,6 +67,9 @@ PLANNED_WINDOW = re.compile(
     r"|\b(window|period|delay)\s+(it|I|the task|this task|we)\s+(set|planned|chose)\b"
     r"|\bstart_(after|when)\b", re.I)
 WAIT_KINDS = ("self", "external")
+# kv: when this project's daemon first ran a release that logs escalations and their refusals with
+# timestamps (rerun turns' notes, `rejected_actions` events); a window starting earlier is not covered.
+ESCALATION_LOG_KEY = "escalation_log_since"
 LIVE_WAITS_MAX = 6   # coordinator.live_waits_max: waits on the same live jobs or locks in 24 h that stay routine
 _SHELL_OPS = frozenset({"&&", "||", ";", "|", "&"})
 # A cheap wake that found work and runs again at once: the same wait going on, never a new one.
@@ -263,47 +270,101 @@ def _pct(sorted_vals: list[float], q: float) -> float:
     return sorted_vals[k]
 
 
-def episodes(db: DB, since: float, now: float | None = None) -> list[dict]:
-    """Stuck episodes that started at or after `since`: {task, title, kind, start, end, open, s}."""
-    now = time.time() if now is None else now
+def _task_episodes(db: DB, task: dict, now: float) -> list[dict]:
+    """Every stuck episode of one task, oldest first: {task, title, kind, start, [end], open, s, segments}.
+    `segments` are its per-state intervals ({kind, start, [end], open, s}): a blocked task that goes
+    to review and then waits is one episode of three segments. `kind` is the episode's one state, or
+    "mixed" when it changed state."""
+    tid = task["id"]
     kinds = tuple(STUCK) + tuple(MOVED)
+    # A self-wait is the task moving on: it ends a waiting episode and starts none.
+    marks = [(e["ts"], "self_wait" if e["kind"] == "task_waiting" and is_self_wait(e["data"]) else e["kind"])
+             for e in db.q(f"SELECT ts, kind, data FROM events WHERE task=? AND kind IN "
+                           f"({','.join('?' * len(kinds))})", (tid, *kinds))]
+    marks += [(r["started"], "run") for r in db.q(
+        "SELECT started FROM runs WHERE task=? AND role!='coordinator' AND started IS NOT NULL", (tid,))]
+    marks.sort()
+    out: list[dict] = []
+    ep: dict | None = None
+    for ts, kind in marks:
+        if kind in STUCK:
+            if ep is None:
+                ep = {"task": tid, "title": task["title"], "start": ts, "segments": []}
+            if not ep["segments"] or ep["segments"][-1]["kind"] != STUCK[kind]:
+                if ep["segments"]:
+                    ep["segments"][-1]["end"] = ts
+                ep["segments"].append({"kind": STUCK[kind], "start": ts})
+        elif ep and (kind in MOVED or (kind == "self_wait" and ep["segments"][-1]["kind"] == "waiting")
+                     or (kind == "run" and ep["segments"][-1]["kind"] != "waiting")):
+            ep["end"] = ts
+            out.append(ep)
+            ep = None
+    if ep:
+        status, upd = task["status"], float(task["updated"] or 0)
+        mode = ep["segments"][-1]["kind"]
+        left = status in ENDED or (mode != "waiting" and status not in ("blocked", "review"))
+        if left and upd >= ep["start"]:
+            ep["end"] = upd
+        out.append(ep)
+    for ep in out:
+        if "end" in ep:
+            ep["segments"][-1]["end"] = ep["end"]
+        for x in (ep, *ep["segments"]):
+            x["open"] = "end" not in x
+            x["s"] = max(0.0, (now if x["open"] else x["end"]) - x["start"])
+        states = {x["kind"] for x in ep["segments"]}
+        ep["kind"] = states.pop() if len(states) == 1 else "mixed"
+    return out
+
+
+def _stuck_since(db: DB, since: float, now: float) -> list[dict]:
+    """Every episode of each task with a stuck hand-off at or after `since` (each interval starts with one)."""
     ids = [r["task"] for r in db.q(
         f"SELECT DISTINCT task FROM events WHERE task IS NOT NULL AND ts>=? AND kind IN "
         f"({','.join('?' * len(STUCK))})", (since, *STUCK))]
     out: list[dict] = []
     for tid in ids:
         task = db.task(tid)
-        if not task:
-            continue
-        # A self-wait is the task moving on: it ends a waiting episode and starts none.
-        marks = [(e["ts"], "self_wait" if e["kind"] == "task_waiting" and is_self_wait(e["data"]) else e["kind"])
-                 for e in db.q(f"SELECT ts, kind, data FROM events WHERE task=? AND kind IN "
-                               f"({','.join('?' * len(kinds))})", (tid, *kinds))]
-        marks += [(r["started"], "run") for r in db.q(
-            "SELECT started FROM runs WHERE task=? AND role!='coordinator' AND started IS NOT NULL", (tid,))]
-        marks.sort()
-        ep: dict | None = None
-        for ts, kind in marks:
-            if kind in STUCK:
-                if ep is None:
-                    ep = {"task": tid, "title": task["title"], "kind": STUCK[kind], "start": ts, "mode": STUCK[kind]}
-                ep["mode"] = STUCK[kind]
-            elif ep and (kind in MOVED or (kind == "self_wait" and ep["mode"] == "waiting")
-                         or (kind == "run" and ep["mode"] != "waiting")):
-                ep["end"] = ts
-                out.append(ep)
-                ep = None
-        if ep:
-            status, upd = task["status"], float(task["updated"] or 0)
-            left = status in ENDED or (ep["mode"] != "waiting" and status not in ("blocked", "review"))
-            if left and upd >= ep["start"]:
-                ep["end"] = upd
-            out.append(ep)
-    for ep in out:
-        ep["open"] = "end" not in ep
-        ep["s"] = max(0.0, (ep["end"] if not ep["open"] else now) - ep["start"])
-        ep.pop("mode", None)
-    return [ep for ep in out if ep["start"] >= since]
+        if task:
+            out += _task_episodes(db, task, now)
+    return out
+
+
+def episodes(db: DB, since: float, now: float | None = None) -> list[dict]:
+    """Stuck episodes that started at or after `since` (a start cohort; see _task_episodes). An open
+    one counts with its full age so far; what is stuck now, whenever it started, is inventory()."""
+    now = time.time() if now is None else now
+    return [ep for ep in _stuck_since(db, since, now) if ep["start"] >= since]
+
+
+def intervals(db: DB, since: float, now: float | None = None) -> list[dict]:
+    """Per-state intervals that started at or after `since`, whenever their episode started, each with
+    its task and title: time in one state, not the episode's whole age."""
+    now = time.time() if now is None else now
+    return [{**seg, "task": ep["task"], "title": ep["title"]}
+            for ep in _stuck_since(db, since, now) for seg in ep["segments"] if seg["start"] >= since]
+
+
+def inventory(db: DB, now: float | None = None) -> list[dict]:
+    """Tasks stuck now, whenever they got stuck: {task, title, kind (its status), state_s (time in
+    that state, None when unknown), stuck_s (the whole open episode, None when unknown)}. A waiting
+    task whose latest wait is its own work (a self-wait) is not stuck. Without stuck history (pruned,
+    or from a release that logged none) its ages are unknown, never zero."""
+    now = time.time() if now is None else now
+    out = []
+    for task in db.q("SELECT * FROM tasks WHERE status IN ('blocked','waiting','review') ORDER BY id"):
+        eps = _task_episodes(db, task, now)
+        ep = eps[-1] if eps and eps[-1]["open"] else None
+        if ep is None and task["status"] == "waiting":
+            last = db.one("SELECT data FROM events WHERE task=? AND kind='task_waiting' ORDER BY ts DESC, id DESC "
+                          "LIMIT 1", (task["id"],))
+            if last and is_self_wait(last["data"]):
+                continue
+        seg = ep["segments"][-1] if ep else None
+        out.append({"task": task["id"], "title": task["title"], "kind": task["status"],
+                    "state_s": seg["s"] if seg and seg["kind"] == task["status"] else None,
+                    "stuck_s": ep["s"] if ep else None})
+    return out
 
 
 def self_waits(db: DB, since: float) -> list[dict]:
@@ -329,13 +390,15 @@ def _dur(s: float) -> str:
 
 
 def stuck_line(eps: list[dict]) -> str:
-    """count, still open, median, p90 and the longest of some episodes."""
+    """count, still open, median, p90 and the longest of some episodes or intervals; for episodes, how
+    many changed state (kind "mixed")."""
     if not eps:
         return "none"
     vals = sorted(e["s"] for e in eps)
     top = max(eps, key=lambda e: e["s"])
     opened = sum(e["open"] for e in eps)
-    return (f"{len(eps)} ({opened} still open), median {_dur(_pct(vals, 0.5))}, p90 {_dur(_pct(vals, 0.9))}, "
+    mixed = sum(e.get("kind") == "mixed" for e in eps)
+    return (f"{len(eps)} ({opened} still open{f', {mixed} changed state' if mixed else ''}), median {_dur(_pct(vals, 0.5))}, p90 {_dur(_pct(vals, 0.9))}, "
             f"longest #{top['task']} {top['title'][:70]} {_dur(top['s'])}{' (still open)' if top['open'] else ''}")
 
 
@@ -345,6 +408,31 @@ def record_resolve(db: DB, ask_id: int, messages: list[int]) -> None:
     rec = db.kv(RESOLVED_KEY, {}) or {}
     rec[str(ask_id)] = {"ts": time.time(), "messages": [int(m) for m in messages]}
     db.set_kv(RESOLVED_KEY, dict(sorted(rec.items(), key=lambda kv: int(kv[0]))[-RESOLVED_KEEP:]))
+
+
+def inventory_line(rows: list[dict]) -> str:
+    """What is stuck now, per state: count and the oldest by time in that state; unknown ages apart."""
+    if not rows:
+        return "nothing stuck"
+    parts = []
+    for kind in STUCK.values():
+        of = [r for r in rows if r["kind"] == kind]
+        known = [r for r in of if r["state_s"] is not None]
+        if not of:
+            continue
+        part = f"{kind} {len(of)}"
+        if known:
+            top = max(known, key=lambda r: r["state_s"])
+            whole = f", stuck {_dur(top['stuck_s'])} in all" if top["stuck_s"] is not None and \
+                top["stuck_s"] - top["state_s"] >= 60 else ""
+            part += f", oldest #{top['task']} {top['title'][:70]} {_dur(top['state_s'])} in {kind}{whole}"
+        parts.append(part)
+    unknown = [r for r in rows if r["state_s"] is None]
+    line = "; ".join(parts)
+    if unknown:
+        line += "; time in state unknown: " + ", ".join(f"#{r['task']}" for r in unknown[:10])
+        line += f" and {len(unknown) - 10} more" if len(unknown) > 10 else ""
+    return line
 
 
 def asks(db: DB, since: float, now: float | None = None) -> list[dict]:
@@ -471,7 +559,7 @@ def _triggers(note: dict) -> list[str]:
 
 def triggers_line(db: DB, since: float) -> str:
     """Coordinator turns per trigger label, the raised vs routine share with their cost, and the
-    `escalations` counts (routine turns escalated, escalations refused)."""
+    escalations (escalations_part)."""
     rows = db.q("SELECT note, cost_usd FROM runs WHERE role='coordinator' AND started>=?", (since,))
     if not rows:
         return "no coordinator turns"
@@ -490,20 +578,44 @@ def triggers_line(db: DB, since: float) -> str:
             f"routine {routine[0]} ({100 * routine[0] / n:.0f}%, ${routine[1]:.2f})")
     if per:
         line += "; per trigger: " + ", ".join(f"{k} {v}" for k, v in sorted(per.items(), key=lambda kv: (-kv[1], kv[0])))
+    return line + "; " + escalations_part(db, since)
+
+
+def escalations_part(db: DB, since: float) -> str:
+    """Escalations (routine turns rerun at high effort) and refused escalations since `since`, from
+    timestamped records: reruns' run notes and `rejected_actions` events. They count only when those
+    records cover the whole window (ESCALATION_LOG_KEY, set by the daemon's first start on a release
+    that keeps them); otherwise the window's count is unknown. The `escalations` kv counters are
+    cumulative, so they are labelled so and never added into the window."""
     from .coordinator import ESCALATIONS_KEY
-    esc = db.kv(ESCALATIONS_KEY, {}) or {}
-    line += f"; escalations: {int(esc.get('n', 0))} (refused {int(esc.get('refused', 0))})"
-    return line
+    since_log = db.kv(ESCALATION_LOG_KEY)
+    if isinstance(since_log, (int, float)) and since_log <= since:
+        n = sum(bool(_note(r["note"]).get("escalated")) for r in db.q(
+            "SELECT note FROM runs WHERE role='coordinator' AND started>=?", (since,)))
+        refused = db.one("SELECT COUNT(*) AS n FROM events WHERE kind='rejected_actions' AND ts>=? AND text LIKE ?",
+                         (since, "%escalate: refused (%"))["n"]
+        part = f"escalations {n} (refused {refused})"
+    else:
+        part = "escalations unknown (not logged for the whole window)"
+    esc = db.kv(ESCALATIONS_KEY)
+    if isinstance(esc, dict) and ("n" in esc or "refused" in esc):
+        part += f"; cumulative (all time, not this window): {int(esc.get('n', 0))} (refused {int(esc.get('refused', 0))})"
+    else:
+        part += "; cumulative: not recorded"
+    return part
 
 
 def lines(db: DB, now: float | None = None) -> list[str]:
     """The daily review's 'Unblocking quality' lines."""
     now = time.time() if now is None else now
-    out = []
+    out = [f"stuck now (inventory, whenever it started): {inventory_line(inventory(db, now))}"]
     for label, span in WINDOWS:
         eps = episodes(db, now - span, now)
+        segs = intervals(db, now - span, now)
         for kind in STUCK.values():
-            out.append(f"stuck {kind}, {label}: {stuck_line([e for e in eps if e['kind'] == kind])}")
+            out.append(f"time in {kind}, {label} (intervals started in window): "
+                       f"{stuck_line([x for x in segs if x['kind'] == kind])}")
+        out.append(f"stuck episodes, {label} (started in window, all stuck states, full age): {stuck_line(eps)}")
         out.append(f"self-waits, {label}: {self_waits_line(self_waits(db, now - span))}")
     for label, span in WINDOWS:
         out.append(f"asks, {label}: {asks_line(asks(db, now - span, now))}")

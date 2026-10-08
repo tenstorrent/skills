@@ -13,9 +13,11 @@ Assess the last day of this project, then hand off.
    Count reviews that asked for changes (`changes_needed`) apart from failures: those reviews worked.
 4. Harness friction: where the user was needed, where the coordinator mis-planned, slow loops.
    Unblocking quality: if this spec ends with `Unblocking quality` lines, report them in one short
-   section: time stuck (blocked, waiting, review: count, median, p90, longest), asks the user
-   handed back ("decide yourself") with their ids and blocking reasons, and the coordinator's
-   high/low turn split and escalations. A handed-back ask should not have been sent: say what rule
+   section: what is stuck now, time in each stuck state (blocked, waiting, review: count, median,
+   p90, longest) and whole stuck episodes, asks the user handed back ("decide yourself") with their
+   ids and blocking reasons, and the coordinator's high/low turn split and escalations. Keep their
+   labels: inventory is not a 24 h count, cumulative counters are not daily totals, and an unknown
+   is not zero. A handed-back ask should not have been sent: say what rule
    would have let the coordinator decide it, as a `harness:` follow-up when one is missing.
 5. Memory: retire entries that are stale, done or replaced: `ttp memory <name> --forget <entry>`
    (the name in [brackets]; it moves to memory/archive/). Keep restrictions, preferences and

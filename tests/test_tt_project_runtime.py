@@ -1486,8 +1486,113 @@ def test_unblock_counts_each_logged_trigger_and_the_escalated_bucket(env):
     db.set_kv("escalations", {"n": 2, "refused": 1})
     assert unblock.triggers_line(db, now - 86400) == (
         "raised 5 (83%, $1.10), routine 1 (17%, $0.10); per trigger: jev 2, task_blocked 2, alert_high 1, "
-        "escalated 1, user_message 1; escalations: 2 (refused 1)")
+        "escalated 1, user_message 1; escalations unknown (not logged for the whole window); "
+        "cumulative (all time, not this window): 2 (refused 1)")
     assert unblock.triggers_line(db, now + 10) == "no coordinator turns"
+
+
+def test_unblock_reports_state_intervals_whole_episodes_and_what_is_stuck_now_apart(env):
+    p = make(env)
+    from ttp import unblock
+    db, now = p.db, time.time()
+
+    def ev(tid, kind, ago, data=None):
+        db.x("INSERT INTO events(ts,source,kind,text,data,status,task) VALUES(?,?,?,?,?,?,?)",
+             (now - ago, "t", kind, "x", data, "handled", tid))
+
+    def task(title, status):
+        tid = db.add_task(title)
+        db.x("UPDATE tasks SET status=?, updated=? WHERE id=?", (status, now - 30, tid))
+        return tid
+
+    a = task("blocked, then up for review", "review")
+    ev(a, "task_blocked", 3 * 3600)
+    ev(a, "task_review", 5400)
+    b = task("blocked for days", "blocked")
+    ev(b, "task_blocked", 3 * 86400)
+    c = task("blocked two days ago, up for review today", "review")
+    ev(c, "task_blocked", 2 * 86400)
+    ev(c, "task_review", 2 * 3600)
+    e = task("blocked with no history", "blocked")
+    f = task("waits on its own checks", "waiting")
+    ev(f, "task_waiting", 600, json.dumps({"wait": "self", "why": "checks"}))
+    g = task("waits on someone else", "waiting")
+    ev(g, "task_waiting", 5400)
+    # A start cohort: only episodes that started in the window, a changed state is one "mixed" episode
+    eps = {x["task"]: x for x in unblock.episodes(db, now - 86400, now)}
+    assert set(eps) == {a, g}
+    assert eps[a]["kind"] == "mixed" and eps[a]["open"] and eps[a]["s"] == pytest.approx(3 * 3600, abs=1)
+    assert [(x["kind"], x["open"], round(x["s"])) for x in eps[a]["segments"]] == [
+        ("blocked", False, 5400), ("review", True, 5400)]
+    # Per-state intervals: by when the interval started, whenever its episode did; each its own state's time
+    segs = sorted((x["task"], x["kind"], round(x["s"] / 60)) for x in unblock.intervals(db, now - 86400, now))
+    assert segs == [(a, "blocked", 90), (a, "review", 90), (c, "review", 120), (g, "waiting", 90)]
+    assert {(x["task"], x["kind"]) for x in unblock.intervals(db, now - 7 * 86400, now)} >= {(b, "blocked"), (c, "blocked")}
+    # The inventory: everything stuck now, whenever it started; no history is unknown, never zero
+    inv = {x["task"]: x for x in unblock.inventory(db, now)}
+    assert set(inv) == {a, b, c, e, g}   # f's latest wait is its own work
+    assert inv[c]["state_s"] == pytest.approx(2 * 3600, abs=1) and inv[c]["stuck_s"] == pytest.approx(2 * 86400, abs=1)
+    assert inv[e]["state_s"] is None and inv[e]["stuck_s"] is None
+    assert unblock.inventory_line(list(inv.values())) == (
+        f"blocked 2, oldest #{b} blocked for days 72.0 h in blocked; "
+        f"waiting 1, oldest #{g} waits on someone else 1.5 h in waiting; "
+        f"review 2, oldest #{c} blocked two days ago, up for review today 2.0 h in review, stuck 48.0 h in all; "
+        f"time in state unknown: #{e}")
+    assert unblock.inventory_line([]) == "nothing stuck"
+    lines = unblock.lines(db, now)
+    assert lines[0].startswith("stuck now (inventory, whenever it started): blocked 2, ")
+    assert "time in review, 24 h (intervals started in window): 2 (2 still open), median 1.5 h, p90 2.0 h, " \
+           f"longest #{c} blocked two days ago, up for review today 2.0 h (still open)" in lines
+    assert "time in blocked, 24 h (intervals started in window): 1 (0 still open), median 1.5 h, p90 1.5 h, " \
+           f"longest #{a} blocked, then up for review 1.5 h" in lines
+    assert "stuck episodes, 24 h (started in window, all stuck states, full age): 2 (2 still open, 1 changed state), " \
+           f"median 1.5 h, p90 3.0 h, longest #{a} blocked, then up for review 3.0 h (still open)" in lines
+
+
+def test_unblock_cumulative_escalation_counters_are_not_reported_as_24h(env):
+    p = make(env)
+    from ttp import unblock
+    db, now = p.db, time.time()
+    for ago, note in ((60, '{"triggers": ["escalated: harder than it looked"], "escalated": true}'),
+                      (120, '{"triggers": []}'), (2 * 86400, '{"escalated": true}')):
+        db.x("INSERT INTO runs(role,status,started,effort,note) VALUES('coordinator','ok',?,?,?)",
+             (now - ago, "high", note))
+    for ago, text in ((3600, "escalate: refused (this batch was already escalated once); decide at this effort"),
+                      (1800, "send: no such chat"), (3 * 86400, "escalate: refused (it came with other actions)")):
+        db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+             (now - ago, "daemon", "rejected_actions", "normal", text, "handled"))
+    since = now - 86400
+    # Nothing tells when timestamped records began, and no counters: both unknown, never zero
+    assert unblock.escalations_part(db, since) == (
+        "escalations unknown (not logged for the whole window); cumulative: not recorded")
+    db.set_kv("escalations", {"n": 9, "refused": 7, "batch": [[], []]})
+    db.set_kv(unblock.ESCALATION_LOG_KEY, now - 3600)   # records begin inside the window: still unknown
+    assert unblock.escalations_part(db, since) == (
+        "escalations unknown (not logged for the whole window); cumulative (all time, not this window): 9 (refused 7)")
+    db.set_kv(unblock.ESCALATION_LOG_KEY, now - 2 * 86400)   # the whole window is covered: counted from records
+    assert unblock.escalations_part(db, since) == (
+        "escalations 1 (refused 1); cumulative (all time, not this window): 9 (refused 7)")
+    assert unblock.triggers_line(db, since).endswith(
+        "; escalations 1 (refused 1); cumulative (all time, not this window): 9 (refused 7)")
+
+
+@pytest.mark.parametrize("marked", [None, 1000.0])
+def test_the_first_daemon_start_marks_when_timestamped_escalation_records_begin(env, monkeypatch, marked):
+    from ttp import daemon as dm, unblock, web
+    p = make(env)
+    if marked:
+        p.db.set_kv(unblock.ESCALATION_LOG_KEY, marked)
+    d = dm.Daemon(p.base)
+    monkeypatch.setattr(d, "tick", lambda: setattr(d, "stopping", True))
+    monkeypatch.setattr(web, "serve", lambda daemon: None)
+    monkeypatch.setattr(dm.signal, "signal", lambda *a: None)
+    monkeypatch.setattr(dm.time, "sleep", lambda s: None)
+    before = time.time()
+    assert d.run() == 0
+    if marked:
+        assert p.db.kv(unblock.ESCALATION_LOG_KEY) == marked, "a later start keeps the first mark"
+    else:
+        assert before <= p.db.kv(unblock.ESCALATION_LOG_KEY) <= time.time()
 
 @pytest.mark.parametrize("result,want", [
     ({"retry_when": "/x/bin/ttp checks --result /runs/7"}, ("self", "checks")),
@@ -1536,7 +1641,8 @@ def test_self_waits_are_not_stuck_and_the_daily_review_lists_them_apart(env):
     assert eps[locked]["s"] == pytest.approx(3600, abs=1) and not eps[locked]["open"]
     assert len(eps) == 2   # the event without data counts as external
     lines = unblock.lines(db, now)
-    assert f"stuck waiting, 24 h: 2 (1 still open), median 10 min, p90 1.0 h, longest #{locked} " in "\n".join(lines)
+    assert (f"time in waiting, 24 h (intervals started in window): 2 (1 still open), median 10 min, p90 1.0 h, "
+            f"longest #{locked} ") in "\n".join(lines)
     assert "self-waits, 24 h: 6 by 3 tasks (not counted as stuck): checks 5, planned window 1" in lines
     assert machines.stats(db, now)["board-a"]["waits"] == 1
 
@@ -1768,7 +1874,8 @@ def test_the_daily_review_gets_the_unblocking_quality_lines(env):
     s = {"name": "daily-review", "budget_usd_day": None, "last_run": None, "description": "review"}
     assert d._schedule_llm(s, {}) == "queued"
     spec = p.db.one("SELECT spec FROM tasks WHERE origin='schedule'")["spec"]
-    assert "Unblocking quality:\n- stuck blocked, 24 h: none" in spec and "- asks, 7 d: no asks sent" in spec
+    assert "Unblocking quality:\n- stuck now (inventory, whenever it started): nothing stuck" in spec
+    assert "- time in blocked, 24 h (intervals started in window): none" in spec and "- asks, 7 d: no asks sent" in spec
     assert "- coordinator, 24 h: no coordinator turns" in spec
     assert "- coordinator triggers, 24 h: no coordinator turns" in spec
     p.db.x("DELETE FROM tasks")

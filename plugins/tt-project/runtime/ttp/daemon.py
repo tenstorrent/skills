@@ -305,6 +305,8 @@ class Daemon:
         signal.signal(signal.SIGINT, lambda *_: setattr(self, "stopping", True))
         log(self.p, f"daemon start pid={os.getpid()} host={hostname()} boot={self.boot}")
         self.p.db.set_kv("daemon", {"pid": os.getpid(), "host": hostname(), "started": time.time()})
+        if self.p.db.kv(unblock.ESCALATION_LOG_KEY) is None:   # timestamped escalation records start here
+            self.p.db.set_kv(unblock.ESCALATION_LOG_KEY, time.time())
         self._check_config()
         self.sync_schedules(start=True)
         from .web import serve
