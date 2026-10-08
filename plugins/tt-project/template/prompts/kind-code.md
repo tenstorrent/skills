@@ -11,8 +11,10 @@
   a pass already recorded for the same tree and commands. If they take longer than one tool call may,
   run `ttp checks --detach -- <cmds>`: its output and exit code go to the run's directory, never
   the worktree, where a commit picks them up. Hand off `waiting` with the `retry_when` it prints;
-  that probe also wakes the task if the checks were killed. Running it again stops this run's
-  earlier detached checks. Run plain
+  that probe also wakes the task if the checks were killed. If nothing is left after them but
+  recording the result, put that final hand-off (`done` or `needs_review`) in `on_pass`: a pass on
+  the same head records it without a model run; a failure wakes the task at its tier with the output.
+  Running it again stops this run's earlier detached checks. Run plain
   test commands (`pytest -k`, `file::test`) only for focused tests while you work.
 - Keep the diff minimal and on-topic. No drive-by rewrites.
 

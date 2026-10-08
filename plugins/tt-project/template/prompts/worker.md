@@ -113,6 +113,7 @@ never write to a run folder named in earlier context):
  "retry_when": "only when waiting: a quick shell check that exits 0 once the wait is over",
  "wake_tier": "only when waiting: light (the next run only checks) or standard (real work follows)",
  "next_step": "only when waiting: the one mechanical step left after it (e.g. push); a light wake does it",
+ "on_pass": {"status": "done", "summary": "only when waiting on your own `ttp checks --detach`: the final hand-off if they pass"},
  "wait_kind": "only when waiting: self (your own detached checks or jobs, a time window you planned) or external",
  "needs_deep": "only on a device task: the problem you could not solve at this tier; its retry runs deep",
  "pr": "URL if you opened or updated one",

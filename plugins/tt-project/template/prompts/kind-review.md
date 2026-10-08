@@ -12,8 +12,9 @@
   takes longer than one tool call may, run `ttp checks --detach -- <cmds>`: its output and exit code
   go to the run's directory, never the worktree, where a commit picks them up. Hand off `waiting`
   with the `retry_when` it prints; that probe also wakes the task if the checks were killed.
-  When only the verdict and its push (or approval) are left once they pass, add `next_step` "push":
-  the light wake then finishes the review itself.
+  When only the verdict and its push (or approval) are left once they pass, put that final hand-off
+  in `on_pass`: a pass on the same head records it without a model run, and a failure wakes the
+  review at its tier with the output.
 <!-- ttp:result-rule: kept as one block across upgrades; a project may reword it (see the README) -->
 - `result.json`: `status` `done` when it may proceed, `failed` when it must not.
 <!-- /ttp:result-rule -->

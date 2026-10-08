@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -1760,7 +1761,8 @@ class Daemon:
                      f"adopted it", "handled", task["id"]))
 
     def _finish_worker(self, r: dict, usage, status: str, run_dir: Path, ended: str | None = None,
-                       rebooted: bool = False, slept: bool = False) -> None:
+                       rebooted: bool = False, slept: bool = False, handoff: dict | None = None) -> None:
+        """`handoff` stands in for the run's result.json: the `on_pass` its checks earned (_probe_passed)."""
         db = self.p.db
         task = db.task(r["task"]) if r["task"] else None
         if not task:
@@ -1772,9 +1774,9 @@ class Daemon:
                 log(self.p, f"run {r.get('id')} of #{task['id']}: queued notes to other projects: {sent}")
         except OSError as e:
             log(self.p, f"could not file the queued notes of #{task['id']}: {e}")
-        if not (run_dir / RESULT_FILE).exists():
+        if handoff is None and not (run_dir / RESULT_FILE).exists():
             self._adopt_misplaced_handoff(r, task, run_dir)
-        handoff = _read_result(run_dir / RESULT_FILE)
+        handoff = handoff if handoff is not None else _read_result(run_dir / RESULT_FILE)
         result = handoff or last_json_object(usage.final_text or "") or {}
         if task["status"] == "cancelled":
             # Cancelled while this run was ending: the decision stands. Keep what the run produced,
@@ -3385,7 +3387,7 @@ class Daemon:
             if rc == 0:
                 task = db.task(tid)
                 if task and task["status"] == "queued" and (task["not_before"] or 0) > now:
-                    self._wake_waiting(task, "probe passed", now)
+                    self._probe_passed(task, now)
         for t in db.q("SELECT * FROM tasks WHERE status='queued' AND not_before IS NOT NULL"):
             prev = load_result(t["result"])
             probe = prev.get("retry_when")
@@ -3405,7 +3407,7 @@ class Daemon:
             got = self._probe_rc.get(t["id"])
             if t["id"] not in self._probes and got and got[0] == 0 and got[2] == probe \
                     and (t["not_before"] or 0) > now:
-                self._wake_waiting(db.task(t["id"]) or t, "probe passed", now)   # a shared verdict
+                self._probe_passed(db.task(t["id"]) or t, now)   # a shared verdict
         self.probe_deferred(now)
 
     def probe_deferred(self, now: float) -> None:
@@ -3549,7 +3551,7 @@ class Daemon:
         rc, at, _ = self._probe_rc.get(tid, (None, 0.0, ""))
         fresh = at >= since and now - at <= 2 * PROBE_EVERY_S
         if fresh and rc == 0:
-            self._wake_waiting(task, "probe passed", now)
+            self._probe_passed(task, now)
         elif fresh and rc not in NOT_YET_RCS:
             self._wake_waiting(task, f"probe broken: {rc if isinstance(rc, str) else f'exit {rc}'}", now)
         elif fresh:
@@ -3590,17 +3592,93 @@ class Daemon:
               f"at its timer, or cancel the task.", "queued", task["id"]))
         log(self.p, f"task {task['id']} probe not yet after {max_hold / 3600:g} h; raised to the coordinator")
 
-    def _wake_waiting(self, task: dict, why: str, now: float) -> None:
+    def _wake_waiting(self, task: dict, why: str, now: float, extra: dict | None = None) -> None:
         """Make a waiting task due now and tell its next run why it woke."""
         tid = task["id"]
         self._probe_rc.pop(tid, None)
         prev = load_result(task["result"])
         self.p.db.update_task(tid, not_before=min(task["not_before"] or now, now),
-                              result=dump_result({**prev, "woke": why}))
+                              result=dump_result({**prev, **(extra or {}), "woke": why}))
         gate = self.gates.get(task["provider"] or self.cfg.get("core_provider", "claude"))
         held = gate and (not gate.allow_new_work or (task["origin"] in ("schedule", "harness")
                                                       and not gate.allow_optional))
         log(self.p, f"task {tid} retry_when {why}; {f'held by gate {gate.level}' if held else 'dispatching'}")
+
+    def _probe_passed(self, task: dict, now: float) -> None:
+        """A waiting task's probe passed. A wait on its own detached `ttp checks` is settled here
+        without a model run where the outcome is clear: checks that passed on the head still checked
+        out record the hand-off's `on_pass` through the normal finish (review and push queue as
+        usual); checks that failed or were killed wake the task at once at its own tier with their
+        output's tail. Anything unclear wakes it as any passed probe does."""
+        why = "probe passed"
+        try:
+            got = self._checks_wait(task)
+        except Exception as e:   # a wake is always safe; a broken check must not keep the task asleep
+            log(self.p, f"task {task['id']}: could not read its checks: {type(e).__name__}: {e}")
+            got = None
+        if got and got[0] == "pass":
+            _, r, run_dir, on_pass, head = got
+            from .providers.base import RunUsage
+            self._probe_rc.pop(task["id"], None)
+            with self.p.db.tx():
+                self._finish_worker(r, RunUsage(), "ok", run_dir, "model-free", handoff=on_pass)
+            log(self.p, f"task {task['id']} retry_when probe passed; its checks passed on {head[:12]}: "
+                        f"recorded its on_pass ({on_pass['status']}) model-free")
+            return
+        if got and got[0] == "fail":
+            _, rc, tail = got
+            tier = task["tier"] if task["tier"] in bud.TIER_ORDER else "standard"
+            self._wake_waiting(task, f"its checks failed ({'killed' if rc == 'killed' else f'exit {rc}'}); "
+                                     f"the end of checks.out:\n{tail}", now,
+                               extra={"wake_tier": tier, "escalated_wake": True})
+            return
+        if got:
+            why += f"; its on_pass was not applied: {got[1]}"
+        self._wake_waiting(task, why, now)
+
+    def _checks_wait(self, task: dict) -> tuple | None:
+        """What a passed `ttp checks --result <run dir>` probe of one of this task's runs settles:
+        ("pass", run row, run dir, on_pass, head), ("fail", rc, tail), ("unclear", why), or None when
+        the wait is not on such checks or they left no exit code."""
+        from .cli import CHECKS_OUT, CHECKS_RC
+        prev = load_result(task["result"])
+        if task["status"] != "queued" or prev.get("status") != "waiting":
+            return None
+        try:
+            words = shlex.split(str(prev.get("retry_when") or ""))
+        except ValueError:
+            return None
+        if len(words) != 4 or Path(words[0]).name != "ttp" or words[1:3] != ["checks", "--result"]:
+            return None
+        run_dir = Path(words[3])
+        r = self.p.db.one("SELECT * FROM runs WHERE task=? AND dir=? AND role!='coordinator' ORDER BY id DESC LIMIT 1",
+                          (task["id"], str(run_dir)))
+        if not r:
+            return None
+        try:
+            rc = (run_dir / CHECKS_RC).read_text().strip()
+        except OSError:
+            return None
+        if rc == "killed" or re.fullmatch(r"-?[1-9][0-9]*", rc):
+            try:
+                lines = (run_dir / CHECKS_OUT).read_text(errors="replace").splitlines()[-20:]
+            except OSError:
+                lines = []
+            return "fail", rc, "\n".join(lines)[-1500:] or "(no output)"
+        if rc != "0":
+            return None
+        full = _read_result(run_dir / RESULT_FILE) or {}
+        if "on_pass" not in full:
+            return None
+        if full.get("status") != "waiting" or full.get("retry_when") != prev.get("retry_when"):
+            return "unclear", "the run's result.json is not the hand-off the task waits on"
+        problem = on_pass_problem(full["on_pass"])
+        if problem:
+            return "unclear", problem
+        head = _checked_head(run_dir, task)
+        if not head:
+            return "unclear", "the checked commit is no longer the head of its worktree and branch, or it is not clean"
+        return "pass", r, run_dir, full["on_pass"], head
 
     def _probe_env(self) -> dict:
         """Probes run `ttp` (e.g. `ttp lock --probe device-a`) as a worker would."""
@@ -4573,6 +4651,50 @@ def review_rejects(result: dict) -> bool:
     verdict = metrics.get("verdict") if isinstance(metrics, dict) else None
     return isinstance(verdict, str) and verdict.strip().lower().replace("-", "_").replace(" ", "_") \
         in REVIEW_REJECT_VERDICTS
+
+
+def on_pass_problem(on_pass) -> str:
+    """Why a waiting hand-off's `on_pass` (the result to record if its checks pass) cannot be
+    recorded, or "". It is a final hand-off: done or needs_review with a summary, and no wait."""
+    if not isinstance(on_pass, dict):
+        return "on_pass is not an object"
+    if on_pass.get("status") not in ("done", "needs_review"):
+        return f"on_pass status must be done or needs_review, not {str(on_pass.get('status'))[:40]!r}"
+    if not isinstance(on_pass.get("summary"), str) or not on_pass["summary"].strip():
+        return "on_pass has no summary"
+    waits = [k for k in (*WAIT_KEYS, "on_pass") if k in on_pass]
+    if waits:
+        return f"on_pass is final and cannot carry {', '.join(waits)}"
+    for key, kind in (("artifacts", list), ("metrics", dict), ("followups", list)):
+        if key in on_pass and not isinstance(on_pass[key], kind):
+            return f"on_pass {key} must be a {kind.__name__}"
+    return ""
+
+
+def _checked_head(run_dir: Path, task: dict) -> str:
+    """The commit a run's passed `ttp checks` recorded, when its worktree still has it checked out,
+    clean, and a code task's branch still points at it; else ""."""
+    try:
+        rec = json.loads((run_dir / prguard.CHECKS_FILE).read_text())
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(rec, dict):
+        return ""
+    head, top = rec.get("head"), rec.get("worktree")
+    if rec.get("passed") is not True or not isinstance(head, str) or len(head) < 40 or not isinstance(top, str) \
+            or not Path(top).is_dir():
+        return ""
+    try:
+        if worktree._git(Path(top), "rev-parse", "HEAD", check=False) != head:
+            return ""
+        if worktree._git(Path(top), "status", "--porcelain", "--untracked-files=no", check=False):
+            return ""
+        if task["kind"] == "code" and task["branch"] and worktree._git(
+                Path(top), "rev-parse", "--verify", "-q", f"refs/heads/{task['branch']}", check=False) != head:
+            return ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return head
 
 
 def _read_result(path: Path) -> dict | None:

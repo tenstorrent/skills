@@ -16479,6 +16479,139 @@ def test_a_waiting_task_wakes_when_its_probe_passes_and_says_so(env, monkeypatch
     assert "Woken because: probe passed." in worker_task(p, p.db.task(tid), str(p.root), None)
 
 
+def _checks_wait_task(p, tmp_path, on_pass=None, rc="0", tier="standard"):
+    """A code task that handed off `waiting` on its own detached `ttp checks`, which ended with `rc`."""
+    from ttp import push, worktree
+    now = time.time()
+    tid = p.db.add_task("fix the parser", "s", kind="code", tier=tier, origin="user")
+    path, branch = worktree.ensure(p, p.db.task(tid))
+    p.db.update_task(tid, branch=branch)
+    (path / "fix.txt").write_text("fixed\n")
+    git = ["git", "-C", str(path)]
+    subprocess.run([*git, "add", "fix.txt"], check=True, capture_output=True)
+    subprocess.run([*git, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "fix"], check=True,
+                   capture_output=True)
+    head = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    run_dir = tmp_path / f"run-{tid}"
+    run_dir.mkdir()
+    p.db.x("INSERT INTO runs(task,role,provider,started,ended,status,dir) VALUES(?,?,?,?,?,?,?)",
+           (tid, "worker", "fake", now - 120, now - 60, "ok", str(run_dir)))
+    hand = {"status": "waiting", "summary": "checks running", "waiting_for": "my checks", "retry_after_s": 900,
+            "retry_when": f"{push._own_ttp(p)} checks --result {shlex.quote(str(run_dir))}"}
+    if on_pass is not None:
+        hand["on_pass"] = on_pass
+    (run_dir / "result.json").write_text(json.dumps(hand))
+    if rc is not None:
+        (run_dir / "checks.rc").write_text(f"{rc}\n")
+    (run_dir / "checks.out").write_text("collected 9 items\nFAILED tests/test_x.py::test_parses_empty\n"
+                                        "ttp checks: 'pytest -q' failed\n")
+    (run_dir / "checks.json").write_text(json.dumps({"head": head, "worktree": str(path), "passed": rc == "0",
+                                                     "commands": ["pytest -q"], "skipped": [], "ts": now}))
+    p.db.update_task(tid, status="queued", not_before=now + 3600,
+                     result=json.dumps({**hand, "waiting_since": now - 60}))
+    return tid, path
+
+
+DONE_ON_PASS = {"status": "done", "summary": "parser fixed; checks pass", "artifacts": ["fix.txt"],
+                "metrics": {"tests": "9 passed"}}
+
+
+def test_passed_checks_record_the_on_pass_hand_off_without_a_model_run(env, monkeypatch, tmp_path):
+    p = make(env)
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    tid, _ = _checks_wait_task(p, tmp_path, DONE_ON_PASS)
+    _settle_probe(d, tid)
+    task = p.db.task(tid)
+    res = json.loads(task["result"])
+    assert task["status"] == "done", (task["status"], task["blocked_reason"], res)
+    assert res["summary"] == "parser fixed; checks pass" and res["run_status"] == "model-free"
+    assert res["metrics"] == {"tests": "9 passed"} and res["artifacts"] == ["fix.txt"]
+    assert len(p.db.q("SELECT id FROM runs WHERE task=?", (tid,))) == 1, "a model run was started"
+    # The normal finish: its review is queued, and the event says no model ran.
+    assert p.db.q("SELECT id FROM tasks WHERE kind='review'"), "the review did not start as usual"
+    ev = p.db.one("SELECT text FROM events WHERE kind='task_done' AND task=?", (tid,))
+    assert "run model-free" in ev["text"] and "$0.00" in ev["text"]
+    assert "recorded its on_pass (done) model-free" in (p.logs / "daemon.log").read_text()
+    for _ in range(3):
+        d.tick()
+    assert len(p.db.q("SELECT id FROM runs WHERE task=?", (tid,))) == 1
+
+
+@pytest.mark.parametrize("rc", ["1", "killed"])
+def test_failed_checks_wake_the_task_at_its_own_tier_with_their_output(env, monkeypatch, tmp_path, rc):
+    p = make(env)
+    from ttp import budget as bud, daemon as dmod
+    from ttp.prompts import worker_task
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    tid, _ = _checks_wait_task(p, tmp_path, DONE_ON_PASS, rc=rc)
+    _settle_probe(d, tid)
+    task = p.db.task(tid)
+    res = json.loads(task["result"])
+    assert _ready(p, tid) and task["status"] == "queued" and task["attempts"] == 0
+    assert bud.wake_tier(task["tier"], res) == "standard", res
+    prompt = worker_task(p, task, str(p.root), None, wake={"tier": "standard", "escalated": True})
+    assert "FAILED tests/test_x.py::test_parses_empty" in prompt
+    assert ("killed" if rc == "killed" else "exit 1") in res["woke"]
+    assert "mechanical step" not in prompt and "check whether the wait is over" not in prompt
+
+
+def test_failed_checks_without_on_pass_also_wake_at_the_task_tier(env, monkeypatch, tmp_path):
+    p = make(env)
+    from ttp import budget as bud, daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    tid, _ = _checks_wait_task(p, tmp_path, rc="2")
+    p.db.update_task(tid, result=json.dumps({**json.loads(p.db.task(tid)["result"]), "next_step": "push"}))
+    _settle_probe(d, tid)
+    assert bud.wake_tier("standard", json.loads(p.db.task(tid)["result"])) == "standard"
+
+
+@pytest.mark.parametrize("change, why", [
+    ("moved", "no longer the head"), ("dirty", "no longer the head"), ("no_rc", None), ("no_on_pass", None),
+    ("waiting", "must be done or needs_review"), ("retry", "cannot carry retry_when"),
+    ("not_handoff", "not the hand-off the task waits on")])
+def test_an_unclear_checks_wait_falls_back_to_a_light_wake(env, monkeypatch, tmp_path, change, why):
+    p = make(env)
+    from ttp import budget as bud, daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    on_pass = {"waiting": {"status": "waiting", "summary": "x"},
+               "retry": {**DONE_ON_PASS, "retry_when": "true"},
+               "no_on_pass": None}.get(change, DONE_ON_PASS)
+    tid, path = _checks_wait_task(p, tmp_path, on_pass, rc=None if change == "no_rc" else "0")
+    run_dir = tmp_path / f"run-{tid}"
+    if change == "moved":
+        subprocess.run(["git", "-C", str(path), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q",
+                        "--allow-empty", "-m", "more"], check=True, capture_output=True)
+    elif change == "dirty":
+        (path / "fix.txt").write_text("changed after the checks\n")
+    elif change == "not_handoff":
+        (run_dir / "result.json").write_text(json.dumps({"status": "done", "summary": "x", "on_pass": DONE_ON_PASS}))
+    _settle_probe(d, tid)
+    task = p.db.task(tid)
+    res = json.loads(task["result"])
+    assert _ready(p, tid) and task["status"] == "queued", (task["status"], res)
+    assert bud.wake_tier(task["tier"], res) == "light", res
+    assert res["woke"].startswith("probe passed") and (why is None or why in res["woke"]), res["woke"]
+    assert len(p.db.q("SELECT id FROM runs WHERE task=?", (tid,))) == 1
+
+
+def test_on_pass_must_be_a_final_hand_off():
+    from ttp.daemon import on_pass_problem
+    assert on_pass_problem(DONE_ON_PASS) == ""
+    assert on_pass_problem({"status": "needs_review", "summary": "s", "followups": []}) == ""
+    assert "must be done or needs_review" in on_pass_problem({"status": "waiting", "summary": "s"})
+    assert "must be done or needs_review" in on_pass_problem({"status": "failed", "summary": "s"})
+    assert "no summary" in on_pass_problem({"status": "done"})
+    assert "not an object" in on_pass_problem("done")
+    assert "cannot carry next_step" in on_pass_problem({**DONE_ON_PASS, "next_step": "push"})
+    assert "cannot carry on_pass" in on_pass_problem({**DONE_ON_PASS, "on_pass": DONE_ON_PASS})
+    assert "metrics must be a dict" in on_pass_problem({**DONE_ON_PASS, "metrics": "9"})
+
+
 @pytest.mark.parametrize("probe, why", [("exit 127", "probe broken: exit 127"),
                                         ("exit 2", "probe broken: exit 2")])
 def test_a_broken_probe_wakes_the_task_at_its_timer(env, probe, why):
