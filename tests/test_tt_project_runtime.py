@@ -28312,7 +28312,7 @@ def test_ttp_devq_cli_submits_locally_and_the_config_and_prompt_name_the_runner(
     assert "device runners" not in worker_task(p, p.db.task(tid), str(p.root), None)
 
 
-def _fake_ssh(tmp_path):
+def _fake_lint_ssh(tmp_path):
     """A stand-in `ssh` on PATH: logs its arguments and runs the remote command here, or exits 255 like
     an unreachable host while the file `down` exists. No real host is ever contacted."""
     b = tmp_path / "fakebin"
@@ -28359,7 +28359,7 @@ def test_devq_lint_refuses_missing_or_broken_scripts_and_warns_on_another_tasks_
     errs, _ = devq.lint("if true; then echo", {})
     assert errs and "the command is not valid shell (bash -n)" in errs[0]
     # A remote host, through a fake ssh: batch mode and a short connect timeout, checked there.
-    monkeypatch.setenv("PATH", f"{_fake_ssh(tmp_path)}:{os.environ['PATH']}")
+    monkeypatch.setenv("PATH", f"{_fake_lint_ssh(tmp_path)}:{os.environ['PATH']}")
     errs, warns = devq.lint(f"{w}/missing.sh && {good}", {"host": "box"})
     assert errs == [f"{w}/missing.sh does not exist on host box"] and warns == []
     log = (tmp_path / "ssh.log").read_text()
@@ -28383,7 +28383,7 @@ def test_ttp_devq_submit_refuses_a_job_whose_script_is_missing_on_the_host_unles
     p = make(env)
     d = tmp_path / "rq"
     p.set_config("device", {"runners": {"dev": {"host": "box", "dir": str(d), **DEVQ_FAST}}})
-    path = {"PATH": f"{_fake_ssh(tmp_path)}:{os.environ['PATH']}", "TTP_TASK": "9"}
+    path = {"PATH": f"{_fake_lint_ssh(tmp_path)}:{os.environ['PATH']}", "TTP_TASK": "9"}
     try:
         r = _ttp_run(p, "devq", "submit", "dev", "--id", "t9-a", "--workdir", str(tmp_path), "--",
                      "./scripts/t4/drive.sh", env=path)
