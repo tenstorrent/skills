@@ -151,14 +151,14 @@ def _kill(proc: subprocess.Popen) -> None:
         pass
 
 
-def _stream(cmd: str, cwd: Path, env: dict | None = None, timeout: float | None = None,
+def _stream(cmd: str | list[str], cwd: Path, env: dict | None = None, timeout: float | None = None,
             group: bool = False) -> tuple[int | None, str, bool]:
-    """Run shell `cmd`, copying its output into this process's output (the batch log): (exit code,
-    the last lines of its output, whether it ran out of time and was killed). `group` starts it in a
+    """Run `cmd` (a shell string, or an argv run without a shell), copying its output into this
+    process's output (the batch log): (exit code, the last lines of its output, whether it ran out of time and was killed). `group` starts it in a
     process group of its own, which a timeout kills whole."""
     sys.stdout.flush()
     sys.stderr.flush()
-    proc = subprocess.Popen(cmd, shell=True, cwd=str(cwd), env=env, stdin=subprocess.DEVNULL,
+    proc = subprocess.Popen(cmd, shell=isinstance(cmd, str), cwd=str(cwd), env=env, stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=group)
     tail: deque[str] = deque(maxlen=push.LOG_TAIL)
 
@@ -856,7 +856,7 @@ class Batch:
         self.checks["runs"] += 1
         try:
             for cmd in todo:
-                rc, tail, _ = _stream(cmd, self.wt, env=push.check_env("target", self.tip))
+                rc, tail, _ = _stream(push.check_argv(cmd), self.wt, env=push.check_env("target", self.tip))
                 if rc != 0:
                     say(f"check failed on {head[:10]}: {cmd}")
                     return cmd, tail

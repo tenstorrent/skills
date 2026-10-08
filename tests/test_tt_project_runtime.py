@@ -29093,7 +29093,7 @@ def test_a_continued_own_worktree_work_task_starts_from_the_old_branch(env):
     assert "on branch feature-x" not in worker_task(p, p.db.task(n2), str(p.root), None)
 
 
-def test_check_commands_have_first_failure_semantics(tmp_path):
+def test_check_commands_have_first_failure_semantics(env, tmp_path):
     # A multi-command check whose earlier command fails must fail even when the last one passes.
     from ttp import push
     run = lambda c: subprocess.run(push.check_argv(c), cwd=tmp_path).returncode
@@ -29104,3 +29104,33 @@ def test_check_commands_have_first_failure_semantics(tmp_path):
     assert run("true; true") == 0
     assert run("true | true") == 0
     assert run("false || true") == 0
+
+
+def test_every_push_checks_call_site_fails_a_masked_failure(env, tmp_path, monkeypatch, capsys):
+    # 'false; true' passes under a plain shell. The push queue, ttp push (--own and plain) and
+    # ttp checks must each refuse it; 'true; true' is the negative control.
+    from ttp import cli
+    p, repo, origin, other = _bump_setup(env, monkeypatch, ["false; true"])
+    rc, m = _run_batch(p, _batch_marker(p, [_entry(repo, "e1", {"plugins/p/f1.txt": "1\n"})]), monkeypatch)
+    assert m["outcome"] != "pushed", m
+    p.set_config("delivery.push_checks", ["true; true"])
+    rc, m = _run_batch(p, _batch_marker(p, [_entry(repo, "e2", {"plugins/p/f2.txt": "2\n"})], bid="b2"), monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed", m
+    p.set_config("delivery.push_checks", ["false; true"])
+    _git_out(repo, "checkout", "-q", "-B", "work", "origin/proj")
+    run = tmp_path / "run1"
+    run.mkdir()
+    monkeypatch.setenv("TTP_RUN_DIR", str(run))
+    monkeypatch.setenv("TTP_TASK", "62")
+    _git_out(repo, "checkout", "-q", "-b", "ttp/t62-x")
+    _commit(repo, "x.txt", "x\n")
+    assert _ttp("push", "--own") == 4
+    assert _ttp("push") == 4
+    p.set_config("delivery.push_checks", ["true; true"])
+    assert _ttp("push", "--own") == 0
+    (tmp_path / "c").mkdir()
+    p2, crepo, crun, git = _checks_repo(env, tmp_path / "c", monkeypatch)
+    p2.set_config("delivery.push_checks", ["false; true"])
+    with pytest.raises(SystemExit):
+        cli.main(["checks"])
+    assert json.loads((crun / "checks.json").read_text())["passed"] is False
