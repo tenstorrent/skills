@@ -4740,6 +4740,41 @@ def test_actor_words_are_no_rule_target_and_an_inverted_may_skips_any_actor(env)
         assert len(err) == 1 and f"\"{ban}\" (section 'Restrictions')" in err[0], (text, err)
 
 
+def test_a_ban_on_one_actor_does_not_pair_with_another_actors_allowance(env):
+    """A ban that names who it binds ("Workers must not push", "Never let agents open PRs") is no
+    blanket ban: an allowance for a different actor ("The coordinator may push") does not contradict
+    it. It still pairs with the same actor's allowance, an allowance naming no actor, and a ban naming
+    no actor pairs with any actor's allowance. A named actor after an inverted "may" is skipped too."""
+    p = make(env)
+    from ttp import coordinator as coord
+
+    def lint(ban, text):
+        return [(x["forbid"], x["allow"]) for x in
+                coord.restriction_pairs(f"# demo\n\n## Restrictions\n- {ban}\n- {text}\n")]
+
+    def guard(ban, text, turn):
+        p.charter_path.write_text(f"# demo\n\n## Restrictions\n- {ban}\n")
+        return coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": text}],
+                           turn=turn, user_turn=True)
+    for k, (ban, text) in enumerate((
+            ("Workers must not push.", "The coordinator may push to the work branch."),
+            ("Never let workers push.", "The coordinator may push to the work branch."),
+            ("Never let agents open pull requests.", "The coordinator may open draft PRs on the fork."))):
+        assert lint(ban, text) == [], text
+        assert guard(ban, text, 10 + k) == [], text
+    for k, (ban, text) in enumerate((
+            ("Workers must not push.", "Workers may push to the work branch."),
+            ("Never push.", "The coordinator may push to the work branch."),
+            ("Never let workers push to main.", "Workers may push to main."),
+            ("Never let agents open pull requests.", "Workers may open draft PRs on the fork."),
+            ("Workers must not push.", "Pushing to the work branch is allowed."),
+            ("Never push to main without the user's word.", "The coordinator may push to main."),
+            ("Never push to main.", "Only after review may Dependabot push to main."))):
+        assert lint(ban, text) == [(ban, text)], text
+        err = guard(ban, text, 20 + k)
+        assert len(err) == 1 and f"\"{ban}\" (section 'Restrictions')" in err[0], (text, err)
+
+
 def test_charter_conflicts_show_in_the_digest_raise_effort_once_and_reach_the_daily_review(env):
     p = make(env)
     from ttp import coordinator as coord, daemon as dm

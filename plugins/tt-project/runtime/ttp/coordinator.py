@@ -1915,9 +1915,9 @@ _ACTOR_SKIP = {"let", "worker", "workers", "agent", "agents", "i", "we", "you", 
 _VERB_SKIP = {"ever", "again", "be", "a", "an", "the", "any", "longer", "even", "yet", "now", "also", "just",
               "still"} | _ACTOR_SKIP
 # The subject of an inverted "may" ("Only after review may the coordinator push"), skipped before its verb.
-_INVERTED_SKIP = {"this", "that", "these", "those", "our", "your", "their", "my", "its"} | {
-    w + s for w in ("user", "owner", "maintainer", "human", "admin", "operator", "coordinator", "reviewer",
-                    "team", "task", "job", "bot") for s in ("", "s")}
+_ACTOR_NOUNS = {w + s for w in ("user", "owner", "maintainer", "human", "admin", "operator", "coordinator",
+                                 "reviewer", "team", "task", "job", "bot") for s in ("", "s")}
+_INVERTED_SKIP = {"this", "that", "these", "those", "our", "your", "their", "my", "its"} | _ACTOR_NOUNS
 # A passive helper verb ("may be done"): the action is the sentence's subject ("Pushing to main").
 _PASSIVE_VERBS = {"done", "performed", "carried", "made"}
 # An item that names its own exception ("except as the dated section allows") has been reconciled.
@@ -1976,8 +1976,10 @@ def _main_verbs(sentence: str) -> set[str] | None:
         return None
     acts: set[str] = set()
     inverted = m.group(0).lower().startswith("may")
-    for w in re.split(r"\s*(?:,|\bor\b|\band\b)\s*|\s+", m.group(1).lower()):
-        if not w or w in _VERB_SKIP or (w.endswith("ly") or inverted and w in _INVERTED_SKIP) and not acts:
+    for word in re.split(r"\s*(?:,|\bor\b|\band\b)\s*|\s+", m.group(1)):
+        w = word.lower()
+        if not w or w in _VERB_SKIP or (w.endswith("ly") or inverted and (w in _INVERTED_SKIP or word[0].isupper())) \
+                and not acts:
             continue
         if w in ("pr", "prs", "pull"):
             return {"open"}
@@ -2013,13 +2015,39 @@ def _rule_target(sentence: str) -> tuple[set[str], set[str]]:
     return acts, objs
 
 
+# Who a rule binds or lets act, by the words before its main verb (_rule_actors): workers, agents and
+# tasks are one actor.
+_WORKER_ACTORS = {"worker", "workers", "agent", "agents", "task", "tasks"}
+_SUBJECT_ACTORS = _WORKER_ACTORS | _ACTOR_NOUNS
+
+
+def _rule_actors(sentence: str) -> set[str]:
+    """Who a rule is about: the actor nouns before its main verb ("Workers must not push", "Never let
+    agents open", "The coordinator may push", "may the coordinator push"), workers, agents and tasks
+    as "worker". Empty when it names none before the verb ("Never push", "Pushing is allowed")."""
+    m = _MAIN_VERB_RE.search(sentence)
+    if not m:
+        return set()
+    head = re.findall(r"[a-z]+", sentence[:m.start(1)].lower())
+    for w in re.findall(r"[\w-]+", m.group(1).lower()):
+        if w not in _VERB_SKIP and w not in _INVERTED_SKIP:
+            break
+        head.append(w)
+    return {"worker" if w in _WORKER_ACTORS else w.rstrip("s") for w in head if w in _SUBJECT_ACTORS}
+
+
 def _contradicts(forbid: str, allow: str) -> bool:
     """Whether a forbidding rule and an allowing one are about the same thing: their objects overlap
     (at least half of the smaller set) and, when both name an action, it is the same one (_same_action);
     or the forbidding rule names no object (a blanket ban) and the actions are the same. A general
     allowance next to a ban on one object is that ban's exception, not a conflict. A forbidding rule that names its own exception
-    ("except as ... allows") is reconciled and never conflicts."""
+    ("except as ... allows") is reconciled and never conflicts. A ban on workers ("Workers must not
+    push", "Never let agents open PRs") does not bind another actor the allowance names instead ("The
+    coordinator may push"); a ban naming no actor, or an allowance naming none, binds everyone."""
     if _OWN_EXCEPTION_RE.search(forbid):
+        return False
+    bound, allowed = _rule_actors(forbid) & {"worker"}, _rule_actors(allow)
+    if bound and allowed and not bound & allowed:
         return False
     fa, fo = _rule_target(forbid)
     aa, ao = _rule_target(allow)
