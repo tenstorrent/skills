@@ -23309,6 +23309,9 @@ def test_worker_hook_lets_targeted_and_other_runs_through(env, monkeypatch, tmp_
     # From a subdirectory, its paths are its own: tests/ there is not the repository's tests/.
     assert not denied("python3 -m pytest -q tests/test_a.py tests/test_b.py", repo / "sub")
     assert not denied("python3 -m pytest -q", repo / "sub")
+    # A cd inside ( ... ) or $( ... ) does not change the directory of later runs: they pass.
+    assert not denied("(cd .. && true); pytest -q", repo / "sub")
+    assert not denied("ROOT=$(cd .. && pwd) && pytest -q", repo / "sub")
     # Bundled flags that select nothing still make a full run; so does an attached -n value.
     assert denied("python3 -m pytest -qx tests/test_a.py tests/test_b.py")
     assert denied("python3 -m pytest -n4 -qq tests/test_a.py tests/test_b.py")
@@ -23325,6 +23328,8 @@ def test_worker_hook_full_suite_guard_follows_the_projects_checks_and_has_an_esc
     assert denied(SUITE)
     # The escape hatch: on the command line, or for the whole run.
     assert not denied(f"TTP_ALLOW_FULL_SUITE=1 {SUITE}")
+    # The reverse: a cd inside a subshell from the top makes later runs unclear, so they pass.
+    assert not denied(f"(cd sub && true); {SUITE}") and not denied(f"X=$(cd sub && pwd); {SUITE}")
     assert not denied(f"export TTP_ALLOW_FULL_SUITE=1; {SUITE}")
     assert denied(f"TTP_ALLOW_FULL_SUITE=0 {SUITE}")
     monkeypatch.setenv(hook.FULL_SUITE_OK, "1")

@@ -606,14 +606,15 @@ def _cd_target(argv: list[str]) -> str | None:
     return args[0]
 
 
-def _pytest_dirs(segments: list[list[str]], cwd: str | None):
+def _pytest_dirs(segments: list[list[str]], cwd: str | None, subshell: bool = False):
     """(each pytest run's arguments, the directory it runs in) in order, following each `cd`/`pushd`
     before it from `cwd`. The directory is None once it is unclear (a non-literal target, `popd`, a
-    relative target from an unknown start): such a run is not judged."""
+    relative target from an unknown start): such a run is not judged. With `subshell` (the command
+    has a `(`), a `cd` may sit inside `( ... )` or `$( ... )`, so every run after one is unclear."""
     for seg in segments:
         if os.path.basename(seg[0]) in CD_COMMANDS:
             t = _cd_target(seg)
-            cwd = None if t is None or (cwd is None and not os.path.isabs(t)) \
+            cwd = None if t is None or subshell or (cwd is None and not os.path.isabs(t)) \
                 else os.path.normpath(os.path.join(cwd or "/", t))
         elif os.path.basename(seg[0]) == "popd":
             cwd = None
@@ -637,7 +638,7 @@ def _check_runs() -> list[tuple[str, set[str], set[tuple[str, str]]]]:
     out = []
     top = "/top"   # checks run from the repository's top; a cd out of it makes the run unclear
     for c in check_list((p.config().get("delivery") or {}).get("push_checks")):
-        for args, d in _pytest_dirs(_segments(str(c)), top):
+        for args, d in _pytest_dirs(_segments(str(c)), top, "(" in str(c)):
             if d is None or not (d + "/").startswith(top + "/"):
                 continue
             paths, select = _pytest_parts(args, os.path.relpath(d, top))
@@ -653,7 +654,7 @@ def full_suite(cmd: str, segments: list[list[str]], cwd: str) -> str | None:
     logged to the run's refusals.jsonl."""
     if os.environ.get(FULL_SUITE_OK) == "1" or FULL_SUITE_OK_RE.search(cmd):
         return None
-    runs = list(_pytest_dirs(segments, cwd))
+    runs = list(_pytest_dirs(segments, cwd, "(" in cmd))
     if not runs:
         return None
     checks = _check_runs()
