@@ -10685,17 +10685,54 @@ def test_the_disk_breakdown_keeps_what_du_measured_before_its_time_ran_out(env, 
     p = make(env)
     from ttp import daemon as dm
 
-    def slow(cmd, **kw):
-        assert kw["timeout"] <= dm.DISK_DU_TIMEOUT_S
+    def slow(cmd, timeout):
+        assert timeout <= dm.DISK_DU_TIMEOUT_S
         if "-s" in cmd:
-            return sp.CompletedProcess(cmd, 0, f"{5 * 10 ** 6}\t{cmd[-1]}\n".encode(), b"")
-        raise sp.TimeoutExpired(cmd, kw["timeout"], output=f"{700 * 10 ** 6}\t/data/scratch\n".encode())
-    monkeypatch.setattr(dm.subprocess, "run", slow)
+            return f"{5 * 10 ** 6}\t{cmd[-1]}\n".encode(), True
+        return f"{700 * 10 ** 6}\t/data/scratch\n".encode(), False
+    monkeypatch.setattr(dm, "_run_bounded", slow)
     b = dm.disk_breakdown(p, p.base)
     assert b["top"] == [("/data/scratch", 700 * 10 ** 6 * 1024)] and not b["complete"] and b["own_complete"]
     line = dm.disk_usage_line(b, 900e9)
     assert line == (f"This project's own data is 5.1 GB of the 900.0 GB used on {env['tmp']}; biggest top-level "
                     f"directories (du stopped after {dm.DISK_DU_TIMEOUT_S} s; partial): /data/scratch 716.8 GB."), line
+
+
+def test_disk_scans_never_walk_root_home_or_network_mounts(env, monkeypatch, tmp_path):
+    from pathlib import Path
+    p = make(env)
+    from ttp import daemon as dm
+    from ttp import worktree as wt
+    mounts = tmp_path / "mounts"
+    net = env["tmp"] / "shared-net"
+    mounts.write_text(f"/dev/sda1 / ext4 rw 0 0\nhost:/vol {net} nfs4 rw 0 0\nfs {tmp_path}/f fuse.sshfs rw 0 0\n")
+    real = Path.read_text
+    monkeypatch.setattr(Path, "read_text", lambda self, *a, **k: real(mounts if str(self) == "/proc/self/mounts" else self, *a, **k))
+    nets = dm.network_mounts()
+    assert net in nets and tmp_path / "f" in nets and Path("/") not in nets
+    assert not dm._scan_ok(Path("/"), nets) and not dm._scan_ok(Path.home(), nets)
+    assert not dm._scan_ok(env["tmp"], nets), "a dir holding a network mount is not scanned"
+    assert dm._scan_ok(p.root.resolve(), nets)
+    ran = []
+    monkeypatch.setattr(dm, "_run_bounded", lambda cmd, timeout: (ran.append(cmd), (b"", True))[1])
+    b = dm.disk_breakdown(p, p.base)
+    assert b["top_skipped"] and not b["top"] and all(c[-1] != str(env["tmp"]) for c in ran), ran
+    assert "top-level directories unknown" in dm.disk_usage_line(b, 1e9)
+    monkeypatch.setenv("TTP_TEST_DISK_MOUNT", "/")
+    ran.clear()
+    dm.disk_breakdown(p, p.base)
+    assert all(c[-1] != "/" for c in ran), "never du from /"
+    (net / "x").mkdir(parents=True)
+    (net / "x" / "f").write_bytes(b"1" * 100)
+    assert wt._size(env["tmp"], ["shared-net"]) == 0, "a network mount is never walked"
+
+
+def test_a_du_stuck_past_its_timeout_is_killed_and_reported_unknown(env):
+    import time as _t
+    from ttp import daemon as dm
+    t0 = _t.monotonic()
+    out, done = dm._run_bounded(["sh", "-c", "echo 5; exec sleep 30"], 1)
+    assert not done and _t.monotonic() - t0 < 5 and out.startswith(b"5")
 
 
 def test_below_the_disk_floor_even_questions_wait(env, monkeypatch):

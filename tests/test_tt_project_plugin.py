@@ -318,6 +318,12 @@ def test_worker_prompt_limits_search_scope():
         assert cmd in text, cmd
 
 
+def test_worker_prompt_bounds_disk_usage_scans():
+    text = " ".join((PLUGIN / "template" / "prompts" / "worker.md").read_text(encoding="utf-8").split())
+    for part in ("`df <path>`", "Never `du` from / or a home folder", "`du -x`", "`timeout`", "is unknown, not a blocker"):
+        assert part in text, part
+
+
 def test_worker_prompt_ci_wait_wakes_on_a_hung_job():
     text = " ".join((PLUGIN / "template" / "prompts" / "worker.md").read_text(encoding="utf-8").split())
     for part in ("`ttp ci --repo <owner/repo> --branch <branch>`", "exits 0 when a job hangs", "`hung:` line",

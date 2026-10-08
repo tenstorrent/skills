@@ -318,10 +318,15 @@ def move_leftovers(path: Path, rels: list[str], dest: Path) -> int:
 
 
 def _size(path: Path, rels: list[str]) -> int:
-    """Bytes these entries take (a directory: everything in it), links not followed."""
+    """Bytes these entries take (a directory: everything in it), links not followed. A directory
+    holding a network or FUSE mount is skipped: a hung one would block the walk in D state."""
+    from .daemon import network_mounts
+    nets = network_mounts()
     total = 0
     for rel in rels:
         full = path / rel
+        if any(m == full or full in m.parents for m in nets):
+            continue
         try:
             if full.is_dir() and not full.is_symlink():
                 total += sum(f.lstat().st_size for f in full.rglob("*") if f.is_symlink() or f.is_file())

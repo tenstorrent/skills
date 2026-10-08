@@ -64,7 +64,8 @@
   `min_free_gb` uses that instead of `disk.min_free_gb` (for a shared disk that other services keep
   near full by design) and resumes at 1.2× it. The alert, and the digest while low, say how much of
   the used space is this project's own data and name the biggest top-level directories (`du -x -d 1`,
-  stopped after 30 s), so a full shared disk is not taken for project growth.
+  stopped after 30 s and killed; never from / or a home folder, nor over a network or FUSE mount:
+  those show as unknown), so a full shared disk is not taken for project growth.
 - When a task ends (done, failed, cancelled), its worktree loses its git-ignored build and cache
   directories (`disk.cache_dirs`) and is removed once clean with HEAD on a branch. Branches are never
   deleted, so `continues` still starts from the old commits. One whose only dirty entries are untracked

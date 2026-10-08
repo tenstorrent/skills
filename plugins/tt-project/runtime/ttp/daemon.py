@@ -146,18 +146,63 @@ def log(p: Project, msg: str) -> None:
         f.write(line)
 
 
+NETWORK_FS = {"nfs", "nfs4", "cifs", "smb3", "smbfs", "sshfs", "9p", "afs", "ceph", "glusterfs", "lustre",
+              "gpfs", "beegfs", "wekafs", "davfs", "ncpfs", "orangefs", "ocfs2", "gfs2"}
+
+
+def network_mounts() -> list[Path]:
+    """Mount points of network and FUSE filesystems, read from /proc/self/mounts (never stat'ed:
+    a hung network mount blocks any stat of it in D state)."""
+    try:
+        lines = Path("/proc/self/mounts").read_text(errors="replace").splitlines()
+    except OSError:
+        return []
+    out = []
+    for ln in lines:
+        f = ln.split()
+        if len(f) >= 3 and (f[2] in NETWORK_FS or f[2].startswith("fuse")):
+            out.append(Path(f[1].replace("\\040", " ")))
+    return out
+
+
+def _scan_ok(d: Path, nets: list[Path]) -> bool:
+    """A recursive scan of `d` stays on its own data: never / or a home folder (or above one),
+    and no network or FUSE mount at or below it."""
+    home = Path(os.path.expanduser("~"))
+    if d == Path(d.anchor) or d == home or d in home.parents:
+        return False
+    return not any(m == d or d in m.parents or m in d.parents for m in nets)
+
+
+def _run_bounded(cmd: list[str], timeout: float) -> tuple[bytes, bool]:
+    """stdout of `cmd` and whether it finished within `timeout`. On timeout its process group is
+    killed and we wait at most 2 s more, so a child stuck in D state never blocks the caller."""
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                            start_new_session=True)
+    try:
+        out, _ = proc.communicate(timeout=max(timeout, 1))
+        return out or b"", True
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            out, _ = proc.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            out = b""   # left to the kernel; its pipe is dropped, never waited on
+        return out or b"", False
+
+
 def _du(args: list[str], timeout: float) -> tuple[dict[str, int], bool]:
     """{path: bytes} from `du -k` (unreadable directories are skipped), and whether it finished
     within `timeout`; what it printed before it was stopped is kept."""
     try:
-        r = subprocess.run(["du", "-k", *args], capture_output=True, timeout=max(timeout, 1))
-        out, done = r.stdout, True
-    except subprocess.TimeoutExpired as e:
-        out, done = e.stdout or b"", False
+        out, done = _run_bounded(["du", "-k", *args], timeout)
     except OSError:
         return {}, False
     sizes = {}
-    for ln in (out.decode(errors="replace") if isinstance(out, bytes) else out).splitlines():
+    for ln in out.decode(errors="replace").splitlines():
         kb, _, name = ln.partition("\t")
         if kb.strip().isdigit() and name:
             sizes[name] = int(kb) * 1024
@@ -177,9 +222,11 @@ def disk_breakdown(p: Project, path: Path, timeout: float = DISK_DU_TIMEOUT_S) -
     """What fills the filesystem holding `path`, so a full shared disk is not taken for project growth:
     this project's own data on it (its root, and its worktrees wherever they are) and the biggest
     top-level directories (du -x -d 1). The project gets at most half of `timeout`; each du keeps
-    what it measured when stopped."""
+    what it measured when stopped. Never scans / or a home folder, nor anything holding a network
+    or FUSE mount (see _scan_ok): those come back unknown."""
     deadline = time.monotonic() + timeout
     mount = _mount_of(path)
+    nets = network_mounts()
     try:
         dev = os.stat(mount).st_dev
     except OSError:
@@ -193,9 +240,15 @@ def disk_breakdown(p: Project, path: Path, timeout: float = DISK_DU_TIMEOUT_S) -
             continue
     own, own_done = 0, True
     for d in roots:
+        if not _scan_ok(d, nets):
+            own_done = False
+            continue
         sizes, done = _du(["-x", "-s", str(d)], min(deadline - time.monotonic(), timeout / 2))
         own += sum(sizes.values())
         own_done = own_done and done and bool(sizes)
+    if not _scan_ok(mount, nets):
+        return {"mount": str(mount), "top": [], "complete": False, "top_skipped": True,
+                "own_bytes": own if roots else None, "own_complete": own_done}
     sizes, done = _du(["-x", "-d", "1", str(mount)], deadline - time.monotonic())
     sizes = {k: v for k, v in sizes.items() if Path(k) != mount}   # the total line
     top = sorted(sizes.items(), key=lambda kv: -kv[1])[:DISK_DU_TOP]
@@ -217,6 +270,8 @@ def disk_usage_line(b: dict, used: float) -> str:
         partial = "" if b.get("complete") else f" (du stopped after {DISK_DU_TIMEOUT_S} s; partial)"
         parts.append(f"biggest top-level directories{partial}: "
                      + ", ".join(f"{name} {gb(n)}" for name, n in b["top"]))
+    elif b.get("top_skipped"):
+        parts.append("top-level directories unknown (not scanned: filesystem root, home folder or network mount)")
     else:
         parts.append(f"du measured no top-level directory within {DISK_DU_TIMEOUT_S} s")
     return "; ".join(parts) + "."

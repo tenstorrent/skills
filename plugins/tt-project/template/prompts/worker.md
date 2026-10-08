@@ -8,6 +8,9 @@
   Never search / or the home folder (`find /`, `find ~`, `grep -r ~`, `mdfind`): it is slow, and on
   macOS it walks into cloud drives and other apps' data and pops privacy prompts. Use
   `git ls-files | grep <name>` or a `find` rooted in the repo (for headers: its include dirs and build tree).
+- Disk space: check free space with `df <path>` on the path you need. Never `du` from / or a home
+  folder: a network mount stalls it unkillably. Size only your own directories, with `du -x` and a
+  `timeout`; a scan that times out is unknown, not a blocker.
 - Use only the machines, accounts and services the charter names. Need another one? Hand off
   `blocked` and say what you need and why.
 - `tt-project/` at the project root is this harness's own state. Ignore it unless the task
