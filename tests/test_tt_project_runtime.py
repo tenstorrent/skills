@@ -4494,12 +4494,16 @@ def test_an_append_that_contradicts_a_standing_restriction_is_rejected_quoting_i
         return [r["text"] for r in db.q("SELECT text FROM events WHERE kind='charter_conflict' AND status='queued'")]
 
     # A dated section, or text in another section, that widens the old item: rejected, quoting it,
-    # in the user's turn and outside it alike; the charter is left as it was.
+    # in the user's turn and outside it alike; the charter is left as it was. A clause that restates
+    # the ban does not clear an exception next to it.
     for k, (act, user) in enumerate((
             ({"section": "Restrictions", "text": "Pushing hotfixes to the main branch is allowed.",
               "until": "the release ships"}, True),
             ({"section": "Policies", "text": "Workers may push to the main branch for hotfixes."}, True),
-            ({"section": "Goals", "text": "Pushing to the main branch is fine now."}, False))):
+            ({"section": "Goals", "text": "Pushing to the main branch is fine now."}, False),
+            ({"section": "Restrictions", "text": "Never push to the main branch, except hotfixes."}, False),
+            ({"section": "Policies", "text": "Never push to the main branch without review, but hotfixes may "
+                                             "be pushed to it."}, False))):
         db.x("DELETE FROM events")
         p.charter_path.write_text(base)
         err = coord.apply(p, [{"type": "charter_update", **act}], turn=10 + k, user_turn=user)
@@ -4525,7 +4529,8 @@ def test_an_append_that_contradicts_a_standing_restriction_is_rejected_quoting_i
     assert len(coord.apply(p, [lift], turn=32)) == 1
     assert "needs the user's word" in coord.apply(p, [{**lift, "quote": "Never modify main."}], turn=33)[0]
     # Not rejected or flagged: a plain new restriction, an unrelated permission, the same change made
-    # in place, a stricter rule on another target, and an append the coordinator says both hold.
+    # in place, a stricter rule on another target, a negated permission (it restates the ban), and an
+    # append the coordinator says both hold.
     for k, (acts, user) in enumerate((
             ([{"section": "Restrictions", "text": "Never push to the main branch on release days."}], True),
             ([{"section": "Restrictions", "text": "Never delete release tags.", "expires": "2d"}], True),
@@ -4535,31 +4540,40 @@ def test_an_append_that_contradicts_a_standing_restriction_is_rejected_quoting_i
               {"section": "Restrictions", "text": "Pushing hotfixes to the main branch is allowed.",
                "expires": "1d"}], True),
             ([{"section": "Policies", "text": "Pushing to the release branch is allowed."}], False),
+            ([{"section": "Policies", "text": "Workers may never push to the main branch."}], False),
+            ([{"section": "Policies", "text": "Workers may not push to the main branch."}], False),
+            ([{"section": "Goals", "text": "Pushing to the main branch is not allowed."}], False),
             ([{"section": "Policies", "text": "Workers may push to the main branch for hotfixes.",
                "both_hold": True}], True))):
         db.x("DELETE FROM events")
         p.charter_path.write_text(base)
         assert coord.apply(p, [{"type": "charter_update", **a} for a in acts], turn=40 + k, user_turn=user) == []
         assert conflicts() == [], acts
-    # A permission inside a conditional or limiting clause lifts nothing, and a participle used as a
-    # modifier ("running jobs") is not the rule's action: none of these is rejected.
-    p.charter_path.write_text("# demo\n\n## Restrictions\n- Never open pull requests.\n- Never push to main.\n"
-                              "- Never disturb the other project's running jobs.\n")
-    for k, text in enumerate(("PR flow, for any repo where PRs are allowed: open a draft PR once tested.",
-                              "Once PRs are allowed, open drafts first.",
-                              "If pushing to main is ever allowed, the user says so first.",
-                              "Workers may run jobs on the device when it is free.")):
-        assert coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": text}],
-                           turn=50 + k, user_turn=True) == [], text
-    # A permission reserved to who may act is a limit, not a lift.
-    p.charter_path.write_text("# demo\n\n## Restrictions\n- Never open pull requests.\n- Never push to main.\n"
-                              "- Never use a paused device.\n")
-    for k, text in enumerate(("Only the user may push to main.", "The user alone may push to main.",
-                              "Pushing to main is allowed for the user only.",
-                              "Main may be pushed to by the user alone.", "Only the user may open pull requests.",
-                              "Only the user lifts device pauses.", "Only the user may lift a device pause.")):
-        assert coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": text}],
-                           turn=70 + k, user_turn=True) == [], text
+    # The guard flags when in doubt: a permission inside a conditional or limiting clause, or one
+    # reserved to who may act, is rejected like any lift of a forbidden action (the lint exempts them),
+    # and goes through on a resend with `both_hold`. Text that loosens no forbidden action passes as it
+    # is: a participle used as a modifier ("running jobs") is not the rule's action.
+    bans = ("# demo\n\n## Restrictions\n- Never open pull requests.\n- Never push to main.\n"
+            "- Never disturb the other project's running jobs.\n- Never use a paused device.\n")
+    p.charter_path.write_text(bans)
+    assert coord.apply(p, [{"type": "charter_update", "section": "Policies",
+                            "text": "Workers may run jobs on the device when it is free."}], turn=50, user_turn=True) == []
+    for k, (text, ban) in enumerate([(t, "Never open pull requests.") for t in (
+            "PR flow, for any repo where PRs are allowed: open a draft PR once tested.",
+            "Once PRs are allowed, open drafts first.", "Only the user may open pull requests.")]
+            + [(t, "Never push to main.") for t in (
+            "If pushing to main is ever allowed, the user says so first.", "Only the user may push to main.",
+            "The user alone may push to main.", "Pushing to main is allowed for the user only.",
+            "Main may be pushed to by the user alone.")]
+            + [(t, "Never use a paused device.") for t in (
+            "Only the user lifts device pauses.", "Only the user may lift a device pause.")]):
+        p.charter_path.write_text(bans)
+        add = {"type": "charter_update", "section": "Policies", "text": text}
+        err = coord.apply(p, [add], turn=51 + 2 * k, user_turn=True)
+        assert len(err) == 1 and f"contradicts the Restrictions item \"{ban}\" (section 'Restrictions')" in err[0], err
+        assert err[0].count("(section ") == 1 and "`both_hold`: true" in err[0], (text, err)
+        assert coord.apply(p, [{**add, "both_hold": True}], turn=52 + 2 * k, user_turn=True) == [], text
+        assert text in p.charter_path.read_text() and ban in p.charter_path.read_text()
     # The rejection offers keeping both as an equal fix, not a fallback after replacing the item.
     p.charter_path.write_text(base)
     err = coord.apply(p, [{"type": "charter_update", "section": "Policies",
@@ -4613,6 +4627,12 @@ def test_restriction_pairs_flags_contradicting_restrictions_items_and_only_those
 
 
 def test_only_or_alone_is_a_limit_only_when_it_names_an_actor_so_a_scoped_lift_is_flagged(env):
+    """The lint (restriction_pairs) reads "only"/"alone" as a limit only when it names who may act or
+    whose word the permission waits for, and a condition or actor after "only" only when "only" sits
+    next to the permission word: with the action between them ("may push to main only when the user
+    says so") it is a conditional lift. The guard (_append_conflicts) has no such exemption: it
+    rejects every permission of a forbidden action, these limits too (a resend with `both_hold` adds
+    a limit), since a miss leaves a stale ban that workers obey."""
     p = make(env)
     from ttp import coordinator as coord
     bans = "# demo\n\n## Restrictions\n- Never push to main.\n- Never open pull requests.\n- Never use a paused device.\n"
@@ -4626,27 +4646,40 @@ def test_only_or_alone_is_a_limit_only_when_it_names_an_actor_so_a_scoped_lift_i
         return coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": text}],
                            turn=turn, user_turn=True)
     # "only"/"alone" on a scope (hotfixes, release tags, the docs repo, pushing, main, the device), in
-    # either word order, or across "and", leaves a lift a lift: the guard rejects it quoting the ban
-    # it contradicts, and the lint pairs the two.
+    # either word order, or across "and", leaves a lift a lift, and so does a condition or actor after
+    # an "only" with the action before it: the guard rejects it quoting the ban it contradicts, and
+    # the lint pairs the two.
     for k, (ban, text) in enumerate([("Never push to main.", t) for t in (
             "Pushing to main is allowed for hotfixes only.", "Workers may push to main for release tags only.",
             "Only pushing to main is allowed.", "Pushing to main alone is allowed.",
             "Leave the device alone and workers may push to main.", "Pushing to main is allowed only for hotfixes.",
             "Pushing to main is only allowed for hotfixes.", "Main alone may be pushed to.",
-            "Only the user and workers may push to main.", "Leave the user alone and workers may push to main.")]
+            "Only the user and workers may push to main.", "Leave the user alone and workers may push to main.",
+            "Workers may push to main only after the user approves.",
+            "Workers may push to main only when the user says so.",
+            "Workers may push to main only once the user approves.",
+            "Workers may push to main only with the user's approval.",
+            "Workers may push to main only on the user's word.", "You may push to main only when we agree.",
+            "Workers may push to main only for the team.", "Workers may push to main for the team only.",
+            "Workers may only push to main after the user approves.",
+            "Main may be pushed to only when the user says so.")]
             + [("Never open pull requests.", "Draft pull requests are allowed for the docs repo only.")]):
         err = guard(text, 10 + k)
         assert len(err) == 1 and f"\"{ban}\" (section 'Restrictions')" in err[0], (text, err)
         assert err[0].count("(section ") == 1, (text, err)
         assert lint(ban, text) == [(ban, text)], text
-    # "only"/"alone" naming who may act, or whose word the permission waits for, is a limit: neither.
+    # "only"/"alone" naming who may act, or whose word the permission waits for, next to the permission
+    # word (fillers such as "be" between them), is a limit: the lint leaves it, the guard still flags it.
     for k, (ban, text) in enumerate([("Never push to main.", t) for t in (
             "Only the user or a maintainer may push to main.", "Only the user is allowed to push to main.",
             "Main may be pushed to by maintainers alone.", "Pushing to main is only allowed for maintainers.",
             "Pushing to main is allowed only when the user says so.")]
             + [("Never use a paused device.", t) for t in (
-            "Device pauses may only be lifted by the user.", "Device pauses are only lifted on the user’s word.")]):
-        assert guard(text, 40 + k) == [], text
+            "Device pauses may only be lifted by the user.", "Device pauses are only lifted on the user’s word.",
+            "Device pauses may be lifted only by the user.",
+            "Device pauses are lifted again only on the user's explicit word.")]):
+        err = guard(text, 40 + k)
+        assert len(err) == 1 and f"\"{ban}\" (section 'Restrictions')" in err[0], (text, err)
         assert lint(ban, text) == [], text
 
 

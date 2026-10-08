@@ -1864,20 +1864,23 @@ def charter_lint(p: Project) -> list[str]:
 
 
 # Contradicting Restrictions items (restriction_pairs, _append_conflicts). A permission said with a
-# negation ("is not allowed", "may not") forbids; "no longer forbidden" allows.
-_NEG_PERMIT_RE = re.compile(r"\b(?:not|never)\s+(?:be\s+)?(?:allowed|permitted|fine|ok(?:ay)?)\b|\b(?:may|can)\s*not\b|"
+# negation ("is not allowed", "may not", "may never") forbids; "no longer forbidden" allows.
+_NEG_PERMIT_RE = re.compile(r"\b(?:not|never)\s+(?:be\s+)?(?:allowed|permitted|fine|ok(?:ay)?)\b|\b(?:may|can)(?:\s*not|\s+never)\b|"
                             r"n't\s+(?:be\s+)?(?:allowed|permitted|fine)\b", re.I)
 _NO_LONGER_BANNED_RE = re.compile(r"\bno longer\s+(?:forbidden|prohibited|banned|off[- ]limits|restricted)\b", re.I)
 _FORBIDS_RE = re.compile(r"\b(?:never|do not|does not|must not|cannot|forbidden|prohibited|banned|no(?! longer\b))\b"
                          r"|\b(?:don|doesn|mustn|can)'t\b", re.I)
 _ALLOWS_RE = re.compile(r"\b(?:allowed|permitted|may|(?:is|are) fine|fine to|ok(?:ay)? to|lift(?:s|ed)?|can now|"
                         r"no longer)\b", re.I)
-# A permission inside a conditional clause ("where PRs are allowed", "once allowed", "if ... is ever
-# allowed") lifts nothing. Nor does one whose "only"/"alone" names who may act ("Only the user may
-# ...", "the user alone may ...", "allowed for the user only", "by the user alone") or whose word it
-# waits for ("lifted only on the user's word", "may only be lifted by the user"). Any other
-# "only"/"alone" scopes a lift and leaves it one ("allowed for hotfixes only", "Only pushing to main
-# is allowed", "main alone", "allowed only for hotfixes"): when in doubt, flag.
+# For the lint (restriction_pairs), a permission inside a conditional clause ("where PRs are allowed",
+# "once allowed", "if ... is ever allowed") lifts nothing. Nor does one whose "only"/"alone" names who
+# may act ("Only the user may ...", "the user alone may ...", "allowed for the user only", "by the user
+# alone") or whose word it waits for ("lifted only on the user's word", "may only be lifted by the
+# user"), with that "only" next to the permission word: with the action between them it is a
+# conditional lift ("may push to main only when the user says so"). Any other "only"/"alone" scopes a
+# lift and leaves it one ("allowed for hotfixes only", "Only pushing to main is allowed", "main alone",
+# "allowed only for hotfixes"): when in doubt, flag. The applier guard (_append_conflicts) makes no
+# such exemption.
 _PERMIT = r"(?:allowed|permitted|lift(?:s|ed)?|may|fine|ok(?:ay)?)"
 _CONDITIONAL_PERMIT_RE = re.compile(r"\b(?:where|once|if|when|whenever|until|unless|provided|as long as)\b"
                                     rf"[^,.;:!?()]*?\b{_PERMIT}\b", re.I)
@@ -1887,11 +1890,14 @@ _ACTOR = (r"(?:(?:the|a|an|this|that|these|those|our|your|their|my|its)\s+)?(?:i
           r"(?:user|owner|maintainer|human|admin|operator|coordinator|reviewer|team|lead)s?)(?![\w-])")
 _ACTORS = rf"{_ACTOR}(?:\s+or\s+{_ACTOR})*"
 _IN_CLAUSE = r"(?:(?!\b(?:and|but)\b)[^,.;:!?()])*?"   # words of one clause: no stop, no "and"/"but"
+# Words that may stand between a permission word and its "only" or "for <actor>" ("may be lifted only
+# by", "allowed again only when"): no action, object or gerund.
+_FILLERS = rf"(?:\s+(?:be|been|again|ever|also|still|now|{_PERMIT})\b)*"
 _LIMITED_PERMIT_RE = re.compile(
     rf"(?:\bonly\s+{_ACTORS}(?!['’])|\b{_ACTORS}\s+alone)\s+(?:(?:is|are|can)\s+)?{_PERMIT}\b"
     rf"(?:{_IN_CLAUSE}\b{_PERMIT}\b)*"
-    rf"|\b{_PERMIT}\b{_IN_CLAUSE}\b(?:by|for)\s+{_ACTORS}\s+(?:only|alone)\b"
-    rf"|\b(?:{_PERMIT}\b{_IN_CLAUSE}\bonly\s+(?:be\s+)?(?:{_PERMIT}\s+)?|only\s+(?:be\s+)?{_PERMIT}\s+)"
+    rf"|\b{_PERMIT}\b(?:{_IN_CLAUSE}\bby|{_FILLERS}\s+for)\s+{_ACTORS}\s+(?:only|alone)\b"
+    rf"|\b(?:{_PERMIT}{_FILLERS}\s+only|only{_FILLERS}\s+{_PERMIT}){_FILLERS}\s+"
     rf"(?:(?:on|upon|with)\s+{_ACTORS}['’]s?(?!\w)|(?:after|when|if|once)\s+{_ACTORS}"
     rf"|(?:by|for|to)\s+{_ACTORS}(?=\s*(?:[,.;:!?()]|\b(?:and|but)\b|$)))", re.I)
 # The words after which a rule's main verb comes ("never push", "may run", "allowed to merge"), and
@@ -1934,9 +1940,12 @@ def _unconditional(sentence: str) -> str:
     return _LIMITED_PERMIT_RE.sub(" ", _CONDITIONAL_PERMIT_RE.sub(" ", sentence))
 
 
-def _stance(sentence: str) -> str:
-    """"forbid", "allow", or "" for a sentence that says neither or both."""
-    s = _unconditional(_NO_LONGER_BANNED_RE.sub(" allowed ", _NEG_PERMIT_RE.sub(" never ", sentence)))
+def _stance(sentence: str, exempt: bool = True) -> str:
+    """"forbid", "allow", or "" for a sentence that says neither or both. A permission in a conditional
+    or limiting clause (_unconditional) allows nothing, unless `exempt` is off: then every permission
+    word that is not negated allows."""
+    s = _NO_LONGER_BANNED_RE.sub(" allowed ", _NEG_PERMIT_RE.sub(" never ", sentence))
+    s = _unconditional(s) if exempt else s
     forbids, allows = bool(_FORBIDS_RE.search(s)), bool(_ALLOWS_RE.search(s))
     return "forbid" if forbids and not allows else "allow" if allows and not forbids else ""
 
@@ -2074,8 +2083,12 @@ def _append_conflicts(charter: str, section: str, text: str) -> list[tuple[str, 
     """The standing Restrictions items an appended `text` would contradict, as (item, its section):
     text for Restrictions (dated or temporary too), Goals or Policies that allows what an item
     forbids or forbids what it allows (_contradicts, which tells targets apart), or narrows a
-    forbidding item ("Never X except Y") in a sentence that does not keep its limit (_widens,
-    _restates_limit)."""
+    forbidding item ("Never X, except Y", "Never X, but Y may") in a sentence about it (_widens).
+    It flags when in doubt: a permission counts wherever it sits, in a conditional clause or limited
+    to who may act or when too (no _unconditional), and a clause keeping the item's limit does not
+    clear the sentence. A false hit costs one resend (`quote`, or `both_hold`); a miss leaves a stale
+    ban standing, and workers obey it. A negated permission ("may not", "is not allowed") loosens
+    nothing."""
     if not _DATED.sub("", section).lower().startswith(("restriction", "goal", "polic")):
         return []
     out: list[tuple[str, str]] = []
@@ -2083,12 +2096,11 @@ def _append_conflicts(charter: str, section: str, text: str) -> list[tuple[str, 
     for item, sec, _ in _restriction_items(charter):
         st = _stance(item)
         for s in new:
-            ns = _stance(s)
+            ns = _stance(s, exempt=False)
             if (st == "forbid" and ns == "allow" and _contradicts(item, s)
-                    or st == "allow" and ns == "forbid" and _contradicts(s, item)
-                    or st == "forbid" and ns != "allow" and _LOOSEN_RE.search(_unconditional(s))
-                    and not _OWN_EXCEPTION_RE.search(item) and _widens(item, _rule_words(s))
-                    and not _restates_limit(item, s)):
+                    or st == "allow" and _stance(s) == "forbid" and _contradicts(s, item)
+                    or st == "forbid" and ns != "allow" and _LOOSEN_RE.search(_NEG_PERMIT_RE.sub(" never ", s))
+                    and not _OWN_EXCEPTION_RE.search(item) and _widens(item, _rule_words(s))):
                 if (item, sec) not in out:
                     out.append((item, sec))
                 break
@@ -2123,7 +2135,8 @@ def _reject_contradicting_append(p: Project, section: str, text: str, user_turn:
           f"{first[1]!r}, `quote` \"{first[0]}\" and this `text`"
         + (" (the user's yes is on record for it)" if said else ", with `over` naming the user's word that changed it")
         + (", and retire the other items with `quote` and `over` too" if len(hits) > 1 else "")
-        + "; if both hold (this is the item's exception or condition, or not about the same thing), resend "
+        + "; if both hold (this text only limits who may act or when, is the item's exception or condition, "
+          "or is not about the same thing), resend "
           "with `both_hold`: true, or rewrite the item to name its exception. Never drop a restriction the "
           "user did not change")
 
