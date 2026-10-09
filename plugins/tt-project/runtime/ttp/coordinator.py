@@ -612,6 +612,8 @@ def parse_start_after(raw: Any, now: float | None = None) -> float | None:
     from now; an ISO time without a zone is local."""
     now = time.time() if now is None else now
     s = str(raw).strip()
+    if isinstance(raw, str) and s.lower() in ("", "now"):
+        return None
     if not isinstance(raw, str) or not re.fullmatch(START_AFTER_RE, s):
         raise ValueError(f"start_after {raw!r}: use a delay such as 90m, 6h or 3d, an ISO date or time "
                          f"such as 2026-10-05T09:00, or now")
@@ -640,6 +642,8 @@ def _start_args(a: dict, cur: dict) -> tuple[float | None, str | None]:
         when = cur.get("when")
     else:
         check_probe(when)
+        if when.strip().lower() == "now":   # `now` clears the probe, as for start_after; never a command
+            when = ""
     return after, (when.strip() or None) if when else None
 
 

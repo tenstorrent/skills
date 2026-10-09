@@ -21911,6 +21911,42 @@ def test_a_start_when_task_starts_only_once_its_probe_passes(env, monkeypatch):
     assert f"task {tid} start_when passed" in (p.logs / "daemon.log").read_text()
 
 
+@pytest.mark.parametrize("clear", ["now", "", " NOW ", "  "])
+def test_task_update_start_when_now_or_empty_clears_the_probe(env, clear):
+    p = make(env)
+    from ttp import coordinator as coord
+    assert coord.apply(p, [{"type": "task_add", "title": "deferred", "spec": "s",
+                            "start_when": "test -f never"}]) == []
+    tid = _added(p, "deferred")
+    assert not _ready(p, tid)
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "start_when": clear}]) == []
+    assert not any(lb.split(":")[0] in ("start_when", "deferred_since") for lb in _labels(p, tid))
+    assert _ready(p, tid)
+
+
+def test_task_add_start_when_now_adds_a_task_with_no_probe(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    assert coord.apply(p, [{"type": "task_add", "title": "go", "spec": "s", "start_when": "Now"}]) == []
+    tid = _added(p, "go")
+    assert _ready(p, tid) and not any(lb.startswith("start_when:") for lb in _labels(p, tid))
+
+
+def test_task_update_start_when_real_probe_is_still_stored(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    assert coord.apply(p, [{"type": "task_add", "title": "t", "spec": "s"}]) == []
+    tid = _added(p, "t")
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "start_when": "test -f out/now"}]) == []
+    assert "start_when:test -f out/now" in _labels(p, tid) and not _ready(p, tid)
+
+
+def test_parse_start_after_now_any_case_or_empty_clears(env):
+    from ttp import coordinator as coord
+    for v in ("now", "NOW", " Now ", ""):
+        assert coord.parse_start_after(v) is None, v
+
+
 def test_a_start_when_probe_waits_for_start_after(env, monkeypatch):
     p = make(env)
     from ttp import coordinator as coord
