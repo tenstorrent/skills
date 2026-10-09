@@ -52,7 +52,7 @@
 
 - Open a DRAFT PR only once the change is fully tested: commit, run `ttp checks` (the project's
   checks, plus the repository's test commands after `--`) and fix what fails. `gh` opens a PR only
-  after they passed on HEAD. Say in `summary` what ran and passed. One PR per change.
+  after they passed on HEAD, in this run or an earlier one of this task (a clean tree, no rerun). Say in `summary` what ran and passed. One PR per change.
 - Publish your own branch with `ttp push --own --detach` (same probe and exit codes as above): it
   runs the checks on your HEAD and pushes it as it is under its own name, never a shared branch.
   A branch your spec names instead of `ttp/t<id>-...` goes too, checked out in your worktree, but

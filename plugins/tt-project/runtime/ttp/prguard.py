@@ -581,9 +581,49 @@ def _refuse_ready(prs: set[str], db, what: str, allowed: set | None, heads: dict
     return None
 
 
+def _git_out(cwd: str | None, *args: str) -> str:
+    try:
+        return subprocess.run(["git", *args], capture_output=True, text=True, cwd=cwd, timeout=30).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def _task_pass(head: str, cwd: str | None) -> dict | None:
+    """A pass that `ttp checks` recorded in another run of this run's task on exactly `head` in this
+    worktree, while the worktree has no uncommitted changes to tracked files; else None. A wake run may
+    then open the PR its earlier run checked (detached checks pass in one run, the next opens the PR)."""
+    task, base = os.environ.get("TTP_TASK", ""), os.environ.get("TTP_PROJECT")
+    if not (task.isdigit() and base and head):
+        return None
+    top = _git_out(cwd, "rev-parse", "--show-toplevel")
+    if not top or _git_out(cwd, "status", "--porcelain", "--untracked-files=no"):
+        return None
+    from .project import Project
+    p = Project(base)
+    if not (p.state / "project.db").is_file():
+        return None
+    try:
+        runs = p.db.q("SELECT id FROM runs WHERE task=? ORDER BY id DESC", (int(task),))
+    except Exception:
+        return None
+    for r in runs:
+        try:
+            rec = json.loads((p.runs / str(r["id"]) / CHECKS_FILE).read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(rec, dict) and rec.get("head") == head:
+            # The latest record on this head decides: a later failure there is not covered by an earlier pass.
+            if rec.get("passed") is True and isinstance(rec.get("worktree"), str) \
+                    and os.path.realpath(rec["worktree"]) == os.path.realpath(top):
+                return rec
+            return None
+    return None
+
+
 def _checks_problem(cwd: str | None = None) -> str | None:
     """Inside a run: why a PR may not be opened from this worktree yet (its local checks have not passed
-    on HEAD). Outside a run, nothing."""
+    on HEAD). A pass recorded by another run of the same task on this HEAD in this worktree, with no
+    uncommitted changes, also counts. Outside a run, nothing."""
     run_dir = os.environ.get("TTP_RUN_DIR")
     if not run_dir:
         return None
@@ -591,19 +631,17 @@ def _checks_problem(cwd: str | None = None) -> str | None:
         rec = json.loads((Path(run_dir) / CHECKS_FILE).read_text())
     except (OSError, ValueError):
         rec = None
+    head = _git_out(cwd, "rev-parse", "HEAD")
+    if isinstance(rec, dict) and rec.get("passed") and head and rec.get("head") == head:
+        return None
+    if _task_pass(head, cwd):
+        return None
     if not isinstance(rec, dict):
         return "refused: open a PR only after the local checks pass; none are recorded for this run. " + CHECKS_HOW
-    try:
-        head = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, cwd=cwd,
-                              timeout=30).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        head = ""
     if not rec.get("passed"):
         return "refused: the local checks recorded for this run failed. " + CHECKS_HOW
-    if not head or rec.get("head") != head:
-        return (f"refused: the local checks passed on {str(rec.get('head'))[:12]}, not on this worktree's HEAD "
-                f"{head[:12] or '(unknown)'}. " + CHECKS_HOW)
-    return None
+    return (f"refused: the local checks passed on {str(rec.get('head'))[:12]}, not on this worktree's HEAD "
+            f"{head[:12] or '(unknown)'}. " + CHECKS_HOW)
 
 
 def _no_reviewers(seen: list | None, text: str) -> str:

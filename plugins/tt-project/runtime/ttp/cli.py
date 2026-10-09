@@ -1029,9 +1029,28 @@ CHECK_PASSES = "check_passes.json"   # under the project's state: {"passes": [{"
 CHECK_PASSES_MAX = 200                # the newest entries kept
 
 
+_PLAIN_WORD = re.compile(r"[\w@%+=:,./ -]+")
+
+
+def _command_key(c) -> str:
+    """How a recorded pass names a check: a command line made only of plain words is compared as its
+    words, so `pytest -q 'a.py'`, `pytest  -q a.py` and the argv `pytest -q a.py` are one command. Any
+    shell syntax (quotes around `$`, globs, `;`, pipes, ...) can change what runs, so such a line, or a
+    structured check, is compared as written."""
+    if not isinstance(c, str):
+        return str(c)
+    try:
+        words = shlex.split(c)
+    except ValueError:
+        return c
+    if words and all(_PLAIN_WORD.fullmatch(w) for w in words):
+        return shlex.join(words)
+    return c
+
+
 def _commands_hash(cmds: list) -> str:
     import hashlib
-    return hashlib.sha256(json.dumps([str(c) for c in cmds]).encode()).hexdigest()
+    return hashlib.sha256(json.dumps([_command_key(c) for c in cmds]).encode()).hexdigest()
 
 
 def _recorded_pass(p: Project | None, tree: str, cmds: list) -> dict | None:

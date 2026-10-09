@@ -25198,6 +25198,80 @@ def test_gh_opens_a_draft_pr_only_after_the_runs_checks_passed_on_head(env, tmp_
     assert rc == 1 and "not on this worktree's HEAD" in err, "checks on an older commit let a PR open"
 
 
+def test_gh_accepts_a_checks_pass_from_another_run_of_the_task_only_on_the_same_clean_head(env, tmp_path,
+                                                                                           monkeypatch):
+    """A detached `ttp checks` passes in one run; the task's wake run opens the PR on that pass. Only the
+    same task, the same worktree, the same HEAD, no uncommitted changes and a pass that is the latest
+    record on that HEAD count."""
+    p = make(env)
+    repo, other = tmp_path / "work", tmp_path / "other"
+    git = ["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=t"]
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / "a.txt").write_text("a\n")
+    subprocess.run([*git, "add", "a.txt"], check=True)
+    subprocess.run([*git, "commit", "-qm", "a"], check=True)
+    head = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    task = p.db.x("INSERT INTO tasks(title,kind,status,created) VALUES('t','code','running',?)", (time.time(),))
+    stranger = p.db.x("INSERT INTO tasks(title,kind,status,created) VALUES('u','code','running',?)", (time.time(),))
+
+    def run_of(t, rec=None):
+        rid = p.db.x("INSERT INTO runs(task,role,status) VALUES(?,'worker','ok')", (t,))
+        (p.runs / str(rid)).mkdir(parents=True, exist_ok=True)
+        if rec is not None:
+            (p.runs / str(rid) / "checks.json").write_text(json.dumps(rec))
+        return p.runs / str(rid)
+
+    def rec(passed=True, sha=head, top=repo):
+        return {"head": sha, "worktree": str(top), "passed": passed, "commands": ["true"], "ts": time.time()}
+
+    def opens(wake):
+        monkeypatch.setenv("TTP_TASK", str(task))
+        r = _gh_runner(p, tmp_path, run_dir=wake, cwd=repo)("pr", "create", "--draft", "--title", "t")
+        return r[0] == 0 and bool(r[2]), r[1]
+
+    run_of(stranger, rec())                       # another task's pass on this very head
+    wake = run_of(task)
+    assert not opens(wake)[0], "another task's pass let a PR open"
+    run_of(task, rec(top=other))                  # this task's pass in another worktree
+    assert not opens(run_of(task))[0], "a pass in another worktree let a PR open"
+    run_of(task, rec())                           # the detached checks of an earlier run passed on HEAD
+    wake = run_of(task)
+    ok, err = opens(wake)
+    assert ok, err
+    (repo / "a.txt").write_text("dirty\n")
+    ok, err = opens(wake)
+    assert not ok and "ttp checks" in err, "a pass let a PR open from a worktree with uncommitted changes"
+    subprocess.run([*git, "checkout", "-q", "a.txt"], check=True)
+    assert opens(wake)[0]
+    run_of(task, rec(passed=False))               # a later run's checks failed on the same head
+    assert not opens(run_of(task))[0], "an earlier pass outweighed a later failure on the same head"
+    run_of(task, rec())
+    subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "b"], check=True)
+    ok, err = opens(run_of(task))
+    assert not ok and "ttp checks" in err, "a pass on an older HEAD let a PR open"
+    # This run's own failed record on HEAD is not outweighed by an earlier run's pass on it.
+    new = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    run_of(task, rec(sha=new))
+    wake = run_of(task, rec(passed=False, sha=new))
+    ok, err = opens(wake)
+    assert not ok and "failed" in err
+
+
+def test_ttp_checks_reuses_a_pass_of_the_same_commands_given_in_another_form(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    cli.main(["checks", "--", "test", "-f", "a.txt"])
+    assert "(recorded)" not in capsys.readouterr().out
+    for form in (["test  -f 'a.txt'"], ["--", 'test -f "a.txt"'], ["test", "-f", "a.txt"]):
+        cli.main(["checks", *form])
+        assert "(recorded)" in capsys.readouterr().out, f"{form} ran the same check again"
+    # Shell syntax can change what runs: a quoted glob or `$` is not the bare one.
+    assert cli._command_key("ls '*.py'") != cli._command_key("ls *.py")
+    assert cli._command_key("echo '$HOME'") != cli._command_key("echo $HOME")
+    assert cli._command_key("a 'b;c'") != cli._command_key("a b;c")
+    assert cli._command_key("pytest -k 'a and b'") == cli._command_key('pytest  -k "a and b"')
+
+
 def test_pr_watch_turns_ci_failures_and_bot_comments_into_work_before_the_review_ask(env, monkeypatch):
     from ttp import coordinator as coord, prguard, watchers
     from ttp.daemon import Daemon
