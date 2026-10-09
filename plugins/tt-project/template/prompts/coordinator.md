@@ -101,6 +101,11 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
   `coordinator.defer_max_days`, comes back as an event. Defer with these fields, never with a
   memory note ("deferred", "once X", "N days after Y"). A follow-up that carries them is added
   with them; if it names memory entries it replaces, `memory_forget` those in the same turn.
+- Work that waits for another task's change to land on the push branch: `start_when`
+  `landed:#<id>`. It passes once that task's landed commit is on the branch, which the push queue
+  records per task. Never wait on a raw sha (`git merge-base --is-ancestor <sha> ...`): pushing
+  rebases each commit to a new sha. For a commit that is not a task's, use `ttp landed <sha>`,
+  which also finds it rebased.
 - A task that runs on one of the user's machines (`## Machines` in STANDING) names its alias in
   `resources`, so failures are counted per machine. Use only machines the charter's Resources
   section allows.

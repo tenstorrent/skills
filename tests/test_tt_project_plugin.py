@@ -487,3 +487,13 @@ def test_code_and_review_prompts_keep_full_suite_runs_to_ttp_checks():
                  "They run again only when the head differs or no pass is recorded",
                  "never rerun the full suite by hand"):
         assert part in review, part
+
+
+def test_the_coordinator_defers_on_a_landing_with_landed_id_not_a_raw_sha():
+    """Pushing rebases each commit to a new sha, so a raw-sha ancestor probe can go stale for good."""
+    prompts = PLUGIN / "template" / "prompts"
+    coordinator = " ".join((prompts / "coordinator.md").read_text(encoding="utf-8").split())
+    assert "`start_when` `landed:#<id>`" in coordinator
+    assert "Never wait on a raw sha" in coordinator and "`ttp landed <sha>`" in coordinator
+    review = " ".join((prompts / "daily-review.md").read_text(encoding="utf-8").split())
+    assert "`landed:#<id>`" in review

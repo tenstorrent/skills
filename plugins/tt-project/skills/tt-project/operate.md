@@ -21,6 +21,7 @@
 | `ttp stop <name> [--kill]` | remove the service; keeps all data. Running workers finish unless `--kill` (their tasks resume on start) |
 | `ttp task <name> cancel <id>` | cancel a task and end its running worker |
 | `ttp task <name> set-when <id> "<cmd>"` | re-point the probe of a task that has not started: a waiting task's `retry_when`, else its `start_when`; `""` clears it. Refuses running and finished tasks |
+| `ttp landed <sha>` / `ttp landed --task <id>` | probe: exit 0 once the commit, or the task's landing, is on the push branch, also after a rebase gave it a new sha (same patch-id, or same author, date and subject); 1 not yet. `start_when` `landed:#<id>` runs it |
 | `ttp doctor <name>` | providers, accounts, Jev, notifications, web |
 | `ttp alerts <name> --after N` | alerts since a message id |
 | `ttp stats [<name>] [--days N] [--json]` | context re-read (cache-read) tokens per run and per $, by role, task kind, tier and effort, and the runs that re-read most |

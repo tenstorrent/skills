@@ -15464,6 +15464,32 @@ def test_a_push_batch_entry_already_on_the_target_is_landed_without_a_bump(env, 
     assert _bump_commits(origin) == ["p: 0.1.1 (e3: edit plugins/p/f3.txt)"]
 
 
+def test_a_push_batch_names_each_entrys_own_rebased_commit_and_the_queue_records_it(env, monkeypatch):
+    """A rebase lands each entry under a new sha: the marker names it per entry ("sha"), and the push
+    queue keeps it per row (landed_sha), so `landed:#id` can find the task's change on the branch."""
+    from ttp import pushq
+    p, repo, origin, other = _bump_setup(env, monkeypatch, ["true"])
+    heads = [_entry(repo, f"e{n}", {f"plugins/p/f{n}.txt": f"{n}\n"}) for n in (1, 2)]
+    on = _entry(repo, "e0", {"plugins/p/f0.txt": "0\n"})
+    _git_out(repo, "push", "-q", "origin", f"{on}:refs/heads/proj")
+    rc, m = _run_batch(p, _batch_marker(p, heads + [on]), monkeypatch)
+    assert rc == 0 and _statuses(m) == ["pushed", "pushed", "landed"], m
+    shas = [r.get("sha") for r in m["results"]]
+    tip = _git_out(origin, "rev-parse", "proj")
+    assert shas[2] == on and shas[0] != heads[0] and shas[1] != heads[1] and m["pushed_sha"] == tip
+    assert _git_out(origin, "log", "-1", "--format=%s", shas[1]) == "e2: edit plugins/p/f2.txt"
+    assert _git_out(origin, "rev-parse", f"{shas[1]}^") == shas[0] and _git_out(origin, "rev-parse", f"{tip}^") == shas[1]
+    # pushq._apply keeps each row's own commit, and the batch's head for a row the marker names none of.
+    now = time.time()
+    p.db.x("INSERT INTO push_batches(id, marker, target, started) VALUES('b1', 'm', 'origin/proj', ?)", (now,))
+    for n, h in enumerate(heads + [on], 1):
+        p.db.x("INSERT INTO push_queue(id, task, branch, head, target, status, batch, created, updated) "
+               "VALUES(?, ?, ?, ?, 'origin/proj', 'batched', 'b1', ?, ?)", (n, 100 + n, f"e{n}", h, now, now))
+    m["results"][1].pop("sha")
+    pushq._apply(p, {"id": "b1", "target": "origin/proj"}, m, lambda *a, **k: None, now)
+    assert [r["landed_sha"] for r in p.db.q("SELECT landed_sha FROM push_queue ORDER BY id")] == [shas[0], tip, on]
+
+
 def test_a_push_batch_entry_with_a_real_conflict_stays_out_and_the_others_land(env, monkeypatch, capsys):
     p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
     _commit(other, "notes.txt", "a\nb\nc\n")
@@ -22259,6 +22285,95 @@ def test_ttp_task_set_when_repoints_a_waiting_tasks_retry_when(env, monkeypatch,
     assert _ready(p, tid), "the daemon runs the new probe"
     cli.main(["task", "demo", "set-when", str(tid), ""])
     assert "retry_when" not in json.loads(p.db.task(tid)["result"])
+
+
+def _landed_setup(env, monkeypatch):
+    """A code task whose one commit (`head`) another clone landed on origin/proj as a rebased copy:
+    a new sha with the same patch, author, date and subject."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    tid, path, branch = _code_task(p, "feature")
+    _commit(path, "feature.txt", "feature\n")
+    head = _git_out(path, "rev-parse", "HEAD")
+    _commit(other, "theirs.txt", "theirs\n")
+    _git_out(other, "fetch", "-q", str(path), branch)
+    _git_out(other, "cherry-pick", head)
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    _git_out(repo, "fetch", "-q", "origin")
+    return p, repo, other, tid, path, branch, head
+
+
+def test_ttp_landed_finds_a_rebased_commit_by_patch_id_or_author_date_and_subject(env, monkeypatch, capsys):
+    from ttp import cli, landed
+    p, repo, other, tid, path, branch, head = _landed_setup(env, monkeypatch)
+    raw = f"git merge-base --is-ancestor {head} origin/proj"
+    assert subprocess.run(raw, shell=True, cwd=repo).returncode == 1, "the raw probe never passes after a rebase"
+    assert landed.probe_command(raw) == f"ttp landed {head} --onto origin/proj"
+    assert landed.probe_command("landed:#42") == "ttp landed --task 42" == landed.probe_command(" landed: 42 ")
+    assert landed.probe_command("test -f x") == "test -f x"
+
+    def ttp_landed(*args):
+        with pytest.raises(SystemExit) as e:
+            cli.main(["landed", *args])
+        return e.value.code
+    assert ttp_landed(head) == 0 and ttp_landed(head[:10], "--onto", "origin/proj") == 0
+    assert ttp_landed(f"#{tid}") == 0 and ttp_landed("--task", str(tid)) == 0, "the task's branch, by patch"
+    # A settled conflict changes the patch; the same author, date and subject still match.
+    _git_out(other, "commit", "-q", "--amend", "--no-edit", "--allow-empty", "--only", "--", ".")
+    (other / "feature.txt").write_text("feature, settled\n")
+    _git_out(other, "commit", "-q", "--amend", "--no-edit", "-a")
+    _git_out(other, "push", "-q", "-f", "origin", "HEAD:proj")
+    assert ttp_landed(head) == 0
+    # Not landed: a new commit, a commit nowhere, a task with nothing.
+    _commit(path, "more.txt", "more\n")
+    assert ttp_landed(_git_out(path, "rev-parse", "HEAD")) == 1 and ttp_landed(f"#{tid}") == 1
+    assert ttp_landed("0" * 40) == 2 and ttp_landed("--task", "9999") == 1
+    assert "not on origin/proj yet" in capsys.readouterr().out
+
+
+def test_landed_task_prefers_the_push_queues_recorded_commit_and_waits_until_it_is_on_the_branch(env, monkeypatch):
+    """A review's approval the queue landed counts for the code task it reviews: its landed_sha."""
+    from ttp import landed
+    p, repo, other, tid, path, branch, head = _landed_setup(env, monkeypatch)
+    (path / "feature.txt").write_text("feature, redone\n")   # its branch no longer matches what landed
+    _git_out(path, "commit", "-q", "--amend", "-am", "redone after the landing")
+    assert landed.check(p, repo, tid=tid)[0] == 1
+    review = p.db.add_task(f"Review #{tid}", "r", kind="review", origin="coordinator")
+    rebased = _git_out(other, "rev-parse", "HEAD")
+    now = time.time()
+    p.db.x("INSERT INTO push_queue(task, branch, head, target, status, created, updated, pushed_sha, landed_sha) "
+           "VALUES(?, 'other-branch', ?, 'origin/proj', 'approved', ?, ?, NULL, NULL)", (review, head, now, now))
+    assert landed.check(p, repo, tid=tid)[0] == 1, "an approval still in the queue has not landed"
+    p.db.x("UPDATE push_queue SET status='pushed', pushed_sha=?, landed_sha=?", (rebased, rebased))
+    assert landed.task_shas(p, tid) == ([rebased], "its push queue landing")
+    assert landed.check(p, repo, tid=tid) == (0, f"#{tid} (its push queue landing) is on origin/proj")
+
+
+def test_a_start_when_landed_task_starts_once_its_rebased_landing_is_on_the_branch(env, monkeypatch):
+    from ttp import coordinator as coord
+    from ttp import daemon as dmod
+    p, repo, other, tid, path, branch, head = _landed_setup(env, monkeypatch)
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    later = _commit(path, "later.txt", "later\n") or _git_out(path, "rev-parse", "HEAD")
+    assert coord.apply(p, [{"type": "task_add", "title": "after the landing", "spec": "s",
+                            "start_when": f"landed:#{tid}"},
+                           {"type": "task_add", "title": "after the raw sha", "spec": "s",
+                            "start_when": f"git merge-base --is-ancestor {head} origin/proj"},
+                           {"type": "task_add", "title": "after a later commit", "spec": "s",
+                            "start_when": f"git merge-base --is-ancestor {later} origin/proj"}]) == []
+    ids = [_added(p, t) for t in ("after the landing", "after the raw sha", "after a later commit")]
+    p.db.update_task(tid, branch=None)   # only the push queue can tell: nothing recorded yet
+    d = dmod.Daemon(p.base)
+    _settle_deferred(d, ids[1], until=lambda: _ready(p, ids[1]))
+    _settle_deferred(d, ids[0])
+    _settle_deferred(d, ids[2])
+    assert [_ready(p, i) for i in ids] == [False, True, False]
+    now = time.time()
+    p.db.x("INSERT INTO push_queue(task, branch, head, target, status, created, updated, pushed_sha, landed_sha) "
+           "VALUES(?, ?, ?, 'origin/proj', 'landed', ?, ?, ?, ?)",
+           (tid, branch, head, now, now, _git_out(other, "rev-parse", "HEAD"), _git_out(other, "rev-parse", "HEAD")))
+    _settle_deferred(d, ids[0], until=lambda: _ready(p, ids[0]))
+    assert _ready(p, ids[0]) and not _ready(p, ids[2])
+    assert not [e for i in ids for e in _events(p, i, "deferral_probe_broken")]
 
 
 def test_ttp_task_set_when_sets_and_clears_a_queued_tasks_start_when(env, capsys):
