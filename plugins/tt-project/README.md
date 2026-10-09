@@ -419,6 +419,11 @@ and preferences you add later become part of the project's charter and memory.
   user's word. Separately, a hand-off that finds uncommitted changes to tracked paths in the
   project's main checkout records one observation naming them (once per set of paths); nothing
   there is committed or changed.
+- `delivery.allow_protected_push_branch` (off by default) lets `ttp push` and the push queue
+  publish to a push branch that is `main`, `master` or the remote's default branch. Off, such a
+  push branch is refused, the config alert and `ttp doctor` say so, and every review is review
+  only, never followed by a raw `git push`. On, the push checks, the rebase before the push and
+  the no-force rule apply as to any branch. Only the user's word sets it.
 - `delivery.fast_forward_also` (branch names, off by default) keeps more branches in step with
   the push branch, such as a `main` that holds the last good state: after each successful `ttp push`
   or push queue batch, each listed branch on the push remote is moved to the pushed commit, never

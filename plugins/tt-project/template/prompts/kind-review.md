@@ -37,6 +37,8 @@
 ## Pushing a reviewed change (only when the spec asks for it, without the push queue)
 
 - Push only with `ttp push`, run in the change's worktree. NEVER use `git push` directly.
+  When it refuses the branch (main, master or the remote's default), the review is review only:
+  NEVER fall back to a raw `git push` to that branch.
 - It refuses uncommitted changes, rebases onto the project's target branch, runs the project's
   checks on the final head, starts over if the branch moved meanwhile, and pushes without force.
 - Its checks can take longer than one tool call may: run `ttp push --detach`. It starts the push in

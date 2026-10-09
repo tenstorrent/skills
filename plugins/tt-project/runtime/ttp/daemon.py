@@ -4174,10 +4174,11 @@ class Daemon:
         # A change that must not reach the push branch (its diff is all push-excluded, or its spec or
         # hand-off forbids it) is review only too: a pass would push what the push refuses or the spec bans.
         off = "" if delivered or not d.get("push_branch") else push.kept_off(task, changes, d)
-        # A push branch no push can ever reach (main/master, or a code repo without the remote) makes
-        # every review review only: a push step there would only exit 2 and block the review.
+        # A push branch no push can ever reach (main/master without allow_protected_push_branch, or a
+        # code repo without the remote) makes every review review only: a push step there would only
+        # exit 2 and block the review, and a raw `git push` would skip the checks and the queue.
         never = "" if delivered or off or not (d.get("push_branch") and d.get("push_allowed", True)) \
-            else push.push_branch_problem(d["push_branch"], self.p.root)
+            else push.push_branch_problem(d["push_branch"], self.p.root, push.allow_protected(d))
         pushes = bool(d.get("push_branch") and d.get("push_allowed", True)) and not delivered and not off \
             and not never
         if delivered:
@@ -4190,8 +4191,9 @@ class Daemon:
                          + (" and the PR" if pr else "") + " as they are.")
         elif never:
             lines.append(f"Nothing can be pushed: {never.removeprefix('delivery.push_branch: ')}. Review only: if it "
-                         f"passes, hand off `done`; do not run `ttp push` or approve it for the push queue. Leave "
-                         f"the branch" + (" and the PR" if pr else "") + " as they are.")
+                         f"passes, hand off `done`; do not run `ttp push` or approve it for the push queue, and "
+                         f"never fall back to a raw `git push` to {d['push_branch']}. Leave the branch"
+                         + (" and the PR" if pr else "") + " as they are.")
         elif pushes:
             lines.append(f"If it passes, push it with `ttp push` from the change's worktree (it publishes to "
                          f"{d['push_branch']}).")

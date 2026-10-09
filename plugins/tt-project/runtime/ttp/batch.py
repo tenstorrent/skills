@@ -649,7 +649,7 @@ class Batch:
         if self.target_lock is None:
             who = ", ".join(locks.holders(push.lock_paths(self.p, self.remote, self.branch))) or "another push"
             return self._all("requeued", "busy", f"{push.lock_name(self.remote, self.branch)} is busy (held by {who})")
-        why = push.refusal(self.repo, self.remote, self.branch)
+        why = push.refusal(self.repo, self.remote, self.branch, push.allow_protected(self.d))
         if why.startswith("refusing"):
             return self._all("refused", "refused", why)
         if why:

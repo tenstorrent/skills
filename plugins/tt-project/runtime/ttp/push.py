@@ -825,13 +825,14 @@ def landing(sha: str | None, pushed: str, r: dict | None = None, version: str | 
             + (f" to {pushed}" if pushed else "") + reach_words(r))
 
 
-def push_branch_problem(push_branch: Any, repo: Path | None = None) -> str:
+def push_branch_problem(push_branch: Any, repo: Path | None = None, allow: bool = False) -> str:
     """Why `delivery.push_branch` can never be pushed to, whatever the change, or "" when it may be:
     it names a branch `refusal` always refuses (PROTECTED), or `repo` (the code repo) has no git
     remote, or none of the name the push would use. Local git only: the remote's default branch is
     refused where the remote is asked (refusal, pushq._refusal). Without `repo` (or outside a git
     repo) only the name is checked, its first part read as a remote or as part of the branch.
-    `ttp doctor` and the config check report it; reviews of such a project are review only."""
+    `ttp doctor` and the config check report it; reviews of such a project are review only. `allow`
+    (allow_protected) lets main and master through."""
     ref = str(push_branch or "").strip()
     if not ref:
         return ""
@@ -848,10 +849,11 @@ def push_branch_problem(push_branch: Any, repo: Path | None = None) -> str:
             return (f"delivery.push_branch: {ref} pushes to {remote}, which is not a git remote of the code "
                     f"repo (it has {', '.join(remotes)}), so it can never be pushed to; reviews are review only")
         names = [branch]
-    hit = next((b for b in names if b in PROTECTED), "")
+    hit = next((b for b in names if b in PROTECTED and not (allow and b != "HEAD")), "")
     if hit:
         return (f"delivery.push_branch: {ref} is {hit}, a branch ttp push always refuses, so every review push "
-                f"would fail; reviews are review only (name a branch of its own)")
+                f"would fail; reviews are review only and never fall back to a raw `git push` to it (name a "
+                f"branch of its own, or, only on the user's word, set delivery.allow_protected_push_branch)")
     return ""
 
 
@@ -1059,17 +1061,30 @@ def kept_off(task: dict, changes: dict | None, d: dict) -> str:
     return ""
 
 
-def refusal(repo: Path, remote: str, branch: str) -> str:
+def allow_protected(d: dict | None) -> bool:
+    """`delivery.allow_protected_push_branch` (off by default): whether `ttp push` and the push queue
+    may publish to the push branch when it is main, master or the remote's default branch. Only the
+    user's word turns it on; the checks, the rebase before the push and the no-force rule still apply."""
+    v = (d or {}).get("allow_protected_push_branch")
+    return v is True or (isinstance(v, str) and v.strip().lower() in ("1", "true", "yes", "on"))
+
+
+PROTECTED_HINT = ("only the user's word lets reviewed work go there (delivery.allow_protected_push_branch); "
+                  "until then reviews are review only: never fall back to a raw `git push` to that branch")
+
+
+def refusal(repo: Path, remote: str, branch: str, allow: bool = False) -> str:
     """Why `branch` on `remote` must not be pushed to, or "" when it may. Fails closed when the
-    remote cannot be asked for its default branch."""
-    if branch in PROTECTED:
-        return f"refusing to push to {remote}/{branch}"
+    remote cannot be asked for its default branch. `allow` (allow_protected, for the push branch
+    only) lets main, master and the remote's default branch through; a detached HEAD never."""
+    if branch in PROTECTED and not (allow and branch != "HEAD"):
+        return f"refusing to push to {remote}/{branch}" + (f": {PROTECTED_HINT}" if branch != "HEAD" else "")
     ls = _git(repo, "ls-remote", "--symref", remote, "HEAD")
     if ls.returncode != 0:
         return f"cannot reach {remote}: {ls.stderr.strip()}"
     for line in ls.stdout.splitlines():
-        if line.startswith("ref: ") and line[5:].split("\t")[0] == f"refs/heads/{branch}":
-            return f"refusing to push to {remote}/{branch}, the remote's default branch"
+        if not allow and line.startswith("ref: ") and line[5:].split("\t")[0] == f"refs/heads/{branch}":
+            return f"refusing to push to {remote}/{branch}, the remote's default branch: {PROTECTED_HINT}"
     return ""
 
 
@@ -1435,18 +1450,20 @@ def take(p: Project, remote: str, branch: str, wait_s: float, poll_s: float = 1.
 def push(repo: Path, remote: str, branch: str, checks: list[str], rounds: int = DEFAULT_ROUNDS,
          say: Callable[[str], None] = lambda m: print(f"ttp push: {m}", file=sys.stderr),
          hold: Callable[[], Any] | None = None, version_bump: dict | None = None,
-         timed: Callable[[float], None] | None = None, exclude: list[str] | None = None) -> int:
+         timed: Callable[[float], None] | None = None, exclude: list[str] | None = None,
+         allow: bool = False) -> int:
     """Rebase HEAD onto remote/branch, run `checks` on the result, and push it if the remote did not
     move meanwhile; if it did, start over, at most `rounds` times. With no checks only a change that
     touches nothing but docs goes through, and none that adds or modifies a file `exclude` matches
     (delivery.push_exclude_paths, `excluded`). `hold` takes the push lock once the quick refusals
     passed: it returns the held lock, or None when it stayed busy (BUSY). `version_bump` (bump_of)
-    bumps the version after each rebase; `timed` gets the seconds of each full, passing check run."""
+    bumps the version after each rebase; `timed` gets the seconds of each full, passing check run.
+    `allow` (allow_protected) lets it publish to main, master or the remote's default branch."""
     repo = Path(_git(repo, "rev-parse", "--show-toplevel").stdout.strip() or repo)
     if _git(repo, "status", "--porcelain", "--untracked-files=no").stdout.strip():
         say("uncommitted changes; commit first")
         return REFUSED
-    why = refusal(repo, remote, branch)
+    why = refusal(repo, remote, branch, allow)
     if why:
         say(why)
         return REFUSED
@@ -1729,7 +1746,7 @@ def run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None)
     else:
         rc = push(repo, remote, branch, checks, rounds, hold=lambda: take(p, remote, branch, wait_s),
                   version_bump=version_bump, timed=lambda s: record_check_s(p, s),
-                  exclude=exclude_list(d.get("push_exclude_paths")))
+                  exclude=exclude_list(d.get("push_exclude_paths")), allow=allow_protected(d))
         if rc == 0 and last_pushed and (also := fast_forward_list(d.get("fast_forward_also"))):
             last_ff = fast_forward(repo, remote, last_pushed, also, branch)
     if rc == 0:

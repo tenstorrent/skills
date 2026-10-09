@@ -103,13 +103,14 @@ def _default_branch(p: Project, remote: str, now: float | None = None) -> str | 
     return found
 
 
-def _refusal(p: Project, remote: str, branch: str) -> str:
+def _refusal(p: Project, remote: str, branch: str, allow: bool = False) -> str:
     """push.refusal for the daemon: the same rules, bounded in time. An unreachable remote does not
-    refuse here: the batch asks again before it pushes, and a network blip must not fail a review."""
-    if branch in push.PROTECTED:
-        return f"refusing to push to {remote}/{branch}"
-    if _default_branch(p, remote) == branch:
-        return f"refusing to push to {remote}/{branch}, the remote's default branch"
+    refuse here: the batch asks again before it pushes, and a network blip must not fail a review.
+    `allow` (push.allow_protected) lets main, master and the remote's default branch through."""
+    if branch in push.PROTECTED and not (allow and branch != "HEAD"):
+        return f"refusing to push to {remote}/{branch}" + (f": {push.PROTECTED_HINT}" if branch != "HEAD" else "")
+    if not allow and _default_branch(p, remote) == branch:
+        return f"refusing to push to {remote}/{branch}, the remote's default branch: {push.PROTECTED_HINT}"
     return ""
 
 
@@ -214,7 +215,7 @@ def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None
     tgt = target(p) if enabled(p, cfg) else None
     if not tgt:
         return {"invalid": "no target branch: set delivery.push_branch"}
-    why = _refusal(p, *tgt)
+    why = _refusal(p, *tgt, push.allow_protected(d))
     if why:
         return {"invalid": why}
     if not isinstance(entries, list) or not entries or not all(isinstance(e, dict) for e in entries):

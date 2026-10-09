@@ -119,6 +119,8 @@ USER_SETTABLE = {
     "delivery.backup_remote": lambda v: _backup_remote(v),
     # Branches each push also fast-forwards to the pushed commit (e.g. a 'last best' main); [] turns it off.
     "delivery.fast_forward_also": lambda v: v,   # checked against delivery.push_branch in config_set
+    # Lets ttp push and the push queue publish to a push branch that is main, master or the remote's default.
+    "delivery.allow_protected_push_branch": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     # Code tasks whose spec asks for it land on delivery.push_branch with `ttp push` themselves.
     "delivery.code_tasks_may_push": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     # The runaway valve on task creation; the coordinator may raise it within MAX_TASKS_PER_DAY.
@@ -572,8 +574,9 @@ def _norm_severity(s: str | None) -> str:
 NEEDS_USER = {"budget.daily_usd": "spend", "budget.weekly_usd": "spend", "budget.reserve_pct": "spend",
               "budget.global_daily_usd": "spend",
               "delivery.code_tasks_may_push": "review", "delivery.backup_remote": "access",
-              "delivery.fast_forward_also": "restriction"}
-SAFE_WHEN_OFF = {"delivery.code_tasks_may_push", "delivery.backup_remote", "delivery.fast_forward_also"}
+              "delivery.fast_forward_also": "restriction", "delivery.allow_protected_push_branch": "restriction"}
+SAFE_WHEN_OFF = {"delivery.code_tasks_may_push", "delivery.backup_remote", "delivery.fast_forward_also",
+                 "delivery.allow_protected_push_branch"}
 
 
 def tasks_made(db, since: float, review: bool = False) -> list[float]:

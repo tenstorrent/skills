@@ -14430,6 +14430,73 @@ def test_push_refuses_the_remotes_default_branch(env, monkeypatch, capsys):
     assert _git_out(origin, "rev-parse", "proj") == before
 
 
+def test_push_to_main_needs_allow_protected_push_branch_and_keeps_checks_rebase_and_no_force(env, monkeypatch, capsys):
+    # main (here also the remote's default branch) is refused by default, with a message that names
+    # the opt-in and forbids a raw `git push`. With delivery.allow_protected_push_branch on, the push
+    # goes through the same checks and rebase as any other branch; a detached HEAD never does.
+    from ttp import coordinator as coord, push
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["test ! -f broken.txt"])
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/main")
+    subprocess.run(["git", "-C", str(origin), "symbolic-ref", "HEAD", "refs/heads/main"], check=True)
+    before = _git_out(origin, "rev-parse", "main")
+    p.set_config("delivery.push_branch", "origin/main")
+    _commit(repo, "mine.txt", "mine\n")
+    assert _ttp_push() == 2
+    err = capsys.readouterr().err
+    assert "refusing to push to origin/main" in err and "delivery.allow_protected_push_branch" in err \
+        and "never fall back to a raw `git push`" in err, err
+    for off in (None, False, "false", "", 0):
+        assert push.allow_protected({"allow_protected_push_branch": off}) is False, off
+    assert push.allow_protected(None) is False
+    # From chat it needs the user's word; turning it off does not.
+    ask = {"type": "config_set", "key": "delivery.allow_protected_push_branch", "value": True}
+    assert "ask_user (blocking restriction)" in coord.apply(p, [ask])[0]
+    assert "allow_protected_push_branch" not in (p.config().get("delivery") or {})
+    assert coord.apply(p, [{**ask, "value": False}]) == []
+    assert coord.apply(p, [ask], user_turn=True) == [] and push.allow_protected(p.config()["delivery"])
+    # Checks still run and still stop it.
+    _commit(repo, "broken.txt", "x\n")
+    assert _ttp_push() == 4 and _git_out(origin, "rev-parse", "main") == before
+    _git_out(repo, "reset", "-q", "--hard", "HEAD~1")
+    # Someone else moved main: the push rebases onto it, never forces.
+    _commit(other, "theirs.txt", "theirs\n")
+    _git_out(other, "push", "-q", "origin", "HEAD:main")
+    moved = _git_out(origin, "rev-parse", "main")
+    assert _ttp_push() == 0
+    assert _git_out(origin, "rev-parse", "main") == _git_out(repo, "rev-parse", "HEAD") != moved
+    assert _git_out(origin, "rev-parse", "main~1") == moved
+    assert _git_out(origin, "show", "main:theirs.txt") == "theirs" and _git_out(origin, "show", "main:mine.txt") == "mine"
+    # The opt-in never covers a detached HEAD, nor `--own` publishing to main.
+    p.set_config("delivery.push_branch", "origin/HEAD")
+    assert _ttp_push() == 2 and "refusing to push to origin/HEAD" in capsys.readouterr().err
+    p.set_config("delivery.push_branch", "origin/proj")
+    _git_out(repo, "checkout", "-q", "-B", "main")
+    with pytest.raises(ValueError, match="shared branch"):
+        push.own_target(p, repo)
+
+
+def test_a_push_batch_and_the_queue_publish_to_main_only_with_allow_protected_push_branch(env, monkeypatch):
+    from ttp import pushq
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["test ! -f broken.txt"])
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/main")
+    subprocess.run(["git", "-C", str(origin), "symbolic-ref", "HEAD", "refs/heads/main"], check=True)
+    p.set_config("delivery.push_branch", "origin/main")
+    before = _git_out(origin, "rev-parse", "main")
+    heads = [_entry(repo, "e1", {"f1.txt": "1\n"})]
+    assert "allow_protected_push_branch" in pushq._refusal(p, "origin", "main")
+    rc, m = _run_batch(p, _batch_marker(p, heads, target="origin/main"), monkeypatch)
+    assert rc == 2 and _statuses(m) == ["refused"] and _git_out(origin, "rev-parse", "main") == before, m
+    p.set_config("delivery.allow_protected_push_branch", True)
+    assert pushq._refusal(p, "origin", "main", True) == "" and pushq._refusal(p, "origin", "HEAD", True)
+    # The checks still run on the batch.
+    bad = [_entry(repo, "e2", {"broken.txt": "x\n"})]
+    rc, m = _run_batch(p, _batch_marker(p, bad, bid="b2", target="origin/main"), monkeypatch)
+    assert _statuses(m) != ["pushed"] and _git_out(origin, "rev-parse", "main") == before, m
+    rc, m = _run_batch(p, _batch_marker(p, heads, bid="b3", target="origin/main"), monkeypatch)
+    assert rc == 0 and _statuses(m) == ["pushed"], m
+    assert _git_out(origin, "show", "main:f1.txt") == "1" and _git_out(origin, "rev-parse", "main~1") == before
+
+
 @pytest.mark.parametrize("value", [False, 0, "false", "0", "no", "off", "False", " OFF "])
 def test_push_reads_push_allowed_strings_as_false(env, monkeypatch, capsys, value):
     p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
@@ -27155,6 +27222,41 @@ def test_the_review_of_a_change_that_must_not_reach_the_push_branch_has_no_push_
     p.set_config("delivery.push_branch", "")
     rev = review("no branch", {"notes/c.md": 5})
     assert "Review only" in rev["spec"] and push.REVIEW_ONLY_LABEL not in json.loads(rev["labels"])
+
+
+def test_allow_protected_push_branch_lets_reviews_push_to_main_and_without_it_they_never_git_push(env, monkeypatch, capsys):
+    from ttp import cli, push, pushq
+    from ttp.project import config_problems
+    p = make(env)
+    monkeypatch.setattr(pushq, "enabled", lambda *a, **k: False)   # no prechecks: the spec text is the subject
+    for ref in ("main", "origin/master", "refs/heads/main"):
+        assert push.push_branch_problem(ref, allow=True) == "", ref
+        assert "allow_protected_push_branch" in push.push_branch_problem(ref)
+    assert "always refuses" in push.push_branch_problem("HEAD", allow=True)
+    _with_origin(env, clone=False)
+    p.set_config("delivery.push_branch", "main")
+
+    def review(title):
+        _, _, _, (rev,) = _finish_code(env, p, title, {f"{title}.py": 3})
+        return rev
+
+    rev = review("off")
+    assert "Review only" in rev["spec"] and "never fall back to a raw `git push` to main" in rev["spec"]
+    assert push.REVIEW_ONLY_LABEL in json.loads(rev["labels"]) and "ttp push` from" not in rev["spec"]
+    cli.main(["doctor", p.name])
+    out = capsys.readouterr().out
+    assert "delivery.allow_protected_push_branch" in out and "raw `git push`" in out
+    p.set_config("delivery.allow_protected_push_branch", True)
+    assert not any("push_branch" in x for x in config_problems(p.raw_config(), p.root))
+    rev = review("on")
+    assert "ttp push` from" in rev["spec"] and push.REVIEW_ONLY_LABEL not in json.loads(rev["labels"])
+    # The prompts say the same: the reviewer never falls back to git push; only the user's word sets the key.
+    text = (RUNTIME.parent / "template" / "prompts" / "kind-review.md").read_text()
+    assert "NEVER fall back to a raw `git push` to that branch" in text
+    coordinator = (RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text()
+    rule = next(line for line in coordinator.splitlines() if line.startswith("| `config_set`"))
+    assert "`delivery.allow_protected_push_branch`" in rule and rule.index("allow_protected") < rule.index("only on the user's word")
+    assert "never a raw `git push` to it" in coordinator
 
 
 def test_a_push_branch_no_push_can_reach_is_flagged_and_its_reviews_are_review_only(env, monkeypatch, capsys):
