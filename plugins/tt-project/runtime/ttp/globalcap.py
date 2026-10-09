@@ -182,8 +182,17 @@ def _rows(conn: sqlite3.Connection, start: float, end: float) -> list[dict]:
     return [{"provider": p, "key": k, "usd": round(u, 4)} for (p, k), u in out.items()]
 
 
+def connect_ro(path: Path, timeout: float = 5) -> sqlite3.Connection:
+    """Another project's database, opened without writing a byte of it. While it has a -wal file (its
+    daemon or a command has it open) as an ordinary reader (mode=ro); otherwise as immutable, since
+    even a read-only reader of a WAL database creates its -wal and -shm files."""
+    path = Path(path).absolute()
+    wal = path.with_name(path.name + "-wal").exists()
+    return sqlite3.connect(f"{path.as_uri()}?{'mode=ro' if wal else 'immutable=1'}", uri=True, timeout=timeout)
+
+
 def _read_only(path: Path, start: float, end: float) -> list[dict]:
-    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+    conn = connect_ro(path)
     try:
         return _rows(conn, start, end)
     finally:

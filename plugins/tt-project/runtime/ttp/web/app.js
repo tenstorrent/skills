@@ -22,7 +22,22 @@ document.querySelectorAll("#tabs button").forEach((b) => b.onclick = () => {
   document.querySelectorAll("#tabs button, .tab").forEach((x) => x.classList.remove("on"));
   b.classList.add("on"); $("#" + b.dataset.tab).classList.add("on");
   if (b.dataset.tab === "chat") $("#msg").focus();
+  if (b.dataset.tab === "projects") projects();
 });
+
+// The Projects tab: /api/overview, the same lines as `ttp overview`. A name links only where the
+// registry gives the project a link.
+async function projects() {
+  const o = await api("/api/overview");
+  const name = (r) => r.url ? `<a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.name)}</a>` : esc(r.name);
+  put($("#projlist"), o.projects.length ? `<table><tr><th>Project</th><th>Daemon</th><th>Version</th><th>Open asks</th><th>Waiting on you</th><th>Running</th><th>Spend</th></tr>` +
+    o.projects.map((r) => !r.ok ? `<tr><td><b>${name(r)}</b></td><td colspan="6" class="meta">${esc(r.note)}</td></tr>`
+      : `<tr><td><b>${name(r)}</b></td><td><span class="pill ${r.daemon === "running" ? "" : "lv-red"}">${esc(r.daemon)}</span></td>` +
+        `<td>${esc(r.version)}${r.lag ? ` <span class="pill lv-orange">behind ${esc(r.lib)}</span>` : r.ahead ? ` <span class="meta">ahead of ${esc(r.lib)}</span>` : ""}</td>` +
+        `<td>${r.asks}</td><td>${r.waiting_on_user}</td><td>${r.running}</td><td>${esc(o.spend[r.name] || "")}</td></tr>`).join("") + `</table>`
+    : `<p class="muted">No projects registered on this machine.</p>`);
+  text($("#projfoot"), o.footer);
+}
 
 function gateHtml(gates) {
   const ks = Object.keys(gates || {});
@@ -260,4 +275,4 @@ async function pollChat() {
 $("#say").onsubmit = async (e) => { e.preventDefault(); const t = $("#msg").value.trim(); if (!t) return; $("#msg").value = ""; await api("/api/say", { text: t }); pollChat(); };
 
 refresh(); pollChat();
-setInterval(() => { if (!document.hidden) { refresh(); pollChat(); } }, 4000);
+setInterval(() => { if (!document.hidden) { refresh(); pollChat(); if ($("#projects").classList.contains("on")) projects().catch(() => {}); } }, 4000);

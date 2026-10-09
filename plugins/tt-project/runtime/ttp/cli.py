@@ -1920,11 +1920,21 @@ def cmd_ci(a) -> None:
 
 
 def cmd_list(a) -> None:
+    if getattr(a, "status", False):
+        return cmd_overview(a)
     reg = load_registry().get("projects", {})
     if not reg:
         print("no projects registered on this machine")
     for name, e in sorted(reg.items()):
         print(f"{name}\t{e.get('host')}:{e.get('dir')}")
+
+
+def cmd_overview(a) -> None:
+    """Every project on this machine at a glance: daemon, harness version, asks, waiting, running,
+    spend today; other projects are only read (overview.py)."""
+    from . import overview as ov
+    data = ov.overview()
+    print(json.dumps(data, indent=1, default=str) if getattr(a, "json", False) else ov.text(data))
 
 
 def cmd_find(a) -> None:
@@ -3236,8 +3246,14 @@ def main(argv: list[str] | None = None) -> None:
                         "[--workdir <dir on the host>] [--no-lint] -- <command>; probe: <id>; status: [<id>]; clear: <config>")
     s.set_defaults(fn=cmd_devq)
 
-    for name, fn in (("list", cmd_list),):
-        sub.add_parser(name).set_defaults(fn=fn)
+    s = sub.add_parser("list", help="projects registered on this machine")
+    s.add_argument("--status", action="store_true", help="one status line per project, as `ttp overview`")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_list)
+    s = sub.add_parser("overview", help="every project on this machine: daemon, version, asks, waiting, running, "
+                                        "spend today; other projects are only read")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_overview)
     s = sub.add_parser("find", help="locate a project by name (registry, then chat logs)")
     s.add_argument("name")
     s.set_defaults(fn=cmd_find)

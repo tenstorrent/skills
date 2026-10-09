@@ -5,6 +5,7 @@
 | Command | Does |
 |---|---|
 | `ttp list` | projects known on this machine |
+| `ttp overview [--json]` / `ttp list --status` | one line per project on this machine: daemon running, stopped or stale; harness version, flagged when behind the installed release; open asks; tasks waiting on the user; running workers; spend today vs its cap; then the global daily cap. Other projects are only read; remote ones show "remote, not checked". The web app's Projects tab shows the same |
 | `ttp find <name>` | locate by registry, then by chat-log locators |
 | `ttp adopt <name> --host H --dir D` | record where a project lives |
 | `ttp status [<name>] [--json]` | daemon, spend vs caps, coordinator health, why idle, running/blocked/waiting tasks, open questions, a newer tt-project release; without a name, the project of the current folder |

@@ -535,6 +535,11 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if url.path == "/api/state":
                 return self._send(200, state_payload(self._proj(), db))
+            if url.path == "/api/overview":
+                from . import overview
+                data = overview.overview()
+                return self._send(200, {**data, "footer": overview.footer(data["global"]),
+                                        "spend": {r["name"]: overview.spend(r) for r in data["projects"] if r["ok"]}})
             if url.path == "/api/messages":
                 q = parse_qs(url.query)
                 after = int(q.get("after", ["0"])[0])

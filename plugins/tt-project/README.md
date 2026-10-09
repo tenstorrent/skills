@@ -32,6 +32,7 @@ only requirements; the runtime uses the standard library.
 | "Connect to project X" | this chat attaches; replies and alerts arrive here |
 | anything addressed to the project | relayed to the coordinator; its answer comes back to this chat |
 | "What is X doing?" | `ttp status X`: running work, blockers, spend, why idle |
+| "How are all my projects?" | `ttp overview` (or the web app's Projects tab): one line per project on this machine |
 
 The brief can be inline text, a file, or links. Goals, restrictions ("never access the internet")
 and preferences you add later become part of the project's charter and memory.

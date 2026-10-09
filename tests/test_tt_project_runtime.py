@@ -27525,6 +27525,108 @@ def test_the_global_total_and_the_project_caps_count_spend_by_one_rule(env, tmp_
     assert gcap.total(p.db, "claude", now - 3600, now + 3600, now, account="acct-a")["usd"] == 6.0
 
 
+def _overview_project(tmp_path, name, version, host="testhost"):
+    """A small project folder (settings, harness runtime version, database) registered as `ttp list` shows it."""
+    from ttp.db import DB
+    from ttp.project import FOLDER, register
+    base = tmp_path / name / FOLDER
+    (base / "harness" / "runtime" / "ttp").mkdir(parents=True)
+    (base / "harness" / "project.json").write_text(json.dumps({"name": name, "budget": {"daily_usd": 50}}))
+    (base / "harness" / "runtime" / "ttp" / "__init__.py").write_text(f'__version__ = "{version}"\n')
+    register(name, {"host": host, "dir": str(tmp_path / name)})
+    return base, DB(base / "state" / "project.db")
+
+
+def _tree(root):
+    """Every file under root with its mtime and content hash. A live database's -shm is SQLite's
+    shared memory, where every reader (any `ttp` command too) records its read mark: only its size."""
+    import hashlib
+    return {str(f): (f.stat().st_size,) if f.name.endswith("-shm") else
+            (f.stat().st_mtime_ns, hashlib.sha256(f.read_bytes()).hexdigest())
+            for f in sorted(root.rglob("*")) if f.is_file()}
+
+
+def test_overview_lists_every_project_and_never_modifies_them(env, tmp_path, capsys):
+    from ttp import project
+    from ttp.cli import main
+    lib = project.HOME_DIR / "lib" / "current" / "runtime" / "ttp"
+    lib.mkdir(parents=True)
+    (lib / "__init__.py").write_text('__version__ = "0.9.0"\n')
+    now = time.time()
+    # Stopped: no daemon has run.
+    _, a = _overview_project(tmp_path, "alpha", "0.9.0")
+    a.spend("claude", 3.0, "task:1", account="acct")
+    a.close()
+    # Lagging, with a running daemon (this process) that keeps its database open.
+    bb, b = _overview_project(tmp_path, "beta", "0.8.1")
+    b.set_kv("daemon", {"pid": os.getpid(), "host": "testhost", "started": now})
+    (bb / "state" / "heartbeat").write_text(json.dumps({"pid": os.getpid()}))
+    b.x("INSERT INTO runs(role,provider,started,status) VALUES('worker','claude',?,'running')", (now,))
+    # An open ask and a blocked task; its daemon's process is up but its heartbeat is old.
+    cb, c = _overview_project(tmp_path, "gamma", "0.9.0")
+    c.post("out", "Merge it?", kind="ask")
+    c.add_task("needs a credential", "", kind="code")
+    c.x("UPDATE tasks SET status='blocked'")
+    c.set_kv("daemon", {"pid": os.getpid(), "host": "testhost", "started": now})
+    hb = cb / "state" / "heartbeat"
+    hb.write_text(json.dumps({"pid": os.getpid()}))
+    os.utime(hb, (now - 3600, now - 3600))
+    c.close()
+    project.register("delta", {"host": "otherhost", "dir": "/srv/delta"})
+    before = _tree(tmp_path / "alpha"), _tree(tmp_path / "beta"), _tree(tmp_path / "gamma")
+    capsys.readouterr()
+    main(["overview"])
+    out = capsys.readouterr().out.splitlines()
+    lines = {x.split("\t")[0]: x for x in out}
+    assert "daemon stopped" in lines["alpha"] and "v0.9.0 ·" in lines["alpha"], out
+    assert "today $3.00 of $50 cap" not in lines["alpha"] and "24h $3.00 of $50 cap" in lines["alpha"], out
+    assert "daemon running" in lines["beta"] and "v0.8.1 (behind installed 0.9.0)" in lines["beta"], out
+    assert "1 running" in lines["beta"] and "0 open asks" in lines["beta"], out
+    assert "daemon stale (no tick for 60 min)" in lines["gamma"], out
+    assert "1 open ask ·" in lines["gamma"] and "1 waiting on you" in lines["gamma"], out
+    assert "remote, not checked" in lines["delta"], out
+    assert out[-1].startswith("global daily cap $200 per 24h: claude $3.00 billed by this machine's 3 projects"), out
+    main(["list", "--status"])
+    assert capsys.readouterr().out.splitlines() == out
+    # Nothing in the other projects was written, created or touched.
+    after = _tree(tmp_path / "alpha"), _tree(tmp_path / "beta"), _tree(tmp_path / "gamma")
+    assert [{k: (x.get(k), y.get(k)) for k in x.keys() | y.keys() if x.get(k) != y.get(k)} for x, y in zip(before, after)] == [{}] * 3
+    b.close()
+
+
+def test_overview_reads_ten_projects_in_under_two_seconds(env, tmp_path):
+    from ttp import overview
+    for i in range(10):
+        _, db = _overview_project(tmp_path, f"proj{i}", "0.9.0")
+        db.spend("claude", 1.0, "task:1")
+        db.post("out", "Ship it?", kind="ask")
+        db.close()
+    t0 = time.monotonic()
+    ov = overview.overview()
+    assert time.monotonic() - t0 < 2.0
+    assert len(ov["projects"]) == 10 and all(r["ok"] and r["asks"] == 1 for r in ov["projects"])
+
+
+def test_web_api_overview_serves_the_projects_tab(env, tmp_path):
+    from ttp import web
+    p = make(env)
+    _overview_project(tmp_path, "other", "0.9.0")[1].close()
+    from ttp.project import register
+    register("linked", {"host": "otherhost", "dir": "/srv/linked", "url": "https://example.invalid/linked"})
+    port = _start_web(p)
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/api/overview", headers={"X-TTP-Token": web.token(p)})
+    data = json.loads(urllib.request.urlopen(req, timeout=5).read())
+    names = {r["name"]: r for r in data["projects"]}
+    assert set(names) == {"demo", "other", "linked"} and names["demo"]["ok"] and names["other"]["ok"]
+    assert names["linked"]["url"] == "https://example.invalid/linked" and "url" not in names["other"]
+    assert data["footer"].startswith("global daily cap") and "other" in data["spend"]
+    with pytest.raises(urllib.error.HTTPError) as e:
+        urllib.request.urlopen(f"http://127.0.0.1:{port}/api/overview", timeout=5)
+    assert e.value.code == 401
+    html = (RUNTIME / "ttp" / "web" / "index.html").read_text()
+    assert 'data-tab="projects"' in html and 'id="projlist"' in html
+
+
 def test_global_total_excludes_plan_spend_before_switch(env, tmp_path):
     # The global total counts only billed spend, as the project caps do (billing.billed_by_account):
     # plan account A's $240 before the switch to usage-billed B stays out, B's $15 counts, here and in
