@@ -4816,7 +4816,7 @@ def test_guard_flags_a_conditional_lift_and_another_verb_on_the_same_target(env)
             ("Never push to main.", "Pushing is fine once CI passes."),
             ("Never push to main.", "Workers may push after a green review."),
             ("Never deploy to production.", "Workers may deploy when tests pass."),
-            ("Never disturb FastH3's running jobs.", "Killing FastH3's stuck jobs is allowed."),
+            ("Never disturb project-b's running jobs.", "Killing project-b's stuck jobs is allowed."),
             ("Never touch box-a.", "Rebooting box-a is fine."),
             ("Never use the shared device.", "Workers may restart services."),
             ("Never alter the release notes.", "Workers may deploy the docs."))):
