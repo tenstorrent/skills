@@ -4364,7 +4364,10 @@ def test_charter_update_quote_removes_or_replaces_one_item(env):
     # One sentence inside a paragraph goes and the paragraph stays whole.
     assert coord.apply(p, [{**act, "quote": "Notify only for decisions."}], turn=2) == []
     assert "\n\nLabel every number.\n\n## Restrictions" in p.charter_path.read_text()
-    # Replace in place.
+    # Replace in place (guarded like an append: pushing is about what "Never touch box A." bans).
+    assert "contradicts the Restrictions item \"Never touch box A.\"" in coord.apply(
+        p, [{**act, "quote": "Push daily.", "text": "Push weekly."}], turn=3)[0]
+    act["both_hold"] = True
     assert coord.apply(p, [{**act, "quote": "Push daily.", "text": "Push weekly."}], turn=3) == []
     assert "## Policies\n- Push weekly.\n- Draft PRs." in p.charter_path.read_text()
     assert "### Replaced in Policies (" in hist.read_text() and "Push daily.\nNow: Push weekly." in hist.read_text()
@@ -4452,9 +4455,9 @@ def test_charter_update_restriction_items_change_only_on_the_users_word(env, tmp
     for act in (drop, {**drop, "text": "Never reboot box B."}):
         assert "needs the user's word" in coord.apply(p, [act], turn=1)[0]
     assert "Never touch box A." in p.charter_path.read_text() and not hist.exists()
-    # Adding one needs no such word.
-    assert coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "text": "Never restart the service."}],
-                       turn=2) == []
+    # Adding one needs no such word ("touch" covers restarting: the guard asks, both hold).
+    assert coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "text": "Never restart the service.",
+                            "both_hold": True}], turn=2) == []
     assert coord.apply(p, [drop], turn=3, user_turn=True) == []
     charter = p.charter_path.read_text()
     assert "Never touch box A." not in charter and "Never merge.\n\nNever restart the service." in charter
@@ -4543,7 +4546,7 @@ def test_an_append_that_contradicts_a_standing_restriction_is_rejected_quoting_i
                "text": "Never push to the main branch, except as the temporary section allows."},
               {"section": "Restrictions", "text": "Pushing hotfixes to the main branch is allowed.",
                "expires": "1d"}], True),
-            ([{"section": "Policies", "text": "Pushing to the release branch is allowed."}], False),
+            ([{"section": "Policies", "text": "Deleting stale release tags is allowed."}], False),
             ([{"section": "Policies", "text": "Workers may push to the main branch for hotfixes.",
                "both_hold": True}], True))):
         db.x("DELETE FROM events")
@@ -4557,7 +4560,7 @@ def test_an_append_that_contradicts_a_standing_restriction_is_rejected_quoting_i
             "- Never disturb the other project's running jobs.\n- Never use a paused device.\n")
     p.charter_path.write_text(bans)
     assert coord.apply(p, [{"type": "charter_update", "section": "Policies",
-                            "text": "Workers may run the tests on their own branch."}], turn=50, user_turn=True) == []
+                            "text": "Workers keep their notes short."}], turn=50, user_turn=True) == []
     for k, (text, ban) in enumerate([(t, "Never open pull requests.") for t in (
             "PR flow, for any repo where PRs are allowed: open a draft PR once tested.",
             "Once PRs are allowed, open drafts first.", "Only the user may open pull requests.")]
@@ -4571,7 +4574,7 @@ def test_an_append_that_contradicts_a_standing_restriction_is_rejected_quoting_i
         add = {"type": "charter_update", "section": "Policies", "text": text}
         err = coord.apply(p, [add], turn=51 + 2 * k, user_turn=True)
         assert len(err) == 1 and f"contradicts the Restrictions item \"{ban}\" (section 'Restrictions')" in err[0], err
-        assert err[0].count("(section ") == 1 and "`both_hold`: true" in err[0], (text, err)
+        assert "`both_hold`: true" in err[0], (text, err)   # generic verbs (disturb, use) may add items
         assert coord.apply(p, [{**add, "both_hold": True}], turn=52 + 2 * k, user_turn=True) == [], text
         assert text in p.charter_path.read_text() and ban in p.charter_path.read_text()
     # The rejection offers keeping both as an equal fix, not a fallback after replacing the item.
@@ -4581,15 +4584,15 @@ def test_an_append_that_contradicts_a_standing_restriction_is_rejected_quoting_i
     assert "two equal fixes" in err[0] and "Never drop a restriction the user did not change" in err[0], err
 
 def test_restriction_pairs_flags_contradicting_restrictions_items_and_only_those(env):
-    from ttp.coordinator import restriction_pairs
+    from ttp.coordinator import restriction_pairs, _overlaps
 
     def pairs(body, extra=""):
         return [(x["forbid"], x["allow"]) for x in restriction_pairs(f"# demo\n\n## Restrictions\n{body}{extra}")]
     dated = "\n## Restrictions (added 2026-10-05, turn 3.0)\n"
     # True positives: a lift left next to the ban it lifts, across a dated section too, in either
     # wording ("is not allowed" forbids, "no longer forbidden" allows), and a blanket ban on an action.
-    assert pairs("- Never modify main.\n", dated + "- Pushing to main is allowed.\n") == [
-        ("Never modify main.", "Pushing to main is allowed.")]
+    assert pairs("- Never push to main.\n", dated + "- Pushing to main is allowed.\n") == [
+        ("Never push to main.", "Pushing to main is allowed.")]
     assert pairs("- Deploying to box A is not allowed.\n- Deploying to box A is fine now.\n") == [
         ("Deploying to box A is not allowed.", "Deploying to box A is fine now.")]
     assert len(pairs("- Do not push to the docs repo.\n- Pushing to the docs repo is no longer forbidden.\n")) == 1
@@ -4600,17 +4603,20 @@ def test_restriction_pairs_flags_contradicting_restrictions_items_and_only_those
     # or actor (one rewrite settles it): a general allowance, a limited or conditional one, one
     # reserved to who may act, an action on what the ban names.
     for ban, allow in (("Never push to main.", "Pushing is allowed."),
-                       ("Never use a paused device.", "Device pauses are lifted only on the user's explicit word."),
                        ("Never push to main.", "Pushing to main is allowed only on the user's explicit word."),
                        ("Never disturb the other project's running jobs.", "Workers may run jobs on the device."),
                        ("Never push to main.", "Only the user may push to main."),
                        ("Never push to main.", "The user alone may push to main."),
                        ("Never push to main.", "Pushing to main is allowed for the user only."),
                        ("Never push to main.", "Main may be pushed to by the user alone."),
-                       ("Never open pull requests.", "Only the user may open pull requests."),
-                       ("Never use a paused device.", "Only the user lifts device pauses."),
-                       ("Never use a paused device.", "Only the user may lift a device pause.")):
+                       ("Never open pull requests.", "Only the user may open pull requests.")):
         assert pairs(f"- {ban}\n- {allow}\n") == [(ban, allow)], allow
+    # The lint pairs only the very same action (a pair stays in every digest until settled); the
+    # guard (one resend) also takes a generic verb or a shared object with any action.
+    for ban, allow in (("Never use a paused device.", "Device pauses are lifted only on the user's explicit word."),
+                       ("Never use a paused device.", "Only the user lifts device pauses."),
+                       ("Never modify main.", "Pushing to main is allowed.")):
+        assert pairs(f"- {ban}\n- {allow}\n") == [] and _overlaps(ban, allow), allow
     # No false positives: the ban names its exception; another target (branch, box, repo); another
     # action on the same target; one item stating its own exception in a second sentence; a real
     # charter's prohibitions.
@@ -4680,7 +4686,8 @@ def test_only_or_alone_is_a_limit_only_when_it_names_an_actor_so_a_scoped_lift_i
             "Device pauses are lifted again only on the user's explicit word.")]):
         err = guard(ban, text, 40 + k)
         assert len(err) == 1 and f"\"{ban}\" (section 'Restrictions')" in err[0], (text, err)
-        assert lint(ban, text) == [(ban, text)], text
+        # The lint pairs only the very same action: lifting a pause names none.
+        assert lint(ban, text) == ([(ban, text)] if "push" in ban else []), text
 
 
 def test_guard_flags_lifts_with_an_inverted_modal_a_passive_verb_is_fine_ok_or_no_action(env):
@@ -4705,7 +4712,7 @@ def test_guard_flags_lifts_with_an_inverted_modal_a_passive_verb_is_fine_ok_or_n
         err = guard(text, 70 + k)
         assert len(err) == 1 and "\"Never push to main.\" (section 'Restrictions')" in err[0], (text, err)
         assert err[0].count("(section ") == 1, (text, err)
-    for k, text in enumerate(("Workers may push to their own branch.", "Release tags are OK once CI passes.",
+    for k, text in enumerate(("Workers may run the tests.", "Release tags are OK once CI passes.",
                               "The docs folder is no longer off-limits.", "Workers may run the tests.")):
         assert guard(text, 90 + k) == [], text
 
@@ -4730,7 +4737,8 @@ def test_actor_words_are_no_rule_target_and_an_inverted_may_skips_any_actor(env)
             ("Never let workers touch the shared folder.", "Workers may push to their own branch."),
             ("Never let workers delete files on the shared box.", "Workers may write logs to their run folder."))):
         assert lint(ban, text) == [], text
-        assert guard(ban, text, 10 + k) == [], text
+        # The guard (one resend) flags the same action on another target; the lint does not.
+        assert "`both_hold`: true" in guard(ban, text, 10 + k)[0], text
     for k, (ban, text) in enumerate((
             ("Never let workers push to main.", "Workers may push to main."),
             ("Never push to main.", "Only after review may the coordinator push to main."),
@@ -4787,7 +4795,6 @@ def test_guard_and_lint_flag_every_rule_about_what_a_ban_is_about_whatever_its_s
     # Clearly unrelated rules pass and pair with nothing.
     for k, text in enumerate(("Allow the web app to show spend per task.", "Never delete release tags.",
                               "Workers may run the tests on their own branch.", "No problem if workers run the tests.",
-                              "Workers can run the tests and push to their own branch.",
                               "No rule stops workers from opening draft PRs.", "Keep content generic and safe to open-source.",
                               "Notify the user only for decisions and outages.")):
         assert guard(short, text, 80 + k) == [], text
@@ -4799,18 +4806,109 @@ def test_guard_and_lint_flag_every_rule_about_what_a_ban_is_about_whatever_its_s
     assert len(err) == 1 and "\"Never push to main.\" (section 'Restrictions')" in err[0], err
 
 
+def test_guard_flags_a_conditional_lift_and_another_verb_on_the_same_target(env):
+    """The guard (a false hit costs one `both_hold` resend) takes the same action whatever its
+    objects or conditions ("once CI passes" names no target), a shared target whatever the verbs,
+    and a generic verb (touch, disturb, use, modify, alter) as every action."""
+    p = make(env)
+    from ttp import coordinator as coord
+    for k, (ban, text) in enumerate((
+            ("Never push to main.", "Pushing is fine once CI passes."),
+            ("Never push to main.", "Workers may push after a green review."),
+            ("Never deploy to production.", "Workers may deploy when tests pass."),
+            ("Never disturb FastH3's running jobs.", "Killing FastH3's stuck jobs is allowed."),
+            ("Never touch box-a.", "Rebooting box-a is fine."),
+            ("Never use the shared device.", "Workers may restart services."),
+            ("Never alter the release notes.", "Workers may deploy the docs."))):
+        p.charter_path.write_text(f"# demo\n\n## Restrictions\n- {ban}\n")
+        err = coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": text}],
+                          turn=10 + k, user_turn=True)
+        assert len(err) == 1 and f"\"{ban}\" (section 'Restrictions')" in err[0], (ban, text, err)
+
+
+def test_a_quote_edit_outside_a_user_turn_is_guarded_unless_it_is_refused_anyway(env):
+    """A quote edit in Policies or Goals is guarded in any turn; only an unapproved edit of a
+    Restrictions item skips the guard, since it is refused anyway."""
+    p = make(env)
+    from ttp import coordinator as coord
+    base = "# demo\n\n## Restrictions\n- Never push to main.\n\n## Policies\n- Keep it generic.\n"
+    p.charter_path.write_text(base)
+    lift = {"type": "charter_update", "section": "Policies", "quote": "Keep it generic.",
+            "text": "Keep it generic; workers may push to main."}
+    err = coord.apply(p, [lift], turn=1, user_turn=False)
+    assert len(err) == 1 and "\"Never push to main.\" (section 'Restrictions')" in err[0], err
+    assert p.charter_path.read_text() == base
+    assert coord.apply(p, [{**lift, "both_hold": True}], turn=2, user_turn=False) == []
+    assert "workers may push to main" in p.charter_path.read_text()
+    p.charter_path.write_text("# demo\n\n## Restrictions\n- Never push to main.\n- Keep it generic.\n")
+    err = coord.apply(p, [{**lift, "section": "Restrictions"}], turn=3, user_turn=False)
+    assert len(err) == 1 and "needs the user's word" in err[0] and "contradicts" not in err[0], err
+
+
+def test_a_charter_conflicts_pair_settles_as_both_holding_by_its_key(env):
+    """A lint pair that is no real contradiction settles with one model-free acknowledgement by its
+    key (charter_update `both_hold` with `key`, no text): no charter edit, no ask. It leaves the
+    digest, the effort trigger and the daily review, and stays settled; a changed item (a new key)
+    shows again."""
+    p = make(env)
+    from ttp import coordinator as coord, daemon as dm
+    db, cfg = p.db, p.config()
+    charter = ("# demo\n\n## Restrictions\n"
+               "- Push only to branch dev/x of org/tools. Never push to main. Never open pull requests.\n"
+               "- The other project's folder on this machine may be read, never modified.\n"
+               "- Never disturb the other project's running jobs.\n"
+               "- Work only in ~/proj on box-a; on box-b only under /var/tmp/proj.\n"
+               "- Run one device job at a time per box, queued through that box's broker.\n"
+               "- Never submit to a box while its broker is being upgraded.\n"
+               "- (user, 2026-10-06) box-a and box-b may all run project device jobs, each one at a time.\n"
+               "- Never reset devices ourselves.\n"
+               "- Never push to org/broker; write broker bugs up for the user instead.\n"
+               "- Keep content generic: no hostnames, internal URLs or credentials.\n\n"
+               "## Goals\nShip v1.\n")
+    p.charter_path.write_text(charter)
+    found = coord.charter_conflicts(p)
+    assert 1 <= len(found) <= 3, found   # high-recall, but not a flood
+    trig, seen = coord.effort_triggers(db, cfg, [], None, [], None, conflicts=found)
+    assert trig == ["charter conflict"]
+    db.set_kv(coord.EFFORT_SEEN_KEY, seen)
+    for k, x in enumerate(found):   # one acknowledgement per pair
+        assert x["key"] in coord.digest(p, {}, [], [])
+        assert coord.apply(p, [{"type": "charter_update", "both_hold": True, "key": x["key"]}], turn=10 + k) == []
+    assert p.charter_path.read_text() == charter, "settling edits nothing"
+    for turn in range(2):   # and stays settled, turn after turn
+        assert coord.charter_conflicts(p) == []
+        assert "## Charter conflicts" not in coord.digest(p, {}, [], [])
+        assert coord.effort_triggers(db, cfg, [], None, [], None, conflicts=coord.charter_conflicts(p))[0] == []
+    d = dm.Daemon(p.base)
+    d.cfg = cfg
+    s = {"name": "daily-review", "budget_usd_day": None, "last_run": None, "description": "review"}
+    assert d._schedule_llm(s, {}) == "queued"
+    assert "Charter conflicts" not in db.one("SELECT spec FROM tasks WHERE origin='schedule'")["spec"]
+    # An unknown key is refused; nothing is recorded for it.
+    err = coord.apply(p, [{"type": "charter_update", "both_hold": True, "key": "0123456789ab"}], turn=30)
+    assert len(err) == 1 and "no current Charter conflicts pair has key 0123456789ab" in err[0], err
+    # A changed item gets a new key and shows again; the gone pair's key is dropped when the next settles.
+    first = found[0]
+    p.charter_path.write_text(charter.replace(first["allow"], first["allow"].rstrip(".") + " today."))
+    again = coord.charter_conflicts(p)
+    assert len(again) == 1 and again[0]["key"] != first["key"], again
+    assert coord.effort_triggers(db, cfg, [], None, [], None, conflicts=again)[0] == ["charter conflict"]
+    assert coord.apply(p, [{"type": "charter_update", "both_hold": True, "key": again[0]["key"]}], turn=31) == []
+    assert coord.charter_conflicts(p) == [] and first["key"] not in db.kv(coord.CHARTER_SETTLED_KEY)
+
+
 def test_charter_conflicts_show_in_the_digest_raise_effort_once_and_reach_the_daily_review(env):
     p = make(env)
     from ttp import coordinator as coord, daemon as dm
     db, cfg = p.db, p.config()
-    p.charter_path.write_text("# demo\n\n## Restrictions\n- Never modify main.\n- Keep it generic.\n\n"
+    p.charter_path.write_text("# demo\n\n## Restrictions\n- Never push to main.\n- Keep it generic.\n\n"
                               "## Restrictions (added 2026-10-05, turn 3.0)\n- Pushing to main is allowed.\n")
     text = coord.digest(p, {}, [], [])
-    head = "## Charter conflicts (Restrictions items that contradict each other"
-    assert head in text and "`quote`" in text and "`over`" in text and "two equal fixes" in text
-    assert ("- \"Never modify main.\" (Restrictions) vs \"Pushing to main is allowed.\" "
-            "(Restrictions (added 2026-10-05, turn 3.0))") in text
+    head = "## Charter conflicts (Restrictions items that may contradict each other"
+    assert head in text and "`quote`" in text and "`over`" in text and "`both_hold`: true and `key`" in text
     found = coord.charter_conflicts(p)
+    assert (f"- [{found[0]['key']}] \"Never push to main.\" (Restrictions) vs \"Pushing to main is allowed.\" "
+            "(Restrictions (added 2026-10-05, turn 3.0))") in text
     trig, seen = coord.effort_triggers(db, cfg, [], None, [], None, conflicts=found)
     assert trig == ["charter conflict"]
     db.set_kv(coord.EFFORT_SEEN_KEY, seen)
@@ -4821,9 +4919,9 @@ def test_charter_conflicts_show_in_the_digest_raise_effort_once_and_reach_the_da
     assert d._schedule_llm(s, {}) == "queued"
     spec = db.one("SELECT spec FROM tasks WHERE origin='schedule'")["spec"]
     assert "Charter conflicts (Restrictions items that contradict each other" in spec
-    assert "- \"Never modify main.\" (Restrictions) vs \"Pushing to main is allowed.\"" in spec
+    assert "- \"Never push to main.\" (Restrictions) vs \"Pushing to main is allowed.\"" in spec
     # Retired with `quote` and `over`: the section goes, and nothing raises.
-    assert coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "quote": "Never modify main.",
+    assert coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "quote": "Never push to main.",
                             "text": "", "over": "the user lifted it on 2026-10-05 (turn 3.0)"}], turn=9) == []
     assert head not in coord.digest(p, {}, [], []) and coord.charter_conflicts(p) == []
     assert coord.effort_triggers(db, cfg, [], None, [], None, conflicts=[])[0] == []

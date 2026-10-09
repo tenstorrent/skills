@@ -949,6 +949,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
             elif t == "memory_forget":
                 p.forget_memory(str(a.get("name") or ""))
                 memory_budget_check(p)
+            elif t == "charter_update" and a.get("both_hold") and not (a.get("text") or a.get("quote")
+                                                                    or a.get("replaces")):
+                notes.append(settle_conflicts(p, str(a.get("key") or "")))
             elif t == "charter_update":
                 section = " ".join((a.get("section") or "Notes").lstrip("#").split()) or "Notes"
                 text, quote = (a.get("text") or "").strip(), (a.get("quote") or "").strip()
@@ -969,8 +972,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     replaces = str(a.get("replaces") or "")
                     ok, no_ok = (None, "") if user_turn else _charter_approval(p, section, quote, replaces, text)
                     text = ok["text"].strip() if ok else text   # the words the user said yes to
-                    # an edit without the user's word is refused below anyway, and says so
-                    if text and not (replaces or a.get("both_hold") or quote and not (user_turn or ok)):
+                    # a Restrictions item edited without the user's word or `over` is refused below anyway
+                    refused = (quote and _DATED.sub("", section).lower().startswith("restriction")
+                               and not (user_turn or ok or len(over) >= OVER_MIN))
+                    if text and not (replaces or a.get("both_hold") or refused):
                         _reject_contradicting_append(p, section, text, user_turn, messages, ok, quote)
                     try:
                         target, extra, retired = _charter_update(p, section, text, quote, replaces, key,
@@ -1877,8 +1882,9 @@ def charter_lint(p: Project) -> list[str]:
 
 
 # Contradicting Restrictions items (restriction_pairs, _append_conflicts), by one coarse rule
-# (_overlaps): two rules overlap when they share what they do and what to, whatever their stance,
-# condition or scope. A false hit costs one resend or rewrite; a miss leaves a stale ban that workers obey.
+# (_overlaps): two rules overlap when they share what they do or what to, whatever their stance,
+# condition or scope; the lint takes a stricter reading of it. A false hit costs one resend (guard)
+# or one acknowledgement by key (lint, settle_conflicts); a miss leaves a stale ban that workers obey.
 # A word that bans, or one that permits, anywhere in a sentence, for the lint's report: negations,
 # conditions and scopes are not read.
 _BAN_RE = re.compile(r"\b(?:never|not|no|nobody|none|only|must|cannot|without|forbid\w*|prohibit\w*|"
@@ -1887,15 +1893,18 @@ _PERMIT_RE = re.compile(r"\b(?:allow\w*|permit\w*|may|can|fine|ok(?:ay)?|lift\w*
                         r"no (?:problem|objection|issue)s?|objects|minds|stops)\b", re.I)
 # An item that names its own exception ("except as the dated section allows") has been reconciled.
 _OWN_EXCEPTION_RE = re.compile(r"\b(?:except|unless|other than|apart from|save for|excluding)\b", re.I)
-# Actions, by what they do. A generic change ("modify", "write") covers every action that changes
-# something (_WRITES); two specific ones conflict only when they are the same.
-_ACTIONS = {"push": {"push"}, "force-push": {"push"}, "modify": {"write"}, "edit": {"write"},
-            "touch": {"write"}, "alter": {"write"}, "writ": {"write"}, "rewrit": {"write"}, "commit": {"write"},
+# Actions, by what they do. A generic verb ("touch", "modify", "use") covers every action (_ANY); a
+# write covers every action that changes something (_WRITES); two specific ones conflict only when
+# they are the same.
+_ACTIONS = {"push": {"push"}, "force-push": {"push"}, "modify": {"any"}, "modifi": {"any"}, "edit": {"write"},
+            "touch": {"any"}, "alter": {"any"}, "disturb": {"any"}, "use": {"any"}, "using": {"any"},
+            "used": {"any"}, "writ": {"write"}, "rewrit": {"write"}, "commit": {"write"},
             "merg": {"merge"}, "delet": {"delete"}, "remov": {"delete"},
             "open": {"open"}, "creat": {"open"}, "deploy": {"deploy"}, "publish": {"deploy"},
             "install": {"install"}, "upgrad": {"install"}, "run": {"run"}, "runn": {"run"}, "start": {"run"},
             "submit": {"run"}, "restart": {"stop"}, "reboot": {"stop"}, "kill": {"stop"}, "cancel": {"stop"},
             "stop": {"stop"}}
+_ANY = "any"
 _WRITES = {"write", "push", "merge", "delete"}
 # Words that are no target: rule, stance, actor and filler words, and verbs that let someone act.
 _NOT_TARGET = {x for w in _RULE_STOP | {
@@ -1912,7 +1921,7 @@ _KINDS = {_stem(w) for w in ("branch", "repo", "repository", "folder", "director
 
 
 def _same_action(a: set[str], b: set[str]) -> bool:
-    return bool(a & b or "write" in a and b & _WRITES or "write" in b and a & _WRITES)
+    return bool(a and b and (a & b or _ANY in a | b or "write" in a and b & _WRITES or "write" in b and a & _WRITES))
 
 
 def _target(sentence: str) -> tuple[set[str], set[str]]:
@@ -1929,19 +1938,20 @@ def _target(sentence: str) -> tuple[set[str], set[str]]:
     return acts, objs
 
 
-def _overlaps(a: str, b: str) -> bool:
-    """Whether two rules are about the same thing: when both name an action it is the same one
-    (_same_action), and they share an object word, or one names no object (a rule on the action
-    alone covers every object). Sharing only a kind of target ("branch") counts only when one of
-    them names nothing else ("Deploying to box A" twice)."""
+def _overlaps(a: str, b: str, strict: bool = False) -> bool:
+    """Whether two rules are about the same thing. For the guard (wide, a false hit costs one
+    resend): they name the same action (_same_action) whatever its objects or conditions, or share
+    an object word whatever their actions; sharing only a kind of target ("branch") counts only when
+    one of them names nothing else ("Deploying to box A" twice). For the lint (`strict`, a pair is
+    reported on every turn until settled): both name the very same action family, and they share an
+    object word the same way, or one names no object (a rule on the action alone covers every object)."""
     aa, ao = _target(a)
     ba, bo = _target(b)
-    if aa and ba and not _same_action(aa, ba):
-        return False
-    if not ao or not bo:
-        return bool(aa and ba)
     shared = ao & bo
-    return bool(shared - _KINDS or shared and not (ao - _KINDS and bo - _KINDS))
+    on_object = bool(shared - _KINDS or shared and not (ao - _KINDS and bo - _KINDS))
+    if strict:
+        return bool(aa & ba) and (not ao or not bo or on_object)
+    return _same_action(aa, ba) or on_object
 
 
 def _restriction_items(charter: str) -> list[tuple[str, str, int]]:
@@ -1981,7 +1991,8 @@ def restriction_pairs(charter: str) -> list[dict]:
         if not _BAN_RE.search(f) or _OWN_EXCEPTION_RE.search(f):
             continue
         for a, asec, an in items:
-            if an == fn or not _PERMIT_RE.search(a) or frozenset((f, a)) in seen or not _overlaps(f, a):
+            if (an == fn or not _PERMIT_RE.search(a) or frozenset((f, a)) in seen
+                    or not _overlaps(f, a, strict=True)):
                 continue
             seen.add(frozenset((f, a)))
             key = hashlib.sha256(f"{' '.join(f.split())}\n{' '.join(a.split())}".encode()).hexdigest()[:12]
@@ -1989,24 +2000,53 @@ def restriction_pairs(charter: str) -> list[dict]:
     return out
 
 
+CHARTER_SETTLED_KEY = "charter_conflicts_settled"   # kv: pair keys (restriction_pairs) settled as both holding
+
+
 def charter_conflicts(p: Project) -> list[dict]:
+    """The charter's contradicting Restrictions pairs, less those the coordinator settled as both
+    holding (settle_conflicts): those leave the digest, the daily review and the effort trigger."""
     try:
-        return restriction_pairs(p.charter_path.read_text())
+        pairs = restriction_pairs(p.charter_path.read_text())
     except OSError:
         return []
+    settled = set(p.db.kv(CHARTER_SETTLED_KEY) or [])
+    return [x for x in pairs if x["key"] not in settled]
+
+
+def settle_conflicts(p: Project, keys: str) -> str:
+    """Record Charter conflicts pairs, by `key`, as both holding (not a real contradiction): no
+    charter edit, no ask. A pair whose item changes gets a new key and shows again; keys of pairs
+    no longer in the charter are dropped."""
+    want = set(re.findall(r"\b[0-9a-f]{12}\b", keys.lower()))
+    if not want:
+        raise ValueError("charter_update `both_hold` without text: `key` names no pair key (12 hex digits, "
+                         "as the Charter conflicts digest section lists them)")
+    try:
+        current = {x["key"] for x in restriction_pairs(p.charter_path.read_text())}
+    except OSError:
+        current = set()
+    known = want & current
+    if known:
+        p.db.set_kv(CHARTER_SETTLED_KEY, sorted(set(p.db.kv(CHARTER_SETTLED_KEY) or []) & current | known))
+    if want - current:
+        raise ValueError(f"charter_update `both_hold`: no current Charter conflicts pair has key "
+                         f"{', '.join(sorted(want - current))}" + (f" (settled {', '.join(sorted(known))})"
+                                                                    if known else ""))
+    return f"charter conflicts settled as both holding: {', '.join(sorted(known))}"
 
 
 def charter_conflict_lines(pairs: list[dict]) -> list[str]:
     """The digest's `## Charter conflicts` section (also listed in the daily review)."""
     if not pairs:
         return []
-    return (["## Charter conflicts (Restrictions items that contradict each other; workers obey both, so the "
-             "stricter wins). Settle each pair by what the user said, one of two equal fixes: if the user's "
-             "newer word replaced one side, charter_update its section with `quote` set to it, `text` what "
-             "still holds (empty to drop it) and `over` naming that word; if both hold (one is the other's "
-             "exception or condition), rewrite the forbidding one to name its exception (\"..., except as "
-             "<the other> allows\"). Never drop a restriction the user did not change."]
-            + [f"- \"{clip(x['forbid'], 200)}\" ({x['forbid_section']}) vs \"{clip(x['allow'], 200)}\" "
+    return (["## Charter conflicts (Restrictions items that may contradict each other; workers obey both, so the "
+             "stricter wins). Most pairs only share a word, or one is the other's limit or condition: settle each "
+             "such pair with charter_update `both_hold`: true and `key` set to its key (no text; no charter edit, "
+             "no ask). Only if the user's newer word replaced one side, charter_update its section with `quote` "
+             "set to it, `text` what still holds (empty to drop it) and `over` naming that word. Never drop a "
+             "restriction the user did not change."]
+            + [f"- [{x['key']}] \"{clip(x['forbid'], 200)}\" ({x['forbid_section']}) vs \"{clip(x['allow'], 200)}\" "
                f"({x['allow_section']})" for x in pairs])
 
 
