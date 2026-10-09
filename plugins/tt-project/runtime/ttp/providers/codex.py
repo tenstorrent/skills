@@ -13,14 +13,28 @@ Write fence (from the docs; Codex was not installed where this was probed). Work
 | Fence writes to a list of dirs | yes, `sandbox_workspace_write.writable_roots`; uses `bwrap` from PATH, else a bundled helper that needs unprivileged user namespaces (startup warning if it can't) | yes, Seatbelt |
 | Unix socket under `state/` from the sandbox | blocked by default; allow it with `permissions.<name>.network.unix_sockets` or `dangerously_allow_all_unix_sockets` | same |
 
-Reads are not fenced, and the roots today include all of the project's state."""
+Reads are not fenced, and the roots today include all of the project's state.
+
+Harness hook (measured on codex-cli 0.160). Codex sends the same PreToolUse/PostToolUse payload as
+Claude Code (`tool_name` "Bash", `tool_input.command`) and takes the same deny and added-context
+replies, so workers get `ttp.hook` through `-c hooks.*` keys, never a file under `~/.codex`. Codex
+runs a hook only once its hash is trusted, and silently skips a `-c` hook that is not, so the hook
+needs `--dangerously-bypass-hook-trust`. That flag trusts every hook of the run, so it is passed
+only when no other hook source exists (hook_sources); otherwise the worker reads steer.md between
+steps, as before.
+
+Per-run plugins: not possible. Codex loads a plugin only from its install cache under
+`$CODEX_HOME/plugins/cache` (`codex plugin add` copies it there); enabling a local marketplace's
+plugin with `-c` alone loaded none of its skills (measured), and no `-c` key adds a skill folder."""
 from __future__ import annotations
 
 import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
+import sys
 from pathlib import Path
 
 from . import register
@@ -31,6 +45,13 @@ from .base import AUTH_RE, LIMIT_RE, Provider, RunUsage, cli_output, price_row, 
 PRICES = {"default": (4.0, 0.4, 20.0)}
 # Tools a decision-only turn does without, switched off when this build lists them as features.
 READ_ONLY_OFF = ("shell_tool", "unified_exec", "web_search_request")
+HOOK_TRUST_BYPASS = "--dangerously-bypass-hook-trust"
+IGNORE_USER_CONFIG = "--ignore-user-config"
+IGNORE_RULES = "--ignore-rules"
+# A config.toml line that may define a hook: a hooks table or key, or a plugin (plugins bundle hooks).
+HOOK_CONFIG_RE = re.compile(r"^\s*(?:\[\[?\s*[\"']?(?:hooks|plugins)\b|[\"']?(?:hooks|plugins)[\"']?\s*[.=])", re.M)
+# User config the run cannot reach its model without: ignoring it would break every run.
+PROVIDER_CONFIG_RE = re.compile(r"^\s*(?:\[\s*)?[\"']?model_providers?\b", re.M)
 # Linux refuses one argument longer than 128 KiB; longer system text leads the prompt instead.
 MAX_ARG_BYTES = 120_000
 
@@ -42,6 +63,9 @@ class Codex(Provider):
     api_host, api_base_env = "api.openai.com", "OPENAI_BASE_URL"
     login_hint = "run `codex login` there"
     isolate_read_only = True
+    # Whether build() left the harness hook out only because the user's config.toml defines hooks or
+    # plugins; isolation_args() then adds it, as an isolated run ignores that file.
+    _hook_held_by_user_config = ""
 
     def credential_files(self) -> list[str]:
         return [str(codex_home() / "auth.json")]
@@ -80,6 +104,8 @@ class Codex(Provider):
             argv += ["-c", f"model_reasoning_effort={effort}"]
         argv += ["-c", "approval_policy=never"]
         if read_only:
+            # A decision-only turn: no user config, MCP servers or execpolicy rules, as Claude's --restricted.
+            argv += self._ignore_user_config() + ([IGNORE_RULES] if self._exec_flag(IGNORE_RULES) else [])
             argv += ["-s", "read-only"]
             features = cli_output(exe, "features", "list")
             for feature in READ_ONLY_OFF:
@@ -89,6 +115,7 @@ class Codex(Provider):
             argv += ["-s", "workspace-write"]
             if not restrictions.get("no_internet"):
                 argv += ["-c", "sandbox_workspace_write.network_access=true"]
+            argv += self._hook_for(cwd, user_config=True)
         if schema:
             argv += ["--output-schema", schema_file(strict_schema(schema))]
         argv += ["-"]
@@ -109,6 +136,38 @@ class Codex(Provider):
         # workspace-write only lets the worker write its cwd; result.json, `ttp note`, `ttp lock`
         # and commits in a worktree (whose git metadata lives in the main repository) are elsewhere.
         return ["-c", "sandbox_workspace_write.writable_roots=" + json.dumps([str(d) for d in dirs])] if dirs else []
+
+    def isolation_args(self) -> list[str]:
+        # The user's config.toml holds their MCP servers, plugins, hooks and profiles.
+        out = self._ignore_user_config()
+        if out and self._hook_held_by_user_config:
+            out += self._hook_for(self._hook_held_by_user_config, user_config=False)
+        return out
+
+    def _exec_flag(self, flag: str) -> bool:
+        return bool(re.search(rf"(?<![\w-]){re.escape(flag)}\b", cli_output(self.binary() or "codex", "exec", "--help")))
+
+    def _ignore_user_config(self) -> list[str]:
+        if not self._exec_flag(IGNORE_USER_CONFIG) or PROVIDER_CONFIG_RE.search(_read(codex_home() / "config.toml")):
+            return []
+        return [IGNORE_USER_CONFIG]
+
+    def hooks_supported(self) -> bool:
+        """This build runs hooks (the `hooks` feature is on) and takes the trust bypass flag."""
+        features = cli_output(self.binary() or "codex", "features", "list")
+        return bool(re.search(r"^hooks\s.*\btrue\s*$", features, re.M)) and self._exec_flag(HOOK_TRUST_BYPASS)
+
+    def _hook_for(self, cwd: str, user_config: bool) -> list[str]:
+        """The harness hook and the trust bypass, when the hook would be the run's only hook source;
+        [] otherwise (or on a build without hooks)."""
+        self._hook_held_by_user_config = ""
+        if not self.hooks_supported():
+            return []
+        if hook_sources(cwd, user_config=user_config):
+            if user_config and not hook_sources(cwd, user_config=False):
+                self._hook_held_by_user_config = cwd
+            return []
+        return [HOOK_TRUST_BYPASS, *hook_config_args()]
 
     def write_fence(self) -> str:
         return ""   # workspace-write: Seatbelt on macOS, bubblewrap or the bundled helper on Linux
@@ -245,6 +304,46 @@ class Codex(Provider):
 def codex_home() -> Path:
     """Where Codex keeps its login and saved sessions."""
     return Path(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"))
+
+
+def _read(path: Path) -> str:
+    try:
+        return path.read_text(errors="replace")
+    except OSError:
+        return ""
+
+
+def hook_sources(cwd: str, user_config: bool = True) -> list[str]:
+    """Files besides the harness's own `-c` keys that may give a run in `cwd` hooks Codex would
+    otherwise ask the user to trust: `hooks.json` in Codex's home, its `config.toml` when the run
+    loads it (`user_config`), and a `.codex/` folder in `cwd` or any folder above it. Hooks or
+    plugins in a config.toml count, as plugins can bundle hooks. Read without a TOML parser, so a
+    doubtful line counts too: a false find only keeps the hook off, as before."""
+    home = codex_home()
+    found = [str(home / "hooks.json")] if (home / "hooks.json").exists() else []
+    if user_config and HOOK_CONFIG_RE.search(_read(home / "config.toml")):
+        found.append(str(home / "config.toml"))
+    for d in [Path(cwd), *Path(cwd).parents]:
+        dot = d / ".codex"
+        if dot.resolve() == home.resolve():
+            continue   # Codex's own home (often ~/.codex), handled above
+        if (dot / "hooks.json").exists():
+            found.append(str(dot / "hooks.json"))
+        if HOOK_CONFIG_RE.search(_read(dot / "config.toml")):
+            found.append(str(dot / "config.toml"))
+    return found
+
+
+def hook_config_args() -> list[str]:
+    """`-c` keys that route Bash calls and every tool result through `ttp.hook` (see the module
+    docstring). PYTHONPATH is set in the command itself, so the worker's own commands keep theirs."""
+    runtime = str(Path(__file__).resolve().parents[2])
+    cmd = f"env PYTHONPATH={shlex.quote(runtime)} {shlex.quote(sys.executable)} -m ttp.hook"
+    out = []
+    for event, matcher in (("PreToolUse", "Bash"), ("PostToolUse", "*")):
+        entry = f"[{{matcher={toml_string(matcher)},hooks=[{{type=\"command\",command={toml_string(f'{cmd} {event}')},timeout=20}}]}}]"
+        out += ["-c", f"hooks.{event}={entry}"]
+    return out
 
 
 def toml_string(text: str) -> str:

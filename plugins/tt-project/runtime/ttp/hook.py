@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Provider hook endpoint: `python -m ttp.hook <event>`, with the hook payload on stdin.
 
-Claude Code calls it after every tool use. If the coordinator has changed the task since the
+Claude Code calls it after every tool use. Codex (where its hooks are on) sends the same payload
+fields and takes the same replies; providers/codex.py passes it per run. If the coordinator has changed the task since the
 worker started (it appends to `$TTP_RUN_DIR/steer.md`), the new part is handed to the worker as
 added context, once. Workers on providers without hooks read the same file between steps.
 

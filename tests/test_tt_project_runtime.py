@@ -19916,6 +19916,165 @@ def test_codex_gets_its_system_text_and_compact_window_as_config_overrides(env, 
     assert "model_auto_compact_token_limit" not in overrides(start("worker")[0])
 
 
+CODEX_HOOK_HELP = CODEX_EXEC_HELP + """
+Options:
+      --dangerously-bypass-hook-trust
+          Run enabled hooks without requiring persisted hook trust for this invocation. DANGEROUS.
+      --ignore-user-config
+          Do not load `$CODEX_HOME/config.toml`; auth still uses `CODEX_HOME`
+      --ignore-rules
+          Do not load user or project execpolicy `.rules` files
+"""
+CODEX_HOOK_FEATURES = "goals                 stable             true\nhooks                 stable             true\n"
+
+
+def _codex_hooks(monkeypatch, tmp_path, help_text=CODEX_HOOK_HELP, features=CODEX_HOOK_FEATURES):
+    """The Codex adapter on a fake build answering `exec --help` and `features list` with these
+    texts, its home an empty folder under tmp_path."""
+    from ttp.providers import base, get_provider
+    from ttp.providers import codex as codex_provider
+    monkeypatch.setattr(codex_provider.Codex, "binary", lambda self: "/x/codex")   # never a real agent
+    monkeypatch.setitem(base._CLI_OUTPUT, ("/x/codex", "exec", "--help"), help_text)
+    monkeypatch.setitem(base._CLI_OUTPUT, ("/x/codex", "features", "list"), features)
+    home = tmp_path / "codexhome"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    repo = tmp_path / "wt"
+    (repo / ".git").mkdir(parents=True, exist_ok=True)
+
+    def worker(cwd=repo):
+        prov = get_provider("codex")
+        argv, _ = prov.build(role="worker", model="", effort="", cwd=str(cwd), budget_usd=None, read_only=False,
+                             schema=None, restrictions={})
+        return prov, argv
+    return worker, home, repo
+
+
+def _codex_hook_commands(argv):
+    """{event: shell command} of the hooks a Codex argv passes as `-c hooks.<event>=...`."""
+    out = {}
+    for i, a in enumerate(argv[:-1]):
+        m = re.match(r"hooks\.(\w+)=", argv[i + 1]) if a == "-c" else None
+        if m:
+            out[m.group(1)] = json.loads(re.search(r'command=("(?:[^"\\]|\\.)*")', argv[i + 1]).group(1))
+    return out
+
+
+def test_codex_worker_hook_delivers_the_steer_once_and_denies_bypasses(env, monkeypatch, tmp_path):
+    # The hook Codex is given, run as Codex runs it (a shell command, the payload on stdin, the run's
+    # environment), with the payload fields codex-cli 0.160 sends.
+    worker, _, repo = _codex_hooks(monkeypatch, tmp_path)
+    _, argv = worker()
+    assert "--dangerously-bypass-hook-trust" in argv and argv[-1] == "-"
+    cmds = _codex_hook_commands(argv)
+    assert set(cmds) == {"PreToolUse", "PostToolUse"} and "-m ttp.hook PreToolUse" in cmds["PreToolUse"]
+    assert re.search(r'hooks\.PreToolUse=\[\{matcher="Bash"', " ".join(argv)), "only shell calls are checked"
+    p = make(env)
+    p.set_config("delivery.push_checks", [SUITE])
+    run = tmp_path / "run"
+    run.mkdir()
+    hook_env = {**os.environ, "TTP_RUN_DIR": str(run), "TTP_PROJECT": str(p.base), "TTP_TASK": "42"}
+    hook_env.pop("TTP_ALLOW_FULL_SUITE", None)
+
+    def call(event, command):
+        payload = {"session_id": THREAD, "turn_id": "t-1", "transcript_path": "/x/rollout.jsonl", "cwd": str(repo),
+                   "hook_event_name": event, "model": "m", "permission_mode": "bypassPermissions",
+                   "tool_name": "Bash", "tool_input": {"command": command}, "tool_use_id": "exec-1"}
+        if event == "PostToolUse":
+            payload["tool_response"] = "ok\n"
+        out = subprocess.run(cmds[event], shell=True, input=json.dumps(payload), capture_output=True, text=True,
+                             env=hook_env, cwd=str(repo), timeout=60)
+        assert out.returncode == 0, out.stderr
+        return json.loads(out.stdout)["hookSpecificOutput"] if out.stdout.strip() else None
+
+    assert call("PostToolUse", "echo hi") is None, "no update yet"
+    (run / "steer.md").write_text("Also say PINEAPPLE.\n")
+    got = call("PostToolUse", "echo hi")
+    assert got["hookEventName"] == "PostToolUse" and "Update for your task #42" in got["additionalContext"]
+    assert "PINEAPPLE" in got["additionalContext"]
+    assert call("PostToolUse", "echo hi") is None, "the same update was delivered twice"
+    for cmd in ("/usr/bin/gh pr ready 123", SUITE, "ttp say hello"):
+        got = call("PreToolUse", cmd)
+        assert got and got["permissionDecision"] == "deny" and got["permissionDecisionReason"].startswith("tt-project:"), cmd
+    assert call("PreToolUse", "gh pr ready 123") is None, "the harness's own gh decides that one"
+    assert call("PreToolUse", "python3 -m pytest -q tests/test_a.py") is None
+
+
+def test_codex_without_hooks_or_the_trust_flag_runs_as_before(env, monkeypatch, tmp_path):
+    for help_text, features in ((CODEX_EXEC_HELP, CODEX_HOOK_FEATURES),       # no trust bypass flag
+                                (CODEX_HOOK_HELP, "goals  stable  true\n"),    # no hooks feature
+                                (CODEX_HOOK_HELP, "hooks  under development  false\n"),
+                                (CODEX_HOOK_HELP, "")):                        # `features list` fails
+        worker, _, _ = _codex_hooks(monkeypatch, tmp_path, help_text, features)
+        _, argv = worker()
+        assert "--dangerously-bypass-hook-trust" not in argv and not _codex_hook_commands(argv), (help_text, features)
+    worker, _, _ = _codex_hooks(monkeypatch, tmp_path, CODEX_EXEC_HELP)
+    prov, argv = worker()
+    assert prov.isolation_args() == [], "an old build has no --ignore-user-config"
+
+
+def test_codex_gets_no_trust_bypass_when_another_hook_source_exists(env, monkeypatch, tmp_path):
+    worker, home, repo = _codex_hooks(monkeypatch, tmp_path)
+    assert "--dangerously-bypass-hook-trust" in worker()[1]
+    # Codex's own config, which an isolated run ignores: the hook comes back with isolation.
+    for text in ('[hooks]\n[[hooks.PreToolUse]]\nmatcher = "*"\n', '[[hooks.PostToolUse]]\nmatcher = "*"\n',
+                 'hooks.PreToolUse = []\n', '[plugins."lint@market"]\nenabled = true\n'):
+        (home / "config.toml").write_text('model = "m"\n' + text)
+        prov, argv = worker()
+        assert "--dangerously-bypass-hook-trust" not in argv and not _codex_hook_commands(argv), text
+        iso = prov.isolation_args()
+        assert iso[0] == "--ignore-user-config" and "--dangerously-bypass-hook-trust" in iso, text
+        assert set(_codex_hook_commands(iso + ["-"])) == {"PreToolUse", "PostToolUse"}
+    (home / "config.toml").write_text('model = "m"\n[projects."/x"]\ntrust_level = "trusted"\n')
+    assert "--dangerously-bypass-hook-trust" in worker()[1], "a config without hooks or plugins is no source"
+    # Files no run ignores: no hook, isolated or not.
+    for path in (home / "hooks.json", repo / ".codex" / "hooks.json", tmp_path / ".codex" / "hooks.json",
+                 repo / ".codex" / "config.toml"):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('[[hooks.PreToolUse]]\nmatcher = "*"\n' if path.suffix == ".toml" else "{}")
+        prov, argv = worker()
+        assert "--dangerously-bypass-hook-trust" not in argv and not _codex_hook_commands(argv), path
+        assert prov.isolation_args() == ["--ignore-user-config"], path
+        path.unlink()
+    assert "--dangerously-bypass-hook-trust" in worker()[1]
+
+
+def test_codex_isolated_workers_and_coordinator_turns_skip_the_users_config(env, monkeypatch, tmp_path):
+    from ttp.providers import get_provider
+    worker, home, _ = _codex_hooks(monkeypatch, tmp_path)
+
+    def coordinator():
+        return get_provider("codex").build(role="coordinator", model="", effort="", cwd=str(tmp_path), budget_usd=None,
+                                           read_only=True, schema=None, restrictions={})[0]
+    argv = coordinator()
+    assert "--ignore-user-config" in argv and "--ignore-rules" in argv and argv[-1] == "-"
+    assert not _codex_hook_commands(argv) and "--dangerously-bypass-hook-trust" not in argv
+    assert "--ignore-user-config" not in worker()[1], "workers skip it only with worker_isolation"
+    assert worker()[0].isolation_args() == ["--ignore-user-config"]
+    # A run cannot reach its model without the user's own model provider: their config stays.
+    (home / "config.toml").write_text('model_provider = "local"\n[model_providers.local]\nbase_url = "http://x"\n')
+    assert "--ignore-user-config" not in coordinator() and worker()[0].isolation_args() == []
+    _codex_hooks(monkeypatch, tmp_path, CODEX_EXEC_HELP)
+    (home / "config.toml").unlink()
+    argv = coordinator()
+    assert "--ignore-user-config" not in argv and "--ignore-rules" not in argv, "an old build lacks both flags"
+
+
+def test_codex_worker_isolation_reaches_the_launched_argv(env, monkeypatch, tmp_path):
+    from ttp.daemon import Daemon
+    worker, home, _ = _codex_hooks(monkeypatch, tmp_path)
+    (home / "config.toml").write_text('[[hooks.PreToolUse]]\nmatcher = "*"\n')
+    p = make(env)
+    p.set_config("providers.codex.worker_isolation", True)
+    d = Daemon(p.base)
+    tid = p.db.add_task("t", "s", kind="work", tier="light", origin="user")
+    rid = d.start_run("worker", "PROMPT-MARKER", "codex", "light", str(env["repo"]), task=p.db.task(tid))
+    (p.runs / str(rid) / "STOP").touch()
+    argv = json.loads((p.runs / str(rid) / "run.json").read_text())["argv"]
+    assert argv[-1] == "-" and "--ignore-user-config" in argv and "--dangerously-bypass-hook-trust" in argv
+    assert set(_codex_hook_commands(argv)) == {"PreToolUse", "PostToolUse"}
+
+
 def test_a_failed_resume_that_printed_events_but_no_tokens_is_free(env, monkeypatch):
     from ttp import budget as bud
     out = _codex_events({"type": "error", "message": f"no rollout found for thread id {THREAD}"})

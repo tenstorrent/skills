@@ -441,6 +441,11 @@ and preferences you add later become part of the project's charter and memory.
   Listing a server approves it for workers. A name your config does not define is skipped: the
   run still starts, and `ttp doctor` and a low alert name it. Servers that come from a Claude plugin
   are not in those files, so they cannot be listed; add the server with `claude mcp add` to list it.
+- `providers.codex.worker_isolation: true` starts Codex workers and reviewers with
+  `--ignore-user-config`, so your `config.toml` (its MCP servers, plugins and hooks) stays out;
+  sign-in still works. Codex coordinator turns always skip it, and your rules files too, where the
+  build has those flags. A config that sets your own model provider is kept, since runs need it.
+  Codex has no per-run MCP list, so isolated Codex workers get no MCP servers of yours.
 
 ## Where things live
 
@@ -512,10 +517,20 @@ Design notes, invariants and how to add a provider: [docs/design.md](docs/design
 - Codex and Cursor coordinator turns run from an empty scratch directory, so the project's
   AGENTS.md and rules stay out of them. Codex's shell and web search tools are off, and Cursor
   runs in ask mode, when the installed CLI offers those switches.
-- Not yet on Codex or Cursor: worker plugins (`plugin_dirs`), worker isolation, coordinator
-  updates reaching a running worker (Claude hooks only), and isolation of coordinator turns from
-  your own CLI config and MCP servers. Cursor enforces no `no_internet` restriction and has no
-  plan-window meter; without ask mode it has no read-only mode either.
+- Codex workers get the harness hook (coordinator updates handed over once, PR draft guard,
+  full-suite and `ttp say` refusals) as per-run config, never by editing your Codex home. Codex
+  runs such a hook only when trusted, so the run trusts it for that call alone, and only when the
+  hook is the run's sole hook source: if your Codex home, the repository's `.codex/` folder or an
+  enabled plugin may add hooks, the worker runs without it and reads `steer.md` between steps (an
+  isolated worker skips your config, so only the home `hooks.json` and the repository count then).
+  A build without hooks or the trust flag keeps that older behaviour. Tested live on codex-cli 0.160.
+- Not on Codex: worker plugins (`plugin_dirs`). Codex loads plugins only from those installed in
+  its home (`codex plugin add` copies them there), so a run cannot add one for itself without
+  changing your Codex setup; plugins you install yourself load as usual.
+- Not yet on Cursor: worker plugins, worker isolation, coordinator updates reaching a running
+  worker, and isolation of coordinator turns from your own CLI config and MCP servers. Cursor
+  enforces no `no_internet` restriction and has no plan-window meter; without ask mode it has no
+  read-only mode either.
 - Cursor has no reasoning-effort flag; tiers map to model names.
 - Context compaction per tier (`budget.compact_window_tokens`) works on Claude Code and Codex.
 - Long command output stays out of a worker's context: `ttp clip -- <cmd>` and `ttp checks` keep
