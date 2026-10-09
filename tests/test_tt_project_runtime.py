@@ -2219,7 +2219,8 @@ def test_runner_ends_its_agent_when_the_run_dir_is_deleted(env, tmp_path):
     try:
         assert _wait_for(lambda: pid_file.exists() and pid_file.read_text().strip())
         agent = int(pid_file.read_text())
-        shutil.rmtree(run_dir)
+        # The runner may still be writing its launch files (child.pid, the first lease) into the dir.
+        assert _wait_for(lambda: not shutil.rmtree(run_dir, ignore_errors=True) and not run_dir.exists())
         proc.wait(timeout=30)
         assert _wait_for(lambda: _pid_gone(agent), 10)
         assert not run_dir.exists()
