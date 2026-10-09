@@ -203,7 +203,9 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
             history += f"Woken because: {prev['woke']}.\n"
         history += _reboot_note(prev.get("reboot"))
     run_tier = (wake or {}).get("tier") or task["tier"]
-    step = bud.next_step(prev) if wake else ""
+    step = bud.mechanical_step(prev) if wake else ""
+    if wake and not step and bud.next_step(prev):
+        history += f"The last run left this next step for after its wait: {bud.next_step(prev)}\n"
     if step and not wake.get("escalated"):
         history += (f"This run is a {run_tier} wake for one mechanical step the last run left: {step}. If the wait "
                     "is over, do that step in this run and hand off its outcome. Only if it stops being mechanical "

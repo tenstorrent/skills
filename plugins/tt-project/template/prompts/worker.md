@@ -118,7 +118,7 @@ never write to a run folder named in earlier context):
  "retry_after_s": 1800,
  "retry_when": "only when waiting: a quick shell check that exits 0 once the wait is over",
  "wake_tier": "only when waiting: light (the next run only checks) or standard (real work follows)",
- "next_step": "only when waiting: the one mechanical step left after it (e.g. push); a light wake does it",
+ "next_step": "only when waiting: one short mechanical command left after it (e.g. push, a status check); a light wake does it",
  "on_pass": {"status": "done", "summary": "only when waiting on your own `ttp checks --detach`: the final hand-off if they pass"},
  "wait_kind": "only when waiting: self (your own detached checks or jobs, a time window you planned) or external",
  "needs_deep": "only on a device task: the problem you could not solve at this tier; its retry runs deep",
@@ -167,6 +167,8 @@ never write to a run folder named in earlier context):
   job sees its own limit as `TTP_DEVQ_TIMEOUT_S`). A run that needs longer is split into shorter jobs.
   A host reboot wakes waiting tasks at once; add `"survives_reboot": true` if yours does not die with it.
   The next run is a cheap light wake unless you set `wake_tier`; pick standard only if it will do real work.
+  `next_step` is one short mechanical command (push, a status check), never a plan or an "if ... then"
+  to judge. A wake that needs judgment sets `wake_tier` standard and no `next_step`.
 - `blocked` only when access, a credential, funds or a resource you cannot get is missing, or the
   next step cannot be undone and is outside the charter. Say exactly what. Judgment calls are
   yours: make them, and state each one and why in the summary.

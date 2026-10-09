@@ -3526,7 +3526,8 @@ def test_a_mechanical_next_step_wakes_at_light_and_that_run_finishes_it(env, mon
     from ttp.daemon import Daemon
     from ttp.db import dump_result
     wait = {"status": "waiting", "summary": "checks started", "waiting_for": "the checks", "wake_tier": "standard"}
-    assert bud.wake_tier("standard", {**wait, "next_step": "push"}) == "light", "next_step outranks wake_tier"
+    step = {"status": "waiting", "summary": "checks started", "waiting_for": "the checks", "next_step": "push"}
+    assert bud.wake_tier("standard", step) == "light"
     assert bud.wake_tier("deep", {"status": "waiting", "next_step": "push"}) == "light"
     assert bud.wake_tier("standard", wait) == "standard"
     assert bud.wake_tier("standard", {**wait, "next_step": "  "}) == "standard", "a blank step is no step"
@@ -3537,7 +3538,7 @@ def test_a_mechanical_next_step_wakes_at_light_and_that_run_finishes_it(env, mon
     tiers = {"light": {"effort": "low"}, "standard": {"effort": "high"}, "deep": {"effort": "max"}}
     p.set_config("providers.fake.tiers", tiers)
     mech = p.db.add_task("review and push", "s", kind="work", tier="standard", origin="user")
-    p.db.update_task(mech, result=dump_result({**wait, "next_step": "push"}))
+    p.db.update_task(mech, result=dump_result(step))
     plain = p.db.add_task("review and push, unmarked", "s", kind="work", tier="standard", origin="user")
     p.db.update_task(plain, result=dump_result(wait))
     d = Daemon(p.base)
@@ -3553,6 +3554,35 @@ def test_a_mechanical_next_step_wakes_at_light_and_that_run_finishes_it(env, mon
     assert json.loads(other["note"])["wake"]["tier"] == "standard"
     assert other["effort"] == "high"
     assert p.db.task(mech)["attempts"] == 1
+
+
+def test_an_explicit_wake_tier_or_a_long_next_step_is_judgment_and_wakes_above_light(env):
+    """Only a short next_step with no wake_tier above light is a mechanical step a light wake does;
+    an explicit wake_tier wins over next_step, still capped by the task's own tier."""
+    from ttp import budget as bud
+    from ttp.prompts import worker_task
+    from ttp.db import dump_result
+    base = {"status": "waiting", "waiting_for": "the checks", "retry_when": "test -e rc", "next_step": "push"}
+    assert bud.wake_tier("standard", base) == "light", "a mechanical step without a tier wakes light"
+    assert bud.wake_tier("standard", {**base, "wake_tier": "light"}) == "light"
+    assert bud.wake_tier("standard", {**base, "wake_tier": "bogus"}) == "light", "an unknown tier is no tier"
+    assert bud.wake_tier("standard", {**base, "wake_tier": "standard"}) == "standard"
+    assert bud.wake_tier("deep", {**base, "wake_tier": "deep"}) == "deep"
+    assert bud.wake_tier("standard", {**base, "wake_tier": "deep"}) == "standard", "capped by the task's tier"
+    assert bud.wake_tier("light", {**base, "wake_tier": "standard"}) == "light", "capped by the task's tier"
+    esc = {**base, "retry_after_s": 0, "wake_tier": "standard", "escalated_wake": True}
+    assert bud.wake_tier("deep", esc) == "standard", "an escalated wake still runs at its wake_tier"
+    plan = {**base, "next_step": "read the logs, " * 20}
+    assert len(plan["next_step"]) > bud.NEXT_STEP_MAX
+    assert bud.wake_tier("standard", plan) == "standard", "a long next_step is a plan, not one step"
+    assert bud.wake_tier("standard", {**plan, "wake_tier": "light"}) == "light", "an explicit light wins"
+    assert bud.mechanical_step(base) == "push" and not bud.mechanical_step(plan)
+    assert not bud.mechanical_step({**base, "wake_tier": "standard"})
+    p = make(env)
+    tid = p.db.add_task("review", "s", kind="review", tier="standard", origin="user")
+    p.db.update_task(tid, result=dump_result({**base, "wake_tier": "standard"}))
+    out = worker_task(p, p.db.task(tid), str(p.root), None, wake={"tier": "standard", "escalated": False})
+    assert "mechanical step" not in out and "next step for after its wait: push" in out
 
 
 def test_a_mechanical_wake_that_escalates_but_keeps_next_step_reruns_at_the_tasks_tier(env, monkeypatch):

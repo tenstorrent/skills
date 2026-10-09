@@ -516,22 +516,36 @@ def wake_tier(tier: str, prev: dict) -> str | None:
     """The tier of the run that wakes a task whose last hand-off (`prev`) was `waiting`, or None
     when the run is no wake. Most wakes only check whether the wait is over, so a hand-off that
     names what it waits on wakes at light unless it asks for a `wake_tier`; never above the task's
-    own tier. A hand-off whose `next_step` names the one mechanical step left (say `push`) wakes at
-    light whatever it asked: that run does the step itself, unless that light run escalated
-    (`escalated_wake`): then the step is no longer mechanical and the hand-off's `wake_tier` wins."""
+    own tier. A hand-off whose `next_step` is one mechanical step (say `push`; see mechanical_step)
+    wakes at light: that run does the step itself. A `wake_tier` above light, an escalated light
+    wake (`escalated_wake`) or a `next_step` too long to be one step means judgment: the hand-off's
+    `wake_tier` wins, and without one a long `next_step` wakes at the task's own tier."""
     if not isinstance(prev, dict) or prev.get("status") != "waiting":
         return None
     tier = tier if tier in TIER_ORDER else "standard"
-    want = "light" if next_step(prev) and not prev.get("escalated_wake") else prev.get("wake_tier")
+    want = "light" if mechanical_step(prev) else prev.get("wake_tier")
     if want not in TIER_ORDER:
-        want = "light" if prev.get("retry_when") or prev.get("waiting_for") else tier
+        want = "light" if (prev.get("retry_when") or prev.get("waiting_for")) and not next_step(prev) else tier
     return min(want, tier, key=TIER_ORDER.index)
 
 
+# A next_step longer than this is a plan, not one mechanical step.
+NEXT_STEP_MAX = 200
+
+
 def next_step(prev: dict) -> str:
-    """The mechanical step a waiting hand-off left for after its wait (`next_step`), or ''."""
+    """The step a waiting hand-off left for after its wait (`next_step`), or ''."""
     step = prev.get("next_step") if isinstance(prev, dict) else None
-    return " ".join(step.split())[:200] if isinstance(step, str) else ""
+    return " ".join(step.split())[:NEXT_STEP_MAX] if isinstance(step, str) else ""
+
+
+def mechanical_step(prev: dict) -> str:
+    """The hand-off's `next_step` when a light wake can do it, or '': it is short, the hand-off asks
+    for no `wake_tier` above light, and it is not a light wake that already asked for more."""
+    step = prev.get("next_step") if isinstance(prev, dict) else None
+    if not isinstance(step, str) or len(" ".join(step.split())) > NEXT_STEP_MAX or prev.get("escalated_wake"):
+        return ""
+    return next_step(prev) if prev.get("wake_tier") not in TIER_ORDER[1:] else ""
 
 
 # Not .txt: CMakeLists.txt and requirements.txt are build and dependency changes.
