@@ -132,6 +132,7 @@ USER_SETTABLE = {
     "providers.claude.plugin_dirs": lambda v: existing_dirs(dir_list(v)),
     # Workers load none of the user's own MCP servers, plugins, hooks or settings.
     "providers.claude.worker_isolation": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
+    "providers.codex.worker_isolation": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     # MCP servers from the user's own Claude config that isolated workers still get, by name.
     "providers.claude.mcp_servers": lambda v: name_list(v, strict=True),
     # Hours before an unanswered ask registered with a default falls back to it; 0 turns it off.

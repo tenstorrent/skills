@@ -5479,6 +5479,16 @@ def test_worker_isolation_is_on_for_new_projects_only_and_keeps_the_hook_and_app
     assert argv[argv.index("--plugin-dir") + 1] == str(plug), "approved plugins no longer load"
 
 
+
+def test_codex_worker_isolation_is_a_user_settable_bool(env):
+    from ttp import coordinator as coord
+    p = make(env)
+    for value, want in (("true", True), ("off", False), (1, True)):
+        assert coord.apply(p, [{"type": "config_set", "key": "providers.codex.worker_isolation",
+                                "value": value}]) == []
+        assert p.config()["providers"]["codex"]["worker_isolation"] is want, value
+        assert json.loads(p.config_path.read_text())["providers"]["codex"]["worker_isolation"] is want
+
 def _claude_mcp_config(tmp_path, monkeypatch, p):
     cfg_dir = tmp_path / "claude-config"
     cfg_dir.mkdir()
@@ -13030,6 +13040,19 @@ def test_an_unrelated_401_in_stderr_does_not_log_a_provider_out(env, tmp_path):
     assert get_provider("codex").parse(out, err).auth_failed
 
 
+
+def test_a_codex_hook_denial_does_not_mark_a_run_limited_or_logged_out(env, tmp_path):
+    from ttp.providers import get_provider
+    out, err = tmp_path / "o.jsonl", tmp_path / "e.log"
+    out.write_text("")
+    for denied in ("echo 'usage limit reached'", "curl -H 'Authorization: x' -w 'status 401' ./unauthorized"):
+        err.write_text("2026-10-09T00:00:00Z WARN codex_core::tools::router: Command blocked by PreToolUse "
+                       f"hook: tt-project: refused. Command: {denied}\n")
+        u = get_provider("codex").parse(out, err)
+        assert not u.limited and not u.auth_failed, denied
+    err.write_text(err.read_text() + "ERROR: You've hit your usage limit.\n")
+    assert get_provider("codex").parse(out, err).limited, "a real limit after a denial still counts"
+
 def test_a_codex_run_cut_off_before_reporting_usage_is_not_free(env):
     p = make(env)
     from ttp.daemon import Daemon
@@ -20200,6 +20223,18 @@ def test_codex_isolated_workers_and_coordinator_turns_skip_the_users_config(env,
     argv = coordinator()
     assert "--ignore-user-config" not in argv and "--ignore-rules" not in argv, "an old build lacks both flags"
 
+
+
+@pytest.mark.parametrize("line", ['model_provider = "local"', '[model_providers.local]',
+                                  'cli_auth_credentials_store = "keyring"', 'forced_login_method = "api"',
+                                  'openai_base_url = "http://proxy.invalid/v1"',
+                                  'chatgpt_base_url = "http://proxy.invalid/"'])
+def test_codex_isolation_keeps_a_config_that_sets_the_login_or_endpoint(env, monkeypatch, tmp_path, line):
+    worker, home, _ = _codex_hooks(monkeypatch, tmp_path)
+    (home / "config.toml").write_text('model = "m"\n')
+    assert worker()[0].isolation_args() == ["--ignore-user-config"]
+    (home / "config.toml").write_text('model = "m"\n' + line + "\n")
+    assert worker()[0].isolation_args() == [], f"ignoring {line!r} would break every run"
 
 def test_codex_worker_isolation_reaches_the_launched_argv(env, monkeypatch, tmp_path):
     from ttp.daemon import Daemon

@@ -444,7 +444,8 @@ and preferences you add later become part of the project's charter and memory.
 - `providers.codex.worker_isolation: true` starts Codex workers and reviewers with
   `--ignore-user-config`, so your `config.toml` (its MCP servers, plugins and hooks) stays out;
   sign-in still works. Codex coordinator turns always skip it, and your rules files too, where the
-  build has those flags. A config that sets your own model provider is kept, since runs need it.
+  build has those flags. A config that sets your own model provider, API or ChatGPT endpoint,
+  login method or credentials store is kept, since runs need it.
   Codex has no per-run MCP list, so isolated Codex workers get no MCP servers of yours.
 
 ## Where things live

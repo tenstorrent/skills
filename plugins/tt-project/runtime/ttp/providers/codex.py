@@ -50,8 +50,13 @@ IGNORE_USER_CONFIG = "--ignore-user-config"
 IGNORE_RULES = "--ignore-rules"
 # A config.toml line that may define a hook: a hooks table or key, or a plugin (plugins bundle hooks).
 HOOK_CONFIG_RE = re.compile(r"^\s*(?:\[\[?\s*[\"']?(?:hooks|plugins)\b|[\"']?(?:hooks|plugins)[\"']?\s*[.=])", re.M)
-# User config the run cannot reach its model without: ignoring it would break every run.
-PROVIDER_CONFIG_RE = re.compile(r"^\s*(?:\[\s*)?[\"']?model_providers?\b", re.M)
+# User config the run cannot reach its model without (its provider, endpoint or login): ignoring it
+# would break every run.
+PROVIDER_CONFIG_RE = re.compile(r"^\s*(?:\[\s*)?[\"']?(?:model_providers?|cli_auth_credentials_store|forced_login_method|"
+                                r"openai_base_url|chatgpt_base_url)\b", re.M)
+# A command the harness's hook denied (logged by codex_core::tools::router): its text is the
+# command's, so it says nothing about the run's login or limits.
+HOOK_DENIAL_RE = re.compile(r"^.*Command blocked by PreToolUse hook.*$\n?", re.M)
 # Linux refuses one argument longer than 128 KiB; longer system text leads the prompt instead.
 MAX_ARG_BYTES = 120_000
 
@@ -221,7 +226,7 @@ class Codex(Provider):
                 errors = []   # transient errors Codex retried are reported as "error" events too
             elif ev.get("type") in ("turn.failed", "error"):
                 errors.append(ev)
-        err = stderr_tail(stderr_path)
+        err = HOOK_DENIAL_RE.sub("", stderr_tail(stderr_path))
         if errors:
             u.error = json.dumps(errors[-1])[:400]
         elif not events and err.strip():
