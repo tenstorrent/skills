@@ -444,7 +444,8 @@ daemon under `upgrade.auto`, which retries only a newer version), so a deploy sc
 deferred; exit 1 is a real failure, such as a conflict nothing retries.
 Most conflicts settle without a model: changes to different lines, additions at one spot, and a
 local edit that upstream now makes too (comments and spacing aside: upstream's version is taken,
-the project's stays in the merge's first parent). A project's own rules in a template prompt belong
+the project's stays in the merge's first parent; a line the project removed and upstream reworded
+is a real overlap). A project's own rules in a template prompt belong
 between `<!-- ttp:local -->` and `<!-- /ttp:local -->` lines (the prompt leaves those lines out):
 an upgrade takes upstream's text and puts each block back where it stood. When a project only added
 lines to a template prompt, the upgrade fences them that way itself. Only a real overlap, such as

@@ -8668,6 +8668,42 @@ def test_merge3_superseded_takes_theirs_only_when_it_holds_our_change():
     assert merge3("A rule!\nB\n", "A rule.\nB\n", "A rule, reworded.\nB\n", superseded=True) is None
 
 
+def test_merge3_superseded_keeps_a_deletion_upstream_only_reworded():
+    """A line the project removed counts as removed upstream too only when upstream dropped it, not
+    when it reworded it: otherwise the project's removal would be undone without anyone seeing it."""
+    from ttp.batch import merge3
+    flags = dict(taken_in=True, hunks=True, superseded=True)
+    base = "a = 1\nb = 2\ncheck_dangerous()\nc = 3\n"
+    assert merge3("a = 1\nb = 2\nc = 3\n", base, "a = 1\nb = 20\ncheck_dangerous(strict=True)\nc = 3\n",
+                  py=True, **flags) is None
+    # also when the project changed another line the same way upstream did
+    assert merge3("a = 5\nb = 2\nc = 3\n", base, "a = 5\nb = 2\ncheck_dangerous(strict=True)\nc = 3\n",
+                  py=True, **flags) is None
+    md = "# R\n\n- one\n- rule two: do X\n- three\n"
+    assert merge3("# R\n\n- one\n- three\n", md, "# R\n\n- one\n- rule two: always do X first\n- three\n",
+                  **flags) is None
+    # a deletion-only change where upstream rewrote the whole section is left for judgment
+    assert merge3("# R\n\n- one\n- three\n", md, "# R\n\nAll new text.\nMore of it.\n", **flags) is None
+    # a line upstream truly dropped still settles
+    assert merge3("# R\n\n- one\n- three\n", md, "# R\n\n- one\n- three\n- four\n", **flags) == \
+        "# R\n\n- one\n- three\n- four\n"
+
+
+def test_merge3_superseded_reads_a_hash_inside_a_python_string_as_text():
+    """Prompt text kept in a Python string holds Markdown headings: a project's edit of one is a
+    change, not a comment, so it is not set aside as superseded."""
+    from ttp.batch import merge3
+    base = 'T = """\n# Rules\nbe nice\n"""\n'
+    theirs = 'T = """\n# Rules\nbe kind\n"""\n'
+    assert merge3('T = """\n# Rules (ours: never push)\nbe nice\n"""\n', base, theirs, py=True,
+                  superseded=True) is None
+    assert merge3('T = """\n# Rules\nbe nice  # ours\n"""\n', base, theirs, py=True,
+                  superseded=True) is None
+    # a real comment beside the string is still set aside
+    assert merge3('T = """\n# Rules\nbe nice\n"""  # ours\n', base, theirs, py=True,
+                  superseded=True) == theirs
+
+
 def test_a_conflicting_upgrade_queues_at_most_one_task_a_day(env, monkeypatch, capsys):
     """Each release would otherwise queue its own model task for the same conflict: within a day of
     the last one, the upgrade only records that it waits, and the daemon tries again after."""

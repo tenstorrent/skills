@@ -30,6 +30,7 @@ import sys
 import tempfile
 import threading
 import time
+import tokenize
 from collections import deque
 from pathlib import Path
 
@@ -249,6 +250,7 @@ def merge3(ours: str, base: str, theirs: str, py: bool = False, taken_in: bool =
     if r.returncode == 0:
         return out
     lines, res, i, at_end = out.splitlines(keepends=True), [], 0, False
+    no_comments: dict | None = None     # built on the first conflict that needs it (_py_code)
     while i < len(lines):
         if lines[i].rstrip("\r\n") != start:
             res.append(lines[i])
@@ -272,10 +274,12 @@ def merge3(ours: str, base: str, theirs: str, py: bool = False, taken_in: bool =
             j += 1
         if j >= len(lines):
             return None
+        if superseded and py and no_comments is None:
+            no_comments = _py_code((ours, base, theirs))
         if taken_in and _taken_in(mine, old, theirs_lines):
             res += theirs_lines
             how = "taken_in"
-        elif superseded and _superseded(mine, old, theirs_lines, py):
+        elif superseded and _superseded(mine, old, theirs_lines, py, no_comments):
             res += theirs_lines
             how = "superseded"
         elif not old and not _clash(mine, theirs_lines, py):
@@ -334,21 +338,35 @@ def _taken_in(mine: list[str], old: list[str], theirs: list[str]) -> bool:
     return bool(m - o) and (m - o) <= t and not (o - m) & t
 
 
-_COMMENT_RE = re.compile(r"\s+#[^'\"]*$")     # a trailing comment with no quote after its `#`
+def _py_code(texts: tuple[str, ...]) -> dict[str, str]:
+    """Each physical line of the Python `texts` mapped to itself without its comment, as tokenize reads
+    it: a `#` inside a string, such as a heading in prompt text kept in a triple-quoted string, stays.
+    A line that reads differently in two places (a comment here, string content there) maps to
+    itself. Empty, so that nothing is set aside, when a text does not tokenize."""
+    out: dict[str, str] = {}
+    for text in texts:
+        rows = text.splitlines(keepends=True)
+        cut: dict[int, int] = {}
+        try:
+            for tok in tokenize.generate_tokens(iter(rows).__next__):
+                if tok.type == tokenize.COMMENT:
+                    cut[tok.start[0]] = tok.start[1]
+        except (tokenize.TokenError, SyntaxError, ValueError):
+            return {}
+        for n, row in enumerate(rows, 1):
+            key = row.rstrip()
+            code = row[:cut[n]].rstrip() if n in cut else key
+            out[key] = code if out.get(key, code) == code else key
+    return out
 
 
-def _code(lines: list[str], py: bool) -> list[str]:
-    """`lines` as compared for _superseded: blank lines left out; in Python comment lines too, trailing
+def _code(lines: list[str], no_comments: dict[str, str] | None) -> list[str]:
+    """`lines` as compared for _superseded: blank lines left out; in Python (`no_comments`, _py_code)
     comments cut and the indent kept; elsewhere runs of spaces count as one."""
     out = []
     for line in lines:
         s = line.rstrip()
-        if py:
-            if s.lstrip().startswith("#"):
-                continue
-            s = _COMMENT_RE.sub("", s)
-        else:
-            s = " ".join(s.split())
+        s = no_comments.get(s, s) if no_comments is not None else " ".join(s.split())
         if s.strip():
             out.append(s)
     return out
@@ -364,15 +382,40 @@ def _indel(a: list[str], b: list[str]) -> int:
     return len(a) + len(b) - 2 * row[-1]
 
 
-def _superseded(mine: list[str], old: list[str], theirs: list[str], py: bool) -> bool:
+def _superseded(mine: list[str], old: list[str], theirs: list[str], py: bool,
+                no_comments: dict[str, str] | None = None) -> bool:
     """Whether theirs already makes our side's change of the `old` lines, comments and spacing aside
-    (_code): ours lies on a shortest way from old to theirs, so every line ours removed theirs removed
-    too and every line ours added theirs holds, in order. A local fix that upstream shipped in its own
-    words, or a local edit of comments alone. Big sections are left for judgment."""
-    m, o, t = (_code(x, py) for x in (mine, old, theirs))
+    (_code; in Python `no_comments` from _py_code): ours lies on a shortest way from old to theirs, so
+    every line ours removed theirs removed too and every line ours added theirs holds, in order. A
+    local fix that upstream shipped in its own words, or a local edit of comments alone. A line ours
+    removed must be gone from theirs, not reworded: not when it is close to a line theirs added that
+    ours did not (_reworded; in Python the body of a def or class theirs opens is new as a whole,
+    _said), and, when ours only removed lines, each must sit in a stretch theirs only deleted. Big
+    sections are left for judgment."""
+    m, o, t = (_code(x, (no_comments or {}) if py else None) for x in (mine, old, theirs))
     if (len(m) + len(o)) * (len(t) + len(o)) > 250_000:
         return False
-    return _indel(o, m) + _indel(m, t) == _indel(o, t)
+    if _indel(o, m) + _indel(m, t) != _indel(o, t):
+        return False
+    removed = {i for tag, i1, i2, _, _ in _opcodes(o, m) if tag != "equal" for i in range(i1, i2)}
+    added = [x for tag, _, _, j1, j2 in _opcodes(o, m) if tag != "equal" for x in m[j1:j2]]
+    if not added and any(tag != "delete" and i1 <= i < i2 for i in removed
+                         for tag, i1, i2, _, _ in _opcodes(o, t) if tag != "equal"):
+        return False
+    new = [x for tag, _, _, j1, j2 in _opcodes(o, t) if tag != "equal" for x in t[j1:j2]]
+    for x in added:
+        if x in new:
+            new.remove(x)
+    return not any(_reworded(o[i].strip(), x) for i in removed for x in _said(new, py))
+
+
+def _opcodes(a: list[str], b: list[str]) -> list[tuple[str, int, int, int, int]]:
+    return difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes()
+
+
+def _reworded(a: str, b: str) -> bool:
+    """Whether line `b` reads as a rewording of line `a` (most of their text in common)."""
+    return difflib.SequenceMatcher(None, a, b, autojunk=False).ratio() > 0.6
 
 
 def _clash(mine: list[str], theirs: list[str], py: bool) -> bool:
