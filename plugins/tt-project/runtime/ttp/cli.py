@@ -1647,7 +1647,16 @@ def cmd_detach(a) -> None:
     resources an `exclusive:` task holds for its whole run stay held until its jobs end (hold.py)."""
     from . import locks as lk
     from .push import _own_ttp
-    if a.check:
+    if a.check is not None:   # `--check --host <alias> <path>` leaves the paths to the positionals
+        a.check = [*a.check, *([a.name] if a.name else []), *(a.command or [])]
+        if not a.check:
+            die("usage: ttp detach --check <rc path...>  |  ttp detach --check --host <ssh alias> <dir>/<name>...")
+        if a.host:
+            sys.exit(_detach_check_remote(a.host, a.check))
+    if a.remote:
+        _detach_remote(a, _own_ttp())
+        return
+    if a.check is not None:
         ended = True
         for rc in map(Path, a.check):
             if rc.exists():
@@ -1696,6 +1705,109 @@ def cmd_detach(a) -> None:
     durable_write(reg, json.dumps(jobs, indent=1))
     print(f"detached {a.name} (pid {proc.pid})\nlog: {logf}\nrc:  {rc}\n"
           f"hand off: status waiting, retry_when \"{lk.job_probe([rc], _own_ttp())}\"")
+
+
+# The remote side of `ttp detach --remote`, run by POSIX sh over ssh. The driver's wrapper records its
+# own pid and its process start (field 22 of /proc/<pid>/stat), next to the host's boot_id: a pid alive
+# with another start, or a boot_id that changed, is a driver that is gone even with no .rc.
+_REMOTE_START = r'''d=$1 n=$2; shift 2
+case $d in "~"|"~/"*) d=$HOME${d#\~} ;; esac
+mkdir -p "$d" || exit 3
+p=$d/$n
+if [ -e "$p.log" ] || [ -e "$p.rc" ] || [ -e "$p.pid" ]; then echo "exists $p"; exit 4; fi
+cat /proc/sys/kernel/random/boot_id >"$p.boot" 2>/dev/null || : >"$p.boot"
+setsid nohup sh -c 'p=$1; shift
+echo "$(date +%s) $(sed "s/.*) //" /proc/$$/stat 2>/dev/null | cut -d" " -f20)" >"$p.start"
+echo $$ >"$p.pid.tmp"; mv "$p.pid.tmp" "$p.pid"
+"$@" >"$p.log" 2>&1 </dev/null; c=$?; echo $c >"$p.rc.tmp"; mv "$p.rc.tmp" "$p.rc"' sh "$p" "$@" \
+  >/dev/null 2>&1 </dev/null &
+i=0; while [ ! -s "$p.pid" ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done
+[ -s "$p.pid" ] || { echo "nopid $p"; exit 5; }
+echo "started $(cat "$p.pid") $p"
+'''
+
+_REMOTE_CHECK = r'''p=$1
+case $p in "~"|"~/"*) p=$HOME${p#\~} ;; esac
+p=${p%.rc}
+if [ -e "$p.rc" ]; then echo "rc $(cat "$p.rc")"; exit 0; fi
+if [ ! -s "$p.pid" ]; then echo "none $p"; exit 0; fi
+b=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
+if [ -s "$p.boot" ] && [ "$b" != "$(cat "$p.boot")" ]; then echo "boot"; exit 0; fi
+pid=$(cat "$p.pid")
+if kill -0 "$pid" 2>/dev/null; then
+  st=$(sed "s/.*) //" /proc/$pid/stat 2>/dev/null | cut -d" " -f20)
+  want=$(cut -d" " -f2 "$p.start" 2>/dev/null)
+  if [ -z "$st" ] || [ -z "$want" ] || [ "$st" = "$want" ]; then echo "running $pid"; exit 0; fi
+fi
+if [ -e "$p.rc" ]; then echo "rc $(cat "$p.rc")"; exit 0; fi
+echo "gone"
+'''
+
+
+def _ssh_sh(host: str, script: str, args: list, timeout: float = 60) -> subprocess.CompletedProcess | None:
+    """Run `script` with sh on `host` over ssh, with `args` as its $1...; None when ssh cannot run."""
+    remote = "sh -c " + " ".join(shlex.quote(x) for x in (script, "sh", *map(str, args)))
+    try:
+        return subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", host, remote],
+                              stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _detach_remote(a, ttp: str) -> None:
+    """`ttp detach --remote <ssh alias> [--dir <remote dir>] <name> -- <command...>`: start the driver
+    on that host with setsid nohup, so it outlives this run, ssh and a reboot of this host. <name>.log,
+    .rc, .pid, .boot and .start go to the remote folder (default ~/.ttp-detach/<run>); the retry_when
+    it prints, `ttp detach --check --host <alias> <dir>/<name>`, exits 0 once the .rc exists or the
+    driver is gone (pid dead, or the host restarted), 1 while it runs and 255 when ssh fails."""
+    cmd = list(a.command or [])
+    if cmd and cmd[0] == "--":
+        cmd = cmd[1:]
+    if not cmd or not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", a.name or "") or a.remote.startswith("-"):
+        die("usage: ttp detach --remote <ssh alias> [--dir <remote dir>] <name> -- <command...>   "
+            "(name: letters, digits, . _ -)")
+    run = Path(os.environ.get("TTP_RUN_DIR") or "").name or time.strftime("manual-%Y%m%d-%H%M%S")
+    rdir = (a.dir or f"~/.ttp-detach/{run}").rstrip("/") or "/"
+    r = _ssh_sh(a.remote, _REMOTE_START, [rdir, a.name, *cmd])
+    if r is None or r.returncode == 255:
+        die(f"ssh to {a.remote} failed{': ' + r.stderr.strip()[-300:] if r and r.stderr.strip() else ''}", 255)
+    out = (r.stdout.strip().splitlines() or [""])[-1].split(" ", 2)
+    if r.returncode == 4:
+        die(f"a detached job named {a.name} already ran in {rdir} on {a.remote}; pick another name")
+    if r.returncode or out[0] != "started" or len(out) < 3:
+        die(f"could not start {a.name} on {a.remote} (exit {r.returncode}): "
+            f"{(r.stdout + r.stderr).strip()[-300:]}")
+    pid, prefix = out[1], out[2]
+    print(f"detached {a.name} on {a.remote} (pid {pid})\nlog: {prefix}.log\nrc:  {prefix}.rc\n"
+          f"hand off: status waiting, survives_reboot true, retry_when "
+          f"\"{ttp} detach --check --host {shlex.quote(a.remote)} {shlex.quote(prefix)}\"")
+
+
+def _detach_check_remote(host: str, prefixes: list) -> int:
+    """`ttp detach --check --host <alias> <dir>/<name>...`: 0 once every job ended or is gone, 1 while
+    any runs, 255 when ssh fails (retry_when keeps the task asleep), 2 on an answer it cannot read."""
+    ended = True
+    for pre in prefixes:
+        name = Path(pre[:-3] if pre.endswith(".rc") else pre).name
+        r = _ssh_sh(host, _REMOTE_CHECK, [pre])
+        if r is None or r.returncode == 255:
+            print(f"{name}: ssh to {host} failed{': ' + r.stderr.strip()[-200:] if r and r.stderr.strip() else ''}")
+            return 255
+        out = (r.stdout.strip().splitlines() or [""])[-1].split(" ", 1)
+        if r.returncode or out[0] not in ("rc", "none", "boot", "running", "gone"):
+            print(f"{name}: unreadable answer from {host} (exit {r.returncode}): {(r.stdout + r.stderr).strip()[-200:]}")
+            return 2
+        if out[0] == "rc":
+            print(f"{name}: ended, exit {out[1].strip() if len(out) > 1 and out[1].strip() else '?'}")
+        elif out[0] == "running":
+            ended = False
+            print(f"{name}: running on {host}")
+        elif out[0] == "none":
+            print(f"{name}: gone without an exit code: no driver was recorded at {pre} on {host}")
+        else:
+            why = "the host restarted" if out[0] == "boot" else "killed, or the host restarted"
+            print(f"{name}: gone without an exit code ({why}); see {pre}.log on {host}")
+    return 0 if ended else 1
 
 
 def cmd_devq(a) -> None:
@@ -3090,8 +3202,13 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_landed)
 
     s = sub.add_parser("detach", help="(inside a run) start a job that outlives the run; writes <name>.rc")
-    s.add_argument("--check", nargs="+", metavar="RC",
+    s.add_argument("--check", nargs="*", metavar="RC",
                    help="exit 0 once every job of these .rc paths ended or is gone, else 1 (for retry_when)")
+    s.add_argument("--remote", metavar="HOST",
+                   help="start the job on this ssh host with setsid nohup; it survives this run and a reboot here")
+    s.add_argument("--dir", help="with --remote: the remote folder for its files (default ~/.ttp-detach/<run>)")
+    s.add_argument("--host", help="with --check: the ssh host the jobs run on; the paths are <dir>/<name>; "
+                   "255 when ssh fails")
     s.add_argument("name", nargs="?")
     s.add_argument("command", nargs=argparse.REMAINDER)
     s.set_defaults(fn=cmd_detach)

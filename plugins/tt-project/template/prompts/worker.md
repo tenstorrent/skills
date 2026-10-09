@@ -146,9 +146,13 @@ never write to a run folder named in earlier context):
   exit code and writes the first non-zero one into the marker, so the next run sees the refusal.
   Size each step's timeout to that tool's limits before starting.
   Under `set -e`, write that marker from an EXIT trap (`trap 'echo $? > "$marker"' EXIT`).
-  For a job on another machine, start its driver there (`ssh <host> 'setsid nohup <driver> > <log>
-  2>&1 &'`), keep the marker there, point `retry_when` at it (`ssh <host> test -e <marker>`) and
-  set `"survives_reboot": true`: a reboot here does not end it. Copy a driver or runner script to a
+  For a job on another machine (a device job goes through a device runner instead, when your task
+  header lists them; see below), start its driver there with `ttp detach --remote <ssh alias> <name>
+  -- <command...>`, set `"survives_reboot": true` (a reboot here does not end it) and use the
+  `retry_when` it prints, `ttp detach --check --host <alias> <dir>/<name>`: it exits 0 once the job
+  wrote its exit code or is gone (killed, or that host restarted), 1 while it runs, 255 while ssh
+  fails. Prefer it to a bare `ssh <host> test -e <marker>`, which never wakes when the driver dies
+  without writing its marker. Copy a driver or runner script to a
   host under a temporary name in the same folder and rename it into place (`mv`): bash reads a running
   script as it goes, so overwriting one in place (scp, cp) corrupts it. To stop a driver you started,
   kill its process group (`kill -- -<pgid>`), not only the bash pid: a child such as a `sleep` keeps

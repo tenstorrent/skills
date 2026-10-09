@@ -17996,10 +17996,13 @@ def test_worker_prompt_says_how_to_wait_on_a_job_on_another_machine():
     prompt = (RUNTIME.parent / "template" / "prompts" / "worker.md").read_text()
     flat = " ".join(prompt.split())
     assert "or 255, ssh not reaching the host" in flat
-    assert "For a job on another machine, start its driver there" in flat
-    assert "ssh <host> 'setsid nohup <driver> > <log> 2>&1 &'" in flat
-    assert "keep the marker there" in flat and "ssh <host> test -e <marker>" in flat
+    assert "For a job on another machine" in flat
+    assert "start its driver there with `ttp detach --remote <ssh alias> <name> -- <command...>`" in flat
+    assert "`ttp detach --check --host <alias> <dir>/<name>`" in flat and "255 while ssh fails" in flat
+    assert "Prefer it to a bare `ssh <host> test -e <marker>`" in flat
     assert 'set `"survives_reboot": true`' in flat
+    # Device runners stay first: a device job goes through one, not a remote driver.
+    assert "a device job goes through a device runner instead" in flat
 
 
 def _lost_to_reboot(p, d, tmp_path, tid, name="lost", notes=()):
@@ -29354,6 +29357,117 @@ def test_detach_check_waits_while_running_and_wakes_when_the_job_dies(env):
     check = _ttp_run(p, "detach", "--check", str(rc))
     assert check.returncode == 0 and "gone without an exit code" in check.stdout
     assert not rc.exists()
+
+
+def _ssh_stub(tmp_path):
+    """A local `ssh` on PATH: drops the options and the host and runs the remote command here, or
+    fails like an unreachable host (exit 255) while $SSH_STUB_FAIL is set. No real host is used."""
+    bin_dir = tmp_path / "sshbin"
+    bin_dir.mkdir()
+    (bin_dir / "ssh").write_text(
+        "#!/bin/sh\n"
+        "while [ $# -gt 0 ]; do case $1 in -o) shift 2;; -*) shift;; *) break;; esac; done\n"
+        "host=$1; shift\n"
+        "echo \"$host\" >>\"$SSH_STUB_LOG\"\n"
+        "[ -n \"$SSH_STUB_FAIL\" ] && { echo \"ssh: connect to host $host: Connection refused\" >&2; exit 255; }\n"
+        "exec sh -c \"$*\"\n")
+    (bin_dir / "ssh").chmod(0o755)
+    if not shutil.which("setsid"):   # macOS: the stub's "remote" is this host; a pass-through stands in
+        (bin_dir / "setsid").write_text("#!/bin/sh\nexec \"$@\"\n")
+        (bin_dir / "setsid").chmod(0o755)
+    return {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "SSH_STUB_LOG": str(tmp_path / "ssh.log"),
+            "HOME": str(tmp_path / "home")}
+
+
+def _kill_driver(pid):
+    """Stop a stub-remote driver and its job: its whole group when setsid gave it one of its own."""
+    try:
+        os.killpg(pid, signal.SIGKILL) if os.getpgid(pid) == pid else os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def _remote_probe(out):
+    m = re.search(r'retry_when "(.*)"', out)
+    assert m, out
+    return shlex.split(m.group(1))
+
+
+def test_detach_remote_runs_the_driver_over_ssh_and_its_check_reports_running_then_the_exit(env, tmp_path):
+    p = _device_project(env, device=False)
+    run_dir = p.runs / "21"
+    run_dir.mkdir(parents=True)
+    e = {**_ssh_stub(tmp_path), "TTP_RUN_DIR": str(run_dir)}
+    go = tmp_path / "go"
+    r = _ttp_run(p, "detach", "--remote", "box-a", "drv", "--", "sh", "-c",
+                 f"echo hi; while [ ! -e {go} ]; do sleep 0.1; done; exit 3", env=e)
+    assert r.returncode == 0, r.stderr
+    remote = tmp_path / "home" / ".ttp-detach" / "21"   # the default folder, under the remote home
+    for ext in ("pid", "boot", "start"):
+        assert (remote / f"drv.{ext}").exists(), ext
+    assert (remote / "drv.start").read_text().split()[0].isdigit()
+    probe = _remote_probe(r.stdout)
+    assert probe[1:] == ["detach", "--check", "--host", "box-a", str(remote / "drv")], probe
+    assert "survives_reboot true" in r.stdout
+    check = _ttp_run(p, *probe[1:], env=e)
+    assert check.returncode == 1 and "running" in check.stdout, check.stdout
+    assert not (run_dir / "detached.json").exists(), "the local job registry holds local jobs only"
+    go.touch()
+    assert _wait_for_path(remote / "drv.rc")
+    check = _ttp_run(p, *probe[1:], env=e)
+    assert check.returncode == 0 and "ended, exit 3" in check.stdout, check.stdout
+    assert (remote / "drv.log").read_text().strip() == "hi"
+    assert set((tmp_path / "ssh.log").read_text().split()) == {"box-a"}
+    again = _ttp_run(p, "detach", "--remote", "box-a", "drv", "--", "true", env=e)
+    assert again.returncode != 0 and "already ran" in again.stderr + again.stdout
+
+
+def test_detach_remote_check_sees_a_dead_pid_or_a_new_boot_as_gone_and_ssh_failure_as_255(env, tmp_path):
+    p = _device_project(env, device=False)
+    e = _ssh_stub(tmp_path)
+    rdir = tmp_path / "remote"
+    r = _ttp_run(p, "detach", "--remote", "box-b", "--dir", str(rdir), "long", "--", "sleep", "60", env=e)
+    assert r.returncode == 0, r.stderr
+    probe = _remote_probe(r.stdout)
+    assert probe[-1] == str(rdir / "long")
+    pid = int((rdir / "long.pid").read_text())
+    try:
+        assert _ttp_run(p, *probe[1:], env=e).returncode == 1
+        # ssh failing keeps the task asleep (255), never reads as the driver being gone.
+        down = _ttp_run(p, *probe[1:], env={**e, "SSH_STUB_FAIL": "1"})
+        assert down.returncode == 255 and "ssh to box-b failed" in down.stdout, down.stdout
+        assert _ttp_run(p, "detach", "--remote", "box-b", "--dir", str(rdir), "x", "--", "true",
+                        env={**e, "SSH_STUB_FAIL": "1"}).returncode == 255
+        # The host restarted: its boot_id changed, so the driver is gone even if a process holds its pid.
+        if os.path.exists("/proc/sys/kernel/random/boot_id"):
+            boot = (rdir / "long.boot").read_text()
+            (rdir / "long.boot").write_text("another-boot\n")
+            gone = _ttp_run(p, *probe[1:], env=e)
+            assert gone.returncode == 0 and "gone without an exit code" in gone.stdout, gone.stdout
+            (rdir / "long.boot").write_text(boot)
+            assert _ttp_run(p, *probe[1:], env=e).returncode == 1
+    finally:
+        _kill_driver(pid)
+    # Killed: no .rc is ever written, and the check still ends the wait with 'gone', not a missing marker.
+    deadline = time.time() + 20
+    while time.time() < deadline and _ttp_run(p, *probe[1:], env=e).returncode != 0:
+        time.sleep(0.1)
+    gone = _ttp_run(p, *probe[1:], env=e)
+    assert gone.returncode == 0 and "gone without an exit code (killed, or the host restarted)" in gone.stdout
+    assert not (rdir / "long.rc").exists()
+    # A pid now taken by another process (its start differs) is gone too.
+    (rdir / "long.pid").write_text(f"{os.getpid()}\n")
+    if os.path.exists(f"/proc/{os.getpid()}/stat"):
+        assert _ttp_run(p, *probe[1:], env=e).returncode == 0
+    # Several jobs on one host: still waiting while any one runs; a path with .rc reads the same.
+    r2 = _ttp_run(p, "detach", "--remote", "box-b", "--dir", str(rdir), "two", "--", "sleep", "60", env=e)
+    pid2 = int((rdir / "two.pid").read_text())
+    try:
+        both = _ttp_run(p, "detach", "--check", "--host", "box-b", str(rdir / "long.rc"), str(rdir / "two"), env=e)
+        assert both.returncode == 1 and "long: gone" in both.stdout and "two: running" in both.stdout, both.stdout
+    finally:
+        _kill_driver(pid2)
+    assert r2.returncode == 0
 
 
 def _dev_task(p, labels=(), status="queued", title="t", spec=""):

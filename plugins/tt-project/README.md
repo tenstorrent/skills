@@ -228,7 +228,11 @@ and preferences you add later become part of the project's charter and memory.
   get the `needs_device` label, and at most `device.max_tasks` of them run at once. A worker starts
   a long job with `ttp detach <name> -- <command>`; a run that ends without a hand-off, or waiting
   without a `retry_when`, then waits on `ttp detach --check`, which exits 0 once each job wrote its
-  exit code or its process is gone. Config `device.runners.<name>` (opt-in) sets up one serial
+  exit code or its process is gone. `ttp detach --remote <ssh alias> [--dir <dir>] <name> -- <command>`
+  starts the driver on another host with setsid nohup (default folder `~/.ttp-detach/<run>`, with its
+  .log, .rc, .pid, .boot and .start); its probe `ttp detach --check --host <alias> <dir>/<name>` exits
+  0 once the .rc exists or the driver is gone (pid dead, or that host's boot id changed), 1 while it
+  runs and 255 while ssh fails. Config `device.runners.<name>` (opt-in) sets up one serial
   device-job runner per device host instead of a driver per task: `host` (ssh alias; empty = this
   machine), `dir` (its state folder there), `health` (a command that must pass before each job),
   `drop_check` (a command that tells a device drop from a plain failure), `max_drops` (default 2),
