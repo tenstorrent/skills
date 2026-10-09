@@ -3,11 +3,37 @@
 What the runtime needs from each agent CLI, and what each one offers. Each cell says what the
 adapter in `runtime/ttp/providers/` does and links the official doc it relies on.
 
-Claude Code is tested live. Codex was run live on codex-cli 0.160 for the hook and isolation
-rows (one worker run: an update handed over once, a PR draft bypass refused); its other cells and
-the Cursor column were checked against their docs and against fixture tests built from the
-documented output formats only. Flags that only some builds have are probed with `--help` first. A build
-without them keeps the older behaviour.
+Claude Code and the Codex CLI have been run live; Cursor has not. `ttp doctor --live <provider>
+[--json]` measures one provider's row: in a scratch project it starts a small worker run the way
+the daemon does, resumes its session, and runs one read-only coordinator turn with the
+coordinator's structured-output schema. It costs a few tens of cents per provider. Each check is
+pass, fail, or unsupported (the adapter does not use that feature; the note says why).
+
+Measured on 2026-10-09:
+
+| Check | Claude Code 2.1.285 | Codex CLI 0.160.0 | Cursor agent |
+| :- | :- | :- | :- |
+| Launch and login | pass | pass | not measured: CLI not installed |
+| Session id | pass (assigned up front) | pass | not measured |
+| Usage | pass (reported cost) | pass (estimated from tokens) | not measured |
+| Structured output | pass | pass | not measured |
+| Write fence | unsupported: `bypassPermissions` runs without the Bash sandbox, which would need bubblewrap | pass (refused: read-only file system) | not measured |
+| Resume | pass | pass | not measured |
+| Steer mid-run | pass (hook) | unsupported: no hook, the worker reads `steer.md` between steps | not measured |
+| Plan meter | pass (five-hour and seven-day) | pass (seven-day) | not measured |
+
+The steer row was measured before Codex workers got the harness hook. Codex was also run live on
+codex-cli 0.160 for the hook and isolation rows (one worker run: an update handed over once, a
+PR draft bypass refused), so where hooks are on, Codex now takes updates by hook as well.
+
+The Codex structured-output check first failed: the API rejected the coordinator schema as
+"invalid schema keyword" because an optional property that was already nullable got a second
+`"null"` in its type list. The adapter now adds `"null"` only once.
+
+The table below says what each adapter does and links the official doc it relies on. The Cursor
+column was checked against its docs and against fixture tests built from the documented output
+formats only. Flags that only some builds have are probed with `--help` first. A build without
+them keeps the older behaviour.
 
 | Feature | Claude Code (`claude -p`) | Codex CLI (`codex exec`) | Cursor agent (`agent -p`) |
 | :- | :- | :- | :- |
@@ -28,17 +54,23 @@ The project chooses which plugin directories load, per provider, in
 
 ## Open gaps
 
+Measured on 2026-10-09 with Claude Code 2.1.285 and Codex CLI 0.160.0; rerun
+`ttp doctor --live <provider>` after a CLI upgrade.
+
+- Claude Code: workers have no write fence. They run with `bypassPermissions`, and the Bash
+  sandbox that would fence them needs bubblewrap.
+- Codex: the harness hook runs only where hooks are on and no other hook source exists.
+  Otherwise a worker sees an update only when it reads `steer.md` between steps.
 - Codex: the docs give no version for `developer_instructions` or
   `model_auto_compact_token_limit`. A build that ignores an unknown `-c` key would run a worker
   without its instructions or compaction.
+- Codex: the cost is estimated from tokens and `pricing.codex`; the CLI reports no cost.
 - Codex: where rollouts are kept is not documented. If it changes, lost runs start fresh.
-- Cursor: no documented chat store, so `session_saved` stays false and no run is resumed. Also
-  no budget, effort, auto-compact or system-prompt switch, and no usage in the documented
-  output.
-- Codex: only the hook and isolation rows were tested live (codex-cli 0.160). Hook-source
-  detection reads `config.toml` with simple patterns, so it errs towards seeing a source and
-  leaving the hook off.
-- Cursor: no live test with this version.
+- Codex: hook-source detection reads `config.toml` with simple patterns, so it errs towards
+  seeing a source and leaving the hook off.
+- Cursor: not measured, because the CLI is not installed on the test machine. From its docs: no
+  chat store, so `session_saved` stays false and no run is resumed; no budget, effort,
+  auto-compact or system-prompt switch; and no usage in the documented output.
 
 [cc-cli]: https://code.claude.com/docs/en/cli-reference
 [cc-env]: https://code.claude.com/docs/en/env-vars
