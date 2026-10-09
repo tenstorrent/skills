@@ -30844,3 +30844,16 @@ def test_new_and_upgrade_give_the_harness_a_local_git_identity_but_keep_one_alre
     except SystemExit:
         pass
     assert (local("user.name"), local("user.email")) == ("tt-project", "me@example.com")
+
+
+def test_daemon_lines_after_a_long_summary_stay_inside_the_digest_cap(env):
+    from ttp import coordinator as coord
+    p = make(env)
+    _with_origin(env, clone=False)
+    _, _, _, (rev,) = _finish_code(env, p, "a long title " + "x" * 190, {"app.py": 20})
+    waiters = [p.db.add_task(f"waiter {i}", "s", origin="coordinator", depends_on=[rev["id"]]) for i in range(3)]
+    failed = _fail_review(env, p, rev["id"], [{"title": "add the test", "spec": "test it"}], summary="s" * 1200)
+    (re_rev,) = p.db.q("SELECT * FROM tasks WHERE kind='review' AND id!=?", (rev["id"],))
+    tail = ", ".join(f"#{w}" for w in waiters) + f" now wait on #{re_rev['id']}."
+    assert len(failed["text"]) <= coord.EVENT_CHARS, len(failed["text"])
+    assert failed["text"].endswith(tail) and "[cut; the whole text is in" in failed["text"]

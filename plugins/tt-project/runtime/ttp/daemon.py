@@ -2090,8 +2090,9 @@ class Daemon:
         # A plan's findings, plugin advice and follow-up specs are its product: each part gets its own
         # event, sized for the digest to show it whole, so an ordinary hand-off does not grow.
         where = _result_ref(self.p, run_dir if handoff is None else run_dir / RESULT_FILE)
-        text = (f"#{task['id']} {task['title']} → {outcome} (run {ended or status}, {'~' if usage.estimated else ''}"
-                f"${usage.cost_usd:.2f}): {_cut(summary, 1200, where)}{push_note}")
+        head = (f"#{task['id']} {task['title']} → {outcome} (run {ended or status}, {'~' if usage.estimated else ''}"
+                f"${usage.cost_usd:.2f}): ")
+        text = ""   # the daemon's own lines after the summary, which the digest must show whole
         notes = ""
         if len(fups) > MAX_FOLLOWUPS:
             notes += (f"\nMore proposed follow-ups (their specs are in {where}): "
@@ -2131,6 +2132,9 @@ class Daemon:
         if outcome == "done" and task["kind"] == "review":
             text += relay_hint(coord._open_dependents(db, task["id"]))
         routine = (review is not None and plain) or fix is not None
+        # The summary takes what the digest's cap leaves after the header, push note and daemon lines.
+        room = min(1200, coord.EVENT_CHARS - len(head) - len(push_note) - len(text))
+        text = f"{head}{_cut(summary, max(200, room), where)}{push_note}{text}"
         if not approval:   # an approval has its push_queued event; the batch's outcome closes the task
             db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                  (time.time(), f"task:{task['id']}", f"task_{outcome}", sev, text,
