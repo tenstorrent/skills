@@ -350,7 +350,10 @@ and preferences you add later become part of the project's charter and memory.
   and `ttp doctor` as an environment problem, not as the head's code (as an environment problem
   also, when tests failed too): point the check at a venv.
 - `ttp checks -- <cmd>` adds a check. Several words run as that argv (`ttp checks -- pytest -q`);
-  one quoted string runs through the shell (`ttp checks -- 'FOO=1 pytest -q && ruff check .'`).
+  one quoted string runs through the shell (`ttp checks -- 'FOO=1 pytest -q && ruff check .'`);
+  several quoted strings run as one check each (`ttp checks -- 'pytest -q' 'ruff check .'`). An
+  added check that `delivery.push_checks` already runs on every head is dropped, and said, so it
+  never runs twice.
 - In Claude Code workers and reviewers, a Bash call that runs one of the configured pytest checks
   in full (every path it names, or a directory above them, and no `-k`, `-m`, `--lf` or node id
   it does not have) is refused with a pointer to `ttp checks`, which reuses a recorded pass.

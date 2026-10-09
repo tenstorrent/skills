@@ -480,7 +480,8 @@ def test_code_and_review_prompts_keep_full_suite_runs_to_ttp_checks():
     code = " ".join((prompts / "kind-code.md").read_text(encoding="utf-8").split())
     for part in ("While you iterate, run only the tests your change affects", "never the full suite",
                  "Run `ttp checks` once at the end, committed, before the hand-off",
-                 "A direct full-suite run is refused"):
+                 "A direct full-suite run is refused",
+                 "each command quoted as one word (`-- 'pytest -q tests/a.py' 'ruff check .'`)"):
         assert part in code, part
     review = " ".join((prompts / "kind-review.md").read_text(encoding="utf-8").split())
     for part in ("Rely on the pass the change's task recorded for the head you review",

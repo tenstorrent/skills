@@ -7,7 +7,8 @@
 - Reproduce first, then fix. Add or update a test that fails without the fix.
   Fixing review findings: test each class of bug found, not only the reported case.
 - Run the full checks before handing off, committed, through `ttp checks`: the project's checks,
-  plus after `--` only the repository's test and lint commands they do not already run. It reuses
+  plus after `--` only the repository's test and lint commands they do not already run, each
+  command quoted as one word (`-- 'pytest -q tests/a.py' 'ruff check .'`). It reuses
   a pass already recorded for the same tree and commands. If they take longer than one tool call may,
   run `ttp checks --detach -- <cmds>`: its output and exit code go to the run's directory, never
   the worktree, where a commit picks them up. Hand off `waiting` with the `retry_when` it prints;

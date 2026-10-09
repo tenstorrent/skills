@@ -1142,6 +1142,29 @@ def checks_env_line(p: Project) -> str | None:
             f"{e.get('run') or '?'} at {when} ({what}): {e['problem']}")
 
 
+def _extra_checks(extra: list[str], own: list) -> tuple[list[str], list[str]]:
+    """(the commands given after `--`, the ones dropped). One word is a shell command line as
+    written (`ttp checks -- 'FOO=1 pytest -q'`). Several words that each hold whitespace are one
+    command each (`-- 'pytest -q tests/a.py' 'ruff check .'`); any other several words are argv,
+    quoted so each stays one word (`-- pytest -k 'a and b'`). A command the same as one of the
+    project's checks that runs on every head (no `if_exists`/`if_changed`), or as an earlier one
+    here, is dropped: it would run twice. One that only a scoped check matches stays, as that
+    check may be skipped on this head."""
+    if not extra:
+        return [], []
+    if len(extra) == 1 or all(any(ch.isspace() for ch in w) for w in extra):
+        given = [w for w in extra if w.strip()]
+    else:
+        given = [shlex.join(extra)]
+    seen = {_command_key(c) for c in own if not (getattr(c, "if_exists", "") or getattr(c, "if_changed", ()))}
+    mine, dropped = [], []
+    for c in given:
+        key = _command_key(c)
+        (dropped if key in seen else mine).append(c)
+        seen.add(key)
+    return mine, dropped
+
+
 def cmd_checks(a) -> None:
     """(inside a run) Run the local checks on this worktree's commit and record the result in the
     run's directory: the harness's gh opens a PR (even a draft) only after they passed on HEAD. The
@@ -1173,11 +1196,11 @@ def cmd_checks(a) -> None:
     cfg = p.config() if p and p.exists() else {}
     if not (p and p.exists()):
         p = None
-    extra = a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd
-    # One word after `--` is a shell command line as written (`ttp checks -- 'FOO=1 pytest -q'`);
-    # several words are argv, quoted so each stays one word.
-    mine = [extra[0] if len(extra) == 1 else shlex.join(extra)] if extra else []
     own = push.check_list((cfg.get("delivery") or {}).get("push_checks"))
+    mine, dropped = _extra_checks(a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd, own)
+    if dropped:
+        print(f"ttp checks: not running {', '.join(map(repr, dropped))} after `--` again: "
+              f"delivery.push_checks already runs it")
     cmds = own + mine
     if not cmds:
         die("ttp checks: the project sets no delivery.push_checks; give the repository's test commands after "
@@ -3183,8 +3206,10 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--result", metavar="RUN_DIR",
                    help="run nothing: exit 0 once a run's detached checks finished or died, 1 while they run")
     s.add_argument("--rc", help=argparse.SUPPRESS)   # the detached process itself: where it writes its exit code
-    s.add_argument("cmd", nargs=argparse.REMAINDER, help="extra check command after --: several words run as argv; one quoted string "
-                        "runs through the shell, e.g. ttp checks -- 'FOO=1 pytest -q && ruff check'")
+    s.add_argument("cmd", nargs=argparse.REMAINDER, help="extra check commands after --: one quoted string runs through the shell "
+                        "(ttp checks -- 'FOO=1 pytest -q && ruff check'); several quoted strings run as "
+                        "one check each (-- 'pytest -q' 'ruff check .'); plain words run as argv "
+                        "(-- pytest -q tests/a.py). One that delivery.push_checks already runs is dropped")
     s.set_defaults(fn=cmd_checks)
 
     s = sub.add_parser("stats", help="context re-read (cache-read) tokens per run and per $, by kind and tier")

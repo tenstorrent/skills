@@ -27743,6 +27743,58 @@ def test_ttp_checks_runs_one_quoted_extra_command_through_the_shell(env, tmp_pat
     assert "not found" in (run / "checks.log").read_text()
 
 
+
+def test_ttp_checks_runs_several_quoted_extra_commands_as_one_check_each(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    rec = lambda: json.loads((run / "checks.json").read_text())
+    log = tmp_path / "ran"
+    cli.main(["checks", "--fresh", "--", f"echo a >> {log}", f"test -f a.txt && echo b >> {log}"])
+    assert rec()["passed"] is True and rec()["commands"] == [f"echo a >> {log}", f"test -f a.txt && echo b >> {log}"]
+    assert log.read_text().split() == ["a", "b"], "each quoted command ran as its own check"
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--fresh", "--", "test -f a.txt", "test -f missing.txt"])
+    assert e.value.code != 0 and rec()["passed"] is False
+    assert "'test -f missing.txt' failed" in capsys.readouterr().err
+    # A plain argv, and argv with one quoted word among plain ones, stays one command.
+    assert cli._extra_checks(["pytest", "-q", "tests/x.py"], []) == (["pytest -q tests/x.py"], [])
+    assert cli._extra_checks(["pytest", "-k", "a and b"], []) == (["pytest -k 'a and b'"], [])
+    assert cli._extra_checks(["FOO=1 pytest -q"], []) == (["FOO=1 pytest -q"], [])
+    assert cli._extra_checks([], []) == ([], [])
+
+
+def test_ttp_checks_drops_an_extra_command_the_project_checks_already_run(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli, push
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    count = tmp_path / "count"
+    check = f"echo x >> {count}"
+    p.set_config("delivery.push_checks", [check])
+    cli.main(["checks", "--fresh", "--", check, "test -f a.txt"])
+    out = capsys.readouterr().out
+    assert len(count.read_text().splitlines()) == 1, "the push check ran once"
+    assert json.loads((run / "checks.json").read_text())["commands"] == [check, "test -f a.txt"]
+    assert out.count("delivery.push_checks already runs it") == 1 and repr(check) in out
+    # The same command in another form, or given twice, is still one command.
+    own = push.check_list(["pytest -q tests/a.py"])
+    assert cli._extra_checks(["pytest", "-q", "tests/a.py"], own) == ([], ["pytest -q tests/a.py"])
+    assert cli._extra_checks(["pytest  -q 'tests/a.py'"], own) == ([], ["pytest  -q 'tests/a.py'"])
+    assert cli._extra_checks(["ruff check .", "ruff  check ."], own) == (["ruff check ."], ["ruff  check ."])
+    # A scoped project check may be skipped on this head: the extra that matches it stays.
+    scoped = push.check_list([{"run": "pytest -q", "if_changed": "src/**"}])
+    assert cli._extra_checks(["pytest", "-q"], scoped) == (["pytest -q"], [])
+
+
+def test_ttp_checks_still_reads_a_checks_record_from_before_extras_were_split(env, tmp_path, monkeypatch):
+    from ttp import cli, push
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    head = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    (run / "checks.json").write_text(json.dumps({"head": head, "worktree": str(repo), "passed": True,
+                                                 "commands": ["pytest -q", "test -n 'a b'"], "skipped": [],
+                                                 "ts": time.time()}))
+    assert push.recorded_extras(push.recorded_checks(run), head, push.check_list(["pytest -q"])) == ["test -n 'a b'"]
+    cli.main(["checks", "--", "test", "-n", "a b"])
+    assert json.loads((run / "checks.json").read_text())["commands"] == ["test -n 'a b'"]
+
 # global daily cap and the fixed budget day ---------------------------------------------------------
 def _other_project(tmp_path, name, host="testhost"):
     """Another project's database on this machine, registered as `ttp list` would show it."""
