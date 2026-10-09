@@ -2504,7 +2504,9 @@ The live harness was left untouched, and this task holds it until it ends: a new
 moves `upstream` and retargets this task (merge `upstream` again) instead of queuing another.
 In this harness repo:
 1. `git worktree add --detach <tmp> main`, then in <tmp>: `git merge upstream`.
-2. Resolve each conflict keeping this project's intent and taking upstream's fixes.
+2. Resolve each conflict keeping this project's intent and taking upstream's fixes. Put this project's
+   own prompt rules between `<!-- ttp:local -->` and `<!-- /ttp:local -->` lines, so later upgrades keep
+   them without a merge.
 3. Check in <tmp>: `python3 -m compileall -q runtime` and `PYTHONPATH=runtime python3 -c "import ttp.daemon, ttp.cli"`.
 4. Commit, then in <tmp>: `git merge main` (main may have moved meanwhile; resolve and check again).
 5. `ttp upgrade {name} --apply <commit>`, run on its own (never piped or masked). It fast-forwards main
@@ -2659,18 +2661,123 @@ def _restore_from_upstream(tmp: Path, ident: list[str], cut: dict[str, str]) -> 
     return ""
 
 
+LOCAL_OPEN, LOCAL_CLOSE = "<!-- ttp:local -->", "<!-- /ttp:local -->"
+
+
 def _settle_merge(tmp: Path, ident: list[str], files: list[str]) -> str:
     """Finish the stopped merge of upstream in worktree `tmp` without a model when no conflict needs
-    judgment (batch.settle): both sides only added lines at one spot, or upstream already holds the
-    project's change. Commits it and returns ""; else names the files left (nothing is committed)."""
-    from .batch import settle
-    left = [f for f in files if not settle(tmp, f, [], taken_in=True)]
+    judgment (batch.settle): both sides only added lines at one spot, they changed different lines,
+    or upstream already makes the project's change (comments and spacing aside). A template prompt
+    the project only added to takes upstream's text with the project's blocks put back
+    (_keep_local_blocks). Commits it and returns ""; else names the files left (nothing is committed)."""
+    from .batch import _show, settle
+    left, kinds, blocks = [], set(), []
+    for f in files:
+        if settle(tmp, f, [], taken_in=True, hunks=True, superseded=True, kinds=kinds):
+            continue
+        sides = [_show(tmp, n, f) for n in (2, 1, 3)]
+        merged = None
+        if f.startswith("prompts/") and f.endswith(".md") and None not in sides:
+            try:
+                merged = _keep_local_blocks(*(s.decode() for s in sides))
+            except UnicodeDecodeError:
+                pass
+        if merged is None:
+            left.append(f)
+        else:
+            durable_write(tmp / f, merged)
+            blocks.append(f)
     if left or not files:
         return "the merge conflicts in " + ", ".join(left)
     _git(tmp, "add", "--", *files)
     _git(tmp, *ident, "commit", "-q", "--no-edit", "--no-verify")
     print("settled the template merge's conflicts, which needed no judgment: " + ", ".join(files))
+    if "superseded" in kinds:
+        print("took upstream's version where it already makes the project's change; the project's own "
+              "wording stays in the merge's first parent")
+    if blocks:
+        print(f"kept this project's own blocks in upstream's text, fenced as {LOCAL_OPEN}: " + ", ".join(blocks))
     return ""
+
+
+def _keep_local_blocks(ours: str, base: str, theirs: str) -> str | None:
+    """A template prompt merged as upstream's text (`theirs`) plus this project's own blocks, when the
+    project only added to it: its text outside `<!-- ttp:local -->` fences is `base` with lines inserted.
+    Each block goes back after the base line it followed (after upstream's rewrite of that spot, if
+    any); added lines not yet fenced get the fence lines, so the next upgrade finds them as the
+    project's (the prompts leave the fence lines out). None when the project changed or removed
+    template text, or a fence is not closed: that needs judgment."""
+    import difflib
+    items: list[tuple[str, object]] = []       # ("t", template line) or ("b", fenced block lines)
+    block = None
+    for line in ours.splitlines(keepends=True):
+        s = line.strip()
+        opens, closes = (s.startswith(m[:-4]) and s.endswith("-->") for m in (LOCAL_OPEN, LOCAL_CLOSE))
+        if block is not None:
+            block.append(line)
+            if closes:
+                items.append(("b", block))
+                block = None
+        elif opens:
+            block = [line]
+        elif closes:
+            return None
+        else:
+            items.append(("t", line))
+    if block is not None:
+        return None
+    old = base.splitlines(keepends=True)
+    tmpl = [x for kind, x in items if kind == "t"]
+    added = [False] * len(tmpl)
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, old, tmpl, autojunk=False).get_opcodes():
+        if tag in ("replace", "delete"):
+            return None
+        if tag == "insert":
+            added[j1:j2] = [True] * (j2 - j1)
+    groups: list[tuple[int, list[str]]] = []    # (base lines before it, the block's lines)
+    at, j, new = 0, 0, []
+
+    def put(lines: list[str]) -> None:
+        if groups and groups[-1][0] == at:
+            groups[-1][1].extend(lines)
+        else:
+            groups.append((at, list(lines)))
+
+    def fence() -> None:
+        if new:
+            body = [x if x.endswith("\n") else x + "\n" for x in new]
+            put([LOCAL_OPEN + "\n", *body, LOCAL_CLOSE + "\n"])
+            new.clear()
+    for kind, x in items:
+        if kind == "b":
+            fence()
+            put([y if y.endswith("\n") else y + "\n" for y in x])
+        elif added[j]:
+            new.append(x)
+            j += 1
+        else:
+            fence()
+            at, j = at + 1, j + 1
+    fence()
+    if not groups:
+        return None
+    out = theirs.splitlines(keepends=True)
+    ops = difflib.SequenceMatcher(None, old, out, autojunk=False).get_opcodes()
+
+    def where(i: int) -> int:
+        for tag, i1, i2, j1, j2 in ops:
+            if tag == "equal" and i1 <= i <= i2:
+                return j1 + i - i1
+            if tag != "equal" and i == i1:
+                return j1
+            if tag != "equal" and i1 < i <= i2:
+                return j2
+        return len(out)
+    if out and not out[-1].endswith("\n"):
+        out[-1] += "\n"
+    for i, _, lines in sorted(((where(i), k, lines) for k, (i, lines) in enumerate(groups)), reverse=True):
+        out[i:i] = lines
+    return "".join(out)
 
 
 def _merge_upstream(h: Path, tmp: Path, ident: list[str], base: str = "main",

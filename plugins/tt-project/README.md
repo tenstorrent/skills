@@ -442,6 +442,13 @@ and restarts, keeping running work. `ttp config <name> upgrade.auto false` turns
 project finishes the upgrade itself (a merge conflict handed to its harness task, or retried by its
 daemon under `upgrade.auto`, which retries only a newer version), so a deploy script can count it as
 deferred; exit 1 is a real failure, such as a conflict nothing retries.
+Most conflicts settle without a model: changes to different lines, additions at one spot, and a
+local edit that upstream now makes too (comments and spacing aside: upstream's version is taken,
+the project's stays in the merge's first parent). A project's own rules in a template prompt belong
+between `<!-- ttp:local -->` and `<!-- /ttp:local -->` lines (the prompt leaves those lines out):
+an upgrade takes upstream's text and puts each block back where it stood. When a project only added
+lines to a template prompt, the upgrade fences them that way itself. Only a real overlap, such as
+the project and upstream rewording the same line, goes to a harness task.
 The same conflict deferred past 48 h, or past two harness tasks that ended without landing it,
 reaches the coordinator once as a normal observation, not once per deploy.
 

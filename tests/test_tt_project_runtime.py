@@ -8528,6 +8528,146 @@ def test_an_upgrade_settles_conflicts_that_need_no_judgment_without_a_task(env, 
     assert not _git_out(h, "status", "--porcelain") and len(_git_out(h, "worktree", "list").splitlines()) == 1
 
 
+_OLD_TUNING = """
+
+
+def tuning(flag):
+    # upstream's old note
+    if flag:
+        return 1
+    return 2
+
+
+def spacer_one():
+    return "a"
+
+
+def spacer_two():
+    return "b"
+"""
+
+
+def _upgrade_with_local_edits(env, monkeypatch, local, upstream, prompts=None, local_prompt=None):
+    """A harness on a template whose release.py ends with _OLD_TUNING, then local edits committed
+    (`local` replaces that tail; `local_prompt` maps prompt names to (base, ours)), then a newer
+    template (`upstream` replaces the tail; `prompts` maps prompt names to upstream's text)."""
+    p = make(env)
+    from ttp import cli, service
+    restarts = []
+    monkeypatch.setattr(service, "restart", lambda p: restarts.append(1) or "restarted")
+    lib = env["home"] / "lib" / "current" / "runtime" / "ttp"
+    h = p.harness
+    _install_template(env, {k: base for k, (base, _) in (local_prompt or {}).items()})
+    plain = (lib / "release.py").read_text()
+    (lib / "release.py").write_text(plain + _OLD_TUNING)
+    cli.main(["upgrade", "demo"])
+    rel = h / "runtime" / "ttp" / "release.py"
+    rel.write_text(rel.read_text().replace(_OLD_TUNING, local))
+    for name, (_, ours) in (local_prompt or {}).items():
+        (h / "prompts" / name).write_text(ours)
+    _git_out(h, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "local edits")
+    _install_template(env, prompts)
+    (lib / "release.py").write_text(plain + upstream)
+    _next_release(env)
+    restarts.clear()
+    return p, cli, restarts
+
+
+def test_an_upgrade_takes_upstream_where_it_already_makes_the_local_change(env, monkeypatch, capsys):
+    """A project hot-fixed a runtime function and upstream later shipped the same fix in its own
+    words, next to more changes: git calls it a conflict, but nothing needs judgment. The project's
+    other local edit of the file stays, and no harness task is queued."""
+    local = _OLD_TUNING.replace("    # upstream's old note\n    if flag:\n        return 1\n    return 2\n",
+                                "    return 1   # local fix: the flag never matters here\n") \
+        + "\n\ndef local_helper():\n    return 3\n"
+    upstream = _OLD_TUNING.replace("    # upstream's old note\n    if flag:\n        return 1\n    return 2\n",
+                                   "    # The flag is gone: always 1.\n    return 1\n\n\ndef tuning_more():\n"
+                                   "    return 5\n")
+    p, cli, restarts = _upgrade_with_local_edits(env, monkeypatch, local, upstream)
+    h = p.harness
+    capsys.readouterr()
+    cli.main(["upgrade", "demo", "--auto"])
+    out = capsys.readouterr().out
+    text = (h / "runtime" / "ttp" / "release.py").read_text()
+    assert "def tuning_more" in text and "The flag is gone" in text and "def local_helper" in text
+    assert "local fix" not in text and "if flag" not in text and "<<<<<<<" not in text
+    assert "settled the template merge's conflicts" in out and "already makes the project's change" in out
+    assert restarts == [1] and not p.db.q("SELECT id FROM tasks WHERE kind='harness'")
+    assert p.db.kv("upgrade_auto")["outcome"] == "applied" and _imports(h / "runtime").returncode == 0
+
+
+def test_an_upgrade_keeps_a_projects_prompt_blocks_in_upstreams_rewritten_text(env, monkeypatch, capsys):
+    """A project's rule sits in a fenced block inside a paragraph upstream rewrote, and another one was
+    added without a fence: upstream's text is taken whole, both rules go back where they stood, and
+    the unfenced one gets the fence for the next upgrade. The prompt leaves the fence lines out."""
+    from ttp import prompts
+    worker = (RUNTIME.parent / "template" / "prompts" / "worker.md").read_text()
+    base = worker + "\n## Local test\nAlpha one.\nAlpha two.\nAlpha three.\n"
+    ours = (worker + "\n## Local test\nAlpha one.\n<!-- ttp:local -->\nProject rule one.\n<!-- /ttp:local -->\n"
+            "Alpha two.\nAlpha three.\nProject rule two.\n")
+    theirs = worker + "\n## Local test\nAlpha one, reworded.\nAlpha two, reworded.\nAlpha three.\n"
+    p, cli, restarts = _upgrade_with_local_edits(env, monkeypatch, _OLD_TUNING, _OLD_TUNING,
+                                                 {"worker.md": theirs}, {"worker.md": (base, ours)})
+    h = p.harness
+    capsys.readouterr()
+    cli.main(["upgrade", "demo"])
+    out = capsys.readouterr().out
+    assert "kept this project's own blocks" in out and "prompts/worker.md" in out
+    assert (h / "prompts" / "worker.md").read_text() == (
+        worker + "\n## Local test\nAlpha one, reworded.\nAlpha two, reworded.\n<!-- ttp:local -->\n"
+        "Project rule one.\n<!-- /ttp:local -->\nAlpha three.\n<!-- ttp:local -->\nProject rule two.\n"
+        "<!-- /ttp:local -->\n")
+    shown = prompts.worker_system(p)
+    assert "Project rule one.\nAlpha three.\nProject rule two." in shown and "ttp:local" not in shown
+    assert restarts == [1] and not p.db.q("SELECT id FROM tasks WHERE kind='harness'")
+
+
+@pytest.mark.parametrize("where", ["runtime", "prompt"])
+def test_an_upgrade_still_hands_a_true_overlap_to_a_harness_task(env, monkeypatch, capsys, where):
+    """The project and upstream changed the same code, or reworded the same prompt line, each its own
+    way: that needs judgment, so the live harness stays as it is and a harness task merges it."""
+    worker = (RUNTIME.parent / "template" / "prompts" / "worker.md").read_text()
+    local = upstream = _OLD_TUNING
+    prompt = local_prompt = None
+    if where == "runtime":
+        local = _OLD_TUNING.replace("        return 1\n", "        return 10\n")
+        upstream = _OLD_TUNING.replace("        return 1\n", "        return 100\n")
+    else:
+        base = worker + "\n## Local test\nAlpha one.\n"
+        local_prompt = {"worker.md": (base, worker + "\n## Local test\nAlpha one, the project's way.\n")}
+        prompt = {"worker.md": worker + "\n## Local test\nAlpha one, upstream's way.\n"}
+    p, cli, restarts = _upgrade_with_local_edits(env, monkeypatch, local, upstream, prompt, local_prompt)
+    h = p.harness
+    before = _git_out(h, "rev-parse", "HEAD")
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo"])
+    out = capsys.readouterr().out
+    assert e.value.code == 75 and "the merge conflicts in" in out
+    assert ("runtime/ttp/release.py" if where == "runtime" else "prompts/worker.md") in out
+    assert _git_out(h, "rev-parse", "HEAD") == before and not restarts
+    assert p.db.one("SELECT id FROM tasks WHERE kind='harness'")
+
+
+def test_merge3_superseded_takes_theirs_only_when_it_holds_our_change():
+    from ttp.batch import merge3
+    base = "x = 1\nif a:\n    y = 2\nz = 3\n"
+    comment_only = "x = 1  # set\nif a:\n    y = 2\nz = 3\n"
+    assert merge3(comment_only, base, "x = 5\nif a:\n    y = 2\nz = 3\n", py=True) is None
+    assert merge3(comment_only, base, "x = 5\nif a:\n    y = 2\nz = 3\n", py=True,
+                  superseded=True) == "x = 5\nif a:\n    y = 2\nz = 3\n"
+    ours = "x = 1\ny = 2\nz = 3\n"         # dropped the `if`
+    theirs = "x = 1\n# no more if\ny = 2\nw = 4\nz = 3\n"
+    assert merge3(ours, base, theirs, py=True, superseded=True) == theirs
+    assert merge3("x = 1\ny = 9\nz = 3\n", base, theirs, py=True, superseded=True) is None
+    # a "#" inside a string is code, not a comment
+    assert merge3('x = "a #b"\nif a:\n    y = 2\nz = 3\n', base, "x = 5\nif a:\n    y = 2\nz = 3\n",
+                  py=True, superseded=True) is None
+    # in prompts only spacing is set aside
+    assert merge3("A  rule.\nB\n", "A rule.\nB\n", "A rule, reworded.\nB\n", superseded=True) == \
+        "A rule, reworded.\nB\n"
+    assert merge3("A rule!\nB\n", "A rule.\nB\n", "A rule, reworded.\nB\n", superseded=True) is None
+
+
 def test_a_conflicting_upgrade_queues_at_most_one_task_a_day(env, monkeypatch, capsys):
     """Each release would otherwise queue its own model task for the same conflict: within a day of
     the last one, the upgrade only records that it waits, and the daemon tries again after."""

@@ -218,12 +218,14 @@ def _sweep_after_push(p: Project, repo: Path) -> None:
 # Conflicts that need no judgment ---------------------------------------------------------------------
 
 def merge3(ours: str, base: str, theirs: str, py: bool = False, taken_in: bool = False,
-           hunks: bool = False, kinds: set | None = None) -> str | None:
+           hunks: bool = False, kinds: set | None = None, superseded: bool = False) -> str | None:
     """git's three-way merge of the texts, where each conflict in which both sides only added lines
     at one spot (an empty base section) keeps both: ours first, then theirs (in Python, see _seam).
     With `taken_in`, a conflict whose change on our side theirs already holds (_taken_in) takes
     theirs. With `hunks`, a conflict where the two sides changed different lines of the base section
-    (git calls adjacent changes a conflict) takes both changes (_hunks). None when any other conflict
+    (git calls adjacent changes a conflict) takes both changes (_hunks). With `superseded`, a conflict
+    whose change on our side theirs already makes, comments and spacing aside, takes theirs
+    (_superseded). None when any other conflict
     remains, or when keeping both could be wrong (_clash). `kinds` collects how each conflict was
     settled ("added", "taken_in", "hunks"). The conflict markers carry a random tag, so file content
     never passes for one; a hunk whose base-to-end part holds more than one separator line is not read.
@@ -260,7 +262,7 @@ def merge3(ours: str, base: str, theirs: str, py: bool = False, taken_in: bool =
         while j < len(lines) and lines[j].rstrip("\r\n") != sep:
             old.append(lines[j])
             j += 1
-        if old and not (taken_in or hunks):
+        if old and not (taken_in or hunks or superseded):
             return None                 # the base section is not empty: a real conflict
         j, theirs_lines = j + 1, []
         while j < len(lines) and lines[j].rstrip("\r\n") != end:
@@ -273,6 +275,9 @@ def merge3(ours: str, base: str, theirs: str, py: bool = False, taken_in: bool =
         if taken_in and _taken_in(mine, old, theirs_lines):
             res += theirs_lines
             how = "taken_in"
+        elif superseded and _superseded(mine, old, theirs_lines, py):
+            res += theirs_lines
+            how = "superseded"
         elif not old and not _clash(mine, theirs_lines, py):
             res += _seam(mine, theirs_lines) if py else mine + theirs_lines
             how = "added"
@@ -327,6 +332,47 @@ def _taken_in(mine: list[str], old: list[str], theirs: list[str]) -> bool:
         return {s for s in (line.strip() for line in lines) if any(c.isalnum() for c in s)}
     m, o, t = said(mine), said(old), said(theirs)
     return bool(m - o) and (m - o) <= t and not (o - m) & t
+
+
+_COMMENT_RE = re.compile(r"\s+#[^'\"]*$")     # a trailing comment with no quote after its `#`
+
+
+def _code(lines: list[str], py: bool) -> list[str]:
+    """`lines` as compared for _superseded: blank lines left out; in Python comment lines too, trailing
+    comments cut and the indent kept; elsewhere runs of spaces count as one."""
+    out = []
+    for line in lines:
+        s = line.rstrip()
+        if py:
+            if s.lstrip().startswith("#"):
+                continue
+            s = _COMMENT_RE.sub("", s)
+        else:
+            s = " ".join(s.split())
+        if s.strip():
+            out.append(s)
+    return out
+
+
+def _indel(a: list[str], b: list[str]) -> int:
+    """Lines to delete and insert to turn `a` into `b` (via their longest common subsequence)."""
+    row = [0] * (len(b) + 1)
+    for x in a:
+        prev, row = row, [0]
+        for j, y in enumerate(b):
+            row.append(prev[j] + 1 if x == y else max(prev[j + 1], row[j]))
+    return len(a) + len(b) - 2 * row[-1]
+
+
+def _superseded(mine: list[str], old: list[str], theirs: list[str], py: bool) -> bool:
+    """Whether theirs already makes our side's change of the `old` lines, comments and spacing aside
+    (_code): ours lies on a shortest way from old to theirs, so every line ours removed theirs removed
+    too and every line ours added theirs holds, in order. A local fix that upstream shipped in its own
+    words, or a local edit of comments alone. Big sections are left for judgment."""
+    m, o, t = (_code(x, py) for x in (mine, old, theirs))
+    if (len(m) + len(o)) * (len(t) + len(o)) > 250_000:
+        return False
+    return _indel(o, m) + _indel(m, t) == _indel(o, t)
 
 
 def _clash(mine: list[str], theirs: list[str], py: bool) -> bool:
@@ -405,13 +451,13 @@ def _show(wt: Path, stage: int, path: str) -> bytes | None:
 
 
 def settle(wt: Path, path: str, version_files: list[str], taken_in: bool = False, hunks: bool = False,
-           kinds: set | None = None) -> bool:
+           kinds: set | None = None, superseded: bool = False) -> bool:
     """Settle the conflicted `path` of a stopped rebase in `wt`, if it needs no judgment, and write
     the result: True when settled. Ours (stage 2) is the batch head, theirs (stage 3) the entry.
     In a version file every stage first takes the batch head's version, so a version line alone
     never conflicts. A pure addition keeps both sides (merge3), unless in a .py file that leaves a
     top-level def or class name twice where neither side had it twice (it would silently shadow a
-    test). `taken_in`, `hunks` and `kinds` are merge3's; a version line taken adds "version" to
+    test). `taken_in`, `hunks`, `superseded` and `kinds` are merge3's; a version line taken adds "version" to
     `kinds`. A file both sides created is never settled."""
     ours, base, theirs = _show(wt, 2, path), _show(wt, 1, path), _show(wt, 3, path)
     if ours is None or theirs is None or base is None:
@@ -429,7 +475,8 @@ def settle(wt: Path, path: str, version_files: list[str], taken_in: bool = False
         if (vb, vt) != (b, t):
             how.add("version")
         b, t = vb, vt
-    merged = merge3(o, b, t, py=path.endswith(".py"), taken_in=taken_in, hunks=hunks, kinds=how)
+    merged = merge3(o, b, t, py=path.endswith(".py"), taken_in=taken_in, hunks=hunks, kinds=how,
+                    superseded=superseded)
     if merged is None:
         return False
     if path.endswith(".py") and _duplicates(merged) - _duplicates(o) - _duplicates(t):
