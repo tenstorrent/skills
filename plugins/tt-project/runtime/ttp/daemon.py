@@ -2128,6 +2128,8 @@ class Daemon:
             moved = ", ".join(f"#{i}" for i in fix[2])
             text += (f"\nFix #{fix[0]} and re-review #{fix[1]} queued by the daemon"
                      + (f"; {moved} now wait on #{fix[1]}." if moved else "."))
+        if outcome == "done" and task["kind"] == "review":
+            text += relay_hint(coord._open_dependents(db, task["id"]))
         routine = (review is not None and plain) or fix is not None
         if not approval:   # an approval has its push_queued event; the batch's outcome closes the task
             db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
@@ -4753,6 +4755,21 @@ def review_rejects(result: dict) -> bool:
     verdict = metrics.get("verdict") if isinstance(metrics, dict) else None
     return isinstance(verdict, str) and verdict.strip().lower().replace("-", "_").replace(" ", "_") \
         in REVIEW_REJECT_VERDICTS
+
+
+RELAY_SHOWN = 8   # consuming tasks a passed review's event names
+
+
+def relay_hint(dependents: list[dict]) -> str:
+    """For a review that passed, the open tasks waiting on it and how they get its result: a
+    spec-only task_update, never a worker relaunched only to relay the verdict. "" when none wait."""
+    if not dependents:
+        return ""
+    shown = ", ".join(f"#{t['id']} ({t['status']})" for t in dependents[:RELAY_SHOWN])
+    if len(dependents) > RELAY_SHOWN:
+        shown += f" and {len(dependents) - RELAY_SHOWN} more"
+    return (f"\nWaiting on it: {shown}. Hand them the accepted commit, evidence path, verdict and open "
+            "gates with a spec-only task_update; requeue or add no task only to relay it.")
 
 
 def on_pass_problem(on_pass) -> str:

@@ -26305,6 +26305,26 @@ def _fail_review(env, p, rid, followups=(), **handoff):
     return p.db.one("SELECT * FROM events WHERE task=? AND kind IN ('task_failed','task_changes_needed')", (rid,))
 
 
+def test_a_passed_review_names_its_consumers_for_a_spec_only_update(env):
+    """A review that passes lists the open tasks waiting on it, so the coordinator hands them its
+    result with a spec-only task_update instead of relaunching a worker only to relay it."""
+    p = make(env)
+    from ttp.daemon import relay_hint
+    _, _, _, (rev,) = _finish_code(env, p, "feature", {"app.py": 40})
+    waiter = p.db.add_task("deploy it", "s", origin="coordinator", depends_on=[rev["id"]])
+    held = p.db.add_task("publish it", "s", origin="coordinator", depends_on=[rev["id"]])
+    p.db.update_task(held, status="blocked", blocked_reason="needs the published manifest")
+    _fail_review(env, p, rev["id"], status="done", summary="accepted at abc123")
+    done = p.db.one("SELECT * FROM events WHERE task=? AND kind='task_done'", (rev["id"],))
+    assert f"Waiting on it: #{waiter} (queued), #{held} (blocked)" in done["text"]
+    assert "spec-only task_update" in done["text"] and done["status"] == "queued"
+    assert p.db.task(held)["status"] == "blocked", "a passed review released a blocked consumer"
+    # No open consumer: no hint; a long list is cut.
+    assert relay_hint([]) == ""
+    many = relay_hint([{"id": i, "status": "queued"} for i in range(10)])
+    assert "#7 (queued) and 2 more" in many and "#8" not in many
+
+
 def test_a_failed_review_with_fixes_moves_its_dependents_onto_the_re_review(env):
     p = make(env)
     from ttp import worktree

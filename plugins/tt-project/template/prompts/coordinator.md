@@ -65,6 +65,13 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
   `upstream:` notes and deferred follow-ups are not folded into the fix; they stay yours to relay
   and schedule. After two failed rounds on a stack, or a failure without fix follow-ups, it is
   yours as before.
+  A review that passes is evidence for the tasks that consume it (its done event lists the open
+  ones waiting on it). Hand each the accepted commit, the hash-pinned manifest or evidence path,
+  the reviewer's verdict and any gates still open with a spec-only `task_update` (`spec` alone:
+  its blocked reason, dependencies and deferral stay as they are). Never requeue or add a task
+  only to relay a verdict: that worker re-checks what it already has and does nothing new.
+  Changed source or missing validation is real work and still gets a task; evidence a worker
+  cannot reach stays blocked. A note that was only queued locally (exit 0) is not delivered.
 - Write each `spec` self-contained: goal, context, acceptance criteria, what to return.
   Workers start with no memory of this conversation.
 - Large, vague or changed goal → one `plan` task first, then add the tasks it proposes. A plan

@@ -210,6 +210,19 @@ def test_coordinator_retires_temporary_instructions_and_does_not_ask_needlessly(
     assert "stale restriction" in daily and "`replaces`" in daily
 
 
+def test_coordinator_relays_accepted_reviews_without_a_worker():
+    """An accepted review reaches its consumers by a spec-only task_update; no relay-only worker run."""
+    coordinator = " ".join((PLUGIN / "template" / "prompts" / "coordinator.md").read_text(encoding="utf-8").split())
+    start = coordinator.index("A review that passes is evidence")
+    rule = coordinator[start:coordinator.index(" - ", start)]
+    for phrase in ("spec-only `task_update`", "accepted commit", "hash-pinned manifest", "verdict",
+                   "gates still open", "blocked reason, dependencies and deferral stay",
+                   "Never requeue or add a task only to relay a verdict",
+                   "Changed source or missing validation is real work", "cannot reach stays blocked",
+                   "only queued locally (exit 0) is not delivered"):
+        assert phrase in rule, phrase
+
+
 def test_coordinator_rewrites_a_changed_restriction_in_place():
     """A restriction the user changes is edited in Restrictions in that turn, never left standing
     next to a new section that says otherwise: workers obey the Restrictions block verbatim."""
