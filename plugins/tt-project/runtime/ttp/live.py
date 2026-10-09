@@ -27,6 +27,7 @@ import time
 import uuid
 from pathlib import Path
 
+from .project import durable_write
 from .providers.base import Provider, cli_output
 
 CHECKS = ("launch", "login", "session", "usage", "structured", "fence", "resume", "steer", "meter")
@@ -176,7 +177,7 @@ def measure(provider: str, *, tier: str = "light", timeout_s: float = RUN_TIMEOU
         rid = d.start_run("worker", prompt, provider, tier, str(repo), task=p.db.task(tid),
                           budget_usd=WORKER_USD, timeout_s=timeout_s)
         run_dir = p.runs / str(rid)
-        (run_dir / STEER_FILE).write_text(f"Update for your task: the update's code word is {steer_word}.\n")
+        durable_write(run_dir / STEER_FILE, f"Update for your task: the update's code word is {steer_word}.\n")
         assigned = (p.db.q("SELECT session_id FROM runs WHERE id=?", (rid,))[0] or {}).get("session_id") or ""
         exit_info, u = _finish(d, prov, provider, rid, timeout_s)
         try:

@@ -32,6 +32,22 @@ RUNTIME = pathlib.Path(__file__).resolve().parents[1] / "plugins" / "tt-project"
 TTP = pathlib.Path(__file__).resolve().parents[1] / "plugins" / "tt-project" / "bin" / "ttp"
 
 
+def _sockets_refused() -> bool:
+    """Some sandboxes (`codex sandbox` with the network off) refuse to create a network socket at all,
+    even one for loopback, and to bind a Unix socket."""
+    import tempfile
+    try:
+        socket.socket().close()
+        with tempfile.TemporaryDirectory() as d, socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
+            s.bind(os.path.join(d, "s"))
+        return False
+    except PermissionError:
+        return True
+
+
+needs_sockets = pytest.mark.skipif(_sockets_refused(), reason="this sandbox refuses network sockets and socket binds")
+
+
 _CODE: dict = {}       # (path, mtime, size) -> code object of a runtime module
 _LOCALES: dict = {}    # gettext.find's arguments and locale settings -> its answer
 
@@ -158,7 +174,7 @@ def env(tmp_path, monkeypatch, _git_session):
     monkeypatch.setenv("TTP_TEST_POLL_S", "0.05")   # wait loops (runner, ttp lock, listen) check often
     monkeypatch.setenv("TTP_TEST_DISK_MOUNT", str(tmp_path))   # the disk guard's du stays in the test folder
     # Tests may run inside a live run, under `ttp detach` (no in-run lock-wait cap) or `ttp lock`.
-    for var in ("TTP_RUN_DIR", "TTP_TASK", "TTP_RUN_ID", "TTP_PROJECT", "TTP_DETACHED", "TTP_LOCKS_HELD"):
+    for var in ("TTP_RUN_DIR", "TTP_TASK", "TTP_RUN_ID", "TTP_PROJECT", "TTP_DETACHED", "TTP_LOCKS_HELD", "TTP_PIDNS"):
         monkeypatch.delenv(var, raising=False)
     # A run's environment makes every git fsync its objects (project.git_fsync_env); test repositories
     # need no power-loss durability, and on some filesystems each `git add` then takes 20x longer.
@@ -2306,6 +2322,7 @@ def _start_web(p) -> int:
     return port
 
 
+@needs_sockets
 def test_web_servers_started_together_never_share_a_port(env):
     """Two web apps started at once each hold their own port and answer with their own project."""
     from ttp import web
@@ -2321,6 +2338,7 @@ def test_web_servers_started_together_never_share_a_port(env):
         assert json.loads(urllib.request.urlopen(req, timeout=5).read())["project"]["name"] == p.name
 
 
+@needs_sockets
 def test_web_api_requires_the_token(env):
     p = make(env)
     from ttp import web
@@ -2431,6 +2449,7 @@ def test_unreadable_config_refuses_settings_cleanly(env, capsys, monkeypatch):
     def no_server(*a, **k):
         raise Stop()
     monkeypatch.setattr(web, "ThreadingHTTPServer", no_server)
+    monkeypatch.setattr(web, "free_port", lambda start=0: 18700)   # no real socket: sandboxes may refuse one
     with pytest.raises(Stop):   # got past saving the port
         web.serve(type("D", (), {"p": p})())
     assert not p.config_path.exists()
@@ -2948,6 +2967,7 @@ def test_config_refreshes_last_good_on_equal_mtime(env):
     assert p.config()["budget"]["daily_usd"] == 43
     assert json.loads(good.read_text())["budget"]["daily_usd"] == 43
 
+@needs_sockets
 def test_web_chat_shows_replies_to_every_chat(env):
     p = make(env)
     from ttp import web
@@ -7745,6 +7765,7 @@ def load_result_summary(task) -> str:
     return json.loads(task["result"] or "{}").get("summary", "")
 
 
+@needs_sockets
 def test_web_cannot_requeue_a_running_task(env, tmp_path):
     p = make(env)
     from ttp import web
@@ -9816,6 +9837,7 @@ def _short_sock_path(name):
     return os.path.join(d, name), lambda: shutil.rmtree(d, ignore_errors=True)
 
 
+@needs_sockets
 def test_systemd_restarts_a_stuck_daemon_through_its_watchdog(env, monkeypatch):
     import socket
     p = make(env)
@@ -18597,6 +18619,7 @@ def test_health_does_not_count_a_task_on_a_paused_resource_as_ready(env):
     assert "ready to start" not in why and "board is paused" in why, why
 
 
+@needs_sockets
 def test_web_api_pauses_and_resumes_a_resource(env):
     p = make(env)
     from ttp import web
@@ -19242,6 +19265,7 @@ def test_budget_line_shows_both_windows_their_resets_and_the_mean_of_window_peak
     assert budget_line(p.db, now, "other").startswith("5h 80% - resets in 1.0 h, 24h $0.17 virtual")
 
 
+@needs_sockets
 def test_web_keep_installs_a_kept_local_forward_and_adopts_an_existing_one(env, tmp_path, monkeypatch, capsys):
     """`ttp web <name> --tunnel --keep` opens the local forward to a remote project's web app as a
     user service without asking. A com.tt-project.tunnel.<name> service set up by hand is adopted
@@ -19607,6 +19631,7 @@ def test_top_section_lists_open_asks_first_and_never_caps_them(env):
     assert "Question 0?" in coord.digest(p, {}, [], [])
 
 
+@needs_sockets
 def test_a_long_tick_tells_both_watchdogs_it_still_moves(env, monkeypatch):
     import socket
     p = make(env)
@@ -23333,6 +23358,7 @@ def test_a_monthly_alert_is_not_forgotten_after_a_week(env, monkeypatch):
     assert len(p.db.q("SELECT id FROM messages WHERE ref='config_problems:abc'")) == 1
 
 
+@needs_sockets
 def test_web_api_config_rejects_a_bad_value_with_400(env):
     p = make(env)
     from ttp import web
@@ -24337,6 +24363,7 @@ def test_without_a_schedules_file_the_database_holds_them_until_exported(env, ca
         cli.main(["schedules", "demo", "--export"])
 
 
+@needs_sockets
 def test_web_schedule_changes_write_back_to_the_schedules_file(env):
     p = make(env)
     from ttp import web
@@ -25351,6 +25378,7 @@ def test_pr_watch_alerts_when_a_run_took_a_pr_out_of_draft(env, monkeypatch):
     assert set(p.db.kv(prguard.UNAPPROVED_KEY)) == {"acme/widgets#9"}
 
 
+@needs_sockets
 def test_web_state_works_once_the_coordinator_has_run(env):
     """The page's data comes from request threads. After a coordinator turn it also shows the next
     idle wake, which must read through the request thread's own connection: SQLite refuses a
@@ -25385,6 +25413,7 @@ def _serve(p, start: int) -> int:
     raise AssertionError("the web app did not start")
 
 
+@needs_sockets
 def test_connect_ends_with_a_web_link_checked_on_its_own_port_and_token(env, capsys):
     """`ttp connect` ends with the web app link only once the state endpoint answered 200 on that
     exact port with that token and named this project. A wrong token or another project's web app
@@ -25415,6 +25444,7 @@ def test_connect_retries_while_the_web_app_comes_up(env, monkeypatch, capsys):
     assert {s[1] for s in seen} == {"demo"}
 
 
+@needs_sockets
 def test_connect_repairs_or_names_what_is_broken_instead_of_a_dead_link(env, monkeypatch, capsys):
     """Nothing answers: a daemon kept by a service is restarted and the link checked again. A
     daemon no service keeps stays stopped (starting it would start spending), and the line says
@@ -25464,6 +25494,7 @@ def _remote(env, monkeypatch, tmp_path, connect_out):
     return p, port, calls, ssh
 
 
+@needs_sockets
 def test_connect_to_a_remote_project_keeps_a_local_forward_and_checks_the_link(env, monkeypatch, tmp_path, capsys):
     from ttp import cli, tunnel, web
     p, port, calls, ssh = _remote(env, monkeypatch, tmp_path, "tt-project://demo@box:/srv/p\nchat: c1\nstatus\n"
@@ -25486,6 +25517,7 @@ def test_connect_to_a_remote_project_keeps_a_local_forward_and_checks_the_link(e
     assert e.value.code == 0 and ssh[-1] == ["web", "demo"] and f"127.0.0.1:{port}/#token=" in out, out
 
 
+@needs_sockets
 def test_a_remote_link_that_fails_is_repaired_then_reported(env, monkeypatch, tmp_path, capsys):
     """Retry while the new tunnel comes up; then restart the kept tunnel; then, if ssh works, the
     daemon there. Still nothing: say what is broken, with no link."""
@@ -25540,6 +25572,7 @@ def test_remote_new_passes_on_the_far_machines_failed_check(env, monkeypatch, ca
     assert {k: load_registry()["projects"]["far"][k] for k in ("host", "dir")} == {"host": "box", "dir": "/srv/far"}
 
 
+@needs_sockets
 def test_a_kept_tunnel_the_service_manager_refuses_is_named_without_touching_the_daemon(env, monkeypatch, tmp_path, capsys):
     from ttp import cli, tunnel, weblink
     p, port, calls, ssh = _remote(env, monkeypatch, tmp_path, "web app: http://127.0.0.1:18700/#token=abc123\n")
@@ -25788,6 +25821,7 @@ def test_setup_warns_when_installed_copy_is_older_than_checkout(env, tmp_path, m
     assert cli.stale_install_warning(sub) == ""
 
 
+@needs_sockets
 def test_web_api_paths_use_their_own_connection_after_a_coordinator_turn(env):
     """Every API path runs in a request thread, and the helpers it calls must read through that
     thread's connection: the daemon's p.db belongs to the main thread, and SQLite refuses it
