@@ -30667,3 +30667,19 @@ def test_daily_review_target_line_reads_the_last_pushed_batch_reach(env, tmp_pat
     assert pushq.target_line(db).startswith("Intended target origin/main could not be read at the last push")
     batch("same", {"ref": "origin/proj", "on": True, "behind": 0}, started=7.0)
     assert pushq.target_line(db) is None
+
+
+def test_the_worker_hook_logs_a_denied_draft_guard_bypass_to_the_gh_guard_log(env, monkeypatch, tmp_path):
+    from ttp import hook, prguard
+    run_dir = tmp_path / "state" / "runs" / "7"
+    run_dir.mkdir(parents=True)
+    monkeypatch.setenv("TTP_RUN_DIR", str(run_dir))
+    monkeypatch.setenv("TTP_RUN_ID", "7")
+    state = tmp_path / "state"
+    out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "ttp say other hi"}})
+    assert out and not (state / prguard.GH_LOG).exists()
+    out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "/usr/bin/gh pr ready 5"}})
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    (rec,) = [json.loads(x) for x in (state / prguard.GH_LOG).read_text().splitlines()]
+    assert rec["action"] == "ready" and rec["refused"] is True and rec["run"] == "7"
+    assert prguard.worker_calls(state, "o/r#5", 0)
