@@ -32328,6 +32328,52 @@ def test_each_hold_anchor_releases_its_task_once_it_is_over(env, tmp_path):
     assert len(why) == 4 and any("ask #" in w for w in why) and any("when probe passed" in w for w in why)
 
 
+def test_a_hold_anchor_never_outlives_its_hold(env):
+    """A requeue by any path (here the web app's raw SQL) drops the anchor, so a later block for
+    another reason is not released by it."""
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import web
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    tid = _hold_task(p)
+    coord.pause_resource(p, "board-a", True, "maintenance")
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "status": "blocked",
+                            "waits_on": "resource:board-a"}]) == []
+    port = _start_web(p)
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/api/task/{tid}", method="POST",
+                                 data=json.dumps({"status": "queued"}).encode(),
+                                 headers={"X-TTP-Token": web.token(p), "Content-Type": "application/json"})
+    for _ in range(50):
+        try:
+            with urllib.request.urlopen(req, timeout=2) as r:
+                assert r.status == 200
+            break
+        except urllib.error.HTTPError:
+            raise
+        except OSError:
+            time.sleep(0.1)
+    t = p.db.task(tid)
+    assert t["status"] == "queued" and "waits:" not in t["labels"]
+    p.db.update_task(tid, status="blocked", blocked_reason="task budget exhausted")
+    coord.pause_resource(p, "board-a", False)
+    d.sweep_holds()
+    t = p.db.task(tid)
+    assert t["status"] == "blocked" and t["blocked_reason"] == "task budget exhausted"
+    # Every other way off blocked, and every way to put an anchor on a task not blocked, drops it too.
+    for leave in (lambda: p.db.update_task(tid, status="running"),
+                  lambda: p.db.x("UPDATE tasks SET status='done' WHERE id=?", (tid,)),
+                  lambda: p.db.update_task(tid, status="queued", labels=["kept", "waits:resource:board-a"])):
+        p.db.update_task(tid, status="blocked", labels=["kept", "waits:resource:board-a"])
+        assert "waits:" in p.db.task(tid)["labels"]
+        leave()
+        assert json.loads(p.db.task(tid)["labels"]) == ["kept"]
+    p.db.update_task(tid, labels=["waits:until:1", "kept"])
+    assert json.loads(p.db.task(tid)["labels"]) == ["kept"]
+    new = p.db.add_task("born queued", "s", origin="user", labels=["waits:resource:board-a", "resource:board-a"])
+    assert json.loads(p.db.task(new)["labels"]) == ["resource:board-a"]
+
+
 def test_an_expired_ask_releases_its_hold(env):
     p = make(env)
     from ttp import coordinator as coord

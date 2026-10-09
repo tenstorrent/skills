@@ -8,7 +8,8 @@ The coordinator sets a task blocked (task_update status=blocked) only with `wait
 - `until:<time>`: over at that time (a delay such as 6h or an ISO time, as start_after),
 - `when:<probe>`: over once the shell probe exits 0 (as start_when; the daemon runs it).
 It is kept as the task label `waits:<kind>:<value>` (an until as epoch seconds). The daemon requeues an
-anchored hold once its anchor is over, model-free (Daemon.sweep_holds).
+anchored hold once its anchor is over, model-free (Daemon.sweep_holds). It lives only while the task is
+blocked: a trigger in db.py drops it from any write that leaves it on a task in another status.
 
 Blocks the daemon or a worker made carry no anchor, nor do holds from before anchors. A hold with no
 anchor is stale once held past coordinator.hold_max_h, or once the user wrote after it was held (that

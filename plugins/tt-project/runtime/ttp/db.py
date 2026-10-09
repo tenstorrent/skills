@@ -50,6 +50,23 @@ CREATE TABLE IF NOT EXISTS tasks (
   blocked_reason TEXT, depends_on TEXT NOT NULL DEFAULT '[]', labels TEXT NOT NULL DEFAULT '[]',
   not_before REAL);
 CREATE INDEX IF NOT EXISTS tasks_status ON tasks(status, priority);
+-- A hold's anchor (anchors.py, the label `waits:<kind>:<value>`) lives only while the task is blocked.
+-- Every write that leaves it on a task not blocked, raw SQL included, drops it: else a later block
+-- for another reason (a budget, a dead dependency, a worker) would be released by the old anchor.
+CREATE TRIGGER IF NOT EXISTS tasks_anchor_update AFTER UPDATE OF status, labels ON tasks
+WHEN NEW.status != 'blocked' AND NEW.labels LIKE '%"waits:%' AND json_valid(NEW.labels)
+  AND json_type(NEW.labels) = 'array'
+BEGIN
+  UPDATE tasks SET labels = (SELECT json_group_array(value) FROM (SELECT value FROM json_each(NEW.labels)
+    WHERE type != 'text' OR substr(value, 1, 6) != 'waits:' ORDER BY key)) WHERE id = NEW.id;
+END;
+CREATE TRIGGER IF NOT EXISTS tasks_anchor_insert AFTER INSERT ON tasks
+WHEN NEW.status != 'blocked' AND NEW.labels LIKE '%"waits:%' AND json_valid(NEW.labels)
+  AND json_type(NEW.labels) = 'array'
+BEGIN
+  UPDATE tasks SET labels = (SELECT json_group_array(value) FROM (SELECT value FROM json_each(NEW.labels)
+    WHERE type != 'text' OR substr(value, 1, 6) != 'waits:' ORDER BY key)) WHERE id = NEW.id;
+END;
 
 CREATE TABLE IF NOT EXISTS runs (
   id INTEGER PRIMARY KEY AUTOINCREMENT, task INTEGER, role TEXT NOT NULL,
