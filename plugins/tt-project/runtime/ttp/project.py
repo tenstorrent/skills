@@ -170,7 +170,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Workers and reviewers run with the project's Python venv active (VIRTUAL_ENV, PATH), so a
     # fresh task worktree does not rebuild one. "auto" finds .venv or venv in the project root; a
     # path (absolute, or relative to the project root) names one; "" turns it off. A working
-    # directory with a venv of its own keeps that one. A new task worktree gets a symlink to each
+    # directory with a venv of its own keeps that one. Every worktree of the project's repository
+    # (a task's, a reviewer's, the push queue's; worktree.prepare) gets a symlink to each
     # link_paths entry (relative to the project root) that exists and is git-ignored there and is
     # missing in the worktree, so checks naming `.venv/bin/python` work; [] turns it off. Code tasks
     # always run in a worktree of their own; `kinds` adds other task kinds (say ["work"]) so they

@@ -85,7 +85,9 @@
   prompt names it), so a fresh worktree does not rebuild one. `worktree.venv`: `auto` (default) finds
   `.venv` or `venv` in the project root, a path names another, `""` turns it off. A worktree with a
   venv of its own keeps it; with no venv, runs start as before.
-- A new task worktree gets a symlink to each `worktree.link_paths` entry (default `[".venv"]`,
+- Every worktree of the project's repository (a code or fix task's, one a reviewer works in or made
+  itself, where `ttp checks` or `ttp push` runs, and the push queue's checkouts) gets a symlink to
+  each `worktree.link_paths` entry (default `[".venv"]`,
   relative to the project root) that exists and is git-ignored in the project checkout and is
   missing in the worktree, so a check such as `.venv/bin/python -m pytest` works there. Tracked
   paths and existing files are never touched; the link is git-ignored (info/exclude if needed), and

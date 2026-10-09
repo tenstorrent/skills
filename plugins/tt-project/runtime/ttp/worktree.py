@@ -92,7 +92,7 @@ def ensure(p: Project, task: dict) -> tuple[Path, str]:
     branch = task.get("branch") or f"ttp/t{task['id']}-{slug(task['title'])}"
     path = p.worktrees / f"t{task['id']}"
     if path.exists() and is_git(path):
-        link_paths(p, path)
+        prepare(p, path)
         return path, branch
     p.worktrees.mkdir(parents=True, exist_ok=True)
     exists = _git(p.root, "rev-parse", "--verify", "--quiet", branch, check=False)
@@ -101,7 +101,7 @@ def ensure(p: Project, task: dict) -> tuple[Path, str]:
     else:
         _git(p.root, "fetch", "--quiet", "origin", check=False)
         _git(p.root, "worktree", "add", "-b", branch, str(path), continued_head(p, task) or resolve_base(p))
-    link_paths(p, path)
+    prepare(p, path)
     return path, branch
 
 
@@ -137,10 +137,30 @@ def _ignores(repo: Path, rel: str) -> bool:
                           capture_output=True, timeout=120).returncode == 0
 
 
-def link_paths(p: Project, path: Path) -> list[str]:
-    """Symlink the project checkout's git-ignored environment entries (`worktree.link_paths`,
-    relative paths) into the worktree at `path`, so a check that runs `.venv/bin/python` works in a
-    fresh worktree. An entry is linked only when it exists in the checkout, git ignores it there (so
+def prepare(p: Project, path: str | Path, root: str | Path | None = None) -> list[str]:
+    """Set up a worktree of the project's repository the same way whatever made it: a code or fix
+    task's (ensure), one a reviewer works in or made itself, the push queue's and after_push's
+    checkouts. Today that is link_paths from the main checkout `root` (the project root by default).
+    Nothing happens for the main checkout itself or a worktree of another repository. Returns the
+    entries linked; failures are skipped."""
+    root = Path(root or p.root)
+    try:
+        path = Path(path)
+        top = Path(_git(path, "rev-parse", "--show-toplevel"))
+        if top.resolve() == root.resolve():
+            return []
+        common = lambda d: (Path(d) / _git(d, "rev-parse", "--git-common-dir")).resolve()   # noqa: E731
+        if common(top) != common(root):
+            return []
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        return []
+    return link_paths(p, top, root)
+
+
+def link_paths(p: Project, path: Path, root: str | Path | None = None) -> list[str]:
+    """Symlink the main checkout's (`root`, the project root by default) git-ignored environment
+    entries (`worktree.link_paths`, relative paths) into the worktree at `path`, so a check that runs
+    `.venv/bin/python` works in a fresh worktree. An entry is linked only when it exists in the checkout, git ignores it there (so
     it is not tracked) and nothing is at its place in the worktree, tracked or not. A rule like
     `.venv/` matches directories only, not a link, so a link git would not ignore gets a `/<entry>`
     line in the repository's info/exclude: `git add -A` never commits it and the worktree still
@@ -149,15 +169,15 @@ def link_paths(p: Project, path: Path) -> list[str]:
     rels = (p.config().get("worktree") or {}).get("link_paths", LINK_PATHS)
     if not isinstance(rels, list):
         return []
-    done = []
+    root, path, done = Path(root or p.root), Path(path), []
     for rel in rels:
         if not isinstance(rel, str) or not rel.strip("/") or Path(rel).is_absolute() or ".." in Path(rel).parts:
             continue
         rel = rel.strip("/")
-        src, dest, made = p.root / rel, path / rel, False
+        src, dest, made = root / rel, path / rel, False
         try:
             if (not src.exists() or os.path.lexists(dest) or not dest.parent.is_dir()
-                    or not _ignores(p.root, rel) or _git(path, "ls-files", "--", rel, check=False)):
+                    or not _ignores(root, rel) or _git(path, "ls-files", "--", rel, check=False)):
                 continue
             os.symlink(src.resolve(), dest, target_is_directory=src.is_dir())
             made = True

@@ -3870,6 +3870,46 @@ def test_a_new_worktree_links_the_checkouts_ignored_venv_and_removing_it_keeps_t
     assert not os.path.lexists(again / ".venv") and (venv / "pyvenv.cfg").is_file()
 
 
+def test_every_worktree_of_the_project_gets_the_venv_link_a_review_one_too(env, monkeypatch, tmp_path):
+    """A worktree a reviewer works in, or made itself, gets the same .venv link as a code task's, so
+    push checks like `.venv/bin/python -m pytest` run there; none without a project .venv, and the main
+    checkout or another repository's worktree is left alone."""
+    p = make(env)
+    from ttp import cli, worktree
+    (p.root / ".gitignore").write_text(".venv/\n")
+    _git_out(p.root, "add", ".gitignore")
+    _git_out(p.root, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "ignore the venv")
+
+    def review_worktree(name):
+        path = p.worktrees / name
+        p.worktrees.mkdir(parents=True, exist_ok=True)
+        _git_out(p.root, "worktree", "add", "-q", "--detach", str(path), "HEAD")
+        return path
+    # No venv in the project: nothing is linked.
+    bare = review_worktree("r1")
+    assert worktree.prepare(p, bare) == [] and not os.path.lexists(bare / ".venv")
+    venv = _fake_venv(p.root / ".venv")
+    rev = review_worktree("r2")
+    assert worktree.prepare(p, rev) == [".venv"]
+    assert (rev / ".venv").resolve() == venv.resolve() and _git_out(rev, "status", "--porcelain") == ""
+    assert worktree.prepare(p, rev) == [], "a second call finds the link in place"
+    assert worktree.prepare(p, p.root) == [] and not (p.root / ".venv").is_symlink()
+    other = tmp_path / "other"
+    subprocess.run(["git", "init", "-q", str(other)], check=True)
+    _git_out(other, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x")
+    _git_out(other, "worktree", "add", "-q", "--detach", str(tmp_path / "other-wt"), "HEAD")
+    assert worktree.prepare(p, tmp_path / "other-wt") == [] and not os.path.lexists(tmp_path / "other-wt" / ".venv")
+    # `ttp checks` in a worktree a reviewer made itself: the venv check runs.
+    p.set_config("delivery.push_checks", ["test -x .venv/bin/python"])
+    (venv / "bin" / "python").chmod(0o755)
+    made = review_worktree("r3")
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path))
+    monkeypatch.chdir(made)
+    cli.main(["checks", "--fresh"])
+    assert (made / ".venv").is_symlink() and "test -x .venv/bin/python" in (tmp_path / "checks.log").read_text()
+
+
 def test_ttp_in_a_run_ignores_a_broken_project_venv_python(env):
     """The venv's bin sits right after the harness bin on a run's PATH: `ttp` must still run under
     the daemon's interpreter, not whatever `python3` the venv has."""
@@ -15515,6 +15555,18 @@ def test_a_push_batch_lands_its_entries_with_one_bump_one_changeset_and_one_chec
         "- e3: edit plugins/p/f3.txt")
     assert m["phase"] == "finished" and m["after_push"] == {"status": "skipped", "reason": "delivery.after_push is not set"}
     assert not list((p.state / "locks").glob("*run-b1*")), "no lock file of the batch is left behind"
+
+
+def test_a_push_batch_checkout_gets_the_projects_venv_link(env, monkeypatch):
+    """The push queue's own checkout gets the project's .venv link, as a code task's worktree does,
+    so a check like `.venv/bin/python ...` runs there."""
+    p, repo, origin, other = _bump_setup(env, monkeypatch, ["test -x .venv/bin/python"])
+    (repo / ".git" / "info" / "exclude").write_text("/.venv\n")
+    venv = _fake_venv(repo / ".venv")
+    (venv / "bin" / "python").chmod(0o755)
+    heads = [_entry(repo, "e1", {"plugins/p/f1.txt": "1\n"})]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed", m
 
 
 def test_a_push_batch_fast_forwards_the_extra_branches_it_is_given(env, monkeypatch, capsys):

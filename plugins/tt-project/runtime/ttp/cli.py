@@ -1028,6 +1028,8 @@ def cmd_push(a) -> None:
         return
     if a.free:
         sys.exit(push.free(p, Path.cwd()))
+    from . import worktree
+    worktree.prepare(p, Path.cwd())   # a worktree a reviewer made itself gets the .venv its checks may run
     if a.marker:
         sys.exit(push.run_detached(p, Path.cwd(), Path(a.marker), a.own))
     if a.batch:
@@ -1213,6 +1215,9 @@ def cmd_checks(a) -> None:
     head = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     if not top or not head:
         die("ttp checks: run it in the change's git worktree")
+    if p:
+        from . import worktree
+        worktree.prepare(p, top)   # a worktree a reviewer made itself gets the .venv its checks may run
     if subprocess.run([*git, "status", "--porcelain", "--untracked-files=no"], capture_output=True,
                       text=True).stdout.strip():
         die("ttp checks: commit first; the checks are recorded for a commit, and this worktree has changes")

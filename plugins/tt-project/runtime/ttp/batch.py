@@ -34,7 +34,7 @@ import tokenize
 from collections import deque
 from pathlib import Path
 
-from . import locks, push
+from . import locks, push, worktree
 from .project import Project, durable_write, write_json
 
 WORKTREE = "push"             # the batch's own checkout under the project's worktrees (never t<id>)
@@ -685,6 +685,7 @@ class Batch:
             r = _git(self.repo, "worktree", "add", "-q", "--detach", str(wt), tip)
             if r.returncode != 0:
                 raise RuntimeError(f"cannot make the push worktree {wt}: {_last(r.stderr, 3)}")
+        worktree.prepare(self.p, wt, self.repo)   # the .venv a check like `.venv/bin/python ...` runs
 
     def _checkout(self, head: str) -> None:
         r = _git(self.wt, "checkout", "-q", "--detach", "--force", head)
@@ -1054,6 +1055,7 @@ def after_push(p: Project, marker: Path, m: dict) -> dict:
         say(f"after_push: cannot check out {sha[:10]}: {_last(r.stderr, 3)}")
         return {"status": "failed", "exit": None, "cmd": "git worktree add", "started": started,
                 "ended": time.time(), "tail": _last(r.stderr)}
+    worktree.prepare(p, wt, repo)
     tasks = []
     for res in m.get("results") or []:
         t = res.get("task")
