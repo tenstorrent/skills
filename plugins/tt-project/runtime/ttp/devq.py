@@ -415,7 +415,7 @@ def over_cap(spec: dict, cfg: dict) -> str:
 # fill the host's disk can take down more than the job: the guard refuses such a job at submit.
 _GROUP_ISOLATION = re.compile(r"(?<![\w-])setsid(?![\w-])")
 _TRAP = re.compile(r"""(?<![\w-])trap\s+(?:--\s+)?('[^']*'|"[^"]*"|[^\s'"]+)((?:[ \t]+[A-Za-z0-9_]+)+)""")
-_FUNC = re.compile(r"(?:^|[\s;])(?:function\s+)?([A-Za-z_][\w-]*)\s*\(\s*\)\s*\{")
+_FUNC = re.compile(r"(?:^|[\s;])(?:function\s+([A-Za-z_][\w-]*)\s*(?:\(\s*\))?|([A-Za-z_][\w-]*)\s*\(\s*\))\s*\{")
 _KILL = re.compile(r"(?<![\w-])kill((?:[ \t]+[^\s;&|)]+)+)")
 _QUOTES = "\"'"
 _SIGNALS = {"0": "EXIT", "1": "HUP", "2": "INT", "15": "TERM"}
@@ -473,7 +473,7 @@ def _function_bodies(text: str) -> dict:
         while i < len(text) and depth:
             depth += {"{": 1, "}": -1}.get(text[i], 0)
             i += 1
-        out[m.group(1)] = text[m.end():i]
+        out[m.group(1) or m.group(2)] = text[m.end():i]
     return out
 
 
@@ -516,7 +516,7 @@ def _expand(value: str, known: dict) -> str | None:
 
 def _under(path: str, prefixes: list) -> str:
     for pre in prefixes:
-        pre = pre.rstrip("/")
+        pre = os.path.expanduser(pre).rstrip("/")
         if path == pre or path.startswith(pre + "/"):
             return pre
     return ""

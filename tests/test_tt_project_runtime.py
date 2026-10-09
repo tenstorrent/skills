@@ -31419,3 +31419,16 @@ def test_daemon_lines_after_a_long_summary_stay_inside_the_digest_cap(env):
     tail = ", ".join(f"#{w}" for w in waiters) + f" now wait on #{re_rev['id']}."
     assert len(failed["text"]) <= coord.EVENT_CHARS, len(failed["text"])
     assert failed["text"].endswith(tail) and "[cut; the whole text is in" in failed["text"]
+
+
+def test_devq_guard_accepts_function_keyword_handlers_and_tilde_netfs_prefixes(tmp_path, monkeypatch):
+    from ttp import devq
+    # `function name {` (no parens) is a handler too; the old pattern reported its trap missing.
+    for defn in ("function stop { kill -- -$pg; }", "function stop() { kill -- -$pg; }", "stop() { kill -- -$pg; }"):
+        assert devq._isolation_problem(f"{defn}\nsetsid x & pg=$!\ntrap stop EXIT TERM INT\n") == "", defn
+    assert "a trap on EXIT" in devq._isolation_problem(
+        "function stop { kill $pid; }\nsetsid x & pid=$!\ntrap stop EXIT TERM INT\n")
+    # A '~' prefix (accepted by the config check) matches the expanded path it stands for.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    resolved, pre = devq.resolve_local(os.path.expanduser("~/net/a"), ["~/net"])
+    assert pre == f"{tmp_path}/net" and resolved == f"{tmp_path}/net/a"
