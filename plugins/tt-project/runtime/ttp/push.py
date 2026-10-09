@@ -28,7 +28,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 from . import locks
 from .budget import DOC_SUFFIXES
@@ -201,14 +201,23 @@ def check_argv(cmd: str, top: str | Path | None = None) -> list[str]:
 
 
 VENV_DIRS = (".venv", "venv")
-# A pytest run at a command's start: after the line's start or a separator, and VAR=value words.
-_PYTEST_RUN = re.compile(r"(^|&&|\|\||[;|(\n])(\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*)"
+# A pytest run at a command's start: after the line's start or a separator, and VAR=value words,
+# `env [VAR=value...]` and `timeout [options] <duration>` wrappers.
+_PYTEST_RUN = re.compile(r"(^|&&|\|\||[;|(\n])(\s*(?:(?:[A-Za-z_][A-Za-z0-9_]*=\S*|env|"
+                         r"timeout(?:\s+-[A-Za-z-]+(?:[= ]\S+)?)*\s+\d+(?:\.\d+)?[smhd]?)\s+)*)"
                          r"(?:pytest|py\.test|python3?\s+-m\s+pytest)(?=\s|$|[;&|)])")
 
 
 def venv_python(top: str | Path) -> Path | None:
     """The python of the repository's venv (.venv/ or venv/, with pytest installed in it) in the
     worktree `top`, else in its main checkout (a linked worktree has no copy of an ignored venv), or None."""
+    return _venv(top)[0]
+
+
+def _venv(top: str | Path) -> tuple[Path | None, str]:
+    """(venv_python, "") or, when the only venv is the main checkout's and it has a package installed
+    editable from outside the worktree `top`, (None, why): the worktree's tests would import the main
+    checkout's code and could pass whatever the worktree's code does."""
     bases = [Path(top)]
     r = subprocess.run(["git", "-C", str(top), "rev-parse", "--path-format=absolute", "--git-common-dir"],
                        capture_output=True, text=True)
@@ -219,19 +228,63 @@ def venv_python(top: str | Path) -> Path | None:
         for d in VENV_DIRS:
             py, bin_ = base / d / "bin" / "python", base / d / "bin"
             if os.access(py, os.X_OK) and (bin_ / "pytest").exists():
-                return py
-    return None
+                if base != bases[0] and (src := editable_outside(base / d, top, base)):
+                    return None, (f"the venv {base / d} has the project installed editable from {src}, outside "
+                                  f"this worktree, so its tests would import that code, not this worktree's; "
+                                  f"pytest runs as written (make a venv in this worktree to use one)")
+                return py, ""
+    return None, ""
+
+
+def editable_outside(venv: Path, top: str | Path, main: Path) -> str:
+    """A path in the main checkout `main`, outside the worktree `top`, that the venv has a package
+    installed editable from (its dist-info direct_url.json, an __editable__ finder's mapping or a
+    .pth line), or ""."""
+    top, main, venv = Path(top).resolve(), main.resolve(), venv.resolve()
+
+    def outside(path: str) -> bool:
+        try:
+            q = Path(path).resolve()
+        except (OSError, ValueError):
+            return False
+        return (q == main or main in q.parents) and not (q == top or top in q.parents or venv in q.parents)
+
+    for site in venv.glob("lib/python*/site-packages"):
+        for f in site.glob("*.dist-info/direct_url.json"):
+            try:
+                d = json.loads(f.read_text())
+            except (OSError, ValueError):
+                continue
+            if not isinstance(d, dict) or not isinstance(d.get("dir_info"), dict):
+                continue
+            url = str(d.get("url") or "")
+            path = unquote(url[7:]) if url.startswith("file://") else ""
+            if d["dir_info"].get("editable") and path and outside(path):
+                return path
+        for f in [*site.glob("__editable__*finder.py"), *site.glob("*.pth")]:
+            try:
+                text = f.read_text(errors="replace")
+            except OSError:
+                continue
+            paths = re.findall(r"""['"](/[^'"]+)['"]""", text) if f.suffix == ".py" else \
+                [ln.strip() for ln in text.splitlines() if ln.strip().startswith("/")]
+            for path in paths:
+                if outside(path) and Path(path).exists():
+                    return path
+    return ""
 
 
 def venv_cmd(cmd: str, top: str | Path) -> str:
     """`cmd` with each bare pytest run (`pytest`, `py.test`, `python[3] -m pytest`) made
     `<venv>/bin/python -m pytest` when the repository has a venv (venv_python); else `cmd` as it is.
-    A bare pytest otherwise runs with whatever python is on PATH, which may lack the repo's dependencies."""
+    A bare pytest otherwise runs with whatever python is on PATH, which may lack the repo's dependencies.
+    When the main checkout's venv is skipped for an editable install from outside the worktree, the
+    command stays as written and first prints why to the checks output."""
     if not _PYTEST_RUN.search(cmd):
         return cmd
-    py = venv_python(top)
+    py, why = _venv(top)
     if not py:
-        return cmd
+        return f"printf '%s\\n' {shlex.quote('ttp: ' + why)} >&2\n{cmd}" if why else cmd
     return _PYTEST_RUN.sub(lambda m: f"{m.group(1)}{m.group(2)}{shlex.quote(str(py))} -m pytest", cmd)
 
 
@@ -256,6 +309,14 @@ def env_problem(output: str, top: str | Path) -> str | None:
     if not missing:
         return None
     return f"{', '.join(missing)} not installed for the python the check ran with; {ENV_FIX}"
+
+
+_TEST_FAILED = re.compile(r"^FAILED \S|^=+ .*\b[1-9]\d* failed\b", re.M)
+
+
+def test_failures(output: str) -> bool:
+    """A test run's output reports tests that ran and failed (pytest's FAILED lines or summary)."""
+    return bool(_TEST_FAILED.search(output))
 
 
 def _in_repo(name: str, top: str | Path) -> bool:

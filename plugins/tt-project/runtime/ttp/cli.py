@@ -1097,14 +1097,18 @@ def _record_pass(p: Project | None, tree: str, cmds: list) -> None:
 CHECKS_ENV = "checks_env.json"   # under the project's state: the last check that failed at import, for doctor
 
 
-def _note_checks_env(p: Project | None, cmd: str | None, problem: str | None, head: str) -> None:
-    """Keep the last import-time failure of a check for `ttp doctor`; any other outcome clears it."""
+def _note_checks_env(p: Project | None, cmd: str | None, problem: str | None, head: str,
+                     source: str = "delivery.push_checks", also: bool = False) -> None:
+    """Keep the last import-time failure of a check for `ttp doctor`; any other outcome clears it.
+    `source` is where the command came from (delivery.push_checks, or `ttp checks --`); `also`, that
+    tests failed in the same run as well, so the head's code is not cleared."""
     if not p:
         return
     path = p.state / CHECKS_ENV
     try:
         if problem:
-            write_json(path, {"command": cmd, "problem": problem, "head": head,
+            write_json(path, {"command": cmd, "problem": problem, "head": head, "source": source,
+                              **({"also": True} if also else {}),
                               "run": os.environ.get("TTP_RUN_ID") or "?", "ts": time.time()})
         else:
             path.unlink(missing_ok=True)
@@ -1121,8 +1125,10 @@ def checks_env_line(p: Project) -> str | None:
     if not isinstance(e, dict) or not e.get("problem"):
         return None
     when = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(e.get("ts") or 0)))
-    return (f"delivery.push_checks: {e.get('command')!r} failed at import in run {e.get('run') or '?'} at {when} "
-            f"(an environment problem, not the code): {e['problem']}")
+    what = ("tests failed, and also an environment problem" if e.get("also")
+            else "an environment problem, not the code")
+    return (f"{e.get('source') or 'delivery.push_checks'}: {e.get('command')!r} failed at import in run "
+            f"{e.get('run') or '?'} at {when} ({what}): {e['problem']}")
 
 
 def cmd_checks(a) -> None:
@@ -1160,7 +1166,8 @@ def cmd_checks(a) -> None:
     # One word after `--` is a shell command line as written (`ttp checks -- 'FOO=1 pytest -q'`);
     # several words are argv, quoted so each stays one word.
     mine = [extra[0] if len(extra) == 1 else shlex.join(extra)] if extra else []
-    cmds = push.check_list((cfg.get("delivery") or {}).get("push_checks")) + mine
+    own = push.check_list((cfg.get("delivery") or {}).get("push_checks"))
+    cmds = own + mine
     if not cmds:
         die("ttp checks: the project sets no delivery.push_checks; give the repository's test commands after "
             "`--`, e.g. ttp checks -- pytest -q")
@@ -1219,19 +1226,24 @@ def cmd_checks(a) -> None:
             if rc != 0:
                 passed, failed = False, c
                 break
-    env_problem = None
+    env_problem, also = None, False
     if not passed:
         with open(log, "rb") as f:   # this call's part of the log
             f.seek(start)
             text = f.read().decode("utf-8", errors="replace")
         env_problem = push.env_problem(text, top) if failed in todo else None
+        also = bool(env_problem) and push.test_failures(text)
     write_json(Path(run_dir) / prguard.CHECKS_FILE, {"head": head, "worktree": top, "passed": passed,
                                                      "commands": todo, "skipped": skipped, "ts": time.time(),
                                                      **({"env_problem": env_problem} if env_problem else {})})
-    _note_checks_env(p, str(failed) if env_problem else None, env_problem, head)
+    source = "delivery.push_checks" if any(str(c) == str(failed) for c in own) else "ttp checks --"
+    _note_checks_env(p, str(failed) if env_problem else None, env_problem, head, source, also)
     if not passed:
         from . import trim
         print(trim.summary(text))   # a test run's failures, else head and tail
+        if also:
+            die(f"ttp checks: {failed!r} failed on {head[:12]}: tests failed, and there is also an environment "
+                f"problem: {env_problem} (full output: {log})", 1)
         if env_problem:
             die(f"ttp checks: {failed!r} failed at import on {head[:12]}: an environment problem, not the "
                 f"head's code: {env_problem} (full output: {log})", 1)

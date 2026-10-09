@@ -22909,6 +22909,54 @@ def test_ttp_checks_runs_a_bare_pytest_with_the_venv(env, tmp_path, monkeypatch,
     assert rec["passed"] is True and rec["commands"] == ["pytest -q"]   # recorded as written
 
 
+def test_check_commands_run_wrapped_pytest_with_the_venv(tmp_path):
+    from ttp import push
+    repo, py = _venv_repo(tmp_path)
+    q = shlex.quote(str(py))
+    assert push.venv_cmd("timeout 600 pytest -q", repo) == f"timeout 600 {q} -m pytest -q"
+    assert push.venv_cmd("timeout -k 5 --preserve-status 10m python3 -m pytest", repo) == \
+        f"timeout -k 5 --preserve-status 10m {q} -m pytest"
+    assert push.venv_cmd("env X=1 pytest -x", repo) == f"env X=1 {q} -m pytest -x"
+    assert push.venv_cmd("make && env A=1 timeout 60 pytest", repo) == f"make && env A=1 timeout 60 {q} -m pytest"
+    for other in ("timeout pytest", "envoy pytest", "timeout 60 make test"):
+        assert push.venv_cmd(other, repo) == other
+
+
+def _editable(venv: Path, kind: str, src: Path) -> None:
+    site = venv / "lib" / "python3.12" / "site-packages"
+    site.mkdir(parents=True, exist_ok=True)
+    if kind == "direct_url":
+        (site / "mypkg-0.1.dist-info").mkdir(exist_ok=True)
+        (site / "mypkg-0.1.dist-info" / "direct_url.json").write_text(
+            json.dumps({"url": src.as_uri(), "dir_info": {"editable": True}}))
+    elif kind == "finder":
+        (site / "__editable___mypkg_0_1_finder.py").write_text(f"MAPPING = {{'mypkg': '{src / 'mypkg'}'}}\n")
+    else:
+        (site / "__editable__.mypkg-0.1.pth").write_text(f"{src}\n")
+
+
+@pytest.mark.parametrize("kind", ["direct_url", "finder", "pth"])
+def test_a_worktree_skips_the_main_checkouts_venv_with_an_editable_install_of_it(tmp_path, kind):
+    from ttp import push
+    repo, py = _venv_repo(tmp_path)
+    wt = tmp_path / "wt"
+    subprocess.run(["git", "-C", str(repo), "worktree", "add", "-q", "-b", "x", str(wt)], check=True)
+    q = shlex.quote(str(py))
+    # A non-editable install, or one from elsewhere, keeps the venv in use.
+    _editable(repo / ".venv", kind, tmp_path / "elsewhere")
+    (tmp_path / "elsewhere" / "mypkg").mkdir(parents=True)
+    assert push.venv_cmd("pytest -q", wt) == f"{q} -m pytest -q"
+    # Installed editable from the main checkout: the worktree's tests would import its code, so the
+    # command runs as written and the checks output says why.
+    _editable(repo / ".venv", kind, repo)
+    cmd = push.venv_cmd("pytest -q", wt)
+    assert cmd.endswith("\npytest -q") and str(py) not in cmd.splitlines()[-1]
+    said = subprocess.run(["bash", "-c", cmd.replace("pytest -q", "true")], capture_output=True, text=True).stderr
+    assert "installed editable from" in said and str(repo) in said and "outside this worktree" in said
+    # In the main checkout itself the install is its own code: the venv is used.
+    assert push.venv_cmd("pytest -q", repo) == f"{q} -m pytest -q"
+
+
 CONFTEST_FAIL = ("ImportError while loading conftest '/w/tests/conftest.py'.\n"
                  "tests/conftest.py:3: in <module>\n    import {mod}\n"
                  "E   ModuleNotFoundError: No module named '{mod}'\n")
@@ -22951,7 +22999,9 @@ def test_ttp_checks_reports_an_import_time_failure_as_an_environment_problem(env
     assert rec["passed"] is False and "numpy" in rec["env_problem"] and "venv" in rec["env_problem"]
     cli.main(["doctor", p.name])
     said = capsys.readouterr().out
-    assert f"delivery.push_checks: {failing!r} failed at import" in said and "point delivery checks at a venv" in said
+    # The command came after `ttp checks --`, not from delivery.push_checks: doctor says so.
+    assert f"ttp checks --: {failing!r} failed at import" in said and "point delivery checks at a venv" in said
+    assert "delivery.push_checks:" not in said
     # A code failure is said as one, and clears doctor's line; so does a pass.
     with pytest.raises(SystemExit):
         cli.main(["checks", "--", "false"])
@@ -22964,6 +23014,40 @@ def test_ttp_checks_reports_an_import_time_failure_as_an_environment_problem(env
     cli.main(["checks", "--", "true"])
     cli.main(["doctor", p.name])
     assert "failed at import" not in capsys.readouterr().out
+
+
+def test_ttp_checks_says_an_environment_problem_is_also_there_beside_test_failures(env, tmp_path, monkeypatch,
+                                                                                    capsys):
+    from ttp import cli
+    p = make(env)
+    repo, _ = _venv_repo(tmp_path)
+    run = tmp_path / "run"
+    run.mkdir()
+    monkeypatch.setenv("TTP_RUN_DIR", str(run))
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    out = tmp_path / "out.txt"
+    out.write_text("FAILED tests/test_b.py::test_x - AssertionError\n" + CONFTEST_FAIL.format(mod="numpy") +
+                   "==== 1 failed, 3 passed, 1 error in 0.5s ====\n")
+    failing = f"cat {out}; exit 1"
+    p.set_config("delivery.push_checks", [failing])
+    monkeypatch.chdir(repo)
+    with pytest.raises(SystemExit):
+        cli.main(["checks"])
+    err = capsys.readouterr().err
+    assert "tests failed, and there is also an environment problem" in err and "numpy" in err, err
+    assert "not the head's code" not in err
+    cli.main(["doctor", p.name])
+    said = capsys.readouterr().out
+    assert f"delivery.push_checks: {failing!r} failed at import" in said and "and also an environment problem" in said
+    assert "not the code" not in said
+    assert push_test_failures("E   AssertionError\n1 failed in 0.1s\n") is False   # no pytest summary bar
+    assert push_test_failures("=== 2 failed, 1 passed in 1s ===\n") is True
+    assert push_test_failures(CONFTEST_FAIL.format(mod="numpy") + "=== 1 error in 0.1s ===\n") is False
+
+
+def push_test_failures(text):
+    from ttp import push
+    return push.test_failures(text)
 
 
 
