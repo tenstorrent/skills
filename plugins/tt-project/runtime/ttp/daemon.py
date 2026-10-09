@@ -3710,12 +3710,14 @@ class Daemon:
             since = since if isinstance(since, (int, float)) else t["updated"]
             if not since or since >= self.boot_at:
                 continue
-            if self._relaunch_checks(t, prev):
+            asleep, relaunched = self._relaunch_checks(t, prev)
+            if asleep:
                 continue   # asleep on its retry_when: the same checks run again
             self._probe_rc.pop(t["id"], None)
-            counts = self._job_cut_by_reboot(t["id"])
+            counts = bool(relaunched) or self._job_cut_by_reboot(t["id"])
             wakes = _reboot_wakes(t) + int(counts)
-            n = self._reboot_losses(t["id"]) + wakes
+            # Reboots its relaunched checks went through count too: a loop stays within the cap.
+            n = self._reboot_losses(t["id"]) + wakes + relaunched
             if counts and n >= int(self.cfg["budget"].get("max_reboot_losses", 3)):
                 # Its detached job may be what takes the host down: stop waking it.
                 prev.pop("reboot_wakes", None)
@@ -3731,14 +3733,16 @@ class Daemon:
                 {**prev, "woke": "the host rebooted", "reboot": {"at": self.boot_at}, "reboot_wakes": wakes}))
             log(self.p, f"task {t['id']} waited from before the reboot; due now")
 
-    def _relaunch_checks(self, t: dict, prev: dict) -> bool:
+    def _relaunch_checks(self, t: dict, prev: dict) -> tuple[bool, int]:
         """A task waiting on its own `ttp checks --detach` (retry_when `ttp checks --result <its run
         dir>`) that the reboot killed: start the same checks again in that run dir, model-free, and
         keep it asleep on its retry_when. Only while the worktree checks.pid names still exists, holds
         the head they ran on and has no uncommitted changes to tracked files (untracked ones never
         count, as for `ttp checks`), at most once per boot per task and max_reboot_losses times per
-        head (checks that take the host down are not started forever). True when the task stays
-        asleep: relaunched now, or already on this boot (a daemon restart). False wakes it as before."""
+        head since the task was last blocked (checks that take the host down are not started forever).
+        Returns (asleep, relaunched): asleep when the task stays asleep (relaunched now, or already on
+        this boot, a daemon restart), else it wakes as before; relaunched is the number of relaunches
+        when the cap refused one after an abrupt reboot, which then count as reboot losses, else 0."""
         from .cli import CHECKS_RC, _checks_alive, _read_checks_pid
         db, tid = self.p.db, t["id"]
         m = re.search(r"\bchecks\s+--result\s+(\S+)", str(prev.get("retry_when") or ""))
@@ -3747,19 +3751,22 @@ class Daemon:
         except ValueError:
             out = None
         if not out or not db.one("SELECT id FROM runs WHERE task=? AND dir=?", (tid, str(out))):
-            return False
+            return False, 0
         mine = f"checks_relaunched:{tid}:{self.boot}:"
         if db.one("SELECT id FROM events WHERE fingerprint LIKE ?", (mine + "%",)):
-            return True
+            return True, 0
         info = _read_checks_pid(out)
-        wt, head, cmd = info.get("worktree"), info.get("head"), info.get("cmd")
-        if ((out / CHECKS_RC).exists() or not info.get("boot") or info.get("boot") == self.boot
-                or _checks_alive(info) or not wt or not head or not isinstance(cmd, list)):
-            return False
-        same = db.one("SELECT COUNT(*) n FROM events WHERE kind='checks_relaunched' AND task=? AND fingerprint LIKE ?",
-                      (tid, f"checks_relaunched:{tid}:%:{head[:12]}"))
-        if (same or {}).get("n", 0) >= int(self.cfg["budget"].get("max_reboot_losses", 3)):
-            return False
+        wt, head, boot, cmd = info.get("worktree"), info.get("head"), info.get("boot"), info.get("cmd")
+        # A malformed checks.pid (fields of the wrong type) wakes the task as before.
+        if not all(isinstance(x, str) and x for x in (wt, head, boot)) or not isinstance(cmd, list):
+            return False, 0
+        if (out / CHECKS_RC).exists() or boot == self.boot or _checks_alive(info):
+            return False, 0
+        since = (db.one("SELECT MAX(ts) ts FROM events WHERE task=? AND kind='task_blocked'", (tid,)) or {}).get("ts")
+        same = (db.one("SELECT COUNT(*) n FROM events WHERE kind='checks_relaunched' AND task=? AND fingerprint "
+                       "LIKE ? AND ts>?", (tid, f"checks_relaunched:{tid}:%:{head[:12]}", since or 0)) or {}).get("n", 0)
+        if same >= int(self.cfg["budget"].get("max_reboot_losses", 3)):
+            return False, (same if self._shutdown(boot) == "abrupt" else 0)
         why = ""
         try:
             if not worktree.is_git(Path(wt)):
@@ -3772,17 +3779,17 @@ class Daemon:
             why = f"its worktree could not be read: {e}"
         if why:
             log(self.p, f"task {tid}: the reboot killed its checks, not started again: {why}")
-            return False
+            return False, 0
         argv = (["--fresh"] if info.get("fresh") else []) + [str(c) for c in cmd]
         r = self._start_checks(Path(wt), out, f"relaunch-t{tid}", tid, argv)
         if not r:
-            return False
+            return False, 0
         db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
              (time.time(), "daemon", "checks_relaunched", mine + head[:12], "low",
               f"#{tid} {t['title']}: the reboot killed its checks on {head[:12]}; started them again in {out}, "
               f"no model run", "handled", tid))
         log(self.p, f"task {tid}: the reboot killed its checks; started them again on {head[:12]} ({out})")
-        return True
+        return True, 0
 
     def _start_checks(self, path: Path, out: Path, run_id: str, tid: int, extra: list[str]) -> bool:
         """`ttp checks --detach [extra]` in worktree `path`, writing to `out` as a run's directory,

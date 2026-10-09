@@ -18394,7 +18394,71 @@ def test_checks_a_reboot_killed_start_again_at_most_max_reboot_losses_times_per_
         if i < 3:
             assert _wait_precheck(run_dir) == "0"
     assert len(_relaunches(p, tid)) == 3
-    assert p.db.task(tid)["not_before"] is None, "checks that keep dying with the host were started forever"
+    t = p.db.task(tid)
+    assert t["status"] == "blocked", "checks that keep dying with the host were started forever"
+    assert t["blocked_reason"] == "lost to a host reboot 4 times; it may be causing them"
+
+
+def test_relaunched_checks_count_toward_reboot_losses(env, tmp_path):
+    """Reboots the relaunched checks went through count as reboot losses once the relaunch cap is
+    reached: the task is blocked then, not woken for max_reboot_losses more model runs."""
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    p = make(env)
+
+    def reboot(tid, boot, orderly=False):
+        _, run_dir = _checks_killed_by_reboot(p, tmp_path, tid, boot=boot)
+        d = Daemon(p.base)
+        d.cfg["budget"]["max_reboot_losses"] = 2
+        d.boot, d.boot_at = f"{boot}+1", time.time() - 300
+        if orderly:
+            p.db.set_kv("boot_prev", {"boot": d.boot, "prev_boot": boot, "shutdown": "orderly"})
+        n = len(_relaunches(p, tid))
+        d.wake_after_reboot()
+        if len(_relaunches(p, tid)) > n:
+            assert _wait_precheck(run_dir) == "0"   # done before the next reboot rewrites checks.pid
+
+    tid = p.db.add_task("crashy", "s", kind="code", tier="light", origin="user")
+    reboots = 0
+    while p.db.task(tid)["status"] != "blocked" and reboots < 10:
+        reboot(tid, f"boot-{reboots}")
+        reboots += 1
+    assert len(_relaunches(p, tid)) == 2
+    assert reboots == 3, f"blocked only after {reboots} reboots"
+    assert p.db.task(tid)["blocked_reason"] == "lost to a host reboot 3 times; it may be causing them"
+    # An orderly shutdown is not one the checks caused: past the cap they wake the task, uncounted.
+    other = p.db.add_task("calm", "s", kind="code", tier="light", origin="user")
+    for i in range(3):
+        reboot(other, f"calm-{i}", orderly=i == 2)
+    t = p.db.task(other)
+    assert t["status"] == "queued" and t["not_before"] is None, dict(t)
+    # A requeue starts the count over: the checks may be started again.
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "status": "queued"}]) == []
+    reboot(tid, "boot-after")
+    assert len(_relaunches(p, tid)) == 3 and p.db.task(tid)["status"] == "queued"
+
+
+def test_a_malformed_checks_pid_does_not_stop_other_tasks_waking(env, tmp_path):
+    from ttp import cli
+    from ttp.daemon import Daemon
+    p = make(env)
+    bad = {}
+    for field, value in (("head", 123), ("boot", ["x"]), ("worktree", 7)):
+        tid = p.db.add_task(f"bad {field}", "s", kind="code", tier="light", origin="user")
+        _, run_dir = _checks_killed_by_reboot(p, tmp_path, tid)
+        info = json.loads((run_dir / cli.CHECKS_PID).read_text())
+        (run_dir / cli.CHECKS_PID).write_text(json.dumps({**info, field: value}))
+        bad[tid] = field
+    later = p.db.add_task("later", "s", kind="work", tier="light", origin="user")
+    _waiting_from_before_the_boot(p, later, job=False)
+    d = Daemon(p.base)
+    d.boot_at = time.time() - 300
+    d.wake_after_reboot()
+    for tid in [*bad, later]:
+        t = p.db.task(tid)
+        assert t["not_before"] is None and json.loads(t["result"]).get("woke") == "the host rebooted", \
+            (bad.get(tid), dict(t))
+    assert not any(_relaunches(p, x) for x in bad)
 
 
 def test_boot_time_wakes_and_reboot_losses_count_together(env, tmp_path):
