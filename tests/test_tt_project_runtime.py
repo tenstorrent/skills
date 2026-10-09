@@ -17338,6 +17338,25 @@ def test_the_third_reboot_with_lost_runs_in_a_day_raises_one_high_alert(env, tmp
     assert "4th reboot in 24 h" in notes[3]["text"] and "unstable" not in notes[3]["text"]
 
 
+def test_orderly_reboots_never_call_the_host_unstable(env, tmp_path, monkeypatch):
+    p = make(env)
+    from ttp.daemon import CLEAN_STOP_KEY, Daemon
+    _boot_as(monkeypatch, "boot-0")
+    Daemon(p.base).tick()
+    p.db.set_kv("paused", True)
+    for i in range(1, 5):
+        (tmp_path / f"b{i}").mkdir()
+        _lost_deep_runs(p, tmp_path / f"b{i}", f"boot-{i - 1}", costs=(1.0,))
+        p.db.set_kv(CLEAN_STOP_KEY, {"boot": f"boot-{i - 1}", "ts": time.time()})   # stopped for a shutdown
+        _boot_as(monkeypatch, f"boot-{i}", time.time() - (5 - i) * 600)
+        d = Daemon(p.base)
+        d.tick()
+        d.tick()
+    notes = _reboot_notices(p)
+    assert len(notes) == 4 and all(n["severity"] == "normal" for n in notes), notes
+    assert all("(orderly;" in n["text"] and "unstable" not in n["text"] for n in notes), notes
+
+
 def test_no_host_line_without_a_reboot_in_the_last_day(env, tmp_path, monkeypatch):
     p = make(env)
     from ttp import coordinator as coord
@@ -18064,7 +18083,16 @@ def test_a_requeued_task_is_not_blocked_again_by_one_later_reboot_loss(env, tmp_
     assert p.db.task(tid)["status"] == "queued", "a requeue did not start the reboot count over"
 
 
-def _waiting_from_before_the_boot(p, tid):
+def _waiting_from_before_the_boot(p, tid, job=True, boot="an-earlier-boot"):
+    """Task tid waits from before this boot; with job, on a detached job of its own that the reboot
+    cut short (no .rc)."""
+    if job:
+        run_dir = p.runs / f"pre-boot-{tid}-{len(p.db.q('SELECT id FROM runs WHERE task=?', (tid,)))}"
+        run_dir.mkdir(parents=True)
+        (run_dir / "detached.json").write_text(json.dumps([{"name": "soak", "rc": str(run_dir / "soak.rc"),
+                                                            "log": str(run_dir / "soak.log")}]))
+        p.db.x("INSERT INTO runs(task,role,provider,started,ended,status,dir,boot_id) VALUES(?,?,?,?,?,?,?,?)",
+               (tid, "worker", "fake", time.time() - 1800, time.time() - 900, "ok", str(run_dir), boot))
     p.db.update_task(tid, status="queued", not_before=time.time() + 3600, result=json.dumps(
         {**json.loads(p.db.task(tid)["result"] or "{}"), "status": "waiting", "summary": "job running",
          "retry_after_s": 3600, "retry_when": "exit 1", "waiting_since": time.time() - 900}))
@@ -18112,6 +18140,121 @@ def test_boot_time_wakes_and_reboot_losses_count_together(env, tmp_path):
     t = p.db.task(tid)
     assert t["status"] == "blocked", dict(t)
     assert t["blocked_reason"] == "lost to a host reboot 3 times; it may be causing them"
+
+def _run_once(d, monkeypatch, crash=False):
+    """One daemon start, one tick, then a clean stop (or, with crash, the process dies mid-tick)."""
+    from ttp import daemon as dm, web
+
+    def tick():
+        if crash:
+            raise SystemExit("power cut")
+        d.stopping = True
+
+    monkeypatch.setattr(d, "tick", tick)
+    monkeypatch.setattr(web, "serve", lambda daemon: None)
+    monkeypatch.setattr(dm.signal, "signal", lambda *a: None)
+    monkeypatch.setattr(dm.time, "sleep", lambda s: None)
+    try:
+        if crash:
+            with pytest.raises(SystemExit):
+                d.run()
+        else:
+            assert d.run() == 0
+    finally:
+        if isinstance(getattr(d, "_lock_fd", None), int):
+            os.close(d._lock_fd)   # the process ended: its lock with it
+
+
+@pytest.mark.parametrize("how", ["orderly", "abrupt"])
+def test_a_clean_stop_makes_the_next_boot_orderly_and_a_crash_abrupt(env, tmp_path, monkeypatch, how):
+    p = make(env)
+    from ttp.daemon import CLEAN_STOP_KEY, Daemon
+    _boot_as(monkeypatch, "boot-a")
+    _run_once(Daemon(p.base), monkeypatch)
+    assert p.db.kv(CLEAN_STOP_KEY)["boot"] == "boot-a" and p.db.kv(CLEAN_STOP_KEY)["clean_stop"]
+    if how == "abrupt":
+        # Restarted on the same boot, then the host died under it: the start dropped the earlier
+        # stop's record, so it cannot vouch for this boot's end.
+        _run_once(Daemon(p.base), monkeypatch, crash=True)
+        assert p.db.kv(CLEAN_STOP_KEY) is None
+    p.db.set_kv("paused", True)
+    _, rids = _lost_deep_runs(p, tmp_path, "boot-a", costs=(1.0,))
+    _boot_as(monkeypatch, "boot-b", time.time() - 60)
+    d = Daemon(p.base)
+    d.tick()
+    d.tick()
+    assert p.db.kv("boot_prev")["shutdown"] == how
+    assert json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (rids[0],))["note"])["shutdown"] == how
+    ev = p.db.q("SELECT text, data FROM events WHERE source='host' AND kind='boot'")
+    assert len(ev) == 1 and ev[0]["text"] == f"the host rebooted ({how}); 1 run(s) cut short", ev
+    assert json.loads(ev[0]["data"])["shutdown"] == how
+    note = _reboot_notices(p)
+    assert len(note) == 1 and note[0]["text"].startswith(f"The host rebooted ({how}; 1st reboot in 24 h)"), note
+
+
+@pytest.mark.parametrize("how", ["orderly", "abrupt"])
+def test_only_abrupt_reboot_losses_block_the_task(env, tmp_path, how):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    p.db.set_kv("boot_prev", {"boot": d.boot, "prev_boot": "an-earlier-boot", "shutdown": how})
+    tid = p.db.add_task("flash the board", "s", kind="work", tier="light", origin="user")
+    for i in range(4):
+        _lost_to_reboot(p, d, tmp_path, tid, name=f"lost{i}")
+        if p.db.task(tid)["status"] == "blocked":
+            break
+    t = p.db.task(tid)
+    assert t["attempts"] == 0, "a reboot loss spent an attempt"
+    if how == "orderly":
+        assert t["status"] == "queued" and i == 3, dict(t)
+        assert d._reboot_losses(tid) == 0
+    else:
+        assert t["status"] == "blocked" and i == 2, dict(t)
+        assert t["blocked_reason"] == "lost to a host reboot 3 times; it may be causing them"
+
+
+@pytest.mark.parametrize("case", ["orderly", "job_ended", "no_job_of_its_own"])
+def test_a_boot_time_wake_counts_only_for_its_own_job_cut_by_an_abrupt_reboot(env, case):
+    p = make(env)
+    from ttp.daemon import Daemon
+    tid = p.db.add_task("soak test", "s", kind="work", tier="light", origin="user")
+    for i in range(4):
+        _waiting_from_before_the_boot(p, tid, job=case != "no_job_of_its_own")
+        if case == "job_ended":
+            last = p.db.one("SELECT dir FROM runs WHERE task=? ORDER BY id DESC", (tid,))["dir"]
+            (p.runs / last / "soak.rc").write_text("0\n")   # the job finished before the host went down
+        d = Daemon(p.base)
+        d.boot_at = time.time() - 300
+        if case == "orderly":
+            p.db.set_kv("boot_prev", {"boot": d.boot, "prev_boot": "an-earlier-boot", "shutdown": "orderly"})
+        d.wake_after_reboot()
+        t = p.db.task(tid)
+        assert t["status"] == "queued" and not t["not_before"], (i, dict(t))
+        assert json.loads(t["result"])["woke"] == "the host rebooted"
+        assert not json.loads(t["result"]).get("reboot_wakes"), "a wake that was not the task's counted"
+
+
+def test_a_coordinator_turn_lost_to_a_reboot_is_not_a_failed_turn(env, tmp_path):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    eid = p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                 (time.time(), "user", "note", "normal", "something to decide", "queued"))
+    run_dir = tmp_path / "coord"
+    run_dir.mkdir()
+    (run_dir / "output.jsonl").write_text("")
+    (run_dir / "lease").touch()
+    os.utime(run_dir / "lease", (time.time() - 999, time.time() - 999))
+    rid = p.db.x("INSERT INTO runs(task,role,provider,started,status,dir,boot_id,note) VALUES(?,?,?,?,?,?,?,?)",
+                 (None, "coordinator", "fake", time.time() - 1800, "running", str(run_dir), "an-earlier-boot",
+                  json.dumps({"events": [eid], "messages": []})))
+    d.reap_runs()
+    assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == "lost"
+    assert int(p.db.kv("coordinator_failures", 0)) == 0
+    assert not p.db.kv("coordinator_backoff_until")
+    assert not p.db.q("SELECT id FROM alerts WHERE key LIKE 'coordinator%'")
+    assert p.db.one("SELECT status FROM events WHERE id=?", (eid,))["status"] == "queued", "its event was dropped"
+
 
 def test_a_light_review_stays_light_after_a_reboot_loss(env, tmp_path):
     p = make(env)

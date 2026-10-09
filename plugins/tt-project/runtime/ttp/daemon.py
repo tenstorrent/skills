@@ -68,6 +68,7 @@ from .providers.jev import Jev, JevOutOfFunds
 from .prompts import RUN_DIR_MARK
 
 TICK_S = 3.0
+CLEAN_STOP_KEY = "clean_stop"   # kv: {boot, ts} of the daemon's last clean stop
 LEASE_STALE_S = 180
 HEARTBEAT_STALE_S = 300   # longer than any single tick step (a git fetch, a watcher command)
 WATCHDOG_S = 2 * HEARTBEAT_STALE_S   # no tick progress this long: the service restarts the daemon
@@ -355,6 +356,9 @@ class Daemon:
             print(f"daemon already running (pid {_read_pid(pidfile)})", file=sys.stderr)
             return 1
         pidfile.write_text(str(os.getpid()))
+        # The last stop's record was read when this boot was noted (_note_boot); from here on a
+        # reboot that finds none of this boot's was abrupt.
+        self.p.db.x("DELETE FROM kv WHERE key=?", (CLEAN_STOP_KEY,))
         # Kept here rather than in the environment, which runs and their tools would inherit.
         self._notify = os.environ.pop("NOTIFY_SOCKET", None)
         self._mark_start()
@@ -386,6 +390,10 @@ class Daemon:
                 time.sleep(10)
             time.sleep(TICK_S)
         log(self.p, "daemon stop")
+        try:   # an orderly shutdown stops the daemon first: the next boot tells it from a crash
+            self.p.db.set_kv(CLEAN_STOP_KEY, {"boot": self.boot, "ts": time.time(), "clean_stop": True})
+        except Exception:
+            log(self.p, "clean stop record: " + traceback.format_exc().replace("\n", " | ")[:1000])
         self._idle.release()
         self._ends.stop()   # end-condition probes are rerun after the next start
         if _read_pid(pidfile) == os.getpid():
@@ -480,7 +488,9 @@ class Daemon:
     def _note_boot(self) -> None:
         """On a new boot, keep what the earlier boot's last heartbeat said (when, and the resources
         held then) before this daemon's first tick overwrites it; the boot event is written from it
-        once the runs the reboot cut short are reaped."""
+        once the runs the reboot cut short are reaped. The earlier boot ended orderly when the daemon
+        recorded a clean stop on it (a shutdown stops the service first), abrupt otherwise (a crash,
+        a power cut, a hardware reset)."""
         try:
             db = self.p.db
             if (db.kv("boot_prev") or {}).get("boot") == self.boot:
@@ -490,10 +500,20 @@ class Daemon:
             prev = hb.get("boot") or db.kv("reboot_told")
             if not prev or prev == self.boot:
                 return
+            clean = (db.kv(CLEAN_STOP_KEY) or {}).get("boot") == prev
             db.set_kv("boot_prev", {"boot": self.boot, "prev_boot": prev, "held": hb.get("held") or [],
-                                    "last_heartbeat": time.time() - hb["age"] if "age" in hb else None})
+                                    "last_heartbeat": time.time() - hb["age"] if "age" in hb else None,
+                                    "shutdown": "orderly" if clean else "abrupt"})
         except Exception:
             log(self.p, "boot record: " + traceback.format_exc().replace("\n", " | ")[:1000])
+
+    def _shutdown(self, boot: str | None) -> str:
+        """How the host went down under boot `boot`: "orderly" when this boot's record says the daemon
+        stopped cleanly on it, else "abrupt" (also when nothing says, to stay on the safe side)."""
+        prev = self.p.db.kv("boot_prev") or {}
+        orderly = boot and prev.get("boot") == self.boot and prev.get("prev_boot") == boot \
+            and prev.get("shutdown") == "orderly"
+        return "orderly" if orderly else "abrupt"
 
     def _beat(self) -> None:
         """A completed tick. `status`, the web app and `ttp restart` read its age; the first one
@@ -1213,24 +1233,26 @@ class Daemon:
             usd = sum(float(r["cost_usd"] or 0) for r in lost)
             held = list(prev.get("held") or [])
             booted = self.boot_at
-            data = {"boot": self.boot, "boot_time": booted, "prev_boot": prev.get("prev_boot"),
+            shutdown = prev.get("shutdown") or "abrupt"
+            data = {"boot": self.boot, "boot_time": booted, "prev_boot": prev.get("prev_boot"), "shutdown": shutdown,
                     "last_heartbeat": prev.get("last_heartbeat"), "held": held, "lost_usd": round(usd, 2),
                     "lost": [{"run": r["id"], "task": r["task"], "role": r["role"],
                               "usd": round(float(r["cost_usd"] or 0), 2)} for r in lost]}
             # A record, not news: the coordinator sees it in its digest, not as a new event.
             db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status) VALUES(?,?,?,?,?,?,?,?)",
                  (min(booted or now, now), "host", "boot", f"boot:{self.boot}", "normal",
-                  f"the host rebooted; {len(lost)} run(s) cut short", json.dumps(data), "record"))
+                  f"the host rebooted ({shutdown}); {len(lost)} run(s) cut short", json.dumps(data), "record"))
             if not lost:
                 return
             boots = db.boots(now - 86400)
-            cut = sum(1 for b in boots if b.get("lost"))
+            # Only abrupt reboots say the host is unstable: an orderly one was a shutdown or an update.
+            cut = sum(1 for b in boots if b.get("lost") and b.get("shutdown") != "orderly")
             severity, unstable = "normal", ""
-            if cut >= 3 and now - float(db.kv("host_unstable_told") or 0) >= 86400:
+            if shutdown != "orderly" and cut >= 3 and now - float(db.kv("host_unstable_told") or 0) >= 86400:
                 db.set_kv("host_unstable_told", now)
                 severity = "high"
-                unstable = (f" The host looks unstable: {cut} reboots cut runs short in 24 h; check its power, "
-                            f"cooling and system logs.")
+                unstable = (f" The host looks unstable: {cut} abrupt reboots cut runs short in 24 h; check its "
+                            f"power, cooling and system logs.")
             then = f" Held at its last heartbeat: {', '.join(held)}." if held else ""
             parts = []
             for r in lost:
@@ -1239,7 +1261,7 @@ class Daemon:
                              else f"run {r['id']} ({r['role']})")
             nth = ordinal(max(len(boots), 1))
             # Information, never a "needs you" alert: the lost runs are already requeued.
-            db.post("out", f"The host rebooted ({nth} reboot in 24 h); {len(lost)} run(s) were cut short "
+            db.post("out", f"The host rebooted ({shutdown}; {nth} reboot in 24 h); {len(lost)} run(s) were cut short "
                            f"(${usd:.2f}).{then}{unstable} Runs: {'; '.join(parts)}"[:3000],
                     kind="info", severity=severity, ref=f"reboot:{self.boot}")
 
@@ -1522,7 +1544,8 @@ class Daemon:
         # The runaway guard counts runs that ended without an outcome; a reboot, a host sleep or a
         # hand-off that stands is an outcome, not a loop.
         if status == "lost" and r["boot_id"] and r["boot_id"] != self.boot:
-            note.update(not_waste="reboot", lost_to_reboot=self.boot, boot_at=self.boot_at)
+            note.update(not_waste="reboot", lost_to_reboot=self.boot, boot_at=self.boot_at,
+                        shutdown=self._shutdown(r["boot_id"]))
         elif status in bud.WASTED and handed_off:
             note["not_waste"] = "handoff"
         elif net_lost:
@@ -1601,6 +1624,7 @@ class Daemon:
                     log(p, f"run {r['id']}: checking the project root's checkout failed\n" + traceback.format_exc())
                 self._finish_worker(r, usage, status, run_dir, cut_off if status == "ok" else None,
                                     rebooted=bool(note.get("lost_to_reboot")),
+                                    orderly=note.get("shutdown") == "orderly",
                                     slept=bool(note.get("lost_to_sleep") or note.get("lost_to_network")))
         self._check_price_table(r, usage)
         asleep = float(exit_info.get("slept_s") or 0)
@@ -1659,10 +1683,11 @@ class Daemon:
         out = usage.structured if isinstance(usage.structured, dict) else last_json_object(usage.final_text or "")
         actions = (out or {}).get("actions")
         checked = note.get("coord_check") or {}
-        lost_to = "sleep" if note.get("lost_to_sleep") else "network" if note.get("lost_to_network") else ""
+        lost_to = "sleep" if note.get("lost_to_sleep") else "network" if note.get("lost_to_network") else \
+            "reboot" if note.get("lost_to_reboot") and status == "lost" else ""
         if (status == "lost" and not r["dir"]) or status == "shutdown" or lost_to:
-            # Never launched, ended by `ttp stop --kill`, or cut by a host sleep or a lost network: not
-            # a failed turn. Its messages and events stay queued for the next one.
+            # Never launched, ended by `ttp stop --kill`, or cut by a host sleep, a lost network or a
+            # reboot: not a failed turn. Its messages and events stay queued for the next one.
             self._settle_coord_check(checked, f"lost to {lost_to}" if lost_to else status)
             return
         if status == "auth":
@@ -1820,8 +1845,10 @@ class Daemon:
                      f"adopted it", "handled", task["id"]))
 
     def _finish_worker(self, r: dict, usage, status: str, run_dir: Path, ended: str | None = None,
-                       rebooted: bool = False, slept: bool = False, handoff: dict | None = None) -> None:
-        """`handoff` stands in for the run's result.json: the `on_pass` its checks earned (_probe_passed)."""
+                       rebooted: bool = False, slept: bool = False, handoff: dict | None = None,
+                       orderly: bool = False) -> None:
+        """`handoff` stands in for the run's result.json: the `on_pass` its checks earned (_probe_passed).
+        `orderly`: the reboot that cut the run short was an orderly one, which never blocks the task."""
         db = self.p.db
         task = db.task(r["task"]) if r["task"] else None
         if not task:
@@ -1940,7 +1967,7 @@ class Daemon:
         if rebooted:
             extra["reboot"] = {"at": self.boot_at, "notes": _last_notes(run_dir)}
         wakes = _reboot_wakes(task)
-        if reboot_lost and not slept:
+        if reboot_lost and not slept and not orderly:
             n = self._reboot_losses(task["id"]) + wakes
             if n >= int(self.cfg["budget"].get("max_reboot_losses", 3)):
                 new, reason = "blocked", f"lost to a host reboot {n} times; it may be causing them"
@@ -1973,7 +2000,7 @@ class Daemon:
                 reason = f"woke at {wake['tier']} and found work; runs again now at {up}"
             elif waits > int(self.cfg["budget"].get("max_waits", 24)):
                 new, reason = "blocked", f"still waiting after {waits} tries: {what}"
-            elif rebooted and result.get("survives_reboot") is not True and (
+            elif rebooted and not orderly and result.get("survives_reboot") is not True and (
                     n := self._reboot_losses(task["id"]) + wakes) >= int(
                     self.cfg["budget"].get("max_reboot_losses", 3)):
                 # This run is already one of the losses: its wait counts once, not again as a wake.
@@ -3578,7 +3605,9 @@ class Daemon:
     def wake_after_reboot(self) -> None:
         """Once per daemon start: a waiting task that handed off before this host booted waits on
         something the reboot may have ended (a detached job, a /tmp file, device state). It is due
-        now, past its timer and its probe, unless its hand-off said `survives_reboot`."""
+        now, past its timer and its probe, unless its hand-off said `survives_reboot`. The wake counts
+        toward max_reboot_losses only after an abrupt reboot that cut short a detached job of its own
+        (one with no .rc yet): only then may the task be what takes the host down."""
         if self._boot_woken:
             return
         self._boot_woken = True
@@ -3594,9 +3623,10 @@ class Daemon:
             if not since or since >= self.boot_at:
                 continue
             self._probe_rc.pop(t["id"], None)
-            wakes = _reboot_wakes(t) + 1
+            counts = self._job_cut_by_reboot(t["id"])
+            wakes = _reboot_wakes(t) + int(counts)
             n = self._reboot_losses(t["id"]) + wakes
-            if n >= int(self.cfg["budget"].get("max_reboot_losses", 3)):
+            if counts and n >= int(self.cfg["budget"].get("max_reboot_losses", 3)):
                 # Its detached job may be what takes the host down: stop waking it.
                 prev.pop("reboot_wakes", None)
                 reason = f"lost to a host reboot {n} times; it may be causing them"
@@ -3611,15 +3641,27 @@ class Daemon:
                 {**prev, "woke": "the host rebooted", "reboot": {"at": self.boot_at}, "reboot_wakes": wakes}))
             log(self.p, f"task {t['id']} waited from before the reboot; due now")
 
+    def _job_cut_by_reboot(self, tid: int) -> bool:
+        """Whether the abrupt reboot behind this boot cut short a detached job of task tid: one its
+        runs on the earlier boot started that wrote no .rc."""
+        db = self.p.db
+        last = db.one("SELECT boot_id FROM runs WHERE task=? AND boot_id IS NOT NULL AND boot_id!=? "
+                      "ORDER BY id DESC LIMIT 1", (tid, self.boot))
+        if not last or self._shutdown(last["boot_id"]) == "orderly":
+            return False
+        dirs = db.q("SELECT dir FROM runs WHERE task=? AND boot_id=? AND dir IS NOT NULL", (tid, last["boot_id"]))
+        return any(not Path(j["rc"]).exists() for r in dirs for j in _detached_jobs(Path(r["dir"])))
+
     def _reboot_losses(self, tid: int, key: str = "lost_to_reboot") -> int:
-        """Runs of the task lost to a host reboot (or, by key, a host sleep) since it was last
+        """Runs of the task lost to an abrupt host reboot (or, by key, a host sleep) since it was last
         blocked: a person or the coordinator who requeues a task blocked for reboots starts its count
-        over."""
+        over. An orderly reboot (a shutdown, an update) is not one the task may have caused."""
         db = self.p.db
         since = (db.one("SELECT MAX(ts) ts FROM events WHERE task=? AND kind='task_blocked'", (tid,)) or {}).get("ts")
         return sum(1 for x in db.q("SELECT note FROM runs WHERE task=? AND status='lost' AND note LIKE ? "
                                    "AND started>?", (tid, f"%{key}%", since or 0))
-                   if json.loads(x["note"] or "{}").get(key))
+                   if (n := json.loads(x["note"] or "{}")).get(key)
+                   and not (key == "lost_to_reboot" and n.get("shutdown") == "orderly"))
 
     def _start_probe(self, tid: int, probe: str, now: float, what: str = "retry_when") -> None:
         self._probed[tid] = now
