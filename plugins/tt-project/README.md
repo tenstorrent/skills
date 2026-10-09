@@ -152,7 +152,11 @@ and preferences you add later become part of the project's charter and memory.
   follow-ups gets one fix task on the reviewed branch and a re-review from the daemon, and the
   tasks waiting on the failed review wait on the re-review instead of being blocked (at most two
   rounds per stack; a failure without fix follow-ups still blocks them, and `upstream:` notes and
-  deferred follow-ups stay with the coordinator).
+  deferred follow-ups stay with the coordinator). Across stacks, once `review.area_fail_cap` (3; 0
+  off) reviews of one area failed within 48 h (a lineage linked by `continues`, follow-ups,
+  `depends_on` and `Review #N` / `Fix review #N` titles, or changes with the same main file), the
+  daemon queues no more fixes there and raises a high-effort coordinator turn to re-plan it
+  ("repeated review failures in one area", also counted in the daily review).
 - A review's result: `done` lets the change proceed (its PR, push or push-queue approval and its
   dependents), `failed` stops it and starts the fix flow above. A review handed off `done` with
   `metrics.verdict` `changes_needed` (or `changes_requested`, `rejected`) counts as failed too, so a

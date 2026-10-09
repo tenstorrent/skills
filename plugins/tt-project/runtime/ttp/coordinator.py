@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from . import locks
-from . import effort, ends, jevuse, machines, prguard, push, shared, unblock, upstream
+from . import effort, ends, jevuse, machines, prguard, push, reviewcap, shared, unblock, upstream
 from . import screen as scr
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
@@ -1287,6 +1287,9 @@ def effort_triggers(db, cfg: dict, event_ids: list[int], wake_due: str | None,
     if any(r["kind"] in ("task_failed", "task_changes_needed") and r["task"]
            and (db.task(r["task"]) or {}).get("kind") == "review" for r in rows):
         add("failed review")
+    # An area whose reviews keep failing across stacks needs a re-plan, not another fix round.
+    if any(r["kind"] == reviewcap.REVIEW_AREA_EVENT for r in rows):
+        add(reviewcap.TRIGGER)
     if any(r["severity"] in EFFORT_SEVERITIES for r in rows):
         add("high severity event")
     if msg_ids:

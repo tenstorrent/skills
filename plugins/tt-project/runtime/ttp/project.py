@@ -140,8 +140,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # non-doc file to match one of them.
     # With `auto`, the daemon queues the review of each finished code task with a routine hand-off
     # whenever delivery has a review step (review_before_pr or a push_branch); auto_notes ends each
-    # such review's spec.
-    "review": {"light_max_lines": 80, "risky_paths": [], "light_paths": [], "auto": True, "auto_notes": ""},
+    # such review's spec. With area_fail_cap (0 off) reviews of one area failed within 48 h, across
+    # stacks, the daemon queues no automatic fix for it and the coordinator re-plans (reviewcap).
+    "review": {"light_max_lines": 80, "risky_paths": [], "light_paths": [], "auto": True, "auto_notes": "",
+               "area_fail_cap": 3},
     # Each Jev use (e.g. "screen") is switched off once its net saving over window_days is not
     # positive, judged after min_calls calls or once its first call is a window old, or once idle_calls
     # calls in the window changed none of the rules' decisions; uses.<use> = "on" or "off" forces it

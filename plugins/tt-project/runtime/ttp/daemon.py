@@ -48,6 +48,7 @@ from . import prguard
 from . import push
 from . import pushq
 from . import release
+from . import reviewcap
 from . import runner
 from . import schedule as sched
 from . import service
@@ -2123,8 +2124,12 @@ class Daemon:
         # on it waits on the re-review instead of being blocked. A failure without them still blocks.
         # Upstream notes and deferred follow-ups are not fixes: they stay with the coordinator.
         fixes = [f for f in fups if not upstream.is_note(f) and not f.get("start_after") and not f.get("start_when")]
+        # Across stacks, an area whose reviews keep failing gets no more automatic fixes: the
+        # coordinator re-plans it (reviewcap).
+        area = self._review_area(dict(task, **upd)) if new == "failed" and task["kind"] == "review" else None
         fix = self._fix_failed_review(dict(task, **upd), fixes, summary) \
-            if new == "failed" and task["kind"] == "review" and fixes and len(fups) <= MAX_FOLLOWUPS else None
+            if new == "failed" and task["kind"] == "review" and fixes and len(fups) <= MAX_FOLLOWUPS \
+            and not area else None
         folded = {id(f) for f in fixes} if fix else set()
         if fix:
             moved = ", ".join(f"#{i}" for i in fix[2])
@@ -2132,6 +2137,8 @@ class Daemon:
                      + (f"; {moved} now wait on #{fix[1]}." if moved else "."))
         if outcome == "done" and task["kind"] == "review":
             text += relay_hint(coord._open_dependents(db, task["id"]))
+        if area:
+            text += f"\nNo automatic fix: {reviewcap.TRIGGER} (lineage of #{area['root']})."
         routine = (review is not None and plain) or fix is not None
         # The summary takes what the digest's cap leaves after the header, push note and daemon lines.
         room = min(1200, coord.EVENT_CHARS - len(head) - len(push_note) - len(text))
@@ -2140,6 +2147,12 @@ class Daemon:
             db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                  (time.time(), f"task:{task['id']}", f"task_{outcome}", sev, text,
                   "handled" if quiet or routine else "queued", task["id"]))
+        if area:
+            db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
+                 (time.time(), f"task:{task['id']}", reviewcap.REVIEW_AREA_EVENT, "normal",
+                  reviewcap.event_text(area), json.dumps(area), "queued", task["id"]))
+            log(self.p, f"review {task['id']}: {reviewcap.TRIGGER} in the lineage of #{area['root']} "
+                        f"(reviews {area['reviews']}); no automatic fix")
         if notes:
             db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                  (time.time(), f"task:{task['id']}", "task_notes", "normal",
@@ -4086,6 +4099,14 @@ class Daemon:
         info = _read_checks_pid(out)
         return (not (out / CHECKS_RC).exists() and _checks_alive(info)
                 and now - float(info.get("ts") or 0) < PRECHECK_HOLD_S)
+
+    def _review_area(self, review: dict) -> dict | None:
+        """reviewcap.area for a review failing now; None when it cannot be read (a fix still follows)."""
+        try:
+            return reviewcap.area(self.p, self.cfg, review)
+        except Exception as e:
+            log(self.p, f"review {review['id']}: its area's failures were not counted: {e}")
+            return None
 
     def _fix_failed_review(self, review: dict, fups: list[dict], summary: str) -> tuple[int, int, list[int]] | None:
         """A review that failed with fix specs, handled the way the coordinator would: one code task

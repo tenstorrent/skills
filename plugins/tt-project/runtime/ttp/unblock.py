@@ -42,6 +42,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from . import reviewcap
 from .db import DB
 
 WINDOWS = (("24 h", 86400), ("7 d", 7 * 86400))
@@ -621,4 +622,5 @@ def lines(db: DB, now: float | None = None) -> list[str]:
         out.append(f"asks, {label}: {asks_line(asks(db, now - span, now))}")
     out.append(f"coordinator, 24 h: {turns_line(db, now - 86400)}")
     out.append(f"coordinator triggers, 24 h: {triggers_line(db, now - 86400)}")
+    out.append(f"{reviewcap.TRIGGER}, 24 h: {reviewcap.daily_line(db, now - 86400)}")
     return out

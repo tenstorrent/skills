@@ -26747,6 +26747,104 @@ def test_a_failed_review_with_fixes_moves_its_dependents_onto_the_re_review(env)
     assert w["status"] == "blocked" and w["blocked_reason"] == f"dependency #{re_rev2['id']} failed"
 
 
+def test_review_lineage_follows_continues_follow_ups_depends_on_and_titles_but_no_plan_hub(env):
+    p = make(env)
+    from ttp import reviewcap
+    db = p.db
+    code = db.add_task("feature", "s", kind="code")
+    rev = db.add_task(f"Review #{code}: feature", "s", kind="review", depends_on=[code])
+    fix = db.add_task(f"Fix review #{rev}: feature", "s", kind="code", labels=[f"continues:{code}"])
+    rerev = db.add_task(f"Re-review #{rev}: feature", "s", kind="review", depends_on=[fix],
+                        labels=[f"continues:{rev}"])
+    follow = db.add_task("narrower take on the feature", "s", kind="code", parent=code)   # a follow-up
+    by_title = db.add_task(f"Fix re-review #{rerev}: feature", "s", kind="code")
+    by_title2 = db.add_task(f"#{follow} follow-up: edge case", "s", kind="code")
+    plan = db.add_task("plan the quarter", "s", kind="plan")
+    hub_a = db.add_task("unrelated a", "s", kind="code", parent=plan)
+    hub_b = db.add_task(f"Review #{hub_a}", "s", kind="review", depends_on=[hub_a, plan])
+    other = db.add_task("Review the docs", "s", kind="review")
+    want = {code, rev, fix, rerev, follow, by_title, by_title2}
+    for t in want:
+        assert reviewcap.lineage(db, t) == want, t
+    assert reviewcap.lineage(db, hub_b) == {hub_a, hub_b}, "a plan task joined two lineages"
+    assert reviewcap.lineage(db, other) == {other}
+    # A task older than the lookback is still followed by id.
+    db.x("UPDATE tasks SET created=?, updated=? WHERE id=?", (time.time() - 30 * 86400,) * 2 + (code,))
+    assert reviewcap.lineage(db, by_title2) == want
+
+
+def test_repeated_review_failures_across_stacks_stop_auto_fixes_and_raise_a_re_plan(env):
+    """Each new stack restarted AUTO_FIX_ROUNDS; a lineage across stacks now caps at 3 failed reviews."""
+    p = make(env)
+    from ttp import reviewcap, unblock
+    from ttp import coordinator as coord
+    fups = [{"title": "handle the edge case", "spec": "parse('') raises"}]
+    code_a, _, _, (rev_a,) = _finish_code(env, p, "feature", {"a.py": 40})
+    _fail_review(env, p, rev_a["id"], fups)
+    # The coordinator starts new stacks on the same component: a follow-up, then a fix of its re-review.
+    code_b, _, _, (rev_b,) = _finish_code(env, p, f"#{code_a} follow-up: feature", {"b.py": 40})
+    _fail_review(env, p, rev_b["id"], fups)
+    assert p.db.one("SELECT id FROM tasks WHERE title=?", (f"Fix review #{rev_b['id']}: #{code_a} follow-up: feature",)), \
+        "two failures in an area still get their fix"
+    fixes = p.db.one("SELECT COUNT(*) n FROM tasks WHERE kind='code' AND origin='daemon'")["n"]
+    code_c, _, _, (rev_c,) = _finish_code(env, p, f"Fix re-review #{rev_b['id']}: feature", {"c.py": 40})
+    failed = _fail_review(env, p, rev_c["id"], fups)
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE kind='code' AND origin='daemon'")["n"] == fixes, \
+        "a third failure in the area queued another automatic fix"
+    assert failed["status"] == "queued" and reviewcap.TRIGGER in failed["text"]
+    ev = p.db.one("SELECT * FROM events WHERE kind=?", (reviewcap.REVIEW_AREA_EVENT,))
+    data = json.loads(ev["data"])
+    assert ev["status"] == "queued" and ev["task"] == rev_c["id"]
+    assert data["root"] == code_a and data["reviews"] == [rev_a["id"], rev_b["id"], rev_c["id"]]
+    assert {code_a, code_b, code_c} <= set(data["tasks"]) and set(data["files"]) == {"a.py", "b.py", "c.py"}
+    assert f"#{code_a}" in ev["text"] and "Re-plan" in ev["text"] and "edge-case fix" in ev["text"]
+    # The coordinator's turn is a high-effort one, counted by trigger, and the daily review lists the area.
+    labels, _ = coord.effort_triggers(p.db, p.config(), [ev["id"]], None)
+    assert reviewcap.TRIGGER in labels
+    assert f"{reviewcap.TRIGGER}: 3 reviews failed" in coord.digest(p, {}, [ev["id"]], [])
+    p.db.x("INSERT INTO runs(task,role,started,ended,status,note) VALUES(NULL,'coordinator',?,?,'done',?)",
+           (time.time(), time.time(), json.dumps({"triggers": labels})))
+    lines = unblock.lines(p.db)
+    assert f"per trigger: {reviewcap.TRIGGER} 1" in next(x for x in lines if x.startswith("coordinator triggers"))
+    assert f"{reviewcap.TRIGGER}, 24 h: 1 area(s): #{code_a} (3 failed reviews, a.py, b.py, c.py)" in lines
+
+
+def test_the_review_area_falls_back_to_the_same_main_file_within_48_hours(env):
+    p = make(env)
+    from ttp import reviewcap
+    fups = [{"title": "fix it", "spec": "it breaks"}]
+
+    def stack(title, files):
+        _, _, _, (rev,) = _finish_code(env, p, title, files)
+        return rev
+
+    def fixed(rev):
+        return p.db.one("SELECT id FROM tasks WHERE title LIKE ?", (f"Fix review #{rev['id']}:%",)) is not None
+
+    # Unlinked stacks whose main file is core.py; the larger test file does not count as main.
+    core = {"core.py": 30, "tests/test_core.py": 200}
+    s1 = stack("first try", core)
+    _fail_review(env, p, s1["id"], fups)
+    assert reviewcap.main_file(p, p.db.task(s1["id"])) == "core.py"
+    p.db.x("UPDATE events SET ts=? WHERE task=?", (time.time() - 49 * 3600, s1["id"]))   # out of the window
+    s2 = stack("second try", core)
+    _fail_review(env, p, s2["id"], fups)
+    elsewhere = stack("unrelated", {"else.py": 30})
+    _fail_review(env, p, elsewhere["id"], fups)
+    s3 = stack("third try", core)
+    _fail_review(env, p, s3["id"], fups)
+    assert fixed(s2) and fixed(elsewhere) and fixed(s3), "a failure outside the window or area was counted"
+    assert not p.db.q("SELECT id FROM events WHERE kind=?", (reviewcap.REVIEW_AREA_EVENT,))
+    s4 = stack("fourth try", core)
+    _fail_review(env, p, s4["id"], fups)
+    assert not fixed(s4), "the same main file did not join the area"
+    data = json.loads(p.db.one("SELECT data FROM events WHERE kind=?", (reviewcap.REVIEW_AREA_EVENT,))["data"])
+    assert data["reviews"] == [s2["id"], s3["id"], s4["id"]] and data["files"] == ["core.py"]
+    # 0 turns the cap off.
+    p.set_config("review.area_fail_cap", 0)
+    assert reviewcap.area(p, p.config(), p.db.task(s4["id"])) is None
+
+
 def test_a_review_done_with_a_changes_needed_verdict_gates_like_a_failed_review(env):
     """A project whose result rule is `done` plus `metrics.verdict` gets the same fix flow as `failed`,
     and approves nothing; `done` with another verdict, or from a non-review task, stays done."""

@@ -64,7 +64,12 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
   review's dependents move to the re-review. Do not add these again: steer them with `task_update`.
   `upstream:` notes and deferred follow-ups are not folded into the fix; they stay yours to relay
   and schedule. After two failed rounds on a stack, or a failure without fix follow-ups, it is
-  yours as before.
+  yours as before. So is an area whose reviews keep failing across stacks: at `review.area_fail_cap`
+  (3) failed reviews within 48 h in one lineage (linked by `continues`, follow-ups, `depends_on` and
+  `Review #N` / `Fix review #N` titles, or changes with the same main file), the daemon queues no
+  fix and a `review_area_cap` event (repeated review failures in one area) names its tasks and
+  files. Re-plan that area: narrow the scope, accept and document the known gaps, or redesign. Do
+  not add another edge-case fix, and do not raise the tier to `deep` for that reason alone.
   A review that passes is evidence for the tasks that consume it (its done event lists the open
   ones waiting on it). Hand each the accepted commit, the hash-pinned manifest or evidence path,
   the reviewer's verdict and any gates still open with a spec-only `task_update` (`spec` alone:
