@@ -323,6 +323,7 @@ def bootstrap(root: Path, name: str, brief: str, provider: str) -> Project:
     _git(p.harness, "-c", "user.name=tt-project", "-c", "user.email=tt-project@localhost", "commit", "-q",
          "-m", f"tt-project template {__version__}")
     _git(p.harness, "checkout", "-q", "-b", "main")
+    _ensure_git_ident(p.harness)
     from . import release
     release.guard_harness(p.harness)
     charter = (template / "CHARTER.md").read_text().replace("{{NAME}}", name).replace(
@@ -2267,6 +2268,7 @@ def _upgrade(p: Project, auto: bool = False) -> None:
     else:
         print(f"installed template: ttp {new_v} ({new_c})")
     ident = ["-c", "user.name=tt-project", "-c", "user.email=tt-project@localhost"]
+    _ensure_git_ident(h)        # harness tasks commit here with plain `git commit`
     _refuse_unfinished_merge(p, auto)
     emptied = _emptied(h, None, "HEAD")
     if emptied:      # a crash cut these short: they are damage, not local edits to commit and keep
@@ -2281,7 +2283,6 @@ def _upgrade(p: Project, auto: bool = False) -> None:
     kept: dict[str, str] = {}
     merged, problem = _merge_upstream(h, p.state / "upgrade-merge", ident, base, kept)
     if problem:
-        _ensure_git_ident(h)        # the task merges and commits in a fresh worktree of this repo
         holder = release.finish_holder(p)
         tid = holder["task"] if holder else None
         last = None if tid else release.recent_upgrade_task(p)
@@ -2521,15 +2522,13 @@ In this harness repo:
 
 
 def _ensure_git_ident(h: Path) -> None:
-    """Give the harness repo a local commit identity when git resolves none (no user.name/user.email
-    and no usable account name), so a plain `git merge` or `git commit` in it works for any run."""
-    for who in ("GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT"):
-        if subprocess.run(["git", "-C", str(h), "var", who], capture_output=True).returncode != 0:
-            for key, val in (("user.name", "tt-project"), ("user.email", "tt-project@localhost")):
-                if subprocess.run(["git", "-C", str(h), "config", key], capture_output=True,
-                                  text=True).stdout.strip() == "":
-                    _git(h, "config", key, val)    # only what is missing: a configured name or email stays
-            return
+    """Give the harness repo a local commit identity (tt-project <tt-project@localhost>) for any key
+    its own .git/config lacks, so a plain `git merge` or `git commit` in it works for any run, even
+    where no global identity is set. A locally configured name or email is never overwritten."""
+    for key, val in (("user.name", "tt-project"), ("user.email", "tt-project@localhost")):
+        if subprocess.run(["git", "-C", str(h), "config", "--local", key], capture_output=True,
+                          text=True).stdout.strip() == "":
+            _git(h, "config", "--local", key, val)
 
 
 def _emptied(h: Path, have: str | None, ref: str) -> list[str]:

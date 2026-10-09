@@ -8279,6 +8279,8 @@ def test_the_queued_upgrade_task_can_merge_and_commit_without_a_git_identity(env
     h = p.harness
     (h / "prompts" / "kind-harness.md").write_text("# Harness task, this project's way\n")
     _git_out(h, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "local prompt")
+    for key in ("user.name", "user.email"):     # a harness made before new set a local identity
+        _git_out(h, "config", "--local", "--unset", key)
     for var in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "EMAIL"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
@@ -30823,3 +30825,22 @@ def test_the_worker_hook_logs_a_denied_draft_guard_bypass_to_the_gh_guard_log(en
     (rec,) = [json.loads(x) for x in (state / prguard.GH_LOG).read_text().splitlines()]
     assert rec["action"] == "ready" and rec["refused"] is True and rec["run"] == "7"
     assert prguard.worker_calls(state, "o/r#5", 0)
+
+
+def test_new_and_upgrade_give_the_harness_a_local_git_identity_but_keep_one_already_set(env, monkeypatch):
+    """Harness tasks run a plain `git commit` in the harness repo: it must carry its own identity,
+    set only where its .git/config has none."""
+    p = make(env)
+    from ttp import cli, service
+    monkeypatch.setattr(service, "restart", lambda p: "restarted")
+    h = p.harness
+    local = lambda k: _git_out(h, "config", "--local", k)
+    assert (local("user.name"), local("user.email")) == ("tt-project", "tt-project@localhost")
+    _git_out(h, "config", "--local", "--unset", "user.name")
+    _git_out(h, "config", "--local", "user.email", "me@example.com")
+    _install_template(env)
+    try:
+        cli.main(["upgrade", "demo"])
+    except SystemExit:
+        pass
+    assert (local("user.name"), local("user.email")) == ("tt-project", "me@example.com")
