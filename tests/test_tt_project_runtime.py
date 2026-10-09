@@ -30310,6 +30310,141 @@ def test_devq_lint_refuses_missing_or_broken_scripts_and_warns_on_another_tasks_
     assert warns == [], "no submitting task, nothing to compare"
 
 
+DEVQ_ISOLATED = """#!/bin/bash
+stop() { kill -TERM -- -"$pg" 2>/dev/null; }
+trap stop EXIT TERM INT
+setsid python3 run.py & pg=$!
+wait
+"""
+
+
+def _guard_submit(d, cfg, spec, monkeypatch, capsys):
+    from ttp import devq
+    monkeypatch.setattr(devq, "start", lambda d, cfg: 0)
+    rc = devq.submit(d, cfg, {"id": f"j{len(list(d.glob('queue/*')))}-{os.urandom(3).hex()}", **spec})
+    return rc, capsys.readouterr().err
+
+
+def test_devq_guard_is_off_by_default_and_refuses_jobs_whose_children_could_outlive_them(
+        tmp_path, devq_dir, monkeypatch, capsys):
+    from ttp import devq
+    w = tmp_path / "w"
+    w.mkdir()
+    (w / "bare.sh").write_text("#!/bin/bash\npython3 run.py &\nwait\n")
+    (w / "good.sh").write_text(DEVQ_ISOLATED)
+    bare = {"cmd": "bash bare.sh", "workdir": str(w)}
+    assert _guard_submit(devq_dir, {}, bare, monkeypatch, capsys) == (0, ""), "off unless configured"
+    rc, err = _guard_submit(devq_dir, {"script_lint": "refuse"}, bare, monkeypatch, capsys)
+    assert rc == 2 and "refused by this host's job guard" in err and "lacks setsid, a trap on EXIT" in err, err
+    rc, err = _guard_submit(devq_dir, {"script_lint": "warn"}, bare, monkeypatch, capsys)
+    assert rc == 0 and "devq submit: warning: no process-group isolation" in err, err
+    assert _guard_submit(devq_dir, {"script_lint": "refuse"}, {"cmd": "./good.sh", "workdir": str(w)},
+                         monkeypatch, capsys)[0] == 0
+    # Each class: setsid alone, a trap that kills only one pid, a trap missing a signal, inline traps.
+    assert "lacks a trap on EXIT, a trap on TERM" in devq._isolation_problem("setsid x &\n")
+    assert "a trap on EXIT" in devq._isolation_problem("setsid x &\ntrap 'kill -15 $pid' EXIT TERM INT\n")
+    assert "lacks a trap on TERM (" in devq._isolation_problem("setsid x & pg=$!\ntrap 'kill -- -$pg' EXIT INT\n")
+    assert devq._isolation_problem("setsid x &\ntrap 'kill 0' 0\ntrap 'kill -9 -$$' SIGTERM 2\n") == ""
+    assert "lacks setsid" in devq._isolation_problem(devq._code("# setsid x\ntrap 'kill 0' EXIT TERM INT\n"))
+    assert "lacks setsid" in devq._isolation_problem("pkill -g 0 setsidx\ntrap 'kill 0' EXIT TERM INT\n")
+
+
+def test_devq_guard_refuses_downloads_and_cache_writes_without_a_disk_guard(tmp_path, devq_dir, monkeypatch,
+                                                                           capsys):
+    from ttp import devq
+    for cmd in ("wget https://example.org/w.bin", "curl -fsSLo w.bin https://example.org/w.bin",
+                "hf download org/model", "git clone https://example.org/r.git", "cp -r w $HF_CACHE/",
+                "aws s3 sync s3://bucket/w /data/w"):
+        assert "without a disk guard" in devq._download_problem(cmd), cmd
+        assert devq._download_problem("df -P / | tail -1\n" + cmd) == "", cmd
+        assert devq._download_problem("du -sh ~/.cache\n" + cmd) == "", cmd
+    assert devq._download_problem("curl -s http://localhost:8000/health") == "", "a request writes nothing"
+    script = tmp_path / "fetch.sh"
+    script.write_text(DEVQ_ISOLATED + "wget https://example.org/w.bin\n")
+    rc, err = _guard_submit(devq_dir, {"script_lint": "refuse"}, {"cmd": f"bash {script}"}, monkeypatch, capsys)
+    assert rc == 2 and "without a disk guard" in err and "process-group" not in err, err
+
+
+def test_devq_guard_flags_cache_paths_on_network_mounts_without_touching_them(tmp_path, devq_dir, monkeypatch,
+                                                                             capsys):
+    from ttp import devq
+    net = str(tmp_path / "net")             # stands for a network mount: never looked at by the guard
+    (tmp_path / "local").mkdir()
+    (tmp_path / "local" / "models").symlink_to(f"{net}/team/models")
+    looked = []
+    real = os.readlink
+    monkeypatch.setattr(devq.os, "readlink", lambda path: (looked.append(str(path)), real(path))[1])
+    resolved, pre = devq.resolve_local(f"{tmp_path}/local/models/llm", [net])
+    assert (resolved, pre) == (f"{net}/team/models/llm", net)
+    assert looked and not any(x == net or x.startswith(net + "/") for x in looked), looked
+    assert devq.resolve_local(f"{tmp_path}/local/other", [net]) == (f"{tmp_path}/local/other", "")
+    code = (f"ROOT={tmp_path}/local\nexport HF_HOME=\"$ROOT/models/hf\"\n"
+            f"python3 x.py --weights-dir ${{ROOT}}/models/w --cache-dir /tmp/c --out $UNSET/x\n")
+    found = devq._netfs_problems(code, [net])
+    assert len(found) == 2 and found[0].startswith("HF_HOME $ROOT/models/hf resolves to " + net), found
+    assert found[1].startswith("--weights-dir ${ROOT}/models/w resolves to " + net), found
+    job = {"cmd": f"HF_HOME={tmp_path}/local/models python3 x.py"}
+    assert _guard_submit(devq_dir, {}, job, monkeypatch, capsys) == (0, ""), "off without netfs_prefixes"
+    rc, err = _guard_submit(devq_dir, {"netfs_prefixes": [net]}, job, monkeypatch, capsys)
+    assert rc == 0 and "warning: the command: HF_HOME" in err and "on the network filesystem" in err, err
+    rc, err = _guard_submit(devq_dir, {"netfs_prefixes": [net], "netfs_policy": "refuse"}, job, monkeypatch, capsys)
+    assert rc == 2 and "refused by this host's job guard" in err, err
+
+
+def test_devq_guard_disk_cap_refuses_submits_and_holds_the_queue(tmp_path, devq_dir, monkeypatch, capsys):
+    from ttp import devq
+    usage = {"used": 95, "free": 5}
+    monkeypatch.setattr(shutil, "disk_usage", lambda p: types.SimpleNamespace(total=100, **usage))
+    rc, err = _guard_submit(devq_dir, {"disk_max_pct": 90}, {"cmd": "true"}, monkeypatch, capsys)
+    assert rc == 2 and "is 95% full, above the cap of 90% (disk_max_pct)" in err, err
+    assert _guard_submit(devq_dir, {}, {"cmd": "true"}, monkeypatch, capsys)[0] == 0, "off by default"
+    devq._write(devq_dir / "config.json", json.dumps(devq.settings(
+        {"disk_max_pct": 90, "health_wait_s": 0.2, "health_poll_s": 0.05})))
+    runner = devq.Runner(devq_dir)
+    assert "disk_max_pct" in runner.healthy(1, "j"), "a queued job waits while the disk is full"
+    usage.update(used=50, free=50)
+    assert runner.healthy(1, "j") == ""
+
+
+def test_devq_guard_preflight_checks_inputs_and_warns_on_a_cold_start_past_the_limit(
+        tmp_path, devq_dir, monkeypatch, capsys):
+    from ttp import devq
+    (tmp_path / "in.bin").write_text("x")
+    spec = {"cmd": "true", "workdir": str(tmp_path), "inputs": ["in.bin", str(tmp_path / "gone.bin")]}
+    rc, err = _guard_submit(devq_dir, {}, spec, monkeypatch, capsys)
+    assert rc == 2 and f"input {tmp_path}/gone.bin: missing or not readable" in err and "in.bin:" not in err, err
+    spec = {"cmd": "true", "inputs": [str(tmp_path / "in.bin")], "cold_start_s": 900, "timeout_s": 600}
+    rc, err = _guard_submit(devq_dir, {}, spec, monkeypatch, capsys)
+    assert rc == 0 and "cold start of 900 s is longer than its limit of 600 s" in err, err
+    assert _guard_submit(devq_dir, {}, {**spec, "timeout_s": 1200}, monkeypatch, capsys) == (0, "")
+
+
+def test_devq_guard_settings_are_validated():
+    from ttp import devq
+    assert devq.config_problems("r", {"script_lint": "refuse", "netfs_prefixes": ["/net"], "netfs_policy": "refuse",
+                                      "disk_max_pct": 90, "disk_paths": ["/", "~/cache"]}) == []
+    probs = devq.config_problems("r", {"script_lint": "yes", "netfs_prefixes": ["/"], "netfs_policy": "",
+                                       "disk_max_pct": 120, "disk_paths": "/"})
+    assert [x.split(":")[0] for x in probs] == ["device.runners.r.script_lint", "device.runners.r.netfs_prefixes",
+                                                "device.runners.r.netfs_policy", "device.runners.r.disk_paths",
+                                                "device.runners.r.disk_max_pct"], probs
+
+
+def test_ttp_devq_submit_passes_inputs_and_cold_start_to_the_hosts_guard(env, tmp_path):
+    p = make(env)
+    d = tmp_path / "rq"
+    p.set_config("device", {"runners": {"dev": {"dir": str(d), **DEVQ_FAST}}})
+    try:
+        r = _ttp_run(p, "devq", "submit", "dev", "--id", "g1", "--input", str(tmp_path / "gone"),
+                     "--cold-start", "30", "--timeout", "10", "--", "true")
+        assert r.returncode == 2 and f"input {tmp_path}/gone: missing or not readable" in r.stderr, r.stderr
+        assert "cold start of 30 s is longer than its limit of 10 s" in r.stderr
+        assert not (d / "queue").exists() or not list((d / "queue").iterdir()), "a refused job is not queued"
+    finally:
+        with contextlib.suppress(OSError, ValueError):
+            os.kill(int((d / "runner.pid").read_text()), signal.SIGKILL)
+
+
 def test_ttp_devq_submit_refuses_a_job_whose_script_is_missing_on_the_host_unless_no_lint(env, tmp_path):
     p = make(env)
     d = tmp_path / "rq"

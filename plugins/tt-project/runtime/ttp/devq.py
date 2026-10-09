@@ -50,7 +50,15 @@ RUNNER_DEFAULTS = {
     # of the user's processes matches, the runner does not start and starts no job, and the probe keeps
     # a task with a pending job asleep: both checking "no other job of ours" at once could pass.
     "legacy_driver": "",
+    # The job guard, run on the host by every submit (see guard); each part is off until set. It is the
+    # host's policy, so --no-lint does not skip it.
+    "script_lint": "",         # "refuse" or "warn": process-group isolation and a disk guard before downloads
+    "netfs_prefixes": [],      # network-filesystem mount prefixes no weight or cache path may resolve under
+    "netfs_policy": "warn",    # "warn" or "refuse" for such a path
+    "disk_max_pct": 0,         # refuse a submit, and hold the queue, while a disk is fuller than this (0 = off)
+    "disk_paths": [],          # the disks disk_max_pct watches ([] = / and the runner's state folder)
 }
+_CHOICES = {"script_lint": ("", "warn", "refuse"), "netfs_policy": ("warn", "refuse")}
 ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
 NAME_RE = ID_RE
 STATUSES = ("done", "failed", "skipped")
@@ -71,6 +79,14 @@ def config_problems(name: str, cfg) -> list:
             out.append(f"{where}.{k}: {v!r} is not a number >= 0")
         elif isinstance(RUNNER_DEFAULTS[k], str) and not isinstance(v, str):
             out.append(f"{where}.{k}: {v!r} is not a string")
+        elif k in _CHOICES and v not in _CHOICES[k]:
+            out.append(f"{where}.{k}: {v!r} is not one of {', '.join(repr(c) for c in _CHOICES[k])}")
+        elif isinstance(RUNNER_DEFAULTS[k], list):
+            ok = isinstance(v, list) and all(isinstance(x, str) and x.startswith(("/", "~")) for x in v)
+            if not ok or (k == "netfs_prefixes" and any(x.rstrip("/") in ("", "~") for x in v)):
+                out.append(f"{where}.{k}: {v!r} is not a list of absolute paths (and not / or ~ itself)")
+    if isinstance(cfg.get("disk_max_pct"), (int, float)) and cfg["disk_max_pct"] > 100:
+        out.append(f"{where}.disk_max_pct: {cfg['disk_max_pct']} is above 100")
     if isinstance(cfg.get("legacy_driver"), str) and cfg["legacy_driver"]:
         try:
             re.compile(cfg["legacy_driver"])
@@ -394,6 +410,237 @@ def over_cap(spec: dict, cfg: dict) -> str:
     return ""
 
 
+# host side: the job guard (config script_lint, netfs_prefixes, disk_max_pct; a job's inputs) ----------
+# A job's child that outlives its script, a weight or cache path on a hung network mount, or caches that
+# fill the host's disk can take down more than the job: the guard refuses such a job at submit.
+_GROUP_ISOLATION = re.compile(r"(?<![\w-])setsid(?![\w-])")
+_TRAP = re.compile(r"""(?<![\w-])trap\s+(?:--\s+)?('[^']*'|"[^"]*"|[^\s'"]+)((?:[ \t]+[A-Za-z0-9_]+)+)""")
+_FUNC = re.compile(r"(?:^|[\s;])(?:function\s+)?([A-Za-z_][\w-]*)\s*\(\s*\)\s*\{")
+_KILL = re.compile(r"(?<![\w-])kill((?:[ \t]+[^\s;&|)]+)+)")
+_QUOTES = "\"'"
+_SIGNALS = {"0": "EXIT", "1": "HUP", "2": "INT", "15": "TERM"}
+_DOWNLOAD = re.compile(
+    r"(?<![\w-])(?:wget|aria2c|rsync|scp|rclone\s+(?:copy|sync)|(?:huggingface-cli|hf)\s+download|"
+    r"snapshot_download|hf_hub_download|git\s+clone|git\s+lfs\s+(?:pull|fetch)|aws\s+s3\s+(?:cp|sync)|"
+    r"gsutil\s+(?:-m\s+)?(?:cp|rsync)|curl\b[^\n]*\s(?:-[A-Za-z]*[oO]\b|--output|--remote-name))")
+_CACHE_WRITE = re.compile(r"(?<![\w-])(?:cp|mv|tar|unzip|rsync)\s[^\n]*cache", re.I)
+_DISK_GUARD = re.compile(r"(?<![\w-])(?:df|du)(?![\w-])")
+_CACHE_NAME = r"[A-Za-z_]*(?:CACHE|WEIGHT|MODEL|CKPT|CHECKPOINT|HF_HOME|TORCH_HOME|ARTIFACT)[A-Za-z0-9_]*"
+_CACHE_VAR = re.compile(r"(?<![\w-])(" + _CACHE_NAME + r")=(\"[^\"]*\"|'[^']*'|[^\s;&|)]+)", re.I)
+_CACHE_OPT = re.compile(r"(?<![\w-])--[\w-]*(?:cache|weight|model|ckpt|checkpoint)[\w-]*(?:=|\s+)"
+                        r"(\"[^\"]*\"|'[^']*'|[^\s;&|)]+)", re.I)
+_ASSIGN = re.compile(r"(?<![\w-])([A-Za-z_][A-Za-z0-9_]*)=(\"[^\"`]*\"|'[^']*'|[^\s;&|)\"'`]+)")
+
+
+def _code(text: str) -> str:
+    """`text` without its comment lines (the #! line too)."""
+    return "\n".join(x for x in text.splitlines() if not x.lstrip().startswith("#"))
+
+
+def _job_texts(spec: dict) -> list:
+    """(label, code) for the job's command and each shell script it calls that is readable here."""
+    out = [("the command", _code(spec["cmd"]))]
+    for path, kind in called_scripts(spec["cmd"], spec.get("workdir") or ""):
+        f = Path(os.path.expanduser(path))
+        try:
+            with open(f, errors="replace") as fh:
+                text = fh.read(1 << 20)
+        except OSError:
+            continue
+        if kind == "sh" or (kind == "?" and re.match(r"#!.*[/ ]((ba|da|k|z)?sh)(\s|$)", text)):
+            out.append((path, _code(text)))
+    return out
+
+
+def _kills_group(text: str) -> bool:
+    """A kill of a process group in `text`: a negative pid (`kill -- -$pgid`, `kill -TERM -$$`) or 0."""
+    for m in _KILL.finditer(text):
+        words = [re.sub("[\"']", "", w) for w in m.group(1).split()]
+        if words[:1] == ["-s"] or words[:1] == ["-n"]:
+            words = words[2:]
+        elif words and words[0].startswith("-") and words[0] != "--" and len(words) > 1:
+            words = words[1:]                    # the signal (kill takes one)
+        if any(w == "0" or (w[:1] == "-" and w[1:2] and w[1:2] in "$0123456789") for w in words):
+            return True
+    return False
+
+
+def _function_bodies(text: str) -> dict:
+    """name -> body of each shell function defined in `text` (braces counted, quotes not)."""
+    out = {}
+    for m in _FUNC.finditer(text):
+        depth, i = 1, m.end()
+        while i < len(text) and depth:
+            depth += {"{": 1, "}": -1}.get(text[i], 0)
+            i += 1
+        out[m.group(1)] = text[m.end():i]
+    return out
+
+
+def _isolation_problem(code: str) -> str:
+    """Why the job's processes could outlive it, or "": it needs setsid, and traps on EXIT, TERM and INT
+    whose action (or a function it calls) kills the process group."""
+    bodies, covered = _function_bodies(code), set()
+    for m in _TRAP.finditer(code):
+        action = m.group(1).strip(_QUOTES)
+        called = [b for name, b in bodies.items() if re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", action)]
+        if _kills_group(action) or any(_kills_group(b) for b in called):
+            for sig in m.group(2).split():
+                sig = sig.upper()
+                covered.add(_SIGNALS.get(sig, sig[3:] if sig.startswith("SIG") else sig))
+    missing = [x for x in ("setsid",) if not _GROUP_ISOLATION.search(code)]
+    missing += [f"a trap on {s}" for s in ("EXIT", "TERM", "INT") if s not in covered]
+    if not missing:
+        return ""
+    return ("no process-group isolation: it lacks " + ", ".join(missing) + " (run the work under `setsid`, "
+            "and `trap 'kill -TERM -- -$pgid' EXIT TERM INT` with its process group, so no child outlives the job)")
+
+
+def _download_problem(code: str) -> str:
+    m = _DOWNLOAD.search(code) or _CACHE_WRITE.search(code)
+    if not m or _DISK_GUARD.search(code):
+        return ""
+    return (f"it downloads or writes a cache ({' '.join(m.group(0).split())[:60]!r}) without a disk guard "
+            f"(check free space with `df` or the cache's size with `du` first, and stop when it is short)")
+
+
+def _expand(value: str, known: dict) -> str | None:
+    """A path word with ~ and $VAR / ${VAR} / ${VAR:-x} filled in from `known`; None if one is unknown."""
+    v = value.strip(_QUOTES)
+    v = re.sub(r"\$\{([A-Za-z_]\w*):?-([^}]*)\}", lambda m: known.get(m.group(1)) or m.group(2), v)
+    v = re.sub(r"\$\{?([A-Za-z_]\w*)\}?", lambda m: known.get(m.group(1), "\0"), v)
+    if "\0" in v or re.search(r"[$`*?]", v):
+        return None
+    return os.path.expanduser(v)
+
+
+def _under(path: str, prefixes: list) -> str:
+    for pre in prefixes:
+        pre = pre.rstrip("/")
+        if path == pre or path.startswith(pre + "/"):
+            return pre
+    return ""
+
+
+def resolve_local(path: str, prefixes: list) -> tuple:
+    """(path with its symlinks resolved, the network prefix it lies under or ""). Nothing under a prefix
+    is looked at (a hung mount would hang the lint): once the path so far is under one, the rest is joined
+    as written. Only absolute paths are taken."""
+    import posixpath
+    parts, cur, hops = [x for x in path.split("/") if x], "/", 0
+    while parts:
+        if _under(cur, prefixes):
+            break
+        comp = parts.pop(0)
+        if comp in (".", ".."):
+            cur = posixpath.dirname(cur) if comp == ".." else cur
+            continue
+        nxt = posixpath.join(cur, comp)
+        if _under(nxt, prefixes):
+            cur = nxt
+            break
+        try:
+            target = os.readlink(nxt)
+        except OSError:                          # not a link, or not there: kept as written
+            cur = nxt
+            continue
+        hops += 1
+        if hops > 40:
+            cur = nxt
+            break
+        parts = [x for x in target.split("/") if x] + parts
+        cur = "/" if target.startswith("/") else cur
+    out = posixpath.normpath(posixpath.join(cur, *parts)) if parts else cur
+    return out, _under(out, prefixes)
+
+
+def _netfs_problems(code: str, prefixes: list) -> list:
+    known = {"HOME": str(Path.home()), **{k: v for k, v in os.environ.items()}}
+    for m in _ASSIGN.finditer(code):              # in order: a later assignment wins
+        val = _expand(m.group(2), known)
+        if val is not None:
+            known[m.group(1)] = val
+    out = []
+    for m in list(_CACHE_VAR.finditer(code)) + list(_CACHE_OPT.finditer(code)):
+        word = m.group(m.lastindex)
+        path = _expand(word, known)
+        if not path or not path.startswith("/"):
+            continue
+        real, pre = resolve_local(path, prefixes)
+        if pre:
+            name = m.group(1) if m.re is _CACHE_VAR else m.group(0).split("=")[0].split()[0]
+            line = (f"{name} {word.strip(_QUOTES)} resolves to {real}, on the network filesystem {pre} "
+                    f"(netfs_prefixes): a hung mount hangs the job; keep weights and caches on a local disk")
+            if line not in out:
+                out.append(line)
+    return out
+
+
+def disk_full(cfg: dict, d: Path) -> str:
+    """Why a disk disk_max_pct watches is too full, or "" (also when the cap is off)."""
+    import shutil
+    cap = float(cfg.get("disk_max_pct") or 0)
+    if not cap:
+        return ""
+    for path in cfg.get("disk_paths") or ["/", str(d)]:
+        try:
+            u = shutil.disk_usage(os.path.expanduser(path))
+        except OSError:
+            continue
+        pct = 100.0 * u.used / ((u.used + u.free) or 1)
+        if pct > cap:
+            return (f"the disk holding {path} is {pct:.0f}% full, above the cap of {cap:.0f}% "
+                    f"(disk_max_pct); free space there first")
+    return ""
+
+
+def _readable(path: str, timeout: float = 20) -> str:
+    """"" if `path` can be read here, else why. Asked in a child, so a hung mount costs `timeout`."""
+    try:
+        p = subprocess.Popen(["/bin/sh", "-c", 'test -r "$1"', "sh", path], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        rc = p.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_group(p.pid)
+        return f"no answer in {timeout:.0f} s (a hung mount?)"
+    except OSError as e:
+        return str(e)
+    return "" if rc == 0 else "missing or not readable"
+
+
+def guard(d: Path, cfg: dict, spec: dict) -> tuple:
+    """(errors, warnings) of the job guard, on the host at submit. Each part is off until configured:
+    script_lint checks the command and the shell scripts it calls for process-group isolation (setsid,
+    and EXIT/TERM/INT traps that kill the group) and for a df/du guard before downloads or cache writes;
+    netfs_prefixes flags weight and cache paths that resolve onto a network filesystem (netfs_policy);
+    disk_max_pct refuses while a watched disk is fuller. A job's declared inputs must be readable here, and
+    a declared cold start longer than its limit is a warning."""
+    cfg = settings(cfg)
+    errors, warnings = [], []
+    full = disk_full(cfg, d)
+    if full:
+        errors.append(full)
+    texts = _job_texts(spec) if cfg["script_lint"] or cfg["netfs_prefixes"] else []
+    if cfg["script_lint"]:
+        found = [p for p in (_isolation_problem("\n".join(c for _, c in texts)),
+                             _download_problem("\n".join(c for _, c in texts))) if p]
+        (errors if cfg["script_lint"] == "refuse" else warnings).extend(found)
+    if cfg["netfs_prefixes"]:
+        found = [f"{label}: {x}" for label, c in texts for x in _netfs_problems(c, cfg["netfs_prefixes"])]
+        (errors if cfg["netfs_policy"] == "refuse" else warnings).extend(found)
+    base = spec.get("workdir") or str(Path.home())
+    for path in spec.get("inputs") or []:
+        full_path = os.path.join(base, os.path.expanduser(str(path)))
+        why = _readable(full_path)
+        if why:
+            errors.append(f"input {path}: {why} on this host")
+    cold, limit = float(spec.get("cold_start_s") or 0), job_limit(spec, cfg)
+    if cold and limit and cold > limit:
+        warnings.append(f"its declared cold start of {cold:.0f} s is longer than its limit of {limit:.0f} s: "
+                        f"it would time out before it does any work")
+    return errors, warnings
+
+
 def _now() -> float:
     return time.time()
 
@@ -565,6 +812,13 @@ def submit(d: Path, cfg: dict, spec: dict) -> int:
     if too_long:
         print(f"devq submit: refused: {too_long}", file=sys.stderr)
         return 2
+    errors, warnings = guard(d, cfg, spec)
+    for w in warnings:
+        print(f"devq submit: warning: {w}", file=sys.stderr)
+    if errors:
+        print("devq submit: refused by this host's job guard (config device.runners): " + "; ".join(errors),
+              file=sys.stderr)
+        return 2
     if where_is(d, job) != "unknown":
         print(f"devq submit: id {job} was already used here; pick a new one (e.g. {job}-r2)", file=sys.stderr)
         return 2
@@ -697,13 +951,15 @@ class Runner:
         return p.returncode, (lines[-1][:300] if lines else "")
 
     def healthy(self, need: int, job: str) -> str:
-        """Wait until `need` health checks in a row pass: "" then, else why the gate gave up."""
+        """Wait until `need` health checks in a row pass and no disk is over disk_max_pct: "" then, else why
+        the gate gave up."""
         cmd = self.cfg["health"]
-        if not cmd.strip():
-            return ""
         t0, passes, last = _now(), 0, None
         while True:
-            rc, out = self.sh(cmd, self.cfg["health_timeout_s"], {"TTP_DEVQ_JOB": job})
+            full = disk_full(self.cfg, self.d)        # a disk over disk_max_pct holds the queue too
+            if not full and not cmd.strip():
+                return ""
+            rc, out = (1, "") if full else self.sh(cmd, self.cfg["health_timeout_s"], {"TTP_DEVQ_JOB": job})
             if rc == 0:
                 passes += 1
                 if passes >= need:
@@ -711,7 +967,7 @@ class Runner:
                     return ""
             else:
                 passes = 0
-                why = f"health check exit {rc}" + (f": {out}" if out else "")
+                why = full or f"health check exit {rc}" + (f": {out}" if out else "")
                 if why != last:
                     self.log(f"{job}: waiting: {why}")
                 last = why

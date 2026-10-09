@@ -1689,10 +1689,11 @@ def cmd_detach(a) -> None:
 def cmd_devq(a) -> None:
     """The project's serial device-job runners (config `device.runners.<name>`; see devq.py).
 
-    `ttp devq submit <runner> --id <id> [--config <key>] [--timeout <s>] [--workdir <dir>] [--no-lint] -- <command>`
-    lints the command first (devq.lint: bash -n, the scripts it calls exist on the host, a task id not
-    this task's; --no-lint skips it), then
-    queues one job on the runner's host and starts the runner if it is down (with runner.device_timeout_max_s
+    `ttp devq submit <runner> --id <id> [--config <key>] [--timeout <s>] [--workdir <dir>] [--input <path>]...
+    [--cold-start <s>] [--no-lint] -- <command>` lints the command first (devq.lint: bash -n, the scripts it
+    calls exist on the host, a task id not this task's; --no-lint skips it), then
+    queues one job on the runner's host (whose job guard, devq.guard, may refuse it; it checks the --input
+    paths are readable there and warns on a --cold-start longer than the job's limit) and starts the runner if it is down (with runner.device_timeout_max_s
     set, it refuses a longer --timeout and gives a job without one that ceiling); it prints the retry_when,
     `ttp devq probe <runner> <id>`, which exits 0 once the job has its done marker, or once no runner is
     alive while the job waits (the waking run then calls `ttp devq start <runner>` and waits again), and
@@ -1720,12 +1721,14 @@ def cmd_devq(a) -> None:
     rest = list(a.rest or [])
     if a.op == "submit":
         usage = ("usage: ttp devq submit <runner> --id <id> [--config <key>] [--timeout <s>] [--workdir <dir>] "
-                 "[--no-lint] -- <command...>")
+                 "[--input <path>]... [--cold-start <s>] [--no-lint] -- <command...>")
         opts, rest = (rest[:rest.index("--")], rest[rest.index("--") + 1:]) if "--" in rest else (rest, [])
         sp = argparse.ArgumentParser(prog="ttp devq submit", add_help=False)
         for flag in ("--id", "--config", "--workdir"):
             sp.add_argument(flag, default="")
         sp.add_argument("--timeout", type=int, default=0)
+        sp.add_argument("--input", action="append", default=[])
+        sp.add_argument("--cold-start", type=int, default=0)
         sp.add_argument("--no-lint", action="store_true")
         try:
             o, extra = sp.parse_known_args(opts)
@@ -1743,7 +1746,8 @@ def cmd_devq(a) -> None:
             timeout = ceiling
             print(f"devq submit: no --timeout; the job gets the project's device-job ceiling of {ceiling} s")
         spec = {"id": o.id, "config": o.config or o.id, "cmd": rest[0] if len(rest) == 1 else shlex.join(rest),
-                "task": os.environ.get("TTP_TASK", ""), "workdir": o.workdir, "timeout_s": timeout}
+                "task": os.environ.get("TTP_TASK", ""), "workdir": o.workdir, "timeout_s": timeout,
+                "inputs": o.input, "cold_start_s": o.cold_start}
         if not o.no_lint:
             errors, warnings = devq.lint(spec["cmd"], rc, o.id, o.workdir, spec["task"])
             for w in warnings:

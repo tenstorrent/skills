@@ -246,6 +246,16 @@ and preferences you add later become part of the project's charter and memory.
   on the runner's host or not valid shell there (checked over ssh in batch mode, read-only; an
   unreachable host only warns), and warns when a script path, the job id or the workdir names a task
   other than the submitting one. `--no-lint` skips the check.
+  An opt-in job guard, run by the host at submit, keeps a job from harming the host (each part is off
+  until set; `--no-lint` does not skip it): `script_lint` (`"warn"` or `"refuse"`) checks the command
+  and the shell scripts it calls for process-group isolation (`setsid`, plus traps on EXIT, TERM and
+  INT that kill the process group) and for a `df` or `du` guard before downloads or cache writes;
+  `netfs_prefixes` (network-filesystem mount prefixes, none by default) flags weight and cache paths
+  that resolve onto one, symlinks followed without touching anything under the prefixes
+  (`netfs_policy` `"warn"` or `"refuse"`); `disk_max_pct` refuses a submit, and holds queued jobs
+  like a failing health check, while a disk in `disk_paths` (default `/` and the runner's folder) is
+  fuller. A job may declare `--input <path>` (repeatable; must be readable on the host) and
+  `--cold-start <s>` (a warning when it is longer than the job's limit).
   `legacy_driver` (a regex for the command line of the project's old per-task drivers) closes the
   race between the two paths: while one of the user's processes matches it, the runner does not
   start or start a job, and the probe keeps a task with a pending job waiting until it ends.
