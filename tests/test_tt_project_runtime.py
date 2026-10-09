@@ -5545,6 +5545,114 @@ def test_doctor_names_unfenced_providers(env, monkeypatch, capsys):
     assert "unfenced providers" not in capsys.readouterr().out, "uninstalled providers are not named"
 
 
+def _live_ev(**kw):
+    """Evidence from a live check whose runs all went right; `kw` overrides parts of it."""
+    worker = {"exit": {"rc": 0, "launched": True}, "error": "", "session_id": "s1", "assigned_session": "s1",
+              "cost_usd": 0.02, "estimated": False, "tokens": 900, "result": {"status": "done", "fence": "refused"},
+              "steer_word_seen": True}
+    ev = {"login": True, "worker": {**worker, **kw.pop("worker", {})}, "probe_written": False,
+          "steer_delivered": True, "windows": ["5h"], "resume": {"recalled": True},
+          "coordinator": {"structured": {"actions": [{"type": "noop"}]}}}
+    return {**ev, **kw}
+
+
+def test_live_check_judges_every_check_pass_fail_and_unsupported(env):
+    from ttp import live
+    from ttp.providers.fake import Fake
+
+    class Full(Fake):   # every feature the checks look for
+        steer_hook = True
+
+        def write_fence(self):
+            return ""
+
+        def meter(self):
+            return []
+
+    class Bare(Fake):   # none of them
+        def resume_args(self, session_id):
+            return []
+
+    def st(prov, **kw):
+        return {k: v[0] for k, v in live.judge(prov, _live_ev(**kw)).items()}
+
+    full, bare = Full(), Bare()
+    assert set(st(full).values()) == {"pass"} and list(st(full)) == list(live.CHECKS)
+    assert {k for k, v in st(bare).items() if v == "unsupported"} == {"fence", "resume", "steer"}, \
+        "a bare adapter: no fence, resume or hook"
+    assert st(bare, windows=[])["meter"] == "unsupported" and st(full, windows=[])["meter"] == "fail"
+    # launch
+    assert st(full, worker={"exit": {"rc": 1, "launched": True}})["launch"] == "fail"
+    assert st(full, worker={"exit": {"rc": None, "launched": False}})["launch"] == "fail"
+    assert st(full, worker={"error": "boom"})["launch"] == "fail"
+    # login: a status command says yes or no; without one, a run finds out
+    assert st(full, login=None)["login"] == "unsupported" and st(full, login=False)["login"] == "fail"
+    # session
+    assert st(full, worker={"session_id": ""})["session"] == "fail"
+    assert st(full, worker={"session_id": "other"})["session"] == "fail", "not the id assigned up front"
+    assert st(full, worker={"assigned_session": ""})["session"] == "pass"
+    # usage
+    assert st(full, worker={"cost_usd": 0, "tokens": 0})["usage"] == "fail"
+    assert st(full, worker={"cost_usd": 0})["usage"] == "pass"
+    assert "estimated" in live.judge(full, _live_ev(worker={"estimated": True}))["usage"][1]
+    # structured
+    assert st(full, coordinator={"structured": None, "from_text": {"actions": []}})["structured"] == "pass"
+    assert st(full, coordinator={"structured": {"x": 1}, "from_text": None})["structured"] == "fail"
+    assert st(full, coordinator={"skipped": "over budget"})["structured"] == "fail"
+    # fence
+    assert st(full, probe_written=True)["fence"] == "fail"
+    assert st(full, worker={"result": None})["fence"] == "fail"
+    assert st(full, worker={"exit": {"rc": 2}})["fence"] == "fail"
+    # resume
+    assert st(full, resume={"recalled": False})["resume"] == "fail"
+    assert st(full, resume={"skipped": "no session"})["resume"] == "fail"
+    # steer
+    assert st(full, steer_delivered=False)["steer"] == "fail"
+    assert st(full, worker={"steer_word_seen": False})["steer"] == "pass"
+
+
+def test_live_check_runs_through_the_real_launch_path_with_the_fake(env, monkeypatch):
+    from ttp import live
+    sessions = env["tmp"] / "sessions"
+    sessions.mkdir()
+    monkeypatch.setenv("TTP_FAKE_SESSIONS", str(sessions))
+    monkeypatch.setenv("TTP_FAKE_COST", "0.01")
+    monkeypatch.setattr(live, "POLL_S", 0.05)
+    r = live.row("fake", base=env["tmp"] / "live")
+    assert r["available"] and r["spend_usd"] == 0.03, r
+    got = {k: v["status"] for k, v in r["checks"].items()}
+    assert got == {"launch": "pass", "login": "unsupported", "session": "pass", "usage": "pass",
+                   "structured": "pass", "fence": "unsupported", "resume": "fail", "steer": "unsupported",
+                   "meter": "unsupported"}, r
+    assert "did not recall" in r["checks"]["resume"]["note"], "the fake resumes but echoes no word"
+    assert list((env["tmp"] / "live").iterdir()) == [], "the scratch project is removed"
+    text = live.format_row(r)
+    assert text.startswith("fake ") and "resume fail" in text and "spent $0.03" in text
+
+
+def test_live_check_reports_a_missing_or_logged_out_cli_and_exits_0(env, monkeypatch, capsys):
+    from ttp import cli, live
+    from ttp.providers import base, claude
+    monkeypatch.setattr(base.Provider, "available", lambda self: False)
+    monkeypatch.setattr(live, "measure", lambda *a, **k: pytest.fail("nothing runs"))
+    with pytest.raises(SystemExit) as e:
+        cli.main(["doctor", "--live", "codex"])
+    assert e.value.code == 0 and "codex" in capsys.readouterr().out.split(" · ")[0]
+    monkeypatch.setattr(base.Provider, "available", lambda self: True)
+    monkeypatch.setattr(claude.Claude, "login_check", lambda self: False)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["doctor", "--live", "claude", "--json"])
+    r = json.loads(capsys.readouterr().out)
+    assert e.value.code == 0 and not r["available"] and r["reason"].startswith("logged out") and r["checks"] == {}
+    monkeypatch.setattr(base.Provider, "available", lambda self: False)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["doctor", "--live", "cursor"])
+    assert e.value.code == 0 and "not available: not installed" in capsys.readouterr().out
+    with pytest.raises(SystemExit) as e:
+        cli.main(["doctor"])
+    assert e.value.code == 2, "a plain doctor still needs a project"
+
+
 def test_the_runner_removes_private_files_when_the_agent_exits(env, tmp_path):
     run_dir = tmp_path / "run"
     run_dir.mkdir()

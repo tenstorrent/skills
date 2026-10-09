@@ -113,6 +113,9 @@ class Provider:
     # Cache breakpoints the agent itself places on one request, at most (on any call of a run, not
     # only the first): runtime-added marks get what is left of MAX_CACHE_BREAKPOINTS.
     own_cache_breakpoints = 0
+    # Workers get coordinator updates (steer.md) from a hook after each tool call (ttp.hook); without
+    # one, the worker prompt has them read the file between steps.
+    steer_hook = False
 
     def reach_host(self, env: dict | None = None) -> str:
         """The host this provider's runs reach its API at: the base URL's host when its variable is

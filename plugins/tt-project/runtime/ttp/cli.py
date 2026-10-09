@@ -3007,6 +3007,14 @@ def cmd_daemon(a) -> None:
 
 
 def cmd_doctor(a) -> None:
+    if getattr(a, "live", None):
+        # Measures the agent CLI itself, in a scratch project: no project needed, and real spend.
+        from . import live
+        r = live.row(a.live)
+        print(json.dumps(r, indent=1) if a.json else live.format_row(r))
+        sys.exit(1 if any(c["status"] == live.FAIL for c in r["checks"].values()) else 0)
+    if not a.name:
+        die("ttp doctor: name a project, or --live <provider>")
     p = need(a.name, sys.argv[1:])
     from .providers import all_providers
     print(status_text(p))
@@ -3095,7 +3103,7 @@ def main(argv: list[str] | None = None) -> None:
                           ("prune", cmd_prune, "tidy finished tasks' worktrees now (branches are kept)")):
         s = sub.add_parser(name, help=hlp)
         # `ttp status` alone, inside a project's folder (or a run), is that project's status.
-        s.add_argument("name", nargs="?" if name == "status" else None)
+        s.add_argument("name", nargs="?" if name in ("status", "doctor") else None)
         if name == "connect":
             s.add_argument("--chat")
             s.add_argument("--label")
@@ -3105,6 +3113,11 @@ def main(argv: list[str] | None = None) -> None:
             s.add_argument("--dry-run", action="store_true", help="change nothing; list what a sweep would do")
         if name == "logs":
             s.add_argument("--bytes", type=int, default=6000)
+        if name == "doctor":
+            s.add_argument("--live", choices=["claude", "codex", "cursor"], metavar="PROVIDER",
+                           help="measure one agent CLI with real runs in a scratch project (spends up to "
+                           "about $0.55; a missing or logged-out CLI is reported, exit 0)")
+            s.add_argument("--json", action="store_true", help="with --live: the row as JSON")
         s.set_defaults(fn=fn)
 
     s = sub.add_parser("say", help="send a message to the coordinator")
