@@ -386,10 +386,13 @@ def strict_schema(schema):
 
 
 def _nullable(sub: dict) -> dict:
+    # A repeated "null" in `type` (a property already nullable in the source schema) makes the
+    # API reject the whole schema as "invalid schema keyword".
     t = sub.get("type")
     sub = dict(sub)
-    sub["type"] = [*(t if isinstance(t, list) else [t]), "null"] if t else ["null"]
-    if "enum" in sub:
+    types = (t if isinstance(t, list) else [t]) if t else []
+    sub["type"] = types if "null" in types else [*types, "null"]
+    if "enum" in sub and None not in sub["enum"]:
         sub["enum"] = [*sub["enum"], None]
     return sub
 

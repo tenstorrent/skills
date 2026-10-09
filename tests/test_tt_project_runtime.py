@@ -12246,6 +12246,14 @@ def test_codex_coordinator_schema_is_strict_and_its_nulls_are_dropped(env, tmp_p
         assert obj["additionalProperties"] is False and set(obj["required"]) == set(obj["properties"]), obj
     item = strict["properties"]["actions"]["items"]["properties"]
     assert item["type"]["type"] == "string" and "null" in item["title"]["type"]
+    # The API rejects a repeated "null" ("invalid schema keyword"): optional and already nullable.
+    for name, sub in item.items():
+        for key in ("type", "enum"):
+            if isinstance(sub.get(key), list):
+                assert len(sub[key]) == len(set(map(str, sub[key]))), (name, sub)
+    from ttp.providers.codex import strict_schema
+    src = {"type": "object", "properties": {"a": {"type": ["string", "null"], "enum": ["x", None]}}}
+    assert strict_schema(src)["properties"]["a"] == {"type": ["string", "null"], "enum": ["x", None]}
     again, _ = codex.build(role="coordinator", model="", effort="low", cwd=str(tmp_path), budget_usd=1.0,
                            read_only=True, schema=coord.ACTIONS_SCHEMA, restrictions={})
     assert again[again.index("--output-schema") + 1] == path, "each turn must not leave a new temp file"
