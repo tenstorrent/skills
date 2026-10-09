@@ -1924,16 +1924,27 @@ def _same_action(a: set[str], b: set[str]) -> bool:
     return bool(a and b and (a & b or _ANY in a | b or "write" in a and b & _WRITES or "write" in b and a & _WRITES))
 
 
-def _target(sentence: str) -> tuple[set[str], set[str]]:
-    """A rule's (action families, object words), from every word in it: a pull request is opened."""
+# A condition clause ("once CI passes", "after review"), up to the next comma: without an action of its
+# own it says when, not what to ("if workers push to main" does say what to).
+_CONDITION_RE = re.compile(r"\b(?:once|if|when|whenever|after|before|until|unless|provided|while|as soon as|"
+                           r"as long as)\b[^,;:]*", re.I)
+
+
+def _target(sentence: str, conditions: bool = True) -> tuple[set[str], set[str]]:
+    """A rule's (action families, object words), from every word in it: a pull request is opened.
+    Without `conditions`, words of a condition clause name no object (its actions still count)."""
     low = sentence.lower()
     pr = re.search(r"\bprs?\b|\bpull requests?\b", low)
     acts, objs = ({"open"}, {"pr"}) if pr else (set(), set())
+    what = low if conditions else _CONDITION_RE.sub(
+        lambda m: m[0] if any(_ACTIONS.get(_stem(w)) or _ACTIONS.get(w)
+                              for w in re.findall(r"[a-z][a-z0-9-]*[a-z0-9]", m[0])) else " ", low)
     for w in re.findall(r"[a-z][a-z0-9-]*[a-z0-9]", low):
-        s = _stem(w)
-        if fam := _ACTIONS.get(s) or _ACTIONS.get(w):
+        if fam := _ACTIONS.get(_stem(w)) or _ACTIONS.get(w):
             acts |= fam
-        elif len(w) > 2 and w not in _NOT_TARGET and s not in _NOT_TARGET:
+    for w in re.findall(r"[a-z][a-z0-9-]*[a-z0-9]", what):
+        s = _stem(w)
+        if not (_ACTIONS.get(s) or _ACTIONS.get(w)) and len(w) > 2 and w not in _NOT_TARGET and s not in _NOT_TARGET:
             objs.add(s)
     return acts, objs
 
@@ -1942,15 +1953,16 @@ def _overlaps(a: str, b: str, strict: bool = False) -> bool:
     """Whether two rules are about the same thing. For the guard (wide, a false hit costs one
     resend): they name the same action (_same_action) whatever its objects or conditions, or share
     an object word whatever their actions; sharing only a kind of target ("branch") counts only when
-    one of them names nothing else ("Deploying to box A" twice). For the lint (`strict`, a pair is
-    reported on every turn until settled): both name the very same action family, and they share an
-    object word the same way, or one names no object (a rule on the action alone covers every object)."""
-    aa, ao = _target(a)
-    ba, bo = _target(b)
+    one of them names nothing else ("Deploying to box A" twice). For the lint (`strict`, a pair stays
+    in the digest until settled by key): they name the same action (_same_action), and they share an
+    object word the same way, or one names no object outside its conditions (a rule on the action
+    alone, "Pushing is fine once CI passes", covers every object)."""
+    aa, ao = _target(a, conditions=not strict)
+    ba, bo = _target(b, conditions=not strict)
     shared = ao & bo
     on_object = bool(shared - _KINDS or shared and not (ao - _KINDS and bo - _KINDS))
     if strict:
-        return bool(aa & ba) and (not ao or not bo or on_object)
+        return _same_action(aa, ba) and (not ao or not bo or on_object)
     return _same_action(aa, ba) or on_object
 
 

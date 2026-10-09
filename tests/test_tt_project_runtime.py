@@ -4611,11 +4611,19 @@ def test_restriction_pairs_flags_contradicting_restrictions_items_and_only_those
                        ("Never push to main.", "Main may be pushed to by the user alone."),
                        ("Never open pull requests.", "Only the user may open pull requests.")):
         assert pairs(f"- {ban}\n- {allow}\n") == [(ban, allow)], allow
-    # The lint pairs only the very same action (a pair stays in every digest until settled); the
-    # guard (one resend) also takes a generic verb or a shared object with any action.
+    # A generic verb ("modify", "alter", "touch") covers every action and a write covers a push, on the
+    # same target; a lift on the bare action covers every target, whatever its condition ("once CI
+    # passes" names no target).
+    for ban, allow in (("Never modify main.", "Pushing to main is allowed."),
+                       ("Never alter the shared repo.", "Workers may push to the shared repo."),
+                       ("Never touch box-a.", "Rebooting box-a is fine."),
+                       ("Never push to main.", "Pushing is fine once CI passes."),
+                       ("Never push to main.", "Pushing is fine after review and tests pass."),
+                       ("Never push to main.", "When CI passes, pushing is fine.")):
+        assert pairs(f"- {ban}\n", f"{dated}- {allow}\n") == [(ban, allow)], allow
+    # The lint needs an action on both sides; the guard (one resend) also takes a shared object alone.
     for ban, allow in (("Never use a paused device.", "Device pauses are lifted only on the user's explicit word."),
-                       ("Never use a paused device.", "Only the user lifts device pauses."),
-                       ("Never modify main.", "Pushing to main is allowed.")):
+                       ("Never use a paused device.", "Only the user lifts device pauses.")):
         assert pairs(f"- {ban}\n- {allow}\n") == [] and _overlaps(ban, allow), allow
     # No false positives: the ban names its exception; another target (branch, box, repo); another
     # action on the same target; one item stating its own exception in a second sentence; a real
@@ -4626,6 +4634,7 @@ def test_restriction_pairs_flags_contradicting_restrictions_items_and_only_those
                  "- Never modify the shared folder of project B.\n- Pushing to branch team/project-a is allowed.\n",
                  "- Never reboot box A.\n- Running jobs on box A is allowed.\n",
                  "- Never merge.\n- Pushing hotfixes to the main branch is allowed.\n",
+                 "- Never push to main.\n- Pushing to the docs repo is fine once CI passes.\n",
                  "- Never push to main. Pushing tags to main is allowed.\n",
                  "- Push only to branch dev/x of org/repo. Never push to main. Never open pull requests.\n"
                  "- Keep content generic: no hostnames, internal URLs or credentials.\n"
@@ -4867,7 +4876,7 @@ def test_a_charter_conflicts_pair_settles_as_both_holding_by_its_key(env):
                "## Goals\nShip v1.\n")
     p.charter_path.write_text(charter)
     found = coord.charter_conflicts(p)
-    assert 1 <= len(found) <= 3, found   # high-recall, but not a flood
+    assert 1 <= len(found) <= 3, found   # high-recall, but not a flood (live charters: 3 to 7 pairs)
     trig, seen = coord.effort_triggers(db, cfg, [], None, [], None, conflicts=found)
     assert trig == ["charter conflict"]
     db.set_kv(coord.EFFORT_SEEN_KEY, seen)
