@@ -1,7 +1,7 @@
 """What a stuck task waits on, in plain words, for the web board, `ttp status` and the relay.
 
-A task blocked on the user (an open ask that names it, or a `waits:user:...` label) belongs under
-'Waiting on you'. Every other stuck task is the project's to move: it waits on a resource, budget,
+A task blocked on the user (an open ask that names it, a `waits:user:...` label, or a coordinator hold
+anchored on an ask, `waits:ask:<id>`) belongs under 'Waiting on you'. Every other stuck task is the project's to move: it waits on a resource, budget,
 a review, the coordinator or a time, and the user is shown that, not asked."""
 from __future__ import annotations
 
@@ -13,10 +13,20 @@ KINDS = ("user", "resource", "budget", "review", "coordinator", "time")
 _WHO = {"user": "you", "resource": "a resource", "budget": "budget", "review": "a review",
         "coordinator": "the coordinator", "time": "a later time"}
 _TEXT_CHARS = 200
+# A coordinator hold's anchor (anchors.py) as the kind it waits on: an ask is the user's, an until a time,
+# a when probe or a resource the project's to watch.
+_ANCHOR_KINDS = {"ask": "user", "until": "time", "when": "resource", "resource": "resource"}
+
+
+def _when_words(probe: str) -> str:
+    """A `when:` hold in plain words, as starts_text says a start_when: never the probe itself."""
+    landed = re.fullmatch(r"landed:#([0-9]+)", probe.strip())
+    return f"#{landed[1]} to land" if landed else "a check to pass"
 
 
 def _label(task: dict) -> tuple[str, str] | None:
-    """The task's `waits:<kind>:<value>` label, when it carries one with a known kind."""
+    """The task's `waits:<kind>:<value>` label, when it carries one with a known kind, a hold's anchor
+    mapped to its kind: (user, 'ask <id>'), (time, epoch), (resource, plain words or the name)."""
     try:
         labels = json.loads(task.get("labels") or "[]")
     except (ValueError, TypeError):
@@ -26,7 +36,21 @@ def _label(task: dict) -> tuple[str, str] | None:
             _, kind, value = (lb.split(":", 2) + [""])[:3]
             if kind in KINDS:
                 return kind, value.strip()
+            if kind in _ANCHOR_KINDS and value.strip():
+                value = value.strip()
+                if kind == "ask":
+                    value = "an ask" if value == "new" else f"ask {value.lstrip('#')}"
+                elif kind == "when":
+                    value = _when_words(value)
+                return _ANCHOR_KINDS[kind], value
     return None
+
+
+def _held_ask(task: dict) -> int | None:
+    """The id of the ask a hold is anchored on (`waits:ask:<id>`), or None."""
+    from .anchors import anchor
+    got = anchor(task)
+    return int(got[1].lstrip("#")) if got and got[0] == "ask" and got[1].lstrip("#").isdigit() else None
 
 
 def _clip(s: str, n: int = _TEXT_CHARS) -> str:
@@ -77,8 +101,13 @@ def wait_kind(task: dict, open_asks: list[dict], now: float | None = None) -> di
     since = float(task.get("updated") or task.get("created") or now)
     linked = asks_for(task["id"], open_asks)
     lab = _label(task)
+    held = _held_ask(task)
+    if held is not None:   # the ask a hold is anchored on counts as the task's, named or not
+        linked += [a for a in open_asks if a.get("id") == held and a not in linked]
     if lab:
         kind, detail = lab
+        if held is not None and linked:
+            since = min(float(a.get("ts") or since) for a in linked)
     elif linked:
         kind, detail = "user", ", ".join(f"ask {a['id']}" for a in linked)
         since = min(float(a.get("ts") or since) for a in linked)

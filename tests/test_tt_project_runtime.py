@@ -32181,6 +32181,41 @@ def test_a_task_an_open_ask_names_waits_on_the_user(env):
     assert f"needs you (#{tid}" not in status_text(p)
 
 
+_UNTIL = 2_000_000_000
+
+
+@pytest.mark.parametrize("anchor,kind,text", [
+    ("ask", "user", None),
+    (f"until:{_UNTIL}", "time", "waits until " + time.strftime("%Y-%m-%d %H:%M", time.localtime(_UNTIL))),
+    ("when:test -f out/landed.marker", "resource", "waits on a check to pass"),
+    ("when:landed:#41", "resource", "waits on #41 to land"),
+    ("resource:board-a", "resource", "waits on board-a"),
+])
+def test_status_and_web_read_a_hold_anchor_by_its_kind(env, anchor, kind, text):
+    """A coordinator hold (waits:ask/until/when/resource) shows what it waits on, not its free-text
+    reason: an ask is the user's even when its text does not name the task, an until its time, a when
+    plain words and never the probe."""
+    from ttp.cli import status_text
+    from ttp.web import state_payload
+    p = make(env)
+    tid = p.db.add_task("cache layout", "s", origin="user")
+    if anchor == "ask":
+        ask = p.db.post("out", "vendor A or B?", chat=None, kind="ask", severity="high")
+        anchor, text = f"ask:{ask}", f"waits on you: ask {ask}"
+    p.db.update_task(tid, status="blocked", blocked_reason="held by the coordinator: some free text",
+                     labels=["kept", f"waits:{anchor}"])
+    w = next(t for t in state_payload(p, p.db)["tasks"] if t["id"] == tid)["wait"]
+    assert (w["kind"], w["text"]) == (kind, text) and w["age"] == "0.0h", w
+    assert w["asks"] == ([ask] if kind == "user" else []), w
+    assert "free text" not in w["text"] and "test -f" not in w["text"], w
+    out = status_text(p)
+    if kind == "user":
+        assert f"  needs you (#{tid}, 0.0h): cache layout — {text}" in out, out
+        assert "stuck, the project is on it:" not in out, out
+    else:
+        assert f"  #{tid} 0.0h: cache layout — {text}" in out and f"needs you (#{tid}" not in out, out
+
+
 def test_wait_kind_label_wins_and_queued_holds_read_plainly():
     from ttp import waits
     from ttp.daemon import LOGGED_OUT_NOTE, NET_HELD_NOTE, PAUSED_NOTE
