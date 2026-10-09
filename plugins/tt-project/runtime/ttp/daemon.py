@@ -3710,6 +3710,8 @@ class Daemon:
             since = since if isinstance(since, (int, float)) else t["updated"]
             if not since or since >= self.boot_at:
                 continue
+            if self._relaunch_checks(t, prev):
+                continue   # asleep on its retry_when: the same checks run again
             self._probe_rc.pop(t["id"], None)
             counts = self._job_cut_by_reboot(t["id"])
             wakes = _reboot_wakes(t) + int(counts)
@@ -3728,6 +3730,83 @@ class Daemon:
             db.update_task(t["id"], not_before=None, result=dump_result(
                 {**prev, "woke": "the host rebooted", "reboot": {"at": self.boot_at}, "reboot_wakes": wakes}))
             log(self.p, f"task {t['id']} waited from before the reboot; due now")
+
+    def _relaunch_checks(self, t: dict, prev: dict) -> bool:
+        """A task waiting on its own `ttp checks --detach` (retry_when `ttp checks --result <its run
+        dir>`) that the reboot killed: start the same checks again in that run dir, model-free, and
+        keep it asleep on its retry_when. Only while the worktree checks.pid names still exists, holds
+        the head they ran on and has no uncommitted changes to tracked files (untracked ones never
+        count, as for `ttp checks`), at most once per boot per task and max_reboot_losses times per
+        head (checks that take the host down are not started forever). True when the task stays
+        asleep: relaunched now, or already on this boot (a daemon restart). False wakes it as before."""
+        from .cli import CHECKS_RC, _checks_alive, _read_checks_pid
+        db, tid = self.p.db, t["id"]
+        m = re.search(r"\bchecks\s+--result\s+(\S+)", str(prev.get("retry_when") or ""))
+        try:
+            out = Path(shlex.split(m.group(1))[0]) if m else None
+        except ValueError:
+            out = None
+        if not out or not db.one("SELECT id FROM runs WHERE task=? AND dir=?", (tid, str(out))):
+            return False
+        mine = f"checks_relaunched:{tid}:{self.boot}:"
+        if db.one("SELECT id FROM events WHERE fingerprint LIKE ?", (mine + "%",)):
+            return True
+        info = _read_checks_pid(out)
+        wt, head, cmd = info.get("worktree"), info.get("head"), info.get("cmd")
+        if ((out / CHECKS_RC).exists() or not info.get("boot") or info.get("boot") == self.boot
+                or _checks_alive(info) or not wt or not head or not isinstance(cmd, list)):
+            return False
+        same = db.one("SELECT COUNT(*) n FROM events WHERE kind='checks_relaunched' AND task=? AND fingerprint LIKE ?",
+                      (tid, f"checks_relaunched:{tid}:%:{head[:12]}"))
+        if (same or {}).get("n", 0) >= int(self.cfg["budget"].get("max_reboot_losses", 3)):
+            return False
+        why = ""
+        try:
+            if not worktree.is_git(Path(wt)):
+                why = f"its worktree {wt} is gone"
+            elif (now := worktree._git(Path(wt), "rev-parse", "HEAD")) != head:
+                why = f"its worktree moved from {head[:12]} to {now[:12]}"
+            elif worktree._git(Path(wt), "status", "--porcelain", "--untracked-files=no"):
+                why = f"its worktree {wt} has uncommitted changes"
+        except Exception as e:
+            why = f"its worktree could not be read: {e}"
+        if why:
+            log(self.p, f"task {tid}: the reboot killed its checks, not started again: {why}")
+            return False
+        argv = (["--fresh"] if info.get("fresh") else []) + [str(c) for c in cmd]
+        r = self._start_checks(Path(wt), out, f"relaunch-t{tid}", tid, argv)
+        if not r:
+            return False
+        db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
+             (time.time(), "daemon", "checks_relaunched", mine + head[:12], "low",
+              f"#{tid} {t['title']}: the reboot killed its checks on {head[:12]}; started them again in {out}, "
+              f"no model run", "handled", tid))
+        log(self.p, f"task {tid}: the reboot killed its checks; started them again on {head[:12]} ({out})")
+        return True
+
+    def _start_checks(self, path: Path, out: Path, run_id: str, tid: int, extra: list[str]) -> bool:
+        """`ttp checks --detach [extra]` in worktree `path`, writing to `out` as a run's directory,
+        as a worker's run would: the project's venv, `ttp` first, niced like workers."""
+        runtime_dir = str(Path(__file__).resolve().parent.parent)
+        bin_path = f"{service_path()}:{os.environ.get('PATH', '')}"
+        venv = worktree.project_venv(self.p, path)
+        venv_vars = worktree.venv_env(venv, bin_path) if venv else {}
+        env = {**os.environ, **venv_vars, "TTP_RUN_DIR": str(out), "TTP_PROJECT": str(self.p.base),
+               "TTP_RUN_ID": run_id, "TTP_TASK": str(tid), "PYTHONPATH": runtime_dir,
+               "PATH": f"{self.p.harness / 'bin'}:{venv_vars.get('PATH', bin_path)}"}
+        level = nice_level(self.cfg.get("runner"))[0]
+        argv = (["nice", "-n", str(level)] if level else []) + [sys.executable, "-m", "ttp", "checks", "--detach", *extra]
+        try:
+            out.mkdir(parents=True, exist_ok=True)
+            r = subprocess.run(argv, cwd=path, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                               timeout=PROBE_TIMEOUT_S)
+        except (OSError, subprocess.SubprocessError) as e:
+            log(self.p, f"task {tid}: checks not started: {e}")
+            return False
+        if r.returncode:
+            log(self.p, f"task {tid}: checks not started: {(r.stderr or r.stdout).strip()[:300]}")
+            return False
+        return True
 
     def _job_cut_by_reboot(self, tid: int) -> bool:
         """Whether the abrupt reboot behind this boot cut short a detached job of task tid: one its
@@ -4181,25 +4260,7 @@ class Daemon:
         base = self.p.state / PRECHECKS_DIR
         self._prune_prechecks(base)
         out = base / f"t{task['id']}-{full[:12]}"
-        runtime_dir = str(Path(__file__).resolve().parent.parent)
-        bin_path = f"{service_path()}:{os.environ.get('PATH', '')}"
-        venv = worktree.project_venv(self.p, path)
-        venv_vars = worktree.venv_env(venv, bin_path) if venv else {}
-        # As a reviewer's run would: the project's venv, `ttp` first, niced like workers.
-        env = {**os.environ, **venv_vars, "TTP_RUN_DIR": str(out), "TTP_PROJECT": str(self.p.base),
-               "TTP_RUN_ID": f"precheck-t{task['id']}", "TTP_TASK": str(task["id"]), "PYTHONPATH": runtime_dir,
-               "PATH": f"{self.p.harness / 'bin'}:{venv_vars.get('PATH', bin_path)}"}
-        level = nice_level(self.cfg.get("runner"))[0]
-        argv = (["nice", "-n", str(level)] if level else []) + [sys.executable, "-m", "ttp", "checks", "--detach"]
-        try:
-            out.mkdir(parents=True, exist_ok=True)
-            r = subprocess.run(argv, cwd=path, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                               timeout=PROBE_TIMEOUT_S)
-        except (OSError, subprocess.SubprocessError) as e:
-            log(self.p, f"task {task['id']}: checks not started for its review: {e}")
-            return None
-        if r.returncode:
-            log(self.p, f"task {task['id']}: checks not started for its review: {(r.stderr or r.stdout).strip()[:300]}")
+        if not self._start_checks(path, out, f"precheck-t{task['id']}", task["id"], []):
             return None
         log(self.p, f"task {task['id']}: started the checks on {full[:12]} for its review ({out})")
         return out

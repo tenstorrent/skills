@@ -18277,6 +18277,126 @@ def test_three_boot_time_wakes_of_a_waiting_task_block_it(env):
     assert ev and ev[-1]["severity"] == "high" and ev[-1]["status"] == "queued", ev
 
 
+def _checks_killed_by_reboot(p, tmp_path, tid, boot="an-earlier-boot"):
+    """Task tid waits on its own `ttp checks --detach` in a clean git worktree; the reboot behind
+    `boot` killed them (checks.pid of that boot, a dead pid, no checks.rc)."""
+    from ttp import cli
+    wt = tmp_path / f"wt-{tid}"
+    if not wt.exists():
+        wt.mkdir()
+        _git_out(wt, "init", "-q")
+        (wt / "app.py").write_text("x = 1\n")
+        _git_out(wt, "add", ".")
+        _git_out(wt, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "c")
+    head = _git_out(wt, "rev-parse", "HEAD").strip()
+    run_dir = p.runs / f"checks-{tid}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / cli.CHECKS_RC).unlink(missing_ok=True)
+    (run_dir / cli.CHECKS_PID).write_text(json.dumps(
+        {"pid": 999999, "started": "gone", "ts": time.time() - 900, "boot": boot, "worktree": str(wt),
+         "head": head, "cmd": ["--", "test -f app.py"], "fresh": True}))
+    if not p.db.one("SELECT id FROM runs WHERE task=? AND dir=?", (tid, str(run_dir))):
+        p.db.x("INSERT INTO runs(task,role,provider,started,ended,status,dir,boot_id) VALUES(?,?,?,?,?,?,?,?)",
+               (tid, "worker", "fake", time.time() - 1800, time.time() - 900, "ok", str(run_dir), boot))
+    p.db.update_task(tid, status="queued", not_before=time.time() + 3600, result=json.dumps(
+        {"status": "waiting", "summary": "checks running", "retry_after_s": 3600,
+         "retry_when": f"ttp checks --result {run_dir}", "waiting_since": time.time() - 900,
+         "on_pass": {"status": "done", "summary": "checks passed"}}))
+    return wt, run_dir
+
+
+def _relaunches(p, tid):
+    return p.db.q("SELECT * FROM events WHERE kind='checks_relaunched' AND task=?", (tid,))
+
+
+def test_checks_a_reboot_killed_start_again_without_a_model_run(env, tmp_path):
+    from ttp import cli
+    from ttp.daemon import Daemon
+    p = make(env)
+    tid = p.db.add_task("feature", "s", kind="code", tier="light", origin="user")
+    wt, run_dir = _checks_killed_by_reboot(p, tmp_path, tid)
+    d = Daemon(p.base)
+    d.boot_at = time.time() - 300
+    d.wake_after_reboot()
+    t = p.db.task(tid)
+    assert t["not_before"] and "woke" not in json.loads(t["result"]), "the task was woken for a model run"
+    (ev,) = _relaunches(p, tid)
+    assert ev["status"] == "handled" and ev["severity"] == "low", dict(ev)
+    assert _wait_precheck(run_dir) == "0", (run_dir / cli.CHECKS_OUT).read_text()
+    info = cli._read_checks_pid(run_dir)
+    assert info["boot"] == d.boot and info["worktree"] == str(wt) and info["fresh"] is True, info
+    assert "$ test -f app.py" in (run_dir / "checks.log").read_text(), "not the same checks"
+    # A daemon restart on the same boot starts nothing more and wakes nothing, even with them dead again.
+    _checks_killed_by_reboot(p, tmp_path, tid)
+    d2 = Daemon(p.base)
+    d2.boot, d2.boot_at = d.boot, d.boot_at
+    d2.wake_after_reboot()
+    assert len(_relaunches(p, tid)) == 1 and not (run_dir / cli.CHECKS_RC).exists()
+    assert p.db.task(tid)["not_before"], "a daemon restart woke the task"
+    # The next boot may start them once more.
+    d3 = Daemon(p.base)
+    d3.boot, d3.boot_at = "a-later-boot", time.time() - 60
+    d3.wake_after_reboot()
+    assert len(_relaunches(p, tid)) == 2
+    assert _wait_precheck(run_dir) == "0"
+
+
+def test_checks_a_reboot_killed_are_not_restarted_on_a_moved_or_dirty_worktree(env, tmp_path):
+    from ttp import cli
+    from ttp.daemon import Daemon
+
+    def boot(tid):
+        d = Daemon(p.base)
+        d.boot_at = time.time() - 300
+        d.wake_after_reboot()
+        t = p.db.task(tid)
+        return t["not_before"] is None and json.loads(t["result"]).get("woke") == "the host rebooted"
+
+    p = make(env)
+    moved = p.db.add_task("moved", "s", kind="code", tier="light", origin="user")
+    wt, run_dir = _checks_killed_by_reboot(p, tmp_path, moved)
+    (wt / "b.py").write_text("y = 2\n")
+    _git_out(wt, "add", ".")
+    _git_out(wt, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "later")
+    assert boot(moved), "checks of a moved head were started, not the task woken"
+    dirty = p.db.add_task("dirty", "s", kind="code", tier="light", origin="user")
+    wt, run_dir2 = _checks_killed_by_reboot(p, tmp_path, dirty)
+    (wt / "app.py").write_text("x = 3\n")
+    (run_dir2 / "untracked.txt").write_text("")
+    assert boot(dirty), "checks on a dirty tree were started"
+    gone = p.db.add_task("gone", "s", kind="code", tier="light", origin="user")
+    wt, _ = _checks_killed_by_reboot(p, tmp_path, gone)
+    shutil.rmtree(wt)
+    assert boot(gone), "checks in a removed worktree were started"
+    # Untracked files alone do not count, as for `ttp checks` itself.
+    fine = p.db.add_task("untracked", "s", kind="code", tier="light", origin="user")
+    wt, run_dir3 = _checks_killed_by_reboot(p, tmp_path, fine)
+    (wt / "notes.txt").write_text("")
+    assert not boot(fine) and len(_relaunches(p, fine)) == 1
+    assert _wait_precheck(run_dir3) == "0"
+    # An old checks.pid that names no worktree, head or boot: woken as before.
+    old = p.db.add_task("old", "s", kind="code", tier="light", origin="user")
+    _, run_dir4 = _checks_killed_by_reboot(p, tmp_path, old)
+    (run_dir4 / cli.CHECKS_PID).write_text(json.dumps({"pid": 999999, "started": "gone", "ts": 1}))
+    assert boot(old)
+    assert not any(_relaunches(p, x) for x in (moved, dirty, gone, old))
+
+
+def test_checks_a_reboot_killed_start_again_at_most_max_reboot_losses_times_per_head(env, tmp_path):
+    from ttp.daemon import Daemon
+    p = make(env)
+    tid = p.db.add_task("crashy", "s", kind="code", tier="light", origin="user")
+    for i in range(4):
+        _, run_dir = _checks_killed_by_reboot(p, tmp_path, tid, boot=f"boot-{i}")
+        d = Daemon(p.base)
+        d.boot, d.boot_at = f"boot-{i + 1}", time.time() - 300
+        d.wake_after_reboot()
+        if i < 3:
+            assert _wait_precheck(run_dir) == "0"
+    assert len(_relaunches(p, tid)) == 3
+    assert p.db.task(tid)["not_before"] is None, "checks that keep dying with the host were started forever"
+
+
 def test_boot_time_wakes_and_reboot_losses_count_together(env, tmp_path):
     p = make(env)
     from ttp.daemon import Daemon

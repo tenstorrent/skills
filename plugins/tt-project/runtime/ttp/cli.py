@@ -1218,7 +1218,7 @@ def cmd_checks(a) -> None:
         die("ttp checks: commit first; the checks are recorded for a commit, and this worktree has changes")
     tree = subprocess.run([*git, "rev-parse", "HEAD^{tree}"], capture_output=True, text=True).stdout.strip()
     if a.detach:
-        _checks_detach(a, Path(run_dir), p)
+        _checks_detach(a, Path(run_dir), p, top, head)
         return
     log = Path(run_dir) / "checks.log"
     passed, failed = True, None
@@ -1337,12 +1337,14 @@ def _read_checks_pid(run_dir: Path) -> dict:
     return info if isinstance(info, dict) else {}
 
 
-def _checks_detach(a, run_dir: Path, p: Project | None) -> None:
+def _checks_detach(a, run_dir: Path, p: Project | None, top: str = "", head: str = "") -> None:
     """Start `ttp checks` in a session of its own. It writes checks.rc however it ends (a stop by
     TERM, HUP or INT included); the printed `--result` probe also wakes the task when it was killed
-    outright. This run's earlier detached checks are stopped first, so nobody needs `pkill`."""
+    outright. This run's earlier detached checks are stopped first, so nobody needs `pkill`.
+    checks.pid also keeps the worktree, head and command, so the daemon can start the same checks
+    again, model-free, after a reboot killed them (Daemon._relaunch_checks)."""
     from . import push
-    from .runner import proc_start
+    from .runner import boot_id, proc_start
     old = _read_checks_pid(run_dir)
     if _checks_alive(old):
         try:
@@ -1364,7 +1366,9 @@ def _checks_detach(a, run_dir: Path, p: Project | None) -> None:
                                   *(["--fresh"] if a.fresh else []), *a.cmd],
                                  cwd=Path.cwd(), env=env, stdin=subprocess.DEVNULL, stdout=out,
                                  stderr=subprocess.STDOUT, start_new_session=True)
-    write_json(run_dir / CHECKS_PID, {"pid": child.pid, "started": proc_start(child.pid), "ts": time.time()})
+    write_json(run_dir / CHECKS_PID, {"pid": child.pid, "started": proc_start(child.pid), "ts": time.time(),
+                                      "boot": boot_id(), "worktree": top, "head": head, "cmd": list(a.cmd),
+                                      "fresh": bool(a.fresh)})
     print(f"ttp checks: started in the background (pid {child.pid}); output in {run_dir / CHECKS_OUT}, "
           f"exit code in {run_dir / CHECKS_RC}")
     print(f"retry_when: {push._own_ttp(p)} checks --result {shlex.quote(str(run_dir))}")
