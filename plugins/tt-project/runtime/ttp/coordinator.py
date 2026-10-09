@@ -969,8 +969,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     replaces = str(a.get("replaces") or "")
                     ok, no_ok = (None, "") if user_turn else _charter_approval(p, section, quote, replaces, text)
                     text = ok["text"].strip() if ok else text   # the words the user said yes to
-                    if text and not (quote or replaces or a.get("both_hold")):
-                        _reject_contradicting_append(p, section, text, user_turn, messages, ok)
+                    # an edit without the user's word is refused below anyway, and says so
+                    if text and not (replaces or a.get("both_hold") or quote and not (user_turn or ok)):
+                        _reject_contradicting_append(p, section, text, user_turn, messages, ok, quote)
                     try:
                         target, extra, retired = _charter_update(p, section, text, quote, replaces, key,
                                                                  user_turn or ok is not None, over, end, no_ok)
@@ -1875,89 +1876,15 @@ def charter_lint(p: Project) -> list[str]:
     return out
 
 
-# Words that join two clauses: the subject of "No ... may" never runs across one (_NO_SUBJECT), and the
-# guard judges each clause on its own (_clauses).
-_JOINS = ("and", "or", "so", "then", "but", "yet", "while", "because", "since", "now", "if", "when", "once",
-          "after", "before", "until", "as", "though", "although", "unless", "whereas", "where", "whenever",
-          "hence", "thus", "therefore")
-_CLAUSE_SPLIT_RE = re.compile(rf"[,;:—–]|\s-+\s|(?<![\w'’-])(?:{'|'.join(_JOINS)})(?![\w'’-])", re.I)
-# Contradicting Restrictions items (restriction_pairs, _append_conflicts). A permission said with a
-# negation ("is not allowed", "may not", "may never"), or given to no one ("No worker may", "Nobody may",
-# "None of the agents are allowed to", but not "Nobody but the user may", nor "No restriction remains
-# and workers may", whose "no" ends with its clause), forbids; "no longer forbidden" allows. Inside
-# the subject "and"/"or" join two nouns only when an actor noun heads it, right after "No" or after
-# "other" or one plain adjective ("No worker or agent may", "No workers and no tasks may", "No user or
-# other bot may"): anywhere else ("No review by a maintainer and agents may") they open a new clause.
-_SUBJECT_NOUN = (r"(?:worker|agent|task|job|bot|user|owner|maintainer|human|admin|operator|coordinator|reviewer|"
-                 r"team|lead|person|people|one|body|tool|script|process|service|subagent|contributor|developer)s?")
-_SUBJECT_WORD = (rf"(?!(?:but|except|save|besides|apart|beyond|than|{'|'.join(_JOINS)})(?![\w'’-]))\w[\w'-]*")
-_NOT_ADJECTIVE = (r"(?:by|from|for|of|with|without|within|to|in|into|on|onto|at|about|under|over|via|through|"
-                  r"per|against|among|between|toward|towards|upon|across|behind|beside|near|off|out|up|down|"
-                  r"around|like|the|a|an|any|this|that|these|those|our|your|their|my|its|his|her|every|each|"
-                  r"some|all|no)(?![\w'’-])")
-_NO_SUBJECT = (rf"(?:(?:\s+(?!{_NOT_ADJECTIVE}){_SUBJECT_WORD})?\s+{_SUBJECT_NOUN}\s+(?:and|or)\s+(?:no\s+)?"
-               rf"(?:other\s+)?\w[\w'-]*(?![\w'’-])(?:\s+{_SUBJECT_WORD}){{0,2}}?|(?:\s+{_SUBJECT_WORD}){{0,4}}?)"
-               r"\s+(?:may|can|shall|should|must|will|(?:is|are)\s+(?:allowed|permitted)\s+to)\b")
-_NEG_PERMIT_RE = re.compile(r"\b(?:not|never)\s+(?:be\s+)?(?:allowed|permitted|fine|ok(?:ay)?)\b|\b(?:may|can)(?:\s*not|\s+never)\b|"
-                            r"n't\s+(?:be\s+)?(?:allowed|permitted|fine)\b|"
-                            rf"(?:^|(?<=[,;:(]))\s*(?:no|nobody|none)\b{_NO_SUBJECT}", re.I)
-_NO_LONGER_BANNED_RE = re.compile(r"\bno longer\s+(?:forbidden|prohibited|banned|off[- ]limits|restricted)\b", re.I)
-_FORBIDS_RE = re.compile(r"\b(?:never|do not|does not|must not|cannot|forbidden|prohibited|banned|no(?! longer\b))\b"
-                         r"|\b(?:don|doesn|mustn|can)'t\b", re.I)
-_ALLOWS_RE = re.compile(r"\b(?:allowed|permitted|may|(?:is|are)(?:\s+(?:also|still|now|again|just))*\s+(?:fine|ok(?:ay)?)|"
-                        r"fine to|ok(?:ay)? to|lift(?:s|ed)?|can now|no longer)\b", re.I)
-# For the guard (_append_conflicts), a bare "can" not negated is a permission too ("workers can push").
-_CAN_RE = re.compile(r"\bcan\b(?!\s*(?:not|never)\b|\s+no\s+longer\b|['’]t\b)", re.I)
-# For the lint (restriction_pairs), a permission inside a conditional clause ("where PRs are allowed",
-# "once allowed", "if ... is ever allowed") lifts nothing. Nor does one whose "only"/"alone" names who
-# may act ("Only the user may ...", "the user alone may ...", "allowed for the user only", "by the user
-# alone") or whose word it waits for ("lifted only on the user's word", "may only be lifted by the
-# user"), with that "only" next to the permission word: with the action between them it is a
-# conditional lift ("may push to main only when the user says so"). Any other "only"/"alone" scopes a
-# lift and leaves it one ("allowed for hotfixes only", "Only pushing to main is allowed", "main alone",
-# "allowed only for hotfixes"): when in doubt, flag. The applier guard (_append_conflicts) makes no
-# such exemption.
-_PERMIT = r"(?:allowed|permitted|lift(?:s|ed)?|may|fine|ok(?:ay)?)"
-_CONDITIONAL_PERMIT_RE = re.compile(r"\b(?:where|once|if|when|whenever|until|unless|provided|as long as)\b"
-                                    rf"[^,.;:!?()]*?\b{_PERMIT}\b", re.I)
-# An actor: a pronoun or a generic actor noun, after at most a determiner or possessive. A closed
-# list, so a gerund, an action or a scope ("pushing", "release tags", "the docs repo") is never one.
-_ACTOR = (r"(?:(?:the|a|an|this|that|these|those|our|your|their|my|its)\s+)?(?:i|we|you|they|me|us|them|"
-          r"(?:user|owner|maintainer|human|admin|operator|coordinator|reviewer|team|lead)s?)(?![\w-])")
-_ACTORS = rf"{_ACTOR}(?:\s+or\s+{_ACTOR})*"
-_IN_CLAUSE = r"(?:(?!\b(?:and|but)\b)[^,.;:!?()])*?"   # words of one clause: no stop, no "and"/"but"
-# Words that may stand between a permission word and its "only" or "for <actor>" ("may be lifted only
-# by", "allowed again only when"): no action, object or gerund.
-_FILLERS = rf"(?:\s+(?:be|been|again|ever|also|still|now|{_PERMIT})\b)*"
-_LIMITED_PERMIT_RE = re.compile(
-    rf"(?:\bonly\s+{_ACTORS}(?!['’])|\b{_ACTORS}\s+alone)\s+(?:(?:is|are|can)\s+)?{_PERMIT}\b"
-    rf"(?:{_IN_CLAUSE}\b{_PERMIT}\b)*"
-    rf"|\b{_PERMIT}\b(?:{_IN_CLAUSE}\bby|{_FILLERS}\s+for)\s+{_ACTORS}\s+(?:only|alone)\b"
-    rf"|\b(?:{_PERMIT}{_FILLERS}\s+only|only{_FILLERS}\s+{_PERMIT}){_FILLERS}\s+"
-    rf"(?:(?:on|upon|with)\s+{_ACTORS}['’]s?(?!\w)|(?:after|when|if|once)\s+{_ACTORS}"
-    rf"|(?:by|for|to)\s+{_ACTORS}(?=\s*(?:[,.;:!?()]|\b(?:and|but)\b|$)))", re.I)
-# The words after which a rule's main verb comes ("never push", "may run", "allowed to merge"), and
-# words skipped before it ("never directly push"). A "no" giving its subject a modal ("No worker may
-# push") is no stance word: the modal is.
-_MAIN_VERB_RE = re.compile(r"\b(?:never|do not|does not|must not|cannot|(?:don|doesn|mustn|can)'t|"
-                           rf"no(?!{_NO_SUBJECT})|may|can now|"
-                           r"(?:allowed|permitted|fine|ok(?:ay)?) to)\s+((?:[\w-]+\s*(?:,|\bor\b|\band\b)?\s*)+)", re.I)
-# Who acts, or who lets them, before the verb ("may workers push", "may let agents push"): never an
-# action, and never what a rule is about (_rule_target).
-_ACTOR_SKIP = {"let", "worker", "workers", "agent", "agents", "i", "we", "you", "they", "me", "us", "them"}
-_VERB_SKIP = {"ever", "again", "be", "a", "an", "the", "any", "longer", "even", "yet", "now", "also", "just",
-              "still"} | _ACTOR_SKIP
-# A verb by which someone lets or makes workers act ("tell workers to push", "have agents open", "allow
-# tasks to merge"): the workers' verb is the rule's action (_main_verbs), and the workers act (_rule_actors).
-_CAUSATIVE = {"let", "allow", "permit", "enable", "authorize", "authorise", "tell", "ask", "have", "get", "make",
-              "instruct", "direct", "order"}
-_CAUSEE_DET = {"the", "a", "an", "any", "all", "other", "each", "every", "its", "their", "our", "your", "my"}
-# The subject of an inverted "may" ("Only after review may the coordinator push"), skipped before its verb.
-_ACTOR_NOUNS = {w + s for w in ("user", "owner", "maintainer", "human", "admin", "operator", "coordinator",
-                                 "reviewer", "team", "task", "job", "bot") for s in ("", "s")}
-_INVERTED_SKIP = {"this", "that", "these", "those", "our", "your", "their", "my", "its"} | _ACTOR_NOUNS
-# A passive helper verb ("may be done"): the action is the sentence's subject ("Pushing to main").
-_PASSIVE_VERBS = {"done", "performed", "carried", "made"}
+# Contradicting Restrictions items (restriction_pairs, _append_conflicts), by one coarse rule
+# (_overlaps): two rules overlap when they share what they do and what to, whatever their stance,
+# condition or scope. A false hit costs one resend or rewrite; a miss leaves a stale ban that workers obey.
+# A word that bans, or one that permits, anywhere in a sentence, for the lint's report: negations,
+# conditions and scopes are not read.
+_BAN_RE = re.compile(r"\b(?:never|not|no|nobody|none|only|must|cannot|without|forbid\w*|prohibit\w*|"
+                     r"ban(?:s|ned)?)\b|n['’]t\b", re.I)
+_PERMIT_RE = re.compile(r"\b(?:allow\w*|permit\w*|may|can|fine|ok(?:ay)?|lift\w*|no longer|"
+                        r"no (?:problem|objection|issue)s?|objects|minds|stops)\b", re.I)
 # An item that names its own exception ("except as the dated section allows") has been reconciled.
 _OWN_EXCEPTION_RE = re.compile(r"\b(?:except|unless|other than|apart from|save for|excluding)\b", re.I)
 # Actions, by what they do. A generic change ("modify", "write") covers every action that changes
@@ -1965,166 +1892,56 @@ _OWN_EXCEPTION_RE = re.compile(r"\b(?:except|unless|other than|apart from|save f
 _ACTIONS = {"push": {"push"}, "force-push": {"push"}, "modify": {"write"}, "edit": {"write"},
             "touch": {"write"}, "alter": {"write"}, "writ": {"write"}, "rewrit": {"write"}, "commit": {"write"},
             "merg": {"merge"}, "delet": {"delete"}, "remov": {"delete"},
-            "open": {"open"}, "creat": {"open"}, "deploy": {"deploy"}, "releas": {"deploy"},
-            "publish": {"deploy"}, "install": {"install"}, "upgrad": {"install"}, "run": {"run"},
-            "runn": {"run"}, "us": {"run"}, "start": {"run"}, "submit": {"run"}, "restart": {"stop"},
-            "reboot": {"stop"}, "kill": {"stop"}, "cancel": {"stop"}, "stop": {"stop"}}
+            "open": {"open"}, "creat": {"open"}, "deploy": {"deploy"}, "publish": {"deploy"},
+            "install": {"install"}, "upgrad": {"install"}, "run": {"run"}, "runn": {"run"}, "start": {"run"},
+            "submit": {"run"}, "restart": {"stop"}, "reboot": {"stop"}, "kill": {"stop"}, "cancel": {"stop"},
+            "stop": {"stop"}}
 _WRITES = {"write", "push", "merge", "delete"}
+# Words that are no target: rule, stance, actor and filler words, and verbs that let someone act.
+_NOT_TARGET = {x for w in _RULE_STOP | {
+    "the", "and", "for", "nor", "not", "may", "can", "its", "own", "are", "was", "has", "had", "all", "but", "any",
+    "you", "our", "per", "via", "too", "yet", "one", "off", "keep", "stay", "avoid", "permitt", "fine", "okay",
+    "lift", "forbidden", "prohibit", "bann", "off-limits", "problem", "objection", "objects", "minds", "stops",
+    "nobody", "none", "anyone", "everyone", "someone", "worker", "agent", "task", "user", "owner", "maintainer",
+    "human", "admin", "operator", "coordinator", "reviewer", "let", "tell", "ask", "make", "get", "enable",
+    "instruct", "change", "work", "thing", "anything", "something", "everything", "explicit", "word", "directly",
+    "ever", "pull", "request", "prs"} for x in (w, _stem(w))}
+# Kinds of target: "the main branch" and "the release branch" share only a kind, which is no overlap.
+_KINDS = {_stem(w) for w in ("branch", "repo", "repository", "folder", "directory", "file", "path", "box",
+                             "machine", "node", "host", "server", "service", "project")}
 
 
 def _same_action(a: set[str], b: set[str]) -> bool:
     return bool(a & b or "write" in a and b & _WRITES or "write" in b and a & _WRITES)
 
 
-# Words that name the rule, not its target.
-_STANCE_WORDS = {"allow", "permitt", "fine", "okay", "lift", "forbidden", "prohibit", "bann", "longer", "never",
-                 "off-limit",
-                 "change", "work", "thing", "anything", "something", "everything", "user", "explicit", "word",
-                 "directly", "ever", "any", "pull", "request", "requests",
-                 # kinds of target: "the main branch" and "the release branch" share no target
-                 "branch", "branche", "repo", "repository", "folder", "directory", "file", "path", "box",
-                 "machine", "node", "host", "server", "service", "project"}
-
-_SHORT_STOP = {"the", "and", "for", "not", "may", "can", "its", "own", "are", "was", "has", "had", "all", "but",
-               "any", "you", "our", "per", "via", "now", "too", "yet", "one"}
-
-
-def _unconditional(sentence: str) -> str:
-    """The sentence without its conditional or limited permissions (_CONDITIONAL_PERMIT_RE)."""
-    return _LIMITED_PERMIT_RE.sub(" ", _CONDITIONAL_PERMIT_RE.sub(" ", sentence))
-
-
-def _stance(sentence: str, exempt: bool = True) -> str:
-    """"forbid", "allow", or "" for a sentence that says neither or both. A permission in a conditional
-    or limiting clause (_unconditional) allows nothing, unless `exempt` is off: then every permission
-    word that is not negated allows, a bare "can" too (_CAN_RE)."""
-    s = _NO_LONGER_BANNED_RE.sub(" allowed ", _NEG_PERMIT_RE.sub(" never ", sentence))
-    s = _unconditional(s) if exempt else s
-    forbids = bool(_FORBIDS_RE.search(s))
-    allows = bool(_ALLOWS_RE.search(s) or not exempt and _CAN_RE.search(s))
-    return "forbid" if forbids and not allows else "allow" if allows and not forbids else ""
-
-
-def _causee(words: list[str], i: int) -> int:
-    """How many of `words` from i on are a causative verb with workers as its object, and the "to"
-    after them ("tell workers to", "have the agents", "allow tasks to"); 0 when none starts at i."""
-    if words[i].lower() not in _CAUSATIVE:
-        return 0
-    j = i + 1
-    while j < len(words) and words[j].lower() in _CAUSEE_DET:
-        j += 1
-    k = j
-    while k < len(words) and words[k].lower() in _WORKER_ACTORS:
-        k += 1
-    return 0 if k == j else k - i + (k < len(words) and words[k].lower() == "to")
-
-
-def _main_verbs(sentence: str) -> set[str] | None:
-    """The action families of a rule's main verb, the one after its stance word ("never disturb",
-    "may run", "allowed to merge"), with the verbs joined to it ("never touch or push"); a verb that
-    is no known action is its own family. None when no stance word is followed by a verb ("Pushing
-    to main is allowed"). A participle used as a modifier ("running jobs") is never the action, and
-    a verb that lets or makes workers act is not either: theirs is ("may tell workers to push")."""
-    m = _MAIN_VERB_RE.search(sentence)
-    if not m:
-        return None
-    acts: set[str] = set()
-    inverted = m.group(0).lower().startswith("may")
-    words = re.split(r"\s*(?:,|\bor\b|\band\b)\s*|\s+", m.group(1))
-    lead = 0
-    for i, word in enumerate(words):
-        w = word.lower()
-        if i < lead or not w or w in _VERB_SKIP \
-                or (w.endswith("ly") or inverted and (w in _INVERTED_SKIP or word[0].isupper())) and not acts:
-            continue
-        if not acts and (n := _causee(words, i)):
-            lead = i + n
-            continue
-        if w in ("pr", "prs", "pull"):
-            return {"open"}
-        if not acts and (w in _STANCE_WORDS or _stem(w) in _STANCE_WORDS or w in _PASSIVE_VERBS):
-            return None   # "is never allowed", "no longer forbidden": the stance, not a verb
-        fam = _ACTIONS.get(_stem(w)) or _ACTIONS.get(w)
-        if not fam:
-            return acts or {_stem(w)}
-        acts |= fam
-    return acts or None
-
-
-def _rule_target(sentence: str) -> tuple[set[str], set[str]]:
-    """A rule's (action families, object words): what it does (its main verb, _main_verbs, else every
-    action word), and what to (a branch, path, repo, box). A verb that lets or makes workers act ("tell
-    workers to") is neither."""
-    words = re.findall(r"[a-z0-9][\w./-]*[a-z0-9]|[a-z0-9]", sentence.lower().replace("'s ", " "))
-    main = _main_verbs(sentence)
-    acts: set[str] = set(main or ())
-    objs: set[str] = set()
-    lets = {k for i in range(len(words)) for k in range(i, i + _causee(words, i))}
-    for i, w in enumerate(words):
-        if i in lets:
-            continue
-        if w in ("pr", "prs") or w == "pull" and "pull request" in sentence.lower():
-            if main is None:
-                acts.add("open")   # "open a PR", "no PRs": the action is opening one
-            continue
-        stem = _stem(w)
-        fam = _ACTIONS.get(stem) or _ACTIONS.get(w)
-        if fam:
-            if main is None:
-                acts |= fam
-        elif (len(w) >= 3 or "/" in w or w.isdigit()) and w not in _RULE_STOP and stem not in _STANCE_WORDS \
-                and w not in _STANCE_WORDS and w not in _SHORT_STOP and w not in _ACTOR_SKIP:
-            objs.add(stem)
+def _target(sentence: str) -> tuple[set[str], set[str]]:
+    """A rule's (action families, object words), from every word in it: a pull request is opened."""
+    low = sentence.lower()
+    pr = re.search(r"\bprs?\b|\bpull requests?\b", low)
+    acts, objs = ({"open"}, {"pr"}) if pr else (set(), set())
+    for w in re.findall(r"[a-z][a-z0-9-]*[a-z0-9]", low):
+        s = _stem(w)
+        if fam := _ACTIONS.get(s) or _ACTIONS.get(w):
+            acts |= fam
+        elif len(w) > 2 and w not in _NOT_TARGET and s not in _NOT_TARGET:
+            objs.add(s)
     return acts, objs
 
 
-# Who a rule binds or lets act, by the words before its main verb (_rule_actors): workers, agents and
-# tasks are one actor.
-_WORKER_ACTORS = {"worker", "workers", "agent", "agents", "task", "tasks"}
-_SUBJECT_ACTORS = _WORKER_ACTORS | _ACTOR_NOUNS
-
-
-def _rule_actors(sentence: str) -> set[str]:
-    """Who a rule is about: the actor nouns before its main verb ("Workers must not push", "Never let
-    agents open", "The coordinator may push", "may the coordinator push", "may tell workers to push"),
-    workers, agents and tasks as "worker". Empty when it names none before the verb ("Never push",
-    "Pushing is allowed")."""
-    m = _MAIN_VERB_RE.search(sentence)
-    if not m:
-        return set()
-    head = re.findall(r"[a-z]+", sentence[:m.start(1)].lower())
-    rest = re.findall(r"[\w-]+", m.group(1).lower())
-    i = 0
-    while i < len(rest) and (rest[i] in _VERB_SKIP or rest[i] in _INVERTED_SKIP or _causee(rest, i)):
-        n = _causee(rest, i) or 1
-        head += rest[i:i + n]
-        i += n
-    return {"worker" if w in _WORKER_ACTORS else w.rstrip("s") for w in head if w in _SUBJECT_ACTORS}
-
-
-def _contradicts(forbid: str, allow: str, exempt: bool = True) -> bool:
-    """Whether a forbidding rule and an allowing one are about the same thing: their objects overlap
-    (at least half of the smaller set) and, when both name an action, it is the same one (_same_action);
-    or the forbidding rule names no object (a blanket ban) and the actions are the same. A general
-    allowance next to a ban on one object is that ban's exception, not a conflict. A forbidding rule that names its own exception
-    ("except as ... allows") is reconciled and never conflicts. A ban on workers ("Workers must not
-    push", "Never let agents open PRs") does not bind another actor the allowance names instead ("The
-    coordinator may push"), unless `exempt` is off or the allowance names workers anywhere ("The user
-    may allow workers to push", "... and let workers do so too"); a ban naming no actor, or an
-    allowance naming none, binds everyone."""
-    if _OWN_EXCEPTION_RE.search(forbid):
+def _overlaps(a: str, b: str) -> bool:
+    """Whether two rules are about the same thing: when both name an action it is the same one
+    (_same_action), and they share an object word, or one names no object (a rule on the action
+    alone covers every object). Sharing only a kind of target ("branch") counts only when one of
+    them names nothing else ("Deploying to box A" twice)."""
+    aa, ao = _target(a)
+    ba, bo = _target(b)
+    if aa and ba and not _same_action(aa, ba):
         return False
-    if (exempt and _rule_actors(forbid) & {"worker"} and _rule_actors(allow)
-            and not _WORKER_ACTORS & set(re.findall(r"[a-z]+", allow.lower()))):
-        return False
-    fa, fo = _rule_target(forbid)
-    aa, ao = _rule_target(allow)
-    if fa and aa and not _same_action(fa, aa):
-        return False
-    if not fo:   # a blanket ban on an action contradicts any allowance of it
-        return _same_action(fa, aa)
-    shared = fo & ao
-    return bool(shared) and 2 * len(shared) >= min(len(fo), len(ao))
+    if not ao or not bo:
+        return bool(aa and ba)
+    shared = ao & bo
+    return bool(shared - _KINDS or shared and not (ao - _KINDS and bo - _KINDS))
 
 
 def _restriction_items(charter: str) -> list[tuple[str, str, int]]:
@@ -2151,68 +1968,24 @@ def _restriction_items(charter: str) -> list[tuple[str, str, int]]:
     return out
 
 
-# For the lint, "can" before an action ("workers can push") is a permission in a ban's clauses
-# (_lint_readings); before anything else ("what the harness can do itself") it is ability.
-_CAN_ACT_RE = re.compile(r"\bcan(?=(?:\s+(?:also|still|just|always|freely|even))*\s+([a-z][\w-]*))", re.I)
-
-
-def _lint_readings(sentence: str) -> list[tuple[str, str]]:
-    """What a Restrictions sentence says, for the lint: (text, stance) pairs. A sentence that forbids
-    (_stance) is read clause by clause (_CLAUSE_SPLIT_RE), so a ban in one clause never hides an
-    allowance in another ("No ticket needed and workers can push to main"): when a clause allows, each
-    clause with a stance is a reading of its own, with the clauses after it that have none ("Never
-    push to main or release branches"). "can <action>" counts as "may" there, and the conditional and
-    "only" exemptions (_unconditional) are read over the whole sentence first. Any other sentence,
-    and a ban with no allowing clause, is one reading, whole."""
-    st = _stance(sentence)
-    if st != "forbid":
-        return [(sentence, st)]
-
-    def may(m: re.Match) -> str:
-        w = m.group(1).lower()
-        return "may" if _ACTIONS.get(_stem(w)) or _ACTIONS.get(w) else m.group(0)
-    s = _NO_LONGER_BANNED_RE.sub(" allowed ", _CAN_ACT_RE.sub(may, _NEG_PERMIT_RE.sub(" never ", sentence)))
-    s = _unconditional(s)
-    groups: list[list] = []   # [start, end, stance]
-    for a, b in _spans(s):
-        cst = _stance(s[a:b])
-        if groups and (not cst or not groups[-1][2]):
-            groups[-1][1:] = [b, groups[-1][2] or cst]
-        else:
-            groups.append([a, b, cst])
-    if not any(g[2] == "allow" for g in groups):
-        return [(sentence, st)]
-    return [(s[a:b].strip(), gst) for a, b, gst in groups if gst]
-
-
-def _spans(text: str) -> list[tuple[int, int]]:
-    """The (start, end) of each clause of `text` (_clauses)."""
-    out, pos = [], 0
-    for x in _CLAUSE_SPLIT_RE.finditer(text):
-        out.append((pos, x.start()))
-        pos = x.end()
-    out.append((pos, len(text)))
-    return [(a, b) for a, b in out if text[a:b].strip(" .!?")]
-
-
 def restriction_pairs(charter: str) -> list[dict]:
-    """Model-free lint: pairs of Restrictions items, across every Restrictions section, where one
-    forbids what the other allows (_contradicts). Workers obey both as binding, so the stricter one
-    wins and the allowing one does nothing. Each pair once, with a stable `key`; sentences of one
-    item are never paired (an item may state its own exception in a second sentence). A ban's
-    clauses are read one by one (_lint_readings)."""
-    items = [(s, sec, n, rst, r) for s, sec, n in _restriction_items(charter) for r, rst in _lint_readings(s)]
-    out, keys = [], set()
-    for f, fsec, fn, fst, fr in items:
-        if fst != "forbid":
+    """Model-free lint: pairs of Restrictions items, across every Restrictions section, where one has
+    a word that bans (_BAN_RE) and the other one that permits (_PERMIT_RE), about the same thing
+    (_overlaps), whatever their conditions or scopes. Workers obey both as binding, so the stricter one
+    wins and the permitting one may do nothing. Each pair once, with a stable `key`; sentences of one
+    item are never paired (an item may state its own exception in a second sentence), nor is a ban
+    that names its own exception (_OWN_EXCEPTION_RE)."""
+    items = _restriction_items(charter)
+    out, seen = [], set()
+    for f, fsec, fn in items:
+        if not _BAN_RE.search(f) or _OWN_EXCEPTION_RE.search(f):
             continue
-        for a, asec, an, ast, ar in items:
-            if ast != "allow" or an == fn or not _contradicts(fr, ar):
+        for a, asec, an in items:
+            if an == fn or not _PERMIT_RE.search(a) or frozenset((f, a)) in seen or not _overlaps(f, a):
                 continue
+            seen.add(frozenset((f, a)))
             key = hashlib.sha256(f"{' '.join(f.split())}\n{' '.join(a.split())}".encode()).hexdigest()[:12]
-            if key not in keys:
-                keys.add(key)
-                out.append({"forbid": f, "forbid_section": fsec, "allow": a, "allow_section": asec, "key": key})
+            out.append({"forbid": f, "forbid_section": fsec, "allow": a, "allow_section": asec, "key": key})
     return out
 
 
@@ -2237,96 +2010,36 @@ def charter_conflict_lines(pairs: list[dict]) -> list[str]:
                f"({x['allow_section']})" for x in pairs])
 
 
-# A lift said as no one minding ("No problem if workers push", "No objection to workers pushing", "No
-# one objects anymore when workers push", "No rule stops workers from pushing"): the guard reads it as
-# "may" (_as_permission).
-_NO_ONE = r"(?:no\s+(?:one|rule|restriction|policy|reason|thing)|nobody|nothing)\s+(?:\w+ly\s+)?"
-_NO_OBJECTION_RE = re.compile(
-    r"\bno\s+(?:problem|objection|issue|concern|harm|worry|worries)s?\s+(?:with|to|if|when|in|about)\b"
-    rf"|\b{_NO_ONE}(?:objects?|minds?|cares?)(?:\s+(?:anymore|now|any\s+more|any\s+longer))?"
-    r"(?:\s+(?:to|if|when|that)\b)?"
-    rf"|\b{_NO_ONE}(?:stops?|prevents?|blocks?|bars?|keeps?)(?:\s+any\s+more|\s+anymore)?"
-    rf"(?P<who>(?:\s+(?!(?:{'|'.join(j for j in _JOINS if j not in ('and', 'or'))})(?![\w'’-]))\w[\w'-]*){{1,5}}?)"
-    r"\s+from\b", re.I)
-# A negation in the clause after it ("No problem if workers never push"): the sentence keeps a ban.
-_NEGATION_RE = re.compile(r"\b(?:not|never|no longer)\b|n['’]t\b", re.I)
-
-
-def _as_permission(sentence: str) -> str:
-    """The sentence with a lift said as no one minding (_NO_OBJECTION_RE) as "may": "No rule stops
-    workers from pushing" reads "workers may pushing". One whose clause negates the action ("No
-    problem if workers never push") stays as it is: it reinforces a ban."""
-    def sub(m: re.Match) -> str:
-        rest = sentence[m.end():]
-        end = _CLAUSE_SPLIT_RE.search(rest)
-        if _NEGATION_RE.search(rest[:end.start() if end else len(rest)]):
-            return m[0]
-        return f"{m['who'] or ''} may"
-    return _NO_OBJECTION_RE.sub(sub, sentence)
-
-
-# A permission given to no one (_NO_SUBJECT): the "and"/"or" in its subject joins no clauses.
-_NO_ONE_MAY_RE = re.compile(rf"\b(?:no|nobody|none)\b{_NO_SUBJECT}", re.I)
-
-
-def _clauses(sentence: str) -> list[str]:
-    """A sentence's clauses: its text between commas, semicolons, colons, dashes and the words that join
-    clauses (_JOINS), except a join inside the subject of "No ... may" ("No worker or agent may")."""
-    keep = [m.span() for m in _NO_ONE_MAY_RE.finditer(sentence)]
-    parts, start = [], 0
-    for m in _CLAUSE_SPLIT_RE.finditer(sentence):
-        if not any(a < m.start() and m.end() < b for a, b in keep):
-            parts.append(sentence[start:m.start()])
-            start = m.end()
-    return [c for c in (x.strip() for x in parts + [sentence[start:]]) if c.strip(" .!?")]
-
-
-def _append_conflicts(charter: str, section: str, text: str) -> list[tuple[str, str]]:
-    """The standing Restrictions items an appended `text` would contradict, as (item, its section):
-    text for Restrictions (dated or temporary too), Goals or Policies that allows what an item
-    forbids or forbids what it allows (_contradicts, which tells targets apart), or narrows a
-    forbidding item ("Never X, except Y", "Never X, but Y may") in a sentence about it (_widens).
-    It flags when in doubt: a permission counts wherever it sits, in a conditional clause or limited
-    to who may act or when too (no _unconditional), a ban on workers binds every actor (no actor
-    exemption in _contradicts), and a clause keeping the item's limit does not clear the sentence. Each
-    sentence is judged whole, and each of its clauses (_clauses) on its own for what it allows or
-    loosens: a forbid in one clause never cancels an allowance in another ("No review is needed and
-    workers may push to main" lifts a ban on pushing to main). A false hit costs one resend (`quote`, or
-    `both_hold`); a miss leaves a stale ban standing, and workers obey it. A negated permission ("may
-    not", "is not allowed") loosens nothing."""
+def _append_conflicts(charter: str, section: str, text: str, quote: str = "") -> list[tuple[str, str]]:
+    """The standing Restrictions items that text added to Restrictions (dated or temporary too), Goals
+    or Policies is about, as (item, its section): every item one of its sentences overlaps
+    (_overlaps), whatever either one says about it (a lift, a new ban, a condition, a scope). An item
+    the text replaces (`quote`) or that names its own exception (_OWN_EXCEPTION_RE) is left out. A
+    false hit costs one resend (`quote`, or `both_hold`); a miss leaves a stale ban standing, and
+    workers obey it."""
     if not _DATED.sub("", section).lower().startswith(("restriction", "goal", "polic")):
         return []
+    new, gone = _sentences(text.splitlines()), " ".join(quote.split())
     out: list[tuple[str, str]] = []
-    whole = _sentences(text.splitlines())
-    new = list(dict.fromkeys([*whole, *(c for s in whole for c in _clauses(s)),
-                              *(c for s in whole for c in _clauses(_as_permission(s)) if c not in whole)]))
     for item, sec, _ in _restriction_items(charter):
-        st = _stance(item)
-        for s in new:
-            ns = _stance(s, exempt=False)
-            loose = _NEG_PERMIT_RE.sub(" never ", s)
-            if (st == "forbid" and ns == "allow" and _contradicts(item, s, exempt=False)
-                    or st == "allow" and s in whole and _stance(s) == "forbid" and _contradicts(s, item, exempt=False)
-                    or st == "forbid" and ns != "allow" and (_LOOSEN_RE.search(loose) or _CAN_RE.search(loose))
-                    and not _OWN_EXCEPTION_RE.search(item) and _widens(item, _rule_words(s))):
-                if (item, sec) not in out:
-                    out.append((item, sec))
-                break
+        if ((item, sec) not in out and not (gone and " ".join(item.split()) in gone)
+                and not _OWN_EXCEPTION_RE.search(item) and any(_overlaps(item, s) for s in new)):
+            out.append((item, sec))
     return out
 
 
 def _reject_contradicting_append(p: Project, section: str, text: str, user_turn: bool,
-                                 messages: list[int] | None, ok: dict | None) -> None:
-    """Refuse a charter_update that appends `text` while a Restrictions item it contradicts would
-    stay standing (_append_conflicts): workers obey that item as binding, so the change would do
-    nothing. The rejection quotes the item. When the user's word is behind the change (this turn's
+                                 messages: list[int] | None, ok: dict | None, quote: str = "") -> None:
+    """Refuse a charter_update that adds `text` (appended, or in place of `quote`) while a Restrictions
+    item it is about would stay standing (_append_conflicts): workers obey that item as binding, so the
+    change may do nothing. The rejection quotes the item. When the user's word is behind the change (this turn's
     messages, or the approval it already carried), that word is recorded for the quoted resend of
     each item (_record_charter_approval), so the fix goes through in a later turn without asking
     again. Text already in the charter (a retried turn) passes."""
     charter = p.charter_path.read_text()
     if " ".join(text.split()) in " ".join(charter.split()):
         return
-    hits = _append_conflicts(charter, section, text)
+    hits = _append_conflicts(charter, section, text, quote)
     if not hits:
         return
     said = list(messages or []) if user_turn else list((ok or {}).get("messages") or [])
@@ -2343,8 +2056,8 @@ def _reject_contradicting_append(p: Project, section: str, text: str, user_turn:
           f"{first[1]!r}, `quote` \"{first[0]}\" and this `text`"
         + (" (the user's yes is on record for it)" if said else ", with `over` naming the user's word that changed it")
         + (", and retire the other items with `quote` and `over` too" if len(hits) > 1 else "")
-        + "; if both hold (this text only limits who may act or when, is the item's exception or condition, "
-          "or is not about the same thing), resend "
+        + "; if both hold (this text only adds a limit, a ban or a condition, is the item's "
+          "exception, or is not about the same thing), resend "
           "with `both_hold`: true, or rewrite the item to name its exception. Never drop a restriction the "
           "user did not change")
 

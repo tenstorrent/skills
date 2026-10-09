@@ -4449,15 +4449,15 @@ def test_charter_update_restriction_items_change_only_on_the_users_word(env, tmp
            (tid, "worker", "fake", time.time(), "running", str(run_dir)))
     hist = p.harness / coord.CHARTER_HISTORY
     drop = {"type": "charter_update", "section": "Restrictions", "quote": "Never touch box A."}
-    for act in (drop, {**drop, "text": "Never touch box B."}):
+    for act in (drop, {**drop, "text": "Never reboot box B."}):
         assert "needs the user's word" in coord.apply(p, [act], turn=1)[0]
     assert "Never touch box A." in p.charter_path.read_text() and not hist.exists()
     # Adding one needs no such word.
-    assert coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "text": "Never push."}],
+    assert coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "text": "Never restart the service."}],
                        turn=2) == []
     assert coord.apply(p, [drop], turn=3, user_turn=True) == []
     charter = p.charter_path.read_text()
-    assert "Never touch box A." not in charter and "Never merge.\n\nNever push." in charter
+    assert "Never touch box A." not in charter and "Never merge.\n\nNever restart the service." in charter
     assert "### Removed from Restrictions (binding on every task) (" in hist.read_text()
     assert "turn 3.0)\nNever touch box A." in hist.read_text()
     assert "Binding restriction retired: Never touch box A." in (run_dir / "steer.md").read_text()
@@ -4494,9 +4494,9 @@ def test_an_append_that_contradicts_a_standing_restriction_is_rejected_quoting_i
     def conflicts():
         return [r["text"] for r in db.q("SELECT text FROM events WHERE kind='charter_conflict' AND status='queued'")]
 
-    # A dated section, or text in another section, that widens the old item: rejected, quoting it,
-    # in the user's turn and outside it alike; the charter is left as it was. A clause that restates
-    # the ban does not clear an exception next to it.
+    # A dated section, or text in another section, about the same thing as the old item: rejected,
+    # quoting it, in the user's turn and outside it alike; the charter is left as it was. A lift, a
+    # scoped exception, a negated permission and a new ban on the same thing alike.
     for k, (act, user) in enumerate((
             ({"section": "Restrictions", "text": "Pushing hotfixes to the main branch is allowed.",
               "until": "the release ships"}, True),
@@ -4504,7 +4504,11 @@ def test_an_append_that_contradicts_a_standing_restriction_is_rejected_quoting_i
             ({"section": "Goals", "text": "Pushing to the main branch is fine now."}, False),
             ({"section": "Restrictions", "text": "Never push to the main branch, except hotfixes."}, False),
             ({"section": "Policies", "text": "Never push to the main branch without review, but hotfixes may "
-                                             "be pushed to it."}, False))):
+                                             "be pushed to it."}, False),
+            ({"section": "Restrictions", "text": "Never push to the main branch on release days."}, True),
+            ({"section": "Policies", "text": "Workers may never push to the main branch."}, False),
+            ({"section": "Policies", "text": "Workers may not push to the main branch."}, False),
+            ({"section": "Goals", "text": "Pushing to the main branch is not allowed."}, False))):
         db.x("DELETE FROM events")
         p.charter_path.write_text(base)
         err = coord.apply(p, [{"type": "charter_update", **act}], turn=10 + k, user_turn=user)
@@ -4529,11 +4533,10 @@ def test_an_append_that_contradicts_a_standing_restriction_is_rejected_quoting_i
     p.charter_path.write_text("# demo\n\n## Restrictions\n- Never modify main.\n")
     assert len(coord.apply(p, [lift], turn=32)) == 1
     assert "needs the user's word" in coord.apply(p, [{**lift, "quote": "Never modify main."}], turn=33)[0]
-    # Not rejected or flagged: a plain new restriction, an unrelated permission, the same change made
-    # in place, a stricter rule on another target, a negated permission (it restates the ban), and an
-    # append the coordinator says both hold.
+    # Not rejected or flagged: a new restriction about something else, an unrelated permission, the
+    # same change made in place, a permission on another target, and an append the coordinator says
+    # both hold.
     for k, (acts, user) in enumerate((
-            ([{"section": "Restrictions", "text": "Never push to the main branch on release days."}], True),
             ([{"section": "Restrictions", "text": "Never delete release tags.", "expires": "2d"}], True),
             ([{"section": "Goals", "text": "Allow the web app to show spend per task."}], True),
             ([{"section": "Restrictions", "quote": "Never push to the main branch.",
@@ -4541,9 +4544,6 @@ def test_an_append_that_contradicts_a_standing_restriction_is_rejected_quoting_i
               {"section": "Restrictions", "text": "Pushing hotfixes to the main branch is allowed.",
                "expires": "1d"}], True),
             ([{"section": "Policies", "text": "Pushing to the release branch is allowed."}], False),
-            ([{"section": "Policies", "text": "Workers may never push to the main branch."}], False),
-            ([{"section": "Policies", "text": "Workers may not push to the main branch."}], False),
-            ([{"section": "Goals", "text": "Pushing to the main branch is not allowed."}], False),
             ([{"section": "Policies", "text": "Workers may push to the main branch for hotfixes.",
                "both_hold": True}], True))):
         db.x("DELETE FROM events")
@@ -4551,14 +4551,13 @@ def test_an_append_that_contradicts_a_standing_restriction_is_rejected_quoting_i
         assert coord.apply(p, [{"type": "charter_update", **a} for a in acts], turn=40 + k, user_turn=user) == []
         assert conflicts() == [], acts
     # The guard flags when in doubt: a permission inside a conditional or limiting clause, or one
-    # reserved to who may act, is rejected like any lift of a forbidden action (the lint exempts them),
-    # and goes through on a resend with `both_hold`. Text that loosens no forbidden action passes as it
-    # is: a participle used as a modifier ("running jobs") is not the rule's action.
+    # reserved to who may act, is rejected like any lift of a forbidden action, and goes through on a
+    # resend with `both_hold`. Text about none of the items passes as it is.
     bans = ("# demo\n\n## Restrictions\n- Never open pull requests.\n- Never push to main.\n"
             "- Never disturb the other project's running jobs.\n- Never use a paused device.\n")
     p.charter_path.write_text(bans)
     assert coord.apply(p, [{"type": "charter_update", "section": "Policies",
-                            "text": "Workers may run jobs on the device when it is free."}], turn=50, user_turn=True) == []
+                            "text": "Workers may run the tests on their own branch."}], turn=50, user_turn=True) == []
     for k, (text, ban) in enumerate([(t, "Never open pull requests.") for t in (
             "PR flow, for any repo where PRs are allowed: open a draft PR once tested.",
             "Once PRs are allowed, open drafts first.", "Only the user may open pull requests.")]
@@ -4597,53 +4596,54 @@ def test_restriction_pairs_flags_contradicting_restrictions_items_and_only_those
     assert len(pairs("- Never open pull requests (the user opens the PR).\n- Opening draft PRs is allowed.\n")) == 1
     assert len(pairs("- Never force-push.\n", "\n## Restrictions (added 2026-10-06)\nForce-pushing to own "
                      "branches is fine.\nUntil: the migration ends\n")) == 1
+    # Any permission-ish item about what a ban is about pairs with it, whatever its condition, scope
+    # or actor (one rewrite settles it): a general allowance, a limited or conditional one, one
+    # reserved to who may act, an action on what the ban names.
+    for ban, allow in (("Never push to main.", "Pushing is allowed."),
+                       ("Never use a paused device.", "Device pauses are lifted only on the user's explicit word."),
+                       ("Never push to main.", "Pushing to main is allowed only on the user's explicit word."),
+                       ("Never disturb the other project's running jobs.", "Workers may run jobs on the device."),
+                       ("Never push to main.", "Only the user may push to main."),
+                       ("Never push to main.", "The user alone may push to main."),
+                       ("Never push to main.", "Pushing to main is allowed for the user only."),
+                       ("Never push to main.", "Main may be pushed to by the user alone."),
+                       ("Never open pull requests.", "Only the user may open pull requests."),
+                       ("Never use a paused device.", "Only the user lifts device pauses."),
+                       ("Never use a paused device.", "Only the user may lift a device pause.")):
+        assert pairs(f"- {ban}\n- {allow}\n") == [(ban, allow)], allow
     # No false positives: the ban names its exception; another target (branch, box, repo); another
-    # action on the same target; a general allowance next to a ban on one target; one item stating its
-    # own exception in a second sentence; prohibitions only.
+    # action on the same target; one item stating its own exception in a second sentence; a real
+    # charter's prohibitions.
     for body in ("- Never push to main, except as the dated section allows.\n- Pushing hotfixes to main is allowed.\n",
                  "- Never push to main.\n- Pushing to branch feature/x is allowed.\n",
                  "- Never push to the main branch.\n- Pushing to the release branch is allowed.\n",
                  "- Never modify the shared folder of project B.\n- Pushing to branch team/project-a is allowed.\n",
                  "- Never reboot box A.\n- Running jobs on box A is allowed.\n",
                  "- Never merge.\n- Pushing hotfixes to the main branch is allowed.\n",
-                 "- Never push to main.\n- Pushing is allowed.\n",
                  "- Never push to main. Pushing tags to main is allowed.\n",
                  "- Push only to branch dev/x of org/repo. Never push to main. Never open pull requests.\n"
                  "- Keep content generic: no hostnames, internal URLs or credentials.\n"
                  "- Never force-push to dev/x. Always fetch and rebase before pushing.\n"
                  "- Resource pauses are lifted only on the user's explicit word.\n",
-                 # a permission limited to a condition is a restriction, not a lift
-                 "- Never use a paused device.\n- Device pauses are lifted only on the user's explicit word.\n",
-                 "- Never push to main.\n- Pushing to main is allowed only on the user's explicit word.\n",
-                 "- Never disturb the other project's running jobs.\n- Workers may run jobs on the device.\n",
-                 # a permission reserved to who may act is a restriction, not a lift
-                 "- Never push to main.\n- Only the user may push to main.\n",
-                 "- Never push to main.\n- The user alone may push to main.\n",
-                 "- Never push to main.\n- Pushing to main is allowed for the user only.\n",
-                 "- Never push to main.\n- Main may be pushed to by the user alone.\n",
-                 "- Never open pull requests.\n- Only the user may open pull requests.\n",
-                 "- Never use a paused device.\n- Only the user lifts device pauses.\n",
-                 "- Never use a paused device.\n- Only the user may lift a device pause.\n"):
+                 "- Never run jobs on a paused device.\n- Workers may push to their own branch.\n"
+                 "- Keep content generic.\n- Workers may open issues on the docs repo.\n"):
         assert pairs(body) == [], body
 
 
 def test_only_or_alone_is_a_limit_only_when_it_names_an_actor_so_a_scoped_lift_is_flagged(env):
-    """The lint (restriction_pairs) reads "only"/"alone" as a limit only when it names who may act or
-    whose word the permission waits for, and a condition or actor after "only" only when "only" sits
-    next to the permission word: with the action between them ("may push to main only when the user
-    says so") it is a conditional lift. The guard (_append_conflicts) has no such exemption: it
-    rejects every permission of a forbidden action, these limits too (a resend with `both_hold` adds
-    a limit), since a miss leaves a stale ban that workers obey."""
+    """Neither the guard (_append_conflicts) nor the lint (restriction_pairs) reads "only"/"alone": a
+    scoped lift, a conditional one and one reserved to who may act are all about what the ban is
+    about, so the guard rejects them (a resend with `both_hold` adds a limit) and the lint pairs them,
+    since a miss leaves a stale ban that workers obey."""
     p = make(env)
     from ttp import coordinator as coord
-    bans = "# demo\n\n## Restrictions\n- Never push to main.\n- Never open pull requests.\n- Never use a paused device.\n"
 
     def lint(ban, text):
         return [(x["forbid"], x["allow"]) for x in
                 coord.restriction_pairs(f"# demo\n\n## Restrictions\n- {ban}\n- {text}\n")]
 
-    def guard(text, turn):
-        p.charter_path.write_text(bans)
+    def guard(ban, text, turn):
+        p.charter_path.write_text(f"# demo\n\n## Restrictions\n- {ban}\n- Never merge.\n")
         return coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": text}],
                            turn=turn, user_turn=True)
     # "only"/"alone" on a scope (hotfixes, release tags, the docs repo, pushing, main, the device), in
@@ -4665,12 +4665,11 @@ def test_only_or_alone_is_a_limit_only_when_it_names_an_actor_so_a_scoped_lift_i
             "Workers may only push to main after the user approves.",
             "Main may be pushed to only when the user says so.")]
             + [("Never open pull requests.", "Draft pull requests are allowed for the docs repo only.")]):
-        err = guard(text, 10 + k)
+        err = guard(ban, text, 10 + k)
         assert len(err) == 1 and f"\"{ban}\" (section 'Restrictions')" in err[0], (text, err)
         assert err[0].count("(section ") == 1, (text, err)
         assert lint(ban, text) == [(ban, text)], text
-    # "only"/"alone" naming who may act, or whose word the permission waits for, next to the permission
-    # word (fillers such as "be" between them), is a limit: the lint leaves it, the guard still flags it.
+    # "only"/"alone" naming who may act, or whose word the permission waits for, is flagged and paired too.
     for k, (ban, text) in enumerate([("Never push to main.", t) for t in (
             "Only the user or a maintainer may push to main.", "Only the user is allowed to push to main.",
             "Main may be pushed to by maintainers alone.", "Pushing to main is only allowed for maintainers.",
@@ -4679,9 +4678,9 @@ def test_only_or_alone_is_a_limit_only_when_it_names_an_actor_so_a_scoped_lift_i
             "Device pauses may only be lifted by the user.", "Device pauses are only lifted on the user’s word.",
             "Device pauses may be lifted only by the user.",
             "Device pauses are lifted again only on the user's explicit word.")]):
-        err = guard(text, 40 + k)
+        err = guard(ban, text, 40 + k)
         assert len(err) == 1 and f"\"{ban}\" (section 'Restrictions')" in err[0], (text, err)
-        assert lint(ban, text) == [], text
+        assert lint(ban, text) == [(ban, text)], text
 
 
 def test_guard_flags_lifts_with_an_inverted_modal_a_passive_verb_is_fine_ok_or_no_action(env):
@@ -4741,210 +4740,63 @@ def test_actor_words_are_no_rule_target_and_an_inverted_may_skips_any_actor(env)
         assert len(err) == 1 and f"\"{ban}\" (section 'Restrictions')" in err[0], (text, err)
 
 
-def test_a_ban_on_one_actor_does_not_pair_with_another_actors_allowance(env):
-    """For the lint, a ban that names who it binds ("Workers must not push", "Never let agents open
-    PRs", "Never ask agents to open PRs") is no blanket ban: an allowance for a different actor ("The
-    coordinator may push") does not contradict it, unless it names workers anywhere ("The user may
-    allow workers to push", "... and let workers do so too"). It still pairs with the same actor's
-    allowance, an allowance naming no actor, and a ban naming no actor pairs with any actor's
-    allowance. A verb that lets or makes workers act passes its action on ("may tell workers to
-    push"), a named actor after an inverted "may" is skipped, and a permission given to no one ("No
-    worker may push") forbids. The guard makes no actor exemption: it flags every one of these."""
+def test_guard_and_lint_flag_every_rule_about_what_a_ban_is_about_whatever_its_stance(env):
+    """One coarse rule (_overlaps) for the guard and the lint: two rules overlap when they share what
+    they do and what to. Actor, condition, negation, scope and clause order are not read, so a new
+    ban, a lift said as no objection, a lift after a ban word in the same sentence and an allowance
+    for another actor are all flagged (one resend with `both_hold` settles a false hit). Rules about
+    another action or another target are not."""
     p = make(env)
     from ttp import coordinator as coord
+
+    def guard(ban, text, turn):
+        p.charter_path.write_text(f"# demo\n\n## Restrictions\n- {ban}\n")
+        return coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": text}],
+                           turn=turn, user_turn=True)
 
     def lint(ban, text):
         return [(x["forbid"], x["allow"]) for x in
                 coord.restriction_pairs(f"# demo\n\n## Restrictions\n- {ban}\n- {text}\n")]
-
-    def guard(ban, text, turn):
-        p.charter_path.write_text(f"# demo\n\n## Restrictions\n- {ban}\n")
-        return coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": text}],
-                           turn=turn, user_turn=True)
-    for k, (ban, text) in enumerate((
-            ("Workers must not push.", "The coordinator may push to the work branch."),
-            ("Never let workers push.", "The coordinator may push to the work branch."),
-            ("Never let agents open pull requests.", "The coordinator may open draft PRs on the fork."),
-            ("Never tell workers to push.", "The coordinator may push to the work branch."),
-            ("Never ask agents to open pull requests.", "The coordinator may open draft PRs on the fork."))):
-        assert lint(ban, text) == [], text
-        err = guard(ban, text, 10 + k)
-        assert len(err) == 1 and f"\"{ban}\" (section 'Restrictions')" in err[0], (text, err)
-    for k, (ban, text) in enumerate((
-            ("Workers must not push.", "Workers may push to the work branch."),
-            ("Never push.", "The coordinator may push to the work branch."),
-            ("Never let workers push to main.", "Workers may push to main."),
-            ("Never let agents open pull requests.", "Workers may open draft PRs on the fork."),
-            ("Workers must not push.", "Pushing to the work branch is allowed."),
-            ("Never push to main without the user's word.", "The coordinator may push to main."),
-            ("Never push to main.", "Only after review may Dependabot push to main."),
-            ("Workers must not push to main.", "The user may allow workers to push to main."),
-            ("Workers must not open PRs.", "The coordinator may open draft PRs and let workers do so too."),
-            ("Workers must not push to main.", "The coordinator may tell workers to push to main."),
-            ("Workers must not push to main.", "The coordinator may have workers push to main."),
-            ("Workers must not push to main.", "The coordinator may ask workers to push to main."),
-            ("Never push to main.", "Only after review may the coordinator tell workers to push to main."),
-            ("Never tell workers to push to main.", "Workers may push to main."),
-            ("No worker may push to main.", "Workers may push to main."),
-            ("Nobody may push to main.", "The coordinator may push to main."),
-            ("None of the agents are allowed to push to main.", "Agents may push to main."))):
-        assert lint(ban, text) == [(ban, text)], text
-        err = guard(ban, text, 20 + k)
-        assert len(err) == 1 and f"\"{ban}\" (section 'Restrictions')" in err[0], (text, err)
-
-
-def test_a_permission_given_to_no_one_adds_a_ban_and_only_workers_pass_an_action_on(env):
-    """"No worker may X" and "Nobody may X" forbid X: appended next to a ban on X they add a ban, which
-    the guard lets through, while "Nobody but the user may X" still allows X and is flagged. A verb
-    passes its action on only to workers: "Never ask the user to run commands" is about asking, and an
-    allowance to run commands does not contradict it."""
-    p = make(env)
-    from ttp import coordinator as coord
-
-    def guard(ban, text, turn):
-        p.charter_path.write_text(f"# demo\n\n## Restrictions\n- {ban}\n")
-        return coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": text}],
-                           turn=turn, user_turn=True)
-    assert guard("Never push to main.", "No worker may push to main.", 10) == []
-    assert guard("Never push to main.", "Nobody may push to main.", 11) == []
-    err = guard("Never push to main.", "Nobody but the user may push to main.", 12)
-    assert len(err) == 1 and "\"Never push to main.\" (section 'Restrictions')" in err[0], err
-    ban, text = "Never ask the user to run commands the harness can run.", "Workers may run commands."
-    assert coord.restriction_pairs(f"# demo\n\n## Restrictions\n- {ban}\n- {text}\n") == []
-    assert guard(ban, text, 13) == []
-
-
-def test_guard_judges_each_clause_so_a_forbid_in_one_never_cancels_an_allowance_in_another(env):
-    """The guard judges an appended sentence whole and each clause on its own, split at commas,
-    semicolons, colons, dashes and joining words ("and", "so", "then", "since", ...): a clause that
-    allows a forbidden action is flagged whatever the other clauses say, a bare "can" allowing too.
-    The subject of "No ... may" never runs across a join, so "No restriction remains and workers may
-    push" is no ban, while "No worker may push" still is. Against the longer ban only the clause
-    reading catches the lift: the whole sentence shares too few words with it."""
-    p = make(env)
-    from ttp import coordinator as coord
-
-    def guard(ban, text, turn):
-        p.charter_path.write_text(f"# demo\n\n## Restrictions\n- {ban}\n")
-        return coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": text}],
-                           turn=turn, user_turn=True)
     short, long = "Never push to main.", "Never push to main without the user's explicit word."
-    for k, (ban, text) in enumerate([(short, t) for t in (
-            "No restriction remains and workers may push to main.", "No ticket needed and workers can push to main.",
-            "No more waiting and workers can push to main.", "No more waiting: workers can push to main.",
-            "No more waiting - workers can push to main.", "Nobody objects since workers can push to main.",
-            "Workers can push to main.", "Never push to main, but hotfixes can go there.")]
-            + [(long, t) for t in (
-            "No restriction remains and workers may push to main.", "No ticket is needed, so workers may push to main.",
-            "No more waiting; workers can push to main.", "No review remains then workers may push to main.",
-            "Nothing blocks it any more and workers can push to main.")]):
+    lifts = ("Never wait for review: workers may push to main.",
+             "No problem if workers push to main, which never needs a review.",
+             "No restriction remains and workers may push to main.", "No ticket needed and workers can push to main.",
+             "No more waiting - workers can push to main.", "Nobody objects since workers can push to main.",
+             "Never push to main, but hotfixes can go there.", "No objection to workers pushing to main.",
+             "No rule stops workers from pushing to main.", "There is no issue with agents pushing to main.",
+             "Nobody minds if workers push to main.", "No review by a maintainer and agents may push to main.",
+             "Do not ask first: workers can push and merge to main.",
+             "No ticket needed; workers can push to main only when the user says so.",
+             "Only after review may the coordinator tell workers to push to main.",
+             "The coordinator may push to main.", "Nobody but the user may push to main.",
+             "No objection to workers pushing to their own branch, but never to main.")
+    cases = ([(b, t) for b in (short, long) for t in lifts]
+             + [(short, t) for t in ("No worker may push to main.", "Nobody may push to main.",
+                                     "Workers can't push to main.", "No problem if workers never push to main.")]
+             + [("Workers must not push.", "The coordinator may push to the work branch."),
+                ("Never tell workers to push.", "The coordinator may push to the work branch."),
+                ("Never let agents open pull requests.", "The coordinator may open draft PRs on the fork."),
+                ("No worker or agent may push to main.", "Workers may push to main."),
+                ("Never open pull requests, but workers can push to main.", "Opening draft PRs is allowed."),
+                ("Never ask the user to run commands the harness can run.", "Workers may run commands.")])
+    for k, (ban, text) in enumerate(cases):
         err = guard(ban, text, 10 + k)
-        assert len(err) == 1 and f"\"{ban}\" (section 'Restrictions')" in err[0], (text, err)
-    # A permission given to no one, or negated ("can't", "cannot", "can never"), adds a ban in any
-    # clause; a "can" allowing another action lifts nothing.
-    for k, text in enumerate(("No worker may push to main.", "Nobody may push to main.",
-                              "None of the agents are allowed to push to main.",
-                              "Reviews are done; no worker may push to main.", "Workers can't push to main.",
-                              "Workers cannot push to main.", "Workers can never push to main.",
-                              "Workers can not push to main.", "Workers can't push to main, and they cannot merge either.",
-                              "Workers can run the tests and push to their own branch.")):
-        assert guard(short, text, 40 + k) == [], text
-    # The lint reads a joined "No ... and workers may X" as no ban, so it no longer pairs it with an
-    # allowance of X; "No worker may X" still pairs.
-    def lint(ban, text):
-        return [(x["forbid"], x["allow"]) for x in
-                coord.restriction_pairs(f"# demo\n\n## Restrictions\n- {ban}\n- {text}\n")]
-    assert lint("No restriction remains and workers may push to main.", "Workers may push to main.") == []
-    assert lint("No worker may push to main.", "Workers may push to main.") == [
-        ("No worker may push to main.", "Workers may push to main.")]
-
-
-def test_the_lint_reads_a_ban_clause_by_clause_so_an_allowing_clause_pairs_with_the_ban_it_lifts(env):
-    """The lint (restriction_pairs) reads a sentence that bans something clause by clause: a ban in one
-    clause never hides an allowance in another ("No ticket needed and workers can push to main"), and
-    "can <action>" there is an allowance. The allowing clause pairs with the ban it lifts, and the
-    banning clause alone with what it bans. A conditional or "only" permission still lifts nothing,
-    read over the whole sentence, and "can" with no action after it is ability, not permission."""
-    from ttp import coordinator as coord
-
-    def lint(ban, text):
-        return [(x["forbid"], x["allow"]) for x in
-                coord.restriction_pairs(f"# demo\n\n## Restrictions\n- {ban}\n- {text}\n")]
-    ban = "Never push to main."
-    for text in ("No ticket needed and workers can push to main.", "No ticket is needed, workers can push to main.",
-                 "No ticket needed and workers can also push to main.",
-                 "Never wait for a review, workers can push and merge to main.",
-                 "Do not ask first: workers can push to main."):
-        assert lint(ban, text) == [(ban, text)], text
-        assert lint(text, ban) == [(ban, text)], text
-    # The banning clause alone is the ban: it pairs with an allowance of what it bans, never with
-    # one of what the other clause allows.
-    mixed = "Never open pull requests, but workers can push to main."
-    assert lint(mixed, "Opening draft PRs is allowed.") == [(mixed, "Opening draft PRs is allowed.")]
-    assert lint(mixed, "Workers may push to main.") == []
-    # Bans stay bans: a conditional or "only" permission, "can" as ability, a negated "can".
-    for text in ("No ticket needed; workers can push to main only when the user says so.",
-                 "No ticket needed, and only the user can push to main.",
-                 "No ticket needed, and the user alone can push to main.",
-                 "Never push to main unless workers can push to main safely.",
-                 "Never ask the user to do what the harness can do itself.",
-                 "Never ask the user for this, since the harness can do it itself.",
-                 "Never push to main; only the user can.",
-                 "No ticket needed and workers cannot push to main.",
-                 "No ticket needed and workers can't push to main.",
-                 "No ticket needed and workers can no longer push to main."):
-        assert [x for x in lint(ban, text) if x[1] == text] == [], text
-    # A ban with no allowing clause is read whole, as before: it keeps its own exception.
-    assert lint("Never push to main, except as the dated section allows.", "Pushing hotfixes to main is allowed.") == []
-
-
-def test_no_x_or_y_may_bans_and_lifts_said_as_no_objection(env):
-    """"and"/"or" join nouns inside the subject of "No ... may" ("No worker or agent may X" bans X, so
-    an allowance of X next to it is flagged and paired), but after any other word they still open a
-    new clause. A lift said as no one minding ("No problem if", "No objection to", "No one objects
-    when", "No rule stops ... from") allows the action, and the guard flags it."""
-    p = make(env)
-    from ttp import coordinator as coord
-
-    def guard(ban, text, turn):
-        p.charter_path.write_text(f"# demo\n\n## Restrictions\n- {ban}\n")
-        return coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": text}],
-                           turn=turn, user_turn=True)
-
-    def lint(ban, text):
-        return [(x["forbid"], x["allow"]) for x in
-                coord.restriction_pairs(f"# demo\n\n## Restrictions\n- {ban}\n- {text}\n")]
-    bans = ("No worker or agent may push to main.", "No workers or tasks may push to main.",
-            "No worker and no agent may push to main.", "No user or other bot is allowed to push to main.")
-    for k, ban in enumerate(bans):
-        assert coord._stance(ban) == "forbid", ban
-        assert lint(ban, "Workers may push to main.") == [(ban, "Workers may push to main.")], ban
-        err = guard(ban, "Workers may push to main.", 10 + k)
-        assert len(err) == 1 and f"\"{ban}\" (section 'Restrictions')" in err[0], (ban, err)
-        assert guard("Never push to main.", ban, 20 + k) == [], ban
-    for text in ("No restriction remains and workers may push to main.", "No review is left or workers may push to main.",
-                 "No worker remains and tasks may push to main."):
-        assert coord._stance(text) != "forbid", text
-        assert lint(text, "Workers may push to main.") == [], text
-    short, long = "Never push to main.", "Never push to main without the user's explicit word."
-    lifts = ("No problem if workers push to main.", "No objection to workers pushing to main.",
-             "No one objects anymore when workers push to main.", "No rule stops workers from pushing to main.",
-             "There is no issue with agents pushing to main.", "Nobody minds if workers push to main.",
-             "No rule stops the coordinator or workers from pushing to main.",
-             # The subject join holds only for an actor noun heading the subject: after a
-             # preposition or determiner, "and"/"or" opens a new clause that allows.
-             "No review by a maintainer and agents may push to main.",
-             "No sign-off from the user and workers may push to main.",
-             "No approval from any reviewer or agents may push to main.",
-             "No wait for the owner and workers may push to main.")
-    for k, (ban, text) in enumerate([(b, t) for b in (short, long) for t in lifts]):
-        err = guard(ban, text, 30 + k)
         assert len(err) == 1 and f"\"{ban}\" (section 'Restrictions')" in err[0], (ban, text, err)
-    # About another action, or still a ban, it lifts nothing.
-    for k, text in enumerate(("No problem if workers run the tests.", "No rule stops workers from opening draft PRs.",
-                              "No objection to workers pushing to their own branch, but never to main.",
-                              "No problem if workers never push to main.", "No problem if workers do not push to main.")):
-        assert guard(short, text, 60 + k) == [], text
+        if coord._PERMIT_RE.search(text):   # the lint pairs the sentence that permits
+            assert [(f, a in text) for f, a in lint(ban, text)] == [(ban, True)], (ban, text)
+    # Clearly unrelated rules pass and pair with nothing.
+    for k, text in enumerate(("Allow the web app to show spend per task.", "Never delete release tags.",
+                              "Workers may run the tests on their own branch.", "No problem if workers run the tests.",
+                              "Workers can run the tests and push to their own branch.",
+                              "No rule stops workers from opening draft PRs.", "Keep content generic and safe to open-source.",
+                              "Notify the user only for decisions and outages.")):
+        assert guard(short, text, 80 + k) == [], text
+        assert lint(short, text) == [], text
+    # An edit is guarded too: text put in place of one item that touches another is flagged.
+    p.charter_path.write_text("# demo\n\n## Restrictions\n- Never push to main.\n- Keep it generic.\n")
+    err = coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "quote": "Keep it generic.",
+                           "text": "Keep it generic; workers may push to main."}], turn=99, user_turn=True)
+    assert len(err) == 1 and "\"Never push to main.\" (section 'Restrictions')" in err[0], err
 
 
 def test_charter_conflicts_show_in_the_digest_raise_effort_once_and_reach_the_daily_review(env):

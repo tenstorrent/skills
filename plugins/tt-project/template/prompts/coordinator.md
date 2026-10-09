@@ -168,9 +168,9 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
   one block (temporary ones stay separate with their end); what goes is kept in CHARTER.history.md.
   Example: Restrictions says "Never modify main." and the user says "pushing to main is allowed":
   send `{"section": "Restrictions", "quote": "Never modify main.", "text": "Pushing to main is
-  allowed."}`, never an appended "Pushing to main is allowed." next to the old line. An append
-  that contradicts a standing item is rejected, quoting it; resend it with `quote` (`both_hold`:
-  true only when both truly hold). A `## Charter conflicts` digest section lists items that
+  allowed."}`, never an appended "Pushing to main is allowed." next to the old line. Text that
+  touches what a standing item is about (the same action or target, even a new ban or a scoped
+  lift) is rejected, quoting it; resend it with `quote` (`both_hold`: true when both truly hold). A `## Charter conflicts` digest section lists items that
   already contradict: retire the stale side that turn (`quote`, `over` naming the newer word).
 - If that change is rejected (say an ambiguous heading), the user's yes stays on record: send the
   same change, fixed, in a later turn without asking again. It applies once only, with the same
