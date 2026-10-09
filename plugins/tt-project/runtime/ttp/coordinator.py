@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from . import locks
-from . import effort, ends, jevuse, machines, prguard, push, reviewcap, shared, unblock, upstream
+from . import anchors, effort, ends, jevuse, machines, prguard, push, reviewcap, shared, unblock, upstream
 from . import screen as scr
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
@@ -71,7 +71,8 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "expires": {"type": "string"}, "until": {"type": "string"}, "until_probe": {"type": "string"},
             "source": {"type": "string"}, "match": {"type": "string"}, "hours": {"type": "number"},
             "below": {"type": "string"}, "why": {"type": "string"}, "quote": {"type": "string"},
-            "start_after": {"type": "string", "pattern": START_AFTER_RE}, "start_when": {"type": "string"}},
+            "start_after": {"type": "string", "pattern": START_AFTER_RE}, "start_when": {"type": "string"},
+            "waits_on": {"type": "string"}},
             "required": ["type"]}},
         "summary": {"type": "string"},
     },
@@ -161,7 +162,7 @@ EFFORT_EVENT_TRIGGERS = {
     "task_blocked": "stuck", "task_failed": "stuck", "task_changes_needed": "stuck", "task_review": "stuck",
     "dead_dependency": "stuck",
     "deferral_expired": "stuck", "deferral_probe_broken": "stuck", "review_stall": "stuck",
-    "wait_stale": "stuck",
+    "wait_stale": "stuck", "hold_probe_broken": "stuck",
     "resource_trouble": "resource",
     # costly or irreversible decisions
     "task_budget_exhausted": "costly", "ask_timeout": "costly", "pr_findings": "costly", "pr_clean": "costly",
@@ -451,6 +452,8 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     in_review = db.review_since()
     for t in rows:
         note = clip(t["blocked_reason"] or load_result(t["result"]).get("summary"), NOTE_CHARS)
+        held = anchors.anchor(t) if t["status"] == "blocked" else None
+        note = f"{anchors.describe(*held)}: {note}" if held else note
         cont = continues_id(t)
         title = clip(t["title"], TITLE_CHARS) + (f" (continues #{cont})" if cont else "")
         starts = (starts_text(t, now) if t["status"] == "queued" else
@@ -649,6 +652,61 @@ def _start_args(a: dict, cur: dict) -> tuple[float | None, str | None]:
     return after, (when.strip() or None) if when else None
 
 
+HOLD_NEEDS_ANCHOR = ("a hold needs `waits_on`: ask:<id> (an open ask, or ask:new for the ask_user of this turn), "
+                     "resource:<name>, until:<time> or when:<probe>. A hold never replaces an ask or a decision: "
+                     "decide it yourself (requeue or cancel, memory_add the decision), or ask_user with a valid "
+                     "blocking category and waits_on ask:new, or set an end with until or when")
+
+
+def _hold_anchor(db, task: dict, a: dict, turn_asks: list[tuple[int, int]], later_ask: bool) -> str | None:
+    """The `waits:<kind>:<value>` label of a task_update that sets or keeps a task blocked with `waits_on`
+    (anchors.py), or None when it sets none. `ask:new` names this turn's newest ask so far, or, with an
+    ask_user later in the turn, stays `ask:new` until apply re-points it. Raises when the update would
+    hold the task on nothing: blocked with no anchor (unless it keeps its own), or an anchor that is not
+    a valid one."""
+    raw = a.get("waits_on")
+    raw = raw.strip() if isinstance(raw, str) else ""
+    status = a.get("status") if a.get("status") in ("queued", "blocked", "cancelled", "done", "waiting") else None
+    if not raw:
+        if status == "blocked" and not (task["status"] == "blocked" and anchors.anchor(task)):
+            raise ValueError(f"#{task['id']} rejected: {HOLD_NEEDS_ANCHOR}")
+        return None
+    if (status or task["status"]) != "blocked":
+        raise ValueError(f"#{task['id']} rejected: `waits_on` goes with status blocked")
+    kind, _, value = raw.partition(":")
+    kind, value = kind.strip().lower(), value.strip()
+    if kind not in anchors.KINDS or not value:
+        raise ValueError(f"#{task['id']} rejected: waits_on {raw[:80]!r} is not one of ask:<id>, resource:<name>, "
+                         f"until:<time> or when:<probe>")
+    if kind == "ask":
+        if value.lower() == anchors.NEW_ASK:
+            if turn_asks:
+                return anchors.label("ask", str(turn_asks[-1][1]))
+            if later_ask:
+                return anchors.label("ask", anchors.NEW_ASK)
+            raise ValueError(f"#{task['id']} rejected: waits_on ask:new, but this turn sends no ask_user")
+        mid = value.lstrip("#")
+        if not mid.isdigit() or not db.one("SELECT id FROM messages WHERE id=? AND kind='ask' AND handled=0",
+                                           (int(mid),)):
+            raise ValueError(f"#{task['id']} rejected: waits_on {raw[:80]!r}: no open ask #{mid}")
+        return anchors.label("ask", mid)
+    if kind == "resource":
+        if not RESOURCE_RE.fullmatch(value):
+            raise ValueError(f"#{task['id']} rejected: waits_on resource {value[:80]!r} is not a resource name")
+        return anchors.label("resource", value)
+    if kind == "until":
+        try:
+            at = parse_start_after(value)
+        except ValueError as e:
+            raise ValueError(f"#{task['id']} rejected: waits_on until: {str(e).replace('start_after ', '', 1)}") \
+                from None
+        if at is None:
+            raise ValueError(f"#{task['id']} rejected: waits_on until {value!r} is not in the future")
+        return anchors.label("until", f"{at:.0f}")
+    check_probe(value, "waits_on when")
+    return anchors.label("when", value)
+
+
 def check_probe(probe, what: str = "start_when") -> None:
     """A task's shell probe (start_when, or a waiting task's retry_when): one command, bounded."""
     if not isinstance(probe, str) or len(probe) > START_WHEN_CHARS:
@@ -719,7 +777,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
     # config_set goes first so a cap raised in this turn counts for this turn's task_add actions.
     # The index stays the original one so replay keys do not change.
     order = sorted(enumerate(actions), key=lambda ia: (ia[1] or {}).get("type") != "config_set")
-    for i, a in order:
+    turn_asks: list[tuple[int, int]] = []   # (position in order, ask id) of this turn's asks, for `waits_on ask:new`
+    new_ask_holds: list[tuple[int, dict, dict]] = []   # (position, task before, update) waiting for a later ask
+    for k, (i, a) in enumerate(order):
         t = a.get("type")
         key = f"{turn}.{i}" if turn is not None else None
         try:
@@ -832,6 +892,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                             # A requeue is a decision to run it, not to sleep on its probe.
                             prev.pop("waiting_since")
                             upd["result"] = dump_result(prev)
+                waits = _hold_anchor(db, task, a, turn_asks,
+                                     any((x or {}).get("type") == "ask_user" for _, x in order[k + 1:]))
                 if a.get("depends_on") is not None:
                     deps = _new_dependencies(db, task, a["depends_on"])
                     upd["depends_on"] = deps
@@ -900,7 +962,14 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         notes.append(f"task_update: #{task['id']} asks for PR delivery but is running as "
                                      f"`{task['kind']}` and keeps that kind mid-run, so it cannot open the PR: "
                                      f"cancel it and task_add a code task with continues={task['id']}")
+                if waits or upd.get("status", "blocked") != "blocked":
+                    labels = upd.get("labels")
+                    labels = json.loads(task["labels"] or "[]") if labels is None else labels
+                    if waits or anchors.without(labels) != labels:
+                        upd["labels"] = anchors.without(labels) + ([waits] if waits else [])
                 db.update_task(task["id"], **upd)
+                if waits == anchors.label("ask", anchors.NEW_ASK):
+                    new_ask_holds.append((k, task, upd))
                 if spec and task["status"] == "running":
                     for r in db.q("SELECT dir FROM runs WHERE task=? AND status='running'", (task["id"],)):
                         if r["dir"]:
@@ -943,8 +1012,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     text += f"{_LEAST_NOTE}{least}"
                 if rec:
                     text += f"{_REC_NOTE}{rec}"
-                db.post("out", text, chat=None, kind="ask", severity=_norm_severity(a.get("severity") or "high"),
-                        ref=f"{prguard.BLOCKING_REF}{a['blocking']}")
+                turn_asks.append((k, db.post("out", text, chat=None, kind="ask",
+                                             severity=_norm_severity(a.get("severity") or "high"),
+                                             ref=f"{prguard.BLOCKING_REF}{a['blocking']}")))
             elif t == "resolve":
                 n = db.x("UPDATE messages SET handled=1 WHERE id=? AND kind='ask'", (int(a["id"]),))
                 if not n:
@@ -1105,6 +1175,15 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 raise ValueError(f"unknown action {t!r}")
         except Exception as e:   # one bad action is reported back; it never aborts the turn
             problems.append(f"{t}: {e}")
+    for k, before, upd in new_ask_holds:
+        ask = next((mid for at, mid in turn_asks if at > k), None)
+        now_labels = json.loads((db.task(before["id"]) or before)["labels"] or "[]")
+        if ask is not None:
+            db.update_task(before["id"], labels=anchors.without(now_labels) + [anchors.label("ask", str(ask))])
+        else:   # its ask was rejected: the hold would wait on nothing, so the whole update is undone
+            db.update_task(before["id"], **{f: before[f] for f in upd if f != "updated"})
+            problems.append(f"task_update: #{before['id']} rejected: it waits_on ask:new, but no ask_user of this "
+                            f"turn went through")
     if user_turn and rules_added and not restr_edited and restr_before:
         _restriction_conflicts(p, restr_before, rules_added)
     db.set_kv(NOTES_KEY, notes)
@@ -1318,6 +1397,9 @@ def effort_triggers(db, cfg: dict, event_ids: list[int], wake_due: str | None,
     # An area whose reviews keep failing across stacks needs a re-plan, not another fix round.
     if any(r["kind"] == reviewcap.REVIEW_AREA_EVENT for r in rows):
         add(reviewcap.TRIGGER)
+    # Holds that wait on nothing anyone will act on (anchors.py): the daemon raises each new set once.
+    if any(r["kind"] == anchors.STALE_EVENT for r in rows):
+        add(anchors.TRIGGER)
     if any(r["severity"] in EFFORT_SEVERITIES for r in rows):
         add("high severity event")
     if msg_ids:

@@ -30,6 +30,7 @@ import uuid
 from pathlib import Path
 
 from . import alerts
+from . import anchors
 from . import awake
 from . import budget as bud
 from . import globalcap as gcap
@@ -584,7 +585,7 @@ class Daemon:
         core = self.cfg.get("core_provider") or "claude"
         core_held = self.net_held(core) and not self._net_may_probe(core)
         for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.read_upstream,
-                     self.forward_upstream, self.retry_rejected, self.retire_ended, self.maybe_coordinate, self.probe_waiting, self.start_pushes, self.dispatch, self.deliver_outbound):
+                     self.forward_upstream, self.retry_rejected, self.retire_ended, self.sweep_holds, self.maybe_coordinate, self.probe_waiting, self.start_pushes, self.dispatch, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
                 continue   # no routing to start model work with (see _load_config)
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
@@ -3485,6 +3486,93 @@ class Daemon:
         return {"status": r["status"], "paths": paths[:5], "count": len(paths), "fingerprint": r["fingerprint"],
                 "since": (prev or {}).get("since") if (prev or {}).get("fingerprint") == r["fingerprint"] else now}
 
+    def sweep_holds(self) -> None:
+        """Model-free: requeue a hold whose anchor is over (anchors.py): its ask resolved or expired,
+        its until passed, its resource free and not paused, or its when probe exited 0 (run like a
+        start_when; a broken one is raised once). Then raise the holds with no anchor that went stale,
+        once per set with a new member."""
+        db, now = self.p.db, time.time()
+        for t in db.q("SELECT * FROM tasks WHERE status='blocked' AND labels LIKE '%\"waits:%'"):
+            got = anchors.anchor(t)
+            if not got:
+                continue
+            kind, value = got
+            over = ""
+            if kind == "ask" and value.isdigit():
+                if not db.one("SELECT id FROM messages WHERE id=? AND kind='ask' AND handled=0", (int(value),)):
+                    over = f"ask #{value} was resolved or expired"
+            elif kind == "until":
+                try:
+                    over = "its until passed" if float(value) <= now else ""
+                except ValueError:
+                    over = ""
+            elif kind == "resource":
+                over = f"{value} is free" if self._resource_ready(value) else ""
+            elif kind == "when":
+                over = self._hold_probe(t, value, now)
+            if over:
+                self._release_hold(t, over, now)
+        with db.tx():
+            rows = anchors.stale(db, self.cfg, now, anchors.track(db, now))
+            ids = sorted(r["task"] for r in rows)
+            seen = [int(x) for x in db.kv(anchors.STALE_KEY, []) or []]
+            if ids == seen:
+                return
+            db.set_kv(anchors.STALE_KEY, ids)
+            if not set(ids) - set(seen):
+                return   # only fewer: nothing new to decide
+            db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                 (now, "daemon", anchors.STALE_EVENT, "normal", anchors.event_text(rows), "queued"))
+        log(self.p, f"stale holds raised to the coordinator: {', '.join(f'#{i}' for i in ids)}")
+
+    def _hold_probe(self, task: dict, probe: str, now: float) -> str:
+        """A `when:` hold's probe, run like a start_when: why it is over once it exited 0, else ''."""
+        tid = task["id"]
+        self._drop_stale_probe(tid, probe)
+        got = self._probe_rc.get(tid)
+        if got and got[2] == probe and tid not in self._probes:
+            if got[0] == 0:
+                self._probe_rc.pop(tid, None)
+                return "its when probe passed"
+            if got[0] not in NOT_YET_RCS:
+                fp = f"hold_probe_broken:{tid}:{hashlib.sha256(probe.encode()).hexdigest()[:12]}"
+                if not self.p.db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+                    why = got[0] if isinstance(got[0], str) else f"exit {got[0]}"
+                    self.p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) "
+                                "VALUES(?,?,?,?,?,?,?,?)",
+                                (now, "daemon", "hold_probe_broken", fp, "normal",
+                                 f"#{tid} {task['title']} is held until its probe passes, but the probe is broken "
+                                 f"({why}; only 0 = over and 1, 75 or 255 = not yet are valid): {probe[:300]}. It "
+                                 f"keeps running; decide: task_update waits_on with a fixed probe, requeue the "
+                                 f"task, or cancel it.", "queued", tid))
+        if tid not in self._probes and now - self._probed.get(tid, 0) >= PROBE_EVERY_S:
+            self._start_probe(tid, probe, now, "waits_on when")
+        return ""
+
+    def _resource_ready(self, name: str) -> bool:
+        """Not paused (by any name of the same device) and its lock free, nobody queued for it."""
+        lock = locks.canonical(self.cfg, name)
+        if lock in {locks.canonical(self.cfg, r) for r in self.p.db.paused_resources()}:
+            return False
+        return locks.probe(shared.locks_dir(self.p, lock, self.cfg), lock, self._slot_paths(name))
+
+    def _release_hold(self, task: dict, why: str, now: float) -> None:
+        db = self.p.db
+        prev = load_result(task["result"])
+        upd: dict = {"status": "queued", "blocked_reason": None,
+                     "labels": anchors.without(json.loads(task["labels"] or "[]"))}
+        if "waiting_since" in prev:
+            prev.pop("waiting_since")
+            upd["result"] = dump_result(prev)
+        with db.tx():
+            if (db.task(task["id"]) or {}).get("status") != "blocked":
+                return
+            db.update_task(task["id"], **upd)
+            db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                 (now, "daemon", "hold_released", "low", f"#{task['id']} {task['title']} queued again: {why}",
+                  "handled", task["id"]))
+        log(self.p, f"task {task['id']} hold released: {why}")
+
     def probe_waiting(self) -> None:
         """A waiting task may name a shell probe (`retry_when`) for the thing it waits on. The probe
         runs here, model-free and in the background. Exit 0 makes the task due at once. When its
@@ -5015,8 +5103,11 @@ def _retry_s(result: dict) -> float:
 
 
 def _current_probe(task: dict) -> str | None:
-    """The probe the daemon should be running for a task now: its start_when, else its waiting
-    hand-off's retry_when."""
+    """The probe the daemon should be running for a task now: a hold's `when:` anchor, else its
+    start_when, else its waiting hand-off's retry_when."""
+    held = anchors.anchor(task) if task.get("status") == "blocked" else None
+    if held and held[0] == "when":
+        return held[1]
     when = deferral(task).get("when")
     if when:
         return when

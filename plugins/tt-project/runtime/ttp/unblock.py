@@ -42,7 +42,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import reviewcap
+from . import anchors, reviewcap
 from .db import DB
 
 WINDOWS = (("24 h", 86400), ("7 d", 7 * 86400))
@@ -368,6 +368,29 @@ def inventory(db: DB, now: float | None = None) -> list[dict]:
     return out
 
 
+def unanchored(db: DB, now: float | None = None) -> list[dict]:
+    """Blocked tasks with no anchor (anchors.py), oldest first: {task, title, age_s}, aged from when the
+    hold sweep first saw them blocked, else their last update."""
+    now = time.time() if now is None else now
+    since = db.kv(anchors.SINCE_KEY, {}) or {}
+    out = []
+    for t in db.q("SELECT * FROM tasks WHERE status='blocked' ORDER BY id"):
+        if anchors.anchor(t):
+            continue
+        at = since.get(str(t["id"]))
+        at = float(at) if isinstance(at, (int, float)) else float(t["updated"] or now)
+        out.append({"task": t["id"], "title": t["title"], "age_s": max(0.0, now - at)})
+    return sorted(out, key=lambda r: -r["age_s"])
+
+
+def unanchored_line(rows: list[dict]) -> str:
+    """How many holds wait on nothing, and each one's age (the 10 oldest)."""
+    if not rows:
+        return "none"
+    shown = ", ".join(f"#{r['task']} {_dur(r['age_s'])}" for r in rows[:10])
+    return f"{len(rows)}: {shown}" + (f" and {len(rows) - 10} more" if len(rows) > 10 else "")
+
+
 def self_waits(db: DB, since: float) -> list[dict]:
     """Self-waits handed off since `since`: {task, why}."""
     return [{"task": e["task"], "why": wait_data(e["data"]).get("why") or "other"}
@@ -609,7 +632,8 @@ def escalations_part(db: DB, since: float) -> str:
 def lines(db: DB, now: float | None = None) -> list[str]:
     """The daily review's 'Unblocking quality' lines."""
     now = time.time() if now is None else now
-    out = [f"stuck now (inventory, whenever it started): {inventory_line(inventory(db, now))}"]
+    out = [f"stuck now (inventory, whenever it started): {inventory_line(inventory(db, now))}",
+           f"holds with no anchor (no ask, resource, until or when), by age: {unanchored_line(unanchored(db, now))}"]
     for label, span in WINDOWS:
         eps = episodes(db, now - span, now)
         segs = intervals(db, now - span, now)

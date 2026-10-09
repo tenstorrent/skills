@@ -125,6 +125,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # A task deferred with `start_when` that has not started after this long is raised
                     # to the coordinator once.
                     "defer_max_days": 14,
+                    # A blocked task with no anchor (see anchors.py) held longer than this is raised to
+                    # the coordinator as a stale hold; 0 leaves only the 'user wrote since' rule.
+                    "hold_max_h": 12,
                     # A queued task waiting on a task in 'review' longer than this is raised to the
                     # coordinator once per review stint; 0 turns it off.
                     "review_stall_s": 14400},

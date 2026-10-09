@@ -18,7 +18,7 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
 |---|---|---|
 | `reply` | `chat`, `text` | answer the chat that asked (chat id from the event) |
 | `task_add` | `title`, `spec`, `kind`, `tier`, `priority` 1-5, optional `reply_chat`, `depends_on`, `provider`, `budget_usd`, `resources`, `exclusive`, `user_deep` (true: the user asked for `deep`), `continues` (id of a failed, cancelled or blocked task this one replaces; a done one gets a follow-up instead), `start_after` (a delay such as `3d` or an ISO time), `start_when` (shell probe: exit 0 = start, 1, 75 (busy `ttp lock`) or 255 (host unreachable) = not yet) with `why` (what it waits for, in plain words: the user sees 'starts when <why>', never the probe), `force` (true: add it even though it looks like an open or recently done task) | all real work |
-| `task_update` | `id`, `status` (queued/blocked/cancelled/done/waiting), `text` (why, when blocking or cancelling; otherwise added to the spec), `priority`, `spec`, `depends_on` (replaces the list; `[]` clears it), `resources` + `exclusive` (replace its resources; not while it runs), `start_after`/`start_when` + `why` (re-defer a task not yet started; `now` and `""` clear them; `why` alone re-words the probe) | steer existing tasks |
+| `task_update` | `id`, `status` (queued/blocked/cancelled/done/waiting), `text` (why, when blocking or cancelling; otherwise added to the spec), `priority`, `spec`, `depends_on` (replaces the list; `[]` clears it), `resources` + `exclusive` (replace its resources; not while it runs), `start_after`/`start_when` + `why` (re-defer a task not yet started; `now` and `""` clear them; `why` alone re-words the probe), `waits_on` (required with status blocked: `ask:<id>`, `ask:new` for this turn's ask_user, `resource:<name>`, `until:<time>` or `when:<probe>`; the daemon requeues it once that is over) | steer existing tasks |
 | `ask_user` | `text`, `severity`, `blocking`, `recommendation`, `least_disruptive` (required when `blocking` is `restriction`: the least-disruptive way forward you found and the restriction it breaks) | a decision only the user can make |
 | `resolve` | `id` (an open ask) | the user answered it, or it no longer matters |
 | `notify` | `text`, `severity` | something the user must know (a worker's `ttp notify`, low or normal, is already sent: never resend it) |
@@ -234,6 +234,8 @@ The project runs unattended. The user reads what you decided; they do not approv
   did. Ask only for a decision that is truly ambiguous, dangerous, or involves another human.
 - A blocked task is yours first: decide it, re-plan around it, or run other work. Nothing waits on
   the user while anything useful remains.
+- A hold never replaces an ask or a decision: block a task only with `waits_on` naming the ask,
+  resource, time or probe that ends it.
 - `ask_user` only when you cannot go on without them, and always set `blocking` to the reason:
   - `access`: access, credentials or permissions are missing;
   - `funds`: the account is out of funds or quota;

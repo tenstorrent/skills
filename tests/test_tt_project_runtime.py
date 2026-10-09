@@ -5756,7 +5756,8 @@ def test_a_task_note_never_outlives_the_state_it_described(env, tmp_path):
     task = p.db.task(tid)
     assert task["status"] == "done" and task["blocked_reason"] is None, "a done task kept an old reason"
     tid2 = p.db.add_task("other", "spec", kind="work", tier="light", origin="user")
-    assert coord.apply(p, [{"type": "task_update", "id": tid2, "status": "blocked", "text": "needs a board"}]) == []
+    assert coord.apply(p, [{"type": "task_update", "id": tid2, "status": "blocked", "text": "needs a board",
+                            "waits_on": "resource:board-a"}]) == []
     assert p.db.task(tid2)["blocked_reason"] == "needs a board"
 
 
@@ -32234,3 +32235,173 @@ def test_a_deferred_task_shows_plain_words_never_its_probe(env, why):
     # A wait for another task's landing reads as such without a why.
     assert coord.apply(p, [{"type": "task_update", "id": tid, "start_when": "landed:#12"}]) == []
     assert coord.starts_text(p.db.task(tid), plain=True) == "starts when #12 lands"
+
+
+def _hold_task(p, title="hold me"):
+    tid = p.db.add_task(title, "spec", kind="work", tier="light", origin="user")
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    return tid
+
+
+def test_a_hold_without_an_anchor_is_rejected_and_a_bad_anchor_too(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    tid = _hold_task(p)
+    problems = coord.apply(p, [{"type": "task_update", "id": tid, "status": "blocked",
+                                "text": "until the user confirms"}])
+    assert len(problems) == 1 and "a hold needs `waits_on`" in problems[0] and "ask_user" in problems[0]
+    assert "decide it yourself" in problems[0] and "until or when" in problems[0]
+    assert p.db.task(tid)["status"] == "queued", "an unanchored hold was applied"
+    for bad in ("ask:999", "later:soon", "until:2001-01-01T00:00", "resource:", "ask:new"):
+        got = coord.apply(p, [{"type": "task_update", "id": tid, "status": "blocked", "waits_on": bad}])
+        assert len(got) == 1 and "rejected" in got[0], bad
+        assert p.db.task(tid)["status"] == "queued", bad
+    got = coord.apply(p, [{"type": "task_update", "id": tid, "waits_on": "until:6h"}])
+    assert "goes with status blocked" in got[0]
+    # A daemon-made block stays as it is, and a text change on an anchored hold keeps its anchor.
+    p.db.update_task(tid, status="blocked", blocked_reason="task budget exhausted")
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "status": "blocked", "waits_on": "until:6h",
+                            "text": "after the window"}]) == []
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "status": "blocked", "text": "still"}]) == []
+    assert p.db.task(tid)["blocked_reason"] == "still" and "waits:until:" in p.db.task(tid)["labels"]
+    # Leaving blocked drops the anchor.
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "status": "queued"}]) == []
+    assert "waits:" not in p.db.task(tid)["labels"]
+
+
+def test_a_hold_on_this_turns_ask_points_at_it_and_is_undone_when_the_ask_is_rejected(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    tid = _hold_task(p)
+    hold = {"type": "task_update", "id": tid, "status": "blocked", "text": "needs access", "waits_on": "ask:new"}
+    ask = {"type": "ask_user", "text": "May I use the shared bucket for the results?", "blocking": "access",
+           "recommendation": "yes"}
+    assert coord.apply(p, [hold, ask]) == []
+    aid = p.db.one("SELECT MAX(id) id FROM messages WHERE kind='ask'")["id"]
+    assert f'"waits:ask:{aid}"' in p.db.task(tid)["labels"] and p.db.task(tid)["status"] == "blocked"
+    tid2 = _hold_task(p, "second")
+    assert coord.apply(p, [{"type": "ask_user", "text": "Which account pays for the run?", "blocking": "funds"},
+                           {**hold, "id": tid2}]) == []
+    aid2 = p.db.one("SELECT MAX(id) id FROM messages WHERE kind='ask'")["id"]
+    assert f'"waits:ask:{aid2}"' in p.db.task(tid2)["labels"]
+    tid3 = _hold_task(p, "third")
+    got = coord.apply(p, [{**hold, "id": tid3}, {**ask, "blocking": "maybe"}])
+    assert any("no ask_user of this turn went through" in x for x in got)
+    t3 = p.db.task(tid3)
+    assert t3["status"] == "queued" and t3["blocked_reason"] is None and "waits:" not in t3["labels"]
+
+
+def test_each_hold_anchor_releases_its_task_once_it_is_over(env, tmp_path):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    ask_t, until_t, res_t, when_t = (_hold_task(p, n) for n in ("ask", "until", "resource", "when"))
+    flag = tmp_path / "go"
+    assert coord.apply(p, [{"type": "ask_user", "text": "May I spend $40 on the long run?", "blocking": "spend"},
+                           {"type": "task_update", "id": ask_t, "status": "blocked", "waits_on": "ask:new"},
+                           {"type": "task_update", "id": until_t, "status": "blocked", "waits_on": "until:2h"},
+                           {"type": "task_update", "id": res_t, "status": "blocked", "waits_on": "resource:board-a"},
+                           {"type": "task_update", "id": when_t, "status": "blocked",
+                            "waits_on": f"when:test -e {flag}"}]) == []
+    coord.pause_resource(p, "board-a", True, "maintenance")
+    d.sweep_holds()
+    if when_t in d._probes:
+        d._probes[when_t][0].wait(10)
+    d.probe_waiting()
+    d.sweep_holds()
+    assert all(p.db.task(t)["status"] == "blocked" for t in (ask_t, until_t, res_t, when_t))
+    aid = p.db.one("SELECT MAX(id) id FROM messages WHERE kind='ask'")["id"]
+    assert coord.apply(p, [{"type": "resolve", "id": aid}]) == []
+    p.db.update_task(until_t, labels=[f"waits:until:{time.time() - 1:.0f}"])
+    coord.pause_resource(p, "board-a", False)
+    flag.write_text("")
+    d._probed.clear()
+    d.sweep_holds()
+    d._probes[when_t][0].wait(10)
+    d.probe_waiting()
+    d.sweep_holds()
+    for t in (ask_t, until_t, res_t, when_t):
+        task = p.db.task(t)
+        assert task["status"] == "queued" and "waits:" not in task["labels"], task["title"]
+    why = [e["text"] for e in p.db.q("SELECT text FROM events WHERE kind='hold_released' ORDER BY id")]
+    assert len(why) == 4 and any("ask #" in w for w in why) and any("when probe passed" in w for w in why)
+
+
+def test_an_expired_ask_releases_its_hold(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    tid = _hold_task(p)
+    assert coord.apply(p, [{"type": "ask_user", "text": "May I delete the old artifacts?",
+                            "blocking": "irreversible"},
+                           {"type": "task_update", "id": tid, "status": "blocked", "waits_on": "ask:new"}]) == []
+    p.db.x("UPDATE messages SET handled=1 WHERE kind='ask'")   # what expire_asks does to a due ask
+    Daemon(p.base).sweep_holds()
+    assert p.db.task(tid)["status"] == "queued"
+
+
+def test_stale_holds_raise_one_trigger_per_new_set_and_legacy_holds_count(env):
+    p = make(env)
+    from ttp import anchors
+    from ttp import coordinator as coord
+    from ttp import unblock
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    now = time.time()
+    legacy = _hold_task(p, "legacy hold")
+    p.db.update_task(legacy, status="blocked", blocked_reason="until the user confirms")
+    p.db.x("UPDATE tasks SET updated=? WHERE id=?", (now - 20 * 3600, legacy))
+    fresh = _hold_task(p, "fresh hold")
+    p.db.update_task(fresh, status="blocked", blocked_reason="needs a look")
+    anchored = _hold_task(p, "anchored")
+    p.db.update_task(anchored, status="blocked", labels=[f"waits:until:{now + 3600:.0f}"])
+    p.db.x("UPDATE tasks SET updated=? WHERE id=?", (now - 30 * 3600, anchored))
+
+    def stale_events():
+        return p.db.q("SELECT * FROM events WHERE kind=?", (anchors.STALE_EVENT,))
+    d.sweep_holds()
+    d.sweep_holds()
+    evs = stale_events()
+    assert len(evs) == 1 and f"#{legacy} legacy hold" in evs[0]["text"] and f"#{fresh} " not in evs[0]["text"]
+    assert evs[0]["status"] == "queued"
+    labels, _ = coord.effort_triggers(p.db, p.config(), [evs[0]["id"]], None)
+    assert anchors.TRIGGER in labels
+    # A spec edit does not make the old hold look new.
+    assert coord.apply(p, [{"type": "task_update", "id": legacy, "spec": "more detail"}]) == []
+    d.sweep_holds()
+    assert len(stale_events()) == 1
+    # A user message after a hold makes it stale too: a new set, one more trigger.
+    p.db.post("in", "the board is back", chat="c1")
+    d.sweep_holds()
+    d.sweep_holds()
+    evs = stale_events()
+    assert len(evs) == 2 and f"#{fresh} fresh hold" in evs[1]["text"] and "the user wrote since" in evs[1]["text"]
+    # A set that only shrinks raises nothing; the anchored hold never counts.
+    p.db.update_task(fresh, status="cancelled")
+    d.sweep_holds()
+    assert len(stale_events()) == 2 and all(f"#{anchored} " not in e["text"] for e in stale_events())
+    line = next(x for x in unblock.lines(p.db) if x.startswith("holds with no anchor"))
+    assert line.endswith(f"1: #{legacy} 20.0 h")
+
+
+def test_a_replayed_free_text_hold_13h_old_with_no_ask_gives_exactly_one_trigger(env):
+    p = make(env)
+    from ttp import anchors
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    tid = _hold_task(p, "deploy after confirmation")
+    # The hold as an older release let the coordinator make it: free text, no ask, no end.
+    p.db.update_task(tid, status="blocked", blocked_reason="blocked until the user confirms the deploy")
+    p.db.x("UPDATE tasks SET updated=? WHERE id=?", (time.time() - 13 * 3600, tid))
+    assert not p.db.one("SELECT id FROM messages WHERE kind='ask' AND handled=0")
+    d = Daemon(p.base)
+    for _ in range(5):
+        d.sweep_holds()
+    evs = p.db.q("SELECT * FROM events WHERE kind=?", (anchors.STALE_EVENT,))
+    assert len(evs) == 1 and f"#{tid} deploy after confirmation (held 13.0h" in evs[0]["text"]
+    labels, _ = coord.effort_triggers(p.db, p.config(), [e["id"] for e in evs], None)
+    assert labels.count(anchors.TRIGGER) == 1
+    assert "anchored" not in labels
+    Daemon(p.base).sweep_holds()   # a restarted daemon does not raise it again
+    assert len(p.db.q("SELECT id FROM events WHERE kind=?", (anchors.STALE_EVENT,))) == 1
