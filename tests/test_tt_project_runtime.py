@@ -19666,11 +19666,14 @@ def test_a_long_tick_tells_both_watchdogs_it_still_moves(env, monkeypatch):
     sock.settimeout(0.2)
     d = dm.Daemon(p.base)
     d._notify = addr
+    # The tick's steps, read from the daemon itself, so a new step needs no change here.
+    import ast, inspect, textwrap
+    tick_src = ast.parse(textwrap.dedent(inspect.getsource(dm.Daemon.tick)))
+    loop_steps = [e.attr for n in ast.walk(tick_src) if isinstance(n, ast.For) and isinstance(n.iter, ast.Tuple)
+                  for e in n.iter.elts if isinstance(e, ast.Attribute)]
+    assert len(loop_steps) > 10 and "dispatch" in loop_steps, loop_steps
     steps = []
-    for name in ("reap_runs", "wake_after_reboot", "meter_running", "reconcile_tasks", "tend_pushes", "prune_worktrees",
-                 "backup_branches", "check_local_only", "check_disk", "sweep_alerts", "check_release", "sync_shared_pauses", "check_integrity", "sync_schedules", "lint_charter", "tend_holds", "_refresh_meters", "update_gates", "run_schedules", "poll_slack",
-                 "check_resource_trouble", "read_upstream", "forward_upstream", "retry_rejected", "retire_ended", "sweep_holds", "maybe_coordinate", "probe_waiting", "start_pushes",
-                 "dispatch", "deliver_outbound"):
+    for name in loop_steps + ["_refresh_meters", "update_gates"]:
         monkeypatch.setattr(d, name, lambda name=name: steps.append(name))
     monkeypatch.setattr(dm.coord, "expire_asks", lambda *a, **k: [])
     monkeypatch.setattr(dm, "PROGRESS_EVERY_S", 0)   # each step stands for a slow one
@@ -19688,7 +19691,9 @@ def test_a_long_tick_tells_both_watchdogs_it_still_moves(env, monkeypatch):
     finally:
         sock.close()
         cleanup()
-    assert len(steps) == 31 and pings == [b"WATCHDOG=1"] * 29, (steps, pings)
+    # Every step ran and each one, standing for a slow step, reached the systemd watchdog.
+    ran = [s for s in steps if s in loop_steps]
+    assert ran == loop_steps and pings == [b"WATCHDOG=1"] * len(ran), (steps, pings)
     # Before its first completed tick the heartbeat is not written (`ttp restart` reads it as that
     # tick); the start marker carries the progress, which `ttp.watchdog` counts.
     assert not hb.exists()
