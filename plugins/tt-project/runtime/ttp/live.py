@@ -52,6 +52,12 @@ def unavailable(prov: Provider) -> str:
     return ""
 
 
+def hook_used(argv: list) -> bool:
+    """Whether a run's argv routes tool results through the harness hook (Codex gets it per run,
+    only when hooks are on; see providers/codex.py)."""
+    return any("ttp.hook PostToolUse" in str(a) for a in argv)
+
+
 def judge(prov: Provider, ev: dict) -> dict[str, tuple[str, str]]:
     """Each check's (status, note) from what the runs left (`ev`, gathered by measure()). Pure, so
     every path is tested without a real agent."""
@@ -100,7 +106,7 @@ def judge(prov: Provider, ev: dict) -> dict[str, tuple[str, str]]:
         out["resume"] = (PASS, "")
     else:
         out["resume"] = (FAIL, (r.get("error") or "the resumed run did not recall the code word")[:200])
-    if not getattr(prov, "steer_hook", False):
+    if not (getattr(prov, "steer_hook", False) or ev.get("hook_used")):
         out["steer"] = (UNSUPPORTED, "no hook: the worker reads steer.md between steps")
     elif ev.get("steer_delivered"):
         out["steer"] = (PASS, "" if w.get("steer_word_seen") else "handed over; the agent did not echo it")
@@ -201,7 +207,9 @@ def measure(provider: str, *, tier: str = "light", timeout_s: float = RUN_TIMEOU
         ev["windows"] = [f"{w.get('window')}" for w in (u.extra.get("windows") or [])]
         if not ev["windows"] and type(prov).meter is not Provider.meter:
             ev["windows"] = [w.window for w in prov.meter()]
-        env = json.loads((run_dir / "run.json").read_text()).get("env") or {}
+        spec = json.loads((run_dir / "run.json").read_text())
+        env = spec.get("env") or {}
+        ev["hook_used"] = hook_used(spec.get("argv") or [])
         if not prov.resume_args("00000000-0000-4000-8000-000000000000"):
             ev["resume"] = {}
         elif not u.session_id:

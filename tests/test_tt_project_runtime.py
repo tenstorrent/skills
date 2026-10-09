@@ -32451,3 +32451,17 @@ def test_a_replayed_free_text_hold_13h_old_with_no_ask_gives_exactly_one_trigger
     assert "anchored" not in labels
     Daemon(p.base).sweep_holds()   # a restarted daemon does not raise it again
     assert len(p.db.q("SELECT id FROM events WHERE kind=?", (anchors.STALE_EVENT,))) == 1
+
+
+def test_live_check_judges_codex_steer_by_the_hook_its_run_got(env, monkeypatch, tmp_path):
+    # Codex has no fixed steer_hook: a build with hooks on gets ttp.hook per run, so the steer check
+    # passes or fails on what the run did; without hooks it stays unsupported.
+    from ttp import live
+    worker, _, _ = _codex_hooks(monkeypatch, tmp_path)
+    prov, argv = worker()
+    assert not getattr(prov, "steer_hook", False) and live.hook_used(argv)
+    st = lambda **kw: live.judge(prov, _live_ev(**kw))["steer"][0]
+    assert st(hook_used=True) == "pass" and st(hook_used=True, steer_delivered=False) == "fail"
+    assert st(hook_used=False) == "unsupported"
+    off, _, _ = _codex_hooks(monkeypatch, tmp_path, features="hooks  stable  false\n")
+    assert not live.hook_used(off()[1])
