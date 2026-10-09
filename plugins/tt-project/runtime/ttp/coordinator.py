@@ -39,6 +39,7 @@ ACTION_TYPES = ("reply", "task_add", "task_update", "ask_user", "resolve", "noti
 START_AFTER_RE = (r"^(now|[0-9]+ ?[smhdw]|[0-9]{4}-[0-9]{2}-[0-9]{2}([T ][0-9]{2}:[0-9]{2}(:[0-9]{2})?)?"
                   r"(Z|[+-][0-9]{2}:?[0-9]{2})?)$")
 START_WHEN_CHARS = 1000
+START_WHY_CHARS = 200     # the plain words for a start_when probe, shown to the user instead
 MAX_DEFER_S = 365 * 86400
 
 # Why an ask cannot be decided by the coordinator itself. Anything else is a judgment call.
@@ -653,22 +654,40 @@ def check_probe(probe, what: str = "start_when") -> None:
         raise ValueError(f"{what} must be one shell command of at most {START_WHEN_CHARS} characters")
 
 
-def defer_labels(after: float | None, when: str | None) -> list[str]:
+def start_why(a: dict, cur: dict, when: str | None) -> str | None:
+    """The plain words for a start_when probe: the action's `why`, else the current one while the
+    probe stays the same. None without a probe."""
+    if not when:
+        return None
+    why = a.get("why") if a.get("why") is not None else cur.get("why") if when == cur.get("when") else None
+    why = " ".join(str(why or "").split())[:START_WHY_CHARS]
+    return why or None
+
+
+def defer_labels(after: float | None, when: str | None, why: str | None = None) -> list[str]:
     """The labels a deferred task carries (see db.deferral); none when it may start now."""
     if after is None and not when:
         return []
     return ([f"start_after:{after:.0f}"] if after else []) + ([f"start_when:{when}"] if when else []) \
-        + [f"deferred_since:{time.time():.0f}"]
+        + ([f"start_why:{why}"] if when and why else []) + [f"deferred_since:{time.time():.0f}"]
 
 
-def starts_text(task: dict, now: float | None = None) -> str:
-    """'starts <time>' / 'starts when: <probe>' for a task that waits to start; '' otherwise."""
+def starts_text(task: dict, now: float | None = None, plain: bool = False) -> str:
+    """'starts <time>' / 'starts when: <probe>' for a task that waits to start; '' otherwise.
+    `plain` (what the user sees): 'starts when <why>', or 'when a check passes', never the probe."""
     now = time.time() if now is None else now
     d = deferral(task)
     after = d.get("after") if (d.get("after") or 0) > now and (task.get("not_before") or 0) > now else None
     if not after and not d.get("when"):
         return ""
-    when = f"when: {clip(d['when'], 160)}" if d.get("when") else ""
+    if not d.get("when"):
+        when = ""
+    elif plain:
+        landed = re.fullmatch(r"landed:#([0-9]+)", d["when"].strip())
+        when = (f"when {clip(d['why'], 160)}" if d.get("why") else f"when #{landed[1]} lands" if landed
+                else "when a check passes")
+    else:
+        when = f"when: {clip(d['when'], 160)}" + (f" ({clip(d['why'], 160)})" if d.get("why") else "")
     return "starts " + (f"{_clock(after)}" + (f", then {when}" if when else "") if after else when)
 
 
@@ -770,7 +789,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if old:
                     labels.append(f"continues:{old['id']}")
                 after, when = _start_args(a, {})
-                labels += defer_labels(after, when)
+                labels += defer_labels(after, when, start_why(a, {}, when))
                 why = prguard.spec_problem(db, a.get("spec") or "")
                 if why:
                     raise ValueError(f"task_add rejected: {why}")
@@ -838,14 +857,16 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         prev = load_result(upd.get("result") or task["result"])
                         prev.pop("waiting_since", None)
                         upd["result"] = dump_result(prev)
-                if a.get("start_after") is not None or a.get("start_when") is not None:
+                if a.get("start_after") is not None or a.get("start_when") is not None \
+                        or (a.get("why") is not None and deferral(task).get("when")):
                     if task["status"] in ("running", *TERMINAL_TASK_STATES):
                         raise ValueError(f"task #{task['id']} is {task['status']}: only a task that has not "
                                          f"started can be deferred; add a new one with start_after/start_when")
-                    after, when = _start_args(a, deferral(task))
+                    cur = deferral(task)
+                    after, when = _start_args(a, cur)
                     labels = upd.get("labels")
                     labels = json.loads(task["labels"] or "[]") if labels is None else labels
-                    upd["labels"] = without_deferral(labels) + defer_labels(after, when)
+                    upd["labels"] = without_deferral(labels) + defer_labels(after, when, start_why(a, cur, when))
                     upd["not_before"] = after
                 # The daemon blocks a queued task on a dead dependency at once, so accepting this
                 # would report a requeue that does not stick.

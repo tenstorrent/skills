@@ -590,13 +590,13 @@ def reviews_task(review: dict, task: dict) -> bool:
     return bool(branch and re.search(rf"(?<![\w/.-]){re.escape(branch)}(?![\w/-])", review.get("spec") or ""))
 
 
-DEFER_LABELS = ("start_after", "start_when", "deferred_since")
+DEFER_LABELS = ("start_after", "start_when", "start_why", "deferred_since")
 
 
 def deferral(task: dict) -> dict:
     """A deferred task's start condition, from its labels: `after` (epoch seconds, kept in
-    `not_before` too), `when` (a shell probe that must exit 0 first) and `since` (when it was
-    deferred). Empty when the task is not deferred."""
+    `not_before` too), `when` (a shell probe that must exit 0 first), `why` (plain words for the
+    probe) and `since` (when it was deferred). Empty when the task is not deferred."""
     try:
         labels = json.loads(task["labels"] or "[]")
     except (ValueError, KeyError, TypeError):
@@ -606,6 +606,8 @@ def deferral(task: dict) -> dict:
         key, _, val = lb.partition(":") if isinstance(lb, str) else ("", "", "")
         if key == "start_when" and val.strip():
             out["when"] = val
+        elif key == "start_why" and val.strip():
+            out["why"] = val
         elif key in ("start_after", "deferred_since"):
             try:
                 out["after" if key == "start_after" else "since"] = float(val)

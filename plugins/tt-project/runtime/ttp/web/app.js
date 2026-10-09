@@ -66,6 +66,7 @@ function taskRow(t) {
   const noteLabel = t.status === "blocked" ? "Blocked" : waiting(t) ? "Waiting" : held(t) ? "Held" : "Note";
   return `<details class="row"><summary><span class="id">#${t.id}</span> <span class="st st-${t.outcome || t.status}">${label}</span>
     <span class="title">${esc(t.title)}</span> <span class="meta">${esc(t.tier)} · ${money(t.spent_usd)}${t.budget_usd ? " / " + money(t.budget_usd) : ""} · ${agoH(t.updated)} ago${t.pr_url ? ` · <a href="${esc(t.pr_url)}" target="_blank" rel="noopener">PR</a>` : ""}</span></summary>
+    ${t.wait ? `<p class="meta">${esc(t.wait.text)} (${esc(t.wait.age)})</p>` : ""}${t.start_when ? `<p class="meta">start check: <code>${esc(t.start_when)}</code></p>` : ""}
     ${t.blocked_reason ? `<p><b>${noteLabel}:</b> ${esc(t.blocked_reason)}</p>` : ""}${t.result ? `<p>${esc(t.result)}</p>` : ""}
     ${(t.pushed || []).map((x) => `<p class="meta">${x.status === "landed" ? "already on the branch" : "pushed"} ${esc((x.sha || "").slice(0, 7))}${x.version ? " as " + esc(x.version) : ""} (${esc(x.branch || "?")})</p>`).join("")}
     <p class="meta">origin ${esc(t.origin)} · kind ${esc(t.kind)} · attempts ${t.attempts}${t.branch ? " · branch " + esc(t.branch) : ""}</p>
@@ -105,12 +106,16 @@ function announce(items, project) {
 }
 document.addEventListener("visibilitychange", () => { if (!document.hidden) unseen = 0; });
 
+// Blocked tasks that wait on the user (kind "user"), or on anything else (no kind).
+const stuck = (st, kind) => st.tasks.filter((t) => t.status === "blocked" && t.wait && (kind ? t.wait.kind === kind : t.wait.kind !== "user"));
 function board(st) {
   const asks = st.attention.filter((m) => m.kind === "ask");
   // An item is its text, cut to fit, then an optional HTML tail (an age).
   const cols = [
-    ["you", "Waiting on you", st.tasks.filter((t) => t.status === "blocked").map((t) => [`#${t.id} ${t.title}${t.blocked_reason ? ` — ${t.blocked_reason}` : ""}`])
+    // Only what needs the user: open asks and tasks that wait on them. Other stuck tasks are the project's.
+    ["you", "Waiting on you", stuck(st, "user").map((t) => [`#${t.id} ${t.title} — ${t.wait.text}`, ` (${t.wait.age})`])
       .concat(asks.map((m) => [`${m.text}`, "", `ask ${m.id}, ${agoH(m.ts)} ago: `]))],
+    ["stuck", "Stuck, the project is on it", stuck(st).map((t) => [`#${t.id} ${t.title} — ${t.wait.text}`, ` (${t.wait.age})`])],
     ["review", "Ready for review", st.tasks.filter((t) => t.status === "review" || (t.pr_url && t.status === "done")).map((t) => [`#${t.id} ${t.title}`, t.review_since ? ` (in review ${agoH(t.review_since)})` : ""])],
     ["work", "Working", st.tasks.filter((t) => t.status === "running").map((t) => [`#${t.id} ${t.title}`])],
     ["queued", "Queued", st.tasks.filter((t) => t.status === "queued").map((t) => [`#${t.id} ${t.title}${deferred(t) ? ` (${t.starts})` : waiting(t) ? ` (waiting, next try ${at(t.not_before)})` : ""}`])],

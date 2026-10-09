@@ -22619,7 +22619,7 @@ def test_deferred_tasks_show_in_rows_not_alerts(env):
                     {"type": "task_add", "title": "next week", "spec": "s", "start_after": "7d"}])
     st = state_payload(p, p.db)
     rows = {t["title"]: t for t in st["tasks"]}
-    assert rows["probe later"]["starts"] == "starts when: test -f out/done"
+    assert rows["probe later"]["starts"] == "starts when a check passes"   # the probe is in start_when
     assert rows["next week"]["starts"].startswith("starts ") and "labels" not in rows["next week"]
     h = st["health"]
     assert {t["title"] for t in h["deferred"]} == {"probe later", "next week"}
@@ -22627,7 +22627,7 @@ def test_deferred_tasks_show_in_rows_not_alerts(env):
     assert "2 task(s) deferred" in h["why_idle"] and "wait on other tasks" not in h["why_idle"]
     assert not any("probe later" in a.get("text", "") or "next week" in a.get("text", "") for a in st["attention"])
     out = status_text(p)
-    assert "deferred, starts when: test -f out/done: probe later" in out and "waiting, next try" not in out
+    assert "deferred, starts when a check passes: probe later" in out and "waiting, next try" not in out
     dg = coord.digest(p, {}, [], [])
     assert "| queued (starts when: test -f out/done) |" in dg
 
@@ -31780,3 +31780,113 @@ def test_devq_guard_accepts_function_keyword_handlers_and_tilde_netfs_prefixes(t
     monkeypatch.setenv("HOME", str(tmp_path))
     resolved, pre = devq.resolve_local(os.path.expanduser("~/net/a"), ["~/net"])
     assert pre == f"{tmp_path}/net" and resolved == f"{tmp_path}/net/a"
+
+
+# What a stuck task waits on (waits.wait_kind), and plain words for deferred probes -----------------
+
+_BLOCK_REASONS = [
+    ("dependency #7 failed", "coordinator", "waits on the coordinator: dependency #7 failed"),
+    ("a dependency is not a task id", "coordinator", "waits on the coordinator: a dependency is not a task id"),
+    ("task budget exhausted", "budget", "waits on budget: its task budget is used up"),
+    ("its $5.00 budget is above the dollar cap", "budget", "waits on budget: its budget is above the dollar cap"),
+    ("workspace: worktree add failed", "coordinator", "waits on the coordinator: a workspace fix: worktree add failed"),
+    ("lost to a host reboot 3 times; it may be causing them", "coordinator",
+     "waits on the coordinator: lost to a host reboot 3 times; it may be causing them"),
+    ("push refused: the branch is protected", "coordinator", "waits on the coordinator: push refused: the branch is protected"),
+    ("Which of the two layouts should the cache use?", "coordinator",
+     "waits on the coordinator: Which of the two layouts should the cache use?"),
+]
+
+
+@pytest.mark.parametrize("reason,kind,text", _BLOCK_REASONS)
+def test_status_and_web_say_what_a_blocked_task_waits_on(env, reason, kind, text):
+    """Each blocked reason the daemon writes is the project's to move: the task is listed as stuck
+    with plain words and an age, never under 'needs you', in `ttp status` and in /api/state."""
+    from ttp.cli import status_text
+    from ttp.web import state_payload
+    p = make(env)
+    tid = p.db.add_task("cache layout", "s", origin="user")
+    p.db.update_task(tid, status="blocked", blocked_reason=reason)
+    w = next(t for t in state_payload(p, p.db)["tasks"] if t["id"] == tid)["wait"]
+    assert (w["kind"], w["text"]) == (kind, text) and w["age"] == "0.0h" and w["asks"] == [], w
+    out = status_text(p)
+    assert "stuck, the project is on it:" in out and f"  #{tid} 0.0h: cache layout — {text}" in out, out
+    assert f"needs you (#{tid}" not in out, out
+
+
+def test_a_task_an_open_ask_names_waits_on_the_user(env):
+    from ttp.cli import status_text
+    from ttp.web import state_payload
+    p = make(env)
+    tid = p.db.add_task("pick a vendor", "s", origin="user")
+    other = p.db.add_task("other", "s", origin="user")
+    p.db.update_task(tid, status="blocked", blocked_reason="needs a vendor choice")
+    p.db.update_task(other, status="blocked", blocked_reason="dependency #99 failed")
+    # #1 inside #10 or #100 does not count: only the exact id.
+    ask = p.db.post("out", f"#{tid}: vendor A or B? (not #{tid}0)", chat=None, kind="ask", severity="high")
+    st = state_payload(p, p.db)
+    w = next(t for t in st["tasks"] if t["id"] == tid)["wait"]
+    assert w["kind"] == "user" and w["text"] == f"waits on you: ask {ask}" and w["asks"] == [ask], w
+    assert next(t for t in st["tasks"] if t["id"] == other)["wait"]["kind"] == "coordinator"
+    out = status_text(p)
+    assert f"  needs you (#{tid}, 0.0h): pick a vendor — waits on you: ask {ask}" in out, out
+    assert f"  #{other} 0.0h: other — waits on the coordinator" in out, out
+    # Answered, it is the coordinator's again.
+    p.db.x("UPDATE messages SET handled=1 WHERE id=?", (ask,))
+    assert f"needs you (#{tid}" not in status_text(p)
+
+
+def test_wait_kind_label_wins_and_queued_holds_read_plainly():
+    from ttp import waits
+    from ttp.daemon import LOGGED_OUT_NOTE, NET_HELD_NOTE, PAUSED_NOTE
+    t = {"id": 3, "status": "blocked", "updated": 100.0, "blocked_reason": "dependency #2 failed",
+         "labels": json.dumps(["waits:resource:the lab board"])}
+    asks = [{"id": 9, "ts": 50.0, "kind": "ask", "text": "about #3"}]
+    assert waits.wait_kind(t, asks, now=3700.0)["text"] == "waits on the lab board"
+    assert waits.wait_kind({**t, "labels": "[]"}, asks, now=3700.0)["age"] == "1.0h"   # from the ask
+    assert waits.wait_kind({**t, "labels": '["waits:review:#12"]'}, [], 100.0)["text"] == "waits on a review: #12"
+    assert waits.wait_kind({**t, "labels": '["waits:bogus:x"]'}, [], 100.0)["kind"] == "coordinator"
+    assert waits.wait_kind({**t, "status": "review", "labels": "[]"}, [], 100.0)["kind"] == "review"
+    for reason, kind in ((f"{PAUSED_NOTE} box: maintenance; it starts once resumed (`ttp resume x --resource box`)",
+                          "resource"), (f"{LOGGED_OUT_NOTE} (claude); it starts once a login check passes", "user"),
+                         (f"{NET_HELD_NOTE} waiting for claude's API host to resolve", "resource"),
+                         ("waiting for the build box; its probe says not yet; next try 10:00", "resource"),
+                         ("interrupted by `ttp stop --kill`; resumes", "time")):
+        w = waits.wait_kind({**t, "status": "queued", "labels": "[]", "blocked_reason": reason}, [], 100.0)
+        assert w["kind"] == kind and "`" not in w["text"] and "probe" not in w["text"], (reason, w)
+    assert waits.wait_kind({**t, "status": "queued", "labels": "[]",
+                            "blocked_reason": "waiting for the build box; its probe says not yet; next try 10:00"},
+                           [], 100.0)["text"] == "waits on the build box"
+
+
+@pytest.mark.parametrize("why", [None, "the build lands on the branch"])
+def test_a_deferred_task_shows_plain_words_never_its_probe(env, why):
+    """start_when's shell text stays in the task's detail (and the coordinator's digest); status
+    and the board say 'starts when <why>', or 'when a check passes' without one."""
+    from ttp import coordinator as coord
+    from ttp.cli import status_text
+    from ttp.web import state_payload
+    p = make(env)
+    probe = "test -f out/landed.marker"
+    a = {"type": "task_add", "title": "after landing", "spec": "s", "start_when": probe}
+    assert coord.apply(p, [{**a, **({"why": why} if why else {})}]) == []
+    tid = p.db.q("SELECT id FROM tasks WHERE title='after landing'")[0]["id"]
+    want = f"starts when {why}" if why else "starts when a check passes"
+    st = state_payload(p, p.db)
+    t = next(t for t in st["tasks"] if t["id"] == tid)
+    assert t["starts"] == want and t["start_when"] == probe and t["start_why"] == why, t
+    out = status_text(p)
+    assert f"  #{tid} deferred, {want}: after landing" in out and "landed.marker" not in out, out
+    assert probe in coord.starts_text(p.db.task(tid))   # the coordinator still sees the probe
+    # A later why alone re-words it; a new probe without one drops the old words.
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "why": "the release is tagged"}]) == []
+    assert coord.starts_text(p.db.task(tid), plain=True) == "starts when the release is tagged"
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "start_when": "test -f other"}]) == []
+    assert coord.starts_text(p.db.task(tid), plain=True) == "starts when a check passes"
+    # Clearing the probe clears its words too.
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "start_when": "x", "why": "w"}]) == []
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "start_when": ""}]) == []
+    assert not any(lb.startswith("start_why:") for lb in json.loads(p.db.task(tid)["labels"]))
+    # A wait for another task's landing reads as such without a why.
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "start_when": "landed:#12"}]) == []
+    assert coord.starts_text(p.db.task(tid), plain=True) == "starts when #12 lands"

@@ -64,4 +64,4 @@ form#say { display: flex; gap: 8px; margin-top: 8px; } form#say input { flex: 1;
 .board .item { padding: 5px 0; border-top: 1px solid var(--line); font-size: 13px; }
 .board .item:first-of-type { border-top: 0; }
 .board .col.you { border-left: 4px solid var(--red); } .board .col.review { border-left: 4px solid var(--yellow); }
-.board .col.work { border-left: 4px solid var(--accent); }
+.board .col.work { border-left: 4px solid var(--accent); } .board .col.stuck { border-left: 4px solid var(--orange); }

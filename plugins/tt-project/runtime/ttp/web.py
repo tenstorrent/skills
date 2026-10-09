@@ -17,7 +17,7 @@ from . import alerts, awake
 from . import budget as bud
 from . import globalcap as gcap
 from . import coordinator as coord
-from . import pushq, release
+from . import pushq, release, waits
 from . import schedule as sched
 from . import upstream
 from .daemon import (AUTH_PROBE_S, HEARTBEAT_STALE_S, KV_LOCAL_ONLY, KV_WORKTREES_DIRTY, LOGGED_OUT_NOTE, NET_HELD_NOTE,
@@ -225,7 +225,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
                                      "fix": fix_for(r["key"].split(":", 1)[1], note)})
     paused_resources = [{"resource": k, **v} for k, v in sorted(db.paused_resources().items())]
     # A deferred task waits to start (start_after / start_when): a plan, not a problem or a retry.
-    deferred = [{"id": t["id"], "title": t["title"], "starts": coord.starts_text(t, now)}
+    deferred = [{"id": t["id"], "title": t["title"], "starts": coord.starts_text(t, now, plain=True)}
                 for t in db.q("SELECT * FROM tasks WHERE status='queued' AND labels LIKE '%\"start_%' "
                               "ORDER BY COALESCE(not_before, 0), id")]
     deferred = [t for t in deferred if t["starts"]]
@@ -451,6 +451,7 @@ def state_payload(p: Project, db: DB) -> dict:
     in_review = db.review_since()
     # The dependency graph and start/retry conditions, so outside tools need not infer them.
     unmet = db.unmet_dependencies(db.q("SELECT * FROM tasks WHERE status='queued'"))
+    asks = waits.open_asks(db)
     for t in tasks:
         t["review_since"] = in_review.get(t["id"])
         t["outcome"] = task_outcome(t)   # changes_needed for a review that asked for changes
@@ -459,10 +460,12 @@ def state_payload(p: Project, db: DB) -> dict:
         pushed = result.get("pushed")
         t["pushed"] = [{k: x.get(k) for k in ("branch", "sha", "version", "status")} for x in pushed
                        if isinstance(x, dict)] or None if isinstance(pushed, list) else None   # what the push queue pushed for a review
-        t["starts"] = coord.starts_text(t, now) if t["status"] == "queued" else ""
+        # Plain words for the board; the probe itself stays in start_when, the task's detail.
+        t["starts"] = coord.starts_text(t, now, plain=True) if t["status"] == "queued" else ""
+        t["wait"] = waits.wait_kind(t, asks, now) if t["status"] == "blocked" else None
         d = deferral(t)
         t.update(depends_on=dependency_ids(t), waits_on=unmet.get(t["id"], []), continues=continues_id(t),
-                 start_after=d.get("after"), start_when=d.get("when"),
+                 start_after=d.get("after"), start_when=d.get("when"), start_why=d.get("why"),
                  retry={**{k: result[k] for k in WAIT_KEYS if k in result}, "next_try": t["not_before"]}
                  if t["status"] == "queued" and result.get("status") == "waiting" else None)
         del t["labels"]

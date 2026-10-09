@@ -678,6 +678,12 @@ def status_text(p: Project) -> str:
         text = " ".join(m["text"].split())
         what = f"ask {m['id']}" if m["kind"] == "ask" else "alert"
         lines.append(f"  needs you ({what}, {since(m['ts'], now)} ago): {text[:300]}")
+    # Blocked tasks: those that wait on the user join the top; the rest are the project's to move.
+    from . import waits
+    you, stuck = waits.split(db.q("SELECT * FROM tasks WHERE status='blocked' ORDER BY priority, id"),
+                             waits.open_asks(db), now)
+    for t in you[:6]:
+        lines.append(f"  needs you (#{t['id']}, {t['wait']['age']}): {t['title']} — {t['wait']['text']}")
     lines.append("budget: " + h["spend"]["headline"])
     c = h["coordinator"]
     coord = "coordinator: no turn yet"
@@ -722,7 +728,11 @@ def status_text(p: Project) -> str:
         lines.append(f"  running {since(w['started'], now)}: {what}" + (f" ({w['wake']} wake)" if w.get("wake") else "")
                      + (f" — {w['note']}" if w["note"] else ""))
     in_review = db.review_since()
-    for t in db.q("SELECT id,title,status,blocked_reason FROM tasks WHERE status IN ('blocked','review','pushing') "
+    if stuck:
+        lines.append("stuck, the project is on it:")
+    for t in stuck[:8]:
+        lines.append(f"  #{t['id']} {t['wait']['age']}: {t['title']} — {t['wait']['text']}")
+    for t in db.q("SELECT id,title,status,blocked_reason FROM tasks WHERE status IN ('review','pushing') "
                   "ORDER BY status, id LIMIT 8"):
         age = f" {since(in_review[t['id']], now)}" if t["id"] in in_review else ""
         lines.append(f"  #{t['id']} {t['status']}{age}: {t['title']}" + (f" — {t['blocked_reason']}" if t["blocked_reason"] else ""))
@@ -1980,7 +1990,7 @@ def cmd_task(a) -> None:
 def set_when(db, tid: int, probe: str | None) -> str:
     """Re-point the probe of a task that has not started: a waiting task's `retry_when`, else its
     `start_when` deferral. An empty probe clears it. Same checks as the coordinator's task_update."""
-    from .coordinator import _start_args, check_probe, defer_labels
+    from .coordinator import _start_args, check_probe, defer_labels, start_why
     from .db import TERMINAL_TASK_STATES, deferral, dump_result, load_result, without_deferral
     if probe is None:
         raise ValueError("set-when needs the probe command (\"\" clears it)")
@@ -2001,9 +2011,10 @@ def set_when(db, tid: int, probe: str | None) -> str:
             db.update_task(tid, result=dump_result(prev))
             return f"task #{tid} retry_when " + (f"set: {probe.strip()}" if probe.strip()
                                                  else "cleared; it wakes at its retry timer")
-        after, when = _start_args({"start_when": probe}, deferral(task))
-        db.update_task(tid, labels=without_deferral(json.loads(task["labels"] or "[]")) + defer_labels(after, when),
-                       not_before=after)
+        cur = deferral(task)
+        after, when = _start_args({"start_when": probe}, cur)
+        db.update_task(tid, labels=without_deferral(json.loads(task["labels"] or "[]"))
+                       + defer_labels(after, when, start_why({}, cur, when)), not_before=after)
         return f"task #{tid} start_when " + (f"set: {when}" if when else "cleared")
 
 
