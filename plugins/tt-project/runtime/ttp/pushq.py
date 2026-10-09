@@ -776,8 +776,9 @@ def _apply(p: Project, b: dict, m: dict, alert: Callable, now: float) -> None:
                 detail = {"why": str(m.get("message") or "")[:2000] or None}
             text = json.dumps(detail)[:8000] if detail else None
             if status in ("pushed", "landed"):
-                db.x("UPDATE push_queue SET status=?, pushed_sha=?, version=?, detail=?, updated=? WHERE id=?",
-                     (status, sha or tip, version, text, now, r["id"]))
+                own = res.get("sha") if isinstance(res.get("sha"), str) and _HEX40.fullmatch(res["sha"]) else None
+                db.x("UPDATE push_queue SET status=?, pushed_sha=?, landed_sha=?, version=?, detail=?, updated=? "
+                     "WHERE id=?", (status, sha or tip, own or sha or tip, version, text, now, r["id"]))
             elif status in ("conflict", "check_failed", "refused"):
                 db.x("UPDATE push_queue SET status=?, detail=?, updated=? WHERE id=?", (status, text, now, r["id"]))
             else:   # requeued, or the batch did not get to it (busy, moved, rejected, tip_failed)

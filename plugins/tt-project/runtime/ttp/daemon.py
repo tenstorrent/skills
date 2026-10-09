@@ -40,6 +40,7 @@ from . import ends
 from . import hold
 from . import integrity
 from . import jevuse
+from . import landed
 from . import localspend
 from . import locks
 from . import machines
@@ -3619,8 +3620,8 @@ class Daemon:
                 self._probe_rc[tid] = got
                 return
         try:
-            proc = subprocess.Popen(probe, shell=True, cwd=str(self.p.root), stdin=subprocess.DEVNULL,
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            proc = subprocess.Popen(landed.probe_command(probe), shell=True, cwd=str(self.p.root),
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                     start_new_session=True, env=self._probe_env())
         except OSError as e:
             log(self.p, f"task {tid} {what} probe could not start: {e}")

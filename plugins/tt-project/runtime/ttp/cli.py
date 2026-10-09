@@ -1625,6 +1625,18 @@ def cmd_lock(a) -> None:
             told = time.time()
         time.sleep(poll_s(3))
 
+def cmd_landed(a) -> None:
+    """Probe for start_when/retry_when: exit 0 once a commit, or a task's landing (`--task <id>`),
+    is on the push branch, also as rebased commits; 1 while not yet; 2 when it cannot tell. The
+    daemon runs a `landed:#<id>` probe as `ttp landed --task <id>` (see landed.py)."""
+    from . import landed
+    p = here()
+    if not p:
+        print("ttp landed: no project here (run it in a project or with TTP_PROJECT set)")
+        sys.exit(landed.CANNOT)
+    sys.exit(landed.run(p, a))
+
+
 def cmd_detach(a) -> None:
     """Start a long job that outlives this run: `ttp detach <name> -- <command...>`.
 
@@ -3068,6 +3080,14 @@ def main(argv: list[str] | None = None) -> None:
                         "inside a run: at most half its stall limit")
     s.add_argument("command", nargs=argparse.REMAINDER)
     s.set_defaults(fn=cmd_lock)
+
+    s = sub.add_parser("landed", help="exit 0 once a commit or a task's landing is on the push branch, even "
+                                      "rebased (same patch-id or author/date/subject), 1 while not yet, 2 if it "
+                                      "cannot tell (for start_when; `landed:#<id>` runs it)")
+    s.add_argument("ref", nargs="?", help="a commit, or #<id> for a task's landing")
+    s.add_argument("--task", type=int, help="the task whose landing to look for")
+    s.add_argument("--onto", help="the branch to look on (default: delivery.push_branch)")
+    s.set_defaults(fn=cmd_landed)
 
     s = sub.add_parser("detach", help="(inside a run) start a job that outlives the run; writes <name>.rc")
     s.add_argument("--check", nargs="+", metavar="RC",

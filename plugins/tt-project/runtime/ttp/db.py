@@ -119,7 +119,7 @@ CREATE TABLE IF NOT EXISTS push_queue(
   status TEXT NOT NULL DEFAULT 'approved',
   batch TEXT, tries INTEGER NOT NULL DEFAULT 0,
   created REAL NOT NULL, updated REAL NOT NULL,
-  pushed_sha TEXT, version TEXT, detail TEXT);
+  pushed_sha TEXT, version TEXT, detail TEXT, landed_sha TEXT);
 CREATE INDEX IF NOT EXISTS push_queue_status ON push_queue(status, id);
 CREATE TABLE IF NOT EXISTS push_batches(
   id TEXT PRIMARY KEY, marker TEXT NOT NULL, target TEXT NOT NULL,
@@ -157,6 +157,7 @@ class DB:
         self._migrate_run_session()
         self._migrate_jev_changed()
         self._migrate_issue_lifecycle()
+        self._migrate_push_landed()
 
     def _migrate_ledger_account(self) -> None:
         """Ledger rows written without an account take the account of the run they booked: the run
@@ -202,6 +203,15 @@ class DB:
             for col in ("lifecycle", "subject"):
                 if col not in have:
                     self.x(f"ALTER TABLE issues ADD COLUMN {col} TEXT")
+
+    def _migrate_push_landed(self) -> None:
+        # Each pushed or landed row's own commit on the branch (pushq._apply; `ttp landed`). Older
+        # rows keep NULL: their pushed_sha, the batch's head, contains them.
+        if "landed_sha" in {r["name"] for r in self.q("PRAGMA table_info(push_queue)")}:
+            return
+        with self.tx():
+            if "landed_sha" not in {r["name"] for r in self.q("PRAGMA table_info(push_queue)")}:
+                self.x("ALTER TABLE push_queue ADD COLUMN landed_sha TEXT")
 
     def _migrate_push_queue(self) -> None:
         if self.meta(PUSH_QUEUE_MIGRATION) is not None:

@@ -568,6 +568,7 @@ class Batch:
         self.wt = p.worktrees / WORKTREE
         self.status: dict[int, str] = {}       # entry index -> status
         self.detail: dict[int, dict] = {}
+        self.landed_at: dict[int, str] = {}    # entry index -> its own commit on the branch (pushed or landed)
         self.checks = {"runs": 0, "seconds": 0.0, "flaky": False}
         self.tip = self.pushed_sha = self.version = None
         self.reach: dict | None = None          # push.reach of what it pushed or found landed
@@ -588,9 +589,18 @@ class Batch:
 
     def results(self) -> list[dict]:
         """Each entry's outcome; the detail of one whose replay settled conflicts names them
-        ("settled": files, "settled_by": kinds), so a check failure after it can be traced to it."""
-        return [{"id": e.get("id"), "task": e.get("task"), "status": self.status.get(i, "requeued"),
-                 "detail": {**self.detail.get(i, {}), **self.settled.get(i, {})}} for i, e in enumerate(self.entries)]
+        ("settled": files, "settled_by": kinds), so a check failure after it can be traced to it. A
+        pushed or landed entry names its own commit on the branch ("sha": the replayed head that ends
+        with it, or the tip it was found on), which a rebase made different from its reviewed head."""
+        out = []
+        for i, e in enumerate(self.entries):
+            st = self.status.get(i, "requeued")
+            r = {"id": e.get("id"), "task": e.get("task"), "status": st,
+                 "detail": {**self.detail.get(i, {}), **self.settled.get(i, {})}}
+            if st in ("pushed", "landed") and i in self.landed_at:
+                r["sha"] = self.landed_at[i]
+            out.append(r)
+        return out
 
     def conflicts(self) -> dict:
         """The round's conflict counts, for the marker and the log: entries replayed, those that hit a
@@ -650,7 +660,7 @@ class Batch:
             if not tip:
                 return self._all("requeued", "error", f"cannot fetch {self.target}", keep=("refused",))
             self.tip = tip
-            self.status, self.detail = {}, {}
+            self.status, self.detail, self.landed_at = {}, {}, {}
             self._prepare(tip)
             outcome = self._round(tip, checks)
             if outcome != "moved":
@@ -723,9 +733,10 @@ class Batch:
         as that merge may be what fails. An entry that added nothing on top of carried entries (a
         rider), or conflicted with them, follows them: if they did not go, it is requeued, as it may
         apply to the tip as it is."""
-        for n, (i, _) in enumerate(carried or [], 1):
+        for n, (i, h) in enumerate(carried or [], 1):
             if n <= k:
                 self._set(i, "pushed")
+                self.landed_at[i] = h
             elif n == k + 1 and failed and failed[0] not in (STALE, push.NONE_APPLY) \
                     and "hunks" in self.settled.get(i, {}).get("settled_by", []):
                 say(f"entry {self.entries[i].get('id')}: its checks failed after the batch merged changes of "
@@ -739,6 +750,8 @@ class Batch:
             after = self.detail[i].pop("_after", 0)   # carried entries before it
             if st == "rider":
                 self._set(i, "pushed" if outcome == "pushed" and after <= k else "requeued")
+                if outcome == "pushed" and 0 < after <= k:
+                    self.landed_at[i] = carried[after - 1][1]
             elif st == "conflict" and after > k:
                 self._set(i, "requeued")
         if outcome == "nothing" and "landed" in self.status.values():
@@ -772,6 +785,7 @@ class Batch:
             if top == base or self._on_tip(tip, base, top):
                 say(f"entry {e.get('id')} ({e.get('branch')}): already on {self.target}")
                 self._set(i, "landed")
+                self.landed_at[i] = tip
                 continue
             subjects = [s for s in _git(self.repo, "log", "--no-merges", "--reverse", "--format=%s",
                                         f"{base}..{top}").stdout.splitlines() if s.strip()]
@@ -802,6 +816,7 @@ class Batch:
                     + (self.target if on_tip else "the entries before it"))
                 if on_tip:
                     self._set(i, "landed")
+                    self.landed_at[i] = tip
                 else:
                     self._set(i, "rider", _after=len(carried))
             else:
