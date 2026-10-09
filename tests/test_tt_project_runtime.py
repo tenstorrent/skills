@@ -22376,6 +22376,43 @@ def test_a_start_when_landed_task_starts_once_its_rebased_landing_is_on_the_bran
     assert not [e for i in ids for e in _events(p, i, "deferral_probe_broken")]
 
 
+@pytest.mark.parametrize("status", ["running", "failed", "cancelled", "done"])
+def test_landed_task_never_passes_for_a_task_that_has_not_landed_anything(env, monkeypatch, status):
+    """The daemon makes a task's branch at the push branch's tip when it starts, so the branch head is
+    already on the branch: that must not read as landed while the task runs, after it failed or was
+    cancelled, or when it finished without a commit. A deferral on it stays deferred."""
+    from ttp import coordinator as coord
+    from ttp import daemon as dmod
+    from ttp import landed
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    tid, path, branch = _code_task(p, "feature", status=status)
+    assert landed.on_branch(repo, _git_out(path, "rev-parse", "HEAD"), _git_out(repo, "rev-parse", "origin/proj"))
+    rc, words = landed.check(p, repo, tid=tid)
+    assert rc == 1 and landed.task_shas(p, tid)[0] == [], words
+    assert ("no commits on its branch" if status == "done" else f"has not finished ({status})") in words
+    assert coord.apply(p, [{"type": "task_add", "title": "after it", "spec": "s",
+                            "start_when": f"landed:#{tid}"}]) == []
+    after = _added(p, "after it")
+    d = dmod.Daemon(p.base)
+    _settle_deferred(d, after)
+    _settle_deferred(d, after)
+    assert not _ready(p, after) and not _events(p, after, "deferral_probe_broken")
+
+
+def test_landed_task_counts_a_done_tasks_own_commits_once_they_are_on_the_branch(env, monkeypatch):
+    """The branch fallback still works for a done task with a commit, landed by fast-forward."""
+    from ttp import landed
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    tid, path, branch = _code_task(p, "feature", status="running")
+    _commit(path, "feature.txt", "feature\n")
+    assert landed.check(p, repo, tid=tid)[0] == 1, "still running"
+    p.db.update_task(tid, status="done")
+    assert landed.check(p, repo, tid=tid)[0] == 1, "done, not pushed yet"
+    _git_out(path, "push", "-q", "origin", "HEAD:proj")
+    assert landed.check(p, repo, tid=tid) == (0, f"#{tid} (its branch {branch}) is on origin/proj")
+
+
 def test_ttp_task_set_when_sets_and_clears_a_queued_tasks_start_when(env, capsys):
     p = make(env)
     from ttp import cli

@@ -5,7 +5,8 @@ shas. The push queue (and `ttp push`) rebase each approved head onto the branch 
 `git merge-base --is-ancestor <reviewed sha> origin/<branch>` never passes once they did.
 
 - `landed:#<id>` (a start_when or retry_when) passes once task <id>'s landing is on the branch: the
-  commit the push queue recorded for it (push_queue.landed_sha), else its branch's commits by patch.
+  commit the push queue recorded for it (push_queue.landed_sha), else (once it is done and committed
+  something) its branch's commits by patch.
 - `git merge-base --is-ancestor <sha> <ref>`, as a whole probe, also passes when every commit of
   <sha> has an equivalent on <ref>: the same `git patch-id --stable` (git cherry), the same author,
   author date and subject (a rebase keeps them; a settled conflict changes the patch), or a commit
@@ -113,7 +114,7 @@ def _push_ref(p, repo: Path) -> str:
 def task_shas(p, tid: int) -> tuple[list[str], str]:
     """The commits that carry task `tid` to the branch, and where they come from: the landed commits
     the push queue recorded for it (its own approvals, those of a review of it, or of its branch),
-    else its branch's head. ([], why) when there is none yet."""
+    else, once it is done with commits of its own, its branch's head. ([], why) when there is none yet."""
     db = p.db
     task = db.task(tid)
     if not task:
@@ -131,9 +132,21 @@ def task_shas(p, tid: int) -> tuple[list[str], str]:
     if shas:
         return shas, "its push queue landing"
     head = _commit(p.root, f"refs/heads/{branch}") if branch else ""
-    if head:
-        return [head], f"its branch {branch}"
-    return [], f"#{tid} has no landing recorded and no branch"
+    if not head:
+        return [], f"#{tid} has no landing recorded and no branch"
+    # The daemon makes the branch at the push branch's tip when the task starts: until the task is
+    # done and has commits of its own, its head is "on the branch" with nothing landed.
+    if task.get("status") != "done":
+        return [], f"#{tid} has no landing recorded and has not finished ({task.get('status')})"
+    if head == _start(p.root, branch):
+        return [], f"#{tid} has no landing recorded and no commits on its branch {branch}"
+    return [head], f"its branch {branch}"
+
+
+def _start(repo: Path, branch: str) -> str:
+    """The commit `branch` was created at (its oldest reflog entry), "" when git kept no reflog."""
+    log = _git(repo, "reflog", "show", "--format=%H", f"refs/heads/{branch}").stdout.split()
+    return log[-1] if log else ""
 
 
 def check(p, repo: Path, sha: str | None = None, tid: int | None = None, onto: str | None = None) -> tuple[int, str]:
