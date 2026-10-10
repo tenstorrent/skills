@@ -1,6 +1,6 @@
 {
   "name": "tt-model-op-analysis",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Kernel-op analysis of a tt-metal model test: static trace to device ops and program factories, and Tracy-measured ops, host fallback and footprint.",
   "author": {
     "name": "tenstorrent"

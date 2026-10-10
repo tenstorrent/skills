@@ -1,5 +1,24 @@
 # Run setup (both skills)
 
+## Interactive gate
+
+Do not treat open files, IDE selections, shell history, environment variables, or a previous run
+as user confirmation. Ask exactly one setup question per turn and stop for the answer. Never ask
+the user to confirm the whole configuration in one message.
+
+Use this order, skipping only values the user explicitly stated in the current conversation:
+
+1. Ask which model to analyse. Do no model-specific discovery before the answer.
+2. Discover the model directory and candidate entry tests. Propose one node ID and ask whether
+   to use it. Stop for the answer.
+3. When multiple implementations or ports exist, ask which one to analyse. Stop for the answer.
+4. Ask which source ref to pin. A suggested ref is allowed, but it is not confirmation. Stop.
+5. Ask for the output root, explain it cannot be inside the tt-metal checkout, and stop.
+
+After this shared setup, the selected workflow asks its own remaining questions one at a time
+(for example static target profiles or measured warm/cold handling). Do not inspect model source,
+create output, or delegate tracing until every required answer is confirmed.
+
 ## 1. Model and test
 
 Ask which model. In the tt-metal checkout, find:

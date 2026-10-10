@@ -1,6 +1,6 @@
 {
   "name": "tt-model-op-analysis",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Kernel-op analysis of a tt-metal model test: static trace to device ops and program factories, and Tracy-measured ops, host fallback and footprint.",
   "author": {
     "name": "Tenstorrent"
@@ -29,7 +29,7 @@
     ],
     "websiteURL": "https://github.com/tenstorrent/skills",
     "defaultPrompt": [
-      "Make the kernel op table for ResNet50 on P150 and Quasar."
+      "Ask me whether to run static-op-analysis or measured-op-analysis, then start its interactive setup."
     ]
   }
 }

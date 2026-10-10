@@ -87,7 +87,8 @@
         "installation": "AVAILABLE",
         "authentication": "ON_INSTALL"
       },
-      "category": "Developer Tools"
+      "category": "Developer Tools",
+      "description": "Interactive static trace or Tracy measurement for a tt-metal model test, with Blackhole and Quasar status and CSV output."
     }
   ]
 }

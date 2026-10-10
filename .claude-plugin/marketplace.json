@@ -38,7 +38,7 @@
     {
       "name": "tt-model-op-analysis",
       "source": "./plugins/tt-model-op-analysis",
-      "description": "Kernel-op table for a tt-metal model test: static trace or Tracy measurement, Blackhole and Quasar status, CSV output."
+      "description": "Interactive static trace or Tracy measurement for a tt-metal model test, with Blackhole and Quasar status and CSV output."
     }
   ]
 }

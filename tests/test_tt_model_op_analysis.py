@@ -12,10 +12,10 @@ import sys
 REPO = pathlib.Path(__file__).resolve().parents[1]
 PLUGIN = REPO / "plugins" / "tt-model-op-analysis"
 SCRIPTS = PLUGIN / "scripts"
-SKILL_NAMES = ("static-op-analysis", "measured-op-analysis")
+SKILL_NAMES = ("model-op-analysis", "static-op-analysis", "measured-op-analysis")
 
 
-def test_plugin_has_both_skills():
+def test_plugin_has_router_and_both_workflows():
     for name in SKILL_NAMES:
         assert (PLUGIN / "skills" / name / "SKILL.md").is_file()
 
@@ -23,7 +23,20 @@ def test_plugin_has_both_skills():
 def test_manifest_versions_match():
     claude = json.loads((PLUGIN / ".claude-plugin" / "plugin.json").read_text())
     codex = json.loads((PLUGIN / ".codex-plugin" / "plugin.json").read_text())
-    assert claude["version"] == codex["version"] == "0.1.0"
+    assert claude["version"] == codex["version"] == "0.1.1"
+
+
+def test_generic_router_requires_explicit_workflow_choice():
+    router = (PLUGIN / "skills" / "model-op-analysis" / "SKILL.md").read_text()
+    assert "Do not infer one from open files" in router
+    assert "Stop until the user explicitly chooses one" in router
+    assert "Never batch the model, test, implementation" in router
+
+
+def test_shared_setup_is_step_by_step():
+    setup = (PLUGIN / "references" / "run-setup.md").read_text()
+    assert "Ask exactly one setup question per turn and stop for the answer" in setup
+    assert "Ask which model to analyse. Do no model-specific discovery before the answer" in setup
 
 
 def run_script(name: str, *args: str) -> subprocess.CompletedProcess[str]:
