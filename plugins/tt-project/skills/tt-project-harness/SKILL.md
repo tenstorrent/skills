@@ -70,9 +70,10 @@ do not run while the project is paused. A task that must reboot the host its har
 
 1. `ttp drain <name> --wait 240`: no new runs or pushes start; it exits 0 once none is in flight
    (the calling run does not count) and 1 at the timeout, with the project left paused. Running
-   workers are never killed. Keep the wait inside one tool call (a few minutes). On exit 1 the
-   project stays paused: hand off `waiting` with `retry_when` `ttp drain <name>` (no `--wait`, or
-   `--wait 0`, checks once and exits 0 when drained) and reboot on the next run.
+   workers are never killed. Keep the wait inside one tool call (a few minutes). On exit 1 run it
+   again in further tool calls of the same run, at most 3 times. Still not drained: `ttp resume
+   <name>` and hand off `waiting` with a time-based `retry_when` (`test "$(date +%s)" -ge <epoch>`).
+   Never leave a paused project with a waiting task: probes do not run while paused, so it never wakes.
 2. `ttp pause <name> --until-reboot`: the daemon lifts this pause on its first tick after the host
    booted again and says so in the feed. A plain `ttp pause` or `ttp resume` replaces it.
 3. Write the hand-off (`waiting`, with a `retry_when` that holds once the host is back, and no

@@ -729,3 +729,13 @@ def test_box_clean_probe_queries_the_broker_python(tmp_path):
     assert rc == 1 and "[broker]health-gate" in out, out
     text = seen.read_text()
     assert text.startswith("-c\n") and "tt_device_recent_jobs" in text and text.endswith("\n9000\n50\n40\n")
+
+
+def test_self_reboot_recipe_never_waits_on_drain_probe_while_paused():
+    import re
+    root = pathlib.Path(__file__).resolve().parents[1] / "plugins" / "tt-project" / "skills"
+    for name in ("tt-project", "tt-project-harness"):
+        text = (root / name / "SKILL.md").read_text()
+        assert "--wait 240" in text
+        assert not re.search(r"retry_when`?\s*`ttp drain", text)
+        assert "ttp resume <name>" in " ".join(text.split())
