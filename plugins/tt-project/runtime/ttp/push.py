@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, unquote
 
-from . import locks
+from . import locks, worktree
 from .budget import DOC_SUFFIXES
 from .project import Project, durable_write, git_fsync_env, nice_level, renice, write_json
 
@@ -888,7 +888,11 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
     m = OWN_BRANCH.fullmatch(branch)
     task = os.environ.get("TTP_TASK")
     onto = _labelled(p, task, "pr_branch") if task else ""
-    if m and onto and m.group(1) == task:
+    carried = bool(m and onto and m.group(1) == task)
+    if carried:
+        if not worktree.valid_branch(onto):
+            raise ValueError(f"this task's pr_branch label ({onto!r}) is not one valid branch name; "
+                             f"not publishing")
         branch = onto
     elif m and task and m.group(1) != task and not _carries(p, task, m.group(1), branch):
         raise ValueError(f"--own publishes only this task's own branch (ttp/t{task}-...), not {branch}")
@@ -897,6 +901,12 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
     base = str(d.get("base_ref") or "").strip()
     if branch in PROTECTED or branch in (shared, base, base.partition("/")[2]):
         raise ValueError(f"--own never pushes to a shared branch ({branch})")
+    mine = OWN_BRANCH.fullmatch(branch)
+    if carried and not (mine and mine.group(1) == task):
+        local = _git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}").returncode == 0
+        if not local and not _on_remote(repo, remote, branch):
+            raise ValueError(f"this task's pr_branch {branch} exists neither here nor on {remote}: --own "
+                             f"publishes onto an existing branch only, never creates one")
     return remote, branch
 
 

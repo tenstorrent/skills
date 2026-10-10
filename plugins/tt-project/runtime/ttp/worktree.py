@@ -112,13 +112,30 @@ def ensure(p: Project, task: dict) -> tuple[Path, str]:
     return path, branch
 
 
+_VALID_BRANCHES: dict[str, bool] = {}
+
+
+def valid_branch(name: str) -> bool:
+    """Whether `name` is one valid branch name (`git check-ref-format --branch`): never prose, several
+    words, an option-like `-x`, main/master or HEAD (a task never carries a protected branch)."""
+    if not name or name != name.strip() or any(c.isspace() for c in name) or name.startswith("-") \
+            or name in ("HEAD", "main", "master"):
+        return False
+    if name not in _VALID_BRANCHES:
+        r = subprocess.run(["git", "check-ref-format", "--branch", name], capture_output=True, text=True)
+        _VALID_BRANCHES[name] = r.returncode == 0 and r.stdout.strip() == name
+    return _VALID_BRANCHES[name]
+
+
 def carried_branch(task: dict) -> str:
-    """The branch a task's `pr_branch:<branch>` label names (it delivers onto it), or ""."""
+    """The branch a task's `pr_branch:<branch>` label names (it delivers onto it), or "" (also when
+    the label's value is not a valid branch name: valid_branch)."""
     try:
         labels = json.loads(task.get("labels") or "[]")
     except (ValueError, TypeError):
         return ""
-    return next((lb[10:] for lb in labels if isinstance(lb, str) and lb.startswith("pr_branch:")), "")
+    found = next((lb[10:] for lb in labels if isinstance(lb, str) and lb.startswith("pr_branch:")), "")
+    return found if valid_branch(found) else ""
 
 
 def on_carried(p: Project, task: dict) -> str:
