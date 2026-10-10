@@ -47,6 +47,7 @@ from . import jevuse
 from . import landed
 from . import localspend
 from . import locks
+from . import machine_ledger
 from . import machines
 from . import prguard
 from . import push
@@ -354,6 +355,8 @@ class Daemon:
         self._probed: dict[int, float] = {}
         self._ends = ends.Ends(self.p, log=lambda m: log(self.p, m))   # temporary instructions' end conditions
         self._pause_ends = pauseends.PauseEnds(self.p, log=lambda m: log(self.p, m))   # resource pauses' ends
+        self._machine_probes = machine_ledger.Probes(self.p, log=lambda m: log(self.p, m))
+        self._machines_routed = 0.0
         self._probe_rc: dict[int, tuple[int | str, float, str]] = {}   # last verdict: exit code or why, when, probe
         self._probe_files: dict[int, object] = {}   # id(probe proc) -> the file its output goes to
         self._probe_out: dict[int, tuple[str, float, str]] = {}   # task -> its probe's last output, unchanged since, probe
@@ -423,6 +426,7 @@ class Daemon:
         self._idle.release()
         self._ends.stop()   # end-condition probes are rerun after the next start
         self._pause_ends.stop()
+        self._machine_probes.stop()
         if _read_pid(pidfile) == os.getpid():
             pidfile.unlink(missing_ok=True)
         # Running workers are left alone: they write their results to disk and the next start
@@ -612,7 +616,7 @@ class Daemon:
         core = self.cfg.get("core_provider") or "claude"
         core_held = self.net_held(core) and not self._net_may_probe(core)
         for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.read_upstream,
-                     self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.retire_ended, self.sweep_holds, self.maybe_coordinate, self.probe_waiting, self.start_pushes, self.dispatch, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
+                     self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.retire_ended, self.route_machines, self.sweep_holds, self.maybe_coordinate, self.probe_waiting, self.start_pushes, self.dispatch, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
                 continue   # no routing to start model work with (see _load_config)
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
@@ -814,6 +818,50 @@ class Daemon:
             self._ends.tick()
         except Exception:
             log(self.p, "retiring ended instructions failed\n" + traceback.format_exc())
+
+    def route_machines(self, every_s: float = 60) -> None:
+        """Shared machines (machine_ledger): run this project's ledger probes, then send the pages due
+        for long down or held machines and overdue changes, model-free. A page is marked delivered only
+        once it went out; one that did not stays pending and goes on a later tick."""
+        now = time.time()
+        if now - self._machines_routed < every_s:
+            return
+        self._machines_routed = now
+        try:
+            self._machine_probes.tick(now)
+            pages = machine_ledger.route(now, claimer=self.p.name)
+        except Exception:
+            log(self.p, "routing shared-machine pages failed\n" + traceback.format_exc())
+            return
+        for page in pages:
+            try:
+                ok = self._machine_page(page, now)
+            except Exception:
+                ok = False
+                log(self.p, f"page for {page['key']} failed\n" + traceback.format_exc())
+            try:
+                (machine_ledger.delivered if ok else machine_ledger.release)(page)
+            except Exception:
+                log(self.p, f"settling the page for {page['key']} failed\n" + traceback.format_exc())
+
+    def _machine_page(self, page: dict, now: float) -> bool:
+        """Deliver one page; whether it went out (or already had: a resend is idempotent)."""
+        target, text = page["target"], page["text"]
+        if target == machine_ledger.USER:
+            self.alert(page["key"], f"Outage: {text} Nobody else could act on it.", severity="high")
+        elif target == self.p.name:
+            fp = page.get("id") or page["key"]
+            with self.p.db.tx():
+                if not self.p.db.one("SELECT id FROM events WHERE fingerprint=? AND kind=?", (fp, page["kind"])):
+                    self.p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) "
+                                "VALUES(?,?,?,?,?,?,?)", (now, "daemon", page["kind"], fp, "high", text, "queued"))
+        else:
+            got = upstream.send(self.p.name, None, target, text, "high", now=now, sender="daemon")
+            if got not in ("sent", "duplicate"):
+                log(self.p, f"page for {page['key']} to {target}: {got}; retried on a later tick")
+                return False
+        log(self.p, f"paged {target}: {text}")
+        return True
 
     def sync_shared_pauses(self) -> None:
         coord.sync_shared_pauses(self.p)
@@ -2672,6 +2720,8 @@ class Daemon:
             kind = scr.ERROR if error else receipt
             self.observe(errors if error else source, body, obs.get("severity"), rewake_after_s=rewake,
                          repeat=obs.get("repeat") is True, lifecycle=kind)
+            if not error and obs.get("machine") and obs.get("condition"):
+                self._machine_condition(obs, body)
             if kind == scr.RECEIPT:
                 subjects.update(scr.normalize(subj) for subj, _, cleared in scr.watcher_conditions(source, body) or ()
                                 if not cleared)
@@ -2680,6 +2730,16 @@ class Daemon:
             scr.settle_receipts(self.p.db, source, started, subjects)
             scr.settle_mutes(self.p.db, source, started)   # muted conditions it no longer reported cleared
         return f"ok ({n} observations)"
+
+    def _machine_condition(self, obs: dict, body: str) -> None:
+        """A watcher saw a shared machine down or held (or no longer: `cleared`): tell its recovery owner."""
+        try:
+            grace = obs.get("grace_s")
+            machine_ledger.report(self.p.name, str(obs["machine"]), str(obs["condition"]), body,
+                                  float(grace) if isinstance(grace, (int, float)) else None,
+                                  cleared=obs.get("cleared") is True)
+        except Exception:
+            log(self.p, "recording a shared-machine condition failed\n" + traceback.format_exc())
 
     def _schedule_llm(self, s: dict, payload: dict) -> str:
         db = self.p.db

@@ -55,6 +55,8 @@ CLEARED_TEXT = {
     "after_push_failed": "after_push no longer fails: the last one succeeded, or after_push or the push queue is off.",
     "push_queue_dying": "Push batches finish again.",
     "heal": "Heal check {arg} passes again.",
+    "machine": "Machine condition {arg} is over: no longer reported.",
+    "machine-change": "Machine change #{arg} is closed or no longer overdue.",
 }
 
 
@@ -149,6 +151,14 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
             return False
         return not db.one("SELECT id FROM push_batches WHERE after_push='ok' AND after_finalized>=? LIMIT 1",
                           (since,))
+    # Shared machines (machine_ledger): an outage page to the user lasts while its condition is still
+    # reported, or while its change is open and overdue.
+    if kind == "machine":
+        from . import machine_ledger
+        return machine_ledger.condition_open(arg, now)
+    if kind == "machine-change":
+        from . import machine_ledger
+        return arg.isdigit() and machine_ledger.change_overdue(int(arg), now)
     if key == "push_queue_dying":
         return not db.one("SELECT id FROM push_batches WHERE outcome IS NOT NULL AND outcome NOT IN ('died','error') "
                           "AND finalized>=? LIMIT 1", (since,))
@@ -171,7 +181,8 @@ def active(db: DB, key: str, ts: float, now: float) -> bool:
 def _checkable(key: str) -> bool:
     return key.partition(":")[0] in ("auth", "limit", "budget", "relayed", "disk", "coordinator", "run-start",
                                          "schedule", "release-older", "integrity", "pr-ready", "config",
-                                         "push_rejected", "after_push_failed", "push_queue_dying", "heal")
+                                         "push_rejected", "after_push_failed", "push_queue_dying", "heal",
+                                         "machine", "machine-change")
 
 
 def _since(ep: dict) -> float:

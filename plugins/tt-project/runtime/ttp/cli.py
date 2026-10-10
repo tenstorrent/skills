@@ -2192,13 +2192,20 @@ def cmd_machines(a) -> None:
     project's charter says which of them it may use; its coordinator routes work only to those.
     A project created with --host reads the copy on its machine: changes are copied there, merged."""
     from . import machines as mm
+    if a.action == "change":
+        return _machine_change(a)
     if a.action == "set":
         a.action = "add"
     if a.action == "add":
+        recovery = a.owner is not None or a.fallback is not None
         try:
-            entry = mm.add(a.alias, a.tags, a.note,
-                           ... if a.min_free_gb is None else a.min_free_gb, a.hostname,
-                           False if a.unshared else a.shared, a.until)
+            if not recovery or any(v is not None for v in (a.tags, a.note, a.until, a.min_free_gb, a.hostname,
+                                                            a.shared)) or a.unshared:
+                entry = mm.add(a.alias, a.tags, a.note,
+                               ... if a.min_free_gb is None else a.min_free_gb, a.hostname,
+                               False if a.unshared else a.shared, a.until)
+            if recovery:   # only an owner or fallback: the machine must be known already
+                entry = mm.set_recovery(a.alias.strip(), a.owner, a.fallback)
         except ValueError as e:
             die(str(e))
         print(f"saved {mm.line(a.alias.strip(), entry)}")
@@ -2209,7 +2216,7 @@ def cmd_machines(a) -> None:
         except ValueError as e:
             die(str(e))
         print(f"removed {a.alias}")
-    if a.action in ("add", "remove", "push"):
+    if a.action in ("add", "remove", "push", "set"):
         hosts = [a.host] if getattr(a, "host", None) else remote_hosts()
         if a.action == "push" and not hosts:
             print("no projects on other machines; nothing to copy")
@@ -2224,6 +2231,40 @@ def cmd_machines(a) -> None:
             print("no machines yet: ttp machines add <alias> --tags device,... [--note TEXT]")
         for alias in sorted(known):
             print(mm.line(alias, known[alias]))
+
+
+def _machine_change(a) -> None:
+    """`ttp machines change add|list|close`: the ledger of live changes to shared machines (machine_ledger.py)."""
+    from . import machine_ledger as ml
+    if a.change == "list":
+        got = ml.changes([a.alias] if a.alias else None, open_only=not a.all)
+        if a.json:
+            print(json.dumps(got, indent=2, sort_keys=True))
+            return
+        if not got:
+            print("no open machine changes")
+        for c in got:
+            print(ml.change_line(c) + (f" (closed {ml.ends.stamp(c['closed'])}: {c.get('closed_why')})"
+                                       if c.get("closed") else ""))
+        return
+    p = here()
+    by = a.by or (p.name if p else "")
+    if a.change == "close":
+        try:
+            c = ml.close_change(a.id, a.why or "", by or "user")
+        except ValueError as e:
+            die(str(e))
+        print(f"closed machine change #{c['id']} on {c['alias']}")
+        return
+    if not by:
+        die("run it inside a project, or say whose change it is: --by <project>")
+    task = os.environ.get("TTP_TASK")
+    try:
+        c = ml.add_change(a.alias, a.what, a.undo, by, a.expires, a.until_probe,
+                          int(task) if task and task.isdigit() else None)
+    except ValueError as e:
+        die(str(e))
+    print(f"recorded {ml.change_line(c)}")
 
 
 def cmd_pause(a) -> None:
@@ -3457,7 +3498,7 @@ def main(argv: list[str] | None = None) -> None:
 
     s = sub.add_parser("machines", help="your machines, shared by all your projects (add/list/remove/push)")
     ms = s.add_subparsers(dest="action", required=True)
-    m = ms.add_parser("add", aliases=["set"], help="add a machine, or change its tags or note")
+    m = ms.add_parser("add", aliases=["set"], help="add a machine, or change its tags, note or recovery owner")
     m.add_argument("alias", help="a short name, also used as the resource name in tasks (e.g. box-a)")
     m.add_argument("--tags", help="what it offers, comma-separated (e.g. device,x86)")
     m.add_argument("--note", help="one line for the coordinator (no secrets)")
@@ -3471,12 +3512,33 @@ def main(argv: list[str] | None = None) -> None:
                    help="resources on it that all your projects share: one set of `ttp lock` slots and one "
                         "pause across projects (comma-separated; default: the alias itself)")
     m.add_argument("--unshared", action="store_true", help="its resources are per project again")
+    m.add_argument("--owner", help="the project that recovers it when it stays down or held (\"\" = none)")
+    m.add_argument("--fallback", help="the project that takes over when the owner cannot act (\"\" = none)")
     m = ms.add_parser("list", help="list your machines")
     m.add_argument("--json", action="store_true")
     m = ms.add_parser("remove", help="remove a machine")
     m.add_argument("alias")
     m = ms.add_parser("push", help="copy the list to the machines your --host projects run on, merged")
     m.add_argument("--host", help="only this machine")
+    m = ms.add_parser("change", help="the ledger of live changes to shared machines, seen by every co-tenant")
+    cs = m.add_subparsers(dest="change", required=True)
+    c = cs.add_parser("add", help="record a live change: what, how to undo it and when it ends")
+    c.add_argument("alias")
+    c.add_argument("what", help="what changed and why, one line")
+    c.add_argument("--undo", required=True, help="the command that undoes it")
+    end = c.add_mutually_exclusive_group(required=True)
+    end.add_argument("--expires", help="when it ends: a delay (6h, 3d) or a time")
+    end.add_argument("--until-probe", dest="until_probe",
+                     help="a command that exits 0 once the change should be undone (checked every 10 min)")
+    c.add_argument("--by", help="the project that owns the change (default: the project you are in)")
+    c = cs.add_parser("list", help="the open changes")
+    c.add_argument("alias", nargs="?")
+    c.add_argument("--all", action="store_true", help="closed ones too")
+    c.add_argument("--json", action="store_true")
+    c = cs.add_parser("close", help="the change was undone")
+    c.add_argument("id", type=int)
+    c.add_argument("--why")
+    c.add_argument("--by")
     s.set_defaults(fn=cmd_machines)
 
     for name in ("pause", "resume"):

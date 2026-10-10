@@ -199,6 +199,19 @@ def test_harness_tasks_deliver_by_a_local_commit_not_a_push():
     assert "never ask it to push, `ttp push --own` or publish its change on a code branch" in coordinator
 
 
+def test_prompts_record_live_changes_to_shared_machines_in_the_ledger():
+    """Every live change to a shared machine goes in the change ledger with an owner, a reason and an end."""
+    prompts = PLUGIN / "template" / "prompts"
+    for name in ("worker.md", "coordinator.md"):
+        text = " ".join((prompts / name).read_text(encoding="utf-8").split())
+        assert "`ttp machines change add <alias>" in text and "--undo" in text and "--expires" in text, name
+        assert "a disabled recovery switch, a pause" in text, name
+    coordinator = " ".join((prompts / "coordinator.md").read_text(encoding="utf-8").split())
+    assert "`machine_condition`" in coordinator and "`ttp machines set <alias> --owner <project>" in coordinator
+    operate = (SKILLS / "tt-project" / "operate.md").read_text(encoding="utf-8")
+    assert "ttp machines set <alias> --owner" in operate and "ttp machines change add" in operate
+
+
 def test_coordinator_retires_temporary_instructions_and_does_not_ask_needlessly():
     """Temporary words get an end; a clearly-over restriction is retired, not asked about; a known,
     safe, reversible fix is done and reported, never asked about with a yes recommendation."""

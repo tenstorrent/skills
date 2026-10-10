@@ -57,6 +57,10 @@ Other workers run at the same time as you, on other tasks of this project.
   with `retry_when` `ttp lock --probe <resource>` (exits 0 once it is free).
 - Never release or re-create a machine reservation, or restart a shared service, unless that is
   your task. Others may be using it.
+- Every live change you make to a shared machine (a drop-in, a disabled recovery switch, a pause)
+  goes in its change ledger, which every project using that machine sees: `ttp machines change add
+  <alias> "<what and why>" --undo "<cmd>" (--expires <t> | --until-probe "<cmd>")`. Undo it and
+  `ttp machines change close <id>` when it is over.
 - Stop only processes you started, by their pid. Never kill by name or pattern (`pkill -f`,
   `killall`): other workers and projects run the same commands, and you would end theirs.
 - The same goes for scripts and test stubs you run. `pkill -f <name>` also matches your own tool

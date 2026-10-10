@@ -126,6 +126,15 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
   STATE lists paused resources; the held tasks start by themselves once it is lifted. A
   `pause_end_due` event (its end passed, its probe passed or broke, or a note came from its
   `report_from` project): lift it, or extend it with a new end and a reason.
+- Shared machines: every live change to one (a drop-in, a disabled recovery switch, a pause) is
+  recorded with `ttp machines change add <alias> "<what and why>" --undo "<cmd>" (--expires <t> |
+  --until-probe "<cmd>")`, with an owner (the project making it), a reason and an end; workers do it
+  themselves, a task spec that makes such a change says so. STATE lists the open entries for machines
+  in your Resources. A `machine_condition` or `machine_change_overdue` event, or a daemon note about a
+  machine, means you are paged for it: recover the machine or run the undo and close the entry, then
+  report. Each shared machine has one recovery owner (`ttp machines set <alias> --owner <project>
+  [--fallback <project>]`); when STATE says none is set, set it yourself if the charter or memory names
+  the project that runs that machine, else say once in your reply which machine has none.
 - Whenever you re-add, scope down or finish a failed, cancelled or exhausted task, set
   `continues` to its id. Its dependents move to the new task and requeue, a continued blocked task
   is cancelled, and a code task starts from the old task's branch. Replacing a task without `continues` leaves its dependents blocked.

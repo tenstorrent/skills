@@ -151,6 +151,9 @@ def add(alias: str, tags: Any = None, note: str | None = None, min_free_gb: Any 
     sh.check_unshare(old.get("shared"), shared, alias)
     if shared:
         entry["shared"] = shared
+    for k in RECOVERY:
+        if old.get(k):
+            entry[k] = old[k]
     machines[alias] = entry
     removed.pop(alias, None)
     _save(machines, removed)
@@ -262,6 +265,36 @@ def disk_min_free_gb(known: dict[str, dict] | None = None) -> tuple[str, float] 
     return (hit[0], gb) if gb is not None else None
 
 
+RECOVERY = ("recovery_owner", "recovery_fallback")
+PROJECT_RE = re.compile(r"[\w.-]{1,100}")
+
+
+def set_recovery(alias: str, owner: str | None = None, fallback: str | None = None) -> dict:
+    """Name the project that recovers machine `alias` when it stays down or held, and the one that
+    takes over when the owner cannot act (machine_ledger.py). None keeps a value, "" removes it."""
+    doc = _doc()
+    machines, removed = load(), dict(_part(doc, "removed"))
+    if alias not in machines:
+        raise ValueError(f"no machine {alias!r} in `ttp machines list`")
+    entry = dict(machines[alias])
+    for key, name in zip(RECOVERY, (owner, fallback)):
+        if name is None:
+            continue
+        name = name.strip()
+        if name and not PROJECT_RE.fullmatch(name):
+            raise ValueError(f"not a project name: {name!r}")
+        if name:
+            entry[key] = name
+        else:
+            entry.pop(key, None)
+    if entry.get("recovery_fallback") and not entry.get("recovery_owner"):
+        raise ValueError("a fallback needs an owner: give --owner too")
+    entry["updated"] = time.time()
+    machines[alias] = entry
+    _save(machines, removed)
+    return entry
+
+
 def line(alias: str, m: dict) -> str:
     tags = f" [{', '.join(m.get('tags') or [])}]" if m.get("tags") else ""
     host = f" (host {m['hostname']})" if m.get("hostname") else ""
@@ -271,7 +304,9 @@ def line(alias: str, m: dict) -> str:
         note += f" (until {_day(m['note_until'])})"
     shared = m.get("shared")
     shared = f" (shared by all projects: {', '.join(shared)})" if isinstance(shared, list) and shared else ""
-    return f"{alias}{tags}{host}{disk}{shared}{note}"
+    owner = (f" (recovery owner {m['recovery_owner']}" + (f", fallback {m['recovery_fallback']}"
+             if m.get("recovery_fallback") else "") + ")") if m.get("recovery_owner") else ""
+    return f"{alias}{tags}{host}{disk}{shared}{owner}{note}"
 
 
 def alternatives(alias: str, machines: dict[str, dict], avoid: set[str]) -> list[str]:

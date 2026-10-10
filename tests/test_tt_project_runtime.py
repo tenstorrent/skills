@@ -4857,6 +4857,11 @@ def test_a_routine_digest_collapses_unchanged_background_and_keeps_what_decides_
     _memories(p, [("restriction" if i % 2 else "preference", f"RULE-{i} " + "y" * 900) for i in range(10)]
               + [("fact", "OLD-FACT")])
     coord.pause_resource(p, "box-b", True, reason="firmware", by="user")
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    mm.add("box-c", tags="device")
+    _resources(p, "- box-c")
+    ml.add_change("box-c", "disabled auto power cycle", "enable it", "other", expires="6h")
     tid = db.add_task("open work", "s", origin="user")
     ask = db.post("out", "Which board should the soak use?", kind="ask")
     ev = db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
@@ -35589,3 +35594,347 @@ def test_check_probe_rejects_a_malformed_landed_probe(probe):
         coord.check_probe(probe)
     for ok in ("landed:#12", " landed: 12 ", "test -f landed:x"):
         coord.check_probe(ok)
+
+
+# shared machines: recovery owner and change ledger (machine_ledger.py) -----------------------------
+
+def _resources(p, text):
+    c = p.charter_path.read_text()
+    p.charter_path.write_text(c.replace("## Resources\n", f"## Resources\n{text}\n", 1))
+
+
+def test_machines_set_names_a_recovery_owner_that_an_update_keeps(env, capsys):
+    from ttp import machines as mm
+    from ttp.cli import main
+    main(["machines", "add", "box-a", "--tags", "device"])
+    main(["machines", "set", "box-a", "--owner", "alpha", "--fallback", "beta"])
+    assert "box-a [device] (recovery owner alpha, fallback beta)" in capsys.readouterr().out
+    mm.add("box-a", note="main board")
+    m = mm.load()["box-a"]
+    assert (m["recovery_owner"], m["recovery_fallback"], m["note"]) == ("alpha", "beta", "main board")
+    mm.set_recovery("box-a", fallback="")
+    assert "recovery_fallback" not in mm.load()["box-a"] and mm.load()["box-a"]["recovery_owner"] == "alpha"
+    with pytest.raises(ValueError):
+        mm.set_recovery("box-z", owner="alpha")
+    mm.set_recovery("box-a", owner="")
+    with pytest.raises(ValueError, match="needs an owner"):
+        mm.set_recovery("box-a", fallback="beta")
+
+
+def test_machine_change_ledger_add_list_overdue_and_close(env, capsys):
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp.cli import main
+    p = make(env)
+    mm.add("box-a", tags="device")
+    now = time.time()
+    with pytest.raises(ValueError, match="give an end"):
+        ml.add_change("box-a", "drop-in", "rm it", "demo")
+    with pytest.raises(ValueError, match="no machine"):
+        ml.add_change("box-z", "drop-in", "rm it", "demo", expires="2h")
+    main(["machines", "change", "add", "box-a", "disabled auto power cycle for a soak", "--undo",
+          "enable-power-cycle", "--expires", "2h", "--by", "demo"])
+    assert "recorded #1 box-a: disabled auto power cycle for a soak (by demo; undo: `enable-power-cycle`" \
+        in capsys.readouterr().out
+    probe = ml.add_change("box-a", "paused the queue", "resume-queue", "demo", until_probe="exit 0", now=now)
+    assert probe["expires"] == pytest.approx(now + ml.PROBE_END_S)
+    main(["machines", "change", "list"])
+    out = capsys.readouterr().out
+    assert "#1 box-a" in out and "#2 box-a: paused the queue" in out and "OVERDUE" not in out
+    first = ml.changes()[0]
+    assert ml.overdue(first, now + 3 * 3600).startswith("expired") and not ml.overdue(first, now)
+    assert ml.overdue(probe, now + ml.PROBE_END_S + 1).startswith("expired")
+    # The until-probe runs in the daemon of the project that made the entry; exit 0 makes it overdue.
+    other = ml.Probes(type("P", (), {"name": "else", "root": p.root})())
+    other.tick(now)
+    assert not other._procs, "another project's daemon runs only its own entries' probes"
+    probes = ml.Probes(p)
+    probes.tick(now)
+    proc = probes._procs[2][0]
+    proc.wait(timeout=10)
+    probes.tick(now + 1)
+    assert ml.overdue(ml.changes()[1], now + 1) == "its until-probe passed"
+    main(["machines", "change", "close", "2", "--why", "resumed", "--by", "demo"])
+    assert [c["id"] for c in ml.changes()] == [1]
+    assert ml.changes(open_only=False)[1]["closed_why"] == "resumed"
+    with pytest.raises(SystemExit):
+        main(["machines", "change", "close", "2"])
+
+
+def _ledger_writer(home, n, k):
+    from ttp import machine_ledger as ml
+    for i in range(k):
+        ml.add_change("box-a", f"change {n}.{i}", "undo", f"p{n}", expires="1h")
+
+
+def test_machine_ledger_keeps_every_entry_from_concurrent_writers(env):
+    import multiprocessing
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    mm.add("box-a", tags="device")
+    ctx = multiprocessing.get_context("fork")
+    procs = [ctx.Process(target=_ledger_writer, args=(env["home"], n, 10)) for n in range(4)]
+    for pr in procs:
+        pr.start()
+    for pr in procs:
+        pr.join(60)
+        assert pr.exitcode == 0
+    got = ml.changes()
+    assert len(got) == 40 and sorted(c["id"] for c in got) == list(range(1, 41))
+    assert {c["what"] for c in got} == {f"change {n}.{i}" for n in range(4) for i in range(10)}
+
+
+def test_a_long_machine_condition_goes_to_its_owner_then_the_fallback_then_the_user(env):
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp import upstream
+    from ttp.daemon import Daemon
+    alpha = make(env, "alpha")
+    mm.add("box-a", tags="device")
+    t0 = time.time()
+    assert ml.report("gamma", "box-a", "down", "no answer to ssh", now=t0)
+    assert not ml.report("gamma", "box-z", "down", now=t0)
+    assert ml.route(t0 + 2 * 3600, able=lambda n: (True, "")) == [], "no owner set: nothing is routed"
+    mm.set_recovery("box-a", owner="alpha", fallback="beta")
+    t0 += 2 * 3600
+    ml.report("gamma", "box-a", "down", "no answer to ssh", now=t0)
+    ml.report("delta", "box-a", "down", now=t0 + 60)
+    able = {"alpha": (False, "its daemon is stopped"), "beta": (False, "it is paused")}
+    pages = ml.route(t0 + 120, able=able.get)
+    assert [x["target"] for x in pages] == ["alpha"] and pages[0]["kind"] == "machine_condition"
+    assert "box-a down" in pages[0]["text"] and "gamma, delta" in pages[0]["text"]
+    assert ml.route(t0 + 180, able=able.get) == [], "a claimed page goes to one daemon"
+    assert ml.delivered(pages[0]) and not ml.delivered(pages[0])
+    assert ml.route(t0 + 180 + ml.UNAVAILABLE_S - 60, able=able.get) == [], "a delivered page is sent once"
+    pages = ml.route(t0 + 180 + ml.UNAVAILABLE_S, able=able.get)
+    assert [x["target"] for x in pages] == ["beta"] and "alpha cannot act: its daemon is stopped" in pages[0]["text"]
+    ml.delivered(pages[0])
+    ml.report("gamma", "box-a", "down", now=t0 + 3000)
+    assert ml.route(t0 + 3000, able=able.get) == []
+    pages = ml.route(t0 + 3000 + ml.UNAVAILABLE_S, able=able.get)
+    assert [x["target"] for x in pages] == [ml.USER]
+    ml.delivered(pages[0])
+    assert ml.route(t0 + 3000 + 2 * ml.UNAVAILABLE_S, able=able.get) == []
+    # Delivered: a high note in the owner's inbox from this daemon, an event at home, an outage alert.
+    d = Daemon(alpha.base)
+    d._machine_page({"target": "beta", "kind": "machine_condition", "key": "machine:box-a:down",
+                     "alias": "box-a", "text": "Machine box-a down."}, t0)
+    note = [json.loads(ln) for ln in upstream.path().read_text().splitlines()][-1]
+    assert (note["to"], note["from"], note["severity"], note["project"]) == ("beta", "daemon", "high", "alpha")
+    assert "from the daemon of alpha" in upstream._event(note)[1]
+    d._machine_page({"target": "alpha", "kind": "machine_condition", "key": "machine:box-a:down",
+                     "alias": "box-a", "text": "Machine box-a down."}, t0)
+    ev = alpha.db.one("SELECT * FROM events WHERE kind='machine_condition'")
+    assert ev["severity"] == "high" and ev["status"] == "queued"
+    from ttp import coordinator as coord
+    assert coord.EFFORT_EVENT_TRIGGERS["machine_condition"] == "resource"
+    d._machine_page({"target": ml.USER, "kind": "machine_condition", "key": "machine:box-a:down",
+                     "alias": "box-a", "text": "Machine box-a down."}, t0)
+    assert "Outage: Machine box-a down." in alpha.db.one("SELECT text FROM alerts WHERE key='machine:box-a:down'")["text"]
+    # A clear, or nobody reporting it for CONDITION_GONE_S, ends it.
+    ml.report("gamma", "box-a", "down", cleared=True)
+    assert ml.conditions() == {}
+    ml.report("gamma", "box-a", "held", now=t0)
+    ml.route(t0 + ml.CONDITION_GONE_S, able=able.get)
+    assert ml.conditions() == {}
+    # A command watcher's observation with `machine` and `condition` reports it.
+    d._machine_condition({"machine": "box-a", "condition": "held", "grace_s": 60}, "hold never recovers")
+    got = ml.conditions()["box-a:held"]
+    assert (got["seen_by"], got["grace_s"], got["text"]) == (["alpha"], 60.0, "hold never recovers")
+
+
+def test_can_act_reads_another_projects_state_without_writing_it(env):
+    from ttp import machine_ledger as ml
+    beta = make(env, "beta")
+    db = beta.base / "state" / "project.db"
+    before = db.stat().st_mtime
+    assert ml.can_act("beta") == (False, "its daemon is stopped")
+    assert ml.can_act("nobody")[0] is False
+    assert db.stat().st_mtime == before
+
+
+def test_an_overdue_machine_change_pages_its_project_then_the_owner(env):
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    mm.add("box-a", tags="device")
+    mm.set_recovery("box-a", owner="alpha")
+    now = time.time()
+    ml.add_change("box-a", "drop-in for a soak", "remove-drop-in", "gamma", expires="1h", now=now)
+    assert ml.route(now + 60, able=lambda n: (True, "")) == []
+    able = {"gamma": (False, "it is paused"), "alpha": (True, "")}
+    pages = ml.route(now + 3601, able=able.get)
+    assert [(x["target"], x["kind"]) for x in pages] == [("gamma", "machine_change_overdue")]
+    assert "undo it with `remove-drop-in`" in pages[0]["text"]
+    ml.route(now + 3700, able=able.get)
+    pages = ml.route(now + 3700 + ml.UNAVAILABLE_S, able=able.get)
+    assert [x["target"] for x in pages] == ["alpha"]
+    assert ml.route(now + 3700 + ml.UNAVAILABLE_S + ml.REPAGE_S, able=able.get)[0]["target"] == ml.USER
+    ml.close_change(1, "undone")
+    assert ml.route(now + 4 * 86400, able=able.get) == []
+
+
+def test_the_digest_lists_shared_machine_changes_only_for_machines_in_resources(env):
+    from ttp import coordinator as coord
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    p = make(env)
+    for a in ("box-a", "box-b", "box-ab"):
+        mm.add(a, tags="device")
+    ml.add_change("box-a", "disabled auto power cycle", "enable it", "other", expires="6h")
+    ml.add_change("box-b", "paused the queue", "resume it", "other", expires="6h")
+    ml.add_change("box-ab", "a drop-in", "rm it", "other", expires="6h")
+    assert "Shared machines in your Resources" not in coord.digest(p, {}, [], [])
+    _resources(p, "- box-a: the device machine (shared with other projects)")
+    dig = coord.digest(p, {}, [], [])
+    sec = dig.split("## Shared machines in your Resources")[1].split("\n## ")[0]
+    assert "#1 box-a: disabled auto power cycle (by other; undo: `enable it`" in sec
+    assert "box-b" not in sec and "a drop-in" not in sec
+    assert "No recovery owner set for box-a" in sec
+    assert "No recovery owner set" not in coord.digest(p, {}, [], []), "the gap is named once"
+    ml.report("other", "box-a", "held", "hold never recovers")
+    assert "box-a held since" in coord.digest(p, {}, [], [])
+
+
+def _inbox():
+    from ttp import upstream
+    try:
+        return [json.loads(ln) for ln in upstream.path().read_text().splitlines() if ln.strip()]
+    except FileNotFoundError:
+        return []
+
+
+def test_a_machine_page_lost_to_a_crash_goes_out_on_a_later_tick_exactly_once(env, monkeypatch):
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp.daemon import Daemon
+    alpha = make(env, "alpha")
+    mm.add("box-a", tags="device")
+    mm.set_recovery("box-a", owner="beta")
+    ml.report("gamma", "box-a", "down", "no answer to ssh", now=time.time() - 3600)
+    # A daemon routes the page, then dies before it delivers: the page stays pending, claimed for a while.
+    pages = ml.route(claimer="alpha")
+    assert [x["target"] for x in pages] == ["beta"] and _inbox() == []
+    d = Daemon(alpha.base)
+    d.route_machines()
+    assert _inbox() == [], "the claim holds while the crashed daemon might still deliver"
+    monkeypatch.setattr(ml, "CLAIM_S", 0)   # the claim lapsed
+    d._machines_routed = 0
+    d.route_machines()
+    notes = _inbox()
+    assert [(n["to"], n["from"]) for n in notes] == [("beta", "daemon")]
+    assert notes[0]["spec"] == " ".join(pages[0]["text"].split()), "the text is fixed for the step"
+    d._machines_routed = 0
+    d.route_machines()
+    assert len(_inbox()) == 1
+    # A crash after the send but before it was marked: the resend is the same note, dropped as a duplicate.
+    ml.report("gamma", "box-a", "held", now=time.time() - 3600)
+    page = next(x for x in ml.route(claimer="alpha") if x["key"] == "machine:box-a:held")
+    assert d._machine_page(page, time.time())
+    d._machines_routed = 0
+    d.route_machines()
+    assert len(_inbox()) == 2 and ml.route() == []
+    # The same at home: one event per page, however often it is retried.
+    mm.set_recovery("box-a", owner="alpha")
+    ml.report("gamma", "box-a", "down", cleared=True)
+    ml.report("gamma", "box-a", "down", now=time.time() - 3600)
+    page = ml.route(claimer="alpha")[0]
+    assert d._machine_page(page, time.time()) and d._machine_page(page, time.time())
+    d._machines_routed = 0
+    d.route_machines()
+    assert alpha.db.one("SELECT COUNT(*) n FROM events WHERE kind='machine_condition'")["n"] == 1
+    assert ml.route() == []
+
+
+def test_a_limited_machine_page_is_retried_and_daemon_pages_skip_the_worker_note_limit(env, monkeypatch):
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp import upstream
+    from ttp.daemon import Daemon
+    alpha = make(env, "alpha")
+    mm.add("box-a", tags="device")
+    mm.set_recovery("box-a", owner="beta")
+    now = time.time()
+    for i in range(upstream.NOTES_PER_HOUR):
+        assert upstream.send("alpha", 1, "other", f"worker note {i}", now=now) == "sent"
+    assert upstream.send("alpha", 1, "other", "one more", now=now) == "limited"
+    assert upstream.send("alpha", None, "beta", "a page", "high", now=now, sender="daemon") == "sent"
+    assert upstream.send("alpha", 1, "other", "one more", now=now) == "limited", "pages count apart"
+    # A page whose send is refused stays pending and goes out on the next tick.
+    ml.report("gamma", "box-a", "down", now=now - 3600)
+    real, calls = upstream.send, []
+
+    def flaky(*a, **k):
+        calls.append(a[2])
+        return "limited" if len(calls) == 1 else real(*a, **k)
+    monkeypatch.setattr(upstream, "send", flaky)
+    d = Daemon(alpha.base)
+    d.route_machines()
+    assert calls == ["beta"] and not [n for n in _inbox() if "Machine box-a down" in n["spec"]]
+    d._machines_routed = 0
+    d.route_machines()
+    assert calls == ["beta", "beta"]
+    assert len([n for n in _inbox() if "Machine box-a down" in n["spec"]]) == 1
+    d._machines_routed = 0
+    d.route_machines()
+    assert len(calls) == 2
+
+
+def _router(home, n, now):
+    from ttp import machine_ledger as ml
+    from ttp import upstream
+    for page in ml.route(now, able=lambda name: (True, ""), claimer=f"p{n}"):
+        assert upstream.send(f"p{n}", None, page["target"], page["text"], "high", now=now, sender="daemon") == "sent"
+        assert ml.delivered(page)
+
+
+def test_two_daemons_routing_at_once_deliver_a_machine_page_once(env):
+    import multiprocessing
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    mm.add("box-a", tags="device")
+    mm.set_recovery("box-a", owner="beta")
+    now = time.time()
+    ml.report("gamma", "box-a", "down", now=now - 3600)
+    ml.add_change("box-a", "drop-in", "rm it", "gamma", expires="1h", now=now - 7200)
+    ctx = multiprocessing.get_context("fork")
+    procs = [ctx.Process(target=_router, args=(env["home"], n, now)) for n in range(4)]
+    for pr in procs:
+        pr.start()
+    for pr in procs:
+        pr.join(60)
+        assert pr.exitcode == 0
+    assert sorted(n["to"] for n in _inbox()) == ["beta", "gamma"]
+    assert ml.route(now + ml.CLAIM_S, able=lambda name: (True, "")) == []
+
+
+def test_a_machine_outage_alert_holds_while_reported_and_clears_with_its_condition(env):
+    from ttp import alerts
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp.daemon import Daemon
+    alpha = make(env, "alpha")
+    mm.add("box-a", tags="device")
+    now = time.time()
+    ml.report("gamma", "box-a", "down", now=now)
+    d = Daemon(alpha.base)
+    d._machine_page({"target": ml.USER, "kind": "machine_condition", "key": "machine:box-a:down",
+                     "alias": "box-a", "text": "Machine box-a down."}, now)
+    late = now + alerts.DAY + 3600
+    ml.report("gamma", "box-a", "down", now=late)
+    assert alerts.sweep(alpha.db, late) == [], "still reported past a day: it holds"
+    ml.report("gamma", "box-a", "down", cleared=True)
+    closed = alerts.sweep(alpha.db, late)
+    assert [(c["key"], c["cleared_why"]) for c in closed] == [("machine:box-a:down", "condition cleared")]
+    assert alpha.db.one("SELECT text FROM messages WHERE kind='resolved' AND ref='machine:box-a:down'")
+    # Nobody reporting it for CONDITION_GONE_S ends it too.
+    ml.report("gamma", "box-a", "held", now=now)
+    d.alert("machine:box-a:held", "Outage: Machine box-a held.", severity="high")
+    assert alerts.sweep(alpha.db, now + 60) == []
+    assert [c["key"] for c in alerts.sweep(alpha.db, now + ml.CONDITION_GONE_S)] == ["machine:box-a:held"]
+    # An overdue change: holds while it is open and overdue, clears once it is closed.
+    c = ml.add_change("box-a", "drop-in", "rm it", "gamma", expires="1h", now=now - 7200)
+    key = f"machine-change:{c['id']}"
+    d.alert(key, "Outage: Machine change overdue.", severity="high")
+    assert alerts.sweep(alpha.db, late) == []
+    ml.close_change(c["id"], "undone")
+    assert [x["key"] for x in alerts.sweep(alpha.db, late)] == [key]

@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from . import locks
-from . import anchors, effort, ends, heal, jevuse, machines, pauseends, prguard, push, reviewcap, shared, unblock, upstream, worktree
+from . import anchors, effort, ends, heal, jevuse, machine_ledger, machines, pauseends, prguard, push, reviewcap, shared, unblock, upstream, worktree
 from . import screen as scr
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
@@ -174,7 +174,7 @@ EFFORT_EVENT_TRIGGERS = {
     "deferral_expired": "stuck", "deferral_probe_broken": "stuck", "review_stall": "stuck",
     "wait_stale": "stuck", "hold_probe_broken": "stuck", "probe_never_passes": "stuck",
     "start_resource_stale": "resource",
-    "resource_trouble": "resource",
+    "resource_trouble": "resource", "machine_condition": "resource", "machine_change_overdue": "resource",
     # costly or irreversible decisions
     "task_budget_exhausted": "costly", "ask_timeout": "costly", "pr_findings": "costly", "pr_clean": "costly",
     "pr_unapproved_ready": "costly", "after_push_failed": "costly", "push_batch_died": "costly",
@@ -211,7 +211,7 @@ MUTE_CHARS = 200
 # saw them (`digest_seen`). The budget gate, open asks and tasks, new events, paused resources and
 # memory changes are always shown whole; so is everything on a turn at raised effort.
 DIGEST_SEEN_KEY = "digest_seen"   # kv: {section: hash of what the previous turn's digest showed}
-COLLAPSIBLE = ("recurring", "muted", "memory_budget")
+COLLAPSIBLE = ("recurring", "muted", "memory_budget", "machine_ledger")
 EVENT_CHARS = 1500
 # A plan's product arrives as these events; the daemon sizes them to fit, so they show whole.
 EVENT_CHARS_BY_KIND = {"followup_proposed": 4300, "task_notes": 6000, "upstream_note": 4300}
@@ -456,6 +456,12 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
                      + ", ".join(f"{k} {n}" for k, n in sorted(got.items())) + f"); all use the smallest, "
                      f"{min(got.values())}")
     section("shared", lines)
+    lines = machine_ledger.digest_lines(p, now)
+    if lines:
+        kept = [ln for ln in lines if not ln.startswith("No recovery owner")]   # named once: not a change
+        section("machine_ledger", ["## Shared machines in your Resources: open changes (`ttp machines change`), "
+                                   "conditions, owners"] + [f"- {ln}" for ln in lines], "\n".join(kept),
+                f"## Shared machines in your Resources: {len(kept)} open (as last turn)")
     section("memory_added", memory_digest_lines(memory_view(p, now)))
     section("charter_conflicts", charter_conflict_lines(charter_conflicts(p)))
     section("ends", ends.digest_lines(p, float(db.kv("last_coordinator_turn", 0) or 0), now))
