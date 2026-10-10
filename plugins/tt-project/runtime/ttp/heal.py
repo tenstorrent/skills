@@ -14,7 +14,8 @@ or a timeout, is unknown too and reported as an error of the schedule. Each run 
 - unhealthy within `grace_s` of the first unhealthy run: tolerated (automatic recovery may still
   happen); the check runs again when the grace ends;
 - unhealthy past grace: the fix runs (under `ttp lock <resource>` when set; a busy or paused lock
-  defers it) and the check runs again `settle_s` later. Healthy then: one low feed line and a digest
+  defers it uncounted, but a lock that stays busy, not paused, past `window_h` escalates as below;
+  a fix that itself exits 75 counts like any other) and the check runs again `settle_s` later. Healthy then: one low feed line and a digest
   record ("fixed X, n today"), no coordinator wake.
 - the fix failed, did not help, `max_fixes` per `window_h` is used up, or there is no fix: one
   priority-1 self-fix task is queued (label `heal:<name>`, so one is open per check), carrying the
@@ -24,7 +25,14 @@ or a timeout, is unknown too and reported as an error of the schedule. Each run 
 Known faults and outages: `known_fault` (why repair is not ours) keeps a single fault quiet: no fix,
 no task, no alert. A check with `outage: true` watches a whole box or resource; once it has served
 nothing for 60 min (or past its grace_s, if shorter) it escalates as above whatever `known_fault`
-says. Observation mutes never reach these checks: their escalation does not go through observations.
+says. Its check staying unknown (75, 255 or a broken check: an unreachable box looks like that) for as
+long escalates the same way, without running the fix; the next healthy result clears it. Observation
+mutes never reach these checks: their escalation does not go through observations.
+
+Daemon time: `timeout_s` is capped at MAX_TIMEOUT_S (the daemon's command-watcher cap), a timeout
+kills the check's or fix's whole process group, and the daemon tells its watchdog it still moves
+between the check and the fix; after a fix the schedule's own command waits for the recheck, so one
+step never outlasts the watchdog.
 
 Presets fill in `check` (and a default `fix`) from config, so no host or unit is named in code:
 - `{"preset": "systemd", "unit": "x.service", "user": false, "host": null}`: active and not
@@ -36,13 +44,15 @@ Presets fill in `check` (and a default `fix`) from config, so no host or unit is
   recovery: power cycle, reboot) is false. No default fix.
 
 State lives in the database (kv `heal:<name>`), so a daemon restart, even in the middle of a fix,
-picks up where it was: a fix that started counts toward the cap, and the next run is its recheck.
+picks up where it was: a fix that started counts toward the cap, and the next run is its recheck,
+no earlier than `settle_s` after the fix started.
 """
 from __future__ import annotations
 
 import json
 import os
 import shlex
+import signal
 import subprocess
 import sys
 import time
@@ -58,6 +68,9 @@ LABEL = "heal:"                 # task label of a check's self-fix task
 UNKNOWN_RCS = (75, 255)
 OUTAGE_S = 3600                 # a whole box or resource serving nothing this long is never kept quiet
 LOCK_WAIT_S = 30                # how long a fix waits for its resource lock before it is deferred
+MAX_TIMEOUT_S = 240             # timeout_s cap: daemon.WATCHER_MAX_S, so check, then fix (+ lock wait) stay
+                                # each well below the daemon's watchdog (WATCHDOG_S)
+FIX_OWN_75 = 176                # a fix under a lock that itself exits 75 exits this, apart from the lock's 75
 DEFAULTS = {"grace_s": 300, "settle_s": 60, "max_fixes": 3, "window_h": 1.0, "timeout_s": 120}
 OPEN = ("queued", "running", "waiting", "needs_review")
 _COMMON = {"check", "fix", "resource", "preset", "outage", "known_fault", *DEFAULTS}
@@ -89,6 +102,7 @@ def validate(block: Any, where: str = "heal") -> dict:
             raise ValueError(f"{where}: `{k}` is a number, 0 or more")
     if out["timeout_s"] <= 0 or out["window_h"] <= 0:
         raise ValueError(f"{where}: `timeout_s` and `window_h` must be positive")
+    out["timeout_s"] = min(out["timeout_s"], MAX_TIMEOUT_S)   # longer would hold the daemon's tick past its watchdog
     for k in ("check", "fix", "resource", "known_fault"):
         if out.get(k) is not None and not isinstance(out[k], str):
             raise ValueError(f"{where}: `{k}` is text")
@@ -136,12 +150,30 @@ def _env() -> dict:
     return {**os.environ, "PATH": service_path()}
 
 
-def _shell(cmd: str, cwd: str, timeout: float) -> tuple[int, str]:
+def _exec(args: str | list[str], cwd: str, timeout: float, env: dict | None = None) -> tuple[int, str]:
+    """Run in a session of its own; a timeout kills the whole group (a hung ssh, a fix's children)."""
     try:
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=cwd, timeout=timeout, env=_env())
+        proc = subprocess.Popen(args, shell=isinstance(args, str), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, cwd=cwd, env=env or _env(), start_new_session=True)
+    except OSError as e:
+        return 127, str(e)
+    try:
+        out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:   # a child that left the group still holds the pipes
+            pass
         return 124, f"timed out after {timeout:.0f} s"
-    return r.returncode, ((r.stdout or "") + (r.stderr or "")).strip()[-2000:]
+    return proc.returncode, ((out or "") + (err or "")).strip()[-2000:]
+
+
+def _shell(cmd: str, cwd: str, timeout: float) -> tuple[int, str]:
+    return _exec(cmd, cwd, timeout)
 
 
 def _systemctl(spec: dict, *args: str) -> str:
@@ -232,20 +264,17 @@ def check(spec: dict, state: dict, cwd: str) -> tuple[int, str]:
 
 
 def run_fix(spec: dict, cwd: str, project_base: str) -> tuple[int, str]:
-    """Run the fix, under `ttp lock <resource>` when it names one. 75 from the lock: busy or paused."""
+    """Run the fix, under `ttp lock <resource>` when it names one. 75 only from the lock (busy or
+    paused): `ttp lock` passes its command's exit code on, so a fix's own 75 comes back as FIX_OWN_75."""
     if not spec.get("resource"):
         return _shell(spec["fix"], cwd, spec["timeout_s"])
+    wrap = f'sh -c "$1"; rc=$?; [ "$rc" -eq 75 ] && exit {FIX_OWN_75}; exit "$rc"'
     argv = [sys.executable, "-m", "ttp", "lock", "--timeout", str(LOCK_WAIT_S), spec["resource"],
-            "--", "sh", "-c", spec["fix"]]
+            "--", "sh", "-c", wrap, "heal-fix", spec["fix"]]
     env = {**_env(), "TTP_PROJECT": project_base, "PYTHONPATH": os.pathsep.join(
         [os.path.dirname(os.path.dirname(os.path.abspath(__file__))), os.environ.get("PYTHONPATH", "")]).rstrip(
         os.pathsep)}
-    try:
-        r = subprocess.run(argv, capture_output=True, text=True, cwd=cwd, env=env,
-                           timeout=spec["timeout_s"] + LOCK_WAIT_S + 10)
-    except subprocess.TimeoutExpired:
-        return 124, f"timed out after {spec['timeout_s']:.0f} s"
-    return r.returncode, ((r.stdout or "") + (r.stderr or "")).strip()[-2000:]
+    return _exec(argv, cwd, spec["timeout_s"] + LOCK_WAIT_S + 10, env)
 
 
 # State --------------------------------------------------------------------------------------------
@@ -278,12 +307,20 @@ def open_task(db: DB, name: str) -> dict | None:
 
 # The flow -----------------------------------------------------------------------------------------
 def run(host: Any, name: str, spec: dict, now: float | None = None) -> tuple[str, float | None]:
-    """One run of the check for the daemon `host` (it has `p` and `alert`). Returns (schedule status, when to run again if sooner than its period)."""
+    """One run of the check for the daemon `host` (it has `p` and `alert`, and may have `_progress`,
+    the watchdog ping, called between the check and the fix). Returns (schedule status, when to run
+    again if sooner than its period)."""
     p, db = host.p, host.p.db
     now = time.time() if now is None else now
     st = state(db, name)
     cwd = str(p.root)
+    if st.get("phase") == "fixing" and now < float(st.get("fix_started") or 0) + spec["settle_s"]:
+        # A restart cut the fix short: its recheck still waits for settle_s.
+        return "unhealthy (fix interrupted; rechecking)", float(st["fix_started"]) + spec["settle_s"]
     rc, out = check(spec, st, cwd)
+    ping = getattr(host, "_progress", None)
+    if callable(ping):
+        ping()
     st.update(last_check=now, last_rc=rc, last_out=out[-1000:])
     pending = st.get("phase") in ("fixing", "settling")   # a fix ran (or a restart cut it short)
     if rc == 0:
@@ -297,10 +334,25 @@ def run(host: Any, name: str, spec: dict, now: float | None = None) -> tuple[str
             return f"fixed ({n} today)", None
         return "ok (healthy)", None
     if rc != 1:
-        _save(db, name, {**st, "unknown_since": st.get("unknown_since") or now})
+        st["unknown_since"] = st.get("unknown_since") or now
+        again = None
+        if spec.get("outage"):
+            # A whole box whose check cannot even tell (ssh fails: it looks like this when it is down)
+            # serves nothing either: escalated as unhealthy past the outage window, never fixed blind.
+            window = min(spec["grace_s"] or OUTAGE_S, OUTAGE_S)
+            dark = now - float(st["unknown_since"])
+            if dark >= window:
+                st["status"] = "unhealthy"
+                st.setdefault("since", st["unknown_since"])
+                if st.get("task") or st.get("escalated"):
+                    return _escalated(host, name, spec, st, now)
+                return _escalate(host, name, spec, st, now, f"its check could not tell for {dark / 60:.0f} min "
+                                                            f"(exit {rc}): the box or resource may be unreachable")
+            again = float(st["unknown_since"]) + window
+        _save(db, name, st)
         if rc in UNKNOWN_RCS:
-            return f"ok (unknown, rc {rc})", None
-        return f"error: heal check exited {rc}: {out[-150:]}", None
+            return f"ok (unknown, rc {rc})", again
+        return f"error: heal check exited {rc}: {out[-150:]}", again
     st.pop("unknown_since", None)
     st["status"] = "unhealthy"
     since = st.setdefault("since", now)
@@ -327,14 +379,26 @@ def run(host: Any, name: str, spec: dict, now: float | None = None) -> tuple[str
         return _escalate(host, name, spec, st, now,
                          f"{len(fixes)} fixes in {spec['window_h']:g} h used up its cap ({spec['max_fixes']})")
     # Recorded before the fix runs: a restart in the middle still counts it, and rechecks next.
+    deferred = st.pop("deferred_since", None)
     st.update(fixes=fixes + [now], phase="fixing", fix_started=now)
     _save(db, name, st)
     frc, fout = run_fix(spec, cwd, str(p.base))
     st.update(fix_rc=frc, fix_out=fout[-1000:])
     if frc == 75 and spec.get("resource"):
-        st.update(fixes=fixes, phase=None)   # the lock was busy or paused: not a fix, try again next run
+        # Only the lock exits 75 here (run_fix): the fix never started. Not counted; try again next run.
+        st.update(fixes=fixes, phase=None)
+        res = spec["resource"]
+        if "is paused" in fout:   # a pause is the user's; it waits however long it lasts
+            _save(db, name, st)
+            return f"unhealthy (fix deferred: {res} paused)", None
+        st["deferred_since"] = deferred or now
+        if now - float(st["deferred_since"]) >= window:
+            return _escalate(host, name, spec, st, now, f"its fix could not get the lock {res} for "
+                                                        f"{(now - float(st['deferred_since'])) / 3600:.1f} h: it stayed busy")
         _save(db, name, st)
-        return f"unhealthy (fix deferred: {spec['resource']} busy or paused)", None
+        return f"unhealthy (fix deferred: {res} busy)", None
+    if frc == FIX_OWN_75:
+        frc = st["fix_rc"] = 75   # the fix's own 75 (run_fix), counted like any failed fix
     if frc != 0:
         st["phase"] = None
         return _escalate(host, name, spec, st, now, f"the fix exited {frc}")
@@ -412,7 +476,9 @@ def summary(db: DB, now: float | None = None) -> dict:
     n_ok = n_bad = n_unknown = 0
     for r, _ in checks(db):
         s = state(db, r["name"])
-        if "unknown_since" in s:   # the latest reading tells nothing either way
+        if s.get("status") == "unhealthy" and s.get("escalated"):   # an unreachable box escalated too
+            n_bad += 1
+        elif "unknown_since" in s:   # the latest reading tells nothing either way
             n_unknown += 1
         elif s.get("status") == "unhealthy":
             n_bad += 1

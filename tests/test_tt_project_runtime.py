@@ -34736,11 +34736,131 @@ def test_heal_fix_runs_under_its_lock_and_waits_out_a_pause(env):
                           fix=f'echo "$TTP_LOCKS_HELD" > {held}; touch {up}')
     spec, now = _heal_spec(p), time.time()
     p.db.set_kv(PAUSED_RESOURCES_KEY, {"dev-x": {"reason": "user hold", "since": now}})
-    assert heal.run(d, "svc", spec, now)[0] == "unhealthy (fix deferred: dev-x busy or paused)"
+    assert heal.run(d, "svc", spec, now)[0] == "unhealthy (fix deferred: dev-x paused)"
+    assert heal.run(d, "svc", spec, now + 7200)[0] == "unhealthy (fix deferred: dev-x paused)"   # a pause never escalates
     assert not up.exists() and heal.state(p.db, "svc")["fixes"] == []
+    assert not p.db.q("SELECT id FROM tasks WHERE origin='daemon'")
     p.db.set_kv(PAUSED_RESOURCES_KEY, {})
-    assert heal.run(d, "svc", spec, now + 10)[0] == "unhealthy (fixed; rechecking)", heal.state(p.db, "svc")
+    assert heal.run(d, "svc", spec, now + 7210)[0] == "unhealthy (fixed; rechecking)", heal.state(p.db, "svc")
     assert up.exists() and "dev-x" in held.read_text()
+
+
+def test_heal_fix_that_itself_exits_75_under_a_lock_is_counted(env):
+    from ttp import heal
+    p, d, up = _heal_setup(env, resource="dev-x", fix="echo own; exit 75", max_fixes=2)
+    spec, now = _heal_spec(p), time.time()
+    status = heal.run(d, "svc", spec, now)[0]
+    assert "the fix exited 75" in status and "self-fix task" in status, status
+    st = heal.state(p.db, "svc")
+    assert st["fixes"] == [now] and st["fix_rc"] == 75 and "own" in st["fix_out"]
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 1
+
+
+def test_heal_lock_busy_past_window_escalates(env, monkeypatch):
+    from ttp import heal
+    p, d, up = _heal_setup(env, resource="dev-x", window_h=1)
+    spec, now = _heal_spec(p), time.time()
+    monkeypatch.setattr(heal, "run_fix", lambda *a: (75, "dev-x stayed busy for 30 s. Hand the task back"))
+    assert heal.run(d, "svc", spec, now)[0] == "unhealthy (fix deferred: dev-x busy)"
+    assert heal.run(d, "svc", spec, now + 1800)[0] == "unhealthy (fix deferred: dev-x busy)"
+    assert heal.state(p.db, "svc")["fixes"] == [] and not p.db.q("SELECT id FROM tasks WHERE origin='daemon'")
+    status = heal.run(d, "svc", spec, now + 3600)[0]
+    assert "could not get the lock dev-x for 1.0 h" in status, status
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 1
+
+
+def test_heal_timeout_is_capped_below_the_daemon_watchdog(env):
+    from ttp import daemon as dm
+    from ttp import heal
+    assert heal.validate({"check": "true", "timeout_s": 100000})["timeout_s"] == heal.MAX_TIMEOUT_S
+    assert heal.validate({"check": "true", "timeout_s": 30})["timeout_s"] == 30
+    assert heal.MAX_TIMEOUT_S == dm.WATCHER_MAX_S
+    assert heal.MAX_TIMEOUT_S + heal.LOCK_WAIT_S + 10 < dm.WATCHDOG_S   # the longest single segment
+
+
+def test_heal_timeout_kills_the_whole_process_group(env, tmp_path):
+    from pathlib import Path
+    from ttp import heal
+    pidf = tmp_path / "child.pid"
+    t0 = time.time()
+    rc, out = heal._exec(f"sleep 60 & echo $! > {pidf}; wait", str(tmp_path), 1)
+    assert rc == 124 and "timed out" in out and time.time() - t0 < 10
+    child, status = int(pidf.read_text()), Path(f"/proc/{pidf.read_text().strip()}/status")
+
+    def gone() -> bool:
+        try:
+            os.kill(child, 0)
+        except ProcessLookupError:
+            return True
+        try:
+            return "State:\tZ" in status.read_text()   # killed, not yet reaped
+        except OSError:
+            return True
+    deadline = time.time() + 5
+    while not gone() and time.time() < deadline:
+        time.sleep(0.1)
+    assert gone(), "the check's child outlived its timeout"
+
+
+def test_heal_step_pings_the_watchdog_between_check_and_fix_and_skips_own_command_after_a_fix(env):
+    from ttp import heal
+    trail, ran = env["repo"] / "trail", env["repo"] / "own-ran"
+    p, d, up = _heal_setup(env, check=f"echo check >> {trail}; test -e {env['repo'] / 'never'}",
+                           fix=f"echo fix >> {trail}")
+    pings = []
+    d._progress = lambda: pings.append(trail.read_text())
+    payload = {"command": f"touch {ran}", "heal": json.loads(
+        p.db.one("SELECT payload FROM schedules WHERE name='svc'")["payload"])["heal"]}
+    status, again = d._run_heal(dict(p.db.one("SELECT * FROM schedules WHERE name='svc'")), payload)
+    assert status == "unhealthy (fixed; rechecking)" and again is not None
+    assert pings[0] == "check\n" and pings[-1] == "check\nfix\n", pings
+    assert not ran.exists()   # the own command waits for the recheck
+    d._run_heal(dict(p.db.one("SELECT * FROM schedules WHERE name='svc'")), payload)
+    assert ran.exists()   # the recheck failed and escalated: no fix this step, so the own command ran
+
+
+def test_heal_restart_mid_fix_still_waits_settle(env):
+    from ttp import heal
+    p, d, up = _heal_setup(env, settle_s=60)
+    spec, now = _heal_spec(p), time.time()
+    p.db.set_kv(heal.STATE_KEY + "svc", {"status": "unhealthy", "since": now - 120, "phase": "fixing",
+                                         "fix_started": now - 5, "fixes": [now - 5]})
+    up.touch()
+    assert heal.run(d, "svc", spec, now) == ("unhealthy (fix interrupted; rechecking)", now + 55)
+    assert "last_check" not in heal.state(p.db, "svc")   # no check ran early
+    assert heal.run(d, "svc", spec, now + 56) == ("fixed (1 today)", None)
+
+
+def test_heal_outage_check_that_stays_unknown_escalates_without_fixing(env):
+    from ttp import alerts, heal
+    p, d, up = _heal_setup(env, outage=True, grace_s=600)
+    spec, now = _heal_spec(p), time.time()
+    dark = dict(spec, check="exit 255")
+    assert heal.run(d, "svc", dark, now) == ("ok (unknown, rc 255)", now + 600)
+    assert heal.run(d, "svc", dark, now + 300)[0] == "ok (unknown, rc 255)"
+    assert not p.db.q("SELECT id FROM tasks WHERE origin='daemon'")
+    status = heal.run(d, "svc", dark, now + 600)[0]
+    assert "could not tell for 10 min (exit 255)" in status and not up.exists(), status
+    t = p.db.one("SELECT * FROM tasks WHERE origin='daemon'")
+    assert json.loads(t["labels"]) == ["heal:svc"] and heal.summary(p.db)["failing"] == 1
+    assert heal.run(d, "svc", dark, now + 900)[0] == f"unhealthy (self-fix task #{t['id']} open)"
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 1
+    assert not p.db.q("SELECT id FROM messages WHERE kind='alert'")
+    p.db.update_task(t["id"], status="failed")
+    assert "alerted" in heal.run(d, "svc", dark, now + 1200)[0] and not up.exists()
+    assert len(p.db.q("SELECT id FROM messages WHERE kind='alert' AND ref='heal:svc'")) == 1
+    up.touch()
+    assert heal.run(d, "svc", spec, now + 1500) == ("ok (healthy)", None)
+    assert [e["key"] for e in alerts.sweep(p.db)] == ["heal:svc"]
+    st = heal.state(p.db, "svc")
+    assert st["status"] == "healthy" and not {"unknown_since", "task", "escalated", "alerted"} & set(st)
+    # Without outage, a check that stays unknown never fixes or escalates however long it lasts.
+    plain = dict(spec, outage=False, check="exit 255")
+    p.db.set_kv(heal.STATE_KEY + "svc", {})
+    up.unlink()
+    for dt in (0, 3600, 10 * 3600):
+        assert heal.run(d, "svc", plain, now + 2000 + dt) == ("ok (unknown, rc 255)", None)
+    assert not up.exists() and p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 1
 
 
 def test_heal_known_fault_stays_quiet_unless_a_whole_box_is_out(env):

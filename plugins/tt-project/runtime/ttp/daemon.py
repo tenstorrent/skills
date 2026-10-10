@@ -2570,7 +2570,10 @@ class Daemon:
         except ValueError as e:
             return f"error: {e}"[:200], None
         status, again = heal.run(self, s["name"], spec)
-        if str(payload.get("command") or "").strip():
+        self._progress()
+        # After a fix the own command waits for the recheck: check, fix and command in one step could
+        # outlast the watchdog.
+        if str(payload.get("command") or "").strip() and "rechecking" not in status:
             status += "; " + self._run_command_watcher(s, payload)
         if status.startswith("fixed") or "self-fix task" in status:
             log(self.p, f"heal {s['name']}: {status}")
