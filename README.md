@@ -47,6 +47,7 @@ automatically for matching tasks; you can also ask your agent to make them expli
 | `tt-model-bringup` | Eleven stages from HF decoder through TTNN/vLLM benchmarking, with chunked-prefill guidance, prefill/TTFT optimization, trace warmup/reuse and allocation validation, targeted path/serving checks, and fixed standard accuracy subsets plus 4K-input vLLM benchmarks at concurrency 1 and 32. Includes a standalone TTI release skill. Requires `tt-autodebug`. |
 | `tt-debug-tools` | Drive the Tenstorrent debug tools and read their output: tt-triage, dprint, watcher, asserts, etc. See [`plugins/tt-debug-tools/README.md`](plugins/tt-debug-tools/README.md) |
 | `tt-buddy` | A coding agent with Tenstorrent operating principles: takes notes all the time, learns when needed, keeps the diff minimal. Device runs need [`tt-device-mcp`](https://github.com/tenstorrent/tt-device-mcp). See [`plugins/tt-buddy/README.md`](plugins/tt-buddy/README.md) |
+| `tt-model-op-analysis` | Kernel-op table for a tt-metal model test: static trace of every ttnn call to its device op and program factory for P100, P150 and Quasar, or a Tracy run with host-fallback and footprint numbers; CSV output with optional Google Drive upload. See [`plugins/tt-model-op-analysis/README.md`](plugins/tt-model-op-analysis/README.md) |
 
 AutoDebug investigates in a fresh agent process and writes `AUTODEBUG.md`. AutoFix handles source
 changes and validation. For examples and expected outputs, see the
@@ -105,6 +106,7 @@ codex plugin add tt-autodebug@tenstorrent-skills
 codex plugin add tt-review-skills@tenstorrent-skills
 codex plugin add tt-debug-tools@tenstorrent-skills
 codex plugin add tt-buddy@tenstorrent-skills
+codex plugin add tt-model-op-analysis@tenstorrent-skills
 # tt-buddy ships session hooks: trust them in Codex with /hooks, then t.
 # Model bring-up also requires tt-autodebug:
 codex plugin add tt-model-bringup@tenstorrent-skills
@@ -128,6 +130,7 @@ Choose any optional plugins you want:
 /plugin install tt-review-skills@tenstorrent-skills
 /plugin install tt-debug-tools@tenstorrent-skills
 /plugin install tt-buddy@tenstorrent-skills
+/plugin install tt-model-op-analysis@tenstorrent-skills
 ```
 
 For model bring-up, install `tt-autodebug` above and then:

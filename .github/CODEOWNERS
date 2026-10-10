@@ -26,3 +26,6 @@
 
 # Tenstorrent operating principles
 /plugins/tt-buddy/ @ppetrovicTT
+
+# Model kernel-op analysis
+/plugins/tt-model-op-analysis/ @ctr-mmicic

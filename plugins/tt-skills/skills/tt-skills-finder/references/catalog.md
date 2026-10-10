@@ -99,3 +99,20 @@ Install or enable it only after the user chooses it:
   Directory.
 - **Claude Code:** run `/plugin install tt-buddy@tenstorrent-skills` after adding the
   `tenstorrent/skills` marketplace.
+
+## `tt-model-op-analysis`
+
+Use when the user wants the list of kernel ops a tt-metal model test runs, their device ops and
+program factories, Blackhole and Quasar support status, or measured host versus device op time
+and core footprint for that test. Not for optimizing an op (that is profiling work in
+`tt-debug-tools`) or for bringing up a new model (`tt-model-bringup`).
+
+The measured skill needs a Tenstorrent device and a built tt-metal checkout; the static skill
+only needs the tt-metal checkout.
+
+Install or enable it only after the user chooses it:
+
+- **Codex / ChatGPT desktop:** select `tt-model-op-analysis` under **Tenstorrent Skills** in the
+  Plugins Directory.
+- **Claude Code:** run `/plugin install tt-model-op-analysis@tenstorrent-skills` after adding the
+  `tenstorrent/skills` marketplace.

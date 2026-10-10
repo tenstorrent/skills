@@ -1,0 +1,11 @@
+{
+  "name": "tt-model-op-analysis",
+  "version": "0.1.0",
+  "description": "Kernel-op analysis of a tt-metal model test: static trace to device ops and program factories, and Tracy-measured ops, host fallback and footprint.",
+  "author": {
+    "name": "tenstorrent"
+  },
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/tenstorrent/skills",
+  "skills": "./skills/"
+}

@@ -1,0 +1,35 @@
+{
+  "name": "tt-model-op-analysis",
+  "version": "0.1.0",
+  "description": "Kernel-op analysis of a tt-metal model test: static trace to device ops and program factories, and Tracy-measured ops, host fallback and footprint.",
+  "author": {
+    "name": "Tenstorrent"
+  },
+  "homepage": "https://github.com/tenstorrent/skills",
+  "repository": "https://github.com/tenstorrent/skills",
+  "license": "Apache-2.0",
+  "keywords": [
+    "tenstorrent",
+    "tt-metal",
+    "ttnn",
+    "profiling",
+    "quasar"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Tenstorrent Model Op Analysis",
+    "shortDescription": "List every kernel op a tt-metal model test runs, with Blackhole and Quasar support status, statically or measured with Tracy.",
+    "longDescription": "Two skills share one starting point, a model and its entry test. static-op-analysis traces every ttnn call at a pinned tt-metal commit to its device op and program factory for the chosen target profiles (P100, P150, Quasar) and checks the result with a validator. measured-op-analysis runs the same test under Tracy and reports executed ops, host versus device time and core footprint, then diffs against the static table. Output is CSV with an optional Google Drive upload.",
+    "developerName": "Tenstorrent",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Static device-op tracing",
+      "Tracy op report processing",
+      "Static versus measured diff"
+    ],
+    "websiteURL": "https://github.com/tenstorrent/skills",
+    "defaultPrompt": [
+      "Make the kernel op table for ResNet50 on P150 and Quasar."
+    ]
+  }
+}
