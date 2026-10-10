@@ -35949,10 +35949,18 @@ def test_heal_timeout_kills_the_whole_process_group(env, tmp_path):
     from pathlib import Path
     from ttp import heal
     pidf = tmp_path / "child.pid"
-    t0 = time.time()
-    rc, out = heal._exec(f"sleep 60 & echo $! > {pidf}; wait", str(tmp_path), 1)
-    assert rc == 124 and "timed out" in out and time.time() - t0 < 10
-    child, status = int(pidf.read_text()), Path(f"/proc/{pidf.read_text().strip()}/status")
+    # the child records its pid and kernel start time, so a pid reused after it died is not mistaken for it;
+    # on a busy machine the timeout can fire before the shell wrote them, so retry with a longer one
+    for timeout in (1, 5, 15):
+        pidf.unlink(missing_ok=True)
+        t0 = time.time()
+        rc, out = heal._exec(f"sleep 60 & echo $! $(cut -d' ' -f22 /proc/$!/stat) > {pidf}.tmp; mv {pidf}.tmp {pidf}; wait",
+                             str(tmp_path), timeout)
+        assert rc == 124 and "timed out" in out and time.time() - t0 < timeout + 10
+        if pidf.exists():
+            break
+    pid, start = pidf.read_text().split()
+    child, stat = int(pid), Path(f"/proc/{pid}/stat")
 
     def gone() -> bool:
         try:
@@ -35960,10 +35968,11 @@ def test_heal_timeout_kills_the_whole_process_group(env, tmp_path):
         except ProcessLookupError:
             return True
         try:
-            return "State:\tZ" in status.read_text()   # killed, not yet reaped
+            fields = stat.read_text().rsplit(")", 1)[1].split()
         except OSError:
             return True
-    deadline = time.time() + 5
+        return fields[0] == "Z" or fields[19] != start   # killed, not yet reaped; or the pid was reused
+    deadline = time.time() + 30   # generous: reaping an orphan can lag on a busy machine
     while not gone() and time.time() < deadline:
         time.sleep(0.1)
     assert gone(), "the check's child outlived its timeout"
