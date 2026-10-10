@@ -23,6 +23,9 @@ files it in the same inbox with a `to` field, its source project, host and task,
 gets it as an `upstream_note` event marked as another project's worker's data, never as the user's
 message, an approval or an answer. Identical text to the same project is filed once, and a project
 files at most NOTES_PER_HOUR addressed notes an hour, so a looping worker cannot flood the inbox.
+A note past that limit is not refused: it waits in the project's outbox (state/OUTBOX_FILE) and the
+project's daemon files it, in order, as the limit allows; one that waits OUTBOX_STUCK_S is reported
+to its coordinator once, and only a full outbox (OUTBOX_MAX notes) refuses a note.
 A worker whose sandbox cannot write the inbox leaves the note in its run's directory instead
 (QUEUED_FILE); its project's daemon files it, with the run's project and task, when the run ends.
 
@@ -52,6 +55,7 @@ import time
 from pathlib import Path
 
 from . import project
+from .project import durable_append
 
 KV_CURSOR = "upstream_cursor"
 LOCAL_EVERY_S = 60          # how often an ingesting project looks at this machine's inbox
@@ -166,6 +170,119 @@ def send(source: str, task: int | None, to: str, text: str, severity: str = "nor
     return "sent"
 
 
+OUTBOX_FILE = "notes-outbox.jsonl"   # in a project's state/: its addressed notes past the hourly limit
+OUTBOX_MAX = 200                     # notes an outbox keeps; past it a note is refused
+OUTBOX_STUCK_S = 3 * 3600            # a note waiting this long gets one coordinator event
+
+
+def _outbox_lock(state: Path):
+    """The outbox's lock, on a file of its own: drain replaces the outbox, so a lock on it would not hold."""
+    fd = os.open(Path(state) / (OUTBOX_FILE + ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    f = os.fdopen(fd, "rb+")
+    fcntl.flock(f, fcntl.LOCK_EX)
+    return f
+
+
+def _outbox(state: Path) -> list[dict]:
+    try:
+        raw = (Path(state) / OUTBOX_FILE).read_bytes()
+    except FileNotFoundError:
+        return []
+    out = []
+    for ln in raw[:raw.rfind(b"\n") + 1].splitlines():
+        try:
+            n = json.loads(ln)
+        except ValueError:
+            continue
+        if isinstance(n, dict) and n.get("to") and n.get("text") and n.get("fp"):
+            out.append(n)
+    return out
+
+
+def outbox_pending(state: Path) -> int:
+    """How many addressed notes wait in the project's outbox."""
+    return len(_outbox(state))
+
+
+def send_or_queue(state: Path, source: str, task: int | None, to: str, text: str, severity: str = "normal",
+                  now: float | None = None) -> tuple[str, int]:
+    """`send`, except that a note past the hourly limit, or behind notes already waiting, is appended to
+    the project's outbox (state/OUTBOX_FILE) for its daemon to file in order as the limit allows
+    (`drain_outbox`): the limit caps how fast notes reach the inbox, never the worker that wrote one.
+    Returns ("sent" | "duplicate" | "queued" | "full", the note's place in the outbox or 0)."""
+    now = now or time.time()
+    text = " ".join(str(text).split())[:SPEC_CHARS]
+    fp = note_id(to, text)
+    with _outbox_lock(state):
+        waiting = _outbox(state)
+        for i, n in enumerate(waiting, 1):
+            if n["fp"] == fp:
+                return "queued", i
+        if not waiting:
+            got = send(source, task, to, text, severity, now)
+            if got != "limited":
+                return got, 0
+        elif _filed(fp):
+            return "duplicate", 0
+        if len(waiting) >= OUTBOX_MAX:
+            return "full", 0
+        box = Path(state) / OUTBOX_FILE
+        torn = box.exists() and box.stat().st_size and not box.read_bytes().endswith(b"\n")
+        durable_append(box, ("\n" if torn else "") + json.dumps(
+            {"ts": now, "task": task, "to": to, "text": text, "fp": fp,
+             "severity": severity if severity in NOTE_SEVERITIES else "normal"}, sort_keys=True) + "\n")
+        return "queued", len(waiting) + 1
+
+
+def _filed(fp: str) -> bool:
+    try:
+        with open(path(), "rb") as f:
+            fcntl.flock(f, fcntl.LOCK_SH)
+            return any(n["fp"] == fp for n in _lines(f.read())[0])
+    except FileNotFoundError:
+        return False
+
+
+def drain_outbox(state: Path, source: str, now: float | None = None) -> tuple[int, list[dict]]:
+    """File the project's waiting notes (`send_or_queue`) in order, as many as the hourly limit allows,
+    and keep the rest. A note is dropped from the outbox only after `send` filed it or found it filed,
+    so a crash in between only repeats a send that finds it there: never lost, never filed twice.
+    Returns how many were filed, and the notes that have now waited OUTBOX_STUCK_S, each once."""
+    now = now or time.time()
+    p = Path(state) / OUTBOX_FILE
+    if not p.exists():
+        return 0, []
+    with _outbox_lock(state):
+        waiting = _outbox(state)
+        filed, stuck = 0, []
+        while waiting:
+            n = waiting[0]
+            if send(source, n.get("task"), n["to"], n["text"], str(n.get("severity") or "normal"), now) == "limited":
+                break
+            waiting.pop(0)
+            filed += 1
+        for n in waiting:
+            if not n.get("stuck") and now - float(n.get("ts") or now) >= OUTBOX_STUCK_S:
+                n["stuck"] = True
+                stuck.append(n)
+        if waiting and (filed or stuck):
+            _rewrite(p, waiting)
+        elif not waiting:
+            p.unlink()
+            project.fsync_dir(p.parent)
+    return filed, stuck
+
+
+def _rewrite(p: Path, notes: list[dict]) -> None:
+    tmp = p.with_name(p.name + ".tmp")
+    with open(tmp, "w") as f:
+        f.write("".join(json.dumps(n, sort_keys=True) + "\n" for n in notes))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, p)
+    project.fsync_dir(p.parent)
+
+
 QUEUED_FILE = "notes-to.jsonl"   # in a run's directory: notes a sandboxed worker could not file itself
 QUEUED_MAX = 50                  # queued notes one run may leave
 
@@ -183,13 +300,14 @@ def queue(run_dir: Path, to: str, text: str, severity: str = "normal") -> None:
         os.close(fd)
 
 
-def send_queued(run_dir: Path, source: str, task: int | None) -> dict[str, int]:
+def send_queued(run_dir: Path, source: str, task: int | None, state: Path | None = None) -> dict[str, int]:
     """File the notes a run queued (`queue`) as `send` would have, with the project and task the daemon
-    knows the run by, not what the file says. The file is renamed once done, so a later pass does not
+    knows the run by, not what the file says; with the project's `state` directory, one past the hourly
+    limit waits in its outbox (`send_or_queue`). The file is renamed once done, so a later pass does not
     send them again; a crash before that only repeats sends `send` drops as duplicates.
-    Returns how many were sent, duplicate, limited or invalid."""
+    Returns how many were sent, duplicate, queued, limited (no outbox, or a full one) or invalid."""
     src = Path(run_dir) / QUEUED_FILE
-    got = {"sent": 0, "duplicate": 0, "limited": 0, "invalid": 0}
+    got = {"sent": 0, "duplicate": 0, "queued": 0, "limited": 0, "invalid": 0}
     try:
         raw = src.read_bytes()
     except FileNotFoundError:
@@ -204,7 +322,12 @@ def send_queued(run_dir: Path, source: str, task: int | None) -> dict[str, int]:
         if not to or to == source or not text or not re.fullmatch(r"[\w.-]{1,100}", to):
             got["invalid"] += 1
             continue
-        got[send(source, task, to, text, str(n.get("severity") or "normal"))] += 1
+        sev = str(n.get("severity") or "normal")
+        if state is None:
+            got[send(source, task, to, text, sev)] += 1
+        else:
+            r = send_or_queue(state, source, task, to, text, sev)[0]
+            got["limited" if r == "full" else r] += 1
     os.replace(src, src.with_name(QUEUED_FILE + ".filed"))
     return got
 

@@ -20,6 +20,7 @@
   for tt-project go in the hand-off as upstream notes: `followups` titled `upstream: ...`.
   A note for one other project on this machine goes to its inbox with `ttp note --to <project>
   "<text>"` (`ttp say` is refused in a run). Its coordinator reads it as your data, not an order.
+  A note that is queued or refused is never a reason to wait or block: keep working.
   Running `ttp setup` or `ttp upgrade <name>` to deploy a release to another project on this
   machine is not editing its harness; hand edits to its charter, memory, config, state or code are.
 - Open, update or close pull requests ONLY in a `code` task whose spec asks for delivery,

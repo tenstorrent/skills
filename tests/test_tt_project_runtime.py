@@ -22546,11 +22546,123 @@ def test_notes_to_another_project_are_deduped_and_rate_limited(env, monkeypatch,
     assert len(_upstream_inbox(env)) == 1, "identical text was filed twice"
     for i in range(upstream.NOTES_PER_HOUR - 1):
         assert _note(cli, "--to", "second", f"note {i}") == 0
-    assert _note(cli, "--to", "second", "one too many") != 0
-    assert "not sent" in capsys.readouterr().err
+    assert upstream.send("demo", 57, "second", "one too many") == "limited"
     assert len(_upstream_inbox(env)) == upstream.NOTES_PER_HOUR
     assert upstream.send("demo", 57, "second", "an hour later", now=time.time() + 3700) == "sent"
     assert upstream.ingest(q, q.config()) == upstream.NOTES_PER_HOUR + 1
+
+
+def _two_projects(env, monkeypatch):
+    from ttp.cli import bootstrap
+    from ttp.project import register
+    p = make(env)
+    repo2 = env["tmp"] / "repo2"
+    subprocess.run(["git", "clone", "-q", str(env["repo"]), str(repo2)], check=True)
+    q = bootstrap(repo2, "second", "Another project.", "fake")
+    register("second", {"host": "testhost", "dir": str(q.root)})
+    _note_run(env, monkeypatch, p)
+    return p, q
+
+
+def test_a_note_past_the_hourly_limit_waits_in_the_outbox_and_the_worker_goes_on(env, monkeypatch, capsys):
+    """`ttp note --to` past NOTES_PER_HOUR is never refused: the note waits in the project's outbox, the
+    command exits 0 saying so and its place, and later notes queue behind it, so the order holds."""
+    from ttp import cli, upstream
+    p, q = _two_projects(env, monkeypatch)
+    for i in range(upstream.NOTES_PER_HOUR):
+        assert _note(cli, "--to", "second", f"note {i}") == 0
+    capsys.readouterr()
+    assert _note(cli, "--to", "second", "one too many") == 0
+    out = capsys.readouterr().out
+    assert "queued: number 1 in this project's outbox" in out and "keep working" in out
+    assert upstream.note_id("second", "one too many") in out
+    assert _note(cli, "--to", "second", "and  another") == 0
+    assert "number 2" in capsys.readouterr().out
+    assert _note(cli, "--to", "second", "one too many") == 0, "the same note again"
+    assert "number 1" in capsys.readouterr().out
+    assert _note(cli, "--to", "second", "note 3") == 0
+    assert "already in its inbox" in capsys.readouterr().out
+    assert upstream.outbox_pending(p.state) == 2
+    assert len(_upstream_inbox(env)) == upstream.NOTES_PER_HOUR
+    assert "one too many" in (pathlib.Path(os.environ["TTP_RUN_DIR"]) / "progress.md").read_text()
+    # Only a full outbox refuses a note, and the refusal says to go on.
+    monkeypatch.setattr(upstream, "OUTBOX_MAX", 2)
+    assert _note(cli, "--to", "second", "a third") == 2
+    assert "keep working" in capsys.readouterr().err
+    # The worker prompt says a queued or refused note is never a reason to wait.
+    worker = " ".join((RUNTIME.parent / "template" / "prompts" / "worker.md").read_text().split())
+    assert "A note that is queued or refused is never a reason to wait or block: keep working." in worker
+
+
+def test_the_daemon_drains_the_note_outbox_in_order_at_the_hourly_rate(env, monkeypatch):
+    """The daemon files waiting notes oldest first, never more than NOTES_PER_HOUR an hour, and each once
+    across restarts and a crash between filing a note and dropping it from the outbox."""
+    from ttp import upstream
+    from ttp.daemon import Daemon
+    p, q = _two_projects(env, monkeypatch)
+    t0 = time.time()
+    n = upstream.NOTES_PER_HOUR
+    for i in range(n):
+        assert upstream.send_or_queue(p.state, "demo", 57, "second", f"now {i}", now=t0) == ("sent", 0)
+    for i in range(n + 3):
+        assert upstream.send_or_queue(p.state, "demo", 57, "second", f"later {i}", now=t0 + i) == ("queued", i + 1)
+    # Within the hour nothing goes.
+    assert upstream.drain_outbox(p.state, "demo", now=t0 + 600) == (0, [])
+    # An hour on, n go, oldest first; the rest wait.
+    assert upstream.drain_outbox(p.state, "demo", now=t0 + 3601)[0] == n
+    assert [x["spec"] for x in _upstream_inbox(env)][n:] == [f"later {i}" for i in range(n)]
+    assert upstream.outbox_pending(p.state) == 3
+    assert upstream.drain_outbox(p.state, "demo", now=t0 + 3700)[0] == 0, "the rate cap holds"
+    # A crash after filing but before the outbox was rewritten: the next pass finds it filed, once.
+    real, calls = upstream.send, []
+
+    def killed_after_one(*a, **k):
+        if calls:
+            raise OSError("killed")
+        calls.append(a)
+        return real(*a, **k)
+    monkeypatch.setattr(upstream, "send", killed_after_one)
+    with pytest.raises(OSError):
+        upstream.drain_outbox(p.state, "demo", now=t0 + 2 * 3600 + 1)
+    monkeypatch.setattr(upstream, "send", real)
+    assert len(_upstream_inbox(env)) == 2 * n + 1
+    assert upstream.outbox_pending(p.state) == 3, "a crash loses nothing"
+    # A restarted daemon drains the rest.
+    monkeypatch.setattr(time, "time", lambda: t0 + 2 * 3600 + 2)
+    Daemon(p.base).drain_note_outbox()
+    assert upstream.outbox_pending(p.state) == 0 and not (p.state / upstream.OUTBOX_FILE).exists()
+    specs = [x["spec"] for x in _upstream_inbox(env)]
+    assert specs[n:] == [f"later {i}" for i in range(n + 3)], "in order, each once"
+    assert upstream.ingest(q, q.config(), now=t0 + 2 * 3600 + 3) == 2 * n + 3
+
+
+def test_a_note_stuck_in_the_outbox_gets_one_coordinator_event(env, monkeypatch):
+    from ttp import upstream
+    from ttp.daemon import Daemon
+    p, q = _two_projects(env, monkeypatch)
+    t0 = time.time()
+    for i in range(upstream.NOTES_PER_HOUR):
+        upstream.send_or_queue(p.state, "demo", 57, "second", f"now {i}", now=t0)
+    assert upstream.send_or_queue(p.state, "demo", 57, "second", "late", now=t0)[0] == "queued"
+    for _ in range(2):   # past the stuck time, but still over the limit (the window keeps refilling)
+        monkeypatch.setattr(upstream, "send", lambda *a, **k: "limited")
+        monkeypatch.setattr(time, "time", lambda: t0 + upstream.OUTBOX_STUCK_S + 1)
+        Daemon(p.base).drain_note_outbox()
+    (ev,) = p.db.q("SELECT kind, text FROM events WHERE text LIKE '%in its outbox%'")
+    assert ev["kind"] == "observation" and "to second" in ev["text"]
+    assert upstream.outbox_pending(p.state) == 1
+
+
+def test_a_sandboxed_workers_note_past_the_limit_waits_in_the_outbox(env, monkeypatch, tmp_path):
+    from ttp import upstream
+    p, q = _two_projects(env, monkeypatch)
+    for i in range(upstream.NOTES_PER_HOUR):
+        upstream.send("demo", 57, "second", f"now {i}")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    upstream.queue(run_dir, "second", "from the sandbox")
+    assert upstream.send_queued(run_dir, "demo", 58, p.state)["queued"] == 1
+    assert [n["text"] for n in upstream._outbox(p.state)] == ["from the sandbox"]
 
 
 def test_a_sandboxed_worker_that_cannot_write_the_inbox_still_sends_its_note(env, monkeypatch, capsys):
@@ -22594,7 +22706,8 @@ def test_a_sandboxed_worker_that_cannot_write_the_inbox_still_sends_its_note(env
                                                                          "the cache is stale")
     assert n["fp"] == upstream.note_id("second", "the cache is stale")
     assert not (run_dir / upstream.QUEUED_FILE).exists() and (run_dir / (upstream.QUEUED_FILE + ".filed")).exists()
-    assert upstream.send_queued(run_dir, "demo", tid) == {"sent": 0, "duplicate": 0, "limited": 0, "invalid": 0}
+    assert upstream.send_queued(run_dir, "demo", tid) == {"sent": 0, "duplicate": 0, "queued": 0, "limited": 0,
+                                                         "invalid": 0}
     assert len(_upstream_inbox(env)) == 1
     d = Daemon(dst.base)
     d.read_upstream()

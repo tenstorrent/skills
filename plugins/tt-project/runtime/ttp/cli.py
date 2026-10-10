@@ -963,7 +963,8 @@ def _note_to(a) -> None:
         die("empty note")
     task = os.environ.get("TTP_TASK") or ""
     try:
-        got = upstream.send(me.name, int(task) if task.isdigit() else None, a.to, a.text, a.severity)
+        got, place = upstream.send_or_queue(me.state, me.name, int(task) if task.isdigit() else None, a.to,
+                                            a.text, a.severity)
     except OSError as e:
         # A sandbox that cannot write the inbox (read-only home): the run's directory keeps the note,
         # and this project's daemon files it when the run ends (upstream.send_queued).
@@ -971,8 +972,14 @@ def _note_to(a) -> None:
         print(f"note for {a.to} queued in this run's directory ({e.strerror or e}); this project's daemon files "
               f"it in its inbox as {upstream.note_id(a.to, a.text)} when the run ends")
         return
-    if got == "limited":
-        die(f"not sent: this project already sent {upstream.NOTES_PER_HOUR} notes to other projects in the last hour")
+    if got == "full":
+        die(f"not sent: {upstream.OUTBOX_MAX} notes of this project already wait to go to other projects. "
+            f"Put it in the hand-off instead and keep working")
+    if got == "queued":
+        print(f"note for {a.to} queued: number {place} in this project's outbox (other projects get at most "
+              f"{upstream.NOTES_PER_HOUR} of its notes an hour); its daemon files it as "
+              f"{upstream.note_id(a.to, a.text)} when the limit allows. Nothing to wait for: keep working")
+        return
     print(f"note for {a.to} " + ("already in its inbox" if got == "duplicate" else "filed in its inbox")
           + f" as {upstream.note_id(a.to, a.text)}"
           + (f"; this machine's daemon sends it on to {far.get('ssh') or far['host']}" if far else ""))

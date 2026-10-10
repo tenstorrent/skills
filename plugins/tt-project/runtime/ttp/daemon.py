@@ -323,6 +323,7 @@ class Daemon:
         self._trouble_checked = 0.0
         self._upstream_checked = 0.0
         self._forwarded = 0.0
+        self._outbox_drained = 0.0
         self._forwarder: threading.Thread | None = None
         self._last_slack = 0.0
         self._thread_scan = 0.0
@@ -611,7 +612,7 @@ class Daemon:
         core = self.cfg.get("core_provider") or "claude"
         core_held = self.net_held(core) and not self._net_may_probe(core)
         for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.read_upstream,
-                     self.forward_upstream, self.retry_rejected, self.retire_ended, self.sweep_holds, self.maybe_coordinate, self.probe_waiting, self.start_pushes, self.dispatch, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
+                     self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.retire_ended, self.sweep_holds, self.maybe_coordinate, self.probe_waiting, self.start_pushes, self.dispatch, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
                 continue   # no routing to start model work with (see _load_config)
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
@@ -1974,7 +1975,7 @@ class Daemon:
             return
         relay_worker_notifies(self.p, task, run_dir)
         try:   # notes for other projects a sandboxed worker could not file itself (ttp note --to)
-            sent = upstream.send_queued(run_dir, self.p.name, task["id"])
+            sent = upstream.send_queued(run_dir, self.p.name, task["id"], self.p.state)
             if any(sent.values()):
                 log(self.p, f"run {r.get('id')} of #{task['id']}: queued notes to other projects: {sent}")
         except OSError as e:
@@ -3549,6 +3550,32 @@ class Daemon:
             return
         if n:
             log(self.p, f"{n} new upstream note(s) for the coordinator")
+
+    def drain_note_outbox(self) -> None:
+        """File the notes for other projects that wait in this project's outbox (`ttp note --to` past the
+        hourly limit), in order, as the limit allows. A note that has waited upstream.OUTBOX_STUCK_S
+        becomes one coordinator event."""
+        now = time.time()
+        if now - self._outbox_drained < upstream.LOCAL_EVERY_S:
+            return
+        self._outbox_drained = now
+        try:
+            filed, stuck = upstream.drain_outbox(self.p.state, self.p.name, now)
+        except (OSError, ValueError) as e:
+            log(self.p, f"filing the note outbox failed: {type(e).__name__}: {e}")
+            return
+        if filed:
+            log(self.p, f"{filed} waiting note(s) to other projects filed from the outbox")
+        if stuck:
+            left = upstream.outbox_pending(self.p.state)
+            to = ", ".join(sorted({str(n["to"]) for n in stuck}))
+            self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                        (now, "daemon", "observation", "low",
+                         f"{len(stuck)} note(s) of this project's workers to {to} have waited over "
+                         f"{upstream.OUTBOX_STUCK_S // 3600} h in its outbox: other projects get at most "
+                         f"{upstream.NOTES_PER_HOUR} of its notes an hour and {left} wait. They are filed in "
+                         f"order as the limit allows; a worker sending this many notes may be looping.",
+                         "queued"))
 
     def forward_upstream(self) -> None:
         """Send this machine's new upstream notes on to the machines that cannot reach it (upstream.forward),
