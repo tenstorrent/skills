@@ -36,6 +36,11 @@
   run starts on that provider; the daemon asks its CLI's status, no model call); budget red →
   the gate leaves red; coordinator failures → a successful turn; disk low → space is back. Chats
   hear once that it cleared. A host reboot is information only.
+- A logout is one alert per machine and provider, however many projects wait on it, reminded after
+  1 h, 4 h and 12 h, then daily, with the waiting projects, queued tasks and high events.
+- While the coordinator cannot run (logged out, paused, budget red, repeated failures) for 30 min,
+  the daemon sends new high conditions that persisted 2 h to the chat itself: one line each, at
+  most one message an hour.
 - The budget is a few plain lines: per plan window the percent used, time to reset and history
   (daily peaks for the 5-hour window, the last two weekly finals), and one line for dollar caps.
   Pacing, gate reasons and top spenders are in the web app's Budget tab.

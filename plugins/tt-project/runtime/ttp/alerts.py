@@ -14,6 +14,10 @@ reminder once a day has passed. A condition every project on the machine sees (a
 full shared disk) is broadcast by one of them: the first takes a claim in the per-user tt-project
 folder, and the others post theirs on the `quiet` channel, shown in the web app and `ttp status`
 but never sent to a chat, Slack or the desktop.
+
+A logout is the exception to the one daily reminder: every project waiting on the logged-out CLI
+reports itself into the claim (machine_round), and the claimer reminds the chats at LOGOUT_REMIND_S
+with how many projects, queued tasks and high events wait, whichever project holds the claim then.
 """
 from __future__ import annotations
 
@@ -32,6 +36,8 @@ REMIND_S = DAY          # an open episode is broadcast again once, this long aft
 QUIET = "quiet"         # channel of a broadcast that stays out of chats (another project has the claim)
 CLAIM_TTL = DAY + 3600  # a claim its holder stopped renewing (gone, or no reminder) passes on after this
 FEED_DAYS = 7
+LOGOUT_REMIND_S = (3600.0, 4 * 3600.0, 12 * 3600.0)   # a logout is reminded this long after it began, then daily
+WAITER_TTL = 1800.0     # a project's report into a logout claim counts this long (it renews every few minutes)
 # What the chat hears once an episode clears.
 CLEARED_TEXT = {
     "budget": "Budget for {arg} is out of red; new work starts again.",
@@ -107,6 +113,10 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
         return float((db.kv(f"limited:{arg}") or {}).get("until") or 0) > now
     if kind == "budget":
         return (db.kv("gates", {}).get(arg) or {}).get("level") == "red"
+    if kind == "relayed":   # conditions told to the chat while the coordinator could not run: while one is open
+        ids = [int(x) for x in arg.split(",") if x.isdigit()]
+        return bool(ids) and bool(db.one(f"SELECT id FROM issues WHERE status='open' AND id IN "
+                                         f"({','.join('?' * len(ids))}) LIMIT 1", ids))
     if key == "disk":
         return bool(db.kv("disk_low"))
     if key == "coordinator":
@@ -154,9 +164,9 @@ def active(db: DB, key: str, ts: float, now: float) -> bool:
 
 
 def _checkable(key: str) -> bool:
-    return key.partition(":")[0] in ("auth", "limit", "budget", "disk", "coordinator", "run-start", "schedule",
-                                         "release-older", "integrity", "pr-ready", "config", "push_rejected",
-                                         "after_push_failed", "push_queue_dying")
+    return key.partition(":")[0] in ("auth", "limit", "budget", "relayed", "disk", "coordinator", "run-start",
+                                         "schedule", "release-older", "integrity", "pr-ready", "config",
+                                         "push_rejected", "after_push_failed", "push_queue_dying")
 
 
 def _since(ep: dict) -> float:
@@ -222,18 +232,89 @@ def claim(claim_key: str, key: str, owner: str, now: float, cleared: float = 0.0
             data = json.loads(path.read_text())
         except (OSError, ValueError):
             data = {}
-        data = {k: v for k, v in (data if isinstance(data, dict) else {}).items()
-                if isinstance(v, dict) and now - float(v.get("ts") or 0) < CLAIM_TTL}
-        held = data.get(claim_key)
-        if (held and held.get("owner") != owner and float(held.get("ts") or 0) > cleared
-                and owner_alive(str(held.get("owner")))):
-            return False
-        data[claim_key] = {"owner": owner, "alert": key, "ts": now}
+        data = _live_claims(data, now)
+        took = _take(data, claim_key, key, owner, now, cleared)
         from .project import write_json
         write_json(path, data, 0o600)
-        return True
+        return took
     except OSError:
         return True
+    finally:
+        os.close(fd)
+
+
+def _live_claims(data, now: float) -> dict:
+    return {k: v for k, v in (data if isinstance(data, dict) else {}).items()
+            if isinstance(v, dict) and now - float(v.get("ts") or 0) < CLAIM_TTL}
+
+
+def _take(data: dict, claim_key: str, key: str, owner: str, now: float, cleared: float) -> bool:
+    """Take or renew the claim in `data`; False (and `data` unchanged) while another live project holds
+    it. A renewal or a take-over keeps what the claim knows of the condition (since, reminders, waiting
+    projects); a claim from an earlier episode starts afresh."""
+    held = data.get(claim_key)
+    fresh = bool(held) and float(held.get("ts") or 0) > cleared
+    if fresh and held.get("owner") != owner and owner_alive(str(held.get("owner"))):
+        return False
+    keep = {k: held[k] for k in ("since", "reminded", "waiting") if k in held} if fresh else {}
+    data[claim_key] = {**keep, "owner": owner, "alert": key, "ts": now}
+    return True
+
+
+def due_reminders(since: float, now: float) -> int:
+    """How many logout reminders are due `now` for a logout that began at `since`: one at each
+    LOGOUT_REMIND_S, then one a day after the last."""
+    age = now - since
+    n = sum(1 for s in LOGOUT_REMIND_S if age >= s)
+    if age >= LOGOUT_REMIND_S[-1] + DAY:
+        n += int((age - LOGOUT_REMIND_S[-1]) // DAY)
+    return n
+
+
+def machine_round(claim_key: str, key: str, owner: str, now: float, cleared: float, raised: float,
+                  info: dict) -> dict | None:
+    """One project's turn on a machine-wide logout: report what waits on it here (`info`: name,
+    queued, events) into the shared claim, and if this project holds or may take the claim and a
+    reminder is due, mark it sent and return what the reminder says: {since, reminder, waiting}
+    (the live projects' reports). None otherwise, also when the claim file cannot be used: a
+    reminder is extra, the first alert already went out."""
+    path = claims_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(str(path.with_suffix(".lock")), os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            data = {}
+        data = _live_claims(data, now)
+        held = data.get(claim_key)
+        if held and float(held.get("ts") or 0) <= cleared:
+            held = None   # an earlier episode's: _take starts afresh
+        waiting = {o: w for o, w in ((held or {}).get("waiting") or {}).items()
+                   if isinstance(w, dict) and now - float(w.get("ts") or 0) < WAITER_TTL
+                   and (o == owner or owner_alive(o))}
+        waiting[owner] = {**info, "ts": now}
+        since = min(float((held or {}).get("since") or raised), raised)
+        out = None
+        if held and held.get("owner") != owner and owner_alive(str(held.get("owner"))):
+            data[claim_key] = {**held, "waiting": waiting, "since": since}
+        else:
+            _take(data, claim_key, key, owner, now, cleared)
+            rec = data[claim_key]
+            rec.update(waiting=waiting, since=since)
+            due = due_reminders(since, now)
+            if due > int(rec.get("reminded") or 0):
+                rec["reminded"] = due
+                out = {"since": since, "reminder": due, "waiting": list(waiting.values())}
+        from .project import write_json
+        write_json(path, data, 0o600)
+        return out
+    except OSError:
+        return None
     finally:
         os.close(fd)
 

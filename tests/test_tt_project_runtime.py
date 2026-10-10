@@ -2735,18 +2735,18 @@ def test_an_open_alert_episode_is_not_rebroadcast_and_reminds_once_after_a_day(e
     clock = {"t": start}
     monkeypatch.setattr(time, "time", lambda: clock["t"])
     d = Daemon(p.base)
-    sent = lambda: p.db.q("SELECT text FROM messages WHERE kind='alert' AND ref='auth:fake'")
+    sent = lambda: p.db.q("SELECT text FROM messages WHERE kind='alert' AND ref='limit:fake'")
     for hours in (0, 4.5, 9, 23):   # the old 4-hourly repeat
         clock["t"] = start + hours * 3600
-        d.alert("auth:fake", f"fake is logged out ({hours} h)", "high", every_s=4 * 3600)
-    assert [m["text"] for m in sent()] == ["fake is logged out (0 h)"]
-    assert _episodes(p, "auth:fake")[0]["last"] == start + 23 * 3600, "a repeat updates the episode"
+        d.alert("limit:fake", f"fake refused work ({hours} h)", "high", every_s=4 * 3600)
+    assert [m["text"] for m in sent()] == ["fake refused work (0 h)"]
+    assert _episodes(p, "limit:fake")[0]["last"] == start + 23 * 3600, "a repeat updates the episode"
     for hours in (25, 30, 49, 73):
         clock["t"] = start + hours * 3600
-        Daemon(p.base).alert("auth:fake", f"fake is logged out ({hours} h)", "high")
-    assert [m["text"] for m in sent()] == ["fake is logged out (0 h)", "fake is logged out (25 h)"], \
+        Daemon(p.base).alert("limit:fake", f"fake refused work ({hours} h)", "high")
+    assert [m["text"] for m in sent()] == ["fake refused work (0 h)", "fake refused work (25 h)"], \
         "one reminder after a day, then quiet"
-    assert len(_episodes(p, "auth:fake")) == 1
+    assert len(_episodes(p, "limit:fake")) == 1
 
 
 def test_a_machine_wide_alert_is_broadcast_by_one_project_and_shown_quietly_by_the_others(env, monkeypatch):
@@ -2838,16 +2838,150 @@ def test_a_stopped_claimers_claim_does_not_silence_the_others(env, monkeypatch):
     clock = {"t": start}
     monkeypatch.setattr(time, "time", lambda: clock["t"])
     Daemon(p.base).alert("auth:fake", "fake is logged out", "high")
-    Daemon(q.base).alert("auth:fake", "fake is logged out", "high")
+    dq = Daemon(q.base)
+    dq.open_breaker("fake", "logged out")
+    dq.alert("auth:fake", "fake is logged out", "high")
     assert q.db.unread_for_chat("c1", 0) == []
     running.discard(str(p.base))   # p's daemon stops for good, still holding the claim
     clock["t"] = start + alerts.REMIND_S + 1800   # before the claim's TTL runs out
     assert clock["t"] - start < alerts.CLAIM_TTL
-    Daemon(q.base).alert("auth:fake", "fake is still logged out", "high")
-    assert [m["text"] for m in q.db.unread_for_chat("c1", 0)] == ["fake is still logged out"], \
-        "the day's reminder was left to a stopped project"
+    dq.remind_logouts()
+    assert [m["text"] for m in q.db.unread_for_chat("c1", 0)][0].startswith("fake on testhost is still logged out"), \
+        "the reminder was left to a stopped project"
     from ttp.project import hostname
     assert json.loads(alerts.claims_path().read_text())[f"{hostname()}|auth:fake"]["owner"] == str(q.base)
+
+
+def test_a_logout_is_one_alert_per_machine_reminded_at_1_4_and_12_hours_with_what_waits(env, monkeypatch):
+    from ttp import alerts
+    from ttp.daemon import Daemon
+    p, q = _two_projects(env)
+    running = {str(p.base), str(q.base)}
+    monkeypatch.setattr(alerts, "owner_alive", lambda owner: owner in running)
+    start = time.time()
+    clock = {"t": start}
+    monkeypatch.setattr(time, "time", lambda: clock["t"])
+    dp, dq = Daemon(p.base), Daemon(q.base)
+    for d in (dp, dq):
+        d.open_breaker("fake", "logged out")
+        d.alert("auth:fake", "fake is logged out", "high")
+    q.db.add_task("queued work", "")
+    q.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+           (start, "watch", "obs", "high", "a box is down", "queued"))
+    told = lambda x: [m["text"] for m in x.db.unread_for_chat("c1", 0)]
+    seen = []
+    for hours in (0.5, 1.01, 2, 3.9, 4.01, 8, 11.9, 12.01, 20, 35.9, 36.01):
+        clock["t"] = start + hours * 3600
+        for d in (dq, dp):   # each project reports every few minutes; here the claimer goes last
+            d._logout_round = 0.0
+            d.remind_logouts()
+        seen.append((hours, len(told(p))))
+    assert told(q) == [], "the second project paged the chat too"
+    sent = told(p)
+    assert sent[0] == "fake is logged out" and len(sent) == 5, sent
+    assert [h for (h, n), (_, m) in zip(seen[1:], seen) if n > m] == [1.01, 4.01, 12.01, 36.01]
+    assert all("still logged out" in t and "2 project(s) wait on it (demo, second)" in t
+               and "1 queued task(s) and 1 high event(s)" in t for t in sent[1:]), sent[1]
+    rows = p.db.q("SELECT channel, severity FROM messages WHERE ref='auth:fake'")
+    assert {(r["channel"], r["severity"]) for r in rows} == {("chat", "high")}, "a reminder went out quietly"
+    assert len(_episodes(p, "auth:fake")) == 1, "a reminder opened a second episode"
+    # The claimer stops: the other project keeps the cadence without repeating a reminder.
+    running.discard(str(p.base))
+    clock["t"] = start + 36.5 * 3600
+    dq._logout_round = 0.0
+    dq.remind_logouts()
+    assert told(q) == []
+    clock["t"] = start + 60.01 * 3600
+    dq._logout_round = 0.0
+    dq.remind_logouts()
+    assert len(told(q)) == 1 and "1 project(s) wait on it (second)" in told(q)[0]
+    # Logged in again: no more reminders.
+    dq._close_breaker("fake", alerts.breaker(q.db, "fake"), "login check passed")
+    clock["t"] = start + 90 * 3600
+    dq._logout_round = 0.0
+    dq.remind_logouts()
+    assert len(told(q)) == 1
+
+
+def test_the_coordinators_own_logout_raises_the_machine_alert(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    db = p.db
+    rid = db.x("INSERT INTO runs(role,provider,model,started,status,boot_id) VALUES('coordinator','claude','opus',?,"
+               "'running',?)", (time.time() - 60, d.boot))
+    run_dir = p.runs / str(rid)
+    run_dir.mkdir(parents=True)
+    db.x("UPDATE runs SET dir=? WHERE id=?", (str(run_dir), rid))
+    (run_dir / "output.jsonl").write_text("".join(json.dumps(x) + "\n" for x in NOT_LOGGED_IN))
+    (run_dir / "stderr.log").write_text("")
+    d.finish_run(db.one("SELECT * FROM runs WHERE id=?", (rid,)),
+                 {"rc": 1, "started": time.time() - 60, "ended": time.time(), "stopped": None})
+    m = db.q("SELECT channel, severity FROM messages WHERE ref='auth:claude'")
+    assert [(x["channel"], x["severity"]) for x in m] == [("chat", "high")]
+    d.cfg["core_provider"] = "claude"
+    assert d.coordinator_blocked() == "claude is logged out"
+
+
+def _open_issue(db, title, *, first, last, severity="high", status="open"):
+    return db.x("INSERT INTO issues(fingerprint,source,first_seen,last_seen,count,title,severity,status) "
+                "VALUES(?,?,?,?,2,?,?,?)", (f"fp-{title}", "watch", first, last, title, severity, status))
+
+
+def test_high_conditions_reach_the_chat_model_free_only_while_the_coordinator_cannot_run(env, monkeypatch):
+    p = make(env)
+    from ttp.daemon import Daemon
+    p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)",
+           (time.time(), "t", time.time()))
+    start = time.time()
+    clock = {"t": start}
+    monkeypatch.setattr(time, "time", lambda: clock["t"])
+    d = Daemon(p.base)
+    told = lambda: [m["text"] for m in p.db.unread_for_chat("c1", 0)]
+    p.db.x("INSERT INTO runs(role,status,started,ended) VALUES('coordinator','ok',?,?)", (start - 5 * 3600,) * 2)
+    _open_issue(p.db, "box-a is down", first=start - 3 * 3600, last=start)
+    _open_issue(p.db, "seen once an hour ago", first=start - 3600, last=start - 3600)
+    _open_issue(p.db, "known before the last turn", first=start - 6 * 3600, last=start)
+    _open_issue(p.db, "only normal", first=start - 3 * 3600, last=start, severity="normal")
+    _open_issue(p.db, "already fixed", first=start - 3 * 3600, last=start, status="fixed")
+    d.relay_when_blocked()
+    clock["t"] = start + 3600
+    d.relay_when_blocked()
+    assert told() == [], "relayed while the coordinator could run"
+    # Its turns keep failing: after 30 min the persistent new high condition goes to the chat.
+    p.db.set_kv("coordinator_failures", 3)
+    d.relay_when_blocked()
+    clock["t"] = start + 3600 + 1700
+    d.relay_when_blocked()
+    assert told() == []
+    clock["t"] = start + 3600 + 1900
+    d.relay_when_blocked()
+    assert len(told()) == 1
+    assert "The coordinator cannot run (its last 3 turns failed" in told()[0]
+    assert "\n- high: box-a is down (seen for 3.0 h, watch)" in told()[0]
+    assert all(x not in told()[0] for x in ("seen once", "known before", "only normal", "already fixed"))
+    # Rate limit: a new condition waits for the hour; the one already told is not repeated.
+    _open_issue(p.db, "box-b is down", first=start, last=start + 3 * 3600, severity="critical")
+    clock["t"] = start + 3600 + 1900 + 1800
+    d.relay_when_blocked()
+    assert len(told()) == 1, "two relays within the hour"
+    clock["t"] = start + 3600 + 1900 + 3601
+    d.relay_when_blocked()
+    assert len(told()) == 2 and "critical: box-b is down" in told()[1] and "box-a" not in told()[1]
+    assert p.db.q("SELECT severity FROM messages WHERE id=(SELECT MAX(id) FROM messages)")[0]["severity"] == "critical"
+    # Once the condition clears, its relayed alert leaves the top section.
+    from ttp.web import attention
+    assert any("box-b" in m["text"] for m in attention(p.db, time.time()))
+    p.db.x("UPDATE issues SET status='fixed' WHERE title='box-b is down'")
+    assert not any("box-b" in m["text"] for m in attention(p.db, time.time()))
+    # The coordinator runs again: nothing more is relayed.
+    p.db.set_kv("coordinator_failures", 0)
+    d.relay_when_blocked()
+    assert p.db.kv("coordinator_blocked") is None
+    _open_issue(p.db, "box-c is down", first=start + 3600, last=start + 9 * 3600)
+    clock["t"] = start + 10 * 3600
+    d.relay_when_blocked()
+    assert len(told()) == 2
 
 
 def test_productive_burst_is_not_a_runaway_but_waste_is(env):

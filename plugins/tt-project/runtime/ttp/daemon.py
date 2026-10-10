@@ -104,6 +104,15 @@ ORPHAN_GRACE_S = 10     # TERM to KILL for an agent whose supervisor died
 HANDOFF_STATES = ("done", "blocked", "failed", "needs_review", "waiting")
 SLEEP_CUT = ("timeout", "stalled", "lost", "failed")   # ends a host sleep can cause
 DISK_LIGHT_KINDS = ("question", "plan")   # the only task kinds that still start under the disk guard
+LOGOUT_REPORT_S = 300    # how often a project reports into a machine-wide logout and checks its reminders
+# While the coordinator cannot run for BLOCKED_RELAY_AFTER_S, high conditions it never saw that persisted
+# RELAY_PERSIST_S go to the chat model-free, at most one message per RELAY_EVERY_S.
+BLOCKED_RELAY_AFTER_S = 1800
+RELAY_PERSIST_S = 7200
+RELAY_EVERY_S = 3600
+RELAY_MAX_LINES = 10
+COORD_BLOCKED_KEY = "coordinator_blocked"   # kv: {since, why} while the coordinator cannot run
+RELAYED_KEY = "relayed_issues"              # kv: {"last": ts of the last relay, "ids": {issue id: ts}}
 DISK_RESUME = 1.2        # the guard ends once free space is this many times its threshold
 DISK_FLOOR_GB = 2        # below this even questions and plans wait
 DISK_DU_TIMEOUT_S = 30   # the guard alert's du breakdown stops after this, keeping what it measured
@@ -586,7 +595,7 @@ class Daemon:
         core = self.cfg.get("core_provider") or "claude"
         core_held = self.net_held(core) and not self._net_may_probe(core)
         for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.read_upstream,
-                     self.forward_upstream, self.retry_rejected, self.retire_ended, self.sweep_holds, self.maybe_coordinate, self.probe_waiting, self.start_pushes, self.dispatch, self.deliver_outbound):
+                     self.forward_upstream, self.retry_rejected, self.retire_ended, self.sweep_holds, self.maybe_coordinate, self.probe_waiting, self.start_pushes, self.dispatch, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
                 continue   # no routing to start model work with (see _load_config)
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
@@ -4548,7 +4557,9 @@ class Daemon:
             last = float(sent.get(key, 0))
             ep = db.one("SELECT * FROM alerts WHERE key=? AND cleared IS NULL ORDER BY id DESC LIMIT 1",
                         (key,)) if tracked else None
-            if ep and every_s and (now - ep["raised"] < alerts.REMIND_S or last >= ep["raised"] + alerts.REMIND_S):
+            # A logout's reminders come from remind_logouts, on its own cadence.
+            if ep and every_s and (key.startswith("auth:") or now - ep["raised"] < alerts.REMIND_S
+                                   or last >= ep["raised"] + alerts.REMIND_S):
                 db.x("UPDATE alerts SET last=? WHERE id=?", (now, ep["id"]))
                 return
             if not ep and not tracked and now - last < every_s:
@@ -4567,6 +4578,103 @@ class Daemon:
                 return
             db.post("out", text, chat=None, channel=alerts.QUIET if quiet else "chat", kind="alert",
                     severity=severity, ref=key)
+
+    def remind_logouts(self) -> None:
+        """Each open logout: report what waits on it here into its machine-wide claim, and if this
+        project holds the claim and a reminder is due (alerts.LOGOUT_REMIND_S), remind the chats with
+        how many projects, queued tasks and high events wait on it. Model-free, so it works while no
+        coordinator can run."""
+        db, now = self.p.db, time.time()
+        if now - getattr(self, "_logout_round", 0.0) < LOGOUT_REPORT_S:
+            return
+        self._logout_round = now
+        for ep in db.q("SELECT key, MIN(raised) raised FROM alerts WHERE key LIKE 'auth:%' AND cleared IS NULL "
+                       "GROUP BY key"):
+            key, prov = ep["key"], ep["key"].split(":", 1)[1]
+            if not alerts.breaker(db, prov):
+                continue   # check_logins closes it, and the sweep the alert
+            info = {"name": self.p.name,
+                    "queued": db.one("SELECT COUNT(*) n FROM tasks WHERE status='queued'")["n"],
+                    "events": db.one("SELECT COUNT(*) n FROM events WHERE status IN ('new','queued') "
+                                     "AND severity IN ('high','critical')")["n"]}
+            prev = db.one("SELECT MAX(cleared) AS c FROM alerts WHERE key=?", (key,))
+            due = alerts.machine_round(self._machine_wide(key), key, str(self.p.base), now,
+                                       float(prev["c"] or 0) if prev else 0.0, float(ep["raised"]), info)
+            if not due:
+                continue
+            waiting = due["waiting"]
+            try:
+                hint = get_provider(prov).login_hint
+            except Exception:
+                hint = ""
+            names = ", ".join(sorted(str(w.get("name")) for w in waiting))
+            text = (f"{prov} on {hostname()} is still logged out ({(now - due['since']) / 3600:.1f} h). "
+                    f"{len(waiting)} project(s) wait on it ({names}): "
+                    f"{sum(int(w.get('queued') or 0) for w in waiting)} queued task(s) and "
+                    f"{sum(int(w.get('events') or 0) for w in waiting)} high event(s) not handled yet. "
+                    f"Log in once on that machine{f' ({hint})' if hint else ''}; work resumes by itself.")
+            db.post("out", text, chat=None, kind="alert", severity="high", ref=key)
+            log(self.p, f"{key}: logout reminder {due['reminder']} sent")
+
+    def coordinator_blocked(self) -> str | None:
+        """Why no coordinator turn can run now (None when one can): its provider is logged out or
+        paused, its budget gate is red, or its turns keep failing."""
+        db, core = self.p.db, self.cfg.get("core_provider") or "claude"
+        if self._logged_out(core):
+            return f"{core} is logged out"
+        lim = self._provider_pause(core)
+        if lim and float(lim.get("until") or 0) > time.time():
+            return f"{core} is paused ({lim.get('note') or 'at its limit'})"
+        gate = self.gates.get(core)
+        if gate and gate.level == "red":
+            return f"the {core} budget is red"
+        fails = int(db.kv("coordinator_failures", 0))
+        if fails >= 3:
+            return f"its last {fails} turns failed"
+        return None
+
+    def relay_when_blocked(self) -> None:
+        """While the coordinator has been unable to run for BLOCKED_RELAY_AFTER_S, tell the chat
+        model-free about high or critical conditions it never saw (first seen after its last good
+        turn) that persisted RELAY_PERSIST_S and are still open: one line each, at most one message
+        per RELAY_EVERY_S, each condition once. The usual notify floors apply to the message."""
+        db, now = self.p.db, time.time()
+        why = self.coordinator_blocked()
+        state = db.kv(COORD_BLOCKED_KEY)
+        if not why:
+            if state:
+                db.x("DELETE FROM kv WHERE key=?", (COORD_BLOCKED_KEY,))
+            return
+        if not state:
+            db.set_kv(COORD_BLOCKED_KEY, {"since": now, "why": why})
+            return
+        since = float(state.get("since") or now)
+        sent = db.kv(RELAYED_KEY) or {}
+        if now - since < BLOCKED_RELAY_AFTER_S or now - float(sent.get("last") or 0) < RELAY_EVERY_S:
+            return
+        last_ok = db.one("SELECT MAX(started) t FROM runs WHERE role='coordinator' AND status='ok'")["t"] or 0
+        told = sent.get("ids") or {}
+        rows = [r for r in db.q("SELECT * FROM issues WHERE status='open' AND severity IN ('high','critical') "
+                                "AND first_seen>? AND last_seen-first_seen>=? ORDER BY first_seen",
+                                (float(last_ok), RELAY_PERSIST_S))
+                if str(r["id"]) not in told]
+        if not rows:
+            return
+        lines = [f"- {r['severity']}: {r['title']} (seen for "
+                 f"{(float(r['last_seen']) - float(r['first_seen'])) / 3600:.1f} h, {r['source']})"
+                 for r in rows[:RELAY_MAX_LINES]]
+        if len(rows) > RELAY_MAX_LINES:
+            lines.append(f"- and {len(rows) - RELAY_MAX_LINES} more")
+        text = (f"The coordinator cannot run ({why}, {(now - since) / 3600:.1f} h), so these conditions are "
+                f"waiting unhandled:\n" + "\n".join(lines))
+        severity = "critical" if any(r["severity"] == "critical" for r in rows) else "high"
+        keep = {k: v for k, v in told.items() if now - float(v) < 14 * alerts.DAY}
+        keep.update({str(r["id"]): now for r in rows[:RELAY_MAX_LINES]})
+        with db.tx():
+            db.post("out", text, chat=None, kind="alert", severity=severity,
+                    ref="relayed:" + ",".join(str(r["id"]) for r in rows[:RELAY_MAX_LINES]))
+            db.set_kv(RELAYED_KEY, {"last": now, "ids": keep})
+        log(self.p, f"coordinator blocked ({why}): {len(rows[:RELAY_MAX_LINES])} condition(s) relayed to the chat")
 
     def _machine_wide(self, key: str) -> str | None:
         """The per-user claim key of a condition every project on this machine sees alike: a
