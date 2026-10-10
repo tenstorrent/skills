@@ -274,13 +274,7 @@ def drain_outbox(state: Path, source: str, now: float | None = None) -> tuple[in
 
 
 def _rewrite(p: Path, notes: list[dict]) -> None:
-    tmp = p.with_name(p.name + ".tmp")
-    with open(tmp, "w") as f:
-        f.write("".join(json.dumps(n, sort_keys=True) + "\n" for n in notes))
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, p)
-    project.fsync_dir(p.parent)
+    project.durable_write(p, "".join(json.dumps(n, sort_keys=True) + "\n" for n in notes))
 
 
 QUEUED_FILE = "notes-to.jsonl"   # in a run's directory: notes a sandboxed worker could not file itself

@@ -22552,7 +22552,7 @@ def test_notes_to_another_project_are_deduped_and_rate_limited(env, monkeypatch,
     assert upstream.ingest(q, q.config()) == upstream.NOTES_PER_HOUR + 1
 
 
-def _two_projects(env, monkeypatch):
+def _two_projects_for_outbox(env, monkeypatch):
     from ttp.cli import bootstrap
     from ttp.project import register
     p = make(env)
@@ -22568,7 +22568,7 @@ def test_a_note_past_the_hourly_limit_waits_in_the_outbox_and_the_worker_goes_on
     """`ttp note --to` past NOTES_PER_HOUR is never refused: the note waits in the project's outbox, the
     command exits 0 saying so and its place, and later notes queue behind it, so the order holds."""
     from ttp import cli, upstream
-    p, q = _two_projects(env, monkeypatch)
+    p, q = _two_projects_for_outbox(env, monkeypatch)
     for i in range(upstream.NOTES_PER_HOUR):
         assert _note(cli, "--to", "second", f"note {i}") == 0
     capsys.readouterr()
@@ -22599,7 +22599,7 @@ def test_the_daemon_drains_the_note_outbox_in_order_at_the_hourly_rate(env, monk
     across restarts and a crash between filing a note and dropping it from the outbox."""
     from ttp import upstream
     from ttp.daemon import Daemon
-    p, q = _two_projects(env, monkeypatch)
+    p, q = _two_projects_for_outbox(env, monkeypatch)
     t0 = time.time()
     n = upstream.NOTES_PER_HOUR
     for i in range(n):
@@ -22639,7 +22639,7 @@ def test_the_daemon_drains_the_note_outbox_in_order_at_the_hourly_rate(env, monk
 def test_a_note_stuck_in_the_outbox_gets_one_coordinator_event(env, monkeypatch):
     from ttp import upstream
     from ttp.daemon import Daemon
-    p, q = _two_projects(env, monkeypatch)
+    p, q = _two_projects_for_outbox(env, monkeypatch)
     t0 = time.time()
     for i in range(upstream.NOTES_PER_HOUR):
         upstream.send_or_queue(p.state, "demo", 57, "second", f"now {i}", now=t0)
@@ -22655,7 +22655,7 @@ def test_a_note_stuck_in_the_outbox_gets_one_coordinator_event(env, monkeypatch)
 
 def test_a_sandboxed_workers_note_past_the_limit_waits_in_the_outbox(env, monkeypatch, tmp_path):
     from ttp import upstream
-    p, q = _two_projects(env, monkeypatch)
+    p, q = _two_projects_for_outbox(env, monkeypatch)
     for i in range(upstream.NOTES_PER_HOUR):
         upstream.send("demo", 57, "second", f"now {i}")
     run_dir = tmp_path / "run"
