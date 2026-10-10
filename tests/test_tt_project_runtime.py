@@ -36814,6 +36814,73 @@ def test_heal_cap_then_one_self_fix_task_then_outage_alert_that_clears(env):
     assert "passes again" in p.db.one("SELECT text FROM messages WHERE kind='resolved'")["text"]
 
 
+def _heal_to_self_fix_failed(p, d, up, spec, now):
+    """Drive the check (no fix) to its self-fix task, then fail that task."""
+    from ttp import heal
+    assert "it has no fix" in heal.run(d, "svc", spec, now)[0]
+    tid = heal.state(p.db, "svc")["task"]
+    p.db.update_task(tid, status="failed")
+    return tid
+
+
+def test_heal_escalate_user_alerts_and_coordinator_observes_once_per_episode(env):
+    from ttp import heal
+    p, d, up = _heal_setup(env, fix=None)
+    spec, now = _heal_spec(p), time.time()
+    assert heal.escalate_to(d, spec) == "user"
+    tid = _heal_to_self_fix_failed(p, d, up, spec, now)
+    assert "alerted" in heal.run(d, "svc", spec, now + 10)[0]
+    assert [a["ref"] for a in p.db.q("SELECT ref FROM messages WHERE kind='alert'")] == ["heal:svc"]
+    assert not p.db.q("SELECT id FROM events WHERE fingerprint LIKE 'heal:%'")
+    up.touch()
+    heal.run(d, "svc", spec, now + 20)
+    up.unlink()
+    p.db.x("DELETE FROM messages WHERE kind='alert'")
+
+    co = dict(spec, escalate="coordinator")
+    t0 = now + 100
+    tid2 = _heal_to_self_fix_failed(p, d, up, co, t0)
+    assert tid2 != tid
+    for i in range(3):   # repeated runs in one episode add nothing
+        assert "coordinator told" in heal.run(d, "svc", co, t0 + 10 + i)[0]
+    ev = p.db.q("SELECT * FROM events WHERE fingerprint LIKE 'heal:%'")
+    assert len(ev) == 1 and ev[0]["kind"] == "observation" and ev[0]["severity"] == "high"
+    assert ev[0]["status"] == "queued" and ev[0]["fingerprint"] == f"heal:svc:{t0:.0f}" and "svc" in ev[0]["text"]
+    assert not p.db.q("SELECT id FROM messages WHERE kind='alert'"), "coordinator mode alerted the user"
+    st = heal.state(p.db, "svc")
+    st.pop("observed")   # a lost state flag still finds the episode's event
+    heal._save(p.db, "svc", st)
+    heal.run(d, "svc", co, t0 + 20)
+    assert len(p.db.q("SELECT id FROM events WHERE fingerprint LIKE 'heal:%'")) == 1
+
+    up.touch()   # healthy ends the episode; the next one is told again
+    heal.run(d, "svc", co, t0 + 30)
+    up.unlink()
+    t1 = t0 + 200
+    _heal_to_self_fix_failed(p, d, up, co, t1)
+    heal.run(d, "svc", co, t1 + 10)
+    fps = [e["fingerprint"] for e in p.db.q("SELECT fingerprint FROM events WHERE fingerprint LIKE 'heal:%' ORDER BY id")]
+    assert fps == [f"heal:svc:{t0:.0f}", f"heal:svc:{t1:.0f}"]
+    assert not p.db.q("SELECT id FROM messages WHERE kind='alert'")
+
+
+def test_heal_escalate_project_default_and_validation(env):
+    from ttp import heal
+    with pytest.raises(ValueError, match="escalate"):
+        heal.validate({"check": "true", "escalate": "chat"})
+    p, d, up = _heal_setup(env, fix=None)
+    spec = _heal_spec(p)
+    d.cfg["heal"] = {"escalate": "coordinator"}
+    assert heal.escalate_to(d, spec) == "coordinator"
+    assert heal.escalate_to(d, dict(spec, escalate="user")) == "user", "the block's own setting wins"
+    now = time.time()
+    _heal_to_self_fix_failed(p, d, up, spec, now)
+    assert "coordinator told" in heal.run(d, "svc", spec, now + 10)[0]
+    assert not p.db.q("SELECT id FROM messages WHERE kind='alert'")
+    from ttp import project
+    assert project.unknown_key_hint("heal.escalate") is None
+
+
 def test_heal_fix_that_fails_or_does_not_help_queues_the_task(env):
     from ttp import heal
     p, d, up = _heal_setup(env, fix="echo boom; exit 3")

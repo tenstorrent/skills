@@ -21,13 +21,16 @@ or a timeout, is unknown too and reported as an error of the schedule. Each run 
   priority-1 self-fix task is queued (label `heal:<name>`, so one is open per check), carrying the
   check's and the fix's output. Only once that task fails, blocks, or ends while the check still
   fails does a keyed high alert `heal:<name>` go out; it clears itself once the check is healthy.
+  `escalate` picks who gets that last step: "user" (default; the project's `heal.escalate` config
+  sets it for every check) sends the alert; "coordinator" sends no alert and instead queues one high
+  observation for the coordinator per unhealthy episode (fingerprint `heal:<name>:<since>`).
 
 Known faults and outages: `known_fault` (why repair is not ours) keeps a single fault quiet: no fix,
 no task, no alert. A check with `outage: true` watches a whole box or resource; once it has served
 nothing for 60 min (or past its grace_s, if shorter) it escalates as above whatever `known_fault`
 says. Its check staying unknown (75, 255 or a broken check: an unreachable box looks like that) for as
 long escalates the same way, without running the fix; the next healthy result clears it. Observation
-mutes never reach these checks: their escalation does not go through observations.
+mutes never reach these checks: their escalation does not go through the observation screen.
 
 Daemon time: `timeout_s` is capped at MAX_TIMEOUT_S (the daemon's command-watcher cap), a timeout
 kills the check's or fix's whole process group, and the daemon tells its watchdog it still moves
@@ -81,7 +84,9 @@ MAX_TIMEOUT_S = 240             # timeout_s cap: daemon.WATCHER_MAX_S, so check,
 FIX_OWN_75 = 176                # a fix under a lock that itself exits 75 exits this, apart from the lock's 75
 DEFAULTS = {"grace_s": 300, "settle_s": 60, "max_fixes": 3, "window_h": 1.0, "timeout_s": 120}
 OPEN = ("queued", "running", "waiting", "needs_review")
-_COMMON = {"check", "fix", "resource", "machine", "condition", "preset", "outage", "known_fault", *DEFAULTS}
+_COMMON = {"check", "fix", "resource", "machine", "condition", "preset", "outage", "known_fault", "escalate",
+           *DEFAULTS}
+ESCALATE = ("user", "coordinator")   # who hears of a check its self-fix task could not repair
 PRESETS: dict[str, set[str]] = {
     "systemd": {"unit", "user", "host"},
     "http": {"url", "expect"},
@@ -117,6 +122,8 @@ def validate(block: Any, where: str = "heal") -> dict:
             raise ValueError(f"{where}: `{k}` is text")
     if not isinstance(out.get("outage", False), bool):
         raise ValueError(f"{where}: `outage` is true or false")
+    if out.get("escalate") is not None and out["escalate"] not in ESCALATE:
+        raise ValueError(f"{where}: `escalate` is one of {', '.join(ESCALATE)}")
     if out.get("condition") is not None and out["condition"] not in LEDGER_CONDITIONS:
         raise ValueError(f"{where}: `condition` is one of {', '.join(LEDGER_CONDITIONS)}")
     if preset == "systemd":
@@ -545,13 +552,31 @@ def _escalated(host: Any, name: str, spec: dict, st: dict, now: float) -> tuple[
         _save(db, name, st)
         return f"unhealthy (self-fix task #{tid} open)", None
     how = f"self-fix task #{tid} {t['status']}" if t else f"self-fix task #{tid} is gone"
+    last = (st.get("last_out") or "")[:300]
+    if escalate_to(host, spec) == "coordinator":
+        fp = f"{STATE_KEY}{name}:{float(st.get('since') or st.get('escalated') or now):.0f}"
+        if not st.get("observed") and not db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+            db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
+                 (now, "daemon", "observation", fp, "high",
+                  f"Heal check {name} still fails and its {how}. Repair it within the charter "
+                  f"(a new task, or a corrected heal block); the check clears itself once it passes. "
+                  f"Last check: {last}", "queued"))
+        st["observed"] = st.get("observed") or now
+        _save(db, name, st)
+        return f"unhealthy ({how}; coordinator told)", None
     if not st.get("alerted"):
         st["alerted"] = now
-        host.alert(STATE_KEY + name,
-                   f"Outage: heal check {name} still fails and its {how}. "
-                   f"Last check: {(st.get('last_out') or '')[:300]}", "high")
+        host.alert(STATE_KEY + name, f"Outage: heal check {name} still fails and its {how}. Last check: {last}",
+                   "high")
     _save(db, name, st)
     return f"unhealthy ({how}; alerted)", None
+
+
+def escalate_to(host: Any, spec: dict) -> str:
+    """Who hears of a check its self-fix task could not repair: the block's `escalate`, else the
+    project's `heal.escalate`, else the user."""
+    v = spec.get("escalate") or ((getattr(host, "cfg", None) or {}).get("heal") or {}).get("escalate")
+    return v if v in ESCALATE else "user"
 
 
 def holds(db: DB, name: str) -> bool:
