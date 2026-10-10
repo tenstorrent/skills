@@ -29762,6 +29762,69 @@ def test_task_add_naming_a_finished_tasks_branch_carries_it(env):
         assert not [x for x in labels(title) if x.startswith(("pr_branch:", "continues:"))], title
 
 
+def test_a_pr_branch_line_must_be_exactly_one_valid_branch_name(env):
+    """A spec's `pr_branch:` line labels the task only when its whole value is one valid branch name
+    (git check-ref-format --branch). Prose, several words, an invalid ref or a protected branch gives
+    no label and a note to the coordinator instead; a label like that already on a task is ignored."""
+    p = make(env)
+    from ttp import coordinator as coord, worktree
+
+    def labels(title):
+        return json.loads(p.db.one("SELECT labels FROM tasks WHERE title=?", (title,))["labels"])
+
+    for spec, want in (("pr_branch: feature/fast-io", "feature/fast-io"),
+                       ("Goal: fix CI.\npr_branch: `user/fix-ci`.", "user/fix-ci"),
+                       ("pr_branch: 'release-2.1'", "release-2.1")):
+        assert coord.spec_pr_branch(spec) == (want, ""), spec
+        title = f"valid {want}"
+        assert coord.apply(p, [{"type": "task_add", "title": title, "kind": "code", "spec": spec}]) == []
+        assert labels(title) == [f"pr_branch:{want}"]
+    prose = "pr_branch: use that task #467 branch name exactly as in its worktree"
+    for i, spec in enumerate((prose, "a spec line like 'pr_branch: use the PR's branch' was parsed",
+                              "pr_branch: feat..ure", "pr_branch: main", "pr_branch: -x", "pr_branch:\nmore",
+                              "pr_branch: a b")):
+        assert coord.spec_pr_branch(spec)[0] == "", spec
+        title = f"bad {i}"
+        assert coord.apply(p, [{"type": "task_add", "title": title, "kind": "code", "spec": spec}]) == []
+        new = p.db.one("SELECT id FROM tasks WHERE title=?", (title,))["id"]
+        assert not [x for x in labels(title) if x.startswith("pr_branch:")], spec
+        assert any(n.startswith(f"task_add: #{new}'s spec has `pr_branch:") and "not one valid branch name" in n
+                   for n in p.db.kv(coord.NOTES_KEY)), spec
+    assert coord.spec_pr_branch("no such line") == ("", "")
+    assert worktree.carried_branch({"labels": json.dumps(["pr_branch:use that branch"])}) == ""
+    assert worktree.carried_branch({"labels": json.dumps(["pr_branch:feat..ure"])}) == ""
+    assert worktree.carried_branch({"labels": json.dumps(["pr_branch:feature/x"])}) == "feature/x"
+
+
+def test_own_push_refuses_a_pr_branch_that_exists_nowhere(env, monkeypatch):
+    """`ttp push --own` from a task's own branch publishes onto its pr_branch only when that branch
+    exists here or on the remote; a missing one (e.g. a word parsed out of prose) or an invalid one is
+    refused, and main/master never go."""
+    from ttp import push
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+
+    def target(label):
+        t = p.db.add_task("Carry it", "s", kind="code", labels=[f"pr_branch:{label}"])
+        own = f"ttp/t{t}-carry-it"
+        _git_out(repo, "checkout", "-q", "-B", own)
+        monkeypatch.setenv("TTP_TASK", str(t))
+        return push.own_target(p, repo)
+
+    with pytest.raises(ValueError, match="exists neither here nor on origin"):
+        target("use")
+    assert "use" not in _git_out(origin, "for-each-ref", "--format=%(refname:short)", "refs/heads").split()
+    for bad in ("use that branch", "feat..ure"):
+        with pytest.raises(ValueError, match="not one valid branch name"):
+            target(bad)
+    for shared in ("main", "master"):
+        with pytest.raises(ValueError):
+            target(shared)
+    _git_out(other, "push", "-q", "origin", "HEAD:refs/heads/feature/remote")
+    assert target("feature/remote") == ("origin", "feature/remote")
+    _git_out(repo, "branch", "feature/local", "HEAD")
+    assert target("feature/local") == ("origin", "feature/local")
+
+
 def test_a_task_carrying_a_branch_works_on_it_in_a_worktree_and_publishes_onto_it(env, monkeypatch, capsys):
     """A task labelled pr_branch:<branch>, of any kind but review or harness, runs in a worktree on that
     branch (made from the remote's when there is no local one) and `ttp push --own` fast-forwards it.
