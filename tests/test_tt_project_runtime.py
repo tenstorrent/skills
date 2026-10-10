@@ -29801,35 +29801,25 @@ def test_task_add_naming_a_finished_tasks_branch_carries_it(env):
         assert not [x for x in labels(title) if x.startswith(("pr_branch:", "continues:"))], title
 
 
-def test_a_pr_branch_line_must_be_exactly_one_valid_branch_name(env):
-    """A spec's `pr_branch:` line labels the task only when its whole value is one valid branch name
-    (git check-ref-format --branch). Prose, several words, an invalid ref or a protected branch gives
-    no label and a note to the coordinator instead; a label like that already on a task is ignored."""
+def test_a_pr_branch_line_labels_its_first_token_with_text_after_it(env):
+    """A spec's `pr_branch:` line labels the task with the branch right after it, backticks or quotes
+    aside, even with more text on the same line, and writes no note about it. A label that is not a
+    valid branch name is ignored when the task runs (worktree.carried_branch)."""
     p = make(env)
     from ttp import coordinator as coord, worktree
 
     def labels(title):
         return json.loads(p.db.one("SELECT labels FROM tasks WHERE title=?", (title,))["labels"])
 
-    for spec, want in (("pr_branch: feature/fast-io", "feature/fast-io"),
-                       ("Goal: fix CI.\npr_branch: `user/fix-ci`.", "user/fix-ci"),
-                       ("pr_branch: 'release-2.1'", "release-2.1")):
-        assert coord.spec_pr_branch(spec) == (want, ""), spec
-        title = f"valid {want}"
+    for i, (spec, want) in enumerate((("pr_branch: feature/fast-io Goal: fix CI.", "feature/fast-io"),
+                                      ("pr_branch: `ttp/t5-x` Context: the old parser read it.", "ttp/t5-x"),
+                                      ("Goal: fix CI.\npr_branch: `user/fix-ci`.", "user/fix-ci"),
+                                      ("pr_branch: 'release-2.1' then more", "release-2.1"),
+                                      ('pr_branch: "feature/q"', "feature/q"))):
+        title = f"carry {i}"
         assert coord.apply(p, [{"type": "task_add", "title": title, "kind": "code", "spec": spec}]) == []
-        assert labels(title) == [f"pr_branch:{want}"]
-    prose = "pr_branch: use that task #467 branch name exactly as in its worktree"
-    for i, spec in enumerate((prose, "a spec line like 'pr_branch: use the PR's branch' was parsed",
-                              "pr_branch: feat..ure", "pr_branch: main", "pr_branch: -x", "pr_branch:\nmore",
-                              "pr_branch: a b")):
-        assert coord.spec_pr_branch(spec)[0] == "", spec
-        title = f"bad {i}"
-        assert coord.apply(p, [{"type": "task_add", "title": title, "kind": "code", "spec": spec}]) == []
-        new = p.db.one("SELECT id FROM tasks WHERE title=?", (title,))["id"]
-        assert not [x for x in labels(title) if x.startswith("pr_branch:")], spec
-        assert any(n.startswith(f"task_add: #{new}'s spec has `pr_branch:") and "not one valid branch name" in n
-                   for n in p.db.kv(coord.NOTES_KEY)), spec
-    assert coord.spec_pr_branch("no such line") == ("", "")
+        assert labels(title) == [f"pr_branch:{want}"], spec
+    assert not [n for n in p.db.kv(coord.NOTES_KEY) or [] if "pr_branch" in n]
     assert worktree.carried_branch({"labels": json.dumps(["pr_branch:use that branch"])}) == ""
     assert worktree.carried_branch({"labels": json.dumps(["pr_branch:feat..ure"])}) == ""
     assert worktree.carried_branch({"labels": json.dumps(["pr_branch:feature/x"])}) == "feature/x"
