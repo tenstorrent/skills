@@ -132,8 +132,12 @@ def _touch(p: Path) -> None:
 
 
 def request_stop(run_dir: Path, why: str = "cancel") -> None:
-    """Ask a run's supervisor to end its agent (TERM, then KILL after the grace period)."""
-    (run_dir / "STOP").write_text(why)
+    """Ask a run's supervisor to end its agent (TERM, then KILL after the grace period).
+    Written whole by rename: a supervisor polling between create and write would read "" and
+    record a project stop ("shutdown") as a cancel."""
+    tmp = run_dir / f".STOP.{os.getpid()}"
+    tmp.write_text(why)
+    os.replace(tmp, run_dir / "STOP")
 
 
 def stop_runs(db, runs_dir: Path, task: int | None = None, why: str = "cancel") -> list[int]:

@@ -9663,6 +9663,20 @@ def _start_sleeping_run(p, tid, role="worker", argv=("sleep", "120"), boot="x"):
     return rid, run_dir, proc
 
 
+def test_stop_file_appears_whole_so_a_kill_is_never_read_as_a_cancel(env, tmp_path, monkeypatch):
+    # A supervisor polling between STOP's creation and its write read "" and recorded a project
+    # stop ("shutdown", task back to the queue) as a cancel ("stopped").
+    from ttp import runner
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    written = []
+    real = pathlib.Path.write_text
+    monkeypatch.setattr(pathlib.Path, "write_text", lambda self, *a, **k: (written.append(self.name), real(self, *a, **k))[1])
+    runner.request_stop(run_dir, "shutdown")
+    assert "STOP" not in written, "STOP was written in place, not renamed into place"
+    assert runner.stop_reason(run_dir) == "shutdown" and [f.name for f in run_dir.iterdir()] == ["STOP"]
+
+
 def test_cancel_and_stop_kill_end_running_workers_but_stop_keeps_them(env, monkeypatch):
     p = make(env)
     from ttp import cli, service
