@@ -36194,7 +36194,7 @@ def _setting_ask(p, text="May reviewed work land on main? That needs delivery.al
     return p.db.one("SELECT MAX(id) id FROM messages WHERE kind='ask'")["id"]
 
 
-def _with_origin(p):
+def _remote_origin(p):
     """A code repo with a remote, so a push branch on it is refused only by the setting."""
     subprocess.run(["git", "-C", str(p.root), "remote", "add", "origin", "https://example.invalid/r.git"], check=True)
 
@@ -36205,7 +36205,7 @@ def test_a_setting_hold_keeps_landing_tasks_off_workers_until_the_setting_is_on(
     from ttp import coordinator as coord
     from ttp import settinghold
     p = make(env)
-    _with_origin(p)
+    _remote_origin(p)
     p.set_config("delivery.push_branch", "origin/main")
     land = [p.db.add_task("Land the fix", "Fix it, then land on main with `ttp push --detach`.", kind="code",
                           tier="light", origin="user"),
@@ -36254,7 +36254,7 @@ def test_a_setting_hold_ends_when_its_ask_is_resolved_and_follows_a_newer_ask(en
     from ttp import coordinator as coord
     from ttp import settinghold
     p = make(env)
-    _with_origin(p)
+    _remote_origin(p)
     p.set_config("delivery.push_branch", "origin/main")
     tids = [p.db.add_task(f"Land {n}", "land on main with `ttp push`", kind="code", tier="light", origin="user")
             for n in ("a", "b")]
