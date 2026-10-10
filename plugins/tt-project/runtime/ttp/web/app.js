@@ -37,6 +37,17 @@ async function projects() {
         `<td>${r.asks}</td><td>${r.waiting_on_user}</td><td>${r.running}</td><td>${esc(o.spend[r.name] || "")}</td></tr>`).join("") + `</table>`
     : `<p class="muted">No projects registered on this machine.</p>`);
   text($("#projfoot"), o.footer);
+  const m = await api("/api/machines");
+  const rows = (r) => [["projects", r.projects.join(", ") || "none name it"],
+    ["recovery owner", (r.owner || "none set") + (r.fallback ? `, fallback ${r.fallback}` : "")]]
+    .concat(r.pauses.map((p) => ["paused", `${p.resource} by ${p.project}${p.reason ? ` (${p.reason})` : ""}; ${p.end || "no end recorded"}`]),
+      r.conditions.map((c) => ["condition", c]), r.changes.map((c) => ["change", c]),
+      r.checks.length ? r.checks.map((c) => ["heal check", `${c.project}/${c.check}: ${c.status}`]) : [["heal checks", "none name it"]],
+      r.problems.map((x) => ["problem", x]), r.unread.length ? [["could not read", r.unread.join(", ")]] : []);
+  put($("#machlist"), m.machines.length ? m.machines.map((r) => `<div class="card"><b>${esc(r.alias)}</b>` +
+    (r.conditions.length || r.problems.length ? ` <span class="pill lv-red">trouble</span>` : r.pauses.length ? ` <span class="pill lv-yellow">paused</span>` : "") +
+    rows(r).map(([k, v]) => `<div class="row"><span class="meta">${esc(k)}</span> ${esc(v)}</div>`).join("") + `</div>`).join("")
+    : `<p class="muted">No machines recorded.</p>`);
 }
 
 function gateHtml(gates) {
@@ -154,6 +165,7 @@ function healthHtml(h) {
     (h.breakers || []).map((b) => `<div class="row"><b>${esc(b.provider)}</b><span class="pill lv-red">logged out</span><span>${esc(b.line)}</span></div>`).join("") +
     (h.schedules_broken ? `<div class="row"><span class="pill lv-red">${esc(h.schedules_broken)}</span></div>` : "") +
     (h.health ? `<div class="row"><span class="${/ [1-9]\d* failing/.test(h.health) ? "pill lv-red" : "meta"}">${esc(h.health)}</span></div>` : "") +
+    (h.coverage ? `<div class="row"><span class="${/missing:/.test(h.coverage) ? "pill lv-yellow" : "meta"}">${esc(h.coverage)}</span></div>` : "") +
     (h.upstream ? `<div class="row"><span class="meta">${esc(h.upstream)}</span></div>` : "") +
     (h.resources_paused || []).map((r) =>
     `<div class="row"><b>${esc(r.resource)}</b><span class="pill lv-orange">resource paused</span><span>${esc(r.reason || "")}</span><span class="meta">since ${at(r.since)} by ${esc(r.by || "user")}: its tasks wait</span><button data-resume-resource="${esc(r.resource)}">Resume</button></div>`).join("");

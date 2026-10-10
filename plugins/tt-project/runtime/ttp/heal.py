@@ -43,6 +43,13 @@ Presets fill in `check` (and a default `fix`) from config, so no host or unit is
   command prints JSON; unhealthy while `hold_field` is true or any of `auto_fields` (automatic
   recovery: power cycle, reboot) is false. No default fix.
 
+Shared machines: a check that watches one of the user's machines (`machine: "<alias>"`, or a
+`resource` naming a known alias on an `outage` or broker check) reports what it sees to the machine
+ledger (machine_ledger.report), so the machine's recovery owner is paged once the condition outlasts
+the check's grace: `held` while a broker's hold field is set, otherwise `down` (`condition` overrides
+it); an unknown result counts only once an outage check escalates on it, and a single known fault
+never does. The next healthy result reports it cleared.
+
 State lives in the database (kv `heal:<name>`), so a daemon restart, even in the middle of a fix,
 picks up where it was: a fix that started counts toward the cap, and the next run is its recheck,
 no earlier than `settle_s` after the fix started.
@@ -74,7 +81,7 @@ MAX_TIMEOUT_S = 240             # timeout_s cap: daemon.WATCHER_MAX_S, so check,
 FIX_OWN_75 = 176                # a fix under a lock that itself exits 75 exits this, apart from the lock's 75
 DEFAULTS = {"grace_s": 300, "settle_s": 60, "max_fixes": 3, "window_h": 1.0, "timeout_s": 120}
 OPEN = ("queued", "running", "waiting", "needs_review")
-_COMMON = {"check", "fix", "resource", "preset", "outage", "known_fault", *DEFAULTS}
+_COMMON = {"check", "fix", "resource", "machine", "condition", "preset", "outage", "known_fault", *DEFAULTS}
 PRESETS: dict[str, set[str]] = {
     "systemd": {"unit", "user", "host"},
     "http": {"url", "expect"},
@@ -82,6 +89,7 @@ PRESETS: dict[str, set[str]] = {
 }
 BROKER_HOLD = "held"
 BROKER_AUTO = ("auto_power_cycle", "auto_reboot")
+LEDGER_CONDITIONS = ("down", "held")   # machine_ledger.CONDITIONS
 
 
 # The block ----------------------------------------------------------------------------------------
@@ -104,11 +112,13 @@ def validate(block: Any, where: str = "heal") -> dict:
     if out["timeout_s"] <= 0 or out["window_h"] <= 0:
         raise ValueError(f"{where}: `timeout_s` and `window_h` must be positive")
     out["timeout_s"] = min(out["timeout_s"], MAX_TIMEOUT_S)   # longer would hold the daemon's tick past its watchdog
-    for k in ("check", "fix", "resource", "known_fault"):
+    for k in ("check", "fix", "resource", "machine", "known_fault"):
         if out.get(k) is not None and not isinstance(out[k], str):
             raise ValueError(f"{where}: `{k}` is text")
     if not isinstance(out.get("outage", False), bool):
         raise ValueError(f"{where}: `outage` is true or false")
+    if out.get("condition") is not None and out["condition"] not in LEDGER_CONDITIONS:
+        raise ValueError(f"{where}: `condition` is one of {', '.join(LEDGER_CONDITIONS)}")
     if preset == "systemd":
         if not str(out.get("unit") or "").strip():
             raise ValueError(f"{where}: preset systemd needs `unit`")
@@ -236,7 +246,8 @@ def _check_broker(spec: dict, state: dict, cwd: str) -> tuple[int, str]:
     except ValueError:
         return 75, f"status command printed no JSON: {out[-300:]}"
     problems = []
-    if _field(data, spec.get("hold_field") or BROKER_HOLD):
+    state["held"] = bool(_field(data, spec.get("hold_field") or BROKER_HOLD))
+    if state["held"]:
         problems.append(f"{spec.get('hold_field') or BROKER_HOLD} is set")
     missing = []
     for f in spec.get("auto_fields") or BROKER_AUTO:
@@ -334,8 +345,68 @@ def run(host: Any, name: str, spec: dict, now: float | None = None) -> tuple[str
     """One run of the check for the daemon `host` (it has `p` and `alert`, and may have `_progress`,
     the watchdog ping, called between the check and the fix). Returns (schedule status, when to run
     again if sooner than its period)."""
-    p, db = host.p, host.p.db
     now = time.time() if now is None else now
+    out = _run(host, name, spec, now)
+    try:
+        _report_machine(host, name, spec, now)
+    except Exception as e:   # the ledger is shared and best effort: the check's own result stands
+        print(f"heal {name}: machine ledger report failed: {e}", file=sys.stderr)
+    return out
+
+
+def machine_of(spec: dict, known: dict | None = None) -> str | None:
+    """The machine alias a check watches, for the ledger: `machine`, else the alias its `resource` is on
+    when it watches a whole box (`outage`) or a broker."""
+    if spec.get("machine"):
+        return spec["machine"]
+    res = str(spec.get("resource") or "")
+    if not res or not (spec.get("outage") or spec.get("preset") == "broker"):
+        return None
+    if known is None:
+        from . import machines
+        known = machines.load()
+    return next((a for a in sorted(known, key=len, reverse=True)
+                 if res == a or res.startswith((a + "-", a + ":"))), None)
+
+
+def _report_machine(host: Any, name: str, spec: dict, now: float) -> None:
+    """Tell the machine ledger what the check sees of its machine (module doc): down or held, or cleared."""
+    alias = machine_of(spec)
+    db = host.p.db
+    st = state(db, name)
+    was = st.get("machine_reported")
+    want, grace = None, min(spec["grace_s"], OUTAGE_S) if spec.get("outage") else spec["grace_s"]
+    if "unknown_since" in st:
+        # Unknown tells nothing until an outage check escalates on it, once its window has passed.
+        if not spec.get("outage") or now - float(st["unknown_since"]) < min(spec["grace_s"] or OUTAGE_S, OUTAGE_S):
+            return
+        want, grace = [alias, spec.get("condition") or "down"] if alias else None, 0
+    elif alias and st.get("status") == "unhealthy" and (spec.get("outage") or not spec.get("known_fault")):
+        if spec.get("condition"):
+            want = [alias, spec["condition"]]
+        elif st.get("held"):
+            want = [alias, "held"]
+        elif spec.get("preset") != "broker":   # a broker only missing its automatic recovery is not down
+            want = [alias, "down"]
+    if not was and not want:
+        return
+    from . import machine_ledger
+    if was and was != want:
+        machine_ledger.report(host.p.name, was[0], was[1], cleared=True, now=now)
+    if want:
+        machine_ledger.report(host.p.name, want[0], want[1], f"heal check {name}: {st.get('last_out') or ''}",
+                              grace_s=grace, now=now)
+    if want != was:
+        st = state(db, name)
+        if want:
+            st["machine_reported"] = want
+        else:
+            st.pop("machine_reported", None)
+        _save(db, name, st)
+
+
+def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | None]:
+    p, db = host.p, host.p.db
     st = state(db, name)
     cwd, env = str(p.root), command_env(p)
     if st.get("phase") == "fixing" and now < float(st.get("fix_started") or 0) + spec["settle_s"]:
@@ -349,7 +420,8 @@ def run(host: Any, name: str, spec: dict, now: float | None = None) -> tuple[str
     pending = st.get("phase") in ("fixing", "settling")   # a fix ran (or a restart cut it short)
     if rc == 0:
         was = st.get("status")
-        nxt = {k: st[k] for k in ("fixes", "nrestarts", "last_check", "last_rc", "last_out") if k in st}
+        nxt = {k: st[k] for k in ("fixes", "nrestarts", "last_check", "last_rc", "last_out", "machine_reported")
+               if k in st}
         _save(db, name, {**nxt, "status": "healthy"})
         t = db.task(int(st["task"])) if st.get("task") else None
         if t is not None and t["status"] == "queued":   # a running one is left to finish

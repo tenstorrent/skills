@@ -53,6 +53,7 @@ from . import prguard
 from . import push
 from . import pushq
 from . import release
+from . import responsibilities
 from . import reviewcap
 from . import runner
 from . import schedule as sched
@@ -358,6 +359,7 @@ class Daemon:
         self._pause_ends = pauseends.PauseEnds(self.p, log=lambda m: log(self.p, m))   # resource pauses' ends
         self._machine_probes = machine_ledger.Probes(self.p, log=lambda m: log(self.p, m))
         self._machines_routed = 0.0
+        self._coverage_at = 0.0
         self._probe_rc: dict[int, tuple[int | str, float, str]] = {}   # last verdict: exit code or why, when, probe
         self._probe_files: dict[int, object] = {}   # id(probe proc) -> the file its output goes to
         self._probe_out: dict[int, tuple[str, float, str]] = {}   # task -> its probe's last output, unchanged since, probe
@@ -621,7 +623,7 @@ class Daemon:
         core = self.cfg.get("core_provider") or "claude"
         core_held = self.net_held(core) and not self._net_may_probe(core)
         for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.read_upstream,
-                     self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.retire_ended, self.route_machines, self.sweep_holds, self.maybe_coordinate, self.probe_waiting, self.start_pushes, self.dispatch, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
+                     self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.retire_ended, self.route_machines, self.refresh_coverage, self.sweep_holds, self.maybe_coordinate, self.probe_waiting, self.start_pushes, self.dispatch, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
                 continue   # no routing to start model work with (see _load_config)
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
@@ -848,6 +850,18 @@ class Daemon:
                 (machine_ledger.delivered if ok else machine_ledger.release)(page)
             except Exception:
                 log(self.p, f"settling the page for {page['key']} failed\n" + traceback.format_exc())
+
+    def refresh_coverage(self) -> None:
+        """The responsibility inventory and its health coverage (responsibilities.py), model-free: a
+        file read and a few queries every CHECK_EVERY_S; stored when it changed and once a day."""
+        now = time.time()
+        if now - self._coverage_at < responsibilities.CHECK_EVERY_S:
+            return
+        self._coverage_at = now
+        try:
+            responsibilities.refresh(self.p, self.cfg, now)
+        except Exception:
+            log(self.p, "health coverage inventory failed\n" + traceback.format_exc())
 
     def _machine_page(self, page: dict, now: float) -> bool:
         """Deliver one page; whether it went out (or already had: a resend is idempotent)."""
@@ -2799,6 +2813,14 @@ class Daemon:
                          + "\n".join(f"- {line}" for line in audit.lines(db, blocked_h=hours, p=self.p)))
             except Exception as e:   # nor must the audit
                 log(self.p, f"self-efficiency audit failed: {type(e).__name__}: {e}")
+        if payload.get("audit_report", s["name"] == "daily-review"):
+            try:
+                line = responsibilities.line(db)
+                if line:
+                    spec += (f"\n\nResponsibilities: {line}. Give each missing one a heal check naming it "
+                             "(`ttp machines status` shows the shared machines).")
+            except Exception as e:   # nor must the inventory
+                log(self.p, f"health coverage line failed: {type(e).__name__}: {e}")
         if s["name"] == "daily-review":
             try:
                 line = pushq.target_line(db)

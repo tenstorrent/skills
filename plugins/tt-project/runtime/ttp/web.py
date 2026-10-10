@@ -17,7 +17,7 @@ from . import alerts, awake
 from . import budget as bud
 from . import globalcap as gcap
 from . import coordinator as coord
-from . import heal, pushq, release, waits
+from . import heal, pushq, release, responsibilities, waits
 from . import schedule as sched
 from . import upstream
 from .daemon import (AUTH_PROBE_S, HEARTBEAT_STALE_S, KV_LOCAL_ONLY, KV_WORKTREES_DIRTY, LOGGED_OUT_NOTE, NET_HELD_NOTE,
@@ -367,6 +367,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         "schedules_broken": sched.broken_line(db),
         "schedules_waiting": sched.waiting_line(db),
         "health": heal.line(db, now),
+        "coverage": responsibilities.line(db),
         "local_only": local_only_line(db),
         "uncommitted": uncommitted_line(db),
         "upstream": upstream.status_line(db, cfg),
@@ -544,6 +545,9 @@ class Handler(BaseHTTPRequestHandler):
                 data = overview.overview()
                 return self._send(200, {**data, "footer": overview.footer(data["global"]),
                                         "spend": {r["name"]: overview.spend(r) for r in data["projects"] if r["ok"]}})
+            if url.path == "/api/machines":
+                from . import responsibilities
+                return self._send(200, {"machines": responsibilities.machine_status()})
             if url.path == "/api/messages":
                 q = parse_qs(url.query)
                 after = int(q.get("after", ["0"])[0])

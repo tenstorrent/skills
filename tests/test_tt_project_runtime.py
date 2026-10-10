@@ -36551,3 +36551,156 @@ def test_a_machine_outage_alert_holds_while_reported_and_clears_with_its_conditi
     assert alerts.sweep(alpha.db, late) == []
     ml.close_change(c["id"], "undone")
     assert [x["key"] for x in alerts.sweep(alpha.db, late)] == [key]
+
+
+def test_responsibility_inventory_shows_an_unwatched_machine_until_a_check_names_it(env):
+    from ttp import machines as mm
+    from ttp import responsibilities as rs
+    from ttp import schedule as sched
+    from ttp.cli import status_text
+    p = make(env)
+    mm.add("box-a", tags="device")
+    mm.add("box-b")
+    _resources(p, "Machines: box-a")
+    rec = rs.refresh(p, now=1000.0)
+    box = [i for i in rec["items"] if i["kind"] == "machine"]
+    assert box == [{"kind": "machine", "name": "box-a", "covered_by": []}]
+    n = len(rec["items"])   # the default schedules are items too, covered by the daemon itself
+    assert rec["line"] == f"health coverage: {n - 1}/{n} (missing: machine box-a)"
+    assert rec["line"] in status_text(p)
+    first = rs.digest_lines(p.db)
+    assert len(first) == 1 and "missing: machine box-a" in first[0]
+    # Unchanged: nothing is stored again and the coordinator hears nothing more.
+    assert rs.refresh(p, now=2000.0)["at"] == 1000.0
+    assert rs.digest_lines(p.db) == []
+    # A heal check on its broker covers it: the change is one digest line.
+    sched.upsert(p.db, "box-a-broker", "command", "10m", payload={"heal": {
+        "preset": "broker", "status_command": "ssh box-a broker status --json", "resource": "box-a-device"}})
+    rec = rs.refresh(p, now=3000.0)
+    assert rec["line"] == f"health coverage: {n}/{n}"
+    assert rec["items"][0]["covered_by"] == ["box-a-broker"]
+    told = rs.digest_lines(p.db)
+    assert len(told) == 1 and "now covered: machine box-a" in told[0]
+    assert rs.digest_lines(p.db) == []
+    # A plain command watcher naming the alias's host name covers it too; an alias inside a word does not.
+    p.db.x("DELETE FROM schedules WHERE name='box-a-broker'")
+    sched.upsert(p.db, "probe", "command", "10m", payload={"command": "ping -c1 xbox-a.example"})
+    assert rs.refresh(p, now=4000.0)["items"][0]["covered_by"] == []
+    mm.add("box-a", hostname="node7")
+    sched.upsert(p.db, "probe", "command", "10m", payload={"command": "ping -c1 node7"})
+    assert rs.refresh(p, now=5000.0)["items"][0]["covered_by"] == ["probe"]
+    # The daily review spec carries the line.
+    from ttp import daemon as dm
+    sched.upsert(p.db, "daily-review", "llm", "1d", payload={})
+    d = dm.Daemon(p.base)
+    p.db.x("UPDATE schedules SET next_run=0 WHERE name='daily-review'")
+    d.run_schedules()
+    t = p.db.one("SELECT spec FROM tasks WHERE labels LIKE '%daily-review%'")
+    assert t and "Responsibilities: health coverage:" in t["spec"]
+
+
+def test_responsibility_inventory_lists_runners_schedules_prs_and_remote_jobs(env):
+    from ttp import responsibilities as rs
+    from ttp import schedule as sched
+    p = make(env)
+    p.set_config("device", {"runners": {"q1": {"host": "box-c"}}})
+    sched.upsert(p.db, "nightly", "command", "1d", payload={"command": "make nightly"})
+    p.db.x("UPDATE schedules SET enabled=0 WHERE name='pr-watch'")
+    tid = p.db.add_task("t", "s")
+    p.db.update_task(tid, status="waiting", pr_url="https://example.invalid/pr/1",
+                     result=json.dumps({"retry_when": "ttp detach --check --host box-c /tmp/x/job"}))
+    items = {(i["kind"], i["name"]): i["covered_by"] for i in rs.inventory(p)}
+    assert items[("runner", "q1")] == []
+    assert items[("schedule", "nightly")] and items[("remote job", f"task #{tid} on box-c")]
+    assert items[("pr", "https://example.invalid/pr/1")] == [], "no PR watcher: not covered"
+    p.db.x("UPDATE schedules SET enabled=1 WHERE name='pr-watch'")
+    items = {(i["kind"], i["name"]): i["covered_by"] for i in rs.inventory(p)}
+    assert items[("pr", "https://example.invalid/pr/1")] == ["builtin: PR watcher pr-watch"]
+    p.db.set_kv("pr_signatures", {"https://example.invalid/pr/1": {"state": "MERGED"}})
+    assert not [i for i in rs.inventory(p) if i["kind"] == "pr"]
+    sched.upsert(p.db, "q1-alive", "command", "5m", payload={"heal": {"check": "ssh box-c true", "outage": True}})
+    items = {(i["kind"], i["name"]): i["covered_by"] for i in rs.inventory(p)}
+    assert items[("runner", "q1")] == ["q1-alive"] and ("schedule", "q1-alive") not in items
+
+
+def test_machine_status_lists_co_tenants_owner_pauses_changes_and_checks_read_only(env, capsys):
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp import schedule as sched
+    from ttp.cli import main
+    from ttp.db import PAUSED_RESOURCES_KEY
+    mm.add("box-a", tags="device")
+    mm.set_recovery("box-a", "alpha", "beta")
+    alpha, beta, gamma = make(env, "alpha"), _second_project(env, "beta"), _second_project(env, "gamma")
+    _resources(alpha, "Machines: box-a")
+    _resources(beta, "We also run on box-a, read only.")
+    _resources(gamma, "Machines: box-ab")
+    beta.db.set_kv(PAUSED_RESOURCES_KEY, {"box-a-device": {"reason": "firmware", "since": time.time(), "by": "user",
+                                                           "until": time.time() + 3600}})
+    sched.upsert(alpha.db, "box-a-up", "command", "5m", payload={"heal": {"check": "ssh box-a true", "outage": True}})
+    ml.add_change("box-a", "drop-in for the broker", "rm the drop-in", "alpha", expires="1d")
+    db_files = {n: (q.base / "state" / "project.db").stat().st_mtime_ns for n, q in
+                (("alpha", alpha), ("beta", beta), ("gamma", gamma))}
+    main(["machines", "status", "box-a"])
+    out = capsys.readouterr().out
+    assert "projects: alpha, beta" in out and "gamma" not in out
+    assert "recovery owner: alpha, fallback beta" in out
+    assert "paused: box-a-device by beta (firmware); ends" in out
+    assert "change: " in out and "drop-in for the broker" in out
+    assert "heal check alpha/box-a-up: not checked yet" in out
+    main(["machines", "status", "--json"])
+    view = json.loads(capsys.readouterr().out)
+    assert [r["alias"] for r in view] == ["box-a"] and view[0]["projects"] == ["alpha", "beta"]
+    assert {n: (q.base / "state" / "project.db").stat().st_mtime_ns for n, q in
+            (("alpha", alpha), ("beta", beta), ("gamma", gamma))} == db_files, "read only"
+
+
+def test_heal_check_reports_its_machine_down_or_held_to_the_ledger_and_clears_it(env):
+    from ttp import heal
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    mm.add("box-a", tags="device")
+    p, d, up = _heal_setup(env, machine="box-a", fix=None, grace_s=600)
+    spec = _heal_spec(p)
+    assert heal.machine_of(spec) == "box-a"
+    now = time.time()
+    heal.run(d, "svc", spec, now)
+    c = ml.conditions()["box-a:down"]
+    assert c["seen_by"] == ["demo"] and c["grace_s"] == 600 and "heal check svc" in c["text"]
+    up.touch()
+    heal.run(d, "svc", spec, now + 60)
+    assert ml.conditions() == {} and "machine_reported" not in heal.state(p.db, "svc")
+    # A known fault on a non-outage check is not reported; an unknown result only past the outage window.
+    with pytest.raises(ValueError, match="condition"):
+        heal.validate({"check": "true", "condition": "gone"})
+    assert heal.machine_of(heal.validate({"check": "x", "resource": "box-a-device"})) is None
+    assert heal.machine_of(heal.validate({"check": "x", "resource": "box-a-device", "outage": True})) == "box-a"
+    up.unlink()
+    quiet = heal.validate({"check": f"test -e {up}", "machine": "box-a", "known_fault": "vendor bug"})
+    heal.run(d, "svc", quiet, now + 120)
+    assert ml.conditions() == {}
+    dark = heal.validate({"check": "exit 75", "machine": "box-a", "outage": True, "grace_s": 600})
+    heal.run(d, "svc", dark, now + 180)
+    assert ml.conditions() == {}
+    heal.run(d, "svc", dark, now + 180 + 600)
+    assert ml.conditions()["box-a:down"]["grace_s"] == 0
+
+
+def test_heal_broker_check_reports_held_and_not_a_missing_auto_recovery(env, tmp_path):
+    from ttp import heal
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    mm.add("box-a", tags="device")
+    out = tmp_path / "status.json"
+    p, d, _ = _heal_setup(env)
+    spec = heal.validate({"preset": "broker", "status_command": f"cat {out}", "resource": "box-a-device",
+                          "grace_s": 0})
+    out.write_text(json.dumps({"held": False, "auto_power_cycle": False, "auto_reboot": True}))
+    heal.run(d, "svc", spec, time.time())
+    assert ml.conditions() == {}, "automatic recovery off is not a held or down machine"
+    out.write_text(json.dumps({"held": True, "auto_power_cycle": True, "auto_reboot": True}))
+    heal.run(d, "svc", spec, time.time())
+    assert list(ml.conditions()) == ["box-a:held"]
+    out.write_text(json.dumps({"held": False, "auto_power_cycle": True, "auto_reboot": True}))
+    heal.run(d, "svc", spec, time.time())
+    assert ml.conditions() == {}

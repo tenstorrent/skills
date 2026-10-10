@@ -33,3 +33,6 @@ Created {{DATE}}. The coordinator keeps this file current; the user's words win 
 
 Machines this project may use (aliases from `ttp machines list`; the coordinator routes work
 only to these): (none stated yet)
+
+Responsibilities (what this project keeps running: machines, device runners, tunnels, watchers;
+each gets a heal check naming it, and `ttp status` shows the coverage): (none stated yet)

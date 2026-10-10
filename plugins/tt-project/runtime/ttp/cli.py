@@ -743,6 +743,8 @@ def status_text(p: Project) -> str:
         lines.append(h["schedules_waiting"])
     if h.get("health"):
         lines.append(h["health"])
+    if h.get("coverage"):
+        lines.append(h["coverage"])
     from . import screen as scr
     for m in scr.mutes(db, now):
         lines.append(f"muted: {scr.mute_line(m, now)}")
@@ -2195,6 +2197,16 @@ def cmd_machines(a) -> None:
     from . import machines as mm
     if a.action == "change":
         return _machine_change(a)
+    if a.action == "status":
+        from . import responsibilities
+        view = responsibilities.machine_status(a.alias)
+        if a.json:
+            print(json.dumps(view, indent=2, sort_keys=True))
+        elif not view:
+            print(f"no machines in {mm.path()} (ttp machines add <alias>)")
+        for rec in ([] if a.json else view):
+            print("\n".join(responsibilities.machine_lines(rec)))
+        return
     if a.action == "set":
         a.action = "add"
     if a.action == "add":
@@ -3548,7 +3560,7 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--project", help="the project (default: the one this folder or run belongs to)")
     s.set_defaults(fn=cmd_heal)
 
-    s = sub.add_parser("machines", help="your machines, shared by all your projects (add/list/remove/push)")
+    s = sub.add_parser("machines", help="your machines, shared by all your projects (add/list/status/remove/push)")
     ms = s.add_subparsers(dest="action", required=True)
     m = ms.add_parser("add", aliases=["set"], help="add a machine, or change its tags, note or recovery owner")
     m.add_argument("alias", help="a short name, also used as the resource name in tasks (e.g. box-a)")
@@ -3567,6 +3579,10 @@ def main(argv: list[str] | None = None) -> None:
     m.add_argument("--owner", help="the project that recovers it when it stays down or held (\"\" = none)")
     m.add_argument("--fallback", help="the project that takes over when the owner cannot act (\"\" = none)")
     m = ms.add_parser("list", help="list your machines")
+    m.add_argument("--json", action="store_true")
+    m = ms.add_parser("status", help="per machine: the projects using it, its recovery owner, pauses, open changes, "
+                                     "heal checks and problems in 24 h (read only)")
+    m.add_argument("alias", nargs="?", help="only this machine")
     m.add_argument("--json", action="store_true")
     m = ms.add_parser("remove", help="remove a machine")
     m.add_argument("alias")
