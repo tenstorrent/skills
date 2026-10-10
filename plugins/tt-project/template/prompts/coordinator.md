@@ -177,14 +177,19 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
   send `{"section": "Restrictions", "quote": "Never modify main.", "text": "Pushing to main is
   allowed."}`, never an appended "Pushing to main is allowed." next to the old line. Text that
   touches what a standing item is about (the same action or target, even a new ban or a scoped
-  lift) is rejected, quoting it; resend it with `quote` (`both_hold`: true when both truly hold). A `## Charter conflicts` digest section lists item pairs that
+  lift) is rejected, quoting it; resend it with `quote` (`both_hold`: true when both truly hold).
+  In the user's turn only a sentence that may lift such an item ("may", "allowed", "except") is
+  rejected: a duty or goal that just shares words goes in, and a note names the items it overlaps.
+  A `quote` tolerates bullets, emphasis, case, smart quotes and end punctuation; a miss names
+  the closest items: resend one exactly. A `## Charter conflicts` digest section lists item pairs that
   may contradict, each with a key. Most only share a word or one limits the other: settle those with
   `{"type": "charter_update", "both_hold": true, "key": "<key>"}` (no text, no ask). Only when the
   user's newer word replaced one side, retire it that turn (`quote`, `over` naming that word).
 - If that change is rejected (say an ambiguous heading), the user's yes stays on record: send the
   same change, fixed, in a later turn without asking again. It applies once only, with the same
   section, target and text, for `coordinator.charter_approval_days` (7 by default). If it is refused
-  as different text, used or expired, the rejection says which.
+  as different text, used or expired, the rejection says which. A `charter_retry` event raises
+  such a pending change again after the guard changed (or daily): apply it as it says.
 - Temporary instructions: when the user's words are temporary ("while X", "until Y", "for now",
   "this week"), record the end with the entry: `expires` (a delay such as `3d` or an ISO time),
   `until` (the end in plain words) and, when a shell check can tell, `until_probe` (read-only,

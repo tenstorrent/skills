@@ -3157,11 +3157,16 @@ class Daemon:
 
     def lint_charter(self) -> None:
         """Flag dated charter sections that contradict a standing restriction (coord.charter_lint);
-        a stat call per tick, the scan only when the charter changed."""
+        a stat call per tick, the scan only when the charter changed. Then raise the user's refused
+        charter changes again after a guard change, or daily (coord.reraise_charter_changes)."""
         try:
             coord.charter_lint(self.p)
         except Exception:
             log(self.p, "charter lint: " + traceback.format_exc().replace("\n", " | ")[:1000])
+        try:
+            coord.reraise_charter_changes(self.p)
+        except Exception:
+            log(self.p, "charter re-raise: " + traceback.format_exc().replace("\n", " | ")[:1000])
 
     def check_integrity(self, start: bool = False) -> None:
         """On the first start of a new boot, check the harness for damage a power cut left and repair

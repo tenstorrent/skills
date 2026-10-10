@@ -174,7 +174,7 @@ EFFORT_EVENT_TRIGGERS = {
     "pr_unapproved_ready": "costly", "after_push_failed": "costly", "push_batch_died": "costly",
     "push_tip_failed": "costly",
     # conflicting instructions: an appended rule a standing Restrictions item would override
-    "charter_conflict": "conflict",
+    "charter_conflict": "conflict", "charter_retry": "conflict",
 }
 UNBLOCK_KINDS = frozenset(EFFORT_EVENT_TRIGGERS)
 EFFORT_SEVERITIES = ("high", "critical")   # an event or alert this severe is never routine
@@ -1079,10 +1079,14 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     refused = (quote and _DATED.sub("", section).lower().startswith("restriction")
                                and not (user_turn or ok or len(over) >= OVER_MIN))
                     if text and not (replaces or a.get("both_hold") or refused):
-                        _reject_contradicting_append(p, section, text, user_turn, messages, ok, quote)
+                        overlap = _reject_contradicting_append(p, section, text, user_turn, messages, ok, quote, end)
+                        if overlap:
+                            notes.append(overlap)
+                    source = _users_own(db, messages or []) if user_turn else list((ok or {}).get("messages") or [])
                     try:
                         target, extra, retired = _charter_update(p, section, text, quote, replaces, key,
-                                                                 user_turn or ok is not None, over, end, no_ok)
+                                                                 user_turn or ok is not None, over, end, no_ok,
+                                                                 source)
                     except ValueError as e:
                         if user_turn:
                             _record_charter_approval(p, messages or [], section, quote, replaces, text, end, str(e))
@@ -2195,43 +2199,69 @@ def charter_conflict_lines(pairs: list[dict]) -> list[str]:
                f"({x['allow_section']})" for x in pairs])
 
 
-def _append_conflicts(charter: str, section: str, text: str, quote: str = "") -> list[tuple[str, str]]:
+def _append_conflicts(charter: str, section: str, text: str, quote: str = "",
+                      lifts_only: bool = False) -> list[tuple[str, str]]:
     """The standing Restrictions items that text added to Restrictions (dated or temporary too), Goals
     or Policies is about, as (item, its section): every item one of its sentences overlaps
     (_overlaps), whatever either one says about it (a lift, a new ban, a condition, a scope). An item
     the text replaces (`quote`) or that names its own exception (_OWN_EXCEPTION_RE) is left out. A
     false hit costs one resend (`quote`, or `both_hold`); a miss leaves a stale ban standing, and
-    workers obey it."""
+    workers obey it. `lifts_only`: only sentences that may permit or loosen something (_may_lift)."""
     if not _DATED.sub("", section).lower().startswith(("restriction", "goal", "polic")):
         return []
-    new, gone = _sentences(text.splitlines()), " ".join(quote.split())
+    new, gone = _sentences(text.splitlines()), _loose(quote)
+    if lifts_only:
+        new = [x for x in new if _may_lift(x)]
     out: list[tuple[str, str]] = []
     for item, sec, _ in _restriction_items(charter):
-        if ((item, sec) not in out and not (gone and " ".join(item.split()) in gone)
+        if ((item, sec) not in out and not (gone and _loose(item) in gone)
                 and not _OWN_EXCEPTION_RE.search(item) and any(_overlaps(item, s) for s in new)):
             out.append((item, sec))
     return out
 
 
+def _may_lift(sentence: str) -> bool:
+    """Whether a sentence has a word that permits or loosens ("may", "allowed", "except", "no
+    longer"): it may lift a ban it overlaps. A duty, a goal or a new ban has none."""
+    return bool(_PERMIT_RE.search(sentence) or _LOOSEN_RE.search(sentence))
+
+
+GUARD_REJECTED = "the old Restrictions item it contradicts still stood"   # _record_charter_approval `failed`
+
+
 def _reject_contradicting_append(p: Project, section: str, text: str, user_turn: bool,
-                                 messages: list[int] | None, ok: dict | None, quote: str = "") -> None:
+                                 messages: list[int] | None, ok: dict | None, quote: str = "",
+                                 end: dict | None = None) -> str:
     """Refuse a charter_update that adds `text` (appended, or in place of `quote`) while a Restrictions
     item it is about would stay standing (_append_conflicts): workers obey that item as binding, so the
-    change may do nothing. The rejection quotes the item. When the user's word is behind the change (this turn's
-    messages, or the approval it already carried), that word is recorded for the quoted resend of
-    each item (_record_charter_approval), so the fix goes through in a later turn without asking
-    again. Text already in the charter (a retried turn) passes."""
+    change may do nothing. The rejection quotes the item. With the user's word behind the change (a
+    user turn, or the approval it already carried) only a sentence that may lift what an item bans
+    (_may_lift) is refused: any other overlap is a duty, a goal or a ban added next to the item, both
+    hold, and the change goes through; the returned note names the items judged to overlap. A refused
+    change of the user's is recorded (_record_charter_approval), as sent and as the quoted resend of
+    each item, so the fix goes through in a later turn without asking again, and the daemon raises it
+    again when the guard changes (reraise_charter_changes). Text already in the charter (a retried
+    turn) passes. Returns the note, or ""."""
     charter = p.charter_path.read_text()
     if " ".join(text.split()) in " ".join(charter.split()):
-        return
+        return ""
     hits = _append_conflicts(charter, section, text, quote)
     if not hits:
-        return
+        return ""
     said = list(messages or []) if user_turn else list((ok or {}).get("messages") or [])
+    if user_turn or ok is not None:
+        lifts = _append_conflicts(charter, section, text, quote, lifts_only=True)
+        if not lifts:
+            return (f"charter_update: {clip(text, 120)!r} went in on the user's word, taken as holding alongside "
+                    "the Restrictions item " + "; ".join(f"\"{clip(i, 160)}\"" for i, _ in hits)
+                    + " (it only shares words with them; workers obey both). If the user changed one of them, "
+                      "charter_update its section with `quote` set to it")
+        hits = lifts
+    if user_turn:
+        _record_charter_approval(p, said, section, quote, "", text, end, "the charter guard: " + GUARD_REJECTED)
     for item, sec in hits:
         for name in dict.fromkeys([sec, _DATED.sub("", sec)]):
-            _record_charter_approval(p, said, name, item, "", text, None,
-                                     "the old Restrictions item it contradicts still stood")
+            _record_charter_approval(p, said, name, item, "", text, None, GUARD_REJECTED)
     first = hits[0]
     raise ValueError(
         f"charter_update: {clip(text, 200)!r} contradicts the Restrictions item "
@@ -2292,6 +2322,15 @@ def _ws(text: str) -> str:
     return " ".join(text.split())
 
 
+def _users_own(db, messages: list[int]) -> list[int]:
+    """The ids among `messages` of the user's own messages: none the harness posted (provenance system)."""
+    if not messages:
+        return []
+    rows = db.q(f"SELECT id, provenance FROM messages WHERE id IN ({','.join('?' * len(messages))}) "
+                f"AND direction='in' AND kind='user'", list(messages))
+    return [r["id"] for r in rows if (r["provenance"] or "") != "system"]
+
+
 def _record_charter_approval(p: Project, messages: list[int], section: str, quote: str, replaces: str,
                              text: str, end: dict | None, failed: str = "") -> None:
     """Record a charter change the user's turn asked for that failed to apply (an ambiguous heading,
@@ -2301,9 +2340,7 @@ def _record_charter_approval(p: Project, messages: list[int], section: str, quot
     if end or not messages:
         return
     db = p.db
-    rows = db.q(f"SELECT id, provenance FROM messages WHERE id IN ({','.join('?' * len(messages))}) "
-                f"AND direction='in' AND kind='user'", list(messages))
-    said = [r["id"] for r in rows if (r["provenance"] or "") != "system"]
+    said = _users_own(db, messages)
     if not said:
         return
     from .prompts import charter_sections
@@ -2343,14 +2380,19 @@ def _charter_approval(p: Project, section: str, quote: str, replaces: str, text:
     hits = _replaces_hits(sections, replaces) if replaces else []
     now_name = " ".join(sections[hits[0]][0][3:].split()) if len(hits) == 1 else None
     why, found = "No approval of the user's is on record for this change (same section and quote or replaces)", ""
+    sha = hashlib.sha256(_ws(text).encode()).hexdigest()
     for rec in reversed(have):   # newest first; a refusal says why the newest one for this target fails
-        if rec["section"] != _ws(section).lower() or rec["quote"] != _ws(quote):
+        # Adding the very text the user approved removes nothing: it matches in any section (a change
+        # the old guard refused was recorded under the item it named, see reraise_charter_changes).
+        appends = text and not quote and not replaces and rec["sha"] == sha
+        if not appends and (rec["section"] != _ws(section).lower() or rec["quote"] != _ws(quote)):
             continue
-        if (rec["replaces"] or replaces) and not (rec["replaces"].lower() == _ws(replaces.lstrip("#")).lower()
-                                                 or now_name is not None and now_name in rec["candidates"]):
+        if not appends and (rec["replaces"] or replaces) and not (
+                rec["replaces"].lower() == _ws(replaces.lstrip("#")).lower()
+                or now_name is not None and now_name in rec["candidates"]):
             continue
         ids = ", #".join(map(str, rec["messages"]))
-        if rec["sha"] != hashlib.sha256(_ws(text).encode()).hexdigest():
+        if rec["sha"] != sha:
             found = found or (f"The user's yes in message #{ids} was for other text: "
                               f"{clip(_ws(rec['text']), 300)!r}; send that text exactly, or ask again for this one")
         elif rec.get("used"):
@@ -2363,12 +2405,78 @@ def _charter_approval(p: Project, section: str, quote: str, replaces: str, text:
 
 
 def _use_charter_approval(p: Project, rid: str, key: str | None) -> None:
+    """Mark an approval used, with the other records of the same change (the same text from the same
+    messages: as sent and as the quoted resend of each item the guard named): one yes, one use."""
     with p.db.tx():
         have = p.db.kv(CHARTER_APPROVALS_KEY, []) or []
+        mine = next((r for r in have if r.get("id") == rid), None)
         for rec in have:
-            if rec.get("id") == rid:
+            if mine and rec.get("sha") == mine.get("sha") and rec.get("messages") == mine.get("messages") \
+                    and not rec.get("used"):
                 rec["used"] = {"ts": time.time(), "turn": key}
         p.db.set_kv(CHARTER_APPROVALS_KEY, have)
+
+
+# Raise this when the charter_update guard changes what it lets through: each project's daemon then
+# raises the user's pending changes the guard refused again (reraise_charter_changes).
+CHARTER_GUARD_VERSION = 2
+CHARTER_RERAISE_KEY = "charter_reraise"   # kv: {"version", "ts"} of the last re-raise
+
+
+def reraise_charter_changes(p: Project, now: float | None = None) -> list[str]:
+    """Raise the user's charter changes that failed and are still pending (recorded by
+    _record_charter_approval, unused, unexpired, not in the charter yet) to the coordinator again, as
+    queued charter_retry events, once the guard changed (CHARTER_GUARD_VERSION) and else once a
+    day. The user's word stays on record, so the resend goes through without asking. A change
+    the guard refused as contradicting an item is raised as the addition the user asked for
+    (any section takes it, see _charter_approval), never as a replacement of that item. No model.
+    Returns the new events' texts."""
+    now = time.time() if now is None else now
+    db = p.db
+    state = db.kv(CHARTER_RERAISE_KEY) or {}
+    if state.get("version") == CHARTER_GUARD_VERSION and now - float(state.get("ts") or 0) < 86400:
+        return []
+    db.set_kv(CHARTER_RERAISE_KEY, {"version": CHARTER_GUARD_VERSION, "ts": now})
+    try:
+        days = float(p.config()["coordinator"].get("charter_approval_days", CHARTER_APPROVAL_DAYS))
+    except (KeyError, TypeError, ValueError):
+        days = CHARTER_APPROVAL_DAYS
+    try:
+        charter = _ws(p.charter_path.read_text())
+    except OSError:
+        return []
+    groups: dict[str, list[dict]] = {}
+    for rec in db.kv(CHARTER_APPROVALS_KEY, []) or []:
+        if not rec.get("used") and rec.get("failed") and now - float(rec.get("ts") or 0) <= days * 86400:
+            groups.setdefault(rec["sha"], []).append(rec)
+    out = []
+    for recs in groups.values():
+        # the change as sent, else (refused by an older guard) one of the items it was said to contradict
+        rec = next((r for r in recs if r["failed"] != GUARD_REJECTED), recs[0])
+        text = _ws(rec["text"])
+        if text and text in charter or not text and rec["quote"] and rec["quote"] not in charter:
+            continue   # it landed meanwhile
+        ids = ", #".join(map(str, rec["messages"]))
+        when = datetime.fromtimestamp(float(rec["ts"])).strftime("%Y-%m-%d")
+        if rec["failed"] == GUARD_REJECTED:
+            how = (f"charter_update with `text` {rec['text'].strip()!r} in the section it belongs to (Goals, "
+                   f"Policies or Restrictions), no `quote`: an addition that only shares words with Restrictions "
+                   f"items now goes in. `quote` an item only if the user changed it: "
+                   + "; ".join(f"\"{clip(r['quote'], 200)}\"" for r in recs if r["quote"]))
+        else:
+            how = (f"charter_update section {rec['section']!r}"
+                   + (f", `quote` {rec['quote']!r}" if rec["quote"] else "")
+                   + (f", `replaces` {rec['replaces']!r}" if rec["replaces"] else "")
+                   + f", `text` {rec['text'].strip()!r}")
+        msg = (f"Pending charter change from the user's message #{ids}, refused on {when} ({clip(rec['failed'], 200)}). "
+               f"The charter guard changed since, or a day passed: apply it now with {how}. The user's word is on "
+               f"record; no ask. If the user has since said otherwise, leave it.")
+        if db.one("SELECT 1 FROM events WHERE kind='charter_retry' AND status='queued' AND text=?", (msg,)):
+            continue
+        db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+             (now, "harness", "charter_retry", "normal", msg, "queued"))
+        out.append(msg)
+    return out
 
 
 _DATED = re.compile(r"\s*\(added [^)]*\)$", re.I)   # legacy "## Policies (added 2026-09-30, turn 4.0)"
@@ -2376,7 +2484,7 @@ _DATED = re.compile(r"\s*\(added [^)]*\)$", re.I)   # legacy "## Policies (added
 
 def _charter_update(p: Project, section: str, text: str, quote: str, replaces: str, key: str | None,
                     user_turn: bool, over: str = "", end: dict | None = None,
-                    no_approval: str = "") -> tuple[str, str, str]:
+                    no_approval: str = "", source: list[int] | None = None) -> tuple[str, str, str]:
     """Apply one charter_update: retire the section `replaces` names, then edit the one section
     `section` names. With `quote`, the single span of that section matching it is replaced by
     `text` (or removed when `text` is empty); otherwise `text` is added at the section's end, and
@@ -2388,11 +2496,14 @@ def _charter_update(p: Project, section: str, text: str, quote: str, replaces: s
     user's covered it). A restriction the user's word changes or lifts (`quote` or `replaces`)
     also merges every permanent Restrictions section into one block (_merge_restrictions).
     Returns the edited section's name, a note for the commit message and, when `over` retired a
-    restriction, what it retired (else "")."""
+    restriction, what it retired (else ""). `source`: the user's messages the change came from,
+    named in CHARTER_HISTORY."""
     from .prompts import charter_sections
     sections = charter_sections(p.charter_path.read_text())
     hist = p.harness / CHARTER_HISTORY
     stamp = time.strftime("%Y-%m-%d") + (f", turn {key}" if key else "")
+    said = f", user message #{', #'.join(map(str, source))}" if source else ""
+    logged = time.strftime("%Y-%m-%d") + said + (f", turn {key}" if key else "")   # ends ", turn <key>)" too
     log: list[str] = []
     # Logged by an earlier try of this turn: write the charter only if that try died before it did.
     retried = bool(key) and _has_line(hist, f", turn {key})")
@@ -2418,7 +2529,7 @@ def _charter_update(p: Project, section: str, text: str, quote: str, replaces: s
             retired = f"section \"{name}\""
         lifted = user_turn and name.lower().startswith("restriction")
         del sections[i]
-        log.append(f"{old_head}\n(replaced by an update to {section}, {stamp}" + (f"; over: {over}" if over else "")
+        log.append(f"{old_head}\n(replaced by an update to {section}, {logged}" + (f"; over: {over}" if over else "")
                    + ")\n" + "\n".join(old_body).strip("\n"))
         extra = f" (replaces {name})"
     names = [" ".join(h[3:].split()) for h, _ in sections]
@@ -2434,13 +2545,16 @@ def _charter_update(p: Project, section: str, text: str, quote: str, replaces: s
             raise ValueError(f"charter_update: removing or replacing a restriction {why}")
         body = "\n".join(sections[t][1])
         if len(hits) != 1:
+            near = _closest_items(sections, quote) if not hits else []
             raise ValueError(f"charter_update: `quote` matches {len(hits)} times in {names[t]!r}; quote the exact "
-                             f"text of one item, long enough to be unique there")
+                             f"text of one item, long enough to be unique there"
+                             + ("; closest: " + "; ".join(f"\"{clip(i, 800)}\" (section {n!r})" for i, n in near)
+                                + ": resend one of them exactly as `quote`, with its section" if near else ""))
         s, e = hits[0].span()
         if names[t].lower().startswith("restriction") and not user_turn:
             retired = f"\"{clip(' '.join(body[s:e].split()), 200)}\""
         lifted = user_turn and names[t].lower().startswith("restriction")
-        log.append(f"### {'Replaced in' if text else 'Removed from'} {names[t]} ({stamp})\n{body[s:e]}"
+        log.append(f"### {'Replaced in' if text else 'Removed from'} {names[t]} ({logged})\n{body[s:e]}"
                    + (f"\nNow: {text}" if text else "") + (f"\nOver: {over}" if over and not user_turn else ""))
         sections[t] = (sections[t][0], _cut(body, s, e, text).split("\n"))
     elif text and end:
@@ -2451,7 +2565,7 @@ def _charter_update(p: Project, section: str, text: str, quote: str, replaces: s
             heading, n = f"## {name} (added {stamp}, {n})", n + 1   # unique, so `replaces` can name it
         sections.append((heading, (text + ends.charter_tail(end)).split("\n")))
         t, names = len(sections) - 1, names + [heading[3:]]
-        log.append(f"### Added to {names[t]} ({stamp})\n{text}{ends.charter_tail(end)}")
+        log.append(f"### Added to {names[t]} ({logged})\n{text}{ends.charter_tail(end)}")
     elif text:
         if t is None:
             name = _DATED.sub("", section)
@@ -2463,7 +2577,7 @@ def _charter_update(p: Project, section: str, text: str, quote: str, replaces: s
             body.pop()
         bullets = bool(body) and body[-1].lstrip().startswith("- ") and text.startswith("- ")
         sections[t] = (sections[t][0], body + ([] if bullets or not body else [""]) + text.split("\n"))
-        log.append(f"### Added to {names[t]} ({stamp})\n{text}")
+        log.append(f"### Added to {names[t]} ({logged})\n{text}")
     if lifted:
         target = sections[t][0] if t is not None else None
         sections = _merge_restrictions(sections, log, stamp)
@@ -2629,13 +2743,75 @@ def _charter_quote_spot(sections: list[tuple[str, list[str]]], t: int, section: 
 def _quote_hits(body: str, quote: str) -> list[re.Match]:
     """Where `quote` occurs in `body`, line breaks and runs of spaces counting as one space. A quote
     that starts or ends with a letter or digit matches only whole words there ("ever merge." does
-    not match inside "Never merge.")."""
+    not match inside "Never merge."). A quote found nowhere that way is matched tolerantly
+    (_loose_quote_hits)."""
     words = quote.split()
     if not words:
         return []
     pat = r"\s+".join(map(re.escape, words))
     pat = (r"(?<!\w)" if re.match(r"\w", words[0]) else "") + pat + (r"(?!\w)" if re.search(r"\w$", words[-1]) else "")
-    return list(re.finditer(pat, body))
+    return list(re.finditer(pat, body)) or _loose_quote_hits(body, quote)
+
+
+_EMPH = "*_`"   # markdown emphasis and code marks
+_SMART = str.maketrans({"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"'})
+_QUOTE_CLASS = {"'": "['\u2018\u2019]", '"': '["\u201c\u201d]'}
+_BULLET = r"(?:[-*+]|\d+[.)])\s+"
+
+
+def _loose_quote_hits(body: str, quote: str) -> list[re.Match]:
+    """Where `quote` occurs in `body` ignoring case, a leading bullet marker, markdown emphasis
+    around words, the bullet markers between items, smart or straight quotes and its trailing
+    punctuation (taken along when the item has it). Whole words only, as in _quote_hits."""
+    q = re.sub(r"^\s*" + _BULLET, "", quote.translate(_SMART))
+    words = [w.strip(_EMPH) for w in q.split()]
+    words = [w for w in words if w]
+    if words:
+        words[-1] = words[-1].rstrip(".,;:!?" + _EMPH)
+    words = [w for w in words if w]
+    if not words:
+        return []
+    emph = f"[{re.escape(_EMPH)}]*"
+
+    def word(w: str) -> str:   # emphasis may also close before a word's punctuation ("**first**,")
+        lead, core, trail = re.fullmatch(r"(\W*)(.*?)(\W*)", w).groups()
+        return emph.join("".join(_QUOTE_CLASS.get(c, re.escape(c)) for c in x) for x in (lead, core, trail) if x)
+    pat = (emph + r"\s+(?:" + _BULLET + ")?" + emph).join(map(word, words))
+    head = rf"(?<![\w{re.escape(_EMPH)}])" + emph if re.match(r"\w", words[0]) else ""
+    tail = (r"(?!\w)" if re.search(r"\w$", words[-1]) else "") + emph + r"[.,;:!?]?" + emph
+    return list(re.finditer(head + pat + tail, body, re.I))
+
+
+def _loose(text: str) -> str:
+    """Text compared loosely: straight quotes, no emphasis marks, bullets or trailing punctuation,
+    single spaces, lower case."""
+    t = text.translate(_SMART)
+    t = re.sub(r"(?m)^\s*" + _BULLET, "", t)
+    t = t.translate(str.maketrans("", "", _EMPH))
+    return " ".join(t.split()).rstrip(".,;:!? ").lower()
+
+
+def _closest_items(sections: list[tuple[str, list[str]]], quote: str, n: int = 2) -> list[tuple[str, str]]:
+    """The charter items (bullets, paragraphs and their sentences; not the Brief) most like `quote`,
+    as (item, section), best first, at most `n`, none below a 0.4 similarity."""
+    from difflib import SequenceMatcher
+    want, scored = _loose(quote), {}
+    for heading, body in sections:
+        name = " ".join(heading[3:].split())
+        if not name or name.lower().startswith("brief"):
+            continue
+        cur: list[str] = []
+        for line in body + [""]:
+            if (re.match(r"\s*" + _BULLET, line) or not line.strip()) and cur:
+                par = " ".join(" ".join(cur).split())
+                for item in dict.fromkeys([re.sub("^" + _BULLET, "", par), *_sentences([par])]):
+                    r = SequenceMatcher(None, want, _loose(item)).ratio()
+                    if r >= 0.4 and r > scored.get((item, name), 0):
+                        scored[(item, name)] = r
+                cur = []
+            if line.strip():
+                cur.append(line.strip())
+    return sorted(scored, key=lambda k: -scored[k])[:n]
 
 
 def _cut(body: str, s: int, e: int, text: str) -> str:

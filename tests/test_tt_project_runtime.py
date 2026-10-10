@@ -4944,7 +4944,7 @@ def test_an_append_that_contradicts_a_standing_restriction_is_rejected_quoting_i
             ({"section": "Restrictions", "text": "Never push to the main branch, except hotfixes."}, False),
             ({"section": "Policies", "text": "Never push to the main branch without review, but hotfixes may "
                                              "be pushed to it."}, False),
-            ({"section": "Restrictions", "text": "Never push to the main branch on release days."}, True),
+            ({"section": "Restrictions", "text": "Never push to the main branch on release days."}, False),
             ({"section": "Policies", "text": "Workers may never push to the main branch."}, False),
             ({"section": "Policies", "text": "Workers may not push to the main branch."}, False),
             ({"section": "Goals", "text": "Pushing to the main branch is not allowed."}, False))):
@@ -5018,6 +5018,134 @@ def test_an_append_that_contradicts_a_standing_restriction_is_rejected_quoting_i
     err = coord.apply(p, [{"type": "charter_update", "section": "Policies",
                            "text": "Workers may push to the main branch for hotfixes."}], turn=60, user_turn=True)
     assert "two equal fixes" in err[0] and "Never drop a restriction the user did not change" in err[0], err
+
+_SELF_HEALING = ("Self-healing (prime directive): keep the project stable without the user. Keep checking "
+                 "everything the project is responsible for (its workers, daemon, schedules, watchers and the "
+                 "resources it manages) for anomalies, such as a dead worker, a disabled auto power cycle or a hold "
+                 "that never recovers. Fix them yourself and report afterwards; each fix keeps the test suite green "
+                 "and is pushed to the work branch after review, like any change. Questions like 'a worker is "
+                 "dead, what should I do?' never reach the user.")
+_BANS = ("# demo\n\n## Restrictions\n- Push only to branch work/x of the repo. Never push to main.\n"
+         "- Every change keeps the test suite green and the plugin validator passing.\n"
+         "- Never disturb the other project's running jobs.\n- Never use a paused device.\n\n## Policies\nReview first.\n")
+
+
+def test_a_user_turn_duty_that_shares_words_with_bans_goes_in_with_its_source(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    db = p.db
+    add = {"type": "charter_update", "section": "Policies", "text": _SELF_HEALING}
+    # (b) Outside a user turn the same text is still refused, quoting the bans it shares words with.
+    p.charter_path.write_text(_BANS)
+    err = coord.apply(p, [add], turn=1)
+    assert len(err) == 1 and "contradicts the Restrictions item" in err[0], err
+    assert p.charter_path.read_text() == _BANS
+    # (a) In the user's turn it goes in: it adds a duty and loosens nothing. Its source (the user's
+    # message) is in the charter history, and the coordinator is told which items it overlaps.
+    said = db.post("in", "new prime directive: self-healing ...", chat=None, channel="web", kind="user",
+                   provenance="web-session")
+    assert coord.apply(p, [add], turn=2, user_turn=True, messages=[said]) == []
+    charter = p.charter_path.read_text()
+    assert _SELF_HEALING in charter and "Never use a paused device." in charter and "Never push to main." in charter
+    hist = (p.harness / coord.CHARTER_HISTORY).read_text()
+    assert f"### Added to Policies (" in hist and f", user message #{said}, turn 2.0)\n{_SELF_HEALING}" in hist, hist
+    note = " ".join(db.kv(coord.NOTES_KEY) or [])
+    assert "went in on the user's word" in note and "Never use a paused device." in note, note
+    # A retried turn adds it once.
+    assert coord.apply(p, [add], turn=2, user_turn=True, messages=[said]) == []
+    assert p.charter_path.read_text().count("Self-healing (prime directive)") == 1
+    # A user-turn sentence that may lift a ban it overlaps is still refused, so the ban gets quoted.
+    p.charter_path.write_text(_BANS)
+    lift = {"type": "charter_update", "section": "Policies", "text": "Workers may push to main for hotfixes."}
+    err = coord.apply(p, [lift], turn=3, user_turn=True, messages=[said])
+    assert len(err) == 1 and "\"Never push to main.\"" in err[0] and "user's yes is on record" in err[0], err
+    assert "Every change keeps" not in err[0], "only the items the lifting sentence overlaps are named"
+
+
+def test_a_user_turn_loosening_via_quote_still_replaces_the_ban(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    db = p.db
+    p.charter_path.write_text(_BANS)
+    said = db.post("in", "you may now use the paused device", chat=None, channel="web", kind="user",
+                   provenance="web-session")
+    act = {"type": "charter_update", "section": "Restrictions", "quote": "Never use a paused device.",
+           "text": "Use the device even when paused, for short jobs."}
+    assert coord.apply(p, [act], turn=1) and "Never use a paused device." in p.charter_path.read_text()
+    assert coord.apply(p, [act], turn=2, user_turn=True, messages=[said]) == []
+    charter = p.charter_path.read_text()
+    assert "Never use a paused device." not in charter and "Use the device even when paused" in charter
+    hist = (p.harness / coord.CHARTER_HISTORY).read_text()
+    assert f"### Replaced in Restrictions (" in hist and f"user message #{said}, turn 2.0)" in hist, hist
+
+
+def test_charter_quote_matches_tolerantly_and_a_miss_names_the_closest_items(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    p.charter_path.write_text("# demo\n\n## Policies\n- **Review first**, then push.\n- Label every \u201cnumber\u201d.\n"
+                              "- Notify only for decisions.\n\n## Restrictions\n- Never merge.\n")
+    act = {"type": "charter_update", "section": "Policies", "both_hold": True}
+    # Emphasis, a leading bullet, smart quotes, case and trailing punctuation do not stop a match.
+    assert coord.apply(p, [{**act, "quote": "- Review first, then push", "text": "Review, then push."}],
+                       turn=1) == []
+    assert "- Review, then push.\n" in p.charter_path.read_text(), p.charter_path.read_text()
+    assert coord.apply(p, [{**act, "quote": 'label every "number"!', "text": "Label numbers."}], turn=2) == []
+    assert "- Label numbers.\n" in p.charter_path.read_text(), p.charter_path.read_text()
+    assert coord.apply(p, [{**act, "quote": "Notify only for decisions"}], turn=3) == []
+    assert "Notify only" not in p.charter_path.read_text()
+    # Whole words still: no match inside a word.
+    assert "matches 0 times" in coord.apply(p, [{"type": "charter_update", "section": "Restrictions",
+                                                 "quote": "ever merge."}], turn=4, user_turn=True)[0]
+    # A miss names the closest items, in any section, so the next turn can resend one exactly.
+    err = coord.apply(p, [{**act, "quote": "Review, then push to main."}], turn=5)[0]
+    assert "matches 0 times" in err and "closest: \"Review, then push.\" (section 'Policies')" in err, err
+    err = coord.apply(p, [{**act, "quote": "Never merge PRs."}], turn=6)[0]
+    assert "\"Never merge.\" (section 'Restrictions')" in err, err
+    assert "closest" not in coord.apply(p, [{**act, "quote": "Completely unrelated words here."}], turn=7)[0]
+
+
+def test_a_refused_user_charter_change_is_raised_again_after_a_guard_change(env, monkeypatch):
+    p = make(env)
+    from ttp import coordinator as coord
+    db = p.db
+
+    def retries():
+        return [r["text"] for r in db.q("SELECT text FROM events WHERE kind='charter_retry' AND status='queued'")]
+    p.charter_path.write_text(_BANS)
+    said = db.post("in", "new prime directive", chat=None, channel="web", kind="user", provenance="web-session")
+    # What an older guard left on record: the directive refused, kept only as the quoted resend of
+    # each item it was said to contradict.
+    for item in ("Push only to branch work/x of the repo.", "Never push to main."):
+        coord._record_charter_approval(p, [said], "Restrictions", item, "", _SELF_HEALING, None, coord.GUARD_REJECTED)
+    # A failed quote of the user's, kept as sent.
+    coord._record_charter_approval(p, [said], "Policies", "Review first!!", "", "Review twice.", None,
+                                   "charter_update: `quote` matches 0 times in 'Policies'")
+    db.set_kv(coord.CHARTER_RERAISE_KEY, {"version": coord.CHARTER_GUARD_VERSION - 1, "ts": time.time()})
+    out = coord.reraise_charter_changes(p)
+    assert len(out) == 2 and retries() == out, out
+    directive = next(x for x in out if "Self-healing" in x)
+    assert f"message #{said}" in directive and "no `quote`" in directive and "\"Never push to main.\"" in directive
+    assert "charter_retry" in coord.UNBLOCK_KINDS
+    # Not again the same day for the same guard; a day later again, without duplicating a queued one.
+    assert coord.reraise_charter_changes(p) == []
+    assert coord.reraise_charter_changes(p, now=time.time() + 86400 + 60) == [] and len(retries()) == 2
+    # The coordinator's resend, outside a user turn, goes in on the user's word on record, as an
+    # addition in the section it chose, and both bans stay.
+    assert coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": _SELF_HEALING}], turn=9) == []
+    assert coord.apply(p, [{"type": "charter_update", "section": "Policies", "quote": "Review first",
+                            "text": "Review twice."}], turn=10) == []
+    charter = p.charter_path.read_text()
+    assert _SELF_HEALING in charter and "Never push to main." in charter and "Review twice." in charter
+    assert f"user message #{said}, turn 9.0)" in (p.harness / coord.CHARTER_HISTORY).read_text()
+    # Landed or used: never raised again.
+    db.x("DELETE FROM events")
+    db.set_kv(coord.CHARTER_RERAISE_KEY, {"version": 0, "ts": 0})
+    assert coord.reraise_charter_changes(p) == []
+    # Expired approvals are not raised either.
+    coord._record_charter_approval(p, [said], "Goals", "", "", "Ship v2.", None, "x")
+    db.set_kv(coord.CHARTER_RERAISE_KEY, {"version": 0, "ts": 0})
+    assert coord.reraise_charter_changes(p, now=time.time() + 8 * 86400) == []
+
 
 def test_restriction_pairs_flags_contradicting_restrictions_items_and_only_those(env):
     from ttp.coordinator import restriction_pairs, _overlaps
