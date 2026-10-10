@@ -2729,6 +2729,8 @@ class Daemon:
             kind = scr.ERROR if error else receipt
             # One JSON line is one observation, never split at '; ', unless it opts in with "items": true.
             whole = obs.get("json") is True and obs.get("items") is not True
+            if not error and obs.get("machine") and obs.get("condition"):
+                self._machine_condition(obs, body)   # an info line still reaches the machine ledger
             if not error and obs.get("severity") == "info":
                 log(self.p, f"{source} info: {body[:500]}")   # info is logged only, never an issue
                 n += 1
@@ -2736,8 +2738,6 @@ class Daemon:
             self.observe(errors if error else source, body, obs.get("severity"), rewake_after_s=rewake,
                          repeat=obs.get("repeat") is True, lifecycle=kind, whole=whole,
                          key=obs.get("key") if isinstance(obs.get("key"), str) and obs["key"].strip() else None)
-            if not error and obs.get("machine") and obs.get("condition"):
-                self._machine_condition(obs, body)
             if kind == scr.RECEIPT:
                 subjects.update(scr.normalize(subj) for subj, _, cleared in scr.watcher_conditions(source, body, whole) or ()
                                 if not cleared)
