@@ -36795,3 +36795,23 @@ def test_heal_broker_check_reports_held_and_not_a_missing_auto_recovery(env, tmp
     out.write_text(json.dumps({"held": False, "auto_power_cycle": True, "auto_reboot": True}))
     heal.run(d, "svc", spec, time.time())
     assert ml.conditions() == {}
+
+
+def test_responsibility_inventory_counts_a_tunnel_watched_through_its_unit_file_name(env, monkeypatch):
+    from ttp import responsibilities as rs
+    from ttp import schedule as sched
+    from ttp import tunnel
+    p = make(env)
+    monkeypatch.setattr(tunnel, "installed", lambda name, platform=None: {"host": "h", "local": 1, "remote": 2})
+    lab = tunnel.label(p.name)
+
+    def cov():
+        return {(i["kind"], i["name"]): i["covered_by"] for i in rs.inventory(p)}[("tunnel", p.name)]
+    assert cov() == []
+    for unit in (f"{lab}.service", f"{lab}.plist"):
+        sched.upsert(p.db, "tunnel-heal", "command", "10m", payload={"heal": {
+            "preset": "systemd", "unit": unit, "user": True}})
+        assert cov() == ["tunnel-heal"], unit
+    # A longer name that only starts with the label still does not count.
+    sched.upsert(p.db, "tunnel-heal", "command", "10m", payload={"command": f"systemctl --user is-active {lab}x.service"})
+    assert cov() == []

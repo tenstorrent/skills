@@ -104,7 +104,8 @@ def inventory(p, cfg: dict | None = None, db=None) -> list[dict]:
     except Exception:
         kept = None
     if kept:
-        items.append({"kind": "tunnel", "name": p.name, "covered_by": covering([tunnel.label(p.name)], found)})
+        items.append({"kind": "tunnel", "name": p.name, "covered_by": covering(
+            [tunnel.label(p.name)] + [tunnel.service_file(p.name, plat).name for plat in ("linux", "darwin")], found)})
     prs_on = []
     for r in db.q("SELECT name, kind, payload FROM schedules WHERE enabled=1 AND kind IN ('command','watcher') "
                   "ORDER BY name"):
