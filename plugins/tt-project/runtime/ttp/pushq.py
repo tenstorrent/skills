@@ -20,7 +20,7 @@ from typing import Any, Callable
 
 from . import locks, push
 from .db import (TERMINAL_TASK_STATES, continues_id, dependency_ids, dump_result, load_result, review_subject,
-                 reviews_task)
+                 reviewed_ids)
 from .project import Project, nice_level, push_allowed, push_queue_on, renice, write_json
 
 REF_PREFIX = "refs/ttp/push/"   # + row id: pins the approved commit until its row is settled
@@ -860,7 +860,7 @@ def _covers(db, review: dict, rows: list[dict], code: list[dict] | None = None) 
     branches = {r["branch"] for r in rows if r["branch"]}
     if code is None:
         code = db.q("SELECT id, branch, labels FROM tasks WHERE kind='code' AND branch IS NOT NULL AND branch!=''")
-    ids |= {t["id"] for t in code if t["branch"] in branches or reviews_task(review, t)}
+    ids |= {t["id"] for t in code if t["branch"] in branches} | reviewed_ids(review, code)
     out: set[int] = set()
     while ids:
         i = ids.pop()

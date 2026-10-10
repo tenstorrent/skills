@@ -624,8 +624,33 @@ def reviews_task(review: dict, task: dict) -> bool:
     subject = review_subject(review)
     if subject is not None:
         return subject == task["id"]
-    branch = task.get("branch")
-    return bool(branch and re.search(rf"(?<![\w/.-]){re.escape(branch)}(?![\w/-])", review.get("spec") or ""))
+    return names_branch(review.get("spec") or "", task.get("branch"))
+
+
+def reviewed_ids(review: dict, tasks: list[dict]) -> set[int]:
+    """The ids of `tasks` that `review` reviews (see reviews_task), in one pass that reads its subject
+    once."""
+    subject = review_subject(review)
+    if subject is not None:
+        return {t["id"] for t in tasks if t["id"] == subject}
+    spec = review.get("spec") or ""
+    return {t["id"] for t in tasks if names_branch(spec, t.get("branch"))}
+
+
+def names_branch(spec: str, branch: str | None) -> bool:
+    """Whether `spec` names `branch` on its own: no word character, '/', '.' or '-' right before it, no
+    word character, '/' or '-' right after. Plain string search, no regex: a pattern per task branch
+    would thrash re's cache of 512 compiled patterns."""
+    if not branch:
+        return False
+    i = spec.find(branch)
+    while i >= 0:
+        before, after = spec[i - 1:i], spec[i + len(branch):i + len(branch) + 1]
+        if not (before and (before.isalnum() or before in "_/.-")) and \
+                not (after and (after.isalnum() or after in "_/-")):
+            return True
+        i = spec.find(branch, i + 1)
+    return False
 
 
 DEFER_LABELS = ("start_after", "start_when", "start_why", "deferred_since")

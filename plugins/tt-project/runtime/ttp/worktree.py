@@ -697,11 +697,11 @@ def reviewed_refs(p: Project, task: dict) -> list[str]:
 def named_refs(p: Project, task: dict) -> list[str]:
     """The branches of the tasks a review depends on, and the task branches and commit hashes its
     spec names."""
-    from .db import dependency_ids
+    from .db import dependency_ids, names_branch
     spec = task.get("spec") or ""
     ids = [i for i in dependency_ids(task) if i is not None]
     refs = [r["branch"] for r in p.db.q("SELECT id, branch FROM tasks WHERE branch IS NOT NULL AND branch!=''")
-            if r["id"] in ids or re.search(rf"(?<![\w/.-]){re.escape(r['branch'])}(?![\w/-])", spec)]
+            if r["id"] in ids or names_branch(spec, r["branch"])]
     refs += _HEX.findall(spec)
     return list(dict.fromkeys(refs))
 

@@ -30553,6 +30553,42 @@ def test_a_review_approving_a_head_with_rejected_commits_runs_again_and_is_told_
     assert not s.p.db.q("SELECT id FROM push_queue WHERE task=?", (crev,))
 
 
+def test_the_inherited_commit_check_stays_fast_with_many_tasks_and_reviews(env, monkeypatch):
+    # check_approval runs in the daemon's result path: it must not grow with tasks x reviews.
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    x, xbranch, _, _ = _pq_stacked(s, "rejected", review="failed")
+    c, cbranch, chead, crev = _pq_stacked(s, "stacked", on=xbranch, review="running")
+    with s.p.db.conn:
+        for i in range(600):
+            s.p.db.conn.execute("INSERT INTO tasks (created, updated, title, spec, kind, status, branch) "
+                                "VALUES (?, ?, ?, '', 'code', 'done', ?)",
+                                (time.time(), time.time(), f"t{i}", f"ttp/t{9000 + i}-change-{i}"))
+            s.p.db.conn.execute("INSERT INTO tasks (created, updated, title, spec, kind, status) "
+                                "VALUES (?, ?, ?, ?, 'review', ?)",
+                                (time.time(), time.time(), f"check {i}",
+                                 f"Check ttp/t{9000 + i}-change-{i} against the spec.", ("done", "failed")[i % 2]))
+    entries = [{"branch": cbranch, "head": chead}]
+    t0 = time.perf_counter()
+    check = pushq.check_approval(s.p, s.p.db.task(crev), entries)
+    took = time.perf_counter() - t0
+    assert f"carries unreviewed commits from #{x}," in check.get("invalid", ""), check
+    assert took < 0.5, f"check_approval took {took:.2f} s"
+
+
+def test_names_branch_matches_the_whole_word_pattern_it_replaces():
+    import random
+    from ttp.db import names_branch
+    rng = random.Random(7)
+    parts = ["ttp/t12-fix", "ttp/t1-fix", "fix", "a", "_", "/", ".", "-", " ", "\n", "é", "٣", "x", "`", ":", ","]
+    for _ in range(20000):
+        spec = "".join(rng.choice(parts) for _ in range(rng.randint(0, 8)))
+        branch = rng.choice(["ttp/t12-fix", "ttp/t1-fix", "fix", "t1", "a.b", "-x"])
+        want = bool(re.search(rf"(?<![\w/.-]){re.escape(branch)}(?![\w/-])", spec))
+        assert names_branch(spec, branch) == want, (spec, branch)
+    assert not names_branch("anything", "") and not names_branch("anything", None)
+
+
 def test_a_review_only_stack_stays_review_only_through_its_fix_and_the_push_queue_ignores_its_approval(
         env, monkeypatch):
     from ttp import push, pushq

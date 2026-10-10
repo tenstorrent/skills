@@ -25,7 +25,8 @@ from . import anchors, effort, ends, heal, jevuse, landed, machine_ledger, machi
 from . import screen as scr
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
-                 dependency_ids, dump_result, host_line, load_result, task_outcome, without_deferral)
+                 dependency_ids, dump_result, host_line, load_result, names_branch, task_outcome,
+                 without_deferral)
 from .project import (COORDINATOR_MEMORY_CHARS, WORKER_MEMORY_CHARS, Project, code_tasks_may_push, durable_append,
                       durable_write, push_queue_number, push_queue_on)
 from .runner import stop_runs
@@ -1448,7 +1449,7 @@ def _covered(db, deps: list, spec: str) -> set[int]:
     """The code tasks a review covers: those it depends on and those whose branch its spec names."""
     ids = {d for d in deps if isinstance(d, int)}
     for r in db.q("SELECT id, branch FROM tasks WHERE kind='code' AND branch IS NOT NULL AND branch!=''"):
-        if re.search(rf"(?<![\w/.-]){re.escape(r['branch'])}(?![\w/-])", spec):
+        if names_branch(spec, r["branch"]):
             ids.add(r["id"])
     return ids
 
