@@ -321,7 +321,8 @@ class Daemon:
     def __init__(self, base: str | Path):
         self.p = Project(base)
         self.stopping = False
-        self.boot = runner.boot_id()
+        self.boot, old = runner.boot_ids()
+        self._boot_old = old if old != self.boot else None
         self.boot_at = runner.boot_time()
         self.gates: dict[str, bud.Gate] = {}
         self.cfg_status = "ok"
@@ -542,12 +543,12 @@ class Daemon:
         a power cut, a hardware reset)."""
         try:
             db = self.p.db
-            if (db.kv("boot_prev") or {}).get("boot") == self.boot:
+            if self._this_boot((db.kv("boot_prev") or {}).get("boot")):
                 return
             hb = heartbeat(self.p) or {}
             # An older runtime's heartbeat has no boot id; the boot last told about stands in.
             prev = hb.get("boot") or db.kv("reboot_told")
-            if not prev or prev == self.boot:
+            if not prev or self._this_boot(prev):
                 return
             clean = (db.kv(CLEAN_STOP_KEY) or {}).get("boot") == prev
             db.set_kv("boot_prev", {"boot": self.boot, "prev_boot": prev, "held": hb.get("held") or [],
@@ -556,11 +557,20 @@ class Daemon:
         except Exception:
             log(self.p, "boot record: " + traceback.format_exc().replace("\n", " | ")[:1000])
 
+    @property
+    def boots(self) -> tuple[str, str]:
+        """This boot's id, then the form an older version recorded for it (so an upgrade is no reboot)."""
+        return self.boot, self._boot_old or self.boot
+
+    def _this_boot(self, boot: str | None) -> bool:
+        """Whether a recorded boot id names this boot, in the current or the older form."""
+        return bool(boot) and boot in self.boots
+
     def _shutdown(self, boot: str | None) -> str:
         """How the host went down under boot `boot`: "orderly" when this boot's record says the daemon
         stopped cleanly on it, else "abrupt" (also when nothing says, to stay on the safe side)."""
         prev = self.p.db.kv("boot_prev") or {}
-        orderly = boot and prev.get("boot") == self.boot and prev.get("prev_boot") == boot \
+        orderly = boot and self._this_boot(prev.get("boot")) and prev.get("prev_boot") == boot \
             and prev.get("shutdown") == "orderly"
         return "orderly" if orderly else "abrupt"
 
@@ -1292,7 +1302,7 @@ class Daemon:
             fresh = time.time() - (run_dir / "lease").stat().st_mtime <= LEASE_STALE_S
         except OSError:
             fresh = False
-        return fresh or (r["boot_id"] == self.boot and bool(r["pid"]) and _alive(r["pid"])
+        return fresh or (self._this_boot(r["boot_id"]) and bool(r["pid"]) and _alive(r["pid"])
                          and self._is_supervisor(r) is not False)
 
     def _is_supervisor(self, r: dict) -> bool | None:
@@ -1310,7 +1320,7 @@ class Daemon:
         """Why a run whose supervisor's pid lives must be ended anyway: "hung" when its lease has been
         stale for LEASE_HUNG_S of awake time (a sleep restarts the count), "overdue" when it runs
         BACKSTOP_SLACK_S of awake time past its own wall clock, waits and stall limit. None otherwise."""
-        if r["boot_id"] != self.boot:
+        if not self._this_boot(r["boot_id"]):
             return None
         run_dir = self._run_dir(r)
         try:
@@ -1399,18 +1409,19 @@ class Daemon:
         rebooted lately. A restart on the same boot says nothing."""
         db = self.p.db
         if self._reboot_told or db.one("SELECT COUNT(*) n FROM runs WHERE status='running' AND boot_id IS NOT NULL "
-                                       "AND boot_id!=?", (self.boot,))["n"]:
+                                       "AND boot_id NOT IN (?,?)", self.boots)["n"]:
             return
         with db.tx():
             self._reboot_told = True
-            if db.kv("reboot_told") == self.boot:
+            if self._this_boot(db.kv("reboot_told")):
                 return
             db.set_kv("reboot_told", self.boot)
             lost = [r for r in db.q("SELECT id, task, role, cost_usd, note FROM runs WHERE status='lost' "
-                                    "AND boot_id!=? AND note LIKE ?", (self.boot, f"%{self.boot}%"))
-                    if json.loads(r["note"] or "{}").get("lost_to_reboot") == self.boot]
+                                    "AND boot_id NOT IN (?,?) AND (note LIKE ? OR note LIKE ?)",
+                                    (*self.boots, *(f"%{b}%" for b in self.boots)))
+                    if self._this_boot(json.loads(r["note"] or "{}").get("lost_to_reboot"))]
             prev = db.kv("boot_prev") or {}
-            if prev.get("boot") != self.boot:
+            if not self._this_boot(prev.get("boot")):
                 prev = {}
             if not lost and not prev:
                 return   # the first start of this project, or nothing says the host rebooted
@@ -1453,7 +1464,7 @@ class Daemon:
     def _end_orphan(self, r: dict) -> None:
         """A supervisor that died (kill -9, OOM) leaves its agent running with no wall clock, budget
         or cancel, beside the retry of its task. End the agent's process group, TERM then KILL."""
-        if r["boot_id"] != self.boot:
+        if not self._this_boot(r["boot_id"]):
             return   # a reboot already ended it
         try:
             pid_text, _, started = (self._run_dir(r) / "child.pid").read_text().partition("\n")
@@ -1732,7 +1743,7 @@ class Daemon:
             note["session_cost_usd"] = usage.extra["session_cost_usd"]   # reported; cost_usd is this run's
         # The runaway guard counts runs that ended without an outcome; a reboot, a host sleep or a
         # hand-off that stands is an outcome, not a loop.
-        if status == "lost" and r["boot_id"] and r["boot_id"] != self.boot:
+        if status == "lost" and r["boot_id"] and not self._this_boot(r["boot_id"]):
             note.update(not_waste="reboot", lost_to_reboot=self.boot, boot_at=self.boot_at,
                         shutdown=self._shutdown(r["boot_id"]))
         elif status in bud.WASTED and handed_off:
@@ -3422,7 +3433,7 @@ class Daemon:
         last = db.kv(KV_INTEGRITY) or {}
         broken = bool(last.get("bad") or last.get("worktrees"))
         if start:
-            due = last.get("boot") != self.boot or broken
+            due = not self._this_boot(last.get("boot")) or broken
         else:   # a tick: only the hourly re-check of something still broken
             due = broken and time.time() - float(last.get("at") or 0) >= INTEGRITY_RECHECK_S
         if not due:
@@ -4209,7 +4220,7 @@ class Daemon:
         if not db.kv("paused", False):
             db.x("DELETE FROM kv WHERE key=?", (PAUSE_BOOT_KEY,))
             return
-        if self.boot == "unknown" or rec.get("boot") == self.boot:
+        if self.boot == "unknown" or self._this_boot(rec.get("boot")):
             return
         db.set_paused(False)
         since = timefmt.long(float(rec.get("since") or 0), self.p)
@@ -4287,7 +4298,7 @@ class Daemon:
         # A malformed checks.pid (fields of the wrong type) wakes the task as before.
         if not all(isinstance(x, str) and x for x in (wt, head, boot)) or not isinstance(cmd, list):
             return False, 0
-        if (out / CHECKS_RC).exists() or boot == self.boot or _checks_alive(info):
+        if (out / CHECKS_RC).exists() or self._this_boot(boot) or _checks_alive(info):
             return False, 0
         since = (db.one("SELECT MAX(ts) ts FROM events WHERE task=? AND kind='task_blocked'", (tid,)) or {}).get("ts")
         same = (db.one("SELECT COUNT(*) n FROM events WHERE kind='checks_relaunched' AND task=? AND fingerprint "
@@ -4346,8 +4357,8 @@ class Daemon:
         """Whether the abrupt reboot behind this boot cut short a detached job of task tid: one its
         runs on the earlier boot started that wrote no .rc."""
         db = self.p.db
-        last = db.one("SELECT boot_id FROM runs WHERE task=? AND boot_id IS NOT NULL AND boot_id!=? "
-                      "ORDER BY id DESC LIMIT 1", (tid, self.boot))
+        last = db.one("SELECT boot_id FROM runs WHERE task=? AND boot_id IS NOT NULL AND boot_id NOT IN (?,?) "
+                      "ORDER BY id DESC LIMIT 1", (tid, *self.boots))
         if not last or self._shutdown(last["boot_id"]) == "orderly":
             return False
         dirs = db.q("SELECT dir FROM runs WHERE task=? AND boot_id=? AND dir IS NOT NULL", (tid, last["boot_id"]))

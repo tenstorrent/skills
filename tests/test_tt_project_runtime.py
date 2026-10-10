@@ -33949,8 +33949,7 @@ def test_detach_remote_scripts_tell_a_reused_pid_and_a_reboot_without_proc(env, 
     fake.mkdir()
     booted = tmp_path / "booted"
     booted.write_text("1700000000")
-    (fake / "sysctl").write_text(f'#!/bin/sh\necho "{{ sec = $(cat {booted}), usec = 4242 }} Tue Nov 14 22:13:20 2023"\n')
-    (fake / "sysctl").chmod(0o755)
+    _fake_sysctl(fake, booted, tmp_path / "uuid")
     start, check = (x.replace("/proc/", noproc) for x in (cli._REMOTE_START, cli._REMOTE_CHECK))
     assert "/proc/" not in start + check
     e = {**os.environ, "PATH": f"{fake}{os.pathsep}{os.environ['PATH']}"}
@@ -33981,6 +33980,72 @@ def test_detach_remote_scripts_tell_a_reused_pid_and_a_reboot_without_proc(env, 
     while time.time() < deadline and sh(check, rdir / "job") != "gone":
         time.sleep(0.1)
     assert sh(check, rdir / "job") == "gone"
+    # With kern.bootsessionuuid (macOS), the uuid is the boot: a stepped clock that moves kern.boottime is
+    # no reboot, and a .boot an older version wrote with kern.boottime's seconds still names this boot.
+    (tmp_path / "uuid").write_text("6A1C0E4B-0000-4000-8000-000000000001")
+    out = sh(start, rdir, "job2", "sleep", "60")
+    assert out.startswith("started "), out
+    pid = int((rdir / "job2.pid").read_text())
+    try:
+        assert (rdir / "job2.boot").read_text().strip() == "6A1C0E4B-0000-4000-8000-000000000001"
+        booted.write_text("1700000123")   # the calendar clock was stepped
+        assert sh(check, rdir / "job2") == f"running {pid}"
+        (rdir / "job2.boot").write_text("1700000123\n")   # recorded before the upgrade
+        assert sh(check, rdir / "job2") == f"running {pid}"
+        (rdir / "job2.boot").write_text("1699999999\n")   # an older boot's seconds
+        assert sh(check, rdir / "job2") == "boot"
+        (rdir / "job2.boot").write_text("6A1C0E4B-0000-4000-8000-000000000001\n")
+        (tmp_path / "uuid").write_text("6A1C0E4B-0000-4000-8000-000000000002")   # the host restarted
+        assert sh(check, rdir / "job2") == "boot"
+    finally:
+        _kill_driver(pid)
+
+
+def _fake_sysctl(fake, booted, uuid):
+    """A macOS-like `sysctl -n <key>`: kern.boottime from file `booted`, kern.bootsessionuuid from file
+    `uuid` (an unknown key, as on older systems, while that file is missing)."""
+    (fake / "sysctl").write_text(
+        '#!/bin/sh\ncase $2 in\n'
+        f'kern.boottime) echo "{{ sec = $(cat {booted}), usec = 4242 }} Tue Nov 14 22:13:20 2023" ;;\n'
+        f'kern.bootsessionuuid) [ -e {uuid} ] || {{ echo "unknown oid" >&2; exit 1; }}; cat {uuid} ;;\n'
+        '*) exit 1 ;;\nesac\n')
+    (fake / "sysctl").chmod(0o755)
+
+
+def test_macos_boot_id_prefers_bootsessionuuid_and_still_knows_the_boottime_seconds(env, tmp_path, monkeypatch):
+    """kern.boottime moves when the clock is stepped, so the boot id is kern.bootsessionuuid where the host
+    has it. A boot recorded by an older version as kern.boottime's seconds still reads as this boot, in the
+    runner and the daemon, so an upgrade is never taken for a reboot."""
+    from ttp import push, runner
+    from ttp.daemon import Daemon
+    p = make(env)
+    fake, booted, uuid = tmp_path / "fakebin", tmp_path / "booted", tmp_path / "uuid"
+    fake.mkdir()
+    booted.write_text("1700000000")
+    _fake_sysctl(fake, booted, uuid)
+    monkeypatch.setenv("PATH", f"{fake}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setattr(runner, "BOOT_ID_FILE", tmp_path / "noproc" / "boot_id")
+    # No uuid (an older macOS): kern.boottime's seconds, as before.
+    assert runner.boot_id() == "1700000000" and runner.boot_ids() == ("1700000000", "1700000000")
+    uuid.write_text("6A1C0E4B-0000-4000-8000-000000000001\n")
+    assert runner.boot_id() == "6A1C0E4B-0000-4000-8000-000000000001"
+    assert runner.boot_ids() == ("6A1C0E4B-0000-4000-8000-000000000001", "1700000000")
+    assert runner.same_boot("1700000000") and runner.same_boot("6A1C0E4B-0000-4000-8000-000000000001")
+    assert not runner.same_boot("1699999999") and not runner.same_boot("") and not runner.same_boot(None)
+    assert "rebooted" not in push._dead_reason({"boot": "1700000000"})
+    assert "rebooted" in push._dead_reason({"boot": "1699999999"})
+    # A stepped clock moves kern.boottime but not the boot id.
+    booted.write_text("1700000042")
+    assert runner.boot_id() == "6A1C0E4B-0000-4000-8000-000000000001"
+    # The daemon after an upgrade: a run, a pause until reboot and the last told boot recorded with the
+    # seconds are this boot's; a run of an earlier boot is not.
+    d = Daemon(p.base)
+    assert d.boots == ("6A1C0E4B-0000-4000-8000-000000000001", "1700000042")
+    assert d._this_boot("1700000042") and not d._this_boot("1700000000") and not d._this_boot(None)
+    p.db.set_kv("paused", True)
+    p.db.set_kv("pause_until_boot", {"boot": "1700000042", "since": time.time()})
+    Daemon(p.base).tick()
+    assert p.db.kv("paused"), "a pause until reboot recorded with the seconds is not lifted by an upgrade"
 
 
 def _dev_task(p, labels=(), status="queued", title="t", spec=""):

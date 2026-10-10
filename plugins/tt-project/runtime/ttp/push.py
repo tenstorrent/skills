@@ -2132,8 +2132,8 @@ def run_detached(p: Project, repo: Path, marker: Path, own: bool = False) -> int
 
 
 def _dead_reason(m: dict) -> str:
-    from .runner import boot_id
-    if m.get("boot") and m["boot"] != boot_id():
+    from .runner import same_boot
+    if m.get("boot") and not same_boot(m["boot"]):
         return "the push process ended without writing an outcome: the host rebooted while it ran"
     if m.get("boot") and not m.get("alive"):   # written by a version that marks the start
         return ("the push process ended without writing an outcome before it began: it was probably "

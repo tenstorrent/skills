@@ -1814,15 +1814,18 @@ def cmd_detach(a) -> None:
 
 # The remote side of `ttp detach --remote`, run by POSIX sh over ssh. The driver's wrapper records its
 # own pid and its process start (field 22 of /proc/<pid>/stat; without /proc, as on macOS, ps's lstart),
-# next to the host's boot_id (else kern.boottime's seconds): a pid alive with another start, or a boot that
-# changed, is a driver that is gone even with no .rc.
+# next to the host's boot_id (else kern.bootsessionuuid, else kern.boottime's seconds, which moves when the
+# clock is stepped): a pid alive with another start, or a boot that changed, is a driver that is gone even
+# with no .rc. A .boot holding kern.boottime's seconds, as older versions wrote, still names its boot.
 _REMOTE_START = r'''d=$1 n=$2; shift 2
 case $d in "~"|"~/"*) d=$HOME${d#\~} ;; esac
 mkdir -p "$d" || exit 3
 p=$d/$n
 if [ -e "$p.log" ] || [ -e "$p.rc" ] || [ -e "$p.pid" ]; then echo "exists $p"; exit 4; fi
-{ cat /proc/sys/kernel/random/boot_id 2>/dev/null ||
-  sysctl -n kern.boottime 2>/dev/null | sed -n "s/^{ sec = \([0-9]*\),.*/\1/p"; } >"$p.boot"
+b=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
+[ -n "$b" ] || b=$(sysctl -n kern.bootsessionuuid 2>/dev/null)
+[ -n "$b" ] || b=$(sysctl -n kern.boottime 2>/dev/null | sed -n "s/^{ sec = \([0-9]*\),.*/\1/p")
+if [ -n "$b" ]; then echo "$b"; fi >"$p.boot"
 setsid nohup sh -c 'p=$1; shift
 s=$(sed "s/.*) //" /proc/$$/stat 2>/dev/null | cut -d" " -f20)
 [ -n "$s" ] || s=$(ps -o lstart= -p $$ 2>/dev/null | tr -s " " _)
@@ -1840,9 +1843,15 @@ case $p in "~"|"~/"*) p=$HOME${p#\~} ;; esac
 p=${p%.rc}
 if [ -e "$p.rc" ]; then echo "rc $(cat "$p.rc")"; exit 0; fi
 if [ ! -s "$p.pid" ]; then echo "none $p"; exit 0; fi
-b=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null ||
-  sysctl -n kern.boottime 2>/dev/null | sed -n "s/^{ sec = \([0-9]*\),.*/\1/p")
-if [ -s "$p.boot" ] && [ "$b" != "$(cat "$p.boot")" ]; then echo "boot"; exit 0; fi
+if [ -s "$p.boot" ]; then
+  r=$(cat "$p.boot") s=
+  b=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
+  if [ -z "$b" ]; then
+    b=$(sysctl -n kern.bootsessionuuid 2>/dev/null)
+    s=$(sysctl -n kern.boottime 2>/dev/null | sed -n "s/^{ sec = \([0-9]*\),.*/\1/p")
+  fi
+  if [ "$r" != "${b:-$s}" ] && [ "$r" != "$s" ]; then echo "boot"; exit 0; fi
+fi
 pid=$(cat "$p.pid")
 if kill -0 "$pid" 2>/dev/null; then
   st=$(sed "s/.*) //" /proc/$pid/stat 2>/dev/null | cut -d" " -f20)
@@ -2348,7 +2357,7 @@ def cmd_pause(a) -> None:
         boot = boot_id()
         if boot == "unknown":
             die("--until-reboot: this host's boot id cannot be read (no /proc/sys/kernel/random/boot_id "
-                "or kern.boottime); use a plain pause and resume it after the reboot")
+                "or kern.bootsessionuuid or kern.boottime); use a plain pause and resume it after the reboot")
     p.db.set_paused(a.cmd == "pause", boot)
     print(f"{p.name} " + ("resumed" if a.cmd != "pause" else "paused: no new model runs start"
                           + (" until the host reboots; the daemon lifts it on its first tick after boot" if boot else "")))

@@ -80,7 +80,7 @@ do not run while the project is paused. A task that must reboot the host its har
    `survives_reboot`: a reboot then wakes the task at once), and start the reboot a little later
    (for example `shutdown -r +2`), so the run ends cleanly first.
 
-The boot is told by the kernel's boot id (on macOS, kern.boottime); where neither can be read,
+The boot is told by the kernel's boot id (on macOS, kern.bootsessionuuid, else kern.boottime); where none can be read,
 `--until-reboot` is refused.
 
 ## Template updates

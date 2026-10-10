@@ -84,16 +84,46 @@ for sig in (signal.SIGTERM, signal.SIGKILL):
 """
 
 
+BOOT_ID_FILE = Path("/proc/sys/kernel/random/boot_id")
+
+
+def _sysctl(key: str) -> str:
+    try:
+        return subprocess.run(["sysctl", "-n", key], capture_output=True, text=True, timeout=5).stdout.strip()
+    except Exception:
+        return ""
+
+
+def _boottime_secs() -> str:
+    """Whole seconds of kern.boottime (macOS); the microseconds field drifts between reads. "" if none."""
+    try:
+        return _sysctl("kern.boottime").split("sec =")[1].split(",")[0].strip()
+    except IndexError:
+        return ""
+
+
 def boot_id() -> str:
     try:
-        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        return BOOT_ID_FILE.read_text().strip()
     except OSError:
         pass
-    try:  # macOS: whole seconds of kern.boottime; the microseconds field drifts between reads
-        out = subprocess.run(["sysctl", "-n", "kern.boottime"], capture_output=True, text=True, timeout=5).stdout
-        return out.split("sec =")[1].split(",")[0].strip()
-    except Exception:
-        return "unknown"
+    # macOS: kern.bootsessionuuid is new each boot. kern.boottime moves when the clock is stepped, so
+    # it is only the fallback where the uuid is missing.
+    return _sysctl("kern.bootsessionuuid") or _boottime_secs() or "unknown"
+
+
+def boot_ids() -> tuple[str, str]:
+    """This boot's id, then the id older versions recorded for it (macOS: kern.boottime's seconds,
+    before kern.bootsessionuuid was preferred); the same id twice where there is only one."""
+    b = boot_id()
+    if b == "unknown" or BOOT_ID_FILE.exists():
+        return b, b
+    return b, _boottime_secs() or b
+
+
+def same_boot(recorded: str | None) -> bool:
+    """Whether a recorded boot id names this boot, in either the current or the older form."""
+    return bool(recorded) and recorded in boot_ids()
 
 
 def boot_time() -> float | None:
@@ -105,9 +135,8 @@ def boot_time() -> float | None:
     except (OSError, ValueError):
         pass
     try:
-        out = subprocess.run(["sysctl", "-n", "kern.boottime"], capture_output=True, text=True, timeout=5).stdout
-        return float(out.split("sec =")[1].split(",")[0].strip())
-    except Exception:
+        return float(_boottime_secs())
+    except ValueError:
         return None
 
 
