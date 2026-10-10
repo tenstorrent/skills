@@ -2230,6 +2230,30 @@ def test_command_watcher_multi_line_observations_key_by_first_line_or_explicit_k
     assert len(rows) == 1 and rows[0]["count"] == 2 and rows[0]["title"].startswith("queue: 5 waiting")
     out["stdout"] = line("queue: stuck runner", "queue-stuck")
     assert len(run("q")) == 2
+    # Explicit keys are not normalized: ids that differ only in digits are distinct issues.
+    out["stdout"] = line("tray down", "tray-1") + "\n" + line("tray down", "tray-2")
+    assert len(run("t")) == 2
+    # A keyed 'cleared:' line closes its issue without a wake, and is no regression after a close.
+    out["stdout"] = line("box-a: hold", "hold-a")
+    run("h")
+    woke = p.db.one("SELECT COUNT(*) AS n FROM events WHERE kind='observation'")["n"]
+    out["stdout"] = line("cleared: box-a: hold", "hold-a")
+    run("h")
+    assert [r["status"] for r in p.db.q("SELECT status FROM issues WHERE source='watcher:h'")] == ["fixed"]
+    out["stdout"] = line("box-a: cleared: hold", "hold-a")
+    run("h")
+    assert [r["status"] for r in p.db.q("SELECT status FROM issues WHERE source='watcher:h'")] == ["fixed"]
+    assert p.db.one("SELECT COUNT(*) AS n FROM events WHERE kind='observation'")["n"] == woke
+
+
+def test_keyed_receipt_closes_on_its_cleared_line(env, tmp_path):
+    r = _receipt_rig(env, tmp_path)
+    keyed = lambda text: json.dumps({"text": text, "severity": "normal", "key": "job-9"}) + "\n"
+    other = _line("job5: done")
+    assert r["tick"](keyed("job9: done") + other)[1] == 2
+    assert "job9: done" in r["open_titles"]()
+    assert r["tick"](keyed("job9: cleared: done") + other)[1] == 0
+    assert r["open_titles"]() == {"job5: done"}
 
 
 def test_watcher_conditions_keep_one_issue_each_and_close_when_cleared(env):

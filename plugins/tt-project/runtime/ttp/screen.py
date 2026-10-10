@@ -103,8 +103,12 @@ def _screen(db: DB, cfg: dict, source: str, text: str, hint: str | None, jev,
 
     if key:
         title = _first_line(text)[:160] or source
+        parts = watcher_conditions(source, text, whole=True) or [("", title, False)]
+        subject, _cond, cleared = parts[0]
+        if cleared:
+            return _clear(db, key_fingerprint(source, key), now)
         v = _issue(db, key_fingerprint(source, key), source, title, title, hint, judge, floor, now,
-                   rewake_after_s, repeat, lifecycle)
+                   rewake_after_s, repeat, lifecycle, normalize(subject))
         v.jev_out_of_funds = any(j[3].get("jev_out_of_funds") for j in judged)
         return v
     conditions = watcher_conditions(source, text, whole)
@@ -302,7 +306,7 @@ def _first_line(text: str) -> str:
 
 
 def key_fingerprint(source: str, key: str) -> str:
-    return hashlib.sha1(f"{source}\nkey\n{normalize(key)}".encode()).hexdigest()[:16]
+    return hashlib.sha1(f"{source}\nkey\n{key.strip().lower()}".encode()).hexdigest()[:16]
 
 
 def watcher_conditions(source: str, text: str, whole: bool = False) -> list[tuple[str, str, bool]] | None:
@@ -516,7 +520,8 @@ def _mute_conditions(m: dict, source: str, text: str, whole: bool = False,
     """(key, text, cleared) for each condition of an observation `m` covers: the items of a command-watcher
     line that contain the match (all of them when only the whole line does), else the whole text."""
     if key:
-        return [(key_fingerprint(source, key), _first_line(text)[:160] or source, False)]
+        parts = watcher_conditions(source, text, whole=True)
+        return [(key_fingerprint(source, key), _first_line(text)[:160] or source, bool(parts and parts[0][2]))]
     items = watcher_conditions(source, text, whole)
     if items is None:
         return [(fingerprint(source, text), text.strip().splitlines()[0][:160] if text.strip() else source, False)]
