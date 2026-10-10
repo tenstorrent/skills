@@ -24,6 +24,8 @@ _VOLATILE = [
     (re.compile(r"\b\d{4}-\d\d-\d\d[T ]\d\d:\d\d(:\d\d)?(\.\d+)?(Z|[+-]\d\d:?\d\d)?\b", re.I), "<ts>"),
     (re.compile(r"/tmp/[^\s'\"]+"), "<tmp>"),
     (re.compile(r"\bv\d+(\.\d+)+"), "<n>"),        # versions like v1.0.0
+    # durations: compound (1d2h, 18h52m, 3m20s) and decimal with a unit (1.5h, 250ms)
+    (re.compile(r"(?<![A-Za-z0-9_])(\d+(\.\d+)?(ms|us|[dhms])){1,4}(?![A-Za-z0-9_])", re.I), "<dur>"),
     # numbers not glued to a preceding letter, so host03, gpu1 and t48 keep their identity;
     # units after a number are masked with it: 30s, 12ms, 4GB
     (re.compile(r"(?<![A-Za-z0-9_])\d+(\.\d+)*"), "<n>"),

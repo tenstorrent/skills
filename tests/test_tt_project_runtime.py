@@ -33114,3 +33114,21 @@ def test_live_check_judges_codex_steer_by_the_hook_its_run_got(env, monkeypatch,
     assert st(hook_used=False) == "unsupported"
     off, _, _ = _codex_hooks(monkeypatch, tmp_path, features="hooks  stable  false\n")
     assert not live.hook_used(off()[1])
+
+
+def test_command_watcher_output_is_parsed_per_line():
+    from ttp import daemon
+    out = daemon._observations('starting\n{"text": "a down", "severity": "high"}\n{bad json\n'
+                               '{"text": "b ok"}\ntail one\ntail two\n')
+    assert out == [{"text": "starting"}, {"text": "a down", "severity": "high"}, {"text": "{bad json"},
+                   {"text": "b ok"}, {"text": "tail one\ntail two"}]
+    assert daemon._observations("just\nplain") == [{"text": "just\nplain"}]
+    assert daemon._observations("") == []
+
+
+def test_normalize_masks_compound_and_decimal_durations():
+    from ttp import screen
+    for a, b in [("up 18h52m", "up 3h07m"), ("in 1d2h", "in 4d11h"), ("took 3m20s", "took 1m5s"),
+                 ("1.5h ago", "0.25h ago"), ("wait 250ms", "wait 12ms")]:
+        assert screen.normalize(a) == screen.normalize(b), a
+    assert screen.normalize("host03 t48 gpu1") == "host03 t48 gpu1"

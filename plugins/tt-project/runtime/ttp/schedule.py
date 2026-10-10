@@ -1,7 +1,10 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
 """Recurring work. Three kinds, cheapest first:
-- `command`: a deterministic script (no model). Its stdout lines become observations.
+- `command`: a deterministic script (no model). Each stdout line that is a JSON object
+  {"text", "severity"} is its own observation; each run of plain lines between them is one.
+  Write durations as one number and a unit (52m, 1.5h) or a compound (18h52m): issues are keyed
+  with them masked, so a changing age does not open a new issue on every run.
 - `watcher`: a built-in probe (pull requests, CI, logs) — also no model.
 - `llm`: a scheduled task for a worker (daily review, audits). Budgeted per day, off when the
   governor says optional work must wait.

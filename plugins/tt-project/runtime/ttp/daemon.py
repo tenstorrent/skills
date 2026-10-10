@@ -4907,22 +4907,33 @@ def _explicit_clear(payload: str | None) -> bool:
 
 
 def _observations(text: str) -> list[dict]:
+    """Each JSON line with a `text` is its own observation; each run of other lines between them
+    is one plain observation, so a stray line never swallows the JSON reports around it."""
     if not text:
         return []
-    obs = []
-    for line in text.splitlines():
-        line = line.strip()
+    obs: list[dict] = []
+    plain: list[str] = []
+
+    def flush():
+        body = "\n".join(plain).strip()
+        if body:
+            obs.append({"text": body[:6000]})
+        plain.clear()
+
+    for raw in text.splitlines():
+        line = raw.strip()
         if line.startswith("{"):
             try:
                 o = json.loads(line)
-                if isinstance(o, dict) and o.get("text"):
-                    obs.append(o)
-                    continue
             except ValueError:
-                pass
-        obs = []
-        break
-    return obs or [{"text": text[:6000]}]
+                o = None
+            if isinstance(o, dict) and o.get("text"):
+                flush()
+                obs.append(o)
+                continue
+        plain.append(raw)
+    flush()
+    return obs
 
 
 def _result_ref(p: Project, path: Path) -> str:
