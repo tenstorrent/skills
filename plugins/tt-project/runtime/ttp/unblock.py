@@ -541,6 +541,20 @@ def asks_line(rows: list[dict]) -> str:
     return line
 
 
+def refused_line(db: DB, since: float) -> str:
+    """Asks the gate refused since `since` (coordinator._count_refusal), by why: self-health
+    questions the project should have fixed itself, and unclassified or `neither` asks."""
+    from .coordinator import ASK_REFUSED_KIND
+    by: dict[str, int] = {}
+    for r in db.q("SELECT text FROM events WHERE kind=? AND ts>=?", (ASK_REFUSED_KIND, since)):
+        label = str(r["text"]).split(":", 1)[0]
+        by[label] = by.get(label, 0) + 1
+    if not by:
+        return "none refused"
+    return f"{sum(by.values())} refused (" + ", ".join(
+        f"{label} {n}" for label, n in sorted(by.items(), key=lambda kv: (-kv[1], kv[0]))) + ")"
+
+
 def turns_line(db: DB, since: float) -> str:
     """The coordinator's high/low turn split and, where its turns log them, escalations and triggers.
     A note's `triggers` list counts each trigger on its own; an "escalated: <why>" entry counts
@@ -648,6 +662,7 @@ def lines(db: DB, now: float | None = None) -> list[str]:
         out.append(f"self-waits, {label}: {self_waits_line(self_waits(db, now - span))}")
     for label, span in WINDOWS:
         out.append(f"asks, {label}: {asks_line(asks(db, now - span, now))}")
+        out.append(f"asks refused by the gate, {label}: {refused_line(db, now - span)}")
     out.append(f"coordinator, 24 h: {turns_line(db, now - 86400)}")
     out.append(f"coordinator triggers, 24 h: {triggers_line(db, now - 86400)}")
     out.append(f"{reviewcap.TRIGGER}, 24 h: {reviewcap.daily_line(db, now - 86400)}")

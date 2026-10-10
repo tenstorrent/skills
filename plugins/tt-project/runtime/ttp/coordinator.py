@@ -44,6 +44,10 @@ MAX_DEFER_S = 365 * 86400
 
 # Why an ask cannot be decided by the coordinator itself. Anything else is a judgment call.
 BLOCKING_REASONS = ("access", "funds", "spend", "review", "merge", "irreversible", "restriction", "human")
+# What an irreversible or restriction ask is about, set by the coordinator before it is accepted:
+# "neither" is a judgment call and is refused (decide it yourself).
+ASK_CLASSES = ("irreversible", "restriction_change", "neither")
+ASK_REFUSED_KIND = "ask_refused"   # events: an ask the gate refused, counted in the unblocking metrics
 
 ACTIONS_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -63,6 +67,7 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "key": {"type": "string"}, "value": {"type": "string"},
             "blocking": {"type": "string", "enum": list(BLOCKING_REASONS)}, "recommendation": {"type": "string"},
             "least_disruptive": {"type": "string"}, "reversible": {"type": "boolean"}, "force": {"type": "boolean"},
+            "classify": {"type": "string", "enum": list(ASK_CLASSES)},
             "resources": {"type": "array", "items": {"type": "string"}}, "exclusive": {"type": "boolean"},
             "needs_device": {"type": "boolean"}, "user_deep": {"type": "boolean"}, "standing": {"type": "boolean"},
             "continues": {"type": "integer"}, "resource": {"type": "string"}, "paused": {"type": "boolean"},
@@ -223,6 +228,7 @@ _DEFAULT_NOTE = "\n\nIf there is no answer within "
 # Shown so the user can answer in one word; never applied without their answer.
 _REC_NOTE = "\n\nMy recommendation: "
 _LEAST_NOTE = "\n\nLeast-disruptive way considered: "
+_REVERSIBLE_NOTE = "\n\nReversible alternative considered: "
 LEAST_DISRUPTIVE_MIN = 40   # chars: a restriction ask names the way around it and the rule it breaks
 OVER_MIN = 20   # chars: retiring a restriction outside a user turn names the end that passed
 # An ask recommending yes to a step it calls reversible or safe to undo: that step is the coordinator's.
@@ -995,12 +1001,20 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     raise ValueError(f"ask_user rejected: `blocking` must be one of {', '.join(BLOCKING_REASONS)}; "
                                      f"got {a.get('blocking')!r}. Anything else, decide it yourself")
                 least = str(a.get("least_disruptive") or "").strip()
+                text = a["text"].strip()
+                why = _unclassified_ask(a, least)
+                if why:
+                    _count_refusal(db, key, why[0], text)
+                    raise ValueError(f"ask_user rejected: {why[1]}")
                 if a["blocking"] == "restriction" and len(least) < LEAST_DISRUPTIVE_MIN:
                     raise ValueError("ask_user rejected: first answer what is a reasonably non-disruptive way to "
                                      "proceed. If it fits the restrictions, take it (task_add) and memory_add the "
                                      "decision instead of asking. If not, put it in least_disruptive with the "
                                      "restriction it breaks.")
-                text = a["text"].strip()
+                why = _self_health_ask(a, text, least)
+                if why:
+                    _count_refusal(db, key, "self-health", text)
+                    raise ValueError(f"ask_user rejected: {why}")
                 if (a["blocking"] not in ("restriction", "review", "merge")    # a review or merge ask is never leave to open
                         and prguard.draft_permission_ask(text)):
                     raise ValueError("ask_user rejected: draft PRs need no permission: open it. Opening and updating a "
@@ -1019,6 +1033,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 rec = (a.get("recommendation") or "").strip()
                 if a["blocking"] == "restriction":
                     text += f"{_LEAST_NOTE}{least}"
+                elif a["blocking"] == "irreversible":
+                    text += f"{_REVERSIBLE_NOTE}{least}"
                 if rec:
                     text += f"{_REC_NOTE}{rec}"
                 turn_asks.append((k, db.post("out", text, chat=None, kind="ask",
@@ -2300,6 +2316,79 @@ def _needless_ask(a: dict, text: str) -> str:
         return ("you recommend yes to a step you call reversible: a known, safe, reversible fix is yours. Do it "
                 "(task_add or the action), memory_add the decision and notify at severity low")
     return ""
+
+
+def _unclassified_ask(a: dict, least: str) -> tuple[str, str] | None:
+    """(refusal label, why) for an irreversible or restriction ask that is not classified, is classified
+    `neither`, or does not name the way around it it considered; else None. Access, funds, spend,
+    review, merge and human asks carry a reason only the user or another person can clear, so they
+    need no class."""
+    if a.get("blocking") not in ("irreversible", "restriction"):
+        return None
+    cls = a.get("classify")
+    if cls not in ASK_CLASSES:
+        return ("unclassified", f"classify it first: set `classify` to {', '.join(ASK_CLASSES)}. "
+                "`irreversible`: the step cannot be undone; `restriction_change`: it breaks or changes a "
+                "restriction; `neither`: decide it yourself")
+    if cls == "neither":
+        return ("neither", "decide it yourself. A step that is neither irreversible nor a restriction change is a "
+                "judgment call: act on it, memory_add a decision and notify at severity low")
+    if cls == "irreversible" and len(least) < LEAST_DISRUPTIVE_MIN:
+        return ("no reversible alternative", "name the reversible alternative you considered in least_disruptive, "
+                "and why it does not do. If one does, take it (task_add) and memory_add the decision instead of "
+                "asking")
+    return None
+
+
+# A question about the health of something the project runs: an anomaly word and the thing it is
+# about. The project fixes these itself (task, heal check) and reports afterwards.
+_HEALTH_RE = re.compile(
+    r"\b(dead|hung|hangs|hanging|stuck|crash(?:ed|es|ing)?|not running|offline|stopped responding|"
+    r"not responding|unresponsive|(?:is|are|was|went|gone|been|stays?|still) down|restart(?:ed|ing|s)?|"
+    r"relaunch(?:ed|ing)?|bring (?:it |them )?back|recover(?:ed|ing|y)?|reviv(?:e|ed|ing)|re-?enabl(?:e|ed|ing)|"
+    r"power[- ]?cycl(?:e|ed|ing)|held|not (?:been )?(?:released|cleared)|never (?:released|cleared|recovered))\b", re.I)
+_HEALTH_OBJ_RE = re.compile(
+    r"\b(workers?|services?|runners?|daemons?|schedules?|watchers?|queues?|tunnels?|box(?:es)?|machines?|"
+    r"holds?|devices?|hosts?|brokers?|timers?|process(?:es)?)\b", re.I)
+# A missing credential the user must supply: an access or human ask about it still goes out.
+_CREDENTIAL_RE = re.compile(
+    r"\b(logged out|log ?in|password|passphrase|token|(?:ssh |api |deploy )?keys?|permission denied|sudo|2fa|mfa|"
+    r"credentials?|re-?auth\w*)\b", re.I)
+# The restriction or the irreversible step a self-health ask names in least_disruptive.
+_NAMES_LIMIT_RE = re.compile(
+    r"\b(restrict\w*|rules?|charter|forbid\w*|bans?|banned|not allowed|never|breaks?|irreversibl\w*|"
+    r"undone|permanent\w*|cannot undo|can't undo)\b", re.I)
+
+
+def _self_health_ask(a: dict, text: str, least: str = "") -> str:
+    """Why an ask about the project's own health (a dead worker, a stuck queue, a hold that never
+    cleared) is the project's to fix, or "". Under human or access it is refused unless the text
+    names a real missing credential; under irreversible or restriction unless least_disruptive
+    names the restriction or the irreversible step. Review, merge, funds and spend asks pass."""
+    blocking = a.get("blocking")
+    if blocking not in ("human", "access", "irreversible", "restriction"):
+        return ""
+    said = f"{text} {a.get('recommendation') or ''}"
+    if not (_HEALTH_RE.search(said) and _HEALTH_OBJ_RE.search(said)):
+        return ""
+    if blocking in ("human", "access") and _CREDENTIAL_RE.search(said):
+        return ""
+    if blocking in ("irreversible", "restriction") and _NAMES_LIMIT_RE.search(least):
+        return ""
+    return ("keeping the project running is yours: fix what it runs yourself and report afterwards. Queue the fix "
+            "(task_add priority 1) or a heal check (schedule_set), memory_add the decision and notify at severity "
+            "low. If the fix lives in another project's harness, a task sends it there with `ttp note --to "
+            "<project>`. Ask only when every fix breaks a restriction: blocking restriction (or irreversible), "
+            "with least_disruptive naming the restriction or the irreversible step")
+
+
+def _count_refusal(db, key: str | None, label: str, text: str) -> None:
+    """Record a refused ask for the unblocking metrics, once per turn action (a replayed turn adds none)."""
+    fp = f"{ASK_REFUSED_KIND}:{key}" if key else None
+    if fp and db.one("SELECT 1 FROM events WHERE kind=? AND fingerprint=?", (ASK_REFUSED_KIND, fp)):
+        return
+    db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
+         (time.time(), "coordinator", ASK_REFUSED_KIND, fp, "low", f"{label}: {clip(text, 300)}", "handled"))
 
 
 def _calls_undoable(text: str) -> bool:

@@ -177,6 +177,9 @@ never write to a run folder named in earlier context):
 - `blocked` only when access, a credential, funds or a resource you cannot get is missing, or the
   next step cannot be undone and is outside the charter. Say exactly what. Judgment calls are
   yours: make them, and state each one and why in the summary.
+- A dead or stuck component the project owns (a worker, service, runner, schedule, watcher, queue,
+  a hold that never cleared) is fixed in the task, or handed off with a fix plan in `followups`;
+  never handed off `blocked` as a question about what to do.
 - `failed` when the approach does not work. Say what you learned.
 - A process exiting cleanly is not the task being done. Judge the outcome.
 - Never ask the user to do what you or the project can do, and never offer to do it ("want me

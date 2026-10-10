@@ -21,6 +21,8 @@ Created {{DATE}}. The coordinator keeps this file current; the user's words win 
   change, and the PR leaves draft only on the user's explicit OK. The user merges.
 - Auto-merge repositories: none.
 - Notify the user only for decisions, reviews, merges, funds and outages.
+- Self-healing: keeping the project stable is a prime directive; check everything it is responsible
+  for, fix anomalies yourself and report afterwards.
 - Shared clusters (Slurm, other people's machines): only the exact nodes listed under Resources;
   a node only when free and idle at least 2 h; one self-ending batch job per test, time limit sized
   to the run, nothing left running; never hold a node idle or touch another user's allocation.

@@ -5951,20 +5951,23 @@ def test_an_ask_recommending_yes_to_a_safe_step_is_rejected(env):
     stale = ("Retire the stale restriction \"Restrictions (added 2026-09-02)\"? A newer section says the "
              "diagnosis is done.")
     least = "keep obeying it; it breaks no restriction to leave it in place for now"
-    problems, ask = _ask(p, stale, blocking="restriction", recommendation="yes, retire it", least_disruptive=least)
+    rc, ir = {"classify": "restriction_change"}, {"classify": "irreversible", "least_disruptive": least}
+    problems, ask = _ask(p, stale, blocking="restriction", recommendation="yes, retire it", least_disruptive=least,
+                         **rc)
     assert problems and "retired, not asked about" in problems[0] and ask is None
     problems, ask = _ask(p, "Delete the scratch branch on the fork?", blocking="irreversible",
-                         recommendation="Yes: it is reversible, the commits stay in the reflog")
+                         recommendation="Yes: it is reversible, the commits stay in the reflog", **ir)
     assert problems and "you call reversible" in problems[0] and ask is None
     # A plain "reversible" is still rejected, including after a clause hedged otherwise.
     for k, say in enumerate(("yes, this is reversible", "Yes. It can be undone with one command",
                              "yes: not a big change, and it is reversible")):
-        problems, ask = _ask(p, f"Pause nightly job {k}?", blocking="irreversible", recommendation=say)
+        problems, ask = _ask(p, f"Pause nightly job {k}?", blocking="irreversible", recommendation=say, **ir)
         assert problems and "you call reversible" in problems[0] and ask is None, say
     # Truly unclear (no yes), a step that cannot be undone, and review asks still go out.
     assert _ask(p, stale, blocking="restriction", recommendation="keep it until you confirm",
-                least_disruptive=least)[0] == []
-    assert _ask(p, "Publish the package?", blocking="irreversible", recommendation="yes, it is not reversible")[0] == []
+                least_disruptive=least, **rc)[0] == []
+    assert _ask(p, "Publish the package?", blocking="irreversible", recommendation="yes, it is not reversible",
+                **ir)[0] == []
     # Any negation or hedge before "reversible" / "be undone", or "irreversible" anywhere, lets it go out.
     for k, say in enumerate(("yes. It isn't reversible", "yes, though it is not easily reversible",
                              "yes; it's not fully reversible", "yes, it is only partly reversible",
@@ -5974,9 +5977,9 @@ def test_an_ask_recommending_yes_to_a_safe_step_is_rejected(env):
                              "yes. Once pushed the tag is permanent, so reversible only by a new release")):
         for blocking in ("irreversible", "restriction"):
             assert _ask(p, f"Publish package {k} ({blocking})?", blocking=blocking, recommendation=say,
-                        least_disruptive=least)[0] == [], (blocking, say)
+                        least_disruptive=least, classify="irreversible")[0] == [], (blocking, say)
     assert _ask(p, "Publish the package? It isn\u2019t reversible.", blocking="irreversible",
-                recommendation="yes, publish")[0] == []
+                recommendation="yes, publish", **ir)[0] == []
     assert _ask(p, "Grant the bot read access?", blocking="access", recommendation="yes, it can be undone")[0] == []
 
 
@@ -7479,7 +7482,8 @@ def test_an_ask_needs_a_blocking_reason_and_never_gets_a_default(env):
     assert f"ask #{ask['id']} (waits for the user)" in coord.digest(p, {}, [], [])
     least = {"least_disruptive": "a canary on one box breaks the no-shared-machines restriction"}
     for reason in coord.BLOCKING_REASONS:
-        extra = least if reason == "restriction" else {}
+        extra = {**least, "classify": "irreversible" if reason == "irreversible" else "restriction_change"} \
+            if reason in ("restriction", "irreversible") else {}
         assert _ask(p, f"Question on {reason}?", blocking=reason, **extra)[0] == [], reason
 
 
@@ -7488,16 +7492,18 @@ def test_a_restriction_ask_must_name_the_least_disruptive_way_forward(env):
     from ttp import coordinator as coord
     assert "least_disruptive" in coord.ACTIONS_SCHEMA["properties"]["actions"]["items"]["properties"]
     for extra in ({}, {"least_disruptive": "wait"}):
-        problems, ask = _ask(p, "May I restart the shared service?", blocking="restriction", **extra)
+        problems, ask = _ask(p, "May I restart the shared service?", blocking="restriction",
+                             classify="restriction_change", **extra)
         assert problems and "first answer what is a reasonably non-disruptive way to proceed" in problems[0]
         assert "put it in least_disruptive with the restriction it breaks" in problems[0]
         assert ask is None, "a restriction ask without the way it considered reached the user"
     way = "restart it during the nightly lull; still breaks 'never restart a shared service'"
     problems, ask = _ask(p, "May I restart the shared service?", blocking="restriction",
-                         least_disruptive=way, recommendation="yes, at night")
+                         least_disruptive=way, recommendation="yes, at night", classify="restriction_change")
     assert problems == []
     assert f"Least-disruptive way considered: {way}" in ask["text"] and "My recommendation: yes" in ask["text"]
-    problems, _ = _ask(p, "may i restart the shared service?", blocking="restriction", least_disruptive=way)
+    problems, _ = _ask(p, "may i restart the shared service?", blocking="restriction", least_disruptive=way,
+                       classify="restriction_change")
     assert problems and "already asked" in problems[0], "the note hid a repeated ask"
     # Asks for any other reason need no such field and carry no such line.
     problems, ask = _ask(p, "Grant repo access?", blocking="access", least_disruptive=way)
@@ -7602,11 +7608,82 @@ def test_the_web_app_shows_every_open_ask(env):
     assert shown == {ask["id"]: "ask"}, "an open question was counted but hidden, or a routine alert shown"
 
 
+def test_the_ask_gate_refuses_questions_about_the_projects_own_health(env):
+    p = make(env)
+    from ttp import coordinator as coord, unblock
+    for text in ("a hold on device X has not cleared, should I release it?",
+                 "the serving worker on box A is dead, should I restart it?",
+                 "The nightly watcher is stuck; restart it?"):
+        for blocking in ("human", "access"):
+            problems, ask = _ask(p, text, blocking=blocking, recommendation="yes")
+            assert problems and "keeping the project running is yours" in problems[0], (text, blocking)
+            for part in ("task_add priority 1", "heal check", "memory_add", "severity low",
+                         "`ttp note --to <project>`", "every fix breaks a restriction"):
+                assert part in problems[0], part
+            assert ask is None, "a self-health question reached the user"
+    # irreversible / restriction: only with least_disruptive naming the restriction or the step.
+    vague = "restart it at night when traffic is low, that is the least disruptive way"
+    problems, ask = _ask(p, "The serving runner on box A crashed; restart it?", blocking="restriction",
+                         classify="restriction_change", least_disruptive=vague)
+    assert problems and "keeping the project running is yours" in problems[0] and ask is None
+    way = "restart it at night; it still breaks the 'never restart a shared service' restriction"
+    problems, ask = _ask(p, "The serving runner on box A crashed; restart it?", blocking="restriction",
+                         classify="restriction_change", least_disruptive=way)
+    assert problems == [] and ask is not None
+    wipe = "reinstall in place: it would wipe the box's cache, which cannot be undone"
+    assert _ask(p, "The queue on box B is down; reimage the machine?", blocking="irreversible",
+                classify="irreversible", least_disruptive=wipe)[0] == []
+    # A real missing credential still goes out; review, merge, funds and spend asks always pass.
+    assert _ask(p, "The runner on box C is down: its ssh key is missing, so I cannot log in to restart it.",
+                blocking="access", recommendation="add the key")[0] == []
+    for blocking in ("review", "merge", "funds", "spend"):
+        assert _ask(p, f"The worker on box D is dead ({blocking}); approve the fix PR?",
+                    blocking=blocking)[0] == [], blocking
+    assert _ask(p, "Option A or B for the colour scheme?", blocking="human")[0] == []
+    # Refusals are counted in the unblocking metrics, once per turn action.
+    assert coord._self_health_ask({"blocking": "human"}, "Which logo do you prefer?") == ""
+    line = next(x for x in unblock.lines(p.db) if x.startswith("asks refused by the gate, 24 h"))
+    assert "7 refused (self-health 7)" in line, line
+    coord.apply(p, [{"type": "ask_user", "text": "the worker is dead, restart?", "blocking": "human"}], turn=9)
+    coord.apply(p, [{"type": "ask_user", "text": "the worker is dead, restart?", "blocking": "human"}], turn=9)
+    assert "8 refused (self-health 8)" in next(x for x in unblock.lines(p.db) if x.startswith("asks refused"))
+
+
+def test_an_irreversible_or_restriction_ask_must_be_classified(env):
+    p = make(env)
+    from ttp import coordinator as coord, unblock
+    assert coord.ACTIONS_SCHEMA["properties"]["actions"]["items"]["properties"]["classify"]["enum"] == \
+        ["irreversible", "restriction_change", "neither"]
+    least = "archive the old data instead; the archive is full, so it would not free the space"
+    for blocking in ("irreversible", "restriction"):
+        problems, ask = _ask(p, f"Delete the old data ({blocking})?", blocking=blocking, least_disruptive=least)
+        assert problems and "classify it first" in problems[0] and ask is None, blocking
+        problems, ask = _ask(p, f"Delete the old data ({blocking})?", blocking=blocking, least_disruptive=least,
+                             classify="neither")
+        assert problems and "decide it yourself" in problems[0] and ask is None, blocking
+    # irreversible: the reversible alternative it considered is named, and shown to the user.
+    for extra in ({}, {"least_disruptive": "none"}):
+        problems, ask = _ask(p, "Publish the package?", blocking="irreversible", classify="irreversible", **extra)
+        assert problems and "name the reversible alternative you considered" in problems[0] and ask is None
+    problems, ask = _ask(p, "Publish the package?", blocking="irreversible", classify="irreversible",
+                         least_disruptive=least)
+    assert problems == [] and f"Reversible alternative considered: {least}" in ask["text"]
+    assert _ask(p, "Lift the freeze?", blocking="restriction", classify="restriction_change",
+                least_disruptive=least)[0] == []
+    # Other reasons need no class.
+    for blocking in ("access", "funds", "spend", "review", "merge", "human"):
+        assert _ask(p, f"Question on {blocking}?", blocking=blocking)[0] == [], blocking
+    line = next(x for x in unblock.lines(p.db) if x.startswith("asks refused by the gate, 24 h"))
+    assert "6 refused (" in line and "unclassified 2" in line and "neither 2" in line \
+        and "no reversible alternative 2" in line, line
+
+
 def test_asks_without_a_registered_default_never_time_out(env):
     p = make(env)
     from ttp import coordinator as coord
     _, firm = _ask(p, "Delete the old data?", blocking="irreversible", reversible=False,
-                   recommendation="delete the old data")
+                   recommendation="delete the old data", classify="irreversible",
+                   least_disruptive="archive it instead; the disk is full, so archiving does not free the space")
     _, silent = _ask(p, "Option A or C?", blocking="human", recommendation="use option A")
     assert "within" not in firm["text"]
     assert coord.expire_asks(p, now=time.time() + 1000 * 3600) == []
@@ -33861,7 +33938,8 @@ def test_an_expired_ask_releases_its_hold(env):
     from ttp.daemon import Daemon
     tid = _hold_task(p)
     assert coord.apply(p, [{"type": "ask_user", "text": "May I delete the old artifacts?",
-                            "blocking": "irreversible"},
+                            "blocking": "irreversible", "classify": "irreversible",
+                            "least_disruptive": "move them to an archive; the archive is as full as the disk"},
                            {"type": "task_update", "id": tid, "status": "blocked", "waits_on": "ask:new"}]) == []
     p.db.x("UPDATE messages SET handled=1 WHERE kind='ask'")   # what expire_asks does to a due ask
     Daemon(p.base).sweep_holds()

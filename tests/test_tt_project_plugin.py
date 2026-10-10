@@ -331,6 +331,23 @@ def test_worker_prompt_limits_search_scope():
         assert cmd in text, cmd
 
 
+def test_prompts_and_charter_template_say_self_heal_then_report():
+    def flat(*parts):
+        return " ".join((PLUGIN / "template" / pathlib.Path(*parts)).read_text(encoding="utf-8").split())
+    coord = flat("prompts", "coordinator.md")
+    for part in ("Self-healing: keeping the project stable is yours.", "a hold that never cleared",
+                 "(`task_add` priority 1) or a heal check", "notify at severity `low` afterwards",
+                 "`ttp note --to <project>`", "`classify`", "`restriction_change`",
+                 "`neither`, which is rejected: decide it yourself", "name the reversible alternative you considered"):
+        assert part in coord, part
+    worker = flat("prompts", "worker.md")
+    assert ("is fixed in the task, or handed off with a fix plan in `followups`; never handed off `blocked` as a "
+            "question about what to do") in worker
+    charter = flat("CHARTER.md")
+    assert ("Self-healing: keeping the project stable is a prime directive; check everything it is responsible "
+            "for, fix anomalies yourself and report afterwards.") in charter
+
+
 def test_worker_prompt_bounds_disk_usage_scans():
     text = " ".join((PLUGIN / "template" / "prompts" / "worker.md").read_text(encoding="utf-8").split())
     for part in ("`df <path>`", "Never `du` from / or a home folder", "`du -x`", "`timeout`", "is unknown, not a blocker"):
