@@ -34581,3 +34581,216 @@ def test_a_start_when_that_waits_for_hours_on_a_device_resource_raises_one_event
     d.cfg["waiting"]["start_resource_stale_s"] = 0
     d._start_verdict(p.db.task(fresh), 1, time.time() + 5 * 3600)
     assert len(p.db.q("SELECT * FROM events WHERE kind='start_resource_stale'")) == 1, "0 turns it off"
+
+
+# Heal checks (runtime/ttp/heal.py) ----------------------------------------------------------------
+def _heal_setup(env, **block):
+    from ttp import daemon as dm
+    from ttp import schedule as sched
+    p = make(env)
+    up = p.root / "svc-up"
+    heal_block = {"check": f"test -e {up}", "fix": f"touch {up}", "grace_s": 0, "settle_s": 0, **block}
+    sched.upsert(p.db, "svc", "command", "5m", payload={"heal": heal_block})
+    return p, dm.Daemon(p.base), up
+
+
+def _heal_spec(p):
+    from ttp import heal
+    return heal.of(json.loads(p.db.one("SELECT payload FROM schedules WHERE name='svc'")["payload"]))
+
+
+def test_heal_block_is_validated_in_the_file_and_schedule_set(env):
+    from ttp import heal
+    from ttp import schedule as sched
+    with pytest.raises(ValueError, match="needs `check`"):
+        heal.validate({"fix": "x"})
+    with pytest.raises(ValueError, match="unknown key"):
+        heal.validate({"check": "true", "unit": "x"})
+    with pytest.raises(ValueError, match="needs `unit`"):
+        heal.validate({"preset": "systemd"})
+    s = heal.validate({"preset": "systemd", "unit": "w.service", "user": True, "host": "box-a"})
+    assert s["fix"] == "ssh -o BatchMode=yes box-a 'systemctl --user restart w.service'" and s["max_fixes"] == 3
+    ok = [{"name": "svc", "kind": "command", "every": "5m", "payload": {"heal": {"check": "true"}}}]
+    assert sched.parse_file(json.dumps(ok))
+    with pytest.raises(ValueError, match="only a command schedule"):
+        sched.parse_file(json.dumps([dict(ok[0], kind="llm")]))
+    with pytest.raises(ValueError, match="grace_s"):
+        sched.parse_file(json.dumps([dict(ok[0], payload={"heal": {"check": "true", "grace_s": -1}})]))
+    p = make(env)
+    from ttp import coordinator as coord
+    coord.apply(p, [{"type": "schedule_set", "name": "svc", "kind": "command", "every": "5m",
+                             "heal": {"check": "true", "fix": "true"}}])
+    assert json.loads(p.db.one("SELECT payload FROM schedules WHERE name='svc'")["payload"])["heal"]["fix"] == "true"
+
+
+def test_heal_dead_service_is_fixed_without_coordinator_turns_or_asks(env):
+    from ttp import daemon as dm
+    from ttp import heal
+    p, d, up = _heal_setup(env)
+    p.db.x("UPDATE schedules SET next_run=0 WHERE name='svc'")
+    fp, events = dm.wake_fingerprint(p, {}), p.db.one("SELECT COUNT(*) n FROM events")["n"]
+    tasks, msgs = p.db.q("SELECT id, status FROM tasks"), p.db.one("SELECT COUNT(*) n FROM messages")["n"]
+    d.run_schedules()
+    assert up.exists() and heal.state(p.db, "svc")["phase"] == "settling"
+    assert p.db.one("SELECT next_run FROM schedules WHERE name='svc'")["next_run"] <= time.time()
+    d.run_schedules()   # the settle recheck
+    row = p.db.one("SELECT last_status FROM schedules WHERE name='svc'")
+    assert row["last_status"] == "fixed (1 today)"
+    assert heal.state(p.db, "svc")["status"] == "healthy"
+    assert p.db.q("SELECT id, status FROM tasks") == tasks, p.db.q("SELECT id, title, origin FROM tasks")
+    assert p.db.one("SELECT COUNT(*) n FROM messages")["n"] == msgs + 1   # the info line only
+    assert not p.db.q("SELECT id FROM messages WHERE kind IN ('ask','alert')")
+    assert p.db.one("SELECT COUNT(*) n FROM events")["n"] == events
+    assert not p.db.q("SELECT id FROM runs WHERE role='coordinator'")
+    assert dm.wake_fingerprint(p, {}) == fp
+    info = p.db.q("SELECT text, severity FROM messages WHERE kind='info'")
+    assert len(info) == 1 and info[0]["severity"] == "low" and "Self-healed svc" in info[0]["text"]
+    assert heal.digest_lines(p.db, 0) == ["## Self-healed (nothing to do): fixed svc, 1 today"]
+    assert heal.line(p.db) == "health: 1 ok, 1 fixed today, 0 failing"
+
+
+def test_heal_grace_unknown_and_broken_check_never_fix(env):
+    from ttp import heal
+    p, d, up = _heal_setup(env, grace_s=300)
+    spec, now = _heal_spec(p), time.time()
+    assert heal.run(d, "svc", spec, now) == ("unhealthy (0 s, grace 300 s)", now + 300)
+    assert heal.run(d, "svc", spec, now + 100)[0] == "unhealthy (100 s, grace 300 s)" and not up.exists()
+    for rc, status in ((75, "ok (unknown, rc 75)"), (255, "ok (unknown, rc 255)")):
+        assert heal.run(d, "svc", dict(spec, check=f"exit {rc}"), now + 400) == (status, None)
+    assert heal.run(d, "svc", dict(spec, check="exit 2"), now + 400)[0].startswith("error: heal check exited 2")
+    assert not up.exists() and heal.summary(p.db)["unknown"] == 1
+    up.touch()
+    assert heal.run(d, "svc", spec, now + 500) == ("ok (healthy)", None)   # healthy clears, no fix recorded
+    st = heal.state(p.db, "svc")
+    assert st["status"] == "healthy" and "since" not in st and "unknown_since" not in st
+    assert heal.fixed_today(p.db) == 0
+    up.unlink()
+    assert heal.run(d, "svc", spec, now + 600)[0] == "unhealthy (0 s, grace 300 s)"   # a new stint
+
+
+def test_heal_cap_then_one_self_fix_task_then_outage_alert_that_clears(env):
+    from ttp import alerts, heal
+    p, d, up = _heal_setup(env, max_fixes=2, window_h=1)
+    spec, now = _heal_spec(p), time.time()
+    for i in range(2):   # it dies again after each fix
+        assert heal.run(d, "svc", spec, now + i * 10)[0] == "unhealthy (fixed; rechecking)"
+        assert heal.run(d, "svc", spec, now + i * 10 + 1)[0] == "fixed (%d today)" % (i + 1)
+        up.unlink()
+    status, _ = heal.run(d, "svc", spec, now + 30)
+    assert "cap" in status and not up.exists()
+    t = p.db.one("SELECT * FROM tasks WHERE origin='daemon'")
+    assert t["priority"] == 1 and json.loads(t["labels"]) == ["heal:svc"] and "test -e" in t["spec"]
+    assert heal.run(d, "svc", spec, now + 40)[0] == f"unhealthy (self-fix task #{t['id']} open)"
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 1
+    assert not p.db.q("SELECT id FROM messages WHERE kind='alert'")
+    p.db.update_task(t["id"], status="failed")
+    assert "alerted" in heal.run(d, "svc", spec, now + 50)[0]
+    heal.run(d, "svc", spec, now + 60)
+    al = p.db.q("SELECT * FROM messages WHERE kind='alert'")
+    assert len(al) == 1 and al[0]["severity"] == "high" and al[0]["ref"] == "heal:svc"
+    assert alerts.holds(p.db, "heal:svc", now, now + 60)
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 1
+    up.touch()
+    assert heal.run(d, "svc", spec, now + 70)[0] == "ok (healthy)"
+    assert [e["key"] for e in alerts.sweep(p.db)] == ["heal:svc"]
+    assert "passes again" in p.db.one("SELECT text FROM messages WHERE kind='resolved'")["text"]
+
+
+def test_heal_fix_that_fails_or_does_not_help_queues_the_task(env):
+    from ttp import heal
+    p, d, up = _heal_setup(env, fix="echo boom; exit 3")
+    spec, now = _heal_spec(p), time.time()
+    assert "the fix exited 3" in heal.run(d, "svc", spec, now)[0]
+    assert "boom" in p.db.one("SELECT spec FROM tasks WHERE origin='daemon'")["spec"]
+    p.db.x("DELETE FROM tasks WHERE origin='daemon'")
+    p.db.set_kv(heal.STATE_KEY + "svc", {})
+    assert heal.run(d, "svc", dict(spec, fix="true"), now)[0] == "unhealthy (fixed; rechecking)"
+    assert "still fails" in heal.run(d, "svc", dict(spec, fix="true"), now + 1)[0]
+    p.db.x("DELETE FROM tasks WHERE origin='daemon'")
+    p.db.set_kv(heal.STATE_KEY + "svc", {})
+    assert "it has no fix" in heal.run(d, "svc", dict(spec, fix=None), now)[0]
+
+
+def test_heal_restart_mid_fix_counts_the_fix_and_rechecks(env):
+    from ttp import heal
+    p, d, up = _heal_setup(env, max_fixes=1)
+    spec, now = _heal_spec(p), time.time()
+    # The daemon died while the fix ran: the state says so, the database kept it.
+    p.db.set_kv(heal.STATE_KEY + "svc", {"status": "unhealthy", "since": now - 60, "phase": "fixing",
+                                         "fix_started": now - 5, "fixes": [now - 5]})
+    up.touch()
+    assert heal.run(d, "svc", spec, now) == ("fixed (1 today)", None)
+    up.unlink()
+    assert "cap" in heal.run(d, "svc", spec, now + 1)[0]   # the interrupted fix used the cap
+    p.db.x("DELETE FROM tasks WHERE origin='daemon'")
+    p.db.set_kv(heal.STATE_KEY + "svc", {"status": "unhealthy", "since": now - 60, "phase": "fixing",
+                                         "fixes": [now - 5]})
+    assert "still fails" in heal.run(d, "svc", spec, now)[0]
+
+
+def test_heal_fix_runs_under_its_lock_and_waits_out_a_pause(env):
+    from ttp import heal
+    from ttp.db import PAUSED_RESOURCES_KEY
+    held, up = env["repo"] / "held", env["repo"] / "demo-up"
+    p, d, _ = _heal_setup(env, resource="dev-x", check=f"test -e {up}",
+                          fix=f'echo "$TTP_LOCKS_HELD" > {held}; touch {up}')
+    spec, now = _heal_spec(p), time.time()
+    p.db.set_kv(PAUSED_RESOURCES_KEY, {"dev-x": {"reason": "user hold", "since": now}})
+    assert heal.run(d, "svc", spec, now)[0] == "unhealthy (fix deferred: dev-x busy or paused)"
+    assert not up.exists() and heal.state(p.db, "svc")["fixes"] == []
+    p.db.set_kv(PAUSED_RESOURCES_KEY, {})
+    assert heal.run(d, "svc", spec, now + 10)[0] == "unhealthy (fixed; rechecking)", heal.state(p.db, "svc")
+    assert up.exists() and "dev-x" in held.read_text()
+
+
+def test_heal_known_fault_stays_quiet_unless_a_whole_box_is_out(env):
+    from ttp import heal
+    p, d, up = _heal_setup(env, known_fault="repair is the user's call", grace_s=7200)
+    spec, now = _heal_spec(p), time.time()
+    assert heal.run(d, "svc", spec, now)[0] == "unhealthy (known fault: kept quiet)"
+    assert heal.run(d, "svc", spec, now + 3 * 3600)[0] == "unhealthy (known fault: kept quiet)"
+    p.db.set_kv(heal.STATE_KEY + "svc", {})
+    box = dict(spec, outage=True)
+    assert heal.run(d, "svc", box, now)[0] == "unhealthy (known fault: kept quiet)"
+    assert heal.run(d, "svc", box, now + heal.OUTAGE_S)[0] == "unhealthy (fixed; rechecking)"
+
+
+def test_heal_presets_read_systemd_and_broker_status(env, monkeypatch):
+    from ttp import heal
+    out = {}
+    monkeypatch.setattr(heal, "_shell", lambda cmd, cwd, timeout: out[cmd.split()[0]])
+    sd = heal.validate({"preset": "systemd", "unit": "w.service"})
+    st: dict = {}
+    out["systemctl"] = (0, "ActiveState=active\nNRestarts=2")
+    assert heal.check(sd, st, ".")[0] == 0 and st["nrestarts"] == 2
+    out["systemctl"] = (0, "ActiveState=active\nNRestarts=5")
+    assert heal.check(sd, st, ".") == (1, "w.service is crash-looping: NRestarts 2 -> 5")
+    out["systemctl"] = (0, "ActiveState=failed\nNRestarts=5")
+    assert heal.check(sd, st, ".")[0] == 1
+    bk = heal.validate({"preset": "broker", "status_command": "status --json"})
+    out["status"] = (0, json.dumps({"held": False, "auto_power_cycle": True, "auto_reboot": True}))
+    assert heal.check(bk, {}, ".") == (0, "no hold; automatic recovery on")
+    out["status"] = (0, json.dumps({"held": True, "auto_power_cycle": False, "auto_reboot": True}))
+    assert heal.check(bk, {}, ".") == (1, "held is set; auto_power_cycle is off")
+    out["status"] = (0, json.dumps({"held": False}))
+    assert heal.check(bk, {}, ".")[0] == 75
+    out["status"] = (255, "ssh: connect failed")
+    assert heal.check(bk, {}, ".")[0] == 255
+    with pytest.raises(ValueError, match="needs `url`"):
+        heal.validate({"preset": "http", "url": "ftp://x"})
+
+
+def test_heal_cli_lists_and_tests_a_check(env, capsys, monkeypatch):
+    from ttp import cli
+    p, d, up = _heal_setup(env)
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    cli.main(["heal", "list"])
+    assert "svc: not checked yet" in capsys.readouterr().out
+    with pytest.raises(SystemExit) as e:
+        cli.main(["heal", "test", "svc"])
+    assert e.value.code == 1 and "svc: unhealthy (exit 1)" in capsys.readouterr().out
+    assert not up.exists()   # a dry run never fixes
+    up.touch()
+    with pytest.raises(SystemExit) as e:
+        cli.main(["heal", "test", "svc"])
+    assert e.value.code == 0

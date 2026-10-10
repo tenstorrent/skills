@@ -39,6 +39,7 @@ from . import coordinator as coord
 from . import coordcheck
 from . import effort
 from . import ends
+from . import heal
 from . import pauseends
 from . import hold
 from . import integrity
@@ -2539,8 +2540,11 @@ class Daemon:
         db = self.p.db
         for s in sched.due(db):
             payload = json.loads(s["payload"] or "{}")
+            again = None
             try:
-                if s["kind"] == "command":
+                if s["kind"] == "command" and payload.get("heal"):
+                    status, again = self._run_heal(s, payload)
+                elif s["kind"] == "command":
                     status = self._run_command_watcher(s, payload)
                 elif s["kind"] == "watcher":
                     from .watchers import run_builtin
@@ -2550,11 +2554,27 @@ class Daemon:
             except Exception as e:
                 status = f"error: {type(e).__name__}: {e}"[:200]
             sched.mark_ran(db, s, status)
+            if again is not None:   # a heal check's grace end or settle recheck comes before its period
+                db.x("UPDATE schedules SET next_run=MIN(next_run, ?) WHERE name=?", (again, s["name"]))
             if sched.failing(status) and sched.failing(s["last_status"]):
                 self._schedule_broken(s, status)
             elif not sched.failing(status):
                 self._schedule_mended(s["name"])
             self._progress()
+
+    def _run_heal(self, s: dict, payload: dict) -> tuple[str, float | None]:
+        """A command schedule with a heal block: its check, fix and escalation (heal.run), then its
+        own command, if it has one, as a watcher."""
+        try:
+            spec = heal.validate(payload["heal"])
+        except ValueError as e:
+            return f"error: {e}"[:200], None
+        status, again = heal.run(self, s["name"], spec)
+        if str(payload.get("command") or "").strip():
+            status += "; " + self._run_command_watcher(s, payload)
+        if status.startswith("fixed") or "self-fix task" in status:
+            log(self.p, f"heal {s['name']}: {status}")
+        return status, again
 
     SCHEDULE_FIXES_KEY = "schedule_fixes"   # kv: schedule -> {task, since, errors} for its failure stint
 

@@ -54,6 +54,7 @@ CLEARED_TEXT = {
     "push_rejected": "Pushes go through again: a push batch pushed.",
     "after_push_failed": "after_push no longer fails: the last one succeeded, or after_push or the push queue is off.",
     "push_queue_dying": "Push batches finish again.",
+    "heal": "Heal check {arg} passes again.",
 }
 
 
@@ -137,6 +138,9 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
         return arg in (db.kv(prguard.UNAPPROVED_KEY, {}) or {}) and not prguard.approved(db, arg)
     if key == "run-start":
         return not db.one("SELECT id FROM runs WHERE role!='coordinator' AND started>? LIMIT 1", (since,))
+    if kind == "heal":   # an outage from a heal check lasts until the check passes (heal.holds)
+        from . import heal
+        return heal.holds(db, arg)
     # The push queue (pushq.py): each lasts until a batch finalized after it was raised shows otherwise.
     if key == "push_rejected":
         return not db.one("SELECT id FROM push_batches WHERE outcome='pushed' AND finalized>=? LIMIT 1", (since,))
@@ -167,7 +171,7 @@ def active(db: DB, key: str, ts: float, now: float) -> bool:
 def _checkable(key: str) -> bool:
     return key.partition(":")[0] in ("auth", "limit", "budget", "relayed", "disk", "coordinator", "run-start",
                                          "schedule", "release-older", "integrity", "pr-ready", "config",
-                                         "push_rejected", "after_push_failed", "push_queue_dying")
+                                         "push_rejected", "after_push_failed", "push_queue_dying", "heal")
 
 
 def _since(ep: dict) -> float:

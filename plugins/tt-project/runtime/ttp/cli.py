@@ -740,6 +740,8 @@ def status_text(p: Project) -> str:
         lines.append(h["schedules_broken"])
     if h.get("schedules_waiting"):
         lines.append(h["schedules_waiting"])
+    if h.get("health"):
+        lines.append(h["health"])
     from . import screen as scr
     for m in scr.mutes(db, now):
         lines.append(f"muted: {scr.mute_line(m, now)}")
@@ -2133,6 +2135,38 @@ def cmd_schedules(a) -> None:
               f"{f' timeout {t}s' if t else ''}{'' if e['enabled'] else ' (off)'}  {r['last_status'] or ''}")
 
 
+def cmd_heal(a) -> None:
+    """Heal checks (command schedules with a `heal` block): `list` shows each with its state,
+    `test <name>` runs its check once as a dry run (no fix, no state change)."""
+    from . import heal
+    if a.project:
+        p = need(a.project, sys.argv[1:])
+    else:
+        base = os.environ.get("TTP_PROJECT") or next(
+            (str(d) for d in [Path.cwd(), *Path.cwd().parents] if Project(d).exists()), None)
+        if not base:
+            die("no project here: run it inside a project or a run, or pass --project NAME")
+        p = Project(base)
+    found = heal.checks(p.db)
+    if a.action == "list":
+        if not found:
+            print("no heal checks (a command schedule's `heal` block declares one)")
+        for r, spec in found:
+            print(heal.describe(r, spec, p.db))
+        line = heal.line(p.db)
+        if line:
+            print(line)
+        return
+    match = [(r, spec) for r, spec in found if r["name"] == a.check]
+    if not match:
+        die(f"no enabled heal check named {a.check!r}; `ttp heal list` shows them")
+    r, spec = match[0]
+    rc, out = heal.check(spec, dict(heal.state(p.db, r["name"])), str(p.root))
+    word = {0: "healthy", 1: "unhealthy"}.get(rc, "unknown")
+    print(f"{r['name']}: {word} (exit {rc})" + (f"\n{out}" if out else ""))
+    sys.exit(0 if rc == 0 else 1 if rc == 1 else 75)
+
+
 def cmd_machines(a) -> None:
     """The user's machines (~/.tt-project/machines.json), shared by all their projects. Each
     project's charter says which of them it may use; its coordinator routes work only to those.
@@ -3387,6 +3421,12 @@ def main(argv: list[str] | None = None) -> None:
                         "them. Asks first; needs --yes when not interactive. To only read, use show")
     s.add_argument("--yes", action="store_true", help="confirm --export without a prompt")
     s.set_defaults(fn=cmd_schedules)
+
+    s = sub.add_parser("heal", help="heal checks: list them, or test one's check (dry run)")
+    s.add_argument("action", choices=("list", "test"))
+    s.add_argument("check", nargs="?", help="test: the heal check (its schedule's name)")
+    s.add_argument("--project", help="the project (default: the one this folder or run belongs to)")
+    s.set_defaults(fn=cmd_heal)
 
     s = sub.add_parser("machines", help="your machines, shared by all your projects (add/list/remove/push)")
     ms = s.add_subparsers(dest="action", required=True)

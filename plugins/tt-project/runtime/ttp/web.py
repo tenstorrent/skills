@@ -17,7 +17,7 @@ from . import alerts, awake
 from . import budget as bud
 from . import globalcap as gcap
 from . import coordinator as coord
-from . import pushq, release, waits
+from . import heal, pushq, release, waits
 from . import schedule as sched
 from . import upstream
 from .daemon import (AUTH_PROBE_S, HEARTBEAT_STALE_S, KV_LOCAL_ONLY, KV_WORKTREES_DIRTY, LOGGED_OUT_NOTE, NET_HELD_NOTE,
@@ -366,6 +366,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         "release": release.line(p, db, cfg),
         "schedules_broken": sched.broken_line(db),
         "schedules_waiting": sched.waiting_line(db),
+        "health": heal.line(db, now),
         "local_only": local_only_line(db),
         "uncommitted": uncommitted_line(db),
         "upstream": upstream.status_line(db, cfg),

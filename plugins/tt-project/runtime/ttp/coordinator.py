@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from . import locks
-from . import anchors, effort, ends, jevuse, machines, pauseends, prguard, push, reviewcap, shared, unblock, upstream
+from . import anchors, effort, ends, heal, jevuse, machines, pauseends, prguard, push, reviewcap, shared, unblock, upstream
 from . import screen as scr
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
@@ -459,6 +459,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     section("memory_added", memory_digest_lines(memory_view(p, now)))
     section("charter_conflicts", charter_conflict_lines(charter_conflicts(p)))
     section("ends", ends.digest_lines(p, float(db.kv("last_coordinator_turn", 0) or 0), now))
+    section("heal", heal.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0), now))
     mem = memory_budget_line(p)
     if mem:
         section("memory_budget", [mem], mem, mem.split(";")[0] + " (as last turn)")
@@ -1156,9 +1157,14 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         payload.pop("issue_lifecycle", None)
                         if life == scr.EXPLICIT_CLEAR:
                             payload["issue_lifecycle"] = life
-                    if enabled and not str(payload.get("command") or "").strip():
+                    if "heal" in a:   # null removes it
+                        payload.pop("heal", None)
+                        if a["heal"]:
+                            heal.validate(a["heal"], f"schedule_set {a.get('name')!r} rejected: `heal`")
+                            payload["heal"] = a["heal"]
+                    if enabled and not str(payload.get("command") or "").strip() and not payload.get("heal"):
                         raise ValueError(f"schedule_set {a.get('name')!r} rejected: kind command needs `command`, "
-                                         f"the shell command to run (and optionally `timeout_s`)")
+                                         f"the shell command to run (and optionally `timeout_s`), or a `heal` block")
                 elif kind == "llm":
                     payload = {**kept, "spec": a.get("spec") or kept.get("spec") or "",
                                "tier": a.get("tier") or kept.get("tier") or "standard"}

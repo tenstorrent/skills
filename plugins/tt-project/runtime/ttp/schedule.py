@@ -224,8 +224,14 @@ def parse_file(text: str | bytes) -> list[dict]:
         payload = e.get("payload", {})
         if not isinstance(payload, dict):
             raise ValueError(f"{where}: `payload` is an object")
-        if e["kind"] == "command" and e.get("enabled", True) and not str(payload.get("command") or "").strip():
-            raise ValueError(f"{where}: an enabled command schedule needs `payload.command`")
+        if "heal" in payload:
+            if e["kind"] != "command":
+                raise ValueError(f"{where}: only a command schedule takes `payload.heal`")
+            from .heal import validate
+            validate(payload["heal"], f"{where}: payload.heal")
+        if e["kind"] == "command" and e.get("enabled", True) and not str(payload.get("command") or "").strip() \
+                and not payload.get("heal"):
+            raise ValueError(f"{where}: an enabled command schedule needs `payload.command` or `payload.heal`")
     return data
 
 
