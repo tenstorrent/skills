@@ -920,7 +920,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 # `pr_branch: <branch>` line names, else a finished task's work branch the spec names.
                 # Failed or cancelled work is continued then (taken over); done work is not.
                 spec_text = a.get("spec") or ""
-                given, bad_branch = ("", "") if review else spec_pr_branch(spec_text)
+                given = None if review else SPEC_PR_BRANCH.search(spec_text)
                 carried = None if review or given else _named_branch(db, spec_text)
                 if carried and old and old["id"] == carried[0]["id"]:
                     carried = None   # it continues that branch's task already
@@ -930,7 +930,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     except ValueError:
                         old = None
                 taken = bool(carried and old and old["id"] == carried[0]["id"])
-                onto = given or (carried[1] if carried and not taken else "")
+                onto = given.group(1) if given else carried[1] if carried and not taken else ""
                 if onto:
                     labels.append(f"pr_branch:{onto}")
                 if old:
@@ -958,10 +958,6 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                             db.update_task(old["id"], status="cancelled", blocked_reason=f"continued by #{new_id}")
                 if followup:
                     notes.append(f"task_add: #{followup['id']} is done; added #{new_id} as its follow-up")
-                if bad_branch:
-                    notes.append(f"task_add: #{new_id}'s spec has `pr_branch: {bad_branch[:80]}`, which is not one "
-                                 f"valid branch name, so it carries no branch; if it should, cancel it and add it "
-                                 f"again with only the exact branch name after pr_branch:")
                 if carried:
                     how = f"continues #{old['id']}" if taken else f"labelled pr_branch:{carried[1]}"
                     notes.append(f"task_add: #{new_id} names #{carried[0]['id']}'s branch {carried[1]}: {how}, "
@@ -1426,21 +1422,12 @@ def _continued(db, raw: Any, deps: list[int]) -> dict:
 
 
 # A task's own work branch named in a spec (worktree.ensure names them ttp/t<id>-<slug>), and a
-# spec line naming the branch a task delivers onto.
+# spec line naming the branch a task delivers onto: its first token, backticks or quotes aside, so
+# text may follow on the same line. Known gap, accepted: prose such as `pr_branch: use that branch`
+# labels a bogus branch ("use"); `ttp push --own` refuses one that exists nowhere and on_carried
+# sends the task back to its own branch, so no parser heuristics here.
 NAMED_BRANCH = re.compile(r"(?<![\w/.-])ttp/t(\d+)-[\w./-]*[\w-]")
-SPEC_PR_BRANCH = re.compile(r"(?<![\w-])pr_branch:[ \t]*([^\n]*)")
-
-
-def spec_pr_branch(spec: str) -> tuple[str, str]:
-    """(branch, "") for a spec's `pr_branch: <branch>` line, whose whole value (quotes, backticks
-    and a closing `.`, `,` or `;` aside) is one valid branch name (worktree.valid_branch);
-    ("", value) when it is prose, several words or not a valid name; ("", "") with no such line."""
-    m = SPEC_PR_BRANCH.search(spec)
-    if not m:
-        return "", ""
-    raw = m.group(1).strip()
-    value = raw.rstrip(".,;").strip().strip("`'\"")
-    return (value, "") if worktree.valid_branch(value) else ("", raw or "(empty)")
+SPEC_PR_BRANCH = re.compile(r"(?<![\w-])pr_branch:\s*[`'\"]?([A-Za-z0-9][\w./-]*[\w-])")
 
 
 def _named_branch(db, spec: str) -> tuple[dict, str] | None:

@@ -142,8 +142,8 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
   `continues` on a done task adds a follow-up of it instead: it takes over no dependents and a code
   task starts from the base branch.
 - A task that must deliver onto another task's branch (a fix on a finished task's PR) names that
-  branch in its spec, or a line `pr_branch: <branch>` for any other branch, holding only the exact
-  branch name (prose there labels nothing, and a branch that exists nowhere is refused). The harness then
+  branch in its spec, or a line `pr_branch: <branch>` for any other branch: put the branch name
+  alone right after `pr_branch:`, in backticks, at the start of its line. The harness then
   labels it `pr_branch:<branch>` (or continues a failed or cancelled owner): it works on that
   branch in a worktree, and `ttp push --own` fast-forwards it. Never leave this out: without it
   the push is refused and the run is wasted.
