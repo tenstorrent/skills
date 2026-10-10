@@ -4839,9 +4839,9 @@ class Daemon:
     def _auto_review(self, task: dict, summary: str, add: bool = True) -> tuple[int, bool] | None:
         """The review of a finished code task, queued here the way the coordinator would, so a
         routine hand-off needs no coordinator turn: (review id, whether it was added now). An open
-        review that already covers the task (queued ahead by the coordinator, or a re-review of the
-        branch the task's fix branch builds on: worktree.fix_branches), or one that already approved
-        its head, is that review: one head gets one review. None
+        review that already covers the task (queued ahead by the coordinator, or a still queued
+        re-review of the branch the task's fix branch builds on: worktree.fix_branches), or one that
+        already approved its head, is that review: one head gets one review. None
         when delivery has no review step, `add` is off and none is open, the branch changes nothing,
         the review cap is reached or the diff cannot be read: the coordinator then decides."""
         cfg, db = self.cfg, self.p.db
@@ -4852,7 +4852,12 @@ class Daemon:
         branch = task.get("branch")
         try:
             for t in db.q("SELECT * FROM tasks WHERE kind='review' AND status NOT IN ('done','failed','cancelled')"):
-                if task["id"] in dependency_ids(t) or (branch and branch in worktree.reviewed_refs(self.p, t)):
+                # A re-review covers a fix branch built on the branch it names only while it is still
+                # queued: it reads that branch's head when it starts, and a running one approves only
+                # the head it read, so later commits there get their own review.
+                named = worktree.named_refs(self.p, t) if branch else []
+                if task["id"] in dependency_ids(t) or (branch and branch in named) or (
+                        branch and t["status"] == "queued" and branch in worktree.fix_branches(self.p, t, named)):
                     self._precheck_open(task, t)
                     return t["id"], False
             # A review that already approved this exact head (it ran while the task waited on its own

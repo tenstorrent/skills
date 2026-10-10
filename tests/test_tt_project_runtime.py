@@ -18397,6 +18397,24 @@ def test_a_re_plan_head_gets_one_review_not_its_re_review_plus_a_daemon_review(e
         "SELECT title FROM tasks WHERE kind='review' AND status='queued'")] == [f"Review #{fix}"]
 
 
+@pytest.mark.parametrize("status", ["running", "waiting"])
+def test_a_re_review_that_already_started_does_not_cover_a_later_fix_head(env, monkeypatch, status):
+    """A re-review of the reviewed branch can start while its re-plan still commits: it approves only
+    the head it read, so the re-plan's later commits get their own review instead of none."""
+    s = _pq(env, monkeypatch)
+    fix, path, _, head = _re_plan(s, f"pr_branch:{s.branch}")
+    again = s.p.db.add_task("Re-review (narrowed)", f"Re-review branch {s.branch} after its re-plan.", kind="review",
+                            origin="coordinator")
+    s.p.db.update_task(again, status=status)
+    # It approved the head it read; the re-plan then commits once more.
+    s.p.db.x("INSERT INTO push_queue(task,run,branch,head,target,status,created,updated) "
+             "VALUES(?,1,'b',?,'origin/proj','approved',0,0)", (again, head))
+    _commit(path, "later.txt", "a later fix\n")
+    _finish_fix(env, s.p, fix)
+    assert [r["title"][:len(f"Review #{fix}")] for r in s.p.db.q(
+        "SELECT title FROM tasks WHERE kind='review' AND status='queued'")] == [f"Review #{fix}"]
+
+
 @pytest.mark.parametrize("setting, push", [("push_allowed", None), ("push_queue", "pushed it")])
 def test_a_push_list_in_a_project_that_does_not_push_is_ignored_and_logged(env, monkeypatch, setting, push):
     """No pushing at all, or a stray `push` field (not a list of approvals) while the queue is off,
