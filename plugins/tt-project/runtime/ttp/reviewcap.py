@@ -7,7 +7,10 @@ a new stack on the same component (`Fix re-review #N`, `#N follow-up`, a task th
 started the count again. Here an area is a lineage of code and review tasks linked by `continues:`,
 follow-ups (`parent`), a review's `depends_on`, the daemon's `review_fix:`/`auto_review:` labels and
 `Review #N` / `Fix review #N` / `#N follow-up` titles; as a fallback, reviews whose diffs have the
-same main file (the non-test file with the most changed lines) count as one area too. Links run
+same main file (the non-test file with the most changed lines) count as one area too. On a busy
+file that fallback would pool unrelated work, so it applies only once the review's own lineage has
+OWN_FAILS_FOR_FILE failed reviews in the window; before that, a review on the same main file joins
+only when its changes there overlap: a shared hunk line range or a shared changed function. Links run
 only between code and review tasks, so a plan or daily review that spawned many tasks joins none.
 
 With review.area_fail_cap (default 3; 0 off) or more reviews of one area failed or asking for
@@ -26,12 +29,15 @@ AREA_WINDOW_S = 48 * 3600
 LOOKBACK_S = 14 * 86400   # tasks this recent are searched for links back into a lineage
 MAX_LINEAGE = 400         # a lineage this big stops growing: the search must stay cheap
 DEFAULT_CAP = 3
+OWN_FAILS_FOR_FILE = 2    # failed reviews in its own lineage before any review on the same main file joins
 REVIEW_AREA_EVENT = "review_area_cap"
 TRIGGER = "repeated review failures in one area"
 FAILED_KINDS = ("task_failed", "task_changes_needed")
 TITLE_REF = re.compile(r"(?i)^\s*(?:fix\s+)?(?:re-?)?review\s+#(\d+)|#(\d+)\s+follow-?up\b"
                        r"|\bfollow-?up\s+(?:to|of|on|for)\s+#(\d+)")
 LINK_LABELS = ("review_fix:", "auto_review:")
+HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@ ?(.*)$")
+DEF = re.compile(r"^\s*(?:export\s+)?(?:async\s+)?(?:def|class|function|fn|func|sub)\s+([A-Za-z_]\w*)")
 TEST_PATH = re.compile(r"(^|/)(tests?|testing)/|(^|/)test_[^/]*$|_test\.[^/]+$|\.(spec|test)\.[^/]+$")
 
 
@@ -106,6 +112,35 @@ def main_file(p, review: dict) -> str | None:
     return max(files, key=lambda x: (x[0], x[1]))[1] if files else None
 
 
+def touched(p, review: dict, path: str) -> tuple[list[tuple[int, int]], set[str]]:
+    """What `review` changes in `path`: the base-side line ranges of its hunks, and the functions
+    or classes they sit in or change."""
+    from . import worktree
+    ranges: list[tuple[int, int]] = []
+    names: set[str] = set()
+    try:
+        base, refs = worktree.resolve_base(p), worktree.reviewed_refs(p, review)
+        for ref in refs:
+            if not worktree._git(p.root, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", check=False):
+                continue
+            for line in worktree._git(p.root, "diff", "-U0", "--no-renames", "--no-color", f"{base}...{ref}",
+                                      "--", path).splitlines():
+                if m := HUNK.match(line):
+                    start = int(m[1])
+                    ranges.append((start, start + max(int(m[2] if m[2] is not None else 1), 1)))
+                    if d := DEF.match(m[3] or ""):
+                        names.add(d[1])
+                elif line[:1] in "+-" and not line.startswith(("+++", "---")) and (d := DEF.match(line[1:])):
+                    names.add(d[1])
+    except Exception:   # unreadable: nothing overlaps
+        pass
+    return ranges, names
+
+
+def overlaps(a: tuple[list[tuple[int, int]], set[str]], b: tuple[list[tuple[int, int]], set[str]]) -> bool:
+    return bool(a[1] & b[1]) or any(s1 <= e2 and s2 <= e1 for s1, e1 in a[0] for s2, e2 in b[0])
+
+
 def failed_reviews(db: DB, since: float) -> list[int]:
     """Reviews that failed or asked for changes since `since`, each once."""
     return [r["task"] for r in db.q(
@@ -127,9 +162,12 @@ def area(p, cfg: dict, review: dict, now: float | None = None) -> dict | None:
     hit = fails & line
     mains: dict[int, str | None] = {}
     if len(hit) < n and (main := main_file(p, review)):
+        # A lineage with one failure joins others on its main file only where their changes overlap.
+        mine = touched(p, review, main) if len(hit) < OWN_FAILS_FOR_FILE else None
         for i in sorted(fails - hit):
             t = db.task(i)
-            if t and (mains.setdefault(i, main_file(p, t)) == main):
+            if t and (mains.setdefault(i, main_file(p, t)) == main) \
+                    and (mine is None or overlaps(mine, touched(p, t, main))):
                 hit.add(i)
     if len(hit) < n:
         return None

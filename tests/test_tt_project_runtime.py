@@ -28887,9 +28887,10 @@ def test_idle_slot_wake_backs_off_to_long_waits_while_every_queued_task_is_gated
     assert st and st["wait"] == float(c["idle_wake_s"]), st
 
 
-def _finish_code(env, p, title, files, result=None, labels=None, before=None):
-    """A code task that committed `files` (name -> lines) on its branch, then handed off. `before`
-    is called with the task id and its branch's head just before the hand-off."""
+def _finish_code(env, p, title, files, result=None, labels=None, before=None, edit=None):
+    """A code task that committed `files` (name -> lines), and what `edit(worktree)` changed, on its
+    branch, then handed off. `before` is called with the task id and its branch's head just before
+    the hand-off."""
     from ttp import worktree
     from ttp.daemon import Daemon
     from ttp.providers.base import RunUsage as Usage
@@ -28899,7 +28900,9 @@ def _finish_code(env, p, title, files, result=None, labels=None, before=None):
     for name, lines in files.items():
         (path / name).parent.mkdir(parents=True, exist_ok=True)
         (path / name).write_text("".join(f"{title} {i}\n" for i in range(lines)))
-    if files:
+    if edit:
+        edit(path)
+    if files or edit:
         _git_out(path, "add", ".")
         _git_out(path, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", title)
     p.db.update_task(tid, status="running", branch=branch)
@@ -29661,6 +29664,52 @@ def test_the_review_area_falls_back_to_the_same_main_file_within_48_hours(env):
     # 0 turns the cap off.
     p.set_config("review.area_fail_cap", 0)
     assert reviewcap.area(p, p.config(), p.db.task(s4["id"])) is None
+
+
+def test_a_single_failure_on_a_busy_main_file_joins_another_lineage_only_where_the_changes_overlap(env):
+    """A lineage with one failed review was capped because 12 failures of a separate lineage had the
+    same main file. Now the main-file fallback needs 2 failures in the review's own lineage; before
+    that only overlapping hunks or functions in the main file join."""
+    p = make(env)
+    from ttp import reviewcap
+    fups = [{"title": "fix it", "spec": "it breaks"}]
+    (p.root / "core.py").write_text("".join(f"def f{i}():\n" + "    x = 1\n" * 8 + f"    return {i}\n\n\n"
+                                            for i in range(10)))
+    _git_out(p.root, "add", "core.py")
+    _git_out(p.root, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "core")
+
+    def stack(title, fn):
+        def edit(path):
+            src = (path / "core.py").read_text()
+            (path / "core.py").write_text(src.replace(f"    return {fn}\n", f"    return {fn}  # {title}\n"))
+        _, _, _, (rev,) = _finish_code(env, p, title, {}, edit=edit)
+        _fail_review(env, p, rev["id"], fups)
+        return rev
+
+    def fixed(rev):
+        return p.db.one("SELECT id FROM tasks WHERE title LIKE ?", (f"Fix review #{rev['id']}:%",)) is not None
+
+    def capped():
+        return [json.loads(r["data"]) for r in p.db.q("SELECT data FROM events WHERE kind=? ORDER BY id",
+                                                      (reviewcap.REVIEW_AREA_EVENT,))]
+    # The busy lineage fails three times on f0 and reaches the cap by itself.
+    a1 = stack("feature", 0)
+    a2 = stack(f"#{a1['depends_on'][1:-1]} follow-up: feature", 0)
+    a3 = stack(f"Fix re-review #{a2['id']}: feature", 0)
+    assert [d["reviews"] for d in capped()] == [[a1["id"], a2["id"], a3["id"]]]
+    # A separate lineage fails once on f9 of the same main file: not pooled, its fix is queued.
+    b = stack("unrelated tidy", 9)
+    assert reviewcap.main_file(p, p.db.task(b["id"])) == "core.py"
+    assert fixed(b) and len(capped()) == 1, "an unrelated lineage on the same main file was capped"
+    assert reviewcap.area(p, p.config(), p.db.task(b["id"])) is None
+    # One failure that changes the busy lineage's own function does join it.
+    c = stack("another take on f0", 0)
+    assert not fixed(c) and capped()[-1]["reviews"] == [a1["id"], a2["id"], a3["id"], c["id"]]
+    # Its second failure in its own lineage brings the plain main-file fallback back.
+    d1 = stack("d work", 5)
+    assert fixed(d1) and len(capped()) == 2
+    d2 = stack(f"#{d1['depends_on'][1:-1]} follow-up: d work", 5)
+    assert not fixed(d2) and {b["id"], d1["id"], d2["id"]} <= set(capped()[-1]["reviews"])
 
 
 def test_a_review_done_with_a_changes_needed_verdict_gates_like_a_failed_review(env):
