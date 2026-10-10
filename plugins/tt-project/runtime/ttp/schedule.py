@@ -267,6 +267,24 @@ def sync_file(p: Any, force: bool = False) -> tuple[bool, str | None]:
     return True, None
 
 
+def held_for_harness_task(p: Any) -> bool:
+    """True while harness/schedules.json has uncommitted changes and a harness task is running:
+    that worker may not have committed the script a new entry runs yet, so the edit waits until
+    it is committed or no harness task runs (then the daemon applies and commits it)."""
+    if not (p.harness / ".git").exists() or not file_path(p).exists():
+        return False
+    if not p.db.one("SELECT r.id FROM runs r JOIN tasks t ON t.id=r.task "
+                    "WHERE r.status='running' AND t.kind='harness' LIMIT 1"):
+        return False
+    import subprocess
+    try:
+        r = subprocess.run(["git", "-C", str(p.harness), "status", "--porcelain", "--", FILE],
+                           capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0 and bool(r.stdout.strip())
+
+
 def before_change(p: Any) -> None:
     """Called before a schedule change that writes back to the file: applies a hand edit the
     daemon has not picked up yet, so the write does not undo it, and refuses while the file is broken."""

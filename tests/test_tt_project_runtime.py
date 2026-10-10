@@ -26529,6 +26529,36 @@ def test_the_daemon_applies_a_hand_edit_of_the_schedules_file(env):
     assert p.db.one("SELECT every_s FROM schedules WHERE name='pr-watch'")["every_s"] == 600
 
 
+def test_an_uncommitted_schedules_edit_waits_while_a_harness_task_runs(env):
+    import subprocess
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    d.sync_schedules()
+    tid = p.db.add_task("Add a probe", "x", kind="harness")
+    p.db.x("INSERT INTO runs(task,role,provider,started,status) VALUES(?,'worker','claude',?,'running')",
+           (tid, time.time()))
+    entries = _sched_file(p) + [{"name": "probe", "kind": "command", "every": "1h",
+                                 "payload": {"command": "bash scripts/probe.sh"}}]
+    (p.harness / "schedules.json").write_text(json.dumps(entries))
+    head = _harness_log(p)[0]
+    d.sync_schedules()
+    assert not p.db.one("SELECT 1 FROM schedules WHERE name='probe'"), "held while uncommitted"
+    assert _harness_log(p)[0] == head, "the daemon does not commit the worker's half-done edit"
+    # The worker commits it: applied, with no extra commit.
+    git = ["git", "-C", str(p.harness), "-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run([*git, "commit", "-qm", "worker: probe", "--", "schedules.json"], check=True)
+    d.sync_schedules()
+    assert p.db.one("SELECT 1 FROM schedules WHERE name='probe'")
+    assert _harness_log(p)[0] == "worker: probe"
+    # An uncommitted edit with no harness task running is applied and committed as before.
+    p.db.x("UPDATE runs SET status='done' WHERE task=?", (tid,))
+    (p.harness / "schedules.json").write_text(json.dumps([e for e in entries if e["name"] != "probe"]))
+    d.sync_schedules()
+    assert not p.db.one("SELECT 1 FROM schedules WHERE name='probe'")
+    assert _harness_log(p)[0] == "schedules: schedules.json applied"
+
+
 def test_a_broken_schedules_file_is_reported_and_left_unapplied(env):
     p = make(env)
     from ttp import coordinator as coord

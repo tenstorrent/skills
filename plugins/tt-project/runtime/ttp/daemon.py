@@ -503,6 +503,8 @@ class Daemon:
         # The content is compared too, once a minute: an edit can keep both mtime and size.
         if not start and sig == self._sched_sig and time.monotonic() - self._sched_read < 60:
             return
+        if sched.held_for_harness_task(self.p):
+            return   # read again next tick: applied once it is committed or the harness task ends
         applied, problem = sched.sync_file(self.p, force=start)
         self._sched_sig, self._sched_read = sig, time.monotonic()
         if applied:
