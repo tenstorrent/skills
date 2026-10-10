@@ -130,9 +130,9 @@ never write to a run folder named in earlier context):
 
 - `done` only with evidence: tests run, numbers measured, files produced.
 - `waiting` when a resource is busy (a machine reservation, a queue, a review). The task comes back
-  after `retry_after_s` without counting as an attempt. Save what you learned first. If a
-  command can tell when the wait is over (a job finished, a file exists, a queue is free), give it
-  as `retry_when`: the harness runs it every few minutes in the project root, without a model, and
+  after `retry_after_s` without counting as an attempt. Save what you learned first. Always give
+  a `retry_when`, a command that tells when the wait is over (a job finished, a file exists, a queue
+  is free; for a wait only time ends, `test "$(date +%s)" -ge <epoch>`): the harness runs it every few minutes in the project root, without a model, and
   brings the task back as soon as it exits 0. Keep it read-only and under a minute. It must exit 0
   once the wait is over whatever the outcome (the job finished or failed), and 1 while it is not:
   while it exits 1 (or 75, a busy `ttp lock`, or 255, ssh not reaching the host) the task stays asleep past `retry_after_s`;
@@ -172,6 +172,8 @@ never write to a run folder named in earlier context):
   job sees its own limit as `TTP_DEVQ_TIMEOUT_S`). A run that needs longer is split into shorter jobs.
   A host reboot wakes waiting tasks at once; add `"survives_reboot": true` if yours does not die with it.
   The next run is a cheap light wake unless you set `wake_tier`; pick standard only if it will do real work.
+  A wake that hands back the same `waiting_for` and `retry_when` with no new commit made no progress:
+  the next wakes run light only, and after 3 the task goes to the coordinator to split or re-plan.
   `next_step` is one short mechanical command (push, a status check), never a plan or an "if ... then"
   to judge. A wake that needs judgment sets `wake_tier` standard and no `next_step`.
 - `blocked` only when access, a credential, funds or a resource you cannot get is missing, or the

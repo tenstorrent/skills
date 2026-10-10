@@ -52,6 +52,9 @@ in `state/runs/<id>/`, so a daemon restart never loses a result.
    after the hand-off it still sleeps, and the coordinator is asked once to fix the probe or cancel.
    A probe that can never pass (command not found, a run dir or worktree that is gone, a devq job
    unknown to its runner) is raised once per wait when it is first seen.
+   A wake that hands back the same wait (`waiting_for`, `retry_when`, branch head) made no
+   progress: later wakes run light only, and after `waiting.max_stale_wakes` (3) the task is
+   blocked for the coordinator to split or re-plan, and not woken again.
 8. The project folder ignores itself; nothing of a project is ever committed to the user's repo.
 9. Secrets live only in `~/.tt-project/secrets.json` (0600). Never in argv, logs or projects.
 10. The runtime is standard-library Python ≥ 3.9. Web assets are static files.

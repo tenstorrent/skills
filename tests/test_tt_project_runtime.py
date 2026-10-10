@@ -3826,6 +3826,78 @@ def test_a_wake_runs_at_light_or_its_wake_tier_never_above_the_task_and_other_ru
         assert " wake" not in started[tid][2].split("## Spec")[0]
 
 
+def test_wakes_that_hand_back_the_same_wait_run_light_then_go_to_the_coordinator(env, monkeypatch):
+    """A wake that hands back the same waiting_for and retry_when made no progress: the next wakes
+    run light whatever the hand-off asks, and the third such wake blocks the task for a split or a
+    re-plan instead of waking it again. A changed wait starts the count over."""
+    p = make(env)
+    from ttp.daemon import Daemon
+    from ttp.db import dump_result
+    same = {"status": "waiting", "summary": "still busy", "waiting_for": "a free board", "wake_tier": "standard",
+            "retry_after_s": 300}
+    monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps(same))
+    tid = p.db.add_task("measure on a board", "s", kind="work", tier="standard", origin="user")
+    p.db.update_task(tid, result=dump_result({**same, "summary": "boards busy", "waits": 1}))
+    d = Daemon(p.base)
+
+    def runs():
+        return p.db.q("SELECT status, note FROM runs WHERE task=? AND role='worker' ORDER BY id", (tid,))
+
+    tiers = []
+    for n in (1, 2, 3):
+        p.db.update_task(tid, not_before=None)
+        assert _run_until(d, p, lambda: len(runs()) == n and runs()[-1]["status"] != "running"
+                          and p.db.task(tid)["status"] in ("queued", "blocked"))
+        tiers.append(json.loads(runs()[-1]["note"])["wake"]["tier"])
+        res = json.loads(p.db.task(tid)["result"])
+        assert res["stale_wakes"] == n
+    assert tiers == ["standard", "light", "light"], "after one unchanged wake no standard model runs"
+    t = p.db.task(tid)
+    assert t["status"] == "blocked" and t["attempts"] == 0
+    assert "no progress after 3 wakes" in t["blocked_reason"] and "split" in t["blocked_reason"]
+    ev = p.db.one("SELECT severity, status FROM events WHERE task=? AND text LIKE '%→ blocked%'", (tid,))
+    assert ev and ev["status"] == "queued", "the coordinator is told"
+    assert not _run_until(d, p, lambda: len(runs()) > 3, timeout=1), "not woken again"
+
+
+def test_a_changed_wait_or_a_new_commit_is_progress_and_a_reboot_or_escalation_is_neither(env):
+    from ttp import budget as bud
+    from ttp.daemon import _stale_wakes, _wait_key
+    prev = {"status": "waiting", "waiting_for": "CI on x", "retry_when": "ttp ci --branch x", "stale_wakes": 1}
+    key = {"key": _wait_key(prev), "head": "a" * 40}
+    prev["wait_key"] = dict(key)
+    assert _stale_wakes(prev, key, False) == 2
+    assert _stale_wakes(prev, {**key, "key": _wait_key({**prev, "waiting_for": "the device"})}, False) == 0
+    assert _stale_wakes(prev, {**key, "key": _wait_key({**prev, "retry_when": "test -e m"})}, False) == 0
+    assert _stale_wakes(prev, {**key, "head": "b" * 40}, False) == 0, "a new commit is progress"
+    assert _stale_wakes({**prev, "waiting_for": "  ci ON  x "}, {**key, "key": _wait_key(
+        {**prev, "waiting_for": "  ci ON  x "})}, False) == 2
+    assert _stale_wakes(prev, key, True) == 1, "an escalating light wake neither counts nor resets"
+    assert _stale_wakes({**prev, "woke": "the host rebooted"}, key, False) == 1
+    assert _stale_wakes({**prev, "status": "failed"}, key, False) == 0, "a first wait starts at 0"
+    old = {k: v for k, v in prev.items() if k != "wait_key"}
+    assert _stale_wakes(old, key, False) == 2, "a hand-off from before the key was kept compares its fields"
+    assert bud.wake_tier("deep", {**prev, "wake_tier": "deep"}) == "light"
+    assert bud.wake_tier("deep", {**prev, "next_step": "read the logs, " * 20}) == "light"
+    assert bud.wake_tier("standard", {**prev, "wake_tier": "standard", "escalated_wake": True}) == "standard"
+    assert bud.wake_tier("standard", {**prev, "stale_wakes": "x", "wake_tier": "standard"}) == "standard"
+
+
+def test_a_wake_prompt_says_the_wait_came_back_unchanged_and_asks_for_a_retry_when(env):
+    p = make(env)
+    from ttp.db import dump_result
+    from ttp.prompts import worker_task
+    tid = p.db.add_task("measure", "s", kind="work", tier="standard", origin="user")
+    p.db.update_task(tid, result=dump_result({"status": "waiting", "summary": "busy", "waiting_for": "a board",
+                                              "stale_wakes": 2}))
+    text = worker_task(p, p.db.task(tid), str(p.root), None, wake={"tier": "light", "escalated": False})
+    assert "unchanged from the last 2 wake(s); at 3 the task goes to the coordinator" in text
+    assert "gave no `retry_when`" in text
+    p.db.update_task(tid, result=dump_result({"status": "waiting", "summary": "busy", "retry_when": "test -e m"}))
+    text = worker_task(p, p.db.task(tid), str(p.root), None, wake={"tier": "light", "escalated": False})
+    assert "unchanged" not in text and "gave no `retry_when`" not in text
+
+
 def test_a_light_wake_escalates_once_at_once_and_free(env, monkeypatch):
     p = make(env)
     from ttp.daemon import Daemon

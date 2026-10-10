@@ -85,7 +85,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "waiting": {"max_hold_s": 21600,
                 # a queued task whose start_when says not yet this long while it names a device or
                 # serving resource is raised once (0: never)
-                "start_resource_stale_s": 10800},
+                "start_resource_stale_s": 10800,
+                "max_stale_wakes": 3},          # max_stale_wakes: 0 = off
     "resources": {},                    # shared-slot limits, e.g. {"device": 1}
     # Lock names that all mean the one device (they share one `ttp lock` slot), and how many tasks
     # tagged needs_device may run at once; `ttp lock` admits one of them at a time to the device.

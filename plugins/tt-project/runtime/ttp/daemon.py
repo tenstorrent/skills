@@ -83,7 +83,7 @@ NOTIFY_FILE = "notify.jsonl"      # `ttp notify` lines a run left for the user (
 NOTIFIES_PER_RUN = 3
 # What a waiting hand-off keeps across a run the account refused (limit, auth).
 WAIT_KEYS = ("retry_when", "retry_after_s", "waiting_for", "wake_tier", "next_step", "survives_reboot", "waits",
-             "waiting_since")
+             "waiting_since", "stale_wakes", "wait_key")
 MAX_FOLLOWUPS, FOLLOWUP_SPEC_CHARS = 12, 4000   # per hand-off; each follow-up is its own event
 # What a review the daemon queues repeats of the code task's spec and hand-off.
 AUTO_REVIEW_SPEC_CHARS, AUTO_REVIEW_SUMMARY_CHARS = 2000, 1000
@@ -2103,6 +2103,14 @@ class Daemon:
                 waits = 1
             what = str(result.get("waiting_for") or summary)[:300]
             extra["waits"] = waits
+            # A wake that hands back the same wait (what it waits for and its probe, on the same branch
+            # head) made no progress: from then on the task wakes only at light, and past
+            # waiting.max_stale_wakes it is the coordinator's to split or re-plan, not woken again.
+            prev_res = load_result(task["result"])
+            key = {"key": _wait_key(result), "head": self._branch_head(task)}
+            stale = _stale_wakes(prev_res, key, escalate)
+            extra.update(wait_key=key, stale_wakes=stale)
+            max_stale = int((self.cfg.get("waiting") or {}).get("max_stale_wakes", 3) or 0)
             gate_probe = result.get("retry_when") if escalate else None
             gate_probe = gate_probe.strip() if isinstance(gate_probe, str) and gate_probe.strip() else None
             if escalate and gate_probe:
@@ -2118,6 +2126,9 @@ class Daemon:
                 reason = f"woke at {wake['tier']} and found work; runs again now at {up}"
             elif waits > int(self.cfg["budget"].get("max_waits", 24)):
                 new, reason = "blocked", f"still waiting after {waits} tries: {what}"
+            elif max_stale and stale >= max_stale:
+                new, reason = "blocked", (f"no progress after {stale} wakes waiting for {what}: needs a split or "
+                                          f"a re-plan (a probe that tells when the wait is over, or smaller steps)")
             elif rebooted and not orderly and result.get("survives_reboot") is not True and (
                     n := self._reboot_losses(task["id"]) + wakes) >= int(
                     self.cfg["budget"].get("max_reboot_losses", 3)):
@@ -2169,7 +2180,8 @@ class Daemon:
         upd = {"status": new, "attempts": attempts, "result": dump_result(
             {"summary": summary, "status": shown, **extra,
              **({k: v for k, v in result.items()
-                 if k not in ("summary", "waits", "waiting_since", "woke", "reboot_wakes", "escalated_wake")}
+                 if k not in ("summary", "waits", "waiting_since", "woke", "reboot_wakes", "escalated_wake",
+                              "stale_wakes", "wait_key")}
                 if isinstance(result, dict) else {})})}
         if reason:
             upd["blocked_reason"] = reason[:500]
@@ -4028,6 +4040,16 @@ class Daemon:
         dirs = db.q("SELECT dir FROM runs WHERE task=? AND boot_id=? AND dir IS NOT NULL", (tid, last["boot_id"]))
         return any(not Path(j["rc"]).exists() for r in dirs for j in _detached_jobs(Path(r["dir"])))
 
+    def _branch_head(self, task: dict) -> str:
+        """The commit a task's own branch points at, or "": a new commit there is progress."""
+        if not task["branch"] or not worktree.own_worktree(task):
+            return ""
+        try:
+            return worktree._git(self.p.root, "rev-parse", "--verify", "-q", f"refs/heads/{task['branch']}^{{commit}}",
+                                 check=False)
+        except (OSError, subprocess.SubprocessError):
+            return ""
+
     def _reboot_losses(self, tid: int, key: str = "lost_to_reboot") -> int:
         """Runs of the task lost to an abrupt host reboot (or, by key, a host sleep) since it was last
         blocked: a person or the coordinator who requeues a task blocked for reboots starts its count
@@ -5610,6 +5632,27 @@ def _last_notes(run_dir: Path, n: int = 5) -> list[str]:
     except OSError:
         return []
     return [x[:300] for x in lines if x.strip()][-n:]
+
+
+def _wait_key(result: dict) -> str:
+    """What a waiting hand-off waits for, as compared between wakes: its waiting_for and retry_when,
+    whitespace and case aside."""
+    return "\x00".join(" ".join(str(result.get(k) or "").split()).lower() for k in ("waiting_for", "retry_when"))
+
+
+def _stale_wakes(prev: dict, key: dict, escalate: bool) -> int:
+    """How many wakes in a row handed back the same wait (`key`) as the hand-off they woke from (`prev`).
+    A first wait, a changed wait or a new branch head starts over at 0. A light wake that escalates,
+    and a wake the host's reboot caused, neither count nor reset."""
+    if not isinstance(prev, dict) or prev.get("status") != "waiting":
+        return 0
+    n = bud.stale_wakes(prev)
+    if escalate or str(prev.get("woke") or "").startswith("the host rebooted"):
+        return n
+    before = prev.get("wait_key")
+    if not isinstance(before, dict):
+        before = {"key": _wait_key(prev), "head": key.get("head")}   # a hand-off from before this was kept
+    return n + 1 if before.get("key") == key.get("key") and before.get("head") == key.get("head") else 0
 
 
 def _retry_s(result: dict) -> float:

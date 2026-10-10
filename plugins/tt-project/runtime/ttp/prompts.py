@@ -218,6 +218,17 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
         history += (f"This run is a {run_tier} wake: check whether the wait is over. If it is and substantial "
                     f"work remains, hand off `waiting` with `retry_after_s: 0` and `wake_tier: \"{task['tier']}\"` "
                     f"at once: the task runs again now at its own tier, without costing an attempt.\n")
+    if wake and not wake.get("escalated"):
+        stale = bud.stale_wakes(prev)
+        cap = int((cfg.get("waiting") or {}).get("max_stale_wakes", 3) or 0)
+        if stale:
+            history += (f"This wait came back unchanged from the last {stale} wake(s)"
+                        + (f"; at {cap} the task goes to the coordinator to split or re-plan" if cap else "")
+                        + ". If it is still not over, hand off `waiting` with a `retry_when` probe that exits 0 "
+                          "once it is: the daemon checks it without a model.\n")
+        if not str(prev.get("retry_when") or "").strip():
+            history += ("The last hand-off gave no `retry_when`, so only a model run could check this wait. "
+                        "If you hand off `waiting` again, give one.\n")
     old_id = continues_id(task)
     old = p.db.task(old_id) if old_id else None
     if old:

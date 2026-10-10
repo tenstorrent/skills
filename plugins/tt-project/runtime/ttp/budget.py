@@ -519,14 +519,26 @@ def wake_tier(tier: str, prev: dict) -> str | None:
     own tier. A hand-off whose `next_step` is one mechanical step (say `push`; see mechanical_step)
     wakes at light: that run does the step itself. A `wake_tier` above light, an escalated light
     wake (`escalated_wake`) or a `next_step` too long to be one step means judgment: the hand-off's
-    `wake_tier` wins, and without one a long `next_step` wakes at the task's own tier."""
+    `wake_tier` wins, and without one a long `next_step` wakes at the task's own tier. A wait that a
+    wake already handed back unchanged (`stale_wakes`) wakes at light whatever it asks: only a light
+    wake that found work and escalated runs above it."""
     if not isinstance(prev, dict) or prev.get("status") != "waiting":
         return None
     tier = tier if tier in TIER_ORDER else "standard"
+    if stale_wakes(prev) and not prev.get("escalated_wake"):
+        return TIER_ORDER[0]
     want = "light" if mechanical_step(prev) else prev.get("wake_tier")
     if want not in TIER_ORDER:
         want = "light" if (prev.get("retry_when") or prev.get("waiting_for")) and not next_step(prev) else tier
     return min(want, tier, key=TIER_ORDER.index)
+
+
+def stale_wakes(prev: dict) -> int:
+    """How many wakes in a row handed this wait back unchanged (the daemon's count), or 0."""
+    try:
+        return max(int(prev.get("stale_wakes") or 0), 0) if isinstance(prev, dict) else 0
+    except (TypeError, ValueError):
+        return 0
 
 
 # A next_step longer than this is a plan, not one mechanical step.
