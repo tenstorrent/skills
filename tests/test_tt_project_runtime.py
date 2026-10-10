@@ -13793,6 +13793,93 @@ def test_the_idle_slot_wake_fires_below_the_line_and_backs_off(env):
     assert not turn_after(3000), "a plan in its last stretch before the line needs no extra work"
 
 
+def _stall_events(p):
+    return p.db.q("SELECT * FROM events WHERE kind='observation' AND source='daemon' AND fingerprint LIKE 'stall:%' "
+                  "ORDER BY id")
+
+
+def test_stall_check_raises_one_high_observation_per_stall_listing_each_hold(env):
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    p = make(env)
+    _no_events(p)
+    now = time.time()
+    d = Daemon(p.base)
+    d._started = now - 86400
+    run = "INSERT INTO runs(task,role,started,ended,status) VALUES(?,'worker',?,?,'ok')"
+    p.db.x(run, (None, now - 4 * 3600, now - 4 * 3600 + 60))
+    assert coord.apply(p, [{"type": "task_add", "title": "after the fix lands", "spec": "s",
+                            "start_when": "git log origin/main --oneline | grep -q 'fix the thing'"},
+                           {"type": "task_add", "title": "after the board", "spec": "s",
+                            "start_when": "test -f /tmp/board-ready"}]) == []
+    waiting = p.db.add_task("waits on a job", "s", kind="work", tier="light", origin="coordinator")
+    p.db.update_task(waiting, not_before=now + 7200,
+                     result=json.dumps({"status": "waiting", "retry_when": "git branch -r --contains abc | grep -q main"}))
+    p.db.x(run, (waiting, now - 5 * 3600, now - 4.5 * 3600))
+    p.db.x("UPDATE tasks SET created=? WHERE status='queued'", (now - 6 * 3600,))
+
+    d.check_stall()
+    evs = _stall_events(p)
+    assert len(evs) == 1, "a stall past stall_wake_h raises one observation"
+    e = evs[0]
+    assert e["severity"] == "high" and e["status"] == "queued", "it wakes the coordinator"
+    ids = [t["id"] for t in p.db.q("SELECT id FROM tasks WHERE status='queued' ORDER BY id")]
+    for tid in ids:
+        assert f"#{tid} " in e["text"], f"held task #{tid} is listed"
+    assert "fix the thing" in e["text"] and "timer until" in e["text"], "each probe or timer is named"
+    assert "(held 4.5 h)" in e["text"], "the waiting task is held since its run ended"
+    flagged = e["text"].split("landed:#<id>` instead:")[1]
+    assert f"#{ids[0]}" in flagged and f"#{waiting}" in flagged and f"#{ids[1]}" not in flagged, \
+        "probes that grep commit messages or branch logs are flagged, others are not"
+
+    p.db.add_task("one more", "s", kind="work", tier="light", origin="coordinator", not_before=now + 3600)
+    d._stall_checked = 0.0
+    d.check_stall()
+    assert len(_stall_events(p)) == 1, "a change in the held tasks does not raise the same stall again"
+
+    p.db.x(run, (None, now - 3.5 * 3600, now - 3.4 * 3600))
+    d._stall_checked = 0.0
+    d.check_stall()
+    evs = _stall_events(p)
+    assert len(evs) == 2 and evs[0]["fingerprint"] != evs[1]["fingerprint"], \
+        "a worker run that started ends the stall; a new one past the threshold is raised once more"
+
+
+def test_stall_check_stays_quiet_when_nothing_is_stalled(env):
+    from ttp.daemon import Daemon
+    p = make(env)
+    _no_events(p)
+    now = time.time()
+    d = Daemon(p.base)
+    run = "INSERT INTO runs(role,started,status) VALUES('worker',?,?)"
+
+    def raised():
+        d._stall_checked = 0.0
+        d.check_stall()
+        return len(_stall_events(p))
+
+    p.db.x(run, (now - 5 * 3600, "ok"))
+    assert raised() == 0, "nothing queued is no stall"
+    tid = p.db.add_task("later", "s", kind="work", tier="light", origin="coordinator", not_before=now + 3600)
+    p.db.x("UPDATE tasks SET created=? WHERE id=?", (now - 5 * 3600, tid))
+    assert raised() == 0, "a daemon that just started gives probes and timers a chance first"
+    d._started = now - 86400
+    d.cfg["coordinator"]["stall_wake_h"] = 0
+    assert raised() == 0, "stall_wake_h 0 turns the check off"
+    d.cfg["coordinator"]["stall_wake_h"] = 6
+    assert raised() == 0, "a stall shorter than stall_wake_h is not raised"
+    d.cfg["coordinator"]["stall_wake_h"] = 3
+    slots = int(d.cfg["budget"].get("max_parallel_workers", 6))
+    for _ in range(slots):
+        p.db.x(run, (now - 4 * 3600, "running"))
+    assert raised() == 0, "every slot busy is no stall"
+    p.db.x("UPDATE runs SET status='ok' WHERE status='running'")
+    p.db.x("UPDATE tasks SET created=? WHERE id=?", (now - 60, tid))
+    assert raised() == 0, "the queue has not waited stall_wake_h yet"
+    p.db.x("UPDATE tasks SET created=? WHERE id=?", (now - 5 * 3600, tid))
+    assert raised() == 1
+
+
 def _objects(schema):
     if isinstance(schema, dict):
         if schema.get("type") == "object" or "properties" in schema:

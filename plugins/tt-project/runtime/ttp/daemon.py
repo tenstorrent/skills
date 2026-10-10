@@ -136,6 +136,9 @@ CONFIG_UNREADABLE_KEY = "config_unreadable"   # kv: project.json and its last go
 ALERT_KEEP_S = 30 * 86400   # alerts_sent keeps an entry this long: the longest every_s any alert uses
 ROOT_CHECKOUT_KEY = "root_checkout"   # kv: task -> its open alert on what a run left in the project root's checkout
 ROOT_RECHECK_S = 300   # an open root-checkout alert's condition is looked at again this often
+STALL_KEY = "stall"   # kv: {"run": the last worker run when a stall was raised} (Daemon.check_stall)
+STALL_SETTLE_S = 600   # after a daemon start, probes and timers get this long before a stall is raised
+STALL_LIST_MAX = 30    # held tasks listed in one stall observation
 STALE_HOLDS_KEY = "holds_stale"   # kv: run -> its hold alerted as kept for a closed task (Daemon.alert_stale_holds)
 SLEPT_MIN_S = 60        # a run whose wall clock ran this much ahead of its monotonic clock overlapped a host sleep
 SLEEPS_KEPT_S = 7 * 86400
@@ -623,7 +626,7 @@ class Daemon:
         core = self.cfg.get("core_provider") or "claude"
         core_held = self.net_held(core) and not self._net_may_probe(core)
         for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.read_upstream,
-                     self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.retire_ended, self.route_machines, self.refresh_coverage, self.sweep_holds, self.maybe_coordinate, self.probe_waiting, self.start_pushes, self.dispatch, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
+                     self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.retire_ended, self.route_machines, self.refresh_coverage, self.sweep_holds, self.maybe_coordinate, self.probe_waiting, self.start_pushes, self.dispatch, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
                 continue   # no routing to start model work with (see _load_config)
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
@@ -2867,6 +2870,78 @@ class Daemon:
         if v.wake:
             self.p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
                         (time.time(), source, "observation", v.fingerprint, v.severity, text[:4000], "queued"))
+
+    def check_stall(self, every_s: float = 60) -> None:
+        """Model-free stall check. The idle-slot wake backs off up to a day while every queued task
+        waits on its own probe or timer, trusting those to wake the coordinator. When none of them
+        does, nothing starts for hours: once no worker run has started for coordinator.stall_wake_h
+        (default 3, 0: off) while worker slots are free, a budget gate allows new work and tasks
+        are queued, raise one high observation listing each queued task's hold (probe, timer,
+        dependency or resource) and how long it has been held, and flag probes that grep commit
+        messages or branch logs. One per stall: keyed on the last worker run started, so a change
+        in the held tasks does not wake the coordinator again; a new worker run ends the stall."""
+        now = time.time()
+        if now - getattr(self, "_stall_checked", 0.0) < every_s:
+            return
+        self._stall_checked = now
+        db = self.p.db
+        hours = float(self.cfg["coordinator"].get("stall_wake_h", 3) or 0)
+        if hours <= 0 or now - self._started < STALL_SETTLE_S:
+            return
+        if self.gates and not any(g.allow_new_work for g in self.gates.values()):
+            return   # the budget holds new work: that has its own alerts
+        slots = int(self.cfg["budget"].get("max_parallel_workers", 6))
+        running = db.one("SELECT COUNT(*) n FROM runs WHERE status='running' AND role!='coordinator'")["n"]
+        if running >= slots:
+            return
+        queued = db.q("SELECT * FROM tasks WHERE status='queued' ORDER BY priority, id")
+        if not queued:
+            return
+        last = db.one("SELECT id, started FROM runs WHERE role!='coordinator' ORDER BY started DESC, id DESC LIMIT 1")
+        last_id = int(last["id"]) if last else 0
+        if int((db.kv(STALL_KEY) or {}).get("run", -1)) == last_id:
+            return   # this stall was raised already
+        # Stalled since the last worker run started, or since the oldest queued task came, if later.
+        since = max(float(last["started"] or 0) if last else 0.0, min(float(t["created"] or now) for t in queued))
+        if now - since < hours * 3600:
+            return
+        states = {r["id"]: r["status"] for r in db.q("SELECT id, status FROM tasks")}
+        lines, grep_ids = [], []
+        for t in queued:
+            d = deferral(t)
+            res = load_result(t["result"])
+            probe = d.get("when") or (res.get("retry_when") if isinstance(res.get("retry_when"), str) else None)
+            deps = [x for x in json.loads(t["depends_on"] or "[]") if states.get(x) != "done"]
+            ended = db.one("SELECT MAX(ended) t FROM runs WHERE task=?", (t["id"],))["t"]
+            held_at = d.get("since") or ended or t["created"] or now
+            nb = max(float(t["not_before"] or 0), float(d.get("after") or 0))
+            what = []
+            if probe:
+                what.append(f"{'start_when' if d.get('when') else 'retry_when'} `{waitheal.clip(probe, 160)}`")
+                if waitheal.greps_history(probe):
+                    grep_ids.append(t["id"])
+            if nb > now:
+                what.append(f"timer until {time.strftime('%Y-%m-%d %H:%M', time.localtime(nb))}")
+            if deps:
+                what.append("after " + ", ".join(f"#{x}" for x in deps))
+            if not what and not self._resources_free(t):
+                what.append("its resource is busy: " + ", ".join(_exclusive(t) + _shared(t)))
+            lines.append(f"#{t['id']} {t['title'][:60]}: {'; '.join(what) or 'ready, but not started'} "
+                         f"(held {(now - float(held_at)) / 3600:.1f} h)")
+        more = f" (+{len(lines) - STALL_LIST_MAX} more)" if len(lines) > STALL_LIST_MAX else ""
+        text = (f"Stall: no worker run has started for {(now - since) / 3600:.1f} h while {slots - running} of "
+                f"{slots} worker slots are free and {len(queued)} task(s) are queued. The probes and timers below "
+                f"have not let any of them start. Check each hold: fix or cancel a probe that cannot pass, "
+                f"bring forward a timer that waits for nothing, start what is ready.\n"
+                + "\n".join(f"- {x}" for x in lines[:STALL_LIST_MAX]) + more)
+        if grep_ids:
+            text += ("\nThese probes grep commit messages or branch logs, which a squash, rebase or reworded "
+                     "landing never matches; wait on `landed:#<id>` instead: " + ", ".join(f"#{x}" for x in grep_ids) + ".")
+        with db.tx():
+            db.set_kv(STALL_KEY, {"run": last_id, "at": now})
+            db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
+                 (now, "daemon", "observation", f"stall:{last_id}", "high", text[:4000], "queued"))
+        log(self.p, f"stall: no worker run for {(now - since) / 3600:.1f} h, {len(queued)} queued")
 
     # coordinator ------------------------------------------------------------------------------------
     def retry_rejected(self) -> None:

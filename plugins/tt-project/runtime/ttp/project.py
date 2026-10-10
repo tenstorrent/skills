@@ -115,6 +115,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     "debounce_s": 15, "max_events_per_turn": 40,
                     "max_turns_per_hour": 30, "max_new_tasks_per_day": 200, "idle_wake_s": 3600,
                     "starve_wake_s": 300,
+                    # No worker run started for this long while slots are free and tasks are queued:
+                    # one high observation per stall lists each hold (Daemon.check_stall; 0: off).
+                    "stall_wake_h": 3,
                     # Routine events (task done, follow-ups, notes, normal observations) wait up to
                     # this long for company while every worker slot is busy or runnable work is queued.
                     "batch_s": 300,
