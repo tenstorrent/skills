@@ -560,3 +560,101 @@ def test_the_forked_test_runner_reports_every_test_once_as_one_process_would(tmp
     # One process runs the same tests the same way, but for the test that ends its process.
     single, _ = run(1)
     assert single.returncode != 0 and "2 failed" not in single.stdout, single.stdout
+
+
+BOX_PROBE = PLUGIN / "template" / "bin" / "tt-box-clean-probe"
+PROBE_NOW = "2026-01-10T12:00:00"
+
+
+def _box_probe(tmp_path, jobs=None, up_h=100.0, args=(), broker=None):
+    """Run the box-clean probe at PROBE_NOW with a fake uptime and either a jobs JSON file or a broker."""
+    import subprocess
+    up = tmp_path / "uptime"
+    up.write_text("%.2f 1.00\n" % (up_h * 3600))
+    cmd = [sys.executable, str(BOX_PROBE), "--uptime-file", str(up), "--now", PROBE_NOW, *args]
+    if jobs is not None:
+        f = tmp_path / "jobs.json"
+        f.write_text(json.dumps(jobs))
+        cmd += ["--jobs-file", str(f)]
+    else:
+        cmd += ["--broker-python", str(broker or tmp_path / "no-broker-python")]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    return r.returncode, r.stdout.strip()
+
+
+def _job(hours_ago, owner="alice", status="done", command="pytest tests", job_id="j1"):
+    import datetime as dt
+    t = dt.datetime.fromisoformat(PROBE_NOW) - dt.timedelta(hours=hours_ago)
+    return {"job_id": job_id, "owner": owner, "status": status, "command": command, "queued_at": t.isoformat()}
+
+
+def test_box_clean_probe_ships_executable_and_documented():
+    assert os.access(BOX_PROBE, os.X_OK)
+    assert "tt-box-clean-probe" in (SKILLS / "tt-project-harness" / "SKILL.md").read_text()
+
+
+@pytest.mark.parametrize("job", [
+    _job(3, owner="[broker]power-cycle"), _job(3, owner="[broker]bridge-reset"), _job(3, owner="[broker]reboot"),
+    _job(3, owner="[broker]pci-rescan"), _job(3, owner="[broker]health-gate"),
+    _job(3, owner="[broker]hold", status="started"), _job(3, owner="[broker]fabric-check", status="failed"),
+    _job(3, status="broker-kill"), _job(3, status="hung"), _job(3, command="tt-smi -r 0"),
+    _job(3, command="python -c 'tt_device_reset()'"),
+])
+def test_box_clean_probe_counts_each_incident_kind(tmp_path, job):
+    rc, out = _box_probe(tmp_path, {"jobs": [_job(1), job, _job(30, owner="[broker]power-cycle")]})
+    assert rc == 1, out
+    assert out.startswith("NOT CLEAN: newest incident 2026-01-10 09:00:00 UTC") and "clean at 2026-01-11 09:00" in out
+
+
+def test_box_clean_probe_ignores_routine_and_old_jobs(tmp_path):
+    jobs = [_job(1, owner="[broker]startup"), _job(2, owner="[broker]fabric-check"),
+            _job(3, owner="[broker]hold", status="ended"), _job(4, status="failed"),
+            _job(5, command="tt-smi -s"), _job(25, owner="[broker]power-cycle"), {"job_id": "x", "owner": "[broker]reboot"}]
+    rc, out = _box_probe(tmp_path, {"jobs": jobs})
+    assert (rc, out) == (0, "CLEAN: up 100.0 h, no broker incident since 2026-01-09 12:00 UTC")
+    # A shorter window, aware timestamps and a bare list are read too.
+    aware = [dict(_job(3, owner="[broker]reboot"), queued_at="2026-01-10T11:00:00+01:00")]
+    assert _box_probe(tmp_path, aware, args=["--window-h", "2"])[0] == 1
+    assert _box_probe(tmp_path, aware, args=["--window-h", "1.5"])[0] == 0
+    aware[0]["queued_at"] = "2026-01-10T10:30:00Z"
+    assert _box_probe(tmp_path, aware, args=["--window-h", "2"])[0] == 1
+
+
+def test_box_clean_probe_counts_a_recent_boot_and_short_history(tmp_path):
+    rc, out = _box_probe(tmp_path, {"jobs": []}, up_h=5)
+    assert rc == 1 and "(host boot)" in out and "clean at 2026-01-11 07:00" in out
+    rc, out = _box_probe(tmp_path, {"jobs": [_job(1), _job(2)]}, args=["--limit", "2"])
+    assert rc == 1 and "does not reach back 24.0 h" in out
+    assert _box_probe(tmp_path, {"jobs": [_job(1), _job(30)]}, args=["--limit", "2"])[0] == 0
+
+
+def test_box_clean_probe_degrades_without_a_broker_and_255_when_unreadable(tmp_path):
+    rc, out = _box_probe(tmp_path)
+    assert rc == 0 and "no broker installed, uptime only" in out
+    assert _box_probe(tmp_path, up_h=3)[0] == 1
+    rc, out = _box_probe(tmp_path, args=["--require-broker"])
+    assert rc == 255 and out.startswith("UNKNOWN: no broker python at")
+    for body in ("exit 3", "echo not json", "echo '{\"error\": \"held\"}'"):
+        fake = tmp_path / "broker-python"
+        fake.write_text("#!/bin/sh\n%s\n" % body)
+        fake.chmod(0o755)
+        rc, out = _box_probe(tmp_path, broker=fake)
+        assert rc == 255 and out.startswith("UNKNOWN: broker"), out
+    (tmp_path / "jobs.json").write_text("{")
+    import subprocess
+    r = subprocess.run([sys.executable, str(BOX_PROBE), "--jobs-file", str(tmp_path / "jobs.json"),
+                        "--uptime-file", str(tmp_path / "missing")], capture_output=True, text=True)
+    assert r.returncode == 255 and r.stdout.startswith("UNKNOWN: uptime unreadable")
+
+
+def test_box_clean_probe_queries_the_broker_python(tmp_path):
+    """The broker's python gets the fetch snippet with port, limit and timeout and its JSON is judged."""
+    fake = tmp_path / "broker-python"
+    seen = tmp_path / "argv"
+    payload = json.dumps({"jobs": [_job(2, owner="[broker]health-gate")]})
+    fake.write_text("#!/bin/sh\nprintf '%%s\\n' \"$@\" > %s\necho '%s'\n" % (seen, payload))
+    fake.chmod(0o755)
+    rc, out = _box_probe(tmp_path, broker=fake, args=["--port", "9000", "--limit", "50"])
+    assert rc == 1 and "[broker]health-gate" in out, out
+    text = seen.read_text()
+    assert text.startswith("-c\n") and "tt_device_recent_jobs" in text and text.endswith("\n9000\n50\n40\n")

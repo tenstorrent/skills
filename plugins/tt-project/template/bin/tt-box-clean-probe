@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""Model-free probe: has this box been up and free of device incidents for a whole window?
+
+Use it as a `start_when`, `retry_when` or resource-pause `end_when` instead of a daily model run
+that only checks the box. Read-only: it reads the host's uptime and the tt-device-mcp broker's
+recent jobs, and never touches the device. Run it on the box itself; for another box pipe it over
+ssh: `ssh <box> python3 - --window-h 24 < "$TTP_PROJECT/harness/bin/tt-box-clean-probe"`.
+
+Incidents: a host boot; broker-run bridge-reset, power-cycle, reboot, pci-rescan or health-gate
+jobs; a hold starting; a failed broker job; a tenant job the broker killed, found hung, or that
+ran a device reset. Broker times are naive UTC.
+
+Exit 0: clean for the window. 1: not yet (prints the newest incident and the earliest clean
+time). 255: cannot tell (uptime or the broker unreadable). The harness reads 1 and 255 as not yet.
+With no broker installed it judges on uptime alone, unless --require-broker.
+Stdlib only, Python 3.9+.
+"""
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import subprocess
+import sys
+
+CLEAN, NOT_YET, UNKNOWN = 0, 1, 255
+BROKER_PY = "/opt/tt-device-broker/venv/bin/python3"
+# Broker-run jobs (owner "[broker]<kind>") that mean a drop or a reset. Startup, fabric checks and
+# hold-ended are routine.
+EVENT_KINDS = {"bridge-reset", "power-cycle", "reboot", "pci-rescan", "health-gate"}
+TENANT_BAD = {"broker-kill", "hung"}
+BROKER_BAD = {"failed", "crash"}
+RESET_CMD = re.compile(r"tt-smi\s+(-r\b|-glx_reset|--reset)|tt_device_reset")
+# Runs under the broker's own python, which has tt_device_mcp; prints the tool's JSON.
+FETCH = """
+import json, sys
+from tt_device_mcp import cli
+from tt_device_mcp.constants import DEFAULT_PORT
+port = int(sys.argv[1]) if sys.argv[1] else DEFAULT_PORT
+print(json.dumps(cli.mcp_tool_call(port, "tt_device_recent_jobs", {"limit": int(sys.argv[2])},
+                                   timeout=int(sys.argv[3]))))
+"""
+
+
+def utc_naive(text):
+    """An ISO time as naive UTC; an aware one is converted. None when unparseable."""
+    if not isinstance(text, str) or not text:
+        return None
+    s = text.strip()
+    if s.endswith(("Z", "z")):
+        s = s[:-1] + "+00:00"
+    try:
+        t = dt.datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if t.tzinfo is not None:
+        t = t.astimezone(dt.timezone.utc).replace(tzinfo=None)
+    return t
+
+
+def incident(job):
+    """A one-line description when the job marks an incident, else None."""
+    owner = str(job.get("owner") or "")
+    status = str(job.get("status") or "")
+    cmd = str(job.get("command") or "")
+    if owner.startswith("[broker]"):
+        kind = owner[len("[broker]"):]
+        hit = kind in EVENT_KINDS or (kind == "hold" and status == "started") or status in BROKER_BAD
+    else:
+        hit = status in TENANT_BAD or bool(RESET_CMD.search(cmd))
+    if not hit:
+        return None
+    return "job %s %s %s: %s" % (job.get("job_id", "?"), owner, status, cmd[:80])
+
+
+def judge(jobs, up_s, window_s, now, limit):
+    """(exit code, one line) for these broker jobs (None: no broker) and host uptime."""
+    cutoff = now - dt.timedelta(seconds=window_s)
+    found = []
+    boot = now - dt.timedelta(seconds=up_s)
+    if boot > cutoff:
+        found.append((boot, "host boot"))
+    oldest = now
+    for j in jobs or ():
+        if not isinstance(j, dict):
+            continue
+        t = utc_naive(j.get("queued_at")) or utc_naive(j.get("started_at"))
+        if t is None:
+            continue
+        oldest = min(oldest, t)
+        what = t >= cutoff and incident(j)
+        if what:
+            found.append((t, what))
+    if found:
+        t, what = max(found)
+        return NOT_YET, ("NOT CLEAN: newest incident %s UTC (%s); %d in window; clean at %s UTC at the "
+                         "earliest" % (t.strftime("%Y-%m-%d %H:%M:%S"), what, len(found),
+                                       (t + dt.timedelta(seconds=window_s)).strftime("%Y-%m-%d %H:%M")))
+    if jobs is not None and len(jobs) >= limit and oldest > cutoff:
+        return NOT_YET, ("NOT CLEAN: broker history (%d jobs) does not reach back %.1f h; raise --limit"
+                         % (len(jobs), window_s / 3600))
+    basis = "no broker incident" if jobs is not None else "no broker installed, uptime only"
+    return CLEAN, "CLEAN: up %.1f h, %s since %s UTC" % (up_s / 3600, basis, cutoff.strftime("%Y-%m-%d %H:%M"))
+
+
+def read_jobs(args):
+    """(jobs list or None for no broker, error text or None)."""
+    if args.jobs_file:
+        try:
+            if args.jobs_file == "-":
+                raw = sys.stdin.read()
+            else:
+                with open(args.jobs_file, encoding="utf-8") as f:
+                    raw = f.read()
+        except OSError as e:
+            return None, "jobs file unreadable: %s" % e
+    else:
+        py = args.broker_python
+        if not (os.path.isfile(py) and os.access(py, os.X_OK)):
+            if args.require_broker:
+                return None, "no broker python at %s" % py
+            return None, None
+        try:
+            r = subprocess.run([py, "-c", FETCH, str(args.port or ""), str(args.limit), str(args.timeout)],
+                               capture_output=True, text=True, timeout=args.timeout + 10,
+                               cwd="/", stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return None, "broker query failed: %s" % e
+        if r.returncode != 0:
+            tail = (r.stderr or r.stdout).strip().splitlines()[-1:] or ["no output"]
+            return None, "broker query exited %d: %s" % (r.returncode, tail[0][:200])
+        raw = r.stdout
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None, "broker recent jobs are not JSON: %s" % raw.strip()[:200]
+    jobs = data.get("jobs") if isinstance(data, dict) else data
+    if not isinstance(jobs, list):
+        return None, "broker recent jobs unreadable: %s" % str(data)[:200]
+    return jobs, None
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--window-h", type=float, default=float(os.environ.get("TT_BOX_CLEAN_WINDOW_H", 24)),
+                    help="hours the box must be clean (default 24, env TT_BOX_CLEAN_WINDOW_H)")
+    ap.add_argument("--broker-python", default=os.environ.get("TT_BROKER_PYTHON", BROKER_PY),
+                    help="the broker venv's python (env TT_BROKER_PYTHON, default %(default)s)")
+    ap.add_argument("--port", type=int, default=None, help="broker port (default: the broker's own)")
+    ap.add_argument("--limit", type=int, default=2000, help="recent jobs to read (default 2000)")
+    ap.add_argument("--timeout", type=int, default=40, help="broker query timeout in seconds (default 40)")
+    ap.add_argument("--require-broker", action="store_true",
+                    help="exit 255 when no broker is installed instead of judging on uptime alone")
+    ap.add_argument("--jobs-file", help="read recent jobs JSON from this file ('-': stdin) instead of the broker")
+    ap.add_argument("--uptime-file", default="/proc/uptime", help=argparse.SUPPRESS)
+    ap.add_argument("--now", help=argparse.SUPPRESS)  # naive UTC ISO time, for tests
+    args = ap.parse_args(argv)
+    try:
+        with open(args.uptime_file, encoding="ascii") as f:
+            up_s = float(f.read().split()[0])
+    except (OSError, ValueError, IndexError) as e:
+        print("UNKNOWN: uptime unreadable: %s" % e)
+        return UNKNOWN
+    now = utc_naive(args.now) if args.now else dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+    jobs, err = read_jobs(args)
+    if err:
+        print("UNKNOWN: %s" % err)
+        return UNKNOWN
+    rc, line = judge(jobs, up_s, args.window_h * 3600, now, args.limit)
+    print(line)
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())
