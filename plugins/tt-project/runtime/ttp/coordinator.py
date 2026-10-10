@@ -883,7 +883,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                f"woken when it is")
                     else:
                         why = (f"cap of {cap} {what} in 24 h reached; the next slot frees at "
-                               f"{_clock(free_at)} local, when you are woken to add it again")
+                               f"{_clock(free_at, p)}, when you are woken to add it again")
                     wake = db.kv(RETRY_WAKE_KEY) or {}
                     if not wake.get("at") or free_at < float(wake["at"]):
                         db.set_kv(RETRY_WAKE_KEY, {"at": free_at, "review": review,

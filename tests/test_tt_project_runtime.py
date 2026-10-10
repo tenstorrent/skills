@@ -13187,9 +13187,10 @@ def test_a_rejected_action_waits_for_the_next_turn_instead_of_starting_one(env, 
 
 def test_the_task_cap_names_its_next_slot_marks_the_reply_not_done_and_wakes_then(env, monkeypatch):
     p = make(env)
-    from ttp import coordinator as coord
+    from ttp import coordinator as coord, timefmt
     from ttp.daemon import Daemon
     p.set_config("coordinator.max_new_tasks_per_day", 2)
+    timefmt.set_home(p, "America/Los_Angeles")
     now = time.time()
     old = [p.db.add_task(f"earlier {i}", "s", origin="coordinator") for i in range(2)]
     for tid, ago in zip(old, (3600, 1800)):
@@ -13200,8 +13201,9 @@ def test_the_task_cap_names_its_next_slot_marks_the_reply_not_done_and_wakes_the
     assert p.db.one("SELECT id FROM tasks WHERE title='review the fix'"), "a review counted toward the task cap"
     assert not p.db.one("SELECT id FROM tasks WHERE title='fix it'")
     free_at = now - 3600 + 86400
-    clock_text = time.strftime("%H:%M", time.localtime(free_at))
-    assert len(problems) == 1 and "next slot frees at" in problems[0] and f"{clock_text} local" in problems[0], problems
+    clock_text = coord._clock(free_at, p)
+    assert clock_text.endswith((" PDT", " PST")), clock_text
+    assert len(problems) == 1 and f"next slot frees at {clock_text}," in problems[0], problems
     reply = p.db.one("SELECT text FROM messages WHERE kind='reply'")["text"]
     assert reply.startswith("Starting the fix now.") and "(not done: task_add: cap of 2 new tasks" in reply
     assert abs(p.db.kv(coord.RETRY_WAKE_KEY)["at"] - free_at) < 1
