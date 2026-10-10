@@ -36194,12 +36194,18 @@ def _setting_ask(p, text="May reviewed work land on main? That needs delivery.al
     return p.db.one("SELECT MAX(id) id FROM messages WHERE kind='ask'")["id"]
 
 
+def _with_origin(p):
+    """A code repo with a remote, so a push branch on it is refused only by the setting."""
+    subprocess.run(["git", "-C", str(p.root), "remote", "add", "origin", "https://example.invalid/r.git"], check=True)
+
+
 def test_a_setting_hold_keeps_landing_tasks_off_workers_until_the_setting_is_on(env, monkeypatch):
     """While an open ask names delivery.allow_protected_push_branch (off), tasks that land with `ttp push`
     wait blocked, attempts untouched; everything else runs. Turning it on releases them all together."""
     from ttp import coordinator as coord
     from ttp import settinghold
     p = make(env)
+    _with_origin(p)
     p.set_config("delivery.push_branch", "origin/main")
     land = [p.db.add_task("Land the fix", "Fix it, then land on main with `ttp push --detach`.", kind="code",
                           tier="light", origin="user"),
@@ -36248,6 +36254,7 @@ def test_a_setting_hold_ends_when_its_ask_is_resolved_and_follows_a_newer_ask(en
     from ttp import coordinator as coord
     from ttp import settinghold
     p = make(env)
+    _with_origin(p)
     p.set_config("delivery.push_branch", "origin/main")
     tids = [p.db.add_task(f"Land {n}", "land on main with `ttp push`", kind="code", tier="light", origin="user")
             for n in ("a", "b")]
@@ -36280,7 +36287,7 @@ def test_a_setting_hold_ends_when_its_ask_is_resolved_and_follows_a_newer_ask(en
 
 def test_setting_hold_reads_landing_specs():
     from ttp.settinghold import lands
-    yes = ["land on origin/main with `ttp push`", "Then run ttp push --detach.", "Landing it on the branch is next"]
+    yes = ["land on origin/main with `ttp push`", "Then run ttp push --detach.", "Landing it on the push branch is next"]
     no = ["Never run ttp push.", "publish with `ttp push --own --detach`", "do not land anything",
           "the landed sha is reported", "plain spec"]
     for s in yes:
@@ -36288,6 +36295,53 @@ def test_setting_hold_reads_landing_specs():
     for s in no:
         assert not lands({"kind": "code", "spec": s}), s
     assert not lands({"kind": "review", "spec": yes[0]})
+
+
+@pytest.mark.parametrize("title,spec,held", [
+    ("Fix ttp push retry on conflict", "", False),                       # a mention in a title
+    ("Docs", "The README describes how `ttp push` works", False),        # prose
+    ("Land it", "When reviewed, push with `ttp push --detach`.\nno_push: review only", False),
+    ("Publish", "Publish with `ttp push --detach --own`", False),        # --own after another flag
+    ("Check the plan lands on time", "", False),
+    ("Docs", "Never, under any circumstances at all, run ttp push", False),
+    ("Docs", "Don't, whatever happens, push it with `ttp push`.", False),
+    ("Ship", "When reviewed, push with `ttp push --detach`", True),
+    ("Ship", "Land #12 on the push branch", True),
+    ("Ship", "Land #12 on `origin/main` once checks pass", True),
+    ("Ship", "Steps:\n- fix it\n- `ttp push --detach`", True),
+    ("Ship", "Never skip the tests.\nThen run ttp push.", True),       # a negation in an earlier sentence
+    ("Ship", "no_push: false\nRun ttp push.", True),
+])
+def test_setting_hold_holds_only_landing_instructions(title, spec, held):
+    from ttp.settinghold import lands
+    assert lands({"kind": "code", "title": title, "spec": spec}, "origin/main") is held
+
+
+def test_setting_hold_applies_only_to_a_push_branch_the_setting_refuses(env, tmp_path):
+    """An open ask naming the setting holds landing tasks only while `ttp push` would refuse the push
+    branch with it off and let it through with it on: main/master, or the remote's default branch as
+    the code repo last fetched it (local git only). An ordinary branch holds nothing."""
+    from ttp import settinghold
+    p = make(env)
+    _setting_ask(p)
+    for branch, held in (("origin/feature", False), ("owner/feature", False), ("origin/main", True),
+                         ("master", True)):
+        p.set_config("delivery.push_branch", branch)
+        assert bool(settinghold.active(p.db, p.config())) is held, branch
+        task = {"kind": "code", "title": "Ship", "spec": "When reviewed, push with `ttp push --detach`"}
+        assert bool(settinghold.refused_by(task, settinghold.active(p.db, p.config()), p.config())) is held
+    # The remote's default branch, from the local refs/remotes/<remote>/HEAD (no network).
+    repo = tmp_path / "code"
+    repo.mkdir()
+    for cmd in (["init", "-q", "-b", "trunk"], ["remote", "add", "origin", "https://example.invalid/r.git"],
+                ["commit", "-q", "--allow-empty", "-m", "x"], ["update-ref", "refs/remotes/origin/trunk", "HEAD"],
+                ["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk"]):
+        subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t", *cmd], check=True)
+    p.set_config("delivery.push_branch", "origin/trunk")
+    assert settinghold.active(p.db, p.config(), repo) and not settinghold.active(p.db, p.config())
+    p.set_config("delivery.push_branch", "origin/feature")
+    assert not settinghold.active(p.db, p.config(), repo)
+    assert "no longer refuses" in settinghold.over(p.config(), "delivery.allow_protected_push_branch", {}, repo)
 
 
 def test_stale_holds_raise_one_trigger_per_new_set_and_legacy_holds_count(env):

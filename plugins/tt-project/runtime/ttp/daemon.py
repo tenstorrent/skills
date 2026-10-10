@@ -3105,7 +3105,7 @@ class Daemon:
             ready = [t for t in ready if not logged_out[t["provider"] or core]] + \
                 sorted(out, key=lambda t: rank.get(t["tier"], len(rank)))
         ctx = {"now": now, "paused": paused, "logged_out": logged_out, "busy": busy, "committed": None}
-        holds = settinghold.active(db, self.cfg) if ready else {}
+        holds = settinghold.active(db, self.cfg, self.p.root) if ready else {}
         for task in ready:
             # Before _start_hold, which may reserve the task's resource.
             if holds and self._setting_hold(task, holds, now):
@@ -3960,7 +3960,7 @@ class Daemon:
     def _setting_hold(self, task: dict, holds: dict[str, int], now: float) -> bool:
         """Hold a queued task that a user-only setting being asked about would refuse (settinghold):
         blocked, attempts untouched, anchored on the ask; sweep_holds releases it."""
-        key = settinghold.refused_by(task, holds)
+        key = settinghold.refused_by(task, holds, self.cfg)
         if not key:
             return False
         db = self.p.db
@@ -3980,9 +3980,9 @@ class Daemon:
         held = [(t, k) for t, k in held if k]
         if not held:
             return
-        holds = settinghold.active(self.p.db, self.cfg)
+        holds = settinghold.active(self.p.db, self.cfg, self.p.root)
         for t, key in held:
-            why = settinghold.over(self.cfg, key, holds)
+            why = settinghold.over(self.cfg, key, holds, self.p.root)
             if why:
                 self._release_hold(t, why, now)
             elif anchors.anchor(t) != ("ask", str(holds[key])):
