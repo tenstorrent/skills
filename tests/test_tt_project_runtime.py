@@ -13729,6 +13729,171 @@ def test_the_reaper_never_kills_a_process_that_reused_the_agents_pid(env, tmp_pa
         other.wait()
 
 
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+@pytest.mark.parametrize("fault", ["thread-dies", "one-look-fails"])
+def test_an_error_in_the_watch_thread_never_leaves_the_agent_unwatched(env, tmp_path, monkeypatch, capsys, fault):
+    # The watch thread is the only thing that enforces the wall clock, stall, budget and cancel. An
+    # error in one look is logged and the next look still ends the agent at its limit; a thread that
+    # dies anyway is noticed by the main thread, which ends the agent and writes exit.json.
+    from ttp import runner
+    if fault == "thread-dies":
+        def broken(*a, **kw):
+            raise RuntimeError("watch setup broke")
+        monkeypatch.setattr(runner, "ProgressWatch", broken)
+    else:
+        monkeypatch.setattr(runner.ProgressWatch, "poll", lambda self: 1 / 0)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "prompt.md").write_text("x")
+    (run_dir / "run.json").write_text(json.dumps({
+        "argv": [sys.executable, "-c", "import time; time.sleep(60)"], "env": {}, "cwd": str(tmp_path),
+        "timeout_s": 1, "stall_s": 30, "provider": "fake"}))
+    t0 = time.time()
+    runner.supervise(run_dir)
+    info = json.loads((run_dir / "exit.json").read_text())
+    assert time.time() - t0 < 20, "the agent ran on unwatched"
+    if fault == "thread-dies":
+        assert info["stopped"] == "supervisor_error"
+        assert "watch thread died" in capsys.readouterr().out
+    else:
+        assert info["stopped"] == "timeout"
+        assert "watch error 1: " in capsys.readouterr().out
+
+
+def _hung_run(p, d, tmp_path, token=None, lease_age=999, spec=None, started=None):
+    """A worker run on this boot whose supervisor and agent are live processes (sleeps in sessions of
+    their own) and whose lease is lease_age old. token: the supervisor start recorded beside its pid
+    (its real one by default)."""
+    from ttp import runner
+    tid = p.db.add_task("job", "s", kind="work", tier="light", origin="user")
+    p.db.update_task(tid, status="running")
+    sup = subprocess.Popen(["sleep", "120"], start_new_session=True)
+    agent = subprocess.Popen(["sleep", "120"], start_new_session=True)
+    run_dir = tmp_path / f"run-{sup.pid}"
+    run_dir.mkdir()
+    (run_dir / "output.jsonl").write_text("")
+    (run_dir / "runner.pid").write_text(f"{sup.pid}\n{token or runner.proc_start(sup.pid)}\n")
+    (run_dir / "child.pid").write_text(f"{agent.pid}\n{runner.proc_start(agent.pid)}\n")
+    if spec:
+        (run_dir / "run.json").write_text(json.dumps(spec))
+    (run_dir / "lease").touch()
+    old = time.time() - lease_age
+    os.utime(run_dir / "lease", (old, old))
+    rid = p.db.x("INSERT INTO runs(task,role,provider,started,status,dir,boot_id,pid) VALUES(?,?,?,?,?,?,?,?)",
+                 (tid, "worker", "fake", started or old, "running", str(run_dir), d.boot, sup.pid))
+    return tid, rid, sup, agent
+
+
+class _Awake:
+    def __init__(self):
+        self.up = 1000.0
+
+    def tick(self):
+        return self.up
+
+
+def test_a_live_supervisor_with_a_stale_lease_is_ended_as_hung_after_the_threshold(env, tmp_path):
+    p = make(env)
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    d._awake = clock = _Awake()
+    tid, rid, sup, agent = _hung_run(p, d, tmp_path)
+    try:
+        d.reap_runs()
+        clock.up += dmod.LEASE_HUNG_S - dmod.LEASE_STALE_S - 1
+        d.reap_runs()
+        assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == "running"
+        assert sup.poll() is None and agent.poll() is None, "ended before the threshold"
+        clock.up += 2
+        d.reap_runs()
+        row = p.db.one("SELECT status, note FROM runs WHERE id=?", (rid,))
+        assert row["status"] == "stalled" and json.loads(row["note"])["stopped"] == "hung"
+        assert _wait(lambda: sup.poll() is not None and agent.poll() is not None, 15)
+        t = p.db.task(tid)
+        assert t["status"] == "queued" and t["attempts"] == 1, "a hung run counts an attempt like a stall"
+        feed = p.db.q("SELECT kind, severity, text FROM messages WHERE ref=?", (f"hung:{rid}",))
+        assert len(feed) == 1 and feed[0]["kind"] == "info" and feed[0]["severity"] == "low", feed
+        assert not p.db.q("SELECT 1 FROM events WHERE task=? AND status='queued'", (tid,)), "a hung run needs no turn"
+    finally:
+        for proc in (sup, agent):
+            proc.kill()
+            proc.wait()
+
+
+def test_a_reused_supervisor_pid_is_reaped_as_lost_and_never_signalled(env, tmp_path):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    tid, rid, sup, agent = _hung_run(p, d, tmp_path, token="1")   # the supervisor had another start
+    try:
+        d.reap_runs()
+        assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == "lost"
+        time.sleep(0.5)
+        assert sup.poll() is None, "the reaper signalled a process that only reused the supervisor's pid"
+    finally:
+        for proc in (sup, agent):
+            proc.kill()
+            proc.wait()
+
+
+def test_a_host_sleep_never_makes_a_stale_lease_hung(env, tmp_path, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dmod, runner
+    d = dmod.Daemon(p.base)
+    real = time
+
+    class Clock:   # the host sleeps: the wall clock jumps, the monotonic one stands still
+        jump = 0.0
+
+        @staticmethod
+        def monotonic():
+            return real.monotonic()
+
+        @staticmethod
+        def time():
+            return real.time() + Clock.jump
+    monkeypatch.setattr(runner, "time", Clock)
+    d._awake = runner.AwakeClock()
+    tid, rid, sup, agent = _hung_run(p, d, tmp_path)
+    try:
+        d.reap_runs()
+        Clock.jump = 7200.0
+        d.reap_runs()
+        assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == "running"
+        assert sup.poll() is None and agent.poll() is None
+    finally:
+        for proc in (sup, agent):
+            proc.kill()
+            proc.wait()
+
+
+@pytest.mark.parametrize("asleep", [False, True])
+def test_a_run_far_past_its_own_limits_is_ended_unless_the_host_slept(env, tmp_path, asleep):
+    # The backstop: even with its lease renewed, a run past timeout + waits + stall + slack of awake
+    # time has a supervisor that does not enforce its wall clock.
+    p = make(env)
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    now = time.time()
+    started = now - 60 - 30 - dmod.BACKSTOP_SLACK_S - 100
+    if asleep:
+        p.db.set_kv("host_sleeps", [[started + 10, started + 1000]])
+    tid, rid, sup, agent = _hung_run(p, d, tmp_path, lease_age=0, started=started,
+                                     spec={"timeout_s": 60, "stall_s": 30})
+    try:
+        d.reap_runs()
+        row = p.db.one("SELECT status, note FROM runs WHERE id=?", (rid,))
+        if asleep:
+            assert row["status"] == "running"
+        else:
+            assert row["status"] == "stalled" and json.loads(row["note"])["stopped"] == "overdue"
+            assert _wait(lambda: sup.poll() is not None and agent.poll() is not None, 15)
+    finally:
+        for proc in (sup, agent):
+            proc.kill()
+            proc.wait()
+
+
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="the leaderless group is found through /proc")
 @pytest.mark.parametrize("ours", [True, False], ids=["this-run", "another-run"])
 def test_the_reaper_ends_the_tools_of_an_agent_that_already_exited(env, tmp_path, ours):

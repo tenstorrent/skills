@@ -45,6 +45,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 
 from . import poll_s
@@ -53,6 +54,7 @@ from .project import durable_write, lower_priority
 LEASE_EVERY_S = 30
 KILL_AFTER_S = 30
 POLL_S = 5
+WATCH_ERRORS_LOGGED = 20   # a watch error that repeats every poll is logged this many times
 BUDGET_EVERY_S = 10
 TOOL_GRACE_S = 60     # past a pending tool call's own timeout before its silence counts as a stall
 SLEEP_GAP_S = 600     # polls are POLL_S apart: a gap this long between two can only be a host sleep
@@ -313,27 +315,28 @@ def supervise(run_dir: Path) -> int:
         from . import locks
         from .providers import get_provider  # local import: keeps startup cheap
         prov = get_provider(spec["provider"]).use(spec.get("model", ""), spec.get("prices"))
-        last_lease = last_budget = 0.0
-        progress, active = ProgressWatch(out_path, run_dir), 0.0
-        while child.poll() is None:
+        st = {"lease": 0.0, "budget": 0.0, "active": 0.0}
+        progress = ProgressWatch(out_path, run_dir)
+
+        def look() -> None:
             now, up = time.time(), awake.tick()
-            if now - last_lease >= LEASE_EVERY_S:
+            if now - st["lease"] >= LEASE_EVERY_S:
                 try:
                     _touch(lease)
                 except OSError:   # the run dir is gone: stop_reason below ends the agent
                     pass
-                last_lease = now
+                st["lease"] = now
             if up > timeout_s + min(locks.waited(run_dir), timeout_s):
                 threading.Thread(target=stop, args=("timeout",), daemon=True).start()
             if stall_s:
                 # Stalled = no assistant message, tool result or progress note for stall_s of awake
                 # time, or for a pending tool call's own timeout (plus grace) when that is longer.
                 if progress.poll():
-                    active = up
-                elif up - active > progress.limit(stall_s):
+                    st["active"] = up
+                elif up - st["active"] > progress.limit(stall_s):
                     threading.Thread(target=stop, args=("stalled",), daemon=True).start()
-            if budget is not None and now - last_budget >= BUDGET_EVERY_S:
-                last_budget = now
+            if budget is not None and now - st["budget"] >= BUDGET_EVERY_S:
+                st["budget"] = now
                 try:
                     so_far = prov.cost_so_far(out_path)
                 except Exception:
@@ -343,11 +346,33 @@ def supervise(run_dir: Path) -> int:
             why = stop_reason(run_dir)
             if why:
                 threading.Thread(target=stop, args=(why,), daemon=True).start()
+
+        errors = 0
+        while child.poll() is None:
+            try:
+                look()
+            except Exception:
+                # One failed look must not end the only thread that enforces the limits: log it, go on.
+                errors += 1
+                if errors <= WATCH_ERRORS_LOGGED:
+                    print(f"runner: watch error {errors}: " + traceback.format_exc().replace("\n", " | ")[:2000],
+                          flush=True)
             time.sleep(poll_s(POLL_S))
 
     t = threading.Thread(target=watch, daemon=True)
     t.start()
-    rc = child.wait()
+    while True:
+        try:
+            rc = child.wait(timeout=poll_s(POLL_S))
+            break
+        except subprocess.TimeoutExpired:
+            pass
+        if not t.is_alive() and child.poll() is None:
+            # The watch thread died anyway: nothing enforces the wall clock, stall, budget or cancel.
+            print("runner: the watch thread died; ending the agent", flush=True)
+            stop("supervisor_error")
+            rc = child.wait()
+            break
     ended, mono_end, up = time.time(), time.monotonic(), awake.tick()
     if guard is not None:   # a normal end: the watchdog leaves the group alone
         try:

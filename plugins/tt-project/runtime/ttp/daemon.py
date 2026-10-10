@@ -101,6 +101,12 @@ PROBE_TIMEOUT_S = 60
 AUTH_PROBE_S = 900      # while a provider without a login check is logged out, one run on it checks this often
 AUTH_CHECK_S = (60, 120, 300, 600, 1200, 1800)   # backoff of the model-free login checks of an open breaker
 ORPHAN_GRACE_S = 10     # TERM to KILL for an agent whose supervisor died
+# A supervisor whose pid lives but whose lease went stale for this long in awake time is hung (its
+# watch thread died or it is stuck): the daemon ends it and its agent. Also, as a backstop, any run
+# this far past its own wall clock, stall limit and waits.
+LEASE_HUNG_S = 600
+BACKSTOP_SLACK_S = 600
+HUNG_STOPS = ("hung", "overdue", "supervisor_error")   # a broken supervisor's ends: they count as a stall
 HANDOFF_STATES = ("done", "blocked", "failed", "needs_review", "waiting")
 SLEEP_CUT = ("timeout", "stalled", "lost", "failed")   # ends a host sleep can cause
 DISK_LIGHT_KINDS = ("question", "plan")   # the only task kinds that still start under the disk guard
@@ -349,6 +355,8 @@ class Daemon:
         self._held: list[str] | None = None   # lock holders the heartbeat file last recorded
         self._notify: str | None = None   # systemd's socket for the watchdog ping, when it runs us
         self._tick_wall, self._tick_mono = time.time(), time.monotonic()
+        self._awake = runner.AwakeClock()   # the daemon's own awake time: a hung run's stale lease counts in it
+        self._stale_since: dict[int, float] = {}   # run -> awake time its lease was first seen stale from
         self._settle_until = 0.0   # monotonic time before which nothing new starts (the host just woke)
         # provider -> {host, since, checked, checking, up, probe}: its API host must resolve before
         # new runs start on it (net_held). In memory only: a restart tries the network afresh.
@@ -845,6 +853,7 @@ class Daemon:
         self._tick_wall, self._tick_mono = wall, mono
         if jump < SLEPT_MIN_S:
             return
+        self._stale_since.clear()   # every supervisor slept too: its lease gets a fresh look once it renews
         settle = float(self.cfg["budget"].get("wake_settle_s", 300))
         self._settle_until = mono + settle
         db = self.p.db
@@ -1164,6 +1173,11 @@ class Daemon:
             runner.remove_files(private)
             raise
         try:
+            # Its start beside its pid, as child.pid has it: a pid reused later is not this supervisor.
+            durable_write(run_dir / "runner.pid", f"{proc.pid}\n{runner.proc_start(proc.pid) or ''}\n")
+        except OSError as e:
+            log(self.p, f"run {run_id}: could not record its supervisor's start: {e}")
+        try:
             db.x("UPDATE runs SET pid=?, dir=? WHERE id=?", (proc.pid, str(run_dir), run_id))
         except Exception as e:   # launched all the same: the reaper finds it by its run id's directory
             log(self.p, f"run {run_id} started but its pid was not recorded: {e}")
@@ -1183,7 +1197,64 @@ class Daemon:
             fresh = time.time() - (run_dir / "lease").stat().st_mtime <= LEASE_STALE_S
         except OSError:
             fresh = False
-        return fresh or (r["boot_id"] == self.boot and bool(r["pid"]) and _alive(r["pid"]))
+        return fresh or (r["boot_id"] == self.boot and bool(r["pid"]) and _alive(r["pid"])
+                         and self._is_supervisor(r) is not False)
+
+    def _is_supervisor(self, r: dict) -> bool | None:
+        """Whether the run's pid is still its supervisor: the start recorded beside it at launch
+        matches. None when nothing was recorded (a run started before the record was kept)."""
+        try:
+            pid_text, _, started = (self._run_dir(r) / "runner.pid").read_text().partition("\n")
+            if int(pid_text) == r["pid"] and started.strip():
+                return runner.proc_start(r["pid"]) == started.strip()
+        except (OSError, ValueError):
+            pass
+        return None
+
+    def _hung(self, r: dict, up: float) -> str | None:
+        """Why a run whose supervisor's pid lives must be ended anyway: "hung" when its lease has been
+        stale for LEASE_HUNG_S of awake time (a sleep restarts the count), "overdue" when it runs
+        BACKSTOP_SLACK_S of awake time past its own wall clock, waits and stall limit. None otherwise."""
+        if r["boot_id"] != self.boot:
+            return None
+        run_dir = self._run_dir(r)
+        try:
+            age = time.time() - (run_dir / "lease").stat().st_mtime
+        except OSError:
+            age = None
+        if age is not None and age <= LEASE_STALE_S:
+            self._stale_since.pop(r["id"], None)
+        elif up - self._stale_since.setdefault(r["id"], up - (LEASE_STALE_S if age is not None else 0)) \
+                >= LEASE_HUNG_S:
+            return "hung"
+        try:
+            spec = json.loads((run_dir / "run.json").read_text())
+            tout = float(spec.get("timeout_s") or 3600)
+            limit = (tout + min(locks.waited(run_dir), tout) + min(float(spec.get("exclusive_wait_s") or 0), tout)
+                     + float(spec.get("stall_s") or 0) + BACKSTOP_SLACK_S)
+        except (OSError, ValueError, TypeError, AttributeError):
+            return None
+        now = time.time()
+        start = float(r["started"] or now)
+        asleep = sum(max(0.0, min(b, now) - max(a, start)) for a, b in self.p.db.kv("host_sleeps", []) or [])
+        return "overdue" if now - start - asleep > limit else None
+
+    def _end_hung(self, r: dict, why: str) -> None:
+        """End a run whose supervisor lives but no longer enforces its limits: its group and the
+        agent's, TERM then KILL. The run ends as a stall: an attempt, one low feed line, no turn."""
+        pid = r["pid"]
+        log(self.p, f"run {r['id']} {why}: its supervisor (pid {pid}) no longer enforces its limits; ending it")
+        if pid and _alive(pid) and self._is_supervisor(r):
+            _end_group(pid, ORPHAN_GRACE_S)
+        self._end_orphan(r)
+        self._stale_since.pop(r["id"], None)
+        self.finish_run(r, {"rc": -1, "stopped": why, "ended": time.time()})
+        task = self.p.db.task(r["task"]) if r["task"] else None
+        what = f"#{task['id']} {task['title'][:80]}" if task else r["role"]
+        cause = "stopped renewing its lease for 10 min" if why == "hung" else "let it run past its limits"
+        then = f"; the task is now {task['status']}" if task else ""
+        self.p.db.post("out", f"Run {r['id']} ({what}) was ended by the daemon: its supervisor {cause}{then}.",
+                       kind="info", severity="low", ref=f"hung:{r['id']}")
 
     def _last_sign_of_life(self, r) -> float:
         """When a lost run was last seen working, so downtime is not billed to it: the newest mtime
@@ -1199,7 +1270,11 @@ class Daemon:
         return min(now, max(max(seen), r["started"] or 0))
 
     def reap_runs(self) -> None:
-        for r in self.p.db.q("SELECT * FROM runs WHERE status='running'"):
+        up = self._awake.tick()
+        running = self.p.db.q("SELECT * FROM runs WHERE status='running'")
+        for gone in set(self._stale_since) - {r["id"] for r in running}:
+            self._stale_since.pop(gone, None)
+        for r in running:
             try:
                 # Liveness first: a runner writes exit.json before it exits, so a run found dead here
                 # has its exit.json by the look below. The other order calls a run that ends between
@@ -1211,6 +1286,8 @@ class Daemon:
                 elif not alive:
                     self._end_orphan(r)
                     self.finish_run(r, {"rc": -1, "stopped": "lost", "ended": self._last_sign_of_life(r)})
+                elif why := self._hung(r, up):
+                    self._end_hung(r, why)
                 self._reap_errors.pop(r["id"], None)
             except Exception:
                 # One run whose end cannot be processed must not hold up the others or wedge the loop.
@@ -1529,6 +1606,8 @@ class Daemon:
         status = "ok" if exit_info.get("rc") == 0 and not usage.error else "failed"
         if stopped in ("timeout", "budget", "stopped", "lost", "stalled", "shutdown", "resource_busy"):
             status = stopped if stopped != "stopped" else "killed"
+        elif stopped in HUNG_STOPS:
+            status = "stalled"   # its supervisor broke: an attempt like a stall, retried without a turn
         cut_off = None
         if r["role"] != "coordinator" and r["task"] and not (run_dir / RESULT_FILE).exists():
             # Before handed_off: a hand-off misplaced in an earlier run dir also spares this run the
@@ -1550,6 +1629,8 @@ class Daemon:
         elif r["provider"] in self._net_holds and (status == "ok" or _has_tokens(usage)):
             self._end_net_hold(r["provider"], f"run {r['id']} reached its API")
         note = json.loads(r["note"] or "{}")
+        if stopped in HUNG_STOPS:
+            note["stopped"] = stopped
         if usage.session_id:
             note["session_id"] = usage.session_id   # a run the host takes away resumes it (_resumable)
         if "session_cost_usd" in usage.extra:
