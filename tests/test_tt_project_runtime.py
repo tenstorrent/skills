@@ -35732,6 +35732,44 @@ def test_heal_outage_check_exiting_an_error_code_gets_one_task(env):
     assert "heal:svc" in [e["key"] for e in alerts.sweep(p.db)]
 
 
+def test_heal_outage_check_whose_adopted_task_fails_raises_one_high_alert(env):
+    """heal owns the alert once it holds the adopted schedule_fix task: no second schedule:<name>."""
+    import unittest.mock
+    from ttp import schedule as sched
+    p, d, up = _heal_setup(env, outage=True, grace_s=600)
+    payload = json.loads(p.db.one("SELECT payload FROM schedules WHERE name='svc'")["payload"])
+    payload["heal"]["check"] = "exit 124"
+    sched.upsert(p.db, "svc", "command", "5m", payload=payload)
+    now = time.time()
+
+    def tick(at):
+        p.db.x("UPDATE schedules SET next_run=0 WHERE name='svc'")
+        with unittest.mock.patch("time.time", return_value=at):
+            d.run_schedules()
+
+    for dt in (0, 300, 700):
+        tick(now + dt)
+    tid = p.db.one("SELECT id FROM tasks WHERE origin='daemon'")["id"]
+    p.db.update_task(tid, status="failed")
+    for dt in (1000, 1300):
+        tick(now + dt)
+    # The box answers once (unhealthy, not unknown), then goes dark again: the schedule fails twice
+    # more while heal still holds its failed task.
+    def check(cmd):
+        payload["heal"]["check"] = cmd
+        sched.upsert(p.db, "svc", "command", "5m", payload=payload)
+    check("exit 1")
+    tick(now + 1600)
+    check("exit 124")
+    for dt in (1900, 2200, 2500):
+        tick(now + dt)
+        for t in p.db.q("SELECT id FROM tasks WHERE origin='daemon' AND status='queued'"):
+            p.db.update_task(t["id"], status="failed")
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 1
+    rows = p.db.q("SELECT key FROM alerts WHERE cleared IS NULL AND severity='high'")
+    assert [r["key"] for r in rows] == ["heal:svc"], rows
+
+
 def test_landed_falls_back_to_the_local_branch_in_a_repo_with_no_remote(tmp_path, monkeypatch):
     """A remote-less repo: the push target's remote does not exist, so look on refs/heads/<branch>."""
     from ttp import landed, push

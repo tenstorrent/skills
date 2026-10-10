@@ -2608,7 +2608,7 @@ class Daemon:
             if again is not None:   # a heal check's grace end or settle recheck comes before its period
                 db.x("UPDATE schedules SET next_run=MIN(next_run, ?) WHERE name=?", (again, s["name"]))
             if (sched.failing(status) and sched.failing(s["last_status"])
-                    and not (s["kind"] == "command" and payload.get("heal") and heal.has_open_task(db, s["name"]))):
+                    and not (s["kind"] == "command" and payload.get("heal") and heal.owns(db, s["name"]))):
                 self._schedule_broken(s, status)
             elif not sched.failing(status):
                 self._schedule_mended(s["name"])

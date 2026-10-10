@@ -322,6 +322,13 @@ def has_open_task(db: DB, name: str) -> bool:
     return bool(t and t["status"] in OPEN)
 
 
+
+def owns(db: DB, name: str) -> bool:
+    """The check owns its failure: a self-fix task is open, or it holds (or escalated with) one. Its
+    schedule then gets no schedule_fix task or schedule:<name> alert of its own: one per failure."""
+    st = state(db, name)
+    return has_open_task(db, name) or bool(st.get("task") or st.get("escalated"))
+
 # The flow -----------------------------------------------------------------------------------------
 def run(host: Any, name: str, spec: dict, now: float | None = None) -> tuple[str, float | None]:
     """One run of the check for the daemon `host` (it has `p` and `alert`, and may have `_progress`,
