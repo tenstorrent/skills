@@ -356,7 +356,7 @@ def bootstrap(root: Path, name: str, brief: str, provider: str, home_tz: str | N
     db = p.db
     for s in json.loads((template / "recurring.json").read_text()):
         sched.upsert(db, s["name"], s["kind"], s["every"], s.get("at"), s.get("enabled", True),
-                     s.get("budget_usd_day"), s.get("description", ""), s.get("payload", {}), timefmt.home(p))
+                     s.get("budget_usd_day"), s.get("description", ""), s.get("payload", {}), cfg[timefmt.KEY])
     sched.write_file(p, "schedules: from the template", create=True)
     db.set_meta("name", name)
     db.post("in", "Project created. Brief:\n" + (brief.strip() or "(none)") +
