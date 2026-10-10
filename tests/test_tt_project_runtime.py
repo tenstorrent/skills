@@ -30646,27 +30646,70 @@ def test_a_review_approving_a_head_with_rejected_commits_runs_again_and_is_told_
     assert not s.p.db.q("SELECT id FROM push_queue WHERE task=?", (crev,))
 
 
+def _pq_add_reviewed_tasks(db, start, stop):
+    """Code tasks start..stop-1 on branches of their own, each with a finished review naming its branch
+    in the spec (passed and failed in turn)."""
+    with db.conn:
+        for i in range(start, stop):
+            db.conn.execute("INSERT INTO tasks (created, updated, title, spec, kind, status, branch) "
+                            "VALUES (?, ?, ?, '', 'code', 'done', ?)",
+                            (time.time(), time.time(), f"t{i}", f"ttp/t{9000 + i}-change-{i}"))
+            db.conn.execute("INSERT INTO tasks (created, updated, title, spec, kind, status) "
+                            "VALUES (?, ?, ?, ?, 'review', ?)",
+                            (time.time(), time.time(), f"check {i}",
+                             f"Check ttp/t{9000 + i}-change-{i} against the spec.", ("done", "failed")[i % 2]))
+
+
 def test_the_inherited_commit_check_stays_fast_with_many_tasks_and_reviews(env, monkeypatch):
-    # check_approval runs in the daemon's result path: it must not grow with tasks x reviews.
+    # check_approval runs in the daemon's result path: its work must not grow with tasks x reviews.
+    # Counted, not timed against the clock (a loaded machine makes any wall-clock bound flaky): git
+    # calls stay the same however many tasks there are, rows read from the database grow linearly,
+    # and its own CPU time grows sub-quadratically from n to 8n tasks and reviews.
     from ttp import pushq
+    from ttp.db import DB
     s = _pq(env, monkeypatch)
     x, xbranch, _, _ = _pq_stacked(s, "rejected", review="failed")
     c, cbranch, chead, crev = _pq_stacked(s, "stacked", on=xbranch, review="running")
-    with s.p.db.conn:
-        for i in range(600):
-            s.p.db.conn.execute("INSERT INTO tasks (created, updated, title, spec, kind, status, branch) "
-                                "VALUES (?, ?, ?, '', 'code', 'done', ?)",
-                                (time.time(), time.time(), f"t{i}", f"ttp/t{9000 + i}-change-{i}"))
-            s.p.db.conn.execute("INSERT INTO tasks (created, updated, title, spec, kind, status) "
-                                "VALUES (?, ?, ?, ?, 'review', ?)",
-                                (time.time(), time.time(), f"check {i}",
-                                 f"Check ttp/t{9000 + i}-change-{i} against the spec.", ("done", "failed")[i % 2]))
     entries = [{"branch": cbranch, "head": chead}]
-    t0 = time.perf_counter()
-    check = pushq.check_approval(s.p, s.p.db.task(crev), entries)
-    took = time.perf_counter() - t0
-    assert f"carries unreviewed commits from #{x}," in check.get("invalid", ""), check
-    assert took < 0.5, f"check_approval took {took:.2f} s"
+    n = {"git": 0, "rows": 0}
+    run, q, one = subprocess.run, DB.q, DB.one
+
+    def counted_run(*a, **kw):
+        n["git"] += 1
+        return run(*a, **kw)
+
+    def counted_q(self, *a, **kw):
+        rows = q(self, *a, **kw)
+        n["rows"] += len(rows)
+        return rows
+
+    def counted_one(self, *a, **kw):
+        n["rows"] += 1
+        return one(self, *a, **kw)
+
+    def measure():
+        task = s.p.db.task(crev)
+        took = []
+        for _ in range(3):
+            n.update(git=0, rows=0)
+            with monkeypatch.context() as m:
+                m.setattr(pushq.subprocess, "run", counted_run)
+                m.setattr(DB, "q", counted_q)
+                m.setattr(DB, "one", counted_one)
+                t0 = time.process_time()
+                check = pushq.check_approval(s.p, task, entries)
+                took.append(time.process_time() - t0)
+            assert f"carries unreviewed commits from #{x}," in check.get("invalid", ""), check
+        return dict(n, cpu=min(took))
+
+    _pq_add_reviewed_tasks(s.p.db, 0, 100)
+    small = measure()
+    _pq_add_reviewed_tasks(s.p.db, 100, 800)
+    big = measure()
+    assert big["git"] == small["git"], f"git calls grew with the tasks: {small} -> {big}"
+    assert big["rows"] - small["rows"] <= 10 * 700, f"rows read grew faster than the tasks: {small} -> {big}"
+    # 8x the tasks: linear work grows at most 8x (much less, as git dominates), quadratic 64x.
+    assert big["cpu"] < 16 * small["cpu"], f"CPU time grew quadratically: {small} -> {big}"
 
 
 def test_names_branch_matches_the_whole_word_pattern_it_replaces():
