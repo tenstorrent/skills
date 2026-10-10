@@ -671,7 +671,8 @@ def status_text(p: Project) -> str:
     h = health(p, db, alive=state == "running")
     now = time.time()
     counts = db.status_counts()
-    head = f"{p.name}: daemon {state}" + (" (paused)" if db.kv("paused") else "")
+    head = f"{p.name}: daemon {state}" + ((" (paused until reboot)" if db.kv("pause_until_boot") else " (paused)")
+                                          if db.kv("paused") else "")
     head += " · tasks: " + (", ".join(f"{k} {v}" for k, v in sorted(counts.items())) if counts else "none yet")
     lines = [head]
     for m in attention(db, now)[:6]:
@@ -2269,6 +2270,8 @@ def _machine_change(a) -> None:
 
 def cmd_pause(a) -> None:
     p = need(a.name, sys.argv[1:])
+    if a.resource and getattr(a, "until_reboot", False):
+        die("--until-reboot pauses the whole project; a resource pause ends with --until or --end-when")
     if a.resource:
         from .coordinator import pause_resource
         try:
@@ -2280,8 +2283,48 @@ def cmd_pause(a) -> None:
         except ValueError as e:
             die(str(e))
         return
-    p.db.set_kv("paused", a.cmd == "pause")
-    print(f"{p.name} {'paused: no new model runs start' if a.cmd == 'pause' else 'resumed'}")
+    boot = None
+    if a.cmd == "pause" and getattr(a, "until_reboot", False):
+        from .runner import boot_id
+        boot = boot_id()
+        if boot == "unknown":
+            die("--until-reboot: this host's boot id cannot be read (no /proc/sys/kernel/random/boot_id "
+                "or kern.boottime); use a plain pause and resume it after the reboot")
+    p.db.set_paused(a.cmd == "pause", boot)
+    print(f"{p.name} " + ("resumed" if a.cmd != "pause" else "paused: no new model runs start"
+                          + (" until the host reboots; the daemon lifts it on its first tick after boot" if boot else "")))
+
+
+def _draining_runs(p: Project) -> list[dict]:
+    """Runs and pushes in flight in project p, apart from the run calling (TTP_RUN_ID of this project)."""
+    me = os.environ.get("TTP_RUN_ID") if os.environ.get("TTP_PROJECT") and \
+        Path(os.environ["TTP_PROJECT"]).resolve() == Path(p.base).resolve() else None
+    runs = [dict(r) for r in p.db.q("SELECT id,task,role FROM runs WHERE status='running' ORDER BY id")
+            if str(r["id"]) != str(me)]
+    return runs + [{"id": None, "task": t["id"], "role": "push"}
+                   for t in p.db.q("SELECT id FROM tasks WHERE status='pushing' ORDER BY id")]
+
+
+def cmd_drain(a) -> None:
+    """Pause the project (no new runs) and wait until the runs in flight end; running workers are kept."""
+    p = need(a.name, sys.argv[1:])
+    if not p.db.kv("paused", False):
+        p.db.set_paused(True)
+        print(f"{p.name} paused: no new model runs start")
+    end = time.time() + max(0.0, a.wait)
+    while True:
+        left = _draining_runs(p)
+        if not left:
+            print(f"{p.name} drained: no runs in flight")
+            return
+        if time.time() >= end:
+            break
+        time.sleep(min(poll_s(2.0), max(0.1, end - time.time())))
+    what = ", ".join(f"push of task #{r['task']}" if r["role"] == "push" else
+                     f"run {r['id']} ({r['role']}" + (f", task #{r['task']})" if r["task"] else ")") for r in left)
+    print(f"{p.name} not drained after {a.wait:g} s: {len(left)} in flight: {what}. The project stays paused; "
+          f"`ttp resume {p.name}` lifts it", file=sys.stderr)
+    sys.exit(1)
 
 
 def cmd_service(a) -> None:
@@ -3563,7 +3606,15 @@ def main(argv: list[str] | None = None) -> None:
                            help="with --resource: a read-only shell probe that exits 0 once the pause can end")
             s.add_argument("--report-from", dest="report_from", metavar="PROJECT",
                            help="with --resource: the project whose report it waits on; its notes re-prompt the coordinator")
+            s.add_argument("--until-reboot", dest="until_reboot", action="store_true",
+                           help="the whole project until this host reboots: the daemon lifts it on its first tick "
+                                "on a new boot")
         s.set_defaults(fn=cmd_pause)
+    s = sub.add_parser("drain", help="pause the project and wait until its runs in flight end (they are not killed)")
+    s.add_argument("name")
+    s.add_argument("--wait", type=float, default=0, metavar="S",
+                   help="seconds to wait; exits 0 once no run or push is in flight, 1 at the timeout (default 0: check once)")
+    s.set_defaults(fn=cmd_drain)
     for name in ("start", "stop", "restart"):
         s = sub.add_parser(name, help=f"{name} the project's daemon service (running workers are kept)")
         s.add_argument("name")

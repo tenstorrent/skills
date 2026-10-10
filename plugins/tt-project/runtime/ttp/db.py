@@ -15,6 +15,7 @@ from . import billing
 
 SCHEMA_VERSION = 1
 PAUSED_RESOURCES_KEY = "paused_resources"   # kv: see DB.paused_resources
+PAUSE_BOOT_KEY = "pause_until_boot"   # kv: {"boot", "since"} of a `ttp pause --until-reboot`; see DB.set_paused
 SHARED_SEEN_KEY = "shared_pauses_seen"   # kv: {resource: pause} of the shared pauses this project acted on
 WATCHER_ISSUES_MIGRATION = "watcher_issues_per_condition"   # meta: set once DB._migrate has run
 PROVENANCE_MIGRATION = "message_provenance"   # meta: set once inbound messages have their provenance
@@ -343,6 +344,15 @@ class DB:
     def set_kv(self, key: str, value: Any) -> None:
         self.x("INSERT INTO kv(key,value,ts) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET "
                "value=excluded.value, ts=excluded.ts", (key, json.dumps(value), time.time()))
+
+    def set_paused(self, on: bool, boot: str | None = None) -> None:
+        """Pause or resume the whole project. With boot (this host's boot id) the pause lasts until the
+        daemon first ticks on another boot (Daemon.lift_boot_pause); any other pause or resume ends that."""
+        self.set_kv("paused", bool(on))
+        if on and boot:
+            self.set_kv(PAUSE_BOOT_KEY, {"boot": boot, "since": time.time()})
+        else:
+            self.x("DELETE FROM kv WHERE key=?", (PAUSE_BOOT_KEY,))
 
     def paused_resources(self, shared: bool = True) -> dict[str, dict]:
         """Resources paused by name: {"reason", "since", "by"}. Kept in the database, so a pause

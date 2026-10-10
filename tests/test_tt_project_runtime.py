@@ -20987,6 +20987,73 @@ def test_paused_resources_show_in_the_digest_status_and_web_state(env):
     assert "Paused resources" not in coord.digest(p, {}, [], [])
 
 
+def test_a_pause_until_reboot_is_lifted_on_the_first_tick_of_a_new_boot_only(env, monkeypatch, capsys):
+    p = make(env)
+    from ttp import cli, runner
+    from ttp.cli import status_text
+    from ttp.daemon import Daemon
+    monkeypatch.setattr(runner, "boot_id", lambda: "boot-a")
+    cli.main(["pause", "demo", "--until-reboot"])
+    assert "until the host reboots" in capsys.readouterr().out
+    assert p.db.kv("paused") and p.db.kv("pause_until_boot")["boot"] == "boot-a"
+    assert "(paused until reboot)" in status_text(p)
+    # The same boot (a daemon restart): the pause stays.
+    Daemon(p.base).tick()
+    assert p.db.kv("paused") and p.db.kv("pause_until_boot")
+    # A new boot: the first tick lifts it and says so in the feed.
+    monkeypatch.setattr(runner, "boot_id", lambda: "boot-b")
+    Daemon(p.base).tick()
+    assert not p.db.kv("paused") and p.db.kv("pause_until_boot") is None
+    msgs = p.db.q("SELECT text,kind FROM messages WHERE direction='out' AND ref='pause-lifted:boot-b'")
+    assert len(msgs) == 1 and msgs[0]["kind"] == "info" and "lifted" in msgs[0]["text"], msgs
+    # A plain pause is never lifted by a boot, also one set over a pause until reboot.
+    cli.main(["pause", "demo", "--until-reboot"])
+    cli.main(["pause", "demo"])
+    assert p.db.kv("pause_until_boot") is None
+    monkeypatch.setattr(runner, "boot_id", lambda: "boot-c")
+    Daemon(p.base).tick()
+    assert p.db.kv("paused") is True
+    # Resume ends a pause until reboot too; a boot id that cannot be read is refused.
+    cli.main(["pause", "demo", "--until-reboot"])
+    cli.main(["resume", "demo"])
+    assert not p.db.kv("paused") and p.db.kv("pause_until_boot") is None
+    monkeypatch.setattr(runner, "boot_id", lambda: "unknown")
+    with pytest.raises(SystemExit):
+        cli.main(["pause", "demo", "--until-reboot"])
+    assert "boot id cannot be read" in capsys.readouterr().err and not p.db.kv("paused")
+    with pytest.raises(SystemExit):
+        cli.main(["pause", "demo", "--resource", "board", "--until-reboot"])
+
+
+def test_drain_pauses_and_exits_once_runs_end_or_fails_at_its_timeout(env, monkeypatch, capsys):
+    p = make(env)
+    from ttp import cli
+    rid = p.db.x("INSERT INTO runs(role,provider,started,status) VALUES('worker','claude',?,'running')",
+                 (time.time(),))
+    t0 = time.time()
+    with pytest.raises(SystemExit) as e:
+        cli.main(["drain", "demo", "--wait", "0.3"])
+    assert e.value.code == 1 and time.time() - t0 >= 0.3
+    assert "not drained" in capsys.readouterr().err and p.db.kv("paused") is True
+    assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == "running"   # not killed
+    # The run ends while drain waits: it exits 0.
+    from ttp.project import Project
+    threading.Timer(0.2, lambda: Project(p.base).db.x("UPDATE runs SET status='done', ended=? WHERE id=?",
+                                                      (time.time(), rid))).start()
+    cli.main(["drain", "demo", "--wait", "10"])
+    assert "drained" in capsys.readouterr().out
+    # A push in flight is waited on; the calling run itself is not.
+    tid = p.db.add_task("t", "s")
+    me = p.db.x("INSERT INTO runs(role,provider,started,status) VALUES('worker','claude',?,'running')", (time.time(),))
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.setenv("TTP_RUN_ID", str(me))
+    cli.main(["drain", "demo"])
+    p.db.x("UPDATE tasks SET status='pushing' WHERE id=?", (tid,))
+    with pytest.raises(SystemExit):
+        cli.main(["drain", "demo"])
+    assert f"push of task #{tid}" in capsys.readouterr().err
+
+
 def test_resuming_a_resource_wakes_the_tasks_that_waited_on_its_pause(env):
     p = make(env)
     from ttp import coordinator as coord

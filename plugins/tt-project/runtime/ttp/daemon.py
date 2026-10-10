@@ -63,7 +63,7 @@ from . import waitheal
 from . import screen as scr
 from . import shared
 from . import worktree
-from .db import (CHANGES_NEEDED, OPEN_ASK_MAX_AGE_S, SEVERITY_RANK, TERMINAL_TASK_STATES, continues_id, deferral, dependency_ids,
+from .db import (CHANGES_NEEDED, OPEN_ASK_MAX_AGE_S, PAUSE_BOOT_KEY, SEVERITY_RANK, TERMINAL_TASK_STATES, continues_id, deferral, dependency_ids,
                  dump_result, load_result, without_deferral)
 from .project import (Project, command_env, deep_merge, layered, disk_resume_gb, durable_write, git_fsync_env,
                       hostname, nice_level, output_tail, push_allowed, zombie)
@@ -601,7 +601,7 @@ class Daemon:
             self._load_config()
             self._last_cfg = now
             self.jev = Jev(self.cfg, db=self.p.db)
-        for step in (self.reap_runs, self.wake_after_reboot, self.meter_running, self.reconcile_tasks, self.tend_pushes,
+        for step in (self.lift_boot_pause, self.reap_runs, self.wake_after_reboot, self.meter_running, self.reconcile_tasks, self.tend_pushes,
                      self.prune_worktrees, self.backup_branches, self.check_local_only, self.check_disk,
                      self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends,
                      self.check_integrity,
@@ -4038,6 +4038,24 @@ class Daemon:
               f"it with task_update start_when, start the task now with start_when \"\", or cancel it.",
               "queued", task["id"]))
         log(self.p, f"task {task['id']} {kind}; raised to the coordinator")
+
+    def lift_boot_pause(self) -> None:
+        """A `ttp pause --until-reboot` ends on the first tick on another boot than the one it recorded
+        (schedules and probes do not run while paused, so nothing else would lift it). A plain pause stays."""
+        db = self.p.db
+        rec = db.kv(PAUSE_BOOT_KEY)
+        if not rec:
+            return
+        if not db.kv("paused", False):
+            db.x("DELETE FROM kv WHERE key=?", (PAUSE_BOOT_KEY,))
+            return
+        if self.boot == "unknown" or rec.get("boot") == self.boot:
+            return
+        db.set_paused(False)
+        since = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(rec.get("since") or 0)))
+        log(self.p, f"pause lifted: set until reboot at {since}, now on boot {self.boot}")
+        db.post("out", f"The project pause set until the host reboots ({since}) was lifted: the host has booted since. "
+                       "New runs start again.", kind="info", severity="low", ref=f"pause-lifted:{self.boot}")
 
     def wake_after_reboot(self) -> None:
         """Once per daemon start: a waiting task that handed off before this host booted waits on

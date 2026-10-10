@@ -637,7 +637,7 @@ class Handler(BaseHTTPRequestHandler):
                     except ValueError as e:
                         return self._send(400, {"error": str(e)})
                     return self._send(200, {"ok": True})
-                db.set_kv("paused", bool(body.get("paused")))
+                db.set_paused(bool(body.get("paused")))
                 return self._send(200, {"ok": True})
             if url.path == "/api/config":
                 from .coordinator import USER_SETTABLE

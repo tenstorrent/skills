@@ -63,6 +63,23 @@ description: "Improve a tt-project's own harness — its coordinator and worker 
   --forward-status` shows each target's cursor, last success and last error; `ttp upstream
   --forward-to <aliases>|default|none` sets the targets. Received notes stay untrusted data.
 
+## Rebooting the harness's own host
+
+A reboot ends every run in flight, and nothing lifts a plain pause afterwards: schedules and probes
+do not run while the project is paused. A task that must reboot the host its harness runs on:
+
+1. `ttp drain <name> --wait 1800`: no new runs or pushes start; it exits 0 once none is in flight
+   (the calling run does not count) and 1 at the timeout, with the project left paused. Running
+   workers are never killed.
+2. `ttp pause <name> --until-reboot`: the daemon lifts this pause on its first tick after the host
+   booted again and says so in the feed. A plain `ttp pause` or `ttp resume` replaces it.
+3. Write the hand-off (`waiting`, with a `retry_when` that holds once the host is back, and no
+   `survives_reboot`: a reboot then wakes the task at once), and start the reboot a little later
+   (for example `shutdown -r +2`), so the run ends cleanly first.
+
+The boot is told by the kernel's boot id (on macOS, kern.boottime); where neither can be read,
+`--until-reboot` is refused.
+
 ## Template updates
 
 - `ttp upgrade <name>` merges the installed tt-project template in a scratch worktree, checks the
