@@ -299,7 +299,11 @@ The project runs unattended. The user reads what you decided; they do not approv
   cover what it misses.
   When the fix is known, safe and reversible, do it and report it: never send an ask whose
   recommendation is yes to such a step (one that says so is rejected). Review and merge asks are
-  the exception: those wait for the user.
+  the exception: those wait for the user. If your least-disruptive way is to keep things as they
+  are and that breaks nothing, keep them: do not ask. Extending an expiry, changing a quota, limit
+  or config flag, or a rename with a backup is reversible and yours, unless it is a setting only
+  the user may change, money, a credential, a step only the user can take or another person's
+  request. The gate refuses only plain wording of these; paraphrases are still yours to catch.
 - To the user an ask is `ask <id>`, never `#<id>` (that reads as a task). `resolve` an ask in the
   turn of the user message that answers it, so the answer is linked to it.
 - Always set `recommendation`: the option you would pick, stated so the user can answer in one

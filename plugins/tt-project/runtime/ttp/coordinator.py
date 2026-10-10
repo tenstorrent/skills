@@ -1054,6 +1054,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if why:
                     _count_refusal(db, key, "self-health", text)
                     raise ValueError(f"ask_user rejected: {why}")
+                why = _reversible_ask(a, text, least)
+                if why:
+                    _count_refusal(db, key, why[0], text)
+                    raise ValueError(f"ask_user rejected: {why[1]}")
                 if (a["blocking"] not in ("restriction", "review", "merge")    # a review or merge ask is never leave to open
                         and prguard.draft_permission_ask(text)):
                     raise ValueError("ask_user rejected: draft PRs need no permission: open it. Opening and updating a "
@@ -2611,6 +2615,69 @@ def _self_health_ask(a: dict, text: str, least: str = "") -> str:
             "<project>`. Ask only for a real missing credential, a step only the user can take (physical, on their "
             "machine) or another person's request, or when every fix breaks a restriction: blocking restriction "
             "(or irreversible), with least_disruptive naming the restriction or the irreversible step")
+
+
+# The reversible-step gate is a high-precision backstop too: few exact phrasings, each with a
+# false-positive test. Known gaps, accepted: paraphrases ("let it be", "give the hold another week",
+# "allow two more runs a day") get through; the prompt rule covers them.
+# least_disruptive that keeps things as they are, and nothing in it says what that costs.
+_STATUS_QUO_RE = re.compile(r"\bstatus quo\b|\b(?:do|doing|change|changing)\s+nothing\b|"
+                            r"\b(?:keep|keeping|leave|leaving)\s+(?:(?:it|them|things|everything|the\s+[\w.-]+)\s+)?"
+                            r"as\s+(?:is|it\s+is|they\s+are)\b", re.I)
+_STATUS_QUO_COST_RE = re.compile(r"\b(?:but|except|however|though|although|not|never|cannot|fails?|failing|stalls?|"
+                                 r"blocks?|blocked|loses?|lost|miss(?:es)?|expires?|risks?|costs?|outage|down)\b|"
+                                 r"n't\b|\bbreak(?:s|ing)?\b(?!\s+(?:nothing|no\b|none))", re.I)
+# A step the coordinator can undo: an expiry, a quota or limit, a config flag, a rename with a backup.
+# Up to two words between the verb and its object, but not "raise the issue about the limit".
+_STEP_FILL = (r"(?:the\s+|its\s+|their\s+|an?\s+)?"
+              r"(?:(?!(?:about|on|of|for|to|in|with|issue|question|concern)\b)[\w'.`-]+\s+){0,2}")
+_REVERSIBLE_STEP_RES = (
+    re.compile(rf"\b(?:extend|renew|bump|push\s+back|move|change|set|lift|remove|drop)\s+{_STEP_FILL}"
+               r"(?:expiry|expiration|end\s+date)\b", re.I),
+    re.compile(rf"\b(?:raise|lower|increase|decrease|reduce|bump|change|adjust|set|lift)\s+{_STEP_FILL}"
+               r"(?:quota|limit|cap)s?\b", re.I),
+    re.compile(rf"\b(?:flip|toggle|set|change|turn\s+(?:on|off)|switch\s+(?:on|off)|enable|disable)\s+{_STEP_FILL}"
+               r"(?:config(?:uration)?\s+(?:flag|setting|option|key)|flag|setting)\b", re.I),
+    re.compile(r"\brenam\w*\b[^.;!?\n]*\b(?:backup|back\s+(?:it\s+|them\s+)?up|backed\s+up|\.bak|"
+               r"(?:keep\w*|with|make|making)\s+a\s+copy)\b|"
+               r"\b(?:backup|back\s+(?:it\s+|them\s+)?up)\b[^.;!?\n]*\brenam\w*\b", re.I),
+)
+# Never refused as reversible: a step that destroys or publishes something, or that says it is one-way.
+_ONE_WAY_RE = re.compile(r"\b(?:delet\w*|purg\w*|wip(?:e|es|ing)|destroy\w*|publish\w*|force[- ]push\w*|"
+                         r"overwrit\w*)\b", re.I)
+# Money is the user's (blocking spend or funds), whatever the wording.
+_MONEY_RE = re.compile(r"\$|\b(?:budget|spend\w*|usd|dollars?|funds?|billing|paid|pay)\b", re.I)
+
+
+def _names_needs_user(said: str) -> bool:
+    """True when the text names a setting only the user may change (NEEDS_USER), by key or by its last part."""
+    low = said.lower()
+    return any(k in low or re.search(rf"\b{re.escape(k.rsplit('.', 1)[-1])}\b", low) for k in NEEDS_USER)
+
+
+def _reversible_ask(a: dict, text: str, least: str = "") -> tuple[str, str] | None:
+    """(refusal label, why) for an ask that is the coordinator's own call, else None: its least_disruptive
+    keeps the status quo and names no cost (human, irreversible or restriction), or what it asks or
+    recommends is a reversible step (an expiry, quota, limit, config flag, rename with a backup;
+    human or irreversible only: a restriction-set limit is the user's). Exempt: a NEEDS_USER setting,
+    money, a real credential, a step only the user can take, another person's request."""
+    blocking = a.get("blocking")
+    if blocking not in ("human", "irreversible", "restriction"):
+        return None
+    said = f"{text} {a.get('recommendation') or ''}".replace("’", "'")
+    if (_names_needs_user(said) or _MONEY_RE.search(said) or _CREDENTIAL_RE.search(said)
+            or _USER_ONLY_RE.search(said) or _OTHERS_ASK_RE.search(said)):
+        return None
+    if _STATUS_QUO_RE.search(least) and not _STATUS_QUO_COST_RE.search(least):
+        return ("status quo", "your least-disruptive way keeps things as they are and breaks nothing: that is "
+                "yours to take. Keep the status quo, memory_add the decision and notify at severity low. If keeping "
+                "it costs something, say what in least_disruptive")
+    if (blocking != "restriction" and any(r.search(said) for r in _REVERSIBLE_STEP_RES)
+            and not _ONE_WAY_RE.search(said) and not _NOT_UNDOABLE_RE.search(said)):
+        return ("reversible step", "an expiry, quota, limit, config flag or rename with a backup can be undone: "
+                "decide it yourself, act on it (task_add or the action), memory_add the decision and notify at "
+                "severity low. Settings only the user may change, money and credentials still go to the user")
+    return None
 
 
 def _count_refusal(db, key: str | None, label: str, text: str) -> None:

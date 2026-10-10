@@ -8262,6 +8262,63 @@ def test_the_self_health_gate_by_reason_and_its_refusal_count(env):
     assert "3 refused (self-health 3)" in next(x for x in unblock.lines(p.db) if x.startswith("asks refused"))
 
 
+_QUO = "leave the config as it is for now; that breaks nothing and nobody waits on it"
+_COSTLY_QUO = "leave the config as it is; but then the nightly job keeps failing until it changes"
+# (fields, refused label or None). Refusals first, then exemptions and near misses that must go out.
+_REVERSIBLE_CASES = [
+    ({"text": "Rename the field?", "blocking": "restriction", "classify": "restriction_change",
+      "least_disruptive": _QUO}, "status quo"),
+    ({"text": "Rename the field?", "blocking": "irreversible", "classify": "irreversible",
+      "least_disruptive": "keep things as they are; the status quo breaks no rule at all"}, "status quo"),
+    ({"text": "Extend the hold's expiry by a week?", "blocking": "human", "recommendation": "yes"},
+     "reversible step"),
+    ({"text": "The cache fills up. Raise the disk quota to 50 GB?", "blocking": "human"}, "reversible step"),
+    ({"text": "Should I lower the parallel job limit to 2?", "blocking": "human"}, "reversible step"),
+    ({"text": "Flip the verbose_logs config flag on?", "blocking": "human"}, "reversible step"),
+    ({"text": "Rename results/ to results-old/ and keep a backup?", "blocking": "irreversible",
+      "classify": "irreversible", "least_disruptive": "write to a new folder; the dashboards read the old path"},
+     "reversible step"),
+    # Exempt: a NEEDS_USER setting, money, a credential, a user-only step, another person's request.
+    ({"text": "Turn on the code_tasks_may_push setting?", "blocking": "human"}, None),
+    ({"text": "Raise the daily limit to $40?", "blocking": "human"}, None),
+    ({"text": "Extend the API token's expiry?", "blocking": "human"}, None),
+    ({"text": "Raise the quota on your laptop's disk by hand?", "blocking": "human"}, None),
+    ({"text": "A reviewer asked us to raise the retry limit; do we?", "blocking": "human"}, None),
+    # Near misses: a status quo that costs something, a one-way step, a restriction-set limit, other wording.
+    ({"text": "Rename the field?", "blocking": "restriction", "classify": "restriction_change",
+      "least_disruptive": _COSTLY_QUO}, None),
+    ({"text": "Rename the old table with a backup, then delete it?", "blocking": "irreversible",
+      "classify": "irreversible", "least_disruptive": "archive it instead; the archive is full so that will not do"},
+     None),
+    ({"text": "The charter caps workers at 2; raise the cap to 4?", "blocking": "restriction",
+      "classify": "restriction_change", "least_disruptive": "run 2 workers; it breaks the 2-worker restriction"},
+     None),
+    ({"text": "Should I raise the issue about the rate limit with the maintainers?", "blocking": "human"}, None),
+    ({"text": "Option A or B for the settings page layout?", "blocking": "human"}, None),
+    ({"text": "Which setting do you prefer, compact or wide?", "blocking": "human"}, None),
+]
+
+
+@pytest.mark.parametrize("fields,label", _REVERSIBLE_CASES)
+def test_the_ask_gate_refuses_status_quo_and_reversible_step_asks(env, fields, label):
+    p = make(env)
+    from ttp import unblock
+    problems, ask = _ask(p, **fields)
+    if label is None:
+        assert problems == [] and ask is not None, problems
+        return
+    assert problems and ask is None
+    assert ("keep the status quo" if label == "status quo" else "can be undone: decide it yourself") \
+        in problems[0].lower(), problems[0]
+    assert f"1 refused ({label} 1)" in next(x for x in unblock.lines(p.db) if x.startswith("asks refused"))
+
+
+def test_review_merge_funds_spend_and_access_asks_skip_the_reversible_gate(env):
+    from ttp import coordinator as coord
+    for blocking in ("review", "merge", "funds", "spend", "access"):
+        assert coord._reversible_ask({"blocking": blocking}, "Raise the disk quota?", _QUO) is None, blocking
+
+
 def test_an_irreversible_or_restriction_ask_must_be_classified(env):
     p = make(env)
     from ttp import coordinator as coord, unblock
