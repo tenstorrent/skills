@@ -2182,24 +2182,86 @@ def test_command_watcher_repeats_wake_the_coordinator(env, monkeypatch):
     assert wakes() == 3
 
 
-def test_command_watcher_info_lines_are_logged_only_and_json_lines_are_never_split(env, monkeypatch):
+def _json_watcher(env, monkeypatch):
+    """A project whose command watchers print the given lines (dicts as JSON): (run(name, *lines), issues(name), p)."""
     p = make(env)
     from ttp import daemon as dm
     out = {"stdout": ""}
     monkeypatch.setattr(dm.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, out["stdout"], ""))
     d = dm.Daemon(p.base)
-    out["stdout"] = json.dumps({"text": "box-a: queue empty; 4 chips ok", "severity": "info"})
-    d._run_command_watcher({"name": "hw"}, {"command": "x"})
-    assert p.db.q("SELECT id FROM issues") == []
-    assert p.db.one("SELECT COUNT(*) AS n FROM events WHERE kind='observation'")["n"] == 0
-    out["stdout"] = json.dumps({"text": "box-a: chip 3 dropped; tray 2 power-cycled", "severity": "high"})
-    d._run_command_watcher({"name": "hw"}, {"command": "x"})
-    titles = [r["title"] for r in p.db.q("SELECT title FROM issues")]
-    assert titles == ["box-a: chip 3 dropped; tray 2 power-cycled"]
-    # A plain line keeps its '; ' items.
-    out["stdout"] = "box-b: fan slow; disk full"
-    d._run_command_watcher({"name": "hw2"}, {"command": "x"})
-    assert p.db.one("SELECT COUNT(*) AS n FROM issues WHERE source='watcher:hw2'")["n"] == 2
+
+    def run(name, *lines):
+        out["stdout"] = "\n".join(x if isinstance(x, str) else json.dumps(x) for x in lines)
+        d._run_command_watcher({"name": name}, {"command": "x"})
+
+    def issues(name):
+        return {r["title"]: r for r in p.db.q("SELECT * FROM issues WHERE source=?", (f"watcher:{name}",))}
+    return run, issues, p
+
+
+def test_command_watcher_json_lines_keep_their_items_unless_they_say_whole(env, monkeypatch):
+    from ttp import screen as scr
+    run, issues, _ = _json_watcher(env, monkeypatch)
+
+    def status(name):
+        return {t: r["status"] for t, r in issues(name).items()}
+
+    # By default a JSON line keeps its '; ' items (a broker-style report): one issue each, and a
+    # `cleared:` item closes its own.
+    box = "broker box-a [abc1234 1.2.0]"
+    run("hw", {"text": f"{box}: now chip 3 dropped; changed: fan slow; still: tray 2 held", "severity": "normal"})
+    assert status("hw") == {f"{box}: chip 3 dropped": "open", f"{box}: fan slow": "open",
+                            f"{box}: tray 2 held": "open"}
+    run("hw", {"text": f"{box}: cleared: chip 3 dropped; still: fan slow; tray 2 held", "severity": "normal"})
+    assert status("hw") == {f"{box}: chip 3 dropped": "fixed", f"{box}: fan slow": "open",
+                            f"{box}: tray 2 held": "open"}
+    assert issues("hw")[f"{box}: chip 3 dropped"]["cleared_why"] == scr.CLEARED_WHY
+    # "whole": true makes the line one observation: one issue under one condition key (counts masked),
+    # and a `cleared:` line closes it as a whole.
+    run("q", {"text": "box-b: queue stalled; 2 jobs waiting", "severity": "high", "whole": True})
+    assert status("q") == {"box-b: queue stalled; 2 jobs waiting": "open"}
+    run("q", {"text": "box-b: queue stalled; 3 jobs waiting", "severity": "high", "whole": True})
+    assert status("q") == {"box-b: queue stalled; 3 jobs waiting": "open"}
+    assert issues("q")["box-b: queue stalled; 3 jobs waiting"]["count"] == 2
+    run("q", {"text": "box-b: cleared: queue stalled; 3 jobs waiting", "severity": "normal", "whole": True})
+    assert status("q") == {"box-b: queue stalled; 3 jobs waiting": "fixed"}
+    # A plain line keeps its items too.
+    run("plain", "box-c: fan slow; disk full")
+    assert status("plain") == {"box-c: fan slow": "open", "box-c: disk full": "open"}
+
+
+def test_command_watcher_info_lines_clear_items_and_are_recorded_quietly(env, monkeypatch):
+    from ttp import screen as scr
+    run, issues, p = _json_watcher(env, monkeypatch)
+
+    def wakes():
+        return p.db.one("SELECT COUNT(*) AS n FROM events WHERE kind='observation'")["n"]
+
+    run("hw", {"text": "box-a: chip 3 dropped; fan slow", "severity": "high"})
+    assert wakes() == 1
+    # An info line takes the same path as any other: its `cleared:` item closes that issue, the items it
+    # still reports are seen again, and an item first seen at info is recorded quietly (never a wake).
+    run("hw", {"text": "box-a: cleared: chip 3 dropped; still: fan slow; disk nearly full", "severity": "info"})
+    rows = issues("hw")
+    assert (rows["box-a: chip 3 dropped"]["status"], rows["box-a: chip 3 dropped"]["cleared_why"]) == \
+        ("fixed", scr.CLEARED_WHY)
+    assert (rows["box-a: fan slow"]["status"], rows["box-a: fan slow"]["count"]) == ("open", 2)
+    assert rows["box-a: disk nearly full"]["status"] == "ignored"
+    assert wakes() == 1
+
+
+def test_command_watcher_machine_lines_reach_the_ledger_and_take_the_usual_path_at_info(env, monkeypatch):
+    from ttp import machine_ledger as ml, machines as mm, screen as scr
+    run, issues, _ = _json_watcher(env, monkeypatch)
+    mm.add("box-a", tags="device")
+    run("hw", {"text": "box-a: held", "severity": "high", "machine": "box-a", "condition": "held"})
+    assert list(ml.conditions()) == ["box-a:held"] and issues("hw")["box-a: held"]["status"] == "open"
+    # Its clear, rated info, reaches the ledger and closes the issue too.
+    run("hw", {"text": "box-a: cleared: held", "severity": "info", "machine": "box-a", "condition": "held",
+               "cleared": True})
+    assert ml.conditions() == {}
+    assert (issues("hw")["box-a: held"]["status"], issues("hw")["box-a: held"]["cleared_why"]) == \
+        ("fixed", scr.CLEARED_WHY)
 
 
 def test_command_watcher_multi_line_observations_key_by_first_line_or_explicit_key(env, monkeypatch):
@@ -2641,7 +2703,7 @@ def test_mute_clock_restarts_after_clean_runs(env, monkeypatch):
 
 def test_mute_clock_clears_only_the_condition_a_run_dropped(env, monkeypatch):
     from ttp import screen as scr
-    both = json.dumps({"text": "boxes: box-a held; box-b held", "severity": "high", "repeat": True, "items": True})
+    both = json.dumps({"text": "boxes: box-a held; box-b held", "severity": "high", "repeat": True})
     only_b = json.dumps({"text": "boxes: box-b held", "severity": "high", "repeat": True})
     run, asks, p = _muted_watcher(env, monkeypatch, both)
     run(0.5, both)
@@ -2659,6 +2721,15 @@ def test_mute_clock_clears_only_the_condition_a_run_dropped(env, monkeypatch):
                                                      (f"%{scr.MUTE_PERSISTS}%",))["text"]
     run(3.5, both)
     assert asks() == [2.0, 3.5], asks()
+
+
+def test_mute_tracks_a_whole_json_line_as_one_condition(env, monkeypatch):
+    from ttp import screen as scr
+    line = json.dumps({"text": "boxes: box-a held; box-b held", "severity": "high", "repeat": True, "whole": True})
+    run, _, p = _muted_watcher(env, monkeypatch, line)
+    run(0.5, line)
+    [m] = scr.mutes(p.db, now=0)
+    assert [c["text"] for c in m["conds"].values()] == ["boxes: box-a held; box-b held"]
 
 
 def test_missed_schedule_runs_once_on_wake(env):
@@ -9017,7 +9088,7 @@ def _receipt_rig(env, tmp_path, name="receipts", lifecycle="explicit_clear"):
 
 
 def _line(text, **kw):
-    return json.dumps({"text": text, "severity": "normal", "items": True, **kw}) + "\n"
+    return json.dumps({"text": text, "severity": "normal", **kw}) + "\n"
 
 
 def test_explicit_clear_receipts_stay_pending_through_the_quiet_sweep_downtime_and_restarts(env, tmp_path):
@@ -9065,6 +9136,25 @@ def test_explicit_clear_receipts_stay_pending_through_the_quiet_sweep_downtime_a
     assert tick(_line("job8: cleared: done; cleared: evidence_" + "c3" * 20) + _line(a))[1] == 0
     assert not any(t.startswith("job8") for t in r["open_titles"]())
     assert tick("")[0] == "ok (0 observations)" and r["open_titles"]() == set()
+
+
+def test_an_info_outcome_replaces_the_older_receipt_of_its_subject(env, tmp_path):
+    from ttp import screen as scr
+    r = _receipt_rig(env, tmp_path)
+    tick, db = r["tick"], r["db"]
+    old = ("job-1: failed", "job-1: evidence_" + "a1" * 20)
+    assert tick(_line("job-1: failed; evidence_" + "a1" * 20))[1] == 1
+    assert r["open_titles"]() == set(old)
+    # The newer outcome, rated info, still replaces the pending receipts of its subject, without a wake.
+    assert tick(_line("job-1: done; evidence_" + "b2" * 20, severity="info"))[1] == 0
+    rows = db().q("SELECT status, cleared_why FROM issues WHERE source=? AND title IN (?,?)", (r["src"], *old))
+    assert len(rows) == 2 and {(x["status"], x["cleared_why"]) for x in rows} == {("fixed", scr.REPLACED_WHY)}
+    assert r["open_titles"]() == set()
+    # A "whole": true line is one receipt of its subject, replaced the same way by the next outcome.
+    first, then = "job-2: failed; evidence_" + "c3" * 20, "job-2: done; evidence_" + "d4" * 20
+    assert tick(_line(first, whole=True))[1] == 1 and r["open_titles"]() == {first}
+    assert tick(_line(then, whole=True))[1] == 1 and r["open_titles"]() == {then}
+    assert db().one("SELECT cleared_why FROM issues WHERE title=?", (first,))["cleared_why"] == scr.REPLACED_WHY
 
 
 def test_explicit_clear_errors_recover_and_a_later_recurrence_wakes(env, tmp_path):
@@ -35958,8 +36048,8 @@ def test_command_watcher_output_is_parsed_per_line():
     from ttp import daemon
     out = daemon._observations('starting\n{"text": "a down", "severity": "high"}\n{bad json\n'
                                '{"text": "b ok"}\ntail one\ntail two\n')
-    assert out == [{"text": "starting"}, {"text": "a down", "severity": "high", "json": True},
-                   {"text": "{bad json"}, {"text": "b ok", "json": True}, {"text": "tail one\ntail two"}]
+    assert out == [{"text": "starting"}, {"text": "a down", "severity": "high"}, {"text": "{bad json"},
+                   {"text": "b ok"}, {"text": "tail one\ntail two"}]
     assert daemon._observations("just\nplain") == [{"text": "just\nplain"}]
     assert daemon._observations("") == []
 

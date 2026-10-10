@@ -2745,14 +2745,10 @@ class Daemon:
             # Its own failure lines ("error": true) are errors, not reports.
             error = failed or obs.get("error") is True
             kind = scr.ERROR if error else receipt
-            # One JSON line is one observation, never split at '; ', unless it opts in with "items": true.
-            whole = obs.get("json") is True and obs.get("items") is not True
+            # A JSON line with "whole": true is one observation: never split at '; '.
+            whole = obs.get("whole") is True
             if not error and obs.get("machine") and obs.get("condition"):
-                self._machine_condition(obs, body)   # an info line still reaches the machine ledger
-            if not error and obs.get("severity") == "info":
-                log(self.p, f"{source} info: {body[:500]}")   # info is logged only, never an issue
-                n += 1
-                continue
+                self._machine_condition(obs, body)   # an info line reaches the machine ledger too
             self.observe(errors if error else source, body, obs.get("severity"), rewake_after_s=rewake,
                          repeat=obs.get("repeat") is True, lifecycle=kind, whole=whole,
                          key=obs.get("key") if isinstance(obs.get("key"), str) and obs["key"].strip() else None)
@@ -5753,7 +5749,7 @@ def _observations(text: str) -> list[dict]:
                 o = None
             if isinstance(o, dict) and o.get("text"):
                 flush()
-                obs.append({**o, "json": True})
+                obs.append(o)
                 continue
         plain.append(raw)
     flush()

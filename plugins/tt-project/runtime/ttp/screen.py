@@ -80,7 +80,7 @@ def screen(db: DB, cfg: dict, source: str, text: str, hint: str | None = None, j
     spell). Without either, a known open issue stays quiet. An observation an active mute covers
     is recorded and counted but never wakes (see mute). `lifecycle` (RECEIPT or ERROR, from a
     receipt source) is kept on the issue with its subject; see settle_receipts. `whole` (a watcher's JSON
-    line) keeps the line as one condition: its text is never split at '; '. `key` (a watcher JSON line's
+    line with "whole": true) keeps the line as one condition: its text is never split at '; '. `key` (a watcher JSON line's
     "key" field) is the issue's identity instead of its text: the text may change without a new issue."""
     v = _screen(db, cfg, source, text, hint, jev, rewake_after_s, repeat, lifecycle, whole, key)
     m = count_muted(db, source, text, v.severity, whole=whole, key=key)
@@ -277,7 +277,8 @@ def _judge(db: DB, cfg: dict, source: str, text: str, hint: str | None, jev,
 # A command watcher reports a line like "<subject>: <item>; <item>", where an item may start with
 # now / still / changed / cleared. Each item is kept as its own issue, keyed by source, subject and
 # the item's kind (counts and changing numbers masked), so a condition reported every run with new
-# counts stays one issue, and "cleared: <item>" closes the issue "now <item>" opened.
+# counts stays one issue, and "cleared: <item>" closes the issue "now <item>" opened. A JSON line
+# with "whole": true is one item instead (watcher_conditions' `whole`).
 _MARK = re.compile(r"^(now|still|changed|cleared)\b:?\s*", re.I)
 _COUNT = re.compile(r"\s+x\d+\b", re.I)             # "hold x3", "failed checks x2": a count, not an id
 _NUM_LIST = re.compile(r"<n>(\s*,\s*<n>)+")     # "chip 8,9,10" and "chip 3" are the same kind
@@ -311,7 +312,7 @@ def key_fingerprint(source: str, key: str) -> str:
 
 def watcher_conditions(source: str, text: str, whole: bool = False) -> list[tuple[str, str, bool]] | None:
     """(subject, item, cleared) for each item of a command-watcher observation; None for anything
-    else, which keeps one issue per normalized text. `whole` (a JSON line, one observation) keeps the
+    else, which keeps one issue per normalized text. `whole` (a JSON line with "whole": true) keeps the
     line as one item: it is never split at '; ', and its title is truncated instead. A multi-line
     observation is one item keyed by its first line, so a change in the lines below it opens no new issue."""
     line = text.strip()
