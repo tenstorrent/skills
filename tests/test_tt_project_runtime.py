@@ -30294,6 +30294,82 @@ def test_a_push_branch_no_push_can_reach_is_flagged_and_its_reviews_are_review_o
         assert not any("push_branch" in x for x in config_problems(p.raw_config(), p.root)), ref
 
 
+def _pq_stacked(s, name, on=None, picks=(), review=None):
+    """A code task whose branch starts at `on` (default: the target's tip), cherry-picks `picks` (a
+    rebased copy of each) and adds one commit of its own, and a review of it with status `review`
+    (None: none). Returns (task, branch, head, review id)."""
+    tid, path, branch = _code_task(s.p, name)
+    _git_out(path, "reset", "-q", "--hard", on or "origin/proj")
+    for c in picks:
+        _git_out(path, "cherry-pick", "-x", c)
+    _commit(path, f"{name}.txt", f"{name}\n")
+    rid = None
+    if review:
+        rid = s.p.db.add_task(f"review {name}", "r", kind="review", origin="coordinator", depends_on=[tid])
+        s.p.db.update_task(rid, status=review)
+    return tid, branch, _git_out(path, "rev-parse", "HEAD"), rid
+
+
+def test_the_push_queue_refuses_a_head_carrying_commits_of_a_failed_review_unless_its_review_accepts_them(
+        env, monkeypatch):
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    x, xbranch, xhead, _ = _pq_stacked(s, "rejected", review="failed")
+    # Stacked on the rejected branch: refused, naming the task and its commit.
+    c, cbranch, chead, crev = _pq_stacked(s, "stacked", on=xbranch, review="running")
+    check = pushq.check_approval(s.p, s.p.db.task(crev), [{"branch": cbranch, "head": chead}])
+    assert f"carries unreviewed commits from #{x}," in check.get("invalid", ""), check
+    assert "edit rejected.txt" in check["invalid"] and '"inherited": [%d]' % x in check["invalid"]
+    # The review judged them and lists the task: approved, and the feed line says so.
+    check = pushq.check_approval(s.p, s.p.db.task(crev), [{"branch": cbranch, "head": chead, "inherited": [x]}])
+    assert check.get("entries") and check["inherited"] == {chead: [x]}, check
+    assert f"carries commits of #{x}" in pushq.queued_text(s.p.db.task(crev), check)
+    # A rebased copy of the rejected commit (another sha, the same patch) is caught too.
+    d, dbranch, dhead, drev = _pq_stacked(s, "copied", picks=[xhead], review="running")
+    assert _git_out(s.path, "rev-parse", f"{dbranch}~1") != xhead
+    check = pushq.check_approval(s.p, s.p.db.task(drev), [{"branch": dbranch, "head": dhead}])
+    assert f"from #{x}," in check.get("invalid", ""), check
+    # The rejected task's own re-review (or a fix that continues it) covers it: not refused.
+    rr = s.p.db.add_task("re-review", "r", kind="review", origin="coordinator", depends_on=[x])
+    assert pushq.check_approval(s.p, s.p.db.task(rr), [{"branch": xbranch, "head": xhead}]).get("entries")
+    # A later passing review of the rejected task clears it.
+    s.p.db.update_task(rr, status="done")
+    assert pushq.check_approval(s.p, s.p.db.task(crev), [{"branch": cbranch, "head": chead}]).get("entries")
+    # An unrelated head is approved as before.
+    assert pushq.check_approval(s.p, s.p.db.task(s.review), [{"branch": s.branch, "head": s.head}]).get("entries")
+
+
+def test_the_push_queue_accepts_a_head_stacked_on_a_passed_branch_landed_or_not(env, monkeypatch):
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    p_, pbranch, phead, prev = _pq_stacked(s, "passed", review="done")
+    # A rejected sibling stacked on the passed branch holds its commits too: they stay the passed task's.
+    _pq_stacked(s, "sibling", on=pbranch, review="failed")
+    c, cbranch, chead, crev = _pq_stacked(s, "stacked", on=pbranch, review="running")
+    entries = [{"branch": cbranch, "head": chead}]
+    check = pushq.check_approval(s.p, s.p.db.task(crev), entries)
+    assert check.get("entries") and "inherited" not in check, check
+    # Landed as a rebased copy (as a batch lands it) and its review gone: its patch is on the tip.
+    s.p.db.update_task(prev, status="cancelled")
+    _git_out(s.other, "fetch", "-q", str(s.repo), pbranch)
+    _git_out(s.other, "cherry-pick", "-x", "FETCH_HEAD")
+    _git_out(s.other, "push", "-q", "origin", "HEAD:proj")
+    _git_out(s.repo, "fetch", "-q", "origin")
+    assert _git_out(s.repo, "rev-parse", "origin/proj") != phead
+    check = pushq.check_approval(s.p, s.p.db.task(crev), entries)
+    assert check.get("entries"), check
+
+
+def test_a_review_approving_a_head_with_rejected_commits_runs_again_and_is_told_why(env, monkeypatch):
+    s = _pq(env, monkeypatch)
+    x, xbranch, _, _ = _pq_stacked(s, "rejected", review="failed")
+    c, cbranch, chead, crev = _pq_stacked(s, "stacked", on=xbranch, review="running")
+    t = _pq_hand_off(env, s, push=[{"branch": cbranch, "head": chead}], task=crev)
+    assert t["status"] == "queued", t
+    assert f"carries unreviewed commits from #{x}" in json.loads(t["result"])["woke"]
+    assert not s.p.db.q("SELECT id FROM push_queue WHERE task=?", (crev,))
+
+
 def test_a_review_only_stack_stays_review_only_through_its_fix_and_the_push_queue_ignores_its_approval(
         env, monkeypatch):
     from ttp import push, pushq

@@ -44,6 +44,8 @@ TIPS_TOLD = 20                  # tip_failed shas remembered, so each tip is rep
 ROW_RESULTS = ("pushed", "landed", "conflict", "check_failed", "requeued", "refused")
 AFTER_STATES = ("ok", "failed", "timeout", "killed", "skipped")
 STATS_S = 7 * 86400            # the conflict counts `ttp push --queue` and the web app show cover this long
+INHERIT_WINDOW_S = 30 * 86400  # reviews finished this long ago at most tell which branches were rejected
+INHERIT_GIT_S = 30             # each git call of that check, bounded, as the tick waits for it
 _HEX40 = re.compile(r"[0-9a-f]{40}")
 _children: dict[str, subprocess.Popen] = {}   # batch processes this daemon started, reaped by finalize
 _default_branches: dict[tuple[str, str], tuple[float, str | None]] = {}   # (root, remote): (until, branch)
@@ -198,6 +200,71 @@ def _contains(p: Project, heads: list[str], commit: str) -> bool:
     return r.returncode == 0 and not r.stdout.strip()
 
 
+def _verdicts(db, review: dict, branches: set[str], now: float) -> tuple[dict[int, int], set[int], dict[int, str]]:
+    """Per code task, the latest finished review covering it (see _covers) within INHERIT_WINDOW_S,
+    leaving out `review` itself and the tasks it covers: ({failed task: its review}, {passed tasks},
+    {task: branch})."""
+    code = db.q("SELECT id, branch, labels FROM tasks WHERE kind='code' AND branch IS NOT NULL AND branch!=''")
+    own = _covers(db, review, [{"branch": b} for b in branches], code)
+    reviews = db.q("SELECT * FROM tasks WHERE kind='review' AND status IN ('done','pushing','failed') AND id!=? "
+                   "AND updated>=? ORDER BY id DESC", (review["id"], now - INHERIT_WINDOW_S))
+    rows: dict[int, list[dict]] = {}
+    for r in db.q("SELECT task, branch FROM push_queue WHERE task IN (%s)" % ",".join("?" * len(reviews)),
+                  [r["id"] for r in reviews]) if reviews else []:
+        rows.setdefault(r["task"], []).append(r)
+    failed, passed, seen = {}, set(), set(own)
+    for r in reviews:
+        for tid in _covers(db, r, rows.get(r["id"], []), code) - seen:
+            seen.add(tid)
+            if r["status"] == "failed":
+                failed[tid] = r["id"]
+            else:
+                passed.add(tid)
+    return failed, passed, {t["id"]: t["branch"] for t in code if t["branch"] not in branches}
+
+
+def _patch_ids(p: Project, shas: list[str]) -> dict[str, str]:
+    """{patch-id: commit} of `shas` (git patch-id --stable): equal for a rebased copy of a commit."""
+    if not shas:
+        return {}
+    show = _git(p, "show", "--no-color", "--format=commit %H", "-p", *shas, timeout=INHERIT_GIT_S)
+    pid = subprocess.run(["git", "-C", str(p.root), "patch-id", "--stable"], input=show.stdout, text=True,
+                         capture_output=True, timeout=INHERIT_GIT_S)
+    return {f[0]: f[1] for f in (line.split() for line in pid.stdout.splitlines()) if len(f) == 2}
+
+
+def _inherited(p: Project, task: dict, entries: list[dict], tip: str, now: float) -> dict[str, dict[int, list[str]]]:
+    """Commits each head adds over the target's `tip` that come from another task whose latest review
+    failed: {head: {task id: ["<short sha> <subject>", ...]}}. A commit counts by its hash or by its
+    patch-id, so a rebased or cherry-picked copy of a rejected commit is caught too. A rejected
+    branch's commits that a passed task's branch also holds are that task's (it was stacked on it)."""
+    failed, passed, branch_of = _verdicts(p.db, task, {e["branch"] for e in entries if e["branch"]}, now)
+    have = set(_git(p, "for-each-ref", "--format=%(refname:short)", "refs/heads/",
+                    timeout=INHERIT_GIT_S).stdout.split())
+    bad = {branch_of[t]: t for t in failed if branch_of.get(t) in have}
+    if not bad:
+        return {}
+    good = [branch_of[t] for t in passed if branch_of.get(t) in have]
+    rejected = _git(p, "rev-list", "--no-merges", *bad, "--not", tip, *good, timeout=INHERIT_GIT_S).stdout.split()
+    if not rejected:
+        return {}
+    rejected_set, rejected_ids = set(rejected), _patch_ids(p, rejected)
+    out: dict[str, dict[int, list[str]]] = {}
+    for e in entries:
+        adds = _git(p, "rev-list", "--no-merges", "--right-only", "--cherry-pick", f"{tip}...{e['head']}",
+                    timeout=INHERIT_GIT_S).stdout.split()
+        hits = {c: c for c in adds if c in rejected_set}
+        rest = [c for c in adds if c not in hits]
+        hits |= {c: rejected_ids[i] for i, c in _patch_ids(p, rest).items() if i in rejected_ids}
+        for c, src in hits.items():
+            holders = _git(p, "for-each-ref", "--contains", src, "--format=%(refname:short)", "refs/heads/",
+                           timeout=INHERIT_GIT_S).stdout.split()
+            subject = _git(p, "log", "-1", "--format=%h %s", c, timeout=INHERIT_GIT_S).stdout.strip()
+            for tid in sorted({bad[b] for b in holders if b in bad}):
+                out.setdefault(e["head"], {}).setdefault(tid, []).append(subject)
+    return out
+
+
 def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None) -> dict:
     """Validate a review's `push` list with fast local git: {"ignored": why} in a project that does
     not push or, while the queue is off, for anything but a list of approvals; {"invalid": why} (also
@@ -208,7 +275,10 @@ def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None
     (worktree.fix_branches: a re-plan that committed on its own branch, not the reviewed one) that
     contains the reviewed branch it builds on. Only the commit the review names is pinned and
     pushed, so a head the reviewer did not name never goes out. A re-approval after a push conflict
-    may name any commit; the commits it adds over the conflicting head are listed for the event."""
+    may name any commit; the commits it adds over the conflicting head are listed for the event. A
+    head that carries commits of another task whose latest review failed (see _inherited) is invalid
+    unless its entry lists that task under "inherited": the review judged them; "inherited" then
+    names them per head for the event."""
     from .worktree import fix_branches, named_refs
     d = _delivery(p, cfg)
     if d.get("push_queue") is not True:
@@ -231,7 +301,7 @@ def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None
     conflicted = [r["head"] for r in rows if r["created"] == rows[-1]["created"] and r["status"] == "conflict"]
     reviewed: list[str] | None = None
     built: list[tuple[str, str]] = []
-    out, added = [], {}
+    out, added, accepted = [], {}, {}
     for e in entries:
         head = str(e.get("head") or "").strip().lower()
         if not _HEX40.fullmatch(head):
@@ -253,7 +323,25 @@ def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None
                     not any(_contains(p, [tip], head) and _contains(p, [head], on) for tip, on in built):
                 return {"invalid": f"{head} is none of the reviewed refs ({names}) nor an ancestor of one"}
         out.append({"branch": str(e.get("branch") or "").strip()[:200], "head": head})
-    return {"entries": out, "target": f"{tgt[0]}/{tgt[1]}", "added": added}
+        ids = e.get("inherited") if isinstance(e.get("inherited"), list) else []
+        accepted[head] = {int(str(i).lstrip("#")) for i in ids if str(i).lstrip("#").isdigit()}
+    tip = _tracking_tip(p, *tgt)
+    try:
+        carried = _inherited(p, task, out, tip, time.time()) if tip else {}
+    except subprocess.TimeoutExpired:
+        carried = {}   # git hung: the push checks still run; the tick must not wait on it
+    taken: dict[str, list[int]] = {}
+    for head, by_task in carried.items():
+        left = {t: c for t, c in by_task.items() if t not in accepted[head]}
+        if left:
+            tid, commits = next(iter(left.items()))
+            more = f" (and from #{', #'.join(map(str, list(left)[1:]))})" if len(left) > 1 else ""
+            return {"invalid": f"{_short(head)} carries unreviewed commits from #{tid}{more}, whose latest review "
+                               f"failed: {'; '.join(commits[:10])}. Approve a head without them, or judge them in "
+                               f"this review and, if they are sound, add \"inherited\": {sorted(left)} to its entry"}
+        taken[head] = sorted(by_task)
+    return {"entries": out, "target": f"{tgt[0]}/{tgt[1]}", "added": added,
+            **({"inherited": taken} if taken else {})}
 
 
 def approve(p: Project, task_id: int, run_id: int | None, approval: dict) -> list[int]:
@@ -277,6 +365,8 @@ def queued_text(task: dict, approval: dict) -> str:
     """The feed line of an approval."""
     what = ", ".join(f"{e['branch'] or '?'} at {_short(e['head'])}" for e in approval["entries"])
     text = f"#{task['id']} {task['title']}: approved {what} for {approval['target']}; it goes out with the next batch"
+    for head, ids in (approval.get("inherited") or {}).items():
+        text += f"\n{_short(head)} carries commits of #{', #'.join(map(str, ids))}, whose review failed; this review accepted them"
     for head, lines in (approval.get("added") or {}).items():
         text += (f"\nRe-approved after a push conflict; {_short(head)} adds: "
                  + ("; ".join(lines[:20]) if lines else "no new commits"))

@@ -70,6 +70,9 @@
   focused tests of what changed, and reuse the check results that exist: the spec names the checks
   the daemon started on the head as it queued this review (`ttp checks --result <folder>` prints
   them). Checks that failed on the head are a blocking finding.
+- Woken because the head `carries unreviewed commits from #<task>` (its branch was built on a
+  branch whose review failed): approve a head without those commits, or review them as part of
+  this change and, only if they are sound, add `"inherited": [<task>]` to that entry.
 - Woken because `push conflict`: fetch, rebase the change onto the push branch's current tip in
   its worktree and resolve keeping both sides' intents (the one edit you may make). Run focused
   tests of what the resolution touched, commit, and approve the new head.
