@@ -1169,6 +1169,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if not isinstance(a.get("paused"), bool):
                     raise ValueError("resource_pause needs `paused`: true or false")
                 name = str(a.get("resource") or "").strip()
+                if not RESOURCE_RE.fullmatch(name):
+                    raise ValueError(f"not a resource name: {name!r}")
                 held = db.paused_resources().get(name)
                 if not a["paused"] and held and held.get("by") == "user" and not user_turn:
                     # A pause the user set is lifted on their word only, never by text from outside.

@@ -19433,7 +19433,7 @@ def test_a_paused_resource_holds_its_tasks_across_restarts_until_resumed(env, mo
                            {"type": "task_add", "title": "reflash", "spec": "s", "tier": "light",
                             "resources": ["board"], "exclusive": True},
                            {"type": "task_add", "title": "docs", "spec": "s", "tier": "light"}]) == []
-    cli.main(["pause", "demo", "--resource", "board", "--reason", "maintenance window"])
+    cli.main(["pause", "demo", "--resource", "board", "--reason", "maintenance window", "--until", "2d"])
     _, started = _paused_dispatch(p, monkeypatch)
     assert started == ["docs"], started
     held = p.db.q("SELECT * FROM tasks WHERE title IN ('measure', 'reflash')")
@@ -19460,14 +19460,14 @@ def test_a_resource_pause_reaches_only_workers_that_use_it(env, tmp_path):
         dirs[title].mkdir()
         p.db.x("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(?,?,?,?,?,?)",
                (tid, "worker", "fake", time.time(), "running", str(dirs[title])))
-    assert coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": True,
+    assert coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": True, "until": "1d",
                             "reason": "the user asked to stop device jobs"}], turn=7) == []
     for title in ("on board", "holds board"):
         steer = (dirs[title] / "steer.md").read_text()
         assert "`board` is paused (the user asked to stop device jobs)" in steer and "hand off `waiting`" in steer
     assert not (dirs["other"] / "steer.md").exists(), "a worker that does not use the resource was interrupted"
     # A replay of the same turn does not repeat the update.
-    coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": True}], turn=7)
+    coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": True, "until": "1d"}], turn=7)
     assert (dirs["on board"] / "steer.md").read_text().count("is paused") == 1
     assert coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": False}]) == []
     assert "no longer paused" in (dirs["on board"] / "steer.md").read_text()
@@ -19484,15 +19484,153 @@ def test_resource_pause_actions_are_validated_and_a_user_pause_needs_the_user(en
     assert p.db.paused_resources() == {}
     pause_resource(p, "board", True, reason="firmware update", by="user")
     # A turn woken by a hand-off or a log line cannot lift the user's pause; re-pausing keeps it theirs.
-    assert coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": True, "reason": "still"}]) == []
+    assert coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": True, "reason": "still",
+                            "until": "3d"}]) == []
     problems = coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": False}])
     assert problems and "paused by the user" in problems[0], problems
     assert p.db.paused_resources()["board"]["by"] == "user"
     assert coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": False}], user_turn=True) == []
     assert p.db.paused_resources() == {}
     # A pause the coordinator set, it may lift itself.
-    assert coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": True}]) == []
+    assert coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": True, "end_when": "false"}]) == []
     assert coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": False}]) == []
+
+
+def test_a_resource_pause_without_an_end_is_refused(env, capsys):
+    p = make(env)
+    from ttp import cli, coordinator as coord
+    problems = coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": True, "reason": "x"}])
+    assert problems and "needs an end" in problems[0], problems
+    for bad, why in (({"until": "9d"}, "more than 7 days"), ({"until": "2001-01-01"}, "already past"),
+                     ({"until": "soon"}, "use a delay"), ({"end_when": "a\nb"}, "one line"),
+                     ({"until": "1d", "report_from": "../x"}, "not a project name")):
+        problems = coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": True, **bad}])
+        assert problems and why in problems[0], (bad, problems)
+    assert p.db.paused_resources() == {}
+    with pytest.raises(SystemExit):
+        cli.main(["pause", "demo", "--resource", "board", "--reason", "x"])
+    assert "needs an end" in capsys.readouterr().err and p.db.paused_resources() == {}
+    # Lifting needs no end; a pause with one keeps it until a new one replaces it.
+    assert coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": True, "until": "2d"}]) == []
+    v = p.db.paused_resources()["board"]
+    assert 2 * 86400 - 60 < v["until"] - time.time() <= 2 * 86400 and "end_when" not in v
+    assert coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": True,
+                            "end_when": "test -e done", "report_from": "other"}]) == []
+    v = p.db.paused_resources()["board"]
+    assert v["end_when"] == "test -e done" and v["report_from"] == "other" and "until" not in v, v
+    dig = coord.digest(p, {}, [], [])
+    assert "ends when `test -e done` passes; waits on project other's report" in dig
+    assert coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": False}]) == []
+    assert p.db.paused_resources() == {}
+    # The daemon's tick gives an old pause without an end the default one.
+    from ttp.daemon import Daemon
+    coord.pause_resource(p, "board", True, reason="from before ends", by="user")
+    Daemon(p.base).check_pause_ends()
+    assert p.db.paused_resources()["board"]["end_default"] is True
+
+
+def test_a_pause_without_an_end_gets_a_default_end_and_one_info_message(env):
+    p = make(env)
+    from ttp import coordinator as coord, pauseends
+    coord.pause_resource(p, "board", True, reason="old pause", by="coordinator")
+    coord.pause_resource(p, "rig", True, reason="has one", by="user", end={"until": time.time() + 3600})
+    now = time.time()
+    pe = pauseends.PauseEnds(p)
+    assert pe.tick(now) == []
+    v = p.db.paused_resources()["board"]
+    assert v["until"] == now + pauseends.DEFAULT_S and v["end_default"] and v["reason"] == "old pause"
+    assert p.db.paused_resources()["rig"]["until"] < now + 7200, "a pause with an end keeps it"
+    (m,) = p.db.q("SELECT text, kind, severity FROM messages WHERE direction='out' AND text LIKE '%had no end%'")
+    assert m["kind"] == "info" and m["severity"] == "low" and "board" in m["text"] and "rig" not in m["text"]
+    pe.tick(now + 120)
+    assert p.db.one("SELECT COUNT(*) n FROM messages WHERE text LIKE '%had no end%'")["n"] == 1
+    assert not p.db.one("SELECT id FROM events WHERE kind='pause_end_due'")
+    # When the default passes the coordinator is prompted once; nothing is lifted by itself.
+    assert pe.tick(now + pauseends.DEFAULT_S + 1) == ["board", "rig"]
+    (ev,) = p.db.q("SELECT text, severity FROM events WHERE kind='pause_end_due'")
+    assert "`board`" in ev["text"] and "Lift it" in ev["text"] and ev["severity"] == "normal"
+    assert set(p.db.paused_resources()) == {"board", "rig"}
+    assert pe.tick(now + pauseends.DEFAULT_S + 200) == []
+    # Extending it with a new end re-arms it.
+    assert coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": True, "until": "1d",
+                            "reason": "firmware still flashing"}]) == []
+    assert "end_default" not in p.db.paused_resources()["board"]
+
+
+def test_an_end_when_probe_prompts_the_coordinator_and_a_user_pause_is_left_alone(env):
+    p = make(env)
+    from ttp import coordinator as coord, pauseends
+    flag = p.root / "fixed"
+    assert coord.apply(p, [{"type": "resource_pause", "resource": "board", "paused": True,
+                            "end_when": f"test -e {flag}", "reason": "flaky"}]) == []
+    coord.pause_resource(p, "rig", True, reason="the user's", by="user", end={"end_when": f"test -e {flag}"})
+    pe = pauseends.PauseEnds(p)
+
+    def settle(now):
+        pe.tick(now)
+        for proc, _, _ in list(pe._procs.values()):
+            proc.wait(10)
+        return pe.tick(now + 1)
+    now = time.time()
+    assert settle(now) == [] and not p.db.one("SELECT id FROM events WHERE kind IN ('pause_end_due', 'observation')")
+    flag.write_text("")
+    assert settle(now + pauseends.PROBE_EVERY_S + 5) == ["board", "rig"]
+    (ev,) = p.db.q("SELECT text FROM events WHERE kind='pause_end_due'")
+    assert "`board`" in ev["text"] and "probe" in ev["text"] and "passed" in ev["text"]
+    (low,) = p.db.q("SELECT text, severity FROM events WHERE kind='observation'")
+    assert "`rig`" in low["text"] and low["severity"] == "low" and "do not ask" in low["text"]
+    assert set(p.db.paused_resources()) == {"board", "rig"}, "nothing is lifted by itself"
+    assert p.db.paused_resources()["rig"]["by"] == "user"
+    # Once each; the coordinator still cannot lift the user's pause on its own.
+    assert settle(now + 2 * pauseends.PROBE_EVERY_S + 10) == []
+    problems = coord.apply(p, [{"type": "resource_pause", "resource": "rig", "paused": False}])
+    assert problems and "paused by the user" in problems[0]
+    # A broken probe is reported too: it would never end the pause.
+    assert coord.apply(p, [{"type": "resource_pause", "resource": "box", "paused": True, "end_when": "exit 7"}]) == []
+    assert settle(now + 3 * pauseends.PROBE_EVERY_S) == ["box"]
+    assert "broken (exit 7)" in p.db.q("SELECT text FROM events WHERE kind='pause_end_due'")[-1]["text"]
+
+
+def test_a_note_from_the_project_a_pause_waits_on_re_prompts_its_owner(env, monkeypatch, capsys):
+    from ttp import cli, coordinator as coord
+    from ttp.cli import bootstrap
+    from ttp.daemon import Daemon
+    from ttp.project import register
+    src = make(env)
+    repo2 = env["tmp"] / "repo2"
+    subprocess.run(["git", "clone", "-q", str(env["repo"]), str(repo2)], check=True)
+    dst = bootstrap(repo2, "second", "Another project.", "fake")
+    register("second", {"host": "testhost", "dir": str(dst.root)})
+    assert coord.apply(dst, [{"type": "resource_pause", "resource": "board", "paused": True, "until": "3d",
+                              "report_from": "demo", "reason": "waits on demo's soak report"},
+                             {"type": "resource_pause", "resource": "rig", "paused": True, "until": "3d",
+                              "report_from": "third"}]) == []
+    _note_run(env, monkeypatch, src)
+    assert _note(cli, "--to", "second", "soak report: the board is fine again") == 0
+    Daemon(dst.base).read_upstream()
+    (ev,) = dst.db.q("SELECT text FROM events WHERE kind='pause_end_due'")
+    assert "`board`" in ev["text"] and "a note from project demo" in ev["text"], ev["text"]
+    assert dst.db.one("SELECT id FROM events WHERE kind='upstream_note'")
+    assert set(dst.db.paused_resources()) == {"board", "rig"}
+
+
+def test_a_machine_note_past_its_until_is_marked_stale_in_the_digest(env):
+    p = make(env)
+    from ttp import cli, coordinator as coord, machines as mm
+    cli.main(["machines", "set", "box-a", "--tags", "device", "--note", "firmware update running", "--until", "2d"])
+    m = mm.load()["box-a"]
+    assert m["note"] == "firmware update running" and m["note_until"] > time.time() + 86400
+    assert "(until " in mm.line("box-a", m)
+    assert "stale since" not in coord.digest(p, {}, [], [])
+    later = m["note_until"] + 60
+    lines = mm.digest_lines(p.db, {}, later)
+    day = time.strftime("%Y-%m-%d", time.gmtime(m["note_until"]))
+    assert f"- box-a: firmware update running (stale since {day})" in lines, lines
+    # Tags alone keep the note's end; a new note without one clears it.
+    mm.add("box-a", tags="device,x86")
+    assert mm.load()["box-a"]["note_until"] == m["note_until"]
+    mm.add("box-a", note="healthy")
+    assert "note_until" not in mm.load()["box-a"] and not mm.digest_lines(p.db, {}, later)
 
 
 def test_paused_resources_show_in_the_digest_status_and_web_state(env):
@@ -19575,12 +19713,14 @@ def test_web_api_pauses_and_resumes_a_resource(env):
             except OSError:
                 time.sleep(0.1)
         raise AssertionError("the web app did not start")
-    assert post({"resource": "board", "paused": True, "reason": "firmware update"}) == (200, None)
+    code, err = post({"resource": "board", "paused": True, "reason": "firmware update"})
+    assert code == 400 and "needs an end" in err["error"] and p.db.paused_resources() == {}, err
+    assert post({"resource": "board", "paused": True, "reason": "firmware update", "until": "2d"}) == (200, None)
     assert p.db.paused_resources()["board"]["reason"] == "firmware update"
     assert p.db.paused_resources()["board"]["by"] == "user" and not p.db.kv("paused", False)
     assert post({"resource": "board", "paused": False}) == (200, None)
     assert p.db.paused_resources() == {}
-    code, err = post({"resource": "../board", "paused": True})
+    code, err = post({"resource": "../board", "paused": True, "until": "2d"})
     assert code == 400 and "not a resource name" in err["error"], err
     assert p.db.paused_resources() == {} and not p.db.kv("paused", False)
 
