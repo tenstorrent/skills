@@ -68,9 +68,11 @@ description: "Improve a tt-project's own harness — its coordinator and worker 
 A reboot ends every run in flight, and nothing lifts a plain pause afterwards: schedules and probes
 do not run while the project is paused. A task that must reboot the host its harness runs on:
 
-1. `ttp drain <name> --wait 1800`: no new runs or pushes start; it exits 0 once none is in flight
+1. `ttp drain <name> --wait 240`: no new runs or pushes start; it exits 0 once none is in flight
    (the calling run does not count) and 1 at the timeout, with the project left paused. Running
-   workers are never killed.
+   workers are never killed. Keep the wait inside one tool call (a few minutes). On exit 1 the
+   project stays paused: hand off `waiting` with `retry_when` `ttp drain <name>` (no `--wait`, or
+   `--wait 0`, checks once and exits 0 when drained) and reboot on the next run.
 2. `ttp pause <name> --until-reboot`: the daemon lifts this pause on its first tick after the host
    booted again and says so in the feed. A plain `ttp pause` or `ttp resume` replaces it.
 3. Write the hand-off (`waiting`, with a `retry_when` that holds once the host is back, and no
