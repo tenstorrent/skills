@@ -3850,7 +3850,7 @@ def test_wakes_that_hand_back_the_same_wait_run_light_then_go_to_the_coordinator
                           and p.db.task(tid)["status"] in ("queued", "blocked"))
         tiers.append(json.loads(runs()[-1]["note"])["wake"]["tier"])
         res = json.loads(p.db.task(tid)["result"])
-        assert res["stale_wakes"] == n
+        assert res["stale_wakes"] == (0 if n == 3 else n), "the block starts the count over"
     assert tiers == ["standard", "light", "light"], "after one unchanged wake no standard model runs"
     t = p.db.task(tid)
     assert t["status"] == "blocked" and t["attempts"] == 0
@@ -3858,6 +3858,20 @@ def test_wakes_that_hand_back_the_same_wait_run_light_then_go_to_the_coordinator
     ev = p.db.one("SELECT severity, status FROM events WHERE task=? AND text LIKE '%→ blocked%'", (tid,))
     assert ev and ev["status"] == "queued", "the coordinator is told"
     assert not _run_until(d, p, lambda: len(runs()) > 3, timeout=1), "not woken again"
+    # The coordinator requeues it (a re-plan, or a probe it now trusts): the count starts over, so its
+    # next run is at its own wake tier and only max_stale_wakes more unchanged wakes block it again.
+    from ttp import coordinator as coord
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "status": "queued"}]) == []
+    tiers = []
+    for n in (4, 5, 6):
+        p.db.update_task(tid, not_before=None)
+        assert _run_until(d, p, lambda: len(runs()) == n and runs()[-1]["status"] != "running"
+                          and p.db.task(tid)["status"] in ("queued", "blocked"))
+        tiers.append(json.loads(runs()[-1]["note"])["wake"]["tier"])
+        assert json.loads(p.db.task(tid)["result"])["stale_wakes"] == (0 if n == 6 else n - 3)
+        assert p.db.task(tid)["status"] == ("blocked" if n == 6 else "queued")
+    assert tiers == ["standard", "light", "light"]
+    assert "no progress after 3 wakes" in p.db.task(tid)["blocked_reason"]
 
 
 def test_a_changed_wait_or_a_new_commit_is_progress_and_a_reboot_or_escalation_is_neither(env):
@@ -3881,6 +3895,70 @@ def test_a_changed_wait_or_a_new_commit_is_progress_and_a_reboot_or_escalation_i
     assert bud.wake_tier("deep", {**prev, "next_step": "read the logs, " * 20}) == "light"
     assert bud.wake_tier("standard", {**prev, "wake_tier": "standard", "escalated_wake": True}) == "standard"
     assert bud.wake_tier("standard", {**prev, "stale_wakes": "x", "wake_tier": "standard"}) == "standard"
+
+
+@needs_sockets
+def test_a_requeue_or_a_re_plan_starts_the_unchanged_wake_count_over(env):
+    """Every way a person or the coordinator decides to run a stale wait again (a coordinator or web
+    requeue, a new spec) drops its unchanged-wake count: the next run is at its own wake tier."""
+    p = make(env)
+    from ttp import budget as bud
+    from ttp import coordinator as coord
+    from ttp import web
+    from ttp.daemon import _wait_key
+    from ttp.db import dump_result, load_result
+    wait = {"status": "waiting", "summary": "busy", "waiting_for": "a free board", "wake_tier": "standard",
+            "waiting_since": time.time()}
+    stale = {**wait, "stale_wakes": 2, "wait_key": {"key": _wait_key(wait), "head": ""}}
+
+    def stale_task(status):
+        tid = p.db.add_task(f"stale {status}", "s", kind="work", tier="standard", origin="user")
+        p.db.update_task(tid, status=status, result=dump_result(stale))
+        assert bud.wake_tier("standard", load_result(p.db.task(tid)["result"])) == "light"
+        return tid
+
+    def after(tid):
+        res = load_result(p.db.task(tid)["result"])
+        assert "stale_wakes" not in res and res["wait_key"] == stale["wait_key"], res
+        assert bud.wake_tier("standard", res) == "standard"
+
+    for status in ("blocked", "waiting"):
+        tid = stale_task(status)
+        assert coord.apply(p, [{"type": "task_update", "id": tid, "status": "queued"}]) == []
+        after(tid)
+    tid = stale_task("queued")
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "spec": "measure on any free board"}]) == []
+    after(tid)
+    tid = stale_task("queued")
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "priority": 1}]) == []
+    assert load_result(p.db.task(tid)["result"])["stale_wakes"] == 2, "only a requeue or a new spec resets"
+    tid = stale_task("blocked")
+    port = _start_web(p)
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/api/task/{tid}", method="POST",
+                                 data=json.dumps({"status": "queued"}).encode(),
+                                 headers={"X-TTP-Token": web.token(p), "Content-Type": "application/json"})
+    for _ in range(50):
+        try:
+            with urllib.request.urlopen(req, timeout=2) as r:
+                assert r.status == 200
+            break
+        except urllib.error.HTTPError:
+            raise
+        except OSError:
+            time.sleep(0.1)
+    after(tid)
+
+
+def test_a_wait_key_survives_a_clipped_hand_off(env):
+    from ttp.daemon import _stale_wakes, _wait_key
+    from ttp.db import dump_result, load_result
+    long = {"status": "waiting", "waiting_for": "the board " * 400, "retry_when": "test -e " + "x" * 3000}
+    key = {"key": _wait_key(long), "head": ""}
+    assert len(key["key"]) == 16
+    kept = load_result(dump_result({**long, "summary": "s " * 4000, "stale_wakes": 1, "wait_key": key,
+                                    "notes": "n" * 9000}))
+    assert kept.get("clipped") and kept["wait_key"] == key
+    assert _stale_wakes(kept, key, False) == 2
 
 
 def test_a_wake_prompt_says_the_wait_came_back_unchanged_and_asks_for_a_retry_when(env):

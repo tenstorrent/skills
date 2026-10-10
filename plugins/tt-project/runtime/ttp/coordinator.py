@@ -903,9 +903,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     if a["status"] == "queued":
                         upd["blocked_reason"] = None
                         prev = load_result(task["result"])
-                        if task["status"] != "queued" and "waiting_since" in prev:
-                            # A requeue is a decision to run it, not to sleep on its probe.
-                            prev.pop("waiting_since")
+                        if task["status"] != "queued" and ("waiting_since" in prev or "stale_wakes" in prev):
+                            # A requeue is a decision to run it, not to sleep on its probe, and its
+                            # earlier unchanged wakes no longer count.
+                            prev.pop("waiting_since", None)
+                            prev.pop("stale_wakes", None)
                             upd["result"] = dump_result(prev)
                 waits = _hold_anchor(db, task, a, turn_asks,
                                      any((x or {}).get("type") == "ask_user" for _, x in order[k + 1:]))
@@ -968,6 +970,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     if why:
                         raise ValueError(f"#{task['id']} rejected: {why}")
                     upd["spec"] = task["spec"] + "\n\n## Update\n" + spec
+                    prev = load_result(upd.get("result") or task["result"])
+                    if task["status"] != "running" and prev.pop("stale_wakes", None) is not None:
+                        # A re-plan: the wait it hands back next is not compared with the old plan's.
+                        upd["result"] = dump_result(prev)
                     kind, pr_ask = _delivery_kind(task["kind"], spec)
                     if pr_ask and upd.get("status", task["status"]) in ("queued", "blocked", "waiting"):   # not mid-run
                         upd["kind"] = kind

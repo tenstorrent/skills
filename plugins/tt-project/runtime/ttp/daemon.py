@@ -2143,6 +2143,9 @@ class Daemon:
                 not_before = time.time() + _retry_s(result)
                 extra["waiting_since"] = time.time()
                 reason = f"waiting for {what}; next try {time.strftime('%H:%M', time.localtime(not_before))}"
+            if new == "blocked":
+                # A block is the coordinator's to decide: whoever requeues it starts the count over.
+                extra["stale_wakes"] = 0
         # A review that passes may hand its approved commits to the push queue instead of pushing
         # (delivery.push_queue): it waits as 'pushing' until a batch pushed them (pushq.py).
         approval, push_note, push_quiet = None, "", False
@@ -5636,8 +5639,9 @@ def _last_notes(run_dir: Path, n: int = 5) -> list[str]:
 
 def _wait_key(result: dict) -> str:
     """What a waiting hand-off waits for, as compared between wakes: its waiting_for and retry_when,
-    whitespace and case aside."""
-    return "\x00".join(" ".join(str(result.get(k) or "").split()).lower() for k in ("waiting_for", "retry_when"))
+    whitespace and case aside, as a short hash a clipped hand-off keeps whole."""
+    text = "\x00".join(" ".join(str(result.get(k) or "").split()).lower() for k in ("waiting_for", "retry_when"))
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
 
 
 def _stale_wakes(prev: dict, key: dict, escalate: bool) -> int:

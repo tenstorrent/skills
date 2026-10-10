@@ -612,9 +612,11 @@ class Handler(BaseHTTPRequestHandler):
                                            "WHERE id=? AND status!='running'", (time.time(), tid)).rowcount:
                         return self._send(409, {"error": f"task #{tid} is running: cancel it first"})
                     prev = load_result(t["result"])
-                    if t["status"] != "queued" and "waiting_since" in prev:
-                        # A requeue is a decision to run it, not to sleep on its probe.
-                        prev.pop("waiting_since")
+                    if t["status"] != "queued" and ("waiting_since" in prev or "stale_wakes" in prev):
+                        # A requeue is a decision to run it, not to sleep on its probe, and its
+                        # earlier unchanged wakes no longer count.
+                        prev.pop("waiting_since", None)
+                        prev.pop("stale_wakes", None)
                         db.x("UPDATE tasks SET result=? WHERE id=? AND result=?",
                              (dump_result(prev), tid, t["result"]))
                 elif body.get("status") == "cancelled":
