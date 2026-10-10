@@ -178,6 +178,9 @@ def env(tmp_path, monkeypatch, _git_session):
     # Tests may run inside a live run, under `ttp detach` (no in-run lock-wait cap) or `ttp lock`.
     for var in ("TTP_RUN_DIR", "TTP_TASK", "TTP_RUN_ID", "TTP_PROJECT", "TTP_DETACHED", "TTP_LOCKS_HELD", "TTP_PIDNS"):
         monkeypatch.delenv(var, raising=False)
+    # Tests may run from an ssh login: timefmt.in_ssh_login() is false unless a test sets it.
+    for var in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"):
+        monkeypatch.delenv(var, raising=False)
     # A run's environment makes every git fsync its objects (project.git_fsync_env); test repositories
     # need no power-loss durability, and on some filesystems each `git add` then takes 20x longer.
     # Tests of those settings set and inspect them explicitly.
@@ -37867,6 +37870,35 @@ def test_remote_connect_sends_the_workstations_zone_and_an_older_runtime_still_c
     monkeypatch.setattr(cli, "_ssh", old_runtime)
     assert cli.connect_remote("far", {"host": "box", "dir": "/srv/far"}, ["connect", "far"]) == 0
     assert seen == [["connect", "far", "--home-tz", "America/Los_Angeles", "--home-from", "testhost"], ["connect", "far"]]
+
+
+def test_remote_connect_from_an_ssh_login_sends_no_zone_and_keeps_the_projects(env, monkeypatch, capsys):
+    """A user ssh'd into one box who connects to a project on another sends that box's zone (a
+    server's), so nothing: the project's zone and the machine that set it stay as they are."""
+    from ttp import cli
+    p = make(env)
+    p.set_config("home_timezone", "America/Los_Angeles")
+    p.set_config("home_timezone_from", "laptop")
+    monkeypatch.setenv("SSH_CLIENT", "10.0.0.1 1 22")
+    monkeypatch.setattr(cli, "flush_outbox", lambda name, entry: None)
+    monkeypatch.setattr(cli, "remote_web", lambda name, entry, out: ("web app: ok", 0))
+    seen = []
+
+    from ttp import weblink
+    monkeypatch.setattr(weblink, "local", lambda p, url: ("web app: ok", 0))
+
+    def box(entry, argv, capture=False):   # the project's machine runs `ttp connect` with what it was sent
+        seen.append(argv)
+        monkeypatch.delenv("SSH_CLIENT")   # there, outside this login
+        monkeypatch.setenv("SSH_CONNECTION", "10.0.0.1 1 10.0.0.2 22")   # it runs under ssh on that box
+        cli.main(argv)
+        return subprocess.CompletedProcess(argv, 0, "chat: c1\n", "")
+    monkeypatch.setattr(cli, "_ssh", box)
+    assert cli.connect_remote(p.name, {"host": "box", "dir": str(p.root)}, ["connect", p.name]) == 0
+    assert seen == [["connect", p.name]]
+    raw = p.raw_config()
+    assert (raw["home_timezone"], raw["home_timezone_from"]) == ("America/Los_Angeles", "laptop")
+    assert _home_feed(p) == []
 
 
 def test_a_spend_push_moves_the_home_zone_only_of_projects_its_sender_set(env, monkeypatch, capsys):

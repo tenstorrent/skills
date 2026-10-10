@@ -118,7 +118,7 @@ and preferences you add later become part of the project's charter and memory.
   cap count that day. Empty (the default) keeps the rolling 24 hours. Weekly caps stay rolling.
 - Home time zone: each project keeps the IANA zone of the user's workstation as `home_timezone` in
   its `project.json`. `ttp new` records the zone of the machine it runs on (with `--host`, the
-  workstation's, never the box's). `ttp connect` from a workstation, and a workstation's spend push
+  workstation's, never the box's). `ttp connect` from a workstation (not from an ssh login), and a workstation's spend push
   for the projects it set last, send its current zone; a change is logged once in the feed, so the
   zone follows a travelling user. A project without one gets the account's `budget.timezone`, else the
   machine's zone, once at daemon start. Times shown to the user use it (`runtime/ttp/timefmt.py`).

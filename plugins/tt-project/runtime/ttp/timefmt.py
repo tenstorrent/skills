@@ -9,7 +9,7 @@ machine that last set it as `home_timezone_from`:
 - `ttp new` records the zone of the machine it runs on; created on another machine from a
   workstation, it records the workstation's zone (sent as `--home-tz`), never the box's.
 - `ttp connect` from a workstation sends its current zone (`--home-tz`), and so does a local
-  `ttp connect` typed on the project's own machine outside an ssh login. A machine's spend push
+  `ttp connect` typed on the project's own machine; neither does from an ssh login (a server's zone). A machine's spend push
   (globalcap.push) carries its zone too, and moves only the projects that machine set last. A
   change is logged once in the feed (old -> new), so the zone follows a travelling user.
 - A project without one (made before this existed) gets, once, the account's `budget.timezone` if

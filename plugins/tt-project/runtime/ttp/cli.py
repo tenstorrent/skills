@@ -544,9 +544,10 @@ def connect_remote(name: str, entry: dict, argv: list[str]) -> int:
     if failed is not None and failed.returncode == 255:
         _unreachable(entry, failed.stderr)
         return 255
-    home = ["--home-tz", timefmt.detect_local(), "--home-from", hostname()]
+    # The user's zone only from their workstation: in an ssh login here it is a server's, so none.
+    home = [] if timefmt.in_ssh_login() else ["--home-tz", timefmt.detect_local(), "--home-from", hostname()]
     r = _ssh(entry, [*argv, *home], capture=True)
-    if r.returncode == 2 and "--home-tz" in (r.stderr or ""):   # an older runtime there: connect without it
+    if home and r.returncode == 2 and "--home-tz" in (r.stderr or ""):   # an older runtime there: connect without it
         r = _ssh(entry, argv, capture=True)
     if r.returncode == 255:
         _unreachable(entry, r.stderr)
