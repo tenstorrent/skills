@@ -58,6 +58,7 @@ from . import reviewcap
 from . import runner
 from . import schedule as sched
 from . import service
+from . import settinghold
 from . import unblock
 from . import upstream
 from . import waitheal
@@ -3104,7 +3105,11 @@ class Daemon:
             ready = [t for t in ready if not logged_out[t["provider"] or core]] + \
                 sorted(out, key=lambda t: rank.get(t["tier"], len(rank)))
         ctx = {"now": now, "paused": paused, "logged_out": logged_out, "busy": busy, "committed": None}
+        holds = settinghold.active(db, self.cfg) if ready else {}
         for task in ready:
+            # Before _start_hold, which may reserve the task's resource.
+            if holds and self._setting_hold(task, holds, now):
+                continue
             provider = task["provider"] or core
             why = self._start_hold(task, provider, ctx, reserve=True)
             if why == "held":
@@ -3917,9 +3922,11 @@ class Daemon:
         start_when; a broken one is raised once). Then raise the holds with no anchor that went stale,
         once per set with a new member."""
         db, now = self.p.db, time.time()
-        for t in db.q("SELECT * FROM tasks WHERE status='blocked' AND labels LIKE '%\"waits:%'"):
+        rows = db.q("SELECT * FROM tasks WHERE status='blocked' AND labels LIKE '%\"waits:%'")
+        self._sweep_setting_holds(rows, now)
+        for t in rows:
             got = anchors.anchor(t)
-            if not got:
+            if not got or settinghold.held_key(t):
                 continue
             kind, value = got
             over = ""
@@ -3949,6 +3956,39 @@ class Daemon:
             db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
                  (now, "daemon", anchors.STALE_EVENT, "normal", anchors.event_text(rows), "queued"))
         log(self.p, f"stale holds raised to the coordinator: {', '.join(f'#{i}' for i in ids)}")
+
+    def _setting_hold(self, task: dict, holds: dict[str, int], now: float) -> bool:
+        """Hold a queued task that a user-only setting being asked about would refuse (settinghold):
+        blocked, attempts untouched, anchored on the ask; sweep_holds releases it."""
+        key = settinghold.refused_by(task, holds)
+        if not key:
+            return False
+        db = self.p.db
+        labels = anchors.without(json.loads(task["labels"] or "[]")) + [anchors.label("ask", str(holds[key]))]
+        with db.tx():
+            if (db.task(task["id"]) or {}).get("status") != "queued":
+                return True
+            db.update_task(task["id"], status="blocked", labels=labels,
+                           blocked_reason=settinghold.reason(key, holds[key], self.cfg))
+        log(self.p, f"task {task['id']} held: {key} is off and ask #{holds[key]} about it is open")
+        return True
+
+    def _sweep_setting_holds(self, rows: list[dict], now: float) -> None:
+        """Release every task held on a setting together once the setting is on or no open ask names
+        it; one still held moves its anchor to the newest open ask about it."""
+        held = [(t, settinghold.held_key(t)) for t in rows]
+        held = [(t, k) for t, k in held if k]
+        if not held:
+            return
+        holds = settinghold.active(self.p.db, self.cfg)
+        for t, key in held:
+            why = settinghold.over(self.cfg, key, holds)
+            if why:
+                self._release_hold(t, why, now)
+            elif anchors.anchor(t) != ("ask", str(holds[key])):
+                labels = anchors.without(json.loads(t["labels"] or "[]")) + [anchors.label("ask", str(holds[key]))]
+                self.p.db.update_task(t["id"], labels=labels,
+                                      blocked_reason=settinghold.reason(key, holds[key], self.cfg))
 
     def _hold_probe(self, task: dict, probe: str, now: float) -> str:
         """A `when:` hold's probe, run like a start_when: why it is over once it exited 0, else ''."""

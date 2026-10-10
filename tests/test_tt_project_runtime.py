@@ -36188,6 +36188,108 @@ def test_an_expired_ask_releases_its_hold(env):
     assert p.db.task(tid)["status"] == "queued"
 
 
+def _setting_ask(p, text="May reviewed work land on main? That needs delivery.allow_protected_push_branch on."):
+    p.db.x("INSERT INTO messages(ts,direction,kind,severity,text) VALUES(?,?,?,?,?)",
+           (time.time(), "out", "ask", "high", text))
+    return p.db.one("SELECT MAX(id) id FROM messages WHERE kind='ask'")["id"]
+
+
+def test_a_setting_hold_keeps_landing_tasks_off_workers_until_the_setting_is_on(env, monkeypatch):
+    """While an open ask names delivery.allow_protected_push_branch (off), tasks that land with `ttp push`
+    wait blocked, attempts untouched; everything else runs. Turning it on releases them all together."""
+    from ttp import coordinator as coord
+    from ttp import settinghold
+    p = make(env)
+    p.set_config("delivery.push_branch", "origin/main")
+    land = [p.db.add_task("Land the fix", "Fix it, then land on main with `ttp push --detach`.", kind="code",
+                          tier="light", origin="user"),
+            p.db.add_task("Push the batch", "Run ttp push in the worktree.", kind="work", tier="light",
+                          origin="user")]
+    other = [p.db.add_task("Fix docs", "Never run ttp push; do not land anything.", kind="code", tier="light",
+                           origin="user"),
+             p.db.add_task("Publish own", "Publish with `ttp push --own --detach`.", kind="code", tier="light",
+                           origin="user"),
+             p.db.add_task("Review it", "If it passes, push it with `ttp push`.", kind="review", tier="light",
+                           origin="user")]
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    # No ask about it: nothing is held.
+    _, started = _paused_dispatch(p, monkeypatch)
+    assert len(started) == 5
+    p.db.x("UPDATE tasks SET status='queued'")
+    aid = _setting_ask(p)
+    d, started = _paused_dispatch(p, monkeypatch)
+    assert sorted(started) == sorted(p.db.task(t)["title"] for t in other), started
+    for t in land:
+        task = p.db.task(t)
+        assert task["status"] == "blocked" and not task["attempts"], task
+        assert task["blocked_reason"].startswith(settinghold.NOTE) and f"ask #{aid}" in task["blocked_reason"]
+        assert f'"waits:ask:{aid}"' in task["labels"]
+    # The digest shows the hold once, as one line, and not the held tasks' own rows.
+    text = coord.digest(p, {}, [], [])
+    lines = [ln for ln in text.splitlines() if "setting hold" in ln]
+    assert len(lines) == 1 and f"#{land[0]}, #{land[1]}" in lines[0] and f"ask #{aid}" in lines[0], lines
+    assert not any(ln.startswith(f"- #{land[0]} |") for ln in text.splitlines())
+    # Still off, still asked: the sweep keeps them.
+    d.sweep_holds()
+    assert all(p.db.task(t)["status"] == "blocked" for t in land)
+    p.set_config("delivery.allow_protected_push_branch", True)
+    d.cfg = p.config()
+    d.sweep_holds()
+    for t in land:
+        task = p.db.task(t)
+        assert task["status"] == "queued" and task["blocked_reason"] is None and "waits:" not in task["labels"]
+    why = [e["text"] for e in p.db.q("SELECT text FROM events WHERE kind='hold_released'")]
+    assert len(why) == 2 and all("allow_protected_push_branch was turned on" in w for w in why), why
+    _, started = _paused_dispatch(p, monkeypatch)
+    assert sorted(started) == ["Land the fix", "Push the batch"]
+
+
+def test_a_setting_hold_ends_when_its_ask_is_resolved_and_follows_a_newer_ask(env, monkeypatch):
+    from ttp import coordinator as coord
+    from ttp import settinghold
+    p = make(env)
+    p.set_config("delivery.push_branch", "origin/main")
+    tids = [p.db.add_task(f"Land {n}", "land on main with `ttp push`", kind="code", tier="light", origin="user")
+            for n in ("a", "b")]
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    first = _setting_ask(p)
+    d, started = _paused_dispatch(p, monkeypatch)
+    assert started == [] and all(p.db.task(t)["status"] == "blocked" for t in tids)
+    # A second ask about it: resolving the first keeps them held, on the newer ask.
+    second = _setting_ask(p, "Still need allow_protected_push_branch for the landing")
+    assert coord.apply(p, [{"type": "resolve", "id": first}]) == []
+    d.sweep_holds()
+    for t in tids:
+        task = p.db.task(t)
+        assert task["status"] == "blocked" and f'"waits:ask:{second}"' in task["labels"], task
+        assert f"ask #{second}" in task["blocked_reason"]
+    assert coord.apply(p, [{"type": "resolve", "id": second}]) == []
+    d.sweep_holds()
+    assert all(p.db.task(t)["status"] == "queued" for t in tids)
+    why = [e["text"] for e in p.db.q("SELECT text FROM events WHERE kind='hold_released'")]
+    assert len(why) == 2 and all("no open ask names" in w for w in why), why
+    # A setting already on, or no push branch, holds nothing.
+    third = _setting_ask(p)
+    p.set_config("delivery.allow_protected_push_branch", True)
+    _, started = _paused_dispatch(p, monkeypatch)
+    assert len(started) == 2
+    p.set_config("delivery.allow_protected_push_branch", False)
+    p.set_config("delivery.push_branch", "")
+    assert settinghold.active(p.db, p.config()) == {} and third
+
+
+def test_setting_hold_reads_landing_specs():
+    from ttp.settinghold import lands
+    yes = ["land on origin/main with `ttp push`", "Then run ttp push --detach.", "Landing it on the branch is next"]
+    no = ["Never run ttp push.", "publish with `ttp push --own --detach`", "do not land anything",
+          "the landed sha is reported", "plain spec"]
+    for s in yes:
+        assert lands({"kind": "code", "spec": s}), s
+    for s in no:
+        assert not lands({"kind": "code", "spec": s}), s
+    assert not lands({"kind": "review", "spec": yes[0]})
+
+
 def test_stale_holds_raise_one_trigger_per_new_set_and_legacy_holds_count(env):
     p = make(env)
     from ttp import anchors

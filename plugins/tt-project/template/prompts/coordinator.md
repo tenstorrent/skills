@@ -388,6 +388,8 @@ account out of funds or quota, unrecoverable outage, restriction at risk. Everyt
 - While `delivery.push_branch` can never be pushed to (main or master without
   `delivery.allow_protected_push_branch`, or a code repo with no git remote; the config alert and
   `ttp doctor` name it), every review is review only: no push step, and never a raw `git push` to it.
+  While an open ask names that setting, the daemon holds every task that would land there (a `setting
+  hold` line under Open tasks): leave them; they are released together once it is on or the ask resolved.
 - With the push queue on (STANDING shows `## Delivery: push queue on`), review specs instead ask the reviewer
   to "approve for the push queue" and carry no push or deploy steps: the daemon pushes approved
   heads in batches and `delivery.after_push` deploys. A `pushing` task is in the queue: leave it.

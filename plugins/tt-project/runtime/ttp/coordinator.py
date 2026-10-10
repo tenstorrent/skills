@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from . import locks
-from . import anchors, effort, ends, heal, jevuse, landed, machine_ledger, machines, pauseends, prguard, push, responsibilities, reviewcap, shared, unblock, upstream, worktree
+from . import anchors, effort, ends, heal, jevuse, landed, machine_ledger, machines, pauseends, prguard, push, responsibilities, reviewcap, settinghold, shared, unblock, upstream, worktree
 from . import screen as scr
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
@@ -474,7 +474,10 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     lines = ["## Open tasks (id | status | tier | priority | age | title | last note)"]
     rows = db.q("SELECT * FROM tasks WHERE status NOT IN ('done','failed','cancelled') ORDER BY priority, id LIMIT 60")
     in_review = db.review_since()
+    setting_held = settinghold.digest_lines(rows)   # tasks held on a setting being asked about: one line each
     for t in rows:
+        if setting_held and settinghold.held_key(t):
+            continue
         note = clip(t["blocked_reason"] or load_result(t["result"]).get("summary"), NOTE_CHARS)
         held = anchors.anchor(t) if t["status"] == "blocked" else None
         note = f"{anchors.describe(*held)}: {note}" if held else note
@@ -484,6 +487,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
                   f"{(now - in_review[t['id']]) / 3600:.1f}h in review" if t["id"] in in_review else "")
         lines.append(f"- #{t['id']} | {t['status']}{f' ({starts})' if starts else ''} | {t['tier']} | p{t['priority']} | "
                      f"{(now - t['created']) / 3600:.1f}h | {title} | {note}")
+    lines += setting_held
     if not rows:
         lines.append("- (none)")
     section("tasks", lines)
