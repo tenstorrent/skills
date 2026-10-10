@@ -32,6 +32,12 @@ says. Its check staying unknown (75, 255 or a broken check: an unreachable box l
 long escalates the same way, without running the fix; the next healthy result clears it. Observation
 mutes never reach these checks: their escalation does not go through the observation screen.
 
+Non-outage findings: a check that exits non-zero and prints a line `ttp-heal: not-outage` (FINDING) says
+the box or resource is up and something narrower is wrong. That run counts as plain unhealthy (exit 1)
+on a check without `outage`: its own grace, its fix, `known_fault` keeps it quiet, the ordinary self-fix
+task, no outage wording, and nothing reported to the machine ledger (an earlier down report clears).
+A check that never prints the line keeps the behaviour above.
+
 Daemon time: `timeout_s` is capped at MAX_TIMEOUT_S (the daemon's command-watcher cap), a timeout
 kills the check's or fix's whole process group, and the daemon tells its watchdog it still moves
 between the check and the fix; after a fix the schedule's own command waits for the recheck, so one
@@ -81,6 +87,7 @@ OUTAGE_S = 3600                 # a whole box or resource serving nothing this l
 LOCK_WAIT_S = 30                # how long a fix waits for its resource lock before it is deferred
 MAX_TIMEOUT_S = 240             # timeout_s cap: daemon.WATCHER_MAX_S, so check, then fix (+ lock wait) stay
                                 # each well below the daemon's watchdog (WATCHDOG_S)
+FINDING = "ttp-heal: not-outage"   # a check output line: unhealthy, but the box is up (module doc)
 FIX_OWN_75 = 176                # a fix under a lock that itself exits 75 exits this, apart from the lock's 75
 DEFAULTS = {"grace_s": 300, "settle_s": 60, "max_fixes": 3, "window_h": 1.0, "timeout_s": 120}
 OPEN = ("queued", "running", "waiting", "needs_review")
@@ -283,6 +290,11 @@ def check(spec: dict, state: dict, cwd: str, env: dict | None = None) -> tuple[i
     return _shell(spec["check"], cwd, spec["timeout_s"], env)
 
 
+def finding(rc: int, out: str) -> bool:
+    """A check result that is a non-outage finding: non-zero, with a FINDING line in its output."""
+    return rc != 0 and any(line.strip() == FINDING for line in (out or "").splitlines())
+
+
 def run_fix(spec: dict, cwd: str, env: dict) -> tuple[int, str]:
     """Run the fix in its project's `env` (project.command_env), under `ttp lock <resource>` when it
     names one. 75 only from the lock (busy or paused): `ttp lock` passes its command's exit code on,
@@ -388,6 +400,8 @@ def _report_machine(host: Any, name: str, spec: dict, now: float) -> None:
         if not spec.get("outage") or now - float(st["unknown_since"]) < min(spec["grace_s"] or OUTAGE_S, OUTAGE_S):
             return
         want, grace = [alias, spec.get("condition") or "down"] if alias else None, 0
+    elif st.get("finding"):
+        pass   # the box is up: nothing to report, and an earlier down report clears
     elif alias and st.get("status") == "unhealthy" and (spec.get("outage") or not spec.get("known_fault")):
         if spec.get("condition"):
             want = [alias, spec["condition"]]
@@ -424,6 +438,10 @@ def _run(host: Any, name: str, spec: dict, now: float) -> tuple[str, float | Non
     if callable(ping):
         ping()
     st.update(last_check=now, last_rc=rc, last_out=out[-1000:])
+    if finding(rc, out):   # the box is up: a plain unhealthy result of a check without `outage`
+        rc, spec, st["finding"] = 1, {**spec, "outage": False}, True
+    else:
+        st.pop("finding", None)
     pending = st.get("phase") in ("fixing", "settling")   # a fix ran (or a restart cut it short)
     if rc == 0:
         was = st.get("status")
@@ -528,7 +546,9 @@ def _escalate(host: Any, name: str, spec: dict, st: dict, now: float, why: str) 
             f"Fix: {fix}\n"
             + (f"Last fix (exit {st.get('fix_rc')}): {st.get('fix_out') or '(no output)'}\n"
                if st.get("fix_rc") is not None else "")
-            + f"Unhealthy since {time.strftime('%Y-%m-%d %H:%M', time.localtime(float(st['since'])))}.\n\n"
+            + f"Unhealthy since {time.strftime('%Y-%m-%d %H:%M', time.localtime(float(st['since'])))}.\n"
+            + ("The check reports a non-outage finding: the box or resource is up.\n" if st.get("finding") else "")
+            + "\n"
             "Find the cause and repair it within the charter's restrictions, then make sure the check "
             f"passes (`ttp heal test {name}`). If the fix command itself is wrong, correct the heal block "
             "in harness/schedules.json. Report what you changed. Hand off blocked only for a missing "
@@ -566,8 +586,8 @@ def _escalated(host: Any, name: str, spec: dict, st: dict, now: float) -> tuple[
         return f"unhealthy ({how}; coordinator told)", None
     if not st.get("alerted"):
         st["alerted"] = now
-        host.alert(STATE_KEY + name, f"Outage: heal check {name} still fails and its {how}. Last check: {last}",
-                   "high")
+        host.alert(STATE_KEY + name, ("Heal check" if st.get("finding") else "Outage: heal check")
+                   + f" {name} still fails and its {how}. Last check: {last}", "high")
     _save(db, name, st)
     return f"unhealthy ({how}; alerted)", None
 

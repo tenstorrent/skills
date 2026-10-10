@@ -2230,9 +2230,9 @@ def cmd_heal(a) -> None:
         die(f"no enabled heal check named {a.check!r}; `ttp heal list` shows them")
     r, spec = match[0]
     rc, out = heal.check(spec, dict(heal.state(p.db, r["name"])), str(p.root), command_env(p))
-    word = {0: "healthy", 1: "unhealthy"}.get(rc, "unknown")
+    word = "unhealthy, not an outage" if heal.finding(rc, out) else {0: "healthy", 1: "unhealthy"}.get(rc, "unknown")
     print(f"{r['name']}: {word} (exit {rc})" + (f"\n{out}" if out else ""))
-    sys.exit(0 if rc == 0 else 1 if rc == 1 else 75)
+    sys.exit(0 if rc == 0 else 1 if rc == 1 or heal.finding(rc, out) else 75)
 
 
 def cmd_machines(a) -> None:

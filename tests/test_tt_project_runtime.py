@@ -37215,6 +37215,55 @@ def test_heal_known_fault_stays_quiet_unless_a_whole_box_is_out(env):
     assert heal.run(d, "svc", box, now + heal.OUTAGE_S)[0] == "unhealthy (fixed; rechecking)"
 
 
+def test_heal_check_marks_a_non_outage_finding_with_one_output_line():
+    from ttp import heal
+    assert heal.finding(1, "keeper stale\nttp-heal: not-outage\n")
+    assert heal.finding(2, "  ttp-heal: not-outage  ")
+    assert not heal.finding(0, "ttp-heal: not-outage"), "a healthy check is healthy"
+    assert not heal.finding(1, "box down"), "no line: the default classification"
+    assert not heal.finding(1, "it says ttp-heal: not-outage inline"), "only a line of its own counts"
+
+
+def test_heal_outage_check_with_a_non_outage_finding_queues_an_ordinary_self_fix_task(env):
+    from ttp import heal
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    mm.add("box-a", tags="device")
+    p, d, up = _heal_setup(env, outage=True, machine="box-a", fix=None, grace_s=7200)
+    spec, now = _heal_spec(p), time.time()
+    # Default (no line): an outage check exiting 1 escalates as an outage within OUTAGE_S, reported down.
+    assert heal.run(d, "svc", spec, now)[0].startswith("unhealthy (")
+    assert list(ml.conditions()) == ["box-a:down"]
+    # The same check now says the box is up: the down report clears and its own grace_s applies.
+    found = dict(spec, check=f"test -e {up} || {{ echo 'keeper stale'; echo 'ttp-heal: not-outage'; exit 2; }}")
+    status = heal.run(d, "svc", found, now + 60)
+    assert status == ("unhealthy (60 s, grace 7200 s)", now + 7200), status
+    assert ml.conditions() == {} and heal.state(p.db, "svc")["finding"] is True
+    assert heal.run(d, "svc", found, now + heal.OUTAGE_S)[0] == f"unhealthy ({heal.OUTAGE_S} s, grace 7200 s)"
+    assert not p.db.q("SELECT id FROM tasks WHERE origin='daemon'")
+    status = heal.run(d, "svc", found, now + 7200)[0]
+    assert "self-fix task" in status and not status.startswith("error"), status
+    t = p.db.one("SELECT * FROM tasks WHERE origin='daemon'")
+    assert json.loads(t["labels"]) == ["heal:svc"] and "non-outage finding" in t["spec"]
+    p.db.update_task(t["id"], status="failed")
+    assert "alerted" in heal.run(d, "svc", found, now + 7500)[0]
+    alert = p.db.one("SELECT text FROM messages WHERE kind='alert' AND ref='heal:svc'")["text"]
+    assert alert.startswith("Heal check svc still fails") and "Outage" not in alert, alert
+    up.touch()
+    assert heal.run(d, "svc", found, now + 7800) == ("ok (healthy)", None)
+    assert "finding" not in heal.state(p.db, "svc")
+    # A known fault stays quiet past the outage window when the check reports a finding.
+    p.db.set_kv(heal.STATE_KEY + "svc", {})
+    up.unlink()
+    quiet = dict(found, known_fault="vendor bug", grace_s=0)
+    for dt in (0, heal.OUTAGE_S, 3 * heal.OUTAGE_S):
+        assert heal.run(d, "svc", quiet, now + 9000 + dt)[0] == "unhealthy (known fault: kept quiet)"
+    # Without the line the same exit 2 stays today's unknown-and-error result.
+    p.db.set_kv(heal.STATE_KEY + "svc", {})
+    plain = dict(spec, check="echo 'keeper stale'; exit 2", grace_s=600)
+    assert heal.run(d, "svc", plain, now + 20000)[0].startswith("error: heal check exited 2")
+
+
 def test_heal_presets_read_systemd_and_broker_status(env, monkeypatch):
     from ttp import heal
     out = {}
