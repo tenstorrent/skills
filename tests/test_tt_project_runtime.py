@@ -10136,6 +10136,28 @@ def test_an_upgrade_keeps_a_projects_prompt_blocks_in_upstreams_rewritten_text(e
     assert restarts == [1] and not p.db.q("SELECT id FROM tasks WHERE kind='harness'")
 
 
+def test_an_upgrade_keeps_a_block_when_upstream_adds_a_like_line_in_another_section(env, monkeypatch, capsys):
+    """Upstream rewrote the paragraph around a project's fenced block and, in another section, added a
+    bash code block and a 'Note:' line like the block's own: those are not two versions of one line,
+    so the upgrade still settles without a model and the block stays where it stood."""
+    worker = (RUNTIME.parent / "template" / "prompts" / "worker.md").read_text()
+    base = worker + "\n## Other\nBeta one.\n\n## Local test\nAlpha one.\nAlpha two.\n"
+    block = "<!-- ttp:local -->\nNote: build first.\n```bash\nmake\n```\n<!-- /ttp:local -->\n"
+    ours = base.replace("Alpha one.\n", "Alpha one.\n" + block)
+    theirs = (worker + "\n## Other\nBeta one.\nNote: check the status.\n```bash\nttp status\n```\n"
+              "\n## Local test\nAlpha one, reworded.\nAlpha two, reworded.\n")
+    p, cli, restarts = _upgrade_with_local_edits(env, monkeypatch, _OLD_TUNING, _OLD_TUNING,
+                                                 {"worker.md": theirs}, {"worker.md": (base, ours)})
+    h = p.harness
+    capsys.readouterr()
+    cli.main(["upgrade", "demo"])
+    out = capsys.readouterr().out
+    assert "kept this project's own blocks" in out and "prompts/worker.md" in out
+    assert (h / "prompts" / "worker.md").read_text() == theirs.replace("Alpha two, reworded.\n",
+                                                                       "Alpha two, reworded.\n" + block)
+    assert restarts == [1] and not p.db.q("SELECT id FROM tasks WHERE kind='harness'")
+
+
 @pytest.mark.parametrize("where", ["runtime", "prompt"])
 def test_an_upgrade_still_hands_a_true_overlap_to_a_harness_task(env, monkeypatch, capsys, where):
     """The project and upstream changed the same code, or reworded the same prompt line, each its own

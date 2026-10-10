@@ -3016,7 +3016,7 @@ def _keep_local_blocks(ours: str, base: str, theirs: str) -> str | None:
     any); added lines not yet fenced get the fence lines, so the next upgrade finds them as the
     project's (the prompts leave the fence lines out). None when the project changed or removed
     template text, a fence is not closed, or a line the project added nearly repeats one upstream
-    added (batch._near: two versions of one line): that needs judgment."""
+    added or changed at the same spot (batch._near: two versions of one line): that needs judgment."""
     import difflib
 
     from .batch import _near
@@ -3075,9 +3075,11 @@ def _keep_local_blocks(ours: str, base: str, theirs: str) -> str | None:
         return None
     out = theirs.splitlines(keepends=True)
     ops = difflib.SequenceMatcher(None, old, out, autojunk=False).get_opcodes()
-    mine = [x for _, lines in groups for x in lines if x.strip() not in (LOCAL_OPEN, LOCAL_CLOSE)]
-    if _near(mine, [x for tag, _, _, j1, j2 in ops if tag != "equal" for x in out[j1:j2]], False):
-        return None
+    for i, lines in groups:                     # only upstream's lines added or changed at the block's spot
+        mine = [x for x in lines if x.strip() not in (LOCAL_OPEN, LOCAL_CLOSE)]
+        if _near(mine, [x for tag, i1, i2, j1, j2 in ops if tag != "equal" and i1 <= i <= i2
+                        for x in out[j1:j2]], False):
+            return None
 
     def where(i: int) -> int:
         for tag, i1, i2, j1, j2 in ops:
