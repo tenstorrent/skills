@@ -26987,7 +26987,9 @@ def test_web_api_paths_use_their_own_connection_after_a_coordinator_turn(env):
     assert code == 200, data
     assert f"the merge needs harness task #{upgrade}" in data["health"]["release"]
     assert call("/api/messages")[0] == 200
-    assert call("/api/pause", {"resource": "board", "paused": True, "reason": "check"})[0] == 200
+    assert call("/api/pause", {"resource": "board", "paused": True, "reason": "check"})[0] == 400   # no end
+    until = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600))
+    assert call("/api/pause", {"resource": "board", "paused": True, "reason": "check", "until": until})[0] == 200
     assert call("/api/pause", {"resource": "board", "paused": False})[0] == 200
     assert call("/api/schedule/pr-watch", {"enabled": False})[0] == 200
     assert call(f"/api/task/{other}", {"status": "cancelled"})[0] == 200
