@@ -100,6 +100,11 @@ def zone_name(cfg: dict | None) -> str:
     return valid((cfg or {}).get(KEY)) or "UTC"
 
 
+def home(p) -> str:
+    """A Project's home zone name; UTC when it has none."""
+    return zone_name(p.raw_config())
+
+
 def zone(p_or_cfg) -> ZoneInfo:
     """The home zone of a Project or its settings, as a tzinfo."""
     cfg = p_or_cfg if isinstance(p_or_cfg, dict) else p_or_cfg.raw_config()

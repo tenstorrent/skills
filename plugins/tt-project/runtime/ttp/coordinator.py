@@ -19,6 +19,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from . import locks
 from . import anchors, effort, ends, heal, jevuse, landed, machine_ledger, machines, pauseends, prguard, push, responsibilities, reviewcap, settinghold, shared, timefmt, unblock, upstream, worktree
@@ -371,6 +372,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     section whose hash is unchanged is shown as one line."""
     db = p.db
     now = time.time()
+    home = timefmt.home(p)
     shown: list[tuple[str, list[str]]] = []
     shas: dict[str, str] = {}
 
@@ -385,7 +387,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
                 body = [short]
         shown.append((key, body))
 
-    lines = [f"# STATE at {timefmt.long(time.time(), p)} (the project's home zone)",
+    lines = [f"# STATE at {timefmt.long(now, home)} (the project's home zone, {home})",
              "## Project budget (authoritative; your own turn's small spend limit is NOT this budget)"]
     b = p.config()["budget"]
     for prov, g in gates.items():
@@ -643,9 +645,10 @@ def next_task_slot(db, cap: int, now: float | None = None, review: bool = False)
     return made[len(made) - cap] + 86400
 
 
-def parse_start_after(raw: Any, now: float | None = None) -> float | None:
+def parse_start_after(raw: Any, now: float | None = None, tz: str | None = None) -> float | None:
     """`start_after` as epoch seconds, or None for `now` and times already past. A delay counts
-    from now; an ISO time without a zone is local."""
+    from now; an ISO time without a zone is in zone `tz` (the project's home zone; this machine's
+    without one). Tasks keep the result as epoch seconds, so a later zone change never moves it."""
     now = time.time() if now is None else now
     s = str(raw).strip()
     if isinstance(raw, str) and s.lower() in ("", "now"):
@@ -661,7 +664,10 @@ def parse_start_after(raw: Any, now: float | None = None) -> float | None:
     else:
         iso = re.sub(r"([+-][0-9]{2})([0-9]{2})$", r"\1:\2", s.replace(" ", "T", 1).replace("Z", "+00:00"))
         try:
-            at = datetime.fromisoformat(iso).timestamp()
+            at_dt = datetime.fromisoformat(iso)
+            if at_dt.tzinfo is None and timefmt.valid(tz):
+                at_dt = at_dt.replace(tzinfo=ZoneInfo(timefmt.valid(tz)))
+            at = at_dt.timestamp()
         except ValueError as e:
             raise ValueError(f"start_after {raw!r}: {e}") from None
     if at > now + MAX_DEFER_S:
@@ -673,7 +679,8 @@ def _start_args(a: dict, cur: dict, p: Project | None = None) -> tuple[float | N
     """A task_add/task_update's deferral: (start_after, start_when), each kept from `cur` (the
     task's current deferral) when the action leaves it out. `now` and an empty probe clear them.
     A new probe gets static checks only (check_start_when)."""
-    after = parse_start_after(a["start_after"]) if a.get("start_after") is not None else cur.get("after")
+    after = parse_start_after(a["start_after"], tz=timefmt.home(p) if p else None) \
+        if a.get("start_after") is not None else cur.get("after")
     when = a.get("start_when")
     if when is None:
         when = cur.get("when")
@@ -724,7 +731,8 @@ HOLD_NEEDS_ANCHOR = ("a hold needs `waits_on`: ask:<id> (an open ask, or ask:new
                      "blocking category and waits_on ask:new, or set an end with until or when")
 
 
-def _hold_anchor(db, task: dict, a: dict, turn_asks: list[tuple[int, int]], later_ask: bool) -> str | None:
+def _hold_anchor(db, task: dict, a: dict, turn_asks: list[tuple[int, int]], later_ask: bool,
+                 home: str | None = None) -> str | None:
     """The `waits:<kind>:<value>` label of a task_update that sets or keeps a task blocked with `waits_on`
     (anchors.py), or None when it sets none. `ask:new` names this turn's newest ask so far, or, with an
     ask_user later in the turn, stays `ask:new` until apply re-points it. Raises when the update would
@@ -762,7 +770,7 @@ def _hold_anchor(db, task: dict, a: dict, turn_asks: list[tuple[int, int]], late
         return anchors.label("resource", value)
     if kind == "until":
         try:
-            at = parse_start_after(value)
+            at = parse_start_after(value, tz=home)
         except ValueError as e:
             raise ValueError(f"#{task['id']} rejected: waits_on until: {str(e).replace('start_after ', '', 1)}") \
                 from None
@@ -988,7 +996,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                             prev.pop("stale_wakes", None)
                             upd["result"] = dump_result(prev)
                 waits = _hold_anchor(db, task, a, turn_asks,
-                                     any((x or {}).get("type") == "ask_user" for _, x in order[k + 1:]))
+                                     any((x or {}).get("type") == "ask_user" for _, x in order[k + 1:]),
+                                     timefmt.home(p))
                 if a.get("depends_on") is not None:
                     deps = _new_dependencies(db, task, a["depends_on"])
                     upd["depends_on"] = deps
@@ -1267,7 +1276,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                              (a.get("at") or None) if "at" in a else (old["at"] if old else None), enabled,
                              a["budget_usd"] if "budget_usd" in a else (old["budget_usd_day"] if old else None),
                              (a.get("text") or "") if "text" in a else ((old["description"] or "") if old else ""),
-                             payload)
+                             payload, timefmt.home(p))
                 sched.write_file(p, f"schedule {a['name']}: {'changed' if old else 'added'}")
             elif t == "config_set":
                 key = a.get("key", "")

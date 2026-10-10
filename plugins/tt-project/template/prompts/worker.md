@@ -35,6 +35,8 @@
 ## Progress
 
 - Run `ttp note "<one line>"` at each milestone. Humans read these live.
+- Write every time meant for the user (notes, notify, hand-off, follow-up `start_after`) in the
+  project's home zone from your task header, with its abbreviation (`09:30 PDT`), never the host's or UTC.
 - Only when your spec asks you to tell the user something: `ttp notify "<text>"` (`--severity low`
   or `normal`). It is sent when your run ends. Say in your hand-off that you sent it.
 - Make durable progress early: commit, write files. A killed run keeps what is on disk.

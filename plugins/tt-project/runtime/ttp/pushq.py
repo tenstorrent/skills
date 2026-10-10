@@ -165,7 +165,7 @@ def _landing(row: dict, target: str, reach: dict | None) -> str:
     return f"already on {target} at {_short(row['pushed_sha'])}" + push.reach_words(reach)
 
 
-def target_line(db) -> str | None:
+def target_line(db, tz: str | None = None) -> str | None:
     """The daily review's line on how far the intended target (delivery.base_ref) is behind the push
     branch, from the reach the last pushed batch recorded in its marker: no git, no model. None when
     no batch recorded a reach (the branches are the same, no marker, or nothing pushed yet)."""
@@ -174,7 +174,11 @@ def target_line(db) -> str | None:
     r = _reach(db, row["id"]) if row else None
     if not r or not r.get("ref") or r["ref"] == row["target"]:
         return None
-    when = time.strftime("%Y-%m-%d %H:%MZ", time.gmtime(row["ended"] or row["started"]))
+    if tz:   # the project's home zone
+        from .timefmt import long
+        when = long(row["ended"] or row["started"], tz)
+    else:
+        when = time.strftime("%Y-%m-%d %H:%MZ", time.gmtime(row["ended"] or row["started"]))
     if r.get("on") is None:
         return f"Intended target {r['ref']} could not be read at the last push to {row['target']} ({when})"
     n = r.get("behind") if not r.get("on") else 0

@@ -95,7 +95,7 @@ CREATE TABLE IF NOT EXISTS issues (
 CREATE TABLE IF NOT EXISTS schedules (
   name TEXT PRIMARY KEY, kind TEXT NOT NULL, every_s INTEGER NOT NULL, at TEXT,
   enabled INTEGER NOT NULL DEFAULT 1, budget_usd_day REAL, description TEXT,
-  payload TEXT NOT NULL DEFAULT '{}', last_run REAL, next_run REAL, last_status TEXT);
+  payload TEXT NOT NULL DEFAULT '{}', last_run REAL, next_run REAL, last_status TEXT, tz TEXT);
 
 CREATE TABLE IF NOT EXISTS ledger (
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, provider TEXT, account TEXT,
@@ -178,6 +178,7 @@ class DB:
         self._migrate_issue_lifecycle()
         self._migrate_push_landed()
         self._migrate_issue_opened()
+        self._migrate_schedule_tz()
 
     def _migrate_ledger_account(self) -> None:
         """Ledger rows written without an account take the account of the run they booked: the run
@@ -223,6 +224,18 @@ class DB:
             for col in ("lifecycle", "subject"):
                 if col not in have:
                     self.x(f"ALTER TABLE issues ADD COLUMN {col} TEXT")
+
+    def _migrate_schedule_tz(self) -> None:
+        # The zone a schedule's `at` is read in (schedule.zone_of). Rows from before home zones were
+        # read in the daemon's own zone, so they are stamped with it and keep firing at the same
+        # instants; rows added or given a new `at` later leave it empty and follow the home zone.
+        if "tz" in {r["name"] for r in self.q("PRAGMA table_info(schedules)")}:
+            return
+        from .timefmt import detect_local
+        with self.tx():
+            if "tz" not in {r["name"] for r in self.q("PRAGMA table_info(schedules)")}:
+                self.x("ALTER TABLE schedules ADD COLUMN tz TEXT")
+                self.x("UPDATE schedules SET tz=? WHERE at IS NOT NULL AND at!=''", (detect_local(),))
 
     def _migrate_issue_opened(self) -> None:
         # When each issue's current open stretch began (screen._issue sets it on insert and on each

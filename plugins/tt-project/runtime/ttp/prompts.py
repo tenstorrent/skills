@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 from . import budget as bud
+from . import timefmt
 from .db import continues_id, load_result
 from .hook import unread_update
 from .project import WORKER_MEMORY_CHARS, Project, code_tasks_may_push, push_queue_on
@@ -169,12 +170,20 @@ def worker_system(p: Project) -> str:
     return "\n\n".join(x for x in parts if x.strip())
 
 
-def _reboot_note(reboot) -> str:
+def _zone_line(p: Project, now: float | None = None) -> str:
+    """The project's home zone and the time there now, for the task header."""
+    tz = timefmt.home(p)
+    return (f"home time zone: {tz}, now {timefmt.long(time.time() if now is None else now, tz)}: write times "
+            f"for the user in it\n")
+
+
+def _reboot_note(reboot, tz: str | None = None) -> str:
     """What a run lost to a host reboot, or a wait from before one, must know before it redoes work."""
     if not isinstance(reboot, dict):
         return ""
     at = reboot.get("at")
-    when = time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(at)) if isinstance(at, (int, float)) else "recently"
+    when = (timefmt.long(at, tz) if tz else time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(at))) \
+        if isinstance(at, (int, float)) else "recently"
     out = (f"The host rebooted (booted {when}) since the last run; that does not count as an attempt. "
            "Detached jobs, /tmp files and device state from before the reboot are gone. Check `git status` "
            "and the job logs before redoing work.\n")
@@ -201,7 +210,7 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
         history = f"\nPrevious attempt ended '{prev.get('status')}': {str(prev.get('summary') or '')[:1500]}\n"
         if prev.get("woke"):
             history += f"Woken because: {prev['woke']}.\n"
-        history += _reboot_note(prev.get("reboot"))
+        history += _reboot_note(prev.get("reboot"), timefmt.home(p))
     run_tier = (wake or {}).get("tier") or task["tier"]
     step = bud.mechanical_step(prev) if wake else ""
     if wake and not step and bud.next_step(prev):
@@ -262,6 +271,7 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
         + _resource_line(task)
         + _runner_line(cfg)
         + f"project root: {p.root}\n"
+        + _zone_line(p)
         + venv_line
         + f"delivery policy: draft PRs={delivery.get('draft_prs', True)}, review before PR="
         f"{delivery.get('review_before_pr', True)}, auto-merge repos={delivery.get('auto_merge_repos') or 'none'}, "
@@ -285,7 +295,7 @@ def worker_resume(p: Project, task: dict, lost: dict) -> str:
     daemon): what happened, what is gone, what changed since, then the restrictions again. The
     session already holds the task and its own work."""
     at = lost.get("ended")
-    when = time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(at)) if isinstance(at, (int, float)) else "recently"
+    when = timefmt.long(at, timefmt.home(p)) if isinstance(at, (int, float)) else "recently"
     why = {"reboot": "the host rebooted", "sleep": "the host slept",
            "network": "the network went away"}.get(lost.get("cause"), "its supervisor was lost")
     free = lost.get("cause") in ("reboot", "sleep", "network")

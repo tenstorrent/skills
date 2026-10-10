@@ -356,7 +356,7 @@ def bootstrap(root: Path, name: str, brief: str, provider: str, home_tz: str | N
     db = p.db
     for s in json.loads((template / "recurring.json").read_text()):
         sched.upsert(db, s["name"], s["kind"], s["every"], s.get("at"), s.get("enabled", True),
-                     s.get("budget_usd_day"), s.get("description", ""), s.get("payload", {}))
+                     s.get("budget_usd_day"), s.get("description", ""), s.get("payload", {}), timefmt.home(p))
     sched.write_file(p, "schedules: from the template", create=True)
     db.set_meta("name", name)
     db.post("in", "Project created. Brief:\n" + (brief.strip() or "(none)") +
@@ -2196,10 +2196,12 @@ def cmd_schedules(a) -> None:
         return
     print(f"schedules from {path}" if path.exists() else
           f"schedules from the database only (`ttp schedules {p.name} --export` moves them into {path})")
+    home = timefmt.home(p)
     for r in p.db.q("SELECT * FROM schedules ORDER BY name"):
         e = sched.entry(r)
         t = e["payload"].get("timeout_s") if isinstance(e["payload"], dict) else None
-        print(f"  {e['name']:24} {e['kind']:8} every {e['every']}{' at ' + e['at'] if e.get('at') else ''}"
+        at = sched.at_text(r, home)
+        print(f"  {e['name']:24} {e['kind']:8} every {e['every']}{' ' + at if at else ''}"
               f"{f' timeout {t}s' if t else ''}{'' if e['enabled'] else ' (off)'}  {r['last_status'] or ''}")
 
 

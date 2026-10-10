@@ -35,8 +35,10 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from .db import DB
+from . import timefmt
 
 _EVERY = re.compile(r"^\s*(\d+)\s*([smhdw])\s*$")
 _UNIT = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 7 * 86400}
@@ -53,27 +55,53 @@ def parse_every(spec: str | int) -> int:
     return int(m.group(1)) * _UNIT[m.group(2)]
 
 
-def next_run(every_s: int, at: str | None, after: float) -> float:
-    """Next fire time strictly after `after`. `at` ("HH:MM", local) anchors day-scale schedules."""
+def next_run(every_s: int, at: str | None, after: float, tz: str | None = None) -> float:
+    """Next fire time strictly after `after`. `at` ("HH:MM" in zone `tz`; this machine's zone
+    without one) anchors day-scale schedules, at the same wall-clock time across DST changes."""
     if at and every_s >= 86400:
         hh, mm = (int(x) for x in at.split(":"))
-        base = datetime.fromtimestamp(after).replace(hour=hh, minute=mm, second=0, microsecond=0)
+        zone = ZoneInfo(timefmt.valid(tz)) if timefmt.valid(tz) else None
+        base = datetime.fromtimestamp(after, zone).replace(hour=hh, minute=mm, second=0, microsecond=0)
         while base.timestamp() <= after:
             base += timedelta(seconds=every_s)
         return base.timestamp()
     return after + every_s
 
 
+def zone_of(row: dict, home: str | None) -> str | None:
+    """The zone a schedule's `at` is read in: the one it was stamped with (rows from before home
+    zones keep the zone the daemon used then, see db._migrate_schedule_tz), else the project's home zone."""
+    return timefmt.valid(row.get("tz")) or timefmt.valid(home)
+
+
+def at_text(row: dict, home: str | None, now: float | None = None) -> str:
+    """'at 09:00 PDT' (the zone's abbreviation at the next run), with the zone's name when a row
+    stamped before home zones keeps another zone: 'at 09:00 UTC (UTC)'. '' without an `at`."""
+    if not row.get("at"):
+        return ""
+    tz = zone_of(row, home) or "UTC"
+    when = row.get("next_run") or (time.time() if now is None else now)
+    pinned = timefmt.valid(row.get("tz")) and timefmt.valid(row.get("tz")) != timefmt.valid(home)
+    return f"at {row['at']} {timefmt.abbrev(tz, float(when))}" + (f" ({tz})" if pinned else "")
+
+
 def upsert(db: DB, name: str, kind: str, every: str | int, at: str | None = None, enabled: bool = True,
-           budget_usd_day: float | None = None, description: str = "", payload: dict | None = None) -> None:
+           budget_usd_day: float | None = None, description: str = "", payload: dict | None = None,
+           home: str | None = None) -> None:
+    """Add or change a schedule. A new `at` is read in the project's home zone `home`, and so is
+    every later run (the row follows the home zone); an unchanged `at` keeps the zone it had."""
     every_s = parse_every(every)
+    at = at or None
     existing = db.one("SELECT * FROM schedules WHERE name=?", (name,))
-    nxt = existing["next_run"] if existing and existing["next_run"] else next_run(every_s, at, time.time())
-    db.x("INSERT INTO schedules(name,kind,every_s,at,enabled,budget_usd_day,description,payload,next_run) "
-         "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET kind=excluded.kind, every_s=excluded.every_s, "
+    same_at = bool(existing) and (existing["at"] or None) == at
+    tz = existing.get("tz") if same_at else None
+    nxt = existing["next_run"] if existing and existing["next_run"] and same_at else \
+        next_run(every_s, at, time.time(), zone_of({"tz": tz}, home))
+    db.x("INSERT INTO schedules(name,kind,every_s,at,enabled,budget_usd_day,description,payload,next_run,tz) "
+         "VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET kind=excluded.kind, every_s=excluded.every_s, "
          "at=excluded.at, enabled=excluded.enabled, budget_usd_day=excluded.budget_usd_day, "
-         "description=excluded.description, payload=excluded.payload",
-         (name, kind, every_s, at, int(enabled), budget_usd_day, description, json.dumps(payload or {}), nxt))
+         "description=excluded.description, payload=excluded.payload, next_run=excluded.next_run, tz=excluded.tz",
+         (name, kind, every_s, at, int(enabled), budget_usd_day, description, json.dumps(payload or {}), nxt, tz))
 
 
 def due(db: DB, now: float | None = None) -> list[dict]:
@@ -95,7 +123,7 @@ def deferred(status: str | None) -> bool:
     return bool(status) and status.startswith("deferred: ")
 
 
-def mark_ran(db: DB, sched: dict, status: str, now: float | None = None) -> None:
+def mark_ran(db: DB, sched: dict, status: str, now: float | None = None, home: str | None = None) -> None:
     now = now or time.time()
     if budget_skipped(status) or deferred(status):
         # Keep last_run so the period still counts as not run, and retry soon instead of a full period on.
@@ -103,7 +131,8 @@ def mark_ran(db: DB, sched: dict, status: str, now: float | None = None) -> None
              (status, now + min(BUDGET_RETRY_S, sched["every_s"]), sched["name"]))
         return
     db.x("UPDATE schedules SET last_run=?, last_status=?, next_run=? WHERE name=?",
-         (now, status, next_run(sched["every_s"], sched["at"], now), sched["name"]))
+         (now, status, next_run(sched["every_s"], sched["at"], now, zone_of(sched, home)),
+          sched["name"]))
 
 
 def failing(status: str | None) -> bool:
@@ -136,8 +165,8 @@ def spent_today(db: DB, name: str) -> float:
     return float(row["s"]) if row else 0.0
 
 
-def with_costs(db: DB) -> list[dict]:
-    """Schedules annotated with their last-7-day cost, for the web app's recurring pane."""
+def with_costs(db: DB, home: str | None = None) -> list[dict]:
+    """Schedules annotated with their last-7-day cost and `at` time, for the web app's recurring pane."""
     rows = db.q("SELECT * FROM schedules ORDER BY name")
     week = time.time() - 7 * 86400
     for r in rows:
@@ -145,6 +174,7 @@ def with_costs(db: DB) -> list[dict]:
                    (week, f"schedule:{r['name']}"))
         r["cost_7d"] = round(float(c["s"]), 2)
         r["payload"] = json.loads(r["payload"] or "{}")
+        r["at_text"] = at_text(r, home)
     return rows
 
 
@@ -213,7 +243,7 @@ def parse_file(text: str | bytes) -> list[dict]:
         except (ValueError, TypeError) as err:
             raise ValueError(f"{where}: {err}") from None
         if e.get("at") is not None and not (isinstance(e["at"], str) and _AT.match(e["at"])):
-            raise ValueError(f"{where}: `at` is a local time HH:MM")
+            raise ValueError(f"{where}: `at` is a time HH:MM in the project's home zone")
         if not isinstance(e.get("enabled", True), bool):
             raise ValueError(f"{where}: `enabled` is true or false")
         b = e.get("budget_usd_day")
@@ -260,7 +290,7 @@ def sync_file(p: Any, force: bool = False) -> tuple[bool, str | None]:
     with db.tx():
         for e in entries:
             upsert(db, e["name"], e["kind"], e["every"], e.get("at") or None, e.get("enabled", True),
-                   e.get("budget_usd_day"), e.get("description", ""), e.get("payload", {}))
+                   e.get("budget_usd_day"), e.get("description", ""), e.get("payload", {}), timefmt.home(p))
         names = [e["name"] for e in entries]
         db.x(f"DELETE FROM schedules WHERE name NOT IN ({','.join('?' * len(names))})", names)
         db.set_kv(_APPLIED, sha)

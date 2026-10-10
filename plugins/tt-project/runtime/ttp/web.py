@@ -17,7 +17,7 @@ from . import alerts, awake
 from . import budget as bud
 from . import globalcap as gcap
 from . import coordinator as coord
-from . import heal, pushq, release, responsibilities, waits
+from . import heal, pushq, release, responsibilities, timefmt, waits
 from . import schedule as sched
 from . import timefmt, upstream
 from .daemon import (AUTH_PROBE_S, HEARTBEAT_STALE_S, KV_LOCAL_ONLY, KV_WORKTREES_DIRTY, LOGGED_OUT_NOTE, NET_HELD_NOTE,
@@ -489,7 +489,7 @@ def state_payload(p: Project, db: DB) -> dict:
         "tasks": tasks, "task_counts": db.status_counts(), "runs": runs,
         "issues": db.q("SELECT id,source,title,severity,status,count,first_seen,last_seen,task FROM issues "
                        "WHERE status IN ('open','tracking') ORDER BY last_seen DESC LIMIT 100"),
-        "schedules": sched.with_costs(db),
+        "schedules": sched.with_costs(db, timefmt.home(p)),
         "attention": attention(db, now),
         "feed": sorted(alerts.feed(db, now) + uncommitted_feed(db), key=lambda m: -float(m["ts"] or 0)),
         "offline_help": offline_help(p.name),

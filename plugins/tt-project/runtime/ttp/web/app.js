@@ -271,7 +271,7 @@ async function refresh() {
   R.rows($("#tasklist"), st.tasks.length ? taskRows(st.tasks) : muted("No tasks."));
   R.rows($("#issuelist"), st.issues.length ? st.issues.map((i) => ({ key: i.id, html: `<div class="row"><span class="id">${esc(i.severity)}</span><span class="title">${esc(i.title)}</span><span class="meta">${esc(i.source)} · seen ${i.count}× · last ${agoH(i.last_seen)} ago${i.task ? " · task #" + i.task : ""}</span></div>` })) : muted("No open issues."));
   put($("#schedlist"), `<table><tr><th>Name</th><th>Kind</th><th>Every</th><th>Last run</th><th>7-day cost</th><th>Daily budget</th><th>On</th></tr>` +
-    st.schedules.map((s) => `<tr><td><b>${esc(s.name)}</b><div class="meta">${esc(s.description)}</div></td><td>${esc(s.kind)}</td><td>${Math.round(s.every_s / 60)} min</td>
+    st.schedules.map((s) => `<tr><td><b>${esc(s.name)}</b><div class="meta">${esc(s.description)}</div></td><td>${esc(s.kind)}</td><td>${Math.round(s.every_s / 60)} min${s.at_text ? " " + esc(s.at_text) : ""}</td>
       <td>${agoH(s.last_run)} ago<div class="meta">${esc((s.last_status || "").startsWith("skipped: budget ") ? "waiting for budget" : s.last_status || "")}</div></td><td>${money(s.cost_7d)}</td>
       <td><input type="number" min="0" step="0.5" value="${s.budget_usd_day == null ? "" : s.budget_usd_day}" style="width:6em" onchange="setSched('${esc(s.name)}',{budget_usd_day:this.value})"></td>
       <td><input type="checkbox" ${s.enabled ? "checked" : ""} onchange="setSched('${esc(s.name)}',{enabled:this.checked})"></td></tr>`).join("") + `</table>`);

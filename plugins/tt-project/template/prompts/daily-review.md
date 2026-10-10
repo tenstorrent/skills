@@ -41,7 +41,7 @@ Assess the last day of this project, then hand off.
    that recurs: one finished instance does not make it done, and size is no reason to retire it.
    Retire one only with `--why "<its end condition, or the user's words ending it>"`.
 7. Deferrals held in memory ("deferred", "once X", "N days after Y", "queue it when ..."): turn
-   each into a follow-up with `start_after` (a delay such as `3d` or an ISO time) and/or
+   each into a follow-up with `start_after` (a delay such as `3d` or an ISO time in the home zone) and/or
    `start_when` (a read-only shell probe from the project root: exit 0 = start, 1 = not yet,
    under a minute; `landed:#<id>` for "once task <id> landed"), and a spec that names the entry
    it replaces. The coordinator adds it as a

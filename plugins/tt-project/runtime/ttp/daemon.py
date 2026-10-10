@@ -2632,7 +2632,7 @@ class Daemon:
                     status = self._schedule_llm(s, payload)
             except Exception as e:
                 status = f"error: {type(e).__name__}: {e}"[:200]
-            sched.mark_ran(db, s, status)
+            sched.mark_ran(db, s, status, home=timefmt.home(self.p))
             if again is not None:   # a heal check's grace end or settle recheck comes before its period
                 db.x("UPDATE schedules SET next_run=MIN(next_run, ?) WHERE name=?", (again, s["name"]))
             if (sched.failing(status) and sched.failing(s["last_status"])
@@ -2830,7 +2830,7 @@ class Daemon:
                 log(self.p, f"health coverage line failed: {type(e).__name__}: {e}")
         if s["name"] == "daily-review":
             try:
-                line = pushq.target_line(db)
+                line = pushq.target_line(db, timefmt.home(self.p))
                 if line:
                     spec += f"\n\nDelivery: {line}."
             except Exception as e:   # nor must a missing or broken push marker
