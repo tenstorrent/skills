@@ -33,6 +33,9 @@ BACKOFF_STEP_S = 300            # a dead batch's rows wait 5 min per try ...
 BACKOFF_MAX_S = 1800            # ... and at most 30 min
 DYING_AFTER = 3                 # batches that die in a row before push_queue_dying is raised
 MAX_RESUMES = 1                 # respawns of an after_push that died (a reboot killed the deploy)
+RECOVER_S = 1800                # a batch that died mid-push: how long its remote may stay unreadable
+RECOVER_GAP_S = 120             # ... asked at most this often meanwhile
+RECOVER_FETCH_S = 20            # ... each fetch bounded, as the tick waits for it
 REFUSAL_TIMEOUT_S = 30          # the approval asks the remote for its default branch; never hang the tick
 DEFAULT_BRANCH_TTL_S = 3600     # ... and remembers the answer per remote this long (one ask, not one per approval)
 DEFAULT_BRANCH_RETRY_S = 300    # an unreachable remote is asked again after this, not on every approval
@@ -44,6 +47,7 @@ STATS_S = 7 * 86400            # the conflict counts `ttp push --queue` and the 
 _HEX40 = re.compile(r"[0-9a-f]{40}")
 _children: dict[str, subprocess.Popen] = {}   # batch processes this daemon started, reaped by finalize
 _default_branches: dict[tuple[str, str], tuple[float, str | None]] = {}   # (root, remote): (until, branch)
+_recover_asked: dict[str, float] = {}         # batch id: when its remote was last asked (_recover)
 
 
 # settings -----------------------------------------------------------------------------------------
@@ -556,9 +560,10 @@ def _tail_of(m: dict, detail: dict | None = None, n: int = 20) -> str:
     return "\n".join((tail or push._tail(m.get("log"), n)).splitlines()[-n:])
 
 
-def _died(p: Project, b: dict, m: dict, alert: Callable, why: str, now: float) -> None:
+def _died(p: Project, b: dict, m: dict, alert: Callable, why: str, now: float, queued: bool = False) -> None:
     """A batch that ended without a usable outcome: its rows go back to approved, a try counted, and
-    the queue backs off. DYING_AFTER of them in a row raise push_queue_dying."""
+    the queue backs off. DYING_AFTER of them in a row raise push_queue_dying. `queued`: the event
+    needs the coordinator (something is left that the queue cannot recover)."""
     db = p.db
     with db.tx():
         if not db.conn.execute("UPDATE push_batches SET outcome=?, ended=?, finalized=?, after_push='skipped', "
@@ -575,12 +580,80 @@ def _died(p: Project, b: dict, m: dict, alert: Callable, why: str, now: float) -
         db.set_kv(KV, st)
         _event(db, None, "push_batch_died",
                f"push batch {b['id']} {why}; {len(rows)} approval{'s' if len(rows) != 1 else ''} back in the queue, "
-               f"retried after {st['backoff_until'] - now:.0f} s", queued=False)
+               f"retried after {st['backoff_until'] - now:.0f} s", queued=queued, severity="high" if queued else "normal")
     push._forget_lock(Path(b["marker"]))     # dead: nothing holds it; the next batch has its own
     if st["deaths"] >= DYING_AFTER:
         alert("push_queue_dying", f"The last {st['deaths']} push batches ended without finishing ({why}). The "
                                   f"approvals stay queued and are retried with a growing pause. Log: {m.get('log') or '?'}",
               severity="high")
+
+
+def _on_remote(repo: Path, remote: str, branch: str, sha: str, fetch: bool) -> bool | None:
+    """Whether `sha` is on remote/branch: the tracking ref first (a push that went through moved it),
+    then a bounded fetch when asked. None when the branch cannot be read."""
+    from .landed import on_branch
+    if fetch:
+        try:
+            if subprocess.run(["git", "-C", str(repo), "fetch", "-q", remote,
+                               f"+refs/heads/{branch}:refs/remotes/{remote}/{branch}"], stdin=subprocess.DEVNULL,
+                              capture_output=True, timeout=RECOVER_FETCH_S,
+                              env={**os.environ, "GIT_TERMINAL_PROMPT": "0"}).returncode != 0:
+                return None
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+    tip = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet",
+                          f"refs/remotes/{remote}/{branch}^{{commit}}"], text=True, capture_output=True,
+                         stdin=subprocess.DEVNULL).stdout.strip()
+    if not tip:
+        return None
+    try:
+        return on_branch(repo, sha, tip)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _recover(p: Project, b: dict, marker: Path, m: dict, now: float) -> dict | None:
+    """A batch that died with no outcome but had begun `git push` (batch.Batch._mark_pushing). If
+    that head is on the branch, the push went through: the marker gets the outcome it would have
+    written (pushed, with each entry's result), so finalize applies it and resumes its after_push,
+    and no entry goes back to be pushed again. If it is not, the batch died as usual. While the
+    branch cannot be read: None (asked again later), until RECOVER_S, then the batch died with
+    `unverified` set."""
+    pg = m["pushing"]
+    sha = str(pg.get("sha") or "")
+    remote, _, branch = str(b["target"] or "").partition("/")
+    if not (_HEX40.fullmatch(sha) and remote and branch):
+        return m
+    repo = Path(m.get("repo") or p.root)
+    on = _on_remote(repo, remote, branch, sha, fetch=False) or None   # not on the tracking ref: ask the remote
+    if on is None and now - _recover_asked.get(b["id"], 0) >= RECOVER_GAP_S:
+        _recover_asked[b["id"]] = now
+        on = _on_remote(repo, remote, branch, sha, fetch=True)
+    if on is None:
+        try:
+            since = float(pg.get("at") or 0)
+        except (TypeError, ValueError):
+            since = 0
+        if now - since < RECOVER_S:
+            return None
+        _recover_asked.pop(b["id"], None)
+        return {**m, "unverified": sha}
+    _recover_asked.pop(b["id"], None)
+    if not on:
+        return m
+    also = push.fast_forward_list(_delivery(p).get("fast_forward_also"))
+    m = dict(push._read(marker) or m)
+    m.update(outcome="pushed", pushed_sha=sha, tip=pg.get("tip"), version=pg.get("version"),
+             results=pg.get("results") or [], checks=pg.get("checks") or {}, rounds=pg.get("rounds"),
+             message=None, recovered=now)
+    if also:
+        m["fast_forward"] = [f"not ff {x}: the batch stopped after its push, before this step (a reboot?); "
+                             f"not run" for x in also]
+    write_json(marker, m)
+    _event(p.db, None, "push_batch_recovered", f"push batch {b['id']} stopped after pushing {_short(sha)} to "
+                                               f"{b['target']}, before it wrote its outcome (a reboot?); it is on the "
+                                               f"branch, so the batch counts as pushed", queued=False)
+    return m
 
 
 def _settle(p: Project, tid: int, b: dict, m: dict, now: float) -> None:
@@ -903,15 +976,23 @@ def finalize(p: Project, cfg: dict | None = None, alert: Callable = lambda *a, *
         marker = Path(b["marker"])
         live, m = alive(marker)
         if b["finalized"] is None:
+            if not live and not m.get("outcome") and isinstance(m.get("pushing"), dict):
+                m = _recover(p, b, marker, m, now_)
+                if m is None:
+                    continue
             if m.get("outcome") and m.get("outcome") != "error":
                 _apply(p, b, m, alert, now_)
             elif live:
                 continue
             else:
                 why = (f"failed: {str(m.get('message') or '')[:300]}" if m.get("outcome") == "error"
+                       else f"ended while pushing {_short(m['unverified'])} (a reboot, a kill or a crash), and "
+                            f"{b['target']} could not be read for {RECOVER_S // 60} min to tell whether it landed. "
+                            f"If it did, the next batch finds the approvals on the branch, but no after_push "
+                            f"ran for it" if m.get("unverified")
                        else "ended before writing an outcome (a reboot, a kill or a crash)" if m
                        else "lost its marker")
-                _died(p, b, m, alert, why, now_)
+                _died(p, b, m, alert, why, now_, queued=bool(m.get("unverified")))
                 changed.append(b["id"])
                 continue
             changed.append(b["id"])

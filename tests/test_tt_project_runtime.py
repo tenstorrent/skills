@@ -17745,6 +17745,8 @@ with open(marker[:-5] + ".starts", "a") as f:
 if m.get("outcome") is None:
     wait(plan.get("release"))
     if plan.get("die") == "push":
+        if plan.get("pushing"):    # died between its `git push` and its outcome
+            write(pushing=plan["pushing"])
         sys.exit(3)
     rows = plan.get("rows") or {}
     write(outcome=plan.get("outcome", "pushed"), tip=plan.get("tip"), pushed_sha=plan.get("sha"),
@@ -18798,6 +18800,138 @@ def test_after_push_failures_are_reported_and_a_deploy_cut_short_runs_once_more(
     assert s.p.db.one("SELECT after_push FROM push_batches WHERE id=?", (bid,))["after_push"] == "ok"
     assert [e["status"] for e in _pq_events(s.p, mark) if e["kind"] == "after_push_ok"] == ["handled"]
     assert "after_push_failed" in [ep["key"] for ep in alerts.sweep(s.p.db)]
+
+
+def _pq_pushing(s, sha, row="pushed"):
+    """The plan of a batch that dies after it began pushing `sha`, before writing its outcome."""
+    rows = s.p.db.q("SELECT id, task FROM push_queue WHERE status='approved'")
+    _pq_plan(s, die="push", pushing={"sha": sha, "tip": _git_out(s.origin, "rev-parse", "proj"), "version": "1.0.2",
+                                     "at": time.time(), "checks": {"runs": 1, "seconds": 2.0}, "rounds": 1,
+                                     "results": [{"id": r["id"], "task": r["task"], "status": row, "sha": sha,
+                                                  "detail": {}} for r in rows]})
+
+
+def test_a_batch_that_died_after_its_push_landed_counts_as_pushed_and_runs_its_after_push(env, monkeypatch):
+    """A reboot between the batch's `git push` and its outcome: the head it was pushing is on the
+    branch, so the queue settles the batch as pushed from what it recorded before the push. Its
+    approvals are not queued again (no second push), the review is done, and its after_push runs."""
+    from ttp import pushq
+    s = _pq(env, monkeypatch, after_push="./deploy.sh")
+    _pq_hand_off(env, s)
+    mark = _pq_mark(s.p)
+    sha = _git_out(s.origin, "rev-parse", "proj")   # what the dead batch pushed is the branch tip
+    _pq_pushing(s, sha)
+    bid = _pq_batch(s)
+    _pq_tend(s)
+    t = s.p.db.task(s.review)
+    assert t["status"] == "done" and json.loads(t["result"])["pushed"][0]["sha"] == sha
+    assert s.p.db.one("SELECT status, tries, landed_sha FROM push_queue") == {
+        "status": "pushed", "tries": 0, "landed_sha": sha}
+    assert s.p.db.one("SELECT outcome, pushed_sha, version FROM push_batches") == {
+        "outcome": "pushed", "pushed_sha": sha, "version": "1.0.2"}
+    assert pushq.due(s.p, time.time() + 10 ** 6)[0] == [], "nothing goes out again"
+    assert (s.p.db.kv(pushq.KV) or {}).get("deaths", 0) == 0
+    pushq._children[bid].wait(timeout=30)            # the after_push, run once more
+    _pq_tend(s)
+    assert s.p.db.one("SELECT after_push, after_tries FROM push_batches") == {"after_push": "ok", "after_tries": 1}
+    assert (s.p.state / "pushes" / f"{bid}.starts").read_text().split() == ["push", "after_push"]
+    evs = _pq_events(s.p, mark)
+    assert [e["status"] for e in evs if e["kind"] == "push_batch_recovered"] == ["handled"]
+    assert not [e for e in evs if e["status"] == "queued"], "recovered: the coordinator is not woken"
+    assert not [e for e in evs if e["kind"] == "push_batch_died"]
+
+
+def test_a_batch_that_died_before_its_push_landed_puts_each_approval_back_once(env, monkeypatch):
+    """The dead batch had begun pushing, but its head is not on the branch: its approvals go back to
+    the queue exactly once and are never called landed; the next batch pushes them."""
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    _pq_hand_off(env, s)
+    mark = _pq_mark(s.p)
+    _pq_pushing(s, s.head)                          # the reviewed head was never pushed
+    _pq_batch(s)
+    _pq_tend(s)
+    _pq_tend(s)                                     # a second tick changes nothing
+    assert s.p.db.one("SELECT status, tries, landed_sha FROM push_queue") == {
+        "status": "approved", "tries": 1, "landed_sha": None}
+    assert s.p.db.task(s.review)["status"] == "pushing"
+    assert s.p.db.one("SELECT outcome FROM push_batches")["outcome"] == "died"
+    assert [e["status"] for e in _pq_events(s.p, mark) if e["kind"] == "push_batch_died"] == ["handled"]
+    assert len(pushq.due(s.p, time.time() + 10 ** 6)[0]) == 1
+    _pq_plan(s, outcome="pushed", sha="ab" * 20)
+    _pq_batch(s)
+    _pq_tend(s)
+    assert s.p.db.task(s.review)["status"] == "done"
+    assert s.p.db.one("SELECT COUNT(*) n FROM push_queue")["n"] == 1
+
+
+def test_a_batch_that_died_mid_push_waits_for_an_unreadable_branch_then_tells_the_coordinator_once(env, monkeypatch):
+    """Whether the dead batch's push landed cannot be told while the remote cannot be read: the batch
+    waits (its approvals neither pushed again nor called landed). Past RECOVER_S it counts as died,
+    its approvals go back, and the coordinator gets one event, since an after_push may be missing."""
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    _pq_hand_off(env, s)
+    mark = _pq_mark(s.p)
+    _git_out(s.p.root, "remote", "set-url", "origin", str(env["tmp"] / "gone.git"))
+    _pq_pushing(s, s.head)
+    _pq_batch(s)
+    pushq._recover_asked.clear()
+    _pq_tend(s)
+    assert s.p.db.one("SELECT status, tries FROM push_queue") == {"status": "batched", "tries": 0}
+    assert s.p.db.one("SELECT finalized FROM push_batches")["finalized"] is None
+    assert pushq.due(s.p, time.time() + 10 ** 6)[0] == []
+    later = time.time() + pushq.RECOVER_S + 1
+    pushq.finalize(s.p, now=later)
+    pushq.finalize(s.p, now=later + 600)
+    assert s.p.db.one("SELECT status, tries FROM push_queue") == {"status": "approved", "tries": 1}
+    [ev] = [e for e in _pq_events(s.p, mark) if e["status"] == "queued"]
+    assert ev["kind"] == "push_batch_died" and "could not be read" in ev["text"] and "after_push" in ev["text"]
+
+
+def test_a_real_batch_records_what_it_pushes_before_pushing_and_recovers_after_a_reboot(env, monkeypatch):
+    """The real batch writes `pushing` (its head and each entry's result if it lands) before `git
+    push`, matching what it writes once pushed. Cut off right after the push (the marker as a reboot
+    leaves it, with the run lock and the target lock files still labelled), the queue settles it as
+    pushed and runs the after_push once; the stale lock files hold nothing up for the next batch."""
+    from ttp import pushq
+    from ttp.project import write_json
+    s = _pq_real(env, monkeypatch)
+    _pq_hand_off(env, s)
+    bid = _pq_batch(s)
+    marker = s.p.state / "pushes" / f"{bid}.json"
+    m = json.loads(marker.read_text())
+    sha = _git_out(s.origin, "rev-parse", "proj")
+    assert m["outcome"] == "pushed" and m["pushing"]["sha"] == sha == m["pushed_sha"], m
+    assert m["pushing"]["results"] == m["results"]
+    # As a reboot leaves it: no outcome, phase push, the run lock and target lock files labelled but free.
+    run_lock = s.p.state / "locks" / f"push:run-{bid}.0.lock"
+    for path in (run_lock, s.p.state / "locks" / "push:origin%2Fproj.0.lock"):
+        path.write_text(json.dumps({"holder": f"push batch {bid}", "since": time.time()}))
+    gone = ("outcome", "results", "pushed_sha", "version", "tip", "checks", "rounds", "message", "conflicts",
+            "reach", "after_push", "ended")
+    write_json(marker, {**{k: v for k, v in m.items() if k not in gone},
+                        "status": "running", "phase": "push", "lock": str(run_lock)})
+    deploys = env["tmp"] / "deploys.log"
+    s.p.set_config("delivery.after_push", [f"git rev-parse HEAD >> {deploys}"])
+    _pq_tend(s)
+    t = s.p.db.task(s.review)
+    assert t["status"] == "done" and json.loads(t["result"])["pushed"][0]["sha"] == sha
+    pushq._children[bid].wait(timeout=60)
+    _pq_tend(s)
+    assert deploys.read_text().split() == [sha]
+    assert s.p.db.one("SELECT outcome, after_push FROM push_batches") == {"outcome": "pushed", "after_push": "ok"}
+    assert not run_lock.exists()
+    # The next approval goes out past the stale target lock file; the first is not pushed again.
+    _commit(s.path, "more.txt", "more\n")
+    rid, _ = _pq_review(s)
+    with s.p.db.tx():
+        s.p.db.x("UPDATE push_queue SET head=? WHERE task=?", (_git_out(s.path, "rev-parse", "HEAD"), rid))
+    bid2 = _pq_batch(s)
+    assert pushq._children[bid2].returncode == 0, (s.p.state / "pushes" / f"{bid2}.log").read_text()
+    _pq_tend(s)
+    assert s.p.db.task(rid)["status"] == "done"
+    assert _git_out(s.origin, "log", "--format=%s", f"{sha}..proj").count("feature") == 0
 
 
 @pytest.mark.parametrize("delivery, on", [

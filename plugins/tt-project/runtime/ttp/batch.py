@@ -15,7 +15,9 @@ applies it to the reviews.
 After the push the process lets go of the push lock and of its `push:run-<id>` lock (automatic
 upgrades wait only for that one). It then runs `delivery.after_push` (a deploy) at the pushed commit,
 under a lock of its own, `after_push:run-<id>`. A marker that has an outcome but whose after_push did
-not finish is resumed: only the after_push step runs."""
+not finish is resumed: only the after_push step runs. Before `git push` the marker records what the push
+lands (`pushing`), so a process that dies between the push and its outcome (a reboot) is settled as
+pushed once its head is found on the branch, never pushed twice (pushq.finalize)."""
 from __future__ import annotations
 
 import difflib
@@ -710,6 +712,7 @@ class Batch:
             return self._close(0, "tip_failed" if failed is None else "nothing", carried, failed)
         if push._fetch(self.repo, self.remote, self.branch) != tip:
             return "moved"
+        self._mark_pushing(tip, head, k, carried, failed)
         # Without --force the remote takes only a fast-forward of the tip the checks ran on.
         r = _git(self.repo, "push", self.remote, f"{head}:refs/heads/{self.branch}")
         if r.returncode != 0:
@@ -726,6 +729,26 @@ class Batch:
         except Exception:
             pass
         return outcome
+
+    def _mark_pushing(self, tip: str, head: str, k: int, carried: list, failed: tuple | None) -> None:
+        """Record in the marker, before `git push`, what this push lands and what each entry's result
+        is if it does. A process that dies between the push and its outcome (a reboot) leaves this
+        behind; the queue finds `head` on the branch and settles the batch as pushed from it
+        (pushq.finalize), so the push is neither lost nor made twice and its after_push still runs."""
+        saved = (dict(self.status), {i: dict(d) for i, d in self.detail.items()}, dict(self.landed_at))
+        try:
+            self._close(k, "pushed", carried, failed)
+            results = self.results()
+        finally:
+            self.status, self.detail, self.landed_at = saved
+        try:
+            version = self._version(head)
+        except Exception:
+            version = None
+        m = push._read(self.marker) or self.m
+        m["pushing"] = {"sha": head, "tip": tip, "version": version, "results": results, "at": time.time(),
+                        "checks": self.checks, "rounds": self.rounds}
+        write_json(self.marker, m)
 
     def _close(self, k: int, outcome: str, carried: list | None = None, failed: tuple | None = None) -> str:
         """Settle every entry once the first `k` carried entries are pushed: the one after them is
