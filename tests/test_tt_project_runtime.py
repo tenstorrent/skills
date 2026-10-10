@@ -20007,7 +20007,8 @@ def test_a_reboot_is_recorded_with_the_runs_it_cut_and_the_locks_held(env, tmp_p
     note = _reboot_notices(p)
     assert len(note) == 1 and note[0]["severity"] == "normal", note
     assert "1st reboot in 24 h" in note[0]["text"] and "board: task #7" in note[0]["text"], note
-    line = f"host: 1 reboot in 24 h (last {time.strftime('%H:%M', time.localtime(booted))}), 2 runs lost ($53.00)"
+    from ttp import timefmt
+    line = f"host: 1 reboot in 24 h (last {timefmt.short(booted, p)}), 2 runs lost ($53.00)"
     assert health(p, p.db)["host"] == line
     assert line in status_text(p).splitlines()
     digest = coord.digest(p, {}, [], [])
@@ -36129,7 +36130,7 @@ _UNTIL = 2_000_000_000
 
 @pytest.mark.parametrize("anchor,kind,text", [
     ("ask", "user", None),
-    (f"until:{_UNTIL}", "time", "waits until " + time.strftime("%Y-%m-%d %H:%M", time.localtime(_UNTIL))),
+    (f"until:{_UNTIL}", "time", "waits until 2033-05-18 03:33 UTC"),   # the project's home zone (UTC in tests)
     ("when:test -f out/landed.marker", "resource", "waits on a check to pass"),
     ("when:landed:#41", "resource", "waits on #41 to land"),
     ("resource:board-a", "resource", "waits on board-a"),
@@ -37885,6 +37886,67 @@ def test_ttp_new_records_this_machines_zone_and_status_shows_times_in_it(env, mo
     assert tf.zone_name(raw) == "America/Los_Angeles"
     head = status_text(p).splitlines()[0]
     assert re.search(r" · \d{4}-\d\d-\d\d \d\d:\d\d P[DS]T$", head), head
+
+
+def test_a_los_angeles_project_on_a_utc_box_shows_pdt_or_pst_in_every_surface(env, monkeypatch):
+    """The process runs on UTC, the project's home zone is America/Los_Angeles: ttp status, the web
+    app's JSON and its client-side clock, alert and wait texts and the coordinator's digest (what its
+    chat replies are written from) all show Pacific time with its abbreviation, never UTC."""
+    import shutil
+    from ttp import alerts, anchors, waits, web
+    from ttp import coordinator as coord
+    from ttp.cli import status_text
+    from ttp.db import host_line
+    monkeypatch.setenv("TZ", "UTC")
+    time.tzset()
+    p = make(env)
+    p.set_config("home_timezone", "America/Los_Angeles")
+    db, now = p.db, time.time()
+    pac = re.compile(r"\d\d:\d\d P[DS]T")
+    db.set_kv("coordinator_failures", 2)
+    db.set_kv("coordinator_backoff_until", now + 600)
+    db.set_kv("limited:fake", {"until": now + 900, "note": "logged out"})
+    tid = db.add_task("measure on a board", "needs a board", kind="work", tier="light", origin="user",
+                      not_before=now + 1200)
+    # ttp status: the clock in the head line, retry and pause times.
+    out = status_text(p)
+    for need in ("retry at", "fake paused until", "next try"):
+        line = next(ln for ln in out.splitlines() if need in ln)
+        assert pac.search(line.split(need, 1)[1]) and " UTC" not in line, line
+    # The web app's JSON: the zone it formats in, and the lines the daemon writes for it.
+    h = web.health(p, db, now=now)
+    assert h["zone"] == "America/Los_Angeles" and web.state_payload(p, db)["project"]["zone"] == h["zone"]
+    assert pac.search(h["why_idle"].split("next try", 1)[1]), h["why_idle"]
+    assert pac.search(web.gate_detail({"regime": "windows", "numbers": {"window": "5h", "utilization": 4,
+                                       "resets_at": now + 3600, "limit": 90}}, now, p))
+    db.set_kv(alerts.BREAKER + "fake", {"open": True, "opened": now - 600, "next_check": now + 600})
+    line = web.breaker_lines(db, now, p)[0]["line"]
+    assert len(pac.findall(line)) == 2 and " UTC" not in line, line
+    assert web.at(now + 60, now).endswith("UTC")    # no zone given: UTC, never the box's or a guess
+    assert pac.search(host_line([{"ts": now - 60, "lost": []}], p))
+    # Alert and wait texts with clock times.
+    w = waits.wait_kind({"id": tid, "status": "blocked", "labels": json.dumps([f"waits:time:{now + 900:.0f}"]),
+                         "blocked_reason": "", "updated": now}, [], now, p)
+    assert re.search(r"P[DS]T$", w["text"]), w
+    assert re.search(r"P[DS]T$", anchors.describe("until", str(now + 900), p))
+    db.x("UPDATE tasks SET labels=? WHERE id=?", (json.dumps(coord.defer_labels(now + 3600, None)), tid))
+    db.x("UPDATE tasks SET not_before=? WHERE id=?", (now + 3600, tid))
+    assert pac.search(coord.starts_text(db.task(tid), now, plain=True, where=p))
+    # The coordinator's digest, which its chat replies are written from, is stamped in the home zone.
+    head = coord.digest(p, {}, [], []).splitlines()[0]
+    assert re.match(r"# STATE at \d{4}-\d\d-\d\d \d\d:\d\d P[DS]T ", head), head
+    # The web app formats on the client in the zone the daemon sends, not the browser's.
+    js = (RUNTIME / "ttp" / "web" / "app.js").read_text()
+    assert "toLocaleTimeString" not in js and "toLocaleString" not in js
+    assert "ZONE = (st.project && st.project.zone)" in js
+    node = shutil.which("node")
+    if node:
+        block = js[js.index("let ZONE"):js.index("\n", js.index("const at = "))]
+        r = subprocess.run([node, "-e", block + "\nZONE = 'America/Los_Angeles';"
+                            f"console.log(at({now + 60}), '|', at({now + 3 * 86400}))"],
+                           capture_output=True, text=True, timeout=60, env={**os.environ, "TZ": "UTC"})
+        assert r.returncode == 0, r.stderr
+        assert re.fullmatch(r"\d\d:\d\d P[DS]T \| \w{3},? \d\d:\d\d P[DS]T\n", r.stdout), r.stdout
 
 
 def test_a_remote_project_made_from_a_workstation_gets_the_workstations_zone(env, monkeypatch, capsys):

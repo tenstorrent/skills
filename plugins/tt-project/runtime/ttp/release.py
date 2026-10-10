@@ -16,7 +16,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import locks
+from . import locks, timefmt
 from .project import HOME_DIR, Project, durable_write, fsync_dir
 
 CHECK_S = 3600          # how often the daemon compares the installed release with its harness
@@ -368,7 +368,7 @@ def line(p: Project, db, cfg: dict) -> str:
                 return text + " (upgrading now)"
             return text + " (the automatic upgrade did not finish: see logs/upgrade.log)"
         if rec.get("outcome") == "deferred":
-            at = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(rec.get("until") or 0)))
+            at = timefmt.long(float(rec.get("until") or 0), p)
             return text + f" (the merge needs judgment; one harness task a day at most, next try after {at})"
         if rec.get("outcome") == "failed":
             return text + f" (the automatic upgrade failed: {rec.get('why') or 'see logs/upgrade.log'})"

@@ -9,6 +9,8 @@ import json
 import re
 import time
 
+from . import timefmt
+
 KINDS = ("user", "resource", "budget", "review", "coordinator", "time")
 _WHO = {"user": "you", "resource": "a resource", "budget": "budget", "review": "a review",
         "coordinator": "the coordinator", "time": "a later time"}
@@ -93,10 +95,10 @@ def _from_reason(reason: str) -> tuple[str, str]:
     return "coordinator", r
 
 
-def wait_kind(task: dict, open_asks: list[dict], now: float | None = None) -> dict:
+def wait_kind(task: dict, open_asks: list[dict], now: float | None = None, where=None) -> dict:
     """What `task` waits on: {"kind": one of KINDS, "text": "waits on ...", "since": epoch,
     "age": "3.2h", "asks": [ask ids]}. The `waits:` label wins, then open asks that name the
-    task, then the blocked_reason's prefix."""
+    task, then the blocked_reason's prefix. A time is shown in the home zone `where` (UTC without one)."""
     now = time.time() if now is None else now
     since = float(task.get("updated") or task.get("created") or now)
     linked = asks_for(task["id"], open_asks)
@@ -116,7 +118,7 @@ def wait_kind(task: dict, open_asks: list[dict], now: float | None = None) -> di
     else:
         kind, detail = _from_reason(task.get("blocked_reason") or "")
     if kind == "time" and re.fullmatch(r"[0-9]+(\.[0-9]+)?", detail):
-        text = "waits until " + time.strftime("%Y-%m-%d %H:%M", time.localtime(float(detail)))
+        text = "waits until " + timefmt.long(float(detail), where)
     elif kind in ("resource", "time") and detail:
         text = f"waits on {_clip(detail)}"
     else:
@@ -126,14 +128,14 @@ def wait_kind(task: dict, open_asks: list[dict], now: float | None = None) -> di
             "asks": [a["id"] for a in linked]}
 
 
-def split(tasks: list[dict], open_asks: list[dict], now: float | None = None) -> tuple[list[dict], list[dict]]:
+def split(tasks: list[dict], open_asks: list[dict], now: float | None = None, where=None) -> tuple[list[dict], list[dict]]:
     """Blocked tasks as (waiting on the user, stuck with the project on it), each task with its
     `wait` (see wait_kind)."""
     you, stuck = [], []
     for t in tasks:
         if t.get("status") != "blocked":
             continue
-        w = wait_kind(t, open_asks, now)
+        w = wait_kind(t, open_asks, now, where)
         (you if w["kind"] == "user" else stuck).append({**t, "wait": w})
     return you, stuck
 

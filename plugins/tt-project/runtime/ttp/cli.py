@@ -696,6 +696,7 @@ def status_text(p: Project) -> str:
     state = daemon_state(p)
     h = health(p, db, alive=state == "running")
     now = time.time()
+    tz = timefmt.zone(p)
     counts = db.status_counts()
     head = f"{p.name}: daemon {state}" + ((" (paused until reboot)" if db.kv("pause_until_boot") else " (paused)")
                                           if db.kv("paused") else "")
@@ -709,7 +710,7 @@ def status_text(p: Project) -> str:
     # Blocked tasks: those that wait on the user join the top; the rest are the project's to move.
     from . import waits
     you, stuck = waits.split(db.q("SELECT * FROM tasks WHERE status='blocked' ORDER BY priority, id"),
-                             waits.open_asks(db), now)
+                             waits.open_asks(db), now, tz)
     for t in you[:6]:
         lines.append(f"  needs you (#{t['id']}, {t['wait']['age']}): {t['title']} — {t['wait']['text']}")
     lines.append("budget: " + h["spend"]["headline"])
@@ -721,9 +722,9 @@ def status_text(p: Project) -> str:
     if c["failures"]:
         coord += f" · {c['failures']} failed in a row"
     if c["backoff_until"]:
-        coord += f" · retry at {at(c['backoff_until'], now)}"
+        coord += f" · retry at {at(c['backoff_until'], now, tz)}"
     if c["idle_wake"]:
-        coord += f" · next idle check {at(c['idle_wake'], now)}"
+        coord += f" · next idle check {at(c['idle_wake'], now, tz)}"
     elif c["idle_held"]:
         coord += f" · idle check {c['idle_held']}"
     lines.append(coord)
@@ -734,9 +735,9 @@ def status_text(p: Project) -> str:
     for b in h.get("breakers") or []:
         lines.append(b["line"])
     for pp in h["providers_paused"]:
-        lines.append(f"{pp['provider']} paused until {at(pp['until'], now)}: {pp['note']} — fix: {pp['fix']}")
+        lines.append(f"{pp['provider']} paused until {at(pp['until'], now, tz)}: {pp['note']} — fix: {pp['fix']}")
     for pr in h["resources_paused"]:
-        lines.append(f"resource {pr['resource']} paused since {at(pr['since'], now)} by {pr.get('by') or 'user'}"
+        lines.append(f"resource {pr['resource']} paused since {at(pr['since'], now, tz)} by {pr.get('by') or 'user'}"
                      + (f" in {pr['project']} (shared: holds in every project)" if pr.get("shared") else "")
                      + (f": {pr['reason']}" if pr.get("reason") else "")
                      + f" — resume: ttp resume {p.name} --resource {pr['resource']}")
@@ -797,12 +798,12 @@ def status_text(p: Project) -> str:
         lines.append(f"  #{t['id']} held: network: {t['title']}")
     for t in h["waiting"][:5]:
         why = re.sub(r";? *next try \S+$", "", t["blocked_reason"] or "").strip()
-        lines.append(f"  #{t['id']} waiting, next try {at(t['not_before'], now)}: {t['title']}" + (f" — {why}" if why else ""))
+        lines.append(f"  #{t['id']} waiting, next try {at(t['not_before'], now, tz)}: {t['title']}" + (f" — {why}" if why else ""))
     for t in h["deferred"][:5]:
         lines.append(f"  #{t['id']} deferred, {t['starts']}: {t['title']}")
     if h["undelivered"]:
         u = h["undelivered"]
-        lines.append(f"chat relay: {u['asks']} question(s) not delivered to any chat since {at(u['since'], now)}; "
+        lines.append(f"chat relay: {u['asks']} question(s) not delivered to any chat since {at(u['since'], now, tz)}; "
                      f"is the chat's `ttp listen` running?")
         if u["below_floor"]:
             lines.append(f"  {u['below_floor']} of them are below every chat's severity floor; lower "
@@ -812,8 +813,8 @@ def status_text(p: Project) -> str:
         lines.append("recent:")
     for m in recent:
         text = " ".join(m["text"].split())
-        tag = f"cleared {at(m['cleared_at'], now)}" if m.get("cleared_at") else m["state"]
-        lines.append(f"  {at(m['ts'], now)} ({tag}) {text[:160]}")
+        tag = f"cleared {at(m['cleared_at'], now, tz)}" if m.get("cleared_at") else m["state"]
+        lines.append(f"  {at(m['ts'], now, tz)} ({tag}) {text[:160]}")
     return "\n".join(lines)
 
 
@@ -1199,7 +1200,7 @@ def checks_env_line(p: Project) -> str | None:
         return None
     if not isinstance(e, dict) or not e.get("problem"):
         return None
-    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(e.get("ts") or 0)))
+    when = timefmt.long(float(e.get("ts") or 0), p)
     what = ("tests failed, and also an environment problem" if e.get("also")
             else "an environment problem, not the code")
     return (f"{e.get('source') or 'delivery.push_checks'}: {e.get('command')!r} failed at import in run "
@@ -1307,7 +1308,7 @@ def cmd_checks(a) -> None:
             out.write(f"{push.NONE_APPLY}\n")
             passed, failed = False, push.NONE_APPLY
         elif hit:
-            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(hit.get("ts") or 0)))
+            when = timefmt.long(float(hit.get("ts") or 0), p)
             said = (f"ttp checks: {len(todo)} check(s) passed on {tree[:12]} in run {hit.get('run') or '?'} "
                     f"at {when} (recorded); --fresh runs them again")
             out.write(f"{said}\n")
@@ -2692,7 +2693,7 @@ def _upgrade(p: Project, auto: bool = False) -> None:
             release.note_deferred(p, problem, last["id"])
             release.defer(p, auto, f"{new_v} {new_c}", f"{old_v} ({old_c})", f"{new_v} ({new_c})", until,
                           problem[:300])
-            at = time.strftime('%Y-%m-%d %H:%M', time.localtime(until))
+            at = timefmt.long(until, p)
             took = (f"upgrade not applied; the running harness is unchanged. {problem}\nHarness task "
                     f"#{last['id']} took on a template merge less than a day ago, so none is queued now; ")
             # Exit 75 (deferred) only when the project takes it on itself: its daemon retries after `until`.

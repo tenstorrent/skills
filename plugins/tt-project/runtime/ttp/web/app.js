@@ -8,7 +8,20 @@ const agoH = R.agoHtml;
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const ago = R.ago;
 const money = (x) => `$${(+x || 0).toFixed(2)}`;
-const at = (ts) => ts ? new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "—";
+// Every time is shown in the project's home zone (the daemon sends it), with its abbreviation: never
+// this browser's zone or the zone of the machine the project runs on.
+let ZONE = "UTC";
+const fmts = {};
+const zoneFmt = (day) => {
+  const key = `${ZONE}|${day}`;
+  if (!fmts[key]) {
+    const o = { timeZone: ZONE, hour: "2-digit", minute: "2-digit", hourCycle: "h23", timeZoneName: "short" };
+    try { fmts[key] = new Intl.DateTimeFormat(undefined, day ? { ...o, weekday: "short" } : o); }
+    catch (e) { ZONE = "UTC"; return zoneFmt(day); }   // a zone this browser does not know
+  }
+  return fmts[key];
+};
+const at = (ts) => ts ? zoneFmt(Math.abs(ts - Date.now() / 1000) >= 20 * 3600).format(new Date(ts * 1000)) : "—";
 
 let TOKEN = new URLSearchParams(location.hash.slice(1)).get("token") || sessionStorage.getItem("ttp_token") || "";
 if (TOKEN) { sessionStorage.setItem("ttp_token", TOKEN); document.cookie = `ttp_token=${TOKEN}; SameSite=Strict; path=/`; history.replaceState(null, "", location.pathname); }
@@ -192,6 +205,7 @@ async function refresh() {
     return;
   }
   lastOk = Date.now();
+  ZONE = (st.project && st.project.zone) || (st.health && st.health.zone) || "UTC";
   const hb = st.heartbeat;
   const stuck = hb && hb.age > st.heartbeat_stale_s;
   // Nothing new (ticking ages aside): leave the page alone and only move the ages on. The minute

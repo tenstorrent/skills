@@ -555,14 +555,15 @@ def counted_spend(since_ts: float, until_ts: float | None = None, provider: str 
 SEVERITY_RANK = {"info": 0, "low": 0, "normal": 1, "high": 2, "critical": 3}
 
 
-def host_line(boots: list[dict]) -> str:
-    """'host: N reboots in 24 h (last HH:MM), M runs lost ($X)' for the boots of the last day, as
-    DB.boots returns them; '' when there were none."""
+def host_line(boots: list[dict], where=None) -> str:
+    """'host: N reboots in 24 h (last HH:MM PDT), M runs lost ($X)' for the boots of the last day, as
+    DB.boots returns them, in the home zone `where`; '' when there were none."""
     if not boots:
         return ""
     lost = sum(len(b.get("lost") or []) for b in boots)
     usd = sum(float(b.get("lost_usd") or 0) for b in boots)
-    last = time.strftime("%H:%M", time.localtime(boots[-1]["ts"]))
+    from .timefmt import short
+    last = short(float(boots[-1]["ts"]), where)
     return (f"host: {len(boots)} reboot{'' if len(boots) == 1 else 's'} in 24 h (last {last}), "
             f"{lost} run{'' if lost == 1 else 's'} lost (${usd:.2f})")
 

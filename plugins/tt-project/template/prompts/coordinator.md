@@ -170,6 +170,8 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
   work is verified, or re-point or cancel the dependents.
 - A question you can answer from the digest: `reply` directly. Otherwise a `question` task with
   `reply_chat` set; do NOT send an acknowledgement unless the answer will take over ~10 minutes.
+- Any clock time you tell the user is in the project's home zone, the one the STATE line shows, with
+  its abbreviation ('14:05 PDT'), never the zone of the machine the project runs on.
 
 # User instructions
 

@@ -19,8 +19,9 @@ message may be what it waited for). A stale set with a member not in the last on
 from __future__ import annotations
 
 import json
-import time
 from typing import Any
+
+from . import timefmt
 
 PREFIX = "waits:"
 KINDS = ("ask", "resource", "until", "when")
@@ -59,13 +60,13 @@ def label(kind: str, value: str) -> str:
     return f"{PREFIX}{kind}:{value}"
 
 
-def describe(kind: str, value: str) -> str:
-    """'waits on ask #12' and the like, for the digest."""
+def describe(kind: str, value: str, where=None) -> str:
+    """'waits on ask #12' and the like, for the digest; a time in the home zone `where`."""
     if kind == "ask":
         return f"waits on ask #{value}"
     if kind == "until":
         try:
-            return "waits until " + time.strftime("%Y-%m-%d %H:%M", time.localtime(float(value)))
+            return "waits until " + timefmt.long(float(value), where)
         except ValueError:
             return f"waits until {value}"
     return f"waits on {kind} {value[:160]}"

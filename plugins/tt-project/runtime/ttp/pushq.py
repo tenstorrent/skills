@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from . import locks, push
+from . import locks, push, timefmt
 from .db import (TERMINAL_TASK_STATES, BranchIndex, continues_id, dependency_ids, dump_result, load_result,
                  review_subject, reviewed_ids)
 from .project import Project, nice_level, push_allowed, push_queue_on, renice, write_json
@@ -1244,8 +1244,8 @@ def _age(s: float) -> str:
     return f"{int(s // 60)} min" if s < 7200 else f"{s / 3600:.0f} h" if s < 172800 else f"{s / 86400:.0f} days"
 
 
-def _at(ts: float, now: float) -> str:
-    return time.strftime("%H:%M" if abs(ts - now) < 20 * 3600 else "%a %H:%M", time.localtime(ts))
+def _at(ts: float, now: float, where) -> str:
+    return timefmt.short(ts, where, now)
 
 
 def shown(p: Project, db=None) -> bool:
@@ -1279,7 +1279,7 @@ def status_line(p: Project, now: float | None = None, sm: dict | None = None, db
     hold = sm.get("hold") or {}
     wait = max(float(sm.get("backoff_until") or 0), float(hold.get("until") or 0))
     if wait > now and n and not live:
-        parts.append(f"next try {_at(wait, now)}")
+        parts.append(f"next try {_at(wait, now, p)}")
     lp = sm.get("last_pushed")
     if lp:
         parts.append("last " + push.landing(lp["pushed_sha"], lp.get("target") or "", None, lp["version"])

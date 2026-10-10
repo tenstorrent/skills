@@ -2222,7 +2222,7 @@ class Daemon:
             else:
                 not_before = time.time() + _retry_s(result)
                 extra["waiting_since"] = time.time()
-                reason = f"waiting for {what}; next try {time.strftime('%H:%M', time.localtime(not_before))}"
+                reason = f"waiting for {what}; next try {timefmt.short(not_before, self.p)}"
             if new == "blocked":
                 # A block is the coordinator's to decide: whoever requeues it starts the count over.
                 extra["stale_wakes"] = 0
@@ -4212,7 +4212,7 @@ class Daemon:
         if self.boot == "unknown" or rec.get("boot") == self.boot:
             return
         db.set_paused(False)
-        since = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(rec.get("since") or 0)))
+        since = timefmt.long(float(rec.get("since") or 0), self.p)
         log(self.p, f"pause lifted: set until reboot at {since}, now on boot {self.boot}")
         db.post("out", f"The project pause set until the host reboots ({since}) was lifted: the host has booted since. "
                        "New runs start again.", kind="info", severity="low", ref=f"pause-lifted:{self.boot}")
@@ -4549,7 +4549,7 @@ class Daemon:
             db = self.p.db
             db.update_task(tid, not_before=nb, blocked_reason=(
                 f"waiting for {what}; its probe says {says}; next try "
-                f"{time.strftime('%H:%M', time.localtime(nb))}")[:500])
+                f"{timefmt.short(nb, self.p)}")[:500])
             log(self.p, f"task {tid} retry_when probe still failing"
                         f"{' (host unreachable)' if rc == 255 else ''}; asleep until "
                         f"{time.strftime('%H:%M', time.localtime(nb))}")

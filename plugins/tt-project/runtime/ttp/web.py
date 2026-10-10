@@ -19,7 +19,7 @@ from . import globalcap as gcap
 from . import coordinator as coord
 from . import heal, pushq, release, responsibilities, waits
 from . import schedule as sched
-from . import upstream
+from . import timefmt, upstream
 from .daemon import (AUTH_PROBE_S, HEARTBEAT_STALE_S, KV_LOCAL_ONLY, KV_WORKTREES_DIRTY, LOGGED_OUT_NOTE, NET_HELD_NOTE,
                      WAIT_KEYS, WATCHDOG_S, heartbeat, idle_wake)
 from .alerts import cleared  # noqa: F401  (readers import it from here)
@@ -72,10 +72,12 @@ def fix_for(provider: str, note: str) -> str:
     return "resumes by itself when the limit resets"
 
 
-def at(ts: float | None, now: float | None = None) -> str:
+def at(ts: float | None, now: float | None = None, where=None) -> str:
+    """'23:32 PDT' (or 'Fri 23:32 PDT') in the project's home zone (`where`: a Project, its settings,
+    a zone name or ZoneInfo); never the zone of the machine the daemon runs on."""
     if not ts:
         return "—"
-    return time.strftime("%H:%M" if abs(ts - (now or time.time())) < 20 * 3600 else "%a %H:%M", time.localtime(ts))
+    return timefmt.short(float(ts), where, now if now else None)
 
 
 def since(ts: float, now: float | None = None) -> str:
@@ -83,7 +85,7 @@ def since(ts: float, now: float | None = None) -> str:
     return f"{int(s // 60)} min" if s < 7200 else f"{s / 3600:.0f} h" if s < 2 * DAY else f"{s / DAY:.0f} days"
 
 
-def gate_detail(g: dict, now: float | None = None) -> str:
+def gate_detail(g: dict, now: float | None = None, where=None) -> str:
     n = g.get("numbers") or {}
     if g.get("regime") == "windows":
         wins = n.get("plan") or [n]
@@ -91,7 +93,7 @@ def gate_detail(g: dict, now: float | None = None) -> str:
         for w in wins:
             s = f"{w.get('window')} {w.get('utilization')}%"
             if w.get("resets_at"):
-                s += f", resets {at(w['resets_at'], now)}"
+                s += f", resets {at(w['resets_at'], now, where)}"
             parts.append(s)
         # Plan-billed dollars are bounded by the windows, so the dollar caps do not apply to them.
         return (f"account use: {'; '.join(parts)}. The project stops at {n.get('limit')}% "
@@ -210,6 +212,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
     app's header show, so both answer "is it working, what is it costing, what is it waiting for"."""
     now = now or time.time()
     cfg = p.config()
+    tz = timefmt.zone(p)
     core, notify = cfg.get("core_provider", "claude"), cfg["notify"]
     gates = db.kv("gates", {})
     last_turn = float(db.kv("last_coordinator_turn", 0))
@@ -225,7 +228,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
                                      "fix": fix_for(r["key"].split(":", 1)[1], note)})
     paused_resources = [{"resource": k, **v} for k, v in sorted(db.paused_resources().items())]
     # A deferred task waits to start (start_after / start_when): a plan, not a problem or a retry.
-    deferred = [{"id": t["id"], "title": t["title"], "starts": coord.starts_text(t, now, plain=True)}
+    deferred = [{"id": t["id"], "title": t["title"], "starts": coord.starts_text(t, now, plain=True, where=tz)}
                 for t in db.q("SELECT * FROM tasks WHERE status='queued' AND labels LIKE '%\"start_%' "
                               "ORDER BY COALESCE(not_before, 0), id")]
     deferred = [t for t in deferred if t["starts"]]
@@ -238,7 +241,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
     from .coordinator import task_resources
     due = db.ready_tasks()
     # A task on a logged-out provider is held too, until its breaker closes.
-    breakers = breaker_lines(db, now)
+    breakers = breaker_lines(db, now, tz)
     out = {b["provider"] for b in breakers}
     logged_out = [t for t in due if (t["blocked_reason"] or "").startswith(LOGGED_OUT_NOTE)
                   and (t["provider"] or core) in out]
@@ -280,7 +283,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
     if db.kv("paused", False):
         stops.append(f"the project is paused (`ttp resume {p.name}` or the web app)")
     for pp in paused_providers:
-        stops.append(f"{pp['provider']} is paused until {at(pp['until'], now)}: {pp['note']}")
+        stops.append(f"{pp['provider']} is paused until {at(pp['until'], now, tz)}: {pp['note']}")
     for prov, pg in sorted(gates.items(), key=lambda kv: kv[0] != core):
         if pg.get("level") == "red":
             stops.append(("budget is red: " if prov == core else f"budget for {prov} is red: ")
@@ -290,7 +293,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         stops.append("no new starts near the plan line: " + "; ".join(g.get("reasons") or []))
     settle = float(db.kv("settle_until", 0) or 0)
     if settle > now and alive:
-        stops.append(f"the host just woke from sleep; new work starts at {at(settle, now)} if it stays awake")
+        stops.append(f"the host just woke from sleep; new work starts at {at(settle, now, tz)} if it stays awake")
     disk = db.kv("disk_low")
     if disk:
         stops.append(f"disk is low ({disk['free_gb']} GB free), so only questions and plans start")
@@ -299,7 +302,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
            if blocked or asks else "")
     why = list(stops)
     if backoff > now:
-        why.append(f"the coordinator is backing off after failed turns, next try {at(backoff, now)}")
+        why.append(f"the coordinator is backing off after failed turns, next try {at(backoff, now, tz)}")
     if ready:
         why.append(f"{ready} task(s) ready to start")
     for pr in paused_resources:
@@ -314,7 +317,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         why.append(f"{len(net_held)} task(s) held: network ({', '.join(provs)}); they start once the API host "
                    f"resolves")
     if waiting:
-        why.append(f"{len(waiting)} task(s) waiting, next try {at(waiting[0]['not_before'], now)}")
+        why.append(f"{len(waiting)} task(s) waiting, next try {at(waiting[0]['not_before'], now, tz)}")
     if deferred:
         why.append(f"{len(deferred)} task(s) deferred, first {deferred[0]['starts']}")
     retry = db.kv(coord.RETRY_WAKE_KEY) or {}
@@ -324,13 +327,13 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         if retry["at"] - now >= 365 * 86400 or coord.task_cap(cfg, review) == 0:
             why.append(f"the cap on {what} is 0: none are added until it is raised")
         else:
-            why.append(f"the 24 h cap on {what} is full; the coordinator adds held work at {at(retry['at'], now)}")
+            why.append(f"the 24 h cap on {what} is full; the coordinator adds held work at {at(retry['at'], now, tz)}")
     if len(queued) > len(due):
         why.append(f"{len(queued) - len(due)} queued task(s) wait on other tasks")
     if you:
         why.append(you)
     if not why and next_wake:
-        why.append(f"nothing queued; the coordinator checks in at {at(next_wake, now)}")
+        why.append(f"nothing queued; the coordinator checks in at {at(next_wake, now, tz)}")
     elif not why and wake["held"]:
         why.append(f"nothing queued; the coordinator's idle check is {wake['held']}")
     held = ""
@@ -345,8 +348,9 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
     spend = {"spent_24h": round(db.spent_since(now - DAY), 2), "spent_7d": round(db.spent_since(now - WEEK), 2),
              "top_7d": top if top and top["usd"] else None, "in_flight": round(bud.in_flight(db), 2)}
     spend["headline"] = budget_line(db, now, core, g, spend["spent_24h"])
-    spend["detail"] = gate_detail(g, now) if g else ""
+    spend["detail"] = gate_detail(g, now, tz) if g else ""
     return {
+        "zone": timefmt.zone_name(p.raw_config()),   # the home zone every time here is shown in
         "spend": spend,
         "coordinator": {"last_turn": last_turn or None, "last_status": last_run["status"] if last_run else None,
                         "failures": int(db.kv("coordinator_failures", 0)),
@@ -361,7 +365,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         "asks": asks, "running": running, "working": working,
         "undelivered": undelivered,
         "why_idle": "; ".join(why) if not running else "", "held": held,
-        "host": host_line(db.boots(now - DAY)),
+        "host": host_line(db.boots(now - DAY), tz),
         "idle_sleep": awake.line(db.kv(awake.KV), (db.kv("daemon", {}) or {}).get("pid")) if alive else "",
         "release": release.line(p, db, cfg),
         "schedules_broken": sched.broken_line(db),
@@ -374,7 +378,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
     }
 
 
-def breaker_lines(db: DB, now: float) -> list[dict]:
+def breaker_lines(db: DB, now: float, where=None) -> list[dict]:
     """Each open auth breaker (Daemon.check_logins) in one plain line: since when, and when the
     harness checks the login again. The fix is a login only the user can do, named by the alert."""
     out = []
@@ -384,10 +388,10 @@ def breaker_lines(db: DB, now: float) -> list[dict]:
         if not b:
             continue
         nxt = (f"one run checks the login every {AUTH_PROBE_S // 60} min" if b.get("probe")
-               else f"next login check {at(max(float(b.get('next_check') or now), now), now)}")
+               else f"next login check {at(max(float(b.get('next_check') or now), now), now, where)}")
         out.append({"provider": prov, "opened": b.get("opened"), "next_check": b.get("next_check"),
                     "checks": int(b.get("checks") or 0),
-                    "line": f"{prov} is logged out since {at(b.get('opened'), now)}: no runs start on it; {nxt}, "
+                    "line": f"{prov} is logged out since {at(b.get('opened'), now, where)}: no runs start on it; {nxt}, "
                             f"and work resumes by itself once it passes"})
     return out
 
@@ -445,6 +449,7 @@ def attention(db: DB, now: float) -> list[dict]:
 
 def state_payload(p: Project, db: DB) -> dict:
     now = time.time()
+    tz = timefmt.zone(p)
     tasks = db.q("SELECT id,title,kind,status,priority,tier,provider,budget_usd,spent_usd,attempts,max_attempts,"
                  "origin,branch,pr_url,blocked_reason,not_before,created,updated,result,labels,depends_on FROM tasks WHERE status NOT IN ('done','failed',"
                  "'cancelled') OR updated>? ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'blocked' THEN 1 "
@@ -463,8 +468,8 @@ def state_payload(p: Project, db: DB) -> dict:
         t["pushed"] = [{k: x.get(k) for k in ("branch", "sha", "version", "status")} for x in pushed
                        if isinstance(x, dict)] or None if isinstance(pushed, list) else None   # what the push queue pushed for a review
         # Plain words for the board; the probe itself stays in start_when, the task's detail.
-        t["starts"] = coord.starts_text(t, now, plain=True) if t["status"] == "queued" else ""
-        t["wait"] = waits.wait_kind(t, asks, now) if t["status"] == "blocked" else None
+        t["starts"] = coord.starts_text(t, now, plain=True, where=tz) if t["status"] == "queued" else ""
+        t["wait"] = waits.wait_kind(t, asks, now, tz) if t["status"] == "blocked" else None
         d = deferral(t)
         t.update(depends_on=dependency_ids(t), waits_on=unmet.get(t["id"], []), continues=continues_id(t),
                  start_after=d.get("after"), start_when=d.get("when"), start_why=d.get("why"),
@@ -474,9 +479,10 @@ def state_payload(p: Project, db: DB) -> dict:
     runs = db.q("SELECT id,task,role,provider,model,effort,status,started,ended,cost_usd FROM runs "
                 "ORDER BY id DESC LIMIT 40")
     return {
-        "project": {"name": p.name, "root": str(p.root), "config": p.config()},
+        "project": {"name": p.name, "root": str(p.root), "config": p.config(),
+                    "zone": timefmt.zone_name(p.raw_config())},   # the web app shows every time in it
         "daemon": db.kv("daemon", {}), "paused": db.kv("paused", False),
-        "gates": {k: {**g, "detail": gate_detail(g, now)} for k, g in db.kv("gates", {}).items()},
+        "gates": {k: {**g, "detail": gate_detail(g, now, tz)} for k, g in db.kv("gates", {}).items()},
         "heartbeat": heartbeat(p), "heartbeat_stale_s": HEARTBEAT_STALE_S, "watchdog_s": WATCHDOG_S,
         "service": installed(p), "disk_low": db.kv("disk_low"),
         "disk": db.kv("disk"), "worktrees_kept": db.kv("worktrees_kept"),

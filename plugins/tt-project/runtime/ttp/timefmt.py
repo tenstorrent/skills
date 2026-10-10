@@ -107,11 +107,18 @@ def zone(p_or_cfg) -> ZoneInfo:
 
 
 def _tz(where) -> ZoneInfo:
+    if where is None:
+        return ZoneInfo("UTC")
     if isinstance(where, ZoneInfo):
         return where
     if isinstance(where, str):
         return ZoneInfo(valid(where) or "UTC")
     return zone(where)
+
+
+def tzinfo(where) -> ZoneInfo:
+    """The zone of `where` (a zone name, ZoneInfo, Project or settings; None is UTC), as a tzinfo."""
+    return _tz(where)
 
 
 # formatting ---------------------------------------------------------------------------------------

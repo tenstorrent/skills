@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from . import locks
-from . import anchors, effort, ends, heal, jevuse, landed, machine_ledger, machines, pauseends, prguard, push, responsibilities, reviewcap, settinghold, shared, unblock, upstream, worktree
+from . import anchors, effort, ends, heal, jevuse, landed, machine_ledger, machines, pauseends, prguard, push, responsibilities, reviewcap, settinghold, shared, timefmt, unblock, upstream, worktree
 from . import screen as scr
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
@@ -385,7 +385,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
                 body = [short]
         shown.append((key, body))
 
-    lines = [f"# STATE at {time.strftime('%Y-%m-%d %H:%M %Z')}",
+    lines = [f"# STATE at {timefmt.long(time.time(), p)} (the project's home zone)",
              "## Project budget (authoritative; your own turn's small spend limit is NOT this budget)"]
     b = p.config()["budget"]
     for prov, g in gates.items():
@@ -422,9 +422,9 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     lines = []
     boots = db.boots(now - 86400)
     if boots:
-        at_each = "; ".join(f"{time.strftime('%H:%M', time.localtime(x['ts']))} "
+        at_each = "; ".join(f"{timefmt.short(float(x['ts']), p)} "
                             f"{', '.join(x.get('held') or []) or 'nothing'}" for x in boots)
-        lines.append(f"## Host: {host_line(boots)[len('host: '):]}; held at each: {clip(at_each, 600)}")
+        lines.append(f"## Host: {host_line(boots, p)[len('host: '):]}; held at each: {clip(at_each, 600)}")
     disk = db.kv("disk")
     if disk:
         low = db.kv("disk_low")
@@ -481,10 +481,10 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
             continue
         note = clip(t["blocked_reason"] or load_result(t["result"]).get("summary"), NOTE_CHARS)
         held = anchors.anchor(t) if t["status"] == "blocked" else None
-        note = f"{anchors.describe(*held)}: {note}" if held else note
+        note = f"{anchors.describe(*held, p)}: {note}" if held else note
         cont = continues_id(t)
         title = clip(t["title"], TITLE_CHARS) + (f" (continues #{cont})" if cont else "")
-        starts = (starts_text(t, now) if t["status"] == "queued" else
+        starts = (starts_text(t, now, where=p) if t["status"] == "queued" else
                   f"{(now - in_review[t['id']]) / 3600:.1f}h in review" if t["id"] in in_review else "")
         lines.append(f"- #{t['id']} | {t['status']}{f' ({starts})' if starts else ''} | {t['tier']} | p{t['priority']} | "
                      f"{(now - t['created']) / 3600:.1f}h | {title} | {note}")
@@ -801,9 +801,10 @@ def defer_labels(after: float | None, when: str | None, why: str | None = None) 
         + ([f"start_why:{why}"] if when and why else []) + [f"deferred_since:{time.time():.0f}"]
 
 
-def starts_text(task: dict, now: float | None = None, plain: bool = False) -> str:
+def starts_text(task: dict, now: float | None = None, plain: bool = False, where=None) -> str:
     """'starts <time>' / 'starts when: <probe>' for a task that waits to start; '' otherwise.
-    `plain` (what the user sees): 'starts when <why>', or 'when a check passes', never the probe."""
+    `plain` (what the user sees): 'starts when <why>', or 'when a check passes', never the probe.
+    Times are in the home zone `where` (a Project, zone name or ZoneInfo); UTC without one."""
     now = time.time() if now is None else now
     d = deferral(task)
     after = d.get("after") if (d.get("after") or 0) > now and (task.get("not_before") or 0) > now else None
@@ -817,13 +818,14 @@ def starts_text(task: dict, now: float | None = None, plain: bool = False) -> st
                 else "when a check passes")
     else:
         when = f"when: {clip(d['when'], 160)}" + (f" ({clip(d['why'], 160)})" if d.get("why") else "")
-    return "starts " + (f"{_clock(after)}" + (f", then {when}" if when else "") if after else when)
+    return "starts " + (f"{_clock(after, where)}" + (f", then {when}" if when else "") if after else when)
 
 
-def _clock(ts: float) -> str:
-    """A local time: today's as HH:MM, another day's with its date."""
-    same_day = time.strftime("%Y-%m-%d", time.localtime(ts)) == time.strftime("%Y-%m-%d")
-    return time.strftime("%H:%M" if same_day else "%Y-%m-%d %H:%M", time.localtime(ts))
+def _clock(ts: float, where=None) -> str:
+    """A time in the home zone `where`: today's as 'HH:MM PDT', another day's with its date."""
+    tz = timefmt.tzinfo(where)
+    t, today = datetime.fromtimestamp(ts, tz), datetime.now(tz)
+    return t.strftime("%H:%M %Z" if t.date() == today.date() else "%Y-%m-%d %H:%M %Z")
 
 
 def apply(p: Project, actions: list[dict], default_chat: str | None = None, user_turn: bool = False,
