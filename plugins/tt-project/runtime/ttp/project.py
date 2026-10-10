@@ -620,11 +620,15 @@ class Project:
             return False
 
     def add_memory(self, text: str, kind: str = "fact", title: str | None = None, key: str | None = None,
-                   end: dict | None = None) -> Path:
+                   end: dict | None = None, standing: bool = False) -> Path:
         """One fact per file plus a one-line pointer in MEMORY.md, so the index stays cheap to load.
         A memory written again under the same `key` (a replayed coordinator turn) keeps its one
-        file and line. `end` (see ends.from_action) makes it temporary: the daemon retires it then."""
+        file and line. `end` (see ends.from_action) makes it temporary: the daemon retires it then.
+        `standing` marks an instruction that applies every time its case comes up (a preference
+        unless pinned already): finishing one instance never retires it (see forget_memory)."""
         from .ends import front_matter
+        if standing and kind not in PINNED_MEMORY_KINDS:
+            kind = "preference"
         self.memory_dir.mkdir(parents=True, exist_ok=True)
         text = text.strip()
         title = (title or text.splitlines()[0])[:80]
@@ -642,17 +646,20 @@ class Project:
             while path.exists() or (self.memory_dir / "archive" / path.name).exists():
                 path = self.memory_dir / f"{kind}-{slug}-{n}.md"
                 n += 1
-            durable_write(path, f"---\nkind: {kind}\ncreated: {_stamp(time.time())}\n{front_matter(end or {})}{tag}"
+            durable_write(path, f"---\nkind: {kind}\ncreated: {_stamp(time.time())}\n{front_matter(end or {})}"
+                                f"{'standing: true' + chr(10) if standing else ''}{tag}"
                                 f"---\n{text}\n")
         index = self.memory_index.read_text() if self.memory_index.exists() else ""
         if f"](memory/{path.name})" not in index:
-            durable_append(self.memory_index, f"- [{title}](memory/{path.name}) ({kind})\n")
+            durable_append(self.memory_index, f"- [{title}](memory/{path.name}) ({kind}"
+                                              f"{', standing' if standing else ''})\n")
         self.commit_harness([path, self.memory_index], f"memory ({kind}): {title}")
         return path
 
     def _memory_entries(self) -> list[dict]:
         """Live memory entries, oldest first: `name` (the file stem shown in prompts), `kind`, `line`,
-        and `end` (see ends) for a temporary one, whose line says when it ends.
+        `end` (see ends) for a temporary one, whose line says when it ends, and `standing` (see
+        add_memory), whose line says so.
         Ordered by the front matter's `created`, then name; the file's mtime stands in only where
         `created` is missing, so a checkout or copy that touches the files does not reorder them
         (which would change the coordinator's cached prompt)."""
@@ -668,21 +675,25 @@ class Project:
             kind = m.group(1) if m else p.stem.split("-", 1)[0]
             c = re.search(r"^created:\s*(\S+)", head, re.M)
             end = read_front_matter(head)
-            ends = f" ({describe(end)})" if end else ""
+            standing = bool(re.search(r"^standing:[ \t]*true[ \t]*$", head, re.M))
+            ends = (" (standing)" if standing else "") + (f" ({describe(end)})" if end else "")
             out.append({"name": p.stem, "kind": kind, "line": f"[{p.stem}] {body.strip()}{ends}", "end": end,
+                        "standing": standing,
                         "order": (c.group(1) if c else _stamp(p.stat().st_mtime), p.stem)})
         out.sort(key=lambda e: e.pop("order"))
         return out
 
     def memory_select(self, limit_chars: int = COORDINATOR_MEMORY_CHARS) -> tuple[list[dict], dict]:
         """The entries a prompt of `limit_chars` gets, whole: every pinned entry (restrictions,
-        preferences, resources) first, then the newest decisions and facts that still fit. Pinned
-        entries are kept even past the budget. Also returns the usage numbers for the digest."""
+        preferences, resources, standing entries) first, then the newest decisions and facts that
+        still fit. Pinned entries are kept even past the budget. Also returns the usage numbers for
+        the digest."""
         entries = self._memory_entries()
-        pinned = [e for e in entries if e["kind"] in PINNED_MEMORY_KINDS]
+        pin = lambda e: e["kind"] in PINNED_MEMORY_KINDS or e["standing"]
+        pinned = [e for e in entries if pin(e)]
         used = sum(len(e["line"]) + 1 for e in pinned)
         rest = []
-        for e in reversed([e for e in entries if e["kind"] not in PINNED_MEMORY_KINDS]):
+        for e in reversed([e for e in entries if not pin(e)]):
             if used + len(e["line"]) + 1 > limit_chars:
                 break   # whole entries only, and no older one slips in past a gap
             rest.append(e)
@@ -721,14 +732,22 @@ class Project:
                                  + ", ".join(f"[{n}]" + (" (archived)" if old else "") for n, old in found))
         raise ValueError(f"no memory entry {name!r}; use the name in [brackets] from MEMORY")
 
-    def forget_memory(self, name: str, keep: str | None = None) -> Path:
+    def forget_memory(self, name: str, keep: str | None = None, why: str | None = None) -> Path:
         """Retire an entry: its file moves to memory/archive/ and its line leaves MEMORY.md, so no
         prompt carries it again. Forgetting an entry already archived (a replayed turn) is a no-op.
-        `keep` names an entry that must survive (the one a `supersedes` adds)."""
+        `keep` names an entry that must survive (the one a `supersedes` adds). A standing entry is
+        refused unless `why` names its end condition or the user's words ending it: one finished
+        instance, a review's tidy-up or memory pressure never retires a duty that recurs."""
         name, archived = self._resolve_memory_name(Path(name.strip().strip("[]")).stem, keep)
         src, dst = self.memory_dir / f"{name}.md", self.memory_dir / "archive" / f"{name}.md"
         if archived:
             return dst
+        why = " ".join((why or "").split())
+        if not why and re.search(r"^standing:[ \t]*true[ \t]*$", src.read_text().split("\n---\n", 1)[0], re.M):
+            raise ValueError(f"[{name}] is a standing instruction; nothing retired. It applies every time its "
+                             "case comes up, so one finished instance does not end it. Retire it only with a "
+                             "`why` naming its end condition or quoting the user's words ending it; to make "
+                             "it shorter, add a standing entry that supersedes it")
         dst.parent.mkdir(parents=True, exist_ok=True)
         os.replace(src, dst)
         fsync_dir(dst.parent)
@@ -736,7 +755,8 @@ class Project:
         if self.memory_index.exists():
             lines = self.memory_index.read_text().splitlines(keepends=True)
             durable_write(self.memory_index, "".join(x for x in lines if f"](memory/{name}.md)" not in x))
-        self.commit_harness([dst, self.memory_index], f"memory retired: {name}", removed=[src])
+        self.commit_harness([dst, self.memory_index], f"memory retired: {name}" + (f" ({why})" if why else ""),
+                            removed=[src])
         return dst
 
 def _stamp(ts: float) -> str:

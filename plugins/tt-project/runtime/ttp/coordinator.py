@@ -64,7 +64,7 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "blocking": {"type": "string", "enum": list(BLOCKING_REASONS)}, "recommendation": {"type": "string"},
             "least_disruptive": {"type": "string"}, "reversible": {"type": "boolean"}, "force": {"type": "boolean"},
             "resources": {"type": "array", "items": {"type": "string"}}, "exclusive": {"type": "boolean"},
-            "needs_device": {"type": "boolean"}, "user_deep": {"type": "boolean"},
+            "needs_device": {"type": "boolean"}, "user_deep": {"type": "boolean"}, "standing": {"type": "boolean"},
             "continues": {"type": "integer"}, "resource": {"type": "string"}, "paused": {"type": "boolean"},
             "reason": {"type": "string"}, "supersedes": {"type": "array", "items": {"type": "string"}},
             "replaces": {"type": "string"}, "over": {"type": "string"}, "both_hold": {"type": "boolean"},
@@ -1033,18 +1033,20 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 db.post("out", a["text"], chat=None, kind="alert", severity=_norm_severity(a.get("severity")))
             elif t == "memory_add":
                 added = p.add_memory(a["text"], kind=a.get("memory_kind") or "fact", title=a.get("title"), key=key,
-                                     end=ends.from_action(a))
+                                     end=ends.from_action(a), standing=a.get("standing") is True)
                 if (a.get("memory_kind") or "") == "restriction":
                     _tell_running_workers(db, f"New binding restriction: {a['text'].strip()}", key)
                 old = a.get("supersedes") or []
                 for name in [old] if isinstance(old, str) else old:
                     try:
-                        p.forget_memory(str(name), keep=added.stem)
+                        # A standing entry superseded by a standing one is shortened, not retired.
+                        p.forget_memory(str(name), keep=added.stem, why=a.get("why") or (
+                            f"shortened into [{added.stem}]" if a.get("standing") is True else None))
                     except ValueError as e:
                         raise ValueError(f"memory added, but `supersedes` failed: {e}") from None
                 memory_budget_check(p)
             elif t == "memory_forget":
-                p.forget_memory(str(a.get("name") or ""))
+                p.forget_memory(str(a.get("name") or ""), why=a.get("why"))
                 memory_budget_check(p)
             elif t == "charter_update" and a.get("both_hold") and not (a.get("text") or a.get("quote")
                                                                     or a.get("replaces")):
@@ -1803,7 +1805,8 @@ def memory_budget_line(p: Project) -> str:
     return (f"## Memory over budget: {coord['entries']} entries, {coord['chars']} chars; you see "
             f"{coord['shown']}, workers see {work['shown']} (pinned restrictions/preferences/resources "
             f"{coord['pinned_chars']} chars, always shown). Retire stale entries with `memory_forget`, "
-            f"or `supersedes` when a new one replaces them")
+            f"or `supersedes` when a new one replaces them; a (standing) entry is only shortened (a "
+            f"standing `memory_add` that supersedes it), never retired for space")
 
 
 def memory_budget_check(p: Project) -> None:
@@ -1817,7 +1820,8 @@ def memory_budget_check(p: Project) -> None:
                 f"Pinned memory ({over['pinned']} restriction/preference/resource entries, "
                 f"{over['pinned_chars']} chars) alone exceeds the workers' {over['limit']}-char memory "
                 f"budget, so they get no decisions or facts. Merge or retire pinned entries "
-                f"(`memory_add` with `supersedes`, or `memory_forget`).", "queued"))
+                f"(`memory_add` with `supersedes`, or `memory_forget`). Shorten (standing) entries "
+                f"with a standing `memory_add` that supersedes them; never retire them for space.", "queued"))
         p.db.set_kv(MEMORY_ALERT_KEY, True)
     elif flagged and not over["pinned_over"]:
         p.db.set_kv(MEMORY_ALERT_KEY, False)

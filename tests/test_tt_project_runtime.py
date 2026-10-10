@@ -13645,6 +13645,62 @@ def test_memory_cli_retires_an_entry(env):
     assert (p.memory_dir / "archive" / stale.name).exists() and "Old news." not in p.memory_text()
 
 
+def test_a_standing_entry_is_refused_retirement_without_a_why(env):
+    p = make(env)
+    from ttp import cli, coordinator as coord
+    assert coord.apply(p, [{"type": "memory_add", "text": "Whenever a box is down, repower it.",
+                            "memory_kind": "decision", "standing": True}], turn=1) == []
+    duty = next(p.memory_dir.glob("preference-*.md"))   # standing: kept as a preference
+    assert "standing: true" in duty.read_text() and "(preference, standing)" in p.memory_index.read_text()
+    assert f"[{duty.stem}] Whenever a box is down, repower it. (standing)" in p.memory_text()
+    errors = coord.apply(p, [{"type": "memory_forget", "name": duty.stem}], turn=2)
+    assert errors and "standing instruction" in errors[0] and duty.exists()
+    # A supersedes by an entry that is not standing is a retirement too.
+    errors = coord.apply(p, [{"type": "memory_add", "text": "Box A was repowered.", "supersedes": [duty.stem]}],
+                         turn=3)
+    assert errors and "standing instruction" in errors[0] and duty.exists()
+    with pytest.raises(SystemExit, match="standing instruction"), contextlib.redirect_stdout(io.StringIO()):
+        cli.main(["memory", "demo", "--forget", duty.stem])
+    assert duty.exists() and "repower it" in p.memory_text()
+
+
+def test_a_standing_entry_retires_with_a_why_and_is_shortened_by_a_standing_supersede(env):
+    p = make(env)
+    from ttp import cli, coordinator as coord
+    with contextlib.redirect_stdout(io.StringIO()):
+        cli.main(["memory", "demo", "Every time a box drops, repower it and tell the owner.", "--standing"])
+    duty = next(p.memory_dir.glob("preference-*.md"))
+    assert coord.apply(p, [{"type": "memory_add", "text": "Whenever a box drops, repower it.", "standing": True,
+                            "title": "Repower dropped boxes", "supersedes": [duty.stem]}], turn=1) == []
+    short = p.memory_dir / "preference-repower-dropped-boxes.md"
+    assert not duty.exists() and short.exists() and "standing: true" in short.read_text()
+    with contextlib.redirect_stdout(io.StringIO()):
+        cli.main(["memory", "demo", "--forget", short.stem, "--why", "user: 'stop repowering, the boxes are gone'"])
+    assert (p.memory_dir / "archive" / short.name).exists() and "repower" not in p.memory_text()
+    log = subprocess.run(["git", "-C", str(p.harness), "log", "-1", "--format=%s"], capture_output=True,
+                         text=True).stdout
+    assert "the boxes are gone" in log
+    # Its own end condition retires it without a why from anyone.
+    from ttp import ends
+    timed = p.add_memory("Whenever the queue fills, drain it.", standing=True, end={"expires": time.time() + 60})
+    [item] = [i for i in ends.temporaries(p) if i["name"] == timed.stem]
+    ends.retire(p, item, "expired", time.time())
+    assert not timed.exists() and (p.memory_dir / "archive" / timed.name).exists()
+
+
+def test_memory_budget_keeps_standing_entries_whole(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    duty = p.add_memory("Whenever a box is down, repower it. " + "z" * 200, standing=True)
+    # Standing pins it whatever its kind (an older or hand-edited entry), oldest of all.
+    duty.write_text(duty.read_text().replace("kind: preference", "kind: decision"))
+    _memories(p, [("decision", f"DECISION-{i} " + "x" * 300) for i in range(40)])
+    text = p.memory_text(limit_chars=2000)
+    assert "Whenever a box is down" in text, "memory pressure dropped a standing entry"
+    assert p.memory_select(2000)[1]["pinned"] == 1
+    assert "never retired for space" in coord.memory_budget_line(p)
+
+
 def _memory_section(digest):
     """The digest's 'Memory added since the snapshot' lines, or [] when it has none."""
     lines = digest.splitlines()

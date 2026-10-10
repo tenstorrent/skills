@@ -2081,10 +2081,10 @@ def cmd_memory(a) -> None:
     if not a.text and not a.forget:
         sys.exit("give the memory's text, or --forget <entry>")
     if a.text:
-        print(p.add_memory(a.text, kind=a.kind))
+        print(p.add_memory(a.text, kind=a.kind, standing=a.standing))
     for name in a.forget or []:
         try:
-            print(f"retired to {p.forget_memory(name)}")
+            print(f"retired to {p.forget_memory(name, why=a.why)}")
         except ValueError as e:
             sys.exit(str(e))
     memory_budget_check(p)
@@ -3338,6 +3338,11 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--kind", default="fact")
     s.add_argument("--forget", action="append", metavar="ENTRY",
                    help="retire an entry (its name in [brackets]) to memory/archive/; repeatable")
+    s.add_argument("--standing", action="store_true",
+                   help="an instruction that applies every time its case comes up (kept as a preference); "
+                        "one finished instance never retires it")
+    s.add_argument("--why", help="with --forget: why it ends; required for a standing entry (its end condition "
+                                  "or the user's words ending it)")
     s.set_defaults(fn=cmd_memory)
 
     s = sub.add_parser("schedules", help="list schedules, or --export them once to harness/schedules.json")

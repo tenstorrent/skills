@@ -196,7 +196,7 @@ def temporaries(p: Project) -> list[dict]:
 
 def retire(p: Project, item: dict, why: str, now: float) -> None:
     if item["kind"] == "memory":
-        p.forget_memory(item["name"])
+        p.forget_memory(item["name"], why=why)
     elif not retire_section(p, item["name"], why):
         return
     db = p.db

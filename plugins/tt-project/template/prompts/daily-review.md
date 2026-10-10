@@ -21,7 +21,9 @@ Assess the last day of this project, then hand off.
    would have let the coordinator decide it, as a `harness:` follow-up when one is missing.
 5. Memory: retire entries that are stale, done or replaced: `ttp memory <name> --forget <entry>`
    (the name in [brackets]; it moves to memory/archive/). Keep restrictions, preferences and
-   resources that still hold. Name what you retired in the summary.
+   resources that still hold. Name what you retired in the summary. A (standing) entry is a duty
+   that recurs: one finished instance does not make it done, and size is no reason to retire it.
+   Retire one only with `--why "<its end condition, or the user's words ending it>"`.
 6. Deferrals held in memory ("deferred", "once X", "N days after Y", "queue it when ..."): turn
    each into a follow-up with `start_after` (a delay such as `3d` or an ISO time) and/or
    `start_when` (a read-only shell probe from the project root: exit 0 = start, 1 = not yet,
