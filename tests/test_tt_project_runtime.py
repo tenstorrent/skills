@@ -27015,10 +27015,7 @@ def test_with_the_push_queue_on_the_daemon_starts_the_checks_as_it_queues_the_re
     out = p.state / PRECHECKS_DIR / f"t{tid}-{head[:12]}"
     assert f"{PRECHECK_LABEL}{out.name}" in json.loads(rev["labels"])
     assert f"ttp checks --result {out}" in rev["spec"] and "run only focused tests" in rev["spec"]
-    deadline = time.time() + 30
-    while not (out / cli.CHECKS_RC).exists() and time.time() < deadline:
-        time.sleep(0.1)
-    assert (out / cli.CHECKS_RC).read_text().strip() == "0", (out / cli.CHECKS_OUT).read_text()
+    assert _wait_precheck(out) == "0", (out / cli.CHECKS_OUT).read_text()
     tree = _git_out(p.root, "rev-parse", f"{head}^{{tree}}").strip()
     assert cli._recorded_pass(p, tree, ["test -f app.py"]), "the reviewer's `ttp checks` could not reuse the pass"
     d, now = Daemon(p.base), time.time()
@@ -27040,12 +27037,21 @@ def test_with_the_push_queue_on_the_daemon_starts_the_checks_as_it_queues_the_re
     assert PRECHECK_LABEL not in none["labels"] and "ttp checks --result" not in none["spec"]
 
 
-def _wait_precheck(out: Path) -> str:
+def _wait_precheck(out: Path, timeout: float = 180.0) -> str:
+    """The exit code the detached checks in `out` wrote. They start as their own processes, which a
+    busy host can take well over 30 s to get through: this waits while they run, up to `timeout`, and
+    fails at once, with their log, when they ended without writing it."""
     from ttp import cli
-    deadline = time.time() + 30
-    while not (out / cli.CHECKS_RC).exists() and time.time() < deadline:
-        time.sleep(0.1)
-    return (out / cli.CHECKS_RC).read_text().strip()
+    rc = out / cli.CHECKS_RC
+
+    def ended():
+        info = cli._read_checks_pid(out)
+        return rc.exists() or (bool(info) and not cli._checks_alive(info))
+    _wait_for(ended, timeout)
+    if not rc.exists():
+        log = next((f.read_text() for f in (out / "checks.log", out / cli.CHECKS_OUT) if f.exists()), "")
+        pytest.fail(f"the checks in {out} wrote no {cli.CHECKS_RC} ({cli._read_checks_pid(out)}): {log[-2000:]}")
+    return rc.read_text().strip()
 
 
 def test_a_pass_of_more_commands_answers_for_the_commands_they_start_with(env):
