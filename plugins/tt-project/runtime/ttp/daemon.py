@@ -31,6 +31,7 @@ from pathlib import Path
 
 from . import alerts
 from . import anchors
+from . import audit
 from . import awake
 from . import budget as bud
 from . import globalcap as gcap
@@ -1746,6 +1747,9 @@ class Daemon:
         if evs:
             db.x(f"UPDATE events SET status='handled' WHERE id IN ({','.join('?' * len(evs))})", evs)
         problems = refused + list(problems)
+        # What the turn decided, for the daily review's audit of turns that decided nothing.
+        note = {**note, "decided": len(_decisions(actions))}
+        db.x("UPDATE runs SET note=? WHERE id=?", (json.dumps(note), r.get("id")))
         self._record_rejections([x[:500] for x in problems])
         self._settle_coord_check(checked, status, actions, problems, float(getattr(usage, "cost_usd", 0) or 0))
         db.set_kv("last_coordinator_summary", {"ts": time.time(), "summary": (out or {}).get("summary", "")})
@@ -1791,8 +1795,9 @@ class Daemon:
         db.set_kv(coord.REJECTED_KEY, problems)
         if not problems:
             return
-        db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
-             (time.time(), "daemon", "rejected_actions", "normal", "; ".join(problems)[:1500], "handled"))
+        db.x("INSERT INTO events(ts,source,kind,severity,text,data,status) VALUES(?,?,?,?,?,?,?)",
+             (time.time(), "daemon", "rejected_actions", "normal", "; ".join(problems)[:1500],
+              json.dumps(problems), "handled"))
         seen = db.kv("rejected_repeats", []) or []
         for x in problems:
             key = hashlib.sha256(x.encode()).hexdigest()[:16]
@@ -2523,6 +2528,13 @@ class Daemon:
                 spec += "\n\nUnblocking quality:\n" + "\n".join(f"- {line}" for line in unblock.lines(db))
             except Exception as e:   # a metric must not keep the review from starting
                 log(self.p, f"unblocking metrics failed: {type(e).__name__}: {e}")
+        if payload.get("audit_report", s["name"] == "daily-review"):
+            try:
+                hours = float((self.cfg.get("review") or {}).get("blocked_long_h", audit.BLOCKED_H))
+                spec += ("\n\nSelf-efficiency audit (last 24 h):\n"
+                         + "\n".join(f"- {line}" for line in audit.lines(db, blocked_h=hours, p=self.p)))
+            except Exception as e:   # nor must the audit
+                log(self.p, f"self-efficiency audit failed: {type(e).__name__}: {e}")
         if s["name"] == "daily-review":
             try:
                 line = pushq.target_line(db)

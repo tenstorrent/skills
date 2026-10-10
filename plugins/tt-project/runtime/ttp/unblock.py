@@ -461,7 +461,8 @@ def inventory_line(rows: list[dict]) -> str:
 
 def asks(db: DB, since: float, now: float | None = None) -> list[dict]:
     """Asks sent since `since`: {id, blocking, answered, handback (the phrase or None), how (the
-    first rule that linked an answer: named, thread, resolved, only_open or newest; None)}."""
+    first rule that linked an answer: named, thread, resolved, only_open or newest; None), answer
+    (the earliest linked answer's text, cut to 200 chars) and answered_at (its time)}."""
     now = time.time() if now is None else now
     # Older asks still count as open when a plain reply is matched, so it is not given to a newer one.
     sent = db.q("SELECT id, ts, ref, ext_id, chat FROM messages WHERE direction='out' AND kind='ask' AND ts>=? "
@@ -474,10 +475,12 @@ def asks(db: DB, since: float, now: float | None = None) -> list[dict]:
     resolved = db.kv(RESOLVED_KEY, {}) or {}
     rows = {a["id"]: {"id": a["id"], "blocking": (a["ref"] or "").split(":", 1)[1]
                       if (a["ref"] or "").startswith("blocking:") else "unset",
-                      "answered": False, "handback": None, "how": None, "first": None} for a in sent}
+                      "answered": False, "handback": None, "how": None, "first": None, "answer": None} for a in sent}
 
     def link(a: dict, m: dict, part: str, how: str) -> None:
         row = rows[a["id"]]
+        if row["first"] is None or m["ts"] < row["first"]:
+            row["answer"] = " ".join(part.split())[:200]
         row["answered"] = True
         row["handback"] = row["handback"] or handback(part)
         row["how"] = row["how"] or how
@@ -519,7 +522,8 @@ def asks(db: DB, since: float, now: float | None = None) -> list[dict]:
             link(open_[0], m, m["text"], "only_open")
         elif open_ and prev is not None and sum(a["ts"] > prev for a in open_) == 1 and open_[-1]["ts"] > prev:
             link(open_[-1], m, m["text"], "newest")
-    return [{k: v for k, v in rows[a["id"]].items() if k != "first"} for a in sent if a["ts"] >= since]
+    return [{**{k: v for k, v in rows[a["id"]].items() if k != "first"}, "answered_at": rows[a["id"]]["first"]}
+            for a in sent if a["ts"] >= since]
 
 
 def asks_line(rows: list[dict]) -> str:

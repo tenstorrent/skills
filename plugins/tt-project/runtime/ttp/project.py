@@ -145,8 +145,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # whenever delivery has a review step (review_before_pr or a push_branch); auto_notes ends each
     # such review's spec. With area_fail_cap (0 off) reviews of one area failed within 48 h, across
     # stacks, the daemon queues no automatic fix for it and the coordinator re-plans (reviewcap).
+    # The daily review's self-efficiency audit lists tasks blocked longer than blocked_long_h hours.
     "review": {"light_max_lines": 80, "risky_paths": [], "light_paths": [], "auto": True, "auto_notes": "",
-               "area_fail_cap": 3},
+               "area_fail_cap": 3, "blocked_long_h": 12},
     # Each Jev use (e.g. "screen") is switched off once its net saving over window_days is not
     # positive, judged after min_calls calls or once its first call is a window old, or once idle_calls
     # calls in the window changed none of the rules' decisions; uses.<use> = "on" or "off" forces it

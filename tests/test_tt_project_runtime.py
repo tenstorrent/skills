@@ -1898,6 +1898,118 @@ def test_the_daily_review_gets_the_unblocking_quality_lines(env):
     assert d._schedule_llm(dict(s, name="audit"), {}) == "queued"
     assert "Unblocking quality" not in p.db.one("SELECT spec FROM tasks WHERE origin='schedule'")["spec"]
 
+
+def test_the_daily_review_gets_the_self_efficiency_audit(env):
+    p = make(env)
+    p.db.x("DELETE FROM messages")
+    from ttp import daemon as dm
+    d = dm.Daemon(p.base)
+    d.cfg = p.config()
+    s = {"name": "daily-review", "budget_usd_day": None, "last_run": None, "description": "review"}
+    assert d._schedule_llm(s, {}) == "queued"
+    spec = p.db.one("SELECT spec FROM tasks WHERE origin='schedule'")["spec"]
+    assert "Self-efficiency audit (last 24 h):\n- nothing to grade" in spec   # an empty day is one line
+    p.db.x("DELETE FROM tasks")
+    assert d._schedule_llm(dict(s, name="other"), {}) == "queued"
+    assert "Self-efficiency audit" not in p.db.one("SELECT spec FROM tasks WHERE origin='schedule'")["spec"]
+    review = " ".join((RUNTIME.parent / "template" / "prompts" / "daily-review.md").read_text().split())
+    for phrase in ("Self-efficiency audit", "A needless ask is a defect", "ask-gate rule", "model-free recovery",
+                   "needless asks: N of M", "top 1-3 inefficiencies", "`nothing to grade`"):
+        assert phrase in review, phrase
+
+
+def test_the_audit_grades_asks_answers_rejections_and_waste(env):
+    from ttp import audit
+    p, now, msg = _ask_db(env)
+    a = msg("out", "Restart the dead worker?\n\nMy recommendation: yes, restart it", 7200, "ask",
+            ref="blocking:human")
+    msg("in", "decide yourself", 3600, chat="web")
+    b = msg("out", "Grant repo access?", 600, "ask", ref="blocking:access")
+    old = msg("out", "An ask from two weeks ago?", 15 * 86400, "ask", ref="blocking:review")
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,data,status) VALUES(?,?,?,?,?,?,?)",
+           (now - 100, "daemon", "rejected_actions", "normal", "x",
+            json.dumps(["ask_user: ask_user rejected: you recommend yes to a step you call reversible",
+                        "task_update: #9 rejected"]), "handled"))
+    p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",   # an older release
+           (now - 50, "daemon", "rejected_actions", "normal", "ask_user: already asked as open ask #3", "handled"))
+    task = p.db.add_task("flaky build", "s", origin="user")
+    p.db.update_task(task, status="done", attempts=2, spent_usd=1.5)
+    run = "INSERT INTO runs(task,role,started,ended,status,cost_usd,note) VALUES(?,?,?,?,?,?,?)"
+    p.db.x(run, (task, "worker", now - 5000, now - 4000, "failed", 0.7, "{}"))
+    p.db.x(run, (task, "worker", now - 3000, now - 2000, "lost", 0.4, json.dumps({"not_waste": "reboot"})))
+    p.db.x(run, (task, "worker", now - 1000, now - 900, "ok", 0.4, "{}"))
+    p.db.x(run, (None, "coordinator", now - 800, now - 790, "ok", 0.05,
+                 json.dumps({"messages": [], "events": [], "wake_due": "idle", "decided": 0})))
+    p.db.x(run, (None, "coordinator", now - 700, now - 690, "ok", 0.25, json.dumps({"messages": [a], "decided": 2})))
+    rows = {r["id"]: r for r in audit.asks(p.db, now - 86400, now)}
+    assert set(rows) == {a, b}, "an ask from before the window is not graded"
+    assert rows[a]["question"] == "Restart the dead worker?" and rows[a]["recommendation"] == "yes, restart it"
+    assert rows[a]["answer"] == "decide yourself" and rows[a]["handback"] and rows[a]["wait_s"] == pytest.approx(3600)
+    assert not rows[b]["answered"] and rows[b]["open_s"] == pytest.approx(600)
+    assert audit.rejected_asks(p.db, now - 86400) == [
+        "ask_user: ask_user rejected: you recommend yes to a step you call reversible",
+        "ask_user: already asked as open ask #3"]
+    out = "\n".join(audit.lines(p.db, now))
+    assert f'ask {a} (human): "Restart the dead worker?"; recommended: yes, restart it; answered after 1.0 h' in out
+    assert '(handed back: "decide yourself")' in out
+    assert f'ask {b} (access): "Grant repo access?"; no answer yet, open 10 min' in out
+    assert "asks refused by the ask gate: 2" in out and "asks: 2 sent, 1 answered, 1 handed back" in out
+    assert "failed worker runs: 1, $0.70" in out, "a run lost to a reboot is not a failure"
+    assert f"tasks run again after a failed attempt: 1: #{task} flaky build (attempt 2, done, $1.50)" in out
+    assert "coordinator turns: 2, $0.30; 1 decided nothing ($0.05); 1 idle wakes ($0.05)" in out
+    assert "finished tasks: 1 (1 done), workers $1.50 ($1.50 each), coordinator $0.30" in out
+    assert old not in rows
+
+
+def test_the_audit_sums_review_loops_and_lists_overrides_held_long(env):
+    from ttp import audit, ends
+    from ttp.screen import MUTES_KEY
+    p = make(env)
+    now = time.time()
+    change = p.db.add_task("add a cache", "s", origin="user")
+    fix = p.db.add_task("fix the cache", "s", origin="daemon")
+    p.db.update_task(fix, spent_usd=0.8)
+    r1 = p.db.add_task("review #1", "s", kind="review", origin="daemon", labels=[f"auto_review:{change}"])
+    r2 = p.db.add_task("review #2", "s", kind="review", origin="daemon",
+                       labels=[f"auto_review:{fix}", f"continues:{r1}"])
+    p.db.update_task(r1, spent_usd=1.0)
+    p.db.update_task(r2, spent_usd=0.5)
+    loops = audit.review_loops(p.db, now - 86400)
+    assert loops == [{"change": change, "title": "add a cache", "rounds": 2, "review_usd": 1.5, "fix_usd": 0.8}]
+    assert not audit.review_loops(p.db, now + 60), "a loop that did not move in the window is not listed"
+    assert "review loops: 1 changes, reviews $1.50 + fixes $0.80" in "\n".join(audit.lines(p.db, now))
+    p.db.set_kv("paused_resources", {"rig": {"reason": "maintenance", "since": now - 20 * 3600, "by": "coordinator"},
+                                     "fresh": {"reason": "x", "since": now - 600, "by": "user"}})
+    p.db.set_kv(MUTES_KEY, [{"source": "watch", "match": "flaky", "below": "high", "count": 0,
+                             "since": now - 30 * 3600, "until": now + 3600}])
+    p.add_memory("Hold the release while the freeze lasts.", "decision", "freeze hold",
+                 end={"until": "the freeze is over"})
+    held = audit.overrides(p, p.db, now, 12)
+    assert any(h.startswith("resource rig paused 20.0 h by coordinator (maintenance)") for h in held)
+    assert not any("fresh" in h for h in held) and any(h.startswith("mute of watch 'flaky' held 30.0 h") for h in held)
+    assert not any("possibly over" in h for h in held), "not listed as possibly over yet"
+    keys = [t["key"] for t in ends.temporaries(p)]
+    p.db.set_kv(ends.LISTED_KEY, {keys[0]: now - 2 * 86400})
+    assert any("possibly over (ends when the freeze is over)" in h for h in audit.overrides(p, p.db, now, 12))
+    assert "overrides held long:" in "\n".join(audit.lines(p.db, now, p=p))
+
+
+def test_a_coordinator_turn_logs_what_it_decided_and_its_rejections(env):
+    p = make(env)
+    from types import SimpleNamespace
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    rid = p.db.x("INSERT INTO runs(role,started,status,note) VALUES('coordinator',?,'ok','{}')", (time.time(),))
+    usage = SimpleNamespace(structured={"actions": [{"type": "noop"},
+                                                    {"type": "ask_user", "text": "Shall I retry?",
+                                                     "blocking": "nope"}], "summary": ""},
+                            error="", final_text="")
+    d._finish_coordinator({"id": rid, "dir": "x"}, usage, "ok", {"wake_due": "idle"})
+    note = json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (rid,))["note"])
+    assert note["decided"] == 1 and note["wake_due"] == "idle"
+    data = json.loads(p.db.one("SELECT data FROM events WHERE kind='rejected_actions'")["data"])
+    assert len(data) == 1 and data[0].startswith("ask_user:")
+
 def test_command_watcher_repeats_wake_the_coordinator(env, monkeypatch):
     p = make(env)
     from ttp import daemon as dm

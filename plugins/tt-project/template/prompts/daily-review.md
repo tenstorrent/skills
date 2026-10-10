@@ -19,18 +19,30 @@ Assess the last day of this project, then hand off.
    labels: inventory is not a 24 h count, cumulative counters are not daily totals, and an unknown
    is not zero. A handed-back ask should not have been sent: say what rule
    would have let the coordinator decide it, as a `harness:` follow-up when one is missing.
-5. Memory: retire entries that are stale, done or replaced: `ttp memory <name> --forget <entry>`
+5. Self-efficiency: if this spec ends with `Self-efficiency audit` lines, grade them. For each
+   ask: was it truly blocked on access, funds, spend, review, merge, an irreversible step, a
+   restriction or another human, or could the project have decided, fixed or retried it itself (a
+   dead worker, a stuck hold, a failed run, a reversible choice)? A needless ask is a defect: for
+   each pattern, a `harness:` follow-up with a concrete fix (an ask-gate rule, a prompt rule or a
+   model-free recovery). Asks the gate refused are the gate working; a reason refused again and
+   again needs a prompt rule. Then name the top 1-3 inefficiencies (failed or retried runs, turns
+   that decided nothing, idle wakes, costly tasks, review loops, long blocks) with their cost and a
+   fix. An override held past its premise (a pause, a mute, a temporary instruction possibly over)
+   is retired if it clearly is over, else gets an end condition. In the
+   summary: one line, `needless asks: N of M` and the top inefficiency. `nothing to grade`: say so
+   in a few words.
+6. Memory: retire entries that are stale, done or replaced: `ttp memory <name> --forget <entry>`
    (the name in [brackets]; it moves to memory/archive/). Keep restrictions, preferences and
    resources that still hold. Name what you retired in the summary. A (standing) entry is a duty
    that recurs: one finished instance does not make it done, and size is no reason to retire it.
    Retire one only with `--why "<its end condition, or the user's words ending it>"`.
-6. Deferrals held in memory ("deferred", "once X", "N days after Y", "queue it when ..."): turn
+7. Deferrals held in memory ("deferred", "once X", "N days after Y", "queue it when ..."): turn
    each into a follow-up with `start_after` (a delay such as `3d` or an ISO time) and/or
    `start_when` (a read-only shell probe from the project root: exit 0 = start, 1 = not yet,
    under a minute; `landed:#<id>` for "once task <id> landed"), and a spec that names the entry
    it replaces. The coordinator adds it as a
    deferred task and retires the entry in the same turn, so the deferral is never lost.
-7. Charter: read `tt-project/harness/CHARTER.md`. List each restriction that newer charter text on
+8. Charter: read `tt-project/harness/CHARTER.md`. List each restriction that newer charter text on
    the same subject contradicts, quoting both exactly, in the summary as
    `stale restriction: "<old text>" (contradicted by "<newer text>")`, and each section whose own
    end (`Expires:`, `Until:`) has clearly passed as `stale restriction: "<heading>" (over: <what
@@ -38,6 +50,6 @@ Assess the last day of this project, then hand off.
    `quote` or `replaces`.
 
 `result.json` → `followups`: at most 5 concrete tasks, each worth its cost, plus the deferrals
-from step 6 (`{"title", "spec", "start_after", "start_when"}`). Use titles starting
+from step 7 (`{"title", "spec", "start_after", "start_when"}`). Use titles starting
 `project:` or `harness:`. Recommend disabling or slowing any recurring job that wastes money.
 `summary`: five lines max, for the user.
