@@ -831,6 +831,19 @@ def cmd_stats(a) -> None:
     print(json.dumps(s, indent=1) if a.json else bud.reread_text(s))
 
 
+def cmd_audit(a) -> None:
+    """The daily review's self-efficiency audit of this project's last `--hours`, model-free."""
+    from . import audit
+    p = need(a.name, sys.argv[1:]) if a.name else here()
+    if not p:
+        die("no tt-project project here; name one: `ttp audit <name>`")
+    hours = float((p.config().get("review") or {}).get("blocked_long_h", audit.BLOCKED_H))
+    if a.json:
+        print(json.dumps(audit.report(p.db, window_s=a.hours * 3600, blocked_h=hours, p=p), indent=1, default=str))
+    else:
+        print("\n".join(f"- {line}" for line in audit.lines(p.db, window_s=a.hours * 3600, blocked_h=hours, p=p)))
+
+
 def cmd_spend_today(a) -> None:
     """This machine's projects' spend in [since, until) by provider and account key, and its other
     Claude Code sessions as estimated (globalcap.answer): what another machine's global daily total
@@ -3300,6 +3313,13 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--top", type=int, default=10)
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_stats)
+
+    s = sub.add_parser("audit", help="the daily review's self-efficiency audit: asks, wasted runs, idle wakes, "
+                                     "$ per outcome, review loops, stuck work and overrides held past their end")
+    s.add_argument("name", nargs="?")
+    s.add_argument("--hours", type=float, default=24)
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_audit)
 
     s = sub.add_parser("spend-today", help="this machine's tt-project spend today, by provider and account "
                                            "(for the global daily cap)")

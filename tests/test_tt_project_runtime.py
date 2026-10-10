@@ -1914,7 +1914,8 @@ def test_the_daily_review_gets_the_self_efficiency_audit(env):
     assert "Self-efficiency audit" not in p.db.one("SELECT spec FROM tasks WHERE origin='schedule'")["spec"]
     review = " ".join((RUNTIME.parent / "template" / "prompts" / "daily-review.md").read_text().split())
     for phrase in ("Self-efficiency audit", "A needless ask is a defect", "ask-gate rule", "model-free recovery",
-                   "needless asks: N of M", "top 1-3 inefficiencies", "`nothing to grade`"):
+                   "needless asks: N of M", "top 1-3 inefficiencies", "`nothing to grade`", "Grade every ask",
+                   "`human-only` or `avoidable`", "fix it the same day", "same-day fixes from step 5"):
         assert phrase in review, phrase
 
 
@@ -1955,6 +1956,7 @@ def test_the_audit_grades_asks_answers_rejections_and_waste(env):
     assert f'ask {b} (access): "Grant repo access?"; no answer yet, open 10 min' in out
     assert "asks refused by the ask gate: 2" in out and "asks: 2 sent, 1 answered, 1 handed back" in out
     assert "failed worker runs: 1, $0.70" in out, "a run lost to a reboot is not a failure"
+    assert "worker runs lost (not failures): 1, $0.40: 1 to reboot $0.40" in out
     assert f"tasks run again after a failed attempt: 1: #{task} flaky build (attempt 2, done, $1.50)" in out
     assert "coordinator turns: 2, $0.30; 1 decided nothing ($0.05); 1 idle wakes ($0.05), 0 starve wakes ($0.00)" in out
     assert "finished tasks: 1 (1 done), workers $1.50 ($1.50 each), coordinator $0.30" in out
@@ -1979,7 +1981,7 @@ def test_the_audit_sums_review_loops_and_lists_overrides_held_long(env):
     assert not audit.review_loops(p.db, now + 60), "a loop that did not move in the window is not listed"
     assert "review loops: 1 changes, reviews $1.50 + fixes $0.80" in "\n".join(audit.lines(p.db, now))
     p.db.set_kv("paused_resources", {"rig": {"reason": "maintenance", "since": now - 20 * 3600, "by": "coordinator"},
-                                     "fresh": {"reason": "x", "since": now - 600, "by": "user"}})
+                                     "fresh": {"reason": "x", "since": now - 600, "by": "user", "until": now + 3600}})
     p.db.set_kv(MUTES_KEY, [{"source": "watch", "match": "flaky", "below": "high", "count": 0,
                              "since": now - 30 * 3600, "until": now + 3600}])
     p.add_memory("Hold the release while the freeze lasts.", "decision", "freeze hold",
@@ -2053,6 +2055,103 @@ def test_the_audit_reports_starve_wakes_apart_from_idle_wakes(env):
     assert (turns["idle"], turns["starve"]) == (1, 2)
     assert turns["idle_usd"] == pytest.approx(0.05) and turns["starve_usd"] == pytest.approx(0.30)
     assert "1 idle wakes ($0.05), 2 starve wakes ($0.30)" in "\n".join(audit.lines(p.db, now))
+
+
+def test_the_audit_reports_dollars_per_done_task_by_kind_and_tier(env):
+    from ttp import audit
+    p = make(env)
+    now = time.time()
+    for title, kind, tier, status, usd in (("a", "code", "standard", "done", 2.0), ("b", "code", "standard", "done", 1.0),
+                                           ("c", "review", "light", "done", 0.2), ("d", "code", "deep", "failed", 5.0)):
+        t = p.db.add_task(title, "s", kind=kind, tier=tier, origin="user")
+        p.db.update_task(t, status=status, spent_usd=usd)
+    groups = audit.per_outcome(audit.finished(p.db, now - 86400))
+    assert [(g["kind"], g["tier"], g["n"]) for g in groups] == [("code", "standard", 2), ("review", "light", 1)], \
+        "a failed task is no outcome"
+    assert groups[0]["each"] == pytest.approx(1.5)
+    assert "$ per done task by kind and tier: code/standard 2 at $1.50, review/light 1 at $0.20" in \
+        "\n".join(audit.lines(p.db, now))
+
+
+def test_the_audit_counts_runs_lost_to_reboots_and_continued_tasks_apart(env):
+    from ttp import audit
+    p = make(env)
+    now = time.time()
+    run = "INSERT INTO runs(role,started,ended,status,cost_usd,note) VALUES(?,?,?,?,?,?)"
+    for role, status, note, usd in (("worker", "lost", {"not_waste": "reboot"}, 0.5),
+                                    ("worker", "lost", {"not_waste": "reboot"}, 0.25),
+                                    ("worker", "stalled", {"not_waste": "sleep"}, 0.1),
+                                    ("worker", "no_handoff", {"not_waste": "handoff"}, 0.3),
+                                    ("worker", "failed", {}, 0.7), ("coordinator", "lost", {"not_waste": "reboot"}, 9.0)):
+        p.db.x(run, (role, now - 600, now - 500, status, usd, json.dumps(note)))
+    p.db.x(run, ("worker", now - 2 * 86400, now - 2 * 86400, "lost", 4.0, json.dumps({"not_waste": "reboot"})))
+    lost = audit.lost_runs(p.db, now - 86400)
+    assert lost == {"reboot": {"n": 2, "usd": 0.75}, "sleep": {"n": 1, "usd": 0.1}}, lost
+    old = p.db.add_task("big change", "s", kind="code", origin="user")
+    p.db.update_task(old, status="done", spent_usd=3.0)
+    cont = p.db.add_task("continue: big change", "s", kind="code", origin="coordinator", labels=[f"continues:{old}"])
+    p.db.update_task(cont, spent_usd=1.0)
+    review = p.db.add_task("re-review", "s", kind="review", origin="daemon", labels=[f"continues:{old}"])
+    gone = p.db.add_task("continues a deleted task", "s", origin="coordinator", labels=["continues:99999"])
+    rows = audit.continued_tasks(p.db, now - 86400)
+    assert rows == [{"id": cont, "title": "continue: big change", "of": old, "of_usd": 3.0, "usd": 1.0}], \
+        "review rounds are review_loops', and a missing original is skipped"
+    assert review and gone and not audit.continued_tasks(p.db, now + 60), "only tasks added in the window"
+    out = "\n".join(audit.lines(p.db, now))
+    assert "worker runs lost (not failures): 3, $0.85: 2 to reboot $0.75, 1 to sleep $0.10" in out
+    assert f"tasks continued from an earlier one: 1: #{cont} continue: big change continues #{old} ($3.00 + $1.00)" in out
+
+
+def test_the_audit_lists_blocked_and_waiting_work_longest_first(env, monkeypatch):
+    from ttp import audit, unblock
+    p = make(env)
+    now = time.time()
+    rows = [{"task": 1, "title": "short", "kind": "blocked", "state_s": 3600, "stuck_s": 3600},
+            {"task": 2, "title": "waits long", "kind": "waiting", "state_s": 30 * 3600, "stuck_s": 30 * 3600},
+            {"task": 3, "title": "blocked long", "kind": "blocked", "state_s": 20 * 3600, "stuck_s": 20 * 3600},
+            {"task": 4, "title": "unknown age", "kind": "blocked", "state_s": None, "stuck_s": None},
+            {"task": 5, "title": "in review", "kind": "review", "state_s": 40 * 3600, "stuck_s": 40 * 3600}]
+    monkeypatch.setattr(unblock, "inventory", lambda db, now=None: rows)
+    assert [r["task"] for r in audit.stuck_long(p.db, now, 12)] == [2, 3]
+    assert "blocked or waiting longer than 12 h now: 2: #2 waits long waiting 30.0 h, #3 blocked long blocked 20.0 h" \
+        in "\n".join(audit.lines(p.db, now))
+
+
+def test_the_audit_lists_pauses_past_their_end_or_with_none_at_any_age(env):
+    from ttp import audit
+    p = make(env)
+    now = time.time()
+    p.db.set_kv("paused_resources", {
+        "endless": {"reason": "x", "since": now - 600, "by": "coordinator"},
+        "overdue": {"reason": "y", "since": now - 1200, "by": "coordinator", "until": now - 7200},
+        "probe": {"reason": "z", "since": now - 600, "by": "coordinator", "end_when": "true"},
+        "timed": {"reason": "w", "since": now - 600, "by": "user", "until": now + 3600}})
+    held = audit.overrides(None, p.db, now, 12)
+    assert any(h.startswith("resource endless paused 10 min") and h.endswith(", with no end") for h in held), held
+    assert any(h.startswith("resource overdue paused") and h.endswith("its end passed 2.0 h ago") for h in held), held
+    assert not any("probe" in h or "timed" in h for h in held), "a fresh pause with a live end is not listed"
+
+
+def test_ttp_audit_prints_the_audit_lines_or_its_rows_as_json(env, capsys):
+    p = make(env)
+    now = time.time()
+    p.db.x("INSERT INTO runs(role,started,ended,status,cost_usd,note) VALUES('worker',?,?,'failed',0.5,'{}')",
+           (now - 3 * 3600, now - 3 * 3600 + 60))
+    monkey = pytest.MonkeyPatch()
+    monkey.chdir(p.root)
+    try:
+        assert _ttp_main("audit") is None
+        out = capsys.readouterr().out
+        assert out.startswith("- failed worker runs: 1, $0.50"), out
+        assert _ttp_main("audit", "--hours", "1") is None
+        assert capsys.readouterr().out == "- nothing to grade\n", "the run is outside a 1 h window"
+        assert _ttp_main("audit", "--json") is None
+        data = json.loads(capsys.readouterr().out)
+    finally:
+        monkey.undo()
+    assert data["window_h"] == 24 and len(data["failed_runs"]) == 1
+    assert set(data) >= {"asks", "asks_refused", "lost_runs", "retried_tasks", "continued_tasks", "coordinator_turns",
+                         "per_outcome", "stuck", "review_loops", "overrides"}
 
 
 def test_command_watcher_repeats_wake_the_coordinator(env, monkeypatch):

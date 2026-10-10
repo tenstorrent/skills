@@ -19,15 +19,17 @@ Assess the last day of this project, then hand off.
    labels: inventory is not a 24 h count, cumulative counters are not daily totals, and an unknown
    is not zero. A handed-back ask should not have been sent: say what rule
    would have let the coordinator decide it, as a `harness:` follow-up when one is missing.
-5. Self-efficiency: if this spec ends with `Self-efficiency audit` lines, grade them. For each
-   ask: was it truly blocked on access, funds, spend, review, merge, an irreversible step, a
-   restriction or another human, or could the project have decided, fixed or retried it itself (a
+5. Self-efficiency: if this spec ends with `Self-efficiency audit` lines (`ttp audit <name>` prints
+   them, `--json` the rows), grade them. Grade every ask, one line each, `human-only` or
+   `avoidable`: was it truly blocked on access, funds, spend, review, merge, an irreversible step,
+   a restriction or another human, or could the project have decided, fixed or retried it itself (a
    dead worker, a stuck hold, a failed run, a reversible choice)? A needless ask is a defect: for
    each pattern, a `harness:` follow-up with a concrete fix (an ask-gate rule, a prompt rule or a
    model-free recovery). Asks the gate refused are the gate working; a reason refused again and
-   again needs a prompt rule. Then name the top 1-3 inefficiencies (failed or retried runs, turns
-   that decided nothing, idle wakes, costly tasks, review loops, long blocks) with their cost and a
-   fix. An override held past its premise (a pause, a mute, a temporary instruction possibly over)
+   again needs a prompt rule. Each cause of wasted runs (failed, retried, lost or continued runs)
+   that will recur gets a follow-up too: fix it the same day, not in a later review. Then name the
+   top 1-3 inefficiencies (wasted runs, turns that decided nothing, idle wakes, $ per outcome,
+   review loops, long blocks or waits) with their cost and a fix. An override held past its premise (a pause, a mute, a temporary instruction possibly over)
    is retired if it clearly is over, else gets an end condition. A resource pause the user set is
    never lifted without the user's word: propose an end condition, or ask the user. In the
    summary: one line, `needless asks: N of M` and the top inefficiency. `nothing to grade`: say so
@@ -50,7 +52,7 @@ Assess the last day of this project, then hand off.
    ended it>)`. Do not edit the charter: the coordinator retires them with `charter_update`
    `quote` or `replaces`.
 
-`result.json` → `followups`: at most 5 concrete tasks, each worth its cost, plus the deferrals
-from step 7 (`{"title", "spec", "start_after", "start_when"}`). Use titles starting
+`result.json` → `followups`: at most 5 concrete tasks, each worth its cost, plus the same-day fixes
+from step 5 and the deferrals from step 7 (`{"title", "spec", "start_after", "start_when"}`). Use titles starting
 `project:` or `harness:`. Recommend disabling or slowing any recurring job that wastes money.
 `summary`: five lines max, for the user.

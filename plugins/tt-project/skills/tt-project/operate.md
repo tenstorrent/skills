@@ -26,6 +26,7 @@
 | `ttp doctor <name>` | providers, accounts, Jev, notifications, web |
 | `ttp alerts <name> --after N` | alerts since a message id |
 | `ttp stats [<name>] [--days N] [--json]` | context re-read (cache-read) tokens per run and per $, by role, task kind, tier and effort, and the runs that re-read most |
+| `ttp audit [<name>] [--hours N] [--json]` | the daily review's self-efficiency audit: every ask with its blocking reason and answer, failed, lost, retried and continued runs, idle wakes, $ per done task by kind and tier, review-loop spend per change, stuck work and overrides held past their end |
 | `ttp web <name> --tunnel --keep` / `--unkeep` | keep the web app's tunnel up as a user service / remove it (remote projects; a local view forward needs no ask) |
 
 ## What needs the user

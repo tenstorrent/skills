@@ -5,18 +5,22 @@ the project could have saved. Model-free; the review grades it.
 
 - every ask sent (its question, blocking reason, recommendation, the user's answer and how long it
   took), asks the ask gate refused, and answers that handed the decision back ("decide yourself");
-- worker runs that failed (a reboot, sleep, lost network or a resume is not a failure) and tasks
-  run again after a failed attempt;
+- worker runs that failed (a reboot, sleep, lost network or a resume is not a failure), runs lost
+  to those causes apart, tasks run again after a failed attempt, and tasks that continue an
+  earlier one (`continues:<id>`), with the spend of each;
 - coordinator turns that decided nothing (no action but `noop`, or an escalate), and idle and
   starve wakes (woken by the idle or idle-slot timer alone, with no message or event), with their cost;
-- spend per finished task: the workers' own, and the coordinator's day spread over them;
-- tasks blocked longer than `blocked_h` hours now;
+- spend per finished task: the workers' own, and the coordinator's day spread over them; $ per
+  done task by kind and tier;
+- tasks blocked or waiting longer than `blocked_h` hours now, longest first;
 - review loops: per change whose review moved in the window, its review rounds and their spend
   plus the fixes they asked for (a review's `auto_review:<task>` and `continues:<review>` labels);
 - overrides held longer than `blocked_h`: resource pauses and active mutes, and temporary instructions
-  whose end only a model can judge that were listed as possibly over a day or more ago.
+  whose end only a model can judge that were listed as possibly over a day or more ago; and at any
+  age, a resource pause with no end or whose `until` has passed.
 
-An empty day is one line, NOTHING."""
+An empty day is one line, NOTHING. `ttp audit` prints the same lines, or `report` as JSON. It reads
+only the project's own database and harness files."""
 from __future__ import annotations
 
 import json
@@ -24,7 +28,7 @@ import time
 from typing import Any
 
 from . import budget, ends, unblock
-from .db import DB
+from .db import DB, continues_id
 from .project import Project
 
 WINDOW_S = 86400
@@ -97,6 +101,34 @@ def retried_tasks(db: DB, since: float) -> list[dict]:
                 "(SELECT task FROM runs WHERE role!='coordinator' AND started>=?) ORDER BY spent_usd DESC", (since,))
 
 
+def lost_runs(db: DB, since: float) -> dict[str, dict]:
+    """Worker runs that ended since `since` without an outcome for a cause other than their own (a
+    reboot, sleep, lost network, a resume): {cause: {n, usd}}. Not failures, but their spend is gone."""
+    out: dict[str, dict] = {}
+    for r in db.q("SELECT status, note, cost_usd FROM runs WHERE role!='coordinator' AND ended>=? AND status IN "
+                  f"({','.join('?' * len(budget.WASTED))})", (since, *budget.WASTED)):
+        cause = _note(r["note"]).get("not_waste")
+        if cause and cause != "handoff":   # a hand-off that stood is an outcome
+            c = out.setdefault(str(cause), {"n": 0, "usd": 0.0})
+            c["n"] += 1
+            c["usd"] += float(r["cost_usd"] or 0)
+    return out
+
+
+def continued_tasks(db: DB, since: float) -> list[dict]:
+    """Work tasks added since `since` that continue an earlier one (`continues:<id>`; review rounds are
+    review_loops'), most costly first: {id, title, of, of_usd, usd}."""
+    out = []
+    for t in db.q("SELECT id, title, labels, spent_usd FROM tasks WHERE kind!='review' AND created>=? "
+                  "AND labels LIKE '%continues:%'", (since,)):
+        of = continues_id(t)
+        old = db.task(of) if of is not None else None
+        if old:
+            out.append({"id": t["id"], "title": t["title"], "of": of, "of_usd": float(old["spent_usd"] or 0),
+                        "usd": float(t["spent_usd"] or 0)})
+    return sorted(out, key=lambda x: -(x["of_usd"] + x["usd"]))
+
+
 def coordinator_turns(db: DB, since: float) -> dict:
     """Coordinator turns since `since`: all, those that decided nothing, idle wakes and starve wakes,
     with costs. A turn decided nothing when its note says `decided` 0 (turns before that was logged
@@ -122,13 +154,24 @@ def coordinator_turns(db: DB, since: float) -> dict:
 
 def finished(db: DB, since: float) -> list[dict]:
     """Tasks that ended (done or failed) since `since`, most costly first."""
-    return db.q("SELECT id, title, status, spent_usd FROM tasks WHERE status IN ('done','failed') AND updated>=? "
-                "ORDER BY spent_usd DESC", (since,))
+    return db.q("SELECT id, title, status, kind, tier, spent_usd FROM tasks WHERE status IN ('done','failed') "
+                "AND updated>=? ORDER BY spent_usd DESC", (since,))
 
 
-def blocked_long(db: DB, now: float, hours: float) -> list[dict]:
-    """Tasks blocked now for more than `hours`, longest first."""
-    rows = [r for r in unblock.inventory(db, now) if r["kind"] == "blocked"
+def per_outcome(done: list[dict]) -> list[dict]:
+    """$ per done task by kind and tier, from `finished` rows, most costly first: {kind, tier, n, usd, each}."""
+    groups: dict[tuple, dict] = {}
+    for t in done:
+        if t["status"] == "done":
+            g = groups.setdefault((t["kind"], t["tier"]), {"kind": t["kind"], "tier": t["tier"], "n": 0, "usd": 0.0})
+            g["n"] += 1
+            g["usd"] += float(t["spent_usd"] or 0)
+    return sorted(({**g, "each": g["usd"] / g["n"]} for g in groups.values()), key=lambda g: -g["usd"])
+
+
+def stuck_long(db: DB, now: float, hours: float) -> list[dict]:
+    """Tasks blocked or waiting now (not on their own work) for more than `hours`, longest first."""
+    rows = [r for r in unblock.inventory(db, now) if r["kind"] in ("blocked", "waiting")
             and r["state_s"] is not None and r["state_s"] > hours * 3600]
     return sorted(rows, key=lambda r: -r["state_s"])
 
@@ -177,9 +220,12 @@ def overrides(p: Project | None, db: DB, now: float, hours: float) -> list[str]:
     out = []
     for name, v in sorted(db.paused_resources(shared=False).items()):
         age = now - float(v.get("since") or now)
-        if age > hours * 3600:
+        until = float(v["until"]) if isinstance(v.get("until"), (int, float)) else None
+        end = ("with no end" if until is None and not v.get("end_when")
+               else f"its end passed {_dur(now - until)} ago" if until is not None and until <= now else "")
+        if age > hours * 3600 or end:
             out.append(f"resource {name} paused {_dur(age)} by {v.get('by') or 'unknown'}"
-                       + (f" ({_short(v['reason'], 80)})" if v.get("reason") else ""))
+                       + (f" ({_short(v['reason'], 80)})" if v.get("reason") else "") + (f", {end}" if end else ""))
     for m in mutes(db, now):
         age = now - float(m.get("since") or now)
         if age > hours * 3600:
@@ -234,6 +280,16 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
         out.append(f"tasks run again after a failed attempt: {len(again)}: " + ", ".join(
             f"#{t['id']} {_short(t['title'], 50)} (attempt {t['attempts']}, {t['status']}, ${float(t['spent_usd'] or 0):.2f})"
             for t in again[:TOP]) + _more(again))
+    lost = lost_runs(db, since)
+    if lost:
+        out.append(f"worker runs lost (not failures): {sum(c['n'] for c in lost.values())}, "
+                   f"${sum(c['usd'] for c in lost.values()):.2f}: " + ", ".join(
+                       f"{c['n']} to {cause} ${c['usd']:.2f}" for cause, c in sorted(lost.items())))
+    cont = continued_tasks(db, since)
+    if cont:
+        out.append(f"tasks continued from an earlier one: {len(cont)}: " + ", ".join(
+            f"#{t['id']} {_short(t['title'], 50)} continues #{t['of']} (${t['of_usd']:.2f} + ${t['usd']:.2f})"
+            for t in cont[:TOP]) + _more(cont))
     turns = coordinator_turns(db, since)
     if turns["n"]:
         noop = (f"{turns['noop']} decided nothing (${turns['noop_usd']:.2f})" if turns["logged"] else
@@ -250,10 +306,15 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
                    f"(${turns['usd'] / len(done):.2f} per finished task); most costly: " + ", ".join(
                        f"#{t['id']} {_short(t['title'], 50)} {t['status']} ${float(t['spent_usd'] or 0):.2f}"
                        for t in done[:3]))
-    stuck = blocked_long(db, now, blocked_h)
+        groups = per_outcome(done)
+        if groups:
+            out.append("$ per done task by kind and tier: " + ", ".join(
+                f"{g['kind']}/{g['tier']} {g['n']} at ${g['each']:.2f}" for g in groups))
+    stuck = stuck_long(db, now, blocked_h)
     if stuck:
-        out.append(f"blocked longer than {blocked_h:g} h now: {len(stuck)}: " + ", ".join(
-            f"#{r['task']} {_short(r['title'], 50)} {_dur(r['state_s'])}" for r in stuck[:TOP]) + _more(stuck))
+        out.append(f"blocked or waiting longer than {blocked_h:g} h now: {len(stuck)}: " + ", ".join(
+            f"#{r['task']} {_short(r['title'], 50)} {r['kind']} {_dur(r['state_s'])}" for r in stuck[:TOP])
+            + _more(stuck))
     loops = review_loops(db, since)
     if loops:
         rev, fix = sum(x["review_usd"] for x in loops), sum(x["fix_usd"] for x in loops)
@@ -265,3 +326,17 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
     if held:
         out.append(f"overrides held long: {len(held)}: " + "; ".join(held[:TOP]) + _more(held))
     return out or [NOTHING]
+
+
+def report(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_h: float = BLOCKED_H,
+           p: Project | None = None) -> dict:
+    """Every collector's rows for the last `window_s`, for `ttp audit --json`."""
+    now = time.time() if now is None else now
+    since = now - window_s
+    done = finished(db, since)
+    return {"window_h": window_s / 3600, "asks": asks(db, since, now), "asks_refused": rejected_asks(db, since),
+            "failed_runs": failed_runs(db, since), "lost_runs": lost_runs(db, since),
+            "retried_tasks": retried_tasks(db, since), "continued_tasks": continued_tasks(db, since),
+            "coordinator_turns": coordinator_turns(db, since), "finished": done, "per_outcome": per_outcome(done),
+            "stuck": stuck_long(db, now, blocked_h), "review_loops": review_loops(db, since),
+            "overrides": overrides(p, db, now, blocked_h)}
