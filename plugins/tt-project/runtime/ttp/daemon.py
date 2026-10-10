@@ -85,7 +85,7 @@ NOTIFY_FILE = "notify.jsonl"      # `ttp notify` lines a run left for the user (
 NOTIFIES_PER_RUN = 3
 # What a waiting hand-off keeps across a run the account refused (limit, auth).
 WAIT_KEYS = ("retry_when", "retry_after_s", "waiting_for", "wake_tier", "next_step", "survives_reboot", "waits",
-             "waiting_since", "stale_wakes", "wait_key")
+             "waiting_since", "stale_wakes", "wait_key", "on_pass_cmd")
 MAX_FOLLOWUPS, FOLLOWUP_SPEC_CHARS = 12, 4000   # per hand-off; each follow-up is its own event
 # What a review the daemon queues repeats of the code task's spec and hand-off.
 AUTO_REVIEW_SPEC_CHARS, AUTO_REVIEW_SUMMARY_CHARS = 2000, 1000
@@ -102,6 +102,7 @@ PR_FIX_ROUNDS = 2
 PROBE_EVERY_S = 180     # how often a waiting task's `retry_when` (or a deferred one's `start_when`) probe runs
 NOT_YET_RCS = (1, 75, 255)   # probe exits meaning "not yet": 1, EX_TEMPFAIL (a busy `ttp lock`), ssh unreachable
 PROBE_TIMEOUT_S = 60
+ON_PASS_TIMEOUT_S, ON_PASS_DIR, ON_PASS_LOG = 600, "on_pass", "on_pass.log"   # a hand-off's on_pass_cmd
 AUTH_PROBE_S = 900      # while a provider without a login check is logged out, one run on it checks this often
 AUTH_CHECK_S = (60, 120, 300, 600, 1200, 1800)   # backoff of the model-free login checks of an open breaker
 ORPHAN_GRACE_S = 10     # TERM to KILL for an agent whose supervisor died
@@ -360,6 +361,8 @@ class Daemon:
         self._probe_rc: dict[int, tuple[int | str, float, str]] = {}   # last verdict: exit code or why, when, probe
         self._probe_files: dict[int, object] = {}   # id(probe proc) -> the file its output goes to
         self._probe_out: dict[int, tuple[str, float, str]] = {}   # task -> its probe's last output, unchanged since, probe
+        # running on_pass_cmd: task -> proc, started, timeout, its output dir, the waiting run's id, command
+        self._on_pass: dict[int, tuple[subprocess.Popen, float, float, Path, int, str]] = {}
         self._reboot_told = False
         self._boot_woken = False
         self._held: list[str] | None = None   # lock holders the heartbeat file last recorded
@@ -3884,6 +3887,7 @@ class Daemon:
         model run cannot make the probe pass) and raises one `wait_stale` event for the coordinator.
         Tasks with the same probe share its runs."""
         db, now = self.p.db, time.time()
+        self._poll_on_pass(now)
         outs: dict[int, str] = {}   # one read of a probe run's output, whichever tasks share it
         for tid, (proc, started, probe) in list(self._probes.items()):
             rc = proc.poll()
@@ -4429,7 +4433,99 @@ class Daemon:
             return
         if got:
             why += f"; its on_pass was not applied: {got[1]}"
+        else:
+            try:
+                started = self._start_on_pass(task, now)
+            except Exception as e:   # as above: a wake is always safe
+                started = f"it could not start: {type(e).__name__}: {e}"
+            if started is True:
+                return
+            if started:
+                why += f"; its on_pass_cmd was not run: {started}"
         self._wake_waiting(task, why, now)
+
+    def _start_on_pass(self, task: dict, now: float) -> bool | str | None:
+        """A passed probe of a hand-off naming an `on_pass_cmd`: run that command model-free from the
+        project root, in the background, and keep the task asleep while it runs (_poll_on_pass settles
+        it). True when it runs (or already ran from an earlier pass of the same probe), None when the
+        hand-off names none, else why it was not run."""
+        tid = task["id"]
+        if tid in self._on_pass:
+            return True
+        prev = load_result(task["result"])
+        cmd = prev.get("on_pass_cmd")
+        if task["status"] != "queued" or prev.get("status") != "waiting" or cmd is None:
+            return None
+        if not isinstance(cmd, str) or not cmd.strip():
+            return "on_pass_cmd is not a command"
+        r = self.p.db.one("SELECT * FROM runs WHERE task=? AND role!='coordinator' AND dir IS NOT NULL "
+                          "ORDER BY id DESC LIMIT 1", (tid,))
+        full = _read_result(Path(r["dir"]) / RESULT_FILE) if r and r["dir"] else None
+        if not full or full.get("status") != "waiting" or full.get("on_pass_cmd") != cmd \
+                or full.get("retry_when") != prev.get("retry_when"):
+            return "the task's last run's result.json is not the hand-off the task waits on"
+        out = Path(r["dir"]) / ON_PASS_DIR
+        shutil.rmtree(out, ignore_errors=True)   # a result from an earlier try must not count
+        out.mkdir(parents=True)
+        timeout = float((self.cfg.get("waiting") or {}).get("on_pass_timeout_s") or ON_PASS_TIMEOUT_S)
+        with open(out / ON_PASS_LOG, "wb") as f:
+            proc = subprocess.Popen(cmd, shell=True, cwd=str(self.p.root), stdin=subprocess.DEVNULL, stdout=f,
+                                    stderr=subprocess.STDOUT, start_new_session=True,
+                                    env={**self._probe_env(), "TTP_TASK": str(tid),
+                                         "TTP_RESULT": str(out / RESULT_FILE)})
+        self._on_pass[tid] = (proc, now, timeout, out, r["id"], cmd)
+        # Asleep while it runs: its timer must not start a model run meanwhile.
+        self.p.db.update_task(tid, not_before=max(task["not_before"] or 0, now + timeout + PROBE_TIMEOUT_S),
+                              blocked_reason=f"its probe passed; running its on_pass_cmd model-free "
+                                             f"(up to {timeout / 60:g} min)")
+        log(self.p, f"task {tid} retry_when probe passed; running its on_pass_cmd model-free (pid {proc.pid})")
+        return True
+
+    def _poll_on_pass(self, now: float) -> None:
+        """Settle finished (or overdue) on_pass commands. Exit 0 with a result.json at $TTP_RESULT that
+        says done with a summary is the task's hand-off, recorded through the normal finish (review and
+        push queue as usual) without a model run. Anything else wakes the task as any passed probe
+        does, with the command's exit and the end of its output."""
+        db = self.p.db
+        for tid, (proc, started, timeout, out, run_id, cmd) in list(self._on_pass.items()):
+            rc = proc.poll()
+            if rc is None and now - started < timeout:
+                continue
+            del self._on_pass[tid]
+            if rc is None:
+                _kill_group(proc)
+            task = db.task(tid)
+            prev = load_result(task["result"]) if task else {}
+            if not task or task["status"] != "queued" or prev.get("status") != "waiting" \
+                    or prev.get("on_pass_cmd") != cmd or prev.get("woke"):
+                continue   # cancelled, re-planned or woken meanwhile: this result is not its hand-off
+            try:
+                lines = (out / ON_PASS_LOG).read_text(errors="replace").splitlines()[-20:]
+            except OSError:
+                lines = []
+            tail = "\n".join(lines)[-1500:] or "(no output)"
+            result = _read_result(out / RESULT_FILE)
+            if rc is None:
+                why = f"timed out after {timeout / 60:g} min"
+            elif rc != 0:
+                why = f"exit {rc}"
+            elif not isinstance(result, dict):
+                why = "exit 0 but no result.json at $TTP_RESULT"
+            elif result.get("status") != "done":
+                why = f"its result.json says {str(result.get('status'))[:40]!r}, not done"
+            else:
+                why = on_pass_problem(result)
+            r = db.one("SELECT * FROM runs WHERE id=?", (run_id,))
+            if not why and r:
+                from .providers.base import RunUsage
+                self._probe_rc.pop(tid, None)
+                with db.tx():
+                    self._finish_worker(r, RunUsage(), "ok", Path(r["dir"]), "model-free", handoff=result)
+                log(self.p, f"task {tid} on_pass_cmd recorded done model-free")
+                continue
+            log(self.p, f"task {tid} on_pass_cmd did not record done: {why or 'its run is gone'}")
+            self._wake_waiting(task, f"probe passed; its on_pass_cmd did not record done "
+                                     f"({why or 'its run is gone'}); the end of its output:\n{tail}", now)
 
     def _checks_wait(self, task: dict) -> tuple | None:
         """What a passed `ttp checks --result <run dir>` probe of one of this task's runs settles:

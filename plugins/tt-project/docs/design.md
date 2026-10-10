@@ -56,6 +56,10 @@ in `state/runs/<id>/`, so a daemon restart never loses a result.
    progress: later wakes run light only, and after `waiting.max_stale_wakes` (3) the task is
    blocked for the coordinator to split or re-plan, and not woken again. The block, a requeue or
    a new spec starts the count over: the next run is at the task's own wake tier.
+   A passed probe needs no model run when the hand-off says what comes next: an `on_pass` (the
+   final hand-off, applied when the run's own detached checks passed on its head) or an
+   `on_pass_cmd`, run from the project root and killed after `waiting.on_pass_timeout_s`; its exit 0
+   with a `done` hand-off at `$TTP_RESULT` ends the task, anything else wakes it as usual.
 8. The project folder ignores itself; nothing of a project is ever committed to the user's repo.
 9. Secrets live only in `~/.tt-project/secrets.json` (0600). Never in argv, logs or projects.
 10. The runtime is standard-library Python ≥ 3.9. Web assets are static files.

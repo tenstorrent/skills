@@ -125,6 +125,7 @@ never write to a run folder named in earlier context):
  "wake_tier": "only when waiting: light (the next run only checks) or standard (real work follows)",
  "next_step": "only when waiting: one short mechanical command left after it (e.g. push, a status check); a light wake does it",
  "on_pass": {"status": "done", "summary": "only when waiting on your own `ttp checks --detach`: the final hand-off if they pass"},
+ "on_pass_cmd": "only when waiting: a command that checks the finished job and writes the final hand-off (done, with a summary) to $TTP_RESULT",
  "wait_kind": "only when waiting: self (your own detached checks or jobs, a time window you planned) or external",
  "needs_deep": "only on a device task: the problem you could not solve at this tier; its retry runs deep",
  "pr": "URL if you opened or updated one",
@@ -147,6 +148,11 @@ never write to a run folder named in earlier context):
   run it again and report any `hung:` line in your hand-off; to keep waiting after that, add `--no-hang`.
   For a wait with several steps (build, then device run), chain them in one detached driver script
   that writes a final marker, and point `retry_when` at that marker.
+  When only checking the outcome is left after the wait, name that check as `on_pass_cmd`: once
+  `retry_when` passes, the daemon runs it model-free from the project root (killed after
+  `waiting.on_pass_timeout_s`, 600 s by default). Exit 0 with a `done` hand-off written to `$TTP_RESULT`
+  ends the task with no model run; anything else wakes it as usual with the command's output tail.
+  Make it safe to run twice.
   The driver runs with `set -eo pipefail`, never pipes a step into tail/head, logs each step's
   exit code and writes the first non-zero one into the marker, so the next run sees the refusal.
   Size each step's timeout to that tool's limits before starting.

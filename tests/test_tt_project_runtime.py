@@ -19762,6 +19762,123 @@ def test_an_unclear_checks_wait_falls_back_to_a_light_wake(env, monkeypatch, tmp
     assert len(p.db.q("SELECT id FROM runs WHERE task=?", (tid,))) == 1
 
 
+def _on_pass_cmd_task(p, tmp_path, cmd, probe="true"):
+    """A task that handed off `waiting` on `probe` and named `cmd` to run once it passes."""
+    now = time.time()
+    tid = p.db.add_task("run the long job", "s", kind="work", tier="standard", origin="user")
+    run_dir = tmp_path / f"run-{tid}"
+    run_dir.mkdir()
+    p.db.x("INSERT INTO runs(task,role,provider,started,ended,status,dir) VALUES(?,?,?,?,?,?,?)",
+           (tid, "worker", "fake", now - 120, now - 60, "ok", str(run_dir)))
+    hand = {"status": "waiting", "summary": "job running", "waiting_for": "the job", "retry_after_s": 900,
+            "retry_when": probe, "on_pass_cmd": cmd}
+    (run_dir / "result.json").write_text(json.dumps(hand))
+    p.db.update_task(tid, status="queued", not_before=now + 3600,
+                     result=json.dumps({**hand, "waiting_since": now - 60}))
+    return tid, run_dir
+
+
+def _settle_on_pass(d, tid):
+    _settle_probe(d, tid)
+    if tid in d._on_pass:
+        d._on_pass[tid][0].wait(10)
+        d.probe_waiting()
+
+
+def test_an_on_pass_cmd_that_records_done_is_the_hand_off_without_a_model_run(env, monkeypatch, tmp_path):
+    p = make(env)
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    seen = tmp_path / "seen"
+    tid, run_dir = _on_pass_cmd_task(p, tmp_path, f"echo \"$PWD $TTP_TASK\" > {seen}; echo verifying; "
+                                     "printf '{\"status\":\"done\",\"summary\":\"job verified\","
+                                     "\"metrics\":{\"rows\":\"9\"}}' > \"$TTP_RESULT\"")
+    _settle_on_pass(d, tid)
+    task = p.db.task(tid)
+    res = json.loads(task["result"])
+    assert task["status"] == "done", (task["status"], task["blocked_reason"], res)
+    assert res["summary"] == "job verified" and res["run_status"] == "model-free" and res["metrics"] == {"rows": "9"}
+    assert seen.read_text().split() == [str(p.root), str(tid)]
+    assert "verifying" in (run_dir / "on_pass" / "on_pass.log").read_text()
+    assert len(p.db.q("SELECT id FROM runs WHERE task=?", (tid,))) == 1, "a model run was started"
+    ev = p.db.one("SELECT text FROM events WHERE kind='task_done' AND task=?", (tid,))
+    assert "run model-free" in ev["text"]
+    assert "on_pass_cmd recorded done model-free" in (p.logs / "daemon.log").read_text()
+    for _ in range(3):
+        d.tick()
+    assert len(p.db.q("SELECT id FROM runs WHERE task=?", (tid,))) == 1
+
+
+def test_an_on_pass_cmd_keeps_the_task_asleep_while_it_runs_and_runs_once(env, monkeypatch, tmp_path):
+    p = make(env)
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    tid, _ = _on_pass_cmd_task(p, tmp_path, "sleep 30")
+    _settle_probe(d, tid)
+    try:
+        proc = d._on_pass[tid][0]
+        assert not _ready(p, tid) and "on_pass_cmd" in p.db.task(tid)["blocked_reason"]
+        p.db.update_task(tid, not_before=time.time() - 1)   # its own timer runs out meanwhile
+        _settle_probe(d, tid)
+        assert d._on_pass[tid][0] is proc and p.db.task(tid)["status"] == "queued"
+        assert "woke" not in json.loads(p.db.task(tid)["result"])
+    finally:
+        dmod._kill_group(d._on_pass[tid][0])
+
+
+_TO_RESULT = ' > "$TTP_RESULT"'
+
+
+@pytest.mark.parametrize("cmd, why", [
+    ("""printf '{"status":"done","summary":"s"}'""" + _TO_RESULT + "; echo boom; exit 3", "exit 3"),
+    ("echo nothing written", "no result.json"),
+    ("""printf '{"status":"waiting","summary":"s"}'""" + _TO_RESULT, "not done"),
+    ("""printf '{"status":"needs_review","summary":"s"}'""" + _TO_RESULT, "not done"),
+    ("""printf '{"status":"done"}'""" + _TO_RESULT, "no summary"),
+    ("""printf '{"status":"done","summary":"s","retry_when":"true"}'""" + _TO_RESULT, "cannot carry"),
+    ("""printf 'not json'""" + _TO_RESULT, "no result.json"),
+    ("sleep 30", "timed out")])
+def test_an_on_pass_cmd_that_does_not_record_done_wakes_the_task(env, monkeypatch, tmp_path, cmd, why):
+    p = make(env)
+    from ttp import daemon as dmod
+    from ttp.prompts import worker_task
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    d.cfg["waiting"]["on_pass_timeout_s"] = 0.5
+    tid, _ = _on_pass_cmd_task(p, tmp_path, cmd)
+    _settle_probe(d, tid)
+    if why == "timed out":
+        time.sleep(0.6)
+    else:
+        d._on_pass[tid][0].wait(10)
+    d.probe_waiting()
+    task = p.db.task(tid)
+    res = json.loads(task["result"])
+    assert _ready(p, tid) and task["status"] == "queued" and task["attempts"] == 0, (task["status"], res)
+    assert "its on_pass_cmd did not record done" in res["woke"] and why in res["woke"], res["woke"]
+    if "boom" in cmd:
+        assert "boom" in worker_task(p, task, str(p.root), None)
+    assert len(p.db.q("SELECT id FROM runs WHERE task=?", (tid,))) == 1
+
+
+def test_an_on_pass_cmd_runs_only_for_the_hand_off_the_task_waits_on(env, monkeypatch, tmp_path):
+    p = make(env)
+    from ttp import daemon as dmod
+    from ttp.daemon import on_pass_problem
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    flag = tmp_path / "ran"
+    tid, run_dir = _on_pass_cmd_task(p, tmp_path, f"touch {flag}")
+    (run_dir / "result.json").write_text(json.dumps({"status": "done", "summary": "x"}))
+    _settle_on_pass(d, tid)
+    res = json.loads(p.db.task(tid)["result"])
+    assert _ready(p, tid) and not flag.exists()
+    assert "its on_pass_cmd was not run: the task's last run's result.json is not the hand-off" in res["woke"]
+    assert "cannot carry on_pass_cmd" in on_pass_problem({**DONE_ON_PASS, "on_pass_cmd": "true"})
+
+
 def test_on_pass_must_be_a_final_hand_off():
     from ttp.daemon import on_pass_problem
     assert on_pass_problem(DONE_ON_PASS) == ""
