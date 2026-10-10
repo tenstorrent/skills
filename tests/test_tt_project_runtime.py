@@ -38380,9 +38380,9 @@ def test_start_after_and_until_are_read_and_shown_in_the_home_zone(env):
     from zoneinfo import ZoneInfo
     after = deferral(t)["after"]
     assert datetime.fromtimestamp(after, ZoneInfo(la)).strftime("%Y-%m-%dT%H:%M") == soon
-    assert re.search(r"starts \d{4}-\d\d-\d\d 09:00 P[DS]T", coord.starts_text(t, tz=la))
+    assert re.search(r"starts \d{4}-\d\d-\d\d 09:00 P[DS]T", coord.starts_text(t, where=la))
     assert re.search(r"starts \d{4}-\d\d-\d\d 09:00 P[DS]T", coord.digest(p, {}, [], []))
-    assert anchors.describe("until", str(_utc(2026, 7, 1, 16, 0)), tz=la) == "waits until 2026-07-01 09:00 PDT"
+    assert anchors.describe("until", str(_utc(2026, 7, 1, 16, 0)), where=la) == "waits until 2026-07-01 09:00 PDT"
 
 
 def test_digest_daily_review_and_prompt_headers_carry_the_home_zone(env):
