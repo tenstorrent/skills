@@ -30589,6 +30589,25 @@ def test_names_branch_matches_the_whole_word_pattern_it_replaces():
     assert not names_branch("anything", "") and not names_branch("anything", None)
 
 
+def test_branch_index_finds_the_same_tasks_as_names_branch_one_by_one():
+    import random
+    from ttp.db import BranchIndex, names_branch, reviewed_ids
+    rng = random.Random(11)
+    parts = ["ttp/t12-fix", "ttp/t1-fix", "fix", "a", "_", "/", ".", "-", " ", "\n", "\x1c", "é", "٣", "x", "`",
+             ":", ",", "(", ")", "a b", "a.b"]
+    branches = ["ttp/t12-fix", "ttp/t1-fix", "fix", "t1", "a.b", "-x", "x.", ".x", "/", "a b", "fix,", "`fix`"]
+    tasks = [{"id": i, "branch": b} for i, b in enumerate(branches)] + [{"id": 99, "branch": "fix"},
+                                                                         {"id": 98, "branch": None}]
+    index = BranchIndex(tasks)
+    for _ in range(20000):
+        spec = "".join(rng.choice(parts) for _ in range(rng.randint(0, 10)))
+        want = {t["id"] for t in tasks if names_branch(spec, t["branch"])}
+        assert index.named(spec) == want, spec
+        assert reviewed_ids({"spec": spec}, tasks) == want, spec
+    assert reviewed_ids({"title": "Review #3", "spec": "fix"}, index) == {3}
+    assert reviewed_ids({"title": "Review #77", "spec": "fix"}, index) == set()
+
+
 def test_a_review_only_stack_stays_review_only_through_its_fix_and_the_push_queue_ignores_its_approval(
         env, monkeypatch):
     from ttp import push, pushq

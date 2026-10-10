@@ -627,14 +627,52 @@ def reviews_task(review: dict, task: dict) -> bool:
     return names_branch(review.get("spec") or "", task.get("branch"))
 
 
-def reviewed_ids(review: dict, tasks: list[dict]) -> set[int]:
+_INNER_EDGE = re.compile(r"[^\w/-]")  # a character a branch named inside a word can end before
+_START_AFTER = re.compile(r"[^\w/.-]")  # a character a branch named inside a word can start after
+
+
+class BranchIndex:
+    """Tasks by branch, to find the ones a text names (see names_branch) in one scan of the text rather
+    than one search per task: a named branch has no whitespace, so it is a whole word of the text or a
+    part of one cut at its punctuation. Branches with whitespace are searched one by one."""
+
+    def __init__(self, tasks: list[dict]):
+        self.tasks = tasks
+        self.ids = {t["id"] for t in tasks}
+        self.by_branch: dict[str, list[int]] = {}
+        self.spaced: list[dict] = []
+        for t in tasks:
+            if b := t.get("branch"):
+                self.by_branch.setdefault(b, []).append(t["id"])
+                if any(c.isspace() for c in b):
+                    self.spaced.append(t)
+        self.maxlen = max(map(len, self.by_branch), default=0)
+
+    def named(self, spec: str) -> set[int]:
+        out = {t["id"] for t in self.spaced if names_branch(spec, t["branch"])}
+        get, maxlen = self.by_branch.get, self.maxlen
+        for w in spec.split():
+            if ids := get(w):
+                out.update(ids)
+            if not _INNER_EDGE.search(w):
+                continue
+            starts = [0] + [m.end() for m in _START_AFTER.finditer(w)]
+            ends = [m.start() for m in _INNER_EDGE.finditer(w)] + [len(w)]
+            for i in starts:
+                for j in ends:
+                    if i < j <= i + maxlen and (i, j) != (0, len(w)) and (ids := get(w[i:j])):
+                        out.update(ids)
+        return out
+
+
+def reviewed_ids(review: dict, tasks: list[dict] | BranchIndex) -> set[int]:
     """The ids of `tasks` that `review` reviews (see reviews_task), in one pass that reads its subject
-    once."""
+    once. Pass a BranchIndex when checking many reviews against the same tasks."""
+    index = tasks if isinstance(tasks, BranchIndex) else BranchIndex(tasks)
     subject = review_subject(review)
     if subject is not None:
-        return {t["id"] for t in tasks if t["id"] == subject}
-    spec = review.get("spec") or ""
-    return {t["id"] for t in tasks if names_branch(spec, t.get("branch"))}
+        return {subject} & index.ids
+    return index.named(review.get("spec") or "")
 
 
 def names_branch(spec: str, branch: str | None) -> bool:

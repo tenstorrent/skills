@@ -19,8 +19,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import locks, push
-from .db import (TERMINAL_TASK_STATES, continues_id, dependency_ids, dump_result, load_result, review_subject,
-                 reviewed_ids)
+from .db import (TERMINAL_TASK_STATES, BranchIndex, continues_id, dependency_ids, dump_result, load_result,
+                 review_subject, reviewed_ids)
 from .project import Project, nice_level, push_allowed, push_queue_on, renice, write_json
 
 REF_PREFIX = "refs/ttp/push/"   # + row id: pins the approved commit until its row is settled
@@ -205,7 +205,8 @@ def _verdicts(db, review: dict, branches: set[str], now: float) -> tuple[dict[in
     leaving out `review` itself and the tasks it covers: ({failed task: its review}, {passed tasks},
     {task: branch})."""
     code = db.q("SELECT id, branch, labels FROM tasks WHERE kind='code' AND branch IS NOT NULL AND branch!=''")
-    own = _covers(db, review, [{"branch": b} for b in branches], code)
+    index = BranchIndex(code)
+    own = _covers(db, review, [{"branch": b} for b in branches], index)
     reviews = db.q("SELECT * FROM tasks WHERE kind='review' AND status IN ('done','pushing','failed') AND id!=? "
                    "AND updated>=? ORDER BY id DESC", (review["id"], now - INHERIT_WINDOW_S))
     rows: dict[int, list[dict]] = {}
@@ -214,7 +215,7 @@ def _verdicts(db, review: dict, branches: set[str], now: float) -> tuple[dict[in
         rows.setdefault(r["task"], []).append(r)
     failed, passed, seen = {}, set(), set(own)
     for r in reviews:
-        for tid in _covers(db, r, rows.get(r["id"], []), code) - seen:
+        for tid in _covers(db, r, rows.get(r["id"], []), index) - seen:
             seen.add(tid)
             if r["status"] == "failed":
                 failed[tid] = r["id"]
@@ -851,7 +852,7 @@ def _settle(p: Project, tid: int, b: dict, m: dict, now: float) -> None:
 
 
 # reviewed code tasks ------------------------------------------------------------------------------
-def _covers(db, review: dict, rows: list[dict], code: list[dict] | None = None) -> set[int]:
+def _covers(db, review: dict, rows: list[dict], code: list[dict] | BranchIndex | None = None) -> set[int]:
     """The tasks whose work a review's push ships: its parent and dependencies, the task its title or
     label names, the code tasks whose branch it pushed or (naming no subject) its spec names, and the
     tasks each of those continues (a fix carries the change it fixes)."""
@@ -860,7 +861,8 @@ def _covers(db, review: dict, rows: list[dict], code: list[dict] | None = None) 
     branches = {r["branch"] for r in rows if r["branch"]}
     if code is None:
         code = db.q("SELECT id, branch, labels FROM tasks WHERE kind='code' AND branch IS NOT NULL AND branch!=''")
-    ids |= {t["id"] for t in code if t["branch"] in branches} | reviewed_ids(review, code)
+    index = code if isinstance(code, BranchIndex) else BranchIndex(code)
+    ids |= {i for b in branches for i in index.by_branch.get(b, ())} | reviewed_ids(review, index)
     out: set[int] = set()
     while ids:
         i = ids.pop()
@@ -883,7 +885,8 @@ def settle_reviewed(db, now: float | None = None, only: set[int] | None = None) 
     if not todo:
         return []
     since = db.review_since()
-    code = db.q("SELECT id, branch, labels FROM tasks WHERE kind='code' AND branch IS NOT NULL AND branch!=''")
+    code = BranchIndex(db.q("SELECT id, branch, labels FROM tasks WHERE kind='code' AND branch IS NOT NULL "
+                            "AND branch!=''"))
     reviews = db.q("SELECT * FROM tasks WHERE kind='review' AND status!='cancelled' AND id>? ORDER BY id DESC",
                    (min(t["id"] for t in todo),))
     rows: dict[int, list[dict]] = {}
