@@ -72,7 +72,7 @@ class Verdict:
 
 def screen(db: DB, cfg: dict, source: str, text: str, hint: str | None = None, jev=None,
            rewake_after_s: float | None = None, repeat: bool = False, lifecycle: str | None = None,
-           whole: bool = False) -> Verdict:
+           whole: bool = False, key: str | None = None) -> Verdict:
     """Record the observation as an issue and say whether the coordinator should wake for it.
 
     A known open issue wakes again when `repeat` is set (the watcher says each report is a new
@@ -80,16 +80,18 @@ def screen(db: DB, cfg: dict, source: str, text: str, hint: str | None = None, j
     spell). Without either, a known open issue stays quiet. An observation an active mute covers
     is recorded and counted but never wakes (see mute). `lifecycle` (RECEIPT or ERROR, from a
     receipt source) is kept on the issue with its subject; see settle_receipts. `whole` (a watcher's JSON
-    line) keeps the line as one condition: its text is never split at '; '."""
-    v = _screen(db, cfg, source, text, hint, jev, rewake_after_s, repeat, lifecycle, whole)
-    m = count_muted(db, source, text, v.severity, whole=whole)
+    line) keeps the line as one condition: its text is never split at '; '. `key` (a watcher JSON line's
+    "key" field) is the issue's identity instead of its text: the text may change without a new issue."""
+    v = _screen(db, cfg, source, text, hint, jev, rewake_after_s, repeat, lifecycle, whole, key)
+    m = count_muted(db, source, text, v.severity, whole=whole, key=key)
     if m and v.wake:
         v.wake, v.reason = False, f"muted ({v.reason})"
     return v
 
 
 def _screen(db: DB, cfg: dict, source: str, text: str, hint: str | None, jev,
-            rewake_after_s: float | None, repeat: bool, lifecycle: str | None = None, whole: bool = False) -> Verdict:
+            rewake_after_s: float | None, repeat: bool, lifecycle: str | None = None, whole: bool = False,
+            key: str | None = None) -> Verdict:
     now = time.time()
     floor = SEVERITY_RANK.get(cfg.get("screen", {}).get("wake_min_severity", "normal"), 1)
     judged: list[tuple[str, str, str, dict]] = []
@@ -99,6 +101,12 @@ def _screen(db: DB, cfg: dict, source: str, text: str, hint: str | None, jev,
             judged.append(_judge(db, cfg, source, text, hint, jev, floor))
         return judged[0]
 
+    if key:
+        title = _first_line(text)[:160] or source
+        v = _issue(db, key_fingerprint(source, key), source, title, title, hint, judge, floor, now,
+                   rewake_after_s, repeat, lifecycle)
+        v.jev_out_of_funds = any(j[3].get("jev_out_of_funds") for j in judged)
+        return v
     conditions = watcher_conditions(source, text, whole)
     if conditions is None:
         title = text.strip().splitlines()[0][:160] if text.strip() else source
@@ -289,13 +297,24 @@ def error_source(source: str) -> str:
     return "watcher-error:" + source.split(":", 1)[1]
 
 
+def _first_line(text: str) -> str:
+    return text.strip().splitlines()[0].strip() if text.strip() else ""
+
+
+def key_fingerprint(source: str, key: str) -> str:
+    return hashlib.sha1(f"{source}\nkey\n{normalize(key)}".encode()).hexdigest()[:16]
+
+
 def watcher_conditions(source: str, text: str, whole: bool = False) -> list[tuple[str, str, bool]] | None:
-    """(subject, item, cleared) for each item of a one-line command-watcher observation; None for
-    anything else, which keeps one issue per normalized text. `whole` (a JSON line, one observation)
-    keeps the line as one item: it is never split at '; ', and its title is truncated instead."""
+    """(subject, item, cleared) for each item of a command-watcher observation; None for anything
+    else, which keeps one issue per normalized text. `whole` (a JSON line, one observation) keeps the
+    line as one item: it is never split at '; ', and its title is truncated instead. A multi-line
+    observation is one item keyed by its first line, so a change in the lines below it opens no new issue."""
     line = text.strip()
-    if not source.startswith("watcher:") or not line or "\n" in line:
+    if not source.startswith("watcher:") or not line:
         return None
+    if "\n" in line:
+        line, whole = _first_line(line), True
     subject, rest = "", line
     if ": " in line:
         head, tail = line.split(": ", 1)
@@ -473,7 +492,7 @@ def mutes(db: DB, now: float | None = None) -> list[dict]:
 
 
 def count_muted(db: DB, source: str, text: str, severity: str, now: float | None = None,
-                whole: bool = False) -> dict | None:
+                whole: bool = False, key: str | None = None) -> dict | None:
     """The active mute covering this observation, after counting it there and tracking how long each
     of its conditions has persisted; None when none does."""
     now = time.time() if now is None else now
@@ -486,15 +505,18 @@ def count_muted(db: DB, source: str, text: str, severity: str, now: float | None
             if (float(m["until"]) > now and m["source"].lower() == source.lower() and m["match"].lower() in low
                     and rank < SEVERITY_RANK[m["below"]]):
                 m["count"], m["last_at"] = int(m["count"]) + 1, now
-                _track(db, m, source, text, now, whole)
+                _track(db, m, source, text, now, whole, key)
                 db.set_kv(MUTES_KEY, active)
                 return m
     return None
 
 
-def _mute_conditions(m: dict, source: str, text: str, whole: bool = False) -> list[tuple[str, str, bool]]:
+def _mute_conditions(m: dict, source: str, text: str, whole: bool = False,
+                     key: str | None = None) -> list[tuple[str, str, bool]]:
     """(key, text, cleared) for each condition of an observation `m` covers: the items of a command-watcher
     line that contain the match (all of them when only the whole line does), else the whole text."""
+    if key:
+        return [(key_fingerprint(source, key), _first_line(text)[:160] or source, False)]
     items = watcher_conditions(source, text, whole)
     if items is None:
         return [(fingerprint(source, text), text.strip().splitlines()[0][:160] if text.strip() else source, False)]
@@ -503,13 +525,14 @@ def _mute_conditions(m: dict, source: str, text: str, whole: bool = False) -> li
     return [c for c in out if m["match"].lower() in c[1].lower()] or out
 
 
-def _track(db: DB, m: dict, source: str, text: str, now: float, whole: bool = False) -> None:
+def _track(db: DB, m: dict, source: str, text: str, now: float, whole: bool = False,
+           key: str | None = None) -> None:
     """Start, continue or clear the clock of each condition this muted observation reports, and queue
     the one high event for each that persisted past the mute's escalate_after_h."""
     conds = m.setdefault("conds", {})
     armed = float(m.get("armed_at") or m["since"])
     esc_h = float(m.get("escalate_after_h", MUTE_ESCALATE_H))
-    for key, item, cleared in _mute_conditions(m, source, text, whole):
+    for key, item, cleared in _mute_conditions(m, source, text, whole, key):
         c = conds.get(key)
         if cleared:
             if c:

@@ -2734,7 +2734,8 @@ class Daemon:
                 n += 1
                 continue
             self.observe(errors if error else source, body, obs.get("severity"), rewake_after_s=rewake,
-                         repeat=obs.get("repeat") is True, lifecycle=kind, whole=whole)
+                         repeat=obs.get("repeat") is True, lifecycle=kind, whole=whole,
+                         key=obs.get("key") if isinstance(obs.get("key"), str) and obs["key"].strip() else None)
             if not error and obs.get("machine") and obs.get("condition"):
                 self._machine_condition(obs, body)
             if kind == scr.RECEIPT:
@@ -2832,10 +2833,12 @@ class Daemon:
                               (since, since, json.dumps([schedule]))))
 
     def observe(self, source: str, text: str, hint: str | None = None, rewake_after_s: float | None = None,
-                repeat: bool = False, lifecycle: str | None = None, whole: bool = False) -> None:
+                repeat: bool = False, lifecycle: str | None = None, whole: bool = False,
+                key: str | None = None) -> None:
         if not text.strip():
             return
-        again = {"rewake_after_s": rewake_after_s, "repeat": repeat, "lifecycle": lifecycle, "whole": whole}
+        again = {"rewake_after_s": rewake_after_s, "repeat": repeat, "lifecycle": lifecycle, "whole": whole,
+                 "key": key}
         v = scr.screen(self.p.db, self.cfg, source, text, hint, jev=self.jev, **again)
         if v.jev_out_of_funds:
             self.alert("jev-funds", JEV_FUNDS_TEXT, "high")

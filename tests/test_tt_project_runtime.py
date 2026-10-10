@@ -2202,6 +2202,36 @@ def test_command_watcher_info_lines_are_logged_only_and_json_lines_are_never_spl
     assert p.db.one("SELECT COUNT(*) AS n FROM issues WHERE source='watcher:hw2'")["n"] == 2
 
 
+def test_command_watcher_multi_line_observations_key_by_first_line_or_explicit_key(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dm
+    out = {"stdout": ""}
+    monkeypatch.setattr(dm.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, out["stdout"], ""))
+    d = dm.Daemon(p.base)
+
+    def run(name):
+        d._run_command_watcher({"name": name}, {"command": "x"})
+        return p.db.q("SELECT title, count FROM issues WHERE source=?", (f"watcher:{name}",))
+
+    # A multi-line block is keyed by its first line: a changed item below it is the same issue, no new wake.
+    out["stdout"] = "stale jobs on box-a\n- job-1 idle\n- job-2 idle"
+    assert len(run("jobs")) == 1
+    woke = p.db.one("SELECT COUNT(*) AS n FROM events WHERE kind='observation'")["n"]
+    out["stdout"] = "stale jobs on box-a\n- job-1 idle\n- job-3 idle"
+    rows = run("jobs")
+    assert len(rows) == 1 and rows[0]["count"] == 2 and rows[0]["title"] == "stale jobs on box-a"
+    assert p.db.one("SELECT COUNT(*) AS n FROM events WHERE kind='observation'")["n"] == woke
+    # An explicit "key" is the identity: a changed text keeps the issue, a different key opens another.
+    line = lambda text, key: json.dumps({"text": text, "severity": "high", "key": key})
+    out["stdout"] = line("queue: 3 waiting (job-1, job-2, job-3)", "queue-backlog")
+    assert len(run("q")) == 1
+    out["stdout"] = line("queue: 5 waiting (job-4, job-5)", "queue-backlog")
+    rows = run("q")
+    assert len(rows) == 1 and rows[0]["count"] == 2 and rows[0]["title"].startswith("queue: 5 waiting")
+    out["stdout"] = line("queue: stuck runner", "queue-stuck")
+    assert len(run("q")) == 2
+
+
 def test_watcher_conditions_keep_one_issue_each_and_close_when_cleared(env):
     p = make(env)
     from ttp import screen as scr
