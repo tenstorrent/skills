@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from . import jevuse
+from . import jevuse, timefmt
 from .db import DB, SEVERITY_RANK
 from .providers.jev import JevOutOfFunds
 
@@ -593,8 +593,9 @@ def mute_ages(m: dict, now: float | None = None) -> list[str]:
             for c in sorted(live, key=lambda c: float(c["first_at"]))]
 
 
-def expire_mutes(db: DB, now: float | None = None) -> list[dict]:
-    """End the mutes whose time is up, queuing one summary observation event for each."""
+def expire_mutes(db: DB, now: float | None = None, where: Any = None) -> list[dict]:
+    """End the mutes whose time is up, queuing one summary observation event for each. Clock times
+    are in the zone of `where` (the project; None is UTC)."""
     now = time.time() if now is None else now
     with db.tx():
         active = db.kv(MUTES_KEY, []) or []
@@ -604,7 +605,7 @@ def expire_mutes(db: DB, now: float | None = None) -> list[dict]:
         db.set_kv(MUTES_KEY, [m for m in active if float(m["until"]) > now])
         for m in done:
             n = int(m["count"])
-            seen = (f"{n} observation{'' if n == 1 else 's'}, last at {_when(m['last_at'])}" if n
+            seen = (f"{n} observation{'' if n == 1 else 's'}, last at {_when(m['last_at'], where)}" if n
                     else "no observations")
             db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
                  (now, m["source"], "observation", "info",
@@ -613,11 +614,11 @@ def expire_mutes(db: DB, now: float | None = None) -> list[dict]:
     return done
 
 
-def mute_line(m: dict, now: float | None = None) -> str:
-    """One line for the digest and `ttp status`."""
+def mute_line(m: dict, now: float | None = None, where: Any = None) -> str:
+    """One line for the digest and `ttp status`, its clock time in the zone of `where` (the project)."""
     now = time.time() if now is None else now
     n = int(m["count"])
-    seen = f"{n} muted, last at {_when(m['last_at'])}" if n else "none muted yet"
+    seen = f"{n} muted, last at {_when(m['last_at'], where)}" if n else "none muted yet"
     ages = mute_ages(m, now)
     esc = float(m.get("escalate_after_h", MUTE_ESCALATE_H))
     return (f"{m['source']} {m['match']!r} below {m['below']}: {seen}; "
@@ -634,5 +635,5 @@ def _hours(m: dict) -> str:
     return f"{(float(m['until']) - float(m['since'])) / 3600:.1f}".rstrip("0").rstrip(".")
 
 
-def _when(ts: Any) -> str:
-    return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(ts))) if ts else "-"
+def _when(ts: Any, where: Any = None) -> str:
+    return timefmt.long(float(ts), where) if ts else "-"

@@ -76,6 +76,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Callable
 
+from . import timefmt
 from .db import DB
 from .project import command_env
 
@@ -546,7 +547,7 @@ def _escalate(host: Any, name: str, spec: dict, st: dict, now: float, why: str) 
             f"Fix: {fix}\n"
             + (f"Last fix (exit {st.get('fix_rc')}): {st.get('fix_out') or '(no output)'}\n"
                if st.get("fix_rc") is not None else "")
-            + f"Unhealthy since {time.strftime('%Y-%m-%d %H:%M', time.localtime(float(st['since'])))}.\n"
+            + f"Unhealthy since {timefmt.long(float(st['since']), host.p)}.\n"
             + ("The check reports a non-outage finding: the box or resource is up.\n" if st.get("finding") else "")
             + "\n"
             "Find the cause and repair it within the charter's restrictions, then make sure the check "

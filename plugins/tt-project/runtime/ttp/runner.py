@@ -49,7 +49,7 @@ import traceback
 from pathlib import Path
 
 from . import poll_s
-from .project import durable_write, lower_priority
+from .project import Project, durable_write, lower_priority
 
 LEASE_EVERY_S = 30
 KILL_AFTER_S = 30
@@ -550,6 +550,7 @@ def _take_exclusive(run_dir: Path, wanted: list[dict], env: dict, deadline: floa
     task = f"task #{env.get('TTP_TASK') or '?'}"
     who = f"{task} (run {env.get('TTP_RUN_ID') or '?'}), whole run"
     held, told, asked = [], 0.0, set()
+    where = Project(env["TTP_PROJECT"]) if env.get("TTP_PROJECT") else None   # holders' times in its zone
     for res in wanted:
         paths = [Path(x) for x in res["paths"]]
         mark = Path(res["reserve"]) if res.get("reserve") else None
@@ -580,7 +581,7 @@ def _take_exclusive(run_dir: Path, wanted: list[dict], env: dict, deadline: floa
             if time.time() - told >= 120:
                 with open(run_dir / "progress.md", "a") as pf:
                     pf.write(f"{time.strftime('%H:%M:%S')} waiting for {res['resource']} "
-                             f"(held by {', '.join(locks.holders(paths)) or 'another task'})\n")
+                             f"(held by {', '.join(locks.holders(paths, where)) or 'another task'})\n")
                 told = time.time()
             time.sleep(poll_s(2))
     return held

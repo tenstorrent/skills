@@ -637,7 +637,7 @@ class Daemon:
         self._refresh_meters()
         self.update_gates()
         coord.expire_asks(self.p, hold=any(g.level == "red" for g in self.gates.values()))
-        scr.expire_mutes(self.p.db)
+        scr.expire_mutes(self.p.db, where=self.p)
         self.sweep_watcher_issues()
         self.review_jev()
         settling = self.settling()
@@ -2928,7 +2928,7 @@ class Daemon:
         started = float(last["started"] or 0) if last else 0.0
         if now - started < hours * 3600 or int((db.kv(STALL_KEY) or {}).get("run", -1)) == last_id:
             return   # a worker run started meanwhile, or this stall was raised already
-        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(started)) if last else "never"
+        when = timefmt.long(started, self.p) if last else "never"
         lines = [f"#{t['id']} {t['title'][:60]} (ready {(now - self._stall_ready[t['id']]) / 3600:.1f} h)"
                  for t in stuck]
         more = f" (+{len(lines) - STALL_LIST_MAX} more)" if len(lines) > STALL_LIST_MAX else ""

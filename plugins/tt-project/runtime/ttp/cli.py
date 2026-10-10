@@ -743,7 +743,7 @@ def status_text(p: Project) -> str:
                      + f" — resume: ttp resume {p.name} --resource {pr['resource']}")
     from . import locks, shared
     for res in sorted(shared.names(p.config())):
-        who = locks.held(shared.root() / res)
+        who = locks.held(shared.root() / res, p)
         lines.append(f"shared {res}: " + ("; ".join(w.split(": ", 1)[-1] for w in who) if who else "free"))
     for res, got in shared.mismatches(p).items():
         lines.append(f"shared {res}: projects give different slot counts ("
@@ -775,7 +775,7 @@ def status_text(p: Project) -> str:
         lines.append(h["coverage"])
     from . import screen as scr
     for m in scr.mutes(db, now):
-        lines.append(f"muted: {scr.mute_line(m, now)}")
+        lines.append(f"muted: {scr.mute_line(m, now, p)}")
     if h.get("host"):
         lines.append(h["host"])
     if h.get("idle_sleep"):
@@ -1616,7 +1616,7 @@ def cmd_lock(a) -> None:
             sys.exit(75)
         free = lk.probe(where, res, paths)
         n, who_r = len(lk.queued(where, res)), lk.reserved_by(lk.reserve_path(where, res))
-        print(f"{a.resource}: " + ("free" if free else f"busy (held by {', '.join(lk.holders(paths)) or 'nobody'}"
+        print(f"{a.resource}: " + ("free" if free else f"busy (held by {', '.join(lk.holders(paths, p)) or 'nobody'}"
                                                       f"; {n} waiting{f'; reserved for {who_r}' if who_r else ''})"))
         sys.exit(0 if free else 75)
     who = shared.holder(p, res, f"task #{os.environ.get('TTP_TASK') or '?'} "
@@ -1718,7 +1718,7 @@ def cmd_lock(a) -> None:
         if time.time() - told >= 120:
             ahead = len(lk.queued(where, res)) - 1
             line = (f"waiting for {a.resource} (reserved for {reserved})" if reserved else
-                    f"waiting for {a.resource} (held by {', '.join(lk.holders(paths)) or 'another task'}"
+                    f"waiting for {a.resource} (held by {', '.join(lk.holders(paths, p)) or 'another task'}"
                     f"{f'; {ahead} ahead in queue' if ahead > 0 else ''})")
             print(f"ttp lock: {line}", file=sys.stderr, flush=True)
             if run_dir:
@@ -2634,7 +2634,7 @@ def cmd_upgrade(a) -> None:
     if held is None:
         if a.auto:
             release.finish(p, "held", why="another upgrade is running")
-        who = locks.holders([release.upgrade_lock(p)])
+        who = locks.holders([release.upgrade_lock(p)], p)
         die(f"upgrade refused: another upgrade of {p.name} is running"
             + (f" ({who[0]})" if who else "") + "; nothing was changed", 75)
     try:

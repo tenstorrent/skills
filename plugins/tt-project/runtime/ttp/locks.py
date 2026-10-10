@@ -28,6 +28,7 @@ import subprocess
 import time
 from pathlib import Path
 
+from . import timefmt
 from .project import durable_write, zombie
 
 RESERVE_STALE_S = 120
@@ -85,7 +86,8 @@ def any_free(paths: list[Path]) -> bool:
     return False
 
 
-def holders(paths: list[Path]) -> list[str]:
+def holders(paths: list[Path], where=None) -> list[str]:
+    """Each slot's holder label and since when, in the zone of `where` (the project; None is UTC)."""
     out = []
     for path in paths:
         try:
@@ -93,7 +95,7 @@ def holders(paths: list[Path]) -> list[str]:
         except (OSError, ValueError):
             continue
         if h:
-            out.append(f"{h.get('holder')} since {time.strftime('%H:%M', time.localtime(h.get('since', 0)))}")
+            out.append(f"{h.get('holder')} since {timefmt.short(float(h.get('since') or 0), where)}")
     return out
 
 
@@ -114,9 +116,9 @@ def held_labels(paths: list[Path]) -> list[str]:
     return out
 
 
-def held(locks_dir: Path) -> list[str]:
+def held(locks_dir: Path, where=None) -> list[str]:
     """Who holds each resource right now, and who has one reserved: "device: task #3 (run 9) since
-    10:02". A slot file keeps its label after release, so only slots whose lock is taken count;
+    10:02 PDT" (in the zone of `where`, the project). A slot file keeps its label after release, so only slots whose lock is taken count;
     testing takes a free one for an instant, which a `ttp lock` trying then just retries."""
     out, locks_dir = [], Path(locks_dir)
     try:
@@ -134,7 +136,7 @@ def held(locks_dir: Path) -> list[str]:
                     pass
         except OSError:
             continue
-        out += [f"{path.name.rsplit('.', 2)[0]}: {h}" for h in holders([path])]
+        out += [f"{path.name.rsplit('.', 2)[0]}: {h}" for h in holders([path], where)]
     for path in marks:
         who = reserved_by(path)
         if who:

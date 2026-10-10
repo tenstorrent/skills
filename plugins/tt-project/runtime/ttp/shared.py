@@ -66,9 +66,9 @@ def holder(p, res: str, who: str, cfg: dict | None = None) -> str:
 
 def held(p, cfg: dict | None = None) -> list[str]:
     """Who holds each of the project's resources right now, shared ones included."""
-    out = locks.held(p.state / "locks")
+    out = locks.held(p.state / "locks", p)
     for res in sorted(names(cfg if cfg is not None else p.config())):
-        out += locks.held(root() / res)
+        out += locks.held(root() / res, p)
     return out
 
 

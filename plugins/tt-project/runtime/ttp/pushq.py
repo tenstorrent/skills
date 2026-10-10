@@ -499,7 +499,7 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
         return [], "the push resource is paused"
     st = _state(db)
     if float(st.get("backoff_until") or 0) > now:
-        return [], f"backing off until {time.strftime('%H:%M', time.localtime(st['backoff_until']))}"
+        return [], f"backing off until {_at(float(st['backoff_until']), now, p)}"
     if not locks.any_free(push.lock_paths(p, remote, branch)) or any(
             not locks.any_free([x]) for x in sorted((p.state / "locks").glob("push:run-*.lock"))):
         return [], "another push holds its turn"

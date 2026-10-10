@@ -675,7 +675,7 @@ class Batch:
         self.target_lock = push.take(self.p, self.remote, self.branch, 0, say=lambda _m: None,
                                      who=f"push batch {self.id}")
         if self.target_lock is None:
-            who = ", ".join(locks.holders(push.lock_paths(self.p, self.remote, self.branch))) or "another push"
+            who = ", ".join(locks.holders(push.lock_paths(self.p, self.remote, self.branch), self.p)) or "another push"
             return self._all("requeued", "busy", f"{push.lock_name(self.remote, self.branch)} is busy (held by {who})")
         why = push.refusal(self.repo, self.remote, self.branch, push.allow_protected(self.d))
         if why.startswith("refusing"):

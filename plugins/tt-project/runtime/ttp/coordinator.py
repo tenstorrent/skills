@@ -520,7 +520,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     lines = ["## Muted observations (recorded and counted, never wake you; one high event if a condition "
              "persists past its ask time; one summary event when each ends)"] if muted else []
     for m in muted:
-        lines.append(f"- {clip(scr.mute_line(m, now), MUTE_CHARS)}")
+        lines.append(f"- {clip(scr.mute_line(m, now, p), MUTE_CHARS)}")
     section("muted", lines, json.dumps([[m["source"], m["match"], m["below"], m["until"], m.get("why")] for m in muted]),
             "## Muted observations (as last turn; never wake you): "
             + "; ".join(f"{m['source']} {m['match']!r}: {int(m['count'])} muted, "

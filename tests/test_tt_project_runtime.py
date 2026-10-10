@@ -38102,7 +38102,17 @@ def test_ttp_new_records_this_machines_zone_and_status_shows_times_in_it(env, mo
     assert re.search(r" · \d{4}-\d\d-\d\d \d\d:\d\d P[DS]T$", head), head
 
 
-def test_a_los_angeles_project_on_a_utc_box_shows_pdt_or_pst_in_every_surface(env, monkeypatch):
+@pytest.fixture
+def utc_box():
+    """The process runs on UTC for the test, and on the zone it had again after it."""
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("TZ", "UTC")
+        time.tzset()
+        yield
+    time.tzset()
+
+
+def test_a_los_angeles_project_on_a_utc_box_shows_pdt_or_pst_in_every_surface(env, utc_box):
     """The process runs on UTC, the project's home zone is America/Los_Angeles: ttp status, the web
     app's JSON and its client-side clock, alert and wait texts and the coordinator's digest (what its
     chat replies are written from) all show Pacific time with its abbreviation, never UTC."""
@@ -38111,8 +38121,6 @@ def test_a_los_angeles_project_on_a_utc_box_shows_pdt_or_pst_in_every_surface(en
     from ttp import coordinator as coord
     from ttp.cli import status_text
     from ttp.db import host_line
-    monkeypatch.setenv("TZ", "UTC")
-    time.tzset()
     p = make(env)
     p.set_config("home_timezone", "America/Los_Angeles")
     db, now = p.db, time.time()
@@ -38161,6 +38169,69 @@ def test_a_los_angeles_project_on_a_utc_box_shows_pdt_or_pst_in_every_surface(en
                            capture_output=True, text=True, timeout=60, env={**os.environ, "TZ": "UTC"})
         assert r.returncode == 0, r.stderr
         assert re.fullmatch(r"\d\d:\d\d P[DS]T \| \w{3},? \d\d:\d\d P[DS]T\n", r.stdout), r.stdout
+
+
+def test_mute_heal_and_lock_holder_times_show_the_home_zone_on_a_utc_box(env, utc_box):
+    """Mute lines and their end summary, a heal check's self-fix task and lock holders (local and
+    shared) are in the project's home zone with its abbreviation, never the box's UTC."""
+    from types import SimpleNamespace
+    from ttp import heal, locks, shared
+    from ttp import screen as scr
+    pac = re.compile(r"\d\d:\d\d P[DS]T")
+    p = make(env)
+    p.set_config("home_timezone", "America/Los_Angeles")
+    now = time.time()
+    scr.mute(p.db, "watcher:hw", "held", 1, now=now - 3600)
+    with p.db.tx():
+        [m] = p.db.kv(scr.MUTES_KEY)
+        m.update(count=2, last_at=now - 600)
+        p.db.set_kv(scr.MUTES_KEY, [m])
+    line = scr.mute_line(m, now, p)
+    assert pac.search(line.split("last at", 1)[1]) and " UTC" not in line, line
+    assert scr.expire_mutes(p.db, now + 60, where=p)
+    ended = p.db.one("SELECT text FROM events WHERE text LIKE 'mute ended:%'")["text"]
+    assert pac.search(ended.split("last at", 1)[1]) and " UTC" not in ended, ended
+    heal._escalate(SimpleNamespace(p=p), "svc", {"check": "false", "fix": "true"},
+                   {"since": now - 7200, "last_rc": 1}, now, "the fix exited 1")
+    spec = p.db.one("SELECT spec FROM tasks WHERE title LIKE 'Self-fix: heal check svc%'")["spec"]
+    assert re.search(r"Unhealthy since \d{4}-\d\d-\d\d \d\d:\d\d P[DS]T\.", spec), spec
+    p.set_config("shared_resources", ["board"])
+    slots = {"own": p.state / "locks" / "dev.0.lock", "shared": shared.root() / "board" / "board.0.lock"}
+    held = []
+    try:
+        for path in slots.values():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            held.append(locks.try_take([path], "task #3 (run 9)", "x"))
+        assert all(held)
+        assert re.fullmatch(r"task #3 \(run 9\) since \d\d:\d\d P[DS]T", locks.holders([slots["own"]], p)[0])
+        for who in shared.held(p) + locks.held(p.state / "locks", p):
+            assert pac.search(who) and " UTC" not in who, who
+        assert len(shared.held(p)) == 2, shared.held(p)
+    finally:
+        for f in held:
+            if f:
+                f.close()
+
+
+def test_push_queue_backoff_shows_the_home_zone_on_a_utc_box(env, monkeypatch, utc_box):
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    _pq_review(s, priority=1)
+    s.p.set_config("home_timezone", "America/Los_Angeles")
+    now = time.time()
+    s.p.db.set_kv(pushq.KV, {"backoff_until": now + 600})
+    rows, why = pushq.due(s.p, now)
+    assert rows == [] and re.fullmatch(r"backing off until \d\d:\d\d P[DS]T", why), why
+
+
+def test_the_stall_observation_shows_the_home_zone_on_a_utc_box(env, monkeypatch, utc_box):
+    p, d, now, check = _stall_setup(env, monkeypatch)
+    p.set_config("home_timezone", "America/Los_Angeles")
+    p.db.add_task("ready but never started", "s", kind="work", tier="light", origin="coordinator")
+    p.db.x("UPDATE tasks SET created=?", (now - 6 * 3600,))
+    check(now)
+    [e] = check(now + 3 * 3600)
+    assert re.search(r"last worker run started: \d{4}-\d\d-\d\d \d\d:\d\d P[DS]T\)", e["text"]), e["text"]
 
 
 def test_a_remote_project_made_from_a_workstation_gets_the_workstations_zone(env, monkeypatch, capsys):

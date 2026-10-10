@@ -1519,7 +1519,7 @@ def take(p: Project, remote: str, branch: str, wait_s: float, poll_s: float = 1.
     if f:
         return f
     name = lock_name(remote, branch)
-    say(f"waiting up to {wait_s:.0f} s for {name} (held by {', '.join(locks.holders(paths)) or 'another push'})")
+    say(f"waiting up to {wait_s:.0f} s for {name} (held by {', '.join(locks.holders(paths, p)) or 'another push'})")
     run_dir = Path(os.environ["TTP_RUN_DIR"]) if os.environ.get("TTP_RUN_DIR") else None
     started = time.time()
     key = f"push:{os.getpid()}:{started}"
@@ -1535,7 +1535,7 @@ def take(p: Project, remote: str, branch: str, wait_s: float, poll_s: float = 1.
     if f:
         say(f"got {name} after {time.time() - started:.0f} s")
         return f
-    say(f"{name} stayed busy for {wait_s:.0f} s (held by {', '.join(locks.holders(paths)) or 'another push'}); "
+    say(f"{name} stayed busy for {wait_s:.0f} s (held by {', '.join(locks.holders(paths, p)) or 'another push'}); "
         f"hand the task back as waiting with retry_when: {free_probe(p)}")
     return None
 
@@ -1870,7 +1870,7 @@ def free(p: Project, repo: Path) -> int:
     held = [x for x in sorted((p.state / "locks").glob("push:*.lock")) if not locks.any_free([x])]
     if not held:
         return 0
-    print(f"ttp push: a push holds its turn: {', '.join(locks.holders(held)) or 'another push'}",
+    print(f"ttp push: a push holds its turn: {', '.join(locks.holders(held, p)) or 'another push'}",
           file=sys.stderr)
     return 1
 
