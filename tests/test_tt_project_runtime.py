@@ -173,6 +173,7 @@ def env(tmp_path, monkeypatch, _git_session):
     monkeypatch.setenv("TTP_HOST", "testhost")
     monkeypatch.setenv("TTP_TEST_POLL_S", "0.05")   # wait loops (runner, ttp lock, listen) check often
     monkeypatch.setenv("TTP_TEST_DISK_MOUNT", str(tmp_path))   # the disk guard's du stays in the test folder
+    monkeypatch.setenv("TTP_TEST_SSH_CONFIG", str(tmp_path / "ssh_config"))   # never the user's own ssh config
     # Tests may run inside a live run, under `ttp detach` (no in-run lock-wait cap) or `ttp lock`.
     for var in ("TTP_RUN_DIR", "TTP_TASK", "TTP_RUN_ID", "TTP_PROJECT", "TTP_DETACHED", "TTP_LOCKS_HELD", "TTP_PIDNS"):
         monkeypatch.delenv(var, raising=False)
@@ -8050,6 +8051,76 @@ def test_the_web_app_shows_every_open_ask(env):
     p.db.post("out", "fyi", chat=None, kind="alert", severity="normal")
     shown = {m["id"]: m["kind"] for m in state_payload(p, p.db)["attention"]}
     assert shown == {ask["id"]: "ask"}, "an open question was counted but hidden, or a routine alert shown"
+
+
+# (text, refused): host-a is an ssh config alias, host-b is in the machines list, node3 only in a
+# resource memory entry, other-host nowhere.
+_UNTRIED_HOST_CASES = [
+    ("Please check host-a, I cannot get to it.", True),
+    ("host-a.example.com does not respond. Can you look at it?", True),
+    ("Is host-b still online? Please check it.", True),
+    ("I lost the connection to node3; can you check the box?", True),
+    ("Tried ssh host-a (ProxyCommand route): timed out after 30 s; ping refused. Please check the box.", False),
+    ("ssh host-b through the jump host fails with 'connection refused'; is it down?", False),
+    ("Please check other-host, it does not respond.", False),               # not a host the project knows
+    ("The ssh key for host-a is missing; please add one.", False),          # a real credential
+    ("Another team asked us to check host-b before Friday; agree?", False),  # another person's request
+    ("We need write access to the repo on host-a.", False),                 # not about reaching the host
+]
+
+
+@pytest.mark.parametrize("text,refused", _UNTRIED_HOST_CASES)
+def test_an_access_ask_about_a_known_host_lists_the_routes_tried(env, text, refused):
+    from ttp import machines
+    env["tmp"].joinpath("ssh_config").write_text("Host host-a\n  ProxyCommand nc -X 5 -x proxy:1080 %h %p\n"
+                                                 "Host *.example.com !skip\n  User me\n")
+    p = make(env)
+    machines.add("host-b", ["device"], "test box")
+    p.add_memory("Build machines: node3, reached by ssh from the main box.", kind="resource")
+    problems, ask = _ask(p, text, blocking="access", recommendation="go ahead")
+    if not refused:
+        assert problems == [] and ask is not None, problems
+        return
+    assert problems and "Try those routes from a task" in problems[0] and ask is None, problems
+    assert "listing each route tried and its result" in problems[0]
+
+
+def test_the_untried_host_gate_only_checks_access_asks_and_counts_refusals(env):
+    from ttp import coordinator as coord, unblock
+    env["tmp"].joinpath("ssh_config").write_text("Host host-a\n")
+    p = make(env)
+    for blocking in ("human", "funds", "review"):
+        assert coord._untried_host_ask(p, {"blocking": blocking}, "Please check host-a.") == "", blocking
+    why = coord._untried_host_ask(p, {"blocking": "access"}, "Please check host-a.")
+    assert "host-a (ssh config alias)" in why, why
+    assert _ask(p, "host-a is unreachable, please check.", blocking="access")[0]
+    line = next(x for x in unblock.lines(p.db) if x.startswith("asks refused by the gate, 24 h"))
+    assert "untried host 1" in line, line
+    env["tmp"].joinpath("ssh_config").unlink()
+    assert coord._untried_host_ask(p, {"blocking": "access"}, "Please check host-a.") == ""
+
+
+_OWNED_FIX_NOTIFIES = [
+    ("I set an override on the queue limit after the outage. Keep or remove?", True),
+    ("The watcher hung; I restarted it and it recovered. Should I keep the workaround?", True),
+    ("Fell back to the second provider after the auth failure; leave it that way?", True),
+    ("I set an override on the queue limit after the outage; it ends Friday.", False),     # no question
+    ("The watcher recovered after a restart. Anything else you need?", False),            # not keep/remove
+    ("You set an override on the queue limit last week. Keep or remove?", False),         # the user's own
+    ("Should I keep the nightly report at 6 am?", False),                                 # no override
+]
+
+
+@pytest.mark.parametrize("text,refused", _OWNED_FIX_NOTIFIES)
+def test_a_notify_never_hands_an_owned_override_back_as_a_question(env, text, refused):
+    from ttp import coordinator as coord
+    p = make(env)
+    problems = coord.apply(p, [{"type": "notify", "text": text, "severity": "low"}])
+    sent = p.db.one("SELECT * FROM messages WHERE kind='alert' AND text=?", (text,))
+    if not refused:
+        assert problems == [] and sent is not None, problems
+        return
+    assert problems and "notify rejected" in problems[0] and "is yours" in problems[0] and sent is None, problems
 
 
 # Every sentence from the review of the first gate, plus ordinary decisions. (blocking, text, refused)

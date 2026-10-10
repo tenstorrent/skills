@@ -1061,6 +1061,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 why = _needless_ask(a, text)
                 if why:
                     raise ValueError(f"ask_user rejected: {why}")
+                why = _untried_host_ask(p, a, text)
+                if why:
+                    _count_refusal(db, key, "untried host", text)
+                    raise ValueError(f"ask_user rejected: {why}")
                 for o in db.q("SELECT id, text FROM messages WHERE kind='ask' AND handled=0"):
                     if _same_text(_ask_question(o["text"]), text):
                         raise ValueError(f"already asked as open ask #{o['id']}; it waits for the answer")
@@ -1088,6 +1092,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 prguard.approve(db, str(a.get("text") or a.get("value") or ""), int(a.get("id") or 0),
                                 str(a.get("quote") or ""), slack=from_config(cfg), project=p.name)
             elif t == "notify":
+                why = _owned_fix_question(a["text"])
+                if why:
+                    raise ValueError(f"notify rejected: {why}")
                 db.post("out", a["text"], chat=None, kind="alert", severity=_norm_severity(a.get("severity")))
             elif t == "memory_add":
                 added = p.add_memory(a["text"], kind=a.get("memory_kind") or "fact", title=a.get("title"), key=key,
@@ -2375,6 +2382,110 @@ def _append_update(steer: Path, text: str, key: str | None = None) -> None:
     if key and _has_line(steer, f"(turn {key})"):
         return
     durable_append(steer, f"\n## Update {time.strftime('%Y-%m-%d %H:%M')}{f' (turn {key})' if key else ''}\n{text.strip()}\n")
+
+
+# The host-access gate is a high-precision backstop too. It refuses an access ask only when it names,
+# as a whole word, a host the machines list, a resource memory entry or an ssh config alias knows,
+# says something about reaching it, and lists no route tried with its result. Known gaps, accepted:
+# hosts only the charter's Resources names, ssh config Include files and Match blocks are not read;
+# an ask that says "tried ssh: it failed" passes even if a ProxyCommand route was not tried; a resource
+# memory entry is read only for names with a digit ("node3"), so a plain word is never taken for a host.
+_REACH_RE = re.compile(r"\b(?:reach\w*|unreachable|ssh|connect\w*|down|offline|online|respond\w*|answer\w*|check|"
+                       r"look at|ping\w*|time[sd]? out|timeout|log ?in|logged in)\b", re.I)
+# A route named with its result counts as tried: "ssh times out, the jump host refuses".
+_TRIED_RE = re.compile(r"\b(?:tried|attempted|retried|tested|probed|ssh|ping\w*|via|proxy\w*|jump|bastion|tunnel)\b",
+                       re.I)
+_RESULT_RE = re.compile(r"\b(?:fail\w*|refused|denied|time[sd]? out|timeout|unreachable|no route|hang\w*|hung|"
+                        r"errors?|exit(?:ed)?(?: code)? \d+|rc ?[=:]? ?\d+|could not|couldn't|"
+                        r"unknown host|reset|closed|worked|works|succeeded|ok)\b", re.I)
+_HOSTY_RE = re.compile(r"(?<![\w/.-])[a-z][a-z0-9-]*\d[a-z0-9-]*(?:\.[a-z0-9-]+)*(?![\w/-])", re.I)
+_HOST_ENTRY_RE = re.compile(r"\b(?:ssh|hosts?|machines?|box(?:es)?|servers?|nodes?)\b", re.I)
+
+
+def _ssh_aliases() -> set[str]:
+    """The concrete Host aliases of the user's ssh config (no patterns; Include and Match not read)."""
+    cfg = Path(os.environ.get("TTP_TEST_SSH_CONFIG") or Path.home() / ".ssh" / "config")
+    try:
+        lines = cfg.read_text(errors="replace").splitlines()
+    except OSError:
+        return set()
+    out = set()
+    for line in lines:
+        parts = line.split("#", 1)[0].replace("=", " ").split()
+        if len(parts) > 1 and parts[0].lower() == "host":
+            out |= {h.lower() for h in parts[1:] if not set(h) & set("*?!")}
+    return out
+
+
+def _known_hosts(p: Project) -> dict[str, list[str]]:
+    """{host (lower case): where it is known} from the machines list, resource memory entries that
+    talk about machines, and ssh config aliases."""
+    known: dict[str, list[str]] = {}
+    for alias, m in machines.load().items():
+        for h in {alias, str((m or {}).get("hostname") or "")} - {""}:
+            known.setdefault(h.lower(), []).append("machines list")
+    try:
+        entries = p._memory_entries()
+    except OSError:
+        entries = []
+    for e in entries:
+        if e["kind"] == "resource" and _HOST_ENTRY_RE.search(e["line"]):
+            body = " ".join(w for w in e["line"].split("] ", 1)[-1].split() if "/" not in w)
+            for h in _HOSTY_RE.findall(body):
+                known.setdefault(h.lower(), []).append("resource memory")
+    for h in _ssh_aliases():
+        known.setdefault(h, []).append("ssh config alias")
+    return {h: sorted(set(w)) for h, w in known.items() if len(h) >= 2}
+
+
+def _untried_host_ask(p: Project, a: dict, text: str) -> str:
+    """Why an access ask about reaching a known host is the project's to try first, or "": it names
+    the host and says nothing about the routes tried and how each went. Exempt: a real credential,
+    another person's request."""
+    if a.get("blocking") != "access":
+        return ""
+    said = f"{text} {a.get('recommendation') or ''}".replace("’", "'")
+    if not _REACH_RE.search(said) or _CREDENTIAL_RE.search(said) or _OTHERS_ASK_RE.search(said):
+        return ""
+    if _TRIED_RE.search(said) and _RESULT_RE.search(said):
+        return ""
+    words = {w.lower().rstrip(".-") for w in re.findall(r"[A-Za-z0-9][A-Za-z0-9_.+-]*", said)}
+    words |= {w.split(".", 1)[0] for w in words}   # host-a.example.com names host-a too
+    named = {h: w for h, w in _known_hosts(p).items() if h in words}
+    if not named:
+        return ""
+    where = "; ".join(f"{h} ({', '.join(w)})" for h, w in sorted(named.items()))
+    return (f"the project knows how to reach {where}. Try those routes from a task first (`ssh <alias>` uses the "
+            "ssh config's ProxyCommand or ProxyJump; the machines list and resource memory name the others) and "
+            "act on what works. Ask only if every route fails, listing each route tried and its result")
+
+
+# A notify about an override or recovery the project made, handing it back as a question: whether to
+# keep it is the project's call, like a recommendation-yes ask. High precision: the last sentence is
+# a question with a keep/remove-type verb, the text names an override or recovery, and nothing says
+# the user (or another person) set it. Known gaps, accepted: replies and workers' `ttp notify` are
+# not checked, and a question in the middle of the text gets through.
+_OWNED_FIX_RE = re.compile(r"\b(?:overrid\w*|overrode|workaround|recover\w*|healed|self-heal\w*|restarted|"
+                           r"re-?enabled|rolled back|power[- ]cycled|fallback|fell back)\b", re.I)
+_KEEP_Q_RE = re.compile(r"\b(?:keep|remove|revert|undo|lift|leave|drop|retire|restore|roll back|turn (?:it )?off)\b",
+                        re.I)
+_NOT_OURS_RE = re.compile(r"\b(?:your|the user's|user[- ]set|(?:you|the user)\s+(?:set|added|placed|paused|asked|"
+                          r"wanted|made|restarted|enabled|disabled|chose|pinned))\b|"
+                          r"\b(?:another|other|a|an|the|their)\s+(?:team|person|people|reviewer|maintainer)s?\b",
+                          re.I)
+
+
+def _owned_fix_question(text: str) -> str:
+    """Why a notify that hands an override or recovery the project owns back as a question is
+    refused, or ""."""
+    said = text.replace("’", "'").strip().rstrip("*_` \n")
+    if not said.endswith("?"):
+        return ""
+    last = re.split(r"(?<=[.!?\n])\s+", said[:-1])[-1]
+    if not _KEEP_Q_RE.search(last) or not _OWNED_FIX_RE.search(said) or _NOT_OURS_RE.search(said):
+        return ""
+    return ("whether to keep an override or recovery you made is yours: decide it (keep it with an end condition, "
+            "or remove it), memory_add the decision and notify at severity low without a question")
 
 
 def _needless_ask(a: dict, text: str) -> str:
