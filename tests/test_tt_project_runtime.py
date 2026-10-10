@@ -29712,6 +29712,47 @@ def test_a_single_failure_on_a_busy_main_file_joins_another_lineage_only_where_t
     assert not fixed(d2) and {b["id"], d1["id"], d2["id"]} <= set(capped()[-1]["reviews"])
 
 
+def test_edits_to_different_methods_of_one_class_do_not_overlap(env):
+    """git's hunk header names the enclosing top-level line, `class Core:` for every method edit,
+    so two edits to unrelated methods of one class overlapped. The shared name is now the innermost
+    enclosing function read from the base file; an enclosing class alone is no overlap."""
+    p = make(env)
+    from ttp import reviewcap
+    fups = [{"title": "fix it", "spec": "it breaks"}]
+    (p.root / "core.py").write_text("class Core:\n" + "".join(
+        f"    def m{i}(self):\n" + "        x = 1\n" * 8 + f"        return {i}\n\n" for i in range(10)))
+    _git_out(p.root, "add", "core.py")
+    _git_out(p.root, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "core")
+
+    def stack(title, fn, line="return"):
+        def edit(path):
+            src = (path / "core.py").read_text()
+            old = f"        return {fn}\n" if line == "return" else f"    def m{fn}(self):\n        x = 1\n"
+            (path / "core.py").write_text(src.replace(old, old.replace("\n", f"  # {title}\n", 1), 1))
+        _, _, _, (rev,) = _finish_code(env, p, title, {}, edit=edit)
+        _fail_review(env, p, rev["id"], fups)
+        return rev
+
+    def capped():
+        return [json.loads(r["data"]) for r in p.db.q("SELECT data FROM events WHERE kind=? ORDER BY id",
+                                                      (reviewcap.REVIEW_AREA_EVENT,))]
+    a1 = stack("feature", 0)
+    a2 = stack(f"#{a1['depends_on'][1:-1]} follow-up: feature", 0)
+    a3 = stack(f"Fix re-review #{a2['id']}: feature", 0)
+    assert [d["reviews"] for d in capped()] == [[a1["id"], a2["id"], a3["id"]]]
+    a_side = reviewcap.touched(p, p.db.task(a1["id"]), "core.py")
+    assert a_side[1] == {"Core.m0"}, a_side
+    # One failure in method m9 of the same class: not pooled with the m0 lineage.
+    b = stack("unrelated tidy", 9)
+    b_side = reviewcap.touched(p, p.db.task(b["id"]), "core.py")
+    assert b_side[1] == {"Core.m9"} and not reviewcap.overlaps(a_side, b_side), b_side
+    assert len(capped()) == 1, "an edit to another method of the same class was pooled"
+    assert reviewcap.area(p, p.config(), p.db.task(b["id"])) is None
+    # One failure elsewhere in m0 itself (no shared lines) does join.
+    c = stack("another take on m0", 0, line="def")
+    assert capped()[-1]["reviews"] == [a1["id"], a2["id"], a3["id"], c["id"]]
+
+
 def test_a_review_done_with_a_changes_needed_verdict_gates_like_a_failed_review(env):
     """A project whose result rule is `done` plus `metrics.verdict` gets the same fix flow as `failed`,
     and approves nothing; `done` with another verdict, or from a non-review task, stays done."""

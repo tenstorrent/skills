@@ -10,7 +10,8 @@ follow-ups (`parent`), a review's `depends_on`, the daemon's `review_fix:`/`auto
 same main file (the non-test file with the most changed lines) count as one area too. On a busy
 file that fallback would pool unrelated work, so it applies only once the review's own lineage has
 OWN_FAILS_FOR_FILE failed reviews in the window; before that, a review on the same main file joins
-only when its changes there overlap: a shared hunk line range or a shared changed function. Links run
+only when its changes there overlap: a shared hunk line range, or a shared function around or changed by
+its hunks (an enclosing class alone does not count). Links run
 only between code and review tasks, so a plan or daily review that spawned many tasks joins none.
 
 With review.area_fail_cap (default 3; 0 off) or more reviews of one area failed or asking for
@@ -112,9 +113,31 @@ def main_file(p, review: dict) -> str | None:
     return max(files, key=lambda x: (x[0], x[1]))[1] if files else None
 
 
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip())
+
+
+def _scope(base: list[str], at: int, limit: int) -> list[tuple[int, str, bool]]:
+    """The functions and classes around base line `at` (1-based, walking up from it) for code at
+    indent `limit`, outermost first: (indent, name, is a class)."""
+    out: list[tuple[int, str, bool]] = []
+    for line in reversed(base[:max(at, 0)]):
+        if not line.strip() or line.lstrip().startswith(("#", "//", "/*", "*")) or _indent(line) >= limit:
+            continue
+        limit = _indent(line)
+        if d := DEF.match(line):
+            out.append((limit, d[1], d[0].split()[-2] == "class"))
+        if not limit:
+            break
+    return out[::-1]
+
+
 def touched(p, review: dict, path: str) -> tuple[list[tuple[int, int]], set[str]]:
     """What `review` changes in `path`: the base-side line ranges of its hunks, and the functions
-    or classes they sit in or change."""
+    they sit in or the functions and classes they change, as dotted names (`Core.run`). The function
+    around a hunk is read from the base file: git's hunk header names the enclosing top-level line,
+    which for a method is its class, and a shared enclosing class alone is no overlap."""
+    import subprocess
     from . import worktree
     ranges: list[tuple[int, int]] = []
     names: set[str] = set()
@@ -123,22 +146,38 @@ def touched(p, review: dict, path: str) -> tuple[list[tuple[int, int]], set[str]
         for ref in refs:
             if not worktree._git(p.root, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", check=False):
                 continue
+            mb = worktree._git(p.root, "merge-base", base, ref, check=False)
+            old = subprocess.run(["git", "-C", str(p.root), "show", f"{mb}:{path}"], capture_output=True,
+                                 text=True, timeout=120) if mb else None
+            lines = old.stdout.splitlines() if old is not None and old.returncode == 0 else []
+            hunks: list[tuple[int, int, list[str]]] = []
             for line in worktree._git(p.root, "diff", "-U0", "--no-renames", "--no-color", f"{base}...{ref}",
                                       "--", path).splitlines():
                 if m := HUNK.match(line):
-                    start = int(m[1])
-                    ranges.append((start, start + max(int(m[2] if m[2] is not None else 1), 1)))
-                    if d := DEF.match(m[3] or ""):
-                        names.add(d[1])
-                elif line[:1] in "+-" and not line.startswith(("+++", "---")) and (d := DEF.match(line[1:])):
-                    names.add(d[1])
+                    count = int(m[2] if m[2] is not None else 1)
+                    hunks.append((int(m[1]), count, []))
+                elif hunks and line[:1] in "+-" and not line.startswith(("+++", "---")):
+                    hunks[-1][2].append(line[1:])
+            for start, count, body in hunks:
+                ranges.append((start, start + max(count, 1)))
+                # A modified hunk starts at its first changed line; an insertion follows line `start`.
+                at = start - 1 if count else start
+                code = [b for b in body if b.strip()]
+                limit = _indent(code[0]) if code else _indent(lines[start - 1]) if 0 < start <= len(lines) else 0
+                around = _scope(lines, at, limit)
+                if around and not around[-1][2]:
+                    names.add(".".join(n for _, n, _ in around))
+                for b in code:
+                    if d := DEF.match(b):
+                        names.add(".".join([n for i, n, _ in around if i < _indent(b)] + [d[1]]))
     except Exception:   # unreadable: nothing overlaps
         pass
     return ranges, names
 
 
 def overlaps(a: tuple[list[tuple[int, int]], set[str]], b: tuple[list[tuple[int, int]], set[str]]) -> bool:
-    return bool(a[1] & b[1]) or any(s1 <= e2 and s2 <= e1 for s1, e1 in a[0] for s2, e2 in b[0])
+    """A shared function, or hunks sharing a base line (half-open ranges: touching ends do not)."""
+    return bool(a[1] & b[1]) or any(s1 < e2 and s2 < e1 for s1, e1 in a[0] for s2, e2 in b[0])
 
 
 def failed_reviews(db: DB, since: float) -> list[int]:
