@@ -30681,6 +30681,21 @@ def test_branch_index_finds_the_same_tasks_as_names_branch_one_by_one():
     assert reviewed_ids({"title": "Review #77", "spec": "fix"}, index) == set()
 
 
+def test_branch_index_scans_a_long_punctuation_run_in_linear_time(env):
+    from ttp.db import BranchIndex
+    index = BranchIndex([{"id": i, "branch": f"ttp/t{i}-fix-{'x' * (i % 40)}"} for i in range(600)])
+    spec = "=" * 10000 + " see ===ttp/t7-fix-xxxxxxx=== too"
+    t0 = time.perf_counter()
+    assert index.named(spec) == {7}
+    took = time.perf_counter() - t0
+    assert took < 0.1, f"BranchIndex.named took {took:.2f} s"
+    # Every start a branch could begin at: only the bound on a branch's length keeps this linear.
+    t0 = time.perf_counter()
+    assert index.named("t=" * 10000) == set()
+    took = time.perf_counter() - t0
+    assert took < 0.5, f"BranchIndex.named took {took:.2f} s"
+
+
 def test_a_review_only_stack_stays_review_only_through_its_fix_and_the_push_queue_ignores_its_approval(
         env, monkeypatch):
     from ttp import push, pushq

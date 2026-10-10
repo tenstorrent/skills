@@ -7,6 +7,7 @@ import json
 import re
 import sqlite3
 import time
+from bisect import bisect_right
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping
@@ -646,21 +647,22 @@ class BranchIndex:
                 self.by_branch.setdefault(b, []).append(t["id"])
                 if any(c.isspace() for c in b):
                     self.spaced.append(t)
+        self.firsts = {b[0] for b in self.by_branch}
         self.maxlen = max(map(len, self.by_branch), default=0)
 
     def named(self, spec: str) -> set[int]:
         out = {t["id"] for t in self.spaced if names_branch(spec, t["branch"])}
-        get, maxlen = self.by_branch.get, self.maxlen
+        get, firsts, maxlen = self.by_branch.get, self.firsts, self.maxlen
         for w in spec.split():
             if ids := get(w):
                 out.update(ids)
             if not _INNER_EDGE.search(w):
                 continue
-            starts = [0] + [m.end() for m in _START_AFTER.finditer(w)]
+            starts = [i for i in [0] + [m.end() for m in _START_AFTER.finditer(w)] if w[i:i + 1] in firsts]
             ends = [m.start() for m in _INNER_EDGE.finditer(w)] + [len(w)]
-            for i in starts:
-                for j in ends:
-                    if i < j <= i + maxlen and (i, j) != (0, len(w)) and (ids := get(w[i:j])):
+            for i in starts:   # ends is sorted: visit only the ends no longer than the longest branch
+                for j in ends[bisect_right(ends, i):bisect_right(ends, i + maxlen)]:
+                    if (i, j) != (0, len(w)) and (ids := get(w[i:j])):
                         out.update(ids)
         return out
 
