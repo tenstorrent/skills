@@ -17095,6 +17095,41 @@ def test_push_never_rebases_a_foreign_based_branch_onto_the_push_target(env, mon
     assert _git_out(origin, "rev-parse", "ttp/t48-int") == target
 
 
+def test_a_detached_push_starts_promptly_when_the_base_detection_fetch_times_out(env, monkeypatch, capsys):
+    """foreign_base runs in `ttp push --detach`'s foreground: its fetch of the push target is bounded,
+    prompt-free and stdin-free, and a timeout skips base detection (as a failed fetch does), so the
+    detached push still starts at once."""
+    from ttp import push
+    p, repo, origin = _foreign_setup(env, monkeypatch)
+    target = _git_out(origin, "rev-parse", "ttp/t48-int")
+    monkeypatch.setenv("TTP_TASK", "60")
+    _git_out(repo, "checkout", "-q", "-b", "ttp/t60-h3", "origin/main")
+    _commit(repo, "mine.txt", "mine\n")
+    real, bounded, unbounded = subprocess.run, [], []
+
+    def stalled(cmd, *a, **kw):
+        if "fetch" in cmd and cmd[-1].endswith(":refs/remotes/origin/ttp/t48-int"):
+            if kw.get("timeout") is None:
+                unbounded.append(cmd)
+                return subprocess.CompletedProcess(cmd, 1, "", "would hang")
+            bounded.append(kw)
+            raise subprocess.TimeoutExpired(cmd, kw["timeout"])
+        return real(cmd, *a, **kw)
+    monkeypatch.setattr(push.subprocess, "run", stalled)
+    assert push.foreign_base(p, repo, "origin", "ttp/t48-int", "ttp/t60-h3") is None
+    capsys.readouterr()
+    start = time.monotonic()
+    rc, marker, probe = _detach(capsys)
+    assert rc == 0 and marker is not None and time.monotonic() - start < 30
+    assert not unbounded, unbounded
+    kw = bounded[0]
+    assert kw["timeout"] == push.REACH_FETCH_S <= 60 and kw["stdin"] == subprocess.DEVNULL, kw
+    assert kw["env"]["GIT_TERMINAL_PROMPT"] == "0", kw
+    monkeypatch.setattr(push.subprocess, "run", real)
+    assert _probe_until_done(p, probe).returncode != 1
+    assert _git_out(origin, "rev-parse", "ttp/t48-int") == target
+
+
 def test_push_still_rebases_a_published_branch_based_on_base_ref_onto_the_push_target(env, monkeypatch, capsys):
     p, repo, origin = _foreign_setup(env, monkeypatch)
     monkeypatch.setenv("TTP_TASK", "63")

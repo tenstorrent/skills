@@ -771,7 +771,7 @@ def intended(p: Project, repo: Path, pushed: str) -> str:
     return ""
 
 
-REACH_FETCH_S = 60   # reach() runs after a push has landed: its fetch may never hold that up for long
+REACH_FETCH_S = 60   # reach() runs after a push landed, foreign_base() before --detach starts: never held up long
 
 
 def _fetch_bounded(repo: Path, remote: str, branch: str) -> str:
@@ -1059,8 +1059,9 @@ def foreign_base(p: Project, repo: Path, remote: str, push_to: str, branch: str)
     """(base, carried) when the checked-out `branch` is based on a branch outside the flow work lands
     by (real_base is no configured candidate): rebasing it onto the push target would carry that
     base's commits too, and conflict or land them unreviewed. None otherwise, or when the push
-    target cannot be fetched (the push itself then refuses)."""
-    if branch == push_to or not _fetch(repo, remote, push_to):
+    target cannot be fetched within REACH_FETCH_S (the push itself then fetches it, or refuses):
+    `ttp push --detach` runs this in the foreground, so a stalled fetch never holds up its start."""
+    if branch == push_to or not _fetch_bounded(repo, remote, push_to):
         return None
     base, carried = real_base(p, repo, remote, push_to, branch)
     if not base or base in base_candidates(p, repo, remote, push_to, branch)[0]:
