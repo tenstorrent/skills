@@ -16996,6 +16996,106 @@ def test_push_conflict_on_a_published_branch_says_merge_not_rebase(env, monkeypa
     assert _git_out(repo, "rev-parse", "HEAD") == mine
 
 
+def _foreign_setup(env, monkeypatch):
+    """_push_setup with an integration branch ttp/t48-int (rt plus one commit) as the push target and
+    rt as base_ref; origin also has main, ahead of the common root by two commits, a colleague's
+    main-based branch and other tasks' ttp/* branches, all fetched."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    root = _git_out(repo, "rev-parse", "HEAD")
+    for name, files in (("rt", ["rt.txt"]), ("ttp/t48-int", ["rt.txt", "int.txt"]),
+                        ("main", ["m1.txt", "m2.txt"]), ("someone/feature", ["m1.txt", "m2.txt", "feat.txt"]),
+                        ("ttp/t47-near", ["m1.txt", "m2.txt", "near.txt"]), ("ttp/t49-other", ["int.txt"])):
+        _git_out(repo, "checkout", "-q", "--detach", root)
+        for f in files:
+            _commit(repo, f, f"{f}\n")
+        _git_out(repo, "push", "-q", "origin", f"HEAD:refs/heads/{name}")
+    _git_out(repo, "fetch", "-q", "origin")
+    p.set_config("delivery.push_branch", "origin/ttp/t48-int")
+    p.set_config("delivery.base_ref", "rt")
+    return p, repo, origin
+
+
+def test_push_picks_a_branchs_real_base_over_the_push_target_and_other_task_branches(env, monkeypatch):
+    from ttp import push
+    p, repo, origin = _foreign_setup(env, monkeypatch)
+    real = lambda: push.real_base(p, repo, "origin", "ttp/t48-int",
+                                  _git_out(repo, "symbolic-ref", "--short", "HEAD"))
+    # Based on main, with ttp/t47-near (also main-based) and t49 present: main, never a ttp/* branch.
+    _git_out(repo, "checkout", "-q", "-b", "ttp/t60-h3", "origin/main")
+    _commit(repo, "mine.txt", "mine\n")
+    assert real() == ("origin/main", 1)
+    assert push.foreign_base(p, repo, "origin", "ttp/t48-int", "ttp/t60-h3") == ("origin/main", 1)
+    # Its upstream (a colleague's branch) when it tracks one.
+    _git_out(repo, "checkout", "-q", "-b", "ttp/t61-x", "--track", "origin/someone/feature")
+    _commit(repo, "x.txt", "x\n")
+    assert real() == ("origin/someone/feature", 1)
+    # Based on the push target or on base_ref: the configured flow, as before.
+    _git_out(repo, "checkout", "-q", "-b", "ttp/t62-y", "origin/ttp/t48-int")
+    _commit(repo, "y.txt", "y\n")
+    assert real() == ("origin/ttp/t48-int", 1)
+    assert push.foreign_base(p, repo, "origin", "ttp/t48-int", "ttp/t62-y") is None
+    _git_out(repo, "checkout", "-q", "-b", "ttp/t63-z", "origin/rt")
+    _commit(repo, "z.txt", "z\n")
+    assert push.foreign_base(p, repo, "origin", "ttp/t48-int", "ttp/t63-z") is None
+
+
+def test_push_never_rebases_a_foreign_based_branch_onto_the_push_target(env, monkeypatch, capsys):
+    p, repo, origin = _foreign_setup(env, monkeypatch)
+    target = _git_out(origin, "rev-parse", "ttp/t48-int")
+    monkeypatch.setenv("TTP_TASK", "60")
+    _git_out(repo, "checkout", "-q", "-b", "ttp/t60-h3", "origin/main")
+    _commit(repo, "mine.txt", "mine\n")
+    mine = _git_out(repo, "rev-parse", "HEAD")
+    # Not on origin yet: refused at once, the branch and the push target untouched.
+    capsys.readouterr()
+    assert _ttp("push") == 2
+    err = capsys.readouterr().err
+    assert "based on origin/main" in err and "ttp push --own" in err, err
+    assert "git rebase --onto origin/ttp/t48-int origin/main" in err, err
+    rc, marker, _ = _detach(capsys)
+    assert rc == 2 and marker is None
+    assert _git_out(repo, "rev-parse", "HEAD") == mine
+    assert _git_out(origin, "rev-parse", "ttp/t48-int") == target
+    # Already on origin and a fast-forward: pushed there as it is, with no rebase.
+    assert _ttp("push", "--own") == 0
+    _commit(repo, "more.txt", "more\n")
+    head = _git_out(repo, "rev-parse", "HEAD")
+    capsys.readouterr()
+    assert _ttp("push") == 0
+    assert "fast-forward, with no rebase" in capsys.readouterr().err
+    assert _git_out(origin, "rev-parse", "ttp/t60-h3") == head == _git_out(repo, "rev-parse", "HEAD")
+    assert _git_out(origin, "rev-parse", "ttp/t48-int") == target
+    # The detached push resolves the same target.
+    _commit(repo, "more2.txt", "more2\n")
+    rc, marker, probe = _detach(capsys)
+    assert rc == 0
+    assert json.loads(marker.read_text())["target"] == "origin/ttp/t60-h3"
+    r = _probe_until_done(p, probe)
+    assert r.returncode == 0, r
+    assert _git_out(origin, "rev-parse", "ttp/t60-h3") == _git_out(repo, "rev-parse", "HEAD")
+    assert _git_out(origin, "rev-parse", "ttp/t48-int") == target
+    # Diverged from its copy on origin: refused, never rewritten.
+    _git_out(repo, "reset", "-q", "--hard", "HEAD~1")
+    _commit(repo, "fork.txt", "fork\n")
+    assert _ttp("push") == 2
+    assert _git_out(origin, "rev-parse", "ttp/t48-int") == target
+
+
+def test_push_still_rebases_a_published_branch_based_on_base_ref_onto_the_push_target(env, monkeypatch, capsys):
+    p, repo, origin = _foreign_setup(env, monkeypatch)
+    monkeypatch.setenv("TTP_TASK", "63")
+    _git_out(repo, "checkout", "-q", "-b", "ttp/t63-z", "origin/rt")
+    _commit(repo, "z.txt", "z\n")
+    assert _ttp("push", "--own") == 0
+    mine = _git_out(repo, "rev-parse", "HEAD")
+    capsys.readouterr()
+    assert _ttp("push") == 0
+    assert "stays as it is" in capsys.readouterr().err
+    landed = _git_out(origin, "rev-parse", "ttp/t48-int")
+    assert _git_out(origin, "show", f"{landed}:z.txt") == "z" and landed != mine
+    assert _git_out(origin, "rev-parse", "ttp/t63-z") == mine
+
+
 def test_push_own_without_checks_publishes_docs_only_and_refuses_code(env, monkeypatch, capsys):
     p, repo, origin, other = _push_setup(env, monkeypatch, [])
     p.set_config("delivery.push_checks", [])

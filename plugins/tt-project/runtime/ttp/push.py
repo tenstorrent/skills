@@ -969,7 +969,9 @@ def resolve(p: Project, repo: Path, own: bool = False) -> tuple[str, str, bool]:
     """(remote, branch, own) for `ttp push`. `--own` is own_target. Otherwise the target is
     `delivery.push_branch`, but inside a run a worktree on another task's ttp/t<id>-... branch is
     refused (it would land that task's work: _may_land), and with no push_branch set this task's
-    own branch, once on the remote, is the default target (published as with --own)."""
+    own branch, once on the remote, is the default target (published as with --own). A branch based
+    on a branch outside the flow work lands by (foreign_base) is never rebased onto the push target:
+    once on the remote as a fast-forward it is pushed there as with --own, else it is refused."""
     if own:
         return (*own_target(p, repo), True)
     branch = _git(repo, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
@@ -986,7 +988,84 @@ def resolve(p: Project, repo: Path, own: bool = False) -> tuple[str, str, bool]:
             print(f"ttp push: no delivery.push_branch; {remote}/{branch} is this task's own branch, "
                   f"publishing it as with --own", file=sys.stderr)
             return remote, own_branch, True
-    return (*target(p, repo), False)
+    remote, push_to = target(p, repo)
+    if branch and (other := foreign_base(p, repo, remote, push_to, branch)):
+        base, carried = other
+        upstream = f"{remote}/{push_to}"
+        why = (f"{branch} is based on {base}, not on {upstream} or the base work starts from: rebasing it "
+               f"onto {upstream} would carry {carried} commit(s) it has over that base with it")
+        if published(repo, remote, push_to) == branch:
+            try:
+                ok = own_target(p, repo) == (remote, branch)
+            except ValueError:
+                ok = False
+            if ok:
+                print(f"ttp push: {why}; {remote}/{branch} is already on {remote}, so it is pushed there "
+                      f"as a fast-forward, with no rebase (as with --own)", file=sys.stderr)
+                return remote, branch, True
+        raise ValueError(f"{why}. Publish it on its own branch with `ttp push --own`, or rebase only "
+                         f"its own commits (`git rebase --onto {upstream} {base}`) and rerun")
+    return remote, push_to, False
+
+
+def _commit_of(repo: Path, ref: str) -> str:
+    return _git(repo, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}").stdout.strip()
+
+
+def _carried(repo: Path, ref: str) -> int:
+    """How many commits HEAD has that `ref` does not: what a rebase onto `ref` would carry."""
+    out = _git(repo, "rev-list", "--count", "HEAD", f"^{ref}")
+    return int(out.stdout.strip()) if out.returncode == 0 and out.stdout.strip().isdigit() else -1
+
+
+def base_candidates(p: Project, repo: Path, remote: str, push_to: str, branch: str) -> tuple[list[str], list[str]]:
+    """(configured, other) refs that may be the checked-out `branch`'s base. Configured: the push
+    target, `delivery.base_ref` (or the base worktrees start from without it), the flow work lands
+    by. Other: the branch's upstream and the remote's default branch (else its main or master).
+    Never the branch's own copy on the remote, nor another task's ttp/t<id>-... branch: that is
+    work landing by the same flow, not a base."""
+    from .worktree import named_base
+    configured = [f"{remote}/{push_to}"]
+    d = p.config().get("delivery") or {}
+    for ref in (str(d.get("base_ref") or "").strip(), named_base(p)):
+        if ref:
+            name = ref_name(repo, ref)
+            configured.append(name if _commit_of(repo, name) else ref)
+    other = [_git(repo, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}").stdout.strip()]
+    default = _git(repo, "symbolic-ref", "--quiet", "--short", f"refs/remotes/{remote}/HEAD").stdout.strip()
+    other += [default] if default else [f"{remote}/main", f"{remote}/master"]
+    mine = {branch, f"{remote}/{branch}"}
+
+    def keep(ref: str) -> bool:
+        tail = ref.partition("/")[2] if ref.startswith(f"{remote}/") else ref
+        return bool(ref) and ref not in mine and not OWN_BRANCH.fullmatch(tail) and bool(_commit_of(repo, ref))
+    configured = list(dict.fromkeys(r for r in configured if r and r not in mine and _commit_of(repo, r)))
+    return configured, [r for r in dict.fromkeys(other) if keep(r) and r not in configured]
+
+
+def real_base(p: Project, repo: Path, remote: str, push_to: str, branch: str) -> tuple[str, int]:
+    """(ref, carried) of the checked-out branch's nearest base among base_candidates: the one HEAD
+    has the fewest commits over (_carried); on a tie a configured one, the push target first."""
+    configured, other = base_candidates(p, repo, remote, push_to, branch)
+    best = ("", -1)
+    for ref in configured + other:
+        n = _carried(repo, ref)
+        if n >= 0 and (best[1] < 0 or n < best[1]):
+            best = (ref, n)
+    return best
+
+
+def foreign_base(p: Project, repo: Path, remote: str, push_to: str, branch: str) -> tuple[str, int] | None:
+    """(base, carried) when the checked-out `branch` is based on a branch outside the flow work lands
+    by (real_base is no configured candidate): rebasing it onto the push target would carry that
+    base's commits too, and conflict or land them unreviewed. None otherwise, or when the push
+    target cannot be fetched (the push itself then refuses)."""
+    if branch == push_to or not _fetch(repo, remote, push_to):
+        return None
+    base, carried = real_base(p, repo, remote, push_to, branch)
+    if not base or base in base_candidates(p, repo, remote, push_to, branch)[0]:
+        return None
+    return base, carried
 
 
 def behind(repo: Path, remote: str, branch: str) -> str:
