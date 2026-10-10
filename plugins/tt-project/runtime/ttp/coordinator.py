@@ -78,7 +78,7 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "escalate_after_h": {"type": "number"}, "below": {"type": "string"}, "why": {"type": "string"},
             "quote": {"type": "string"},
             "start_after": {"type": "string", "pattern": START_AFTER_RE}, "start_when": {"type": "string"},
-            "waits_on": {"type": "string"}},
+            "waits_on": {"type": "string"}, "heal": {"type": ["object", "null"]}},
             "required": ["type"]}},
         "summary": {"type": "string"},
     },
