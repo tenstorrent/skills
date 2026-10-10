@@ -23813,6 +23813,58 @@ def test_effort_triggers_raise_every_tricky_turn_and_leave_routine_ones_low(env)
     assert trig(gates={"claude": {"level": "green"}}) == ["budget gate change"]
 
 
+def test_idle_slot_trigger_treats_dependencies_on_deferrals_as_deferred_and_fires_only_on_new_held_ids(env):
+    """A task waiting only on queued deferrals (directly or down a chain) is deferred, not held.
+    The trigger raises only when an id not held before joins the held set: never when the set
+    shrinks or stays, nor for ids that stayed held while the slots were busy."""
+    p = make(env)
+    from ttp import coordinator as coord
+    db, cfg = p.db, p.config()
+    db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    db.x("DELETE FROM messages WHERE direction='out'")
+    db.x("UPDATE tasks SET status='done' WHERE status='queued'")
+    db.set_kv("last_coordinator_turn", time.time() + 1)
+
+    def turn(c=cfg):
+        got, seen = coord.effort_triggers(db, c, [], None)
+        db.set_kv(coord.EFFORT_SEEN_KEY, seen)
+        return got, seen
+
+    later = time.time() + 3 * 3600
+    after = db.add_task("after", "s", origin="user", not_before=later, labels=[f"start_after:{later}"])
+    when = db.add_task("when", "s", origin="user", labels=["start_when:test -e /nonexistent"])
+    child = db.add_task("child", "s", origin="user", depends_on=[after, when])
+    grandchild = db.add_task("grandchild", "s", origin="user", depends_on=[child])
+    got, seen = turn()
+    assert got == [] and "held" not in seen
+    # A dependency on something not deferred (a blocked task) is a real hold, chain included.
+    base = db.add_task("base", "s", origin="user")
+    db.update_task(base, status="blocked")
+    a = db.add_task("a", "s", origin="user", depends_on=[base])
+    b = db.add_task("b", "s", origin="user", depends_on=[base, after])
+    got, seen = turn()
+    assert got == ["idle slots, queued work held"] and seen["held"] == [a, b]
+    assert turn()[0] == []                       # unchanged: nothing new
+    db.update_task(a, status="cancelled")
+    got, seen = turn()
+    assert got == [] and seen["held"] == [b]     # shrank: nothing new
+    c = db.add_task("c", "s", origin="user", depends_on=[base])
+    got, seen = turn()
+    assert got == ["idle slots, queued work held"] and seen["held"] == [b, c]
+    # Busy slots: no raise, and the ids still held stay seen, so freeing the slots raises nothing...
+    busy = {**cfg, "budget": {**(cfg.get("budget") or {}), "max_parallel_workers": 0}}
+    db.update_task(c, status="cancelled")
+    got, seen = turn(busy)
+    assert got == [] and seen["held"] == [b]
+    assert turn()[0] == []
+    # ...but an id that joined while they were busy raises once they free up.
+    d = db.add_task("d", "s", origin="user", depends_on=[base])
+    assert turn(busy)[0] == []
+    got, seen = turn()
+    assert got == ["idle slots, queued work held"] and seen["held"] == [b, d]
+    assert grandchild not in seen["held"] and child not in seen["held"]
+
+
 def test_planned_deferrals_do_not_count_as_held_work_but_real_holds_still_raise(env):
     """'idle slots, queued work held' is for work that cannot start, not for work deferred on
     purpose: a queue of start_after/start_when tasks raises nothing; a paused resource still does,

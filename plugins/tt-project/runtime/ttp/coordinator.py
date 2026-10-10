@@ -1531,19 +1531,31 @@ def effort_triggers(db, cfg: dict, event_ids: list[int], wake_due: str | None,
     # Free worker slots while every queued task is held (a dependency, a paused resource) or
     # deferred on purpose, at least one of them held: a queue of planned deferrals alone is routine
     # (deferral_expired, deferral_probe_broken and dead_dependency catch the ones that go wrong).
+    # A task waiting only on queued deferrals (directly or down a chain) is deferred too. It raises
+    # only when an id not held before joins the held set; a shrinking or unchanged set is routine.
     queued = db.q("SELECT * FROM tasks WHERE status='queued' ORDER BY id")
-    running = db.one("SELECT COUNT(*) n FROM runs WHERE role!='coordinator' AND status='running'")["n"]
-    slots = int((cfg.get("budget") or {}).get("max_parallel_workers", 6) or 0)
-    if queued and running < slots:
+    if queued:
         paused = db.paused_resources()
         unmet = db.unmet_dependencies(queued)
-        held = [t["id"] for t in queued if unmet[t["id"]] or task_resources(t) & paused.keys()]
-        deferred = [t["id"] for t in queued if t["id"] not in held
-                    and ("when" in (d := deferral(t)) or float(d.get("after") or 0) > now)]
-        if held and len(held) + len(deferred) == len(queued):
-            seen["held"] = held
-            if held != seen_before.get("held"):
+        boxed = {t["id"] for t in queued if task_resources(t) & paused.keys()}
+        deferred = {t["id"] for t in queued if t["id"] not in boxed and not unmet[t["id"]]
+                    and ("when" in (d := deferral(t)) or float(d.get("after") or 0) > now)}
+        grew = True
+        while grew:
+            more = {t["id"] for t in queued if t["id"] not in boxed | deferred and unmet[t["id"]]
+                    and set(unmet[t["id"]]) <= deferred}
+            deferred |= more
+            grew = bool(more)
+        held = [t["id"] for t in queued if t["id"] in boxed or (unmet[t["id"]] and t["id"] not in deferred)]
+        before = set(seen_before.get("held") or [])
+        running = db.one("SELECT COUNT(*) n FROM runs WHERE role!='coordinator' AND status='running'")["n"]
+        slots = int((cfg.get("budget") or {}).get("max_parallel_workers", 6) or 0)
+        if held and running < slots and len(held) + len(deferred) == len(queued):
+            if set(held) - before:
                 add("idle slots, queued work held")
+            seen["held"] = held
+        elif before & set(held):   # still held while the slots were busy: not new when they free up
+            seen["held"] = [x for x in held if x in before]
     keys = sorted(x["key"] for x in conflicts or [])
     seen["charter_conflicts"] = keys
     if set(keys) - set(seen_before.get("charter_conflicts") or []):
