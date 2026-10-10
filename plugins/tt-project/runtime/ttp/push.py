@@ -1068,10 +1068,13 @@ def real_base(p: Project, repo: Path, remote: str, push_to: str, branch: str) ->
 def foreign_base(p: Project, repo: Path, remote: str, push_to: str, branch: str) -> tuple[str, int] | None:
     """(base, carried) when the checked-out `branch` is based on a branch outside the flow work lands
     by (real_base is no configured candidate): rebasing it onto the push target would carry that
-    base's commits too, and conflict or land them unreviewed. None otherwise, or when the push
+    base's commits too, and conflict or land them unreviewed. None otherwise: when HEAD already
+    descends from the push target's tip (on the flow, whatever else it merged in), or when the push
     target cannot be fetched within REACH_FETCH_S (the push itself then fetches it, or refuses):
     `ttp push --detach` runs this in the foreground, so a stalled fetch never holds up its start."""
-    if branch == push_to or not _fetch_bounded(repo, remote, push_to):
+    if branch == push_to or not (tip := _fetch_bounded(repo, remote, push_to)):
+        return None
+    if _git(repo, "merge-base", "--is-ancestor", tip, "HEAD").returncode == 0:
         return None
     base, carried = real_base(p, repo, remote, push_to, branch)
     if not base or base in base_candidates(p, repo, remote, push_to, branch)[0]:

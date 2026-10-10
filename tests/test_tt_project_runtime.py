@@ -17057,6 +17057,22 @@ def test_push_picks_a_branchs_real_base_over_the_push_target_and_other_task_bran
     assert push.foreign_base(p, repo, "origin", "ttp/t48-int", "ttp/t63-z") is None
 
 
+def test_push_keeps_a_branch_on_the_push_target_that_merged_in_another_branch(env, monkeypatch):
+    """A branch that descends from the push target's tip but merged in main (not base_ref), with main
+    the candidate it has the fewest commits over, is on the flow: never refused as foreign."""
+    from ttp import push
+    p, repo, origin = _foreign_setup(env, monkeypatch)
+    _git_out(repo, "checkout", "-q", "--detach", "origin/main")
+    _commit(repo, "m3.txt", "m3\n")
+    _git_out(repo, "push", "-q", "origin", "HEAD:refs/heads/main")
+    _git_out(repo, "fetch", "-q", "origin")
+    _git_out(repo, "checkout", "-q", "-b", "ttp/t64-merged", "origin/ttp/t48-int")
+    _git_out(repo, "merge", "-q", "--no-edit", "origin/main")
+    _commit(repo, "w.txt", "w\n")
+    assert push.real_base(p, repo, "origin", "ttp/t48-int", "ttp/t64-merged")[0] == "origin/main"
+    assert push.foreign_base(p, repo, "origin", "ttp/t48-int", "ttp/t64-merged") is None
+
+
 def test_push_never_rebases_a_foreign_based_branch_onto_the_push_target(env, monkeypatch, capsys):
     p, repo, origin = _foreign_setup(env, monkeypatch)
     target = _git_out(origin, "rev-parse", "ttp/t48-int")
