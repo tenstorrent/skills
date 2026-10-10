@@ -2239,9 +2239,9 @@ def _reject_contradicting_append(p: Project, section: str, text: str, user_turn:
     (_may_lift) is refused: any other overlap is a duty, a goal or a ban added next to the item, both
     hold, and the change goes through; the returned note names the items judged to overlap. A refused
     change of the user's is recorded (_record_charter_approval), as sent and as the quoted resend of
-    each item, so the fix goes through in a later turn without asking again, and the daemon raises it
-    again when the guard changes (reraise_charter_changes). Text already in the charter (a retried
-    turn) passes. Returns the note, or ""."""
+    each item, so either fix goes through in a later turn without asking again; it is never raised
+    again by itself (reraise_charter_changes). Text already in the charter (a retried turn) passes.
+    Returns the note, or ""."""
     charter = p.charter_path.read_text()
     if " ".join(text.split()) in " ".join(charter.split()):
         return ""
@@ -2359,7 +2359,8 @@ def _record_charter_approval(p: Project, messages: list[int], section: str, quot
         if any(all(x.get(k) == v for k, v in rec.items()) and not x.get("used") for x in have):
             return   # a retried turn records it once
         rec.update(id=hashlib.sha256(f"{said}{sha}{time.time()}".encode()).hexdigest()[:12], messages=said,
-                   ask=ask["id"] if ask else None, candidates=cands, failed=failed[:300], ts=time.time(), used=None)
+                   ask=ask["id"] if ask else None, candidates=cands, failed=failed[:300], ts=time.time(), used=None,
+                   guard=CHARTER_GUARD_VERSION)
         db.set_kv(CHARTER_APPROVALS_KEY, (have + [rec])[-20:])
 
 
@@ -2383,7 +2384,7 @@ def _charter_approval(p: Project, section: str, quote: str, replaces: str, text:
     sha = hashlib.sha256(_ws(text).encode()).hexdigest()
     for rec in reversed(have):   # newest first; a refusal says why the newest one for this target fails
         # Adding the very text the user approved removes nothing: it matches in any section (a change
-        # the old guard refused was recorded under the item it named, see reraise_charter_changes).
+        # the guard refused is also recorded under each item it named, see _reject_contradicting_append).
         appends = text and not quote and not replaces and rec["sha"] == sha
         if not appends and (rec["section"] != _ws(section).lower() or rec["quote"] != _ws(quote)):
             continue
@@ -2417,20 +2418,27 @@ def _use_charter_approval(p: Project, rid: str, key: str | None) -> None:
         p.db.set_kv(CHARTER_APPROVALS_KEY, have)
 
 
-# Raise this when the charter_update guard changes what it lets through: each project's daemon then
-# raises the user's pending changes the guard refused again (reraise_charter_changes).
-CHARTER_GUARD_VERSION = 2
-CHARTER_RERAISE_KEY = "charter_reraise"   # kv: {"version", "ts"} of the last re-raise
+# Raise this when the charter_update guard changes what it lets through, and pin the new source
+# with it: a test fails when the source of CHARTER_GUARD_FUNCS no longer has CHARTER_GUARD_PIN's
+# sha256. A user's change that failed under an older guard for another reason than the guard
+# (reraise_charter_changes) is then raised at once.
+CHARTER_GUARD_VERSION = 3
+CHARTER_GUARD_FUNCS = ("_reject_contradicting_append", "_append_conflicts", "_overlaps", "_quote_hits",
+                       "_item_quote_hits", "_items", "_norm", "_may_lift")
+CHARTER_GUARD_PIN = (3, "1dd6797f084673b4177959b53a76aced9468cef9c17dcc50cd79b8346cc2edd9")
+CHARTER_RERAISE_KEY = "charter_reraise"   # kv: {"version", "ts"} of the last re-raise pass
 
 
 def reraise_charter_changes(p: Project, now: float | None = None) -> list[str]:
-    """Raise the user's charter changes that failed and are still pending (recorded by
-    _record_charter_approval, unused, unexpired, not in the charter yet) to the coordinator again, as
-    queued charter_retry events, once the guard changed (CHARTER_GUARD_VERSION) and else once a
-    day. The user's word stays on record, so the resend goes through without asking. A change
-    the guard refused as contradicting an item is raised as the addition the user asked for
-    (any section takes it, see _charter_approval), never as a replacement of that item. No model.
-    Returns the new events' texts."""
+    """Raise a charter change of the user's that failed for a reason other than the guard (an
+    ambiguous heading, a quote that named no one item) and is still pending (recorded by
+    _record_charter_approval, unused, unexpired, not in the charter yet) to the coordinator again,
+    as a queued charter_retry event: once per change (marked `raised` on its newest record), a
+    day after it failed, or on the first pass after a guard change (CHARTER_GUARD_VERSION) when it
+    failed under an older guard. A change whose newest failure is the guard's refusal is never
+    raised again: the coordinator had the refusal in its next digest, with its two fixes (the
+    quoted resend of the item, or `both_hold`), and the user's word stays on record for either.
+    One pass per guard change and per day. No model. Returns the new events' texts."""
     now = time.time() if now is None else now
     db = p.db
     state = db.kv(CHARTER_RERAISE_KEY) or {}
@@ -2445,37 +2453,38 @@ def reraise_charter_changes(p: Project, now: float | None = None) -> list[str]:
         charter = _ws(p.charter_path.read_text())
     except OSError:
         return []
-    groups: dict[str, list[dict]] = {}
-    for rec in db.kv(CHARTER_APPROVALS_KEY, []) or []:
-        if not rec.get("used") and rec.get("failed") and now - float(rec.get("ts") or 0) <= days * 86400:
-            groups.setdefault(rec["sha"], []).append(rec)
     out = []
-    for recs in groups.values():
-        # the change as sent, else (refused by an older guard) one of the items it was said to contradict
-        rec = next((r for r in recs if r["failed"] != GUARD_REJECTED), recs[0])
-        text = _ws(rec["text"])
-        if text and text in charter or not text and rec["quote"] and rec["quote"] not in charter:
-            continue   # it landed meanwhile
-        ids = ", #".join(map(str, rec["messages"]))
-        when = datetime.fromtimestamp(float(rec["ts"])).strftime("%Y-%m-%d")
-        if rec["failed"] == GUARD_REJECTED:
-            how = (f"charter_update with `text` {rec['text'].strip()!r} in the section it belongs to (Goals, "
-                   f"Policies or Restrictions), no `quote`: an addition that only shares words with Restrictions "
-                   f"items now goes in. `quote` an item only if the user changed it: "
-                   + "; ".join(f"\"{clip(r['quote'], 200)}\"" for r in recs if r["quote"]))
-        else:
-            how = (f"charter_update section {rec['section']!r}"
-                   + (f", `quote` {rec['quote']!r}" if rec["quote"] else "")
-                   + (f", `replaces` {rec['replaces']!r}" if rec["replaces"] else "")
-                   + f", `text` {rec['text'].strip()!r}")
-        msg = (f"Pending charter change from the user's message #{ids}, refused on {when} ({clip(rec['failed'], 200)}). "
-               f"The charter guard changed since, or a day passed: apply it now with {how}. The user's word is on "
-               f"record; no ask. If the user has since said otherwise, leave it.")
-        if db.one("SELECT 1 FROM events WHERE kind='charter_retry' AND status='queued' AND text=?", (msg,)):
-            continue
-        db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
-             (now, "harness", "charter_retry", "normal", msg, "queued"))
-        out.append(msg)
+    with db.tx():
+        have = db.kv(CHARTER_APPROVALS_KEY, []) or []
+        newest: dict[str, dict] = {}
+        for rec in have:   # oldest first: the newest record of each change wins
+            if not rec.get("used") and rec.get("failed"):
+                newest[rec["sha"]] = rec
+        for rec in newest.values():
+            age = now - float(rec.get("ts") or 0)
+            older_guard = int(rec.get("guard") or 0) < CHARTER_GUARD_VERSION
+            if (rec.get("raised") or GUARD_REJECTED in rec["failed"] or age > days * 86400
+                    or age < 86400 and not older_guard):
+                continue
+            rec["raised"] = now
+            text = _ws(rec["text"])
+            if text and text in charter or not text and rec["quote"] and rec["quote"] not in charter:
+                continue   # it landed meanwhile
+            sent = (f"section {rec['section']!r}" + (f", `quote` {rec['quote']!r}" if rec["quote"] else "")
+                    + (f", `replaces` {rec['replaces']!r}" if rec["replaces"] else "")
+                    + f", `text` {rec['text'].strip()!r}")
+            msg = (f"Pending charter change from the user's message #{', #'.join(map(str, rec['messages']))}, "
+                   f"refused on {datetime.fromtimestamp(float(rec['ts'])).strftime('%Y-%m-%d')} "
+                   f"({clip(rec['failed'], 300)}). It was sent as: {sent}. "
+                   + ("The charter guard changed since, so it may go through as sent; else fix"
+                      if older_guard else "Fix")
+                   + " what that error names and send it again (no ask: the user's yes on record covers the "
+                     "same section, target and text, and for a `replaces` any heading it matched). Raised once "
+                     "only. If the user has since said otherwise, leave it.")
+            db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                 (now, "harness", "charter_retry", "normal", msg, "queued"))
+            out.append(msg)
+        db.set_kv(CHARTER_APPROVALS_KEY, have)
     return out
 
 
@@ -2550,13 +2559,15 @@ def _charter_update(p: Project, section: str, text: str, quote: str, replaces: s
                              f"text of one item, long enough to be unique there"
                              + ("; closest: " + "; ".join(f"\"{clip(i, 800)}\" (section {n!r})" for i, n in near)
                                 + ": resend one of them exactly as `quote`, with its section" if near else ""))
-        s, e = hits[0].span()
+        s, e = hits[0]
         if names[t].lower().startswith("restriction") and not user_turn:
             retired = f"\"{clip(' '.join(body[s:e].split()), 200)}\""
         lifted = user_turn and names[t].lower().startswith("restriction")
         log.append(f"### {'Replaced in' if text else 'Removed from'} {names[t]} ({logged})\n{body[s:e]}"
                    + (f"\nNow: {text}" if text else "") + (f"\nOver: {over}" if over and not user_turn else ""))
-        sections[t] = (sections[t][0], _cut(body, s, e, text).split("\n"))
+        # Text going into a bullet keeps that bullet's marker, not one of its own ("- - ...").
+        new = re.sub(r"^\s*" + _BULLET, "", text, count=1) if text and _in_bullet(body, s) else text
+        sections[t] = (sections[t][0], _cut(body, s, e, new).split("\n"))
     elif text and end:
         name = _DATED.sub("", section)
         name = name[:1].upper() + name[1:]
@@ -2719,7 +2730,7 @@ def _base_heading(name: str) -> str:
 
 
 def _charter_quote_spot(sections: list[tuple[str, list[str]]], t: int, section: str,
-                        quote: str) -> tuple[int, list[re.Match]]:
+                        quote: str) -> tuple[int, list[tuple[int, int]]]:
     """The section a `quote` edit goes to, and where `quote` matches in it: section `t`, unless it
     matches nowhere there; then the one other section with the same base heading (a legacy
     "(added ...)" duplicate) holding its only match. Raises when it matches in several of those."""
@@ -2740,46 +2751,97 @@ def _charter_quote_spot(sections: list[tuple[str, list[str]]], t: int, section: 
     return t, hits
 
 
-def _quote_hits(body: str, quote: str) -> list[re.Match]:
-    """Where `quote` occurs in `body`, line breaks and runs of spaces counting as one space. A quote
-    that starts or ends with a letter or digit matches only whole words there ("ever merge." does
-    not match inside "Never merge."). A quote found nowhere that way is matched tolerantly
-    (_loose_quote_hits)."""
+def _quote_hits(body: str, quote: str) -> list[tuple[int, int]]:
+    """Where `quote` occurs in `body`, as (start, end) spans, line breaks and runs of spaces counting
+    as one space. A quote that starts or ends with a letter or digit matches only whole words there
+    ("ever merge." does not match inside "Never merge."). A quote found nowhere that way may still
+    name one item (_item_quote_hits)."""
     words = quote.split()
     if not words:
         return []
     pat = r"\s+".join(map(re.escape, words))
     pat = (r"(?<!\w)" if re.match(r"\w", words[0]) else "") + pat + (r"(?!\w)" if re.search(r"\w$", words[-1]) else "")
-    return list(re.finditer(pat, body)) or _loose_quote_hits(body, quote)
+    return [m.span() for m in re.finditer(pat, body)] or _item_quote_hits(body, quote)
 
 
 _EMPH = "*_`"   # markdown emphasis and code marks
 _SMART = str.maketrans({"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"'})
-_QUOTE_CLASS = {"'": "['\u2018\u2019]", '"': '["\u201c\u201d]'}
 _BULLET = r"(?:[-*+]|\d+[.)])\s+"
+_END_PUNCT = ".,;:!?"
 
 
-def _loose_quote_hits(body: str, quote: str) -> list[re.Match]:
-    """Where `quote` occurs in `body` ignoring case, a leading bullet marker, markdown emphasis
-    around words, the bullet markers between items, smart or straight quotes and its trailing
-    punctuation (taken along when the item has it). Whole words only, as in _quote_hits."""
-    q = re.sub(r"^\s*" + _BULLET, "", quote.translate(_SMART))
-    words = [w.strip(_EMPH) for w in q.split()]
-    words = [w for w in words if w]
-    if words:
-        words[-1] = words[-1].rstrip(".,;:!?" + _EMPH)
-    words = [w for w in words if w]
-    if not words:
+def _item_quote_hits(body: str, quote: str) -> list[tuple[int, int]]:
+    """Where a `quote` that matches nowhere exactly names one item of `body` (_items), compared
+    ignoring a leading bullet marker, case, runs of spaces, smart quotes and end punctuation
+    (_norm): the item it equals as a whole (the span is the item's text after its bullet marker),
+    else the one place it occurs inside an item, whole words only (the span is that text, with the
+    end punctuation that follows it when the quote ends with some). Each item is compared on its
+    own, so a span never reaches across items. Anything else (no item, several, text spanning
+    items) matches nothing, and the rejection names the closest items. Known gap, by design: a
+    quote that spans several items needs their exact text, or `replaces`."""
+    want = _norm(re.sub(r"^\s*" + _BULLET, "", quote))[0]
+    if not want:
         return []
-    emph = f"[{re.escape(_EMPH)}]*"
+    items = [(s, e, *_norm(body[s:e])) for s, e, _ in _items(body)]
+    whole = [(s, e) for s, e, have, _ in items if have == want]
+    if whole:
+        return whole if len(whole) == 1 else []
+    pat = ((r"(?<!\w)" if re.match(r"\w", want) else "") + re.escape(want)
+           + (r"(?!\w)" if re.search(r"\w$", want) else ""))
+    spans = [(s + at[m.start(1)], s + at[m.end(1) - 1] + 1, e)
+             for s, e, have, at in items for m in re.finditer(f"(?=({pat}))", have)]
+    if len(spans) != 1:
+        return []
+    s, end, e = spans[0]
+    if quote.rstrip()[-1:] in _END_PUNCT:   # the quote's end punctuation names the item's
+        while end < e and body[end] in _END_PUNCT:
+            end += 1
+    return [(s, end)]
 
-    def word(w: str) -> str:   # emphasis may also close before a word's punctuation ("**first**,")
-        lead, core, trail = re.fullmatch(r"(\W*)(.*?)(\W*)", w).groups()
-        return emph.join("".join(_QUOTE_CLASS.get(c, re.escape(c)) for c in x) for x in (lead, core, trail) if x)
-    pat = (emph + r"\s+(?:" + _BULLET + ")?" + emph).join(map(word, words))
-    head = rf"(?<![\w{re.escape(_EMPH)}])" + emph if re.match(r"\w", words[0]) else ""
-    tail = (r"(?!\w)" if re.search(r"\w$", words[-1]) else "") + emph + r"[.,;:!?]?" + emph
-    return list(re.finditer(head + pat + tail, body, re.I))
+
+def _items(body: str) -> list[tuple[int, int, bool]]:
+    """The items of a section's body: each bullet with the lines that continue it, and each
+    paragraph, as (start of its text after any bullet marker, end of its text, whether it is a
+    bullet). A blank line or a bullet ends an item."""
+    out: list[list] = []
+    cur, pos = None, 0
+    for line in body.split("\n"):
+        end = pos + len(line.rstrip())
+        bullet = re.match(r"\s*" + _BULLET, line)
+        if not line.strip():
+            cur = None
+        elif bullet or cur is None:
+            cur = [pos + (bullet.end() if bullet else len(line) - len(line.lstrip())), end, bool(bullet)]
+            out.append(cur)
+        else:
+            cur[1] = end
+        pos += len(line) + 1
+    return [(s, e, b) for s, e, b in out]
+
+
+def _norm(text: str) -> tuple[str, list[int]]:
+    """`text` as _item_quote_hits compares it: straight quotes, single spaces, case folded, no
+    leading spaces or trailing spaces and end punctuation; with the offset in `text` of each of
+    its characters."""
+    out: list[str] = []
+    at: list[int] = []
+    for i, c in enumerate(text.translate(_SMART)):
+        if c.isspace():
+            if not out or out[-1] == " ":
+                continue
+            c = " "
+        for x in c.casefold():
+            out.append(x)
+            at.append(i)
+    while out and (out[-1] == " " or out[-1] in _END_PUNCT):
+        out.pop()
+        at.pop()
+    return "".join(out), at
+
+
+def _in_bullet(body: str, s: int) -> bool:
+    """Whether offset `s` of a section's body is in a bullet's text, after its marker (_items)."""
+    return any(b and a <= s <= e for a, e, b in _items(body))
 
 
 def _loose(text: str) -> str:

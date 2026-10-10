@@ -180,8 +180,9 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
   lift) is rejected, quoting it; resend it with `quote` (`both_hold`: true when both truly hold).
   In the user's turn only a sentence that may lift such an item ("may", "allowed", "except") is
   rejected: a duty or goal that just shares words goes in, and a note names the items it overlaps.
-  A `quote` tolerates bullets, emphasis, case, smart quotes and end punctuation; a miss names
-  the closest items: resend one exactly. A `## Charter conflicts` digest section lists item pairs that
+  A `quote` with no exact match may still name one whole item, or text inside one item, by its
+  words (bullet, case, spacing, smart quotes and end punctuation aside); a quote spanning items
+  needs their exact text, or `replaces`. A miss names the closest items: resend one exactly. A `## Charter conflicts` digest section lists item pairs that
   may contradict, each with a key. Most only share a word or one limits the other: settle those with
   `{"type": "charter_update", "both_hold": true, "key": "<key>"}` (no text, no ask). Only when the
   user's newer word replaced one side, retire it that turn (`quote`, `over` naming that word).
@@ -189,7 +190,8 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
   same change, fixed, in a later turn without asking again. It applies once only, with the same
   section, target and text, for `coordinator.charter_approval_days` (7 by default). If it is refused
   as different text, used or expired, the rejection says which. A `charter_retry` event raises
-  such a pending change again after the guard changed (or daily): apply it as it says.
+  such a pending change once more (a day later, or after a guard change): fix what its error names
+  and send it. One the guard refused is not raised again: its rejection names both fixes.
 - Temporary instructions: when the user's words are temporary ("while X", "until Y", "for now",
   "this week"), record the end with the entry: `expires` (a delay such as `3d` or an ISO time),
   `until` (the end in plain words) and, when a shell check can tell, `until_probe` (read-only,

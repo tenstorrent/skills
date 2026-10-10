@@ -3157,8 +3157,8 @@ class Daemon:
 
     def lint_charter(self) -> None:
         """Flag dated charter sections that contradict a standing restriction (coord.charter_lint);
-        a stat call per tick, the scan only when the charter changed. Then raise the user's refused
-        charter changes again after a guard change, or daily (coord.reraise_charter_changes)."""
+        a stat call per tick, the scan only when the charter changed. Then raise a user's charter
+        change that failed, but not on the guard's refusal, again once (coord.reraise_charter_changes)."""
         try:
             coord.charter_lint(self.p)
         except Exception:

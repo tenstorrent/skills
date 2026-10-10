@@ -5079,72 +5079,185 @@ def test_a_user_turn_loosening_via_quote_still_replaces_the_ban(env):
     assert f"### Replaced in Restrictions (" in hist and f"user message #{said}, turn 2.0)" in hist, hist
 
 
-def test_charter_quote_matches_tolerantly_and_a_miss_names_the_closest_items(env):
+def test_charter_quote_names_one_whole_item_or_text_inside_one(env):
     p = make(env)
     from ttp import coordinator as coord
-    p.charter_path.write_text("# demo\n\n## Policies\n- **Review first**, then push.\n- Label every \u201cnumber\u201d.\n"
-                              "- Notify only for decisions.\n\n## Restrictions\n- Never merge.\n")
+    p.charter_path.write_text("# demo\n\n## Policies\n- Review first, then push.\n- Label every \u201cnumber\u201d.\n"
+                              "- Notify only for decisions.\n- **Bold** rules stay as written.\n\n"
+                              "## Restrictions\n- Never merge.\n- Never push to main.\n")
     act = {"type": "charter_update", "section": "Policies", "both_hold": True}
-    # Emphasis, a leading bullet, smart quotes, case and trailing punctuation do not stop a match.
-    assert coord.apply(p, [{**act, "quote": "- Review first, then push", "text": "Review, then push."}],
+    # One whole item, its bullet, case, smart quotes and end punctuation aside: the item is replaced
+    # and keeps its own bullet.
+    assert coord.apply(p, [{**act, "quote": "- review first, then push", "text": "Review, then push."}],
                        turn=1) == []
-    assert "- Review, then push.\n" in p.charter_path.read_text(), p.charter_path.read_text()
+    assert "\n- Review, then push.\n" in p.charter_path.read_text(), p.charter_path.read_text()
     assert coord.apply(p, [{**act, "quote": 'label every "number"!', "text": "Label numbers."}], turn=2) == []
-    assert "- Label numbers.\n" in p.charter_path.read_text(), p.charter_path.read_text()
-    assert coord.apply(p, [{**act, "quote": "Notify only for decisions"}], turn=3) == []
-    assert "Notify only" not in p.charter_path.read_text()
-    # Whole words still: no match inside a word.
-    assert "matches 0 times" in coord.apply(p, [{"type": "charter_update", "section": "Restrictions",
-                                                 "quote": "ever merge."}], turn=4, user_turn=True)[0]
+    assert "\n- Label numbers.\n" in p.charter_path.read_text(), p.charter_path.read_text()
+    restr = {"type": "charter_update", "section": "Restrictions"}
+    assert coord.apply(p, [{**restr, "quote": "never push to main", "text": "Never push to main unreviewed."}],
+                       turn=3, user_turn=True) == []
+    assert "\n- Never push to main unreviewed.\n" in p.charter_path.read_text(), p.charter_path.read_text()
+    # Text inside one item, whole words: only that text is replaced, or removed.
+    assert coord.apply(p, [{**act, "quote": "NOTIFY ONLY", "text": "Ping only"}], turn=4) == []
+    assert "\n- Ping only for decisions.\n" in p.charter_path.read_text(), p.charter_path.read_text()
+    assert coord.apply(p, [{**act, "quote": "ping only for decisions"}], turn=5) == []
+    assert "Ping only" not in p.charter_path.read_text()
+    # Not inside a word, nor across emphasis marks (no tolerance for those: the miss names the item).
+    assert "matches 0 times" in coord.apply(p, [{**restr, "quote": "ever merge."}], turn=6, user_turn=True)[0]
+    err = coord.apply(p, [{**act, "quote": "Bold rules stay as written"}], turn=7)[0]
+    assert "matches 0 times" in err and "\"**Bold** rules stay as written.\" (section 'Policies')" in err, err
     # A miss names the closest items, in any section, so the next turn can resend one exactly.
-    err = coord.apply(p, [{**act, "quote": "Review, then push to main."}], turn=5)[0]
+    err = coord.apply(p, [{**act, "quote": "Review, then push to main."}], turn=8)[0]
     assert "matches 0 times" in err and "closest: \"Review, then push.\" (section 'Policies')" in err, err
-    err = coord.apply(p, [{**act, "quote": "Never merge PRs."}], turn=6)[0]
+    err = coord.apply(p, [{**act, "quote": "Never merge PRs."}], turn=9)[0]
     assert "\"Never merge.\" (section 'Restrictions')" in err, err
-    assert "closest" not in coord.apply(p, [{**act, "quote": "Completely unrelated words here."}], turn=7)[0]
+    assert "closest" not in coord.apply(p, [{**act, "quote": "Completely unrelated words here."}], turn=10)[0]
 
 
-def test_a_refused_user_charter_change_is_raised_again_after_a_guard_change(env, monkeypatch):
+def test_charter_item_quote_hits_take_one_item_and_nothing_across_items():
+    from ttp.coordinator import _item_quote_hits, _quote_hits
+    body = ("- Never push to main.\n- Keep content generic.\n- Never push to main.\n"
+            "- Merge after review,\n  only on green CI.\n\nA paragraph\nwrapped here.")
+    def hit(quote):
+        return [body[s:e] for s, e in _quote_hits(body, quote)]
+    assert hit("keep content GENERIC") == ["Keep content generic."]          # the whole item
+    assert hit("merge after review, only on green ci") == ["Merge after review,\n  only on green CI."]
+    assert hit("content") == ["content"] and hit("paragraph wrapped") == ["paragraph\nwrapped"]
+    assert hit("on green ci.") == ["on green CI."]   # the quote's end punctuation takes the item's along
+    # Across items, the same text in two items, a word cut short, or nothing in common: no match.
+    for quote in ("main. Keep content", "main.\n- keep content", "never push to main", "push to main",
+                  "eep content", "generic. - Never", "review, only on green CI. A paragraph"):
+        assert _item_quote_hits(body, quote) == [], quote
+
+
+def test_a_loose_charter_quote_across_two_items_is_refused_in_and_out_of_user_turns(env):
     p = make(env)
     from ttp import coordinator as coord
     db = p.db
+    said = db.post("in", "replace that", chat=None, channel="web", kind="user", provenance="web-session")
+    before = "# demo\n\n## Restrictions\n- Never push to main.\n- Keep content generic.\n"
+    act = {"type": "charter_update", "section": "Restrictions", "quote": "main. Keep content", "text": "zzz"}
+    for kw in ({"user_turn": True, "messages": [said]}, {}):
+        p.charter_path.write_text(before)
+        a = {**act} if kw else {**act, "over": "the user's message #1 ended it on 2026-10-01"}
+        err = coord.apply(p, [a], turn=11 if kw else 12, **kw)
+        assert len(err) == 1 and "matches 0 times" in err[0] and "closest: " in err[0], err
+        assert p.charter_path.read_text() == before, p.charter_path.read_text()   # was "- Never push to zzz generic."
 
-    def retries():
-        return [r["text"] for r in db.q("SELECT text FROM events WHERE kind='charter_retry' AND status='queued'")]
+
+def test_text_put_into_a_bullet_item_keeps_one_bullet_in_and_out_of_user_turns(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    db = p.db
+    said = db.post("in", "pushes to main need review", chat=None, channel="web", kind="user",
+                   provenance="web-session")
+    before = "# demo\n\n## Restrictions\n- Never push to main.\n- Keep content generic.\n"
+    text = "- Never push to main without review."
+    # A bulleted quote that only an item match finds (case), and an exact quote after the marker.
+    for n, quote in enumerate(("- never push to main.", "Never push to main.")):
+        for kw in ({"user_turn": True, "messages": [said]}, {}):
+            p.charter_path.write_text(before)
+            a = {"type": "charter_update", "section": "Restrictions", "quote": quote, "text": text}
+            if not kw:
+                a["over"] = "the user's message #1 changed it on 2026-10-01"
+            assert coord.apply(p, [a], turn=20 + 2 * n + bool(kw), **kw) == []
+            got = p.charter_path.read_text()
+            assert got == "# demo\n\n## Restrictions\n- Never push to main without review.\n- Keep content generic.\n", got
+    # A quote that takes the marker along gets the text's own bullet.
+    p.charter_path.write_text(before)
+    assert coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "quote": "- Keep content generic.",
+                            "text": "- Keep content generic and safe."}], turn=30, user_turn=True,
+                       messages=[said]) == []
+    assert "\n- Keep content generic and safe.\n" in p.charter_path.read_text(), p.charter_path.read_text()
+
+
+def _retries(db):
+    return [r["text"] for r in db.q("SELECT text FROM events WHERE kind='charter_retry'")]
+
+
+def test_a_guard_refused_charter_change_is_never_raised_again(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    db = p.db
     p.charter_path.write_text(_BANS)
-    said = db.post("in", "new prime directive", chat=None, channel="web", kind="user", provenance="web-session")
-    # What an older guard left on record: the directive refused, kept only as the quoted resend of
-    # each item it was said to contradict.
-    for item in ("Push only to branch work/x of the repo.", "Never push to main."):
-        coord._record_charter_approval(p, [said], "Restrictions", item, "", _SELF_HEALING, None, coord.GUARD_REJECTED)
-    # A failed quote of the user's, kept as sent.
-    coord._record_charter_approval(p, [said], "Policies", "Review first!!", "", "Review twice.", None,
-                                   "charter_update: `quote` matches 0 times in 'Policies'")
+    said = db.post("in", "hotfixes may go to main", chat=None, channel="web", kind="user", provenance="web-session")
+    lift = {"type": "charter_update", "section": "Policies", "text": "Workers may push to main for hotfixes."}
+    # In the user's turn: refused, naming both fixes (the quoted resend and both_hold).
+    err = coord.apply(p, [lift], turn=1, user_turn=True, messages=[said])
+    assert len(err) == 1 and "\"Never push to main.\"" in err[0] and "`quote` \"" in err[0], err
+    assert "`both_hold`" in err[0] and "apply it now" not in err[0], err
+    # Outside one: a change of the user's that failed for another reason (an ambiguous heading),
+    # resent on the user's yes on record (`over` too) and refused by the guard: its newest failure.
+    p.charter_path.write_text(_BANS + "\n## Goals A\nShip.\n\n## Goals B\nTest.\n")
+    other = {"type": "charter_update", "section": "Goals", "replaces": "Goals",
+             "text": "Workers may push to main for releases."}
+    err = coord.apply(p, [other], turn=2, user_turn=True, messages=[said])
+    assert len(err) == 1 and "matches 2 charter sections" in err[0], err
+    err = coord.apply(p, [{"type": "charter_update", "section": "Goals", "text": other["text"],
+                           "over": "the user's message on 2026-10-01"}], turn=3)
+    assert len(err) == 1 and "contradicts the Restrictions item" in err[0], err
+    have = db.kv(coord.CHARTER_APPROVALS_KEY)
+    assert {coord.GUARD_REJECTED in r["failed"] for r in have} == {True, False}, have
+    # Never raised: on the next tick, a day later (the first event handled meanwhile), nor after a
+    # guard change.
+    t = time.time()
+    db.set_kv(coord.CHARTER_RERAISE_KEY, {})
+    for now in (t, t + 1, t + 86400 + 60, t + 2 * 86400 + 120):
+        assert coord.reraise_charter_changes(p, now=now) == []
+        db.x("UPDATE events SET status='handled' WHERE kind='charter_retry'")
+    db.set_kv(coord.CHARTER_RERAISE_KEY, {"version": coord.CHARTER_GUARD_VERSION - 1, "ts": t})
+    assert coord.reraise_charter_changes(p, now=t + 3 * 86400) == [] and _retries(db) == []
+
+
+def test_another_failed_charter_change_is_raised_once(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    db = p.db
+    p.charter_path.write_text("# demo\n\n## Goals A\nShip.\n\n## Goals B\nTest.\n\n## Restrictions\n- Never merge.\n")
+    said = db.post("in", "goals: ship v2", chat=None, channel="web", kind="user", provenance="web-session")
+    act = {"type": "charter_update", "section": "Goals", "replaces": "Goals", "text": "Ship v2."}
+    assert "matches 2 charter sections" in coord.apply(p, [act], turn=1, user_turn=True, messages=[said])[0]
+    t = time.time()
+    db.set_kv(coord.CHARTER_RERAISE_KEY, {})
+    assert coord.reraise_charter_changes(p, now=t + 60) == []   # the coordinator has the error already
+    out = coord.reraise_charter_changes(p, now=t + 86400 + 120)   # still pending a day later: once
+    assert len(out) == 1 and _retries(db) == out, out
+    assert f"message #{said}" in out[0] and "`replaces` 'Goals'" in out[0] and "Fix what that error names" in out[0]
+    assert "apply it now" not in out[0]
+    assert "charter_retry" in coord.UNBLOCK_KINDS
+    db.x("UPDATE events SET status='handled' WHERE kind='charter_retry'")
+    assert coord.reraise_charter_changes(p, now=t + 2 * 86400 + 180) == []
+    db.set_kv(coord.CHARTER_RERAISE_KEY, {"version": coord.CHARTER_GUARD_VERSION - 1, "ts": t})
+    assert coord.reraise_charter_changes(p, now=t + 3 * 86400) == [] and len(_retries(db)) == 1
+    # One that failed under an older guard is raised on the first pass after the change, at once.
+    have = db.kv(coord.CHARTER_APPROVALS_KEY)
+    coord._record_charter_approval(p, [said], "Restrictions", "Never merge PRs.", "", "Merge on green.", None,
+                                   "charter_update: `quote` matches 0 times in 'Restrictions'")
+    have = db.kv(coord.CHARTER_APPROVALS_KEY)
+    have[-1]["guard"] = coord.CHARTER_GUARD_VERSION - 1
+    db.set_kv(coord.CHARTER_APPROVALS_KEY, have)
     db.set_kv(coord.CHARTER_RERAISE_KEY, {"version": coord.CHARTER_GUARD_VERSION - 1, "ts": time.time()})
     out = coord.reraise_charter_changes(p)
-    assert len(out) == 2 and retries() == out, out
-    directive = next(x for x in out if "Self-healing" in x)
-    assert f"message #{said}" in directive and "no `quote`" in directive and "\"Never push to main.\"" in directive
-    assert "charter_retry" in coord.UNBLOCK_KINDS
-    # Not again the same day for the same guard; a day later again, without duplicating a queued one.
-    assert coord.reraise_charter_changes(p) == []
-    assert coord.reraise_charter_changes(p, now=time.time() + 86400 + 60) == [] and len(retries()) == 2
-    # The coordinator's resend, outside a user turn, goes in on the user's word on record, as an
-    # addition in the section it chose, and both bans stay.
-    assert coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": _SELF_HEALING}], turn=9) == []
-    assert coord.apply(p, [{"type": "charter_update", "section": "Policies", "quote": "Review first",
-                            "text": "Review twice."}], turn=10) == []
-    charter = p.charter_path.read_text()
-    assert _SELF_HEALING in charter and "Never push to main." in charter and "Review twice." in charter
-    assert f"user message #{said}, turn 9.0)" in (p.harness / coord.CHARTER_HISTORY).read_text()
-    # Landed or used: never raised again.
-    db.x("DELETE FROM events")
-    db.set_kv(coord.CHARTER_RERAISE_KEY, {"version": 0, "ts": 0})
-    assert coord.reraise_charter_changes(p) == []
-    # Expired approvals are not raised either.
-    coord._record_charter_approval(p, [said], "Goals", "", "", "Ship v2.", None, "x")
-    db.set_kv(coord.CHARTER_RERAISE_KEY, {"version": 0, "ts": 0})
-    assert coord.reraise_charter_changes(p, now=time.time() + 8 * 86400) == []
+    assert len(out) == 1 and "may go through as sent" in out[0] and "`quote` 'Never merge PRs.'" in out[0], out
+    # Landed or expired: not raised.
+    coord._record_charter_approval(p, [said], "Goals", "", "", "Ship.", None, "x")
+    db.set_kv(coord.CHARTER_RERAISE_KEY, {})
+    assert coord.reraise_charter_changes(p, now=time.time() + 86400 + 60) == []
+    coord._record_charter_approval(p, [said], "Goals", "", "", "Ship v3.", None, "x")
+    db.set_kv(coord.CHARTER_RERAISE_KEY, {})
+    assert coord.reraise_charter_changes(p, now=time.time() + 8 * 86400) == [] and len(_retries(db)) == 2
+
+
+def test_a_charter_guard_source_change_needs_a_version_bump():
+    import hashlib
+    import inspect
+    from ttp import coordinator as coord
+    src = "".join(inspect.getsource(getattr(coord, name)) for name in coord.CHARTER_GUARD_FUNCS)
+    sha = hashlib.sha256(src.encode()).hexdigest()
+    version, pinned = coord.CHARTER_GUARD_PIN
+    want = (coord.CHARTER_GUARD_VERSION + (version == coord.CHARTER_GUARD_VERSION), sha)
+    assert (version, pinned) == (coord.CHARTER_GUARD_VERSION, sha), (
+        f"the charter guard's source changed: set CHARTER_GUARD_VERSION = {want[0]} and CHARTER_GUARD_PIN = {want!r}")
 
 
 def test_restriction_pairs_flags_contradicting_restrictions_items_and_only_those(env):
