@@ -725,6 +725,22 @@ def check_start_when(probe: str, p: Project | None = None) -> None:
                              f"start_when `landed:#<id>`, or for a commit with `ttp landed <sha>`")
 
 
+# A probe that only tests that a readiness marker file exists (`test -f state/ready/<box>.READY`,
+# `[ -e ... ]`, joined by && at most): such a file outlives the resource going down, so the task
+# would start at once against a dead box. A flag only, never a refusal.
+_FILE_TEST = r"(?:test\s+-[efs]\s+\S+|\[\[?\s+-[efs]\s+\S+\s+\]\]?)"
+_MARKER_ONLY = re.compile(rf"\s*{_FILE_TEST}(?:\s*&&\s*{_FILE_TEST})*\s*")
+
+
+def marker_only_probe(probe: str | None) -> str | None:
+    """A hint when a start_when only checks that a readiness marker file exists, else None."""
+    if not probe or not _MARKER_ONLY.fullmatch(probe) or not re.search(r"ready", probe, re.I):
+        return None
+    return (f"start_when {clip(probe, 120)!r} only checks a readiness marker file, which can outlive the "
+            f"resource going down: prefer a live read-only probe (e.g. the device broker's status), or "
+            f"make sure whatever writes the marker removes it when the resource is paused or fails")
+
+
 HOLD_NEEDS_ANCHOR = ("a hold needs `waits_on`: ask:<id> (an open ask, or ask:new for the ask_user of this turn), "
                      "resource:<name>, until:<time> or when:<probe>. A hold never replaces an ask or a decision: "
                      "decide it yourself (requeue or cancel, memory_add the decision), or ask_user with a valid "
@@ -948,6 +964,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     labels.append(f"continues:{old['id']}")
                 after, when = _start_args(a, {}, p)
                 labels += defer_labels(after, when, start_why(a, {}, when))
+                stale = marker_only_probe(when)
                 why = prguard.spec_problem(db, a.get("spec") or "")
                 if why:
                     raise ValueError(f"task_add rejected: {why}")
@@ -973,6 +990,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     how = f"continues #{old['id']}" if taken else f"labelled pr_branch:{carried[1]}"
                     notes.append(f"task_add: #{new_id} names #{carried[0]['id']}'s branch {carried[1]}: {how}, "
                                  f"so `ttp push --own` publishes onto it")
+                if stale:
+                    notes.append(f"task_add: #{new_id} added; flagged: {stale}")
                 if pr_ask:
                     notes.append(f"task_add: #{new_id} added as `code`, not `{a.get('kind') or 'work'}`: it asks for "
                                  f"PR delivery ({pr_ask!r}) and only code tasks open or update PRs")
@@ -1035,6 +1054,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     labels = json.loads(task["labels"] or "[]") if labels is None else labels
                     upd["labels"] = without_deferral(labels) + defer_labels(after, when, start_why(a, cur, when))
                     upd["not_before"] = after
+                    stale = marker_only_probe(when) if when != cur.get("when") else None
+                    if stale:
+                        notes.append(f"task_update: #{task['id']} flagged: {stale}")
                 # The daemon blocks a queued task on a dead dependency at once, so accepting this
                 # would report a requeue that does not stick.
                 if upd.get("status", task["status"]) == "queued" and ("status" in upd or "depends_on" in upd):

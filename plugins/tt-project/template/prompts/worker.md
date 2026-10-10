@@ -149,7 +149,9 @@ never write to a run folder named in earlier context):
   `retry_when`. It also exits 0 when a job hangs (in progress past 3x its recent median). On waking,
   run it again and report any `hung:` line in your hand-off; to keep waiting after that, add `--no-hang`.
   For a wait with several steps (build, then device run), chain them in one detached driver script
-  that writes a final marker, and point `retry_when` at that marker.
+  that writes a final marker, and point `retry_when` at that marker. A wait for a device or box to
+  be usable checks it live (its broker's status, read-only), never a readiness marker file, which
+  outlives the box going down.
   When only checking the outcome is left after the wait, name that check as `on_pass_cmd`: once
   `retry_when` passes, the daemon runs it model-free from the project root (killed after
   `waiting.on_pass_timeout_s`, 600 s by default). Exit 0 with a `done` hand-off written to `$TTP_RESULT`

@@ -110,6 +110,10 @@ time you set without a zone (`start_after`, `until:`, a schedule's `at`) is read
   `coordinator.defer_max_days`, comes back as an event. Defer with these fields, never with a
   memory note ("deferred", "once X", "N days after Y"). A follow-up that carries them is added
   with them; if it names memory entries it replaces, `memory_forget` those in the same turn.
+- A `start_when` that waits for a device or box uses a live read-only probe (the broker's status,
+  `tt-box-clean-probe`), never a bare marker file (`test -f .../<box>.READY`): a marker outlives
+  the box going down, so the task would start against a dead box. A marker you do use must be
+  removed by whatever writes it when the resource is paused, shows trouble or fails its check.
 - Work that waits for another task's change to land on the push branch: `start_when`
   `landed:#<id>`. It passes once that task's landed commit is on the branch, which the push queue
   records per task. Never wait on a raw sha (`git merge-base --is-ancestor <sha> ...`): pushing

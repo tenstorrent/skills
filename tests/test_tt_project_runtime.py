@@ -25970,6 +25970,44 @@ def test_task_update_start_when_real_probe_is_still_stored(env):
     assert "start_when:test -f out/now" in _labels(p, tid) and not _ready(p, tid)
 
 
+@pytest.mark.parametrize("probe", [
+    "test -f tt-project/state/ready/box1.READY",
+    "[ -e state/ready/box1.ready ]",
+    "[[ -f a/READY ]] && test -s b/box2.READY",
+])
+def test_a_start_when_that_only_tests_a_ready_marker_is_flagged_not_refused(env, probe):
+    # A readiness marker outlives the resource going down: the task would start against a dead box.
+    p = make(env)
+    from ttp import cli
+    from ttp import coordinator as coord
+    assert coord.apply(p, [{"type": "task_add", "title": "dev", "spec": "s", "start_when": probe}]) == []
+    tid = _added(p, "dev")
+    assert f"start_when:{probe}" in _labels(p, tid)   # added and deferred as asked
+    notes = p.db.kv(coord.NOTES_KEY)
+    assert len(notes) == 1 and "flagged" in notes[0] and "live read-only probe" in notes[0]
+    assert coord.apply(p, [{"type": "task_add", "title": "t2", "spec": "s"}]) == []
+    t2 = _added(p, "t2")
+    assert coord.apply(p, [{"type": "task_update", "id": t2, "start_when": probe}]) == []
+    notes = p.db.kv(coord.NOTES_KEY)
+    assert len(notes) == 1 and f"#{t2} flagged" in notes[0] and f"start_when:{probe}" in _labels(p, t2)
+    assert coord.apply(p, [{"type": "task_update", "id": t2, "why": "box is up"}]) == []
+    assert p.db.kv(coord.NOTES_KEY) == []   # the same probe again: no repeat
+    assert cli.set_when(p.db, t2, "", p) == f"task #{t2} start_when cleared"
+    assert "; flagged: " in cli.set_when(p.db, t2, probe, p)
+
+
+@pytest.mark.parametrize("probe", [
+    "test -f out/now",                                          # a marker, but no readiness marker
+    "test -f state/ready/box1.READY && broker-status --healthy",  # a live check alongside it
+    "ttp lock --probe box1-ready",
+])
+def test_a_start_when_with_a_live_check_or_no_ready_marker_is_not_flagged(env, probe):
+    p = make(env)
+    from ttp import coordinator as coord
+    assert coord.apply(p, [{"type": "task_add", "title": "ok", "spec": "s", "start_when": probe}]) == []
+    assert p.db.kv(coord.NOTES_KEY) == [] and coord.marker_only_probe(probe) is None
+
+
 def test_parse_start_after_now_any_case_or_empty_clears(env):
     from ttp import coordinator as coord
     for v in ("now", "NOW", " Now ", ""):
