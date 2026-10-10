@@ -132,13 +132,14 @@ def _issue(db: DB, fp: str, source: str, title: str, retitle: str | None, hint: 
         if row["status"] == "fixed":
             # Seen again after it was fixed or closed: it wakes when this sighting is at or above the floor.
             sev = hint if seen_at >= 0 else row["severity"]
-            db.x("UPDATE issues SET status=?, severity=?, closed=NULL, cleared_why=NULL WHERE id=?",
-                 ("open" if sev != "info" else "ignored", sev, row["id"]))
+            db.x("UPDATE issues SET status=?, severity=?, closed=NULL, cleared_why=NULL, opened=? WHERE id=?",
+                 ("open" if sev != "info" else "ignored", sev, now, row["id"]))
             v = Verdict(SEVERITY_RANK.get(sev, 1) >= floor, sev, "regressed after fix", fp, row["id"], "dedupe")
             return _jev_missed(db, row, v)
         if seen_at > rank and seen_at >= floor:
             # The watcher now rates it higher than before (a condition kept quiet that turned serious).
-            db.x("UPDATE issues SET status='open', severity=? WHERE id=?", (hint, row["id"]))
+            db.x("UPDATE issues SET status='open', severity=?, opened=CASE WHEN status='open' THEN opened ELSE ? END "
+                 "WHERE id=?", (hint, now, row["id"]))
             return _jev_missed(db, row, Verdict(True, str(hint), f"now {hint}", fp, row["id"], "dedupe"))
         reason = "known issue"
         if row["status"] == "open" and rank >= floor:
@@ -150,9 +151,9 @@ def _issue(db: DB, fp: str, source: str, title: str, retitle: str | None, hint: 
 
     severity, verdict_src, reason, info = judge()
     issue_id = db.x("INSERT INTO issues(fingerprint,source,first_seen,last_seen,count,title,severity,status,screen,"
-                    "lifecycle,subject) VALUES(?,?,?,?,1,?,?,?,?,?,?)",
+                    "lifecycle,subject,opened) VALUES(?,?,?,?,1,?,?,?,?,?,?,?)",
                     (fp, source, now, now, title, severity, "open" if severity != "info" else "ignored",
-                     json.dumps({"by": verdict_src, "reason": reason, **info}), lifecycle, subject))
+                     json.dumps({"by": verdict_src, "reason": reason, **info}), lifecycle, subject, now))
     if info.get("jev_call"):
         jevuse.set_ref(db, info["jev_call"], f"issue:{issue_id}")
     return Verdict(SEVERITY_RANK.get(severity, 1) >= floor, severity, reason, fp, issue_id, verdict_src)

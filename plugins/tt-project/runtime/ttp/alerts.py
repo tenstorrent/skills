@@ -115,8 +115,9 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
         return (db.kv("gates", {}).get(arg) or {}).get("level") == "red"
     if kind == "relayed":   # conditions told to the chat while the coordinator could not run: while one is open
         ids = [int(x) for x in arg.split(",") if x.isdigit()]
-        return bool(ids) and bool(db.one(f"SELECT id FROM issues WHERE status='open' AND id IN "
-                                         f"({','.join('?' * len(ids))}) LIMIT 1", ids))
+        # One reopened after the relay is a new stretch, told by a relay of its own.
+        return bool(ids) and bool(db.one(f"SELECT id FROM issues WHERE status='open' AND COALESCE(opened,first_seen)<=? "
+                                         f"AND id IN ({','.join('?' * len(ids))}) LIMIT 1", [since, *ids]))
     if key == "disk":
         return bool(db.kv("disk_low"))
     if key == "coordinator":

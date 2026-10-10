@@ -88,7 +88,7 @@ CREATE TABLE IF NOT EXISTS issues (
   id INTEGER PRIMARY KEY AUTOINCREMENT, fingerprint TEXT UNIQUE, source TEXT,
   first_seen REAL, last_seen REAL, count INTEGER DEFAULT 1, title TEXT,
   severity TEXT DEFAULT 'normal', status TEXT DEFAULT 'open', task INTEGER, screen TEXT,
-  closed REAL, cleared_why TEXT, lifecycle TEXT, subject TEXT);
+  closed REAL, cleared_why TEXT, lifecycle TEXT, subject TEXT, opened REAL);
 
 CREATE TABLE IF NOT EXISTS schedules (
   name TEXT PRIMARY KEY, kind TEXT NOT NULL, every_s INTEGER NOT NULL, at TEXT,
@@ -175,6 +175,7 @@ class DB:
         self._migrate_jev_changed()
         self._migrate_issue_lifecycle()
         self._migrate_push_landed()
+        self._migrate_issue_opened()
 
     def _migrate_ledger_account(self) -> None:
         """Ledger rows written without an account take the account of the run they booked: the run
@@ -220,6 +221,16 @@ class DB:
             for col in ("lifecycle", "subject"):
                 if col not in have:
                     self.x(f"ALTER TABLE issues ADD COLUMN {col} TEXT")
+
+    def _migrate_issue_opened(self) -> None:
+        # When each issue's current open stretch began (screen._issue sets it on insert and on each
+        # reopen). Older issues start theirs at first_seen.
+        if "opened" in {r["name"] for r in self.q("PRAGMA table_info(issues)")}:
+            return
+        with self.tx():
+            if "opened" not in {r["name"] for r in self.q("PRAGMA table_info(issues)")}:
+                self.x("ALTER TABLE issues ADD COLUMN opened REAL")
+                self.x("UPDATE issues SET opened=first_seen")
 
     def _migrate_push_landed(self) -> None:
         # Each pushed or landed row's own commit on the branch (pushq._apply; `ttp landed`). Older

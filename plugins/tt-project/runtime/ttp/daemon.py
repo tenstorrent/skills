@@ -4635,9 +4635,10 @@ class Daemon:
 
     def relay_when_blocked(self) -> None:
         """While the coordinator has been unable to run for BLOCKED_RELAY_AFTER_S, tell the chat
-        model-free about high or critical conditions it never saw (first seen after its last good
-        turn) that persisted RELAY_PERSIST_S and are still open: one line each, at most one message
-        per RELAY_EVERY_S, each condition once. The usual notify floors apply to the message."""
+        model-free about high or critical conditions it never saw (opened, or reopened, after its last
+        good turn) that persisted RELAY_PERSIST_S and are still open: one line each, at most one
+        message per RELAY_EVERY_S, each open stretch of a condition once. The usual notify floors
+        apply to the message."""
         db, now = self.p.db, time.time()
         why = self.coordinator_blocked()
         state = db.kv(COORD_BLOCKED_KEY)
@@ -4654,14 +4655,16 @@ class Daemon:
             return
         last_ok = db.one("SELECT MAX(started) t FROM runs WHERE role='coordinator' AND status='ok'")["t"] or 0
         told = sent.get("ids") or {}
-        rows = [r for r in db.q("SELECT * FROM issues WHERE status='open' AND severity IN ('high','critical') "
-                                "AND first_seen>? AND last_seen-first_seen>=? ORDER BY first_seen",
+        # `opened` is when the current open stretch began: a condition fixed and back again counts anew.
+        rows = [r for r in db.q("SELECT *, COALESCE(opened, first_seen) since FROM issues WHERE status='open' "
+                                "AND severity IN ('high','critical') AND COALESCE(opened, first_seen)>? "
+                                "AND last_seen-COALESCE(opened, first_seen)>=? ORDER BY since",
                                 (float(last_ok), RELAY_PERSIST_S))
-                if str(r["id"]) not in told]
+                if float(told.get(str(r["id"])) or 0) < float(r["since"])]
         if not rows:
             return
         lines = [f"- {r['severity']}: {r['title']} (seen for "
-                 f"{(float(r['last_seen']) - float(r['first_seen'])) / 3600:.1f} h, {r['source']})"
+                 f"{(float(r['last_seen']) - float(r['since'])) / 3600:.1f} h, {r['source']})"
                  for r in rows[:RELAY_MAX_LINES]]
         if len(rows) > RELAY_MAX_LINES:
             lines.append(f"- and {len(rows) - RELAY_MAX_LINES} more")

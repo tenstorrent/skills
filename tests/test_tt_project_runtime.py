@@ -2156,11 +2156,13 @@ def test_migration_closes_old_watcher_issues_once(env, tmp_path):
               "'normal', status TEXT DEFAULT 'open', task INTEGER, screen TEXT)")
     for i, (src, st) in enumerate([("watcher:hw", "open"), ("watcher:hw", "open"), ("watcher:hw", "ignored"),
                                    ("log:app", "open")]):
-        c.execute("INSERT INTO issues(fingerprint, source, title, status) VALUES(?,?,?,?)", (f"f{i}", src, "t", st))
+        c.execute("INSERT INTO issues(fingerprint, source, title, status, first_seen) VALUES(?,?,?,?,?)",
+                  (f"f{i}", src, "t", st, 100.0 + i))
     c.commit()
     c.close()
     db = DB(path)
-    rows = db.q("SELECT source, status, cleared_why FROM issues ORDER BY id")
+    rows = db.q("SELECT source, status, cleared_why, opened FROM issues ORDER BY id")
+    assert [r["opened"] for r in rows] == [100.0, 101.0, 102.0, 103.0]   # open stretches start at first_seen
     assert [r["status"] for r in rows] == ["fixed", "fixed", "ignored", "open"]
     assert rows[0]["cleared_why"] and rows[3]["cleared_why"] is None and db.meta(WATCHER_ISSUES_MIGRATION)
     db.x("UPDATE issues SET status='open' WHERE id=1")
@@ -2982,6 +2984,59 @@ def test_high_conditions_reach_the_chat_model_free_only_while_the_coordinator_ca
     clock["t"] = start + 10 * 3600
     d.relay_when_blocked()
     assert len(told()) == 2
+
+
+def test_a_condition_back_during_the_block_is_relayed_after_two_hours_of_its_new_stretch(env, monkeypatch):
+    p = make(env)
+    from ttp.daemon import Daemon
+    from ttp.screen import _issue
+    from ttp import alerts
+    p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)",
+           (time.time(), "t", time.time()))
+    start = time.time()
+    clock = {"t": start}
+    monkeypatch.setattr(time, "time", lambda: clock["t"])
+    d = Daemon(p.base)
+    told = lambda: [m["text"] for m in p.db.unread_for_chat("c1", 0)]
+    seen = lambda fp, at: _issue(p.db, fp, "watch", fp, None, "high", lambda: ("high", "rule", "new", {}), 2,
+                                 at, None, False)
+    p.db.x("INSERT INTO runs(role,status,started,ended) VALUES('coordinator','ok',?,?)", (start - 3600,) * 2)
+    # Seen 48 h ago (and after the last good turn), fixed since.
+    old = _open_issue(p.db, "box-a is down", first=start - 48 * 3600, last=start - 47 * 3600, status="fixed")
+    late = _open_issue(p.db, "box-b is down", first=start - 1800, last=start - 1700, status="fixed")
+    p.db.x("UPDATE issues SET opened=first_seen")
+    p.db.set_kv("coordinator_failures", 3)
+    d.relay_when_blocked()
+    # 3 h into the block box-a is down again; box-b too, 10 min before the next check.
+    clock["t"] = start + 3 * 3600
+    seen("fp-box-a is down", clock["t"])
+    assert p.db.one("SELECT opened FROM issues WHERE id=?", (old,))["opened"] == clock["t"]
+    clock["t"] = start + 5 * 3600 - 600
+    seen("fp-box-b is down", clock["t"])
+    clock["t"] = start + 5 * 3600
+    seen("fp-box-a is down", clock["t"])
+    seen("fp-box-b is down", clock["t"])
+    d.relay_when_blocked()
+    assert len(told()) == 1
+    assert "\n- high: box-a is down (seen for 2.0 h, watch)" in told()[0]
+    assert "box-b" not in told()[0], "a regressed condition was relayed without 2 h of its new stretch"
+    clock["t"] = start + 6 * 3600 + 1
+    seen("fp-box-a is down", clock["t"])
+    d.relay_when_blocked()
+    assert len(told()) == 1, "box-a was told twice in one stretch, or box-b before 2 h"
+    # box-a recovers, then is down again: its old alert does not stand for the new stretch, and the
+    # new stretch is relayed on its own once it has lasted 2 h.
+    first = p.db.one("SELECT ref, ts FROM messages WHERE ref LIKE 'relayed:%'")
+    p.db.x("UPDATE issues SET status='fixed' WHERE id=?", (old,))
+    clock["t"] = start + 7 * 3600
+    seen("fp-box-a is down", clock["t"])
+    assert not alerts.holds(p.db, first["ref"], first["ts"], clock["t"])
+    clock["t"] = start + 9 * 3600 + 1
+    seen("fp-box-a is down", clock["t"])
+    seen("fp-box-b is down", clock["t"])
+    d.relay_when_blocked()
+    assert len(told()) == 2 and "box-a is down (seen for 2.0 h" in told()[1] and "box-b is down" in told()[1]
+    assert late
 
 
 def test_productive_burst_is_not_a_runaway_but_waste_is(env):
