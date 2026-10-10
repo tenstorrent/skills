@@ -43,12 +43,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "weekly_usd": 200.0,
         # Usage-billed: all of the account's tt-project spend today, every project on every machine
         # tt-project can see (globalcap.py), stops new work at this many $ (0 = off). The day starts at
-        # day_start ("HH:MM"; "" = rolling 24 h) in timezone (IANA name, never the host's own zone).
+        # day_start ("HH:MM"; "" = rolling 24 h) in timezone (IANA name, never the host's own zone; "" =
+        # the project's home zone, timefmt.py).
         # Usually set once per machine for every project: `ttp config --account KEY VALUE`. $200 and
         # rolling by default; plan windows never count toward it.
         "global_daily_usd": 200.0,
         "day_start": "",
-        "timezone": "UTC",
+        "timezone": "",
         "hourly_alarm_x": 4.0,          # spend rate this many times the 7-day hourly norm = runaway
         "max_parallel_workers": 6,          # on a plan, all of them run until the last stretch before the line
         "task_default_usd": {"light": 2.0, "standard": 8.0, "deep": 25.0},
@@ -212,7 +213,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 # project.json keys the runtime reads beyond DEFAULT_CONFIG: identity written at creation, open
 # sections, and settings that have no default. A key in neither is reported as unknown.
-META_KEYS = {"name", "id", "host", "root", "created", "tt_project_version", "pricing", "restrictions"}
+META_KEYS = {"name", "id", "host", "root", "created", "tt_project_version", "pricing", "restrictions",
+             "home_timezone", "home_timezone_from"}
 EXTRA_KEYS = {
     "budget": {"max_waits", "hourly_floor_usd", "estimate_weights", "hourly_waste_usd", "hourly_coordinator_usd",
                "max_pace_hold_s"},   # max_pace_hold_s: deprecated and ignored; accepted so old configs stay quiet
@@ -943,8 +945,13 @@ ACCOUNT_KEYS = {"budget": {"global_daily_usd", "day_start", "timezone", "push_sp
 
 
 def layered(raw: dict) -> dict:
-    """A project's settings: the defaults, then the account-level ones, then its project.json."""
-    return deep_merge(deep_merge(DEFAULT_CONFIG, load_account_settings()), raw)
+    """A project's settings: the defaults, then the account-level ones, then its project.json.
+    budget.timezone set nowhere is the project's home zone (UTC without one)."""
+    cfg = deep_merge(deep_merge(DEFAULT_CONFIG, load_account_settings()), raw)
+    if isinstance(cfg.get("budget"), dict) and not cfg["budget"].get("timezone"):
+        from .timefmt import zone_name
+        cfg["budget"]["timezone"] = zone_name(raw)
+    return cfg
 
 
 def account_settings_path() -> Path:

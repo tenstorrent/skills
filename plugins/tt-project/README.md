@@ -113,9 +113,15 @@ and preferences you add later become part of the project's charter and memory.
   source can be added in code with `globalcap.add_other_source(fn)`, where
   `fn(provider, account, start, end)` returns `(usd, label)`.
 - Budget day: with `budget.day_start` set (`"HH:MM"`), "today" is a fixed day starting at that time
-  in `budget.timezone` (an IANA name such as `Europe/Berlin`, default `UTC`; the host's own zone
-  plays no part), 23 or 25 hours long across a daylight-saving change. The daily cap and the global
+  in `budget.timezone` (an IANA name such as `Europe/Berlin`; unset, the project's home zone, below;
+  the host's own zone plays no part), 23 or 25 hours long across a daylight-saving change. The daily cap and the global
   cap count that day. Empty (the default) keeps the rolling 24 hours. Weekly caps stay rolling.
+- Home time zone: each project keeps the IANA zone of the user's workstation as `home_timezone` in
+  its `project.json`. `ttp new` records the zone of the machine it runs on (with `--host`, the
+  workstation's, never the box's). `ttp connect` from a workstation, and a workstation's spend push
+  for the projects it set last, send its current zone; a change is logged once in the feed, so the
+  zone follows a travelling user. A project without one gets the account's `budget.timezone`, else the
+  machine's zone, once at daemon start. Times shown to the user use it (`runtime/ttp/timefmt.py`).
 - These keys (and `budget.push_spend_to`) are account-level: `ttp config --account KEY VALUE` writes them to
   `~/.tt-project/settings.json` (mode 0600), which every project on the machine reads under its own
   `project.json` (a project may still override a key, except `budget.push_spend_to`, which is read

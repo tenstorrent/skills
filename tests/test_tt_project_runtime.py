@@ -171,6 +171,7 @@ def env(tmp_path, monkeypatch, _git_session):
     monkeypatch.setenv("TTP_HOME", str(home))
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     monkeypatch.setenv("TTP_HOST", "testhost")
+    monkeypatch.setenv("TTP_TEST_LOCAL_TZ", "UTC")   # home zones: never the zone of the machine running the tests
     monkeypatch.setenv("TTP_TEST_POLL_S", "0.05")   # wait loops (runner, ttp lock, listen) check often
     monkeypatch.setenv("TTP_TEST_DISK_MOUNT", str(tmp_path))   # the disk guard's du stays in the test folder
     monkeypatch.setenv("TTP_TEST_SSH_CONFIG", str(tmp_path / "ssh_config"))   # never the user's own ssh config
@@ -28896,7 +28897,7 @@ def test_connect_to_a_remote_project_keeps_a_local_forward_and_checks_the_link(e
     with pytest.raises(SystemExit) as e:
         cli.main(["connect", "demo", "--chat", "c1"])
     out = capsys.readouterr().out
-    assert e.value.code == 0 and ssh == [["connect", "demo", "--chat", "c1"]]
+    assert e.value.code == 0 and ssh == [["connect", "demo", "--chat", "c1", "--home-tz", "UTC", "--home-from", "testhost"]]
     assert "chat: c1" in out and "18700/#token" not in out, "the far machine's own link does not work here"
     assert "installed a kept tunnel" in out and f"web app: http://127.0.0.1:{port}/#token={web.token(p)}" in out, out
     unit = tunnel.service_file("demo", "linux").read_text()
@@ -37751,3 +37752,201 @@ def test_responsibility_inventory_counts_a_tunnel_watched_through_its_unit_file_
     # A longer name that only starts with the label still does not count.
     sched.upsert(p.db, "tunnel-heal", "command", "10m", payload={"command": f"systemctl --user is-active {lab}x.service"})
     assert cov() == []
+
+
+# home time zone (timefmt) --------------------------------------------------------------------------
+def test_local_zone_detection_tries_tz_then_the_localtime_link_then_etc_timezone_then_utc(env, tmp_path):
+    from ttp import timefmt as tf
+    link = tmp_path / "localtime"
+    link.symlink_to("/var/db/timezone/zoneinfo/Europe/Paris")     # macOS; Linux: /usr/share/zoneinfo/...
+    etc = tmp_path / "timezone"
+    etc.write_text("Asia/Tokyo\n")
+    none = tmp_path / "missing"
+    detect = lambda env_, lt=link, et=etc: tf.detect_local(env_, lt, et, timedatectl=False)
+    assert detect({"TZ": "America/Los_Angeles"}) == "America/Los_Angeles"
+    assert detect({"TZ": ":/usr/share/zoneinfo/America/New_York"}) == "America/New_York"
+    for bad in ("Mars/Base", "PST", "", "../../etc/passwd", "/etc/passwd", "x" * 100):
+        assert detect({"TZ": bad}) == "Europe/Paris", bad          # an invalid TZ falls through to the link
+    assert detect({}, lt=none) == "Asia/Tokyo"
+    etc.write_text("Not/AZone\n")
+    assert detect({}, lt=none) == "UTC"
+    assert detect({}, lt=none, et=none) == "UTC"
+    assert tf.valid("/usr/share/zoneinfo/posix/Europe/Berlin") == "Europe/Berlin" and tf.valid(None) is None
+    assert tf.in_ssh_login({"SSH_CONNECTION": "a b c d"}) and not tf.in_ssh_login({})
+
+
+def test_home_zone_formatter_shows_the_abbreviation_across_daylight_saving(env):
+    from datetime import datetime, timezone as dt_timezone
+    from ttp import timefmt as tf
+    summer = datetime(2026, 7, 1, 12, 0, tzinfo=dt_timezone.utc).timestamp()
+    winter = datetime(2026, 12, 1, 12, 0, tzinfo=dt_timezone.utc).timestamp()
+    la = "America/Los_Angeles"
+    assert tf.long(summer, la) == "2026-07-01 05:00 PDT" and tf.long(winter, la) == "2026-12-01 04:00 PST"
+    assert tf.short(summer, la, now=summer + 3600) == "05:00 PDT"
+    assert tf.short(winter, la, now=winter + 3 * 86400) == "Tue 04:00 PST"
+    assert tf.abbrev(la, summer) == "PDT" and tf.abbrev(la, winter) == "PST" and tf.long(summer, "Mars/Base").endswith("UTC")
+    assert tf.long(summer, {"home_timezone": "Europe/Berlin"}) == "2026-07-01 14:00 CEST"
+
+
+def test_ttp_new_records_this_machines_zone_and_status_shows_times_in_it(env, monkeypatch):
+    from ttp import timefmt as tf
+    from ttp.cli import status_text
+    monkeypatch.setenv("TTP_TEST_LOCAL_TZ", "America/Los_Angeles")
+    p = make(env)
+    raw = p.raw_config()
+    assert (raw["home_timezone"], raw["home_timezone_from"]) == ("America/Los_Angeles", "testhost")
+    assert tf.zone_name(raw) == "America/Los_Angeles"
+    head = status_text(p).splitlines()[0]
+    assert re.search(r" · \d{4}-\d\d-\d\d \d\d:\d\d P[DS]T$", head), head
+
+
+def test_a_remote_project_made_from_a_workstation_gets_the_workstations_zone(env, monkeypatch, capsys):
+    """Workstation in America/Los_Angeles, box on UTC: the project there gets the workstation's zone."""
+    from ttp import cli, machines, weblink
+    monkeypatch.setenv("TTP_TEST_LOCAL_TZ", "America/Los_Angeles")
+    monkeypatch.setattr(cli, "ship_runtime", lambda host: "~/.tt-project/lib/current/bin/ttp")
+    monkeypatch.setattr(cli, "load_secrets", lambda: {})
+    monkeypatch.setattr(machines, "push", lambda host: "machines: none")
+    sent = []
+    monkeypatch.setattr(cli.subprocess, "run", lambda argv, **k: sent.append(argv) or subprocess.CompletedProcess(
+        argv, 0, "created far\n", None))
+    monkeypatch.setattr(cli, "remote_web", lambda name, entry, out: ("web app: ok", 0))
+    cli.main(["new", "far", "--host", "box", "--dir", "/srv/far"])
+    remote = sent[-1][-1]
+    assert "--home-tz America/Los_Angeles --home-from testhost" in remote, remote
+    # What that command does on the box, whose own zone is UTC.
+    monkeypatch.undo()
+    monkeypatch.setenv("TTP_TEST_LOCAL_TZ", "UTC")
+    monkeypatch.setattr(cli, "_wait_for_daemon", lambda p, timeout=20: None)
+    monkeypatch.setattr(weblink, "local", lambda p, url: ("web app: ok", 0))
+    cli.main(["new", "far", "--dir", str(env["repo"]), "--provider", "fake", "--no-service",
+              "--home-tz", "America/Los_Angeles", "--home-from", "laptop"])
+    from ttp.project import Project
+    raw = Project(env["repo"]).raw_config()
+    assert (raw["home_timezone"], raw["home_timezone_from"]) == ("America/Los_Angeles", "laptop")
+    assert Project(env["repo"]).config()["budget"]["timezone"] == "America/Los_Angeles"
+
+
+def _home_feed(p):
+    return [m["text"] for m in p.db.q("SELECT text FROM messages WHERE direction='out' AND text LIKE 'Home time zone%'")]
+
+
+def test_connect_from_a_workstation_in_a_new_zone_moves_the_home_zone_and_logs_it_once(env, monkeypatch, capsys):
+    from ttp import cli, weblink
+    p = make(env)
+    monkeypatch.setattr(weblink, "local", lambda p, url: ("web app: ok", 0))
+    cli.main(["connect", "demo", "--home-tz", "Asia/Tokyo", "--home-from", "laptop"])
+    cli.main(["connect", "demo", "--home-tz", "Asia/Tokyo", "--home-from", "laptop"])
+    raw = p.raw_config()
+    assert (raw["home_timezone"], raw["home_timezone_from"]) == ("Asia/Tokyo", "laptop")
+    assert _home_feed(p) == ["Home time zone UTC -> Asia/Tokyo (ttp connect from laptop)."]
+    # An invalid zone changes nothing; a connect typed in an ssh login here keeps the workstation's zone.
+    cli.main(["connect", "demo", "--home-tz", "Mars/Base", "--home-from", "laptop"])
+    monkeypatch.setenv("SSH_CONNECTION", "10.0.0.1 1 10.0.0.2 22")
+    cli.main(["connect", "demo"])
+    assert p.raw_config()["home_timezone"] == "Asia/Tokyo" and len(_home_feed(p)) == 1
+    # Typed on this machine's own desk, outside ssh: this machine's zone.
+    monkeypatch.delenv("SSH_CONNECTION")
+    monkeypatch.setenv("TTP_TEST_LOCAL_TZ", "Europe/Berlin")
+    cli.main(["connect", "demo"])
+    assert p.raw_config()["home_timezone"] == "Europe/Berlin" and len(_home_feed(p)) == 2
+
+
+def test_remote_connect_sends_the_workstations_zone_and_an_older_runtime_still_connects(env, monkeypatch, capsys):
+    from ttp import cli
+    monkeypatch.setenv("TTP_TEST_LOCAL_TZ", "America/Los_Angeles")
+    monkeypatch.setattr(cli, "flush_outbox", lambda name, entry: None)
+    monkeypatch.setattr(cli, "remote_web", lambda name, entry, out: ("web app: ok", 0))
+    seen = []
+
+    def old_runtime(entry, argv, capture=False):
+        seen.append(argv)
+        if "--home-tz" in argv:
+            return subprocess.CompletedProcess(argv, 2, "", "ttp: error: unrecognized arguments: --home-tz")
+        return subprocess.CompletedProcess(argv, 0, "chat: c1\n", "")
+    monkeypatch.setattr(cli, "_ssh", old_runtime)
+    assert cli.connect_remote("far", {"host": "box", "dir": "/srv/far"}, ["connect", "far"]) == 0
+    assert seen == [["connect", "far", "--home-tz", "America/Los_Angeles", "--home-from", "testhost"], ["connect", "far"]]
+
+
+def test_a_spend_push_moves_the_home_zone_only_of_projects_its_sender_set(env, monkeypatch, capsys):
+    from ttp import cli
+    from ttp import globalcap as gcap
+    p = make(env)
+    p.set_config("home_timezone_from", "laptop")
+    from ttp.cli import bootstrap
+    from ttp.project import register
+    repo2 = env["tmp"] / "repo2"
+    subprocess.run(["git", "clone", "-q", str(env["repo"]), str(repo2)], check=True)
+    q = bootstrap(repo2, "other", "Another project.", "fake")
+    register("other", {"host": "testhost", "dir": str(q.root)})
+    q.set_config("home_timezone_from", "server2")
+    now = time.time()
+    rec = json.loads(_spend_record("laptop", [(now - 3600, now + 3600, 1.0)]))
+    stream = (json.dumps({**rec, "tz": "America/Los_Angeles"}) + "\n").encode()
+    monkeypatch.setattr(sys, "stdin", type("S", (), {"buffer": io.BytesIO(stream)})())
+    with pytest.raises(SystemExit) as e:
+        cli.main(["spend-today", "--receive", "--via", "lap"])
+    ack = json.loads(capsys.readouterr().out)
+    assert e.value.code == 0 and ack == {"accepted": 1, "pulls": False}, ack
+    assert p.raw_config()["home_timezone"] == "America/Los_Angeles"
+    assert _home_feed(p) == ["Home time zone UTC -> America/Los_Angeles (from laptop)."]
+    assert q.raw_config()["home_timezone"] == "UTC" and _home_feed(q) == []
+    assert gcap._valid_push({**rec, "tz": "Mars/Base"}, now)["tz"] is None
+
+
+def test_the_spend_push_carries_this_machines_zone(env, monkeypatch):
+    from ttp import globalcap as gcap
+    from ttp import project
+    from ttp import upstream
+    make(env)
+    monkeypatch.setenv("TTP_TEST_LOCAL_TZ", "Europe/Berlin")
+    monkeypatch.setattr(gcap, "push_targets", lambda: ["box"])
+    sent = []
+    monkeypatch.setattr(upstream, "ssh_pipe", lambda t, cmd, data, timeout: sent.append(data) or (None, "down"))
+    gcap.push(project.layered({})["budget"])
+    assert sent and json.loads(sent[0])["tz"] == "Europe/Berlin"
+
+
+def test_the_budget_day_follows_the_home_zone_unless_budget_timezone_is_set(env):
+    from datetime import datetime, timezone as dt_timezone
+    from ttp import globalcap as gcap
+    from ttp import project
+    from ttp.cli import main
+    p = make(env)
+    p.set_config("home_timezone", "America/Los_Angeles")
+    b = p.config()["budget"]
+    assert b["timezone"] == "America/Los_Angeles" and not gcap.setting_problems(b)
+    now = datetime(2026, 7, 1, 3, 0, tzinfo=dt_timezone.utc).timestamp()       # 20:00 PDT on June 30
+    start, _ = gcap.day_bounds({**b, "day_start": "00:00"}, now)
+    assert start == datetime(2026, 6, 30, 7, 0, tzinfo=dt_timezone.utc).timestamp()
+    main(["config", "--account", "budget.timezone", "Asia/Tokyo"])
+    assert p.config()["budget"]["timezone"] == "Asia/Tokyo"                     # explicit (account) wins
+    p.set_config("budget.timezone", "Europe/Berlin")
+    assert p.config()["budget"]["timezone"] == "Europe/Berlin"                  # explicit (project) wins
+    assert project.layered({})["budget"]["timezone"] == "Asia/Tokyo"
+    main(["config", "--account", "budget.timezone", ""])
+    assert project.layered({})["budget"]["timezone"] == "UTC"                    # no project, no home: UTC
+
+
+def test_a_project_without_a_home_zone_gets_the_account_zone_else_this_machines_once(env, monkeypatch):
+    from ttp import project
+    from ttp import timefmt as tf
+    p = make(env)
+    raw = p.raw_config()
+    del raw["home_timezone"], raw["home_timezone_from"]
+    project.write_json(p.config_path, raw)
+    project.set_account_setting("budget.timezone", "America/Los_Angeles")
+    logged = []
+    assert tf.migrate(p, logged.append) == "America/Los_Angeles" and len(logged) == 1
+    assert tf.migrate(p, logged.append) is None and len(logged) == 1
+    assert p.config()["budget"]["timezone"] == "America/Los_Angeles"
+    raw = p.raw_config()
+    raw.pop("home_timezone")
+    project.write_json(p.config_path, raw)
+    project.set_account_setting("budget.timezone", None)
+    monkeypatch.setenv("TTP_TEST_LOCAL_TZ", "Europe/Berlin")
+    assert tf.migrate(p) == "Europe/Berlin" and p.raw_config()["home_timezone"] == "Europe/Berlin"
+    # The daemon runs it at start, before its first tick.
+    src = (RUNTIME / "ttp" / "daemon.py").read_text()
+    assert src.index("timefmt.migrate(self.p") < src.index("signal.signal(signal.SIGTERM")

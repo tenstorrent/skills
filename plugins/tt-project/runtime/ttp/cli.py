@@ -26,6 +26,7 @@ from pathlib import Path
 from . import __version__, poll_s
 from .db import chat_floor, task_outcome
 from . import outbox
+from . import timefmt
 from . import schedule as sched
 from .project import (FOLDER, NAME_RE, Project, hostname, load_registry, load_secrets, register, save_secret,
                       durable_append, durable_write, write_json, ACCOUNT_KEYS, DEFAULT_CONFIG, deep_merge,
@@ -299,7 +300,8 @@ def _runtime_version(runtime: Path) -> str:
     return m.group(1) if m else "unknown"
 
 
-def bootstrap(root: Path, name: str, brief: str, provider: str) -> Project:
+def bootstrap(root: Path, name: str, brief: str, provider: str, home_tz: str | None = None,
+              home_from: str = "") -> Project:
     p = Project(root)
     if p.exists():
         if p.name != name:
@@ -333,6 +335,9 @@ def bootstrap(root: Path, name: str, brief: str, provider: str) -> Project:
     cfg = {"name": name, "created": time.time(), "root": str(p.root), "host": hostname(),
            "core_provider": provider, "tt_project_version": __version__,
            "id": pysecrets.token_hex(4),
+           # The user's zone: the workstation's when it sent one (new_remote), else this machine's.
+           timefmt.KEY: timefmt.valid(home_tz) or timefmt.detect_local(),
+           timefmt.FROM_KEY: home_from or hostname(),
            # New projects only: DEFAULT_CONFIG keeps it off, so existing projects are unchanged.
            "providers": {"claude": {"worker_isolation": True}}}
     sec = load_secrets()
@@ -364,7 +369,7 @@ def cmd_new(a) -> None:
     if a.host and a.host not in (hostname(), "localhost"):
         return new_remote(a, brief)
     root = Path(a.dir).expanduser().resolve() if a.dir else _default_root()
-    p = bootstrap(root, a.name, brief, a.provider or detect_provider())
+    p = bootstrap(root, a.name, brief, a.provider or detect_provider(), a.home_tz, a.home_from or "")
     register(a.name, {"host": hostname(), "dir": str(p.root)})
     ident = subprocess.run(["git", "-C", str(p.root), "config", "user.email"], capture_output=True, text=True)
     if ident.returncode != 0 or not ident.stdout.strip():
@@ -445,7 +450,9 @@ def new_remote(a, brief: str) -> None:
         print(push_secrets(host))
     from . import machines as mm
     print(mm.push(host))        # its daemon reads the machines list there
-    args = [launcher, "new", a.name, "--dir", a.dir, "--provider", a.provider or detect_provider()]
+    args = [launcher, "new", a.name, "--dir", a.dir, "--provider", a.provider or detect_provider(),
+            # this workstation's zone, never the box's (that runtime is at least this one: ship_runtime)
+            "--home-tz", timefmt.detect_local(), "--home-from", hostname()]
     if a.no_service:
         args.append("--no-service")
     remote = " ".join(shlex.quote(x) if not x.startswith("~/") else x for x in args) + " --describe-file -"
@@ -509,6 +516,13 @@ def cmd_connect(a) -> None:
         argv = ["connect", a.name, *(["--chat", a.chat] if a.chat else []), *(["--label", a.label] if a.label else [])]
         sys.exit(connect_remote(a.name, entry, argv))
     p = need(a.name, sys.argv[1:])
+    # The home zone follows the user: the zone a workstation sent, or this machine's own when the
+    # user types here (an ssh login here is a server's zone, not the user's).
+    tz, src = a.home_tz, a.home_from or ""
+    if not tz and not timefmt.in_ssh_login():
+        tz, src = timefmt.detect_local(), hostname()
+    if tz:
+        timefmt.set_home(p, tz, src, f"ttp connect from {src}" if src else "ttp connect")
     chat = a.chat or f"c{pysecrets.token_hex(3)}"
     p.db.x("INSERT INTO chats(id,created,label,host,last_active,last_read) VALUES(?,?,?,?,?,"
            "(SELECT COALESCE(MAX(id),0) FROM messages)) ON CONFLICT(id) DO UPDATE SET last_active=excluded.last_active",
@@ -530,7 +544,10 @@ def connect_remote(name: str, entry: dict, argv: list[str]) -> int:
     if failed is not None and failed.returncode == 255:
         _unreachable(entry, failed.stderr)
         return 255
-    r = _ssh(entry, argv, capture=True)
+    home = ["--home-tz", timefmt.detect_local(), "--home-from", hostname()]
+    r = _ssh(entry, [*argv, *home], capture=True)
+    if r.returncode == 2 and "--home-tz" in (r.stderr or ""):   # an older runtime there: connect without it
+        r = _ssh(entry, argv, capture=True)
     if r.returncode == 255:
         _unreachable(entry, r.stderr)
         return 255
@@ -674,6 +691,7 @@ def status_text(p: Project) -> str:
     head = f"{p.name}: daemon {state}" + ((" (paused until reboot)" if db.kv("pause_until_boot") else " (paused)")
                                           if db.kv("paused") else "")
     head += " · tasks: " + (", ".join(f"{k} {v}" for k, v in sorted(counts.items())) if counts else "none yet")
+    head += " · " + timefmt.long(now, p)
     lines = [head]
     for m in attention(db, now)[:6]:
         text = " ".join(m["text"].split())
@@ -856,6 +874,16 @@ def cmd_spend_today(a) -> None:
     now = time.time()
     if a.receive:
         ack, rc = gcap.receive(sys.stdin.buffer.read(gcap.RECEIVE_BYTES + 1), a.via or "", now)
+        if rc == 0 and ack.get("tz"):
+            # The sender's zone moves the home zone of this machine's projects that it set last.
+            import sqlite3
+            for e in load_registry().get("projects", {}).values():
+                if e.get("host") in (hostname(), "localhost") and e.get("dir") and Project(e["dir"]).exists():
+                    try:
+                        timefmt.follow_push(Project(e["dir"]), ack["tz"], ack.get("from") or "")
+                    except (OSError, RuntimeError, sqlite3.Error):
+                        pass
+            ack = {k: v for k, v in ack.items() if k not in ("tz", "from")}
         print(json.dumps(ack, sort_keys=True))
         raise SystemExit(rc)
     if a.since is None:
@@ -3310,6 +3338,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--provider", choices=["claude", "codex", "cursor", "fake"])
     s.add_argument("--no-service", action="store_true", help="do not install a boot-time service")
     s.add_argument("--no-secrets", action="store_true", help="with --host: do not copy your saved keys there")
+    s.add_argument("--home-tz", help=argparse.SUPPRESS)     # with --host there: the workstation's zone
+    s.add_argument("--home-from", help=argparse.SUPPRESS)   # and its name
     s.set_defaults(fn=cmd_new)
 
     s = sub.add_parser("web", help="web app link (for a remote project: tunnel command and link)")
@@ -3331,6 +3361,8 @@ def main(argv: list[str] | None = None) -> None:
         if name == "connect":
             s.add_argument("--chat")
             s.add_argument("--label")
+            s.add_argument("--home-tz", help=argparse.SUPPRESS)     # the connecting workstation's zone
+            s.add_argument("--home-from", help=argparse.SUPPRESS)   # and its name
         if name == "status":
             s.add_argument("--json", action="store_true")
         if name == "prune":

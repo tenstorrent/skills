@@ -59,6 +59,7 @@ from . import runner
 from . import schedule as sched
 from . import service
 from . import settinghold
+from . import timefmt
 from . import unblock
 from . import upstream
 from . import waitheal
@@ -401,6 +402,11 @@ class Daemon:
         # Kept here rather than in the environment, which runs and their tools would inherit.
         self._notify = os.environ.pop("NOTIFY_SOCKET", None)
         self._mark_start()
+        try:   # a project made before home zones gets one, once (timefmt.migrate)
+            if timefmt.migrate(self.p, log=lambda m: log(self.p, m)):
+                self._load_config()
+        except (OSError, RuntimeError) as e:
+            log(self.p, f"home time zone not set: {e}")
         signal.signal(signal.SIGTERM, lambda *_: setattr(self, "stopping", True))
         signal.signal(signal.SIGINT, lambda *_: setattr(self, "stopping", True))
         log(self.p, f"daemon start pid={os.getpid()} host={hostname()} boot={self.boot}")

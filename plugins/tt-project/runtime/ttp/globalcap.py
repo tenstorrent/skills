@@ -498,7 +498,8 @@ def _valid_push(rec, now: float) -> dict | None:
                                      "rows": [{"provider": r["provider"], "key": r["key"], "usd": float(r["usd"])}
                                               for r in rows],
                                      **({SESSIONS: _sessions(w[SESSIONS])} if SESSIONS in w else {})}
-    return {"host": host, "sent": float(rec["sent"]), "windows": out}
+    from .timefmt import valid
+    return {"host": host, "sent": float(rec["sent"]), "windows": out, "tz": valid(rec.get("tz"))}
 
 
 def load_pushed(now: float | None = None) -> dict:
@@ -541,7 +542,10 @@ def receive(stream: bytes, via: str, now: float | None = None) -> tuple[dict, in
         os.close(fd)
     pulls = any(m.get("host") == got["host"] and m.get("ok") and 0 <= now - float(m.get("ts") or 0) <= STALE_S
                 for m in (load_cache().get("machines") or {}).values() if isinstance(m, dict))
-    return {"accepted": len(got["windows"]), "pulls": pulls}, 0
+    ack = {"accepted": len(got["windows"]), "pulls": pulls}
+    if got.get("tz"):     # for the caller (cmd_spend_today), which takes them out of the ack it prints
+        ack.update(tz=got["tz"], **{"from": got["host"]})
+    return ack, 0
 
 
 def push_targets() -> list[str]:
@@ -595,7 +599,9 @@ def push(budget: dict, now: float | None = None) -> int:
             if not data:
                 wins = [{"start": a, "end": b, **{k: v for k, v in answer(a, b, now=now).items()
                                                   if k in ("rows", "projects", SESSIONS)}} for a, b in push_windows(budget, now)]
-                data = (json.dumps({"v": 1, "host": project.hostname(), "sent": now, "windows": wins}) + "\n").encode()
+                from .timefmt import detect_local
+                data = (json.dumps({"v": 1, "host": project.hostname(), "sent": now, "windows": wins,
+                                    "tz": detect_local()}) + "\n").encode()
             out, err = upstream.ssh_pipe(t, f"spend-today --receive --via {shlex.quote(upstream.alias())}",
                                          data, PUSH_TIMEOUT_S)
             ack = None
