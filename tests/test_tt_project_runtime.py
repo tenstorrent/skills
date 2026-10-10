@@ -2182,6 +2182,26 @@ def test_command_watcher_repeats_wake_the_coordinator(env, monkeypatch):
     assert wakes() == 3
 
 
+def test_command_watcher_info_lines_are_logged_only_and_json_lines_are_never_split(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dm
+    out = {"stdout": ""}
+    monkeypatch.setattr(dm.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, out["stdout"], ""))
+    d = dm.Daemon(p.base)
+    out["stdout"] = json.dumps({"text": "box-a: queue empty; 4 chips ok", "severity": "info"})
+    d._run_command_watcher({"name": "hw"}, {"command": "x"})
+    assert p.db.q("SELECT id FROM issues") == []
+    assert p.db.one("SELECT COUNT(*) AS n FROM events WHERE kind='observation'")["n"] == 0
+    out["stdout"] = json.dumps({"text": "box-a: chip 3 dropped; tray 2 power-cycled", "severity": "high"})
+    d._run_command_watcher({"name": "hw"}, {"command": "x"})
+    titles = [r["title"] for r in p.db.q("SELECT title FROM issues")]
+    assert titles == ["box-a: chip 3 dropped; tray 2 power-cycled"]
+    # A plain line keeps its '; ' items.
+    out["stdout"] = "box-b: fan slow; disk full"
+    d._run_command_watcher({"name": "hw2"}, {"command": "x"})
+    assert p.db.one("SELECT COUNT(*) AS n FROM issues WHERE source='watcher:hw2'")["n"] == 2
+
+
 def test_watcher_conditions_keep_one_issue_each_and_close_when_cleared(env):
     p = make(env)
     from ttp import screen as scr
@@ -2567,7 +2587,7 @@ def test_mute_clock_restarts_after_clean_runs(env, monkeypatch):
 
 def test_mute_clock_clears_only_the_condition_a_run_dropped(env, monkeypatch):
     from ttp import screen as scr
-    both = json.dumps({"text": "boxes: box-a held; box-b held", "severity": "high", "repeat": True})
+    both = json.dumps({"text": "boxes: box-a held; box-b held", "severity": "high", "repeat": True, "items": True})
     only_b = json.dumps({"text": "boxes: box-b held", "severity": "high", "repeat": True})
     run, asks, p = _muted_watcher(env, monkeypatch, both)
     run(0.5, both)
@@ -35353,8 +35373,8 @@ def test_command_watcher_output_is_parsed_per_line():
     from ttp import daemon
     out = daemon._observations('starting\n{"text": "a down", "severity": "high"}\n{bad json\n'
                                '{"text": "b ok"}\ntail one\ntail two\n')
-    assert out == [{"text": "starting"}, {"text": "a down", "severity": "high"}, {"text": "{bad json"},
-                   {"text": "b ok"}, {"text": "tail one\ntail two"}]
+    assert out == [{"text": "starting"}, {"text": "a down", "severity": "high", "json": True},
+                   {"text": "{bad json"}, {"text": "b ok", "json": True}, {"text": "tail one\ntail two"}]
     assert daemon._observations("just\nplain") == [{"text": "just\nplain"}]
     assert daemon._observations("") == []
 

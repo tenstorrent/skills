@@ -2727,12 +2727,18 @@ class Daemon:
             # Its own failure lines ("error": true) are errors, not reports.
             error = failed or obs.get("error") is True
             kind = scr.ERROR if error else receipt
+            # One JSON line is one observation, never split at '; ', unless it opts in with "items": true.
+            whole = obs.get("json") is True and obs.get("items") is not True
+            if not error and obs.get("severity") == "info":
+                log(self.p, f"{source} info: {body[:500]}")   # info is logged only, never an issue
+                n += 1
+                continue
             self.observe(errors if error else source, body, obs.get("severity"), rewake_after_s=rewake,
-                         repeat=obs.get("repeat") is True, lifecycle=kind)
+                         repeat=obs.get("repeat") is True, lifecycle=kind, whole=whole)
             if not error and obs.get("machine") and obs.get("condition"):
                 self._machine_condition(obs, body)
             if kind == scr.RECEIPT:
-                subjects.update(scr.normalize(subj) for subj, _, cleared in scr.watcher_conditions(source, body) or ()
+                subjects.update(scr.normalize(subj) for subj, _, cleared in scr.watcher_conditions(source, body, whole) or ()
                                 if not cleared)
             n += 1
         if ok:
@@ -2826,10 +2832,10 @@ class Daemon:
                               (since, since, json.dumps([schedule]))))
 
     def observe(self, source: str, text: str, hint: str | None = None, rewake_after_s: float | None = None,
-                repeat: bool = False, lifecycle: str | None = None) -> None:
+                repeat: bool = False, lifecycle: str | None = None, whole: bool = False) -> None:
         if not text.strip():
             return
-        again = {"rewake_after_s": rewake_after_s, "repeat": repeat, "lifecycle": lifecycle}
+        again = {"rewake_after_s": rewake_after_s, "repeat": repeat, "lifecycle": lifecycle, "whole": whole}
         v = scr.screen(self.p.db, self.cfg, source, text, hint, jev=self.jev, **again)
         if v.jev_out_of_funds:
             self.alert("jev-funds", JEV_FUNDS_TEXT, "high")
@@ -5592,7 +5598,7 @@ def _observations(text: str) -> list[dict]:
                 o = None
             if isinstance(o, dict) and o.get("text"):
                 flush()
-                obs.append(o)
+                obs.append({**o, "json": True})
                 continue
         plain.append(raw)
     flush()
