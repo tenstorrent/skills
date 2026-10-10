@@ -18878,11 +18878,11 @@ def test_after_push_failures_are_reported_and_a_deploy_cut_short_runs_once_more(
     assert "after_push_failed" in [ep["key"] for ep in alerts.sweep(s.p.db)]
 
 
-def _pq_pushing(s, sha, row="pushed"):
+def _pq_pushing(s, sha, row="pushed", at=None):
     """The plan of a batch that dies after it began pushing `sha`, before writing its outcome."""
     rows = s.p.db.q("SELECT id, task FROM push_queue WHERE status='approved'")
     _pq_plan(s, die="push", pushing={"sha": sha, "tip": _git_out(s.origin, "rev-parse", "proj"), "version": "1.0.2",
-                                     "at": time.time(), "checks": {"runs": 1, "seconds": 2.0}, "rounds": 1,
+                                     "at": time.time() if at is None else at, "checks": {"runs": 1, "seconds": 2.0}, "rounds": 1,
                                      "results": [{"id": r["id"], "task": r["task"], "status": row, "sha": sha,
                                                   "detail": {}} for r in rows]})
 
@@ -18963,6 +18963,66 @@ def test_a_batch_that_died_mid_push_waits_for_an_unreadable_branch_then_tells_th
     assert s.p.db.one("SELECT status, tries FROM push_queue") == {"status": "approved", "tries": 1}
     [ev] = [e for e in _pq_events(s.p, mark) if e["status"] == "queued"]
     assert ev["kind"] == "push_batch_died" and "could not be read" in ev["text"] and "after_push" in ev["text"]
+
+
+def test_a_batch_that_died_mid_push_before_a_long_outage_is_still_recovered_once_the_remote_answers(env, monkeypatch):
+    """The host was down longer than RECOVER_S after the batch began `git push`, and the network is not
+    up on the first look: the window counts from that look, not from the push, so a later look that
+    finds the head on the branch settles it as pushed, with no coordinator event and one after_push."""
+    from ttp import pushq
+    monkeypatch.setattr(pushq, "RECOVER_GAP_S", 0)
+    s = _pq(env, monkeypatch, after_push="./deploy.sh")
+    _pq_hand_off(env, s)
+    mark = _pq_mark(s.p)
+    sha = _git_out(s.origin, "rev-parse", "proj")
+    url = _git_out(s.p.root, "remote", "get-url", "origin")
+    _pq_pushing(s, sha, at=time.time() - pushq.RECOVER_S - 3600)
+    bid = _pq_batch(s)
+    _git_out(s.p.root, "update-ref", "-d", "refs/remotes/origin/proj")   # only a fetch can tell
+    _git_out(s.p.root, "remote", "set-url", "origin", str(env["tmp"] / "gone.git"))
+    _pq_tend(s)
+    assert s.p.db.one("SELECT finalized FROM push_batches")["finalized"] is None, "an old push is not died at once"
+    assert s.p.db.one("SELECT status, tries FROM push_queue") == {"status": "batched", "tries": 0}
+    _git_out(s.p.root, "remote", "set-url", "origin", url)   # the network is back
+    _pq_tend(s)
+    assert s.p.db.one("SELECT outcome, pushed_sha FROM push_batches") == {"outcome": "pushed", "pushed_sha": sha}
+    assert s.p.db.task(s.review)["status"] == "done"
+    pushq._children[bid].wait(timeout=30)
+    _pq_tend(s)
+    assert s.p.db.one("SELECT after_push, after_tries FROM push_batches") == {"after_push": "ok", "after_tries": 1}
+    assert (s.p.state / "pushes" / f"{bid}.starts").read_text().split() == ["push", "after_push"]
+    evs = _pq_events(s.p, mark)
+    assert not [e for e in evs if e["status"] == "queued"], "recovered: the coordinator is not woken"
+    assert not [e for e in evs if e["kind"] == "push_batch_died"]
+
+
+def test_the_mid_push_recovery_window_counts_from_the_first_look_and_survives_a_restart(env, monkeypatch):
+    """The first look is kept in the marker (pushing.first_checked): a restart between looks (the
+    daemon's memory gone) neither restarts the window nor ends it early, and past RECOVER_S from that
+    look the batch still dies `unverified`, with one event for the coordinator."""
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    _pq_hand_off(env, s)
+    mark = _pq_mark(s.p)
+    _git_out(s.p.root, "remote", "set-url", "origin", str(env["tmp"] / "gone.git"))
+    _pq_pushing(s, s.head, at=time.time() - pushq.RECOVER_S - 3600)
+    bid = _pq_batch(s)
+    pushq._recover_asked.clear()
+    _pq_tend(s)
+    marker = s.p.state / "pushes" / f"{bid}.json"
+    first = json.loads(marker.read_text())["pushing"]["first_checked"]
+    assert time.time() - 60 < first <= time.time()
+    pushq._recover_asked.clear()                    # a restart: nothing kept in memory
+    pushq.finalize(s.p, now=first + pushq.RECOVER_S - 60)
+    assert json.loads(marker.read_text())["pushing"]["first_checked"] == first
+    assert s.p.db.one("SELECT finalized FROM push_batches")["finalized"] is None
+    assert s.p.db.one("SELECT status, tries FROM push_queue") == {"status": "batched", "tries": 0}
+    pushq._recover_asked.clear()
+    pushq.finalize(s.p, now=first + pushq.RECOVER_S + 1)
+    assert s.p.db.one("SELECT outcome FROM push_batches")["outcome"] == "died"
+    assert s.p.db.one("SELECT status, tries FROM push_queue") == {"status": "approved", "tries": 1}
+    [ev] = [e for e in _pq_events(s.p, mark) if e["status"] == "queued"]
+    assert ev["kind"] == "push_batch_died" and "could not be read" in ev["text"]
 
 
 def test_a_real_batch_records_what_it_pushes_before_pushing_and_recovers_after_a_reboot(env, monkeypatch):

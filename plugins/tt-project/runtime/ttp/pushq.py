@@ -617,8 +617,9 @@ def _recover(p: Project, b: dict, marker: Path, m: dict, now: float) -> dict | N
     that head is on the branch, the push went through: the marker gets the outcome it would have
     written (pushed, with each entry's result), so finalize applies it and resumes its after_push,
     and no entry goes back to be pushed again. If it is not, the batch died as usual. While the
-    branch cannot be read: None (asked again later), until RECOVER_S, then the batch died with
-    `unverified` set."""
+    branch cannot be read: None (asked again later), until RECOVER_S from the first such look (not from
+    the push: a long outage must not use the window up; kept in the marker as pushing.first_checked,
+    so a restart keeps it), then the batch died with `unverified` set."""
     pg = m["pushing"]
     sha = str(pg.get("sha") or "")
     remote, _, branch = str(b["target"] or "").partition("/")
@@ -631,9 +632,13 @@ def _recover(p: Project, b: dict, marker: Path, m: dict, now: float) -> dict | N
         on = _on_remote(repo, remote, branch, sha, fetch=True)
     if on is None:
         try:
-            since = float(pg.get("at") or 0)
-        except (TypeError, ValueError):
-            since = 0
+            since = float(pg["first_checked"])
+        except (KeyError, TypeError, ValueError):
+            since = now                                 # counted from the first look, kept across restarts
+            fresh = dict(push._read(marker) or m)
+            fresh["pushing"] = {**(fresh.get("pushing") if isinstance(fresh.get("pushing"), dict) else pg),
+                                "first_checked": now}
+            write_json(marker, fresh)
         if now - since < RECOVER_S:
             return None
         _recover_asked.pop(b["id"], None)
