@@ -9,8 +9,8 @@ recent jobs, and never touches the device. Run it on the box itself; for another
 ssh: `ssh <box> python3 - --window-h 24 < "$TTP_PROJECT/harness/bin/tt-box-clean-probe"`.
 
 Incidents: a host boot; broker-run bridge-reset, power-cycle, reboot, pci-rescan or health-gate
-jobs; a hold starting; a failed broker job; a tenant job the broker killed, found hung, or that
-ran a device reset. Each job is dated by the latest time it has (finished, else started, else
+jobs; a hold starting or a device held degraded; a failed broker job; a tenant job the broker
+killed (or left "[MCP killed ...]" by a chip drop), found hung, or that ran a device reset. Each job is dated by the latest time it has (finished, else started, else
 queued); a running job, or a hold still on, counts as now. The broker writes naive local times, so
 the probe compares them with the host's local clock (it runs on the broker's own host).
 
@@ -79,9 +79,13 @@ def incident(job):
     cmd = str(job.get("command") or "")
     if owner.startswith("[broker]"):
         kind = owner[len("[broker]"):]
-        hit = kind in EVENT_KINDS or (kind == "hold" and status == "started") or status in BROKER_BAD
+        # A device held degraded before any tenant is refused shows as a live "[broker]" row.
+        held = (kind == "hold" and status == "started") or (kind == "" and cmd.startswith("device HELD"))
+        hit = kind in EVENT_KINDS or held or status in BROKER_BAD
     else:
-        hit = status in TENANT_BAD or bool(RESET_CMD.search(cmd))
+        # The broker tags a tenant job orphaned by a chip drop "interrupted" with "[MCP killed ...".
+        killed = status.startswith("interrupted") and cmd.startswith("[MCP killed")
+        hit = status in TENANT_BAD or killed or bool(RESET_CMD.search(cmd))
     if not hit:
         return None
     return "job %s %s %s: %s" % (job.get("job_id", "?"), owner, status, cmd[:80])

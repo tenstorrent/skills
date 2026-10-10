@@ -643,6 +643,24 @@ def test_box_clean_probe_dates_a_job_by_when_it_went_wrong(tmp_path):
     assert _box_probe(tmp_path, {"jobs": [_job(0.5), done]}, args=["--limit", "2"])[0] == 0
 
 
+def test_box_clean_probe_counts_a_degraded_hold_and_chip_drop_orphans(tmp_path):
+    """The broker's live row for a device held degraded (no tenant refused yet) is a hold on now."""
+    import datetime as dt
+    at = lambda h: (dt.datetime.fromisoformat(PROBE_NOW) - dt.timedelta(hours=h)).isoformat()
+    held = {"job_id": "--", "owner": "[broker]", "status": "running", "finished_at": None,
+            "queued_at": at(30), "started_at": at(30),
+            "command": "device HELD (degraded): chip 3 off the bus - new tenant jobs refused until recovered"}
+    rc, out = _box_probe(tmp_path, {"jobs": [held]}, args=["--window-h", "6"])
+    assert rc == 1 and "newest incident 2026-01-10 12:00:00" in out, out
+    # A tenant job orphaned by a chip drop counts when it went wrong; a plain interrupted one does not.
+    orphan = dict(_job(3, status="interrupted", command="[MCP killed: chips left PCIe] pytest tests"),
+                  started_at=at(3), finished_at=at(2))
+    rc, out = _box_probe(tmp_path, {"jobs": [orphan]}, args=["--window-h", "6"])
+    assert rc == 1 and "newest incident 2026-01-10 10:00:00" in out, out
+    plain = dict(orphan, command="[interrupted: reboot] pytest tests")
+    assert _box_probe(tmp_path, {"jobs": [plain]}, args=["--window-h", "6"])[0] == 0
+
+
 def test_box_clean_probe_reads_broker_times_as_local(tmp_path):
     """The broker writes naive local times: west of UTC, an incident 1 h ago is still inside a 6 h window."""
     import datetime as dt
