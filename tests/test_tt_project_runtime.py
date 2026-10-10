@@ -38587,3 +38587,45 @@ def test_digest_daily_review_and_prompt_headers_carry_the_home_zone(env):
            "VALUES('b',?,'origin/proj',?,?,?,'pushed','ab12345')", (str(m),) + (_utc(2026, 7, 1, 16, 0),) * 3)
     assert pushq.target_line(p.db, "America/Los_Angeles").endswith("(as of the last push, 2026-07-01 09:00 PDT)")
     assert "pushq.target_line(db, timefmt.home(self.p))" in (RUNTIME / "ttp" / "daemon.py").read_text()
+
+
+@pytest.fixture
+def utc_box(monkeypatch):
+    """The process runs on a UTC box."""
+    monkeypatch.setenv("TZ", "UTC")
+    time.tzset()
+    yield
+    monkeypatch.undo()
+    time.tzset()
+
+
+def test_asleep_until_log_line_is_in_the_home_zone_on_a_utc_box(env, utc_box):
+    p = make(env)
+    p.set_config("home_timezone", "America/Los_Angeles")
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    tid = _due_waiting_task(p, "exit 1")
+    _settle_probe(d, tid)
+    p.db.update_task(tid, not_before=time.time() - 1)
+    d.probe_waiting()
+    line = next(ln for ln in (p.logs / "daemon.log").read_text().splitlines() if "asleep until" in ln)
+    assert re.search(r"asleep until (\w{3} )?\d\d:\d\d P[DS]T", line), line
+
+
+def test_runner_wait_progress_line_is_in_the_home_zone_on_a_utc_box(env, utc_box):
+    from ttp import runner
+    p = make(env)
+    p.set_config("home_timezone", "America/Los_Angeles")
+    assert re.fullmatch(r"\d\d:\d\d:\d\d P[DS]T", runner._clock({"TTP_PROJECT": str(p.base)}))
+    assert runner._clock({"TTP_PROJECT": ""}).endswith(" UTC") or "TTP_PROJECT" in os.environ
+
+
+def test_push_target_line_is_in_the_home_zone_on_a_utc_box(utc_box, tmp_path):
+    from ttp import pushq
+    from ttp.db import DB
+    db = DB(tmp_path / "t.db")
+    m = tmp_path / "m.json"
+    m.write_text(json.dumps({"reach": {"ref": "origin/main", "on": False, "behind": 2}}))
+    db.x("INSERT INTO push_batches(id,marker,target,started,ended,finalized,outcome,pushed_sha) "
+         "VALUES('b',?,'origin/proj',1.0,1.0,1.0,'pushed','ab12345')", (str(m),))
+    assert pushq.target_line(db, "America/Los_Angeles").endswith("(as of the last push, 1969-12-31 16:00 PST)")

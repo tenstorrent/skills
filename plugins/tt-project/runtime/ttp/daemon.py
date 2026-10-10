@@ -4563,7 +4563,7 @@ class Daemon:
                 f"{timefmt.short(nb, self.p)}")[:500])
             log(self.p, f"task {tid} retry_when probe still failing"
                         f"{' (host unreachable)' if rc == 255 else ''}; asleep until "
-                        f"{time.strftime('%H:%M', time.localtime(nb))}")
+                        f"{timefmt.short(nb, self.p)}")
         else:
             # No recent verdict (the daemon restarted): ask the probe before waking a worker.
             self.p.db.update_task(tid, not_before=now + PROBE_TIMEOUT_S)

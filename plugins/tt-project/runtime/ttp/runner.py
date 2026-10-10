@@ -539,6 +539,22 @@ class ProgressWatch:
         return True
 
 
+def _clock(env: dict) -> str:
+    """'23:32:05 PDT': now in the home zone of the project in `env` (TTP_PROJECT); UTC without one."""
+    from datetime import datetime
+    from . import timefmt
+    where = None
+    try:
+        base = env.get("TTP_PROJECT") or os.environ.get("TTP_PROJECT")
+        if base:
+            from .project import Project
+            where = Project(base)
+            where = timefmt.zone(where)
+    except Exception:
+        where = None
+    return datetime.now(timefmt.tzinfo(where)).strftime("%H:%M:%S %Z")
+
+
 def _take_exclusive(run_dir: Path, wanted: list[dict], env: dict, deadline: float, holds: str | None = None,
                     inherited: list | None = None) -> list | None:
     """One slot of each resource, waiting while `ttp lock` commands hold them all. The daemon starts
@@ -580,7 +596,7 @@ def _take_exclusive(run_dir: Path, wanted: list[dict], env: dict, deadline: floa
             _touch(run_dir / "lease")
             if time.time() - told >= 120:
                 with open(run_dir / "progress.md", "a") as pf:
-                    pf.write(f"{time.strftime('%H:%M:%S')} waiting for {res['resource']} "
+                    pf.write(f"{_clock(env)} waiting for {res['resource']} "
                              f"(held by {', '.join(locks.holders(paths, where)) or 'another task'})\n")
                 told = time.time()
             time.sleep(poll_s(2))
