@@ -2091,20 +2091,46 @@ def cmd_memory(a) -> None:
 
 
 def cmd_schedules(a) -> None:
+    """Read-only by default (list, show). Only --export writes: it moves the schedules into
+    harness/schedules.json and commits it, so it is confirmed first."""
     p = need(a.name, sys.argv[1:])
     path = sched.file_path(p)
     if a.export:
         if path.exists():
             die(f"{path} already exists: it holds the schedules; edit it, the daemon applies it")
+        if not a.yes:
+            note = (f"--export moves the schedules into {path} and commits it: from then on that file, "
+                    "not the database, holds them and every change is a harness commit. "
+                    "To only read them, use `ttp schedules {} show <schedule>`.".format(p.name))
+            if not sys.stdin.isatty():
+                die(note + " Add --yes to export anyway.")
+            print(note)
+            if input("export? [y/N] ").strip().lower() not in ("y", "yes"):
+                print("not exported")
+                return
         sched.write_file(p, "schedules: exported from the database", create=True)
-        print(f"wrote {path}; from now on it holds the schedules and every change to them is a harness commit")
+        print(f"moved the schedules into {path} and committed it; from now on it holds them "
+              "and every change to them is a harness commit")
+        return
+    if a.action == "show":
+        if not a.schedule:
+            die("usage: ttp schedules <name> show <schedule>")
+        r = p.db.one("SELECT * FROM schedules WHERE name=?", (a.schedule,))
+        if not r:
+            die(f"no schedule {a.schedule!r}")
+        r = dict(r)
+        e = sched.entry(r)
+        state = {k: r[k] for k in r if k not in ("name", "kind", "every_s", "at", "enabled", "budget_usd_day",
+                                                  "description", "payload")}
+        print(json.dumps({**e, "state": state}, indent=2, default=str))
         return
     print(f"schedules from {path}" if path.exists() else
-          f"schedules from the database only (`ttp schedules {p.name} --export` keeps them in {path})")
+          f"schedules from the database only (`ttp schedules {p.name} --export` moves them into {path})")
     for r in p.db.q("SELECT * FROM schedules ORDER BY name"):
         e = sched.entry(r)
+        t = e["payload"].get("timeout_s") if isinstance(e["payload"], dict) else None
         print(f"  {e['name']:24} {e['kind']:8} every {e['every']}{' at ' + e['at'] if e.get('at') else ''}"
-              f"{'' if e['enabled'] else ' (off)'}  {r['last_status'] or ''}")
+              f"{f' timeout {t}s' if t else ''}{'' if e['enabled'] else ' (off)'}  {r['last_status'] or ''}")
 
 
 def cmd_machines(a) -> None:
@@ -3345,10 +3371,15 @@ def main(argv: list[str] | None = None) -> None:
                                   "or the user's words ending it)")
     s.set_defaults(fn=cmd_memory)
 
-    s = sub.add_parser("schedules", help="list schedules, or --export them once to harness/schedules.json")
+    s = sub.add_parser("schedules", help="list or show schedules (read-only); --export moves them into the harness")
     s.add_argument("name")
+    s.add_argument("action", nargs="?", choices=["list", "show"], default="list",
+                   help="list (default) or show <schedule>: read-only, writes nothing")
+    s.add_argument("schedule", nargs="?", help="the schedule to show")
     s.add_argument("--export", action="store_true",
-                   help="write the database's schedules to harness/schedules.json, which then holds them")
+                   help="MOVES the schedules into harness/schedules.json and COMMITS it; that file then holds "
+                        "them. Asks first; needs --yes when not interactive. To only read, use show")
+    s.add_argument("--yes", action="store_true", help="confirm --export without a prompt")
     s.set_defaults(fn=cmd_schedules)
 
     s = sub.add_parser("machines", help="your machines, shared by all your projects (add/list/remove/push)")

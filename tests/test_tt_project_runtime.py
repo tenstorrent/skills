@@ -24913,11 +24913,23 @@ def test_without_a_schedules_file_the_database_holds_them_until_exported(env, ca
     assert not path.exists() and len(p.db.q("SELECT name FROM schedules")) == 3
     cli.main(["schedules", "demo"])
     assert "from the database only" in capsys.readouterr().out
-    cli.main(["schedules", "demo", "--export"])
+    cli.main(["schedules", "demo", "list"])
+    cli.main(["schedules", "demo", "show", "probe"])
+    out = capsys.readouterr().out
+    assert '"name": "probe"' in out and '"state"' in out
+    assert not path.exists()   # reading writes nothing
+    with pytest.raises(SystemExit):
+        cli.main(["schedules", "demo", "show", "nope"])
+    with pytest.raises(SystemExit) as ex:   # not interactive: --export needs --yes
+        cli.main(["schedules", "demo", "--export"])
+    assert "--yes" in str(ex.value.code) or "--yes" in capsys.readouterr().err
+    assert not path.exists()
+    cli.main(["schedules", "demo", "--export", "--yes"])
+    assert "moved the schedules" in capsys.readouterr().out
     assert [e["name"] for e in _sched_file(p)] == ["daily-review", "pr-watch", "probe"]
     assert _harness_log(p)[0] == "schedules: exported from the database"
     with pytest.raises(SystemExit):
-        cli.main(["schedules", "demo", "--export"])
+        cli.main(["schedules", "demo", "--export", "--yes"])
 
 
 @needs_sockets
