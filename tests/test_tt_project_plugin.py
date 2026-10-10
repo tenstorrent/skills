@@ -566,19 +566,20 @@ BOX_PROBE = PLUGIN / "template" / "bin" / "tt-box-clean-probe"
 PROBE_NOW = "2026-01-10T12:00:00"
 
 
-def _box_probe(tmp_path, jobs=None, up_h=100.0, args=(), broker=None):
-    """Run the box-clean probe at PROBE_NOW with a fake uptime and either a jobs JSON file or a broker."""
+def _box_probe(tmp_path, jobs=None, up_h=100.0, args=(), broker=None, tz="UTC", now=PROBE_NOW):
+    """Run the box-clean probe at `now` (local, in zone `tz`) with a fake uptime and either a jobs JSON
+    file or a broker."""
     import subprocess
     up = tmp_path / "uptime"
     up.write_text("%.2f 1.00\n" % (up_h * 3600))
-    cmd = [sys.executable, str(BOX_PROBE), "--uptime-file", str(up), "--now", PROBE_NOW, *args]
+    cmd = [sys.executable, str(BOX_PROBE), "--uptime-file", str(up), *(["--now", now] if now else []), *args]
     if jobs is not None:
         f = tmp_path / "jobs.json"
         f.write_text(json.dumps(jobs))
         cmd += ["--jobs-file", str(f)]
     else:
         cmd += ["--broker-python", str(broker or tmp_path / "no-broker-python")]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=60, env=dict(os.environ, TZ=tz))
     return r.returncode, r.stdout.strip()
 
 
@@ -596,14 +597,16 @@ def test_box_clean_probe_ships_executable_and_documented():
 @pytest.mark.parametrize("job", [
     _job(3, owner="[broker]power-cycle"), _job(3, owner="[broker]bridge-reset"), _job(3, owner="[broker]reboot"),
     _job(3, owner="[broker]pci-rescan"), _job(3, owner="[broker]health-gate"),
-    _job(3, owner="[broker]hold", status="started"), _job(3, owner="[broker]fabric-check", status="failed"),
+    dict(_job(3, owner="[broker]hold", status="started"), finished_at="2026-01-10T09:00:00"),
+    _job(3, owner="[broker]fabric-check", status="failed"),
     _job(3, status="broker-kill"), _job(3, status="hung"), _job(3, command="tt-smi -r 0"),
     _job(3, command="python -c 'tt_device_reset()'"),
 ])
 def test_box_clean_probe_counts_each_incident_kind(tmp_path, job):
-    rc, out = _box_probe(tmp_path, {"jobs": [_job(1), job, _job(30, owner="[broker]power-cycle")]})
+    ended = _job(2.5, owner="[broker]hold", status="ended")
+    rc, out = _box_probe(tmp_path, {"jobs": [_job(1), job, ended, _job(30, owner="[broker]power-cycle")]})
     assert rc == 1, out
-    assert out.startswith("NOT CLEAN: newest incident 2026-01-10 09:00:00 UTC") and "clean at 2026-01-11 09:00" in out
+    assert out.startswith("NOT CLEAN: newest incident 2026-01-10 09:00:00 (") and "clean at 2026-01-11 09:00" in out
 
 
 def test_box_clean_probe_ignores_routine_and_old_jobs(tmp_path):
@@ -611,13 +614,50 @@ def test_box_clean_probe_ignores_routine_and_old_jobs(tmp_path):
             _job(3, owner="[broker]hold", status="ended"), _job(4, status="failed"),
             _job(5, command="tt-smi -s"), _job(25, owner="[broker]power-cycle"), {"job_id": "x", "owner": "[broker]reboot"}]
     rc, out = _box_probe(tmp_path, {"jobs": jobs})
-    assert (rc, out) == (0, "CLEAN: up 100.0 h, no broker incident since 2026-01-09 12:00 UTC")
+    assert (rc, out) == (0, "CLEAN: up 100.0 h, no broker incident since 2026-01-09 12:00")
     # A shorter window, aware timestamps and a bare list are read too.
     aware = [dict(_job(3, owner="[broker]reboot"), queued_at="2026-01-10T11:00:00+01:00")]
     assert _box_probe(tmp_path, aware, args=["--window-h", "2"])[0] == 1
     assert _box_probe(tmp_path, aware, args=["--window-h", "1.5"])[0] == 0
     aware[0]["queued_at"] = "2026-01-10T10:30:00Z"
     assert _box_probe(tmp_path, aware, args=["--window-h", "2"])[0] == 1
+
+
+def test_box_clean_probe_dates_a_job_by_when_it_went_wrong(tmp_path):
+    """A job queued and started before the window but hung, killed or running inside it counts."""
+    import datetime as dt
+    at = lambda h: (dt.datetime.fromisoformat(PROBE_NOW) - dt.timedelta(hours=h)).isoformat()
+    hung = dict(_job(26, status="hung"), started_at=at(25), finished_at=at(1))
+    rc, out = _box_probe(tmp_path, {"jobs": [_job(0.5), hung]})
+    assert rc == 1 and "newest incident 2026-01-10 11:00:00" in out, out
+    running = dict(_job(30, owner="[broker]power-cycle", status="running"), started_at=at(29))
+    # A hold whose start row (finished when written) has no later "ended" row is still on.
+    held = [dict(_job(50, owner="[broker]hold", status="ended")),
+            dict(_job(40, owner="[broker]hold", status="started"), started_at=at(40), finished_at=at(40))]
+    for jobs in ([running], held):
+        rc, out = _box_probe(tmp_path, {"jobs": [_job(0.5), *jobs]})
+        assert rc == 1 and "newest incident 2026-01-10 12:00:00" in out, out
+    # A routine job that finished inside the window is still routine; the history check uses its queue time.
+    done = dict(_job(30), started_at=at(29), finished_at=at(1))
+    assert _box_probe(tmp_path, {"jobs": [done]})[0] == 0
+    assert _box_probe(tmp_path, {"jobs": [_job(0.5), done]}, args=["--limit", "2"])[0] == 0
+
+
+def test_box_clean_probe_reads_broker_times_as_local(tmp_path):
+    """The broker writes naive local times: west of UTC, an incident 1 h ago is still inside a 6 h window."""
+    import datetime as dt
+    tz = "America/Los_Angeles"
+    if not os.path.exists("/usr/share/zoneinfo/" + tz):
+        tz = "PST8PDT"
+    env = dict(os.environ, TZ=tz)
+    import subprocess
+    local_now = subprocess.run([sys.executable, "-c", "import datetime; print(datetime.datetime.now().isoformat())"],
+                               capture_output=True, text=True, env=env).stdout.strip()
+    hour_ago = (dt.datetime.fromisoformat(local_now) - dt.timedelta(hours=1)).isoformat()
+    job = {"job_id": "j9", "owner": "[broker]power-cycle", "status": "completed", "command": "power-cycle",
+           "queued_at": hour_ago, "started_at": hour_ago, "finished_at": hour_ago}
+    rc, out = _box_probe(tmp_path, {"jobs": [job]}, args=["--window-h", "6"], tz=tz, now=None)
+    assert rc == 1, out
 
 
 def test_box_clean_probe_counts_a_recent_boot_and_short_history(tmp_path):

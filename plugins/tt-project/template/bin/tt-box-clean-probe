@@ -10,7 +10,9 @@ ssh: `ssh <box> python3 - --window-h 24 < "$TTP_PROJECT/harness/bin/tt-box-clean
 
 Incidents: a host boot; broker-run bridge-reset, power-cycle, reboot, pci-rescan or health-gate
 jobs; a hold starting; a failed broker job; a tenant job the broker killed, found hung, or that
-ran a device reset. Broker times are naive UTC.
+ran a device reset. Each job is dated by the latest time it has (finished, else started, else
+queued); a running job, or a hold still on, counts as now. The broker writes naive local times, so
+the probe compares them with the host's local clock (it runs on the broker's own host).
 
 Exit 0: clean for the window. 1: not yet (prints the newest incident and the earliest clean
 time). 255: cannot tell (uptime or the broker unreadable). The harness reads 1 and 255 as not yet.
@@ -44,8 +46,12 @@ print(json.dumps(cli.mcp_tool_call(port, "tt_device_recent_jobs", {"limit": int(
 """
 
 
-def utc_naive(text):
-    """An ISO time as naive UTC; an aware one is converted. None when unparseable."""
+LIVE = {"running", "started", "queued"}
+
+
+def local_naive(text):
+    """An ISO time as naive local time, as the broker writes it; an aware one is converted. None when
+    unparseable."""
     if not isinstance(text, str) or not text:
         return None
     s = text.strip()
@@ -56,8 +62,14 @@ def utc_naive(text):
     except ValueError:
         return None
     if t.tzinfo is not None:
-        t = t.astimezone(dt.timezone.utc).replace(tzinfo=None)
+        t = t.astimezone().replace(tzinfo=None)
     return t
+
+
+def job_times(job):
+    """The job's parseable queued, started and finished times."""
+    times = (local_naive(job.get(k)) for k in ("queued_at", "started_at", "finished_at"))
+    return [t for t in times if t is not None]
 
 
 def incident(job):
@@ -83,26 +95,35 @@ def judge(jobs, up_s, window_s, now, limit):
     if boot > cutoff:
         found.append((boot, "host boot"))
     oldest = now
+    # The broker writes a hold's start as a finished "started" row and its end as a separate "ended"
+    # row: the newest hold row being "started" means the device is held now.
+    holds = [(max(ts), j) for j in jobs or () for ts in [job_times(j)]
+             if ts and j.get("owner") == "[broker]hold" and j.get("status") in ("started", "ended")]
+    held = max(holds, key=lambda h: h[0])[1] if holds else None
     for j in jobs or ():
         if not isinstance(j, dict):
             continue
-        t = utc_naive(j.get("queued_at")) or utc_naive(j.get("started_at"))
-        if t is None:
+        times = job_times(j)
+        if not times:
             continue
-        oldest = min(oldest, t)
+        oldest = min(oldest, *times)
+        # Queue time is not when it went wrong: a job queued or started long ago may hang, be killed
+        # or reset the device just now. One still running (or a hold still on) is an incident now.
+        live = (not j.get("finished_at") and j.get("status") in LIVE) or (j is held and j["status"] == "started")
+        t = now if live else max(times)
         what = t >= cutoff and incident(j)
         if what:
             found.append((t, what))
     if found:
         t, what = max(found)
-        return NOT_YET, ("NOT CLEAN: newest incident %s UTC (%s); %d in window; clean at %s UTC at the "
+        return NOT_YET, ("NOT CLEAN: newest incident %s (%s); %d in window; clean at %s at the "
                          "earliest" % (t.strftime("%Y-%m-%d %H:%M:%S"), what, len(found),
                                        (t + dt.timedelta(seconds=window_s)).strftime("%Y-%m-%d %H:%M")))
     if jobs is not None and len(jobs) >= limit and oldest > cutoff:
         return NOT_YET, ("NOT CLEAN: broker history (%d jobs) does not reach back %.1f h; raise --limit"
                          % (len(jobs), window_s / 3600))
     basis = "no broker incident" if jobs is not None else "no broker installed, uptime only"
-    return CLEAN, "CLEAN: up %.1f h, %s since %s UTC" % (up_s / 3600, basis, cutoff.strftime("%Y-%m-%d %H:%M"))
+    return CLEAN, "CLEAN: up %.1f h, %s since %s" % (up_s / 3600, basis, cutoff.strftime("%Y-%m-%d %H:%M"))
 
 
 def read_jobs(args):
@@ -155,7 +176,7 @@ def main(argv=None):
                     help="exit 255 when no broker is installed instead of judging on uptime alone")
     ap.add_argument("--jobs-file", help="read recent jobs JSON from this file ('-': stdin) instead of the broker")
     ap.add_argument("--uptime-file", default="/proc/uptime", help=argparse.SUPPRESS)
-    ap.add_argument("--now", help=argparse.SUPPRESS)  # naive UTC ISO time, for tests
+    ap.add_argument("--now", help=argparse.SUPPRESS)  # naive local ISO time, for tests
     args = ap.parse_args(argv)
     try:
         with open(args.uptime_file, encoding="ascii") as f:
@@ -163,7 +184,7 @@ def main(argv=None):
     except (OSError, ValueError, IndexError) as e:
         print("UNKNOWN: uptime unreadable: %s" % e)
         return UNKNOWN
-    now = utc_naive(args.now) if args.now else dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+    now = local_naive(args.now) if args.now else dt.datetime.now()
     jobs, err = read_jobs(args)
     if err:
         print("UNKNOWN: %s" % err)
