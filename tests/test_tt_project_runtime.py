@@ -12102,6 +12102,41 @@ def test_a_task_continuing_one_whose_worktree_was_removed_starts_from_its_commit
     assert _git_out(again, "rev-parse", "HEAD") == head
 
 
+def test_a_task_continuing_a_failed_review_starts_from_the_reviewed_branch(env, monkeypatch):
+    # A re-plan labelled continues:<review> builds on what the review reviewed, not on the base,
+    # so its head contains the reviewed branch (the push queue refuses one that does not).
+    p = make(env)
+    _no_grace(monkeypatch)
+    from ttp import worktree
+    from ttp.prompts import worker_task
+    work, path, branch = _code_task(p, "change", status="done")
+    _commit_file(path, "change")
+    head = _git_out(path, "rev-parse", "HEAD")
+    review = p.db.add_task("review change", f"Review branch {branch}.", kind="review", tier="light",
+                           origin="user")
+    p.db.update_task(review, status="failed")
+    replan = p.db.add_task("redo change", "s", kind="code", tier="light", origin="user",
+                           labels=[f"continues:{review}"])
+    new_path, new_branch = worktree.ensure(p, p.db.task(replan))
+    assert new_branch != branch and _git_out(new_path, "rev-parse", "HEAD") == head
+    assert (new_path / "change.txt").exists()
+    assert "starts from the head of what it reviewed" in worker_task(p, p.db.task(replan), str(new_path), new_branch)
+    # A fix branch built on the reviewed branch is what a later re-plan of its re-review starts from.
+    _commit_file(new_path, "fix")
+    fix_head = _git_out(new_path, "rev-parse", "HEAD")
+    p.db.update_task(replan, branch=new_branch, status="done")
+    again = p.db.add_task("review change again", f"Review branch {branch}.", kind="review", tier="light",
+                          origin="user")
+    p.db.update_task(again, status="failed")
+    third = p.db.add_task("redo change again", "s", kind="code", tier="light", origin="user",
+                          labels=[f"continues:{again}"])
+    assert worktree.continued_head(p, p.db.task(third)) == fix_head
+    # A review naming nothing that resolves: the base, as before.
+    lost = p.db.add_task("review gone", "Review branch ttp/t999-gone.", kind="review", tier="light", origin="user")
+    stray = p.db.add_task("redo gone", "s", kind="code", tier="light", origin="user", labels=[f"continues:{lost}"])
+    assert worktree.continued_head(p, p.db.task(stray)) is None
+
+
 def test_worktree_retention_delays_removal(env, monkeypatch):
     p = make(env)
     _no_grace(monkeypatch)

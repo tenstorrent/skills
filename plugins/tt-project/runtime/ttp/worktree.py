@@ -262,10 +262,13 @@ def venv_env(venv: Path, path: str) -> dict[str, str]:
 
 def continued_head(p: Project, task: dict) -> str | None:
     """The head of the branch of the task this one continues (one that ran in a worktree of its
-    own, own_worktree), so its commits carry over.
+    own, own_worktree), so its commits carry over; for a continued review, the head of what it
+    reviewed (reviewed_head), so a re-plan of a failed review builds on the reviewed branch.
     A branch of its own lets the old worktree stay checked out until it is pruned."""
     old_id = continues_id(task)
     old = p.db.task(old_id) if old_id else None
+    if old and old["kind"] == "review":
+        return reviewed_head(p, old)
     if not old or not own_worktree(old) or not old["branch"]:
         return None
     for cand in (old["branch"], f"origin/{old['branch']}"):
@@ -273,6 +276,25 @@ def continued_head(p: Project, task: dict) -> str | None:
         if head:
             return head
     return None
+
+
+def reviewed_head(p: Project, review: dict) -> str | None:
+    """The commit a review reviewed: of the refs it covers (reviewed_refs) that resolve here or on
+    origin, the one that contains all the others (a fix branch on top of the reviewed branch), else
+    the first one named. None when none resolves."""
+    heads = []
+    for ref in reviewed_refs(p, review):
+        for cand in (ref,) if _HEX.fullmatch(ref) else (ref, f"origin/{ref}"):
+            head = _git(p.root, "rev-parse", "--verify", "--quiet", f"{cand}^{{commit}}", check=False)
+            if head:
+                heads.append(head)
+                break
+    heads = list(dict.fromkeys(heads))
+    for tip in heads:
+        if all(h == tip or subprocess.run(["git", "-C", str(p.root), "merge-base", "--is-ancestor", h, tip],
+                                          capture_output=True, timeout=120).returncode == 0 for h in heads):
+            return tip
+    return heads[0] if heads else None
 
 
 def carried_head(p: Project, task: dict) -> str | None:

@@ -236,6 +236,7 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
         was = str(load_result(old["result"]).get("summary") or old["blocked_reason"] or "")[:1500]
         history += (f"\nThis task continues #{old['id']} {old['title']} ({old['status']}){on}"
                     + (", and starts from that branch's head" if on and (branch or gets_worktree(p, kind)) else "")
+                    + (", and starts from the head of what it reviewed" if old["kind"] == "review" and branch else "")
                     + (f". Its last summary: {was}" if was else "") + "\n")
     if (onto := carried_branch(task)) and branch:
         history += (f"\nThis task delivers onto branch {onto} (`ttp push --own --detach`, fast-forward only)"
