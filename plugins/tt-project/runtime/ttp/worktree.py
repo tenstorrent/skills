@@ -138,6 +138,17 @@ def carried_branch(task: dict) -> str:
     return found if valid_branch(found) else ""
 
 
+def rebased_branch(task: dict) -> str:
+    """The branch a task's `rebases:<branch>` label names: it starts from that branch's head on its own
+    branch and delivers there (a rebase cannot fast-forward the old one), or ""."""
+    try:
+        labels = json.loads(task.get("labels") or "[]")
+    except (ValueError, TypeError):
+        return ""
+    found = next((lb[8:] for lb in labels if isinstance(lb, str) and lb.startswith("rebases:")), "")
+    return found if valid_branch(found) else ""
+
+
 def on_carried(p: Project, task: dict) -> str:
     """The task's carried branch when its worktree may check it out: it exists here or on origin,
     no other worktree holds it, and it is no shared branch (main/master, the push branch or the
@@ -315,8 +326,9 @@ def reviewed_head(p: Project, review: dict) -> str | None:
 
 
 def carried_head(p: Project, task: dict) -> str | None:
-    """The head of the task's carried branch (carried_branch), so it builds on what it delivers onto."""
-    branch = carried_branch(task)
+    """The head of the task's carried branch (carried_branch), so it builds on what it delivers onto,
+    or of the branch it rebases (rebased_branch)."""
+    branch = carried_branch(task) or rebased_branch(task)
     for cand in (branch, f"origin/{branch}") if branch else ():
         head = _git(p.root, "rev-parse", "--verify", "--quiet", f"{cand}^{{commit}}", check=False)
         if head:

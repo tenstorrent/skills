@@ -38796,3 +38796,127 @@ def test_push_target_line_is_in_the_home_zone_on_a_utc_box(utc_box, tmp_path):
     db.x("INSERT INTO push_batches(id,marker,target,started,ended,finalized,outcome,pushed_sha) "
          "VALUES('b',?,'origin/proj',1.0,1.0,1.0,'pushed','ab12345')", (str(m),))
     assert pushq.target_line(db, "America/Los_Angeles").endswith("(as of the last push, 1969-12-31 16:00 PST)")
+
+
+def _local_push_setup(env, monkeypatch, checks):
+    """The project's code repo has no git remote at all; its `proj` branch is the push branch."""
+    for var, val in (("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"),
+                     ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t")):
+        monkeypatch.setenv(var, val)
+    p = make(env)
+    repo = env["repo"]
+    assert _git_out(repo, "remote") == ""
+    _git_out(repo, "branch", "proj")
+    p.set_config("delivery.push_branch", "proj")
+    p.set_config("delivery.push_checks", checks)
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.chdir(repo)
+    return p, repo
+
+
+def test_push_own_without_a_git_remote_fast_forwards_the_local_branch(env, monkeypatch, capsys):
+    """In a code repo with no git remote, `ttp push --own` (and --detach) publishes by moving the
+    local branch, fast-forward only, after its checks: the task's own branch is already there, and a
+    pr_branch it carries is fast-forwarded to HEAD. A diverged branch, or one another worktree has
+    checked out, is refused before the checks and keeps its tip."""
+    log = env["tmp"] / "checked"
+    p, repo = _local_push_setup(env, monkeypatch, [f"git rev-parse HEAD >> {log}"])
+    t = p.db.add_task("Speed it up", "s", kind="code")
+    monkeypatch.setenv("TTP_TASK", str(t))
+    _git_out(repo, "checkout", "-q", "-b", f"ttp/t{t}-speed-it-up")
+    _commit(repo, "a.txt", "a\n")
+    head = _git_out(repo, "rev-parse", "HEAD")
+    capsys.readouterr()
+    assert _ttp("push", "--own") == 0
+    err = capsys.readouterr().err
+    assert "local branch" in err and "cannot reach" not in err, err
+    assert log.read_text().split() == [head]
+    # A pr_branch it carries: fast-forwarded to HEAD.
+    _git_out(repo, "branch", "feature/x", "proj")
+    p.db.update_task(t, labels=["pr_branch:feature/x"])
+    assert _ttp("push", "--own") == 0 and _git_out(repo, "rev-parse", "feature/x") == head
+    assert f"pushed {head[:10]} to local branch feature/x" in capsys.readouterr().err
+    # --detach takes the same way and its probe reports it.
+    _commit(repo, "b.txt", "b\n")
+    second = _git_out(repo, "rev-parse", "HEAD")
+    rc = _ttp("push", "--own", "--detach")
+    out = capsys.readouterr().out
+    probe = next(ln.split(": ", 1)[1] for ln in out.splitlines() if ln.startswith("retry_when: "))
+    assert rc == 0
+    r = _probe_until_done(p, probe)
+    assert r.returncode == 0 and f"pushed {second}" in r.stdout, r
+    assert _git_out(repo, "rev-parse", "feature/x") == second
+    # Diverged: refused before the checks, the branch keeps its tip.
+    _git_out(repo, "branch", "-f", "feature/x", "proj")
+    side = env["tmp"] / "side"
+    _git_out(repo, "worktree", "add", "-q", str(side), "feature/x")
+    _commit(side, "theirs.txt", "theirs\n")
+    theirs = _git_out(repo, "rev-parse", "feature/x")
+    _git_out(repo, "worktree", "remove", str(side))
+    ran = log.read_text().split()
+    assert _ttp("push", "--own") == 2 and "not an ancestor of HEAD" in capsys.readouterr().err
+    assert _git_out(repo, "rev-parse", "feature/x") == theirs and log.read_text().split() == ran
+    # Checked out in another worktree: refused, whatever its history.
+    _git_out(repo, "branch", "-f", "feature/x", head)
+    _git_out(repo, "worktree", "add", "-q", str(side), "feature/x")
+    assert _ttp("push", "--own") == 2 and "checked out in another worktree" in capsys.readouterr().err
+    assert _git_out(repo, "rev-parse", "feature/x") == head and log.read_text().split() == ran
+    # Shared branches stay refused.
+    p.db.update_task(t, labels=[])
+    _git_out(repo, "worktree", "remove", str(side))
+    for name in ("proj", "main"):
+        _git_out(repo, "checkout", "-q", "-B", name)
+        assert _ttp("push", "--own") == 2 and "shared branch" in capsys.readouterr().err, name
+
+
+def test_push_own_with_a_git_remote_still_pushes_to_it_and_never_falls_back_to_the_local_branch(
+        env, monkeypatch, capsys):
+    """A repo with a remote is unchanged: an unreachable remote refuses (exit 2), never moving a local
+    branch instead."""
+    from ttp import push
+    p, repo = _local_push_setup(env, monkeypatch, ["true"])
+    _git_out(repo, "remote", "add", "origin", str(env["tmp"] / "gone.git"))
+    t = p.db.add_task("Speed it up", "s", kind="code", labels=["pr_branch:feature/x"])
+    monkeypatch.setenv("TTP_TASK", str(t))
+    _git_out(repo, "branch", "feature/x")
+    _git_out(repo, "checkout", "-q", "-b", f"ttp/t{t}-speed-it-up")
+    _commit(repo, "a.txt", "a\n")
+    assert push.own_target(p, repo) == ("origin", "feature/x")
+    before = _git_out(repo, "rev-parse", "feature/x")
+    capsys.readouterr()
+    assert _ttp("push", "--own") == 2 and "cannot reach origin" in capsys.readouterr().err
+    assert _git_out(repo, "rev-parse", "feature/x") == before
+
+
+def test_a_rebase_task_delivers_on_its_own_branch_and_its_review_publishes_that_one(env, monkeypatch):
+    """A task whose title says it rebases the branch its spec names is labelled rebases:<branch>, not
+    pr_branch: it starts from that branch's head on its own branch, its prompt says it delivers there,
+    and its review publishes that new branch with --own (never the old one, never the queue)."""
+    from ttp import coordinator as coord, push, pushq, worktree
+    from ttp.prompts import worker_task
+    p = make(env)
+    _with_origin(env, clone=False)
+    p.set_config("delivery.push_branch", "origin/work")
+    monkeypatch.setattr(pushq, "enabled", lambda *a, **k: False)
+    _git_out(p.root, "branch", "feature/x")
+    assert coord.apply(p, [{"type": "task_add", "title": "Rebase feature/x onto work", "kind": "code",
+                            "spec": "pr_branch: `feature/x`\nRebase it onto the latest work."}]) == []
+    t = p.db.one("SELECT * FROM tasks WHERE title='Rebase feature/x onto work'")
+    assert json.loads(t["labels"]) == ["rebases:feature/x"]
+    assert any("rebases feature/x" in n for n in p.db.kv(coord.NOTES_KEY) or [])
+    assert worktree.rebased_branch(t) == "feature/x" and worktree.carried_branch(t) == ""
+    path, branch = worktree.ensure(p, t)
+    assert branch.startswith(f"ttp/t{t['id']}-")
+    assert _git_out(path, "rev-parse", "HEAD") == _git_out(p.root, "rev-parse", "feature/x")
+    assert "rebases branch feature/x" in worker_task(p, t, str(path), branch)
+    # A title without "rebase" keeps pr_branch.
+    assert coord.apply(p, [{"type": "task_add", "title": "Fix feature/x CI", "kind": "code",
+                            "spec": "pr_branch: `feature/x`\nFix it."}]) == []
+    assert json.loads(p.db.one("SELECT labels FROM tasks WHERE title='Fix feature/x CI'")["labels"]) \
+        == ["pr_branch:feature/x"]
+    # Its review: retargeted to the task's own branch, published with --own, review only for the queue.
+    code, _, _, (rev,) = _finish_code(env, p, "rebase it", {"r.py": 3}, labels=["rebases:feature/x"])
+    own = p.db.task(code)["branch"]
+    assert own.startswith(f"ttp/t{code}-") and push.pr_elsewhere(p, p.db.task(code), {"push_branch": "origin/work"}) == own
+    assert f"It rebases feature/x and delivers onto its own branch {own}" in rev["spec"], rev["spec"]
+    assert "`ttp push --own --detach`" in rev["spec"] and "do not approve it for the push queue" in rev["spec"]

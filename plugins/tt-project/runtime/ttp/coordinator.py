@@ -958,8 +958,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         old = None
                 taken = bool(carried and old and old["id"] == carried[0]["id"])
                 onto = given.group(1) if given else carried[1] if carried and not taken else ""
+                # A rebase of that branch cannot fast-forward it: it delivers on its own branch.
+                rebase = bool(onto and REBASE_TITLE.search(title))
                 if onto:
-                    labels.append(f"pr_branch:{onto}")
+                    labels.append(f"{'rebases' if rebase else 'pr_branch'}:{onto}")
                 if old:
                     labels.append(f"continues:{old['id']}")
                 after, when = _start_args(a, {}, p)
@@ -986,7 +988,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                             db.update_task(old["id"], status="cancelled", blocked_reason=f"continued by #{new_id}")
                 if followup:
                     notes.append(f"task_add: #{followup['id']} is done; added #{new_id} as its follow-up")
-                if carried:
+                if rebase:
+                    notes.append(f"task_add: #{new_id} rebases {onto}: it starts from that branch on its own "
+                                 f"branch and delivers there with `ttp push --own` (a rebase cannot fast-forward "
+                                 f"{onto}); its review publishes that new branch")
+                elif carried:
                     how = f"continues #{old['id']}" if taken else f"labelled pr_branch:{carried[1]}"
                     notes.append(f"task_add: #{new_id} names #{carried[0]['id']}'s branch {carried[1]}: {how}, "
                                  f"so `ttp push --own` publishes onto it")
@@ -1461,6 +1467,7 @@ def _continued(db, raw: Any, deps: list[int]) -> dict:
 # labels a bogus branch ("use"); `ttp push --own` refuses one that exists nowhere and on_carried
 # sends the task back to its own branch, so no parser heuristics here.
 NAMED_BRANCH = re.compile(r"(?<![\w/.-])ttp/t(\d+)-[\w./-]*[\w-]")
+REBASE_TITLE = re.compile(r"\brebas(?:e|es|ed|ing)\b", re.I)   # a task whose work is a rebase of its branch
 SPEC_PR_BRANCH = re.compile(r"(?<![\w-])pr_branch:\s*[`'\"]?([A-Za-z0-9][\w./-]*[\w-])")
 
 

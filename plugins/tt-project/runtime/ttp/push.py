@@ -882,7 +882,8 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
     `pr_branch:<branch>` on its own ttp/t<id>-... branch (the PR's branch was held by another
     worktree) publishes its head onto that branch instead, and so does a review covering that task.
     Never a detached HEAD, main/master, the
-    push branch or the branch work starts from; publish also refuses the remote's default branch."""
+    push branch or the branch work starts from; publish also refuses the remote's default branch.
+    In a repo with no git remote the remote is LOCAL: publish moves the local branch (local_refusal)."""
     branch = _git(repo, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
     if not branch:
         raise ValueError("--own publishes the checked-out branch, not a detached HEAD")
@@ -903,6 +904,8 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
         raise ValueError(f"--own publishes only this task's own branch (ttp/t{task}-...), not {branch}")
     d = p.config().get("delivery") or {}
     remote, shared = target(p, repo) if str(d.get("push_branch") or "").strip() else ("origin", "")
+    if remote_less(repo):
+        remote = LOCAL
     base = str(d.get("base_ref") or "").strip()
     if branch in PROTECTED or branch in (shared, base, base.partition("/")[2]):
         raise ValueError(f"--own never pushes to a shared branch ({branch})")
@@ -913,6 +916,71 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
             raise ValueError(f"this task's pr_branch {branch} exists neither here nor on {remote}: --own "
                              f"publishes onto an existing branch only, never creates one")
     return remote, branch
+
+
+LOCAL = "local"   # own_target's remote in a code repo with no git remote: publishing moves the local branch
+
+
+def remote_less(repo: Path) -> bool:
+    """Whether `repo` is a git repo with no remote at all (`git remote` lists none)."""
+    r = _git(repo, "remote")
+    return r.returncode == 0 and not r.stdout.split()
+
+
+def _local_tip(repo: Path, branch: str) -> str:
+    return _git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}^{{commit}}").stdout.strip()
+
+
+def local_refusal(repo: Path, branch: str) -> str:
+    """Why `ttp push --own` in a repo with no git remote must not move local branch `branch` to HEAD,
+    or "": that branch is the published copy there. Never main/master, never a branch another
+    worktree has checked out (its files would no longer match), and only as a fast-forward."""
+    if branch in PROTECTED:
+        return f"refusing to move the local branch {branch}"
+    if branch != _git(repo, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip():
+        top, cur = Path(repo).resolve(), ""
+        for line in _git(repo, "worktree", "list", "--porcelain").stdout.splitlines():
+            if line.startswith("worktree "):
+                cur = line[9:]
+            elif line == f"branch refs/heads/{branch}" and Path(cur).resolve() != top:
+                return (f"no git remote, and {branch} is checked out in another worktree ({cur}): moving it "
+                        f"would leave that worktree's files behind its branch; not publishing. Publish "
+                        f"onto a branch no worktree holds, e.g. this task's own")
+    tip = _local_tip(repo, branch)
+    if tip and _git(repo, "merge-base", "--is-ancestor", tip, "HEAD").returncode != 0:
+        return (f"local branch {branch} ({tip[:10]}) is not an ancestor of HEAD: with no git remote --own "
+                f"only fast-forwards it, never rewrites it. A rebase delivers on a branch of its own")
+    return ""
+
+
+def _move_local(repo: Path, branch: str, head: str, say: Callable[[str], None]) -> int:
+    """Publish `head` in a repo with no git remote: fast-forward local branch `branch` to it, guarded
+    by the tip it had (another writer in between makes git refuse)."""
+    if branch == _git(repo, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip():
+        say(f"pushed {head[:10]} to local branch {branch}: no git remote, so the branch is the published "
+            f"copy and it is already there")
+        return 0
+    if why := local_refusal(repo, branch):   # again: it may have changed during the checks
+        say(why)
+        return REJECTED
+    old = _local_tip(repo, branch) or "0" * len(head)
+    r = _git(repo, "update-ref", "-m", "ttp push --own", f"refs/heads/{branch}", head, old)
+    if r.returncode != 0:
+        say(f"could not move local branch {branch}: {r.stderr.strip()}")
+        return REJECTED
+    say(f"pushed {head[:10]} to local branch {branch} (no git remote: the local branch is the published copy)")
+    return 0
+
+
+def own_base(p: Project, repo: Path, remote: str) -> str | None:
+    """The tip of the shared branch work leaves from (delivery.push_branch) that `ttp push --own`
+    compares with: fetched, or the local branch of that name in a repo with no git remote. None
+    when there is none."""
+    try:
+        tgt = target(p, repo)
+    except ValueError:
+        return None
+    return (_local_tip(repo, tgt[1]) if remote == LOCAL else _fetch(repo, *tgt)) or None
 
 
 def own_ff_only(branch: str) -> bool:
@@ -1162,13 +1230,16 @@ def kept_off(task: dict, changes: dict | None, d: dict) -> str:
 
 
 def pr_branch_of(p: Project, task: dict | None) -> str:
-    """The branch a task's `pr_branch:` label delivers onto (worktree.carried_branch), or that of the
-    task it continues (a fix of a failed review's findings builds on that task's work), or ""."""
+    """The branch a task's `pr_branch:` label delivers onto (worktree.carried_branch), its own branch
+    when it rebases one (`rebases:<branch>`: a rebase cannot fast-forward the old branch), or that of
+    the task it continues (a fix of a failed review's findings builds on that task's work), or ""."""
     from .db import continues_id
     seen: set[int] = set()
     while task and task["id"] not in seen:
         seen.add(task["id"])
         if onto := worktree.carried_branch(task):
+            return onto
+        if worktree.rebased_branch(task) and (onto := str(task.get("branch") or "")):
             return onto
         c = continues_id(task)
         task = p.db.task(c) if c is not None else None
@@ -1679,7 +1750,9 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
     if _git(repo, "status", "--porcelain", "--untracked-files=no").stdout.strip():
         say("uncommitted changes; commit first")
         return REFUSED
-    why = refusal(repo, remote, branch) or (behind(repo, remote, branch) if ff_only else "")
+    local = remote == LOCAL and remote_less(repo)
+    why = local_refusal(repo, branch) if local else \
+        refusal(repo, remote, branch) or (behind(repo, remote, branch) if ff_only else "")
     if why:
         say(why)
         return REFUSED
@@ -1709,7 +1782,8 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
                 say(f"{head[:10]}: every project check was skipped; running the {len(todo)} command(s) "
                     f"`ttp checks` recorded passing on this commit: {'; '.join(todo)}")
         started = time.time()
-        env = check_env("own", _existing_tip(repo, remote, branch) if todo else "")
+        tip = (_local_tip(repo, branch) if local else _existing_tip(repo, remote, branch)) if todo else ""
+        env = check_env("own", tip)
         for cmd in todo:
             if subprocess.run(check_argv(cmd, repo), cwd=repo, env=env).returncode != 0:
                 say(f"check failed on {head[:10]}: {cmd}; not pushing")
@@ -1719,6 +1793,8 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
         if _git(repo, "rev-parse", "HEAD").stdout.strip() != head:
             say(f"HEAD moved off {head[:10]} during the checks; not pushing")
             return REFUSED
+        if local:
+            return _move_local(repo, branch, head, say)
         if _git(repo, "push", remote, f"{head}:refs/heads/{branch}", quiet=False).returncode == 0:
             say(f"pushed {head[:10]} to {remote}/{branch}")
             return 0
@@ -1887,13 +1963,9 @@ def run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None)
     global last_ff, last_reach
     last_ff, last_reach = [], None
     if own:   # delivery.push_exclude_paths guards the push branch only
-        base = None
         # The docs-only test, if_changed scopes and the project's own checks may all compare with the
         # shared branch this work leaves from: always fetch it (cheap), so none sees a stale base.
-        try:
-            base = _fetch(repo, *target(p, repo)) or None
-        except ValueError:
-            pass
+        base = own_base(p, repo, remote)
         rc = publish(repo, remote, branch, checks, hold=lambda: take(p, remote, branch, wait_s),
                      timed=lambda s: record_check_s(p, s), base=base,
                      ff_only=own_ff_only(branch),
@@ -1904,7 +1976,7 @@ def run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None)
                   exclude=exclude_list(d.get("push_exclude_paths")), allow=allow_protected(d))
         if rc == 0 and last_pushed and (also := fast_forward_list(d.get("fast_forward_also"))):
             last_ff = fast_forward(repo, remote, last_pushed, also, branch)
-    if rc == 0:
+    if rc == 0 and remote != LOCAL:   # no remote: nothing to fetch the intended branch from
         sha = (None if own else last_pushed) or _git(repo, "rev-parse", "HEAD").stdout.strip()
         try:
             last_reach = reach(p, repo, f"{remote}/{branch}", sha)
@@ -2080,10 +2152,7 @@ def detach(p: Project, repo: Path, own: bool = False) -> int:
         print("ttp push: uncommitted changes; commit first", file=sys.stderr)
         return REFUSED
     if not check_list(d.get("push_checks")):   # refuse now, not after the task handed off waiting
-        try:
-            base = _fetch(top, *target(p, top)) or None
-        except ValueError:
-            base = None
+        base = own_base(p, top, remote)
         if code := code_paths(top, base) if base else ["(no push target to compare with)"]:
             more = f" and {len(code) - 3} more" if len(code) > 3 else ""
             print(f"ttp push: no checks configured, and this change touches more than docs "

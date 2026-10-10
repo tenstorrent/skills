@@ -14,7 +14,7 @@ from . import timefmt
 from .db import continues_id, load_result
 from .hook import unread_update
 from .project import WORKER_MEMORY_CHARS, Project, code_tasks_may_push, push_queue_on
-from .worktree import carried_branch, gets_worktree, own_worktree, project_venv
+from .worktree import carried_branch, gets_worktree, own_worktree, project_venv, rebased_branch
 
 
 def _read(p: Project, name: str) -> str:
@@ -252,6 +252,10 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
                     + (": its worktree is on it.\n" if branch == onto else
                        f": it could not be checked out here, so this task works on its own branch, from that "
                        f"branch's head when there is one, and the push publishes its head onto {onto}.\n"))
+    elif (old_branch := rebased_branch(task)) and branch:
+        history += (f"\nThis task rebases branch {old_branch}: it starts from that branch's head on its own branch "
+                    f"{branch} and delivers there (`ttp push --own --detach`), never onto {old_branch}: a rebase "
+                    f"cannot fast-forward it.\n")
     delivery = cfg.get("delivery", {})
     venv = project_venv(p, cwd)
     venv_line = (f"python venv: {venv} (the project's, already active: VIRTUAL_ENV and PATH; shared with other "

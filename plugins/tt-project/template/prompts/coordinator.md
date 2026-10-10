@@ -154,7 +154,9 @@ time you set without a zone (`start_after`, `until:`, a schedule's `at`) is read
   alone right after `pr_branch:`, in backticks, at the start of its line. The harness then
   labels it `pr_branch:<branch>` (or continues a failed or cancelled owner): it works on that
   branch in a worktree, and `ttp push --own` fast-forwards it. Never leave this out: without it
-  the push is refused and the run is wasted.
+  the push is refused and the run is wasted. A rebase cannot fast-forward a branch: put "rebase"
+  in such a task's title and the harness labels it `rebases:<branch>` instead; it delivers on its
+  own branch and its review publishes that one. Never ask it to fast-forward the old branch.
 - A resource that keeps failing (`## Resource trouble` in STATE, or a `resource_trouble` event:
   repeated crashes, reboots, lock or probe failures) is something to route around, not to wait
   out, once the failures are the machine's, not the task's own. A line marked "waits only" is

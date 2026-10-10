@@ -4975,6 +4975,11 @@ class Daemon:
             lines.append(f"Its head is already delivered as PR {delivered}: review only. If it passes, hand off "
                          f"`done`; do not run `ttp push` or approve it for the push queue. Leave the branch and "
                          f"the PR as they are.")
+        elif elsewhere and (old := worktree.rebased_branch(task)) and d.get("push_allowed", True):
+            lines.append(f"It rebases {old} and delivers onto its own branch {elsewhere}, not {old} (a rebase "
+                         f"cannot fast-forward it) and not {d['push_branch']}. If it passes, publish it with "
+                         f"`ttp push --own --detach` from the change's worktree; never run plain `ttp push` and "
+                         f"do not approve it for the push queue.")
         elif elsewhere and d.get("push_allowed", True):
             lines.append(f"It delivers onto its pr_branch {elsewhere}, not {d['push_branch']}. If it passes, "
                          f"publish it there with `ttp push --own --detach` from the change's worktree; never run "
