@@ -491,7 +491,8 @@ is a real overlap). A project's own rules in a template prompt belong
 between `<!-- ttp:local -->` and `<!-- /ttp:local -->` lines (the prompt leaves those lines out):
 an upgrade takes upstream's text and puts each block back where it stood. When a project only added
 lines to a template prompt, the upgrade fences them that way itself. Only a real overlap, such as
-the project and upstream rewording the same line, goes to a harness task.
+the project and upstream rewording the same line, or each adding its own version of one line (the
+same leading key, or most of the text alike), goes to a harness task.
 The same conflict deferred past 48 h, or past two harness tasks that ended without landing it,
 reaches the coordinator once as a normal observation, not once per deploy.
 

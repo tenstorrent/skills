@@ -2975,13 +2975,14 @@ LOCAL_OPEN, LOCAL_CLOSE = "<!-- ttp:local -->", "<!-- /ttp:local -->"
 def _settle_merge(tmp: Path, ident: list[str], files: list[str]) -> str:
     """Finish the stopped merge of upstream in worktree `tmp` without a model when no conflict needs
     judgment (batch.settle): both sides only added lines at one spot, they changed different lines,
-    or upstream already makes the project's change (comments and spacing aside). A template prompt
+    or upstream already makes the project's change (comments and spacing aside); never when a line
+    one side added nearly repeats one the other added (batch._near). A template prompt
     the project only added to takes upstream's text with the project's blocks put back
     (_keep_local_blocks). Commits it and returns ""; else names the files left (nothing is committed)."""
     from .batch import _show, settle
     left, kinds, blocks = [], set(), []
     for f in files:
-        if settle(tmp, f, [], taken_in=True, hunks=True, superseded=True, kinds=kinds):
+        if settle(tmp, f, [], taken_in=True, hunks=True, superseded=True, near=True, kinds=kinds):
             continue
         sides = [_show(tmp, n, f) for n in (2, 1, 3)]
         merged = None
@@ -3014,8 +3015,11 @@ def _keep_local_blocks(ours: str, base: str, theirs: str) -> str | None:
     Each block goes back after the base line it followed (after upstream's rewrite of that spot, if
     any); added lines not yet fenced get the fence lines, so the next upgrade finds them as the
     project's (the prompts leave the fence lines out). None when the project changed or removed
-    template text, or a fence is not closed: that needs judgment."""
+    template text, a fence is not closed, or a line the project added nearly repeats one upstream
+    added (batch._near: two versions of one line): that needs judgment."""
     import difflib
+
+    from .batch import _near
     items: list[tuple[str, object]] = []       # ("t", template line) or ("b", fenced block lines)
     block = None
     for line in ours.splitlines(keepends=True):
@@ -3071,6 +3075,9 @@ def _keep_local_blocks(ours: str, base: str, theirs: str) -> str | None:
         return None
     out = theirs.splitlines(keepends=True)
     ops = difflib.SequenceMatcher(None, old, out, autojunk=False).get_opcodes()
+    mine = [x for _, lines in groups for x in lines if x.strip() not in (LOCAL_OPEN, LOCAL_CLOSE)]
+    if _near(mine, [x for tag, _, _, j1, j2 in ops if tag != "equal" for x in out[j1:j2]], False):
+        return None
 
     def where(i: int) -> int:
         for tag, i1, i2, j1, j2 in ops:

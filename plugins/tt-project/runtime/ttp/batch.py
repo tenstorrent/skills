@@ -47,6 +47,7 @@ SETTLED_WORDS = {"version": "version lines", "added": "lines both sides added",
                  "hunks": "changes of different lines", "taken_in": "a change the other side holds"}
 REPLAYED = "Ttp-Replayed-From"     # trailer of a commit the batch settled: the entry commit it replays
 TOP_DEF = re.compile(r"^(?:async[ \t]+def|def|class)[ \t]+([A-Za-z_]\w*)", re.M)
+LEAD_KEY = re.compile(r"""["']?([A-Za-z_][\w.-]*)["']?[ \t]*[:=](?![=/])""")   # `"key":`, `key =`, `key:`
 TOP_START = re.compile(r"(?:@|(?:async[ \t]+)?def[ \t]|class[ \t])")
 EXIT = {"pushed": 0, "landed": 0, "nothing": 0, "busy": push.BUSY, "moved": push.KEPT_MOVING,
         "rejected": push.REJECTED, "refused": push.REFUSED, "tip_failed": push.CHECKS_FAILED}
@@ -221,14 +222,16 @@ def _sweep_after_push(p: Project, repo: Path) -> None:
 # Conflicts that need no judgment ---------------------------------------------------------------------
 
 def merge3(ours: str, base: str, theirs: str, py: bool = False, taken_in: bool = False,
-           hunks: bool = False, kinds: set | None = None, superseded: bool = False) -> str | None:
+           hunks: bool = False, kinds: set | None = None, superseded: bool = False,
+           near: bool = False) -> str | None:
     """git's three-way merge of the texts, where each conflict in which both sides only added lines
     at one spot (an empty base section) keeps both: ours first, then theirs (in Python, see _seam).
     With `taken_in`, a conflict whose change on our side theirs already holds (_taken_in) takes
     theirs. With `hunks`, a conflict where the two sides changed different lines of the base section
     (git calls adjacent changes a conflict) takes both changes (_hunks). With `superseded`, a conflict
     whose change on our side theirs already makes, comments and spacing aside, takes theirs
-    (_superseded). None when any other conflict
+    (_superseded). With `near`, both sides' added lines are not kept (by the added or hunks rule)
+    when one nearly repeats the other (_near). None when any other conflict
     remains, or when keeping both could be wrong (_clash). `kinds` collects how each conflict was
     settled ("added", "taken_in", "hunks"). The conflict markers carry a random tag, so file content
     never passes for one; a hunk whose base-to-end part holds more than one separator line is not read.
@@ -284,10 +287,10 @@ def merge3(ours: str, base: str, theirs: str, py: bool = False, taken_in: bool =
         elif superseded and _superseded(mine, old, theirs_lines, py, no_comments):
             res += theirs_lines
             how = "superseded"
-        elif not old and not _clash(mine, theirs_lines, py):
+        elif not old and not _clash(mine, theirs_lines, py) and not (near and _near(mine, theirs_lines, py)):
             res += _seam(mine, theirs_lines) if py else mine + theirs_lines
             how = "added"
-        elif old and hunks and (both := _hunks(mine, old, theirs_lines, py)) is not None:
+        elif old and hunks and (both := _hunks(mine, old, theirs_lines, py, near)) is not None:
             res += both
             how = "hunks"
         else:                           # a real conflict
@@ -303,11 +306,12 @@ def merge3(ours: str, base: str, theirs: str, py: bool = False, taken_in: bool =
     return merged
 
 
-def _hunks(mine: list[str], old: list[str], theirs: list[str], py: bool) -> list[str] | None:
+def _hunks(mine: list[str], old: list[str], theirs: list[str], py: bool, near: bool = False) -> list[str] | None:
     """Both sides' changes of the `old` lines of one conflict, when they touch different lines: each
     side's edits (line diff against old) share no old line, and neither inserts lines at the edge of
     or inside an edit of the other (the order would be a guess). None on an overlap, or when the
-    lines the two sides added share one (_said: the result would hold it twice)."""
+    lines the two sides added share one (_said: the result would hold it twice), or with `near`,
+    when one nearly repeats the other (_near)."""
     def edits(side: list[str]) -> list[tuple[int, int, list[str]]]:
         sm = difflib.SequenceMatcher(None, old, side, autojunk=False)
         return [(i1, i2, side[j1:j2]) for tag, i1, i2, j1, j2 in sm.get_opcodes() if tag != "equal"]
@@ -320,7 +324,8 @@ def _hunks(mine: list[str], old: list[str], theirs: list[str], py: bool) -> list
                 return None
             if (i1 == i2 and j1 <= i1 <= j2) or (j1 == j2 and i1 <= j1 <= i2):
                 return None                             # an insertion where the other edits
-    if _said([x for *_, new in a for x in new], py) & _said([x for *_, new in b for x in new], py):
+    new_a, new_b = [x for *_, new in a for x in new], [x for *_, new in b for x in new]
+    if _said(new_a, py) & _said(new_b, py) or near and _near(new_a, new_b, py):
         return None
     out, pos = [], 0
     for i1, i2, new in sorted(a + b, key=lambda e: e[:2]):
@@ -432,6 +437,27 @@ def _clash(mine: list[str], theirs: list[str], py: bool) -> bool:
     return depth > 0 and any(_indent(line) < depth for line in mine if line.strip())
 
 
+def _near(mine: list[str], theirs: list[str], py: bool) -> bool:
+    """Whether a line one side added nearly repeats one the other added (lines as _said reads them):
+    the same leading key (`"key":`, `key =`, `key:`) or most of the text alike (difflib ratio above
+    0.8). Keeping both would then likely hold two versions of one line, such as a key given twice.
+    In Python a def or class line is not compared by its text: settle refuses a repeated name."""
+    a, b = _said(mine, py), _said(theirs, py)
+    keys = {m.group(1) for y in b if (m := LEAD_KEY.match(y))}
+    for x in a:
+        if (m := LEAD_KEY.match(x)) and m.group(1) in keys:
+            return True
+        if py and TOP_DEF.match(x):
+            continue
+        for y in b:
+            if py and TOP_DEF.match(y):
+                continue
+            sm = difflib.SequenceMatcher(None, x, y, autojunk=False)
+            if sm.real_quick_ratio() > 0.8 and sm.quick_ratio() > 0.8 and sm.ratio() > 0.8:
+                return True
+    return False
+
+
 def _indent(line: str) -> int:
     return len(line) - len(line.lstrip(" \t"))
 
@@ -496,13 +522,13 @@ def _show(wt: Path, stage: int, path: str) -> bytes | None:
 
 
 def settle(wt: Path, path: str, version_files: list[str], taken_in: bool = False, hunks: bool = False,
-           kinds: set | None = None, superseded: bool = False) -> bool:
+           kinds: set | None = None, superseded: bool = False, near: bool = False) -> bool:
     """Settle the conflicted `path` of a stopped rebase in `wt`, if it needs no judgment, and write
     the result: True when settled. Ours (stage 2) is the batch head, theirs (stage 3) the entry.
     In a version file every stage first takes the batch head's version, so a version line alone
     never conflicts. A pure addition keeps both sides (merge3), unless in a .py file that leaves a
     top-level def or class name twice where neither side had it twice (it would silently shadow a
-    test). `taken_in`, `hunks`, `superseded` and `kinds` are merge3's; a version line taken adds "version" to
+    test). `taken_in`, `hunks`, `superseded`, `near` and `kinds` are merge3's; a version line taken adds "version" to
     `kinds`. A file both sides created is never settled."""
     ours, base, theirs = _show(wt, 2, path), _show(wt, 1, path), _show(wt, 3, path)
     if ours is None or theirs is None or base is None:
@@ -521,7 +547,7 @@ def settle(wt: Path, path: str, version_files: list[str], taken_in: bool = False
             how.add("version")
         b, t = vb, vt
     merged = merge3(o, b, t, py=path.endswith(".py"), taken_in=taken_in, hunks=hunks, kinds=how,
-                    superseded=superseded)
+                    superseded=superseded, near=near)
     if merged is None:
         return False
     if path.endswith(".py") and _duplicates(merged) - _duplicates(o) - _duplicates(t):

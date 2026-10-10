@@ -10162,6 +10162,57 @@ def test_an_upgrade_still_hands_a_true_overlap_to_a_harness_task(env, monkeypatc
     assert p.db.one("SELECT id FROM tasks WHERE kind='harness'")
 
 
+@pytest.mark.parametrize("fenced", [False, True])
+def test_an_upgrade_hands_two_versions_of_one_added_line_to_a_harness_task(env, monkeypatch, capsys, fenced):
+    """The project and upstream each added their own version of one hand-off line at the same spot
+    (one JSON key, worded apart): keeping both would leave the key twice, so the upgrade does not
+    settle it, also when the project's line sits in a fenced block, and a harness task merges it."""
+    worker = (RUNTIME.parent / "template" / "prompts" / "worker.md").read_text()
+    base = worker + "\n## Local test\n{\n  \"status\": \"done\",\n}\n"
+    line = '  "needs_deep": "only on a device task: the analysis problem you could not solve",\n'
+    if fenced:
+        line = "<!-- ttp:local -->\n" + line + "<!-- /ttp:local -->\n"
+    ours = base.replace('"done",\n', '"done",\n' + line)
+    theirs = base.replace('"done",\n', '"done",\n  "needs_deep": "only on a device task: the problem you '
+                                       'could not solve",\n')
+    p, cli, restarts = _upgrade_with_local_edits(env, monkeypatch, _OLD_TUNING, _OLD_TUNING,
+                                                 {"worker.md": theirs}, {"worker.md": (base, ours)})
+    h = p.harness
+    before = _git_out(h, "rev-parse", "HEAD")
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo"])
+    out = capsys.readouterr().out
+    assert e.value.code == 75 and "the merge conflicts in prompts/worker.md" in out
+    assert (h / "prompts" / "worker.md").read_text() == ours
+    assert _git_out(h, "rev-parse", "HEAD") == before and not restarts
+    assert p.db.one("SELECT id FROM tasks WHERE kind='harness'")
+
+
+def test_merge3_near_refuses_additions_that_nearly_repeat_each_other():
+    """With `near`, lines both sides added at one spot, or in different lines of one section (hunks),
+    are not both kept when one nearly repeats the other: the same leading key, or most of the text
+    alike. Additions that only look alike in shape (other keys, other words, new defs) still settle."""
+    from ttp.batch import merge3
+    base = "{\n  \"a\": 1,\n}\n"
+    add = lambda x: base.replace("1,\n", "1,\n" + x)
+    key_o, key_t = add('  "deep": "the analysis problem",\n'), add('  "deep": "a problem",\n')
+    assert merge3(key_o, base, key_t) is not None                       # without near: kept both
+    assert merge3(key_o, base, key_t, near=True) is None                # same key
+    assert merge3(add("timeout = 5\n"), base, add("timeout = 10\n"), near=True) is None
+    alike_o, alike_t = add("Never run the suite twice per fix.\n"), add("Never run the suite twice for a fix.\n")
+    assert merge3(alike_o, base, alike_t, near=True) is None             # most of the text alike
+    kinds: set = set()
+    both = merge3(add('  "deep": "x",\n'), base, add('  "pr": "y",\n'), near=True, kinds=kinds)
+    assert both == add('  "deep": "x",\n  "pr": "y",\n') and kinds == {"added"}
+    assert merge3(add("Check the device first.\n"), base, add("Write the hand-off last.\n"), near=True)
+    assert merge3("def test_one(env):\n    pass\n", "", "def test_two(env):\n    pass\n", py=True, near=True)
+    # hunks: each side changes its own line of one section and adds a version of one key
+    hb = "A\nB\nC\n"
+    ho, ht = "A1\nkey: one way\nB\nC\n", "A\nB1\nkey: another way\nC\n"
+    assert merge3(ho, hb, ht, hunks=True) == "A1\nkey: one way\nB1\nkey: another way\nC\n"
+    assert merge3(ho, hb, ht, hunks=True, near=True) is None
+
+
 def test_merge3_superseded_takes_theirs_only_when_it_holds_our_change():
     from ttp.batch import merge3
     base = "x = 1\nif a:\n    y = 2\nz = 3\n"
