@@ -61,6 +61,7 @@ import urllib.request
 from typing import Any, Callable
 
 from .db import DB
+from .project import command_env
 
 STATE_KEY = "heal:"             # kv per check: its state (see run)
 FIXED_KEY = "heal_fixed"        # kv: [{"at", "name"}] successful fixes, last 7 days
@@ -172,8 +173,8 @@ def _exec(args: str | list[str], cwd: str, timeout: float, env: dict | None = No
     return proc.returncode, ((out or "") + (err or "")).strip()[-2000:]
 
 
-def _shell(cmd: str, cwd: str, timeout: float) -> tuple[int, str]:
-    return _exec(cmd, cwd, timeout)
+def _shell(cmd: str, cwd: str, timeout: float, env: dict | None = None) -> tuple[int, str]:
+    return _exec(cmd, cwd, timeout, env)
 
 
 def _systemctl(spec: dict, *args: str) -> str:
@@ -255,25 +256,24 @@ _PRESET_CHECKS: dict[str, Callable[[dict, dict, str], tuple[int, str]]] = {
     "systemd": _check_systemd, "http": _check_http, "broker": _check_broker}
 
 
-def check(spec: dict, state: dict, cwd: str) -> tuple[int, str]:
-    """Run the check: (0 healthy | 1 unhealthy | other: unknown, its output). May update `state`."""
+def check(spec: dict, state: dict, cwd: str, env: dict | None = None) -> tuple[int, str]:
+    """Run the check: (0 healthy | 1 unhealthy | other: unknown, its output). May update `state`.
+    `env` is its project's (project.command_env), so a check calling `ttp lock` finds the project."""
     fn = _PRESET_CHECKS.get(spec.get("preset") or "")
     if fn and not spec.get("check"):
         return fn(spec, state, cwd)
-    return _shell(spec["check"], cwd, spec["timeout_s"])
+    return _shell(spec["check"], cwd, spec["timeout_s"], env)
 
 
-def run_fix(spec: dict, cwd: str, project_base: str) -> tuple[int, str]:
-    """Run the fix, under `ttp lock <resource>` when it names one. 75 only from the lock (busy or
-    paused): `ttp lock` passes its command's exit code on, so a fix's own 75 comes back as FIX_OWN_75."""
+def run_fix(spec: dict, cwd: str, env: dict) -> tuple[int, str]:
+    """Run the fix in its project's `env` (project.command_env), under `ttp lock <resource>` when it
+    names one. 75 only from the lock (busy or paused): `ttp lock` passes its command's exit code on,
+    so a fix's own 75 comes back as FIX_OWN_75."""
     if not spec.get("resource"):
-        return _shell(spec["fix"], cwd, spec["timeout_s"])
+        return _shell(spec["fix"], cwd, spec["timeout_s"], env)
     wrap = f'sh -c "$1"; rc=$?; [ "$rc" -eq 75 ] && exit {FIX_OWN_75}; exit "$rc"'
     argv = [sys.executable, "-m", "ttp", "lock", "--timeout", str(LOCK_WAIT_S), spec["resource"],
             "--", "sh", "-c", wrap, "heal-fix", spec["fix"]]
-    env = {**_env(), "TTP_PROJECT": project_base, "PYTHONPATH": os.pathsep.join(
-        [os.path.dirname(os.path.dirname(os.path.abspath(__file__))), os.environ.get("PYTHONPATH", "")]).rstrip(
-        os.pathsep)}
     return _exec(argv, cwd, spec["timeout_s"] + LOCK_WAIT_S + 10, env)
 
 
@@ -337,11 +337,11 @@ def run(host: Any, name: str, spec: dict, now: float | None = None) -> tuple[str
     p, db = host.p, host.p.db
     now = time.time() if now is None else now
     st = state(db, name)
-    cwd = str(p.root)
+    cwd, env = str(p.root), command_env(p)
     if st.get("phase") == "fixing" and now < float(st.get("fix_started") or 0) + spec["settle_s"]:
         # A restart cut the fix short: its recheck still waits for settle_s.
         return "unhealthy (fix interrupted; rechecking)", float(st["fix_started"]) + spec["settle_s"]
-    rc, out = check(spec, st, cwd)
+    rc, out = check(spec, st, cwd, env)
     ping = getattr(host, "_progress", None)
     if callable(ping):
         ping()
@@ -409,7 +409,7 @@ def run(host: Any, name: str, spec: dict, now: float | None = None) -> tuple[str
     deferred = st.pop("deferred_since", None)
     st.update(fixes=fixes + [now], phase="fixing", fix_started=now)
     _save(db, name, st)
-    frc, fout = run_fix(spec, cwd, str(p.base))
+    frc, fout = run_fix(spec, cwd, env)
     st.update(fix_rc=frc, fix_out=fout[-1000:])
     if frc == 75 and spec.get("resource"):
         # Only the lock exits 75 here (run_fix): the fix never started. Not counted; try again next run.

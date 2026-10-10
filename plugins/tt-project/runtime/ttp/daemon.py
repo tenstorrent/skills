@@ -65,8 +65,8 @@ from . import shared
 from . import worktree
 from .db import (CHANGES_NEEDED, OPEN_ASK_MAX_AGE_S, SEVERITY_RANK, TERMINAL_TASK_STATES, continues_id, deferral, dependency_ids,
                  dump_result, load_result, without_deferral)
-from .project import (Project, deep_merge, layered, disk_resume_gb, durable_write, git_fsync_env, hostname,
-                      nice_level, push_allowed, zombie)
+from .project import (Project, command_env, deep_merge, layered, disk_resume_gb, durable_write, git_fsync_env,
+                      hostname, nice_level, output_tail, push_allowed, zombie)
 from .providers import get_provider
 from .providers.base import last_json_object, scratch_dir, service_path
 from .providers.claude import as_windows
@@ -2698,7 +2698,7 @@ class Daemon:
         started = time.time()
         try:
             out = subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=str(self.p.root),
-                                 timeout=_watcher_timeout(payload), env={**os.environ, "PATH": service_path()})
+                                 timeout=_watcher_timeout(payload), env=command_env(self.p))
         except subprocess.TimeoutExpired:
             self.observe(errors, f"watcher command timed out: {cmd}", "normal", rewake_after_s=rewake,
                          lifecycle=scr.ERROR)
@@ -2707,7 +2707,11 @@ class Daemon:
         ok = out.returncode in (0, 1)
         failed = not ok and not text   # the daemon reports the failure itself
         if failed:
-            text = f"watcher command failed rc={out.returncode}: {(out.stderr or '')[-500:]}"
+            text = f"watcher command failed rc={out.returncode}: {output_tail(out.stderr) or '(no stderr)'}"
+        elif not ok:   # it printed reports, then failed: the reports stand and so does its failure
+            self.observe(errors, f"watcher command exited rc={out.returncode}: "
+                                 f"{output_tail(out.stderr) or '(no stderr)'}", "normal", rewake_after_s=rewake,
+                         lifecycle=scr.ERROR)
         if not text:
             # Nothing to report: what this watcher reported before is over. A recurrence reopens it.
             scr.close_watcher_issues(self.p.db, source, why=scr.CLEAN_RUN_WHY)
@@ -4473,9 +4477,7 @@ class Daemon:
 
     def _probe_env(self) -> dict:
         """Probes run `ttp` (e.g. `ttp lock --probe device-a`) as a worker would."""
-        runtime_dir = str(Path(__file__).resolve().parent.parent)
-        return {**os.environ, "TTP_PROJECT": str(self.p.base), "PYTHONPATH": runtime_dir,
-                "PATH": f"{self.p.harness / 'bin'}:{service_path()}:{os.environ.get('PATH', '')}"}
+        return command_env(self.p)
 
     def _start_failed(self, task: dict, e: Exception) -> None:
         """Nothing was launched, so no attempt is spent. The task waits a minute before the next try,

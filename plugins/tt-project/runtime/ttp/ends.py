@@ -17,12 +17,13 @@ import os
 import re
 import signal
 import subprocess
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .project import Project, durable_append, durable_write
+from .project import Project, command_env, durable_append, durable_write, output_tail
 
 CHARTER_HISTORY = "CHARTER.history.md"   # harness file: charter sections retired or replaced
 ENDED_KEY = "ended_instructions"   # kv: [{"at", "what", "why"}] retired by their end condition (last 7 days)
@@ -218,6 +219,7 @@ class Ends:
         self.p, self.log = p, log
         self._checked = 0.0
         self._procs: dict[str, tuple[subprocess.Popen, float, str]] = {}
+        self._errs: dict[int, Any] = {}   # id(proc) -> its stderr file
         self._probed: dict[str, float] = {}
 
     def tick(self, now: float | None = None) -> list[str]:
@@ -230,7 +232,7 @@ class Ends:
         retired, broken = [], dict(self.p.db.kv(BROKEN_KEY) or {})
         for item in temporaries(self.p):
             end, key = item["end"], item["key"]
-            rc = verdicts.get(key, (None, ""))
+            rc = verdicts.get(key, (None, "", ""))
             why = ""
             if end.get("expires") and end["expires"] <= now:
                 why = f"expired {stamp(end['expires'])}"
@@ -249,7 +251,8 @@ class Ends:
                 if rc[0] in NOT_YET_RCS:
                     broken.pop(key, None)
                 else:
-                    broken[key] = rc[0] if isinstance(rc[0], str) else f"exit {rc[0]}"
+                    code = rc[0] if isinstance(rc[0], str) else f"exit {rc[0]}"
+                    broken[key] = f"{code}: {rc[2]}" if rc[2] else code   # with its stderr tail
             if end.get("probe") and key not in self._procs and now - self._probed.get(key, 0) >= PROBE_EVERY_S:
                 self._start(key, end["probe"], now)
         live = {i["key"] for i in temporaries(self.p)} if retired else None
@@ -265,29 +268,66 @@ class Ends:
     def _start(self, key: str, probe: str, now: float) -> None:
         self._probed[key] = now
         try:
-            proc = subprocess.Popen(probe, shell=True, cwd=str(self.p.root), stdin=subprocess.DEVNULL,
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            self._procs[key] = (spawn_probe(self.p, probe, self._errs), now, probe)
         except OSError as e:
             self.log(f"end probe for {key} could not start: {e}")
-            return
-        self._procs[key] = (proc, now, probe)
 
     def _reap(self, now: float) -> dict:
-        out = {}
-        for key, (proc, started, probe) in list(self._procs.items()):
-            rc = proc.poll()
-            if rc is None and now - started < PROBE_TIMEOUT_S:
-                continue
-            del self._procs[key]
-            if rc is None:
-                _kill(proc)
-            out[key] = ("timeout" if rc is None else rc, probe)
-        return out
+        return reap_probes(self._procs, self._errs, now)
 
     def stop(self) -> None:
-        for proc, _, _ in self._procs.values():
+        stop_probes(self._procs, self._errs)
+
+
+def spawn_probe(p: Project, probe: str, errs: dict[int, Any]) -> subprocess.Popen:
+    """Start shell probe `probe` in a session of its own, in its project's context (cwd p.root,
+    project.command_env). Its stderr goes to a file in `errs` (a pipe nobody reads could fill)."""
+    err = tempfile.TemporaryFile()
+    try:
+        proc = subprocess.Popen(probe, shell=True, cwd=str(p.root), env=command_env(p), stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=err, start_new_session=True)
+    except OSError:
+        err.close()
+        raise
+    errs[id(proc)] = err
+    return proc
+
+
+def _err_tail(errs: dict[int, Any], proc: subprocess.Popen) -> str:
+    """The bounded end of a finished probe's stderr, once (its file is closed after)."""
+    f = errs.pop(id(proc), None)
+    if f is None:
+        return ""
+    try:
+        f.seek(0, os.SEEK_END)
+        f.seek(max(0, f.tell() - 4 * 2000))
+        return output_tail(f.read())
+    except (OSError, ValueError):
+        return ""
+    finally:
+        f.close()
+
+
+def reap_probes(procs: dict, errs: dict[int, Any], now: float) -> dict[str, tuple[Any, str, str]]:
+    """{key: (exit code or "timeout", probe, stderr tail)} of the probes in `procs` that ended or
+    ran past PROBE_TIMEOUT_S (killed); the rest keep running."""
+    out = {}
+    for key, (proc, started, probe) in list(procs.items()):
+        rc = proc.poll()
+        if rc is None and now - started < PROBE_TIMEOUT_S:
+            continue
+        del procs[key]
+        if rc is None:
             _kill(proc)
-        self._procs.clear()
+        out[key] = ("timeout" if rc is None else rc, probe, _err_tail(errs, proc))
+    return out
+
+
+def stop_probes(procs: dict, errs: dict[int, Any]) -> None:
+    for proc, _, _ in procs.values():
+        _kill(proc)
+        _err_tail(errs, proc)
+    procs.clear()
 
 
 def _kill(proc: subprocess.Popen) -> None:
@@ -322,7 +362,7 @@ def digest_lines(p: Project, since: float, now: float | None = None) -> list[str
         elif now - float(listed[key]) >= RECHECK_S:
             listed[key] = now
             cond = end.get("until") or "its probe passes"
-            note = f"; its until_probe is broken ({broken[key]}): fix it with a restated entry" if key in broken else ""
+            note = f"; its until_probe is broken ({broken[key][-500:]}): fix it with a restated entry" if key in broken else ""
             due.append(f"- {item['what']}: until {cond}{note}")
     listed = {k: v for k, v in listed.items() if k in live}
     if listed != (db.kv(LISTED_KEY) or {}):

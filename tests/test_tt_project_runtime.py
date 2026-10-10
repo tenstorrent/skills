@@ -32964,6 +32964,88 @@ def test_probe_env_finds_ttp(env):
     assert e["PYTHONPATH"] == str(RUNTIME.resolve())
 
 
+def _no_project_env(monkeypatch):
+    """The daemon's environment as a service manager may start it: no TTP_PROJECT, no ttp on PATH."""
+    for var in ("TTP_PROJECT", "TTP_RUN_DIR", "TTP_LOCKS_HELD"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+
+def test_daemon_run_commands_resolve_the_project_without_ttp_project(env, monkeypatch):
+    """`ttp lock <res> -- cmd` exits 2 without a project. A command schedule, a heal check and fix,
+    an until_probe and a pause's end_when all run it in their project's context, so it runs."""
+    p = _device_project(env, device=False)
+    from ttp import coordinator as coord, ends, heal, pauseends
+    from ttp.daemon import Daemon
+    from ttp.project import command_env
+    _no_project_env(monkeypatch)
+    locked = "ttp lock board -- true"
+    d = Daemon(p.base)
+    assert d._run_command_watcher({"name": "w"}, {"command": locked}) == "ok (0 observations)"
+    assert not p.db.q("SELECT text FROM events WHERE source IN ('watcher:w', 'watcher-error:w')")
+    spec = heal.validate({"check": locked})
+    assert heal.run(d, "svc", spec, time.time()) == ("ok (healthy)", None), heal.state(p.db, "svc")
+    flag = p.root / "fixed"
+    st = {}
+    assert heal.run_fix(dict(spec, fix=f"ttp lock board -- touch {flag}"), str(p.root),
+                        command_env(p)) == (0, "") and flag.exists()
+    assert heal.check(spec, st, str(p.root), command_env(p))[0] == 0
+    # A pause whose end_when takes a lock passes; without TTP_PROJECT it would be "broken (exit 2)".
+    assert coord.apply(p, [{"type": "resource_pause", "resource": "rig", "paused": True,
+                            "end_when": "ttp lock other -- true", "reason": "flaky"}]) == []
+    pe, now = pauseends.PauseEnds(p), time.time()
+    pe.tick(now)
+    for proc, _, _ in list(pe._procs.values()):
+        proc.wait(30)
+    assert pe.tick(now + 1) == ["rig"]
+    due = p.db.one("SELECT text FROM events WHERE kind='pause_end_due'")["text"]
+    assert "probe `ttp lock other -- true` passed" in due, due
+
+
+def test_failed_daemon_run_commands_keep_a_bounded_stderr_tail(env, monkeypatch):
+    p = _device_project(env, device=False)
+    from ttp import coordinator as coord, ends, heal, pauseends
+    from ttp.daemon import Daemon
+    from ttp.project import OUTPUT_TAIL
+    _no_project_env(monkeypatch)
+    noisy = "printf 'x%.0s' $(seq 5000) >&2; echo >&2; echo the-real-cause >&2; exit 3"
+    d = Daemon(p.base)
+    d._run_command_watcher({"name": "w"}, {"command": noisy})
+    text = p.db.one("SELECT text FROM events WHERE source='watcher-error:w'")["text"]
+    assert text.startswith("watcher command failed rc=3: ") and text.endswith("the-real-cause"), text[-80:]
+    assert len(text) <= OUTPUT_TAIL + 40
+    # A watcher that printed reports and then failed keeps both: its reports, and its failure with why.
+    report = shlex.quote(json.dumps({"text": "box-a is down", "severity": "high"}))
+    d._run_command_watcher({"name": "v"}, {"command": f"echo {report}; echo why-it-broke >&2; exit 2"})
+    got = [r["text"] for r in p.db.q("SELECT text FROM events WHERE source IN ('watcher:v', 'watcher-error:v') "
+                                     "ORDER BY id")]
+    assert sorted(got) == ["box-a is down", "watcher command exited rc=2: why-it-broke"], got
+    # An until_probe that neither passes nor says "not yet" is broken: its stderr tail says why.
+    assert coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "text": "Hands off the rig.",
+                            "until": "the rig is fixed", "until_probe": noisy}]) == []
+    e, now = ends.Ends(p), time.time()
+    e.tick(now)
+    e._procs[next(iter(e._procs))][0].wait(30)
+    e.tick(now + 1)
+    (why,) = (p.db.kv(ends.BROKEN_KEY) or {}).values()
+    assert why.startswith("exit 3: ") and why.endswith("the-real-cause") and len(why) <= OUTPUT_TAIL + 10, why[-80:]
+    assert not e._errs, "each probe's stderr file is closed once read"
+    # So does a pause's broken end_when, and it still wakes the coordinator.
+    assert coord.apply(p, [{"type": "resource_pause", "resource": "rig", "paused": True,
+                            "end_when": "echo no-such-box >&2; exit 4", "reason": "flaky"}]) == []
+    pe = pauseends.PauseEnds(p)
+    pe.tick(now)
+    for proc, _, _ in list(pe._procs.values()):
+        proc.wait(30)
+    assert pe.tick(now + 1) == ["rig"]
+    due = p.db.one("SELECT text FROM events WHERE kind='pause_end_due'")["text"]
+    assert "is broken (exit 4): it would never end. Its stderr: no-such-box" in due, due
+    # A heal check's output, stderr included, is kept bounded in its state for the self-fix task.
+    assert heal.run(d, "svc", heal.validate({"check": noisy}), now)[0].startswith("error: heal check exited 3")
+    st = heal.state(p.db, "svc")
+    assert st["last_out"].endswith("the-real-cause") and len(st["last_out"]) <= 1000
+
+
 def test_task_add_tags_device_tasks(env):
     p = _device_project(env)
     from ttp import coordinator as coord

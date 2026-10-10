@@ -764,6 +764,29 @@ class Project:
                             removed=[src])
         return dst
 
+OUTPUT_TAIL = 2000   # chars of a failed daemon-run command's output kept for its event or observation
+
+
+def command_env(p: Project, base: dict | None = None) -> dict[str, str]:
+    """The environment of a shell command the daemon runs for `p` (command schedule, heal check and
+    fix, start_when/retry_when, until_probe, pause end_when, after_push), as a worker's commands see
+    it: TTP_PROJECT set, this runtime importable and `ttp` first on PATH. Run it with cwd p.root (an
+    after_push in its own checkout), so `ttp lock` resolves the project whatever the daemon inherited."""
+    from .providers.base import service_path
+    env = dict(os.environ if base is None else base)
+    dirs = [str(p.harness / "bin"), *service_path().split(":"), *env.get("PATH", "").split(":")]
+    # This runtime only: an inherited PYTHONPATH may name another install's.
+    return {**env, "TTP_PROJECT": str(p.base), "PYTHONPATH": str(Path(__file__).resolve().parent.parent),
+            "PATH": ":".join(dict.fromkeys(d for d in dirs if d))}
+
+
+def output_tail(text: str | bytes | None, limit: int = OUTPUT_TAIL) -> str:
+    """The last `limit` chars of a command's output (stderr), stripped: bounded for events and state."""
+    if isinstance(text, bytes):
+        text = text[-4 * limit:].decode(errors="replace")
+    return (text or "").strip()[-limit:].strip()
+
+
 def _stamp(ts: float) -> str:
     """A memory entry's `created`: UTC to the microsecond, so entries sort in the order they were
     written. Older entries carry the date alone, which sorts before any stamp of the same day."""

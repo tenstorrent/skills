@@ -37,7 +37,7 @@ from collections import deque
 from pathlib import Path
 
 from . import locks, push, worktree
-from .project import Project, durable_write, write_json
+from .project import Project, command_env, durable_write, write_json
 
 WORKTREE = "push"             # the batch's own checkout under the project's worktrees (never t<id>)
 AFTER_PUSH = "after_push-"    # + batch id: the temporary checkout after_push runs in
@@ -1084,9 +1084,9 @@ def after_push(p: Project, marker: Path, m: dict) -> dict:
         t = res.get("task")
         if res.get("status") == "pushed" and t is not None and str(t) not in tasks:
             tasks.append(str(t))
-    env = {**os.environ, "TTP_PUSHED_SHA": sha, "TTP_PUSHED_VERSION": str(m.get("version") or ""),
+    env = {**command_env(p), "TTP_PUSHED_SHA": sha, "TTP_PUSHED_VERSION": str(m.get("version") or ""),
            "TTP_PUSH_TARGET": str(m.get("target") or ""), "TTP_PUSH_TASKS": ",".join(tasks),
-           "TTP_PUSH_BATCH": str(marker), "TTP_PROJECT": str(p.base)}
+           "TTP_PUSH_BATCH": str(marker)}
     out = {"status": "ok", "exit": 0, "started": started, "tail": ""}
     try:
         for cmd in cmds:

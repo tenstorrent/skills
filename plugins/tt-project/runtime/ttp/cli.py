@@ -29,7 +29,7 @@ from . import outbox
 from . import schedule as sched
 from .project import (FOLDER, NAME_RE, Project, hostname, load_registry, load_secrets, register, save_secret,
                       durable_append, durable_write, write_json, ACCOUNT_KEYS, DEFAULT_CONFIG, deep_merge,
-                      load_account_settings, set_account_setting, zombie, device_timeout_max)
+                      load_account_settings, set_account_setting, zombie, device_timeout_max, command_env)
 
 RUNTIME = Path(__file__).resolve().parent.parent              # .../runtime (plugin or project copy)
 PLUGIN_ROOT = RUNTIME.parent                                   # plugin root, or a project's harness/
@@ -2181,7 +2181,7 @@ def cmd_heal(a) -> None:
     if not match:
         die(f"no enabled heal check named {a.check!r}; `ttp heal list` shows them")
     r, spec = match[0]
-    rc, out = heal.check(spec, dict(heal.state(p.db, r["name"])), str(p.root))
+    rc, out = heal.check(spec, dict(heal.state(p.db, r["name"])), str(p.root), command_env(p))
     word = {0: "healthy", 1: "unhealthy"}.get(rc, "unknown")
     print(f"{r['name']}: {word} (exit {rc})" + (f"\n{out}" if out else ""))
     sys.exit(0 if rc == 0 else 1 if rc == 1 else 75)

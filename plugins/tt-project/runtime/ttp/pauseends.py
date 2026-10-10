@@ -146,6 +146,7 @@ class PauseEnds:
         self.p, self.log = p, log
         self._checked = 0.0
         self._procs: dict[str, tuple[subprocess.Popen, float, str]] = {}
+        self._errs: dict[int, Any] = {}   # id(proc) -> its stderr file
         self._probed: dict[str, float] = {}
 
     def tick(self, now: float | None = None) -> list[str]:
@@ -161,7 +162,7 @@ class PauseEnds:
         sent = {k: v for k, v in (db.kv(DUE_KEY) or {}).items() if k in pauses}
         due = []
         for name, v in sorted(pauses.items()):
-            probe, rc = v.get("end_when"), verdicts.get(name, (None, ""))
+            probe, rc = v.get("end_when"), verdicts.get(name, (None, "", ""))
             why = ""
             if v.get("until") and float(v["until"]) <= now:
                 why = f"its end time {ends.stamp(float(v['until']))} passed"
@@ -169,7 +170,8 @@ class PauseEnds:
                 why = f"its end_when probe `{probe}` passed"
             elif probe and rc[1] == probe and rc[0] is not None and rc[0] not in ends.NOT_YET_RCS:
                 why = (f"its end_when probe `{probe}` is broken "
-                       f"({rc[0] if isinstance(rc[0], str) else f'exit {rc[0]}'}): it would never end")
+                       f"({rc[0] if isinstance(rc[0], str) else f'exit {rc[0]}'}): it would never end"
+                       + (f". Its stderr: {rc[2]}" if rc[2] else ""))
             if why and sent.get(name) != _sig(v):
                 _queue(db, name, v, why, now)
                 sent[name] = _sig(v)
@@ -185,26 +187,12 @@ class PauseEnds:
     def _start(self, key: str, probe: str, now: float) -> None:
         self._probed[key] = now
         try:
-            proc = subprocess.Popen(probe, shell=True, cwd=str(self.p.root), stdin=subprocess.DEVNULL,
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            self._procs[key] = (ends.spawn_probe(self.p, probe, self._errs), now, probe)
         except OSError as e:
             self.log(f"end_when probe of the pause of {key} could not start: {e}")
-            return
-        self._procs[key] = (proc, now, probe)
 
-    def _reap(self, now: float) -> dict[str, tuple[Any, str]]:
-        out = {}
-        for key, (proc, started, probe) in list(self._procs.items()):
-            rc = proc.poll()
-            if rc is None and now - started < ends.PROBE_TIMEOUT_S:
-                continue
-            del self._procs[key]
-            if rc is None:
-                ends._kill(proc)
-            out[key] = ("timeout" if rc is None else rc, probe)
-        return out
+    def _reap(self, now: float) -> dict[str, tuple[Any, str, str]]:
+        return ends.reap_probes(self._procs, self._errs, now)
 
     def stop(self) -> None:
-        for proc, _, _ in self._procs.values():
-            ends._kill(proc)
-        self._procs.clear()
+        ends.stop_probes(self._procs, self._errs)
