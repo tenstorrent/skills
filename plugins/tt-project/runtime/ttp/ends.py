@@ -54,9 +54,10 @@ def parse_time(raw: str) -> float | None:
     return (at if at.tzinfo else at.replace(tzinfo=timezone.utc)).timestamp()
 
 
-def parse_expires(raw: Any, now: float | None = None) -> float:
-    """`expires` from an action: a delay (`6h`, `3d`) from now, or an ISO date or time (local
-    unless it names a zone). Must lie ahead, within a year."""
+def parse_expires(raw: Any, now: float | None = None, what: str = "expires",
+                  max_s: float = MAX_EXPIRES_S) -> float:
+    """`expires` (or `what`) from an action: a delay (`6h`, `3d`) from now, or an ISO date or time
+    (local unless it names a zone). Must lie ahead, within `max_s` (a year)."""
     now = time.time() if now is None else now
     s = str(raw).strip() if isinstance(raw, str) else ""
     m = re.fullmatch(r"([0-9]+) ?([smhdw])", s)
@@ -69,12 +70,13 @@ def parse_expires(raw: Any, now: float | None = None) -> float:
         except ValueError:
             at = None
         if at is None:
-            raise ValueError(f"expires {raw!r}: use a delay such as 12h or 3d, or an ISO date or time such as "
+            raise ValueError(f"{what} {raw!r}: use a delay such as 12h or 3d, or an ISO date or time such as "
                              f"2026-10-05T09:00")
     if at <= now:
-        raise ValueError(f"expires {raw!r} is already past: retire it now instead")
-    if at > now + MAX_EXPIRES_S:
-        raise ValueError(f"expires {raw!r} is more than a year away")
+        raise ValueError(f"{what} {raw!r} is already past" + (": retire it now instead" if what == "expires" else ""))
+    if at > now + max_s:
+        raise ValueError(f"{what} {raw!r} is more than " + ("a year" if max_s == MAX_EXPIRES_S
+                                                           else f"{max_s / 86400:g} days") + " away")
     return at
 
 

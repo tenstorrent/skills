@@ -39,6 +39,7 @@ from . import coordinator as coord
 from . import coordcheck
 from . import effort
 from . import ends
+from . import pauseends
 from . import hold
 from . import integrity
 from . import jevuse
@@ -349,6 +350,7 @@ class Daemon:
         self._probes: dict[int, tuple[subprocess.Popen, float, str]] = {}   # running: proc, started, probe
         self._probed: dict[int, float] = {}
         self._ends = ends.Ends(self.p, log=lambda m: log(self.p, m))   # temporary instructions' end conditions
+        self._pause_ends = pauseends.PauseEnds(self.p, log=lambda m: log(self.p, m))   # resource pauses' ends
         self._probe_rc: dict[int, tuple[int | str, float, str]] = {}   # last verdict: exit code or why, when, probe
         self._reboot_told = False
         self._boot_woken = False
@@ -415,6 +417,7 @@ class Daemon:
             log(self.p, "clean stop record: " + traceback.format_exc().replace("\n", " | ")[:1000])
         self._idle.release()
         self._ends.stop()   # end-condition probes are rerun after the next start
+        self._pause_ends.stop()
         if _read_pid(pidfile) == os.getpid():
             pidfile.unlink(missing_ok=True)
         # Running workers are left alone: they write their results to disk and the next start
@@ -586,7 +589,8 @@ class Daemon:
             self.jev = Jev(self.cfg, db=self.p.db)
         for step in (self.reap_runs, self.wake_after_reboot, self.meter_running, self.reconcile_tasks, self.tend_pushes,
                      self.prune_worktrees, self.backup_branches, self.check_local_only, self.check_disk,
-                     self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_integrity,
+                     self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends,
+                     self.check_integrity,
                      self.sync_schedules, self.lint_charter, self.tend_holds):
             step()
             self._progress()
@@ -808,6 +812,14 @@ class Daemon:
 
     def sync_shared_pauses(self) -> None:
         coord.sync_shared_pauses(self.p)
+
+    def check_pause_ends(self) -> None:
+        """Resource pauses whose end passed (pauseends): one event each for the coordinator to lift or
+        extend it; a pause without an end gets the default one. Model-free, also while paused."""
+        try:
+            self._pause_ends.tick()
+        except Exception:
+            log(self.p, "checking resource pause ends failed\n" + traceback.format_exc())
 
     def tend_pushes(self) -> None:
         """Start the detached pushes queued from inside a sandbox; record the dead ones as failed. Then

@@ -626,9 +626,11 @@ class Handler(BaseHTTPRequestHandler):
             if url.path == "/api/pause":
                 if body.get("resource"):
                     from .coordinator import pause_resource
+                    from .pauseends import from_action
                     try:
                         pause_resource(p, str(body["resource"]), bool(body.get("paused")),
-                                       reason=str(body.get("reason") or ""), by="user", db=db)
+                                       reason=str(body.get("reason") or ""), by="user", db=db,
+                                       end=from_action(body) if body.get("paused") else None)
                     except ValueError as e:
                         return self._send(400, {"error": str(e)})
                     return self._send(200, {"ok": True})

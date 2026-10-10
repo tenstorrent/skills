@@ -2138,11 +2138,13 @@ def cmd_machines(a) -> None:
     project's charter says which of them it may use; its coordinator routes work only to those.
     A project created with --host reads the copy on its machine: changes are copied there, merged."""
     from . import machines as mm
+    if a.action == "set":
+        a.action = "add"
     if a.action == "add":
         try:
             entry = mm.add(a.alias, a.tags, a.note,
                            ... if a.min_free_gb is None else a.min_free_gb, a.hostname,
-                           False if a.unshared else a.shared)
+                           False if a.unshared else a.shared, a.until)
         except ValueError as e:
             die(str(e))
         print(f"saved {mm.line(a.alias.strip(), entry)}")
@@ -2175,7 +2177,11 @@ def cmd_pause(a) -> None:
     if a.resource:
         from .coordinator import pause_resource
         try:
-            print(f"{p.name}: " + pause_resource(p, a.resource, a.cmd == "pause", reason=getattr(a, "reason", None) or "", by="user"))
+            from . import pauseends
+            end = pauseends.from_action({"until": a.until, "end_when": a.end_when, "report_from": a.report_from}) \
+                if a.cmd == "pause" else None
+            print(f"{p.name}: " + pause_resource(p, a.resource, a.cmd == "pause", reason=getattr(a, "reason", None) or "",
+                                                 by="user", end=end))
         except ValueError as e:
             die(str(e))
         return
@@ -3384,10 +3390,12 @@ def main(argv: list[str] | None = None) -> None:
 
     s = sub.add_parser("machines", help="your machines, shared by all your projects (add/list/remove/push)")
     ms = s.add_subparsers(dest="action", required=True)
-    m = ms.add_parser("add", help="add a machine, or change its tags or note")
+    m = ms.add_parser("add", aliases=["set"], help="add a machine, or change its tags or note")
     m.add_argument("alias", help="a short name, also used as the resource name in tasks (e.g. box-a)")
     m.add_argument("--tags", help="what it offers, comma-separated (e.g. device,x86)")
     m.add_argument("--note", help="one line for the coordinator (no secrets)")
+    m.add_argument("--until", help="when the note stops being true (a delay such as 3d, or an ISO time); past "
+                                   "it the coordinator sees it as stale (\"\" = no end)")
     m.add_argument("--min-free-gb", dest="min_free_gb",
                    help="disk guard threshold on this machine's filesystem, overriding the projects' "
                         "disk.min_free_gb there (0 = off; \"\" = back to the projects' own)")
@@ -3411,6 +3419,12 @@ def main(argv: list[str] | None = None) -> None:
                        if name == "pause" else f"{name} only this resource")
         if name == "pause":
             s.add_argument("--reason", help="why, shown to workers, the coordinator and in status")
+            s.add_argument("--until", help="with --resource: when it should end, a delay (2d) or an ISO time, at "
+                                           "most 7 days ahead; this or --end-when is required")
+            s.add_argument("--end-when", dest="end_when", metavar="PROBE",
+                           help="with --resource: a read-only shell probe that exits 0 once the pause can end")
+            s.add_argument("--report-from", dest="report_from", metavar="PROJECT",
+                           help="with --resource: the project whose report it waits on; its notes re-prompt the coordinator")
         s.set_defaults(fn=cmd_pause)
     for name in ("start", "stop", "restart"):
         s = sub.add_parser(name, help=f"{name} the project's daemon service (running workers are kept)")

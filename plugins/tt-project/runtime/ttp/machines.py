@@ -113,11 +113,13 @@ def tag_names(v: Any) -> list[str]:
 
 
 def add(alias: str, tags: Any = None, note: str | None = None, min_free_gb: Any = ...,
-        hostname: str | None = None, shared: Any = None) -> dict:
+        hostname: str | None = None, shared: Any = None, until: str | None = None) -> dict:
     """Add a machine, or update its tags, note, disk threshold or host name (one left out keeps the
     old value; a threshold or host name of "" removes it). `shared` names the resources on it that
     all of the user's projects share (shared.py): a list or "a,b"; "" the alias itself; False none.
-    Left out, it keeps the old ones."""
+    Left out, it keeps the old ones. `until` (a delay such as 3d or an ISO time) is when the note
+    stops being true; past it the digest marks the note stale. A new note without one has none;
+    "" removes it."""
     alias = (alias or "").strip()
     if not ALIAS_RE.fullmatch(alias):
         raise ValueError(f"not a machine alias: {alias!r} (letters, digits and _.@+- only)")
@@ -128,6 +130,11 @@ def add(alias: str, tags: Any = None, note: str | None = None, min_free_gb: Any 
     entry = {"tags": tag_list(tags) if tags is not None else old.get("tags", []),
              "note": " ".join(str(note).split())[:NOTE_CHARS] if note is not None else old.get("note", ""),
              "added": old.get("added") or now, "updated": now}
+    if until:
+        from .ends import parse_expires
+        entry["note_until"] = parse_expires(until, now, what="until")
+    elif until is None and note is None and old.get("note_until"):
+        entry["note_until"] = old["note_until"]
     gb = old.get("min_free_gb") if min_free_gb is ... else gb_value(min_free_gb)
     if gb is not None:
         entry["min_free_gb"] = gb
@@ -260,6 +267,8 @@ def line(alias: str, m: dict) -> str:
     host = f" (host {m['hostname']})" if m.get("hostname") else ""
     disk = f" (disk guard {m['min_free_gb']:g} GB)" if isinstance(m.get("min_free_gb"), (int, float)) else ""
     note = f": {m['note']}" if m.get("note") else ""
+    if note and isinstance(m.get("note_until"), (int, float)):
+        note += f" (until {_day(m['note_until'])})"
     shared = m.get("shared")
     shared = f" (shared by all projects: {', '.join(shared)})" if isinstance(shared, list) and shared else ""
     return f"{alias}{tags}{host}{disk}{shared}{note}"
@@ -363,8 +372,19 @@ def list_lines() -> list[str]:
     return lines
 
 
+def _day(ts: float) -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime(ts))
+
+
+def stale_notes(machines: dict[str, dict], now: float) -> dict[str, float]:
+    """{alias: note_until} for the notes whose `until` passed."""
+    return {a: float(m["note_until"]) for a, m in machines.items()
+            if m.get("note") and isinstance(m.get("note_until"), (int, float)) and m["note_until"] <= now}
+
+
 def digest_lines(db, paused: dict | None = None, now: float | None = None) -> list[str]:
-    """The Resource trouble section of the coordinator's digest; [] when there is none."""
+    """The Resource trouble section of the coordinator's digest, and machine notes past their
+    `until`; [] when there is neither."""
     machines, lines = load(), []
     bad = trouble(db, now)
     if bad:
@@ -372,4 +392,9 @@ def digest_lines(db, paused: dict | None = None, now: float | None = None) -> li
         lines.append("## Resource trouble (last 24 h; move its tasks to an allowed healthy alternative)")
         for name in sorted(bad):
             lines.append(f"- {trouble_line(name, bad[name], machines, avoid)}")
+    stale = stale_notes(machines, time.time() if now is None else now)
+    if stale:
+        lines.append("## Machine notes past their end (may no longer hold; do not act on them as current)")
+        for alias in sorted(stale)[:DIGEST_MACHINES]:
+            lines.append(f"- {alias}: {machines[alias]['note']} (stale since {_day(stale[alias])})")
     return lines

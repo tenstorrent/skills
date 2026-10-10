@@ -338,6 +338,9 @@ def _file(p: project.Project, sources, offsets: dict, known: set, seen: list, no
             p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
                    (now, "upstream", "upstream_note", sev, text[:cap], "queued"))
             added += 1
+            if n.get("project") and n.get("project") != p.name:
+                from .pauseends import note_arrived
+                note_arrived(p, n["project"], now)   # a pause waiting on that project's report
     return added
 
 

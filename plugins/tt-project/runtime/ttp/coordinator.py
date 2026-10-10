@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from . import locks
-from . import anchors, effort, ends, jevuse, machines, prguard, push, reviewcap, shared, unblock, upstream
+from . import anchors, effort, ends, jevuse, machines, pauseends, prguard, push, reviewcap, shared, unblock, upstream
 from . import screen as scr
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
@@ -436,7 +436,10 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
         for name, v in sorted(paused.items()):
             lines.append(f"- {name}: paused {(now - float(v.get('since') or now)) / 3600:.1f}h ago by "
                          f"{v.get('by') or 'user'}" + (f" in project {v.get('project')} (shared by all projects)"
-                                                      if v.get("shared") else "") + (f": {clip(v['reason'], NOTE_CHARS)}" if v.get("reason") else ""))
+                                                      if v.get("shared") else "") + (f": {clip(v['reason'], NOTE_CHARS)}" if v.get("reason") else "")
+                         + (f" ({pauseends.describe(v)})" if pauseends.describe(v) else "")
+                         + (" (its end passed; the user's pause: only they lift it, no ask)" if v.get("by") == "user"
+                            and v.get("until") and float(v["until"]) <= now else ""))
     section("paused", lines)
     section("resources", machines.digest_lines(db, paused, now))
     lines = []
@@ -1172,7 +1175,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     raise ValueError(f"{name} was paused by the user; lift it only in the turn that carries "
                                      f"their go-ahead")
                 pause_resource(p, name, a["paused"], reason=a.get("reason") or a.get("text") or "",
-                               by="coordinator", key=key)
+                               by="coordinator", key=key, end=pauseends.from_action(a) if a["paused"] else None)
             elif t == "observation_mute":
                 scr.mute(db, a.get("source"), a.get("match"), a.get("hours"), a.get("below"),
                          a.get("why") or a.get("reason") or a.get("text") or "")
@@ -1669,13 +1672,14 @@ def _resource_names(names, action: str, problems: list) -> list[str]:
 
 
 def pause_resource(p: Project, name: str, paused: bool, reason: str = "", by: str = "user",
-                   key: str | None = None, db=None) -> str:
+                   key: str | None = None, db=None, end: dict | None = None) -> str:
     """Pause or resume one resource for the project's tasks. While paused, no task labelled with it
     is dispatched and `ttp lock` refuses it; running workers whose task uses it are told mid-run.
     Resuming it makes tasks that handed off `waiting` on the pause due now. A shared resource
     (shared.py) is paused for every project that names it; their daemons tell their own workers
     (sync_shared_pauses). `db` is the caller's own connection when it runs on another thread (the
-    web app). Returns a line for the user."""
+    web app). `end` (pauseends.from_action, which the action, `ttp pause` and the web app require)
+    replaces the pause's end; left out, a pause keeps the end it has. Returns a line for the user."""
     name = (name or "").strip()
     if not RESOURCE_RE.fullmatch(name):
         raise ValueError(f"not a resource name: {name!r}")
@@ -1686,7 +1690,8 @@ def pause_resource(p: Project, name: str, paused: bool, reason: str = "", by: st
 
     def _entry(was: dict | None) -> dict:
         was = was or {}
-        return {"reason": reason or was.get("reason", ""), "since": was.get("since") or time.time(),
+        kept = end if end is not None else {k: was[k] for k in pauseends.END_FIELDS if k in was}
+        return {**kept, "reason": reason or was.get("reason", ""), "since": was.get("since") or time.time(),
                 # The coordinator may lift only a pause the user had no part in.
                 "by": "user" if "user" in (by, was.get("by")) else by,
                 **({"project": p.name} if is_shared else {})}
@@ -1715,7 +1720,8 @@ def pause_resource(p: Project, name: str, paused: bool, reason: str = "", by: st
     why = f" ({entry['reason']})" if paused and entry["reason"] else ""
     _tell_runs(db, name, paused, why, key)
     scope = " for every project that shares it" if is_shared else ""
-    return (f"{name} paused{why}{scope}: tasks using it wait, and `ttp lock {name}` refuses it" if paused
+    till = f"; {pauseends.describe(entry)}" if paused and pauseends.describe(entry) else ""
+    return (f"{name} paused{why}{scope}: tasks using it wait, and `ttp lock {name}` refuses it{till}" if paused
             else f"{name} resumed{scope}" + (f"; {woken} task(s) that waited on it start again" if woken else ""))
 
 
@@ -1753,7 +1759,8 @@ def sync_shared_pauses(p: Project, db=None) -> None:
                 with db.tx():
                     local = db.paused_resources(shared=False)
                     was = local.get(name) or {}
-                    local[name] = {"reason": still.get("reason") or was.get("reason", ""),
+                    local[name] = {**{k: still[k] for k in pauseends.END_FIELDS if k in still},
+                                   "reason": still.get("reason") or was.get("reason", ""),
                                    "since": was.get("since") or still.get("since") or time.time(),
                                    "by": "user" if "user" in (still.get("by"), was.get("by"))
                                    else still.get("by") or "user"}

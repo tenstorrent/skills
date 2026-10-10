@@ -69,7 +69,7 @@ description: "Start, connect to, and talk with a long-running tt-project: a loca
 |---|---|
 | status, spend, blockers, why idle | `ttp status <name>` |
 | pause or resume all model work | `ttp pause <name>` / `ttp resume <name>` |
-| stop all use of one resource (a device) | `ttp pause <name> --resource <r> --reason "..."` / `ttp resume <name> --resource <r>` |
+| stop all use of one resource (a device) | `ttp pause <name> --resource <r> --reason "..." --until 2d` (or `--end-when "<probe>"`) / `ttp resume <name> --resource <r>` |
 | record their machines (shared by all projects) | `ttp machines add <alias> --tags device,...` / `ttp machines list`; say in the charter which ones the project may use. Projects on other machines (`--host`) get a merged copy on add/remove, `ttp upgrade` and `ttp machines push` |
 | change caps | tell the coordinator, or `ttp config <name> budget.daily_usd 150` |
 | read a schedule | `ttp schedules <name> show <schedule>` (or `list`): read-only, writes nothing |
