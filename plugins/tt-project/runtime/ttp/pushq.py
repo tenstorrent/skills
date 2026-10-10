@@ -294,6 +294,10 @@ def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None
         return {"ignored": "this project does not allow pushing (delivery.push_allowed)"}
     if push.REVIEW_ONLY_LABEL in push._labels(task):
         return {"ignored": "this review is review only: its change must not reach the push branch"}
+    for t in push._reviewed(p, str(task["id"])):
+        if onto := push.pr_elsewhere(p, t, d):
+            return {"invalid": f"#{t['id']} delivers onto its pr_branch {onto}, not the push branch: publish it "
+                               f"there with `ttp push --own --detach` instead of approving it for the push queue"}
     tgt = target(p) if enabled(p, cfg) else None
     if not tgt:
         return {"invalid": "no target branch: set delivery.push_branch"}

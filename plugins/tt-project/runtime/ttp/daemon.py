@@ -4958,20 +4958,32 @@ class Daemon:
         # A head its PR already carries is delivered: a pass closes the review, with no push to the
         # push branch or approval for the push queue (that branch may be unrelated, or not exist yet).
         delivered = push.delivered_pr(self.p, task, full)
+        # A task that delivers onto a pr_branch other than the push branch goes to that PR with
+        # `ttp push --own`: a plain push or a push-queue approval would rebase it onto the push branch.
+        elsewhere = "" if delivered else push.pr_elsewhere(self.p, task, d)
         # A change that must not reach the push branch (its diff is all push-excluded, or its spec or
         # hand-off forbids it) is review only too: a pass would push what the push refuses or the spec bans.
-        off = "" if delivered or not d.get("push_branch") else push.kept_off(task, changes, d)
+        off = "" if delivered or elsewhere or not d.get("push_branch") else push.kept_off(task, changes, d)
         # A push branch no push can ever reach (main/master without allow_protected_push_branch, or a
         # code repo without the remote) makes every review review only: a push step there would only
         # exit 2 and block the review, and a raw `git push` would skip the checks and the queue.
-        never = "" if delivered or off or not (d.get("push_branch") and d.get("push_allowed", True)) \
+        never = "" if delivered or elsewhere or off or not (d.get("push_branch") and d.get("push_allowed", True)) \
             else push.push_branch_problem(d["push_branch"], self.p.root, push.allow_protected(d))
-        pushes = bool(d.get("push_branch") and d.get("push_allowed", True)) and not delivered and not off \
-            and not never
+        pushes = bool(d.get("push_branch") and d.get("push_allowed", True)) and not delivered and not elsewhere \
+            and not off and not never
         if delivered:
             lines.append(f"Its head is already delivered as PR {delivered}: review only. If it passes, hand off "
                          f"`done`; do not run `ttp push` or approve it for the push queue. Leave the branch and "
                          f"the PR as they are.")
+        elif elsewhere and d.get("push_allowed", True):
+            lines.append(f"It delivers onto its pr_branch {elsewhere}, not {d['push_branch']}. If it passes, "
+                         f"publish it there with `ttp push --own --detach` from the change's worktree; never run "
+                         f"plain `ttp push` (it would rebase the work onto {d['push_branch']}) and do not approve "
+                         f"it for the push queue.")
+        elif elsewhere:
+            lines.append(f"It delivers onto its pr_branch {elsewhere}, not {d['push_branch']}. Review only: if it "
+                         f"passes, hand off `done`; do not run `ttp push` or approve it for the push queue. Leave "
+                         f"the branch" + (" and the PR" if pr else "") + " as they are.")
         elif off:
             lines.append(f"It must not reach {d['push_branch']}: {off}. Review only: if it passes, hand off "
                          f"`done`; do not run `ttp push` or approve it for the push queue. Leave the branch"
@@ -4991,9 +5003,10 @@ class Daemon:
             lines.append(self._precheck_line(task, head, checks))
         if str(rules.get("auto_notes") or "").strip():
             lines.append(str(rules["auto_notes"]).strip())
-        lines.append("Return the verdict and findings" + (", and the pushed commit." if pushes else "."))
+        lines.append("Return the verdict and findings" + (", and the pushed commit." if pushes or (
+            elsewhere and d.get("push_allowed", True)) else "."))
         labels = [f"auto_review:{task['id']}"] + ([f"continues:{prior['id']}"] if prior else []) \
-            + ([PRECHECK_LABEL + checks.name] if checks else []) + ([push.REVIEW_ONLY_LABEL] if off or never else [])
+            + ([PRECHECK_LABEL + checks.name] if checks else []) + ([push.REVIEW_ONLY_LABEL] if elsewhere or off or never else [])
         rid = db.add_task(title, "\n".join(lines), kind="review", tier=tier, priority=2, origin="daemon",
                           budget_usd=float(cfg["budget"]["task_default_usd"].get(tier, 8.0)),
                           depends_on=[task["id"]], labels=labels)

@@ -396,6 +396,10 @@ account out of funds or quota, unrecoverable outage, restriction at risk. Everyt
   branch (notes only), or whose spec or hand-off marks it: review only, no push or push-queue step.
   When a change must stay off the push branch, put a line `no_push: <why>` in its spec; prose
   saying so is not read.
+- A code task labelled `pr_branch:<branch>` for a branch other than `delivery.push_branch` delivers
+  to that PR: its review spec says "if it passes, publish it with `ttp push --own --detach`", never
+  plain `ttp push` or a push-queue approval (both would rebase it onto the push branch; `ttp push`
+  and the queue refuse it).
 - While `delivery.push_branch` can never be pushed to (main or master without
   `delivery.allow_protected_push_branch`, or a code repo with no git remote; the config alert and
   `ttp doctor` name it), every review is review only: no push step, and never a raw `git push` to it.

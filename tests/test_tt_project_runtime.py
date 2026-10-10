@@ -30823,6 +30823,89 @@ def test_a_review_only_stack_stays_review_only_through_its_fix_and_the_push_queu
     assert started == []
 
 
+def test_the_review_of_a_task_with_another_pr_branch_publishes_with_own_and_never_approves_for_the_queue(
+        env, monkeypatch):
+    """A code task whose pr_branch is the push branch gets the usual push step; one whose pr_branch is
+    another branch gets a review that publishes with `ttp push --own` and is review only for the push
+    branch: no plain `ttp push`, no push-queue approval."""
+    from ttp import push, pushq
+    p = make(env)
+    _with_origin(env, clone=False)
+    p.set_config("delivery.push_branch", "origin/work")
+    monkeypatch.setattr(pushq, "enabled", lambda *a, **k: False)   # no prechecks: the spec text is the subject
+    for on in (False, True):
+        p.set_config("delivery.push_queue", on)
+        _, _, _, (same,) = _finish_code(env, p, f"same {on}", {f"s{on}.py": 3}, labels=["pr_branch:work"])
+        assert "ttp push` from" in same["spec"] and "--own" not in same["spec"], same["spec"]
+        assert push.REVIEW_ONLY_LABEL not in json.loads(same["labels"])
+        _, _, _, (other,) = _finish_code(env, p, f"other {on}", {f"o{on}.py": 3}, labels=["pr_branch:feature/x"])
+        assert "ttp push` from" not in other["spec"], other["spec"]
+        assert "pr_branch feature/x" in other["spec"] and "`ttp push --own --detach`" in other["spec"]
+        assert "do not approve it for the push queue" in other["spec"]
+        assert other["spec"].rstrip().endswith("the pushed commit.")
+        assert push.REVIEW_ONLY_LABEL in json.loads(other["labels"])
+    # A project that does not push: review only, no publish step.
+    p.set_config("delivery.push_allowed", False)
+    _, _, _, (rev,) = _finish_code(env, p, "no push", {"n.py": 3}, labels=["pr_branch:feature/x"])
+    assert "Review only" in rev["spec"] and "--own --detach" not in rev["spec"], rev["spec"]
+    coordinator = (RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text()
+    assert "publish it with `ttp push --own --detach`\", never\n  plain `ttp push` or a push-queue approval" \
+        in coordinator
+
+
+def test_the_push_queue_refuses_an_approval_of_a_task_with_another_pr_branch(env, monkeypatch):
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    entries = [{"branch": s.branch, "head": s.head}]
+    s.p.db.update_task(s.code, labels=["pr_branch:proj"])   # the push branch itself: approved as usual
+    assert pushq.check_approval(s.p, s.p.db.task(s.review), entries).get("entries")
+    s.p.db.update_task(s.code, labels=["pr_branch:feature/x"])
+    check = pushq.check_approval(s.p, s.p.db.task(s.review), entries)
+    assert "pr_branch feature/x" in check.get("invalid", "") and "ttp push --own" in check["invalid"], check
+    # The review's run approving it anyway runs again once, told why, and nothing enters the queue.
+    task = _pq_hand_off(env, s)
+    assert task["status"] == "queued" and not s.p.db.q("SELECT * FROM push_queue")
+
+
+def test_a_plain_push_refuses_a_head_whose_task_has_another_pr_branch_and_own_publishes_onto_it(
+        env, monkeypatch):
+    """Plain `ttp push` of a task that delivers onto a pr_branch other than the push branch is refused,
+    naming --own, in the task's run, its review's and its review fix's; `ttp push --own` from the
+    review publishes onto that pr_branch. A pr_branch that is the push branch pushes as before."""
+    from ttp import push
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    _git_out(other, "push", "-q", "origin", "HEAD:refs/heads/feature/x")
+
+    def task(labels, kind="code", **more):
+        tid = p.db.add_task(f"t{len(p.db.q('SELECT id FROM tasks'))}", "s", kind=kind, labels=labels, **more)
+        return tid, f"ttp/t{tid}-x"
+
+    code, branch = task(["pr_branch:feature/x"])
+    _git_out(repo, "checkout", "-q", "-B", branch)
+    for runner in (str(code), str(task([f"auto_review:{code}"], kind="review", depends_on=[code])[0])):
+        monkeypatch.setenv("TTP_TASK", runner)
+        with pytest.raises(ValueError, match=r"pr_branch feature/x, not origin/proj.*ttp push --own --detach"):
+            push.resolve(p, repo)
+        assert push.resolve(p, repo, own=True) == ("origin", "feature/x", True), runner
+    # The review's run in the PR branch's own worktree (the task worked on it directly).
+    _git_out(repo, "checkout", "-q", "-B", "feature/x")
+    with pytest.raises(ValueError, match="ttp push --own"):
+        push.resolve(p, repo)
+    # A fix of a failed review continues the task: its branch delivers onto the same PR.
+    fix, fbranch = task([f"continues:{code}"])
+    _git_out(repo, "checkout", "-q", "-B", fbranch)
+    monkeypatch.setenv("TTP_TASK", str(fix))
+    with pytest.raises(ValueError, match="pr_branch feature/x"):
+        push.resolve(p, repo)
+    # pr_branch is the push branch: the usual target.
+    same, sbranch = task(["pr_branch:proj"])
+    _git_out(repo, "checkout", "-q", "-B", sbranch)
+    monkeypatch.setenv("TTP_TASK", str(same))
+    assert push.resolve(p, repo) == ("origin", "proj", False)
+    monkeypatch.delenv("TTP_TASK")
+    assert push.resolve(p, repo) == ("origin", "proj", False)
+
+
 def test_a_code_hand_off_with_more_to_decide_still_wakes_the_coordinator(env):
     p = make(env)
     # Follow-ups or findings: the coordinator's turn queues the review, so the reviewer sees its decisions.

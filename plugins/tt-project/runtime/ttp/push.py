@@ -880,7 +880,8 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
     finished task's PR); any other named branch (one a spec names, e.g. <user>/feature-x) may go
     too. Both only as a fast-forward (publish, ff_only: own_ff_only). A task labelled
     `pr_branch:<branch>` on its own ttp/t<id>-... branch (the PR's branch was held by another
-    worktree) publishes its head onto that branch instead. Never a detached HEAD, main/master, the
+    worktree) publishes its head onto that branch instead, and so does a review covering that task.
+    Never a detached HEAD, main/master, the
     push branch or the branch work starts from; publish also refuses the remote's default branch."""
     branch = _git(repo, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
     if not branch:
@@ -889,6 +890,10 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
     task = os.environ.get("TTP_TASK")
     onto = _labelled(p, task, "pr_branch") if task else ""
     carried = bool(m and onto and m.group(1) == task)
+    if m and task and m.group(1) != task and not carried:
+        # A review publishes the code task it covers onto that task's pr_branch, as the task would.
+        onto = next((pr_branch_of(p, t) for t in _reviewed(p, task) if str(t["id"]) == m.group(1)), "")
+        carried = bool(onto)
     if carried:
         if not worktree.valid_branch(onto):
             raise ValueError(f"this task's pr_branch label ({onto!r}) is not one valid branch name; "
@@ -992,6 +997,8 @@ def resolve(p: Project, repo: Path, own: bool = False) -> tuple[str, str, bool]:
                          f"task #{task}'s own (ttp/t{task}-...): ttp push lands only this task's work. "
                          f"Run it in this task's own worktree")
     d = p.config().get("delivery") or {}
+    if branch and (why := pr_branch_guard(p, branch, task, d)):
+        raise ValueError(why)
     if not str(d.get("push_branch") or "").strip() and m and m.group(1) == task:
         remote, own_branch = own_target(p, repo)
         if _on_remote(repo, remote, own_branch):
@@ -1151,6 +1158,58 @@ def kept_off(task: dict, changes: dict | None, d: dict) -> str:
         why = m.group(1).strip("`\"' ")
         if why.lower() not in ("false", "no", "0"):
             return "its spec says it must not reach the push branch" + (f" ({why[:200]})" if why else "")
+    return ""
+
+
+def pr_branch_of(p: Project, task: dict | None) -> str:
+    """The branch a task's `pr_branch:` label delivers onto (worktree.carried_branch), or that of the
+    task it continues (a fix of a failed review's findings builds on that task's work), or ""."""
+    from .db import continues_id
+    seen: set[int] = set()
+    while task and task["id"] not in seen:
+        seen.add(task["id"])
+        if onto := worktree.carried_branch(task):
+            return onto
+        c = continues_id(task)
+        task = p.db.task(c) if c is not None else None
+    return ""
+
+
+def pr_elsewhere(p: Project, task: dict | None, d: dict) -> str:
+    """The branch a task delivers onto (pr_branch_of) when it is not `delivery.push_branch`, else "".
+    Its work goes to that PR with `ttp push --own`: a plain push or a push-queue approval would
+    rebase it onto the push branch, which may be unrelated to it."""
+    onto = pr_branch_of(p, task)
+    ref = str(d.get("push_branch") or "").strip()
+    if not onto or not ref:
+        return ""
+    ref = ref.removeprefix("refs/heads/")
+    return "" if onto in (ref, ref.partition("/")[2].removeprefix("refs/heads/")) else onto
+
+
+def _reviewed(p: Project, task: str | None) -> list[dict]:
+    """The code tasks review `task` covers (its dependencies and auto_review: label), or []."""
+    t = _task_row(p, task)
+    if not t or t.get("kind") != "review":
+        return []
+    from .db import dependency_ids
+    ids = [i for i in dependency_ids(t) if i is not None]
+    ids += [int(x[12:]) for x in _labels(t) if x.startswith("auto_review:") and x[12:].isdigit()]
+    return [r for r in (_task_row(p, str(i)) for i in dict.fromkeys(ids)) if r]
+
+
+def pr_branch_guard(p: Project, branch: str, task: str | None, d: dict) -> str:
+    """Why a plain `ttp push` of the checked-out `branch` must not land on the push branch, or "": the
+    task whose work it is (the ttp/t<id>-... branch's owner, else the running task or a code task the
+    running review covers whose pr_branch is `branch`) delivers onto another branch (pr_elsewhere)."""
+    m = OWN_BRANCH.fullmatch(branch)
+    rows = [_task_row(p, m.group(1))] if m else [_task_row(p, task)] + _reviewed(p, task)
+    for t in rows:
+        onto = pr_elsewhere(p, t, d)
+        if onto and (m or onto == branch):
+            return (f"task #{t['id']} delivers onto its pr_branch {onto}, not {d['push_branch']}: a plain "
+                    f"`ttp push` would rebase it onto {d['push_branch']}. Publish it with "
+                    f"`ttp push --own --detach`")
     return ""
 
 
