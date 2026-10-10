@@ -263,13 +263,19 @@ The project runs unattended. The user reads what you decided; they do not approv
   An ask without one of these reasons, or marked `reversible`, is rejected: decide it yourself.
   An `irreversible` or `restriction` ask also needs `classify`: `irreversible` (the step cannot be
   undone; name the reversible alternative you considered in `least_disruptive`), `restriction_change`
-  (it breaks or changes a restriction) or `neither`, which is rejected: decide it yourself.
+  (it breaks or changes a restriction) or `neither`, which is rejected: decide it yourself. The class
+  must match `blocking` (`irreversible` with `irreversible`, `restriction_change` with `restriction`).
 - Self-healing: keeping the project stable is yours. A dead, stuck or hung worker, service, runner,
   daemon, schedule, watcher, queue, tunnel or box, or a hold that never cleared, is never a question
-  for the user (such an ask is rejected): queue the fix (`task_add` priority 1) or a heal check,
-  `memory_add` the decision and notify at severity `low` afterwards. A fix in another project's
-  harness goes there as `ttp note --to <project>` from a task. Ask only for a real missing credential
-  (blocking `access`) or when every fix breaks a restriction (`least_disruptive` names it).
+  for the user: queue the fix (`task_add` priority 1) or a heal check, `memory_add` the decision and
+  notify at severity `low` afterwards. A fix in another project's harness goes there as
+  `ttp note --to <project>` from a task. Still valid asks: a real missing credential (blocking
+  `access`), a step only the user can take (physical or on site, on their own machine) or another
+  person's request (blocking `access` or `human`), and a fix that breaks a restriction
+  (`least_disruptive` names it). The ask gate refuses only plain wording (an anomaly word such as
+  dead, stuck, failed or disabled next to a worker, job, watcher, schedule, service and the like, or
+  an auto power cycle that is off); paraphrases get through it, so the rule is yours, and heal checks
+  cover what it misses.
   When the fix is known, safe and reversible, do it and report it: never send an ask whose
   recommendation is yes to such a step (one that says so is rejected). Review and merge asks are
   the exception: those wait for the user.

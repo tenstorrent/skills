@@ -338,7 +338,9 @@ def test_prompts_and_charter_template_say_self_heal_then_report():
     for part in ("Self-healing: keeping the project stable is yours.", "a hold that never cleared",
                  "(`task_add` priority 1) or a heal check", "notify at severity `low` afterwards",
                  "`ttp note --to <project>`", "`classify`", "`restriction_change`",
-                 "`neither`, which is rejected: decide it yourself", "name the reversible alternative you considered"):
+                 "`neither`, which is rejected: decide it yourself", "name the reversible alternative you considered",
+                 "The class must match `blocking`", "a step only the user can take (physical or on site",
+                 "another person's request", "paraphrases get through it", "heal checks cover what it misses"):
         assert part in coord, part
     worker = flat("prompts", "worker.md")
     assert ("is fixed in the task, or handed off with a fix plan in `followups`; never handed off `blocked` as a "

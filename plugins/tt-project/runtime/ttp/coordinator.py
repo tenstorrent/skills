@@ -1033,7 +1033,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 rec = (a.get("recommendation") or "").strip()
                 if a["blocking"] == "restriction":
                     text += f"{_LEAST_NOTE}{least}"
-                elif a["blocking"] == "irreversible":
+                elif a["blocking"] == "irreversible" and least:
                     text += f"{_REVERSIBLE_NOTE}{least}"
                 if rec:
                     text += f"{_REC_NOTE}{rec}"
@@ -2318,68 +2318,110 @@ def _needless_ask(a: dict, text: str) -> str:
     return ""
 
 
+_CLASS_FOR = {"irreversible": "irreversible", "restriction": "restriction_change"}
+
+
 def _unclassified_ask(a: dict, least: str) -> tuple[str, str] | None:
-    """(refusal label, why) for an irreversible or restriction ask that is not classified, is classified
-    `neither`, or does not name the way around it it considered; else None. Access, funds, spend,
-    review, merge and human asks carry a reason only the user or another person can clear, so they
-    need no class."""
-    if a.get("blocking") not in ("irreversible", "restriction"):
+    """(refusal label, why) for an irreversible or restriction ask whose `classify` is missing, is
+    `neither`, or does not agree with `blocking`, or an irreversible ask that does not name the
+    reversible alternative it considered; else None. Access, funds, spend, review, merge and human
+    asks carry a reason only the user or another person can clear, so they need no class."""
+    blocking = a.get("blocking")
+    want = _CLASS_FOR.get(blocking)
+    if not want:
         return None
     cls = a.get("classify")
     if cls not in ASK_CLASSES:
-        return ("unclassified", f"classify it first: set `classify` to {', '.join(ASK_CLASSES)}. "
+        return ("unclassified", f"classify it first: set `classify` to `{want}` for blocking `{blocking}`. "
                 "`irreversible`: the step cannot be undone; `restriction_change`: it breaks or changes a "
                 "restriction; `neither`: decide it yourself")
     if cls == "neither":
         return ("neither", "decide it yourself. A step that is neither irreversible nor a restriction change is a "
                 "judgment call: act on it, memory_add a decision and notify at severity low")
-    if cls == "irreversible" and len(least) < LEAST_DISRUPTIVE_MIN:
+    if cls != want:
+        return ("classify mismatch", f"`classify` {cls} does not match blocking `{blocking}`: set `classify` to "
+                f"`{want}`, or change `blocking` to the reason that is true")
+    if blocking == "irreversible" and len(least) < LEAST_DISRUPTIVE_MIN:
         return ("no reversible alternative", "name the reversible alternative you considered in least_disruptive, "
                 "and why it does not do. If one does, take it (task_add) and memory_add the decision instead of "
                 "asking")
     return None
 
 
-# A question about the health of something the project runs: an anomaly word and the thing it is
-# about. The project fixes these itself (task, heal check) and reports afterwards.
-_HEALTH_RE = re.compile(
-    r"\b(dead|hung|hangs|hanging|stuck|crash(?:ed|es|ing)?|not running|offline|stopped responding|"
-    r"not responding|unresponsive|(?:is|are|was|went|gone|been|stays?|still) down|restart(?:ed|ing|s)?|"
-    r"relaunch(?:ed|ing)?|bring (?:it |them )?back|recover(?:ed|ing|y)?|reviv(?:e|ed|ing)|re-?enabl(?:e|ed|ing)|"
-    r"power[- ]?cycl(?:e|ed|ing)|held|not (?:been )?(?:released|cleared)|never (?:released|cleared|recovered))\b", re.I)
-_HEALTH_OBJ_RE = re.compile(
-    r"\b(workers?|services?|runners?|daemons?|schedules?|watchers?|queues?|tunnels?|box(?:es)?|machines?|"
-    r"holds?|devices?|hosts?|brokers?|timers?|process(?:es)?)\b", re.I)
-# A missing credential the user must supply: an access or human ask about it still goes out.
-_CREDENTIAL_RE = re.compile(
-    r"\b(logged out|log ?in|password|passphrase|token|(?:ssh |api |deploy )?keys?|permission denied|sudo|2fa|mfa|"
-    r"credentials?|re-?auth\w*)\b", re.I)
+# The self-health gate is a high-precision backstop; model-free heal checks (heal.py) do the
+# self-healing. It refuses an ask only when, in one sentence, an anomaly word (or a restart-type
+# verb) sits within _NEAR words of something the project runs, or when an auto power cycle is off.
+# Known gaps, accepted: paraphrases without these words ("the box no longer answers", "a hold never
+# cleared", "the queue is wedged") get through, and heal checks cover them.
+_NEAR = 4
+_ANOMALY = {"dead", "died", "dies", "hung", "stuck", "crashed", "failed", "failing", "stopped", "exited", "disabled"}
+_ANOMALY_PAIRS = {("is", "off"), ("turned", "off"), ("are", "off"), ("was", "off")}
+_DOWN_AFTER = {"is", "are", "was", "were", "went", "been", "still", "stays", "gone"}   # "is down", not "scale down"
+_RESTART = {"re-enable", "reenable", "restart", "rerun", "re-run", "retry", "relaunch"}
+_OBJECTS = {"worker", "task", "job", "watcher", "schedule", "daemon", "runner", "broker", "timer", "service"}
+_RUN_BEFORE = {"a", "an", "the", "this", "that", "its", "their", "our", "my", "last", "nightly", "daily", "latest"}
+_AUTO_POWER_RE = re.compile(r"\b(?:auto(?:matic)?[- ]?power[- ]?cycl\w*|power[- ]cycling)\b", re.I)
+_POWER_OFF_RE = re.compile(r"\b(?:is off|are off|turned off|switched off|disabled|re-?enabl\w*|turn (?:it )?back on)\b",
+                           re.I)
+# Exemptions, checked first. A real credential (bare "key" or "login" is not one):
+_CREDENTIAL_RE = re.compile(r"\b(?:ssh keys?|api keys?|tokens?|logged out|log in again|needs? an? login|passwords?)\b",
+                            re.I)
+# Under access or human only: a step only the user can take, or another person's request.
+_USER_ONLY_RE = re.compile(r"\b(?:physical(?:ly)?|on[- ]site|by hand|power button|your (?:laptop|machine)|"
+                           r"the user's (?:laptop|machine)|reverse tunnel)\b", re.I)
+_OTHERS_ASK_RE = re.compile(r"\b(?:another|other|a|an|the|their)\s+(?:team|person|people|reviewer|reporter|"
+                            r"maintainer)s?\b(?:\s+\w+){0,2}?\s+(?:asked|requested)\b", re.I)
 # The restriction or the irreversible step a self-health ask names in least_disruptive.
 _NAMES_LIMIT_RE = re.compile(
     r"\b(restrict\w*|rules?|charter|forbid\w*|bans?|banned|not allowed|never|breaks?|irreversibl\w*|"
     r"undone|permanent\w*|cannot undo|can't undo)\b", re.I)
 
 
+def _health_hit(text: str) -> bool:
+    """True when one sentence has an anomaly or restart word within _NEAR words of an object the
+    project runs, or says an auto power cycle is off."""
+    for sentence in re.split(r"[.;:!?\n]+", text.replace("’", "'")):
+        if _AUTO_POWER_RE.search(sentence) and _POWER_OFF_RE.search(sentence):
+            return True
+        words = [re.sub(r"'s$", "", w.strip("\"'*_(),")).lower() for w in sentence.split()]
+        hits, objs = [], []
+        for i, w in enumerate(words):
+            prev = words[i - 1] if i else ""
+            if (w in _ANOMALY or w in _RESTART or (w == "down" and prev in _DOWN_AFTER)
+                    or (prev, w) in _ANOMALY_PAIRS):
+                hits.append(i)
+            stem = w[:-1] if w.endswith("s") else w
+            if stem in _OBJECTS or (stem == "run" and prev in _RUN_BEFORE):
+                objs.append(i)
+        if any(abs(h - o) <= _NEAR for h in hits for o in objs):
+            return True
+    return False
+
+
 def _self_health_ask(a: dict, text: str, least: str = "") -> str:
-    """Why an ask about the project's own health (a dead worker, a stuck queue, a hold that never
-    cleared) is the project's to fix, or "". Under human or access it is refused unless the text
-    names a real missing credential; under irreversible or restriction unless least_disruptive
-    names the restriction or the irreversible step. Review, merge, funds and spend asks pass."""
+    """Why an ask about the project's own health (a dead worker, a disabled schedule, an auto power
+    cycle that is off) is the project's to fix, or "". Exempt: a real credential; under access or
+    human, a step only the user can take or another person's request; under irreversible or
+    restriction, least_disruptive naming the restriction or the irreversible step. Review, merge,
+    funds and spend asks pass."""
     blocking = a.get("blocking")
     if blocking not in ("human", "access", "irreversible", "restriction"):
         return ""
     said = f"{text} {a.get('recommendation') or ''}"
-    if not (_HEALTH_RE.search(said) and _HEALTH_OBJ_RE.search(said)):
+    if _CREDENTIAL_RE.search(said):
         return ""
-    if blocking in ("human", "access") and _CREDENTIAL_RE.search(said):
+    if blocking in ("human", "access") and (_USER_ONLY_RE.search(said) or _OTHERS_ASK_RE.search(said)):
+        return ""
+    if not _health_hit(said):
         return ""
     if blocking in ("irreversible", "restriction") and _NAMES_LIMIT_RE.search(least):
         return ""
     return ("keeping the project running is yours: fix what it runs yourself and report afterwards. Queue the fix "
             "(task_add priority 1) or a heal check (schedule_set), memory_add the decision and notify at severity "
             "low. If the fix lives in another project's harness, a task sends it there with `ttp note --to "
-            "<project>`. Ask only when every fix breaks a restriction: blocking restriction (or irreversible), "
-            "with least_disruptive naming the restriction or the irreversible step")
+            "<project>`. Ask only for a real missing credential, a step only the user can take (physical, on their "
+            "machine) or another person's request, or when every fix breaks a restriction: blocking restriction "
+            "(or irreversible), with least_disruptive naming the restriction or the irreversible step")
 
 
 def _count_refusal(db, key: str | None, label: str, text: str) -> None:
