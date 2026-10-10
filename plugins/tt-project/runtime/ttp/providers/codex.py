@@ -100,7 +100,8 @@ class Codex(Provider):
         homes = ([Path(own).expanduser()] if own else []) + [codex_home()]
         return any(any((h / "sessions").glob(f"*/*/*/rollout-*-{session_id}.jsonl")) for h in dict.fromkeys(homes))
 
-    def build(self, *, role, model, effort, cwd, budget_usd, read_only, schema, restrictions):
+    def build(self, *, role, model, effort, cwd, budget_usd, read_only, schema, restrictions,
+              disallowed_tools=()):
         exe = self.binary() or "codex"
         argv = [exe, "exec", "--json", "-C", cwd, "--skip-git-repo-check"]
         if model:

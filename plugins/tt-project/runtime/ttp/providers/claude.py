@@ -85,7 +85,8 @@ class Claude(Provider):
         except ValueError:
             return rc == 0
 
-    def build(self, *, role, model, effort, cwd, budget_usd, read_only, schema, restrictions):
+    def build(self, *, role, model, effort, cwd, budget_usd, read_only, schema, restrictions,
+              disallowed_tools=()):
         argv = [self.binary() or "claude", "-p", "--output-format", "stream-json", "--verbose", "--no-chrome"]
         if model:
             argv += ["--model", model]
@@ -105,6 +106,7 @@ class Claude(Provider):
             denied = list(WORKER_DENIED_TOOLS)
             if restrictions.get("no_internet"):
                 denied += ["WebFetch", "WebSearch"]
+            denied += [t for t in disallowed_tools if t not in denied]   # the project's own denylist
             argv += ["--disallowedTools", *denied]
             argv += ["--settings", json.dumps(worker_settings())]
             # Workers start in many different worktrees; with the per-directory sections out of the

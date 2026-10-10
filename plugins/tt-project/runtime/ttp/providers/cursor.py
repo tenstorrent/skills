@@ -52,7 +52,8 @@ class Cursor(Provider):
         return got[0] == 0 and not re.search(r"not (logged|authenticated)|login required|unauthenticated",
                                              got[1], re.I)
 
-    def build(self, *, role, model, effort, cwd, budget_usd, read_only, schema, restrictions):
+    def build(self, *, role, model, effort, cwd, budget_usd, read_only, schema, restrictions,
+              disallowed_tools=()):
         exe = self.binary() or "agent"
         help_text = cli_output(exe, "--help")
         fmt = "stream-json" if "stream-json" in help_text else "json"

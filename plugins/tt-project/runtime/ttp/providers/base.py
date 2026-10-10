@@ -157,8 +157,10 @@ class Provider:
         return None
 
     def build(self, *, role: str, model: str, effort: str, cwd: str, budget_usd: float | None,
-              read_only: bool, schema: dict | None, restrictions: dict) -> tuple[list[str], dict]:
-        """Return (argv, extra_env) for a headless run whose prompt arrives on stdin."""
+              read_only: bool, schema: dict | None, restrictions: dict,
+              disallowed_tools: list[str] | tuple = ()) -> tuple[list[str], dict]:
+        """Return (argv, extra_env) for a headless run whose prompt arrives on stdin. A worker's run
+        also denies `disallowed_tools` (the project's providers.<p>.disallowed_tools), where the agent can."""
         raise NotImplementedError
 
     def parse(self, output_path: Path, stderr_path: Path | None = None) -> RunUsage:

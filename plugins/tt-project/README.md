@@ -449,6 +449,12 @@ and preferences you add later become part of the project's charter and memory.
   Listing a server approves it for workers. A name your config does not define is skipped: the
   run still starts, and `ttp doctor` and a low alert name it. Servers that come from a Claude plugin
   are not in those files, so they cannot be listed; add the server with `claude mcp add` to list it.
+- `providers.claude.disallowed_tools: ["mcp__<server>__<tool>", "mcp__<server>__*", ...]` lists tools
+  Claude workers and reviewers may not call, on top of the tools the harness always denies them; a
+  trailing `*` covers every tool whose name starts so, e.g. every tool of one server. Use it to keep
+  workers off a server's private-data or write tools while they keep its other tools. A malformed
+  entry is refused when set; one written into project.json by hand is skipped and named by
+  `ttp doctor` and a low alert.
 - `providers.codex.worker_isolation: true` starts Codex workers and reviewers with
   `--ignore-user-config`, so your `config.toml` (its MCP servers, plugins and hooks) stays out;
   sign-in still works. Codex coordinator turns always skip it, and your rules files too, where the

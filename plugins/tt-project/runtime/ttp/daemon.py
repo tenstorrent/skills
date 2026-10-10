@@ -1003,8 +1003,10 @@ class Daemon:
         restrictions = self.cfg.get("restrictions", {})
         if read_only and prov.isolate_read_only:
             cwd = scratch_dir(str(self.p.base))
+        denied = coord.tool_list(self.cfg["providers"].get(provider, {}).get("disallowed_tools") or [])
         argv, env = prov.build(role=role, model=model, effort=effort, cwd=cwd, budget_usd=budget_usd,
-                               read_only=read_only, schema=schema, restrictions=restrictions)
+                               read_only=read_only, schema=schema, restrictions=restrictions,
+                               disallowed_tools=denied)
         env = {**env, **prov.cache_env(cache_ttl)}
         if role != "coordinator":
             window = self.cfg["budget"].get("compact_window_tokens") or 0   # 0: off for every tier

@@ -219,7 +219,7 @@ EXTRA_KEYS = {
     "runner": {"device_timeout_max_s"},
 }
 OPEN_SECTIONS = {"resources"}           # any name below is fine
-PROVIDER_KEYS = {"tiers", "plugin_dirs", "worker_isolation", "mcp_servers"}
+PROVIDER_KEYS = {"tiers", "plugin_dirs", "worker_isolation", "mcp_servers", "disallowed_tools"}
 
 
 def _known_keys(path: list[str]) -> set[str] | None:
@@ -426,6 +426,14 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
         out.append(f"worktree.kinds: {kinds!r} is not a list of task kinds; only code tasks get worktrees")
     elif kinds and set(kinds) & {"review", "harness"}:
         out.append("worktree.kinds: review and harness tasks never get a worktree of their own; they are skipped")
+    from .coordinator import tool_list   # coordinator imports this module
+    for prov, pcfg in (raw.get("providers") or {}).items() if isinstance(raw.get("providers"), dict) else ():
+        denied = pcfg.get("disallowed_tools") if isinstance(pcfg, dict) else None
+        try:
+            tool_list(denied or [], strict=True)
+        except ValueError as e:
+            out.append(f"providers.{prov}.disallowed_tools: {str(e).split(';')[0]}; "
+                       "skipped, so workers may still call it")
     if isinstance(raw.get("budget"), dict):
         from .globalcap import setting_problems
         out += setting_problems(raw["budget"])

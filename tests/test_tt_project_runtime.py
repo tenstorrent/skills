@@ -5595,6 +5595,51 @@ def test_an_unknown_mcp_server_is_named_and_the_run_still_starts(env, monkeypatc
                             "value": "bad name!"}]), "a malformed name must be rejected"
 
 
+def test_disallowed_tools_extend_the_workers_denylist_and_never_the_coordinators(env):
+    from ttp.providers import claude, get_provider
+    kw = dict(role="worker", model="opus", effort="low", cwd=".", budget_usd=None, schema=None,
+              restrictions={"no_internet": True})
+
+    def denied(argv):
+        i = argv.index("--disallowedTools")
+        return argv[i + 1:argv.index("--settings")]
+    worker, _ = get_provider("claude").build(read_only=False, **kw)
+    assert denied(worker) == [*claude.WORKER_DENIED_TOOLS, "WebFetch", "WebSearch"], "unset: the defaults only"
+    worker, _ = get_provider("claude").build(read_only=False, disallowed_tools=["mcp__mail__*", "Task",
+                                                                                "mcp__docs__write_page"], **kw)
+    assert denied(worker) == [*claude.WORKER_DENIED_TOOLS, "WebFetch", "WebSearch", "mcp__mail__*",
+                              "mcp__docs__write_page"], "the defaults stay, each tool once"
+    assert worker.count("--disallowedTools") == 1
+    turn, _ = get_provider("claude").build(read_only=True, disallowed_tools=["mcp__mail__*"], **kw)
+    assert "mcp__mail__*" not in turn
+    for name in ("codex", "cursor", "fake"):
+        get_provider(name).build(read_only=False, disallowed_tools=["mcp__mail__*"], **kw)
+
+
+def test_disallowed_tools_are_validated_and_reach_dispatched_workers(env, monkeypatch, capsys):
+    p = make(env)
+    from ttp import coordinator as coord
+    for bad in ("mcp__mail__*x", "*", "mcp mail", "Bash(rm:*)", "mcp__mail__**"):
+        rejected = coord.apply(p, [{"type": "config_set", "key": "providers.claude.disallowed_tools",
+                                    "value": ["mcp__ok__*", bad]}])
+        assert rejected and "not a tool name or pattern" in rejected[0] and bad in rejected[0], bad
+    assert "disallowed_tools" not in p.config()["providers"].get("claude", {}), "nothing changes on a refusal"
+    assert coord.apply(p, [{"type": "config_set", "key": "providers.claude.disallowed_tools",
+                            "value": "mcp__mail__*, mcp__docs__write_page"}]) == []
+    assert p.config()["providers"]["claude"]["disallowed_tools"] == ["mcp__mail__*", "mcp__docs__write_page"]
+    argv, _, _ = _dispatch_claude_worker(p, monkeypatch, {})
+    assert argv.count("--disallowedTools") == 1
+    tail = argv[argv.index("--disallowedTools"):]
+    assert {"mcp__mail__*", "mcp__docs__write_page", "Workflow"} <= set(tail[:tail.index("--settings")])
+    # A malformed entry written into project.json by hand is skipped, and named.
+    from ttp.project import config_problems
+    p.set_config("providers.claude.disallowed_tools", ["mcp__mail__*", "bad name"])
+    assert any(l.startswith("providers.claude.disallowed_tools: not a tool name or pattern") and "bad name" in l
+               for l in config_problems(p.raw_config()))
+    assert coord.tool_list(p.config()["providers"]["claude"]["disallowed_tools"]) == ["mcp__mail__*"]
+    assert not any("disallowed_tools" in l for l in config_problems({"providers": {"claude": {}}}))
+
+
 def test_doctor_names_unfenced_providers(env, monkeypatch, capsys):
     p = make(env)
     from ttp import cli

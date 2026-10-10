@@ -138,6 +138,8 @@ USER_SETTABLE = {
     "providers.codex.worker_isolation": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     # MCP servers from the user's own Claude config that isolated workers still get, by name.
     "providers.claude.mcp_servers": lambda v: name_list(v, strict=True),
+    # Tools workers and reviewers may not call, on top of the built-in denylist (mcp__<server>__*).
+    "providers.claude.disallowed_tools": lambda v: tool_list(v, strict=True),
     # Hours before an unanswered ask registered with a default falls back to it; 0 turns it off.
     # New asks never get a default, so this only drains asks registered with one.
     "coordinator.ask_timeout_h": float,
@@ -1367,6 +1369,9 @@ def _is_dir(path: str) -> bool:
 
 
 MCP_NAME_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,100}$")
+# A tool workers may not call (providers.claude.disallowed_tools): a tool name such as
+# mcp__<server>__<tool>, or a trailing * for every tool that starts so (mcp__<server>__*).
+TOOL_PATTERN_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,199}\*?$")
 
 
 def effort_triggers(db, cfg: dict, event_ids: list[int], wake_due: str | None,
@@ -1543,7 +1548,8 @@ def raise_effort(effort: str, floor: str) -> str:
     return floor
 
 
-def name_list(v: Any, strict: bool = False) -> list[str]:
+def name_list(v: Any, strict: bool = False, pattern: re.Pattern = MCP_NAME_RE,
+              what: str = "an MCP server name") -> list[str]:
     """Names from a config value: a list, a JSON-encoded list or a comma/newline-separated string."""
     if isinstance(v, str):
         try:
@@ -1552,10 +1558,16 @@ def name_list(v: Any, strict: bool = False) -> list[str]:
             pass
     items = v if isinstance(v, list) else re.split(r"[,\n]", str(v))
     out = list(dict.fromkeys(str(x).strip() for x in items if str(x).strip()))
-    bad = [n for n in out if not MCP_NAME_RE.match(n)]
+    bad = [n for n in out if not pattern.match(n)]
     if strict and bad:
-        raise ValueError(f"not an MCP server name: {', '.join(bad)}; nothing was changed")
+        raise ValueError(f"not {what}: {', '.join(bad)}; nothing was changed")
     return [n for n in out if n not in bad]
+
+
+def tool_list(v: Any, strict: bool = False) -> list[str]:
+    """Tool names or patterns from a config value, as name_list reads server names."""
+    return name_list(v, strict, TOOL_PATTERN_RE, "a tool name or pattern (e.g. mcp__server__tool or "
+                     "mcp__server__*)")
 
 
 def existing_dirs(dirs: list[str]) -> list[str]:
