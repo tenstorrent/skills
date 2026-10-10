@@ -36,8 +36,8 @@ ACTION_TYPES = ("reply", "task_add", "task_update", "ask_user", "resolve", "noti
                 "charter_update", "schedule_set", "config_set", "resource_pause", "observation_mute", "pr_approve",
                 "escalate", "noop")
 
-# A deferred task's `start_after`: `now`, a delay (`90m`, `3d`) or an ISO date or time (local
-# unless it names a zone). Plain character classes, so every provider's schema engine takes it.
+# A deferred task's `start_after`: `now`, a delay (`90m`, `3d`) or an ISO date or time (in the
+# project's home zone unless it names one). Plain character classes, so every provider's schema engine takes it.
 START_AFTER_RE = (r"^(now|[0-9]+ ?[smhdw]|[0-9]{4}-[0-9]{2}-[0-9]{2}([T ][0-9]{2}:[0-9]{2}(:[0-9]{2})?)?"
                   r"(Z|[+-][0-9]{2}:?[0-9]{2})?)$")
 START_WHEN_CHARS = 1000

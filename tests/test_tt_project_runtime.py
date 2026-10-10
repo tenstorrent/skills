@@ -38273,3 +38273,138 @@ def test_a_project_without_a_home_zone_gets_the_account_zone_else_this_machines_
     # The daemon runs it at start, before its first tick.
     src = (RUNTIME / "ttp" / "daemon.py").read_text()
     assert src.index("timefmt.migrate(self.p") < src.index("signal.signal(signal.SIGTERM")
+
+
+def _utc(*a):
+    from datetime import datetime, timezone as dt_timezone
+    return datetime(*a, tzinfo=dt_timezone.utc).timestamp()
+
+
+def test_a_schedule_at_fires_at_the_same_home_time_across_dst_and_shows_its_abbreviation(env):
+    from ttp import schedule as sched
+    la = "America/Los_Angeles"
+    # Spring forward (2026-03-08) and fall back (2026-11-01): 09:00 stays 09:00 local.
+    assert sched.next_run(86400, "09:00", _utc(2026, 3, 7, 18, 0), la) == _utc(2026, 3, 8, 16, 0)    # 09:00 PDT
+    assert sched.next_run(86400, "09:00", _utc(2026, 3, 7, 16, 0), la) == _utc(2026, 3, 7, 17, 0)    # 09:00 PST
+    assert sched.next_run(86400, "09:00", _utc(2026, 10, 31, 17, 0), la) == _utc(2026, 11, 1, 17, 0)  # 09:00 PST
+    p = make(env)
+    p.set_config("home_timezone", la)
+    sched.upsert(p.db, "morning", "command", "1d", "09:00", payload={"command": "true"}, home=la)
+    row = p.db.one("SELECT * FROM schedules WHERE name='morning'")
+    assert row["tz"] is None   # follows the home zone
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    assert datetime.fromtimestamp(row["next_run"], ZoneInfo(la)).strftime("%H:%M") == "09:00"
+    assert re.fullmatch(r"at 09:00 P[DS]T", sched.at_text(row, la))
+    sched.mark_ran(p.db, row, "ok", now=_utc(2026, 3, 7, 18, 0), home=la)
+    assert p.db.one("SELECT next_run FROM schedules WHERE name='morning'")["next_run"] == _utc(2026, 3, 8, 16, 0)
+    # A user who moves on: the row follows the home zone from its next run on.
+    sched.mark_ran(p.db, row, "ok", now=_utc(2026, 3, 7, 18, 0), home="Europe/Berlin")
+    assert p.db.one("SELECT next_run FROM schedules WHERE name='morning'")["next_run"] == _utc(2026, 3, 8, 8, 0)
+    # The web app and `ttp schedules` say it in the home zone.
+    from ttp import web
+    shown = {r["name"]: r for r in web.state_payload(p, p.db)["schedules"]}
+    assert re.fullmatch(r"at 09:00 P[DS]T", shown["morning"]["at_text"])
+    assert "s.at_text" in (RUNTIME / "ttp" / "web" / "app.js").read_text()
+
+
+def test_an_existing_schedule_at_still_fires_at_the_same_instant_after_the_upgrade(env, monkeypatch):
+    """A row from before home zones was read in the daemon's own zone: it is stamped with it, so its
+    'at 09:00' keeps firing at the same instants, even with another home zone and across DST."""
+    from ttp import schedule as sched
+    from ttp.db import DB
+    ny, old_tz = "America/New_York", os.environ.get("TZ")
+    p = make(env)
+    p.set_config("home_timezone", "Asia/Tokyo")
+    try:
+        monkeypatch.setenv("TZ", ny)
+        monkeypatch.setenv("TTP_TEST_LOCAL_TZ", ny)
+        time.tzset()
+        db = p.db
+        # The database as the old runtime left it: no tz column, `at` read in the host's zone.
+        db.x("DELETE FROM schedules")
+        db.x("ALTER TABLE schedules DROP COLUMN tz")
+        after = _utc(2026, 10, 30, 12, 0)
+        old_next = sched.next_run(86400, "09:00", after)   # the old evaluation: this machine's zone
+        db.x("INSERT INTO schedules(name,kind,every_s,at,enabled,payload,next_run) VALUES"
+             "('daily-review','llm',86400,'09:00',1,'{}',?), ('poll','command',600,NULL,1,'{}',?)",
+             (old_next, after + 600))
+        db = DB(db.path)   # the upgraded runtime opens it
+        row = db.one("SELECT * FROM schedules WHERE name='daily-review'")
+        assert row["tz"] == ny and db.one("SELECT tz FROM schedules WHERE name='poll'")["tz"] is None
+        assert row["next_run"] == old_next == _utc(2026, 10, 30, 13, 0)    # 09:00 EDT
+        # It fires as before across the fall-back change (09:00 EST on Nov 2), not at 09:00 in Tokyo.
+        expect, at = [], old_next
+        for _ in range(4):   # what the old runtime would have fired next, each from the last
+            at = sched.next_run(86400, "09:00", at)
+            expect.append(at)
+        fired = []
+        for _ in range(4):
+            row = db.one("SELECT * FROM schedules WHERE name='daily-review'")
+            sched.mark_ran(db, row, "queued", now=row["next_run"], home="Asia/Tokyo")
+            fired.append(db.one("SELECT next_run FROM schedules WHERE name='daily-review'")["next_run"])
+        assert fired == expect and fired[3] == _utc(2026, 11, 3, 14, 0)
+        assert sched.at_text(row, "Asia/Tokyo").endswith(f"({ny})")
+        # Re-applied unchanged (schedules.json, the web app): it keeps its zone. A new `at`: the home zone.
+        sched.upsert(db, "daily-review", "llm", "1d", "09:00", home="Asia/Tokyo")
+        assert db.one("SELECT tz, next_run FROM schedules WHERE name='daily-review'") == {"tz": ny, "next_run": fired[3]}
+        sched.upsert(db, "daily-review", "llm", "1d", "08:00", home="Asia/Tokyo")
+        row = db.one("SELECT * FROM schedules WHERE name='daily-review'")
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        assert row["tz"] is None
+        assert datetime.fromtimestamp(row["next_run"], ZoneInfo("Asia/Tokyo")).strftime("%H:%M") == "08:00"
+    finally:
+        if old_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = old_tz
+        time.tzset()
+
+
+def test_start_after_and_until_are_read_and_shown_in_the_home_zone(env):
+    from ttp import anchors
+    from ttp import coordinator as coord
+    from ttp.db import deferral
+    la = "America/Los_Angeles"
+    now = _utc(2026, 3, 1, 0, 0)
+    assert coord.parse_start_after("2026-03-08T09:00", now, tz=la) == _utc(2026, 3, 8, 16, 0)   # PDT
+    assert coord.parse_start_after("2026-03-07 09:00", now, tz=la) == _utc(2026, 3, 7, 17, 0)   # PST
+    assert coord.parse_start_after("2026-03-08T09:00Z", now, tz=la) == _utc(2026, 3, 8, 9, 0)   # a zone wins
+    p = make(env)
+    p.set_config("home_timezone", la)
+    soon = time.strftime("%Y-%m-%dT09:00", time.gmtime(time.time() + 3 * 86400))
+    assert coord.apply(p, [{"type": "task_add", "title": "soon", "spec": "x", "start_after": soon}]) == []
+    t = p.db.one("SELECT * FROM tasks WHERE title='soon'")
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    after = deferral(t)["after"]
+    assert datetime.fromtimestamp(after, ZoneInfo(la)).strftime("%Y-%m-%dT%H:%M") == soon
+    assert re.search(r"starts \d{4}-\d\d-\d\d 09:00 P[DS]T", coord.starts_text(t, tz=la))
+    assert re.search(r"starts \d{4}-\d\d-\d\d 09:00 P[DS]T", coord.digest(p, {}, [], []))
+    assert anchors.describe("until", str(_utc(2026, 7, 1, 16, 0)), tz=la) == "waits until 2026-07-01 09:00 PDT"
+
+
+def test_digest_daily_review_and_prompt_headers_carry_the_home_zone(env):
+    from ttp import coordinator as coord
+    from ttp import prompts
+    from ttp import pushq
+    p = make(env)
+    p.set_config("home_timezone", "America/Los_Angeles")
+    d = coord.digest(p, {}, [], [])
+    assert re.search(r"^# STATE at \d{4}-\d\d-\d\d \d\d:\d\d P[DS]T \(the project's home zone, America/Los_Angeles\)",
+                     d, re.M), d[:200]
+    tid = p.db.add_task("t", "spec", kind="work")
+    text = prompts.worker_task(p, p.db.task(tid), str(p.root), None)
+    assert re.search(r"home time zone: America/Los_Angeles, now \d{4}-\d\d-\d\d \d\d:\d\d P[DS]T: write times "
+                     r"for the user in it", text)
+    tpl = RUNTIME.parent / "template" / "prompts"
+    assert "home zone" in (tpl / "coordinator.md").read_text() and "home zone" in (tpl / "worker.md").read_text()
+    assert "(HH:MM in the home zone)" in (tpl / "coordinator.md").read_text()
+    # The daily review's delivery line: the home zone, not UTC.
+    m = p.root / "reach.json"
+    m.write_text(json.dumps({"reach": {"ref": "origin/main", "on": False, "behind": 2}}))
+    p.db.x("INSERT INTO push_batches(id,marker,target,started,ended,finalized,outcome,pushed_sha) "
+           "VALUES('b',?,'origin/proj',?,?,?,'pushed','ab12345')", (str(m),) + (_utc(2026, 7, 1, 16, 0),) * 3)
+    assert pushq.target_line(p.db, "America/Los_Angeles").endswith("(as of the last push, 2026-07-01 09:00 PDT)")
+    assert "pushq.target_line(db, timefmt.home(self.p))" in (RUNTIME / "ttp" / "daemon.py").read_text()
