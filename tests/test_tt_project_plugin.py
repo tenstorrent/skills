@@ -498,3 +498,46 @@ def test_the_coordinator_defers_on_a_landing_with_landed_id_not_a_raw_sha():
     assert "Never wait on a raw sha" in coordinator and "`ttp landed <sha>`" in coordinator
     review = " ".join((prompts / "daily-review.md").read_text(encoding="utf-8").split())
     assert "`landed:#<id>`" in review
+
+
+def test_the_forked_test_runner_reports_every_test_once_as_one_process_would(tmp_path):
+    """tests/conftest.py runs the tt-project tests in forked workers: every test runs exactly once,
+    failures, skips and warnings come back as in one process, other files stay in one worker in
+    order, and a worker that dies fails the test it was running instead of losing it."""
+    import shutil
+    import subprocess
+    shutil.copy(pathlib.Path(__file__).with_name("conftest.py"), tmp_path / "conftest.py")
+    (tmp_path / "test_tt_project_sample.py").write_text(
+        "import os, pathlib, warnings, pytest\n"
+        "@pytest.mark.parametrize('i', range(60))\n"
+        "def test_ok(i, tmp_path):\n"
+        "    pathlib.Path(os.environ['OUT'], f'ok-{i}').write_text(str(os.getpid()))\n"
+        "def test_fail(): assert 1 == 2, 'boom'\n"
+        "def test_skip(): pytest.skip('not here')\n"
+        "def test_warn(): warnings.warn('careful', UserWarning)\n"
+        "def test_crash(): os._exit(3)\n")
+    (tmp_path / "test_other.py").write_text(
+        "import os, pathlib\n"
+        "def test_a(): pathlib.Path(os.environ['OUT'], 'a').write_text(str(os.getpid()))\n"
+        "def test_b(): assert pathlib.Path(os.environ['OUT'], 'a').read_text() == str(os.getpid())\n")
+
+    def run(jobs):
+        out = tmp_path / f"out-{jobs}"
+        out.mkdir()
+        env = {**os.environ, "TTP_TEST_JOBS": str(jobs), "OUT": str(out)}
+        r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-rfEs", "-p", "no:cacheprovider", "-W",
+                            "default", str(tmp_path)], cwd=str(tmp_path), env=env, capture_output=True,
+                           text=True, timeout=120)
+        return r, out
+
+    forked, out = run(3)
+    assert forked.returncode == 1, forked.stdout
+    assert "2 failed, 63 passed, 1 skipped, 1 warning" in forked.stdout, forked.stdout
+    assert "FAILED test_tt_project_sample.py::test_fail - AssertionError: boom" in forked.stdout
+    assert "test_tt_project_sample.py::test_crash - the test worker process" in forked.stdout
+    assert "SKIPPED [1] test_tt_project_sample.py:" in forked.stdout and "UserWarning: careful" in forked.stdout
+    pids = {(out / f"ok-{i}").read_text() for i in range(60)}
+    assert len(pids) > 1 and str(os.getpid()) not in pids, "the tests did not run in forked workers"
+    # One process runs the same tests the same way, but for the test that ends its process.
+    single, _ = run(1)
+    assert single.returncode != 0 and "2 failed" not in single.stdout, single.stdout
