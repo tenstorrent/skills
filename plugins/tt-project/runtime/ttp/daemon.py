@@ -4923,7 +4923,9 @@ class Daemon:
     def _workdir_for(self, task: dict) -> tuple[str, str | None]:
         if task["kind"] == "harness":
             return str(self.p.harness), None
-        if worktree.gets_worktree(self.p, task["kind"]) and worktree.is_git(self.p.root):
+        # A task carrying a branch (pr_branch:) works on it in a worktree, whatever its kind.
+        carries = worktree.carried_branch(task) and task["kind"] not in worktree.NEVER_OWN_KINDS
+        if (worktree.gets_worktree(self.p, task["kind"]) or carries) and worktree.is_git(self.p.root):
             path, branch = worktree.ensure(self.p, task)
             return str(path), branch
         return str(self.p.root), None

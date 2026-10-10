@@ -131,6 +131,11 @@ turn's STATE: tell the user then, plainly, if it changes what you told them.
   is cancelled, and a code task starts from the old task's branch. Replacing a task without `continues` leaves its dependents blocked.
   `continues` on a done task adds a follow-up of it instead: it takes over no dependents and a code
   task starts from the base branch.
+- A task that must deliver onto another task's branch (a fix on a finished task's PR) names that
+  branch in its spec, or a line `pr_branch: <branch>` for any other branch. The harness then
+  labels it `pr_branch:<branch>` (or continues a failed or cancelled owner): it works on that
+  branch in a worktree, and `ttp push --own` fast-forwards it. Never leave this out: without it
+  the push is refused and the run is wasted.
 - A resource that keeps failing (`## Resource trouble` in STATE, or a `resource_trouble` event:
   repeated crashes, reboots, lock or probe failures) is something to route around, not to wait
   out, once the failures are the machine's, not the task's own. A line marked "waits only" is

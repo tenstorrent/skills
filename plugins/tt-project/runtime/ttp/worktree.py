@@ -4,6 +4,7 @@
 ignored folder, so parallel workers never share a working tree with each other or the user."""
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -88,8 +89,11 @@ def named_base(p: Project) -> str:
 
 
 def ensure(p: Project, task: dict) -> tuple[Path, str]:
-    """Create (or reuse) the task's worktree. A retried task continues on its own branch."""
-    branch = task.get("branch") or f"ttp/t{task['id']}-{slug(task['title'])}"
+    """Create (or reuse) the task's worktree. A retried task continues on its own branch. A task
+    carrying a branch (`pr_branch:<branch>`) works on that branch when it may (on_carried), else on
+    its own branch from that branch's head."""
+    carried = on_carried(p, task) if not task.get("branch") else ""
+    branch = task.get("branch") or carried or f"ttp/t{task['id']}-{slug(task['title'])}"
     path = p.worktrees / f"t{task['id']}"
     if path.exists() and is_git(path):
         prepare(p, path)
@@ -98,11 +102,42 @@ def ensure(p: Project, task: dict) -> tuple[Path, str]:
     exists = _git(p.root, "rev-parse", "--verify", "--quiet", branch, check=False)
     if exists:
         _git(p.root, "worktree", "add", str(path), branch)
+        if carried:   # a local copy left behind by the remote's catches up, fast-forward only
+            _git(path, "merge", "--ff-only", "--quiet", f"origin/{branch}", check=False)
     else:
         _git(p.root, "fetch", "--quiet", "origin", check=False)
-        _git(p.root, "worktree", "add", "-b", branch, str(path), continued_head(p, task) or resolve_base(p))
+        start = carried_head(p, task) if carried else continued_head(p, task) or carried_head(p, task)
+        _git(p.root, "worktree", "add", "-b", branch, str(path), start or resolve_base(p))
     prepare(p, path)
     return path, branch
+
+
+def carried_branch(task: dict) -> str:
+    """The branch a task's `pr_branch:<branch>` label names (it delivers onto it), or ""."""
+    try:
+        labels = json.loads(task.get("labels") or "[]")
+    except (ValueError, TypeError):
+        return ""
+    return next((lb[10:] for lb in labels if isinstance(lb, str) and lb.startswith("pr_branch:")), "")
+
+
+def on_carried(p: Project, task: dict) -> str:
+    """The task's carried branch when its worktree may check it out: it exists here or on origin,
+    no other worktree holds it, and it is no shared branch (main/master, the push branch or the
+    base work starts from). "" otherwise: the task then works on its own branch."""
+    branch = carried_branch(task)
+    if not branch:
+        return ""
+    d = p.config().get("delivery") or {}
+    shared = {"main", "master"}
+    for ref in (str(d.get("push_branch") or "").strip(), named_base(p)):
+        shared |= {ref, ref.partition("/")[2]} if ref else set()
+    if branch in shared:
+        return ""
+    if f"branch refs/heads/{branch}" in _git(p.root, "worktree", "list", "--porcelain", check=False).splitlines():
+        return ""
+    _git(p.root, "fetch", "--quiet", "origin", check=False)
+    return branch if carried_head(p, task) else ""
 
 
 LINK_PATHS = [".venv"]   # worktree.link_paths: the default
@@ -234,6 +269,16 @@ def continued_head(p: Project, task: dict) -> str | None:
     if not old or not own_worktree(old) or not old["branch"]:
         return None
     for cand in (old["branch"], f"origin/{old['branch']}"):
+        head = _git(p.root, "rev-parse", "--verify", "--quiet", f"{cand}^{{commit}}", check=False)
+        if head:
+            return head
+    return None
+
+
+def carried_head(p: Project, task: dict) -> str | None:
+    """The head of the task's carried branch (carried_branch), so it builds on what it delivers onto."""
+    branch = carried_branch(task)
+    for cand in (branch, f"origin/{branch}") if branch else ():
         head = _git(p.root, "rev-parse", "--verify", "--quiet", f"{cand}^{{commit}}", check=False)
         if head:
             return head

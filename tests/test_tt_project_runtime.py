@@ -28300,6 +28300,105 @@ def test_a_pr_fix_task_publishes_onto_the_prs_branch_whether_it_is_free_or_held(
         push.own_target(p, path)
 
 
+def test_task_add_naming_a_finished_tasks_branch_carries_it(env):
+    """A task_add whose spec names another task's work branch (ttp/t<id>-...) and says nothing of which
+    branch it carries gets `pr_branch:<branch>` (done work) or continues the task (failed or cancelled
+    work), so `ttp push --own` accepts the branch. One that already carries a branch is left alone, and
+    a name that matches no task's branch, or a live task's, is not labelled."""
+    p = make(env)
+    from ttp import coordinator as coord
+
+    def labels(title):
+        return json.loads(p.db.one("SELECT labels FROM tasks WHERE title=?", (title,))["labels"])
+
+    src = p.db.add_task("Speed up the loader", "s", kind="code")
+    b = f"ttp/t{src}-speed-up-the-loader"
+    p.db.update_task(src, status="done", branch=b)
+    # (a) Done work: labelled with the branch, and the coordinator is told.
+    assert coord.apply(p, [{"type": "task_add", "title": "Fix the PR's CI", "kind": "code",
+                            "spec": f"CI fails on the PR from branch `{b}`. Fix it there."}]) == []
+    new = p.db.one("SELECT id FROM tasks WHERE title=?", ("Fix the PR's CI",))["id"]
+    assert labels("Fix the PR's CI") == [f"pr_branch:{b}"]
+    assert any(f"#{new} names #{src}'s branch {b}: labelled pr_branch:{b}" in n for n in p.db.kv(coord.NOTES_KEY))
+    # A never-started task's branch is the name worktree.ensure would give it.
+    idle = p.db.add_task("Tidy the docs", "s", kind="code")
+    p.db.update_task(idle, status="cancelled")
+    # Failed or cancelled work is continued instead (it takes over its dependents).
+    dep = p.db.add_task("after the docs", "s", depends_on=[idle])
+    assert coord.apply(p, [{"type": "task_add", "title": "Docs again", "kind": "code",
+                            "spec": f"Pick up ttp/t{idle}-tidy-the-docs and finish it."}]) == []
+    again = p.db.one("SELECT id FROM tasks WHERE title='Docs again'")["id"]
+    assert labels("Docs again") == [f"continues:{idle}"]
+    assert json.loads(p.db.task(dep)["depends_on"]) == [again]
+    # (b) Already carrying a branch: left alone.
+    gone = p.db.add_task("Port the parser", "s", kind="code")
+    p.db.update_task(gone, status="failed", branch=f"ttp/t{gone}-port-the-parser")
+    assert coord.apply(p, [{"type": "task_add", "title": "Parser, smaller", "kind": "code", "continues": gone,
+                            "spec": f"Finish ttp/t{gone}-port-the-parser in a smaller scope."}]) == []
+    assert labels("Parser, smaller") == [f"continues:{gone}"]
+    assert coord.apply(p, [{"type": "task_add", "title": "Fix the feature PR", "kind": "code",
+                            "spec": f"pr_branch: `feature/fast-io`\nLike {b}, but on the feature branch."}]) == []
+    assert labels("Fix the feature PR") == ["pr_branch:feature/fast-io"]
+    # (c) No such task, a branch that is not the task's, a live task's branch, or a review: no label.
+    live = p.db.add_task("Rewrite the cache", "s", kind="code")
+    p.db.update_task(live, status="running", branch=f"ttp/t{live}-rewrite-the-cache")
+    for title, kind, spec in (("Nothing named", "code", "Work from ttp/t99999-no-such-task please."),
+                              ("Wrong slug", "code", f"Work from ttp/t{src}-another-name please."),
+                              ("Live branch", "code", f"Help ttp/t{live}-rewrite-the-cache along."),
+                              ("Review the loader", "review", f"Review {b}.")):
+        assert coord.apply(p, [{"type": "task_add", "title": title, "kind": kind, "spec": spec}]) == [], title
+        assert not [x for x in labels(title) if x.startswith(("pr_branch:", "continues:"))], title
+
+
+def test_a_task_carrying_a_branch_works_on_it_in_a_worktree_and_publishes_onto_it(env, monkeypatch, capsys):
+    """A task labelled pr_branch:<branch>, of any kind but review or harness, runs in a worktree on that
+    branch (made from the remote's when there is no local one) and `ttp push --own` fast-forwards it.
+    When it cannot check the branch out (another worktree holds it, or it is a shared branch), the task
+    works on its own branch from that branch's head."""
+    from pathlib import Path
+    from ttp import prompts, push, worktree
+    from ttp.daemon import Daemon
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    src = p.db.add_task("Speed up the loader", "s", kind="code")
+    b = f"ttp/t{src}-speed-up-the-loader"
+    p.db.update_task(src, status="done", branch=b)
+    _git_out(repo, "branch", b)
+    wt = env["tmp"] / "pr"
+    _git_out(repo, "worktree", "add", "-q", str(wt), b)
+    _commit(wt, "pr.txt", "pr\n")
+    _git_out(wt, "push", "-q", "origin", f"HEAD:refs/heads/{b}")
+    _git_out(repo, "worktree", "remove", str(wt))
+    _git_out(repo, "branch", "-D", b)   # only the remote has it now
+    d = Daemon(p.base)
+    task = p.db.task(p.db.add_task("Answer the PR comments", "s", kind="work",
+                                   labels=[f"continues:{src}", f"pr_branch:{b}"]))
+    cwd, branch = d._workdir_for(task)
+    assert Path(cwd) == p.worktrees / f"t{task['id']}" and branch == b
+    assert _git_out(cwd, "rev-parse", "HEAD") == _git_out(origin, "rev-parse", b)
+    assert f"delivers onto branch {b}" in prompts.worker_task(p, task, cwd, branch)
+    _commit(Path(cwd), "fix.txt", "fix\n")
+    monkeypatch.chdir(cwd)
+    monkeypatch.setenv("TTP_TASK", str(task["id"]))
+    assert push.resolve(p, Path(cwd), own=True) == ("origin", b, True)
+    assert _ttp("push", "--own") == 0, capsys.readouterr().err
+    assert _git_out(origin, "rev-parse", b) == _git_out(cwd, "rev-parse", "HEAD")
+    # Held by that worktree: the next one works on its own branch from the carried branch's head.
+    monkeypatch.chdir(repo)
+    held = p.db.task(p.db.add_task("More PR comments", "s", kind="work", labels=[f"pr_branch:{b}"]))
+    cwd2, branch2 = d._workdir_for(held)
+    assert branch2 == f"ttp/t{held['id']}-more-pr-comments"
+    assert _git_out(cwd2, "rev-parse", "HEAD") == _git_out(origin, "rev-parse", b)
+    monkeypatch.setenv("TTP_TASK", str(held["id"]))
+    assert push.resolve(p, Path(cwd2), own=True) == ("origin", b, True)
+    # A shared branch is never checked out as the task's branch.
+    shared = p.db.task(p.db.add_task("On the push branch", "s", kind="code", labels=["pr_branch:proj"]))
+    assert worktree.on_carried(p, shared) == ""
+    assert d._workdir_for(shared)[1] == f"ttp/t{shared['id']}-on-the-push-branch"
+    # A review still works in the change's worktree.
+    review = p.db.task(p.db.add_task("Review it", "s", kind="review", labels=[f"pr_branch:{b}"]))
+    assert d._workdir_for(review) == (str(p.root), None)
+
+
 def test_pr_findings_wait_for_the_delivering_tasks_review_chain_and_a_pr_has_one_fixer(env, monkeypatch):
     """While the done task's review, or the daemon's fix and re-review of it, is open, PR findings
     queue no PR fix: that stack owns them. A review that fails while a PR fix is open hands its

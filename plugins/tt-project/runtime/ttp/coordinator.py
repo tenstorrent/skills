@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from . import locks
-from . import anchors, effort, ends, heal, jevuse, machines, pauseends, prguard, push, reviewcap, shared, unblock, upstream
+from . import anchors, effort, ends, heal, jevuse, machines, pauseends, prguard, push, reviewcap, shared, unblock, upstream, worktree
 from . import screen as scr
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
@@ -865,6 +865,23 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     # Done work is not taken over: the new task is a follow-up that starts fresh
                     # (a code task from the delivery branch tip, not the old branch).
                     old = None
+                # A task on another branch carries it (worktree on it, `ttp push --own` onto it): one a
+                # `pr_branch: <branch>` line names, else a finished task's work branch the spec names.
+                # Failed or cancelled work is continued then (taken over); done work is not.
+                spec_text = a.get("spec") or ""
+                given = None if review else SPEC_PR_BRANCH.search(spec_text)
+                carried = None if review or given else _named_branch(db, spec_text)
+                if carried and old and old["id"] == carried[0]["id"]:
+                    carried = None   # it continues that branch's task already
+                elif carried and a.get("continues") is None and carried[0]["status"] in ("failed", "cancelled"):
+                    try:
+                        old = _continued(db, carried[0]["id"], deps)
+                    except ValueError:
+                        old = None
+                taken = bool(carried and old and old["id"] == carried[0]["id"])
+                onto = given.group(1) if given else carried[1] if carried and not taken else ""
+                if onto:
+                    labels.append(f"pr_branch:{onto}")
                 if old:
                     labels.append(f"continues:{old['id']}")
                 after, when = _start_args(a, {})
@@ -890,6 +907,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                             db.update_task(old["id"], status="cancelled", blocked_reason=f"continued by #{new_id}")
                 if followup:
                     notes.append(f"task_add: #{followup['id']} is done; added #{new_id} as its follow-up")
+                if carried:
+                    how = f"continues #{old['id']}" if taken else f"labelled pr_branch:{carried[1]}"
+                    notes.append(f"task_add: #{new_id} names #{carried[0]['id']}'s branch {carried[1]}: {how}, "
+                                 f"so `ttp push --own` publishes onto it")
                 if pr_ask:
                     notes.append(f"task_add: #{new_id} added as `code`, not `{a.get('kind') or 'work'}`: it asks for "
                                  f"PR delivery ({pr_ask!r}) and only code tasks open or update PRs")
@@ -1336,6 +1357,24 @@ def _continued(db, raw: Any, deps: list[int]) -> dict:
         raise ValueError(f"task_add depends_on {deps} would create a cycle: it waits on a task that "
                          f"waits on #{old['id']}")
     return old
+
+
+# A task's own work branch named in a spec (worktree.ensure names them ttp/t<id>-<slug>), and a
+# spec line naming the branch a task delivers onto.
+NAMED_BRANCH = re.compile(r"(?<![\w/.-])ttp/t(\d+)-[\w./-]*[\w-]")
+SPEC_PR_BRANCH = re.compile(r"(?<![\w-])pr_branch:\s*`?([A-Za-z0-9][\w./-]*[\w-])`?")
+
+
+def _named_branch(db, spec: str) -> tuple[dict, str] | None:
+    """(task, branch) when `spec` names the work branch of one finished task (done, failed or
+    cancelled; a live one still owns it); None when it names none, or branches of several tasks."""
+    found: dict[int, tuple[dict, str]] = {}
+    for m in NAMED_BRANCH.finditer(spec):
+        t = db.task(int(m.group(1)))
+        if t and t["status"] in ("done", "failed", "cancelled") \
+                and m.group(0) == (t["branch"] or f"ttp/t{t['id']}-{worktree.slug(t['title'])}"):
+            found[t["id"]] = (t, m.group(0))
+    return next(iter(found.values())) if len(found) == 1 else None
 
 
 def _open_dependents(db, task_id: int) -> list[dict]:
