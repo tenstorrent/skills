@@ -10,13 +10,13 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from opa_schema import (  # noqa: E402
-    CALL_TRACE_COLUMNS, CONFIDENCE_VALUES, PROFILES, STATUS_VALUES,
+    CALL_TRACE_COLUMNS, CONFIDENCE_VALUES, CSV_ENCODING, PROFILES, STATUS_VALUES,
     op_table_columns, read_csv, status_columns,
 )
 
 
 def _header(path: pathlib.Path) -> list[str]:
-    with path.open(newline="", encoding="utf-8") as fh:
+    with path.open(newline="", encoding=CSV_ENCODING) as fh:
         return next(csv.reader(fh), [])
 
 

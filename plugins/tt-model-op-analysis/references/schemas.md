@@ -2,6 +2,9 @@
 
 `<p>` is a profile: `p100`, `p150`. Quasar uses its own columns.
 
+All CSVs are UTF-8 with a BOM (`utf-8-sig`) so Excel and Numbers show the status emoji;
+write them with `opa_schema.write_csv` or open files with `encoding="utf-8-sig"`.
+
 ## op_table.csv (static, one row per unique device-op variant)
 
 `id` (1..N in row order), `stage`, `ttnn_api`, `op_code` (Tracy OP CODE, e.g.

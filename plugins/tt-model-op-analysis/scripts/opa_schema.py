@@ -36,13 +36,18 @@ def status_columns(profiles: list[str]) -> list[str]:
     return cols
 
 
+# utf-8-sig: reading tolerates a BOM, writing adds one so Excel and Numbers decode the
+# status emoji as UTF-8 instead of Mac Roman.
+CSV_ENCODING = "utf-8-sig"
+
+
 def read_csv(path: pathlib.Path) -> list[dict[str, str]]:
-    with pathlib.Path(path).open(newline="", encoding="utf-8") as fh:
+    with pathlib.Path(path).open(newline="", encoding=CSV_ENCODING) as fh:
         return list(csv.DictReader(fh))
 
 
 def write_csv(path: pathlib.Path, columns: list[str], rows: list[dict]) -> None:
-    with pathlib.Path(path).open("w", newline="", encoding="utf-8") as fh:
+    with pathlib.Path(path).open("w", newline="", encoding=CSV_ENCODING) as fh:
         writer = csv.DictWriter(fh, fieldnames=list(columns), extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)

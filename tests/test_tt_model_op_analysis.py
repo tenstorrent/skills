@@ -142,7 +142,7 @@ def sign(name, ts):
 
 
 def read(path):
-    with path.open(newline="", encoding="utf-8") as fh:
+    with path.open(newline="", encoding="utf-8-sig") as fh:
         return list(csv.DictReader(fh))
 
 
@@ -387,3 +387,20 @@ def test_root_readme_installs_plugin_on_both_hosts():
     readme = (REPO / "README.md").read_text(encoding="utf-8")
     assert "codex plugin add tt-model-op-analysis@tenstorrent-skills" in readme
     assert "/plugin install tt-model-op-analysis@tenstorrent-skills" in readme
+
+
+def test_validator_accepts_bom_csv(tmp_path):
+    run = make_static_run(tmp_path, [op_row(1, 1)], [trace_row(1, 1, 1)])
+    for name in ("op_table.csv", "call_trace.csv"):
+        path = run / name
+        path.write_bytes(b"\xef\xbb\xbf" + path.read_bytes())
+    result = run_script("validate_static.py", str(run))
+    assert result.returncode == 0, result.stdout
+
+
+def test_written_csvs_carry_bom_for_spreadsheet_apps(tmp_path):
+    src = ops_csv(tmp_path / "ops.csv", [dev("MatmulDeviceOperation", 0, 1, 8, 1)])
+    out = tmp_path / "out"
+    assert run_script("tracy_report.py", str(src), str(out)).returncode == 0
+    for name in ("measured_ops.csv", "host_fallback.csv", "footprint.csv"):
+        assert (out / name).read_bytes().startswith(b"\xef\xbb\xbf"), name
