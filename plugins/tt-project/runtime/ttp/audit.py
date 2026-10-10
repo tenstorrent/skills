@@ -7,13 +7,13 @@ the project could have saved. Model-free; the review grades it.
   took), asks the ask gate refused, and answers that handed the decision back ("decide yourself");
 - worker runs that failed (a reboot, sleep, lost network or a resume is not a failure) and tasks
   run again after a failed attempt;
-- coordinator turns that decided nothing (no action but `noop`) and idle wakes (woken by the idle
-  timer alone, with no message or event), with their cost;
+- coordinator turns that decided nothing (no action but `noop`, or an escalate), and idle and
+  starve wakes (woken by the idle or idle-slot timer alone, with no message or event), with their cost;
 - spend per finished task: the workers' own, and the coordinator's day spread over them;
 - tasks blocked longer than `blocked_h` hours now;
 - review loops: per change whose review moved in the window, its review rounds and their spend
   plus the fixes they asked for (a review's `auto_review:<task>` and `continues:<review>` labels);
-- overrides held longer than `blocked_h`: resource pauses and mutes, and temporary instructions
+- overrides held longer than `blocked_h`: resource pauses and active mutes, and temporary instructions
   whose end only a model can judge that were listed as possibly over a day or more ago.
 
 An empty day is one line, NOTHING."""
@@ -23,7 +23,7 @@ import json
 import time
 from typing import Any
 
-from . import ends, unblock
+from . import budget, ends, unblock
 from .db import DB
 from .project import Project
 
@@ -83,12 +83,12 @@ def rejected_asks(db: DB, since: float) -> list[str]:
 
 
 def failed_runs(db: DB, since: float) -> list[dict]:
-    """Worker runs that ended since `since` in a failure of their own, most costly first."""
+    """Worker runs that ended since `since` in a failure of their own (budget.wasted: what the
+    runaway guard counts as waste), most costly first."""
     rows = db.q("SELECT r.id, r.task, r.status, r.cost_usd, r.note, t.title FROM runs r LEFT JOIN tasks t "
                 "ON t.id=r.task WHERE r.role!='coordinator' AND r.ended>=? AND r.status NOT IN ('ok','running')",
                 (since,))
-    rows = [r for r in rows if not _note(r["note"]).get("not_waste")]
-    return sorted(rows, key=lambda r: -float(r["cost_usd"] or 0))
+    return sorted([r for r in rows if budget.wasted(r)], key=lambda r: -float(r["cost_usd"] or 0))
 
 
 def retried_tasks(db: DB, since: float) -> list[dict]:
@@ -98,17 +98,20 @@ def retried_tasks(db: DB, since: float) -> list[dict]:
 
 
 def coordinator_turns(db: DB, since: float) -> dict:
-    """Coordinator turns since `since`: all, those that decided nothing and idle wakes, with costs.
-    A turn decided nothing when its note says `decided` 0 (turns before that was logged are not
-    counted); an idle wake was due to the idle timer with no message or event in its batch."""
+    """Coordinator turns since `since`: all, those that decided nothing, idle wakes and starve wakes,
+    with costs. A turn decided nothing when its note says `decided` 0 (turns before that was logged
+    are not counted; an escalated turn decided nothing itself); an idle or starve wake was due to the
+    idle timer or the idle-slot (starve) timer with no message or event in its batch."""
     rows = db.q("SELECT note, cost_usd FROM runs WHERE role='coordinator' AND status='ok' AND started>=?", (since,))
-    out = {"n": len(rows), "usd": 0.0, "noop": 0, "noop_usd": 0.0, "idle": 0, "idle_usd": 0.0, "logged": 0}
+    out = {"n": len(rows), "usd": 0.0, "noop": 0, "noop_usd": 0.0, "idle": 0, "idle_usd": 0.0,
+           "starve": 0, "starve_usd": 0.0, "logged": 0}
     for r in rows:
         note, usd = _note(r["note"]), float(r["cost_usd"] or 0)
         out["usd"] += usd
-        if note.get("wake_due") and not note.get("messages") and not note.get("events"):
-            out["idle"] += 1
-            out["idle_usd"] += usd
+        due = "starve" if note.get("wake_due") == "starve" else "idle" if note.get("wake_due") else None
+        if due and not note.get("messages") and not note.get("events"):
+            out[due] += 1
+            out[f"{due}_usd"] += usd
         if "decided" in note:
             out["logged"] += 1
             if not note["decided"]:
@@ -168,16 +171,16 @@ def review_loops(db: DB, since: float) -> list[dict]:
 
 
 def overrides(p: Project | None, db: DB, now: float, hours: float) -> list[str]:
-    """Overrides held longer than `hours`: resource pauses, mutes, and temporary instructions whose
+    """Overrides held longer than `hours`: resource pauses, active mutes, and temporary instructions whose
     end only a model can judge, listed as possibly over at least ends.RECHECK_S ago."""
-    from .screen import MUTES_KEY
+    from .screen import mutes
     out = []
     for name, v in sorted(db.paused_resources(shared=False).items()):
         age = now - float(v.get("since") or now)
         if age > hours * 3600:
             out.append(f"resource {name} paused {_dur(age)} by {v.get('by') or 'unknown'}"
                        + (f" ({_short(v['reason'], 80)})" if v.get("reason") else ""))
-    for m in db.kv(MUTES_KEY, []) or []:
+    for m in mutes(db, now):
         age = now - float(m.get("since") or now)
         if age > hours * 3600:
             out.append(f"mute of {m.get('source')} {str(m.get('match'))[:60]!r} held {_dur(age)}, "
@@ -237,7 +240,8 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
                 "turns that decided nothing: not logged")
         part = f" of {turns['logged']} logged" if turns["logged"] and turns["logged"] < turns["n"] else ""
         out.append(f"coordinator turns: {turns['n']}, ${turns['usd']:.2f}; {noop}{part}; "
-                   f"{turns['idle']} idle wakes (${turns['idle_usd']:.2f})")
+                   f"{turns['idle']} idle wakes (${turns['idle_usd']:.2f}), "
+                   f"{turns['starve']} starve wakes (${turns['starve_usd']:.2f})")
     done = finished(db, since)
     if done:
         work = sum(float(t["spent_usd"] or 0) for t in done)

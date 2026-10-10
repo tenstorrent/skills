@@ -1956,7 +1956,7 @@ def test_the_audit_grades_asks_answers_rejections_and_waste(env):
     assert "asks refused by the ask gate: 2" in out and "asks: 2 sent, 1 answered, 1 handed back" in out
     assert "failed worker runs: 1, $0.70" in out, "a run lost to a reboot is not a failure"
     assert f"tasks run again after a failed attempt: 1: #{task} flaky build (attempt 2, done, $1.50)" in out
-    assert "coordinator turns: 2, $0.30; 1 decided nothing ($0.05); 1 idle wakes ($0.05)" in out
+    assert "coordinator turns: 2, $0.30; 1 decided nothing ($0.05); 1 idle wakes ($0.05), 0 starve wakes ($0.00)" in out
     assert "finished tasks: 1 (1 done), workers $1.50 ($1.50 each), coordinator $0.30" in out
     assert old not in rows
 
@@ -2009,6 +2009,51 @@ def test_a_coordinator_turn_logs_what_it_decided_and_its_rejections(env):
     assert note["decided"] == 1 and note["wake_due"] == "idle"
     data = json.loads(p.db.one("SELECT data FROM events WHERE kind='rejected_actions'")["data"])
     assert len(data) == 1 and data[0].startswith("ask_user:")
+
+def test_the_daily_review_never_lifts_a_pause_the_user_set():
+    review = " ".join((RUNTIME.parent / "template" / "prompts" / "daily-review.md").read_text().split())
+    assert "A resource pause the user set is never lifted without the user's word" in review
+    assert "propose an end condition, or ask the user" in review
+
+
+def test_the_audit_lists_only_active_mutes(env):
+    from ttp import audit
+    from ttp.screen import MUTES_KEY
+    p = make(env)
+    now = time.time()
+    p.db.set_kv(MUTES_KEY, [{"source": "watch", "match": "live", "since": now - 30 * 3600, "until": now + 3600},
+                            {"source": "watch", "match": "ended", "since": now - 30 * 3600, "until": now - 60}])
+    held = audit.overrides(None, p.db, now, 12)
+    assert any("'live'" in h for h in held) and not any("'ended'" in h for h in held), held
+
+
+def test_the_audit_counts_failed_runs_as_the_runaway_guard_counts_waste(env):
+    from ttp import audit, budget
+    p = make(env)
+    now = time.time()
+    run = "INSERT INTO runs(role,started,ended,status,cost_usd,note) VALUES('worker',?,?,?,?,?)"
+    for status, note in (("failed", "{}"), ("no_handoff", "not json"), ("shutdown", "{}"), ("auth", "{}"),
+                         ("cancelled", "{}"), ("lost", json.dumps({"not_waste": "reboot"}))):
+        p.db.x(run, (now - 600, now - 500, status, 0.5, note))
+    got = sorted(r["status"] for r in audit.failed_runs(p.db, now - 86400))
+    assert got == ["failed", "no_handoff"]
+    assert got == sorted(r["status"] for r in p.db.q("SELECT status, note FROM runs") if budget.wasted(r))
+
+
+def test_the_audit_reports_starve_wakes_apart_from_idle_wakes(env):
+    from ttp import audit
+    p = make(env)
+    now = time.time()
+    run = "INSERT INTO runs(role,started,status,cost_usd,note) VALUES('coordinator',?,'ok',?,?)"
+    p.db.x(run, (now - 900, 0.05, json.dumps({"wake_due": "idle", "decided": 0})))
+    p.db.x(run, (now - 800, 0.10, json.dumps({"wake_due": "starve", "decided": 1})))
+    p.db.x(run, (now - 700, 0.20, json.dumps({"wake_due": "starve", "decided": 0})))
+    p.db.x(run, (now - 600, 0.40, json.dumps({"wake_due": "starve", "events": [1], "decided": 1})))
+    turns = audit.coordinator_turns(p.db, now - 86400)
+    assert (turns["idle"], turns["starve"]) == (1, 2)
+    assert turns["idle_usd"] == pytest.approx(0.05) and turns["starve_usd"] == pytest.approx(0.30)
+    assert "1 idle wakes ($0.05), 2 starve wakes ($0.30)" in "\n".join(audit.lines(p.db, now))
+
 
 def test_command_watcher_repeats_wake_the_coordinator(env, monkeypatch):
     p = make(env)
@@ -22701,6 +22746,28 @@ def _escalate_turn(env, monkeypatch, pin=""):
            (clock[0], "daemon", "task_done", "normal", "#1 done", "queued"))
     clock[0] += 600
     return p, d, clock, calls
+
+
+@pytest.mark.parametrize("pin", ["", "low"])
+def test_an_escalated_or_requeued_turn_is_logged_as_deciding_nothing(env, monkeypatch, pin):
+    """A turn that escalated (pin "") or whose only escalate was refused and its batch requeued
+    (pin "low") decided nothing: its run note says decided 0, so the audit counts it."""
+    from types import SimpleNamespace
+    from ttp import audit
+    from ttp import coordinator as coord
+    p, d, clock, calls = _escalate_turn(env, monkeypatch, pin=pin)
+    d.maybe_coordinate()
+    (_, k), = calls
+    rid = p.db.x("INSERT INTO runs(role,started,status,cost_usd,note) VALUES('coordinator',?,'ok',0.1,'{}')",
+                 (clock[0],))
+    only = SimpleNamespace(structured={"actions": [{"type": "escalate", "why": "harder"}], "summary": ""},
+                           error="", final_text="")
+    d._finish_coordinator({"dir": "x", "id": rid, "effort": "low"}, only, "ok", k["note"])
+    assert bool(p.db.kv(coord.ESCALATE_KEY)) == (not pin)
+    assert p.db.one("SELECT COUNT(*) n FROM events WHERE status='queued'")["n"] == 1, "its batch stays queued"
+    assert json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (rid,))["note"])["decided"] == 0
+    turns = audit.coordinator_turns(p.db, clock[0] - 60)
+    assert (turns["logged"], turns["noop"]) == (1, 1) and turns["noop_usd"] == pytest.approx(0.1)
 
 
 def test_a_pinned_routine_turn_is_not_offered_escalate_and_a_returned_one_is_rejected(env, monkeypatch):

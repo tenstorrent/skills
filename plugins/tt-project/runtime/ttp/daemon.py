@@ -1810,6 +1810,7 @@ class Daemon:
                 log(self.p, f"coordinator turn {r.get('id')} escalated to high effort: {why}")
                 # Jev called it routine (if it was asked), and the turn found it was not
                 self._settle_coord_check(checked, "escalated", actions, [])
+                self._log_decided(r, note, 0)
                 return   # its messages and events stay queued for the rerun
             refused = [f"escalate: refused ({why_not}); decide at this effort"]
             # A turn that returned only a refused escalate decided nothing: its batch goes to the next
@@ -1826,6 +1827,7 @@ class Daemon:
             self._record_rejections(refused)
             self._settle_coord_check(checked, status, actions, refused, float(getattr(usage, "cost_usd", 0) or 0))
             db.set_kv("last_coordinator_summary", {"ts": time.time(), "summary": (out or {}).get("summary", "")})
+            self._log_decided(r, note, 0)
             return
         default_chat = note.get("default_chat")
         problems = coord.apply(self.p, actions, default_chat=default_chat, user_turn=bool(note.get("messages")),
@@ -1837,12 +1839,15 @@ class Daemon:
         if evs:
             db.x(f"UPDATE events SET status='handled' WHERE id IN ({','.join('?' * len(evs))})", evs)
         problems = refused + list(problems)
-        # What the turn decided, for the daily review's audit of turns that decided nothing.
-        note = {**note, "decided": len(_decisions(actions))}
-        db.x("UPDATE runs SET note=? WHERE id=?", (json.dumps(note), r.get("id")))
+        self._log_decided(r, note, len(_decisions(actions)))
         self._record_rejections([x[:500] for x in problems])
         self._settle_coord_check(checked, status, actions, problems, float(getattr(usage, "cost_usd", 0) or 0))
         db.set_kv("last_coordinator_summary", {"ts": time.time(), "summary": (out or {}).get("summary", "")})
+
+    def _log_decided(self, r: dict, note: dict, decided: int) -> None:
+        """What the turn decided, for the daily review's audit of turns that decided nothing. A turn
+        that escalated, or whose batch was requeued after a refused escalate, decided nothing."""
+        self.p.db.x("UPDATE runs SET note=? WHERE id=?", (json.dumps({**note, "decided": decided}), r.get("id")))
 
     def _escalate_refusal(self, r: dict, note: dict, actions: list, batch: list, counts: dict) -> str:
         """Why a turn's `escalate` is refused, or "" when its batch reruns at high effort."""

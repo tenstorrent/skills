@@ -28,7 +28,8 @@ Assess the last day of this project, then hand off.
    again needs a prompt rule. Then name the top 1-3 inefficiencies (failed or retried runs, turns
    that decided nothing, idle wakes, costly tasks, review loops, long blocks) with their cost and a
    fix. An override held past its premise (a pause, a mute, a temporary instruction possibly over)
-   is retired if it clearly is over, else gets an end condition. In the
+   is retired if it clearly is over, else gets an end condition. A resource pause the user set is
+   never lifted without the user's word: propose an end condition, or ask the user. In the
    summary: one line, `needless asks: N of M` and the top inefficiency. `nothing to grade`: say so
    in a few words.
 6. Memory: retire entries that are stale, done or replaced: `ttp memory <name> --forget <entry>`
