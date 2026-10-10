@@ -246,7 +246,10 @@ and preferences you add later become part of the project's charter and memory.
   runner adopts them). A task queues each device job with
   `ttp devq submit <runner> --id <id> [--config <key>] [--timeout <s>] -- <command>` and waits on
   `ttp devq probe <runner> <id>`, which exits 0 once the job's done marker is written (done, failed
-  or skipped, with exit code and log) or once no runner is alive while the job waits. The runner is
+  or skipped, with exit code and log), 1 while it waits and 3 while it waits with no runner alive:
+  the project's daemon then runs `ttp devq start <runner>` itself, without a model, at most every
+  10 min and `device.runner_restarts_per_day` (default 6) times a day per runner, and queues one
+  harness task to fix the runner after two failed restarts in a row or the day's cap. The runner is
   started under a lock (a second start does nothing), runs jobs in arrival order, runs a job again
   after a drop or a host reboot, and skips a config that dropped `max_drops` times in a row until
   `ttp devq clear <runner> <config>`; drops go to its `drops.log`. `ttp devq status` shows the queue.

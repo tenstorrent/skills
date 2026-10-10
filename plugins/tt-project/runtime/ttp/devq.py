@@ -59,6 +59,7 @@ RUNNER_DEFAULTS = {
     "disk_paths": [],          # the disks disk_max_pct watches ([] = / and the runner's state folder)
 }
 _CHOICES = {"script_lint": ("", "warn", "refuse"), "netfs_policy": ("warn", "refuse")}
+RUNNER_DOWN_RC = 3   # probe: the job is pending and no runner is alive (the daemon restarts it)
 ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
 NAME_RE = ID_RE
 STATUSES = ("done", "failed", "skipped")
@@ -769,8 +770,9 @@ def legacy_drivers(d: Path, pattern: str) -> list:
 
 
 def probe(d: Path, job: str) -> int:
-    """retry_when probe, read-only: 0 once job's marker exists, the job is unknown, or it is pending with
-    no runner alive (the waking run restarts it with `ttp devq start`); 1 while a live runner has it."""
+    """retry_when probe, read-only: 0 once job's marker exists or the job is unknown; 1 while a live
+    runner has it (or an old per-task driver still runs); RUNNER_DOWN_RC while it is pending with no
+    runner alive: the project's daemon then runs `ttp devq start` itself and the task sleeps on."""
     at = where_is(d, job)
     if at == "done":
         m = _load(d / "done" / f"{job}.json")
@@ -784,8 +786,8 @@ def probe(d: Path, job: str) -> int:
         if legacy:
             print(f"{job}: {at}; no runner yet: an old per-task driver still runs ({legacy[0]})")
             return 1
-        print(f"{job}: {at}, but no runner is alive: run `ttp devq start` and wait again")
-        return 0
+        print(f"{job}: {at}, but no runner is alive (runner down): `ttp devq start` brings it back")
+        return RUNNER_DOWN_RC
     print(f"{job}: {at}")
     return 1
 

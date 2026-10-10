@@ -163,7 +163,8 @@ never write to a run folder named in earlier context):
   `--timeout` above it; size the job, and any reservation its command makes, to fit. It prints the
   `retry_when`; with several jobs,
   submit them in order and wait on the last. On wake, `ttp devq status <runner> <id>` shows its marker
-  (done, failed or skipped, exit code, log, drops). No marker and no runner alive: run
+  (done, failed or skipped, exit code, log, drops). A runner that dies while you sleep is restarted
+  by the harness, model-free. Woken anyway with no marker and no runner alive: run
   `ttp devq start <runner>` and hand off `waiting` again on the same probe (also when it says an old
   per-task driver still runs: the runner starts on a later wake).
   When your task header gives a device job timeout ceiling, keep every device timeout within it: the

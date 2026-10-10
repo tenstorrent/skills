@@ -82,14 +82,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     # A waiting task whose `retry_when` probe still says "not yet" sleeps on. This long after its
     # hand-off the coordinator is asked once (`wait_stale`) to fix the probe or cancel; it still sleeps.
-    "waiting": {"max_hold_s": 21600},
+    "waiting": {"max_hold_s": 21600,
+                # a queued task whose start_when says not yet this long while it names a device or
+                # serving resource is raised once (0: never)
+                "start_resource_stale_s": 10800},
     "resources": {},                    # shared-slot limits, e.g. {"device": 1}
     # Lock names that all mean the one device (they share one `ttp lock` slot), and how many tasks
     # tagged needs_device may run at once; `ttp lock` admits one of them at a time to the device.
     # runners: serial device-job runners by name, each {"host", "dir", "health", "drop_check", ...}
     # (devq.RUNNER_DEFAULTS); tasks queue device jobs on one with `ttp devq submit` instead of each
     # running its own detached driver. Empty: none, and workers keep the detached-driver path.
-    "device": {"locks": [], "max_tasks": 2, "runners": {}},
+    "device": {"locks": [], "max_tasks": 2, "runners": {}, "runner_restarts_per_day": 6},
     "shared_resources": [],             # resources whose slots and pause all the user's projects share
     # model / effort, when set, override the coordinator tier's for the coordinator only.
     # unblock_effort: the least effort of a tricky or blocking turn (coordinator.effort_triggers);

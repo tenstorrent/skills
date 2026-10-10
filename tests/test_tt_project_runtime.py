@@ -7589,10 +7589,12 @@ def test_a_broken_command_schedule_can_be_turned_off_without_a_command(env):
     sched.upsert(p.db, "probe", "command", "30m", payload={"spec": "python3 check.py", "tier": "light"})
     d = Daemon(p.base)
     d.gates = {}
-    for _ in range(2):
+    for _ in range(3):
         p.db.x("UPDATE schedules SET next_run=? WHERE name='probe'", (time.time() - 1,))
         d.run_schedules()
         d.sweep_alerts()
+        if fix := p.db.one("SELECT id FROM tasks WHERE labels LIKE '%schedule_fix:probe%'"):
+            p.db.update_task(fix["id"], status="failed")   # its fix task could not fix it: now the alert
     assert [m for m in alerts.needs_you(p.db, time.time()) if "probe" in m["text"]]
     # Enabling it without a command is still rejected.
     out = coord.apply(p, [{"type": "schedule_set", "name": "probe", "enabled": True}])
@@ -7630,14 +7632,28 @@ def test_a_schedule_failing_twice_raises_one_alert_that_clears_on_an_ok_run(env)
     assert not live()   # one failure may be a fluke
     assert "schedules failing: probe (no command)" in status_text(p)
     tick()
+    # Two failures queue one harness task to fix it, with its errors; no alert yet.
+    fixes = p.db.q("SELECT * FROM tasks WHERE labels LIKE '%schedule_fix:probe%'")
+    assert len(fixes) == 1 and fixes[0]["kind"] == "harness" and "no command" in fixes[0]["spec"]
+    assert "harness/schedules.json" in fixes[0]["spec"]
     tick()
-    assert len(live()) == 1
+    assert not live() and len(p.db.q("SELECT id FROM tasks WHERE labels LIKE '%schedule_fix:probe%'")) == 1
+    # Its fix task done while the schedule still fails: now the alert, naming the task.
+    p.db.update_task(fixes[0]["id"], status="done")
+    tick()
+    tick()
+    assert len(live()) == 1 and f"#{fixes[0]['id']} ended done" in live()[0]["text"]
     assert p.db.one("SELECT COUNT(*) n FROM messages WHERE ref='schedule:probe' AND kind='alert'")["n"] == 1
     p.db.x("UPDATE schedules SET payload=? WHERE name='probe'", (json.dumps({"command": "true"}),))
     tick()
     assert not live()
     assert p.db.one("SELECT cleared FROM alerts WHERE key='schedule:probe'")["cleared"]
     assert "schedules failing" not in status_text(p)
+    # A new failure stint after the ok run queues a new fix task.
+    p.db.x("UPDATE schedules SET payload=? WHERE name='probe'", (json.dumps({}),))
+    tick()
+    tick()
+    assert len(p.db.q("SELECT id FROM tasks WHERE labels LIKE '%schedule_fix:probe%'")) == 2 and not live()
 
 
 def test_a_budget_skipped_llm_schedule_retries_when_the_gate_opens(env):
@@ -32086,7 +32102,7 @@ def test_devq_probe_exit_codes(devq_dir):
     (d / "queue" / "00000000000000000001-t5-x.json").write_text(json.dumps({"id": "t5-x", "cmd": "true"}))
     (d / "queue" / "00000000000000000002-x.json").write_text(json.dumps({"id": "x", "cmd": "true"}))
     dead = _devq("probe", d, "t5-x")
-    assert dead.returncode == 0 and "no runner is alive" in dead.stdout, "pending with the runner dead: wake"
+    assert dead.returncode == 3 and "no runner is alive" in dead.stdout, "pending with the runner dead: restart it"
     with open(d / "runner.lock", "a") as lock:   # a live runner holds this lock
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         assert _devq("probe", d, "t5-x").returncode == 1
@@ -32113,7 +32129,7 @@ def test_devq_runner_and_probe_wait_while_an_old_per_task_driver_runs(devq_dir, 
         driver.kill()
         driver.wait()
     woke = _devq("probe", d, "t9-a")
-    assert woke.returncode == 0 and "no runner is alive" in woke.stdout
+    assert woke.returncode == 3 and "no runner is alive" in woke.stdout
     assert _devq("start", d, json.dumps(cfg)).returncode == 0
     assert _devq_marker(d, "t9-a")["status"] == "done" and (tmp_path / "ran").exists()
 
@@ -32292,7 +32308,7 @@ def test_devq_runner_stopped_with_term_ends_its_health_check_and_frees_the_lock_
     assert not _pid_running(child), "the health check (its sleep) ended with the runner"
     assert _devq_lock_free(d), "runner.lock is free right away"
     assert "runner stopped by signal" in (d / "runner.log").read_text()
-    assert _devq("probe", d, "h-1").returncode == 0, "the job waits and no runner is alive: wake and restart"
+    assert _devq("probe", d, "h-1").returncode == 3, "the job waits and no runner is alive: restart it"
 
 
 def _pid_running(pid):
@@ -33707,3 +33723,159 @@ def test_normalize_masks_compound_and_decimal_durations():
                  ("1.5h ago", "0.25h ago"), ("wait 250ms", "wait 12ms")]:
         assert screen.normalize(a) == screen.normalize(b), a
     assert screen.normalize("host03 t48 gpu1") == "host03 t48 gpu1"
+
+
+def _fake_ttp(tmp_path, rc, out):
+    """A `ttp` on an absolute path that prints `out` and exits `rc` (a devq probe's verdict)."""
+    b = tmp_path / "fakebin"
+    b.mkdir(exist_ok=True)
+    (b / "ttp").write_text(f"#!/bin/sh\necho '{out}'\nexit {rc}\n")
+    (b / "ttp").chmod(0o755)
+    return str(b / "ttp")
+
+
+def _reprobe(d, tid):
+    """Run its probe again ahead of its timer (as every PROBE_EVERY_S)."""
+    d._probed.pop(tid, None)
+    d.p.db.update_task(tid, not_before=time.time() + 900)
+    _settle_probe(d, tid)
+
+
+def test_a_devq_probe_finding_its_runner_down_restarts_it_model_free_and_the_task_sleeps_on(env, tmp_path):
+    from ttp import waitheal
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    d.cfg.setdefault("device", {})["runner_restarts_per_day"] = 2
+    calls = []
+    d._devq_start = lambda runner: (calls.append(runner), (0, "started runner"))[1]
+    probe = f"{_fake_ttp(tmp_path, 3, 'r1-1: queued, but no runner is alive (runner down)')} devq probe r1 r1-1"
+    tid = _due_waiting_task(p, probe)
+    _settle_probe(d, tid)
+    assert calls == ["r1"] and not _ready(p, tid), "restarted, and the task sleeps on (exit 3 is not yet)"
+    ev = p.db.q("SELECT * FROM events WHERE kind='devq_runner_restarted'")
+    assert len(ev) == 1 and ev[0]["status"] == "handled" and ev[0]["task"] == tid
+    assert not p.db.q("SELECT id FROM runs"), "no model run"
+    _reprobe(d, tid)
+    assert calls == ["r1"], "at most once per 10 min per runner"
+    st = p.db.kv(waitheal.RUNNER_RESTARTS_KEY)
+    p.db.set_kv(waitheal.RUNNER_RESTARTS_KEY, {"r1": {**st["r1"], "last": time.time() - 601}})
+    _reprobe(d, tid)
+    assert calls == ["r1", "r1"]
+    st = p.db.kv(waitheal.RUNNER_RESTARTS_KEY)
+    p.db.set_kv(waitheal.RUNNER_RESTARTS_KEY, {"r1": {**st["r1"], "last": time.time() - 601}})
+    _reprobe(d, tid)
+    assert calls == ["r1", "r1"], "the day's cap"
+    fix = p.db.q("SELECT * FROM tasks WHERE kind='harness' AND title LIKE 'Fix device runner r1:%'")
+    assert len(fix) == 1 and "2 restarts today" in fix[0]["title"]
+    assert p.db.one("SELECT COUNT(*) n FROM messages WHERE ref='devq_runner:r1' AND severity='low'")["n"] == 1
+    _reprobe(d, tid)
+    assert len(p.db.q("SELECT id FROM tasks WHERE kind='harness'")) == 1 and not _ready(p, tid)
+
+
+def test_a_runner_restart_failing_twice_posts_one_low_line_and_queues_one_fix_task(env, tmp_path):
+    from ttp import waitheal
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    d._devq_start = lambda runner: (1, "health gate failed")
+    tid = _due_waiting_task(p, f"{_fake_ttp(tmp_path, 3, 'no runner is alive')} devq probe r2 r2-1")
+    for i in range(3):
+        if i:
+            st = p.db.kv(waitheal.RUNNER_RESTARTS_KEY)
+            p.db.set_kv(waitheal.RUNNER_RESTARTS_KEY, {"r2": {**st["r2"], "last": time.time() - 601}})
+        _reprobe(d, tid)
+        lines = p.db.one("SELECT COUNT(*) n FROM messages WHERE ref='devq_runner:r2'")["n"]
+        assert lines == (0 if i == 0 else 1), i
+    fix = p.db.q("SELECT * FROM tasks WHERE kind='harness'")
+    assert len(fix) == 1 and "health gate failed" in fix[0]["spec"] and f"#{tid}" in fix[0]["spec"]
+    assert not _ready(p, tid)
+
+
+def test_a_legacy_driver_probe_stays_not_yet_and_restarts_nothing(env, tmp_path):
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    calls = []
+    d._devq_start = lambda runner: (calls.append(runner), (0, ""))[1]
+    tid = _due_waiting_task(p, f"{_fake_ttp(tmp_path, 1, 'an old per-task driver still runs')} devq probe r3 r3-1")
+    _settle_probe(d, tid)
+    assert not calls and not _ready(p, tid)
+    # Exit 3 from any other probe is not a runner down: the probe is broken and wakes its task.
+    tid2 = _due_waiting_task(p, f"{_fake_ttp(tmp_path, 3, 'x')} devq probe r3 r3-1 && true")
+    _settle_probe(d, tid2)
+    assert not calls and d._probe_rc[tid2][0] == 3
+
+
+def _never(p, tid):
+    return p.db.q("SELECT * FROM events WHERE kind='probe_never_passes' AND task=?", (tid,))
+
+
+def test_probes_that_can_never_pass_are_flagged_once_per_wait(env, tmp_path):
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    assert coord.EFFORT_EVENT_TRIGGERS["probe_never_passes"] == "stuck"
+    missing = _due_waiting_task(p, "no-such-command-xyz --check")
+    _settle_probe(d, missing)
+    ev = _never(p, missing)
+    assert len(ev) == 1 and "not found (exit 127)" in ev[0]["text"] and ev[0]["status"] == "queued"
+    assert "no-such-command-xyz" in ev[0]["text"] and f"set-when {missing}" in ev[0]["text"]
+    gone = _due_waiting_task(p, f"test -e {p.runs}/99999/done")
+    (p.runs / "88888").mkdir(parents=True, exist_ok=True)
+    live = _due_waiting_task(p, f"test -e {p.runs}/88888/done")
+    for t in (gone, live):
+        _settle_probe(d, t)
+        _reprobe(d, t)
+    assert len(_never(p, gone)) == 1 and "99999" in _never(p, gone)[0]["text"]
+    assert not _never(p, live), "a missing marker in a live run dir is the normal wait"
+    unknown = _due_waiting_task(p, f"{_fake_ttp(tmp_path, 1, 'j: unknown to the runner in /x')} devq probe r j")
+    _settle_probe(d, unknown)
+    assert len(_never(p, unknown)) == 1 and "unknown to its runner" in _never(p, unknown)[0]["text"]
+
+
+
+def test_wait_stale_shows_the_gate_and_flags_same_output_while_a_named_task_has_ended(env):
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    other = p.db.add_task("build", "s", kind="work", tier="light", origin="user")
+    p.db.update_task(other, status="done")
+    probe = f"echo 'still waiting on #{other}'; exit 1"
+    tid = _due_waiting_task(p, probe, since_ago=30000)
+    _settle_probe(d, tid)
+    p.db.update_task(tid, not_before=time.time() - 1)
+    d.probe_waiting()   # its timer runs out on a fresh not yet past the cap
+    stale = p.db.q("SELECT * FROM events WHERE kind='wait_stale' AND task=?", (tid,))
+    assert len(stale) == 1 and f"Blocking gate: {probe}" in stale[0]["text"]
+    assert f"last output: still waiting on #{other}" in stale[0]["text"] and "keeps sleeping" in stale[0]["text"]
+    assert not _never(p, tid), "the same output only just started"
+    text, _, pr = d._probe_out[tid]
+    d._probe_out[tid] = (text, time.time() - 22000, pr)
+    d._flag_never_passes(p.db.task(tid), probe, 1, text, stale=True)   # as at its next wait_stale check
+    ev = _never(p, tid)
+    assert len(ev) == 1 and f"#{other} (done)" in ev[0]["text"] and not _ready(p, tid)
+
+
+def test_a_start_when_that_waits_for_hours_on_a_device_resource_raises_one_event(env):
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    assert coord.EFFORT_EVENT_TRIGGERS["start_resource_stale"] == "resource"
+    old = time.time() - 4 * 3600
+    dev = p.db.add_task("run", "s", kind="work", tier="light", origin="user",
+                        labels=["start_when:false", f"deferred_since:{old}", "resource:device"])
+    plain = p.db.add_task("run", "s", kind="work", tier="light", origin="user",
+                          labels=["start_when:false", f"deferred_since:{old}", "resource:disk"])
+    fresh = p.db.add_task("run", "s", kind="work", tier="light", origin="user",
+                          labels=["start_when:false", f"deferred_since:{time.time()}", "exclusive:serving"])
+    for _ in range(2):
+        for t in (dev, plain, fresh):
+            d._start_verdict(p.db.task(t), 1, time.time())
+    ev = p.db.q("SELECT * FROM events WHERE kind='start_resource_stale'")
+    assert [e["task"] for e in ev] == [dev] and "device" in ev[0]["text"] and "Blocking gate: false" in ev[0]["text"]
+    d.cfg["waiting"]["start_resource_stale_s"] = 0
+    d._start_verdict(p.db.task(fresh), 1, time.time() + 5 * 3600)
+    assert len(p.db.q("SELECT * FROM events WHERE kind='start_resource_stale'")) == 1, "0 turns it off"

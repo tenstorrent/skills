@@ -166,7 +166,8 @@ EFFORT_EVENT_TRIGGERS = {
     "task_blocked": "stuck", "task_failed": "stuck", "task_changes_needed": "stuck", "task_review": "stuck",
     "dead_dependency": "stuck",
     "deferral_expired": "stuck", "deferral_probe_broken": "stuck", "review_stall": "stuck",
-    "wait_stale": "stuck", "hold_probe_broken": "stuck",
+    "wait_stale": "stuck", "hold_probe_broken": "stuck", "probe_never_passes": "stuck",
+    "start_resource_stale": "resource",
     "resource_trouble": "resource",
     # costly or irreversible decisions
     "task_budget_exhausted": "costly", "ask_timeout": "costly", "pr_findings": "costly", "pr_clean": "costly",

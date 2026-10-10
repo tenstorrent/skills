@@ -50,6 +50,8 @@ in `state/runs/<id>/`, so a daemon restart never loses a result.
    `budget.max_waits` times, then asks the user. While its `retry_when` probe exits 1 ("not yet")
    or 255 (ssh could not reach the host) it sleeps on without a run; past `waiting.max_hold_s`
    after the hand-off it still sleeps, and the coordinator is asked once to fix the probe or cancel.
+   A probe that can never pass (command not found, a run dir or worktree that is gone, a devq job
+   unknown to its runner) is raised once per wait when it is first seen.
 8. The project folder ignores itself; nothing of a project is ever committed to the user's repo.
 9. Secrets live only in `~/.tt-project/secrets.json` (0600). Never in argv, logs or projects.
 10. The runtime is standard-library Python ≥ 3.9. Web assets are static files.
@@ -67,6 +69,16 @@ in `state/runs/<id>/`, so a daemon restart never loses a result.
     before this rule with a default still drain: after `coordinator.ask_timeout_h`, never at a
     cap or when the user has written since it was asked (the coordinator is asked to confirm
     instead); the user is told what was decided, at `high` severity or above.
+
+## Known gaps (accepted)
+
+- A wait on another project of this machine gets nothing extra from the daemon: no note to that
+  project, no default end, no matching of project names in `waiting_for`. The worker tells the
+  other project itself with `ttp note --to <project>`. A wait that never ends is caught like any
+  other: a timer-only wait is blocked after `budget.max_waits` tries, a probe that can never pass
+  raises one `probe_never_passes` event, and one still saying not yet past `waiting.max_hold_s`
+  raises one `wait_stale` event. A daemon-side version was dropped: it moved the end on every
+  re-wait, sent the note again each time and matched project names too loosely.
 
 ## Why the coordinator is tool-less
 

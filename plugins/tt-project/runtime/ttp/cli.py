@@ -1861,9 +1861,9 @@ def cmd_devq(a) -> None:
     queues one job on the runner's host (whose job guard, devq.guard, may refuse it; it checks the --input
     paths are readable there and warns on a --cold-start longer than the job's limit) and starts the runner if it is down (with runner.device_timeout_max_s
     set, it refuses a longer --timeout and gives a job without one that ceiling); it prints the retry_when,
-    `ttp devq probe <runner> <id>`, which exits 0 once the job has its done marker, or once no runner is
-    alive while the job waits (the waking run then calls `ttp devq start <runner>` and waits again), and
-    1 while it runs. `status <runner> [<id>]` shows the queue or one job's marker; `clear <runner> <config>`
+    `ttp devq probe <runner> <id>`, which exits 0 once the job has its done marker, 1 while it runs and
+    3 while it waits with no runner alive (the daemon then runs `ttp devq start <runner>` itself, model-free,
+    and the task sleeps on: daemon._restart_runner). `status <runner> [<id>]` shows the queue or one job's marker; `clear <runner> <config>`
     allows a config skipped for its drops again; `list` names the runners."""
     from . import devq
     p = here()

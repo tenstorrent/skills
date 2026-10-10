@@ -57,6 +57,7 @@ from . import schedule as sched
 from . import service
 from . import unblock
 from . import upstream
+from . import waitheal
 from . import screen as scr
 from . import shared
 from . import worktree
@@ -352,6 +353,8 @@ class Daemon:
         self._ends = ends.Ends(self.p, log=lambda m: log(self.p, m))   # temporary instructions' end conditions
         self._pause_ends = pauseends.PauseEnds(self.p, log=lambda m: log(self.p, m))   # resource pauses' ends
         self._probe_rc: dict[int, tuple[int | str, float, str]] = {}   # last verdict: exit code or why, when, probe
+        self._probe_files: dict[int, object] = {}   # id(probe proc) -> the file its output goes to
+        self._probe_out: dict[int, tuple[str, float, str]] = {}   # task -> its probe's last output, unchanged since, probe
         self._reboot_told = False
         self._boot_woken = False
         self._held: list[str] | None = None   # lock holders the heartbeat file last recorded
@@ -2215,6 +2218,8 @@ class Daemon:
             db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
                  (time.time(), f"task:{task['id']}", "task_waiting", "low",
                   f"#{task['id']} {task['title']}: {reason}", json.dumps(data), "handled", task["id"]))
+            if (now_t := db.task(task["id"])) and isinstance(result, dict):
+                self._wait_started(now_t, result)
             return
         outcome = CHANGES_NEEDED if rejects else new
         if task["reply_chat"] and new in ("done", "failed", "blocked"):
@@ -2532,16 +2537,50 @@ class Daemon:
             sched.mark_ran(db, s, status)
             if sched.failing(status) and sched.failing(s["last_status"]):
                 self._schedule_broken(s, status)
+            elif not sched.failing(status):
+                self._schedule_mended(s["name"])
             self._progress()
 
+    SCHEDULE_FIXES_KEY = "schedule_fixes"   # kv: schedule -> {task, since, errors} for its failure stint
+
     def _schedule_broken(self, s: dict, status: str) -> None:
-        """Two failed runs in a row raise one alert; it clears itself on the next run that does not fail."""
-        key = f"schedule:{s['name']}"
-        if self.p.db.one("SELECT id FROM alerts WHERE key=? AND cleared IS NULL", (key,)):
-            return
+        """Two failed runs in a row queue one harness task to fix the schedule (once per failure stint).
+        The high alert is raised only when that task ends without fixing it (failed or cancelled, or
+        done while the schedule still fails); it clears itself on the next run that does not fail."""
+        db, name = self.p.db, s["name"]
+        fixes = db.kv(self.SCHEDULE_FIXES_KEY, {}) or {}
+        fix = fixes.get(name)
         why = ("it has no command to run; the coordinator sets one with schedule_set `command`"
                if status == "no command" else status)
-        self.alert(key, f"Schedule {s['name']} failed twice in a row and does nothing until fixed: {why}", "high")
+        if not fix:
+            payload = json.loads(s["payload"] or "{}")
+            errors = [x for x in (s["last_status"], status) if x]
+            spec = (f"Schedule `{name}` ({s['kind']}, every {s['every_s']} s) failed twice in a row and does "
+                    f"nothing until fixed. Its command: {payload.get('command') or payload.get('prompt') or '(none)'}"
+                    f"\nLast errors: {' | '.join(errors)}\n\nFind out why and fix it: the schedule's definition "
+                    f"is in harness/schedules.json (the daemon applies it), the command's own script or config, "
+                    f"or what it needs. Run the command once by hand to show it now passes. If it cannot be "
+                    f"fixed here, say exactly what is missing.")
+            tid = db.add_task(f"Fix schedule {name}: it failed twice in a row"[:200], spec, kind="harness",
+                              tier="standard", priority=2, origin="daemon", labels=[f"schedule_fix:{name}"])
+            db.set_kv(self.SCHEDULE_FIXES_KEY, {**fixes, name: {"task": tid, "since": time.time(), "errors": errors}})
+            log(self.p, f"schedule {name} failed twice in a row: queued fix task {tid}")
+            return
+        t = db.task(int(fix.get("task") or 0))
+        if t and t["status"] not in ("done", "failed", "cancelled", "blocked"):
+            return   # its fix task is still on it
+        key = f"schedule:{name}"
+        if db.one("SELECT id FROM alerts WHERE key=? AND cleared IS NULL", (key,)):
+            return
+        after = (f"; its fix task #{t['id']} ended {t['status']} and it still fails" if t
+                 else "; its fix task is gone")
+        self.alert(key, f"Schedule {name} failed twice in a row and does nothing until fixed: {why}{after}", "high")
+
+    def _schedule_mended(self, name: str) -> None:
+        fixes = self.p.db.kv(self.SCHEDULE_FIXES_KEY, {}) or {}
+        if name in fixes:
+            fixes.pop(name)
+            self.p.db.set_kv(self.SCHEDULE_FIXES_KEY, fixes)
 
     def sweep_watcher_issues(self) -> int:
         """Close quiet command-watcher issues and errors (each tick, before the schedules run). The
@@ -3706,6 +3745,7 @@ class Daemon:
         model run cannot make the probe pass) and raises one `wait_stale` event for the coordinator.
         Tasks with the same probe share its runs."""
         db, now = self.p.db, time.time()
+        outs: dict[int, str] = {}   # one read of a probe run's output, whichever tasks share it
         for tid, (proc, started, probe) in list(self._probes.items()):
             rc = proc.poll()
             if rc is None and now - started < PROBE_TIMEOUT_S:
@@ -3713,13 +3753,23 @@ class Daemon:
             del self._probes[tid]
             if rc is None:
                 _kill_group(proc)
+            if id(proc) not in outs:
+                outs[id(proc)] = self._probe_text(proc)
             task = db.task(tid)
             if task and _current_probe(task) != probe:
                 continue   # re-pointed (`set-when`) while it ran: its verdict is not the new probe's
+            self._note_probe_out(tid, probe, outs[id(proc)], now)
+            runner = waitheal.devq_runner(probe) if rc == waitheal.DEVQ_RUNNER_DOWN_RC else None
+            if runner:
+                # Its device runner is down: the daemon brings it back, and the task sleeps on.
+                self._restart_runner(runner, tid, now)
+                rc = 1
             if task and task["status"] == "queued" and deferral(task).get("when"):
                 self._start_verdict(task, "timeout" if rc is None else rc, now)
                 continue
             self._probe_rc[tid] = ("timeout" if rc is None else rc, now, probe)
+            if task and task["status"] == "queued":
+                self._flag_never_passes(task, probe, rc, outs[id(proc)])
             if rc == 0:
                 task = db.task(tid)
                 if task and task["status"] == "queued" and (task["not_before"] or 0) > now:
@@ -3778,6 +3828,7 @@ class Daemon:
         if run and run[2] != probe:
             if not any(o != tid and r[0] is run[0] for o, r in self._probes.items()):
                 _kill_group(run[0])   # unless shared: the other task still needs its verdict
+                self._probe_text(run[0])
             del self._probes[tid]
             self._probed.pop(tid, None)
         if tid in self._probe_rc and self._probe_rc[tid][2] != probe:
@@ -3791,11 +3842,36 @@ class Daemon:
             self.p.db.update_task(task["id"], labels=without_deferral(json.loads(task["labels"] or "[]")),
                                   not_before=None)
             log(self.p, f"task {task['id']} start_when passed; ready to start")
-        elif rc not in NOT_YET_RCS:
+        elif rc in NOT_YET_RCS:
+            self._start_resource_stale(task, d, now)
+        else:
             why = rc if isinstance(rc, str) else f"exit {rc}"
             self._deferral_event(task, d.get("since") or task["created"], "deferral_probe_broken",
                                  f"its start_when probe is broken ({why}; only 0 = start and 1, 75 or 255 = not "
                                  f"yet are valid): {d.get('when', '')[:300]}")
+
+    def _start_resource_stale(self, task: dict, d: dict, now: float) -> None:
+        """A start_when that has said not yet for waiting.start_resource_stale_s while the task names a
+        device or serving resource raises one event per deferral: the resource may be down, and a
+        probe that waits on it would hide that."""
+        stale = float((self.cfg.get("waiting") or {}).get("start_resource_stale_s", waitheal.START_STALE_S) or 0)
+        since = float(d.get("since") or task["created"] or now)
+        if not stale or now - since < stale:
+            return
+        watched = waitheal.watched_resources(self.cfg, coord.task_resources(task))
+        if watched:
+            got = self._probe_out.get(task["id"])
+            last = got[0] if got and got[2] == d.get("when") else ""
+            self._deferral_event(task, since, "start_resource_stale",
+                                 f"its start_when has said not yet for {(now - since) / 3600:.1f} h while it needs "
+                                 f"{', '.join(watched)}: check that resource is up. Blocking gate: "
+                                 f"{str(d.get('when'))[:200]}; last output: {last or '(none seen)'}")
+
+    def _wait_started(self, task: dict, result: dict) -> None:
+        """When a wait starts, a probe that can never pass is flagged now, not hours later."""
+        probe = str(result.get("retry_when") or "")
+        if probe:
+            self._flag_never_passes(task, probe, None, "")
 
     def _deferral_event(self, task: dict, since: float, kind: str, what: str) -> None:
         """Once per deferral: the coordinator decides again (fix the probe with task_update
@@ -3969,15 +4045,142 @@ class Daemon:
             if other != tid and got[2] == probe and now - got[1] < PROBE_EVERY_S:
                 self._probe_rc[tid] = got
                 return
+        out = None
         try:
+            # Its output (the blocking gate's last word) goes to a file: a pipe nobody reads could fill.
+            out = tempfile.TemporaryFile()
             proc = subprocess.Popen(landed.probe_command(probe), shell=True, cwd=str(self.p.root),
-                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                    stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
                                     start_new_session=True, env=self._probe_env())
         except OSError as e:
+            if out:
+                out.close()
             log(self.p, f"task {tid} {what} probe could not start: {e}")
             self._probe_rc[tid] = ("could not start", now, probe)
             return
         self._probes[tid] = (proc, now, probe)
+        self._probe_files[id(proc)] = out
+
+    def _probe_text(self, proc) -> str:
+        """The end of a finished probe run's output, once (its file is closed after)."""
+        f = self._probe_files.pop(id(proc), None)
+        if f is None:
+            return ""
+        try:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 4000))
+            return waitheal.clip(f.read().decode(errors="replace"))
+        except (OSError, ValueError):
+            return ""
+        finally:
+            f.close()
+
+    def _note_probe_out(self, tid: int, probe: str, text: str, now: float) -> None:
+        got = self._probe_out.get(tid)
+        if not got or got[0] != text or got[2] != probe:
+            self._probe_out[tid] = (text, now, probe)
+
+    def _flag_never_passes(self, task: dict, probe: str, rc, text: str, stale: bool = False) -> None:
+        """One `probe_never_passes` event per wait for a waiting task whose probe can never pass
+        (waitheal.never_passes; at wait_stale also the same output for max_hold_s while a task it names
+        has ended). Checked when the wait starts, on each verdict and at wait_stale. The task keeps
+        its timer and its probe; the coordinator decides."""
+        prev = load_result(task["result"])
+        if prev.get("status") != "waiting" or prev.get("retry_when") != probe:
+            return
+        tid, db = task["id"], self.p.db
+        since = prev.get("waiting_since")
+        since = float(since) if isinstance(since, (int, float)) else float(task["updated"] or 0)
+        fp = f"probe_never_passes:{tid}:{since:.0f}"
+        if db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+            return
+        try:
+            why = waitheal.never_passes(self.p, probe, rc, text)
+            got = self._probe_out.get(tid)
+            max_hold = float((self.cfg.get("waiting") or {}).get("max_hold_s") or 6 * 3600)
+            if not why and stale and got and got[2] == probe and time.time() - got[1] >= max_hold \
+                    and (ended := waitheal.ended_refs(db, probe, tid)):
+                why = (f"it has printed the same output for {max_hold / 3600:g} h while "
+                       f"{', '.join(ended)} it names has ended")
+        except Exception as e:   # a check of the wait must never break the wait
+            log(self.p, f"task {tid}: could not check its probe: {type(e).__name__}: {e}")
+            return
+        if not why:
+            return
+        db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
+             (time.time(), "daemon", "probe_never_passes", fp, "normal",
+              f"#{tid} {task['title']} waits on a probe that can never pass: {why}. Blocking gate: "
+              f"{probe[:200]}; last output: {text or '(none yet)'}. Decide: fix its probe (`ttp task set-when "
+              f"{tid} \"<cmd>\"`), clear it (\"\") so it wakes at its timer, or cancel the task.", "queued", tid))
+        log(self.p, f"task {tid} probe can never pass: {why}; raised to the coordinator")
+
+    def _restart_runner(self, runner: str, tid: int, now: float) -> None:
+        """A waiting task's `ttp devq probe` found its job pending and runner `runner` down: run `ttp
+        devq start` here, model-free, at most once per RESTART_EVERY_S and
+        device.runner_restarts_per_day times a day per runner. Each restart is logged and recorded
+        as a handled `devq_runner_restarted` event. Two failed in a row, or the day's cap reached,
+        post one low line and queue one harness task to fix the runner; the task sleeps on."""
+        db = self.p.db
+        cap = int((self.cfg.get("device") or {}).get("runner_restarts_per_day") or waitheal.RESTARTS_PER_DAY)
+        every = (db.kv(waitheal.RUNNER_RESTARTS_KEY, {}) or {})
+        st = dict(every.get(runner) or {})
+        day = time.strftime("%Y-%m-%d", time.localtime(now))
+        if st.get("day") != day:
+            st.update(day=day, n=0)
+        if now - float(st.get("last") or 0) < waitheal.RESTART_EVERY_S:
+            return
+        if int(st.get("n") or 0) >= cap:
+            if st.get("capped") != day:
+                st["capped"] = day
+                log(self.p, f"device runner {runner}: down again after {cap} restarts today; not restarted")
+                self._report_runner(runner, f"went down again after {cap} restarts today", st.get("error") or "", tid)
+                db.set_kv(waitheal.RUNNER_RESTARTS_KEY, {**every, runner: st})
+            return
+        rc, out = self._devq_start(runner)
+        ok = rc in (0, waitheal.DEVQ_RUNNER_DOWN_RC)   # 3: an old per-task driver still runs, not a failure
+        st.update(last=now, n=int(st.get("n") or 0) + 1, fails=0 if ok else int(st.get("fails") or 0) + 1,
+                  error="" if ok else waitheal.clip(out, 300))
+        if ok:
+            st.pop("reported", None)
+        db.set_kv(waitheal.RUNNER_RESTARTS_KEY, {**every, runner: st})
+        db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+             (time.time(), "daemon", "devq_runner_restarted", "low",
+              f"device runner {runner} was down while #{tid} waited on it: `ttp devq start` "
+              f"{'ran' if ok else f'failed (exit {rc})'}, no model run: {waitheal.clip(out, 200)}", "handled", tid))
+        log(self.p, f"device runner {runner} down while task {tid} waits: restart {'ok' if ok else f'failed ({rc})'}: "
+                    f"{waitheal.clip(out, 200)}")
+        if not ok and st["fails"] >= waitheal.RESTART_FAILS_REPORTED and not st.get("reported"):
+            st["reported"] = True
+            db.set_kv(waitheal.RUNNER_RESTARTS_KEY, {**every, runner: st})
+            self._report_runner(runner, f"could not be restarted {st['fails']} times in a row", st["error"], tid)
+        self._progress()
+
+    def _devq_start(self, runner: str) -> tuple[int, str]:
+        try:
+            r = subprocess.run([sys.executable, "-m", "ttp", "devq", "start", runner], cwd=str(self.p.root),
+                               env=self._probe_env(), stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                               timeout=2 * PROBE_TIMEOUT_S + 30)
+        except (OSError, subprocess.SubprocessError) as e:
+            return 1, f"{type(e).__name__}: {e}"
+        return r.returncode, f"{r.stdout or ''} {r.stderr or ''}".strip()
+
+    def _report_runner(self, runner: str, why: str, error: str, tid: int) -> None:
+        """One low line for the user and one open harness task to fix the runner."""
+        db = self.p.db
+        title = f"Fix device runner {runner}: it {why}"[:200]
+        if db.one("SELECT id FROM tasks WHERE kind='harness' AND title LIKE ? AND status NOT IN ('done','failed',"
+                  "'cancelled')", (f"Fix device runner {runner}: %",)):
+            return
+        spec = (f"Device runner `{runner}` (config device.runners.{runner}) {why}. The daemon restarts it "
+                f"model-free when a waiting task's `ttp devq probe` finds it down (task #{tid} waits on it). "
+                f"Last error: {error or '(none recorded)'}.\n\nFind out why: `ttp devq status {runner}`, and the "
+                f"runner's runner.out and runner.log in its state folder. Fix what is this project's (its config "
+                f"entry, its health gate), bring it back with `ttp devq start {runner}`, and report what is not.")
+        fid = db.add_task(title, spec, kind="harness", tier="standard", priority=2, origin="daemon",
+                          labels=[f"devq_runner:{runner}"])
+        db.post("out", f"Device runner {runner} {why}; queued #{fid} to fix it. Tasks waiting on it keep sleeping.",
+                chat=None, kind="info", severity="low", ref=f"devq_runner:{runner}")
+        log(self.p, f"device runner {runner} {why}: queued task {fid}")
 
     def _hold_waiting(self, task: dict, prev: dict, now: float) -> bool:
         """A waiting task whose timer ran out: wake it, or put it back to sleep while its probe says
@@ -3998,6 +4201,8 @@ class Daemon:
             held = now >= since + max_hold
             if held:
                 self._stale_wait_event(task, prev, since, max_hold)
+                self._flag_never_passes(task, str(prev.get("retry_when") or ""), rc,
+                                        (self._probe_out.get(tid) or ("",))[0], stale=True)
             nb = now + _retry_s(prev) if held else min(now + _retry_s(prev), since + max_hold)
             what = str(prev.get("waiting_for") or prev.get("summary") or "")[:300]
             says = "host unreachable" if rc == 255 else "not yet"
@@ -4021,10 +4226,14 @@ class Daemon:
         if db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
             return
         what = str(prev.get("waiting_for") or prev.get("summary") or "")[:300]
+        probe = str(prev.get("retry_when") or "")
+        got = self._probe_out.get(task["id"])
+        last = got[0] if got and got[2] == probe else ""
         db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
              (time.time(), "daemon", "wait_stale", fp, "normal",
               f"#{task['id']} {task['title']} has waited {max_hold / 3600:g} h for {what}; its probe still says "
-              f"not yet ({str(prev.get('retry_when') or '')[:200]}). It keeps sleeping and no worker run is spent. "
+              f"not yet. Blocking gate: {probe[:200]}; last output: {last or '(none seen)'}. "
+              f"It keeps sleeping and no worker run is spent. "
               f"Decide: fix its probe (`ttp task set-when {task['id']} \"<cmd>\"`), clear it (\"\") so it wakes "
               f"at its timer, or cancel the task.", "queued", task["id"]))
         log(self.p, f"task {task['id']} probe not yet after {max_hold / 3600:g} h; raised to the coordinator")
