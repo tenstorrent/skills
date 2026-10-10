@@ -204,9 +204,12 @@ def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None
     for such a list while the queue is off: turned off while the review ran, it runs again and
     pushes itself, as queue_off sends back approvals made before), or {"entries": [{"branch", "head"}], "target": "remote/branch", "added": {head:
     [commit lines]}}. Each head is a full hash of a commit in the project root that the review
-    reviewed (worktree.reviewed_refs) or an ancestor of one. A re-approval after a push conflict may
-    name any commit; the commits it adds over the conflicting head are listed for the event."""
-    from .worktree import reviewed_refs
+    reviewed (worktree.named_refs) or an ancestor of one, or a commit of a fix branch of the lineage
+    (worktree.fix_branches: a re-plan that committed on its own branch, not the reviewed one) that
+    contains the reviewed branch it builds on. Only the commit the review names is pinned and
+    pushed, so a head the reviewer did not name never goes out. A re-approval after a push conflict
+    may name any commit; the commits it adds over the conflicting head are listed for the event."""
+    from .worktree import fix_branches, named_refs
     d = _delivery(p, cfg)
     if d.get("push_queue") is not True:
         if isinstance(entries, list) and entries and all(isinstance(e, dict) and e.get("head") for e in entries):
@@ -227,6 +230,7 @@ def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None
     rows = p.db.q("SELECT status, head, created FROM push_queue WHERE task=? ORDER BY id", (task["id"],))
     conflicted = [r["head"] for r in rows if r["created"] == rows[-1]["created"] and r["status"] == "conflict"]
     reviewed: list[str] | None = None
+    built: list[tuple[str, str]] = []
     out, added = [], {}
     for e in entries:
         head = str(e.get("head") or "").strip().lower()
@@ -239,10 +243,14 @@ def check_approval(p: Project, task: dict, entries: Any, cfg: dict | None = None
             added[head] = log.stdout.splitlines() if log.returncode == 0 else []
         else:
             if reviewed is None:
-                refs = reviewed_refs(p, task)
+                refs = named_refs(p, task)
+                fixes = fix_branches(p, task, refs)
                 reviewed = [c for c in (_commit(p, r) for r in refs) if c]
-                names = ", ".join(refs) or "none"
-            if not _contains(p, reviewed, head):
+                built = [(tip, on) for tip, on in ((_commit(p, b), _commit(p, r)) for b, r in fixes.items())
+                         if tip and on]
+                names = ", ".join(refs + list(fixes)) or "none"
+            if not _contains(p, reviewed, head) and \
+                    not any(_contains(p, [tip], head) and _contains(p, [head], on) for tip, on in built):
                 return {"invalid": f"{head} is none of the reviewed refs ({names}) nor an ancestor of one"}
         out.append({"branch": str(e.get("branch") or "").strip()[:200], "head": head})
     return {"entries": out, "target": f"{tgt[0]}/{tgt[1]}", "added": added}

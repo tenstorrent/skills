@@ -4839,7 +4839,9 @@ class Daemon:
     def _auto_review(self, task: dict, summary: str, add: bool = True) -> tuple[int, bool] | None:
         """The review of a finished code task, queued here the way the coordinator would, so a
         routine hand-off needs no coordinator turn: (review id, whether it was added now). An open
-        review that already covers the task (queued ahead by the coordinator) is that review. None
+        review that already covers the task (queued ahead by the coordinator, or a re-review of the
+        branch the task's fix branch builds on: worktree.fix_branches), or one that already approved
+        its head, is that review: one head gets one review. None
         when delivery has no review step, `add` is off and none is open, the branch changes nothing,
         the review cap is reached or the diff cannot be read: the coordinator then decides."""
         cfg, db = self.cfg, self.p.db
@@ -4853,6 +4855,15 @@ class Daemon:
                 if task["id"] in dependency_ids(t) or (branch and branch in worktree.reviewed_refs(self.p, t)):
                     self._precheck_open(task, t)
                     return t["id"], False
+            # A review that already approved this exact head (it ran while the task waited on its own
+            # checks) passed it: a second review of the same head is a wasted run.
+            tip = worktree._git(self.p.root, "rev-parse", "--verify", "--quiet", f"{branch}^{{commit}}",
+                                check=False) if branch else ""
+            passed = db.one("SELECT q.task FROM push_queue q JOIN tasks t ON t.id=q.task WHERE q.head=? AND "
+                            "t.kind='review' AND q.status!='cancelled' ORDER BY q.id DESC LIMIT 1",
+                            (tip,)) if tip else None
+            if passed:
+                return passed["task"], False
             if not add:
                 return None
             changes = worktree.diff_lines(self.p, [branch]) if branch else None

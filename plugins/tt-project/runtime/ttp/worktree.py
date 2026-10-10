@@ -667,8 +667,14 @@ _HEX = re.compile(r"\b[0-9a-f]{7,40}\b")
 
 
 def reviewed_refs(p: Project, task: dict) -> list[str]:
-    """What a review task reviews: the branches of the tasks it depends on, and the task branches
-    and commit hashes its spec names."""
+    """What a review task reviews: named_refs, and the fix branches that build on them (fix_branches)."""
+    refs = named_refs(p, task)
+    return list(dict.fromkeys(refs + list(fix_branches(p, task, refs))))
+
+
+def named_refs(p: Project, task: dict) -> list[str]:
+    """The branches of the tasks a review depends on, and the task branches and commit hashes its
+    spec names."""
     from .db import dependency_ids
     spec = task.get("spec") or ""
     ids = [i for i in dependency_ids(task) if i is not None]
@@ -676,6 +682,36 @@ def reviewed_refs(p: Project, task: dict) -> list[str]:
             if r["id"] in ids or re.search(rf"(?<![\w/.-]){re.escape(r['branch'])}(?![\w/-])", spec)]
     refs += _HEX.findall(spec)
     return list(dict.fromkeys(refs))
+
+
+def fix_branches(p: Project, task: dict, refs: list[str]) -> dict[str, str]:
+    """{fix branch: the reviewed branch it builds on}: for each branch in `refs`, the own branch of
+    the newest code task that carries it, other than the review itself. A fix or re-plan of a failed
+    review often cannot check the reviewed branch out (the reviewed task's worktree still holds it),
+    so it commits on its own ttp/t<id>-... branch from that branch's head (ensure); its re-review,
+    queued with it, names only the reviewed branch. A task carries a branch it labels
+    `pr_branch:<branch>`, or the branch of the task it continues (a code task's branch, or a branch
+    a continued review reviews). Failed and cancelled tasks carry nothing."""
+    from .db import continues_id
+    names = {r for r in refs if not _HEX.fullmatch(r)}
+    if not names:
+        return {}
+    newest: dict[str, tuple[int, str]] = {}
+    for t in p.db.q("SELECT * FROM tasks WHERE kind='code' AND branch IS NOT NULL AND branch!='' AND id!=? "
+                    "AND status NOT IN ('failed','cancelled') AND (labels LIKE '%\"pr_branch:%' "
+                    "OR labels LIKE '%\"continues:%')", (task["id"],)):
+        if t["branch"] in names:
+            continue
+        on = {carried_branch(t)} & names
+        prev = p.db.task(c) if not on and (c := continues_id(t)) is not None else None
+        if prev and prev["kind"] == "review":
+            on = set(named_refs(p, prev)) & names
+        elif prev:
+            on = {prev.get("branch")} & names
+        for ref in on:
+            if ref not in newest or t["id"] > newest[ref][0]:
+                newest[ref] = (t["id"], t["branch"])
+    return {b: ref for ref, (_, b) in sorted(newest.items(), key=lambda kv: kv[1][0])}
 
 
 def diff_lines(p: Project, refs: list[str]) -> dict[str, int | None] | None:

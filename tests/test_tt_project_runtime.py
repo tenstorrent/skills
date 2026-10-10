@@ -18319,6 +18319,84 @@ def test_an_invalid_push_approval_runs_the_review_again_once_then_fails_it(env, 
     assert not s.p.db.q("SELECT id FROM push_queue")
 
 
+def _re_plan(s, label):
+    """A re-plan of the failed review `s.review`, carrying the reviewed branch by `label`: the reviewed
+    task's worktree still holds that branch, so it commits on its own branch from that head (a
+    `continues:` one starts from the base, and its worker builds on the reviewed head)."""
+    from ttp import worktree
+    s.p.db.update_task(s.review, status="failed")
+    fix = s.p.db.add_task("Re-plan (narrowed)", "narrow it", kind="code", origin="coordinator", labels=[label])
+    path, branch = worktree.ensure(s.p, s.p.db.task(fix))
+    assert branch != s.branch
+    _git_out(path, "reset", "-q", "--hard", s.head)
+    _commit(path, "narrow.txt", "narrowed\n")
+    s.p.db.update_task(fix, branch=branch)
+    return fix, path, branch, _git_out(path, "rev-parse", "HEAD")
+
+
+@pytest.mark.parametrize("link", ["pr_branch", "continues"])
+def test_a_re_review_approves_the_head_its_re_plan_left_on_its_own_branch_in_one_run(env, monkeypatch, link):
+    """The coordinator queues a re-review with the re-plan; it names only the reviewed branch, and the
+    re-plan's head is on the re-plan's own branch. The push queue takes that head at once, with no
+    second review run, but only a commit that builds on the reviewed branch, on the newest fix branch."""
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    fix, path, branch, head = _re_plan(s, f"pr_branch:{s.branch}" if link == "pr_branch" else f"continues:{s.review}")
+    s.p.db.update_task(fix, status="done")
+    again = s.p.db.add_task("Re-review (narrowed)", f"Re-review branch {s.branch} after its re-plan.", kind="review",
+                            origin="coordinator")
+    # Not a commit that leaves the reviewed branch out, even on the newest fix branch.
+    _git_out(path, "checkout", "-q", "-b", "elsewhere", s.head + "~1")
+    _commit(path, "stray.txt", "not on the reviewed branch\n")
+    stray = _git_out(path, "rev-parse", "HEAD")
+    _git_out(path, "checkout", "-q", branch)
+    check = pushq.check_approval(s.p, s.p.db.task(again), [{"branch": branch, "head": stray}])
+    assert "none of the reviewed refs" in check["invalid"] and branch in check["invalid"]
+    later = s.p.db.add_task("Re-plan again", "s", kind="code", origin="coordinator", labels=[f"pr_branch:{s.branch}"])
+    s.p.db.update_task(later, branch="ttp/t%d-later" % later)
+    _git_out(s.repo, "branch", f"ttp/t{later}-later", stray)
+    assert "invalid" in pushq.check_approval(s.p, s.p.db.task(again), [{"branch": branch, "head": stray}])
+    s.p.db.update_task(later, status="cancelled")
+    t = _pq_hand_off(env, s, push=[{"branch": branch, "head": head}], task=again)
+    assert t["status"] == "pushing" and "woke" not in json.loads(t["result"])
+    [row] = s.p.db.q("SELECT * FROM push_queue")
+    assert (row["task"], row["head"], row["status"]) == (again, head, "approved")
+
+
+def _finish_fix(env, p, fix):
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage as Usage
+    p.db.update_task(fix, status="running")
+    run_dir = env["tmp"] / f"run-fix-{time.monotonic_ns()}"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps({"status": "done", "summary": "narrowed"}))
+    Daemon(p.base)._finish_worker({"task": fix}, Usage(cost_usd=1.0), "ok", run_dir)
+    return p.db.one("SELECT * FROM events WHERE task=? AND kind='task_done' ORDER BY id DESC", (fix,))
+
+
+@pytest.mark.parametrize("link", ["pr_branch", "continues"])
+def test_a_re_plan_head_gets_one_review_not_its_re_review_plus_a_daemon_review(env, monkeypatch, link):
+    s = _pq(env, monkeypatch)
+    fix, _, _, head = _re_plan(s, f"pr_branch:{s.branch}" if link == "pr_branch" else f"continues:{s.review}")
+    again = s.p.db.add_task("Re-review (narrowed)", f"Re-review branch {s.branch} after its re-plan.", kind="review",
+                            origin="coordinator")
+    done = _finish_fix(env, s.p, fix)
+    assert [r["id"] for r in s.p.db.q("SELECT id FROM tasks WHERE kind='review' AND status!='failed'")] == [again]
+    assert f"Review #{again} was already queued" in done["text"]
+    # A review that already passed the head (it ran while the re-plan waited on its checks) covers it too.
+    s.p.db.update_task(again, status="done", spec="Re-review the re-plan.")
+    s.p.db.x("INSERT INTO push_queue(task,run,branch,head,target,status,created,updated) "
+             "VALUES(?,1,'b',?,'origin/proj','pushed',0,0)", (again, head))
+    done = _finish_fix(env, s.p, fix)
+    assert not s.p.db.q("SELECT id FROM tasks WHERE kind='review' AND status NOT IN ('failed','done')")
+    assert f"Review #{again} was already queued" in done["text"]
+    # Without either, the daemon reviews it as before.
+    s.p.db.x("DELETE FROM push_queue")
+    _finish_fix(env, s.p, fix)
+    assert [r["title"][:len(f"Review #{fix}")] for r in s.p.db.q(
+        "SELECT title FROM tasks WHERE kind='review' AND status='queued'")] == [f"Review #{fix}"]
+
+
 @pytest.mark.parametrize("setting, push", [("push_allowed", None), ("push_queue", "pushed it")])
 def test_a_push_list_in_a_project_that_does_not_push_is_ignored_and_logged(env, monkeypatch, setting, push):
     """No pushing at all, or a stray `push` field (not a list of approvals) while the queue is off,
