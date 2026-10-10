@@ -107,7 +107,11 @@ def _tip(repo: Path, onto: str, fetch: bool) -> tuple[str, str]:
 
 
 def _push_ref(p, repo: Path) -> str:
+    """The push branch to look on: <remote>/<branch>, or the local refs/heads/<branch> when the repo
+    has no such remote (a remote-less repo pushes nowhere, so its branch is the local one)."""
     remote, branch = push.target(p, repo)
+    if remote not in _git(repo, "remote").stdout.split():
+        return f"refs/heads/{branch}"
     return f"{remote}/{branch}"
 
 

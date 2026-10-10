@@ -35474,3 +35474,28 @@ def test_heal_outage_check_exiting_an_error_code_gets_one_task(env):
     up.touch()
     assert heal.run(d, "svc", dict(spec, check=f"test -e {up}"), now + 1900)[0] == "ok (healthy)"
     assert "heal:svc" in [e["key"] for e in alerts.sweep(p.db)]
+
+
+def test_landed_falls_back_to_the_local_branch_in_a_repo_with_no_remote(tmp_path, monkeypatch):
+    """A remote-less repo: the push target's remote does not exist, so look on refs/heads/<branch>."""
+    from ttp import landed, push
+    repo = tmp_path / "r"
+    repo.mkdir()
+    _git_out(repo, "init", "-q", "-b", "main")
+    _git_out(repo, "-c", "user.name=t", "-c", "user.email=t@e", "commit", "-q", "--allow-empty", "-m", "a")
+    sha = _git_out(repo, "rev-parse", "HEAD")
+    monkeypatch.setattr(push, "target", lambda p, r: ("origin", "main"))
+    assert landed._push_ref(None, repo) == "refs/heads/main"
+    assert landed.check(None, repo, sha=sha)[0] == 0
+    _git_out(repo, "checkout", "-q", "-b", "side")
+    _git_out(repo, "-c", "user.name=t", "-c", "user.email=t@e", "commit", "-q", "--allow-empty", "-m", "b")
+    assert landed.check(None, repo, sha=_git_out(repo, "rev-parse", "HEAD"))[0] == 1
+
+
+@pytest.mark.parametrize("probe", ["landed:abc", "landed:#12 && true", "landed: #", " landed:#1x"])
+def test_check_probe_rejects_a_malformed_landed_probe(probe):
+    from ttp import coordinator as coord
+    with pytest.raises(ValueError, match="landed:#<task id>"):
+        coord.check_probe(probe)
+    for ok in ("landed:#12", " landed: 12 ", "test -f landed:x"):
+        coord.check_probe(ok)
