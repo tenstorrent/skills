@@ -642,7 +642,7 @@ def deferral(task: dict) -> dict:
     out: dict = {}
     for lb in labels if isinstance(labels, list) else []:
         key, _, val = lb.partition(":") if isinstance(lb, str) else ("", "", "")
-        if key == "start_when" and val.strip():
+        if key == "start_when" and val.strip() and val.strip().lower() != "now":   # `now` is no probe
             out["when"] = val
         elif key == "start_why" and val.strip():
             out["why"] = val

@@ -2039,14 +2039,15 @@ def cmd_task(a) -> None:
         if not a.title.strip().isdigit():
             die(f"set-when needs a task id, not {a.title!r}")
         try:
-            print(set_when(p.db, int(a.title), a.probe))
+            print(set_when(p.db, int(a.title), a.probe, p))
         except ValueError as e:
             die(str(e))
 
 
-def set_when(db, tid: int, probe: str | None) -> str:
+def set_when(db, tid: int, probe: str | None, p=None) -> str:
     """Re-point the probe of a task that has not started: a waiting task's `retry_when`, else its
-    `start_when` deferral. An empty probe clears it. Same checks as the coordinator's task_update."""
+    `start_when` deferral. An empty probe clears it. Same checks as the coordinator's task_update
+    (the push branch's log check needs `p`)."""
     from .coordinator import _start_args, check_probe, defer_labels, start_why
     from .db import TERMINAL_TASK_STATES, deferral, dump_result, load_result, without_deferral
     if probe is None:
@@ -2069,7 +2070,7 @@ def set_when(db, tid: int, probe: str | None) -> str:
             return f"task #{tid} retry_when " + (f"set: {probe.strip()}" if probe.strip()
                                                  else "cleared; it wakes at its retry timer")
         cur = deferral(task)
-        after, when = _start_args({"start_when": probe}, cur)
+        after, when = _start_args({"start_when": probe}, cur, p)
         db.update_task(tid, labels=without_deferral(json.loads(task["labels"] or "[]"))
                        + defer_labels(after, when, start_why({}, cur, when)), not_before=after)
         return f"task #{tid} start_when " + (f"set: {when}" if when else "cleared")

@@ -25341,6 +25341,102 @@ def test_task_add_start_when_now_adds_a_task_with_no_probe(env):
     assert _ready(p, tid) and not any(lb.startswith("start_when:") for lb in _labels(p, tid))
 
 
+def test_task_add_start_when_now_with_newlines_and_a_stored_now_label_are_no_probe(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.db import deferral
+    assert coord.apply(p, [{"type": "task_add", "title": "go", "spec": "s", "start_when": "\n NoW \t"}]) == []
+    tid = _added(p, "go")
+    assert _ready(p, tid) and not any(lb.startswith("start_when:") for lb in _labels(p, tid))
+    # A `now` stored before it was cleared at add time is no probe either: the task starts.
+    assert deferral({"labels": json.dumps(["start_when: Now ", "deferred_since:1"])}) == {"since": 1.0}
+
+
+def test_a_new_start_when_is_never_run_at_defer_time(env, monkeypatch):
+    p = make(env)
+    from ttp import cli
+    from ttp import coordinator as coord
+    # The daemon applies a turn inside one write transaction (BEGIN IMMEDIATE) and `ttp task set-when`
+    # holds one too: a probe run there would hold the project DB's write lock. Only static checks.
+    assert coord.apply(p, [{"type": "task_add", "title": "t", "spec": "s", "start_when": "test -f out/x"}]) == []
+    tid = _added(p, "t")
+    spawned = []
+
+    class Spy(subprocess.Popen):
+        def __init__(self, *a, **k):
+            spawned.append(a[0] if a else k.get("args"))
+            super().__init__(*a, **k)
+
+    monkeypatch.setattr(subprocess, "Popen", Spy)
+    slow, broken = "sleep 30; exit 9", "git cat-file -e 0123456789abcdef"
+    t0 = time.time()
+    with p.db.tx():
+        assert coord.apply(p, [{"type": "task_add", "title": "slow", "spec": "s", "start_when": slow},
+                               {"type": "task_update", "id": tid, "start_when": "now-ish"}]) == []
+    assert cli.set_when(p.db, tid, broken, p) == f"task #{tid} start_when set: {broken}"
+    assert time.time() - t0 < 5 and not spawned, spawned
+    assert f"start_when:{slow}" in _labels(p, _added(p, "slow")) and f"start_when:{broken}" in _labels(p, tid)
+
+
+@pytest.mark.parametrize("probe", ["landed:#12 || exit 1", "landed:12x", "landed:#", "Landed:#12"])
+def test_a_start_when_that_is_not_exactly_landed_id_is_refused(env, probe):
+    p = make(env)
+    from ttp import cli
+    from ttp import coordinator as coord
+    out = coord.apply(p, [{"type": "task_add", "title": "bad", "spec": "s", "start_when": probe}])
+    assert len(out) == 1 and "exactly `landed:#<id>`" in out[0] and "ttp landed --task" in out[0], out
+    assert not p.db.q("SELECT id FROM tasks WHERE title='bad'")
+    assert coord.apply(p, [{"type": "task_add", "title": "t", "spec": "s", "start_when": "landed:#12"}]) == []
+    tid = _added(p, "t")
+    with pytest.raises(ValueError, match="exactly `landed:#<id>`"):
+        cli.set_when(p.db, tid, probe, p)
+    for ok in (" landed: 12 ", "landed:12", "ttp landed --task 12 && test -f out/x"):
+        assert coord.apply(p, [{"type": "task_update", "id": tid, "start_when": ok}]) == [], ok
+
+
+@pytest.mark.parametrize("probe", [
+    "git log origin/work --oneline | grep -q 'fix the thing'",
+    "git fetch -q origin work && git log --format=%s origin/work | grep -F 'add x'",
+    "git -C repo log work --grep 'subject' | grep -q .",
+    "git --no-pager log origin/work 2>&1 | head -50 | grep -qi 'x'",
+    'test -n "$(git log --grep x origin/work)"',
+])
+def test_start_when_grepping_the_push_branch_log_is_refused_for_landed(env, probe):
+    p = make(env)
+    from ttp import cli
+    from ttp import coordinator as coord
+    p.set_config("delivery.push_branch", "work")
+    out = coord.apply(p, [{"type": "task_add", "title": "after", "spec": "s", "start_when": probe}])
+    assert len(out) == 1 and "push branch's log" in out[0] and "landed:#<id>" in out[0], out
+    assert not p.db.q("SELECT id FROM tasks WHERE title='after'")
+    # The same on task_update and `ttp task set-when`: the task keeps its old probe.
+    assert coord.apply(p, [{"type": "task_add", "title": "t", "spec": "s", "start_when": "test -f out/x"}]) == []
+    tid = _added(p, "t")
+    out = coord.apply(p, [{"type": "task_update", "id": tid, "start_when": probe}])
+    assert len(out) == 1 and "push branch's log" in out[0], out
+    with pytest.raises(ValueError, match="push branch's log"):
+        cli.set_when(p.db, tid, probe, p)
+    assert "start_when:test -f out/x" in _labels(p, tid)
+    # Another branch's log, and landed:#<id>, are fine.
+    other = probe.replace("work", "other")
+    assert coord.apply(p, [{"type": "task_add", "title": "o", "spec": "s", "start_when": other + " || exit 1"}]) == []
+    assert coord.apply(p, [{"type": "task_add", "title": "l", "spec": "s", "start_when": "landed:#4"}]) == []
+
+
+@pytest.mark.parametrize("probe", [
+    "git show origin/work:file | grep -q x",
+    "git fetch -q origin work && git show origin/work:docs/log.md | grep -q 'x' || exit 1",
+    "git fetch -q origin work && git log origin/other --oneline | grep -q x || exit 1",
+    "git log --oneline -1 | grep -q work || exit 1",
+])
+def test_start_when_grepping_a_file_or_another_log_is_no_push_branch_log_grep(env, probe):
+    p = make(env)
+    from ttp import coordinator as coord
+    p.set_config("delivery.push_branch", "work")
+    assert coord.apply(p, [{"type": "task_add", "title": "ok", "spec": "s", "start_when": probe}]) == []
+    assert f"start_when:{probe}" in _labels(p, _added(p, "ok"))
+
+
 def test_task_update_start_when_real_probe_is_still_stored(env):
     p = make(env)
     from ttp import coordinator as coord
@@ -25371,7 +25467,10 @@ def test_a_start_when_probe_waits_for_start_after(env, monkeypatch):
     assert _ready(p, tid)
 
 
-@pytest.mark.parametrize("probe, why", [("exit 3", "exit 3"), ("sleep 30", "timeout")])
+# Defer time does not run the probe (check_start_when): one that cannot work (127, a bare `git
+# cat-file -e`'s 128) is accepted then, and raised by the daemon's first run of it.
+@pytest.mark.parametrize("probe, why", [("exit 3", "exit 3"), ("sleep 30", "timeout"), ("now-ish", "exit 127"),
+                                        ("git cat-file -e 0123456789abcdef", "exit 128")])
 def test_a_broken_start_when_raises_one_event_and_never_a_worker_run(env, monkeypatch, probe, why):
     p = make(env)
     from ttp import coordinator as coord

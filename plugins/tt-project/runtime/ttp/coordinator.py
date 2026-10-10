@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from . import locks
-from . import anchors, effort, ends, heal, jevuse, machine_ledger, machines, pauseends, prguard, push, responsibilities, reviewcap, shared, unblock, upstream, worktree
+from . import anchors, effort, ends, heal, jevuse, landed, machine_ledger, machines, pauseends, prguard, push, responsibilities, reviewcap, shared, unblock, upstream, worktree
 from . import screen as scr
 from . import schedule as sched
 from .db import (PAUSED_RESOURCES_KEY, SEVERITY_RANK, SHARED_SEEN_KEY, TERMINAL_TASK_STATES, continues_id, deferral,
@@ -664,9 +664,10 @@ def parse_start_after(raw: Any, now: float | None = None) -> float | None:
     return at if at > now else None
 
 
-def _start_args(a: dict, cur: dict) -> tuple[float | None, str | None]:
+def _start_args(a: dict, cur: dict, p: Project | None = None) -> tuple[float | None, str | None]:
     """A task_add/task_update's deferral: (start_after, start_when), each kept from `cur` (the
-    task's current deferral) when the action leaves it out. `now` and an empty probe clear them."""
+    task's current deferral) when the action leaves it out. `now` and an empty probe clear them.
+    A new probe gets static checks only (check_start_when)."""
     after = parse_start_after(a["start_after"]) if a.get("start_after") is not None else cur.get("after")
     when = a.get("start_when")
     if when is None:
@@ -675,7 +676,41 @@ def _start_args(a: dict, cur: dict) -> tuple[float | None, str | None]:
         check_probe(when)
         if when.strip().lower() == "now":   # `now` clears the probe, as for start_after; never a command
             when = ""
+        if when.strip() and when.strip() != cur.get("when"):
+            check_start_when(when.strip(), p)
     return after, (when.strip() or None) if when else None
+
+
+# `git [options] log <args>` and the commands its output is piped into. `log` in a path or after the
+# pipe is no `git log`: `git show <branch>:<file> | grep` checks a file's content.
+_REDIR = r"(?:>&|&>|[^|;&\n])"
+_GIT_LOG = re.compile(rf"\bgit(?:\s+-[^\s|;&]+(?:\s+[^\s|;&-][^\s|;&]*)??)*\s+log(?![\w-])"
+                      rf"(?P<args>{_REDIR}*)(?P<piped>(?:\|(?!\|){_REDIR}*)*)")
+
+
+def check_start_when(probe: str, p: Project | None = None) -> None:
+    """Static checks of a new start_when; it is never run when it is set: the daemon applies a turn
+    inside one write transaction and `ttp task set-when` holds one, so a run would hold the project
+    DB's write lock. Raises for a `landed:` probe that is not exactly `landed:#<id>`, and, with `p`,
+    for a `git log` of the push branch whose output is grepped (piped into grep, or `--grep`):
+    batches write their own subjects, so it never matches; `landed:#<id>` is the probe for that.
+    Known gap: a probe that passes these but fails when run (127: no such command; a bare
+    `git cat-file -e` exits 128) is only raised to the coordinator after the daemon's first run of
+    it, once, as a `deferral_probe_broken` event."""
+    if landed.LANDED_PROBE.fullmatch(probe):
+        return
+    if re.match(r"\s*landed:", probe, re.I):
+        raise ValueError(f"start_when {clip(probe, 160)!r}: write exactly `landed:#<id>` (one task id); to "
+                         f"combine it with another check, use `ttp landed --task <id> && ...`")
+    branch = str((p.config().get("delivery") or {}).get("push_branch") or "").strip() if p else ""
+    if not branch:
+        return
+    named = re.compile(rf"(?<![\w.-]){re.escape(branch)}(?![\w/-])")   # also as origin/<branch>
+    for m in _GIT_LOG.finditer(probe):
+        if named.search(m["args"]) and ("--grep" in m["args"] or re.search(r"\b[ef]?grep\b", m["piped"])):
+            raise ValueError(f"start_when {clip(probe, 160)!r} greps the push branch's log, which never matches: "
+                             f"the push queue writes its own commit subjects. Wait for a task's change with "
+                             f"start_when `landed:#<id>`, or for a commit with `ttp landed <sha>`")
 
 
 HOLD_NEEDS_ANCHOR = ("a hold needs `waits_on`: ask:<id> (an open ask, or ask:new for the ask_user of this turn), "
@@ -894,7 +929,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     labels.append(f"pr_branch:{onto}")
                 if old:
                     labels.append(f"continues:{old['id']}")
-                after, when = _start_args(a, {})
+                after, when = _start_args(a, {}, p)
                 labels += defer_labels(after, when, start_why(a, {}, when))
                 why = prguard.spec_problem(db, a.get("spec") or "")
                 if why:
@@ -977,7 +1012,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         raise ValueError(f"task #{task['id']} is {task['status']}: only a task that has not "
                                          f"started can be deferred; add a new one with start_after/start_when")
                     cur = deferral(task)
-                    after, when = _start_args(a, cur)
+                    after, when = _start_args(a, cur, p)
                     labels = upd.get("labels")
                     labels = json.loads(task["labels"] or "[]") if labels is None else labels
                     upd["labels"] = without_deferral(labels) + defer_labels(after, when, start_why(a, cur, when))
