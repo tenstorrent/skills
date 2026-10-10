@@ -33835,6 +33835,19 @@ def test_probes_that_can_never_pass_are_flagged_once_per_wait(env, tmp_path):
     assert len(_never(p, unknown)) == 1 and "unknown to its runner" in _never(p, unknown)[0]["text"]
 
 
+def test_a_probe_that_exits_0_wakes_its_task_and_is_never_flagged(env, tmp_path):
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    # devq's own probe exits 0 for a job unknown to its runner: the task wakes, with no extra event.
+    unknown = _due_waiting_task(p, f"{_fake_ttp(tmp_path, 0, 'j: unknown to the runner in /x')} devq probe r j")
+    _settle_probe(d, unknown)
+    assert _ready(p, unknown) and not _never(p, unknown)
+    # The same for any probe that passes, even one naming a run dir that is gone.
+    gone = _due_waiting_task(p, f"test -e {p.runs}/99999/done || true")
+    _settle_probe(d, gone)
+    assert _ready(p, gone) and not _never(p, gone)
+
 
 def test_wait_stale_shows_the_gate_and_flags_same_output_while_a_named_task_has_ended(env):
     from ttp.daemon import Daemon

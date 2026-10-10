@@ -4084,9 +4084,9 @@ class Daemon:
         """One `probe_never_passes` event per wait for a waiting task whose probe can never pass
         (waitheal.never_passes; at wait_stale also the same output for max_hold_s while a task it names
         has ended). Checked when the wait starts, on each verdict and at wait_stale. The task keeps
-        its timer and its probe; the coordinator decides."""
+        its timer and its probe; the coordinator decides. A probe that exits 0 passed: its task wakes."""
         prev = load_result(task["result"])
-        if prev.get("status") != "waiting" or prev.get("retry_when") != probe:
+        if rc == 0 or prev.get("status") != "waiting" or prev.get("retry_when") != probe:
             return
         tid, db = task["id"], self.p.db
         since = prev.get("waiting_since")
