@@ -387,19 +387,32 @@ def settle_receipts(db: DB, source: str, since: float, subjects: Any, now: float
 # Mutes ----------------------------------------------------------------------------------------
 # A known, recurring condition the user was already told about and nothing of ours can fix: its
 # observations are still recorded and counted, but do not wake the coordinator until the mute
-# ends, when one summary event does.
+# ends, when one summary event does. A mute hides noise, never a box or workload that stays down:
+# a muted condition still seen escalate_after_h after it was first muted queues one high event
+# (MUTE_PERSISTS), once per mute, re-armed when the condition clears and comes back.
 MUTES_KEY = "observation_mutes"   # kv: list of active mutes, oldest first
 MUTE_MIN_MATCH, MUTE_MAX_H, MUTE_MAX = 3, 72, 20
 MUTE_BELOW = ("normal", "high", "critical")
+MUTE_ESCALATE_H = 2.0   # default escalate_after_h; 0 never escalates (needs a `why` naming who handles it)
+MUTE_ESCALATE_MIN_H = 0.5
+# A muted condition not seen for this long has cleared: its next sighting starts a new clock. Generous,
+# so a watcher that runs less often than every half hour still counts as seeing it all along.
+MUTE_CLEAR_GAP_S = 3 * 3600
+MUTE_CONDS_MAX = 50   # conditions tracked per mute; the longest unseen go first
+MUTE_PERSISTS = "under mute: is the expected recovery happening?"   # the escalation's text; effort trigger
 
 
 def mute(db: DB, source: Any, match: Any, hours: Any, below: Any = None, why: Any = "",
-         now: float | None = None) -> dict:
+         now: float | None = None, escalate_after_h: Any = None) -> dict:
     """Mute observations from `source` whose text contains `match` (any case) and whose severity is
-    below `below` (default critical), for `hours`. Muting the same source and match again replaces
-    its end, threshold and reason and keeps its count. Raises ValueError on bad input."""
+    below `below` (default critical), for `hours`. A matching condition still seen `escalate_after_h`
+    (default MUTE_ESCALATE_H) after it was first muted queues one high event; 0 never does and needs
+    a `why`. Muting the same source and match again replaces its end, threshold, reason and
+    escalation (kept when not given) and keeps its count and the clocks of its conditions, except
+    those that already escalated, which re-arm from now. Raises ValueError on bad input."""
     now = time.time() if now is None else now
     source, match = str(source or "").strip(), str(match or "").strip()
+    why = str(why or "").strip()[:300]
     if not source:
         raise ValueError("observation_mute needs `source`, the observations' source as the digest shows it "
                          "(e.g. watcher:<name>)")
@@ -415,14 +428,31 @@ def mute(db: DB, source: Any, match: Any, hours: Any, below: Any = None, why: An
     below = str(below or "critical").strip().lower()
     if below not in MUTE_BELOW:
         raise ValueError(f"observation_mute `below` must be one of {', '.join(MUTE_BELOW)}; got {below!r}")
+    esc = None
+    if escalate_after_h not in (None, ""):
+        try:
+            esc = float(escalate_after_h)
+        except (TypeError, ValueError):
+            esc = float("nan")
+        if not (esc == 0 or MUTE_ESCALATE_MIN_H <= esc <= MUTE_MAX_H):
+            raise ValueError(f"observation_mute `escalate_after_h` must be 0 (never) or from "
+                             f"{MUTE_ESCALATE_MIN_H:g} to {MUTE_MAX_H}; got {escalate_after_h!r}")
+        if esc == 0 and not why:
+            raise ValueError("observation_mute `escalate_after_h` 0 (never escalate) needs a `why` naming who "
+                             "handles the recovery")
     with db.tx():
         active = db.kv(MUTES_KEY, []) or []
         old = next((m for m in active if _same_mute(m, source, match)), None)
         if old is None and len(active) >= MUTE_MAX:
             raise ValueError(f"observation_mute rejected: {MUTE_MAX} mutes are already active; let one end first")
-        m = {"source": source, "match": match, "below": below, "hours": h, "why": str(why or "").strip()[:300],
+        if esc is None:
+            esc = float(old.get("escalate_after_h", MUTE_ESCALATE_H)) if old else MUTE_ESCALATE_H
+        conds = {k: ({**c, "first_at": now, "escalated": False} if c.get("escalated") else c)
+                 for k, c in ((old or {}).get("conds") or {}).items()}
+        m = {"source": source, "match": match, "below": below, "hours": h, "why": why,
              "since": old["since"] if old else now, "until": now + h * 3600,
-             "count": old["count"] if old else 0, "last_at": old["last_at"] if old else None}
+             "count": old["count"] if old else 0, "last_at": old["last_at"] if old else None,
+             "escalate_after_h": esc, "armed_at": now, "conds": conds}
         db.set_kv(MUTES_KEY, [x for x in active if x is not old] + [m])
     return m
 
@@ -438,7 +468,8 @@ def mutes(db: DB, now: float | None = None) -> list[dict]:
 
 
 def count_muted(db: DB, source: str, text: str, severity: str, now: float | None = None) -> dict | None:
-    """The active mute covering this observation, after counting it there; None when none does."""
+    """The active mute covering this observation, after counting it there and tracking how long each
+    of its conditions has persisted; None when none does."""
     now = time.time() if now is None else now
     rank, low = SEVERITY_RANK.get(severity, 1), text.lower()
     if not db.kv(MUTES_KEY):
@@ -449,9 +480,61 @@ def count_muted(db: DB, source: str, text: str, severity: str, now: float | None
             if (float(m["until"]) > now and m["source"].lower() == source.lower() and m["match"].lower() in low
                     and rank < SEVERITY_RANK[m["below"]]):
                 m["count"], m["last_at"] = int(m["count"]) + 1, now
+                _track(db, m, source, text, now)
                 db.set_kv(MUTES_KEY, active)
                 return m
     return None
+
+
+def _mute_conditions(m: dict, source: str, text: str) -> list[tuple[str, str, bool]]:
+    """(key, text, cleared) for each condition of an observation `m` covers: the items of a command-watcher
+    line that contain the match (all of them when only the whole line does), else the whole text."""
+    items = watcher_conditions(source, text)
+    if items is None:
+        return [(fingerprint(source, text), text.strip().splitlines()[0][:160] if text.strip() else source, False)]
+    out = [(condition_fingerprint(source, subj, cond), f"{subj}: {cond}" if subj else cond, cleared)
+           for subj, cond, cleared in items]
+    return [c for c in out if m["match"].lower() in c[1].lower()] or out
+
+
+def _track(db: DB, m: dict, source: str, text: str, now: float) -> None:
+    """Start, continue or clear the clock of each condition this muted observation reports, and queue
+    the one high event for each that persisted past the mute's escalate_after_h."""
+    conds = m.setdefault("conds", {})
+    armed = float(m.get("armed_at") or m["since"])
+    esc_h = float(m.get("escalate_after_h", MUTE_ESCALATE_H))
+    for key, item, cleared in _mute_conditions(m, source, text):
+        c = conds.get(key)
+        if cleared:
+            if c:
+                conds[key] = {"first_at": None, "last_at": now, "escalated": False, "text": item[:160]}
+            continue
+        if c is None:   # one seen around when the mute began is what it was set for: its clock starts then
+            c = {"first_at": armed if now - armed <= MUTE_CLEAR_GAP_S else now, "escalated": False}
+        elif c.get("first_at") is None or now - float(c.get("last_at") or 0) > MUTE_CLEAR_GAP_S:
+            c = {"first_at": now, "escalated": False}   # it cleared and came back: re-armed
+        c.update(last_at=now, text=item[:160])
+        conds[key] = c
+        age = now - float(c["first_at"])
+        if esc_h > 0 and not c["escalated"] and age >= esc_h * 3600:
+            c["escalated"] = True
+            db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                 (now, m["source"], "observation", "high",
+                  f"{m['source']} {m['match']!r} has persisted {_h(age)} h {MUTE_PERSISTS} Seen now: {item[:160]}"
+                  + (f". Muted because: {m['why']}" if m.get("why") else ""), "queued"))
+    if len(conds) > MUTE_CONDS_MAX:
+        keep = sorted(conds, key=lambda k: float(conds[k].get("last_at") or 0))[-MUTE_CONDS_MAX:]
+        m["conds"] = {k: conds[k] for k in keep}
+
+
+def mute_ages(m: dict, now: float | None = None) -> list[str]:
+    """How long each condition `m` covers has persisted under it ("2.1 h (asked)"), longest first;
+    conditions that cleared or went unseen past MUTE_CLEAR_GAP_S are left out."""
+    now = time.time() if now is None else now
+    live = [c for c in (m.get("conds") or {}).values()
+            if c.get("first_at") is not None and now - float(c.get("last_at") or 0) <= MUTE_CLEAR_GAP_S]
+    return [f"{_h(now - float(c['first_at']))} h" + (" (asked)" if c.get("escalated") else "")
+            for c in sorted(live, key=lambda c: float(c["first_at"]))]
 
 
 def expire_mutes(db: DB, now: float | None = None) -> list[dict]:
@@ -479,8 +562,16 @@ def mute_line(m: dict, now: float | None = None) -> str:
     now = time.time() if now is None else now
     n = int(m["count"])
     seen = f"{n} muted, last at {_when(m['last_at'])}" if n else "none muted yet"
-    return (f"{m['source']} {m['match']!r} below {m['below']}: {seen}; ends in "
-            f"{max(0.0, (float(m['until']) - now) / 3600):.1f} h" + (f" ({m['why']})" if m.get("why") else ""))
+    ages = mute_ages(m, now)
+    esc = float(m.get("escalate_after_h", MUTE_ESCALATE_H))
+    return (f"{m['source']} {m['match']!r} below {m['below']}: {seen}; "
+            + (f"persisting {', '.join(ages)}; " if ages else "")
+            + (f"asks after {_h(esc * 3600)} h; " if esc > 0 else "never asks; ")
+            + f"ends in {max(0.0, (float(m['until']) - now) / 3600):.1f} h" + (f" ({m['why']})" if m.get("why") else ""))
+
+
+def _h(seconds: float) -> str:
+    return f"{seconds / 3600:.1f}".rstrip("0").rstrip(".")
 
 
 def _hours(m: dict) -> str:

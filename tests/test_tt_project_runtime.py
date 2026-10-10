@@ -2298,6 +2298,119 @@ def test_observation_mute_rejects_bad_input(env):
     assert m["below"] == "high" and m["until"] > time.time() + 7 * 3600
 
 
+def test_mute_escalates_once_when_a_muted_condition_persists(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import screen as scr
+    t0 = 1_800_000_000.0
+
+    def asks():
+        return p.db.q("SELECT id, ts, severity, text FROM events WHERE kind='observation' AND text LIKE ?",
+                      (f"%{scr.MUTE_PERSISTS}%",))
+
+    def see(text, at):
+        return scr.count_muted(p.db, "watcher:hw", text, "high", now=at)
+
+    # A 24 h mute whose condition is still seen at 2 h 1 min: exactly one high event, however often seen.
+    scr.mute(p.db, "watcher:hw", "held", 24, why="user told", now=t0)
+    for at in (t0, t0 + 3600, t0 + 7260, t0 + 9000, t0 + 10800):
+        assert see("box-a: held, auto power cycle off", at)
+    [e] = asks()
+    assert e["severity"] == "high" and e["ts"] == t0 + 7260, e
+    assert e["text"].startswith("watcher:hw 'held' has persisted 2 h under mute: is the expected recovery"), e
+    labels, _ = coord.effort_triggers(p.db, p.config(), [e["id"]], None, now=t0 + 7260)
+    assert "muted condition persists" in labels and "high severity event" in labels, labels
+    [m] = scr.mutes(p.db, t0 + 10800)
+    assert "persisting 3 h (asked); asks after 2 h; ends in 21.0 h" in scr.mute_line(m, t0 + 10800), m
+    # It cleared (the watcher says so) and came back: re-armed, one more event 2 h after it returned.
+    see("box-a: cleared: held, auto power cycle off", t0 + 12600)
+    assert scr.mute_ages(scr.mutes(p.db, t0 + 12600)[0], t0 + 12600) == []
+    for at in (t0 + 14400, t0 + 18000, t0 + 21660, t0 + 23400):
+        see("box-a: held, auto power cycle off", at)
+    assert [a["ts"] for a in asks()] == [t0 + 7260, t0 + 21660]
+    # Extending the mute keeps an unasked condition's clock (re-muting never hides it); one that already
+    # asked re-arms from the new mute.
+    see("box-b: held", t0 + 23400)
+    scr.mute(p.db, "watcher:hw", "held", 24, why="user told", now=t0 + 25200)
+    see("box-b: held", t0 + 30660)   # box-b: 2 h 1 min since first seen
+    see("box-a: held, auto power cycle off", t0 + 30660)   # box-a: 1.5 h since the re-mute
+    assert len(asks()) == 3 and "box-b" in asks()[-1]["text"]
+
+
+def test_mute_escalation_skips_cleared_conditions_and_honours_never(env):
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import screen as scr
+    t0 = 1_800_000_000.0
+
+    def asks():
+        return p.db.q("SELECT text FROM events WHERE kind='observation' AND text LIKE ?", (f"%{scr.MUTE_PERSISTS}%",))
+
+    scr.mute(p.db, "watcher:hw", "held", 24, now=t0)
+    # Cleared by the watcher, then back for under 2 h: none.
+    scr.count_muted(p.db, "watcher:hw", "box-a: held", "high", now=t0 + 600)
+    scr.count_muted(p.db, "watcher:hw", "box-a: cleared: held", "info", now=t0 + 1800)
+    scr.count_muted(p.db, "watcher:hw", "box-a: held", "high", now=t0 + 3600)
+    scr.count_muted(p.db, "watcher:hw", "box-a: held", "high", now=t0 + 7260)
+    # Gone quiet for longer than MUTE_CLEAR_GAP_S counts as cleared: none either.
+    scr.count_muted(p.db, "watcher:hw", "box-c: held", "high", now=t0 + 900)
+    scr.count_muted(p.db, "watcher:hw", "box-c: held", "high", now=t0 + 900 + scr.MUTE_CLEAR_GAP_S + 60)
+    # A plain (non-watcher) source keys on the text.
+    scr.mute(p.db, "pr", "mergeable", 24, now=t0)
+    scr.count_muted(p.db, "pr", "PR #1 not mergeable", "normal", now=t0 + 600)
+    scr.count_muted(p.db, "pr", "PR #1 not mergeable", "normal", now=t0 + 7000)
+    assert asks() == []
+    scr.count_muted(p.db, "pr", "PR #1 not mergeable", "normal", now=t0 + 7300)
+    assert len(asks()) == 1
+    # escalate_after_h 0 never asks, and only with a why; bad values are refused.
+    ok = {"type": "observation_mute", "source": "watcher:x", "match": "dropped", "hours": 24}
+    bad = coord.apply(p, [{**ok, "escalate_after_h": 0}, {**ok, "escalate_after_h": 0.1},
+                          {**ok, "escalate_after_h": 99}, {**ok, "escalate_after_h": "soon"}])
+    assert len(bad) == 4 and all("escalate_after_h" in b for b in bad) and "why" in bad[0], bad
+    assert coord.apply(p, [{**ok, "escalate_after_h": 0, "why": "the hardware team handles it"},
+                           {**ok, "source": "watcher:y", "escalate_after_h": 6}]) == []
+    never = next(m for m in scr.mutes(p.db) if m["source"] == "watcher:x")
+    assert never["escalate_after_h"] == 0
+    t1 = time.time()
+    for at in (t1 + i * 1800 for i in range(17)):   # every 30 min for 8 h
+        scr.count_muted(p.db, "watcher:x", "box-a: tray dropped", "high", now=at)
+        scr.count_muted(p.db, "watcher:y", "box-a: tray dropped", "high", now=at)
+    assert len(asks()) == 2 and "watcher:y" in asks()[-1]["text"]
+    assert "never asks" in scr.mute_line(never, t1 + 8 * 3600)
+
+
+def test_mute_replay_of_a_held_box_wakes_the_coordinator_two_hours_in(env, monkeypatch):
+    """The post-mortem timeline: muted at 10:01 for 24 h, the watcher reports the held box every 30 min.
+    Before, nothing woke for 24 h; now the coordinator wakes at high effort at about 12:01."""
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import daemon as dm
+    from ttp import screen as scr
+    from ttp.cli import status_text
+    clock = {"t": 1_800_000_000.0}
+    monkeypatch.setattr(scr.time, "time", lambda: clock["t"])
+    out = {"stdout": ""}
+    monkeypatch.setattr(dm.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, out["stdout"], ""))
+    d = dm.Daemon(p.base)
+    out["stdout"] = json.dumps({"text": "box-a: held by the broker", "severity": "high", "repeat": True})
+    d._run_command_watcher({"name": "hw"}, {"command": "x"})   # 10:01, wakes; the coordinator mutes it
+    muted_at = clock["t"]
+    assert coord.apply(p, [{"type": "observation_mute", "source": "watcher:hw", "match": "held",
+                            "hours": 24, "why": "known"}]) == []
+    woke = []
+    for i in range(1, 12):
+        clock["t"] = muted_at + i * 1800
+        n = len(p.db.q("SELECT id FROM events WHERE kind='observation' AND status='queued'"))
+        d._run_command_watcher({"name": "hw"}, {"command": "x"})
+        if len(p.db.q("SELECT id FROM events WHERE kind='observation' AND status='queued'")) > n:
+            woke.append((clock["t"] - muted_at) / 3600)
+    assert woke == [2.0], woke   # 12:01, and only then
+    [e] = p.db.q("SELECT * FROM events WHERE text LIKE ?", (f"%{scr.MUTE_PERSISTS}%",))
+    assert e["status"] == "queued" and e["severity"] == "high" and e["ts"] == muted_at + 7200, dict(e)
+    assert "persisting 5.5 h (asked)" in status_text(p)
+    assert "persisting 5.5 h" in coord.digest(p, {}, [], [])
+
+
 def test_missed_schedule_runs_once_on_wake(env):
     p = make(env)
     from ttp import schedule as sched

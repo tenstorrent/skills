@@ -500,14 +500,15 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
             "## Recurring (as last turn): " + ", ".join(f"{s['name']} {'on' if s['enabled'] else 'off'}"
                                                         for s in recurring))
     muted = scr.mutes(db, now)
-    lines = ["## Muted observations (recorded and counted, never wake you; one summary event when each ends)"] \
-        if muted else []
+    lines = ["## Muted observations (recorded and counted, never wake you; one high event if a condition "
+             "persists past its ask time; one summary event when each ends)"] if muted else []
     for m in muted:
         lines.append(f"- {clip(scr.mute_line(m, now), MUTE_CHARS)}")
     section("muted", lines, json.dumps([[m["source"], m["match"], m["below"], m["until"], m.get("why")] for m in muted]),
             "## Muted observations (as last turn; never wake you): "
-            + "; ".join(f"{m['source']} {m['match']!r}: {int(m['count'])} muted, ends in "
-                        f"{max(0.0, (float(m['until']) - now) / 3600):.1f} h" for m in muted))
+            + "; ".join(f"{m['source']} {m['match']!r}: {int(m['count'])} muted, "
+                        + (f"persisting {', '.join(scr.mute_ages(m, now))}, " if scr.mute_ages(m, now) else "")
+                        + f"ends in {max(0.0, (float(m['until']) - now) / 3600):.1f} h" for m in muted))
     # Open asks of any age: one still waits on the user however long ago it was sent.
     lines = []
     blockers = db.q("SELECT * FROM messages WHERE kind='ask' AND handled=0 ORDER BY id DESC LIMIT 10")
@@ -1207,7 +1208,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                by="coordinator", key=key, end=pauseends.from_action(a) if a["paused"] else None)
             elif t == "observation_mute":
                 scr.mute(db, a.get("source"), a.get("match"), a.get("hours"), a.get("below"),
-                         a.get("why") or a.get("reason") or a.get("text") or "")
+                         a.get("why") or a.get("reason") or a.get("text") or "",
+                         escalate_after_h=a.get("escalate_after_h"))
             elif t in ("noop", "escalate", None):
                 pass   # an escalation is the daemon's (Daemon._finish_coordinator); here it changes nothing
             else:
@@ -1442,6 +1444,9 @@ def effort_triggers(db, cfg: dict, event_ids: list[int], wake_due: str | None,
     # Holds that wait on nothing anyone will act on (anchors.py): the daemon raises each new set once.
     if any(r["kind"] == anchors.STALE_EVENT for r in rows):
         add(anchors.TRIGGER)
+    # A muted condition that outlasted its mute's escalate_after_h: is its recovery happening?
+    if any(r["kind"] == "observation" and scr.MUTE_PERSISTS in (r["text"] or "") for r in rows):
+        add("muted condition persists")
     if any(r["severity"] in EFFORT_SEVERITIES for r in rows):
         add("high severity event")
     if msg_ids:
