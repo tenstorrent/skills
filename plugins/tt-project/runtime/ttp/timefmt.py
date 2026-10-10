@@ -7,7 +7,9 @@ project keeps the IANA zone of the user's workstation as `home_timezone` in its 
 machine that last set it as `home_timezone_from`:
 
 - `ttp new` records the zone of the machine it runs on; created on another machine from a
-  workstation, it records the workstation's zone (sent as `--home-tz`), never the box's.
+  workstation, it records the workstation's zone (sent as `--home-tz`), never the box's. From an ssh
+  login (a server's zone) it sends none, and the project gets the `migrate` zone with no
+  `home_timezone_from`, so no machine's spend push moves it before the workstation's next connect.
 - `ttp connect` from a workstation sends its current zone (`--home-tz`), and so does a local
   `ttp connect` typed on the project's own machine; neither does from an ssh login (a server's zone). A machine's spend push
   (globalcap.push) carries its zone too, and moves only the projects that machine set last. A
@@ -160,15 +162,21 @@ def follow_push(p, tz: str | None, source: str) -> bool:
     return set_home(p, tz, source, f"from {source}")
 
 
+def fallback() -> tuple[str, bool]:
+    """The zone for a project no workstation sent one for: the account's budget.timezone if set,
+    else this machine's. Returns (zone, whether it is the account's)."""
+    from .project import load_account_settings
+    acct = valid((load_account_settings().get("budget") or {}).get("timezone"))
+    return acct or detect_local(), bool(acct)
+
+
 def migrate(p, log=None) -> str | None:
     """A project with no home zone gets the account's budget.timezone if set, else this machine's
     zone. Returns the zone it set, or None when it had one."""
     raw = p.raw_config()
     if p.config_status != "ok" or not raw or valid(raw.get(KEY)):
         return None
-    from .project import load_account_settings
-    acct = valid((load_account_settings().get("budget") or {}).get("timezone"))
-    tz = acct or detect_local()
+    tz, acct = fallback()
     p.set_config(KEY, tz)
     if log:
         log(f"home time zone set to {tz} ({'the account budget.timezone' if acct else 'this machine'}); "

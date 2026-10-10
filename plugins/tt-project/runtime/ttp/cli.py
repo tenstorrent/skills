@@ -335,11 +335,17 @@ def bootstrap(root: Path, name: str, brief: str, provider: str, home_tz: str | N
     cfg = {"name": name, "created": time.time(), "root": str(p.root), "host": hostname(),
            "core_provider": provider, "tt_project_version": __version__,
            "id": pysecrets.token_hex(4),
-           # The user's zone: the workstation's when it sent one (new_remote), else this machine's.
-           timefmt.KEY: timefmt.valid(home_tz) or timefmt.detect_local(),
-           timefmt.FROM_KEY: home_from or hostname(),
            # New projects only: DEFAULT_CONFIG keeps it off, so existing projects are unchanged.
            "providers": {"claude": {"worker_isolation": True}}}
+    # The user's zone: the workstation's when it sent one (new_remote), else this machine's. In an ssh
+    # login with none sent this machine's is a server's: the fallback zone, set by no machine, so no
+    # spend push moves it and the workstation's next connect sets it.
+    if timefmt.valid(home_tz):
+        cfg.update({timefmt.KEY: timefmt.valid(home_tz), timefmt.FROM_KEY: home_from or hostname()})
+    elif timefmt.in_ssh_login():
+        cfg[timefmt.KEY] = timefmt.fallback()[0]
+    else:
+        cfg.update({timefmt.KEY: timefmt.detect_local(), timefmt.FROM_KEY: hostname()})
     sec = load_secrets()
     if (sec.get("slack") or {}).get("bot_token"):
         cfg["notify"] = {"slack": True}
@@ -450,9 +456,11 @@ def new_remote(a, brief: str) -> None:
         print(push_secrets(host))
     from . import machines as mm
     print(mm.push(host))        # its daemon reads the machines list there
-    args = [launcher, "new", a.name, "--dir", a.dir, "--provider", a.provider or detect_provider(),
-            # this workstation's zone, never the box's (that runtime is at least this one: ship_runtime)
-            "--home-tz", timefmt.detect_local(), "--home-from", hostname()]
+    args = [launcher, "new", a.name, "--dir", a.dir, "--provider", a.provider or detect_provider()]
+    # This workstation's zone, never the box's (that runtime is at least this one: ship_runtime). In an
+    # ssh login here it is a server's, so none: the box falls back and the next workstation connect sets it.
+    if not timefmt.in_ssh_login():
+        args += ["--home-tz", timefmt.detect_local(), "--home-from", hostname()]
     if a.no_service:
         args.append("--no-service")
     remote = " ".join(shlex.quote(x) if not x.startswith("~/") else x for x in args) + " --describe-file -"

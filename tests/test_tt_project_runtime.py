@@ -37899,6 +37899,45 @@ def test_a_remote_project_made_from_a_workstation_gets_the_workstations_zone(env
     assert Project(env["repo"]).config()["budget"]["timezone"] == "America/Los_Angeles"
 
 
+def test_a_remote_project_made_from_an_ssh_login_records_no_servers_zone(env, monkeypatch, capsys):
+    """`ttp new --host` typed in an ssh login on a server sends no zone (the server's is not the user's);
+    the box gives the project the fallback zone set by no machine, so no spend push moves it, and the
+    workstation's next connect sets it."""
+    from ttp import cli, machines, project, weblink
+    from ttp import timefmt as tf
+    monkeypatch.setenv("TTP_TEST_LOCAL_TZ", "Asia/Tokyo")   # the server the user is ssh'd into
+    monkeypatch.setenv("SSH_CONNECTION", "10.0.0.1 1 10.0.0.2 22")
+    monkeypatch.setattr(cli, "ship_runtime", lambda host: "~/.tt-project/lib/current/bin/ttp")
+    monkeypatch.setattr(cli, "load_secrets", lambda: {})
+    monkeypatch.setattr(machines, "push", lambda host: "machines: none")
+    sent = []
+    monkeypatch.setattr(cli.subprocess, "run", lambda argv, **k: sent.append(argv) or subprocess.CompletedProcess(
+        argv, 0, "created far\n", None))
+    monkeypatch.setattr(cli, "remote_web", lambda name, entry, out: ("web app: ok", 0))
+    cli.main(["new", "far", "--host", "box", "--dir", "/srv/far"])
+    remote = sent[-1][-1]
+    assert "--home-tz" not in remote and "--home-from" not in remote, remote
+    # What that command does on the box (zone UTC), also under ssh, with the account's zone set there.
+    monkeypatch.undo()
+    monkeypatch.setenv("TTP_TEST_LOCAL_TZ", "UTC")
+    monkeypatch.setenv("SSH_CONNECTION", "10.0.0.2 1 10.0.0.3 22")
+    monkeypatch.setattr(cli, "_wait_for_daemon", lambda p, timeout=20: None)
+    monkeypatch.setattr(weblink, "local", lambda p, url: ("web app: ok", 0))
+    project.set_account_setting("budget.timezone", "America/New_York")
+    cli.main(["new", "far", "--dir", str(env["repo"]), "--provider", "fake", "--no-service"])
+    from ttp.project import Project
+    p = Project(env["repo"])
+    raw = p.raw_config()
+    assert raw["home_timezone"] == "America/New_York" and "home_timezone_from" not in raw, raw
+    assert not tf.follow_push(p, "UTC", "testhost") and not tf.follow_push(p, "Asia/Tokyo", "server")
+    assert p.raw_config()["home_timezone"] == "America/New_York"
+    # The workstation's next connect sets it.
+    monkeypatch.delenv("SSH_CONNECTION")
+    cli.main(["connect", "far", "--home-tz", "America/Los_Angeles", "--home-from", "laptop"])
+    raw = p.raw_config()
+    assert (raw["home_timezone"], raw["home_timezone_from"]) == ("America/Los_Angeles", "laptop")
+
+
 def _home_feed(p):
     return [m["text"] for m in p.db.q("SELECT text FROM messages WHERE direction='out' AND text LIKE 'Home time zone%'")]
 
