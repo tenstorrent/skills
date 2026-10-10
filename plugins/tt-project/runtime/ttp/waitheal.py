@@ -27,7 +27,6 @@ OUTPUT_CHARS = 400
 START_STALE_S = 3 * 3600      # default of waiting.start_resource_stale_s
 WATCHED_RESOURCE_RE = re.compile(r"device|serv", re.I)
 TASK_REF_RE = re.compile(r"(?:#|\blanded:#?|--task[ =])([0-9]+)\b")
-GIT_HISTORY_RE = re.compile(r"\bgit\b[^|;&]*\b(?:log|rev-list|reflog|show|branch|cherry)\b")
 
 
 def _words(probe: str) -> list[str]:
@@ -44,14 +43,6 @@ def devq_runner(probe: str) -> str | None:
     if len(w) == 5 and Path(w[0]).name == "ttp" and w[1:3] == ["devq", "probe"]:
         return w[3]
     return None
-
-
-def greps_history(probe: str) -> bool:
-    """Whether a probe searches commit messages or branch logs (`git log --grep`, `git log | grep`,
-    `git branch ... | grep`). A squash, rebase or reworded landing never matches it, so it may wait
-    forever: `landed:#<id>` checks the landing itself."""
-    probe = str(probe or "")
-    return bool(GIT_HISTORY_RE.search(probe)) and "grep" in probe
 
 
 def clip(text: str, n: int = OUTPUT_CHARS) -> str:

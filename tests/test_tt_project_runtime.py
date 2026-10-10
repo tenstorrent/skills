@@ -13798,86 +13798,113 @@ def _stall_events(p):
                   "ORDER BY id")
 
 
-def test_stall_check_raises_one_high_observation_per_stall_listing_each_hold(env):
-    from ttp import coordinator as coord
+def _stall_setup(env, monkeypatch=None):
+    """A daemon past its start settle with a last worker run 5 h ago, and a check that runs now
+    (each call is a fresh check, as if a minute had passed)."""
     from ttp.daemon import Daemon
     p = make(env)
     _no_events(p)
     now = time.time()
     d = Daemon(p.base)
     d._started = now - 86400
-    run = "INSERT INTO runs(task,role,started,ended,status) VALUES(?,'worker',?,?,'ok')"
-    p.db.x(run, (None, now - 4 * 3600, now - 4 * 3600 + 60))
-    assert coord.apply(p, [{"type": "task_add", "title": "after the fix lands", "spec": "s",
-                            "start_when": "git log origin/main --oneline | grep -q 'fix the thing'"},
-                           {"type": "task_add", "title": "after the board", "spec": "s",
-                            "start_when": "test -f /tmp/board-ready"}]) == []
-    waiting = p.db.add_task("waits on a job", "s", kind="work", tier="light", origin="coordinator")
-    p.db.update_task(waiting, not_before=now + 7200,
-                     result=json.dumps({"status": "waiting", "retry_when": "git branch -r --contains abc | grep -q main"}))
-    p.db.x(run, (waiting, now - 5 * 3600, now - 4.5 * 3600))
-    p.db.x("UPDATE tasks SET created=? WHERE status='queued'", (now - 6 * 3600,))
+    p.db.x("INSERT INTO runs(task,role,started,ended,status) VALUES(NULL,'worker',?,?,'ok')",
+           (now - 5 * 3600, now - 5 * 3600 + 60))
 
-    d.check_stall()
-    evs = _stall_events(p)
-    assert len(evs) == 1, "a stall past stall_wake_h raises one observation"
+    def check(at):
+        d._stall_checked = at - 60
+        if monkeypatch:
+            monkeypatch.setattr(time, "time", lambda: at)
+        d.check_stall()
+        return _stall_events(p)
+    return p, d, now, check
+
+
+def test_stall_check_raises_once_for_a_task_dispatch_would_start_and_lists_no_held_task(env, monkeypatch):
+    from ttp import coordinator as coord
+    p, d, now, check = _stall_setup(env, monkeypatch)
+    ready = p.db.add_task("ready but never started", "s", kind="work", tier="light", origin="coordinator")
+    timer = p.db.add_task("on a timer", "s", kind="work", tier="light", origin="coordinator", not_before=now + 86400)
+    assert coord.apply(p, [{"type": "task_add", "title": "waits on a probe", "spec": "s",
+                            "start_when": "git log origin/main --oneline | grep -q 'the fix'"}]) == []
+    coord.pause_resource(p, "board", True, reason="maintenance", by="user")
+    paused = p.db.add_task("needs the paused board", "s", kind="work", tier="light", origin="coordinator",
+                           labels=["exclusive:board"])
+    p.db.x("UPDATE tasks SET created=?", (now - 6 * 3600,))
+
+    assert check(now) == [], "readiness counts from the first check that sees it"
+    assert check(now + 2 * 3600) == [], "ready for less than stall_wake_h is no stall"
+    evs = check(now + 3 * 3600)
+    assert len(evs) == 1, "a task dispatch would start, left for stall_wake_h with no worker run, raises one"
     e = evs[0]
     assert e["severity"] == "high" and e["status"] == "queued", "it wakes the coordinator"
-    ids = [t["id"] for t in p.db.q("SELECT id FROM tasks WHERE status='queued' ORDER BY id")]
-    for tid in ids:
-        assert f"#{tid} " in e["text"], f"held task #{tid} is listed"
-    assert "fix the thing" in e["text"] and "timer until" in e["text"], "each probe or timer is named"
-    assert "(held 4.5 h)" in e["text"], "the waiting task is held since its run ended"
-    flagged = e["text"].split("landed:#<id>` instead:")[1]
-    assert f"#{ids[0]}" in flagged and f"#{waiting}" in flagged and f"#{ids[1]}" not in flagged, \
-        "probes that grep commit messages or branch logs are flagged, others are not"
+    assert f"#{ready} " in e["text"] and "(ready 3.0 h)" in e["text"], e["text"]
+    for held in (timer, paused):
+        assert f"#{held} " not in e["text"], "held tasks are never listed"
+    assert "waits on a probe" not in e["text"] and "maintenance" not in e["text"] and "landed:" not in e["text"]
+    assert check(now + 4 * 3600) == evs, "the same stall is raised once"
 
-    p.db.add_task("one more", "s", kind="work", tier="light", origin="coordinator", not_before=now + 3600)
-    d._stall_checked = 0.0
-    d.check_stall()
-    assert len(_stall_events(p)) == 1, "a change in the held tasks does not raise the same stall again"
-
-    p.db.x(run, (None, now - 3.5 * 3600, now - 3.4 * 3600))
-    d._stall_checked = 0.0
-    d.check_stall()
-    evs = _stall_events(p)
+    p.db.x("INSERT INTO runs(task,role,started,status) VALUES(NULL,'worker',?,'ok')", (now + 4 * 3600,))
+    assert len(check(now + 5 * 3600)) == 1, "a worker run that started ends the stall"
+    evs = check(now + 7.5 * 3600)
     assert len(evs) == 2 and evs[0]["fingerprint"] != evs[1]["fingerprint"], \
-        "a worker run that started ends the stall; a new one past the threshold is raised once more"
+        "a new stall past stall_wake_h after that run is raised once more"
 
 
-def test_stall_check_stays_quiet_when_nothing_is_stalled(env):
-    from ttp.daemon import Daemon
-    p = make(env)
-    _no_events(p)
-    now = time.time()
-    d = Daemon(p.base)
-    run = "INSERT INTO runs(role,started,status) VALUES('worker',?,?)"
+def test_stall_check_ignores_tasks_held_by_a_paused_resource_a_logout_or_the_gate(env, monkeypatch):
+    from ttp import budget as bud
+    from ttp import coordinator as coord
+    p, d, now, check = _stall_setup(env, monkeypatch)
+    prov = d.cfg.get("core_provider", "claude")
 
-    def raised():
-        d._stall_checked = 0.0
-        d.check_stall()
-        return len(_stall_events(p))
+    coord.pause_resource(p, "board", True, reason="maintenance", by="user")
+    tid = p.db.add_task("needs the board", "s", kind="work", tier="light", origin="coordinator",
+                        labels=["exclusive:board"])
+    for h in (0, 3, 6):
+        assert check(now + h * 3600) == [], "a task held only by a user-paused resource is no stall"
+    p.db.update_task(tid, status="cancelled")
 
-    p.db.x(run, (now - 5 * 3600, "ok"))
-    assert raised() == 0, "nothing queued is no stall"
-    tid = p.db.add_task("later", "s", kind="work", tier="light", origin="coordinator", not_before=now + 3600)
-    p.db.x("UPDATE tasks SET created=? WHERE id=?", (now - 5 * 3600, tid))
-    assert raised() == 0, "a daemon that just started gives probes and timers a chance first"
+    p.db.add_task("ready", "s", kind="work", tier="light", origin="coordinator")
+    d.gates = {prov: bud.Gate(provider=prov, regime="windows", max_parallel=1)}
+    p.db.x("INSERT INTO runs(task,role,provider,started,status) VALUES(NULL,'worker',?,?,'running')",
+           (prov, now - 5 * 3600))
+    for h in (14, 17, 20):
+        assert check(now + h * 3600) == [], "every slot the gate (or pacing) allows is busy: dispatch starts nothing"
+    d.gates = {prov: bud.Gate(provider=prov, regime="windows", max_parallel=4, allow_new_work=False)}
+    for h in (21, 24, 27):
+        assert check(now + h * 3600) == [], "a gate that holds new work: dispatch starts nothing"
+    d.gates = {prov: bud.Gate(provider=prov, regime="windows", max_parallel=4)}
+    assert check(now + 28 * 3600) == []
+    assert len(check(now + 31 * 3600)) == 1, "with a free slot, the same task is a stall"
+    p.db.x("UPDATE tasks SET status='cancelled'")
+    p.db.x("UPDATE runs SET status='ok'")
+
+    p.db.x("INSERT INTO runs(task,role,started,status) VALUES(NULL,'worker',?,'ok')", (now + 32 * 3600,))
+    tid = p.db.add_task("on a logged-out provider", "s", kind="work", tier="light", origin="coordinator")
+    p.db.update_task(tid, provider="fake")
+    d.open_breaker("fake", "401")
+    monkeypatch.setattr(d, "_may_probe", lambda prov, now: False)
+    for h in (36, 39, 42):
+        assert len(check(now + h * 3600)) == 1, "a task of a logged-out provider is no new stall"
+
+
+def test_stall_check_stays_quiet_when_nothing_is_stalled(env, monkeypatch):
+    p, d, now, check = _stall_setup(env, monkeypatch)
+    assert check(now) == [] and check(now + 4 * 3600) == [], "nothing queued is no stall"
+    p.db.add_task("ready", "s", kind="work", tier="light", origin="coordinator")
+    d._started = now + 5 * 3600
+    assert check(now + 5 * 3600) == [] and check(now + 9 * 3600) == [], \
+        "a daemon that just started gives dispatch a chance first; readiness counts again after it"
     d._started = now - 86400
     d.cfg["coordinator"]["stall_wake_h"] = 0
-    assert raised() == 0, "stall_wake_h 0 turns the check off"
-    d.cfg["coordinator"]["stall_wake_h"] = 6
-    assert raised() == 0, "a stall shorter than stall_wake_h is not raised"
+    assert check(now + 10 * 3600) == [] and check(now + 14 * 3600) == [], "stall_wake_h 0 turns the check off"
     d.cfg["coordinator"]["stall_wake_h"] = 3
-    slots = int(d.cfg["budget"].get("max_parallel_workers", 6))
-    for _ in range(slots):
-        p.db.x(run, (now - 4 * 3600, "running"))
-    assert raised() == 0, "every slot busy is no stall"
-    p.db.x("UPDATE runs SET status='ok' WHERE status='running'")
-    p.db.x("UPDATE tasks SET created=? WHERE id=?", (now - 60, tid))
-    assert raised() == 0, "the queue has not waited stall_wake_h yet"
-    p.db.x("UPDATE tasks SET created=? WHERE id=?", (now - 5 * 3600, tid))
-    assert raised() == 1
+    assert check(now + 15 * 3600) == []
+    d._stall_checked = now + 15 * 3600
+    monkeypatch.setattr(time, "time", lambda: now + 19 * 3600)
+    d.check_stall()
+    assert _stall_events(p) == [], "checks far apart (a paused project) count readiness again"
+    assert check(now + 19.5 * 3600) == [] and check(now + 22 * 3600) == []
+    assert len(check(now + 22.5 * 3600)) == 1
 
 
 def _objects(schema):

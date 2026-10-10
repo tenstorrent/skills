@@ -192,6 +192,13 @@ and preferences you add later become part of the project's charter and memory.
   (0.7) or above raises the turn the same way, and the same events never raise a second turn. Each
   call is logged with the effort it led to and what the turn did, and reported in the daily review;
   `jev.uses.coord_effort` = `off` turns the check off.
+- Stall check (model-free): when no worker run has started for `coordinator.stall_wake_h` (3; 0
+  turns it off) while a queued task has been one dispatch would start now for that long, one high
+  observation lists those tasks and when the last worker run started. It uses dispatch's own checks,
+  so tasks held by a dependency, a timer or probe, a paused resource, a busy lock, a logged-out or
+  offline provider, or the budget gate's slots are never counted: each hold has its own alert.
+  Known gap: a hold that is itself wrong (a lock that never clears, a probe that can never pass) is
+  not reported by this check; the lock, hold and wait checks cover it.
 - The web app shows spend per day, per task and per recurring job, and plan-window peaks for the
   last two weeks.
 - The web app's header and `ttp status` show the budget in one line, for example

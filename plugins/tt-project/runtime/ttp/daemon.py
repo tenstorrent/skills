@@ -137,8 +137,9 @@ ALERT_KEEP_S = 30 * 86400   # alerts_sent keeps an entry this long: the longest 
 ROOT_CHECKOUT_KEY = "root_checkout"   # kv: task -> its open alert on what a run left in the project root's checkout
 ROOT_RECHECK_S = 300   # an open root-checkout alert's condition is looked at again this often
 STALL_KEY = "stall"   # kv: {"run": the last worker run when a stall was raised} (Daemon.check_stall)
-STALL_SETTLE_S = 600   # after a daemon start, probes and timers get this long before a stall is raised
-STALL_LIST_MAX = 30    # held tasks listed in one stall observation
+STALL_SETTLE_S = 600   # after a daemon start, dispatch gets this long before a stall is raised
+STALL_GAP_S = 600      # checks further apart than this (a paused project): readiness counts again
+STALL_LIST_MAX = 30    # ready tasks listed in one stall observation
 STALE_HOLDS_KEY = "holds_stale"   # kv: run -> its hold alerted as kept for a closed task (Daemon.alert_stale_holds)
 SLEPT_MIN_S = 60        # a run whose wall clock ran this much ahead of its monotonic clock overlapped a host sleep
 SLEEPS_KEPT_S = 7 * 86400
@@ -2872,76 +2873,60 @@ class Daemon:
                         (time.time(), source, "observation", v.fingerprint, v.severity, text[:4000], "queued"))
 
     def check_stall(self, every_s: float = 60) -> None:
-        """Model-free stall check. The idle-slot wake backs off up to a day while every queued task
-        waits on its own probe or timer, trusting those to wake the coordinator. When none of them
-        does, nothing starts for hours: once no worker run has started for coordinator.stall_wake_h
-        (default 3, 0: off) while worker slots are free, a budget gate allows new work and tasks
-        are queued, raise one high observation listing each queued task's hold (probe, timer,
-        dependency or resource) and how long it has been held, and flag probes that grep commit
-        messages or branch logs. One per stall: keyed on the last worker run started, so a change
-        in the held tasks does not wake the coordinator again; a new worker run ends the stall."""
+        """Model-free stall check: dispatch would start a queued task, yet nothing starts. Once no
+        worker run has started for coordinator.stall_wake_h (default 3, 0: off) and a queued task
+        has been one dispatch would start now (_start_hold: dependencies, start_after/start_when,
+        paused resources, logged-out or net-held providers, the gate's slots, busy locks and the
+        rest) for that long at every check, raise one high observation listing those tasks and when
+        the last worker run started. One per stall: keyed on the last worker run started; a new
+        worker run ends the stall.
+
+        Held tasks are never counted or listed: each hold has its own alert. Accepted gap: a hold
+        that is itself wrong (a lock that never clears, a probe that can never pass) is not
+        reported here; the lock, hold and wait checks cover it."""
         now = time.time()
-        if now - getattr(self, "_stall_checked", 0.0) < every_s:
+        last_check = getattr(self, "_stall_checked", 0.0)
+        if now - last_check < every_s:
             return
         self._stall_checked = now
         db = self.p.db
         hours = float(self.cfg["coordinator"].get("stall_wake_h", 3) or 0)
-        if hours <= 0 or now - self._started < STALL_SETTLE_S:
+        # Dispatch does not run (settling, no config) or did not run between checks (a paused
+        # project, a long tick): readiness counts again from now.
+        if hours <= 0 or now - self._started < STALL_SETTLE_S or self.cfg_status == "unavailable" \
+                or self.settling() or now - last_check > STALL_GAP_S:
+            self._stall_ready = {}
             return
-        if self.gates and not any(g.allow_new_work for g in self.gates.values()):
-            return   # the budget holds new work: that has its own alerts
-        slots = int(self.cfg["budget"].get("max_parallel_workers", 6))
-        running = db.one("SELECT COUNT(*) n FROM runs WHERE status='running' AND role!='coordinator'")["n"]
-        if running >= slots:
-            return
-        queued = db.q("SELECT * FROM tasks WHERE status='queued' ORDER BY priority, id")
-        if not queued:
+        core = self.cfg.get("core_provider", "claude")
+        ready = db.ready_tasks()
+        busy = {r["provider"]: r["n"] for r in db.q(
+            "SELECT provider, COUNT(*) n FROM runs WHERE role!='coordinator' AND status='running' GROUP BY provider")}
+        ctx = {"now": now, "paused": db.paused_resources(), "busy": busy, "committed": None,
+               "logged_out": {prov: self._logged_out(prov) for prov in {t["provider"] or core for t in ready}}}
+        seen = getattr(self, "_stall_ready", {})
+        self._stall_ready = {t["id"]: seen.get(t["id"], now) for t in ready
+                             if self._start_hold(t, t["provider"] or core, ctx) is None}
+        stuck = [t for t in ready if now - self._stall_ready.get(t["id"], now) >= hours * 3600]
+        if not stuck:
             return
         last = db.one("SELECT id, started FROM runs WHERE role!='coordinator' ORDER BY started DESC, id DESC LIMIT 1")
         last_id = int(last["id"]) if last else 0
-        if int((db.kv(STALL_KEY) or {}).get("run", -1)) == last_id:
-            return   # this stall was raised already
-        # Stalled since the last worker run started, or since the oldest queued task came, if later.
-        since = max(float(last["started"] or 0) if last else 0.0, min(float(t["created"] or now) for t in queued))
-        if now - since < hours * 3600:
-            return
-        states = {r["id"]: r["status"] for r in db.q("SELECT id, status FROM tasks")}
-        lines, grep_ids = [], []
-        for t in queued:
-            d = deferral(t)
-            res = load_result(t["result"])
-            probe = d.get("when") or (res.get("retry_when") if isinstance(res.get("retry_when"), str) else None)
-            deps = [x for x in json.loads(t["depends_on"] or "[]") if states.get(x) != "done"]
-            ended = db.one("SELECT MAX(ended) t FROM runs WHERE task=?", (t["id"],))["t"]
-            held_at = d.get("since") or ended or t["created"] or now
-            nb = max(float(t["not_before"] or 0), float(d.get("after") or 0))
-            what = []
-            if probe:
-                what.append(f"{'start_when' if d.get('when') else 'retry_when'} `{waitheal.clip(probe, 160)}`")
-                if waitheal.greps_history(probe):
-                    grep_ids.append(t["id"])
-            if nb > now:
-                what.append(f"timer until {time.strftime('%Y-%m-%d %H:%M', time.localtime(nb))}")
-            if deps:
-                what.append("after " + ", ".join(f"#{x}" for x in deps))
-            if not what and not self._resources_free(t):
-                what.append("its resource is busy: " + ", ".join(_exclusive(t) + _shared(t)))
-            lines.append(f"#{t['id']} {t['title'][:60]}: {'; '.join(what) or 'ready, but not started'} "
-                         f"(held {(now - float(held_at)) / 3600:.1f} h)")
+        started = float(last["started"] or 0) if last else 0.0
+        if now - started < hours * 3600 or int((db.kv(STALL_KEY) or {}).get("run", -1)) == last_id:
+            return   # a worker run started meanwhile, or this stall was raised already
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(started)) if last else "never"
+        lines = [f"#{t['id']} {t['title'][:60]} (ready {(now - self._stall_ready[t['id']]) / 3600:.1f} h)"
+                 for t in stuck]
         more = f" (+{len(lines) - STALL_LIST_MAX} more)" if len(lines) > STALL_LIST_MAX else ""
-        text = (f"Stall: no worker run has started for {(now - since) / 3600:.1f} h while {slots - running} of "
-                f"{slots} worker slots are free and {len(queued)} task(s) are queued. The probes and timers below "
-                f"have not let any of them start. Check each hold: fix or cancel a probe that cannot pass, "
-                f"bring forward a timer that waits for nothing, start what is ready.\n"
+        text = (f"Stall: dispatch would start {len(stuck)} queued task(s) now, but no worker run has started for "
+                f"{hours:g} h or more (last worker run started: {when}). Find out why they do not start "
+                f"(daemon log, run start errors):\n"
                 + "\n".join(f"- {x}" for x in lines[:STALL_LIST_MAX]) + more)
-        if grep_ids:
-            text += ("\nThese probes grep commit messages or branch logs, which a squash, rebase or reworded "
-                     "landing never matches; wait on `landed:#<id>` instead: " + ", ".join(f"#{x}" for x in grep_ids) + ".")
         with db.tx():
             db.set_kv(STALL_KEY, {"run": last_id, "at": now})
             db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
                  (now, "daemon", "observation", f"stall:{last_id}", "high", text[:4000], "queued"))
-        log(self.p, f"stall: no worker run for {(now - since) / 3600:.1f} h, {len(queued)} queued")
+        log(self.p, f"stall: {len(stuck)} task(s) ready for {hours:g} h or more, no worker run since {when}")
 
     # coordinator ------------------------------------------------------------------------------------
     def retry_rejected(self) -> None:
@@ -3112,7 +3097,6 @@ class Daemon:
         busy = {r["provider"]: r["n"] for r in running}
         ready = db.ready_tasks()
         self.check_disk()
-        committed = None    # what running work under the dollar caps may still spend
         reached = set()     # tasks that got past the gates to the resource check
         paused = db.paused_resources()
         now, core = time.time(), self.cfg.get("core_provider", "claude")
@@ -3123,27 +3107,29 @@ class Daemon:
             rank = {t: i for i, t in enumerate(bud.TIER_ORDER)}
             ready = [t for t in ready if not logged_out[t["provider"] or core]] + \
                 sorted(out, key=lambda t: rank.get(t["tier"], len(rank)))
+        ctx = {"now": now, "paused": paused, "logged_out": logged_out, "busy": busy, "committed": None}
         for task in ready:
-            if self._disk_holds(task) or self._precheck_holds(task, now):
+            provider = task["provider"] or core
+            why = self._start_hold(task, provider, ctx, reserve=True)
+            if why == "held":
                 continue
             # A paused resource holds its tasks in the queue, attempts untouched, until it resumes.
-            hit = sorted(coord.task_resources(task) & paused.keys())
             note = task["blocked_reason"] or ""
-            if hit:
+            if why == "paused":
+                hit = sorted(coord.task_resources(task) & paused.keys())
                 why = "; ".join(f"{r}: {paused[r]['reason']}" if paused[r].get("reason") else r for r in hit)
                 held = (f"{PAUSED_NOTE} {why}; it starts once resumed "
                         f"(`ttp resume {self.p.name} --resource {hit[0]}`)")[:500]
                 if note != held:
                     db.update_task(task["id"], blocked_reason=held)
                 continue
-            provider = task["provider"] or core
-            if logged_out[provider] and not self._may_probe(provider, now):
+            if why == "logged_out":
                 # Logged out: the queue keeps its tasks, attempts untouched, until a run succeeds.
                 held = (f"{LOGGED_OUT_NOTE} ({provider}); it starts once a login check passes")
                 if note != held:
                     db.update_task(task["id"], blocked_reason=held)
                 continue
-            if self.net_held(provider) and not self._net_may_probe(provider):
+            if why == "net":
                 # Its API host does not resolve: the task waits, attempts untouched.
                 held = f"{NET_HELD_NOTE} waiting for {provider}'s API host to resolve"
                 if note != held and (not note or note.startswith(NET_HELD_NOTE)):
@@ -3151,35 +3137,22 @@ class Daemon:
                 continue
             if note.startswith((PAUSED_NOTE, LOGGED_OUT_NOTE, NET_HELD_NOTE)):
                 db.update_task(task["id"], blocked_reason=None)
-            gate = self.gates.get(provider) or bud.evaluate(db, self.cfg, provider, bud.plan_windows(db))
-            if not gate.allow_new_work or busy.get(provider, 0) >= gate.max_parallel:
-                continue
-            if task["origin"] in ("schedule", "harness") and not gate.allow_optional:
-                continue
-            if needs_device(task, self.cfg) and self._device_tasks_running() >= self._device_max_tasks():
-                continue
-            remaining = (task["budget_usd"] or 0) - (task["spent_usd"] or 0)
-            if task["budget_usd"] and remaining <= 0.05:
+            gate = ctx["gate"]
+            remaining, cost = self._start_cost(task)
+            if why == "budget":
                 db.update_task(task["id"], status="blocked", blocked_reason="task budget exhausted")
                 db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                      (time.time(), "daemon", "task_budget_exhausted", "normal",
                       f"#{task['id']} {task['title']} used its ${task['budget_usd']:.2f} budget", "queued", task["id"]))
                 continue
-            # Several runs start in one tick: under the dollar caps, each must fit in what is left
-            # of them after what running work may still spend, or one tick commits past a cap.
-            cost = max(remaining, 0.5) if task["budget_usd"] else 0.0
-            if gate.regime == "caps":
-                committed = self._committed_usd() if committed is None else committed
-                if not self._fits_caps(gate, committed + cost):
-                    if any(cap and cost > cap for cap in (gate.numbers.get("daily_cap"),
-                                                          gate.numbers.get("weekly_cap"))):
-                        db.update_task(task["id"], status="blocked",
-                                       blocked_reason=f"its ${cost:.2f} budget is above the dollar cap")
-                    continue
-            # Checked last: a task that waits for its resource reserves it, and only a task that
-            # would otherwise start now may hold others off the resource.
-            reached.add(task["id"])
-            if not self._resources_free(task, reserve=True):
+            if why == "caps":
+                if any(cap and cost > cap for cap in (gate.numbers.get("daily_cap"), gate.numbers.get("weekly_cap"))):
+                    db.update_task(task["id"], status="blocked",
+                                   blocked_reason=f"its ${cost:.2f} budget is above the dollar cap")
+                continue
+            if why in (None, "resource"):
+                reached.add(task["id"])
+            if why:
                 continue
             review_pick = None
             if task["kind"] == "review":
@@ -3228,11 +3201,59 @@ class Daemon:
             self._progress()   # each start may have added a worktree
             busy[provider] = busy.get(provider, 0) + 1
             if gate.regime == "caps":
-                committed += cost
+                ctx["committed"] += cost
         # A task a gate kept out this tick cannot start, so it must not hold `ttp lock` commands off.
         for task in ready:
             if task["id"] not in reached:
                 self._unreserve(task)
+
+    def _start_cost(self, task: dict) -> tuple[float, float]:
+        """What the task may still spend, and what its start commits under the dollar caps."""
+        remaining = (task["budget_usd"] or 0) - (task["spent_usd"] or 0)
+        return remaining, (max(remaining, 0.5) if task["budget_usd"] else 0.0)
+
+    def _start_hold(self, task: dict, provider: str, ctx: dict, reserve: bool = False) -> str | None:
+        """Why dispatch would not start this ready task now, or None when it would: 'held' (the disk
+        guard, a review's prechecks), 'paused' (a paused resource), 'logged_out', 'net' (its API host
+        does not resolve), 'gate' (the budget gate or its provider's slots), 'optional', 'device'
+        (device task slots), 'budget' (task budget spent), 'caps' (dollar caps) or 'resource' (busy,
+        including `ttp lock` and device-lock aliases). The one copy of dispatch's checks, in its order,
+        so check_stall counts exactly what dispatch would start. Nothing changes but with `reserve`
+        (_resources_free) and ctx's caches: ctx holds now, paused, logged_out (provider -> bool), busy
+        (provider -> running), committed (dollars running work may still spend under the caps; None:
+        not read yet); it sets gate (the task's budget gate, once that check is reached)."""
+        now = ctx["now"]
+        if self._disk_holds(task) or self._precheck_holds(task, now):
+            return "held"
+        if coord.task_resources(task) & ctx["paused"].keys():
+            return "paused"
+        if ctx["logged_out"].get(provider) and not self._may_probe(provider, now):
+            return "logged_out"
+        if self.net_held(provider) and not self._net_may_probe(provider):
+            return "net"
+        gate = ctx["gate"] = self.gates.get(provider) or \
+            bud.evaluate(self.p.db, self.cfg, provider, bud.plan_windows(self.p.db))
+        if not gate.allow_new_work or ctx["busy"].get(provider, 0) >= gate.max_parallel:
+            return "gate"
+        if task["origin"] in ("schedule", "harness") and not gate.allow_optional:
+            return "optional"
+        if needs_device(task, self.cfg) and self._device_tasks_running() >= self._device_max_tasks():
+            return "device"
+        remaining, cost = self._start_cost(task)
+        if task["budget_usd"] and remaining <= 0.05:
+            return "budget"
+        # Several runs start in one tick: under the dollar caps, each must fit in what is left
+        # of them after what running work may still spend, or one tick commits past a cap.
+        if gate.regime == "caps":
+            if ctx["committed"] is None:
+                ctx["committed"] = self._committed_usd()
+            if not self._fits_caps(gate, ctx["committed"] + cost):
+                return "caps"
+        # Checked last: a task that waits for its resource reserves it, and only a task that
+        # would otherwise start now may hold others off the resource.
+        if not self._resources_free(task, reserve=reserve):
+            return "resource"
+        return None
 
     def _pick_effort(self, task: dict, provider: str) -> dict | None:
         """The task's tier for this start (see effort.pick), stored on the task; None leaves it as it is."""
