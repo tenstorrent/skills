@@ -20768,7 +20768,9 @@ def test_waiting_tasks_with_the_same_probe_share_its_runs(env, monkeypatch):
     for tid in (*same, other):
         p.db.update_task(tid, not_before=time.time() + 3600)
     d.probe_waiting()
-    assert sorted(calls) == sorted([f"test -f {flag}", "exit 1"]), "one run per distinct command"
+    # Probes run as shell strings; argv lists are other children (macOS: sysctl for the boot time).
+    probes = [c for c in calls if isinstance(c, str)]
+    assert sorted(probes) == sorted([f"test -f {flag}", "exit 1"]), "one run per distinct command"
     for tid in (*same, other):
         d._probes[tid][0].wait(10)
     d.probe_waiting()
@@ -22722,9 +22724,23 @@ def test_a_long_tick_tells_both_watchdogs_it_still_moves(env, monkeypatch):
     loop_steps = [e.attr for n in ast.walk(tick_src) if isinstance(n, ast.For) and isinstance(n.iter, ast.Tuple)
                   for e in n.iter.elts if isinstance(e, ast.Attribute)]
     assert len(loop_steps) > 10 and "dispatch" in loop_steps, loop_steps
-    steps = []
+    steps, pings = [], []
+
+    def drain(wait: float) -> None:
+        if sock.fileno() < 0:   # closed: the later ticks below check the heartbeat only
+            return
+        sock.settimeout(wait)
+        while True:
+            try:
+                pings.append(sock.recv(64))
+            except (socket.timeout, BlockingIOError):
+                return
+
+    def step(name):
+        drain(0)   # the pings sent so far: each step records how many had arrived when it started
+        steps.append((name, len(pings)))
     for name in loop_steps + ["_refresh_meters", "update_gates"]:
-        monkeypatch.setattr(d, name, lambda name=name: steps.append(name))
+        monkeypatch.setattr(d, name, lambda name=name: step(name))
     monkeypatch.setattr(dm.coord, "expire_asks", lambda *a, **k: [])
     monkeypatch.setattr(dm, "PROGRESS_EVERY_S", 0)   # each step stands for a slow one
     hb = p.state / "heartbeat"
@@ -22732,18 +22748,17 @@ def test_a_long_tick_tells_both_watchdogs_it_still_moves(env, monkeypatch):
     d._started = time.time() - 2 * dm.WATCHDOG_S   # a first tick running far longer than the watchdog
     try:
         d.tick()
-        pings = []
-        while True:
-            try:
-                pings.append(sock.recv(64))
-            except socket.timeout:
-                break
+        drain(0.2)
     finally:
         sock.close()
         cleanup()
-    # Every step ran and each one, standing for a slow step, reached the systemd watchdog.
-    ran = [s for s in steps if s in loop_steps]
-    assert ran == loop_steps and pings == [b"WATCHDOG=1"] * len(ran), (steps, pings)
+    # Every step ran and each one, standing for a slow step, reached the systemd watchdog before the
+    # next one started. Counted per step, not in total: other code may ping too (it is no harm).
+    ran = [(s, n) for s, n in steps if s in loop_steps]
+    assert [s for s, _ in ran] == loop_steps, steps
+    assert set(pings) == {b"WATCHDOG=1"}, pings
+    after = [n for _, n in ran[1:]] + [len(pings)]
+    assert all(b > a for (_, a), b in zip(ran, after)), (steps, len(pings))
     # Before its first completed tick the heartbeat is not written (`ttp restart` reads it as that
     # tick); the start marker carries the progress, which `ttp.watchdog` counts.
     assert not hb.exists()
@@ -37099,32 +37114,28 @@ def test_heal_timeout_is_capped_below_the_daemon_watchdog(env):
 
 
 def test_heal_timeout_kills_the_whole_process_group(env, tmp_path):
-    from pathlib import Path
     from ttp import heal
-    pidf = tmp_path / "child.pid"
-    # the child records its pid and kernel start time, so a pid reused after it died is not mistaken for it;
-    # on a busy machine the timeout can fire before the shell wrote them, so retry with a longer one
+    pidf = tmp_path / "group.pid"
+    # the check's shell records its pid, its process group's id (a session of its own); on a busy machine the
+    # timeout can fire before the shell wrote it, so retry with a longer one
     for timeout in (1, 5, 15):
         pidf.unlink(missing_ok=True)
         t0 = time.time()
-        rc, out = heal._exec(f"sleep 60 & echo $! $(cut -d' ' -f22 /proc/$!/stat) > {pidf}.tmp; mv {pidf}.tmp {pidf}; wait",
-                             str(tmp_path), timeout)
+        rc, out = heal._exec(f"sleep 60 & echo $$ > {pidf}.tmp; mv {pidf}.tmp {pidf}; wait", str(tmp_path), timeout)
         assert rc == 124 and "timed out" in out and time.time() - t0 < timeout + 10
         if pidf.exists():
             break
-    pid, start = pidf.read_text().split()
-    child, stat = int(pid), Path(f"/proc/{pid}/stat")
+    group = int(pidf.read_text())
 
     def gone() -> bool:
+        """No process is left in the group but zombies (killed, not yet reaped). Portable: no /proc."""
         try:
-            os.kill(child, 0)
+            os.killpg(group, 0)
         except ProcessLookupError:
             return True
-        try:
-            fields = stat.read_text().rsplit(")", 1)[1].split()
-        except OSError:
-            return True
-        return fields[0] == "Z" or fields[19] != start   # killed, not yet reaped; or the pid was reused
+        ps = subprocess.run(["ps", "-A", "-o", "pgid=,stat="], capture_output=True, text=True, timeout=30).stdout
+        return all(st.startswith("Z") for g, st in (line.split(None, 1) for line in ps.splitlines() if line.strip())
+                   if int(g) == group)
     deadline = time.time() + 30   # generous: reaping an orphan can lag on a busy machine
     while not gone() and time.time() < deadline:
         time.sleep(0.1)
