@@ -1183,8 +1183,11 @@ def pr_elsewhere(p: Project, task: dict | None, d: dict) -> str:
     ref = str(d.get("push_branch") or "").strip()
     if not onto or not ref:
         return ""
-    ref = ref.removeprefix("refs/heads/")
-    return "" if onto in (ref, ref.partition("/")[2].removeprefix("refs/heads/")) else onto
+    # Its branch part as the push reads it: `team/x` is branch team/x of origin unless team is a remote.
+    # Remotes unknown (not a git repo): either reading, as push_branch_problem does.
+    r = _git(p.root, "remote")
+    tries = [r.stdout.split()] if r.returncode == 0 else [[], [ref.partition("/")[0]]]
+    return "" if onto in {_split_target(ref, remotes)[1] for remotes in tries} else onto
 
 
 def _reviewed(p: Project, task: str | None) -> list[dict]:

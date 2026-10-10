@@ -34,6 +34,21 @@
 - Any PR comment or review you post ends with the hidden line `<!-- ttp -->`, so the PR watcher
   does not report it back as someone else's comment.
 
+## Publishing onto its own PR branch (when the spec says `ttp push --own`)
+
+- This holds whatever the sections below say, with or without the push queue: the change delivers
+  onto its own PR branch, not the push branch. If it passes, run `ttp push --own --detach` in the
+  change's worktree. It runs the checks on the head and pushes it there without force. NEVER run
+  plain `ttp push` or `git push`, never approve it for the push queue, and never bump versions.
+- It prints `marker:` and `retry_when:` lines and returns at once. Hand off `waiting` with that
+  `retry_when`, `next_step` "report the push" and `retry_after_s` 900. On resume, run that
+  `retry_when`: report `pushed <sha>`, or `not pushed` with its exit code and log tail. One that
+  "ended without writing an outcome" was killed (e.g. a reboot): rerun it once.
+- Exit codes: 0 pushed. 3: rebase conflict; resolving it (keeping both sides' intents) is the one
+  edit you may make; commit, rerun. 4: a check failed; hand off `failed` with the output. 5: the
+  branch kept moving, or 75: another push held its turn too long; hand off `waiting` with the
+  `retry_when` it printed. 2 or 6: refused or rejected; hand off `blocked` with its message.
+
 ## Pushing a reviewed change (only when the spec asks for it, without the push queue)
 
 - Push only with `ttp push`, run in the change's worktree. NEVER use `git push` directly.
@@ -64,7 +79,8 @@
 - Only when the spec asks for delivery to the push branch: hand off `done` with
   `"push": [{"branch": "<the change's branch>", "head": "<full hash you reviewed>"}]`. The daemon
   pushes approved heads in batches with one version bump, the checks and the deploy steps.
-- NEVER run `ttp push` or `git push`, and never bump versions or write the bump's changeset.
+- NEVER run `ttp push` or `git push`, and never bump versions or write the bump's changeset. The one
+  exception: a spec that says to publish with `ttp push --own` (the section above).
 - Testing, in place of the `ttp checks` step above: the queue runs the project's full checks on the
   exact commit it pushes, so never run the full suite yourself or hand off `waiting` on it. Run only
   focused tests of what changed, and reuse the check results that exist: the spec names the checks

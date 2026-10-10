@@ -16541,6 +16541,7 @@ def test_push_checks_accept_the_forms_config_set_sends(env):
 
 def test_the_review_prompt_pushes_only_through_the_guarded_push():
     text = (RUNTIME.parent / "template" / "prompts" / "kind-review.md").read_text()
+    text = text[text.index("## Pushing a reviewed change"):]
     assert "`ttp push`" in text and "NEVER use `git push` directly" in text
     # The checks outlast a tool call: the review pushes detached and waits on the printed probe.
     assert "run `ttp push --detach`" in text and "`waiting` with that `retry_when`" in text
@@ -30851,6 +30852,51 @@ def test_the_review_of_a_task_with_another_pr_branch_publishes_with_own_and_neve
     coordinator = (RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text()
     assert "publish it with `ttp push --own --detach`\", never\n  plain `ttp push` or a push-queue approval" \
         in coordinator
+
+
+def test_the_review_prompt_keeps_the_own_publish_step_when_the_push_queue_is_on(env, monkeypatch):
+    """With the push queue on, a review whose spec says to publish with `ttp push --own` still gets
+    the --own section with its --detach, retry_when and exit-code steps, and the queue section's
+    'NEVER run `ttp push`' names it as the exception, so the two never contradict."""
+    from ttp import pushq
+    from ttp.prompts import worker_task
+    p = make(env)
+    _with_origin(env, clone=False)
+    p.set_config("delivery.push_branch", "origin/work")
+    p.set_config("delivery.push_queue", True)
+    monkeypatch.setattr(pushq, "enabled", lambda *a, **k: False)
+    _, _, _, (rev,) = _finish_code(env, p, "other", {"o.py": 3}, labels=["pr_branch:feature/x"])
+    text = worker_task(p, rev, str(p.root), None)
+    assert "push queue=True" in text and "`ttp push --own --detach`" in rev["spec"]
+    own = text[text.index("## Publishing onto its own PR branch (when the spec says `ttp push --own`)"):]
+    own = own[:own.index("\n## ")]
+    assert "whatever the sections below say, with or without the push queue" in own
+    assert "run `ttp push --own --detach` in the\n  change's worktree" in own
+    assert "never approve it for the push queue" in own and "`waiting` with that\n  `retry_when`" in own
+    for code in ("0 pushed", "3: rebase conflict", "4: a check failed", "5: the\n  branch kept moving",
+                 "75: another push", "2 or 6: refused"):
+        assert code in own, code
+    queue = text[text.index("## Approving into the push queue"):]
+    assert "NEVER run `ttp push` or `git push`" in queue
+    assert "The one\n  exception: a spec that says to publish with `ttp push --own`" in queue
+    # Without the queue the section is there too, next to the plain push section.
+    p.set_config("delivery.push_queue", False)
+    off = worker_task(p, rev, str(p.root), None)
+    assert "## Publishing onto its own PR branch" in off and "## Approving into the push queue" not in off
+
+
+def test_pr_elsewhere_compares_the_push_branchs_branch_part(env):
+    """push_branch `team/x` is branch team/x of origin (team is no remote): pr_branch x is another
+    branch; `origin/x` and `refs/heads/x` are x."""
+    from ttp import push
+    p = make(env)
+    _with_origin(env, clone=False)
+    t = {"id": 1, "labels": json.dumps(["pr_branch:x"])}
+    assert push.pr_elsewhere(p, t, {"push_branch": "team/x"}) == "x"
+    for same in ("origin/x", "x", "refs/heads/x", "origin/refs/heads/x"):
+        assert push.pr_elsewhere(p, t, {"push_branch": same}) == "", same
+    assert push.pr_elsewhere(p, {"id": 2, "labels": json.dumps(["pr_branch:team/x"])},
+                             {"push_branch": "team/x"}) == ""
 
 
 def test_the_push_queue_refuses_an_approval_of_a_task_with_another_pr_branch(env, monkeypatch):
