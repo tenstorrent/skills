@@ -1813,16 +1813,20 @@ def cmd_detach(a) -> None:
 
 
 # The remote side of `ttp detach --remote`, run by POSIX sh over ssh. The driver's wrapper records its
-# own pid and its process start (field 22 of /proc/<pid>/stat), next to the host's boot_id: a pid alive
-# with another start, or a boot_id that changed, is a driver that is gone even with no .rc.
+# own pid and its process start (field 22 of /proc/<pid>/stat; without /proc, as on macOS, ps's lstart),
+# next to the host's boot_id (else kern.boottime's seconds): a pid alive with another start, or a boot that
+# changed, is a driver that is gone even with no .rc.
 _REMOTE_START = r'''d=$1 n=$2; shift 2
 case $d in "~"|"~/"*) d=$HOME${d#\~} ;; esac
 mkdir -p "$d" || exit 3
 p=$d/$n
 if [ -e "$p.log" ] || [ -e "$p.rc" ] || [ -e "$p.pid" ]; then echo "exists $p"; exit 4; fi
-cat /proc/sys/kernel/random/boot_id >"$p.boot" 2>/dev/null || : >"$p.boot"
+{ cat /proc/sys/kernel/random/boot_id 2>/dev/null ||
+  sysctl -n kern.boottime 2>/dev/null | sed -n "s/^{ sec = \([0-9]*\),.*/\1/p"; } >"$p.boot"
 setsid nohup sh -c 'p=$1; shift
-echo "$(date +%s) $(sed "s/.*) //" /proc/$$/stat 2>/dev/null | cut -d" " -f20)" >"$p.start"
+s=$(sed "s/.*) //" /proc/$$/stat 2>/dev/null | cut -d" " -f20)
+[ -n "$s" ] || s=$(ps -o lstart= -p $$ 2>/dev/null | tr -s " " _)
+echo "$(date +%s) $s" >"$p.start"
 echo $$ >"$p.pid.tmp"; mv "$p.pid.tmp" "$p.pid"
 "$@" >"$p.log" 2>&1 </dev/null; c=$?; echo $c >"$p.rc.tmp"; mv "$p.rc.tmp" "$p.rc"' sh "$p" "$@" \
   >/dev/null 2>&1 </dev/null &
@@ -1836,11 +1840,13 @@ case $p in "~"|"~/"*) p=$HOME${p#\~} ;; esac
 p=${p%.rc}
 if [ -e "$p.rc" ]; then echo "rc $(cat "$p.rc")"; exit 0; fi
 if [ ! -s "$p.pid" ]; then echo "none $p"; exit 0; fi
-b=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
+b=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null ||
+  sysctl -n kern.boottime 2>/dev/null | sed -n "s/^{ sec = \([0-9]*\),.*/\1/p")
 if [ -s "$p.boot" ] && [ "$b" != "$(cat "$p.boot")" ]; then echo "boot"; exit 0; fi
 pid=$(cat "$p.pid")
 if kill -0 "$pid" 2>/dev/null; then
   st=$(sed "s/.*) //" /proc/$pid/stat 2>/dev/null | cut -d" " -f20)
+  [ -n "$st" ] || st=$(ps -o lstart= -p "$pid" 2>/dev/null | tr -s " " _)
   want=$(cut -d" " -f2 "$p.start" 2>/dev/null)
   if [ -z "$st" ] || [ -z "$want" ] || [ "$st" = "$want" ]; then echo "running $pid"; exit 0; fi
 fi

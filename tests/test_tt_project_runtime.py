@@ -30,6 +30,8 @@ import pytest
 
 RUNTIME = pathlib.Path(__file__).resolve().parents[1] / "plugins" / "tt-project" / "runtime"
 TTP = pathlib.Path(__file__).resolve().parents[1] / "plugins" / "tt-project" / "bin" / "ttp"
+# Tests without the env fixture import ttp too; each must also pass when run alone.
+sys.path.insert(0, str(RUNTIME))
 
 
 def _sockets_refused() -> bool:
@@ -33893,13 +33895,13 @@ def test_detach_remote_check_sees_a_dead_pid_or_a_new_boot_as_gone_and_ssh_failu
         assert _ttp_run(p, "detach", "--remote", "box-b", "--dir", str(rdir), "x", "--", "true",
                         env={**e, "SSH_STUB_FAIL": "1"}).returncode == 255
         # The host restarted: its boot_id changed, so the driver is gone even if a process holds its pid.
-        if os.path.exists("/proc/sys/kernel/random/boot_id"):
-            boot = (rdir / "long.boot").read_text()
-            (rdir / "long.boot").write_text("another-boot\n")
-            gone = _ttp_run(p, *probe[1:], env=e)
-            assert gone.returncode == 0 and "gone without an exit code" in gone.stdout, gone.stdout
-            (rdir / "long.boot").write_text(boot)
-            assert _ttp_run(p, *probe[1:], env=e).returncode == 1
+        boot = (rdir / "long.boot").read_text()
+        assert boot.strip(), "the boot is recorded (boot_id, or kern.boottime without /proc)"
+        (rdir / "long.boot").write_text("another-boot\n")
+        gone = _ttp_run(p, *probe[1:], env=e)
+        assert gone.returncode == 0 and "gone without an exit code" in gone.stdout, gone.stdout
+        (rdir / "long.boot").write_text(boot)
+        assert _ttp_run(p, *probe[1:], env=e).returncode == 1
     finally:
         _kill_driver(pid)
     # Killed: no .rc is ever written, and the check still ends the wait with 'gone', not a missing marker.
@@ -33911,8 +33913,7 @@ def test_detach_remote_check_sees_a_dead_pid_or_a_new_boot_as_gone_and_ssh_failu
     assert not (rdir / "long.rc").exists()
     # A pid now taken by another process (its start differs) is gone too.
     (rdir / "long.pid").write_text(f"{os.getpid()}\n")
-    if os.path.exists(f"/proc/{os.getpid()}/stat"):
-        assert _ttp_run(p, *probe[1:], env=e).returncode == 0
+    assert _ttp_run(p, *probe[1:], env=e).returncode == 0
     # Several jobs on one host: still waiting while any one runs; a path with .rc reads the same.
     r2 = _ttp_run(p, "detach", "--remote", "box-b", "--dir", str(rdir), "two", "--", "sleep", "60", env=e)
     pid2 = int((rdir / "two.pid").read_text())
@@ -33922,6 +33923,49 @@ def test_detach_remote_check_sees_a_dead_pid_or_a_new_boot_as_gone_and_ssh_failu
     finally:
         _kill_driver(pid2)
     assert r2.returncode == 0
+
+
+def test_detach_remote_scripts_tell_a_reused_pid_and_a_reboot_without_proc(env, tmp_path):
+    """A host without /proc (macOS): the driver's start comes from ps's lstart and the boot from
+    kern.boottime, so a pid taken by another process or a restarted host never reads as running.
+    Simulated here: /proc is pointed at a missing folder and a fake sysctl stands in."""
+    from ttp import cli
+    noproc, fake = str(tmp_path / "noproc") + "/", tmp_path / "fakebin"
+    fake.mkdir()
+    booted = tmp_path / "booted"
+    booted.write_text("1700000000")
+    (fake / "sysctl").write_text(f'#!/bin/sh\necho "{{ sec = $(cat {booted}), usec = 4242 }} Tue Nov 14 22:13:20 2023"\n')
+    (fake / "sysctl").chmod(0o755)
+    start, check = (x.replace("/proc/", noproc) for x in (cli._REMOTE_START, cli._REMOTE_CHECK))
+    assert "/proc/" not in start + check
+    e = {**os.environ, "PATH": f"{fake}{os.pathsep}{os.environ['PATH']}"}
+    if not shutil.which("setsid"):
+        (fake / "setsid").write_text("#!/bin/sh\nexec \"$@\"\n")
+        (fake / "setsid").chmod(0o755)
+    rdir = tmp_path / "remote"
+
+    def sh(script, *args):
+        return subprocess.run(["sh", "-c", script, "sh", *map(str, args)], env=e, capture_output=True, text=True,
+                              timeout=30).stdout.strip()
+    out = sh(start, rdir, "job", "sleep", "60")
+    assert out.startswith("started "), out
+    pid = int((rdir / "job.pid").read_text())
+    try:
+        assert (rdir / "job.boot").read_text().strip() == "1700000000"
+        assert (rdir / "job.start").read_text().split()[1:], "the start is recorded without /proc"
+        assert sh(check, rdir / "job") == f"running {pid}"
+        booted.write_text("1700099999")   # the host restarted
+        assert sh(check, rdir / "job") == "boot"
+        booted.write_text("1700000000")
+        (rdir / "job.pid").write_text(f"{os.getpid()}\n")   # the pid now belongs to another process
+        assert sh(check, rdir / "job") == "gone"
+        (rdir / "job.pid").write_text(f"{pid}\n")
+    finally:
+        _kill_driver(pid)
+    deadline = time.time() + 20
+    while time.time() < deadline and sh(check, rdir / "job") != "gone":
+        time.sleep(0.1)
+    assert sh(check, rdir / "job") == "gone"
 
 
 def _dev_task(p, labels=(), status="queued", title="t", spec=""):
