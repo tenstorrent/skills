@@ -48,6 +48,7 @@ BLOCKING_REASONS = ("access", "funds", "spend", "review", "merge", "irreversible
 # "neither" is a judgment call and is refused (decide it yourself).
 ASK_CLASSES = ("irreversible", "restriction_change", "neither")
 ASK_REFUSED_KIND = "ask_refused"   # events: an ask the gate refused, counted in the unblocking metrics
+ASK_FLAGGED_KIND = "ask_flagged"   # events: an ask the gate sent but flagged as likely the coordinator's own call
 
 ACTIONS_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -1054,10 +1055,6 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if why:
                     _count_refusal(db, key, "self-health", text)
                     raise ValueError(f"ask_user rejected: {why}")
-                why = _reversible_ask(a, text, least)
-                if why:
-                    _count_refusal(db, key, why[0], text)
-                    raise ValueError(f"ask_user rejected: {why[1]}")
                 if (a["blocking"] not in ("restriction", "review", "merge")    # a review or merge ask is never leave to open
                         and prguard.draft_permission_ask(text)):
                     raise ValueError("ask_user rejected: draft PRs need no permission: open it. Opening and updating a "
@@ -1087,6 +1084,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 turn_asks.append((k, db.post("out", text, chat=None, kind="ask",
                                              severity=_norm_severity(a.get("severity") or "high"),
                                              ref=f"{prguard.BLOCKING_REF}{a['blocking']}")))
+                flag = _reversible_ask(a, a["text"].strip(), least)
+                if flag:   # sent anyway: a flag is feedback for the next turn and the daily review, never a refusal
+                    _count_refusal(db, key, flag[0], a["text"].strip(), kind=ASK_FLAGGED_KIND)
+                    notes.append(f"ask_user: ask {turn_asks[-1][1]} was sent; flagged ({flag[0]}): {flag[1]}")
             elif t == "resolve":
                 n = db.x("UPDATE messages SET handled=1 WHERE id=? AND kind='ask'", (int(a["id"]),))
                 if not n:
@@ -2617,9 +2618,10 @@ def _self_health_ask(a: dict, text: str, least: str = "") -> str:
             "(or irreversible), with least_disruptive naming the restriction or the irreversible step")
 
 
-# The reversible-step gate is a high-precision backstop too: few exact phrasings, each with a
-# false-positive test. Known gaps, accepted: paraphrases ("let it be", "give the hold another week",
-# "allow two more runs a day") get through; the prompt rule covers them.
+# The status-quo and reversible-step checks only flag: a flagged ask is sent as usual, and the flag is
+# one note in the next digest and a count in the daily review. Wording is too loose to refuse on (a
+# refused real ask is worse than a missed one); the prompt rule is the main guard. Known gaps, accepted:
+# paraphrases ("let it be", "allow two more runs a day") are not flagged.
 # least_disruptive that keeps things as they are, and nothing in it says what that costs.
 _STATUS_QUO_RE = re.compile(r"\bstatus quo\b|\b(?:do|doing|change|changing)\s+nothing\b|"
                             r"\b(?:keep|keeping|leave|leaving)\s+(?:(?:it|them|things|everything|the\s+[\w.-]+)\s+)?"
@@ -2656,37 +2658,38 @@ def _names_needs_user(said: str) -> bool:
 
 
 def _reversible_ask(a: dict, text: str, least: str = "") -> tuple[str, str] | None:
-    """(refusal label, why) for an ask that is the coordinator's own call, else None: its least_disruptive
-    keeps the status quo and names no cost (human, irreversible or restriction), or what it asks or
-    recommends is a reversible step (an expiry, quota, limit, config flag, rename with a backup;
-    human or irreversible only: a restriction-set limit is the user's). Exempt: a NEEDS_USER setting,
-    money, a real credential, a step only the user can take, another person's request."""
+    """(flag label, hint) for a sent ask that looks like the coordinator's own call, else None: its
+    least_disruptive keeps the status quo and names no cost (irreversible or restriction), or what it
+    asks or recommends is a reversible step (an expiry, quota, limit, config flag, rename with a backup;
+    irreversible only: a restriction-set limit is the user's). Never flagged: blocking human, a
+    NEEDS_USER setting, money, a real credential, a step only the user can take, another person's request."""
     blocking = a.get("blocking")
-    if blocking not in ("human", "irreversible", "restriction"):
+    if blocking not in ("irreversible", "restriction"):
         return None
     said = f"{text} {a.get('recommendation') or ''}".replace("’", "'")
     if (_names_needs_user(said) or _MONEY_RE.search(said) or _CREDENTIAL_RE.search(said)
             or _USER_ONLY_RE.search(said) or _OTHERS_ASK_RE.search(said)):
         return None
     if _STATUS_QUO_RE.search(least) and not _STATUS_QUO_COST_RE.search(least):
-        return ("status quo", "your least-disruptive way keeps things as they are and breaks nothing: that is "
-                "yours to take. Keep the status quo, memory_add the decision and notify at severity low. If keeping "
-                "it costs something, say what in least_disruptive")
+        return ("status quo", "its least-disruptive way keeps things as they are. If that costs nothing, such a "
+                "call is yours next time: keep the status quo, memory_add the decision and notify at severity "
+                "low. If it does cost something, nothing to do")
     if (blocking != "restriction" and any(r.search(said) for r in _REVERSIBLE_STEP_RES)
             and not _ONE_WAY_RE.search(said) and not _NOT_UNDOABLE_RE.search(said)):
-        return ("reversible step", "an expiry, quota, limit, config flag or rename with a backup can be undone: "
-                "decide it yourself, act on it (task_add or the action), memory_add the decision and notify at "
-                "severity low. Settings only the user may change, money and credentials still go to the user")
+        return ("reversible step", "an expiry, quota, limit, config flag or rename with a backup can usually be "
+                "undone. If this one can, such a call is yours next time: act on it, memory_add the decision and "
+                "notify at severity low. If it cannot, nothing to do")
     return None
 
 
-def _count_refusal(db, key: str | None, label: str, text: str) -> None:
-    """Record a refused ask for the unblocking metrics, once per turn action (a replayed turn adds none)."""
-    fp = f"{ASK_REFUSED_KIND}:{key}" if key else None
-    if fp and db.one("SELECT 1 FROM events WHERE kind=? AND fingerprint=?", (ASK_REFUSED_KIND, fp)):
+def _count_refusal(db, key: str | None, label: str, text: str, kind: str = ASK_REFUSED_KIND) -> None:
+    """Record a refused (or, with ASK_FLAGGED_KIND, a flagged) ask for the unblocking metrics, once per
+    turn action (a replayed turn adds none)."""
+    fp = f"{kind}:{key}" if key else None
+    if fp and db.one("SELECT 1 FROM events WHERE kind=? AND fingerprint=?", (kind, fp)):
         return
     db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
-         (time.time(), "coordinator", ASK_REFUSED_KIND, fp, "low", f"{label}: {clip(text, 300)}", "handled"))
+         (time.time(), "coordinator", kind, fp, "low", f"{label}: {clip(text, 300)}", "handled"))
 
 
 def _calls_undoable(text: str) -> bool:

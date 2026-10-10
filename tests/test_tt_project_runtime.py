@@ -8264,58 +8264,83 @@ def test_the_self_health_gate_by_reason_and_its_refusal_count(env):
 
 _QUO = "leave the config as it is for now; that breaks nothing and nobody waits on it"
 _COSTLY_QUO = "leave the config as it is; but then the nightly job keeps failing until it changes"
-# (fields, refused label or None). Refusals first, then exemptions and near misses that must go out.
+_R = {"blocking": "restriction", "classify": "restriction_change"}
+_I = {"blocking": "irreversible", "classify": "irreversible"}
+# (fields, flag label, or None for no flag, or "sent" when only sending matters). Every case is sent:
+# these checks never refuse. Flags first, then exemptions, near misses and the asks a review found
+# wrongly refused when these checks refused.
 _REVERSIBLE_CASES = [
-    ({"text": "Rename the field?", "blocking": "restriction", "classify": "restriction_change",
-      "least_disruptive": _QUO}, "status quo"),
-    ({"text": "Rename the field?", "blocking": "irreversible", "classify": "irreversible",
+    ({"text": "Rename the field?", **_R, "least_disruptive": _QUO}, "status quo"),
+    ({"text": "Rename the field?", **_I,
       "least_disruptive": "keep things as they are; the status quo breaks no rule at all"}, "status quo"),
-    ({"text": "Extend the hold's expiry by a week?", "blocking": "human", "recommendation": "yes"},
-     "reversible step"),
-    ({"text": "The cache fills up. Raise the disk quota to 50 GB?", "blocking": "human"}, "reversible step"),
-    ({"text": "Should I lower the parallel job limit to 2?", "blocking": "human"}, "reversible step"),
-    ({"text": "Flip the verbose_logs config flag on?", "blocking": "human"}, "reversible step"),
-    ({"text": "Rename results/ to results-old/ and keep a backup?", "blocking": "irreversible",
-      "classify": "irreversible", "least_disruptive": "write to a new folder; the dashboards read the old path"},
-     "reversible step"),
+    ({"text": "Rename results/ to results-old/ and keep a backup?", **_I,
+      "least_disruptive": "write to a new folder; the dashboards read the old path"}, "reversible step"),
+    ({"text": "The cache fills up. Raise the disk quota to 50 GB?", **_I,
+      "least_disruptive": "move the cache elsewhere; the jobs read it from this path"}, "reversible step"),
+    ({"text": "Flip the verbose_logs config flag on?", **_I,
+      "least_disruptive": "log to a side file; the collector reads only the main one"}, "reversible step"),
+    # blocking human is never flagged, reversible step or not.
+    ({"text": "Extend the hold's expiry by a week?", "blocking": "human", "recommendation": "yes"}, None),
+    ({"text": "The cache fills up. Raise the disk quota to 50 GB?", "blocking": "human"}, None),
+    ({"text": "Should I lower the parallel job limit to 2?", "blocking": "human"}, None),
+    ({"text": "Flip the verbose_logs config flag on?", "blocking": "human"}, None),
     # Exempt: a NEEDS_USER setting, money, a credential, a user-only step, another person's request.
-    ({"text": "Turn on the code_tasks_may_push setting?", "blocking": "human"}, None),
-    ({"text": "Raise the daily limit to $40?", "blocking": "human"}, None),
-    ({"text": "Extend the API token's expiry?", "blocking": "human"}, None),
-    ({"text": "Raise the quota on your laptop's disk by hand?", "blocking": "human"}, None),
-    ({"text": "A reviewer asked us to raise the retry limit; do we?", "blocking": "human"}, None),
+    ({"text": "Turn on the code_tasks_may_push setting?", **_I, "least_disruptive": _QUO}, None),
+    ({"text": "Raise the daily limit to $40?", **_I, "least_disruptive": "stay at the current limit; the runs stop early each day"},
+     None),
+    ({"text": "Extend the API token's expiry?", **_I, "least_disruptive": "use a fresh token instead; none is issued to this project"},
+     None),
+    ({"text": "Raise the quota on your laptop's disk by hand?", **_I,
+      "least_disruptive": "use the shared disk instead; it is too small for the cache"}, None),
+    ({"text": "A reviewer asked us to raise the retry limit; do we?", **_I, "least_disruptive": _QUO}, None),
     # Near misses: a status quo that costs something, a one-way step, a restriction-set limit, other wording.
-    ({"text": "Rename the field?", "blocking": "restriction", "classify": "restriction_change",
-      "least_disruptive": _COSTLY_QUO}, None),
-    ({"text": "Rename the old table with a backup, then delete it?", "blocking": "irreversible",
-      "classify": "irreversible", "least_disruptive": "archive it instead; the archive is full so that will not do"},
-     None),
-    ({"text": "The charter caps workers at 2; raise the cap to 4?", "blocking": "restriction",
-      "classify": "restriction_change", "least_disruptive": "run 2 workers; it breaks the 2-worker restriction"},
-     None),
+    ({"text": "Rename the field?", **_R, "least_disruptive": _COSTLY_QUO}, None),
+    ({"text": "Rename the old table with a backup, then delete it?", **_I,
+      "least_disruptive": "archive it instead; the archive is full so that will not do"}, None),
+    ({"text": "The charter caps workers at 2; raise the cap to 4?", **_R,
+      "least_disruptive": "run 2 workers; it breaks the 2-worker restriction"}, None),
     ({"text": "Should I raise the issue about the rate limit with the maintainers?", "blocking": "human"}, None),
     ({"text": "Option A or B for the settings page layout?", "blocking": "human"}, None),
     ({"text": "Which setting do you prefer, compact or wide?", "blocking": "human"}, None),
+    # Wrongly refused when these checks refused: a status quo whose cost is in plain words, a one-way
+    # step in words outside the one-way list, another team's request worded "wants".
+    *[({"text": "Lift the device restriction for the nightly tests?", **_R, "least_disruptive": least}, "sent")
+      for least in ("keep things as they are; the device tests wait until you lift it",
+                    "leave it as is; this delays the rollout by a week",
+                    "do nothing for now, and the nightly device tasks stay stuck",
+                    "keep it as it is, so the work stays on hold",
+                    "change nothing; nobody can run device jobs meanwhile")],
+    *[({"text": f"Lower the log retention limit to 30 days? It {what}.", **_I, "recommendation": "yes",
+        "least_disruptive": "keep the current retention; the disk fills in a week"}, "sent")
+      for what in ("drops three months of logs", "means old runs are removed for good",
+                   "erases old checkpoints", "means those commits are gone")],
+    ({"text": "The platform team wants us to raise the job limit to 8; do we?", "blocking": "human"}, None),
 ]
 
 
 @pytest.mark.parametrize("fields,label", _REVERSIBLE_CASES)
-def test_the_ask_gate_refuses_status_quo_and_reversible_step_asks(env, fields, label):
+def test_the_ask_gate_flags_status_quo_and_reversible_step_asks_but_sends_them(env, fields, label):
     p = make(env)
-    from ttp import unblock
+    from ttp import coordinator as coord, unblock
     problems, ask = _ask(p, **fields)
-    if label is None:
-        assert problems == [] and ask is not None, problems
+    assert problems == [] and ask is not None and ask["text"].startswith(fields["text"]), problems
+    lines = unblock.lines(p.db)
+    assert "none refused" in next(x for x in lines if x.startswith("asks refused by the gate, 24 h"))
+    flagged = next(x for x in lines if x.startswith("asks sent but flagged by the gate, 24 h"))
+    notes = p.db.kv(coord.NOTES_KEY, [])
+    if label == "sent":
         return
-    assert problems and ask is None
-    assert ("keep the status quo" if label == "status quo" else "can be undone: decide it yourself") \
-        in problems[0].lower(), problems[0]
-    assert f"1 refused ({label} 1)" in next(x for x in unblock.lines(p.db) if x.startswith("asks refused"))
+    if label is None:
+        assert "none flagged" in flagged and notes == [], notes
+        return
+    assert f"1 flagged ({label} 1)" in flagged, flagged
+    assert len(notes) == 1 and notes[0].startswith(f"ask_user: ask {ask['id']} was sent; flagged ({label})")
+    assert "nothing to do" in notes[0]   # a flag never asks for what the ask already gave
 
 
-def test_review_merge_funds_spend_and_access_asks_skip_the_reversible_gate(env):
+def test_review_merge_funds_spend_access_and_human_asks_skip_the_reversible_flag(env):
     from ttp import coordinator as coord
-    for blocking in ("review", "merge", "funds", "spend", "access"):
+    for blocking in ("review", "merge", "funds", "spend", "access", "human"):
         assert coord._reversible_ask({"blocking": blocking}, "Raise the disk quota?", _QUO) is None, blocking
 
 

@@ -26,7 +26,8 @@ Assess the last day of this project, then hand off.
    dead worker, a stuck hold, a failed run, a reversible choice)? A needless ask is a defect: for
    each pattern, a `harness:` follow-up with a concrete fix (an ask-gate rule, a prompt rule or a
    model-free recovery). Asks the gate refused are the gate working; a reason refused again and
-   again needs a prompt rule. Each cause of wasted runs (failed, retried, lost or continued runs)
+   again needs a prompt rule. Asks the gate flagged were still sent: grade each like any other
+   ask. Each cause of wasted runs (failed, retried, lost or continued runs)
    that will recur gets a follow-up too: fix it the same day, not in a later review. Then name the
    top 1-3 inefficiencies (wasted runs, turns that decided nothing, idle wakes, $ per outcome,
    review loops, long blocks or waits) with their cost and a fix. An override held past its premise (a pause, a mute, a temporary instruction possibly over)

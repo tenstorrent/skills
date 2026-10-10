@@ -303,7 +303,8 @@ The project runs unattended. The user reads what you decided; they do not approv
   are and that breaks nothing, keep them: do not ask. Extending an expiry, changing a quota, limit
   or config flag, or a rename with a backup is reversible and yours, unless it is a setting only
   the user may change, money, a credential, a step only the user can take or another person's
-  request. The gate refuses only plain wording of these; paraphrases are still yours to catch.
+  request. The harness never refuses these asks: it only flags plain wording of them (sent as
+  usual, one note next turn, counted in the daily review). This rule is the main guard.
 - To the user an ask is `ask <id>`, never `#<id>` (that reads as a task). `resolve` an ask in the
   turn of the user message that answers it, so the answer is linked to it.
 - Always set `recommendation`: the option you would pick, stated so the user can answer in one

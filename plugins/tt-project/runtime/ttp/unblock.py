@@ -541,17 +541,20 @@ def asks_line(rows: list[dict]) -> str:
     return line
 
 
-def refused_line(db: DB, since: float) -> str:
+def refused_line(db: DB, since: float, flagged: bool = False) -> str:
     """Asks the gate refused since `since` (coordinator._count_refusal), by why: self-health
-    questions the project should have fixed itself, and unclassified or `neither` asks."""
-    from .coordinator import ASK_REFUSED_KIND
+    questions the project should have fixed itself, and unclassified or `neither` asks. With
+    `flagged`, asks it sent but flagged instead (status quo, reversible step)."""
+    from .coordinator import ASK_FLAGGED_KIND, ASK_REFUSED_KIND
+    verb = "flagged" if flagged else "refused"
     by: dict[str, int] = {}
-    for r in db.q("SELECT text FROM events WHERE kind=? AND ts>=?", (ASK_REFUSED_KIND, since)):
+    for r in db.q("SELECT text FROM events WHERE kind=? AND ts>=?",
+                  (ASK_FLAGGED_KIND if flagged else ASK_REFUSED_KIND, since)):
         label = str(r["text"]).split(":", 1)[0]
         by[label] = by.get(label, 0) + 1
     if not by:
-        return "none refused"
-    return f"{sum(by.values())} refused (" + ", ".join(
+        return f"none {verb}"
+    return f"{sum(by.values())} {verb} (" + ", ".join(
         f"{label} {n}" for label, n in sorted(by.items(), key=lambda kv: (-kv[1], kv[0]))) + ")"
 
 
@@ -663,6 +666,7 @@ def lines(db: DB, now: float | None = None) -> list[str]:
     for label, span in WINDOWS:
         out.append(f"asks, {label}: {asks_line(asks(db, now - span, now))}")
         out.append(f"asks refused by the gate, {label}: {refused_line(db, now - span)}")
+        out.append(f"asks sent but flagged by the gate, {label}: {refused_line(db, now - span, flagged=True)}")
     out.append(f"coordinator, 24 h: {turns_line(db, now - 86400)}")
     out.append(f"coordinator triggers, 24 h: {triggers_line(db, now - 86400)}")
     out.append(f"{reviewcap.TRIGGER}, 24 h: {reviewcap.daily_line(db, now - 86400)}")
