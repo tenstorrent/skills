@@ -772,8 +772,10 @@ def check_probe(probe, what: str = "start_when") -> None:
     """A task's shell probe (start_when, or a waiting task's retry_when): one command, bounded."""
     if not isinstance(probe, str) or len(probe) > START_WHEN_CHARS:
         raise ValueError(f"{what} must be one shell command of at most {START_WHEN_CHARS} characters")
-    if re.match(r"\s*landed:", probe) and not re.fullmatch(r"\s*landed:\s*#?\d+\s*", probe):
-        raise ValueError(f"{what} {probe.strip()[:60]!r} is not a landed probe: write it as landed:#<task id>")
+    if re.match(r"\s*landed:", probe, re.I) and not re.fullmatch(r"\s*landed:\s*#?\d+\s*", probe):
+        raise ValueError(f"{what} {probe.strip()[:60]!r} is not a landed probe: write it as landed:#<task id> "
+                         f"(exactly `landed:#<id>`, one task id); to combine it with another check, use "
+                         f"`ttp landed --task <id> && ...`")
 
 
 def start_why(a: dict, cur: dict, when: str | None) -> str | None:
