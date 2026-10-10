@@ -8881,7 +8881,7 @@ def _receipt_rig(env, tmp_path, name="receipts", lifecycle="explicit_clear"):
 
 
 def _line(text, **kw):
-    return json.dumps({"text": text, "severity": "normal", **kw}) + "\n"
+    return json.dumps({"text": text, "severity": "normal", "items": True, **kw}) + "\n"
 
 
 def test_explicit_clear_receipts_stay_pending_through_the_quiet_sweep_downtime_and_restarts(env, tmp_path):
