@@ -35126,3 +35126,66 @@ def test_heal_cli_lists_and_tests_a_check(env, capsys, monkeypatch):
     with pytest.raises(SystemExit) as e:
         cli.main(["heal", "test", "svc"])
     assert e.value.code == 0
+
+
+def test_heal_open_task_matches_labels_exactly_not_as_like_wildcards(env):
+    from ttp import heal
+    p = make(env)
+    ids = {n: p.db.add_task(f"t {n}", "s", origin="daemon", labels=[heal.LABEL + n]) for n in ("axb", "a%c")}
+    assert heal.open_task(p.db, "a_b") is None and heal.open_task(p.db, "a%") is None
+    assert heal.open_task(p.db, "%") is None and heal.open_task(p.db, "a_c") is None
+    assert heal.open_task(p.db, "axb")["id"] == ids["axb"] and heal.open_task(p.db, "a%c")["id"] == ids["a%c"]
+
+
+def test_heal_queued_self_fix_task_is_cancelled_when_the_check_recovers_a_running_one_is_not(env):
+    from ttp import heal
+    p, d, up = _heal_setup(env)
+    spec, now = _heal_spec(p), time.time()
+    nofix = dict(spec, fix="")
+    for status in ("queued", "running"):
+        assert "self-fix task" in heal.run(d, "svc", nofix, now)[0]
+        t = heal.open_task(p.db, "svc")
+        p.db.update_task(t["id"], status=status)
+        up.touch()
+        assert heal.run(d, "svc", nofix, now + 10)[0] == "ok (healthy)"
+        t = p.db.task(t["id"])
+        if status == "queued":
+            assert t["status"] == "cancelled" and "recovered" in t["blocked_reason"]
+        else:
+            assert t["status"] == "running"
+            p.db.update_task(t["id"], status="done")
+        up.unlink()
+
+
+def test_heal_outage_check_exiting_an_error_code_gets_one_task(env):
+    import unittest.mock
+    from ttp import alerts, heal
+    from ttp import schedule as sched
+    p, d, up = _heal_setup(env, outage=True, grace_s=600)
+    payload = json.loads(p.db.one("SELECT payload FROM schedules WHERE name='svc'")["payload"])
+    payload["heal"]["check"] = "exit 124"
+    sched.upsert(p.db, "svc", "command", "5m", payload=payload)
+    spec, now = _heal_spec(p), time.time()
+
+    def tick(at):   # one daemon run of the schedule, due now
+        p.db.x("UPDATE schedules SET next_run=0 WHERE name='svc'")
+        with unittest.mock.patch("time.time", return_value=at):
+            d.run_schedules()
+        return p.db.one("SELECT last_status FROM schedules WHERE name='svc'")["last_status"]
+
+    assert tick(now).startswith("error: heal check exited 124")
+    tick(now + 300)   # second failure: the daemon queues its schedule_fix task
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 1
+    status = tick(now + 700)   # past the outage window: heal adopts that task
+    tasks = p.db.q("SELECT * FROM tasks WHERE origin='daemon'")
+    assert len(tasks) == 1 and f"self-fix task #{tasks[0]['id']}" in status, status
+    assert heal.has_open_task(p.db, "svc")
+    for dt in (1000, 1300):
+        tick(now + dt)
+    assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 1
+    p.db.update_task(tasks[0]["id"], status="failed")
+    assert "alerted" in heal.run(d, "svc", spec, now + 1600)[0]
+    assert p.db.q("SELECT id FROM messages WHERE kind='alert' AND ref='heal:svc'")
+    up.touch()
+    assert heal.run(d, "svc", dict(spec, check=f"test -e {up}"), now + 1900)[0] == "ok (healthy)"
+    assert "heal:svc" in [e["key"] for e in alerts.sweep(p.db)]

@@ -298,11 +298,28 @@ def _record_fixed(db: DB, name: str, now: float) -> int:
     return fixed_today(db, name, now)
 
 
-def open_task(db: DB, name: str) -> dict | None:
-    """The check's open self-fix task (its fingerprint is the label heal:<name>)."""
-    label = json.dumps(LABEL + name)
-    return db.one(f"SELECT * FROM tasks WHERE status IN ({','.join('?' * len(OPEN))}) AND labels LIKE ? "
-                  f"ORDER BY id DESC LIMIT 1", (*OPEN, f"%{label}%"))
+def open_task(db: DB, name: str, label: str | None = None) -> dict | None:
+    """The check's open self-fix task (its fingerprint is the label heal:<name>, or `label`). The
+    labels are compared exactly (instr, then the parsed list): a LIKE pattern would read `_` and `%` in a name as wildcards."""
+    want = LABEL + name if label is None else label
+    for t in db.q(f"SELECT * FROM tasks WHERE status IN ({','.join('?' * len(OPEN))}) AND instr(labels, ?) > 0 "
+                  f"ORDER BY id DESC", (*OPEN, json.dumps(want))):
+        try:
+            labels = json.loads(t["labels"] or "[]")
+        except ValueError:
+            continue
+        if isinstance(labels, list) and want in labels:
+            return t
+    return None
+
+
+def has_open_task(db: DB, name: str) -> bool:
+    """A self-fix task of the check is open (its own, or the schedule_fix task it adopted)."""
+    if open_task(db, name):
+        return True
+    tid = state(db, name).get("task")
+    t = db.task(int(tid)) if tid else None
+    return bool(t and t["status"] in OPEN)
 
 
 # The flow -----------------------------------------------------------------------------------------
@@ -327,6 +344,9 @@ def run(host: Any, name: str, spec: dict, now: float | None = None) -> tuple[str
         was = st.get("status")
         nxt = {k: st[k] for k in ("fixes", "nrestarts", "last_check", "last_rc", "last_out") if k in st}
         _save(db, name, {**nxt, "status": "healthy"})
+        t = db.task(int(st["task"])) if st.get("task") else None
+        if t is not None and t["status"] == "queued":   # a running one is left to finish
+            db.update_task(t["id"], status="cancelled", blocked_reason="check recovered before the fix ran")
         if pending and was == "unhealthy":
             n = _record_fixed(db, name, now)
             db.post("out", f"Self-healed {name}: its fix worked ({n} today). {out[:200]}".strip(), chat=None,
@@ -410,7 +430,9 @@ def run(host: Any, name: str, spec: dict, now: float | None = None) -> tuple[str
 def _escalate(host: Any, name: str, spec: dict, st: dict, now: float, why: str) -> tuple[str, float | None]:
     """Queue the check's one self-fix task (or keep the open one)."""
     db = host.p.db
-    t = open_task(db, name)
+    # The daemon may have queued a schedule_fix task for the same failure (a check exiting an error
+    # code): adopt it, one task per failing check.
+    t = open_task(db, name) or open_task(db, name, f"schedule_fix:{name}")
     if t is None:
         fix = spec.get("fix") or "(none)"
         spec_text = (
