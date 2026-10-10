@@ -2637,6 +2637,7 @@ class Daemon:
             # Nothing to report: what this watcher reported before is over. A recurrence reopens it.
             scr.close_watcher_issues(self.p.db, source, why=scr.CLEAN_RUN_WHY)
             scr.settle_receipts(self.p.db, source, started, ())   # and its errors are repaired
+            scr.settle_mutes(self.p.db, source, started)   # and so are its muted conditions' clocks
             return "ok (0 observations)"
         n, subjects = 0, set()
         for obs in _observations(text):
@@ -2652,6 +2653,7 @@ class Daemon:
             n += 1
         if ok:
             scr.settle_receipts(self.p.db, source, started, subjects)
+            scr.settle_mutes(self.p.db, source, started)   # muted conditions it no longer reported cleared
         return f"ok ({n} observations)"
 
     def _schedule_llm(self, s: dict, payload: dict) -> str:

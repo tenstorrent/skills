@@ -2411,6 +2411,82 @@ def test_mute_replay_of_a_held_box_wakes_the_coordinator_two_hours_in(env, monke
     assert "persisting 5.5 h" in coord.digest(p, {}, [], [])
 
 
+def _muted_watcher(env, monkeypatch, first):
+    """A command watcher `hw` reporting `first`, muted on 'held' for 24 h: (run(at_h, stdout), asks(), p)."""
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import daemon as dm
+    from ttp import screen as scr
+    clock = {"t": 1_800_000_000.0}
+    t0 = clock["t"]
+    monkeypatch.setattr(scr.time, "time", lambda: clock["t"])
+    out = {"stdout": ""}
+    monkeypatch.setattr(dm.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, out["stdout"], ""))
+    d = dm.Daemon(p.base)
+
+    def run(at_h, stdout):
+        clock["t"], out["stdout"] = t0 + at_h * 3600, stdout
+        d._run_command_watcher({"name": "hw"}, {"command": "x"})
+
+    run(0, first)
+    assert coord.apply(p, [{"type": "observation_mute", "source": "watcher:hw", "match": "held",
+                            "hours": 24, "why": "known"}]) == []
+
+    def asks():
+        return [(e["ts"] - t0) / 3600 for e in p.db.q("SELECT ts FROM events WHERE text LIKE ? ORDER BY id",
+                                                       (f"%{scr.MUTE_PERSISTS}%",))]
+    return run, asks, p
+
+
+def test_mute_clock_clears_on_a_clean_watcher_run_and_re_arms(env, monkeypatch):
+    held = json.dumps({"text": "box-a: held by the broker", "severity": "high", "repeat": True})
+    run, asks, _ = _muted_watcher(env, monkeypatch, held)
+    for h in (0.5, 1, 1.5, 2, 2.5):
+        run(h, held)
+    assert asks() == [2.0]
+    run(3, "")   # a clean run: the daemon counts it as cleared
+    for h in (3.5, 4, 4.5, 5, 5.5, 6, 6.5):
+        run(h, held)   # back from 3.5 h and held for 3 h
+    assert asks() == [2.0, 5.5], asks()
+
+
+def test_mute_clock_restarts_after_clean_runs(env, monkeypatch):
+    held = json.dumps({"text": "box-a: held by the broker", "severity": "high", "repeat": True})
+    run, asks, _ = _muted_watcher(env, monkeypatch, held)
+    run(0.5, held)
+    run(1, "")
+    run(1.5, "")
+    run(2, held)   # back: 0 h old, not 2 h
+    assert asks() == []
+    for h in (2.5, 3, 3.5):
+        run(h, held)
+    assert asks() == []
+    run(4, held)
+    assert asks() == [4.0], asks()
+
+
+def test_mute_clock_clears_only_the_condition_a_run_dropped(env, monkeypatch):
+    from ttp import screen as scr
+    both = json.dumps({"text": "boxes: box-a held; box-b held", "severity": "high", "repeat": True})
+    only_b = json.dumps({"text": "boxes: box-b held", "severity": "high", "repeat": True})
+    run, asks, p = _muted_watcher(env, monkeypatch, both)
+    run(0.5, both)
+    run(1, only_b)   # box-a cleared, box-b still held
+
+    def conds():
+        [m] = scr.mutes(p.db, now=0)
+        return {c["text"]: c for c in m["conds"].values()}
+    c = conds()
+    assert c["boxes: box-a held"]["first_at"] is None
+    assert c["boxes: box-b held"]["first_at"] is not None
+    run(1.5, both)   # box-a back: a new clock
+    run(2, both)
+    assert asks() == [2.0] and "box-b" in p.db.one("SELECT text FROM events WHERE text LIKE ?",
+                                                     (f"%{scr.MUTE_PERSISTS}%",))["text"]
+    run(3.5, both)
+    assert asks() == [2.0, 3.5], asks()
+
+
 def test_missed_schedule_runs_once_on_wake(env):
     p = make(env)
     from ttp import schedule as sched

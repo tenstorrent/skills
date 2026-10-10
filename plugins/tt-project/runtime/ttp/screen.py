@@ -389,14 +389,16 @@ def settle_receipts(db: DB, source: str, since: float, subjects: Any, now: float
 # observations are still recorded and counted, but do not wake the coordinator until the mute
 # ends, when one summary event does. A mute hides noise, never a box or workload that stays down:
 # a muted condition still seen escalate_after_h after it was first muted queues one high event
-# (MUTE_PERSISTS), once per mute, re-armed when the condition clears and comes back.
+# (MUTE_PERSISTS), once per mute, re-armed when the condition clears and comes back. It clears on a
+# "cleared:" item, on a successful watcher run that no longer reports it (settle_mutes), or after
+# MUTE_CLEAR_GAP_S unseen.
 MUTES_KEY = "observation_mutes"   # kv: list of active mutes, oldest first
 MUTE_MIN_MATCH, MUTE_MAX_H, MUTE_MAX = 3, 72, 20
 MUTE_BELOW = ("normal", "high", "critical")
 MUTE_ESCALATE_H = 2.0   # default escalate_after_h; 0 never escalates (needs a `why` naming who handles it)
 MUTE_ESCALATE_MIN_H = 0.5
-# A muted condition not seen for this long has cleared: its next sighting starts a new clock. Generous,
-# so a watcher that runs less often than every half hour still counts as seeing it all along.
+# A muted condition not seen for this long has cleared: its next sighting starts a new clock. The
+# fallback for runs that never settle (failed or killed ones, sources other than command watchers).
 MUTE_CLEAR_GAP_S = 3 * 3600
 MUTE_CONDS_MAX = 50   # conditions tracked per mute; the longest unseen go first
 MUTE_PERSISTS = "under mute: is the expected recovery happening?"   # the escalation's text; effort trigger
@@ -525,6 +527,27 @@ def _track(db: DB, m: dict, source: str, text: str, now: float) -> None:
     if len(conds) > MUTE_CONDS_MAX:
         keep = sorted(conds, key=lambda k: float(conds[k].get("last_at") or 0))[-MUTE_CONDS_MAX:]
         m["conds"] = {k: conds[k] for k in keep}
+
+
+def settle_mutes(db: DB, source: str, since: float) -> int:
+    """After a successful run of command watcher `source` (it began at `since`): each muted condition of
+    `source` that run did not report has cleared, as its issue did, so its next sighting starts a new
+    clock and one that already asked re-arms. Returns how many cleared."""
+    if not db.kv(MUTES_KEY):
+        return 0
+    n = 0
+    with db.tx():
+        active = db.kv(MUTES_KEY, []) or []
+        for m in active:
+            if m["source"].lower() != source.lower():
+                continue
+            for c in (m.get("conds") or {}).values():
+                if c.get("first_at") is not None and float(c.get("last_at") or 0) < since:
+                    c.update(first_at=None, escalated=False)
+                    n += 1
+        if n:
+            db.set_kv(MUTES_KEY, active)
+    return n
 
 
 def mute_ages(m: dict, now: float | None = None) -> list[str]:
