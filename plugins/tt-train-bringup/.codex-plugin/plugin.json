@@ -1,0 +1,37 @@
+{
+  "name": "tt-train-bringup",
+  "version": "0.1.0",
+  "description": "Bring up and optimise training of a Hugging Face model in tt-train on one chip through three phases: plan (kernel inventory, freeze map, roofline target, memory budget), composite bring-up with a PCC harness on the forward and every gradient, and an optimisation loop that classifies every op as useful math, layout, glue, wasted or dispatch, costs it with training multiplicity and fixes it until the roofline target is met. Requires tt-autodebug.",
+  "author": {
+    "name": "Tenstorrent"
+  },
+  "homepage": "https://github.com/tenstorrent/skills",
+  "repository": "https://github.com/tenstorrent/skills",
+  "license": "Apache-2.0",
+  "keywords": [
+    "tenstorrent",
+    "tt-train",
+    "ttml",
+    "training",
+    "fine-tuning",
+    "model-bringup"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Tenstorrent Training Bring-up",
+    "shortDescription": "Bring up and optimise model training in tt-train",
+    "longDescription": "Bring up and optimise training of Hugging Face models in tt-train through seven verified stages: plan, functional training layer, fused training layer, optimised training layer, multichip, full model, benchmark. Every stage gates on forward and per-gradient PCC against torch, MFU and a Tracy op-class diff. Requires tt-autodebug.",
+    "developerName": "Tenstorrent",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Staged training implementation",
+      "Gradient correctness gates",
+      "Op-class profiling loop",
+      "Persistent goal orchestration"
+    ],
+    "websiteURL": "https://github.com/tenstorrent/skills",
+    "defaultPrompt": [
+      "Use train-bringup to bring up training of this Hugging Face model in tt-train."
+    ]
+  }
+}

@@ -54,6 +54,19 @@
       "description": "Staged TTNN model bring-up with vLLM TT plugin serving; requires tt-autodebug. Codex runs add optional telemetry when tenstorrent/ar-dashboard is accessible."
     },
     {
+      "name": "tt-train-bringup",
+      "source": {
+        "source": "local",
+        "path": "./plugins/tt-train-bringup"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools",
+      "description": "Staged tt-train training bring-up on one chip: plan, composite bring-up, optimisation loop with gradient PCC, MFU and Tracy op-class gates; requires tt-autodebug."
+    },
+    {
       "name": "tt-debug-tools",
       "source": {
         "source": "local",

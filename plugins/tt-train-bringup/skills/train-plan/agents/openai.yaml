@@ -1,0 +1,7 @@
+interface:
+  display_name: "Training Plan"
+  short_description: "Kernel inventory, freeze map, roofline target, memory budget"
+  default_prompt: "Use $train-plan to produce doc/plan.md for this model: kernel inventory, freeze map, single-chip roofline target and memory budget before any device code is written."
+
+policy:
+  allow_implicit_invocation: true

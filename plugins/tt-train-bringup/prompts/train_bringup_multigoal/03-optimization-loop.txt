@@ -1,0 +1,19 @@
+/goal Use $optimization-loop and $tt-device-usage for training HF_MODEL (recipe: RECIPE) in the current tt-metal checkout, single chip.
+
+As the user, I explicitly authorize you to use subagents when a selected skill requests or recommends them.
+
+This goal runs the optimisation loop on the composite training model until the roofline target in MODEL_DIR/doc/plan.md is met. Work on MODEL_DIR, tt-train/sources/ttml/ (ops, metal kernels, bindings) and tests; keep the PCC harness and loss match passing on every iteration.
+
+Goal completion requirements:
+- Every iteration is recorded in MODEL_DIR/doc/perf_analysis.md: MFU history row, updated ranked cost table, and for each candidate its class, cost (µs × ops/layer × layers × multiplicity incl. recompute and backward mirror), action taken or reason for rejection.
+- Every op of one step (forward, recompute, backward, optimiser) is attributed to model code and classified as useful math, layout, glue, wasted or dispatch; chains between real ops are costed as chains.
+- Items are picked by class first (overhead that can go to zero before math kernels), then cost; the ladder delete > reuse > extend > write-new is applied and the rung used is recorded.
+- Every landed change has: PCC harness pass on forward and every gradient with relative errors, MFU rerun with the baseline command, and a Tracy diff showing the targeted ops gone and nothing new; it beats the best correct measured path, not only the composite baseline.
+- Every layout, glue and wasted item above the stated threshold is removed or listed with cost, attempted fix and reason for rejection; every remaining useful-math kernel is at a stated fraction of its own roofline or has a documented blocker.
+- The host/dispatch gap (wall-clock minus summed device time) is measured each iteration and reduced where the runtime allows (fewer ops, trace capture of the static step, no host syncs).
+- Final MODEL_DIR/doc/perf_analysis.md holds the gap decomposition (step time = roofline + math inefficiency + overhead + dispatch), memory peak, and the final ranked table.
+- The loop stops only when the measured step time is within the stated margin of the roofline target or every remaining item is useful math near its own roofline with blockers documented.
+- MODEL_DIR/doc/optimization/README.md and work_log.md record commands, commits, before/after per iteration and exact artefacts.
+- $stage-review returns `clean-pass`; findings fixed/rereviewed. Local commit touched-repo changes; never push; log SHAs.
+
+Unmet requirements, review findings, failed gates: work. Stop only after `$autofix` fails.

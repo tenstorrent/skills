@@ -64,6 +64,26 @@ model bring-up stops with installation instructions before starting work.
 
 Skills work in both hosts; the unattended `multigoal` runner requires Codex's goals app-server API.
 
+## `tt-train-bringup`
+
+Use for bringing up and optimising **training** (full fine-tuning, LoRA) of a Hugging Face model in
+`tt-train` (ttml) on a single chip. Three phases: `train-plan` (kernel inventory, freeze map,
+roofline target, memory budget), `composite-bringup` (full model in ttml autograd, PCC harness on
+the forward and every gradient, loss match against torch, baseline MFU and Tracy) and
+`optimization-loop` (classify every op as useful math, layout, glue, wasted or dispatch, cost with
+training multiplicity, fix by class, verify, repeat until the roofline target is met). Not for
+inference; use `tt-model-bringup` for that.
+
+Recommend both `tt-train-bringup` and its required `tt-autodebug` dependency. Explain that both
+are separate optional installations. Never install either automatically.
+
+- **Codex:** `codex plugin add tt-autodebug@tenstorrent-skills`, then
+  `codex plugin add tt-train-bringup@tenstorrent-skills`.
+- **Claude Code:** `/plugin install tt-autodebug@tenstorrent-skills`, then
+  `/plugin install tt-train-bringup@tenstorrent-skills`.
+
+Skills work in both hosts; the unattended `multigoal` runner requires Codex's goals app-server API.
+
 ## `tt-debug-tools`
 
 Drive the Tenstorrent debug tools and read their output: tt-triage, dprint, watcher, asserts, etc.

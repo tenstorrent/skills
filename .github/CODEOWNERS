@@ -21,6 +21,9 @@
 # Staged TTNN model bring-up
 /plugins/tt-model-bringup/ @yieldthought @tchedaTT @odjuricicTT @mvasiljevicTT
 
+# tt-train training bring-up
+/plugins/tt-train-bringup/ @umales
+
 # Debug tools
 /plugins/tt-debug-tools/ @ppetrovicTT
 

@@ -1,0 +1,7 @@
+interface:
+  display_name: "Optimisation Loop"
+  short_description: "Measure, classify, cost, fix, verify, repeat to the roofline target"
+  default_prompt: "Use $optimization-loop on the composite training model: MFU and Tracy, classify every op into useful math / layout / glue / wasted / dispatch, cost with training multiplicity, fix the top item by class, verify with the PCC harness, MFU rerun and Tracy diff, and repeat until the roofline target in doc/plan.md is met."
+
+policy:
+  allow_implicit_invocation: true

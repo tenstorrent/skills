@@ -1,0 +1,7 @@
+interface:
+  display_name: "Training Bring-up"
+  short_description: "Bring up and optimise model training in tt-train on one chip"
+  default_prompt: "Use $train-bringup to bring up training of this Hugging Face model in tt-train: plan, composite bring-up, then the optimisation loop until the roofline target is met."
+
+policy:
+  allow_implicit_invocation: true

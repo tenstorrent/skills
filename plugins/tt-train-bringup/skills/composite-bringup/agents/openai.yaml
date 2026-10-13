@@ -1,0 +1,7 @@
+interface:
+  display_name: "Composite Bring-up"
+  short_description: "Correct full training model on one chip plus PCC harness"
+  default_prompt: "Use $composite-bringup to implement the full training model in ttml autograd on one chip following doc/plan.md, build the PCC harness for the forward and every gradient, match the torch loss, and record the baseline MFU and Tracy cost table."
+
+policy:
+  allow_implicit_invocation: true

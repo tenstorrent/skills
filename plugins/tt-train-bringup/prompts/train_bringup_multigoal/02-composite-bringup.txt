@@ -1,0 +1,19 @@
+/goal Use $composite-bringup and $tt-device-usage for training HF_MODEL (recipe: RECIPE) in the current tt-metal checkout, single chip.
+
+As the user, I explicitly authorize you to use subagents when a selected skill requests or recommends them.
+
+This goal creates the correct composite training model following MODEL_DIR/doc/plan.md. Work on MODEL_DIR, the training example under tt-train/sources/examples/, and tests under tt-train/tests/python/; do not start optimisation-loop work in this goal.
+
+Goal completion requirements:
+- Every layer kind and the full model are implemented in ttml autograd under MODEL_DIR with a documented HF weight loader; existing ttnn/ttml kernels are used wherever the kernel inventory has them.
+- Every backward op takes per-input requires_grad flags from the freeze map and allocates no gradient for a frozen input.
+- Activations cross module boundaries as [B, 1, T, W] tile layout with heads merged on the last dimension; every place a head axis is put on dimension -2 is recorded as a known layout cost.
+- A PCC harness under tt-train/tests/python/ compares, per module and per layer kind at real shapes, the forward output and every gradient against torch fp64 with bf16-rounded inputs, reporting PCC and relative error per tensor; all pass the stated acceptance bar.
+- The full model runs N training steps on one chip within the plan's memory budget and the loss trajectory matches the torch reference within a stated tolerance.
+- No hidden size, head count, sequence length or weight shape was reduced to make evidence easier to collect.
+- Baseline measurement exists: an MFU run without the profiler (ms/step, MFU with the plan's FLOP count) and a Tracy run on a reduced model with one real layer of each kind; MODEL_DIR/doc/perf_analysis.md holds the MFU history (composite baseline row) and the first ranked cost table.
+- A watcher-clean run and repeated-run determinism evidence exist.
+- MODEL_DIR/doc/composite/README.md and work_log.md record commands, PCC and relative-error tables, loss comparison, perf, limitations and exact artefacts.
+- $stage-review returns `clean-pass`; findings fixed/rereviewed. Local commit touched-repo changes; never push; log SHAs.
+
+Unmet requirements, review findings, failed gates: work. Stop only after `$autofix` fails.
