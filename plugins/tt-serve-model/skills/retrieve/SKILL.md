@@ -20,13 +20,13 @@ alone runs `pull.md`.
 
 ## When to Invoke
 
-Invoke `tt:retrieve` (Skill tool) for any model question before deployment:
+Invoke `tt-serve-model:retrieve` (Skill tool) for any model question before deployment:
 *"does X exist / is it gated"*, *"is there a TT implementation for my board"*,
 *"what image, commits, limits"*, *"is the image's spec stale"*, *"is there a
 bundle for X"*, *"what will tt-model serve run"*, *"how do I pull X"* — or
 when a deploy task has its Discovery table and needs the model side.
 
-Boundary: `tt:discover` answers *what is this host*. `tt:retrieve` answers
+Boundary: `tt-serve-model:discover` answers *what is this host*. `tt-serve-model:retrieve` answers
 *what is this model and how does it get here*. Launching is not here.
 
 ## Arguments
@@ -35,11 +35,11 @@ Boundary: `tt:discover` answers *what is this host*. `tt:retrieve` answers
 |---|---|
 | `--model <id>` | HF repo id, spec `model_name`, or bundle id. Required for all rows but R1, B1–B3. |
 | `--search <term>` | R1, B1–B3: list candidates. |
-| `--device <KEY>` | Spec key (`P150`, `P300X2`). Default: invoke `tt:discover --questions D9`. |
+| `--device <KEY>` | Spec key (`P150`, `P300X2`). Default: invoke `tt-serve-model:discover --questions D9`. |
 | `--fix-sha <sha>` | Enables the R15 ancestry verdict. |
 | `--questions R6,B7` | Answer only the listed IDs. Dependencies still run. |
 | `--pull` | After the table, execute `pull.md`. Default: never. |
-| `--note` | Also record via `tt:note`, topic `retrieve-<model>`. Default: chat only. |
+| `--note` | Also record via `tt-buddy:note` (only if the `tt-buddy` plugin is installed; otherwise say it is unavailable), topic `retrieve-<model>`. Default: chat only. |
 
 ## Pipeline
 
@@ -116,5 +116,5 @@ failed: <url>`. Token values are never printed.
 | Executing the retrieval (`--pull`) | `pull.md` |
 | Spec fetch, layout, queries, per-model doc path | `knowledge/recipes/tt-inference-server/model-spec.md` |
 | Image naming, mandatory flags, baked spec, run.py token rule | `knowledge/recipes/tt-inference-server/container.md` |
-| Device key, board count for this host; boards vs ASICs per spec key | invoke `tt:discover --questions D9,D10`; `knowledge/hardware/boards.md` |
-| Recording the table | invoke `tt:note` |
+| Device key, board count for this host; boards vs ASICs per spec key | invoke `tt-serve-model:discover --questions D9,D10`; `knowledge/hardware/boards.md` |
+| Recording the table | invoke `tt-buddy:note`, if installed |

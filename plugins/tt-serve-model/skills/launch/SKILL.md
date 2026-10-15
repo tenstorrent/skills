@@ -15,18 +15,18 @@ answer comes from a captured log/state snapshot or a listed static rule.
 
 ## When to Invoke
 
-Invoke `tt:launch` (Skill tool) when:
+Invoke `tt-serve-model:launch` (Skill tool) when:
 
 - `docker run` / `run.py` has already been issued for a model launch.
 - The user asks: *"is this hanging"*, *"why did it fail"*, *"what flags do I
   need"*, *"how long should this take"*, *"did I break something else on this
   box"*, *"is my override safe"*.
 
-Boundary: `tt:discover` answers what the machine *is*, before a launch starts.
-`tt:retrieve` answers what the model/image *should be* — its spec entry,
-docker image tag, mandatory flags, gating. `tt:launch` answers what a launch
-*is doing*, once one is running, against what `tt:retrieve` said it should
-be. `tt:verify` takes over the moment the server actually answers `/health`.
+Boundary: `tt-serve-model:discover` answers what the machine *is*, before a launch starts.
+`tt-serve-model:retrieve` answers what the model/image *should be* — its spec entry,
+docker image tag, mandatory flags, gating. `tt-serve-model:launch` answers what a launch
+*is doing*, once one is running, against what `tt-serve-model:retrieve` said it should
+be. `tt-serve-model:verify` takes over the moment the server actually answers `/health`.
 
 ## Resolve
 
@@ -39,8 +39,8 @@ OVERRIDE=<--override, if any>
 echo "container=${CID:-NONE}"
 ```
 
-If `tt:retrieve` was run first for this model, its captured entry
-(`$SCRATCH/entry_*.json`) is the source of truth for what flags/image *should*
+If `tt-serve-model:retrieve` was run first for this model, its captured entry
+(the path in `$SCRATCH/selection.json`) is the source of truth for what flags/image *should*
 be running — read it before assuming a launch command was correct, rather
 than re-deriving from documentation.
 
@@ -84,7 +84,7 @@ Sources: docker logs <container> captured <ISO time>; static launch knowledge
 
 - Read-only against the device and the container. NEVER `docker kill`,
   `docker rm`, `docker restart`, or `tt-smi -r` here — a fix decision routes
-  to `tt:run` recovery. This skill only diagnoses.
+  to device recovery, which is outside this plugin. This skill only diagnoses.
 - NEVER guess a failure class from partial output. If none of the known
   signatures match, report `unknown failure: <last 20 log lines>`, never a
   guess — that is itself a new signature to add here, not a dead end.
@@ -98,7 +98,7 @@ Sources: docker logs <container> captured <ISO time>; static launch knowledge
 | "It's been quiet for a minute, must be hanging" | Kernel JIT/tilize is silently long-running. Compare elapsed time against the step list in `diagnose.md` § L2, not silence alone. |
 | "The published '10–20 min' first-run estimate says this is late" | NEVER cite a single range as ground truth — not the doc's, and not the "8–22 min cold / 6–8 warm" figure this file used to give, which our own run refuted: 29 min with a *warm* 29 GB tensor cache, mesh assembly alone 10 m 48 s. "Warm" is not one variable — the weights cache and the tensor cache warm independently. Cite `diagnose.md` § Stage markers, phase by phase. |
 | "I'll bind-mount the whole repo spec, it's simpler" | Overrides are ranked for a reason. Try the surgical merge first; state why before reaching for `--dev-mode`. |
-| "The override file looks right, ship it" | NEVER skip the byte-diff against upstream (L6) — a hand-edited override can silently pin the wrong image while looking correct. |
+| "The override file looks right, ship it" | NEVER skip the structural diff against upstream (L6) — a hand-edited override can silently pin the wrong image while looking correct. |
 
 ## Progressive Load Table
 
@@ -106,9 +106,9 @@ Sources: docker logs <container> captured <ISO time>; static launch knowledge
 |---|---|
 | Is it hanging, what step, what failure, timing, what got displaced, silent fallbacks (L1, L2, L4, L8, L9, L10) | `diagnose.md` |
 | Mandatory flags, override selection and safety (L3, L5, L6, L7) | `override.md` |
-| What the image/spec *should* look like (docker image tag, mandatory flags, gating) | invoke `tt:retrieve` |
-| Acting on a failure (reset, restart) | invoke `tt:run` — **not yet shipped**; until it exists, reset by hand (`tt-smi -r`, then relaunch) |
-| Server finally answers `/health` | hand off to `tt:verify` |
+| What the image/spec *should* look like (docker image tag, mandatory flags, gating) | invoke `tt-serve-model:retrieve` |
+| Acting on a failure (reset, restart) | outside this plugin; the user resets by hand (`tt-smi -r`, then relaunch) |
+| Server finally answers `/health` | hand off to `tt-serve-model:verify` |
 
 ## Note on shared knowledge
 

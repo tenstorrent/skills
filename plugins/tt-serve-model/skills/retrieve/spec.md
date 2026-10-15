@@ -8,7 +8,17 @@ the fetch).
 ## Commands
 
 ```bash
-E=$(ls $SCRATCH/entry_*.json 2>/dev/null | head -1); echo "entry=${E:-NOENTRY}"
+SEL=$(python3 - "$SCRATCH" "$MODEL" "$DEV" <<'PY'
+import json,os,sys
+scratch,want,dev=sys.argv[1],sys.argv[2].lower(),sys.argv[3].upper()
+try: s=json.load(open(os.path.join(scratch,"selection.json")))
+except Exception: print("NOENTRY"); raise SystemExit
+if want not in (s["model"].lower(), s["model"].split("/")[-1].lower()) or s["device"]!=dev:
+    print("MISMATCH", s["model"], s["device"]); raise SystemExit
+print(s["entry"])
+PY
+)
+case "$SEL" in NOENTRY|MISMATCH*|"") E=""; echo "entry=${SEL:-NOENTRY} (re-run the query for $MODEL on $DEV)";; *) E=$SEL; echo "entry=$E";; esac
 [ -n "$E" ] && python3 - "$E" $SCRATCH/config.json <<'PY'
 import json,sys
 e=json.load(open(sys.argv[1])); dm=e['device_model_spec']

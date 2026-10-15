@@ -6,7 +6,7 @@ R7, R13, R14, R15. In one Bash call: § Resolve, then this block. It re-reads
 ## Commands
 
 ```bash
-E=$(ls $SCRATCH/entry_*.json | head -1); IMG=$(python3 -c "import json;print(json.load(open('$E'))['docker_image'])"); TTC=$(python3 -c "import json;print(json.load(open('$E'))['tt_metal_commit'])")
+E=$(python3 -c "import json,os,sys;print(json.load(open(os.path.join(sys.argv[1],'selection.json')))['entry'])" "$SCRATCH" 2>/dev/null); IMG=$(python3 -c "import json;print(json.load(open('$E'))['docker_image'])"); TTC=$(python3 -c "import json;print(json.load(open('$E'))['tt_metal_commit'])")
 T=$(python3 -c "import json;t=json.load(open('$E'))['model_type'].lower();print('tts' if t=='text_to_speech' else t)"); N=$(python3 -c "import json;print(json.load(open('$E'))['model_name'])"); DOCP=docs/model_support/$T/${N}_${DEV,,}.md
 NAME=${IMG%%:*}; NAME=${NAME#ghcr.io/}; TAG=${IMG##*:}
 TOK=$(curl -sf "https://ghcr.io/token?scope=repository:$NAME:pull" | python3 -c "import json,sys;print(json.load(sys.stdin)['token'])")

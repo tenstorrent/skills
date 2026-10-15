@@ -90,7 +90,7 @@ LOG="$SCRATCH/launch-log.txt"
 grep -q "No model spec found" "$LOG" && \
   echo "stale registry (3-14s) — refresh MODEL_SPECS_JSON_PATH or the image"
 grep -qE "Timed out waiting for active ethernet core" "$LOG" && \
-  echo "wedged inter-chip links — tt:run recovery (tt-smi -r), do not retry blind"
+  echo "wedged inter-chip links — device recovery needed (tt-smi -r), do not retry blind"
 grep -qE "Bind for 0\.0\.0\.0:8000 failed" "$LOG" && \
   echo "port collision — see L9"
 grep -qiE "out of memory|\bOOM\b|CUDA out of memory" "$LOG" && \
@@ -137,7 +137,7 @@ grep -qE "Signal: Bus error|Non-existent physical address" "$LOG" && \
        "died on a device write, not on a client request. Seen on the first" \
        "request after ~11 h idle: 'Prefilling 1 user(s)' then SIGBUS," \
        "EngineCore died, container Exited (0). The mesh is left wedged;" \
-       "tt:run recovery (tt-smi -r) before any relaunch. Not a config error."
+       "device recovery (tt-smi -r) before any relaunch. Not a config error."
 ```
 
 ## Silent fallbacks and env overrides (L10)
@@ -197,7 +197,7 @@ Before L10 existed these were only caught by `verify` V22, i.e. after
   biggest and the second-biggest cost are cache-dependent, which is why a
   fixed range is the wrong shape of answer.
 - **L9 cannot answer its own question from `docker ps` alone.** Naming a
-  displaced service needs the pre-launch baseline from `tt:discover` D8/D13.
+  displaced service needs the pre-launch baseline from `tt-serve-model:discover` D8/D13.
   Absent that, the honest answer is `unknown: no pre-launch baseline` — not
   `none`. TT-Studio moving 8000→8001 is expected and benign; any *other*
   service displaced is worth surfacing unprompted.

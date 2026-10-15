@@ -16,7 +16,7 @@ echo "==V22"; docker logs "$CID" 2>&1 \
   | grep -iE 'warn|fallback|mismatch|\bpcc\b|dtype|not supported|unsupported|ignor|degrad|accuracy|unsafe|active trace|setting .* to [0-9]+ for compatibility|overrid|deprecat' \
   | sort -u | head -40
 
-echo "==V23"; E=$(ls $SCRATCH/entry_*.json 2>/dev/null | head -1)
+echo "==V23"; E=$(python3 -c "import json,os,sys;print(json.load(open(os.path.join(sys.argv[1],'selection.json')))['entry'])" "$SCRATCH" 2>/dev/null)
 if [ -z "${DEV:-}" ]; then
   echo "V23 requires \$DEV (Resolve: --device or D9, uppercase) — not set"
 elif [ -n "$E" ]; then
@@ -26,7 +26,7 @@ elif [ -n "$E" ]; then
   echo "doc=$DOCP"
   curl -sf "https://raw.githubusercontent.com/tenstorrent/tt-inference-server/main/$DOCP" \
     || echo "no page at $DOCP — list docs/model_support/$T/ for other _<dev>.md files for this model"
-else echo "V23 requires tt:retrieve's captured entry (model_name + model_type)"; fi
+else echo "V23 requires tt-serve-model:retrieve's captured entry (model_name + model_type)"; fi
 
 echo "==V24"; curl -s "https://api.github.com/search/issues?q=repo:tenstorrent/tt-metal+${SYMPTOM// /+}"
 echo "==V25"; curl -s "https://api.github.com/repos/tenstorrent/tt-metal/compare/${FIX_SHA}...${TT_METAL_SHA}" \
@@ -85,7 +85,7 @@ echo "==V25"; curl -s "https://api.github.com/repos/tenstorrent/tt-metal/compare
   search, 60/hr general). Cache results in `$SCRATCH` keyed by symptom/SHA
   pair — don't re-query the same question twice in one session. Budget ≤6
   GitHub calls per run (1 search, ≤3 compare, 1 issue-comments fetch) — same
-  discipline as `tt:retrieve`'s R13/R15. `GH_TOKEN`, if set, lifts the limit;
+  discipline as `tt-serve-model:retrieve`'s R13/R15. `GH_TOKEN`, if set, lifts the limit;
   NEVER echo it or include it in a printed command.
 - V25 is the one row in the whole dataset with an explicit "never do it the
   easy wrong way" warning attached (never compare by version-string order) —

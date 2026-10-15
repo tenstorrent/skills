@@ -1,6 +1,6 @@
 # Hardware Utilization & Performance
 
-V7–V12. Requires the container id (`$CID`, from `tt:launch`) and Discovery's
+V7–V12. Requires the container id (`$CID`, from `tt-serve-model:launch`) and Discovery's
 idle baseline (D12).
 
 ## Commands
@@ -141,7 +141,7 @@ PY
   verdict.
 - V8: when there is no container to read counters from, the honest answer is
   `unknown: no engine to report; telemetry cannot distinguish wedged from
-  loaded` — plus a reset verdict from `tt:discover` D14.
+  loaded` — plus a reset verdict from `tt-serve-model:discover` D14.
 - V8's telemetry capture is the same as `discover/boards.md` § Capture —
   `-s --snapshot_no_tty` with the binary located explicitly. A bare
   `tt-smi -s` writes a TTY table, not JSON, and tt-smi is often not on `PATH`.

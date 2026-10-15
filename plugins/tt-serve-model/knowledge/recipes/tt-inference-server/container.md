@@ -1,7 +1,7 @@
 # tt-inference-server containers
 
-Shared by `tt:retrieve` (`spec.md` R6/R16, `image.md` R7), `tt:launch`
-(L3 mandatory flags, L5 overrides) and `tt:verify` (V22 log reads).
+Shared by `tt-serve-model:retrieve` (`spec.md` R6/R16, `image.md` R7), `tt-serve-model:launch`
+(L3 mandatory flags, L5 overrides) and `tt-serve-model:verify` (V22 log reads).
 
 Everything below was checked against the live container `qwen36-golden-test`
 on 2026-09-22 — image `0.20.0-de59f8a-03fa3af`, host p300x2. Where a fact is

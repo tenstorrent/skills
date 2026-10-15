@@ -1,6 +1,6 @@
 # Boards, ASICs and the device string
 
-Shared by `tt:discover` (`boards.md`, D9/D10), `tt:retrieve` (`bundle.md` B7,
+Shared by `tt-serve-model:discover` (`boards.md`, D9/D10), `tt-serve-model:retrieve` (`bundle.md` B7,
 `SKILL.md` `--device`) and anything that names a device key.
 
 The one rule everything here serves: **the device string is derived from the

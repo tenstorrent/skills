@@ -56,5 +56,5 @@ PY
   others) → report it as `loaded` and exclude it from the baseline range.
 - D14 verdict: `yes` if any exited container listed `/dev/tenstorrent`
   (stopping a container leaves inter-chip Ethernet wedged). `blocked` if
-  D13 shows a live holder. Otherwise `no`. On `yes`, add `invoke tt:run
-  recovery`. NEVER run the reset here.
+  D13 shows a live holder. Otherwise `no`. On `yes`, add `device
+  recovery needed (reset by hand: tt-smi -r)`. NEVER run the reset here.

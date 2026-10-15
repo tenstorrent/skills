@@ -21,23 +21,28 @@ print('schema_version=', d.get('schema_version'))
 PY
   stat -c '%a %U' "$OVERRIDE"
   readlink -f "$OVERRIDE"
-  # L6: byte-diff against the upstream entry tt:retrieve already captured for this
-  # model/device (spec.md writes $SCRATCH/entry_<impl_id>.json). Without that file
+  # L6: structural diff against the upstream entry tt-serve-model:retrieve already captured for this
+  # model/device ($SCRATCH/selection.json names the exact entry). Without that file
   # there is nothing to diff against — report unavailable, never "matches upstream".
-  ENTRY=$(ls "$SCRATCH"/entry_*.json 2>/dev/null | head -1)
+  ENTRY=$(python3 -c "import json,os,sys;print(json.load(open(os.path.join(sys.argv[1],'selection.json')))['entry'])" "$SCRATCH" 2>/dev/null)
   if [ -n "$ENTRY" ]; then
     python3 - "$OVERRIDE" "$ENTRY" <<'PY'
 import json, sys
 override, entry = json.load(open(sys.argv[1])), json.load(open(sys.argv[2]))
-if override == entry:
-    print("override_diff=matches upstream byte-for-byte")
+try:
+    override_entry = override['model_specs'][entry['hf_model_repo']][entry['device_type']][entry['inference_engine']][entry['impl']['impl_id']]
+except (KeyError, TypeError):
+    print("override_diff=unavailable: override is missing the selected model/device/engine/implementation")
+    raise SystemExit
+if override_entry == entry:
+    print("override_diff=matches upstream entry structurally")
 else:
-    keys = sorted(set(override) | set(entry))
-    diffs = [k for k in keys if override.get(k) != entry.get(k)]
+    keys = sorted(set(override_entry) | set(entry))
+    diffs = [k for k in keys if (k in override_entry) != (k in entry) or override_entry.get(k) != entry.get(k)]
     print(f"override_diff=differs in {len(diffs)} key(s): {', '.join(diffs[:8])}")
 PY
   else
-    echo "override_diff=unavailable: no captured upstream entry (run tt:retrieve for this model/device first)"
+    echo "override_diff=unavailable: no captured upstream entry (run tt-serve-model:retrieve for this model/device first)"
   fi
 fi
 ```
@@ -64,9 +69,9 @@ fi
 - L5: try the surgical option first every time. Reaching straight for
   `--dev-mode` is a red flag in itself — see `SKILL.md` § Red Flags.
 - L6/L7: NEVER treat "the file looks right" as safe — always run the
-  byte-diff against the upstream entry. A hand-edited override can silently
+  structural diff against the upstream entry. A hand-edited override can silently
   pin the wrong image while looking correct.
-- L6: the byte-diff needs `tt:retrieve`'s captured `entry_<impl_id>.json` for
+- L6: the structural diff needs `tt-serve-model:retrieve`'s captured `entry_<impl_id>.json` for
   this exact model/device — invoke it first if `$SCRATCH` has none. Reporting
   `matches upstream` without that file compared is itself the failure mode
   this row exists to catch.
@@ -82,7 +87,7 @@ fi
 
   Answer the question that was asked, and name which of the three the path
   falls into rather than collapsing them.
-- L6/L7: this is what `tt:retrieve`'s R6/R7 check for the *documented*
+- L6/L7: this is what `tt-serve-model:retrieve`'s R6/R7 check for the *documented*
   image and spec agreeing. This file checks whether *your local override*
   agrees with either of them — a related but separate question.
 
@@ -92,5 +97,5 @@ fi
 |---|---|
 | L3 | **TESTED** 2026-09-22 — all three flags confirmed present on the container that reached `/health` 200, read via `Devices` / `IpcMode` / `Mounts` |
 | L5 | **UNTESTED** — no override was needed on 0.20.0; re-test when an override run actually happens |
-| L6 | **UNTESTED** — no override in play; byte-diff logic against `tt:retrieve`'s captured entry added but not yet run against a real override |
+| L6 | **UNTESTED** — no override in play; structural-diff logic against `tt-serve-model:retrieve`'s captured entry, tested on synthetic overrides only (unchanged, changed image, entry missing), not yet run against a real override |
 | L7 | **UNTESTED** — no override in play; the three-case table above is reasoned from path semantics, not measured |

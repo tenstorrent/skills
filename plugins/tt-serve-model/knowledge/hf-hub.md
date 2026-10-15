@@ -1,6 +1,6 @@
 # HF Hub
 
-Shared by `tt:retrieve` (`hf.md`, `bundle.md`) and any skill that reads the
+Shared by `tt-serve-model:retrieve` (`hf.md`, `bundle.md`) and any skill that reads the
 Hugging Face Hub. Read-only: these sections never download weights.
 
 `$SCRATCH` is the session scratchpad. `$M` is the repo id being inspected —

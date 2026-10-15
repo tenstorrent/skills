@@ -16,17 +16,17 @@ from assuming the server works because it answered *something*.
 
 ## When to Invoke
 
-Invoke `tt:verify` (Skill tool) when:
+Invoke `tt-serve-model:verify` (Skill tool) when:
 
-- `tt:launch` reports `/health` → 200 (the hand-off point).
+- `tt-serve-model:launch` reports `/health` → 200 (the hand-off point).
 - The user asks: *"is it working"*, *"is it actually using all 4 chips"*,
   *"why is the output wrong"*, *"is reasoning broken"*, *"is it actually
   batching"*.
 
-Boundary: `tt:launch` owns everything before the server answers `/health`.
-`tt:verify` does not restart or reconfigure the server — a fix routes back to
-`tt:launch` (bad override) or `tt:run` (device-level recovery — **not yet
-shipped**; reset by hand with `tt-smi -r` until it exists). `tt:retrieve`'s
+Boundary: `tt-serve-model:launch` owns everything before the server answers `/health`.
+`tt-serve-model:verify` does not restart or reconfigure the server — a fix routes back to
+`tt-serve-model:launch` (bad override) or to device-level recovery (outside this plugin;
+reset by hand with `tt-smi -r`). `tt-serve-model:retrieve`'s
 captured spec entry is what V2/V9's "expected" values are checked against —
 read it rather than assuming the served config matches what was requested.
 
@@ -37,9 +37,9 @@ Shell state does not survive between Bash calls. Start every call with:
 ```bash
 SCRATCH=<session scratchpad>
 EP=${ENDPOINT:-http://localhost:8000}
-MODEL=<--model, or the model tt:launch reports running>
+MODEL=<--model, or the model tt-serve-model:launch reports running>
 DEV=<--device or D9, uppercase — needed for V23>
-CID=<container id from tt:launch, needed for V7,V9,V14,V21,V22>
+CID=<container id from tt-serve-model:launch, needed for V7,V9,V14,V21,V22>
 ```
 
 ## Arguments
@@ -88,7 +88,7 @@ the Sheet carries it; evidence is in `hardware-and-performance.md` § Status.
   compare against the exact expected value/shape in the interpretation
   tables, not just HTTP 200.
 - `debug-and-provenance.md`'s GitHub calls: ≤6 per run (1 search, ≤3 compare,
-  1 issue-comments fetch), same budget as `tt:retrieve`. Unauthenticated
+  1 issue-comments fetch), same budget as `tt-serve-model:retrieve`. Unauthenticated
   limit is 60/h; a `GH_TOKEN` lifts it. NEVER echo a token used for auth.
 
 ## Red Flags
@@ -109,6 +109,6 @@ the Sheet carries it; evidence is in `hardware-and-performance.md` § Status.
 | Mesh membership, real work vs idle, KV-cache, throughput, batching, long prefill | `hardware-and-performance.md` |
 | reasoning_content, parser metadata, undocumented flags, token budget, tool-call gate | `reasoning-models.md` |
 | Root-cause elimination, quiet server warnings, known-bug search, fix-by-ancestry | `debug-and-provenance.md` |
-| What the spec declares (reasoning_parser_name, max_context, known_issues) | invoke `tt:retrieve` |
-| Idle telemetry baseline for V8's comparison | invoke `tt:discover --questions D12` |
-| A launch-stage explanation is needed instead of a runtime one | hand back to `tt:launch` |
+| What the spec declares (reasoning_parser_name, max_context, known_issues) | invoke `tt-serve-model:retrieve` |
+| Idle telemetry baseline for V8's comparison | invoke `tt-serve-model:discover --questions D12` |
+| A launch-stage explanation is needed instead of a runtime one | hand back to `tt-serve-model:launch` |

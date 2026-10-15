@@ -15,11 +15,11 @@ a listed rule. No memory, no inference from product pages, no sampling.
 
 **Read-only.** NEVER reset, kill, pull, download, `docker rm`, or write
 outside the scratchpad. The reset question returns a verdict; the reset
-itself is `tt:run`'s job.
+itself is outside this plugin: the user resets by hand with `tt-smi -r`.
 
 ## When to Invoke
 
-Invoke `tt:discover` (Skill tool) when:
+Invoke `tt-serve-model:discover` (Skill tool) when:
 
 - The user asks any Discovery question: *"what's on this machine"*, *"which
   boards / driver / firmware"*, *"can I deploy X here"*, *"what do I pass to
@@ -27,8 +27,8 @@ Invoke `tt:discover` (Skill tool) when:
   *"do I need a reset"*, *"is this box clean"*.
 - A deploy or launch task starts and no Discovery table exists for this session.
 
-Boundary: `tt:run` workspace detection answers *"can I run a job from this
-cwd"*. `tt:discover` answers *"what is this host and what can it deploy"*.
+Boundary: workspace detection (*"can I run a job from this cwd"*) is not part of
+this plugin. `tt-serve-model:discover` answers *"what is this host and what can it deploy"*.
 
 ## Arguments
 
@@ -37,7 +37,7 @@ cwd"*. `tt:discover` answers *"what is this host and what can it deploy"*.
 | none | Answer D1–D16. D7 and D15 return `requires --model`. |
 | `--model <org>/<name>` | Enables D7, D15; scopes D6 and D11 to that model's spec entry. |
 | `--questions D3,D9` | Answer only the listed IDs. Dependencies (below) still run. |
-| `--note` | Also record the table via `tt:note`, topic `discover-<hostname>`. Default: chat only. |
+| `--note` | Also record the table via `tt-buddy:note` (only if the `tt-buddy` plugin is installed; otherwise say it is unavailable), topic `discover-<hostname>`. Default: chat only. |
 
 ## Pipeline
 
@@ -87,7 +87,7 @@ Comparisons (D11) state both sides and the verdict. Unknowns say `unknown:
 |---|---|
 | "The getting-started page says p150x4 for this box" | Derive D9 from board serials. Docs describe SKUs, not this host. |
 | "HugePages_Total in /proc/meminfo is 0, so no hugepages" | That line is the default page size only. Read the sysfs per-size pool. |
-| "I'll run tt-smi -r since it needs a reset" | NEVER. Report the verdict. Reset is `tt:run` recovery. |
+| "I'll run tt-smi -r since it needs a reset" | NEVER. Report the verdict. Device recovery is outside this plugin. |
 | "I'll skip the snapshot and eyeball tt-smi -ls" | `-ls` truncates serials. The snapshot is the only complete source. |
 | "I'll answer gating from memory" | One curl per model. 200 with `gated` field or nothing. |
 | "The local checkout is newer, I'll read that" | Raw at main, every time. Drift is reported, not hidden. |
@@ -100,5 +100,5 @@ Comparisons (D11) state both sides and the verdict. Unknowns say `unknown:
 | Snapshot capture, boards vs ASICs, device string, firmware, telemetry, reset verdict | `boards.md` |
 | Deployable models, gating, disk budget, clean-box | `models.md` |
 | Board type → ASIC count → device string | `knowledge/hardware/boards.md` |
-| Recording the table | invoke `tt:note` |
-| Acting on a reset verdict | invoke `tt:run` — **not yet shipped**; reset by hand with `tt-smi -r` until it exists |
+| Recording the table | invoke `tt-buddy:note`, if installed |
+| Acting on a reset verdict | outside this plugin; the user resets by hand with `tt-smi -r` |

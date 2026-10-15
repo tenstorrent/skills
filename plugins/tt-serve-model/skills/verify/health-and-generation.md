@@ -9,8 +9,8 @@ EP=${ENDPOINT:-http://localhost:8000}
 
 echo "==V1"; curl -s -o /dev/null -w '%{http_code}\n' "$EP/health"
 
-echo "==V2"; curl -s "$EP/v1/models" -o "$SCRATCH/models.json"; python3 - "$SCRATCH/models.json" \
-  "$SCRATCH/entry_"*.json "$SCRATCH/config.json" <<'PY'
+echo "==V2"; curl -s "$EP/v1/models" -o "$SCRATCH/models.json"; E=$(python3 -c "import json,os,sys;print(json.load(open(os.path.join(sys.argv[1],'selection.json')))['entry'])" "$SCRATCH" 2>/dev/null); python3 - "$SCRATCH/models.json" \
+  "${E:-/nonexistent}" "$SCRATCH/config.json" <<'PY'
 import json,sys,glob
 served=json.load(open(sys.argv[1]))['data'][0]
 mml=served.get('max_model_len')

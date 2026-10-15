@@ -2,8 +2,8 @@
 
 `release_model_spec.json` is the upstream source of truth for *what runs on
 what*: image tag, commits, maturity status, ceilings, env, known issues.
-Shared by `tt:retrieve` (`spec.md`, `image.md`), `tt:discover` (`models.md`
-D6/D7/D11/D15) and `tt:launch` (what the launch *should* have been).
+Shared by `tt-serve-model:retrieve` (`spec.md`, `image.md`), `tt-serve-model:discover` (`models.md`
+D6/D7/D11/D15) and `tt-serve-model:launch` (what the launch *should* have been).
 
 ## Layout
 
@@ -54,13 +54,20 @@ One fetch per run, reused by every row.
 
 ## Query: one model on one device
 
-Writes `$SCRATCH/entry_<impl_id>.json` — the flat entry that `spec.md` and
-`image.md` both re-read. Callers set `$MODEL` and `$DEV` (upper-case).
+Writes `$SCRATCH/entry_<impl_id>.json` (the flat entry) and
+`$SCRATCH/selection.json` (the exact entry path plus the model, device, engine,
+and impl it was resolved from). Every reader takes the entry from
+`selection.json`, never from a glob of `entry_*.json`: the scratchpad lasts the
+whole session, so a glob can return another model's entry. A query that finds
+no model or no entry deletes `selection.json`. Callers set `$MODEL` and `$DEV`
+(upper-case).
 
 ```bash
 python3 - $SCRATCH/spec.json "$MODEL" "$DEV" $SCRATCH <<'PY'
 import json,sys,os
 spec,want,dev,scratch=json.load(open(sys.argv[1])),sys.argv[2].lower(),sys.argv[3].upper(),sys.argv[4]
+sel=os.path.join(scratch,"selection.json")
+if os.path.exists(sel): os.remove(sel)  # a failed query must not leave an older selection
 key=next((k for k in spec['model_specs'] if k.lower()==want or k.split('/')[-1].lower()==want), None)
 if not key: print("spec_model=NOMODEL"); raise SystemExit
 devs=spec['model_specs'][key]
@@ -73,13 +80,16 @@ dflt=next((i.get('device_model_spec',{}).get('default_impl') for i in impls.valu
 iid=dflt if dflt in impls else sorted(impls)[0]
 e=impls[iid]
 json.dump(e, open(os.path.join(scratch,f"entry_{iid}.json"),"w"), indent=1)
+json.dump({"entry":os.path.join(scratch,f"entry_{iid}.json"),"model":key,"device":dev,"engine":eng,"impl_id":iid}, open(sel,"w"), indent=1)
 print("engine=",eng,"impl_id=",iid,"impls_available=",sorted(impls),"engines_available=",sorted(engines))
 print("entry=",os.path.join(scratch,f"entry_{iid}.json"))
 PY
 ```
 
-Then read the entry with `spec.md` § Commands. The two outcomes the callers
-branch on are the literal strings `NOMODEL` / `NOENTRY` and an `entry=` path.
+Then read the entry with `spec.md` § Commands. The outcomes the callers branch on
+are the literal strings `NOMODEL` / `NOENTRY` and an `entry=` path. After
+`NOMODEL` or `NOENTRY` there is no selection: do not pick another `entry_*.json`
+from the scratchpad. Report it and stop.
 
 ## Rules
 

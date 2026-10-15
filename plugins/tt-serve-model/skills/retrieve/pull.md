@@ -8,7 +8,7 @@ Absent `--pull`, this file is never read.
 - R8 (and B13 on the B path) read `yes`, and R3/B15 credentials are met
   (`token: set` whenever a token is required).
 - Disk: R4 weights + R14 compressed image (+ B11 bundle) fit the free space
-  from `tt:discover` D1. Short → stop; report the shortfall; pull nothing.
+  from `tt-serve-model:discover` D1. Short → stop; report the shortfall; pull nothing.
 
 ## Commands
 
