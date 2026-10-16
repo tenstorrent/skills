@@ -1,0 +1,26 @@
+{
+  "name": "tt-serve-model",
+  "displayName": "Tenstorrent Deploy",
+  "version": "0.2.0",
+  "description": "Take a model from host discovery to a verified server on Tenstorrent hardware. discover answers the Discovery-stage host questions: host facts, driver, boards vs ASICs, hugepages, docker, HF cache, port 8000, device holders, the --tt-device string, firmware minimums, idle telemetry, reset verdict, deployable models, gating, disk, clean-box. retrieve resolves one model: HF existence, gating and config; the tt-inference-server spec entry (image, commits, status, ceilings, known_issues); image-vs-repo spec drift; GHCR tag, size and ancestry; run.py vs docker; and the tt-model-manager bundle path. launch reads the launching container's own log/state to classify hangs and failures, mandatory docker flags, override safety, timing, and displaced services. verify checks health, generation correctness, mesh utilization, throughput/batching, and reasoning-model quirks against a live endpoint, with root-cause elimination when a check fails. Deterministic, evidence-based; every answer traces to a listed command's output, a captured log, a live request/response, or a listed static rule. Covers all four stages of the model-deployment journey.",
+  "author": {
+    "name": "Tenstorrent"
+  },
+  "homepage": "https://github.com/tenstorrent/skills",
+  "repository": "https://github.com/tenstorrent/skills",
+  "license": "Apache-2.0",
+  "keywords": [
+    "deploy",
+    "diagnostics",
+    "discovery",
+    "huggingface",
+    "inference",
+    "launch",
+    "model-retrieval",
+    "tenstorrent",
+    "tt-inference-server",
+    "verification",
+    "vllm"
+  ],
+  "skills": "./skills/"
+}

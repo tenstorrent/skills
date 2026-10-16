@@ -76,6 +76,19 @@
         "authentication": "ON_INSTALL"
       },
       "category": "Developer Tools"
+    },
+    {
+      "name": "tt-serve-model",
+      "source": {
+        "source": "local",
+        "path": "./plugins/tt-serve-model"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools",
+      "description": "Diagnose a model launch and verify a running server on Tenstorrent hardware, deterministically and evidence-based."
     }
   ]
 }

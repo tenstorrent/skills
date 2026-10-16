@@ -26,3 +26,6 @@
 
 # Tenstorrent operating principles
 /plugins/tt-buddy/ @ppetrovicTT
+
+# Model-deployment lifecycle (launch, verify; discover/retrieve to follow)
+/plugins/tt-serve-model/ @ctr-fmamedov-crypto @ndalyTT
