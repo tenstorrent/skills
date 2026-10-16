@@ -6,7 +6,8 @@ execute them. They cover the cases a review of the plugin asked for:
 - skill handoffs use the installed plugin namespace, and name skills that exist;
 - two model lookups in one scratchpad never return the first model's entry;
 - an unsupported model or device clears the selection instead of reusing an old one;
-- the override check compares the selected nested entry, not the whole document.
+- the override check compares the selected nested entry, not the whole document;
+- V6 reads model-generated code without ever running it.
 """
 
 import json
@@ -22,6 +23,7 @@ PLUGIN = Path(__file__).resolve().parents[1] / "plugins/tt-serve-model"
 MODEL_SPEC_MD = PLUGIN / "knowledge/recipes/tt-inference-server/model-spec.md"
 SPEC_MD = PLUGIN / "skills/retrieve/spec.md"
 OVERRIDE_MD = PLUGIN / "skills/launch/override.md"
+GENERATION_MD = PLUGIN / "skills/verify/health-and-generation.md"
 
 
 def heredoc_blocks(path: Path) -> list[str]:
@@ -190,6 +192,90 @@ class OverrideTests(unittest.TestCase):
     def test_flat_document_is_unavailable_not_a_false_match(self):
         entry = spec_entry("Qwen/Qwen3-32B", "P300X2", "tt_transformers", "image-qwen")
         self.assertTrue(self.compare(entry, entry).startswith("override_diff=unavailable"))
+
+
+class V6Tests(unittest.TestCase):
+    """V6 parses a served model's code. It must never run it."""
+
+    FIB = "def fib(n):\n    a, b, out = 1, 1, []\n    for _ in range(n):\n        out.append(a)\n        a, b = b, a + b\n    return out\n"
+
+    @classmethod
+    def block(cls) -> str:
+        return next(b for b in heredoc_blocks(GENERATION_MD) if "v6_check" in b)
+
+    def check(self, reply: str) -> str:
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "v6.json"
+            f.write_text(json.dumps({"choices": [{"message": {"content": reply}}]}))
+            run = subprocess.run([sys.executable, "-", str(f)], input=self.block(), capture_output=True, text=True, check=True)
+        return run.stdout.strip()
+
+    def fenced(self, code: str) -> str:
+        return "```python\n" + code + "```"
+
+    def test_the_check_contains_no_way_to_run_code(self):
+        self.assertIsNone(re.search(r"\b(exec|eval|compile|__import__|subprocess|os\.system)\b\s*[(.]", self.block()))
+        self.assertNotIn("import subprocess", self.block())
+
+    def test_valid_fib_is_consistent_and_says_it_was_not_executed(self):
+        self.assertEqual(self.check(self.fenced(self.FIB)), "v6_check=consistent (static check only, not executed)")
+
+    def test_pathlib_write_is_not_run(self):
+        # The reviewer's first route: passed a text filter and wrote a host file.
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "pwned"
+            code = f"from pathlib import Path\nPath({str(marker)!r}).write_text('x')\n" + self.FIB
+            out = self.check(self.fenced(code))
+            self.assertFalse(marker.exists())
+        self.assertTrue(out.startswith("v6_check="))
+
+    def test_constructed_expression_is_not_run(self):
+        # The reviewer's second route: a function returns text that gets eval()'d.
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "pwned"
+            code = (
+                "def fib(n):\n"
+                f"    return \"__import__('pathlib').Path({str(marker)!r}).write_text('x') or [1, 1]\"\n"
+                f"open({str(marker)!r}, 'w').write('x')\n"
+            )
+            self.check(self.fenced(code))
+            self.assertFalse(marker.exists())
+
+    def test_syntax_error(self):
+        self.assertTrue(self.check(self.fenced("def fib(n:\n    return n\n")).startswith("v6_check=syntax error at line"))
+
+    def test_no_code_block(self):
+        self.assertEqual(self.check("Sure! Here is the answer."), "v6_check=no fenced code block in reply")
+        self.assertEqual(self.check(""), "v6_check=no fenced code block in reply")
+
+    def test_no_function_named_fib(self):
+        self.assertEqual(self.check(self.fenced("def fibonacci(n):\n    return [1]\n")), "v6_check=no function named fib")
+
+    def test_undefined_name(self):
+        out = self.check(self.fenced("def fib(n):\n    return [a, b]\n"))
+        self.assertEqual(out, "v6_check=undefined name(s): a, b")
+
+    def test_function_that_never_returns_a_value(self):
+        out = self.check(self.fenced("def fib(n):\n    x = n\n"))
+        self.assertEqual(out, "v6_check=fib never returns a value")
+
+    def test_while_true_without_exit_is_flagged(self):
+        out = self.check(self.fenced("def fib(n):\n    while True:\n        n += 1\n    return n\n"))
+        self.assertIn("possible infinite loop at line 2", out)
+
+    def test_while_true_with_break_is_fine(self):
+        code = "def fib(n):\n    out = [1]\n    while True:\n        break\n    return out\n"
+        self.assertEqual(self.check(self.fenced(code)), "v6_check=consistent (static check only, not executed)")
+
+    def test_builtins_imports_and_comprehensions_are_not_undefined(self):
+        code = "import math\ndef fib(n):\n    return [int(math.sqrt(i * i)) for i in range(n)]\n"
+        self.assertEqual(self.check(self.fenced(code)), "v6_check=consistent (static check only, not executed)")
+
+    def test_docs_do_not_claim_execution(self):
+        text = GENERATION_MD.read_text()
+        self.assertIn("never run it", text)
+        self.assertNotIn("run only the survivors", text)
+        self.assertIn("not executed", text)
 
 
 if __name__ == "__main__":
