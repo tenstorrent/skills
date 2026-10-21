@@ -167,6 +167,21 @@ default. For any stage, review:
 - stale-artifact risk: paths in reports should exist and match the described
   run.
 
+For generator and serving stages, inspect the
+[version-1 reload contract](../vllm-integration/references/decode-reload-contract.md).
+Check the four commands through the adapter and generator. Check full reload,
+page-table-only reload, and resident decode with stale host inputs. Confirm that
+the version marker does not substitute for async capability, and that slot remaps,
+partial prefill, penalty history, and seeds follow the documented rules.
+For async support, check that later submissions cannot overwrite earlier outputs
+before readback completes. Host results and returned views must remain unchanged
+until the plugin finishes using them, not just until host formatting returns.
+For warmup changes, check component-owned variant preparation and the generator's
+prepare-before-capture ordering. Require supported penalty/logprob coverage and
+tests for the first real seeded request after warmup and repeated setup calls.
+For a full-reload-only adapter, require tested rejection of unsupported resident
+commands and keep async support false; do not require those modes to succeed.
+
 For changed chunking, padding, sharding, dispatch, or memory ownership, compare the
 actual branch/allocation rules with the selected cases. Require coverage of affected
 paths, nearby valid boundary lengths, and awkward tails, including sibling consumers

@@ -51,6 +51,11 @@ Version and commit verification remains part of setup and resume.
 
 Stages 9 and 10 require served qualitative artifacts (`--scope vllm`). Verify
 page-growth refresh and pending-token handling before enabling async overlap.
+New adapters and their low-level generators target version 1 from standalone
+plugin PR #78. The four explicit reload commands replace `reset_batch` in new
+code. Keep the Python contracts, skills, and stage prompts consistent with
+`skills/vllm-integration/references/decode-reload-contract.md`. That reference
+also defines direct-caller policy, slot-state handling, and async validation.
 
 ## Validation
 

@@ -15,6 +15,11 @@ This skill starts from working TTNN block or decoder code and turns it into a co
 
 The full model stage does not implement the vLLM adapter, but it must design the model and generator so a later serving adapter can drive the same low-level prefill/decode path without duplicating model logic. Treat the generator as a serving component, not only as a demo loop: external callers may own scheduling, cache/page-table state, prompt lengths, positions, sampling parameters, fixed request slots, inactive rows, and mixed-length prompts.
 
+Read the [version-1 decode reload contract](../vllm-integration/references/decode-reload-contract.md)
+before designing that API. The low-level generator executes four explicit commands.
+The high-level driver chooses them for standalone generation. The later vLLM adapter
+forwards the plugin's commands. Keep reload policy out of the model.
+
 ## What To Build
 
 Implement the model-specific pieces around the working block stack:
@@ -57,7 +62,7 @@ The full-model stage owns sampling. A full model is complete only when token-out
 - the chosen sampling implementation is traced, or the generator owns a correct trace wrapper around it;
 - sampling receives `tt_out_tok` pointing at the persistent decode token input tensor, so the sampled token becomes the next decode input on device;
 - current-position/RoPE position state advances coherently with token feedback on device inside the trace for fixed-step decode loops; do not refresh positions from host every token;
-- page-table trace inputs are refreshed only when the page table changes, with no per-token page-table copy in the unchanged-page-table case;
+- page-table trace inputs are copied on a full reload or a page-table-only command; steady resident decode performs no copies when both commands are false;
 - greedy decode stays on device and uses the fastest correct on-device sampling strategy for the target mesh. Force-argmax is optional. Benchmark it against the normal top-k/top-p-capable sampling path when terminal sampling is material.
 
 The same path supports top-k/top-p sampling. Do not complete the full model with a one-off greedy-only path and leave sampled serving to be invented in vLLM.
@@ -73,7 +78,7 @@ Build decode around persistent device state:
 - capture model decode and sampling traces over those stable tensors and retain them according to the lifetime rule in `$tt-enable-tracing`;
 - feed the next token through `tt_out_tok`, not a host reconstruction path;
 - advance current-position/RoPE state on device for each replay when the decode step is a simple increment;
-- skip page-table copies when the page table is unchanged;
+- obey the explicit full-input and page-table-only commands without inferring reloads;
 - avoid per-token host mask construction, cache reset, synchronization, blocking trace replay, or feedback readback.
 
 If TTNN or the runtime API blocks one of these items, keep the stage incomplete until it is fixed or you have the smallest repro for the blocked item. Do not treat a full-model decode result as complete while it still has avoidable host work between trace replays.
@@ -96,13 +101,28 @@ with a concrete generator class implementing `readiness_check.contract.Generator
 Expose both API levels with signatures along these lines:
 
 ```python
-def prefill_forward(tokens, *, page_table, kv_cache, prompt_lens, ...): ...
-def decode_forward(tokens, start_pos, *, page_table, kv_cache, ...): ...
+def prefill_forward(tokens, *, page_table, kv_cache, prompt_lens, **kwargs): ...
+def decode_forward(
+    tokens, start_pos, *, page_table, kv_cache,
+    reload_inputs, reload_page_table, reload_sampling_params,
+    reset_sampling_state, slot_remap=None, **kwargs,
+): ...
 def prefill_logits(prompt_token_ids): ...  # high-level, owns cache/page-table setup
 def generate(prompt_token_ids, max_new_tokens, *, next_input=None, enable_trace=True, **kwargs): ...
 ```
 
-The exact arguments can vary by model, but keep them keyword-friendly and explicit. `enable_trace` must be an explicit keyword on `generate`; accepting it only through `**kwargs` is not enough because the readiness teacher-forcing runner requires traced decode. The high-level `generate` path should be a thin deterministic loop over the low-level methods.
+Keep the four decode commands explicit and required. Model-specific extra arguments
+can vary. Reject `reset_batch` in `**kwargs`. `enable_trace` must be an explicit
+keyword on `generate`; accepting it only through `**kwargs` is not enough because
+the readiness teacher-forcing runner requires traced decode. The high-level
+`generate` path should be a thin deterministic loop over the low-level methods.
+
+Teacher forcing supplies a replacement token and current host position on each
+step, so its driver sends `reload_inputs=True`. Free-running device decode can
+keep tokens and positions resident between transitions. Initialize sampling state
+for each new request, including device seeds when `seed=None`. A warmup with no
+history does not request a penalty-history reset. See the reload reference for
+direct-caller modes, partial prefill, and slot-remap rules.
 
 Make cache ownership explicit. Standalone generation often owns its cache internally; serving or other external callers may need to pass an already-allocated cache and page table. Do not bake in assumptions that prevent either mode unless the project contract intentionally does so.
 
@@ -155,11 +175,12 @@ Shift qualitative checks left: as soon as the full model can generate text, use 
 
 Add a focused split-sampling trace test before marking the stage complete:
 
-- capture/replay two or more decode steps with different token and current-position values;
-- assert the exact persistent trace input tensors consumed by decode changed as expected;
+- request a full reload with changed host token and position values;
+- verify that the exact persistent trace input tensors receive those values;
+- run steady steps with `reload_inputs=False` and stale host inputs, then verify that those inputs do not overwrite device state;
 - assert the sampled token from step N is the token input for step N+1 without host reconstruction;
-- cover unchanged and changed page-table cases;
-- prove the delivered path is not rebuilding tokens, positions, RoPE indices, masks, or page tables on the host every token; if a per-token host refresh remains, the stage is incomplete;
+- cover page-table-only reloads and steady steps with no copies;
+- prove that free-running resident decode does not rebuild forward inputs on the host every token; teacher-forced input replacement and host sampling require full reloads;
 - alternate greedy and non-greedy-capable sampling params if the generator caches trace ids by sampling mode.
 
 Build the fast probe before any repeated debugging loop: a reduced full-model variant (one layer of each kind, short generation, real tensor/cache/page-table shapes, and the real terminal path) with a documented runtime of a couple of minutes or less. Repeating a multi-minute all-layer pass to answer single-bit questions wastes the budget the debugging loop needs; the probe pays for itself within a few iterations. This probe is for debugging only. Final correctness and performance evidence still comes from the complete all-layer model.
@@ -197,7 +218,11 @@ Be precise about the local harness. `readiness_check.run_teacher_forcing` drives
 
 Do not compare a sampling-inclusive serving result against a teacher-forcing/logits-only reference without naming the boundary. If token-out decode is slower, profile terminal work separately: final norm, LM head, logits movement/all-gather, argmax/top-k/sampling trace, token readback, and trace orchestration.
 
-Treat host steps between decode iterations as implementation bugs to remove from the steady-state path, not just performance terms to report. Add counters for trace replays, token-input refreshes, current-position/RoPE refreshes, page-table refreshes, synchronizations, and readbacks, then drive the steady-state refresh counts to zero except where the caller-visible API truly requires a readback or the scheduler changes state. If current-position/RoPE refreshes happen once per generated token, the full model still has a host-stepped decode loop; fix it with device-side state advance where possible before claiming optimized full-model performance.
+Measure host work against the requested decode mode. Record reload commands, trace
+replays, input copies, waits, and readbacks. Steady free-running resident decode
+should have no full input copies; page growth can require a page-table-only copy.
+Host sampling and teacher-forced token replacement require full reloads. Preserve
+those copies and measure free-running device feedback separately.
 
 Measure the primary batch-1 TTFT and trace-verified decode t/s/u with the same workload shape as the vLLM primary single-user profile (prompt 128 / generate 128 by default unless the project specifies otherwise), separate from the accuracy workload, and record the workload shape next to every number. Compare this to `vllm_benchmark.json` in later stages. The larger-batch or concurrent-serving checks prove capability and serving behavior; they are not a replacement for the batch-1 latency target.
 

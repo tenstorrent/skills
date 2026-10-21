@@ -4,6 +4,6 @@ vLLM and tt-inference-server serving paths.
 
 | Skill | Description |
 |---|---|
-| [`tt-vllm-serving-review`](tt-vllm-serving-review/SKILL.md) | Reviews the vLLM and tt-inference-server serving path — generator_vllm.py contracts, plugin registration, the tt_data_parallel ambiguity, and TT-fork branch and config conventions. Use when reviewing changes to generator_vllm.py, vLLM plugin registration, or serving configuration. |
+| [`tt-vllm-serving-review`](tt-vllm-serving-review/SKILL.md) | Reviews generator contracts, version-1 decode reload commands, async capability, slot state, plugin registration, and TT data-parallel layouts. |
 
 See the [top-level Reference](../../README.md#reference) for the full catalogue.

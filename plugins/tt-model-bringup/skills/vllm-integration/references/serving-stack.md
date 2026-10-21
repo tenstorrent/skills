@@ -47,3 +47,10 @@ with `arch` and `main_class`. Source registrations live under
 new autoport adapter, especially when the architecture already has a built-in implementation.
 Record the registration and propagate it to every engine subprocess; model implementation
 still belongs in TT-Metal, not upstream vLLM core.
+
+Before implementing decode, read the selected plugin's `docs/DECODE_RELOAD_CONTRACT.md`
+and this skill's [version-1 adapter guidance](decode-reload-contract.md). New adapters
+use `decode_input_update_contract = 1` and the four explicit reload commands from
+plugin PR #78. Verify the selected tt-metal generator can execute those commands.
+If it is still legacy, update it as part of the bring-up. Do not infer support from
+the plugin version or require a fixed tt-metal PR branch for all future runs.
