@@ -19,7 +19,7 @@
 /SOURCES.md @blozano-tt @yieldthought
 /plugins/tt-review-skills/ @blozano-tt @yieldthought
 # Staged TTNN model bring-up
-/plugins/tt-model-bringup/ @yieldthought @tchedaTT
+/plugins/tt-model-bringup/ @yieldthought @tchedaTT @odjuricicTT @mvasiljevicTT
 
 # Debug tools
 /plugins/tt-debug-tools/ @ppetrovicTT
