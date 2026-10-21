@@ -18,6 +18,11 @@ generator's low-level interface and preserves cache ownership semantics:
 - vLLM serving path: vLLM owns attention KV cache allocation and passes that
   cache through prefill/decode calls.
 
+This module summarizes the adapter contract for readiness tooling. The pinned
+TT vLLM plugin's model interface and model capability documents are
+authoritative; this summary does not list every call or capability key that
+the plugin reads.
+
 Async decode split contract
 ---------------------------
 
@@ -39,7 +44,7 @@ import torch
 
 
 class ModelCapabilities(TypedDict, total=False):
-    """Capability flags consumed by the TT vLLM integration path."""
+    """Capability keys that the readiness tooling refers to; the plugin reads more."""
 
     supports_prefix_caching: bool
     supports_async_decode: bool
@@ -51,18 +56,18 @@ class VllmGeneratorAdapter(Protocol):
     Protocol for ``tt/generator_vllm.py`` adapter classes.
 
     Implementations are typically named ``TT<Arch>ForCausalLM`` (or
-    ``...ForConditionalGeneration``) and are registered in the TT vLLM plugin.
+    ``...ForConditionalGeneration``) and are registered with the TT vLLM plugin.
 
-    This protocol mirrors what the TT vLLM plugin calls today.
+    This protocol summarizes the calls that the TT vLLM plugin makes. The pinned
+    plugin's model interface document is authoritative.
     """
 
     model_capabilities: ClassVar[ModelCapabilities]
     """
-    Model capability flags interpreted by plugin/runtime.
+    Model capability declarations interpreted by the plugin.
 
-    When present, the plugin currently reads:
-    ``supports_sample_on_device``, ``supports_async_decode``, and
-    ``supports_prefix_caching``.
+    Declare only keys that the pinned plugin's model capability document lists,
+    with values that the model meets.
     """
 
     @classmethod

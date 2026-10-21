@@ -50,7 +50,7 @@
       "destination": "prompts/model_bringup_multigoal/06-full-model.txt",
       "blob": "bff9bb890a6052bfa0fff9f06f12891ce1ad0f10",
       "source_sha256": "9ffedb6e7af6dcbbd32fc8002b5add7cd599967ef163eb9e0191af47bb14cf09",
-      "packaged_sha256": "9ffedb6e7af6dcbbd32fc8002b5add7cd599967ef163eb9e0191af47bb14cf09"
+      "packaged_sha256": "4031fa919c9de3dfc129f087b8f56dfd9f5a245812e87c75309d6495750b3507"
     },
     {
       "source": ".agents/prompts/model_bringup_multigoal/07-optimized-full-model.check.sh",
@@ -85,7 +85,7 @@
       "destination": "prompts/model_bringup_multigoal/09-vllm.txt",
       "blob": "fc930a5472158d07221c2c5440786a7c5aed9ed2",
       "source_sha256": "65e532c7e54a6e1bd348575f4471fa0708990fe93e91ef06bbfa9695c60ca727",
-      "packaged_sha256": "25bbd0ae23662362c57f0b054622453703b546defa54f0d1eebae748bc519500"
+      "packaged_sha256": "5b05170f500899fc542bee53b2f5d3e59c01ef59ae0c6aded8fbb720de38fcdf"
     },
     {
       "source": ".agents/prompts/model_bringup_multigoal/10-optimized-vllm.check.sh",
@@ -99,7 +99,7 @@
       "destination": "prompts/model_bringup_multigoal/10-optimized-vllm.txt",
       "blob": "7c661791b3c29bbad8de5ce8d50176d13633657f",
       "source_sha256": "6817dc59aa6d8cdc9c50404aa4e919240f1a07e3ce772dab04ae21d4561bec24",
-      "packaged_sha256": "d918a1cf738823ae15717b848c8f16d0a4cd0366d0377884b7a62a8cc8c6a361"
+      "packaged_sha256": "c4ff962430a858da07e44fc5a7b60084597bc992e5e57bbb07ad5aa3722db788"
     },
     {
       "source": ".agents/requirements.txt",
@@ -141,7 +141,7 @@
       "destination": "skills/full-model/SKILL.md",
       "blob": "de994d5552a74b4f1cdcaf64f6ba364178b8d5a4",
       "source_sha256": "0618a7bd6ee01f995cb98dd73a9b2c46d8fd3daab9fcecdafde67501c529d2f8",
-      "packaged_sha256": "92b37989d9dd4a93e2f8501571849cf8d9432c68d187569bf2bc23bcb7ad1a87"
+      "packaged_sha256": "dde99c96444aa4d9116d9d5136d8fa9c9b34e7dfabd5cf7a846b11cf2bc891cf"
     },
     {
       "source": ".agents/skills/full-model/agents/openai.yaml",
@@ -225,7 +225,7 @@
       "destination": "skills/stage-review/SKILL.md",
       "blob": "7c89b9d281aa1a853a273d3ff4b1c16ad8ccac0d",
       "source_sha256": "b84c344e6a2c0130569dc7e4147ad748d44aa04afa11f181b0711d00afbe3466",
-      "packaged_sha256": "f46fc472ed5f6d791874f5ee7c14efd0393f6c6179ab27905d5211b473f1c6e4"
+      "packaged_sha256": "8d70ae894bedebcfb21b5b5d237d01059974e0f74ef30fec10333e524e5caf82"
     },
     {
       "source": ".agents/skills/stage-review/agents/openai.yaml",
@@ -274,7 +274,7 @@
       "destination": "skills/vllm-integration/SKILL.md",
       "blob": "05d9e19f7cfbb596d209c504cc49e063b9361da1",
       "source_sha256": "a23a516ab0e8afc3a5dd6ddd72a42781997fb454872139e70605ecbd234e114c",
-      "packaged_sha256": "b20dc786698ac19960f90e9fe80c3e00f5ef3fe1c8b07aef6f7bfa49ac296242"
+      "packaged_sha256": "4f4f427bfb827c8c1a8dbad0a00d4c0c79a3b4506835af1f42afb45aacd21734"
     },
     {
       "source": ".agents/skills/vllm-integration/agents/openai.yaml",
@@ -323,7 +323,7 @@
       "destination": "runtime/readiness_check/contract_vllm.py",
       "blob": "17532121d80665f4e761c0accf1804b47a9e24a0",
       "source_sha256": "1cad43e6e36705297dbfa5416b38cf4ee555a564a2463066f1676ffc5ac8a5a7",
-      "packaged_sha256": "1cad43e6e36705297dbfa5416b38cf4ee555a564a2463066f1676ffc5ac8a5a7"
+      "packaged_sha256": "71758f9307b58758a65f5c748a186d9b24b9faf01f19f2d1000963d8797cc34f"
     },
     {
       "source": "models/common/readiness_check/generate.py",

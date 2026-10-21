@@ -41,10 +41,12 @@ or replace acceptance criteria with a review plugin's criteria.
 4. Confirm the HF model/revision, target checkout, acceptance contract and already-authorized
    hardware. Resolve model directory as `models/autoports/<lowercase HF ID with non-alphanumeric
    characters replaced by underscores>`. Do not acquire hardware just because a plugin was installed.
+   Record any serving-plugin interface change that the operator authorizes for this run.
 5. Keep the checkout, `CODEX_HOME`, runner logs and artifacts on persistent storage. Runtime model
-   changes belong in the target checkout; workflow fixes belong in this plugin. Record exact
-   commands, commits, hardware identity and evidence. Keep weights, credentials and private logs
-   out of published commits.
+   changes belong in the target checkout; workflow fixes belong in this plugin. Changes to the
+   TT vLLM plugin or vLLM follow [plugin changes](../vllm-integration/references/plugin-changes.md).
+   Record exact commands, commits, hardware identity and evidence. Keep weights, credentials and
+   private logs out of published commits.
 
 ## Dependency selection
 

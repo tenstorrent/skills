@@ -30,7 +30,7 @@ tt/model.py
 tt/generator.py
 ```
 
-If they do not, use `$full-model` first. During vLLM integration you may make small, evidence-backed changes to `model.py` or `generator.py` when the serving adapter exposes a real contract gap, but avoid turning this stage back into full-model bringup.
+If they do not, use `$full-model` first. During vLLM integration you may make small, evidence-backed changes to `model.py` or `generator.py` when the serving adapter exposes a real contract gap, but avoid turning this stage back into full-model bringup. Fix a serving gap that the model owns in the model or generator, even when a plugin change would be a smaller diff. Changes to the TT vLLM plugin or to vLLM follow [plugin changes](references/plugin-changes.md).
 
 Before writing adapter code, load the datatype-sweep selection and confirm the generator constructs that exact policy: weight groups, activation/residual dtype, CCL dtype, KV-cache dtype, compute fidelities, and layer exceptions. Serving uses the selected full-model policy. Serving a reduced-speed model does not satisfy completion.
 
@@ -43,8 +43,15 @@ Preserve larger-batch serving capability. The headline performance target is sti
 ## Serving dependency
 
 Before serving, follow [serving stack setup](references/serving-stack.md): use the standalone
-TT plugin and the upstream vLLM version its current instructions recommend. Keep the selected
-pair and its source provenance in the run record.
+TT plugin and the upstream vLLM version its current instructions recommend. Reuse the pair that
+`$full-model` recorded for its serving contract check. Keep the selected pair and its source
+provenance in the run record.
+
+Before writing adapter code, read the pinned plugin's model interface and model capability
+documents (currently `docs/MODEL_INTERFACE.md` and `docs/MODEL_CAPABILITIES.md`) and load
+`doc/full_model/serving_contract.md`. If that file is missing, write it first as `$full-model`
+describes. Declare only `model_capabilities` keys that the pinned plugin documents, and declare
+each value only with evidence that the model meets it.
 
 ## vLLM Adapter
 
@@ -81,8 +88,11 @@ Before enabling overlap, verify that the selected vLLM revision invalidates or r
 device page tables when active requests gain blocks. A reset that reloads host tokens or
 positions must first drain pending decode results. A page-only refresh is acceptable only
 with evidence that it preserves token and position state. Empty new-block lists must not
-force a refresh on every token. If the dependency lacks this behavior, fix and verify the
-dependency or keep overlap disabled; do not report the async path as complete.
+force a refresh on every token. If the pinned revision lacks this behavior, compare it with the
+plugin's documented decode-reload contract. When the adapter does not meet that contract, fix
+the adapter. When the plugin violates its own contract, fix the plugin only with a complete
+[plugin changes](references/plugin-changes.md) record. Until then, keep overlap disabled and do
+not report the async path as complete.
 
 Validate automatic allocator-driven page growth across multiple page boundaries, with
 several distinct concurrent requests and a trustworthy non-overlapped control. Check
@@ -93,7 +103,7 @@ degenerate text does not establish page-table correctness.
 Leave prefix caching `False` unless it is implemented and tested.
 
 
-If the vLLM plugin or harness is being changed, prefer the same safety rule there: overlap should default to false unless the model declares this proof-backed capability. Leaving overlap disabled may cost a few tokens/sec/user; letting it default on can silently corrupt generation.
+The existing `supports_async_decode` declaration gates overlap. Declare it `True` only with the evidence above. Leaving overlap disabled may cost a few tokens/sec/user; enabling it without proof can silently corrupt generation. Do not add a plugin capability, environment variable, or `--additional-config` option to gate overlap.
 
 The traced serving decode path reuses the full-model generator's canonical split-sampling path and replays via `ttnn.execute_trace(..., blocking=False)`. For `sample_on_device_mode=all`, serving has no new sampling strategy, host greedy/top-1 argmax, full-logits readback, generic top-k fallback for greedy, or Python readback/writeback token-feedback loop. If the full-model generator lacks split sampling, stop and fix `$full-model`; do not complete vLLM by patching sampling in the adapter. Do not copy a full page table every token when it is unchanged. Reduce token/current-position/page-table refresh to actual scheduler state changes, then prove both changed and unchanged cases with stale-input tests.
 
@@ -141,7 +151,7 @@ Include this check in Stage 9 serving evidence. Repeat it after Stage 10 optimiz
 3. Exercise each supported chunked-prefill path with first chunks, changed continuation start positions, and partial final chunks. Scheduler coverage requires concurrent arrivals and prompts that cross its token budget while other requests decode.
 4. Repeat known lengths in different batch combinations and row orderings, with supported sampling-mode switches before returning to an earlier trace key.
 5. Record actual request lengths, chunk lengths, start positions, and active decode work. A configured chunking flag alone does not prove that the workload exercised chunking.
-6. Collect trace IDs, capture/retirement counts, and compilation/capture times for prefill, decode, and sampling. Map cache keys to actual execution signatures. Include a baseline for traces captured before the workload. Model or plugin event instrumentation is required where HTTP results cannot expose these events. Missing counters are incomplete evidence, not zero recaptures.
+6. Collect trace IDs, capture/retirement counts, and compilation/capture times for prefill, decode, and sampling. Map cache keys to actual execution signatures. Include a baseline for traces captured before the workload. The generator owns trace capture, so add generator or model event instrumentation where HTTP results cannot expose these events; plugin instrumentation follows [plugin changes](references/plugin-changes.md). Missing counters are incomplete evidence, not zero recaptures.
 7. Report request completion, correctness, TTFT p50/p95/p99, decode pauses, and completed-request throughput for this traffic. The measurements must include first encounters with the measured logical lengths and chunk offsets. This result is separate from fixed-shape warmed performance.
 
 Apply the [trace lifetime rule](../tt-enable-tracing/SKILL.md#trace-lifetime-and-reuse): at most one capture per prepared execution signature and zero invalidations, retirements, evictions, or recaptures throughout the workload. Preserve traces captured before the workload as well as deferred first captures made during it. Do not restart the generator or reset counters between requests. Record shutdown releases separately. Apply the allocation-safety gate from `$tt-enable-tracing` and measure performance separately with tracking disabled.
@@ -153,7 +163,9 @@ Keep commands, workload details, trace events, and results under `readiness_vllm
 Register the model through the pinned standalone plugin's documented extension mechanism;
 see [serving stack setup](references/serving-stack.md). Verify the resolved class is this
 experiment's adapter, including in engine subprocesses. An existing built-in architecture
-must not silently select a reference model instead.
+must not silently select a reference model instead. Do not add a built-in registration for the
+adapter to the plugin source when a runtime mechanism can select it; see
+[plugin changes](references/plugin-changes.md).
 
 ## vLLM Server Integration Test
 
@@ -222,13 +234,15 @@ When determinism tests fail in vLLM, validate that logits output by the model fo
 
 Classify reproducibility-only sampling failures separately when they are the only failures. Typical names include `test_top1_is_greedy`, `test_topk`, `test_uniform_seed_deterministic`, `test_specific_seed_reproducible`, `test_same_seeds_reproduce_across_batches`, `test_*_mixed_batch`, and `test_mixed_params_batch`. They do not require more serving-correctness work only when correctness, logprobs, crash-free serving, and qualitative output all pass. Correctness failures, missing logprobs, crashes, gibberish output, or wrong logprob values remain required work.
 
+When a plugin test fails because the device sampler lacks a request feature, such as logprobs, penalties, or a top-k range, fix the generator sampling path that `$full-model` owns. A documented `model_capabilities` declaration that routes such requests to host sampling is acceptable only when it states a real support boundary of this model and `doc/full_model/serving_contract.md` records that boundary. Do not add a routing capability or weaken a plugin test to make the suite pass.
+
 If vLLM crashes mid-run, kill leftover `EngineCore` or `vllm.entrypoints` processes before retrying; they can hold chip locks after `tt-smi -r`.
 
 If a profiler run is accidentally started and fails, do not escalate it into repeated watcher/profiler/reset attempts. Kill leftover server processes. If `tt-smi -ls --local` or reset hangs, or if logs show remote Ethernet/ARC/ERISC failures such as `Timeout waiting for Ethernet core service remote IO request`, `ETH core heartbeat check failed`, `Unexpected ERISC Response Flags`, `Read 0xffffffff from ARC scratch`, or ARC lock/readback waits, stop profiler work, preserve the logs, mark the profiler evidence `hardware-profiler-limited`, and follow `$tt-device-usage` reset recovery before treating the stage as stopped. Request monitor/operator reboot only after bounded reset/list and mesh-smoke recovery fail or require authority this agent does not have.
 
 Transient CCL/fabric link errors immediately after a failed multi-device run still need a device reset and one retry before being treated as hardware evidence, as long as `tt-smi` remains responsive and the failure is not part of the profiler/watcher pattern above.
 
-Failed serving gates, missing serving artifacts, sampling failures, qualitative-output failures, and `$stage-review` `more-work-needed` findings are vLLM-stage work, not terminal stop reasons. If logs make the cause obvious, fix it directly and rerun the failing gate. If the first direct fix does not close the gate, or if the failure crosses the adapter, generator, cache ownership, scheduler inputs, trace inputs, sampling, or plugin registration path, use `$autofix`; it will run `$autodebug` if needed, then verify or refute each proposed bug before keeping any fix. Do not terminal-stop the vLLM stage until `$autofix` has tried and failed or an external dependency is genuinely unavailable.
+Failed serving gates, missing serving artifacts, sampling failures, qualitative-output failures, and `$stage-review` `more-work-needed` findings are vLLM-stage work, not terminal stop reasons. If logs make the cause obvious, fix it directly and rerun the failing gate. If the first direct fix does not close the gate, or if the failure crosses the adapter, generator, cache ownership, scheduler inputs, trace inputs, sampling, or plugin registration path, use `$autofix`; it will run `$autodebug` if needed, then verify or refute each proposed bug before keeping any fix. Plugin fixes that `$autofix` proposes follow [plugin changes](references/plugin-changes.md). Do not terminal-stop the vLLM stage until `$autofix` has tried and failed, an external dependency is genuinely unavailable, or a required plugin change needs human authorization and its proposal is recorded.
 
 Record the working server invocation in the work log, including `--max-model-len`, `--tt-config`, workload config, and any env vars that mattered. Use typed runner flags for `--max-model-len` and `--tt-config`; keep `--additional-server-args` for uncommon flags only.
 
@@ -259,7 +273,8 @@ Done means all of these are true and recorded:
 - Served max context, matching `doc/context_contract.json`, with any hard-physical-limit reduction evidence.
 - Non-aligned prompt-length evidence through serving: a valid request length that is not divisible by internal chunk/page/block alignment succeeds without capping or truncating the advertised context.
 - Served batch/concurrency coverage, including the largest tested `max_num_seqs` up to 32 and any hard-physical-limit reduction evidence.
-- Capability flags with evidence: no unproven `supports_async_decode=True`, no prefix-caching claim without tests, and on-device sampling verified for the measured mode.
+- Capability flags with evidence: no unproven `supports_async_decode=True`, no prefix-caching claim without tests, and on-device sampling verified for the measured mode. Every declared `model_capabilities` key is documented by the pinned plugin.
+- Plugin and vLLM checkout state: unchanged from the pinned commits, or a complete `doc/vllm_integration/plugin_changes.md` entry for each local change, as [plugin changes](references/plugin-changes.md) requires.
 - Evidence that serving uses the full-model split-sampling contract: internal sampling trace, `tt_out_tok` feedback into the persistent decode token input, greedy benchmarks using the fastest correct on-device sampling strategy measured for this mesh, and stale-token/current-position smoke coverage.
 - Logit-determinism evidence through vLLM, with run-to-run and cross-batch-position reproducibility checks and standalone baseline comparison.
 - Sampling test results, with any reproducibility-only failures separated from real failures.
@@ -292,3 +307,5 @@ The README should lead with vLLM sampling status, qualitative verdict, primary s
 | tt_transformers generator | `models/tt_transformers/tt/generator.py` |
 | Thin vLLM adapter | `models/tt_transformers/tt/generator_vllm.py` |
 | vLLM model registration | Standalone plugin registration; see [stack setup](references/serving-stack.md) |
+| Plugin model interface and capabilities | Pinned plugin checkout, currently `docs/MODEL_INTERFACE.md` and `docs/MODEL_CAPABILITIES.md` |
+| Plugin and vLLM changes | [plugin changes](references/plugin-changes.md) |

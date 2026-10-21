@@ -1,6 +1,6 @@
 {
   "name": "tt-model-bringup",
-  "version": "0.1.19",
+  "version": "0.1.20",
   "description": "Bring Hugging Face text models to TTNN through eleven verified stages. Requires tt-autodebug. Codex multigoal setup automatically adds optional telemetry when tenstorrent/ar-dashboard is accessible.",
   "author": {
     "name": "Tenstorrent"

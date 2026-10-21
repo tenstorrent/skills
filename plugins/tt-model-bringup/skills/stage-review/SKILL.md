@@ -152,8 +152,10 @@ ready to pass yet. It is a remediation trigger, not permission for the stage
 owner to set the Codex goal to terminal `blocked`. The stage owner must treat
 each finding as work: fix it directly when the cause is obvious, or use
 `$autofix` when the fix is not obvious or the first direct fix does not close
-the gate. Only a later, explicit `$autofix` failure or an unrecoverable external
-dependency can justify terminal goal `blocked`.
+the gate. Only a later, explicit `$autofix` failure, an unrecoverable external
+dependency, or a required serving-plugin change that needs human authorization
+under [plugin changes](../vllm-integration/references/plugin-changes.md), with its
+proposal recorded, can justify terminal goal `blocked`.
 
 ## What To Inspect
 
@@ -198,6 +200,16 @@ For generation or serving stages, also inspect:
 - capability-contract evidence: for nonstandard or non-LLM models, the
   model-specific equivalent of context length, cache/state semantics, mode
   switches, and advertised input/output limits.
+- serving contract for full-model: `doc/full_model/serving_contract.md` names
+  the pinned plugin and vLLM pair and has no missing rows.
+- serving-plugin and vLLM checkout state: every file changed outside the target
+  tt-metal checkout. Each change in the plugin or vLLM checkout needs a complete
+  `doc/vllm_integration/plugin_changes.md` entry under
+  [plugin changes](../vllm-integration/references/plugin-changes.md). A change
+  that adds shared plugin interface without recorded human authorization, or
+  whose justification is a smaller diff or avoided rework, needs more work.
+- declared `model_capabilities`: every key in `tt/generator_vllm.py` is
+  documented by the pinned plugin, and each declared value has evidence.
 
 For release stages, also inspect:
 
@@ -407,8 +419,10 @@ After the reviewer returns:
 3. If the verdict is `clean-pass`, record the review artifact or subagent final
    answer path in the stage work log.
 4. After `clean-pass`, create local checkpoint commits for stage-owned changes
-   in each touched repo, including `tt-metal` and `vllm` when applicable. Never
-   push these commits from autonomous bringup.
+   in each touched repo: `tt-metal`, and the serving plugin or vLLM checkout
+   only for changes with a complete
+   [plugin changes](../vllm-integration/references/plugin-changes.md) record.
+   Never push these commits from autonomous bringup.
 5. Record each repo, branch, and commit SHA in the stage work log. Do not
    include unrelated dirty files in a checkpoint commit. If stage-owned changes
    cannot be isolated from unrelated dirty state, treat that as more required

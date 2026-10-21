@@ -52,6 +52,10 @@ Version and commit verification remains part of setup and resume.
 Stages 9 and 10 require served qualitative artifacts (`--scope vllm`). Verify
 page-growth refresh and pending-token handling before enabling async overlap.
 
+The full-model stage pins the serving pair and records the plugin interface in
+`doc/full_model/serving_contract.md`. Changes to the plugin or vLLM checkouts follow
+`skills/vllm-integration/references/plugin-changes.md`, and stage review checks them.
+
 ## Validation
 
 The repository's `pytest tests/` suite uses pytest and PyYAML for package checks
@@ -106,3 +110,16 @@ from this serving requirement; they are not automatic exceptions to its checks.
 
 Only packaged hashes for the six edited skills and two stage prompts change in `sync-source.json`;
 the original import provenance stays intact. No tracker runtime code is vendored.
+
+## Serving plugin change policy (0.1.20)
+
+Bringup agents first read the serving plugin interface during vLLM integration, after the
+generator, sampler and datatype policy were frozen. A plugin change was then the smallest
+local diff, and the stage gates offered no stop for a missing plugin feature. The full-model
+stage now pins the serving pair and writes a serving contract from the plugin's own interface
+documents. `skills/vllm-integration/references/plugin-changes.md` defines who owns a serving
+gap, which plugin changes need human authorization, and the justification record that stage
+review checks.
+
+Only packaged hashes for three edited stage prompts, three edited skills and
+`contract_vllm.py` change in `sync-source.json`; the original import provenance stays intact.

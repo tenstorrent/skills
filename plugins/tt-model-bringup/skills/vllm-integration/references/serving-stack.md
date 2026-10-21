@@ -4,7 +4,8 @@ Use the standalone plugin [tenstorrent/vllm-tt-plugin](https://github.com/tensto
 with the upstream [vllm-project/vllm](https://github.com/vllm-project/vllm) version it recommends.
 The old `tenstorrent/vllm` fork and its bundled plugin are not the default serving stack.
 
-For a new run:
+For a new run, resolve and pin the pair once, during the `$full-model` serving contract check.
+That check only reads the plugin checkout; install the stack before the first server launch.
 
 1. Resolve the plugin's current default branch from GitHub and pin the selected commit in a
    separate checkout. Read that checkout's README and the installation script it references
@@ -42,8 +43,9 @@ Register the new adapter using the pinned plugin's supported extension mechanism
 current registration docs/source first. The standalone plugin currently supports
 `TT_MODEL_CLASS_OVERRIDES="TT<Arch>=models.autoports.<model>.tt.generator_vllm:<Class>"`
 for a per-launch selection, or `EXTRA_MODELS_DIR` bundles containing `vllm_metadata.json`
-with `arch` and `main_class`. Source registrations live under
-`src/vllm_tt_plugin/` in the standalone checkout. Verify the resolved registry target is the
-new autoport adapter, especially when the architecture already has a built-in implementation.
-Record the registration and propagate it to every engine subprocess; model implementation
-still belongs in TT-Metal, not upstream vLLM core.
+with `arch` and `main_class`. A built-in registration in the plugin source is a plugin change.
+Verify the resolved registry target is the new autoport adapter, especially when the
+architecture already has a built-in implementation. Record the registration and propagate it
+to every engine subprocess. Model implementation belongs in TT-Metal, not in the plugin or
+upstream vLLM core. Changes to the plugin or vLLM checkouts follow
+[plugin changes](plugin-changes.md).
