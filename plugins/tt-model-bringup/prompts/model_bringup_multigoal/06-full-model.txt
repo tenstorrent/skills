@@ -10,7 +10,7 @@ Goal completion requirements:
 - Preserve the full-stack context contract. Recompute weight plus KV-cache DRAM capacity in doc/context_contract.json. Reduce advertised capability only for a hard physical limit, with evidence and the largest feasible value.
 - The model/generator accepts valid prompt lengths up to the supported context, including non-aligned lengths. If prefill chunks internally, the public generator owns padding, masking, cache fill, position handling, and output slicing.
 - Expose serving-ready low-level prefill/decode with explicit cache/page-table/position/prompt-length/batch state, mixed prompts, fixed slots, and inactive rows where used.
-- doc/full_model/serving_contract.md maps each call, capability, and request feature that the pinned vllm-tt-plugin uses or tests to generator support. Missing rows are work for this stage.
+- doc/full_model/serving_contract.json maps each call, capability, and request feature that the pinned vllm-tt-plugin uses or tests to generator support. Missing rows are work for this stage.
 - Generate a fresh AIME24 HF-tokenizer chat-template reference, 100 tokens, unless metadata proves an exact match.
 - run_prefill_check and run_teacher_forcing report top-1/top-5/top-100 for prefill and decode. The expected bar is top-5 >= 98% and top-100 = 100%.
 - run_autoregressive produces HF and TT completions, and the outputs are read for coherence, repetition, wrong-language drift, and early divergence.

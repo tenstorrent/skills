@@ -53,7 +53,7 @@ Stages 9 and 10 require served qualitative artifacts (`--scope vllm`). Verify
 page-growth refresh and pending-token handling before enabling async overlap.
 
 The full-model stage pins the serving pair and records the plugin interface in
-`doc/full_model/serving_contract.md`. Changes to the plugin or vLLM checkouts follow
+`doc/full_model/serving_contract.json`. Changes to the plugin or vLLM checkouts follow
 `skills/vllm-integration/references/plugin-changes.md`, and stage review checks them.
 
 ## Validation
@@ -121,5 +121,10 @@ documents. `skills/vllm-integration/references/plugin-changes.md` defines who ow
 gap, which plugin changes need human authorization, and the justification record that stage
 review checks.
 
-Only packaged hashes for three edited stage prompts, three edited skills and
-`contract_vllm.py` change in `sync-source.json`; the original import provenance stays intact.
+`scripts/check_serving_contract.py` is authored in this plugin. The stage 6 and stage 9 gates
+run it after the context contract check; it rejects a missing serving contract, an unpinned
+plugin commit, and rows with status `missing`.
+
+Only packaged hashes for three edited stage prompts, two edited check scripts, three edited
+skills and `contract_vllm.py` change in `sync-source.json`; the original import provenance
+stays intact.

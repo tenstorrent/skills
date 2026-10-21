@@ -17,4 +17,7 @@ python "${TT_MODEL_BRINGUP_ROOT}/runtime/readiness_check/check_degenerate_output
 
 python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_context_contract.py" \
   --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}" \
-  --stage full-model --require-contract
+  --stage full-model --require-contract || exit $?
+
+python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_serving_contract.py" \
+  --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}" --require-contract

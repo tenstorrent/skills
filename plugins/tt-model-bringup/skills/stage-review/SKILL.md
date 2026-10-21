@@ -200,7 +200,7 @@ For generation or serving stages, also inspect:
 - capability-contract evidence: for nonstandard or non-LLM models, the
   model-specific equivalent of context length, cache/state semantics, mode
   switches, and advertised input/output limits.
-- serving contract for full-model: `doc/full_model/serving_contract.md` names
+- serving contract for full-model: `doc/full_model/serving_contract.json` names
   the pinned plugin and vLLM pair and has no missing rows.
 - serving-plugin and vLLM checkout state: every file changed outside the target
   tt-metal checkout. Each change in the plugin or vLLM checkout needs a complete
@@ -208,6 +208,9 @@ For generation or serving stages, also inspect:
   [plugin changes](../vllm-integration/references/plugin-changes.md). A change
   that adds shared plugin interface without recorded human authorization, or
   whose justification is a smaller diff or avoided rework, needs more work.
+  When the only remedy for a finding is a plugin change that needs human
+  authorization, set its `Required next step` to `human authorization` and name
+  the `proposed` record; do not ask the stage owner to implement the change.
 - declared `model_capabilities`: every key in `tt/generator_vllm.py` is
   documented by the pinned plugin, and each declared value has evidence.
 
@@ -412,10 +415,12 @@ it to complete the stage.
 After the reviewer returns:
 
 1. Read the findings and verify that the cited artifacts exist.
-2. If the verdict is `more-work-needed`, do not mark the stage complete or
-   terminal `blocked`. Treat the findings as the next stage work item. Use the
-   relevant debugging skill or `$autofix` to resolve it, then rerun
-   `$stage-review`.
+2. If the verdict is `more-work-needed`, do not mark the stage complete. Set the
+   goal to terminal `blocked` only when every remaining Required Work item has
+   `Required next step: human authorization` and its `proposed` record exists;
+   name the record paths as the concrete blocker. Otherwise treat the findings
+   as the next stage work item. Use the relevant debugging skill or `$autofix`
+   to resolve it, then rerun `$stage-review`.
 3. If the verdict is `clean-pass`, record the review artifact or subagent final
    answer path in the stage work log.
 4. After `clean-pass`, create local checkpoint commits for stage-owned changes

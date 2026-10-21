@@ -41,12 +41,12 @@ Before you change the plugin, or when you propose a change, add an entry to `mod
 3. **Model-side alternative.** The model or generator change that would close the gap, and why that change is incorrect. "The model change is larger" and "the model change belongs to an earlier stage" are not reasons.
 4. **Existing mechanisms.** The `model_capabilities` keys, `--additional-config` options, environment variables, and registration mechanisms in the pinned plugin documents that you checked, and why each one does not apply.
 5. **Effect on other models.** The behavior of models that do not use the change, and the existing models that take the changed path.
-6. **Authorization.** For a change that adds shared interface: the person, the source, and the exact item. Otherwise state that the change adds no shared interface.
-7. **Validation.** A plugin regression test that fails before the change and passes after it, the plugin's own host test results, and the affected serving checks.
+6. **Authorization.** For a change that adds shared interface: the person, the source, and the exact item, or `pending` and the exact item for a `proposed` record. Otherwise state that the change adds no shared interface.
+7. **Validation.** For `implemented`: a plugin regression test that fails before the change and passes after it, the plugin's own host test results, and the affected serving checks. For `proposed`: the planned regression test, built from the reproducer in item 1, and the checks to run after implementation.
 8. **Status.** `implemented` with the local plugin commit SHA, or `proposed`.
 
 ## Make the change
 
 Keep the change minimal and model-independent. Add the regression test in the plugin checkout. Run the plugin's host test suite as its documentation describes, then rerun the affected serving checks. Commit the change locally in the plugin checkout as its own stage-owned commit and never push it. Record the pinned base commit and the local commit in the run record and the stage work log.
 
-A record with status `implemented` that is missing any item above is incomplete stage evidence.
+A record is complete when it contains every item above in the form that its status requires. An `implemented` record without test results is incomplete stage evidence. A `proposed` record does not need test results, because the change does not exist yet.

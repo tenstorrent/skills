@@ -47,11 +47,12 @@ TT plugin and the upstream vLLM version its current instructions recommend. Reus
 `$full-model` recorded for its serving contract check. Keep the selected pair and its source
 provenance in the run record.
 
-Before writing adapter code, read the pinned plugin's model interface and model capability
-documents (currently `docs/MODEL_INTERFACE.md` and `docs/MODEL_CAPABILITIES.md`) and load
-`doc/full_model/serving_contract.md`. If that file is missing, write it first as `$full-model`
-describes. Declare only `model_capabilities` keys that the pinned plugin documents, and declare
-each value only with evidence that the model meets it.
+Before writing adapter code, read the pinned plugin's model interface guide (currently
+`docs/MODEL_INTERFACE.md`) and the documents it links, and load
+`doc/full_model/serving_contract.json`. If that file is missing, write it first as
+`$full-model` describes; the stage gate requires it. Declare only `model_capabilities` keys
+that the pinned plugin documents, and declare each value only with evidence that the model
+meets it.
 
 ## vLLM Adapter
 
@@ -234,7 +235,7 @@ When determinism tests fail in vLLM, validate that logits output by the model fo
 
 Classify reproducibility-only sampling failures separately when they are the only failures. Typical names include `test_top1_is_greedy`, `test_topk`, `test_uniform_seed_deterministic`, `test_specific_seed_reproducible`, `test_same_seeds_reproduce_across_batches`, `test_*_mixed_batch`, and `test_mixed_params_batch`. They do not require more serving-correctness work only when correctness, logprobs, crash-free serving, and qualitative output all pass. Correctness failures, missing logprobs, crashes, gibberish output, or wrong logprob values remain required work.
 
-When a plugin test fails because the device sampler lacks a request feature, such as logprobs, penalties, or a top-k range, fix the generator sampling path that `$full-model` owns. A documented `model_capabilities` declaration that routes such requests to host sampling is acceptable only when it states a real support boundary of this model and `doc/full_model/serving_contract.md` records that boundary. Do not add a routing capability or weaken a plugin test to make the suite pass.
+When a plugin test fails because the device sampler lacks a request feature, such as logprobs, penalties, or a top-k range, fix the generator sampling path that `$full-model` owns. A documented `model_capabilities` declaration that routes such requests to host sampling is acceptable only when it states a real support boundary of this model and `doc/full_model/serving_contract.json` records that boundary. Do not add a routing capability or weaken a plugin test to make the suite pass.
 
 If vLLM crashes mid-run, kill leftover `EngineCore` or `vllm.entrypoints` processes before retrying; they can hold chip locks after `tt-smi -r`.
 
@@ -307,5 +308,5 @@ The README should lead with vLLM sampling status, qualitative verdict, primary s
 | tt_transformers generator | `models/tt_transformers/tt/generator.py` |
 | Thin vLLM adapter | `models/tt_transformers/tt/generator_vllm.py` |
 | vLLM model registration | Standalone plugin registration; see [stack setup](references/serving-stack.md) |
-| Plugin model interface and capabilities | Pinned plugin checkout, currently `docs/MODEL_INTERFACE.md` and `docs/MODEL_CAPABILITIES.md` |
+| Plugin model interface and capabilities | Pinned plugin checkout, currently `docs/MODEL_INTERFACE.md` and the documents it links |
 | Plugin and vLLM changes | [plugin changes](references/plugin-changes.md) |
