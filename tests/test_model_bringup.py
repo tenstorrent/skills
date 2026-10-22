@@ -198,6 +198,35 @@ def test_serving_contract_checker(tmp_path, mutate, message):
         assert message in result.stderr
 
 
+@pytest.mark.parametrize('stage', ['06-full-model', '09-vllm'])
+@pytest.mark.parametrize('field, value', [('kind', ['request_feature']), ('status', {'name': 'supported'})])
+def test_gates_fail_critical_for_malformed_serving_contract(installed, stage, field, value):
+    plugin, target, env = installed
+    model = target / 'models/autoports/org_model'
+    doc = model / 'doc'
+    (doc / 'autoregressive').mkdir(parents=True)
+    (doc / 'full_model').mkdir()
+    (model / 'readiness_vllm').mkdir()
+    completion = ' '.join(f'word{i}' for i in range(60))
+    (doc / 'autoregressive/autoregressive_meta.json').write_text(json.dumps({'tt': {'token_ids': list(range(60))}}))
+    (doc / 'autoregressive/tt_completion.txt').write_text(completion)
+    (model / 'readiness_vllm/vllm_qualitative_outputs.json').write_text(json.dumps(
+        [{'prompt': 'p', 'greedy_completion': completion, 'sampled_completion': completion}]))
+    (doc / 'context_contract.json').write_text(json.dumps({'hf_advertised_context': 8192, 'current_supported_context': 8192}))
+    contract = valid_serving_contract()
+    path = doc / 'full_model/serving_contract.json'
+    path.write_text(json.dumps(contract))
+    env['MODEL_DIR'] = str(model)
+    gate = plugin / 'prompts/model_bringup_multigoal' / (stage + '.check.sh')
+    result = run('bash', str(gate), cwd=target, env=env)
+    assert result.returncode == 0, result.stderr + result.stdout
+    contract['rows'][0][field] = value
+    path.write_text(json.dumps(contract))
+    result = run('bash', str(gate), cwd=target, env=env)
+    assert result.returncode == 2, result.stderr
+    assert f'{field} must be one of' in result.stderr
+
+
 def test_standalone_tti_checker_resolves_package_and_rejects_stock_evidence(installed):
     plugin, target, env = installed
     assert (plugin / 'skills/tti-release/SKILL.md').is_file()
