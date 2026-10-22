@@ -62,13 +62,16 @@ def check_contract(data: Any, model_dir: Path) -> list[str]:
         label = f"rows[{index}] ({text(row.get('item')) or 'unnamed'})"
         if not text(row.get("item")):
             problems.append(f"{label}: item is missing")
-        if row.get("kind") not in KINDS:
+        # A list or object here is unhashable; the TypeError would exit 1
+        # (advisory) and let a malformed contract past the required gate.
+        kind = row.get("kind")
+        if not isinstance(kind, str) or kind not in KINDS:
             problems.append(f"{label}: kind must be one of {sorted(KINDS)}")
         status = row.get("status")
         if status == "missing":
             problems.append(f"{label}: missing row is unfinished full-model work")
             continue
-        if status not in STATUS_FIELDS:
+        if not isinstance(status, str) or status not in STATUS_FIELDS:
             problems.append(f"{label}: status must be one of {sorted(STATUS_FIELDS) + ['missing']}")
             continue
         for field in STATUS_FIELDS[status]:

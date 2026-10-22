@@ -176,6 +176,8 @@ def test_full_model_gate_accepts_valid_evidence_and_rejects_context_reduction(in
     (lambda c: c['rows'][0].pop('evidence'), 'requires evidence'),
     (lambda c: c['rows'].append({'item': 'hook', 'kind': 'call', 'status': 'plugin_owned',
                                  'record': 'doc/vllm_integration/plugin_changes.md'}), 'does not exist'),
+    (lambda c: c['rows'][0].update(kind=['request_feature']), 'kind must be one of'),
+    (lambda c: c['rows'][0].update(status={'name': 'supported'}), 'status must be one of'),
 ])
 def test_serving_contract_checker(tmp_path, mutate, message):
     checker = PLUGIN / 'scripts/check_serving_contract.py'
