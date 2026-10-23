@@ -132,6 +132,7 @@ Regenerate it after any re-vendor rather than editing by hand.
 | `tt-l1-memory-review` | `tenstorrent/tt_ops_code_gen` | `references/l1-footprint-discipline.md` | `e9c9417eee23` | mstaletovicTT |
 | `tt-l1-memory-review` | `tenstorrent/tt_ops_code_gen` | `skills/memory-budget-metal/SKILL.md` | `e9c9417eee23` | mstaletovicTT, astancovTT, wransom-TT |
 | `tt-l1-memory-review` | `tenstorrent/tt_ops_code_gen` | `references/ttnn-cb-memory-fundamentals.md` | `e9c9417eee23` | mstaletovicTT, astancovTT, wransom-TT, dstoiljkovicTT |
+| `tt-triage-review` | `tenstorrent/tt-metal` | `tools/triage/tt-triage.md` | `f83f3da72a38` | tt-vjovanovic, miacim, onenezicTT |
 | `tt-model-bringup-review` | `tenstorrent/tt-metal` | `.agents/skills/optimize/SKILL.md` | `d58cb341c703` | yieldthought |
 | `tt-model-bringup-review` | `tenstorrent/tt-metal` | `.agents/skills/functional-decoder/SKILL.md` | `d58cb341c703` | yieldthought |
 | `tt-model-bringup-review` | `tenstorrent/tt-buddy` | `knowledge/matmul.md` | `ba9021417442` | ppetrovicTT |

@@ -21,6 +21,7 @@ skills:
   - tenstorrent/skills/tt-model-bringup-review@0000000000000000000000000000000000000000
   - tenstorrent/skills/tt-multichip-ccl-review@0000000000000000000000000000000000000000
   - tenstorrent/skills/tt-test-coverage-review@0000000000000000000000000000000000000000
+  - tenstorrent/skills/tt-triage-review@0000000000000000000000000000000000000000
 
 safe-outputs:
   create-pull-request-review-comment:
