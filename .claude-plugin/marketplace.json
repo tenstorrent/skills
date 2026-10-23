@@ -23,7 +23,7 @@
     {
       "name": "tt-model-bringup",
       "source": "./plugins/tt-model-bringup",
-      "description": "Staged TTNN model bring-up with vLLM TT plugin serving; requires tt-autodebug. Codex runs add optional telemetry when tenstorrent/ar-dashboard is accessible."
+      "description": "Staged TTNN model bring-up with vLLM TT plugin serving; requires tt-autodebug. Codex multigoal runs default to full permissions and add optional telemetry when tenstorrent/ar-dashboard is accessible."
     },
     {
       "name": "tt-debug-tools",

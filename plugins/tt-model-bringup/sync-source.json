@@ -120,7 +120,7 @@
       "destination": "scripts/multigoal",
       "blob": "11ba52778be9b7d6e86483df6e77b270063c93fd",
       "source_sha256": "ef6e721f22958f5b99e22867370c20d4d9db8f87a16fce1cb7603693dcc1e4b8",
-      "packaged_sha256": "ef692f58bdcc034890e0e630b69e98f869c5204bae0a142478b9ccaf0db567f6"
+      "packaged_sha256": "207cdce13665b93018ca3c518d3b16b617bddce70c9af904a298a5c19df60c07"
     },
     {
       "source": ".agents/skills/datatype-sweep/SKILL.md",
@@ -288,7 +288,7 @@
       "destination": "tests/test_multigoal.py",
       "blob": "223fd6e354bd667d8e956269d556c756cad28bba",
       "source_sha256": "0b14f1f455d6ca03beb404f5bbb2fd5f5d42b1c685201e60ca4aea047d190f91",
-      "packaged_sha256": "e984891b1e201265826fe9ca62958caa8a38e529dd844d224fd0f0d726150ad8"
+      "packaged_sha256": "41e1b69a8e354a535a47612fbfec53d83bf2b8150d967cac0db9396e3f54bcc6"
     },
     {
       "source": "models/common/readiness_check/__init__.py",
