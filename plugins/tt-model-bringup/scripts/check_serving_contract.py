@@ -26,6 +26,8 @@ STATUS_FIELDS = {
     "not_supported": ("declaration", "reason"),
     "plugin_owned": ("record",),
 }
+# The only documented reasons a text model may decline prefix caching.
+PREFIX_CACHE_EXCLUSIONS = ("block_output", "recurrent_state")
 
 
 def slugify(hf_model: str) -> str:
@@ -80,6 +82,12 @@ def check_contract(data: Any, model_dir: Path) -> list[str]:
         if status == "plugin_owned" and text(row.get("record")):
             if not (model_dir / text(row["record"])).is_file():
                 problems.append(f"{label}: record {row['record']} does not exist under {model_dir}")
+        if text(row.get("item")) == "supports_prefix_caching" and status == "not_supported":
+            if not any(name in text(row.get("reason")) for name in PREFIX_CACHE_EXCLUSIONS):
+                problems.append(
+                    f"{label}: not_supported requires an exclusion reason naming one of "
+                    f"{list(PREFIX_CACHE_EXCLUSIONS)}; otherwise prefix caching is required model work"
+                )
     return problems
 
 

@@ -128,3 +128,27 @@ plugin commit, and rows with status `missing`.
 Only packaged hashes for three edited stage prompts, two edited check scripts, three edited
 skills and `contract_vllm.py` change in `sync-source.json`; the original import provenance
 stays intact.
+
+## Prefix caching and batched prefill (0.1.21)
+
+The skills gated prefix caching on "implemented and tested" without saying how to implement or
+test it, and nothing in the runtime exercised multi-row prefill; the readiness "batch prefill
+check" is a single-sequence all-position check. Served models therefore shipped with prefix
+caching either off or on without proof, and one shipped model returns corrupted text on repeated
+prefixes. Both features are now required for every text model, with two documented exclusions
+(`block_output`, `recurrent_state`) that the serving contract must name.
+
+`skills/vllm-integration/references/prefill-features.md` is authored in this plugin. It holds the
+continuation invariants a cache hit, a chunked continuation and a preemption resume share, the
+equal-length and packed-row batched-prefill designs, the warmup rule, the thresholds, and the
+negative controls. The generator contract gains a `start_pos` keyword on `prefill_forward` and a
+non-abstract `prefill_logits_continuation` driver. `runtime/readiness_check/run_prefill_resume_check.py`
+compares resumed prefill with full prefill over a position window and requires its `no_history`
+and `fresh_suffix` controls to fail. `run_vllm_server.py` gains `--enable-prefix-caching`,
+`--server-log`, the opt-in `prefix_cache` and `prefill_burst` stages, and writes
+`vllm_run_summary.json` on every run. `scripts/check_prefill_features.py` is authored in this
+plugin and runs last in the stage 9 and stage 10 gates; stage 10 passes `--require-burst`.
+
+Only packaged hashes for three edited stage prompts, two edited check scripts, six edited skills,
+`contract.py` and `run_vllm_server.py` change in `sync-source.json`; the original import
+provenance stays intact.

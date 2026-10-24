@@ -53,11 +53,16 @@ Read the pinned plugin's model interface guide (currently `docs/MODEL_INTERFACE.
   "documents_read": ["docs/MODEL_INTERFACE.md", "docs/MODEL_SETUP.md"],
   "rows": [
     {"item": "logprobs", "kind": "request_feature", "status": "supported", "evidence": "<test or artifact path>"},
-    {"item": "supports_prefix_caching", "kind": "capability", "status": "not_supported",
+    {"item": "supports_prefix_caching", "kind": "capability", "status": "supported",
+     "evidence": "readiness/prefill_resume_check.json"},
+    {"item": "batched_prefill", "kind": "call", "status": "supported", "evidence": "<batched-equals-solo test>"},
+    {"item": "supports_device_penalties", "kind": "capability", "status": "not_supported",
      "declaration": "<key and value, or documented default>", "reason": "<why the model does not implement it>"}
   ]
 }
 ```
+
+Prefix caching and batched prefill are required rows. `supports_prefix_caching` may be `not_supported` only for an exclusion named in [prefill features](../vllm-integration/references/prefill-features.md) (`block_output` or `recurrent_state`), and the `reason` must name it; the gate rejects any other reason.
 
 Add one row for each adapter call, `model_capabilities` declaration, and request feature that the plugin calls or tests, such as sampling parameters, seeds, logprobs, penalties, chunked prefill, prefix caching, and async decode. `kind` is `call`, `capability`, or `request_feature`. `status` is one of:
 
@@ -124,13 +129,14 @@ with a concrete generator class implementing `readiness_check.contract.Generator
 Expose both API levels with signatures along these lines:
 
 ```python
-def prefill_forward(tokens, *, page_table, kv_cache, prompt_lens, ...): ...
+def prefill_forward(tokens, *, page_table, kv_cache, prompt_lens, start_pos=None, ...): ...
 def decode_forward(tokens, start_pos, *, page_table, kv_cache, ...): ...
 def prefill_logits(prompt_token_ids): ...  # high-level, owns cache/page-table setup
+def prefill_logits_continuation(prompt_token_ids, start, *, positions=None, prefill_prefix=True): ...
 def generate(prompt_token_ids, max_new_tokens, *, next_input=None, enable_trace=True, **kwargs): ...
 ```
 
-The exact arguments can vary by model, but keep them keyword-friendly and explicit. `enable_trace` must be an explicit keyword on `generate`; accepting it only through `**kwargs` is not enough because the readiness teacher-forcing runner requires traced decode. The high-level `generate` path should be a thin deterministic loop over the low-level methods.
+`prefill_forward` takes several rows per call, each with its own absolute `start_pos` and absolute `prompt_lens` end, and computes `tokens[i, start_pos[i]:prompt_lens[i]]` at absolute cache and RoPE positions. That one path serves prefix-cache hits, chunked continuations, and preemption resumes; [prefill features](../vllm-integration/references/prefill-features.md) lists the invariants. `prefill_logits_continuation` is the high-level driver the resumed-prefill readiness check calls. The exact arguments can vary by model, but keep them keyword-friendly and explicit. `enable_trace` must be an explicit keyword on `generate`; accepting it only through `**kwargs` is not enough because the readiness teacher-forcing runner requires traced decode. The high-level `generate` path should be a thin deterministic loop over the low-level methods.
 
 Make cache ownership explicit. Standalone generation often owns its cache internally; serving or other external callers may need to pass an already-allocated cache and page table. Do not bake in assumptions that prevent either mode unless the project contract intentionally does so.
 
@@ -152,7 +158,7 @@ Compare full-model behavior against the HuggingFace reference with real weights.
 
 Run correctness from the smallest useful surface to the full gate. Start with a short smoke check on the reduced full-model probe when the all-layer gate is slow, then move to the complete all-layer model after the smoke check passes. If a test, prompt, or command fails, rerun that failing item directly while debugging; do not rerun the whole suite after every edit. Once the targeted failure is fixed, rerun the smoke check, then rerun the full all-layer correctness gate for final evidence.
 
-Include both batch-1 and larger-batch correctness coverage. Batch 1 is the primary latency target, but the model must still handle batch dimensions correctly. Add at least one batch >1 test for prefill, decode, cache/page-table indexing, token feedback, and output formatting; test up to batch 32 when the hardware and harness allow it.
+Include both batch-1 and larger-batch correctness coverage. Batch 1 is the primary latency target, but the model must still handle batch dimensions correctly. Add at least one batch >1 test for prefill, decode, cache/page-table indexing, token feedback, and output formatting; test up to batch 32 when the hardware and harness allow it. Two more tests are required here, because serving depends on them: a resumed-prefill test through `prefill_logits_continuation` (run `run_prefill_resume_check` and keep its output under `readiness/`), and a multi-row prefill test where one `prefill_forward` call carries rows of different lengths and the per-row outputs equal the single-row results. Implement `prefill_logits_continuation` in the generator; see [prefill features](../vllm-integration/references/prefill-features.md).
 
 For instruction/chat models, prefer a teacher-forcing reference generated from a normal chat-template prompt over raw book text. In tt-metal autoports, use the DeepSeek AIME24 prompt set rendered by the HF tokenizer chat template as the main readiness reference, for example:
 
@@ -249,6 +255,8 @@ Done means all of these are true and recorded:
 - selected block/decoder implementation and why;
 - model wrapper and generator contracts;
 - serving contract: pinned plugin and vLLM pair, and `doc/full_model/serving_contract.json` with no missing rows;
+- resumed prefill: `readiness/prefill_resume_check.json` from `run_prefill_resume_check` with every resume start passing and both negative controls failing, or the serving-contract exclusion that explains its absence;
+- batched prefill: batched-equals-solo evidence for mixed lengths and row orders, the warmup bucket list, and program-cache entry counts before and after the workload;
 - carried-forward decoder contract: weight/activation/KV/CCL dtype policy, tensor-group exceptions, and residual layout;
 - state-dict mapping, tied-embedding behavior if relevant, and real-weight loading behavior;
 - KV-cache, page-table or position handling, prompt lengths, and repeated decode reuse;

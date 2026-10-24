@@ -103,6 +103,18 @@ Return `more-work-needed` when evidence shows one of these:
 - serving evidence lacks the mixed-shape trace reuse check from
   `$vllm-integration`, including supported chunked-prefill paths with changed
   start positions and batch orderings while other requests decode;
+- `supports_prefix_caching` is not `supported` in the serving contract without
+  a documented exclusion (`block_output` or `recurrent_state`), or it is
+  declared `True` without `readiness/prefill_resume_check.json`,
+  `readiness_vllm/prefix_cache_check.json`, and sampling and qualitative
+  verdicts from the caching-enabled server; or a resume negative control did
+  not fail; or a greedy divergence after a
+  cache hit is recorded as drift without the logit-level comparison that
+  separates drift from a cache or position bug;
+- a vLLM stage has no batched-equals-solo prefill evidence or no
+  `prefill_burst` comparison against the serial path; in optimized-vLLM the
+  burst TTFT ratio misses its gate or single-user latency regressed with
+  batched prefill on;
 - logs or code show a plausible bug in a stage-critical subsystem, such as
   cache ownership, trace replay, token feedback, sampling, precision policy,
   page-table handling, or model output correctness;
@@ -202,6 +214,13 @@ For generation or serving stages, also inspect:
   switches, and advertised input/output limits.
 - serving contract for full-model: `doc/full_model/serving_contract.json` names
   the pinned plugin and vLLM pair and has no missing rows.
+- prefix-cache and batched-prefill evidence for vLLM stages:
+  `readiness_vllm/vllm_run_summary.json` shows the server enabled prefix
+  caching, `prefix_cache_check.json` passed with hit counters and TTFT, the
+  resume check's controls failed, and `vllm_prefill_burst_benchmark.json`
+  carries a `serial_reference`. Check that the evidence covers every layer kind
+  (sliding-window layers need the history snapshot) and that warmup covered the
+  prefill buckets the burst used.
 - serving-plugin and vLLM checkout state: every file changed outside the target
   tt-metal checkout. Each change in the plugin or vLLM checkout needs a complete
   `doc/vllm_integration/plugin_changes.md` entry under
@@ -211,6 +230,11 @@ For generation or serving stages, also inspect:
   When the only remedy for a finding is a plugin change that needs human
   authorization, set its `Required next step` to `human authorization` and name
   the `proposed` record; do not ask the stage owner to implement the change.
+  Treat a served-default change that only an operator can accept (for example a
+  generation-config override that keeps the default recipe on the device
+  sampler) the same way: `Required next step: operator decision`, with the
+  work-log record named. When every remaining finding is of these two kinds,
+  say so in the verdict so the stage can end `blocked` instead of looping.
 - declared `model_capabilities`: every key in `tt/generator_vllm.py` is
   documented by the pinned plugin, and each declared value has evidence.
 
