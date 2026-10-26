@@ -7259,6 +7259,23 @@ def test_an_explicit_check_prestage_is_used_unchanged_over_a_derived_one(env, tm
     assert "explicit-ran" in out and "derived" not in out and "seeded-static-failure" not in out
 
 
+def test_a_derived_check_prestage_exports_the_pytest_checks_env(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli
+    p, run, started = _derived_setup(env, tmp_path, monkeypatch)
+    monkeypatch.delenv("X", raising=False)
+    repo = tmp_path / "work"
+    git = ["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=t"]
+    (repo / "tests" / "test_env.py").write_text(
+        "import os\n\n\ndef test_needs_x():\n    assert os.environ.get('X') == '1', 'env-not-exported'\n")
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-qm", "env test"], check=True)
+    p.set_config("delivery.push_checks", [{"run": "python3 -m pytest -q tests", "env": {"X": "1"}}])
+    _seed_check_failure(p, 1, ["tests/test_env.py::test_needs_x"])
+    cli.main(["checks", "--detach"])
+    out = capsys.readouterr().out
+    assert "env-not-exported" not in out and "pre-stage passed" in out and len(started) == 1, out
+
+
 def test_check_output_batch_child_has_own_writable_directory(env, monkeypatch):
     from ttp import pushq
     command = ('test -n "$TTP_RUN_DIR"; test "$TTP_RUN_DIR" != /; '

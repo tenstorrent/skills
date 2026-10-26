@@ -572,6 +572,23 @@ def test_code_workers_try_to_break_their_change_before_the_hand_off():
         assert part in ref, part
 
 
+def test_harness_docs_describe_the_derived_check_prestage_as_on_by_default():
+    """Since the pre-stage is derived when delivery.check_prestage is unset, the harness docs no
+    longer call it opt-in and say what the derived one runs and how to turn it off."""
+    harness = SKILLS / "tt-project-harness"
+    row = next(line for line in (harness / "SKILL.md").read_text(encoding="utf-8").splitlines()
+               if line.startswith("| Checks pre-stage |"))
+    ref = " ".join((harness / "references" / "push-checks.md").read_text(encoding="utf-8").split())
+    ref = ref.partition("## Pre-stage before detached checks")[2].partition("## ")[0]
+    for text in (row, ref):
+        assert "off by default" not in text.lower() and "opt-in" not in text.lower()
+        assert "derive" in text and "`''` or `false` turns" in text
+    for part in ("On by default", "up to 10 tests", "over 14 days", "5 s or more", "pytest exit 5 passes",
+                 "pytest exits 3 and 4 never hold the checks back", "With no such history none runs",
+                 "daily audit", "An explicit `delivery.check_prestage` is used unchanged"):
+        assert part in ref, part
+
+
 def test_new_tests_for_an_area_go_in_its_case_file():
     """Area case files keep changes to different areas in different files, so pushes conflict less."""
     code = " ".join((PLUGIN / "template" / "prompts" / "kind-code.md").read_text(encoding="utf-8").split())

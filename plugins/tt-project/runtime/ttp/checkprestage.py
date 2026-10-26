@@ -128,8 +128,8 @@ def derived_command(ids: list[str], top: str) -> tuple[str, str] | None:
 
 def run_derived(p, ids: list[str], checks: list, top: str, env: dict, say, run_dir: str | Path | None = None) -> int:
     """Run the derived pre-stage `ids` as `run` does (0: start the full checks, 1: start nothing),
-    the way the project's pytest check among `checks` runs (push.check_argv: its venv, and its process
-    sandbox unless it opts out). No test selected passes, and a pytest internal or usage error never
+    the way the project's pytest check among `checks` runs (push.check_argv: its venv, its "env"
+    exports, and its process sandbox unless it opts out). No test selected passes, and a pytest internal or usage error never
     holds the full checks back; a failure is
     recorded for the daily audit (CAUGHT_KEY). Its test times go to DURATIONS in `run_dir`, so a
     test found slow there is left out next time."""
@@ -142,8 +142,10 @@ def run_derived(p, ids: list[str], checks: list, top: str, env: dict, say, run_d
     env = {**env, **pushpass.select_env(pattern, env)}
     if run_dir:
         env = {**env, **slowtests.env(Path(run_dir) / DURATIONS, env)}
-    isolate = getattr(pytest_check(checks), "sandbox", True) is not False
-    rc = run(shlex.join(push.check_argv(cmd, top, env, isolate)), top, env, say,
+    check = push.Check(cmd)   # with the project check's exports and sandbox opt-out
+    check.env = tuple(getattr(pytest_check(checks), "env", ()) or ())
+    check.sandbox = getattr(pytest_check(checks), "sandbox", True) is not False
+    rc = run(shlex.join(push.check_argv(check, top, env)), top, env, say,
              what="derived from this project's frequent check failures", ok=(0, NO_TESTS),
              cannot=(*SETUP, *CANNOT_RUN), shown=cmd)
     if rc:
