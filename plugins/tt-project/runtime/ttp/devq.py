@@ -686,16 +686,13 @@ def disk_full(cfg: dict, d: Path) -> str:
 
 def _readable(path: str, timeout: float = 20) -> str:
     """"" if `path` can be read here, else why. Asked in a child, so a hung mount costs `timeout`."""
-    try:
-        p = subprocess.Popen(["/bin/sh", "-c", 'test -r "$1"', "sh", path], stdin=subprocess.DEVNULL,
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-        rc = p.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        _kill_group(p.pid)
+    from . import boundedchild
+    res = boundedchild.run(["/bin/sh", "-c", 'test -r "$1"', "sh", path], timeout, stderr="devnull")
+    if res.timed_out:
         return f"no answer in {timeout:.0f} s (a hung mount?)"
-    except OSError as e:
-        return str(e)
-    return "" if rc == 0 else "missing or not readable"
+    if res.rc is None:
+        return res.error.removeprefix("could not start: ")
+    return "" if res.rc == 0 else "missing or not readable"
 
 
 def guard(d: Path, cfg: dict, spec: dict) -> tuple:

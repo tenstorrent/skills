@@ -771,27 +771,19 @@ def _done_wait(p, tid: int) -> tuple[int, str]:
 def _run_landed_probe(p, cmd: str, tid: int) -> tuple[int, str]:
     """delivery.landed_probe for task `tid`, run in the project root within FETCH_S: its exit 0 and 1
     as they are, anything else (a timeout, a missing command) CANNOT naming the key."""
-    try:
-        proc = subprocess.Popen(cmd.replace("{id}", str(int(tid))), shell=True, cwd=str(p.root),
-                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, start_new_session=True)
-    except OSError as e:
-        return CANNOT, f"delivery.landed_probe could not start: {e}"
-    try:
-        out, _ = proc.communicate(timeout=FETCH_S)
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(proc.pid, 9)
-        except OSError:
-            pass
-        proc.communicate()
+    from . import boundedchild
+    res = boundedchild.run(cmd.replace("{id}", str(int(tid))), FETCH_S, shell=True, cwd=str(p.root), stderr="stdout")
+    if res.timed_out:
         return CANNOT, f"delivery.landed_probe for #{tid} ran over {FETCH_S} s"
+    if res.rc is None:
+        return CANNOT, f"delivery.landed_probe {res.error}"
+    out = res.out
     tail = " ".join((out or "").strip().splitlines()[-1:])[:200]
-    if proc.returncode == 0:
+    if res.rc == 0:
         return 0, f"#{tid} landed (delivery.landed_probe)" + (f": {tail}" if tail else "")
-    if proc.returncode == NOT_YET:
+    if res.rc == NOT_YET:
         return NOT_YET, f"#{tid} has not landed yet (delivery.landed_probe)" + (f": {tail}" if tail else "")
-    return CANNOT, f"delivery.landed_probe for #{tid} exited {proc.returncode}" + (f": {tail}" if tail else "")
+    return CANNOT, f"delivery.landed_probe for #{tid} exited {res.rc}" + (f": {tail}" if tail else "")
 
 
 def _start(repo: Path, branch: str) -> str:

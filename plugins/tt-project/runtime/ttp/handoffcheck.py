@@ -22,8 +22,6 @@ import hashlib
 import json
 import os
 import shlex
-import signal
-import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -130,26 +128,15 @@ def _run_one(p: Project, check: dict, task: dict, path: Path) -> tuple[int | str
     env = dict(os.environ, TTP_RESULT_JSON=str(path), TTP_TASK_ID=str(task["id"]),
                TTP_TASK_KIND=str(task.get("kind") or "work"))
     cmd = check["run"].replace("{result}", shlex.quote(str(path)))
-    try:
-        proc = subprocess.Popen(cmd, shell=True, cwd=str(p.root), env=env, stdin=subprocess.DEVNULL,
-                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
-    except OSError as e:
-        return f"error: {e}", ""
-    try:
-        out, _ = proc.communicate(timeout=check["timeout_s"])
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)   # its own session: only what this check started
-        except OSError:
-            pass
-        try:
-            out, _ = proc.communicate(timeout=KILL_WAIT_S)
-        except subprocess.TimeoutExpired as e:   # a child that left the session still holds the pipe
-            out = e.output
-            if proc.stdout:
-                proc.stdout.close()
-        return "timeout", _tail((out or b"").decode(errors="replace"))
-    return proc.returncode, _tail((out or b"").decode(errors="replace"))
+    from . import boundedchild
+    res = boundedchild.run(cmd, check["timeout_s"], shell=True, cwd=str(p.root), env=env, text=False,
+                           stderr="stdout", grace=KILL_WAIT_S)
+    out = _tail(res.out.decode(errors="replace"))
+    if res.timed_out:
+        return "timeout", out
+    if res.rc is None:
+        return f"error: {res.error.removeprefix('could not start: ')}", ""
+    return res.rc, out
 
 
 def run(p: Project, cfg: dict, task: dict, handoff, run_dir: Path | None) -> dict:

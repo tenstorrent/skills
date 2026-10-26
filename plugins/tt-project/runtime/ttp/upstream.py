@@ -64,7 +64,6 @@ import json
 import os
 import re
 import shlex
-import signal
 import sqlite3
 import subprocess
 import sys
@@ -1670,26 +1669,18 @@ def ssh_pipe(target: str, args: str, data: bytes, timeout: float) -> tuple[bytes
     (its output, "") or (None, what went wrong). A hung ssh is killed with everything it started
     when `timeout` runs out. Shared by the notes forwarder and the global spend push (globalcap)."""
     cmd = f"t=~/.tt-project/lib/current/bin/ttp; [ -x \"$t\" ] || t=ttp; exec \"$t\" {args}"
-    try:
-        proc = subprocess.Popen([*SSH, "-o", "StrictHostKeyChecking=yes",
-                                 "-o", "ControlMaster=no", "-o", "ControlPath=none", "--", target, f"sh -c {shlex.quote(cmd)}"],
-                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                start_new_session=True)
-    except OSError as e:
-        return None, f"ssh did not start: {e}"
-    try:
-        out, err = proc.communicate(data, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except OSError:
-            pass
-        proc.communicate()
+    from . import boundedchild
+    res = boundedchild.run([*SSH, "-o", "StrictHostKeyChecking=yes", "-o", "ControlMaster=no",
+                            "-o", "ControlPath=none", "--", target, f"sh -c {shlex.quote(cmd)}"],
+                           timeout, input=data, text=False)
+    if res.timed_out:
         return None, f"no answer within {timeout:.0f} s"
-    if proc.returncode != 0:
-        tail = " ".join(err.decode(errors="replace").split())[-200:]
-        return None, f"exit {proc.returncode}: {tail}"
-    return out, ""
+    if res.rc is None:
+        return None, f"ssh did not start: {res.error.removeprefix('could not start: ')}"
+    if res.rc != 0:
+        tail = " ".join(res.err.decode(errors="replace").split())[-200:]
+        return None, f"exit {res.rc}: {tail}"
+    return res.out, ""
 
 
 def _ssh_receive(target: str, lines: list[bytes], timeout: float) -> tuple[dict | None, str]:

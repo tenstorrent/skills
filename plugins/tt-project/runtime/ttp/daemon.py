@@ -429,23 +429,12 @@ def _scan_ok(d: Path, nets: list[Path]) -> bool:
 
 
 def _run_bounded(cmd: list[str], timeout: float) -> tuple[bytes, bool]:
-    """stdout of `cmd` and whether it finished within `timeout`. On timeout its process group is
-    killed and we wait at most 2 s more, so a child stuck in D state never blocks the caller."""
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
-                            start_new_session=True)
-    try:
-        out, _ = proc.communicate(timeout=max(timeout, 1))
-        return out or b"", True
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except OSError:
-            pass
-        try:
-            out, _ = proc.communicate(timeout=2)
-        except subprocess.TimeoutExpired:
-            out = b""   # left to the kernel; its pipe is dropped, never waited on
-        return out or b"", False
+    """stdout of `cmd` and whether it finished within `timeout`. It runs through boundedchild: on timeout
+    its process group is killed and waited for about 2 s more at most, so a child stuck in D state never
+    blocks the caller."""
+    from . import boundedchild
+    res = boundedchild.run(cmd, max(timeout, 1), text=False, stderr="devnull", grace=1)
+    return res.out, res.rc is not None and res.rc >= 0   # killed by a signal: not finished
 
 
 def _du(args: list[str], timeout: float) -> tuple[dict[str, int], bool]:

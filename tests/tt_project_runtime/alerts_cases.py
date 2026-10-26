@@ -1787,6 +1787,32 @@ def test_pr_watch_leaves_no_gh_process_behind_at_its_deadline(env, monkeypatch, 
     assert len(pids.read_text().split()) == 4 and _all_gone(pids)
 
 
+def test_pr_watch_runs_gh_through_boundedchild_and_a_hung_one_hits_its_deadline_unread(env, monkeypatch, tmp_path):
+    """Each gh call goes through boundedchild, so a hung gh is cut at the run's deadline with its whole
+    group: that PR is reported not checked and nothing of it is recorded as read; the other PR is."""
+    from ttp import boundedchild, watchers
+    from ttp.daemon import Daemon
+    p, urls, pids = _fake_gh_prs(env, monkeypatch, tmp_path, 2, "2")
+    calls, real = [], boundedchild.run
+
+    def spy(argv, timeout, **kw):
+        res = real(argv, timeout, **kw)
+        calls.append((argv[3] if argv[:3] == ["gh", "pr", "view"] else argv[1], res))
+        return res
+    monkeypatch.setattr(boundedchild, "run", spy)
+    t0 = time.monotonic()
+    status = watchers.run_builtin(Daemon(p.base), "prs", {"deadline_s": 1.5, "gh_timeout_s": 20,
+                                                          "pr_timeout_s": 30, "pr_workers": 2})
+    assert time.monotonic() - t0 < 6
+    assert status.startswith("cut short (1 of 2") and "acme/widgets#2 (deadline)" in status, status
+    hung = [res for what, res in calls if what == urls[1]]
+    assert len(hung) == 1 and hung[0].timed_out and hung[0].rc is None, calls
+    assert any(what == urls[0] and res.rc == 0 for what, res in calls)
+    seen = p.db.kv("pr_signatures", {})
+    assert urls[0] in seen and urls[1] not in seen, "the hung PR is unchecked, never read"
+    assert _all_gone(pids), "the hung gh and its child were killed with their group"
+
+
 @pytest.mark.parametrize("where", ["payload", "config"])
 def test_pr_watch_reports_a_pr_whose_gh_call_timed_out_before_its_per_pr_timeout(env, monkeypatch, tmp_path, where):
     """The default ratio (a gh call's timeout below the PR's): a hung call times out on its own, the

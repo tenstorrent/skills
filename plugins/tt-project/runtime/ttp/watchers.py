@@ -35,8 +35,6 @@ import json
 import os
 import re
 import contextvars
-import subprocess
-import signal
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
@@ -170,54 +168,36 @@ def run_builtin(daemon, name: str, payload: dict) -> str:
 def _gh(args: list[str], cwd: str) -> dict | None:
     """gh's JSON answer, or None. Its timeout is the running builtin's per-call one, cut to the time
     left before its deadline; past the deadline or once its schedule run was stopped it is not called.
-    gh runs in a process group of its own, killed whole at the timeout, and known to the schedule run
-    while it lives (schedrun.track), so a daemon stop kills it too. A call that timed out is told to
-    _read_pr (_TIMED_OUT)."""
+    gh runs through boundedchild, in a process group of its own killed whole at the timeout, and known
+    to the schedule run while it lives (schedrun.track), so a daemon stop kills it too. A call that timed
+    out is told to _read_pr (_TIMED_OUT)."""
     left, b, run = _left(), _BOUND.get(), _RUN.get()
     timeout = GH_TIMEOUT_S if b is None else min(b[1], left)
     if timeout <= 0 or (run is not None and run.stopping.is_set()):
         return None
+    from . import boundedchild, schedrun
+    pids: list[int] = []
+
+    def started(pid: int) -> bool:   # stopped while it started: the helper kills it
+        pids.append(pid)
+        return run is None or schedrun.track(run, pid)
+
     try:
-        proc = subprocess.Popen(["gh", *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                cwd=cwd, stdin=subprocess.DEVNULL, start_new_session=True)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    from . import schedrun
-    if run is not None and not schedrun.track(run, proc.pid):   # stopped while it started: killed
-        _kill_group(proc)
-        run.groups.pop(proc.pid, None)
-        return None
-    try:
-        out, _ = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        _kill_group(proc)
+        res = boundedchild.run(["gh", *args], timeout, cwd=cwd, on_start=started)
+    finally:
+        if run is not None and pids:
+            run.groups.pop(pids[0], None)
+    if res.timed_out:
         timed = _TIMED_OUT.get()
         if timed is not None:
             timed.append(timeout)
         return None
-    except BaseException:
-        _kill_group(proc)
-        raise
-    finally:
-        if run is not None:
-            run.groups.pop(proc.pid, None)
-    if proc.returncode != 0:
+    if res.rc != 0:
         return None
     try:
-        return json.loads(out)
+        return json.loads(res.out)
     except ValueError:
         return None
-
-
-def _kill_group(proc: subprocess.Popen) -> None:
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except OSError:
-        pass
-    try:
-        proc.communicate(timeout=5)
-    except subprocess.TimeoutExpired:   # a child that left the group still holds the pipes
-        pass
 
 
 TTP_MARKER = "<!-- ttp -->"

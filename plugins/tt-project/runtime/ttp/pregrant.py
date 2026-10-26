@@ -19,8 +19,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import signal
-import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,27 +56,14 @@ def check(cmd: str, root: Path | str, resource: str, task: str | int | None = ""
     recorded under `state` (record_fault) when given."""
     task = "" if task is None else str(task)
     env = {**os.environ, "TTP_RESOURCE": resource, "TTP_TASK_ID": task}
-    rc, out = None, ""
-    try:
-        proc = subprocess.Popen(["/bin/sh", "-c", cmd + ' "$@"', "pre-grant-check", resource, task], cwd=str(root),
-                                env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                start_new_session=True)
-    except OSError as e:
-        out = f"could not start: {e}"
-    else:
-        try:
-            raw, _ = proc.communicate(timeout=timeout)
-            rc, out = proc.returncode, raw.decode(errors="replace")
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)   # its own session: only what this check started
-            except OSError:
-                pass
-            try:
-                proc.communicate(timeout=2)
-            except subprocess.TimeoutExpired:   # a child that left its session keeps the pipe: not waited for
-                pass
-            out = f"no answer within {timeout:g} s"
+    from . import boundedchild
+    res = boundedchild.run(["/bin/sh", "-c", cmd + ' "$@"', "pre-grant-check", resource, task], timeout,
+                           cwd=str(root), env=env, text=False, stderr="stdout", grace=2)
+    rc, out = res.rc, res.out.decode(errors="replace")
+    if res.timed_out:
+        out = f"no answer within {timeout:g} s"
+    elif rc is None:
+        out = res.error
     said = next((ln.strip() for ln in out.splitlines() if ln.strip()), "")[:200]
     if rc == 0:
         return Answer(True, 0, False, f"{resource}: pre-grant check granted")
