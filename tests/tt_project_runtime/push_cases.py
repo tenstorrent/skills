@@ -7121,6 +7121,144 @@ def test_check_output_missing_or_invalid_fails_closed(env, monkeypatch, value):
         push.check_env('target')
 
 
+def _derived_setup(env, tmp_path, monkeypatch, prestage=None):
+    """A checks repo whose project's own checks run pytest and whose tests/test_seed.py has a static
+    failure; delivery.check_prestage is `prestage` (None: unset); the detached launch is recorded."""
+    p, run, started = _prestage_setup(env, tmp_path, monkeypatch, prestage)
+    for var in ("PYTEST_ADDOPTS", "TTP_PYTEST_RESUME", "TTP_PYTEST_DURATIONS", "TTP_PYTEST_SELECT"):
+        monkeypatch.delenv(var, raising=False)   # the outer suite's plugins never reach the pre-stage
+    repo = tmp_path / "work"
+    git = ["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=t"]
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_seed.py").write_text(
+        "def test_static_guard():\n    assert 0, 'seeded-static-failure'\n\n\n"
+        "def test_fine():\n    pass\n\n\ndef test_slow_one():\n    assert 0, 'slow-test-ran'\n")
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-qm", "tests"], check=True)
+    p.set_config("delivery.push_checks", ["python3 -m pytest -q tests"])
+    return p, run, started
+
+
+def _seed_check_failure(p, rid, ids, detached=True, age_s=0.0, durations=None):
+    """Run `rid`'s directory as a `ttp checks` run left it: its failure naming `ids` and, once it
+    detached, the pid file; `durations` its slowest tests ({id: seconds})."""
+    from ttp import cli, checkprestage, slowtests
+    d = p.runs / str(rid)
+    d.mkdir(parents=True, exist_ok=True)
+    out = "".join(f"FAILED {i} - AssertionError\n" for i in ids) + f"{len(ids)} failed in 0.5s\n"
+    f = d / checkprestage.FAILURE
+    f.write_text(json.dumps({"kind": "check_failed", "purpose": "candidate", "output": out}))
+    if detached:
+        (d / cli.CHECKS_PID).write_text("{}")
+    if durations:
+        (d / slowtests.FILE).write_text(json.dumps({"tests": [{"id": i, "s": s} for i, s in durations.items()]}))
+    if age_s:
+        t = time.time() - age_s
+        os.utime(f, (t, t))
+
+
+SEED = "tests/test_seed.py::test_static_guard"
+
+
+def test_a_derived_check_prestage_catches_a_frequent_failure_before_detaching(env, tmp_path, monkeypatch, capsys):
+    from ttp import audit, checkprestage, cli
+    p, run, started = _derived_setup(env, tmp_path, monkeypatch)
+    for rid in (1, 2):
+        _seed_check_failure(p, rid, [SEED])
+    _seed_check_failure(p, 3, ["tests/test_seed.py::test_fine"])
+    assert checkprestage.derive(p.runs) == [SEED, "tests/test_seed.py::test_fine"], "most distinct runs first"
+    with pytest.raises(SystemExit) as failed:
+        cli.main(["checks", "--detach"])
+    out = capsys.readouterr().out
+    assert failed.value.code == 1 and not started, "caught in the foreground: nothing detached"
+    assert f"derived from this project's detached checks failures (delivery.check_prestage unset): {SEED}" in out
+    assert "seeded-static-failure" in out and "NOT started" in out and "slow-test-ran" not in out
+    line = checkprestage.audit_line(p.db, time.time() - 86400)
+    assert SEED in line and "caught 1 failure(s) before detaching (1 wake(s) saved)" in line
+    assert any(x == line for x in audit.lines(p.db))
+
+
+def test_a_derived_check_prestage_leaves_out_a_test_recorded_over_5_s(env, tmp_path, monkeypatch, capsys):
+    from ttp import checkprestage, cli, slowtests
+    p, run, started = _derived_setup(env, tmp_path, monkeypatch)
+    slow, quick = "tests/test_seed.py::test_slow_one", "tests/test_seed.py::test_fine"
+    _seed_check_failure(p, 1, [slow, quick], durations={slow: 6.0, quick: 4.9})
+    _seed_check_failure(p, 2, [slow])
+    assert checkprestage.derive(p.runs) == [quick]
+    cli.main(["checks", "--detach"])
+    out = capsys.readouterr().out
+    assert len(started) == 1 and "slow-test-ran" not in out and "pre-stage passed" in out
+    # The pre-stage times its own tests: one found slow there is left out next time.
+    times = run / checkprestage.DURATIONS
+    assert [i for i, _ in slowtests.load(times)] == [quick]
+    later = p.runs / "9" / checkprestage.DURATIONS   # a run's directory is under the project's runs
+    later.parent.mkdir()
+    later.write_text(json.dumps({"tests": [{"id": quick, "s": 5.0}]}))
+    assert checkprestage.derive(p.runs) == []
+
+
+def test_a_derived_check_prestage_id_that_no_longer_exists_never_fails_it(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli
+    p, run, started = _derived_setup(env, tmp_path, monkeypatch)
+    gone = ["tests/test_seed.py::test_renamed_away", "tests/test_deleted.py::test_x",
+            "tests/test_seed.py::test_fine[gone-param]"]
+    _seed_check_failure(p, 1, gone)
+    cli.main(["checks", "--detach"])   # nothing selected (pytest exit 5): a pass
+    out = capsys.readouterr().out
+    assert len(started) == 1 and "pre-stage passed" in out and "not found" not in out
+    # A stale id beside a live failing one: the live one still runs and is caught (pytest refuses a
+    # whole run naming one missing id).
+    _seed_check_failure(p, 2, [*gone, SEED])
+    with pytest.raises(SystemExit):
+        cli.main(["checks", "--detach"])
+    assert len(started) == 1 and "seeded-static-failure" in capsys.readouterr().out
+    # Every derived file gone: no pre-stage, the full checks start.
+    for rid in (1, 2):
+        _seed_check_failure(p, rid, ["tests/test_deleted.py::test_x"])
+    cli.main(["checks", "--detach"])
+    assert len(started) == 2 and "none of the derived tests' files exist" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("off", ["", False], ids=["empty", "false"])
+def test_an_explicit_empty_check_prestage_turns_the_derived_one_off(env, tmp_path, monkeypatch, capsys, off):
+    from ttp import cli, project
+    p, run, started = _derived_setup(env, tmp_path, monkeypatch, off)
+    _seed_check_failure(p, 1, [SEED])
+    cli.main(["checks", "--detach"])
+    out = capsys.readouterr().out
+    assert len(started) == 1 and "pre-stage" not in out and "seeded-static-failure" not in out
+    assert not project.config_problems({"delivery": {"check_prestage": off}})
+
+
+def test_no_check_failure_history_means_no_derived_check_prestage(env, tmp_path, monkeypatch, capsys):
+    from ttp import checkprestage, cli
+    p, run, started = _derived_setup(env, tmp_path, monkeypatch)
+    # Older than the window, or a failure of foreground checks only: no history.
+    _seed_check_failure(p, 1, [SEED], age_s=checkprestage.DERIVE_WINDOW_S + 3600)
+    _seed_check_failure(p, 2, [SEED], detached=False)
+    cli.main(["checks", "--detach"])
+    out = capsys.readouterr().out
+    assert len(started) == 1 and "none in the last 14 days, so none runs" in out
+    assert "seeded-static-failure" not in out and "pre-stage passed" not in out
+    assert checkprestage.audit_line(p.db, 0) == "derived check pre-stage: 0 test(s); caught 0 failure(s) " \
+        "before detaching (0 wake(s) saved)"
+    # A project whose checks run no pytest here gets none, and says nothing of it.
+    p.set_config("delivery.push_checks", ["true"])
+    _seed_check_failure(p, 3, [SEED])
+    cli.main(["checks", "--detach"])
+    assert len(started) == 2 and "pre-stage" not in capsys.readouterr().out
+
+
+def test_an_explicit_check_prestage_is_used_unchanged_over_a_derived_one(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli
+    p, run, started = _derived_setup(env, tmp_path, monkeypatch, "echo explicit-ran")
+    _seed_check_failure(p, 1, [SEED])
+    cli.main(["checks", "--detach"])
+    out = capsys.readouterr().out
+    assert len(started) == 1 and "pre-stage 'echo explicit-ran' (delivery.check_prestage" in out
+    assert "explicit-ran" in out and "derived" not in out and "seeded-static-failure" not in out
+
+
 def test_check_output_batch_child_has_own_writable_directory(env, monkeypatch):
     from ttp import pushq
     command = ('test -n "$TTP_RUN_DIR"; test "$TTP_RUN_DIR" != /; '

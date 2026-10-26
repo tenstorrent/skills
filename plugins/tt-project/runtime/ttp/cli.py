@@ -2449,15 +2449,20 @@ def cmd_checks(a) -> None:
         try:
             checkdirs.writable(run_dir)
             # The project's short pre-stage runs first, in the foreground (checkprestage): its failure
-            # starts nothing, so it is fixed in this run, not after the whole detached suite.
+            # starts nothing, so it is fixed in this run, not after the whole detached suite. Unset, it is
+            # derived from the project's frequent detached checks failures (checkprestage.derived).
+            say = lambda m: print(f"ttp checks: {m}", flush=True)
+            pre = d.get(checkprestage.KEY)
             if purpose == "candidate" and not harness_unset and not getattr(a, "no_prestage", False) \
-                    and d.get(checkprestage.KEY) is not None and not _checks_owner(Path(run_dir), top, purpose):
-                pre_env = {**push.check_env("checks"), "PWD": top, **venv_vars}
-                if why := _prestage_skip(a, p, top, head, tree, cmds, own, vpy, purpose):
-                    print(f"ttp checks: pre-stage (delivery.{checkprestage.KEY}) skipped: {why}", flush=True)
-                elif checkprestage.run(d.get(checkprestage.KEY), top, pre_env,
-                                     lambda m: print(f"ttp checks: {m}", flush=True)):
-                    sys.exit(1)
+                    and not _checks_owner(Path(run_dir), top, purpose):
+                ids = checkprestage.derived(p, own, say) if pre is None else None
+                if pre is not None or ids:
+                    pre_env = {**push.check_env("checks"), "PWD": top, **venv_vars}
+                    if why := _prestage_skip(a, p, top, head, tree, cmds, own, vpy, purpose):
+                        print(f"ttp checks: pre-stage (delivery.{checkprestage.KEY}) skipped: {why}", flush=True)
+                    elif checkprestage.run(pre, top, pre_env, say) if pre is not None else \
+                            checkprestage.run_derived(p, ids, own, top, pre_env, say, run_dir):
+                        sys.exit(1)
             _checks_detach(a, Path(run_dir), p, top, head)
         except OSError as e:
             die(f"ttp checks: {e}")

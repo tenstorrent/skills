@@ -29,6 +29,8 @@ the project could have saved. Model-free; the review grades it.
   as 'confirmed by quiet' in the window;
 - over 7 days, each Restrictions item that only blocked work: blocked runs and asks citing it reached
   `review.rule_blocks_min` while no refused action cited it (restriction_audit.only_blocks_lines).
+- the check pre-stage derived from frequent detached checks failures (checkprestage): its last list
+  and the failures it caught before detaching (each a worker wake saved).
 
 An empty day is one line, NOTHING. `ttp audit` prints the same lines, or `report` as JSON. It reads
 only the project's own database and harness files."""
@@ -38,7 +40,7 @@ import json
 import time
 from typing import Any
 
-from . import budget, chaincap, correction, ends, obligations, quietgate, reviewstats, schedule, sharedchecks, suitecost, sweepskip, turngate, unblock, upstream
+from . import budget, chaincap, checkprestage, correction, ends, obligations, quietgate, reviewstats, schedule, sharedchecks, suitecost, sweepskip, turngate, unblock, upstream
 from .db import DB, continues_id
 from .project import Project
 
@@ -338,6 +340,8 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
         out.append(shared)
     if suite := suitecost.audit_line(db, now):
         out.append(suite)
+    if pre := checkprestage.audit_line(db, since):
+        out.append(pre)
     turns = coordinator_turns(db, since)
     if turns["n"]:
         noop = (f"{turns['noop']} decided nothing (${turns['noop_usd']:.2f})" if turns["logged"] else
