@@ -2231,8 +2231,13 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                      "`permanent` contradict each other; give one")
                 if old and not end and a.get("permanent") is not True:
                     end = p.superseded_end([str(n) for n in old])   # a temporary entry never turns permanent
+                audience, room = a.get("audience"), ""
+                if not old:   # a merge keeps its audience: checked once the replaced entries are gone
+                    audience, room = plan_memory_audience(p, text, a.get("memory_kind") or "fact",
+                                                          a.get("standing") is True, audience, a.get("title"),
+                                                          key, end)
                 added = p.add_memory(text, kind=a.get("memory_kind") or "fact", title=a.get("title"), key=key,
-                                     end=end, standing=a.get("standing") is True, audience=a.get("audience"))
+                                     end=end, standing=a.get("standing") is True, audience=audience)
                 if (a.get("memory_kind") or "") == "restriction":
                     _tell_running_workers(db, f"New binding restriction: {a['text'].strip()}", key)
                 for name in old:
@@ -2242,6 +2247,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                             f"shortened into [{added.stem}]" if a.get("standing") is True else None))
                     except ValueError as e:
                         raise ValueError(f"memory added, but `supersedes` failed: {e}") from None
+                if room := room or (worker_room_after(p, added.stem) if old else ""):
+                    notes.append(f"memory_add: warning: {room}")
                 memory_budget_check(p)
             elif t == "memory_forget":
                 p.forget_memory(str(a.get("name") or ""), why=a.get("why"))
@@ -3635,6 +3642,67 @@ def worker_pinned_total(p: Project) -> tuple[str, str]:
     total = (f"pinned worker memory: {use['pinned_chars']} of {use['memory_limit']} chars "
              f"({use['pinned']} entr{'y' if use['pinned'] == 1 else 'ies'})")
     return total, worker_pinned_line(p, use)
+
+
+# Kinds a new entry with no audience is stored for the coordinator alone as, once workers' pinned memory
+# has no room for it (plan_memory_audience): one-off notes, never a rule, a resource or a standing entry.
+REROUTED_MEMORY_KINDS = ("decision", "fact")
+
+
+def worker_room_warning(p: Project, new: dict, entries: list[dict], largest: int = 3) -> str:
+    """A warning once memory entry `new`, among the live `entries` (it included), is one workers see
+    (project.worker_memory) and the memory pinned for workers, `new` counted in whether pinned or not,
+    takes more than the room worker prompts leave it (prompts.worker_context's `memory_limit`), naming
+    that room, the new total and the `largest` entries workers see; else ""."""
+    from .project import worker_memory
+    from .prompts import worker_context
+    if not worker_memory(new):
+        return ""
+    use = worker_context(p, entries=entries)[2]
+    pinned = [e for e in entries if worker_memory(e) == 1]
+    total = use["pinned_chars"] + (0 if worker_memory(new) == 1 else len(new["line"]) + 1)
+    if total <= use["memory_limit"]:
+        return ""
+    seen = pinned + ([] if worker_memory(new) == 1 else [new])
+    big = sorted(seen, key=lambda e: -len(e["line"]))[:largest]
+    return (f"pinned worker memory would take {total} chars with [{new['name']}] ({len(new['line']) + 1} chars), "
+            f"over the {use['memory_limit']} chars of room worker prompts leave it; largest entries workers see: "
+            + ", ".join(f"{e['name']} ({len(e['line']) + 1} chars)" for e in big))
+
+
+def plan_memory_audience(p: Project, text: str, kind: str = "fact", standing: bool = False,
+                         audience: str | None = None, title: str | None = None, key: str | None = None,
+                         end: dict | None = None, without=()) -> tuple[str | None, str]:
+    """Before a memory add (Project.add_memory's arguments): (the audience to store it with, a warning
+    or ""). A warning (worker_room_warning) once the entry would push the memory pinned for workers past
+    its room. A non-standing REROUTED_MEMORY_KINDS entry with no `audience` is then stored for the
+    coordinator alone, and the warning says so; a given one ("default" too) is kept and only warned
+    about. `without`: names of entries the same write retires. Raises add_memory's refusal (forbidden
+    data) before anything is written."""
+    from .ends import describe
+    path = p.add_memory(text, kind=kind, title=title, key=key, end=end, standing=standing, audience=audience,
+                        dry_run=True)
+    kind = "preference" if standing and kind not in PINNED_MEMORY_KINDS else kind
+    ends = (" (standing)" if standing else "") + (f" ({describe(end, p)})" if end else "")
+    new = {"name": path.stem, "kind": kind, "line": f"[{path.stem}] {text.strip()}{ends}", "end": end,
+           "body": text.strip(), "standing": standing, "audience": audience or "", "created": ""}
+    warn = worker_room_warning(p, new, [e for e in p._memory_entries() if e["name"] not in {new["name"], *without}] + [new])
+    if not warn:
+        return audience, ""
+    if not audience and not standing and kind in REROUTED_MEMORY_KINDS:
+        return "coordinator", (f"{warn}; stored for the coordinator only (audience coordinator), as a one-off "
+                               f"{kind} with no audience; give audience workers to keep it for workers")
+    return audience, (f"{warn}; stored as given (only a one-off decision or fact with no audience is "
+                      f"re-routed); merge or shorten entries workers see, or store this one with audience "
+                      f"coordinator")
+
+
+def worker_room_after(p: Project, name: str) -> str:
+    """After a memory write that merged entries (no audience is changed then): worker_room_warning
+    for the entry `name` as memory/ now stands, else ""."""
+    entries = p._memory_entries()
+    new = next((e for e in entries if e["name"] == name), None)
+    return worker_room_warning(p, new, entries) if new else ""
 
 
 def coordinator_pinned_total(p: Project, largest: int = 3) -> tuple[str, str]:

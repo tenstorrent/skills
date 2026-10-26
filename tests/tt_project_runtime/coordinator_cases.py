@@ -16348,3 +16348,114 @@ def test_a_clipped_information_only_refusal_keeps_its_mark():
     cut = coord.clip_rejection(long)
     assert coord.informational_rejection(cut) and len(cut) <= 500 + len(coord.INFO_MARK) + 1
     assert coord.clip_rejection("task_update: no task " + "y" * 900) == ("task_update: no task " + "y" * 900)[:500]
+
+
+def _fill_worker_room(p, short: int):
+    """Entries for workers that leave `short` chars of the room worker prompts give pinned memory."""
+    from ttp.prompts import worker_context
+    room = worker_context(p)[2]["memory_limit"]
+    paths, used = [], 0
+    while room - used - short > 0:
+        n = min(900, room - used - short - 14)
+        if n < 30:
+            break
+        path = p.add_memory("RULE " + "r" * n, kind="decision", title=f"rule {len(paths)}", audience="workers")
+        paths.append(path)
+        used = worker_context(p)[2]["pinned_chars"]
+    assert 0 < room - used <= short + 60, (room, used)
+    return paths
+
+
+def test_memory_cli_warns_once_a_new_entry_workers_see_overflows_their_pinned_room_and_reroutes_one_offs(env, capsys):
+    """`ttp memory` adding an entry workers see warns once it takes the memory pinned for workers past
+    the room worker_context gives it, naming that room, the new total and the largest entries workers
+    see. A one-off decision or fact with no --audience is then stored for the coordinator alone; an
+    explicit audience (workers or default), a standing entry and other kinds are kept and only warned
+    about. Under the room: no warning and no re-route."""
+    p = make(env)
+    from ttp import cli
+    from ttp.prompts import worker_context
+    _fill_worker_room(p, 400)
+    room = worker_context(p)[2]["memory_limit"]
+    capsys.readouterr()
+
+    def add(text, *argv):
+        cli.main(["memory", "demo", text, *argv])
+        out = capsys.readouterr()
+        e = p._memory_entries()[-1]
+        assert e["body"] == text, e
+        return e, out.err
+
+    # (e) Under the room: stored as given, no warning.
+    e, err = add("Workers run the short suite first.", "--kind", "fact")
+    assert e["audience"] == "" and "warning" not in err, err
+    e, err = add("Workers keep the lock for one command.", "--kind", "decision", "--audience", "workers")
+    assert e["audience"] == "workers" and "warning" not in err, err
+    big = "Workers note: " + "w" * 600
+    # (a) + (c) A one-off fact or decision with no audience past the room: warned and re-routed.
+    for kind in ("fact", "decision"):
+        e, err = add(f"{big} {kind}", "--kind", kind)
+        assert e["audience"] == "coordinator" and e["kind"] == kind, e
+        total = worker_context(p)[2]["pinned_chars"] + len(e["line"]) + 1
+        assert f"warning: pinned worker memory would take {total} chars with [{e['name']}] " in err, err
+        assert f"over the {room} chars of room worker prompts leave it; largest entries workers see: decision-rule-" in err
+        assert "stored for the coordinator only (audience coordinator)" in err, err
+    # (d) An explicit audience is kept and only warned about.
+    for aud, stored in (("workers", "workers"), ("default", "")):
+        before = worker_context(p)[2]["pinned_chars"]
+        e, err = add(f"{big} {aud}", "--kind", "fact", "--audience", aud)
+        assert e["audience"] == stored, e
+        assert "warning: pinned worker memory would take " in err and "stored as given" in err, err
+        assert "coordinator only" not in err
+        if aud == "workers":
+            assert f"would take {before + len(e['line']) + 1} chars" in err, err
+    # (f) A standing entry and other kinds are never re-routed.
+    for argv in (("--kind", "fact", "--standing"), ("--kind", "decision", "--standing"), ("--kind", "resource"),
+                 ("--kind", "preference", "--standing")):
+        e, err = add(f"{big} {' '.join(argv)}", *argv)
+        assert e["audience"] == "" and "stored as given" in err, (argv, e, err)
+    # Meant for the coordinator alone: workers never see it, so no warning.
+    e, err = add(f"{big} coordinator", "--kind", "decision", "--audience", "coordinator")
+    assert e["audience"] == "coordinator" and "would take" not in err, err
+    # A dry run warns and re-routes on paper only.
+    n = len(p._memory_entries())
+    cli.main(["memory", "demo", f"{big} dry", "--kind", "fact", "--dry-run"])
+    err = capsys.readouterr().err
+    assert "dry run, nothing written or committed: warning: pinned worker memory would take " in err, err
+    assert len(p._memory_entries()) == n
+
+
+def test_memory_add_action_notes_a_worker_room_overflow_and_reroutes_a_one_off(env):
+    """The coordinator's memory_add gets the same check: past the room, a note on its action names the
+    room, the new total and the largest entries workers see; a one-off fact with no audience is stored
+    for the coordinator alone, an explicit one kept. Under the room, no note. A merge (`supersedes`)
+    is warned about once the replaced entries are gone, and never re-routed."""
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp.prompts import worker_context
+    rules = _fill_worker_room(p, 400)
+    room = worker_context(p)[2]["memory_limit"]
+
+    def apply(action, turn):
+        assert coord.apply(p, [dict(action, type="memory_add")], turn=turn) == []
+        return p.db.kv(coord.NOTES_KEY)
+    assert apply({"text": "Workers run the short suite first.", "memory_kind": "fact"}, 1) == []
+    assert p._memory_entries()[-1]["audience"] == ""
+    big = "Workers note: " + "w" * 600
+    notes = apply({"text": big, "memory_kind": "fact"}, 2)
+    e = p._memory_entries()[-1]
+    assert e["audience"] == "coordinator", e
+    assert len(notes) == 1 and notes[0].startswith(
+        f"memory_add: warning: pinned worker memory would take "), notes
+    assert f"with [{e['name']}] " in notes[0] and f"over the {room} chars of room" in notes[0]
+    assert "largest entries workers see: decision-rule-" in notes[0] and "stored for the coordinator only" in notes[0]
+    # The same turn replayed keeps its one entry and its audience.
+    assert apply({"text": big, "memory_kind": "fact"}, 2) == notes
+    assert [x["audience"] for x in p._memory_entries() if x["body"] == big] == ["coordinator"]
+    notes = apply({"text": big + " kept", "memory_kind": "fact", "audience": "workers"}, 3)
+    assert p._memory_entries()[-1]["audience"] == "workers"
+    assert len(notes) == 1 and "stored as given" in notes[0], notes
+    notes = apply({"text": big + " merged", "memory_kind": "decision", "supersedes": [rules[0].stem]}, 4)
+    e = p._memory_entries()[-1]
+    assert e["audience"] == "" and not (p.memory_dir / f"{rules[0].stem}.md").exists()
+    assert len(notes) == 1 and notes[0].startswith("memory_add: warning: pinned worker memory would take "), notes

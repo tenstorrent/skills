@@ -5296,7 +5296,7 @@ def _memory_room(p, dry: str = "", added: bool = True) -> None:
 
 
 def cmd_memory(a) -> None:
-    from .coordinator import memory_budget_check
+    from .coordinator import memory_budget_check, plan_memory_audience, worker_room_after
     p = need(a.name, sys.argv[1:])
     if a.search:
         found = p.search_memory(a.search)
@@ -5342,13 +5342,19 @@ def cmd_memory(a) -> None:
         print(f"{dry}would add {added}" if dry else added)
         for dst in done:
             print(f"{dry}would retire to {dst}" if dry else f"retired to {dst}")
+        room = "" if a.dry_run else worker_room_after(p, added.stem)
         if not a.dry_run:
             memory_budget_check(p)
         _memory_room(p, dry)
+        if room:
+            print(f"warning: {room}", file=sys.stderr)
         return
+    room = ""
     try:
         if a.text:
-            path = p.add_memory(a.text, kind=a.kind, title=a.title, standing=a.standing, audience=a.audience,
+            audience, room = plan_memory_audience(p, a.text, a.kind, a.standing, a.audience, a.title,
+                                                  without=a.forget or ())
+            path = p.add_memory(a.text, kind=a.kind, title=a.title, standing=a.standing, audience=audience,
                                 dry_run=a.dry_run)
             print(f"{dry}would add {path}" if dry else path)
         done, errors = p.forget_memories(a.forget, why=a.why, dry_run=a.dry_run) if a.forget else ([], [])
@@ -5360,6 +5366,8 @@ def cmd_memory(a) -> None:
         memory_budget_check(p)
     if a.text or a.forget:
         _memory_room(p, dry, added=bool(a.text))
+    if a.text and room:
+        print(f"{dry}warning: {room}", file=sys.stderr)
     if spaced := [n for n in a.forget or [] if len(n.split()) > 1]:
         # --forget takes every word after it, so text written after it was read as an entry name.
         errors.append(f"{spaced[0]!r} is no entry name (names have no spaces): --forget takes every word "

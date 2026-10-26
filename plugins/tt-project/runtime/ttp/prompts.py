@@ -396,7 +396,8 @@ def restated_in(block: str):
     return test
 
 
-def worker_context(p: Project, task: dict | None = None) -> tuple[str, list[dict], dict]:
+def worker_context(p: Project, task: dict | None = None,
+                   entries: list[dict] | None = None) -> tuple[str, list[dict], dict]:
     """A worker's digest of the charter and memory: the Goals and Resources whole (the Brief only when
     no Goals are stated) and the policies and other charter items meant for workers (see
     for_workers) within what those leave of WORKER_MEMORY_CHARS, never less than
@@ -406,8 +407,8 @@ def worker_context(p: Project, task: dict | None = None) -> tuple[str, list[dict
     or WORKER_RANKED_MIN_CHARS past the pinned ones if that is more (see worker_memory_select).
     Memory never pushes out a policy. Memory entries that restate the charter's restrictions are left
     out: the prompt states those whole in their own block. Pinned entries past their budget are
-    counted in `pinned_dropped` (worker_system says where to read them). Returns (charter text,
-    memory entries, usage)."""
+    counted in `pinned_dropped` (worker_system says where to read them). `entries`: memory entries in
+    place of memory/'s (see Project.worker_memory_select). Returns (charter text, memory entries, usage)."""
     raw = p.charter_path.read_text() if p.charter_path.exists() else ""
     secs = [(h, b) for h, b in charter_sections(charter_without_placeholders(raw))
             if h and not h[3:].strip().lower().startswith("restriction")]
@@ -441,12 +442,12 @@ def worker_context(p: Project, task: dict | None = None) -> tuple[str, list[dict
     rest = max(0, WORKER_MEMORY_CHARS - heads - len(text))
     room = max(rest, WORKER_PINNED_MIN_CHARS)   # for pinned entries
     restated = restated_in(charter_restrictions(raw))
-    mem, use = p.worker_memory_select(rest, task, room, restated)
+    mem, use = p.worker_memory_select(rest, task, room, restated, entries)
     if use["pinned_dropped"]:   # make room for the line saying so
         room -= len(_PINNED_MORE.format(n=999, path=p.memory_dir)) + 1
-        mem, use = p.worker_memory_select(min(rest, room), task, room, restated)
+        mem, use = p.worker_memory_select(min(rest, room), task, room, restated, entries)
     elif use["pinned_chars"] + WORKER_RANKED_MIN_CHARS > rest:   # every pinned one shown: the others' floor
-        mem, use = p.worker_memory_select(use["pinned_chars"] + WORKER_RANKED_MIN_CHARS, task, room, restated)
+        mem, use = p.worker_memory_select(use["pinned_chars"] + WORKER_RANKED_MIN_CHARS, task, room, restated, entries)
     return text, mem, dict(use, charter_chars=heads + len(text), charter_dropped=dropped, limit=WORKER_MEMORY_CHARS,
                            memory_limit=room)
 

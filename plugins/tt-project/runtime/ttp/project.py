@@ -1408,7 +1408,7 @@ class Project:
                         "crowded": bool(left) and pinned_chars + reserve > limit_chars}
 
     def worker_memory_select(self, limit_chars: int, task: dict | None = None, pinned_limit: int | None = None,
-                             restated=None) -> tuple[list[dict], dict]:
+                             restated=None, entries: list[dict] | None = None) -> tuple[list[dict], dict]:
         """The entries a worker's prompt gets, whole, oldest first: those worker_memory pins, the
         restrictions, resources and standing ones always (worker_always), whatever the limits, then the
         others while they fit `pinned_limit` (None:
@@ -1421,9 +1421,11 @@ class Project:
         memory_select's, counting only the entries meant for workers, plus `duplicates` (left out as
         restated), `pinned_dropped` (pinned ones past `pinned_limit`), `kept`, `kept_chars` and
         `kept_over` (those always carried alone outgrow `pinned_limit`, or `limit_chars` without one).
-        user_corrections are left out: worker_system lists them on their own, outside this budget."""
+        user_corrections are left out: worker_system lists them on their own, outside this budget.
+        `entries`: the live entries to select from in place of memory/'s (a write not made yet)."""
         corrected = {e["name"] for e in self.user_corrections()}
-        entries = [e for e in self._memory_entries() if worker_memory(e) and e["name"] not in corrected]
+        entries = [e for e in (self._memory_entries() if entries is None else entries)
+                   if worker_memory(e) and e["name"] not in corrected]
         dup = {e["name"] for e in entries if restated and restated(e.get("body", ""))}
         pinned = [e for e in entries if worker_memory(e) == 1 and e["name"] not in dup]
         pinned_chars = sum(len(e["line"]) + 1 for e in pinned)
