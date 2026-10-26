@@ -138,6 +138,7 @@ OWN_SESSION_ALLOWED = {
     "devq.py::start": "the device queue runner service",
     "devq.py::Runner.sh": "device queue runner step; the runner service kills its group on timeout",
     "devq.py::Runner._launch": "a device queue job, meant to outlive the runner's call",
+    "devq.py::_readable": "bounded child; devq.py runs as a standalone script on hosts, so it cannot import the helper",
     "ends.py::spawn_probe": "daemon probe polled across ticks; its callers kill the group",
     "heal.py::_exec": "daemon heal check tracked by schedrun.spawned, killed by a daemon stop",
     "hold.py::_spawn": "ttp hold's holder process, meant to outlive the command",
