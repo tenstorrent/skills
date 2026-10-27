@@ -288,6 +288,7 @@ def test_ttp_leftover_procs_uses_the_task_worktree_of_the_project_it_runs_in(env
     assert _ttp("leftover-procs", str(env["tmp"] / "missing.json")) == 2
 
 
+@pytest.mark.skipif(sys.platform != 'linux' or not os.path.exists('/proc/self/cwd'), reason='lists processes from /proc')
 def test_leftover_procs_as_a_hand_off_check_sends_back_only_for_a_live_process_in_its_own_worktree(env):
     p = make(env)
     tid = _hc_task(p)
