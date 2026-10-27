@@ -9098,6 +9098,64 @@ def test_a_past_start_after_adds_no_delay_to_a_passed_retry_when(env, monkeypatc
     assert _ready(p, tid) and "woke" in json.loads(p.db.task(tid)["result"])
 
 
+def _clear_start_after_keeps_the_probe_gate(p, monkeypatch, tmp_path, clear):
+    """A waiting task (retry_when `test -e <file>`) deferred by 2 h, then `clear(tid)` drops its
+    start_after: it stays gated by its probe until the file exists, then starts."""
+    from ttp import cli
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    flag = tmp_path / "ready"
+    tid = _due_waiting_task(p, f"test -e {flag}")
+    cli.set_when(p.db, tid, None, p, start_after="2h")
+    clear(tid)
+    t = p.db.task(tid)
+    assert t["not_before"] is not None and not _ready(p, tid), "a cleared start_after keeps the retry_when gate"
+    assert not any(lb.startswith("start_after:") for lb in _labels(p, tid))
+    d = dmod.Daemon(p.base)
+    for _ in range(2):
+        _settle_probe(d, tid)
+        assert d._probe_rc[tid][0] == 1 and not _ready(p, tid), "its probe still says not yet"
+    flag.touch()
+    for _ in range(3):   # a probe started before the file appeared may still answer 1
+        _settle_probe(d, tid)
+        if _ready(p, tid):
+            break
+    assert _ready(p, tid) and "woke" in json.loads(p.db.task(tid)["result"])
+
+
+@pytest.mark.parametrize("clear", ["now", ""])
+def test_set_when_clearing_start_after_keeps_a_waiting_tasks_retry_when_gate(env, monkeypatch, tmp_path, clear):
+    p = make(env)
+    from ttp import cli
+    _clear_start_after_keeps_the_probe_gate(
+        p, monkeypatch, tmp_path, lambda tid: cli.main(["task", "demo", "set-when", str(tid), "--start-after", clear]))
+
+
+@pytest.mark.parametrize("clear", ["now", ""])
+def test_task_update_clearing_start_after_keeps_a_waiting_tasks_retry_when_gate(env, monkeypatch, tmp_path, clear):
+    p = make(env)
+    from ttp import coordinator as coord
+
+    def update(tid):
+        assert coord.apply(p, [{"type": "task_update", "id": tid, "start_after": clear}]) == []
+    _clear_start_after_keeps_the_probe_gate(p, monkeypatch, tmp_path, update)
+
+
+def test_clearing_start_after_on_a_woken_or_plain_task_makes_it_ready_at_once(env):
+    p = make(env)
+    from ttp import cli
+    from ttp import coordinator as coord
+    plain = p.db.add_task("plain", "s", kind="work", tier="light", origin="user")
+    woken = _due_waiting_task(p, "exit 1", woke="probe passed")
+    for tid in (plain, woken):
+        cli.set_when(p.db, tid, None, p, start_after="2h")
+        assert not _ready(p, tid)
+    cli.set_when(p.db, plain, None, p, start_after="now")
+    assert coord.apply(p, [{"type": "task_update", "id": woken, "start_after": ""}]) == []
+    for tid in (plain, woken):
+        assert p.db.task(tid)["not_before"] is None and _ready(p, tid)
+
+
 @pytest.mark.parametrize("status", ["running", "done", "cancelled"])
 def test_ttp_task_set_when_start_after_refuses_a_started_or_finished_task(env, capsys, status):
     p = make(env)

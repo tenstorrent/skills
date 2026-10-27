@@ -1590,8 +1590,17 @@ def deferral_update(db, task: dict, a: dict, p: Project | None, labels: list | N
     labels = json.loads(task["labels"] or "[]") if labels is None else labels
     if after and after > time.time() and after != cur.get("after"):
         progress.drop_probe(db, task["id"])   # a planned deferral: its old answers no longer count
+    # In whole seconds, as its label keeps it, so daemon._probe_passed reads the two as one time.
+    nb = round(after) if after else after
+    prev = load_result(task["result"])
+    if nb is None and not when and prev.get("status") == "waiting" and not prev.get("woke") \
+            and isinstance(prev.get("retry_when"), str) and prev["retry_when"].strip():
+        # Still waiting on its retry_when: the probe loop gates only a task with a not_before, so
+        # keep its retry timer (a new one when the deferral replaced it), as the hand-off set it.
+        from .daemon import _retry_s   # daemon imports this module
+        nb = task["not_before"] if task["not_before"] and not cur.get("after") else time.time() + _retry_s(prev)
     return {"labels": without_deferral(labels) + defer_labels(after, when, start_why(a, cur, when)),
-            "not_before": after}, after, when
+            "not_before": nb}, after, when
 
 
 def defer_labels(after: float | None, when: str | None, why: str | None = None) -> list[str]:
