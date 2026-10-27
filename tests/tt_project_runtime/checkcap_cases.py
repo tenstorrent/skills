@@ -1460,6 +1460,18 @@ def test_check_priority_falls_back_to_runner_nice(env, monkeypatch):
     assert _argv_with(monkeypatch, runner={"nice": 15})[:3] == ["nice", "-n", "15"]
 
 
+def test_check_priority_follows_the_project_s_checks_ionice(env, monkeypatch):
+    from ttp import testslots
+    monkeypatch.setattr(testslots.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(testslots, "_cfg", lambda: {"checks": {"ionice": "idle"}})
+    assert testslots.low_priority(["pytest"])[3:] == ["ionice", "-c3", "pytest"]
+    from ttp import project
+    project.set_account_setting("checks.ionice", "best-effort:3")
+    assert testslots.ionice_args({"checks": {"ionice": "best-effort:1"}}) == ["-c2", "-n", "1"], "project first"
+    assert testslots.ionice_args({"checks": {"ionice": "bogus"}}) == ["-c2", "-n", "3"], "invalid: the account's"
+    assert testslots.ionice_args(None) == ["-c2", "-n", "3"]
+
+
 def test_check_priority_invalid_values_fall_back_to_the_defaults(env, monkeypatch):
     got = _argv_with(monkeypatch, {"checks.nice": "soon", "checks.ionice": "bogus:9"}, runner={"nice": "x"})
     assert got == ["nice", "-n", "10", "ionice", "-c2", "-n7", "pytest"]

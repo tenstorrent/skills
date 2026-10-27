@@ -517,11 +517,14 @@ def nice_level(cfg: dict | None = None) -> int:
     return NICE
 
 
-def ionice_args() -> list:
-    """The ionice arguments from checks.ionice (account): 'idle' is -c3, 'best-effort' or 'best-effort:N'
-    (N 0-7) is -c2 -n N; unset or invalid is IONICE."""
-    v = (project.load_account_settings().get("checks") or {}).get("ionice")
-    if isinstance(v, str):
+def ionice_args(cfg: dict | None = None) -> list:
+    """The ionice arguments from checks.ionice (the project's, then the account's): 'idle' is -c3,
+    'best-effort' or 'best-effort:N' (N 0-7) is -c2 -n N; an invalid value falls back to the next
+    source; unset or invalid is IONICE."""
+    acct = project.load_account_settings().get("checks") or {}
+    for v in (_section(cfg, "checks").get("ionice"), acct.get("ionice")):
+        if not isinstance(v, str):
+            continue
         cls, _, lvl = v.strip().lower().partition(":")
         if cls == "idle" and not lvl:
             return ["-c3"]
@@ -536,5 +539,6 @@ def low_priority(argv: list) -> list:
     runs it as it is."""
     if (project.load_account_settings().get("checks") or {}).get("nice") is False:
         return list(argv)
-    return ((["nice", "-n", str(nice_level(_cfg()))] if shutil.which("nice") else [])
-            + (["ionice", *ionice_args()] if shutil.which("ionice") else []) + list(argv))
+    cfg = _cfg()
+    return ((["nice", "-n", str(nice_level(cfg))] if shutil.which("nice") else [])
+            + (["ionice", *ionice_args(cfg)] if shutil.which("ionice") else []) + list(argv))
