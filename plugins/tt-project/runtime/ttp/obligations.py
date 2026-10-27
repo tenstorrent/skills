@@ -516,9 +516,17 @@ def _live_jobs(p, st: dict) -> dict[str, list[dict]]:
 def _glob_walk(root: str, pat: str):
     """Yield paths under root matching the glob `pat` (`**` spans folders), visiting at most
     RESULT_FILES_MAX directory entries and for at most RESULT_WALK_S seconds, so a big tree never stalls
-    the caller; the walk then just ends (partial results)."""
-    rx = [None if x == "**" else re.compile(fnmatch.translate(x)) for x in pat.split("/") if x not in ("", ".")]
-    deep = None in rx
+    the caller; the walk then just ends (partial results). Literal leading parts ('out/', '..') are
+    joined directly, as pathlib does, and the walk enters only folders whose path can still lead to a
+    match, so a fixed-prefix glob never spends its budget on unrelated folders."""
+    parts = [x for x in pat.split("/") if x not in ("", ".")]
+    while parts and parts[0] != "**" and not re.search(r"[*?[]", parts[0]):
+        root = os.path.join(root, parts.pop(0))
+    if not parts:
+        if os.path.lexists(root):
+            yield Path(root)
+        return
+    rx = [None if x == "**" else re.compile(fnmatch.translate(x)) for x in parts]
     end = time.monotonic() + RESULT_WALK_S
     seen = 0
 
@@ -528,6 +536,14 @@ def _glob_walk(root: str, pat: str):
         if rx[j] is None:
             return any(match(names, k, j + 1) for k in range(i, len(names) + 1))
         return i < len(names) and rx[j].match(names[i]) is not None and match(names, i + 1, j + 1)
+
+    def leads(names, i=0, j=0):
+        """Whether a path below folder `names` can still match: each part matches until a '**'."""
+        if j == len(rx):
+            return False
+        if rx[j] is None or i == len(names):
+            return True
+        return rx[j].match(names[i]) is not None and leads(names, i + 1, j + 1)
 
     stack = [(root, ())]
     while stack:
@@ -541,7 +557,7 @@ def _glob_walk(root: str, pat: str):
                     names = rel + (e.name,)
                     if match(names):
                         yield Path(e.path)
-                    if (deep or len(names) < len(rx)) and e.is_dir(follow_symlinks=False):
+                    if leads(names) and e.is_dir(follow_symlinks=False):
                         stack.append((e.path, names))
         except OSError:
             continue

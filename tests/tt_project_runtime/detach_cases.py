@@ -899,3 +899,59 @@ def test_result_file_patterns_still_find_files(tmp_path):
     now = _t.time()
     job = {"results": "**/deep.json", "cwd": str(tmp_path), "started": now - 60}
     assert ob._result_file(job, now + 1)[1] == "a/b/deep.json"
+
+
+def _scan_count(ob, monkeypatch):
+    seen = []
+    real = os.scandir
+    monkeypatch.setattr(ob.os, "scandir", lambda d: (seen.append(d), real(d))[1])
+    return seen
+
+
+def test_result_file_walk_skips_folders_a_prefixed_glob_cannot_match(tmp_path, monkeypatch):
+    from ttp import obligations as ob
+    for i in range(10):
+        (tmp_path / f"out{i}").mkdir()
+        (tmp_path / f"out{i}" / "res.json").write_text("{}")
+    for i in range(30):
+        (tmp_path / f"big{i}").mkdir()
+        for k in range(1000):
+            (tmp_path / f"big{i}" / f"f{k}.txt").write_text("")
+    seen = _scan_count(ob, monkeypatch)
+    assert [p.name for p in ob._glob_walk(str(tmp_path), "out3/*.json")] == ["res.json"]
+    assert seen == [str(tmp_path / "out3")]   # the literal prefix is joined, not scanned for
+    seen.clear()
+    # A wildcard prefix still prunes: only the out* folders are entered, never big*.
+    got = sorted(p.parent.name for p in ob._glob_walk(str(tmp_path), "out*/res.json"))
+    assert got == [f"out{i}" for i in range(10)]
+    assert not any("big" in d for d in seen), seen
+
+
+def test_result_file_deep_glob_under_a_literal_folder_never_scans_siblings(tmp_path, monkeypatch):
+    from ttp import obligations as ob
+    (tmp_path / "out" / "a" / "b").mkdir(parents=True)
+    (tmp_path / "out" / "top.json").write_text("1")
+    (tmp_path / "out" / "a" / "b" / "deep.json").write_text("1")
+    for i in range(20):
+        (tmp_path / "build" / f"d{i}").mkdir(parents=True)
+        (tmp_path / "build" / f"d{i}" / "x.json").write_text("1")
+    seen = _scan_count(ob, monkeypatch)
+    rel = sorted(str(p.relative_to(tmp_path)) for p in ob._glob_walk(str(tmp_path), "out/**/*.json"))
+    assert rel == ["out/a/b/deep.json", "out/top.json"]
+    assert all(d.startswith(str(tmp_path / "out")) for d in seen), seen
+
+
+def test_result_file_glob_resolves_literal_dotdot_and_whole_paths(tmp_path):
+    import time as _t
+    from ttp import obligations as ob
+    (tmp_path / "res").mkdir()
+    (tmp_path / "res" / "r.json").write_text("1")
+    (tmp_path / "job").mkdir()
+    job = str(tmp_path / "job")
+    assert [p.name for p in ob._glob_walk(job, "../res/*.json")] == ["r.json"]
+    assert [p.name for p in ob._glob_walk(job, "../res/r.json")] == ["r.json"]
+    assert list(ob._glob_walk(job, "../res/none.json")) == []
+    assert list(ob._glob_walk(job, "*/../res/r.json")) == []   # '..' after a wildcard never matches
+    now = _t.time()
+    got = ob._result_file({"results": "../res/*.json", "cwd": job, "started": now - 60}, now + 1)
+    assert got[1] == "../res/r.json"
