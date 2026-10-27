@@ -1440,6 +1440,24 @@ def start_why(a: dict, cur: dict, when: str | None) -> str | None:
     return why or None
 
 
+# A deferred device task whose why waits for a lull, an ack or a pause to end (lull_note).
+LULL_WAIT = re.compile(r"\b(lull|idle|quiet|ack(?:s|ed)?|acknowledg\w*|pause[sd]?|unpaus\w*|hold(?:s)?)\b", re.I)
+DISRUPTIVE = re.compile(r"\b(restart\w*|upgrad\w*|roll(?:s|ed|ing)?[ -]?outs?|reboot\w*|power[ -]?cycl\w*)\b", re.I)
+
+
+def lull_note(where: str, labels: list, why: str | None, *texts: str) -> str | None:
+    """Advice (never a rejection) for a deferred task on a device resource whose `why` waits for a
+    lull, another project's ack or a pause to end: the broker serializes device jobs, so they are
+    enqueued now. None for disruptive work (DISRUPTIVE in its title, spec or why) or no device."""
+    cue = LULL_WAIT.search(why or "")
+    if not cue or any(DISRUPTIVE.search(x or "") for x in (why, *texts)) \
+            or not effort.device_task({"labels": json.dumps(labels)}):
+        return None
+    return (f"{where} deferred on a device resource for {cue.group(0)!r}: device jobs behind a broker are "
+            f"enqueued now (it orders them; a resource pause holds its tasks itself); a lull is only for "
+            f"disruptive work (restart, upgrade, rollout, reboot, power cycle)")
+
+
 def _file_overlaps(p: Project, kind: str, spec: str, skip: set) -> list[dict]:
     """Other open or unlanded code tasks a new code or harness task's spec names files of (overlap.py);
     a warning only, so a fault reading them is no overlap."""
@@ -1931,6 +1949,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                  f"`parallel:` line asks: {beside}")
                 if hit := settled.turn_note(p, str(a.get("spec") or ""), f"task_add: #{new_id}"):
                     notes.append(hit)
+                if (after or when) and (lull := lull_note(f"task_add: #{new_id}", labels, a.get("why"),
+                                                          title, a.get("spec") or "")):
+                    notes.append(lull)
                 if pr_ask:
                     notes.append(f"task_add: #{new_id} added as `code`, not `{a.get('kind') or 'work'}`: it asks for "
                                  f"PR delivery ({pr_ask!r}) and only code tasks open or update PRs")
@@ -1941,6 +1962,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 batch_tasks[task["id"]] = task["reply_chat"]
                 a, as_deps = _landed_as_deps(p, a, dependency_ids(task))
                 upd: dict[str, Any] = {}
+                lull = None
                 if a.get("status") in ("queued", "blocked", "cancelled", "done", "waiting"):
                     if task["status"] == "running" and a["status"] != "cancelled":
                         raise InfoRejection(f"task #{task['id']} is running: send `spec` alone to steer it mid-run, "
@@ -2025,6 +2047,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     stale = marker_only_probe(when, p.root) if when != cur.get("when") else None
                     if stale:
                         notes.append(f"task_update: #{task['id']} flagged: {stale}")
+                    lull = (after or when) and lull_note(f"task_update: #{task['id']}", upd["labels"],
+                                                         a.get("why") if a.get("why") is not None else cur.get("why"), task["title"],
+                                                         task["spec"], a.get("spec") or "")
                 # The daemon blocks a queued task on a dead dependency at once, so accepting this
                 # would report a requeue that does not stick.
                 if upd.get("status", task["status"]) == "queued" and ("status" in upd or "depends_on" in upd):
@@ -2095,6 +2120,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     if waits or anchors.without(labels) != labels:
                         upd["labels"] = anchors.without(labels) + ([waits] if waits else [])
                 db.update_task(task["id"], **upd)
+                if lull:
+                    notes.append(lull)
                 if as_deps:
                     notes.append(f"task_update: #{task['id']} {as_deps}")
                 if waits == anchors.label("ask", anchors.NEW_ASK):

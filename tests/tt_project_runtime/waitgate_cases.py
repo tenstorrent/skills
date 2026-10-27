@@ -375,3 +375,55 @@ def test_the_daily_review_reports_the_wake_gate(env):
     assert dm._schedule_llm(s, {}) == "queued"
     spec = p.db.one("SELECT spec FROM tasks WHERE origin='schedule'")["spec"]
     assert f"- {line}" in spec
+
+
+# Deferred device tasks (coordinator.lull_note): a broker serializes device jobs, so a deferral that
+# waits for a lull, an ack or a pause to end gets advice on its result note, never a rejection.
+def test_the_coordinator_prompt_keeps_a_lull_for_disruptive_work_and_enqueues_device_jobs_now():
+    rule = " ".join((RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text().split())
+    assert "Device jobs behind a broker or job queue that serializes them: enqueue now" in rule
+    assert "never held for a lull, another project's ack or others' use" in rule
+    assert "A lull (`start_when`, `start_after`) is for disruptive work it does not serialize: restarts, " \
+           "upgrades, rollouts, reboots, power cycles" in rule
+    assert "Work that would disturb others: run it in a lull" not in rule
+
+
+@pytest.mark.parametrize("why", ["wait for a lull on the box", "until the other project acks",
+                                 "after the other team's test pause ends", "once the box is idle"])
+def test_a_deferred_device_task_waiting_for_a_lull_or_ack_gets_the_enqueue_now_advice(env, why):
+    from ttp import coordinator as coord
+    p = make(env)
+    assert coord.apply(p, [{"type": "task_add", "title": "run the device tests", "spec": "Run the suite.",
+                            "resources": ["board-device"], "start_after": "6h", "why": why}]) == []
+    t = p.db.one("SELECT * FROM tasks WHERE title=?", ("run the device tests",))
+    assert t["not_before"]   # applied as usual
+    note = next(n for n in p.db.kv(coord.NOTES_KEY) if n.startswith(f"task_add: #{t['id']} deferred"))
+    assert "device jobs behind a broker are enqueued now" in note and "a lull is only for disruptive work" in note
+    # The same deferral set by task_update advises too.
+    tid = p.db.add_task("run the bench", "Bench it.", kind="work", labels=["resource:board-device"])
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "start_after": "3h", "why": why}]) == []
+    assert p.db.task(tid)["not_before"]
+    assert any(n.startswith(f"task_update: #{tid} deferred on a device resource") for n in p.db.kv(coord.NOTES_KEY))
+
+
+@pytest.mark.parametrize("title,resources,why", [
+    ("roll out the broker upgrade", ["board-device"], "wait for a lull"),
+    ("run the device tests", ["board-device"], "restart the service in a quiet hour"),
+    ("power cycle the board", ["board-device"], "once the box is idle"),
+    ("run the docs build", ["build-box"], "wait for a lull"),
+    ("run the device tests", ["board-device"], "after the nightly window opens"),
+])
+def test_no_lull_advice_for_disruptive_work_a_task_without_a_device_or_another_why(env, title, resources, why):
+    from ttp import coordinator as coord
+    p = make(env)
+    assert coord.apply(p, [{"type": "task_add", "title": title, "spec": "Do it.", "resources": resources,
+                            "start_after": "6h", "why": why}]) == []
+    assert not any("deferred on a device resource" in n for n in p.db.kv(coord.NOTES_KEY) or [])
+    # Not deferred: no advice whatever its why.
+    assert coord.apply(p, [{"type": "task_add", "title": "now", "spec": "Do it.", "resources": ["board-device"],
+                            "why": "wait for a lull"}]) == []
+    assert not any("deferred on a device resource" in n for n in p.db.kv(coord.NOTES_KEY) or [])
+    # The control: the same device task waiting for a lull, with no disruptive word, is advised.
+    assert coord.apply(p, [{"type": "task_add", "title": "control", "spec": "Run it.", "resources": ["board-device"],
+                            "start_when": "test -e /tmp/ttp-lull-control", "why": "wait for a lull"}]) == []
+    assert sum("deferred on a device resource" in n for n in p.db.kv(coord.NOTES_KEY)) == 1
