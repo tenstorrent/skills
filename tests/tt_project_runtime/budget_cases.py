@@ -2654,11 +2654,18 @@ def test_an_account_level_global_cap_overrides_the_default(env, tmp_path):
 
 
 
+def _mid_budget_day(p):
+    """A fixed instant six hours into today's budget day: a suite run crossing the reset cannot move it."""
+    from ttp import globalcap as gcap
+    return gcap.day_bounds(p.config()["budget"], time.time())[0] + 6 * 3600
+
+
+
 def test_the_coordinator_digest_shows_the_global_daily_total(env, tmp_path):
     p, other = _global_cap_setup(env, tmp_path, cap=1000)
     from ttp import budget as bud
     from ttp import coordinator as coord
-    now = time.time()
+    now = _mid_budget_day(p)
     p.db.spend("fake", 1.2, "task:1", ts=now - 60)
     other.spend("fake", 340.0, "task:1", ts=now - 60)
     g = bud.evaluate(p.db, p.config(), "fake", [], now).as_dict()
@@ -2670,6 +2677,18 @@ def test_the_coordinator_digest_shows_the_global_daily_total(env, tmp_path):
     g = bud.evaluate(p.db, p.config(), "fake", [], now).as_dict()
     d = coord.digest(p, {"fake": g}, [], [])
     assert "$1.20 of $100.0 per 24h" in d and "global daily cap" not in d, d
+
+
+
+def test_the_today_total_follows_the_clock_across_the_budget_day_reset(env, tmp_path):
+    p, other = _global_cap_setup(env, tmp_path, cap=1000)
+    from ttp import budget as bud
+    from ttp import globalcap as gcap
+    start, end = gcap.day_bounds(p.config()["budget"], _mid_budget_day(p))
+    p.db.spend("fake", 1.2, "task:1", ts=end - 60)
+    before = bud.evaluate(p.db, p.config(), "fake", [], end - 30)
+    after = bud.evaluate(p.db, p.config(), "fake", [], end + 30)
+    assert before.numbers["spent_today"] == 1.2 and after.numbers["spent_today"] == 0, (before.numbers, after.numbers)
 
 
 
@@ -2687,10 +2706,11 @@ def test_an_unknown_global_total_leaves_the_project_caps_in_charge(env, tmp_path
     from ttp import budget as bud
     from ttp import globalcap as gcap
     monkeypatch.setattr(gcap, "total", lambda *a, **k: (_ for _ in ()).throw(OSError("unreadable")))
-    g = bud.evaluate(p.db, p.config(), "fake", [])
+    now = _mid_budget_day(p)
+    g = bud.evaluate(p.db, p.config(), "fake", [], now)
     assert g.level == "green" and any("the project caps still apply" in r for r in g.reasons), g.reasons
-    p.db.spend("fake", 150.0, "task:1", ts=time.time() - 60)
-    assert bud.evaluate(p.db, p.config(), "fake", []).level == "red"
+    p.db.spend("fake", 150.0, "task:1", ts=now - 60)
+    assert bud.evaluate(p.db, p.config(), "fake", [], now).level == "red"
 
 
 
@@ -2699,7 +2719,7 @@ def test_the_budget_line_of_a_usage_billed_account_and_of_a_plan(env, tmp_path):
     from ttp import budget as bud
     from ttp import globalcap as gcap
     from ttp.web import budget_line
-    now = time.time()
+    now = _mid_budget_day(p)
     p.db.spend("fake", 1.2, "task:1", ts=now - 60)
     other.spend("fake", 340.0, "task:1", ts=now - 60)
     g = bud.evaluate(p.db, p.config(), "fake", [], now).as_dict()
