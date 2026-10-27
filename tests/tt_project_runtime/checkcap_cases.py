@@ -872,3 +872,265 @@ def test_test_slots_nested_run_keeps_its_parents_grant(env, monkeypatch):
     monkeypatch.setenv(testslots.HELD_ENV, "2")
     g = testslots.acquire("nested", wait_s=0)
     assert g.k == 2 and not g.files
+
+
+_SLOT_WAITER = """
+import sys, time
+from pathlib import Path
+from ttp import testslots
+g = testslots.acquire("waiter " + sys.argv[1], project_name=sys.argv[1])
+Path(sys.argv[2]).write_text(f"{time.time()} {g.k}")
+while not Path(sys.argv[3]).exists():
+    time.sleep(0.05)
+"""
+
+
+def _slot_waiter(name: str, tmp_path):
+    got, stop = tmp_path / f"{name}.got", tmp_path / f"{name}.stop"
+    proc = subprocess.Popen([sys.executable, "-c", _SLOT_WAITER, name, str(got), str(stop)],
+                            env={**os.environ, "PYTHONPATH": str(RUNTIME)})
+    return proc, got, stop
+
+
+def _queued_test_waiters(n: int) -> bool:
+    from ttp import checkcap, locks, testslots
+    return len(locks.queued(checkcap.slot_dir(), testslots.RESOURCE)) >= n
+
+
+def test_test_slots_waiters_are_served_first_come_and_a_killed_waiter_frees_its_place(env, tmp_path, monkeypatch):
+    from ttp import testslots
+    monkeypatch.setenv("TTP_TEST_POOL", "2")
+    monkeypatch.setenv("TTP_TEST_RUN_MAX", "1")
+    monkeypatch.setenv("TTP_TEST_POLL_S", "0.05")
+    held = [testslots.acquire("a", project_name="pa"), testslots.acquire("b", project_name="pb")]
+    assert [g.k for g in held] == [1, 1]
+    procs = []
+    try:
+        first = _slot_waiter("p1", tmp_path)
+        procs.append(first)
+        assert _wait_for(lambda: _queued_test_waiters(1))
+        dead = _slot_waiter("p2", tmp_path)
+        procs.append(dead)
+        assert _wait_for(lambda: _queued_test_waiters(2))
+        last = _slot_waiter("p3", tmp_path)
+        procs.append(last)
+        assert _wait_for(lambda: _queued_test_waiters(3))
+        dead[0].kill()   # a killed waiter's ticket goes with it
+        dead[0].wait(10)
+        held.pop().close()
+        assert _wait_for(lambda: first[1].exists()), "the earliest waiter gets the freed slot"
+        time.sleep(0.3)
+        assert not last[1].exists(), "a later waiter never jumps the line"
+        held.pop().close()
+        assert _wait_for(lambda: last[1].exists()), "the killed waiter's place passes on, nothing leaks"
+        assert float(first[1].read_text().split()[0]) < float(last[1].read_text().split()[0])
+    finally:
+        for proc, _, stop in procs:
+            stop.write_text("")
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(10)
+        for g in held:
+            g.close()
+
+
+def test_test_slots_one_project_holds_at_most_its_budget_and_never_blocks_the_others(env, monkeypatch):
+    from ttp import testslots
+    monkeypatch.setenv("TTP_TEST_POOL", "8")
+    monkeypatch.setenv("TTP_TEST_RUN_MAX", "2")
+    monkeypatch.setenv("TTP_TEST_POLL_S", "0.05")
+    assert testslots.project_max() == 4, "default: twice a run's share, within the pool"
+    a1 = testslots.acquire("a1", project_name="pa")
+    a2 = testslots.acquire("a2", project_name="pa")
+    assert (a1.k, a2.k) == (2, 2)
+    assert testslots.acquire("a3", project_name="pa", wait_s=0.3) is None, "the project is at its budget"
+    import threading
+    got = {}
+    t = threading.Thread(target=lambda: got.setdefault("a4", testslots.acquire("a4", project_name="pa", wait_s=5)))
+    t.start()
+    time.sleep(0.2)
+    b = testslots.acquire("b", project_name="pb", wait_s=1)
+    assert b is not None and b.k == 2, "another project goes ahead of a waiter whose project is at its budget"
+    a1.close()
+    t.join(10)
+    assert got["a4"] is not None and got["a4"].k == 2, "freed budget goes back to its project's waiter"
+    monkeypatch.setenv("TTP_TEST_PROJECT_MAX", "3")
+    assert testslots.project_max({"checks": {"test_project_max": 1}}) == 2, "never below one run's share"
+    for g in (a2, b, got["a4"]):
+        g.close()
+
+
+def test_push_checks_take_a_reserved_test_slot_when_task_checks_fill_the_pool(env, monkeypatch):
+    from ttp import locks, testslots
+    monkeypatch.setenv("TTP_TEST_POOL", "4")
+    monkeypatch.setenv("TTP_TEST_RUN_MAX", "2")
+    monkeypatch.setenv("TTP_TEST_POLL_S", "0.05")
+    tasks = [testslots.acquire("t1", project_name="pa"), testslots.acquire("t2", project_name="pb")]
+    assert [g.k for g in tasks] == [2, 2]
+    t0 = time.time()
+    push = testslots.acquire("push", project_name="pa", push_key="remote main", wait_s=0)
+    assert push is not None and push.k == 1 and time.time() - t0 < 2, "(a) granted at once on the reserved slot"
+    assert locks.held_labels([testslots.reserved_path("remote main")]) == ["push"]
+    # (b) the reserved slot never goes to a task check: with the pool full, one waits for the pool.
+    assert testslots.acquire("t3", project_name="pc", wait_s=0.3) is None
+    other = testslots.acquire("push 2", project_name="pc", push_key="remote other", wait_s=0)
+    assert other is not None and other.k == 1, "each push branch has its own reserved slot"
+    push.close()
+    other.close()
+    tasks.pop().close()
+    # (c) with free pool slots a push takes them within the per-run and per-project budgets.
+    monkeypatch.setenv("TTP_TEST_PROJECT_MAX", "2")
+    push = testslots.acquire("push", project_name="pb", push_key="remote main", wait_s=0)
+    assert push.k == 2 and not locks.held_labels([testslots.reserved_path("remote main")])
+    push.close()
+    push = testslots.acquire("push", project_name="pa", push_key="remote main", wait_s=0)
+    assert push.k == 1 and locks.held_labels([testslots.reserved_path("remote main")]) == ["push"], \
+        "its project at budget: the reserved slot, never a pool slot past the budget"
+    over = testslots.acquire("t4", project_name="pa", wait_s=0.3)
+    assert over is None, "a task check of a project at its budget waits though the pool has room"
+    push.close()
+    tasks.pop().close()
+
+
+_SUITE_HOLDER = """
+import sys, time
+from pathlib import Path
+from ttp import testslots
+g = testslots.suite_hold(sys.argv[1])
+Path(sys.argv[2]).write_text("held")
+while True:
+    time.sleep(1)
+"""
+
+
+def test_one_full_checks_run_per_project_at_a_time_freed_by_a_crash(env, tmp_path, monkeypatch):
+    from ttp import checkcap, testslots
+    monkeypatch.setenv("TTP_TEST_POLL_S", "0.05")
+    monkeypatch.delenv(testslots.HELD_ENV, raising=False)
+    monkeypatch.delenv(checkcap.HELD_ENV, raising=False)
+    got = tmp_path / "held"
+    proc = subprocess.Popen([sys.executable, "-c", _SUITE_HOLDER, "pa", str(got)],
+                            env={**os.environ, "PYTHONPATH": str(RUNTIME)})
+    try:
+        assert _wait_for(got.exists)
+        lines = []
+        assert testslots.suite_hold("pa", lines.append, wait_s=0.3) is None, "a second full run waits"
+        assert lines and "one at a time per project" in lines[0]
+        other = testslots.suite_hold("pb", wait_s=0)
+        assert other is not None and other.files, "another project's full checks never wait for it"
+        other.close()
+        monkeypatch.setenv(testslots.HELD_ENV, "2")
+        assert testslots.suite_hold("pa", wait_s=0).files == [], "a check nested in a run does not take it"
+        monkeypatch.delenv(testslots.HELD_ENV)
+        proc.kill()   # a crash: the kernel drops the lock, nothing stale stays
+        proc.wait(10)
+        again = testslots.suite_hold("pa", wait_s=5)
+        assert again is not None and again.files
+        again.close()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(10)
+
+
+def test_ttp_checks_waits_for_its_project_s_other_full_checks(env, tmp_path, monkeypatch, capsys):
+    from ttp import checkcap, cli, locks, testslots
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setenv("TTP_TEST_POLL_S", "0.05")
+    monkeypatch.setattr(checkcap, "FOREGROUND_WAIT_S", 0.3)
+    detached = []
+    monkeypatch.setattr(cli, "_checks_detach", lambda *a, **k: detached.append(1))
+    hold = testslots.suite_hold(p.name)
+    assert hold.files
+    seen = tmp_path / "seen"
+    try:
+        with pytest.raises(SystemExit) as e:
+            cli.main(["checks", "--", "sh", "-c", f"echo ran > {seen}"])
+    finally:
+        hold.close()
+    assert e.value.code == 75 and detached == [1], "the foreground wait hands over to detached checks"
+    assert not seen.exists(), "nothing ran beside the project's other full checks"
+    assert "one at a time per project" in (run / "checks.log").read_text() + capsys.readouterr().out
+    cli.main(["checks", "--", "sh", "-c", f"echo ran > {seen}"])
+    assert seen.exists() and not locks.held_labels(
+        locks.slot_paths(checkcap.slot_dir(), f"{testslots.SUITE}.{locks.group_id(p.name)}", 1)), \
+        "with the other run gone it runs, and frees the project's suite lock at its end"
+
+
+def test_a_pytest_n_above_the_budget_is_lowered_with_a_line_saying_so_and_refused_in_a_worker_shell(env, monkeypatch):
+    from ttp import hook, push, testslots
+    out = testslots.clamped("cd x && pytest -n 64 tests", 4)
+    assert out.splitlines()[0].startswith("echo ") and "pytest -n 64 lowered to -n 4" in out
+    assert out.splitlines()[1] == "cd x && pytest -n 4 tests"
+    assert testslots.clamped("pytest -n 4 tests", 4) == "pytest -n 4 tests", "within it: as it is, no line"
+    argv = push.check_argv("pytest -n 64 tests", None, {**os.environ, testslots.HELD_ENV: "3"}, isolate=False)
+    r = subprocess.run(["bash", "-c", argv[-1].replace("pytest -n 3 tests", "true")], capture_output=True, text=True)
+    assert "lowered to -n 3" in r.stderr and r.returncode == 0
+    monkeypatch.setenv("TTP_TEST_SLOTS", "4")
+    assert "budget of 4" in hook.too_many_workers("python3 -m pytest -n 16 tests/a.py")
+    assert hook.too_many_workers("pytest -n 4 tests/a.py") is None
+    assert hook.too_many_workers("pytest -n auto tests/a.py") is None
+    assert hook.too_many_workers("ttp checks -- 'pytest -n 16 tests/a.py'") is None, "ttp checks lowers it"
+    assert hook.too_many_workers("head -n 50 f && sort -n 99 g") is None
+    monkeypatch.delenv("TTP_TEST_SLOTS")
+    assert hook.too_many_workers("pytest -n 64 tests") is None, "outside a worker run: no budget"
+
+
+def _fake_proc(root, forks: int, procs: dict):
+    """A /proc with `processes forks` in stat and pid -> (cgroup unit or None, cmdline)."""
+    import shutil
+    if root.exists():
+        shutil.rmtree(root)
+    root.mkdir()
+    (root / "stat").write_text(f"cpu  1 2 3\nprocesses {forks}\nprocs_running 1\n")
+    for pid, (unit, cmd) in procs.items():
+        d = root / str(pid)
+        d.mkdir()
+        (d / "cgroup").write_text(f"0::/user.slice/app.slice/{unit}.service\n" if unit else "0::/init.scope\n")
+        (d / "cmdline").write_bytes(cmd.replace(" ", "\0").encode())
+
+
+def test_churn_watch_names_the_owning_project_only_when_the_fork_rate_stays_high(env, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from ttp import churnwatch, daemon, service
+    monkeypatch.setenv("TTP_CHURN_FORKS_S", "100")
+    monkeypatch.setenv("TTP_CHURN_WINDOW_S", "60")
+    root = tmp_path / "proc"
+    xdist = "python -c import sys;exec(eval(sys.stdin.readline()))"
+    w = churnwatch.Watch(root)
+    _fake_proc(root, 1000, {1: (None, "init")})
+    assert w.step(0) is None
+    _fake_proc(root, 1000 + 30 * 500, {1: (None, "init")})
+    assert w.step(30) is None, "a high rate starts an episode, nothing yet"
+    _fake_proc(root, 1000 + 60 * 50, {1: (None, "init")})
+    assert w.step(60) is None and w.since is None, "a short burst wakes nobody"
+    n, pid = 1000 + 60 * 50, 100
+    for t in (90, 120, 150, 180):
+        n += 30 * 900
+        procs = {1: (None, "init")}
+        for _ in range(5):
+            pid += 1
+            procs[pid] = ("tt-project-alpha", xdist)
+        procs[pid + 1000] = ("tt-project-beta", "sh -c true")
+        _fake_proc(root, n, procs)
+        obs = w.step(t)
+        if t < 120:
+            assert obs is None, "not sustained for the window yet"
+        elif t == 120:
+            assert obs and obs["key"] == "process-churn:tt-project-alpha" and obs["severity"] == "normal"
+            assert obs["forks_s"] == 900 and obs["xdist_workers"] == 5 and "tt-project-alpha.service" in obs["text"]
+        else:
+            assert obs is None, "one observation per episode"
+    assert churnwatch.Watch(tmp_path / "no-proc").step(0) is None, "no /proc (macOS): nothing"
+    # The daemon raises it only in the owning project's daemon; the watch never signals anything.
+    seen = []
+    for name in ("alpha", "beta"):
+        d = SimpleNamespace(p=SimpleNamespace(name=name), observe=lambda *a, **k: seen.append((a, k)))
+        d._churn = SimpleNamespace(step=lambda now: obs_alpha)
+        obs_alpha = {"unit": service.unit_name(SimpleNamespace(name="alpha")), "text": "x", "severity": "normal",
+                     "key": "process-churn:tt-project-alpha"}
+        daemon.Daemon.check_churn(d)
+    assert len(seen) == 1 and seen[0][1]["key"] == "process-churn:tt-project-alpha"
+    import pathlib
+    src = pathlib.Path(churnwatch.__file__).read_text()
+    assert "os.kill(" not in src and "import signal" not in src, "read-only: it signals nothing"

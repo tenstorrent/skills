@@ -34,6 +34,7 @@ from pathlib import Path
 
 from . import runtimeload   # first of its own: its LOADED_AT is when the daemon imported its code
 from . import ackwait
+from . import churnwatch
 from . import alerts
 from . import anchors
 from . import askrethink
@@ -1199,7 +1200,7 @@ class Daemon:
         core_held = self._run_step(lambda: self.net_held(core) and not self._net_may_probe(core), "net_held", default=False)
         cycle = self._run_step(lambda: self.host_cycle_held(now), "host_cycle_held", default=False)
         for step in (self.run_schedules, self.poll_slack, self.check_resource_trouble, self.read_upstream,
-                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_slot_wait, self.check_progress, self.check_idle_capacity, self.check_obligations, self.audit_pushes, self.retire_ended, self.archive_hidden_memory, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.sweep_unreviewed, self.check_unqueued_continues, self.check_stale_duplicates, self.tend_mitigations, self.failover_pinned, self.rethink_asks, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.watch_progress, self.probe_waiting, self.start_pushes, self.dispatch, self.raise_pre_grant_faults, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
+                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_slot_wait, self.check_progress, self.check_churn, self.check_idle_capacity, self.check_obligations, self.audit_pushes, self.retire_ended, self.archive_hidden_memory, self.route_machines, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.sweep_unreviewed, self.check_unqueued_continues, self.check_stale_duplicates, self.tend_mitigations, self.failover_pinned, self.rethink_asks, self.blocker_sweep, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.watch_progress, self.probe_waiting, self.start_pushes, self.dispatch, self.raise_pre_grant_faults, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
                 continue   # no routing to start model work with (see _load_config)
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
@@ -5488,6 +5489,18 @@ class Daemon:
             db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
                  (now, "daemon", "observation", f"stall:{last_id}", "high", text[:4000], "queued"))
         log(self.p, f"stall: {len(stuck)} task(s) ready for {hours:g} h or more, no worker run since {when}")
+
+    def check_churn(self) -> None:
+        """Model-free host process-churn watch (churnwatch): a fork rate that stays high, owned by this
+        project's unit, raises one normal observation per episode. Read-only; nothing on hosts without /proc."""
+        now = time.time()
+        if now - getattr(self, "_churn_checked", 0.0) < churnwatch.CHECK_S:
+            return
+        self._churn_checked = now
+        w = self.__dict__.setdefault("_churn", churnwatch.Watch())
+        obs = w.step(now)
+        if obs and obs["unit"] == service.unit_name(self.p):
+            self.observe("daemon:process-churn", obs["text"], obs["severity"], whole=True, key=obs["key"])
 
     def check_slot_wait(self, every_s: float = 60) -> None:
         """Model-free urgent slot wait: a ready task that is a required owner of an open obligation, or has

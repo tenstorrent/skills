@@ -261,7 +261,7 @@ def run(v, cwd: str, env: dict, say, what: str = f"delivery.{KEY}", ok: tuple = 
     # Its output goes to a file, not a pipe, so a process it leaves running cannot hold the run open;
     # boundedchild kills its whole group however the run ends (a SIGTERM or SIGHUP to `ttp checks` too).
     with grant, tempfile.NamedTemporaryFile(prefix="ttp-prestage-") as out:
-        script = f"exec >{shlex.quote(out.name)} 2>&1\n{testslots.clamp(cmd, grant.k)}"
+        script = f"exec >{shlex.quote(out.name)} 2>&1\n{testslots.clamped(cmd, grant.k)}"
         res = boundedchild.run(testslots.low_priority(["/bin/sh", "-c", script]), timeout, cwd=cwd,
                                env={**env, **grant.env()}, text=False, stderr="stdout")
         if res.error.startswith("could not start"):

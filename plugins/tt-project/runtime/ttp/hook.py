@@ -547,6 +547,8 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
         _log_bypass(cmd)
     if not why:
         why = full_suite(cmd, segments, str(payload.get("cwd") or os.getcwd()))
+    if not why:
+        why = too_many_workers(cmd)
     hint = None
     if not why:
         why, hint = device_test_run(commands)
@@ -864,6 +866,20 @@ def _check_runs() -> list[tuple[str, set[str], set[tuple[str, str]]]]:
             paths, select = _pytest_parts(args, os.path.relpath(d, top))
             out.append((str(c), paths, select))
     return out
+
+
+def too_many_workers(cmd: str) -> str | None:
+    """Why `cmd` is refused when a pytest in it asks for more workers (`-n N`) than the run's test-worker
+    budget (TTP_TEST_SLOTS, which the daemon gives worker runs: testslots.worker_env), else None."""
+    from . import testslots
+    try:
+        k = int(os.environ.get(testslots.SLOTS_ENV) or 0)
+    except ValueError:
+        return None
+    if re.search(r"\bttp\s+checks\b", cmd) or not (big := testslots.over(cmd, k)):
+        return None   # `ttp checks` lowers it itself
+    return (f"pytest -n {max(big)} is above this run's test-worker budget of {k} on this shared host. "
+            f"Use -n {k} or fewer, or `-n auto` (it reads {testslots.XDIST_ENV}={k})")
 
 
 def full_suite(cmd: str, segments: list[list[str]], cwd: str) -> str | None:

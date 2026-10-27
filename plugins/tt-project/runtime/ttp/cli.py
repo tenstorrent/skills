@@ -3134,22 +3134,30 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
 
     start = time.time()
     prio, owns = checkcap.task_rank(p)
+    # One full checks run per project at a time (testslots.suite_hold), taken before the checks slot so
+    # a second run of the project never holds one of the host's slots while it waits.
+    from . import testslots
+    suite = testslots.suite_hold(p.name if p else None, tell, checkcap.FOREGROUND_WAIT_S if foreground and p else None)
+    if suite is None:
+        return None
     try:
         slot = checkcap.acquire(checkcap.label(p.name if p else None), f"ttp checks on {head[:12]}", tell, waiting,
                                 checkcap.FOREGROUND_WAIT_S if foreground and p else None, arrived,
                                 p.name if p else None, prio, same, done, lambda: _checks_cancelled(run_dir),
                                 p.state if p else None, owns)
         if slot is None or slot.served:
+            suite.close()
             return slot
         # Then the run's share of the host's test-worker slots (testslots), held with the checks slot;
         # in the foreground none free by the end of the same wait hands over to detached checks too.
-        from . import testslots
         left = max(0.0, checkcap.FOREGROUND_WAIT_S - (time.time() - start)) if foreground and p else None
         slot.tests = testslots.acquire(checkcap.label(p.name if p else None), tell, left,
-                                       p.config() if p else {})
+                                       p.config() if p else {}, p.name if p else "")
         if slot.tests is None:
             slot.close()
+            suite.close()
             return None
+        slot.tests.files += suite.files   # the suite lock ends with the run's test slots
         return slot
     except checkcap.Cancelled as e:
         said = f"not run: stopped waiting for a host-wide checks slot: {e}"

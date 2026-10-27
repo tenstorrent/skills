@@ -655,8 +655,10 @@ def check_slot(head: str, say: Callable[[str], None], who: str = "", priority: s
         prio, owns = checkcap.task_rank(proj)
         slot = checkcap.acquire(who, f"push checks on {head[:12]}", say, project_name=name,
                                 priority=prio, state=state, owns=owns)
-    # The run's share of the host's test-worker slots, held and freed with the checks slot (testslots).
-    slot.tests = testslots.acquire(who, say, cfg=proj.config() if proj else {})
+    # The run's share of the host's test-worker slots, held and freed with the checks slot (testslots);
+    # push-priority checks take the branch's reserved test slot when the pool has none free.
+    slot.tests = testslots.acquire(who, say, cfg=proj.config() if proj else {}, project_name=name or "",
+                                   push_key=priority)
     return slot
 
 
