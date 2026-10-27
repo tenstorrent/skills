@@ -8,8 +8,10 @@ tools as unreadable with no hint why. The daemon runs `claude mcp list` (it prob
 be slow) in the background, bounded by TIMEOUT_S, at most every TTL_S, from the project root (local and
 project scope count too), and keeps the answer in the project's state. ttp status and the web app's feed
 read only that file: a connected server neither listed nor withheld (`providers.claude.mcp_withheld`) is
-one feed line. A failed or timed-out probe is unknown, never a warning. claude.ai connectors and servers
-from a plugin are left out: `mcp_servers` cannot list them."""
+one feed line. A failed or timed-out probe is unknown, never a warning. Servers from a plugin are left
+out: `mcp_servers` cannot list them. Connected claude.ai account connectors get a second line: isolated
+workers never get them (`--strict-mcp-config` drops every server not passed in `--mcp-config`, and a
+connector is no file-defined server, so it cannot be passed on); withheld ones are not named."""
 from __future__ import annotations
 
 import json
@@ -38,6 +40,12 @@ def parse(text: str) -> list[str]:
         if status.endswith("connected") and "not connected" not in status and name not in out:
             out.append(name)
     return out
+
+
+def split(names: list[str]) -> tuple[list[str], list[str]]:
+    """parse()'s names as (servers, connectors): claude.ai account connectors apart, plugin servers in neither."""
+    connectors = [n for n in names if n.lower().startswith(CONNECTOR_PREFIXES)]
+    return [n for n in names if n not in connectors and not n.startswith(PLUGIN_PREFIX)], connectors
 
 
 def probe(binary: str, cwd: str, timeout: float = TIMEOUT_S, now: float | None = None) -> dict:
@@ -76,21 +84,28 @@ def _names(v) -> list[str]:
 
 
 def gap(claude_cfg: dict, entry: dict | None) -> dict:
-    """{"state": "off" | "unknown" | "none" | "missing", "missing": [...], "line": str}; only
-    "missing" has a line."""
+    """{"state": "off" | "unknown" | "none" | "missing", "missing": [...], "connectors": [...], "line": str};
+    only "missing" has a line (one per kind: servers, then connectors)."""
     if not claude_cfg.get("worker_isolation"):
-        return {"state": "off", "missing": [], "line": ""}
+        return {"state": "off", "missing": [], "connectors": [], "line": ""}
     if not entry or not entry.get("ok"):
-        return {"state": "unknown", "missing": [], "line": "",
+        return {"state": "unknown", "missing": [], "connectors": [], "line": "",
                 "error": (entry or {}).get("error") or "not probed yet"}
     given = set(_names(claude_cfg.get("mcp_servers"))) | set(_names(claude_cfg.get("mcp_withheld")))
-    missing = [n for n in entry.get("connected") or []
-               if n not in given and not n.lower().startswith(CONNECTOR_PREFIXES) and not n.startswith(PLUGIN_PREFIX)]
-    if not missing:
-        return {"state": "none", "missing": [], "line": ""}
-    return {"state": "missing", "missing": missing,
-            "line": f"MCP servers connected on this host but not given to workers: {', '.join(missing)} "
-                    "(add to providers.claude.mcp_servers, or to providers.claude.mcp_withheld to keep them out)"}
+    servers, connectors = split(entry.get("connected") or [])
+    missing = [n for n in servers if n not in given]
+    connectors = [n for n in connectors if n not in given]
+    if not missing and not connectors:
+        return {"state": "none", "missing": [], "connectors": [], "line": ""}
+    lines = []
+    if missing:
+        lines.append(f"MCP servers connected on this host but not given to workers: {', '.join(missing)} "
+                     "(add to providers.claude.mcp_servers, or to providers.claude.mcp_withheld to keep them out)")
+    if connectors:
+        lines.append(f"Connected claude.ai connectors ({', '.join(connectors)}) are not available to isolated "
+                     "workers; they cannot be passed on. Turn off providers.claude.worker_isolation to use them "
+                     "(or add them to providers.claude.mcp_withheld to keep them out)")
+    return {"state": "missing", "missing": missing, "connectors": connectors, "line": "\n".join(lines)}
 
 
 def line(state: Path, cfg: dict) -> str:

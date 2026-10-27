@@ -1281,6 +1281,9 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
 - `providers.claude.worker_isolation: true` starts Claude workers and reviewers without your own
   MCP servers, plugins, hooks and user settings; the project's `plugin_dirs` and its hook still
   load. In one measurement it cut a worker's first turn from about 38k to 23k input tokens.
+  Isolated workers never get your claude.ai account connectors: `--strict-mcp-config` drops every
+  server not passed in its own config file, and connectors are not defined in any file, so there is
+  no way to pass them on.
   `ttp new` turns it on; projects created earlier keep it off until you set it.
 - `providers.claude.mcp_servers: ["name", ...]` lists the MCP servers isolated workers still get.
   Each run copies just those entries from your Claude config (local, then `.mcp.json`, then user
@@ -1293,8 +1296,10 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   A server it reports connected that `mcp_servers` does not list gets one line in `ttp status` and
   the web app's feed: `MCP servers connected on this host but not given to workers: ...`. List a
   server you keep from workers on purpose in `providers.claude.mcp_withheld: ["name", ...]` and the
-  line drops it. claude.ai connectors and plugin servers are left out (`mcp_servers` cannot list
-  them). A probe that fails or times out shows as unknown in `ttp doctor`, never as this line.
+  line drops it. Plugin servers are left out (`mcp_servers` cannot list them). Connected claude.ai
+  connectors get a line of their own, `Connected claude.ai connectors (...) are not available to
+  isolated workers`: turn off `worker_isolation` to use them, or list them in `mcp_withheld` to drop
+  the line. A probe that fails or times out shows as unknown in `ttp doctor`, never as either line.
 - With `worker_isolation` off, Claude workers and reviewers still load your own, the project's and
   plugins' MCP servers, but not your claude.ai connectors (about 2k tokens on every call), unless
   the project needs them: `mcp_servers` names one (`"claude.ai <name>"`), or one of its runs called

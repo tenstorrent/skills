@@ -52,6 +52,7 @@ button { padding: 6px 12px; border-radius: 6px; border: 1px solid var(--line); b
 button.ghost { background: none; color: var(--ink); } button.danger { background: var(--red); }
 button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 #log { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 10px; height: 60vh; overflow-y: auto; }
+#mcpline { white-space: pre-line; }   /* one line per kind of MCP gap (mcpgap.gap) */
 .msg { margin: 6px 0; max-width: 80ch; } .msg.in { margin-left: auto; text-align: right; }
 .msg .b { display: inline-block; padding: 7px 10px; border-radius: 8px; background: var(--bg); white-space: pre-wrap; text-align: left; }
 .msg.in .b { background: var(--accent); color: #fff; }

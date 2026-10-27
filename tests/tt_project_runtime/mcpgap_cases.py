@@ -4,6 +4,9 @@ from __future__ import annotations
 MCP_LIST = """Checking MCP server health…
 
 claude.ai Gmail: https://example.invalid/mcp - ✔ Connected
+claude.ai Example Notes: https://example.invalid/notes - ✔ Connected
+claude.ai Example Calendar: https://example.invalid/cal - ! Needs authentication
+claude.ai Example Drive: https://example.invalid/drive - ✗ Failed to connect
 plugin:tools:helper: npx helper - ✔ Connected
 search: /usr/local/bin/search-mcp  - ✔ Connected
 tickets: https://example.invalid/tickets (HTTP) - ✔ Connected
@@ -35,7 +38,8 @@ def _isolated(env, **claude):
 
 def test_mcp_list_parse_keeps_only_connected_servers():
     from ttp import mcpgap
-    assert mcpgap.parse(MCP_LIST) == ["claude.ai Gmail", "plugin:tools:helper", "search", "tickets"]
+    assert mcpgap.parse(MCP_LIST) == ["claude.ai Gmail", "claude.ai Example Notes", "plugin:tools:helper",
+                                      "search", "tickets"]
     assert mcpgap.parse("No MCP servers configured. Use `claude mcp add` to add a server.\n") == []
 
 
@@ -43,11 +47,11 @@ def test_mcp_gap_none_missing_shows_no_line(env, tmp_path):
     from ttp import mcpgap
     from ttp.cli import status_text
     from ttp.web import health
-    p = _isolated(env, mcp_servers=["search", "tickets"])
+    p = _isolated(env, mcp_servers=["search", "tickets"], mcp_withheld=["claude.ai Gmail", "claude.ai Example Notes"])
     e = mcpgap.refresh(p.state, _listing(tmp_path), str(p.root))
     assert e["ok"] and e["connected"]
     g = mcpgap.gap(p.config()["providers"]["claude"], mcpgap.read(p.state))
-    assert g == {"state": "none", "missing": [], "line": ""}
+    assert g == {"state": "none", "missing": [], "connectors": [], "line": ""}
     assert "MCP servers connected" not in status_text(p)
     assert health(p, p.db, alive=False)["mcp_gap"] == ""
 
@@ -56,7 +60,7 @@ def test_mcp_gap_some_missing_is_one_status_and_feed_line_never_the_top(env, tmp
     from ttp import mcpgap
     from ttp.cli import status_text
     from ttp.web import attention, health
-    p = _isolated(env, mcp_servers=["search"])
+    p = _isolated(env, mcp_servers=["search"], mcp_withheld=["claude.ai Gmail", "claude.ai Example Notes"])
     mcpgap.refresh(p.state, _listing(tmp_path), str(p.root))
     want = ("MCP servers connected on this host but not given to workers: tickets (add to "
             "providers.claude.mcp_servers, or to providers.claude.mcp_withheld to keep them out)")
@@ -77,7 +81,9 @@ def test_mcp_gap_withheld_servers_are_not_named(env, tmp_path):
     assert "search, tickets (add to" in mcpgap.line(p.state, p.config())
     p.set_config("providers.claude.mcp_withheld", "tickets")
     assert ": search (add to" in mcpgap.line(p.state, p.config())
-    p.set_config("providers.claude.mcp_withheld", ["search", "tickets"])
+    p.set_config("providers.claude.mcp_withheld", ["search", "tickets", "claude.ai Gmail"])
+    assert mcpgap.line(p.state, p.config()).startswith("Connected claude.ai connectors (claude.ai Example Notes)")
+    p.set_config("providers.claude.mcp_withheld", ["search", "tickets", "claude.ai Gmail", "claude.ai Example Notes"])
     assert mcpgap.line(p.state, p.config()) == ""
     assert "MCP servers connected" not in status_text(p)
 
@@ -136,3 +142,57 @@ def test_mcp_gap_daemon_probes_in_the_background_and_only_when_due(env, tmp_path
     d.cfg = p.config()
     d.probe_mcp()
     assert d._mcp_probe is first and mcpgap.read(p.state) is None
+
+
+def test_mcp_list_split_keeps_connected_connectors_apart_from_servers():
+    from ttp import mcpgap
+    names = mcpgap.parse(MCP_LIST + "claude_ai_Example_Wiki: https://example.invalid/w - ✔ Connected\n")
+    servers, connectors = mcpgap.split(names)
+    assert servers == ["search", "tickets"]   # plugin servers in neither list
+    # Only connectors that are connected: not those needing authentication or failing to connect.
+    assert connectors == ["claude.ai Gmail", "claude.ai Example Notes", "claude_ai_Example_Wiki"]
+
+
+def test_mcp_gap_connected_connectors_get_their_own_line_only_with_isolation(env, tmp_path):
+    from ttp import mcpgap
+    from ttp.cli import status_text
+    from ttp.web import health
+    p = _isolated(env, mcp_servers=["search", "tickets"])
+    mcpgap.refresh(p.state, _listing(tmp_path), str(p.root))
+    want = ("Connected claude.ai connectors (claude.ai Gmail, claude.ai Example Notes) are not available to "
+            "isolated workers; they cannot be passed on. Turn off providers.claude.worker_isolation to use them "
+            "(or add them to providers.claude.mcp_withheld to keep them out)")
+    g = mcpgap.gap(p.config()["providers"]["claude"], mcpgap.read(p.state))
+    assert g["state"] == "missing" and g["missing"] == [] and g["line"] == want
+    assert g["connectors"] == ["claude.ai Gmail", "claude.ai Example Notes"]
+    assert "Example Calendar" not in g["line"] and "Example Drive" not in g["line"] and "plugin:" not in g["line"]
+    assert [ln for ln in status_text(p).splitlines() if "claude.ai connectors" in ln] == [want]
+    assert health(p, p.db, alive=False)["mcp_gap"] == want
+    # A server gap and a connector gap: two lines, servers first.
+    p.set_config("providers.claude.mcp_servers", ["search"])
+    assert mcpgap.line(p.state, p.config()).split("\n") == [
+        "MCP servers connected on this host but not given to workers: tickets (add to "
+        "providers.claude.mcp_servers, or to providers.claude.mcp_withheld to keep them out)", want]
+    # Isolation off: connectors load in workers, no line.
+    p.set_config("providers.claude.worker_isolation", False)
+    assert mcpgap.line(p.state, p.config()) == ""
+    assert "claude.ai connectors" not in status_text(p)
+
+
+def test_mcp_gap_connectors_needing_authentication_or_a_failed_probe_show_no_line(env, tmp_path):
+    from ttp import mcpgap
+    from ttp.cli import status_text
+    p = _isolated(env)
+    listing = tmp_path / "auth.txt"
+    listing.write_text("claude.ai Example Calendar: https://example.invalid/cal - ! Needs authentication\n"
+                       "claude.ai Example Drive: https://example.invalid/drive - ✗ Failed to connect\n"
+                       "plugin:tools:helper: npx helper - ✔ Connected\n")
+    mcpgap.refresh(p.state, _fake_claude(tmp_path, f'cat "{listing}"'), str(p.root))
+    g = mcpgap.gap(p.config()["providers"]["claude"], mcpgap.read(p.state))
+    assert g["state"] == "none" and g["connectors"] == []
+    # A probe that fails after printing connected connectors stays unknown: no line, no false warning.
+    (tmp_path / "mcp_list.txt").write_text(MCP_LIST)
+    mcpgap.refresh(p.state, _fake_claude(tmp_path, f'cat "{tmp_path / "mcp_list.txt"}"; exit 1'), str(p.root))
+    g = mcpgap.gap(p.config()["providers"]["claude"], mcpgap.read(p.state))
+    assert g["state"] == "unknown" and g["line"] == "" and g["connectors"] == []
+    assert "claude.ai connectors" not in status_text(p)
