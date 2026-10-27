@@ -7,9 +7,10 @@ that is not there) used to show only once its job finished, and that cost a full
 hands off `waiting` with one, the daemon runs it once right away, model-free, before it records the
 hand-off (Daemon._prefetch_remote, outside the transaction): from the project root with the
 environment its real run gets, TTP_ON_PASS_DRY_RUN=1 set, a scratch $TTP_RESULT and note folder, and
-waiting.on_pass_dry_run_timeout_s (30 s). Under that variable `ttp note`, `ttp notify` and `ttp push`
-do nothing and `ttp lock` is refused (cli.dry_run_stub), so nothing leaves the run and no device or
-shared machine is touched; the command itself may exit early on it.
+waiting.on_pass_dry_run_timeout_s (30 s). Under that variable `ttp note`, `notify`, `push` and `land`
+do nothing, and `ttp lock`, `devq submit|start|clear` and a `detach` that starts a job are refused
+(cli.dry_run_stub), so nothing leaves the run and no device or shared machine is touched; the command
+itself may exit early on it.
 
 A crash signature (CRASH_RE in the output, or exit 2, 126 or 127) hands the run back: its task is
 queued again at once and its next run continues the same agent session with the dry run's output
