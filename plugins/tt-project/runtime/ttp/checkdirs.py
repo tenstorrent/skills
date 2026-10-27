@@ -35,6 +35,7 @@ SCRATCH, LOCK = 'checks-tmp', 'checks-tmp.lock'
 OWNER = 'owner.json'
 TRASH = '.trash-'   # an allocation claimed for removal; removed with no folder lock held
 WAIT_S = 5.0        # longest wait for the folder-wide lock
+PROC_LOCKS = '/proc/locks'           # names a bare flock's holder (Linux)
 PSEUDO = ('/proc', '/sys', '/dev')   # their filesystems are never descended into on removal
 
 
@@ -239,21 +240,30 @@ def _catalogue(fd: int, bound: float, where=LOCK):
 
 
 def _holder(fd: int) -> int | None:
-    """The pid holding the folder lock: from the lock file, else (Linux) /proc/locks."""
+    """The pid holding the folder lock: from the lock file, else (Linux) /proc/locks. There a lock
+    names the superblock's device, which on btrfs differs from the st_dev stat gives: an exact device
+    match wins, else the one FLOCK on that inode number."""
     pid = _read(fd, LOCK).get('pid')
     if isinstance(pid, int) and pid > 0:
         return pid
     try:
         st = os.stat(LOCK, dir_fd=fd, follow_symlinks=False)
-        want = f':{st.st_ino}'
-        with open('/proc/locks') as f:
+        dev = (os.major(st.st_dev), os.minor(st.st_dev))
+        others = set()
+        with open(PROC_LOCKS) as f:
             for line in f:
                 parts = line.split()
-                if len(parts) > 5 and parts[1] == 'FLOCK' and parts[5].endswith(want) \
-                        and int(parts[5].split(':')[0], 16) == os.major(st.st_dev) \
-                        and int(parts[5].split(':')[1], 16) == os.minor(st.st_dev):
+                if len(parts) < 6 or parts[1] != 'FLOCK':
+                    continue
+                where = parts[5].split(':')
+                if len(where) != 3 or where[2] != str(st.st_ino) or not parts[4].isdigit():
+                    continue
+                if (int(where[0], 16), int(where[1], 16)) == dev:
                     return int(parts[4])
-    except (OSError, ValueError, IndexError):
+                others.add(int(parts[4]))
+        if len(others) == 1:
+            return others.pop()
+    except (OSError, ValueError):
         pass
     return None
 

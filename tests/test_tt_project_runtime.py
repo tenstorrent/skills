@@ -44238,6 +44238,38 @@ def test_check_scratch_new_never_hangs_on_a_held_folder_lock_and_names_its_holde
     assert not output.exists()
 
 
+def test_check_scratch_holder_reads_proc_locks_when_the_device_differs(env, monkeypatch, tmp_path):
+    """/proc/locks names a lock's superblock device, which on btrfs is not the st_dev stat gives:
+    a bare flock's holder was then '(unknown)'. An exact device match wins, else the one FLOCK on that
+    inode; two strangers on the inode, a POSIX lock or a garbled line name nobody."""
+    from ttp import checkdirs
+    folder = make(env).state / checkdirs.FOLDER
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / checkdirs.LOCK).touch()
+    st = os.stat(folder / checkdirs.LOCK)
+    ino, here = st.st_ino, f'{os.major(st.st_dev):02x}:{os.minor(st.st_dev):02x}'
+    other = f'{os.major(st.st_dev):02x}:{os.minor(st.st_dev) + 1:02x}'
+    table = tmp_path / 'locks'
+    monkeypatch.setattr(checkdirs, 'PROC_LOCKS', str(table))
+
+    def holder(*lines):
+        table.write_text(''.join(f'{n}: {line}\n' for n, line in enumerate(lines, 1)))
+        fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            return checkdirs._holder(fd)
+        finally:
+            os.close(fd)
+
+    assert holder(f'FLOCK  ADVISORY  WRITE 4242 {other}:{ino} 0 EOF') == 4242
+    assert holder(f'FLOCK  ADVISORY  WRITE 4242 {other}:{ino} 0 EOF',
+                  f'FLOCK  ADVISORY  WRITE 4343 {here}:{ino} 0 EOF') == 4343
+    assert holder(f'FLOCK  ADVISORY  WRITE 4242 {other}:{ino} 0 EOF',
+                  f'FLOCK  ADVISORY  WRITE 4343 00:99:{ino} 0 EOF') is None
+    assert holder(f'POSIX  ADVISORY  WRITE 4242 {here}:{ino} 0 EOF') is None
+    assert holder(f'FLOCK  ADVISORY  WRITE 4242 {here}:{ino}1 0 EOF', 'FLOCK garbled',
+                  f'FLOCK  ADVISORY  WRITE -> {here}:{ino} 0 EOF') is None
+
+
 def test_check_scratch_cleanup_removes_trees_without_the_folder_lock(env, monkeypatch):
     """Removing an old allocation (slow, or stuck in uninterruptible IO) never holds the folder-wide
     lock: a new allocation goes ahead while it runs, without waiting."""
