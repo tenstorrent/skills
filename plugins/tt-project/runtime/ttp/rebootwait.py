@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import re
 import shlex
+from pathlib import Path
 
 # A path a reboot clears or that names a process of the earlier boot.
 _VOLATILE_RE = re.compile(r"(?<![\w.~-])(?:/tmp|/var/tmp|/run|/var/run|/dev/shm|/proc)(?:/|\b)")
@@ -21,6 +22,9 @@ _VOLATILE_RE = re.compile(r"(?<![\w.~-])(?:/tmp|/var/tmp|/run|/var/run|/dev/shm|
 _RUN_DIR_RE = re.compile(r"(?:/state/runs/|\$\{?TTP_RUN_DIR\b)")
 _PROC_CMDS = {"pgrep", "pidof", "ps", "pkill"}
 _PUNCT = ";&|()`"
+# `ttp detach --check` options that take a value (as cli._check_options reads them).
+_CHECK_VALUED = ("--rows", "--after", "--mirror")
+_ASSIGN_RE = re.compile(r"[A-Za-z_]\w*=")
 
 
 def _commands(probe: str) -> list[list[str]] | None:
@@ -47,6 +51,42 @@ def _local_part(cmd: list[str]) -> list[str]:
         if w.rsplit("/", 1)[-1] in ("ssh", "mosh"):
             return cmd[:i]
     return cmd
+
+
+def local_jobs(probe) -> list[Path]:
+    """The .rc paths of the local `ttp detach --check` commands in a retry_when, alone or within a
+    compound probe (&&, ;, ||, other tests; split as _commands splits it), in order, once each. A check
+    with --host, or one after an ssh, is the other host's and never counted. [] when it checks no local
+    job or when in doubt: it does not parse, or a local check names a path that is not an absolute .rc
+    path, or an option `ttp detach --check` does not take."""
+    cmds = _commands(probe) if isinstance(probe, str) else None
+    out: list[Path] = []
+    for cmd in cmds or ():
+        words = _local_part(cmd)
+        while words and _ASSIGN_RE.match(words[0]):
+            words = words[1:]   # VAR=value before the command
+        if len(words) < 3 or words[0].rsplit("/", 1)[-1] not in ("ttp", "ttp.sh") or words[1] != "detach" \
+                or "--check" not in words[2:]:
+            continue
+        rest, paths, remote = words[2:], [], False
+        while rest:
+            w = rest.pop(0)
+            key, eq, _ = w.partition("=")
+            if key == "--host":
+                remote = True
+                break
+            if w == "--check":
+                continue
+            if key in _CHECK_VALUED:
+                if not eq and rest:
+                    rest.pop(0)
+                continue
+            if w.startswith("-") or not w.endswith(".rc") or not Path(w).is_absolute():
+                return []
+            paths.append(Path(w))
+        if not remote:
+            out += [p for p in paths if p not in out]
+    return out
 
 
 def _transient_words(words: list[str], run_dirs: tuple[str, ...]) -> str:
@@ -94,6 +134,25 @@ def transient(probe: str, run_dirs: tuple[str, ...] = ()) -> str:
     for cmd in cmds:
         why = _transient_words(_local_part(cmd), run_dirs)
         if why:
+            return why
+    return ""
+
+
+def transient_besides_jobs(probe, run_dirs: tuple[str, ...] = ()) -> str:
+    """Why a retry_when depends on local state a reboot ends apart from its local detached jobs (see
+    local_jobs) and the run-folder files they write, or '' when nothing else: a process, a path a reboot
+    clears, its own checks or a device runner job. A probe that does not parse says so."""
+    probe = probe.strip() if isinstance(probe, str) else ""
+    cmds = _commands(probe)
+    if cmds is None:
+        return "a probe that does not parse"
+    for cmd in cmds:
+        if local_jobs(shlex.join(cmd)):
+            continue
+        # A file in a run folder is the jobs' own output, wherever the folder lies.
+        words = [w for w in _local_part(cmd) if not (_RUN_DIR_RE.search(w) or any(d and d in w for d in run_dirs))]
+        why = _transient_words(words, run_dirs)
+        if why and why != "a file in a run folder":
             return why
     return ""
 

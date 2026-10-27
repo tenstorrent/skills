@@ -21729,7 +21729,7 @@ def test_a_host_reboot_wakes_only_waits_it_may_have_broken(env, probe, job, wake
     t = p.db.task(tid)
     res = json.loads(t["result"])
     if wakes:
-        assert not t["not_before"] and res["woke"] == "the host rebooted", dict(t)
+        assert not t["not_before"] and res["woke"].startswith("the host rebooted"), dict(t)
     else:
         assert t["not_before"] > time.time() + 3000 and "woke" not in res, dict(t)
 
@@ -22014,7 +22014,7 @@ def _boot_daemon(p, boot="a-later-boot", max_losses=None, orderly_after=None):
 
 def _woken(p, tid):
     t = p.db.task(tid)
-    return t["not_before"] is None and json.loads(t["result"]).get("woke") == "the host rebooted"
+    return t["not_before"] is None and str(json.loads(t["result"]).get("woke")).startswith("the host rebooted")
 
 
 def test_a_resumable_job_a_reboot_cut_short_is_relaunched_without_a_model_run(env, tmp_path):
@@ -22055,7 +22055,9 @@ def test_no_relaunch_of_a_job_that_ended_did_not_opt_in_or_whose_task_no_longer_
     _, counter3 = _resumable_job_cut_by_reboot(p, tmp_path, done)
     p.db.update_task(done, status="done", not_before=None, result=json.dumps({"status": "done", "summary": "ok"}))
     _boot_daemon(p)
-    assert _woken(p, ended) and _woken(p, plain), "woken as before"
+    # One that ended sleeps on: its own probe passes at once. One that did not opt in wakes, at light.
+    assert not _woken(p, ended) and p.db.task(ended)["not_before"], "a job that ended woke its task at boot"
+    assert _woken(p, plain), "woken as before"
     assert p.db.task(done)["status"] == "done"
     assert not any(_job_relaunches(p, t) for t in (ended, plain, done))
     time.sleep(0.5)

@@ -8083,7 +8083,10 @@ class Daemon:
         boot wrote no .rc. A timer, a probe of another host or another project's reply sleeps on, and
         `survives_reboot` always does. The wake counts
         toward max_reboot_losses only after an abrupt reboot that cut short a detached job of its own
-        (one with no .rc yet): only then may the task be what takes the host down."""
+        (one with no .rc yet): only then may the task be what takes the host down. A task whose
+        retry_when checks local detached jobs (rebootwait.local_jobs, also within a compound probe) sleeps
+        on while each ended or runs on this boot (relaunched, or a daemon restart within the boot); one
+        the reboot cut short and nothing relaunched wakes it at light, told to relaunch and re-arm."""
         if self._boot_woken:
             return
         self._boot_woken = True
@@ -8116,6 +8119,15 @@ class Daemon:
                 continue   # asleep on its retry_when: the same checks or resumable jobs run again
             if rebootwait.stays_asleep(prev, (str(self.p.runs),)) and not self._job_without_rc(t["id"]):
                 continue   # nothing it waits on died with the host: its timer and probe stand
+            probe = str(prev.get("retry_when") or "")
+            rcs = rebootwait.local_jobs(probe)
+            lost = self._lost_jobs(t["id"], rcs)
+            if rcs and not lost and not rebootwait.transient_besides_jobs(probe, (str(self.p.runs),)):
+                # Every local job it waits on ended or runs on this boot (relaunched, or a daemon restart
+                # within the boot): its retry_when wakes it once they end.
+                log(self.p, f"task {t['id']} waited from before the reboot on detached jobs that ended or "
+                            "still run; asleep on its retry_when")
+                continue
             self._probe_rc.pop(t["id"], None)
             counts = bool(relaunched) or cut or self._job_cut_by_reboot(t["id"])
             wakes = _reboot_wakes(t) + int(counts)
@@ -8128,8 +8140,17 @@ class Daemon:
             reboot = {"at": self.boot_at}
             if cycle:
                 reboot["planned"] = str(cycle.get("reason") or "no reason recorded")[:300]
+            woke = {"woke": "the host rebooted"}
+            if gone := [rc for rc in rcs if rc in lost]:
+                # Only relaunching its jobs and re-arming the same wait is left: a light run does that.
+                names = ", ".join(rc.stem for rc in gone[:5]) + (f" and {len(gone) - 5} more" if len(gone) > 5 else "")
+                woke = {"woke": f"the host rebooted and cut short detached job{'s' if len(gone) > 1 else ''} {names} "
+                                f"(in {gone[0].parent}), not relaunched: relaunch each with the same command and "
+                                "hand off waiting again with the same retry_when (naming the new .rc paths)",
+                        "wake_tier": "light"}
+                prev.pop("escalated_wake", None)
             db.update_task(t["id"], not_before=None, result=dump_result(
-                {**prev, "woke": "the host rebooted", "reboot": reboot, "reboot_wakes": wakes}))
+                {**prev, **woke, "reboot": reboot, "reboot_wakes": wakes}))
             log(self.p, f"task {t['id']} waited from before the reboot; due now")
 
     def _block_after_reboot(self, t: dict, prev: dict, reason: str) -> None:
@@ -8191,7 +8212,8 @@ class Daemon:
         return True, 0
 
     def _relaunch_jobs(self, t: dict, prev: dict) -> tuple[bool, bool]:
-        """A task waiting on local detached jobs (retry_when `ttp detach --check <rc...>`) that all
+        """A task waiting on local detached jobs (`ttp detach --check <rc...>` in its retry_when, alone
+        or in a compound probe: rebootwait.local_jobs) that all
         opted in with `--resumable`: start each the reboot cut short (no .rc) again, model-free, note
         it on the task and keep the task asleep on its retry_when. Returns (asleep, cut). asleep when it
         stays asleep (relaunched now, or already on this boot: a daemon restart). Else it wakes as
@@ -8204,7 +8226,7 @@ class Daemon:
         unplanned reboot cut short one of its resumable jobs: the wake then counts as a reboot loss.
         Relaunches after such reboots count toward max_reboot_losses too (_job_relaunch_boots)."""
         tid = t["id"]
-        rcs = _waited_jobs(str(prev.get("retry_when") or ""))
+        rcs = rebootwait.local_jobs(str(prev.get("retry_when") or ""))
         dirs = {r["dir"] for r in self.p.db.q("SELECT dir FROM runs WHERE task=? AND dir IS NOT NULL", (tid,))}
         if not rcs or any(str(rc.parent) not in dirs for rc in rcs):
             return False, False   # not only its own runs' jobs: not ours to start
@@ -8403,6 +8425,16 @@ class Daemon:
         """Whether a run of task tid on `boot` detached a job that wrote no .rc."""
         dirs = self.p.db.q("SELECT dir FROM runs WHERE task=? AND boot_id=? AND dir IS NOT NULL", (tid, boot))
         return any(not Path(j["rc"]).exists() for r in dirs for j in _detached_jobs(Path(r["dir"])))
+
+    def _lost_jobs(self, tid: int, rcs: list[Path]) -> list[Path]:
+        """Of the local detached jobs task tid waits on (`rcs`) and those its runs on the earlier boot
+        started, the ones with no .rc that do not run on this boot (detach.running_pid): what the
+        reboot cut short and nothing relaunched."""
+        boot = self._last_earlier_boot(tid)
+        dirs = self.p.db.q("SELECT dir FROM runs WHERE task=? AND boot_id=? AND dir IS NOT NULL", (tid, boot)) \
+            if boot else []
+        jobs = dict.fromkeys([*rcs, *(Path(j["rc"]) for r in dirs for j in _detached_jobs(Path(r["dir"])))])
+        return [rc for rc in jobs if not rc.exists() and not detach.running_pid(rc, self._this_boot)]
 
     def _job_without_rc(self, tid: int) -> bool:
         """Whether a detached job task tid started on the earlier boot never wrote its .rc: the reboot
