@@ -1,7 +1,9 @@
 # tt-dit-bringup
 
 Skills for bringing models up in `models/tt_dit` on Tenstorrent hardware.
-`dit-bringup` starts a whole-model bring-up and defines its required artifacts;
+`dit-bringup` drives a whole-model bring-up through seven stages (components,
+unit correctness, missing ops, end-to-end, output quality, end-to-end perf,
+optimization), each ending in a summary or report a person can review;
 `dit-device-backend` decides where device commands run (local host, batch
 submit, or Slurm). The five `tt-dit-*` skills below do the work. They were
 written by Kevin Mi in tt-metal (`kevinmi/tt-dit-skills`, PRs 52234 and 52247)

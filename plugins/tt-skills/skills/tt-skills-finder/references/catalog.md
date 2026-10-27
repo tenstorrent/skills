@@ -140,8 +140,8 @@ Install or enable it only after the user chooses it:
 
 Use for bringing tt_dit models up in TTNN: diffusion transformers, VAEs, text encoders, and full
 image or video pipelines under `models/tt_dit`. For autoregressive text LLMs, recommend
-`tt-model-bringup` instead. Covers per-component correctness, profiling, optimization, kernel
-research, and multi-session campaigns, with device runs on the local host, through a batch
+`tt-model-bringup` instead. Runs seven gated stages on the target hardware, from component
+bring-up and unit correctness through VBench/CLIP quality, end-to-end perf and optimization, with device runs on the local host, through a batch
 submit command, or in a Slurm allocation.
 
 Install or enable it only after the user chooses it:
