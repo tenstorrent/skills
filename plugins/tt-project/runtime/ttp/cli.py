@@ -1926,7 +1926,9 @@ def cmd_upstream(a) -> None:
     not-a-bug note without a release, `--ack <fp>
     "<evidence>"` closes it for this project, `--regress <fp> "<reason>"` records that a shipped fix did not
     hold (its filer's note then never closes by silence, nor as filer unreachable), `--fp "<title>" "<spec>"` prints the id an `upstream: ...`
-    follow-up gets, and `--mine` / `--resolved` list this project's notes / every resolution."""
+    follow-up gets, and `--mine` / `--resolved` list this project's notes / every resolution. With no flag it
+    lists the inbox's notes with each sender (project, host, task), open first, then the forward status;
+    `--resolve` prints the sender and sends the answer to it once when it is another project on this machine."""
     from . import upstream
     if a.has_project is not None:
         print(json.dumps({"project": a.has_project, "here": upstream.has_project(a.has_project)}))
@@ -1960,8 +1962,11 @@ def cmd_upstream(a) -> None:
                     upstream.queue_wontfix(Path(os.environ["TTP_RUN_DIR"]), a.resolve, a.wontfix)
                     print(f"wontfix of note {a.resolve.strip().lower()} queued in this run's directory "
                           f"({e.strerror or e}); this project's daemon records it when the run ends")
+                    _answer_sender({"kind": "wontfix", "fp": a.resolve.strip().lower(),
+                                    "note": " ".join(a.wontfix.split())}, me)
                     return
                 print(f"note {r['fp']} closed without a release (wontfix): {r['note']}")
+                _answer_sender(r, me)
                 return
             if a.resolve:
                 if not a.fixed_in:
@@ -1976,9 +1981,12 @@ def cmd_upstream(a) -> None:
                     upstream.queue_resolve(Path(os.environ["TTP_RUN_DIR"]), a.resolve, a.fixed_in, a.note or "")
                     print(f"resolution of note {a.resolve.strip().lower()} queued in this run's directory "
                           f"({e.strerror or e}); this project's daemon records it when the run ends")
+                    _answer_sender({"kind": "resolve", "fp": a.resolve.strip().lower(),
+                                    "fixed_in": a.fixed_in.strip().lstrip("v")}, me)
                     return
                 print(f"note {r['fp']} resolved: fixed in {r['fixed_in']}. The project that filed it is told once its "
                       f"daemon runs that version; it closes the note with `ttp upstream --ack {r['fp']} \"<evidence>\"`")
+                _answer_sender(r, me)
                 return
             if a.resolved:
                 for line in upstream.listing(None) or ["no upstream note is resolved"]:
@@ -2049,8 +2057,34 @@ def cmd_upstream(a) -> None:
         print("upstream notes go to " + ("the machines of the remote projects" if got is None
                                          else ", ".join(got) if got else "no other machine"))
         return
-    for line in upstream.forward_status():
+    for line in ([] if a.forward_status else upstream.inbox_lines()) + upstream.forward_status():
         print(line)
+
+
+def _answer_sender(rec: dict, me) -> None:
+    """After `ttp upstream --resolve`: print who sent the note and, when that is another project on this
+    machine, send it the answer once through the note path (a repeat is a duplicate). Never fails the
+    resolve: a send that cannot be made says why."""
+    from . import upstream
+    n, to, line = upstream.answer_target(rec["fp"], me.name if me else "")
+    if not to:
+        print(line)
+        return
+    text, task = upstream.answer_text(n, rec), os.environ.get("TTP_TASK") or ""
+    source, task = (me.name if me else upstream.MAINTAINERS), (int(task) if task.isdigit() else None)
+    try:
+        got = (upstream.send_or_queue(me.state, source, task, to, text)[0] if me
+               else upstream.send(source, task, to, text))
+    except OSError as e:
+        if not os.environ.get("TTP_RUN_DIR"):
+            print(f"{line}; answer not sent: {e.strerror or e}")
+            return
+        upstream.queue(Path(os.environ["TTP_RUN_DIR"]), to, text)
+        got = "queued in this run's directory"
+    words = {"sent": "answer sent", "duplicate": "answer already sent",
+             "queued": "answer queued in this project's outbox (the hourly limit)",
+             "limited": "answer not sent: this machine's hourly note limit", "full": "answer not sent: the outbox is full"}
+    print(f"{line}; {words.get(got, 'answer ' + got)} to {to} as {upstream.note_id(to, text)}")
 
 def cmd_push(a) -> None:
     """Publish this worktree's commits onto the project's target branch, guarded: refuse a dirty
@@ -7771,7 +7805,8 @@ def main(argv: list[str] | None = None) -> None:
                         "one); REASON: why, one line (an exit code, the refusal's text); --key may come anywhere")
     m.set_defaults(fn=cmd_progress)
 
-    s = sub.add_parser("upstream", help="upstream notes across machines: receive, forwarding status and targets")
+    s = sub.add_parser("upstream", help="upstream notes across machines: the inbox "
+                       "with each note's sender (project, host, task), receive, forwarding status and targets")
     s.add_argument("--receive", action="store_true", help="file notes sent over ssh (JSON lines on stdin); prints an ack")
     s.add_argument("--via", metavar="ALIAS", help="with --receive: the sending machine's alias")
     s.add_argument("--forward-status", action="store_true", help="per target: cursor, last ok, last error (the default)")
@@ -7779,7 +7814,8 @@ def main(argv: list[str] | None = None) -> None:
                    "the daemon has failed to reach for a while (started in the background by `ttp note` and `ttp status`)")
     s.add_argument("--forward-to", metavar="ALIASES",
                    help="machines to send this machine's notes on to (comma-separated), 'default' or 'none'")
-    s.add_argument("--resolve", metavar="FP", help="record that note FP is fixed (with --fixed-in)")
+    s.add_argument("--resolve", metavar="FP", help="record that note FP is fixed (with --fixed-in); prints its sender "
+                   "and sends the answer once to a sending project on this machine")
     s.add_argument("--fixed-in", metavar="VERSION", help="with --resolve: the release with the fix")
     s.add_argument("--wontfix", metavar="REASON", help="with --resolve: close note FP without a release (not a "
                                                        "plugin bug); the reason is required and recorded")

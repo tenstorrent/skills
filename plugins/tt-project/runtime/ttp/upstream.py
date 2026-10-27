@@ -1202,6 +1202,77 @@ def listing(name: str | None, now: float | None = None) -> list[str]:
     return out
 
 
+INBOX_LIST_MAX = 50   # notes `ttp upstream` lists; past it, a count of the rest
+
+
+def _inbox_notes() -> list[dict]:
+    """The maintainers' notes in this machine's inbox (not notes addressed to a project), once each."""
+    try:
+        with open(path(), "rb") as f:
+            fcntl.flock(f, fcntl.LOCK_SH)
+            notes = _lines(f.read())[0]
+    except FileNotFoundError:
+        return []
+    return list({n["fp"]: n for n in reversed(notes) if not n.get("to")}.values())[::-1]
+
+
+def _sender(n: dict) -> str:
+    """Who filed note `n`: its project, host and task; `unknown` for a field an older record lacks."""
+    task = n.get("task")
+    return (f"from {n.get('project') or 'unknown'} on {n.get('host') or 'unknown'} "
+            f"task {f'#{task}' if task not in (None, '') else 'unknown'}")
+
+
+def inbox_lines(limit: int | None = None, now: float | None = None) -> list[str]:
+    """`ttp upstream`: the inbox's notes one per line (fingerprint, open/fixed/wontfix, sender, title),
+    open ones first, newest first within each; past `limit`, a count of the rest."""
+    recs, notes, limit = _records(), _inbox_notes(), INBOX_LIST_MAX if limit is None else limit
+    if not notes:
+        return ["no upstream note in this machine's inbox"]
+    rows = []
+    for n in notes:
+        st = state(n["fp"], now, recs)
+        res = resolution(n["fp"], recs)
+        st = st if st in ("open", "wontfix") else f"fixed in {res['fixed_in']}" if res else "fixed"
+        rows.append((st != "open", -float(n.get("ts") or 0), f"{n['fp']} {st} {_sender(n)}: "
+                     f"{' '.join(str(n.get('title') or '').split())[:120]}"))
+    rows.sort(key=lambda r: r[:2])
+    opened = sum(1 for r in rows if not r[0])
+    out = [f"upstream notes in this machine's inbox: {opened} open of {len(rows)}"] + [r[2] for r in rows[:limit]]
+    return out + ([f"… {len(rows) - limit} more not shown"] if len(rows) > limit else [])
+
+
+def answer_target(fp: str, by: str) -> tuple[dict, str | None, str]:
+    """For `--resolve`: note `fp`'s inbox record, the project on this machine to answer (None when
+    there is none) and the line saying who sent it and, with no target, why no answer goes."""
+    fp = _check_fp(fp)
+    n = _find(fp)[0]
+    if not n:
+        return {}, None, f"sender: unknown (note {fp} is not in this machine's inbox); no answer sent"
+    who, host = n.get("project"), n.get("host")
+    line = f"sender: {_sender(n)[len('from '):]}"
+    why = ("the note names no sending project" if not who
+           else "its host is unknown" if not host
+           else f"{who} runs on another machine ({host})" if n.get("via") or host != project.hostname()
+           else "the sender is this project" if who == by
+           else f"no project {who} is registered on this machine" if not has_project(who) else "")
+    return n, (None if why else who), line + (f"; no answer sent: {why}" if why else "")
+
+
+def answer_text(n: dict, rec: dict) -> str:
+    """The note a resolution sends back to the project that filed note `n` (`rec`: the resolve or
+    wontfix record): the same resolution always reads the same, so a repeat is a duplicate."""
+    fp = rec["fp"]
+    what = f"Your upstream note {fp} ({' '.join(str(n.get('title') or '').split())[:120]})"
+    if rec.get("kind") == "wontfix":
+        return note_text(f"{what} was closed as won't fix, not a plugin bug: {cut(str(rec.get('note') or ''), 'it')[:SPEC_CHARS // 2]}"
+                         f". No release fixes it (`ttp upstream --fixed {fp}` exits {WONTFIX_RC}).")
+    v = rec["fixed_in"]
+    return note_text(f"{what} is fixed in tt-project {v}. Once your daemon runs {v}, check the fix and close the "
+                     f"note with `ttp upstream --ack {fp} \"<evidence>\"`, or `ttp upstream --regress {fp} \"<reason>\"` "
+                     f"if it did not hold.")
+
+
 # sending notes on to machines that cannot reach this one ------------------------------------------
 def settings_path() -> Path:
     return project.HOME_DIR / "settings.json"

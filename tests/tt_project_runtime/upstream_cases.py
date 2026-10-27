@@ -360,3 +360,112 @@ def test_upstream_fixed_prints_the_note_and_what_it_read(env, monkeypatch, capsy
     assert rc == 2 and "running daemon version is unknown" in out, out
     rc, out, err = fixed("nothex")
     assert rc == 2 and out == "" and "not a note fingerprint" in err, (out, err)
+
+
+def _raw_inbox_line(env, rec):
+    with open(env["home"] / "upstream.jsonl", "a") as f:
+        f.write(json.dumps(rec) + "\n")
+
+
+def test_ttp_upstream_lists_each_inbox_note_with_its_sender_open_first_and_bounded(env, monkeypatch, capsys):
+    """Bare `ttp upstream` used to print only the forward status, so finding who filed a note meant
+    reading the inbox file by hand. It now lists each maintainers' note with its fingerprint, status,
+    sending project, host and task, open notes first, newest first, within INBOX_LIST_MAX, then the
+    forward status. Notes addressed to a project are not listed; an older record lacking the sender
+    fields reads `unknown`."""
+    from ttp import cli, upstream
+    t0 = time.time()
+    for i, who in enumerate(["alpha", "beta", "gamma", "delta"]):
+        monkeypatch.setattr(upstream.time, "time", lambda i=i: t0 + i)
+        upstream.append(who, 10 + i, [{"title": f"upstream: lesson {i}", "spec": f"s{i}"}])
+    monkeypatch.undo()
+    fps = [upstream.fingerprint(f"upstream: lesson {i}", f"s{i}") for i in range(4)]
+    upstream.resolve(fps[3], "0.3.1")
+    upstream.wontfix(fps[2], "the project's own script")
+    old = "0123456789abcdef"
+    _raw_inbox_line(env, {"ts": t0 - 50, "title": "upstream: an old note", "spec": "x", "fp": old})
+    upstream.send("alpha", 3, "beta", "an addressed note, not for the maintainers")
+    assert _upstream_cli(cli) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == "upstream notes in this machine's inbox: 3 open of 5"
+    assert lines[1:4] == [f"{fps[1]} open from beta on testhost task #11: upstream: lesson 1",
+                          f"{fps[0]} open from alpha on testhost task #10: upstream: lesson 0",
+                          f"{old} open from unknown on unknown task unknown: upstream: an old note"]
+    assert lines[4:6] == [f"{fps[3]} fixed in 0.3.1 from delta on testhost task #13: upstream: lesson 3",
+                          f"{fps[2]} wontfix from gamma on testhost task #12: upstream: lesson 2"]
+    assert "addressed" not in "\n".join(lines) and lines[6:] == upstream.forward_status()
+    # Bounded: the newest open notes first, then a count of the rest.
+    monkeypatch.setattr(upstream, "INBOX_LIST_MAX", 2)
+    assert _upstream_cli(cli) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[1].startswith(fps[1]) and lines[2].startswith(fps[0]) and lines[3] == "… 3 more not shown"
+    # --forward-status keeps printing the forward status alone.
+    assert _upstream_cli(cli, "--forward-status") == 0
+    assert capsys.readouterr().out.splitlines() == upstream.forward_status()
+
+
+def test_upstream_resolve_prints_the_sender_and_answers_a_local_sending_project_once(env, monkeypatch, capsys):
+    """`ttp upstream --resolve` prints who sent the note. A sender that is another project registered on
+    this machine gets the answer (fixed in X, or won't fix and why) once, as an addressed note; resolving
+    again sends nothing new. A sender on another machine, the resolving project itself, an unregistered
+    or unknown sender, or a note not in this inbox: it says no answer was sent and why, and the resolve
+    still succeeds."""
+    from ttp import cli, upstream
+    from ttp.cli import bootstrap
+    from ttp.project import register
+    p = make(env)
+    repo2 = env["tmp"] / "repo2"
+    subprocess.run(["git", "clone", "-q", str(env["repo"]), str(repo2)], check=True)
+    register("second", {"host": "testhost", "dir": str(bootstrap(repo2, "second", "Another project.", "fake").root)})
+    monkeypatch.chdir(p.base)
+    notes = {k: {"title": f"upstream: {k} note", "spec": "s"} for k in ("fix", "nofix", "far", "self", "ghost")}
+    fp = {k: upstream.fingerprint(n["title"], n["spec"]) for k, n in notes.items()}
+    upstream.append("second", 7, [notes["fix"], notes["nofix"]])
+    upstream.append("demo", 8, [notes["self"]])
+    upstream.append("ghost", 9, [notes["ghost"]])
+    _raw_inbox_line(env, {"ts": time.time(), "project": "far", "host": "farbox", "task": 2, "via": "farbox",
+                          "title": notes["far"]["title"], "spec": "s", "fp": fp["far"]})
+    old = "0123456789abcdef"
+    _raw_inbox_line(env, {"ts": time.time(), "title": "upstream: old", "spec": "s", "fp": old})
+
+    def answers():
+        return [n for n in _upstream_inbox(env) if n.get("to") == "second"]
+
+    assert _upstream_cli(cli, "--resolve", fp["fix"], "--fixed-in", "0.3.2") == 0
+    out = capsys.readouterr().out
+    (a,) = answers()
+    assert f"sender: second on testhost task #7; answer sent to second as {a['fp']}" in out
+    assert a["project"] == "demo" and f"{fp['fix']}" in a["spec"] and "fixed in tt-project 0.3.2" in a["spec"]
+    assert f"ttp upstream --ack {fp['fix']}" in a["spec"]
+    # Idempotent: the same resolution again sends nothing new.
+    assert _upstream_cli(cli, "--resolve", fp["fix"], "--fixed-in", "0.3.2") == 0
+    assert f"answer already sent to second as {a['fp']}" in capsys.readouterr().out and len(answers()) == 1
+    assert _upstream_cli(cli, "--resolve", fp["nofix"], "--wontfix", "the project's own check") == 0
+    assert "answer sent to second" in capsys.readouterr().out
+    assert len(answers()) == 2 and "won't fix" in answers()[1]["spec"] and "the project's own check" in answers()[1]["spec"]
+    assert _upstream_cli(cli, "--resolve", fp["nofix"], "--wontfix", "the project's own check") == 0
+    assert "answer already sent" in capsys.readouterr().out and len(answers()) == 2
+    # No answer: each says why, and the resolve is still recorded.
+    for key, why in [("far", "sender: far on farbox task #2; no answer sent: far runs on another machine (farbox)"),
+                     ("self", "sender: demo on testhost task #8; no answer sent: the sender is this project"),
+                     ("ghost", "no answer sent: no project ghost is registered on this machine")]:
+        assert _upstream_cli(cli, "--resolve", fp[key], "--fixed-in", "0.3.2") == 0
+        assert why in capsys.readouterr().out, key
+        assert upstream.resolution(fp[key])["fixed_in"] == "0.3.2"
+    assert _upstream_cli(cli, "--resolve", old, "--wontfix", "not ours") == 0
+    assert ("sender: unknown on unknown task unknown; no answer sent: the note names no sending project"
+            in capsys.readouterr().out) and upstream.wontfixed(old)
+    assert _upstream_cli(cli, "--resolve", "fedcba9876543210", "--fixed-in", "0.3.2") == 0
+    assert "sender: unknown (note fedcba9876543210 is not in this machine's inbox); no answer sent" in capsys.readouterr().out
+    assert len(answers()) == 2 and not [n for n in _upstream_inbox(env) if n.get("to") not in (None, "second")]
+    # A sandbox that cannot write the user's files: the resolve and the answer wait in the run's directory.
+    run_dir = env["tmp"] / "run-sandboxed"
+    run_dir.mkdir()
+    monkeypatch.setenv("TTP_RUN_DIR", str(run_dir))
+    monkeypatch.setattr(upstream, "_record", lambda rec: (_ for _ in ()).throw(PermissionError(13, "read-only")))
+    monkeypatch.setattr(upstream, "send_or_queue", lambda *a, **k: (_ for _ in ()).throw(PermissionError(13, "read-only")))
+    upstream.append("second", 7, [{"title": "upstream: sandboxed", "spec": "s"}])
+    assert _upstream_cli(cli, "--resolve", upstream.fingerprint("upstream: sandboxed", "s"), "--fixed-in", "0.3.3") == 0
+    assert "answer queued in this run's directory to second" in capsys.readouterr().out
+    (q,) = [json.loads(x) for x in (run_dir / upstream.QUEUED_FILE).read_text().splitlines()]
+    assert q["to"] == "second" and "fixed in tt-project 0.3.3" in q["text"] and len(answers()) == 2

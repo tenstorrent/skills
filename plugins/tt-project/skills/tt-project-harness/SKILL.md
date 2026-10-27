@@ -135,6 +135,8 @@ read the one for the lever you change.
   14 days. If the fix did not hold, run `ttp upstream --regress <fp> "<reason>"` (filer project only,
   after a resolution; stays on this machine): it blocks the close by silence. Filing the same note
   again after its resolution counts as a regression. `ttp upstream --mine` lists this project's notes.
+  `ttp upstream` lists the inbox's notes with each sender (project, host, task), open first; `--resolve`
+  prints the sender and sends the answer once to a sending project on this machine.
 
 ## Maintainer checklist (liveness, progress, deploys)
 
