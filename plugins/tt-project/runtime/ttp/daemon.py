@@ -3671,12 +3671,14 @@ class Daemon:
         cell_chk = cells.check(task.get("spec"), result) \
             if new == "done" and task["kind"] != "review" and isinstance(result, dict) else None
         cell_mark = cells.prefix(cell_chk)
-        if cell_mark and not cells.marked(summary):
-            summary = f"{cell_mark}{summary}"
+        # `cells_checked` in the stored result is the daemon's own seal (it survives a deferred push and
+        # a restart); a worker's own 'partial:' text is not, so its missing cells still get a follow-up.
+        if cell_mark and not result.get("cells_checked"):
+            summary = summary if cells.marked(summary) else f"{cell_mark}{summary}"
             fups0 = result.get("followups") if isinstance(result.get("followups"), list) else []
             add = [cells.followup(task, cell_chk["missing"])] \
                 if cell_chk["missing"] and not cells.has_followup(fups0) else []
-            result = {**result, "summary": summary, "followups": [*fups0, *add]}
+            result = {**result, "summary": summary, "followups": [*fups0, *add], "cells_checked": True}
             log(self.p, f"task {task['id']}: {cell_mark.strip()}")
         extra: dict = {}
         reason = None

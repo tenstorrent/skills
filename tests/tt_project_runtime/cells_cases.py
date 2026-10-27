@@ -132,3 +132,36 @@ def test_only_a_worker_whose_spec_has_a_cells_line_is_told_about_the_cells_field
     assert '"cells": [' in prompt and "A cell that ran without a valid result is not finished" in prompt
     prompt = worker_prompt(p, p.db.task(without), str(p.root), None)
     assert '"cells": [' not in prompt and "valid result is not finished" not in prompt
+
+
+def test_a_worker_written_partial_summary_still_gets_the_missing_cells_follow_up(env):
+    p = make(env)
+    res = {"status": "done", "summary": "partial: only 150W ran", "cells": ["150W"]}
+    tid, _ = _finish_cells(env, p, SWEEP, res)
+    got = load_result(p.db.task(tid)["result"])
+    assert got["summary"] == "partial: only 150W ran" and got["cells_checked"] is True
+    hops = p.db.q("SELECT spec FROM tasks WHERE parent=?", (tid,))
+    fup = p.db.q("SELECT text FROM events WHERE task=? AND kind='followup_proposed'", (tid,))
+    assert len(hops) + (0 if hops else len(fup)) == 1, (hops, fup)
+
+
+def test_a_summary_the_daemon_already_marked_is_not_marked_or_followed_up_twice(env):
+    p = make(env)
+    res = {"status": "done", "summary": "measured", "cells": ["150W"]}
+    tid, _ = _finish_cells(env, p, SWEEP, res)
+    sealed = load_result(p.db.task(tid)["result"])
+    assert sealed["summary"].count("partial:") == 1
+    n = len(p.db.q("SELECT id FROM tasks WHERE parent=?", (tid,))) + \
+        len(p.db.q("SELECT id FROM events WHERE task=? AND kind='followup_proposed'", (tid,)))
+    tid2, _ = _finish_cells(env, p, SWEEP, sealed)
+    again = load_result(p.db.task(tid2)["result"])
+    assert again["summary"] == sealed["summary"] and len(again["followups"]) == len(sealed["followups"])
+    assert n == 1
+
+
+def test_a_complete_matrix_gets_no_mark_or_seal(env):
+    p = make(env)
+    res = {"status": "done", "summary": "ok", "cells": ["150W", "200W", "250W"]}
+    tid, _ = _finish_cells(env, p, SWEEP, res)
+    got = load_result(p.db.task(tid)["result"])
+    assert got["summary"] == "ok" and "cells_checked" not in got
