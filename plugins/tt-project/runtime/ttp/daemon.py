@@ -118,6 +118,7 @@ from . import startcheck
 from . import startgate
 from . import sweep
 from . import sweepskip
+from . import testslots
 from . import timefmt
 from . import ttr
 from . import turngate
@@ -2232,6 +2233,8 @@ class Daemon:
                    "TTP_RUN_ID": str(run_id), **task_env(task["id"] if task else ""), "PYTHONPATH": runtime_dir,
                    **({"TTP_LEASE_EPOCH": str(self._lease.epoch)} if self._lease else {}),
                    "TTP_PYTHON": sys.executable,   # `ttp` runs under this, not the venv's python3
+                   # Tests run straight in its shell take at most one run's share of the host's test slots.
+                   **(testslots.worker_env(self.cfg) if role in ("worker", "reviewer") else {}),
                    # A worker's sandbox may run commands in a PID namespace or cgroup of their own, which
                    # ends with the command: `ttp push --detach` and `ttp detach` compare and have the
                    # daemon start the push or job.

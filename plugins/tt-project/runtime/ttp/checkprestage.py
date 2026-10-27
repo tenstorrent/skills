@@ -14,13 +14,14 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import shlex
 import tempfile
 import time
 from pathlib import Path
 
-from . import boundedchild
+from . import boundedchild, checkcap, testslots
 
 KEY = "check_prestage"
 DEFAULT_TIMEOUT_S = 90.0     # under the 120 s a Bash tool call gets by default, so the caller outlives it
@@ -248,13 +249,21 @@ def run(v, cwd: str, env: dict, say, what: str = f"delivery.{KEY}", ok: tuple = 
     if spec is None:
         return 0
     cmd, timeout = spec
+    # It runs on the host's test slots (testslots) like the full checks; still none free after a
+    # foreground wait, the detached full checks start without it and wait for theirs.
+    grant = testslots.acquire(f"ttp checks pre-stage (task #{os.environ.get('TTP_TASK') or '?'}, pid {os.getpid()})",
+                              say, checkcap.FOREGROUND_WAIT_S)
+    if grant is None:
+        say("pre-stage skipped: the host's test slots stayed busy; starting the full checks without it")
+        return 0
     say(f"pre-stage {(shown or cmd)!r} ({what}, up to {timeout:.0f} s) before the full checks start in the background")
     t0 = time.monotonic()
     # Its output goes to a file, not a pipe, so a process it leaves running cannot hold the run open;
     # boundedchild kills its whole group however the run ends (a SIGTERM or SIGHUP to `ttp checks` too).
-    with tempfile.NamedTemporaryFile(prefix="ttp-prestage-") as out:
-        res = boundedchild.run(f"exec >{shlex.quote(out.name)} 2>&1\n{cmd}", timeout, shell=True, cwd=cwd,
-                               env=env, text=False, stderr="stdout")
+    with grant, tempfile.NamedTemporaryFile(prefix="ttp-prestage-") as out:
+        script = f"exec >{shlex.quote(out.name)} 2>&1\n{testslots.clamp(cmd, grant.k)}"
+        res = boundedchild.run(testslots.low_priority(["/bin/sh", "-c", script]), timeout, cwd=cwd,
+                               env={**env, **grant.env()}, text=False, stderr="stdout")
         if res.error.startswith("could not start"):
             say(f"pre-stage not started ({res.error.partition(': ')[2]}); starting the full checks without it")
             return 0

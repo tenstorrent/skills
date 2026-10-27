@@ -264,9 +264,9 @@ def test_check_commands_run_niced_where_nice_and_ionice_exist_unless_turned_off(
     from ttp import cli, project
     have = {"nice"}
     monkeypatch.setattr(cli.shutil, "which", lambda name: f"/usr/bin/{name}" if name in have else None)
-    assert cli._low_priority(["pytest"]) == ["nice", "-n", "19", "pytest"]
+    assert cli._low_priority(["pytest"]) == ["nice", "-n", "10", "pytest"]
     have.add("ionice")
-    assert cli._low_priority(["pytest"]) == ["nice", "-n", "19", "ionice", "-c3", "pytest"]
+    assert cli._low_priority(["pytest"]) == ["nice", "-n", "10", "ionice", "-c2", "-n7", "pytest"]
     have.clear()
     assert cli._low_priority(["pytest"]) == ["pytest"], "neither found: run as it is"
     have.update({"nice", "ionice"})
@@ -713,3 +713,162 @@ def test_checks_log_records_each_check_commands_wall_clock_seconds_and_exit(env,
     took = re.search(r"^ttp checks: sleep 0\.3 took (\d+\.\d) s \(exit 0\)$", log, re.M)
     assert took and float(took.group(1)) >= 0.3, log
     assert re.search(r"^ttp checks: exit 4 took \d+\.\d s \(exit 4\)$", log, re.M), log
+
+
+# Host-wide test-worker slots (testslots) --------------------------------------------------------
+_SLOT_HOLDER = """
+import os, sys, time
+from pathlib import Path
+from ttp import testslots
+g = testslots.acquire("holder " + sys.argv[1])
+Path(sys.argv[2]).write_text(str(g.k))
+while not Path(sys.argv[3]).exists():
+    time.sleep(0.05)
+"""
+
+
+def _slot_holder(env_vars: dict, name: str, base, tmp_path):
+    got, stop = tmp_path / f"{name}.k", tmp_path / f"{name}.stop"
+    proc = subprocess.Popen([sys.executable, "-c", _SLOT_HOLDER, name, str(got), str(stop)],
+                            env={**os.environ, **env_vars, "TTP_PROJECT": str(base),
+                                 "PYTHONPATH": str(RUNTIME)})
+    assert _wait_for(lambda: got.exists() and got.read_text())
+    return proc, int(got.read_text()), stop
+
+
+def test_test_slots_two_projects_share_one_host_pool_and_a_killed_holder_frees_its_slots(env, tmp_path, monkeypatch):
+    from ttp import locks, testslots
+    monkeypatch.setenv("TTP_TEST_POOL", "3")
+    monkeypatch.setenv("TTP_TEST_RUN_MAX", "2")
+    a_base, b_base = tmp_path / "proj-a", tmp_path / "proj-b"
+    a_base.mkdir()
+    b_base.mkdir()
+    a, ka, _ = _slot_holder({}, "a", a_base, tmp_path)
+    b, kb, b_stop = _slot_holder({}, "b", b_base, tmp_path)
+    try:
+        assert (ka, kb) == (2, 1), "the second project gets what the first left, never more than the pool"
+        assert len(locks.held_labels(testslots.paths(3))) == 3
+        assert testslots.acquire("third", wait_s=0.2) is None, "a full pool grants nothing more"
+        a.kill()   # SIGKILL: no clean-up runs, the kernel drops its locks
+        a.wait(10)
+        g = testslots.acquire("after", wait_s=5)
+        assert g is not None and g.k == 2, "a killed holder's slots are free again"
+        g.close()
+    finally:
+        b_stop.write_text("")
+        for proc in (a, b):
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(10)
+
+
+def test_test_slots_default_sizes_follow_the_cores_and_host_settings_override_them(env, monkeypatch):
+    from ttp import cli, testslots
+    assert testslots.sizes(cores=64) == (32, 8)
+    assert testslots.sizes(cores=16) == (8, 4)
+    assert testslots.sizes(cores=4) == (2, 1)
+    assert testslots.sizes(cores=1) == (2, 1), "at least 2 slots, at least 1 per run"
+    monkeypatch.setattr(testslots.checkcap, "cores", lambda: 24)
+    assert testslots.sizes() == (12, 6), "the host's usable cores, mocked"
+    cli.main(["config", "--account", "checks.test_pool", "20"])
+    assert testslots.sizes() == (20, 8)
+    cli.main(["config", "--account", "checks.test_run_max", "3"])
+    assert testslots.sizes() == (20, 3)
+    monkeypatch.setenv("TTP_TEST_POOL", "6")
+    assert testslots.sizes() == (6, 3), "the environment wins over the account setting"
+    cli.main(["config", "--account", "checks.test_pool", "0"])
+    monkeypatch.delenv("TTP_TEST_POOL")
+    assert testslots.sizes() is None and testslots.worker_env({}) == {}, "test_pool 0 turns the pool off"
+
+
+def test_test_slots_project_config_can_only_lower_the_host_limits(env, monkeypatch):
+    from ttp import testslots
+    monkeypatch.setattr(testslots.checkcap, "cores", lambda: 32)
+    assert testslots.sizes({"checks": {"test_pool": 100, "test_run_max": 50}}) == (16, 8), "never raised"
+    assert testslots.sizes({"checks": {"test_pool": 4}}) == (4, 4)
+    assert testslots.sizes({"checks": {"test_pool": 6, "test_run_max": 2}}) == (6, 2)
+    assert testslots.sizes({"checks": {"test_pool": 0}}) == (16, 8), "a project cannot turn the host's pool off"
+    assert testslots.worker_env({"checks": {"test_run_max": 3}}) == {
+        "PYTEST_XDIST_AUTO_NUM_WORKERS": "3", "TTP_TEST_SLOTS": "3"}
+
+
+def test_test_slots_clamp_only_lowers_pytest_worker_counts_above_the_grant(env):
+    from ttp import push, testslots
+    c = testslots.clamp
+    assert c("pytest -q -n 64 tests", 4) == "pytest -q -n 4 tests"
+    assert c("python3 -m pytest -n64 x", 4) == "python3 -m pytest -n4 x"
+    assert c("pytest --numprocesses=64 x && pytest --numprocesses 9", 4) == \
+        "pytest --numprocesses=4 x && pytest --numprocesses 4"
+    assert c("pytest -n 2 x", 4) == "pytest -n 2 x", "below the grant: as it is"
+    assert c("pytest -n auto x", 4) == "pytest -n auto x", "auto reads the environment"
+    assert c("nice -n 19 pytest -n 16 | head -n 50", 4) == "nice -n 19 pytest -n 4 | head -n 50"
+    assert c("make -j 64 && sort -n 64 f", 4) == "make -j 64 && sort -n 64 f", "no pytest: untouched"
+    argv = push.check_argv("pytest -n 64 tests", None, {**os.environ, testslots.HELD_ENV: "3"}, isolate=False)
+    assert argv[-1].endswith("pytest -n 3 tests")
+    assert push.check_argv("pytest -n 64 tests", None, {}, isolate=False)[-1].endswith("pytest -n 64 tests")
+
+
+def test_ttp_checks_passes_its_test_slot_grant_runs_without_nice_and_clamps_n(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli, testslots
+    import shutil as _shutil
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setenv("TTP_TEST_POOL", "6")
+    monkeypatch.setenv("TTP_TEST_RUN_MAX", "3")
+    real = _shutil.which
+    monkeypatch.setattr(testslots.shutil, "which", lambda n, *a, **k: None if n in ("nice", "ionice") else real(n, *a, **k))
+    seen = tmp_path / "seen"
+    cli.main(["checks", "--", "sh", "-c",
+              f'echo "$PYTEST_XDIST_AUTO_NUM_WORKERS $TTP_TEST_SLOTS" > {seen}; echo pytest -n 64 >> {seen}'])
+    assert seen.read_text().split("\n")[0] == "3 3", "-n auto reads the grant"
+    log = (run / "checks.log").read_text()
+    assert "test slots: 3 granted of a host pool of 6" in log and "s waiting" in log
+    assert not locks_held(testslots), "released once the checks end"
+
+
+def locks_held(testslots):
+    from ttp import locks
+    return locks.held_labels(testslots.paths(testslots.sizes()[0]))
+
+
+def test_test_slots_a_full_pool_waits_with_a_line_then_runs(env, monkeypatch):
+    import threading
+    from ttp import testslots
+    monkeypatch.setenv("TTP_TEST_POOL", "2")
+    monkeypatch.setattr(testslots, "POLL_S", 0.05)
+    first = testslots.acquire("first")
+    assert first.k == 1
+    second = testslots.acquire("second")
+    told, got = [], []
+    t = threading.Thread(target=lambda: got.append(testslots.acquire("waiter", told.append)))
+    t.start()
+    try:
+        assert _wait_for(lambda: any("waiting for a host-wide test slot" in x for x in told))
+        assert not got, "no grant while the pool is full, and no failure"
+    finally:
+        first.close()
+    t.join(10)
+    assert got and got[0].k == 1 and "granted" in told[-1]
+    for g in (got[0], second):
+        g.close()
+
+
+def test_test_slots_off_restores_the_old_behaviour(env, tmp_path, monkeypatch):
+    from ttp import cli, testslots
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setenv("TTP_TEST_POOL", "0")
+    for var in (testslots.XDIST_ENV, testslots.SLOTS_ENV):
+        monkeypatch.delenv(var, raising=False)
+    g = testslots.acquire("x")
+    assert g.k == 0 and g.env() == {}
+    assert testslots.clamp_for("pytest -n 64", {}) == "pytest -n 64"
+    seen = tmp_path / "seen"
+    cli.main(["checks", "--", "sh", "-c", f'echo "[$PYTEST_XDIST_AUTO_NUM_WORKERS]" > {seen}'])
+    assert seen.read_text().strip() == "[]"
+    assert "test slots" not in (run / "checks.log").read_text()
+
+
+def test_test_slots_nested_run_keeps_its_parents_grant(env, monkeypatch):
+    from ttp import testslots
+    monkeypatch.setenv(testslots.HELD_ENV, "2")
+    g = testslots.acquire("nested", wait_s=0)
+    assert g.k == 2 and not g.files

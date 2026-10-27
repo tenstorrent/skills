@@ -36,7 +36,7 @@ from typing import Any, Callable
 from urllib.parse import quote, unquote
 
 from . import (checkcap, checkdirs, cleantree, envfault, landed, locks, machines, prguard, remotecheck, runner, sandbox,
-               scriptwatch, settinghold, timefmt, worktree)
+               scriptwatch, settinghold, testslots, timefmt, worktree)
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
 from .project import (Project, code_tasks_may_push, durable_append, durable_write, git_fsync_env, hostname,
@@ -354,7 +354,7 @@ def check_argv(cmd: str, top: str | Path | None = None, env: dict | None = None,
     if host := remote_host(cmd):
         return remotecheck.argv(str(cmd), host, exports)
     cmd = venv_cmd(cmd, top, env) if top else cmd
-    cmd = remotecheck.exports(exports) + cmd
+    cmd = remotecheck.exports(exports) + testslots.clamp_for(cmd, env)
     bash = shutil.which("bash")
     argv = [bash, "-e", "-o", "pipefail", "-c", cmd] if bash else ["sh", "-e", "-c", cmd]
     return sandbox.wrap(argv, isolate, env)
@@ -650,10 +650,14 @@ def check_slot(head: str, say: Callable[[str], None], who: str = "", priority: s
     if not who:
         who = checkcap.label(name, "ttp push")
     if priority:
-        return checkcap.acquire_priority(priority, who, f"push checks on {head[:12]}", say, name, state)
-    prio, owns = checkcap.task_rank(proj)
-    return checkcap.acquire(who, f"push checks on {head[:12]}", say, project_name=name,
-                            priority=prio, state=state, owns=owns)
+        slot = checkcap.acquire_priority(priority, who, f"push checks on {head[:12]}", say, name, state)
+    else:
+        prio, owns = checkcap.task_rank(proj)
+        slot = checkcap.acquire(who, f"push checks on {head[:12]}", say, project_name=name,
+                                priority=prio, state=state, owns=owns)
+    # The run's share of the host's test-worker slots, held and freed with the checks slot (testslots).
+    slot.tests = testslots.acquire(who, say, cfg=proj.config() if proj else {})
+    return slot
 
 
 def priority_key(repo: Path, remote: str, branch: str) -> str:
@@ -3525,7 +3529,8 @@ def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None]) -> int
     if remote_host(cmd):
         say(f"running {cmd}{where(cmd)}")
     def once() -> int:
-        with subprocess.Popen(check_argv(cmd, repo, env), cwd=repo, env=env, pass_fds=checkdirs.inherited()) as proc:
+        with subprocess.Popen(testslots.low_priority(check_argv(cmd, repo, env)), cwd=repo, env=env,
+                              pass_fds=checkdirs.inherited()) as proc:
             try:
                 return proc.wait(timeout=check_limit_s)
             except subprocess.TimeoutExpired:

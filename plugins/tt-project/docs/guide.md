@@ -817,7 +817,10 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   shrinks as they load the host; a running check keeps its slot. A set cap wins: `ttp config
   --account checks.host_max N` (0 turns the cap off) or `TTP_CHECKS_HOST_MAX`. While
   the 1-minute load average is under half the cores, up to `checks.load_extra` more slots open (default 2,
-  0 turns them off); check commands run under `nice`/`ionice` unless `checks.nice` is false. A
+  0 turns them off); check commands run under `nice -n 10`/`ionice -c2 -n7` unless `checks.nice` is false. Each check
+  run also takes test-worker slots from a host pool shared by all projects (testslots: default half the cores, at
+  least 2; at most min(8, half the pool) per run; `checks.test_pool`, `checks.test_run_max`, 0 pool turns it off;
+  a project may only lower them) and passes its grant as PYTEST_XDIST_AUTO_NUM_WORKERS and TTP_TEST_SLOTS. A
   `ttp checks` or push inside a check command does not wait for its parent's slot. Checks that
   gate a push to the push branch (the push queue's batches and `ttp push`) hold the push lock, so
   they never queue behind task checks: each push branch has one priority slot of its own beyond the

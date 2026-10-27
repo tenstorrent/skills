@@ -300,15 +300,19 @@ class Slot:
     def __init__(self, f=None, served: bool = False):
         self.f = f
         self.served = served
+        self.tests = None   # the run's test slots (testslots.Grant), held and freed with this slot
 
     def env(self) -> dict[str, str]:
         """For the check commands' environment: a `ttp checks` or push nested in them runs at once."""
-        return {HELD_ENV: "1"} if self.f is not None else {}
+        return ({HELD_ENV: "1"} if self.f is not None else {}) | (self.tests.env() if self.tests else {})
 
     def close(self) -> None:
         if self.f is not None:
             self.f.close()
             self.f = None
+        if self.tests is not None:
+            self.tests.close()
+            self.tests = None
 
     def __enter__(self):
         return self

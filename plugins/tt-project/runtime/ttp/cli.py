@@ -1335,9 +1335,11 @@ def status_text(p: Project, verbose: bool = False) -> str:
                      + (f" in {pr['project']} (shared: holds in every project)" if pr.get("shared") else "")
                      + (f": {pr['reason']}" if pr.get("reason") else "") + (f"; {pr['end']}" if pr.get("end") else "")
                      + f" — resume: ttp resume {p.name} --resource {pr['resource']}")
-    from . import checkcap, locks, shared
+    from . import checkcap, locks, shared, testslots
     if host := checkcap.line():
         lines.append(host)
+    if pool := testslots.use():
+        lines.append(pool)
     if verbose and (slot_waits := checkcap.wait_line(p.state, now)):
         lines.append(slot_waits)
     for res in sorted(shared.names(p.config())):
@@ -3076,12 +3078,9 @@ def _checks_key(p: Project | None, tree: str, cmds: list, purpose: str) -> str:
 
 
 def _low_priority(argv: list) -> list:
-    """A check command's argv under `nice -n 19` and `ionice -c3` where they exist, so a host's
-    interactive and build work goes first; checks.nice false (account setting) runs it as it is."""
-    if (load_account_settings().get("checks") or {}).get("nice") is False:
-        return argv
-    return ((["nice", "-n", "19"] if shutil.which("nice") else [])
-            + (["ionice", "-c3"] if shutil.which("ionice") else []) + list(argv))
+    """A check command's argv at a lower CPU and IO priority (testslots.low_priority)."""
+    from . import testslots
+    return testslots.low_priority(argv)
 
 
 def _checks_cancelled(run_dir: Path) -> str:
@@ -3134,10 +3133,22 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     start = time.time()
     prio, owns = checkcap.task_rank(p)
     try:
-        return checkcap.acquire(checkcap.label(p.name if p else None), f"ttp checks on {head[:12]}", tell, waiting,
+        slot = checkcap.acquire(checkcap.label(p.name if p else None), f"ttp checks on {head[:12]}", tell, waiting,
                                 checkcap.FOREGROUND_WAIT_S if foreground and p else None, arrived,
                                 p.name if p else None, prio, same, done, lambda: _checks_cancelled(run_dir),
                                 p.state if p else None, owns)
+        if slot is None or slot.served:
+            return slot
+        # Then the run's share of the host's test-worker slots (testslots), held with the checks slot;
+        # in the foreground none free by the end of the same wait hands over to detached checks too.
+        from . import testslots
+        left = max(0.0, checkcap.FOREGROUND_WAIT_S - (time.time() - start)) if foreground and p else None
+        slot.tests = testslots.acquire(checkcap.label(p.name if p else None), tell, left,
+                                       p.config() if p else {})
+        if slot.tests is None:
+            slot.close()
+            return None
+        return slot
     except checkcap.Cancelled as e:
         said = f"not run: stopped waiting for a host-wide checks slot: {e}"
         out.write(f"ttp checks: {said}\n")
