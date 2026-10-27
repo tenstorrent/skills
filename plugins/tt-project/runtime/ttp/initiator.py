@@ -6,13 +6,15 @@ The daemon asks once per boot (daemon._note_boot) and keeps the answer in the bo
 question such as "did tt-project reboot this host?" is answered by the record itself. Sources, in
 order; each is bounded and never raises:
 
-1. The previous boot's journal (`journalctl -b <boot> -o json`, its last TAIL_ENTRIES entries), read
-   as this user, else through `sudo -n` (bounded, never prompts) when that showed only the user's own
-   entries and `sudo -n true` works: a sudo or pkexec COMMAND that runs reboot, shutdown, poweroff or
-   halt (or `systemctl reboot|poweroff|halt|kexec`), or systemd-logind's 'Power key pressed'; the last
-   one wins. Else the shutdown marker (logind's 'System is rebooting/powering down', systemd reaching
-   the reboot or poweroff target, a 'shutdown scheduled' line) and, within WINDOW_S before it, the
-   nearest system unit line that names a power cycle, reboot or shutdown: '<unit> (<message>)'.
+1. The previous boot's journal as JSON, read as this user, else through `sudo -n` (bounded, never
+   prompts, stores nothing) when that showed only the user's own entries and `sudo -n true` works. Two
+   bounded reads the same way: the boot's last MARK_ENTRIES lines of systemd, logind, sudo and pkexec,
+   then the WINDOW_S before the shutdown marker found there (logind's 'System is rebooting/powering
+   down', systemd reaching the reboot or poweroff target, a 'shutdown scheduled' line). A sudo or
+   pkexec COMMAND that runs reboot, shutdown, poweroff or halt (or `systemctl reboot|poweroff|halt|
+   kexec`), or logind's 'Power key pressed': the last one wins. Else the line nearest before the marker
+   of a system unit, or of systemd starting one, that names a power cycle, reboot or shutdown:
+   '<unit> (<message>)'.
 2. A tt-project host-cycle record (`ttp drain --reboot`) from any project on this host that ended that
    boot (hostcycle.planned).
 3. An entry in the shared machine-change ledger for this host's machine alias, recorded from
@@ -22,7 +24,7 @@ order; each is bounded and never raises:
 Else the unit started or logging nearest before the marker, a bare logind line, or for a boot whose
 journal ends with no marker 'no clean shutdown logged (...)' and its last unit lines. Else 'unknown',
 or 'unknown (journal not readable: <why>)'. Tests set TTP_TEST_NO_JOURNAL so the real journalctl and
-sudo never run; they stub run_journal and run_sudo_journal instead.
+sudo never run; they stub run_journal (extra, sudo) and sudo_ok instead.
 """
 from __future__ import annotations
 
@@ -35,10 +37,13 @@ import time
 from pathlib import Path
 
 JOURNAL_TIMEOUT_S = 5
-SUDO_TIMEOUT_S = 10   # sudo -n journalctl; `sudo -n true` before it takes SUDO_CHECK_S
-SUDO_CHECK_S = 5
-TAIL_ENTRIES = 3000   # the last entries of the boot: its shutdown and the minutes before it
-WINDOW_S = 600        # how far before the shutdown marker a unit line may name the initiator
+SUDO_TIMEOUT_S = 8    # each `sudo -n journalctl`; `sudo -n true` before them takes SUDO_CHECK_S
+SUDO_CHECK_S = 3
+MARK_ENTRIES = 5000   # the marker read: the boot's last lines of systemd, logind, sudo and pkexec
+WINDOW_S = 600        # the window read: this long before the shutdown marker, at most WINDOW_ENTRIES
+WINDOW_ENTRIES = 5000
+TAIL_ENTRIES = 300    # a boot with no marker: its last lines
+MARK_IDENTS = ("systemd-logind", "systemd", "sudo", "pkexec")
 FIELDS = "MESSAGE,_SYSTEMD_UNIT,UNIT,SYSLOG_IDENTIFIER,_COMM,_UID"
 LEDGER_WINDOW_S = 1800
 TEXT_CHARS = 120
@@ -54,6 +59,7 @@ _MARKER_LOGIND = re.compile(r"^System is (rebooting|powering down|halting)|shutd
 _MARKER_SYSTEMD = re.compile(r"^Reached target .*\b(reboot|power-?off|halt|kexec)\b", re.I)
 _UNIT_START = re.compile(r"^Start(?:ed|ing) (?P<unit>[\w.@:-]+\.(?:service|scope|timer))\b")
 NO_SHUTDOWN = "no clean shutdown logged (power loss, hard reset or watchdog)"
+EMPTY = "no system entries visible for the previous boot"
 
 
 def _clip(text, chars: int = TEXT_CHARS) -> str:
@@ -61,11 +67,10 @@ def _clip(text, chars: int = TEXT_CHARS) -> str:
     return text if len(text) <= chars else text[:chars - 1] + "…"
 
 
-def _journalctl(boot: str | None) -> list[str]:
+def _journalctl(boot: str | None, extra) -> list[str]:
     hexid = (boot or "").replace("-", "")
     which = hexid if re.fullmatch(r"[0-9a-f]{32}", hexid) else "-1"
-    return ["journalctl", "-b", which, "--no-pager", "-o", "json", "-n", str(TAIL_ENTRIES),
-            f"--output-fields={FIELDS}"]
+    return ["journalctl", "-b", which, "--no-pager", "-o", "json", f"--output-fields={FIELDS}", *extra]
 
 
 def _run(argv: list[str], timeout: float) -> tuple[int, str, str] | None:
@@ -77,24 +82,35 @@ def _run(argv: list[str], timeout: float) -> tuple[int, str, str] | None:
     return r.returncode, r.stdout or "", r.stderr or ""
 
 
-def run_journal(boot: str | None) -> tuple[int, str, str] | None:
-    """(exit code, stdout, stderr) of journalctl as this user for boot `boot` (the previous boot when it
-    is no journal boot id): the boot's last TAIL_ENTRIES entries as JSON, only the fields parse() reads;
-    None when it could not run."""
+def marker_args() -> list[str]:
+    return ["-n", str(MARK_ENTRIES), *(f"SYSLOG_IDENTIFIER={i}" for i in MARK_IDENTS)]
+
+
+def window_args(at: float | None) -> list[str]:
+    """The lines before the shutdown marker at `at`, newest first (with --since, -n alone would keep the
+    oldest), or with no marker the boot's last lines."""
+    if at is None:
+        return ["-n", str(TAIL_ENTRIES)]
+    return ["--since", f"@{int(at - WINDOW_S)}", "--until", f"@{int(at) + 1}", "-r", "-n", str(WINDOW_ENTRIES)]
+
+
+def run_journal(boot: str | None, extra=(), sudo: bool = False) -> tuple[int, str, str] | None:
+    """(exit code, stdout, stderr) of journalctl for boot `boot` (the previous boot when it is no journal
+    boot id) as JSON, only the fields parse() reads, `extra` selecting the lines; through `sudo -n` with
+    `sudo` (never prompts, stores nothing). None when it could not run."""
     if os.environ.get("TTP_TEST_NO_JOURNAL"):
         return None
-    return _run(_journalctl(boot), JOURNAL_TIMEOUT_S)
+    if sudo:
+        return _run(["sudo", "-n", *_journalctl(boot, extra)], SUDO_TIMEOUT_S)
+    return _run(_journalctl(boot, extra), JOURNAL_TIMEOUT_S)
 
 
-def run_sudo_journal(boot: str | None) -> tuple[int, str, str] | bool | None:
-    """The same read through `sudo -n` (never prompts, stores nothing); False when `sudo -n true` fails
-    (no passwordless sudo here), None when the read could not run."""
+def sudo_ok() -> bool:
+    """Whether `sudo -n` works here (passwordless): checked once per reboot, silently."""
     if os.environ.get("TTP_TEST_NO_JOURNAL"):
         return False
-    ok = _run(["sudo", "-n", "true"], SUDO_CHECK_S)
-    if not ok or ok[0] != 0:
-        return False
-    return _run(["sudo", "-n", *_journalctl(boot)], SUDO_TIMEOUT_S)
+    r = _run(["sudo", "-n", "true"], SUDO_CHECK_S)
+    return bool(r) and r[0] == 0
 
 
 def _entries(out: str) -> list[dict]:
@@ -142,27 +158,32 @@ def _limited(got: tuple[int, str, str]) -> str:
     me = str(os.getuid())
     if rows and all(str(e["uid"]) == me for e in rows):
         return "user not in systemd-journal"   # only this user's own entries came back
+    if not (out or "").strip():
+        return EMPTY
     return ""
 
 
-def read(boot: str | None, journal=None, sudo=None) -> tuple[tuple[int, str, str] | None, str, str]:
-    """(the read to parse, how it was read: 'user', 'sudo' or '' when none showed the system's entries,
-    why none did). As this user first, then `sudo -n` when that saw only the user's own entries.
-    `journal`/`sudo`: run_journal's/run_sudo_journal's answers, read here when None."""
-    got = run_journal(boot) if journal is None else journal
+def read(boot: str | None, journal=None, sudo=None):
+    """(the marker read, ask, how, why): ask(extra) reads more the same way, how is 'user', 'sudo' or ''
+    when no read showed the system's entries (ask is then None), why says why not. As this user first,
+    then through `sudo -n` when that showed only the user's own entries or none. `journal`/`sudo`: fixed answers
+    (tests; sudo False: no passwordless sudo), read here when None."""
+    as_user = (lambda extra: journal) if journal is not None else (lambda extra: run_journal(boot, extra))
+    got = as_user(marker_args())
     if not got:
-        return None, "", "journalctl did not answer, missing or timed out"
+        return None, None, "", "journalctl did not answer, missing or timed out"
     why = _limited(got)
     if not why:
-        return got, "user", ""
-    if why != "user not in systemd-journal":
-        return got, "", why
-    s = run_sudo_journal(boot) if sudo is None else sudo
-    if s is False:
-        return got, "", f"{why} and no passwordless sudo"
+        return got, as_user, "user", ""
+    if why not in ("user not in systemd-journal", EMPTY):
+        return got, None, "", why
+    if sudo is False or sudo is None and not sudo_ok():
+        return got, None, "", f"{why} and no passwordless sudo"
+    as_root = (lambda extra: sudo) if sudo is not None else (lambda extra: run_journal(boot, extra, sudo=True))
+    s = as_root(marker_args())
     if not s or _limited(s):
-        return got, "", f"{why}, and sudo -n journalctl did not read it either"
-    return s, "sudo", ""
+        return got, None, "", f"{why}, and sudo -n journalctl did not read it either"
+    return s, as_root, "sudo", ""
 
 
 def _stop_command(cmd: str) -> str | None:
@@ -194,10 +215,21 @@ def _marker(e: dict) -> bool:
         or (e["ident"] == "systemd" and bool(_MARKER_SYSTEMD.search(e["msg"])))
 
 
-def parse(out: str, full: bool = False) -> tuple[str | None, str | None]:
-    """(initiator, fallback) from the previous boot's journal. Initiator: the last sudo/pkexec stop
-    command or power-key press, else the system unit line nearest before the shutdown marker (within
-    WINDOW_S) that names a power cycle, reboot or shutdown. Fallback: the unit started or logging
+def marker_at(out: str) -> float | None:
+    """The time of the first shutdown marker in the marker read, None with none (or no time)."""
+    rows = _entries(out)
+    marks = [e for e in rows if _marker(e)]
+    if not marks or marks[-1]["ts"] is None:
+        return None
+    end = marks[-1]["ts"]
+    return next(e["ts"] for e in marks if e["ts"] is not None and e["ts"] >= end - WINDOW_S)
+
+
+def parse(out: str, window: str | None = None, full: bool = False) -> tuple[str | None, str | None]:
+    """(initiator, fallback) from the previous boot's journal: `out` the marker read, `window` the lines
+    before its marker (out itself when None). Initiator: the last sudo/pkexec stop command or power-key
+    press, else the line nearest before the marker (within WINDOW_S) of a system unit, or of systemd
+    starting one, that names a power cycle, reboot or shutdown. Fallback: the unit started or logging
     nearest before the marker, a logind 'System is ...' line that names nobody, or with `full` (a read
     that shows the system's entries) and no marker, NO_SHUTDOWN and the last unit lines before the gap."""
     rows = _entries(out)
@@ -219,33 +251,32 @@ def parse(out: str, full: bool = False) -> tuple[str | None, str | None]:
             fallback = f"a request to systemd-logind that names no user (journal: {_clip(msg, 60)})"
     if found:
         return found, fallback
-    marks = [i for i, e in enumerate(rows) if _marker(e)]
+    near = rows if window is None else _entries(window)
+    marks = [e for e in rows if _marker(e)]
     if not marks:
-        if full and rows:
-            last = [f"{_service(e)}: {_clip(e['msg'], 60)}" for e in rows if _service(e) and e["msg"]][-2:]
+        if full and near:
+            last = [f"{_service(e)}: {_clip(e['msg'], 60)}" for e in near if _service(e) and e["msg"]][-2:]
             return None, NO_SHUTDOWN + (f"; last unit lines: {'; '.join(last)}" if last else "")
         return None, fallback
-    # The shutdown's first marker: a 'shutdown scheduled' line may come minutes before logind's.
-    end = rows[marks[-1]]["ts"]
-    first = next(i for i in marks if end is None or rows[i]["ts"] is None or rows[i]["ts"] >= end - WINDOW_S)
-    at = rows[first]["ts"]
-    near = start = unit_line = None
-    for e in reversed(rows[:first]):
+    at = marker_at(out)
+    first = next((k for k, e in enumerate(near) if _marker(e) and (at is None or e["ts"] is None or e["ts"] >= at)),
+                 None)
+    before = near[:first] if first is not None else [e for e in near if at is None or (e["ts"] or 0) < at]
+    start = unit_line = None
+    for e in reversed(before):
         if at is not None and e["ts"] is not None and e["ts"] < at - WINDOW_S:
             break
         unit = _service(e)
-        if unit and e["msg"] and _STOP_WORDS.search(e["msg"]):
-            near = f"{unit} ({_clip(e['msg'])})"
-            break
-        if start is None and e["ident"] == "systemd":
-            m = _UNIT_START.match(e["msg"])
-            u = e["about"] or (m["unit"] if m else "")
-            if m and not u.startswith(("systemd-", "user@")):
-                start = f"{u} ({_clip(e['msg'])})"
+        m = _UNIT_START.match(e["msg"]) if e["ident"] == "systemd" else None
+        started = (e["about"] or (m["unit"] if m else "")) if m or e["about"] and e["msg"].startswith("Start") else ""
+        if started.startswith(("systemd-", "user@")):
+            started = ""
+        if (unit or started) and _STOP_WORDS.search(e["msg"]):
+            return f"{unit or started} ({_clip(e['msg'])})", fallback
+        if start is None and started:
+            start = f"{started} ({_clip(e['msg'])})"
         if unit_line is None and unit and e["msg"]:
             unit_line = f"{unit} ({_clip(e['msg'])})"
-    if near:
-        return near, fallback
     return None, start or unit_line or fallback
 
 
@@ -272,14 +303,22 @@ def find(p, boot: str | None, boot_at: float | None, last_heartbeat: float | Non
          journal=None, sudo=None) -> dict:
     """{source: journal|host-cycle|ledger|unknown, text, ...} for the shutdown that ended boot `boot`;
     `boot_at`: this boot's start; `last_heartbeat`: the daemon's last sign of life on `boot`.
-    `journal`/`sudo`: run_journal's/run_sudo_journal's answers, read here when None. `unreadable`: why
-    no read showed the system's entries (ttp doctor says it once; the notice only in its text)."""
+    `journal`/`sudo`: fixed answers to every read as this user/through sudo -n, read here when None.
+    `unreadable`: why no read showed the system's entries (ttp doctor says it once; the notice only in
+    its text)."""
     from . import hostcycle, machines
     fallback, why, how = None, "", ""
     try:
-        got, how, why = read(boot, journal, sudo)
+        got, ask, how, why = read(boot, journal, sudo)
         if got:
-            found, fallback = parse(got[1], full=bool(how))
+            window = None
+            if ask:
+                args = window_args(marker_at(got[1]))
+                w = ask(args)
+                window = w[1] if w and w[0] == 0 else None
+                if window is not None and "-r" in args:
+                    window = "\n".join(reversed(window.splitlines()))   # read newest first
+            found, fallback = parse(got[1], window, full=bool(how) and window is not None)
             if found:
                 return {"source": "journal", "text": found, **({"read": how} if how == "sudo" else {})}
     except Exception:

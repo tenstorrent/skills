@@ -1892,7 +1892,7 @@ def _setup_box(tmp_path, *args, entry=None):
                           capture_output=True, text=True, timeout=60)
 
 
-ALL_NONE = ["account.user=same", "account.admin=none", "account.keys=here", "account.outbound=none", "broker=none", "host_checks=driver,pcie", "storage=none", "workspace=none", "python_env=none", "agent_clis=none", "editor=none",
+ALL_NONE = ["account.user=same", "account.admin=none", "account.keys=here", "account.outbound=none", "broker=none", "host_checks=driver,pcie", "journal=no", "storage=none", "workspace=none", "python_env=none", "agent_clis=none", "editor=none",
             "projects=all", "recovery.owner=none", "lock=shared", "disk_guard=150"]
 
 
@@ -1903,8 +1903,8 @@ def test_setup_box_new_box_question_set_fits_the_question_tool_and_the_numbered_
     qs = [q for b in batches for q in b]
     # The first pass asks every top-level topic of the new-box flow; follow-ups wait for their answer.
     assert [q["id"] for q in qs] == ["account.user", "account.admin", "account.keys", "account.outbound",
-                                     "broker", "host_checks", "storage", "workspace", "python_env", "agent_clis",
-                                     "editor", "projects", "recovery.owner", "lock", "disk_guard"]
+                                     "broker", "host_checks", "journal", "storage", "workspace", "python_env",
+                                     "agent_clis", "editor", "projects", "recovery.owner", "lock", "disk_guard"]
     for b in batches:
         assert 1 <= len(b) <= 4
         for q in b:
@@ -1915,7 +1915,7 @@ def test_setup_box_new_box_question_set_fits_the_question_tool_and_the_numbered_
     assert "ttp lock <box-alias>-device -- <cmd>" in broker["options"][1]["description"]
     assert next(q for q in qs if q["id"] == "host_checks")["multiSelect"] is True
     num = _setup_box(tmp_path, "setup", "questions", "<box-alias>", "--format", "numbered").stdout
-    assert num.count("\n1. ") == 1 and "\n15. " in num and "   b) No broker:" in num
+    assert num.count("\n1. ") == 1 and "\n16. " in num and "   b) No broker:" in num
     assert "nothing is assumed" in num and "(suggested: install)" in num
 
 
@@ -2029,6 +2029,47 @@ def test_setup_box_hostcheck_reads_sysfs_without_opening_a_device(monkeypatch):
     assert any("not reported by the driver" in ln for ln in lines)
     _, problems = bs.read_hostcheck("driver=2.0.0\ndev_nodes=1\n", only=("pcie",))
     assert problems == ["pcie"]
+
+
+def test_setup_box_journal_question_is_asked_skipped_when_readable_and_never_done_silently(tmp_path, monkeypatch):
+    import subprocess
+    monkeypatch.syspath_prepend(str(BOX_PY.parent))
+    import box
+    import box_setup as bs
+    script = bs.journalcheck_script()
+    assert subprocess.run(["bash", "-n", "-c", script]).returncode == 0
+    assert "usermod" not in script and "sudo" not in script   # the probe only reads
+    assert bs.read_journalcheck("uid=1000\ngroups=someuser systemd-journal\nforeign=0\n") == \
+        (True, "in group systemd-journal")
+    assert bs.read_journalcheck("uid=1000\ngroups=someuser\nforeign=37\n")[0] is True
+    assert bs.read_journalcheck("uid=0\ngroups=root\nforeign=0\n") == (True, "root")
+    assert bs.read_journalcheck("uid=1000\ngroups=someuser docker\nforeign=0\n")[0] is False
+    # The question is offered with each choice spelled out; "add" is a plan step for the user's go-ahead.
+    q = next(q for q in bs.QUESTIONS if q["id"] == "journal")
+    assert [o[0] for o in q["options"]] == ["add", "no", "readable"]
+    answers = bs.merge({}, dict(kv.split("=", 1) for kv in ALL_NONE + ["journal=add"]))["answers"]
+    (step,) = [s for s in bs.plan("<box-alias>", {"workdir_root": "~/w"}, answers) if s["id"] == "journal"]
+    assert "sudo usermod -aG systemd-journal" in step["action"] and "Never reboot" in step["action"]
+    assert "setup journalcheck <box-alias>" in step["check"]
+    answers = bs.merge({}, dict(kv.split("=", 1) for kv in ALL_NONE))["answers"]
+    assert not any(s["id"] == "journal" for s in bs.plan("<box-alias>", {"workdir_root": "~/w"}, answers))
+    # journalcheck: 0 readable, 1 not, 255 ssh failed; --save fills in journal=readable only when unanswered.
+    site = tmp_path / "boxes.json"
+    site.write_text(json.dumps({"version": 1, "boxes": {"<box-alias>": {"route": "bare", "workdir_root": "~/w"}}}))
+    for stdout, rc, want in (("uid=1000\ngroups=u\nforeign=0\n", 0, 1), ("", 255, 255),
+                             ("uid=1000\ngroups=u systemd-journal\nforeign=0\n", 0, 0)):
+        monkeypatch.setattr(box, "ssh_run", lambda *a, _o=stdout, _r=rc, **k: subprocess.CompletedProcess(a, _r, _o, "x"))
+        args = box.build_parser().parse_args(["--site", str(site), "setup", "journalcheck", "<box-alias>", "--save"])
+        assert args.func(args) == want
+        saved = json.loads(site.read_text())["boxes"]["<box-alias>"].get("setup") or {}
+        assert (saved.get("answers") or {}).get("journal") == ("readable" if want == 0 else None)
+    assert "journal" not in [q["id"] for q in bs.pending(saved)]
+    entry = json.loads(site.read_text())
+    entry["boxes"]["<box-alias>"]["setup"]["answers"]["journal"] = "no"
+    site.write_text(json.dumps(entry))
+    args = box.build_parser().parse_args(["--site", str(site), "setup", "journalcheck", "<box-alias>", "--save"])
+    assert args.func(args) == 0   # readable now, but the user's own answer stays
+    assert json.loads(site.read_text())["boxes"]["<box-alias>"]["setup"]["answers"]["journal"] == "no"
 
 
 def test_setup_box_rejects_null_answers_and_workspace_env_without_workspace(monkeypatch):

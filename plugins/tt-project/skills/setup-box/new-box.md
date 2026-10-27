@@ -10,6 +10,7 @@ The box needs its site entry first (`site.md`). Every command below is
 ## 1. Ask
 
 ```
+box.py setup journalcheck <box-alias> --save         # first: skips the journal question when readable
 box.py setup questions <box-alias>                    # JSON batches for a question tool
 box.py setup questions <box-alias> --format numbered  # a plain numbered prompt
 ```
@@ -33,6 +34,7 @@ box.py setup questions <box-alias> --format numbered  # a plain numbered prompt
 | ssh keys, Outbound | public keys for authorized_keys; your own outbound keys to restore, or none |
 | Device broker | install tt-device-mcp (which release or branch), or none: device work then takes `ttp lock <box-alias>-device -- <command>` |
 | Host checks (read-only) | any of driver, firmware, hugepages, PCIe link |
+| Journal | add your login to the systemd-journal group so tt-project's reboot notices name what rebooted the box, or leave it; always asked, never done silently, skipped when `journalcheck --save` finds the journal readable |
 | Shared mount | none, or a mount point for shared network storage; its source, type, options and how it persists (follow-ups) |
 | Workspace | a repo checkout and build under `workdir_root` (branch, ccache), or none |
 | Python env | pip ttnn, the workspace's own env, or none |
@@ -80,6 +82,10 @@ not skipped.
 - Host checks: `box.py setup hostcheck <box-alias> [--only driver,pcie]` reads sysfs, /proc and
   `/dev/tenstorrent` listings only; it opens no device. Exit 0 ok, 1 a problem, 255 ssh failed.
   Fixes (driver, firmware, hugepages): tt-buddy's `recipes/developer-setup.md`.
+- Journal, add: `sudo usermod -aG systemd-journal <login>` on the box (`sudo -n`; if it needs a
+  password, the user runs it once). It applies from the next login, and to the running tt-project
+  daemon from the next reboot: never reboot a shared box for it. Check with
+  `box.py setup journalcheck <box-alias>` (exit 0 readable, 1 not, 255 ssh failed).
 - Shared mount: `box.py setup mount <box-alias> --run` makes it persistent (fstab or a systemd
   unit), `box.py setup mountcheck <box-alias>` verifies it now and `--after-reboot` once the box
   rebooted; record the change with `ttp machines change add`: `storage.md`.

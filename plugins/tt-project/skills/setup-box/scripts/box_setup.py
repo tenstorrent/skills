@@ -10,6 +10,8 @@
 - `plan` turns the saved answers into steps, each an action and the check that proves it. It
   refuses while a question is pending. The actions link to tt-buddy and tt-device-mcp's own docs.
 - `hostcheck` is one read-only ssh probe: driver, firmware, hugepages, PCIe link.
+- `journalcheck` is one read-only ssh probe: whether the login reads the system journal (reboot causes);
+  `--save` records `journal=readable` so that question is skipped.
 - `mount` makes the saved shared network mount persistent (sudo -n, else printed for the user);
   `mountcheck` verifies it now and, with `--after-reboot`, once the box has rebooted; `--rebooted` is the
   change entry's until-probe (`box_storage`).
@@ -37,6 +39,7 @@ KNOWN_KEYS = {"setup"}
 HOST_CHECKS = ("driver", "firmware", "hugepages", "pcie")
 AGENT_CLIS = {"claude": "claude --version", "codex": "codex --version", "cursor": "cursor-agent --version"}
 TT_PCI_VENDOR = "0x1e52"
+JOURNAL_GROUPS = {"systemd-journal", "adm", "wheel"}
 DEFAULT_GUARD_GB = 150  # the harness's own disk.min_free_gb default
 
 
@@ -111,6 +114,13 @@ QUESTIONS: List[dict] = [
              ("firmware", "Firmware", "firmware versions the driver reports"),
              ("hugepages", "Hugepages", "1 GB hugepages reserved"),
              ("pcie", "PCIe link", "each card's link speed and width against its maximum")]),
+    dict(id="journal", header="Journal", suggest="add",
+         text="Let your login on {alias} read the system journal, so tt-project's reboot notices name what "
+              "rebooted it? (`setup journalcheck --save` skips this when it already can)", options=[
+             ("add", "Add to group", "add your login to the systemd-journal group (sudo, once); it applies "
+                                     "from your next login, and to running user services from the next reboot"),
+             ("no", "Leave it", "reboot notices then say the journal is not readable"),
+             ("readable", "Already readable", "your login on {alias} reads the system journal already")]),
     dict(id="storage", header="Shared mount", other=box_storage.valid_mountpoint,
          text="Should {alias} mount shared network storage (caches, backups) at every boot? A mount made by "
               "hand is gone after the next reboot. (yes: type its mount point, an absolute path)", options=[
@@ -457,6 +467,12 @@ def plan(alias: str, entry: dict, answers: dict, plugin_root: str = "<plugin-roo
         step("host_checks", "nothing to change: the checks are read-only; fix what they report with tt-buddy's "
                             "`recipes/developer-setup.md`",
              f"{box_py} setup hostcheck {alias} --only {','.join(checks)}")
+    if answers.get("journal") == "add":
+        user = login_user(answers)
+        step("journal", f"on {alias}: `sudo usermod -aG systemd-journal {user}` (sudo -n; if it needs a password, "
+                        "the user runs it once); it applies from the next login, and to running user services "
+                        "(the tt-project daemon) from the next reboot. Never reboot a shared box for it",
+             f"{box_py} setup journalcheck {alias}  (expect: in group systemd-journal; readable from a new login)")
     mnt = box_storage.spec(answers)
     if mnt:
         how = ("a systemd .mount unit" + (f" after {box_storage.agent_unit(mnt['agent'])}"
@@ -669,6 +685,54 @@ def cmd_plan(args) -> int:
         for n, s in enumerate(steps, 1):
             print(f"{n}. [{s['id']}] {s['action']}\n   check: {s['check']}")
     return 0
+
+
+def journalcheck_script() -> str:
+    """Read-only: the login's uid and groups, and how many recent system-journal entries are not its own."""
+    return ("echo uid=$(id -u); echo groups=$(id -nG); "
+            "echo foreign=$(journalctl --system -n 200 -o json --output-fields=_UID --no-pager 2>/dev/null "
+            "| grep -vc \"\\\"_UID\\\":\\\"$(id -u)\\\"\")")
+
+
+def read_journalcheck(out: str) -> "tuple[bool, str]":
+    """(readable, why) from the probe's key=value lines: root, a journal-reading group (systemd-journal,
+    adm, wheel), or system entries that are not the login's own."""
+    kv = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+    groups = set(kv.get("groups", "").split()) & JOURNAL_GROUPS
+    try:
+        foreign = int(kv.get("foreign", "0").strip() or 0)
+    except ValueError:
+        foreign = 0
+    if kv.get("uid", "").strip() == "0":
+        return True, "root"
+    if groups:
+        return True, f"in group {', '.join(sorted(groups))}"
+    if foreign:
+        return True, f"{foreign} recent system entries visible"
+    return False, "not in systemd-journal, adm or wheel, and no system entries visible"
+
+
+def cmd_journalcheck(args) -> int:
+    """Exit 0 readable, 1 not, 255 ssh failed. --save records journal=readable so the question is skipped;
+    a box that cannot read it keeps the question, which only the user answers."""
+    r = box.ssh_run(args.alias, journalcheck_script(), timeout=30)
+    if r.returncode != 0:
+        tail = (r.stderr or r.stdout).strip().splitlines()[-1:] or [""]
+        print(f"ssh: connection to {args.alias} failed (exit {r.returncode}) {tail[0]}".rstrip())
+        return 255 if r.returncode == 255 else 1
+    ok, why = read_journalcheck(r.stdout)
+    print(f"journal on {args.alias}: {'readable' if ok else 'not readable'} ({why})")
+    if ok and args.save:
+        try:
+            site, entry = _entry(args)
+            if (entry.get("setup") or {}).get("answers", {}).get("journal") is None:
+                entry["setup"] = merge(entry.get("setup") or {}, {"journal": "readable"})
+                save_site(box.site_path(args.site), site)
+                print("saved journal=readable: the question is skipped")
+        except (ValueError, box.SiteError) as e:
+            print(f"error: {e}")
+            return 1
+    return 0 if ok else 1
 
 
 def cmd_hostcheck(args) -> int:
@@ -896,6 +960,10 @@ def register(sub) -> None:
     h.add_argument("--only", help=f"comma-separated subset of {','.join(HOST_CHECKS)}")
     h.add_argument("--json", action="store_true")
     h.set_defaults(func=cmd_hostcheck)
+    j = st.add_parser("journalcheck", help="read-only: whether the login reads the system journal")
+    j.add_argument("alias")
+    j.add_argument("--save", action="store_true", help="when readable, save journal=readable (skips the question)")
+    j.set_defaults(func=cmd_journalcheck)
     m = st.add_parser("mount", help="make the saved shared network mount persistent (dry run unless --run)")
     m.add_argument("alias")
     m.add_argument("--run", action="store_true", help="run the root script with sudo -n")
