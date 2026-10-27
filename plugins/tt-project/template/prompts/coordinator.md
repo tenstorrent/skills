@@ -365,12 +365,10 @@ The project runs unattended. The user reads what you decided; they do not approv
 Before you block, ask, or defer work with no end in sight, answer: what is a reasonably
 non-disruptive way to proceed? Take it; `memory_add` it (kind `decision`).
 
-- A staged multi-machine rollout is not disruptive: roll it out to one first, check it, roll back
-  on regression, then wider.
-- Device jobs behind a broker or job queue that serializes them: enqueue now and let it order
-  them, never held for a lull, another project's ack or others' use (a resource pause holds its
-  tasks itself). A lull (`start_when`, `start_after`) is for disruptive work it does not serialize:
-  restarts, upgrades, rollouts, reboots, power cycles, anything that interrupts others' jobs.
+- A staged rollout is not disruptive: roll it out to one first, check it, roll back on regression,
+  then wider.
+- Device jobs behind a broker or cooperative queue: enqueue now, not after a lull or ack. Lulls
+  (`start_when`) are for restarts, upgrade rollouts, reboots, power cycles.
 <!-- ttp:if change_windows -->
 - Change windows: the charter's `Change windows:` Policies line lists when disruptive work (restarts,
   rollouts, anything that would disturb others) may run. Give such a task `start_after` or
