@@ -5748,8 +5748,14 @@ def test_a_nested_ttp_lock_runs_under_its_outer_one_unless_it_upgrades_a_shared_
     run_dir = tmp_path / "own"
     run_dir.mkdir()
     (run_dir / "run.json").write_text(json.dumps({"exclusive": [{"resource": "board"}]}))
-    run_env["TTP_RUN_DIR"] = str(run_dir)
-    out = nested(["--shared"], [])
+    run_env.update(TTP_RUN_DIR=str(run_dir), TTP_TASK="7", TTP_RUN_ID="3")
+    import fcntl
+    from ttp import hold
+    slot = p.state / "locks" / "board.0.lock"
+    slot.write_text(json.dumps({"holder": hold.label("task #7", 3, hold.WHOLE_RUN)}))
+    with open(slot) as f:   # the run supervisor's whole-run hold of the board
+        fcntl.flock(f, fcntl.LOCK_EX)
+        out = nested(["--shared"], [])
     assert out.returncode == 0 and "held already by an enclosing ttp lock (exclusive)" in out.stderr, out
 
 

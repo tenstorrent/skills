@@ -3971,7 +3971,8 @@ def cmd_lock(a) -> None:
     --shared` on one answers as the plain probe does.
 
     Nested: a `ttp lock` inside one that holds the same lock in the same or a stronger mode (or
-    inside an exclusive task's run) just runs, saying so on stderr. An exclusive one inside a shared
+    inside an exclusive task's run while its lineage holds it, hold.covers; a hold recorded lost does
+    not) just runs, saying so on stderr. An exclusive one inside a shared
     hold of the lock exits 2 at once: it could only wait for itself.
 
     Inside a run, waiting is reported in the run's progress (a wait is not a stall), does not count
@@ -4141,7 +4142,10 @@ def cmd_lock(a) -> None:
                 activity.append(p.state, {"ev": "release", "id": aid, "end": time.time(), "rc": rc})
 
     whole = {lk.canonical(cfg, x.get("resource") or "") for x in spec.get("exclusive") or []}
-    if run_held := [L for L in todo if L["res"] in whole]:
+    # run.json alone is not the hold: one recorded lost (its keeper died, another task took the slot)
+    # still lists it. Only a slot the run's own lineage holds now covers the command (hold.covers).
+    if run_held := [L for L in todo if L["res"] in whole and own.strip() and
+                    hold.covers(L["paths"], shared.holder(p, L["res"], hold.who(own), cfg), spec)]:
         # This run's task holds the resource for its whole run already, exclusively even for a --shared
         # command: a nested plain `ttp lock` of it inside the command just runs too.
         _refuse_paused()

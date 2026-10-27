@@ -707,3 +707,87 @@ def test_a_kept_hold_reads_free_only_for_its_own_runs_lineage(env, tmp_path):
             env_ = {"TTP_RUN_ID": "62", "TTP_DETACHED": "1", "TTP_DETACH_RC": job}
             assert hold.covers([slot], f"task #{mine['id']}", spec, env_) is None, lbl
     assert _until_true(lambda: (hold.read(run_dir) or {}).get("state") == "released"), "the hold outlived its job"
+
+
+def _whole_run_hold(slot, lbl):
+    """Holds `slot` as a run supervisor does (its label `lbl`), in this process, until the file closes."""
+    import fcntl
+    slot.parent.mkdir(parents=True, exist_ok=True)
+    slot.write_text(json.dumps({"holder": lbl}))
+    f = open(slot)
+    fcntl.flock(f, fcntl.LOCK_EX)
+    return f
+
+
+def _run_listing_the_board(env, p, tmp_path, run_id):
+    """Tasks mine and other on the board, and a detached job's env of mine's run `run_id`, whose run.json
+    lists the board for its whole run; with lock(env, *args), its `ttp lock board -- touch ran`."""
+    from ttp.daemon import Daemon
+    mine, other = _board_task(p, "flash"), _board_task(p, "other")
+    paths = Daemon(p.base)._slot_paths("board")
+    run_dir, ran = p.runs / str(run_id), tmp_path / "ran"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text(json.dumps({
+        "env": {"TTP_TASK": str(mine["id"]), "TTP_RUN_ID": str(run_id)}, "holds": str(p.state / "holds"),
+        "exclusive": [{"resource": "board", "paths": [str(x) for x in paths], "holder": f"task #{mine['id']}"}]}))
+    job = _lock_env(env, p, TTP_TASK=str(mine["id"]), TTP_RUN_ID=str(run_id), TTP_RUN_DIR=str(run_dir),
+                    TTP_DETACHED="1", TTP_DETACH_RC=str(run_dir / "job.rc"))
+
+    def lock(e, *args):
+        return subprocess.run([sys.executable, str(TTP), "lock", *args, "board", "--", "touch", str(ran)],
+                              env=e, capture_output=True, text=True, timeout=60)
+    return mine, other, paths, run_dir, ran, job, lock
+
+
+def test_a_runs_lock_never_passes_a_lost_hold_whose_slot_another_task_took(env, tmp_path):
+    # run.json lists the board for the whole run, but the run's hold was recorded lost (its keeper died)
+    # and another task took the slot: the run's `ttp lock board` must not run beside that task; it is
+    # busy (75) on the no-wait path, or waits. A pause still refuses it.
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import hold, locks
+    mine, other, paths, run_dir, ran, job, lock = _run_listing_the_board(env, p, tmp_path, 71)
+    hold._write(run_dir, {"state": "lost", "why": "its keeper died and board was taken meanwhile"})
+    release = tmp_path / "release"
+    theirs = _lock(_lock_env(env, p, TTP_TASK=str(other["id"]), TTP_RUN_ID="72"), "board", cmd=_until(release))
+    waiter = None
+    try:
+        assert _until_true(lambda: locks.held_labels(paths) == [f"task #{other['id']} (run 72)"])
+        r = lock(job, "--timeout", "2")
+        assert r.returncode == 75 and not ran.exists(), ("ran beside the task that took a lost hold's slot", r)
+        coord.pause_resource(p, "board", True, reason="maintenance", by="user")
+        r = lock(job, "--timeout", "2")
+        assert r.returncode == 75 and "board is paused" in r.stderr and not ran.exists(), r
+        coord.pause_resource(p, "board", False)
+        waiter = subprocess.Popen([sys.executable, str(TTP), "lock", "--timeout", "0", "board", "--", "touch", str(ran)],
+                                  env=job, stderr=subprocess.PIPE, text=True)
+        assert "waiting for board" in waiter.stderr.readline() and not ran.exists()
+    finally:
+        release.touch()
+    assert theirs.wait(timeout=30) == 0
+    assert waiter.wait(timeout=30) == 0 and ran.exists(), "the waiter never took the board once it was free"
+    ran.unlink()
+    # Another task's whole-run hold never covers this run either, whatever its run.json says.
+    with _whole_run_hold(paths[0], hold.label(f"task #{other['id']}", 71, hold.WHOLE_RUN)):
+        r = lock(job, "--timeout", "2")
+        assert r.returncode == 75 and not ran.exists(), r
+
+
+def test_a_runs_lock_passes_through_at_once_while_its_lineage_holds_the_resource(env, tmp_path):
+    # The run's own whole-run hold (this run, or a detached job of it after a later run took it over):
+    # its `ttp lock board` runs at once under the hold, without waiting. A pause still refuses it.
+    p = make(env)
+    from ttp import coordinator as coord
+    from ttp import hold
+    mine, other, paths, run_dir, ran, job, lock = _run_listing_the_board(env, p, tmp_path, 71)
+    for e in (dict(job, TTP_DETACHED="", TTP_DETACH_RC=""), dict(job, TTP_RUN_ID="70")):
+        with _whole_run_hold(paths[0], hold.label(f"task #{mine['id']}", 71, hold.WHOLE_RUN)):
+            start = time.time()
+            r = lock(e, "--timeout", "5")
+            assert r.returncode == 0 and ran.exists() and time.time() - start < 5, r
+            assert "held already by this task's whole run" in r.stderr, r.stderr
+            ran.unlink()
+            coord.pause_resource(p, "board", True, by="user")
+            r = lock(e, "--timeout", "2")
+            assert r.returncode == 75 and "board is paused" in r.stderr and not ran.exists(), r
+            coord.pause_resource(p, "board", False)
