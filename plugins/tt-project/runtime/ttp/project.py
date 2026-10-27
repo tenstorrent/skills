@@ -482,8 +482,9 @@ PROVIDER_KEYS = {"tiers", "plugin_dirs", "worker_isolation", "mcp_servers", "dis
                  # providers.chat only (chatbridge.py): the `ttp secret endpoint` alias holding the key,
                  # the base URL saved with it, a max_tokens cap and the model's context_window (also per tier).
                  # route_cooldown_s: how long a tier routed to it (tiers.<tier>.route, route.py) runs on the
-                 # core provider after a fallback.
-                 "endpoint", "base_url", "max_tokens", "context_window", "route_cooldown_s"}
+                 # core provider after a fallback. effort_fields: per model, the run's effort to extra request
+                 # fields (chatbridge.effort_fields).
+                 "endpoint", "base_url", "max_tokens", "context_window", "route_cooldown_s", "effort_fields"}
 
 
 def _known_keys(path: list[str]) -> set[str] | None:

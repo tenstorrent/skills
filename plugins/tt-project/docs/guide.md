@@ -545,6 +545,17 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    and the web budget line show the last 24 h as one phrase (`routed 24h: 6 runs to chat, 2 fell
    back (down 1, rate_limit 1)`), and `ttp stats --runs --tier light` lists each run's provider,
    model, outcome (with any fallback reason), wall time and cost.
+5. Endpoints take reasoning settings that differ per model. `providers.chat.effort_fields` maps
+   each model's run effort (`low`, `medium`, `high`, `xhigh`, `max`, or `*` for any other) to
+   request fields the bridge adds to every request of the run, for example
+   `"effort_fields": {"<model id>": {"high": {"reasoning_effort": "xhigh"}, "*": {"enable_thinking": false}}}`.
+   The effort is the one tt-project launched the run at and wins over Claude Code's own; the fields
+   never replace the model, messages, tools or other conversation fields. Unset, requests go out
+   unchanged and the model uses its own default. An unknown effort or a value that is not an object
+   is a config error. If the endpoint rejects a field (a 400 naming it), the bridge repeats the
+   request without the fields for the rest of the run, logs it once per model and effort, and the
+   run's route record says so. The `ttp status` routing phrase ends with each routed tier's latest
+   fields (`; light high: reasoning_effort=xhigh`).
 
 The key stays in the per-user secrets store and the bridge's upstream requests: the agent gets
 only the bridge's address and a per-run token. Reasoning text from the endpoint is dropped,

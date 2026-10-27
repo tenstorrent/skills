@@ -978,3 +978,164 @@ def test_a_routed_chat_run_keeps_the_key_out_of_its_files(env, tmp_path, mock_ch
     for f in run_dir.rglob("*"):
         if f.is_file():
             assert _CB_KEY.encode() not in f.read_bytes(), f
+
+
+# providers.chat.effort_fields: the run's effort to extra Chat Completions request fields, per model.
+_EF = {"made-up-model-a": {"low": {"reasoning_effort": "low"}, "high": {"reasoning_effort": "xhigh"},
+                           "*": {"reasoning_effort": "medium"}},
+       "made-up-model-b": {"low": {"enable_thinking": False}, "max": {"thinking": {"type": "enabled"}}}}
+_EF_HI = {"max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]}
+_EF_OK = (200, {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]})
+
+
+def test_chatbridge_effort_fields_follow_the_run_effort_with_a_star_fallback():
+    from ttp import chatbridge
+    cfg = {"providers": {"chat": {"endpoint": "cloud", "effort_fields": _EF}}}
+    got = {(m, e): chatbridge.settings(cfg, "light", m, e).get("fields")
+           for m in ("made-up-model-a", "made-up-model-b", "made-up-model-c") for e in ("low", "high", "max", "")}
+    assert got[("made-up-model-a", "low")] == {"reasoning_effort": "low"}
+    assert got[("made-up-model-a", "high")] == {"reasoning_effort": "xhigh"}
+    assert got[("made-up-model-a", "max")] == got[("made-up-model-a", "")] == {"reasoning_effort": "medium"}, "* fallback"
+    assert got[("made-up-model-b", "low")] == {"enable_thinking": False}
+    assert got[("made-up-model-b", "max")] == {"thinking": {"type": "enabled"}}
+    assert got[("made-up-model-b", "high")] is None, "no entry and no *: nothing sent"
+    assert all(got[("made-up-model-c", e)] is None for e in ("low", "high", "max", "")), "a model without a map"
+    assert chatbridge.settings(cfg, "light", "made-up-model-a", "high")["effort"] == "high"
+    # Unset: the settings are as before, with no effort or fields.
+    plain = chatbridge.settings({"providers": {"chat": {"endpoint": "cloud"}}}, "light", "made-up-model-a", "high")
+    assert "fields" not in plain and "effort" not in plain
+    # An invalid map sends nothing, not part of it.
+    bad = {"providers": {"chat": {"effort_fields": {"made-up-model-a": {"low": {"reasoning_effort": "low"},
+                                                                         "huge": {"x": 1}}}}}}
+    assert "fields" not in chatbridge.settings(bad, "light", "made-up-model-a", "low")
+
+
+def test_chatbridge_effort_fields_config_problems():
+    from ttp import chatbridge, project
+    ok = {"providers": {"chat": {"endpoint": "cloud", "effort_fields": _EF}}}
+    assert chatbridge.config_problems(ok) == []
+    assert project.unknown_key_hint("providers.chat.effort_fields") is None
+    for table, want in (({"m": {"huge": {"x": 1}}}, "effort_fields.m.huge: not an effort"),
+                        ({"m": {"low": "low"}}, "effort_fields.m.low: give an object of request fields"),
+                        ({"m": {"low": ["reasoning_effort", "low"]}}, "effort_fields.m.low: give an object"),
+                        ({"m": "low"}, "effort_fields.m: give an object of efforts"),
+                        ("low", "effort_fields: give an object of model names"),
+                        ({"m": {"*": {"messages": [], "model": "x"}}}, "messages, model carries the conversation")):
+        got = chatbridge.config_problems({"providers": {"chat": {"endpoint": "cloud", "effort_fields": table}}})
+        assert len(got) == 1 and want in got[0], (table, got)
+    # Through the project's own check, as `ttp config` and load report it.
+    assert any("not an effort" in x for x in project.config_problems(
+        {"providers": {"chat": {"endpoint": "cloud", "effort_fields": {"m": {"top": {}}}}}}))
+
+
+def test_chatbridge_sends_the_effort_fields_over_claude_codes_own_and_never_over_the_conversation(mock_chat):
+    from ttp.chatbridge import Bridge, CONVERSATION, with_fields
+    up = mock_chat(_EF_OK, _EF_OK)
+    fields = {"reasoning_effort": "xhigh", "enable_thinking": True}
+    tools = [{"name": "Read", "description": "read", "input_schema": {"type": "object"}}]
+    body = {**_EF_HI, "tools": tools, "thinking": {"type": "enabled", "budget_tokens": 9000},
+            "output_config": {"effort": "low"}, "reasoning_effort": "low"}
+    with Bridge(up.url, _CB_KEY, "made-up-model-a", effort="high", fields=fields) as b:
+        assert _post(b, body)[0] == 200
+        assert _post(b, {**body, "stream": False})[0] == 200
+        st = b.stats()
+    for seen in up.seen:
+        sent = seen["body"]
+        assert sent["reasoning_effort"] == "xhigh" and sent["enable_thinking"] is True
+        assert "thinking" not in sent and "output_config" not in sent, "the daemon's effort wins"
+        assert sent["model"] == "made-up-model-a" and sent["messages"] == [{"role": "user", "content": "hi"}]
+        assert sent["tools"][0]["function"]["name"] == "Read"
+    assert st["effort"] == "high" and st["fields"] == fields and st["rejected"] is False
+    # Conversation fields are never replaced, whatever a map holds.
+    req = {"model": "m", "messages": [1], "tools": [2], "stream": True, "max_tokens": 5}
+    assert with_fields(req, {k: "x" for k in CONVERSATION} | {"top_k": 3}) == {**req, "top_k": 3}
+
+
+def test_chatbridge_without_effort_fields_sends_the_request_unchanged(mock_chat):
+    from ttp.chatbridge import Bridge, to_chat
+    up = mock_chat(_EF_OK)
+    with Bridge(up.url, _CB_KEY, "made-up-model-a", effort="high") as b:
+        _post(b, _EF_HI)
+        st = b.stats()
+    assert up.seen[0]["body"] == to_chat(_EF_HI, "made-up-model-a")
+    assert st == {"last_fault": "", "faults": {}}, "no effort record without fields"
+
+
+@pytest.mark.parametrize("status", [400, 422])
+def test_chatbridge_retries_once_without_rejected_effort_fields(mock_chat, status):
+    from ttp.chatbridge import Bridge
+    fields = {"reasoning_effort": "high"}
+    no = (status, {"error": {"message": "Unsupported value: 'reasoning_effort' does not support 'high' with this model."}})
+    up = mock_chat(no, _EF_OK, _EF_OK, (200, [{"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]}]))
+    with Bridge(up.url, _CB_KEY, "made-up-model-a", effort="high", fields=fields) as b:
+        code, text = _post(b, _EF_HI)
+        assert code == 200 and json.loads(text)["content"][0]["text"] == "ok"
+        _post(b, _EF_HI)
+        code, text = _post(b, {**_EF_HI, "stream": True})
+        st = b.stats()
+    assert code == 200 and "message_stop" in text
+    assert [("reasoning_effort" in s["body"]) for s in up.seen] == [True, False, False, False], \
+        "retried without them, and the rest of the run goes without them"
+    assert st["rejected"] is True and st["last_fault"] == "" and st["faults"] == {}
+
+
+def test_chatbridge_other_errors_with_effort_fields_are_not_retried(mock_chat):
+    from ttp.chatbridge import Bridge
+    fields = {"reasoning_effort": "high"}
+    up = mock_chat((400, {"error": {"message": "invalid tool schema"}}),
+                   (400, {"error": {"message": "maximum context length is 8192 tokens; reasoning_effort high"}}),
+                   (500, {"error": {"message": "reasoning_effort backend crashed"}}))
+    with Bridge(up.url, _CB_KEY, "made-up-model-a", effort="high", fields=fields) as b:
+        first = _post(b, _EF_HI)
+        second = _post(b, _EF_HI)
+        third = _post(b, _EF_HI)
+        st = b.stats()
+    assert len(up.seen) == 3 and all("reasoning_effort" in s["body"] for s in up.seen)
+    assert first[0] == 400 and "invalid tool schema" in first[1]
+    assert second[0] == 400 and "prompt is too long" in second[1], "a context error is not a rejected field"
+    assert third[0] >= 500 and st["rejected"] is False
+
+
+def test_a_chat_run_launches_its_bridge_with_the_effort_fields_of_its_effort(env):
+    from ttp.daemon import Daemon
+    p = make(env)
+    p.set_config("providers.chat", {"endpoint": "cloud", "base_url": "https://api.example.com/v1",
+                                    "effort_fields": _EF,
+                                    "tiers": {"light": {"model": "made-up-model-a", "effort": "high"}}})
+    d = Daemon(p.base)
+    sent = {}
+    for pin in ("", "low"):
+        tid = p.db.add_task("build it", "s", kind="code", tier="light", origin="user", provider="chat",
+                            **({"effort": pin} if pin else {}))
+        cwd, _ = d._workdir_for(p.db.task(tid))
+        rid = d.start_run("worker", "go", "chat", "light", cwd, task=p.db.task(tid))
+        (p.runs / str(rid) / "STOP").touch()
+        b = json.loads((p.runs / str(rid) / "run.json").read_text())["bridge"]
+        sent[pin] = (b.get("effort"), b.get("fields"))
+    assert sent == {"": ("high", {"reasoning_effort": "xhigh"}), "low": ("low", {"reasoning_effort": "low"})}
+
+
+def test_a_routed_run_records_its_effort_fields_logs_a_rejection_once_and_shows_them_in_status(env, monkeypatch):
+    from ttp import route, web
+    from ttp.daemon import Daemon
+    p = make(env)
+    _route_config(p, effort_fields={_RT_MODEL: {"high": {"reasoning_effort": "xhigh"}}})
+    d = Daemon(p.base)
+    monkeypatch.setattr(d, "observe", lambda *a, **k: None)
+    tid = p.db.add_task("build", "", kind="work", tier="light", priority=3, budget_usd=8.0, labels=[])
+    stats = {"last_fault": "", "faults": {}, "effort": "high", "fields": {"reasoning_effort": "xhigh"}}
+    runs = [_route_finish(p, d, tid, {"rc": 0, "bridge": {**stats, "rejected": r}})[0] for r in (True, True, False)]
+    notes = [json.loads(r["note"])["route"]["effort"] for r in runs]
+    assert notes[0] == {"effort": "high", "fields": {"reasoning_effort": "xhigh"}, "rejected": True}
+    assert [n["rejected"] for n in notes] == [True, True, False]
+    assert all(r["status"] == "ok" for r in runs), "a rejected field never fails the run"
+    logged = (p.logs / "daemon.log").read_text().count("rejected its effort_fields")
+    assert logged == 1, "logged once per model and effort"
+    want = "light high: reasoning_effort=xhigh"
+    assert route.phrase(p.db).endswith("; " + want)
+    assert want in web.budget_line(p.db, time.time(), d.cfg.get("core_provider", "claude"), None, 0.0, {})
+    # The latest run's rejection shows; a run without fields records none.
+    _route_finish(p, d, tid, {"rc": 0, "bridge": {**stats, "rejected": True}})
+    assert route.phrase(p.db).endswith(want + " (rejected)")
+    plain = _route_finish(p, d, tid, {"rc": 0, "bridge": {"last_fault": "", "faults": {}}})[0]
+    assert "effort" not in json.loads(plain["note"])["route"]

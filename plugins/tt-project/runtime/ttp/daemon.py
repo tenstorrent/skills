@@ -2258,7 +2258,8 @@ class Daemon:
                     "prices": prices, **({"stdin": "input.jsonl"} if stdin is not None else {}),
                     "budget_usd": None if prov.caps_budget else budget_usd,
                     # The chat provider's loopback bridge (chatbridge.py): where its key is, never the key.
-                    **({"bridge": chatbridge.settings(self.cfg, tier, model)} if provider == "chat" else {}),
+                    # Its effort_fields follow the effort the run launches at, whatever Claude Code asks for.
+                    **({"bridge": chatbridge.settings(self.cfg, tier, model, effort)} if provider == "chat" else {}),
                     # What a run without its own budget is priced at when it reports no usage.
                     "default_budget_usd": self.cfg["budget"].get("task_default_usd", {}).get(tier, 8.0),
                     "exclusive": [{"resource": res, "lock": locks.canonical(self.cfg, res),
@@ -3045,6 +3046,13 @@ class Daemon:
             note[route.KEY] = {**routed, **({"fallback": fell} if fell else {}),
                                **({"priced": priced} if priced is not None else {}),
                                "wall_s": round(float(exit_info.get("ended") or time.time()) - float(r["started"] or 0), 1)}
+            sent = route.effort_entry(exit_info.get("bridge") or {}) if on_route else None
+            if sent:
+                note[route.KEY]["effort"] = sent
+                if sent.get("rejected") and not db.kv(seen := f"{route.REJECTED}{r['model']}|{sent['effort']}"):
+                    db.set_kv(seen, {"run": r["id"], "ts": time.time()})   # logged once per model and effort
+                    log(self.p, f"route: {r['model']} rejected its effort_fields at effort "
+                                f"{sent['effort'] or '-'} ({', '.join(sent['fields'])}); run {r['id']} went on without them")
             if fell:
                 route.cool(db, self.cfg, routed["to"], fell, r["id"], time.time())
         if "split" not in note:   # the split steer may have fired after `r` was read

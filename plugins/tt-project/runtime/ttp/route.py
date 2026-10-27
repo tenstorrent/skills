@@ -7,7 +7,8 @@ Off unless project.json sets `providers.chat.tiers.<tier>.route: true` next to t
 A worker run of a routed tier starts on chat when its task pins no provider or model and the start is
 no tier-up retry; reviews and coordinator turns never route. The run's note gets a `route` entry:
 the tier, where it was routed (`to`, `model`), its `fallback` reason (none, down, error, rate_limit,
-auth or busy), whether its spend is `priced` and its wall time.
+auth or busy), whether its spend is `priced`, its wall time and, when the model has effort_fields
+(chatbridge.py), the `effort` it ran at with the fields sent and whether the endpoint `rejected` them.
 
 Slots: a routed start takes a worker slot under the routed-to provider's gate (its max_parallel,
 allow_new_work, pause and net hold), never the core provider's; when that has no room the run starts
@@ -27,6 +28,7 @@ import time
 TO = "chat"                 # the provider a tier can be routed to
 KEY = "route"               # the run note's entry
 COOL = "route_cooldown:"    # kv: {"until", "reason", "run"} per routed-to provider
+REJECTED = "route_effort_rejected:"   # kv: <model>|<effort> whose effort_fields an endpoint rejected (logged once)
 COOLDOWN_S = 900
 FAULTS = ("down", "error", "rate_limit", "auth")
 REASONS = ("none", *FAULTS, "busy")   # busy: the routed-to provider had no free slot (its gate), no fault
@@ -108,6 +110,21 @@ def price(cfg: dict, prov: str, model: str, usage) -> bool:
     return True
 
 
+def effort_entry(stats: dict) -> dict | None:
+    """The route entry's `effort` record from a bridge's stats: the effort, the fields sent and whether
+    the endpoint rejected them; None when the run sent none."""
+    fields = stats.get("fields")
+    if not isinstance(fields, dict) or not fields:
+        return None
+    return {"effort": str(stats.get("effort") or ""), "fields": fields, "rejected": bool(stats.get("rejected"))}
+
+
+def _fields_text(e: dict) -> str:
+    """'standard high: reasoning_effort=xhigh' (with ', rejected' when the endpoint refused them)."""
+    f = ", ".join(f"{k}={json.dumps(v) if not isinstance(v, str) else v}" for k, v in e["fields"].items())
+    return f"{e.get('effort') or '-'}: {f}" + (" (rejected)" if e.get("rejected") else "")
+
+
 def _rows(db, since: float, until: float | None = None) -> list[dict]:
     out = []
     for r in db.q("SELECT id, task, provider, model, status, started, ended, cost_usd, note FROM runs "
@@ -118,13 +135,15 @@ def _rows(db, since: float, until: float | None = None) -> list[dict]:
             out.append({**{k: r[k] for k in ("id", "task", "provider", "model", "status", "cost_usd")},
                         "tier": e.get("tier"), "to": e.get("to"), "fallback": e.get("fallback") or "none",
                         "priced": e.get("priced"),
+                        "effort": e.get("effort") if isinstance(e.get("effort"), dict) else None,
                         "wall_s": round(float(r["ended"]) - float(r["started"]), 1) if r["ended"] and r["started"] else None})
     return out
 
 
 def phrase(db, now: float | None = None) -> str:
     """The last 24 h of routing in one short phrase for `ttp status` and the web budget line
-    ('routed 24h: 6 runs to chat, 2 fell back (down 1, rate_limit 1)'), '' with none."""
+    ('routed 24h: 6 runs to chat, 2 fell back (down 1, rate_limit 1); light high: reasoning_effort=xhigh',
+    each routed tier's latest effort fields last), '' with none."""
     now = now or time.time()
     rows = _rows(db, now - 86400, now + 1)
     if not rows:
@@ -138,6 +157,12 @@ def phrase(db, now: float | None = None) -> str:
         for r in fell:
             why[r["fallback"]] = why.get(r["fallback"], 0) + 1
         text += f", {len(fell)} fell back ({', '.join(f'{k} {n}' for k, n in sorted(why.items()))})"
+    last = {}   # each routed tier's latest effort fields (effort_fields), as the endpoint got them
+    for r in on:
+        if r["effort"]:
+            last[str(r["tier"])] = r["effort"]
+    if last:
+        text += "; " + "; ".join(f"{t} {_fields_text(e)}" for t, e in sorted(last.items()))
     return text
 
 

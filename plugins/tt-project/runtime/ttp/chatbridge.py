@@ -22,6 +22,13 @@ overloaded and other 5xx as a retryable api_error. A prompt past the model's con
 back worded as Anthropic's ('prompt is too long: N tokens > M maximum'), which Claude Code compacts
 on; a tier's context_window also sets the agent's CLAUDE_CODE_AUTO_COMPACT_WINDOW, as Claude Code
 takes 200k for a model name it does not know.
+
+Effort: `providers.chat.effort_fields.<model>.<effort>` (or its `*` fallback) names extra request
+fields for the effort the daemon launched the run at (low, medium, high, xhigh, max), such as
+{"reasoning_effort": "low"} or {"enable_thinking": false}; they win over Claude Code's own and never
+replace a field that carries the conversation (CONVERSATION). Unset, a request goes out as it is. An
+endpoint that rejects one (a 400 naming it) gets the request again without them, and the rest of the
+run goes without them; stats() records it for the run's meter.
 """
 from __future__ import annotations
 
@@ -48,6 +55,11 @@ CONTEXT_RE = re.compile(
     r"|exceeds? (?:the )?(?:available |maximum |model'?s? )*context|too many (?:input |prompt )?tokens"
     r"|prompt is too long|input is too long|tokens \+ `?max_new_tokens`? must be", re.I)
 CONTEXT_STATUSES = (400, 413, 422)
+EFFORTS = ("low", "medium", "high", "xhigh", "max")   # the run efforts an effort_fields entry may name
+# Request fields that carry the conversation or the bridge's own wiring: effort_fields never sets them.
+CONVERSATION = frozenset({"model", "messages", "tools", "tool_choice", "parallel_tool_calls", "functions",
+                          "function_call", "stream", "stream_options", "n", "max_tokens"})
+REJECT_STATUSES = (400, 422)
 
 
 class BridgeError(Exception):
@@ -61,14 +73,63 @@ class BridgeAuthError(BridgeError):
     auth = True
 
 
-def settings(cfg: dict, tier: str, model: str) -> dict:
-    """The run.json `bridge` entry for a `chat` run: no key, only where to find it."""
+def settings(cfg: dict, tier: str, model: str, effort: str = "") -> dict:
+    """The run.json `bridge` entry for a `chat` run: no key, only where to find it, and the extra
+    request fields for the run's effort (effort_fields) when its model has any."""
     entry = ((cfg or {}).get("providers") or {}).get("chat") or {}
     row = (entry.get("tiers") or {}).get(tier) or {}
     cap = row.get("max_tokens") or entry.get("max_tokens") or 0
     window = row.get("context_window") or entry.get("context_window") or 0
+    fields = effort_fields(entry, model, effort)
     return {"endpoint": str(entry.get("endpoint") or ""), "base_url": str(entry.get("base_url") or ""),
-            "model": model, "max_tokens": int(cap or 0), **({"context_window": int(window)} if window else {})}
+            "model": model, "max_tokens": int(cap or 0), **({"context_window": int(window)} if window else {}),
+            **({"effort": effort, "fields": fields} if fields else {})}
+
+
+def effort_fields(entry: dict, model: str, effort: str) -> dict:
+    """The request fields providers.chat.effort_fields gives `model` at `effort` (its `*` entry when
+    the effort has none), or {}: unset or invalid, the request goes out unchanged."""
+    table = (entry or {}).get("effort_fields") if isinstance(entry, dict) else None
+    if not isinstance(table, dict) or _effort_problems(table):
+        return {}
+    row = table.get(model) or {}
+    got = row.get(effort) if effort in row else row.get("*")
+    return dict(got or {})
+
+
+def _effort_problems(table) -> list[str]:
+    if not isinstance(table, dict):
+        return ["providers.chat.effort_fields: give an object of model names, each an object of efforts; "
+                "no fields are sent"]
+    out = []
+    for model, row in table.items():
+        where = f"providers.chat.effort_fields.{model}"
+        if not isinstance(row, dict):
+            out.append(f"{where}: give an object of efforts ({', '.join(EFFORTS)} or *); no fields are sent")
+            continue
+        for effort, fields in row.items():
+            if effort not in (*EFFORTS, "*"):
+                out.append(f"{where}.{effort}: not an effort; give {', '.join(EFFORTS)} or *; no fields are sent")
+            elif not isinstance(fields, dict):
+                out.append(f"{where}.{effort}: give an object of request fields, such as "
+                           '{"reasoning_effort": "low"}; no fields are sent')
+            elif bad := sorted(CONVERSATION & set(fields)):
+                out.append(f"{where}.{effort}: {', '.join(bad)} carries the conversation and cannot be set; "
+                           "no fields are sent")
+    return out
+
+
+def with_fields(req: dict, fields: dict) -> dict:
+    """`req` with the effort fields set over its own (Claude Code's), never a CONVERSATION field."""
+    return {**req, **{k: v for k, v in (fields or {}).items() if k not in CONVERSATION}}
+
+
+def rejects(status: int, detail: str, fields: dict) -> bool:
+    """Whether an upstream error refuses one of the effort fields: a 400 (or 422) naming it, not a
+    prompt past the window."""
+    low = detail.lower()
+    return (status in REJECT_STATUSES and bool(fields) and not too_long(detail)
+            and any(k.lower() in low for k in fields))
 
 
 def config_problems(raw: dict) -> list[str]:
@@ -78,7 +139,7 @@ def config_problems(raw: dict) -> list[str]:
         return []
     if not isinstance(entry, dict):
         return ["providers.chat: not an object; chat runs cannot start"]
-    out = []
+    out = _effort_problems(entry["effort_fields"]) if entry.get("effort_fields") is not None else []
     try:
         endpoint.slot(str(entry.get("endpoint") or ""))
     except ValueError:
@@ -418,10 +479,12 @@ class Bridge:
     closes the port. Use as a context manager."""
 
     def __init__(self, base_url: str, key: str, model: str, max_tokens: int = 0,
-                 timeout: float = UPSTREAM_TIMEOUT_S, context_window: int = 0):
+                 timeout: float = UPSTREAM_TIMEOUT_S, context_window: int = 0, effort: str = "",
+                 fields: dict | None = None):
         self.base_url, self._key, self.model = endpoint.base_url(base_url), key, model
         self.max_tokens, self.timeout = int(max_tokens or 0), timeout
         self.context_window = int(context_window or 0)
+        self.effort, self.fields, self.rejected = effort, dict(fields or {}), False   # effort_fields
         self.token = secrets.token_urlsafe(24)
         self.last_fault, self.faults = "", {}   # the last call's endpoint fault kind (fault_of), counts
         self.server: http.server.ThreadingHTTPServer | None = None
@@ -449,7 +512,8 @@ class Bridge:
         if not s.get("model"):
             raise BridgeError("no model for this tier: set providers.chat.tiers.<tier>.model")
         return cls(url or saved, key, s["model"], s.get("max_tokens") or 0,
-                   **{"context_window": s.get("context_window") or 0, **kw})
+                   **{"context_window": s.get("context_window") or 0, "effort": s.get("effort") or "",
+                      "fields": s.get("fields") or {}, **kw})
 
     @property
     def url(self) -> str:
@@ -499,21 +563,42 @@ class Bridge:
         return code, err
 
     def stats(self) -> dict:
-        """For the run's exit record: fault kinds only, never upstream text (it may echo a key)."""
-        return {"last_fault": self.last_fault, "faults": dict(self.faults)}
+        """For the run's exit record: fault kinds only, never upstream text (it may echo a key); the
+        effort fields sent and whether the endpoint rejected them, when the run had any."""
+        return {"last_fault": self.last_fault, "faults": dict(self.faults),
+                **({"effort": self.effort, "fields": dict(self.fields), "rejected": self.rejected}
+                   if self.fields else {})}
 
-    def forward(self, h: _Handler, body: dict) -> None:
-        req = to_chat(body, self.model, self.max_tokens)
+    def _open(self, req: dict):
         r = urllib.request.Request(f"{self.base_url}/chat/completions", data=json.dumps(req).encode(), headers={
             "Authorization": f"Bearer {self._key}", "Content-Type": "application/json",
             "Accept": "text/event-stream" if req.get("stream") else "application/json"})
+        return urllib.request.build_opener(endpoint._NoRedirect).open(r, timeout=self.timeout)
+
+    def forward(self, h: _Handler, body: dict) -> None:
+        req = to_chat(body, self.model, self.max_tokens)
         try:
-            resp = urllib.request.build_opener(endpoint._NoRedirect).open(r, timeout=self.timeout)
-        except urllib.error.HTTPError as e:
             try:
-                detail = e.read(2000).decode("utf-8", "replace")
-            except Exception:
-                detail = ""
+                resp = self._open(with_fields(req, {} if self.rejected else self.fields))
+            except urllib.error.HTTPError as e:
+                if self.rejected or not self.fields:
+                    raise
+                try:
+                    detail = e.read(2000).decode("utf-8", "replace")
+                except Exception:
+                    detail = ""
+                if not rejects(e.code, detail, self.fields):
+                    e.ttp_detail = detail   # read once: the handler below reports it
+                    raise
+                self.rejected = True   # once, then the rest of the run goes without them
+                resp = self._open(req)
+        except urllib.error.HTTPError as e:
+            detail = getattr(e, "ttp_detail", None)
+            if detail is None:
+                try:
+                    detail = e.read(2000).decode("utf-8", "replace")
+                except Exception:
+                    detail = ""
             self._fault(e.code, detail)
             return h._reply(*error_for(e.code, self._scrub(detail)))
         except (urllib.error.URLError, OSError) as e:
