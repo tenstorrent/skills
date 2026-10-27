@@ -122,7 +122,6 @@ def test_boundedchild_restores_handlers_kills_on_an_exception_and_hooks_nothing_
 OWN_SESSION_ALLOWED = {
     "awake.py::IdleHold.update": "the sleep inhibitor lives across calls; IdleHold stops it when work ends",
     "batch.py::_stream": "streams a push batch step's output line by line, so it cannot wait in one call; kills its group itself",
-    "checkprestage.py::run": "bounded child; moves onto the helper in a follow-up",
     "cli.py::cmd_web": "the web tunnel is meant to outlive the command that opened it",
     "cli.py::_run_check": "a ttp checks command; _CHECK_STOP's signal handling kills its group",
     "cli.py::_checks_start": "ttp checks --detach: the checks run on after the caller returns",

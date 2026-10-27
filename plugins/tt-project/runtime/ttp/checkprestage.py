@@ -14,33 +14,25 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import re
 import shlex
-import signal
-import subprocess
 import tempfile
 import time
 from pathlib import Path
+
+from . import boundedchild
 
 KEY = "check_prestage"
 DEFAULT_TIMEOUT_S = 90.0     # under the 120 s a Bash tool call gets by default, so the caller outlives it
 MAX_TIMEOUT_S = 900.0
 TAIL_LINES = 60
 CANNOT_RUN = (126, 127)   # the shell found no such command or could not run it: a setting fault
-STOP_ON = (signal.SIGTERM, signal.SIGHUP)   # what ends `ttp checks` (a tool timeout, a run's group kill)
 DERIVE_MAX, DERIVE_WINDOW_S, DERIVE_FAST_S = 10, 14 * 86400, 5.0
 DERIVED_KEY, CAUGHT_KEY = "check_prestage_derived", "check_prestage_caught"   # kv, for the daily audit
 FAILURE = "check_failure.json"   # a `ttp checks` run's last failure, in its run's directory
 DURATIONS = "prestage-slowest-tests.json"   # the derived pre-stage's own test times, beside slowtests.FILE
 LIVE = "prestage-test-times.jsonl"   # its tests' starts and ends as they happen (the durations plugin)
 NO_TESTS, SETUP = 5, (3, 4)   # pytest: no test selected (a pass here); internal and usage errors (never a failure here)
-
-
-class _Signalled(BaseException):
-    def __init__(self, signum: int):
-        super().__init__(signum)
-        self.signum = signum
 
 
 def parse(v) -> tuple[str, float] | None:
@@ -258,24 +250,20 @@ def run(v, cwd: str, env: dict, say, what: str = f"delivery.{KEY}", ok: tuple = 
     cmd, timeout = spec
     say(f"pre-stage {(shown or cmd)!r} ({what}, up to {timeout:.0f} s) before the full checks start in the background")
     t0 = time.monotonic()
-    with tempfile.TemporaryFile() as out:
-        try:
-            proc = subprocess.Popen(cmd, shell=True, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=out,
-                                    stderr=subprocess.STDOUT, start_new_session=True)
-        except OSError as e:
-            say(f"pre-stage not started ({e}); starting the full checks without it")
+    # Its output goes to a file, not a pipe, so a process it leaves running cannot hold the run open;
+    # boundedchild kills its whole group however the run ends (a SIGTERM or SIGHUP to `ttp checks` too).
+    with tempfile.NamedTemporaryFile(prefix="ttp-prestage-") as out:
+        res = boundedchild.run(f"exec >{shlex.quote(out.name)} 2>&1\n{cmd}", timeout, shell=True, cwd=cwd,
+                               env=env, text=False, stderr="stdout")
+        if res.error.startswith("could not start"):
+            say(f"pre-stage not started ({res.error.partition(': ')[2]}); starting the full checks without it")
             return 0
-        try:
-            rc = _wait(proc, timeout)
-        except subprocess.TimeoutExpired:
-            rc = None
-        if rc is None:
-            _stop(proc)
+        if res.timed_out:
             say(f"pre-stage timed out after {timeout:.0f} s; starting the full checks anyway")
             if on_timeout:
                 on_timeout(time.monotonic() - t0)
             return 0
-        took = time.monotonic() - t0
+        rc, took = res.rc, time.monotonic() - t0
         if rc in ok:
             say(f"pre-stage passed in {took:.0f} s")
             return 0
@@ -291,52 +279,3 @@ def run(v, cwd: str, env: dict, say, what: str = f"delivery.{KEY}", ok: tuple = 
         "without it")
     return 1
 
-
-def _wait(proc: subprocess.Popen, timeout: float) -> int:
-    """proc.wait(timeout), but a SIGTERM or SIGHUP to this process, or any interruption, first ends
-    the pre-stage's group: it runs in a session of its own, so the signal that ends `ttp checks`
-    never reaches it. The signal then takes its course as if no handler had been set."""
-    old: dict = {}
-    def caught(signum, frame):
-        raise _Signalled(signum)
-    try:
-        for sig in STOP_ON:
-            if signal.getsignal(sig) is not signal.SIG_IGN:
-                old[sig] = signal.signal(sig, caught)
-    except ValueError:   # not the main thread: no handlers, the except below still covers it
-        pass
-    try:
-        return proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        raise
-    except BaseException as e:   # interrupted: never leave its process group running
-        _stop(proc)
-        if not isinstance(e, _Signalled):
-            raise
-        prior = old.get(e.signum, signal.SIG_DFL)
-        for sig, h in old.items():
-            signal.signal(sig, h if h is not None else signal.SIG_DFL)
-        old = {}
-        if callable(prior):
-            prior(e.signum, None)
-        else:
-            signal.signal(e.signum, signal.SIG_DFL)
-            os.kill(os.getpid(), e.signum)
-        raise SystemExit(128 + e.signum)
-    finally:
-        for sig, h in old.items():
-            signal.signal(sig, h if h is not None else signal.SIG_DFL)
-
-
-def _stop(proc: subprocess.Popen) -> None:
-    """End the pre-stage's own process group (this command started it in a session of its own)."""
-    for sig in (signal.SIGTERM, signal.SIGKILL):
-        try:
-            os.killpg(proc.pid, sig)
-        except OSError:
-            pass
-        try:
-            proc.wait(timeout=5)
-            return
-        except subprocess.TimeoutExpired:
-            continue

@@ -7000,6 +7000,40 @@ def test_a_check_prestage_is_stopped_when_ttp_checks_is_killed(tmp_path, sig):
             os.kill(int(pidf.read_text()), signal.SIGKILL)
 
 
+def test_a_check_prestage_child_that_ignores_sigterm_dies_with_ttp_checks(tmp_path):
+    """A SIGTERM to `ttp checks` kills the pre-stage's whole group: a process in it that ignores
+    SIGTERM and outlives the shell that started it is not left behind."""
+    import ttp
+    from ttp.daemon import _alive
+    pidf = tmp_path / "prestage.pid"
+    stay = "sh -c 'trap \"\" TERM; exec sleep 60' & echo $! > " + str(pidf) + "; wait"
+    code = ("from ttp import checkprestage; import os, sys; "
+            f"checkprestage.run({{'run': {stay!r}, 'timeout_s': 30}}, {str(tmp_path)!r}, dict(os.environ), print); "
+            "sys.exit(9)")
+    env = {**os.environ, "PYTHONPATH": str(pathlib.Path(ttp.__file__).parent.parent)}
+    proc = subprocess.Popen([sys.executable, "-c", code], env=env, stdout=subprocess.DEVNULL)
+    child = None
+    try:
+        deadline = time.monotonic() + 20
+        while not (pidf.exists() and pidf.read_text().strip()) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        child = int(pidf.read_text())
+        time.sleep(0.2)   # the inner shell has set its trap and exec'd sleep
+        assert _alive(child)
+        proc.send_signal(signal.SIGTERM)
+        assert proc.wait(timeout=15) == -signal.SIGTERM
+        deadline = time.monotonic() + 5
+        while _alive(child) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not _alive(child), "a pre-stage process that ignores SIGTERM outlived `ttp checks`"
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        if child and _alive(child):
+            os.kill(child, signal.SIGKILL)
+
+
 def test_a_check_prestage_is_skipped_on_a_tree_whose_checks_already_passed(env, tmp_path, monkeypatch, capsys):
     from ttp import cli
     p, run, started = _prestage_setup(env, tmp_path, monkeypatch, "echo flaky; exit 3")
