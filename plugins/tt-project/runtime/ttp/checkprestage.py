@@ -195,12 +195,10 @@ def _learn_from_timeout(run_dir: Path, ids: list[str], took: float, say) -> None
         return
     path = run_dir / DURATIONS
     try:
-        from . import slowtests
+        from . import project, slowtests
         times = dict(slowtests.load(path)) | ended | cut
-        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps({"tests": [{"id": i, "s": round(t, 3)} for i, t in times.items()],
-                                   "count": len(times)}))
-        os.replace(tmp, path)
+        project.durable_write(path, json.dumps({"tests": [{"id": i, "s": round(t, 3)} for i, t in times.items()],
+                                                "count": len(times)}))
     except Exception:
         return
     if cut:

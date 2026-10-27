@@ -26615,6 +26615,7 @@ def test_durable_write_syncs_renames_and_keeps_the_mode(env, monkeypatch):
 DURABLE_EXEMPT = {
     ("ttp_pytest_durations.py", 'open(tmp, "w")'): "runs inside the checked repo's pytest, not the runtime: a timing note written whole to a temp file, then renamed; a lost one costs only the note",
     ("ttp_pytest_durations.py", "os.replace(tmp, self.path)"): "renames that timing note into place: a rename lost to a crash leaves the old note or none",
+    ("ttp_pytest_durations.py", 'open(self.live, "a")'): "runs inside the checked repo's pytest, not the runtime: appends one timing line per test start and end; a cut last line is ignored on read, a lost one costs only the note",
     ("checkdirs.py", "os.fdopen(out, 'w')"): "new owner record: file and both directories synced before releasing the catalogue lock; descriptor-relative to refuse links",
     ("project.py", "os.replace(src, dst)"): "memory archive move: a rename, both directories synced after",
     ("project.py", "os.replace(a, b)"): "rolled-back memory retirement moves the file back: a rename, both directories synced after",
