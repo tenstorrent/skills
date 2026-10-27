@@ -145,3 +145,138 @@ def test_pr_body_check_refuses_an_unreadable_body_and_a_check_that_cannot_run(en
     assert any(x.startswith("delivery.pr_body_check: ") for x in config_problems({"delivery": {"pr_body_check": 5}}))
     assert not [x for x in config_problems({"delivery": {"pr_body_check": {"run": "true", "skip_repos": ["a/*"]}}})
                 if "pr_body_check" in x]
+
+
+def test_pr_body_check_covers_rest_api_writes_of_a_pr_body(env, tmp_path, monkeypatch):
+    monkeypatch.setenv("PR_CHECK_LOG", "")
+    p, gh, seen = _pr_body_project(env, tmp_path, lambda s: s)
+    good = tmp_path / "good.md"
+    good.write_text("Type: fix\n\nWhat changed.\n")
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps({"title": "t", "body": "no type"}))
+    for args in (("api", "-X", "PATCH", "repos/acme/widgets/pulls/7", "-f", "body=no type"),
+                 ("api", "--method=patch", "/repos/acme/widgets/pulls/7", "--raw-field", "body=no type"),
+                 ("api", "repos/acme/widgets/pulls/7", "-F", "body=no type"),   # POST implied by a field
+                 ("api", "-X", "PATCH", "https://api.github.com/repos/acme/widgets/pulls/7", "--input", str(bad)),
+                 ("api", "repos/acme/widgets/pulls", "-F", "draft=true", "-f", "head=x", "-f", "body=no type")):
+        rc, err, ran = gh(*args)
+        assert rc == 1 and ran == [] and "delivery.pr_body_check, exit 3" in err, (args, err)
+        assert seen() == [("create" if args[-6:-5] == ("-F",) else "edit") + " acme/widgets no type"], args
+    for args in (("api", "-X", "PATCH", "repos/acme/widgets/pulls/7", "-F", f"body=@{good}"),
+                 ("api", "repos/acme/widgets/pulls", "-F", "draft=true", "-f", "body=Type: docs")):
+        rc, err, ran = gh(*args)
+        assert rc == 0 and ran == [" ".join(args)], (args, err)
+        assert seen()[0].endswith("acme/widgets Type: " + ("fix" if "@" in args[-1] else "docs"))
+    # Reads, writes without a body and other endpoints are not checked.
+    for args in (("api", "repos/acme/widgets/pulls/7"), ("api", "-X", "GET", "repos/acme/widgets/pulls", "-f", "body=x"),
+                 ("api", "-X", "PATCH", "repos/acme/widgets/pulls/7", "-f", "title=t"),
+                 ("api", "repos/acme/widgets/issues/7/comments", "-f", "body=no type")):
+        rc, err, ran = gh(*args)
+        assert rc == 0 and ran, (args, err)
+    assert seen() == []
+
+
+def test_pr_body_check_covers_graphql_pr_mutations(env, tmp_path, monkeypatch):
+    monkeypatch.setenv("PR_CHECK_LOG", "")
+    p, gh, seen = _pr_body_project(env, tmp_path, lambda s: s)
+    upd = 'mutation{updatePullRequest(input:{pullRequestId:"PR_kwDOabc123",%s}){pullRequest{url body}}}'
+    for body in ('body:"no type\\nmore"', 'body: """\n    no type\n    """'):
+        rc, err, ran = gh("api", "graphql", "-f", "query=" + upd % body)
+        assert rc == 1 and ran == [] and "delivery.pr_body_check, exit 3" in err, (body, err)
+        assert seen() == ["edit  no type"]
+    rc, err, ran = gh("api", "graphql", "-f", "query=" + upd % 'body:"Type: fix\\u0021"')
+    assert rc == 0 and ran and seen() == ["edit  Type: fix!"], err
+    good = tmp_path / "good.md"
+    good.write_text("Type: feat\n")
+    create = ('mutation($b:String!){createPullRequest(input:{repositoryId:"R_1",baseRefName:"main",headRefName:"x",'
+              'title:"t",draft:true,body:$b}){pullRequest{url}}}')
+    rc, err, ran = gh("api", "graphql", "-f", "query=" + create, "-F", f"b=@{good}")
+    assert rc == 0 and ran and seen() == ["create  Type: feat"], err
+    rc, err, ran = gh("api", "graphql", "-f", "query=" + create, "-f", "b=no type")
+    assert rc == 1 and ran == [] and seen() == ["create  no type"], err
+    whole = "mutation($input:UpdatePullRequestInput!){updatePullRequest(input:$input){pullRequest{url}}}"
+    rc, err, ran = gh("api", "graphql", "-f", "query=" + whole, "-f", "input[pullRequestId]=PR_kwDOabc123",
+                      "-f", "input[body]=no type")
+    assert rc == 1 and ran == [] and seen() == ["edit  no type"], err
+    inp = tmp_path / "q.json"
+    inp.write_text(json.dumps({"query": whole, "variables": {"input": {"pullRequestId": "PR_x", "body": "no type"}}}))
+    rc, err, ran = gh("api", "graphql", "--input", str(inp))
+    assert rc == 1 and ran == [] and seen() == ["edit  no type"], err
+    # A mutation that leaves the body alone, and other GraphQL calls, are not checked.
+    for q in (upd % 'title:"t"', "query{viewer{login}}", 'mutation{addComment(input:{subjectId:"I_1",body:"x"}){clientMutationId}}'):
+        rc, err, ran = gh("api", "graphql", "-f", "query=" + q)
+        assert rc == 0 and ran, (q, err)
+    assert seen() == []
+
+
+def test_pr_body_check_refuses_a_gh_api_pr_body_it_cannot_read(env, tmp_path, monkeypatch):
+    monkeypatch.setenv("PR_CHECK_LOG", "")
+    p, gh, seen = _pr_body_project(env, tmp_path, lambda s: s)
+    from ttp import prguard
+    cfg = p.config()
+    rest = ["api", "-X", "PATCH", "repos/acme/widgets/pulls/7", "--input", "-"]
+    why = prguard.check(rest, "/bin/false", cfg=cfg)
+    assert why and "cannot read the --input from stdin for delivery.pr_body_check" in why
+    assert "exit 3" in prguard.check(rest, "/bin/false", stdin_text='{"body": "no type"}', cfg=cfg)
+    assert prguard.check(rest, "/bin/false", stdin_text='{"body": "Type: x"}', cfg=cfg) is None
+    assert seen() == ["edit acme/widgets no type", "edit acme/widgets Type: x"]
+    assert "cannot read the field file from stdin for delivery.pr_body_check" in prguard.check(
+        ["api", "-X", "PATCH", "repos/acme/widgets/pulls/7", "-F", "body=@-"], "/bin/false", cfg=cfg)
+    notjson = tmp_path / "body.txt"
+    notjson.write_text("Type: x, not JSON")
+    rc, err, ran = gh("api", "-X", "PATCH", "repos/acme/widgets/pulls/7", "--input", str(notjson))
+    assert rc == 1 and ran == [] and "as JSON for delivery.pr_body_check" in err, err
+    rc, err, ran = gh("api", "graphql", "-f",
+                      'query=mutation{updatePullRequest(input:{pullRequestId:"PR_kwDOabc123",body:$b}){clientMutationId}}')
+    assert rc == 1 and ran == [] and "the GraphQL variable $b for delivery.pr_body_check" in err, err
+    rc, err, ran = gh("api", "graphql", "-f",
+                      "query=mutation($i:UpdatePullRequestInput!){updatePullRequest(input:$i){clientMutationId}}")
+    assert rc == 1 and ran == [] and "the GraphQL variable $i for delivery.pr_body_check" in err, err
+    assert seen() == []
+
+
+def test_pr_body_check_globs_apply_to_rest_api_and_check_graphql(env, tmp_path, monkeypatch):
+    monkeypatch.setenv("PR_CHECK_LOG", "")
+    p, gh, seen = _pr_body_project(env, tmp_path, lambda s: {"run": s, "repos": ["acme/*"],
+                                                             "skip_repos": ["acme/scratch-*"]})
+    for repo in ("acme/scratch-notes", "other/widgets"):
+        rc, err, ran = gh("api", "-X", "PATCH", f"repos/{repo}/pulls/3", "-f", "body=no type")
+        assert rc == 0 and ran, (repo, err)
+    assert seen() == []
+    rc, err, ran = gh("api", "-X", "PATCH", "repos/ACME/Widgets/pulls/3", "-f", "body=no type")
+    assert rc == 1 and ran == [] and seen() == ["edit acme/widgets no type"], err
+    # A GraphQL call names its repo by node id: the repo is not told, so the check runs.
+    rc, err, ran = gh("api", "graphql", "-f", 'query=mutation{createPullRequest(input:{repositoryId:"R_kgDOscratch",'
+                      'baseRefName:"main",headRefName:"x",title:"t",draft:true,body:"no type"}){pullRequest{url}}}')
+    assert rc == 1 and ran == [] and seen() == ["create  no type"], err
+    from ttp import prguard
+    for current, refused in (("acme/scratch-x", False), ("acme/widgets", True)):   # {owner}/{repo}: the current repo
+        monkeypatch.setenv("GH_REPO", current)
+        why = prguard.check(["api", "-X", "PATCH", "repos/{owner}/{repo}/pulls/3", "-f", "body=no type"], "/bin/false",
+                            cfg=p.config())
+        assert bool(why) == refused, (current, why)
+    assert seen() == ["edit acme/widgets no type"]
+
+
+def test_pr_body_check_unset_leaves_gh_api_calls_unchanged(env, tmp_path, monkeypatch):
+    monkeypatch.setenv("PR_CHECK_LOG", "")
+    p, gh, seen = _pr_body_project(env, tmp_path)
+    from ttp import prbody, prguard
+
+    def no_read(*a, **k):
+        raise AssertionError("a body was read while the check is unset")
+    monkeypatch.setattr(prbody, "_read", no_read)
+    calls = [["api", "-X", "PATCH", "repos/acme/widgets/pulls/7", "-f", "body=no type"],
+             ["api", "-X", "PATCH", "repos/acme/widgets/pulls/7", "--input", "-"],
+             ["api", "repos/acme/widgets/pulls", "-F", "draft=true", "-F", "body=@-"],
+             ["api", "graphql", "-f", 'query=mutation{updatePullRequest(input:{pullRequestId:"PR_kwDOabc123",'
+                                      'body:$missing}){clientMutationId}}'],
+             ["api", "graphql", "-f", "query=mutation($i:UpdatePullRequestInput!){updatePullRequest(input:$i){x}}"]]
+    for args in calls:
+        assert prguard.check(args, "/bin/false", cfg=p.config()) is None, args
+        assert prbody.api_problem(*prguard._api_target(args[1:]), args[1:], {}) is None
+    # The guard's own refusals stay as they were.
+    assert "drafts only" in prguard.check(["api", "repos/acme/widgets/pulls", "-f", "body=x"], "/bin/false", cfg={})
+    rc, err, ran = gh(*calls[0])
+    assert rc == 0 and ran == [" ".join(calls[0])], err
+    assert seen() == []

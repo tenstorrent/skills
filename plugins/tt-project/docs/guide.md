@@ -1158,7 +1158,11 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   (globs on `owner/name`; `timeout_s` defaults to 30, at most 300). While a check applies, a body gh
   would get some other way (`--fill`, `--editor`, a template) is refused with a hint to pass
   `--body-file`, and a check that cannot run (no such command, a timeout) refuses with its error.
-  Edits that leave the body alone are not checked. Put the project's own rules (such as labels its
+  Edits that leave the body alone are not checked. It also covers PR bodies written through
+  `gh api`: a REST POST or PATCH to `repos/<owner>/<repo>/pulls[/<n>]` with a `body` field or an
+  `--input` JSON `body`, and a GraphQL `createPullRequest` or `updatePullRequest` with a body inline
+  or in a variable; a GraphQL call's repo is not told, so the globs do not skip it, and a body that
+  cannot be read (stdin not given, a missing file or variable) is refused. Put the project's own rules (such as labels its
   PR bodies must start with) in the command, never in the plugin.
 - Change windows: the template charter's Policies line `- Change windows: none` means disruptive
   work (restarts, rollouts, anything that disturbs others) may run whenever it is safe, and waiting

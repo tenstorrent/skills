@@ -15,14 +15,23 @@ matching repos out. A repo that cannot be told is checked. A body gh would get s
 (`--fill`, `--editor`, `--web`, a template, a prompt) cannot be read beforehand: while a check
 applies, such a call is refused and asked to pass `--body-file`. A check that cannot run (no such
 command, a timeout) refuses too, naming the setting and the error.
+
+A body written through `gh api` is checked too (api_problem): a REST POST or PATCH to
+repos/<owner>/<repo>/pulls[/<n>] carrying a `body` field (`-f`, `-F`, `-F body=@file`) or an --input
+JSON "body", and a GraphQL createPullRequest or updatePullRequest whose body is inline in the query or
+in a variable (`-f`/`-F` fields, --input "variables"). Its repo comes from the REST path; a GraphQL
+call's repo is not told (checked). A body that cannot be read (stdin gh would get, an unreadable file, a
+variable not given) refuses the call.
 """
 from __future__ import annotations
 
 import fnmatch
+import json
 import math
 import os
 import re
 import tempfile
+import textwrap
 
 KEY = "pr_body_check"
 SETTING = f"delivery.{KEY}"
@@ -154,13 +163,9 @@ def problem(sub: str, args: list[str], cfg: dict, real: str | None = None, stdin
     """Why `gh pr <sub> <args>` must not run under the project's PR body check, or None."""
     if sub not in ("create", "edit"):
         return None
-    raw = (cfg.get("delivery") or {}).get(KEY)
-    try:
-        conf = parse(raw)
-    except ValueError as e:
-        return f"refused: {SETTING} is malformed ({e}); fix it in the project's settings"
+    conf, why = _conf(cfg)
     if conf is None:
-        return None
+        return why
     opts, pos = _scan(args, CREATE_VALUES if sub == "create" else EDIT_VALUES)
     files = [opts[k] for k in ("--body-file", "-F") if k in opts]
     bodies = [opts[k] for k in ("--body", "-b") if k in opts]
@@ -189,6 +194,167 @@ def problem(sub: str, args: list[str], cfg: dict, real: str | None = None, stdin
         return (f"refused: the project checks each PR body ({SETTING}), and this call gives gh no body to "
                 f"check beforehand (--fill, --editor, --web, a template or a prompt); {BODY_FILE_HOW}")
     return _run(conf, body, sub, repo, cwd)
+
+
+def _conf(cfg: dict) -> tuple[dict | None, str | None]:
+    """The project's parsed setting (None when unset or malformed) and the refusal when malformed."""
+    try:
+        return parse((cfg.get("delivery") or {}).get(KEY)), None
+    except ValueError as e:
+        return None, f"refused: {SETTING} is malformed ({e}); fix it in the project's settings"
+
+
+# --- PR bodies written through gh api -----------------------------------------------------------
+
+API_PULLS_RE = re.compile(r"^/?repos/([^/]+)/([^/]+)/pulls(?:/(\d+))?/?$")
+GQL_PR_RE = re.compile(r"\b(createPullRequest|updatePullRequest)\b")
+# A `body:` argument: a block string, a string or a variable.
+GQL_BODY_RE = re.compile(r'\bbody\s*:\s*(?:"""((?:[^"\\]|\\.|"(?!""))*)"""|"((?:[^"\\\n]|\\.)*)"|\$(\w+))')
+GQL_INPUT_VAR_RE = re.compile(r"\binput\s*:\s*\$(\w+)")
+
+
+class _Unread(Exception):
+    pass
+
+
+def api_writes(endpoint: str, method: str) -> bool:
+    """Whether a `gh api` call may write a PR body (api_problem decides): a REST POST or PATCH on a
+    pulls endpoint, or any GraphQL call."""
+    return endpoint == "graphql" or bool(API_PULLS_RE.match(endpoint)) and method in ("POST", "PATCH")
+
+
+def api_problem(endpoint: str, method: str, args: list[str], cfg: dict, real: str | None = None,
+                stdin_text: str | None = None, cwd: str | None = None) -> str | None:
+    """Why `gh api <args>` (its endpoint and method already read) must not run under the project's PR
+    body check, or None. Nothing is read while the setting is unset."""
+    if not api_writes(endpoint, method):
+        return None
+    conf, why = _conf(cfg)
+    if conf is None:
+        return why
+    rest = API_PULLS_RE.match(endpoint)
+    repo = ""
+    if rest:
+        owner, name, number = rest.groups()
+        if "{" in owner or "{" in name:   # gh fills {owner}/{repo} from the current repo
+            repo = _repo({}, [], real if conf["repos"] or conf["skip_repos"] else None)
+        else:
+            repo = f"{owner}/{name}".lower()
+        if not applies(conf, repo):
+            return None
+    try:
+        if rest:
+            action, bodies = "create" if number is None else "edit", _rest_bodies(args, stdin_text, cwd)
+        else:
+            action, bodies = _graphql_bodies(args, stdin_text, cwd)
+    except _Unread as e:
+        return (f"refused: cannot read {e} for {SETTING} to check the PR body; pass the body as a field "
+                f"(-F body=@<file>) or in an --input file")
+    for body in dict.fromkeys(bodies):
+        if why := _run(conf, body, action, repo, cwd):
+            return why
+    return None
+
+
+def _read(path: str, stdin_text: str | None, cwd: str | None, what: str) -> str:
+    if path == "-":
+        if stdin_text is None:
+            raise _Unread(f"the {what} from stdin")
+        return stdin_text
+    try:
+        with open(os.path.join(cwd or "", path), encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError as e:
+        raise _Unread(f"the {what} {path!r} ({e.strerror or e})") from None
+
+
+def _api_fields(args: list[str], stdin_text: str | None, cwd: str | None) -> list[tuple[str, object]]:
+    """The fields a `gh api` call sends, as (name, value getter): a typed field's `@file` is read when
+    its value is asked for."""
+    from .prguard import _opts
+    out = []
+    for typed, names in ((False, ("-f", "--raw-field")), (True, ("-F", "--field"))):
+        for f in _opts(args, names):
+            k, _, v = f.partition("=")
+            if typed and v.startswith("@"):
+                out.append((k, lambda p=v[1:]: _read(p, stdin_text, cwd, "field file")))
+            else:
+                out.append((k, lambda v=v: v))
+    return out
+
+
+def _api_input(args: list[str], stdin_text: str | None, cwd: str | None) -> dict | None:
+    """The --input JSON object (None without --input or when it is not an object)."""
+    from .prguard import _opts
+    inputs = _opts(args, ("--input",))
+    if not inputs:
+        return None
+    try:
+        data = json.loads(_read(inputs[-1], stdin_text, cwd, "--input"))
+    except ValueError:
+        raise _Unread(f"the --input {inputs[-1]!r} as JSON") from None
+    return data if isinstance(data, dict) else None
+
+
+def _text(v) -> str:
+    return v if isinstance(v, str) else "" if v is None else json.dumps(v)
+
+
+def _rest_bodies(args: list[str], stdin_text: str | None, cwd: str | None) -> list[str]:
+    bodies = [get() for k, get in _api_fields(args, stdin_text, cwd) if k == "body"]
+    data = _api_input(args, stdin_text, cwd)
+    if data is not None and "body" in data:
+        bodies.append(_text(data["body"]))
+    return bodies
+
+
+def _graphql_bodies(args: list[str], stdin_text: str | None, cwd: str | None) -> tuple[str, list[str]]:
+    """The action and the PR bodies a GraphQL createPullRequest or updatePullRequest sets."""
+    fields = _api_fields(args, stdin_text, cwd)
+    queries = [get() for k, get in fields if k == "query"]
+    data = _api_input(args, stdin_text, cwd) or {}
+    if isinstance(data.get("query"), str):
+        queries.append(data["query"])
+    queries = [q for q in queries if GQL_PR_RE.search(q)]
+    if not queries:
+        return "edit", []
+    variables = dict(data.get("variables") or {}) if isinstance(data.get("variables"), dict) else {}
+    for k, get in fields:   # every other field is a variable; `input[body]=x` nests one level
+        if k in ("query", "operationName"):
+            continue
+        m = re.fullmatch(r"(\w+)\[(\w+)\]", k)
+        if m:
+            node = variables.get(m.group(1))
+            node = variables[m.group(1)] = node if isinstance(node, dict) else {}
+            node[m.group(2)] = get
+        else:
+            variables[k] = get
+
+    def value(v):
+        return v() if callable(v) else v
+
+    def variable(name: str):
+        if name not in variables:
+            raise _Unread(f"the GraphQL variable ${name}")
+        return value(variables[name])
+    action = "create" if any("createPullRequest" in q for q in queries) else "edit"
+    bodies = []
+    for q in queries:
+        for block, string, var in GQL_BODY_RE.findall(q):
+            if var:
+                bodies.append(_text(variable(var)))
+            elif string or not block:
+                try:
+                    bodies.append(json.loads(f'"{string}"'))
+                except ValueError:
+                    bodies.append(string)
+            else:
+                bodies.append(textwrap.dedent(block.replace('\\"""', '"""')).strip("\n"))
+        for var in GQL_INPUT_VAR_RE.findall(q):   # the whole input object passed as a variable
+            v = variable(var)
+            if isinstance(v, dict) and "body" in v:
+                bodies.append(_text(value(v["body"])))
+    return action, bodies
 
 
 def _run(conf: dict, body: str, sub: str, repo: str, cwd: str | None) -> str | None:

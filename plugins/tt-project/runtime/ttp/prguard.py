@@ -12,8 +12,9 @@ It refuses, whatever the agent or provider:
 - requests for human reviewers (`gh pr create --reviewer`, `gh pr edit --add-reviewer`, REST POSTs to
   a PR's requested_reviewers and GraphQL requestReviews): the user asks for reviews, never a run.
   Bot reviewers (a login ending in `[bot]`, Copilot) may be requested.
-- with `delivery.pr_body_check` set, `gh pr create` and a `gh pr edit` that sets the body when the
-  project's own PR body check refuses the body (prbody).
+- with `delivery.pr_body_check` set, `gh pr create`, a `gh pr edit` that sets the body and a
+  `gh api` REST or GraphQL call that writes a PR body when the project's own PR body check refuses
+  the body (prbody).
 
 An approval record is written only by the coordinator's `pr_approve` action. It needs the user's
 own words, quoted: a user message that names the PR, or the user's answer to a blocking `review` or
@@ -777,7 +778,7 @@ def check(args: list[str], real: str, db=None, stdin_text: str | None = None, _d
                 return _no_reviewers(seen, " ".join(more))
             return _body_problem("edit", more, real, stdin_text, cfg)
     if cmd == "api":
-        return _check_api(rest, real, db, stdin_text, allowed, seen)
+        return _check_api(rest, real, db, stdin_text, allowed, seen) or _api_body_problem(rest, real, stdin_text, cfg)
     return None
 
 
@@ -827,11 +828,7 @@ def _check_api(args: list[str], real: str, db, stdin_text: str | None, allowed: 
             except OSError:
                 return f"refused: cannot read the field file {val[1:]!r} to check it for a PR draft change"
     text = " ".join(fields) + " " + body
-    pos = _positionals(args, ("-X", "--method", "-f", "-F", "--field", "--raw-field", "-H", "--header",
-                              "--input", "-q", "--jq", "-t", "--template", "--hostname", "--cache", "-p",
-                              "--preview"))
-    endpoint = re.sub(r"^https?://[^/]+/(api/v3/)?", "", (pos[0] if pos else "").split("?")[0], flags=re.I)
-    method = ((_opts(args, ("-X", "--method")) or [""])[-1] or ("POST" if fields or inputs else "GET")).upper()
+    endpoint, method = _api_target(args)
     draft_false = bool(re.search(r"(^|\s)draft=false\b|[\"']draft[\"']\s*:\s*false", text, re.I))
     draft_true = bool(re.search(r"(^|\s)draft=true\b|[\"']draft[\"']\s*:\s*true|\bdraft\s*:\s*true", text, re.I))
     if endpoint == "graphql" and re.search(r"\brequestReviews", text):
@@ -874,6 +871,25 @@ def _check_api(args: list[str], real: str, db, stdin_text: str | None, allowed: 
         head = _sha(_gh(real, "api", *host, f"repos/{owner}/{repo}/pulls/{number}", "-q", ".head.sha"))
         return _refuse_ready({key}, db, "setting draft=false on a PR", allowed, {key: head}, seen)
     return None
+
+
+def _api_target(args: list[str]) -> tuple[str, str]:
+    """A `gh api` call's endpoint (no host, no query) and HTTP method."""
+    pos = _positionals(args, ("-X", "--method", "-f", "-F", "--field", "--raw-field", "-H", "--header",
+                              "--input", "-q", "--jq", "-t", "--template", "--hostname", "--cache", "-p",
+                              "--preview"))
+    endpoint = re.sub(r"^https?://[^/]+/(api/v3/)?", "", (pos[0] if pos else "").split("?")[0], flags=re.I)
+    sends = _opts(args, ("-f", "-F", "--field", "--raw-field", "--input"))
+    return endpoint, ((_opts(args, ("-X", "--method")) or [""])[-1] or ("POST" if sends else "GET")).upper()
+
+
+def _api_body_problem(args: list[str], real: str, stdin_text: str | None, cfg: dict | None) -> str | None:
+    """A PR body written through `gh api`, under the project's PR body check (prbody)."""
+    from . import prbody
+    endpoint, method = _api_target(args)
+    if not prbody.api_writes(endpoint, method):
+        return None
+    return prbody.api_problem(endpoint, method, args, _project_config() if cfg is None else cfg, real, stdin_text)
 
 
 def _reviewer_humans(fields: list[str], body: str) -> bool:
