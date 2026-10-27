@@ -16,7 +16,9 @@ order; each is bounded and never raises:
    pkexec COMMAND that runs reboot, shutdown, poweroff or halt (or `systemctl reboot|poweroff|halt|
    kexec`), or logind's 'Power key pressed': the last one wins. Else the line nearest before the marker
    of a system unit, or of systemd starting one, that names a power cycle, reboot or shutdown:
-   '<unit> (<message>)'.
+   '<unit> (<message>)'. A unit systemd only started is named only when its own lines (the last
+   UNIT_ENTRIES with its _SYSTEMD_UNIT, read the same way) show it logged after its start: one armed just
+   before the request (a shutdown watchdog) that logged nothing is 'armed, not fired' after the request.
 2. A tt-project host-cycle record (`ttp drain --reboot`) from any project on this host that ended that
    boot (hostcycle.planned).
 3. An entry in the shared machine-change ledger for this host's machine alias, recorded from
@@ -46,6 +48,7 @@ MARK_ENTRIES = 5000   # the marker read (logind, systemd's shutdown-target lines
 WINDOW_S = 600        # the window read: this long before the shutdown marker, at most WINDOW_ENTRIES
 WINDOW_ENTRIES = 5000
 TAIL_ENTRIES = 300    # a boot with no marker: its last lines
+UNIT_ENTRIES = 20     # a started unit's own last lines: whether it logged after its start
 STOP_TARGETS = ("reboot.target", "poweroff.target", "halt.target", "kexec.target")
 COMMAND_IDENTS = ("sudo", "pkexec")
 FIELDS = "MESSAGE,_SYSTEMD_UNIT,UNIT,SYSLOG_IDENTIFIER,_COMM,_UID"
@@ -103,6 +106,16 @@ def window_args(at: float | None) -> list[str]:
     if at is None:
         return ["-n", str(TAIL_ENTRIES)]
     return ["--since", f"@{int(at - WINDOW_S)}", "--until", f"@{int(at) + 1}", "-r", "-n", str(WINDOW_ENTRIES)]
+
+
+def unit_args(unit: str) -> list[str]:
+    """The last lines unit `unit` logged itself (systemd's lines about it are init.scope's)."""
+    return ["-n", str(UNIT_ENTRIES), f"_SYSTEMD_UNIT={unit}"]
+
+
+def end_args() -> list[str]:
+    """The boot's last line: when its journal ended."""
+    return ["-n", "1"]
 
 
 def run_journal(boot: str | None, extra=(), sudo: bool = False) -> tuple[int, str, str] | None:
@@ -236,14 +249,38 @@ def marker_at(out: str) -> float | None:
     return next(e["ts"] for e in marks if e["ts"] is not None and e["ts"] >= end - WINDOW_S)
 
 
+def _armed(unit: str, e: dict, own) -> str | None:
+    """'<unit> (<description>) armed, not fired: ...' when systemd started `unit` at `e` and its own lines
+    (own(unit): (its read, the boot's last line), either None when not read) show nothing after that;
+    None when it logged after its start, or that is unknown."""
+    got = own(unit) if own else None
+    if not got or got[0] is None:
+        return None
+    lines, end = got
+    t0 = e["ts"]
+    if any(r["unit"] == unit and r["msg"] and (t0 is None or r["ts"] is None or r["ts"] >= t0)
+           for r in _entries(lines) if r["json"]):
+        return None
+    m = re.match(r"Start(?:ed|ing) (?P<what>.*?)\.*$", e["msg"])
+    what = m["what"] if m else ""
+    if what.startswith(unit):
+        what = what[len(unit):].lstrip(" -")
+    ends = [r["ts"] for r in _entries(end or "") if r["ts"] is not None]
+    later = f" {max(ends) - t0:.0f} s later" if ends and t0 is not None and max(ends) >= t0 else ""
+    name = f"{unit} ({_clip(what, 60)})" if what and what != unit else unit
+    return f"{name} armed, not fired: it logged nothing of its own before the boot's journal ended{later}"
+
+
 def parse(out: str, window: str | None = None, full: bool = False,
-          commands: str | None = None) -> tuple[str | None, str | None]:
+          commands: str | None = None, own=None) -> tuple[str | None, str | None]:
     """(initiator, fallback) from the previous boot's journal: `out` the marker read, `window` the lines
     before its marker (out itself when None), `commands` the sudo and pkexec read (or in out). A marker
     read with MARK_ENTRIES lines and no marker says NO_MARKER, never NO_SHUTDOWN. Initiator: the last
     sudo/pkexec stop command or power-key
     press, else the line nearest before the marker (within WINDOW_S) of a system unit, or of systemd
-    starting one, that names a power cycle, reboot or shutdown. Fallback: the unit started or logging
+    starting one, that names a power cycle, reboot or shutdown; a unit systemd started that `own` (see
+    _armed) shows logged nothing after its start is no initiator: the next such line before it, else the
+    logind request, is, with '; <unit> (...) armed, not fired: ...' after it. Fallback: the unit started or logging
     nearest before the marker, a logind 'System is ...' line that names nobody, or with `full` (a read
     that shows the system's entries) and no marker, NO_SHUTDOWN and the last unit lines before the gap."""
     rows = _entries(out)
@@ -281,7 +318,7 @@ def parse(out: str, window: str | None = None, full: bool = False,
     first = next((k for k, e in enumerate(near) if _marker(e) and (at is None or e["ts"] is None or e["ts"] >= at)),
                  None)
     before = near[:first] if first is not None else [e for e in near if at is None or (e["ts"] or 0) < at]
-    start = unit_line = None
+    start = unit_line = armed = None
     for e in reversed(before):
         if at is not None and e["ts"] is not None and e["ts"] < at - WINDOW_S:
             break
@@ -291,11 +328,19 @@ def parse(out: str, window: str | None = None, full: bool = False,
         if started.startswith(("systemd-", "user@")):
             started = ""
         if (unit or started) and _STOP_WORDS.search(e["msg"]):
-            return f"{unit or started} ({_clip(e['msg'])})", fallback
+            quiet = None if unit else _armed(started, e, own)
+            if quiet is None:
+                hit = f"{unit or started} ({_clip(e['msg'])})"
+                return (f"{hit}; {armed}" if armed else hit), fallback
+            armed = armed or quiet
+            continue
         if start is None and started:
             start = f"{started} ({_clip(e['msg'])})"
         if unit_line is None and unit and e["msg"]:
             unit_line = f"{unit} ({_clip(e['msg'])})"
+    if armed:
+        # The request itself names nobody: a fallback, so a host-cycle record or ledger entry still wins.
+        return None, f"{fallback or 'a shutdown request that names no one (journal)'}; {armed}"
     return None, start or unit_line or fallback
 
 
@@ -339,7 +384,15 @@ def find(p, boot: str | None, boot_at: float | None, last_heartbeat: float | Non
                 window = w[1] if w and w[0] == 0 else None
                 if window is not None and "-r" in args:
                     window = "\n".join(reversed(window.splitlines()))   # read newest first
-            found, fallback = parse(got[1], window, full=bool(how) and window is not None, commands=commands)
+            seen = {}
+
+            def own(unit):   # once per unit: its 'Starting' and 'Started' lines both ask
+                if unit not in seen:
+                    u, n = ask(unit_args(unit)), ask(end_args())
+                    seen[unit] = (u[1] if u and u[0] == 0 else None), (n[1] if n and n[0] == 0 else None)
+                return seen[unit]
+            found, fallback = parse(got[1], window, full=bool(how) and window is not None, commands=commands,
+                                    own=own if ask else None)
             if found:
                 return {"source": "journal", "text": found, **({"read": how} if how == "sudo" else {})}
     except Exception:

@@ -1021,8 +1021,7 @@ def test_the_reboot_notice_names_the_unit_that_power_cycled_the_host_from_a_read
 
 
 @pytest.mark.parametrize("target", [True, False])
-def test_the_initiator_is_the_unit_systemd_started_just_before_the_marker_however_long_the_shutdown(monkeypatch,
-                                                                                                    target):
+def test_the_unit_systemd_started_just_before_the_marker_is_found_however_long_the_shutdown(monkeypatch, target):
     from ttp import initiator
     # More Stopping/Stopped lines after the marker than any bounded read holds: the marker read (logind,
     # systemd about the shutdown targets) still finds it, the window read then holds the 10 min before it,
@@ -1046,10 +1045,95 @@ def test_the_initiator_is_the_unit_systemd_started_just_before_the_marker_howeve
     monkeypatch.setattr(initiator, "run_journal", lambda boot, extra=(), sudo=False: reads.append(list(extra)) or
                         _journalctl(text, extra))
     got = initiator.find(None, "boot-0", None, None)
-    assert got == {"source": "journal", "text": "example-broker-recover.service (Started Example recovery: "
-                                                "power-cycle a hung shutdown.)"}, got
-    assert [r[:2] for r in reads] == [["-n", str(initiator.MARK_ENTRIES)]] * 2 + [["--since", f"@{_T0 - 600}"]], reads
+    # It logged nothing of its own after its start: armed, not fired; logind's request is the cause.
+    end = 11 if target else 4
+    assert got == {"source": "journal", "text": "a request to systemd-logind that names no user (journal: System is "
+                   "rebooting.); example-broker-recover.service (Example recovery: power-cycle a hung shutdown) "
+                   f"armed, not fired: it logged nothing of its own before the boot's journal ended {end} s later"}, got
+    assert [r[:2] for r in reads] == [["-n", str(initiator.MARK_ENTRIES)]] * 2 + [["--since", f"@{_T0 - 600}"]] + \
+        [["-n", str(initiator.UNIT_ENTRIES)], ["-n", "1"]], reads
     assert reads[0] == initiator.marker_args() and reads[1] == initiator.command_args(), reads
+    assert reads[3] == initiator.unit_args("example-broker-recover.service") and reads[4] == initiator.end_args()
+
+
+# A shutdown watchdog systemd-run started just before the reboot request, to power-cycle the host if the
+# shutdown hangs: generic unit names only.
+_WATCHDOG = "run-u42.service"
+_ARMED = [
+    _j(-60, "job 7 finished", _BROKER, "example-broker"),
+    _j(-0.014, f"Started {_WATCHDOG} - power-cycle a hung shutdown.", "init.scope", "systemd", about=_WATCHDOG),
+    _j(0, "System is rebooting.", "systemd-logind.service", "systemd-logind"),
+    _j(3, f"Stopping {_BROKER} - Example broker...", "init.scope", "systemd", about=_BROKER),
+    _j(88, "Reached target reboot.target - System Reboot.", "init.scope", "systemd", about="reboot.target"),
+]
+
+
+def _find_over(monkeypatch, boot, reads=None, unit_rc=0):
+    from ttp import initiator
+    text = "\n".join(boot) + "\n"
+
+    def run(b, extra=(), sudo=False):
+        (reads if reads is not None else []).append(list(extra))
+        return (1, "", "journalctl: failed") if unit_rc and any(a.startswith("_SYSTEMD_UNIT=") for a in extra) \
+            else _journalctl(text, extra)
+    monkeypatch.setattr(initiator, "run_journal", run)
+    return initiator.find(None, "boot-0", None, None)
+
+
+def test_a_watchdog_systemd_only_started_before_the_request_is_armed_not_the_initiator(env, monkeypatch):
+    from ttp import hostcycle, initiator
+    reads = []
+    got = _find_over(monkeypatch, _ARMED, reads)
+    assert got == {"source": "journal", "text": "a request to systemd-logind that names no user (journal: System is "
+                   f"rebooting.); {_WATCHDOG} (power-cycle a hung shutdown) armed, not fired: it logged nothing of "
+                   "its own before the boot's journal ended 88 s later"}, got
+    assert reads[3:] == [initiator.unit_args(_WATCHDOG), initiator.end_args()], reads
+    # Its lines from before this start (an earlier run of the same name) are no sign it fired.
+    early = [_j(-300, "ready", _WATCHDOG, "example-watchdog"), *_ARMED]
+    assert _find_over(monkeypatch, early)["text"] == got["text"]
+    # Its 'Starting' and 'Started' lines read its own lines once.
+    both = [_ARMED[0], _j(-0.02, f"Starting {_WATCHDOG} - power-cycle a hung shutdown...", "init.scope", "systemd",
+                          about=_WATCHDOG), *_ARMED[1:]]
+    reads.clear()
+    assert _find_over(monkeypatch, both, reads)["text"] == got["text"] and len(reads) == 5, reads
+    # The request names nobody, so a host-cycle record for the boot still wins over it.
+    monkeypatch.setattr(hostcycle, "planned", lambda p, boot, at: {"path": "/x/rec/cycle.json", "id": "c1",
+                                                                   "project": "other", "reason": "kernel update"})
+    assert _find_over(monkeypatch, _ARMED)["source"] == "host-cycle"
+    # An earlier unit line that names a power cycle is the initiator, the armed watchdog noted after it.
+    real = [_j(-5, "power-cycle the host now", "example-recover.service", "example-recover"), *_ARMED]
+    monkeypatch.setattr(hostcycle, "planned", lambda p, boot, at: None)
+    assert _find_over(monkeypatch, real)["text"] == (
+        f"example-recover.service (power-cycle the host now); {_WATCHDOG} (power-cycle a hung shutdown) armed, "
+        "not fired: it logged nothing of its own before the boot's journal ended 88 s later")
+
+
+def test_a_watchdog_that_logged_after_its_start_is_still_the_initiator(monkeypatch):
+    from ttp import initiator
+    said = f"{_WATCHDOG} (Started {_WATCHDOG} - power-cycle a hung shutdown.)"
+    fired = [*_ARMED[:-1], _j(45, "shutdown hung: power-cycling the host", _WATCHDOG, "example-watchdog"),
+             _ARMED[-1]]
+    reads = []
+    assert _find_over(monkeypatch, fired, reads) == {"source": "journal", "text": said}
+    assert initiator.unit_args(_WATCHDOG) in reads, reads
+    # Its own lines not readable: no claim it did not fire, named as before.
+    assert _find_over(monkeypatch, _ARMED, unit_rc=1) == {"source": "journal", "text": said}
+
+
+def test_a_unit_line_that_is_no_systemd_start_is_the_initiator_without_reading_its_lines(monkeypatch):
+    from ttp import initiator
+    plain = [_j(-60, "job 7 finished", _BROKER, "example-broker"),
+             _j(-2, "power-cycle requested by the operator console", _BROKER, "example-broker"),
+             *_ARMED[2:]]
+    reads = []
+    assert _find_over(monkeypatch, plain, reads) == {
+        "source": "journal", "text": f"{_BROKER} (power-cycle requested by the operator console)"}
+    assert len(reads) == 3 and initiator.unit_args(_BROKER) not in reads and initiator.end_args() not in reads, reads
+    # A unit line that reads like a start (not systemd's) is the unit's own line: named, nothing more read.
+    own = [_j(-2, f"Started {_WATCHDOG} - power-cycle a hung shutdown.", _BROKER, "example-broker"), *_ARMED[2:]]
+    reads.clear()
+    assert _find_over(monkeypatch, own, reads)["text"].startswith(f"{_BROKER} (Started ")
+    assert len(reads) == 3 and initiator.unit_args(_WATCHDOG) not in reads, reads
 
 
 def test_a_full_marker_read_with_no_marker_never_claims_no_clean_shutdown(monkeypatch):
