@@ -351,8 +351,10 @@ _WRAPPERS = ("nice", "ionice", "time", "env", "nohup", "stdbuf", "timeout", "chr
 def _segments(cmd: str) -> list[list[tuple[int, int, str]]]:
     """The simple commands of shell line `cmd`, each a list of its words as (start, end, unquoted
     text), split at the operators outside quotes, so a '|' or ';' in a quoted -k expression stays
-    inside its word. Redirections such as 2>&1 stay words; a comment ends at the line's end."""
-    segs, cur, i, n = [], [], 0, len(cmd)
+    inside its word. Redirections such as 2>&1 stay words; a comment ends at the line's end. An unquoted
+    $(...) stays inside its word (`-j$(nproc)`, `$(nproc)`), and the commands in it follow as segments
+    of their own, so `echo $(make -j 64)` still shows its make."""
+    segs, cur, inner, i, n = [], [], [], 0, len(cmd)
     while i < n:
         if cmd[i] in " \t":
             i += 1
@@ -373,6 +375,11 @@ def _segments(cmd: str) -> list[list[tuple[int, int, str]]]:
             elif c == "\\":
                 word.append(cmd[i + 1:i + 2])
                 i += 2
+            elif cmd.startswith("$(", i):
+                j = _close(cmd, i + 1)
+                word.append(cmd[i:j + 1])
+                inner += [[(a + i + 2, b + i + 2, w) for a, b, w in sub] for sub in _segments(cmd[i + 2:j])]
+                i = j + 1
             elif c == "'":
                 j = cmd.find("'", i + 1)
                 j = n if j < 0 else j
@@ -391,7 +398,31 @@ def _segments(cmd: str) -> list[list[tuple[int, int, str]]]:
                 i += 1
         cur.append((start, min(i, n), "".join(word)))
     segs.append(cur)
-    return [s for s in segs if s]
+    return [s for s in segs if s] + inner
+
+
+def _close(cmd: str, i: int) -> int:
+    """The index of the ')' closing the '(' at `i` (len(cmd) when none), past quoted text and nested ()."""
+    depth, n = 0, len(cmd)
+    while i < n:
+        c = cmd[i]
+        if c == "\\":
+            i += 1
+        elif c == "'":
+            i = cmd.find("'", i + 1)
+            i = n if i < 0 else i
+        elif c == '"':
+            i += 1
+            while i < n and cmd[i] != '"':
+                i += 2 if cmd[i] == "\\" else 1
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if not depth:
+                return i
+        i += 1
+    return n
 
 
 def _base(word: str) -> str:
@@ -411,13 +442,23 @@ def _runs(words: list[str], i: int) -> bool:
     return all(re.match(r"[A-Za-z_]\w*=|-|\d", w) or _base(w) in _WRAPPERS for w in words[:i])
 
 
+def _shell_value(w: str) -> bool:
+    """Whether word `w` is a value the shell fills in: $(...), `...` or $VAR."""
+    return "$" in w or "`" in w
+
+
+# ninja calls that build nothing: a tool (-t clean, -t compdb), a dry run, --version, help
+_NINJA_INFO = re.compile(r"-t.*|-n|--version|-h|--help")
+
+
 def _edits(cmd: str, k: int, build: bool) -> list[tuple[int, int, str, int]]:
     """(start, end, new text, old count) for each worker count in `cmd` above `k`: pytest's -n N /
     --numprocesses N after a pytest word (`build` False), or a build's -j N / --jobs N / --parallel N
     after a make, gmake, ninja or `cmake --build` word (`build` True; there a 0, unlimited, or a bare
-    make or cmake -j also becomes k, and a ninja run as the command with no -j gets -j k). Words are
-    matched unquoted and only whole flag or count words change, so `head -n 50`, `nice -n 19 pytest`
-    and a quoted -k expression keep theirs."""
+    make or cmake -j also becomes k, a ninja run as the command with no -j gets -j k unless it only runs
+    a tool or prints (-t, -n, --version, --help), and a count the shell fills in ($(nproc), `nproc`,
+    $N: old count -1) becomes `-j k` with its flag and value). Words are matched unquoted and only whole
+    flag or count words change, so `head -n 50`, `nice -n 19 pytest` and a quoted -k expression keep theirs."""
     out = []
     if k <= 0:
         return out
@@ -428,26 +469,36 @@ def _edits(cmd: str, k: int, build: bool) -> list[tuple[int, int, str, int]]:
         if tool is None:
             continue
         name = _base(words[tool])
-        seen = False
+        seen = info = False
         for i in range(tool + 1, len(seg)):
             start, end, w = seg[i]   # a quoted flag or count counts too; its word becomes plain text
-            m = re.fullmatch(rf"({re.escape(short)}|{'|'.join(map(re.escape, longs))})(=?)(\d*)", w)
+            info = info or (name == "ninja" and bool(_NINJA_INFO.fullmatch(w)))
+            m = re.fullmatch(rf"({re.escape(short)}|{'|'.join(map(re.escape, longs))})(=?)(.*)", w)
             if not m or (m.group(1) != short and m.group(1) not in longs):
                 continue
-            seen = True
             flag, eq, num = m.groups()
-            if not num and not eq and i + 1 < len(seg) and seg[i + 1][2].isdigit():
-                start, end, w = seg[i + 1]
-                num, prefix = w, ""
+            dyn = build and _shell_value(num)
+            if num and not num.isdigit() and not dyn:
+                continue
+            seen = True
+            nxt = seg[i + 1] if not num and not eq and i + 1 < len(seg) else None
+            if nxt and build and _shell_value(nxt[2]):
+                out.append((start, nxt[1], f"-j {k}", -1))   # `-j $(nproc)`: the flag and its value
+                continue
+            if nxt and nxt[2].isdigit():
+                start, end, num = nxt
+                prefix = ""
             else:
                 prefix = flag + eq
-            if num:
+            if dyn:
+                out.append((start, end, f"-j {k}", -1))   # `-j$(nproc)`, `--jobs=$N`: unknown before it runs
+            elif num:
                 n = int(num)
                 if n > k or (build and n == 0):
                     out.append((start, end, f"{prefix}{k}", n))
             elif build and not eq and name != "ninja":
                 out.append((start, end, f"{flag} {k}", 0))   # a bare make or cmake -j: unlimited
-        if build and not seen and name == "ninja" and _runs(words, tool):
+        if build and not seen and not info and name == "ninja" and _runs(words, tool):
             out.append((seg[tool][1], seg[tool][1], f" -j{k}", 0))   # ninja's default is every core and then some
     return out
 

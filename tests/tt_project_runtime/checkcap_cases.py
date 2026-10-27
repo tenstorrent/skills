@@ -1187,6 +1187,41 @@ def test_a_worker_shell_build_with_unlimited_jobs_is_refused_suggesting_the_shar
     assert why and "unlimited" in why and "-j 4" in why and "ttp clip" in why, why
 
 
+# A job count the shell fills in: each form, then what clip makes of it (no leftover expansion word)
+_SHELL_JOBS = [("make -j$(nproc)", "make -j 4"), ('make -j"$(nproc)"', "make -j 4"), ("make -j$N", "make -j 4"),
+               ("make -j`nproc`", "make -j 4"), ("make -j $(nproc)", "make -j 4"), ('make -j "$N" all', "make -j 4 all"),
+               ("make --jobs=$(nproc)", "make -j 4"), ("make --jobs $N", "make -j 4"),
+               ("make --jobs=`nproc` V=1", "make -j 4 V=1"), ("cmake --build . --parallel $(nproc)", "cmake --build . -j 4"),
+               ("cmake --build b --parallel=$N", "cmake --build b -j 4"), ("ninja -j $N", "ninja -j 4"),
+               ("ninja -j$(nproc) -C b", "ninja -j 4 -C b"), ("cd b && make -j$(( $(nproc) / 2 )) && echo ok",
+                                                              "cd b && make -j 4 && echo ok")]
+# ninja calls that run a tool or only print: no build, so no missing -j
+_NINJA_INFO = ["ninja -t clean", "ninja -C b -t compdb", "ninja -tclean", "ninja --version", "ninja -h",
+               "ninja --help", "ninja -n", "ninja -C build -n all"]
+
+
+@pytest.mark.parametrize("cmd,_", _SHELL_JOBS)
+def test_a_worker_shell_build_with_a_job_count_the_shell_fills_in_is_refused_naming_the_share(monkeypatch, cmd, _):
+    from ttp import hook
+    _build_share(monkeypatch, 4)
+    why = hook.too_many_build_jobs(cmd)
+    assert why and "fills in" in why and "build share of 4" in why and "-j 4" in why and "ttp clip" in why, why
+
+
+@pytest.mark.parametrize("cmd,capped", _SHELL_JOBS)
+def test_clip_replaces_a_job_count_the_shell_fills_in_with_its_grant_flag_and_value(cmd, capped):
+    from ttp import testslots
+    assert testslots.clamp_build(cmd, 4) == capped
+
+
+@pytest.mark.parametrize("cmd", _NINJA_INFO)
+def test_ninja_running_a_tool_or_only_printing_is_allowed_and_left_as_it_is(monkeypatch, cmd):
+    from ttp import hook, testslots
+    _build_share(monkeypatch, 4)
+    assert hook.too_many_build_jobs(cmd) is None, cmd
+    assert testslots.clamp_build(cmd, 4) == cmd
+
+
 def test_a_build_within_its_share_through_clip_or_checks_or_outside_a_worker_is_allowed(monkeypatch, tmp_path):
     from ttp import hook
     _build_share(monkeypatch, 4)

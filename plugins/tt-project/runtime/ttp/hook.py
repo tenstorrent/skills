@@ -896,8 +896,8 @@ def build_share() -> int:
 
 def too_many_build_jobs(cmd: str) -> str | None:
     """Why `cmd` is refused when a make, gmake, ninja or `cmake --build` in it asks for more jobs than the
-    run's build share (build_share()): an explicit -j N above it (it overrides MAKEFLAGS), an unlimited
-    `make -j` or a ninja with no -j (ninja reads no MAKEFLAGS). A build run through `ttp clip` (it takes
+    run's build share (build_share()): an explicit -j N above it (it overrides MAKEFLAGS), a -j the shell
+    fills in ($(nproc), $N), an unlimited `make -j` or a ninja with no -j (ninja reads no MAKEFLAGS). A build run through `ttp clip` (it takes
     build slots and lowers -j itself), inside `ttp checks` or under a held slot grant is not refused."""
     from . import testslots
     k = build_share()
@@ -910,7 +910,9 @@ def too_many_build_jobs(cmd: str) -> str | None:
            if not any(lo <= start <= hi for lo, hi in clipped)]
     if not big:
         return None
-    asked = f"-j {max(big)}" if max(big) else "unlimited jobs (`make -j` with no number, or ninja with no -j)"
+    asked = (f"-j {max(big)}" if max(big) > 0 else
+             "a job count the shell fills in (`-j$(nproc)`, `-j $N`), so its size is unknown" if -1 in big else
+             "unlimited jobs (`make -j` with no number, or ninja with no -j)")
     return (f"a build with {asked} is above this run's build share of {k} jobs on this shared host. "
             f"Use -j {k} or fewer, or run it as `ttp clip -- <build>` (it takes the host's build slots and "
             f"caps the jobs itself)")
