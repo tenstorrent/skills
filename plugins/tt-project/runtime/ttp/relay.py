@@ -36,6 +36,7 @@ us was we were what when where which while who will with would you your all any 
 only also just more most some such very please going still yet out off over""".split())
 # A model-like name ("name-5", "name-4.5", "name-6-x"; not "pr-123"), or the effort level only a pin names.
 _PIN_TERM = re.compile(r"^(?:[a-z]+(?:-[a-z]+)*-\d{1,2}(?:[.-][\w.-]+)?|xhigh)$")
+_EFFORTS = {"low", "medium", "high", "xhigh", "max"}   # 'high' is no typo of 'xhigh': another level
 _NOT_TERMS = {"auto", "default"}   # config model values that are plain words
 _WORD = re.compile(r"[a-z0-9][a-z0-9._-]*")
 
@@ -114,8 +115,11 @@ def near_miss(a: str, b: str) -> bool:
 def guard(text: str, messages: list[dict], terms: set[str] | frozenset = frozenset(),
           said: list[str] = (), typos: list[str] | None = None) -> tuple[str, dict | None]:
     """context_only's reason, with the message whose context holds the phrase (None when there is none).
-    `typos` (a list, for an entry's tag only, never a rule, pin or approval): a word the user's verbatim
-    words hold one edit away (near_miss) counts as theirs, and a line saying so is appended for each."""
+    `typos` (a list, for an entry's tag only, never a rule, pin or approval): a flagged pin term the user's
+    verbatim words hold one edit away (near_miss) counts as theirs, and a line saying so is appended for
+    each; a phrase counts only where it is the user's own with that one term swapped. A common word one
+    edit from the user's (fast/last), another known model or another effort level (high/xhigh) is never taken
+    for a typo: it would change their meaning."""
     ctx = [m for m in messages if (m.get("context") or "").strip()]
     if not ctx or not (text or "").strip():
         return "", None
@@ -129,8 +133,9 @@ def guard(text: str, messages: list[dict], terms: set[str] | frozenset = frozens
         in_ctx = {w for m in ctx for w in _words(m["context"])}
         near = {}
         for w in dict.fromkeys(words):
-            hit = next(((u, mid) for mid, ws in verbatim for u in ws if near_miss(w, u)), None) \
-                if w in in_ctx and w not in said_words else None
+            flagged = (w in terms or _PIN_TERM.match(w)) and w in in_ctx and w not in said_words
+            hit = next(((u, mid) for mid, ws in verbatim for u in ws
+                        if u not in terms and u not in _EFFORTS and near_miss(w, u)), None) if flagged else None
             if hit:
                 near[w] = hit
         back = {u: w for w, (u, _) in near.items()}

@@ -9745,6 +9745,19 @@ def test_relay_tag_names_a_typo_of_the_users_word_and_keeps_pins_exact(env):
         problems = coord.apply(p, [act], user_turn=True, messages=[mid])
         assert problems and "'mira-5' is only in message" in problems[0], act
     assert coord._relay_pin_note(p, {}, {"model": "mira-5"}, 1, [mid])
+    # 5. Only a flagged pin term may be a typo: a plain word one edit from the user's keeps the phrase
+    # relayer-only (it would reverse their meaning), and adds no false typo line beside a real one.
+    mid, text = entry("keep the build last on every box", "keep the build fast on every box",
+                      "keep the build fast on every box")
+    assert coord.RELAYED_MARK in text and "likely a typo" not in text
+    mid, text = entry("use mirq-5 for the test", "user wants mira-5 for tests", "tests use mira-5")
+    assert text.count("likely a typo") == 1 and "'mira-5' is in the user's words as 'mirq-5'" in text
+    assert coord.RELAYED_MARK not in text
+    # Another effort level or another known model is a different choice, not a typo.
+    for said, ctx, fact, terms in (("run it at high", "run it at xhigh", "run it at xhigh", set()),
+                                   ("use mira-5x", "use mira-5", "use mira-5", {"mira-5", "mira-5x"})):
+        why, _ = relay.guard(fact, [{"id": 7, "text": said, "context": ctx}], terms, typos=(t := []))
+        assert why and not t, (said, why, t)
 
 
 
