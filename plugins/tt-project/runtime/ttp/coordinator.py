@@ -25,7 +25,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import locks
-from . import ackwait, anchors, askrethink, broadcast, budgetkind, cachettl, chaincap, correction, course, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, machine_ledger, machines, mitigate, msgparts, obligations, outagemsg, pauseends, prguard, progress, projpause, push, relay, responsibilities, restriction_audit, reviewcap, reviewreuse, settinghold, settled, shared, sharedchecks, sweep, timefmt, tried, unblock, upstream, verified, watchdup, worktree
+from . import ackwait, anchors, askrethink, broadcast, budgetkind, cachettl, cells, chaincap, correction, course, credits, deploy, effort, ends, failover, forbidden, heal, hostcycle, jevuse, landed, machine_ledger, machines, mitigate, msgparts, obligations, outagemsg, pauseends, prguard, progress, projpause, push, relay, responsibilities, restriction_audit, reviewcap, reviewreuse, settinghold, settled, shared, sharedchecks, sweep, timefmt, tried, unblock, upstream, verified, watchdup, worktree
 from . import overlap as file_overlap   # apply() has a local `overlap`
 from . import screen as scr
 from . import schedule as sched
@@ -1881,6 +1881,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     owes = obligations.spec_check(db, a.get("spec") or "")
                 except ValueError as e:
                     raise ValueError(f"task_add rejected: {e}") from None
+                if why := cells.problem(a.get("spec")):
+                    raise ValueError(f"task_add rejected: {why}")
                 kind, pr_ask = _delivery_kind(a.get("kind") or "work", title + "\n" + (a.get("spec") or ""))
                 pin = _task_pin(cfg, a, pin_of(old or followup))
                 labels += _pin_mark(db, a.get("pin_required"), pin, old or followup)
@@ -2122,6 +2124,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         obligations.spec_check(db, spec, task["id"], attaching)
                     except ValueError as e:
                         raise ValueError(f"#{task['id']} rejected: {e}") from None
+                    if why := cells.problem(spec):
+                        raise ValueError(f"#{task['id']} rejected: {why}")
                     upd["spec"] = task["spec"] + "\n\n## Update\n" + spec
                     prev = load_result(upd.get("result") or task["result"])
                     if task["status"] != "running" and prev.pop("stale_wakes", None) is not None:

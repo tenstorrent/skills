@@ -3815,6 +3815,9 @@ class Daemon:
         cell_chk = cells.check(task.get("spec"), result) \
             if new == "done" and task["kind"] != "review" and isinstance(result, dict) else None
         cell_mark = cells.prefix(cell_chk)
+        if new == "done" and task["kind"] != "review" and (skip := cells.ignored(task.get("spec"))):
+            # A descriptive `cells:` line stored before spec checks refused it requests no cells.
+            log(self.p, f"task {task['id']}: ignored a non-enumerable cells: line ({skip[0][:80]})")
         # `cells_checked` in the stored result is the daemon's own seal (it survives a deferred push and
         # a restart); a worker's own 'partial:' text is not, so its missing cells still get a follow-up.
         if cell_mark and not result.get("cells_checked"):

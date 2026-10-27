@@ -204,3 +204,55 @@ def test_a_complete_matrix_gets_no_mark_or_seal(env):
     tid, _ = _finish_cells(env, p, SWEEP, res)
     got = load_result(p.db.task(tid)["result"])
     assert got["summary"] == "ok" and "cells_checked" not in got
+
+
+DESCRIBED = "cells: one row per remaining chip from step 1: unit, location, k/N, cause or clean"
+
+
+def test_only_an_enumerable_cells_line_requests_cells():
+    """A descriptive `cells:` line split on its commas into fake cells ('location', 'k/N', ...) and marked
+    full hand-offs partial: a line counts only when every part is a short name."""
+    from ttp import cells
+    assert cells.requested(DESCRIBED) == [] and cells.check(DESCRIBED, {"cells": ["unit"]}) is None
+    assert cells.ignored(DESCRIBED) == [DESCRIBED.split(":", 1)[1].strip()]
+    # Bare device ids keep their ':' (one space-free token); a ':' after free text or before a space is prose.
+    assert cells.requested("cells: 81:00.0, 0000:82:00.0; c1") == ["81:00.0", "0000:82:00.0", "c1"]
+    assert cells.requested("cells: a, b, c") == ["a", "b", "c"]
+    for bad in ("cells: per chip: a, b", "cells: chip 81:00.0, b", "cells: a:, b", "cells: :a",
+                "cells: a, b (one per chip)", "cells: a, [b]", "cells: the full sweep at each level, then a summary",
+                "cells: a, run every test on every chip.", "cells: " + "x" * 41):
+        assert cells.requested(bad) == [] and cells.ignored(bad) and cells.problem(bad), bad
+    # One descriptive line does not void an enumerable one beside it; a spec without lines has no problem.
+    assert cells.requested(f"{DESCRIBED}\ncells: a, b") == ["a", "b"]
+    assert cells.problem(SWEEP) is None and cells.problem("no line") is None and cells.problem(None) is None
+
+
+def test_a_descriptive_cells_line_is_refused_at_task_add_and_task_update(env):
+    from ttp import coordinator as coord
+    p = make(env)
+    count = lambda: p.db.one("SELECT COUNT(*) n FROM tasks")["n"]
+    before = count()
+    out = coord.apply(p, [{"type": "task_add", "title": "chip scan", "kind": "work", "spec": f"Scan.\n{DESCRIBED}"}])
+    assert len(out) == 1 and "task_add rejected" in out[0] and "one short name per measurement or test" in out[0]
+    assert count() == before
+    assert coord.apply(p, [{"type": "task_add", "title": "chip scan", "kind": "work",
+                            "spec": "Scan.\ncells: 81:00.0, 82:00.0"}]) == []
+    tid = p.db.one("SELECT id FROM tasks WHERE title='chip scan'")["id"]
+    spec = p.db.task(tid)["spec"]
+    out = coord.apply(p, [{"type": "task_update", "id": tid, "spec": DESCRIBED}])
+    assert len(out) == 1 and f"#{tid} rejected" in out[0] and "description" in out[0]
+    assert p.db.task(tid)["spec"] == spec
+
+
+def test_a_stored_descriptive_cells_line_never_marks_a_done_partial_or_starts_a_continue(env):
+    """A spec stored before the spec check refused such lines: the done stays as reported, with a log line."""
+    p = make(env)
+    for res in ({"status": "done", "summary": "all chips clean", "cells": ["chip 0", "chip 1"]},
+                {"status": "done", "summary": "all chips clean"}):
+        tid, done = _finish_cells(env, p, f"Scan every chip.\n{DESCRIBED}", res, title="chip scan")
+        got = load_result(p.db.task(tid)["result"])
+        assert got["summary"] == "all chips clean" and "cells_checked" not in got
+        assert "partial" not in done["text"] and "unreported" not in done["text"]
+        assert not p.db.q("SELECT id FROM tasks WHERE parent=?", (tid,))
+        assert not p.db.q("SELECT id FROM events WHERE task=? AND kind='followup_proposed'", (tid,))
+        assert f"task {tid}: ignored a non-enumerable cells: line" in (p.logs / "daemon.log").read_text()

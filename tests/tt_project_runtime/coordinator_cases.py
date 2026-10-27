@@ -9451,7 +9451,8 @@ def test_the_coordinator_role_prompt_carries_only_the_rules_of_features_that_are
     # +100: a relayer findings message is data, never the user's word
     # +100: an overlap never chains onto a device or machine task or one that waits itself
     # +140: a spec's `cells:` line, and a `partial:` or `cells unreported` done is not complete
-    assert len(role) <= 33_540, len(role)
+    # +70: a `cells:` line lists short names, never a description
+    assert len(role) <= 33_610, len(role)
     assert "<!-- ttp:" not in role and "<!-- /ttp:" not in role
     assert role in coord.prompt_parts(p)[0]
     # Rules for features that are off are left out; turning one on brings its rules in.

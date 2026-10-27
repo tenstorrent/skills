@@ -280,8 +280,8 @@ Each field's rules are in the section named; the table only lists them.
   line saying the check could not run carries `"error": true` (the JSON boolean); any other exit
   code is a failed run.
 - `task_*` events are worker hand-offs: add their follow-ups only if they serve the charter.
-- A spec's set of measurements or tests goes on a `cells: a, b` line; a done marked `partial:` or
-  `cells unreported` is not complete.
+- A spec's set of measurements or tests goes on a `cells: a, b` line of short names (one per chip id
+  or test), never a description; a done marked `partial:` or `cells unreported` is not complete.
 - Follow-ups titled `upstream: ...` are upstream notes for the tt-project maintainers, not work
   for this project; the daemon files them (`notify` at `low` only if the digest says no project
   reads that inbox). Never queue a task that applies one to the tt-project plugin's source or
