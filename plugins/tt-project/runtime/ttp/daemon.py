@@ -9196,6 +9196,8 @@ class Daemon:
             if not isinstance(result, dict) or result.get("status") != "waiting" or not isinstance(cmd, str) \
                     or not cmd.strip() or not onpassdry.enabled(self.cfg) or onpassdry.load(run_dir, cmd):
                 return
+            if result.get("retry_when") is not None and not isinstance(result["retry_when"], str):
+                return   # a retry_when that is no shell command is refused: its on_pass_cmd never runs
             got = onpassdry.run(cmd, self.p.root, self._on_pass_env(r["task"]), onpassdry.timeout_s(self.cfg))
             if got["verdict"] == "crash" and session:
                 spec = _read_result(run_dir / "run.json") or {}

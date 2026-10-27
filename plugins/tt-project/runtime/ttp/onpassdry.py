@@ -20,14 +20,12 @@ any other exit is no crash: the hand-off is accepted and records 'dry run inconc
 from __future__ import annotations
 
 import json
-import os
 import re
-import signal
-import subprocess
 import tempfile
 import time
 from pathlib import Path
 
+from . import boundedchild
 from .project import clean_line, durable_write
 
 ENV = "TTP_ON_PASS_DRY_RUN"
@@ -71,22 +69,9 @@ def run(cmd: str, cwd: Path, env: dict, timeout: float) -> dict:
     started = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="ttp-dry-") as scratch:
         env = {**env, ENV: "1", "TTP_RESULT": str(Path(scratch) / "result.json"), "TTP_NOTE_RUN_DIR": scratch}
-        with tempfile.TemporaryFile() as out:
-            proc = subprocess.Popen(cmd, shell=True, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=out,
-                                    stderr=subprocess.STDOUT, start_new_session=True, env=env)
-            try:
-                rc = proc.wait(timeout)
-            except subprocess.TimeoutExpired:
-                rc = None
-            # Its whole group goes: a child left behind must not outlive the dry run.
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
-            if rc is None:
-                proc.wait()
-            out.seek(0)
-            output = _tail(out.read()[-256 * 1024:])
+        got = boundedchild.run(cmd, timeout, shell=True, cwd=str(cwd), env=env, text=False, stderr="stdout",
+                               grace=2.0)
+        rc, output = got.rc, _tail(got.out[-256 * 1024:])
     verdict = classify(rc, output)
     return {"cmd": cmd, "rc": rc, "output": output, "verdict": verdict, "took_s": round(time.monotonic() - started, 1)}
 
