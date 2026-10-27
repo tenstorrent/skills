@@ -1,12 +1,14 @@
 # Stage summary and report formats
 
-Written for a person reviewing the stage in a few minutes. Keep `SUMMARY.md` to about one page.
+Written for a person reviewing the stage in a few minutes. Status: `PASSED`; `FLAGGED` (ran,
+with items under "Needs review"); `BLOCKED` (a hard prerequisite is missing); `ADOPTED` (an
+earlier stage checked from existing work, see `partial-runs.md`); `NOT RUN`. Keep `SUMMARY.md` to about one page.
 Facts come from logs and tests in the run root; link to them rather than pasting them.
 
 ## `SUMMARY.md`
 
 ```markdown
-# Stage <N>: <name> — PASSED | FAILED | BLOCKED
+# Stage <N>: <name> — PASSED | FLAGGED | BLOCKED | ADOPTED | NOT RUN
 
 | | |
 |---|---|

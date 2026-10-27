@@ -1,6 +1,6 @@
 ---
 name: dit-bringup
-description: "Starts and drives a new end-to-end bring-up of a model in models/tt_dit (diffusion transformer, VAE, text encoder, or a full image/video pipeline) from a Hugging Face repo ID or a local model package, through seven fixed stages on the target Tenstorrent hardware: component bring-up, unit correctness, missing ops, end-to-end pipeline, output quality (VBench/CLIP), end-to-end performance, and optimization. Each stage ends with its result plus a short summary or report a person can review. Use when starting or resuming a whole-model bring-up; for one component or one phase, use the tt-dit-* skill for that phase. Not for autoregressive text LLMs (use tt-model-bringup)."
+description: "Starts and drives a new end-to-end bring-up of a model in models/tt_dit (diffusion transformer, VAE, text encoder, or a full image/video pipeline) from a Hugging Face repo ID or a local model package, through seven fixed stages on the target Tenstorrent hardware: component bring-up, unit correctness, missing ops, end-to-end pipeline, output quality (VBench/CLIP), end-to-end performance, and optimization. Each stage ends with its result plus a short summary or report a person can review. Defaults to a Blackhole LoudBox (2x4 mesh). Use when starting or resuming a whole-model bring-up, or to run one stage or a range of stages on a model that is already partly brought up; for one component or one phase, use the tt-dit-* skill for that phase. Not for autoregressive text LLMs (use tt-model-bringup)."
 ---
 
 # tt_dit model bring-up
@@ -28,9 +28,11 @@ read `run.json` and do not ask again.
 | Input | Values | If missing |
 |---|---|---|
 | Model source | HF repo ID, or a local package path | Ask |
+| Stages to run | All (default), one stage, or a range, e.g. `5`, `3-4`, `6-7` | Run all remaining stages |
+| Existing port | Path to code already written for this model, if any | Look in the target directory; see "Partly brought-up models" |
 | Weights | Real checkpoint path, or none yet | Ask; if none, run stages 1–4 on seeded random weights and mark the run as such |
 | Closest in-tree model | The tt_dit model the port will copy patterns from | Propose one from `../../shared/reference-models.md`, confirm with the user |
-| Target hardware and mesh | e.g. Wormhole T3K 2x4, Blackhole Galaxy 4x8 | Ask |
+| Target hardware and mesh | Default: Blackhole LoudBox, 2x4 mesh (`references/hardware.md`) | Use the default if `tt-smi` on the device host shows a matching system; otherwise ask |
 | Production shape(s) | Resolution, frames, steps the model ships with | Infer from the model's configs; ask if unclear |
 | Target directory | Default `models/tt_dit/` in the tt-metal checkout | Use the default |
 | Device backend | `local`, `batch`, `slurm` | See `dit-device-backend` |
@@ -43,8 +45,9 @@ Stage 0 gate: `run.json` complete and the backend health check passes on the tar
 
 ## Stages
 
-Run in order. Do not start a stage until the previous gate passes. Details, gates, and what
-each summary must contain are in `references/stages.md`.
+Run in order. Do not start a stage until the previous gate passes, unless the stage's
+prerequisites are met as described in "Partly brought-up models". Details, prerequisites,
+gates, and what each summary must contain are in `references/stages.md`.
 
 | # | Stage | Required result | For a person to review |
 |---|---|---|---|
@@ -58,6 +61,23 @@ each summary must contain are in `references/stages.md`.
 
 Stage outputs go in `<run-root>/stages/<NN>-<name>/`. Formats are in
 `references/stage-summary.md`.
+
+## Partly brought-up models
+
+Any stage or range of stages can be run on its own, including for a model that was ported
+before this workflow existed. Follow `references/partial-runs.md`. In short:
+
+1. Run stage 0 as usual, plus an inventory of what already exists (code, tests, outputs,
+   earlier stage summaries) recorded in `run.json`.
+2. For each earlier stage, adopt rather than redo: if it has a summary, trust it; otherwise run
+   that stage's existing checks on device and write an `adopted` summary of what they show.
+   Do not rewrite working code to fit this workflow.
+3. Run the requested stages. Stop at the end of the range.
+
+A missing prerequisite the requested stage cannot run without (for example, no end-to-end
+pipeline before stage 6) stops that stage: report what is missing and which stage produces it.
+Anything weaker (an earlier gate failing or never checked) is flagged under "Needs review" and
+the requested stage continues.
 
 ## Rules
 

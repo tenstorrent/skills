@@ -6,6 +6,8 @@ Each stage: what to do, the gate, and what its summary must contain beyond the c
 
 ## 1. Component bring-up
 
+Prerequisites: hard: stage 0 (reference model source loadable on the host). Soft: none.
+
 Do: follow `tt-dit-add-model` Orient and Scaffold. List the components (text encoder(s),
 denoiser blocks, conditioning, positional embedding, VAE encoder/decoder, scheduler glue). Port
 each by copying the closest in-tree model's structure and reusing `layers/` and `utils/` (see
@@ -20,6 +22,8 @@ summary of important similarities and differences vs the closest in-tree model; 
 fallbacks still in place.
 
 ## 2. Unit correctness
+
+Prerequisites: hard: the components to test exist and run on device (stage 1). Soft: none.
 
 Do: write one test per component against the CPU reference with identical weights, following
 `tt-dit-add-model/testing-and-accuracy.md` tiers 1–3. Use `assert_quality` so PCC and
@@ -50,17 +54,22 @@ below the defaults under "Needs review".
 
 ## 3. Missing ops
 
+Prerequisites: hard: a list of missing ops or host fallbacks (stage 1 summary, or found by
+reading the existing code). Soft: stage 2 tests for the affected components.
+
 Do: for each host fallback from stage 1, follow `missing-ops.md`. Re-run the stage 2 tests of
 every component that used the op.
 
-Gate: no host fallbacks left on the device path (or each remaining one is approved by the user
-and listed), each new op has its own on-device test at the stage 2 single-op bar, and the
+Gate: no host fallbacks left on the device path (any that remain are listed under "Needs
+review" with the reason), each new op has its own on-device test at the stage 2 single-op bar, and the
 affected stage 2 tests still pass.
 
 Summary adds: per op, the approach (existing-op change, composite, tt-lang kernel, new
 kernel), where it lives, its accuracy, and whether it is a candidate to upstream.
 
 ## 4. End-to-end bring-up
+
+Prerequisites: hard: every component exists (stage 1). Soft: stage 2 passed, stage 3 passed.
 
 Do: assemble the pipeline following the closest in-tree pipeline. Run it on the target mesh at
 each production shape with real weights (seeded random weights only if none exist yet, and
@@ -75,17 +84,24 @@ side by side; any difference a person should look at.
 
 ## 5. Output quality
 
+Prerequisites: hard: a pipeline that produces output on device (stage 4) and real weights.
+Soft: stage 4 passed.
+
 Do: score the TT output and the reference output on the same prompts and seeds with VBench
 (video) or CLIP score (image), following `testing-and-accuracy.md` tier 6. Needs real weights.
 A missing scoring dependency is a failure to report, not a pass.
 
 Gate: each score is at or above the reference's within the noise band recorded for that
-metric; any shortfall is investigated or approved by the user.
+metric. A shortfall is investigated (bisect by swapping TT components for reference ones);
+if unexplained, it is listed under "Needs review" and the run continues.
 
 Summary adds: a table of metric, TT score, reference score, difference; the prompts and seeds
 used.
 
 ## 6. End-to-end performance
+
+Prerequisites: hard: a pipeline that runs on the target mesh at the production shape
+(stage 4). Soft: stages 4 and 5 passed, since a fast wrong model is not a result.
 
 Do: follow `tt-dit-benchmark-profile`. Measure warm device time at the production shape on the
 target mesh, capture a Tracy profile, and generate the ops report.
@@ -97,12 +113,16 @@ Report: `PERF_REPORT.md` as in `stage-summary.md`, with the ranked tall nails.
 
 ## 7. Optimization
 
+Prerequisites: hard: a stage 6 `PERF_REPORT.md` for the current commit (run stage 6 first if
+the code changed since), and an end-to-end correctness check that can be re-run. Soft: stage 5
+passed; without it, quality is guarded only by the stage 4 check, and the summary must say so.
+
 Do: run `tt-dit-loop` with the stage 6 measurement as its Phase 1 fixed baseline and the stage 4
 and 5 gates as its quality gate. Work the stage 6 tall nails in order, using
 `tt-dit-performance` and the optimization order in the plugin README.
 
-Gate: a `tt-dit-loop` stop gate fires, and the stage 2, 4, and 5 gates still pass on the final
-commit.
+Gate: a `tt-dit-loop` stop gate fires, and the stage 2, 4, and 5 gates (those that were run) still
+pass on the final commit.
 
 Report: `PERF_REPORT.md` with the baseline vs final table and a row per round, plus
 `SUMMARY.md` with the stop gate that fired and the remaining levers.
