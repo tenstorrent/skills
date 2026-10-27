@@ -806,10 +806,40 @@ _HIDDEN = (0, "", "Hint: You are currently not seeing messages from other users 
 
 
 def _newest_first(got, args):
-    """journalctl's answer as `-r` gives it: the lines newest first."""
-    if not got or "-r" not in args:
+    """journalctl's answer as `args` give it: `-r` the lines newest first, `-n N` only the last N lines (with
+    -r the first N, the newest)."""
+    if not got or got[1] is None:
         return got
-    return got[0], "\n".join(reversed((got[1] or "").splitlines())), got[2]
+    lines = got[1].splitlines()
+    if "-r" in args:
+        lines.reverse()
+    n = next((int(args[i + 1]) for i in range(len(args) - 1) if args[i] == "-n" and args[i + 1].isdigit()), None)
+    if n is not None:
+        lines = lines[:n] if "-r" in args else lines[-n:]
+    return got[0], "".join(line + "\n" for line in lines), got[2]
+
+
+def _journalctl(text, args):
+    """A fake journalctl over the JSON lines `text`: FIELD=value matches (one field's values ORed, fields
+    ANDed, `+` ORs groups), --since/--until @epoch, then -r and -n as _newest_first."""
+    groups, cur = [], {}
+    for a in [*args, "+"]:
+        if a == "+":
+            groups, cur = groups + ([cur] if cur else []), {}
+        elif "=" in a and not a.startswith("-"):
+            k, v = a.split("=", 1)
+            cur.setdefault(k, set()).add(v)
+    bound = {k: float(args[args.index(k) + 1][1:]) for k in ("--since", "--until") if k in args}
+    keep = []
+    for line in text.splitlines():
+        e = json.loads(line)
+        ts = int(e["__REALTIME_TIMESTAMP"]) / 1e6
+        if groups and not any(all(e.get(k) in vs for k, vs in g.items()) for g in groups):
+            continue
+        if ts < bound.get("--since", ts) or ts > bound.get("--until", ts):
+            continue
+        keep.append(line)
+    return _newest_first((0, "\n".join(keep), ""), args)
 
 
 def _initiator_reboot(p, tmp_path, monkeypatch, journal, last_heartbeat_ago=600):
@@ -827,8 +857,8 @@ def _initiator_reboot(p, tmp_path, monkeypatch, journal, last_heartbeat_ago=600)
     d = Daemon(p.base)
     d.tick()
     d.tick()
-    assert set(calls) <= {"boot-0"} and 1 <= len(calls) <= 2, "the journal is read once per boot (markers, then " \
-        "the window before them), for the boot that ended"
+    assert set(calls) <= {"boot-0"} and 1 <= len(calls) <= 3, "the journal is read once per boot (markers, " \
+        "commands, then the window before the marker), for the boot that ended"
     (n,) = _reboot_notices(p)
     ev = p.db.one("SELECT text, data FROM events WHERE source='host' AND kind='boot' ORDER BY id DESC LIMIT 1")
     return n["text"], ev["text"], json.loads(ev["data"])["initiator"]
@@ -990,30 +1020,53 @@ def test_the_reboot_notice_names_the_unit_that_power_cycled_the_host_from_a_read
         (None, f"{_BROKER} (job 41 finished)")
 
 
-def test_the_initiator_is_the_unit_systemd_started_just_before_the_marker_however_long_the_shutdown(monkeypatch):
+@pytest.mark.parametrize("target", [True, False])
+def test_the_initiator_is_the_unit_systemd_started_just_before_the_marker_however_long_the_shutdown(monkeypatch,
+                                                                                                    target):
     from ttp import initiator
-    # The marker read (logind, systemd, sudo, pkexec) ends with thousands of shutdown lines after the
-    # marker; the window read then holds the 10 min before it, where systemd started the unit that did it.
-    shutdown = [_j(1 + k / 1000, f"Stopped example-{k}.service.", "init.scope", "systemd") for k in range(6000)]
-    marks = "\n".join([_j(0, "System is rebooting.", "systemd-logind.service", "systemd-logind"), *shutdown]) + "\n"
-    window = "\n".join([
+    # More Stopping/Stopped lines after the marker than any bounded read holds: the marker read (logind,
+    # systemd about the shutdown targets) still finds it, the window read then holds the 10 min before it,
+    # where systemd started the unit that did it. With or without systemd's 'Reached target' line.
+    n = initiator.MARK_ENTRIES + 1000
+    boot = [
         _j(-200, "Started example-health.service - Example health probe.", "init.scope", "systemd",
            about="example-health.service"),
         _j(-190, "probe ok", "example-health.service", "example-health"),
+        _j(-100, "someuser : TTY=pts/1 ; USER=root ; COMMAND=/usr/bin/true", ident="sudo"),
         _j(-2, "Started Example recovery: power-cycle a hung shutdown.", "init.scope", "systemd",
            about="example-broker-recover.service"),
         _j(0, "System is rebooting.", "systemd-logind.service", "systemd-logind"),
-    ]) + "\n"
+        *(_j(2 + k / (2 * n), f"Stopped example-{k}.service.", "init.scope", "systemd", about=f"example-{k}.service")
+          for k in range(n)),
+        *([_j(9, "Reached target reboot.target - System Reboot.", "init.scope", "systemd", about="reboot.target")]
+          if target else []),
+    ]
+    text = "\n".join(boot) + "\n"
     reads = []
-
-    def journal(boot, extra=(), sudo=False):
-        reads.append(list(extra))
-        return _newest_first((0, window if "--since" in extra else marks, ""), extra)
-    monkeypatch.setattr(initiator, "run_journal", journal)
+    monkeypatch.setattr(initiator, "run_journal", lambda boot, extra=(), sudo=False: reads.append(list(extra)) or
+                        _journalctl(text, extra))
     got = initiator.find(None, "boot-0", None, None)
     assert got == {"source": "journal", "text": "example-broker-recover.service (Started Example recovery: "
                                                 "power-cycle a hung shutdown.)"}, got
-    assert len(reads) == 2 and reads[0][:2] == ["-n", str(initiator.MARK_ENTRIES)] and "--since" in reads[1]
+    assert [r[:2] for r in reads] == [["-n", str(initiator.MARK_ENTRIES)]] * 2 + [["--since", f"@{_T0 - 600}"]], reads
+    assert reads[0] == initiator.marker_args() and reads[1] == initiator.command_args(), reads
+
+
+def test_a_full_marker_read_with_no_marker_never_claims_no_clean_shutdown(monkeypatch):
+    from ttp import initiator
+    # As many logind lines as the marker read holds and no marker among them: the marker may lie before them.
+    text = "\n".join([_j(-3, "Started example-health.service.", "init.scope", "systemd", about="example-health.service"),
+                      *(_j(k / 1000, f"Removed session {k}.", "systemd-logind.service", "systemd-logind")
+                        for k in range(initiator.MARK_ENTRIES + 10))]) + "\n"
+    monkeypatch.setattr(initiator, "run_journal", lambda boot, extra=(), sudo=False: _journalctl(text, extra))
+    got = initiator.find(None, "boot-0", None, None)
+    assert got == {"source": "journal", "text": initiator.NO_MARKER}, got
+    assert "no clean shutdown" not in got["text"] and str(initiator.MARK_ENTRIES) in got["text"]
+    full = _journalctl(text, initiator.marker_args())[1]
+    assert initiator.parse(full, full=True) == (None, initiator.NO_MARKER)
+    # One line fewer is the whole boot: a boot with no marker in it did not shut down cleanly.
+    short = "".join(line + "\n" for line in full.splitlines()[1:])
+    assert initiator.parse(short, short, full=True)[1].startswith(initiator.NO_SHUTDOWN)
 
 
 def test_a_permission_limited_journal_is_read_through_sudo_n_never_prompting(env, tmp_path, monkeypatch):
@@ -1034,10 +1087,11 @@ def test_a_permission_limited_journal_is_read_through_sudo_n_never_prompting(env
     got = initiator.find(p, "0123456789abcdef0123456789abcdef", time.time(), None)
     assert got["source"] == "journal" and got["read"] == "sudo" \
         and got["text"].startswith("example-broker-recover.service (power-cycle a hung shutdown"), got
-    user, check, sudo, window = (c[0] for c in calls)
+    user, check, sudo, commands, window = (c[0] for c in calls)
     assert user[:3] == ["journalctl", "-b", "0123456789abcdef0123456789abcdef"] and "json" in user \
         and "SYSLOG_IDENTIFIER=systemd-logind" in user
     assert check == ["sudo", "-n", "true"] and sudo == ["sudo", "-n", *user]
+    assert commands[:2] == ["sudo", "-n"] and commands[-2:] == ["SYSLOG_IDENTIFIER=sudo", "SYSLOG_IDENTIFIER=pkexec"]
     assert window[:2] == ["sudo", "-n"] and window[window.index("--since") + 1] == f"@{_T0 - 600}" \
         and window[window.index("--until") + 1] == f"@{_T0 + 1}", window   # the 10 min before the marker
     assert all(t <= 10 and stdin == sp.DEVNULL for _, t, stdin in calls), calls   # bounded, never prompts

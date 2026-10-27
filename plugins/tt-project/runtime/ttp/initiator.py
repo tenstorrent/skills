@@ -7,10 +7,12 @@ question such as "did tt-project reboot this host?" is answered by the record it
 order; each is bounded and never raises:
 
 1. The previous boot's journal as JSON, read as this user, else through `sudo -n` (bounded, never
-   prompts, stores nothing) when that showed only the user's own entries and `sudo -n true` works. Two
-   bounded reads the same way: the boot's last MARK_ENTRIES lines of systemd, logind, sudo and pkexec,
-   then the WINDOW_S before the shutdown marker found there (logind's 'System is rebooting/powering
-   down', systemd reaching the reboot or poweroff target, a 'shutdown scheduled' line). A sudo or
+   prompts, stores nothing) when that showed only the user's own entries and `sudo -n true` works. Three
+   bounded reads the same way: the boot's last MARK_ENTRIES lines of logind and of systemd about the
+   shutdown targets, which the shutdown's own Stopping/Stopped lines cannot push out; the boot's last
+   MARK_ENTRIES lines of sudo and pkexec; then the WINDOW_S before the shutdown marker found in the
+   first (logind's 'System is rebooting/powering down', systemd reaching the reboot or poweroff target,
+   a 'shutdown scheduled' line). A sudo or
    pkexec COMMAND that runs reboot, shutdown, poweroff or halt (or `systemctl reboot|poweroff|halt|
    kexec`), or logind's 'Power key pressed': the last one wins. Else the line nearest before the marker
    of a system unit, or of systemd starting one, that names a power cycle, reboot or shutdown:
@@ -22,7 +24,8 @@ order; each is bounded and never raises:
    cycle or a reboot: the latest one, with its entry id and the project that recorded it.
 
 Else the unit started or logging nearest before the marker, a bare logind line, or for a boot whose
-journal ends with no marker 'no clean shutdown logged (...)' and its last unit lines. Else 'unknown',
+journal ends with no marker 'no clean shutdown logged (...)' and its last unit lines (a marker read that
+came back full says only that no marker was in it). Else 'unknown',
 or 'unknown (journal not readable: <why>)'. Tests set TTP_TEST_NO_JOURNAL so the real journalctl and
 sudo never run; they stub run_journal (extra, sudo) and sudo_ok instead.
 """
@@ -39,11 +42,12 @@ from pathlib import Path
 JOURNAL_TIMEOUT_S = 5
 SUDO_TIMEOUT_S = 8    # each `sudo -n journalctl`; `sudo -n true` before them takes SUDO_CHECK_S
 SUDO_CHECK_S = 3
-MARK_ENTRIES = 5000   # the marker read: the boot's last lines of systemd, logind, sudo and pkexec
+MARK_ENTRIES = 5000   # the marker read (logind, systemd's shutdown-target lines) and the command read (sudo, pkexec)
 WINDOW_S = 600        # the window read: this long before the shutdown marker, at most WINDOW_ENTRIES
 WINDOW_ENTRIES = 5000
 TAIL_ENTRIES = 300    # a boot with no marker: its last lines
-MARK_IDENTS = ("systemd-logind", "systemd", "sudo", "pkexec")
+STOP_TARGETS = ("reboot.target", "poweroff.target", "halt.target", "kexec.target")
+COMMAND_IDENTS = ("sudo", "pkexec")
 FIELDS = "MESSAGE,_SYSTEMD_UNIT,UNIT,SYSLOG_IDENTIFIER,_COMM,_UID"
 LEDGER_WINDOW_S = 1800
 TEXT_CHARS = 120
@@ -59,6 +63,7 @@ _MARKER_LOGIND = re.compile(r"^System is (rebooting|powering down|halting)|shutd
 _MARKER_SYSTEMD = re.compile(r"^Reached target .*\b(reboot|power-?off|halt|kexec)\b", re.I)
 _UNIT_START = re.compile(r"^Start(?:ed|ing) (?P<unit>[\w.@:-]+\.(?:service|scope|timer))\b")
 NO_SHUTDOWN = "no clean shutdown logged (power loss, hard reset or watchdog)"
+NO_MARKER = f"no shutdown marker in the journal's last {MARK_ENTRIES} logind and shutdown-target lines read"
 EMPTY = "no system entries visible for the previous boot"
 
 
@@ -83,7 +88,13 @@ def _run(argv: list[str], timeout: float) -> tuple[int, str, str] | None:
 
 
 def marker_args() -> list[str]:
-    return ["-n", str(MARK_ENTRIES), *(f"SYSLOG_IDENTIFIER={i}" for i in MARK_IDENTS)]
+    """logind's lines, or systemd's about a shutdown target: few after the marker however many units stop."""
+    return ["-n", str(MARK_ENTRIES), "SYSLOG_IDENTIFIER=systemd-logind", "+", "SYSLOG_IDENTIFIER=systemd",
+            *(f"UNIT={t}" for t in STOP_TARGETS)]
+
+
+def command_args() -> list[str]:
+    return ["-n", str(MARK_ENTRIES), *(f"SYSLOG_IDENTIFIER={i}" for i in COMMAND_IDENTS)]
 
 
 def window_args(at: float | None) -> list[str]:
@@ -225,16 +236,22 @@ def marker_at(out: str) -> float | None:
     return next(e["ts"] for e in marks if e["ts"] is not None and e["ts"] >= end - WINDOW_S)
 
 
-def parse(out: str, window: str | None = None, full: bool = False) -> tuple[str | None, str | None]:
+def parse(out: str, window: str | None = None, full: bool = False,
+          commands: str | None = None) -> tuple[str | None, str | None]:
     """(initiator, fallback) from the previous boot's journal: `out` the marker read, `window` the lines
-    before its marker (out itself when None). Initiator: the last sudo/pkexec stop command or power-key
+    before its marker (out itself when None), `commands` the sudo and pkexec read (or in out). A marker
+    read with MARK_ENTRIES lines and no marker says NO_MARKER, never NO_SHUTDOWN. Initiator: the last
+    sudo/pkexec stop command or power-key
     press, else the line nearest before the marker (within WINDOW_S) of a system unit, or of systemd
     starting one, that names a power cycle, reboot or shutdown. Fallback: the unit started or logging
     nearest before the marker, a logind 'System is ...' line that names nobody, or with `full` (a read
     that shows the system's entries) and no marker, NO_SHUTDOWN and the last unit lines before the gap."""
     rows = _entries(out)
+    scan = (_entries(commands) if commands else []) + rows
+    if commands and all(e["ts"] is not None for e in scan):
+        scan.sort(key=lambda e: e["ts"])
     found = fallback = None
-    for e in rows:
+    for e in scan:
         ident, msg = e["ident"], e["msg"]
         if ident == "sudo" and "COMMAND=" in msg \
                 and not re.search(r"incorrect password|not allowed|not in sudoers", msg, re.I):
@@ -254,6 +271,8 @@ def parse(out: str, window: str | None = None, full: bool = False) -> tuple[str 
     near = rows if window is None else _entries(window)
     marks = [e for e in rows if _marker(e)]
     if not marks:
+        if sum(1 for line in (out or "").splitlines() if line.strip()) >= MARK_ENTRIES:
+            return None, NO_MARKER   # the marker may lie before a full bounded read: no claim about it
         if full and near:
             last = [f"{_service(e)}: {_clip(e['msg'], 60)}" for e in near if _service(e) and e["msg"]][-2:]
             return None, NO_SHUTDOWN + (f"; last unit lines: {'; '.join(last)}" if last else "")
@@ -311,14 +330,16 @@ def find(p, boot: str | None, boot_at: float | None, last_heartbeat: float | Non
     try:
         got, ask, how, why = read(boot, journal, sudo)
         if got:
-            window = None
+            window = commands = None
             if ask:
+                c = ask(command_args())
+                commands = c[1] if c and c[0] == 0 else None
                 args = window_args(marker_at(got[1]))
                 w = ask(args)
                 window = w[1] if w and w[0] == 0 else None
                 if window is not None and "-r" in args:
                     window = "\n".join(reversed(window.splitlines()))   # read newest first
-            found, fallback = parse(got[1], window, full=bool(how) and window is not None)
+            found, fallback = parse(got[1], window, full=bool(how) and window is not None, commands=commands)
             if found:
                 return {"source": "journal", "text": found, **({"read": how} if how == "sudo" else {})}
     except Exception:
