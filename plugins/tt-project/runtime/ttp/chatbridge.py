@@ -18,13 +18,17 @@ tool_result blocks (parallel calls matched by id), stop reasons and usage. Reaso
 blocks out, reasoning_content in) is dropped; max_tokens is capped from the provider entry.
 Upstream errors come back as Messages errors the runner already classifies: 401/403 as an
 authentication error (the auth gate), 402 as a funds limit, 429 as a rate limit, 503/529 as
-overloaded and other 5xx as a retryable api_error.
+overloaded and other 5xx as a retryable api_error. A prompt past the model's context window comes
+back worded as Anthropic's ('prompt is too long: N tokens > M maximum'), which Claude Code compacts
+on; a tier's context_window also sets the agent's CLAUDE_CODE_AUTO_COMPACT_WINDOW, as Claude Code
+takes 200k for a model name it does not know.
 """
 from __future__ import annotations
 
 import hmac
 import http.server
 import json
+import re
 import secrets
 import socket
 import threading
@@ -37,6 +41,13 @@ from . import endpoint
 UPSTREAM_TIMEOUT_S = 600
 STOP_REASONS = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use",
                 "function_call": "tool_use", "content_filter": "end_turn"}
+# An upstream's prompt-too-long answers: OpenAI's code and the wordings of common servers (OpenAI,
+# vLLM, llama.cpp, TGI and the like). Matched on the error body, its code included.
+CONTEXT_RE = re.compile(
+    r"context_length_exceeded|exceed_context_size|maximum context length|context length (?:is |was )?exceeded"
+    r"|exceeds? (?:the )?(?:available |maximum |model'?s? )*context|too many (?:input |prompt )?tokens"
+    r"|prompt is too long|input is too long|tokens \+ `?max_new_tokens`? must be", re.I)
+CONTEXT_STATUSES = (400, 413, 422)
 
 
 class BridgeError(Exception):
@@ -53,9 +64,11 @@ class BridgeAuthError(BridgeError):
 def settings(cfg: dict, tier: str, model: str) -> dict:
     """The run.json `bridge` entry for a `chat` run: no key, only where to find it."""
     entry = ((cfg or {}).get("providers") or {}).get("chat") or {}
-    cap = ((entry.get("tiers") or {}).get(tier) or {}).get("max_tokens") or entry.get("max_tokens") or 0
+    row = (entry.get("tiers") or {}).get(tier) or {}
+    cap = row.get("max_tokens") or entry.get("max_tokens") or 0
+    window = row.get("context_window") or entry.get("context_window") or 0
     return {"endpoint": str(entry.get("endpoint") or ""), "base_url": str(entry.get("base_url") or ""),
-            "model": model, "max_tokens": int(cap or 0)}
+            "model": model, "max_tokens": int(cap or 0), **({"context_window": int(window)} if window else {})}
 
 
 def config_problems(raw: dict) -> list[str]:
@@ -76,11 +89,21 @@ def config_problems(raw: dict) -> list[str]:
             endpoint.base_url(str(entry["base_url"]))
         except ValueError as e:
             out.append(f"providers.chat.base_url: {e}")
-    caps = [entry.get("max_tokens"), *((t or {}).get("max_tokens") for t in (entry.get("tiers") or {}).values()
-                                       if isinstance(t, dict))]
-    if any(c is not None and (isinstance(c, bool) or not isinstance(c, int) or c < 0) for c in caps):
-        out.append("providers.chat max_tokens: give a whole number of tokens (0 = no cap)")
+    for key, unset in (("max_tokens", "no cap"), ("context_window", "Claude Code's own")):
+        caps = [entry.get(key), *((t or {}).get(key) for t in (entry.get("tiers") or {}).values()
+                                  if isinstance(t, dict))]
+        if any(c is not None and (isinstance(c, bool) or not isinstance(c, int) or c < 0) for c in caps):
+            out.append(f"providers.chat {key}: give a whole number of tokens (0 = {unset})")
+    rows = ((raw.get("pricing") or {}) if isinstance(raw.get("pricing"), dict) else {}).get("chat")
+    if rows is not None and (not isinstance(rows, dict) or not all(price_ok(v) for v in rows.values())):
+        out.append("pricing.chat: give each model (or \"default\") [input, cached input, output] in $ per "
+                   "million tokens; chat spend is estimated until then")
     return out
+
+
+def price_ok(row) -> bool:
+    return (isinstance(row, (list, tuple)) and len(row) == 3
+            and all(isinstance(x, (int, float)) and not isinstance(x, bool) and x >= 0 for x in row))
 
 
 def _text(content) -> str:
@@ -279,11 +302,29 @@ class Stream:
         return out + _sse("message_stop", {"type": "message_stop"})
 
 
+def too_long(detail: str) -> str:
+    """Anthropic's wording for an upstream prompt-too-long answer ('prompt is too long: N tokens > M
+    maximum', the numbers when the answer gives them), which Claude Code compacts on; "" for another."""
+    if not CONTEXT_RE.search(detail or ""):
+        return ""
+    limit = re.search(r"(?:maximum context length|context (?:length|window|size)|must be <=)\D{0,20}?(\d{3,})", detail, re.I)
+    used = re.search(r"(?:requested|resulted in|contains|given:?|prompt has|you (?:sent|have))\D{0,20}?(\d{3,})",
+                     detail, re.I)
+    if limit and used and int(used.group(1)) > int(limit.group(1)):
+        return f"prompt is too long: {used.group(1)} tokens > {limit.group(1)} maximum"
+    return "prompt is too long"
+
+
 def error_for(status: int, detail: str = "") -> tuple[int, dict]:
     """The Messages error (status, body) for an upstream HTTP status. The wording carries what the
     provider's classifiers match on: 'invalid api key' (auth gate), 'insufficient credits' (funds),
-    'rate limit' (limit) and 'overloaded'; other 5xx stay retryable api_errors."""
+    'rate limit' (limit) and 'overloaded'; other 5xx stay retryable api_errors. A prompt past the
+    context window is Anthropic's 'prompt is too long', which Claude Code compacts on."""
+    long = too_long(detail) if status in CONTEXT_STATUSES else ""
     detail = (detail or "").strip()[:300]
+    if long:
+        return 400, {"type": "error", "error": {"type": "invalid_request_error", "message":
+                     f"{long} (the upstream model's context window, HTTP {status})" + (f": {detail}" if detail else "")}}
     if status in (401, 403):
         kind, code, msg = "authentication_error", 401, "invalid api key: the upstream endpoint refused it"
     elif status == 402:
@@ -361,9 +402,10 @@ class Bridge:
     closes the port. Use as a context manager."""
 
     def __init__(self, base_url: str, key: str, model: str, max_tokens: int = 0,
-                 timeout: float = UPSTREAM_TIMEOUT_S):
+                 timeout: float = UPSTREAM_TIMEOUT_S, context_window: int = 0):
         self.base_url, self._key, self.model = endpoint.base_url(base_url), key, model
         self.max_tokens, self.timeout = int(max_tokens or 0), timeout
+        self.context_window = int(context_window or 0)
         self.token = secrets.token_urlsafe(24)
         self.server: http.server.ThreadingHTTPServer | None = None
         self.thread: threading.Thread | None = None
@@ -389,7 +431,8 @@ class Bridge:
                                   f"endpoint {alias!r}: the key goes only to the URL it was saved for")
         if not s.get("model"):
             raise BridgeError("no model for this tier: set providers.chat.tiers.<tier>.model")
-        return cls(url or saved, key, s["model"], s.get("max_tokens") or 0, **kw)
+        return cls(url or saved, key, s["model"], s.get("max_tokens") or 0,
+                   **{"context_window": s.get("context_window") or 0, **kw})
 
     @property
     def url(self) -> str:
@@ -398,7 +441,9 @@ class Bridge:
     def env(self) -> dict[str, str]:
         """What the agent gets to reach the bridge: its URL and the per-run token, never the key."""
         return {"ANTHROPIC_BASE_URL": self.url, "ANTHROPIC_AUTH_TOKEN": self.token, "ANTHROPIC_API_KEY": "",
-                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"}
+                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+                # Claude Code takes 200k for a model it does not know: compact within the tier's window.
+                **({"CLAUDE_CODE_AUTO_COMPACT_WINDOW": str(self.context_window)} if self.context_window else {})}
 
     def start(self) -> "Bridge":
         handler = type("Handler", (_Handler,), {"bridge": self})
@@ -501,7 +546,14 @@ def _chunk_error(data: dict, scrub) -> tuple[int, dict]:
     if not isinstance(err, dict):
         err = {"message": str(err)}
     try:
-        code = int(err.get("code") or err.get("status") or 500)
+        code, given = int(err.get("code") or err.get("status") or 500), True
     except (TypeError, ValueError):
-        code = 500
-    return error_for(code if 400 <= code < 600 else 500, scrub(str(err.get("message") or "")))
+        code, given = 500, False
+    given = given and bool(err.get("code") or err.get("status"))
+    message = scrub(str(err.get("message") or ""))
+    # A string code (context_length_exceeded) is not a status: it still names a prompt past the window.
+    # A status the answer gives (a 429 for tokens per minute) keeps its own meaning.
+    hint = " ".join(str(err[k]) for k in ("code", "type") if err.get(k) and not str(err[k]).isdigit())
+    if (not given or code in CONTEXT_STATUSES) and too_long(f"{hint} {message}"):
+        code, message = 400, f"{hint}: {message}" if hint else message
+    return error_for(code if 400 <= code < 600 else 500, message)

@@ -122,6 +122,8 @@ class Claude(Provider):
         except ValueError:
             return rc == 0
 
+    caps_budget = True   # --max-budget-usd
+
     def build(self, *, role, model, effort, cwd, budget_usd, read_only, schema, restrictions,
               disallowed_tools=(), denied_reads=(), web=True):
         argv = [self.binary() or "claude", "-p", "--output-format", "stream-json", "--verbose", "--no-chrome"]

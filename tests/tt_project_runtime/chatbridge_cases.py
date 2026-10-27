@@ -300,7 +300,7 @@ if len(sys.argv) > 2:
 '''
 
 
-def _chat_run(tmp_path, mock, extra=(), timeout_s=60, alias="cloud"):
+def _chat_run(tmp_path, mock, extra=(), timeout_s=60, alias="cloud", bridge=None):
     home = tmp_path / "ttp-home"
     home.mkdir(mode=0o700, exist_ok=True)
     (home / "secrets.json").write_text(json.dumps({f"endpoint/{alias}": {"url": mock.url, "key": _CB_KEY}}))
@@ -313,9 +313,10 @@ def _chat_run(tmp_path, mock, extra=(), timeout_s=60, alias="cloud"):
     (run_dir / "run.json").write_text(json.dumps({
         "argv": [sys.executable, str(agent), str(seen), *extra], "env": {}, "cwd": str(tmp_path),
         "timeout_s": timeout_s, "provider": "chat",
-        "bridge": {"endpoint": "cloud", "base_url": mock.url, "model": "up-model", "max_tokens": 64}}))
+        "bridge": {"endpoint": "cloud", "base_url": mock.url, "model": "up-model", "max_tokens": 64, **(bridge or {})}}))
     env = {**os.environ, "PYTHONPATH": str(RUNTIME), "TTP_HOME": str(home)}
     env.pop("ANTHROPIC_BASE_URL", None)
+    env.pop("CLAUDE_CODE_AUTO_COMPACT_WINDOW", None)
     return run_dir, seen, env
 
 
@@ -511,3 +512,165 @@ def test_check_pin_verifies_a_chat_model_id(tmp_path, model):
     # Another model than the pin is still refused before the first turn.
     refused = runner.check_pin(tmp_path, {**spec, "pin": {"model": "org-name/other-model"}}, {})
     assert refused["refused"] == "model_mismatch"
+
+
+# Prompt-too-long answers as upstreams word them: (status, body, Anthropic message start).
+_CB_TOO_LONG = [
+    (400, {"error": {"message": "This model's maximum context length is 4096 tokens. However, your messages "
+                                "resulted in 5000 tokens. Please reduce the length of the messages.",
+                     "type": "invalid_request_error", "code": "context_length_exceeded"}},
+     "prompt is too long: 5000 tokens > 4096 maximum"),
+    (400, {"object": "error", "message": "This model's maximum context length is 8192 tokens. However, you "
+           "requested 9000 tokens (8500 in the messages, 500 in the completion).", "code": 400},
+     "prompt is too long: 9000 tokens > 8192 maximum"),
+    (400, {"error": {"code": "context_length_exceeded", "message": "Input is rejected."}}, "prompt is too long"),
+    (400, {"error": {"code": 400, "type": "exceed_context_size_error",
+                     "message": "the request exceeds the available context size, try increasing it"}},
+     "prompt is too long"),
+    (413, {"error": {"message": "too many tokens in the prompt"}}, "prompt is too long"),
+    (422, {"error": "Input validation error: `inputs` tokens + `max_new_tokens` must be <= 4096. Given: 5000 "
+                    "`inputs` tokens and 100 `max_new_tokens`"}, "prompt is too long: 5000 tokens > 4096 maximum"),
+]
+
+
+@pytest.mark.parametrize("status,reply,want", _CB_TOO_LONG)
+def test_chatbridge_maps_an_upstream_context_length_error_to_prompt_is_too_long(mock_chat, status, reply, want):
+    from ttp.chatbridge import Bridge
+    from ttp.providers.base import AUTH_RE, FUNDS_RE, LIMIT_RE, request_rejected
+    up = mock_chat((status, reply))
+    with Bridge(up.url, _CB_KEY, "m") as b:
+        code, text = _post(b, {"max_tokens": 50, "messages": [{"role": "user", "content": "hi"}]})
+    err = json.loads(text)["error"]
+    # Anthropic's own shape and wording, which Claude Code compacts on (and reads the numbers from).
+    assert code == 400 and err["type"] == "invalid_request_error" and err["message"].startswith(want), err
+    said = f"API Error: {code} {text}"
+    assert request_rejected(said) and not (AUTH_RE.search(said) or LIMIT_RE.search(said) or FUNDS_RE.search(said))
+
+
+def test_chatbridge_maps_a_context_length_error_in_a_200_body_or_a_stream_chunk(mock_chat):
+    from ttp.chatbridge import Bridge
+    up = mock_chat((200, {"error": {"code": "context_length_exceeded", "message": "too long"}}),
+                   (200, [{"error": {"code": "context_length_exceeded", "message": "too long"}}]),
+                   (200, [{"error": {"code": 429, "message": "too many tokens per minute"}}]))
+    with Bridge(up.url, _CB_KEY, "m") as b:
+        code, text = _post(b, {"max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]})
+        assert code == 400 and json.loads(text)["error"]["message"].startswith("prompt is too long"), text
+        _, text = _post(b, {"max_tokens": 5, "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+        err = _cb_events(text)[-1]["error"]
+        assert err["type"] == "invalid_request_error" and err["message"].startswith("prompt is too long"), err
+        # A status the chunk gives keeps its meaning: a per-minute token limit stays a rate limit.
+        _, text = _post(b, {"max_tokens": 5, "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+        err = _cb_events(text)[-1]["error"]
+        assert err["type"] == "rate_limit_error" and "prompt is too long" not in err["message"], err
+
+
+@pytest.mark.parametrize("status,reply", [
+    (400, {"error": {"message": "max_tokens is too large: 100000. This model supports at most 4096 completion tokens"}}),
+    (400, {"error": {"message": "Invalid value for 'tool_choice'", "code": "invalid_value"}}),
+    (429, {"error": {"message": "Request too large: too many tokens per minute"}}),
+])
+def test_chatbridge_other_upstream_errors_are_not_prompt_too_long(mock_chat, status, reply):
+    from ttp.chatbridge import Bridge, error_for
+    up = mock_chat((status, reply))
+    with Bridge(up.url, _CB_KEY, "m") as b:
+        code, text = _post(b, {"max_tokens": 50, "messages": [{"role": "user", "content": "hi"}]})
+    # Exactly what the bridge returned before: the upstream body behind the status's own wording.
+    assert (code, json.loads(text)) == error_for(status, json.dumps(reply)) and "too long" not in text.lower()
+
+
+def test_chatbridge_context_window_sets_the_agents_compaction_window(env, tmp_path, mock_chat):
+    from ttp import chatbridge, project
+    cfg = {"providers": {"chat": {"endpoint": "cloud", "context_window": 65536,
+                                  "tiers": {"light": {"model": "s", "context_window": 32768}, "standard": {"model": "m"}}}}}
+    assert chatbridge.settings(cfg, "light", "s")["context_window"] == 32768
+    assert chatbridge.settings(cfg, "standard", "m")["context_window"] == 65536
+    del cfg["providers"]["chat"]["context_window"]
+    assert "context_window" not in chatbridge.settings(cfg, "standard", "m"), "unset: the run.json entry is unchanged"
+    assert project.unknown_key_hint("providers.chat.context_window") is None
+    assert chatbridge.config_problems({"providers": {"chat": {"endpoint": "cloud", "context_window": 0}}}) == []
+    bad = chatbridge.config_problems({"providers": {"chat": {"endpoint": "cloud", "tiers": {"light": {"context_window": "big"}}}}})
+    assert len(bad) == 1 and "context_window" in bad[0]
+    # The launch: the agent gets Claude Code's compaction window with it, and nothing new without it.
+    for window in (32768, None):
+        up = mock_chat((200, {"choices": [{"message": {"content": "pong"}, "finish_reason": "stop"}]}))
+        sub = tmp_path / str(window)
+        sub.mkdir()
+        run_dir, seen, run_env = _chat_run(sub, up, bridge={"context_window": window} if window else None)
+        subprocess.run([sys.executable, "-m", "ttp.runner", str(run_dir)], cwd=str(RUNTIME), env=run_env,
+                       timeout=_load_scaled(120))
+        got = json.loads(seen.read_text())["env"]
+        assert got.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW") == (str(window) if window else None)
+
+
+def _cb_stream(path, *, result=True):
+    usage = {"input_tokens": 1000, "output_tokens": 200, "cache_read_input_tokens": 5000,
+             "cache_creation_input_tokens": 0}
+    lines = [{"type": "system", "subtype": "init", "session_id": "s-1", "model": "up-model"},
+             {"type": "assistant", "message": {"id": "msg_1", "usage": usage, "content": [{"type": "text", "text": "ok"}]}}]
+    if result:
+        lines.append({"type": "result", "subtype": "success", "is_error": False, "total_cost_usd": 0.5,
+                      "usage": usage, "result": "ok", "session_id": "s-1"})
+    path.write_text("".join(json.dumps(x) + "\n" for x in lines))
+    return path
+
+
+_CB_PRICES = {"up-model": [2.0, 0.5, 8.0]}
+_CB_PRICED = (1000 * 2.0 + 5000 * 0.5 + 200 * 8.0) / 1e6
+
+
+def test_chat_spend_is_repriced_from_pricing_chat_and_estimated_without_it(tmp_path):
+    from ttp.providers import get_provider
+    out = _cb_stream(tmp_path / "output.jsonl")
+    u = get_provider("chat").use("up-model", _CB_PRICES).parse(out)
+    assert u.cost_usd == pytest.approx(_CB_PRICED) and not u.estimated and u.extra["cost_basis"] == "pricing"
+    # A "default" row covers other models; a malformed row prices nothing.
+    assert get_provider("chat").use("other", {"default": [2.0, 0.5, 8.0]}).parse(out).cost_usd == pytest.approx(_CB_PRICED)
+    for prices in (None, {}, {"up-model": [1, 2]}, {"other": [1, 1, 1]}):
+        u = get_provider("chat").use("up-model", prices).parse(out)
+        assert u.cost_usd == 0.5 and u.estimated, prices   # Claude Code's fallback-rate figure, marked estimated
+    # Mid-run (no result line yet): the runner's budget check reads the repriced tokens so far.
+    part = _cb_stream(tmp_path / "partial.jsonl", result=False)
+    assert get_provider("chat").use("up-model", _CB_PRICES).cost_so_far(part) == pytest.approx(_CB_PRICED)
+    assert get_provider("chat").use("up-model", None).cost_so_far(part) is None
+    # Budget: with prices the runner caps on the repriced figure, so Claude Code gets no --max-budget-usd.
+    kw = dict(role="worker", model="up-model", effort="high", cwd=str(tmp_path), budget_usd=3.0, read_only=False,
+              schema=None, restrictions={})
+    priced, plain = get_provider("chat").use("up-model", _CB_PRICES), get_provider("chat").use("up-model", None)
+    assert not priced.caps_budget and "--max-budget-usd" not in priced.build(**kw)[0]
+    assert plain.caps_budget and "--max-budget-usd" in plain.build(**kw)[0]
+
+
+def test_claude_codex_and_cursor_spend_is_unchanged_by_pricing_chat(tmp_path):
+    from ttp.providers import get_provider
+    out = _cb_stream(tmp_path / "output.jsonl")
+    u = get_provider("claude").use("up-model", _CB_PRICES).parse(out)
+    assert u.cost_usd == 0.5 and not u.estimated and "cost_basis" not in u.extra
+    assert get_provider("claude").caps_budget
+    for name in ("codex", "cursor", "fake"):
+        assert not get_provider(name).caps_budget, name   # the runner keeps capping these, as before
+
+
+def test_a_chat_run_books_its_repriced_spend(env):
+    from ttp.daemon import Daemon
+    p = make(env)
+    _chat_config(p)
+    booked = []
+    for prices in (_CB_PRICES["up-model"], None):
+        p.set_config("pricing", {"chat": {"org/Base-Model-2": prices}} if prices else {})
+        d = Daemon(p.base)
+        tid = p.db.add_task("build", "", kind="work", tier="standard", priority=3, budget_usd=8.0, labels=[],
+                            provider="chat")
+        p.db.update_task(tid, status="running")
+        rid = p.db.x("INSERT INTO runs(task,role,provider,model,started,status,boot_id) "
+                     "VALUES(?,'worker','chat','org/Base-Model-2',?,'running',?)", (tid, time.time() - 5, d.boot))
+        rd = p.runs / str(rid)
+        rd.mkdir(parents=True)
+        _cb_stream(rd / "output.jsonl")
+        p.db.x("UPDATE runs SET dir=? WHERE id=?", (str(rd), rid))
+        d.finish_run(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)),
+                     {"rc": 0, "started": time.time() - 5, "ended": time.time(), "launched": True})
+        run = p.db.one("SELECT * FROM runs WHERE id=?", (rid,))
+        booked.append((run["cost_usd"], run["cost_estimated"]))
+    # Budget gates read runs.cost_usd and the ledger: the repriced figure, not Claude Code's 0.5.
+    assert booked[0][0] == pytest.approx(_CB_PRICED) and booked[0][1] == 0
+    assert booked[1] == (0.5, 1)

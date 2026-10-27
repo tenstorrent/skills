@@ -510,11 +510,16 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    ```json
    "providers": {"chat": {"endpoint": "<alias>", "base_url": "<base url>", "max_tokens": 8192,
                           "tiers": {"light": {"model": "<model id>"},
-                                    "standard": {"model": "<model id>", "max_tokens": 16384}}}}
+                                    "standard": {"model": "<model id>", "max_tokens": 16384,
+                                                 "context_window": 131072}}}}
    ```
 
    `base_url` must match the URL saved with the key: the key goes nowhere else. `max_tokens`
    caps each call's output (per tier or for the provider; 0 or unset: the request's own).
+   `context_window` (per tier or for the provider) is the model's window in tokens: workers compact
+   within it (`CLAUDE_CODE_AUTO_COMPACT_WINDOW`) instead of Claude Code's 200k default for model
+   names it does not know (Claude Code reads values under 100000 as 100000). Set or not, a
+   too-long prompt comes back as Claude Code's own "prompt is too long", on which it compacts.
 3. Route work to it per task, as to any provider (the task's `provider` is `chat`); keep the core provider,
    which runs the coordinator, on Claude, Codex or Cursor. Provider failover moves held `chat`
    work to the core provider as usual.
@@ -525,6 +530,11 @@ tool calls are matched by id, and upstream errors come back as the errors Claude
 reports: a refused key holds the provider as logged out until the key is saved again, 402 and
 429 count as limits, and 5xx answers are retried. Measure a model on a few recorded tasks before
 moving real work to it.
+
+Spend: Claude Code prices model names it does not know at its own fallback rate. Set
+`"pricing": {"chat": {"<model id>": [<input>, <cached input>, <output>]}}` ($ per million tokens;
+a `"default"` row covers other models) and chat runs are booked at those rates from their token
+counts, with budget caps checked on that figure. Without it, chat spend is booked as estimated.
 
 ## Jev (optional add-on)
 

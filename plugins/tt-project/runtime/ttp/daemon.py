@@ -2229,7 +2229,7 @@ class Daemon:
                     **({"pin": pin, "pin_verify": (task or {}).get("pin_verify")
                         or self.cfg["runner"]["pin_verify"]} if pin else {}),
                     "prices": prices, **({"stdin": "input.jsonl"} if stdin is not None else {}),
-                    "budget_usd": budget_usd if provider not in ("claude", "chat") else None,
+                    "budget_usd": None if prov.caps_budget else budget_usd,
                     # The chat provider's loopback bridge (chatbridge.py): where its key is, never the key.
                     **({"bridge": chatbridge.settings(self.cfg, tier, model)} if provider == "chat" else {}),
                     # What a run without its own budget is priced at when it reports no usage.
@@ -2912,7 +2912,8 @@ class Daemon:
         is booked: over-booking is the safe failure, under-booking lets spend run away."""
         session = (json.loads(r["note"] or "{}").get("resumes") or {}).get("session")
         reported = float(usage.cost_usd or 0)
-        if not session or usage.estimated or reported <= 0:
+        basis = usage.extra.get("cost_basis")   # chat runs (providers/chat.py)
+        if not session or reported <= 0 or basis == "pricing" or (usage.estimated and basis != "fallback"):
             return usage.cost_usd
         # By runs.session_id; rows from before that column fall back to the session id in their note.
         booked = sum(float(o["cost_usd"] or 0) for o in self.p.db.q(

@@ -480,8 +480,8 @@ EXTRA_KEYS = {
 OPEN_SECTIONS = {"resources"}           # any name below is fine
 PROVIDER_KEYS = {"tiers", "plugin_dirs", "worker_isolation", "mcp_servers", "disallowed_tools",
                  # providers.chat only (chatbridge.py): the `ttp secret endpoint` alias holding the key,
-                 # the base URL saved with it, and a max_tokens cap (also per tier).
-                 "endpoint", "base_url", "max_tokens"}
+                 # the base URL saved with it, a max_tokens cap and the model's context_window (also per tier).
+                 "endpoint", "base_url", "max_tokens", "context_window"}
 
 
 def _known_keys(path: list[str]) -> set[str] | None:

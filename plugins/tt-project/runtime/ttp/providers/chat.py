@@ -19,6 +19,39 @@ class Chat(Claude):
     login_hint = "save the endpoint's key with `ttp secret endpoint <alias> --url <base url>`"
     own_cache_breakpoints = 0
 
+    # Claude Code prices a model name it does not know at its fallback rate. With pricing.chat rows
+    # ({"<model id>" or "default": [input, cached input, output] in $ per million tokens}) a run is
+    # repriced from its tokens and the runner enforces its budget on that figure; without them its
+    # spend is Claude Code's figure, booked as estimated, and Claude Code's own cap stays.
+    @property
+    def caps_budget(self) -> bool:
+        return not self.price()
+
+    def price(self) -> tuple[float, float, float] | None:
+        from ..chatbridge import price_ok
+        rows = {k: v for k, v in (self.prices or {}).items() if price_ok(v)}
+        row = rows.get(self.model) or rows.get("default")
+        return tuple(float(x) for x in row) if row else None
+
+    def build(self, *, budget_usd, **kw):
+        return super().build(budget_usd=None if self.price() else budget_usd, **kw)
+
+    def parse(self, output_path, stderr_path=None):
+        u = super().parse(output_path, stderr_path)
+        row = self.price()
+        if row:
+            pin, pcached, pout = row
+            u.extra["reported_cost_usd"] = u.cost_usd
+            u.cost_usd = round(((u.input_tokens + u.cache_write_tokens) * pin + u.cache_read_tokens * pcached
+                                + u.output_tokens * pout) / 1e6, 6)
+            u.estimated, u.extra["cost_basis"] = False, "pricing"
+        else:
+            u.estimated, u.extra["cost_basis"] = True, "fallback"
+        return u
+
+    def cost_so_far(self, output_path):
+        return self.parse(output_path).cost_usd if self.price() else None
+
     def credential_files(self) -> list[str]:
         return [str(secrets_path())]   # a key saved again ends a logged-out pause
 
