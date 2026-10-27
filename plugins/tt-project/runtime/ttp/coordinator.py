@@ -2042,7 +2042,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         raise InfoRejection(f"task #{task['id']} is {task['status']}: only a task that has not "
                                          f"started can be deferred; add a new one with start_after/start_when")
                     cur = deferral(task)
-                    new, _, when = deferral_update(db, task, a, p, upd.get("labels"))
+                    new, after, when = deferral_update(db, task, a, p, upd.get("labels"))
                     upd.update(new)
                     stale = marker_only_probe(when, p.root) if when != cur.get("when") else None
                     if stale:
