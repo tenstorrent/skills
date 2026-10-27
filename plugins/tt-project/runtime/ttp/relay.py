@@ -29,6 +29,7 @@ SHINGLE = 5       # words in a phrase the guard matches
 QUOTE_BACK = 600  # chars of the user's words a rejection hands back, so the next turn can quote them
 QUOTE_LABEL = f"{VERBATIM}: \""  # opens the words words_back hands back
 CONTENT = 3       # of them, at least this many not common words: "the push queue is on" is no quote
+TYPO_MIN = 4      # a near-miss counts as the user's typo only between words at least this long
 _COMMON = set("""a an and are as at be been but by can do does done for from has have if in into is it its
 it's me my no not now of on once or our so than that the their them then there these this those to too up
 us was we were what when where which while who will with would you your all any each every new must should
@@ -96,9 +97,25 @@ def words_back(m: dict | None, limit: int = QUOTE_BACK) -> str:
     return f"Message #{m['id']}, {QUOTE_LABEL}{words}\""
 
 
+def near_miss(a: str, b: str) -> bool:
+    """`a` and `b` (both at least TYPO_MIN long, same digits) are one edit apart: one letter inserted,
+    deleted or substituted, or two adjacent letters swapped. A version differing in a digit is no typo."""
+    if a == b or min(len(a), len(b)) < TYPO_MIN or abs(len(a) - len(b)) > 1 \
+            or re.sub(r"\D", "", a) != re.sub(r"\D", "", b):
+        return False
+    if len(a) == len(b):
+        d = [i for i, (x, y) in enumerate(zip(a, b)) if x != y]
+        return len(d) == 1 or (len(d) == 2 and d[1] == d[0] + 1 and a[d[0]] == b[d[1]] and a[d[1]] == b[d[0]])
+    short, long_ = sorted((a, b), key=len)
+    i = next((i for i, (x, y) in enumerate(zip(short, long_)) if x != y), len(short))
+    return short[i:] == long_[i + 1:]
+
+
 def guard(text: str, messages: list[dict], terms: set[str] | frozenset = frozenset(),
-          said: list[str] = ()) -> tuple[str, dict | None]:
-    """context_only's reason, with the message whose context holds the phrase (None when there is none)."""
+          said: list[str] = (), typos: list[str] | None = None) -> tuple[str, dict | None]:
+    """context_only's reason, with the message whose context holds the phrase (None when there is none).
+    `typos` (a list, for an entry's tag only, never a rule, pin or approval): a word the user's verbatim
+    words hold one edit away (near_miss) counts as theirs, and a line saying so is appended for each."""
     ctx = [m for m in messages if (m.get("context") or "").strip()]
     if not ctx or not (text or "").strip():
         return "", None
@@ -107,6 +124,20 @@ def guard(text: str, messages: list[dict], terms: set[str] | frozenset = frozens
     said_phrases = set().union(*(_shingles(ws) for ws in said))
     words = _words(text)
     terms = {t.lower() for t in terms}
+    if typos is not None:
+        verbatim = [(m["id"], _words(split(m.get("text") or "")[0])) for m in messages]
+        in_ctx = {w for m in ctx for w in _words(m["context"])}
+        near = {}
+        for w in dict.fromkeys(words):
+            hit = next(((u, mid) for mid, ws in verbatim for u in ws if near_miss(w, u)), None) \
+                if w in in_ctx and w not in said_words else None
+            if hit:
+                near[w] = hit
+        back = {u: w for w, (u, _) in near.items()}
+        said_words |= set(near)
+        said_phrases |= set().union(*(_shingles([back.get(x, x) for x in ws]) for _, ws in verbatim))
+        typos += [f"{w!r} is in the user's words as {u!r} (message #{mid}), likely a typo"
+                  for w, (u, mid) in near.items()]
     for m in ctx:
         cw = _words(m["context"])
         for w in dict.fromkeys(words):

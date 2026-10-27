@@ -9696,6 +9696,58 @@ def test_rules_and_pins_from_a_relayers_context_are_refused_or_marked(env):
 
 
 
+def test_relay_tag_names_a_typo_of_the_users_word_and_keeps_pins_exact(env):
+    """The user wrote 'mirq-5' (a typo) and the relayer's context 'mira-5': the entry's tag names the typo
+    instead of calling the word relayer-only. A word with no near-miss, or of 3 letters or fewer, keeps the
+    relayer-only tag, and a pin or user rule still needs the exact word in the user's verbatim part."""
+    from ttp import coordinator as coord, relay
+    p = make(env)
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+
+    def entry(said, ctx, fact):
+        mid = p.db.post("in", said, chat="cli", provenance="cli-legacy", context=ctx)
+        assert coord.apply(p, [{"type": "memory_add", "memory_kind": "fact", "text": fact}],
+                           user_turn=True, messages=[mid]) == []
+        f = next(f for f in p.memory_dir.glob("fact-*.md") if fact in f.read_text())
+        text = f.read_text()
+        f.unlink()
+        return mid, text
+
+    # 1. A one-letter typo of the user's word: the typo tag, not the relayer-only one.
+    mid, text = entry("use mirq-5 low for the reference run", "The user wants mira-5 at low effort.",
+                      "reference run uses mira-5")
+    assert f"['mira-5' is in the user's words as 'mirq-5' (message #{mid}), likely a typo]" in text
+    assert coord.RELAYED_MARK not in text
+    assert any("likely a typo" in n for n in p.db.kv(coord.NOTES_KEY, []))
+    # A swap of two adjacent letters and a phrase around it count too.
+    mid, text = entry("use maria-5 at low effort for the reference run",
+                      "Note: use amria-5 at low effort for the reference run", "use amria-5 at low effort for the reference run")
+    assert f"'amria-5' is in the user's words as 'maria-5' (message #{mid})" in text and coord.RELAYED_MARK not in text
+    # 2. No near-miss in the user's words: still relayer-only.
+    mid, text = entry("use the usual model for the reference run", "The user wants mira-5 at low effort.",
+                      "reference run uses mira-5")
+    assert f"{coord.RELAYED_MARK}: 'mira-5' is only in message #{mid}'s relayer context" in text
+    assert "likely a typo" not in text
+    # A version differing in a digit is another model, not a typo.
+    mid, text = entry("use mira-4 low for the reference run", "The user wants mira-5 at low effort.",
+                      "reference run uses mira-5")
+    assert coord.RELAYED_MARK in text and "likely a typo" not in text
+    # 3. Words of 3 letters or fewer keep today's tag.
+    why, _ = relay.guard("run on ace", [{"id": 7, "text": "run on acr", "context": "run on ace"}], {"ace"}, typos=(t := []))
+    assert why and not t
+    assert relay.near_miss("opus", "osus") and relay.near_miss("opus", "opsu") and relay.near_miss("opus", "opuss")
+    assert not relay.near_miss("ace", "acr") and not relay.near_miss("opus", "pous-x") and not relay.near_miss("opus", "opus")
+    # 4. A pin, a user rule and the charter still need the exact word in the user's verbatim part.
+    mid = p.db.post("in", "use mirq-5 low for the reference run", chat="cli", provenance="cli-legacy",
+                    context="The user wants mira-5 at low effort.")
+    for act in ({"type": "memory_add", "memory_kind": "preference", "text": "reference runs use mira-5"},
+                {"type": "charter_update", "section": "Policies", "text": "reference runs use mira-5"}):
+        problems = coord.apply(p, [act], user_turn=True, messages=[mid])
+        assert problems and "'mira-5' is only in message" in problems[0], act
+    assert coord._relay_pin_note(p, {}, {"model": "mira-5"}, 1, [mid])
+
+
+
 def test_relay_rejection_hands_back_the_users_own_words(env):
     """A charter_update or user-rule memory_add refused for quoting a relayer's context returns the named
     message's own words, labelled as the user's and cut at relay.QUOTE_BACK, so the next turn can quote
