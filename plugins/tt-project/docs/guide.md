@@ -821,6 +821,12 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   run also takes test-worker slots from a host pool shared by all projects (testslots: default half the cores, at
   least 2; at most min(8, half the pool) per run; `checks.test_pool`, `checks.test_run_max`, 0 pool turns it off;
   a project may only lower them) and passes its grant as PYTEST_XDIST_AUTO_NUM_WORKERS and TTP_TEST_SLOTS. A
+  project holds at most `checks.test_project_max` slots over all its runs (default twice a run's share), waiters
+  are served first-come, push checks take a reserved test slot of their branch when the pool is full, and a
+  project runs one full `ttp checks` at a time (a second waits; other projects never do). A pytest `-n N` above
+  the grant is lowered with a line saying so; a worker's own pytest above TTP_TEST_SLOTS is refused. Each daemon
+  watches the host's fork rate (/proc/stat): above `checks.churn_forks_s` (800/s) for `checks.churn_window_s`
+  (120 s), the owning project's daemon raises one `process-churn:<unit>` observation. It never stops a process. A
   `ttp checks` or push inside a check command does not wait for its parent's slot. Checks that
   gate a push to the push branch (the push queue's batches and `ttp push`) hold the push lock, so
   they never queue behind task checks: each push branch has one priority slot of its own beyond the
