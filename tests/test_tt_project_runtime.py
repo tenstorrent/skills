@@ -37463,6 +37463,109 @@ def test_a_run_that_leaves_the_project_root_off_its_branch_or_newly_dirty_alerts
     assert not alerts(f"root-checkout:{homing}") and not p.db.kv(dm.ROOT_CHECKOUT_KEY)
 
 
+def test_a_root_run_that_newly_dirties_tracked_paths_is_sent_back_once_before_its_done_counts(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dm
+
+    class Proc:
+        pid = 4242
+    real = subprocess.Popen
+    monkeypatch.setattr(dm.subprocess, "Popen",
+                        lambda argv, *a, **k: Proc() if "ttp.runner" in argv else real(argv, *a, **k))
+    p.set_config("review.auto", False)
+    repo = env["repo"]
+    d = dm.Daemon(p.base)
+    alerts = lambda key: p.db.q("SELECT * FROM messages WHERE kind='alert' AND ref=?", (key,))
+    # a) A root run that newly dirties a tracked file and hands off done is woken once with the path.
+    t = p.db.add_task("edits in the root", "s", kind="work", tier="light", origin="user")
+    row = _root_run(p, d, t)
+    (repo / "README.md").write_text("edited in the root\n")
+    (repo / "scratch.txt").write_text("untracked\n")
+    _end_run(p, d, row)
+    task = p.db.task(t)
+    res = json.loads(task["result"])
+    assert task["status"] == "queued" and int(task["attempts"] or 0) == 0, dict(task)
+    assert "README.md" in res["woke"] and "scratch.txt" not in res["woke"] and "commit" in res["woke"], res
+    assert res[dm.ROOT_WAKE_KEY]["paths"] == ["README.md"]
+    assert not alerts(f"root-checkout:{t}"), "the wake, not the user, deals with it first"
+    assert not p.db.one("SELECT 1 FROM events WHERE kind='observation' AND task=?", (t,))
+    # b) Its next hand-off with the path still dirty is accepted, with the low alert and no second wake.
+    row = _root_run(p, d, t)
+    _end_run(p, d, row)
+    task = p.db.task(t)
+    assert task["status"] == "done", dict(task)
+    got = alerts(f"root-checkout:{t}")
+    assert len(got) == 1 and got[0]["severity"] == "low" and "README.md" in got[0]["text"], got
+    assert dm.ROOT_WAKE_KEY in json.loads(task["result"]), "once per task"
+    # Requeued later, it is not woken again for a newly dirtied path either.
+    _git_out(repo, "checkout", "README.md")
+    p.db.update_task(t, status="queued")
+    row = _root_run(p, d, t)
+    (repo / "README.md").write_text("again\n")
+    _end_run(p, d, row)
+    assert p.db.task(t)["status"] == "done"
+    _git_out(repo, "checkout", "README.md")
+    # A woken run that commits or reverts its edits is accepted with no alert.
+    clean = p.db.add_task("cleans up", "s", kind="work", tier="light", origin="user")
+    row = _root_run(p, d, clean)
+    (repo / "README.md").write_text("edited\n")
+    _end_run(p, d, row)
+    assert p.db.task(clean)["status"] == "queued"
+    row = _root_run(p, d, clean)
+    _git_out(repo, "checkout", "README.md")
+    _end_run(p, d, row)
+    assert p.db.task(clean)["status"] == "done" and not alerts(f"root-checkout:{clean}")
+
+
+def test_a_root_run_is_not_sent_back_for_paths_dirty_before_it_overlapping_root_runs_or_a_worktree(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dm
+
+    class Proc:
+        pid = 4242
+    real = subprocess.Popen
+    monkeypatch.setattr(dm.subprocess, "Popen",
+                        lambda argv, *a, **k: Proc() if "ttp.runner" in argv else real(argv, *a, **k))
+    p.set_config("review.auto", False)
+    repo = env["repo"]
+    d = dm.Daemon(p.base)
+    alerts = lambda key: p.db.q("SELECT * FROM messages WHERE kind='alert' AND ref=?", (key,))
+    # c) A path dirty before the run started: no wake, no alert (not its doing).
+    (repo / "README.md").write_text("dirty before\n")
+    before = p.db.add_task("before", "s", kind="work", tier="light", origin="user")
+    row = _root_run(p, d, before)
+    (repo / "README.md").write_text("dirty before, edited again\n")
+    _end_run(p, d, row)
+    assert p.db.task(before)["status"] == "done" and not alerts(f"root-checkout:{before}")
+    assert dm.ROOT_WAKE_KEY not in json.loads(p.db.task(before)["result"])
+    _git_out(repo, "checkout", "README.md")
+    # d) Two root runs overlapping: whose edit it is is unknown, so no wake; the alert stays as today.
+    first = p.db.add_task("first", "s", kind="work", tier="light", origin="user")
+    second = p.db.add_task("second", "s", kind="work", tier="light", origin="user")
+    a = _root_run(p, d, first)
+    b = _root_run(p, d, second)
+    (repo / "README.md").write_text("edited by one of them\n")
+    _end_run(p, d, b)
+    assert p.db.task(second)["status"] == "done"
+    got = alerts(f"root-checkout:{second}")
+    assert len(got) == 1 and got[0]["severity"] == "low" and "README.md" in got[0]["text"], got
+    _end_run(p, d, a)
+    assert p.db.task(first)["status"] == "done"
+    _git_out(repo, "checkout", "README.md")
+    d.clear_root_checkout(force=True)
+    # e) A run in its own worktree that dirties the root is unchanged: done, and the alert as today.
+    code = p.db.add_task("in a worktree", "s", kind="code", tier="light", origin="user")
+    cwd, branch = d._workdir_for(p.db.task(code))
+    p.db.update_task(code, status="running", branch=branch)
+    w = p.db.one("SELECT * FROM runs WHERE id=?",
+                 (d.start_run("worker", "go", "claude", "light", cwd, task=p.db.task(code)),))
+    (repo / "README.md").write_text("edited from a worktree run\n")
+    _end_run(p, d, w)
+    assert p.db.task(code)["status"] != "queued", dict(p.db.task(code))
+    assert dm.ROOT_WAKE_KEY not in json.loads(p.db.task(code)["result"])
+    assert len(alerts(f"root-checkout:{code}")) == 1
+
+
 def test_a_review_run_works_in_the_changes_worktree_or_its_own_never_the_project_root(env):
     p = make(env)
     from ttp import daemon as dm

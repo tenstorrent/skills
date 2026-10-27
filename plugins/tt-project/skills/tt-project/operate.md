@@ -244,6 +244,9 @@
   no rebase or merge is under way: a detached HEAD's commits are kept on `rescue/root-run<id>-<sha>`,
   nothing is reset or forced, and a coordinator event says so instead of the alert. Uncommitted
   tracked changes there block the repair (an alert instead: they are never carried or discarded).
+  A run whose working directory was the root, that newly dirtied tracked paths there and hands
+  off `done` with no other root run alongside, is first sent back once to commit or revert them
+  (no attempt spent, no alert); its next hand-off is accepted, with the alert if they are still dirty.
   Before a worktree is branched from the root, the daemon checks its HEAD the same way against
   `worktree.root_branch` (unset: the branch it was last seen on with no root alert open; a user's
   own switch is adopted): put back when safe and reported low, else one `root-head` alert that

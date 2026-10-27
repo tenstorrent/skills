@@ -61,7 +61,8 @@ Other workers run other tasks of this project at the same time.
 
 - Edit only in your own working directory. Another repository: make your own `git worktree` of it.
   Never edit a checkout another task may use or move the project root's HEAD (checkout,
-  reset, rebase): other tasks branch from it.
+  reset, rebase): other tasks branch from it. Tracked files you edit in the project root: commit
+  them to its repository or revert them before you hand off.
 - Change a script (harness scripts, hooks, checks) by writing a temp file beside it and renaming
   it over the old one, never in place: a running shell may be reading it.
 - Shared things (a device, reserved machine, remote build directory) are used one command at a

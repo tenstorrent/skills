@@ -326,6 +326,7 @@ KEEP_RECHECK_S = 6 * 3600   # a finished task's kept worktree is looked at again
 CONFIG_UNREADABLE_KEY = "config_unreadable"   # kv: project.json and its last good copy both unreadable
 ALERT_KEEP_S = 30 * 86400   # alerts_sent keeps an entry this long: the longest every_s any alert uses
 ROOT_CHECKOUT_KEY = "root_checkout"   # kv: task -> its open alert on what a run left in the project root's checkout
+ROOT_WAKE_KEY = "root_dirty_wake"   # in the task's result: its one wake to commit or revert paths it dirtied in the root
 ROOT_HEAD_KEY = "root_head"   # kv: the open alert on a project root left detached or off its branch (guard_root_head)
 MEMORY_ARCHIVED_KEY = "memory_archived_at"   # kv: when the daemon last archived hidden memory (archive_hidden_memory)
 LEASE_STATE_KEY = "lease_state"   # kv: the lease state last announced (lease.py), one event per change
@@ -1341,6 +1342,40 @@ class Daemon:
         self.alert(seen[tid]["key"], text, severity="low", every_s=0)
         db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
              (time.time(), "daemon", "observation", "normal", text[:1500], "queued", int(tid)))
+
+    def _root_wake(self, r: dict, run_dir: Path, status: str, before: dict, now_at: dict) -> tuple[dict, list]:
+        """Which tracked paths a run whose working directory was the project root (run.json cwd) left
+        newly dirty there, so its `done` is sent back once to commit or revert them (_finish_worker):
+        returns (the start snapshot to judge the run by, those paths). None of them when the run did
+        not end with a `done` hand-off, another run in the root overlapped it, a path was dirty as it
+        started, or its task was woken for this before. The run after that wake is judged against its
+        own start with the paths it was told about counted as clean, so paths still dirty raise
+        check_root_checkout's alert. Reads only."""
+        if before.get("dirty") is None or now_at.get("dirty") is None:
+            return before, []
+        root = os.path.realpath(self.p.root)
+        cwd = str((_read_result(run_dir / "run.json") or {}).get("cwd") or "")
+        task = self.p.db.task(r["task"])
+        if not cwd or os.path.realpath(cwd) != root or not task:
+            return before, []
+        mark = load_result(task["result"]).get(ROOT_WAKE_KEY)
+        if isinstance(mark, dict):
+            if mark.get("open"):
+                before = {**before, "dirty": sorted(set(before["dirty"]) - set(mark.get("paths") or []))}
+            return before, []
+        if status != "ok" or (_read_result(run_dir / RESULT_FILE) or {}).get("status") != "done":
+            return before, []
+        new = sorted(set(now_at["dirty"]) - set(before["dirty"]))
+        if not new:
+            return before, []
+        rows = self.p.db.q("SELECT id, dir FROM runs WHERE role!='coordinator' AND id!=? "
+                           "AND started<? AND (status='running' OR ended>=?)",
+                           (r["id"], time.time(), float(r["started"] or 0)))
+        for o in rows:
+            spec = _read_result(self._run_dir(o) / "run.json") or {}
+            if spec.get("cwd") and os.path.realpath(str(spec["cwd"])) == root:
+                return before, []   # whose edits they are is unknown: check_root_checkout alerts as before
+        return before, new[:200]
 
     def _restore_root(self, r: dict, branch: str, now_at: dict) -> bool:
         """check_root_checkout's repair, model-free: a run left the project root detached or on another
@@ -3034,6 +3069,15 @@ class Daemon:
             root_now = worktree.checkout_state(p.root) if root_before else None
         except Exception:
             root_now = None
+        root_wake = None
+        if root_now:
+            try:   # a run in the root that newly dirtied tracked paths there is woken once (_root_wake)
+                root_before, paths = self._root_wake(r, run_dir, status, root_before, root_now)
+                if paths:
+                    root_wake = {"paths": paths, "before": root_before, "now": root_now}
+                    root_before = {**root_before, "dirty": sorted(set(root_before["dirty"]) | set(paths))}
+            except Exception:
+                log(p, f"run {r['id']}: judging its project root paths failed\n" + traceback.format_exc())
         if r["role"] != "coordinator" and r["task"]:
             self._prefetch_remote(r["task"], _read_result(run_dir / RESULT_FILE), run_dir)
             if status == "ok":
@@ -3091,7 +3135,7 @@ class Daemon:
                                     refused=refused, rebooted=bool(note.get("lost_to_reboot")),
                                     orderly=note.get("shutdown") == "orderly",
                                     slept=bool(note.get("lost_to_sleep") or note.get("lost_to_network")),
-                                    held=held)
+                                    held=held, root_wake=root_wake)
         self._check_price_table(r, usage)
         asleep = float(exit_info.get("slept_s") or 0)
         if asleep >= SLEPT_LONG_S:
@@ -3513,8 +3557,10 @@ class Daemon:
     def _finish_worker(self, r: dict, usage, status: str, run_dir: Path, ended: str | None = None,
                        rebooted: bool = False, slept: bool = False, handoff: dict | None = None,
                        orderly: bool = False, refused: str = "", push_verified: bool = False,
-                       held: str = "") -> None:
-        """`handoff` stands in for the run's result.json: the `on_pass` its checks earned (_probe_passed).
+                       held: str = "", root_wake: dict | None = None) -> None:
+        """`root_wake`: tracked paths the run newly dirtied in the project root (_root_wake): a `done`
+        is sent back once to commit or revert them; else check_root_checkout reports them.
+        `handoff` stands in for the run's result.json: the `on_pass` its checks earned (_probe_passed).
         `held`: why the run's runtime changes did not load (runtimeload.check): its hand-off is not judged.
         `push_verified`: the pushes the hand-off claims were found on the remote (verify_pushes).
         `orderly`: the reboot that cut the run short was an orderly one, which never blocks the task.
@@ -3894,6 +3940,29 @@ class Daemon:
                                f"{handoffcheck.event_tail(bad['output'])}")
         if sent_back and not (checked and not checked.get("failed")):
             extra[handoffcheck.KEY] = sent_back   # until a hand-off passes them
+        if isinstance(mark := load_result(task["result"]).get(ROOT_WAKE_KEY), dict):
+            # Kept for the task's life: one wake per task. Open until a run of it ends with a hand-off.
+            extra[ROOT_WAKE_KEY] = mark if status != "ok" else {k: v for k, v in mark.items() if k != "open"}
+        root_sent = False
+        if root_wake and new == "done" and not approval and status == "ok":
+            paths = root_wake["paths"]
+            shown = ", ".join(paths[:20]) + (f" and {len(paths) - 20} more" if len(paths) > 20 else "")
+            new, not_before, push_quiet, root_sent = "queued", time.time(), True, True
+            attempts = int(task["attempts"] or 0)
+            extra[ROOT_WAKE_KEY] = {"open": True, "run": r.get("id"), "paths": paths}
+            extra["woke"] = (f"your run worked in the project root ({self.p.root}) and left uncommitted changes "
+                             f"to tracked paths that were clean when it started: {shown}. Other tasks branch from "
+                             f"that checkout, so the edits can be lost or taken by another task. Commit your own "
+                             f"edits to the root's repository, or revert them, then write result.json again; this "
+                             f"is asked once")
+            reason = f"left {len(paths)} tracked path(s) in the project root uncommitted; sent back once"
+            log(self.p, f"task {task['id']}: run {r.get('id')} {reason}")
+        elif root_wake:
+            try:   # not sent back: reported as a run in the root always was
+                self.check_root_checkout(r, root_wake["before"], root_wake["now"])
+            except Exception:
+                log(self.p, f"run {r.get('id')}: checking the project root's checkout failed\n"
+                            + traceback.format_exc())
         if new == "done" and not approval and not push_verified and status == "ok" \
                 and self._defer_for_push(r, task, run_dir, usage, ended, result, summary):
             return
@@ -3920,7 +3989,7 @@ class Daemon:
             {"summary": summary, "status": shown, **extra,
              **({k: v for k, v in result.items()
                  if k not in ("summary", "waits", "waiting_since", "woke", "reboot_wakes", "escalated_wake",
-                              "stale_wakes", "wait_key", handoffcheck.KEY)}
+                              "stale_wakes", "wait_key", handoffcheck.KEY, ROOT_WAKE_KEY)}
                 if isinstance(result, dict) else {})})}
         if reason:
             upd["blocked_reason"] = reason[:500]
@@ -3962,7 +4031,8 @@ class Daemon:
             self._queue_backup(task)
         # git status of the project root can take long in a large repository: after the run-end
         # transaction commits, so it never holds the write lock every other process waits on.
-        db.after_commit(lambda: self._note_dirty_main(task))
+        if not root_sent:   # its next hand-off reports what is left
+            db.after_commit(lambda: self._note_dirty_main(task))
         if waiting and new == "queued" and extra.get("escalated_wake") and gate_probe:
             self._start_probe(task["id"], gate_probe, time.time())
         if waiting and new == "queued":
