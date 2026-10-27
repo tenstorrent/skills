@@ -347,7 +347,7 @@ def supervise(run_dir: Path) -> int:
     err = open(run_dir / "stderr.log", "wb")
     nice = int(spec.get("nice") or 0)
     preexec, _ = _agent_preexec(nice)
-    bridge = None
+    bridge, launch_auth = None, False
     try:
         if spec.get("bridge"):
             # The chat provider's loopback bridge: a thread of this process, so it ends with the run
@@ -356,6 +356,7 @@ def supervise(run_dir: Path) -> int:
             try:
                 bridge = Bridge.from_settings(spec["bridge"]).start()
             except (BridgeError, ValueError, OSError) as e:
+                launch_auth = bool(getattr(e, "auth", False))   # no usable key: the auth gate's (daemon)
                 raise OSError(f"chat bridge: {e}") from None
             env.update(bridge.env())
         child = subprocess.Popen(argv, stdin=prompt, stdout=out, stderr=err, cwd=cwd, env=env,
@@ -372,7 +373,8 @@ def supervise(run_dir: Path) -> int:
         remove_files(spec.get("private_files") or [])
         remove_tmp(run_dir, spec)
         _write_exit(run_dir, {"rc": None, "started": started, "ended": time.time(), "launched": False,
-                              "launch_error": launch_error(e, argv, env)})
+                              "launch_error": launch_error(e, argv, env),
+                              **({"launch_auth": True} if launch_auth else {})})
         return 1
     guard, watchdog = _start_watchdog(child.pid)
     (run_dir / "child.pid").write_text(f"{child.pid}\n{proc_start(child.pid) or ''}\n")

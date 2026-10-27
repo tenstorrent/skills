@@ -2951,6 +2951,10 @@ class Daemon:
         runner.remove_private(run_dir)   # the runner removes them too, unless it died first
         prov = get_provider(r["provider"]).use(r["model"] or "", (self.cfg.get("pricing") or {}).get(r["provider"]))
         usage = prov.parse(run_dir / "output.jsonl", run_dir / "stderr.log")
+        if exit_info.get("launch_auth"):
+            # The chat bridge had no usable key (none saved, or saved for another URL): the provider's
+            # auth gate holds it like a logout, never a launch failure that costs attempts.
+            usage.auth_failed, usage.error = True, usage.error or str(exit_info.get("launch_error") or "")[:400]
         if usage.extra.get("connectors_used"):
             key = f"connectors_used:{r['provider']}"
             seen = db.kv(key) or {"since": time.time()}
@@ -3015,7 +3019,9 @@ class Daemon:
         if refused:
             note.update(refused=refused, not_waste="refused")   # never started a model turn: spent nothing
         launch_error = str(exit_info.get("launch_error") or "")
-        if launch_error:
+        if launch_error and exit_info.get("launch_auth"):
+            note["launch_error"] = launch_error   # the auth gate's (above), not a harness launch failure
+        elif launch_error:
             # The runner could not exec the agent (runner.launch_error): a failed run, never a lost
             # one, and one observation per provider and role while it keeps failing the same way.
             usage.error = usage.error or launch_error

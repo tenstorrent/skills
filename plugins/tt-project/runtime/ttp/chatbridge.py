@@ -41,6 +41,13 @@ STOP_REASONS = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_
 
 class BridgeError(Exception):
     """The bridge cannot start: no key saved, or the config names another URL than the key's."""
+    auth = False
+
+
+class BridgeAuthError(BridgeError):
+    """No usable key for the endpoint: the provider's auth gate, not a launch failure (the runner
+    records it as `launch_auth`, the daemon books the run `auth`)."""
+    auth = True
 
 
 def settings(cfg: dict, tier: str, model: str) -> dict:
@@ -370,7 +377,7 @@ class Bridge:
                               "`ttp secret endpoint <alias> --url <base url>` and set it to that alias")
         got = endpoint.credentials(alias)
         if not got:
-            raise BridgeError(f"failed to authenticate: no key saved for endpoint {alias!r} "
+            raise BridgeAuthError(f"failed to authenticate: no key saved for endpoint {alias!r} "
                               f"(run `ttp secret endpoint {alias} --url <base url>`)")
         key, saved = got
         try:
@@ -378,8 +385,8 @@ class Bridge:
         except ValueError as e:
             raise BridgeError(f"providers.chat.base_url: {e}") from None
         if not same:
-            raise BridgeError(f"providers.chat.base_url is not the URL saved with endpoint {alias!r}: "
-                              "the key goes only to the URL it was saved for")
+            raise BridgeAuthError(f"failed to authenticate: providers.chat.base_url is not the URL saved with "
+                                  f"endpoint {alias!r}: the key goes only to the URL it was saved for")
         if not s.get("model"):
             raise BridgeError("no model for this tier: set providers.chat.tiers.<tier>.model")
         return cls(url or saved, key, s["model"], s.get("max_tokens") or 0, **kw)

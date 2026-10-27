@@ -377,3 +377,70 @@ def test_runner_refuses_a_chat_run_without_a_saved_key(env, tmp_path, mock_chat)
     info = json.loads((run_dir / "exit.json").read_text())
     assert info["launched"] is False and "chat bridge" in info["launch_error"]
     assert "failed to authenticate" in info["launch_error"] and not seen.exists() and up.seen == []
+
+
+def test_runner_books_a_chat_bridge_without_a_usable_key_for_the_auth_gate(env, tmp_path, mock_chat):
+    up = mock_chat()
+    for case, change in (("missing", {}), ("other url", {"base_url": "https://other.example.com/v1"}),
+                         ("no model", {"model": ""})):
+        (tmp_path / case).mkdir()
+        run_dir, seen, run_env = _chat_run(tmp_path / case, up, alias="other" if case == "missing" else "cloud")
+        spec = json.loads((run_dir / "run.json").read_text())
+        spec["bridge"].update(change)
+        (run_dir / "run.json").write_text(json.dumps(spec))
+        subprocess.run([sys.executable, "-m", "ttp.runner", str(run_dir)], cwd=str(RUNTIME), env=run_env,
+                       timeout=_load_scaled(60))
+        info = json.loads((run_dir / "exit.json").read_text())
+        assert info["launched"] is False and not seen.exists() and up.seen == [], case
+        if case == "no model":
+            # A bridge that cannot start for another reason stays a launch failure.
+            assert "no model" in info["launch_error"] and "launch_auth" not in info
+        else:
+            assert info["launch_error"].startswith("could not start the agent: chat bridge: failed to authenticate"), \
+                info["launch_error"]
+            assert info["launch_auth"] is True, case
+
+
+def _chat_config(p):
+    p.set_config("providers.chat", {"endpoint": "cloud", "base_url": "https://api.example.com/v1",
+                                    "tiers": {"standard": {"model": "org/Base-Model-2"}}})
+
+
+def test_a_chat_run_without_a_usable_key_goes_to_the_auth_gate(env, monkeypatch):
+    from ttp import alerts
+    from ttp.daemon import Daemon
+    p = make(env)
+    _chat_config(p)
+    d = Daemon(p.base)
+    seen = []
+    monkeypatch.setattr(d, "observe", lambda source, text, *a, **k: seen.append(source))
+    why = ("could not start the agent: chat bridge: failed to authenticate: providers.chat.base_url is not the URL "
+           "saved with endpoint 'cloud': the key goes only to the URL it was saved for")
+    ends = []
+    for launch_auth in (True, False):
+        tid = p.db.add_task("build", "", kind="work", tier="standard", priority=3, budget_usd=8.0, labels=[],
+                            provider="chat")
+        p.db.update_task(tid, status="running")
+        rid = p.db.x("INSERT INTO runs(task,role,provider,model,started,status,boot_id) "
+                     "VALUES(?,'worker','chat','org/Base-Model-2',?,'running',?)", (tid, time.time() - 5, d.boot))
+        rd = p.runs / str(rid)
+        rd.mkdir(parents=True)
+        p.db.x("UPDATE runs SET dir=? WHERE id=?", (str(rd), rid))
+        d.finish_run(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)),
+                     {"rc": None, "started": time.time() - 5, "ended": time.time(), "launched": False,
+                      "launch_error": why, **({"launch_auth": True} if launch_auth else {})})
+        ends.append((p.db.one("SELECT * FROM runs WHERE id=?", (rid,)), p.db.task(tid)))
+        if launch_auth:
+            # The logged-out pause: the breaker is open, nothing more starts on chat until a check passes.
+            assert d._logged_out("chat") and alerts.breaker(p.db, "chat")
+            assert not d._may_probe("chat", time.time()), "the first check waits for check_logins"
+            assert p.db.q("SELECT id FROM messages WHERE ref='auth:chat'")
+            assert "daemon:launch" not in seen, "not reported as a harness launch failure"
+            p.db.x("DELETE FROM kv WHERE key=?", (alerts.BREAKER + "chat",))
+    (run, task), (plain, _) = ends
+    assert run["status"] == "auth" and not run["cost_usd"]
+    assert "failed to authenticate" in json.loads(run["note"])["launch_error"]
+    assert task["status"] == "queued" and int(task["attempts"] or 0) == 0 and task["tier"] == "standard", \
+        "an auth failure costs no attempt and is not retried a tier up"
+    # Without the runner's mark the same text stays a launch failure (only the bridge decides it is auth).
+    assert plain["status"] == "failed" and "daemon:launch" in seen
