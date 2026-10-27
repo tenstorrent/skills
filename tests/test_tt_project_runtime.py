@@ -8626,15 +8626,15 @@ def test_the_harness_prompt_explains_worktrees_and_staging_by_name():
     assert "runtime changes need `ttp restart" not in text
 
 
-def _wait_for_lock_waiter(procs, timeout=60):
-    """Until one of these `ttp lock` commands says it is waiting for the resource."""
+def _wait_for_lock_waiter(procs, timeout=60, res="board"):
+    """Until one of these `ttp lock` commands says it is waiting for `res` (once a take found it busy)."""
     import select
     deadline = time.time() + timeout
     while time.time() < deadline:
         ready, _, _ = select.select([p.stderr for p in procs], [], [], max(deadline - time.time(), 0))
         for f in ready:
             line = f.readline()
-            if "waiting for board" in line:
+            if f"waiting for {res}" in line:
                 return
             assert line, "a ttp lock command ended without waiting"
     raise AssertionError("no ttp lock command waited")

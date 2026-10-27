@@ -1018,15 +1018,22 @@ def test_boot_check_restores_an_empty_memory_file_and_a_truncated_index(env):
     stray = p.memory_dir / "fact-never-committed.md"
     stray.write_bytes(b"\0" * 64)
     d = Daemon(p.base)
-    t0 = time.monotonic()
+    import resource
+
+    def cpu_s() -> float:
+        # CPU time of this process and its reaped children (the check's git calls): a slow check costs
+        # more of it, a loaded host only stretches the wall clock.
+        return sum(r.ru_utime + r.ru_stime for r in (resource.getrusage(resource.RUSAGE_SELF),
+                                                     resource.getrusage(resource.RUSAGE_CHILDREN)))
+    t0 = cpu_s()
     d.check_integrity(start=True)
-    took = time.monotonic() - t0
+    took = cpu_s() - t0
     assert a.read_bytes() == good_entry
     assert p.memory_index.read_bytes() == good_index
     assert not stray.exists() and (p.state / "damaged" / stray.name).exists()
     res = p.db.kv(KV_INTEGRITY)
     assert res["fsck"] == "ok" and not res["bad"] and len(res["restored"]) == 3, res
-    assert took < 2, f"boot check took {took:.2f} s"
+    assert took < 1, f"boot check used {took:.2f} s of CPU"   # about 0.07 s on an idle host
     assert p.db.one("SELECT id FROM messages WHERE kind='info' AND text LIKE '%repaired%'")
     assert not p.db.one("SELECT id FROM messages WHERE kind='alert'")
     clean = subprocess.run(["git", "-C", str(p.harness), "status", "--porcelain"], capture_output=True, text=True)

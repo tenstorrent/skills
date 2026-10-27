@@ -7253,7 +7253,8 @@ def test_a_derived_check_prestage_that_times_out_leaves_its_unfinished_test_out_
     quick, hangs, after = (f"tests/test_hang.py::{n}" for n in ("test_quick", "test_hangs", "test_after"))
     for rid in (1, 2):
         _seed_check_failure(p, rid, [hangs, quick, after])
-    monkeypatch.setattr(checkprestage, "DEFAULT_TIMEOUT_S", 6.0)
+    default = checkprestage.DEFAULT_TIMEOUT_S
+    monkeypatch.setattr(checkprestage, "DEFAULT_TIMEOUT_S", 6.0)   # short enough to cut test_hangs off
     assert checkprestage.derive(p.runs) == [after, hangs, quick]
     cli.main(["checks", "--detach"])
     out = capsys.readouterr().out
@@ -7262,6 +7263,8 @@ def test_a_derived_check_prestage_that_times_out_leaves_its_unfinished_test_out_
     assert times.get(hangs, 0) >= checkprestage.DERIVE_FAST_S and times.get(quick, 9) < 1, times
     assert after not in times, "a test that never started is not guessed slow"
     assert checkprestage.derive(p.runs) == [after, quick]
+    # Two quick tests now: the product default, so a loaded host cannot time them out at the 6 s above.
+    monkeypatch.setattr(checkprestage, "DEFAULT_TIMEOUT_S", default)
     cli.main(["checks", "--detach"])
     assert len(started) == 2 and "pre-stage passed" in capsys.readouterr().out
 

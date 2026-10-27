@@ -535,6 +535,7 @@ def test_a_waiting_ttp_lock_asks_the_pre_grant_check_again_when_it_takes_the_loc
         # Its first take has failed (it says it waits): a take on the first try reuses its fresh answer.
         seen = _stderr_until(waiter, "ttp lock: waiting for rig")
         assert "waiting for rig" in seen, seen
+        assert _queue_len(p, "rig") == 1
         verdict.write_text("75")   # the project's repair hold begins while the waiter is queued
         go.touch()
         rc = _ended([holder, waiter])
