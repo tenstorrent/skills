@@ -12440,3 +12440,166 @@ def test_task_show_prints_an_abandoned_record_with_its_reason_and_time(env, monk
     assert _ttp_task(p, "show", str(tid), "--json") == 0
     ab = json.loads(capsys.readouterr().out)["abandoned"]
     assert ab["why"] == "stricter design landed instead" and ab["ts"] > 0
+
+
+_EXT_REPO = "example-org/example-widgets"
+
+
+def _ext_handoff(head, summary="published elsewhere", **extra):
+    return {"status": "done", "summary": summary,
+            "published": {"repo": _EXT_REPO, "branch": "ttp/t1-example", "head": head, **extra}}
+
+
+def test_the_published_handoff_field_is_validated_and_an_invalid_one_is_ignored_with_its_reason(env):
+    """`published` names a change in another repository: branch and head required, the head a full or
+    abbreviated hex sha, the repo owner/name or a remote URL without credentials. Anything else is
+    ignored with a logged reason, never a crash, and queues no review."""
+    from ttp import extchange
+    sha = "ab" * 20
+    ok = [{"repo": _EXT_REPO, "branch": "ttp/t1-x", "head": sha},
+          {"repo": "https://git.example.com/acme/widgets.git", "branch": "feature/x", "head": "ABC1234"},
+          {"repo": "ssh://git@git.example.com:2222/acme/widgets", "branch": "x", "head": sha},
+          {"repo": "git@git.example.com:acme/widgets.git", "branch": "x", "head": sha, "extra": 1}]
+    for v in ok:
+        ch, why = extchange.parse(v)
+        assert ch and not why and ch["head"] == v["head"].lower() and ch["repo"] == v["repo"], v
+    assert extchange.parse(None) == (None, "") and extchange.parse({}) == (None, "")
+    bad = {"not an object": ["acme/w ttp/x abc1234", ["acme/w"], 7],
+           "no branch": [{"repo": _EXT_REPO, "head": sha}, {"repo": _EXT_REPO, "branch": " ", "head": sha}],
+           "no head": [{"repo": _EXT_REPO, "branch": "x"}, {"repo": _EXT_REPO, "branch": "x", "head": 12345678}],
+           "no repo": [{"branch": "x", "head": sha}],
+           "not a hex commit sha": [{"repo": _EXT_REPO, "branch": "x", "head": "abc12"},
+                                    {"repo": _EXT_REPO, "branch": "x", "head": "main"},
+                                    {"repo": _EXT_REPO, "branch": "x", "head": "g" * 40}],
+           "not a plain branch name": [{"repo": _EXT_REPO, "branch": b, "head": sha}
+                                       for b in ("-x", "a..b", "a//b", "x/", "x.lock", "a b", "x;rm", "$(x)")],
+           "neither owner/name nor a remote URL": [{"repo": r, "branch": "x", "head": sha} for r in (
+               "widgets", "/srv/repos/widgets", "file:///srv/widgets", "https://user:secret@git.example.com/a/b",
+               "acme/w;rm -rf", "-c/x", "acme/w/../x y", "`x`/y")]}
+    for reason, values in bad.items():
+        for v in values:
+            ch, why = extchange.parse(v)
+            assert ch is None and reason in why, (v, why)
+    # In the daemon: an invalid entry is logged with its reason and no review is queued.
+    from ttp.daemon import Daemon
+    p = make(env)
+    tid = p.db.add_task("bad entry", "spec", kind="code", origin="coordinator")
+    p.db.update_task(tid, status="review", result=json.dumps(
+        {"status": "done", "summary": "ok", "published": {"repo": _EXT_REPO, "branch": "x", "head": "zzz"}}))
+    assert Daemon(p.base)._auto_review(p.db.task(tid), "ok") is None
+    assert f"task {tid}: hand-off `published` ignored: head 'zzz' is not a hex commit sha" \
+        in (p.logs / "daemon.log").read_text()
+    assert not p.db.q("SELECT id FROM tasks WHERE kind='review'")
+
+
+def test_a_code_task_that_published_in_another_repo_gets_one_review_only_review_per_head(env):
+    """A finished code task whose project branch changes nothing (or that has no branch) but whose
+    hand-off names a valid published change gets exactly one `Review #<id>` from the hand-off and the
+    review sweep alike: standard (no diff to size), naming the repo, branch and head, fetched read-only
+    into a scratch clone, review only with a no_push line. A sweep after it, a daemon restart or a
+    repeated hand-off of the same head (also abbreviated) adds none; a new head gets its own."""
+    from ttp import push
+    from ttp.daemon import Daemon
+    p = make(env)
+    _with_origin(env)
+    sha = "cd" * 20
+    tid, branch, done, (rev,) = _finish_code(env, p, "widget fix", {}, result=_ext_handoff(sha))
+    assert branch and rev["title"] == f"Review #{tid}: widget fix" and rev["origin"] == "daemon"
+    assert rev["tier"] == "standard" and f"Review #{rev['id']} queued by the daemon" in done["text"]
+    spec = rev["spec"]
+    assert f"repo {_EXT_REPO}, branch ttp/t1-example, head {sha[:12]}" in spec
+    assert f"gh repo clone {_EXT_REPO} scratch -- --no-checkout" in spec and "scratch clone under your own worktree" in spec
+    assert f"review exactly head {sha}" in spec and "\nno_push: change lives in an external repo\n" in spec
+    assert "Review only: if it passes, hand off `done`. Do not push anything" in spec
+    assert "ttp push` from" not in spec and "ttp push --own" not in spec and "precheck" not in spec.lower()
+    assert push.REVIEW_ONLY_LABEL in push._labels(rev) and f"published_head:{sha}" in push._labels(rev)
+    d = Daemon(p.base)
+    # Sweeps and a restart while it is open, and after it ended: no second review of this head.
+    p.db.update_task(tid, status="review")
+    _ran(p, tid, time.time() - 1900)
+    for status in ("queued", "done", "failed"):
+        p.db.update_task(rev["id"], status=status)
+        _sweep(d)
+        _sweep(Daemon(p.base))
+        assert d._auto_review(p.db.task(tid), "again") == (rev["id"], False), status
+        assert len(p.db.q("SELECT id FROM tasks WHERE kind='review'")) == 1, status
+    # A repeated hand-off of the same head, abbreviated: still that review.
+    p.db.update_task(tid, result=json.dumps(_ext_handoff(sha[:9].upper())))
+    assert d._auto_review(p.db.task(tid), "again") == (rev["id"], False)
+    # A new head is a new change: one review of it.
+    new = "ef" * 20
+    p.db.update_task(tid, result=json.dumps(_ext_handoff(new)))
+    rid2, added = d._auto_review(p.db.task(tid), "again")
+    assert added and f"head {new}" in p.db.task(rid2)["spec"]
+    assert d._auto_review(p.db.task(tid), "again") == (rid2, False)
+    # A task with no branch on record at all, left in review: the sweep queues its one review.
+    bare = p.db.add_task("no branch", "spec", kind="code", origin="coordinator")
+    p.db.update_task(bare, status="review", result=json.dumps(_ext_handoff(sha, "branchless")))
+    _ran(p, bare, time.time() - 1900)
+    _sweep(Daemon(p.base))
+    (brev,) = p.db.q("SELECT * FROM tasks WHERE kind='review' AND title=?", (f"Review #{bare}: no branch",))
+    assert f"repo {_EXT_REPO}, branch ttp/t1-example, head {sha[:12]}" in brev["spec"] and "branchless" in brev["spec"]
+    _sweep(Daemon(p.base))
+    assert len(p.db.q("SELECT id FROM tasks WHERE kind='review' AND title=?", (f"Review #{bare}: no branch",))) == 1
+    # Its review never reuses another review's verdict on a head of the project's git.
+    assert d._reuse_review(p.db.task(brev["id"])) is False
+
+
+def test_a_published_entry_changes_nothing_for_other_tasks(env):
+    """A code task with neither a project diff nor a published change still gets no review; a code
+    task with a project diff is reviewed from the project's git as before, whatever it publishes;
+    a non-code task's `published` queues nothing."""
+    from ttp.daemon import Daemon
+    p = make(env)
+    _, _, _, reviews = _finish_code(env, p, "nothing at all", {})
+    assert reviews == []
+    tid, branch, _, (rev,) = _finish_code(env, p, "in repo", {"app.py": 5}, result=_ext_handoff("ab" * 20))
+    assert branch in rev["spec"] and "external repository" not in rev["spec"] and "no_push:" not in rev["spec"]
+    assert "published_head:" not in rev["labels"]
+    other = p.db.add_task("a plan", "spec", kind="plan", origin="coordinator")
+    p.db.update_task(other, status="review", result=json.dumps(_ext_handoff("ab" * 20)))
+    _ran(p, other, time.time() - 1900)
+    _sweep(Daemon(p.base))
+    assert not p.db.q("SELECT id FROM tasks WHERE kind='review' AND title LIKE ?", (f"Review #{other}:%",))
+
+
+def test_a_failed_review_of_an_external_change_gets_a_fix_that_publishes_to_the_same_branch(env):
+    """A failed review of an external change follows the fix/re-review flow: the fix is told to publish
+    onto the same external branch and name its new head in `published`; the re-review is review only;
+    the fix's hand-off gives the queued re-review its new head once, and queues no second review."""
+    from ttp import push
+    from ttp.daemon import Daemon
+    from ttp.db import continues_id, dependency_ids
+    from ttp.providers.base import RunUsage as Usage
+    p = make(env)
+    sha = "cd" * 20
+    code, _, _, (rev,) = _finish_code(env, p, "widget fix", {}, result=_ext_handoff(sha))
+    waiter = p.db.add_task("use it", "s", origin="coordinator", depends_on=[rev["id"]])
+    failed = _fail_review(env, p, rev["id"], [{"title": "add the missing test", "spec": "test_y must fail"}])
+    (fix,) = p.db.q("SELECT * FROM tasks WHERE kind='code' AND origin='daemon'")
+    (re_rev,) = p.db.q("SELECT * FROM tasks WHERE kind='review' AND id!=?", (rev["id"],))
+    assert f"Fix #{fix['id']} and re-review #{re_rev['id']}" in failed["text"]
+    assert continues_id(fix) == code and "test_y must fail" in fix["spec"]
+    assert f"publish the fix to the same branch ttp/t1-example of {_EXT_REPO}" in fix["spec"]
+    assert '"published": {"repo": "' + _EXT_REPO + '", "branch": "ttp/t1-example", "head": "<new head sha>"}' in fix["spec"]
+    assert dependency_ids(re_rev) == [fix["id"]] and re_rev["tier"] == "standard"
+    assert push.REVIEW_ONLY_LABEL in push._labels(re_rev) and "\nno_push: change lives in an external repo\n" in re_rev["spec"]
+    assert "ttp push` from" not in re_rev["spec"] and dependency_ids(p.db.task(waiter)) == [re_rev["id"]]
+    # The fix publishes a new head: the queued re-review learns it, once; no new review.
+    new = "ef" * 20
+    p.db.update_task(fix["id"], status="running")
+    run_dir = env["tmp"] / f"run-{fix['id']}"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps(_ext_handoff(new, "fixed")))
+    Daemon(p.base)._finish_worker({"task": fix["id"]}, Usage(cost_usd=1.0), "ok", run_dir)
+    r = p.db.task(re_rev["id"])
+    assert f"published_head:{new}" in push._labels(r) and r["spec"].count(f"review exactly head {new}") == 1
+    assert len(p.db.q("SELECT id FROM tasks WHERE kind='review'")) == 2
+    assert Daemon(p.base)._auto_review(p.db.task(fix["id"]), "fixed") == (re_rev["id"], False)
+    assert p.db.task(re_rev["id"])["spec"].count(f"review exactly head {new}") == 1
+
+
+def test_the_code_prompt_says_to_name_a_change_published_in_another_repo():
+    text = " ".join((RUNTIME.parent / "template" / "prompts" / "kind-code.md").read_text().split())
+    assert '"published": {"repo": "<owner/name or URL>", "branch": "...", "head": "<sha>"}' in text
+    assert "so the daemon queues its review" in text

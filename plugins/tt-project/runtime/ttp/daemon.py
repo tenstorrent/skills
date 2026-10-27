@@ -61,6 +61,7 @@ from . import detach
 from . import progress
 from . import downtime
 from . import effort
+from . import extchange
 from . import failover
 from . import outagetask
 from . import grants
@@ -10104,7 +10105,10 @@ class Daemon:
         the review cap is reached or the diff cannot be read: the coordinator then decides. A task with
         no branch on record that published its change as an open PR (pr_url, or the PR its hand-off
         names: it worked in a clone of another repository) is reviewed at that PR's head, its diff read
-        from the hosting service (push.pr_change), review only: the PR is its delivery."""
+        from the hosting service (push.pr_change), review only: the PR is its delivery. One whose
+        project branch changes nothing (or that has none) and whose hand-off names a valid `published`
+        change in another repository (extchange) is reviewed at that head, review only, once per head:
+        its diff is not readable here, so the review runs standard."""
         cfg, db = self.cfg, self.p.db
         d = cfg.get("delivery") or {}
         rules = cfg.get("review") or {}
@@ -10114,22 +10118,31 @@ class Daemon:
             return None
         branch = task.get("branch")
         try:
+            ext = self._external_change(task)
+            if ext and branch and worktree.diff_lines(self.p, [branch]):
+                ext = None   # a change in the project's own git is reviewed there, as before
             for t in db.q("SELECT * FROM tasks WHERE kind='review' AND status NOT IN ('done','failed','cancelled')"):
                 # A re-review covers a fix branch built on the branch it names only while it is still
                 # queued: it reads that branch's head when it starts, and a running one approves only
                 # the head it read, so later commits there get their own review.
-                named = worktree.named_refs(self.p, t) if branch else []
+                named = worktree.named_refs(self.p, t) if branch and not ext else []
                 if task["id"] in dependency_ids(t) or (branch and branch in named) or (
-                        branch and t["status"] == "queued" and branch in worktree.fix_branches(self.p, t, named)):
-                    self._name_new_head(task, t)
-                    self._precheck_open(task, t)
+                        branch and not ext and t["status"] == "queued"
+                        and branch in worktree.fix_branches(self.p, t, named)):
+                    if ext:
+                        self._name_external_head(task, t, ext)
+                    else:
+                        self._name_new_head(task, t)
+                        self._precheck_open(task, t)
                     return t["id"], False
+            if ext and (seen := self._reviewed_external(task, ext)):
+                return seen, False
             # No branch on record: the change is the PR it published, read from the hosting service.
-            pr_url = "" if branch else prguard.task_pr(task)
+            pr_url = "" if branch or ext else prguard.task_pr(task)
             published = push.pr_change(self.p, pr_url) if pr_url else None
             # A review that already approved this exact head (it ran while the task waited on its own
             # checks) passed it: a second review of the same head is a wasted run.
-            tip = published["sha"] if published else (worktree._git(
+            tip = published["sha"] if published else ext["head"] if ext else (worktree._git(
                 self.p.root, "rev-parse", "--verify", "--quiet", f"{branch}^{{commit}}", check=False) if branch else "")
             passed = db.one("SELECT q.task FROM push_queue q JOIN tasks t ON t.id=q.task WHERE q.head=? AND "
                             "t.kind='review' AND q.status!='cancelled' ORDER BY q.id DESC LIMIT 1",
@@ -10146,6 +10159,8 @@ class Daemon:
                 return None
             if published:
                 changes, full = published["changes"], published["sha"]
+            elif ext:
+                changes, full = None, ext["head"]
             else:
                 changes = worktree.diff_lines(self.p, [branch]) if branch else None
                 full = worktree._git(self.p.root, "rev-parse", branch) if changes else ""
@@ -10153,7 +10168,7 @@ class Daemon:
         except Exception as e:
             log(self.p, f"task {task['id']}: no review queued, its diff was not read: {e}")
             return None
-        if not changes or coord.next_task_slot(db, coord.task_cap(cfg, True), review=True) is not None:
+        if (not changes and not ext) or coord.next_task_slot(db, coord.task_cap(cfg, True), review=True) is not None:
             return None
         title = f"Review #{task['id']}: {task['title']}"[:200]
         dup = db.one("SELECT id FROM tasks WHERE title=? AND status NOT IN ('done','failed','cancelled')", (title,))
@@ -10167,11 +10182,15 @@ class Daemon:
             c = continues_id(db.task(c) or {"labels": "[]"})
         prior = next((r for r in db.q("SELECT * FROM tasks WHERE kind='review' AND status='failed' ORDER BY id DESC")
                       if r["id"] in chain or chain & set(dependency_ids(r))), None)
-        tier = "standard" if prior else bud.review_tier(changes, cfg)
-        pr = pr_url or task.get("pr_url")
-        lines = [f"Independently review the change of code task #{task['id']} ({task['title']}): branch "
-                 f"{published['ref'] if published else branch}, head {head}" + (f", PR {pr}" if pr else "") + "."]
-        if published:
+        tier = "standard" if prior or ext else bud.review_tier(changes, cfg)
+        pr = "" if ext else pr_url or task.get("pr_url")
+        lines = [f"Independently review the change of code task #{task['id']} ({task['title']}): "
+                 + (f"repo {ext['repo']}, " if ext else "") + "branch "
+                 f"{published['ref'] if published else ext['branch'] if ext else branch}, head {head}"
+                 + (f", PR {pr}" if pr else "") + "."]
+        if ext:
+            lines += [extchange.fetch_line(ext), extchange.NO_PUSH_LINE]
+        elif published:
             lines.append(f"No branch of it is on record in this project, so its diff is not in the project root's "
                          f"git: read it with `gh pr diff {pr}`, or check out head {full} in a clone of the PR's "
                          f"repository of your own.")
@@ -10204,7 +10223,7 @@ class Daemon:
         elif prior:
             lines.append(f"Review #{prior['id']} failed on an earlier head: check each of its findings is fixed, "
                          f"then review what changed since.")
-        if not published and (line := self._verified_review_line(task, full)):
+        if not published and not ext and (line := self._verified_review_line(task, full)):
             lines.append(line)
         lines.append(REVIEW_CHECK_LINE)
         lines.append("Test it with the task's own test selection (the exact test ids or `-k` expression its "
@@ -10213,10 +10232,10 @@ class Daemon:
                      "`ttp lock` on a device resource, never directly.")
         # A head its PR already carries is delivered: a pass closes the review, with no push to the
         # push branch or approval for the push queue (that branch may be unrelated, or not exist yet).
-        delivered = pr if published else push.delivered_pr(self.p, task, full)
+        delivered = "" if ext else pr if published else push.delivered_pr(self.p, task, full)
         # A task that delivers onto a pr_branch other than the push branch goes to that PR with
         # `ttp push --own`: a plain push or a push-queue approval would rebase it onto the push branch.
-        elsewhere = "" if delivered else push.pr_elsewhere(self.p, task, d)
+        elsewhere = "" if delivered or ext else push.pr_elsewhere(self.p, task, d)
         # Unless it means to create that branch (its spec asks for `ttp push --own`), a pr_branch the push
         # remote has no branch of is ignored, as the push queue's check_approval ignores it.
         # Under delivery.own_push existing_only `ttp push --own` cannot create it either, whatever the spec asks:
@@ -10232,23 +10251,25 @@ class Daemon:
                 uncreatable = (f"{tgt[0]} has no branch {elsewhere}, and own pushes publish only onto a branch the "
                                f"remote already has (delivery.own_push = existing_only)")
         # Own pushes off: a pr_branch or rebases: task lands on the push branch like any other (pr_elsewhere).
-        if own_mode == "off" and not delivered and (onto := push.labelled_elsewhere(self.p, task, d)):
+        if own_mode == "off" and not delivered and not ext and (onto := push.labelled_elsewhere(self.p, task, d)):
             ignored = (f"Its branch label {onto} was ignored: own pushes are off in this project "
                        f"(delivery.own_push), so it lands on {d.get('push_branch')} like any other change.")
         # A change that must not reach the push branch (its diff is all push-excluded, or its spec or
         # hand-off forbids it) is review only too: a pass would push what the push refuses or the spec bans.
-        off = "" if delivered or elsewhere or not d.get("push_branch") else push.kept_off(task, changes, d, self.p)
+        off = "" if delivered or elsewhere or ext or not d.get("push_branch") else push.kept_off(task, changes, d, self.p)
         # A push branch no push can ever reach (main/master without allow_protected_push_branch, or a
         # code repo without the remote) makes every review review only: a push step there would only
         # exit 2 and block the review, and a raw `git push` would skip the checks and the queue.
         held: dict[int, int] = {}
-        never = "" if delivered or elsewhere or off or not (d.get("push_branch") and d.get("push_allowed", True)) \
+        never = "" if delivered or elsewhere or off or ext or not (d.get("push_branch") and d.get("push_allowed", True)) \
             else push.push_branch_problem(d["push_branch"], self.p.root, push.allow_protected(d))
         # A local push branch of a code repo with no git remote lands with `ttp land` (land.py) instead.
         lands = land.local_branch(self.p, self.p.root) if never and full and not (pr or published) else ""
         pushes = bool(d.get("push_branch") and d.get("push_allowed", True)) and not delivered and not elsewhere \
-            and not off and not never
-        if delivered:
+            and not off and not never and not ext
+        if ext:
+            lines.append(extchange.REVIEW_ONLY)
+        elif delivered:
             lines.append(f"Its head is already delivered as PR {delivered}: review only. If it passes, hand off "
                          f"`done`; do not run `ttp push` or approve it for the push queue. Leave the branch and "
                          f"the PR as they are.")
@@ -10311,8 +10332,9 @@ class Daemon:
                                                           ", and the landed commit." if lands else "."))
         # A review that publishes with `ttp push --own` carries the branch it publishes onto, as its subject does.
         labels = [f"auto_review:{task['id']}"] + ([f"continues:{prior['id']}"] if prior else []) \
-            + ([PRECHECK_LABEL + checks.name] if checks else []) + ([push.REVIEW_ONLY_LABEL] if elsewhere or off or never else []) + ([push.LAND_LABEL] if lands else []) \
-            + ([f"pr_branch:{elsewhere}"] if own_step else []) + reviewhold.labels(full, held)
+            + ([PRECHECK_LABEL + checks.name] if checks else []) + ([push.REVIEW_ONLY_LABEL] if elsewhere or off or never or ext else []) + ([push.LAND_LABEL] if lands else []) \
+            + ([f"pr_branch:{elsewhere}"] if own_step else []) + reviewhold.labels(full, held) \
+            + ([extchange.HEAD_LABEL + ext["head"]] if ext else [])
         rid = db.add_task(title, "\n".join(lines), kind="review", tier=tier, priority=2, origin="daemon",
                           budget_usd=float(cfg["budget"]["task_default_usd"].get(tier, 8.0)),
                           depends_on=[task["id"]], labels=labels, **pin_of(task))
@@ -10320,6 +10342,38 @@ class Daemon:
             f", held until the fix of {', '.join(f'#{t} (#{f})' for t, f in sorted(held.items()))} lands or "
             f"its chain ends" if held else ""))
         return rid, True
+
+    def _external_change(self, task: dict) -> dict | None:
+        """The change code task `task`'s hand-off names as published in another repository
+        (extchange.parse), or None; an invalid entry is logged with its reason and ignored."""
+        ch, why = extchange.parse(load_result(task.get("result")).get(extchange.FIELD))
+        if why:
+            log(self.p, f"task {task['id']}: hand-off `{extchange.FIELD}` ignored: {why}")
+        return ch
+
+    def _reviewed_external(self, task: dict, ch: dict) -> int | None:
+        """The review, open or ended (not cancelled), already queued for code task `task`'s external
+        head ch["head"] (extchange.HEAD_LABEL): one head gets one review, across sweeps, restarts and
+        repeated hand-offs. None when there is none."""
+        for r in self.p.db.q("SELECT * FROM tasks WHERE kind='review' AND status!='cancelled' AND labels LIKE ? "
+                             "ORDER BY id", (f'%"{extchange.HEAD_LABEL}%',)):
+            labels = push._labels(r)
+            if (f"auto_review:{task['id']}" in labels or task["id"] in dependency_ids(r)) \
+                    and any(extchange.same_head(h, ch["head"]) for h in extchange.heads(labels)):
+                return r["id"]
+        return None
+
+    def _name_external_head(self, task: dict, review: dict, ch: dict) -> None:
+        """A queued review that covers code task `task` (the re-review _fix_failed_review queued with its
+        fix) gets the external head the task's hand-off published, once per head: its label, for
+        _reviewed_external, and a spec line saying exactly what to fetch and review."""
+        labels = push._labels(review)
+        if review["status"] != "queued" or any(extchange.same_head(h, ch["head"]) for h in extchange.heads(labels)):
+            return
+        spec = (f"{review.get('spec') or ''}\nNew head: #{task['id']} published its fix. "
+                + extchange.fetch_line(ch))
+        self.p.db.update_task(review["id"], spec=spec, labels=[*labels, extchange.HEAD_LABEL + ch["head"]])
+        review["spec"] = spec
 
     def _verified_review_line(self, task: dict, full: str) -> str:
         """The review spec's line on the review marker the code task inherits (verified.py): review only
@@ -10359,8 +10413,11 @@ class Daemon:
         the same checks takes that verdict and closes with no run (reviewreuse.reuse), unless it also
         covers a head that differs from it (reviewreuse.rebased_away): True. Else it
         records the head and check set it starts on, so a later review of that head can reuse it; a
-        review forced past an accepted one runs. False whenever it runs."""
+        review forced past an accepted one runs, as does a review of an external change (extchange). False
+        whenever it runs."""
         db = self.p.db
+        if extchange.heads(push._labels(task)):
+            return False   # its change lives in another repository: the project's git holds no head of it
         try:
             sha = worktree.reviewed_head(self.p, task)
         except Exception as e:
@@ -10633,7 +10690,8 @@ class Daemon:
         self._nofix ('' when nothing needs raising: auto reviews off, a task already continues it,
         or its change already landed, which has its own notice), for deadwait.raise_nofix.
         The covered code tasks are those it depends on and those its spec names; when they are not
-        one stack (a coordinator note naming another change's branch), those it depends on decide."""
+        one stack (a coordinator note naming another change's branch), those it depends on decide.
+        A review of a change published in another repository goes to _fix_external_review."""
         cfg, db = self.cfg, self.p.db
         d = cfg.get("delivery") or {}
         self._nofix = ""
@@ -10661,6 +10719,12 @@ class Daemon:
         deps = dependency_ids(review)
         cands = [t for i in sorted(coord._covered(db, deps, spec))
                  for t in [db.task(i)] if t and t["kind"] == "code" and t["branch"]]
+        # A review of a change published in another repository is fixed there (_fix_external_review).
+        if extchange.heads(push._labels(review) + push._labels(first)):
+            ext = next(((t, ch) for i in sorted((i for i in deps if isinstance(i, int)), reverse=True)
+                        if (t := db.task(i)) and t["kind"] == "code" and (ch := self._external_change(t))), None)
+            if ext:
+                return self._fix_external_review(review, first, ext[0], ext[1], fups, summary)
         code = None
         try:
             # A review of a stack (a fix on top of its change) is fixed on the stack's tip. A branch
@@ -10813,6 +10877,55 @@ class Daemon:
                     + (f"PR fix #{fid} takes its findings" if prfix else f"continue hop #{fid} takes its findings"
                        if hop else f"queued fix #{fid}") + f" and re-review #{rid}"
                     + (f"; moved {moved} onto it" if moved else ""))
+        return fid, rid, moved
+
+    def _fix_external_review(self, review: dict, first: dict, code: dict, ch: dict, fups: list[dict],
+                             summary: str) -> tuple[int, int, list[int]]:
+        """_fix_failed_review for a review of code task `code`'s change published in another repository
+        (`ch`, extchange): one fix task that publishes onto the same branch there and names its new head
+        in its hand-off's `published`, and a review-only re-review that waits on it and takes over the
+        failed review's dependents. Neither touches the project's own git."""
+        cfg, db = self.cfg, self.p.db
+        base_title = re.sub(r"^(?:Fix review #\d+: )+", "", code["title"])
+        tier = code["tier"] if code["tier"] in bud.TIER_ORDER and code["tier"] != "light" else "standard"
+        rtier = "deep" if review["tier"] == "deep" else "standard"
+        found = "\n".join(f"{n}. {str(f['title'])[:200]}: {coord.clip(f.get('spec'), FOLLOWUP_SPEC_CHARS)}"
+                          for n, f in enumerate(fups, 1))
+        where = f"repo {ch['repo']}, branch {ch['branch']}"
+        with db.tx():
+            fid = db.add_task(f"Fix review #{review['id']}: {base_title}"[:200], "", kind="code", tier=tier,
+                              priority=review["priority"], origin="daemon",
+                              budget_usd=float(cfg["budget"]["task_default_usd"].get(tier, 8.0)),
+                              labels=[f"continues:{code['id']}", f"review_fix:{review['id']}"], **pin_of(code))
+            rid = db.add_task(
+                f"Re-review #{review['id']}: " + re.sub(r"^(?:Re-review #\d+: )+", "", review["title"]),
+                "\n".join([
+                    f"Re-review after review #{review['id']} failed. Fix task #{fid} addresses its findings on "
+                    f"code task #{code['id']}'s change in an external repository ({where}, failed head "
+                    f"{ch['head']}):", found,
+                    f"Review the head #{fid}'s hand-off names in `{extchange.FIELD}` (added below once it is "
+                    f"done): check each finding against `git diff {ch['head']}..<new head>` first, then what "
+                    f"the fix could regress.", extchange.NO_PUSH_LINE, extchange.REVIEW_ONLY,
+                    f"The first review's spec (#{first['id']}):\n{(first.get('spec') or '')[:REVIEW_FIX_SPEC_CHARS]}"]),
+                kind="review", tier=rtier, priority=review["priority"], origin="daemon",
+                budget_usd=float(cfg["budget"]["task_default_usd"].get(rtier, 8.0)),
+                depends_on=[fid], labels=[f"auto_review:{fid}", f"continues:{review['id']}", push.REVIEW_ONLY_LABEL],
+                **(pin_of(review) or pin_of(code)))
+            db.update_task(fid, spec="\n".join([
+                f"Fix the blocking findings of review #{review['id']} ({review['title']}) on code task "
+                f"#{code['id']} ({code['title']}).",
+                f"Its change lives in an external repository: {where}, head {ch['head']}. Work in your own "
+                f"clone of it on top of that head, then publish the fix to the same branch {ch['branch']} of "
+                f"{ch['repo']} (a fast-forward, never a force-push), and name the new head in your hand-off: "
+                f'"{extchange.FIELD}": {{"repo": "{ch["repo"]}", "branch": "{ch["branch"]}", "head": "<new head sha>"}}. '
+                f"Push nothing to this project's push branch, and open no pull request. Re-review #{rid} "
+                f"checks each finding once this task is done.",
+                f"Findings to fix:\n{found}",
+                f"The review's hand-off: {coord.clip(summary, AUTO_REVIEW_SUMMARY_CHARS)}"]))
+            moved = [t["id"] for t in coord._open_dependents(db, review["id"])]
+            coord._take_over_dependents(db, review["id"], rid)
+        log(self.p, f"review {review['id']} failed: queued fix #{fid} of the external change ({where}) and "
+                    f"re-review #{rid}" + (f"; moved {moved} onto it" if moved else ""))
         return fid, rid, moved
 
     def _fix_without_commits(self, task: dict) -> list[dict]:
