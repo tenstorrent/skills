@@ -549,6 +549,8 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
         why = full_suite(cmd, segments, str(payload.get("cwd") or os.getcwd()))
     if not why:
         why = too_many_workers(cmd)
+    if not why:
+        why = too_many_build_jobs(cmd)
     hint = None
     if not why:
         why, hint = device_test_run(commands)
@@ -880,6 +882,38 @@ def too_many_workers(cmd: str) -> str | None:
         return None   # `ttp checks` lowers it itself
     return (f"pytest -n {max(big)} is above this run's test-worker budget of {k} on this shared host. "
             f"Use -n {k} or fewer, or `-n auto` (it reads {testslots.XDIST_ENV}={k})")
+
+
+def build_share() -> int:
+    """This run's build share k: CMAKE_BUILD_PARALLEL_LEVEL and MAKEFLAGS' -j<k> as testslots.worker_env
+    sets them together, else 0 (no build pool, or the variables are the user's own)."""
+    try:
+        k = int(os.environ.get("CMAKE_BUILD_PARALLEL_LEVEL") or 0)
+    except ValueError:
+        return 0
+    return k if k > 0 and f"-j{k}" in os.environ.get("MAKEFLAGS", "").split() else 0
+
+
+def too_many_build_jobs(cmd: str) -> str | None:
+    """Why `cmd` is refused when a make, gmake, ninja or `cmake --build` in it asks for more jobs than the
+    run's build share (build_share()): an explicit -j N above it (it overrides MAKEFLAGS), an unlimited
+    `make -j` or a ninja with no -j (ninja reads no MAKEFLAGS). A build run through `ttp clip` (it takes
+    build slots and lowers -j itself), inside `ttp checks` or under a held slot grant is not refused."""
+    from . import testslots
+    k = build_share()
+    if not k or re.search(r"\bttp\s+checks\b", cmd) or any(
+            os.environ.get(v) for v in (testslots.HELD_ENV, testslots.BUILD_HELD_ENV)):
+        return None
+    clipped = [(seg[0][0], seg[-1][1]) for seg in testslots._segments(cmd)
+               if any(testslots._base(a) == "ttp" and b == "clip" for (*_, a), (*_, b) in zip(seg, seg[1:]))]
+    big = [n for start, _, _, n in testslots._edits(cmd, k, True)
+           if not any(lo <= start <= hi for lo, hi in clipped)]
+    if not big:
+        return None
+    asked = f"-j {max(big)}" if max(big) else "unlimited jobs (`make -j` with no number, or ninja with no -j)"
+    return (f"a build with {asked} is above this run's build share of {k} jobs on this shared host. "
+            f"Use -j {k} or fewer, or run it as `ttp clip -- <build>` (it takes the host's build slots and "
+            f"caps the jobs itself)")
 
 
 def full_suite(cmd: str, segments: list[list[str]], cwd: str) -> str | None:

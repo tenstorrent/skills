@@ -1160,6 +1160,62 @@ def test_a_pytest_n_above_the_budget_is_lowered_with_a_line_saying_so_and_refuse
     assert hook.too_many_workers("pytest -n 64 tests") is None, "outside a worker run: no budget"
 
 
+def _build_share(monkeypatch, k):
+    monkeypatch.setenv("CMAKE_BUILD_PARALLEL_LEVEL", str(k))
+    monkeypatch.setenv("MAKEFLAGS", f"-j{k}")
+    for v in ("TTP_TEST_SLOTS_HELD", "TTP_BUILD_SLOTS_HELD"):
+        monkeypatch.delenv(v, raising=False)
+
+
+@pytest.mark.parametrize("cmd,n", [("make -j 64", 64), ("make -j64", 64), ("gmake --jobs=64", 64),
+                                   ("ninja -j 64", 64), ("cmake --build . -j 32", 32),
+                                   ("cmake --build . --parallel 32", 32), ("cd build && make -j 64", 64),
+                                   ("(cd b; nice -n 5 /usr/bin/make -C x -j 64) 2>&1 | tail", 64),
+                                   ("ttp clip -- make -j 2 && make -j 64", 64)])
+def test_a_worker_shell_build_above_its_build_share_is_refused_pointing_at_ttp_clip(monkeypatch, cmd, n):
+    from ttp import hook
+    _build_share(monkeypatch, 4)
+    why = hook.too_many_build_jobs(cmd)
+    assert why and f"-j {n}" in why and "build share of 4" in why and "ttp clip -- <build>" in why, why
+
+
+@pytest.mark.parametrize("cmd", ["make -j", "cd b && make -j && echo ok", "ninja", "ninja -C build", "make -j 0"])
+def test_a_worker_shell_build_with_unlimited_jobs_is_refused_suggesting_the_share_or_ttp_clip(monkeypatch, cmd):
+    from ttp import hook
+    _build_share(monkeypatch, 4)
+    why = hook.too_many_build_jobs(cmd)
+    assert why and "unlimited" in why and "-j 4" in why and "ttp clip" in why, why
+
+
+def test_a_build_within_its_share_through_clip_or_checks_or_outside_a_worker_is_allowed(monkeypatch, tmp_path):
+    from ttp import hook
+    _build_share(monkeypatch, 4)
+    for cmd in ("make -j 4", "make -j2", "ninja -j 3", "cmake --build . --parallel 4", "make", "make -C build all",
+                "cmake --build .", "ttp clip -- make -j 64", "ttp clip -- ninja",
+                "cd b && ttp clip -- cmake --build . -j 32", "ttp checks -- 'make -j 64'", "pip install ninja",
+                "git grep 'make -j 64'", "sort -j 99 f"):
+        assert hook.too_many_build_jobs(cmd) is None, cmd
+    monkeypatch.setenv("TTP_BUILD_SLOTS_HELD", "4")
+    assert hook.too_many_build_jobs("make -j 64") is None, "under a held build grant"
+    monkeypatch.delenv("TTP_BUILD_SLOTS_HELD")
+    monkeypatch.setenv("TTP_TEST_SLOTS_HELD", "3")
+    assert hook.too_many_build_jobs("ninja") is None, "inside a check holding its test grant"
+    monkeypatch.delenv("TTP_TEST_SLOTS_HELD")
+    monkeypatch.setenv("MAKEFLAGS", "-j8")
+    assert hook.too_many_build_jobs("make -j 64") is None, "the variables disagree: not a worker's build share"
+    for v in ("CMAKE_BUILD_PARALLEL_LEVEL", "MAKEFLAGS"):
+        monkeypatch.delenv(v)
+    assert hook.too_many_build_jobs("make -j 64") is None and hook.too_many_build_jobs("ninja") is None, "no share"
+    _build_share(monkeypatch, 4)
+    payload = {"tool_name": "Bash", "tool_input": {"command": "cd build && make -j 64"}, "cwd": str(tmp_path)}
+    monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path))
+    out, _ = hook.pre_tool_use(payload)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "ttp clip" in out["hookSpecificOutput"]["permissionDecisionReason"]
+    monkeypatch.delenv("TTP_RUN_DIR")
+    assert hook.pre_tool_use(payload) == (None, None), "the user's own shells are never refused"
+
+
 # Host-wide build slots (testslots.BUILDS) ----------------------------------------------------------
 _FAKE_MAKE = """#!/bin/sh
 echo "args=$* MAKEFLAGS=$MAKEFLAGS CMAKE=$CMAKE_BUILD_PARALLEL_LEVEL" > "$MAKE_SEEN"
