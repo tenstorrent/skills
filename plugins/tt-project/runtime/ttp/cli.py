@@ -2404,6 +2404,11 @@ def cmd_checks(a) -> None:
     `ttp push --own` takes the commands given after `--` that this run recorded passing on exactly that
     commit and runs them itself before it pushes.
 
+    Once they passed, the tests the head adds compared with the push target (addedtests) run again,
+    ROUNDS times each, through the first check that is one plain local pytest run: one that fails a
+    round fails the checks, named with its pass count; past a cap the rerun is reported skipped,
+    never passed. With no added tests nothing more runs.
+
     `--detach` runs them in a session of their own that writes checks.rc in the run's directory
     however it ends, and prints a `--result` probe for `retry_when` that also answers once they were
     killed outright. Starting it again stops the run's earlier detached checks for the same worktree
@@ -2415,7 +2420,7 @@ def cmd_checks(a) -> None:
     unless a harness-tagged check applies to the head and ran or reused a recorded pass. With no
     harness-tagged check configured it runs the default harness plan (push.default_harness_checks). Its pass is recorded as such and never counts for a PR,
     an on_pass hand-off or `ttp push --own`; its failures open no check gap."""
-    from . import checkcap, checkdirs, checkprestage, cleantree, prguard, push, pushpass, slowtests
+    from . import addedtests, checkcap, checkdirs, checkprestage, cleantree, prguard, push, pushpass, slowtests
     if getattr(a, "gap", None):
         from . import checkgaps
         p = here()
@@ -2545,7 +2550,7 @@ def cmd_checks(a) -> None:
     passed, failed, failure, rc, scope_error = True, None, None, None, None
     clean_note = ""   # why a check found no clean checkout, or what only this worktree has
     fast_skipped, fast_cmds = [], []
-    executed, selected = [], []
+    executed, selected, rerun = [], [], None
     run_env: dict = {}   # what the checks run in, for the pass's envs (pushpass.check_envs)
     base = _checks_base(p, Path(top), cmds)
     (Path(run_dir) / "check_failure.json").unlink(missing_ok=True)
@@ -2754,6 +2759,29 @@ def cmd_checks(a) -> None:
                     out.write(_check_took(c, rc, began))
                     break
                 out.write(_check_took(c, rc, began))
+            # The tests the diff adds, once more several times each: a timing-flaky one fails here.
+            py_check = next((c for c in executed if not push.remote_host(c) and addedtests.eligible(str(c))), None)
+            if passed and py_check is not None and (new_tests := addedtests.added(top, base, head)):
+                cwd = top if _in_place(py_check) else str(clean.path)
+                tmp_fd = bool(getattr(a, "own_group", False)) and getattr(a, "tmp_fd", None) is not None
+                env = {**push.check_env("checks", run_dir=getattr(a, "check_run_dir", None)), **child_env,
+                       "PWD": cwd, **({checkreap.MARKER: reap_tok} if reap_tok else {})}
+                print(f"ttp checks: rerunning {len(new_tests)} added test(s) {addedtests.ROUNDS} times each "
+                      f"with: {py_check}", flush=True)
+                out.write(f"$ {py_check} (rerun of the added tests: {', '.join(map('::'.join, new_tests))})\n")
+                out.flush()
+                check_start = out.tell()
+                rerun = addedtests.run(
+                    new_tests, str(py_check),
+                    lambda e, t: _run_check(_low_priority(push.check_argv(py_check, cwd, e)), True, record=reap_rec,
+                                            cwd=cwd, stdout=out, stderr=subprocess.STDOUT, env=e, timeout=t,
+                                            pass_fds=(a.tmp_fd,) if tmp_fd else ()),
+                    Path(run_dir) / addedtests.FILE, env)
+                for line in addedtests.lines(rerun):
+                    print(f"ttp checks: {line}", flush=True)
+                    out.write(f"ttp checks: {line}\n")
+                if rerun["status"] in ("flaky", "failed"):
+                    passed, failed, rc = False, py_check, rerun.get("rc") or 1
         finally:
             if reap_tok:
                 _checks_reaped(out, reap_tok, reap_rec, clean, rc)
@@ -2819,7 +2847,8 @@ def cmd_checks(a) -> None:
                            "base": base, "worktree": top, "rc": rc if ran else None,
                            "output": output[-8000:], "unrelated": False}),
             "purpose": purpose, "not_executed": not_executed,
-            **({"env_problem": env_problem} if env_problem else {})})
+            **({"env_problem": env_problem} if env_problem else {}),
+            **({"flaky": rerun.get("flaky") or []} if rerun and failed is py_check else {})})
     write_json(Path(run_dir) / prguard.CHECKS_FILE, {"head": head, "worktree": top, "passed": passed,
                                                      "commands": todo, "skipped": skipped, "ts": time.time(),
                                                      **({"verified": verified_cmds, "verified_through": mark["sha"]}
@@ -2831,7 +2860,8 @@ def cmd_checks(a) -> None:
                                                      **({"not_executed": not_executed} if not passed else {}),
                                                      **({"env_problem": env_problem} if env_problem else {}),
                                                      **({"hosts": hosts} if (hosts := push.hosts_of(todo)) else {}),
-                                                     **({"authoring_tree": in_authoring} if in_authoring else {})})
+                                                     **({"authoring_tree": in_authoring} if in_authoring else {}),
+                                                     **({"added_tests": rerun} if rerun else {})})
     source = ("the default harness plan" if any(str(c) == str(failed) for c in defaults)
               else source if any(str(c) == str(failed) for c in own) else "ttp checks --")
     _note_checks_env(p, str(failed) if env_problem else None, env_problem, head, source, also)
@@ -2847,6 +2877,9 @@ def cmd_checks(a) -> None:
         if env_problem:
             die(f"ttp checks: {failed!r} failed at import on {head[:12]}: an environment problem, not the "
                 f"head's code: {env_problem} (full output: {log})", 1)
+        if rerun and failed is py_check:
+            die(f"ttp checks: {addedtests.summary(rerun)} on {head[:12]}, rerun with {failed!r} "
+                f"(full output: {log})", 1)
         die(f"ttp checks: {failed!r} failed on {head[:12]}" + (f"; {clean_note}" if clean_note else "")
             + f" (full output: {log})", 1)
     if fast_cmds:   # a reduced pass verifies nothing: no marker, and only the extras are recorded
@@ -2875,6 +2908,8 @@ def cmd_checks(a) -> None:
     if in_authoring:
         more += (f"; {len(in_authoring)} ran in the authoring worktree, NOT a clean checkout (\"cwd\": "
                  f"\"authoring\"): {', '.join(map(repr, in_authoring))}")
+    if rerun and rerun["status"] == "skipped":
+        more += f"; the rerun of the added tests was SKIPPED ({rerun['why']}), not passed"
     if harness_unset:
         more += f"; {push.HARNESS_UNSET}: the built-in harness default ran, not the code repo's checks"
     print(f"ttp checks: {len(todo)} check(s) passed on {head[:12]}{more}; "
@@ -3165,12 +3200,13 @@ def _check_took(c, rc: int, began: float) -> str:
     return f"ttp checks: {c} took {time.monotonic() - began:.1f} s (exit {rc})\n"
 
 
-def _run_check(argv: list, group: bool, record=None, **kw) -> int:
+def _run_check(argv: list, group: bool, record=None, timeout: float | None = None, **kw) -> int:
     """Run one check command to its exit code. In its own group (`group`) a stop always ends it:
     a stop during Popen would otherwise leave the started command running. Once its exit code is
     known, and when it is stopped or fails, every process it left (checkreap: tied by the run's
     token in its environment, or by its group and a working directory in its tree) is ended too;
-    the check log says how many. `record` (checkreap.Record) learns the check's group."""
+    the check log says how many. `record` (checkreap.Record) learns the check's group. Past `timeout`
+    seconds it is ended and subprocess.TimeoutExpired raised."""
     proc = None
     _CHECK_STOP.update(defer=True, pending=None)
     try:
@@ -3182,7 +3218,7 @@ def _run_check(argv: list, group: bool, record=None, **kw) -> int:
         _CHECK_STOP["defer"] = False
         if _CHECK_STOP["pending"]:
             raise SystemExit(_CHECK_STOP["pending"])
-        rc = proc.wait()
+        rc = proc.wait(timeout=timeout)
         _reap_check(proc, group, kw)
         return rc
     except BaseException:
