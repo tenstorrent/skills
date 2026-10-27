@@ -529,6 +529,20 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
 3. Route work to it per task, as to any provider (the task's `provider` is `chat`); keep the core provider,
    which runs the coordinator, on Claude, Codex or Cursor. Provider failover moves held `chat`
    work to the core provider as usual.
+4. Or route a whole tier's worker runs to it: add `"route": true` next to that tier's `model`
+   (for example `"tiers": {"light": {"model": "<model id>", "route": true}}`). The setting is absent
+   by default and nothing changes without it. A routed tier's worker runs start on `chat` when their
+   task pins no provider or model; reviews, coordinator turns and a run retried a tier up stay on the
+   core provider. A routed run that hits an endpoint fault falls back to the core provider at the
+   same tier with no attempt spent: `down` (unreachable or timed out), `error` (5xx), `rate_limit`
+   (429 or rate-limit wording) or `auth` (a refused key, through the usual logged-out gate). The
+   endpoint then cools down for `providers.chat.route_cooldown_s` seconds (default 900), while the
+   tier's runs start on the core provider. A run that fails on its own merits is retried a tier up
+   as usual. Routed spend uses the `pricing.chat` row for the model (or its `default` row:
+   `[$/M input, cached input, output]`); with no row it is zero and labelled unpriced. `ttp status`
+   and the web budget line show the last 24 h as one phrase (`routed 24h: 6 runs to chat, 2 fell
+   back (down 1, rate_limit 1)`), and `ttp stats --runs --tier light` lists each run's provider,
+   model, outcome (with any fallback reason), wall time and cost.
 
 The key stays in the per-user secrets store and the bridge's upstream requests: the agent gets
 only the bridge's address and a per-run token. Reasoning text from the endpoint is dropped,

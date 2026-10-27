@@ -51,6 +51,7 @@ from . import deadwait
 from . import cachettl
 from . import chaincap
 from . import chatbridge
+from . import route
 from . import checkcap
 from . import conflictfix
 from . import correction
@@ -305,6 +306,8 @@ SLACK_ERROR_KEY = "slack_error"   # kv: {ts, error} of the last failed Slack sen
 HUNG_STOPS = ("hung", "overdue", "supervisor_error")   # a broken supervisor's ends: they count as a stall
 HANDOFF_STATES = ("done", "blocked", "failed", "needs_review", "waiting")
 SLEEP_CUT = ("timeout", "stalled", "lost", "failed")   # ends a host sleep can cause
+# Ends that cost no attempt: the account refused, it is logged out, or a routed endpoint failed (route.py).
+FREE_ENDS = ("limit", "auth", "fallback")
 DISK_LIGHT_KINDS = ("question", "plan")   # the only task kinds that still start under the disk guard
 LOGOUT_REPORT_S = 300    # how often a project reports into a machine-wide logout and checks its reminders
 # While the coordinator cannot run for BLOCKED_RELAY_AFTER_S, high conditions it never saw that persisted
@@ -3001,6 +3004,10 @@ class Daemon:
             and not _has_tokens(usage) and _resume_never_started(json.loads(r["note"] or "{}"), usage)
         if usage.estimated and not usage.cost_usd and not failed_resume:
             usage.cost_usd = _cut_off_cost(run_dir, exit_info, usage, prov)
+        # A run routed to another provider (route.py): booked at its pricing rows, else zero and unpriced.
+        routed = route.of(r["note"]) if r["role"] == "worker" else None
+        on_route = bool(routed) and r["provider"] == routed.get("to")
+        priced = route.price(self.cfg, r["provider"], r["model"] or "", usage) if on_route else None
         status = "ok" if exit_info.get("rc") == 0 and not usage.error else "failed"
         if stopped in ("timeout", "budget", "stopped", "lost", "stalled", "shutdown", "resource_busy"):
             status = stopped if stopped != "stopped" else "killed"
@@ -3025,12 +3032,21 @@ class Daemon:
             # The API rejected the request itself (a 400 or a bad schema): a retry, at any tier, fails
             # the same way. The task fails at once (_finish_worker); a resume still starts fresh.
             status = "request_error"
+        fell = route.fell_back(status, exit_info) if on_route and not handed_off else ""
+        if fell and status not in ("limit", "auth"):
+            status = "fallback"   # the endpoint failed, not the run: no attempt, the same tier on the core provider
         net_lost = status in SLEEP_CUT and bool(NET_LOST_RE.search(usage.error or ""))
         if net_lost:
             self.hold_offline(r["provider"], f"run {r['id']} could not reach its API")
         elif r["provider"] in self._net_holds and (status == "ok" or _has_tokens(usage)):
             self._end_net_hold(r["provider"], f"run {r['id']} reached its API")
         note = json.loads(r["note"] or "{}")
+        if routed:
+            note[route.KEY] = {**routed, **({"fallback": fell} if fell else {}),
+                               **({"priced": priced} if priced is not None else {}),
+                               "wall_s": round(float(exit_info.get("ended") or time.time()) - float(r["started"] or 0), 1)}
+            if fell:
+                route.cool(db, self.cfg, routed["to"], fell, r["id"], time.time())
         if "split" not in note:   # the split steer may have fired after `r` was read
             split = json.loads((db.one("SELECT note FROM runs WHERE id=?", (r["id"],)) or {}).get("note") or "{}")
             if isinstance(split.get("split"), dict):
@@ -3774,11 +3790,11 @@ class Daemon:
             summary = f"ended without a hand-off. Its last message: {summary}"[:1500]
         elif status == "ok" and rstatus in ("done", "blocked", "failed", "needs_review"):
             new = {"done": "done", "blocked": "blocked", "failed": "failed", "needs_review": "review"}[rstatus]
-        elif status in ("limit", "auth") or reboot_lost:
+        elif status in FREE_ENDS or reboot_lost:
             new = "queued"   # not an attempt: the account refused or the host went down, the task did not fail
         else:
             new = "failed"
-        attempts = int(task["attempts"] or 0) + (0 if status in ("limit", "auth") or waiting or reboot_lost
+        attempts = int(task["attempts"] or 0) + (0 if status in FREE_ENDS or waiting or reboot_lost
                                                   or rejects else 1)
         if new == "failed" and attempts < int(task["max_attempts"] or 3) and status in ("failed", "lost", "timeout",
                                                                                      "stalled", "no_handoff",
@@ -3915,7 +3931,7 @@ class Daemon:
         # attempt and with no coordinator turn.
         cfix, cmark = conflictfix.run_note(r.get("note")), conflictfix.of(task)
         if cfix and cmark:
-            lost_run = status in ("limit", "auth") or reboot_lost
+            lost_run = status in FREE_ENDS or reboot_lost
             asks_up = waiting and isinstance(result, dict) and result.get("wake_tier") in ("standard", "deep")
             if cfix.get("tier") == "light" and not lost_run and (asks_up or not waiting) \
                     and new not in ("pushing", "blocked", "review"):
@@ -4012,7 +4028,7 @@ class Daemon:
             new, reason = "review", f"nothing was posted to the chat: {undelivered}"
             extra["undelivered"] = undelivered
             log(self.p, f"task {task['id']}: {reason}")
-        if status in ("limit", "auth") and not rstatus and (prev := load_result(task["result"])).get("status") == "waiting":
+        if status in FREE_ENDS and not rstatus and (prev := load_result(task["result"])).get("status") == "waiting":
             # A wake the account refused is the same wait: its retry stays a cheap wake.
             extra.update({k: prev[k] for k in WAIT_KEYS if k in prev})
             shown = "waiting"
@@ -4032,7 +4048,7 @@ class Daemon:
             upd["not_before"] = not_before
         elif reboot_lost:
             upd["not_before"] = None
-        elif new == "queued" and status not in ("limit", "auth"):
+        elif new == "queued" and status not in FREE_ENDS:
             upd["not_before"] = time.time() + 120 * attempts
         if isinstance(result, dict) and result.get("pr"):
             if url := prguard.safe_pr_url(result["pr"])[:300]:
@@ -4148,7 +4164,7 @@ class Daemon:
         # A retry the daemon already scheduled, after a refusal (which has its own alert) or a run that
         # ended without a verdict, leaves nothing to decide: the final attempt's outcome starts the turn.
         # A timeout still does, since the task may need splitting before it times out again.
-        quiet = new == "queued" and status in ("limit", "auth", "failed", "lost", "stalled", "no_handoff",
+        quiet = new == "queued" and status in (*FREE_ENDS, "failed", "lost", "stalled", "no_handoff",
                                                "refused_wait") or push_quiet
         # A finished code task's next step is its review, queued here in the same step whatever else the
         # hand-off holds: its follow-ups go into the review's spec and stay the coordinator's to queue.
@@ -6268,8 +6284,11 @@ class Daemon:
                 task = dict(task, tier=picked["tier"])
             wake = bud.wake_tier(task["tier"], load_result(task["result"]), self.cfg, self.p.harness)
             tier = bud.clamp_tier(wake or task["tier"], gate)
+            # A tier routed to another provider (route.py) runs there unless it is cooling down.
+            routed = self._route(task, tier, picked, now)
+            run_prov = routed["to"] if routed and routed["fallback"] == "none" else provider
             # Before _workdir_for, which would make a missing worktree afresh.
-            lost = self._resumable(task, provider)
+            lost = self._resumable(task, run_prov)
             try:
                 found = startcheck.check(self.p, task)   # a dangling worktree or a lost base clone blocks
                 cwd, branch = self._workdir_for(task)
@@ -6290,6 +6309,8 @@ class Daemon:
                     note[waitgate.USE] = gated
                 if picked:
                     note["pick"] = picked
+                if routed:
+                    note[route.KEY] = routed
                 if review_pick:
                     note["review_tier"] = review_pick
                     if review_pick.get(conflictfix.KEY):
@@ -6303,7 +6324,7 @@ class Daemon:
                                                conflict=note.get(conflictfix.KEY)), None
                 prompt += startcheck.prompt_lines(found)   # a resumed session is told too
                 db.update_task(task["id"], status="running", branch=branch, blocked_reason=None)
-                self.start_run("worker" if task["kind"] != "review" else "reviewer", prompt, provider, tier, cwd,
+                self.start_run("worker" if task["kind"] != "review" else "reviewer", prompt, run_prov, tier, cwd,
                                task=task, budget_usd=max(remaining, 0.5) if task["budget_usd"] else None,
                                read_only=False, append_system=system, note=note,
                                resume=lost["session"] if lost else None)
@@ -6314,10 +6335,10 @@ class Daemon:
             self._start_failures = 0
             fate[task["id"]] = "picked"
             live[task["id"]] = worktree.claims(self.p, dict(task, branch=branch))   # held from others this tick
-            if logged_out[provider]:
-                db.set_kv(f"auth_probe:{provider}", now)   # the one check of the login until the next
+            if logged_out[provider] if run_prov == provider else self._logged_out(run_prov):
+                db.set_kv(f"auth_probe:{run_prov}", now)   # the one check of the login until the next
             self._progress()   # each start may have added a worktree
-            busy[provider] = busy.get(provider, 0) + 1
+            busy[run_prov] = busy.get(run_prov, 0) + 1
             if gate.regime == "caps":
                 ctx["committed"] += cost
         # A task a gate kept out this tick cannot start, so it must not hold `ttp lock` commands off.
@@ -6472,6 +6493,19 @@ class Daemon:
             marked = effort.mark_raised(task) if picked["by"] == "retry" else None
             self.p.db.update_task(task["id"], tier=picked["tier"], **({"result": marked} if marked else {}))
         return picked
+
+    def _route(self, task: dict, tier: str, picked: dict | None, now: float) -> dict | None:
+        """The run note's `route` entry for a worker run of a tier routed to another provider
+        (route.py), or None: `fallback` is none when it starts there, else why it starts on the core
+        provider (a cool-down after a fallback, or the auth gate holding the endpoint)."""
+        to = route.target(self.cfg, tier)
+        if not to or not route.eligible(task, picked):
+            return None
+        name, model = to
+        why = route.cooling(self.p.db, name, now)
+        if not why and self._logged_out(name) and not self._may_probe(name, now):
+            why = "auth"   # the auth gate holds it; its one login check may be a routed run
+        return {"tier": tier, "to": name, "model": model, "fallback": why or "none"}
 
     def _resumable(self, task: dict, provider: str) -> dict | None:
         """The task's last run, when the host took it away (reboot, sleep, lost supervisor) after

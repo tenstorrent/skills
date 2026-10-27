@@ -96,6 +96,10 @@
 - Plan windows (subscription): the project stops at 90% of any window.
 - Usage-billed: default caps $100 per 24 h and $200 per 7 days, per project (all providers together).
 - A run cut off before it reports its cost counts at an estimate, labelled as such.
+- Tier routing (off by default): `providers.chat.tiers.<tier>.route: true` sends that tier's unpinned
+  worker runs to the OpenAI-compatible `chat` provider; endpoint faults fall back to the core provider
+  with no attempt spent and a cool-down (`route_cooldown_s`, default 900). Spend uses `pricing.chat`
+  (unpriced: $0, labelled). `ttp status` shows a `routed 24h:` phrase; `ttp stats --runs --tier <t>` lists runs.
 - Gates tighten as spend rises: `green` → `yellow` → `orange` → `red` (paused).
 - A spend spike far above the project's norm pauses it ("runaway guard").
 - Raising a cap: tell the coordinator, or `ttp config <name> budget.daily_usd <n>`.

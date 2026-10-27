@@ -1,0 +1,199 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""Per-tier provider routing: one tier's worker runs go to the `chat` provider (an OpenAI-compatible
+endpoint, chatbridge.py), with fallback to the core provider and a meter on every run.
+
+Off unless project.json sets `providers.chat.tiers.<tier>.route: true` next to that tier's `model`.
+A worker run of a routed tier starts on chat when its task pins no provider or model and the start is
+no tier-up retry; reviews and coordinator turns never route. The run's note gets a `route` entry:
+the tier, where it was routed (`to`, `model`), its `fallback` reason (none, down, error, rate_limit
+or auth), whether its spend is `priced` and its wall time.
+
+Fallback: a routed run that ended on an endpoint fault (unreachable or timed out: down; 5xx or a
+missing model: error; 429 or rate-limit wording: rate_limit; a refused key: auth, through the auth
+gate) ends as `fallback` (or `limit`/`auth`), costs no attempt and requeues at the same tier; the
+endpoint then cools down for `providers.chat.route_cooldown_s` (COOLDOWN_S), during which the
+tier's runs start on the core provider. A run that failed on its merits is not a fallback.
+"""
+from __future__ import annotations
+
+import json
+import time
+
+TO = "chat"                 # the provider a tier can be routed to
+KEY = "route"               # the run note's entry
+COOL = "route_cooldown:"    # kv: {"until", "reason", "run"} per routed-to provider
+COOLDOWN_S = 900
+REASONS = ("none", "down", "error", "rate_limit", "auth")
+FAULTS = REASONS[1:]
+# Run ends a bridge fault turns into a fallback; any other end is the run's own.
+FAULT_ENDS = ("failed", "request_error", "timeout", "stalled")
+
+
+def target(cfg: dict, tier: str) -> tuple[str, str] | None:
+    """(provider, model) the tier's worker runs are routed to, or None (unset: nothing changes)."""
+    if (cfg.get("core_provider") or "claude") == TO:
+        return None
+    entry = ((cfg.get("providers") or {}).get(TO) or {})
+    t = ((entry.get("tiers") or {}).get(tier) or {}) if isinstance(entry, dict) else {}
+    if not isinstance(t, dict) or t.get("route") is not True or not str(t.get("model") or ""):
+        return None
+    return TO, str(t["model"])
+
+
+def eligible(task: dict, picked: dict | None) -> bool:
+    """A worker run that may be routed: no review, no provider or model pin, no tier-up retry."""
+    return (task.get("kind") != "review" and not str(task.get("provider") or "")
+            and not str(task.get("model") or "") and (picked or {}).get("by") != "retry")
+
+
+def cooldown_s(cfg: dict) -> float:
+    v = ((cfg.get("providers") or {}).get(TO) or {}).get("route_cooldown_s")
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0 else COOLDOWN_S
+
+
+def cooling(db, prov: str, now: float) -> str:
+    """The fallback reason while `prov` cools down after one, else ''."""
+    c = db.kv(COOL + prov) or {}
+    return str(c.get("reason") or "error") if float(c.get("until") or 0) > now else ""
+
+
+def cool(db, cfg: dict, prov: str, reason: str, run_id: int | None, now: float) -> None:
+    db.set_kv(COOL + prov, {"until": now + cooldown_s(cfg), "reason": reason, "run": run_id})
+
+
+def of(note) -> dict | None:
+    """A run note's route entry (note: the dict or its JSON)."""
+    if isinstance(note, str) or note is None:
+        try:
+            note = json.loads(note or "{}")
+        except ValueError:
+            return None
+    e = note.get(KEY) if isinstance(note, dict) else None
+    return e if isinstance(e, dict) else None
+
+
+def fell_back(status: str, exit_info: dict) -> str:
+    """Why a routed run on the endpoint fell back, or '' when it ended on its own merits."""
+    if status == "auth":
+        return "auth"
+    if status == "limit":
+        return "rate_limit"
+    if status not in FAULT_ENDS:
+        return ""
+    fault = str((exit_info.get("bridge") or {}).get("last_fault") or "")
+    if fault in FAULTS:
+        return fault
+    if str(exit_info.get("launch_error") or "").find("chat bridge:") >= 0:
+        return "error"   # the bridge could not start (not a key fault: that is auth)
+    return ""
+
+
+def price(cfg: dict, prov: str, model: str, usage) -> bool:
+    """Book a routed run's spend at `pricing.<prov>` ([$/M input, cached input, output] for the model
+    or "default"); with no row the spend is zero and the run is unpriced. Returns whether it was priced."""
+    rows = (cfg.get("pricing") or {}).get(prov) or {}
+    row = rows.get(model) if isinstance(rows, dict) else None
+    row = row if isinstance(row, (list, tuple)) and len(row) == 3 else (rows.get("default") if isinstance(rows, dict) else None)
+    if not (isinstance(row, (list, tuple)) and len(row) == 3):
+        usage.cost_usd = 0.0
+        return False
+    i, c, o = (float(x) for x in row)
+    usage.cost_usd = round((usage.input_tokens * i + usage.cache_write_tokens * i + usage.cache_read_tokens * c
+                            + usage.output_tokens * o) / 1e6, 6)
+    return True
+
+
+def _rows(db, since: float, until: float | None = None) -> list[dict]:
+    out = []
+    for r in db.q("SELECT id, task, provider, model, status, started, ended, cost_usd, note FROM runs "
+                  "WHERE role='worker' AND started>=? AND started<? AND note LIKE ? ORDER BY id",
+                  (since, until or time.time() + 1, f'%"{KEY}"%')):
+        e = of(r["note"])
+        if e:
+            out.append({**{k: r[k] for k in ("id", "task", "provider", "model", "status", "cost_usd")},
+                        "tier": e.get("tier"), "to": e.get("to"), "fallback": e.get("fallback") or "none",
+                        "priced": e.get("priced"),
+                        "wall_s": round(float(r["ended"]) - float(r["started"]), 1) if r["ended"] and r["started"] else None})
+    return out
+
+
+def phrase(db, now: float | None = None) -> str:
+    """The last 24 h of routing in one short phrase for `ttp status` and the web budget line
+    ('routed 24h: 6 runs to chat, 2 fell back (down 1, rate_limit 1)'), '' with none."""
+    now = now or time.time()
+    rows = _rows(db, now - 86400, now + 1)
+    if not rows:
+        return ""
+    on = [r for r in rows if r["provider"] == r["to"]]
+    fell = [r for r in rows if r["fallback"] != "none"]
+    to = ", ".join(sorted({str(r["to"]) for r in rows}))
+    text = f"routed 24h: {len(on)} run{'s' if len(on) != 1 else ''} to {to}"
+    if fell:
+        why: dict[str, int] = {}
+        for r in fell:
+            why[r["fallback"]] = why.get(r["fallback"], 0) + 1
+        text += f", {len(fell)} fell back ({', '.join(f'{k} {n}' for k, n in sorted(why.items()))})"
+    return text
+
+
+def runs(db, tier: str | None, since: float, until: float | None = None) -> list[dict]:
+    """Worker runs with their provider, model, tier, outcome and wall time (`ttp stats --runs`): every
+    worker run of the window, routed or not, so a tier's runs compare before and after routing."""
+    routed = {r["id"]: r for r in _rows(db, since, until)}
+    out = []
+    for r in db.q("SELECT r.id, r.task, r.provider, r.model, r.status, r.started, r.ended, r.cost_usd, r.note, "
+                  "t.tier task_tier FROM runs r LEFT JOIN tasks t ON t.id=r.task WHERE r.role='worker' "
+                  "AND r.started>=? AND r.started<? AND r.status!='running' ORDER BY r.id",
+                  (since, until or time.time() + 1)):
+        e = routed.get(r["id"])
+        try:
+            n = json.loads(r["note"] or "{}")
+        except ValueError:
+            n = {}
+        # The run's tier: routed runs record it; else a wake's or a pick's, else the task's tier now.
+        t = (e or {}).get("tier") or (n.get("wake") or {}).get("tier") or (n.get("pick") or {}).get("tier") \
+            or r["task_tier"] or ""
+        if tier and t != tier:
+            continue
+        out.append({"id": r["id"], "task": r["task"], "tier": t, "provider": r["provider"], "model": r["model"],
+                    "outcome": r["status"], "fallback": (e or {}).get("fallback", ""),
+                    "priced": (e or {}).get("priced"), "cost_usd": round(float(r["cost_usd"] or 0), 4),
+                    "wall_s": round(float(r["ended"]) - float(r["started"]), 1) if r["ended"] and r["started"] else None})
+    return out
+
+
+def runs_text(rows: list[dict]) -> str:
+    if not rows:
+        return "no worker runs in the window"
+    lines = ["run    task   tier      provider  model                          outcome                wall      cost"]
+    for r in rows:
+        cost = "unpriced" if r["priced"] is False else f"${r['cost_usd']:.2f}"
+        out = r["outcome"] + (f" ({r['fallback']})" if r["fallback"] not in ("", "none") else "")
+        wall = f"{r['wall_s'] / 60:.1f}m" if r["wall_s"] is not None else "-"
+        lines.append(f"{r['id']:<6} {str(r['task'] or ''):<6} {str(r['tier'] or '-'):<9} {str(r['provider']):<9} "
+                     f"{str(r['model'] or '-')[:30]:<30} {out[:22]:<22} {wall:>6} {cost:>9}")
+    return "\n".join(lines)
+
+
+def config_problems(raw: dict) -> list[str]:
+    """What is wrong with project.json's routing settings (none when it has none)."""
+    provs = raw.get("providers") if isinstance(raw.get("providers"), dict) else {}
+    out = []
+    for name, entry in provs.items():
+        tiers = (entry or {}).get("tiers") if isinstance(entry, dict) else None
+        for tier, t in (tiers.items() if isinstance(tiers, dict) else ()):
+            if not isinstance(t, dict) or "route" not in t:
+                continue
+            if name != TO:
+                out.append(f"providers.{name}.tiers.{tier}.route: only providers.{TO} tiers can be routed; ignored")
+            elif not isinstance(t["route"], bool):
+                out.append(f"providers.{TO}.tiers.{tier}.route: give true or false; not routed")
+            elif t["route"] and not str(t.get("model") or ""):
+                out.append(f"providers.{TO}.tiers.{tier}.route: set providers.{TO}.tiers.{tier}.model too; not routed")
+            elif t["route"] and (raw.get("core_provider") or "claude") == TO:
+                out.append(f"providers.{TO}.tiers.{tier}.route: {TO} is the core provider; nothing to route")
+    v = (provs.get(TO) or {}).get("route_cooldown_s") if isinstance(provs.get(TO), dict) else None
+    if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0):
+        out.append(f"providers.{TO}.route_cooldown_s: give seconds (0 or more); {COOLDOWN_S} is used")
+    return out

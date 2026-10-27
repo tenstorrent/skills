@@ -481,7 +481,9 @@ OPEN_SECTIONS = {"resources"}           # any name below is fine
 PROVIDER_KEYS = {"tiers", "plugin_dirs", "worker_isolation", "mcp_servers", "disallowed_tools",
                  # providers.chat only (chatbridge.py): the `ttp secret endpoint` alias holding the key,
                  # the base URL saved with it, a max_tokens cap and the model's context_window (also per tier).
-                 "endpoint", "base_url", "max_tokens", "context_window"}
+                 # route_cooldown_s: how long a tier routed to it (tiers.<tier>.route, route.py) runs on the
+                 # core provider after a fallback.
+                 "endpoint", "base_url", "max_tokens", "context_window", "route_cooldown_s"}
 
 
 def _known_keys(path: list[str]) -> set[str] | None:
@@ -841,6 +843,8 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
                        "skipped, so workers may still call it")
     from .chatbridge import config_problems as chat_problems
     out += chat_problems(raw)
+    from .route import config_problems as route_problems
+    out += route_problems(raw)
     if isinstance(raw.get("budget"), dict):
         from .globalcap import setting_problems
         out += setting_problems(raw["budget"])

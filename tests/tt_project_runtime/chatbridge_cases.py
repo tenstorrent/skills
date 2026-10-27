@@ -674,3 +674,232 @@ def test_a_chat_run_books_its_repriced_spend(env):
     # Budget gates read runs.cost_usd and the ledger: the repriced figure, not Claude Code's 0.5.
     assert booked[0][0] == pytest.approx(_CB_PRICED) and booked[0][1] == 0
     assert booked[1] == (0.5, 1)
+
+
+# Per-tier routing (route.py): a tier's worker runs to the chat provider, with fallback and a meter.
+_RT_URL, _RT_MODEL = "https://example.invalid/v1", "placeholder-model"
+
+
+def _route_config(p, route=True, **extra):
+    p.set_config("providers.chat", {"endpoint": "placeholder", "base_url": _RT_URL,
+                                    "tiers": {"light": {"model": _RT_MODEL, **({"route": route} if route is not None else {})}},
+                                    **extra})
+
+
+def _route_dispatch(p, d, monkeypatch, **task):
+    """Dispatch one queued task; returns (provider, tier, note) of the start, or None."""
+    from ttp import budget as bud
+    from ttp import coordinator as coord
+    started = []
+    monkeypatch.setattr(d, "start_run", lambda role, prompt, provider, tier, cwd, **k: started.append(
+        (provider, tier, k.get("note") or {})) or 0)
+    monkeypatch.setattr(d, "_workdir_for", lambda t: (str(p.root), None))
+    for prov in (d.cfg.get("core_provider", "claude"), "chat", "codex"):
+        d.gates[prov] = bud.Gate(prov, regime="windows", max_parallel=6)
+    title = task.pop("title", "t")
+    assert coord.apply(p, [{"type": "task_add", "title": title, "spec": "s", "tier": "light", "priority": 1, **task}]) == []
+    d.dispatch()
+    return started[-1] if started else None
+
+
+def test_tier_routing_unset_changes_nothing(env, monkeypatch):
+    from ttp import route, web
+    from ttp.daemon import Daemon
+    p = make(env)
+    _route_config(p, route=None)
+    d = Daemon(p.base)
+    prov, tier, note = _route_dispatch(p, d, monkeypatch)
+    assert (prov, tier) == (d.cfg.get("core_provider", "claude"), "light") and route.KEY not in note
+    assert route.target(d.cfg, "light") is None and route.config_problems(p.config()) == []
+    assert route.phrase(p.db) == "" and "routed" not in web.budget_line(p.db, time.time(), d.cfg.get("core_provider", "claude"), None, 0.0, {})
+    # A run with no route entry is booked as before: the finish path never touches it.
+    assert route.of(None) is None and route.of("{}") is None
+
+
+def test_a_routed_tier_starts_on_chat_unless_pinned_reviewed_or_retried(env, monkeypatch):
+    from ttp import route
+    from ttp.daemon import Daemon
+    p = make(env)
+    _route_config(p)
+    d = Daemon(p.base)
+    prov, tier, note = _route_dispatch(p, d, monkeypatch, title="plain")
+    assert (prov, tier) == ("chat", "light")
+    assert note[route.KEY] == {"tier": "light", "to": "chat", "model": _RT_MODEL, "fallback": "none"}
+    assert d.cfg["providers"]["chat"]["tiers"]["light"]["model"] == _RT_MODEL   # start_run's model for chat/light
+    for pin in ({"provider": "codex"}, {"model": "some-model"}):
+        prov, _, note = _route_dispatch(p, d, monkeypatch, title=f"pinned {pin}", **pin)
+        assert prov == pin.get("provider", d.cfg.get("core_provider", "claude")) and route.KEY not in note, pin
+    assert not route.eligible({"kind": "review"}, None)
+    assert not route.eligible({"kind": "code"}, {"by": "retry", "tier": "light"})
+    assert route.eligible({"kind": "code"}, {"by": "jev", "tier": "light"})
+    assert route.target(d.cfg, "standard") is None
+    assert route.target({**d.cfg, "core_provider": "chat"}, "light") is None
+
+
+def _route_finish(p, d, tid, exit_info, provider="chat"):
+    p.db.update_task(tid, status="running")
+    note = {"route": {"tier": "light", "to": "chat", "model": _RT_MODEL, "fallback": "none"}}
+    rid = p.db.x("INSERT INTO runs(task,role,provider,model,started,status,boot_id,note) "
+                 "VALUES(?,'worker',?,?,?,'running',?,?)",
+                 (tid, provider, _RT_MODEL, time.time() - 30, d.boot, json.dumps(note)))
+    rd = p.runs / str(rid)
+    rd.mkdir(parents=True)
+    p.db.x("UPDATE runs SET dir=? WHERE id=?", (str(rd), rid))
+    d.finish_run(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)),
+                 {"rc": 1, "started": time.time() - 30, "ended": time.time(), **exit_info})
+    return p.db.one("SELECT * FROM runs WHERE id=?", (rid,)), p.db.task(tid)
+
+
+@pytest.mark.parametrize("fault", ["down", "error", "rate_limit"])
+def test_a_routed_run_on_an_endpoint_fault_falls_back_to_the_core_provider(env, monkeypatch, fault):
+    from ttp import route
+    from ttp.daemon import Daemon
+    p = make(env)
+    _route_config(p, route_cooldown_s=600)
+    d = Daemon(p.base)
+    monkeypatch.setattr(d, "observe", lambda *a, **k: None)
+    tid = p.db.add_task("build", "", kind="work", tier="light", priority=3, budget_usd=8.0, labels=[])
+    run, task = _route_finish(p, d, tid, {"bridge": {"last_fault": fault, "faults": {fault: 2}}})
+    assert run["status"] == "fallback", run["status"]
+    assert task["status"] == "queued" and int(task["attempts"] or 0) == 0 and task["tier"] == "light"
+    e = route.of(run["note"])
+    assert e["fallback"] == fault and e["wall_s"] >= 29 and e["priced"] is False and not run["cost_usd"]
+    assert route.cooling(p.db, "chat", time.time()) == fault
+    assert route.cooling(p.db, "chat", time.time() + 601) == ""
+    # The retry starts on the core provider at the same tier, its note naming why.
+    p.db.update_task(tid, status="done")
+    prov, tier, note = _route_dispatch(p, d, monkeypatch, title="next")
+    assert (prov, tier) == (d.cfg.get("core_provider", "claude"), "light") and note[route.KEY]["fallback"] == fault
+    # Once the cool-down ends the tier routes again.
+    p.db.set_kv(route.COOL + "chat", {"until": time.time() - 1, "reason": fault})
+    prov, _, note = _route_dispatch(p, d, monkeypatch, title="after")
+    assert prov == "chat" and note[route.KEY]["fallback"] == "none"
+    assert route.phrase(p.db) == f"routed 24h: 1 run to chat, 1 fell back ({fault} 1)"
+
+
+def test_a_routed_run_with_a_refused_key_goes_through_the_auth_gate_then_falls_back(env, monkeypatch):
+    from ttp import alerts, route
+    from ttp.daemon import Daemon
+    p = make(env)
+    _route_config(p)
+    d = Daemon(p.base)
+    monkeypatch.setattr(d, "observe", lambda *a, **k: None)
+    tid = p.db.add_task("build", "", kind="work", tier="light", priority=3, budget_usd=8.0, labels=[])
+    run, task = _route_finish(p, d, tid, {"rc": None, "launched": False, "launch_auth": True,
+                                          "launch_error": "could not start the agent: chat bridge: failed to authenticate"})
+    assert run["status"] == "auth" and route.of(run["note"])["fallback"] == "auth"
+    assert d._logged_out("chat") and alerts.breaker(p.db, "chat")
+    assert task["status"] == "queued" and int(task["attempts"] or 0) == 0 and task["tier"] == "light"
+    p.db.update_task(tid, status="done")
+    prov, _, note = _route_dispatch(p, d, monkeypatch, title="next")
+    assert prov == d.cfg.get("core_provider", "claude") and note[route.KEY]["fallback"] == "auth"
+
+
+def test_a_routed_run_that_fails_on_its_merits_is_no_fallback(env, monkeypatch):
+    from ttp import route
+    from ttp.daemon import Daemon
+    p = make(env)
+    _route_config(p)
+    p.set_config("pricing.chat", {_RT_MODEL: [1.0, 0.1, 4.0]})
+    d = Daemon(p.base)
+    monkeypatch.setattr(d, "observe", lambda *a, **k: None)
+    tid = p.db.add_task("build", "", kind="work", tier="light", priority=3, budget_usd=8.0, labels=[])
+    # The endpoint answered (an earlier fault cleared by a later reply): the run's own failure.
+    run, task = _route_finish(p, d, tid, {"bridge": {"last_fault": "", "faults": {"error": 1}}})
+    assert run["status"] == "failed" and int(task["attempts"] or 0) == 1
+    e = route.of(run["note"])
+    assert e["fallback"] == "none" and e["priced"] is True
+    assert route.cooling(p.db, "chat", time.time()) == ""
+    # A run that fell back to the core provider is booked as usual, not at the chat price.
+    run, _ = _route_finish(p, d, tid, {"bridge": {"last_fault": "down"}}, provider=d.cfg.get("core_provider", "claude"))
+    assert run["status"] == "failed" and "priced" not in route.of(run["note"])
+
+
+def test_routed_spend_uses_the_chat_price_or_is_zero_and_unpriced():
+    from types import SimpleNamespace
+    from ttp import route
+    u = SimpleNamespace(input_tokens=1_000_000, cache_write_tokens=0, cache_read_tokens=2_000_000,
+                        output_tokens=500_000, cost_usd=9.9)
+    assert route.price({}, "chat", _RT_MODEL, u) is False and u.cost_usd == 0
+    cfg = {"pricing": {"chat": {"default": [2.0, 0.5, 8.0]}}}
+    assert route.price(cfg, "chat", _RT_MODEL, u) is True and u.cost_usd == 2.0 + 1.0 + 4.0
+    cfg["pricing"]["chat"][_RT_MODEL] = [1.0, 0.0, 0.0]
+    assert route.price(cfg, "chat", _RT_MODEL, u) is True and u.cost_usd == 1.0
+
+
+def test_routed_runs_show_in_status_web_and_stats_runs(env, monkeypatch, capsys):
+    from ttp import cli, route, web
+    from ttp.daemon import Daemon
+    p = make(env)
+    _route_config(p)
+    d = Daemon(p.base)
+    monkeypatch.setattr(d, "observe", lambda *a, **k: None)
+    tid = p.db.add_task("build", "", kind="work", tier="light", priority=3, budget_usd=8.0, labels=[])
+    _route_finish(p, d, tid, {"rc": 0})
+    _route_finish(p, d, tid, {"bridge": {"last_fault": "rate_limit"}})
+    want = "routed 24h: 2 runs to chat, 1 fell back (rate_limit 1)"
+    assert route.phrase(p.db) == want
+    assert want in web.budget_line(p.db, time.time(), d.cfg.get("core_provider", "claude"), None, 0.0, {})
+    rows = route.runs(p.db, "light", time.time() - 3600)
+    assert [(r["provider"], r["model"], r["fallback"], r["priced"]) for r in rows] == \
+        [("chat", _RT_MODEL, "none", False), ("chat", _RT_MODEL, "rate_limit", False)]
+    assert all(r["wall_s"] >= 29 for r in rows) and route.runs(p.db, "standard", time.time() - 3600) == []
+    cli.main(["stats", "demo", "--runs", "--tier", "light"])
+    out = capsys.readouterr().out
+    assert "fallback (rate_limit)" in out and _RT_MODEL in out and "unpriced" in out
+
+
+def test_route_config_problems():
+    from ttp import route
+    assert route.config_problems({}) == []
+    raw = {"providers": {"chat": {"tiers": {"light": {"route": True}, "standard": {"model": "m", "route": "yes"}},
+                                  "route_cooldown_s": -1},
+                         "claude": {"tiers": {"light": {"route": True}}}}}
+    got = "\n".join(route.config_problems(raw))
+    for want in ("chat.tiers.light.route: set providers.chat.tiers.light.model", "standard.route: give true or false",
+                 "claude.tiers.light.route: only providers.chat", "route_cooldown_s: give seconds"):
+        assert want in got, got
+    assert "core provider" in route.config_problems({"core_provider": "chat", "providers": {"chat": {
+        "tiers": {"light": {"model": "m", "route": True}}}}})[0]
+    assert route.cooldown_s({"providers": {"chat": {"route_cooldown_s": "x"}}}) == route.COOLDOWN_S
+
+
+def test_chatbridge_records_endpoint_fault_kinds_without_their_text(mock_chat):
+    from ttp.chatbridge import Bridge, fault_of
+    assert [fault_of(s) for s in (401, 403, 402, 429, 0, 500, 503, 404, 400)] == \
+        ["auth", "auth", "rate_limit", "rate_limit", "down", "error", "error", "error", ""]
+    assert fault_of(400, "Too Many Requests, slow down") == "rate_limit"
+    hi = {"max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]}
+    up = mock_chat((500, {"error": {"message": f"boom {_CB_KEY}"}}), (429, {"error": {"message": "slow"}}),
+                   (200, {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}))
+    with Bridge(up.url, _CB_KEY, "m") as b:
+        _post(b, hi)
+        assert b.stats()["last_fault"] == "error"
+        _post(b, hi)
+        assert b.stats()["last_fault"] == "rate_limit"
+        _post(b, hi)
+        st = b.stats()
+    assert st == {"last_fault": "", "faults": {"error": 1, "rate_limit": 1}}
+    assert _CB_KEY not in json.dumps(st)
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        dead = f"http://127.0.0.1:{s.getsockname()[1]}/v1"
+    with Bridge(dead, _CB_KEY, "m") as b:
+        _post(b, hi)
+        assert b.stats()["last_fault"] == "down"
+    up = mock_chat((200, [{"choices": [{"delta": {"content": "par"}}]}, {"error": {"message": "rate limited", "code": 429}}]))
+    with Bridge(up.url, _CB_KEY, "m") as b:
+        _post(b, {**hi, "stream": True})
+        assert b.stats()["last_fault"] == "rate_limit"
+
+
+def test_a_routed_chat_run_keeps_the_key_out_of_its_files(env, tmp_path, mock_chat):
+    up = mock_chat((503, {"error": {"message": f"down for {_CB_KEY}"}}))
+    run_dir, seen, run_env = _chat_run(tmp_path, up)
+    subprocess.run([sys.executable, "-m", "ttp.runner", str(run_dir)], cwd=str(RUNTIME), env=run_env,
+                   timeout=_load_scaled(120))
+    info = json.loads((run_dir / "exit.json").read_text())
+    assert info["bridge"]["last_fault"] == "error", info
+    for f in run_dir.rglob("*"):
+        if f.is_file():
+            assert _CB_KEY.encode() not in f.read_bytes(), f

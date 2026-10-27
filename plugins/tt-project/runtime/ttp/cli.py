@@ -1550,6 +1550,11 @@ def cmd_stats(a) -> None:
     tz = timefmt.home(p)
     since, until, at = (_stats_time(v, tz, flag) for v, flag in ((a.since, "--since"), (a.until, "--until"),
                                                                  (a.split_at, "--split-at")))
+    if a.runs or a.tier:
+        from . import route
+        rows = route.runs(p.db, a.tier, since if since is not None else time.time() - a.days * 86400, until)
+        print(json.dumps(rows, indent=1) if a.json else route.runs_text(rows))
+        return
     if at is not None:
         span = a.days * 86400
         s = bud.reread_split(p.db, at, since if since is not None else at - span,
@@ -8006,6 +8011,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--split-at", help="compare runs before and after this time (a change landing)")
     s.add_argument("--top", type=int, default=10, help="how many of the costliest runs to list (default 10)")
     s.add_argument("--tools", action="store_true", help="tool output by category instead: the file-read share")
+    s.add_argument("--runs", action="store_true",
+                   help="worker runs instead: provider, model, tier, outcome (with any route fallback), wall time, cost")
+    s.add_argument("--tier", help="with --runs: only this tier's runs (implies --runs)")
     s.add_argument("--json", action="store_true", help="print JSON")
     s.set_defaults(fn=cmd_stats)
 

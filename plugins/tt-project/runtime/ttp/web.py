@@ -17,7 +17,7 @@ from . import alerts, awake
 from . import budget as bud
 from . import globalcap as gcap
 from . import coordinator as coord
-from . import credits, heal, identity, lockprobe, obligations, outagetask, projpause, pushq, release, responsibilities, sweep, timefmt, waits
+from . import credits, heal, identity, lockprobe, obligations, outagetask, projpause, pushq, release, responsibilities, route, sweep, timefmt, waits
 from . import schedule as sched
 from . import pauseends, startgate, sweepskip, timefmt, trend, upstream
 from .daemon import (AUTH_PROBE_S, HEARTBEAT_STALE_S, KV_LOCAL_ONLY, KV_WORKTREES_DIRTY, LOGGED_OUT_NOTE, NET_HELD_NOTE,
@@ -197,7 +197,7 @@ def budget_line(db: DB, now: float | None = None, core: str = "claude", gate: di
     '..., codex 7d 93% holding 1 task'. An item without data is left out. Pacing, targets and caps
     are in the Budget tab."""
     now = now or time.time()
-    held = holding(db, now, core, gates)
+    held = holding(db, now, core, gates) + [x for x in [route.phrase(db, now)] if x]
     provs = [r["provider"] for r in db.q("SELECT DISTINCT provider FROM snapshots WHERE ts>=? ORDER BY provider",
                                          (now - 3 * WEEK,))]
     prov = core if core in provs else provs[0] if provs else ""

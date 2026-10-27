@@ -344,6 +344,22 @@ def error_for(status: int, detail: str = "") -> tuple[int, dict]:
     return code, {"type": "error", "error": {"type": kind, "message": full}}
 
 
+RATE_WORDS = re.compile(r"rate.?limit|too many requests", re.I)
+
+
+def fault_of(status: int, detail: str = "") -> str:
+    """The endpoint fault an upstream answer is, for per-tier routing's fallback (route.py): down (no
+    answer or timed out), error (5xx, a missing model), rate_limit (429, 402 or rate-limit wording) or
+    auth (401/403); '' for an answer about the request itself."""
+    if status in (401, 403):
+        return "auth"
+    if status in (402, 429) or RATE_WORDS.search(detail or ""):
+        return "rate_limit"
+    if status == 0:
+        return "down"
+    return "error" if status >= 500 or status == 404 else ""
+
+
 def estimate_tokens(body: dict) -> int:
     """count_tokens: about 4 characters a token over the whole request (the endpoint has no counter)."""
     return max(1, len(json.dumps({k: body.get(k) for k in ("system", "messages", "tools")})) // 4)
@@ -407,6 +423,7 @@ class Bridge:
         self.max_tokens, self.timeout = int(max_tokens or 0), timeout
         self.context_window = int(context_window or 0)
         self.token = secrets.token_urlsafe(24)
+        self.last_fault, self.faults = "", {}   # the last call's endpoint fault kind (fault_of), counts
         self.server: http.server.ThreadingHTTPServer | None = None
         self.thread: threading.Thread | None = None
 
@@ -470,6 +487,21 @@ class Bridge:
     def _scrub(self, text: str) -> str:
         return text.replace(self._key, "<key>") if self._key else text
 
+    def _fault(self, status: int, detail: str = "") -> None:
+        kind = fault_of(status, detail)
+        self.last_fault = kind
+        if kind:
+            self.faults[kind] = self.faults.get(kind, 0) + 1
+
+    def _fault_reply(self, reply: tuple[int, dict]) -> tuple[int, dict]:
+        code, err = reply
+        self._fault(code, str((err.get("error") or {}).get("message") or ""))
+        return code, err
+
+    def stats(self) -> dict:
+        """For the run's exit record: fault kinds only, never upstream text (it may echo a key)."""
+        return {"last_fault": self.last_fault, "faults": dict(self.faults)}
+
     def forward(self, h: _Handler, body: dict) -> None:
         req = to_chat(body, self.model, self.max_tokens)
         r = urllib.request.Request(f"{self.base_url}/chat/completions", data=json.dumps(req).encode(), headers={
@@ -482,8 +514,10 @@ class Bridge:
                 detail = e.read(2000).decode("utf-8", "replace")
             except Exception:
                 detail = ""
+            self._fault(e.code, detail)
             return h._reply(*error_for(e.code, self._scrub(detail)))
         except (urllib.error.URLError, OSError) as e:
+            self._fault(0)
             return h._reply(*error_for(0, self._scrub(str(getattr(e, "reason", e)))))
         with resp:
             if not req.get("stream"):
@@ -492,7 +526,8 @@ class Bridge:
                 except ValueError:
                     return h._reply(*error_for(502, "the upstream answer is not JSON"))
                 if data.get("error"):
-                    return h._reply(*_chunk_error(data, self._scrub))
+                    return h._reply(*self._fault_reply(_chunk_error(data, self._scrub)))
+                self.last_fault = ""
                 return h._reply(200, from_chat(data, body.get("model") or self.model))
             self._stream(h, resp, Stream(body.get("model") or self.model))
 
@@ -522,16 +557,18 @@ class Bridge:
                 except ValueError:
                     continue
                 if chunk.get("error"):
-                    code, err = _chunk_error(chunk, self._scrub)
+                    code, err = self._fault_reply(_chunk_error(chunk, self._scrub))
                     send(_sse("error", err))
                     errored = True
                     break
                 send(st.feed(chunk))
             if not errored:
+                self.last_fault = ""
                 send(st.end())
             h.wfile.write(b"0\r\n\r\n")
             h.wfile.flush()
         except (OSError, socket.timeout) as e:
+            self._fault(0)
             try:   # the upstream stream broke: say so in the stream, as the API does
                 send(_sse("error", error_for(0, self._scrub(str(e)))[1]))
                 h.wfile.write(b"0\r\n\r\n")

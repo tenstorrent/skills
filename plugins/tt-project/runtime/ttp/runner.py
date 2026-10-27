@@ -488,6 +488,8 @@ def supervise(run_dir: Path) -> int:
         f.close()
     exit_info = {"rc": rc, "started": started, "ended": ended, "stopped": reason[0] if reason else None,
                  "slept_s": round(max((ended - started) - min(mono_end - mono_start, up), 0.0), 1), "nice": niceness}
+    if bridge is not None:
+        exit_info["bridge"] = bridge.stats()   # endpoint fault kinds for routing's fallback (route.py)
     _write_exit(run_dir, exit_info)
     return rc
 
