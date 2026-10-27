@@ -1702,9 +1702,9 @@ def _ask_db(env):
     p.db.x("DELETE FROM messages")   # the project's brief, posted as the user's first message
     now = time.time()
 
-    def msg(direction, text, ago, kind="user", chat=None, ref=None, ext=None):
-        return p.db.x("INSERT INTO messages(ts,direction,chat,kind,text,ref,ext_id) VALUES(?,?,?,?,?,?,?)",
-                      (now - ago, direction, chat, kind, text, ref, ext))
+    def msg(direction, text, ago, kind="user", chat=None, ref=None, ext=None, context=None):
+        return p.db.x("INSERT INTO messages(ts,direction,chat,kind,text,ref,ext_id,context) VALUES(?,?,?,?,?,?,?,?)",
+                      (now - ago, direction, chat, kind, text, ref, ext, context))
     return p, now, msg
 
 
@@ -1785,6 +1785,81 @@ def test_unblock_with_several_open_asks_the_newest_answers_only_when_unambiguous
     msg("in", "ok", 2000, chat="web")
     rows = {r["id"]: r for r in unblock.asks(p.db, now - 86400, now)}
     assert not rows[a3]["answered"] and not rows[a4]["answered"]
+
+
+def test_unblock_a_reply_to_another_outbound_message_is_not_an_open_asks_answer(env):
+    """A user's reply to a progress post ('re #N' in its text or relayer context, or in that post's
+    thread) is that post's, not the newest open ask's; a broadcast ask's plain answer must come where
+    it was delivered or be about it."""
+    from ttp import unblock
+    p, now, msg = _ask_db(env)
+    old = msg("out", "Start the sweep now?", 9500, "ask")
+    msg("in", f"ask {old}: yes", 9000, chat="relay")   # the user's previous message in that chat
+    a = msg("out", "Which credential should the nightly run use?", 8000, "ask", ref="blocking:access")
+    post = msg("out", "Progress: 40 of 60 cells done", 7000, "info", ext="300.1")
+    msg("in", "fix everything that comes up", 6000, chat="relay", context=f"re #{post} (a progress post)")
+    msg("in", f"re #{post}: fix everything that comes up", 5900, chat="relay")
+    msg("in", "fix everything that comes up", 5800, chat="slack", ref="300.1")   # its thread, no ext id
+    row = unblock.asks(p.db, now - 86400, now)[1]
+    assert row["id"] == a and not row["answered"], row
+    # Not naming the post either: a broadcast ask's plain reply in a chat it is not known to have
+    # reached (only Slack records a delivery) is not its answer unless it is about the ask.
+    msg("in", "fix everything that comes up", 5000, chat="relay")
+    assert not unblock.asks(p.db, now - 86400, now)[1]["answered"]
+    assert unblock.replies_to("re #12", None, "Re: 13", "reply to message #14", "in reply to 15") == {12, 13, 14, 15}
+    assert unblock.replies_to("are 12 cells done", "more #12", "task #16", "re #17.5") == set()
+
+
+def test_unblock_a_broadcast_asks_newest_answer_is_about_it_or_where_it_was_delivered(env):
+    from ttp import unblock
+    p, now, msg = _ask_db(env)
+    old = msg("out", "Start the sweep now?", 9500, "ask")
+    msg("in", f"ask {old}: yes", 9000, chat="relay")
+    a = msg("out", "Which credential should the nightly run use?", 8000, "ask")   # no chat, not posted to Slack
+    msg("in", "fix everything that comes up", 7000, chat="relay")
+    assert not unblock.asks(p.db, now - 86400, now)[1]["answered"], "an off-topic reply was linked"
+    b = msg("out", "Retry the failed cells?", 5000, "ask")
+    msg("in", "ok", 4000, chat="relay")   # a bare reply is about the ask
+    rows = {r["id"]: r for r in unblock.asks(p.db, now - 86400, now)}
+    assert rows[b]["how"] == "newest" and not rows[a]["answered"]
+
+
+def test_unblock_a_plain_reply_where_the_ask_was_delivered_still_links(env):
+    from ttp import unblock
+    p, now, msg = _ask_db(env)
+    old = msg("out", "Start the sweep now?", 9500, "ask")
+    msg("in", f"ask {old}: yes", 9000, chat="relay")   # the user's previous message in that chat
+    msg("in", "and post progress", 8900, chat="slack", ref="100.1", ext="100.1")
+    post = msg("out", "Progress: 40 of 60 cells done", 8500, "info")
+    a = msg("out", "Which credential should the nightly run use?", 8000, "ask", ext="200.1")   # posted to Slack
+    msg("in", "fix everything that comes up", 7000, chat="relay", context=f"re #{post}")
+    msg("in", "the second one", 6000, chat="slack", ref="160.1", ext="160.1")
+    row = unblock.asks(p.db, now - 86400, now)[1]
+    assert row["id"] == a and row["how"] == "newest" and row["answer"] == "the second one", row
+    # An ask with a chat: a plain reply there right after it links as before.
+    msg("in", "start the other sweep", 4000, chat="c1")
+    b = msg("out", "Which board should it use?", 3000, "ask", chat="c1")
+    msg("in", "the spare one", 2000, chat="c1")
+    rows = {r["id"]: r for r in unblock.asks(p.db, now - 86400, now)}
+    assert rows[b]["how"] == "newest" and rows[b]["answer"] == "the spare one"
+
+
+def test_unblock_a_reply_naming_the_ask_links_after_a_reply_to_another_message(env):
+    from ttp import unblock
+    p, now, msg = _ask_db(env)
+    old = msg("out", "Start the sweep now?", 9500, "ask")
+    msg("in", f"ask {old}: yes", 9000, chat="relay")   # the user's previous message in that chat
+    a = msg("out", "Which credential should the nightly run use?", 8000, "ask")
+    post = msg("out", "Progress: 40 of 60 cells done", 7000, "info")
+    msg("in", "fix everything that comes up", 6000, chat="relay", context=f"re #{post}")
+    msg("in", f"ask {a}: the second one", 5000, chat="relay")
+    row = unblock.asks(p.db, now - 86400, now)[1]
+    assert row["how"] == "named" and row["answer"] == f"ask {a}: the second one", row
+    # 're #<ask>' names the ask itself.
+    c = msg("out", "Retry the failed cells?", 4000, "ask")
+    msg("in", f"re #{c}: yes", 2000, chat="relay")
+    rows = {r["id"]: r for r in unblock.asks(p.db, now - 86400, now)}
+    assert rows[c]["how"] == "named" and rows[c]["answer"] == f"#{c}: yes"
 
 
 def test_unblock_stuck_episodes_end_when_the_task_moves_forward(env):

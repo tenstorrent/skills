@@ -26,10 +26,13 @@ coordinator.live_waits_max times in 24 h or, for jobs, their logs stopped growin
 Handed-back asks: a user message answers an ask when, after the ask was sent, it names it (`ask <id>`
 or `#<id>`), replies in its chat thread, or the coordinator resolved the ask in the turn that message
 started (record_resolve). A plain message that does none of these, in the ask's chat (any chat for a
-broadcast ask) and not in another thread, answers the one ask then open: sent before it, no answer
-linked yet and not resolved before it. With several open, it answers the newest only when that is the
-only one sent since the user's previous message in that chat (a plain reply answers what was just
-asked); otherwise it is linked to none. The answer's part about that ask is matched against
+broadcast ask), not in another thread and not a reply to another outbound message (`re #<id>` in its
+text or relayer context, or a reply in that message's thread), answers the one ask then open when it is
+about it (about_ask): sent before it, no answer linked yet and not resolved before it. With several
+open, it answers the newest only when that is the only one sent since the user's previous message in
+that chat (a plain reply answers what was just asked) and, for a broadcast ask, the reply came where
+the ask is known to have been delivered (Slack, once posted there) or is about it; otherwise it is
+linked to none. The answer's part about that ask is matched against
 HANDBACK, a short phrase list of answers that give the decision back to the project.
 """
 from __future__ import annotations
@@ -103,6 +106,8 @@ HANDBACK = tuple(re.compile(p, re.I) for p in (
 ))
 _MENTION = re.compile(r"(?:(?<![\w/])#|\bask\s+#?)(\d+)\b", re.I)   # "#12", "ask 12", "ask #12"
 _NOT_ASK = re.compile(r"\b(task|pr|issue|run|pull request)\s*$", re.I)
+# "re #12", "re: 12", "reply to message #12", "in reply to #12": names the message a reply is for.
+_REPLY_TO = re.compile(r"(?:\bre\b|\breply(?:ing)? to\b)\s*:?\s*(?:(?:message|msg|post)\s+)?#?(\d+)(?![\w.])", re.I)
 
 
 def handback(text: str) -> str | None:
@@ -277,6 +282,11 @@ def wait_marks(ev: Any) -> dict:
 def _ask_mentions(text: str, ask_ids: set[int]) -> list[re.Match]:
     return [m for m in _MENTION.finditer(text or "") if int(m.group(1)) in ask_ids
             and not _NOT_ASK.search(text[:m.start()])]
+
+
+def replies_to(*texts: str | None) -> set[int]:
+    """The message ids a user message (its text or a relayer's context) says it replies to."""
+    return {int(m.group(1)) for t in texts for m in _REPLY_TO.finditer(t or "")}
 
 
 def answer_part(text: str, ask_id: int, ask_ids: set[int]) -> str | None:
@@ -589,8 +599,14 @@ def asks(db: DB, since: float, now: float | None = None) -> list[dict]:
     if not any(a["ts"] >= since for a in sent):
         return []
     every = {r["id"] for r in db.q("SELECT id FROM messages WHERE direction='out' AND kind='ask'")}
-    replies = db.q("SELECT id, ts, text, ref, chat, ext_id FROM messages WHERE direction='in' AND kind='user' "
-                   "AND ts>? ORDER BY id", (sent[0]["ts"],))
+    replies = db.q("SELECT id, ts, text, context, ref, chat, ext_id FROM messages WHERE direction='in' "
+                   "AND kind='user' AND ts>? ORDER BY id", (sent[0]["ts"],))
+    named_out = sorted(set().union(*(replies_to(m["text"], m["context"]) for m in replies)) - every)
+    # Outbound messages other than asks that a reply names or threads under: they claim it, not an ask.
+    others = {r["id"] for r in db.q(f"SELECT id FROM messages WHERE direction='out' AND kind!='ask' AND id IN "
+                                    f"({','.join('?' * len(named_out))})", named_out)} if named_out else set()
+    other_threads = {r["ext_id"] for r in db.q("SELECT ext_id FROM messages WHERE direction='out' AND kind!='ask' "
+                                               "AND ext_id IS NOT NULL AND ts>=?", (sent[0]["ts"],))}
     resolved = db.kv(RESOLVED_KEY, {}) or {}
     rows = {a["id"]: {"id": a["id"], "blocking": (a["ref"] or "").split(":", 1)[1]
                       if (a["ref"] or "").startswith("blocking:") else "unset",
@@ -611,13 +627,20 @@ def asks(db: DB, since: float, now: float | None = None) -> list[dict]:
     def answered_before(a: dict, m: dict) -> bool:
         return rows[a["id"]]["first"] is not None and rows[a["id"]]["first"] < m["ts"]
 
+    def delivered(a: dict, m: dict) -> bool:
+        """Whether the ask is known to have reached the reply's chat: its own chat, or Slack for a
+        broadcast ask posted there (its ext_id). Any other chat may only have seen it in a feed."""
+        return a["chat"] == m["chat"] or (a["chat"] is None and bool(a["ext_id"]) and m["chat"] == "slack")
+
     def closed_before(a: dict, m: dict) -> bool:
         return float((resolved.get(str(a["id"])) or {}).get("ts") or m["ts"]) < m["ts"]
 
     claimed = set()   # replies about a particular ask, or in another thread: never a plain answer
     for m in replies:
         elsewhere = bool(m["ext_id"] and m["ref"] and m["ref"] != m["ext_id"])   # a reply in a thread
-        if elsewhere or _ask_mentions(m["text"], every):
+        other = m["ref"] in other_threads \
+            or any(i in others and i < m["id"] for i in replies_to(m["text"], m["context"]))
+        if elsewhere or other or _ask_mentions(m["text"], every):
             claimed.add(m["id"])
         for a in sent:
             if not in_window(a, m):
@@ -639,7 +662,8 @@ def asks(db: DB, since: float, now: float | None = None) -> list[dict]:
                  and not answered_before(a, m) and not closed_before(a, m)]
         if len(open_) == 1 and about_ask(m["text"], open_[0]["id"], open_[0]["text"]):
             link(open_[0], m, m["text"], "only_open")
-        elif open_ and prev is not None and sum(a["ts"] > prev for a in open_) == 1 and open_[-1]["ts"] > prev:
+        elif open_ and prev is not None and sum(a["ts"] > prev for a in open_) == 1 and open_[-1]["ts"] > prev \
+                and (delivered(open_[-1], m) or about_ask(m["text"], open_[-1]["id"], open_[-1]["text"])):
             link(open_[-1], m, m["text"], "newest")
     return [{**{k: v for k, v in rows[a["id"]].items() if k != "first"}, "answered_at": rows[a["id"]]["first"],
              "landed": _landed(resolved, a["id"])} for a in sent if a["ts"] >= since]
