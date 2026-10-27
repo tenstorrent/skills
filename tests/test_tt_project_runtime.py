@@ -26569,9 +26569,12 @@ def test_ttp_task_deferral_flags_go_only_with_add(env, capsys):
     from ttp import cli
     tid = p.db.add_task("t", "s", kind="work", tier="light", origin="user")
     with pytest.raises(SystemExit):
-        cli.main(["task", "demo", "set-when", str(tid), "true", "--start-after", "1h"])
+        cli.main(["task", "demo", "set-when", str(tid), "true", "--start-when", "exit 1"])
     assert "go with add" in capsys.readouterr().err
-    assert _labels(p, tid) == []
+    with pytest.raises(SystemExit):   # set-when takes --start-after; other actions do not
+        cli.main(["task", "demo", "requeue", str(tid), "--start-after", "1h"])
+    assert "--start-after goes with add or set-when" in capsys.readouterr().err
+    assert _labels(p, tid) == [] and p.db.task(tid)["not_before"] is None
 
 
 def test_prompts_defer_with_task_fields_not_memory():

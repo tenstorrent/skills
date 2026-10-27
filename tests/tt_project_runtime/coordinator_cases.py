@@ -8984,6 +8984,96 @@ def test_task_update_changes_or_clears_a_deferral(env):
     assert problems and "only a task that has not started" in problems[0]
 
 
+def test_ttp_task_set_when_start_after_now_or_empty_clears_a_deferral(env, capsys):
+    p = make(env)
+    from ttp import cli
+    from ttp import coordinator as coord
+    coord.apply(p, [{"type": "task_add", "title": "measure", "spec": "s", "start_after": "3d", "resources": ["board"]}])
+    tid = _added(p, "measure")
+    assert not _ready(p, tid)
+    for clear in ("now", ""):
+        cli.main(["task", "demo", "set-when", str(tid), "--start-after", clear])
+        assert f"task #{tid} start_after cleared" in capsys.readouterr().out
+        assert p.db.task(tid)["not_before"] is None and _ready(p, tid)
+        assert _labels(p, tid) == ["resource:board"]
+        cli.main(["task", "demo", "set-when", str(tid), "--start-after", "1d"])   # deferred again for the next round
+        assert not _ready(p, tid)
+
+
+def test_ttp_task_set_when_start_after_takes_a_delay_or_a_home_zone_time(env, capsys):
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+    p = make(env)
+    p.set_config("home_timezone", "America/Los_Angeles")
+    from ttp import cli
+    tid = p.db.add_task("queued", "s", kind="work", tier="light", origin="user", labels=["resource:board"])
+    cli.main(["task", "demo", "set-when", str(tid), "--start-after", "2h"])
+    assert f"task #{tid} start_after set: " in capsys.readouterr().out
+    assert abs(p.db.task(tid)["not_before"] - (time.time() + 7200)) < 60 and not _ready(p, tid)
+    at = (datetime.now(ZoneInfo("America/Los_Angeles")) + timedelta(days=2)).replace(second=0, microsecond=0)
+    cli.main(["task", "demo", "set-when", str(tid), "--start-after", at.strftime("%Y-%m-%dT%H:%M")])
+    assert p.db.task(tid)["not_before"] == at.timestamp(), "an ISO time with no zone is read in the home zone"
+    # Together with a start_when probe, both change; the probe alone keeps the start_after it had.
+    cli.main(["task", "demo", "set-when", str(tid), "exit 1", "--start-after", "1d"])
+    out = capsys.readouterr().out
+    assert "start_when set: exit 1" in out and "start_after set: " in out
+    after = p.db.task(tid)["not_before"]
+    assert abs(after - (time.time() + 86400)) < 60 and "start_when:exit 1" in _labels(p, tid)
+    cli.main(["task", "demo", "set-when", str(tid), ""])
+    after = p.db.task(tid)["not_before"]   # kept from its label, in whole seconds
+    assert abs(after - (time.time() + 86400)) < 60 and "resource:board" in _labels(p, tid)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["task", "demo", "set-when", str(tid), "--start-after", "soon"])
+    assert e.value.code and "start_after 'soon'" in capsys.readouterr().err
+    assert p.db.task(tid)["not_before"] == after
+
+
+def test_ttp_task_set_when_start_after_works_on_a_waiting_or_blocked_task(env, capsys):
+    p = make(env)
+    from ttp import cli
+    waiting = _due_waiting_task(p, "exit 1")
+    p.db.update_task(waiting, status="waiting")
+    cli.main(["task", "demo", "set-when", str(waiting), "--start-after", "2h"])
+    assert capsys.readouterr().out.strip().startswith(f"task #{waiting} start_after set: ")
+    assert p.db.task(waiting)["not_before"] > time.time() + 7000
+    assert json.loads(p.db.task(waiting)["result"])["retry_when"] == "exit 1", "its retry_when stays"
+    blocked = p.db.add_task("b", "s", kind="work", tier="light", origin="user", status="blocked", not_before=time.time() + 9000)
+    cli.main(["task", "demo", "set-when", str(blocked), "--start-after", "now"])
+    assert p.db.task(blocked)["not_before"] is None and p.db.task(blocked)["status"] == "blocked"
+
+
+@pytest.mark.parametrize("status", ["running", "done", "cancelled"])
+def test_ttp_task_set_when_start_after_refuses_a_started_or_finished_task(env, capsys, status):
+    p = make(env)
+    from ttp import cli
+    tid = p.db.add_task("t", "s", kind="work", tier="light", origin="user")
+    p.db.update_task(tid, status=status)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["task", "demo", "set-when", str(tid), "--start-after", "now"])
+    assert e.value.code and f"task #{tid} is {status}" in capsys.readouterr().err
+    assert p.db.task(tid)["status"] == status
+
+
+def test_ttp_task_requeue_names_a_deferral_it_keeps_and_how_to_clear_it(env, capsys):
+    p = make(env)
+    p.set_config("home_timezone", "America/Los_Angeles")
+    from ttp import cli, timefmt
+    from ttp import coordinator as coord
+    coord.apply(p, [{"type": "task_add", "title": "measure", "spec": "s", "start_after": "3d"}])
+    tid = _added(p, "measure")
+    p.db.update_task(tid, status="blocked", blocked_reason="r")
+    after = p.db.task(tid)["not_before"]
+    cli.main(["task", "demo", "requeue", str(tid)])
+    out = capsys.readouterr().out
+    assert p.db.task(tid)["status"] == "queued" and p.db.task(tid)["not_before"] == after, "the deferral stays"
+    assert timefmt.long(after, p) in out and timefmt.long(after, p).endswith(("PDT", "PST"))
+    assert f"ttp task demo set-when {tid} --start-after now" in out
+    # No deferral: the plain line.
+    other = p.db.add_task("plain", "s", kind="work", tier="light", origin="user", status="blocked")
+    cli.main(["task", "demo", "requeue", str(other)])
+    assert capsys.readouterr().out.strip() == f"task #{other} queued"
+
+
 
 def test_deferred_tasks_show_in_rows_not_alerts(env):
     p = make(env)

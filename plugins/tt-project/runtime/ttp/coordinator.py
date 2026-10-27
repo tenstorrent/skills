@@ -1535,6 +1535,27 @@ def _landed_as_deps(p: Project, a: dict, deps: list | None = None) -> tuple[dict
                f"checked here and it starts once {', '.join(f'#{i}' for i in ids)} is done")
 
 
+def deferral_update(db, task: dict, a: dict, p: Project | None, labels: list | None = None
+                    ) -> tuple[dict, float | None, str | None]:
+    """The one path from a task_update's or `ttp task set-when`'s start_after/start_when/why (`a`) to
+    the columns of a task not yet started: ({labels, not_before}, start_after, start_when). Each part
+    `a` leaves out stays as it was; `now` or "" clears it. `labels` are the ones to build on (the
+    task's own when None). A new future start_after drops the progress probe's old answers."""
+    cur = deferral(task)
+    try:
+        after, when = _start_args(a, cur, p)
+    except MissingTaskRef as e:
+        raise MissingTaskRef(f"#{task['id']} rejected: {e}") from None
+    if p and when and when != cur.get("when") and (stuck := chaincap.own_wait(
+            p, [t["id"] for t in chaincap.chain(db, task["id"])[:-1]], when)):
+        raise ValueError(f"#{task['id']} rejected: {stuck}")
+    labels = json.loads(task["labels"] or "[]") if labels is None else labels
+    if after and after > time.time() and after != cur.get("after"):
+        progress.drop_probe(db, task["id"])   # a planned deferral: its old answers no longer count
+    return {"labels": without_deferral(labels) + defer_labels(after, when, start_why(a, cur, when)),
+            "not_before": after}, after, when
+
+
 def defer_labels(after: float | None, when: str | None, why: str | None = None) -> list[str]:
     """The labels a deferred task carries (see db.deferral); none when it may start now."""
     if after is None and not when:
@@ -1999,19 +2020,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         raise InfoRejection(f"task #{task['id']} is {task['status']}: only a task that has not "
                                          f"started can be deferred; add a new one with start_after/start_when")
                     cur = deferral(task)
-                    try:
-                        after, when = _start_args(a, cur, p)
-                    except MissingTaskRef as e:
-                        raise MissingTaskRef(f"#{task['id']} rejected: {e}") from None
-                    if when and when != cur.get("when") and (stuck := chaincap.own_wait(
-                            p, [t["id"] for t in chaincap.chain(db, task["id"])[:-1]], when)):
-                        raise ValueError(f"#{task['id']} rejected: {stuck}")
-                    labels = upd.get("labels")
-                    labels = json.loads(task["labels"] or "[]") if labels is None else labels
-                    upd["labels"] = without_deferral(labels) + defer_labels(after, when, start_why(a, cur, when))
-                    upd["not_before"] = after
-                    if after and after > time.time() and after != cur.get("after"):
-                        progress.drop_probe(db, task["id"])   # a planned deferral: its old answers no longer count
+                    new, _, when = deferral_update(db, task, a, p, upd.get("labels"))
+                    upd.update(new)
                     stale = marker_only_probe(when, p.root) if when != cur.get("when") else None
                     if stale:
                         notes.append(f"task_update: #{task['id']} flagged: {stale}")

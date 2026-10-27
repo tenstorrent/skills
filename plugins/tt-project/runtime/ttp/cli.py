@@ -4984,8 +4984,10 @@ def list_tasks(p, a) -> tuple[list[dict], int, int | None]:
 
 def cmd_task(a) -> None:
     p = need(a.name, sys.argv[1:])
-    if a.action != "add" and (a.start_when, a.start_after, a.why) != (None, None, None):
-        die("--start-when, --start-after and --why go with add; for a queued task use set-when")
+    if a.action != "add" and (a.start_when, a.why) != (None, None):
+        die("--start-when and --why go with add; for a queued task use set-when")
+    if a.action not in ("add", "set-when") and a.start_after is not None:
+        die("--start-after goes with add or set-when")
     if a.action != "add" and a.budget is not None:
         die("--budget goes with add")
     if a.action != "set-when" and a.on_pass_cmd is not None:
@@ -5046,15 +5048,20 @@ def cmd_task(a) -> None:
     elif a.action == "requeue":
         if not a.title.strip().isdigit():
             die(f"requeue needs a task id, not {a.title!r}")
-        why = p.db.requeue(int(a.title))
+        tid = int(a.title)
+        why = p.db.requeue(tid)
         if why:
             die(why)
-        print(f"task #{int(a.title)} queued")
+        nb = (p.db.task(tid) or {}).get("not_before")
+        # requeue keeps a deferral (often set on purpose); say so, and how to lift it
+        print(f"task #{tid} queued" + (f"; it still waits until {timefmt.long(nb, p)}; to start it sooner: "
+                                      f"ttp task {p.name} set-when {tid} --start-after now"
+                                      if nb and nb > time.time() else ""))
     elif a.action == "set-when":
         if not a.title.strip().isdigit():
             die(f"set-when needs a task id, not {a.title!r}")
         try:
-            print(set_when(p.db, int(a.title), a.probe, p, on_pass_cmd=a.on_pass_cmd))
+            print(set_when(p.db, int(a.title), a.probe, p, on_pass_cmd=a.on_pass_cmd, start_after=a.start_after))
         except ValueError as e:
             die(str(e))
     elif a.action == "superseded":
@@ -5129,11 +5136,12 @@ class _ProbeRefused(ValueError):
         self.key = key
 
 
-def set_when(db, tid: int, probe: str | None, p=None, on_pass_cmd: str | None = None) -> str:
+def set_when(db, tid: int, probe: str | None, p=None, on_pass_cmd: str | None = None,
+             start_after: str | None = None) -> str:
     """_set_when; an always-passing retry_when it refuses is also recorded as one set_when_refused event
     per wait, so a refused model-free caller (a watcher that drops stderr) still shows."""
     try:
-        return _set_when(db, tid, probe, p, on_pass_cmd)
+        return _set_when(db, tid, probe, p, on_pass_cmd, start_after)
     except _ProbeRefused as e:
         fp = f"set_when_refused:{e.key}"
         if not db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
@@ -5142,30 +5150,46 @@ def set_when(db, tid: int, probe: str | None, p=None, on_pass_cmd: str | None = 
         raise ValueError(str(e)) from None
 
 
-def _set_when(db, tid: int, probe: str | None, p=None, on_pass_cmd: str | None = None) -> str:
+def _set_when(db, tid: int, probe: str | None, p=None, on_pass_cmd: str | None = None,
+              start_after: str | None = None) -> str:
     """Re-point the probe of a task that has not started: a waiting task's `retry_when`, else its
-    `start_when` deferral. An empty probe clears it. Same checks as the coordinator's task_update
+    `start_when` deferral. An empty probe clears it. `start_after` (a delay, a time read in the home
+    zone, or `now`/\"\" to clear) sets its start_after deferral (not_before), alone or with the probe.
+    Same checks as the coordinator's task_update, through the same coordinator.deferral_update
     (the push branch's log check needs `p`). `on_pass_cmd` sets (\"\" clears) a waiting task's
     model-free completion command; `probe` None then keeps its retry_when. The first rewrite keeps
     what the run's result.json says as retry_when_orig / on_pass_cmd_orig, so the daemon still
     takes that result.json as the hand-off the task waits on (daemon._same_probe). An always-passing
     probe (`true`) while the hand-off's on_pass_cmd stays is refused: that command was written to run
     only once the hand-off's own wait ended."""
-    from .coordinator import (_start_args, check_probe, check_task_refs, defer_labels, marker_only_probe,
-                              missing_file_probe, start_why)
-    from .db import TERMINAL_TASK_STATES, deferral, dump_result, load_result, without_deferral
-    if probe is None and on_pass_cmd is None:
-        raise ValueError("set-when needs the probe command (\"\" clears it) or --on-pass-cmd")
+    from .coordinator import check_probe, check_task_refs, deferral_update, marker_only_probe, missing_file_probe
+    from .db import TERMINAL_TASK_STATES, deferral, dump_result, load_result
+    if probe is None and on_pass_cmd is None and start_after is None:
+        raise ValueError("set-when needs the probe command (\"\" clears it), --start-after or --on-pass-cmd")
     with db.tx():   # BEGIN IMMEDIATE: the daemon cannot start the task between the check and the write
         task = db.task(tid)
         if not task:
             raise ValueError(f"no task #{tid}")
         if task["status"] in ("running", *TERMINAL_TASK_STATES):
             raise ValueError(f"task #{tid} is {task['status']}: only a task that has not started can have "
-                             f"its probe changed; add a new one instead")
+                             f"its probe or start_after changed; add a new one instead")
         prev = load_result(task["result"])
-        if prev.get("status") == "waiting" and not deferral(task).get("when"):
-            said = []
+        retry = prev.get("status") == "waiting" and not deferral(task).get("when")   # the probe is its retry_when
+        if on_pass_cmd is not None and not retry:
+            raise ValueError(f"task #{tid} is not waiting on a hand-off: only a waiting task has an on_pass_cmd")
+        said = []
+        d = {**({"start_when": probe} if probe is not None and not retry else {}),
+             **({"start_after": start_after} if start_after is not None else {})}
+        if d:
+            cur = deferral(task)
+            upd, after, when = deferral_update(db, task, d, p)
+            db.update_task(tid, **upd)
+            if "start_when" in d:
+                stale = marker_only_probe(when, p.root if p else None) if when != cur.get("when") else None
+                said.append("start_when " + (f"set: {when}" if when else "cleared") + (f"; flagged: {stale}" if stale else ""))
+            if start_after is not None:
+                said.append("start_after " + (f"set: {timefmt.long(after, p)}" if after else "cleared"))
+        if retry and (probe is not None or on_pass_cmd is not None):
             if probe is not None:
                 check_probe(probe, "retry_when")
                 check_task_refs(db, probe, "retry_when")
@@ -5193,27 +5217,18 @@ def _set_when(db, tid: int, probe: str | None, p=None, on_pass_cmd: str | None =
             if probe is not None:
                 from .waitheal import probe_flag
                 end = probe_flag(probe) or missing_file_probe(probe, p.root if p else None, "retry_when")
-                said.append("retry_when " + (f"set: {probe.strip()}" if probe.strip()
-                                             else "cleared; it wakes at its retry timer")
+                said.insert(0, "retry_when " + (f"set: {probe.strip()}" if probe.strip()
+                                                else "cleared; it wakes at its retry timer")
                             + (f"; flagged: {end}" if end else ""))
                 from . import worktree
                 if p and (held := worktree.probe_hold_text(tid, probe)):
                     from .daemon import log
                     log(p, held)
-                    said.append(held.removeprefix(f"task {tid} retry_when "))
+                    said.insert(1, held.removeprefix(f"task {tid} retry_when "))
             if on_pass_cmd is not None:
                 said.append("on_pass_cmd " + (f"set: {on_pass_cmd.strip()}" if on_pass_cmd.strip()
                                               else "cleared; a passed probe wakes it"))
-            return f"task #{tid} " + "; ".join(said)
-        if on_pass_cmd is not None:
-            raise ValueError(f"task #{tid} is not waiting on a hand-off: only a waiting task has an on_pass_cmd")
-        cur = deferral(task)
-        after, when = _start_args({"start_when": probe}, cur, p)
-        db.update_task(tid, labels=without_deferral(json.loads(task["labels"] or "[]"))
-                       + defer_labels(after, when, start_why({}, cur, when)), not_before=after)
-        stale = marker_only_probe(when, p.root if p else None) if when != cur.get("when") else None
-        return f"task #{tid} start_when " + (f"set: {when}" if when else "cleared") \
-            + (f"; flagged: {stale}" if stale else "")
+        return f"task #{tid} " + "; ".join(said)
 
 
 def cmd_prune(a) -> None:
@@ -8213,7 +8228,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--priority", type=int, default=3, help="add: 1 (most urgent) to 5 (default 3)")
     s.add_argument("--budget", type=float, help="add: its per-run dollar cap (default: budget.task_default_usd for its tier)")
     s.add_argument("--start-when", help="add: a probe; the task starts only once it exits 0 (e.g. landed:#<id>)")
-    s.add_argument("--start-after", help="add: a delay (2h, 3d) or ISO time before which it does not start")
+    s.add_argument("--start-after", help="add, set-when: a delay (2h, 3d) or ISO time (home zone unless it names "
+                   "one) before which it does not start; set-when: now or \"\" clears it")
     s.add_argument("--why", help="add: plain words for --start-when, shown instead of the probe")
     s.add_argument("--on-pass-cmd", help="set-when: a waiting task's model-free completion command, run once its "
                    "retry_when passes (\"\" clears it); without a probe its retry_when stays; an "
