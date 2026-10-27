@@ -444,3 +444,70 @@ def test_a_chat_run_without_a_usable_key_goes_to_the_auth_gate(env, monkeypatch)
         "an auth failure costs no attempt and is not retried a tier up"
     # Without the runner's mark the same text stays a launch failure (only the bridge decides it is auth).
     assert plain["status"] == "failed" and "daemon:launch" in seen
+
+
+# Upstream model ids as chat endpoints name them: '/', '.', ':', '-', '_', '@' and uppercase.
+CHAT_MODELS = ("org-name/Model-V2.5-32B-Instruct:free", "accounts/acme/models/model_v3p1@2026-01", "Big.Model:Q4_K_M")
+
+
+def test_a_chat_model_pin_is_kept_as_given(env):
+    from ttp import failover
+    from ttp.coordinator import apply
+    p = make(env)
+    _chat_config(p)
+    for model in CHAT_MODELS:
+        assert apply(p, [{"type": "task_add", "title": f"on {model}", "spec": "x", "provider": "chat",
+                          "model": model, "effort": "high"}]) == []
+        t = p.db.one("SELECT * FROM tasks WHERE title=?", (f"on {model}",))
+        assert (t["provider"], t["model"], t["effort"]) == ("chat", model, "high"), t
+        # An update of the model alone keeps the provider and takes the new id as it is.
+        assert apply(p, [{"type": "task_update", "id": t["id"], "model": model.upper()}]) == []
+        assert (p.db.task(t["id"])["provider"], p.db.task(t["id"])["model"]) == ("chat", model.upper())
+    # pin_required names chat: the mark is set.
+    assert apply(p, [{"type": "task_add", "title": "user asked for chat", "spec": "y", "provider": "chat",
+                      "model": CHAT_MODELS[0], "pin_required": True}]) == []
+    assert failover.required(p.db, p.db.one("SELECT * FROM tasks WHERE title='user asked for chat'"))
+
+
+def test_failover_off_a_logged_out_chat_drops_its_model_and_keeps_a_required_pin(env):
+    from ttp.daemon import Daemon
+    p = make(env)
+    _chat_config(p)
+    d = Daemon(p.base)
+    core = d.cfg.get("core_provider") or "claude"
+    pref = p.db.add_task("preferred", "x", kind="work", tier="standard", provider="chat",
+                         model=CHAT_MODELS[0], effort="high")
+    req = p.db.add_task("required", "y", kind="work", tier="standard", provider="chat",
+                        model=CHAT_MODELS[1], effort="high", labels=["pin:required"])
+    d.open_breaker("chat", "chat bridge: failed to authenticate")
+    d.update_gates()
+    d.failover_pinned()
+    t = p.db.task(pref)
+    assert (t["provider"], t["model"]) == (core, None), "the chat model id must not carry to the core provider"
+    assert "moved at once from chat" in t["spec"].lower()
+    r = p.db.task(req)
+    assert (r["provider"], r["model"], r["status"]) == ("chat", CHAT_MODELS[1], "queued"), \
+        "a pin the user's words require waits for chat"
+    assert not p.db.q("SELECT id FROM events WHERE kind='provider_failover' AND task=?", (req,))
+    # It still waits once chat's stop is past the failover threshold.
+    d._failover_checked = 0
+    d.failover_pinned(every_s=0)
+    assert p.db.task(req)["provider"] == "chat"
+
+
+@pytest.mark.parametrize("model", CHAT_MODELS)
+def test_check_pin_verifies_a_chat_model_id(tmp_path, model):
+    from ttp import runner
+    from ttp.providers import get_provider
+    argv, _ = get_provider("chat").build(role="worker", model=model, effort="high", cwd=str(tmp_path), budget_usd=None,
+                                         read_only=False, schema=None, restrictions={})
+    for mode in ("lenient", "strict"):
+        spec = {"provider": "chat", "argv": argv, "cwd": str(tmp_path), "pin": {"model": model, "effort": "high"},
+                "pin_verify": mode, "bridge": {"endpoint": "cloud", "model": model}}
+        (tmp_path / "run.json").write_text(json.dumps(spec))
+        assert runner.check_pin(tmp_path, spec, {}) is None, mode
+        session = json.loads((tmp_path / "run.json").read_text())["session"]
+        assert session["verification"] == "verified" and session["model"] == model
+    # Another model than the pin is still refused before the first turn.
+    refused = runner.check_pin(tmp_path, {**spec, "pin": {"model": "org-name/other-model"}}, {})
+    assert refused["refused"] == "model_mismatch"

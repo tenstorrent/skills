@@ -25,5 +25,13 @@ class Chat(Claude):
     def login_check(self) -> bool | None:
         return None   # the endpoint is asked by a run, through the bridge
 
+    def resolved_session(self, argv, cwd, env=None):
+        # The bridge sends every request to the model the run was built with (start_run passes the
+        # same name to --model and to the bridge), an upstream id taken as it is: nothing resolves
+        # it to another model. The effort is the one the agent runs at.
+        def flag(name: str) -> str:
+            return str(argv[argv.index(name) + 1]) if name in argv[:-1] else ""
+        return {"model": flag("--model"), "effort": flag("--effort")}
+
     account = Provider.account
     account_kind = Provider.account_kind
