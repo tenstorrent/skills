@@ -3115,17 +3115,19 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
         out.flush()
         print(f"ttp checks: {line}", flush=True)
         try:
-            durable_append(run_dir / "progress.md", f"{time.strftime('%H:%M:%S')} checks: {line}\n")
+            durable_append(run_dir / "progress.md", f"{timefmt.clock()} checks: {line}\n")
         except OSError:
             pass
 
-    def waiting(on: bool) -> None:
-        # The wait is recorded before the marker shows it, so whoever sees the marker sees both.
+    def waiting(on: bool, suite: str = "") -> None:
+        # The wait is recorded before the marker shows it, so whoever sees the marker sees both. `suite`:
+        # the project's suite lock it waits on (testslots.suite_hold), which the `--result` probe names.
         if foreground:
             lk.record_wait(run_dir, key, start, None if on else time.time())
         try:
             if on:
-                write_json(run_dir / CHECKS_SLOT_WAIT, {"since": time.time(), "pid": os.getpid(), "head": head})
+                write_json(run_dir / CHECKS_SLOT_WAIT, {"since": time.time(), "pid": os.getpid(), "head": head,
+                                                        **({"suite": suite} if suite else {})})
             else:
                 (run_dir / CHECKS_SLOT_WAIT).unlink(missing_ok=True)
         except OSError:
@@ -3141,8 +3143,9 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     suite = None
     try:
         suite = testslots.suite_hold(p.name if p else None, tell,
-                                     checkcap.FOREGROUND_WAIT_S if foreground and p else None, waiting,
-                                     lambda: _checks_cancelled(run_dir))
+                                     checkcap.FOREGROUND_WAIT_S if foreground and p else None,
+                                     lambda on: waiting(on, str(testslots.suite_path(p.name))),
+                                     lambda: _checks_cancelled(run_dir), f"run {run_dir.name}")
         if suite is None:
             return None
         left = max(0.0, checkcap.FOREGROUND_WAIT_S - (time.time() - start)) if foreground and p else None
@@ -3167,7 +3170,8 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     except checkcap.Cancelled as e:
         if suite is not None:
             suite.close()
-        said = f"not run: stopped waiting for a host-wide checks slot: {e}"
+        said = ("not run: stopped waiting for "
+                + ("this project's other full checks" if suite is None else "a host-wide checks slot") + f": {e}")
         out.write(f"ttp checks: {said}\n")
         out.flush()
         die(f"ttp checks: {said}", 1)
@@ -3674,7 +3678,19 @@ def _checks_result(run_dir: Path) -> int:
         return 1
     alive = _checks_alive(info)
     if not rc_file.exists() and alive:
-        if (run_dir / CHECKS_SLOT_WAIT).exists():
+        try:
+            wait = json.loads((run_dir / CHECKS_SLOT_WAIT).read_text())
+        except (OSError, ValueError):
+            wait = None
+        if isinstance(wait, dict) and wait.get("suite"):
+            from . import checkcap, locks as lk
+            try:
+                held = checkcap._some(lk.held_labels([Path(wait["suite"])]))
+            except OSError:
+                held = ""
+            print(f"ttp checks: waiting (pid {info['pid']}, not running) for this project's other full checks "
+                  f"to end, one at a time per project: held by {held or 'a run that just ended'}")
+        elif wait is not None or (run_dir / CHECKS_SLOT_WAIT).exists():
             from . import checkcap
             print(f"ttp checks: queued for a host-wide checks slot (pid {info['pid']}); "
                   + (checkcap.line() or "they start once one is free"))

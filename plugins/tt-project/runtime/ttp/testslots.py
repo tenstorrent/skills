@@ -288,22 +288,29 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
         locks.dequeue(ticket)
 
 
+def suite_path(project_name: str):
+    """Project `project_name`'s suite lock file (SUITE)."""
+    return locks.slot_paths(checkcap.slot_dir(), f"{SUITE}.{locks.group_id(project_name)}", 1)[0]
+
+
 def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = None,
                wait_s: float | None = None, waiting: Callable[[bool], None] | None = None,
-               stop: Callable[[], str] | None = None) -> Grant | None:
+               stop: Callable[[], str] | None = None, who: str = "") -> Grant | None:
     """Hold project `project_name`'s suite lock for its full checks (above), waiting while another of its
     runs holds it; Grant(0) holding it, Grant() with no project or nested in a check, None once `wait_s`
     passed. It never waits for another project's runs. `waiting` and `stop` as for checkcap.acquire:
     `waiting(True)` once the wait starts and `waiting(False)` once it ends; a reason from `stop()` ends
-    the wait with checkcap.Cancelled."""
+    the wait with checkcap.Cancelled. `who` (e.g. "run 12") goes in its label, so a waiting run names
+    the run it waits for."""
     if not project_name or os.environ.get(HELD_ENV) or os.environ.get(checkcap.HELD_ENV):
         return Grant()
-    path = locks.slot_paths(checkcap.slot_dir(), f"{SUITE}.{locks.group_id(project_name)}", 1)
+    path = [suite_path(project_name)]
     start, told = time.time(), 0.0
     try:
         while True:
             try:
-                f = locks.try_take(path, f"{project_name}: full checks (pid {os.getpid()})", "full checks")
+                f = locks.try_take(path, f"{project_name}: full checks ({who + ', ' if who else ''}pid {os.getpid()})",
+                                   "full checks")
             except OSError:
                 return Grant()   # an unwritable slot directory: the checks slot says so
             if f is not None:
@@ -316,8 +323,8 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
                 if not told and waiting:
                     waiting(True)
                 told = time.time()
-                tell and tell(f"waiting for this project's other full checks to end (one at a time per project): "
-                              f"{checkcap._some(locks.held_labels(path))}")
+                tell and tell(f"waiting for this project's other full checks to end (one at a time per project), "
+                              f"held by {checkcap._some(locks.held_labels(path)) or 'a run that just ended'}")
             time.sleep(poll_s(POLL_S))
     finally:
         if told and waiting:

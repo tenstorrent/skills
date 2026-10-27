@@ -1086,7 +1086,9 @@ def test_detached_checks_waiting_for_their_project_s_full_checks_are_queued_and_
         assert json.loads((run / cli.CHECKS_SLOT_WAIT).read_text())["pid"] == info["pid"]
         capsys.readouterr()
         assert _ttp("checks", "--result", str(run)) == 1
-        assert "queued for a host-wide checks slot" in capsys.readouterr().out
+        said = capsys.readouterr().out
+        assert f"waiting (pid {info['pid']}, not running) for this project's other full checks" in said, said
+        assert f"held by {p.name}: full checks (pid {os.getpid()})" in said and "host-wide" not in said, said
         tid = p.db.add_task("t", "s", kind="code")
         p.db.x("UPDATE tasks SET status='done', updated=? WHERE id=?", (time.time(), tid))
         p.db.x("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(?,?,?,?,?,?)",
@@ -1097,8 +1099,48 @@ def test_detached_checks_waiting_for_their_project_s_full_checks_are_queued_and_
         hold.close()
     assert (run / cli.CHECKS_RC).read_text().strip() == "1" and not ran.exists()
     assert not (run / cli.CHECKS_SLOT_WAIT).exists()
-    assert f"not run: stopped waiting for a host-wide checks slot: task #{tid} ended (done)" in \
+    assert f"not run: stopped waiting for this project's other full checks: task #{tid} ended (done)" in \
         (run / "checks.log").read_text()
+
+
+_SUITE_RUN = "touch {started}; while [ ! -e {release} ]; do sleep 0.05; done"
+
+
+def test_two_full_checks_runs_of_one_project_never_overlap_whatever_their_purpose(env, tmp_path, monkeypatch, capsys):
+    """A `ttp checks` run of the project holds its suite lock while its suite runs; a second run, for
+    the same or another purpose, runs nothing beside it, and its log and progress name the run it waits
+    for, in the project's home zone."""
+    from ttp import checkcap, cli, testslots, timefmt
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setenv("TTP_TEST_POLL_S", "0.05")
+    monkeypatch.setattr(checkcap, "FOREGROUND_WAIT_S", 0.5)
+    monkeypatch.setattr(cli, "_checks_detach", lambda *a, **k: None)
+    for k in (testslots.HELD_ENV, checkcap.HELD_ENV):
+        monkeypatch.delenv(k, raising=False)
+    first = tmp_path / "runs" / "51"
+    first.mkdir(parents=True)
+    started, release = tmp_path / "started", tmp_path / "release"
+    proc = subprocess.Popen([sys.executable, "-m", "ttp", "checks", "--purpose", "candidate", "--", "sh", "-c",
+                             _SUITE_RUN.format(started=started, release=release)],
+                            env={**os.environ, "PYTHONPATH": str(RUNTIME), "TTP_RUN_DIR": str(first),
+                                 "TTP_RUN_ID": "51"}, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    seen = tmp_path / "seen"
+    try:
+        assert _wait_for(started.exists), "the first run's suite never started"
+        for purpose in ("candidate", "harness"):
+            with pytest.raises(SystemExit) as e:
+                cli.main(["checks", "--purpose", purpose, "--", "sh", "-c", f"touch {seen}"])
+            assert e.value.code == 75 and not seen.exists(), f"a {purpose} run ran beside the first run's suite"
+        told = (run / "checks.log").read_text()
+        assert told.count(f"held by {p.name}: full checks (run 51, pid {proc.pid})") >= 2, told
+        assert f"{timefmt.clock()[-3:]} checks: waiting for this project's other full checks" in \
+            (run / "progress.md").read_text()
+    finally:
+        release.touch()
+        proc.wait(30)
+    assert proc.returncode == 0
+    cli.main(["checks", "--purpose", "harness", "--", "sh", "-c", f"touch {seen}"])
+    assert seen.exists(), "with the first run done the second runs"
 
 
 def test_foreground_checks_waiting_for_the_suite_lock_then_a_slot_hand_over_within_one_foreground_wait(
