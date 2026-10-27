@@ -5576,16 +5576,16 @@ def test_clip_cuts_at_a_word_and_marks_the_cut(env):
 
 
 
-def _hold_exclusive(p, tmp_path, release):
+def _hold_exclusive(p, tmp_path, release, run_env=None):
     """A run supervisor holding the board for a whole run, as an exclusive task's does, until the
-    file `release` exists."""
+    file `release` exists; `run_env` adds to the run's env (e.g. its TTP_RUN_ID)."""
     from ttp.daemon import Daemon
     run_dir = tmp_path / "xrun"
     run_dir.mkdir(parents=True)
     (run_dir / "prompt.md").write_text("x")
     paths = [str(x) for x in Daemon(p.base)._slot_paths("board")]
     (run_dir / "run.json").write_text(json.dumps({
-        "argv": _until(release), "env": {"TTP_TASK": "7"}, "cwd": str(tmp_path), "timeout_s": 60,
+        "argv": _until(release), "env": {"TTP_TASK": "7", **(run_env or {})}, "cwd": str(tmp_path), "timeout_s": 60,
         "provider": "fake", "exclusive": [{"resource": "board", "paths": paths}]}))
     proc = subprocess.Popen([sys.executable, "-m", "ttp.runner", str(run_dir)], cwd=str(RUNTIME),
                             env={**os.environ, "PYTHONPATH": str(RUNTIME)})
@@ -5598,7 +5598,7 @@ def _hold_exclusive(p, tmp_path, release):
 
 def test_an_exclusive_task_and_ttp_lock_exclude_each_other(env, tmp_path):
     p = make(env)
-    from ttp import coordinator as coord
+    from ttp import coordinator as coord, locks
     from ttp.daemon import Daemon
     run_env = dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost", TTP_PROJECT=str(p.base))
     # an exclusive run holds the board until released: a ttp lock command waits for it
@@ -5613,10 +5613,12 @@ def test_an_exclusive_task_and_ttp_lock_exclude_each_other(env, tmp_path):
     assert proc.wait(timeout=60) == 0
     # the exclusive task's own commands use the slot its run already holds
     release = tmp_path / "own-release"
-    proc, run_dir = _hold_exclusive(p, tmp_path / "own", release)
-    try:
+    proc, run_dir = _hold_exclusive(p, tmp_path / "own", release, {"TTP_RUN_ID": "3"})
+    _wait_held(lambda: locks.held_labels(Daemon(p.base)._slot_paths("board")), "the exclusive run never took the board")
+    try:   # with the env the run gives its commands
         own = subprocess.run([sys.executable, str(TTP), "lock", "--timeout", "0.5", "board", "--", "true"],
-                             env={**run_env, "TTP_RUN_DIR": str(run_dir)}).returncode
+                             env={**run_env, "TTP_RUN_DIR": str(run_dir), "TTP_TASK": "7",
+                                  "TTP_RUN_ID": "3"}).returncode
     finally:
         release.touch()
     assert own == 0, "an exclusive task's own ttp lock waited for itself"
