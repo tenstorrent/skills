@@ -5922,9 +5922,9 @@ def test_ttp_checks_runs_an_extra_pytest_once_and_in_the_projects_venv(env, tmp_
     p.set_config("delivery.push_checks", [{"run": cmd, "if_exists": "a.txt"}])
     cli.main(["checks", "--fresh", "--", cmd])
     out = capsys.readouterr().out
-    from ttp import envfault
-    runs = lambda: [ln for ln in ran.read_text().splitlines()   # not the venv probe nor the runner precheck
-                    if ln != "-c pass" and not ln.startswith("-c " + envfault._FIND)]
+    from ttp import envfault, pushpass
+    runs = lambda: [ln for ln in ran.read_text().splitlines()   # not the venv probe, runner precheck nor env_id's
+                    if ln not in ("-c pass", " ".join(pushpass.VERSION_PROBE)) and not ln.startswith("-c " + envfault._FIND)]
     assert runs() == ["-m pytest -q --no-device-tests"], "once, with the project venv's python"
     assert "a scoped delivery.push_checks entry runs it on this head" in out
     # Another spelling of the same pytest run is the same command.
@@ -9930,7 +9930,8 @@ def test_ttp_checks_with_its_runner_present_runs_as_before_and_records_no_fault(
     monkeypatch.setenv("PATH", f"{stub}{os.pathsep}{os.environ['PATH']}")
     cli.main(["checks", "--fresh", "--", "python3 -m pytest -q"])
     assert json.loads((run / "checks.json").read_text())["passed"] is True
-    assert ran.read_text().splitlines() == ["-m pytest -q"]
+    from ttp import pushpass
+    assert [ln for ln in ran.read_text().splitlines() if ln != " ".join(pushpass.VERSION_PROBE)] == ["-m pytest -q"]
     assert not envfault.open_faults(p) and not p.db.kv(envfault.KV) and not _env_events(p)
 
 

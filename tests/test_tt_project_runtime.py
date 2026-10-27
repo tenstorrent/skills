@@ -27130,9 +27130,9 @@ def test_ttp_checks_runs_a_bare_pytest_with_the_venv(env, tmp_path, monkeypatch,
     monkeypatch.setenv("TTP_PROJECT", str(p.base))
     monkeypatch.chdir(repo)
     cli.main(["checks", "--", "pytest -q"])
-    from ttp import envfault
-    ran = [ln for ln in (tmp_path / "venv-ran").read_text().splitlines()
-           if not ln.startswith("-c " + envfault._FIND)]   # not the runner precheck
+    from ttp import envfault, pushpass
+    ran = [ln for ln in (tmp_path / "venv-ran").read_text().splitlines()   # not the runner precheck
+           if not ln.startswith("-c " + envfault._FIND) and ln != " ".join(pushpass.VERSION_PROBE)]   # nor env_id's
     assert ran == ["-m pytest -q"]
     rec = json.loads((run / "checks.json").read_text())
     assert rec["passed"] is True and rec["commands"] == ["pytest -q"]   # recorded as written

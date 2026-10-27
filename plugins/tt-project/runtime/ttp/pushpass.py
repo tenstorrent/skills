@@ -99,6 +99,10 @@ def _content(path: str | Path, roots: list[str]) -> str | None:
     return _cached("text", path, roots, make)
 
 
+# How env_id asks an interpreter for its implementation and version (what the probe's argv reads as).
+VERSION_PROBE = ["-I", "-S", "-c", "import sys; print(sys.implementation.name, sys.version)"]
+
+
 def _binary(real: str) -> tuple:
     """A resolved interpreter's (content hash, implementation and version); the version is "" when it
     does not run, the hash its size and time when it cannot be read."""
@@ -112,7 +116,7 @@ def _binary(real: str) -> tuple:
         except OSError:
             digest = str(_stat(real)[2:])
         try:
-            r = subprocess.run([real, "-I", "-S", "-c", "import sys; print(sys.implementation.name, sys.version)"],
+            r = subprocess.run([real, *VERSION_PROBE],
                                capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
             version = " ".join(r.stdout.split()) if r.returncode == 0 else ""
         except (OSError, subprocess.SubprocessError):
