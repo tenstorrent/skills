@@ -8241,6 +8241,8 @@ class Daemon:
         dirs = {r["dir"] for r in self.p.db.q("SELECT dir FROM runs WHERE task=? AND dir IS NOT NULL", (tid,))}
         if not rcs or any(str(rc.parent) not in dirs for rc in rcs):
             return False, False   # not only its own runs' jobs: not ours to start
+        if rebootwait.transient_besides_jobs(str(prev.get("retry_when") or ""), (str(self.p.runs),)):
+            return False, False   # the probe also checks what the reboot ended: it wakes, never sleeps on
         todo, done, cut = [], [], False
         cap = int(self.cfg["budget"].get("max_job_relaunches", detach.RELAUNCH_CAP))
 

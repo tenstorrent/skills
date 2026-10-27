@@ -126,6 +126,26 @@ def test_a_compound_detach_probe_gets_the_model_free_relaunch(env, tmp_path):
     assert rw.transient_besides_jobs(f"ttp detach --check {a}; test -e /tmp/x") == "a path a reboot clears"
 
 
+def test_a_compound_probe_with_a_reboot_volatile_part_wakes_instead_of_relaunching(env, tmp_path):
+    p = make(env)
+    tid = p.db.add_task("soak", "s", kind="work", tier="light", origin="user")
+    rc, counter = _resumable_job_cut_by_reboot(p, tmp_path, tid)
+    _wait_on(p, tid, f"ttp detach --check {rc} && kill -0 999999")
+    _boot_daemon(p)
+    assert _woken(p, tid), dict(p.db.task(tid))
+    assert counter.read_text().split() == ["run"] and not _job_relaunches(p, tid)
+
+
+def test_a_jobs_only_compound_probe_still_relaunches(env, tmp_path):
+    p = make(env)
+    tid = p.db.add_task("soak", "s", kind="work", tier="light", origin="user")
+    rc, counter = _resumable_job_cut_by_reboot(p, tmp_path, tid)
+    _wait_on(p, tid, f"ttp detach --check {rc} && test -s {rc.parent}/rows")
+    _boot_daemon(p)
+    assert not _woken(p, tid) and len(_job_relaunches(p, tid)) == 1
+    assert _wait_for_path(rc)
+
+
 def test_a_same_boot_restart_with_no_detached_waits_changes_nothing(env, tmp_path):
     from ttp.daemon import Daemon
     p = make(env)
