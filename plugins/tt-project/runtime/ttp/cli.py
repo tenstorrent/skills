@@ -3758,6 +3758,27 @@ def cmd_killscan(a) -> None:
     sys.exit(1 if hits else 0)
 
 
+def cmd_leftover_procs(a) -> None:
+    """A hand-off check (worker.handoff_checks): exit 1 while a done hand-off's task still has live
+    processes in its own worktree (leftoverprocs.py), 0 when it has none, 2 when it cannot tell."""
+    from . import leftoverprocs
+    path = a.result or os.environ.get("TTP_RESULT_JSON") or ""
+    tid = a.task if a.task is not None else os.environ.get("TTP_TASK_ID", "")
+    if not path or not str(tid).isdigit():
+        die("usage: ttp leftover-procs <result.json> (the task from TTP_TASK_ID, or --task)")
+    p = here()
+    if p is None:
+        die("ttp leftover-procs: no project here; run it from the project root")
+    try:
+        result = leftoverprocs.load(path)
+    except (OSError, ValueError) as e:
+        die(f"ttp leftover-procs: cannot read {path}: {e}")
+    rc, msg = leftoverprocs.check(result, p.worktrees / f"t{int(tid)}")
+    if msg:
+        print(msg)
+    sys.exit(rc)
+
+
 def cmd_svcscan(a) -> None:
     """Check scripts for service unit changes (`systemctl stop|disable|mask|start|restart|...`, also
     under `sudo -n`) before running them on a shared machine. Exits 1 when one is found. `--shim <dir>`
@@ -7648,7 +7669,7 @@ COMMAND_GROUPS = (
                   "memory", "obligation", "config", "pause", "resume", "drain", "alerts", "issues", "mute",
                   "machines", "logs", "doctor")),
     ("inside a run", ("note", "notify", "progress", "checks", "lock", "detach", "devq", "push", "land", "clip", "sandbox",
-                      "skill", "killscan", "svcscan")),
+                      "skill", "killscan", "svcscan", "leftover-procs")),
     ("probes (retry_when, start_when)", ("landed", "ci", "ack-wait", "ssh-preflight", "broker-released",
                                          "deployed", "goal", "hours")),
     ("admin", ("setup", "upgrade", "start", "stop", "restart", "adopt", "prune", "secret", "consent",
@@ -8051,6 +8072,17 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--shim", metavar="DIR", help="write logging stand-ins for systemctl, service and sudo "
                                                  "into DIR (put DIR first on PATH)")
     s.set_defaults(fn=cmd_svcscan)
+
+    s = sub.add_parser("leftover-procs", help="hand-off check: exit 1 while a done task still has live processes "
+                                              "in its own worktree", description=(
+        "For worker.handoff_checks: `ttp leftover-procs {result}`. A process is the task's only when its "
+        "resolved working directory is the task's own worktree (<project>/tt-project/worktrees/t<id>) or below "
+        "it, by whole path components: t39 never claims t390, and another project's t<id> is never this "
+        "one's. A pid the hand-off lists in leftover_procs [{pid, stop, ends}] is not reported. Read-only; "
+        "Linux /proc (none found elsewhere). Exit codes: 0 none, 1 some found, 2 usage or an unreadable hand-off."))
+    s.add_argument("result", nargs="?", help="the hand-off's result.json (default: TTP_RESULT_JSON)")
+    s.add_argument("--task", type=int, help="the task id (default: TTP_TASK_ID)")
+    s.set_defaults(fn=cmd_leftover_procs)
 
     s = sub.add_parser("goal", help="stock goal checks, one JSON line per observation; exit 0 met, 1 not, "
                                     "75 could not check")

@@ -181,6 +181,12 @@ prolonged whole-box outage.
   and branch kept, and its one coordinator event names the check and its output. Any other exit or a
   timeout is a broken check: the hand-off is accepted and the coordinator gets one
   `handoff_check_broken` event per check and failure. `ttp config` reports malformed entries.
+  The plugin ships one: `{"name": "leftover-procs", "run": "ttp leftover-procs {result}"}` sends a done
+  hand-off back while a process runs in the task's own worktree (its resolved working directory is
+  `tt-project/worktrees/t<id>` of this project or below it, so another project's task with the same
+  number, or t390 for t39, never counts); a pid the hand-off lists in `leftover_procs`
+  `[{pid, stop, ends}]` is left out. A project check that matches processes itself should compare
+  the full resolved worktree path the same way, never a bare `t<id>`.
 - When delivery has a review step (`delivery.review_before_pr` or a `delivery.push_branch`), the
   daemon queues the review of each finished code task in the same step that records its hand-off
   (`review.auto`, on by default). A review whose head carries commits of another task whose latest

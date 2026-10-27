@@ -210,3 +210,110 @@ def test_hand_off_check_settings_are_validated(env):
         "worker.handoff_checks[4]: kinds must be a list of task kinds; skipped",
         "worker.handoff_check_max_sendbacks: -1 is not a whole number >= 0; 2 is used"]
     assert config_problems({"worker": {"handoff_checks": "true"}}) == ["worker.handoff_checks: not a list; ignored"]
+
+
+# `ttp leftover-procs` (leftoverprocs.py): a process is a task's only by its resolved cwd under the
+# task's own worktree, never by a bare t<id>. Synthetic temp paths and fake process lists.
+
+def _lp_roots(tmp, tid=3922):
+    """Two projects' worktrees of the same task number, and t<id> look-alikes in project A."""
+    a, b = tmp / "a" / "tt-project" / "worktrees", tmp / "b" / "tt-project" / "worktrees"
+    for d in (a / f"t{tid}" / "sub", b / f"t{tid}", a / f"t{tid}0", a / f"t{tid}-old"):
+        d.mkdir(parents=True)
+    return a / f"t{tid}", b / f"t{tid}"
+
+
+def _lp_proc(pid, cwd, cmd="python3 -m pytest -q"):
+    return {"pid": pid, "cwd": str(cwd), "cmd": cmd}
+
+
+def test_leftover_procs_never_claims_another_projects_worktree_of_the_same_task_number(tmp_path):
+    from ttp import leftoverprocs
+    mine, theirs = _lp_roots(tmp_path)
+    procs = [_lp_proc(101, theirs, f"python3 -m pytest {theirs}/tests"), _lp_proc(102, tmp_path / "b" / "tt-project")]
+    assert leftoverprocs.leftovers(mine, procs) == []
+    assert leftoverprocs.check({"status": "done"}, mine, procs) == (0, "")
+    # The other project's own run does claim it: the attribution is by root, not by number.
+    assert [x["pid"] for x in leftoverprocs.leftovers(theirs, procs)] == [101]
+
+
+def test_leftover_procs_reports_a_process_in_the_tasks_own_worktree_or_below_it(tmp_path):
+    from ttp import leftoverprocs
+    mine, theirs = _lp_roots(tmp_path)
+    link = tmp_path / "alias"
+    link.symlink_to(mine)   # a cwd reached through a symlink resolves to the worktree
+    procs = [_lp_proc(201, mine), _lp_proc(202, mine / "sub"), _lp_proc(203, link / "sub"),
+             _lp_proc(204, f"{mine}/sub (deleted)"), _lp_proc(205, theirs)]
+    assert [x["pid"] for x in leftoverprocs.leftovers(mine, procs)] == [201, 202, 203, 204]
+    rc, msg = leftoverprocs.check({"status": "done"}, mine, procs)
+    assert rc == 1 and all(f"pid {n} " in msg for n in (201, 202, 203, 204)) and "pid 205 " not in msg
+    # Listed on purpose with how and when it stops: not reported; listed without both: still reported.
+    held = {"status": "done", "leftover_procs": [{"pid": 201, "stop": "kill 201", "ends": "07:00 PDT"},
+                                                 {"pid": 202, "stop": "kill 202"}, {"pid": "x", "stop": 1, "ends": 1}]}
+    rc, msg = leftoverprocs.check(held, mine, procs)
+    assert rc == 1 and "pid 201 " not in msg and "pid 202 " in msg
+    # Only a done hand-off is checked.
+    assert leftoverprocs.check({"status": "failed"}, mine, procs) == (0, "")
+
+
+def test_leftover_procs_compares_whole_path_components_so_t39_never_claims_t390_or_t3922(tmp_path):
+    from ttp import leftoverprocs
+    root = tmp_path / "a" / "tt-project" / "worktrees"
+    for n in ("t39", "t390", "t3922", "t39-old", "t39.bak"):
+        (root / n).mkdir(parents=True)
+    procs = [_lp_proc(i, root / n) for i, n in enumerate(("t390", "t3922", "t39-old", "t39.bak"), 300)]
+    procs += [_lp_proc(310, "t39"), _lp_proc(311, ""), _lp_proc(312, f"{root}/t39x/../t390")]
+    assert leftoverprocs.leftovers(root / "t39", procs) == []
+    assert [x["pid"] for x in leftoverprocs.leftovers(root / "t39", procs + [_lp_proc(320, root / "t39")])] == [320]
+
+
+def test_ttp_leftover_procs_uses_the_task_worktree_of_the_project_it_runs_in(env, monkeypatch, capsys):
+    from ttp import leftoverprocs
+    p = make(env)
+    other = env["tmp"] / "other" / "tt-project" / "worktrees" / "t7"
+    other.mkdir(parents=True)
+    (p.worktrees / "t7").mkdir(parents=True, exist_ok=True)
+    res = env["tmp"] / "lp-result.json"
+    res.write_text(json.dumps({"status": "done", "summary": "ok"}))
+    monkeypatch.chdir(p.root)
+    monkeypatch.setenv("TTP_TASK_ID", "7")
+    monkeypatch.setattr(leftoverprocs, "listing", lambda: [_lp_proc(401, other)])
+    assert _ttp("leftover-procs", str(res)) == 0
+    monkeypatch.setattr(leftoverprocs, "listing", lambda: [_lp_proc(401, other), _lp_proc(402, p.worktrees / "t7")])
+    capsys.readouterr()
+    assert _ttp("leftover-procs", str(res)) == 1
+    out = capsys.readouterr().out
+    assert "pid 402 " in out and "pid 401 " not in out
+    assert _ttp("leftover-procs", str(res), "--task", "70") == 0
+    assert _ttp("leftover-procs", str(env["tmp"] / "missing.json")) == 2
+
+
+def test_leftover_procs_as_a_hand_off_check_sends_back_only_for_a_live_process_in_its_own_worktree(env):
+    p = make(env)
+    tid = _hc_task(p)
+    wt = p.worktrees / f"t{tid}"
+    wt.mkdir(parents=True, exist_ok=True)
+    twin = env["tmp"] / "twin" / "tt-project" / "worktrees" / f"t{tid}"   # another project, same number
+    twin.mkdir(parents=True)
+    launcher = env["tmp"] / "lp_ttp.py"
+    launcher.write_text(f"import sys\nsys.path.insert(0, {str(RUNTIME)!r})\nfrom ttp import cli\ncli.main()\n")
+    cmd = f"{shlex.quote(sys.executable)} {shlex.quote(str(launcher))} leftover-procs {{result}}"
+    cfg = json.loads(p.config_path.read_text())
+    cfg["worker"] = {"handoff_checks": [{"name": "leftover-procs", "run": cmd}]}
+    p.config_path.write_text(json.dumps(cfg))
+    stray = subprocess.Popen(["sleep", "60"], cwd=twin)
+    try:
+        (wt / "sub").mkdir()
+        own = subprocess.Popen(["sleep", "60"], cwd=wt / "sub")
+        try:
+            t = _hc_hand_off(env, p, tid, _GOOD)
+            woke = json.loads(t["result"])["woke"]
+            assert t["status"] == "queued" and f"pid {own.pid} " in woke and f"pid {stray.pid} " not in woke
+        finally:
+            own.kill()
+            own.wait()
+        t = _hc_hand_off(env, p, tid, _GOOD)   # only the other project's process is left
+        assert t["status"] == "done" and _hc_replies(p) == ["It is up (checked)."]
+    finally:
+        stray.kill()
+        stray.wait()
