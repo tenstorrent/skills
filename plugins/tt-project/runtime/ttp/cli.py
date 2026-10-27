@@ -2213,13 +2213,47 @@ def _recorded_pass(p: Project | None, tree: str, cmds: list, purpose: str = "can
     return None
 
 
+def _env_miss(p: Project | None, tree: str, cmds: list, parts: list[dict], purpose: str = "candidate") -> str:
+    """When _recorded_pass found no pass of `cmds` on `tree` under their environment (`parts`:
+    pushpass.check_env_parts) but one under another: which run recorded it and the parts of the
+    environment it differs in; else ""."""
+    if not p or not tree:
+        return ""
+    try:
+        passes = json.loads((p.state / CHECK_PASSES).read_text()).get("passes")
+    except (OSError, ValueError, AttributeError):
+        return ""
+    from . import pushpass
+    key, new = _commands_hash(cmds), [pushpass.part_digests(x) for x in parts]
+    for e in reversed(passes if isinstance(passes, list) else []):
+        if isinstance(e, dict) and e.get("tree") == tree and e.get("purpose", "candidate") == purpose and (
+                e.get("commands") == key or key in (e.get("prefixes") or ())) and isinstance(e.get("env_parts"), list):
+            why = sorted({part for old, now in zip(e["env_parts"], new)
+                          for part in pushpass.differs(old, now).split(", ") if part})
+            if why:
+                return f"the pass `ttp checks` recorded in run {e.get('run') or '?'} on this tree ran in another " \
+                       f"environment: {', '.join(why)} differ"
+    return ""
+
+
+def _check_envs(top: str | Path, cmds: list, run_env: dict) -> tuple[list[str] | None, list[dict] | None]:
+    """(pushpass.check_envs, their pushpass.check_env_parts) of `cmds`, or (None, None) without `run_env`."""
+    if not run_env:
+        return None, None
+    from . import pushpass
+    parts = pushpass.check_env_parts(Path(top), cmds, run_env)
+    return [pushpass.digest(x) for x in parts], parts
+
+
 def _record_pass(p: Project | None, tree: str, cmds: list, purpose: str = "candidate", run_dir: str | Path = "",
-                 envs: list[str] | None = None) -> None:
-    """Only passes are recorded, with `envs` (pushpass.check_envs) when given. A failed write is said
+                 envs: list[str] | None = None, parts: list[dict] | None = None) -> None:
+    """Only passes are recorded, with `envs` (pushpass.check_envs) when given, and the part_digests of
+    their `parts` (pushpass.check_env_parts) to say what differs on a miss. A failed write is said
     and never fails the checks."""
     if not p or not tree:
         return
     import fcntl
+    from . import pushpass
     path = p.state / CHECK_PASSES
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -2235,6 +2269,8 @@ def _record_pass(p: Project | None, tree: str, cmds: list, purpose: str = "candi
                            "run": os.environ.get("TTP_RUN_ID") or "?", "ts": time.time(),
                            **({"log": str(Path(run_dir) / "checks.log")} if run_dir else {}),
                            **({"envs": list(envs)} if envs is not None and len(envs) == len(cmds) else {}),
+                           **({"env_parts": [pushpass.part_digests(x) for x in parts]}
+                              if parts is not None and len(parts) == len(cmds) else {}),
                            **({"purpose": purpose} if purpose != "candidate" else {})})
             write_json(path, {"passes": passes[-CHECK_PASSES_MAX:]})
     except OSError as e:
@@ -2816,7 +2852,7 @@ def cmd_checks(a) -> None:
     if fast_cmds:   # a reduced pass verifies nothing: no marker, and only the extras are recorded
         extras = [c for c in todo if str(c) not in set(map(str, fast_cmds))]
         if extras:
-            _record_pass(p, tree, extras, purpose, run_dir, pushpass.check_envs(Path(top), extras, run_env) if run_env else None)
+            _record_pass(p, tree, extras, purpose, run_dir, *_check_envs(top, extras, run_env))
         if slot:
             slot.close()
         print(f"ttp checks: FAST-PATH pass on {head[:12]} (whitespace and CRLF checks"
@@ -2830,7 +2866,7 @@ def cmd_checks(a) -> None:
         print(said)
         return
     if todo:
-        _record_pass(p, tree, todo, purpose, run_dir, pushpass.check_envs(Path(top), todo, run_env) if run_env else None)
+        _record_pass(p, tree, todo, purpose, run_dir, *_check_envs(top, todo, run_env))
     # Released only once the pass is recorded: a waiter for the same checks finds it the moment it may run.
     if slot:
         slot.close()

@@ -3150,12 +3150,14 @@ def published(repo: Path, remote: str, target_branch: str) -> str:
     return ""
 
 
-def _reused(repo: Path, head: str, todo: list, run_dir: str | None, reuse: Callable[[str, list, list], str]) -> str:
+def _reused(repo: Path, head: str, todo: list, run_dir: str | None, reuse: Callable[[str, list, list, list], str]) -> str:
     """What `reuse` says of a recorded pass of `todo` on `head`'s tree under the environment they
-    would run in here, or "" (none, or it could not be told)."""
+    would run in here (pushpass.check_envs, and the check_env_parts they hash), or "" (none, or it
+    could not be told)."""
     tree = _git(repo, "rev-parse", f"{head}^{{tree}}").stdout.strip()
     try:
-        return reuse(tree, todo, pushpass.check_envs(repo, todo, check_env("own", "", run_dir))) if tree else ""
+        parts = pushpass.check_env_parts(repo, todo, check_env("own", "", run_dir)) if tree else []
+        return reuse(tree, todo, [pushpass.digest(x) for x in parts], parts) if tree else ""
     except (OSError, ValueError):
         return ""
 
@@ -3176,8 +3178,9 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
     When every check is skipped on HEAD, the extra commands `recorded` (recorded_checks) passing on
     exactly HEAD run instead, and must pass again (or be reused); with none, nothing checked it and it is refused,
     unless every check was skipped by its `if_changed` scope (`outside_scope`, compared with `base`).
-    `reuse(tree, commands, envs)` names a pass `ttp checks` recorded of exactly those commands on HEAD's
-    tree under the same environment (pushpass.check_envs), or gives "": with one, nothing runs again.
+    `reuse(tree, commands, envs, parts)` names a pass `ttp checks` recorded of exactly those commands on
+    HEAD's tree under the same environment (pushpass.check_envs, hashing the check_env_parts `parts`),
+    or gives "": with one, nothing runs again.
     `host` (delivery.checks_host) is where those recorded commands run, as the project's checks do.
     `lease` (own_lease: a rebase of `branch`) replaces the remote branch instead of fast-forwarding it.
     It is refused when the remote tip has a commit HEAD lacks (by patch) beyond `start`, the tip the
@@ -3589,10 +3592,13 @@ def in_check_scratch(p: Project, fn: Callable[[], int], what: str = "ttp push") 
             checkdirs.finish(output)
 
 
-def _own_pass(p: Project, tree: str, cmds: list, envs: list) -> str:
+def _own_pass(p: Project, tree: str, cmds: list, envs: list, parts: list | None = None) -> str:
     """Where and when `ttp checks` recorded passing exactly `cmds` (or more starting with them) on
-    `tree` under `envs`, for `ttp push --own` to reuse, or ""."""
+    `tree` under `envs`, for `ttp push --own` to reuse, or "". With none but one under another
+    environment, says which of `parts` (pushpass.check_env_parts) it differs in."""
     hit = cli._recorded_pass(p, tree, cmds, "candidate", envs)
+    if not hit and parts and (why := cli._env_miss(p, tree, cmds, parts)):
+        print(f"ttp push: not reusing a pass: {why}", file=sys.stderr)
     return f"`ttp checks` recorded in run {hit.get('run') or '?'} at {timefmt.long(float(hit.get('ts') or 0), p)}" \
         if hit else ""
 
@@ -3646,7 +3652,7 @@ def _run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None
                      timed=lambda s: record_check_s(p, s), base=base,
                      ff_only=own_ff_only(branch) and not lease, lease=lease, start=start, start_ref=start_ref,
                      recorded=recorded or recorded_checks(os.environ.get("TTP_RUN_DIR")), check_run_dir=output,
-                     reuse=lambda tree, cmds, envs: _own_pass(p, tree, cmds, envs), host=d.get("checks_host") or "",
+                     reuse=lambda tree, cmds, envs, parts: _own_pass(p, tree, cmds, envs, parts), host=d.get("checks_host") or "",
                      never_force=never_force_on(p.config()))
     else:
         rc = push(repo, remote, branch, checks, rounds, hold=lambda: take(p, remote, branch, wait_s),

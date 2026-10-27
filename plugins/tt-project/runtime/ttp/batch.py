@@ -1123,15 +1123,18 @@ class Batch:
         env = push.check_env("target", self.tip, self.check_run_dir)
         tree, run = pushpass.tree_of(self.wt, head), []
         for cmd in todo:
-            eid = pushpass.env_id(self.wt, cmd, env, self.tip or "")
+            parts = pushpass.env_parts(self.wt, cmd, env, self.tip or "")
+            eid = pushpass.digest(parts)
             if hit := pushpass.passed(self.p, tree, str(cmd), eid):
                 say(f"reused pass from {hit.get('batch') or '?'} (tree {tree[:10]}): {cmd}")
                 self.checks["reused"] = self.checks.get("reused", 0) + 1
             else:
-                run.append((cmd, eid))
+                if why := pushpass.missed(self.p, tree, str(cmd), parts):
+                    say(f"not reusing a pass: {why}: {cmd}")
+                run.append((cmd, eid, parts))
         if not run:
             return None
-        self._runners([c for c, _ in run], env)
+        self._runners([c for c, _, _ in run], env)
         suite_out: list[str] = []
         slot = push.check_slot(head, say, checkcap.label(self.p.name, f"push batch {self.id}"),
                                priority=push.priority_key(self.repo, self.remote, self.branch), proj=self.p)
@@ -1140,9 +1143,9 @@ class Batch:
         if slow:
             slow.unlink(missing_ok=True)   # this head's run only
         try:
-            for line in push.sandbox_lines([cmd for cmd, _ in run]):
+            for line in push.sandbox_lines([cmd for cmd, _, _ in run]):
                 say(line)
-            for cmd, eid in run:
+            for cmd, eid, parts in run:
                 resume = pushpass.resume_file(self.p, tree, str(cmd), eid) if tree and pushpass.resumable(str(cmd)) else None
                 extra = pushpass.resume_env(resume, env) if resume else {}
                 if slow and pushpass.resumable(str(cmd)) and not push.remote_host(cmd):
@@ -1166,7 +1169,7 @@ class Batch:
                             resume.unlink(missing_ok=True)
                         continue
                     return cmd, tail
-                if why := pushpass.record(self.p, tree, str(cmd), eid, self.id):
+                if why := pushpass.record(self.p, tree, str(cmd), eid, self.id, parts):
                     say(f"could not record the pass of {cmd}: {why}")
                 if resume:
                     resume.unlink(missing_ok=True)

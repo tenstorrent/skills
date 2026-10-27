@@ -12603,3 +12603,133 @@ def test_the_code_prompt_says_to_name_a_change_published_in_another_repo():
     text = " ".join((RUNTIME.parent / "template" / "prompts" / "kind-code.md").read_text().split())
     assert 'hand off `"published": {"repo": "<owner/name or URL>", "branch": "...", "head": "<sha>"}`' in text
     assert "so the daemon reviews it" in text
+
+
+def _interp(path, version):
+    """A stand-in interpreter that prints `version` as `sys.implementation.name, sys.version` would."""
+    path.write_text(f"#!/bin/sh\necho cpython {version}\n")
+    path.chmod(0o755)
+    return path
+
+
+def _wt_venv(wt, py, packages=("foo-1.0",)):
+    """A venv of its own in worktree `wt`, its python linked to `py`, with `packages` installed and the
+    worktree's own package installed editable (its source path is the worktree's)."""
+    venv = wt / ".venv"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python").symlink_to(py)
+    (venv / "bin" / "pytest").write_text("")
+    (venv / "pyvenv.cfg").write_text(f"home = {py.parent}\nprompt = {wt.name}\ncommand = python3 -m venv {venv}\n")
+    site = venv / "lib" / "python3" / "site-packages"
+    for name in packages:
+        (site / f"{name}.dist-info").mkdir(parents=True)
+        (site / f"{name}.dist-info" / "RECORD").write_text(f"{name}/__init__.py,sha256=abc,1\n")
+    (site / "proj-0.1.dist-info").mkdir(parents=True)
+    (site / "proj-0.1.dist-info" / "METADATA").write_text("Name: proj\nVersion: 0.1\n")
+    (site / "proj-0.1.dist-info" / "RECORD").write_text(f"__editable__.proj-0.1.pth,sha256={wt.name},9\n")
+    (site / "proj-0.1.dist-info" / "direct_url.json").write_text(
+        json.dumps({"url": f"file://{wt}", "dir_info": {"editable": True}}))
+    (site / "__editable__.proj-0.1.pth").write_text(f"{wt}/src\n")
+    return site
+
+
+def _two_worktrees(env, monkeypatch, py1, py2=None):
+    """Two worktrees of the project's HEAD, nested below a folder with a conftest.py (so their pytest
+    runs name the worktree), each with its own venv."""
+    from ttp import pushpass
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["pytest -q"])
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    outer = env["tmp"] / "outer"
+    outer.mkdir()
+    (outer / "conftest.py").write_text("")
+    wts = []
+    for name, py in (("t1", py1), ("t2", py2 or py1)):
+        _git_out(repo, "worktree", "add", "-q", "--detach", str(outer / name), "HEAD")
+        _wt_venv(outer / name, py)
+        wts.append(outer / name)
+    return p, wts, pushpass.tree_of(repo, "HEAD"), dict(os.environ)
+
+
+def test_a_push_check_pass_serves_another_worktree_of_the_tree_with_its_own_venv(env, monkeypatch):
+    """A pass recorded in one worktree is reused in another of the same tree whose own venv runs the
+    same interpreter with the same packages: where the worktree and its venv live is not the
+    environment (the venv python and --rootdir in the command, the editable install's source)."""
+    from ttp import push, pushpass
+    py = _interp(env["tmp"] / "python3.12", "3.12.1")
+    p, (wt1, wt2), tree, cenv = _two_worktrees(env, monkeypatch, py)
+    eid = pushpass.env_id(wt1, "pytest -q", cenv, "tip")
+    assert str(wt1) in " ".join(push.check_argv("pytest -q", wt1, cenv, isolate=False)), "the run names its worktree"
+    assert pushpass.record(p, tree, "pytest -q", eid, "b1") == ""
+    hit = pushpass.passed(p, tree, "pytest -q", pushpass.env_id(wt2, "pytest -q", cenv, "tip"))
+    assert hit and hit["batch"] == "b1", "the other worktree reuses the pass"
+    assert pushpass.check_envs(wt1, ["pytest -q"], cenv) == pushpass.check_envs(wt2, ["pytest -q"], cenv)
+
+
+def test_a_push_check_pass_misses_another_interpreter_or_packages_and_says_which_part(env, monkeypatch, capsys):
+    """Another interpreter version or binary, or another set of installed packages (one more, one
+    changed in place, an editable install from elsewhere), is another environment; the miss names
+    the part of it that differs, for the push queue and for `ttp push --own` reusing `ttp checks`."""
+    from ttp import cli, push, pushpass
+    py1, py2 = _interp(env["tmp"] / "python3.12", "3.12.1"), _interp(env["tmp"] / "python3.13", "3.13.0")
+    p, (wt1, wt2), tree, cenv = _two_worktrees(env, monkeypatch, py1, py2)
+    parts1 = pushpass.env_parts(wt1, "pytest -q", cenv, "tip")
+    assert pushpass.record(p, tree, "pytest -q", pushpass.digest(parts1), "b1", parts1) == ""
+
+    def miss(wt):
+        parts = pushpass.env_parts(wt, "pytest -q", cenv, "tip")
+        assert pushpass.passed(p, tree, "pytest -q", pushpass.digest(parts)) is None
+        return pushpass.missed(p, tree, "pytest -q", parts)
+
+    assert miss(wt2) == "the pass from b1 on this tree ran in another environment: interpreter, version differ"
+    # The same version from another binary (a rebuild) still misses, on the binary alone.
+    (wt2 / ".venv" / "bin" / "python").unlink()
+    rebuilt = _interp(env["tmp"] / "python3.12b", "3.12.1")
+    rebuilt.write_text(rebuilt.read_text() + "# rebuilt\n")
+    (wt2 / ".venv" / "bin" / "python").symlink_to(rebuilt)
+    assert miss(wt2).endswith(": interpreter differ")
+    (wt2 / ".venv" / "bin" / "python").unlink()
+    (wt2 / ".venv" / "bin" / "python").symlink_to(py1)
+    assert pushpass.passed(p, tree, "pytest -q", pushpass.env_id(wt2, "pytest -q", cenv, "tip")), "same again"
+    site = wt2 / ".venv" / "lib" / "python3" / "site-packages"
+    (site / "bar-2.0.dist-info").mkdir()
+    assert miss(wt2).endswith(": deps differ"), "one more package"
+    shutil.rmtree(site / "bar-2.0.dist-info")
+    (site / "foo-1.0.dist-info" / "RECORD").write_text("foo-1.0/__init__.py,sha256=other,1\n")
+    assert miss(wt2).endswith(": deps differ"), "a package reinstalled with other files"
+    (site / "foo-1.0.dist-info" / "RECORD").write_text("foo-1.0/__init__.py,sha256=abc,1\n")
+    (site / "__editable__.proj-0.1.pth").write_text(f"{wt1}/src\n")
+    assert miss(wt2).endswith(": deps differ"), "the editable install points at another worktree's code"
+    (site / "__editable__.proj-0.1.pth").write_text(f"{wt2}/src\n")
+    assert pushpass.passed(p, tree, "pytest -q", pushpass.env_id(wt2, "pytest -q", cenv, "tip")), "restored: a hit"
+    # `ttp checks` passes: `ttp push --own` names the part too.
+    cmds = ["pytest -q"]
+    envs1, cparts1 = cli._check_envs(wt1, cmds, cenv)
+    cli._record_pass(p, tree, cmds, "candidate", "", envs1, cparts1)
+    monkeypatch.setenv("PYTEST_ADDOPTS", "-x")
+    envs2, cparts2 = cli._check_envs(wt2, cmds, {**cenv, "PYTEST_ADDOPTS": "-x"})
+    assert cli._recorded_pass(p, tree, cmds, "candidate", envs2) is None
+    assert push._own_pass(p, tree, cmds, envs2, cparts2) == ""
+    assert "on this tree ran in another environment: vars differ" in capsys.readouterr().err
+    assert cli._recorded_pass(p, tree, cmds, "candidate", cli._check_envs(wt2, cmds, cenv)[0]), "same env: a hit"
+
+
+def test_push_check_passes_recorded_before_env_parts_just_miss(env, monkeypatch):
+    """A pass keyed the old way, or with parts that are not what this runtime writes, misses once and
+    never breaks the miss line."""
+    from ttp import cli, pushpass
+    py = _interp(env["tmp"] / "python3.12", "3.12.1")
+    p, (wt1, wt2), tree, cenv = _two_worktrees(env, monkeypatch, py)
+    for odd in ({}, {"parts": "x"}, {"parts": ["a"]}, {"parts": {"argv": 1}}):
+        (p.state / pushpass.STORE).write_text(json.dumps({"passes": [
+            {"key": "old", "tree": tree, "cmd": "pytest -q", "batch": "b0", "ts": time.time(), **odd}]}))
+        parts = pushpass.env_parts(wt2, "pytest -q", cenv, "tip")
+        assert pushpass.passed(p, tree, "pytest -q", pushpass.digest(parts)) is None
+        why = pushpass.missed(p, tree, "pytest -q", parts)
+        kept = isinstance(odd.get("parts"), dict) and odd["parts"]
+        assert why.startswith("the pass from b0 on this tree ran in another environment: ") if kept else why == "", why
+    for odd in ("x", ["x"], [{"argv": 1}], None):
+        (p.state / cli.CHECK_PASSES).write_text(json.dumps({"passes": [
+            {"tree": tree, "commands": cli._commands_hash(["pytest -q"]), "envs": ["old"], "env_parts": odd}]}))
+        envs, parts = cli._check_envs(wt2, ["pytest -q"], cenv)
+        assert cli._recorded_pass(p, tree, ["pytest -q"], "candidate", envs) is None
+        assert isinstance(cli._env_miss(p, tree, ["pytest -q"], parts), str)

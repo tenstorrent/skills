@@ -1074,10 +1074,12 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   are skipped whole, never single tests, and pytest-xdist runs never resume. The batch never reads
   the passes `ttp checks` records. `ttp push --own` does: a pass `ttp checks` recorded on exactly
   HEAD's tree, of the same commands (or more that start with them) in the same environment (the
-  interpreter and venv each uses, the active venv, and `PYTHONPATH`, `PYTEST_ADDOPTS`,
-  `PYTEST_PLUGINS` and `PYTEST_DISABLE_PLUGIN_AUTOLOAD`), is reused and logged as
-  `reused the pass of <n> check(s) ...`; any difference, or a pass recorded without its
-  environment, runs them again. Only the task's own branch is pushed that way: the push branch
+  interpreter and venv each uses, told by the binary's content, its version and the installed
+  packages, not by where they live, so another worktree of the tree reuses it; the active venv; and
+  `PYTHONPATH`, `PYTEST_ADDOPTS`, `PYTEST_PLUGINS` and `PYTEST_DISABLE_PLUGIN_AUTOLOAD`), is reused
+  and logged as `reused the pass of <n> check(s) ...`; any difference, or a pass recorded without its
+  environment, runs them again, and the push names the part that differed (`not reusing a pass:
+  ... interpreter, version differ`). The push queue keys its own passes the same way. Only the task's own branch is pushed that way: the push branch
   always gets its own checks. Records live under the project's state
   (`push_check_passes.json`, newest 200 within 14 days; `push_check_resume/`, newest 20 within 3 days).
 - `delivery.backup_remote` (off by default) names a git remote that each finished code task's
