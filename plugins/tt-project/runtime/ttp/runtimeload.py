@@ -20,8 +20,9 @@ runtime outside the harness checkout). Whether a run's changes loaded is then ex
 the run's end commit against that tree (unloaded), with the file times (stale) only when no tree was
 recorded. A runtime/ that moves on any other way (ttp upgrade, a commit by hand, a merge, a reset) is
 caught on a tick (tree_moved): the daemon asks itself to restart through the same RESTART_REQUEST,
-once per tree, and only while no restart is asked or taken, no run waits for one (PENDING_KEY) and no
-push batch is mid-flight. Known gap: a commit landing between the daemon's import (LOADED_AT) and its
+once per tree, and only while no restart is asked or taken, no run waits for one (PENDING_KEY), no
+push batch is mid-flight, no run works in the harness checkout (its end restarts, check) and no
+`ttp upgrade` holds the harness-upgrade lock (it restarts the daemon itself). Known gap: a commit landing between the daemon's import (LOADED_AT) and its
 record, seconds at start, is recorded as loaded."""
 from __future__ import annotations
 
@@ -197,6 +198,17 @@ def _busy(p: Project) -> str:
         return "a run's hand-off waits for its own restart"
     if p.db.one("SELECT id FROM push_batches WHERE finalized IS NULL LIMIT 1"):
         return "a push batch is mid-flight"
+    for r in p.db.q("SELECT id, note FROM runs WHERE status='running' AND note LIKE '%harness_head%'"):
+        try:
+            note = json.loads(r["note"] or "{}")
+        except ValueError:
+            continue
+        if isinstance(note, dict) and note.get("harness_head"):
+            # check() restarts for it at its end; until then its runtime is half-done
+            return f"run {r['id']} still works in the harness checkout"
+    from . import release
+    if release._taken(release.upgrade_lock(p)):   # `ttp upgrade` restarts the daemon itself
+        return "a harness upgrade is in flight"
     return ""
 
 

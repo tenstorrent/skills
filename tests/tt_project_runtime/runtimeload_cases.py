@@ -256,6 +256,35 @@ def test_a_moved_runtime_tree_restarts_the_daemon_once_and_waits_while_a_handoff
     assert not req.exists()
 
 
+def test_a_moved_runtime_tree_waits_while_a_harness_run_works_there_or_an_upgrade_runs(env, monkeypatch):
+    from ttp import locks, release, service
+    p = make(env)
+    d = _rl_harness_daemon(p, monkeypatch)
+    req = p.state / service.RESTART_REQUEST
+    tid = _harness_task(p, "fix a runtime module")
+    start = _hgit(p.harness, "rev-parse", "HEAD").strip()
+    rid = _rl_run(p, tid, start)
+    _commit_in_harness_tree(p.harness, "runtime/ttp/ext_mid.py", "X = 1\n", "a mid-run commit")
+    d._restart_on_moved_runtime()
+    assert not req.exists() and d._tree_asked is None  # the run still works there: its end restarts
+    assert "still works in the harness checkout" in d._tree_wait
+    p.db.x("UPDATE runs SET status='done' WHERE id=?", (rid,))
+    d._restart_on_moved_runtime()
+    assert req.exists()                                # finished: the next tick asks
+    req.unlink()
+    # `ttp upgrade` holds the harness-upgrade lock while it moves main and restarts the daemon itself.
+    held = locks.try_take([release.upgrade_lock(p)], "ttp upgrade", "exclusive")
+    try:
+        _commit_in_harness_tree(p.harness, "runtime/ttp/ext_mid.py", "X = 2\n", "ttp upgrade")
+        d._restart_on_moved_runtime()
+        d._restart_on_moved_runtime()
+        assert not req.exists() and d._tree_wait == "a harness upgrade is in flight"
+    finally:
+        held.close()
+    d._restart_on_moved_runtime()
+    assert req.exists()                                # released: the next tick asks
+
+
 def test_whether_a_runs_runtime_change_loaded_is_decided_by_the_recorded_tree_not_file_times(env):
     from ttp import runtimeload, service
     from ttp.daemon import Daemon
