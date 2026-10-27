@@ -9042,6 +9042,62 @@ def test_ttp_task_set_when_start_after_works_on_a_waiting_or_blocked_task(env, c
     assert p.db.task(blocked)["not_before"] is None and p.db.task(blocked)["status"] == "blocked"
 
 
+def _deferred_waiting_task(p, start_after):
+    """A waiting task whose retry_when (`true`) passes at once, its retry timer an hour off, with
+    `ttp task set-when --start-after <start_after>` applied."""
+    from ttp import cli
+    tid = _due_waiting_task(p, "true")
+    p.db.update_task(tid, not_before=time.time() + 3600)
+    cli.set_when(p.db, tid, None, p, start_after=start_after)
+    return tid
+
+
+def test_a_passed_retry_when_waits_for_a_future_start_after(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    tid = _deferred_waiting_task(p, "2h")
+    after = p.db.task(tid)["not_before"]
+    assert after > time.time() + 7000
+    d = dmod.Daemon(p.base)
+    for _ in range(2):   # a second pass changes nothing either
+        _settle_probe(d, tid)
+        assert d._probe_rc[tid][0] == 0 and not _ready(p, tid), "the deferral wins over the passed probe"
+        task = p.db.task(tid)
+        assert task["not_before"] == after and "woke" not in json.loads(task["result"]), task
+    # Its start_after comes: the pass is acted on then.
+    labels = [lb if not lb.startswith("start_after:") else f"start_after:{time.time() - 1:.0f}"
+              for lb in json.loads(p.db.task(tid)["labels"])]
+    p.db.update_task(tid, labels=json.dumps(labels), not_before=time.time() - 1)
+    _settle_probe(d, tid)
+    assert _ready(p, tid) and "woke" in json.loads(p.db.task(tid)["result"])
+
+
+@pytest.mark.parametrize("clear", ["now", ""])
+def test_a_cleared_start_after_lets_a_passed_retry_when_start_the_task(env, monkeypatch, clear):
+    p = make(env)
+    from ttp import cli
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    tid = _deferred_waiting_task(p, "2h")
+    p.db.update_task(tid, not_before=time.time() + 3600)   # back on a plain retry timer, an hour off
+    cli.set_when(p.db, tid, None, p, start_after=clear)
+    p.db.update_task(tid, not_before=time.time() + 3600)
+    _settle_probe(dmod.Daemon(p.base), tid)
+    assert _ready(p, tid) and "woke" in json.loads(p.db.task(tid)["result"])
+
+
+def test_a_past_start_after_adds_no_delay_to_a_passed_retry_when(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    tid = _due_waiting_task(p, "true")
+    p.db.update_task(tid, not_before=time.time() + 3600,
+                     labels=json.dumps([f"start_after:{time.time() - 60:.0f}", f"deferred_since:{time.time() - 600:.0f}"]))
+    _settle_probe(dmod.Daemon(p.base), tid)
+    assert _ready(p, tid) and "woke" in json.loads(p.db.task(tid)["result"])
+
+
 @pytest.mark.parametrize("status", ["running", "done", "cancelled"])
 def test_ttp_task_set_when_start_after_refuses_a_started_or_finished_task(env, capsys, status):
     p = make(env)

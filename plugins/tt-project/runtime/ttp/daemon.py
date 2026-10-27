@@ -8696,7 +8696,14 @@ class Daemon:
         that failed or were killed wake the task at once at its own tier with their output's tail.
         Anything unclear wakes it as any passed probe does. A hand-off that also names an on_pass_cmd
         runs that command first (_start_on_pass): its on_pass counts only once the command exits 0.
-        `why` is what passed (a freed exclusive slot, for _slot_reservations)."""
+        `why` is what passed (a freed exclusive slot, for _slot_reservations). An explicit start_after
+        still ahead wins: the task sleeps until then, and the pass is acted on once it is over
+        (_hold_waiting, with a fresh answer)."""
+        after = deferral(task).get("after")
+        if after and after > now:
+            if (task["not_before"] or 0) < after:
+                self.p.db.update_task(task["id"], not_before=after)
+            return
         try:
             got = self._checks_wait(task)
         except Exception as e:   # a wake is always safe; a broken check must not keep the task asleep
