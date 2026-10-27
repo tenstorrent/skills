@@ -30,6 +30,21 @@ def _queue_len(p, res):
     return len(locks.queued(shared.locks_dir(p, res, p.config()), res))
 
 
+def _stderr_until(proc, text, timeout=60):
+    """The lines proc wrote to stderr up to the first one holding text (all of it if it ended first)."""
+    got: list[str] = []
+
+    def _read():
+        for line in iter(proc.stderr.readline, ""):
+            got.append(line)
+            if text in line:
+                return
+    t = threading.Thread(target=_read, daemon=True)
+    t.start()
+    t.join(timeout)
+    return "".join(got)
+
+
 def _ended(procs, timeout=60):
     out = []
     for x in procs:
@@ -517,11 +532,13 @@ def test_a_waiting_ttp_lock_asks_the_pre_grant_check_again_when_it_takes_the_loc
     try:
         assert _until_true(lambda: marks.exists() and "start holder" in marks.read_text()), holder.stderr.read()
         waiter = _lock(env7, "rig", cmd=("touch", str(ran)))
-        assert _until_true(lambda: _queue_len(p, "rig") == 1), waiter.stderr.read()
+        # Its first take has failed (it says it waits): a take on the first try reuses its fresh answer.
+        seen = _stderr_until(waiter, "ttp lock: waiting for rig")
+        assert "waiting for rig" in seen, seen
         verdict.write_text("75")   # the project's repair hold begins while the waiter is queued
         go.touch()
         rc = _ended([holder, waiter])
-        err = waiter.stderr.read()
+        err = seen + waiter.stderr.read()
         assert rc == [0, 75] and not ran.exists(), (rc, err)
         assert "held by the project's pre-grant check (exit 75)" in err and "`ttp lock --probe rig --task 7`" in err, err
         assert _queue_len(p, "rig") == 0
