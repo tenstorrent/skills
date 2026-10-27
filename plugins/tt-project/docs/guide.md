@@ -496,6 +496,36 @@ project overrides any entry, for example `ttp config <name> providers.claude.tie
 A task's own model or effort pin wins over its tier. A failed light try is retried at standard,
 on the standard model.
 
+### OpenAI-compatible endpoints (the `chat` provider)
+
+The `chat` provider runs Claude Code workers against any endpoint that speaks the OpenAI Chat
+Completions API. It is off until a project configures it and routes work to it. Each run gets
+its own bridge inside the run's supervisor, on 127.0.0.1 and a free port: it turns Claude Code's
+Messages calls into `<base url>/chat/completions` calls and back, and ends with the run.
+
+1. Save the key once per machine, in a terminal: `ttp secret endpoint <alias> --url <base url>`
+   (the base URL ends before `/chat/completions`, for example `https://<host>/v1`).
+2. Configure the provider (placeholders shown):
+
+   ```json
+   "providers": {"chat": {"endpoint": "<alias>", "base_url": "<base url>", "max_tokens": 8192,
+                          "tiers": {"light": {"model": "<model id>"},
+                                    "standard": {"model": "<model id>", "max_tokens": 16384}}}}
+   ```
+
+   `base_url` must match the URL saved with the key: the key goes nowhere else. `max_tokens`
+   caps each call's output (per tier or for the provider; 0 or unset: the request's own).
+3. Route work to it per task, as to any provider (the task's `provider` is `chat`); keep the core provider,
+   which runs the coordinator, on Claude, Codex or Cursor. Provider failover moves held `chat`
+   work to the core provider as usual.
+
+The key stays in the per-user secrets store and the bridge's upstream requests: the agent gets
+only the bridge's address and a per-run token. Reasoning text from the endpoint is dropped,
+tool calls are matched by id, and upstream errors come back as the errors Claude Code already
+reports: a refused key holds the provider as logged out until the key is saved again, 402 and
+429 count as limits, and 5xx answers are retried. Measure a model on a few recorded tasks before
+moving real work to it.
+
 ## Jev (optional add-on)
 
 Jev is a cheap outside decision model that screens watcher observations, picks task tiers and rates

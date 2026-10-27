@@ -474,7 +474,10 @@ EXTRA_KEYS = {
     "failover": {"standby", "fleet", "lease_remote", "lease_ttl_s", "allow_delivery_remote"},
 }
 OPEN_SECTIONS = {"resources"}           # any name below is fine
-PROVIDER_KEYS = {"tiers", "plugin_dirs", "worker_isolation", "mcp_servers", "disallowed_tools"}
+PROVIDER_KEYS = {"tiers", "plugin_dirs", "worker_isolation", "mcp_servers", "disallowed_tools",
+                 # providers.chat only (chatbridge.py): the `ttp secret endpoint` alias holding the key,
+                 # the base URL saved with it, and a max_tokens cap (also per tier).
+                 "endpoint", "base_url", "max_tokens"}
 
 
 def _known_keys(path: list[str]) -> set[str] | None:
@@ -484,7 +487,7 @@ def _known_keys(path: list[str]) -> set[str] | None:
     if path[0] in OPEN_SECTIONS or path[0] in META_KEYS:
         return None
     if path[0] == "providers":
-        return {"claude", "codex", "cursor", "fake"} if len(path) == 1 else PROVIDER_KEYS if len(path) == 2 else None
+        return {"claude", "codex", "cursor", "fake", "chat"} if len(path) == 1 else PROVIDER_KEYS if len(path) == 2 else None
     if len(path) == 1 and isinstance(DEFAULT_CONFIG.get(path[0]), dict):
         return set(DEFAULT_CONFIG[path[0]]) | EXTRA_KEYS.get(path[0], set())
     return None
@@ -830,6 +833,8 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
         except ValueError as e:
             out.append(f"providers.{prov}.disallowed_tools: {str(e).split(';')[0]}; "
                        "skipped, so workers may still call it")
+    from .chatbridge import config_problems as chat_problems
+    out += chat_problems(raw)
     if isinstance(raw.get("budget"), dict):
         from .globalcap import setting_problems
         out += setting_problems(raw["budget"])

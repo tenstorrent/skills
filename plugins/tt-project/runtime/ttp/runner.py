@@ -347,12 +347,25 @@ def supervise(run_dir: Path) -> int:
     err = open(run_dir / "stderr.log", "wb")
     nice = int(spec.get("nice") or 0)
     preexec, _ = _agent_preexec(nice)
+    bridge = None
     try:
+        if spec.get("bridge"):
+            # The chat provider's loopback bridge: a thread of this process, so it ends with the run
+            # however the run ends. The agent gets its URL and a per-run token, never the endpoint's key.
+            from .chatbridge import Bridge, BridgeError
+            try:
+                bridge = Bridge.from_settings(spec["bridge"]).start()
+            except (BridgeError, ValueError, OSError) as e:
+                raise OSError(f"chat bridge: {e}") from None
+            env.update(bridge.env())
         child = subprocess.Popen(argv, stdin=prompt, stdout=out, stderr=err, cwd=cwd, env=env,
                                  start_new_session=True, preexec_fn=preexec)
     except OSError as e:
         # The agent never started (E2BIG: an argument or the whole command line past the kernel's
-        # limit; a missing binary): a harness fault the same argv repeats, booked as a launch failure.
+        # limit; a missing binary; a chat bridge that could not start): a harness fault the same
+        # argv repeats, booked as a launch failure.
+        if bridge is not None:
+            bridge.stop()
         for f in (prompt, out, err):
             f.close()
         let_go(held)
@@ -448,6 +461,8 @@ def supervise(run_dir: Path) -> int:
             rc = child.wait()
             break
     ended, mono_end, up = time.time(), time.monotonic(), awake.tick()
+    if bridge is not None:
+        bridge.stop()
     if guard is not None:   # a normal end: the watchdog leaves the group alone
         try:
             os.write(guard, b"done")

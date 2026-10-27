@@ -4510,8 +4510,8 @@ def _false_login_ask(db: DB, text: str, cfg: dict | None = None) -> str:
     """Why a text telling the user to log an agent CLI in again is not a real login problem, or "":
     the login is the agent CLI's own (the provider, or 'agent CLI', is grammatically what is logged out
     or logged in), or it cites a plan-metering cue and names a provider, nothing names another credential
-    or tool, and no provider has an open auth breaker or auth alert. The test-only fake provider counts only when the
-    project's config uses it."""
+    or tool, and no provider has an open auth breaker or auth alert. The test-only fake provider and the opt-in
+    chat one count only when the project's config uses them."""
     from . import alerts
     from .providers import all_providers
     said = text.replace("\u2019", "'")
@@ -4520,8 +4520,8 @@ def _false_login_ask(db: DB, text: str, cfg: dict | None = None) -> str:
         return ""
     names = [p.name for p in all_providers()]
     cfg = cfg or {}
-    fake_used = cfg.get("core_provider") == "fake" or "fake" in (cfg.get("providers") or {})
-    agents = [n for n in names if n != "fake" or fake_used] + ["agent cli", "agent clis"]
+    used = {cfg.get("core_provider"), *(cfg.get("providers") or {})}
+    agents = [n for n in names if n not in ("fake", "chat") or n in used] + ["agent cli", "agent clis"]
     who = "|".join(re.escape(n) for n in agents)
     low = said.lower()
     own = re.compile(rf"\b(?:{who})\b(?:'s)?[^.!?;:]{{0,25}}$", re.I)

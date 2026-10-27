@@ -14,7 +14,7 @@ def register(cls: type) -> type:
 
 
 def _load_all() -> None:
-    from . import claude, codex, cursor, fake  # noqa: F401  (registration side effects)
+    from . import chat, claude, codex, cursor, fake  # noqa: F401  (registration side effects)
 
 
 def get_provider(name: str) -> Provider:

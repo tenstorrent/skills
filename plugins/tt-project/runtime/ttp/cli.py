@@ -7509,7 +7509,7 @@ def cmd_doctor(a) -> None:
     from .providers import all_providers
     print(status_text(p))
     for prov in all_providers():
-        if prov.name == "fake":
+        if prov.name == "fake" or (prov.name == "chat" and "chat" not in p.config()["providers"]):
             continue
         print(f"provider {prov.name}: {'found ' + prov.binary() if prov.available() else 'not installed'}"
               + (f" · account {prov.account()}" if prov.available() and prov.account() else ""))

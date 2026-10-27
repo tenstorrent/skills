@@ -49,6 +49,7 @@ from . import pregrant
 from . import deadwait
 from . import cachettl
 from . import chaincap
+from . import chatbridge
 from . import checkcap
 from . import conflictfix
 from . import correction
@@ -2186,7 +2187,9 @@ class Daemon:
                     **({"pin": pin, "pin_verify": (task or {}).get("pin_verify")
                         or self.cfg["runner"]["pin_verify"]} if pin else {}),
                     "prices": prices, **({"stdin": "input.jsonl"} if stdin is not None else {}),
-                    "budget_usd": budget_usd if provider not in ("claude",) else None,
+                    "budget_usd": budget_usd if provider not in ("claude", "chat") else None,
+                    # The chat provider's loopback bridge (chatbridge.py): where its key is, never the key.
+                    **({"bridge": chatbridge.settings(self.cfg, tier, model)} if provider == "chat" else {}),
                     # What a run without its own budget is priced at when it reports no usage.
                     "default_budget_usd": self.cfg["budget"].get("task_default_usd", {}).get(tier, 8.0),
                     "exclusive": [{"resource": res, "lock": locks.canonical(self.cfg, res),
