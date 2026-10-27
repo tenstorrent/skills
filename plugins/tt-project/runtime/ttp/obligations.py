@@ -67,7 +67,8 @@ Keys of closed obligations (receipt or dropped) are history and pass.
 """
 from __future__ import annotations
 
-import itertools
+import fnmatch
+import os
 import json
 import math
 import re
@@ -463,7 +464,8 @@ def overdue(o: dict, now: float) -> list[tuple[str, float]]:
     return out
 
 
-RESULT_FILES_MAX = 20000   # files a results glob looks at per job and pass: a huge tree is not walked whole
+RESULT_FILES_MAX = 20000   # files a results glob looks at per job and pass: the walk itself stops after this many directory entries or RESULT_WALK_S seconds
+RESULT_WALK_S = 2.0
 
 
 def _owner_runs(p, owners) -> tuple[dict[str, str], dict[str, dict]]:
@@ -511,6 +513,40 @@ def _live_jobs(p, st: dict) -> dict[str, list[dict]]:
     return out
 
 
+def _glob_walk(root: str, pat: str):
+    """Yield paths under root matching the glob `pat` (`**` spans folders), visiting at most
+    RESULT_FILES_MAX directory entries and for at most RESULT_WALK_S seconds, so a big tree never stalls
+    the caller; the walk then just ends (partial results)."""
+    rx = [None if x == "**" else re.compile(fnmatch.translate(x)) for x in pat.split("/") if x not in ("", ".")]
+    deep = None in rx
+    end = time.monotonic() + RESULT_WALK_S
+    seen = 0
+
+    def match(names, i=0, j=0):
+        if j == len(rx):
+            return i == len(names)
+        if rx[j] is None:
+            return any(match(names, k, j + 1) for k in range(i, len(names) + 1))
+        return i < len(names) and rx[j].match(names[i]) is not None and match(names, i + 1, j + 1)
+
+    stack = [(root, ())]
+    while stack:
+        d, rel = stack.pop()
+        try:
+            with os.scandir(d) as it:
+                for e in it:
+                    seen += 1
+                    if seen > RESULT_FILES_MAX or time.monotonic() > end:
+                        return
+                    names = rel + (e.name,)
+                    if match(names):
+                        yield Path(e.path)
+                    if (deep or len(names) < len(rx)) and e.is_dir(follow_symlinks=False):
+                        stack.append((e.path, names))
+        except OSError:
+            continue
+
+
 def _result_file(job: dict, now: float) -> tuple[float, str] | None:
     """(mtime, path relative to the job's folder) of the newest file matching the job's declared results
     glob that changed after the job started and within CLOCK_S, else None."""
@@ -520,7 +556,7 @@ def _result_file(job: dict, now: float) -> tuple[float, str] | None:
     since = max(float(job.get("started") or 0), now - CLOCK_S)
     best = None
     try:
-        for f in itertools.islice(Path(cwd).glob(pat), RESULT_FILES_MAX):
+        for f in _glob_walk(str(cwd), pat):
             try:
                 m = f.stat().st_mtime
             except OSError:

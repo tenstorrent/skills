@@ -868,3 +868,34 @@ def test_a_failed_job_s_wake_carries_its_log_tail_and_first_error_line_bounded(e
     # A probe with no local job, or one that only finished ok, adds nothing.
     assert detach.failed_logs("ttp detach --check --host box-a /r/a.rc") == ""
     assert detach.failed_logs(_ended_jobs(tmp_path, fine=0)) == ""
+
+
+def test_result_file_walk_is_bounded_on_a_big_tree(tmp_path, monkeypatch):
+    from ttp import obligations as ob
+    for i in range(30):
+        (tmp_path / f"d{i}").mkdir()
+        for k in range(10):
+            (tmp_path / f"d{i}" / f"f{k}.txt").write_text("x")
+    (tmp_path / "d3" / "out.json").write_text("{}")
+    monkeypatch.setattr(ob, "RESULT_FILES_MAX", 50)
+    seen = []
+    real = os.scandir
+    monkeypatch.setattr(ob.os, "scandir", lambda d: (seen.append(d), real(d))[1])
+    list(ob._glob_walk(str(tmp_path), "**/out.json"))
+    assert len(seen) < 10   # stopped after about 50 entries, not all 30 folders
+
+
+def test_result_file_patterns_still_find_files(tmp_path):
+    import time as _t
+    from ttp import obligations as ob
+    (tmp_path / "a" / "b").mkdir(parents=True)
+    (tmp_path / "top.json").write_text("1")
+    (tmp_path / "a" / "b" / "deep.json").write_text("1")
+    (tmp_path / "a" / "skip.txt").write_text("1")
+    rel = lambda pat: sorted(str(p.relative_to(tmp_path)) for p in ob._glob_walk(str(tmp_path), pat))
+    assert rel("*.json") == ["top.json"]
+    assert rel("a/*.txt") == ["a/skip.txt"]
+    assert rel("**/*.json") == ["a/b/deep.json", "top.json"]
+    now = _t.time()
+    job = {"results": "**/deep.json", "cwd": str(tmp_path), "started": now - 60}
+    assert ob._result_file(job, now + 1)[1] == "a/b/deep.json"
