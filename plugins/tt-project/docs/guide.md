@@ -1299,7 +1299,7 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   line drops it. Plugin servers are left out (`mcp_servers` cannot list them). Connected claude.ai
   connectors get a line of their own, `Connected claude.ai connectors (...) are not available to
   isolated workers`: turn off `worker_isolation` to use them, or list them in `mcp_withheld` to drop
-  the line. A probe that fails or times out shows as unknown in `ttp doctor`, never as either line.
+  the line (listing one in `mcp_servers` does not reach isolated workers, so it stays named). A probe that fails or times out shows as unknown in `ttp doctor`, never as either line.
 - With `worker_isolation` off, Claude workers and reviewers still load your own, the project's and
   plugins' MCP servers, but not your claude.ai connectors (about 2k tokens on every call), unless
   the project needs them: `mcp_servers` names one (`"claude.ai <name>"`), or one of its runs called

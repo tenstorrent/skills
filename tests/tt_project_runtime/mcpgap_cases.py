@@ -196,3 +196,27 @@ def test_mcp_gap_connectors_needing_authentication_or_a_failed_probe_show_no_lin
     g = mcpgap.gap(p.config()["providers"]["claude"], mcpgap.read(p.state))
     assert g["state"] == "unknown" and g["line"] == "" and g["connectors"] == []
     assert "claude.ai connectors" not in status_text(p)
+
+
+def test_mcp_gap_connector_listed_in_mcp_servers_stays_named_only_withheld_drops_it():
+    from ttp import mcpgap
+    probe = {"ok": True, "connected": ["claude.ai Gmail", "claude.ai Example Notes", "search"]}
+    # Listing a connector in mcp_servers asks for it, but isolated workers still never get it.
+    g = mcpgap.gap({"worker_isolation": True, "mcp_servers": ["claude.ai Gmail", "search"]}, probe)
+    assert g["state"] == "missing" and g["missing"] == []
+    assert g["connectors"] == ["claude.ai Gmail", "claude.ai Example Notes"]
+    assert g["line"].startswith("Connected claude.ai connectors (claude.ai Gmail, claude.ai Example Notes)")
+    assert g["line"].endswith(". Listing claude.ai Gmail in providers.claude.mcp_servers does not reach "
+                              "isolated workers")
+    g = mcpgap.gap({"worker_isolation": True, "mcp_servers": ["claude.ai Gmail"]},
+                   {"ok": True, "connected": ["claude.ai Gmail"]})
+    assert g["state"] == "missing" and g["connectors"] == ["claude.ai Gmail"] and "claude.ai Gmail" in g["line"]
+    # Only mcp_withheld drops a connector, listed in mcp_servers or not.
+    for cfg in ({"mcp_servers": ["claude.ai Gmail"], "mcp_withheld": ["claude.ai Gmail"]},
+                {"mcp_withheld": ["claude.ai Gmail"]}):
+        g = mcpgap.gap({"worker_isolation": True, **cfg}, {"ok": True, "connected": ["claude.ai Gmail"]})
+        assert g["state"] == "none" and g["line"] == "" and g["connectors"] == []
+    # Servers keep both filters: listed or withheld, not named.
+    g = mcpgap.gap({"worker_isolation": True, "mcp_servers": ["search"], "mcp_withheld": ["tickets"]},
+                   {"ok": True, "connected": ["search", "tickets"]})
+    assert g["state"] == "none"

@@ -91,10 +91,11 @@ def gap(claude_cfg: dict, entry: dict | None) -> dict:
     if not entry or not entry.get("ok"):
         return {"state": "unknown", "missing": [], "connectors": [], "line": "",
                 "error": (entry or {}).get("error") or "not probed yet"}
-    given = set(_names(claude_cfg.get("mcp_servers"))) | set(_names(claude_cfg.get("mcp_withheld")))
+    listed, withheld = set(_names(claude_cfg.get("mcp_servers"))), set(_names(claude_cfg.get("mcp_withheld")))
     servers, connectors = split(entry.get("connected") or [])
-    missing = [n for n in servers if n not in given]
-    connectors = [n for n in connectors if n not in given]
+    missing = [n for n in servers if n not in listed | withheld]
+    # Listing a connector in mcp_servers does not reach isolated workers: only mcp_withheld drops it.
+    connectors = [n for n in connectors if n not in withheld]
     if not missing and not connectors:
         return {"state": "none", "missing": [], "connectors": [], "line": ""}
     lines = []
@@ -104,7 +105,9 @@ def gap(claude_cfg: dict, entry: dict | None) -> dict:
     if connectors:
         lines.append(f"Connected claude.ai connectors ({', '.join(connectors)}) are not available to isolated "
                      "workers; they cannot be passed on. Turn off providers.claude.worker_isolation to use them "
-                     "(or add them to providers.claude.mcp_withheld to keep them out)")
+                     "(or add them to providers.claude.mcp_withheld to keep them out)"
+                     + (f". Listing {', '.join(n for n in connectors if n in listed)} in providers.claude.mcp_servers "
+                        "does not reach isolated workers" if listed & set(connectors) else ""))
     return {"state": "missing", "missing": missing, "connectors": connectors, "line": "\n".join(lines)}
 
 
