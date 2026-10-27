@@ -9065,7 +9065,7 @@ def test_a_passed_retry_when_waits_for_a_future_start_after(env, monkeypatch):
         _settle_probe(d, tid)
         assert d._probe_rc[tid][0] == 0 and not _ready(p, tid), "the deferral wins over the passed probe"
         task = p.db.task(tid)
-        assert task["not_before"] == after and "woke" not in json.loads(task["result"]), task
+        assert abs(task["not_before"] - after) < 1 and "woke" not in json.loads(task["result"]), task   # the label rounds to whole seconds
     # Its start_after comes: the pass is acted on then.
     labels = [lb if not lb.startswith("start_after:") else f"start_after:{time.time() - 1:.0f}"
               for lb in json.loads(p.db.task(tid)["labels"])]
