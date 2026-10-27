@@ -617,3 +617,93 @@ def test_a_hanging_pre_grant_check_blocks_a_daemon_tick_for_about_one_timeout(en
     d._tick_began = time.monotonic()   # the next tick asks the next one
     d._resource_hold(p.db.task(other[1]))
     assert len(log.read_text().splitlines()) == 2
+
+
+def _probing_driver(marks, release, tries=15):
+    """A detached driver that, like a resumable try loop, probes the lock before each try and gives up
+    after `tries` busy probes; its try runs under `ttp lock board`, then it runs until `release` exists."""
+    q = shlex.quote
+    ttp = f"{q(sys.executable)} {q(str(TTP))}"
+    return ["sh", "-c",
+            f"n=0; until {ttp} lock --probe board >> {q(str(marks))}.probe 2>&1; do n=$((n+1)); "
+            f"[ $n -ge {tries} ] && {{ echo 'gave up' >> {q(str(marks))}; exit 9; }}; sleep 0.1; done; "
+            f"{ttp} lock board -- sh -c 'echo try1 >> {q(str(marks))}' || exit 8; "
+            f"while [ ! -e {q(str(release))} ]; do sleep 0.05; done"]
+
+
+def test_a_driver_probing_its_own_runs_kept_hold_starts_its_try_and_the_hold_then_ends(env, tmp_path):
+    # (a), (d), (b): an exclusive run ends while its detached driver waits for the board through
+    # `ttp lock --probe`. The keeper of the run's hold kept the board for that driver, so the driver's
+    # probe must read it as free for it, its try run under the hold, and the hold end with the driver.
+    p = make(env)
+    from ttp import hold, locks
+    from ttp.daemon import Daemon
+    mine, other = _board_task(p, "flash"), _board_task(p, "other")
+    run_dir, marks, release = p.runs / "61", tmp_path / "marks", tmp_path / "release"
+    _exclusive_run_detaching(p, mine["id"], 61, run_dir, _probing_driver(marks, release))
+    paths = Daemon(p.base)._slot_paths("board")
+    try:
+        assert _until_true(lambda: marks.exists() and marks.read_text().strip(), 60), "the driver never got past its probe"
+        assert marks.read_text().splitlines() == ["try1"], marks.read_text()
+        assert "free for this run (held by task #%d (run 61)" % mine["id"] in (tmp_path / "marks.probe").read_text()
+        # The try ran under the kept hold: the board never was free for anyone else meanwhile.
+        assert locks.held_labels(paths) == [f"task #{mine['id']} (run 61), detached jobs"]
+        assert hold.read(run_dir)["state"] == "holding"
+        for who in ({}, {"TTP_TASK": str(other["id"])}):
+            r = _lock_probe(dict(os.environ, TTP_PROJECT=str(p.base), **who), "board")
+            assert r.returncode == 75 and "busy" in r.stdout, r.stdout
+    finally:
+        release.touch()
+    # (b) No live job of the run uses the hold any more: it ends within a keeper poll or two.
+    assert _until_true(lambda: (run_dir / "job.rc").exists()) and (run_dir / "job.rc").read_text().strip() == "0"
+    assert _until_true(lambda: locks.any_free(paths), 10), "the hold outlived its last detached job"
+    assert hold.read(run_dir)["state"] == "released"
+    assert _lock_probe(dict(os.environ, TTP_PROJECT=str(p.base), TTP_TASK=str(other["id"])), "board").returncode == 0
+
+
+def test_a_kept_hold_reads_free_only_for_its_own_runs_lineage(env, tmp_path):
+    # (c): the probe's pass-through never covers a hold of another task or project, a plain `ttp lock`
+    # command of the same task, a keeper that does not list the caller's job, or a run that does not
+    # hold the resource for its whole run.
+    p = make(env)
+    from ttp import hold
+    from ttp.daemon import Daemon
+    mine, other = _board_task(p, "flash"), _board_task(p, "other")
+    run_dir, release = p.runs / "62", tmp_path / "release"
+    _exclusive_run_detaching(p, mine["id"], 62, run_dir, _until(release))
+    try:
+        job = str((run_dir / "job.rc").resolve())
+        assert hold.read(run_dir)["jobs"] == [job]
+        spec = json.loads((run_dir / "run.json").read_text())
+
+        def probe(task, rd, rc, extra=()):
+            e = dict(os.environ, TTP_PROJECT=str(p.base), TTP_TASK=str(task), TTP_RUN_ID="99",
+                     TTP_RUN_DIR=str(rd), TTP_DETACHED="1", TTP_DETACH_RC=str(rc))
+            return _lock_probe(e, "board", extra=extra).returncode
+
+        def run_of(task, n, exclusive=True):
+            rd = p.runs / str(n)
+            rd.mkdir()
+            (rd / "run.json").write_text(json.dumps({**spec, "env": {"TTP_TASK": str(task)},
+                                                     **({} if exclusive else {"exclusive": []})}))
+            return rd
+        assert probe(mine["id"], run_dir, job) == 0   # the keeper's own job: granted under the hold
+        theirs = run_of(other["id"], 63)
+        assert probe(other["id"], theirs, job) == 75, "another task's job passed a hold kept for this task"
+        assert probe(mine["id"], run_dir, job, extra=("--task", str(other["id"]))) == 75
+        assert probe(mine["id"], run_of(mine["id"], 64), p.runs / "64" / "x.rc") == 75, \
+            "a job the keeper does not keep for passed its hold"
+        assert probe(mine["id"], run_of(mine["id"], 65, exclusive=False), job) == 75, \
+            "a run that holds nothing for its whole run passed the hold"
+    finally:
+        release.touch()
+    # A held slot of another project's task with the same number, or the same task's plain command lock.
+    import fcntl
+    slot = tmp_path / "board.0.lock"
+    for lbl in (f"demo task #{mine['id']} (run 62), detached jobs", f"task #{mine['id']} (run 62)"):
+        slot.write_text(json.dumps({"holder": lbl}))
+        with open(slot) as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            env_ = {"TTP_RUN_ID": "62", "TTP_DETACHED": "1", "TTP_DETACH_RC": job}
+            assert hold.covers([slot], f"task #{mine['id']}", spec, env_) is None, lbl
+    assert _until_true(lambda: (hold.read(run_dir) or {}).get("state") == "released"), "the hold outlived its job"

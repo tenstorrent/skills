@@ -80,6 +80,36 @@ def own_keeper(lbl: str, holder: str) -> bool:
     return bool(h) and h["kind"] == LABEL and h["holder"] == holder
 
 
+def covers(paths: list[Path], holder: str, spec: dict, env=None) -> str | None:
+    """The label of a slot among `paths` that the caller's own run lineage holds, so its `ttp lock` runs
+    under that hold (the whole-run pass-through), else None. The caller is a run of an exclusive task
+    holding the resource (its run.json `spec`, from TTP_RUN_DIR), or a `ttp detach` job of one; a slot
+    covers it only when held by the same `holder` (task, and project when shared) as: this very run
+    (TTP_RUN_ID), a later run of the task (which took this run's jobs over), or the keeper of detached
+    jobs whose hold.json lists the caller's job (TTP_DETACH_RC). Another task's or project's hold, a
+    plain `ttp lock` command's, or a keeper that does not list the caller never covers it."""
+    from .progress import JOB_ENV
+    env = os.environ if env is None else env
+    run = str(env.get("TTP_RUN_ID") or "")
+    job = env.get(JOB_ENV) if env.get("TTP_DETACHED") else None
+    job = str(Path(job).resolve()) if job else None
+    for lbl in locks.held_labels(paths):
+        h = parse(lbl)
+        if not h or h["holder"] != holder:
+            continue
+        if h["kind"] == WHOLE_RUN and (h["run"] == run or job):
+            return lbl
+        if h["kind"] == LABEL and job and spec.get("holds"):
+            try:
+                rd = Path(json.loads((Path(spec["holds"]) / f"{h['run']}.json").read_text())["run_dir"])
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+            rec = read(rd) or {}
+            if rec.get("state") == "holding" and job in {str(Path(j).resolve()) for j in rec.get("jobs") or []}:
+                return lbl
+    return None
+
+
 def read(run_dir: Path) -> dict | None:
     try:
         rec = json.loads((Path(run_dir) / RECORD).read_text())

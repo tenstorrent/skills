@@ -3977,6 +3977,9 @@ def cmd_lock(a) -> None:
     lives; a slot an exclusive run handed to the keeper of its detached jobs names the keeper (pid, via
     "keeper") and the run supervisor that took it (taker_pid). `--probe A,B` answers for each and exits
     75 when any is busy or paused; with `--json` it prints a list of those answers, each with a state.
+    Inside an exclusive task's run, or a detached job of it, a resource held by that run's own lineage
+    (hold.covers: the run itself, a later run of the task, or the keeper whose hold lists this job)
+    probes free (exit 0, held_for_caller in --json) unless paused: its `ttp lock` runs under that hold.
     """
     from . import hold, lockprobe, locks as lk
     cmd = list(a.command or [])
@@ -4045,9 +4048,24 @@ def cmd_lock(a) -> None:
         # only for a known task: the probe of a task's retry_when names it with --task).
         ptask = str(getattr(a, "task", None) or os.environ.get("TTP_TASK") or "").strip()
         check = pregrant.command(cfg) if ptask else ""
+        # What `ttp lock` runs under without waiting: this run's whole-run hold, or the keeper kept for
+        # this detached job (hold.covers). Busy there would leave a driver that probes before each try
+        # waiting on the very hold kept for it.
+        try:
+            rspec = json.loads((Path(os.environ["TTP_RUN_DIR"]) / "run.json").read_text())
+        except (KeyError, OSError, ValueError):
+            rspec = {}
+        mytask = str(os.environ.get("TTP_TASK") or "").strip()
+        whole = {lk.canonical(cfg, x.get("resource") or "") for x in (rspec.get("exclusive") or [])
+                 if isinstance(x, dict)} if mytask and ptask == mytask else set()
 
         def _answer(name: str) -> tuple[int, str | dict]:
             rc, said = lockprobe.answer(p, cfg, name, a.shared, a.json)
+            L = next(x for x in todo if x["res"] == lk.canonical(cfg, name))
+            if rc != 0 and L["res"] in whole and lockprobe.pause(p, cfg, name) is None and (
+                    cov := hold.covers(L["paths"], shared.holder(p, L["res"], hold.who(mytask), cfg), rspec)):
+                line = f"{name}: free for this run (held by {cov}; its ttp lock runs under that hold)"
+                rc, said = 0, ({**said, "free": True, "line": line, "held_for_caller": cov} if a.json else line)
             if rc != 0 or not check:
                 return rc, said
             got = pregrant.check(check, p.root, name, ptask, p.state, pregrant.timeout_s(cfg))
