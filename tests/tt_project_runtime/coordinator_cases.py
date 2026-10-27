@@ -16941,3 +16941,18 @@ def test_memory_add_action_notes_a_worker_room_overflow_and_reroutes_a_one_off(e
     e = p._memory_entries()[-1]
     assert e["audience"] == "" and not (p.memory_dir / f"{rules[0].stem}.md").exists()
     assert len(notes) == 1 and notes[0].startswith("memory_add: warning: pinned worker memory would take "), notes
+
+
+def test_config_set_accepts_checks_nice_and_ionice_and_rejects_bad_values(env):
+    p = make(env)
+    from ttp.coordinator import apply
+    probs = apply(p, [{"type": "config_set", "key": "checks.nice", "value": "15"},
+                      {"type": "config_set", "key": "checks.ionice", "value": "Best-Effort:3"}])
+    assert not probs
+    assert p.config()["checks"] == {"nice": 15, "ionice": "best-effort:3"}
+    probs = apply(p, [{"type": "config_set", "key": "checks.nice", "value": "20"},
+                      {"type": "config_set", "key": "checks.nice", "value": "high"},
+                      {"type": "config_set", "key": "checks.ionice", "value": "realtime"},
+                      {"type": "config_set", "key": "checks.ionice", "value": "best-effort:8"}])
+    assert len(probs) == 4
+    assert p.config()["checks"] == {"nice": 15, "ionice": "best-effort:3"}

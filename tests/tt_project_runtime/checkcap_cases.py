@@ -266,7 +266,7 @@ def test_check_commands_run_niced_where_nice_and_ionice_exist_unless_turned_off(
     monkeypatch.setattr(cli.shutil, "which", lambda name: f"/usr/bin/{name}" if name in have else None)
     assert cli._low_priority(["pytest"]) == ["nice", "-n", "10", "pytest"]
     have.add("ionice")
-    assert cli._low_priority(["pytest"]) == ["nice", "-n", "10", "ionice", "-c2", "-n7", "pytest"]
+    assert cli._low_priority(["pytest"]) == ["nice", "-n", "10", "ionice", "-c3", "pytest"]
     have.clear()
     assert cli._low_priority(["pytest"]) == ["pytest"], "neither found: run as it is"
     have.update({"nice", "ionice"})
@@ -1478,7 +1478,7 @@ def _argv_with(monkeypatch, settings=None, runner=None):
 
 
 def test_check_priority_defaults_are_unchanged_without_settings(env, monkeypatch):
-    assert _argv_with(monkeypatch) == ["nice", "-n", "10", "ionice", "-c2", "-n7", "pytest"]
+    assert _argv_with(monkeypatch) == ["nice", "-n", "10", "ionice", "-c3", "pytest"]
 
 
 def test_check_priority_follows_checks_nice_and_ionice_settings(env, monkeypatch):
@@ -1509,7 +1509,7 @@ def test_check_priority_follows_the_project_s_checks_ionice(env, monkeypatch):
 
 def test_check_priority_invalid_values_fall_back_to_the_defaults(env, monkeypatch):
     got = _argv_with(monkeypatch, {"checks.nice": "soon", "checks.ionice": "bogus:9"}, runner={"nice": "x"})
-    assert got == ["nice", "-n", "10", "ionice", "-c2", "-n7", "pytest"]
+    assert got == ["nice", "-n", "10", "ionice", "-c3", "pytest"]
     from ttp import project, testslots
     project.set_account_setting("checks.ionice", "best-effort:9")
     assert testslots.ionice_args() == ["-c2", "-n7"]

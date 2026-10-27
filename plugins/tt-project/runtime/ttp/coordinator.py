@@ -156,6 +156,26 @@ def _repo_list(v: Any) -> list[str]:
     return out
 
 
+def _checks_nice(v):
+    """checks.nice as config_set takes it: a whole number 0-19."""
+    try:
+        n = int(str(v).strip())
+    except ValueError:
+        n = -1
+    if isinstance(v, bool) or not 0 <= n <= 19:
+        raise ValueError(f"checks.nice: {v!r} is not a whole number 0-19")
+    return n
+
+
+def _checks_ionice(v):
+    """checks.ionice as config_set takes it: idle, best-effort or best-effort:N (N 0-7)."""
+    t = str(v).strip().lower()
+    cls, _, lvl = t.partition(":")
+    if not (t == "idle" or (cls == "best-effort" and (not lvl or (lvl.isdigit() and 0 <= int(lvl) <= 7)))):
+        raise ValueError(f"checks.ionice: {v!r} is not idle, best-effort or best-effort:0-7")
+    return t
+
+
 USER_SETTABLE = {
     "budget.daily_usd": float, "budget.weekly_usd": float, "budget.reserve_pct": float,
     "budget.global_daily_usd": float, "budget.day_start": str, "budget.timezone": str,
@@ -167,6 +187,9 @@ USER_SETTABLE = {
     "coordinator.tier": str, "coordinator.model": str, "coordinator.model_tier": str, "coordinator.effort": str,
     "jev.enabled": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     "runner.pin_verify": pin_verify_mode,
+    # Check commands' CPU and IO priority (testslots.nice_level, ionice_args): nice 0-19; ionice idle or best-effort[:0-7].
+    "checks.nice": lambda v: _checks_nice(v),
+    "checks.ionice": lambda v: _checks_ionice(v),
     # Where code tasks branch from: the project's working branch once it has one.
     "delivery.base_ref": str,
     # Where `ttp push` publishes (required; never main, master or the remote's default branch) and

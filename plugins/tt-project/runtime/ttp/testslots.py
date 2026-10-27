@@ -66,7 +66,7 @@ SUITE = "test-suite"           # check-slots/test-suite.<project id>.lock: one p
 POLL_S = 5.0
 TELL_S = 300.0
 NICE = 10
-IONICE = ["-c2", "-n7"]    # best-effort, lowest: a live service's IO goes first, yet checks never starve
+IONICE = ["-c3"]    # idle class: a live service's IO always goes first
 
 
 def _number(v) -> int | None:
