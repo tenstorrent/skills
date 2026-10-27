@@ -16463,15 +16463,16 @@ def test_mute_slots_show_near_the_cap_and_only_mutes_in_force_hold_one(env):
     db, now = p.db, time.time()
     for i in range(scr.MUTE_MAX - scr.MUTE_SLOTS_NEAR - 1):
         scr.mute(db, f"watcher:w{i}", f"condition number {i}", 2 + i, why="known noise", now=now)
-    assert "mute slots" not in coord.digest(p, {}, [], []), "far from the cap: no count"
+    far = next(x for x in coord.digest(p, {}, [], []).splitlines() if x.startswith("## Muted observations"))
+    assert f"; {scr.MUTE_SLOTS_NEAR + 1} of {scr.MUTE_MAX} mute slots free)" in far and "first to end" not in far, far
     scr.mute(db, "watcher:w99", "condition number 99", 1, why="known noise", now=now)
     shown = coord.digest(p, {}, [], [])
     line = next(x for x in shown.splitlines() if x.startswith("## Muted observations"))
-    assert f"; {scr.MUTE_MAX - scr.MUTE_SLOTS_NEAR} of {scr.MUTE_MAX} mute slots used, first to end: watcher:w99 " \
+    assert f"; {scr.MUTE_SLOTS_NEAR} of {scr.MUTE_MAX} mute slots free, first to end: watcher:w99 " \
            f"'condition number 99' in 1.0 h)" in line, line
     seen = coord.digest_parts(p, {}, [], [], {}, {})[1]
     again = dict(coord.digest_parts(p, {}, [], [], seen, {})[0])["muted"]
-    assert "(as last turn; never wake you; 15 of 20 mute slots used" in again, again
+    assert "(as last turn; never wake you; 5 of 20 mute slots free" in again, again
     for i in range(scr.MUTE_MAX - scr.MUTE_SLOTS_NEAR, scr.MUTE_MAX):
         scr.mute(db, f"watcher:x{i}", f"condition number {i}", 3, why="known noise", now=now)
     with pytest.raises(ValueError, match=f"observation_mute rejected: {scr.MUTE_MAX} mutes are already active; "
@@ -16540,18 +16541,113 @@ def test_information_only_refusals_ride_along_and_real_rules_still_raise_a_turn(
     assert f"ledger entry #{landed}: task done, closed, landed" in out[0], out[0]
     assert db.task(run)["status"] == "running" and json.loads(db.task(run)["labels"] or "[]") == []
     assert db.one("SELECT COUNT(*) n FROM tasks")["n"] == 4, "refused exactly as before: nothing added"
-    # Refusals for a rule or a decision still raise the next turn, worded as before.
-    decide = [{"type": "task_add", "title": "Fuse the norm, bound 1.8x", "kind": "code", "spec": "Fuse it; 1.8x."},
+    # Refusals for a rule or a decision still raise the next turn, worded as before; so does work
+    # already tried when a reply in the same batch may rest on it (settle_refusals).
+    decide = [[{"type": "task_add", "title": "Fuse the norm, bound 1.8x", "kind": "code", "spec": "Fuse it; 1.8x."},
+               {"type": "reply", "chat": "c1", "text": "Queued the norm fusion."}],
               {"type": "pr_approve", "id": 999999, "text": "https://github.com/acme/widgets/pull/7", "quote": "yes"},
               {"type": "task_update", "id": 999999, "priority": 1}]
     for a in decide:
-        out = coord.apply(p, [a])
+        out = coord.apply(p, a if isinstance(a, list) else [a])
         assert len(out) == 1 and not coord.informational_rejection(out[0]), (a, out)
         db.set_kv(coord.REJECTED_KEY, out)
         assert trig() == ["rejected action"], (a, out)
         assert "your previous turn's action was rejected; fix or drop it" in coord.digest(p, {}, [], [])
-    assert "was shelved" in coord.apply(p, [decide[0]])[0] and \
-        f"ledger entry #{shelved}: task done, closed, not landed" in coord.apply(p, [decide[0]])[0]
+    assert "was shelved" in coord.apply(p, decide[0])[0] and \
+        f"ledger entry #{shelved}: task done, closed, not landed" in coord.apply(p, decide[0])[0]
+
+
+def test_settled_refusals_cost_no_turn_of_their_own_and_show_once_with_a_count(env, monkeypatch):
+    """Work already tried and a mute with no free slot are refused the same way on every turn: alone in
+    a batch they raise no turn of their own (the quiet gate still settles the next routine batch) and
+    reach the next naturally started turn's digest, once each with its count. With a reply in the same
+    batch, or for any other refusal, the next routine batch runs as before."""
+    p = make(env)
+    from types import SimpleNamespace
+    from ttp import coordinator as coord, quietgate, screen as scr
+    from ttp.daemon import Daemon
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    held = p.db.add_task("tuning", "s", origin="user")
+    p.db.update_task(held, status="blocked", blocked_reason="paused by the user",
+                     labels=["waits:when:test -e state/user-resume-tuning || exit 1"])
+    shelved = p.db.add_task("fuse the norm (bound 1.8x)", "Fuse the norm; bound 1.8x.", kind="code", origin="user")
+    p.db.update_task(shelved, status="done", attempts=1,
+                     result=json.dumps({"status": "done", "summary": "Shelved: 1.05x of the 1.8x bound."}))
+    d = Daemon(p.base)
+    d.update_gates()
+    d.cfg["coordinator"].update(skip_repeat_window_s=0, batch_s=0)
+    clock = [time.time()]
+    prompts, notes = [], []
+
+    def start_run(role, prompt, *a, **k):
+        prompts.append(prompt)
+        notes.append(k["note"])
+        return p.db.x("INSERT INTO runs(role,started,status,note) VALUES('coordinator',?,'ok',?)",
+                      (clock[0], json.dumps(k["note"])))
+    monkeypatch.setattr(d, "start_run", start_run)
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+
+    def event(actions=({"type": "noop"},), kind="idle_capacity"):
+        clock[0] += 600
+        p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+               (clock[0], "daemon", kind, "normal", f"{kind}:board-b:{int(clock[0])}", "queued"))
+        clock[0] += 60
+        n = len(prompts)
+        d.maybe_coordinate()
+        if len(prompts) == n:
+            return False
+        rid = p.db.one("SELECT MAX(id) id FROM runs")["id"]
+        usage = SimpleNamespace(structured={"actions": list(actions), "summary": ""}, error="", final_text="",
+                                cost_usd=0.2)
+        d._finish_coordinator({"id": rid, "dir": "x"}, usage, "ok", notes[-1])
+        return True
+
+    tried = {"type": "task_add", "title": "Fuse the norm, bound 1.8x", "kind": "code", "spec": "Fuse it; 1.8x."}
+    assert event([tried, tried]), "the first batch runs: no turn has left its state yet"
+    assert len(p.db.kv(coord.REJECTED_KEY)) == 2
+    assert coord.effort_triggers(p.db, d.cfg, [], None)[0] == []
+    assert not event(), "a batch refused only as already tried raises no turn of its own"
+    assert event(kind="task_note"), "a natural turn still runs"
+    shown = [x for x in prompts[-1].splitlines() if f"already tried: task #{shelved}" in x]
+    assert len(shown) == 1 and "refused, information only: nothing to fix; sent 2 times]" in shown[0], shown
+    assert not event()
+    # No free mute slot.
+    now = clock[0]
+    for i in range(scr.MUTE_MAX):
+        scr.mute(p.db, f"watcher:w{i}", f"condition number {i}", 3, why="known noise", now=now)
+    mute = {"type": "observation_mute", "source": "watcher:new", "match": "another condition", "hours": 2}
+    assert event([mute], kind="task_note")
+    assert f"; no mute slot free (all {scr.MUTE_MAX} used), first to end: " in prompts[-1]
+    assert coord.informational_rejection(p.db.kv(coord.REJECTED_KEY)[0])
+    assert not event(), "a batch refused only for want of a mute slot raises no turn of its own"
+    assert event(kind="task_note")
+    assert f"observation_mute rejected: {scr.MUTE_MAX} mutes are already active" in prompts[-1]
+    assert not event()
+    # A reply in the same batch may rest on the refused task: the next batch runs, as before.
+    assert event([tried, {"type": "reply", "chat": "web", "text": "Queued the norm fusion."}], kind="task_note")
+    assert not coord.informational_rejection(p.db.kv(coord.REJECTED_KEY)[0])
+    assert event(), "a refusal a reply may rest on raises the next turn"
+    assert not event()
+    # Another refusal class keeps raising the next turn.
+    assert event([{"type": "task_update", "id": 999999, "priority": 1}], kind="task_note")
+    assert event(), "a refusal that needs a decision raises the next turn"
+    assert not event()
+    assert quietgate.skipped(p.db, 0)["n"] == 6
+
+
+def test_settle_refusals_marks_only_its_classes_and_only_without_a_backing_action():
+    from ttp import coordinator as coord
+    settled = ["task_add: already tried: task #3 'x'", "task_add: near duplicate of task #4 (done) 'y'",
+               "observation_mute: observation_mute rejected: 20 mutes are already active; let one end first",
+               "observation_mute: observation_mute rejected: watcher:w 'z' has been muted for 7 days, the most"]
+    other = ["task_update: #9 rejected: already tried: x", "task_add: cap of 3 new tasks in 24 h reached",
+             "observation_mute: observation_mute needs `hours` from 1 to 72", "ask_user: already tried: x"]
+    out = coord.settle_refusals(settled + other, [{"type": "task_add"}, {"type": "observation_mute"}])
+    assert [coord.informational_rejection(x) for x in out] == [True] * 4 + [False] * 4, out
+    assert coord.settle_refusals(out, []) == out, "an information-only refusal is marked once"
+    for backing in coord.BACKING_ACTIONS:
+        assert coord.settle_refusals(settled, [{"type": "task_add"}, {"type": backing}]) == settled, backing
+    assert coord.settle_refusals(settled, [None, "noise"])[0].endswith(coord.INFO_MARK)
 
 
 def test_a_clipped_information_only_refusal_keeps_its_mark():

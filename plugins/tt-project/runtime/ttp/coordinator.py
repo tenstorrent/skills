@@ -303,6 +303,12 @@ DEFAULT_EFFORT = "xhigh"
 # name, which still adds the task.
 SETTLED_REJECTIONS = ("duplicate of ", "near duplicate of ", "already tried: ", "cap of ", "the cap on ",
                       "task_add rejected: head ", "task_add continues #", "resource ")
+# Refusals no later turn changes (work already tried or a near duplicate, no free mute slot or a mute
+# at its longest): information only, so they never cost a turn of their own, unless the batch also sent
+# a reply, notify or obligation the refused action may back (settle_refusals).
+SETTLED_REFUSALS = ("task_add: already tried: ", "task_add: near duplicate of ",
+                    "observation_mute: observation_mute rejected: ")
+BACKING_ACTIONS = ("reply", "notify", "obligation")
 MISSING_FIELDS = "task_add needs a"   # start of a rejection the next turn can fix (fixable_rejection)
 UNKNOWN_KIND = "task_add kind"   # start of an unknown-kind rejection, also one the next turn can fix
 TASK_KINDS = ("question", "code", "review", "plan", "harness", "work")   # coordinator.md's `kind` list
@@ -1017,11 +1023,14 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     again = set(db.kv(AGAIN_KEY, []) or [])
     told = " Your reply already went out: correct it in a reply only if it told the user otherwise." \
         if rejected and db.kv(REJECTED_REPLY_KEY, False) else ""
-    for x in rejected:
+    sent = [str(x) for x in rejected]
+    for x in dict.fromkeys(sent):   # the same refusal sent more than once is shown once, with its count
         tag = "rejected again, as on the turn before: do not send it as is" if rejection_key(x) in again \
             else "your previous turn's action was refused, information only: nothing to fix" \
             if informational_rejection(x) else "your previous turn's action was rejected; fix or drop it"
-        reason = str(x).replace(f" {INFO_MARK}", "")
+        if sent.count(x) > 1:
+            tag += f"; sent {sent.count(x)} times"
+        reason = x.replace(f" {INFO_MARK}", "")
         lines.append(f"- [{tag}] {reason[:_rejection_cap(reason)]}{told}")
     for x in db.kv(NOTES_KEY, []) or []:
         lines.append(f"- [note on your previous turn's action: applied, nothing to fix] {x[:500]}")
@@ -1047,6 +1056,17 @@ def fixable_rejection(problem: str) -> bool:
     work itself settles, nor a dropped resource name, which still adds the task (SETTLED_REJECTIONS)."""
     text = str(problem)
     return text.startswith("task_add: ") and not text[len("task_add: "):].startswith(SETTLED_REJECTIONS)
+
+
+def settle_refusals(problems: list[str], actions: list) -> list[str]:
+    """`problems` with each SETTLED_REFUSALS one marked information only (InfoRejection), so it reaches
+    the next naturally started turn's digest without raising one itself (effort_triggers). A batch that
+    also sent a reply, notify or obligation keeps them as they were: what it told the user or recorded
+    may rest on the refused action, and the coordinator learns of it on the next turn as before."""
+    if any(isinstance(a, dict) and a.get("type") in BACKING_ACTIONS for a in actions or []):
+        return problems
+    return [f"{x} {INFO_MARK}" if str(x).startswith(SETTLED_REFUSALS) and not informational_rejection(x) else x
+            for x in problems]
 
 
 def task_kinds(p: Project) -> set[str]:
@@ -2611,7 +2631,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
     # Rejections go back to the coordinator in its next digest, never into the user's chat: a reply
     # already sent is corrected there by the coordinator itself, only when it told the user otherwise.
     db.set_kv(REJECTED_REPLY_KEY, bool(problems and replies))
-    return problems
+    return settle_refusals(problems, actions)
 
 
 def _only_adds_repos(cfg: dict, value: list[str]) -> list[str]:

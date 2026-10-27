@@ -547,7 +547,7 @@ def settle_receipts(db: DB, source: str, since: float, subjects: Any, now: float
 # extended, no mute outlasts MUTE_CAP_S from when it began: its end then makes the coordinator look again.
 MUTES_KEY = "observation_mutes"   # kv: list of active mutes, oldest first
 MUTE_MIN_MATCH, MUTE_MAX_H, MUTE_MAX = 3, 72, 20
-MUTE_SLOTS_NEAR = 5   # the digest counts mute slots once this few or fewer are free (slots_line)
+MUTE_SLOTS_NEAR = 5   # the digest names the first mute to end once this few or fewer slots are free (slots_line)
 MUTE_BELOW = ("normal", "high", "critical")
 MUTE_ESCALATE_H = 2.0   # default escalate_after_h; 0 never escalates (needs a `why` naming who handles it)
 MUTE_ESCALATE_MIN_H = 0.5
@@ -703,13 +703,15 @@ def mutes(db: DB, now: float | None = None) -> list[dict]:
 
 
 def slots_line(muted: list[dict], now: float | None = None) -> str:
-    """'; 18 of 20 mute slots used, first to end: <source> <match> in 1.5 h', once the mutes in force
-    are within MUTE_SLOTS_NEAR of MUTE_MAX ('' before), so a turn does not send a mute the cap refuses."""
-    if len(muted) < MUTE_MAX - MUTE_SLOTS_NEAR:
-        return ""
+    """'; 12 of 20 mute slots free' (or '; no mute slot free (all 20 used)'), with the mute that ends
+    first once MUTE_SLOTS_NEAR or fewer are free, so a turn does not send a mute the cap refuses."""
+    free = max(0, MUTE_MAX - len(muted))
+    head = f"; {free} of {MUTE_MAX} mute slots free" if free else f"; no mute slot free (all {MUTE_MAX} used)"
+    if free > MUTE_SLOTS_NEAR or not muted:
+        return head
     now = time.time() if now is None else now
     first = min(muted, key=lambda m: float(m["until"]))
-    return (f"; {len(muted)} of {MUTE_MAX} mute slots used, first to end: {first['source']} "
+    return (f"{head}, first to end: {first['source']} "
             f"{clip_match(first['match'])!r} in {max(0.0, (float(first['until']) - now) / 3600):.1f} h")
 
 
