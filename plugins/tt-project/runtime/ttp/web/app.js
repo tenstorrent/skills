@@ -313,6 +313,7 @@ async function refresh() {
   $("#needs").hidden = !needs; text($("#needs"), `${needs} need${needs === 1 ? "s" : ""} you`);
   $("#hostline").hidden = !h.host; text($("#hostline"), h.host || "");
   $("#sleepline").hidden = !h.idle_sleep; text($("#sleepline"), h.idle_sleep || "");
+  $("#mcpline").hidden = !h.mcp_gap; text($("#mcpline"), h.mcp_gap || "");
   $("#relline").hidden = !h.release; text($("#relline"), h.release || "");
   const rt = (h.runtime || {}).restart_pending ? h.runtime.line : "";   // the header shows only what needs action
   $("#runline").hidden = !rt; text($("#runline"), rt);

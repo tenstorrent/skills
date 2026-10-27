@@ -17,7 +17,7 @@ from . import alerts, awake
 from . import budget as bud
 from . import globalcap as gcap
 from . import coordinator as coord
-from . import credits, heal, identity, lockprobe, obligations, outagetask, projpause, pushq, release, responsibilities, route, sweep, timefmt, waits
+from . import credits, heal, identity, lockprobe, mcpgap, obligations, outagetask, projpause, pushq, release, responsibilities, route, sweep, timefmt, waits
 from . import schedule as sched
 from . import pauseends, startgate, sweepskip, timefmt, trend, upstream
 from .daemon import (AUTH_PROBE_S, HEARTBEAT_STALE_S, KV_LOCAL_ONLY, KV_WORKTREES_DIRTY, LOGGED_OUT_NOTE, NET_HELD_NOTE,
@@ -456,6 +456,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
         "host": host_line(db.boots(now - DAY), tz),
         "idle_sleep": "" if awake.pause_line(sleep_line) and (held or not running) else sleep_line,   # said once
         "release": release.line(p, db, cfg),
+        "mcp_gap": mcpgap.line(p.state, cfg),   # the cached probe only (the daemon refreshes it)
         "runtime": runtime_receipt(p, db, alive, now, tz),
         "schedules_broken": sched.broken_line(db),
         "schedules_waiting": sched.waiting_line(db),

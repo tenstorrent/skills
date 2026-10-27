@@ -223,6 +223,8 @@ USER_SETTABLE = {
     "providers.codex.worker_isolation": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     # MCP servers from the user's own Claude config that isolated workers still get, by name.
     "providers.claude.mcp_servers": lambda v: name_list(v, strict=True),
+    # Connected MCP servers kept from workers on purpose: ttp status no longer names them (mcpgap.py).
+    "providers.claude.mcp_withheld": lambda v: name_list(v, strict=True),
     # Tools workers and reviewers may not call, on top of the built-in denylist (mcp__<server>__*).
     "providers.claude.disallowed_tools": lambda v: tool_list(v, strict=True),
     # Hours before an unanswered ask registered with a default falls back to it; 0 turns it off.

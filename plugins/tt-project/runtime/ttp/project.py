@@ -478,7 +478,7 @@ EXTRA_KEYS = {
     "failover": {"standby", "fleet", "lease_remote", "lease_ttl_s", "allow_delivery_remote"},
 }
 OPEN_SECTIONS = {"resources"}           # any name below is fine
-PROVIDER_KEYS = {"tiers", "plugin_dirs", "worker_isolation", "mcp_servers", "disallowed_tools",
+PROVIDER_KEYS = {"tiers", "plugin_dirs", "worker_isolation", "mcp_servers", "mcp_withheld", "disallowed_tools",
                  # providers.chat only (chatbridge.py): the `ttp secret endpoint` alias holding the key,
                  # the base URL saved with it, a max_tokens cap and the model's context_window (also per tier).
                  # route_cooldown_s: how long a tier routed to it (tiers.<tier>.route, route.py) runs on the

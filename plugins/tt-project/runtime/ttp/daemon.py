@@ -707,6 +707,8 @@ class Daemon:
         self._local_only_job: dict | None = None   # the check running in its thread, applied by a later tick
         self._backup_job: dict | None = None   # the backup pushes running in their thread (backup_branches)
         self._replica_job: threading.Thread | None = None   # the state snapshot being taken (replicate_state)
+        self._mcp_probe: threading.Thread | None = None   # `claude mcp list` in flight (probe_mcp)
+        self._mcp_tried = 0.0   # when it last started: an unwritable answer is not retried every tick
         self._replica_checked = 0.0
         self._replica_stale: bool | None = None   # None: not looked since start
         self._replica_held_from = 0.0   # when this host took the project lease back (0: held since start)
@@ -1174,7 +1176,7 @@ class Daemon:
                      self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends,
                      self.check_integrity, self.heal_harness_git,
                      self.sync_schedules, self.lint_charter, self.tend_holds, self.record_ttr, self.alert_long_pause,
-                     self.check_linger, self.check_notifier):
+                     self.check_linger, self.check_notifier, self.probe_mcp):
             if step in lease_off:
                 continue
             self._run_step(step)
@@ -2520,6 +2522,33 @@ class Daemon:
             self.alert(downtime.LINGER_KEY, downtime.linger_text(name), severity="normal")
         elif db.kv(downtime.LINGER_KV):
             db.x("DELETE FROM kv WHERE key=?", (downtime.LINGER_KV,))
+
+    def probe_mcp(self) -> None:
+        """Refresh this host's connected MCP servers for the status feed (mcpgap.py): `claude mcp list` in
+        a thread, bounded and at most every few hours, only while Claude workers run isolated."""
+        from . import mcpgap
+        if not (self.cfg["providers"].get("claude") or {}).get("worker_isolation") or os.environ.get("TTP_TEST_NO_MCP_PROBE"):
+            return   # the test switch: daemons under test never start the real `claude mcp list`
+        if self._mcp_probe is not None and self._mcp_probe.is_alive():
+            return
+        now = time.time()
+        if now - self._mcp_tried < mcpgap.RETRY_S or not mcpgap.due(mcpgap.read(self.p.state), now):
+            return
+        binary = get_provider("claude").binary()
+        if not binary:
+            return
+        state, root = self.p.state, str(self.p.root)
+        self._mcp_tried = now
+
+        def work() -> None:
+            try:
+                e = mcpgap.refresh(state, binary, root)
+            except Exception:
+                e = {"error": traceback.format_exc().replace("\n", " | ")[-300:]}
+            if not e.get("ok"):
+                log(self.p, f"claude mcp list: unknown ({e.get('error')})")
+        self._mcp_probe = threading.Thread(target=work, daemon=True, name="mcp-probe")
+        self._mcp_probe.start()
 
     def check_notifier(self) -> None:
         """Alert once while this machine's desktop notifier fails to deliver (notifier.DELIVERY: a refused

@@ -1282,6 +1282,13 @@ project with `ttp config <name> jev.enabled false`. Without a key, screening is 
   Listing a server approves it for workers. A name your config does not define is skipped: the
   run still starts, and `ttp doctor` and a low alert name it. Servers that come from a Claude plugin
   are not in those files, so they cannot be listed; add the server with `claude mcp add` to list it.
+- While `worker_isolation` is on, the daemon runs `claude mcp list` from the project root in the
+  background (at most every 6 hours, bounded to 90 s) and keeps the answer in the project's state.
+  A server it reports connected that `mcp_servers` does not list gets one line in `ttp status` and
+  the web app's feed: `MCP servers connected on this host but not given to workers: ...`. List a
+  server you keep from workers on purpose in `providers.claude.mcp_withheld: ["name", ...]` and the
+  line drops it. claude.ai connectors and plugin servers are left out (`mcp_servers` cannot list
+  them). A probe that fails or times out shows as unknown in `ttp doctor`, never as this line.
 - With `worker_isolation` off, Claude workers and reviewers still load your own, the project's and
   plugins' MCP servers, but not your claude.ai connectors (about 2k tokens on every call), unless
   the project needs them: `mcp_servers` names one (`"claude.ai <name>"`), or one of its runs called

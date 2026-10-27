@@ -1390,6 +1390,8 @@ def status_text(p: Project, verbose: bool = False) -> str:
         lines.append(h["idle_sleep"])
     if h.get("release"):
         lines.append(h["release"])
+    if h.get("mcp_gap"):
+        lines.append(h["mcp_gap"])
     if h.get("local_only"):
         lines.append(h["local_only"])
     if h.get("uncommitted"):
@@ -7684,6 +7686,11 @@ def cmd_doctor(a) -> None:
         print("unfenced providers (their workers can write anywhere, project.db included): " + ", ".join(gaps))
     claude_cfg = p.config()["providers"].get("claude", {})
     from .coordinator import name_list
+    from . import mcpgap   # a gap is already a status line above
+    g = mcpgap.gap(claude_cfg, mcpgap.read(p.state))
+    if g["state"] == "unknown":
+        print(f"mcp servers on this host: unknown ({g['error']}); the daemon runs `claude mcp list` again within "
+              f"{mcpgap.RETRY_S // 60} min")
     names = name_list(claude_cfg.get("mcp_servers") or [])
     if names:
         from .providers import get_provider
