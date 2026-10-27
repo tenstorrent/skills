@@ -6,8 +6,12 @@ endpoint, chatbridge.py), with fallback to the core provider and a meter on ever
 Off unless project.json sets `providers.chat.tiers.<tier>.route: true` next to that tier's `model`.
 A worker run of a routed tier starts on chat when its task pins no provider or model and the start is
 no tier-up retry; reviews and coordinator turns never route. The run's note gets a `route` entry:
-the tier, where it was routed (`to`, `model`), its `fallback` reason (none, down, error, rate_limit
-or auth), whether its spend is `priced` and its wall time.
+the tier, where it was routed (`to`, `model`), its `fallback` reason (none, down, error, rate_limit,
+auth or busy), whether its spend is `priced` and its wall time.
+
+Slots: a routed start takes a worker slot under the routed-to provider's gate (its max_parallel,
+allow_new_work, pause and net hold), never the core provider's; when that has no room the run starts
+on the core provider, under the core gate, with fallback `busy` (no fault: no cool-down).
 
 Fallback: a routed run that ended on an endpoint fault (unreachable or timed out: down; 5xx or a
 missing model: error; 429 or rate-limit wording: rate_limit; a refused key: auth, through the auth
@@ -24,8 +28,8 @@ TO = "chat"                 # the provider a tier can be routed to
 KEY = "route"               # the run note's entry
 COOL = "route_cooldown:"    # kv: {"until", "reason", "run"} per routed-to provider
 COOLDOWN_S = 900
-REASONS = ("none", "down", "error", "rate_limit", "auth")
-FAULTS = REASONS[1:]
+FAULTS = ("down", "error", "rate_limit", "auth")
+REASONS = ("none", *FAULTS, "busy")   # busy: the routed-to provider had no free slot (its gate), no fault
 # Run ends a bridge fault turns into a fallback; any other end is the run's own.
 FAULT_ENDS = ("failed", "request_error", "timeout", "stalled")
 

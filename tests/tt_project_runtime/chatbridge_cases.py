@@ -736,6 +736,81 @@ def test_a_routed_tier_starts_on_chat_unless_pinned_reviewed_or_retried(env, mon
     assert route.target({**d.cfg, "core_provider": "chat"}, "light") is None
 
 
+def _route_slots(p, d, monkeypatch, n, core_max=1, chat_max=1, chat_open=True, core_running=0, tag="t"):
+    """Queue n light routed tasks, one dispatch tick under the given gates; returns [(provider, fallback)]."""
+    from ttp import budget as bud
+    from ttp import coordinator as coord
+    core = d.cfg.get("core_provider", "claude")
+    started = []
+    monkeypatch.setattr(d, "start_run", lambda role, prompt, provider, tier, cwd, **k: started.append(
+        (provider, ((k.get("note") or {}).get("route") or {}).get("fallback"))) or 0)
+    monkeypatch.setattr(d, "_workdir_for", lambda t: (str(p.root), None))
+    d.gates[core] = bud.Gate(core, regime="windows", max_parallel=core_max)
+    d.gates["chat"] = bud.Gate("chat", regime="windows", max_parallel=chat_max, allow_new_work=chat_open)
+    for _ in range(core_running):
+        p.db.x("INSERT INTO runs(role,provider,started,status,boot_id) VALUES('worker',?,?,'running',?)",
+               (core, time.time(), d.boot))
+    assert coord.apply(p, [{"type": "task_add", "title": f"{tag}{i}", "spec": f"s {tag}", "tier": "light", "priority": 1}
+                           for i in range(n)]) == []
+    d.dispatch()
+    return started
+
+
+def test_a_routed_start_takes_its_slot_under_the_chat_gate(env, monkeypatch):
+    from ttp.daemon import Daemon
+    p = make(env)
+    _route_config(p)
+    d = Daemon(p.base)
+    core = d.cfg.get("core_provider", "claude")
+    # One slot on each gate, four routed tasks: one runs on chat, the overflow on the core provider.
+    assert sorted(_route_slots(p, d, monkeypatch, 4)) == sorted([("chat", "none"), (core, "busy")])
+    assert len(p.db.q("SELECT id FROM tasks WHERE status='queued'")) == 2
+
+
+def test_a_routed_start_is_not_held_by_full_core_slots(env, monkeypatch):
+    from ttp.daemon import Daemon
+    p = make(env)
+    _route_config(p)
+    d = Daemon(p.base)
+    assert _route_slots(p, d, monkeypatch, 3, chat_max=2, core_running=1) == [("chat", "none")] * 2
+
+
+def test_a_closed_or_held_chat_gate_sends_routed_work_to_the_core_gate(env, monkeypatch):
+    from ttp.daemon import Daemon
+    p = make(env)
+    _route_config(p)
+    d = Daemon(p.base)
+    core = d.cfg.get("core_provider", "claude")
+    assert _route_slots(p, d, monkeypatch, 2, chat_open=False) == [(core, "busy")]
+    p.db.x("UPDATE tasks SET status='done'")
+    # Chat full and core full: nothing starts.
+    assert _route_slots(p, d, monkeypatch, 2, chat_max=0, core_running=1, tag="full") == []
+    p.db.x("UPDATE tasks SET status='done'")
+    p.db.x("UPDATE runs SET status='done'")
+    # Its API host does not resolve: the core provider takes it, reason down.
+    monkeypatch.setattr(d, "net_held", lambda prov: prov == "chat")
+    assert _route_slots(p, d, monkeypatch, 1, tag="net") == [(core, "down")]
+    monkeypatch.setattr(d, "net_held", lambda prov: False)
+    p.db.x("UPDATE tasks SET status='done'")
+    # A rate-limit pause on chat: no routed start there.
+    p.db.set_kv("limited:chat", {"until": time.time() + 600, "note": "rate limited"})
+    assert _route_slots(p, d, monkeypatch, 1, tag="paused") == [(core, "busy")]
+
+
+def test_a_start_whose_tier_leaves_the_route_rechecks_the_core_slots(env, monkeypatch):
+    from ttp.daemon import Daemon
+    p = make(env)
+    _route_config(p)
+    d = Daemon(p.base)
+    core = d.cfg.get("core_provider", "claude")
+    # Its slot was checked on chat, but the pick raises it to an unrouted tier: it needs a core slot.
+    monkeypatch.setattr(d, "_pick_effort", lambda task, prov: {"tier": "standard", "by": "jev"})
+    assert _route_slots(p, d, monkeypatch, 2, chat_max=2, core_running=1) == []
+    p.db.x("UPDATE tasks SET status='done'")
+    p.db.x("UPDATE runs SET status='done'")
+    assert _route_slots(p, d, monkeypatch, 2, chat_max=2, tag="free") == [(core, None)]
+
+
 def _route_finish(p, d, tid, exit_info, provider="chat"):
     p.db.update_task(tid, status="running")
     note = {"route": {"tier": "light", "to": "chat", "model": _RT_MODEL, "fallback": "none"}}

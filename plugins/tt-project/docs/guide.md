@@ -537,7 +537,9 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    same tier with no attempt spent: `down` (unreachable or timed out), `error` (5xx), `rate_limit`
    (429 or rate-limit wording) or `auth` (a refused key, through the usual logged-out gate). The
    endpoint then cools down for `providers.chat.route_cooldown_s` seconds (default 900), while the
-   tier's runs start on the core provider. A run that fails on its own merits is retried a tier up
+   tier's runs start on the core provider. Routed runs take worker slots under the `chat` gate (its
+   `max_parallel`), not the core provider's; when `chat` has no free slot the run starts on the core
+   provider instead, under its gate, with the reason `busy`. A run that fails on its own merits is retried a tier up
    as usual. Routed spend uses the `pricing.chat` row for the model (or its `default` row:
    `[$/M input, cached input, output]`); with no row it is zero and labelled unpriced. `ttp status`
    and the web budget line show the last 24 h as one phrase (`routed 24h: 6 runs to chat, 2 fell

@@ -4527,6 +4527,7 @@ class Daemon:
     def update_gates(self) -> None:
         provs = {self.cfg.get("core_provider", "claude"), *[t["provider"] for t in self.p.db.q(
             "SELECT DISTINCT provider FROM tasks WHERE provider IS NOT NULL AND status IN ('queued','running')")]}
+        provs |= {to[0] for tier in bud.TIER_ORDER if (to := route.target(self.cfg, tier))}   # routed slots' gate
         # Plan readings count only for the account each provider is logged in as now, so a switch
         # of account drops the old plan's windows before the next run.
         for prov in provs:
@@ -6286,7 +6287,20 @@ class Daemon:
             tier = bud.clamp_tier(wake or task["tier"], gate)
             # A tier routed to another provider (route.py) runs there unless it is cooling down.
             routed = self._route(task, tier, picked, now)
+            if routed and routed["fallback"] == "none":
+                routed["fallback"] = self._no_room(routed["to"], ctx) or "none"
             run_prov = routed["to"] if routed and routed["fallback"] == "none" else provider
+            if run_prov != ctx["slot"].get(task["id"], provider):
+                # Its tier or the route changed after the slot check: it takes a slot where it runs.
+                why = self._start_hold(task, run_prov, ctx, reserve=True, reroute=False)
+                if why:
+                    fate[task["id"]] = "full" if why == "gate" and task["id"] in ctx["full"] \
+                        else SLOT_HELD_BY.get(why, "other")
+                    if why != "resource":
+                        reached.discard(task["id"])
+                    continue
+                gate = ctx["gate"]
+                remaining, cost = self._start_cost(task)
             # Before _workdir_for, which would make a missing worktree afresh.
             lost = self._resumable(task, run_prov)
             try:
@@ -6417,7 +6431,8 @@ class Daemon:
         remaining = (task["budget_usd"] or 0) - (task["spent_usd"] or 0)
         return remaining, (max(remaining, 0.5) if task["budget_usd"] else 0.0)
 
-    def _start_hold(self, task: dict, provider: str, ctx: dict, reserve: bool = False) -> str | None:
+    def _start_hold(self, task: dict, provider: str, ctx: dict, reserve: bool = False,
+                    reroute: bool = True) -> str | None:
         """Why dispatch would not start this ready task now, or None when it would: 'held' (another
         live task's branch or worktree, _branch_clash, recorded in ctx["branch"][task id]; the disk
         guard; a review's prechecks), 'paused' (a paused resource), 'logged_out', 'net' (its API host
@@ -6431,7 +6446,8 @@ class Daemon:
         (_resource_hold) and ctx's caches: ctx holds now, paused, logged_out (provider -> bool), busy
         (provider -> running), committed (dollars running work may still spend under the caps; None:
         not read yet), live (_live_claims, read once when absent; dispatch adds its starts); it sets
-        gate (the task's budget gate, once that check is reached)."""
+        gate (the task's budget gate, once that check is reached) and slot[task id] (the provider whose
+        slots it checked: with `reroute`, the one its tier is routed to when that has room, _slot_provider)."""
         now = ctx["now"]
         ctx.setdefault("holds", {}).pop(task["id"], None)
         ctx.setdefault("full", {}).pop(task["id"], None)
@@ -6447,6 +6463,9 @@ class Daemon:
             ctx["holds"][task["id"]] = {"kind": "pause", "resource": sorted(coord.task_resources(task)
                                                                             & ctx["paused"].keys())[0]}
             return "paused"
+        if reroute:
+            provider = self._slot_provider(task, provider, ctx)
+        ctx.setdefault("slot", {})[task["id"]] = provider
         if ctx["logged_out"].get(provider) and not self._may_probe(provider, now):
             return "logged_out"
         if self.net_held(provider) and not self._net_may_probe(provider):
@@ -6506,6 +6525,32 @@ class Daemon:
         if not why and self._logged_out(name) and not self._may_probe(name, now):
             why = "auth"   # the auth gate holds it; its one login check may be a routed run
         return {"tier": tier, "to": name, "model": model, "fallback": why or "none"}
+
+    def _slot_provider(self, task: dict, provider: str, ctx: dict) -> str:
+        """The provider whose worker slots a start of `task` takes: the one its tier is routed to
+        (_route at the task's tier) when that can take a run now, else `provider`."""
+        if provider != (task["provider"] or self.cfg.get("core_provider", "claude")):
+            return provider
+        routed = self._route(task, task["tier"], None, ctx["now"])
+        if not routed or routed["fallback"] != "none" or self._no_room(routed["to"], ctx):
+            return provider
+        return routed["to"]
+
+    def _no_room(self, prov: str, ctx: dict) -> str:
+        """Why routed-to `prov` cannot take a run now, as a route fallback reason (route.REASONS), or
+        '': auth (logged out), down (its API host does not resolve), busy (its gate holds new work, a
+        pause, or every one of its worker slots is taken)."""
+        now = ctx["now"]
+        if self._logged_out(prov) and not self._may_probe(prov, now):
+            return "auth"
+        if self.net_held(prov) and not self._net_may_probe(prov):
+            return "down"
+        gate = self.gates.get(prov) or bud.evaluate(self.p.db, self.cfg, prov, bud.plan_windows(self.p.db))
+        lim = self._provider_pause(prov)
+        if (lim and lim.get("until", 0) > now) or not gate.allow_new_work \
+                or ctx["busy"].get(prov, 0) >= gate.max_parallel:
+            return "busy"
+        return ""
 
     def _resumable(self, task: dict, provider: str) -> dict | None:
         """The task's last run, when the host took it away (reboot, sleep, lost supervisor) after
