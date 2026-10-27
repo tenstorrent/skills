@@ -72,7 +72,7 @@ def _post(bridge, body, token=None, path="/v1/messages"):
         return e.code, e.read().decode()
 
 
-def _events(sse: str) -> list[dict]:
+def _cb_events(sse: str) -> list[dict]:
     return [json.loads(line[6:]) for line in sse.splitlines() if line.startswith("data: ")]
 
 
@@ -149,7 +149,7 @@ def test_chatbridge_streams_text_and_interleaved_parallel_tool_calls(mock_chat):
         status, text = _post(b, {"model": "claude-x", "max_tokens": 32000, "stream": True,
                                  "messages": [{"role": "user", "content": "hi"}]})
     assert status == 200
-    ev = _events(text)
+    ev = _cb_events(text)
     assert ev[0]["type"] == "message_start" and ev[-1]["type"] == "message_stop"
     deltas = [e["delta"]["text"] for e in ev if e["type"] == "content_block_delta" and e["delta"]["type"] == "text_delta"]
     assert "".join(deltas) == "Checking both." and "hidden thoughts" not in text
@@ -227,7 +227,7 @@ def test_chatbridge_unreachable_upstream_and_stream_error_chunk(mock_chat):
                           {"error": {"message": "rate limited", "code": 429}}]))
     with Bridge(up.url, _CB_KEY, "m") as b:
         code, text = _post(b, {"max_tokens": 5, "stream": True, "messages": [{"role": "user", "content": "hi"}]})
-    ev = _events(text)
+    ev = _cb_events(text)
     assert ev[-1]["type"] == "error" and ev[-1]["error"]["type"] == "rate_limit_error"
 
 
