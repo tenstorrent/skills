@@ -48,8 +48,7 @@
   what's on disk.
 - Run builds as `ttp clip -- <command>` (it shows the failures or head and tail, and the log's
   path), test suites and other untrusted test code as `ttp clip -- ttp sandbox -- <command>`
-  (they then cannot see or signal other processes). Run suites through `ttp checks`, or cap
-  xdist at `$TTP_TEST_SLOTS` (`-n auto` does), never `-n` above it.
+  (they then cannot see or signal other processes). Cap pytest -n at $TTP_TEST_SLOTS.
 - Each call re-reads the whole context: `grep -n` first, then every range a step needs in one call
   (`sed -n '10,40p;200,260p' f`, or `grep -n -A30 'def name' f` for a hit's body). Send independent
   reads and searches as parallel tool calls in one message. Never re-read a range.
