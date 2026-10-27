@@ -18804,8 +18804,9 @@ def test_a_push_batch_resumes_a_pytest_check_that_was_cut(env, monkeypatch, caps
     flag.write_text("")
     rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
     assert m["results"][0]["status"] != "pushed", m
-    assert log.read_text().split() == ["a1", "a2", "b", "c", "b", "b"], \
-        "the head, its failing test once more there, then only that test on the tip alone"
+    from ttp import batch
+    assert log.read_text().split() == ["a1", "a2", "b", "c", "b"] + ["b"] * batch.TIP_RERUNS, \
+        "the head, its failing test once more there, then only that test on the tip alone, TIP_RERUNS times"
     flag.unlink()
     log.write_text("")
     capsys.readouterr()

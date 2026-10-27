@@ -167,9 +167,9 @@ def _event(db, task: dict | None, kind: str, text: str, queued: bool, severity: 
 
 
 def _flaky_told(db, st: dict, b, m: dict, now: float) -> None:
-    """The marker's flaky_tests (tests that failed and then passed on one rerun at the same head): one
-    queued FLAKY_EVENT naming the ids not reported in the last FLAKY_TOLD_S, so the coordinator queues a
-    fix that makes them deterministic."""
+    """The marker's flaky_tests (tests that failed and then passed on one rerun at the same head) and
+    pre_existing (tests that failed on a rerun on the tip alone too): one queued FLAKY_EVENT each naming the
+    ids not reported in the last FLAKY_TOLD_S, so the coordinator queues a fix that makes them deterministic."""
     flaky = [f for f in m.get("flaky_tests") or [] if isinstance(f, dict)]
     told = {k: v for k, v in (st.get("flaky_told") or {}).items() if isinstance(v, (int, float)) and now - v < FLAKY_TOLD_S}
     new = sorted({str(i) for f in flaky for i in f.get("ids") or []} - set(told))
@@ -181,6 +181,18 @@ def _flaky_told(db, st: dict, b, m: dict, now: float) -> None:
                f"one rerun at the same head ({', '.join(heads)}), so the batch went on. Queue a fix that makes "
                f"{'them' if len(new) > 1 else 'it'} deterministic (wait on the real condition or a test clock, not "
                f"wall time).", queued=True)
+    pre = [f for f in m.get("pre_existing") or [] if isinstance(f, dict)]
+    new = sorted({str(i) for f in pre for i in f.get("ids") or []} - set(told))
+    if new:
+        told.update({i: now for i in new})
+        tips = sorted({_short(str(f.get("tip") or "")) for f in pre if set(map(str, f.get("ids") or [])) & set(new)})
+        entries = sorted({str(f.get("entry")) for f in pre if set(map(str, f.get("ids") or [])) & set(new)})
+        _event(db, None, FLAKY_EVENT,
+               f"test{'s' if len(new) > 1 else ''} failing on the push branch itself in push batch {b['id']}: "
+               f"{', '.join(new)} failed with entr{'y' if len(entries) == 1 else 'ies'} {', '.join(entries)} and "
+               f"again on a rerun on the tip ({', '.join(tips)}) alone: pre-existing (flaky or already failing), "
+               f"so no entry was sent back for {'them' if len(new) > 1 else 'it'}. Queue a fix that makes "
+               f"{'them' if len(new) > 1 else 'it'} pass reliably.", queued=True)
     if told or "flaky_told" in st:
         st["flaky_told"] = told
 
